@@ -42,7 +42,7 @@ This subsystem reduces risk. It does not eliminate it.
    All network traffic from the sandbox namespace must pass through one controlled interception and policy pipeline.
 
 3. **Policy is abstract**
-   The sandbox policy must describe **intent** and **assurance level**, not the internal mechanics of Dante, HAProxy, mitmproxy, routing, or nftables.
+   The sandbox policy must describe **intent** and **assurance level**, not the internal mechanics of Dante, Envoy, mitmproxy, routing, or nftables.
 
 4. **HTTP is the only real happy path**
    The only fully supported and strongly verified outbound mode is:
@@ -53,7 +53,7 @@ This subsystem reduces risk. It does not eliminate it.
    * with host or `:authority` validation per request
 
 5. **Everything else is a bypass**
-   Any flow that is not inspectable HTTP(S) is treated as an **explicit bypass class**, with weaker guarantees and stronger review requirements.
+   Any flow that is not inspectable HTTP(S) is treated as an **explicit bypass** at a reduced assurance level, with weaker guarantees and stronger review requirements.
 
 6. **Bypasses are first-class policy objects**
    A bypass is not an implementation accident. It is an explicit decision with known security consequences.
@@ -82,7 +82,7 @@ tun2proxy (transparent interception / traffic capture)
     ↓
 Dante (coarse transport mediation)
     ↓
-HAProxy (TLS/SNI-aware routing)
+Envoy (protocol-aware routing and bypass classification)
     ↓
 mitmproxy (HTTP(S) inspection and host validation)
     ↓
@@ -127,13 +127,19 @@ Provides coarse transport mediation:
 
 Dante is not the final security decision point for web identity.
 
-#### HAProxy
+#### Envoy
 
-Provides connection-level TLS routing and SNI-aware logic:
+Provides protocol-aware routing and bypass classification:
 
-* coarse hostname-aware decisions for TLS-capable traffic
-* route to inspection path or bypass path
+* listener filter chains that classify traffic by protocol, not by peeking for a TLS ClientHello
+* explicit separation of TLS-verified from transport-only based on declared policy
+* SNI extraction and validation for connections that are natively TLS
+* custom network filters for explicitly supported STARTTLS-style protocols (supported protocols will be documented separately; unsupported STARTTLS protocols fall to transport-only)
+* builtin protocol support where available (e.g., PostgreSQL proxy filter)
+* route to inspection path, TLS-verified path, or transport-only path
 * reject clearly invalid or unsupported traffic classes
+
+Why Envoy over HAProxy: not every TLS-capable protocol begins with a TLS ClientHello. Protocols like PostgreSQL negotiate TLS via a protocol-specific startup exchange (SSLRequest → server confirmation → ClientHello). HAProxy's routing model assumes it can peek at the first bytes to detect TLS, which fails for STARTTLS-style protocols. Envoy's architecture supports this natively in two ways: (1) builtin protocol filters for well-known protocols like PostgreSQL, and (2) custom network filters for other STARTTLS-style protocols, allowing the proxy to participate in the protocol handshake and upgrade to TLS at the correct point in the exchange. Only explicitly supported STARTTLS protocols will have filters — unsupported STARTTLS protocols cannot use TLS-verified and must fall to transport-only or be denied.
 
 #### mitmproxy
 
@@ -211,7 +217,7 @@ The policy model must describe:
 The policy model must **not** expose internal components such as:
 
 * Dante rule syntax
-* HAProxy ACLs
+* Envoy listener/filter/cluster configuration
 * mitmproxy ignore lists
 * nftables chains
 * routing tables
@@ -223,11 +229,11 @@ Those are backend implementation artifacts.
 
 Every attempted outbound flow must resolve to exactly one outcome:
 
-1. **Deny**
-2. **Allow with HTTP inspection**
-3. **Allow with explicit HTTP/TLS bypass**
-4. **Allow with explicit transport bypass**
-5. **Allow with explicit protocol-specific bypass**
+1. **Deny** (level 0)
+2. **Allow with HTTP inspection** (level 1)
+3. **Allow at TLS-verified level** (level 2)
+4. **Allow at transport-only level** (level 3)
+5. **Allow at UDP level** (level 4)
 
 There is no implicit “best effort allow.”
 
@@ -251,30 +257,40 @@ Conditions:
 
 This is the only true “happy path.”
 
-### Level 2 — TLS bypass
+### Level 2 — TLS-verified
 
-Reduced assurance.
+Reduced assurance. The connection uses TLS and connection-level identity is verified, but HTTP inspection is not performed.
 
 Conditions:
 
-* HTTP inspection is not performed
-* connection may still be validated at TLS connection level
-* SNI may be used when visible
-* request-level HTTP semantics are not trusted
+* the policy declares that this destination is allowed at TLS-verified level
+* the connection is natively TLS (ClientHello is the first message on the wire) **or** Envoy handles TLS negotiation via a protocol-specific network filter for explicitly supported STARTTLS protocols (e.g., PostgreSQL via builtin filter)
+* SNI is extracted and validated when present in natively-TLS connections
+* for STARTTLS-style protocols, the network filter participates in the protocol handshake and upgrades to TLS at the correct point — SNI may still not be available, but the proxy has protocol-level awareness of the connection
+* request-level HTTP semantics are not available
 
-Used only when inspection cannot or should not occur.
+Key distinction from transport-only: the system knows TLS is in use and the policy explicitly requires it. The connection carries encrypted traffic to a declared TLS-capable service.
 
-### Level 3 — TCP bypass
+Typical reasons:
 
-Further reduced assurance.
+* non-HTTP TLS protocol (databases, mail, custom protocols)
+* certificate pinning or custom trust store prevents HTTP interception
+* application cannot trust the interception CA
+
+### Level 3 — Transport-only
+
+Further reduced assurance. The connection is plain TCP — no TLS is expected or required.
 
 Conditions:
 
 * traffic is allowed as a generic TCP capability
-* identity may be limited to IP/port and maybe visible TLS metadata
-* application semantics are opaque
+* no TLS is assumed — the wire protocol is opaque
+* identity is limited to IP/port
+* application semantics are entirely opaque
 
-### Level 4 — UDP or protocol-specific bypass
+Key distinction from TLS-verified: no encryption is expected or verified. This is a raw capability grant to reach a specific TCP endpoint. The system cannot verify anything about what flows over the connection.
+
+### Level 4 — UDP
 
 Weakest assurance.
 
@@ -322,87 +338,56 @@ Every other traffic class loses one or more of those properties.
 
 ### Definition
 
-A bypass is an explicit policy decision to allow traffic without full HTTP inspection and request-level verification.
+A bypass is any policy entry that allows traffic at level 2 or below — that is, without full HTTP inspection and request-level verification.
 
-Bypasses are valid and necessary. They are not failures of the system. But they must be explicit, classified, logged, and reviewable.
+Bypasses are valid and necessary. They are not failures of the system. But they must be explicit, logged, and reviewable.
 
 ### Bypass principles
 
 1. No implicit bypasses
 2. Every bypass has a declared reason
-3. Every bypass has a declared assurance level
+3. Every bypass has a declared assurance level (2, 3, or 4)
 4. Every bypass is visible in logs and audits
 5. Bypasses should be as narrow as possible
 6. Bypasses should not be mistaken for fully verified traffic
 
-### Bypass classes
+### Bypass as policy metadata
 
-#### Bypass class A — HTTP/TLS compatibility bypass
+A bypass is not a separate classification system. It is a policy entry at a specific assurance level with a documented reason. The assurance levels (0–4) are the only classification needed.
 
-Used when:
+Example reasons for level 2 (TLS-verified):
 
-* application cannot trust interception CA
-* certificate pinning prevents interception
-* custom trust store prevents transparent HTTP inspection
+* certificate pinning prevents HTTP interception
+* custom trust store prevents transparent inspection
+* non-HTTP TLS protocol (database, mail, custom)
 * upstream proxy semantics require special handling
 
-Assurance:
+Example reasons for level 3 (transport-only):
 
-* lower than inspected HTTP
-* often limited to connection-level identity
+* protocol requires raw TCP semantics
+* STARTTLS protocol without a supported network filter
+* legacy protocol without TLS support
 
-#### Bypass class B — Non-HTTP TLS bypass
+Example reasons for level 4 (UDP):
 
-Used when:
+* protocol requires UDP (e.g., DNS to a specific resolver)
 
-* protocol is TLS-based but not HTTP
-* service is trusted but not inspectable as HTTP
-* SNI may be available, but application semantics remain opaque
+### Policy semantics for bypasses
 
-Assurance:
+A bypass policy entry should document:
 
-* moderate at best
-* strongly dependent on service trust
-
-#### Bypass class C — Generic TCP bypass
-
-Used when:
-
-* protocol is non-HTTP and non-inspectable
-* application compatibility requires raw TCP semantics
-
-Assurance:
-
-* weak
-* effectively a capability grant to reach that endpoint over TCP
-
-#### Bypass class D — UDP bypass
-
-Used when:
-
-* protocol requires UDP
-* service identity and content inspection are limited or unavailable
-
-Assurance:
-
-* weakest
-* should be rare and tightly scoped
-
-## Policy semantics for bypasses
-
-A bypass policy should answer:
-
-* what is being bypassed
-* why it must be bypassed
-* what narrower checks still apply
+* what assurance level applies
+* why HTTP inspection is not possible
+* what narrower checks still apply at the granted level
 * what security implications are accepted
 
 Examples of policy intent:
 
-* allow HTTPS to service X only as TLS bypass
-* allow non-HTTP TLS to service Y with visible SNI only
-* allow UDP to resolver Z only
-* allow explicit upstream HTTP proxy P for specific workflows only
+* allow HTTPS to service X at level 2 (TLS-verified) — reason: certificate pinning
+* allow PostgreSQL to service Y at level 2 (TLS-verified) — reason: non-HTTP TLS protocol
+* allow legacy service Z at level 3 (transport-only) — reason: no TLS support
+* allow UDP to resolver R at level 4 — reason: DNS requires UDP
+* allow explicit upstream HTTP proxy P at level 2 (TLS-verified) — reason: upstream proxy workflow
 
 ## Namespace model
 
@@ -735,7 +720,7 @@ This includes failures of:
 * routing setup
 * DNS policy path
 * Dante
-* HAProxy
+* Envoy
 * mitmproxy
 * policy distribution
 
@@ -769,7 +754,7 @@ The policy language should let users express intent such as:
 
 * allow web access to service X
 * require full HTTP inspection for service Y
-* allow service Z only via explicit TLS bypass
+* allow service Z only at TLS-verified level
 * allow UDP only to resolver R
 * deny everything else
 
@@ -810,11 +795,15 @@ Those are compilation details of the policy engine.
 * enforce coarse protocol/IP/port restrictions
 * not act as final hostname authority
 
-#### HAProxy
+#### Envoy
 
-* perform TLS/SNI-aware routing
-* separate inspection paths from bypass paths
-* reject invalid TLS cases where possible
+* classify connections into inspection, TLS-verified, or transport-only based on declared policy — not by peeking for ClientHello
+* extract and validate SNI for natively-TLS connections
+* use builtin protocol filters where available (e.g., PostgreSQL proxy filter) for protocol-aware TLS handling
+* use custom network filters for other explicitly supported STARTTLS-style protocols to handle the protocol handshake and TLS upgrade
+* deny or fall back to transport-only for STARTTLS protocols without a supported filter
+* route plain transport-only traffic without assuming any TLS
+* reject clearly invalid or unsupported traffic classes
 
 #### mitmproxy
 
@@ -835,7 +824,7 @@ Even with correct implementation, the following residual risks remain:
 * allowed services may be malicious or overly capable
 * allowed APIs may act as relays
 * generic TCP/UDP bypasses remain weak assurance paths
-* TLS bypass loses request-level certainty
+* TLS-verified level loses request-level certainty
 * application compatibility may pressure policy toward broader exceptions
 * user misunderstanding may overestimate the guarantees of “allowed” traffic
 
