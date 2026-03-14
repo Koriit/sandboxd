@@ -30,6 +30,7 @@ This subsystem does **not** guarantee:
 * that TLS passthrough has the same assurance as HTTP inspection
 * that compatibility can be achieved for every application without bypasses
 * that arbitrary software can safely use the internet merely because direct egress is blocked
+* that the multi-proxy pipeline will have low latency or high throughput — this is a sandbox for running untrusted code, not a production service runtime; performance overhead from mediation is accepted by design
 
 This subsystem reduces risk. It does not eliminate it.
 
@@ -78,15 +79,13 @@ network namespace
     ↓
 kernel firewall (deny by default)
     ↓
-tun2proxy (transparent interception / traffic capture)
+tun2proxy (transparent interception → SOCKS5)
     ↓
-Dante (coarse transport mediation)
-    ↓
-Envoy (protocol-aware routing and bypass classification)
-    ↓
-mitmproxy (HTTP(S) inspection and host validation)
-    ↓
-external destination
+Dante (SOCKS5 endpoint / transport split)
+    ├─ TCP → Envoy (protocol-aware routing)
+    │       ├─ HTTP(S) → mitmproxy (inspection) → destination
+    │       └─ TLS-verified / transport-only → destination
+    └─ UDP → destination (per policy)
 ```
 
 ### Layer responsibilities
@@ -111,21 +110,28 @@ Used primarily as a **mechanism**, not a policy engine.
 
 Its role is to:
 
-* intercept all traffic entering the sandbox network path
-* ensure traffic can be proxied, mediated, and inspected
+* intercept all traffic entering the sandbox network path via a TUN interface
+* convert intercepted traffic into SOCKS5 protocol and forward it to Dante
 * make arbitrary applications usable without requiring explicit proxy configuration
 
 It is not the source of policy truth.
 
 #### Dante
 
-Provides coarse transport mediation:
+Serves two distinct roles in the pipeline:
 
-* TCP/UDP class handling
-* coarse destination/IP/port/protocol gating
+**SOCKS5 endpoint**: receives all proxied traffic from tun2proxy via the SOCKS5 protocol. This is the entry point for all sandbox egress traffic into the proxy chain.
+
+**Transport split and coarse mediation**:
+
+* TCP connections are forwarded to Envoy for protocol-aware classification and routing
+* UDP traffic (via SOCKS5 UDP ASSOCIATE) is mediated directly by Dante per policy — Envoy is not in the UDP path
+* coarse destination/IP/port/protocol gating applies to all traffic classes
 * no final hostname authority
 
-Dante is not the final security decision point for web identity.
+Dante is not the final security decision point for web identity or protocol classification. Its policy is intentionally coarse — it gates at the transport level while Envoy handles protocol-aware decisions for TCP.
+
+**Why both Dante and Envoy**: Dante is necessary because tun2proxy speaks SOCKS5 and Envoy has no native SOCKS5 listener support. Additionally, SOCKS5 UDP ASSOCIATE semantics require handling at this layer — UDP relay cannot be cleanly forwarded through Envoy. Envoy is necessary because protocol-aware TCP classification (TLS vs. STARTTLS vs. transport-only) requires capabilities that Dante does not have. The two components are complementary: Dante handles SOCKS5 reception, UDP, and coarse transport gating; Envoy handles protocol-aware TCP routing.
 
 #### Envoy
 
@@ -134,7 +140,7 @@ Provides protocol-aware routing and bypass classification:
 * listener filter chains that classify traffic by protocol, not by peeking for a TLS ClientHello
 * explicit separation of TLS-verified from transport-only based on declared policy
 * SNI extraction and validation for connections that are natively TLS
-* custom network filters for explicitly supported STARTTLS-style protocols (supported protocols will be documented separately; unsupported STARTTLS protocols fall to transport-only)
+* custom network filters for explicitly supported STARTTLS-style protocols (PostgreSQL is supported at launch via Envoy's builtin filter; other STARTTLS protocols will be added when needed; unsupported STARTTLS protocols fall to transport-only)
 * builtin protocol support where available (e.g., PostgreSQL proxy filter)
 * route to inspection path, TLS-verified path, or transport-only path
 * reject clearly invalid or unsupported traffic classes
@@ -230,12 +236,32 @@ Those are backend implementation artifacts.
 Every attempted outbound flow must resolve to exactly one outcome:
 
 1. **Deny** (level 0)
-2. **Allow with HTTP inspection** (level 1)
-3. **Allow at TLS-verified level** (level 2)
-4. **Allow at transport-only level** (level 3)
-5. **Allow at UDP level** (level 4)
+2. **Allow at UDP level** (level 1)
+3. **Allow at transport-only level** (level 2)
+4. **Allow at TLS-verified level** (level 3)
+5. **Allow with HTTP inspection** (level 4)
 
 There is no implicit “best effort allow.”
+
+## Policy evaluation model
+
+### Pipeline short-circuit
+
+Policy is evaluated sequentially through the pipeline. Each layer either forwards traffic to the next layer or routes it directly to the destination. Once traffic exits the pipeline at a given layer, downstream layers never see it and their rules are not evaluated.
+
+This means there is no policy conflict resolution. The deny-by-default baseline combined with the fixed pipeline order makes ambiguous overlaps impossible. If a domain is declared as a TLS-verified bypass, its traffic exits at Envoy — any mitmproxy rules that might reference the same domain are never reached. They are irrelevant, not overridden.
+
+### Assurance level determines exit point
+
+The declared assurance level in policy determines which pipeline layer is the terminal decision point for a given flow:
+
+| Assurance level | Exit point | Downstream layers |
+|---|---|---|
+| Level 0 — Denied | Any layer (kernel firewall is backstop) | N/A |
+| Level 1 — UDP | Dante | Envoy and mitmproxy are not involved |
+| Level 2 — Transport-only | Envoy | mitmproxy is not involved |
+| Level 3 — TLS-verified | Envoy | mitmproxy is not involved |
+| Level 4 — HTTP inspected | mitmproxy | Full pipeline traversal |
 
 ## Assurance levels
 
@@ -243,23 +269,32 @@ There is no implicit “best effort allow.”
 
 The flow is not permitted.
 
-### Level 1 — HTTP inspected
+### Level 1 — UDP
 
-Strongest supported assurance.
+Weakest assurance.
 
 Conditions:
 
-* HTTP or HTTPS only
-* TLS interception succeeds when HTTPS is used
-* request-level host identity is visible
-* `Host` or `:authority` validated per request
-* policy can enforce method/path/headers/body if needed
+* service identity is often weak
+* protocol semantics may be opaque
+* only narrowly approved use cases are allowed
 
-This is the only true “happy path.”
+### Level 2 — Transport-only
 
-### Level 2 — TLS-verified
+Low assurance. The connection is plain TCP — no TLS is expected or required.
 
-Reduced assurance. The connection uses TLS and connection-level identity is verified, but HTTP inspection is not performed.
+Conditions:
+
+* traffic is allowed as a generic TCP capability
+* no TLS is assumed — the wire protocol is opaque
+* identity is limited to IP/port
+* application semantics are entirely opaque
+
+Key distinction from TLS-verified: no encryption is expected or verified. This is a raw capability grant to reach a specific TCP endpoint. The system cannot verify anything about what flows over the connection.
+
+### Level 3 — TLS-verified
+
+Moderate assurance. The connection uses TLS and connection-level identity is verified, but HTTP inspection is not performed.
 
 Conditions:
 
@@ -277,28 +312,19 @@ Typical reasons:
 * certificate pinning or custom trust store prevents HTTP interception
 * application cannot trust the interception CA
 
-### Level 3 — Transport-only
+### Level 4 — HTTP inspected
 
-Further reduced assurance. The connection is plain TCP — no TLS is expected or required.
-
-Conditions:
-
-* traffic is allowed as a generic TCP capability
-* no TLS is assumed — the wire protocol is opaque
-* identity is limited to IP/port
-* application semantics are entirely opaque
-
-Key distinction from TLS-verified: no encryption is expected or verified. This is a raw capability grant to reach a specific TCP endpoint. The system cannot verify anything about what flows over the connection.
-
-### Level 4 — UDP
-
-Weakest assurance.
+Strongest supported assurance.
 
 Conditions:
 
-* service identity is often weak
-* protocol semantics may be opaque
-* only narrowly approved use cases are allowed
+* HTTP or HTTPS only
+* TLS interception succeeds when HTTPS is used
+* request-level host identity is visible
+* `Host` or `:authority` validated per request
+* policy can enforce method/path/headers/body if needed
+
+This is the only true “happy path.”
 
 ## Fundamental design rule
 
@@ -338,7 +364,7 @@ Every other traffic class loses one or more of those properties.
 
 ### Definition
 
-A bypass is any policy entry that allows traffic at level 2 or below — that is, without full HTTP inspection and request-level verification.
+A bypass is any policy entry that allows traffic below level 4 (HTTP inspected) — that is, at level 1 (UDP), level 2 (transport-only), or level 3 (TLS-verified) — without full HTTP inspection and request-level verification.
 
 Bypasses are valid and necessary. They are not failures of the system. But they must be explicit, logged, and reviewable.
 
@@ -346,7 +372,7 @@ Bypasses are valid and necessary. They are not failures of the system. But they 
 
 1. No implicit bypasses
 2. Every bypass has a declared reason
-3. Every bypass has a declared assurance level (2, 3, or 4)
+3. Every bypass has a declared assurance level (1, 2, or 3)
 4. Every bypass is visible in logs and audits
 5. Bypasses should be as narrow as possible
 6. Bypasses should not be mistaken for fully verified traffic
@@ -355,22 +381,22 @@ Bypasses are valid and necessary. They are not failures of the system. But they 
 
 A bypass is not a separate classification system. It is a policy entry at a specific assurance level with a documented reason. The assurance levels (0–4) are the only classification needed.
 
-Example reasons for level 2 (TLS-verified):
+Example reasons for level 1 (UDP):
 
-* certificate pinning prevents HTTP interception
-* custom trust store prevents transparent inspection
-* non-HTTP TLS protocol (database, mail, custom)
-* upstream proxy semantics require special handling
+* protocol requires UDP (e.g., DNS to a specific resolver)
 
-Example reasons for level 3 (transport-only):
+Example reasons for level 2 (transport-only):
 
 * protocol requires raw TCP semantics
 * STARTTLS protocol without a supported network filter
 * legacy protocol without TLS support
 
-Example reasons for level 4 (UDP):
+Example reasons for level 3 (TLS-verified):
 
-* protocol requires UDP (e.g., DNS to a specific resolver)
+* certificate pinning prevents HTTP interception
+* custom trust store prevents transparent inspection
+* non-HTTP TLS protocol (database, mail, custom)
+* upstream proxy semantics require special handling
 
 ### Policy semantics for bypasses
 
@@ -383,11 +409,11 @@ A bypass policy entry should document:
 
 Examples of policy intent:
 
-* allow HTTPS to service X at level 2 (TLS-verified) — reason: certificate pinning
-* allow PostgreSQL to service Y at level 2 (TLS-verified) — reason: non-HTTP TLS protocol
-* allow legacy service Z at level 3 (transport-only) — reason: no TLS support
-* allow UDP to resolver R at level 4 — reason: DNS requires UDP
-* allow explicit upstream HTTP proxy P at level 2 (TLS-verified) — reason: upstream proxy workflow
+* allow HTTPS to service X at level 3 (TLS-verified) — reason: certificate pinning
+* allow PostgreSQL to service Y at level 3 (TLS-verified) — reason: non-HTTP TLS protocol
+* allow legacy service Z at level 2 (transport-only) — reason: no TLS support
+* allow UDP to resolver R at level 1 — reason: DNS requires UDP
+* allow explicit upstream HTTP proxy P at level 3 (TLS-verified) — reason: upstream proxy workflow
 
 ## Namespace model
 
@@ -402,6 +428,10 @@ All sandboxed traffic must originate from a dedicated network namespace.
 * no policy dependence on host-global networking state
 * no host trust-store coupling
 * easy traffic attribution per sandbox
+
+### Implementation
+
+Network namespaces are created and managed via Docker engine. Docker provides good security defaults for container isolation — no shared host network by default, seccomp profiles, and dropped capabilities. The sandbox leverages Docker's namespace and network management rather than raw `ip netns` or `unshare`, which also provides a well-understood operational model for lifecycle management (create, start, stop, cleanup).
 
 ### Interfaces inside the namespace
 
@@ -480,6 +510,15 @@ There must be exactly one approved DNS resolution path inside the sandbox.
 * deny alternate resolver paths unless explicitly allowed
 * all DNS policy must be explicit
 * DNS answers do not by themselves authorize traffic
+
+### DNS resolution for policy enforcement
+
+Policy is expressed in terms of domain names, but enforcement components (Dante, nftables) operate on IP addresses. The control plane must bridge this gap:
+
+* all policy domains must be periodically resolved to their corresponding IP addresses (e.g., every minute)
+* resolved IPs must be pushed as configuration updates to Dante and nftables
+* DNS resolution results are ephemeral — IPs may change at any time, so periodic re-resolution is required
+* this is a control-plane responsibility, not a data-plane concern — enforcement components consume IP-based rules and do not perform DNS resolution themselves
 
 ### Important limitation
 
@@ -719,6 +758,7 @@ This includes failures of:
 * namespace plumbing
 * routing setup
 * DNS policy path
+* tun2proxy (if tun2proxy crashes, no traffic can leave the namespace — the kernel firewall ensures no direct egress is possible regardless)
 * Dante
 * Envoy
 * mitmproxy
@@ -766,6 +806,42 @@ The policy language should not require users to know:
 
 Those are compilation details of the policy engine.
 
+### Policy schema
+
+The concrete policy schema (e.g., JSON Schema) is intentionally not defined in this design document. It will be produced as part of the implementation, once the interaction between policy intent and backend capabilities is better understood.
+
+However, the implementation **must** produce a formal, machine-readable schema document. This is a hard requirement, not an optional deliverable.
+
+### Policy versioning
+
+Every policy document must declare the schema version it conforms to, following the pattern established by Kubernetes manifests:
+
+* the version field must be present and must use [Semantic Versioning](https://semver.org/)
+* the system must reject policy documents whose declared version is incompatible with the currently supported schema
+* backward-compatible minor/patch versions may be accepted; incompatible major versions must be rejected
+* the schema version is a property of the policy document, not of the sandbox runtime
+
+This ensures that policy documents remain interpretable over time and that silent behavioral changes from schema drift are prevented.
+
+## Control plane / policy manager
+
+A dedicated policy manager component serves as the single source of truth for sandbox network policy. It is the mechanism that makes the policy abstraction guarantee real.
+
+### Responsibilities
+
+* accept abstract policy documents as input — the same documents authored by users
+* compile abstract policy into component-specific configurations: nftables rules, Dante ACLs, Envoy listener/filter/cluster config, mitmproxy rules
+* periodically resolve all policy domains to IP addresses and push updated IP-based rules to Dante and nftables
+* distribute generated configuration to all running enforcement components
+* ensure no enforcement component is hand-configured — all configuration is generated from the abstract policy
+
+### Design constraints
+
+* the policy manager is the only component that interprets policy intent
+* enforcement components receive only their own generated configuration and do not interpret abstract policy
+* configuration updates (including DNS re-resolution) must be applied without requiring sandbox restart where possible
+* the policy manager must validate policy documents against the declared schema version before compilation
+
 ## Recommended policy doctrine
 
 1. Default deny everything
@@ -785,15 +861,17 @@ Those are compilation details of the policy engine.
 
 #### tun2proxy
 
-* capture and proxy traffic transparently
-* act as interception mechanism
+* capture and proxy traffic transparently via TUN interface
+* forward all traffic to Dante as SOCKS5
 * not own policy semantics
 
 #### Dante
 
-* mediate transport classes
-* enforce coarse protocol/IP/port restrictions
-* not act as final hostname authority
+* receive SOCKS5 from tun2proxy (sole entry point for all sandbox egress)
+* forward TCP connections to Envoy for protocol-aware routing
+* mediate UDP traffic directly per policy (UDP ASSOCIATE)
+* enforce coarse destination/IP/port/protocol restrictions on all traffic
+* not act as final hostname authority or protocol classifier
 
 #### Envoy
 
@@ -851,5 +929,3 @@ The result is not “safe internet access for arbitrary code.”
 The result is:
 
 > explicit, mediated, auditable outbound capability with strong controls for HTTP(S) and explicit trust-based exceptions for everything else.
-
-If you want, the next step is turning this into an RFC-style structure with sections like **Requirements**, **Architecture**, **Policy Compilation**, **Security Considerations**, and **Operational Considerations**.
