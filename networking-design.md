@@ -515,9 +515,10 @@ There must be exactly one approved DNS resolution path inside the sandbox.
 
 Policy is expressed in terms of domain names, but enforcement components (Dante, nftables) operate on IP addresses. The control plane must bridge this gap:
 
-* all policy domains must be periodically resolved to their corresponding IP addresses (e.g., every minute)
+* all policy domains must be resolved to their corresponding IP addresses on a TTL-aware schedule: re-resolve when the DNS TTL expires, but enforce a configurable maximum interval (e.g., 60 seconds) as an upper bound regardless of TTL — domains with very long TTLs must not leave stale IPs in place indefinitely
 * resolved IPs must be pushed as configuration updates to Dante and nftables
-* DNS resolution results are ephemeral — IPs may change at any time, so periodic re-resolution is required
+* DNS resolution results are ephemeral — IPs may change at any time, and TTL-aware re-resolution minimizes the window of staleness
+* on resolution failure: immediately remove the previously resolved IPs for the affected domain (fail-closed), log the failure, and reflect the failure in the sandbox health status — stale IPs from domains that no longer resolve are a potential attack vector (e.g., IP takeover) and must not persist
 * this is a control-plane responsibility, not a data-plane concern — enforcement components consume IP-based rules and do not perform DNS resolution themselves
 
 ### Important limitation
@@ -531,6 +532,12 @@ A DNS answer:
 * may later be used with a different hostname or protocol
 
 Therefore DNS is only an input to policy, never final proof.
+
+### Stale IP window
+
+There is an inherent window between when a domain's IP address changes and when the control plane re-resolves and pushes the update. During this window, traffic to the old IP remains permitted while traffic to the new IP is not yet allowed.
+
+This is a known limitation of any DNS-based policy system. TTL-aware resolution minimizes the window but cannot eliminate it entirely. The design accepts this trade-off. Policy authors should be aware that IP-level enforcement is eventually consistent with DNS, not instantaneous.
 
 ## SNI model
 
@@ -580,6 +587,38 @@ The sandbox must be able to enforce, when configured:
 * explicit block or allow rules
 
 Even if only host-level policy is required, request-level inspection remains mandatory.
+
+## Certificate management
+
+### Requirement
+
+TLS interception by mitmproxy requires a CA certificate that the sandboxed application trusts. The sandbox must manage this certificate lifecycle.
+
+### CA generation and storage
+
+* a unique CA keypair is generated per sandbox instance at creation time
+* the CA is short-lived — its validity period matches the sandbox lifetime
+* the private key is stored only in the sandbox's control plane and is never mounted into the sandboxed container
+* per-sandbox generation ensures that compromise of one sandbox's CA does not affect others
+
+### Trust store injection
+
+The CA certificate (public part only) is injected into the sandboxed container so that applications trust the interception CA:
+
+* mounted into the container's system trust store location
+* standard environment variables set for applications that use their own trust store resolution (`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, etc.)
+
+This provides transparent interception for applications that rely on the system trust store or standard environment variables.
+
+### Certificate pinning and custom trust stores
+
+Applications that use certificate pinning or hardcoded trust stores will reject the interception CA. These applications require a TLS-verified bypass (level 3).
+
+Some pinned applications expose configuration options to provide a custom CA certificate. Whether and how to use such options is the user's responsibility — the sandbox provides the bypass mechanism, not application-specific CA configuration.
+
+### Rotation
+
+For ephemeral sandboxes, rotation is not required — the CA lives and dies with the sandbox instance. For long-lived sandboxes, a CA rotation procedure is a future enhancement.
 
 ## Upstream proxy support
 
@@ -763,6 +802,37 @@ This includes failures of:
 * Envoy
 * mitmproxy
 * policy distribution
+
+## Health monitoring
+
+### Component liveness probes
+
+Each enforcement component in the pipeline must expose or support a liveness probe:
+
+* **tun2proxy** — TUN interface status check (interface exists and is up)
+* **Dante** — lightweight SOCKS5 handshake probe
+* **Envoy** — admin health endpoint
+* **mitmproxy** — health endpoint
+* **policy manager** — internal self-check (DNS resolution cycle completing, configuration distribution succeeding)
+
+The policy manager polls these probes periodically. Per-component probes serve a diagnostic purpose: when something is wrong, they identify which component is the source of the failure.
+
+### Failure response
+
+When a component probe fails:
+
+* log an alert with the affected component identified
+* update the sandbox status to reflect degraded networking
+* expose the health state via a policy manager status command
+* attempt to send a system notification that sandbox networking is degraded
+
+The system must **not** automatically terminate the sandbox on health-check failure. The sandbox may be running long-lived processes that do not require network access. The sandbox owner decides what action to take based on the reported status.
+
+### End-to-end pipeline verification
+
+Per-component probes do not guarantee that traffic is actually being proxied through the full pipeline. A true end-to-end probe — originating from within the sandbox network namespace and traversing the complete chain (tun2proxy → Dante → Envoy → mitmproxy → destination) — would provide stronger assurance.
+
+This is recognized as a future enhancement. The design for an end-to-end health-check mechanism is documented separately. Per-component probes are sufficient for initial implementation and provide actionable diagnostics without introducing additional attack surface.
 
 ## Logging and audit requirements
 
