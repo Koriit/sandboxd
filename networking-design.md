@@ -30,7 +30,7 @@ This subsystem does **not** guarantee:
 * that TLS passthrough has the same assurance as HTTP inspection
 * that compatibility can be achieved for every application without bypasses
 * that arbitrary software can safely use the internet merely because direct egress is blocked
-* that the multi-proxy pipeline will have low latency or high throughput — this is a sandbox for running untrusted code, not a production service runtime; performance overhead from mediation is accepted by design
+* that the mediation pipeline will have low latency or high throughput — this is a sandbox for running untrusted code, not a production service runtime; performance overhead from mediation is accepted by design
 
 This subsystem reduces risk. It does not eliminate it.
 
@@ -43,7 +43,7 @@ This subsystem reduces risk. It does not eliminate it.
    All network traffic from the sandbox namespace must pass through one controlled interception and policy pipeline.
 
 3. **Policy is abstract**
-   The sandbox policy must describe **intent** and **assurance level**, not the internal mechanics of Dante, Envoy, mitmproxy, routing, or nftables.
+   The sandbox policy must describe **intent** and **assurance level**, not the internal mechanics of Envoy, mitmproxy, iptables, or nftables.
 
 4. **HTTP is the only real happy path**
    The only fully supported and strongly verified outbound mode is:
@@ -79,13 +79,12 @@ network namespace
     ↓
 kernel firewall (deny by default)
     ↓
-tun2proxy (transparent interception → SOCKS5)
-    ↓
-Dante (SOCKS5 endpoint / transport split)
-    ├─ TCP → Envoy (protocol-aware routing)
-    │       ├─ HTTP(S) → mitmproxy (inspection) → destination
+iptables REDIRECT
+    ├─ DNS → local resolver (policy-aware, logging)
+    ├─ TCP → Envoy (original_dst, protocol-aware routing)
+    │       ├─ HTTP(S) → mitmproxy → destination
     │       └─ TLS-verified / transport-only → destination
-    └─ UDP → destination (per policy)
+    └─ UDP → nftables (IP/port allow/deny)
 ```
 
 ### Layer responsibilities
@@ -94,49 +93,42 @@ Dante (SOCKS5 endpoint / transport split)
 
 Provides isolation from the host network stack and ensures the sandbox has a single controlled outbound path.
 
-#### Kernel firewall
+#### Kernel firewall (nftables + iptables)
 
-Provides hard enforcement:
+Provides hard enforcement and transparent interception:
 
-* deny by default
-* no direct egress
+* deny by default — all protocols denied unless explicitly permitted
+* only TCP and UDP are supported IP protocols
+* ICMP is explicitly denied by default
+* tunneling protocols (GRE, IPIP, WireGuard, etc.) are explicitly denied
+* no direct egress outside the policy path
 * explicit protocol and destination allow rules
 * loopback/local exemptions where required
 * IPv4 and IPv6 parity
 
-#### tun2proxy
+**iptables REDIRECT** performs transparent interception at the kernel level:
 
-Used primarily as a **mechanism**, not a policy engine.
+* DNS traffic (TCP/UDP port 53) is redirected to the local resolver
+* TCP traffic is redirected to Envoy's listener, which uses the `original_dst` listener filter to recover the real destination from the redirected socket
+* UDP traffic is handled purely by nftables rules (IP/port allow/deny) — no userland proxy is involved
 
-Its role is to:
+This eliminates the need for userland transparent interception proxies. The kernel handles the redirect, and Envoy recovers the original destination natively.
 
-* intercept all traffic entering the sandbox network path via a TUN interface
-* convert intercepted traffic into SOCKS5 protocol and forward it to Dante
-* make arbitrary applications usable without requiring explicit proxy configuration
+#### Local DNS resolver
 
-It is not the source of policy truth.
+A local DNS resolver runs inside the namespace and serves as the single enforced DNS path:
 
-#### Dante
+* **policy-aware resolution**: only domains permitted by policy resolve successfully; non-allowed domains receive NXDOMAIN
+* **query logging**: all DNS queries are logged, providing domain→IP correlation for audit trails
+* **enforced path**: nftables rules redirect all DNS traffic to the local resolver — no alternate resolver paths are possible
 
-Serves two distinct roles in the pipeline:
-
-**SOCKS5 endpoint**: receives all proxied traffic from tun2proxy via the SOCKS5 protocol. This is the entry point for all sandbox egress traffic into the proxy chain.
-
-**Transport split and coarse mediation**:
-
-* TCP connections are forwarded to Envoy for protocol-aware classification and routing
-* UDP traffic (via SOCKS5 UDP ASSOCIATE) is mediated directly by Dante per policy — Envoy is not in the UDP path
-* coarse destination/IP/port/protocol gating applies to all traffic classes
-* no final hostname authority
-
-Dante is not the final security decision point for web identity or protocol classification. Its policy is intentionally coarse — it gates at the transport level while Envoy handles protocol-aware decisions for TCP.
-
-**Why both Dante and Envoy**: Dante is necessary because tun2proxy speaks SOCKS5 and Envoy has no native SOCKS5 listener support. Additionally, SOCKS5 UDP ASSOCIATE semantics require handling at this layer — UDP relay cannot be cleanly forwarded through Envoy. Envoy is necessary because protocol-aware TCP classification (TLS vs. STARTTLS vs. transport-only) requires capabilities that Dante does not have. The two components are complementary: Dante handles SOCKS5 reception, UDP, and coarse transport gating; Envoy handles protocol-aware TCP routing.
+The resolver is the bridge between domain-based policy and IP-based enforcement. When policy permits a domain, the resolver both answers the query and makes the resolved IP available to the sandbox daemon for nftables rule updates.
 
 #### Envoy
 
-Provides protocol-aware routing and bypass classification:
+Receives redirected TCP connections and provides protocol-aware routing and bypass classification:
 
+* uses the `original_dst` listener filter to recover the real destination from iptables-redirected connections
 * listener filter chains that classify traffic by protocol, not by peeking for a TLS ClientHello
 * explicit separation of TLS-verified from transport-only based on declared policy
 * SNI extraction and validation for connections that are natively TLS
@@ -222,12 +214,11 @@ The policy model must describe:
 
 The policy model must **not** expose internal components such as:
 
-* Dante rule syntax
 * Envoy listener/filter/cluster configuration
 * mitmproxy ignore lists
-* nftables chains
+* nftables/iptables rules
+* DNS resolver configuration
 * routing tables
-* tun2proxy flags
 
 Those are backend implementation artifacts.
 
@@ -258,7 +249,7 @@ The declared assurance level in policy determines which pipeline layer is the te
 | Assurance level | Exit point | Downstream layers |
 |---|---|---|
 | Level 0 — Denied | Any layer (kernel firewall is backstop) | N/A |
-| Level 1 — UDP | Dante | Envoy and mitmproxy are not involved |
+| Level 1 — UDP | nftables | Envoy and mitmproxy are not involved |
 | Level 2 — Transport-only | Envoy | mitmproxy is not involved |
 | Level 3 — TLS-verified | Envoy | mitmproxy is not involved |
 | Level 4 — HTTP inspected | mitmproxy | Full pipeline traversal |
@@ -474,29 +465,33 @@ Use loopback for local data-plane plumbing where necessary, but prefer:
 
 ## Kernel firewall requirements
 
-The kernel firewall is the hard enforcement layer.
+The kernel firewall (nftables + iptables) is the hard enforcement layer and the transparent interception mechanism.
 
 ### Must enforce
 
-* deny by default
-* explicit allow only
+* deny by default — all traffic denied unless explicitly permitted
+* only TCP and UDP are supported IP protocols
+* ICMP is explicitly denied by default
+* tunneling protocols (GRE, IPIP, WireGuard, etc.) are explicitly denied
+* explicit allow only for permitted traffic
 * no direct internet egress outside the policy path
-* no direct DNS except controlled resolver path
+* no direct DNS except the local resolver path
 * both IPv4 and IPv6
-* no fail-open on userland proxy failure
+* no fail-open on Envoy or mitmproxy failure
 * no accidental side interfaces or alternate routes
 
-### Must support
+### Must provide
 
+* iptables REDIRECT rules to route TCP traffic to Envoy
+* iptables REDIRECT rules to route DNS traffic to the local resolver
+* nftables rules for UDP allow/deny (IP/port based)
 * loopback exemptions
-* self-traffic exemptions for the proxy chain
-* explicit UDP policy
-* explicit bypass handling
+* self-traffic exemptions for Envoy and mitmproxy
 * explicit host and port restrictions as derived from policy
 
 ### Important rule
 
-The kernel firewall is authoritative for **containment**, not for final service identity.
+The kernel firewall is authoritative for **containment** and **transparent interception**, not for final service identity.
 
 ## DNS model
 
@@ -513,13 +508,14 @@ There must be exactly one approved DNS resolution path inside the sandbox.
 
 ### DNS resolution for policy enforcement
 
-Policy is expressed in terms of domain names, but enforcement components (Dante, nftables) operate on IP addresses. The control plane must bridge this gap:
+Policy is expressed in terms of domain names, but enforcement components (nftables) operate on IP addresses. The local DNS resolver bridges this gap:
 
-* all policy domains must be resolved to their corresponding IP addresses on a TTL-aware schedule: re-resolve when the DNS TTL expires, but enforce a configurable maximum interval (e.g., 60 seconds) as an upper bound regardless of TTL — domains with very long TTLs must not leave stale IPs in place indefinitely
-* resolved IPs must be pushed as configuration updates to Dante and nftables
-* DNS resolution results are ephemeral — IPs may change at any time, and TTL-aware re-resolution minimizes the window of staleness
+* the local resolver is the only DNS path available inside the namespace — nftables redirects all DNS traffic to it
+* non-allowed domains receive NXDOMAIN — the resolver enforces policy at the DNS layer
+* for allowed domains, resolution results are reported to the sandbox daemon, which maintains TTL-aware IP-to-domain mappings and pushes updated nftables rules
+* re-resolution occurs when DNS TTL expires, with a configurable maximum interval (e.g., 60 seconds) as an upper bound regardless of TTL — domains with very long TTLs must not leave stale IPs in place indefinitely
 * on resolution failure: immediately remove the previously resolved IPs for the affected domain (fail-closed), log the failure, and reflect the failure in the sandbox health status — stale IPs from domains that no longer resolve are a potential attack vector (e.g., IP takeover) and must not persist
-* this is a control-plane responsibility, not a data-plane concern — enforcement components consume IP-based rules and do not perform DNS resolution themselves
+* all DNS queries are logged for audit trail purposes, providing domain→IP correlation that supports connection attribution
 
 ### Important limitation
 
@@ -796,12 +792,11 @@ This includes failures of:
 
 * namespace plumbing
 * routing setup
-* DNS policy path
-* tun2proxy (if tun2proxy crashes, no traffic can leave the namespace — the kernel firewall ensures no direct egress is possible regardless)
-* Dante
-* Envoy
+* iptables/nftables rules
+* local DNS resolver
+* Envoy (if Envoy crashes, redirected TCP connections fail — the kernel firewall ensures no direct egress is possible regardless)
 * mitmproxy
-* policy distribution
+* sandbox daemon / policy distribution
 
 ## Health monitoring
 
@@ -809,13 +804,13 @@ This includes failures of:
 
 Each enforcement component in the pipeline must expose or support a liveness probe:
 
-* **tun2proxy** — TUN interface status check (interface exists and is up)
-* **Dante** — lightweight SOCKS5 handshake probe
+* **iptables/nftables** — rule verification (expected chains and redirect rules are present and active)
+* **local DNS resolver** — test resolution of a known-allowed domain
 * **Envoy** — admin health endpoint
 * **mitmproxy** — health endpoint
-* **policy manager** — internal self-check (DNS resolution cycle completing, configuration distribution succeeding)
+* **sandbox daemon** — internal self-check (DNS resolution cycle completing, configuration distribution succeeding)
 
-The policy manager polls these probes periodically. Per-component probes serve a diagnostic purpose: when something is wrong, they identify which component is the source of the failure.
+The sandbox daemon polls these probes periodically. Per-component probes serve a diagnostic purpose: when something is wrong, they identify which component is the source of the failure.
 
 ### Failure response
 
@@ -823,14 +818,14 @@ When a component probe fails:
 
 * log an alert with the affected component identified
 * update the sandbox status to reflect degraded networking
-* expose the health state via a policy manager status command
+* expose the health state via a sandbox daemon status command
 * attempt to send a system notification that sandbox networking is degraded
 
 The system must **not** automatically terminate the sandbox on health-check failure. The sandbox may be running long-lived processes that do not require network access. The sandbox owner decides what action to take based on the reported status.
 
 ### End-to-end pipeline verification
 
-Per-component probes do not guarantee that traffic is actually being proxied through the full pipeline. A true end-to-end probe — originating from within the sandbox network namespace and traversing the complete chain (tun2proxy → Dante → Envoy → mitmproxy → destination) — would provide stronger assurance.
+Per-component probes do not guarantee that traffic is actually being proxied through the full pipeline. A true end-to-end probe — originating from within the sandbox network namespace and traversing the complete chain (iptables REDIRECT → Envoy → mitmproxy → destination) — would provide stronger assurance.
 
 This is recognized as a future enhancement. The design for an end-to-end health-check mechanism is documented separately. Per-component probes are sufficient for initial implementation and provide actionable diagnostics without introducing additional attack surface.
 
@@ -893,24 +888,30 @@ Every policy document must declare the schema version it conforms to, following 
 
 This ensures that policy documents remain interpretable over time and that silent behavioral changes from schema drift are prevented.
 
-## Control plane / policy manager
+## Control plane / sandbox daemon
 
-A dedicated policy manager component serves as the single source of truth for sandbox network policy. It is the mechanism that makes the policy abstraction guarantee real.
+A dedicated sandbox daemon serves as the single source of truth for sandbox network policy. It is the mechanism that makes the policy abstraction guarantee real. The sandbox daemon is a single process that manages multiple concurrent sandbox instances, each with its own networking stack.
 
 ### Responsibilities
 
 * accept abstract policy documents as input — the same documents authored by users
-* compile abstract policy into component-specific configurations: nftables rules, Dante ACLs, Envoy listener/filter/cluster config, mitmproxy rules
-* periodically resolve all policy domains to IP addresses and push updated IP-based rules to Dante and nftables
+* compile abstract policy into component-specific configurations: nftables/iptables rules, local DNS resolver policy, Envoy listener/filter/cluster config, mitmproxy rules
+* manage the local DNS resolver's policy (allowed domains, NXDOMAIN for denied domains)
+* receive resolution results from the local resolver and push updated IP-based rules to nftables
 * distribute generated configuration to all running enforcement components
 * ensure no enforcement component is hand-configured — all configuration is generated from the abstract policy
+* manage lifecycle of per-sandbox networking stacks (namespace, firewall rules, resolver, Envoy, mitmproxy)
 
 ### Design constraints
 
-* the policy manager is the only component that interprets policy intent
+* the sandbox daemon is the only component that interprets policy intent
 * enforcement components receive only their own generated configuration and do not interpret abstract policy
 * configuration updates (including DNS re-resolution) must be applied without requiring sandbox restart where possible
-* the policy manager must validate policy documents against the declared schema version before compilation
+* the sandbox daemon must validate policy documents against the declared schema version before compilation
+
+### Time synchronization
+
+Time synchronization is a host responsibility. Sandbox containers inherit the host system clock — this is standard Docker behavior, not a network concern. The sandbox networking subsystem does not need to provide NTP access or any time-synchronization path.
 
 ## Recommended policy doctrine
 
@@ -929,22 +930,26 @@ A dedicated policy manager component serves as the single source of truth for sa
 
 ### What the backend stack should do
 
-#### tun2proxy
+#### Kernel firewall (nftables + iptables)
 
-* capture and proxy traffic transparently via TUN interface
-* forward all traffic to Dante as SOCKS5
-* not own policy semantics
+* enforce deny-by-default for all protocols
+* deny ICMP and tunneling protocols (GRE, IPIP, WireGuard, etc.)
+* permit only TCP and UDP
+* redirect DNS traffic to the local resolver via iptables REDIRECT
+* redirect TCP traffic to Envoy via iptables REDIRECT
+* enforce UDP allow/deny rules (IP/port) via nftables
+* ensure no direct egress is possible outside the policy path
 
-#### Dante
+#### Local DNS resolver
 
-* receive SOCKS5 from tun2proxy (sole entry point for all sandbox egress)
-* forward TCP connections to Envoy for protocol-aware routing
-* mediate UDP traffic directly per policy (UDP ASSOCIATE)
-* enforce coarse destination/IP/port/protocol restrictions on all traffic
-* not act as final hostname authority or protocol classifier
+* resolve only policy-permitted domains; return NXDOMAIN for all others
+* log all queries for audit trail (domain→IP correlation)
+* report resolution results to the sandbox daemon for nftables rule updates
+* serve as the single DNS path — no alternate resolvers reachable
 
 #### Envoy
 
+* use the `original_dst` listener filter to recover real destinations from iptables-redirected connections
 * classify connections into inspection, TLS-verified, or transport-only based on declared policy — not by peeking for ClientHello
 * extract and validate SNI for natively-TLS connections
 * use builtin protocol filters where available (e.g., PostgreSQL proxy filter) for protocol-aware TLS handling
@@ -983,13 +988,15 @@ These are not implementation bugs. They are the natural limits of the problem sp
 This subsystem defines a sandbox network architecture in which:
 
 * all traffic is captured in a dedicated namespace
-* all traffic is denied by default
-* tun2proxy transparently intercepts traffic so it can be proxied and inspected
+* all traffic is denied by default — only TCP and UDP are supported; ICMP and tunneling protocols are explicitly denied
+* iptables REDIRECT transparently intercepts traffic at the kernel level, with Envoy recovering original destinations via `original_dst`
+* a local DNS resolver enforces policy at the DNS layer and provides query logging for audit trails
+* UDP policy is enforced purely by nftables (IP/port allow/deny) with no userland proxy
 * the only normal allowed mode is inspected HTTP(S)
 * every non-HTTP or non-inspected flow is an explicit bypass
 * bypasses are classified by assurance level
 * policy is abstract and implementation-independent
-* policy backends are hidden behind a single sandbox policy model
+* policy backends are hidden behind a single sandbox policy model compiled by the sandbox daemon
 * the system fails closed
 * logs make every exception visible
 * the design is honest about the difference between constrained egress and true safety
