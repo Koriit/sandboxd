@@ -124,6 +124,8 @@ A local DNS resolver runs inside the namespace and serves as the single enforced
 
 The resolver is the bridge between domain-based policy and IP-based enforcement. When policy permits a domain, the resolver both answers the query and makes the resolved IP available to the sandbox daemon for nftables rule updates.
 
+**ECH stripping:** The local DNS resolver strips HTTPS/SVCB records that carry ECHConfig from DNS responses by default. This prevents clients from learning the server's Encrypted Client Hello public key, forcing a fallback to standard TLS with plaintext SNI. This is necessary because ECH encrypts the entire inner ClientHello — including SNI — using the server's public key, which defeats both SNI-based routing at Envoy and TLS interception at mitmproxy. ECH stripping applies only to level 4 (HTTP inspected) destinations. Level 2 and level 3 destinations are not affected — ECH configs are left intact since interception is not performed. ECH stripping is enabled by default because without it, increasing ECH adoption would silently break HTTP inspection for destinations that previously worked, producing confusing TLS handshake errors with no clear cause.
+
 #### Envoy
 
 Receives redirected TCP connections and provides protocol-aware routing and bypass classification:
@@ -763,7 +765,9 @@ Response:
 
 Response:
 
-* explicit bypass only
+* ECH configs are stripped from DNS responses by default for level 4 destinations, forcing client fallback to standard TLS
+* if the upstream server mandates ECH and rejects non-ECH connections, the destination requires an explicit level 2 (transport-only) bypass — HTTP inspection is not possible
+* ECH stripping is enabled by default to prevent silent inspection breakage as ECH adoption grows
 
 ## Relay-capable services and trust amplification
 
@@ -1096,6 +1100,7 @@ Even with correct implementation, the following residual risks remain:
 * TLS-verified level loses request-level certainty
 * application compatibility may pressure policy toward broader exceptions
 * user misunderstanding may overestimate the guarantees of “allowed” traffic
+* increasing ECH adoption may force more destinations to level 2 bypasses as servers begin mandating ECH, reducing the proportion of traffic that can be inspected at level 4
 
 These are not implementation bugs. They are the natural limits of the problem space.
 
