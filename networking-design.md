@@ -139,6 +139,14 @@ Receives redirected TCP connections and provides protocol-aware routing and bypa
 
 Why Envoy over HAProxy: not every TLS-capable protocol begins with a TLS ClientHello. Protocols like PostgreSQL negotiate TLS via a protocol-specific startup exchange (SSLRequest → server confirmation → ClientHello). HAProxy's routing model assumes it can peek at the first bytes to detect TLS, which fails for STARTTLS-style protocols. Envoy's architecture supports this natively in two ways: (1) builtin protocol filters for well-known protocols like PostgreSQL, and (2) custom network filters for other STARTTLS-style protocols, allowing the proxy to participate in the protocol handshake and upgrade to TLS at the correct point in the exchange. Only explicitly supported STARTTLS protocols will have filters — unsupported STARTTLS protocols cannot use TLS-verified and must fall to transport-only or be denied.
 
+**Classification mechanism:** Envoy does not inspect first bytes to guess the protocol class. The sandbox daemon compiles each destination's declared assurance level into Envoy's filter chain configuration. Filter chains match on destination IP and port and apply the behavior declared in policy:
+
+* level 4 destinations: route to mitmproxy for HTTP inspection
+* level 3 destinations: expect TLS, extract and validate SNI, forward directly to destination
+* level 2 destinations: forward as opaque TCP with no TLS assumption
+
+If wire behavior contradicts the declared level (e.g., a level 3 destination sends no TLS ClientHello), the connection is denied. Policy drives classification, not protocol sniffing.
+
 #### mitmproxy
 
 Provides the only strong verification path for HTTP(S):
@@ -641,12 +649,17 @@ Therefore:
 * explicit upstream-proxy use must be modeled as a separate policy case
 * it must not be silently merged into the ordinary transparent-origin path
 
-### Implication
+### CONNECT handling
 
-Supporting upstream HTTP proxies adds another policy concern:
+CONNECT requests are only valid when targeting a destination declared as an upstream proxy in policy. CONNECT to any other destination is denied — this prevents applications from using CONNECT as a tunneling mechanism through non-proxy endpoints.
 
-* validate the final intended destination as expressed by the proxy protocol where possible
-* do not treat upstream-proxy access as equivalent to raw TCP freedom
+Once traffic reaches the allowed upstream proxy, the sandbox's trust boundary applies: the proxy is an approved first-hop destination, and what it does on the application's behalf is beyond the sandbox's control. This is consistent with the trust model for all other allowed destinations.
+
+The sandbox does not attempt to validate or restrict the final destination behind the upstream proxy. Such validation would be:
+
+* inconsistent with the trust boundary — no other allowed service is policed for what it does on behalf of the application
+* unreliable — the proxy could relay anywhere regardless of what the CONNECT target declares
+* already addressed by the relay-capable services classification
 
 ## Transport and protocol classes
 
@@ -731,7 +744,7 @@ Response:
 
 Response:
 
-* invalid and denied unless explicit upstream-proxy policy applies
+* denied unless the target is declared as an upstream proxy in policy
 
 ### Local helper proxies inside namespace
 
@@ -829,6 +842,91 @@ Per-component probes do not guarantee that traffic is actually being proxied thr
 
 This is recognized as a future enhancement. The design for an end-to-end health-check mechanism is documented separately. Per-component probes are sufficient for initial implementation and provide actionable diagnostics without introducing additional attack surface.
 
+## Component lifecycle and startup ordering
+
+### Requirement
+
+The pipeline components must start in a specific order to avoid transient exposure or broken behavior during sandbox initialization.
+
+### Startup order
+
+Components start outside-in — the outermost enforcement layer first, the traffic gate last:
+
+1. **Kernel firewall (nftables)** — deny-by-default rules are applied first. Nothing can leave the namespace. This is always safe.
+2. **mitmproxy** — starts and becomes ready to receive forwarded HTTP(S) traffic from Envoy.
+3. **Envoy** — starts and becomes ready to receive redirected TCP traffic. Can route to mitmproxy, which is already available.
+4. **Local DNS resolver** — starts and becomes ready to answer queries.
+5. **iptables REDIRECT rules** — applied last. Traffic is only redirected into the pipeline once all components are ready to handle it.
+
+### Why this order is safe
+
+The kernel firewall's deny-by-default rules are the first thing applied and the last thing removed. The iptables REDIRECT rules are the gate — no traffic enters the userland pipeline until every component is confirmed ready. During the startup window, the namespace has network access denied entirely, which is the correct default.
+
+### Readiness gates
+
+Each component must signal readiness before the next one in the sequence starts:
+
+* **mitmproxy** — health endpoint returns successfully
+* **Envoy** — admin health endpoint returns successfully
+* **Local DNS resolver** — test query for a known domain resolves successfully
+
+The sandbox daemon orchestrates this sequence and will not proceed to the next step until the current component passes its readiness check.
+
+### Component failure during operation
+
+If a component crashes after the pipeline is fully operational:
+
+* iptables REDIRECT rules remain active — redirected traffic hits a dead port and connections fail
+* this is fail-closed by design — no traffic leaks, connections simply break
+* the sandbox daemon detects the failure via health probes and reports degraded status
+* the sandbox daemon may attempt to restart the failed component without restarting the entire sandbox
+
+Traffic is never silently rerouted or allowed to bypass the pipeline due to a component failure.
+
+## Error propagation
+
+### Principle
+
+When the pipeline denies a connection, the sandboxed application should receive a fast, informative error rather than a silent timeout. Different pipeline layers produce different error signals, but the design preference is immediate failure with useful feedback for the application and full context in logs for the operator.
+
+### Error behavior by layer
+
+**Kernel firewall (nftables):**
+
+* use REJECT (TCP RST for TCP, ICMP unreachable for UDP) rather than DROP where possible
+* REJECT gives the application immediate feedback; DROP causes timeouts
+* exception: DROP may be appropriate for security-sensitive cases where revealing policy structure is undesirable
+
+**Local DNS resolver:**
+
+* return NXDOMAIN for non-allowed domains
+* the application sees "unknown host" — a clean, fast, and familiar error that is typically surfaced clearly by applications
+
+**Envoy:**
+
+* denied connections receive a TCP RST (connection reset)
+* this is Envoy's default behavior for connections that do not match any allowed filter chain
+* the application sees an immediate connection failure
+
+**mitmproxy:**
+
+* denied HTTP requests receive an HTTP error response (e.g., 403)
+* the application receives a real HTTP response it can interpret programmatically
+* the response should not leak internal policy details
+
+### Logging
+
+Every denial at every layer is logged with full context:
+
+* source address and port
+* intended destination and port
+* protocol
+* policy rule that triggered the denial
+* assurance level (if applicable)
+* layer that produced the denial
+
+The application receives a terse error. The audit log receives the full story.
+
 ## Logging and audit requirements
 
 Every connection attempt should be attributable to one of the policy outcomes.
@@ -913,18 +1011,35 @@ A dedicated sandbox daemon serves as the single source of truth for sandbox netw
 
 Time synchronization is a host responsibility. Sandbox containers inherit the host system clock — this is standard Docker behavior, not a network concern. The sandbox networking subsystem does not need to provide NTP access or any time-synchronization path.
 
-## Recommended policy doctrine
+### Policy compilation error handling
 
-1. Default deny everything
-2. Permit only traffic explicitly allowed by policy
-3. Treat inspected HTTP(S) as the standard allowed mode
-4. Treat every non-inspected mode as an explicit bypass
-5. Prefer narrow bypasses over broad capability grants
-6. Never confuse destination reachability with semantic safety
-7. Log all bypasses prominently
-8. Treat relay-capable allowed services as high-risk trust decisions
-9. Keep host-level enforcement request-aware for HTTP
-10. Fail closed
+Policy compilation is an all-or-nothing operation. Either the entire policy compiles successfully to all backend configurations, or it is rejected in full. No partial application is permitted.
+
+Rationale: a half-applied policy is worse than no policy. It creates a false sense of security where some rules are enforced and others are silently missing. Fail-fast is the only safe default.
+
+Compilation validates in two phases:
+
+**Schema validation:**
+
+* the policy document structure conforms to the declared schema version
+* all required fields are present and correctly typed
+* assurance levels are valid
+* referenced protocol classes are recognized
+
+**Semantic validation:**
+
+* every rule can be compiled to every relevant backend — if a rule cannot be expressed in a required backend, compilation fails
+* no internal contradictions exist (e.g., the same destination declared at conflicting assurance levels)
+* assurance levels are consistent with declared protocol classes (e.g., UDP traffic cannot be declared at level 4)
+* bypass entries have required metadata (reason, assurance level)
+
+On failure, the sandbox daemon reports:
+
+* which rule failed validation
+* which backend could not express the rule (if applicable)
+* why the compilation failed
+
+DNS resolution failures are not compilation errors. Policy is expressed in domain names. Domain-to-IP resolution is a runtime control-plane concern, not a compile-time concern.
 
 ## Implementation guidance derived from the design
 
