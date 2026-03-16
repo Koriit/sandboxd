@@ -910,9 +910,10 @@ When the pipeline denies a connection, the sandboxed application should receive 
 
 **mitmproxy:**
 
-* denied HTTP requests receive an HTTP error response (e.g., 403)
-* the application receives a real HTTP response it can interpret programmatically
-* the response should not leak internal policy details
+* denied HTTP requests receive an HTTP 599 response (non-standard)
+* 599 is deliberately non-standard — no upstream server would send it, making it immediately recognizable as a sandbox policy denial
+* the response body should explicitly identify the denial as a sandbox policy decision
+* the response should not leak internal policy details beyond the fact that the request was denied
 
 ### Logging
 
