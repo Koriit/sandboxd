@@ -43,7 +43,7 @@ This subsystem reduces risk. It does not eliminate it.
    All network traffic from the sandbox namespace must pass through one controlled interception and policy pipeline.
 
 3. **Policy is abstract**
-   The sandbox policy must describe **intent** and **assurance level**, not the internal mechanics of Envoy, mitmproxy, iptables, or nftables.
+   The sandbox policy must describe **intent** and **assurance level**, not the internal mechanics of Envoy, mitmproxy, or nftables.
 
 4. **HTTP is the only real happy path**
    The only fully supported and strongly verified outbound mode is:
@@ -79,7 +79,7 @@ network namespace
     ↓
 kernel firewall (deny by default)
     ↓
-iptables REDIRECT
+nftables redirect
     ├─ DNS → local resolver (policy-aware, logging)
     ├─ TCP → Envoy (original_dst, protocol-aware routing)
     │       ├─ HTTP(S) → mitmproxy → destination
@@ -93,7 +93,7 @@ iptables REDIRECT
 
 Provides isolation from the host network stack and ensures the sandbox has a single controlled outbound path.
 
-#### Kernel firewall (nftables + iptables)
+#### Kernel firewall (nftables)
 
 Provides hard enforcement and transparent interception:
 
@@ -106,11 +106,11 @@ Provides hard enforcement and transparent interception:
 * loopback/local exemptions where required
 * IPv4 and IPv6 parity
 
-**iptables REDIRECT** performs transparent interception at the kernel level:
+**nftables redirect** performs transparent interception at the kernel level:
 
 * DNS traffic (TCP/UDP port 53) is redirected to the local resolver
 * TCP traffic is redirected to Envoy's listener, which uses the `original_dst` listener filter to recover the real destination from the redirected socket
-* UDP traffic is handled purely by nftables rules (IP/port allow/deny) — no userland proxy is involved
+* UDP traffic is handled purely by nftables rules (IP/port allow/deny) — no userland proxy is involved. The local DNS resolver is not an exception: it is an actual destination (resolv.conf points applications to it directly), not a proxy in the UDP path. nftables enforces that port 53 traffic can only reach the local resolver; all other port 53 traffic is denied
 
 This eliminates the need for userland transparent interception proxies. The kernel handles the redirect, and Envoy recovers the original destination natively.
 
@@ -122,7 +122,7 @@ A local DNS resolver runs inside the namespace and serves as the single enforced
 * **query logging**: all DNS queries are logged, providing domain→IP correlation for audit trails
 * **enforced path**: nftables rules redirect all DNS traffic to the local resolver — no alternate resolver paths are possible
 
-The resolver is the bridge between domain-based policy and IP-based enforcement. When policy permits a domain, the resolver both answers the query and makes the resolved IP available to the sandbox daemon for nftables rule updates.
+The resolver is the bridge between domain-based policy and IP-based enforcement. When policy permits a domain, the resolver both answers the query and makes the resolved IP available to the sandbox daemon for propagation to all enforcement components that operate on IP addresses.
 
 **ECH stripping:** The local DNS resolver strips HTTPS/SVCB records that carry ECHConfig from DNS responses by default. This prevents clients from learning the server's Encrypted Client Hello public key, forcing a fallback to standard TLS with plaintext SNI. This is necessary because ECH encrypts the entire inner ClientHello — including SNI — using the server's public key, which defeats both SNI-based routing at Envoy and TLS interception at mitmproxy. ECH stripping applies only to level 4 (HTTP inspected) destinations. Level 2 and level 3 destinations are not affected — ECH configs are left intact since interception is not performed. ECH stripping is enabled by default because without it, increasing ECH adoption would silently break HTTP inspection for destinations that previously worked, producing confusing TLS handshake errors with no clear cause.
 
@@ -130,7 +130,7 @@ The resolver is the bridge between domain-based policy and IP-based enforcement.
 
 Receives redirected TCP connections and provides protocol-aware routing and bypass classification:
 
-* uses the `original_dst` listener filter to recover the real destination from iptables-redirected connections
+* uses the `original_dst` listener filter to recover the real destination from nftables-redirected connections
 * listener filter chains that classify traffic by protocol, not by peeking for a TLS ClientHello
 * explicit separation of TLS-verified from transport-only based on declared policy
 * SNI extraction and validation for connections that are natively TLS
@@ -226,7 +226,7 @@ The policy model must **not** expose internal components such as:
 
 * Envoy listener/filter/cluster configuration
 * mitmproxy ignore lists
-* nftables/iptables rules
+* nftables rules
 * DNS resolver configuration
 * routing tables
 
@@ -475,7 +475,7 @@ Use loopback for local data-plane plumbing where necessary, but prefer:
 
 ## Kernel firewall requirements
 
-The kernel firewall (nftables + iptables) is the hard enforcement layer and the transparent interception mechanism.
+The kernel firewall (nftables) is the hard enforcement layer and the transparent interception mechanism.
 
 ### Must enforce
 
@@ -492,8 +492,8 @@ The kernel firewall (nftables + iptables) is the hard enforcement layer and the 
 
 ### Must provide
 
-* iptables REDIRECT rules to route TCP traffic to Envoy
-* iptables REDIRECT rules to route DNS traffic to the local resolver
+* nftables redirect rules to route TCP traffic to Envoy
+* nftables redirect rules to route DNS traffic to the local resolver
 * nftables rules for UDP allow/deny (IP/port based)
 * loopback exemptions
 * self-traffic exemptions for Envoy and mitmproxy
@@ -518,11 +518,11 @@ There must be exactly one approved DNS resolution path inside the sandbox.
 
 ### DNS resolution for policy enforcement
 
-Policy is expressed in terms of domain names, but enforcement components (nftables) operate on IP addresses. The local DNS resolver bridges this gap:
+Policy is expressed in terms of domain names, but some enforcement components operate on IP addresses. The local DNS resolver bridges this gap:
 
 * the local resolver is the only DNS path available inside the namespace — nftables redirects all DNS traffic to it
 * non-allowed domains receive NXDOMAIN — the resolver enforces policy at the DNS layer
-* for allowed domains, resolution results are reported to the sandbox daemon, which maintains TTL-aware IP-to-domain mappings and pushes updated nftables rules
+* for allowed domains, resolution results are reported to the sandbox daemon, which maintains TTL-aware IP-to-domain mappings and pushes configuration updates to all enforcement components that operate on IP addresses
 * re-resolution occurs when DNS TTL expires, with a configurable maximum interval (e.g., 60 seconds) as an upper bound regardless of TTL — domains with very long TTLs must not leave stale IPs in place indefinitely
 * on resolution failure: immediately remove the previously resolved IPs for the affected domain (fail-closed), log the failure, and reflect the failure in the sandbox health status — stale IPs from domains that no longer resolve are a potential attack vector (e.g., IP takeover) and must not persist
 * all DNS queries are logged for audit trail purposes, providing domain→IP correlation that supports connection attribution
@@ -544,6 +544,27 @@ Therefore DNS is only an input to policy, never final proof.
 There is an inherent window between when a domain's IP address changes and when the control plane re-resolves and pushes the update. During this window, traffic to the old IP remains permitted while traffic to the new IP is not yet allowed.
 
 This is a known limitation of any DNS-based policy system. TTL-aware resolution minimizes the window but cannot eliminate it entirely. The design accepts this trade-off. Policy authors should be aware that IP-level enforcement is eventually consistent with DNS, not instantaneous.
+
+### Connection termination on IP rotation
+
+When DNS re-resolution produces new IPs and old IPs are removed from enforcement components, existing connections to the old IPs are terminated immediately. There is no grace period or connection draining.
+
+Rationale:
+
+* an old IP may no longer belong to the intended service — allowing continued communication risks connecting to a different host (IP takeover)
+* this is consistent with the fail-closed philosophy applied to DNS resolution failure
+* the sandbox is not a production runtime — brief connection interruptions are acceptable by design
+* applications that need resilience will retry naturally
+
+### DNS-over-TLS and DNS-over-HTTPS
+
+DNS-over-TLS (DoT, port 853) is blocked by nftables unless explicitly allowed. No special handling is required.
+
+DNS-over-HTTPS (DoH) operates over port 443 and is indistinguishable from normal HTTPS traffic at the network level. If an application sends DoH queries to an allowed HTTPS destination (e.g., a public DNS provider that is also in the allow list), it can resolve domain names outside the local resolver's control.
+
+This does not expand the application's network reach — resolved IPs must still be present in the nftables allow list to be reachable. However, it bypasses the local resolver's query logging and NXDOMAIN enforcement, creating a gap in audit trails.
+
+DoH is accepted as a residual risk. Operators who require complete DNS audit coverage can block known DoH providers at the policy level.
 
 ## SNI model
 
@@ -662,6 +683,8 @@ The sandbox does not attempt to validate or restrict the final destination behin
 * inconsistent with the trust boundary — no other allowed service is policed for what it does on behalf of the application
 * unreliable — the proxy could relay anywhere regardless of what the CONNECT target declares
 * already addressed by the relay-capable services classification
+
+CONNECT validation is performed by mitmproxy, which is the only component in the pipeline with HTTP-level visibility. Envoy forwards level 4 traffic to mitmproxy without parsing HTTP semantics. When mitmproxy receives a CONNECT request, it checks whether the target is declared as an upstream proxy in policy. If not, the request is denied with an HTTP 599 response.
 
 ## Transport and protocol classes
 
@@ -809,7 +832,7 @@ This includes failures of:
 
 * namespace plumbing
 * routing setup
-* iptables/nftables rules
+* nftables rules
 * local DNS resolver
 * Envoy (if Envoy crashes, redirected TCP connections fail — the kernel firewall ensures no direct egress is possible regardless)
 * mitmproxy
@@ -821,7 +844,7 @@ This includes failures of:
 
 Each enforcement component in the pipeline must expose or support a liveness probe:
 
-* **iptables/nftables** — rule verification (expected chains and redirect rules are present and active)
+* **nftables** — rule verification (expected chains and redirect rules are present and active)
 * **local DNS resolver** — test resolution of a known-allowed domain
 * **Envoy** — admin health endpoint
 * **mitmproxy** — health endpoint
@@ -842,7 +865,7 @@ The system must **not** automatically terminate the sandbox on health-check fail
 
 ### End-to-end pipeline verification
 
-Per-component probes do not guarantee that traffic is actually being proxied through the full pipeline. A true end-to-end probe — originating from within the sandbox network namespace and traversing the complete chain (iptables REDIRECT → Envoy → mitmproxy → destination) — would provide stronger assurance.
+Per-component probes do not guarantee that traffic is actually being proxied through the full pipeline. A true end-to-end probe — originating from within the sandbox network namespace and traversing the complete chain (nftables redirect → Envoy → mitmproxy → destination) — would provide stronger assurance.
 
 This is recognized as a future enhancement. The design for an end-to-end health-check mechanism is documented separately. Per-component probes are sufficient for initial implementation and provide actionable diagnostics without introducing additional attack surface.
 
@@ -860,11 +883,11 @@ Components start outside-in — the outermost enforcement layer first, the traff
 2. **mitmproxy** — starts and becomes ready to receive forwarded HTTP(S) traffic from Envoy.
 3. **Envoy** — starts and becomes ready to receive redirected TCP traffic. Can route to mitmproxy, which is already available.
 4. **Local DNS resolver** — starts and becomes ready to answer queries.
-5. **iptables REDIRECT rules** — applied last. Traffic is only redirected into the pipeline once all components are ready to handle it.
+5. **nftables redirect rules** — applied last. Traffic is only redirected into the pipeline once all components are ready to handle it.
 
 ### Why this order is safe
 
-The kernel firewall's deny-by-default rules are the first thing applied and the last thing removed. The iptables REDIRECT rules are the gate — no traffic enters the userland pipeline until every component is confirmed ready. During the startup window, the namespace has network access denied entirely, which is the correct default.
+The kernel firewall's deny-by-default rules are the first thing applied and the last thing removed. The nftables redirect rules are the gate — no traffic enters the userland pipeline until every component is confirmed ready. During the startup window, the namespace has network access denied entirely, which is the correct default.
 
 ### Readiness gates
 
@@ -880,12 +903,24 @@ The sandbox daemon orchestrates this sequence and will not proceed to the next s
 
 If a component crashes after the pipeline is fully operational:
 
-* iptables REDIRECT rules remain active — redirected traffic hits a dead port and connections fail
+* nftables redirect rules remain active — redirected traffic hits a dead port and connections fail
 * this is fail-closed by design — no traffic leaks, connections simply break
 * the sandbox daemon detects the failure via health probes and reports degraded status
 * the sandbox daemon may attempt to restart the failed component without restarting the entire sandbox
 
 Traffic is never silently rerouted or allowed to bypass the pipeline due to a component failure.
+
+### Shutdown order
+
+Shutdown is the reverse of startup — the traffic gate is removed first, the backstop last:
+
+1. **nftables redirect rules** — removed first. No new traffic enters the pipeline.
+2. **Local DNS resolver** — stopped. No new DNS queries are answered.
+3. **Envoy** — stopped. No new TCP connections are routed.
+4. **mitmproxy** — stopped.
+5. **nftables deny-by-default rules** — removed last. The backstop remains until all components are down.
+
+This mirrors the startup logic: the redirect rules are the gate that controls whether traffic enters the pipeline. Removing them first ensures no new connections are initiated while components shut down. The deny-by-default rules remain as the final safety net until the namespace is fully torn down.
 
 ## Error propagation
 
@@ -998,9 +1033,9 @@ A dedicated sandbox daemon serves as the single source of truth for sandbox netw
 ### Responsibilities
 
 * accept abstract policy documents as input — the same documents authored by users
-* compile abstract policy into component-specific configurations: nftables/iptables rules, local DNS resolver policy, Envoy listener/filter/cluster config, mitmproxy rules
+* compile abstract policy into component-specific configurations: nftables rules, local DNS resolver policy, Envoy listener/filter/cluster config, mitmproxy rules
 * manage the local DNS resolver's policy (allowed domains, NXDOMAIN for denied domains)
-* receive resolution results from the local resolver and push updated IP-based rules to nftables
+* receive resolution results from the local resolver and push updated IP-based configuration to all enforcement components that operate on IP addresses
 * distribute generated configuration to all running enforcement components
 * ensure no enforcement component is hand-configured — all configuration is generated from the abstract policy
 * manage lifecycle of per-sandbox networking stacks (namespace, firewall rules, resolver, Envoy, mitmproxy)
@@ -1046,17 +1081,33 @@ On failure, the sandbox daemon reports:
 
 DNS resolution failures are not compilation errors. Policy is expressed in domain names. Domain-to-IP resolution is a runtime control-plane concern, not a compile-time concern.
 
+### Policy distribution and hot-reload
+
+The all-or-nothing guarantee extends from compilation to distribution. When a policy update is applied at runtime, the sandbox daemon distributes the new configuration to components in outside-in order:
+
+1. **nftables deny/allow rules** — updated first
+2. **mitmproxy** — reconfigured
+3. **Envoy** — reconfigured
+4. **Local DNS resolver** — reconfigured
+5. **nftables redirect rules** — updated last
+
+If any component fails to accept the new configuration, the sandbox daemon rolls back all previously updated components to their prior configuration. No partial policy state is permitted — either the entire update succeeds across all components or the sandbox remains on the previous policy.
+
+In-flight connections to destinations removed by the new policy are terminated immediately, consistent with the connection termination behavior during IP rotation.
+
+The sandbox daemon reports the outcome of every policy update: success, or failure with the component that rejected the configuration and the rollback status.
+
 ## Implementation guidance derived from the design
 
 ### What the backend stack should do
 
-#### Kernel firewall (nftables + iptables)
+#### Kernel firewall (nftables)
 
 * enforce deny-by-default for all protocols
 * deny ICMP and tunneling protocols (GRE, IPIP, WireGuard, etc.)
 * permit only TCP and UDP
-* redirect DNS traffic to the local resolver via iptables REDIRECT
-* redirect TCP traffic to Envoy via iptables REDIRECT
+* redirect DNS traffic to the local resolver via nftables redirect
+* redirect TCP traffic to Envoy via nftables redirect
 * enforce UDP allow/deny rules (IP/port) via nftables
 * ensure no direct egress is possible outside the policy path
 
@@ -1064,12 +1115,12 @@ DNS resolution failures are not compilation errors. Policy is expressed in domai
 
 * resolve only policy-permitted domains; return NXDOMAIN for all others
 * log all queries for audit trail (domain→IP correlation)
-* report resolution results to the sandbox daemon for nftables rule updates
+* report resolution results to the sandbox daemon for propagation to all IP-dependent enforcement components
 * serve as the single DNS path — no alternate resolvers reachable
 
 #### Envoy
 
-* use the `original_dst` listener filter to recover real destinations from iptables-redirected connections
+* use the `original_dst` listener filter to recover real destinations from nftables-redirected connections
 * classify connections into inspection, TLS-verified, or transport-only based on declared policy — not by peeking for ClientHello
 * extract and validate SNI for natively-TLS connections
 * use builtin protocol filters where available (e.g., PostgreSQL proxy filter) for protocol-aware TLS handling
@@ -1101,6 +1152,7 @@ Even with correct implementation, the following residual risks remain:
 * application compatibility may pressure policy toward broader exceptions
 * user misunderstanding may overestimate the guarantees of “allowed” traffic
 * increasing ECH adoption may force more destinations to level 2 bypasses as servers begin mandating ECH, reducing the proportion of traffic that can be inspected at level 4
+* DNS-over-HTTPS (DoH) to allowed destinations bypasses the local resolver's query logging and NXDOMAIN enforcement, though it does not expand network reach beyond what policy already permits
 
 These are not implementation bugs. They are the natural limits of the problem space.
 
@@ -1110,7 +1162,7 @@ This subsystem defines a sandbox network architecture in which:
 
 * all traffic is captured in a dedicated namespace
 * all traffic is denied by default — only TCP and UDP are supported; ICMP and tunneling protocols are explicitly denied
-* iptables REDIRECT transparently intercepts traffic at the kernel level, with Envoy recovering original destinations via `original_dst`
+* nftables redirect transparently intercepts traffic at the kernel level, with Envoy recovering original destinations via `original_dst`
 * a local DNS resolver enforces policy at the DNS layer and provides query logging for audit trails
 * UDP policy is enforced purely by nftables (IP/port allow/deny) with no userland proxy
 * the only normal allowed mode is inspected HTTP(S)
