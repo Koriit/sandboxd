@@ -6,7 +6,7 @@ Future enhancement — not part of initial implementation.
 
 ## Context
 
-The network-control subsystem uses per-component liveness probes for health monitoring (see networking-design.md). These probes verify that individual components (iptables/nftables rules, local DNS resolver, Envoy, mitmproxy, sandbox daemon) are alive but do not guarantee that traffic is actually being proxied through the full pipeline.
+The network-control subsystem uses per-component liveness probes for health monitoring (see networking-design.md). These probes verify that individual components (nftables rules, local DNS resolver, Envoy, mitmproxy, sandbox daemon) are alive but do not guarantee that traffic is actually being proxied through the full pipeline.
 
 This document describes an end-to-end health-check mechanism that provides stronger assurance by exercising the complete data path.
 
@@ -28,7 +28,7 @@ The container does not have access to the control plane, sandbox daemon APIs, or
 
 1. A probe process is spawned in the sandbox network namespace (not inside the sandboxed container)
 2. The probe makes an HTTPS request to the health-check container
-3. The request traverses the full pipeline: iptables REDIRECT → Envoy → mitmproxy → health-check container
+3. The request traverses the full pipeline: nftables redirect → Envoy → mitmproxy → health-check container
 4. The health-check container updates the status file on successful receipt
 5. The sandbox daemon reads the status file to determine pipeline health
 
