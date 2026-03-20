@@ -4,6 +4,43 @@
 
 Draft for implementation.
 
+## Table of contents
+
+- [Purpose](#purpose)
+- [Non-goals](#non-goals)
+- [Core design principles](#core-design-principles)
+- [High-level architecture](#high-level-architecture)
+- [Policy outcomes](#policy-outcomes)
+- [Policy evaluation model](#policy-evaluation-model)
+- [Assurance levels](#assurance-levels)
+- [Layer responsibilities](#layer-responsibilities)
+- [Threat model](#threat-model)
+- [Security boundary](#security-boundary)
+- [Policy model](#policy-model)
+- [Fundamental design rule](#fundamental-design-rule)
+- [Why HTTP is the only happy path](#why-http-is-the-only-happy-path)
+- [Bypass framework](#bypass-framework)
+- [Namespace model](#namespace-model)
+- [Kernel firewall requirements](#kernel-firewall-requirements)
+- [DNS model](#dns-model)
+- [SNI model](#sni-model)
+- [HTTP model](#http-model)
+- [Certificate management](#certificate-management)
+- [Upstream proxy support](#upstream-proxy-support)
+- [Transport and protocol classes](#transport-and-protocol-classes)
+- [Escape-pattern assumptions and responses](#escape-pattern-assumptions-and-responses)
+- [Relay-capable services and trust amplification](#relay-capable-services-and-trust-amplification)
+- [Fail-closed requirement](#fail-closed-requirement)
+- [Health monitoring](#health-monitoring)
+- [Component lifecycle and startup ordering](#component-lifecycle-and-startup-ordering)
+- [Error propagation](#error-propagation)
+- [Logging and audit requirements](#logging-and-audit-requirements)
+- [Policy authoring requirements](#policy-authoring-requirements)
+- [Control plane / sandbox daemon](#control-plane--sandbox-daemon)
+- [Implementation guidance derived from the design](#implementation-guidance-derived-from-the-design)
+- [Residual risks](#residual-risks)
+- [Final design summary](#final-design-summary)
+
 ## Purpose
 
 This document defines the **network-control subsystem** of the sandbox.
@@ -31,6 +68,7 @@ This subsystem does **not** guarantee:
 * that compatibility can be achieved for every application without bypasses
 * that arbitrary software can safely use the internet merely because direct egress is blocked
 * that the mediation pipeline will have low latency or high throughput — this is a sandbox for running untrusted code, not a production service runtime; performance overhead from mediation is accepted by design
+* that ingress connections to the sandbox are controllable — inbound connections are denied by default and controllable ingress policy is a future enhancement not covered by this design
 
 This subsystem reduces risk. It does not eliminate it.
 
@@ -59,8 +97,8 @@ This subsystem reduces risk. It does not eliminate it.
 6. **Bypasses are first-class policy objects**
    A bypass is not an implementation accident. It is an explicit decision with known security consequences.
 
-7. **Multiple assurance levels**
-   Not all allowed traffic has the same security meaning. The system must model this clearly.
+7. **Four assurance levels**
+   Not all allowed traffic has the same security meaning. The system models this with four levels (0–3), from denied to fully inspected.
 
 8. **Transparent to applications where possible**
    Applications should, where possible, behave as though they are making ordinary outbound connections. The sandbox mediates beneath them.
@@ -87,7 +125,100 @@ nftables redirect
     └─ UDP → nftables (IP/port allow/deny)
 ```
 
-### Layer responsibilities
+## Policy outcomes
+
+Every attempted outbound flow must resolve to exactly one outcome:
+
+1. **Deny** (level 0)
+2. **Allow at transport-only level** (level 1) — TCP or UDP
+3. **Allow at TLS-verified level** (level 2)
+4. **Allow with HTTP inspection** (level 3)
+
+There is no implicit “best effort allow.”
+
+## Policy evaluation model
+
+### Pipeline short-circuit
+
+Policy is evaluated sequentially through the pipeline. Each layer either forwards traffic to the next layer or routes it directly to the destination. Once traffic exits the pipeline at a given layer, downstream layers never see it and their rules are not evaluated.
+
+This means there is no policy conflict resolution. The deny-by-default baseline combined with the fixed pipeline order makes ambiguous overlaps impossible. If a domain is declared as a TLS-verified bypass, its traffic exits at Envoy — any mitmproxy rules that might reference the same domain are never reached. They are irrelevant, not overridden.
+
+### Assurance level determines exit point
+
+The declared assurance level in policy determines which pipeline layer is the terminal decision point for a given flow:
+
+| Assurance level | Exit point | Downstream layers |
+|---|---|---|
+| Level 0 — Denied | Any layer (kernel firewall is backstop) | N/A |
+| Level 1 — Transport-only (UDP) | nftables | Envoy and mitmproxy are not involved |
+| Level 1 — Transport-only (TCP) | Envoy | mitmproxy is not involved |
+| Level 2 — TLS-verified | Envoy | mitmproxy is not involved |
+| Level 3 — HTTP inspected | mitmproxy | Full pipeline traversal |
+
+## Assurance levels
+
+The assurance level indicates how much the sandbox can verify about a connection. Lower levels mean less verification by the sandbox — and therefore require greater trust in the destination. At level 3, the sandbox verifies request-level identity and enforces fine-grained policy, so minimal trust in the destination is needed. At level 1, the sandbox can only gate by IP and port, so the operator must trust that the destination itself is safe. Level 0 would require infinite trust — which is impossible to justify — so it is denied.
+
+### Level 0 — Denied
+
+The flow is not permitted.
+
+### Level 1 — Transport-only
+
+Lowest assurance. The connection is opaque — no TLS is expected or required. The transport protocol (TCP or UDP) is a required property of the policy entry; nftables requires the protocol to generate rules.
+
+Conditions:
+
+* traffic is allowed as a generic transport capability (TCP or UDP)
+* no TLS is assumed — the wire protocol is opaque
+* identity is limited to IP/port
+* application semantics are entirely invisible
+* only narrowly approved use cases are allowed
+
+For UDP: exits at nftables (IP/port allow/deny) — no userland proxy is involved. UDP is connectionless and inherently harder to attribute.
+
+For TCP: exits at Envoy, which forwards it as opaque TCP. TCP has connection state but the sandbox cannot verify anything about what flows over the connection.
+
+Both share the same assurance: opaque semantics, identity limited to IP/port, application semantics invisible. The transport protocol is a property of the connection, not a different assurance level.
+
+Key distinction from TLS-verified: no encryption is expected or verified. This is a raw capability grant to reach a specific endpoint.
+
+### Level 2 — TLS-verified
+
+Moderate assurance. The connection uses TLS and connection-level identity is verified, but HTTP inspection is not performed.
+
+Conditions:
+
+* the policy declares that this destination is allowed at TLS-verified level
+* the connection is natively TLS (ClientHello is the first message on the wire) **or** Envoy handles TLS negotiation via a protocol-specific network filter for explicitly supported STARTTLS protocols (e.g., PostgreSQL via builtin filter)
+* SNI is extracted and validated when present in natively-TLS connections
+* for STARTTLS-style protocols, the network filter participates in the protocol handshake and upgrades to TLS at the correct point — SNI may still not be available, but the proxy has protocol-level awareness of the connection
+* request-level HTTP semantics are not available
+
+Key distinction from transport-only: the system knows TLS is in use and the policy explicitly requires it. The connection carries encrypted traffic to a declared TLS-capable service.
+
+Typical reasons:
+
+* non-HTTP TLS protocol (databases, mail, custom protocols)
+* certificate pinning or custom trust store prevents HTTP interception
+* application cannot trust the interception CA
+
+### Level 3 — HTTP inspected
+
+Strongest supported assurance.
+
+Conditions:
+
+* HTTP or HTTPS only
+* TLS interception succeeds when HTTPS is used
+* request-level host identity is visible
+* `Host` or `:authority` validated per request
+* policy can enforce method/path/headers/body if needed
+
+This is the only true “happy path.”
+
+## Layer responsibilities
 
 #### Network namespace
 
@@ -108,7 +239,7 @@ Provides hard enforcement and transparent interception:
 
 **nftables redirect** performs transparent interception at the kernel level:
 
-* DNS traffic (TCP/UDP port 53) is redirected to the local resolver
+* DNS traffic (TCP/UDP port 53) is redirected to the local resolver. This serves as a safety net — even applications that ignore resolv.conf or use hardcoded resolver addresses are forced through the local resolver. Well-behaved applications reach the resolver directly via resolv.conf configuration; nftables redirect catches everything else
 * TCP traffic is redirected to Envoy's listener, which uses the `original_dst` listener filter to recover the real destination from the redirected socket
 * UDP traffic is handled purely by nftables rules (IP/port allow/deny) — no userland proxy is involved. The local DNS resolver is not an exception: it is an actual destination (resolv.conf points applications to it directly), not a proxy in the UDP path. nftables enforces that port 53 traffic can only reach the local resolver; all other port 53 traffic is denied
 
@@ -124,7 +255,7 @@ A local DNS resolver runs inside the namespace and serves as the single enforced
 
 The resolver is the bridge between domain-based policy and IP-based enforcement. When policy permits a domain, the resolver both answers the query and makes the resolved IP available to the sandbox daemon for propagation to all enforcement components that operate on IP addresses.
 
-**ECH stripping:** The local DNS resolver strips HTTPS/SVCB records that carry ECHConfig from DNS responses by default. This prevents clients from learning the server's Encrypted Client Hello public key, forcing a fallback to standard TLS with plaintext SNI. This is necessary because ECH encrypts the entire inner ClientHello — including SNI — using the server's public key, which defeats both SNI-based routing at Envoy and TLS interception at mitmproxy. ECH stripping applies only to level 4 (HTTP inspected) destinations. Level 2 and level 3 destinations are not affected — ECH configs are left intact since interception is not performed. ECH stripping is enabled by default because without it, increasing ECH adoption would silently break HTTP inspection for destinations that previously worked, producing confusing TLS handshake errors with no clear cause.
+**ECH stripping:** The local DNS resolver strips HTTPS/SVCB records that carry ECHConfig from DNS responses by default. This prevents clients from learning the server's Encrypted Client Hello public key, forcing a fallback to standard TLS with plaintext SNI. This is necessary because ECH encrypts the entire inner ClientHello — including SNI — using the server's public key, which defeats both SNI-based routing at Envoy and TLS interception at mitmproxy. ECH stripping applies to level 2 (TLS-verified) and level 3 (HTTP inspected) destinations. Level 2 requires SNI extraction and validation, which ECH also defeats. Level 1 (transport-only) destinations are not affected — they do not depend on TLS or SNI. ECH stripping is enabled by default because without it, increasing ECH adoption would silently break HTTP inspection for destinations that previously worked, producing confusing TLS handshake errors with no clear cause.
 
 #### Envoy
 
@@ -143,11 +274,11 @@ Why Envoy over HAProxy: not every TLS-capable protocol begins with a TLS ClientH
 
 **Classification mechanism:** Envoy does not inspect first bytes to guess the protocol class. The sandbox daemon compiles each destination's declared assurance level into Envoy's filter chain configuration. Filter chains match on destination IP and port and apply the behavior declared in policy:
 
-* level 4 destinations: route to mitmproxy for HTTP inspection
-* level 3 destinations: expect TLS, extract and validate SNI, forward directly to destination
-* level 2 destinations: forward as opaque TCP with no TLS assumption
+* level 3 destinations: route to mitmproxy for HTTP inspection
+* level 2 destinations: expect TLS, extract and validate SNI, forward directly to destination
+* level 1 (TCP) destinations: forward as opaque TCP with no TLS assumption
 
-If wire behavior contradicts the declared level (e.g., a level 3 destination sends no TLS ClientHello), the connection is denied. Policy drives classification, not protocol sniffing.
+If wire behavior contradicts the declared level (e.g., a level 2 destination sends no TLS ClientHello), the connection is denied. Policy drives classification, not protocol sniffing.
 
 #### mitmproxy
 
@@ -176,8 +307,6 @@ Assume sandboxed code may be:
 Assume the sandbox must defend primarily against:
 
 * unsanctioned direct egress
-* hidden DNS resolution paths
-* protocol tunneling over allowed ports
 * misuse of shared-IP or CDN-hosted services
 * use of upstream proxies or relay APIs to broaden reach
 * accidental over-permissiveness caused by policy confusion
@@ -232,101 +361,6 @@ The policy model must **not** expose internal components such as:
 
 Those are backend implementation artifacts.
 
-## Policy outcomes
-
-Every attempted outbound flow must resolve to exactly one outcome:
-
-1. **Deny** (level 0)
-2. **Allow at UDP level** (level 1)
-3. **Allow at transport-only level** (level 2)
-4. **Allow at TLS-verified level** (level 3)
-5. **Allow with HTTP inspection** (level 4)
-
-There is no implicit “best effort allow.”
-
-## Policy evaluation model
-
-### Pipeline short-circuit
-
-Policy is evaluated sequentially through the pipeline. Each layer either forwards traffic to the next layer or routes it directly to the destination. Once traffic exits the pipeline at a given layer, downstream layers never see it and their rules are not evaluated.
-
-This means there is no policy conflict resolution. The deny-by-default baseline combined with the fixed pipeline order makes ambiguous overlaps impossible. If a domain is declared as a TLS-verified bypass, its traffic exits at Envoy — any mitmproxy rules that might reference the same domain are never reached. They are irrelevant, not overridden.
-
-### Assurance level determines exit point
-
-The declared assurance level in policy determines which pipeline layer is the terminal decision point for a given flow:
-
-| Assurance level | Exit point | Downstream layers |
-|---|---|---|
-| Level 0 — Denied | Any layer (kernel firewall is backstop) | N/A |
-| Level 1 — UDP | nftables | Envoy and mitmproxy are not involved |
-| Level 2 — Transport-only | Envoy | mitmproxy is not involved |
-| Level 3 — TLS-verified | Envoy | mitmproxy is not involved |
-| Level 4 — HTTP inspected | mitmproxy | Full pipeline traversal |
-
-## Assurance levels
-
-### Level 0 — Denied
-
-The flow is not permitted.
-
-### Level 1 — UDP
-
-Weakest assurance.
-
-Conditions:
-
-* service identity is often weak
-* protocol semantics may be opaque
-* only narrowly approved use cases are allowed
-
-### Level 2 — Transport-only
-
-Low assurance. The connection is plain TCP — no TLS is expected or required.
-
-Conditions:
-
-* traffic is allowed as a generic TCP capability
-* no TLS is assumed — the wire protocol is opaque
-* identity is limited to IP/port
-* application semantics are entirely opaque
-
-Key distinction from TLS-verified: no encryption is expected or verified. This is a raw capability grant to reach a specific TCP endpoint. The system cannot verify anything about what flows over the connection.
-
-### Level 3 — TLS-verified
-
-Moderate assurance. The connection uses TLS and connection-level identity is verified, but HTTP inspection is not performed.
-
-Conditions:
-
-* the policy declares that this destination is allowed at TLS-verified level
-* the connection is natively TLS (ClientHello is the first message on the wire) **or** Envoy handles TLS negotiation via a protocol-specific network filter for explicitly supported STARTTLS protocols (e.g., PostgreSQL via builtin filter)
-* SNI is extracted and validated when present in natively-TLS connections
-* for STARTTLS-style protocols, the network filter participates in the protocol handshake and upgrades to TLS at the correct point — SNI may still not be available, but the proxy has protocol-level awareness of the connection
-* request-level HTTP semantics are not available
-
-Key distinction from transport-only: the system knows TLS is in use and the policy explicitly requires it. The connection carries encrypted traffic to a declared TLS-capable service.
-
-Typical reasons:
-
-* non-HTTP TLS protocol (databases, mail, custom protocols)
-* certificate pinning or custom trust store prevents HTTP interception
-* application cannot trust the interception CA
-
-### Level 4 — HTTP inspected
-
-Strongest supported assurance.
-
-Conditions:
-
-* HTTP or HTTPS only
-* TLS interception succeeds when HTTPS is used
-* request-level host identity is visible
-* `Host` or `:authority` validated per request
-* policy can enforce method/path/headers/body if needed
-
-This is the only true “happy path.”
-
 ## Fundamental design rule
 
 ### HTTP inspection is mandatory by default
@@ -337,11 +371,11 @@ This is true even if the user defines no method/path rules of their own.
 
 Reason:
 
-* SNI is only a connection property
-* actual HTTP target identity is a request property
-* HTTP/2 connection reuse/coalescing allows multiple hostnames over one TLS connection
-* HTTP/1.1 keep-alive also allows request-level host variation
-* therefore host allowlisting cannot rely only on SNI or IP
+* SNI is a connection property. HTTP `Host` / `:authority` is a request property.
+* HTTP/2 multiplexes requests to multiple hosts over a single TLS connection — this is standard protocol behavior, not an attack. A connection legitimately established to an allowed domain (valid SNI) can carry requests targeting different hosts.
+* This is the same class of problem as HTTP-level domain fronting (see [domain fronting analysis in the SNI model](#domain-fronting)), but arising from protocol design rather than malicious intent.
+* Even HTTP/1.1 keep-alive allows host switching between requests on the same connection.
+* Therefore, connection-level checks (SNI, IP) are structurally insufficient for host-level policy — only request-level inspection can enforce it.
 
 So:
 
@@ -365,7 +399,7 @@ Every other traffic class loses one or more of those properties.
 
 ### Definition
 
-A bypass is any policy entry that allows traffic below level 4 (HTTP inspected) — that is, at level 1 (UDP), level 2 (transport-only), or level 3 (TLS-verified) — without full HTTP inspection and request-level verification.
+A bypass is any policy entry that allows traffic below level 3 (HTTP inspected) — that is, at level 1 (transport-only) or level 2 (TLS-verified) — without full HTTP inspection and request-level verification.
 
 Bypasses are valid and necessary. They are not failures of the system. But they must be explicit, logged, and reviewable.
 
@@ -373,26 +407,23 @@ Bypasses are valid and necessary. They are not failures of the system. But they 
 
 1. No implicit bypasses
 2. Every bypass has a declared reason
-3. Every bypass has a declared assurance level (1, 2, or 3)
+3. Every bypass has a declared assurance level (1 or 2)
 4. Every bypass is visible in logs and audits
 5. Bypasses should be as narrow as possible
 6. Bypasses should not be mistaken for fully verified traffic
 
 ### Bypass as policy metadata
 
-A bypass is not a separate classification system. It is a policy entry at a specific assurance level with a documented reason. The assurance levels (0–4) are the only classification needed.
+A bypass is not a separate classification system. It is a policy entry at a specific assurance level with a documented reason. The assurance levels (0–3) are the only classification needed.
 
-Example reasons for level 1 (UDP):
+Example reasons for level 1 (transport-only):
 
 * protocol requires UDP (e.g., DNS to a specific resolver)
-
-Example reasons for level 2 (transport-only):
-
 * protocol requires raw TCP semantics
 * STARTTLS protocol without a supported network filter
 * legacy protocol without TLS support
 
-Example reasons for level 3 (TLS-verified):
+Example reasons for level 2 (TLS-verified):
 
 * certificate pinning prevents HTTP interception
 * custom trust store prevents transparent inspection
@@ -410,11 +441,11 @@ A bypass policy entry should document:
 
 Examples of policy intent:
 
-* allow HTTPS to service X at level 3 (TLS-verified) — reason: certificate pinning
-* allow PostgreSQL to service Y at level 3 (TLS-verified) — reason: non-HTTP TLS protocol
-* allow legacy service Z at level 2 (transport-only) — reason: no TLS support
-* allow UDP to resolver R at level 1 — reason: DNS requires UDP
-* allow explicit upstream HTTP proxy P at level 3 (TLS-verified) — reason: upstream proxy workflow
+* allow HTTPS to service X at level 2 (TLS-verified) — reason: certificate pinning
+* allow PostgreSQL to service Y at level 2 (TLS-verified) — reason: non-HTTP TLS protocol
+* allow legacy service Z at level 1 (transport-only, TCP) — reason: no TLS support
+* allow UDP to resolver R at level 1 (transport-only, UDP) — reason: DNS requires UDP
+* allow explicit upstream HTTP proxy P at level 2 (TLS-verified) — reason: upstream proxy workflow
 
 ## Namespace model
 
@@ -587,6 +618,16 @@ It is not sufficient for final HTTP authorization.
 * no-SNI TLS requires explicit bypass
 * SNI validation is required where applicable, but it is not the final authority for HTTP traffic
 
+### Domain fronting
+
+Domain fronting is a key attack that motivates the combination of SNI validation and HTTP-level host validation. Two variants exist:
+
+**SNI-level fronting:** A shared IP (e.g., a CDN edge) hosts both allowed and disallowed services. The application connects to the shared IP but sets the TLS SNI to a disallowed domain. SNI validation catches this — the SNI does not match any allowed domain and the connection is rejected.
+
+**HTTP-level fronting:** The application sets the TLS SNI to an allowed domain (passing SNI validation) but sets the HTTP `Host` or `:authority` header to a different, disallowed domain. The destination server (e.g., a CDN) routes based on the HTTP header, not the SNI, delivering traffic to the disallowed service. HTTP-level host validation catches this — the mismatch between SNI and the request-level host is detected by mitmproxy.
+
+Neither check alone is sufficient. SNI validation without HTTP inspection misses HTTP-level fronting. HTTP inspection without SNI validation misses connections that never reach mitmproxy (levels below 3). Both checks are required, and they catch different attacks.
+
 ## HTTP model
 
 ### Principle
@@ -594,6 +635,8 @@ It is not sufficient for final HTTP authorization.
 HTTP identity is request-scoped, not connection-scoped.
 
 Therefore:
+
+This is a direct consequence of HTTP/2 connection multiplexing and HTTP/1.1 keep-alive host switching — the same connection may carry requests for different hosts, making connection-level identity (SNI, IP) insufficient. See also the [domain fronting analysis in the SNI model](#domain-fronting).
 
 * HTTP/1 `Host` must be validated per request
 * HTTP/2 `:authority` must be validated per request
@@ -639,7 +682,7 @@ This provides transparent interception for applications that rely on the system 
 
 ### Certificate pinning and custom trust stores
 
-Applications that use certificate pinning or hardcoded trust stores will reject the interception CA. These applications require a TLS-verified bypass (level 3).
+Applications that use certificate pinning or hardcoded trust stores will reject the interception CA. These applications require a TLS-verified bypass (level 2).
 
 Some pinned applications expose configuration options to provide a custom CA certificate. Whether and how to use such options is the user's responsibility — the sandbox provides the bypass mechanism, not application-specific CA configuration.
 
@@ -676,15 +719,11 @@ Therefore:
 
 CONNECT requests are only valid when targeting a destination declared as an upstream proxy in policy. CONNECT to any other destination is denied — this prevents applications from using CONNECT as a tunneling mechanism through non-proxy endpoints.
 
-Once traffic reaches the allowed upstream proxy, the sandbox's trust boundary applies: the proxy is an approved first-hop destination, and what it does on the application's behalf is beyond the sandbox's control. This is consistent with the trust model for all other allowed destinations.
+When mitmproxy inspects traffic to a declared upstream proxy (level 3), it also validates the CONNECT target — the destination the client asks the proxy to connect to. If the CONNECT target is not an allowed destination in policy, the request is denied with an HTTP 599 response. This is a special case where the sandbox can see the intended next hop beyond the proxy and enforces what is visible.
 
-The sandbox does not attempt to validate or restrict the final destination behind the upstream proxy. Such validation would be:
+This is a pragmatic exception to the general trust boundary principle. For most allowed destinations, the sandbox does not police what the service does on behalf of the application. But a CONNECT request explicitly declares the next-hop destination in a field the sandbox can inspect, so it is validated. The upstream proxy could still relay to disallowed destinations through other means — the trust boundary still applies beyond what the sandbox can observe.
 
-* inconsistent with the trust boundary — no other allowed service is policed for what it does on behalf of the application
-* unreliable — the proxy could relay anywhere regardless of what the CONNECT target declares
-* already addressed by the relay-capable services classification
-
-CONNECT validation is performed by mitmproxy, which is the only component in the pipeline with HTTP-level visibility. Envoy forwards level 4 traffic to mitmproxy without parsing HTTP semantics. When mitmproxy receives a CONNECT request, it checks whether the target is declared as an upstream proxy in policy. If not, the request is denied with an HTTP 599 response.
+CONNECT validation is performed by mitmproxy, which is the only component in the pipeline with HTTP-level visibility. Envoy forwards traffic to mitmproxy without parsing HTTP semantics.
 
 ## Transport and protocol classes
 
@@ -788,8 +827,8 @@ Response:
 
 Response:
 
-* ECH configs are stripped from DNS responses by default for level 4 destinations, forcing client fallback to standard TLS
-* if the upstream server mandates ECH and rejects non-ECH connections, the destination requires an explicit level 2 (transport-only) bypass — HTTP inspection is not possible
+* ECH configs are stripped from DNS responses by default for level 2 and level 3 destinations, forcing client fallback to standard TLS
+* if the upstream server mandates ECH and rejects non-ECH connections, the destination requires an explicit level 1 (transport-only) bypass — HTTP inspection is not possible
 * ECH stripping is enabled by default to prevent silent inspection breakage as ECH adoption grows
 
 ## Relay-capable services and trust amplification
@@ -922,6 +961,8 @@ Shutdown is the reverse of startup — the traffic gate is removed first, the ba
 
 This mirrors the startup logic: the redirect rules are the gate that controls whether traffic enters the pipeline. Removing them first ensures no new connections are initiated while components shut down. The deny-by-default rules remain as the final safety net until the namespace is fully torn down.
 
+In-flight connections are terminated immediately as components stop. There is no drain period — this is consistent with the connection termination behavior during IP rotation and the sandbox's non-production posture.
+
 ## Error propagation
 
 ### Principle
@@ -1000,6 +1041,10 @@ The policy language should let users express intent such as:
 * allow service Z only at TLS-verified level
 * allow UDP only to resolver R
 * deny everything else
+* allow only GET requests to `api.github.com/repos/{owner}/{repo}/pulls/{number}` — granting read access to a specific pull request without broader GitHub API access
+* allow only GET and HEAD to a specific service — no mutations permitted
+* deny POST to any path on a specific service
+* allow access to a service but only on specific paths
 
 The policy language should not require users to know:
 
@@ -1008,6 +1053,8 @@ The policy language should not require users to know:
 * whether the rule becomes an SNI check, DNS check, host check, or firewall rule
 
 Those are compilation details of the policy engine.
+
+HTTP-level method and path controls are the key capability that distinguishes this sandbox from network-level firewalls. Any firewall can gate by IP and port. The ability to constrain not just *which* service is reachable but *what operations* are permitted on that service is what makes HTTP inspection meaningful. A sandbox policy that allows access to a version control API but only permits reading a specific pull request is fundamentally more constrained than one that allows all traffic to the API's IP address.
 
 ### Policy schema
 
@@ -1070,7 +1117,7 @@ Compilation validates in two phases:
 
 * every rule can be compiled to every relevant backend — if a rule cannot be expressed in a required backend, compilation fails
 * no internal contradictions exist (e.g., the same destination declared at conflicting assurance levels)
-* assurance levels are consistent with declared protocol classes (e.g., UDP traffic cannot be declared at level 4)
+* assurance levels are consistent with declared protocol classes (e.g., UDP traffic cannot be declared at level 3)
 * bypass entries have required metadata (reason, assurance level)
 
 On failure, the sandbox daemon reports:
@@ -1079,7 +1126,9 @@ On failure, the sandbox daemon reports:
 * which backend could not express the rule (if applicable)
 * why the compilation failed
 
-DNS resolution failures are not compilation errors. Policy is expressed in domain names. Domain-to-IP resolution is a runtime control-plane concern, not a compile-time concern.
+Domain resolution is performed at compile time as a validation step. All policy domains are resolved during compilation — if a domain cannot be resolved, compilation fails with an error identifying the unresolvable domain. This provides immediate feedback when a policy references a domain that does not exist or is unreachable.
+
+The compile-time resolution also produces the initial seed IPs used to generate the first set of nftables rules and Envoy filter chain configurations. These IPs are a point-in-time snapshot. Runtime re-resolution (TTL-aware, managed by the sandbox daemon) keeps the IP mappings current as DNS records change.
 
 ### Policy distribution and hot-reload
 
@@ -1090,6 +1139,8 @@ The all-or-nothing guarantee extends from compilation to distribution. When a po
 3. **Envoy** — reconfigured
 4. **Local DNS resolver** — reconfigured
 5. **nftables redirect rules** — updated last
+
+During the update window, newly-added destinations may be briefly unreachable until all components have been reconfigured. This is by design — the outside-in ordering ensures fail-closed behavior during transitions. No traffic is permitted to a new destination until all components are consistent.
 
 If any component fails to accept the new configuration, the sandbox daemon rolls back all previously updated components to their prior configuration. No partial policy state is permitted — either the entire update succeeds across all components or the sandbox remains on the previous policy.
 
@@ -1151,8 +1202,9 @@ Even with correct implementation, the following residual risks remain:
 * TLS-verified level loses request-level certainty
 * application compatibility may pressure policy toward broader exceptions
 * user misunderstanding may overestimate the guarantees of “allowed” traffic
-* increasing ECH adoption may force more destinations to level 2 bypasses as servers begin mandating ECH, reducing the proportion of traffic that can be inspected at level 4
-* DNS-over-HTTPS (DoH) to allowed destinations bypasses the local resolver's query logging and NXDOMAIN enforcement, though it does not expand network reach beyond what policy already permits
+* increasing ECH adoption may force more destinations to level 1 bypasses as servers begin mandating ECH, reducing the proportion of traffic that can be verified at level 2 or inspected at level 3
+* protocol tunneling over allowed ports and connections — if an application tunnels arbitrary data inside valid requests to an allowed destination, the sandbox cannot detect or prevent it
+* hidden DNS resolution paths (e.g., DoH to allowed destinations) do not expand network reach — unresolved IPs remain blocked by nftables — but bypass the local resolver's query logging and NXDOMAIN enforcement
 
 These are not implementation bugs. They are the natural limits of the problem space.
 
