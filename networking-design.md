@@ -156,7 +156,7 @@ The VM must be configured to route all traffic through the gateway container and
 
 The VM has a single network interface (virtio-net) with a single default route:
 
-* **One NIC.** The VM exposes exactly one network interface — a virtio-net device connected to the per-session Docker bridge network. No other network interfaces exist (no additional NICs, no virtio-fs, no USB network adapters).
+* **One NIC, IPv4 only.** The VM exposes exactly one network interface — a virtio-net device connected to the per-session Docker bridge network. The NIC is configured with an IPv4 address only; no IPv6 addresses are assigned on the bridge interface. No other network interfaces exist (no additional NICs, no virtio-fs, no USB network adapters).
 * **Default route to gateway.** The default route points to the gateway container's IP on the bridge subnet. All traffic (except loopback and vsock) exits via this route.
 * **Static or DHCP.** The VM's IP on the bridge subnet is assigned during provisioning — either statically in the Lima template or via DHCP from the Docker bridge network.
 * **No alternate routes.** No other routes exist. The routing table contains only the default route to the gateway, the connected bridge subnet route, and loopback.
@@ -215,7 +215,7 @@ Port mapping (`-p` flag) works normally inside the VM. Inner containers can bind
 
 ## Per-session bridge network
 
-Each session has a dedicated Docker bridge network that provides the link layer between the VM and its gateway container. The bridge network is created by the sandbox daemon during session creation and deleted during session destruction. For the full session lifecycle, see [sandbox-design.md § Session lifecycle](sandbox-design.md#session-lifecycle).
+Each session has a dedicated Docker bridge network that provides the link layer between the VM and its gateway container. The bridge network is created as IPv4-only (no `--ipv6` flag) by the sandbox daemon during session creation and deleted during session destruction. For the full session lifecycle, see [sandbox-design.md § Session lifecycle](sandbox-design.md#session-lifecycle).
 
 ```text
 VM (virtio-net) ←→ per-session Docker bridge ←→ gateway container (eth0)
@@ -252,7 +252,9 @@ The gateway container runs the proxy pipeline outside the VM, on the host side o
 
 These components form the layered enforcement pipeline described throughout this document. The gateway container has `CAP_NET_ADMIN` (required for nftables) but otherwise runs with Docker's default security profile — no `--privileged`, no host PID namespace, no host filesystem mounts beyond configuration volumes, read-only root filesystem with writable volumes for logs and runtime state.
 
-IP forwarding must be enabled in the gateway container (`net.ipv4.ip_forward=1`, set via `--sysctl` at container creation) because it acts as the router for the VM's traffic. Without IP forwarding, forwarded packets from the VM would be dropped before reaching the nftables PREROUTING DNAT rules. IPv6 forwarding is explicitly disabled (`net.ipv6.conf.all.forwarding=0`) — the bridge network between the VM and gateway is IPv4-only, and IPv6 traffic is not routed through the pipeline.
+IP forwarding must be enabled in the gateway container (`net.ipv4.ip_forward=1`, set via `--sysctl` at container creation) because it acts as the router for the VM's traffic. Without IP forwarding, forwarded packets from the VM would be dropped before reaching the nftables PREROUTING DNAT rules.
+
+The entire networking subsystem is IPv4-only by design. IPv6 forwarding is explicitly disabled in the gateway (`net.ipv6.conf.all.forwarding=0`), and any IPv6 traffic that reaches the gateway is dropped by a blanket nftables `ip6` drop rule. This is a deliberate simplification — a single-stack network reduces attack surface and eliminates an entire class of bypass vectors (see [Escape-pattern assumptions and responses](#escape-pattern-assumptions-and-responses)). IPv6 support is deferred as a future improvement (see [Residual risks](#residual-risks)).
 
 ### Traffic interception model
 
@@ -614,7 +616,7 @@ The kernel firewall (nftables) inside the gateway container is the hard enforcem
 * explicit allow only for permitted traffic
 * no direct internet egress outside the policy path
 * no direct DNS except the local resolver path
-* both IPv4 and IPv6
+* IPv4 rules implement full policy; IPv6 rules are a blanket drop (the networking subsystem is IPv4-only)
 * no fail-open on Envoy or mitmproxy failure
 * no accidental side interfaces or alternate routes
 
@@ -650,6 +652,7 @@ Policy is expressed in terms of domain names, but some enforcement components op
 
 * the local resolver is the only DNS path available to the VM — resolv.conf points to it, and nftables PREROUTING DNAT redirects all DNS traffic from the VM to it
 * non-allowed domains receive NXDOMAIN — the resolver enforces policy at the DNS layer
+* AAAA records are stripped from all responses — the resolver returns only A records. The network path is IPv4-only, so AAAA records for allowed domains would resolve to unreachable IPv6 addresses. Stripping them avoids unnecessary resolution failures and happy-eyeballs delays in dual-stack client libraries.
 * for allowed domains, resolution results are reported to the sandbox daemon, which maintains TTL-aware IP-to-domain mappings and pushes configuration updates to all enforcement components that operate on IP addresses
 * re-resolution occurs when DNS TTL expires, with a configurable maximum interval (e.g., 60 seconds) as an upper bound regardless of TTL — domains with very long TTLs must not leave stale IPs in place indefinitely
 * on resolution failure: immediately remove the previously resolved IPs for the affected domain (fail-closed), log the failure, and reflect the failure in the sandbox health status — stale IPs from domains that no longer resolve are a potential attack vector (e.g., IP takeover) and must not persist
@@ -876,7 +879,7 @@ Response:
 
 Response:
 
-* deny by default or fully mirror policy in IPv6
+* eliminated by design — the networking subsystem is IPv4-only. IPv6 is dropped at the gateway's nftables (`ip6` blanket drop), the bridge network has no IPv6 addressing, the VM NIC has no IPv6 address, and the DNS resolver strips AAAA records. There is no IPv6 path to exploit.
 
 ### QUIC / HTTP/3
 
@@ -1308,6 +1311,18 @@ Even with correct implementation, the following residual risks remain:
 * hidden DNS resolution paths (e.g., DoH to allowed destinations) do not expand network reach — unresolved IPs remain blocked by nftables — but bypass the local resolver's query logging and NXDOMAIN enforcement
 
 These are not implementation bugs. They are the natural limits of the problem space.
+
+### Deferred: IPv6 support
+
+The networking subsystem is IPv4-only by design. This is a deliberate simplification that reduces attack surface and complexity. IPv6 support is deferred as a future improvement. When implemented, it would require:
+
+* dual-stack bridge networks (`--ipv6` on session bridge creation)
+* `inet`-family nftables rules (unified IPv4/IPv6 policy tables instead of separate `ip` and `ip6` tables)
+* AAAA record handling in the DNS resolver (return AAAA alongside A records for allowed domains)
+* IPv6 forwarding enabled in the gateway container (`net.ipv6.conf.all.forwarding=1`)
+* dual-stack VM configuration (IPv6 address on the bridge interface, IPv6 default route to the gateway)
+
+The intended model is session-level opt-in — sessions that need IPv6 destinations would request dual-stack networking at creation time. Sessions that don't need IPv6 would remain single-stack to preserve the simpler security posture.
 
 ## Final design summary
 

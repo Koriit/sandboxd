@@ -485,13 +485,13 @@ Each session has a dedicated Docker bridge network that connects the gateway con
 VM (virtio-net) ←→ Bridge network ←→ Gateway container (eth0)
 ```
 
-The bridge network is created by the sandbox daemon during session creation and deleted during session destruction. Sessions do not share bridge networks — inter-session traffic is impossible at the network level.
+The bridge network is created as IPv4-only by the sandbox daemon during session creation and deleted during session destruction. Sessions do not share bridge networks — inter-session traffic is impossible at the network level.
 
 ### VM network configuration
 
 Inside the VM:
 
-* The single NIC receives an IP address on the bridge subnet (DHCP or static, configured during provisioning)
+* The single NIC receives an IPv4 address on the bridge subnet (DHCP or static, configured during provisioning). No IPv6 addresses are assigned — the networking subsystem is IPv4-only.
 * The default route points to the gateway container's IP on the bridge
 * `/etc/resolv.conf` points to the gateway container's DNS resolver IP
 * No other routes exist — all traffic (except loopback and vsock) exits via the default route to the gateway
@@ -888,3 +888,4 @@ The following items are identified as necessary but are not designed in this doc
 * **Multi-session resource management.** Host capacity planning, session scheduling, and resource contention handling when multiple sessions run concurrently.
 * **Ingress connectivity.** Allowing external access to services running inside the sandbox (e.g., for webhook testing, external API callbacks). This requires extending the gateway container with reverse-proxy capabilities and defining an ingress policy model.
 * **Session monitoring and alerting.** Integration with external monitoring systems for session health, resource utilization, and security events.
+* **IPv6 support.** The networking subsystem is IPv4-only by design — a deliberate simplification that reduces attack surface. When IPv6-only destinations become necessary, this requires dual-stack bridge networks, dual-stack VM configuration, IPv6-aware nftables rules, AAAA record handling in the DNS resolver, and IPv6 forwarding in the gateway container. See [networking-design.md § Deferred: IPv6 support](networking-design.md#deferred-ipv6-support) for the full requirements.
