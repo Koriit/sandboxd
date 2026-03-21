@@ -660,7 +660,7 @@ Policy is expressed in terms of domain names, but some enforcement components op
 
 ### DNS interception is tamper-proof
 
-The agent has root inside the VM and can modify `resolv.conf`, hardcode alternate DNS servers, or configure applications to use any resolver it chooses. None of this matters. All traffic from the VM exits through the single virtio-net NIC, crosses the bridge, and hits the gateway container's nftables PREROUTING DNAT rules. Any packet destined for port 53 (UDP or TCP) is redirected to the local resolver regardless of the original destination address the agent specified.
+Even if the agent gains root inside the VM, it can modify `resolv.conf`, hardcode alternate DNS servers, or configure applications to use any resolver it chooses. None of this matters. All traffic from the VM exits through the single virtio-net NIC, crosses the bridge, and hits the gateway container's nftables PREROUTING DNAT rules. Any packet destined for port 53 (UDP or TCP) is redirected to the local resolver regardless of the original destination address the agent specified.
 
 The gateway container runs on the host side of the hardware virtualization boundary — outside the VM. The agent cannot modify its nftables rules, restart its processes, or interfere with it in any way. This is a stronger property than the old namespace-based model: the enforcement point sits behind a hardware boundary (virtio-net), not just a kernel boundary (namespaces). The agent's root privileges are scoped to the VM guest and do not extend to the host or gateway.
 

@@ -205,7 +205,7 @@ Lima (Linux Machines) is a CNCF incubating project that manages Linux VMs on mac
 * Automatic hypervisor selection (QEMU with KVM on Linux, VZ on macOS)
 * SSH access to VMs via `limactl shell`
 * File sharing (disabled in this design — repos cloned inside VM)
-* Port forwarding (used selectively for control paths)
+* Port forwarding (automatic forwarding disabled; sandboxd uses selective, controlled forwarding for specific control paths)
 * VM snapshot and restore
 
 ### What Lima does not provide
@@ -344,7 +344,7 @@ Each VM is created from a Lima YAML template that specifies:
 * network configuration (bridge network to gateway)
 * vsock enablement
 * provisioning scripts (cloud-init)
-* disabled features: file sharing (no virtio-fs), port forwarding (controlled by sandboxd)
+* disabled features: file sharing (no virtio-fs), automatic port forwarding (sandboxd manages selective forwarding for control paths)
 
 ### Base image
 
@@ -469,7 +469,7 @@ The gateway container is a trusted component — it runs the sandbox operator's 
 
 * Standard Docker container with default seccomp profile
 * No `--privileged`
-* `CAP_NET_ADMIN` only (required for nftables, dropped after rule setup where possible)
+* `CAP_NET_ADMIN` only (required for nftables rule management throughout the gateway's lifetime, including policy hot-reload and IP propagation)
 * No host network (`--network` is the per-session bridge, not `host`)
 * No host PID namespace
 * No host filesystem mounts beyond configuration volumes
@@ -543,7 +543,7 @@ Source code repositories are cloned inside the VM, not shared from the host via 
 
 ### Clone mechanism
 
-The agent (or the boot command) clones the repository using standard `git clone` through the proxy pipeline. The policy must allow HTTPS access to the git hosting service (e.g., `github.com`, `gitlab.com`) at level 3 (HTTP inspected) or level 2 (TLS-verified, for SSH-based git).
+The agent (or the boot command) clones the repository using standard `git clone` through the proxy pipeline. The policy must allow HTTPS access to the git hosting service (e.g., `github.com`, `gitlab.com`) at level 3 (HTTP inspected) or level 1 (transport-only, for SSH-based git; protocol: TCP, since SSH uses its own key exchange, not TLS).
 
 ### Credential injection
 
