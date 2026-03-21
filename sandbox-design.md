@@ -71,7 +71,7 @@ This design does **not** cover:
    Sessions are disposable. Destroy deletes all state irrecoverably. Persistence is opt-in (stop preserves disk; resume restarts from disk state). No session accumulates long-lived trust or credentials.
 
 5. **Cross-platform with one architecture**
-   The same conceptual architecture — Lima VM + gateway container + proxy pipeline — runs on Linux and macOS. Platform differences are confined to the hypervisor backend (QEMU/KVM vs. Apple VZ) and are not visible to the agent or the policy model.
+   The same conceptual architecture — Lima VM + gateway container + proxy pipeline — runs on Linux and macOS. Platform differences are confined to the hypervisor backend (QEMU/KVM vs. Apple VZ) and the VM-to-gateway connectivity layer (TAP on Docker bridge vs. macvlan on vmnet). The gateway container, proxy pipeline, policy model, and agent experience are identical on both platforms.
 
 6. **Fail closed**
    If the gateway container is not running, the VM has no network connectivity. If the proxy pipeline is degraded, traffic fails — it does not bypass. The deny-by-default posture from the networking design extends to the VM boundary: no gateway means no egress.
@@ -98,14 +98,14 @@ Host (Linux or macOS)
 │       ├── mitmproxy (HTTP inspection)
 │       └── DNS resolver (policy-aware)
 │
-│   VM ←→ Gateway: Docker bridge network (per-session, isolated)
+│   VM ←→ Gateway: per-session network (bridge on Linux, macvlan on macOS)
 │   VM ←→ Host: vsock (control channel, not IP — does not traverse proxy)
 │
 ├── Session M
 │   ├── Lima VM ...
 │   └── Gateway container ...
 │
-└── Host Docker daemon (manages gateway containers)
+└── Docker daemon (manages gateway containers; host Docker on Linux, sandboxd-managed Colima on macOS)
 ```
 
 ### Key structural properties
@@ -462,6 +462,7 @@ The proxy pipeline must run outside the VM so that the agent cannot tamper with 
 * **Isolation from the host.** The gateway container runs in its own network namespace, filesystem, and PID namespace. It does not have access to the host's network stack or filesystem beyond what Docker provides.
 * **Lifecycle management.** Docker provides well-understood primitives for starting, stopping, and removing containers. The sandbox daemon manages gateway containers alongside VMs.
 * **Standard runtime.** The gateway container uses the standard runc runtime. It does not need Sysbox, elevated privileges, or any special capabilities beyond `CAP_NET_ADMIN` (required for nftables).
+* **Same image everywhere.** The gateway container runs the same image on both platforms. The connectivity layer differs between Linux and macOS (see [networking-design.md § VM-to-gateway connectivity](networking-design.md#vm-to-gateway-connectivity)); the gateway image, proxy pipeline, and policy enforcement are identical.
 
 ### Gateway security posture
 
@@ -470,7 +471,7 @@ The gateway container is a trusted component — it runs the sandbox operator's 
 * Standard Docker container with default seccomp profile
 * No `--privileged`
 * `CAP_NET_ADMIN` only (required for nftables rule management throughout the gateway's lifetime, including policy hot-reload and IP propagation)
-* No host network (`--network` is the per-session bridge, not `host`)
+* No host network (`--network` is the per-session network, not `host`)
 * No host PID namespace
 * No host filesystem mounts beyond configuration volumes
 * Read-only root filesystem with writable volumes for logs and runtime state
@@ -510,6 +511,15 @@ Agent process (in VM)
 ```
 
 Because the traffic arrives at the gateway container from the VM (forwarded traffic, not locally-generated traffic), the gateway uses nftables PREROUTING DNAT rather than OUTPUT REDIRECT. This is the only technical difference from a shared-namespace model. The policy model, assurance levels, DNS model, SNI model, HTTP model, bypass framework, fail-closed behavior, startup/shutdown ordering, health monitoring, and all other aspects described in the networking design are unchanged.
+
+### VM-to-gateway connectivity
+
+The mechanism that connects the sandbox VM to its gateway container differs between Linux and macOS, but both achieve the same result: the VM has a single NIC with a default route pointing at the gateway container's IP, and traffic arrives at the gateway with original destination intact so that PREROUTING DNAT works correctly.
+
+* **Linux:** Per-session Docker bridge network. The VM's QEMU TAP device and the gateway container attach to the same bridge — direct L2 connectivity.
+* **macOS:** socket_vmnet shared network with Docker macvlan inside a sandboxd-managed Colima VM. Each gateway gets its own IP on the shared vmnet.
+
+For the full platform-specific connectivity explanation, including architecture diagrams, see [networking-design.md § VM-to-gateway connectivity](networking-design.md#vm-to-gateway-connectivity).
 
 ### Docker-in-VM networking
 
@@ -656,11 +666,22 @@ Standard EC2 instances do not support nested virtualization. The sandbox cannot 
 
 **VM startup time:** Approximately 10-30 seconds on Apple Silicon with VZ. Acceptable for interactive development sessions. Snapshot optimization can reduce this.
 
-**Coexistence with Colima.** Developers who use Colima (which also uses Lima) for their day-to-day Docker workflow can continue doing so. The sandbox daemon manages its own Lima VMs with separate names, separate bridge networks, and separate lifecycle. There is no conflict — Lima supports multiple concurrent VM instances.
+**socket_vmnet (required dependency).** socket_vmnet is a vmnet daemon from the Lima project that provides a shared virtual network on macOS. It is required for VM-to-gateway connectivity — see [networking-design.md § VM-to-gateway connectivity](networking-design.md#vm-to-gateway-connectivity) for the full explanation. socket_vmnet is open-source (Apache 2.0 license) and is the standard Lima mechanism for shared networking on macOS.
 
-**Host Docker daemon.** The gateway containers require a Docker daemon on the macOS host. This is provided by Docker Desktop or Colima. The sandbox daemon uses whichever Docker daemon is available on the host.
+**sandboxd-managed Colima instance.** On macOS, sandboxd manages its own Colima instance to host all gateway containers. This is necessary because Docker on macOS runs inside a Linux VM, and sandbox VMs cannot attach TAP devices to Docker bridges that exist inside another VM. See [networking-design.md § VM-to-gateway connectivity](networking-design.md#vm-to-gateway-connectivity) for how the networking works.
 
-**Feature parity.** The sandbox architecture is identical on both platforms. The only difference is the hypervisor backend. The gateway container, proxy pipeline, policy model, and session lifecycle are the same. Tests written against the sandbox on macOS will behave identically on Linux.
+This Colima instance is completely independent of the developer's Docker setup:
+
+* Developers using Docker Desktop continue using Docker Desktop for their own work
+* Developers using their own Colima instance continue using it — sandboxd's Colima has a separate instance name, separate data directory, and separate lifecycle
+* Two Docker daemons coexist without conflict on macOS — they run in separate VMs with separate sockets
+* Colima is free/open-source (MIT license), Lima-based, and architecturally aligned with the sandbox's use of Lima for sandbox VMs
+
+The developer never interacts with sandboxd's Colima instance directly. sandboxd manages its lifecycle (starting it on first session creation, stopping it when the last session is destroyed or on daemon shutdown).
+
+**Coexistence with developer Lima VMs.** Developers who use Lima directly (outside Colima) for other purposes can continue doing so. The sandbox daemon manages its own Lima VMs with separate names and separate lifecycle. There is no conflict — Lima supports multiple concurrent VM instances.
+
+**Feature parity.** The sandbox architecture is identical on both platforms. The differences are confined to the hypervisor backend (QEMU/KVM vs. Apple VZ) and the VM-to-gateway connectivity layer (TAP on Docker bridge vs. macvlan on vmnet — see [networking-design.md § VM-to-gateway connectivity](networking-design.md#vm-to-gateway-connectivity)). The gateway container image, proxy pipeline, policy model, and session lifecycle are the same. Tests written against the sandbox on macOS will behave identically on Linux.
 
 ## Resource management
 
@@ -868,11 +889,11 @@ Everything else — policy model, assurance levels, DNS model, SNI model, HTTP m
 * VM as the isolation boundary (replacing the container namespace)
 * Lima as the VM manager
 * Gateway container as the deployment unit for the proxy pipeline
-* Per-session bridge networks connecting VMs to gateways
+* Per-session networks connecting VMs to gateways (detailed connectivity in the [networking design](networking-design.md#vm-to-gateway-connectivity))
 * vsock control channel between VMs and the sandbox daemon
 * VM hardening layers (device model, QEMU sandboxing, guest OS hardening)
 * Workspace provisioning (clone inside VM, not shared via virtio-fs)
-* Platform-specific considerations (Linux/KVM, macOS/VZ, EC2 constraints)
+* Platform-specific considerations (Linux/KVM, macOS/VZ, EC2 constraints, Colima lifecycle)
 * Session lifecycle (create, start, stop, destroy)
 * Inner Docker authorization (requirement stated, implementation deferred)
 

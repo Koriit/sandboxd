@@ -215,11 +215,62 @@ Port mapping (`-p` flag) works normally inside the VM. Inner containers can bind
 
 ## Per-session bridge network
 
-Each session has a dedicated Docker bridge network that provides the link layer between the VM and its gateway container. The bridge network is created as IPv4-only (no `--ipv6` flag) by the sandbox daemon during session creation and deleted during session destruction. For the full session lifecycle, see [sandbox-design.md § Session lifecycle](sandbox-design.md#session-lifecycle).
+Each session has a dedicated IPv4-only network that provides the link layer between the VM and its gateway container. The network is created by the sandbox daemon during session creation and deleted during session destruction. For the full session lifecycle, see [sandbox-design.md § Session lifecycle](sandbox-design.md#session-lifecycle).
 
 ```text
-VM (virtio-net) ←→ per-session Docker bridge ←→ gateway container (eth0)
+VM (virtio-net) ←→ per-session network ←→ gateway container (eth0)
 ```
+
+The connectivity mechanism differs by platform, but both achieve the same result: the VM has a single NIC with a default route pointing at the gateway container's IP, and traffic arrives at the gateway with original destination intact so that PREROUTING DNAT works correctly.
+
+### VM-to-gateway connectivity
+
+#### Linux
+
+On Linux, the sandbox daemon creates a per-session Docker bridge network. The gateway container attaches to this bridge normally (via Docker). The sandbox VM's QEMU process uses a TAP device on the same bridge as its network backend — Lima configures this via its `networks` YAML stanza. This gives the VM direct L2 connectivity to the gateway container on the bridge subnet, and the VM's default route points to the gateway's IP on the bridge.
+
+```
+Linux host
+├── sandboxd
+├── Docker daemon (hosts all gateway containers)
+│   ├── Gateway container session-1 (bridge-1)
+│   ├── Gateway container session-2 (bridge-2)
+│   └── ...
+├── Sandbox VM session-1 (TAP on bridge-1) → routes to gateway-1
+├── Sandbox VM session-2 (TAP on bridge-2) → routes to gateway-2
+└── ...
+```
+
+Each session is fully isolated at L2 — the TAP device, bridge, and gateway container form a private network segment. No cross-session traffic is possible.
+
+#### macOS
+
+On macOS, Docker does not run natively — it runs inside a Linux VM (Docker Desktop's VM, or a Colima/Lima VM). This means a sandbox VM cannot attach a TAP device to a Docker bridge on the macOS host because that bridge exists inside another VM's network namespace.
+
+The solution uses three components:
+
+1. **socket_vmnet** — a vmnet daemon from the Lima project that provides a shared virtual network accessible to multiple VMs on macOS. Both the Colima VM and all sandbox VMs join this network, giving them L2 connectivity to each other.
+
+2. **Colima (sandboxd-managed)** — sandboxd manages a single Colima instance (a Lima-based Docker runtime) that hosts all gateway containers across all sessions. This Colima instance is completely independent of whatever Docker setup the developer uses (Docker Desktop, their own Colima, etc.). The developer never interacts with it directly.
+
+3. **Docker macvlan** — inside the sandboxd-managed Colima VM, each gateway container uses Docker macvlan networking on the vmnet-facing interface. This gives each gateway its own IP directly on the shared vmnet, rather than hiding it behind the Colima VM's IP with port mapping.
+
+```
+macOS host
+├── sandboxd
+├── socket_vmnet (shared network, e.g. 192.168.105.0/24)
+├── Colima VM (one, managed by sandboxd, hosts all gateways)
+│   ├── Gateway container session-1 (macvlan: 192.168.105.20)
+│   ├── Gateway container session-2 (macvlan: 192.168.105.21)
+│   └── ...
+├── Sandbox VM session-1 (192.168.105.100) → routes to .20
+├── Sandbox VM session-2 (192.168.105.101) → routes to .21
+└── ...
+```
+
+The sandbox VM's default route points to its gateway's macvlan IP on the vmnet. Traffic arrives at the gateway container with the original destination intact — PREROUTING DNAT works exactly as on Linux. From the gateway container's perspective, the traffic flow is indistinguishable from the Linux TAP-on-bridge model.
+
+Gateway containers within the Colima VM are isolated from each other via per-session macvlan networks, analogous to per-session bridges on Linux. One Colima VM hosts all gateways, but each gateway operates on its own macvlan network and cannot see other gateways' traffic.
 
 ### Isolation properties
 
@@ -268,6 +319,8 @@ Traffic arrives at the gateway container from the VM as forwarded packets on the
 | Namespace sharing | Proxy pipeline shares namespace with sandboxed process | Proxy pipeline has its own namespace; VM has its own kernel |
 
 nftables PREROUTING DNAT intercepts forwarded traffic before routing decisions and redirects it to the pipeline components (Envoy listener, DNS resolver). Envoy uses the `original_dst` listener filter to recover the real destination from the DNAT-redirected connection — the same mechanism as before, just triggered by PREROUTING DNAT instead of OUTPUT REDIRECT.
+
+On macOS, the gateway container uses a Docker macvlan network instead of a bridge (see [VM-to-gateway connectivity § macOS](#macos) for the full explanation). The pipeline behavior is identical — traffic arrives on the gateway's network interface from the VM with the original destination intact, and the same PREROUTING DNAT rules intercept it. The macvlan vs. bridge distinction is a link-layer detail that does not affect the proxy pipeline, policy model, or any behavior described in this document.
 
 ### Loopback inside the gateway
 
