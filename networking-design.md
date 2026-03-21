@@ -389,7 +389,7 @@ Provides hard enforcement and transparent interception of forwarded traffic from
 * gateway-internal loopback exemptions where required
 * self-traffic exemptions for Envoy and mitmproxy
 * explicit host and port restrictions as derived from policy
-* IPv4 and IPv6 parity
+* IPv4 rules implement full policy; IPv6 rules are a blanket drop (the networking subsystem is IPv4-only)
 
 **nftables PREROUTING DNAT** performs transparent interception of forwarded traffic arriving from the VM:
 
@@ -841,6 +841,14 @@ Default mode:
 * inspected
 * strongly verified
 * request-level identity enforcement
+
+### gRPC
+
+Standard HTTP/2 traffic — POST requests with `content-type: application/grpc` and a path identifying the service and method. Flows through mitmproxy as normal HTTP/2 at level 3 (HTTP inspected). No special handling required.
+
+### WebSocket
+
+Begins as an HTTP/1.1 Upgrade request (or HTTP/2 extended CONNECT). After the handshake completes, the connection upgrades to an opaque bidirectional binary frame stream that is no longer HTTP-inspectable. Same pattern as QUIC/HTTP/3 — the initial handshake is visible but the ongoing stream is not. WebSocket destinations require a level 2 (TLS-verified) bypass.
 
 ### Non-HTTP TLS
 
