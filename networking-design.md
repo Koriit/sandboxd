@@ -13,39 +13,45 @@ The [sandbox design](sandbox-design.md) covers the isolation boundary, VM lifecy
 - [Purpose](#purpose)
 - [Non-goals](#non-goals)
 - [Core design principles](#core-design-principles)
-- [End-to-end architecture](#end-to-end-architecture)
-- [VM-side networking configuration](#vm-side-networking-configuration)
-- [Per-session network](#per-session-network)
-- [Gateway container pipeline](#gateway-container-pipeline)
-- [Policy outcomes](#policy-outcomes)
-- [Policy evaluation model](#policy-evaluation-model)
-- [Assurance levels](#assurance-levels)
-- [Layer responsibilities](#layer-responsibilities)
-- [Threat model](#threat-model)
-- [Security boundary](#security-boundary)
+- [Architecture](#architecture)
+  - [End-to-end architecture](#end-to-end-architecture)
+  - [VM-side networking configuration](#vm-side-networking-configuration)
+  - [Per-session network](#per-session-network)
+  - [Gateway container pipeline](#gateway-container-pipeline)
 - [Policy model](#policy-model)
-- [Fundamental design rule](#fundamental-design-rule)
-- [Why HTTP is the only happy path](#why-http-is-the-only-happy-path)
-- [Bypass framework](#bypass-framework)
-- [Kernel firewall requirements](#kernel-firewall-requirements)
-- [DNS model](#dns-model)
-- [SNI model](#sni-model)
-- [HTTP model](#http-model)
-- [Certificate management](#certificate-management)
-- [Upstream proxy support](#upstream-proxy-support)
-- [Transport and protocol classes](#transport-and-protocol-classes)
-- [Escape-pattern assumptions and responses](#escape-pattern-assumptions-and-responses)
-- [Relay-capable services and trust amplification](#relay-capable-services-and-trust-amplification)
-- [Fail-closed requirement](#fail-closed-requirement)
-- [Health monitoring](#health-monitoring)
-- [Component lifecycle and startup ordering](#component-lifecycle-and-startup-ordering)
-- [Error propagation](#error-propagation)
-- [Logging and audit requirements](#logging-and-audit-requirements)
-- [Policy authoring requirements](#policy-authoring-requirements)
-- [Control plane / sandbox daemon](#control-plane--sandbox-daemon)
-- [Implementation guidance derived from the design](#implementation-guidance-derived-from-the-design)
-- [Residual risks](#residual-risks)
-- [Final design summary](#final-design-summary)
+  - [Policy outcomes](#policy-outcomes)
+  - [Policy evaluation model](#policy-evaluation-model)
+  - [Assurance levels](#assurance-levels)
+  - [Layer responsibilities](#layer-responsibilities)
+  - [Policy model](#policy-model-1)
+  - [Fundamental design rule](#fundamental-design-rule)
+  - [Why HTTP is the only happy path](#why-http-is-the-only-happy-path)
+  - [Bypass framework](#bypass-framework)
+  - [Policy authoring requirements](#policy-authoring-requirements)
+- [Threat model and security](#threat-model-and-security)
+  - [Threat model](#threat-model)
+  - [Security boundary](#security-boundary)
+  - [Escape-pattern assumptions and responses](#escape-pattern-assumptions-and-responses)
+  - [Relay-capable services and trust amplification](#relay-capable-services-and-trust-amplification)
+  - [Fail-closed requirement](#fail-closed-requirement)
+- [Layer models](#layer-models)
+  - [Kernel firewall requirements](#kernel-firewall-requirements)
+  - [DNS model](#dns-model)
+  - [SNI model](#sni-model)
+  - [HTTP model](#http-model)
+  - [Certificate management](#certificate-management)
+  - [Upstream proxy support](#upstream-proxy-support)
+  - [Transport and protocol classes](#transport-and-protocol-classes)
+- [Operations](#operations)
+  - [Health monitoring](#health-monitoring)
+  - [Component lifecycle and startup ordering](#component-lifecycle-and-startup-ordering)
+  - [Error propagation](#error-propagation)
+  - [Logging and audit requirements](#logging-and-audit-requirements)
+  - [Control plane / sandbox daemon](#control-plane--sandbox-daemon)
+- [Closing](#closing)
+  - [Implementation guidance derived from the design](#implementation-guidance-derived-from-the-design)
+  - [Residual risks](#residual-risks)
+  - [Final design summary](#final-design-summary)
 
 ## Purpose
 
@@ -112,7 +118,9 @@ This subsystem reduces risk. It does not eliminate it.
 9. **No implementation leakage into policy**
    Users of the sandbox policy should not need to know which layer enforces a rule. They should define what is allowed, what must be inspected, and what exceptions exist.
 
-## End-to-end architecture
+## Architecture
+
+### End-to-end architecture
 
 The networking subsystem spans two execution environments — the VM and the gateway container — connected by a per-session network (Docker bridge on Linux, dedicated vmnet on macOS).
 
@@ -140,7 +148,7 @@ nftables (deny by default, PREROUTING DNAT)
     └─ UDP → nftables (IP/port allow/deny)
 ```
 
-### Key properties
+#### Key properties
 
 **Traffic is forwarded, not locally generated.** In the gateway container, traffic from the VM arrives on the container's network interface — it is forwarded traffic, not traffic generated by a local process. This is the fundamental difference from a shared-namespace model. nftables uses PREROUTING DNAT (for forwarded traffic) rather than OUTPUT REDIRECT (for locally-generated traffic).
 
@@ -148,11 +156,11 @@ nftables (deny by default, PREROUTING DNAT)
 
 **Inner Docker traffic is transparent.** When the agent runs Docker containers inside the VM, those containers' outbound traffic follows the same path: inner container → inner Docker bridge → VM kernel NAT → VM virtio-net → gateway → pipeline → destination. The proxy pipeline sees the VM's IP as the source, not the inner container's IP. No special configuration is needed. See [VM-side networking configuration § Inner Docker networking](#inner-docker-networking).
 
-## VM-side networking configuration
+### VM-side networking configuration
 
 The VM must be configured to route all traffic through the gateway container and to trust the interception CA. This configuration is applied during VM provisioning (cloud-init) and is immutable from the agent's perspective. For the provisioning process and VM lifecycle, see [sandbox-design.md § VM specification](sandbox-design.md#vm-specification).
 
-### Network interface and routing
+#### Network interface and routing
 
 The VM has a single network interface (virtio-net) with a single default route:
 
@@ -161,13 +169,13 @@ The VM has a single network interface (virtio-net) with a single default route:
 * **Static or DHCP.** The VM's IP on the /30 subnet is assigned during provisioning — either statically in the Lima template or via DHCP from the per-session network.
 * **No alternate routes.** No other routes exist. The routing table contains only the default route to the gateway, the connected /30 subnet route, and loopback.
 
-### DNS configuration
+#### DNS configuration
 
 `/etc/resolv.conf` points to the gateway container's DNS resolver IP on the /30 subnet. This makes the gateway's policy-aware DNS resolver the default resolver for all applications in the VM.
 
 nftables rules inside the gateway provide a safety net: all DNS traffic (TCP/UDP port 53) arriving from the VM is redirected to the local resolver regardless of the destination address. Applications that ignore `resolv.conf` or hardcode resolver addresses (e.g., `8.8.8.8`) are still forced through the policy-aware resolver.
 
-### Agent user restrictions
+#### Agent user restrictions
 
 The agent process runs as a non-root user (`agent`) that is a member of the `docker` group. Critically:
 
@@ -176,11 +184,11 @@ The agent process runs as a non-root user (`agent`) that is a member of the `doc
 
 These restrictions are enforced by the guest OS hardening described in [sandbox-design.md § Guest OS hardening](sandbox-design.md#guest-os-hardening).
 
-### Single-homed networking
+#### Single-homed networking
 
 Docker sets `net.ipv4.ip_forward=1` globally inside the VM for its internal bridge networking. This has no security implication because the VM has a single external network interface (virtio-net) with one default route to the gateway — there is no second interface to forward traffic to, so the VM cannot act as a router. The agent cannot add interfaces (no `CAP_NET_ADMIN`). IPv6 is not enabled inside the VM.
 
-### CA certificate trust
+#### CA certificate trust
 
 TLS interception by mitmproxy (inside the gateway container) requires that applications in the VM trust the interception CA. The CA certificate (public part only) is installed during provisioning:
 
@@ -194,7 +202,7 @@ TLS interception by mitmproxy (inside the gateway container) requires that appli
 
 The CA private key is never present inside the VM. It exists only in the gateway container, accessible to mitmproxy. Per-session CA generation and lifecycle are described in [Certificate management](#certificate-management).
 
-### Inner Docker networking
+#### Inner Docker networking
 
 The agent runs a Docker daemon inside the VM. This is standard Docker — the inner daemon creates its own bridge networks, manages its own iptables/nftables rules, and performs its own NAT. This is entirely within the VM's network namespace and does not interact with the gateway's configuration.
 
@@ -211,7 +219,7 @@ When inner containers communicate with each other (e.g., services in a `docker c
 
 Port mapping (`-p` flag) works normally inside the VM. Inner containers can bind ports and other inner containers (or the agent process) can reach them via `localhost` or the inner bridge. These connections stay inside the VM.
 
-## Per-session network
+### Per-session network
 
 Each session has a dedicated IPv4-only network that provides the link layer between the VM and its gateway container. On Linux, this is a Docker bridge network; on macOS, this is a dedicated socket_vmnet instance. The network is provisioned by the sandbox daemon (at session creation on Linux, from a pre-provisioned pool on macOS) and released during session destruction. For the full session lifecycle, see [sandbox-design.md § Session lifecycle](sandbox-design.md#session-lifecycle).
 
@@ -221,9 +229,9 @@ VM (virtio-net) ←→ per-session network ←→ gateway container (eth0)
 
 The connectivity mechanism differs by platform, but both achieve the same result: the VM has a single NIC with a default route pointing at the gateway container's IP, and traffic arrives at the gateway with original destination intact so that PREROUTING DNAT works correctly.
 
-### VM-to-gateway connectivity
+#### VM-to-gateway connectivity
 
-#### Linux
+##### Linux
 
 On Linux, the sandbox daemon creates a per-session Docker bridge network. The gateway container attaches to this bridge normally (via Docker). The sandbox VM's QEMU/KVM process uses a TAP device on the same bridge as its network backend — Lima configures this via its `networks` YAML stanza. This gives the VM direct L2 connectivity to the gateway container on the bridge subnet, and the VM's default route points to the gateway's IP on the bridge.
 
@@ -241,7 +249,7 @@ Linux host
 
 Each session is fully isolated at L2 — the TAP device, bridge, and gateway container form a private network segment. No cross-session traffic is possible.
 
-#### macOS
+##### macOS
 
 On macOS, Docker does not run natively — it runs inside a Linux VM (Docker Desktop's VM, or a Colima/Lima VM). This means a sandbox VM cannot attach a TAP device to a Docker bridge on the macOS host because that bridge exists inside another VM's network namespace.
 
@@ -282,13 +290,13 @@ Each session is fully isolated at L2 — the vmnet instance, gateway container, 
 
 The shared Colima VM introduces the only cross-session failure mode in the architecture. On Linux, gateway containers are independent — a single gateway crash affects only its session, and all other sessions continue unaffected. On macOS, the Colima VM hosts all gateway containers, so if it crashes, every active session loses networking simultaneously. This is an inherent consequence of the macOS platform constraint (Docker requires a Linux VM), not a design flaw. sandboxd must monitor the Colima VM's health, restart it on failure, and recreate gateway containers afterward; sessions will experience a networking interruption during recovery. All other failure modes remain session-scoped on both platforms.
 
-### Isolation properties
+#### Isolation properties
 
 * **No shared L2 segments.** Each session gets its own network segment — a Docker bridge on Linux, a dedicated vmnet instance on macOS. Sessions do not share network segments.
 * **No inter-session traffic.** Because network segments are per-session, VMs from different sessions cannot communicate at the network level. There is no L2 path between sessions.
 * **No host network.** The gateway container is attached to the per-session network, not the host network (`--network` is the session bridge on Linux; macvlan on the session's vmnet on macOS). The gateway cannot reach other sessions' networks or the host's network stack directly.
 
-### Subnet allocation
+#### Subnet allocation
 
 Each session gets its own /30 subnet (2 usable IPs: one for the gateway, one for the VM). Subnets are carved from a configurable base range — default `10.209.0.0/24` — chosen from an uncommon RFC 1918 slice to minimize conflicts with VPN and corporate networks. Operators can override the base range to avoid conflicts with their specific network environment.
 
@@ -298,15 +306,15 @@ This applies to both platforms: Docker bridge subnets on Linux and vmnet subnets
 * the DNS resolver address (in `/etc/resolv.conf`)
 * the DNAT target for nftables redirect rules
 
-### MTU
+#### MTU
 
 The MTU must be consistent across the VM NIC, per-session network segment, and gateway interface. Docker bridge networks on Linux default to 1500, which is correct for most environments. On macOS, each per-session vmnet instance uses the same default. On cloud networks with encapsulation overhead (e.g., AWS VPCs with VxLAN), the host's outbound MTU may be lower — the gateway relies on standard path MTU discovery for outbound traffic. If outbound path MTU issues arise, the per-session network MTU can be configured at session creation time; this is an implementation detail, not a design concern.
 
-## Gateway container pipeline
+### Gateway container pipeline
 
 The gateway container runs the proxy pipeline outside the VM, on the host side of the VM's virtual NIC. It is a standard Docker container using the runc runtime. For deployment details, security posture, and lifecycle management, see [sandbox-design.md § Gateway container](sandbox-design.md#gateway-container).
 
-### What runs inside the gateway
+#### What runs inside the gateway
 
 * **nftables** — PREROUTING DNAT rules for forwarded traffic from the VM
 * **Envoy** — original_dst listener for protocol-aware routing
@@ -319,7 +327,7 @@ IP forwarding must be enabled in the gateway container (`net.ipv4.ip_forward=1`,
 
 The entire networking subsystem is IPv4-only by design. IPv6 forwarding is explicitly disabled in the gateway (`net.ipv6.conf.all.forwarding=0`), and any IPv6 traffic that reaches the gateway is dropped by a blanket nftables `ip6` drop rule. This is a deliberate simplification — a single-stack network reduces attack surface and eliminates an entire class of bypass vectors (see [Escape-pattern assumptions and responses](#escape-pattern-assumptions-and-responses)). IPv6 support is deferred as a future improvement (see [Residual risks](#residual-risks)).
 
-### Traffic interception model
+#### Traffic interception model
 
 Traffic arrives at the gateway container from the VM as forwarded packets on the container's network interface. This is fundamentally different from intercepting locally-generated traffic in a shared namespace. The following table compares the previous design iteration (shared network namespace) with the current gateway container model for readers familiar with the earlier approach:
 
@@ -334,7 +342,7 @@ nftables PREROUTING DNAT intercepts forwarded traffic before routing decisions a
 
 On macOS, the gateway container uses a Docker macvlan network on a per-session vmnet instance instead of a Docker bridge (see [VM-to-gateway connectivity § macOS](#macos) for the full explanation). The pipeline behavior is identical — traffic arrives on the gateway's network interface from the VM with the original destination intact, and the same PREROUTING DNAT rules intercept it. The vmnet/macvlan vs. bridge distinction is a link-layer detail that does not affect the proxy pipeline, policy model, or any behavior described in this document.
 
-### Loopback inside the gateway
+#### Loopback inside the gateway
 
 The gateway container has its own loopback interface. Loopback is used for internal communication between pipeline components (e.g., Envoy forwarding to mitmproxy). Loopback traffic inside the gateway is not subject to the PREROUTING DNAT rules — those rules match only traffic arriving on the VM-facing interface from the VM.
 
@@ -346,13 +354,15 @@ Loopback principles:
 * prefer Unix sockets for control/admin paths where possible
 * strict separation of data plane (forwarded traffic from VM) and control plane (component-internal communication)
 
-### No self-traffic exemptions needed
+#### No self-traffic exemptions needed
 
 In the old shared-namespace model (OUTPUT REDIRECT), Envoy and mitmproxy's outbound connections to real destinations were locally-generated traffic in the same namespace as the intercepted process — they would hit the same OUTPUT chain rules and loop back into the proxy. That model required explicit UID/GID-based exemptions so the proxies' own traffic could bypass interception.
 
 In the current gateway container model, this problem does not exist. PREROUTING DNAT rules match only forwarded traffic arriving on the VM-facing interface from the VM. When Envoy or mitmproxy open outbound connections to real destinations, those connections are locally generated inside the gateway container — they traverse the OUTPUT chain, not PREROUTING. Since the DNAT rules are in PREROUTING, locally-generated traffic never hits them. The chain separation inherently prevents interception loops without any exemption rules.
 
-## Policy outcomes
+## Policy model
+
+### Policy outcomes
 
 Every attempted outbound flow must resolve to exactly one outcome:
 
@@ -363,15 +373,15 @@ Every attempted outbound flow must resolve to exactly one outcome:
 
 There is no implicit "best effort allow."
 
-## Policy evaluation model
+### Policy evaluation model
 
-### Pipeline short-circuit
+#### Pipeline short-circuit
 
 Policy is evaluated sequentially through the pipeline. Each layer either forwards traffic to the next layer or routes it directly to the destination. Once traffic exits the pipeline at a given layer, downstream layers never see it and their rules are not evaluated.
 
 This means there is no policy conflict resolution. The deny-by-default baseline combined with the fixed pipeline order makes ambiguous overlaps impossible. If a domain is declared as a TLS-verified bypass, its traffic exits at Envoy — any mitmproxy rules that might reference the same domain are never reached. They are irrelevant, not overridden.
 
-### Assurance level determines exit point
+#### Assurance level determines exit point
 
 The declared assurance level in policy determines which pipeline layer is the terminal decision point for a given flow:
 
@@ -383,15 +393,15 @@ The declared assurance level in policy determines which pipeline layer is the te
 | Level 2 — TLS-verified | Envoy | mitmproxy is not involved |
 | Level 3 — HTTP inspected | mitmproxy | Full pipeline traversal |
 
-## Assurance levels
+### Assurance levels
 
 The assurance level indicates how much the sandbox can verify about a connection. Lower levels mean less verification by the sandbox — and therefore require greater trust in the destination. At level 3, the sandbox verifies request-level identity and enforces fine-grained policy, so minimal trust in the destination is needed. At level 1, the sandbox can only gate by IP and port, so the operator must trust that the destination itself is safe. Level 0 would require infinite trust — which is impossible to justify — so it is denied.
 
-### Level 0 — Denied
+#### Level 0 — Denied
 
 The flow is not permitted.
 
-### Level 1 — Transport-only
+#### Level 1 — Transport-only
 
 Lowest assurance. The connection is opaque — no TLS is expected or required. The transport protocol (TCP or UDP) is a required property of the policy entry; nftables requires the protocol to generate rules.
 
@@ -411,7 +421,7 @@ Both share the same assurance: opaque semantics, identity limited to IP/port, ap
 
 Key distinction from TLS-verified: no encryption is expected or verified. This is a raw capability grant to reach a specific endpoint.
 
-### Level 2 — TLS-verified
+#### Level 2 — TLS-verified
 
 Moderate assurance. The connection uses TLS and connection-level identity is verified, but HTTP inspection is not performed.
 
@@ -431,7 +441,7 @@ Typical reasons:
 * certificate pinning or custom trust store prevents HTTP interception
 * application cannot trust the interception CA
 
-### Level 3 — HTTP inspected
+#### Level 3 — HTTP inspected
 
 Strongest supported assurance.
 
@@ -445,9 +455,9 @@ Conditions:
 
 This is the only true "happy path."
 
-## Layer responsibilities
+### Layer responsibilities
 
-#### Kernel firewall (nftables)
+##### Kernel firewall (nftables)
 
 Provides hard enforcement and transparent interception of forwarded traffic from the VM:
 
@@ -469,7 +479,7 @@ Provides hard enforcement and transparent interception of forwarded traffic from
 
 This eliminates the need for userland transparent interception proxies. The kernel handles the redirect, and Envoy recovers the original destination natively.
 
-#### Local DNS resolver
+##### Local DNS resolver
 
 A local DNS resolver runs inside the gateway container and serves as the single enforced DNS path:
 
@@ -481,7 +491,7 @@ The resolver is the bridge between domain-based policy and IP-based enforcement.
 
 **ECH stripping:** The local DNS resolver strips HTTPS/SVCB records that carry ECHConfig from DNS responses by default. This prevents clients from learning the server's Encrypted Client Hello public key, forcing a fallback to standard TLS with plaintext SNI. This is necessary because ECH encrypts the entire inner ClientHello — including SNI — using the server's public key, which defeats both SNI-based routing at Envoy and TLS interception at mitmproxy. ECH stripping applies to level 2 (TLS-verified) and level 3 (HTTP inspected) destinations. Level 2 requires SNI extraction and validation, which ECH also defeats. Level 1 (transport-only) destinations are not affected — they do not depend on TLS or SNI. ECH stripping is enabled by default because without it, increasing ECH adoption would silently break HTTP inspection for destinations that previously worked, producing confusing TLS handshake errors with no clear cause.
 
-#### Envoy
+##### Envoy
 
 Receives DNAT-redirected TCP connections and provides protocol-aware routing and bypass classification:
 
@@ -504,7 +514,7 @@ Why Envoy over HAProxy: not every TLS-capable protocol begins with a TLS ClientH
 
 If wire behavior contradicts the declared level (e.g., a level 2 destination sends no TLS ClientHello), the connection is denied. Policy drives classification, not protocol sniffing.
 
-#### mitmproxy
+##### mitmproxy
 
 Provides the only strong verification path for HTTP(S):
 
@@ -515,7 +525,158 @@ Provides the only strong verification path for HTTP(S):
 * visibility and analytics
 * upstream-proxy support where explicitly allowed
 
-## Threat model
+### Policy model
+
+#### Policy abstraction
+
+The policy model must describe:
+
+* what destinations or services are allowed
+* which traffic classes require inspection
+* which traffic classes are allowed only via explicit bypass
+* what assurance level applies
+* what logging and auditing requirements apply
+
+The policy model must **not** expose internal components such as:
+
+* Envoy listener/filter/cluster configuration
+* mitmproxy ignore lists
+* nftables rules
+* DNS resolver configuration
+* routing tables
+
+Those are backend implementation artifacts.
+
+### Fundamental design rule
+
+#### HTTP inspection is mandatory by default
+
+If a flow is HTTP or HTTPS and the sandbox wants meaningful host-level policy, then inspection is mandatory.
+
+This is true even if the user defines no method/path rules of their own.
+
+Reason:
+
+* SNI is a connection property. HTTP `Host` / `:authority` is a request property.
+* HTTP/2 multiplexes requests to multiple hosts over a single TLS connection — this is standard protocol behavior, not an attack. A connection legitimately established to an allowed domain (valid SNI) can carry requests targeting different hosts.
+* This is the same class of problem as HTTP-level domain fronting (see [domain fronting analysis in the SNI model](#domain-fronting)), but arising from protocol design rather than malicious intent.
+* Even HTTP/1.1 keep-alive allows host switching between requests on the same connection.
+* Therefore, connection-level checks (SNI, IP) are structurally insufficient for host-level policy — only request-level inspection can enforce it.
+
+So:
+
+* HTTP(S) without inspection is **not** the default allow path
+* it is an **explicit bypass**
+
+### Why HTTP is the only happy path
+
+HTTP and HTTPS are the only traffic classes for which the sandbox can, in general, do all of the following together:
+
+* preserve mostly transparent application behavior
+* observe destination identity at request level
+* validate host per request
+* apply fine-grained policy
+* produce meaningful analytics
+* distinguish "service A" from "service B" on the same IP
+
+Every other traffic class loses one or more of those properties.
+
+### Bypass framework
+
+#### Definition
+
+A bypass is any policy entry that allows traffic below level 3 (HTTP inspected) — that is, at level 1 (transport-only) or level 2 (TLS-verified) — without full HTTP inspection and request-level verification.
+
+Bypasses are valid and necessary. They are not failures of the system. But they must be explicit, logged, and reviewable.
+
+#### Bypass principles
+
+1. No implicit bypasses
+2. Every bypass has a declared reason
+3. Every bypass has a declared assurance level (1 or 2)
+4. Every bypass is visible in logs and audits
+5. Bypasses should be as narrow as possible
+6. Bypasses should not be mistaken for fully verified traffic
+
+#### Bypass as policy metadata
+
+A bypass is not a separate classification system. It is a policy entry at a specific assurance level with a documented reason. The assurance levels (0–3) are the only classification needed.
+
+Example reasons for level 1 (transport-only):
+
+* protocol requires UDP (e.g., DNS to a specific resolver)
+* protocol requires raw TCP semantics
+* STARTTLS protocol without a supported network filter
+* legacy protocol without TLS support
+
+Example reasons for level 2 (TLS-verified):
+
+* certificate pinning prevents HTTP interception
+* custom trust store prevents transparent inspection
+* non-HTTP TLS protocol (database, mail, custom)
+* upstream proxy semantics require special handling
+
+#### Policy semantics for bypasses
+
+A bypass policy entry should document:
+
+* what assurance level applies
+* why HTTP inspection is not possible
+* what narrower checks still apply at the granted level
+* what security implications are accepted
+
+Examples of policy intent:
+
+* allow HTTPS to service X at level 2 (TLS-verified) — reason: certificate pinning
+* allow PostgreSQL to service Y at level 2 (TLS-verified) — reason: non-HTTP TLS protocol
+* allow legacy service Z at level 1 (transport-only, TCP) — reason: no TLS support
+* allow UDP to resolver R at level 1 (transport-only, UDP) — reason: DNS requires UDP
+* allow explicit upstream HTTP proxy P at level 2 (TLS-verified) — reason: upstream proxy workflow
+
+### Policy authoring requirements
+
+The policy language should let users express intent such as:
+
+* allow web access to service X
+* require full HTTP inspection for service Y
+* allow service Z only at TLS-verified level
+* allow UDP only to resolver R
+* deny everything else
+* allow only GET requests to `api.github.com/repos/{owner}/{repo}/pulls/{number}` — granting read access to a specific pull request without broader GitHub API access
+* allow only GET and HEAD to a specific service — no mutations permitted
+* deny POST to any path on a specific service
+* allow access to a service but only on specific paths
+
+The policy language should not require users to know:
+
+* which backend enforces the rule
+* which ACL syntax is used
+* whether the rule becomes an SNI check, DNS check, host check, or firewall rule
+
+Those are compilation details of the policy engine.
+
+HTTP-level method and path controls are the key capability that distinguishes this sandbox from network-level firewalls. Any firewall can gate by IP and port. The ability to constrain not just *which* service is reachable but *what operations* are permitted on that service is what makes HTTP inspection meaningful. A sandbox policy that allows access to a version control API but only permits reading a specific pull request is fundamentally more constrained than one that allows all traffic to the API's IP address.
+
+#### Policy schema
+
+The concrete policy schema (e.g., JSON Schema) is intentionally not defined in this design document. It will be produced as part of the implementation, once the interaction between policy intent and backend capabilities is better understood.
+
+However, the implementation **must** produce a formal, machine-readable schema document. This is a hard requirement, not an optional deliverable.
+
+#### Policy versioning
+
+Every policy document must declare the schema version it conforms to, following the pattern established by Kubernetes manifests:
+
+* the version field must be present and must use [Semantic Versioning](https://semver.org/)
+* the system must reject policy documents whose declared version is incompatible with the currently supported schema
+* backward-compatible minor/patch versions may be accepted; incompatible major versions must be rejected
+* the schema version is a property of the policy document, not of the sandbox runtime
+
+This ensures that policy documents remain interpretable over time and that silent behavioral changes from schema drift are prevented.
+
+## Threat model and security
+
+### Threat model
 
 Assume sandboxed code may be:
 
@@ -536,7 +697,7 @@ Assume the sandbox must defend primarily against:
 * accidental over-permissiveness caused by policy confusion
 * illusion of strong verification where only weak signals exist
 
-## Security boundary
+### Security boundary
 
 The system strongly controls:
 
@@ -565,451 +726,73 @@ approved first-hop destination
 
 After that first hop, trust depends on the service itself.
 
-## Policy model
-
-### Policy abstraction
-
-The policy model must describe:
-
-* what destinations or services are allowed
-* which traffic classes require inspection
-* which traffic classes are allowed only via explicit bypass
-* what assurance level applies
-* what logging and auditing requirements apply
-
-The policy model must **not** expose internal components such as:
-
-* Envoy listener/filter/cluster configuration
-* mitmproxy ignore lists
-* nftables rules
-* DNS resolver configuration
-* routing tables
-
-Those are backend implementation artifacts.
-
-## Fundamental design rule
-
-### HTTP inspection is mandatory by default
-
-If a flow is HTTP or HTTPS and the sandbox wants meaningful host-level policy, then inspection is mandatory.
-
-This is true even if the user defines no method/path rules of their own.
-
-Reason:
-
-* SNI is a connection property. HTTP `Host` / `:authority` is a request property.
-* HTTP/2 multiplexes requests to multiple hosts over a single TLS connection — this is standard protocol behavior, not an attack. A connection legitimately established to an allowed domain (valid SNI) can carry requests targeting different hosts.
-* This is the same class of problem as HTTP-level domain fronting (see [domain fronting analysis in the SNI model](#domain-fronting)), but arising from protocol design rather than malicious intent.
-* Even HTTP/1.1 keep-alive allows host switching between requests on the same connection.
-* Therefore, connection-level checks (SNI, IP) are structurally insufficient for host-level policy — only request-level inspection can enforce it.
-
-So:
-
-* HTTP(S) without inspection is **not** the default allow path
-* it is an **explicit bypass**
-
-## Why HTTP is the only happy path
-
-HTTP and HTTPS are the only traffic classes for which the sandbox can, in general, do all of the following together:
-
-* preserve mostly transparent application behavior
-* observe destination identity at request level
-* validate host per request
-* apply fine-grained policy
-* produce meaningful analytics
-* distinguish "service A" from "service B" on the same IP
-
-Every other traffic class loses one or more of those properties.
-
-## Bypass framework
-
-### Definition
-
-A bypass is any policy entry that allows traffic below level 3 (HTTP inspected) — that is, at level 1 (transport-only) or level 2 (TLS-verified) — without full HTTP inspection and request-level verification.
-
-Bypasses are valid and necessary. They are not failures of the system. But they must be explicit, logged, and reviewable.
-
-### Bypass principles
-
-1. No implicit bypasses
-2. Every bypass has a declared reason
-3. Every bypass has a declared assurance level (1 or 2)
-4. Every bypass is visible in logs and audits
-5. Bypasses should be as narrow as possible
-6. Bypasses should not be mistaken for fully verified traffic
-
-### Bypass as policy metadata
-
-A bypass is not a separate classification system. It is a policy entry at a specific assurance level with a documented reason. The assurance levels (0–3) are the only classification needed.
-
-Example reasons for level 1 (transport-only):
-
-* protocol requires UDP (e.g., DNS to a specific resolver)
-* protocol requires raw TCP semantics
-* STARTTLS protocol without a supported network filter
-* legacy protocol without TLS support
-
-Example reasons for level 2 (TLS-verified):
-
-* certificate pinning prevents HTTP interception
-* custom trust store prevents transparent inspection
-* non-HTTP TLS protocol (database, mail, custom)
-* upstream proxy semantics require special handling
-
-### Policy semantics for bypasses
-
-A bypass policy entry should document:
-
-* what assurance level applies
-* why HTTP inspection is not possible
-* what narrower checks still apply at the granted level
-* what security implications are accepted
-
-Examples of policy intent:
-
-* allow HTTPS to service X at level 2 (TLS-verified) — reason: certificate pinning
-* allow PostgreSQL to service Y at level 2 (TLS-verified) — reason: non-HTTP TLS protocol
-* allow legacy service Z at level 1 (transport-only, TCP) — reason: no TLS support
-* allow UDP to resolver R at level 1 (transport-only, UDP) — reason: DNS requires UDP
-* allow explicit upstream HTTP proxy P at level 2 (TLS-verified) — reason: upstream proxy workflow
-
-## Kernel firewall requirements
-
-The kernel firewall (nftables) inside the gateway container is the hard enforcement layer and the transparent interception mechanism for forwarded traffic from the VM.
-
-### Must enforce
-
-* deny by default — all traffic denied unless explicitly permitted
-* only TCP and UDP are supported IP protocols
-* ICMP is explicitly denied by default
-* tunneling protocols (GRE, IPIP, WireGuard, etc.) are explicitly denied
-* explicit allow only for permitted traffic
-* no direct internet egress outside the policy path
-* no direct DNS except the local resolver path
-* IPv4 rules implement full policy; IPv6 rules are a blanket drop (the networking subsystem is IPv4-only)
-* no fail-open on Envoy or mitmproxy failure
-* no accidental side interfaces or alternate routes
-
-### Must provide
-
-* nftables PREROUTING DNAT rules to redirect forwarded TCP traffic from the VM to Envoy
-* nftables PREROUTING DNAT rules to redirect forwarded DNS traffic from the VM to the local resolver
-* nftables rules for UDP allow/deny (IP/port based)
-* gateway-internal loopback exemptions
-* explicit host and port restrictions as derived from policy
-
-### Important rule
-
-The kernel firewall is authoritative for **containment** and **transparent interception**, not for final service identity.
-
-## DNS model
-
-### Principle
-
-There must be exactly one approved DNS resolution path available to the VM.
-
-### Requirements
-
-* deny direct external DNS by default
-* deny alternate resolver paths unless explicitly allowed
-* all DNS policy must be explicit
-* DNS answers do not by themselves authorize traffic
-
-### DNS resolution for policy enforcement
-
-Policy is expressed in terms of domain names, but some enforcement components operate on IP addresses. The local DNS resolver bridges this gap:
-
-* the local resolver is the only DNS path available to the VM — resolv.conf points to it, and nftables PREROUTING DNAT redirects all DNS traffic from the VM to it
-* non-allowed domains receive NXDOMAIN — the resolver enforces policy at the DNS layer
-* AAAA records are stripped from all responses — the resolver returns only A records. The network path is IPv4-only, so AAAA records for allowed domains would resolve to unreachable IPv6 addresses. Stripping them avoids unnecessary resolution failures and happy-eyeballs delays in dual-stack client libraries.
-* for allowed domains, resolution results are reported to the sandbox daemon, which maintains TTL-aware IP-to-domain mappings and pushes configuration updates to all enforcement components that operate on IP addresses
-* re-resolution occurs when DNS TTL expires, with a configurable maximum interval (e.g., 60 seconds) as an upper bound regardless of TTL — domains with very long TTLs must not leave stale IPs in place indefinitely
-* on resolution failure: immediately remove the previously resolved IPs for the affected domain (fail-closed), log the failure, and reflect the failure in the sandbox health status — stale IPs from domains that no longer resolve are a potential attack vector (e.g., IP takeover) and must not persist
-* all DNS queries are logged for audit trail purposes, providing domain→IP correlation that supports connection attribution
-
-### DNS interception is tamper-proof
-
-Even if the agent gains root inside the VM, it can modify `resolv.conf`, hardcode alternate DNS servers, or configure applications to use any resolver it chooses. None of this matters. All traffic from the VM exits through the single virtio-net NIC, crosses the bridge, and hits the gateway container's nftables PREROUTING DNAT rules. Any packet destined for port 53 (UDP or TCP) is redirected to the local resolver regardless of the original destination address the agent specified.
-
-The gateway container runs on the host side of the hardware virtualization boundary — outside the VM. The agent cannot modify its nftables rules, restart its processes, or interfere with it in any way. This is a stronger property than the old namespace-based model: the enforcement point sits behind a hardware boundary (virtio-net), not just a kernel boundary (namespaces). The agent's root privileges are scoped to the VM guest and do not extend to the host or gateway.
-
-### Important limitation
-
-DNS allowlisting is not final service verification.
-
-A DNS answer:
-
-* may be shared across many hostnames
-* may be one of many CDN edges
-* may later be used with a different hostname or protocol
-
-Therefore DNS is only an input to policy, never final proof.
-
-### Stale IP window
-
-There is an inherent window between when a domain's IP address changes and when the control plane re-resolves and pushes the update. During this window, traffic to the old IP remains permitted while traffic to the new IP is not yet allowed.
-
-This is a known limitation of any DNS-based policy system. TTL-aware resolution minimizes the window but cannot eliminate it entirely. The design accepts this trade-off. Policy authors should be aware that IP-level enforcement is eventually consistent with DNS, not instantaneous.
-
-### Connection termination on IP rotation
-
-When DNS re-resolution produces a **changed** IP set for a domain (IPs added, removed, or replaced), the sandbox daemon pushes updated configuration to all enforcement components. IPs no longer present in the new set are removed from nftables rules and Envoy configuration, and existing connections to those removed IPs are terminated immediately. There is no grace period or connection draining.
-
-When re-resolution produces the **same** IP set as the previous resolution, no action is taken — existing connections, nftables rules, and Envoy configuration are left untouched. This is critical for domains with short TTLs (common for CDNs), which would otherwise cause unnecessary connection churn for long-lived connections such as WebSocket streams or gRPC streaming RPCs.
-
-Rationale for immediate termination on actual IP change:
-
-* an old IP may no longer belong to the intended service — allowing continued communication risks connecting to a different host (IP takeover)
-* this is consistent with the fail-closed philosophy applied to DNS resolution failure
-* the sandbox is not a production runtime — brief connection interruptions are acceptable by design
-* applications that need resilience will retry naturally
-
-### DNS-over-TLS and DNS-over-HTTPS
-
-DNS-over-TLS (DoT, port 853) is blocked by nftables unless explicitly allowed. No special handling is required.
-
-DNS-over-HTTPS (DoH) operates over port 443 and is indistinguishable from normal HTTPS traffic at the network level. If an application sends DoH queries to an allowed HTTPS destination (e.g., a public DNS provider that is also in the allow list), it can resolve domain names outside the local resolver's control.
-
-This does not expand the application's network reach — resolved IPs must still be present in the nftables allow list to be reachable. However, it bypasses the local resolver's query logging and NXDOMAIN enforcement, creating a gap in audit trails.
-
-DoH is accepted as a residual risk. Operators who require complete DNS audit coverage can block known DoH providers at the policy level.
-
-## SNI model
-
-### Principle
-
-SNI is useful, but only as a connection-level signal.
-
-It is suitable for:
-
-* coarse TLS routing
-* coarse host expectation
-* reducing ambiguity on shared IPs
-* rejecting clearly invalid TLS cases
-
-It is not sufficient for final HTTP authorization.
-
-### Rule
-
-* if HTTP(S) is being used and strict host policy matters, SNI alone is not enough
-* no-SNI TLS requires explicit bypass
-* SNI validation is required where applicable, but it is not the final authority for HTTP traffic
-
-### Domain fronting
-
-Domain fronting is a key attack that motivates the combination of SNI validation and HTTP-level host validation. Two variants exist:
-
-**SNI-level fronting:** A shared IP (e.g., a CDN edge) hosts both allowed and disallowed services. The application connects to the shared IP but sets the TLS SNI to a disallowed domain. SNI validation catches this — the SNI does not match any allowed domain and the connection is rejected.
-
-**HTTP-level fronting:** The application sets the TLS SNI to an allowed domain (passing SNI validation) but sets the HTTP `Host` or `:authority` header to a different, disallowed domain. The destination server (e.g., a CDN) routes based on the HTTP header, not the SNI, delivering traffic to the disallowed service. HTTP-level host validation catches this — the mismatch between SNI and the request-level host is detected by mitmproxy.
-
-Neither check alone is sufficient. SNI validation without HTTP inspection misses HTTP-level fronting. HTTP inspection without SNI validation misses connections that never reach mitmproxy (levels below 3). Both checks are required, and they catch different attacks.
-
-## HTTP model
-
-### Principle
-
-HTTP identity is request-scoped, not connection-scoped.
-
-Therefore:
-
-This is a direct consequence of HTTP/2 connection multiplexing and HTTP/1.1 keep-alive host switching — the same connection may carry requests for different hosts, making connection-level identity (SNI, IP) insufficient. See also the [domain fronting analysis in the SNI model](#domain-fronting).
-
-* HTTP/1 `Host` must be validated per request
-* HTTP/2 `:authority` must be validated per request
-
-### Consequence
-
-HTTP inspection is mandatory for normal allowed web traffic.
-
-### HTTP rules
-
-The sandbox must be able to enforce, when configured:
-
-* allowed hosts
-* allowed methods
-* allowed paths
-* allowed schemes
-* host/path consistency
-* explicit block or allow rules
-
-Even if only host-level policy is required, request-level inspection remains mandatory.
-
-## Certificate management
-
-### Requirement
-
-TLS interception by mitmproxy requires a CA certificate that applications in the VM trust. The sandbox must manage this certificate lifecycle.
-
-### CA generation and storage
-
-* a unique CA keypair is generated per session at creation time
-* the CA is short-lived — its validity period matches the session lifetime
-* the private key is stored only in the gateway container (accessible to mitmproxy) and is never present inside the VM
-* per-session generation ensures that compromise of one session's CA does not affect others
-
-### Trust store injection
-
-The CA certificate (public part only) is injected into the VM during provisioning so that applications trust the interception CA:
-
-* installed in the VM's system trust store (`/usr/local/share/ca-certificates/` + `update-ca-certificates`)
-* standard environment variables set for applications that use their own trust store resolution (`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `CURL_CA_BUNDLE`)
-* installed in the Docker daemon trust store (`/etc/docker/certs.d/`) for registry image pulls
-
-This provides transparent interception for applications that rely on the system trust store or standard environment variables. The detailed trust store paths and environment variables are specified in [VM-side networking configuration § CA certificate trust](#ca-certificate-trust).
-
-### Certificate pinning and custom trust stores
-
-Applications that use certificate pinning or hardcoded trust stores will reject the interception CA. These applications require a TLS-verified bypass (level 2).
-
-Some pinned applications expose configuration options to provide a custom CA certificate. Whether and how to use such options is the user's responsibility — the sandbox provides the bypass mechanism, not application-specific CA configuration.
-
-### Rotation
-
-For ephemeral sessions, rotation is not required — the CA lives and dies with the session. For long-lived sessions, a CA rotation procedure is a future enhancement.
-
-## Upstream proxy support
-
-### Requirement
-
-The sandbox may need to support applications that intentionally use an explicit upstream HTTP proxy.
-
-### Design position
-
-This is allowed only as an explicit policy path.
-
-### Why this is special
-
-For a normal transparent client:
-
-* proxy-style `CONNECT` is unexpected and invalid
-
-For a client intentionally using an upstream HTTP proxy:
-
-* `CONNECT` and absolute-form HTTP requests are expected
-
-Therefore:
-
-* explicit upstream-proxy use must be modeled as a separate policy case
-* it must not be silently merged into the ordinary transparent-origin path
-
-### CONNECT handling
-
-CONNECT requests are only valid when targeting a destination declared as an upstream proxy in policy. CONNECT to any other destination is denied — this prevents applications from using CONNECT as a tunneling mechanism through non-proxy endpoints.
-
-When mitmproxy inspects traffic to a declared upstream proxy (level 3), it also validates the CONNECT target — the destination the client asks the proxy to connect to. If the CONNECT target is not an allowed destination in policy, the request is denied with an HTTP 599 response. This is a special case where the sandbox can see the intended next hop beyond the proxy and enforces what is visible.
-
-This is a pragmatic exception to the general trust boundary principle. For most allowed destinations, the sandbox does not police what the service does on behalf of the application. But a CONNECT request explicitly declares the next-hop destination in a field the sandbox can inspect, so it is validated. The upstream proxy could still relay to disallowed destinations through other means — the trust boundary still applies beyond what the sandbox can observe.
-
-CONNECT validation is performed by mitmproxy, which is the only component in the pipeline with HTTP-level visibility. Envoy forwards traffic to mitmproxy without parsing HTTP semantics.
-
-## Transport and protocol classes
-
-### HTTP/HTTPS
-
-Default mode:
-
-* inspected
-* strongly verified
-* request-level identity enforcement
-
-### gRPC
-
-Standard HTTP/2 traffic — POST requests with `content-type: application/grpc` and a path identifying the service and method. Flows through mitmproxy as normal HTTP/2 at level 3 (HTTP inspected). No special handling required.
-
-### WebSocket
-
-Begins as an HTTP/1.1 Upgrade request (or HTTP/2 extended CONNECT). After the handshake completes, the connection upgrades to an opaque bidirectional binary frame stream that is no longer HTTP-inspectable. Same pattern as QUIC/HTTP/3 — the initial handshake is visible but the ongoing stream is not. WebSocket destinations require a level 2 (TLS-verified) bypass.
-
-### Non-HTTP TLS
-
-Allowed only by explicit bypass:
-
-* may use SNI if visible
-* service identity remains weaker than inspected HTTP
-
-### Generic TCP
-
-Allowed only by explicit bypass:
-
-* opaque semantics
-* strong dependence on trust in the endpoint
-
-### UDP
-
-Allowed only by explicit bypass:
-
-* narrow and intentional
-* strongest review burden
-* generally weakest service identity guarantees
-
-## Escape-pattern assumptions and responses
+### Escape-pattern assumptions and responses
 
 The design explicitly accounts for the following classes of behavior.
 
-### Direct IP connections
+#### Direct IP connections
 
 Response:
 
 * denied unless explicitly allowed
 * never equivalent to hostname authorization
 
-### Alternate DNS paths
+#### Alternate DNS paths
 
 Response:
 
 * denied unless explicitly allowed
 
-### IPv6-only or IPv6-bypass paths
+#### IPv6-only or IPv6-bypass paths
 
 Response:
 
 * eliminated by design — the networking subsystem is IPv4-only. IPv6 is dropped at the gateway's nftables (`ip6` blanket drop), the per-session network has no IPv6 addressing, the VM NIC has no IPv6 address, and the DNS resolver strips AAAA records. There is no IPv6 path to exploit.
 
-### QUIC / HTTP/3
+#### QUIC / HTTP/3
 
 Response:
 
 * deny by default unless explicitly bypassed
 
-### Raw non-HTTP traffic on expected ports
+#### Raw non-HTTP traffic on expected ports
 
 Response:
 
 * deny unless explicit bypass applies
 
-### Missing SNI
+#### Missing SNI
 
 Response:
 
 * explicit bypass only
 
-### Pinning or custom trust stores
+#### Pinning or custom trust stores
 
 Response:
 
 * explicit application configuration or explicit bypass
 
-### CONNECT on transparent-origin path
+#### CONNECT on transparent-origin path
 
 Response:
 
 * denied unless the target is declared as an upstream proxy in policy
 
-### Local helper proxies inside the VM
+#### Local helper proxies inside the VM
 
 Response:
 
 * acceptable so long as all egress from the VM still traverses the gateway pipeline
 
-### Shared-IP/CDN ambiguity
+#### Shared-IP/CDN ambiguity
 
 Response:
 
 * resolved only by SNI plus HTTP host validation
 * IP allowlists are never final web identity checks
 
-### ECH or other opaque TLS evolution
+#### ECH or other opaque TLS evolution
 
 Response:
 
@@ -1017,7 +800,7 @@ Response:
 * if the upstream server mandates ECH and rejects non-ECH connections, the destination requires an explicit level 1 (transport-only) bypass — HTTP inspection is not possible
 * ECH stripping is enabled by default to prevent silent inspection breakage as ECH adoption grows
 
-## Relay-capable services and trust amplification
+### Relay-capable services and trust amplification
 
 A destination may be allowed at the network level yet still act as an application-layer proxy or relay.
 
@@ -1032,7 +815,7 @@ Examples include services that can:
 
 This is not a failure of the sandbox network layer. It is a trust issue in the allowed destination.
 
-### Policy implication
+#### Policy implication
 
 Allowed destinations should conceptually be classified into:
 
@@ -1043,7 +826,7 @@ Allowed destinations should conceptually be classified into:
 
 The network-control subsystem cannot fully solve this problem, but it must not hide it.
 
-## Fail-closed requirement
+### Fail-closed requirement
 
 The system must fail closed.
 
@@ -1064,9 +847,283 @@ This includes failures of:
 
 The fail-closed property extends to the VM boundary: if the gateway container is not running, the VM has no network connectivity. The per-session network provides no default route to the internet — only to the gateway. See [sandbox-design.md § Core design principles](sandbox-design.md#core-design-principles).
 
-## Health monitoring
+## Layer models
 
-### Component liveness probes
+### Kernel firewall requirements
+
+The kernel firewall (nftables) inside the gateway container is the hard enforcement layer and the transparent interception mechanism for forwarded traffic from the VM.
+
+#### Must enforce
+
+* deny by default — all traffic denied unless explicitly permitted
+* only TCP and UDP are supported IP protocols
+* ICMP is explicitly denied by default
+* tunneling protocols (GRE, IPIP, WireGuard, etc.) are explicitly denied
+* explicit allow only for permitted traffic
+* no direct internet egress outside the policy path
+* no direct DNS except the local resolver path
+* IPv4 rules implement full policy; IPv6 rules are a blanket drop (the networking subsystem is IPv4-only)
+* no fail-open on Envoy or mitmproxy failure
+* no accidental side interfaces or alternate routes
+
+#### Must provide
+
+* nftables PREROUTING DNAT rules to redirect forwarded TCP traffic from the VM to Envoy
+* nftables PREROUTING DNAT rules to redirect forwarded DNS traffic from the VM to the local resolver
+* nftables rules for UDP allow/deny (IP/port based)
+* gateway-internal loopback exemptions
+* explicit host and port restrictions as derived from policy
+
+#### Important rule
+
+The kernel firewall is authoritative for **containment** and **transparent interception**, not for final service identity.
+
+### DNS model
+
+#### Principle
+
+There must be exactly one approved DNS resolution path available to the VM.
+
+#### Requirements
+
+* deny direct external DNS by default
+* deny alternate resolver paths unless explicitly allowed
+* all DNS policy must be explicit
+* DNS answers do not by themselves authorize traffic
+
+#### DNS resolution for policy enforcement
+
+Policy is expressed in terms of domain names, but some enforcement components operate on IP addresses. The local DNS resolver bridges this gap:
+
+* the local resolver is the only DNS path available to the VM — resolv.conf points to it, and nftables PREROUTING DNAT redirects all DNS traffic from the VM to it
+* non-allowed domains receive NXDOMAIN — the resolver enforces policy at the DNS layer
+* AAAA records are stripped from all responses — the resolver returns only A records. The network path is IPv4-only, so AAAA records for allowed domains would resolve to unreachable IPv6 addresses. Stripping them avoids unnecessary resolution failures and happy-eyeballs delays in dual-stack client libraries.
+* for allowed domains, resolution results are reported to the sandbox daemon, which maintains TTL-aware IP-to-domain mappings and pushes configuration updates to all enforcement components that operate on IP addresses
+* re-resolution occurs when DNS TTL expires, with a configurable maximum interval (e.g., 60 seconds) as an upper bound regardless of TTL — domains with very long TTLs must not leave stale IPs in place indefinitely
+* on resolution failure: immediately remove the previously resolved IPs for the affected domain (fail-closed), log the failure, and reflect the failure in the sandbox health status — stale IPs from domains that no longer resolve are a potential attack vector (e.g., IP takeover) and must not persist
+* all DNS queries are logged for audit trail purposes, providing domain→IP correlation that supports connection attribution
+
+#### DNS interception is tamper-proof
+
+Even if the agent gains root inside the VM, it can modify `resolv.conf`, hardcode alternate DNS servers, or configure applications to use any resolver it chooses. None of this matters. All traffic from the VM exits through the single virtio-net NIC, crosses the bridge, and hits the gateway container's nftables PREROUTING DNAT rules. Any packet destined for port 53 (UDP or TCP) is redirected to the local resolver regardless of the original destination address the agent specified.
+
+The gateway container runs on the host side of the hardware virtualization boundary — outside the VM. The agent cannot modify its nftables rules, restart its processes, or interfere with it in any way. This is a stronger property than the old namespace-based model: the enforcement point sits behind a hardware boundary (virtio-net), not just a kernel boundary (namespaces). The agent's root privileges are scoped to the VM guest and do not extend to the host or gateway.
+
+#### Important limitation
+
+DNS allowlisting is not final service verification.
+
+A DNS answer:
+
+* may be shared across many hostnames
+* may be one of many CDN edges
+* may later be used with a different hostname or protocol
+
+Therefore DNS is only an input to policy, never final proof.
+
+#### Stale IP window
+
+There is an inherent window between when a domain's IP address changes and when the control plane re-resolves and pushes the update. During this window, traffic to the old IP remains permitted while traffic to the new IP is not yet allowed.
+
+This is a known limitation of any DNS-based policy system. TTL-aware resolution minimizes the window but cannot eliminate it entirely. The design accepts this trade-off. Policy authors should be aware that IP-level enforcement is eventually consistent with DNS, not instantaneous.
+
+#### Connection termination on IP rotation
+
+When DNS re-resolution produces a **changed** IP set for a domain (IPs added, removed, or replaced), the sandbox daemon pushes updated configuration to all enforcement components. IPs no longer present in the new set are removed from nftables rules and Envoy configuration, and existing connections to those removed IPs are terminated immediately. There is no grace period or connection draining.
+
+When re-resolution produces the **same** IP set as the previous resolution, no action is taken — existing connections, nftables rules, and Envoy configuration are left untouched. This is critical for domains with short TTLs (common for CDNs), which would otherwise cause unnecessary connection churn for long-lived connections such as WebSocket streams or gRPC streaming RPCs.
+
+Rationale for immediate termination on actual IP change:
+
+* an old IP may no longer belong to the intended service — allowing continued communication risks connecting to a different host (IP takeover)
+* this is consistent with the fail-closed philosophy applied to DNS resolution failure
+* the sandbox is not a production runtime — brief connection interruptions are acceptable by design
+* applications that need resilience will retry naturally
+
+#### DNS-over-TLS and DNS-over-HTTPS
+
+DNS-over-TLS (DoT, port 853) is blocked by nftables unless explicitly allowed. No special handling is required.
+
+DNS-over-HTTPS (DoH) operates over port 443 and is indistinguishable from normal HTTPS traffic at the network level. If an application sends DoH queries to an allowed HTTPS destination (e.g., a public DNS provider that is also in the allow list), it can resolve domain names outside the local resolver's control.
+
+This does not expand the application's network reach — resolved IPs must still be present in the nftables allow list to be reachable. However, it bypasses the local resolver's query logging and NXDOMAIN enforcement, creating a gap in audit trails.
+
+DoH is accepted as a residual risk. Operators who require complete DNS audit coverage can block known DoH providers at the policy level.
+
+### SNI model
+
+#### Principle
+
+SNI is useful, but only as a connection-level signal.
+
+It is suitable for:
+
+* coarse TLS routing
+* coarse host expectation
+* reducing ambiguity on shared IPs
+* rejecting clearly invalid TLS cases
+
+It is not sufficient for final HTTP authorization.
+
+#### Rule
+
+* if HTTP(S) is being used and strict host policy matters, SNI alone is not enough
+* no-SNI TLS requires explicit bypass
+* SNI validation is required where applicable, but it is not the final authority for HTTP traffic
+
+#### Domain fronting
+
+Domain fronting is a key attack that motivates the combination of SNI validation and HTTP-level host validation. Two variants exist:
+
+**SNI-level fronting:** A shared IP (e.g., a CDN edge) hosts both allowed and disallowed services. The application connects to the shared IP but sets the TLS SNI to a disallowed domain. SNI validation catches this — the SNI does not match any allowed domain and the connection is rejected.
+
+**HTTP-level fronting:** The application sets the TLS SNI to an allowed domain (passing SNI validation) but sets the HTTP `Host` or `:authority` header to a different, disallowed domain. The destination server (e.g., a CDN) routes based on the HTTP header, not the SNI, delivering traffic to the disallowed service. HTTP-level host validation catches this — the mismatch between SNI and the request-level host is detected by mitmproxy.
+
+Neither check alone is sufficient. SNI validation without HTTP inspection misses HTTP-level fronting. HTTP inspection without SNI validation misses connections that never reach mitmproxy (levels below 3). Both checks are required, and they catch different attacks.
+
+### HTTP model
+
+#### Principle
+
+HTTP identity is request-scoped, not connection-scoped.
+
+Therefore:
+
+This is a direct consequence of HTTP/2 connection multiplexing and HTTP/1.1 keep-alive host switching — the same connection may carry requests for different hosts, making connection-level identity (SNI, IP) insufficient. See also the [domain fronting analysis in the SNI model](#domain-fronting).
+
+* HTTP/1 `Host` must be validated per request
+* HTTP/2 `:authority` must be validated per request
+
+#### Consequence
+
+HTTP inspection is mandatory for normal allowed web traffic.
+
+#### HTTP rules
+
+The sandbox must be able to enforce, when configured:
+
+* allowed hosts
+* allowed methods
+* allowed paths
+* allowed schemes
+* host/path consistency
+* explicit block or allow rules
+
+Even if only host-level policy is required, request-level inspection remains mandatory.
+
+### Certificate management
+
+#### Requirement
+
+TLS interception by mitmproxy requires a CA certificate that applications in the VM trust. The sandbox must manage this certificate lifecycle.
+
+#### CA generation and storage
+
+* a unique CA keypair is generated per session at creation time
+* the CA is short-lived — its validity period matches the session lifetime
+* the private key is stored only in the gateway container (accessible to mitmproxy) and is never present inside the VM
+* per-session generation ensures that compromise of one session's CA does not affect others
+
+#### Trust store injection
+
+The CA certificate (public part only) is injected into the VM during provisioning so that applications trust the interception CA:
+
+* installed in the VM's system trust store (`/usr/local/share/ca-certificates/` + `update-ca-certificates`)
+* standard environment variables set for applications that use their own trust store resolution (`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `CURL_CA_BUNDLE`)
+* installed in the Docker daemon trust store (`/etc/docker/certs.d/`) for registry image pulls
+
+This provides transparent interception for applications that rely on the system trust store or standard environment variables. The detailed trust store paths and environment variables are specified in [VM-side networking configuration § CA certificate trust](#ca-certificate-trust).
+
+#### Certificate pinning and custom trust stores
+
+Applications that use certificate pinning or hardcoded trust stores will reject the interception CA. These applications require a TLS-verified bypass (level 2).
+
+Some pinned applications expose configuration options to provide a custom CA certificate. Whether and how to use such options is the user's responsibility — the sandbox provides the bypass mechanism, not application-specific CA configuration.
+
+#### Rotation
+
+For ephemeral sessions, rotation is not required — the CA lives and dies with the session. For long-lived sessions, a CA rotation procedure is a future enhancement.
+
+### Upstream proxy support
+
+#### Requirement
+
+The sandbox may need to support applications that intentionally use an explicit upstream HTTP proxy.
+
+#### Design position
+
+This is allowed only as an explicit policy path.
+
+#### Why this is special
+
+For a normal transparent client:
+
+* proxy-style `CONNECT` is unexpected and invalid
+
+For a client intentionally using an upstream HTTP proxy:
+
+* `CONNECT` and absolute-form HTTP requests are expected
+
+Therefore:
+
+* explicit upstream-proxy use must be modeled as a separate policy case
+* it must not be silently merged into the ordinary transparent-origin path
+
+#### CONNECT handling
+
+CONNECT requests are only valid when targeting a destination declared as an upstream proxy in policy. CONNECT to any other destination is denied — this prevents applications from using CONNECT as a tunneling mechanism through non-proxy endpoints.
+
+When mitmproxy inspects traffic to a declared upstream proxy (level 3), it also validates the CONNECT target — the destination the client asks the proxy to connect to. If the CONNECT target is not an allowed destination in policy, the request is denied with an HTTP 599 response. This is a special case where the sandbox can see the intended next hop beyond the proxy and enforces what is visible.
+
+This is a pragmatic exception to the general trust boundary principle. For most allowed destinations, the sandbox does not police what the service does on behalf of the application. But a CONNECT request explicitly declares the next-hop destination in a field the sandbox can inspect, so it is validated. The upstream proxy could still relay to disallowed destinations through other means — the trust boundary still applies beyond what the sandbox can observe.
+
+CONNECT validation is performed by mitmproxy, which is the only component in the pipeline with HTTP-level visibility. Envoy forwards traffic to mitmproxy without parsing HTTP semantics.
+
+### Transport and protocol classes
+
+#### HTTP/HTTPS
+
+Default mode:
+
+* inspected
+* strongly verified
+* request-level identity enforcement
+
+#### gRPC
+
+Standard HTTP/2 traffic — POST requests with `content-type: application/grpc` and a path identifying the service and method. Flows through mitmproxy as normal HTTP/2 at level 3 (HTTP inspected). No special handling required.
+
+#### WebSocket
+
+Begins as an HTTP/1.1 Upgrade request (or HTTP/2 extended CONNECT). After the handshake completes, the connection upgrades to an opaque bidirectional binary frame stream that is no longer HTTP-inspectable. Same pattern as QUIC/HTTP/3 — the initial handshake is visible but the ongoing stream is not. WebSocket destinations require a level 2 (TLS-verified) bypass.
+
+#### Non-HTTP TLS
+
+Allowed only by explicit bypass:
+
+* may use SNI if visible
+* service identity remains weaker than inspected HTTP
+
+#### Generic TCP
+
+Allowed only by explicit bypass:
+
+* opaque semantics
+* strong dependence on trust in the endpoint
+
+#### UDP
+
+Allowed only by explicit bypass:
+
+* narrow and intentional
+* strongest review burden
+* generally weakest service identity guarantees
+
+## Operations
+
+### Health monitoring
+
+#### Component liveness probes
 
 Each enforcement component in the pipeline must expose or support a liveness probe:
 
@@ -1078,7 +1135,7 @@ Each enforcement component in the pipeline must expose or support a liveness pro
 
 The sandbox daemon polls these probes periodically. Per-component probes serve a diagnostic purpose: when something is wrong, they identify which component is the source of the failure.
 
-### Failure response
+#### Failure response
 
 When a component probe fails:
 
@@ -1089,19 +1146,19 @@ When a component probe fails:
 
 The system must **not** automatically terminate the sandbox on health-check failure. The sandbox may be running long-lived processes that do not require network access. The sandbox owner decides what action to take based on the reported status.
 
-### End-to-end pipeline verification
+#### End-to-end pipeline verification
 
 Per-component probes do not guarantee that traffic is actually being proxied through the full pipeline. A true end-to-end probe — originating from within the VM and traversing the complete chain (VM → bridge → gateway → nftables PREROUTING DNAT → Envoy → mitmproxy → destination) — would provide stronger assurance.
 
 This is recognized as a future enhancement. Per-component probes are sufficient for initial implementation and provide actionable diagnostics without introducing additional attack surface.
 
-## Component lifecycle and startup ordering
+### Component lifecycle and startup ordering
 
-### Requirement
+#### Requirement
 
 The pipeline components must start in a specific order to avoid transient exposure or broken behavior during session initialization. The sandbox daemon orchestrates this sequence as part of session creation — see [sandbox-design.md § Session lifecycle](sandbox-design.md#session-lifecycle) for the full create/start/stop/destroy flow.
 
-### Startup order
+#### Startup order
 
 Components start outside-in — the outermost enforcement layer first, the traffic gate last:
 
@@ -1111,11 +1168,11 @@ Components start outside-in — the outermost enforcement layer first, the traff
 4. **Local DNS resolver** — starts and becomes ready to answer queries.
 5. **nftables PREROUTING DNAT rules** — applied last. Traffic is only redirected into the pipeline once all components are ready to handle it.
 
-### Why this order is safe
+#### Why this order is safe
 
 The kernel firewall's deny-by-default rules are the first thing applied and the last thing removed. The nftables PREROUTING DNAT rules are the gate — no traffic enters the userland pipeline until every component is confirmed ready. During the startup window, forwarded traffic from the VM is denied entirely, which is the correct default.
 
-### Readiness gates
+#### Readiness gates
 
 Each component must signal readiness before the next one in the sequence starts:
 
@@ -1125,7 +1182,7 @@ Each component must signal readiness before the next one in the sequence starts:
 
 The sandbox daemon orchestrates this sequence and will not proceed to the next step until the current component passes its readiness check.
 
-### Component failure during operation
+#### Component failure during operation
 
 If a component crashes after the pipeline is fully operational:
 
@@ -1136,7 +1193,7 @@ If a component crashes after the pipeline is fully operational:
 
 Traffic is never silently rerouted or allowed to bypass the pipeline due to a component failure.
 
-### Shutdown order
+#### Shutdown order
 
 Shutdown is the reverse of startup — the traffic gate is removed first, the backstop last:
 
@@ -1150,13 +1207,13 @@ This mirrors the startup logic: the PREROUTING DNAT rules are the gate that cont
 
 In-flight connections are terminated immediately as components stop. There is no drain period — this is consistent with the connection termination behavior during IP rotation and the sandbox's non-production posture.
 
-## Error propagation
+### Error propagation
 
-### Principle
+#### Principle
 
 When the pipeline denies a connection, the application in the VM should receive a fast, informative error rather than a silent timeout. Different pipeline layers produce different error signals, but the design preference is immediate failure with useful feedback for the application and full context in logs for the operator.
 
-### Error behavior by layer
+#### Error behavior by layer
 
 **Kernel firewall (nftables):**
 
@@ -1182,7 +1239,7 @@ When the pipeline denies a connection, the application in the VM should receive 
 * the response body should explicitly identify the denial as a sandbox policy decision
 * the response should not leak internal policy details beyond the fact that the request was denied
 
-### Logging
+#### Logging
 
 Every denial at every layer is logged with full context:
 
@@ -1195,7 +1252,7 @@ Every denial at every layer is logged with full context:
 
 The application receives a terse error. The audit log receives the full story.
 
-## Logging and audit requirements
+### Logging and audit requirements
 
 Every connection attempt should be attributable to one of the policy outcomes.
 
@@ -1219,54 +1276,13 @@ A bypass should always be auditable as:
 * what class it belongs to
 * what assurance was lost
 
-## Policy authoring requirements
-
-The policy language should let users express intent such as:
-
-* allow web access to service X
-* require full HTTP inspection for service Y
-* allow service Z only at TLS-verified level
-* allow UDP only to resolver R
-* deny everything else
-* allow only GET requests to `api.github.com/repos/{owner}/{repo}/pulls/{number}` — granting read access to a specific pull request without broader GitHub API access
-* allow only GET and HEAD to a specific service — no mutations permitted
-* deny POST to any path on a specific service
-* allow access to a service but only on specific paths
-
-The policy language should not require users to know:
-
-* which backend enforces the rule
-* which ACL syntax is used
-* whether the rule becomes an SNI check, DNS check, host check, or firewall rule
-
-Those are compilation details of the policy engine.
-
-HTTP-level method and path controls are the key capability that distinguishes this sandbox from network-level firewalls. Any firewall can gate by IP and port. The ability to constrain not just *which* service is reachable but *what operations* are permitted on that service is what makes HTTP inspection meaningful. A sandbox policy that allows access to a version control API but only permits reading a specific pull request is fundamentally more constrained than one that allows all traffic to the API's IP address.
-
-### Policy schema
-
-The concrete policy schema (e.g., JSON Schema) is intentionally not defined in this design document. It will be produced as part of the implementation, once the interaction between policy intent and backend capabilities is better understood.
-
-However, the implementation **must** produce a formal, machine-readable schema document. This is a hard requirement, not an optional deliverable.
-
-### Policy versioning
-
-Every policy document must declare the schema version it conforms to, following the pattern established by Kubernetes manifests:
-
-* the version field must be present and must use [Semantic Versioning](https://semver.org/)
-* the system must reject policy documents whose declared version is incompatible with the currently supported schema
-* backward-compatible minor/patch versions may be accepted; incompatible major versions must be rejected
-* the schema version is a property of the policy document, not of the sandbox runtime
-
-This ensures that policy documents remain interpretable over time and that silent behavioral changes from schema drift are prevented.
-
-## Control plane / sandbox daemon
+### Control plane / sandbox daemon
 
 The sandbox daemon is the single process per host that manages all sandbox sessions. It is the single source of truth for sandbox network policy and the mechanism that makes the policy abstraction guarantee real. For the daemon's full responsibilities (VM lifecycle, session management, vsock, resource management), see [sandbox-design.md § Sandbox daemon (sandboxd)](sandbox-design.md#sandbox-daemon-sandboxd).
 
 This section covers only the daemon's **networking-specific responsibilities**.
 
-### Policy compilation and distribution
+#### Policy compilation and distribution
 
 * accept abstract policy documents as input — the same documents authored by users
 * compile abstract policy into component-specific configurations: nftables rules, local DNS resolver policy, Envoy listener/filter/cluster config, mitmproxy rules
@@ -1274,20 +1290,20 @@ This section covers only the daemon's **networking-specific responsibilities**.
 * ensure no enforcement component is hand-configured — all configuration is generated from the abstract policy
 * validate policy documents against the declared schema version before compilation
 
-### DNS re-resolution and IP propagation
+#### DNS re-resolution and IP propagation
 
 * manage the local DNS resolver's policy (allowed domains, NXDOMAIN for denied domains)
 * receive resolution results from the local resolver and compare against the current IP set for each domain — push updated configuration only when the resolved IP set actually changes (no-op when IPs are unchanged)
 * perform TTL-aware re-resolution with configurable maximum intervals
 * immediately remove stale IPs on resolution failure (fail-closed)
 
-### Configuration distribution to gateway components
+#### Configuration distribution to gateway components
 
 * the sandbox daemon is the only component that interprets policy intent
 * enforcement components receive only their own generated configuration and do not interpret abstract policy
 * configuration updates (including DNS re-resolution) must be applied without requiring session restart where possible
 
-### Policy compilation error handling
+#### Policy compilation error handling
 
 Policy compilation is an all-or-nothing operation. Either the entire policy compiles successfully to all backend configurations, or it is rejected in full. No partial application is permitted.
 
@@ -1319,7 +1335,7 @@ Domain resolution is performed at compile time as a validation step. All policy 
 
 The compile-time resolution also produces the initial seed IPs used to generate the first set of nftables rules and Envoy filter chain configurations. These IPs are a point-in-time snapshot. Runtime re-resolution (TTL-aware, managed by the sandbox daemon) keeps the IP mappings current as DNS records change.
 
-### Hot-reload with rollback
+#### Hot-reload with rollback
 
 The all-or-nothing guarantee extends from compilation to distribution. When a policy update is applied at runtime, the sandbox daemon distributes the new configuration to components in outside-in order:
 
@@ -1337,11 +1353,13 @@ In-flight connections to destinations removed by the new policy are terminated i
 
 The sandbox daemon reports the outcome of every policy update: success, or failure with the component that rejected the configuration and the rollback status.
 
-## Implementation guidance derived from the design
+## Closing
 
-### What the backend stack should do
+### Implementation guidance derived from the design
 
-#### Kernel firewall (nftables)
+#### What the backend stack should do
+
+##### Kernel firewall (nftables)
 
 * enforce deny-by-default for all protocols
 * deny ICMP and tunneling protocols (GRE, IPIP, WireGuard, etc.)
@@ -1351,14 +1369,14 @@ The sandbox daemon reports the outcome of every policy update: success, or failu
 * enforce UDP allow/deny rules (IP/port) via nftables
 * ensure no direct egress is possible outside the policy path
 
-#### Local DNS resolver
+##### Local DNS resolver
 
 * resolve only policy-permitted domains; return NXDOMAIN for all others
 * log all queries for audit trail (domain→IP correlation)
 * report resolution results to the sandbox daemon for propagation to all IP-dependent enforcement components
 * serve as the single DNS path — no alternate resolvers reachable from the VM
 
-#### Envoy
+##### Envoy
 
 * use the `original_dst` listener filter to recover real destinations from nftables PREROUTING DNAT-redirected connections
 * classify connections into inspection, TLS-verified, or transport-only based on declared policy — not by peeking for ClientHello
@@ -1369,19 +1387,19 @@ The sandbox daemon reports the outcome of every policy update: success, or failu
 * route plain transport-only traffic without assuming any TLS
 * reject clearly invalid or unsupported traffic classes
 
-#### mitmproxy
+##### mitmproxy
 
 * perform mandatory inspection for ordinary HTTP(S)
 * validate host identity per request
 * support explicit bypasses and upstream-proxy workflows where allowed
 
-### Important architectural rule
+#### Important architectural rule
 
 The backend stack exists to implement the sandbox policy.
 
 The policy does not exist to mirror the backend stack.
 
-## Residual risks
+### Residual risks
 
 Even with correct implementation, the following residual risks remain:
 
@@ -1397,7 +1415,7 @@ Even with correct implementation, the following residual risks remain:
 
 These are not implementation bugs. They are the natural limits of the problem space.
 
-### Deferred: IPv6 support
+#### Deferred: IPv6 support
 
 The networking subsystem is IPv4-only by design. This is a deliberate simplification that reduces attack surface and complexity. IPv6 support is deferred as a future improvement. When implemented, it would require:
 
@@ -1409,7 +1427,7 @@ The networking subsystem is IPv4-only by design. This is a deliberate simplifica
 
 The intended model is session-level opt-in — sessions that need IPv6 destinations would request dual-stack networking at creation time. Sessions that don't need IPv6 would remain single-stack to preserve the simpler security posture.
 
-## Final design summary
+### Final design summary
 
 This subsystem defines the networking architecture for the sandbox in which:
 
