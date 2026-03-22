@@ -15,7 +15,7 @@ The [sandbox design](sandbox-design.md) covers the isolation boundary, VM lifecy
 - [Core design principles](#core-design-principles)
 - [End-to-end architecture](#end-to-end-architecture)
 - [VM-side networking configuration](#vm-side-networking-configuration)
-- [Per-session bridge network](#per-session-bridge-network)
+- [Per-session network](#per-session-network)
 - [Gateway container pipeline](#gateway-container-pipeline)
 - [Policy outcomes](#policy-outcomes)
 - [Policy evaluation model](#policy-evaluation-model)
@@ -59,7 +59,7 @@ Its purpose is to make outbound network behavior:
 * auditable
 * reducible to a small number of assurance levels
 
-This subsystem covers the complete network path: from the agent process inside the VM, through the VM's kernel networking stack, across the per-session bridge network, into the gateway container's proxy pipeline, and out to the destination. It defines what is configured where, what each component enforces, and how they compose into a coherent end-to-end policy enforcement system.
+This subsystem covers the complete network path: from the agent process inside the VM, through the VM's kernel networking stack, across the per-session network, into the gateway container's proxy pipeline, and out to the destination. It defines what is configured where, what each component enforces, and how they compose into a coherent end-to-end policy enforcement system.
 
 The isolation boundary itself — why VMs, how Lima manages them, how the gateway container is deployed, session lifecycle, vsock control channel — is defined in the [sandbox design](sandbox-design.md). This document assumes that architecture and defines everything networking within it.
 
@@ -114,18 +114,18 @@ This subsystem reduces risk. It does not eliminate it.
 
 ## End-to-end architecture
 
-The networking subsystem spans two execution environments — the VM and the gateway container — connected by a per-session Docker bridge network.
+The networking subsystem spans two execution environments — the VM and the gateway container — connected by a per-session network (Docker bridge on Linux, dedicated vmnet on macOS).
 
 ```text
 Agent process (in VM)
   → VM kernel networking → virtio-net
-    → per-session Docker bridge → gateway container eth0
+    → per-session network → gateway container eth0
       → nftables PREROUTING DNAT
         → Envoy / mitmproxy / DNS resolver
           → destination (or deny)
 ```
 
-Traffic originates inside the VM, exits via the VM's single virtual NIC (virtio-net), crosses the bridge network, and enters the gateway container as forwarded traffic on the container's network interface. Inside the gateway, nftables PREROUTING DNAT rules intercept the forwarded traffic and redirect it into the proxy pipeline — Envoy, mitmproxy, and the DNS resolver — which enforce policy before forwarding permitted traffic to its destination.
+Traffic originates inside the VM, exits via the VM's single virtual NIC (virtio-net), crosses the per-session network, and enters the gateway container as forwarded traffic on the container's network interface. Inside the gateway, nftables PREROUTING DNAT rules intercept the forwarded traffic and redirect it into the proxy pipeline — Envoy, mitmproxy, and the DNS resolver — which enforce policy before forwarding permitted traffic to its destination.
 
 The proxy pipeline inside the gateway container is a layered enforcement stack:
 
@@ -156,14 +156,14 @@ The VM must be configured to route all traffic through the gateway container and
 
 The VM has a single network interface (virtio-net) with a single default route:
 
-* **One NIC, IPv4 only.** The VM exposes exactly one network interface — a virtio-net device connected to the per-session Docker bridge network. The NIC is configured with an IPv4 address only; no IPv6 addresses are assigned on the bridge interface. No other network interfaces exist (no additional NICs, no virtio-fs, no USB network adapters).
-* **Default route to gateway.** The default route points to the gateway container's IP on the bridge subnet. All traffic (except loopback and vsock) exits via this route.
-* **Static or DHCP.** The VM's IP on the bridge subnet is assigned during provisioning — either statically in the Lima template or via DHCP from the Docker bridge network.
-* **No alternate routes.** No other routes exist. The routing table contains only the default route to the gateway, the connected bridge subnet route, and loopback.
+* **One NIC, IPv4 only.** The VM exposes exactly one network interface — a virtio-net device connected to the per-session network (Docker bridge on Linux, dedicated vmnet on macOS). The NIC is configured with an IPv4 address only; no IPv6 addresses are assigned on the network interface. No other network interfaces exist (no additional NICs, no virtio-fs, no USB network adapters).
+* **Default route to gateway.** The default route points to the gateway container's IP on the /30 subnet. All traffic (except loopback and vsock) exits via this route.
+* **Static or DHCP.** The VM's IP on the /30 subnet is assigned during provisioning — either statically in the Lima template or via DHCP from the per-session network.
+* **No alternate routes.** No other routes exist. The routing table contains only the default route to the gateway, the connected /30 subnet route, and loopback.
 
 ### DNS configuration
 
-`/etc/resolv.conf` points to the gateway container's DNS resolver IP on the bridge subnet. This makes the gateway's policy-aware DNS resolver the default resolver for all applications in the VM.
+`/etc/resolv.conf` points to the gateway container's DNS resolver IP on the /30 subnet. This makes the gateway's policy-aware DNS resolver the default resolver for all applications in the VM.
 
 nftables rules inside the gateway provide a safety net: all DNS traffic (TCP/UDP port 53) arriving from the VM is redirected to the local resolver regardless of the destination address. Applications that ignore `resolv.conf` or hardcode resolver addresses (e.g., `8.8.8.8`) are still forced through the policy-aware resolver.
 
@@ -202,18 +202,18 @@ When an inner container needs to reach an external service, the traffic path is:
 
 ```text
 Inner container → inner Docker bridge → VM kernel NAT → VM virtio-net
-  → per-session Docker bridge → gateway container → proxy pipeline → destination
+  → per-session network → gateway container → proxy pipeline → destination
 ```
 
-The inner Docker daemon's NAT translates container source IPs to the VM's IP on the bridge subnet. The gateway's proxy pipeline sees the VM's IP as the source — it does not see or care about inner container IPs. This is transparent and requires no special configuration.
+The inner Docker daemon's NAT translates container source IPs to the VM's IP on the /30 subnet. The gateway's proxy pipeline sees the VM's IP as the source — it does not see or care about inner container IPs. This is transparent and requires no special configuration.
 
 When inner containers communicate with each other (e.g., services in a `docker compose` stack), traffic stays on the inner Docker bridge and never reaches the gateway. This is standard Docker behavior.
 
 Port mapping (`-p` flag) works normally inside the VM. Inner containers can bind ports and other inner containers (or the agent process) can reach them via `localhost` or the inner bridge. These connections stay inside the VM.
 
-## Per-session bridge network
+## Per-session network
 
-Each session has a dedicated IPv4-only network that provides the link layer between the VM and its gateway container. The network is created by the sandbox daemon during session creation and deleted during session destruction. For the full session lifecycle, see [sandbox-design.md § Session lifecycle](sandbox-design.md#session-lifecycle).
+Each session has a dedicated IPv4-only network that provides the link layer between the VM and its gateway container. On Linux, this is a Docker bridge network; on macOS, this is a dedicated socket_vmnet instance. The network is provisioned by the sandbox daemon (at session creation on Linux, from a pre-provisioned pool on macOS) and released during session destruction. For the full session lifecycle, see [sandbox-design.md § Session lifecycle](sandbox-design.md#session-lifecycle).
 
 ```text
 VM (virtio-net) ←→ per-session network ←→ gateway container (eth0)
@@ -245,42 +245,54 @@ Each session is fully isolated at L2 — the TAP device, bridge, and gateway con
 
 On macOS, Docker does not run natively — it runs inside a Linux VM (Docker Desktop's VM, or a Colima/Lima VM). This means a sandbox VM cannot attach a TAP device to a Docker bridge on the macOS host because that bridge exists inside another VM's network namespace.
 
-The solution uses three components:
+The solution uses a per-session vmnet pool model that mirrors the per-session Docker bridge isolation on Linux:
 
-1. **socket_vmnet** — a vmnet daemon from the Lima project that provides a shared virtual network accessible to multiple VMs on macOS. Both the Colima VM and all sandbox VMs join this network, giving them L2 connectivity to each other.
+1. **socket_vmnet pool** — sandboxd pre-provisions a pool of socket_vmnet instances at daemon startup on macOS. Each instance has its own /30 subnet (2 usable IPs: one for the gateway, one for the sandbox VM). The pool size is configurable (`max_concurrent_sessions_macos`, default 8). Each socket_vmnet instance is an isolated L2 segment — the same isolation property as Linux's per-session Docker bridges.
 
 2. **Colima (sandboxd-managed)** — sandboxd manages a single Colima instance (a Lima-based Docker runtime) that hosts all gateway containers across all sessions. This Colima instance is completely independent of whatever Docker setup the developer uses (Docker Desktop, their own Colima, etc.). The developer never interacts with it directly.
 
-3. **Docker macvlan (private mode)** — inside the sandboxd-managed Colima VM, each gateway container uses Docker macvlan networking (`-o macvlan_mode=private`) on the vmnet-facing interface. This gives each gateway its own IP directly on the shared vmnet, rather than hiding it behind the Colima VM's IP with port mapping. Private mode instructs the kernel to drop all traffic between macvlan interfaces on the same parent, providing L2 isolation between gateway containers without requiring per-session networks.
+3. **Docker macvlan (private mode)** — inside the sandboxd-managed Colima VM, each gateway container uses Docker macvlan networking (`-o macvlan_mode=private`) on the vmnet-facing NIC for its session's vmnet. macvlan private mode is used as defense in depth, even though isolation is already provided by the separate vmnet instances.
+
+**Session lifecycle on macOS:**
+
+* **Session start:** Claim a vmnet slot from the pool. Attach a Colima NIC to that vmnet. Create a gateway container with macvlan (private mode) on that NIC. Boot the sandbox VM on the same vmnet. The two share a /30 subnet — only they can communicate.
+* **Session stop:** Stop the VM, destroy the gateway container, detach and release the vmnet slot back to the pool.
+* **Pool exhaustion:** If the pool is exhausted, reject the session start with a clear error ("max concurrent sessions reached, increase pool size and restart sandboxd"). No silent degradation.
+
+Only running sessions consume pool slots — stopped or created-but-not-started sandboxes do not.
 
 ```
 macOS host
 ├── sandboxd
-├── socket_vmnet (shared network, e.g. 192.168.105.0/24)
-├── Colima VM (one, managed by sandboxd, hosts all gateways)
-│   ├── Gateway container session-1 (macvlan: 192.168.105.20)
-│   ├── Gateway container session-2 (macvlan: 192.168.105.21)
-│   └── ...
-├── Sandbox VM session-1 (192.168.105.100) → routes to .20
-├── Sandbox VM session-2 (192.168.105.101) → routes to .21
+├── socket_vmnet pool (N instances, each an isolated /30 subnet)
+│
+├── Colima VM (one, managed by sandboxd)
+│   ├── NIC-1 on vmnet-1 → Gateway container session-1 (macvlan)
+│   ├── NIC-2 on vmnet-2 → Gateway container session-2 (macvlan)
+│   └── (NICs attached/detached as sessions start/stop)
+│
+├── Sandbox VM session-1 on vmnet-1 → routes to gateway-1
+├── Sandbox VM session-2 on vmnet-2 → routes to gateway-2
 └── ...
 ```
 
-The sandbox VM's default route points to its gateway's macvlan IP on the vmnet. Traffic arrives at the gateway container with the original destination intact — PREROUTING DNAT works exactly as on Linux. From the gateway container's perspective, the traffic flow is indistinguishable from the Linux TAP-on-bridge model.
+The sandbox VM's default route points to its gateway's IP on the /30 subnet. Traffic arrives at the gateway container with the original destination intact — PREROUTING DNAT works exactly as on Linux. From the gateway container's perspective, the traffic flow is indistinguishable from the Linux TAP-on-bridge model.
 
-Gateway containers within the Colima VM are isolated from each other via macvlan private mode, analogous to per-session bridges on Linux. The kernel blocks all macvlan-to-macvlan traffic on the same parent interface, so no gateway container can reach another. Sandbox VM traffic is unaffected because it arrives from the vmnet (external to the macvlan), and gateway outbound traffic exits through the parent to the internet — only inter-gateway traffic is blocked, which is exactly the isolation requirement.
+Each session is fully isolated at L2 — the vmnet instance, gateway container, and sandbox VM form a private /30 network segment. No cross-session traffic is possible, the same as Linux's per-session bridges.
 
 The shared Colima VM introduces the only cross-session failure mode in the architecture. On Linux, gateway containers are independent — a single gateway crash affects only its session, and all other sessions continue unaffected. On macOS, the Colima VM hosts all gateway containers, so if it crashes, every active session loses networking simultaneously. This is an inherent consequence of the macOS platform constraint (Docker requires a Linux VM), not a design flaw. sandboxd must monitor the Colima VM's health, restart it on failure, and recreate gateway containers afterward; sessions will experience a networking interruption during recovery. All other failure modes remain session-scoped on both platforms.
 
 ### Isolation properties
 
-* **No shared bridges.** Each session gets its own bridge network. Sessions do not share bridge networks.
-* **No inter-session traffic.** Because bridges are per-session, VMs from different sessions cannot communicate at the network level. There is no L2 path between sessions.
-* **No host network.** The gateway container is attached to the per-session bridge, not the host network (`--network` is the session bridge, not `host`). The gateway cannot reach other sessions' bridges or the host's network stack directly.
+* **No shared L2 segments.** Each session gets its own network segment — a Docker bridge on Linux, a dedicated vmnet instance on macOS. Sessions do not share network segments.
+* **No inter-session traffic.** Because network segments are per-session, VMs from different sessions cannot communicate at the network level. There is no L2 path between sessions.
+* **No host network.** The gateway container is attached to the per-session network, not the host network (`--network` is the session bridge on Linux; macvlan on the session's vmnet on macOS). The gateway cannot reach other sessions' networks or the host's network stack directly.
 
-### Bridge subnet
+### Subnet allocation
 
-Each bridge network has its own subnet, assigned by Docker's IPAM. The VM and gateway container each receive an IP on this subnet. The gateway's IP serves as:
+Each session gets its own /30 subnet (2 usable IPs: one for the gateway, one for the VM). Subnets are carved from a configurable base range — default `10.209.0.0/24` — chosen from an uncommon RFC 1918 slice to minimize conflicts with VPN and corporate networks. Operators can override the base range to avoid conflicts with their specific network environment.
+
+This applies to both platforms: Docker bridge subnets on Linux and vmnet subnets on macOS. The gateway's IP on the /30 subnet serves as:
 
 * the VM's default gateway (default route target)
 * the DNS resolver address (in `/etc/resolv.conf`)
@@ -288,7 +300,7 @@ Each bridge network has its own subnet, assigned by Docker's IPAM. The VM and ga
 
 ### MTU
 
-The MTU must be consistent across the VM NIC, bridge, and gateway interface. Docker bridge networks default to 1500, which is correct for most environments. On cloud networks with encapsulation overhead (e.g., AWS VPCs with VxLAN), the host's outbound MTU may be lower — the gateway relies on standard path MTU discovery for outbound traffic. If outbound path MTU issues arise, the bridge MTU can be configured at session creation time; this is an implementation detail, not a design concern.
+The MTU must be consistent across the VM NIC, per-session network segment, and gateway interface. Docker bridge networks on Linux default to 1500, which is correct for most environments. On macOS, each per-session vmnet instance uses the same default. On cloud networks with encapsulation overhead (e.g., AWS VPCs with VxLAN), the host's outbound MTU may be lower — the gateway relies on standard path MTU discovery for outbound traffic. If outbound path MTU issues arise, the per-session network MTU can be configured at session creation time; this is an implementation detail, not a design concern.
 
 ## Gateway container pipeline
 
@@ -313,18 +325,18 @@ Traffic arrives at the gateway container from the VM as forwarded packets on the
 
 | Property | Shared namespace (old model) | Gateway container (current model) |
 |---|---|---|
-| Traffic source | Local process in same namespace | VM, via bridge network interface |
+| Traffic source | Local process in same namespace | VM, via per-session network interface |
 | nftables chain | OUTPUT REDIRECT | PREROUTING DNAT |
 | Traffic type | Locally-generated | Forwarded |
 | Namespace sharing | Proxy pipeline shares namespace with sandboxed process | Proxy pipeline has its own namespace; VM has its own kernel |
 
 nftables PREROUTING DNAT intercepts forwarded traffic before routing decisions and redirects it to the pipeline components (Envoy listener, DNS resolver). Envoy uses the `original_dst` listener filter to recover the real destination from the DNAT-redirected connection — the same mechanism as before, just triggered by PREROUTING DNAT instead of OUTPUT REDIRECT.
 
-On macOS, the gateway container uses a Docker macvlan network instead of a bridge (see [VM-to-gateway connectivity § macOS](#macos) for the full explanation). The pipeline behavior is identical — traffic arrives on the gateway's network interface from the VM with the original destination intact, and the same PREROUTING DNAT rules intercept it. The macvlan vs. bridge distinction is a link-layer detail that does not affect the proxy pipeline, policy model, or any behavior described in this document.
+On macOS, the gateway container uses a Docker macvlan network on a per-session vmnet instance instead of a Docker bridge (see [VM-to-gateway connectivity § macOS](#macos) for the full explanation). The pipeline behavior is identical — traffic arrives on the gateway's network interface from the VM with the original destination intact, and the same PREROUTING DNAT rules intercept it. The vmnet/macvlan vs. bridge distinction is a link-layer detail that does not affect the proxy pipeline, policy model, or any behavior described in this document.
 
 ### Loopback inside the gateway
 
-The gateway container has its own loopback interface. Loopback is used for internal communication between pipeline components (e.g., Envoy forwarding to mitmproxy). Loopback traffic inside the gateway is not subject to the PREROUTING DNAT rules — those rules match only traffic arriving on the bridge-facing interface from the VM.
+The gateway container has its own loopback interface. Loopback is used for internal communication between pipeline components (e.g., Envoy forwarding to mitmproxy). Loopback traffic inside the gateway is not subject to the PREROUTING DNAT rules — those rules match only traffic arriving on the VM-facing interface from the VM.
 
 Loopback principles:
 
@@ -338,7 +350,7 @@ Loopback principles:
 
 In the old shared-namespace model (OUTPUT REDIRECT), Envoy and mitmproxy's outbound connections to real destinations were locally-generated traffic in the same namespace as the intercepted process — they would hit the same OUTPUT chain rules and loop back into the proxy. That model required explicit UID/GID-based exemptions so the proxies' own traffic could bypass interception.
 
-In the current gateway container model, this problem does not exist. PREROUTING DNAT rules match only forwarded traffic arriving on the bridge-facing interface from the VM. When Envoy or mitmproxy open outbound connections to real destinations, those connections are locally generated inside the gateway container — they traverse the OUTPUT chain, not PREROUTING. Since the DNAT rules are in PREROUTING, locally-generated traffic never hits them. The chain separation inherently prevents interception loops without any exemption rules.
+In the current gateway container model, this problem does not exist. PREROUTING DNAT rules match only forwarded traffic arriving on the VM-facing interface from the VM. When Envoy or mitmproxy open outbound connections to real destinations, those connections are locally generated inside the gateway container — they traverse the OUTPUT chain, not PREROUTING. Since the DNAT rules are in PREROUTING, locally-generated traffic never hits them. The chain separation inherently prevents interception loops without any exemption rules.
 
 ## Policy outcomes
 
@@ -952,7 +964,7 @@ Response:
 
 Response:
 
-* eliminated by design — the networking subsystem is IPv4-only. IPv6 is dropped at the gateway's nftables (`ip6` blanket drop), the bridge network has no IPv6 addressing, the VM NIC has no IPv6 address, and the DNS resolver strips AAAA records. There is no IPv6 path to exploit.
+* eliminated by design — the networking subsystem is IPv4-only. IPv6 is dropped at the gateway's nftables (`ip6` blanket drop), the per-session network has no IPv6 addressing, the VM NIC has no IPv6 address, and the DNS resolver strips AAAA records. There is no IPv6 path to exploit.
 
 ### QUIC / HTTP/3
 
@@ -1043,14 +1055,14 @@ If any policy-enforcing component fails:
 
 This includes failures of:
 
-* bridge network connectivity
+* per-session network connectivity
 * nftables rules
 * local DNS resolver
 * Envoy (if Envoy crashes, DNAT-redirected TCP connections hit a dead port and fail — the kernel firewall ensures no direct egress is possible regardless)
 * mitmproxy
 * sandbox daemon / policy distribution
 
-The fail-closed property extends to the VM boundary: if the gateway container is not running, the VM has no network connectivity. The bridge network provides no default route to the internet — only to the gateway. See [sandbox-design.md § Core design principles](sandbox-design.md#core-design-principles).
+The fail-closed property extends to the VM boundary: if the gateway container is not running, the VM has no network connectivity. The per-session network provides no default route to the internet — only to the gateway. See [sandbox-design.md § Core design principles](sandbox-design.md#core-design-principles).
 
 ## Health monitoring
 
@@ -1389,7 +1401,7 @@ These are not implementation bugs. They are the natural limits of the problem sp
 
 The networking subsystem is IPv4-only by design. This is a deliberate simplification that reduces attack surface and complexity. IPv6 support is deferred as a future improvement. When implemented, it would require:
 
-* dual-stack bridge networks (`--ipv6` on session bridge creation)
+* dual-stack per-session networks (`--ipv6` on session bridge creation on Linux, dual-stack vmnet subnets on macOS)
 * `inet`-family nftables rules (unified IPv4/IPv6 policy tables instead of separate `ip` and `ip6` tables)
 * AAAA record handling in the DNS resolver (return AAAA alongside A records for allowed domains)
 * IPv6 forwarding enabled in the gateway container (`net.ipv6.conf.all.forwarding=1`)
@@ -1401,7 +1413,7 @@ The intended model is session-level opt-in — sessions that need IPv6 destinati
 
 This subsystem defines the networking architecture for the sandbox in which:
 
-* all VM egress traffic traverses a single path: VM → per-session bridge → gateway container → proxy pipeline → destination
+* all VM egress traffic traverses a single path: VM → per-session network → gateway container → proxy pipeline → destination
 * all traffic is denied by default — only TCP and UDP are supported; ICMP and tunneling protocols are explicitly denied
 * nftables PREROUTING DNAT transparently intercepts forwarded traffic from the VM, with Envoy recovering original destinations via `original_dst`
 * a local DNS resolver enforces policy at the DNS layer and provides query logging for audit trails
@@ -1413,7 +1425,7 @@ This subsystem defines the networking architecture for the sandbox in which:
 * policy backends are hidden behind a single sandbox policy model compiled by the sandbox daemon
 * the VM's network configuration is immutable from the agent's perspective — no `CAP_NET_ADMIN`, single NIC, single default route
 * inner Docker networking is transparent — inner container traffic NATs to the VM's IP and follows the same gateway path
-* per-session bridge networks provide complete inter-session isolation
+* per-session network segments (Docker bridges on Linux, vmnet instances on macOS) provide complete inter-session isolation
 * the system fails closed — no gateway means no network connectivity
 * logs make every exception visible
 * the design is honest about the difference between constrained egress and true safety

@@ -71,7 +71,7 @@ This design does **not** cover:
    Sessions are disposable. Destroy deletes all state irrecoverably. Persistence is opt-in (stop preserves disk; resume restarts from disk state). No session accumulates long-lived trust or credentials.
 
 5. **Cross-platform with one architecture**
-   The same conceptual architecture — Lima VM + gateway container + proxy pipeline — runs on Linux and macOS. Platform differences are confined to the hypervisor backend (QEMU/KVM vs. Apple VZ) and the VM-to-gateway connectivity layer (TAP on Docker bridge vs. macvlan on vmnet). The gateway container, proxy pipeline, policy model, and agent experience are identical on both platforms.
+   The same conceptual architecture — Lima VM + gateway container + proxy pipeline — runs on Linux and macOS. Platform differences are confined to the hypervisor backend (QEMU/KVM vs. Apple VZ) and the VM-to-gateway connectivity layer (TAP on Docker bridge vs. per-session vmnet with macvlan). The gateway container, proxy pipeline, policy model, and agent experience are identical on both platforms.
 
 6. **Fail closed**
    If the gateway container is not running, the VM has no network connectivity. If the proxy pipeline is degraded, traffic fails — it does not bypass. The deny-by-default posture from the networking design extends to the VM boundary: no gateway means no egress.
@@ -98,7 +98,7 @@ Host (Linux or macOS)
 │       ├── mitmproxy (HTTP inspection)
 │       └── DNS resolver (policy-aware)
 │
-│   VM ←→ Gateway: per-session network (bridge on Linux, macvlan on macOS)
+│   VM ←→ Gateway: per-session network (Docker bridge on Linux, dedicated vmnet on macOS)
 │   VM ←→ Host: vsock (control channel, not IP — does not traverse proxy)
 │
 ├── Session M
@@ -106,13 +106,14 @@ Host (Linux or macOS)
 │   └── Gateway container ...
 │
 └── Docker daemon (manages gateway containers; host Docker on Linux, sandboxd-managed Colima on macOS)
+    On macOS: socket_vmnet pool (N instances, each an isolated /30 subnet)
 ```
 
 ### Key structural properties
 
 **One VM per session.** Each agent session gets its own VM with its own kernel, filesystem, and Docker daemon. Sessions cannot interact with each other.
 
-**One gateway per session.** Each VM has a dedicated gateway container running the proxy pipeline. Gateway containers are isolated from each other via per-session Docker bridge networks.
+**One gateway per session.** Each VM has a dedicated gateway container running the proxy pipeline. Gateway containers are isolated from each other via per-session networks (Docker bridges on Linux, dedicated vmnet instances on macOS).
 
 **Two communication paths.** The VM has exactly two paths to the outside: (1) the virtual NIC, which routes through the gateway container, and (2) vsock, which connects directly to the sandbox daemon on the host. There are no other paths — no shared filesystems, no host mounts, no metadata services.
 
@@ -228,7 +229,7 @@ The sandbox daemon is a single process per host that manages all sandbox session
 * create, start, stop, and destroy sessions
 * manage Lima VM instances (create, start, stop, delete)
 * manage gateway containers (create, start, stop, remove)
-* manage per-session Docker bridge networks
+* manage per-session networks (Docker bridges on Linux, vmnet pool on macOS)
 * coordinate VM and gateway startup/shutdown ordering
 
 **Policy management** (as defined in the networking design):
@@ -277,11 +278,11 @@ sandboxd logs <session-id> [--component <name>]
 `sandboxd create` performs the following steps in order:
 
 1. **Allocate session ID.** Generate a unique session identifier.
-2. **Create per-session Docker bridge network.** An isolated bridge network that will connect the gateway container to the VM's virtual NIC.
-3. **Create gateway container.** A standard Docker container (runc runtime) attached to the session's bridge network. The container runs the proxy pipeline components (nftables, Envoy, mitmproxy, DNS resolver) but does not start them yet.
-4. **Create Lima VM.** Instantiate a VM from the Lima template. The VM's network interface is connected to the session's bridge network. The VM's default route points to the gateway container's IP on the bridge.
-5. **Provision the VM.** Cloud-init and provisioning scripts install Docker, agent tooling, and hardening configuration inside the VM.
-6. **Start the gateway pipeline.** Start the proxy pipeline inside the gateway container using the startup ordering defined in the networking design (nftables deny-by-default first, redirect rules last).
+2. **Provision per-session network.** On Linux, create a per-session Docker bridge network. On macOS, claim a vmnet slot from the pre-provisioned pool (see [networking-design.md § VM-to-gateway connectivity](networking-design.md#vm-to-gateway-connectivity)). Each session gets a /30 subnet (2 usable IPs: gateway + VM).
+3. **Create gateway container.** A standard Docker container (runc runtime) attached to the session's network. The container runs the proxy pipeline components (nftables, Envoy, mitmproxy, DNS resolver) but does not start them yet.
+4. **Start the gateway pipeline.** Start the proxy pipeline inside the gateway container using the startup ordering defined in the networking design (nftables deny-by-default first, redirect rules last).
+5. **Create Lima VM.** Instantiate a VM from the Lima template. The VM's network interface is connected to the session's network. The VM's default route points to the gateway container's IP on the /30 subnet.
+6. **Provision the VM.** Cloud-init and provisioning scripts install Docker, agent tooling, and hardening configuration inside the VM. The gateway pipeline is already operational, so cloud-init has network access through the proxy.
 7. **Start the VM.** Boot the VM. At this point, the VM has network connectivity through the gateway, mediated by the proxy pipeline.
 8. **Run boot command (optional).** If `--boot-cmd` was specified, execute it inside the VM after startup completes. This is typically used to clone a repository or start an agent process.
 
@@ -291,9 +292,10 @@ The VM has no network connectivity until the gateway pipeline is fully operation
 
 `sandboxd start <session-id>` resumes a previously stopped session:
 
-1. Start the gateway container and pipeline (same ordering as create).
-2. Start the Lima VM (boots from preserved disk state).
-3. Reconnect networking (VM's default route to gateway).
+1. Claim a per-session network. On Linux, the Docker bridge persists across stop/start. On macOS, claim a vmnet slot from the pool (slots are released on stop and re-claimed on start — only running sessions consume pool slots).
+2. Start the gateway container and pipeline (same ordering as create).
+3. Start the Lima VM (boots from preserved disk state).
+4. Reconnect networking (VM's default route to gateway).
 
 Processes that were running when the session was stopped are not restored — there are no memory snapshots. Only disk state persists. The Docker daemon inside the VM starts fresh, but previously pulled images and created volumes remain on disk.
 
@@ -303,9 +305,10 @@ Processes that were running when the session was stopped are not restored — th
 
 1. Shut down the proxy pipeline inside the gateway container (reverse of startup ordering — redirect rules removed first, deny-by-default last, as defined in the networking design).
 2. Shut down the Lima VM. The VM's disk state is preserved.
-3. Stop the gateway container.
+3. Stop and destroy the gateway container.
+4. Release the per-session network. On Linux, the Docker bridge network persists (low overhead). On macOS, the vmnet slot is released back to the pool so other sessions can use it.
 
-The session's Docker bridge network and disk image remain. The session can be resumed with `start`.
+The session's disk image remains. The session can be resumed with `start`.
 
 ### Destroy
 
@@ -313,8 +316,8 @@ The session's Docker bridge network and disk image remain. The session can be re
 
 1. Stop the session if running (same as `stop`).
 2. Delete the Lima VM and its disk image.
-3. Remove the gateway container.
-4. Remove the per-session Docker bridge network.
+3. Remove the gateway container (if not already removed by `stop`).
+4. Release the per-session network. On Linux, remove the Docker bridge network. On macOS, release the vmnet slot back to the pool (if not already released by `stop`).
 
 All state is deleted. This cannot be undone.
 
@@ -341,7 +344,7 @@ Each VM is created from a Lima YAML template that specifies:
 * base image (stock Ubuntu cloud image)
 * CPU, memory, and disk allocation
 * hypervisor backend (auto-detected: QEMU/KVM on Linux, VZ on macOS)
-* network configuration (bridge network to gateway)
+* network configuration (per-session network to gateway)
 * vsock enablement
 * provisioning scripts (cloud-init)
 * disabled features: file sharing (no virtio-fs), automatic port forwarding (sandboxd manages selective forwarding for control paths)
@@ -473,29 +476,29 @@ The gateway container is a trusted component — it runs the sandbox operator's 
 * Standard Docker container with default seccomp profile
 * No `--privileged`
 * `CAP_NET_ADMIN` only (required for nftables rule management throughout the gateway's lifetime, including policy hot-reload and IP propagation)
-* No host network (`--network` is the per-session network, not `host`)
+* No host network (`--network` is the per-session network — Docker bridge on Linux, macvlan on the session's vmnet on macOS — not `host`)
 * No host PID namespace
 * No host filesystem mounts beyond configuration volumes
 * Read-only root filesystem with writable volumes for logs and runtime state
 
 ## Networking integration
 
-### Per-session bridge network
+### Per-session network
 
-Each session has a dedicated Docker bridge network that connects the gateway container to the VM's virtual NIC:
+Each session has a dedicated network that connects the gateway container to the VM's virtual NIC:
 
 ```
-VM (virtio-net) ←→ Bridge network ←→ Gateway container (eth0)
+VM (virtio-net) ←→ Per-session network ←→ Gateway container (eth0)
 ```
 
-The bridge network is created as IPv4-only by the sandbox daemon during session creation and deleted during session destruction. Sessions do not share bridge networks — inter-session traffic is impossible at the network level.
+On Linux, this is a Docker bridge network created during session creation and deleted during session destruction. On macOS, this is a dedicated socket_vmnet instance claimed from a pre-provisioned pool at session start and released at session stop. Both platforms use /30 subnets (2 usable IPs: gateway + VM) carved from a configurable base range (default `10.209.0.0/24`). Sessions do not share network segments — inter-session traffic is impossible at the network level. See [networking-design.md § Per-session network](networking-design.md#per-session-network) for full details.
 
 ### VM network configuration
 
 Inside the VM:
 
-* The single NIC receives an IPv4 address on the bridge subnet (DHCP or static, configured during provisioning). No IPv6 addresses are assigned — the networking subsystem is IPv4-only.
-* The default route points to the gateway container's IP on the bridge
+* The single NIC receives an IPv4 address on the /30 subnet (DHCP or static, configured during provisioning). No IPv6 addresses are assigned — the networking subsystem is IPv4-only.
+* The default route points to the gateway container's IP on the /30 subnet
 * `/etc/resolv.conf` points to the gateway container's DNS resolver IP
 * No other routes exist — all traffic (except loopback and vsock) exits via the default route to the gateway
 
@@ -506,7 +509,7 @@ All agent-initiated network traffic follows this path:
 ```
 Agent process (in VM)
   → VM kernel networking → virtio-net
-    → Docker bridge → gateway container eth0
+    → per-session network → gateway container eth0
       → nftables PREROUTING DNAT
         → Envoy / mitmproxy / DNS resolver (per networking design)
           → destination (or deny)
@@ -519,7 +522,7 @@ Because the traffic arrives at the gateway container from the VM (forwarded traf
 The mechanism that connects the sandbox VM to its gateway container differs between Linux and macOS, but both achieve the same result: the VM has a single NIC with a default route pointing at the gateway container's IP, and traffic arrives at the gateway with original destination intact so that PREROUTING DNAT works correctly.
 
 * **Linux:** Per-session Docker bridge network. The VM's QEMU TAP device and the gateway container attach to the same bridge — direct L2 connectivity.
-* **macOS:** socket_vmnet shared network with Docker macvlan inside a sandboxd-managed Colima VM. Each gateway gets its own IP on the shared vmnet.
+* **macOS:** Per-session vmnet pool. sandboxd pre-provisions a pool of socket_vmnet instances at daemon startup, each with its own /30 subnet. At session start, a vmnet slot is claimed, a Colima NIC is attached, and the gateway container uses macvlan on that NIC. Each session is fully L2-isolated — the same property as Linux's per-session bridges.
 
 For the full platform-specific connectivity explanation, including architecture diagrams, see [networking-design.md § VM-to-gateway connectivity](networking-design.md#vm-to-gateway-connectivity).
 
@@ -670,9 +673,9 @@ Standard EC2 instances do not support nested virtualization. The sandbox cannot 
 
 **VM startup time:** Approximately 10-30 seconds on Apple Silicon with VZ. Acceptable for interactive development sessions. Snapshot optimization can reduce this.
 
-**socket_vmnet (required dependency).** socket_vmnet is a vmnet daemon from the Lima project that provides a shared virtual network on macOS. It is required for VM-to-gateway connectivity — see [networking-design.md § VM-to-gateway connectivity](networking-design.md#vm-to-gateway-connectivity) for the full explanation. socket_vmnet is open-source (Apache 2.0 license) and is the standard Lima mechanism for shared networking on macOS.
+**socket_vmnet pool (required dependency).** sandboxd pre-provisions a pool of socket_vmnet instances at daemon startup on macOS. Each instance is an isolated L2 segment with its own /30 subnet. The pool size is configurable (`max_concurrent_sessions_macos`, default 8). Only running sessions consume pool slots — stopped or created-but-not-started sandboxes do not. If the pool is exhausted, session start is rejected with a clear error; there is no silent degradation. socket_vmnet is open-source (Apache 2.0 license) and is the standard Lima mechanism for shared networking on macOS. See [networking-design.md § VM-to-gateway connectivity](networking-design.md#vm-to-gateway-connectivity) for the full explanation.
 
-**sandboxd-managed Colima instance.** On macOS, sandboxd manages its own Colima instance to host all gateway containers. This is necessary because Docker on macOS runs inside a Linux VM, and sandbox VMs cannot attach TAP devices to Docker bridges that exist inside another VM. See [networking-design.md § VM-to-gateway connectivity](networking-design.md#vm-to-gateway-connectivity) for how the networking works.
+**sandboxd-managed Colima instance.** On macOS, sandboxd manages its own Colima instance to host all gateway containers. This is necessary because Docker on macOS runs inside a Linux VM, and sandbox VMs cannot attach TAP devices to Docker bridges that exist inside another VM. At session start, a Colima NIC is attached to the claimed vmnet slot and the gateway container uses macvlan (private mode) on that NIC. At session stop, the gateway container is destroyed and the NIC is detached. See [networking-design.md § VM-to-gateway connectivity](networking-design.md#vm-to-gateway-connectivity) for how the networking works.
 
 This Colima instance is completely independent of the developer's Docker setup:
 
@@ -685,7 +688,7 @@ The developer never interacts with sandboxd's Colima instance directly. sandboxd
 
 **Coexistence with developer Lima VMs.** Developers who use Lima directly (outside Colima) for other purposes can continue doing so. The sandbox daemon manages its own Lima VMs with separate names and separate lifecycle. There is no conflict — Lima supports multiple concurrent VM instances.
 
-**Feature parity.** The sandbox architecture is identical on both platforms. The differences are confined to the hypervisor backend (QEMU/KVM vs. Apple VZ) and the VM-to-gateway connectivity layer (TAP on Docker bridge vs. macvlan on vmnet — see [networking-design.md § VM-to-gateway connectivity](networking-design.md#vm-to-gateway-connectivity)). The gateway container image, proxy pipeline, policy model, and session lifecycle are the same. Tests written against the sandbox on macOS will behave identically on Linux.
+**Feature parity.** The sandbox architecture is identical on both platforms. The differences are confined to the hypervisor backend (QEMU/KVM vs. Apple VZ) and the VM-to-gateway connectivity layer (TAP on Docker bridge vs. per-session vmnet with macvlan — see [networking-design.md § VM-to-gateway connectivity](networking-design.md#vm-to-gateway-connectivity)). Both platforms achieve the same isolation property: each session gets its own L2 segment with a /30 subnet. The gateway container image, proxy pipeline, policy model, and session lifecycle are the same. Tests written against the sandbox on macOS will behave identically on Linux.
 
 ## Resource management
 
@@ -707,7 +710,7 @@ The sandbox daemon tracks host resource utilization and refuses to create new se
 
 * QEMU process overhead per VM (memory for device emulation, virtio buffers)
 * Gateway container overhead per session (Envoy, mitmproxy, DNS resolver memory)
-* Docker bridge network overhead (negligible)
+* Per-session network overhead (Docker bridges on Linux, vmnet instances on macOS — negligible)
 * Host system reserved resources (OS, sandbox daemon, host Docker daemon)
 
 Capacity planning guidelines are a deferred work item. Initial deployment will use conservative per-session limits and manual capacity management.
@@ -831,7 +834,7 @@ Even with root inside the VM:
 
 * **Cannot reach host filesystem.** No virtio-fs, no host mounts.
 * **Cannot bypass proxy pipeline.** The gateway is on the host side of the virtual NIC. The agent can craft arbitrary network packets, but they all pass through the gateway.
-* **Cannot communicate with other sessions.** Bridge networks are per-session. The VM cannot reach other VMs' bridge networks.
+* **Cannot communicate with other sessions.** Per-session networks are isolated. The VM cannot reach other VMs' network segments.
 * **Cannot access cloud metadata.** 169.254.169.254 is not routable.
 * **Can attempt QEMU exploitation** via crafted I/O on the 4 virtio devices.
 * **Can attempt vsock exploitation** against the sandbox daemon's message handler.
@@ -893,7 +896,7 @@ Everything else — policy model, assurance levels, DNS model, SNI model, HTTP m
 * VM as the isolation boundary (replacing the container namespace)
 * Lima as the VM manager
 * Gateway container as the deployment unit for the proxy pipeline
-* Per-session networks connecting VMs to gateways (detailed connectivity in the [networking design](networking-design.md#vm-to-gateway-connectivity))
+* Per-session networks connecting VMs to gateways (detailed connectivity in the [networking design](networking-design.md#vm-to-gateway-connectivity); vmnet pool model on macOS)
 * vsock control channel between VMs and the sandbox daemon
 * VM hardening layers (device model, QEMU sandboxing, guest OS hardening)
 * Workspace provisioning (clone inside VM, not shared via virtio-fs)
@@ -913,4 +916,4 @@ The following items are identified as necessary but are not designed in this doc
 * **Multi-session resource management.** Host capacity planning, session scheduling, and resource contention handling when multiple sessions run concurrently.
 * **Ingress connectivity.** Allowing external access to services running inside the sandbox (e.g., for webhook testing, external API callbacks). This requires extending the gateway container with reverse-proxy capabilities and defining an ingress policy model.
 * **Session monitoring and alerting.** Integration with external monitoring systems for session health, resource utilization, and security events.
-* **IPv6 support.** The networking subsystem is IPv4-only by design — a deliberate simplification that reduces attack surface. When IPv6-only destinations become necessary, this requires dual-stack bridge networks, dual-stack VM configuration, IPv6-aware nftables rules, AAAA record handling in the DNS resolver, and IPv6 forwarding in the gateway container. See [networking-design.md § Deferred: IPv6 support](networking-design.md#deferred-ipv6-support) for the full requirements.
+* **IPv6 support.** The networking subsystem is IPv4-only by design — a deliberate simplification that reduces attack surface. When IPv6-only destinations become necessary, this requires dual-stack per-session networks, dual-stack VM configuration, IPv6-aware nftables rules, AAAA record handling in the DNS resolver, and IPv6 forwarding in the gateway container. See [networking-design.md § Deferred: IPv6 support](networking-design.md#deferred-ipv6-support) for the full requirements.
