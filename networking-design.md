@@ -225,7 +225,7 @@ The connectivity mechanism differs by platform, but both achieve the same result
 
 #### Linux
 
-On Linux, the sandbox daemon creates a per-session Docker bridge network. The gateway container attaches to this bridge normally (via Docker). The sandbox VM's QEMU process uses a TAP device on the same bridge as its network backend — Lima configures this via its `networks` YAML stanza. This gives the VM direct L2 connectivity to the gateway container on the bridge subnet, and the VM's default route points to the gateway's IP on the bridge.
+On Linux, the sandbox daemon creates a per-session Docker bridge network. The gateway container attaches to this bridge normally (via Docker). The sandbox VM's QEMU/KVM process uses a TAP device on the same bridge as its network backend — Lima configures this via its `networks` YAML stanza. This gives the VM direct L2 connectivity to the gateway container on the bridge subnet, and the VM's default route points to the gateway's IP on the bridge.
 
 ```
 Linux host
@@ -276,7 +276,7 @@ macOS host
 └── ...
 ```
 
-The sandbox VM's default route points to its gateway's IP on the /30 subnet. Traffic arrives at the gateway container with the original destination intact — PREROUTING DNAT works exactly as on Linux. From the gateway container's perspective, the traffic flow is indistinguishable from the Linux TAP-on-bridge model.
+The sandbox VM's default route points to its gateway's IP on the /30 subnet. Traffic arrives at the gateway container with the original destination intact — PREROUTING DNAT works exactly as on Linux. From the gateway container's perspective, the traffic flow is indistinguishable from the Linux TAP-on-bridge model. Both platforms use the same gateway container image — only the network attachment differs (Docker bridge on Linux, macvlan on a per-session vmnet on macOS).
 
 Each session is fully isolated at L2 — the vmnet instance, gateway container, and sandbox VM form a private /30 network segment. No cross-session traffic is possible, the same as Linux's per-session bridges.
 
