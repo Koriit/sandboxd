@@ -176,11 +176,9 @@ The agent process runs as a non-root user (`agent`) that is a member of the `doc
 
 These restrictions are enforced by the guest OS hardening described in [sandbox-design.md § Guest OS hardening](sandbox-design.md#guest-os-hardening).
 
-### IP forwarding disabled
+### Single-homed networking
 
-IP forwarding is disabled in the guest kernel (`net.ipv4.ip_forward` is 0 for the VM's host networking context — distinct from the inner Docker daemon's bridge forwarding). The VM cannot act as a router. This prevents the agent from forwarding traffic between interfaces if additional interfaces were somehow created.
-
-Note: the inner Docker daemon sets `ip_forward=1` for its own bridge networking to function. This is scoped to Docker's bridge — it enables container-to-external routing through the VM's kernel NAT, which is the intended path to the gateway.
+Docker sets `net.ipv4.ip_forward=1` globally inside the VM for its internal bridge networking. This has no security implication because the VM has a single external network interface (virtio-net) with one default route to the gateway — there is no second interface to forward traffic to, so the VM cannot act as a router. The agent cannot add interfaces (no `CAP_NET_ADMIN`). IPv6 is not enabled inside the VM.
 
 ### CA certificate trust
 
@@ -253,7 +251,7 @@ The solution uses three components:
 
 2. **Colima (sandboxd-managed)** — sandboxd manages a single Colima instance (a Lima-based Docker runtime) that hosts all gateway containers across all sessions. This Colima instance is completely independent of whatever Docker setup the developer uses (Docker Desktop, their own Colima, etc.). The developer never interacts with it directly.
 
-3. **Docker macvlan** — inside the sandboxd-managed Colima VM, each gateway container uses Docker macvlan networking on the vmnet-facing interface. This gives each gateway its own IP directly on the shared vmnet, rather than hiding it behind the Colima VM's IP with port mapping.
+3. **Docker macvlan (private mode)** — inside the sandboxd-managed Colima VM, each gateway container uses Docker macvlan networking (`-o macvlan_mode=private`) on the vmnet-facing interface. This gives each gateway its own IP directly on the shared vmnet, rather than hiding it behind the Colima VM's IP with port mapping. Private mode instructs the kernel to drop all traffic between macvlan interfaces on the same parent, providing L2 isolation between gateway containers without requiring per-session networks.
 
 ```
 macOS host
@@ -270,7 +268,9 @@ macOS host
 
 The sandbox VM's default route points to its gateway's macvlan IP on the vmnet. Traffic arrives at the gateway container with the original destination intact — PREROUTING DNAT works exactly as on Linux. From the gateway container's perspective, the traffic flow is indistinguishable from the Linux TAP-on-bridge model.
 
-Gateway containers within the Colima VM are isolated from each other via per-session macvlan networks, analogous to per-session bridges on Linux. One Colima VM hosts all gateways, but each gateway operates on its own macvlan network and cannot see other gateways' traffic.
+Gateway containers within the Colima VM are isolated from each other via macvlan private mode, analogous to per-session bridges on Linux. The kernel blocks all macvlan-to-macvlan traffic on the same parent interface, so no gateway container can reach another. Sandbox VM traffic is unaffected because it arrives from the vmnet (external to the macvlan), and gateway outbound traffic exits through the parent to the internet — only inter-gateway traffic is blocked, which is exactly the isolation requirement.
+
+The shared Colima VM introduces the only cross-session failure mode in the architecture. On Linux, gateway containers are independent — a single gateway crash affects only its session, and all other sessions continue unaffected. On macOS, the Colima VM hosts all gateway containers, so if it crashes, every active session loses networking simultaneously. This is an inherent consequence of the macOS platform constraint (Docker requires a Linux VM), not a design flaw. sandboxd must monitor the Colima VM's health, restart it on failure, and recreate gateway containers afterward; sessions will experience a networking interruption during recovery. All other failure modes remain session-scoped on both platforms.
 
 ### Isolation properties
 
@@ -333,6 +333,12 @@ Loopback principles:
 * admin/debug interfaces on pipeline components must not be exposed insecurely
 * prefer Unix sockets for control/admin paths where possible
 * strict separation of data plane (forwarded traffic from VM) and control plane (component-internal communication)
+
+### No self-traffic exemptions needed
+
+In the old shared-namespace model (OUTPUT REDIRECT), Envoy and mitmproxy's outbound connections to real destinations were locally-generated traffic in the same namespace as the intercepted process — they would hit the same OUTPUT chain rules and loop back into the proxy. That model required explicit UID/GID-based exemptions so the proxies' own traffic could bypass interception.
+
+In the current gateway container model, this problem does not exist. PREROUTING DNAT rules match only forwarded traffic arriving on the bridge-facing interface from the VM. When Envoy or mitmproxy open outbound connections to real destinations, those connections are locally generated inside the gateway container — they traverse the OUTPUT chain, not PREROUTING. Since the DNAT rules are in PREROUTING, locally-generated traffic never hits them. The chain separation inherently prevents interception loops without any exemption rules.
 
 ## Policy outcomes
 
@@ -440,7 +446,6 @@ Provides hard enforcement and transparent interception of forwarded traffic from
 * no direct egress outside the policy path
 * explicit protocol and destination allow rules
 * gateway-internal loopback exemptions where required
-* self-traffic exemptions for Envoy and mitmproxy
 * explicit host and port restrictions as derived from policy
 * IPv4 rules implement full policy; IPv6 rules are a blanket drop (the networking subsystem is IPv4-only)
 
@@ -679,7 +684,6 @@ The kernel firewall (nftables) inside the gateway container is the hard enforcem
 * nftables PREROUTING DNAT rules to redirect forwarded DNS traffic from the VM to the local resolver
 * nftables rules for UDP allow/deny (IP/port based)
 * gateway-internal loopback exemptions
-* self-traffic exemptions for Envoy and mitmproxy (outbound connections to actual destinations)
 * explicit host and port restrictions as derived from policy
 
 ### Important rule
@@ -737,9 +741,11 @@ This is a known limitation of any DNS-based policy system. TTL-aware resolution 
 
 ### Connection termination on IP rotation
 
-When DNS re-resolution produces new IPs and old IPs are removed from enforcement components, existing connections to the old IPs are terminated immediately. There is no grace period or connection draining.
+When DNS re-resolution produces a **changed** IP set for a domain (IPs added, removed, or replaced), the sandbox daemon pushes updated configuration to all enforcement components. IPs no longer present in the new set are removed from nftables rules and Envoy configuration, and existing connections to those removed IPs are terminated immediately. There is no grace period or connection draining.
 
-Rationale:
+When re-resolution produces the **same** IP set as the previous resolution, no action is taken — existing connections, nftables rules, and Envoy configuration are left untouched. This is critical for domains with short TTLs (common for CDNs), which would otherwise cause unnecessary connection churn for long-lived connections such as WebSocket streams or gRPC streaming RPCs.
+
+Rationale for immediate termination on actual IP change:
 
 * an old IP may no longer belong to the intended service — allowing continued communication risks connecting to a different host (IP takeover)
 * this is consistent with the fail-closed philosophy applied to DNS resolution failure
@@ -1259,7 +1265,7 @@ This section covers only the daemon's **networking-specific responsibilities**.
 ### DNS re-resolution and IP propagation
 
 * manage the local DNS resolver's policy (allowed domains, NXDOMAIN for denied domains)
-* receive resolution results from the local resolver and push updated IP-based configuration to all enforcement components that operate on IP addresses
+* receive resolution results from the local resolver and compare against the current IP set for each domain — push updated configuration only when the resolved IP set actually changes (no-op when IPs are unchanged)
 * perform TTL-aware re-resolution with configurable maximum intervals
 * immediately remove stale IPs on resolution failure (fail-closed)
 

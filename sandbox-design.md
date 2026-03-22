@@ -361,6 +361,8 @@ Cloud-init provisioning installs and configures:
 * Interception CA certificate in the system trust store and standard environment variables (`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `CURL_CA_BUNDLE`)
 * DNS configuration (`resolv.conf` pointing to the gateway's DNS resolver)
 
+Fresh provisioning requires network access to package repositories (Ubuntu mirrors, Docker APT repos, GPG key servers) that the production network policy does not permit. During initial image preparation, cloud-init runs under a permissive bootstrap network policy that allows access to these package sources. The snapshot captures the fully provisioned state, so production sessions created from snapshots never need this wider access. The bootstrap policy is only active during image preparation and is never applied to agent sessions.
+
 ### Snapshot optimization
 
 Provisioning a VM from scratch takes time (package installation, Docker setup). For fast cold starts, the sandbox daemon can snapshot a provisioned VM and use the snapshot as the base for new sessions. This amortizes provisioning cost across sessions.
@@ -439,7 +441,7 @@ This prevents the agent (or a compromised process) from modifying system binarie
 * **Single NIC.** The VM has one network interface (virtio-net) with one default route to the gateway container.
 * **No metadata service.** The IP range 169.254.169.254 is not routable from the VM. Cloud metadata services (AWS IMDS, GCP metadata, etc.) are not accessible. This prevents credential theft from the host's cloud environment.
 * **vsock for control.** The control channel between the VM and the sandbox daemon uses AF_VSOCK, which is a host-guest socket family — not an IP protocol. vsock traffic does not traverse the VM's network interface and is not subject to the proxy pipeline. This separation ensures that control traffic cannot be observed or tampered with by the agent's network-facing code.
-* **No IP forwarding.** IP forwarding is disabled in the guest kernel. The VM cannot act as a router.
+* **Single-homed networking.** The VM has one external network interface with one default route to the gateway. Docker enables `net.ipv4.ip_forward=1` inside the VM for its internal bridge networking. This has no security implication because the VM has no second interface to forward traffic to — it cannot act as a router. The agent cannot add interfaces (no `CAP_NET_ADMIN`). IPv6 is not enabled inside the VM.
 
 ## Gateway container
 
@@ -619,6 +621,8 @@ Docker authorization plugins intercept Docker API requests and can approve or de
 * `--device` (arbitrary device access)
 * Unrestricted `cap_add` (only a safe subset permitted)
 * Bind mounts outside the workspace directory
+
+The plugin must intercept all container lifecycle operations — `create`, `run`, `start`, and `update` — not just creation-time requests. Without this, a container created before the plugin is active (or during any enforcement gap) could be started later with previously granted privileged settings, bypassing all restrictions.
 
 ### Status
 
