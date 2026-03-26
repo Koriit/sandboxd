@@ -87,9 +87,9 @@ Host (Linux or macOS)
 │
 ├── Session N
 │   ├── Lima VM (QEMU/KVM on Linux, Apple VZ on macOS)
-│   │   ├── Agent process (non-root, docker group)
+│   │   ├── Agent process (root)
 │   │   ├── dockerd (root, constrained by authorization plugin)
-│   │   ├── Workspace (/home/agent/workspace — cloned repo, writable)
+│   │   ├── Workspace (/root/workspace — cloned repo, writable)
 │   │   └── Single NIC (virtio-net) → default route to gateway
 │   │
 │   └── Gateway container (standard Docker, runc runtime)
@@ -358,8 +358,8 @@ Stock Ubuntu cloud images. No custom disk images are built or maintained. All cu
 Cloud-init provisioning installs and configures:
 
 * Docker Engine (CE) and Docker Compose plugin
-* Agent user account (non-root, member of `docker` group)
-* SSH authorized keys (for `sandboxd ssh`)
+* Root environment for the agent (workspace directory, shell configuration)
+* SSH authorized keys for root (for `sandboxd ssh`)
 * System hardening (see [VM hardening layers](#vm-hardening-layers))
 * Interception CA certificate in the system trust store and standard environment variables (`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `CURL_CA_BUNDLE`)
 * DNS configuration (`resolv.conf` pointing to the gateway's DNS resolver)
@@ -427,15 +427,11 @@ Option A is the default. Option B is available for deployments where the additio
 
 * `/var` — Docker storage, logs, runtime state
 * `/tmp` — temporary files
-* `/home/agent/workspace` — the agent's working directory
+* `/root/workspace` — the agent's working directory
 
 This prevents the agent (or a compromised process) from modifying system binaries, configuration, or the Docker daemon binary.
 
-**Agent runs as non-root.** The agent process runs as a dedicated non-root user (`agent`) that is a member of the `docker` group. This provides Docker access without root privileges.
-
-**No CAP_NET_ADMIN.** The agent user does not have `CAP_NET_ADMIN`. This prevents the agent from reconfiguring the VM's network stack — it cannot add routes, modify iptables/nftables rules, or create network interfaces. The single default route to the gateway is immutable from the agent's perspective.
-
-**No CAP_SYS_ADMIN.** The agent user does not have `CAP_SYS_ADMIN`. This prevents namespace manipulation, mount operations, and other privileged operations.
+**Agent runs as root.** The agent process runs as root inside the VM. This is a deliberate design choice — the VM boundary (hardware isolation) and gateway pipeline (topological enforcement) provide the security properties, not the agent's privilege level inside the VM. Running as non-root would add usability barriers (sudo for package management, system configuration, global tool installation) without improving the security posture. Operators can optionally configure a non-root agent user as a defense-in-depth measure against hypothetical VM escape exploits.
 
 **dockerd runs as root.** This is required by Docker Engine. The Docker daemon is constrained by an authorization plugin (see [Inner Docker policy](#inner-docker-policy)) that restricts the agent's use of dangerous Docker features.
 
@@ -444,7 +440,7 @@ This prevents the agent (or a compromised process) from modifying system binarie
 * **Single NIC.** The VM has one network interface (virtio-net) with one default route to the gateway container.
 * **No metadata service.** The IP range 169.254.169.254 is not routable from the VM. Cloud metadata services (AWS IMDS, GCP metadata, etc.) are not accessible. This prevents credential theft from the host's cloud environment.
 * **vsock for control.** The control channel between the VM and the sandbox daemon uses AF_VSOCK, which is a host-guest socket family — not an IP protocol. vsock traffic does not traverse the VM's network interface and is not subject to the proxy pipeline. This separation ensures that control traffic cannot be observed or tampered with by the agent's network-facing code.
-* **Single-homed networking.** The VM has one external network interface with one default route to the gateway. Docker enables `net.ipv4.ip_forward=1` inside the VM for its internal bridge networking. This has no security implication because the VM has no second interface to forward traffic to — it cannot act as a router. The agent cannot add interfaces (no `CAP_NET_ADMIN`). IPv6 is not enabled inside the VM.
+* **Single-homed networking.** The VM has one external network interface with one default route to the gateway. Docker enables `net.ipv4.ip_forward=1` inside the VM for its internal bridge networking. This has no security implication because the VM has no second interface to forward traffic to — it cannot act as a router. Even with root privileges, creating additional virtual interfaces inside the VM does not change this: all traffic still exits through the single virtio-net NIC to the gateway. IPv6 is not enabled inside the VM.
 
 ## Gateway container
 
@@ -817,20 +813,20 @@ The agent is not assumed to be:
 Agent → syscall to shared host kernel → exploit kernel bug → host root
 ```
 
-**VM (QEMU/KVM) escape — 3-4 steps:**
+**VM (QEMU/KVM) escape — 3 steps:**
 ```
-Agent → exploit guest kernel (or already root)
+Agent (root inside VM)
   → craft malicious virtio device I/O
     → trigger QEMU device emulation bug
       → land in unprivileged, sandboxed QEMU process
         → escalate from sandboxed process to host
 ```
 
-The VM escape requires chaining vulnerabilities across 3-4 independent components: guest kernel, QEMU device emulation, and host privilege escalation from a sandboxed process. Each step targets different code with different security properties.
+The agent has root inside the VM by default, but root in the guest is not root on the host. The VM escape requires chaining vulnerabilities across 3 independent components: QEMU device emulation, host process sandbox escape, and host privilege escalation. Each step targets different code with different security properties.
 
-### What a fully compromised VM gives the attacker
+### What root inside the VM does not give the attacker
 
-Even with root inside the VM:
+The agent runs as root inside the VM by default. Despite this:
 
 * **Cannot reach host filesystem.** No virtio-fs, no host mounts.
 * **Cannot bypass proxy pipeline.** The gateway is on the host side of the virtual NIC. The agent can craft arbitrary network packets, but they all pass through the gateway.
@@ -850,7 +846,7 @@ Layer 3: QEMU process     Unprivileged user + seccomp + namespaces + cgroups
 Layer 4: Device model     4 virtio devices only — no USB, display, legacy, virtio-fs
 Layer 5: Guest kernel     Stock (default) or minimal hardened (optional)
 Layer 6: Guest OS         Read-only root filesystem, writable overlay for workspace
-Layer 7: Agent process    Non-root user, no CAP_NET_ADMIN, no CAP_SYS_ADMIN
+Layer 7: Agent process    Root (VM boundary is the security boundary, not user privilege)
 Layer 8: Inner Docker     Authorization plugin denying dangerous flags (deferred)
 Layer 9: Network path     Single NIC → gateway container → proxy pipeline
 Layer 10: Proxy pipeline  nftables + Envoy + mitmproxy + DNS (see networking design)
