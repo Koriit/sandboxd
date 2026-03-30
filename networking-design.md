@@ -295,6 +295,7 @@ The shared Colima VM introduces the only cross-session failure mode in the archi
 * **No shared L2 segments.** Each session gets its own network segment — a Docker bridge on Linux, a dedicated vmnet instance on macOS. Sessions do not share network segments.
 * **No inter-session traffic.** Because network segments are per-session, VMs from different sessions cannot communicate at the network level. There is no L2 path between sessions.
 * **No host network.** The gateway container is attached to the per-session network, not the host network (`--network` is the session bridge on Linux; macvlan on the session's vmnet on macOS). The gateway cannot reach other sessions' networks or the host's network stack directly.
+* **Gateway egress.** The gateway container's own outbound connections — Envoy forwarding permitted requests, the DNS resolver querying upstream nameservers — follow the standard Docker/Colima NAT path. On Linux, Docker applies MASQUERADE on the host's external interface for traffic leaving the session bridge; the gateway's outbound packets are SNAT'd to the host IP. On macOS, the sandboxd-managed Colima VM provides NAT for all containers it hosts; outbound traffic from the gateway is masqueraded through Colima's external interface. No `--network=host` or special egress privileges are needed.
 
 #### Subnet allocation
 
