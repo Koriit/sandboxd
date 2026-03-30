@@ -264,7 +264,7 @@ The solution uses a per-session vmnet pool model that mirrors the per-session Do
 **Session lifecycle on macOS:**
 
 * **Session start:** Claim a vmnet slot from the pool. Attach a Colima NIC to that vmnet. Create a gateway container with macvlan (private mode) on that NIC. Boot the sandbox VM on the same vmnet. The two share a /30 subnet — only they can communicate.
-* **Session stop:** Stop the VM, destroy the gateway container, detach and release the vmnet slot back to the pool.
+* **Session stop:** Stop the VM, remove the gateway container, detach and release the vmnet slot back to the pool.
 * **Pool exhaustion:** If the pool is exhausted, reject the session start with a clear error ("max concurrent sessions reached, increase pool size and restart sandboxd"). No silent degradation.
 
 Only running sessions consume pool slots — stopped or created-but-not-started sandboxes do not.
@@ -317,12 +317,12 @@ The gateway container runs the proxy pipeline outside the VM, on the host side o
 
 #### What runs inside the gateway
 
-* **nftables** — PREROUTING DNAT rules for forwarded traffic from the VM
+* **nftables** — PREROUTING DNAT rules for forwarded traffic from the VM (rules operate in the gateway's network namespace but are injected by sandboxd from outside the container)
 * **Envoy** — original_dst listener for protocol-aware routing
 * **mitmproxy** — HTTP inspection and policy enforcement
 * **DNS resolver** — policy-aware resolution, query logging
 
-These components form the layered enforcement pipeline described throughout this document. The gateway container has `CAP_NET_ADMIN` (required for nftables) but otherwise runs with Docker's default security profile — no `--privileged`, no host PID namespace, no host filesystem mounts beyond configuration volumes, read-only root filesystem with writable volumes for logs and runtime state.
+These components form the layered enforcement pipeline described throughout this document. The gateway container runs with Docker's default capability set — no `--privileged`, no additional capabilities, no host PID namespace, no host filesystem mounts beyond configuration volumes, read-only root filesystem with writable volumes for logs and runtime state. nftables rules in the gateway's network namespace are managed by sandboxd from outside the container (via `nsenter` or `docker exec`), so the container itself does not need `CAP_NET_ADMIN`.
 
 IP forwarding must be enabled in the gateway container (`net.ipv4.ip_forward=1`, set via `--sysctl` at container creation) because it acts as the router for the VM's traffic. Without IP forwarding, forwarded packets from the VM would be dropped before reaching the nftables PREROUTING DNAT rules.
 
@@ -852,7 +852,7 @@ The fail-closed property extends to the VM boundary: if the gateway container is
 
 ### Kernel firewall requirements
 
-The kernel firewall (nftables) inside the gateway container is the hard enforcement layer and the transparent interception mechanism for forwarded traffic from the VM.
+The kernel firewall (nftables) in the gateway container's network namespace is the hard enforcement layer and the transparent interception mechanism for forwarded traffic from the VM. sandboxd manages these rules from outside the container (via `nsenter` or `docker exec` to run `nft` commands in the gateway's netns).
 
 #### Must enforce
 
@@ -1157,21 +1157,21 @@ This is recognized as a future enhancement. Per-component probes are sufficient 
 
 #### Requirement
 
-The pipeline components must start in a specific order to avoid transient exposure or broken behavior during session initialization. The sandbox daemon orchestrates this sequence as part of session creation — see [sandbox-design.md § Session lifecycle](sandbox-design.md#session-lifecycle) for the full create/start/stop/destroy flow.
+The pipeline components must start in a specific order to avoid transient exposure or broken behavior during session initialization. The sandbox daemon orchestrates this sequence as part of session creation — see [sandbox-design.md § Session lifecycle](sandbox-design.md#session-lifecycle) for the full create/start/stop/rm flow.
 
 #### Startup order
 
 Components start outside-in — the outermost enforcement layer first, the traffic gate last:
 
-1. **Kernel firewall (nftables)** — deny-by-default rules are applied first. Nothing can leave the gateway. This is always safe.
+1. **Kernel firewall (nftables)** — sandboxd applies deny-by-default rules first (via `nsenter`/`docker exec` into the gateway's netns). Nothing can leave the gateway. This is always safe.
 2. **mitmproxy** — starts and becomes ready to receive forwarded HTTP(S) traffic from Envoy.
 3. **Envoy** — starts and becomes ready to receive DNAT-redirected TCP traffic. Can route to mitmproxy, which is already available.
 4. **Local DNS resolver** — starts and becomes ready to answer queries.
-5. **nftables PREROUTING DNAT rules** — applied last. Traffic is only redirected into the pipeline once all components are ready to handle it.
+5. **nftables PREROUTING DNAT rules** — sandboxd applies these last. Traffic is only redirected into the pipeline once all components are ready to handle it.
 
 #### Why this order is safe
 
-The kernel firewall's deny-by-default rules are the first thing applied and the last thing removed. The nftables PREROUTING DNAT rules are the gate — no traffic enters the userland pipeline until every component is confirmed ready. During the startup window, forwarded traffic from the VM is denied entirely, which is the correct default.
+The kernel firewall's deny-by-default rules are the first thing sandboxd applies and the last thing it removes. The nftables PREROUTING DNAT rules are the gate — no traffic enters the userland pipeline until every component is confirmed ready. During the startup window, forwarded traffic from the VM is denied entirely, which is the correct default.
 
 #### Readiness gates
 
@@ -1198,11 +1198,11 @@ Traffic is never silently rerouted or allowed to bypass the pipeline due to a co
 
 Shutdown is the reverse of startup — the traffic gate is removed first, the backstop last:
 
-1. **nftables PREROUTING DNAT rules** — removed first. No new traffic enters the pipeline.
+1. **nftables PREROUTING DNAT rules** — sandboxd removes these first. No new traffic enters the pipeline.
 2. **Local DNS resolver** — stopped. No new DNS queries are answered.
 3. **Envoy** — stopped. No new TCP connections are routed.
 4. **mitmproxy** — stopped.
-5. **nftables deny-by-default rules** — removed last. The backstop remains until all components are down.
+5. **nftables deny-by-default rules** — sandboxd removes these last. The backstop remains until all components are down.
 
 This mirrors the startup logic: the PREROUTING DNAT rules are the gate that controls whether traffic enters the pipeline. Removing them first ensures no new connections are initiated while components shut down. The deny-by-default rules remain as the final safety net until the gateway container is fully torn down.
 

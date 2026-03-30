@@ -72,10 +72,10 @@ This design does **not** cover:
    The network proxy pipeline runs outside the VM, on the host side of the VM's virtual NIC. The agent cannot modify, bypass, or disable the pipeline because it has no access to the host or the gateway container.
 
 3. **Minimal attack surface**
-   The VM exposes the smallest possible device model. No virtio-fs, no USB, no display, no legacy devices. Every device is code parsing guest-controlled input — fewer devices means fewer opportunities for exploitation.
+   The VM exposes the smallest possible device model. No virtio-fs (by default), no USB, no display, no legacy devices. Every device is code parsing guest-controlled input — fewer devices means fewer opportunities for exploitation.
 
 4. **Ephemeral by default**
-   Sessions are disposable. Destroy deletes all state irrecoverably. Persistence is opt-in (stop preserves disk; resume restarts from disk state). No session accumulates long-lived trust or credentials.
+   Sessions are disposable. Removal (`rm`) deletes all state irrecoverably. Persistence is opt-in (stop preserves disk; resume restarts from disk state). No session accumulates long-lived trust or credentials.
 
 5. **Cross-platform with one architecture**
    The same conceptual architecture — Lima VM + gateway container + proxy pipeline — runs on Linux and macOS. Platform differences are confined to the hypervisor backend (QEMU/KVM vs. Apple VZ) and the VM-to-gateway connectivity layer (TAP on Docker bridge vs. per-session vmnet with macvlan). The gateway container, proxy pipeline, policy model, and agent experience are identical on both platforms.
@@ -430,7 +430,7 @@ The VM exposes the minimal set of virtio devices required for operation:
 | virtio-rng | Entropy (/dev/urandom seeding for SSH keys, TLS, etc.) | Minimal — read-only, no guest-controlled input parsing |
 | virtio-vsock | Host-guest control channel | vsock protocol parsing |
 
-**Not present:** USB controller, display adapter, sound device, floppy controller, legacy ISA devices, virtio-fs, virtio-serial, PCI passthrough, GPU.
+**Not present:** USB controller, display adapter, sound device, floppy controller, legacy ISA devices, virtio-fs (available as opt-in for shared mount mode; see [Workspace provisioning](#workspace-provisioning)), virtio-serial, PCI passthrough, GPU.
 
 Every device in the VM's device model is code in QEMU (or VZ) that parses guest-controlled input. The guest kernel and any guest process can craft arbitrary device I/O. Each device is therefore an attack surface. The security value of a minimal device model is linear — fewer devices means fewer independent targets for exploitation.
 
@@ -526,7 +526,7 @@ Each session has a dedicated network that connects the gateway container to the 
 VM (virtio-net) ←→ Per-session network ←→ Gateway container (eth0)
 ```
 
-On Linux, this is a Docker bridge network created during session creation and deleted during session destruction. On macOS, this is a dedicated socket_vmnet instance claimed from a pre-provisioned pool at session start and released at session stop. Both platforms use /30 subnets (2 usable IPs: gateway + VM) carved from a configurable base range (default `10.209.0.0/24`). Sessions do not share network segments — inter-session traffic is impossible at the network level. See [networking-design.md § Per-session network](networking-design.md#per-session-network) for full details.
+On Linux, this is a Docker bridge network created during session creation and deleted during session removal. On macOS, this is a dedicated socket_vmnet instance claimed from a pre-provisioned pool at session start and released at session stop. Both platforms use /30 subnets (2 usable IPs: gateway + VM) carved from a configurable base range (default `10.209.0.0/24`). Sessions do not share network segments — inter-session traffic is impossible at the network level. See [networking-design.md § Per-session network](networking-design.md#per-session-network) for full details.
 
 #### VM network configuration
 
@@ -861,7 +861,7 @@ The agent has root inside the VM by default, but root in the guest is not root o
 
 The agent runs as root inside the VM by default. Despite this:
 
-* **Cannot reach host filesystem.** No virtio-fs, no host mounts.
+* **Cannot reach host filesystem.** In the default configuration, no virtio-fs and no host mounts. The opt-in shared mount mode enables virtio-fs with acknowledged additional attack surface (see [Workspace provisioning](#workspace-provisioning)).
 * **Cannot bypass proxy pipeline.** The gateway is on the host side of the virtual NIC. The agent can craft arbitrary network packets, but they all pass through the gateway.
 * **Cannot communicate with other sessions.** Per-session networks are isolated. The VM cannot reach other VMs' network segments.
 * **Cannot access cloud metadata.** 169.254.169.254 is not routable.
@@ -876,9 +876,9 @@ The agent runs as root inside the VM by default. Despite this:
 Layer 1: Hardware         CPU VMX/EPT (Intel) or VHE (ARM) — enforced by silicon
 Layer 2: Hypervisor       KVM (Linux) or Apple VZ (macOS) — host kernel module
 Layer 3: QEMU process     Unprivileged user + seccomp + namespaces + cgroups
-Layer 4: Device model     4 virtio devices only — no USB, display, legacy, virtio-fs
+Layer 4: Device model     4 virtio devices only — no USB, display, legacy, virtio-fs (by default)
 Layer 5: Guest kernel     Stock (default) or minimal hardened (optional)
-Layer 6: Guest OS         Read-only root filesystem, writable overlay for workspace
+Layer 6: Guest OS         Writable root (disposable — destroyed with session), resource-limited
 Layer 7: Agent process    Root (VM boundary is the security boundary, not user privilege)
 Layer 8: Inner Docker     Authorization plugin denying dangerous flags (deferred)
 Layer 9: Network path     Single NIC → gateway container → proxy pipeline
@@ -898,7 +898,7 @@ Even with correct implementation, the following risks remain:
 * **Stock guest kernel** has a larger attack surface than a minimal custom kernel. The default configuration accepts this trade-off for operational simplicity.
 * **Inner Docker without authorization plugin** (initial deployment) means the agent has unrestricted Docker access inside the VM. This is defense-in-depth loss, not primary boundary loss.
 * **Provisioning from network** means the initial VM setup depends on network access through the proxy pipeline. A supply-chain attack on provisioned packages could compromise the VM. Snapshot-based provisioning mitigates by reducing the number of times provisioning occurs.
-* **Long-lived sessions** accumulate state (Docker images, files, configuration) that may include sensitive data. Destroy cleans this up, but the data exists on disk while the session is running.
+* **Long-lived sessions** accumulate state (Docker images, files, configuration) that may include sensitive data. `rm` cleans this up, but the data exists on disk while the session is running.
 * **Clock drift** in long-running sessions without NTP could affect TLS certificate validation, log correlation, and time-sensitive operations.
 
 These are structural limitations, not implementation bugs. They define the boundary of what this sandbox can guarantee.
