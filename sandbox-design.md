@@ -231,6 +231,8 @@ Lima is the VM lifecycle manager. The sandbox daemon wraps Lima with policy enfo
 
 The sandbox daemon is a single process per host that manages all sandbox sessions. It is the same daemon described in the networking design — that document covers its role in policy compilation and distribution. This document covers its role in VM and gateway lifecycle management.
 
+sandboxd is implemented in Rust. The vsock protocol handler — custom code parsing untrusted input from potentially compromised VMs — is the system's highest-risk attack surface, and Rust's memory safety guarantees eliminate the most common class of parsing vulnerabilities (buffer overflows, use-after-free) at compile time. Rust also provides a strong type system for the policy engine and session state machine, and no GC pauses for a long-running daemon managing concurrent sessions.
+
 #### Responsibilities
 
 **Session lifecycle:**
@@ -698,7 +700,7 @@ The primary attack vector is sandboxd connecting to a malicious or compromised V
 
 **Per-session handler isolation.** sandboxd forks a handler process per session with minimal privileges. The main daemon communicates with forked handlers via a restricted internal channel. A compromised handler — whether from a malicious VM-side response exploiting a parsing bug or any other cause — affects only that session. It cannot access other sessions' state, other handlers' memory, or the main daemon's control structures.
 
-This is the highest-risk custom code in the system. Unlike QEMU/KVM, which are battle-tested by a large community, the vsock protocol handler is private code parsing untrusted input over the most direct host-guest communication channel. It must be implemented with the same defensive posture as any network service facing the internet, and fuzz-tested against adversarial inputs.
+This is the highest-risk custom code in the system. Unlike QEMU/KVM, which are battle-tested by a large community, the vsock protocol handler is private code parsing untrusted input over the most direct host-guest communication channel. Rust's memory safety eliminates the most common class of parsing vulnerabilities (buffer overflows, use-after-free) in this critical path. It must be implemented with the same defensive posture as any network service facing the internet, and fuzz-tested against adversarial inputs.
 
 ### Certificate management
 
