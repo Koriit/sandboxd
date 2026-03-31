@@ -128,7 +128,7 @@ Agent process (in VM)
   → VM kernel networking → virtio-net
     → per-session network → gateway container eth0
       → nftables PREROUTING DNAT
-        → Envoy / mitmproxy / DNS resolver
+        → Envoy / mitmproxy / CoreDNS
           → destination (or deny)
 ```
 
@@ -320,7 +320,7 @@ The gateway container runs the proxy pipeline outside the VM, on the host side o
 * **nftables** — PREROUTING DNAT rules for forwarded traffic from the VM (rules operate in the gateway's network namespace but are injected by sandboxd from outside the container)
 * **Envoy** — original_dst listener for protocol-aware routing
 * **mitmproxy** — HTTP inspection and policy enforcement
-* **DNS resolver** — policy-aware resolution, query logging
+* **CoreDNS** (with a custom policy plugin) — policy-aware resolution, query logging. CoreDNS is used for its mature plugin architecture — the custom policy plugin enforces allow/deny by domain, strips AAAA records, and reports resolution results (IP-to-domain mappings) to sandboxd for nftables IP rule propagation.
 
 These components form the layered enforcement pipeline described throughout this document. The gateway container runs with Docker's default capability set — no `--privileged`, no additional capabilities, no host PID namespace, no host filesystem mounts beyond configuration volumes, read-only root filesystem with writable volumes for logs and runtime state. nftables rules in the gateway's network namespace are managed by sandboxd from outside the container (via `nsenter` or `docker exec`), so the container itself does not need `CAP_NET_ADMIN`.
 
@@ -480,9 +480,9 @@ Provides hard enforcement and transparent interception of forwarded traffic from
 
 This eliminates the need for userland transparent interception proxies. The kernel handles the redirect, and Envoy recovers the original destination natively.
 
-##### Local DNS resolver
+##### Local DNS resolver (CoreDNS)
 
-A local DNS resolver runs inside the gateway container and serves as the single enforced DNS path:
+A CoreDNS instance with a custom policy plugin runs inside the gateway container and serves as the single enforced DNS path:
 
 * **policy-aware resolution**: only domains permitted by policy resolve successfully; non-allowed domains receive NXDOMAIN
 * **query logging**: all DNS queries are logged, providing domain→IP correlation for audit trails

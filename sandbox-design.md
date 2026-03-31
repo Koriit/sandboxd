@@ -105,7 +105,7 @@ Host (Linux or macOS)
 │       ├── nftables (PREROUTING DNAT for forwarded VM traffic)
 │       ├── Envoy (original_dst listener)
 │       ├── mitmproxy (HTTP inspection)
-│       └── DNS resolver (policy-aware)
+│       └── CoreDNS (policy-aware, custom plugin)
 │
 │   VM ←→ Gateway: per-session network (Docker bridge on Linux, dedicated vmnet on macOS)
 │   VM ←→ Host: vsock (control channel, not IP — does not traverse proxy)
@@ -490,7 +490,7 @@ The gateway container runs the network proxy pipeline outside the VM. It is a st
 * **nftables** — PREROUTING DNAT rules for forwarded traffic from the VM
 * **Envoy** — original_dst listener for protocol-aware routing
 * **mitmproxy** — HTTP inspection and policy enforcement
-* **DNS resolver** — policy-aware resolution, query logging
+* **CoreDNS** (with a custom policy plugin) — policy-aware resolution, query logging
 
 These are the same components described in the networking design. The proxy pipeline's behavior — policy model, assurance levels, DNS model, SNI model, HTTP model, bypass framework — is entirely defined in that document and is not duplicated here.
 
