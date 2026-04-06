@@ -1,0 +1,1017 @@
+#!/usr/bin/env python3
+"""Session progress tracker for multi-session implementation plans.
+
+Manages a structured JSON log of session progress, decisions, and discoveries.
+All data is stored in a single JSON file (default: .tasks/progress.json relative
+to the git repo root).
+"""
+
+import argparse
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from collections import Counter
+from pathlib import Path
+
+
+def utc_now_iso():
+    """Return current UTC time as ISO 8601 string with Z suffix."""
+    ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    # Replace +00:00 suffix with Z
+    if ts.endswith("+00:00"):
+        ts = ts[:-6] + "Z"
+    return ts
+
+
+def git_root():
+    """Detect the git repository root directory."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, check=True
+        )
+        return result.stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
+def resolve_progress_path(file_arg):
+    """Resolve the progress file path from --file arg or default."""
+    if file_arg:
+        return Path(file_arg)
+    root = git_root()
+    if root is None:
+        error("Not in a git repository and no --file specified.")
+    return Path(root) / ".tasks" / "progress.json"
+
+
+def error(msg):
+    """Print error to stderr and exit with code 1."""
+    print(f"Error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def read_progress(path):
+    """Read and parse the progress JSON file."""
+    if not path.exists():
+        error(f"Progress file not found: {path}\nRun 'progress init' to create it.")
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except json.JSONDecodeError as e:
+        error(f"Invalid JSON in {path}: {e}")
+
+
+def write_progress(path, data):
+    """Write progress data to file atomically (temp file + rename)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=".progress-",
+        suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        os.replace(tmp_path, str(path))
+    except Exception:
+        # Clean up temp file on failure
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def extract_milestone(session_id):
+    """Extract milestone from session ID (e.g., M3-S4 -> M3)."""
+    m = re.match(r"^(M\d+)-S\d+$", session_id)
+    if m:
+        return m.group(1)
+    return None
+
+
+def validate_session_id(session_id):
+    """Validate that a session ID matches the M{N}-S{K} pattern."""
+    if not re.match(r"^M\d+-S\d+$", session_id):
+        error(f"Invalid session ID format: '{session_id}'. Expected format: M{{N}}-S{{K}} (e.g., M1-S3)")
+
+
+def get_current_session(data):
+    """Return the current session ID from current_state, or None."""
+    return data.get("current_state", {}).get("session")
+
+
+def ensure_todos(data):
+    """Ensure the data has a todos array (backward compat)."""
+    if "todos" not in data:
+        data["todos"] = []
+
+
+def next_todo_id(data):
+    """Return the next available todo ID."""
+    ensure_todos(data)
+    if not data["todos"]:
+        return 1
+    return max(t["id"] for t in data["todos"]) + 1
+
+
+# --- Subcommands ---
+
+
+def cmd_init(args, progress_path):
+    """Initialize a new progress file."""
+    if progress_path.exists() and not args.force:
+        error(f"Progress file already exists: {progress_path}\nUse --force to overwrite.")
+
+    validate_session_id(args.first_session)
+    milestone = extract_milestone(args.first_session)
+
+    data = {
+        "current_state": {
+            "milestone": milestone,
+            "session": args.first_session,
+            "status": "not_started",
+            "completed_sessions": 0,
+            "total_sessions": args.total_sessions,
+            "next": f"{args.first_session}: {args.first_title}"
+        },
+        "current_log": None,
+        "log": [],
+        "todos": []
+    }
+
+    write_progress(progress_path, data)
+    print(f"Initialized progress file: {progress_path}")
+    print(f"  Total sessions: {args.total_sessions}")
+    print(f"  First session:  {args.first_session} — {args.first_title}")
+
+
+def cmd_open(args, progress_path):
+    """Start a new session."""
+    data = read_progress(progress_path)
+    session_id = args.session_id
+    validate_session_id(session_id)
+
+    if data["current_log"] is not None:
+        active = data["current_log"]["session"]
+        error(f"Session {active} is still open. Close it first with 'progress close'.")
+
+    milestone = extract_milestone(session_id)
+    data["current_state"]["milestone"] = milestone
+    data["current_state"]["session"] = session_id
+    data["current_state"]["status"] = "in_progress"
+    if args.next is not None:
+        data["current_state"]["next"] = args.next
+
+    data["current_log"] = {
+        "session": session_id,
+        "title": args.title,
+        "started": utc_now_iso(),
+        "entries": []
+    }
+
+    write_progress(progress_path, data)
+    print(f"Opened session {session_id}: {args.title}")
+
+    # Show deferred todos
+    ensure_todos(data)
+    deferred = [t for t in data["todos"] if t["status"] == "deferred"]
+    if deferred:
+        print()
+        print("Deferred todos:")
+        for t in deferred:
+            print(f"  #{t['id']}  {t['text']} (from {t['added_session']})")
+        print("Use 'progress todo select ID...' to pick todos for this session.")
+
+
+def cmd_log(args, progress_path):
+    """Append an entry to the current session log."""
+    data = read_progress(progress_path)
+
+    if data["current_log"] is None:
+        error("No active session. Run 'progress open' first.")
+
+    entry = {
+        "timestamp": utc_now_iso(),
+        "type": args.type,
+        "note": args.note
+    }
+    data["current_log"]["entries"].append(entry)
+
+    write_progress(progress_path, data)
+    session_id = data["current_log"]["session"]
+    count = len(data["current_log"]["entries"])
+    print(f"Logged {args.type} entry to {session_id} ({count} entries total)")
+
+
+def cmd_close(args, progress_path):
+    """Close the current session and write a permanent log entry."""
+    data = read_progress(progress_path)
+
+    if data["current_log"] is None:
+        error("No active session to close.")
+
+    current_state = data["current_state"]
+    if current_state["status"] == "blocked":
+        error("Cannot close a blocked session. Resume it first with 'progress resume'.")
+
+    current_log = data["current_log"]
+    current_session = current_log["session"]
+
+    # Check for unresolved selected todos
+    ensure_todos(data)
+    selected = [t for t in data["todos"]
+                if t["status"] == "selected"
+                and t.get("selected_session") == current_session]
+    if selected:
+        lines = [f"Cannot close session: {len(selected)} selected todos unresolved. Complete or defer them first:"]
+        for t in selected:
+            lines.append(f"  #{t['id']}  {t['text']}")
+        error("\n".join(lines))
+
+    entries = current_log["entries"]
+
+    # Collect typed entries from current_log
+    decisions = [e["note"] for e in entries if e["type"] == "decision"]
+    discoveries = [e["note"] for e in entries if e["type"] == "discovery"]
+    blockers = [e["note"] for e in entries if e["type"] == "blocker"]
+
+    # Append extras from CLI arguments
+    if args.extra_decisions:
+        decisions.extend(args.extra_decisions)
+    if args.extra_discoveries:
+        discoveries.extend(args.extra_discoveries)
+    if args.extra_blockers:
+        blockers.extend(args.extra_blockers)
+
+    # Build permanent log entry (only required fields + non-empty optionals)
+    log_entry = {
+        "session": current_log["session"],
+        "title": current_log["title"],
+        "summary": args.summary,
+        "completed": utc_now_iso(),
+        "decisions": decisions,
+    }
+
+    # Only include optional fields if non-empty
+    if discoveries:
+        log_entry["discoveries"] = discoveries
+    if blockers:
+        log_entry["blockers"] = blockers
+    if args.artifacts:
+        log_entry["artifacts"] = args.artifacts
+
+    data["log"].append(log_entry)
+
+    # Clear current_log
+    data["current_log"] = None
+
+    # Update current_state — session and milestone stay at the just-closed session
+    data["current_state"]["completed_sessions"] += 1
+    data["current_state"]["status"] = "completed"
+
+    write_progress(progress_path, data)
+
+    completed = data["current_state"]["completed_sessions"]
+    total = data["current_state"]["total_sessions"]
+    print(f"Closed session {current_session} ({completed}/{total} complete)")
+
+
+def cmd_status(args, progress_path):
+    """Show current state and active session info."""
+    data = read_progress(progress_path)
+
+    # Compute todo summary counts
+    ensure_todos(data)
+    todo_counts = Counter(t["status"] for t in data["todos"])
+
+    if args.json:
+        todos_summary = {
+            s: todo_counts[s]
+            for s in ("selected", "deferred", "completed", "dropped")
+            if todo_counts[s]
+        }
+        output = {
+            "current_state": data["current_state"],
+            "current_log": data["current_log"],
+            "todos_summary": todos_summary,
+        }
+        print(json.dumps(output, indent=2))
+        return
+
+    state = data["current_state"]
+    print(f"Milestone: {state['milestone']}")
+    print(f"Session:   {state['session']}")
+    print(f"Status:    {state['status']}")
+    print(f"Progress:  {state['completed_sessions']}/{state['total_sessions']} sessions complete")
+    print(f"Next:      {state['next']}")
+
+    current_log = data["current_log"]
+    if current_log is not None:
+        entry_count = len(current_log["entries"])
+        # Count entry types
+        type_counts = Counter(e["type"] for e in current_log["entries"])
+        type_parts = []
+        for t in ["decision", "discovery", "blocker", "note"]:
+            c = type_counts.get(t, 0)
+            if c > 0:
+                label = t + "s" if c != 1 else t
+                type_parts.append(f"{c} {label}")
+        type_summary = ", ".join(type_parts) if type_parts else ""
+
+        print()
+        print(f"Active session: {current_log['session']} — \"{current_log['title']}\"")
+        print(f"  Started: {current_log['started']}")
+        if type_summary:
+            print(f"  Entries: {entry_count} ({type_summary})")
+        else:
+            print(f"  Entries: {entry_count}")
+    else:
+        print()
+        print("No active session")
+
+    # Todo summary line
+    if not data["todos"]:
+        print(f"Todos: none")
+    else:
+        active_parts = []
+        archive_parts = []
+        for s in ("selected", "deferred"):
+            c = todo_counts.get(s, 0)
+            if c > 0:
+                active_parts.append(f"{c} {s}")
+        for s in ("completed", "dropped"):
+            c = todo_counts.get(s, 0)
+            if c > 0:
+                archive_parts.append(f"{c} {s}")
+        parts = ", ".join(active_parts)
+        if archive_parts:
+            archive = ", ".join(archive_parts)
+            if parts:
+                parts += f" ({archive})"
+            else:
+                parts = f"({archive})"
+        print(f"Todos: {parts}")
+
+
+def cmd_block(args, progress_path):
+    """Block the current session."""
+    data = read_progress(progress_path)
+
+    if data["current_log"] is None:
+        error("No active session. Run 'progress open' first.")
+
+    if data["current_state"]["status"] != "in_progress":
+        error(f"Session is not in_progress (current status: {data['current_state']['status']}).")
+
+    data["current_state"]["status"] = "blocked"
+
+    # Auto-append blocker entry to current_log
+    entry = {
+        "timestamp": utc_now_iso(),
+        "type": "blocker",
+        "note": args.reason
+    }
+    data["current_log"]["entries"].append(entry)
+
+    write_progress(progress_path, data)
+    session_id = data["current_log"]["session"]
+    print(f"Session {session_id} blocked: {args.reason}")
+
+
+def cmd_resume(args, progress_path):
+    """Resume a blocked session."""
+    data = read_progress(progress_path)
+
+    if data["current_log"] is None:
+        error("No active session. Run 'progress open' first.")
+
+    if data["current_state"]["status"] != "blocked":
+        error(f"Session is not blocked (current status: {data['current_state']['status']}).")
+
+    data["current_state"]["status"] = "in_progress"
+
+    write_progress(progress_path, data)
+    session_id = data["current_log"]["session"]
+    print(f"Session {session_id} resumed")
+
+
+def format_log_entry_human(entry):
+    """Format a single log entry for human-readable display."""
+    lines = []
+    lines.append(f"=== {entry['session']}: {entry['title']} ===")
+    lines.append(f"Completed: {entry['completed']}")
+    lines.append(f"Summary: {entry['summary']}")
+
+    if entry.get("decisions"):
+        lines.append("Decisions:")
+        for d in entry["decisions"]:
+            lines.append(f"  - {d}")
+
+    if entry.get("discoveries"):
+        lines.append("Discoveries:")
+        for d in entry["discoveries"]:
+            lines.append(f"  - {d}")
+
+    if entry.get("blockers"):
+        lines.append("Blockers:")
+        for b in entry["blockers"]:
+            lines.append(f"  - {b}")
+
+    if entry.get("artifacts"):
+        lines.append("Artifacts:")
+        for a in entry["artifacts"]:
+            lines.append(f"  - {a}")
+
+    return "\n".join(lines)
+
+
+def format_log_entry_filtered(entry, type_filter):
+    """Format a single log entry showing only items of the specified type."""
+    key = type_filter + "s" if type_filter != "discovery" else "discoveries"
+    items = entry.get(key, [])
+    if not items:
+        return None
+
+    lines = []
+    lines.append(f"=== {entry['session']}: {entry['title']} ===")
+    label = key.capitalize()
+    lines.append(f"{label}:")
+    for item in items:
+        lines.append(f"  - {item}")
+    return "\n".join(lines)
+
+
+def cmd_review(args, progress_path):
+    """Show completed session log entries."""
+    data = read_progress(progress_path)
+    log_entries = data["log"]
+
+    # Apply filters
+    if args.milestone:
+        prefix = args.milestone
+        if not re.match(r"^M\d+$", prefix):
+            error(f"Invalid milestone format: '{prefix}'. Expected format: M{{N}} (e.g., M3)")
+        log_entries = [e for e in log_entries if e["session"].startswith(prefix + "-")]
+
+    if args.session:
+        validate_session_id(args.session)
+        log_entries = [e for e in log_entries if e["session"] == args.session]
+
+    # Apply type filter before --last so that --last N --type X means
+    # "the last N sessions that have items of type X"
+    if args.type:
+        type_filter = args.type
+        key = type_filter + "s" if type_filter != "discovery" else "discoveries"
+        log_entries = [e for e in log_entries if e.get(key)]
+
+    if args.last is not None:
+        if args.last < 1:
+            error("--last must be a positive integer.")
+        log_entries = log_entries[-args.last:]
+
+    if args.json:
+        print(json.dumps(log_entries, indent=2))
+        return
+
+    if not log_entries:
+        print("No log entries found.")
+        return
+
+    if args.type:
+        formatted = []
+        for entry in log_entries:
+            text = format_log_entry_filtered(entry, args.type)
+            if text:
+                formatted.append(text)
+        if not formatted:
+            print("No log entries found.")
+            return
+        print("\n\n".join(formatted))
+    else:
+        formatted = []
+        for entry in log_entries:
+            formatted.append(format_log_entry_human(entry))
+        print("\n\n".join(formatted))
+
+
+# --- Todo subcommands ---
+
+
+def cmd_todo(args, progress_path):
+    """Dispatch todo subcommands."""
+    if args.todo_command is None:
+        # Print help for todo subcommand
+        print("Usage: progress todo {add,list,select,complete,defer,drop} ...")
+        sys.exit(0)
+
+    dispatch = {
+        "add": cmd_todo_add,
+        "list": cmd_todo_list,
+        "select": cmd_todo_select,
+        "complete": cmd_todo_complete,
+        "defer": cmd_todo_defer,
+        "drop": cmd_todo_drop,
+    }
+
+    handler = dispatch.get(args.todo_command)
+    if handler:
+        handler(args, progress_path)
+    else:
+        error(f"Unknown todo command: {args.todo_command}")
+
+
+def cmd_todo_add(args, progress_path):
+    """Add a new todo."""
+    data = read_progress(progress_path)
+    ensure_todos(data)
+
+    # When no session is open, added_session reflects the last session from current_state.
+    # This is technically the closed session, not the adding context. The timestamp field
+    # provides accurate provenance. Schema pattern constraint prevents using null here.
+    current_session = get_current_session(data)
+    has_open_session = data["current_log"] is not None
+
+    todo_id = next_todo_id(data)
+
+    if has_open_session and not args.defer:
+        status = "selected"
+        todo = {
+            "id": todo_id,
+            "text": args.text,
+            "added_session": current_session,
+            "added_timestamp": utc_now_iso(),
+            "status": status,
+            "selected_session": current_session,
+        }
+    else:
+        status = "deferred"
+        todo = {
+            "id": todo_id,
+            "text": args.text,
+            "added_session": current_session,
+            "added_timestamp": utc_now_iso(),
+            "status": status,
+        }
+
+    data["todos"].append(todo)
+    write_progress(progress_path, data)
+    print(f"Added todo #{todo_id}: {args.text} [{status}]")
+
+
+def cmd_todo_list(args, progress_path):
+    """List todos, optionally filtered by status."""
+    data = read_progress(progress_path)
+    ensure_todos(data)
+
+    todos = data["todos"]
+    if args.status:
+        todos = [t for t in todos if t["status"] == args.status]
+
+    if args.json:
+        print(json.dumps(todos, indent=2))
+        return
+
+    if not todos:
+        print("No todos found.")
+        return
+
+    current_session = get_current_session(data)
+
+    # Group by status for display
+    by_status = {}
+    for t in todos:
+        by_status.setdefault(t["status"], []).append(t)
+
+    # Display order
+    status_order = ["selected", "deferred", "completed", "dropped"]
+    status_labels = {
+        "selected": f"Selected (current session {current_session})",
+        "deferred": "Deferred",
+        "completed": "Completed",
+        "dropped": "Dropped",
+    }
+
+    sections = []
+    for s in status_order:
+        items = by_status.get(s, [])
+        if not items:
+            continue
+        lines = [f"{status_labels[s]}:"]
+        for t in items:
+            lines.append(f"  #{t['id']}  {t['text']} (from {t['added_session']})")
+        sections.append("\n".join(lines))
+
+    print("\n\n".join(sections))
+
+
+def cmd_todo_select(args, progress_path):
+    """Select deferred todos for the current session."""
+    data = read_progress(progress_path)
+    ensure_todos(data)
+
+    if data["current_log"] is None:
+        error("No active session. Run 'progress open' first.")
+
+    current_session = get_current_session(data)
+    todo_map = {t["id"]: t for t in data["todos"]}
+
+    had_error = False
+    for todo_id in args.ids:
+        if todo_id not in todo_map:
+            print(f"Error: Todo #{todo_id} not found.", file=sys.stderr)
+            had_error = True
+            continue
+        todo = todo_map[todo_id]
+        if todo["status"] != "deferred":
+            print(f"Error: Todo #{todo_id} is not deferred (current status: {todo['status']}).", file=sys.stderr)
+            had_error = True
+            continue
+        todo["status"] = "selected"
+        todo["selected_session"] = current_session
+        print(f"Selected todo #{todo_id} for session {current_session}")
+
+    write_progress(progress_path, data)
+    if had_error:
+        sys.exit(1)
+
+
+def cmd_todo_complete(args, progress_path):
+    """Complete selected todos."""
+    data = read_progress(progress_path)
+    ensure_todos(data)
+
+    current_session = get_current_session(data)
+    todo_map = {t["id"]: t for t in data["todos"]}
+
+    had_error = False
+    for todo_id in args.ids:
+        if todo_id not in todo_map:
+            print(f"Error: Todo #{todo_id} not found.", file=sys.stderr)
+            had_error = True
+            continue
+        todo = todo_map[todo_id]
+        if todo["status"] != "selected":
+            print(f"Error: Todo #{todo_id} is not selected (current status: {todo['status']}).", file=sys.stderr)
+            had_error = True
+            continue
+        todo["status"] = "completed"
+        todo["resolved_session"] = current_session
+        todo["resolved_timestamp"] = utc_now_iso()
+        print(f"Completed todo #{todo_id}")
+
+    write_progress(progress_path, data)
+    if had_error:
+        sys.exit(1)
+
+
+def cmd_todo_defer(args, progress_path):
+    """Defer selected todos back to the backlog."""
+    data = read_progress(progress_path)
+    ensure_todos(data)
+
+    todo_map = {t["id"]: t for t in data["todos"]}
+
+    had_error = False
+    for todo_id in args.ids:
+        if todo_id not in todo_map:
+            print(f"Error: Todo #{todo_id} not found.", file=sys.stderr)
+            had_error = True
+            continue
+        todo = todo_map[todo_id]
+        if todo["status"] != "selected":
+            print(f"Error: Todo #{todo_id} is not selected (current status: {todo['status']}).", file=sys.stderr)
+            had_error = True
+            continue
+        todo["status"] = "deferred"
+        if "selected_session" in todo:
+            del todo["selected_session"]
+        print(f"Deferred todo #{todo_id}")
+
+    write_progress(progress_path, data)
+    if had_error:
+        sys.exit(1)
+
+
+def cmd_todo_drop(args, progress_path):
+    """Drop todos (selected or deferred)."""
+    data = read_progress(progress_path)
+    ensure_todos(data)
+
+    current_session = get_current_session(data)
+    todo_map = {t["id"]: t for t in data["todos"]}
+
+    had_error = False
+    for todo_id in args.ids:
+        if todo_id not in todo_map:
+            print(f"Error: Todo #{todo_id} not found.", file=sys.stderr)
+            had_error = True
+            continue
+        todo = todo_map[todo_id]
+        if todo["status"] not in ("selected", "deferred"):
+            print(f"Error: Todo #{todo_id} cannot be dropped (current status: {todo['status']}).", file=sys.stderr)
+            had_error = True
+            continue
+        todo["status"] = "dropped"
+        todo["resolved_session"] = current_session
+        todo["resolved_timestamp"] = utc_now_iso()
+        print(f"Dropped todo #{todo_id}")
+
+    write_progress(progress_path, data)
+    if had_error:
+        sys.exit(1)
+
+
+# --- Argument parsing ---
+
+
+def build_parser():
+    """Build the argument parser with all subcommands."""
+    # Shared parent for --file so it can appear before or after the subcommand
+    file_parent = argparse.ArgumentParser(add_help=False)
+    file_parent.add_argument(
+        "--file", metavar="PATH", default=None,
+        help="Path to progress JSON file (default: .tasks/progress.json relative to git root)"
+    )
+
+    parser = argparse.ArgumentParser(
+        prog="progress",
+        description=(
+            "Session progress tracker for multi-session implementation plans.\n"
+            "Manages a structured JSON log of session progress, decisions, and discoveries."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    # --- init ---
+    p_init = subparsers.add_parser(
+        "init",
+        help="Initialize a new progress file",
+        description="Create a new progress JSON file with empty initial state.",
+        parents=[file_parent]
+    )
+    p_init.add_argument(
+        "--total-sessions", type=int, required=True, metavar="N",
+        help="Total number of sessions in the implementation plan"
+    )
+    p_init.add_argument(
+        "--first-session", required=True, metavar="SESSION_ID",
+        help="ID of the first session (e.g., M0-S1)"
+    )
+    p_init.add_argument(
+        "--first-title", required=True, metavar="TITLE",
+        help="Title of the first session"
+    )
+    p_init.add_argument(
+        "--force", action="store_true",
+        help="Overwrite existing progress file"
+    )
+
+    # --- open ---
+    p_open = subparsers.add_parser(
+        "open",
+        help="Start a new session",
+        description=(
+            "Open a new session, setting current_state to in_progress and\n"
+            "initializing current_log with an empty entries list."
+        ),
+        parents=[file_parent]
+    )
+    p_open.add_argument(
+        "session_id", metavar="SESSION_ID",
+        help="Session identifier (e.g., M1-S3)"
+    )
+    p_open.add_argument(
+        "--title", required=True,
+        help="Session title"
+    )
+    p_open.add_argument(
+        "--next", default=None,
+        help="Set current_state.next for forward-looking orientation"
+    )
+
+    # --- log ---
+    p_log = subparsers.add_parser(
+        "log",
+        help="Append an entry to the current session log",
+        description="Append a timestamped entry to the current session's log.",
+        parents=[file_parent]
+    )
+    p_log.add_argument(
+        "--type", required=True, choices=["decision", "discovery", "blocker", "note"],
+        help="Entry type"
+    )
+    p_log.add_argument(
+        "--note", required=True,
+        help="Entry text"
+    )
+
+    # --- close ---
+    p_close = subparsers.add_parser(
+        "close",
+        help="Close the current session and write a permanent log entry",
+        description=(
+            "Close the active session, distill current_log entries into a permanent\n"
+            "log record, reset current_log to null, and set status to completed.\n"
+            "Session and milestone in current_state stay at the just-closed session."
+        ),
+        epilog=(
+            "Note: only decision, discovery, and blocker entries are carried into the\n"
+            "permanent log record. Entries of type 'note' are ephemeral and are dropped\n"
+            "on close. All selected todos must be completed or deferred before closing."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        parents=[file_parent]
+    )
+    p_close.add_argument(
+        "--summary", required=True,
+        help="Summary of what was accomplished in this session"
+    )
+    p_close.add_argument(
+        "--artifacts", nargs="+", metavar="ARTIFACT",
+        help="Artifacts produced (types, modules, components)"
+    )
+    p_close.add_argument(
+        "--extra-decisions", nargs="+", metavar="DECISION",
+        help="Additional decisions to append beyond those logged during the session"
+    )
+    p_close.add_argument(
+        "--extra-discoveries", nargs="+", metavar="DISCOVERY",
+        help="Additional discoveries to append beyond those logged during the session"
+    )
+    p_close.add_argument(
+        "--extra-blockers", nargs="+", metavar="BLOCKER",
+        help="Additional blockers to append beyond those logged during the session"
+    )
+
+    # --- block ---
+    p_block = subparsers.add_parser(
+        "block",
+        help="Block the current session",
+        description="Set the current session status to blocked and log the reason.",
+        parents=[file_parent]
+    )
+    p_block.add_argument(
+        "--reason", required=True,
+        help="Reason for blocking"
+    )
+
+    # --- resume ---
+    p_resume = subparsers.add_parser(
+        "resume",
+        help="Resume a blocked session",
+        description="Set a blocked session back to in_progress.",
+        parents=[file_parent]
+    )
+
+    # --- status ---
+    p_status = subparsers.add_parser(
+        "status",
+        help="Show current state and active session info",
+        description="Display the current milestone, session, status, and active session details.",
+        parents=[file_parent]
+    )
+    p_status.add_argument(
+        "--json", action="store_true",
+        help="Output current_state and current_log as JSON"
+    )
+
+    # --- review ---
+    p_review = subparsers.add_parser(
+        "review",
+        help="Show completed session log entries",
+        description="Display completed session records from the log, with optional filtering.",
+        parents=[file_parent]
+    )
+    p_review.add_argument(
+        "--milestone", metavar="MILESTONE",
+        help="Filter to a specific milestone (e.g., M3)"
+    )
+    p_review.add_argument(
+        "--session", metavar="SESSION",
+        help="Show only a specific session (e.g., M3-S4)"
+    )
+    p_review.add_argument(
+        "--last", type=int, metavar="N",
+        help="Show only the last N entries"
+    )
+    p_review.add_argument(
+        "--type", choices=["decision", "discovery", "blocker"],
+        help="Show only entries containing items of this type"
+    )
+    p_review.add_argument(
+        "--json", action="store_true",
+        help="Output matching log entries as JSON array"
+    )
+
+    # --- todo ---
+    p_todo = subparsers.add_parser(
+        "todo",
+        help="Manage cross-session todos",
+        description="Add, list, select, complete, defer, or drop todos.",
+        parents=[file_parent]
+    )
+    todo_sub = p_todo.add_subparsers(dest="todo_command")
+
+    # todo add
+    p_todo_add = todo_sub.add_parser("add", help="Add a new todo")
+    p_todo_add.add_argument(
+        "--file", metavar="PATH", default=argparse.SUPPRESS,
+        help="Path to progress JSON file (overrides --file on 'todo')"
+    )
+    p_todo_add.add_argument("--text", required=True, help="Todo description")
+    p_todo_add.add_argument(
+        "--defer", action="store_true",
+        help="Add as deferred instead of selecting for current session"
+    )
+
+    # todo list
+    p_todo_list = todo_sub.add_parser("list", help="List todos")
+    p_todo_list.add_argument(
+        "--file", metavar="PATH", default=argparse.SUPPRESS,
+        help="Path to progress JSON file (overrides --file on 'todo')"
+    )
+    p_todo_list.add_argument(
+        "--status", choices=["deferred", "selected", "completed", "dropped"],
+        help="Filter by status"
+    )
+    p_todo_list.add_argument(
+        "--json", action="store_true",
+        help="Output as JSON array"
+    )
+
+    # todo select
+    p_todo_select = todo_sub.add_parser("select", help="Select deferred todos for current session")
+    p_todo_select.add_argument(
+        "--file", metavar="PATH", default=argparse.SUPPRESS,
+        help="Path to progress JSON file (overrides --file on 'todo')"
+    )
+    p_todo_select.add_argument("ids", type=int, nargs="+", metavar="ID", help="Todo IDs to select")
+
+    # todo complete
+    p_todo_complete = todo_sub.add_parser("complete", help="Complete selected todos")
+    p_todo_complete.add_argument(
+        "--file", metavar="PATH", default=argparse.SUPPRESS,
+        help="Path to progress JSON file (overrides --file on 'todo')"
+    )
+    p_todo_complete.add_argument("ids", type=int, nargs="+", metavar="ID", help="Todo IDs to complete")
+
+    # todo defer
+    p_todo_defer = todo_sub.add_parser("defer", help="Defer selected todos back to backlog")
+    p_todo_defer.add_argument(
+        "--file", metavar="PATH", default=argparse.SUPPRESS,
+        help="Path to progress JSON file (overrides --file on 'todo')"
+    )
+    p_todo_defer.add_argument("ids", type=int, nargs="+", metavar="ID", help="Todo IDs to defer")
+
+    # todo drop
+    p_todo_drop = todo_sub.add_parser("drop", help="Drop todos")
+    p_todo_drop.add_argument(
+        "--file", metavar="PATH", default=argparse.SUPPRESS,
+        help="Path to progress JSON file (overrides --file on 'todo')"
+    )
+    p_todo_drop.add_argument("ids", type=int, nargs="+", metavar="ID", help="Todo IDs to drop")
+
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.command is None:
+        parser.print_help()
+        sys.exit(0)
+
+    progress_path = resolve_progress_path(args.file)
+
+    dispatch = {
+        "init": cmd_init,
+        "open": cmd_open,
+        "log": cmd_log,
+        "close": cmd_close,
+        "status": cmd_status,
+        "review": cmd_review,
+        "block": cmd_block,
+        "resume": cmd_resume,
+        "todo": cmd_todo,
+    }
+
+    handler = dispatch.get(args.command)
+    if handler:
+        handler(args, progress_path)
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
