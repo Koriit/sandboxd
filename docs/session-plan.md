@@ -17,7 +17,8 @@
 - [M5: Workspace Provisioning](#m5-workspace-provisioning) — clone mode, cp, git-over-vsock
 - [M6: Hardening](#m6-hardening) — QEMU sandboxing, device model lockdown
 - [M7: Documentation](#m7-documentation) — polish and consolidate user, operator, and contributor docs
-- [M8: macOS Support](#m8-macos-support) — socket_vmnet, Colima, macvlan
+- [M8: Polish and Deferred TODOs](#m8-polish-and-deferred-todos) — resolve accumulated TODOs, deferred findings, technical debt
+- [M9: macOS Support](#m9-macos-support) — socket_vmnet, Colima, macvlan
 - [Risks](#risks)
 - [Session count](#session-count)
 
@@ -25,7 +26,7 @@
 
 ```
 claude-sandbox/
-├── docs/                # design docs, implementation plan
+├── docs/                # design docs, session plan
 ├── sandboxd/            # Rust cargo workspace
 │   ├── sandboxd/        # daemon binary
 │   ├── sandbox-cli/     # CLI binary (binary name: `sandbox`)
@@ -65,7 +66,7 @@ Format reference: `.claude/skills/session-tracking/progress-schema.json`
 
 ### Context recovery
 
-A post-compact hook (planned, see `.claude/skills/session-tracking/hooks-plan.md`) will inject a reminder to read `.tasks/progress.json` and `docs/implementation-plan.md` after context compaction. Until the hook is configured, the orchestrator should read these files manually after detecting compaction or context loss.
+A post-compact hook (planned, see `.claude/skills/session-tracking/hooks-plan.md`) will inject a reminder to read `.tasks/progress.json` and `docs/session-plan.md` after context compaction. Until the hook is configured, the orchestrator should read these files manually after detecting compaction or context loss.
 
 ### Team composition
 
@@ -722,11 +723,52 @@ Tests require a Linux host with KVM and Docker.
 
 ---
 
-## M8: macOS Support
+## M8: Polish and Deferred TODOs
+
+### M8-S1: Logging and error quality
+
+**Entry criteria:** M7 complete.
+
+**Tasks:**
+- Audit logging quality: consistent log levels across all components, structured log fields, no sensitive data leaked in logs, useful context in error paths
+- Review error messages for actionability: user-facing errors should guide the user toward resolution, not expose raw internal details
+- Add useful debug-level logs at key decision points and state transitions to support troubleshooting without requiring code changes
+
+**Exit criteria:** All components use consistent, structured logging. No sensitive data in logs. User-facing errors are actionable. Key decision points have debug-level logs.
+
+---
+
+### M8-S2: Code cleanup and verification
+
+**Entry criteria:** M8-S1 complete.
+
+**Tasks:**
+- Clean up technical debt: dead code, unused dependencies, inconsistent error messages, stale configuration
+- Verify all E2E tests pass as a suite (not just individually per-milestone)
+- Cross-check CLI help text, error messages, and log output for consistency and clarity
+- Final review of `docs/` for accuracy against actual implementation (docs written during M7-S1 may reference planned behavior that diverged during implementation)
+
+**Exit criteria:** All E2E tests pass as a full suite. CLI output is consistent. Documentation matches implemented behavior.
+
+---
+
+### M8-S3: Deferred TODOs
+
+**Entry criteria:** M8-S2 complete.
+
+**Tasks:**
+- Review and resolve any TODO/FIXME/HACK markers accumulated in the codebase during M0–M7
+- Address medium-severity review findings from the session plan review that were deferred during implementation (e.g., session sizing issues, dependency clarifications, E2E coverage gaps)
+
+**Exit criteria:** No unresolved TODO/FIXME/HACK markers remain without explicit justification. All deferred review findings addressed or explicitly documented as out of scope. The Linux implementation is release-ready.
+
+---
+
+## M9: macOS Support
 
 > **Separate track.** macOS support requires access to macOS hardware and can be executed independently of M6 (Hardening). It is not on the critical path for Linux-only deployments.
 
-### M8-S1: socket_vmnet and Colima integration
+### M9-S1: socket_vmnet and Colima integration
 
 **Entry criteria:** M5 complete.
 
@@ -755,9 +797,9 @@ Tests require a Linux host with KVM and Docker.
 
 ---
 
-### M8-S2: Colima failure recovery and cross-platform consolidation
+### M9-S2: Colima failure recovery and cross-platform consolidation
 
-**Entry criteria:** M8-S1 complete.
+**Entry criteria:** M9-S1 complete.
 
 **Tasks:**
 - Implement Colima crash detection and recovery:
@@ -783,7 +825,7 @@ Tests require a Linux host with KVM and Docker.
 | nftables injection into gateway container namespace is fragile | Blocks M3 | Prefer `nsenter --net` over `docker exec` for reliability. Test the injection approach in isolation before M3-S3. |
 | CoreDNS external plugin build process is complex | Delays M4-S3 | Follow the documented external plugin pattern exactly. Build in a Docker container for reproducibility. |
 | Envoy filter chain config for 4 assurance levels is complex | Delays M4-S1/M4-S2 | Start with level 0 (deny) and level 1 (TCP passthrough) in M4-S1. Add level 2 and 3 in M4-S2. |
-| socket_vmnet availability on macOS | Blocks M8 | socket_vmnet must be installed separately (Homebrew). Document as a prerequisite. Test early on a macOS machine. |
+| socket_vmnet availability on macOS | Blocks M9 | socket_vmnet must be installed separately (Homebrew). Document as a prerequisite. Test early on a macOS machine. |
 | QEMU hardening flags conflict with Lima's defaults | Delays M6 | Lima may set its own QEMU flags. Check for conflicts. May need to use Lima's `qemu.args` override mechanism. |
 
 ## Session count
@@ -798,7 +840,8 @@ Tests require a Linux host with KVM and Docker.
 | M5 | 3 |
 | M6 | 3 |
 | M7 | 1 |
-| M8 | 2 |
-| **Total** | **29** |
+| M8 | 3 |
+| M9 | 2 |
+| **Total** | **32** |
 
-Critical path (Linux): 27 sequential sessions (M0 through M7). M8 (macOS) is an independent track (2 sessions) that can execute whenever macOS hardware is available.
+Critical path (Linux): 30 sequential sessions (M0 through M8). M9 (macOS) is an independent track (2 sessions) that can execute whenever macOS hardware is available.
