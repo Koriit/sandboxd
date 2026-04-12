@@ -62,6 +62,11 @@ impl LimaManager {
         self
     }
 
+    /// Return the path to the `limactl` binary.
+    pub fn limactl_path(&self) -> &std::path::Path {
+        &self.limactl
+    }
+
     // -- public API ---------------------------------------------------------
 
     /// Create a new VM for the given session.
