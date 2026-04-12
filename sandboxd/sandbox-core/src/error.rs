@@ -20,6 +20,9 @@ pub enum SandboxError {
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
 
+    #[error("lima error: {0}")]
+    Lima(String),
+
     #[error("internal error: {0}")]
     Internal(String),
 }
