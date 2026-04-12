@@ -219,10 +219,12 @@ impl LimaManager {
             )));
         }
 
-        // 1. Copy the binary into the VM.
+        // 1. Copy the binary into the VM (to a user-writable temp path first,
+        //    then move it with sudo, because limactl copy uses rsync which
+        //    runs as the unprivileged user).
         debug!(vm = %vm_name, binary = %binary_path.display(), "copying guest agent binary");
         let copy_src = binary_path.to_string_lossy().to_string();
-        let copy_dst = format!("{vm_name}:/usr/local/bin/sandbox-guest");
+        let copy_dst = format!("{vm_name}:/tmp/sandbox-guest");
         let output = Command::new(&self.limactl)
             .args(["copy", &copy_src, &copy_dst])
             .output()
@@ -235,12 +237,27 @@ impl LimaManager {
             )));
         }
 
-        // 2. Make the binary executable.
-        debug!(vm = %vm_name, "setting guest agent executable");
+        // 2. Move the binary to /usr/local/bin with sudo and make it executable.
+        debug!(vm = %vm_name, "installing guest agent binary");
         let output = Command::new(&self.limactl)
             .args([
                 "shell", &vm_name, "--",
-                "chmod", "+x", "/usr/local/bin/sandbox-guest",
+                "sudo", "mv", "/tmp/sandbox-guest", "/usr/local/bin/sandbox-guest",
+            ])
+            .output()
+            .map_err(|e| lima_io_error("limactl shell mv", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SandboxError::Lima(format!(
+                "failed to move guest agent in {vm_name}: {stderr}"
+            )));
+        }
+
+        let output = Command::new(&self.limactl)
+            .args([
+                "shell", &vm_name, "--",
+                "sudo", "chmod", "+x", "/usr/local/bin/sandbox-guest",
             ])
             .output()
             .map_err(|e| lima_io_error("limactl shell chmod", e))?;

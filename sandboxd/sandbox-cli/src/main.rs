@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use http_body_util::BodyExt;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
-use sandbox_core::{ApiError, Session};
+use sandbox_core::{ApiError, ExecResponse, Session, SessionResponse};
 use tokio::net::UnixStream;
 
 /// CLI client for managing sandbox sessions.
@@ -59,6 +59,22 @@ enum Command {
     Ps,
     /// List sandbox sessions (alias for ps).
     Ls,
+    /// Open an interactive SSH session (or run a command) in a sandbox.
+    Ssh {
+        /// Session name or ID.
+        session: String,
+        /// Optional command to run (non-interactive). Use after --.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// Execute a command inside a sandbox via the guest agent.
+    Exec {
+        /// Session name or ID.
+        session: String,
+        /// Command and arguments to run. Use after --.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
 }
 
 fn default_socket_path() -> String {
@@ -67,8 +83,10 @@ fn default_socket_path() -> String {
 }
 
 /// Build the HTTP request for the given CLI command.
-fn build_request(command: &Command) -> Request<String> {
-    match command {
+///
+/// Returns `None` for commands that are handled specially (e.g. `ssh`).
+fn build_request(command: &Command) -> Option<Request<String>> {
+    let req = match command {
         Command::Create {
             name,
             cpus,
@@ -114,7 +132,28 @@ fn build_request(command: &Command) -> Request<String> {
             .uri("/sessions")
             .body(String::new())
             .expect("failed to build request"),
-    }
+        Command::Exec { session, command } => {
+            if command.is_empty() {
+                eprintln!("Error: exec requires a command. Usage: sandbox exec <session> -- <command> [args...]");
+                process::exit(1);
+            }
+            let cmd = &command[0];
+            let args: Vec<String> = command[1..].to_vec();
+            let body = serde_json::json!({
+                "command": cmd,
+                "args": args,
+            });
+            Request::builder()
+                .method("POST")
+                .uri(format!("/sessions/{session}/exec"))
+                .header("content-type", "application/json")
+                .body(body.to_string())
+                .expect("failed to build request")
+        }
+        // Ssh is handled specially -- not via a single HTTP request.
+        Command::Ssh { .. } => return None,
+    };
+    Some(req)
 }
 
 /// Format a timestamp as a relative time string (e.g., "2m ago", "3h ago").
@@ -151,14 +190,15 @@ fn format_relative_time(dt: &DateTime<Utc>) -> String {
 }
 
 /// Display a list of sessions as a formatted table.
-fn display_sessions_table(sessions: &[Session]) {
+fn display_sessions_table(sessions: &[SessionResponse]) {
     if sessions.is_empty() {
         println!("No sessions found.");
         return;
     }
 
     // Header — use a pre-formatted constant to avoid clippy::print_literal.
-    const HEADER: &str = "ID                                    NAME              STATE       CREATED";
+    const HEADER: &str =
+        "ID                                    NAME              STATE       AGENT        CREATED";
     println!("{HEADER}");
 
     for session in sessions {
@@ -167,11 +207,15 @@ fn display_sessions_table(sessions: &[Session]) {
             .as_deref()
             .unwrap_or("-");
         let state = session.state.to_string();
+        let agent = session
+            .guest_agent_status
+            .as_deref()
+            .unwrap_or("-");
         let created = format_relative_time(&session.created_at);
 
         println!(
-            "{:<36}  {:<16}  {:<10}  {created}",
-            session.id, name, state
+            "{:<36}  {:<16}  {:<10}  {:<11}  {created}",
+            session.id, name, state, agent
         );
     }
 }
@@ -244,7 +288,7 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
 
     match command {
         Command::Ps | Command::Ls => {
-            let sessions: Vec<Session> = serde_json::from_str(body)
+            let sessions: Vec<SessionResponse> = serde_json::from_str(body)
                 .map_err(|e| format!("failed to parse response: {e}"))?;
             display_sessions_table(&sessions);
         }
@@ -270,15 +314,106 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
             println!("Session stopped:");
             display_session(&session);
         }
+        Command::Exec { .. } => {
+            let result: ExecResponse = serde_json::from_str(body)
+                .map_err(|e| format!("failed to parse exec response: {e}"))?;
+            if !result.stdout.is_empty() {
+                print!("{}", result.stdout);
+            }
+            if !result.stderr.is_empty() {
+                eprint!("{}", result.stderr);
+            }
+            if result.exit_code != 0 {
+                process::exit(result.exit_code);
+            }
+        }
+        Command::Ssh { .. } => {
+            // Ssh is handled separately, should not reach here.
+            unreachable!("ssh command should be handled before send_request");
+        }
     }
 
     Ok(())
 }
 
+/// Handle the `ssh` subcommand: resolve session via daemon API, then exec
+/// `limactl shell`.
+async fn handle_ssh(socket_path: &str, session: &str, command: &[String]) {
+    // Resolve the session name/id to a Session via the daemon API.
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/sessions/{session}"))
+        .body(String::new())
+        .expect("failed to build request");
+
+    let (status, body) = match send_request(socket_path, req).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{e}");
+            process::exit(1);
+        }
+    };
+
+    if !status.is_success() {
+        if let Ok(api_err) = serde_json::from_str::<ApiError>(&body) {
+            eprintln!("Error: {}", api_err.error);
+        } else {
+            eprintln!("Error ({status}): {body}");
+        }
+        process::exit(1);
+    }
+
+    let session_resp: SessionResponse = match serde_json::from_str(&body) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to parse session response: {e}");
+            process::exit(1);
+        }
+    };
+
+    let vm_name = format!("sandbox-{}", session_resp.id);
+
+    // Build the limactl shell command.
+    let mut cmd = std::process::Command::new("limactl");
+    cmd.arg("shell").arg(&vm_name);
+
+    if !command.is_empty() {
+        cmd.arg("--");
+        for arg in command {
+            cmd.arg(arg);
+        }
+    }
+
+    // Use .status() to inherit stdin/stdout/stderr for interactive use.
+    match cmd.status() {
+        Ok(exit_status) => {
+            process::exit(exit_status.code().unwrap_or(1));
+        }
+        Err(e) => {
+            eprintln!("Failed to execute limactl shell: {e}");
+            process::exit(1);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    let req = build_request(&cli.command);
+
+    // Handle ssh specially — it doesn't follow the normal request/response flow.
+    if let Command::Ssh { session, command } = &cli.command {
+        handle_ssh(&cli.socket, session, command).await;
+        return;
+    }
+
+    let req = match build_request(&cli.command) {
+        Some(r) => r,
+        None => {
+            // Should not happen — ssh is handled above.
+            eprintln!("Internal error: unhandled command");
+            process::exit(1);
+        }
+    };
 
     match send_request(&cli.socket, req).await {
         Ok((status, body)) => {
@@ -386,6 +521,42 @@ mod tests {
     }
 
     #[test]
+    fn parse_ssh_interactive() {
+        let cli = Cli::parse_from(["sandbox", "ssh", "my-session"]);
+        match &cli.command {
+            Command::Ssh { session, command } => {
+                assert_eq!(session, "my-session");
+                assert!(command.is_empty());
+            }
+            _ => panic!("expected Ssh command"),
+        }
+    }
+
+    #[test]
+    fn parse_ssh_with_command() {
+        let cli = Cli::parse_from(["sandbox", "ssh", "my-session", "--", "uname", "-a"]);
+        match &cli.command {
+            Command::Ssh { session, command } => {
+                assert_eq!(session, "my-session");
+                assert_eq!(command, &["uname", "-a"]);
+            }
+            _ => panic!("expected Ssh command"),
+        }
+    }
+
+    #[test]
+    fn parse_exec() {
+        let cli = Cli::parse_from(["sandbox", "exec", "my-session", "--", "ls", "-la"]);
+        match &cli.command {
+            Command::Exec { session, command } => {
+                assert_eq!(session, "my-session");
+                assert_eq!(command, &["ls", "-la"]);
+            }
+            _ => panic!("expected Exec command"),
+        }
+    }
+
+    #[test]
     fn default_socket_path_set() {
         let cli = Cli::parse_from(["sandbox", "ps"]);
         assert!(cli.socket.ends_with("sandboxd.sock"));
@@ -406,7 +577,7 @@ mod tests {
             disk: 20,
             template: None,
         };
-        let req = build_request(&cmd);
+        let req = build_request(&cmd).expect("should produce request");
         assert_eq!(req.method(), "POST");
         assert_eq!(req.uri(), "/sessions");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -425,7 +596,7 @@ mod tests {
             disk: 50,
             template: None,
         };
-        let req = build_request(&cmd);
+        let req = build_request(&cmd).expect("should produce request");
         assert_eq!(req.method(), "POST");
         assert_eq!(req.uri(), "/sessions");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -444,7 +615,7 @@ mod tests {
             disk: 20,
             template: Some("/tmp/my-template.yaml".into()),
         };
-        let req = build_request(&cmd);
+        let req = build_request(&cmd).expect("should produce request");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
         assert_eq!(body["template"], "/tmp/my-template.yaml");
     }
@@ -454,7 +625,7 @@ mod tests {
         let cmd = Command::Start {
             session: "abc".into(),
         };
-        let req = build_request(&cmd);
+        let req = build_request(&cmd).expect("should produce request");
         assert_eq!(req.method(), "POST");
         assert_eq!(req.uri(), "/sessions/abc/start");
     }
@@ -464,7 +635,7 @@ mod tests {
         let cmd = Command::Stop {
             session: "abc".into(),
         };
-        let req = build_request(&cmd);
+        let req = build_request(&cmd).expect("should produce request");
         assert_eq!(req.method(), "POST");
         assert_eq!(req.uri(), "/sessions/abc/stop");
     }
@@ -474,7 +645,7 @@ mod tests {
         let cmd = Command::Rm {
             session: "abc".into(),
         };
-        let req = build_request(&cmd);
+        let req = build_request(&cmd).expect("should produce request");
         assert_eq!(req.method(), "DELETE");
         assert_eq!(req.uri(), "/sessions/abc");
     }
@@ -482,7 +653,7 @@ mod tests {
     #[test]
     fn build_ps_request() {
         let cmd = Command::Ps;
-        let req = build_request(&cmd);
+        let req = build_request(&cmd).expect("should produce request");
         assert_eq!(req.method(), "GET");
         assert_eq!(req.uri(), "/sessions");
     }
@@ -490,9 +661,32 @@ mod tests {
     #[test]
     fn build_ls_request() {
         let cmd = Command::Ls;
-        let req = build_request(&cmd);
+        let req = build_request(&cmd).expect("should produce request");
         assert_eq!(req.method(), "GET");
         assert_eq!(req.uri(), "/sessions");
+    }
+
+    #[test]
+    fn build_exec_request() {
+        let cmd = Command::Exec {
+            session: "my-box".into(),
+            command: vec!["uname".into(), "-a".into()],
+        };
+        let req = build_request(&cmd).expect("should produce request");
+        assert_eq!(req.method(), "POST");
+        assert_eq!(req.uri(), "/sessions/my-box/exec");
+        let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
+        assert_eq!(body["command"], "uname");
+        assert_eq!(body["args"], serde_json::json!(["-a"]));
+    }
+
+    #[test]
+    fn build_ssh_returns_none() {
+        let cmd = Command::Ssh {
+            session: "abc".into(),
+            command: vec![],
+        };
+        assert!(build_request(&cmd).is_none());
     }
 
     #[test]

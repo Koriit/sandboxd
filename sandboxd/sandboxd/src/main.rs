@@ -10,8 +10,9 @@ use axum::{
 };
 use clap::Parser;
 use sandbox_core::{
-    ApiError, CreateSessionRequest, GuestConnector, LimaManager, SandboxError, Session,
-    SessionConfig, SessionState, SessionStore, VmStatus,
+    ApiError, CreateSessionRequest, ExecRequest, ExecResponse, GuestConnector, GuestResponse,
+    LimaManager, SandboxError, Session, SessionConfig, SessionResponse, SessionState,
+    SessionStore, VmStatus,
 };
 use tokio::net::UnixListener;
 use tracing::{error, info, warn};
@@ -84,6 +85,7 @@ fn app(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}", delete(remove_session))
         .route("/sessions/{id}/start", post(start_session))
         .route("/sessions/{id}/stop", post(stop_session))
+        .route("/sessions/{id}/exec", post(exec_in_session))
         .with_state(state)
 }
 
@@ -190,7 +192,7 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     // Enrich with VM status (best-effort).
     let vm_list = state.lima.list_vms().unwrap_or_default();
 
-    let enriched: Vec<Session> = sessions
+    let reconciled: Vec<Session> = sessions
         .into_iter()
         .map(|mut s| {
             // If we find the VM in Lima's inventory, reflect its actual status.
@@ -212,6 +214,25 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse 
             s
         })
         .collect();
+
+    // Probe guest agent for running sessions (with a short timeout).
+    let mut enriched: Vec<SessionResponse> = Vec::with_capacity(reconciled.len());
+    for session in reconciled {
+        let agent_status = if session.state == SessionState::Running {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                state.guest.ping(&session.id),
+            )
+            .await
+            {
+                Ok(Ok(true)) => Some("connected".to_string()),
+                _ => Some("unreachable".to_string()),
+            }
+        } else {
+            None
+        };
+        enriched.push(SessionResponse::from_session_with_status(session, agent_status));
+    }
 
     (StatusCode::OK, Json(enriched)).into_response()
 }
@@ -244,7 +265,23 @@ async fn get_session(
         }
     }
 
-    (StatusCode::OK, Json(session)).into_response()
+    // Probe guest agent for running sessions.
+    let agent_status = if session.state == SessionState::Running {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            state.guest.ping(&session.id),
+        )
+        .await
+        {
+            Ok(Ok(true)) => Some("connected".to_string()),
+            _ => Some("unreachable".to_string()),
+        }
+    } else {
+        None
+    };
+
+    let response = SessionResponse::from_session_with_status(session, agent_status);
+    (StatusCode::OK, Json(response)).into_response()
 }
 
 async fn start_session(
@@ -348,6 +385,66 @@ async fn remove_session(
     }
 
     StatusCode::NO_CONTENT.into_response()
+}
+
+async fn exec_in_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<ExecRequest>,
+) -> impl IntoResponse {
+    let session = match state.store.get_session_by_name_or_id(&id) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return error_response(SandboxError::SessionNotFound(id)).into_response()
+        }
+        Err(e) => return error_response(e).into_response(),
+    };
+
+    if session.state != SessionState::Running {
+        return error_response(SandboxError::InvalidState(format!(
+            "cannot exec in session with state {} (must be running)",
+            session.state
+        )))
+        .into_response();
+    }
+
+    let args_refs: Vec<&str> = req.args.iter().map(|s| s.as_str()).collect();
+    match state
+        .guest
+        .exec(&session.id, &req.command, &args_refs)
+        .await
+    {
+        Ok(GuestResponse::ExecResult {
+            exit_code,
+            stdout,
+            stderr,
+        }) => {
+            let response = ExecResponse {
+                exit_code,
+                stdout,
+                stderr,
+            };
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Ok(GuestResponse::Error { message }) => {
+            error!(session_id = %session.id, %message, "guest agent exec error");
+            error_response(SandboxError::Internal(format!(
+                "guest agent error: {message}"
+            )))
+            .into_response()
+        }
+        Ok(other) => {
+            error!(session_id = %session.id, ?other, "unexpected guest response to exec");
+            error_response(SandboxError::Internal(
+                "unexpected response from guest agent".into(),
+            ))
+            .into_response()
+        }
+        Err(e) => {
+            error!(session_id = %session.id, error = %e, "guest agent exec failed");
+            error_response(e).into_response()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

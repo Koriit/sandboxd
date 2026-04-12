@@ -5,7 +5,7 @@ pub mod lima;
 pub mod session;
 pub mod store;
 
-pub use api::CreateSessionRequest;
+pub use api::{CreateSessionRequest, ExecRequest, ExecResponse, SessionResponse};
 pub use error::{ApiError, SandboxError};
 pub use guest::{
     GuestConnector, GuestRequest, GuestResponse, GUEST_AGENT_PORT, MAX_MESSAGE_SIZE,
