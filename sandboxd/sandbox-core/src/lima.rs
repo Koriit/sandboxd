@@ -96,6 +96,37 @@ impl LimaManager {
         Ok(())
     }
 
+    /// Create a new VM using a custom Lima template file.
+    ///
+    /// The template is copied to the session directory before invoking
+    /// `limactl create`.
+    pub fn create_vm_with_custom_template(
+        &self,
+        session_id: &Uuid,
+        template_path: &std::path::Path,
+    ) -> Result<(), SandboxError> {
+        let session_dir = self.session_dir(session_id);
+        std::fs::create_dir_all(&session_dir)?;
+
+        let dest = session_dir.join("template.yaml");
+        std::fs::copy(template_path, &dest)?;
+
+        let vm_name = vm_name(session_id);
+        let output = Command::new(&self.limactl)
+            .args(["create", "--name", &vm_name])
+            .arg(&dest)
+            .arg("--tty=false")
+            .output()
+            .map_err(|e| lima_io_error("limactl create", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(parse_limactl_error("create", &stderr));
+        }
+
+        Ok(())
+    }
+
     /// Start an existing (stopped) VM.
     pub fn start_vm(&self, session_id: &Uuid) -> Result<(), SandboxError> {
         let vm_name = vm_name(session_id);

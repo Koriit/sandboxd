@@ -165,6 +165,36 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Look up a session by name or UUID string.
+    ///
+    /// Tries to parse `query` as a UUID first; if that fails, searches by name.
+    /// Returns `None` if no session matches.
+    pub fn get_session_by_name_or_id(
+        &self,
+        query: &str,
+    ) -> Result<Option<Session>, SandboxError> {
+        // Try UUID first.
+        if let Ok(uuid) = Uuid::parse_str(query) {
+            return self.get_session(&uuid);
+        }
+
+        // Fall back to name lookup.
+        let conn = self.conn.lock().map_err(|e| {
+            SandboxError::Internal(format!("lock poisoned: {e}"))
+        })?;
+
+        let mut stmt = conn.prepare(
+            "SELECT id, name, state, config, created_at, updated_at
+             FROM sessions WHERE name = ?1",
+        )?;
+
+        let mut rows = stmt.query(params![query])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row_to_session(row)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Delete a session from the database and remove its per-session directory.
     pub fn delete_session(&self, id: &Uuid) -> Result<(), SandboxError> {
         let conn = self.conn.lock().map_err(|e| {
@@ -526,5 +556,60 @@ mod tests {
             .join(session.id.to_string());
         assert!(expected.exists());
         assert!(expected.is_dir());
+    }
+
+    #[test]
+    fn test_get_by_name_or_id_with_uuid() {
+        let (store, _dir) = test_store();
+
+        let session = store
+            .create_session(SessionConfig::default(), Some("named".into()))
+            .expect("create");
+
+        let fetched = store
+            .get_session_by_name_or_id(&session.id.to_string())
+            .expect("get by uuid")
+            .expect("should exist");
+
+        assert_eq!(fetched.id, session.id);
+    }
+
+    #[test]
+    fn test_get_by_name_or_id_with_name() {
+        let (store, _dir) = test_store();
+
+        let session = store
+            .create_session(SessionConfig::default(), Some("lookup-test".into()))
+            .expect("create");
+
+        let fetched = store
+            .get_session_by_name_or_id("lookup-test")
+            .expect("get by name")
+            .expect("should exist");
+
+        assert_eq!(fetched.id, session.id);
+        assert_eq!(fetched.name, Some("lookup-test".into()));
+    }
+
+    #[test]
+    fn test_get_by_name_or_id_not_found() {
+        let (store, _dir) = test_store();
+
+        let result = store
+            .get_session_by_name_or_id("nonexistent")
+            .expect("should not error");
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_get_by_name_or_id_with_unknown_uuid() {
+        let (store, _dir) = test_store();
+
+        let result = store
+            .get_session_by_name_or_id(&Uuid::new_v4().to_string())
+            .expect("should not error");
+
+        assert!(result.is_none());
     }
 }
