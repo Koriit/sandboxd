@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -15,10 +17,26 @@ pub enum SessionState {
 impl std::fmt::Display for SessionState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Creating => write!(f, "creating"),
-            Self::Running => write!(f, "running"),
-            Self::Stopped => write!(f, "stopped"),
-            Self::Error => write!(f, "error"),
+            Self::Creating => write!(f, "Creating"),
+            Self::Running => write!(f, "Running"),
+            Self::Stopped => write!(f, "Stopped"),
+            Self::Error => write!(f, "Error"),
+        }
+    }
+}
+
+impl FromStr for SessionState {
+    type Err = crate::SandboxError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "Creating" => Ok(Self::Creating),
+            "Running" => Ok(Self::Running),
+            "Stopped" => Ok(Self::Stopped),
+            "Error" => Ok(Self::Error),
+            other => Err(crate::SandboxError::Internal(format!(
+                "unknown session state: {other}"
+            ))),
         }
     }
 }
