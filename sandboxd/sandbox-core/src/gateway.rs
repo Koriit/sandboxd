@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -72,6 +73,7 @@ impl GatewayManager {
         &self,
         session_id: &Uuid,
         network_info: &NetworkInfo,
+        ca_dir: Option<&Path>,
     ) -> Result<(), SandboxError> {
         let container_name = container_name(session_id);
 
@@ -80,6 +82,7 @@ impl GatewayManager {
             container = %container_name,
             network = %network_info.docker_network_name,
             gateway_ip = %network_info.gateway_ip,
+            ca_dir = ?ca_dir,
             "creating gateway container"
         );
 
@@ -89,35 +92,69 @@ impl GatewayManager {
         // explicitly assign .2 (gateway_ip from NetworkInfo) to the gateway
         // container via --ip so the IP is deterministic and matches the
         // nftables DNAT rules.
+        let mut args = vec![
+            "run".to_string(),
+            "-d".to_string(),
+            "--name".to_string(),
+            container_name.clone(),
+            "--network".to_string(),
+            network_info.docker_network_name.clone(),
+            "--ip".to_string(),
+            network_info.gateway_ip.clone(),
+            "--read-only".to_string(),
+            "--tmpfs".to_string(),
+            "/var/log:rw,noexec,nosuid".to_string(),
+            "--tmpfs".to_string(),
+            "/var/run:rw,noexec,nosuid".to_string(),
+            "--tmpfs".to_string(),
+            "/tmp:rw,exec,nosuid".to_string(),
+            "--tmpfs".to_string(),
+            "/root/.mitmproxy:rw".to_string(),
+        ];
+
+        // When a CA directory is provided, bind-mount the mitmproxy CA
+        // files on top of the tmpfs.  Docker processes mounts in order,
+        // so these bind mounts overlay the specific files within the
+        // tmpfs at /root/.mitmproxy.
+        if let Some(dir) = ca_dir {
+            let ca_pem = dir.join("mitmproxy-ca.pem");
+            let ca_cert_pem = dir.join("mitmproxy-ca-cert.pem");
+
+            args.push("-v".to_string());
+            args.push(format!(
+                "{}:/root/.mitmproxy/mitmproxy-ca.pem:ro",
+                ca_pem.display()
+            ));
+            args.push("-v".to_string());
+            args.push(format!(
+                "{}:/root/.mitmproxy/mitmproxy-ca-cert.pem:ro",
+                ca_cert_pem.display()
+            ));
+
+            debug!(
+                session_id = %session_id,
+                ca_pem = %ca_pem.display(),
+                ca_cert_pem = %ca_cert_pem.display(),
+                "mounting CA certificates into gateway container"
+            );
+        }
+
+        args.extend([
+            "--sysctl".to_string(),
+            "net.ipv4.ip_forward=1".to_string(),
+            "--sysctl".to_string(),
+            "net.ipv6.conf.all.forwarding=0".to_string(),
+            "--restart".to_string(),
+            "unless-stopped".to_string(),
+            "--label".to_string(),
+            format!("sandbox.session_id={session_id}"),
+            GATEWAY_IMAGE.to_string(),
+        ]);
+
+        let args_refs: Vec<&str> =
+            args.iter().map(|s| s.as_str()).collect();
         let output = Command::new("docker")
-            .args([
-                "run",
-                "-d",
-                "--name",
-                &container_name,
-                "--network",
-                &network_info.docker_network_name,
-                "--ip",
-                &network_info.gateway_ip,
-                "--read-only",
-                "--tmpfs",
-                "/var/log:rw,noexec,nosuid",
-                "--tmpfs",
-                "/var/run:rw,noexec,nosuid",
-                "--tmpfs",
-                "/tmp:rw,exec,nosuid",
-                "--tmpfs",
-                "/root/.mitmproxy:rw",
-                "--sysctl",
-                "net.ipv4.ip_forward=1",
-                "--sysctl",
-                "net.ipv6.conf.all.forwarding=0",
-                "--restart",
-                "unless-stopped",
-                "--label",
-                &format!("sandbox.session_id={session_id}"),
-                GATEWAY_IMAGE,
-            ])
+            .args(&args_refs)
             .output()
             .map_err(|e| {
                 SandboxError::Gateway(format!("failed to run docker run: {e}"))
@@ -988,7 +1025,7 @@ mod tests {
         let network_info = net_mgr.create_network(&session_id).unwrap();
 
         // Create the gateway container with nftables rules.
-        let create_result = gw_mgr.create_gateway(&session_id, &network_info);
+        let create_result = gw_mgr.create_gateway(&session_id, &network_info, None);
         if let Err(ref e) = create_result {
             // Clean up on failure.
             let _ = gw_mgr.stop_gateway(&session_id);

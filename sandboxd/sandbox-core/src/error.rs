@@ -23,6 +23,9 @@ pub enum SandboxError {
     #[error("network error: {0}")]
     Network(String),
 
+    #[error("CA error: {0}")]
+    Ca(String),
+
     #[error("gateway error: {0}")]
     Gateway(String),
 

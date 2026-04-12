@@ -246,12 +246,18 @@ impl GuestConnector {
         })?;
         write_message(&mut stdin, &payload).await?;
 
-        // Explicitly close stdin so socat knows the input is complete and can
-        // forward it.  Without this, socat may buffer waiting for more data.
-        drop(stdin);
+        // NOTE: we intentionally keep stdin open until after reading the
+        // response.  Closing it early causes socat (inside the VM, reached
+        // via limactl shell / SSH) to tear down the TCP connection before
+        // the guest agent can send its reply — resulting in
+        // "connection closed while reading message length".  The flush()
+        // inside write_message is sufficient to ensure the data reaches socat.
 
         // Read the response.
         let response_bytes = read_message(&mut stdout).await?;
+
+        // Now close stdin so socat exits cleanly.
+        drop(stdin);
 
         let response: GuestResponse =
             serde_json::from_slice(&response_bytes).map_err(|e| {

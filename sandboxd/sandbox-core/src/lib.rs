@@ -1,4 +1,5 @@
 pub mod api;
+pub mod ca;
 pub mod error;
 pub mod gateway;
 pub mod guest;
@@ -10,6 +11,7 @@ pub mod store;
 pub mod vm_network;
 
 pub use api::{CreateSessionRequest, ExecRequest, ExecResponse, SessionResponse};
+pub use ca::{CaManager, generate_ca_inject_script};
 pub use error::{ApiError, SandboxError};
 pub use gateway::{GatewayManager, GatewayStatus};
 pub use guest::{

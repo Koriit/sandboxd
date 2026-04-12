@@ -10,10 +10,10 @@ use axum::{
 };
 use clap::Parser;
 use sandbox_core::{
-    ApiError, CreateSessionRequest, ExecRequest, ExecResponse, GatewayManager, GuestConnector,
-    GuestResponse, LimaManager, NetworkManager, SandboxError, Session, SessionConfig,
-    SessionResponse, SessionState, SessionStore, VmStatus, attach_vm_to_bridge,
-    detach_vm_from_bridge,
+    ApiError, CaManager, CreateSessionRequest, ExecRequest, ExecResponse, GatewayManager,
+    GuestConnector, GuestResponse, LimaManager, NetworkManager, SandboxError, Session,
+    SessionConfig, SessionResponse, SessionState, SessionStore, VmStatus, attach_vm_to_bridge,
+    detach_vm_from_bridge, generate_ca_inject_script,
 };
 use tokio::net::UnixListener;
 use tracing::{error, info, warn};
@@ -50,6 +50,7 @@ fn default_base_dir() -> String {
 // ---------------------------------------------------------------------------
 
 struct AppState {
+    base_dir: PathBuf,
     store: SessionStore,
     lima: Arc<LimaManager>,
     guest: GuestConnector,
@@ -67,6 +68,7 @@ fn error_response(err: SandboxError) -> (StatusCode, Json<ApiError>) {
         SandboxError::SessionNotFound(_) => (StatusCode::NOT_FOUND, err.to_string()),
         SandboxError::InvalidState(_) => (StatusCode::BAD_REQUEST, err.to_string()),
         SandboxError::Network(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
+        SandboxError::Ca(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
         SandboxError::Gateway(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
         SandboxError::Lima(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
         SandboxError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
@@ -475,35 +477,105 @@ async fn exec_in_session(
 
 /// Set up full networking for a new session.
 ///
-/// 1. Create Docker bridge network
-/// 2. Create gateway container with nftables
-/// 3. Attach VM to bridge (TAP + QMP hot-add + guest config)
-/// 4. Store network info in DB
+/// 1. Generate per-session CA certificate
+/// 2. Create Docker bridge network
+/// 3. Create gateway container with nftables (mounting the CA)
+/// 4. Attach VM to bridge (TAP + QMP hot-add + guest config)
+/// 5. Inject CA certificate into VM trust store
+/// 6. Store network info in DB
 async fn setup_session_networking(
     session_id: &uuid::Uuid,
     state: &AppState,
 ) -> Result<(), SandboxError> {
-    // 1. Create Docker bridge network.
-    let network_info = state.network.create_network(session_id)?;
+    // 1. Generate per-session CA certificate.
+    let ca_dir = CaManager::generate_session_ca(&state.base_dir, session_id)?;
 
-    // 2. Create gateway container with nftables.
-    if let Err(e) = state.gateway.create_gateway(session_id, &network_info) {
-        // Roll back the Docker network on gateway failure.
+    // 2. Create Docker bridge network.
+    let network_info = match state.network.create_network(session_id) {
+        Ok(info) => info,
+        Err(e) => {
+            let _ = CaManager::remove_session_ca(&state.base_dir, session_id);
+            return Err(e);
+        }
+    };
+
+    // 3. Create gateway container with nftables, mounting the CA.
+    if let Err(e) =
+        state
+            .gateway
+            .create_gateway(session_id, &network_info, Some(&ca_dir))
+    {
+        // Roll back the Docker network and CA on gateway failure.
         let _ = state.network.delete_network(session_id);
+        let _ = CaManager::remove_session_ca(&state.base_dir, session_id);
         return Err(e);
     }
 
-    // 3. Attach VM to bridge (TAP + QMP hot-add + guest config).
+    // 4. Attach VM to bridge (TAP + QMP hot-add + guest config).
     if let Err(e) =
         attach_vm_to_bridge(session_id, &network_info, &state.network, &state.guest).await
     {
-        // Roll back gateway and Docker network on attach failure.
+        // Roll back gateway, Docker network, and CA on attach failure.
         let _ = state.gateway.stop_gateway(session_id);
         let _ = state.network.delete_network(session_id);
+        let _ = CaManager::remove_session_ca(&state.base_dir, session_id);
         return Err(e);
     }
 
-    // 4. Store network info in DB.
+    // 5. Inject CA certificate into VM trust store via guest agent.
+    let cert_pem = std::fs::read_to_string(ca_dir.join("cert.pem")).map_err(|e| {
+        SandboxError::Ca(format!("failed to read CA cert for injection: {e}"))
+    })?;
+    let inject_script = generate_ca_inject_script(&cert_pem);
+
+    info!(session_id = %session_id, "injecting CA certificate into VM");
+
+    match state
+        .guest
+        .exec(session_id, "bash", &["-c", &inject_script])
+        .await
+    {
+        Ok(GuestResponse::ExecResult {
+            exit_code,
+            stdout,
+            stderr,
+        }) => {
+            if exit_code != 0 {
+                warn!(
+                    session_id = %session_id,
+                    exit_code,
+                    stdout = %stdout.trim(),
+                    stderr = %stderr.trim(),
+                    "CA injection script returned non-zero exit code"
+                );
+                return Err(SandboxError::Ca(format!(
+                    "CA injection failed (exit {exit_code}): {stderr}"
+                )));
+            }
+            info!(
+                session_id = %session_id,
+                output = %stdout.trim(),
+                "CA certificate injected into VM"
+            );
+        }
+        Ok(GuestResponse::Error { message }) => {
+            return Err(SandboxError::Ca(format!(
+                "guest agent error during CA injection: {message}"
+            )));
+        }
+        Ok(other) => {
+            return Err(SandboxError::Ca(format!(
+                "unexpected guest response during CA injection: {other:?}"
+            )));
+        }
+        Err(e) => {
+            return Err(SandboxError::Ca(format!(
+                "failed to inject CA certificate into VM: {e}"
+            )));
+        }
+    }
+
+    // 6. Store network info in DB.
     state.store.set_network_info(session_id, &network_info)?;
 
     Ok(())
@@ -514,6 +586,7 @@ async fn setup_session_networking(
 /// 1. Detach VM from bridge (remove TAP)
 /// 2. Stop gateway container
 /// 3. Delete Docker bridge network
+/// 4. Remove session CA certificate
 fn teardown_session_networking(session_id: &uuid::Uuid, state: &AppState) {
     if let Err(e) = detach_vm_from_bridge(session_id, &state.network) {
         warn!(%session_id, error = %e, "failed to detach VM from bridge (best-effort)");
@@ -523,6 +596,9 @@ fn teardown_session_networking(session_id: &uuid::Uuid, state: &AppState) {
     }
     if let Err(e) = state.network.delete_network(session_id) {
         warn!(%session_id, error = %e, "failed to delete network (best-effort)");
+    }
+    if let Err(e) = CaManager::remove_session_ca(&state.base_dir, session_id) {
+        warn!(%session_id, error = %e, "failed to remove session CA (best-effort)");
     }
 }
 
@@ -643,7 +719,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize store and Lima manager.
     let store = SessionStore::new(base_dir.clone())?;
-    let lima = Arc::new(LimaManager::new(base_dir));
+    let lima = Arc::new(LimaManager::new(base_dir.clone()));
     let guest = GuestConnector::new(Arc::clone(&lima));
 
     // Initialize networking managers.
@@ -664,6 +740,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     reconcile(&store, &lima);
 
     let state = Arc::new(AppState {
+        base_dir,
         store,
         lima,
         guest,
