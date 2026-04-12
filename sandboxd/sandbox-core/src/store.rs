@@ -195,6 +195,102 @@ impl SessionStore {
         }
     }
 
+    /// Store network info for a session (serialized as JSON).
+    pub fn set_network_info(
+        &self,
+        id: &Uuid,
+        info: &crate::network::NetworkInfo,
+    ) -> Result<(), SandboxError> {
+        let json = serde_json::to_string(info).map_err(|e| {
+            SandboxError::Internal(format!("failed to serialize network info: {e}"))
+        })?;
+
+        let conn = self.conn.lock().map_err(|e| {
+            SandboxError::Internal(format!("lock poisoned: {e}"))
+        })?;
+
+        let rows_affected = conn.execute(
+            "UPDATE sessions SET network_info = ?1 WHERE id = ?2",
+            params![json, id.to_string()],
+        )?;
+
+        if rows_affected == 0 {
+            return Err(SandboxError::SessionNotFound(id.to_string()));
+        }
+
+        Ok(())
+    }
+
+    /// Retrieve network info for a session, if it has been set.
+    pub fn get_network_info(
+        &self,
+        id: &Uuid,
+    ) -> Result<Option<crate::network::NetworkInfo>, SandboxError> {
+        let conn = self.conn.lock().map_err(|e| {
+            SandboxError::Internal(format!("lock poisoned: {e}"))
+        })?;
+
+        let mut stmt = conn.prepare(
+            "SELECT network_info FROM sessions WHERE id = ?1",
+        )?;
+
+        let mut rows = stmt.query(params![id.to_string()])?;
+        match rows.next()? {
+            Some(row) => {
+                let json: Option<String> = row.get(0)?;
+                match json {
+                    Some(j) => {
+                        let info: crate::network::NetworkInfo =
+                            serde_json::from_str(&j).map_err(|e| {
+                                SandboxError::Internal(format!(
+                                    "invalid network_info JSON in database: {e}"
+                                ))
+                            })?;
+                        Ok(Some(info))
+                    }
+                    None => Ok(None),
+                }
+            }
+            None => Err(SandboxError::SessionNotFound(id.to_string())),
+        }
+    }
+
+    /// Load all sessions that have network info, for rebuilding allocator state.
+    pub fn list_sessions_with_network_info(
+        &self,
+    ) -> Result<Vec<(Uuid, crate::network::NetworkInfo)>, SandboxError> {
+        let conn = self.conn.lock().map_err(|e| {
+            SandboxError::Internal(format!("lock poisoned: {e}"))
+        })?;
+
+        let mut stmt = conn.prepare(
+            "SELECT id, network_info FROM sessions WHERE network_info IS NOT NULL",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            let id_str: String = row.get(0)?;
+            let json: String = row.get(1)?;
+            Ok((id_str, json))
+        })?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            let (id_str, json) = row?;
+            let id = Uuid::parse_str(&id_str).map_err(|e| {
+                SandboxError::Internal(format!("invalid UUID in database: {e}"))
+            })?;
+            let info: crate::network::NetworkInfo =
+                serde_json::from_str(&json).map_err(|e| {
+                    SandboxError::Internal(format!(
+                        "invalid network_info JSON in database: {e}"
+                    ))
+                })?;
+            result.push((id, info));
+        }
+
+        Ok(result)
+    }
+
     /// Delete a session from the database and remove its per-session directory.
     pub fn delete_session(&self, id: &Uuid) -> Result<(), SandboxError> {
         let conn = self.conn.lock().map_err(|e| {
@@ -611,5 +707,118 @@ mod tests {
             .expect("should not error");
 
         assert!(result.is_none());
+    }
+
+    // -- NetworkInfo persistence tests ---------------------------------------
+
+    #[test]
+    fn test_set_and_get_network_info() {
+        let (store, _dir) = test_store();
+
+        let session = store
+            .create_session(SessionConfig::default(), None)
+            .expect("create");
+
+        // Initially no network info.
+        let info = store
+            .get_network_info(&session.id)
+            .expect("get_network_info");
+        assert!(info.is_none());
+
+        // Set network info.
+        let net_info = crate::network::NetworkInfo {
+            bridge_name: "sb-test123456".to_string(),
+            subnet: "10.209.0.0/30".to_string(),
+            gateway_ip: "10.209.0.1".to_string(),
+            vm_ip: "10.209.0.2".to_string(),
+            docker_network_name: format!("sandbox-net-{}", session.id),
+        };
+
+        store
+            .set_network_info(&session.id, &net_info)
+            .expect("set_network_info");
+
+        // Retrieve it.
+        let fetched = store
+            .get_network_info(&session.id)
+            .expect("get_network_info")
+            .expect("should have network info");
+
+        assert_eq!(fetched.bridge_name, net_info.bridge_name);
+        assert_eq!(fetched.subnet, net_info.subnet);
+        assert_eq!(fetched.gateway_ip, net_info.gateway_ip);
+        assert_eq!(fetched.vm_ip, net_info.vm_ip);
+        assert_eq!(
+            fetched.docker_network_name,
+            net_info.docker_network_name
+        );
+    }
+
+    #[test]
+    fn test_set_network_info_nonexistent_session() {
+        let (store, _dir) = test_store();
+
+        let net_info = crate::network::NetworkInfo {
+            bridge_name: "sb-test".to_string(),
+            subnet: "10.209.0.0/30".to_string(),
+            gateway_ip: "10.209.0.1".to_string(),
+            vm_ip: "10.209.0.2".to_string(),
+            docker_network_name: "sandbox-net-xxx".to_string(),
+        };
+
+        let result = store.set_network_info(&Uuid::new_v4(), &net_info);
+        assert!(matches!(result, Err(SandboxError::SessionNotFound(_))));
+    }
+
+    #[test]
+    fn test_get_network_info_nonexistent_session() {
+        let (store, _dir) = test_store();
+
+        let result = store.get_network_info(&Uuid::new_v4());
+        assert!(matches!(result, Err(SandboxError::SessionNotFound(_))));
+    }
+
+    #[test]
+    fn test_list_sessions_with_network_info() {
+        let (store, _dir) = test_store();
+
+        let s1 = store
+            .create_session(SessionConfig::default(), Some("s1".into()))
+            .expect("create s1");
+        let s2 = store
+            .create_session(SessionConfig::default(), Some("s2".into()))
+            .expect("create s2");
+        let _s3 = store
+            .create_session(SessionConfig::default(), Some("s3".into()))
+            .expect("create s3");
+
+        // Set network info on s1 and s2, leave s3 without.
+        let info1 = crate::network::NetworkInfo {
+            bridge_name: "sb-aaa".to_string(),
+            subnet: "10.209.0.0/30".to_string(),
+            gateway_ip: "10.209.0.1".to_string(),
+            vm_ip: "10.209.0.2".to_string(),
+            docker_network_name: format!("sandbox-net-{}", s1.id),
+        };
+        let info2 = crate::network::NetworkInfo {
+            bridge_name: "sb-bbb".to_string(),
+            subnet: "10.209.0.4/30".to_string(),
+            gateway_ip: "10.209.0.5".to_string(),
+            vm_ip: "10.209.0.6".to_string(),
+            docker_network_name: format!("sandbox-net-{}", s2.id),
+        };
+
+        store.set_network_info(&s1.id, &info1).expect("set s1");
+        store.set_network_info(&s2.id, &info2).expect("set s2");
+
+        let entries = store
+            .list_sessions_with_network_info()
+            .expect("list with network info");
+
+        assert_eq!(entries.len(), 2);
+
+        let ids: Vec<Uuid> = entries.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&s1.id));
+        assert!(ids.contains(&s2.id));
     }
 }

@@ -63,6 +63,7 @@ fn error_response(err: SandboxError) -> (StatusCode, Json<ApiError>) {
     let (status, msg) = match &err {
         SandboxError::SessionNotFound(_) => (StatusCode::NOT_FOUND, err.to_string()),
         SandboxError::InvalidState(_) => (StatusCode::BAD_REQUEST, err.to_string()),
+        SandboxError::Network(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
         SandboxError::Lima(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
         SandboxError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
         SandboxError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),

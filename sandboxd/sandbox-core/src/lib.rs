@@ -2,6 +2,7 @@ pub mod api;
 pub mod error;
 pub mod guest;
 pub mod lima;
+pub mod network;
 pub mod session;
 pub mod store;
 
@@ -12,5 +13,6 @@ pub use guest::{
     read_message, write_message,
 };
 pub use lima::{LimaManager, VmInfo, VmStatus};
+pub use network::{NetworkInfo, NetworkManager};
 pub use session::{Session, SessionConfig, SessionState};
 pub use store::SessionStore;
