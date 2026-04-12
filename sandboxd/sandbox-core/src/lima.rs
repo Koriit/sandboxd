@@ -150,11 +150,17 @@ impl LimaManager {
     }
 
     /// Start an existing (stopped) VM.
+    ///
+    /// A QEMU wrapper script is injected via `QEMU_SYSTEM_X86_64` so that the
+    /// resulting VM has a PCIe root-port available for NIC hot-add.
     pub fn start_vm(&self, session_id: &Uuid) -> Result<(), SandboxError> {
         let vm_name = vm_name(session_id);
+        let qemu_wrapper = self.ensure_qemu_wrapper()?;
+
         let output = Command::new(&self.limactl)
             .args(["start", &vm_name])
             .arg("--tty=false")
+            .env("QEMU_SYSTEM_X86_64", &qemu_wrapper)
             .output()
             .map_err(|e| lima_io_error("limactl start", e))?;
 
@@ -452,6 +458,45 @@ provision:
     }
 
     // -- helpers ------------------------------------------------------------
+
+    /// Create a QEMU wrapper script that injects a `pcie-root-port` device.
+    ///
+    /// The q35 machine type does not include any PCIe root-port by default,
+    /// which means no PCIe device (including virtio-net-pci) can be hot-added
+    /// via QMP.  Lima does not expose a way to pass extra QEMU arguments, so
+    /// we interpose a tiny shell wrapper that Lima invokes via the
+    /// `QEMU_SYSTEM_X86_64` environment variable.  The wrapper prepends the
+    /// required `-device pcie-root-port,...` argument, then exec's the real
+    /// QEMU binary.
+    fn ensure_qemu_wrapper(&self) -> Result<PathBuf, SandboxError> {
+        let wrapper_dir = self.base_dir.join("libexec");
+        std::fs::create_dir_all(&wrapper_dir)?;
+        let wrapper_path = wrapper_dir.join("qemu-system-x86_64");
+
+        // The wrapper script is idempotent — overwrite if the content changed.
+        let script = r#"#!/bin/sh
+# QEMU wrapper injected by sandboxd.
+# Adds a PCIe root-port so that NIC hot-add via QMP works on q35 machines.
+REAL_QEMU="/usr/bin/qemu-system-x86_64"
+exec "$REAL_QEMU" \
+    -device pcie-root-port,id=pcie-hotplug-port,bus=pcie.0,chassis=1 \
+    "$@"
+"#;
+        std::fs::write(&wrapper_path, script)?;
+
+        // chmod +x
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                &wrapper_path,
+                std::fs::Permissions::from_mode(0o755),
+            )?;
+        }
+
+        debug!(path = %wrapper_path.display(), "QEMU wrapper script ready");
+        Ok(wrapper_path)
+    }
 
     fn session_dir(&self, session_id: &Uuid) -> PathBuf {
         self.base_dir

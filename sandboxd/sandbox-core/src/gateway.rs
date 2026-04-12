@@ -105,7 +105,9 @@ impl GatewayManager {
                 "--tmpfs",
                 "/var/run:rw,noexec,nosuid",
                 "--tmpfs",
-                "/tmp:rw,noexec,nosuid",
+                "/tmp:rw,exec,nosuid",
+                "--tmpfs",
+                "/root/.mitmproxy:rw",
                 "--sysctl",
                 "net.ipv4.ip_forward=1",
                 "--sysctl",
@@ -301,7 +303,13 @@ impl GatewayManager {
 
         // Also update the forward chain to allow forwarding from the VM subnet.
         let forward_rules = generate_forward_allow_ruleset(&network_info.subnet);
-        self.inject_nftables_ruleset(session_id, &forward_rules, "forward-allow")
+        self.inject_nftables_ruleset(session_id, &forward_rules, "forward-allow")?;
+
+        // Open the input chain for service ports (DNS, Envoy) from the VM
+        // subnet.  Without this, DNATted traffic is rejected by the deny-all
+        // input chain.
+        let input_rules = generate_input_allow_ruleset(&network_info.subnet);
+        self.inject_nftables_ruleset(session_id, &input_rules, "input-allow")
     }
 
     /// Inject nftables rules into the gateway container's network namespace.
@@ -426,7 +434,8 @@ impl GatewayManager {
         );
 
         let net_arg = format!("--net={ns_path}");
-        let output = Command::new("nsenter")
+        let output = Command::new("sudo")
+            .arg("nsenter")
             .arg(&net_arg)
             .args(["nft", "-f", "-"])
             .stdin(std::process::Stdio::piped())
@@ -643,6 +652,42 @@ pub fn generate_dnat_ruleset(vm_subnet: &str, gateway_ip: &str) -> String {
 
         # MASQUERADE for outgoing traffic
         masquerade
+    }}
+}}
+"#
+    )
+}
+
+/// Generate rules that open the input chain for service ports.
+///
+/// The initial deny-all ruleset blocks all inbound traffic.  After DNAT
+/// is configured, traffic from the VM subnet is rewritten to the
+/// gateway's own IP on port 53 (DNS) and 10000 (Envoy proxy).  The
+/// input chain must accept this traffic, otherwise the DNATted packets
+/// are rejected.
+pub fn generate_input_allow_ruleset(vm_subnet: &str) -> String {
+    format!(
+        r#"flush chain inet sandbox input
+table inet sandbox {{
+    chain input {{
+        # Allow loopback
+        iif lo accept
+
+        # Allow established/related
+        ct state established,related accept
+
+        # Allow ICMP (ping) for diagnostics
+        ip protocol icmp accept
+
+        # Allow DNS from VM subnet (CoreDNS)
+        ip saddr {vm_subnet} udp dport 53 accept
+        ip saddr {vm_subnet} tcp dport 53 accept
+
+        # Allow HTTP proxy from VM subnet (Envoy)
+        ip saddr {vm_subnet} tcp dport 10000 accept
+
+        # Reject everything else (fast failure)
+        reject
     }}
 }}
 "#
@@ -921,7 +966,7 @@ mod tests {
 
     #[test]
     fn test_gateway_manager_default() {
-        let _manager = GatewayManager::default();
+        let _manager: GatewayManager = Default::default();
         // Verify Default trait is implemented.
     }
 

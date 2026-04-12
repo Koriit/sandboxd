@@ -272,8 +272,6 @@ impl NetworkManager {
                 "bridge",
                 "--subnet",
                 &subnet,
-                "--gateway",
-                &gateway_ip.to_string(),
                 "--label",
                 &format!("sandbox.session_id={session_id}"),
                 "--opt",
@@ -381,6 +379,255 @@ impl NetworkManager {
         })?;
         Ok(nets.get(session_id).map(|(_, info)| info.clone()))
     }
+
+    // -- TAP device management ------------------------------------------------
+
+    /// Create a TAP device on the host and bridge it to the Docker network.
+    ///
+    /// Docker rootless runs bridges in a separate network namespace, so we
+    /// cannot directly attach the TAP to Docker's bridge. Instead we:
+    ///
+    /// 1. Create a host-side bridge (`br-sb-{id}`)
+    /// 2. Create a TAP device on the host, attached to the host bridge
+    /// 3. Create a veth pair (`vh-sb-{id}` / `vd-sb-{id}`)
+    /// 4. Move the Docker-side veth into Docker's namespace, attach to Docker bridge
+    /// 5. Attach the host-side veth to the host bridge
+    ///
+    /// This spans the two namespaces so QEMU (on the host) can reach the
+    /// gateway container (in Docker's namespace) via the TAP.
+    ///
+    /// Returns the TAP device name (for QMP hot-add).
+    ///
+    /// Requires root (uses `sudo`).
+    pub fn create_tap(
+        &self,
+        session_id: &Uuid,
+        network_info: &NetworkInfo,
+    ) -> Result<String, SandboxError> {
+        let tap_name = crate::qmp::tap_name_for_session(session_id);
+        let short_id = &session_id.to_string()[..6];
+        let host_br = format!("br-sb-{short_id}");
+        let veth_host = format!("vh-sb-{short_id}");
+        let veth_dock = format!("vd-sb-{short_id}");
+
+        info!(
+            session_id = %session_id,
+            tap = %tap_name,
+            host_bridge = %host_br,
+            docker_bridge = %network_info.bridge_name,
+            "creating TAP device with veth bridge to Docker namespace"
+        );
+
+        // Find Docker daemon PID for namespace access.
+        let docker_pid = find_docker_daemon_pid()?;
+
+        // 1. Create the host-side bridge.
+        run_sudo(&["ip", "link", "add", &host_br, "type", "bridge"])
+            .map_err(|e| SandboxError::Network(format!("create host bridge: {e}")))?;
+
+        // 2. Create the TAP device on the host.
+        if let Err(e) = run_sudo(&["ip", "tuntap", "add", "mode", "tap", "name", &tap_name]) {
+            let _ = run_sudo(&["ip", "link", "del", &host_br]);
+            return Err(SandboxError::Network(format!("create TAP: {e}")));
+        }
+
+        // 3. Attach TAP to host bridge.
+        if let Err(e) = run_sudo(&["ip", "link", "set", &tap_name, "master", &host_br]) {
+            let _ = run_sudo(&["ip", "tuntap", "del", "mode", "tap", "name", &tap_name]);
+            let _ = run_sudo(&["ip", "link", "del", &host_br]);
+            return Err(SandboxError::Network(format!("attach TAP to host bridge: {e}")));
+        }
+
+        // 4. Create the veth pair.
+        if let Err(e) = run_sudo(&[
+            "ip", "link", "add", &veth_host, "type", "veth", "peer", "name", &veth_dock,
+        ]) {
+            let _ = run_sudo(&["ip", "tuntap", "del", "mode", "tap", "name", &tap_name]);
+            let _ = run_sudo(&["ip", "link", "del", &host_br]);
+            return Err(SandboxError::Network(format!("create veth pair: {e}")));
+        }
+
+        // 5. Attach host-side veth to host bridge.
+        if let Err(e) = run_sudo(&["ip", "link", "set", &veth_host, "master", &host_br]) {
+            let _ = run_sudo(&["ip", "link", "del", &veth_host]);
+            let _ = run_sudo(&["ip", "tuntap", "del", "mode", "tap", "name", &tap_name]);
+            let _ = run_sudo(&["ip", "link", "del", &host_br]);
+            return Err(SandboxError::Network(format!("attach veth to host bridge: {e}")));
+        }
+
+        // 6. Move Docker-side veth into Docker's namespace.
+        let pid_str = docker_pid.to_string();
+        if let Err(e) = run_sudo(&["ip", "link", "set", &veth_dock, "netns", &pid_str]) {
+            let _ = run_sudo(&["ip", "link", "del", &veth_host]);
+            let _ = run_sudo(&["ip", "tuntap", "del", "mode", "tap", "name", &tap_name]);
+            let _ = run_sudo(&["ip", "link", "del", &host_br]);
+            return Err(SandboxError::Network(format!("move veth to Docker ns: {e}")));
+        }
+
+        // 7. Inside Docker's namespace: attach veth to Docker bridge and bring up.
+        let ns_path = format!("/proc/{docker_pid}/ns/net");
+        if let Err(e) = run_nsenter(&ns_path, &[
+            "ip", "link", "set", &veth_dock, "master", &network_info.bridge_name,
+        ]) {
+            // Best-effort cleanup (veth is in Docker ns, so delete host side).
+            let _ = run_sudo(&["ip", "link", "del", &veth_host]);
+            let _ = run_sudo(&["ip", "tuntap", "del", "mode", "tap", "name", &tap_name]);
+            let _ = run_sudo(&["ip", "link", "del", &host_br]);
+            return Err(SandboxError::Network(format!("attach veth to Docker bridge: {e}")));
+        }
+
+        let _ = run_nsenter(&ns_path, &["ip", "link", "set", &veth_dock, "up"]);
+
+        // 8. Bring up host-side interfaces.
+        let _ = run_sudo(&["ip", "link", "set", &veth_host, "up"]);
+        let _ = run_sudo(&["ip", "link", "set", &tap_name, "up"]);
+        let _ = run_sudo(&["ip", "link", "set", &host_br, "up"]);
+
+        info!(
+            session_id = %session_id,
+            tap = %tap_name,
+            host_bridge = %host_br,
+            docker_bridge = %network_info.bridge_name,
+            "TAP device created with veth bridge to Docker namespace"
+        );
+
+        Ok(tap_name)
+    }
+
+    /// Delete the TAP device and associated veth/bridge for a session.
+    ///
+    /// This is idempotent — if devices do not exist, it returns Ok.
+    ///
+    /// Requires root (uses `sudo`).
+    pub fn delete_tap(&self, session_id: &Uuid) -> Result<(), SandboxError> {
+        let tap_name = crate::qmp::tap_name_for_session(session_id);
+        let short_id = &session_id.to_string()[..6];
+        let host_br = format!("br-sb-{short_id}");
+        let veth_host = format!("vh-sb-{short_id}");
+
+        debug!(
+            session_id = %session_id,
+            tap = %tap_name,
+            host_bridge = %host_br,
+            "deleting TAP device and veth bridge"
+        );
+
+        // Delete the TAP (removing from bridge automatically).
+        let _ = run_sudo(&["ip", "tuntap", "del", "mode", "tap", "name", &tap_name]);
+
+        // Delete the veth pair (removes both ends, including the Docker-ns end).
+        let _ = run_sudo(&["ip", "link", "del", &veth_host]);
+
+        // Delete the host bridge.
+        let _ = run_sudo(&["ip", "link", "del", &host_br]);
+
+        info!(
+            session_id = %session_id,
+            tap = %tap_name,
+            "TAP device and veth bridge deleted"
+        );
+
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shell helpers for namespace-aware networking
+// ---------------------------------------------------------------------------
+
+/// Run a command via `sudo` and return Ok(()) on success.
+fn run_sudo(args: &[&str]) -> Result<(), String> {
+    let output = Command::new("sudo")
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to run sudo {}: {e}", args.join(" ")))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!(
+            "sudo {} failed: {}",
+            args.join(" "),
+            stderr.trim()
+        ))
+    }
+}
+
+/// Run a command via `sudo nsenter --net=<ns_path>` and return Ok(()) on success.
+fn run_nsenter(ns_path: &str, args: &[&str]) -> Result<(), String> {
+    let net_arg = format!("--net={ns_path}");
+    let output = Command::new("sudo")
+        .arg("nsenter")
+        .arg(&net_arg)
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to run nsenter {}: {e}", args.join(" ")))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!(
+            "nsenter {} failed: {}",
+            args.join(" "),
+            stderr.trim()
+        ))
+    }
+}
+
+/// Find the PID of the Docker daemon process that owns bridge interfaces.
+///
+/// With Docker rootless, the inner `dockerd` process (child of `rootlesskit`)
+/// owns the network namespace containing bridge interfaces. This function
+/// finds that PID by looking for `dockerd` processes and checking which one
+/// has bridge interfaces in its namespace.
+fn find_docker_daemon_pid() -> Result<u32, SandboxError> {
+    // Strategy: find all processes named `dockerd`, then check which one
+    // has the `docker0` bridge in its network namespace.
+    let output = Command::new("pgrep")
+        .arg("-x")
+        .arg("dockerd")
+        .output()
+        .map_err(|e| {
+            SandboxError::Network(format!("failed to find dockerd process: {e}"))
+        })?;
+
+    if !output.status.success() {
+        return Err(SandboxError::Network(
+            "no dockerd process found (is Docker running?)".into(),
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let pids: Vec<u32> = stdout
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect();
+
+    // Check each PID's namespace for bridge interfaces.
+    for pid in &pids {
+        let ns_path = format!("/proc/{pid}/ns/net");
+        let net_arg = format!("--net={ns_path}");
+        let check = Command::new("sudo")
+            .arg("nsenter")
+            .arg(&net_arg)
+            .args(["ip", "link", "show", "type", "bridge"])
+            .output();
+
+        if let Ok(out) = check {
+            let bridges = String::from_utf8_lossy(&out.stdout);
+            if bridges.contains("docker0") {
+                debug!(pid = pid, "found Docker daemon with bridge interfaces");
+                return Ok(*pid);
+            }
+        }
+    }
+
+    // Fallback: use the first PID found.
+    pids.first().copied().ok_or_else(|| {
+        SandboxError::Network("no dockerd process found".into())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -710,6 +957,18 @@ mod tests {
             Ipv4Addr::new(10, 209, 0, 16)
         );
         assert!(parse_subnet_base("not-an-ip/28").is_err());
+    }
+
+    // -- TAP device name tests ------------------------------------------------
+
+    #[test]
+    fn test_tap_name_from_network_manager() {
+        use crate::qmp::tap_name_for_session;
+
+        let id =
+            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let name = tap_name_for_session(&id);
+        assert_eq!(name, "tap-sb-550e84");
     }
 
     // -- Docker integration tests (require Docker daemon) --------------------

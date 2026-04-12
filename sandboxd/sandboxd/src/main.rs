@@ -10,9 +10,10 @@ use axum::{
 };
 use clap::Parser;
 use sandbox_core::{
-    ApiError, CreateSessionRequest, ExecRequest, ExecResponse, GuestConnector, GuestResponse,
-    LimaManager, SandboxError, Session, SessionConfig, SessionResponse, SessionState,
-    SessionStore, VmStatus,
+    ApiError, CreateSessionRequest, ExecRequest, ExecResponse, GatewayManager, GuestConnector,
+    GuestResponse, LimaManager, NetworkManager, SandboxError, Session, SessionConfig,
+    SessionResponse, SessionState, SessionStore, VmStatus, attach_vm_to_bridge,
+    detach_vm_from_bridge,
 };
 use tokio::net::UnixListener;
 use tracing::{error, info, warn};
@@ -52,6 +53,8 @@ struct AppState {
     store: SessionStore,
     lima: Arc<LimaManager>,
     guest: GuestConnector,
+    network: Arc<NetworkManager>,
+    gateway: Arc<GatewayManager>,
 }
 
 // ---------------------------------------------------------------------------
@@ -174,6 +177,20 @@ async fn create_session(
     // Update state to Running.
     if let Err(e) = state.store.update_state(&session_id, SessionState::Running) {
         return error_response(e).into_response();
+    }
+
+    // Set up networking: Docker bridge, gateway container, VM NIC attachment.
+    match setup_session_networking(&session_id, &state).await {
+        Ok(()) => {
+            info!(%session_id, "session networking configured");
+        }
+        Err(e) => {
+            error!(%session_id, error = %e, "networking setup failed");
+            let _ = state.store.update_state(&session_id, SessionState::Error);
+            // Best-effort teardown of any partial networking state.
+            teardown_session_networking(&session_id, &state);
+            return error_response(e).into_response();
+        }
     }
 
     // Re-fetch the session to get the updated state and timestamp.
@@ -381,6 +398,9 @@ async fn remove_session(
     // Delete the VM from Lima (ignore errors -- it might not exist).
     let _ = state.lima.delete_vm(&session.id);
 
+    // Tear down networking (best-effort -- ignore errors).
+    teardown_session_networking(&session.id, &state);
+
     // Delete the session from the store.
     if let Err(e) = state.store.delete_session(&session.id) {
         return error_response(e).into_response();
@@ -446,6 +466,63 @@ async fn exec_in_session(
             error!(session_id = %session.id, error = %e, "guest agent exec failed");
             error_response(e).into_response()
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Networking helpers
+// ---------------------------------------------------------------------------
+
+/// Set up full networking for a new session.
+///
+/// 1. Create Docker bridge network
+/// 2. Create gateway container with nftables
+/// 3. Attach VM to bridge (TAP + QMP hot-add + guest config)
+/// 4. Store network info in DB
+async fn setup_session_networking(
+    session_id: &uuid::Uuid,
+    state: &AppState,
+) -> Result<(), SandboxError> {
+    // 1. Create Docker bridge network.
+    let network_info = state.network.create_network(session_id)?;
+
+    // 2. Create gateway container with nftables.
+    if let Err(e) = state.gateway.create_gateway(session_id, &network_info) {
+        // Roll back the Docker network on gateway failure.
+        let _ = state.network.delete_network(session_id);
+        return Err(e);
+    }
+
+    // 3. Attach VM to bridge (TAP + QMP hot-add + guest config).
+    if let Err(e) =
+        attach_vm_to_bridge(session_id, &network_info, &state.network, &state.guest).await
+    {
+        // Roll back gateway and Docker network on attach failure.
+        let _ = state.gateway.stop_gateway(session_id);
+        let _ = state.network.delete_network(session_id);
+        return Err(e);
+    }
+
+    // 4. Store network info in DB.
+    state.store.set_network_info(session_id, &network_info)?;
+
+    Ok(())
+}
+
+/// Tear down session networking (best-effort, ignores errors).
+///
+/// 1. Detach VM from bridge (remove TAP)
+/// 2. Stop gateway container
+/// 3. Delete Docker bridge network
+fn teardown_session_networking(session_id: &uuid::Uuid, state: &AppState) {
+    if let Err(e) = detach_vm_from_bridge(session_id, &state.network) {
+        warn!(%session_id, error = %e, "failed to detach VM from bridge (best-effort)");
+    }
+    if let Err(e) = state.gateway.stop_gateway(session_id) {
+        warn!(%session_id, error = %e, "failed to stop gateway (best-effort)");
+    }
+    if let Err(e) = state.network.delete_network(session_id) {
+        warn!(%session_id, error = %e, "failed to delete network (best-effort)");
     }
 }
 
@@ -569,10 +646,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let lima = Arc::new(LimaManager::new(base_dir));
     let guest = GuestConnector::new(Arc::clone(&lima));
 
+    // Initialize networking managers.
+    let network = Arc::new(NetworkManager::with_defaults()?);
+    let gateway = Arc::new(GatewayManager::new());
+
+    // Restore network allocator state from existing sessions.
+    let existing_networks = store.list_sessions_with_network_info()?;
+    if !existing_networks.is_empty() {
+        info!(
+            count = existing_networks.len(),
+            "restoring network allocator state from existing sessions"
+        );
+        network.restore_from_infos(&existing_networks)?;
+    }
+
     // Run startup reconciliation.
     reconcile(&store, &lima);
 
-    let state = Arc::new(AppState { store, lima, guest });
+    let state = Arc::new(AppState {
+        store,
+        lima,
+        guest,
+        network,
+        gateway,
+    });
 
     // Remove stale socket file if it exists.
     if socket_path.exists() {

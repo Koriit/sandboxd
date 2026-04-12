@@ -19,6 +19,9 @@ set -euo pipefail
 LOG_DIR="${LOG_DIR:-/var/log/gateway}"
 READY_TIMEOUT="${READY_TIMEOUT:-30}"
 
+# Ensure the log directory exists (tmpfs mounts wipe it out).
+mkdir -p "${LOG_DIR}"
+
 # PIDs of managed processes
 MITM_PID=""
 ENVOY_PID=""
