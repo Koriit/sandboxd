@@ -1,7 +1,8 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::Deserialize;
+use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::error::SandboxError;
@@ -32,6 +33,22 @@ pub struct VmInfo {
 // ---------------------------------------------------------------------------
 // LimaManager
 // ---------------------------------------------------------------------------
+
+/// Systemd unit file for the sandbox guest agent service.
+const GUEST_AGENT_SERVICE_UNIT: &str = "\
+[Unit]
+Description=Sandbox Guest Agent
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sandbox-guest
+Restart=always
+RestartSec=5
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target";
 
 /// Manages Lima virtual machines that back sandbox sessions.
 ///
@@ -183,6 +200,115 @@ impl LimaManager {
         Ok(())
     }
 
+    /// Copy the sandbox-guest binary into a running VM and start it as a
+    /// systemd service.
+    ///
+    /// This should be called after the VM has booted (i.e. after `start_vm`
+    /// or `create_vm` + start).
+    pub fn install_guest_agent(
+        &self,
+        session_id: &Uuid,
+        binary_path: &Path,
+    ) -> Result<(), SandboxError> {
+        let vm_name = vm_name(session_id);
+
+        if !binary_path.exists() {
+            return Err(SandboxError::Internal(format!(
+                "guest agent binary not found at {}",
+                binary_path.display()
+            )));
+        }
+
+        // 1. Copy the binary into the VM.
+        debug!(vm = %vm_name, binary = %binary_path.display(), "copying guest agent binary");
+        let copy_src = binary_path.to_string_lossy().to_string();
+        let copy_dst = format!("{vm_name}:/usr/local/bin/sandbox-guest");
+        let output = Command::new(&self.limactl)
+            .args(["copy", &copy_src, &copy_dst])
+            .output()
+            .map_err(|e| lima_io_error("limactl copy (guest agent)", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SandboxError::Lima(format!(
+                "failed to copy guest agent to {vm_name}: {stderr}"
+            )));
+        }
+
+        // 2. Make the binary executable.
+        debug!(vm = %vm_name, "setting guest agent executable");
+        let output = Command::new(&self.limactl)
+            .args([
+                "shell", &vm_name, "--",
+                "chmod", "+x", "/usr/local/bin/sandbox-guest",
+            ])
+            .output()
+            .map_err(|e| lima_io_error("limactl shell chmod", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SandboxError::Lima(format!(
+                "failed to chmod guest agent in {vm_name}: {stderr}"
+            )));
+        }
+
+        // 3. Create a systemd service file.
+        debug!(vm = %vm_name, "creating systemd service");
+        let service_unit = GUEST_AGENT_SERVICE_UNIT;
+        let output = Command::new(&self.limactl)
+            .args([
+                "shell", &vm_name, "--",
+                "sudo", "bash", "-c",
+                &format!(
+                    "cat > /etc/systemd/system/sandbox-guest.service << 'UNIT_EOF'\n{service_unit}\nUNIT_EOF"
+                ),
+            ])
+            .output()
+            .map_err(|e| lima_io_error("limactl shell (create service)", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SandboxError::Lima(format!(
+                "failed to create systemd service in {vm_name}: {stderr}"
+            )));
+        }
+
+        // 4. Reload systemd and start the service.
+        debug!(vm = %vm_name, "starting guest agent service");
+        let output = Command::new(&self.limactl)
+            .args([
+                "shell", &vm_name, "--",
+                "sudo", "systemctl", "daemon-reload",
+            ])
+            .output()
+            .map_err(|e| lima_io_error("limactl shell (daemon-reload)", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SandboxError::Lima(format!(
+                "failed to reload systemd in {vm_name}: {stderr}"
+            )));
+        }
+
+        let output = Command::new(&self.limactl)
+            .args([
+                "shell", &vm_name, "--",
+                "sudo", "systemctl", "enable", "--now", "sandbox-guest",
+            ])
+            .output()
+            .map_err(|e| lima_io_error("limactl shell (enable service)", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SandboxError::Lima(format!(
+                "failed to start guest agent service in {vm_name}: {stderr}"
+            )));
+        }
+
+        info!(vm = %vm_name, "guest agent installed and started");
+        Ok(())
+    }
+
     /// Query the status of a single VM.
     pub fn vm_status(&self, session_id: &Uuid) -> Result<VmStatus, SandboxError> {
         let vms = self.list_vms_raw()?;
@@ -279,6 +405,16 @@ provision:
     fi
     echo 'agent ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/agent
     chmod 0440 /etc/sudoers.d/agent
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    # Install socat (needed for host-guest communication bridge)
+    if ! command -v socat &>/dev/null; then
+      apt-get update -qq
+      apt-get install -y socat
+    fi
 - mode: system
   script: |
     #!/bin/bash
@@ -549,6 +685,10 @@ mod tests {
             "template should grant passwordless sudo"
         );
         assert!(
+            template.contains("apt-get install -y socat"),
+            "template should install socat for host-guest communication"
+        );
+        assert!(
             template.contains("get.docker.com"),
             "template should install Docker"
         );
@@ -753,6 +893,47 @@ mod tests {
         assert_eq!(mib_to_gib_string(16384), "16");
         assert_eq!(mib_to_gib_string(1536), "1.5");
         assert_eq!(mib_to_gib_string(2560), "2.5");
+    }
+
+    // -- Guest agent service unit tests --------------------------------------
+
+    #[test]
+    fn test_guest_agent_service_unit() {
+        assert!(
+            GUEST_AGENT_SERVICE_UNIT.contains("[Unit]"),
+            "service unit should have [Unit] section"
+        );
+        assert!(
+            GUEST_AGENT_SERVICE_UNIT.contains("ExecStart=/usr/local/bin/sandbox-guest"),
+            "service unit should run sandbox-guest"
+        );
+        assert!(
+            GUEST_AGENT_SERVICE_UNIT.contains("Restart=always"),
+            "service should restart on failure"
+        );
+        assert!(
+            GUEST_AGENT_SERVICE_UNIT.contains("[Install]"),
+            "service unit should have [Install] section"
+        );
+    }
+
+    #[test]
+    fn test_install_guest_agent_missing_binary() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let mgr = LimaManager::new(dir.path().to_path_buf());
+        let session_id = Uuid::new_v4();
+
+        let result = mgr.install_guest_agent(
+            &session_id,
+            std::path::Path::new("/nonexistent/path/sandbox-guest"),
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not found"),
+            "error should mention binary not found: {err}"
+        );
     }
 
     // -- Integration tests (ignored by default) -----------------------------

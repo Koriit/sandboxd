@@ -10,8 +10,8 @@ use axum::{
 };
 use clap::Parser;
 use sandbox_core::{
-    ApiError, CreateSessionRequest, LimaManager, SandboxError, Session, SessionConfig,
-    SessionState, SessionStore, VmStatus,
+    ApiError, CreateSessionRequest, GuestConnector, LimaManager, SandboxError, Session,
+    SessionConfig, SessionState, SessionStore, VmStatus,
 };
 use tokio::net::UnixListener;
 use tracing::{error, info, warn};
@@ -49,7 +49,8 @@ fn default_base_dir() -> String {
 
 struct AppState {
     store: SessionStore,
-    lima: LimaManager,
+    lima: Arc<LimaManager>,
+    guest: GuestConnector,
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +124,47 @@ async fn create_session(
     if let Err(e) = state.lima.start_vm(&session_id) {
         let _ = state.store.update_state(&session_id, SessionState::Error);
         return error_response(e).into_response();
+    }
+
+    // Install the guest agent into the VM.
+    let guest_binary_path = match std::env::current_exe() {
+        Ok(exe) => exe
+            .parent()
+            .expect("executable must have a parent directory")
+            .join("sandbox-guest"),
+        Err(e) => {
+            let _ = state.store.update_state(&session_id, SessionState::Error);
+            return error_response(SandboxError::Internal(format!(
+                "failed to determine daemon executable path: {e}"
+            )))
+            .into_response();
+        }
+    };
+
+    if let Err(e) = state.lima.install_guest_agent(&session_id, &guest_binary_path) {
+        error!(%session_id, error = %e, "failed to install guest agent");
+        let _ = state.store.update_state(&session_id, SessionState::Error);
+        return error_response(e).into_response();
+    }
+
+    // Verify the guest agent is responsive.
+    match state.guest.ping(&session_id).await {
+        Ok(true) => {
+            info!(%session_id, "guest agent responded to ping");
+        }
+        Ok(false) => {
+            let err = SandboxError::Internal(
+                "guest agent returned unexpected response to ping".into(),
+            );
+            error!(%session_id, "guest agent ping: unexpected response");
+            let _ = state.store.update_state(&session_id, SessionState::Error);
+            return error_response(err).into_response();
+        }
+        Err(e) => {
+            error!(%session_id, error = %e, "guest agent ping failed");
+            let _ = state.store.update_state(&session_id, SessionState::Error);
+            return error_response(e).into_response();
+        }
     }
 
     // Update state to Running.
@@ -425,12 +467,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize store and Lima manager.
     let store = SessionStore::new(base_dir.clone())?;
-    let lima = LimaManager::new(base_dir);
+    let lima = Arc::new(LimaManager::new(base_dir));
+    let guest = GuestConnector::new(Arc::clone(&lima));
 
     // Run startup reconciliation.
     reconcile(&store, &lima);
 
-    let state = Arc::new(AppState { store, lima });
+    let state = Arc::new(AppState { store, lima, guest });
 
     // Remove stale socket file if it exists.
     if socket_path.exists() {
