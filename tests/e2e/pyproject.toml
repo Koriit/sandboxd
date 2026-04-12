@@ -1,0 +1,13 @@
+[project]
+name = "sandbox-e2e-tests"
+version = "0.1.0"
+description = "End-to-end tests for the claude-sandbox project"
+requires-python = ">=3.12"
+dependencies = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]

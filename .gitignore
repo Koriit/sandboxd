@@ -4,3 +4,11 @@
 .trash/
 *.swp
 .venv/
+
+# Rust build artifacts
+/sandboxd/target/
+
+# Python
+/tests/e2e/.venv/
+*.pyc
+__pycache__/
