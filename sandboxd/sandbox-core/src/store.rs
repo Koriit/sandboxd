@@ -728,9 +728,9 @@ mod tests {
         // Set network info.
         let net_info = crate::network::NetworkInfo {
             bridge_name: "sb-test123456".to_string(),
-            subnet: "10.209.0.0/30".to_string(),
-            gateway_ip: "10.209.0.1".to_string(),
-            vm_ip: "10.209.0.2".to_string(),
+            subnet: "10.209.0.0/28".to_string(),
+            gateway_ip: "10.209.0.2".to_string(),
+            vm_ip: "10.209.0.3".to_string(),
             docker_network_name: format!("sandbox-net-{}", session.id),
         };
 
@@ -760,9 +760,9 @@ mod tests {
 
         let net_info = crate::network::NetworkInfo {
             bridge_name: "sb-test".to_string(),
-            subnet: "10.209.0.0/30".to_string(),
-            gateway_ip: "10.209.0.1".to_string(),
-            vm_ip: "10.209.0.2".to_string(),
+            subnet: "10.209.0.0/28".to_string(),
+            gateway_ip: "10.209.0.2".to_string(),
+            vm_ip: "10.209.0.3".to_string(),
             docker_network_name: "sandbox-net-xxx".to_string(),
         };
 
@@ -795,16 +795,16 @@ mod tests {
         // Set network info on s1 and s2, leave s3 without.
         let info1 = crate::network::NetworkInfo {
             bridge_name: "sb-aaa".to_string(),
-            subnet: "10.209.0.0/30".to_string(),
-            gateway_ip: "10.209.0.1".to_string(),
-            vm_ip: "10.209.0.2".to_string(),
+            subnet: "10.209.0.0/28".to_string(),
+            gateway_ip: "10.209.0.2".to_string(),
+            vm_ip: "10.209.0.3".to_string(),
             docker_network_name: format!("sandbox-net-{}", s1.id),
         };
         let info2 = crate::network::NetworkInfo {
             bridge_name: "sb-bbb".to_string(),
-            subnet: "10.209.0.4/30".to_string(),
-            gateway_ip: "10.209.0.5".to_string(),
-            vm_ip: "10.209.0.6".to_string(),
+            subnet: "10.209.0.16/28".to_string(),
+            gateway_ip: "10.209.0.18".to_string(),
+            vm_ip: "10.209.0.19".to_string(),
             docker_network_name: format!("sandbox-net-{}", s2.id),
         };
 

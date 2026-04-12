@@ -18,11 +18,11 @@ use crate::error::SandboxError;
 pub struct NetworkInfo {
     /// Kernel bridge interface name (max 15 chars): `sb-{session_id[0..11]}`.
     pub bridge_name: String,
-    /// Subnet in CIDR notation, e.g. `"10.209.0.0/30"`.
+    /// Subnet in CIDR notation, e.g. `"10.209.0.0/28"`.
     pub subnet: String,
-    /// Gateway IP (the `.1` in the /30), assigned to the bridge.
+    /// Gateway container IP (the `.2` in the /28). Docker bridge claims `.1`.
     pub gateway_ip: String,
-    /// VM IP (the `.2` in the /30), to be assigned to the VM's veth.
+    /// VM IP (the `.3` in the /28), to be assigned to the VM's veth.
     pub vm_ip: String,
     /// Docker network name: `sandbox-net-{session_id}`.
     pub docker_network_name: String,
@@ -32,12 +32,13 @@ pub struct NetworkInfo {
 // SubnetAllocator
 // ---------------------------------------------------------------------------
 
-/// Carves /30 subnets from a base range.
+/// Carves /28 subnets from a base range.
 ///
-/// Each /30 has 4 addresses:
-///   .0 = network, .1 = gateway, .2 = VM, .3 = broadcast
+/// Each /28 has 16 addresses:
+///   .0 = network, .1 = Docker bridge gateway (auto-claimed),
+///   .2 = gateway container, .3 = VM, .4-.14 = unused, .15 = broadcast
 ///
-/// A /24 base provides 64 /30 blocks (256 / 4).
+/// A /24 base provides 16 /28 blocks (256 / 16).
 #[derive(Debug)]
 struct SubnetAllocator {
     /// Base network address, e.g. `10.209.0.0`.
@@ -45,29 +46,29 @@ struct SubnetAllocator {
     /// Prefix length of the base range (e.g. 24). Retained for diagnostics.
     #[allow(dead_code)]
     prefix_len: u8,
-    /// Set of allocated /30 block indices (0..max_blocks).
+    /// Set of allocated /28 block indices (0..max_blocks).
     allocated: HashSet<u8>,
-    /// Maximum number of /30 blocks: 2^(32 - prefix_len) / 4.
+    /// Maximum number of /28 blocks: 2^(32 - prefix_len) / 16.
     max_blocks: u8,
 }
 
 impl SubnetAllocator {
     /// Create a new allocator for the given base range.
     ///
-    /// `prefix_len` must be <= 30 (a /30 is the smallest usable subnet).
-    /// The number of /30 blocks is `2^(32 - prefix_len) / 4`.
+    /// `prefix_len` must be <= 28 (a /28 is the smallest usable subnet).
+    /// The number of /28 blocks is `2^(32 - prefix_len) / 16`.
     fn new(base: Ipv4Addr, prefix_len: u8) -> Result<Self, SandboxError> {
-        if prefix_len > 30 {
+        if prefix_len > 28 {
             return Err(SandboxError::Network(format!(
-                "prefix length {prefix_len} is too large; maximum is 30"
+                "prefix length {prefix_len} is too large; maximum is 28"
             )));
         }
 
         let host_bits = 32 - prefix_len;
         // Total addresses in the range.
         let total_addrs: u32 = 1 << host_bits;
-        // Each /30 uses 4 addresses.
-        let max_blocks = total_addrs / 4;
+        // Each /28 uses 16 addresses.
+        let max_blocks = total_addrs / 16;
 
         // We store the block index as u8, so cap at 255.
         if max_blocks > 255 {
@@ -84,7 +85,7 @@ impl SubnetAllocator {
         })
     }
 
-    /// Allocate the next available /30 block.
+    /// Allocate the next available /28 block.
     ///
     /// Returns `(block_index, subnet_base, gateway_ip, vm_ip)`.
     fn allocate(&mut self) -> Result<(u8, Ipv4Addr, Ipv4Addr, Ipv4Addr), SandboxError> {
@@ -93,7 +94,7 @@ impl SubnetAllocator {
             .find(|idx| !self.allocated.contains(idx))
             .ok_or_else(|| {
                 SandboxError::Network(format!(
-                    "subnet pool exhausted: all {} /30 blocks are allocated",
+                    "subnet pool exhausted: all {} /28 blocks are allocated",
                     self.max_blocks
                 ))
             })?;
@@ -101,15 +102,16 @@ impl SubnetAllocator {
         self.allocated.insert(block_idx);
 
         let base_u32 = u32::from(self.base);
-        let offset = (block_idx as u32) * 4;
+        let offset = (block_idx as u32) * 16;
         let subnet_base = Ipv4Addr::from(base_u32 + offset);
-        let gateway_ip = Ipv4Addr::from(base_u32 + offset + 1);
-        let vm_ip = Ipv4Addr::from(base_u32 + offset + 2);
+        // .1 is claimed by Docker bridge; .2 = gateway container, .3 = VM
+        let gateway_ip = Ipv4Addr::from(base_u32 + offset + 2);
+        let vm_ip = Ipv4Addr::from(base_u32 + offset + 3);
 
         Ok((block_idx, subnet_base, gateway_ip, vm_ip))
     }
 
-    /// Release a /30 block back to the pool.
+    /// Release a /28 block back to the pool.
     fn release(&mut self, block_idx: u8) {
         self.allocated.remove(&block_idx);
     }
@@ -136,11 +138,11 @@ impl SubnetAllocator {
         }
 
         let offset = addr_u32 - base_u32;
-        if offset % 4 != 0 {
+        if offset % 16 != 0 {
             return None;
         }
 
-        let idx = offset / 4;
+        let idx = offset / 16;
         if idx >= self.max_blocks as u32 {
             return None;
         }
@@ -153,9 +155,9 @@ impl SubnetAllocator {
 // NetworkManager
 // ---------------------------------------------------------------------------
 
-/// Manages per-session Docker bridge networks with /30 subnets.
+/// Manages per-session Docker bridge networks with /28 subnets.
 ///
-/// Each session gets an isolated Docker bridge network with a unique /30
+/// Each session gets an isolated Docker bridge network with a unique /28
 /// subnet carved from a configurable base range (default `10.209.0.0/24`).
 pub struct NetworkManager {
     subnet_allocator: Mutex<SubnetAllocator>,
@@ -166,7 +168,7 @@ pub struct NetworkManager {
 impl NetworkManager {
     /// Create a new `NetworkManager` with the given base range.
     ///
-    /// Default: `10.209.0.0/24` provides 64 /30 subnets.
+    /// Default: `10.209.0.0/24` provides 16 /28 subnets.
     pub fn new(base: Ipv4Addr, prefix_len: u8) -> Result<Self, SandboxError> {
         let allocator = SubnetAllocator::new(base, prefix_len)?;
         Ok(Self {
@@ -183,7 +185,7 @@ impl NetworkManager {
     /// Rebuild allocator state from existing `NetworkInfo` entries.
     ///
     /// Call this on daemon startup after loading sessions from the store.
-    /// For each session that has a `NetworkInfo`, the corresponding /30 block
+    /// For each session that has a `NetworkInfo`, the corresponding /28 block
     /// is marked as allocated.
     pub fn restore_from_infos(
         &self,
@@ -214,7 +216,7 @@ impl NetworkManager {
 
     /// Create a Docker bridge network for the given session.
     ///
-    /// Allocates a /30 subnet, shells out to `docker network create`, and
+    /// Allocates a /28 subnet, shells out to `docker network create`, and
     /// returns the resulting `NetworkInfo`.
     pub fn create_network(&self, session_id: &Uuid) -> Result<NetworkInfo, SandboxError> {
         // Check if the session already has a network.
@@ -230,7 +232,7 @@ impl NetworkManager {
             }
         }
 
-        // Allocate a /30 subnet.
+        // Allocate a /28 subnet.
         let (block_idx, subnet_base, gateway_ip, vm_ip) = {
             let mut alloc = self.subnet_allocator.lock().map_err(|e| {
                 SandboxError::Internal(format!("lock poisoned: {e}"))
@@ -243,7 +245,7 @@ impl NetworkManager {
         let short_id = &session_str[..11.min(session_str.len())];
         let bridge_name = format!("sb-{short_id}");
         let docker_network_name = format!("sandbox-net-{session_id}");
-        let subnet = format!("{subnet_base}/30");
+        let subnet = format!("{subnet_base}/28");
 
         let info = NetworkInfo {
             bridge_name: bridge_name.clone(),
@@ -385,7 +387,7 @@ impl NetworkManager {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Parse the base address from a CIDR string like `"10.209.0.4/30"`.
+/// Parse the base address from a CIDR string like `"10.209.0.16/28"`.
 fn parse_subnet_base(cidr: &str) -> Result<Ipv4Addr, SandboxError> {
     let addr_str = cidr
         .split('/')
@@ -414,8 +416,8 @@ mod tests {
         let (idx, subnet_base, gateway, vm) = alloc.allocate().unwrap();
         assert_eq!(idx, 0);
         assert_eq!(subnet_base, Ipv4Addr::new(10, 209, 0, 0));
-        assert_eq!(gateway, Ipv4Addr::new(10, 209, 0, 1));
-        assert_eq!(vm, Ipv4Addr::new(10, 209, 0, 2));
+        assert_eq!(gateway, Ipv4Addr::new(10, 209, 0, 2));
+        assert_eq!(vm, Ipv4Addr::new(10, 209, 0, 3));
     }
 
     #[test]
@@ -432,18 +434,18 @@ mod tests {
         assert_eq!(idx1, 1);
         assert_eq!(idx2, 2);
 
-        // Verify no IP overlap.
+        // Verify no IP overlap (each /28 block = 16 addresses).
         assert_eq!(base0, Ipv4Addr::new(10, 209, 0, 0));
-        assert_eq!(base1, Ipv4Addr::new(10, 209, 0, 4));
-        assert_eq!(base2, Ipv4Addr::new(10, 209, 0, 8));
+        assert_eq!(base1, Ipv4Addr::new(10, 209, 0, 16));
+        assert_eq!(base2, Ipv4Addr::new(10, 209, 0, 32));
 
-        assert_eq!(gw0, Ipv4Addr::new(10, 209, 0, 1));
-        assert_eq!(gw1, Ipv4Addr::new(10, 209, 0, 5));
-        assert_eq!(gw2, Ipv4Addr::new(10, 209, 0, 9));
+        assert_eq!(gw0, Ipv4Addr::new(10, 209, 0, 2));
+        assert_eq!(gw1, Ipv4Addr::new(10, 209, 0, 18));
+        assert_eq!(gw2, Ipv4Addr::new(10, 209, 0, 34));
 
-        assert_eq!(vm0, Ipv4Addr::new(10, 209, 0, 2));
-        assert_eq!(vm1, Ipv4Addr::new(10, 209, 0, 6));
-        assert_eq!(vm2, Ipv4Addr::new(10, 209, 0, 10));
+        assert_eq!(vm0, Ipv4Addr::new(10, 209, 0, 3));
+        assert_eq!(vm1, Ipv4Addr::new(10, 209, 0, 19));
+        assert_eq!(vm2, Ipv4Addr::new(10, 209, 0, 35));
     }
 
     #[test]
@@ -463,15 +465,15 @@ mod tests {
         let (reused_idx, base, gw, vm) = alloc.allocate().unwrap();
         assert_eq!(reused_idx, 0);
         assert_eq!(base, Ipv4Addr::new(10, 209, 0, 0));
-        assert_eq!(gw, Ipv4Addr::new(10, 209, 0, 1));
-        assert_eq!(vm, Ipv4Addr::new(10, 209, 0, 2));
+        assert_eq!(gw, Ipv4Addr::new(10, 209, 0, 2));
+        assert_eq!(vm, Ipv4Addr::new(10, 209, 0, 3));
     }
 
     #[test]
     fn test_pool_exhaustion() {
-        // Use a /30 base — that gives exactly 1 /30 block.
+        // Use a /28 base -- that gives exactly 1 /28 block.
         let mut alloc =
-            SubnetAllocator::new(Ipv4Addr::new(10, 209, 0, 0), 30).unwrap();
+            SubnetAllocator::new(Ipv4Addr::new(10, 209, 0, 0), 28).unwrap();
 
         assert_eq!(alloc.max_blocks, 1);
 
@@ -491,19 +493,19 @@ mod tests {
 
     #[test]
     fn test_pool_exhaustion_full_24() {
-        // A /24 gives 64 /30 blocks.
+        // A /24 gives 16 /28 blocks.
         let mut alloc =
             SubnetAllocator::new(Ipv4Addr::new(10, 209, 0, 0), 24).unwrap();
 
-        assert_eq!(alloc.max_blocks, 64);
+        assert_eq!(alloc.max_blocks, 16);
 
-        // Allocate all 64 blocks.
-        for i in 0..64u8 {
+        // Allocate all 16 blocks.
+        for i in 0..16u8 {
             let (idx, _, _, _) = alloc.allocate().unwrap();
             assert_eq!(idx, i);
         }
 
-        // 65th allocation should fail.
+        // 17th allocation should fail.
         let result = alloc.allocate();
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -520,15 +522,15 @@ mod tests {
             Some(0)
         );
         assert_eq!(
-            alloc.block_index_for(Ipv4Addr::new(10, 209, 0, 4)),
+            alloc.block_index_for(Ipv4Addr::new(10, 209, 0, 16)),
             Some(1)
         );
         assert_eq!(
-            alloc.block_index_for(Ipv4Addr::new(10, 209, 0, 252)),
-            Some(63)
+            alloc.block_index_for(Ipv4Addr::new(10, 209, 0, 240)),
+            Some(15)
         );
 
-        // Not on a /30 boundary.
+        // Not on a /28 boundary.
         assert_eq!(
             alloc.block_index_for(Ipv4Addr::new(10, 209, 0, 3)),
             None
@@ -547,7 +549,7 @@ mod tests {
 
     #[test]
     fn test_invalid_prefix_len() {
-        let result = SubnetAllocator::new(Ipv4Addr::new(10, 0, 0, 0), 31);
+        let result = SubnetAllocator::new(Ipv4Addr::new(10, 0, 0, 0), 29);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("too large"));
@@ -576,15 +578,15 @@ mod tests {
 
         let info = NetworkInfo {
             bridge_name: bridge_name.clone(),
-            subnet: format!("{subnet_base}/30"),
+            subnet: format!("{subnet_base}/28"),
             gateway_ip: gateway_ip.to_string(),
             vm_ip: vm_ip.to_string(),
             docker_network_name: docker_network_name.clone(),
         };
 
-        assert_eq!(info.subnet, "10.209.0.0/30");
-        assert_eq!(info.gateway_ip, "10.209.0.1");
-        assert_eq!(info.vm_ip, "10.209.0.2");
+        assert_eq!(info.subnet, "10.209.0.0/28");
+        assert_eq!(info.gateway_ip, "10.209.0.2");
+        assert_eq!(info.vm_ip, "10.209.0.3");
         assert!(info.bridge_name.starts_with("sb-"));
         assert!(info.docker_network_name.starts_with("sandbox-net-"));
     }
@@ -612,9 +614,9 @@ mod tests {
     fn test_network_info_serialization() {
         let info = NetworkInfo {
             bridge_name: "sb-550e8400-e2".to_string(),
-            subnet: "10.209.0.0/30".to_string(),
-            gateway_ip: "10.209.0.1".to_string(),
-            vm_ip: "10.209.0.2".to_string(),
+            subnet: "10.209.0.0/28".to_string(),
+            gateway_ip: "10.209.0.2".to_string(),
+            vm_ip: "10.209.0.3".to_string(),
             docker_network_name: "sandbox-net-550e8400-e29b-41d4-a716-446655440000"
                 .to_string(),
         };
@@ -642,17 +644,17 @@ mod tests {
 
         let info1 = NetworkInfo {
             bridge_name: "sb-aaaaaaaaaaa".to_string(),
-            subnet: "10.209.0.0/30".to_string(),
-            gateway_ip: "10.209.0.1".to_string(),
-            vm_ip: "10.209.0.2".to_string(),
+            subnet: "10.209.0.0/28".to_string(),
+            gateway_ip: "10.209.0.2".to_string(),
+            vm_ip: "10.209.0.3".to_string(),
             docker_network_name: format!("sandbox-net-{id1}"),
         };
 
         let info2 = NetworkInfo {
             bridge_name: "sb-bbbbbbbbbbb".to_string(),
-            subnet: "10.209.0.8/30".to_string(),
-            gateway_ip: "10.209.0.9".to_string(),
-            vm_ip: "10.209.0.10".to_string(),
+            subnet: "10.209.0.32/28".to_string(),
+            gateway_ip: "10.209.0.34".to_string(),
+            vm_ip: "10.209.0.35".to_string(),
             docker_network_name: format!("sandbox-net-{id2}"),
         };
 
@@ -663,7 +665,7 @@ mod tests {
         {
             let alloc = mgr.subnet_allocator.lock().unwrap();
             assert!(alloc.allocated.contains(&0)); // 10.209.0.0 -> block 0
-            assert!(alloc.allocated.contains(&2)); // 10.209.0.8 -> block 2
+            assert!(alloc.allocated.contains(&2)); // 10.209.0.32 -> block 2
             assert!(!alloc.allocated.contains(&1)); // block 1 should be free
         }
 
@@ -671,12 +673,12 @@ mod tests {
         let fetched1 = mgr.network_info(&id1).unwrap();
         assert!(fetched1.is_some());
         let fetched1 = fetched1.unwrap();
-        assert_eq!(fetched1.subnet, "10.209.0.0/30");
+        assert_eq!(fetched1.subnet, "10.209.0.0/28");
 
         let fetched2 = mgr.network_info(&id2).unwrap();
         assert!(fetched2.is_some());
         let fetched2 = fetched2.unwrap();
-        assert_eq!(fetched2.subnet, "10.209.0.8/30");
+        assert_eq!(fetched2.subnet, "10.209.0.32/28");
 
         // Verify that the next allocation skips restored blocks.
         // Block 0 and 2 are used, so next free is block 1.
@@ -685,7 +687,7 @@ mod tests {
             alloc.allocate().unwrap()
         };
         assert_eq!(idx, 1);
-        assert_eq!(base, Ipv4Addr::new(10, 209, 0, 4));
+        assert_eq!(base, Ipv4Addr::new(10, 209, 0, 16));
     }
 
     #[test]
@@ -700,14 +702,14 @@ mod tests {
     #[test]
     fn test_parse_subnet_base() {
         assert_eq!(
-            parse_subnet_base("10.209.0.0/30").unwrap(),
+            parse_subnet_base("10.209.0.0/28").unwrap(),
             Ipv4Addr::new(10, 209, 0, 0)
         );
         assert_eq!(
-            parse_subnet_base("10.209.0.4/30").unwrap(),
-            Ipv4Addr::new(10, 209, 0, 4)
+            parse_subnet_base("10.209.0.16/28").unwrap(),
+            Ipv4Addr::new(10, 209, 0, 16)
         );
-        assert!(parse_subnet_base("not-an-ip/30").is_err());
+        assert!(parse_subnet_base("not-an-ip/28").is_err());
     }
 
     // -- Docker integration tests (require Docker daemon) --------------------
@@ -725,9 +727,9 @@ mod tests {
 
         assert!(info.bridge_name.starts_with("sb-"));
         assert!(info.docker_network_name.starts_with("sandbox-net-"));
-        assert_eq!(info.subnet, "10.209.1.0/30");
-        assert_eq!(info.gateway_ip, "10.209.1.1");
-        assert_eq!(info.vm_ip, "10.209.1.2");
+        assert_eq!(info.subnet, "10.209.1.0/28");
+        assert_eq!(info.gateway_ip, "10.209.1.2");
+        assert_eq!(info.vm_ip, "10.209.1.3");
 
         // Verify with docker network inspect.
         let output = Command::new("docker")
@@ -738,11 +740,11 @@ mod tests {
         assert!(output.status.success(), "docker inspect failed");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            stdout.contains("10.209.1.0/30"),
+            stdout.contains("10.209.1.0/28"),
             "inspect output should contain subnet: {stdout}"
         );
         assert!(
-            stdout.contains("10.209.1.1"),
+            stdout.contains("10.209.1.2"),
             "inspect output should contain gateway: {stdout}"
         );
 
