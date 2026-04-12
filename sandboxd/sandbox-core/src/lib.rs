@@ -1,5 +1,6 @@
 pub mod api;
 pub mod error;
+pub mod gateway;
 pub mod guest;
 pub mod lima;
 pub mod network;
@@ -8,6 +9,7 @@ pub mod store;
 
 pub use api::{CreateSessionRequest, ExecRequest, ExecResponse, SessionResponse};
 pub use error::{ApiError, SandboxError};
+pub use gateway::{GatewayManager, GatewayStatus};
 pub use guest::{
     GuestConnector, GuestRequest, GuestResponse, GUEST_AGENT_PORT, MAX_MESSAGE_SIZE,
     read_message, write_message,
