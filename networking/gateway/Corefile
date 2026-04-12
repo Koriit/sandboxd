@@ -1,0 +1,15 @@
+# CoreDNS configuration — pass-through mode
+#
+# Forwards all DNS queries to upstream resolvers.
+# Logs all queries for observability.
+# Health endpoint on :8180 for container health checks.
+#
+# In M4, the custom policy plugin will replace the forward-all behavior
+# with domain-based allow/deny and IP-to-domain reporting.
+
+. {
+    forward . 8.8.8.8 8.8.4.4
+    log
+    health :8180
+    ready :8181
+}

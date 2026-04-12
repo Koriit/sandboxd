@@ -10,7 +10,7 @@ test-e2e:
 	cd tests/e2e && . .venv/bin/activate && python -m pytest -v
 
 gateway-image:
-	docker build -t sandbox-gateway networking/gateway/
+	docker build -t sandbox-gateway -f networking/gateway/Dockerfile networking/
 
 clean:
 	cd sandboxd && cargo clean
