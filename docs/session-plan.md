@@ -45,7 +45,9 @@ claude-sandbox/
 
 ### Sequential sessions
 
-All sessions execute sequentially. Each session is implemented by a subagent delegated from the main orchestrating agent. There are no parallel branches or consolidation points.
+Sessions are linearized for single-agent tracking. Some sessions could theoretically run in parallel based on their entry criteria, but we execute one at a time in session-number order. Each session is implemented by a subagent delegated from the main orchestrating agent.
+
+M9 (macOS) is an independent track that can be interleaved or appended when macOS hardware is available.
 
 ### Branch model
 
@@ -63,6 +65,8 @@ The `/session-tracking` skill (`.claude/skills/session-tracking/`) manages `.tas
 The orchestrator follows a two-phase protocol: during a session, it appends entries to `current_log`; at session close, it distills these into a permanent `log` entry. Appending structured JSON entries is trivially reliable even under heavy context degradation — no synthesis required until session close, when the orchestrator has fresh context from the subagent's completion signal.
 
 Format reference: `.claude/skills/session-tracking/progress-schema.json`
+
+Initialize with `progress init --total-sessions 30` (the Linux critical path: M0 through M8). M9 (macOS) is a separate track — add it via `replan` when macOS work begins.
 
 ### Context recovery
 
@@ -844,4 +848,4 @@ Tests require a Linux host with KVM and Docker.
 | M9 | 2 |
 | **Total** | **32** |
 
-Critical path (Linux): 30 sequential sessions (M0 through M8). M9 (macOS) is an independent track (2 sessions) that can execute whenever macOS hardware is available.
+Linux critical path: 30 sessions (M0 through M8). M9 (macOS) is an independent track (2 sessions) that can be interleaved or appended when macOS hardware is available.

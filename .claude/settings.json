@@ -1,6 +1,7 @@
 {
   "enabledPlugins": {
-    	"kio-plugins@kio-plugins": true,
-	"kio-development@kio-plugins": true
+    "kio-plugins@kio-plugins": true,
+    "kio-development@kio-plugins": true,
+    "session-tracking@my-plugins": true
   }
 }
