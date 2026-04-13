@@ -13,3 +13,5 @@
 /tests/e2e/.venv/
 *.pyc
 __pycache__/
+
+.claude/*.local.md

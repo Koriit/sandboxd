@@ -172,6 +172,8 @@ make test          # Unit and integration tests (cargo test)
 make test-e2e      # End-to-end tests (pytest, requires running daemon)
 ```
 
+`make test-e2e` automatically creates a Python virtualenv in `tests/e2e/.venv/` on first run and reinstalls dependencies when `tests/e2e/pyproject.toml` changes. No manual venv setup is needed.
+
 ## First run
 
 ### 1. Start the daemon
