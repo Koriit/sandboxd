@@ -380,6 +380,156 @@ impl NetworkManager {
         Ok(nets.get(session_id).map(|(_, info)| info.clone()))
     }
 
+    /// Ensure the Docker bridge network exists for a session with existing
+    /// `NetworkInfo`.
+    ///
+    /// Unlike `create_network`, this does NOT allocate a new subnet. It uses
+    /// the `NetworkInfo` already tracked in the manager's in-memory map
+    /// (typically restored from DB at startup via `restore_from_infos`).
+    ///
+    /// If the Docker network already exists, this is a no-op. If it was
+    /// removed (e.g. during `stop`), it is recreated with the same subnet.
+    pub fn ensure_network(&self, session_id: &Uuid) -> Result<NetworkInfo, SandboxError> {
+        let info = {
+            let nets = self.networks.lock().map_err(|e| {
+                SandboxError::Internal(format!("lock poisoned: {e}"))
+            })?;
+            nets.get(session_id)
+                .map(|(_, info)| info.clone())
+                .ok_or_else(|| {
+                    SandboxError::Network(format!(
+                        "no network info tracked for session {session_id}"
+                    ))
+                })?
+        };
+
+        // Check if the Docker network already exists.
+        let check = Command::new("docker")
+            .args(["network", "inspect", &info.docker_network_name])
+            .output()
+            .map_err(|e| {
+                SandboxError::Network(format!(
+                    "failed to run docker network inspect: {e}"
+                ))
+            })?;
+
+        if check.status.success() {
+            debug!(
+                session_id = %session_id,
+                network = %info.docker_network_name,
+                "Docker bridge network already exists"
+            );
+            return Ok(info);
+        }
+
+        // Network does not exist -- recreate it with the same subnet.
+        info!(
+            session_id = %session_id,
+            network = %info.docker_network_name,
+            subnet = %info.subnet,
+            bridge = %info.bridge_name,
+            "recreating Docker bridge network"
+        );
+
+        let output = Command::new("docker")
+            .args([
+                "network",
+                "create",
+                "--driver",
+                "bridge",
+                "--subnet",
+                &info.subnet,
+                "--label",
+                &format!("sandbox.session_id={session_id}"),
+                "--opt",
+                &format!("com.docker.network.bridge.name={}", info.bridge_name),
+                &info.docker_network_name,
+            ])
+            .output()
+            .map_err(|e| {
+                SandboxError::Network(format!(
+                    "failed to run docker network create: {e}"
+                ))
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SandboxError::Network(format!(
+                "docker network create failed for ensure_network: {stderr}"
+            )));
+        }
+
+        info!(
+            session_id = %session_id,
+            network = %info.docker_network_name,
+            "Docker bridge network recreated"
+        );
+
+        Ok(info)
+    }
+
+    /// Remove the Docker bridge network for a session without releasing the
+    /// subnet allocation or removing the in-memory tracking.
+    ///
+    /// Used during `stop` to free Docker resources while preserving the
+    /// ability to recreate the same network on `start`. The subnet stays
+    /// allocated so it cannot be reused by another session.
+    ///
+    /// If the Docker network does not exist, this is a no-op (returns Ok).
+    pub fn remove_docker_network(&self, session_id: &Uuid) -> Result<(), SandboxError> {
+        let info = {
+            let nets = self.networks.lock().map_err(|e| {
+                SandboxError::Internal(format!("lock poisoned: {e}"))
+            })?;
+            match nets.get(session_id) {
+                Some((_, info)) => info.clone(),
+                None => {
+                    debug!(
+                        session_id = %session_id,
+                        "no network tracked for session, nothing to remove"
+                    );
+                    return Ok(());
+                }
+            }
+        };
+
+        debug!(
+            session_id = %session_id,
+            network = %info.docker_network_name,
+            "removing Docker bridge network (keeping allocation)"
+        );
+
+        let output = Command::new("docker")
+            .args(["network", "rm", &info.docker_network_name])
+            .output()
+            .map_err(|e| {
+                SandboxError::Network(format!("failed to run docker network rm: {e}"))
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // If the network doesn't exist, that's fine.
+            if stderr.contains("not found") || stderr.contains("No such network") {
+                debug!(
+                    session_id = %session_id,
+                    "Docker network already removed"
+                );
+                return Ok(());
+            }
+            return Err(SandboxError::Network(format!(
+                "docker network rm failed: {stderr}"
+            )));
+        }
+
+        info!(
+            session_id = %session_id,
+            network = %info.docker_network_name,
+            "Docker bridge network removed (allocation preserved)"
+        );
+
+        Ok(())
+    }
+
     // -- TAP device management ------------------------------------------------
 
     /// Create a TAP device on the host and bridge it to the Docker network.

@@ -10,7 +10,10 @@ pub mod session;
 pub mod store;
 pub mod vm_network;
 
-pub use api::{CreateSessionRequest, ExecRequest, ExecResponse, SessionResponse};
+pub use api::{
+    CreateSessionRequest, ExecRequest, ExecResponse, GatewayHealth,
+    NetworkHealth, SessionHealth, SessionResponse,
+};
 pub use ca::{CaManager, generate_ca_inject_script};
 pub use error::{ApiError, SandboxError};
 pub use gateway::{GatewayManager, GatewayStatus};

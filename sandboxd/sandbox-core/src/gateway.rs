@@ -263,8 +263,45 @@ impl GatewayManager {
         Ok(())
     }
 
-    /// Check gateway health by running the healthcheck script inside the container.
-    pub fn gateway_status(&self, session_id: &Uuid) -> Result<GatewayStatus, SandboxError> {
+    /// Restart a crashed or stopped gateway container.
+    ///
+    /// This removes the old container (best-effort) and creates a fresh one
+    /// with the full setup (nftables deny-all, component readiness, DNAT).
+    ///
+    /// This is preferred over `docker start` because the nftables rules live
+    /// in the container's network namespace, which is destroyed when the
+    /// container exits. A fresh container gets a new namespace that needs
+    /// the full rule injection sequence.
+    pub fn restart_gateway(
+        &self,
+        session_id: &Uuid,
+        network_info: &NetworkInfo,
+        ca_dir: Option<&Path>,
+    ) -> Result<(), SandboxError> {
+        info!(
+            session_id = %session_id,
+            "restarting gateway container"
+        );
+
+        // Remove old container (best-effort).
+        if let Err(e) = self.stop_gateway(session_id) {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "failed to stop old gateway during restart (may already be gone)"
+            );
+        }
+
+        // Create fresh container with full setup.
+        self.create_gateway(session_id, network_info, ca_dir)
+    }
+
+    /// Check gateway health by running the healthcheck script inside the
+    /// container.
+    pub fn gateway_status(
+        &self,
+        session_id: &Uuid,
+    ) -> Result<GatewayStatus, SandboxError> {
         let container_name = container_name(session_id);
 
         // First check if the container is running.
@@ -277,14 +314,17 @@ impl GatewayManager {
             ])
             .output()
             .map_err(|e| {
-                SandboxError::Gateway(format!("failed to run docker inspect: {e}"))
+                SandboxError::Gateway(format!(
+                    "failed to run docker inspect: {e}"
+                ))
             })?;
 
         if !output.status.success() {
             return Ok(GatewayStatus::NotRunning);
         }
 
-        let running = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let running =
+            String::from_utf8_lossy(&output.stdout).trim().to_string();
         if running != "true" {
             return Ok(GatewayStatus::NotRunning);
         }
@@ -294,15 +334,74 @@ impl GatewayManager {
             .args(["exec", &container_name, "/healthcheck.sh"])
             .output()
             .map_err(|e| {
-                SandboxError::Gateway(format!("failed to run healthcheck: {e}"))
+                SandboxError::Gateway(format!(
+                    "failed to run healthcheck: {e}"
+                ))
             })?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stdout =
+            String::from_utf8_lossy(&output.stdout).trim().to_string();
 
         if output.status.success() {
             Ok(GatewayStatus::Healthy)
         } else {
             Ok(GatewayStatus::Unhealthy(stdout))
+        }
+    }
+
+    /// Return the container status as a string: "running", "stopped", or
+    /// "not_found".
+    pub fn container_status_str(&self, session_id: &Uuid) -> String {
+        let container_name = container_name(session_id);
+
+        let output = Command::new("docker")
+            .args([
+                "inspect",
+                "--format",
+                "{{.State.Status}}",
+                &container_name,
+            ])
+            .output();
+
+        match output {
+            Ok(o) if o.status.success() => {
+                String::from_utf8_lossy(&o.stdout).trim().to_string()
+            }
+            _ => "not_found".to_string(),
+        }
+    }
+
+    /// Check the health of a single component inside the gateway container.
+    ///
+    /// Returns "healthy", "unhealthy", or "unknown" (if the container is not
+    /// running or the check cannot be performed).
+    pub fn component_health(
+        &self,
+        session_id: &Uuid,
+        component: &str,
+    ) -> String {
+        let container_name = container_name(session_id);
+
+        let check_cmd: &[&str] = match component {
+            "envoy" => {
+                &["curl", "-sf", "http://127.0.0.1:9901/ready"]
+            }
+            "coredns" => {
+                &["curl", "-sf", "http://127.0.0.1:8180/health"]
+            }
+            "mitmproxy" => &["pgrep", "-x", "mitmdump"],
+            _ => return "unknown".to_string(),
+        };
+
+        let mut args = vec!["exec", &container_name];
+        args.extend(check_cmd);
+
+        match Command::new("docker").args(&args).output() {
+            Ok(output) if output.status.success() => {
+                "healthy".to_string()
+            }
+            Ok(_) => "unhealthy".to_string(),
+            Err(_) => "unknown".to_string(),
         }
     }
 

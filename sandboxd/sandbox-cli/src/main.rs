@@ -1,11 +1,11 @@
 use std::process;
 
 use chrono::{DateTime, Utc};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use http_body_util::BodyExt;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
-use sandbox_core::{ApiError, ExecResponse, Session, SessionResponse};
+use sandbox_core::{ApiError, ExecResponse, Session, SessionHealth, SessionResponse};
 use tokio::net::UnixStream;
 
 /// CLI client for managing sandbox sessions.
@@ -75,6 +75,34 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
+    /// Stream gateway container logs.
+    Logs {
+        /// Session name or ID.
+        session: String,
+        /// Component to filter: envoy, mitmproxy, coredns, or all.
+        #[arg(long, default_value = "all")]
+        component: LogComponent,
+        /// Stream logs continuously (like docker logs -f).
+        #[arg(long, short)]
+        follow: bool,
+        /// Show last N lines (default: 100).
+        #[arg(long, default_value_t = 100)]
+        tail: u32,
+    },
+    /// Show detailed health status of a sandbox session.
+    Health {
+        /// Session name or ID.
+        session: String,
+    },
+}
+
+/// Log component filter for the `logs` subcommand.
+#[derive(Debug, Clone, ValueEnum)]
+enum LogComponent {
+    All,
+    Envoy,
+    Mitmproxy,
+    Coredns,
 }
 
 fn default_socket_path() -> String {
@@ -150,8 +178,13 @@ fn build_request(command: &Command) -> Option<Request<String>> {
                 .body(body.to_string())
                 .expect("failed to build request")
         }
-        // Ssh is handled specially -- not via a single HTTP request.
-        Command::Ssh { .. } => return None,
+        Command::Health { session } => Request::builder()
+            .method("GET")
+            .uri(format!("/sessions/{session}/health"))
+            .body(String::new())
+            .expect("failed to build request"),
+        // Ssh and Logs are handled specially -- not via a single HTTP request.
+        Command::Ssh { .. } | Command::Logs { .. } => return None,
     };
     Some(req)
 }
@@ -196,26 +229,28 @@ fn display_sessions_table(sessions: &[SessionResponse]) {
         return;
     }
 
-    // Header — use a pre-formatted constant to avoid clippy::print_literal.
-    const HEADER: &str =
-        "ID                                    NAME              STATE       AGENT        CREATED";
-    println!("{HEADER}");
+    // Header.
+    println!(
+        "{:<36}  {:<16}  {:<10}  {:<11}  {:<11}  CREATED",
+        "ID", "NAME", "STATE", "AGENT", "GATEWAY"
+    );
 
     for session in sessions {
-        let name = session
-            .name
-            .as_deref()
-            .unwrap_or("-");
+        let name = session.name.as_deref().unwrap_or("-");
         let state = session.state.to_string();
         let agent = session
             .guest_agent_status
             .as_deref()
             .unwrap_or("-");
+        let gateway = session
+            .gateway_status
+            .as_deref()
+            .unwrap_or("-");
         let created = format_relative_time(&session.created_at);
 
         println!(
-            "{:<36}  {:<16}  {:<10}  {:<11}  {created}",
-            session.id, name, state, agent
+            "{:<36}  {:<16}  {:<10}  {:<11}  {:<11}  {created}",
+            session.id, name, state, agent, gateway
         );
     }
 }
@@ -327,9 +362,24 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
                 process::exit(result.exit_code);
             }
         }
-        Command::Ssh { .. } => {
-            // Ssh is handled separately, should not reach here.
-            unreachable!("ssh command should be handled before send_request");
+        Command::Health { .. } => {
+            let health: SessionHealth = serde_json::from_str(body)
+                .map_err(|e| format!("failed to parse health response: {e}"))?;
+            println!("Session:   {}", health.session_id);
+            println!("VM:        {}", health.vm_status);
+            println!("Agent:     {}", health.guest_agent);
+            println!("Gateway:");
+            println!("  Container: {}", health.gateway.container_status);
+            println!("  Envoy:     {}", health.gateway.envoy);
+            println!("  mitmproxy: {}", health.gateway.mitmproxy);
+            println!("  CoreDNS:   {}", health.gateway.coredns);
+            println!("Network:");
+            println!("  Bridge:  {}", if health.network.bridge_exists { "exists" } else { "missing" });
+            println!("  TAP:     {}", if health.network.tap_exists { "exists" } else { "missing" });
+        }
+        Command::Ssh { .. } | Command::Logs { .. } => {
+            // Ssh and Logs are handled separately, should not reach here.
+            unreachable!("ssh/logs commands should be handled before send_request");
         }
     }
 
@@ -396,6 +446,91 @@ async fn handle_ssh(socket_path: &str, session: &str, command: &[String]) {
     }
 }
 
+/// Handle the `logs` subcommand: resolve session via daemon API, then exec
+/// `docker logs` for the gateway container.
+async fn handle_logs(
+    socket_path: &str,
+    session: &str,
+    component: &LogComponent,
+    follow: bool,
+    tail: u32,
+) {
+    // Resolve the session name/id to a Session via the daemon API.
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/sessions/{session}"))
+        .body(String::new())
+        .expect("failed to build request");
+
+    let (status, body) = match send_request(socket_path, req).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{e}");
+            process::exit(1);
+        }
+    };
+
+    if !status.is_success() {
+        if let Ok(api_err) = serde_json::from_str::<ApiError>(&body) {
+            eprintln!("Error: {}", api_err.error);
+        } else {
+            eprintln!("Error ({status}): {body}");
+        }
+        process::exit(1);
+    }
+
+    let session_resp: SessionResponse = match serde_json::from_str(&body) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to parse session response: {e}");
+            process::exit(1);
+        }
+    };
+
+    let container_name = format!("sandbox-gw-{}", session_resp.id);
+
+    let mut cmd = std::process::Command::new("docker");
+
+    match component {
+        LogComponent::All => {
+            // Use docker logs for the entrypoint's stdout/stderr output.
+            cmd.arg("logs");
+            cmd.arg("--tail").arg(tail.to_string());
+            if follow {
+                cmd.arg("-f");
+            }
+            cmd.arg(&container_name);
+        }
+        _ => {
+            // Components log to individual files inside the container.
+            let log_file = match component {
+                LogComponent::Envoy => "/var/log/gateway/envoy.log",
+                LogComponent::Mitmproxy => "/var/log/gateway/mitmproxy.log",
+                LogComponent::Coredns => "/var/log/gateway/coredns.log",
+                LogComponent::All => unreachable!(),
+            };
+            cmd.arg("exec").arg(&container_name);
+            cmd.arg("tail");
+            cmd.arg("-n").arg(tail.to_string());
+            if follow {
+                cmd.arg("-f");
+            }
+            cmd.arg(log_file);
+        }
+    }
+
+    // Inherit stdin/stdout/stderr so output streams to the terminal.
+    match cmd.status() {
+        Ok(exit_status) => {
+            process::exit(exit_status.code().unwrap_or(1));
+        }
+        Err(e) => {
+            eprintln!("Failed to execute docker: {e}");
+            process::exit(1);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -406,10 +541,23 @@ async fn main() {
         return;
     }
 
+    // Handle logs specially — it streams output and doesn't use the normal
+    // request/response flow.
+    if let Command::Logs {
+        session,
+        component,
+        follow,
+        tail,
+    } = &cli.command
+    {
+        handle_logs(&cli.socket, session, component, *follow, *tail).await;
+        return;
+    }
+
     let req = match build_request(&cli.command) {
         Some(r) => r,
         None => {
-            // Should not happen — ssh is handled above.
+            // Should not happen — ssh and logs are handled above.
             eprintln!("Internal error: unhandled command");
             process::exit(1);
         }
@@ -719,5 +867,131 @@ mod tests {
         let dt = now - chrono::Duration::days(7);
         let result = format_relative_time(&dt);
         assert_eq!(result, "7d ago");
+    }
+
+    #[test]
+    fn parse_logs_defaults() {
+        let cli = Cli::parse_from(["sandbox", "logs", "my-session"]);
+        match &cli.command {
+            Command::Logs {
+                session,
+                component,
+                follow,
+                tail,
+            } => {
+                assert_eq!(session, "my-session");
+                assert!(matches!(component, LogComponent::All));
+                assert!(!follow);
+                assert_eq!(*tail, 100);
+            }
+            _ => panic!("expected Logs command"),
+        }
+    }
+
+    #[test]
+    fn parse_logs_with_component() {
+        let cli = Cli::parse_from([
+            "sandbox",
+            "logs",
+            "my-session",
+            "--component",
+            "envoy",
+        ]);
+        match &cli.command {
+            Command::Logs {
+                session, component, ..
+            } => {
+                assert_eq!(session, "my-session");
+                assert!(matches!(component, LogComponent::Envoy));
+            }
+            _ => panic!("expected Logs command"),
+        }
+    }
+
+    #[test]
+    fn parse_logs_with_follow_and_tail() {
+        let cli = Cli::parse_from([
+            "sandbox",
+            "logs",
+            "my-session",
+            "--follow",
+            "--tail",
+            "50",
+        ]);
+        match &cli.command {
+            Command::Logs {
+                follow, tail, ..
+            } => {
+                assert!(*follow);
+                assert_eq!(*tail, 50);
+            }
+            _ => panic!("expected Logs command"),
+        }
+    }
+
+    #[test]
+    fn parse_logs_component_mitmproxy() {
+        let cli = Cli::parse_from([
+            "sandbox",
+            "logs",
+            "my-session",
+            "--component",
+            "mitmproxy",
+        ]);
+        match &cli.command {
+            Command::Logs { component, .. } => {
+                assert!(matches!(component, LogComponent::Mitmproxy));
+            }
+            _ => panic!("expected Logs command"),
+        }
+    }
+
+    #[test]
+    fn parse_logs_component_coredns() {
+        let cli = Cli::parse_from([
+            "sandbox",
+            "logs",
+            "my-session",
+            "--component",
+            "coredns",
+        ]);
+        match &cli.command {
+            Command::Logs { component, .. } => {
+                assert!(matches!(component, LogComponent::Coredns));
+            }
+            _ => panic!("expected Logs command"),
+        }
+    }
+
+    #[test]
+    fn parse_health() {
+        let cli = Cli::parse_from(["sandbox", "health", "my-session"]);
+        match &cli.command {
+            Command::Health { session } => {
+                assert_eq!(session, "my-session");
+            }
+            _ => panic!("expected Health command"),
+        }
+    }
+
+    #[test]
+    fn build_health_request() {
+        let cmd = Command::Health {
+            session: "abc".into(),
+        };
+        let req = build_request(&cmd).expect("should produce request");
+        assert_eq!(req.method(), "GET");
+        assert_eq!(req.uri(), "/sessions/abc/health");
+    }
+
+    #[test]
+    fn build_logs_returns_none() {
+        let cmd = Command::Logs {
+            session: "abc".into(),
+            component: LogComponent::All,
+            follow: false,
+            tail: 100,
+        };
+        assert!(build_request(&cmd).is_none());
     }
 }

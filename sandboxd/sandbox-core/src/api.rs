@@ -2,6 +2,36 @@ use serde::{Deserialize, Serialize};
 
 use crate::session::{Session, SessionConfig, SessionState};
 
+// ---------------------------------------------------------------------------
+// Health types
+// ---------------------------------------------------------------------------
+
+/// Detailed health status for a sandbox session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionHealth {
+    pub session_id: uuid::Uuid,
+    pub vm_status: String,
+    pub guest_agent: String,
+    pub gateway: GatewayHealth,
+    pub network: NetworkHealth,
+}
+
+/// Health status of gateway components.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayHealth {
+    pub container_status: String,
+    pub envoy: String,
+    pub mitmproxy: String,
+    pub coredns: String,
+}
+
+/// Health status of network resources.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkHealth {
+    pub bridge_exists: bool,
+    pub tap_exists: bool,
+}
+
 /// Request body for `POST /sessions`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct CreateSessionRequest {
@@ -48,6 +78,9 @@ pub struct SessionResponse {
     /// Guest agent connectivity status: "connected", "unreachable", or null.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guest_agent_status: Option<String>,
+    /// Gateway container status: "running", "stopped", "not_found", or null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_status: Option<String>,
 }
 
 impl SessionResponse {
@@ -61,11 +94,16 @@ impl SessionResponse {
             updated_at: session.updated_at,
             config: session.config,
             guest_agent_status: None,
+            gateway_status: None,
         }
     }
 
-    /// Create from a `Session` with guest agent status.
-    pub fn from_session_with_status(session: Session, status: Option<String>) -> Self {
+    /// Create from a `Session` with guest agent and gateway status.
+    pub fn from_session_with_status(
+        session: Session,
+        agent_status: Option<String>,
+        gateway_status: Option<String>,
+    ) -> Self {
         Self {
             id: session.id,
             name: session.name,
@@ -73,7 +111,8 @@ impl SessionResponse {
             created_at: session.created_at,
             updated_at: session.updated_at,
             config: session.config,
-            guest_agent_status: status,
+            guest_agent_status: agent_status,
+            gateway_status,
         }
     }
 }
@@ -165,9 +204,11 @@ mod tests {
         let resp = SessionResponse::from_session_with_status(
             session.clone(),
             Some("connected".into()),
+            Some("healthy".into()),
         );
         assert_eq!(resp.id, session.id);
         assert_eq!(resp.guest_agent_status, Some("connected".into()));
+        assert_eq!(resp.gateway_status, Some("healthy".into()));
     }
 
     #[test]
@@ -175,8 +216,105 @@ mod tests {
         let session = Session::new(None);
         let resp = SessionResponse::from_session(session);
         let json = serde_json::to_string(&resp).unwrap();
-        // name and guest_agent_status should be omitted when None
+        // name, guest_agent_status, and gateway_status should be omitted when None
         assert!(!json.contains("name"));
         assert!(!json.contains("guest_agent_status"));
+        assert!(!json.contains("gateway_status"));
+    }
+
+    #[test]
+    fn session_health_serialization() {
+        let health = SessionHealth {
+            session_id: uuid::Uuid::nil(),
+            vm_status: "running".into(),
+            guest_agent: "healthy".into(),
+            gateway: GatewayHealth {
+                container_status: "running".into(),
+                envoy: "healthy".into(),
+                mitmproxy: "healthy".into(),
+                coredns: "healthy".into(),
+            },
+            network: NetworkHealth {
+                bridge_exists: true,
+                tap_exists: true,
+            },
+        };
+        let json = serde_json::to_string(&health).unwrap();
+        let deser: SessionHealth = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.vm_status, "running");
+        assert_eq!(deser.guest_agent, "healthy");
+        assert_eq!(deser.gateway.container_status, "running");
+        assert_eq!(deser.gateway.envoy, "healthy");
+        assert_eq!(deser.gateway.mitmproxy, "healthy");
+        assert_eq!(deser.gateway.coredns, "healthy");
+        assert!(deser.network.bridge_exists);
+        assert!(deser.network.tap_exists);
+    }
+
+    #[test]
+    fn session_health_unhealthy_serialization() {
+        let health = SessionHealth {
+            session_id: uuid::Uuid::nil(),
+            vm_status: "stopped".into(),
+            guest_agent: "unknown".into(),
+            gateway: GatewayHealth {
+                container_status: "not_found".into(),
+                envoy: "unknown".into(),
+                mitmproxy: "unknown".into(),
+                coredns: "unknown".into(),
+            },
+            network: NetworkHealth {
+                bridge_exists: false,
+                tap_exists: false,
+            },
+        };
+        let json = serde_json::to_string(&health).unwrap();
+        let deser: SessionHealth = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.vm_status, "stopped");
+        assert_eq!(deser.gateway.container_status, "not_found");
+        assert!(!deser.network.bridge_exists);
+        assert!(!deser.network.tap_exists);
+    }
+
+    #[test]
+    fn gateway_health_round_trip() {
+        let gw = GatewayHealth {
+            container_status: "running".into(),
+            envoy: "healthy".into(),
+            mitmproxy: "unhealthy".into(),
+            coredns: "healthy".into(),
+        };
+        let json = serde_json::to_string(&gw).unwrap();
+        assert!(json.contains("\"envoy\":\"healthy\""));
+        assert!(json.contains("\"mitmproxy\":\"unhealthy\""));
+        let deser: GatewayHealth = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.envoy, "healthy");
+        assert_eq!(deser.mitmproxy, "unhealthy");
+    }
+
+    #[test]
+    fn network_health_round_trip() {
+        let net = NetworkHealth {
+            bridge_exists: true,
+            tap_exists: false,
+        };
+        let json = serde_json::to_string(&net).unwrap();
+        let deser: NetworkHealth = serde_json::from_str(&json).unwrap();
+        assert!(deser.bridge_exists);
+        assert!(!deser.tap_exists);
+    }
+
+    #[test]
+    fn session_response_with_gateway_status() {
+        let session = Session::new(Some("gw-test".into()));
+        let resp = SessionResponse::from_session_with_status(
+            session.clone(),
+            Some("connected".into()),
+            Some("running".into()),
+        );
+        assert_eq!(resp.gateway_status, Some("running".into()));
+
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"gateway_status\":\"running\""));
     }
 }

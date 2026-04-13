@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     Json, Router,
@@ -10,10 +11,11 @@ use axum::{
 };
 use clap::Parser;
 use sandbox_core::{
-    ApiError, CaManager, CreateSessionRequest, ExecRequest, ExecResponse, GatewayManager,
-    GuestConnector, GuestResponse, LimaManager, NetworkManager, SandboxError, Session,
-    SessionConfig, SessionResponse, SessionState, SessionStore, VmStatus, attach_vm_to_bridge,
-    detach_vm_from_bridge, generate_ca_inject_script,
+    ApiError, CaManager, CreateSessionRequest, ExecRequest, ExecResponse, GatewayHealth,
+    GatewayManager, GatewayStatus, GuestConnector, GuestResponse, LimaManager, NetworkHealth,
+    NetworkManager, SandboxError, Session, SessionConfig, SessionHealth, SessionResponse,
+    SessionState, SessionStore, VmStatus, attach_vm_to_bridge, detach_vm_from_bridge,
+    generate_ca_inject_script,
 };
 use tokio::net::UnixListener;
 use tracing::{error, info, warn};
@@ -93,6 +95,8 @@ fn app(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}/start", post(start_session))
         .route("/sessions/{id}/stop", post(stop_session))
         .route("/sessions/{id}/exec", post(exec_in_session))
+        .route("/sessions/{id}/health", get(session_health))
+        .route("/health", get(health_check))
         .with_state(state)
 }
 
@@ -236,7 +240,7 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         })
         .collect();
 
-    // Probe guest agent for running sessions (with a short timeout).
+    // Probe guest agent and gateway for running sessions (with a short timeout).
     let mut enriched: Vec<SessionResponse> = Vec::with_capacity(reconciled.len());
     for session in reconciled {
         let agent_status = if session.state == SessionState::Running {
@@ -252,7 +256,16 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         } else {
             None
         };
-        enriched.push(SessionResponse::from_session_with_status(session, agent_status));
+        let gateway_status = if session.state == SessionState::Running {
+            Some(format_gateway_status(&state.gateway, &session.id))
+        } else {
+            None
+        };
+        enriched.push(SessionResponse::from_session_with_status(
+            session,
+            agent_status,
+            gateway_status,
+        ));
     }
 
     (StatusCode::OK, Json(enriched)).into_response()
@@ -286,7 +299,7 @@ async fn get_session(
         }
     }
 
-    // Probe guest agent for running sessions.
+    // Probe guest agent and gateway for running sessions.
     let agent_status = if session.state == SessionState::Running {
         match tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -301,7 +314,14 @@ async fn get_session(
         None
     };
 
-    let response = SessionResponse::from_session_with_status(session, agent_status);
+    let gateway_status = if session.state == SessionState::Running {
+        Some(format_gateway_status(&state.gateway, &session.id))
+    } else {
+        None
+    };
+
+    let response =
+        SessionResponse::from_session_with_status(session, agent_status, gateway_status);
     (StatusCode::OK, Json(response)).into_response()
 }
 
@@ -326,15 +346,52 @@ async fn start_session(
         .into_response();
     }
 
+    // Start the Lima VM.
     if let Err(e) = state.lima.start_vm(&session.id) {
         let _ = state.store.update_state(&session.id, SessionState::Error);
         return error_response(e).into_response();
     }
 
+    // Wait for the guest agent to become responsive before proceeding.
+    match state.guest.ping(&session.id).await {
+        Ok(true) => {
+            info!(session_id = %session.id, "guest agent responded to ping after start");
+        }
+        Ok(false) => {
+            let err = SandboxError::Internal(
+                "guest agent returned unexpected response to ping after start".into(),
+            );
+            error!(session_id = %session.id, "guest agent ping: unexpected response");
+            let _ = state.store.update_state(&session.id, SessionState::Error);
+            return error_response(err).into_response();
+        }
+        Err(e) => {
+            error!(session_id = %session.id, error = %e, "guest agent ping failed after start");
+            let _ = state.store.update_state(&session.id, SessionState::Error);
+            return error_response(e).into_response();
+        }
+    }
+
+    // Update state to Running.
     if let Err(e) = state.store.update_state(&session.id, SessionState::Running) {
         return error_response(e).into_response();
     }
 
+    // Recreate networking from existing network info (if available).
+    match restore_session_networking(&session.id, &state).await {
+        Ok(()) => {
+            info!(session_id = %session.id, "session networking restored after start");
+        }
+        Err(e) => {
+            error!(session_id = %session.id, error = %e, "networking restore failed after start");
+            let _ = state.store.update_state(&session.id, SessionState::Error);
+            // Best-effort teardown of any partial networking state.
+            teardown_session_networking(&session.id, &state);
+            return error_response(e).into_response();
+        }
+    }
+
+    // Re-fetch the session to get the updated state and timestamp.
     match state.store.get_session(&session.id) {
         Ok(Some(s)) => (StatusCode::OK, Json(s)).into_response(),
         Ok(None) => error_response(SandboxError::SessionNotFound(session.id.to_string()))
@@ -362,6 +419,12 @@ async fn stop_session(
         )))
         .into_response();
     }
+
+    // Tear down networking resources (TAP, gateway, Docker network) before
+    // stopping the VM. The network_info is kept in the DB so `start` can
+    // recreate everything. The subnet remains allocated in the
+    // NetworkManager so it is not reused by another session.
+    teardown_session_networking(&session.id, &state);
 
     if let Err(e) = state.lima.stop_vm(&session.id) {
         let _ = state.store.update_state(&session.id, SessionState::Error);
@@ -400,8 +463,8 @@ async fn remove_session(
     // Delete the VM from Lima (ignore errors -- it might not exist).
     let _ = state.lima.delete_vm(&session.id);
 
-    // Tear down networking (best-effort -- ignore errors).
-    teardown_session_networking(&session.id, &state);
+    // Full teardown: networking + CA + release subnet allocation.
+    teardown_session_networking_full(&session.id, &state);
 
     // Delete the session from the store.
     if let Err(e) = state.store.delete_session(&session.id) {
@@ -581,13 +644,29 @@ async fn setup_session_networking(
     Ok(())
 }
 
-/// Tear down session networking (best-effort, ignores errors).
+/// Tear down session networking infrastructure (best-effort, ignores errors).
 ///
-/// 1. Detach VM from bridge (remove TAP)
-/// 2. Stop gateway container
-/// 3. Delete Docker bridge network
-/// 4. Remove session CA certificate
+/// Removes the TAP device, stops the gateway container, and removes the
+/// Docker bridge network. The subnet allocation and network_info in the DB
+/// are preserved so `start` can recreate everything.
+///
+/// The CA certificate files on disk are NOT removed — they are reused on
+/// start.
 fn teardown_session_networking(session_id: &uuid::Uuid, state: &AppState) {
+    if let Err(e) = detach_vm_from_bridge(session_id, &state.network) {
+        warn!(%session_id, error = %e, "failed to detach VM from bridge (best-effort)");
+    }
+    if let Err(e) = state.gateway.stop_gateway(session_id) {
+        warn!(%session_id, error = %e, "failed to stop gateway (best-effort)");
+    }
+    if let Err(e) = state.network.remove_docker_network(session_id) {
+        warn!(%session_id, error = %e, "failed to remove Docker network (best-effort)");
+    }
+}
+
+/// Full teardown: remove all networking resources AND release the subnet
+/// allocation. Used when deleting a session permanently.
+fn teardown_session_networking_full(session_id: &uuid::Uuid, state: &AppState) {
     if let Err(e) = detach_vm_from_bridge(session_id, &state.network) {
         warn!(%session_id, error = %e, "failed to detach VM from bridge (best-effort)");
     }
@@ -600,6 +679,280 @@ fn teardown_session_networking(session_id: &uuid::Uuid, state: &AppState) {
     if let Err(e) = CaManager::remove_session_ca(&state.base_dir, session_id) {
         warn!(%session_id, error = %e, "failed to remove session CA (best-effort)");
     }
+}
+
+/// Restore session networking from existing network info in the DB.
+///
+/// This is called by the `start` handler and by startup reconciliation.
+/// It recreates the Docker bridge, gateway container, TAP attachment, and
+/// CA injection using the same IPs that were originally allocated.
+async fn restore_session_networking(
+    session_id: &uuid::Uuid,
+    state: &AppState,
+) -> Result<(), SandboxError> {
+    // Check that network info exists in DB (otherwise there's nothing to restore).
+    if state.store.get_network_info(session_id)?.is_none() {
+        info!(
+            session_id = %session_id,
+            "no network info in DB, skipping networking restore"
+        );
+        return Ok(());
+    }
+
+    // 1. Ensure the Docker bridge network exists (recreate if needed).
+    //    This uses the NetworkManager's in-memory map (restored from DB at startup).
+    let network_info = state.network.ensure_network(session_id)?;
+
+    // 2. Get or regenerate the CA certificate.
+    let ca_dir = CaManager::ca_dir(&state.base_dir, session_id);
+    let ca_dir = if ca_dir.join("cert.pem").exists() {
+        info!(
+            session_id = %session_id,
+            "reusing existing CA certificate"
+        );
+        ca_dir
+    } else {
+        info!(
+            session_id = %session_id,
+            "regenerating CA certificate"
+        );
+        CaManager::generate_session_ca(&state.base_dir, session_id)?
+    };
+
+    // 3. Create gateway container with nftables, mounting the CA.
+    if let Err(e) =
+        state
+            .gateway
+            .create_gateway(session_id, &network_info, Some(&ca_dir))
+    {
+        // Roll back the Docker network on gateway failure.
+        let _ = state.network.remove_docker_network(session_id);
+        return Err(e);
+    }
+
+    // 4. Attach VM to bridge (TAP + QMP hot-add + guest config).
+    if let Err(e) =
+        attach_vm_to_bridge(session_id, &network_info, &state.network, &state.guest).await
+    {
+        // Roll back gateway and Docker network on attach failure.
+        let _ = state.gateway.stop_gateway(session_id);
+        let _ = state.network.remove_docker_network(session_id);
+        return Err(e);
+    }
+
+    // 5. Inject CA certificate into VM trust store.
+    let cert_pem = std::fs::read_to_string(ca_dir.join("cert.pem")).map_err(|e| {
+        SandboxError::Ca(format!("failed to read CA cert for injection: {e}"))
+    })?;
+    let inject_script = generate_ca_inject_script(&cert_pem);
+
+    info!(session_id = %session_id, "injecting CA certificate into VM");
+
+    match state
+        .guest
+        .exec(session_id, "bash", &["-c", &inject_script])
+        .await
+    {
+        Ok(GuestResponse::ExecResult {
+            exit_code,
+            stdout,
+            stderr,
+        }) => {
+            if exit_code != 0 {
+                warn!(
+                    session_id = %session_id,
+                    exit_code,
+                    stdout = %stdout.trim(),
+                    stderr = %stderr.trim(),
+                    "CA injection script returned non-zero exit code"
+                );
+                return Err(SandboxError::Ca(format!(
+                    "CA injection failed (exit {exit_code}): {stderr}"
+                )));
+            }
+            info!(
+                session_id = %session_id,
+                output = %stdout.trim(),
+                "CA certificate injected into VM"
+            );
+        }
+        Ok(GuestResponse::Error { message }) => {
+            return Err(SandboxError::Ca(format!(
+                "guest agent error during CA injection: {message}"
+            )));
+        }
+        Ok(other) => {
+            return Err(SandboxError::Ca(format!(
+                "unexpected guest response during CA injection: {other:?}"
+            )));
+        }
+        Err(e) => {
+            return Err(SandboxError::Ca(format!(
+                "failed to inject CA certificate into VM: {e}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Format a `GatewayStatus` into a human-readable string for the API response.
+fn format_gateway_status(gateway: &GatewayManager, session_id: &uuid::Uuid) -> String {
+    match gateway.gateway_status(session_id) {
+        Ok(GatewayStatus::Healthy) => "healthy".to_string(),
+        Ok(GatewayStatus::Unhealthy(reason)) => format!("unhealthy: {reason}"),
+        Ok(GatewayStatus::NotRunning) => "not_running".to_string(),
+        Err(e) => format!("error: {e}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Health endpoint
+// ---------------------------------------------------------------------------
+
+/// Per-session health endpoint: `GET /sessions/{id}/health`
+async fn session_health(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let session = match state.store.get_session_by_name_or_id(&id) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return error_response(SandboxError::SessionNotFound(id)).into_response()
+        }
+        Err(e) => return error_response(e).into_response(),
+    };
+
+    // VM status.
+    let vm_status = match state.lima.vm_status(&session.id) {
+        Ok(VmStatus::Running) => "running".to_string(),
+        Ok(VmStatus::Stopped) => "stopped".to_string(),
+        Ok(VmStatus::Unknown(s)) => s,
+        Err(e) => format!("error: {e}"),
+    };
+
+    // Guest agent status.
+    let guest_agent = if session.state == SessionState::Running {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            state.guest.ping(&session.id),
+        )
+        .await
+        {
+            Ok(Ok(true)) => "connected".to_string(),
+            Ok(Ok(false)) => "unexpected_response".to_string(),
+            Ok(Err(e)) => format!("error: {e}"),
+            Err(_) => "timeout".to_string(),
+        }
+    } else {
+        "not_checked".to_string()
+    };
+
+    // Gateway health.
+    let (container_status, envoy, mitmproxy, coredns) =
+        if session.state == SessionState::Running {
+            match state.gateway.gateway_status(&session.id) {
+                Ok(GatewayStatus::Healthy) => (
+                    "running".to_string(),
+                    "healthy".to_string(),
+                    "healthy".to_string(),
+                    "healthy".to_string(),
+                ),
+                Ok(GatewayStatus::Unhealthy(reason)) => (
+                    "running".to_string(),
+                    "unknown".to_string(),
+                    "unknown".to_string(),
+                    format!("unhealthy: {reason}"),
+                ),
+                Ok(GatewayStatus::NotRunning) => (
+                    "not_running".to_string(),
+                    "not_running".to_string(),
+                    "not_running".to_string(),
+                    "not_running".to_string(),
+                ),
+                Err(e) => {
+                    let msg = format!("error: {e}");
+                    (msg.clone(), msg.clone(), msg.clone(), msg)
+                }
+            }
+        } else {
+            (
+                "not_checked".to_string(),
+                "not_checked".to_string(),
+                "not_checked".to_string(),
+                "not_checked".to_string(),
+            )
+        };
+
+    // Network health: check if bridge and TAP exist.
+    let network_info = state.store.get_network_info(&session.id).ok().flatten();
+    let bridge_exists = network_info
+        .as_ref()
+        .map(|info| {
+            std::process::Command::new("docker")
+                .args(["network", "inspect", &info.docker_network_name])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    let tap_exists = {
+        let tap_name = sandbox_core::tap_name_for_session(&session.id);
+        std::process::Command::new("ip")
+            .args(["link", "show", &tap_name])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    };
+
+    let health = SessionHealth {
+        session_id: session.id,
+        vm_status,
+        guest_agent,
+        gateway: GatewayHealth {
+            container_status,
+            envoy,
+            mitmproxy,
+            coredns,
+        },
+        network: NetworkHealth {
+            bridge_exists,
+            tap_exists,
+        },
+    };
+
+    (StatusCode::OK, Json(health)).into_response()
+}
+
+/// Global health endpoint: `GET /health`
+///
+/// Returns gateway status per running session.
+async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let sessions = match state.store.list_sessions() {
+        Ok(s) => s,
+        Err(e) => return error_response(e).into_response(),
+    };
+
+    let mut statuses: Vec<serde_json::Value> = Vec::new();
+    for session in &sessions {
+        if session.state != SessionState::Running {
+            continue;
+        }
+        let gw_status = format_gateway_status(&state.gateway, &session.id);
+        statuses.push(serde_json::json!({
+            "session_id": session.id,
+            "name": session.name,
+            "gateway_status": gw_status,
+        }));
+    }
+
+    let response = serde_json::json!({
+        "status": "ok",
+        "running_sessions": statuses.len(),
+        "gateways": statuses,
+    });
+
+    (StatusCode::OK, Json(response)).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -692,6 +1045,254 @@ fn reconcile(store: &SessionStore, lima: &LimaManager) {
     );
 }
 
+/// Reconcile networking state for sessions after daemon startup.
+///
+/// For each Running session: check if its gateway container is running and
+/// restart it if needed.
+///
+/// For each Stopped session: ensure gateway is stopped and TAP is removed.
+fn reconcile_networking(state: &AppState) {
+    let sessions = match state.store.list_sessions() {
+        Ok(s) => s,
+        Err(e) => {
+            error!(error = %e, "network reconciliation: failed to list sessions");
+            return;
+        }
+    };
+
+    let mut restored = 0u32;
+    let mut cleaned = 0u32;
+
+    for session in &sessions {
+        match session.state {
+            SessionState::Running => {
+                // Check if gateway is running.
+                match state.gateway.gateway_status(&session.id) {
+                    Ok(GatewayStatus::Healthy) => {
+                        // Gateway is healthy, nothing to do.
+                    }
+                    Ok(status) => {
+                        warn!(
+                            session_id = %session.id,
+                            gateway_status = ?status,
+                            "network reconciliation: gateway not healthy, attempting restart"
+                        );
+
+                        let network_info =
+                            match state.store.get_network_info(&session.id) {
+                                Ok(Some(info)) => info,
+                                Ok(None) => {
+                                    warn!(
+                                        session_id = %session.id,
+                                        "network reconciliation: no network info, skipping"
+                                    );
+                                    continue;
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        session_id = %session.id,
+                                        error = %e,
+                                        "network reconciliation: failed to get network info"
+                                    );
+                                    continue;
+                                }
+                            };
+
+                        // Ensure Docker network exists.
+                        if let Err(e) = state.network.ensure_network(&session.id) {
+                            warn!(
+                                session_id = %session.id,
+                                error = %e,
+                                "network reconciliation: failed to ensure Docker network"
+                            );
+                            continue;
+                        }
+
+                        // Get CA directory.
+                        let ca_dir = CaManager::ca_dir(&state.base_dir, &session.id);
+                        let ca_ref = if ca_dir.join("cert.pem").exists() {
+                            Some(ca_dir.as_path())
+                        } else {
+                            warn!(
+                                session_id = %session.id,
+                                "network reconciliation: CA cert missing, gateway will run without CA"
+                            );
+                            None
+                        };
+
+                        // Restart the gateway.
+                        if let Err(e) = state
+                            .gateway
+                            .restart_gateway(&session.id, &network_info, ca_ref)
+                        {
+                            warn!(
+                                session_id = %session.id,
+                                error = %e,
+                                "network reconciliation: failed to restart gateway"
+                            );
+                        } else {
+                            info!(
+                                session_id = %session.id,
+                                "network reconciliation: gateway restarted"
+                            );
+                            restored += 1;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            session_id = %session.id,
+                            error = %e,
+                            "network reconciliation: failed to check gateway status"
+                        );
+                    }
+                }
+            }
+            SessionState::Stopped => {
+                // Ensure lingering gateway and TAP are cleaned up.
+                match state.gateway.gateway_status(&session.id) {
+                    Ok(GatewayStatus::NotRunning) => {
+                        // Already clean.
+                    }
+                    Ok(_) => {
+                        info!(
+                            session_id = %session.id,
+                            "network reconciliation: cleaning up lingering gateway for stopped session"
+                        );
+                        let _ = state.gateway.stop_gateway(&session.id);
+                        cleaned += 1;
+                    }
+                    Err(_) => {
+                        // Container doesn't exist, that's fine.
+                    }
+                }
+
+                // Best-effort TAP cleanup.
+                let _ = detach_vm_from_bridge(&session.id, &state.network);
+            }
+            _ => {}
+        }
+    }
+
+    info!(
+        restored = restored,
+        cleaned = cleaned,
+        "network reconciliation complete"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Gateway crash recovery
+// ---------------------------------------------------------------------------
+
+/// Background task that monitors gateway containers and restarts crashed ones.
+///
+/// Runs every 30 seconds. For each Running session, checks if the gateway
+/// container is healthy. If it has crashed or stopped, restarts it and
+/// re-injects nftables rules.
+async fn gateway_monitor(state: Arc<AppState>) {
+    let poll_interval = Duration::from_secs(30);
+
+    loop {
+        tokio::time::sleep(poll_interval).await;
+
+        let sessions = match state.store.list_sessions() {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "gateway monitor: failed to list sessions");
+                continue;
+            }
+        };
+
+        for session in &sessions {
+            if session.state != SessionState::Running {
+                continue;
+            }
+
+            let status = match state.gateway.gateway_status(&session.id) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(
+                        session_id = %session.id,
+                        error = %e,
+                        "gateway monitor: failed to check gateway status"
+                    );
+                    continue;
+                }
+            };
+
+            match status {
+                GatewayStatus::Healthy => {
+                    // All good, nothing to do.
+                }
+                GatewayStatus::NotRunning | GatewayStatus::Unhealthy(_) => {
+                    warn!(
+                        session_id = %session.id,
+                        gateway_status = ?status,
+                        "gateway monitor: gateway not healthy, attempting recovery"
+                    );
+
+                    let network_info = match state.store.get_network_info(&session.id) {
+                        Ok(Some(info)) => info,
+                        Ok(None) => {
+                            warn!(
+                                session_id = %session.id,
+                                "gateway monitor: no network info, cannot recover"
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!(
+                                session_id = %session.id,
+                                error = %e,
+                                "gateway monitor: failed to get network info"
+                            );
+                            continue;
+                        }
+                    };
+
+                    // Ensure Docker network is present.
+                    if let Err(e) = state.network.ensure_network(&session.id) {
+                        warn!(
+                            session_id = %session.id,
+                            error = %e,
+                            "gateway monitor: failed to ensure Docker network"
+                        );
+                        continue;
+                    }
+
+                    // Get CA directory.
+                    let ca_dir = CaManager::ca_dir(&state.base_dir, &session.id);
+                    let ca_ref = if ca_dir.join("cert.pem").exists() {
+                        Some(ca_dir.as_path())
+                    } else {
+                        None
+                    };
+
+                    // Restart the gateway.
+                    match state
+                        .gateway
+                        .restart_gateway(&session.id, &network_info, ca_ref)
+                    {
+                        Ok(()) => {
+                            info!(
+                                session_id = %session.id,
+                                "gateway monitor: gateway recovered successfully"
+                            );
+                        }
+                        Err(e) => {
+                            error!(
+                                session_id = %session.id,
+                                error = %e,
+                                "gateway monitor: failed to recover gateway"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -736,7 +1337,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         network.restore_from_infos(&existing_networks)?;
     }
 
-    // Run startup reconciliation.
+    // Run startup reconciliation (VM state).
     reconcile(&store, &lima);
 
     let state = Arc::new(AppState {
@@ -748,6 +1349,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         gateway,
     });
 
+    // Run networking reconciliation: restart crashed gateways, clean up
+    // lingering resources for stopped sessions.
+    reconcile_networking(&state);
+
+    // Spawn background gateway monitor for crash recovery.
+    let monitor_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        gateway_monitor(monitor_state).await;
+    });
+
     // Remove stale socket file if it exists.
     if socket_path.exists() {
         info!(?socket_path, "removing stale socket file");
@@ -757,7 +1368,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = UnixListener::bind(&socket_path)?;
     info!(socket = %socket_path.display(), "sandboxd listening");
 
-    let app = app(state);
+    let app = app(Arc::clone(&state));
 
     // Graceful shutdown on SIGTERM / SIGINT.
     axum::serve(listener, app)
