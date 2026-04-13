@@ -48,9 +48,18 @@ pub struct CreateSessionRequest {
     /// Optional policy to apply immediately after session creation.
     pub policy: Option<crate::policy::Policy>,
     /// Optional git repository URL to clone into `/root/workspace/` after setup.
+    ///
+    /// Mutually exclusive with `workspace`. If both are provided, `workspace`
+    /// takes precedence.
     pub repo: Option<String>,
     /// Optional command to execute after clone (or after setup if no repo).
     pub boot_cmd: Option<String>,
+    /// Optional workspace mode string, e.g. `"shared:/home/user/project"`.
+    ///
+    /// Mutually exclusive with `repo`. When set to a `shared:` mode, the
+    /// host directory is mounted into the VM at `/home/agent/workspace`
+    /// via virtio-fs.
+    pub workspace: Option<String>,
 }
 
 /// Request body for `POST /sessions/{id}/upload`.
@@ -196,6 +205,7 @@ mod tests {
         assert!(req.policy.is_none());
         assert!(req.repo.is_none());
         assert!(req.boot_cmd.is_none());
+        assert!(req.workspace.is_none());
     }
 
     #[test]
@@ -470,6 +480,18 @@ mod tests {
             Some("https://github.com/example/repo.git")
         );
         assert_eq!(req.boot_cmd.as_deref(), Some("make build"));
+    }
+
+    #[test]
+    fn deserialize_create_request_with_workspace() {
+        let json = r#"{"name": "shared-ws", "workspace": "shared:/home/user/project"}"#;
+        let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.name.as_deref(), Some("shared-ws"));
+        assert_eq!(
+            req.workspace.as_deref(),
+            Some("shared:/home/user/project")
+        );
+        assert!(req.repo.is_none());
     }
 
     #[test]

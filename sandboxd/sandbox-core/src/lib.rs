@@ -37,6 +37,6 @@ pub use policy::{
 };
 pub use policy_distributor::PolicyDistributor;
 pub use qmp::{QmpClient, mac_from_uuid, tap_name_for_session};
-pub use session::{Session, SessionConfig, SessionState};
+pub use session::{Session, SessionConfig, SessionState, WorkspaceMode};
 pub use store::SessionStore;
 pub use vm_network::{attach_vm_to_bridge, detach_vm_from_bridge};

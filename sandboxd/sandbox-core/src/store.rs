@@ -622,6 +622,7 @@ mod tests {
             cpus: 8,
             memory_mb: 16384,
             disk_gb: 100,
+            workspace_mode: None,
         };
 
         let session = store

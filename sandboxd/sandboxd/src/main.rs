@@ -118,10 +118,29 @@ async fn create_session(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateSessionRequest>,
 ) -> impl IntoResponse {
+    // Determine workspace mode from the request: the `workspace` field
+    // takes precedence; fall back to `repo` for backward compatibility.
+    let workspace_mode = if let Some(ref ws) = req.workspace {
+        match sandbox_core::WorkspaceMode::parse_flag(ws) {
+            Ok(mode) => Some(mode),
+            Err(e) => {
+                return error_response(SandboxError::Internal(format!(
+                    "invalid workspace value: {e}"
+                )))
+                .into_response();
+            }
+        }
+    } else {
+        req.repo.as_ref().map(|repo_url| sandbox_core::WorkspaceMode::Clone {
+            repo_url: repo_url.clone(),
+        })
+    };
+
     let config = SessionConfig {
         cpus: req.cpus.unwrap_or(2),
         memory_mb: req.memory_mb.unwrap_or(4096),
         disk_gb: req.disk_gb.unwrap_or(20),
+        workspace_mode,
     };
 
     // Create session record in store (state = Creating).

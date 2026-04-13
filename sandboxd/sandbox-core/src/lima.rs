@@ -6,7 +6,7 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::error::SandboxError;
-use crate::session::SessionConfig;
+use crate::session::{SessionConfig, WorkspaceMode};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -385,6 +385,29 @@ impl LimaManager {
         let memory_gib = format!("{}GiB", mib_to_gib_string(config.memory_mb));
         let disk_gib = format!("{}GiB", config.disk_gb);
 
+        // Build the mounts section: empty by default, populated for shared
+        // workspace mode.  Lima supports several mount types; we use
+        // `virtiofs` for performance when the user explicitly opts in via
+        // `--workspace shared:<path>`.
+        //
+        // SECURITY NOTE: virtiofs adds a virtio-fs device to the VM, which
+        // expands the attack surface compared to a fully isolated VM.  The
+        // host directory is writable by the guest.  This is a documented
+        // trade-off — see docs/workspaces.md.
+        let mounts_section = match &config.workspace_mode {
+            Some(WorkspaceMode::Shared { host_path }) => {
+                format!(
+                    "\
+mountType: \"virtiofs\"
+mounts:
+- location: \"{host_path}\"
+  mountPoint: \"/home/agent/workspace\"
+  writable: true"
+                )
+            }
+            _ => "mounts: []".to_string(),
+        };
+
         format!(
             r#"# Auto-generated Lima template for sandbox session {session_id}
 minimumLimaVersion: "2.0.0"
@@ -401,7 +424,7 @@ cpus: {cpus}
 memory: "{memory_gib}"
 disk: "{disk_gib}"
 
-mounts: []
+{mounts_section}
 portForwards: []
 
 containerd:
@@ -453,6 +476,7 @@ provision:
             cpus = config.cpus,
             memory_gib = memory_gib,
             disk_gib = disk_gib,
+            mounts_section = mounts_section,
             hostname = hostname,
         )
     }
@@ -769,6 +793,7 @@ mod tests {
             cpus: 8,
             memory_mb: 16384,
             disk_gb: 100,
+            workspace_mode: None,
         };
 
         let template = mgr.generate_template(&id, &config);
@@ -799,12 +824,82 @@ mod tests {
             cpus: 1,
             memory_mb: 1536, // 1.5 GiB
             disk_gb: 10,
+            workspace_mode: None,
         };
 
         let template = mgr.generate_template(&id, &config);
         assert!(
             template.contains("memory: \"1.5GiB\""),
             "template should handle fractional GiB"
+        );
+    }
+
+    #[test]
+    fn test_generate_template_shared_workspace() {
+        let mgr = LimaManager::new(PathBuf::from("/tmp/test"));
+        let id =
+            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let config = SessionConfig {
+            cpus: 2,
+            memory_mb: 4096,
+            disk_gb: 20,
+            workspace_mode: Some(WorkspaceMode::Shared {
+                host_path: "/home/user/project".into(),
+            }),
+        };
+
+        let template = mgr.generate_template(&id, &config);
+
+        // Should NOT contain the empty mounts placeholder.
+        assert!(
+            !template.contains("mounts: []"),
+            "shared workspace template must not have empty mounts"
+        );
+
+        // Should contain virtiofs mount type.
+        assert!(
+            template.contains("mountType: \"virtiofs\""),
+            "template should specify virtiofs mount type"
+        );
+
+        // Should mount the host path to /home/agent/workspace.
+        assert!(
+            template.contains("location: \"/home/user/project\""),
+            "template should reference the host path"
+        );
+        assert!(
+            template.contains("mountPoint: \"/home/agent/workspace\""),
+            "template should mount to /home/agent/workspace"
+        );
+        assert!(
+            template.contains("writable: true"),
+            "template should make mount writable"
+        );
+    }
+
+    #[test]
+    fn test_generate_template_clone_workspace_no_mount() {
+        let mgr = LimaManager::new(PathBuf::from("/tmp/test"));
+        let id = Uuid::new_v4();
+        let config = SessionConfig {
+            cpus: 1,
+            memory_mb: 1024,
+            disk_gb: 10,
+            workspace_mode: Some(WorkspaceMode::Clone {
+                repo_url: "https://github.com/example/repo.git".into(),
+            }),
+        };
+
+        let template = mgr.generate_template(&id, &config);
+
+        // Clone mode should NOT add mounts — cloning is handled post-boot.
+        assert!(
+            template.contains("mounts: []"),
+            "clone workspace should not produce mounts"
+        );
+        assert!(
+            !template.contains("virtiofs"),
+            "clone workspace should not reference virtiofs"
         );
     }
 
@@ -1022,6 +1117,7 @@ mod tests {
             cpus: 1,
             memory_mb: 1024,
             disk_gb: 10,
+            workspace_mode: None,
         };
 
         // Create the VM

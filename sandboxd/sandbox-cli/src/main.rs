@@ -45,11 +45,19 @@ enum Command {
         #[arg(long)]
         policy: Option<String>,
         /// Git repository URL to clone into /root/workspace/ after session setup.
-        #[arg(long)]
+        ///
+        /// Mutually exclusive with --workspace.
+        #[arg(long, conflicts_with = "workspace")]
         repo: Option<String>,
         /// Command to execute after clone (or after setup if no repo).
         #[arg(long)]
         boot_cmd: Option<String>,
+        /// Workspace mode: `shared:<host-path>` mounts a host directory into
+        /// the VM at /home/agent/workspace via virtio-fs.
+        ///
+        /// Mutually exclusive with --repo.
+        #[arg(long, conflicts_with = "repo")]
+        workspace: Option<String>,
     },
     /// Start a sandbox session.
     Start {
@@ -182,6 +190,7 @@ fn build_request(command: &Command) -> Option<Request<String>> {
             policy,
             repo,
             boot_cmd,
+            workspace,
         } => {
             let mut body = serde_json::Map::new();
             if let Some(n) = name {
@@ -215,6 +224,28 @@ fn build_request(command: &Command) -> Option<Request<String>> {
             }
             if let Some(cmd) = boot_cmd {
                 body.insert("boot_cmd".into(), serde_json::Value::String(cmd.clone()));
+            }
+            if let Some(ws) = workspace {
+                // Validate the workspace value client-side before sending.
+                let path_part = ws.strip_prefix("shared:").unwrap_or("");
+                if !ws.starts_with("shared:") {
+                    eprintln!("Error: --workspace must start with 'shared:', got: {ws}");
+                    process::exit(1);
+                }
+                if path_part.is_empty() {
+                    eprintln!("Error: --workspace shared: path must not be empty");
+                    process::exit(1);
+                }
+                let p = std::path::Path::new(path_part);
+                if !p.is_absolute() {
+                    eprintln!("Error: --workspace path must be absolute, got: {path_part}");
+                    process::exit(1);
+                }
+                if !p.exists() {
+                    eprintln!("Error: --workspace path does not exist: {path_part}");
+                    process::exit(1);
+                }
+                body.insert("workspace".into(), serde_json::Value::String(ws.clone()));
             }
             let body_str = serde_json::Value::Object(body).to_string();
             Request::builder()
@@ -1092,6 +1123,7 @@ mod tests {
                 policy: None,
                 repo: None,
                 boot_cmd: None,
+                workspace: None,
             }
         ));
     }
@@ -1228,6 +1260,7 @@ mod tests {
             policy: None,
             repo: None,
             boot_cmd: None,
+            workspace: None,
         };
         let req = build_request(&cmd).expect("should produce request");
         assert_eq!(req.method(), "POST");
@@ -1250,6 +1283,7 @@ mod tests {
             policy: None,
             repo: None,
             boot_cmd: None,
+            workspace: None,
         };
         let req = build_request(&cmd).expect("should produce request");
         assert_eq!(req.method(), "POST");
@@ -1272,6 +1306,7 @@ mod tests {
             policy: None,
             repo: None,
             boot_cmd: None,
+            workspace: None,
         };
         let req = build_request(&cmd).expect("should produce request");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -1628,6 +1663,7 @@ mod tests {
             policy: None,
             repo: Some("https://github.com/octocat/Hello-World.git".into()),
             boot_cmd: None,
+            workspace: None,
         };
         let req = build_request(&cmd).expect("should produce request");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -1646,6 +1682,7 @@ mod tests {
             policy: None,
             repo: None,
             boot_cmd: Some("npm install".into()),
+            workspace: None,
         };
         let req = build_request(&cmd).expect("should produce request");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();

@@ -1,8 +1,56 @@
+use std::path::Path;
 use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+/// How the workspace directory is made available inside the VM.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WorkspaceMode {
+    /// Mount a host directory into the VM via virtio-fs (bidirectional, live).
+    Shared {
+        /// Absolute path on the host to mount.
+        host_path: String,
+    },
+    /// Clone a git repository into the VM at /root/workspace/.
+    Clone {
+        /// Git repository URL.
+        repo_url: String,
+    },
+}
+
+impl WorkspaceMode {
+    /// Parse a workspace mode from the CLI `--workspace` flag value.
+    ///
+    /// Accepted formats:
+    /// - `shared:/absolute/host/path`
+    pub fn parse_flag(value: &str) -> Result<Self, String> {
+        if let Some(path) = value.strip_prefix("shared:") {
+            if path.is_empty() {
+                return Err("shared workspace path must not be empty".into());
+            }
+            if !Path::new(path).is_absolute() {
+                return Err(format!(
+                    "shared workspace path must be absolute, got: {path}"
+                ));
+            }
+            if !Path::new(path).exists() {
+                return Err(format!(
+                    "shared workspace path does not exist: {path}"
+                ));
+            }
+            Ok(Self::Shared {
+                host_path: path.to_string(),
+            })
+        } else {
+            Err(format!(
+                "unknown workspace mode: {value}. Expected 'shared:<host-path>'"
+            ))
+        }
+    }
+}
 
 /// Current state of a sandbox session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +98,9 @@ pub struct SessionConfig {
     pub memory_mb: u32,
     /// Disk size in gigabytes.
     pub disk_gb: u32,
+    /// How the workspace is provided to the VM (if at all).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_mode: Option<WorkspaceMode>,
 }
 
 impl Default for SessionConfig {
@@ -58,6 +109,7 @@ impl Default for SessionConfig {
             cpus: 2,
             memory_mb: 4096,
             disk_gb: 20,
+            workspace_mode: None,
         }
     }
 }
@@ -162,6 +214,7 @@ mod tests {
             cpus: 4,
             memory_mb: 8192,
             disk_gb: 50,
+            workspace_mode: None,
         };
         let session = Session::with_config(Some("custom".into()), config);
         assert_eq!(session.config.cpus, 4);
@@ -262,5 +315,55 @@ mod tests {
         assert_eq!(config.cpus, 2);
         assert_eq!(config.memory_mb, 4096);
         assert_eq!(config.disk_gb, 20);
+        assert!(config.workspace_mode.is_none());
+    }
+
+    #[test]
+    fn workspace_mode_parse_shared() {
+        // We cannot test with a real path that must exist, so test the
+        // validation logic for non-absolute and empty paths.
+        let err = WorkspaceMode::parse_flag("shared:").unwrap_err();
+        assert!(err.contains("must not be empty"), "err = {err}");
+
+        let err = WorkspaceMode::parse_flag("shared:relative/path").unwrap_err();
+        assert!(err.contains("must be absolute"), "err = {err}");
+
+        let err = WorkspaceMode::parse_flag("shared:/nonexistent/path/xyzzy").unwrap_err();
+        assert!(err.contains("does not exist"), "err = {err}");
+
+        // Use /tmp which is guaranteed to exist.
+        let mode = WorkspaceMode::parse_flag("shared:/tmp").unwrap();
+        assert_eq!(
+            mode,
+            WorkspaceMode::Shared {
+                host_path: "/tmp".into()
+            }
+        );
+    }
+
+    #[test]
+    fn workspace_mode_parse_unknown() {
+        let err = WorkspaceMode::parse_flag("foobar:/some/path").unwrap_err();
+        assert!(err.contains("unknown workspace mode"), "err = {err}");
+    }
+
+    #[test]
+    fn workspace_mode_serialization_shared() {
+        let mode = WorkspaceMode::Shared {
+            host_path: "/home/user/project".into(),
+        };
+        let json = serde_json::to_string(&mode).unwrap();
+        let deser: WorkspaceMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser, mode);
+    }
+
+    #[test]
+    fn workspace_mode_serialization_clone() {
+        let mode = WorkspaceMode::Clone {
+            repo_url: "https://github.com/example/repo.git".into(),
+        };
+        let json = serde_json::to_string(&mode).unwrap();
+        let deser: WorkspaceMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser, mode);
     }
 }

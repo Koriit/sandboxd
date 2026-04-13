@@ -291,3 +291,87 @@ def test_cp_vm_to_host(sandbox_cli):
                 os.unlink(local_file)
             except OSError:
                 pass
+
+
+@pytest.mark.timeout(600)
+def test_shared_mount(sandbox_cli):
+    """Create a session with --workspace shared:<tmpdir>.
+    Verify bidirectional file visibility between host and VM.
+    """
+    session_id = None
+    host_dir = None
+    try:
+        # Create a temporary directory on the host to be shared.
+        host_dir = tempfile.mkdtemp(prefix="sandbox-shared-ws-")
+
+        result = sandbox_cli(
+            "create", "--name", "ws-shared",
+            *_VM_RESOURCE_ARGS,
+            "--workspace", f"shared:{host_dir}",
+            timeout=600,
+        )
+        assert result.returncode == 0, (
+            f"sandbox create failed (rc={result.returncode}).\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        session_id = parse_session_id(result.stdout)
+        wait_for_state(sandbox_cli, "ws-shared", "Running", timeout=10)
+
+        # 1. Host -> VM: create a file on the host, verify visible in the VM.
+        host_file = os.path.join(host_dir, "from-host.txt")
+        host_content = "hello from the host\n"
+        with open(host_file, "w") as f:
+            f.write(host_content)
+
+        # The file should be visible at /home/agent/workspace/from-host.txt
+        cat_result = sandbox_cli(
+            "exec", "ws-shared", "--",
+            "cat", "/home/agent/workspace/from-host.txt",
+            timeout=120,
+        )
+        assert cat_result.returncode == 0, (
+            f"cat from-host.txt failed in VM.\n"
+            f"stdout: {cat_result.stdout}\nstderr: {cat_result.stderr}"
+        )
+        assert cat_result.stdout == host_content, (
+            f"Host file content mismatch in VM.\n"
+            f"Expected: {host_content!r}\nGot: {cat_result.stdout!r}"
+        )
+
+        # 2. VM -> Host: create a file in the VM, verify visible on the host.
+        vm_content = "hello from the VM"
+        exec_result = sandbox_cli(
+            "exec", "ws-shared", "--",
+            "bash", "-c",
+            f"echo -n '{vm_content}' > /home/agent/workspace/from-vm.txt",
+            timeout=120,
+        )
+        assert exec_result.returncode == 0, (
+            f"Failed to create file in VM.\n"
+            f"stdout: {exec_result.stdout}\nstderr: {exec_result.stderr}"
+        )
+
+        vm_file_on_host = os.path.join(host_dir, "from-vm.txt")
+        assert os.path.exists(vm_file_on_host), (
+            f"File created in VM not visible on host at {vm_file_on_host}"
+        )
+        with open(vm_file_on_host) as f:
+            downloaded_content = f.read()
+        assert downloaded_content == vm_content, (
+            f"VM file content mismatch on host.\n"
+            f"Expected: {vm_content!r}\nGot: {downloaded_content!r}"
+        )
+
+        # Clean up.
+        sandbox_cli("rm", "ws-shared", timeout=120)
+        session_id = None
+
+    finally:
+        if session_id is not None:
+            sandbox_cli("rm", "ws-shared", timeout=120)
+        if host_dir is not None:
+            import shutil
+            try:
+                shutil.rmtree(host_dir)
+            except OSError:
+                pass
