@@ -92,13 +92,23 @@ wait_for_ready() {
 
 # ── Start mitmproxy ─────────────────────────────────────────────────
 
-log "Starting mitmproxy (mitmdump) on 127.0.0.1:8080..."
+# Choose the mitmproxy addon: policy enforcement when a config file is
+# present (written by sandboxd), otherwise fall back to pass-through.
+# The policy addon also falls back internally when the config file is
+# absent, but using the dedicated pass-through addon avoids loading the
+# policy machinery when it is not needed.
+MITM_ADDON="/etc/mitmproxy/passthrough_addon.py"
+if [[ -f /etc/mitmproxy/policy_addon.py ]]; then
+    MITM_ADDON="/etc/mitmproxy/policy_addon.py"
+fi
+
+log "Starting mitmproxy (mitmdump) on 127.0.0.1:8080 (addon=${MITM_ADDON})..."
 mitmdump \
     --mode regular \
     --listen-host 127.0.0.1 \
     --listen-port 8080 \
     --set stream_large_bodies=1 \
-    -s /etc/mitmproxy/passthrough_addon.py \
+    -s "${MITM_ADDON}" \
     >>"${LOG_DIR}/mitmproxy.log" 2>&1 &
 MITM_PID=$!
 log "mitmproxy started (PID=${MITM_PID})"
@@ -122,6 +132,15 @@ log "Envoy started (PID=${ENVOY_PID})"
 wait_for_ready "Envoy" "curl -sf http://127.0.0.1:9901/ready"
 
 # ── Start CoreDNS ───────────────────────────────────────────────────
+
+# Ensure the policy file exists. sandboxd writes the real policy, but
+# CoreDNS needs the file present at startup. An empty file means
+# deny-all (no domains allowed) until sandboxd writes the actual policy.
+COREDNS_POLICY_FILE="${COREDNS_POLICY_FILE:-/etc/coredns/policy.conf}"
+if [[ ! -f "$COREDNS_POLICY_FILE" ]]; then
+    log "Creating empty policy file at ${COREDNS_POLICY_FILE} (deny-all until sandboxd writes policy)"
+    echo "# Empty policy — deny all (placeholder until sandboxd writes policy)" > "$COREDNS_POLICY_FILE"
+fi
 
 log "Starting CoreDNS..."
 coredns \

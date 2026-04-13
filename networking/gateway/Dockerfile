@@ -1,11 +1,25 @@
 # Gateway container: Envoy + mitmproxy + CoreDNS proxy pipeline
-# All components run in pass-through mode (no policy enforcement).
-# Policy enforcement is added in M4.
+# CoreDNS is built from source with the sandboxpolicy plugin for DNS-level
+# policy enforcement. Envoy and mitmproxy handle TCP/HTTP proxying.
 
+# ---------- Stage 1: Build custom CoreDNS with sandboxpolicy plugin ----------
+FROM golang:1.22 AS coredns-builder
+
+WORKDIR /build
+
+# Copy the plugin module and build the custom CoreDNS binary.
+# Build context is networking/ (parent of coredns-plugin/).
+COPY coredns-plugin/ ./coredns-plugin/
+
+WORKDIR /build/coredns-plugin
+
+RUN go mod download \
+    && CGO_ENABLED=0 go build -o /coredns ./cmd/coredns
+
+# ---------- Stage 2: Runtime image ----------
 FROM debian:bookworm-slim
 
 # Versions — pinned for reproducibility
-ARG COREDNS_VERSION=1.14.2
 ARG MITMPROXY_VERSION=11.1.3
 ARG TARGETARCH=amd64
 
@@ -28,10 +42,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
-# ---------- install coredns static binary ----------
-RUN curl -fsSL "https://github.com/coredns/coredns/releases/download/v${COREDNS_VERSION}/coredns_${COREDNS_VERSION}_linux_${TARGETARCH}.tgz" \
-        | tar -xz -C /usr/local/bin/ \
-    && chmod +x /usr/local/bin/coredns
+# ---------- install custom CoreDNS with sandboxpolicy plugin ----------
+COPY --from=coredns-builder /coredns /usr/local/bin/coredns
+RUN chmod +x /usr/local/bin/coredns
 
 # ---------- install mitmproxy static binary ----------
 RUN curl -fsSL "https://downloads.mitmproxy.org/${MITMPROXY_VERSION}/mitmproxy-${MITMPROXY_VERSION}-linux-x86_64.tar.gz" \
@@ -47,6 +60,7 @@ RUN mkdir -p /var/log/gateway /var/run/gateway /tmp/gateway \
 COPY envoy/envoy-base.yaml /etc/envoy/envoy.yaml
 COPY gateway/Corefile /etc/coredns/Corefile
 COPY mitmproxy/passthrough_addon.py /etc/mitmproxy/passthrough_addon.py
+COPY mitmproxy/policy_addon.py /etc/mitmproxy/policy_addon.py
 COPY gateway/entrypoint.sh /entrypoint.sh
 COPY gateway/healthcheck.sh /healthcheck.sh
 
