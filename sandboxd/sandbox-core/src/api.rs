@@ -45,6 +45,19 @@ pub struct CreateSessionRequest {
     pub disk_gb: Option<u32>,
     /// Path to a custom Lima template (overrides auto-generation).
     pub template: Option<String>,
+    /// Optional policy to apply immediately after session creation.
+    pub policy: Option<crate::policy::Policy>,
+}
+
+/// Request body for `POST /sessions/{id}/policy`.
+///
+/// Contains the full policy document to compile and distribute to the
+/// session's gateway components.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdatePolicyRequest {
+    /// The policy document to apply.
+    #[serde(flatten)]
+    pub policy: crate::policy::Policy,
 }
 
 /// Request body for `POST /sessions/{id}/exec`.
@@ -129,6 +142,7 @@ mod tests {
         assert!(req.memory_mb.is_none());
         assert!(req.disk_gb.is_none());
         assert!(req.template.is_none());
+        assert!(req.policy.is_none());
     }
 
     #[test]
@@ -316,5 +330,55 @@ mod tests {
 
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"gateway_status\":\"running\""));
+    }
+
+    #[test]
+    fn deserialize_update_policy_request() {
+        let json = r#"{
+            "version": "1.0.0",
+            "rules": [
+                {
+                    "destination": "github.com",
+                    "level": "transport",
+                    "protocol": "https"
+                }
+            ]
+        }"#;
+
+        let req: UpdatePolicyRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.policy.version, "1.0.0");
+        assert_eq!(req.policy.rules.len(), 1);
+    }
+
+    #[test]
+    fn deserialize_create_request_with_policy() {
+        let json = r#"{
+            "name": "with-policy",
+            "cpus": 2,
+            "policy": {
+                "version": "1.0.0",
+                "rules": [
+                    {
+                        "destination": "example.com",
+                        "level": "transport"
+                    }
+                ]
+            }
+        }"#;
+
+        let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.name.as_deref(), Some("with-policy"));
+        assert!(req.policy.is_some());
+        let policy = req.policy.unwrap();
+        assert_eq!(policy.version, "1.0.0");
+        assert_eq!(policy.rules.len(), 1);
+    }
+
+    #[test]
+    fn deserialize_create_request_without_policy() {
+        let json = r#"{"name": "no-policy"}"#;
+        let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.name.as_deref(), Some("no-policy"));
+        assert!(req.policy.is_none());
     }
 }

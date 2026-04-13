@@ -1,11 +1,13 @@
 pub mod api;
 pub mod ca;
+pub mod dns_propagation;
 pub mod error;
 pub mod gateway;
 pub mod guest;
 pub mod lima;
 pub mod network;
 pub mod policy;
+pub mod policy_distributor;
 pub mod qmp;
 pub mod session;
 pub mod store;
@@ -13,9 +15,13 @@ pub mod vm_network;
 
 pub use api::{
     CreateSessionRequest, ExecRequest, ExecResponse, GatewayHealth,
-    NetworkHealth, SessionHealth, SessionResponse,
+    NetworkHealth, SessionHealth, SessionResponse, UpdatePolicyRequest,
 };
 pub use ca::{CaManager, generate_ca_inject_script};
+pub use dns_propagation::{
+    DnsCache, DnsCacheEntry, DnsChange, DnsChangeType, ResolvedMapping, ResolvedReport,
+    generate_domain_ip_rules, propagate_dns_changes, read_resolved_json,
+};
 pub use error::{ApiError, SandboxError};
 pub use gateway::{GatewayManager, GatewayStatus};
 pub use guest::{
@@ -28,6 +34,7 @@ pub use policy::{
     AssuranceLevel, CompiledPolicy, CoreDnsConfig, Destination, HttpConstraints, MitmproxyConfig,
     MitmproxyRule, Policy, PolicyCompiler, PolicyRule, Protocol,
 };
+pub use policy_distributor::PolicyDistributor;
 pub use qmp::{QmpClient, mac_from_uuid, tap_name_for_session};
 pub use session::{Session, SessionConfig, SessionState};
 pub use store::SessionStore;

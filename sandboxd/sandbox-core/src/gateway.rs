@@ -462,6 +462,19 @@ impl GatewayManager {
         self.inject_dnat(session_id, network_info, &network_info.gateway_ip)
     }
 
+    /// Inject an arbitrary nftables ruleset into the gateway container's
+    /// network namespace. This is the public entry point for policy modules
+    /// (e.g. DNS propagation, policy distributor) that need to update
+    /// nftables rules outside the base deny-all/DNAT lifecycle.
+    pub fn inject_nftables_ruleset_public(
+        &self,
+        session_id: &Uuid,
+        ruleset: &str,
+        label: &str,
+    ) -> Result<(), SandboxError> {
+        self.inject_nftables_ruleset(session_id, ruleset, label)
+    }
+
     /// Remove the DNAT nftables rules from the gateway container's network
     /// namespace. Called before shutdown to stop routing new traffic.
     pub fn remove_dnat_rules(&self, session_id: &Uuid) -> Result<(), SandboxError> {

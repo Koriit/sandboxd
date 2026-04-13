@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,14 +12,16 @@ use axum::{
 };
 use clap::Parser;
 use sandbox_core::{
-    ApiError, CaManager, CreateSessionRequest, ExecRequest, ExecResponse, GatewayHealth,
+    ApiError, CaManager, CreateSessionRequest, DnsCache, ExecRequest, ExecResponse, GatewayHealth,
     GatewayManager, GatewayStatus, GuestConnector, GuestResponse, LimaManager, NetworkHealth,
-    NetworkManager, SandboxError, Session, SessionConfig, SessionHealth, SessionResponse,
-    SessionState, SessionStore, VmStatus, attach_vm_to_bridge, detach_vm_from_bridge,
-    generate_ca_inject_script,
+    NetworkManager, Policy, PolicyCompiler, PolicyDistributor, SandboxError, Session, SessionConfig,
+    SessionHealth, SessionResponse, SessionState, SessionStore, UpdatePolicyRequest, VmStatus,
+    attach_vm_to_bridge, detach_vm_from_bridge, generate_ca_inject_script, propagate_dns_changes,
+    read_resolved_json,
 };
 use tokio::net::UnixListener;
-use tracing::{error, info, warn};
+use tokio::sync::Mutex;
+use tracing::{debug, error, info, warn};
 
 // ---------------------------------------------------------------------------
 // CLI args
@@ -58,6 +61,12 @@ struct AppState {
     guest: GuestConnector,
     network: Arc<NetworkManager>,
     gateway: Arc<GatewayManager>,
+    /// Handles for DNS propagation background tasks, keyed by session ID.
+    /// Used to cancel the loop when a session is stopped or deleted.
+    dns_loop_handles: Mutex<HashMap<uuid::Uuid, tokio::task::JoinHandle<()>>>,
+    /// Active policies for sessions, keyed by session ID.
+    /// Uses Arc so it can be shared with spawned DNS propagation tasks.
+    session_policies: Arc<Mutex<HashMap<uuid::Uuid, Policy>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -95,6 +104,7 @@ fn app(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}/start", post(start_session))
         .route("/sessions/{id}/stop", post(stop_session))
         .route("/sessions/{id}/exec", post(exec_in_session))
+        .route("/sessions/{id}/policy", post(update_policy))
         .route("/sessions/{id}/health", get(session_health))
         .route("/health", get(health_check))
         .with_state(state)
@@ -196,6 +206,20 @@ async fn create_session(
             // Best-effort teardown of any partial networking state.
             teardown_session_networking(&session_id, &state);
             return error_response(e).into_response();
+        }
+    }
+
+    // If a policy was provided, compile and distribute it.
+    if let Some(policy) = req.policy {
+        match apply_policy(&session_id, &policy, &state).await {
+            Ok(()) => {
+                info!(%session_id, "initial policy applied");
+            }
+            Err(e) => {
+                // Policy failure is non-fatal for session creation -- the
+                // session is still usable, just without policy enforcement.
+                warn!(%session_id, error = %e, "failed to apply initial policy (session created without policy)");
+            }
         }
     }
 
@@ -420,6 +444,9 @@ async fn stop_session(
         .into_response();
     }
 
+    // Cancel DNS propagation loop before tearing down networking.
+    cancel_dns_propagation_loop(&session.id, &state).await;
+
     // Tear down networking resources (TAP, gateway, Docker network) before
     // stopping the VM. The network_info is kept in the DB so `start` can
     // recreate everything. The subnet remains allocated in the
@@ -454,6 +481,9 @@ async fn remove_session(
         }
         Err(e) => return error_response(e).into_response(),
     };
+
+    // Cancel DNS propagation loop before teardown.
+    cancel_dns_propagation_loop(&session.id, &state).await;
 
     // Stop VM if running (ignore errors -- it might already be stopped).
     if session.state == SessionState::Running {
@@ -530,6 +560,238 @@ async fn exec_in_session(
         Err(e) => {
             error!(session_id = %session.id, error = %e, "guest agent exec failed");
             error_response(e).into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Policy handlers
+// ---------------------------------------------------------------------------
+
+/// `POST /sessions/{id}/policy` -- update the policy for a running session.
+async fn update_policy(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdatePolicyRequest>,
+) -> impl IntoResponse {
+    let session = match state.store.get_session_by_name_or_id(&id) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return error_response(SandboxError::SessionNotFound(id)).into_response()
+        }
+        Err(e) => return error_response(e).into_response(),
+    };
+
+    if session.state != SessionState::Running {
+        return error_response(SandboxError::InvalidState(format!(
+            "cannot update policy for session in {} state (must be running)",
+            session.state
+        )))
+        .into_response();
+    }
+
+    match apply_policy(&session.id, &req.policy, &state).await {
+        Ok(()) => {
+            info!(session_id = %session.id, "policy updated");
+            let body = serde_json::json!({
+                "status": "ok",
+                "message": "policy applied successfully",
+            });
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Err(e) => {
+            error!(session_id = %session.id, error = %e, "policy update failed");
+            error_response(e).into_response()
+        }
+    }
+}
+
+/// Apply a policy to a running session: compile, distribute, and start DNS loop.
+async fn apply_policy(
+    session_id: &uuid::Uuid,
+    policy: &Policy,
+    state: &AppState,
+) -> Result<(), SandboxError> {
+    // Look up network info for this session.
+    let network_info = state
+        .store
+        .get_network_info(session_id)?
+        .ok_or_else(|| {
+            SandboxError::Internal(format!(
+                "no network info for session {session_id} (networking not configured)"
+            ))
+        })?;
+
+    // Compile the policy.
+    let compiled = PolicyCompiler::compile(policy, &network_info)?;
+
+    // Distribute to gateway components.
+    PolicyDistributor::distribute(session_id, &compiled, &state.gateway, &network_info)?;
+
+    // Store the policy for the DNS propagation loop.
+    {
+        let mut policies = state.session_policies.lock().await;
+        policies.insert(*session_id, policy.clone());
+    }
+
+    // Start (or restart) the DNS propagation loop.
+    start_dns_propagation_loop(session_id, state).await;
+
+    Ok(())
+}
+
+/// Start (or restart) the DNS propagation background loop for a session.
+///
+/// If a loop is already running for this session, it is cancelled first.
+async fn start_dns_propagation_loop(session_id: &uuid::Uuid, state: &AppState) {
+    // Cancel any existing loop for this session (but preserve the policy).
+    {
+        let mut handles = state.dns_loop_handles.lock().await;
+        if let Some(handle) = handles.remove(session_id) {
+            handle.abort();
+            debug!(
+                session_id = %session_id,
+                "cancelled existing DNS propagation loop for restart"
+            );
+        }
+    }
+
+    let sid = *session_id;
+    let gateway = Arc::clone(&state.gateway);
+
+    let network_info = match state.store.get_network_info(session_id) {
+        Ok(Some(info)) => info,
+        Ok(None) => {
+            warn!(
+                session_id = %session_id,
+                "cannot start DNS propagation: no network info"
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "cannot start DNS propagation: failed to read network info"
+            );
+            return;
+        }
+    };
+
+    let session_policies = Arc::clone(&state.session_policies);
+
+    let handle = tokio::spawn(async move {
+        dns_propagation_loop(sid, gateway, network_info, session_policies).await;
+    });
+
+    let mut handles = state.dns_loop_handles.lock().await;
+    handles.insert(sid, handle);
+}
+
+/// Cancel the DNS propagation loop for a session.
+async fn cancel_dns_propagation_loop(session_id: &uuid::Uuid, state: &AppState) {
+    let mut handles = state.dns_loop_handles.lock().await;
+    if let Some(handle) = handles.remove(session_id) {
+        handle.abort();
+        debug!(
+            session_id = %session_id,
+            "cancelled DNS propagation loop"
+        );
+    }
+
+    // Clean up the stored policy.
+    let mut policies = state.session_policies.lock().await;
+    policies.remove(session_id);
+}
+
+/// Background DNS propagation loop for a single session.
+///
+/// Periodically reads resolved.json from the gateway container, updates
+/// the DNS cache, and propagates IP changes to nftables.
+async fn dns_propagation_loop(
+    session_id: uuid::Uuid,
+    gateway: Arc<GatewayManager>,
+    network_info: sandbox_core::NetworkInfo,
+    session_policies: Arc<Mutex<HashMap<uuid::Uuid, Policy>>>,
+) {
+    let poll_interval = Duration::from_secs(15);
+    let mut cache = DnsCache::new();
+
+    info!(
+        session_id = %session_id,
+        poll_secs = poll_interval.as_secs(),
+        "starting DNS propagation loop"
+    );
+
+    loop {
+        tokio::time::sleep(poll_interval).await;
+
+        // Read the current policy (it may have been updated).
+        let policy = {
+            let policies = session_policies.lock().await;
+            match policies.get(&session_id) {
+                Some(p) => p.clone(),
+                None => {
+                    debug!(
+                        session_id = %session_id,
+                        "DNS propagation loop: no policy found, stopping"
+                    );
+                    return;
+                }
+            }
+        };
+
+        // Read resolved.json from the gateway container.
+        let report = match read_resolved_json(&session_id) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "DNS propagation: failed to read resolved.json"
+                );
+                continue;
+            }
+        };
+
+        // Update the cache and check for changes.
+        let changes = cache.update(&report);
+
+        if changes.is_empty() && !cache.has_expired_entries() {
+            continue;
+        }
+
+        if !changes.is_empty() {
+            for change in &changes {
+                info!(
+                    session_id = %session_id,
+                    domain = %change.domain,
+                    change_type = ?change.change_type,
+                    old_ips = ?change.old_ips,
+                    new_ips = ?change.new_ips,
+                    "DNS change detected"
+                );
+            }
+        }
+
+        if cache.has_expired_entries() {
+            let expired = cache.expired_domains();
+            debug!(
+                session_id = %session_id,
+                expired_domains = ?expired,
+                "TTL-expired domains detected, will re-propagate"
+            );
+        }
+
+        // Propagate the current cache state to nftables.
+        if let Err(e) =
+            propagate_dns_changes(&session_id, &policy, &cache, &gateway, &network_info)
+        {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "DNS propagation: failed to update nftables"
+            );
         }
     }
 }
@@ -1347,6 +1609,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         guest,
         network,
         gateway,
+        dns_loop_handles: Mutex::new(HashMap::new()),
+        session_policies: Arc::new(Mutex::new(HashMap::new())),
     });
 
     // Run networking reconciliation: restart crashed gateways, clean up

@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use http_body_util::BodyExt;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
-use sandbox_core::{ApiError, ExecResponse, Session, SessionHealth, SessionResponse};
+use sandbox_core::{ApiError, ExecResponse, Policy, Session, SessionHealth, SessionResponse};
 use tokio::net::UnixStream;
 
 /// CLI client for managing sandbox sessions.
@@ -39,6 +39,9 @@ enum Command {
         /// Path to a custom Lima template.
         #[arg(long)]
         template: Option<String>,
+        /// Path to a policy JSON file to apply after creation.
+        #[arg(long)]
+        policy: Option<String>,
     },
     /// Start a sandbox session.
     Start {
@@ -89,10 +92,27 @@ enum Command {
         #[arg(long, default_value_t = 100)]
         tail: u32,
     },
+    /// Update the network policy for a running sandbox session.
+    Policy {
+        #[command(subcommand)]
+        action: PolicyAction,
+    },
     /// Show detailed health status of a sandbox session.
     Health {
         /// Session name or ID.
         session: String,
+    },
+}
+
+/// Policy subcommands.
+#[derive(Subcommand, Debug, Clone)]
+enum PolicyAction {
+    /// Apply a policy from a JSON file to a session.
+    Update {
+        /// Session name or ID.
+        session: String,
+        /// Path to the policy JSON file.
+        policy_path: String,
     },
 }
 
@@ -121,6 +141,7 @@ fn build_request(command: &Command) -> Option<Request<String>> {
             memory,
             disk,
             template,
+            policy,
         } => {
             let mut body = serde_json::Map::new();
             if let Some(n) = name {
@@ -131,6 +152,23 @@ fn build_request(command: &Command) -> Option<Request<String>> {
             body.insert("disk_gb".into(), serde_json::json!(*disk));
             if let Some(t) = template {
                 body.insert("template".into(), serde_json::Value::String(t.clone()));
+            }
+            if let Some(policy_path) = policy {
+                let policy_json = match std::fs::read_to_string(policy_path) {
+                    Ok(content) => content,
+                    Err(e) => {
+                        eprintln!("Error: cannot read policy file '{policy_path}': {e}");
+                        process::exit(1);
+                    }
+                };
+                let policy_value: serde_json::Value = match serde_json::from_str(&policy_json) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("Error: invalid policy JSON in '{policy_path}': {e}");
+                        process::exit(1);
+                    }
+                };
+                body.insert("policy".into(), policy_value);
             }
             let body_str = serde_json::Value::Object(body).to_string();
             Request::builder()
@@ -178,6 +216,31 @@ fn build_request(command: &Command) -> Option<Request<String>> {
                 .body(body.to_string())
                 .expect("failed to build request")
         }
+        Command::Policy { action } => match action {
+            PolicyAction::Update {
+                session,
+                policy_path,
+            } => {
+                let policy_json = match std::fs::read_to_string(policy_path) {
+                    Ok(content) => content,
+                    Err(e) => {
+                        eprintln!("Error: cannot read policy file '{policy_path}': {e}");
+                        process::exit(1);
+                    }
+                };
+                // Validate that it parses as a Policy before sending.
+                if let Err(e) = serde_json::from_str::<Policy>(&policy_json) {
+                    eprintln!("Error: invalid policy JSON in '{policy_path}': {e}");
+                    process::exit(1);
+                }
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/sessions/{session}/policy"))
+                    .header("content-type", "application/json")
+                    .body(policy_json)
+                    .expect("failed to build request")
+            }
+        },
         Command::Health { session } => Request::builder()
             .method("GET")
             .uri(format!("/sessions/{session}/health"))
@@ -360,6 +423,15 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
             }
             if result.exit_code != 0 {
                 process::exit(result.exit_code);
+            }
+        }
+        Command::Policy { .. } => {
+            let result: serde_json::Value = serde_json::from_str(body)
+                .map_err(|e| format!("failed to parse policy response: {e}"))?;
+            if let Some(message) = result.get("message").and_then(|m| m.as_str()) {
+                println!("{message}");
+            } else {
+                println!("Policy updated.");
             }
         }
         Command::Health { .. } => {
@@ -592,6 +664,7 @@ mod tests {
                 memory: 4096,
                 disk: 20,
                 template: None,
+                policy: None,
             }
         ));
     }
@@ -618,6 +691,7 @@ mod tests {
                 memory,
                 disk,
                 template,
+                ..
             } => {
                 assert_eq!(name.as_deref(), Some("full"));
                 assert_eq!(*cpus, 4);
@@ -724,6 +798,7 @@ mod tests {
             memory: 4096,
             disk: 20,
             template: None,
+            policy: None,
         };
         let req = build_request(&cmd).expect("should produce request");
         assert_eq!(req.method(), "POST");
@@ -743,6 +818,7 @@ mod tests {
             memory: 8192,
             disk: 50,
             template: None,
+            policy: None,
         };
         let req = build_request(&cmd).expect("should produce request");
         assert_eq!(req.method(), "POST");
@@ -762,6 +838,7 @@ mod tests {
             memory: 4096,
             disk: 20,
             template: Some("/tmp/my-template.yaml".into()),
+            policy: None,
         };
         let req = build_request(&cmd).expect("should produce request");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -993,5 +1070,58 @@ mod tests {
             tail: 100,
         };
         assert!(build_request(&cmd).is_none());
+    }
+
+    #[test]
+    fn parse_policy_update() {
+        let cli = Cli::parse_from([
+            "sandbox",
+            "policy",
+            "update",
+            "my-session",
+            "/tmp/policy.json",
+        ]);
+        match &cli.command {
+            Command::Policy {
+                action: PolicyAction::Update {
+                    session,
+                    policy_path,
+                },
+            } => {
+                assert_eq!(session, "my-session");
+                assert_eq!(policy_path, "/tmp/policy.json");
+            }
+            _ => panic!("expected Policy Update command"),
+        }
+    }
+
+    #[test]
+    fn parse_create_with_policy_flag() {
+        let cli = Cli::parse_from([
+            "sandbox",
+            "create",
+            "--name",
+            "test",
+            "--policy",
+            "/tmp/policy.json",
+        ]);
+        match &cli.command {
+            Command::Create { name, policy, .. } => {
+                assert_eq!(name.as_deref(), Some("test"));
+                assert_eq!(policy.as_deref(), Some("/tmp/policy.json"));
+            }
+            _ => panic!("expected Create command"),
+        }
+    }
+
+    #[test]
+    fn parse_create_without_policy_flag() {
+        let cli = Cli::parse_from(["sandbox", "create"]);
+        match &cli.command {
+            Command::Create { policy, .. } => {
+                assert!(policy.is_none());
+            }
+            _ => panic!("expected Create command"),
+        }
     }
 }
