@@ -504,6 +504,8 @@ async fn start_session(
         .into_response();
     }
 
+    info!(session_id = %session.id, "starting session");
+
     // Start the Lima VM.
     if let Err(e) = state.lima.start_vm(&session.id, &session.config) {
         let _ = state.store.update_state(&session.id, SessionState::Error);
@@ -578,6 +580,8 @@ async fn stop_session(
         .into_response();
     }
 
+    info!(session_id = %session.id, "stopping session");
+
     // Cancel DNS propagation loop before tearing down networking.
     cancel_dns_propagation_loop(&session.id, &state).await;
 
@@ -595,6 +599,8 @@ async fn stop_session(
     if let Err(e) = state.store.update_state(&session.id, SessionState::Stopped) {
         return error_response(e).into_response();
     }
+
+    info!(session_id = %session.id, "session stopped");
 
     match state.store.get_session(&session.id) {
         Ok(Some(s)) => (StatusCode::OK, Json(s)).into_response(),
@@ -616,6 +622,13 @@ async fn remove_session(
         Err(e) => return error_response(e).into_response(),
     };
 
+    info!(
+        session_id = %session.id,
+        name = ?session.name,
+        state = %session.state,
+        "removing session"
+    );
+
     // Cancel DNS propagation loop before teardown.
     cancel_dns_propagation_loop(&session.id, &state).await;
 
@@ -635,6 +648,7 @@ async fn remove_session(
         return error_response(e).into_response();
     }
 
+    info!(session_id = %session.id, "session removed");
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -1264,6 +1278,7 @@ async fn setup_session_networking(
 /// The CA certificate files on disk are NOT removed — they are reused on
 /// start.
 fn teardown_session_networking(session_id: &uuid::Uuid, state: &AppState) {
+    debug!(session_id = %session_id, "tearing down session networking (preserving allocation)");
     if let Err(e) = detach_vm_from_bridge(session_id, &state.network) {
         warn!(%session_id, error = %e, "failed to detach VM from bridge (best-effort)");
     }
@@ -1278,6 +1293,7 @@ fn teardown_session_networking(session_id: &uuid::Uuid, state: &AppState) {
 /// Full teardown: remove all networking resources AND release the subnet
 /// allocation. Used when deleting a session permanently.
 fn teardown_session_networking_full(session_id: &uuid::Uuid, state: &AppState) {
+    debug!(session_id = %session_id, "tearing down session networking (full cleanup)");
     if let Err(e) = detach_vm_from_bridge(session_id, &state.network) {
         warn!(%session_id, error = %e, "failed to detach VM from bridge (best-effort)");
     }
@@ -1920,6 +1936,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let base_dir = PathBuf::from(&args.base_dir);
     let socket_path = PathBuf::from(&args.socket);
+
+    info!(
+        base_dir = %base_dir.display(),
+        socket = %socket_path.display(),
+        "sandboxd starting"
+    );
 
     // Create the base directory if it doesn't exist.
     tokio::fs::create_dir_all(&base_dir).await?;

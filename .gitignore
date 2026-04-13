@@ -4,6 +4,7 @@
 .trash/
 *.swp
 .venv/
+.idea/
 
 # Rust build artifacts
 /sandboxd/target/

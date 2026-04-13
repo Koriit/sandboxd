@@ -152,6 +152,17 @@ impl LimaManager {
         std::fs::write(&template_path, &template)?;
 
         let vm_name = vm_name(session_id);
+
+        info!(
+            session_id = %session_id,
+            vm = %vm_name,
+            cpus = config.cpus,
+            memory_mb = config.memory_mb,
+            disk_gb = config.disk_gb,
+            hardened = config.hardened,
+            "creating VM"
+        );
+
         let output = Command::new(&self.limactl)
             .args(["create", "--name", &vm_name])
             .arg(&template_path)
@@ -164,6 +175,7 @@ impl LimaManager {
             return Err(parse_limactl_error("create", &stderr));
         }
 
+        info!(session_id = %session_id, vm = %vm_name, "VM created");
         Ok(())
     }
 
@@ -183,6 +195,14 @@ impl LimaManager {
         std::fs::copy(template_path, &dest)?;
 
         let vm_name = vm_name(session_id);
+
+        info!(
+            session_id = %session_id,
+            vm = %vm_name,
+            template = %template_path.display(),
+            "creating VM with custom template"
+        );
+
         let output = Command::new(&self.limactl)
             .args(["create", "--name", &vm_name])
             .arg(&dest)
@@ -195,6 +215,7 @@ impl LimaManager {
             return Err(parse_limactl_error("create", &stderr));
         }
 
+        info!(session_id = %session_id, vm = %vm_name, "VM created with custom template");
         Ok(())
     }
 
@@ -214,6 +235,13 @@ impl LimaManager {
         let vm_name = vm_name(session_id);
         let qemu_wrapper = self.ensure_qemu_wrapper()?;
 
+        info!(
+            session_id = %session_id,
+            vm = %vm_name,
+            hardened = config.hardened,
+            "starting VM"
+        );
+
         let hardened_flag = if config.hardened { "1" } else { "0" };
         let output = Command::new(&self.limactl)
             .args(["start", &vm_name])
@@ -230,12 +258,16 @@ impl LimaManager {
             return Err(parse_limactl_error("start", &stderr));
         }
 
+        info!(session_id = %session_id, vm = %vm_name, "VM started");
         Ok(())
     }
 
     /// Stop a running VM.
     pub fn stop_vm(&self, session_id: &Uuid) -> Result<(), SandboxError> {
         let vm_name = vm_name(session_id);
+
+        info!(session_id = %session_id, vm = %vm_name, "stopping VM");
+
         let output = Command::new(&self.limactl)
             .args(["stop", &vm_name])
             .arg("--tty=false")
@@ -247,12 +279,16 @@ impl LimaManager {
             return Err(parse_limactl_error("stop", &stderr));
         }
 
+        info!(session_id = %session_id, vm = %vm_name, "VM stopped");
         Ok(())
     }
 
     /// Force-delete a VM and its Lima data.
     pub fn delete_vm(&self, session_id: &Uuid) -> Result<(), SandboxError> {
         let vm_name = vm_name(session_id);
+
+        info!(session_id = %session_id, vm = %vm_name, "deleting VM");
+
         let output = Command::new(&self.limactl)
             .args(["delete", "--force", &vm_name])
             .arg("--tty=false")
@@ -264,6 +300,7 @@ impl LimaManager {
             return Err(parse_limactl_error("delete", &stderr));
         }
 
+        info!(session_id = %session_id, vm = %vm_name, "VM deleted");
         Ok(())
     }
 
@@ -511,6 +548,11 @@ provision:
     #!/bin/bash
     set -eux -o pipefail
     hostnamectl set-hostname {hostname}
+    # Add hostname to /etc/hosts so 'sudo' and other tools that resolve
+    # the local hostname do not emit "unable to resolve host" warnings.
+    if ! grep -q '{hostname}' /etc/hosts; then
+      echo "127.0.1.1 {hostname}" >> /etc/hosts
+    fi
 - mode: system
   script: |
     #!/bin/bash
