@@ -503,37 +503,104 @@ impl PolicyCompiler {
 
     /// Compile Envoy configuration for the policy.
     ///
-    /// For level 1: opaque TCP passthrough. Generates per-destination filter
-    /// chain entries that match by destination port and forward via TCP proxy
-    /// using the `original_dst` cluster.
+    /// Supports all assurance levels:
+    /// - Level 1 (transport): default filter chain with TCP passthrough to
+    ///   `original_dst`. nftables controls which IPs reach Envoy.
+    /// - Level 2 (TLS): SNI-matched filter chains forwarding to `original_dst`.
+    ///   The `tls_inspector` listener filter extracts SNI from ClientHello.
+    /// - Level 3 (full): SNI-matched filter chains forwarding to `mitmproxy`
+    ///   cluster (127.0.0.1:8080) for HTTPS inspection.
+    ///
+    /// When L2 or L3 rules are present, `tls_inspector` is added as a listener
+    /// filter. The `original_dst` listener filter is always present.
+    ///
+    /// Filter chain ordering: L2/L3 SNI-matched chains first (order does not
+    /// matter among them since SNI matches are disjoint), then the L1 default
+    /// catch-all chain last.
     fn compile_envoy(policy: &Policy) -> String {
-        let has_transport_rules = policy
+        let has_transport = policy
             .rules
             .iter()
             .any(|r| r.level == AssuranceLevel::Transport);
+        let has_tls = policy
+            .rules
+            .iter()
+            .any(|r| r.level == AssuranceLevel::Tls);
+        let has_full = policy
+            .rules
+            .iter()
+            .any(|r| r.level == AssuranceLevel::Full);
 
         // For a policy with only deny rules, or no rules at all, return a
         // minimal Envoy config that rejects everything.
-        if !has_transport_rules && !policy.rules.iter().any(|r| r.level.as_u8() > 0) {
+        if !has_transport && !has_tls && !has_full {
             return Self::envoy_deny_all();
         }
 
-        // For level 1 transport rules, the existing base Envoy config
-        // (original_dst cluster with TCP passthrough) is sufficient. We
-        // regenerate it here to ensure it is self-contained.
+        let needs_tls_inspector = has_tls || has_full;
+
+        // -- Listener filters ---------------------------------------------------
+
+        let mut listener_filters = Vec::new();
+
+        if needs_tls_inspector {
+            listener_filters.push(
+                r#"        - name: envoy.filters.listener.tls_inspector
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector"#
+                    .to_string(),
+            );
+        }
+
+        listener_filters.push(
+            r#"        - name: envoy.filters.listener.original_dst
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.listener.original_dst.v3.OriginalDst"#
+                .to_string(),
+        );
+
+        let listener_filters_yaml = listener_filters.join("\n");
+
+        // -- Filter chains ------------------------------------------------------
+
         let mut filter_chains = Vec::new();
 
-        // Collect all unique destinations with transport-level access.
-        let transport_rules: Vec<&PolicyRule> = policy
-            .rules
-            .iter()
-            .filter(|r| r.level == AssuranceLevel::Transport)
-            .collect();
+        // Level 2 (TLS): SNI-matched chains → original_dst.
+        for rule in policy.rules.iter().filter(|r| r.level == AssuranceLevel::Tls) {
+            let domain = rule.destination.to_string();
+            let stat_name = Self::sanitize_stat_prefix(&domain);
+            filter_chains.push(format!(
+                r#"        - filter_chain_match:
+            server_names: ["{domain}"]
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                cluster: original_dst
+                stat_prefix: level2_{stat_name}"#
+            ));
+        }
 
-        if !transport_rules.is_empty() {
-            // For level 1 transport, a single default filter chain with TCP
-            // proxy to original_dst handles all allowed destinations. The
-            // nftables layer controls which IPs reach Envoy.
+        // Level 3 (full): SNI-matched chains → mitmproxy.
+        for rule in policy.rules.iter().filter(|r| r.level == AssuranceLevel::Full) {
+            let domain = rule.destination.to_string();
+            let stat_name = Self::sanitize_stat_prefix(&domain);
+            filter_chains.push(format!(
+                r#"        - filter_chain_match:
+            server_names: ["{domain}"]
+          filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                cluster: mitmproxy
+                stat_prefix: level3_{stat_name}"#
+            ));
+        }
+
+        // Level 1 (transport): default catch-all chain → original_dst.
+        // This must be last since it has no filter_chain_match and acts as the
+        // default route for traffic that does not match any SNI-specific chain.
+        if has_transport {
             filter_chains.push(
                 r#"        - filters:
             - name: envoy.filters.network.tcp_proxy
@@ -547,6 +614,38 @@ impl PolicyCompiler {
 
         let filter_chains_yaml = filter_chains.join("\n");
 
+        // -- Clusters -----------------------------------------------------------
+
+        let mut clusters = Vec::new();
+
+        // original_dst is always needed (L1 passthrough and L2 forwarding).
+        clusters.push(
+            r#"    - name: original_dst
+      type: ORIGINAL_DST
+      lb_policy: CLUSTER_PROVIDED
+      connect_timeout: 10s"#
+                .to_string(),
+        );
+
+        if has_full {
+            clusters.push(
+                r#"    - name: mitmproxy
+      type: STATIC
+      load_assignment:
+        cluster_name: mitmproxy
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 8080"#
+                    .to_string(),
+            );
+        }
+
+        let clusters_yaml = clusters.join("\n");
+
         format!(
             r#"# Envoy configuration (generated by sandbox policy engine)
 static_resources:
@@ -557,17 +656,12 @@ static_resources:
           address: 0.0.0.0
           port_value: 10000
       listener_filters:
-        - name: envoy.filters.listener.original_dst
-          typed_config:
-            "@type": type.googleapis.com/envoy.extensions.filters.listener.original_dst.v3.OriginalDst
+{listener_filters_yaml}
       filter_chains:
 {filter_chains_yaml}
 
   clusters:
-    - name: original_dst
-      type: ORIGINAL_DST
-      lb_policy: CLUSTER_PROVIDED
-      connect_timeout: 10s
+{clusters_yaml}
 
 admin:
   address:
@@ -576,6 +670,16 @@ admin:
       port_value: 9901
 "#
         )
+    }
+
+    /// Sanitize a domain name into a valid Envoy stat prefix.
+    ///
+    /// Replaces dots, asterisks, and slashes with underscores.
+    fn sanitize_stat_prefix(domain: &str) -> String {
+        domain
+            .replace('.', "_")
+            .replace('*', "wildcard")
+            .replace('/', "_")
     }
 
     /// Compile mitmproxy configuration for the policy.
@@ -1769,6 +1873,713 @@ mod tests {
         assert!(
             compiled.nftables_rules.contains("8.8.8.0/24"),
             "nftables should contain the UDP CIDR"
+        );
+    }
+
+    // -- Test helpers (L2/L3) -------------------------------------------------
+
+    fn tls_policy() -> Policy {
+        Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![
+                PolicyRule {
+                    destination: Destination::Domain("secure.example.com".to_string()),
+                    level: AssuranceLevel::Tls,
+                    protocol: Protocol::Https,
+                    constraints: None,
+                    reason: Some("TLS passthrough".to_string()),
+                },
+                PolicyRule {
+                    destination: Destination::Domain("api.secure.io".to_string()),
+                    level: AssuranceLevel::Tls,
+                    protocol: Protocol::Https,
+                    constraints: None,
+                    reason: Some("Another TLS destination".to_string()),
+                },
+            ],
+        }
+    }
+
+    fn full_policy() -> Policy {
+        Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![PolicyRule {
+                destination: Destination::Domain("inspected.example.com".to_string()),
+                level: AssuranceLevel::Full,
+                protocol: Protocol::Https,
+                constraints: None,
+                reason: Some("Full inspection".to_string()),
+            }],
+        }
+    }
+
+    fn full_policy_with_constraints() -> Policy {
+        Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![PolicyRule {
+                destination: Destination::Domain("api.example.com".to_string()),
+                level: AssuranceLevel::Full,
+                protocol: Protocol::Https,
+                constraints: Some(HttpConstraints {
+                    methods: vec!["GET".to_string(), "POST".to_string()],
+                    paths: vec!["/api/v1/".to_string(), "/health".to_string()],
+                }),
+                reason: Some("Constrained API access".to_string()),
+            }],
+        }
+    }
+
+    fn mixed_l1_l2_l3_policy() -> Policy {
+        Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![
+                PolicyRule {
+                    destination: Destination::Domain("github.com".to_string()),
+                    level: AssuranceLevel::Transport,
+                    protocol: Protocol::Https,
+                    constraints: None,
+                    reason: Some("L1 transport".to_string()),
+                },
+                PolicyRule {
+                    destination: Destination::Domain("pinned.example.com".to_string()),
+                    level: AssuranceLevel::Tls,
+                    protocol: Protocol::Https,
+                    constraints: None,
+                    reason: Some("L2 TLS passthrough".to_string()),
+                },
+                PolicyRule {
+                    destination: Destination::Domain("monitored.example.com".to_string()),
+                    level: AssuranceLevel::Full,
+                    protocol: Protocol::Https,
+                    constraints: Some(HttpConstraints {
+                        methods: vec!["GET".to_string()],
+                        paths: vec!["/api/".to_string()],
+                    }),
+                    reason: Some("L3 full inspection".to_string()),
+                },
+            ],
+        }
+    }
+
+    // -- Level 2 compilation (TLS/SNI) ----------------------------------------
+
+    #[test]
+    fn compile_level2_envoy_has_tls_inspector() {
+        let policy = tls_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        assert!(
+            compiled
+                .envoy_config
+                .contains("envoy.filters.listener.tls_inspector"),
+            "L2 Envoy config must include tls_inspector listener filter"
+        );
+    }
+
+    #[test]
+    fn compile_level2_envoy_has_sni_filter_chains() {
+        let policy = tls_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        assert!(
+            compiled.envoy_config.contains("server_names: [\"secure.example.com\"]"),
+            "L2 Envoy config must have SNI match for secure.example.com"
+        );
+        assert!(
+            compiled.envoy_config.contains("server_names: [\"api.secure.io\"]"),
+            "L2 Envoy config must have SNI match for api.secure.io"
+        );
+    }
+
+    #[test]
+    fn compile_level2_envoy_routes_to_original_dst() {
+        let policy = tls_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        // Both L2 filter chains should route to original_dst (no MITM).
+        assert!(
+            compiled.envoy_config.contains("level2_secure_example_com"),
+            "L2 filter chain should have level2_ stat prefix"
+        );
+        assert!(
+            compiled.envoy_config.contains("level2_api_secure_io"),
+            "L2 filter chain should have level2_ stat prefix for second domain"
+        );
+    }
+
+    #[test]
+    fn compile_level2_envoy_has_original_dst_listener_filter() {
+        let policy = tls_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        assert!(
+            compiled
+                .envoy_config
+                .contains("envoy.filters.listener.original_dst"),
+            "L2 Envoy config must still include original_dst listener filter"
+        );
+    }
+
+    #[test]
+    fn compile_level2_no_mitmproxy_cluster() {
+        let policy = tls_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        // L2-only should not include mitmproxy cluster.
+        assert!(
+            !compiled.envoy_config.contains("name: mitmproxy"),
+            "L2-only Envoy config should not include mitmproxy cluster"
+        );
+    }
+
+    #[test]
+    fn compile_level2_no_default_filter_chain() {
+        let policy = tls_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        // Without L1 transport rules, there should be no default (unmatch) chain.
+        assert!(
+            !compiled.envoy_config.contains("policy_tcp_passthrough"),
+            "L2-only Envoy config should not include a default passthrough chain"
+        );
+    }
+
+    #[test]
+    fn compile_level2_mitmproxy_config_empty() {
+        let policy = tls_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        let config: MitmproxyConfig =
+            serde_json::from_str(&compiled.mitmproxy_config).unwrap();
+        assert!(
+            config.rules.is_empty(),
+            "L2-only policy should produce no mitmproxy rules"
+        );
+    }
+
+    #[test]
+    fn compile_level2_coredns_includes_domains() {
+        let policy = tls_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        assert!(compiled.coredns_config.contains("secure.example.com"));
+        assert!(compiled.coredns_config.contains("api.secure.io"));
+    }
+
+    #[test]
+    fn compile_level2_nftables_includes_domains() {
+        let policy = tls_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        // Domain rules produce placeholder comments in nftables.
+        assert!(
+            compiled.nftables_rules.contains("# domain: secure.example.com"),
+            "nftables should contain L2 domain placeholder"
+        );
+        assert!(
+            compiled.nftables_rules.contains("(level: tls"),
+            "nftables placeholder should indicate tls level"
+        );
+    }
+
+    // -- Level 3 compilation (full/mitmproxy) ---------------------------------
+
+    #[test]
+    fn compile_level3_envoy_has_tls_inspector() {
+        let policy = full_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        assert!(
+            compiled
+                .envoy_config
+                .contains("envoy.filters.listener.tls_inspector"),
+            "L3 Envoy config must include tls_inspector listener filter"
+        );
+    }
+
+    #[test]
+    fn compile_level3_envoy_routes_to_mitmproxy() {
+        let policy = full_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        assert!(
+            compiled.envoy_config.contains("server_names: [\"inspected.example.com\"]"),
+            "L3 Envoy config must have SNI match for the inspected domain"
+        );
+        assert!(
+            compiled.envoy_config.contains("cluster: mitmproxy"),
+            "L3 filter chain must route to mitmproxy cluster"
+        );
+        assert!(
+            compiled.envoy_config.contains("level3_inspected_example_com"),
+            "L3 filter chain should have level3_ stat prefix"
+        );
+    }
+
+    #[test]
+    fn compile_level3_envoy_has_mitmproxy_cluster() {
+        let policy = full_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        assert!(
+            compiled.envoy_config.contains("name: mitmproxy"),
+            "L3 Envoy config must define mitmproxy cluster"
+        );
+        assert!(
+            compiled.envoy_config.contains("type: STATIC"),
+            "mitmproxy cluster must be STATIC type"
+        );
+        assert!(
+            compiled.envoy_config.contains("port_value: 8080"),
+            "mitmproxy cluster must point to port 8080"
+        );
+        assert!(
+            compiled.envoy_config.contains("address: 127.0.0.1"),
+            "mitmproxy cluster must point to 127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn compile_level3_mitmproxy_has_rules() {
+        let policy = full_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        let config: MitmproxyConfig =
+            serde_json::from_str(&compiled.mitmproxy_config).unwrap();
+        assert_eq!(config.rules.len(), 1);
+        assert_eq!(config.rules[0].host, "inspected.example.com");
+        // No constraints = methods and paths are None (allow all).
+        assert!(config.rules[0].methods.is_none());
+        assert!(config.rules[0].paths.is_none());
+    }
+
+    #[test]
+    fn compile_level3_with_constraints_mitmproxy() {
+        let policy = full_policy_with_constraints();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        let config: MitmproxyConfig =
+            serde_json::from_str(&compiled.mitmproxy_config).unwrap();
+        assert_eq!(config.rules.len(), 1);
+        assert_eq!(config.rules[0].host, "api.example.com");
+
+        let methods = config.rules[0].methods.as_ref().unwrap();
+        assert_eq!(methods, &["GET", "POST"]);
+
+        let paths = config.rules[0].paths.as_ref().unwrap();
+        assert_eq!(paths, &["/api/v1/", "/health"]);
+    }
+
+    #[test]
+    fn compile_level3_coredns_includes_domain() {
+        let policy = full_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        assert!(compiled.coredns_config.contains("inspected.example.com"));
+    }
+
+    // -- Mixed policy (L1+L2+L3) ----------------------------------------------
+
+    #[test]
+    fn compile_mixed_l1_l2_l3_envoy_has_all_listener_filters() {
+        let policy = mixed_l1_l2_l3_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        assert!(
+            compiled
+                .envoy_config
+                .contains("envoy.filters.listener.tls_inspector"),
+            "mixed policy must include tls_inspector"
+        );
+        assert!(
+            compiled
+                .envoy_config
+                .contains("envoy.filters.listener.original_dst"),
+            "mixed policy must include original_dst listener filter"
+        );
+    }
+
+    #[test]
+    fn compile_mixed_l1_l2_l3_envoy_has_sni_chains() {
+        let policy = mixed_l1_l2_l3_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        // L2 SNI chain
+        assert!(
+            compiled.envoy_config.contains("server_names: [\"pinned.example.com\"]"),
+            "mixed policy must have L2 SNI chain"
+        );
+        assert!(
+            compiled.envoy_config.contains("level2_pinned_example_com"),
+            "mixed policy must have L2 stat prefix"
+        );
+
+        // L3 SNI chain
+        assert!(
+            compiled.envoy_config.contains("server_names: [\"monitored.example.com\"]"),
+            "mixed policy must have L3 SNI chain"
+        );
+        assert!(
+            compiled.envoy_config.contains("level3_monitored_example_com"),
+            "mixed policy must have L3 stat prefix"
+        );
+    }
+
+    #[test]
+    fn compile_mixed_l1_l2_l3_envoy_has_default_chain() {
+        let policy = mixed_l1_l2_l3_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        assert!(
+            compiled.envoy_config.contains("policy_tcp_passthrough"),
+            "mixed policy must have L1 default passthrough chain"
+        );
+    }
+
+    #[test]
+    fn compile_mixed_l1_l2_l3_envoy_default_chain_is_last() {
+        let policy = mixed_l1_l2_l3_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        // The default passthrough chain (no filter_chain_match) must come after
+        // the SNI-specific chains. We verify by checking that
+        // "policy_tcp_passthrough" appears after all "server_names" entries.
+        let passthrough_pos = compiled
+            .envoy_config
+            .find("policy_tcp_passthrough")
+            .expect("must contain passthrough");
+        let last_sni_pos = compiled
+            .envoy_config
+            .rfind("server_names")
+            .expect("must contain server_names");
+        assert!(
+            passthrough_pos > last_sni_pos,
+            "default passthrough chain must come after all SNI-matched chains"
+        );
+    }
+
+    #[test]
+    fn compile_mixed_l1_l2_l3_envoy_has_both_clusters() {
+        let policy = mixed_l1_l2_l3_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        assert!(
+            compiled.envoy_config.contains("name: original_dst"),
+            "mixed policy must have original_dst cluster"
+        );
+        assert!(
+            compiled.envoy_config.contains("name: mitmproxy"),
+            "mixed policy must have mitmproxy cluster"
+        );
+    }
+
+    #[test]
+    fn compile_mixed_l1_l2_l3_mitmproxy_has_l3_rules_only() {
+        let policy = mixed_l1_l2_l3_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        let config: MitmproxyConfig =
+            serde_json::from_str(&compiled.mitmproxy_config).unwrap();
+
+        // Only L3 destinations appear in mitmproxy config.
+        assert_eq!(config.rules.len(), 1);
+        assert_eq!(config.rules[0].host, "monitored.example.com");
+
+        // L3 rule with constraints should have methods and paths.
+        let methods = config.rules[0].methods.as_ref().unwrap();
+        assert_eq!(methods, &["GET"]);
+        let paths = config.rules[0].paths.as_ref().unwrap();
+        assert_eq!(paths, &["/api/"]);
+    }
+
+    #[test]
+    fn compile_mixed_l1_l2_l3_coredns_includes_all_allowed() {
+        let policy = mixed_l1_l2_l3_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        assert!(compiled.coredns_config.contains("github.com"));
+        assert!(compiled.coredns_config.contains("pinned.example.com"));
+        assert!(compiled.coredns_config.contains("monitored.example.com"));
+    }
+
+    #[test]
+    fn compile_mixed_l1_l2_l3_nftables_includes_all_allowed() {
+        let policy = mixed_l1_l2_l3_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        // All non-deny domain rules produce nftables placeholders.
+        assert!(compiled.nftables_rules.contains("# domain: github.com"));
+        assert!(compiled.nftables_rules.contains("# domain: pinned.example.com"));
+        assert!(compiled.nftables_rules.contains("# domain: monitored.example.com"));
+    }
+
+    // -- Edge cases: wildcard domains in SNI -----------------------------------
+
+    #[test]
+    fn compile_level2_wildcard_domain_sni() {
+        let policy = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![PolicyRule {
+                destination: Destination::Domain("*.example.com".to_string()),
+                level: AssuranceLevel::Tls,
+                protocol: Protocol::Https,
+                constraints: None,
+                reason: None,
+            }],
+        };
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        // Wildcard domains are passed to Envoy SNI matching as-is. Envoy
+        // supports wildcard SNI matching in filter_chain_match.
+        assert!(
+            compiled.envoy_config.contains("server_names: [\"*.example.com\"]"),
+            "wildcard domain should appear in SNI match"
+        );
+        assert!(
+            compiled.envoy_config.contains("level2_wildcard_example_com"),
+            "wildcard stat prefix should use 'wildcard' replacement"
+        );
+    }
+
+    #[test]
+    fn compile_level3_wildcard_domain_sni() {
+        let policy = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![PolicyRule {
+                destination: Destination::Domain("*.inspected.io".to_string()),
+                level: AssuranceLevel::Full,
+                protocol: Protocol::Https,
+                constraints: None,
+                reason: None,
+            }],
+        };
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        assert!(
+            compiled.envoy_config.contains("server_names: [\"*.inspected.io\"]"),
+            "wildcard domain should appear in L3 SNI match"
+        );
+        assert!(
+            compiled.envoy_config.contains("cluster: mitmproxy"),
+            "wildcard L3 chain must route to mitmproxy"
+        );
+        assert!(
+            compiled.envoy_config.contains("level3_wildcard_inspected_io"),
+            "wildcard L3 stat prefix should use 'wildcard' replacement"
+        );
+    }
+
+    // -- Edge cases: multiple destinations at same level -----------------------
+
+    #[test]
+    fn compile_multiple_level2_destinations() {
+        let policy = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![
+                PolicyRule {
+                    destination: Destination::Domain("a.example.com".to_string()),
+                    level: AssuranceLevel::Tls,
+                    protocol: Protocol::Https,
+                    constraints: None,
+                    reason: None,
+                },
+                PolicyRule {
+                    destination: Destination::Domain("b.example.com".to_string()),
+                    level: AssuranceLevel::Tls,
+                    protocol: Protocol::Https,
+                    constraints: None,
+                    reason: None,
+                },
+                PolicyRule {
+                    destination: Destination::Domain("c.example.com".to_string()),
+                    level: AssuranceLevel::Tls,
+                    protocol: Protocol::Https,
+                    constraints: None,
+                    reason: None,
+                },
+            ],
+        };
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        // Each L2 destination gets its own filter chain.
+        assert!(compiled.envoy_config.contains("server_names: [\"a.example.com\"]"));
+        assert!(compiled.envoy_config.contains("server_names: [\"b.example.com\"]"));
+        assert!(compiled.envoy_config.contains("server_names: [\"c.example.com\"]"));
+
+        // All route to original_dst (not mitmproxy).
+        assert!(!compiled.envoy_config.contains("cluster: mitmproxy"));
+    }
+
+    #[test]
+    fn compile_multiple_level3_destinations() {
+        let policy = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![
+                PolicyRule {
+                    destination: Destination::Domain("api.one.com".to_string()),
+                    level: AssuranceLevel::Full,
+                    protocol: Protocol::Https,
+                    constraints: Some(HttpConstraints {
+                        methods: vec!["GET".to_string()],
+                        paths: vec![],
+                    }),
+                    reason: None,
+                },
+                PolicyRule {
+                    destination: Destination::Domain("api.two.com".to_string()),
+                    level: AssuranceLevel::Full,
+                    protocol: Protocol::Https,
+                    constraints: None,
+                    reason: None,
+                },
+            ],
+        };
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        // Both L3 destinations get SNI chains to mitmproxy.
+        assert!(compiled.envoy_config.contains("server_names: [\"api.one.com\"]"));
+        assert!(compiled.envoy_config.contains("server_names: [\"api.two.com\"]"));
+
+        // mitmproxy config has rules for both.
+        let config: MitmproxyConfig =
+            serde_json::from_str(&compiled.mitmproxy_config).unwrap();
+        assert_eq!(config.rules.len(), 2);
+        let hosts: Vec<&str> = config.rules.iter().map(|r| r.host.as_str()).collect();
+        assert!(hosts.contains(&"api.one.com"));
+        assert!(hosts.contains(&"api.two.com"));
+
+        // First rule has method constraint, second has none.
+        let one_rule = config.rules.iter().find(|r| r.host == "api.one.com").unwrap();
+        assert_eq!(one_rule.methods.as_ref().unwrap(), &["GET"]);
+        assert!(one_rule.paths.is_none()); // empty vec → None
+
+        let two_rule = config.rules.iter().find(|r| r.host == "api.two.com").unwrap();
+        assert!(two_rule.methods.is_none());
+        assert!(two_rule.paths.is_none());
+    }
+
+    // -- L2-only policy (no L1) does not produce default chain ----------------
+
+    #[test]
+    fn compile_level2_only_no_passthrough_chain() {
+        let policy = tls_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        // Without L1 rules, no default passthrough chain.
+        assert!(
+            !compiled.envoy_config.contains("policy_tcp_passthrough"),
+            "L2-only should not have a default passthrough chain"
+        );
+
+        // But should still have original_dst cluster (for L2 forwarding).
+        assert!(compiled.envoy_config.contains("name: original_dst"));
+    }
+
+    // -- L3-only policy (no L1) does not produce default chain ----------------
+
+    #[test]
+    fn compile_level3_only_no_passthrough_chain() {
+        let policy = full_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        assert!(
+            !compiled.envoy_config.contains("policy_tcp_passthrough"),
+            "L3-only should not have a default passthrough chain"
+        );
+    }
+
+    // -- Sanitize stat prefix -------------------------------------------------
+
+    #[test]
+    fn sanitize_stat_prefix_replaces_dots() {
+        assert_eq!(
+            PolicyCompiler::sanitize_stat_prefix("example.com"),
+            "example_com"
+        );
+    }
+
+    #[test]
+    fn sanitize_stat_prefix_replaces_wildcards() {
+        assert_eq!(
+            PolicyCompiler::sanitize_stat_prefix("*.example.com"),
+            "wildcard_example_com"
+        );
+    }
+
+    #[test]
+    fn sanitize_stat_prefix_complex_domain() {
+        assert_eq!(
+            PolicyCompiler::sanitize_stat_prefix("sub.deep.example.co.uk"),
+            "sub_deep_example_co_uk"
+        );
+    }
+
+    // -- L1-only policy still has no tls_inspector ----------------------------
+
+    #[test]
+    fn compile_level1_no_tls_inspector() {
+        let policy = transport_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        assert!(
+            !compiled.envoy_config.contains("tls_inspector"),
+            "L1-only policy should NOT include tls_inspector"
+        );
+    }
+
+    // -- Envoy config YAML structure verification -----------------------------
+
+    #[test]
+    fn compile_level2_envoy_admin_present() {
+        let policy = tls_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        assert!(
+            compiled.envoy_config.contains("9901"),
+            "L2 Envoy config must include admin port 9901"
+        );
+    }
+
+    #[test]
+    fn compile_level3_envoy_admin_present() {
+        let policy = full_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        assert!(
+            compiled.envoy_config.contains("9901"),
+            "L3 Envoy config must include admin port 9901"
         );
     }
 }
