@@ -101,6 +101,17 @@ pub struct SessionConfig {
     /// How the workspace is provided to the VM (if at all).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_mode: Option<WorkspaceMode>,
+    /// Enable QEMU hardening (device lockdown, seccomp).
+    ///
+    /// When `true` (the default), the QEMU wrapper disables unnecessary
+    /// devices and enables seccomp sandboxing.  Set to `false` for debugging
+    /// or when the hardened configuration causes compatibility issues.
+    #[serde(default = "default_hardened")]
+    pub hardened: bool,
+}
+
+fn default_hardened() -> bool {
+    true
 }
 
 impl Default for SessionConfig {
@@ -110,6 +121,7 @@ impl Default for SessionConfig {
             memory_mb: 4096,
             disk_gb: 20,
             workspace_mode: None,
+            hardened: true,
         }
     }
 }
@@ -215,6 +227,7 @@ mod tests {
             memory_mb: 8192,
             disk_gb: 50,
             workspace_mode: None,
+            hardened: true,
         };
         let session = Session::with_config(Some("custom".into()), config);
         assert_eq!(session.config.cpus, 4);
@@ -316,6 +329,36 @@ mod tests {
         assert_eq!(config.memory_mb, 4096);
         assert_eq!(config.disk_gb, 20);
         assert!(config.workspace_mode.is_none());
+        assert!(config.hardened, "hardened should default to true");
+    }
+
+    #[test]
+    fn hardened_defaults_true_on_deserialization() {
+        // When the `hardened` field is missing from JSON, it should
+        // default to true via the serde default function.
+        let json = r#"{"cpus": 2, "memory_mb": 4096, "disk_gb": 20}"#;
+        let config: SessionConfig = serde_json::from_str(json).unwrap();
+        assert!(
+            config.hardened,
+            "hardened should default to true when absent from JSON"
+        );
+    }
+
+    #[test]
+    fn hardened_false_roundtrip() {
+        let config = SessionConfig {
+            cpus: 2,
+            memory_mb: 4096,
+            disk_gb: 20,
+            workspace_mode: None,
+            hardened: false,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let deser: SessionConfig = serde_json::from_str(&json).unwrap();
+        assert!(
+            !deser.hardened,
+            "hardened=false should survive serialization round-trip"
+        );
     }
 
     #[test]

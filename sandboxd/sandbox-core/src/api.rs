@@ -60,6 +60,11 @@ pub struct CreateSessionRequest {
     /// host directory is mounted into the VM at `/home/agent/workspace`
     /// via virtio-fs.
     pub workspace: Option<String>,
+    /// Enable QEMU hardening (device lockdown, seccomp).
+    ///
+    /// Defaults to `true`. Set to `false` for debugging or when the
+    /// hardened configuration causes compatibility issues.
+    pub hardened: Option<bool>,
 }
 
 /// Request body for `POST /sessions/{id}/upload`.
@@ -206,6 +211,7 @@ mod tests {
         assert!(req.repo.is_none());
         assert!(req.boot_cmd.is_none());
         assert!(req.workspace.is_none());
+        assert!(req.hardened.is_none());
     }
 
     #[test]
@@ -492,6 +498,24 @@ mod tests {
             Some("shared:/home/user/project")
         );
         assert!(req.repo.is_none());
+    }
+
+    #[test]
+    fn deserialize_create_request_with_hardened_false() {
+        let json = r#"{"name": "debug-mode", "hardened": false}"#;
+        let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.name.as_deref(), Some("debug-mode"));
+        assert_eq!(req.hardened, Some(false));
+    }
+
+    #[test]
+    fn deserialize_create_request_hardened_defaults_none() {
+        let json = r#"{"name": "normal"}"#;
+        let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
+        assert!(
+            req.hardened.is_none(),
+            "hardened should be None when absent from request"
+        );
     }
 
     #[test]

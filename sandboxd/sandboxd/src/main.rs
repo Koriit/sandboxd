@@ -141,6 +141,7 @@ async fn create_session(
         memory_mb: req.memory_mb.unwrap_or(4096),
         disk_gb: req.disk_gb.unwrap_or(20),
         workspace_mode,
+        hardened: req.hardened.unwrap_or(true),
     };
 
     // Create session record in store (state = Creating).
@@ -167,7 +168,7 @@ async fn create_session(
     }
 
     // Start the VM.
-    if let Err(e) = state.lima.start_vm(&session_id) {
+    if let Err(e) = state.lima.start_vm(&session_id, &config) {
         let _ = state.store.update_state(&session_id, SessionState::Error);
         return error_response(e).into_response();
     }
@@ -504,7 +505,7 @@ async fn start_session(
     }
 
     // Start the Lima VM.
-    if let Err(e) = state.lima.start_vm(&session.id) {
+    if let Err(e) = state.lima.start_vm(&session.id, &session.config) {
         let _ = state.store.update_state(&session.id, SessionState::Error);
         return error_response(e).into_response();
     }

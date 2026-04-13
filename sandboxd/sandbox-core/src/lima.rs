@@ -50,6 +50,55 @@ Environment=RUST_LOG=info
 [Install]
 WantedBy=multi-user.target";
 
+/// QEMU wrapper script that injects PCIe root-port, seccomp sandbox, and
+/// optional cgroup resource limits via `systemd-run`.
+///
+/// Extracted as a constant so tests can verify the content without writing
+/// to the filesystem.
+const QEMU_WRAPPER_SCRIPT: &str = r#"#!/bin/sh
+# QEMU wrapper injected by sandboxd.
+#
+# Always:
+# 1. Adds a PCIe root-port so that NIC hot-add via QMP works on q35 machines.
+#
+# When SANDBOX_QEMU_HARDENED=1:
+# 2. Enables QEMU seccomp sandbox to restrict syscalls.
+# 3. Disables unnecessary devices (USB, sound, display, floppy, HPET, etc.)
+#    and adds virtio-rng for guest entropy.
+#
+# When SANDBOX_QEMU_MEMORY_MB and SANDBOX_QEMU_CPUS are set:
+# 4. Applies cgroup resource limits via systemd-run.
+
+REAL_QEMU="/usr/bin/qemu-system-x86_64"
+
+# PCIe root-port is always needed for NIC hot-add.
+QEMU_ARGS="-device pcie-root-port,id=pcie-hotplug-port,bus=pcie.0,chassis=1"
+
+# Hardened mode: seccomp + device lockdown.
+if [ "$SANDBOX_QEMU_HARDENED" = "1" ]; then
+    QEMU_ARGS="$QEMU_ARGS \
+        -sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny \
+        -nodefaults \
+        -no-user-config \
+        -nographic \
+        -vga none \
+        -no-hpet \
+        -device virtio-rng-pci"
+fi
+
+# If resource limit env vars are set and systemd-run is available, wrap
+# QEMU in a transient systemd scope with memory and CPU limits.
+if [ -n "$SANDBOX_QEMU_MEMORY_MB" ] && [ -n "$SANDBOX_QEMU_CPUS" ] && command -v systemd-run >/dev/null 2>&1; then
+    exec systemd-run --user --scope --slice=sandbox.slice \
+        -p MemoryMax="${SANDBOX_QEMU_MEMORY_MB}M" \
+        -p "CPUQuota=${SANDBOX_QEMU_CPUS}00%" \
+        -p TasksMax=256 \
+        "$REAL_QEMU" $QEMU_ARGS "$@"
+else
+    exec "$REAL_QEMU" $QEMU_ARGS "$@"
+fi
+"#;
+
 /// Manages Lima virtual machines that back sandbox sessions.
 ///
 /// All VMs are named `sandbox-{session_id}` so they can be distinguished from
@@ -152,15 +201,27 @@ impl LimaManager {
     /// Start an existing (stopped) VM.
     ///
     /// A QEMU wrapper script is injected via `QEMU_SYSTEM_X86_64` so that the
-    /// resulting VM has a PCIe root-port available for NIC hot-add.
-    pub fn start_vm(&self, session_id: &Uuid) -> Result<(), SandboxError> {
+    /// resulting VM has a PCIe root-port available for NIC hot-add, seccomp
+    /// sandboxing, device lockdown, and cgroup resource limits.
+    ///
+    /// The `config` parameter controls hardening and propagates resource limits
+    /// (memory, CPU) to the QEMU wrapper script via environment variables.
+    pub fn start_vm(
+        &self,
+        session_id: &Uuid,
+        config: &SessionConfig,
+    ) -> Result<(), SandboxError> {
         let vm_name = vm_name(session_id);
         let qemu_wrapper = self.ensure_qemu_wrapper()?;
 
+        let hardened_flag = if config.hardened { "1" } else { "0" };
         let output = Command::new(&self.limactl)
             .args(["start", &vm_name])
             .arg("--tty=false")
             .env("QEMU_SYSTEM_X86_64", &qemu_wrapper)
+            .env("SANDBOX_QEMU_HARDENED", hardened_flag)
+            .env("SANDBOX_QEMU_MEMORY_MB", config.memory_mb.to_string())
+            .env("SANDBOX_QEMU_CPUS", config.cpus.to_string())
             .output()
             .map_err(|e| lima_io_error("limactl start", e))?;
 
@@ -408,6 +469,15 @@ mounts:
             _ => "mounts: []".to_string(),
         };
 
+        // When hardened, tell Lima to disable video and audio devices.  Lima
+        // translates these into the appropriate QEMU flags at VM creation
+        // time, ensuring no display or sound device is attached.
+        let hardened_section = if config.hardened {
+            "\nvideo:\n  display: \"none\"\naudio:\n  device: \"none\""
+        } else {
+            ""
+        };
+
         format!(
             r#"# Auto-generated Lima template for sandbox session {session_id}
 minimumLimaVersion: "2.0.0"
@@ -426,7 +496,7 @@ disk: "{disk_gib}"
 
 {mounts_section}
 portForwards: []
-
+{hardened_section}
 containerd:
   system: false
   user: false
@@ -477,35 +547,41 @@ provision:
             memory_gib = memory_gib,
             disk_gib = disk_gib,
             mounts_section = mounts_section,
+            hardened_section = hardened_section,
             hostname = hostname,
         )
     }
 
     // -- helpers ------------------------------------------------------------
 
-    /// Create a QEMU wrapper script that injects a `pcie-root-port` device.
+    /// Create a QEMU wrapper script that injects process hardening.
     ///
-    /// The q35 machine type does not include any PCIe root-port by default,
-    /// which means no PCIe device (including virtio-net-pci) can be hot-added
-    /// via QMP.  Lima does not expose a way to pass extra QEMU arguments, so
-    /// we interpose a tiny shell wrapper that Lima invokes via the
-    /// `QEMU_SYSTEM_X86_64` environment variable.  The wrapper prepends the
-    /// required `-device pcie-root-port,...` argument, then exec's the real
-    /// QEMU binary.
+    /// The wrapper does three things:
+    ///
+    /// 1. **PCIe root-port** — The q35 machine type does not include any PCIe
+    ///    root-port by default, which means no PCIe device (including
+    ///    virtio-net-pci) can be hot-added via QMP.
+    ///
+    /// 2. **Seccomp sandbox** — Enables QEMU's built-in seccomp filter to deny
+    ///    obsolete syscalls, privilege escalation, and process spawning.
+    ///
+    /// 3. **Cgroup limits** — When `SANDBOX_QEMU_MEMORY_MB` and
+    ///    `SANDBOX_QEMU_CPUS` environment variables are set (propagated from
+    ///    [`SessionConfig`] in [`start_vm`]), the wrapper uses `systemd-run` to
+    ///    place the QEMU process in a scoped cgroup with memory and CPU limits.
+    ///    If `systemd-run` is not available, the wrapper falls back to running
+    ///    QEMU without cgroup limits.
+    ///
+    /// Lima does not expose a way to pass extra QEMU arguments, so we
+    /// interpose a shell wrapper that Lima invokes via the
+    /// `QEMU_SYSTEM_X86_64` environment variable.
     fn ensure_qemu_wrapper(&self) -> Result<PathBuf, SandboxError> {
         let wrapper_dir = self.base_dir.join("libexec");
         std::fs::create_dir_all(&wrapper_dir)?;
         let wrapper_path = wrapper_dir.join("qemu-system-x86_64");
 
         // The wrapper script is idempotent — overwrite if the content changed.
-        let script = r#"#!/bin/sh
-# QEMU wrapper injected by sandboxd.
-# Adds a PCIe root-port so that NIC hot-add via QMP works on q35 machines.
-REAL_QEMU="/usr/bin/qemu-system-x86_64"
-exec "$REAL_QEMU" \
-    -device pcie-root-port,id=pcie-hotplug-port,bus=pcie.0,chassis=1 \
-    "$@"
-"#;
+        let script = QEMU_WRAPPER_SCRIPT;
         std::fs::write(&wrapper_path, script)?;
 
         // chmod +x
@@ -794,6 +870,7 @@ mod tests {
             memory_mb: 16384,
             disk_gb: 100,
             workspace_mode: None,
+            hardened: true,
         };
 
         let template = mgr.generate_template(&id, &config);
@@ -825,6 +902,7 @@ mod tests {
             memory_mb: 1536, // 1.5 GiB
             disk_gb: 10,
             workspace_mode: None,
+            hardened: true,
         };
 
         let template = mgr.generate_template(&id, &config);
@@ -846,6 +924,7 @@ mod tests {
             workspace_mode: Some(WorkspaceMode::Shared {
                 host_path: "/home/user/project".into(),
             }),
+            hardened: true,
         };
 
         let template = mgr.generate_template(&id, &config);
@@ -888,6 +967,7 @@ mod tests {
             workspace_mode: Some(WorkspaceMode::Clone {
                 repo_url: "https://github.com/example/repo.git".into(),
             }),
+            hardened: true,
         };
 
         let template = mgr.generate_template(&id, &config);
@@ -900,6 +980,146 @@ mod tests {
         assert!(
             !template.contains("virtiofs"),
             "clone workspace should not reference virtiofs"
+        );
+    }
+
+    // -- QEMU hardening / device lockdown ------------------------------------
+
+    #[test]
+    fn test_qemu_wrapper_contains_device_lockdown_args() {
+        // The wrapper script should contain device lockdown args gated on
+        // the SANDBOX_QEMU_HARDENED env var.
+        let script = QEMU_WRAPPER_SCRIPT;
+
+        // Always present: PCIe root-port
+        assert!(
+            script.contains("pcie-root-port"),
+            "wrapper should always add PCIe root-port"
+        );
+
+        // Hardened-only args
+        assert!(
+            script.contains("-nodefaults"),
+            "wrapper should disable default devices when hardened"
+        );
+        assert!(
+            script.contains("-no-user-config"),
+            "wrapper should disable user config when hardened"
+        );
+        assert!(
+            script.contains("-nographic"),
+            "wrapper should disable graphics when hardened"
+        );
+        assert!(
+            script.contains("-vga none"),
+            "wrapper should disable VGA when hardened"
+        );
+        assert!(
+            script.contains("-no-hpet"),
+            "wrapper should disable HPET when hardened"
+        );
+        assert!(
+            script.contains("virtio-rng-pci"),
+            "wrapper should add virtio-rng for entropy when hardened"
+        );
+        assert!(
+            script.contains("-sandbox on"),
+            "wrapper should enable seccomp when hardened"
+        );
+
+        // Verify these are gated on the env var
+        assert!(
+            script.contains("SANDBOX_QEMU_HARDENED"),
+            "wrapper should check SANDBOX_QEMU_HARDENED env var"
+        );
+    }
+
+    #[test]
+    fn test_qemu_wrapper_hardened_conditional() {
+        // Verify the device lockdown args are inside the hardened conditional,
+        // not unconditionally applied. The script should have -nodefaults only
+        // within the if-block checking SANDBOX_QEMU_HARDENED.
+        let script = QEMU_WRAPPER_SCRIPT;
+
+        // Find the position of the hardened check and the -nodefaults arg.
+        let hardened_check_pos = script.find("SANDBOX_QEMU_HARDENED").unwrap();
+        let nodefaults_pos = script.find("-nodefaults").unwrap();
+
+        assert!(
+            nodefaults_pos > hardened_check_pos,
+            "-nodefaults should come after the SANDBOX_QEMU_HARDENED check"
+        );
+    }
+
+    #[test]
+    fn test_generate_template_hardened_video_audio() {
+        let mgr = LimaManager::new(PathBuf::from("/tmp/test"));
+        let id = Uuid::new_v4();
+        let config = SessionConfig {
+            cpus: 2,
+            memory_mb: 4096,
+            disk_gb: 20,
+            workspace_mode: None,
+            hardened: true,
+        };
+
+        let template = mgr.generate_template(&id, &config);
+
+        assert!(
+            template.contains("display: \"none\""),
+            "hardened template should disable video display"
+        );
+        assert!(
+            template.contains("device: \"none\""),
+            "hardened template should disable audio device"
+        );
+    }
+
+    #[test]
+    fn test_generate_template_not_hardened_no_video_audio() {
+        let mgr = LimaManager::new(PathBuf::from("/tmp/test"));
+        let id = Uuid::new_v4();
+        let config = SessionConfig {
+            cpus: 2,
+            memory_mb: 4096,
+            disk_gb: 20,
+            workspace_mode: None,
+            hardened: false,
+        };
+
+        let template = mgr.generate_template(&id, &config);
+
+        assert!(
+            !template.contains("display: \"none\""),
+            "non-hardened template should not disable video display"
+        );
+        assert!(
+            !template.contains("device: \"none\""),
+            "non-hardened template should not disable audio device"
+        );
+    }
+
+    #[test]
+    fn test_ensure_qemu_wrapper_creates_file() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let mgr = LimaManager::new(dir.path().to_path_buf());
+
+        let wrapper = mgr.ensure_qemu_wrapper().unwrap();
+
+        assert!(wrapper.exists(), "wrapper script should exist");
+
+        let content = std::fs::read_to_string(&wrapper).unwrap();
+        assert!(
+            content.contains("pcie-root-port"),
+            "wrapper should contain PCIe root-port"
+        );
+        assert!(
+            content.contains("SANDBOX_QEMU_HARDENED"),
+            "wrapper should reference SANDBOX_QEMU_HARDENED"
+        );
+        assert!(
+            content.contains("-nodefaults"),
+            "wrapper should contain device lockdown args"
         );
     }
 
@@ -1093,6 +1313,124 @@ mod tests {
         );
     }
 
+    // -- QEMU wrapper script tests ------------------------------------------
+
+    #[test]
+    fn test_qemu_wrapper_includes_pcie_root_port() {
+        assert!(
+            QEMU_WRAPPER_SCRIPT.contains("pcie-root-port,id=pcie-hotplug-port"),
+            "wrapper must inject PCIe root-port for NIC hot-add"
+        );
+    }
+
+    #[test]
+    fn test_qemu_wrapper_includes_seccomp_sandbox() {
+        assert!(
+            QEMU_WRAPPER_SCRIPT.contains(
+                "-sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny"
+            ),
+            "wrapper must enable QEMU seccomp sandbox"
+        );
+    }
+
+    #[test]
+    fn test_qemu_wrapper_seccomp_gated_on_hardened() {
+        // Seccomp should only be applied when SANDBOX_QEMU_HARDENED=1.
+        assert!(
+            QEMU_WRAPPER_SCRIPT
+                .contains(r#"SANDBOX_QEMU_HARDENED" = "1"#),
+            "seccomp sandbox must be gated on SANDBOX_QEMU_HARDENED=1"
+        );
+    }
+
+    #[test]
+    fn test_qemu_wrapper_includes_cgroup_limits() {
+        assert!(
+            QEMU_WRAPPER_SCRIPT.contains(
+                "systemd-run --user --scope --slice=sandbox.slice"
+            ),
+            "wrapper must use systemd-run for cgroup limits"
+        );
+        assert!(
+            QEMU_WRAPPER_SCRIPT.contains("MemoryMax="),
+            "wrapper must set MemoryMax cgroup limit"
+        );
+        assert!(
+            QEMU_WRAPPER_SCRIPT.contains("CPUQuota="),
+            "wrapper must set CPUQuota cgroup limit"
+        );
+        assert!(
+            QEMU_WRAPPER_SCRIPT.contains("TasksMax=256"),
+            "wrapper must set TasksMax cgroup limit"
+        );
+    }
+
+    #[test]
+    fn test_qemu_wrapper_cgroup_gated_on_env_vars() {
+        // Cgroup limits should only apply when both env vars are present.
+        assert!(
+            QEMU_WRAPPER_SCRIPT.contains("SANDBOX_QEMU_MEMORY_MB"),
+            "wrapper must check SANDBOX_QEMU_MEMORY_MB env var"
+        );
+        assert!(
+            QEMU_WRAPPER_SCRIPT.contains("SANDBOX_QEMU_CPUS"),
+            "wrapper must check SANDBOX_QEMU_CPUS env var"
+        );
+    }
+
+    #[test]
+    fn test_qemu_wrapper_cgroup_fallback_without_systemd_run() {
+        // When systemd-run is not available, wrapper should fall back to
+        // running QEMU directly (without cgroup limits).
+        assert!(
+            QEMU_WRAPPER_SCRIPT.contains("command -v systemd-run"),
+            "wrapper must check for systemd-run availability"
+        );
+        // The else branch should exec QEMU directly.
+        let lines: Vec<&str> = QEMU_WRAPPER_SCRIPT.lines().collect();
+        let has_else_exec = lines.iter().any(|line| {
+            line.trim() == r#"exec "$REAL_QEMU" $QEMU_ARGS "$@""#
+        });
+        assert!(
+            has_else_exec,
+            "wrapper must have a fallback exec without systemd-run"
+        );
+    }
+
+    #[test]
+    fn test_qemu_wrapper_written_to_filesystem() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let mgr = LimaManager::new(dir.path().to_path_buf());
+
+        let wrapper_path = mgr
+            .ensure_qemu_wrapper()
+            .expect("ensure_qemu_wrapper should succeed");
+
+        // Verify the file exists and is executable.
+        assert!(wrapper_path.exists(), "wrapper script must exist");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::metadata(&wrapper_path)
+                .expect("metadata")
+                .permissions();
+            assert_eq!(
+                perms.mode() & 0o755,
+                0o755,
+                "wrapper script must be executable"
+            );
+        }
+
+        // Verify content matches the constant.
+        let content =
+            std::fs::read_to_string(&wrapper_path).expect("read wrapper");
+        assert_eq!(
+            content, QEMU_WRAPPER_SCRIPT,
+            "written content must match constant"
+        );
+    }
+
     // -- Integration tests (ignored by default) -----------------------------
 
     #[test]
@@ -1118,6 +1456,7 @@ mod tests {
             memory_mb: 1024,
             disk_gb: 10,
             workspace_mode: None,
+            hardened: true,
         };
 
         // Create the VM

@@ -623,6 +623,7 @@ mod tests {
             memory_mb: 16384,
             disk_gb: 100,
             workspace_mode: None,
+            hardened: true,
         };
 
         let session = store

@@ -58,6 +58,12 @@ enum Command {
         /// Mutually exclusive with --repo.
         #[arg(long, conflicts_with = "repo")]
         workspace: Option<String>,
+        /// Disable QEMU hardening (device lockdown, seccomp).
+        ///
+        /// By default, hardening is enabled. Use this flag for debugging
+        /// or when the hardened configuration causes compatibility issues.
+        #[arg(long)]
+        no_hardening: bool,
     },
     /// Start a sandbox session.
     Start {
@@ -191,6 +197,7 @@ fn build_request(command: &Command) -> Option<Request<String>> {
             repo,
             boot_cmd,
             workspace,
+            no_hardening,
         } => {
             let mut body = serde_json::Map::new();
             if let Some(n) = name {
@@ -246,6 +253,9 @@ fn build_request(command: &Command) -> Option<Request<String>> {
                     process::exit(1);
                 }
                 body.insert("workspace".into(), serde_json::Value::String(ws.clone()));
+            }
+            if *no_hardening {
+                body.insert("hardened".into(), serde_json::json!(false));
             }
             let body_str = serde_json::Value::Object(body).to_string();
             Request::builder()
@@ -1124,6 +1134,7 @@ mod tests {
                 repo: None,
                 boot_cmd: None,
                 workspace: None,
+                no_hardening: false,
             }
         ));
     }
@@ -1261,6 +1272,7 @@ mod tests {
             repo: None,
             boot_cmd: None,
             workspace: None,
+            no_hardening: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         assert_eq!(req.method(), "POST");
@@ -1284,6 +1296,7 @@ mod tests {
             repo: None,
             boot_cmd: None,
             workspace: None,
+            no_hardening: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         assert_eq!(req.method(), "POST");
@@ -1307,6 +1320,7 @@ mod tests {
             repo: None,
             boot_cmd: None,
             workspace: None,
+            no_hardening: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -1664,6 +1678,7 @@ mod tests {
             repo: Some("https://github.com/octocat/Hello-World.git".into()),
             boot_cmd: None,
             workspace: None,
+            no_hardening: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -1683,11 +1698,84 @@ mod tests {
             repo: None,
             boot_cmd: Some("npm install".into()),
             workspace: None,
+            no_hardening: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
         assert!(body.get("repo").is_none());
         assert_eq!(body["boot_cmd"], "npm install");
+    }
+
+    #[test]
+    fn parse_create_with_no_hardening_flag() {
+        let cli = Cli::parse_from(["sandbox", "create", "--no-hardening"]);
+        match &cli.command {
+            Command::Create { no_hardening, .. } => {
+                assert!(
+                    *no_hardening,
+                    "--no-hardening flag should set no_hardening to true"
+                );
+            }
+            _ => panic!("expected Create command"),
+        }
+    }
+
+    #[test]
+    fn parse_create_default_hardening_on() {
+        let cli = Cli::parse_from(["sandbox", "create"]);
+        match &cli.command {
+            Command::Create { no_hardening, .. } => {
+                assert!(
+                    !*no_hardening,
+                    "hardening should be on by default (no_hardening = false)"
+                );
+            }
+            _ => panic!("expected Create command"),
+        }
+    }
+
+    #[test]
+    fn build_create_request_with_no_hardening() {
+        let cmd = Command::Create {
+            name: Some("debug".into()),
+            cpus: 2,
+            memory: 4096,
+            disk: 20,
+            template: None,
+            policy: None,
+            repo: None,
+            boot_cmd: None,
+            workspace: None,
+            no_hardening: true,
+        };
+        let req = build_request(&cmd).expect("should produce request");
+        let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
+        assert_eq!(
+            body["hardened"], false,
+            "--no-hardening should set hardened=false in request body"
+        );
+    }
+
+    #[test]
+    fn build_create_request_default_omits_hardened() {
+        let cmd = Command::Create {
+            name: Some("normal".into()),
+            cpus: 2,
+            memory: 4096,
+            disk: 20,
+            template: None,
+            policy: None,
+            repo: None,
+            boot_cmd: None,
+            workspace: None,
+            no_hardening: false,
+        };
+        let req = build_request(&cmd).expect("should produce request");
+        let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
+        assert!(
+            body.get("hardened").is_none(),
+            "default (hardened=true) should omit the field from request body"
+        );
     }
 
     #[test]
