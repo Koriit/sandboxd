@@ -99,6 +99,28 @@ pub struct ExecRequest {
     pub args: Vec<String>,
 }
 
+/// Request body for `POST /sessions/{id}/git`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitRequest {
+    /// Git operation: "upload-pack" or "receive-pack".
+    pub operation: String,
+    /// Path to the git repository inside the VM.
+    pub repo_path: String,
+    /// Base64-encoded git protocol data from the client.
+    pub data: String,
+}
+
+/// Response body for `POST /sessions/{id}/git`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitResponse {
+    /// Base64-encoded git protocol response data.
+    pub data: String,
+    /// Exit code from the git subprocess.
+    pub exit_code: i32,
+    /// Stderr output from the git subprocess.
+    pub stderr: String,
+}
+
 /// Response body for `POST /sessions/{id}/exec`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecResponse {
@@ -482,5 +504,50 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         let deser: FileDownloadResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(deser.data, "aGVsbG8=");
+    }
+
+    #[test]
+    fn deserialize_git_request_upload_pack() {
+        let json = r#"{"operation": "upload-pack", "repo_path": "/root/workspace", "data": "aGVsbG8="}"#;
+        let req: GitRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.operation, "upload-pack");
+        assert_eq!(req.repo_path, "/root/workspace");
+        assert_eq!(req.data, "aGVsbG8=");
+    }
+
+    #[test]
+    fn deserialize_git_request_receive_pack() {
+        let json = r#"{"operation": "receive-pack", "repo_path": "/root/workspace", "data": "dGVzdA=="}"#;
+        let req: GitRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.operation, "receive-pack");
+        assert_eq!(req.repo_path, "/root/workspace");
+        assert_eq!(req.data, "dGVzdA==");
+    }
+
+    #[test]
+    fn git_response_serialization() {
+        let resp = GitResponse {
+            data: "aGVsbG8=".into(),
+            exit_code: 0,
+            stderr: String::new(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let deser: GitResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.data, "aGVsbG8=");
+        assert_eq!(deser.exit_code, 0);
+        assert!(deser.stderr.is_empty());
+    }
+
+    #[test]
+    fn git_response_with_error() {
+        let resp = GitResponse {
+            data: String::new(),
+            exit_code: 128,
+            stderr: "fatal: not a git repository".into(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let deser: GitResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.exit_code, 128);
+        assert!(deser.stderr.contains("not a git repository"));
     }
 }
