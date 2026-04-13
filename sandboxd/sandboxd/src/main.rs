@@ -1953,7 +1953,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize store and Lima manager.
     let store = SessionStore::new(base_dir.clone())?;
-    let lima = Arc::new(LimaManager::new(base_dir.clone()));
+    let lima = Arc::new(LimaManager::new(base_dir.clone())?);
     let guest = GuestConnector::new(Arc::clone(&lima));
 
     // Initialize networking managers.

@@ -69,7 +69,7 @@ const QEMU_WRAPPER_SCRIPT: &str = r#"#!/bin/sh
 # When SANDBOX_QEMU_MEMORY_MB and SANDBOX_QEMU_CPUS are set:
 # 4. Applies cgroup resource limits via systemd-run.
 
-REAL_QEMU="/usr/bin/qemu-system-x86_64"
+REAL_QEMU="$(command -v qemu-system-x86_64)" || { echo "qemu-system-x86_64 not found on PATH" >&2; exit 1; }
 
 # PCIe root-port is always needed for NIC hot-add.
 QEMU_ARGS="-device pcie-root-port,id=pcie-hotplug-port,bus=pcie.0,chassis=1"
@@ -114,18 +114,20 @@ impl LimaManager {
     ///
     /// `base_dir` is typically `~/.sandboxd/` — the same directory used by
     /// [`crate::SessionStore`].
-    pub fn new(base_dir: PathBuf) -> Self {
-        Self {
-            base_dir,
-            limactl: PathBuf::from("/usr/local/bin/limactl"),
-        }
+    ///
+    /// Resolves the `limactl` binary from `PATH` at construction time so
+    /// that a missing installation is detected early with a clear error.
+    pub fn new(base_dir: PathBuf) -> Result<Self, SandboxError> {
+        let limactl = resolve_binary_from_path("limactl")?;
+        Ok(Self { base_dir, limactl })
     }
 
-    /// Override the path to `limactl` (useful for testing).
+    /// Create a manager with a caller-supplied `limactl` path, skipping
+    /// PATH resolution.  Useful for tests and environments where the binary
+    /// location is already known.
     #[cfg(test)]
-    pub fn with_limactl(mut self, path: PathBuf) -> Self {
-        self.limactl = path;
-        self
+    pub fn with_limactl_path(base_dir: PathBuf, limactl: PathBuf) -> Self {
+        Self { base_dir, limactl }
     }
 
     /// Return the path to the `limactl` binary.
@@ -769,6 +771,36 @@ fn parse_limactl_error(subcommand: &str, stderr: &str) -> SandboxError {
     }
 }
 
+/// Resolve a binary name to its absolute path using the system `PATH`.
+///
+/// Shells out to `command -v <name>` (POSIX) to find the binary.  Returns a
+/// clear error if the binary is not installed.
+fn resolve_binary_from_path(name: &str) -> Result<PathBuf, SandboxError> {
+    let output = Command::new("sh")
+        .args(["-c", &format!("command -v {name}")])
+        .output()
+        .map_err(|e| {
+            SandboxError::Internal(format!(
+                "failed to run 'command -v {name}': {e}"
+            ))
+        })?;
+
+    if !output.status.success() {
+        return Err(SandboxError::Lima(format!(
+            "{name} not found on PATH — is it installed?"
+        )));
+    }
+
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        return Err(SandboxError::Lima(format!(
+            "{name} not found on PATH — is it installed?"
+        )));
+    }
+
+    Ok(PathBuf::from(path))
+}
+
 /// Convert MiB to GiB as a human-friendly string.
 ///
 /// If the value divides evenly into GiB, returns a whole number (e.g. "4").
@@ -826,7 +858,7 @@ mod tests {
 
     #[test]
     fn test_generate_template() {
-        let mgr = LimaManager::new(PathBuf::from("/tmp/test"));
+        let mgr = LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
         let id =
             Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
         let config = SessionConfig::default(); // 2 CPU, 4096 MB, 20 GB
@@ -904,7 +936,7 @@ mod tests {
 
     #[test]
     fn test_generate_template_custom_config() {
-        let mgr = LimaManager::new(PathBuf::from("/tmp/test"));
+        let mgr = LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
         let id =
             Uuid::parse_str("a1b2c3d4-e5f6-7890-abcd-ef1234567890").unwrap();
         let config = SessionConfig {
@@ -937,7 +969,7 @@ mod tests {
 
     #[test]
     fn test_generate_template_fractional_memory() {
-        let mgr = LimaManager::new(PathBuf::from("/tmp/test"));
+        let mgr = LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
         let id = Uuid::new_v4();
         let config = SessionConfig {
             cpus: 1,
@@ -956,7 +988,7 @@ mod tests {
 
     #[test]
     fn test_generate_template_shared_workspace() {
-        let mgr = LimaManager::new(PathBuf::from("/tmp/test"));
+        let mgr = LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
         let id =
             Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
         let config = SessionConfig {
@@ -1000,7 +1032,7 @@ mod tests {
 
     #[test]
     fn test_generate_template_clone_workspace_no_mount() {
-        let mgr = LimaManager::new(PathBuf::from("/tmp/test"));
+        let mgr = LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
         let id = Uuid::new_v4();
         let config = SessionConfig {
             cpus: 1,
@@ -1095,7 +1127,7 @@ mod tests {
 
     #[test]
     fn test_generate_template_hardened_video_audio() {
-        let mgr = LimaManager::new(PathBuf::from("/tmp/test"));
+        let mgr = LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
         let id = Uuid::new_v4();
         let config = SessionConfig {
             cpus: 2,
@@ -1119,7 +1151,7 @@ mod tests {
 
     #[test]
     fn test_generate_template_not_hardened_no_video_audio() {
-        let mgr = LimaManager::new(PathBuf::from("/tmp/test"));
+        let mgr = LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
         let id = Uuid::new_v4();
         let config = SessionConfig {
             cpus: 2,
@@ -1144,7 +1176,7 @@ mod tests {
     #[test]
     fn test_ensure_qemu_wrapper_creates_file() {
         let dir = tempfile::TempDir::new().expect("create temp dir");
-        let mgr = LimaManager::new(dir.path().to_path_buf());
+        let mgr = LimaManager::with_limactl_path(dir.path().to_path_buf(), PathBuf::from("limactl"));
 
         let wrapper = mgr.ensure_qemu_wrapper().unwrap();
 
@@ -1339,7 +1371,7 @@ mod tests {
     #[test]
     fn test_install_guest_agent_missing_binary() {
         let dir = tempfile::TempDir::new().expect("create temp dir");
-        let mgr = LimaManager::new(dir.path().to_path_buf());
+        let mgr = LimaManager::with_limactl_path(dir.path().to_path_buf(), PathBuf::from("limactl"));
         let session_id = Uuid::new_v4();
 
         let result = mgr.install_guest_agent(
@@ -1442,7 +1474,7 @@ mod tests {
     #[test]
     fn test_qemu_wrapper_written_to_filesystem() {
         let dir = tempfile::TempDir::new().expect("create temp dir");
-        let mgr = LimaManager::new(dir.path().to_path_buf());
+        let mgr = LimaManager::with_limactl_path(dir.path().to_path_buf(), PathBuf::from("limactl"));
 
         let wrapper_path = mgr
             .ensure_qemu_wrapper()
@@ -1482,7 +1514,7 @@ mod tests {
         // Run with: cargo test --package sandbox-core test_lima_create_and_delete -- --ignored
         //
         // Requirements:
-        //   - limactl available at /usr/local/bin/limactl
+        //   - limactl available on PATH
         //   - KVM available (run `newgrp kvm` if needed)
         //   - Network access to download Ubuntu cloud image (first run only)
         //
@@ -1490,7 +1522,8 @@ mod tests {
         // image and boot.
 
         let dir = tempfile::TempDir::new().expect("create temp dir");
-        let mgr = LimaManager::new(dir.path().to_path_buf());
+        let mgr = LimaManager::new(dir.path().to_path_buf())
+            .expect("limactl must be on PATH for integration test");
 
         let session_id = Uuid::new_v4();
         let config = SessionConfig {
