@@ -12,8 +12,9 @@ use axum::{
 };
 use clap::Parser;
 use sandbox_core::{
-    ApiError, CaManager, CreateSessionRequest, DnsCache, ExecRequest, ExecResponse, GatewayHealth,
-    GatewayManager, GatewayStatus, GuestConnector, GuestResponse, LimaManager, NetworkHealth,
+    ApiError, CaManager, CreateSessionRequest, DnsCache, ExecRequest, ExecResponse,
+    FileDownloadRequest, FileDownloadResponse, FileUploadRequest, GatewayHealth, GatewayManager,
+    GatewayStatus, GuestConnector, GuestRequest, GuestResponse, LimaManager, NetworkHealth,
     NetworkManager, Policy, PolicyCompiler, PolicyDistributor, SandboxError, Session, SessionConfig,
     SessionHealth, SessionResponse, SessionState, SessionStore, UpdatePolicyRequest, VmStatus,
     attach_vm_to_bridge, detach_vm_from_bridge, generate_ca_inject_script, propagate_dns_changes,
@@ -104,6 +105,8 @@ fn app(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}/start", post(start_session))
         .route("/sessions/{id}/stop", post(stop_session))
         .route("/sessions/{id}/exec", post(exec_in_session))
+        .route("/sessions/{id}/upload", post(upload_to_session))
+        .route("/sessions/{id}/download", post(download_from_session))
         .route("/sessions/{id}/policy", post(update_policy))
         .route("/sessions/{id}/health", get(session_health))
         .route("/health", get(health_check))
@@ -219,6 +222,116 @@ async fn create_session(
                 // Policy failure is non-fatal for session creation -- the
                 // session is still usable, just without policy enforcement.
                 warn!(%session_id, error = %e, "failed to apply initial policy (session created without policy)");
+            }
+        }
+    }
+
+    // If a repo URL was provided, clone it into /root/workspace/.
+    if let Some(repo_url) = &req.repo {
+        info!(%session_id, repo = %repo_url, "cloning repository into VM");
+        match state
+            .guest
+            .exec(
+                &session_id,
+                "git",
+                &["clone", repo_url.as_str(), "/root/workspace/"],
+            )
+            .await
+        {
+            Ok(GuestResponse::ExecResult {
+                exit_code,
+                stdout,
+                stderr,
+            }) => {
+                if exit_code != 0 {
+                    warn!(
+                        %session_id,
+                        exit_code,
+                        stdout = %stdout.trim(),
+                        stderr = %stderr.trim(),
+                        "git clone returned non-zero exit code (non-fatal)"
+                    );
+                } else {
+                    info!(
+                        %session_id,
+                        output = %stdout.trim(),
+                        "repository cloned successfully"
+                    );
+                }
+            }
+            Ok(GuestResponse::Error { message }) => {
+                warn!(
+                    %session_id,
+                    %message,
+                    "guest agent error during git clone (non-fatal)"
+                );
+            }
+            Ok(other) => {
+                warn!(
+                    %session_id,
+                    ?other,
+                    "unexpected guest response during git clone (non-fatal)"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    %session_id,
+                    error = %e,
+                    "failed to execute git clone in VM (non-fatal)"
+                );
+            }
+        }
+    }
+
+    // If a boot command was provided, execute it in the VM.
+    if let Some(boot_cmd) = &req.boot_cmd {
+        info!(%session_id, cmd = %boot_cmd, "executing boot command in VM");
+        match state
+            .guest
+            .exec(&session_id, "bash", &["-c", boot_cmd.as_str()])
+            .await
+        {
+            Ok(GuestResponse::ExecResult {
+                exit_code,
+                stdout,
+                stderr,
+            }) => {
+                if exit_code != 0 {
+                    warn!(
+                        %session_id,
+                        exit_code,
+                        stdout = %stdout.trim(),
+                        stderr = %stderr.trim(),
+                        "boot command returned non-zero exit code (non-fatal)"
+                    );
+                } else {
+                    info!(
+                        %session_id,
+                        output = %stdout.trim(),
+                        "boot command completed successfully"
+                    );
+                }
+            }
+            Ok(GuestResponse::Error { message }) => {
+                warn!(
+                    %session_id,
+                    %message,
+                    "guest agent error during boot command (non-fatal)"
+                );
+            }
+            Ok(other) => {
+                warn!(
+                    %session_id,
+                    ?other,
+                    "unexpected guest response during boot command (non-fatal)"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    %session_id,
+                    error = %e,
+                    "failed to execute boot command in VM (non-fatal)"
+                );
             }
         }
     }
@@ -559,6 +672,144 @@ async fn exec_in_session(
         }
         Err(e) => {
             error!(session_id = %session.id, error = %e, "guest agent exec failed");
+            error_response(e).into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// File transfer handlers
+// ---------------------------------------------------------------------------
+
+/// `POST /sessions/{id}/upload` -- upload a file to the VM.
+async fn upload_to_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<FileUploadRequest>,
+) -> impl IntoResponse {
+    let session = match state.store.get_session_by_name_or_id(&id) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return error_response(SandboxError::SessionNotFound(id)).into_response()
+        }
+        Err(e) => return error_response(e).into_response(),
+    };
+
+    if session.state != SessionState::Running {
+        return error_response(SandboxError::InvalidState(format!(
+            "cannot upload to session with state {} (must be running)",
+            session.state
+        )))
+        .into_response();
+    }
+
+    match state
+        .guest
+        .send_request(
+            &session.id,
+            GuestRequest::FileUpload {
+                path: req.path.clone(),
+                data: req.data,
+                mode: req.mode,
+            },
+        )
+        .await
+    {
+        Ok(GuestResponse::FileUploadResult { success, error }) => {
+            if success {
+                let body = serde_json::json!({
+                    "status": "ok",
+                    "message": format!("file uploaded to {}", req.path),
+                });
+                (StatusCode::OK, Json(body)).into_response()
+            } else {
+                let msg = error.unwrap_or_else(|| "unknown error".into());
+                error_response(SandboxError::Internal(format!(
+                    "file upload failed: {msg}"
+                )))
+                .into_response()
+            }
+        }
+        Ok(GuestResponse::Error { message }) => {
+            error!(session_id = %session.id, %message, "guest agent upload error");
+            error_response(SandboxError::Internal(format!(
+                "guest agent error: {message}"
+            )))
+            .into_response()
+        }
+        Ok(other) => {
+            error!(session_id = %session.id, ?other, "unexpected guest response to upload");
+            error_response(SandboxError::Internal(
+                "unexpected response from guest agent".into(),
+            ))
+            .into_response()
+        }
+        Err(e) => {
+            error!(session_id = %session.id, error = %e, "guest agent upload failed");
+            error_response(e).into_response()
+        }
+    }
+}
+
+/// `POST /sessions/{id}/download` -- download a file from the VM.
+async fn download_from_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<FileDownloadRequest>,
+) -> impl IntoResponse {
+    let session = match state.store.get_session_by_name_or_id(&id) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return error_response(SandboxError::SessionNotFound(id)).into_response()
+        }
+        Err(e) => return error_response(e).into_response(),
+    };
+
+    if session.state != SessionState::Running {
+        return error_response(SandboxError::InvalidState(format!(
+            "cannot download from session with state {} (must be running)",
+            session.state
+        )))
+        .into_response();
+    }
+
+    match state
+        .guest
+        .send_request(
+            &session.id,
+            GuestRequest::FileDownload {
+                path: req.path.clone(),
+            },
+        )
+        .await
+    {
+        Ok(GuestResponse::FileDownloadResult { data, error }) => {
+            if let Some(err_msg) = error {
+                error_response(SandboxError::Internal(format!(
+                    "file download failed: {err_msg}"
+                )))
+                .into_response()
+            } else {
+                let body = FileDownloadResponse { data };
+                (StatusCode::OK, Json(body)).into_response()
+            }
+        }
+        Ok(GuestResponse::Error { message }) => {
+            error!(session_id = %session.id, %message, "guest agent download error");
+            error_response(SandboxError::Internal(format!(
+                "guest agent error: {message}"
+            )))
+            .into_response()
+        }
+        Ok(other) => {
+            error!(session_id = %session.id, ?other, "unexpected guest response to download");
+            error_response(SandboxError::Internal(
+                "unexpected response from guest agent".into(),
+            ))
+            .into_response()
+        }
+        Err(e) => {
+            error!(session_id = %session.id, error = %e, "guest agent download failed");
             error_response(e).into_response()
         }
     }

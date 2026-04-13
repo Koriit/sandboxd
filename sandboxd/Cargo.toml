@@ -31,6 +31,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
+base64 = "0.22"
 rcgen = "0.14"
 ring = "0.17"
 schemars = "0.8"

@@ -47,6 +47,35 @@ pub struct CreateSessionRequest {
     pub template: Option<String>,
     /// Optional policy to apply immediately after session creation.
     pub policy: Option<crate::policy::Policy>,
+    /// Optional git repository URL to clone into `/root/workspace/` after setup.
+    pub repo: Option<String>,
+    /// Optional command to execute after clone (or after setup if no repo).
+    pub boot_cmd: Option<String>,
+}
+
+/// Request body for `POST /sessions/{id}/upload`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FileUploadRequest {
+    /// Path inside the VM to write the file to.
+    pub path: String,
+    /// Base64-encoded file data.
+    pub data: String,
+    /// Optional Unix file mode (e.g. 0o644).
+    pub mode: Option<u32>,
+}
+
+/// Request body for `POST /sessions/{id}/download`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FileDownloadRequest {
+    /// Path inside the VM to read.
+    pub path: String,
+}
+
+/// Response body for `POST /sessions/{id}/download`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileDownloadResponse {
+    /// Base64-encoded file data.
+    pub data: String,
 }
 
 /// Request body for `POST /sessions/{id}/policy`.
@@ -143,6 +172,8 @@ mod tests {
         assert!(req.disk_gb.is_none());
         assert!(req.template.is_none());
         assert!(req.policy.is_none());
+        assert!(req.repo.is_none());
+        assert!(req.boot_cmd.is_none());
     }
 
     #[test]
@@ -380,5 +411,76 @@ mod tests {
         let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.name.as_deref(), Some("no-policy"));
         assert!(req.policy.is_none());
+    }
+
+    #[test]
+    fn deserialize_create_request_with_repo() {
+        let json = r#"{"name": "with-repo", "repo": "https://github.com/octocat/Hello-World.git"}"#;
+        let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.name.as_deref(), Some("with-repo"));
+        assert_eq!(
+            req.repo.as_deref(),
+            Some("https://github.com/octocat/Hello-World.git")
+        );
+        assert!(req.boot_cmd.is_none());
+    }
+
+    #[test]
+    fn deserialize_create_request_with_boot_cmd() {
+        let json = r#"{"name": "with-boot", "boot_cmd": "npm install"}"#;
+        let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.name.as_deref(), Some("with-boot"));
+        assert_eq!(req.boot_cmd.as_deref(), Some("npm install"));
+        assert!(req.repo.is_none());
+    }
+
+    #[test]
+    fn deserialize_create_request_with_repo_and_boot_cmd() {
+        let json = r#"{
+            "name": "full-setup",
+            "repo": "https://github.com/example/repo.git",
+            "boot_cmd": "make build"
+        }"#;
+        let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.name.as_deref(), Some("full-setup"));
+        assert_eq!(
+            req.repo.as_deref(),
+            Some("https://github.com/example/repo.git")
+        );
+        assert_eq!(req.boot_cmd.as_deref(), Some("make build"));
+    }
+
+    #[test]
+    fn deserialize_file_upload_request() {
+        let json = r#"{"path": "/root/test.txt", "data": "aGVsbG8=", "mode": 420}"#;
+        let req: FileUploadRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.path, "/root/test.txt");
+        assert_eq!(req.data, "aGVsbG8=");
+        assert_eq!(req.mode, Some(420));
+    }
+
+    #[test]
+    fn deserialize_file_upload_request_no_mode() {
+        let json = r#"{"path": "/root/test.txt", "data": "aGVsbG8="}"#;
+        let req: FileUploadRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.path, "/root/test.txt");
+        assert!(req.mode.is_none());
+    }
+
+    #[test]
+    fn deserialize_file_download_request() {
+        let json = r#"{"path": "/root/test.txt"}"#;
+        let req: FileDownloadRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.path, "/root/test.txt");
+    }
+
+    #[test]
+    fn file_download_response_serialization() {
+        let resp = FileDownloadResponse {
+            data: "aGVsbG8=".into(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let deser: FileDownloadResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.data, "aGVsbG8=");
     }
 }

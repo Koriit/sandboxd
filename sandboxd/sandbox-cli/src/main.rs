@@ -1,5 +1,7 @@
 use std::process;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use http_body_util::BodyExt;
@@ -42,6 +44,12 @@ enum Command {
         /// Path to a policy JSON file to apply after creation.
         #[arg(long)]
         policy: Option<String>,
+        /// Git repository URL to clone into /root/workspace/ after session setup.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Command to execute after clone (or after setup if no repo).
+        #[arg(long)]
+        boot_cmd: Option<String>,
     },
     /// Start a sandbox session.
     Start {
@@ -62,6 +70,17 @@ enum Command {
     Ps,
     /// List sandbox sessions (alias for ps).
     Ls,
+    /// Copy files between host and sandbox VM.
+    ///
+    /// Use session:path syntax to specify the remote side:
+    ///   sandbox cp local/file session:remote/path   (upload)
+    ///   sandbox cp session:remote/path local/file    (download)
+    Cp {
+        /// Source path (prefix with session: for VM paths).
+        src: String,
+        /// Destination path (prefix with session: for VM paths).
+        dst: String,
+    },
     /// Open an interactive SSH session (or run a command) in a sandbox.
     Ssh {
         /// Session name or ID.
@@ -142,6 +161,8 @@ fn build_request(command: &Command) -> Option<Request<String>> {
             disk,
             template,
             policy,
+            repo,
+            boot_cmd,
         } => {
             let mut body = serde_json::Map::new();
             if let Some(n) = name {
@@ -169,6 +190,12 @@ fn build_request(command: &Command) -> Option<Request<String>> {
                     }
                 };
                 body.insert("policy".into(), policy_value);
+            }
+            if let Some(r) = repo {
+                body.insert("repo".into(), serde_json::Value::String(r.clone()));
+            }
+            if let Some(cmd) = boot_cmd {
+                body.insert("boot_cmd".into(), serde_json::Value::String(cmd.clone()));
             }
             let body_str = serde_json::Value::Object(body).to_string();
             Request::builder()
@@ -246,8 +273,8 @@ fn build_request(command: &Command) -> Option<Request<String>> {
             .uri(format!("/sessions/{session}/health"))
             .body(String::new())
             .expect("failed to build request"),
-        // Ssh and Logs are handled specially -- not via a single HTTP request.
-        Command::Ssh { .. } | Command::Logs { .. } => return None,
+        // Ssh, Logs, and Cp are handled specially -- not via a single HTTP request.
+        Command::Ssh { .. } | Command::Logs { .. } | Command::Cp { .. } => return None,
     };
     Some(req)
 }
@@ -449,9 +476,9 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
             println!("  Bridge:  {}", if health.network.bridge_exists { "exists" } else { "missing" });
             println!("  TAP:     {}", if health.network.tap_exists { "exists" } else { "missing" });
         }
-        Command::Ssh { .. } | Command::Logs { .. } => {
-            // Ssh and Logs are handled separately, should not reach here.
-            unreachable!("ssh/logs commands should be handled before send_request");
+        Command::Ssh { .. } | Command::Logs { .. } | Command::Cp { .. } => {
+            // Ssh, Logs, and Cp are handled separately, should not reach here.
+            unreachable!("ssh/logs/cp commands should be handled before send_request");
         }
     }
 
@@ -603,6 +630,255 @@ async fn handle_logs(
     }
 }
 
+/// Maximum raw file size for a single-chunk transfer.
+///
+/// Base64 expands data by ~33%, so 700 KB raw stays well within the 1 MB
+/// framed message limit after encoding + JSON overhead.
+const CP_CHUNK_SIZE: usize = 700 * 1024;
+
+/// Parse a `session:path` spec, returning `(session, path)` if the spec
+/// contains a colon, or `None` if it's a local path.
+fn parse_remote_spec(spec: &str) -> Option<(&str, &str)> {
+    // Split on the first colon only.
+    spec.split_once(':')
+}
+
+/// Handle the `cp` subcommand: copy files between host and sandbox VM.
+async fn handle_cp(socket_path: &str, src: &str, dst: &str) {
+    // Determine transfer direction.
+    let src_remote = parse_remote_spec(src);
+    let dst_remote = parse_remote_spec(dst);
+
+    match (src_remote, dst_remote) {
+        (None, Some((session, remote_path))) => {
+            // Upload: local -> VM
+            handle_cp_upload(socket_path, src, session, remote_path).await;
+        }
+        (Some((session, remote_path)), None) => {
+            // Download: VM -> local
+            handle_cp_download(socket_path, session, remote_path, dst).await;
+        }
+        (Some(_), Some(_)) => {
+            eprintln!("Error: both source and destination cannot be remote");
+            process::exit(1);
+        }
+        (None, None) => {
+            eprintln!(
+                "Error: one of source or destination must be a remote path (session:path)\n\
+                 Usage:\n  \
+                 sandbox cp local/file session:remote/path   (upload)\n  \
+                 sandbox cp session:remote/path local/file   (download)"
+            );
+            process::exit(1);
+        }
+    }
+}
+
+/// Upload a local file to a sandbox VM.
+async fn handle_cp_upload(
+    socket_path: &str,
+    local_path: &str,
+    session: &str,
+    remote_path: &str,
+) {
+    // Read the local file.
+    let data = match std::fs::read(local_path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Error: cannot read local file '{local_path}': {e}");
+            process::exit(1);
+        }
+    };
+
+    if data.len() <= CP_CHUNK_SIZE {
+        // Single-chunk upload.
+        let encoded = BASE64.encode(&data);
+        let body = serde_json::json!({
+            "path": remote_path,
+            "data": encoded,
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/sessions/{session}/upload"))
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .expect("failed to build request");
+
+        let (status, resp_body) = match send_request(socket_path, req).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("{e}");
+                process::exit(1);
+            }
+        };
+
+        if !status.is_success() {
+            if let Ok(api_err) = serde_json::from_str::<ApiError>(&resp_body) {
+                eprintln!("Error: {}", api_err.error);
+            } else {
+                eprintln!("Error ({status}): {resp_body}");
+            }
+            process::exit(1);
+        }
+    } else {
+        // Chunked upload: split into chunks, upload each to a temp file,
+        // then concatenate on the VM side.
+        let chunk_count = data.len().div_ceil(CP_CHUNK_SIZE);
+        let mut chunk_paths: Vec<String> = Vec::with_capacity(chunk_count);
+
+        for (i, chunk) in data.chunks(CP_CHUNK_SIZE).enumerate() {
+            let chunk_remote = format!("{remote_path}.chunk.{i}");
+            let encoded = BASE64.encode(chunk);
+            let body = serde_json::json!({
+                "path": chunk_remote,
+                "data": encoded,
+            });
+            let req = Request::builder()
+                .method("POST")
+                .uri(format!("/sessions/{session}/upload"))
+                .header("content-type", "application/json")
+                .body(body.to_string())
+                .expect("failed to build request");
+
+            let (status, resp_body) = match send_request(socket_path, req).await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("{e}");
+                    process::exit(1);
+                }
+            };
+
+            if !status.is_success() {
+                if let Ok(api_err) = serde_json::from_str::<ApiError>(&resp_body) {
+                    eprintln!("Error uploading chunk {i}: {}", api_err.error);
+                } else {
+                    eprintln!("Error uploading chunk {i} ({status}): {resp_body}");
+                }
+                process::exit(1);
+            }
+
+            chunk_paths.push(chunk_remote);
+        }
+
+        // Concatenate chunks on the VM side via exec.
+        let cat_args: Vec<String> = chunk_paths.iter().map(|p| p.to_string()).collect();
+        let cat_cmd = format!(
+            "cat {} > {} && rm -f {}",
+            cat_args.join(" "),
+            remote_path,
+            cat_args.join(" "),
+        );
+        let exec_body = serde_json::json!({
+            "command": "bash",
+            "args": ["-c", cat_cmd],
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/sessions/{session}/exec"))
+            .header("content-type", "application/json")
+            .body(exec_body.to_string())
+            .expect("failed to build request");
+
+        let (status, resp_body) = match send_request(socket_path, req).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("{e}");
+                process::exit(1);
+            }
+        };
+
+        if !status.is_success() {
+            if let Ok(api_err) = serde_json::from_str::<ApiError>(&resp_body) {
+                eprintln!("Error concatenating chunks: {}", api_err.error);
+            } else {
+                eprintln!("Error concatenating chunks ({status}): {resp_body}");
+            }
+            process::exit(1);
+        }
+
+        // Check the exec result.
+        if let Ok(exec_resp) = serde_json::from_str::<ExecResponse>(&resp_body) {
+            if exec_resp.exit_code != 0 {
+                eprintln!(
+                    "Error: chunk concatenation failed (exit {}): {}",
+                    exec_resp.exit_code, exec_resp.stderr
+                );
+                process::exit(1);
+            }
+        }
+    }
+}
+
+/// Download a file from a sandbox VM to the local filesystem.
+async fn handle_cp_download(
+    socket_path: &str,
+    session: &str,
+    remote_path: &str,
+    local_path: &str,
+) {
+    let body = serde_json::json!({
+        "path": remote_path,
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/sessions/{session}/download"))
+        .header("content-type", "application/json")
+        .body(body.to_string())
+        .expect("failed to build request");
+
+    let (status, resp_body) = match send_request(socket_path, req).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{e}");
+            process::exit(1);
+        }
+    };
+
+    if !status.is_success() {
+        if let Ok(api_err) = serde_json::from_str::<ApiError>(&resp_body) {
+            eprintln!("Error: {}", api_err.error);
+        } else {
+            eprintln!("Error ({status}): {resp_body}");
+        }
+        process::exit(1);
+    }
+
+    // Parse the response.
+    let download_resp: serde_json::Value = match serde_json::from_str(&resp_body) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: failed to parse download response: {e}");
+            process::exit(1);
+        }
+    };
+
+    let data_b64 = match download_resp.get("data").and_then(|d| d.as_str()) {
+        Some(d) => d,
+        None => {
+            // Check if there's an error field.
+            if let Some(err) = download_resp.get("error").and_then(|e| e.as_str()) {
+                eprintln!("Error: {err}");
+            } else {
+                eprintln!("Error: no data in download response");
+            }
+            process::exit(1);
+        }
+    };
+
+    let decoded = match BASE64.decode(data_b64) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Error: failed to decode base64 data: {e}");
+            process::exit(1);
+        }
+    };
+
+    if let Err(e) = std::fs::write(local_path, &decoded) {
+        eprintln!("Error: failed to write local file '{local_path}': {e}");
+        process::exit(1);
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -610,6 +886,12 @@ async fn main() {
     // Handle ssh specially — it doesn't follow the normal request/response flow.
     if let Command::Ssh { session, command } = &cli.command {
         handle_ssh(&cli.socket, session, command).await;
+        return;
+    }
+
+    // Handle cp specially — it uses upload/download endpoints.
+    if let Command::Cp { src, dst } = &cli.command {
+        handle_cp(&cli.socket, src, dst).await;
         return;
     }
 
@@ -665,6 +947,8 @@ mod tests {
                 disk: 20,
                 template: None,
                 policy: None,
+                repo: None,
+                boot_cmd: None,
             }
         ));
     }
@@ -799,6 +1083,8 @@ mod tests {
             disk: 20,
             template: None,
             policy: None,
+            repo: None,
+            boot_cmd: None,
         };
         let req = build_request(&cmd).expect("should produce request");
         assert_eq!(req.method(), "POST");
@@ -819,6 +1105,8 @@ mod tests {
             disk: 50,
             template: None,
             policy: None,
+            repo: None,
+            boot_cmd: None,
         };
         let req = build_request(&cmd).expect("should produce request");
         assert_eq!(req.method(), "POST");
@@ -839,6 +1127,8 @@ mod tests {
             disk: 20,
             template: Some("/tmp/my-template.yaml".into()),
             policy: None,
+            repo: None,
+            boot_cmd: None,
         };
         let req = build_request(&cmd).expect("should produce request");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -1123,5 +1413,162 @@ mod tests {
             }
             _ => panic!("expected Create command"),
         }
+    }
+
+    #[test]
+    fn parse_create_with_repo() {
+        let cli = Cli::parse_from([
+            "sandbox",
+            "create",
+            "--repo",
+            "https://github.com/octocat/Hello-World.git",
+        ]);
+        match &cli.command {
+            Command::Create { repo, boot_cmd, .. } => {
+                assert_eq!(
+                    repo.as_deref(),
+                    Some("https://github.com/octocat/Hello-World.git")
+                );
+                assert!(boot_cmd.is_none());
+            }
+            _ => panic!("expected Create command"),
+        }
+    }
+
+    #[test]
+    fn parse_create_with_boot_cmd() {
+        let cli = Cli::parse_from([
+            "sandbox",
+            "create",
+            "--boot-cmd",
+            "npm install",
+        ]);
+        match &cli.command {
+            Command::Create { repo, boot_cmd, .. } => {
+                assert!(repo.is_none());
+                assert_eq!(boot_cmd.as_deref(), Some("npm install"));
+            }
+            _ => panic!("expected Create command"),
+        }
+    }
+
+    #[test]
+    fn parse_create_with_repo_and_boot_cmd() {
+        let cli = Cli::parse_from([
+            "sandbox",
+            "create",
+            "--repo",
+            "https://github.com/example/repo.git",
+            "--boot-cmd",
+            "make build",
+        ]);
+        match &cli.command {
+            Command::Create { repo, boot_cmd, .. } => {
+                assert_eq!(
+                    repo.as_deref(),
+                    Some("https://github.com/example/repo.git")
+                );
+                assert_eq!(boot_cmd.as_deref(), Some("make build"));
+            }
+            _ => panic!("expected Create command"),
+        }
+    }
+
+    #[test]
+    fn build_create_request_with_repo() {
+        let cmd = Command::Create {
+            name: Some("with-repo".into()),
+            cpus: 2,
+            memory: 4096,
+            disk: 20,
+            template: None,
+            policy: None,
+            repo: Some("https://github.com/octocat/Hello-World.git".into()),
+            boot_cmd: None,
+        };
+        let req = build_request(&cmd).expect("should produce request");
+        let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
+        assert_eq!(body["repo"], "https://github.com/octocat/Hello-World.git");
+        assert!(body.get("boot_cmd").is_none());
+    }
+
+    #[test]
+    fn build_create_request_with_boot_cmd() {
+        let cmd = Command::Create {
+            name: Some("with-boot".into()),
+            cpus: 2,
+            memory: 4096,
+            disk: 20,
+            template: None,
+            policy: None,
+            repo: None,
+            boot_cmd: Some("npm install".into()),
+        };
+        let req = build_request(&cmd).expect("should produce request");
+        let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
+        assert!(body.get("repo").is_none());
+        assert_eq!(body["boot_cmd"], "npm install");
+    }
+
+    #[test]
+    fn parse_cp_upload() {
+        let cli = Cli::parse_from([
+            "sandbox",
+            "cp",
+            "local/file.txt",
+            "my-session:/root/file.txt",
+        ]);
+        match &cli.command {
+            Command::Cp { src, dst } => {
+                assert_eq!(src, "local/file.txt");
+                assert_eq!(dst, "my-session:/root/file.txt");
+            }
+            _ => panic!("expected Cp command"),
+        }
+    }
+
+    #[test]
+    fn parse_cp_download() {
+        let cli = Cli::parse_from([
+            "sandbox",
+            "cp",
+            "my-session:/root/file.txt",
+            "local/file.txt",
+        ]);
+        match &cli.command {
+            Command::Cp { src, dst } => {
+                assert_eq!(src, "my-session:/root/file.txt");
+                assert_eq!(dst, "local/file.txt");
+            }
+            _ => panic!("expected Cp command"),
+        }
+    }
+
+    #[test]
+    fn build_cp_returns_none() {
+        let cmd = Command::Cp {
+            src: "local.txt".into(),
+            dst: "session:/remote.txt".into(),
+        };
+        assert!(build_request(&cmd).is_none());
+    }
+
+    #[test]
+    fn parse_remote_spec_with_colon() {
+        let result = parse_remote_spec("my-session:/root/file.txt");
+        assert_eq!(result, Some(("my-session", "/root/file.txt")));
+    }
+
+    #[test]
+    fn parse_remote_spec_no_colon() {
+        let result = parse_remote_spec("local/file.txt");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn parse_remote_spec_multiple_colons() {
+        // Only splits on first colon.
+        let result = parse_remote_spec("session:/path/with:colon");
+        assert_eq!(result, Some(("session", "/path/with:colon")));
     }
 }

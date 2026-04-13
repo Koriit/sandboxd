@@ -4,8 +4,11 @@
 //! (relayed via `limactl shell ... socat`). Each TCP connection handles
 //! exactly one request-response exchange and is then closed.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use sandbox_core::guest::{
     GUEST_AGENT_PORT, GuestRequest, GuestResponse, read_message, write_message,
 };
@@ -92,6 +95,10 @@ async fn handle_request(request: GuestRequest) -> GuestResponse {
         GuestRequest::Ping => GuestResponse::Pong,
         GuestRequest::Exec { command, args } => handle_exec(command, args).await,
         GuestRequest::Status => handle_status().await,
+        GuestRequest::FileUpload { path, data, mode } => {
+            handle_file_upload(path, data, mode).await
+        }
+        GuestRequest::FileDownload { path } => handle_file_download(path).await,
     }
 }
 
@@ -192,6 +199,166 @@ fn truncate_output(bytes: Vec<u8>, max_bytes: usize) -> String {
         let mut s = String::from_utf8_lossy(truncated).into_owned();
         s.push_str("\n... [output truncated]");
         s
+    }
+}
+
+// ---------------------------------------------------------------------------
+// File transfer handlers
+// ---------------------------------------------------------------------------
+
+/// Directories that file transfer operations are allowed to access.
+const ALLOWED_DIRS: &[&str] = &["/home/agent/", "/root/", "/tmp/"];
+
+/// System directories that are always denied, even if they appear to be
+/// under an allowed prefix (defense-in-depth).
+const DENIED_PREFIXES: &[&str] = &["/proc", "/sys", "/dev", "/etc"];
+
+/// Validate and resolve a guest filesystem path for file transfer.
+///
+/// The path must resolve to a location within one of [`ALLOWED_DIRS`] and
+/// must not contain `..` traversal components.
+fn validate_path(raw: &str) -> Result<PathBuf, String> {
+    // Reject empty paths.
+    if raw.is_empty() {
+        return Err("path must not be empty".into());
+    }
+
+    // Reject paths that contain `..` components (before canonicalization,
+    // to catch attempts even if the intermediate directory doesn't exist).
+    if raw.split('/').any(|component| component == "..") {
+        return Err("path must not contain '..' traversal".into());
+    }
+
+    // Convert to absolute path.
+    let path = if raw.starts_with('/') {
+        PathBuf::from(raw)
+    } else {
+        // Relative paths are resolved against /root/ (default working dir).
+        PathBuf::from("/root").join(raw)
+    };
+
+    // Convert to a string for prefix checks (we cannot canonicalize because
+    // the file may not exist yet for uploads).
+    let path_str = path.to_string_lossy();
+
+    // Check against denied system prefixes.
+    for denied in DENIED_PREFIXES {
+        if path_str.starts_with(denied) {
+            return Err(format!(
+                "access to {denied} is not allowed"
+            ));
+        }
+    }
+
+    // Check that the path is within an allowed directory.
+    let allowed = ALLOWED_DIRS
+        .iter()
+        .any(|dir| path_str.starts_with(dir));
+
+    if !allowed {
+        return Err(format!(
+            "path must be within one of: {}",
+            ALLOWED_DIRS.join(", ")
+        ));
+    }
+
+    Ok(path)
+}
+
+/// Handle a file upload request: validate path, decode base64, write file.
+async fn handle_file_upload(
+    path: String,
+    data: String,
+    mode: Option<u32>,
+) -> GuestResponse {
+    let file_path = match validate_path(&path) {
+        Ok(p) => p,
+        Err(e) => {
+            return GuestResponse::FileUploadResult {
+                success: false,
+                error: Some(e),
+            };
+        }
+    };
+
+    // Decode base64 data.
+    let bytes = match BASE64.decode(&data) {
+        Ok(b) => b,
+        Err(e) => {
+            return GuestResponse::FileUploadResult {
+                success: false,
+                error: Some(format!("invalid base64 data: {e}")),
+            };
+        }
+    };
+
+    // Ensure parent directory exists.
+    if let Some(parent) = file_path.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            return GuestResponse::FileUploadResult {
+                success: false,
+                error: Some(format!("failed to create parent directory: {e}")),
+            };
+        }
+    }
+
+    // Write the file.
+    if let Err(e) = tokio::fs::write(&file_path, &bytes).await {
+        return GuestResponse::FileUploadResult {
+            success: false,
+            error: Some(format!("failed to write file: {e}")),
+        };
+    }
+
+    // Set permissions if requested.
+    if let Some(mode_bits) = mode {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(mode_bits);
+        if let Err(e) = tokio::fs::set_permissions(&file_path, perms).await {
+            return GuestResponse::FileUploadResult {
+                success: false,
+                error: Some(format!(
+                    "file written but failed to set permissions: {e}"
+                )),
+            };
+        }
+    }
+
+    GuestResponse::FileUploadResult {
+        success: true,
+        error: None,
+    }
+}
+
+/// Handle a file download request: validate path, read file, encode base64.
+async fn handle_file_download(path: String) -> GuestResponse {
+    let file_path = match validate_path(&path) {
+        Ok(p) => p,
+        Err(e) => {
+            return GuestResponse::FileDownloadResult {
+                data: String::new(),
+                error: Some(e),
+            };
+        }
+    };
+
+    // Read the file.
+    let bytes = match tokio::fs::read(&file_path).await {
+        Ok(b) => b,
+        Err(e) => {
+            return GuestResponse::FileDownloadResult {
+                data: String::new(),
+                error: Some(format!("failed to read file: {e}")),
+            };
+        }
+    };
+
+    // Encode as base64.
+    let encoded = BASE64.encode(&bytes);
+
+    GuestResponse::FileDownloadResult {
+        data: encoded,
+        error: None,
     }
 }
 
@@ -586,6 +753,233 @@ mod tests {
             }
         }
 
+        server.await.unwrap();
+    }
+
+    // -- Path validation tests ----------------------------------------------
+
+    #[test]
+    fn test_validate_path_allowed_dirs() {
+        assert!(validate_path("/home/agent/test.txt").is_ok());
+        assert!(validate_path("/root/workspace/file").is_ok());
+        assert!(validate_path("/tmp/scratch").is_ok());
+    }
+
+    #[test]
+    fn test_validate_path_denied_dirs() {
+        assert!(validate_path("/etc/passwd").is_err());
+        assert!(validate_path("/proc/self/environ").is_err());
+        assert!(validate_path("/sys/class/net").is_err());
+        assert!(validate_path("/dev/null").is_err());
+    }
+
+    #[test]
+    fn test_validate_path_traversal_rejected() {
+        assert!(validate_path("/home/agent/../etc/passwd").is_err());
+        assert!(validate_path("/tmp/../../etc/shadow").is_err());
+        assert!(validate_path("../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn test_validate_path_outside_allowed() {
+        assert!(validate_path("/var/log/syslog").is_err());
+        assert!(validate_path("/opt/data").is_err());
+        assert!(validate_path("/usr/bin/ls").is_err());
+    }
+
+    #[test]
+    fn test_validate_path_empty() {
+        assert!(validate_path("").is_err());
+    }
+
+    #[test]
+    fn test_validate_path_relative_resolves_to_root() {
+        // Relative paths resolve against /root/
+        let result = validate_path("workspace/file.txt");
+        assert!(result.is_ok());
+        assert_eq!(
+            result.unwrap(),
+            PathBuf::from("/root/workspace/file.txt")
+        );
+    }
+
+    // -- File upload/download handler tests ---------------------------------
+
+    #[tokio::test]
+    async fn test_handle_file_upload_and_download() {
+        // /tmp/ is in the allowed dirs, so we can test upload+download there.
+        let path = format!("/tmp/sandbox-test-{}", std::process::id());
+
+        // Upload.
+        let data = BASE64.encode(b"hello from upload test");
+        let response = handle_file_upload(
+            path.clone(),
+            data,
+            Some(0o644),
+        )
+        .await;
+
+        match response {
+            GuestResponse::FileUploadResult { success, error } => {
+                assert!(success, "upload should succeed: {error:?}");
+                assert!(error.is_none());
+            }
+            other => panic!("expected FileUploadResult, got: {other:?}"),
+        }
+
+        // Download the same file.
+        let response = handle_file_download(path.clone()).await;
+
+        match response {
+            GuestResponse::FileDownloadResult { data, error } => {
+                assert!(error.is_none(), "download should succeed: {error:?}");
+                let decoded = BASE64.decode(&data).unwrap();
+                assert_eq!(decoded, b"hello from upload test");
+            }
+            other => panic!("expected FileDownloadResult, got: {other:?}"),
+        }
+
+        // Clean up.
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+
+    #[tokio::test]
+    async fn test_handle_file_upload_invalid_base64() {
+        let response = handle_file_upload(
+            "/tmp/test-bad-b64".into(),
+            "not valid base64!!!".into(),
+            None,
+        )
+        .await;
+
+        match response {
+            GuestResponse::FileUploadResult { success, error } => {
+                assert!(!success);
+                assert!(
+                    error.as_deref().unwrap_or("").contains("invalid base64"),
+                    "error should mention invalid base64: {error:?}"
+                );
+            }
+            other => panic!("expected FileUploadResult, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_file_upload_path_denied() {
+        let response = handle_file_upload(
+            "/etc/malicious".into(),
+            BASE64.encode(b"bad"),
+            None,
+        )
+        .await;
+
+        match response {
+            GuestResponse::FileUploadResult { success, error } => {
+                assert!(!success);
+                assert!(error.is_some());
+            }
+            other => panic!("expected FileUploadResult, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_file_download_nonexistent() {
+        let response =
+            handle_file_download("/tmp/nonexistent-file-that-does-not-exist-12345".into())
+                .await;
+
+        match response {
+            GuestResponse::FileDownloadResult { data, error } => {
+                assert!(data.is_empty());
+                assert!(
+                    error.as_deref().unwrap_or("").contains("failed to read"),
+                    "error should mention read failure: {error:?}"
+                );
+            }
+            other => panic!("expected FileDownloadResult, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_file_download_path_denied() {
+        let response = handle_file_download("/etc/passwd".into()).await;
+
+        match response {
+            GuestResponse::FileDownloadResult { data, error } => {
+                assert!(data.is_empty());
+                assert!(error.is_some());
+            }
+            other => panic!("expected FileDownloadResult, got: {other:?}"),
+        }
+    }
+
+    // -- End-to-end file transfer over TCP ----------------------------------
+
+    #[tokio::test]
+    async fn test_end_to_end_file_upload() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection(stream).await.unwrap();
+        });
+
+        let test_path = format!("/tmp/e2e-upload-{}", std::process::id());
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = GuestRequest::FileUpload {
+            path: test_path.clone(),
+            data: BASE64.encode(b"e2e upload content"),
+            mode: None,
+        };
+        let response = send_request_over(&mut stream, &request).await.unwrap();
+
+        match response {
+            GuestResponse::FileUploadResult { success, error } => {
+                assert!(success, "e2e upload failed: {error:?}");
+            }
+            other => panic!("expected FileUploadResult, got: {other:?}"),
+        }
+
+        // Verify the file was written.
+        let contents = tokio::fs::read_to_string(&test_path).await.unwrap();
+        assert_eq!(contents, "e2e upload content");
+        let _ = tokio::fs::remove_file(&test_path).await;
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_end_to_end_file_download() {
+        let test_path = format!("/tmp/e2e-download-{}", std::process::id());
+        tokio::fs::write(&test_path, b"e2e download content")
+            .await
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection(stream).await.unwrap();
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = GuestRequest::FileDownload {
+            path: test_path.clone(),
+        };
+        let response = send_request_over(&mut stream, &request).await.unwrap();
+
+        match response {
+            GuestResponse::FileDownloadResult { data, error } => {
+                assert!(error.is_none(), "e2e download failed: {error:?}");
+                let decoded = BASE64.decode(&data).unwrap();
+                assert_eq!(decoded, b"e2e download content");
+            }
+            other => panic!("expected FileDownloadResult, got: {other:?}"),
+        }
+
+        let _ = tokio::fs::remove_file(&test_path).await;
         server.await.unwrap();
     }
 }

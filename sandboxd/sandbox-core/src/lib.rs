@@ -14,8 +14,9 @@ pub mod store;
 pub mod vm_network;
 
 pub use api::{
-    CreateSessionRequest, ExecRequest, ExecResponse, GatewayHealth,
-    NetworkHealth, SessionHealth, SessionResponse, UpdatePolicyRequest,
+    CreateSessionRequest, ExecRequest, ExecResponse, FileDownloadRequest,
+    FileDownloadResponse, FileUploadRequest, GatewayHealth, NetworkHealth,
+    SessionHealth, SessionResponse, UpdatePolicyRequest,
 };
 pub use ca::{CaManager, generate_ca_inject_script};
 pub use dns_propagation::{

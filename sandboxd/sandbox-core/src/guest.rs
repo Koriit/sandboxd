@@ -47,6 +47,16 @@ pub enum GuestRequest {
         args: Vec<String>,
     },
     Status,
+    /// Upload a file to the guest filesystem. `data` is base64-encoded.
+    FileUpload {
+        path: String,
+        data: String,
+        mode: Option<u32>,
+    },
+    /// Download a file from the guest filesystem.
+    FileDownload {
+        path: String,
+    },
 }
 
 /// A response sent from the guest agent back to the host.
@@ -63,6 +73,16 @@ pub enum GuestResponse {
         hostname: String,
         uptime_secs: u64,
         load_average: f64,
+    },
+    /// Result of a file upload operation.
+    FileUploadResult {
+        success: bool,
+        error: Option<String>,
+    },
+    /// Result of a file download operation. `data` is base64-encoded.
+    FileDownloadResult {
+        data: String,
+        error: Option<String>,
     },
     Error {
         message: String,
@@ -435,6 +455,21 @@ mod tests {
         let status = GuestRequest::Status;
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains(r#""type":"Status"#));
+
+        let upload = GuestRequest::FileUpload {
+            path: "/tmp/test.txt".into(),
+            data: "aGVsbG8=".into(),
+            mode: Some(0o644),
+        };
+        let json = serde_json::to_string(&upload).unwrap();
+        assert!(json.contains(r#""type":"FileUpload"#));
+        assert!(json.contains(r#""path":"/tmp/test.txt"#));
+
+        let download = GuestRequest::FileDownload {
+            path: "/tmp/test.txt".into(),
+        };
+        let json = serde_json::to_string(&download).unwrap();
+        assert!(json.contains(r#""type":"FileDownload"#));
     }
 
     #[test]
@@ -460,6 +495,22 @@ mod tests {
         let json = serde_json::to_string(&status_result).unwrap();
         assert!(json.contains(r#""type":"StatusResult"#));
 
+        let upload_result = GuestResponse::FileUploadResult {
+            success: true,
+            error: None,
+        };
+        let json = serde_json::to_string(&upload_result).unwrap();
+        assert!(json.contains(r#""type":"FileUploadResult"#));
+        assert!(json.contains(r#""success":true"#));
+
+        let download_result = GuestResponse::FileDownloadResult {
+            data: "aGVsbG8=".into(),
+            error: None,
+        };
+        let json = serde_json::to_string(&download_result).unwrap();
+        assert!(json.contains(r#""type":"FileDownloadResult"#));
+        assert!(json.contains(r#""data":"aGVsbG8="#));
+
         let error = GuestResponse::Error {
             message: "something broke".into(),
         };
@@ -476,6 +527,19 @@ mod tests {
                 args: vec!["-c".into(), "echo test".into()],
             },
             GuestRequest::Status,
+            GuestRequest::FileUpload {
+                path: "/home/agent/test.txt".into(),
+                data: "aGVsbG8gd29ybGQ=".into(),
+                mode: Some(0o644),
+            },
+            GuestRequest::FileUpload {
+                path: "/tmp/nomode.txt".into(),
+                data: "dGVzdA==".into(),
+                mode: None,
+            },
+            GuestRequest::FileDownload {
+                path: "/home/agent/test.txt".into(),
+            },
         ];
 
         for req in &requests {
@@ -502,6 +566,22 @@ mod tests {
                 hostname: "vm".into(),
                 uptime_secs: 100,
                 load_average: 1.23,
+            },
+            GuestResponse::FileUploadResult {
+                success: true,
+                error: None,
+            },
+            GuestResponse::FileUploadResult {
+                success: false,
+                error: Some("permission denied".into()),
+            },
+            GuestResponse::FileDownloadResult {
+                data: "aGVsbG8=".into(),
+                error: None,
+            },
+            GuestResponse::FileDownloadResult {
+                data: String::new(),
+                error: Some("file not found".into()),
             },
             GuestResponse::Error {
                 message: "fail".into(),
@@ -696,6 +776,9 @@ mod tests {
                         hostname: "test".into(),
                         uptime_secs: 100,
                         load_average: 0.0,
+                    },
+                    _ => GuestResponse::Error {
+                        message: "unexpected request in test".into(),
                     },
                 };
 

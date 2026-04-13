@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+base64.workspace = true
 chrono.workspace = true
 rcgen.workspace = true
 ring.workspace = true

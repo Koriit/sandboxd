@@ -1233,6 +1233,7 @@ dependencies = [
 name = "sandbox-cli"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chrono",
  "clap",
  "http-body-util",
@@ -1251,6 +1252,7 @@ dependencies = [
 name = "sandbox-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chrono",
  "rcgen",
  "refinery",
@@ -1272,6 +1274,7 @@ dependencies = [
 name = "sandbox-guest"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "sandbox-core",
  "serde",
  "serde_json",
