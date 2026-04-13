@@ -1,183 +1,153 @@
 # claude-sandbox
 
-Lightweight, policy-controlled sandbox environments for Claude. Each sandbox runs
-in an isolated VM with per-session networking, traffic inspection, and configurable
-access policies.
+claude-sandbox provides isolated, policy-controlled sandbox environments for coding agents. Each sandbox runs in a dedicated QEMU/KVM virtual machine managed by Lima, with per-session networking, traffic inspection, and configurable access policies.
+
+## Key features
+
+- **Isolated VMs** -- each session runs in its own QEMU/KVM virtual machine with configurable CPU, memory, and disk resources. QEMU hardening (device lockdown, seccomp) is enabled by default.
+- **Per-session networking** -- every session gets a dedicated Docker bridge network with a gateway container running the proxy pipeline (Envoy, mitmproxy, CoreDNS).
+- **Policy engine** -- deny-by-default network policies control which destinations a session can reach and at what level of inspection (transport, TLS-verified, or full HTTP inspection).
+- **TLS interception** -- per-session CA certificates enable transparent HTTPS inspection through mitmproxy. The CA is automatically injected into the VM's trust store.
+- **Workspace provisioning** -- clone git repositories, mount host directories via virtio-fs, copy files, or push/pull via git-over-vsock.
+- **Guest agent** -- a lightweight agent inside each VM communicates with the host over vsock, enabling command execution, file transfer, and git operations without network access.
 
 ## Architecture
 
-- **sandboxd** -- daemon managing sandbox lifecycle (VM creation, networking, policy)
-- **sandbox** (CLI) -- user-facing command-line tool for creating and managing sandboxes
-- **sandbox-guest** -- agent running inside each VM, communicating with the host over vsock
-- **sandbox-core** -- shared library with types, config, error handling, and session storage
-- **networking/** -- gateway container, CoreDNS policy plugin, mitmproxy addons, Envoy configs
+```text
+sandbox (CLI)  -->  Unix socket  -->  sandboxd (daemon)
+                                          |
+                        +-----------------+-----------------+
+                        |                 |                 |
+                     Lima/QEMU     Docker bridge      SQLite store
+                     (VM mgmt)     + gateway           (sessions)
+                                   container
+```
+
+- **sandboxd** -- daemon managing the full sandbox lifecycle (VM creation, networking, policy distribution, guest agent communication).
+- **sandbox** -- CLI tool for creating and managing sandbox sessions.
+- **sandbox-guest** -- agent running inside each VM, communicating with the host over vsock.
+- **sandbox-core** -- shared library with types, configuration, error handling, and session storage.
+- **networking/** -- gateway container image, CoreDNS policy plugin, mitmproxy addons, and Envoy configuration templates.
+
+See [architecture.md](architecture.md) for a detailed component overview.
 
 ## Prerequisites
 
-- **Rust** >= 1.75 (stable)
-- **Lima** >= 2.0 for VM management (`limactl` must be on PATH)
-- **QEMU** for the VM backend (Lima uses it internally)
-- **Docker** for the networking gateway container
-- **KVM** (`/dev/kvm` accessible) for hardware-accelerated VMs
-- **Go** >= 1.22 (for the CoreDNS plugin)
-- **Python** >= 3.12 with pytest (for E2E tests)
+- Linux with KVM support (`/dev/kvm` accessible)
+- Docker 24+
+- Lima 2.1+ (`limactl` on PATH)
+- Rust 1.85+ (stable) for building from source
+- QEMU with `qemu-system-x86` and OVMF firmware
 
-## Getting Started
+See [installation.md](installation.md) for detailed setup instructions.
 
-### 1. Install prerequisites
+## Quickstart
 
-**Rust** (via rustup):
+### 1. Build
 
-```sh
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source $HOME/.cargo/env
-```
-
-**Lima** (VM manager):
-
-```sh
-# See https://lima-vm.io/docs/installation/ for your platform
-brew install lima        # macOS
-# or download from https://github.com/lima-vm/lima/releases
-```
-
-**KVM** (Linux only):
-
-```sh
-sudo apt install qemu-system-x86 ovmf    # Ubuntu/Debian
-sudo usermod -aG kvm $USER                # grant KVM access
-# Log out and back in, or run: newgrp kvm
-```
-
-Verify KVM is accessible:
-
-```sh
-ls -la /dev/kvm
-# Should show crw-rw---- or crw-rw-rw- with group kvm
-```
-
-**Docker** (for networking components):
-
-```sh
-curl -fsSL https://get.docker.com | sh
-sudo usermod -aG docker $USER
-```
-
-### 2. Build
-
-```sh
+```bash
 make build
-# or equivalently:
-cd sandboxd && cargo build --workspace
+# Produces: sandboxd/target/debug/sandboxd and sandboxd/target/debug/sandbox
 ```
 
-This produces two binaries:
-- `sandboxd/target/debug/sandboxd` -- the daemon
-- `sandboxd/target/debug/sandbox` -- the CLI
+Build the gateway container image:
 
-### 3. Start the daemon
+```bash
+make gateway-image
+```
 
-```sh
-# In one terminal:
+### 2. Start the daemon
+
+```bash
 sandboxd/target/debug/sandboxd
-
-# Or with custom paths:
-sandboxd/target/debug/sandboxd --socket /tmp/my.sock --base-dir /tmp/my-state
 ```
 
-The daemon listens on a Unix socket (default: `~/.sandboxd/sandboxd.sock`) and
-stores session state in a SQLite database under its base directory (default:
-`~/.sandboxd/`).
+The daemon listens on `~/.sandboxd/sandboxd.sock` and stores state in `~/.sandboxd/`.
 
-### 4. Create your first sandbox
+### 3. Create a session
 
-```sh
-# In another terminal:
-sandbox create --name my-first-sandbox
+```bash
+# Basic session with default resources (2 CPUs, 4 GB RAM, 20 GB disk)
+sandbox create --name my-sandbox
 
-# With custom resources:
-sandbox create --name my-first-sandbox --cpus 2 --memory 2048 --disk 20
+# With custom resources and a git repo
+sandbox create --name dev \
+    --cpus 4 --memory 8192 --disk 50 \
+    --repo https://github.com/example/project.git
+
+# With a network policy
+sandbox create --name locked-down \
+    --policy policy.json \
+    --repo https://github.com/example/project.git
 ```
 
-This creates and boots a Lima VM. The first run downloads the Ubuntu 24.04
-cloud image (~700 MB) and may take a few minutes. Subsequent creates reuse the
-cached image.
+### 4. Check status
 
-### 5. Check status
-
-```sh
+```bash
 sandbox ps
 ```
 
-Output:
-
 ```
-ID                                    NAME              STATE       CREATED
-a1b2c3d4-e5f6-7890-abcd-ef1234567890  my-first-sandbox  Running     2m ago
+ID                                    NAME        STATE       AGENT        GATEWAY      CREATED
+a1b2c3d4-e5f6-7890-abcd-ef1234567890  my-sandbox  running     connected    healthy      2m ago
 ```
 
-### 6. SSH into the sandbox
+### 5. Run commands
 
-> **Note:** `sandbox ssh` is not yet implemented (planned for M2). For now, use
-> Lima directly:
+```bash
+# Execute a command via the guest agent
+sandbox exec my-sandbox -- ls /root/workspace
 
-```sh
-limactl shell sandbox-<session-id> -- bash
+# Open an interactive SSH session
+sandbox ssh my-sandbox
+
+# Run a non-interactive command via SSH
+sandbox ssh my-sandbox -- uname -a
 ```
 
-Replace `<session-id>` with the UUID from `sandbox ps`.
+### 6. Copy files
 
-### 7. Stop and start
+```bash
+# Upload a file to the VM
+sandbox cp config.toml my-sandbox:/root/config.toml
 
-```sh
-sandbox stop my-first-sandbox
-sandbox start my-first-sandbox
+# Download a file from the VM
+sandbox cp my-sandbox:/root/output.log ./output.log
 ```
 
-Stopping a sandbox gracefully shuts down the VM. Starting it boots the VM again.
-Data on the VM's disk is preserved across stop/start cycles.
+### 7. Manage the session
 
-### 8. Remove
+```bash
+# Stop (preserves VM disk)
+sandbox stop my-sandbox
 
-```sh
-sandbox rm my-first-sandbox
+# Start again (restores networking)
+sandbox start my-sandbox
+
+# Remove permanently
+sandbox rm my-sandbox
 ```
 
-This stops the VM (if running), deletes the Lima instance, and removes the
-session from the daemon's database.
+## Build commands
 
-## CLI Reference
-
-All CLI commands accept `--socket <path>` to override the daemon socket location.
-
-| Command | Description |
-|---------|-------------|
-| `sandbox create [--name NAME] [--cpus N] [--memory MB] [--disk GB] [--template PATH]` | Create and boot a new sandbox VM |
-| `sandbox ps` | List all sandbox sessions |
-| `sandbox ls` | Alias for `ps` |
-| `sandbox start <name-or-id>` | Start a stopped sandbox |
-| `sandbox stop <name-or-id>` | Stop a running sandbox |
-| `sandbox rm <name-or-id>` | Remove a sandbox (stops if running) |
-
-## Build
-
-```sh
-make build       # cargo build --workspace
-make test        # cargo test --workspace
-make test-e2e    # run E2E test suite (pytest)
-make clean       # cargo clean
+```bash
+make build         # cargo build --workspace
+make test          # cargo test --workspace
+make test-e2e      # E2E test suite (pytest)
+make gateway-image # build the gateway container image
+make clean         # cargo clean
 ```
 
 ## Project layout
 
 ```
 claude-sandbox/
-  docs/              design docs, session plan
+  docs/              documentation
   sandboxd/          Rust cargo workspace
     sandboxd/        daemon binary
     sandbox-cli/     CLI binary (produces `sandbox`)
     sandbox-core/    shared library
-    sandbox-guest/   VM-side vsock listener
+    sandbox-guest/   VM-side vsock agent
   tests/e2e/         E2E test suite (pytest)
   networking/        gateway and proxy components
     coredns-plugin/  Go CoreDNS policy plugin
@@ -185,3 +155,18 @@ claude-sandbox/
     envoy/           Envoy config templates
     gateway/         gateway container Dockerfile
 ```
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [installation.md](installation.md) | System requirements and detailed setup guide |
+| [cli-reference.md](cli-reference.md) | Complete CLI command reference |
+| [architecture.md](architecture.md) | Component overview and design |
+| [networking.md](networking.md) | Network architecture and troubleshooting |
+| [policy.md](policy.md) | Policy format and enforcement |
+| [workspaces.md](workspaces.md) | Workspace modes (clone, shared mount, cp, git-over-vsock) |
+
+## License
+
+MIT
