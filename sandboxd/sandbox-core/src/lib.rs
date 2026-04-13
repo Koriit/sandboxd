@@ -5,6 +5,7 @@ pub mod gateway;
 pub mod guest;
 pub mod lima;
 pub mod network;
+pub mod policy;
 pub mod qmp;
 pub mod session;
 pub mod store;
@@ -23,6 +24,10 @@ pub use guest::{
 };
 pub use lima::{LimaManager, VmInfo, VmStatus};
 pub use network::{NetworkInfo, NetworkManager};
+pub use policy::{
+    AssuranceLevel, CompiledPolicy, CoreDnsConfig, Destination, HttpConstraints, MitmproxyConfig,
+    MitmproxyRule, Policy, PolicyCompiler, PolicyRule, Protocol,
+};
 pub use qmp::{QmpClient, mac_from_uuid, tap_name_for_session};
 pub use session::{Session, SessionConfig, SessionState};
 pub use store::SessionStore;

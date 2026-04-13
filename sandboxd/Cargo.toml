@@ -33,6 +33,8 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 rcgen = "0.14"
 ring = "0.17"
+schemars = "0.8"
+semver = "1"
 tempfile = "3"
 time = "0.3"
 
