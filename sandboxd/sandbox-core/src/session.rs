@@ -9,7 +9,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkspaceMode {
-    /// Mount a host directory into the VM via virtio-fs (bidirectional, live).
+    /// Mount a host directory into the VM via 9p (bidirectional, live).
     Shared {
         /// Absolute path on the host to mount.
         host_path: String,
@@ -284,7 +284,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         session.transition_to(SessionState::Running).unwrap();
-        assert!(session.updated_at >= original);
+        assert!(session.updated_at > original);
     }
 
     #[test]

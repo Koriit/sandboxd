@@ -22,62 +22,18 @@ import time
 
 import pytest
 
+from conftest import (
+    _VM_RESOURCE_ARGS,
+    capture_lima_logs,
+    gateway_container_name,
+    lima_vm_name,
+    parse_session_id,
+    wait_for_state,
+)
+
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers (file-specific)
 # ---------------------------------------------------------------------------
-
-# Regex to extract the session ID (UUID) from `sandbox create` output.
-_ID_RE = re.compile(r"^ID:\s+([0-9a-f-]{36})$", re.MULTILINE)
-
-# Default VM resource args -- kept small for hosts with limited RAM (3.8 GB).
-_VM_RESOURCE_ARGS = ("--cpus", "1", "--memory", "1024", "--disk", "10")
-
-
-def parse_session_id(create_output: str) -> str:
-    """Extract the session UUID from `sandbox create` stdout."""
-    m = _ID_RE.search(create_output)
-    if not m:
-        raise ValueError(
-            f"Could not parse session ID from create output:\n{create_output}"
-        )
-    return m.group(1)
-
-
-def lima_vm_name(session_id: str) -> str:
-    """Return the Lima VM name for a given session ID."""
-    return f"sandbox-{session_id}"
-
-
-def gateway_container_name(session_id: str) -> str:
-    """Return the Docker gateway container name for a given session ID."""
-    return f"sandbox-gw-{session_id}"
-
-
-def wait_for_state(
-    sandbox_cli,
-    name: str,
-    expected_state: str,
-    timeout: int = 30,
-    interval: float = 2.0,
-) -> str:
-    """Poll `sandbox ps` until the named session reaches the expected state.
-
-    Returns the full ps output on success.  Raises AssertionError on timeout.
-    """
-    deadline = time.monotonic() + timeout
-    last_output = ""
-    while time.monotonic() < deadline:
-        result = sandbox_cli("ps")
-        last_output = result.stdout
-        for line in last_output.splitlines():
-            if name in line and expected_state in line:
-                return last_output
-        time.sleep(interval)
-
-    raise AssertionError(
-        f"Session {name!r} did not reach state {expected_state!r} "
-        f"within {timeout}s.\nLast ps output:\n{last_output}"
-    )
 
 
 def docker_ps_containers(label_filter: str | None = None) -> list[dict]:
@@ -117,22 +73,6 @@ def docker_container_exists(container_name: str) -> bool:
         capture_output=True, text=True, timeout=30,
     )
     return result.returncode == 0
-
-
-def capture_lima_logs(session_id: str) -> str:
-    """Best-effort capture of Lima VM logs for debugging failures."""
-    vm = lima_vm_name(session_id)
-    logs = []
-    ha_log = os.path.expanduser(f"~/.lima/{vm}/ha.stderr.log")
-    try:
-        with open(ha_log) as f:
-            content = f.read()
-            if content:
-                logs.append(f"--- {ha_log} (last 50 lines) ---")
-                logs.extend(content.splitlines()[-50:])
-    except FileNotFoundError:
-        logs.append(f"(no ha.stderr.log found at {ha_log})")
-    return "\n".join(logs)
 
 
 # ---------------------------------------------------------------------------
@@ -267,8 +207,8 @@ def test_denied_traffic(sandbox_cli):
         # The connection should fail (timeout or connection refused).
         # We check that it did NOT successfully return HTTP content.
         output = metadata_result.stdout
-        assert "EXIT:0" not in output or "metadata" not in output.lower(), (
-            f"Cloud metadata endpoint was reachable (should be blocked).\n"
+        assert "EXIT:0" not in output, (
+            f"Cloud metadata endpoint (169.254.169.254) was reachable but should be blocked.\n"
             f"Output:\n{output}"
         )
 
@@ -289,6 +229,10 @@ def test_denied_traffic(sandbox_cli):
         # will be non-zero (1) on timeout.  We just verify it didn't succeed
         # cleanly in an unexpected way.  This is a best-effort check since
         # UDP is connectionless.
+        assert udp_result.returncode != 0 or "EXIT:0" not in udp_result.stdout, (
+            f"UDP traffic to 8.8.8.8:9999 should have been blocked by nftables.\n"
+            f"stdout: {udp_result.stdout}\nstderr: {udp_result.stderr}"
+        )
 
         # 4. Clean up.
         sandbox_cli("rm", "net-deny-test", timeout=120)

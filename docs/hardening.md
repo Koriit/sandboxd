@@ -52,7 +52,7 @@ systemd-run --user --scope --slice=sandbox.slice \
 
 | Limit | Default | Effect |
 |-------|---------|--------|
-| `MemoryMax` | 4096M (from `SessionConfig.memory_mb`) | OOM-kills the QEMU process if it exceeds the limit |
+| `MemoryMax` | 4608M (from `SessionConfig.memory_mb` + 512 MB headroom) | OOM-kills the QEMU process if it exceeds the limit |
 | `CPUQuota` | 200% (from `SessionConfig.cpus = 2`) | Limits CPU time to the equivalent of N cores |
 | `TasksMax` | 256 | Limits the number of threads/processes QEMU can create |
 

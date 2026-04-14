@@ -842,6 +842,26 @@ Tests require a Linux host with KVM and Docker.
 
 **Exit criteria:** All E2E tests pass. Documentation reflects the actual privilege model. No manual setup beyond group membership, `make gateway-image`, `cargo build`, and bridge.conf is required.
 
+### M85-S4: Comprehensive review
+
+**Entry criteria:** M8.5-S3 complete. 30/30 E2E tests pass. All docs updated.
+
+**Tasks — 5 parallel review tracks:**
+
+1. **Implementation vs plan review.** Compare the final implementation against what was originally planned in each milestone (M0–M8.5). Identify: features delivered as planned, features that diverged (and why), features dropped, features added beyond the plan.
+
+2. **Code quality review.** Review all Rust code in `sandboxd/` for: error handling, resource cleanup, naming consistency, dead code, unnecessary complexity, unsafe patterns, and adherence to idiomatic Rust.
+
+3. **Unit tests quality review.** Review all unit tests for: tautological assertions (tests that pass by construction, not by testing real behaviour), coverage gaps, test isolation, and meaningful assertions. Set up code coverage reporting (`cargo-tarpaulin` or similar) and identify under-tested modules.
+
+4. **E2E tests quality review.** Review all E2E tests in `tests/e2e/` for: tautological assertions, coverage of edge cases, brittleness (timing-dependent assertions, race conditions), cleanup reliability, and whether the tests actually exercise the feature they claim to test.
+
+5. **Documentation quality review.** Review all docs in `docs/` for: accuracy against the actual implementation, completeness, internal consistency, broken references, and stale content.
+
+**Exit criteria:**
+- All review findings fixed (code, tests, docs).
+- Report of the final implementation against what was originally planned and promised.
+
 ---
 
 ## M9: macOS Support
@@ -921,8 +941,8 @@ Tests require a Linux host with KVM and Docker.
 | M6 | 3 |
 | M7 | 1 |
 | M8 | 3 |
-| M8.5 | 3 |
+| M8.5 | 4 |
 | M9 | 2 |
 | **Total** | **35** |
 
-Linux critical path: 33 sessions (M0 through M8.5). M9 (macOS) is an independent track (2 sessions) that can be interleaved or appended when macOS hardware is available.
+Linux critical path: 34 sessions (M0 through M8.5). M9 (macOS) is an independent track (2 sessions) that can be interleaved or appended when macOS hardware is available.

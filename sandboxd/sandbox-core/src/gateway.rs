@@ -1112,20 +1112,6 @@ mod tests {
         );
     }
 
-    // -- GatewayManager construction ----------------------------------------
-
-    #[test]
-    fn test_gateway_manager_new() {
-        let _manager = GatewayManager::new();
-        // Just verify it can be constructed.
-    }
-
-    #[test]
-    fn test_gateway_manager_default() {
-        let _manager: GatewayManager = Default::default();
-        // Verify Default trait is implemented.
-    }
-
     // -- Integration tests (require Docker + root) --------------------------
 
     #[test]

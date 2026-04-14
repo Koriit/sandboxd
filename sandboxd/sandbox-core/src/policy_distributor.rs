@@ -5,7 +5,6 @@ use uuid::Uuid;
 
 use crate::error::SandboxError;
 use crate::gateway::{self, GatewayManager};
-use crate::network::NetworkInfo;
 use crate::policy::CompiledPolicy;
 
 // ---------------------------------------------------------------------------
@@ -46,7 +45,6 @@ impl PolicyDistributor {
         session_id: &Uuid,
         compiled: &CompiledPolicy,
         gateway: &GatewayManager,
-        _network_info: &NetworkInfo,
     ) -> Result<(), SandboxError> {
         let container = gateway::container_name(session_id);
         let mut state = DistributionState::default();
@@ -126,6 +124,8 @@ impl PolicyDistributor {
             Self::rollback_steps(session_id, &state, &previous);
             return Err(e);
         }
+        #[allow(unused_assignments)] // Consistent with prior steps; enables rollback if steps are added.
+        { state.envoy_written = true; }
         debug!(session_id = %session_id, "Envoy config written");
 
         // Signal Envoy to reload by hitting the admin endpoint.
@@ -273,7 +273,7 @@ pub fn write_file_to_container(
     use std::io::Write;
 
     let mut child = Command::new("docker")
-        .args(["exec", "-i", container, "sh", "-c", &format!("cat > {path}")])
+        .args(["exec", "-i", container, "sh", "-c", &format!("cat > '{path}'")])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -380,31 +380,4 @@ fn reload_envoy(container: &str) -> Result<(), SandboxError> {
     }
 
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn distribution_state_default_all_false() {
-        let state = DistributionState::default();
-        assert!(!state.coredns_written);
-        assert!(!state.mitmproxy_written);
-        assert!(!state.nftables_injected);
-        assert!(!state.envoy_written);
-    }
-
-    #[test]
-    fn previous_configs_default_all_none() {
-        let prev = PreviousConfigs::default();
-        assert!(prev.coredns.is_none());
-        assert!(prev.mitmproxy.is_none());
-        assert!(prev.nftables.is_none());
-        assert!(prev.envoy.is_none());
-    }
 }

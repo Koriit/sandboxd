@@ -1088,7 +1088,7 @@ async fn apply_policy(
     let compiled = PolicyCompiler::compile(policy, &network_info)?;
 
     // Distribute to gateway components.
-    PolicyDistributor::distribute(session_id, &compiled, &state.gateway, &network_info)?;
+    PolicyDistributor::distribute(session_id, &compiled, &state.gateway)?;
 
     // Store the policy for the DNS propagation loop.
     {

@@ -577,58 +577,6 @@ mod tests {
         );
     }
 
-    // -- QMP command format tests --------------------------------------------
-
-    #[test]
-    fn test_qmp_netdev_add_format() {
-        // Verify the JSON structure of a netdev_add command.
-        let cmd = serde_json::json!({
-            "execute": "netdev_add",
-            "arguments": {
-                "type": "tap",
-                "id": "net1",
-                "ifname": "tap-sb-550e84",
-                "script": "no",
-                "downscript": "no"
-            }
-        });
-
-        assert_eq!(cmd["execute"], "netdev_add");
-        assert_eq!(cmd["arguments"]["type"], "tap");
-        assert_eq!(cmd["arguments"]["id"], "net1");
-        assert_eq!(cmd["arguments"]["ifname"], "tap-sb-550e84");
-        assert_eq!(cmd["arguments"]["script"], "no");
-        assert_eq!(cmd["arguments"]["downscript"], "no");
-    }
-
-    #[test]
-    fn test_qmp_device_add_format() {
-        // Verify the JSON structure of a device_add command.
-        let cmd = serde_json::json!({
-            "execute": "device_add",
-            "arguments": {
-                "driver": "virtio-net-pci",
-                "netdev": "net1",
-                "id": "nic1",
-                "mac": "52:54:00:55:0e:84"
-            }
-        });
-
-        assert_eq!(cmd["execute"], "device_add");
-        assert_eq!(cmd["arguments"]["driver"], "virtio-net-pci");
-        assert_eq!(cmd["arguments"]["netdev"], "net1");
-        assert_eq!(cmd["arguments"]["id"], "nic1");
-        assert_eq!(cmd["arguments"]["mac"], "52:54:00:55:0e:84");
-    }
-
-    #[test]
-    fn test_qmp_capabilities_format() {
-        let cmd = serde_json::json!({ "execute": "qmp_capabilities" });
-        assert_eq!(cmd["execute"], "qmp_capabilities");
-        // No arguments key should be present.
-        assert!(cmd.get("arguments").is_none());
-    }
-
     #[test]
     fn test_check_qmp_response_success() {
         let response = serde_json::json!({ "return": {} });

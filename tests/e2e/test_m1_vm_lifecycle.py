@@ -11,64 +11,21 @@ Run with generous timeouts:
 from __future__ import annotations
 
 import json
-import os
-import re
 import subprocess
-import time
 
 import pytest
 
+from conftest import (
+    _VM_RESOURCE_ARGS,
+    capture_lima_logs,
+    lima_vm_name,
+    parse_session_id,
+    wait_for_state,
+)
+
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers (file-specific)
 # ---------------------------------------------------------------------------
-
-# Regex to extract the session ID (UUID) from `sandbox create` output.
-# The CLI prints lines like:  ID:       <uuid>
-_ID_RE = re.compile(r"^ID:\s+([0-9a-f-]{36})$", re.MULTILINE)
-
-
-def parse_session_id(create_output: str) -> str:
-    """Extract the session UUID from `sandbox create` stdout."""
-    m = _ID_RE.search(create_output)
-    if not m:
-        raise ValueError(
-            f"Could not parse session ID from create output:\n{create_output}"
-        )
-    return m.group(1)
-
-
-def lima_vm_name(session_id: str) -> str:
-    """Return the Lima VM name for a given session ID."""
-    return f"sandbox-{session_id}"
-
-
-def wait_for_state(
-    sandbox_cli,
-    name: str,
-    expected_state: str,
-    timeout: int = 30,
-    interval: float = 2.0,
-) -> str:
-    """Poll `sandbox ps` until the named session reaches the expected state.
-
-    Returns the full ps output on success.  Raises AssertionError on timeout.
-    """
-    deadline = time.monotonic() + timeout
-    last_output = ""
-    while time.monotonic() < deadline:
-        result = sandbox_cli("ps")
-        last_output = result.stdout
-        # The table has columns: ID, NAME, STATE, CREATED
-        # We look for a line containing the session name and the expected state.
-        for line in last_output.splitlines():
-            if name in line and expected_state in line:
-                return last_output
-        time.sleep(interval)
-
-    raise AssertionError(
-        f"Session {name!r} did not reach state {expected_state!r} "
-        f"within {timeout}s.\nLast ps output:\n{last_output}"
-    )
 
 
 def limactl_list_json() -> list[dict]:
@@ -94,30 +51,6 @@ def limactl_shell(vm_name: str, *cmd: str, timeout: int = 60) -> subprocess.Comp
         ["limactl", "shell", vm_name, "--", *cmd],
         capture_output=True, text=True, timeout=timeout,
     )
-
-
-# Default VM resource args -- kept small so tests work on hosts with limited
-# memory (e.g. 4 GB total).
-_VM_RESOURCE_ARGS = ("--cpus", "1", "--memory", "1024", "--disk", "10")
-
-
-def capture_lima_logs(session_id: str) -> str:
-    """Best-effort capture of Lima VM logs for debugging failures."""
-    vm = lima_vm_name(session_id)
-    logs = []
-
-    # ha.stderr.log is the main Lima log
-    ha_log = os.path.expanduser(f"~/.lima/{vm}/ha.stderr.log")
-    try:
-        with open(ha_log) as f:
-            content = f.read()
-            if content:
-                logs.append(f"--- {ha_log} (last 50 lines) ---")
-                logs.extend(content.splitlines()[-50:])
-    except FileNotFoundError:
-        logs.append(f"(no ha.stderr.log found at {ha_log})")
-
-    return "\n".join(logs)
 
 
 # ---------------------------------------------------------------------------

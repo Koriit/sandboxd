@@ -53,7 +53,7 @@ enum Command {
         #[arg(long)]
         boot_cmd: Option<String>,
         /// Workspace mode: `shared:<host-path>` mounts a host directory into
-        /// the VM at /home/agent/workspace via virtio-fs.
+        /// the VM at /home/agent/workspace via 9p.
         ///
         /// Mutually exclusive with --repo.
         #[arg(long, conflicts_with = "repo")]

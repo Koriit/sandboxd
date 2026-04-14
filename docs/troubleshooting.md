@@ -143,7 +143,7 @@ ip addr show       # Look for .3 address
 ip route           # Default route should go through .2 with metric 50
 ```
 
-If the TAP is missing, the NIC hot-add failed. Check: `journalctl -u sandboxd | grep -i "qmp\|hot-add\|tap"`. Fix: stop and start the session.
+If the TAP is missing, the bridge/TAP setup via qemu-bridge-helper may have failed. Check: `journalctl -u sandboxd | grep -i "bridge\|tap\|qemu-bridge-helper"`. Fix: stop and start the session.
 
 ### Docker bridge missing
 
@@ -159,8 +159,7 @@ If missing, the session's networking was torn down. Fix: `sandbox start <session
 **Symptom:** Gateway is healthy but VM traffic is rejected.
 
 ```bash
-PID=$(docker inspect --format '{{.State.Pid}}' sandbox-gw-<session_id>)
-sudo nsenter --net=/proc/$PID/ns/net nft list ruleset
+docker exec sandbox-gw-<session_id> nft list ruleset
 ```
 
 Look for `table inet sandbox` (deny-all base) and `table inet sandbox_dnat` (DNAT routing). If `sandbox_dnat` is missing, restart the session:
@@ -228,10 +227,10 @@ journalctl -u sandboxd --since "10 minutes ago" | grep <session_id>
 
 Common hang points: guest agent timeout (45s), Docker/gateway setup failure, component readiness timeout (45s).
 
-Fix: force-remove and recreate:
+Fix: remove and recreate:
 
 ```bash
-sandbox rm --force <session>
+sandbox rm <session>
 sandbox create --name <name>
 ```
 
@@ -256,8 +255,7 @@ docker ps --filter label=sandbox.session_id   # Gateway containers
 docker network ls --filter label=sandbox.session_id  # Session networks
 
 # nftables
-PID=$(docker inspect --format '{{.State.Pid}}' sandbox-gw-<session_id>)
-sudo nsenter --net=/proc/$PID/ns/net nft list ruleset
+docker exec sandbox-gw-<session_id> nft list ruleset
 
 # Inside the VM
 ip addr show                                  # Interfaces

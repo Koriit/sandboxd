@@ -219,7 +219,7 @@ sandbox ssh my-sandbox -- ls -la /root/workspace
 
 ## sandbox exec
 
-Execute a command inside a sandbox via the guest agent. Unlike `ssh`, this uses the daemon's guest agent channel (vsock), not SSH.
+Execute a command inside a sandbox via the guest agent. Unlike `ssh`, this uses the daemon's guest agent channel (TCP via SSH tunnel), not a direct SSH session.
 
 ### Synopsis
 

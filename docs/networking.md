@@ -247,7 +247,7 @@ The gateway container runs three processes managed by the entrypoint script:
 
 | Component | Listen address | Health check |
 |-----------|---------------|--------------|
-| mitmproxy (mitmdump) | `127.0.0.1:8080` | Process alive (`pgrep -x mitmdump`) |
+| mitmproxy (mitmdump) | `0.0.0.0:8080` | Process alive (`pgrep -x mitmdump`) |
 | Envoy | `0.0.0.0:10000` (proxy), `127.0.0.1:9901` (admin) | `GET http://127.0.0.1:9901/ready` |
 | CoreDNS | `:53` (DNS), `:8180` (health), `:8181` (ready) | `GET http://127.0.0.1:8180/health` |
 

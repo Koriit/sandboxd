@@ -58,7 +58,7 @@ pub struct CreateSessionRequest {
     ///
     /// Mutually exclusive with `repo`. When set to a `shared:` mode, the
     /// host directory is mounted into the VM at `/home/agent/workspace`
-    /// via virtio-fs.
+    /// via 9p.
     pub workspace: Option<String>,
     /// Enable QEMU hardening (device lockdown, seccomp).
     ///

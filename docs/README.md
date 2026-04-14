@@ -8,8 +8,8 @@ claude-sandbox provides isolated, policy-controlled sandbox environments for cod
 - **Per-session networking** -- every session gets a dedicated Docker bridge network with a gateway container running the proxy pipeline (Envoy, mitmproxy, CoreDNS).
 - **Policy engine** -- deny-by-default network policies control which destinations a session can reach and at what level of inspection (transport, TLS-verified, or full HTTP inspection).
 - **TLS interception** -- per-session CA certificates enable transparent HTTPS inspection through mitmproxy. The CA is automatically injected into the VM's trust store.
-- **Workspace provisioning** -- clone git repositories, mount host directories via 9p, copy files, or push/pull via git-over-vsock.
-- **Guest agent** -- a lightweight agent inside each VM communicates with the host over vsock, enabling command execution, file transfer, and git operations without network access.
+- **Workspace provisioning** -- clone git repositories, mount host directories via 9p, copy files, or push/pull via git remote helper.
+- **Guest agent** -- a lightweight agent inside each VM communicates with the host over TCP (via SSH tunnel), enabling command execution, file transfer, and git operations without network access.
 
 ## Architecture
 
@@ -25,7 +25,7 @@ sandbox (CLI)  -->  Unix socket  -->  sandboxd (daemon)
 
 - **sandboxd** -- daemon managing the full sandbox lifecycle (VM creation, networking, policy distribution, guest agent communication).
 - **sandbox** -- CLI tool for creating and managing sandbox sessions.
-- **sandbox-guest** -- agent running inside each VM, communicating with the host over vsock.
+- **sandbox-guest** -- agent running inside each VM, communicating with the host over TCP (via SSH tunnel).
 - **sandbox-core** -- shared library with types, configuration, error handling, and session storage.
 - **networking/** -- gateway container image, CoreDNS policy plugin, mitmproxy addons, and Envoy configuration templates.
 
@@ -147,7 +147,7 @@ claude-sandbox/
     sandboxd/        daemon binary
     sandbox-cli/     CLI binary (produces `sandbox`)
     sandbox-core/    shared library
-    sandbox-guest/   VM-side vsock agent
+    sandbox-guest/   VM-side guest agent
   tests/e2e/         E2E test suite (pytest)
   networking/        gateway and proxy components
     coredns-plugin/  Go CoreDNS policy plugin
@@ -165,7 +165,7 @@ claude-sandbox/
 | [architecture.md](architecture.md) | Component overview and design |
 | [networking.md](networking.md) | Network architecture and troubleshooting |
 | [policy.md](policy.md) | Policy format and enforcement |
-| [workspaces.md](workspaces.md) | Workspace modes (clone, shared mount, cp, git-over-vsock) |
+| [workspaces.md](workspaces.md) | Workspace modes (clone, shared mount, cp, git remote transport) |
 
 ## License
 

@@ -13,7 +13,7 @@ A sandbox session can receive workspace files through several mechanisms:
 | Clone               | `--repo <url>`              | One-shot pull | Minutes       | Full      |
 | Shared mount        | `--workspace shared:<path>` | Bidirectional | Instant       | Reduced   |
 | sandbox cp          | `sandbox cp`                | Bidirectional | Per-transfer  | Full      |
-| git-over-vsock      | `ext::sandbox git-remote`   | Push / pull   | Per-operation | Full      |
+| git remote transport      | `ext::sandbox git-remote`   | Push / pull   | Per-operation | Full      |
 
 The sections below describe each mode in detail.
 
@@ -55,7 +55,7 @@ API equivalent:
   fail.  Clone failure is non-fatal: the session is still usable, but
   the workspace directory will be missing.
 - Clone mode runs `git clone` once.  Subsequent pulls or pushes require
-  either network access (via policy) or the git-over-vsock transport.
+  either network access (via policy) or the git remote transport.
 
 
 ## Shared mount
@@ -117,7 +117,7 @@ the attack surface** compared to a fully isolated session:
 **Recommendation:** Use shared mounts only for development workflows
 where the convenience of instant bidirectional file access outweighs the
 reduced isolation.  For production or security-sensitive workloads,
-prefer clone mode combined with `sandbox cp` or git-over-vsock for file
+prefer clone mode combined with `sandbox cp` or git remote transport for file
 transfer.
 
 
@@ -150,9 +150,9 @@ sandbox cp my-session:/home/agent/output.log ./output.log
   access.  The host filesystem is never directly exposed.
 
 
-## git-over-vsock
+## git remote transport
 
-The git-over-vsock transport allows standard `git push` and `git pull`
+The git remote transport allows standard `git push` and `git pull`
 operations against a repository inside a sandbox VM, without requiring
 network access.  It uses the `ext::` remote transport built into git.
 
@@ -181,7 +181,7 @@ git pull sandbox main
   operations are supported.
 - No network policy rules are needed because the communication path is
   entirely host-local (daemon socket to guest agent).
-- git-over-vsock maintains **full VM isolation** while enabling
+- git remote transport maintains **full VM isolation** while enabling
   incremental code synchronization.
 
 
@@ -218,7 +218,7 @@ sandbox create --name dev \
 
 ## Choosing a mode
 
-| Criterion                  | Clone       | Shared mount | sandbox cp  | git-over-vsock |
+| Criterion                  | Clone       | Shared mount | sandbox cp  | git remote transport |
 |----------------------------|-------------|--------------|-------------|----------------|
 | Initial setup speed        | Slow (clone)| Fast (mount) | N/A         | N/A            |
 | Incremental sync           | Manual      | Automatic    | Manual      | Manual         |
@@ -228,13 +228,13 @@ sandbox create --name dev \
 | Works offline              | No          | Yes          | Yes         | Yes            |
 | IDE integration            | Via cp/git  | Native       | Via cp      | Native (git)   |
 
-(*) Clone is one-shot.  Use git-over-vsock or `sandbox cp` for
+(*) Clone is one-shot.  Use git remote transport or `sandbox cp` for
 subsequent transfers.
 
 **When to use each mode:**
 
 - **Clone** -- You want a one-time copy of a remote repository and plan
-  to use git-over-vsock or `sandbox cp` for incremental updates.  Best
+  to use git remote transport or `sandbox cp` for incremental updates.  Best
   for CI/CD pipelines and automated environments.
 
 - **Shared mount** -- You are actively developing and need instant
@@ -246,7 +246,7 @@ subsequent transfers.
   setting up git.  Best for one-off file exchanges (config files, build
   artifacts, logs).
 
-- **git-over-vsock** -- You want version-controlled incremental sync
+- **git remote transport** -- You want version-controlled incremental sync
   without network access.  Best for workflows where you commit locally,
   push into the VM, build/test, and pull results back.
 
@@ -288,14 +288,14 @@ sandbox cp ci-run:/root/workspace/dist/app.tar.gz ./app.tar.gz
 sandbox rm ci-run
 ```
 
-### Push local changes via git-over-vsock
+### Push local changes via git remote transport
 
 ```bash
 # Create a bare sandbox and copy seed files
 sandbox create --name review
 sandbox cp ./my-patch.diff review:/root/workspace/patch.diff
 
-# Or use git-over-vsock for full repo sync
+# Or use git remote transport for full repo sync
 git remote add review \
     "ext::sandbox git-remote %S review"
 git push review main

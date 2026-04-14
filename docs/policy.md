@@ -424,6 +424,5 @@ To understand what your policy permits, you can:
 
 4. **Inspect nftables rules** in the gateway to see which IPs are allowed:
    ```bash
-   PID=$(docker inspect --format '{{.State.Pid}}' sandbox-gw-{session_id})
-   sudo nsenter --net=/proc/$PID/ns/net nft list ruleset
+   docker exec sandbox-gw-{session_id} nft list ruleset
    ```

@@ -11,85 +11,18 @@ Run with generous timeouts:
 
 from __future__ import annotations
 
-import json
 import os
-import re
-import subprocess
 import tempfile
-import time
 
 import pytest
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-# Regex to extract the session ID (UUID) from `sandbox create` output.
-_ID_RE = re.compile(r"^ID:\s+([0-9a-f-]{36})$", re.MULTILINE)
-
-# Default VM resource args -- kept small for hosts with limited RAM.
-_VM_RESOURCE_ARGS = ("--cpus", "1", "--memory", "1024", "--disk", "10")
-
-
-def parse_session_id(create_output: str) -> str:
-    """Extract the session UUID from `sandbox create` stdout."""
-    m = _ID_RE.search(create_output)
-    if not m:
-        raise ValueError(
-            f"Could not parse session ID from create output:\n{create_output}"
-        )
-    return m.group(1)
-
-
-def wait_for_state(
-    sandbox_cli,
-    name: str,
-    expected_state: str,
-    timeout: int = 30,
-    interval: float = 2.0,
-) -> str:
-    """Poll `sandbox ps` until the named session reaches the expected state.
-
-    Returns the full ps output on success.  Raises AssertionError on timeout.
-    """
-    deadline = time.monotonic() + timeout
-    last_output = ""
-    while time.monotonic() < deadline:
-        result = sandbox_cli("ps")
-        last_output = result.stdout
-        for line in last_output.splitlines():
-            if name in line and expected_state in line:
-                return last_output
-        time.sleep(interval)
-
-    raise AssertionError(
-        f"Session {name!r} did not reach state {expected_state!r} "
-        f"within {timeout}s.\nLast ps output:\n{last_output}"
-    )
-
-
-def write_policy_file(policy: dict) -> str:
-    """Write a policy dict to a temporary JSON file and return its path.
-
-    The caller is responsible for cleanup (or rely on OS temp cleanup).
-    The file is NOT auto-deleted so it remains available for the sandbox
-    CLI to read during the test.
-    """
-    f = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".json", prefix="sandbox-policy-", delete=False,
-    )
-    json.dump(policy, f)
-    f.close()
-    return f.name
-
-
-def cleanup_policy_file(path: str) -> None:
-    """Best-effort removal of a temporary policy file."""
-    try:
-        os.unlink(path)
-    except OSError:
-        pass
-
+from conftest import (
+    _VM_RESOURCE_ARGS,
+    cleanup_policy_file,
+    parse_session_id,
+    wait_for_state,
+    write_policy_file,
+)
 
 # ---------------------------------------------------------------------------
 # Tests
