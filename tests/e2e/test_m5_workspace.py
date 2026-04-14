@@ -31,7 +31,7 @@ from conftest import (
 @pytest.mark.timeout(600)
 def test_clone_repo(sandbox_cli):
     """Create a session with --repo pointing to a small public repo.
-    Verify the repository is cloned into /root/workspace/.
+    Verify the repository is cloned into /home/agent/workspace/.
     """
     session_id = None
     policy_path = None
@@ -59,28 +59,28 @@ def test_clone_repo(sandbox_cli):
         session_id = parse_session_id(result.stdout)
         wait_for_state(sandbox_cli, "ws-clone", "Running", timeout=10)
 
-        # Verify /root/workspace/ exists and has expected content.
+        # Verify /home/agent/workspace/ exists and has expected content.
         ls_result = sandbox_cli(
-            "exec", "ws-clone", "--", "ls", "/root/workspace/",
+            "exec", "ws-clone", "--", "ls", "/home/agent/workspace/",
             timeout=120,
         )
         assert ls_result.returncode == 0, (
-            f"ls /root/workspace/ failed.\n"
+            f"ls /home/agent/workspace/ failed.\n"
             f"stdout: {ls_result.stdout}\nstderr: {ls_result.stderr}"
         )
         # The Hello-World repo should have a README file.
         assert "README" in ls_result.stdout, (
-            f"Expected README in /root/workspace/, got:\n{ls_result.stdout}"
+            f"Expected README in /home/agent/workspace/, got:\n{ls_result.stdout}"
         )
 
         # Verify it's a git repo.
         git_result = sandbox_cli(
             "exec", "ws-clone", "--",
-            "git", "-C", "/root/workspace/", "log", "--oneline", "-1",
+            "git", "-C", "/home/agent/workspace/", "log", "--oneline", "-1",
             timeout=120,
         )
         assert git_result.returncode == 0, (
-            f"git log failed in /root/workspace/.\n"
+            f"git log failed in /home/agent/workspace/.\n"
             f"stdout: {git_result.stdout}\nstderr: {git_result.stderr}"
         )
 

@@ -96,9 +96,9 @@ Host (Linux or macOS)
 │
 ├── Session N
 │   ├── Lima VM (QEMU/KVM on Linux, Apple VZ on macOS)
-│   │   ├── Agent process (root)
+│   │   ├── Agent process (agent user)
 │   │   ├── dockerd (root, constrained by authorization plugin)
-│   │   ├── Workspace (/root/workspace — cloned repo, writable)
+│   │   ├── Workspace (/home/agent/workspace — cloned repo, writable)
 │   │   └── Single NIC (virtio-net) → default route to gateway
 │   │
 │   └── Gateway container (standard Docker, runc runtime)

@@ -239,8 +239,8 @@ fn validate_path(raw: &str) -> Result<PathBuf, String> {
     let path = if raw.starts_with('/') {
         PathBuf::from(raw)
     } else {
-        // Relative paths are resolved against /root/ (default working dir).
-        PathBuf::from("/root").join(raw)
+        // Relative paths are resolved against /home/agent/ (default working dir).
+        PathBuf::from("/home/agent").join(raw)
     };
 
     // Convert to a string for prefix checks (we cannot canonicalize because
@@ -897,7 +897,7 @@ mod tests {
     #[test]
     fn test_validate_path_allowed_dirs() {
         assert!(validate_path("/home/agent/test.txt").is_ok());
-        assert!(validate_path("/root/workspace/file").is_ok());
+        assert!(validate_path("/home/agent/workspace/file").is_ok());
         assert!(validate_path("/tmp/scratch").is_ok());
     }
 
@@ -929,13 +929,13 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_path_relative_resolves_to_root() {
-        // Relative paths resolve against /root/
+    fn test_validate_path_relative_resolves_to_home() {
+        // Relative paths resolve against /home/agent/
         let result = validate_path("workspace/file.txt");
         assert!(result.is_ok());
         assert_eq!(
             result.unwrap(),
-            PathBuf::from("/root/workspace/file.txt")
+            PathBuf::from("/home/agent/workspace/file.txt")
         );
     }
 

@@ -130,7 +130,7 @@ A session moves through these states:
 4. **State transition.** Session state moves to `Running`.
 5. **Networking.** A per-session Docker bridge and gateway container are created. The VM's bridge NIC is attached at boot time via `qemu-bridge-helper` (no QMP hot-add). The per-session CA certificate is generated and injected into the VM's trust store.
 6. **Policy.** If `--policy` was provided, the policy is compiled and distributed to gateway components. A DNS propagation loop is started.
-7. **Workspace.** If `--repo` was provided, the repository is cloned into `/root/workspace/`. If `--workspace shared:<path>` was provided, the host directory is mounted via 9p.
+7. **Workspace.** If `--repo` was provided, the repository is cloned into `/home/agent/workspace/`. If `--workspace shared:<path>` was provided, the host directory is mounted via 9p.
 8. **Boot command.** If `--boot-cmd` was provided, it is executed via the guest agent.
 
 ### Stop

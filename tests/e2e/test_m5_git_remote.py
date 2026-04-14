@@ -98,7 +98,7 @@ def test_git_push_to_vm(
         # -- 2. Initialize a bare repo inside the VM --------------------------
         exec_result = sandbox_cli(
             "exec", "git-push-vm", "--",
-            "git", "init", "--bare", "/root/workspace/repo.git",
+            "git", "init", "--bare", "/home/agent/workspace/repo.git",
             timeout=120,
         )
         assert exec_result.returncode == 0, (
@@ -141,7 +141,7 @@ def test_git_push_to_vm(
         assert branch, "Could not determine local branch name"
 
         # -- 4. Add a git remote using sandbox:: URL ---------------------------
-        remote_url = "sandbox::git-push-vm/root/workspace/repo.git"
+        remote_url = "sandbox::git-push-vm/home/agent/workspace/repo.git"
         subprocess.run(
             ["git", "-C", local_repo, "remote", "add", "sandbox", remote_url],
             check=True, capture_output=True, timeout=10,
@@ -162,7 +162,7 @@ def test_git_push_to_vm(
         # -- 6. Verify the commit arrived inside the VM -----------------------
         log_result = sandbox_cli(
             "exec", "git-push-vm", "--",
-            "git", "-C", "/root/workspace/repo.git",
+            "git", "-C", "/home/agent/workspace/repo.git",
             "log", "--oneline", "-1",
             timeout=120,
         )
@@ -229,8 +229,8 @@ def test_git_fetch_from_vm(
 
         # -- 2. Create a repo with a commit inside the VM ---------------------
         init_script = (
-            "mkdir -p /root/workspace/repo && "
-            "cd /root/workspace/repo && "
+            "mkdir -p /home/agent/workspace/repo && "
+            "cd /home/agent/workspace/repo && "
             "git init && "
             "git config user.email 'test@test.com' && "
             "git config user.name 'Test' && "
@@ -251,7 +251,7 @@ def test_git_fetch_from_vm(
         # Determine the branch name used inside the VM.
         branch_result = sandbox_cli(
             "exec", "git-fetch-vm", "--",
-            "git", "-C", "/root/workspace/repo", "branch", "--show-current",
+            "git", "-C", "/home/agent/workspace/repo", "branch", "--show-current",
             timeout=30,
         )
         assert branch_result.returncode == 0, (
@@ -269,7 +269,7 @@ def test_git_fetch_from_vm(
         )
 
         # -- 4. Add a git remote using sandbox:: URL ---------------------------
-        remote_url = "sandbox::git-fetch-vm/root/workspace/repo"
+        remote_url = "sandbox::git-fetch-vm/home/agent/workspace/repo"
         subprocess.run(
             ["git", "-C", local_repo, "remote", "add", "sandbox", remote_url],
             check=True, capture_output=True, timeout=10,

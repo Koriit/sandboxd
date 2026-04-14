@@ -14,7 +14,7 @@ pub enum WorkspaceMode {
         /// Absolute path on the host to mount.
         host_path: String,
     },
-    /// Clone a git repository into the VM at /root/workspace/.
+    /// Clone a git repository into the VM at /home/agent/workspace/.
     Clone {
         /// Git repository URL.
         repo_url: String,

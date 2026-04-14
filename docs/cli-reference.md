@@ -34,7 +34,7 @@ sandbox create [OPTIONS]
 | `--cpus <n>` | `2` | Number of CPU cores |
 | `--memory <mb>` | `4096` | Memory in megabytes |
 | `--disk <gb>` | `20` | Disk size in gigabytes |
-| `--repo <url>` | | Git repository URL to clone into `/root/workspace/` |
+| `--repo <url>` | | Git repository URL to clone into `/home/agent/workspace/` |
 | `--workspace <mode>` | | Workspace mode (e.g., `shared:/path/to/dir`) |
 | `--boot-cmd <cmd>` | | Command to execute after provisioning |
 | `--policy <path>` | | Path to a policy JSON file to apply after creation |
@@ -212,7 +212,7 @@ sandbox ssh my-sandbox
 sandbox ssh my-sandbox -- uname -a
 
 # Run a command with arguments
-sandbox ssh my-sandbox -- ls -la /root/workspace
+sandbox ssh my-sandbox -- ls -la /home/agent/workspace
 ```
 
 ---
@@ -250,10 +250,10 @@ sandbox exec <session> -- <command> [args...]
 
 ```bash
 # List workspace contents
-sandbox exec my-sandbox -- ls /root/workspace
+sandbox exec my-sandbox -- ls /home/agent/workspace
 
 # Run a shell command
-sandbox exec my-sandbox -- bash -c "cd /root/workspace && make test"
+sandbox exec my-sandbox -- bash -c "cd /home/agent/workspace && make test"
 
 # Check disk usage
 sandbox exec my-sandbox -- df -h
@@ -296,7 +296,7 @@ sandbox cp local/config.toml my-sandbox:/root/config.toml
 sandbox cp my-sandbox:/root/output.log ./output.log
 
 # Upload a build artifact
-sandbox cp ./dist/app.tar.gz ci-run:/root/workspace/app.tar.gz
+sandbox cp ./dist/app.tar.gz ci-run:/home/agent/workspace/app.tar.gz
 ```
 
 ---
@@ -446,7 +446,7 @@ sandbox git-remote <service> <session> [OPTIONS]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--repo-path <path>` | `/root/workspace` | Path to the git repository inside the VM |
+| `--repo-path <path>` | `/home/agent/workspace` | Path to the git repository inside the VM |
 
 ### Usage
 
@@ -476,7 +476,7 @@ git pull sandbox main
 ### Examples
 
 ```bash
-# Remote with default repo path (/root/workspace)
+# Remote with default repo path (/home/agent/workspace)
 git remote add sandbox "ext::sandbox git-remote %S my-session"
 
 # Remote with custom repo path

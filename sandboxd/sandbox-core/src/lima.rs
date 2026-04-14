@@ -42,6 +42,8 @@ After=network.target
 
 [Service]
 Type=simple
+User=agent
+Group=agent
 ExecStart=/usr/local/bin/sandbox-guest
 Restart=always
 RestartSec=5
@@ -651,8 +653,9 @@ provision:
       apt-get update -qq
       apt-get install -y socat git
     fi
-    # Ensure the workspace directory exists for repo cloning
-    mkdir -p /root/workspace
+    # Ensure the workspace directory exists for repo cloning (owned by agent, not root)
+    mkdir -p /home/agent/workspace
+    chown agent:agent /home/agent/workspace
 - mode: system
   script: |
     #!/bin/bash

@@ -45,7 +45,7 @@ enum Command {
         /// Path to a policy JSON file to apply after creation.
         #[arg(long)]
         policy: Option<String>,
-        /// Git repository URL to clone into /root/workspace/ after session setup.
+        /// Git repository URL to clone into /home/agent/workspace/ after session setup.
         ///
         /// Mutually exclusive with --workspace.
         #[arg(long, conflicts_with = "workspace")]
@@ -151,8 +151,8 @@ enum Command {
         service: String,
         /// Session name or ID.
         session: String,
-        /// Path to the git repository inside the VM (default: /root/workspace).
-        #[arg(long, default_value = "/root/workspace")]
+        /// Path to the git repository inside the VM (default: /home/agent/workspace).
+        #[arg(long, default_value = "/home/agent/workspace")]
         repo_path: String,
     },
 }
@@ -1098,7 +1098,7 @@ fn parse_remote_helper_url(url: &str) -> Result<(String, String), String> {
         if payload.is_empty() {
             return Err(format!("empty URL: {url}"));
         }
-        Ok((payload.to_string(), "/root/workspace".to_string()))
+        Ok((payload.to_string(), "/home/agent/workspace".to_string()))
     }
 }
 
@@ -1206,8 +1206,8 @@ fn run_remote_helper() {
             }
         };
 
-        // Use sudo because the guest agent (which creates repos) runs as root,
-        // but limactl shell connects as the default (non-root) Lima user.
+        // The guest agent runs as the `agent` user (same as limactl shell),
+        // so no privilege escalation is needed for workspace operations.
         let status = std::process::Command::new(&sandbox_bin)
             .args([
                 "--socket",
@@ -1215,7 +1215,6 @@ fn run_remote_helper() {
                 "ssh",
                 &session,
                 "--",
-                "sudo",
                 &service,
                 &repo_path,
             ])
@@ -2046,7 +2045,7 @@ mod tests {
             } => {
                 assert_eq!(service, "git-upload-pack");
                 assert_eq!(session, "my-session");
-                assert_eq!(repo_path, "/root/workspace");
+                assert_eq!(repo_path, "/home/agent/workspace");
             }
             _ => panic!("expected GitRemote command"),
         }
@@ -2081,7 +2080,7 @@ mod tests {
         let cmd = Command::GitRemote {
             service: "git-upload-pack".into(),
             session: "abc".into(),
-            repo_path: "/root/workspace".into(),
+            repo_path: "/home/agent/workspace".into(),
         };
         assert!(build_request(&cmd).is_none());
     }
@@ -2091,26 +2090,26 @@ mod tests {
     #[test]
     fn parse_remote_helper_url_session_and_path() {
         let (session, repo_path) =
-            parse_remote_helper_url("my-session/root/workspace/repo.git").unwrap();
+            parse_remote_helper_url("my-session/home/agent/workspace/repo.git").unwrap();
         assert_eq!(session, "my-session");
-        assert_eq!(repo_path, "/root/workspace/repo.git");
+        assert_eq!(repo_path, "/home/agent/workspace/repo.git");
     }
 
     #[test]
     fn parse_remote_helper_url_with_scheme_prefix() {
         // git may pass the full URL including the sandbox:: prefix.
         let (session, repo_path) =
-            parse_remote_helper_url("sandbox::my-session/root/workspace/repo").unwrap();
+            parse_remote_helper_url("sandbox::my-session/home/agent/workspace/repo").unwrap();
         assert_eq!(session, "my-session");
-        assert_eq!(repo_path, "/root/workspace/repo");
+        assert_eq!(repo_path, "/home/agent/workspace/repo");
     }
 
     #[test]
     fn parse_remote_helper_url_session_only() {
-        // No slash — defaults to /root/workspace.
+        // No slash — defaults to /home/agent/workspace.
         let (session, repo_path) = parse_remote_helper_url("my-session").unwrap();
         assert_eq!(session, "my-session");
-        assert_eq!(repo_path, "/root/workspace");
+        assert_eq!(repo_path, "/home/agent/workspace");
     }
 
     #[test]
@@ -2121,6 +2120,6 @@ mod tests {
     #[test]
     fn parse_remote_helper_url_empty_session() {
         // Starts with slash — empty session name.
-        assert!(parse_remote_helper_url("/root/workspace").is_err());
+        assert!(parse_remote_helper_url("/home/agent/workspace").is_err());
     }
 }

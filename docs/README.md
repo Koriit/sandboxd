@@ -96,7 +96,7 @@ a1b2c3d4-e5f6-7890-abcd-ef1234567890  my-sandbox  running     connected    healt
 
 ```bash
 # Execute a command via the guest agent
-sandbox exec my-sandbox -- ls /root/workspace
+sandbox exec my-sandbox -- ls /home/agent/workspace
 
 # Open an interactive SSH session
 sandbox ssh my-sandbox

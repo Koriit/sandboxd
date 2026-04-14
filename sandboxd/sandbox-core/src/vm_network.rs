@@ -54,8 +54,10 @@ pub async fn attach_vm_to_bridge(
         "configuring network inside VM via guest agent"
     );
 
+    // Network configuration needs root (ip addr, ip route, sysctl).
+    // The guest agent runs as the unprivileged `agent` user, so escalate via sudo.
     let response = guest
-        .exec(session_id, "bash", &["-c", &script])
+        .exec(session_id, "sudo", &["bash", "-c", &script])
         .await
         .map_err(|e| {
             SandboxError::Network(format!(

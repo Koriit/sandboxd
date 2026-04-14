@@ -460,7 +460,7 @@ async fn create_session(
         }
     }
 
-    // If a repo URL was provided, clone it into /root/workspace/.
+    // If a repo URL was provided, clone it into /home/agent/workspace/.
     if let Some(repo_url) = &req.repo {
         info!(%session_id, repo = %repo_url, "cloning repository into VM");
         match state
@@ -468,7 +468,7 @@ async fn create_session(
             .exec(
                 &session_id,
                 "git",
-                &["clone", repo_url.as_str(), "/root/workspace/"],
+                &["clone", repo_url.as_str(), "/home/agent/workspace/"],
             )
             .await
         {
@@ -1526,8 +1526,10 @@ async fn inject_ca_into_vm(
 
     info!(session_id = %session_id, "injecting CA certificate into VM");
 
+    // CA injection writes to /usr/local/share/ca-certificates and /etc/environment,
+    // which requires root. The guest agent runs as unprivileged `agent` user.
     match guest
-        .exec(session_id, "bash", &["-c", &inject_script])
+        .exec(session_id, "sudo", &["bash", "-c", &inject_script])
         .await
     {
         Ok(GuestResponse::ExecResult {

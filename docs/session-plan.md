@@ -591,7 +591,7 @@ Tests require a Linux host with KVM and Docker.
   - `sandbox create --repo <url>` clones the repo during boot command phase
   - Relies on level 3 policy allowing the git host (e.g., github.com)
   - Clone runs inside VM via cloud-init boot command or vsock exec
-  - Workspace at `/root/workspace/`
+  - Workspace at `/home/agent/workspace/`
 - Implement `--boot-cmd <cmd>` flag on create — execute command inside VM after boot (via vsock exec)
 - Implement `sandbox cp`:
   - `sandbox cp <local-path> <session>:<remote-path>` (host to VM)
@@ -605,7 +605,7 @@ Tests require a Linux host with KVM and Docker.
   - Chunked transfer for large files
   - VM-side agent handles file I/O
 - E2E tests in `tests/e2e/test_m5_workspace.py`:
-  - `test_clone_repo` — create session with `--repo`, verify repo is available at `/root/workspace/`
+  - `test_clone_repo` — create session with `--repo`, verify repo is available at `/home/agent/workspace/`
   - `test_cp_host_to_vm` — copy a file into the VM, verify contents
   - `test_cp_vm_to_host` — copy a file from the VM, verify contents
 - Verify all previous E2E tests pass

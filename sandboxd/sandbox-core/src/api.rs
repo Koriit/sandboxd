@@ -47,7 +47,7 @@ pub struct CreateSessionRequest {
     pub template: Option<String>,
     /// Optional policy to apply immediately after session creation.
     pub policy: Option<crate::policy::Policy>,
-    /// Optional git repository URL to clone into `/root/workspace/` after setup.
+    /// Optional git repository URL to clone into `/home/agent/workspace/` after setup.
     ///
     /// Mutually exclusive with `workspace`. If both are provided, `workspace`
     /// takes precedence.
@@ -554,19 +554,19 @@ mod tests {
 
     #[test]
     fn deserialize_git_request_upload_pack() {
-        let json = r#"{"operation": "upload-pack", "repo_path": "/root/workspace", "data": "aGVsbG8="}"#;
+        let json = r#"{"operation": "upload-pack", "repo_path": "/home/agent/workspace", "data": "aGVsbG8="}"#;
         let req: GitRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.operation, "upload-pack");
-        assert_eq!(req.repo_path, "/root/workspace");
+        assert_eq!(req.repo_path, "/home/agent/workspace");
         assert_eq!(req.data, "aGVsbG8=");
     }
 
     #[test]
     fn deserialize_git_request_receive_pack() {
-        let json = r#"{"operation": "receive-pack", "repo_path": "/root/workspace", "data": "dGVzdA=="}"#;
+        let json = r#"{"operation": "receive-pack", "repo_path": "/home/agent/workspace", "data": "dGVzdA=="}"#;
         let req: GitRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.operation, "receive-pack");
-        assert_eq!(req.repo_path, "/root/workspace");
+        assert_eq!(req.repo_path, "/home/agent/workspace");
         assert_eq!(req.data, "dGVzdA==");
     }
 

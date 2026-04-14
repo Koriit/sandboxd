@@ -48,7 +48,7 @@ API equivalent:
 
 ### Details
 
-- The repository is cloned into `/root/workspace/` inside the VM.
+- The repository is cloned into `/home/agent/workspace/` inside the VM.
 - The clone runs as a post-boot provisioning step via the guest agent.
 - A network policy must allow the git hosting domain (e.g. `github.com`)
   at the `transport` assurance level or higher, otherwise the clone will
@@ -175,7 +175,7 @@ git pull sandbox main
 - The `sandbox git-remote` subcommand acts as a git remote helper.  Git
   invokes it via the `ext::` transport, and it relays the git protocol
   stream through the daemon's API to the guest agent.
-- The repository path inside the VM defaults to `/root/workspace`.  Use
+- The repository path inside the VM defaults to `/home/agent/workspace`.  Use
   `--repo-path` to specify a different path.
 - Both `git-upload-pack` (fetch/pull) and `git-receive-pack` (push)
   operations are supported.
@@ -196,7 +196,7 @@ after all other provisioning steps (clone, mount) have completed.
 # Clone a repo and install dependencies
 sandbox create --name dev \
     --repo https://github.com/example/app.git \
-    --boot-cmd "cd /root/workspace && npm install"
+    --boot-cmd "cd /home/agent/workspace && npm install"
 
 # Set up a shared workspace after mount
 sandbox create --name dev \
@@ -276,13 +276,13 @@ sandbox rm dev
 sandbox create --name ci-run \
     --policy ci-policy.json \
     --repo https://github.com/myorg/app.git \
-    --boot-cmd "cd /root/workspace && make build && make test"
+    --boot-cmd "cd /home/agent/workspace && make build && make test"
 
 # Check the results
-sandbox exec ci-run -- cat /root/workspace/test-results.xml
+sandbox exec ci-run -- cat /home/agent/workspace/test-results.xml
 
 # Download the artifact
-sandbox cp ci-run:/root/workspace/dist/app.tar.gz ./app.tar.gz
+sandbox cp ci-run:/home/agent/workspace/dist/app.tar.gz ./app.tar.gz
 
 # Tear down
 sandbox rm ci-run
@@ -293,7 +293,7 @@ sandbox rm ci-run
 ```bash
 # Create a bare sandbox and copy seed files
 sandbox create --name review
-sandbox cp ./my-patch.diff review:/root/workspace/patch.diff
+sandbox cp ./my-patch.diff review:/home/agent/workspace/patch.diff
 
 # Or use git remote transport for full repo sync
 git remote add review \
@@ -302,7 +302,7 @@ git push review main
 
 # Apply and test in the sandbox
 sandbox exec review -- bash -c \
-    "cd /root/workspace && git apply patch.diff && make test"
+    "cd /home/agent/workspace && git apply patch.diff && make test"
 
 # Pull results back
 git pull review main

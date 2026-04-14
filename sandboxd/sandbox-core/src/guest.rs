@@ -490,15 +490,15 @@ mod tests {
         assert!(json.contains(r#""type":"FileDownload"#));
 
         let git_upload = GuestRequest::GitUploadPack {
-            repo_path: "/root/workspace".into(),
+            repo_path: "/home/agent/workspace".into(),
             data: "aGVsbG8=".into(),
         };
         let json = serde_json::to_string(&git_upload).unwrap();
         assert!(json.contains(r#""type":"GitUploadPack"#));
-        assert!(json.contains(r#""repo_path":"/root/workspace"#));
+        assert!(json.contains(r#""repo_path":"/home/agent/workspace"#));
 
         let git_receive = GuestRequest::GitReceivePack {
-            repo_path: "/root/workspace".into(),
+            repo_path: "/home/agent/workspace".into(),
             data: "aGVsbG8=".into(),
         };
         let json = serde_json::to_string(&git_receive).unwrap();
@@ -584,11 +584,11 @@ mod tests {
                 path: "/home/agent/test.txt".into(),
             },
             GuestRequest::GitUploadPack {
-                repo_path: "/root/workspace".into(),
+                repo_path: "/home/agent/workspace".into(),
                 data: "aGVsbG8=".into(),
             },
             GuestRequest::GitReceivePack {
-                repo_path: "/root/workspace".into(),
+                repo_path: "/home/agent/workspace".into(),
                 data: "dGVzdA==".into(),
             },
         ];
