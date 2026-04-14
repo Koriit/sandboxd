@@ -215,7 +215,7 @@ Fix: create sessions with more resources (`sandbox create --cpus 4 --memory 8192
 
 ### Disk I/O
 
-Slow I/O causes: thin-provisioned disk growth, host disk contention, virtiofs overhead on shared mounts. For disk-intensive workloads, use clone mode (`--repo`) instead of shared mounts.
+Slow I/O causes: thin-provisioned disk growth, host disk contention, 9p overhead on shared mounts. For disk-intensive workloads, use clone mode (`--repo`) instead of shared mounts.
 
 ## Session stuck in Creating
 

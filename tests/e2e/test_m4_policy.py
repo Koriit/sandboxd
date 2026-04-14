@@ -242,6 +242,10 @@ def test_level1_transport_tcp(sandbox_cli):
 def test_level1_transport_udp(sandbox_cli):
     """Policy allows DNS to 8.8.8.8 at level 'transport' protocol 'udp'.
     Verify DNS query to 8.8.8.8 works.
+
+    Note: All port-53 traffic is DNAT'd to the gateway's CoreDNS, so the
+    query goes through CoreDNS regardless of the target server.  We must
+    also allow the queried domain in the policy so CoreDNS resolves it.
     """
     session_id = None
     policy_path = None
@@ -249,6 +253,7 @@ def test_level1_transport_udp(sandbox_cli):
         policy = {
             "version": "1.0.0",
             "rules": [
+                {"destination": "example.com", "level": "transport"},
                 {
                     "destination": "8.8.8.8",
                     "level": "transport",
@@ -409,6 +414,20 @@ def test_level3_http_inspected(sandbox_cli):
         session_id = parse_session_id(result.stdout)
         wait_for_state(sandbox_cli, "pol-l3-inspect", "Running", timeout=10)
 
+        # Warm up DNS so the daemon's DNS propagation loop can install
+        # sandbox_l3 nftables DNAT rules that redirect HTTPS traffic to
+        # mitmproxy. Without this, the first HTTPS connection goes through
+        # Envoy (opaque passthrough) and uses the real server certificate
+        # instead of the mitmproxy-issued one.
+        sandbox_cli(
+            "ssh", "pol-l3-inspect", "--",
+            "nslookup", "example.com",
+            timeout=120,
+        )
+        # Wait for the DNS propagation loop (polls every 2s) to pick up
+        # the resolved IPs and install the sandbox_l3 nftables rules.
+        time.sleep(5)
+
         # curl https://example.com should succeed.
         # The sandbox CA is trusted inside the VM, so curl should not complain.
         curl_result = sandbox_cli(
@@ -455,7 +474,10 @@ def test_level3_http_inspected(sandbox_cli):
 @pytest.mark.timeout(600)
 def test_level3_host_mismatch(sandbox_cli):
     """Policy allows only api.github.com at level 'full'. Accessing
-    evil.example.com should get HTTP 599 (policy-denied).
+    evil.example.com should be blocked at the DNS level (NXDOMAIN).
+
+    In the DNS-first architecture, CoreDNS denies resolution of domains
+    not in the policy, so curl never establishes a TCP connection.
     """
     session_id = None
     policy_path = None
@@ -480,17 +502,25 @@ def test_level3_host_mismatch(sandbox_cli):
         session_id = parse_session_id(result.stdout)
         wait_for_state(sandbox_cli, "pol-l3-host", "Running", timeout=10)
 
-        # Accessing a non-allowed host through the MITM proxy should return
-        # HTTP 599 (mitmproxy policy denial response code).
+        # Accessing a non-allowed host should fail: CoreDNS returns NXDOMAIN
+        # for domains not in the policy, so curl can't resolve the hostname.
         curl_result = sandbox_cli(
             "ssh", "pol-l3-host", "--",
             "bash", "-c",
             "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 15 --max-time 30 https://evil.example.com/ 2>&1",
             timeout=120,
         )
+        # curl returns exit code 6 for DNS resolution failure, or 000 as the
+        # HTTP status when no connection is made.  Either way the request must
+        # NOT succeed (HTTP 200).
         http_code = curl_result.stdout.strip()
-        assert http_code == "599", (
-            f"Expected HTTP 599 for non-allowed host, got: {http_code}.\n"
+        assert curl_result.returncode != 0 or http_code == "000", (
+            f"Expected connection failure for non-allowed host, "
+            f"but curl succeeded with HTTP {http_code}.\n"
+            f"stdout: {curl_result.stdout}\nstderr: {curl_result.stderr}"
+        )
+        assert http_code != "200", (
+            f"Non-allowed host should not return HTTP 200.\n"
             f"stdout: {curl_result.stdout}\nstderr: {curl_result.stderr}"
         )
 
@@ -536,6 +566,15 @@ def test_level3_method_restriction(sandbox_cli):
         )
         session_id = parse_session_id(result.stdout)
         wait_for_state(sandbox_cli, "pol-l3-method", "Running", timeout=10)
+
+        # Warm up DNS so sandbox_l3 nftables rules redirect traffic to
+        # mitmproxy (required for method/path enforcement).
+        sandbox_cli(
+            "ssh", "pol-l3-method", "--",
+            "nslookup", "httpbin.org",
+            timeout=120,
+        )
+        time.sleep(5)
 
         # GET should succeed.
         get_result = sandbox_cli(
@@ -605,6 +644,15 @@ def test_level3_path_restriction(sandbox_cli):
         )
         session_id = parse_session_id(result.stdout)
         wait_for_state(sandbox_cli, "pol-l3-path", "Running", timeout=10)
+
+        # Warm up DNS so sandbox_l3 nftables rules redirect traffic to
+        # mitmproxy (required for path enforcement).
+        sandbox_cli(
+            "ssh", "pol-l3-path", "--",
+            "nslookup", "httpbin.org",
+            timeout=120,
+        )
+        time.sleep(5)
 
         # Request to a disallowed path should get HTTP 599.
         bad_path_result = sandbox_cli(
@@ -875,14 +923,26 @@ def test_dns_ip_propagation(sandbox_cli):
         # Allow time for the DNS callback to propagate the IP to nftables.
         time.sleep(5)
 
-        # Check nftables rules inside the gateway container for the resolved IP.
+        # Check the sandbox_policy nftables table inside the gateway container
+        # for the resolved IP.  DNS-resolved IPs are propagated into this table
+        # by the daemon's DNS propagation loop.
         nft_result = subprocess.run(
             [
                 "docker", "exec", gw_container,
-                "nft", "list", "ruleset",
+                "nft", "list", "table", "inet", "sandbox_policy",
             ],
             capture_output=True, text=True, timeout=30,
         )
+        # The sandbox_policy table may not exist yet if the propagation loop
+        # hasn't run.  Fall back to listing the full ruleset.
+        if nft_result.returncode != 0:
+            nft_result = subprocess.run(
+                [
+                    "docker", "exec", gw_container,
+                    "nft", "list", "ruleset",
+                ],
+                capture_output=True, text=True, timeout=30,
+            )
         assert nft_result.returncode == 0, (
             f"Failed to list nftables rules in gateway container.\n"
             f"stdout: {nft_result.stdout}\nstderr: {nft_result.stderr}"
@@ -893,7 +953,7 @@ def test_dns_ip_propagation(sandbox_cli):
         ip_found = any(ip in nft_rules for ip in resolved_ips)
         assert ip_found, (
             f"None of the resolved IPs {resolved_ips} found in nftables rules.\n"
-            f"nftables ruleset:\n{nft_rules}"
+            f"nftables output:\n{nft_rules}"
         )
 
         # Clean up.

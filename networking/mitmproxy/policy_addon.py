@@ -40,7 +40,7 @@ logger = logging.getLogger("policy_addon")
 # Environment variable for config file path (set by sandboxd).
 CONFIG_PATH_ENV = "SANDBOX_MITMPROXY_CONFIG"
 # Default config file location inside the gateway container.
-DEFAULT_CONFIG_PATH = "/etc/mitmproxy/policy.json"
+DEFAULT_CONFIG_PATH = "/tmp/mitmproxy/policy.json"
 # How often (seconds) to poll the config file for changes.
 CONFIG_POLL_INTERVAL = 5
 # Internal health-check endpoint.

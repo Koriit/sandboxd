@@ -38,7 +38,7 @@ impl PolicyDistributor {
     /// Steps (in order):
     /// 1. Write CoreDNS policy file to gateway container
     /// 2. Write mitmproxy policy JSON to gateway container
-    /// 3. Update nftables rules via nsenter
+    /// 3. Update nftables rules via docker exec
     /// 4. Write Envoy config and signal reload
     ///
     /// On partial failure, previously completed steps are rolled back.
@@ -79,7 +79,7 @@ impl PolicyDistributor {
         // Step 2: Write mitmproxy policy JSON.
         if let Err(e) = write_file_to_container(
             &container,
-            "/etc/mitmproxy/policy.json",
+            "/tmp/mitmproxy/policy.json",
             &compiled.mitmproxy_config,
         ) {
             error!(
@@ -200,7 +200,7 @@ impl PolicyDistributor {
             if let Some(ref config) = previous.mitmproxy {
                 let _ = write_file_to_container(
                     &container,
-                    "/etc/mitmproxy/policy.json",
+                    "/tmp/mitmproxy/policy.json",
                     config,
                 );
             }
@@ -243,7 +243,7 @@ impl PreviousConfigs {
 
         let coredns = read_file_from_container(&container, "/etc/coredns/policy.conf").ok();
         let mitmproxy =
-            read_file_from_container(&container, "/etc/mitmproxy/policy.json").ok();
+            read_file_from_container(&container, "/tmp/mitmproxy/policy.json").ok();
         let envoy = read_file_from_container(&container, "/etc/envoy/envoy.yaml").ok();
 
         // Reading current nftables state from the namespace.
@@ -265,7 +265,7 @@ impl PreviousConfigs {
 /// Write content to a file inside a Docker container.
 ///
 /// Uses `docker exec sh -c 'cat > path'` with the content piped to stdin.
-fn write_file_to_container(
+pub fn write_file_to_container(
     container: &str,
     path: &str,
     content: &str,
@@ -334,50 +334,16 @@ fn read_file_from_container(
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// Read the current nftables sandbox_policy table state from the container's
-/// network namespace.
+/// Read the current nftables sandbox_policy table state from the container
+/// via `docker exec`.
 fn read_nftables_state(session_id: &Uuid) -> Result<String, SandboxError> {
     let container = gateway::container_name(session_id);
 
-    // Get PID for nsenter.
     let output = Command::new("docker")
         .args([
-            "inspect",
-            "--format",
-            "{{.State.Pid}}",
-            &container,
+            "exec", &container,
+            "nft", "list", "table", "inet", "sandbox_policy",
         ])
-        .output()
-        .map_err(|e| {
-            SandboxError::Gateway(format!(
-                "failed to inspect container PID for nftables read: {e}"
-            ))
-        })?;
-
-    if !output.status.success() {
-        return Err(SandboxError::Gateway(
-            "failed to get container PID for nftables read".to_string(),
-        ));
-    }
-
-    let pid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let pid: u32 = pid_str.parse().map_err(|_| {
-        SandboxError::Gateway(format!("invalid PID '{pid_str}' for nftables read"))
-    })?;
-
-    if pid == 0 {
-        return Err(SandboxError::Gateway(
-            "container not running for nftables read".to_string(),
-        ));
-    }
-
-    let ns_path = format!("/proc/{pid}/ns/net");
-    let net_arg = format!("--net={ns_path}");
-
-    let output = Command::new("sudo")
-        .arg("nsenter")
-        .arg(&net_arg)
-        .args(["nft", "list", "table", "inet", "sandbox_policy"])
         .output()
         .map_err(|e| {
             SandboxError::Gateway(format!("failed to list nftables policy table: {e}"))
@@ -391,14 +357,14 @@ fn read_nftables_state(session_id: &Uuid) -> Result<String, SandboxError> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// Signal Envoy to reload its configuration.
+/// Signal the gateway entrypoint to restart Envoy with the updated config.
 ///
-/// We send SIGHUP to the Envoy process inside the container. The gateway's
-/// entrypoint script monitors for SIGHUP and restarts Envoy with the new
-/// config.
+/// We send SIGHUP to PID 1 (the entrypoint script) inside the container.
+/// The entrypoint's SIGHUP trap kills the current Envoy process and starts
+/// a new one with the updated `/etc/envoy/envoy.yaml`.
 fn reload_envoy(container: &str) -> Result<(), SandboxError> {
     let output = Command::new("docker")
-        .args(["exec", container, "pkill", "-HUP", "envoy"])
+        .args(["exec", container, "kill", "-HUP", "1"])
         .output()
         .map_err(|e| {
             SandboxError::Gateway(format!(

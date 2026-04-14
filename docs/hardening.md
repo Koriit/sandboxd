@@ -25,16 +25,16 @@ The sandbox runs QEMU through a wrapper script (`~/.sandboxd/libexec/qemu-system
 When hardened mode is active (`SANDBOX_QEMU_HARDENED=1`), the wrapper adds:
 
 ```
--sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny
+-sandbox on,obsolete=deny,elevateprivileges=deny,spawn=allow
 ```
 
-This enables QEMU's built-in seccomp sandbox with three deny policies:
+This enables QEMU's built-in seccomp sandbox with two deny policies and one allow:
 
 | Policy | Effect |
 |--------|--------|
 | `obsolete=deny` | Blocks deprecated syscalls that have known exploitation patterns |
 | `elevateprivileges=deny` | Prevents the QEMU process from gaining elevated privileges |
-| `spawn=deny` | Prevents QEMU from spawning child processes |
+| `spawn=allow` | Allows QEMU to spawn child processes (required for `qemu-bridge-helper` to create TAP devices) |
 
 The seccomp filter is applied by QEMU itself at startup, before the guest begins executing. If a vulnerability allows code execution within the QEMU process, these restrictions limit what the attacker can do.
 
@@ -83,16 +83,14 @@ In hardened mode, the QEMU wrapper strips unnecessary emulated devices and disab
 ### Flags applied
 
 ```
--nodefaults -no-user-config -nographic -vga none -no-hpet
+-no-user-config -display none -vga none
 ```
 
 | Flag | Effect |
 |------|--------|
-| `-nodefaults` | Disables all default devices (serial ports, parallel ports, VGA, floppy, etc.) |
 | `-no-user-config` | Ignores user-level QEMU configuration files |
-| `-nographic` | Disables graphical output entirely |
+| `-display none` | Disables graphical display output |
 | `-vga none` | Removes VGA device emulation |
-| `-no-hpet` | Disables High Precision Event Timer emulation |
 
 ### Devices retained
 
@@ -100,11 +98,11 @@ Only three virtio devices remain:
 
 | Device | Purpose |
 |--------|---------|
-| `virtio-net-pci` | Network connectivity (hot-added via QMP after boot) |
+| `virtio-net-pci` | Network connectivity (added at boot by the QEMU wrapper via `qemu-bridge-helper`) |
 | `virtio-blk` | Disk I/O (managed by Lima) |
 | `virtio-rng-pci` | Guest entropy source (added by the wrapper: `-device virtio-rng-pci`) |
 
-The `virtio-rng-pci` device is explicitly added in hardened mode because `-nodefaults` removes the default entropy source. Without it, the guest kernel's random number generator would be extremely slow to initialize, causing long boot times and potential hangs in applications that read from `/dev/random`.
+The `virtio-rng-pci` device is explicitly added in hardened mode to ensure the guest kernel's random number generator initializes quickly. Without it, `/dev/random` would be extremely slow, causing long boot times and potential hangs.
 
 ### Lima template settings
 
@@ -125,12 +123,25 @@ The following devices are explicitly absent in hardened mode:
 
 - USB controller and devices
 - Sound card
-- Floppy disk controller
-- Serial and parallel ports (removed by `-nodefaults`)
 - VGA/display adapter
-- HPET timer
 
 Each absent device eliminates a category of device-emulation bugs that could be exploited from within the guest.
+
+## Gateway container hardening
+
+The gateway container is configured with a minimal capability set and a read-only filesystem.
+
+### Capabilities
+
+The gateway container is granted only `CAP_NET_ADMIN` (via `--cap-add NET_ADMIN`). This is required for managing nftables rules inside the container. No other elevated capabilities are granted. The daemon manages nftables rules by running `docker exec ... nft` commands inside the container -- no sudo or host-level nftables access is used.
+
+### Read-only filesystem
+
+The container runs with `--read-only` to prevent modifications to the container filesystem. Writable paths are mounted as tmpfs volumes for directories that need runtime writes (logs, PID files, and similar transient data). CA certificate files are bind-mounted read-only from the host.
+
+### No root/sudo on host
+
+The entire sandbox daemon runs as a regular user. No sudo, root, or sudoers configuration is required. The daemon needs only `docker` and `kvm` group membership. The gateway container's `CAP_NET_ADMIN` is scoped to the container's own network namespace and does not grant any host-level privilege.
 
 ## Network isolation
 
@@ -142,7 +153,7 @@ Each session gets its own Docker bridge network with a /28 subnet (e.g., `10.209
 
 ### nftables deny-all baseline
 
-The gateway container's network namespace starts with deny-all nftables rules. These rules are injected immediately after container creation, before any gateway component is ready:
+The gateway container starts with deny-all nftables rules, injected via `docker exec` immediately after container creation, before any gateway component is ready:
 
 - **Input chain:** Drop all inbound traffic (except loopback and established connections).
 - **Forward chain:** Drop all forwarded traffic.
@@ -251,7 +262,7 @@ sandbox create --name debug-session --no-hardening
 |---------|-----------|
 | Seccomp filter | Yes |
 | Cgroup resource limits | Yes |
-| Device lockdown (`-nodefaults`, `-nographic`, `-vga none`, `-no-hpet`) | Yes |
+| Device lockdown (`-no-user-config`, `-display none`, `-vga none`) | Yes |
 | Lima template `video: none`, `audio: none` | Yes |
 | `virtio-rng-pci` injection | Yes |
 | Per-session network isolation | No |
@@ -270,12 +281,12 @@ Do not use `--no-hardening` in production. The hardened configuration is the tes
 
 ## Security trade-offs
 
-### Virtio-fs shared mounts
+### 9p shared mounts
 
-When using shared workspace mode (`--workspace shared:<path>`), a virtio-fs device is added to the VM. This expands the attack surface:
+When using shared workspace mode (`--workspace shared:<path>`), a 9p filesystem device is added to the VM. This expands the attack surface:
 
-- **Additional device.** Virtio-fs adds a host-guest shared memory interface that does not exist in the default configuration.
-- **Host directory access.** The guest has direct read-write access to a host directory. A VM escape combined with virtio-fs access could compromise host files.
+- **Additional device.** 9p adds a host-guest filesystem interface that does not exist in the default configuration.
+- **Host directory access.** The guest has direct read-write access to a host directory. A VM escape combined with 9p access could compromise host files.
 - **Bidirectional writes.** Changes made by the guest are immediately visible on the host and vice versa. There is no review or approval step.
 
 Use clone mode (`--repo`) or file transfer (`sandbox cp`) instead of shared mounts when isolation is more important than convenience. See the [workspace modes guide](workspaces.md) for details.

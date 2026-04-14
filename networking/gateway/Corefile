@@ -13,7 +13,7 @@
     sandboxpolicy {
         policy_file /etc/coredns/policy.conf
         report_file /etc/coredns/resolved.json
-        reload 5s
+        reload 1s
     }
     forward . 8.8.8.8 8.8.4.4
     log

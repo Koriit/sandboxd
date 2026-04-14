@@ -21,7 +21,8 @@ pub use api::{
 pub use ca::{CaManager, generate_ca_inject_script};
 pub use dns_propagation::{
     DnsCache, DnsCacheEntry, DnsChange, DnsChangeType, ResolvedMapping, ResolvedReport,
-    generate_domain_ip_rules, propagate_dns_changes, read_resolved_json,
+    generate_domain_ip_rules, generate_l3_redirect_rules, propagate_dns_changes,
+    read_resolved_json,
 };
 pub use error::{ApiError, SandboxError};
 pub use gateway::{GatewayManager, GatewayStatus};
@@ -35,8 +36,8 @@ pub use policy::{
     AssuranceLevel, CompiledPolicy, CoreDnsConfig, Destination, HttpConstraints, MitmproxyConfig,
     MitmproxyRule, Policy, PolicyCompiler, PolicyRule, Protocol,
 };
-pub use policy_distributor::PolicyDistributor;
-pub use qmp::{QmpClient, mac_from_uuid, tap_name_for_session};
+pub use policy_distributor::{PolicyDistributor, write_file_to_container};
+pub use qmp::{QmpClient, mac_from_uuid};
 pub use session::{Session, SessionConfig, SessionState, WorkspaceMode};
 pub use store::SessionStore;
 pub use vm_network::{attach_vm_to_bridge, detach_vm_from_bridge};

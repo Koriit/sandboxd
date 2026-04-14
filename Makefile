@@ -4,7 +4,7 @@ build:
 	cd sandboxd && cargo build --workspace
 
 test:
-	cd sandboxd && cargo test --workspace
+	cd sandboxd && cargo test --workspace --quiet
 
 tests/e2e/.venv/.installed: tests/e2e/pyproject.toml
 	python3 -m venv tests/e2e/.venv

@@ -490,6 +490,10 @@ def test_stop_start_with_networking(sandbox_cli):
 
 
 @pytest.mark.timeout(600)
+@pytest.mark.skipif(
+    os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") < 6 * 1024**3,
+    reason="Requires >= 6GB RAM for concurrent VMs",
+)
 def test_concurrent_sessions(sandbox_cli):
     """Create two sessions and verify network isolation: different IPs/subnets,
     both functional, no cross-session traffic.
@@ -750,7 +754,14 @@ def test_gateway_crash_recovery(sandbox_cli):
             f"Gateway container {gw_container} is not running before kill test."
         )
 
-        # 3. Kill the gateway container.
+        # 3. Record the container's creation time so we can detect a new one.
+        inspect_result = subprocess.run(
+            ["docker", "inspect", "--format", "{{.Id}}", gw_container],
+            capture_output=True, text=True, timeout=30,
+        )
+        old_container_id = inspect_result.stdout.strip()
+
+        # 4. Kill the gateway container.
         kill_result = subprocess.run(
             ["docker", "kill", gw_container],
             capture_output=True, text=True, timeout=30,
@@ -760,27 +771,33 @@ def test_gateway_crash_recovery(sandbox_cli):
             f"stdout: {kill_result.stdout}\nstderr: {kill_result.stderr}"
         )
 
-        # Verify it's actually dead.
-        time.sleep(2)
-        assert not docker_container_running(gw_container), (
-            f"Gateway container {gw_container} is still running after docker kill."
-        )
-
-        # 4. Wait for crash recovery.  The daemon's gateway_monitor polls
+        # 5. Wait for crash recovery.  The daemon's gateway_monitor polls
         #    every 30 seconds.  We wait up to 90 seconds to allow for
         #    poll timing plus the restart sequence (component readiness).
+        #
+        #    The daemon may recover so quickly that the container is already
+        #    running again before we can observe it being dead.  Instead of
+        #    asserting the container is dead (race-prone), we wait for a NEW
+        #    container to appear -- identified by a different container ID.
         recovered = False
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline:
             # The recovered container will have the same name because
             # restart_gateway removes the old one and creates a fresh one.
             if docker_container_running(gw_container):
-                recovered = True
-                break
+                new_inspect = subprocess.run(
+                    ["docker", "inspect", "--format", "{{.Id}}", gw_container],
+                    capture_output=True, text=True, timeout=30,
+                )
+                new_container_id = new_inspect.stdout.strip()
+                if new_container_id != old_container_id:
+                    recovered = True
+                    break
             time.sleep(5)
 
         assert recovered, (
-            f"Gateway container {gw_container} was not restarted within 90s.\n"
+            f"Gateway container {gw_container} was not recreated within 90s.\n"
+            f"Old container ID: {old_container_id}\n"
             f"docker ps -a:\n"
             f"{subprocess.run(['docker', 'ps', '-a'], capture_output=True, text=True, timeout=30).stdout}"
         )

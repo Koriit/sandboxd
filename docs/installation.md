@@ -63,7 +63,7 @@ If KVM is not available, check that your CPU supports hardware virtualization (I
 
 ## Docker setup
 
-Docker is used for the per-session gateway containers that run the networking pipeline (Envoy, mitmproxy, CoreDNS).
+Docker is used for the per-session gateway containers that run the networking pipeline (Envoy, mitmproxy, CoreDNS). Both standard Docker (with `docker` group membership) and rootless Docker are supported.
 
 ### Install Docker
 
@@ -73,6 +73,8 @@ sudo usermod -aG docker $USER
 ```
 
 Log out and back in for the group change to take effect.
+
+For rootless Docker, follow the [Docker rootless mode documentation](https://docs.docker.com/engine/security/rootless/). Rootless Docker uses a user namespace and stores its data under `~/.local/share/docker` with the socket at `$XDG_RUNTIME_DIR/docker.sock`.
 
 ### Verify Docker
 
@@ -165,6 +167,48 @@ make gateway-image
 
 The gateway image bundles Envoy, mitmproxy, CoreDNS, and the policy plugin into a single container.
 
+### Privilege model
+
+sandboxd runs as a regular user -- it does **not** require root or sudo. The user running the daemon needs membership in two groups:
+
+- **`docker`** -- to manage Docker containers and networks.
+- **`kvm`** -- for hardware-accelerated virtualization via `/dev/kvm`.
+
+All privilege escalation is handled by the underlying tools (Docker, qemu-bridge-helper) rather than the daemon itself.
+
+### qemu-bridge-helper setup
+
+The QEMU bridge helper (`qemu-bridge-helper`) is a setuid binary that creates TAP devices and attaches them to bridge networks. It must be installed and configured for sandbox networking to work.
+
+**Verify the binary exists and is setuid:**
+
+```bash
+ls -la /usr/lib/qemu/qemu-bridge-helper
+# Expected: -rwsr-xr-x ... /usr/lib/qemu/qemu-bridge-helper
+```
+
+If it is not setuid, set it (this is the only step that requires root):
+
+```bash
+sudo chmod u+s /usr/lib/qemu/qemu-bridge-helper
+```
+
+**Configure bridge access:**
+
+Create `/etc/qemu/bridge.conf` if it does not exist:
+
+```bash
+sudo mkdir -p /etc/qemu
+echo "allow br0" | sudo tee /etc/qemu/bridge.conf
+sudo chmod 644 /etc/qemu/bridge.conf
+```
+
+The `allow br0` line permits `qemu-bridge-helper` to attach TAP devices to bridges named `br0`. sandboxd uses Docker-managed bridges (named `sb-{session_id}`), so you may also need a broader allow rule:
+
+```bash
+echo "allow all" | sudo tee /etc/qemu/bridge.conf
+```
+
 ### Run tests
 
 ```bash
@@ -182,7 +226,7 @@ make test-e2e      # End-to-end tests (pytest, requires running daemon)
 sandboxd/target/debug/sandboxd
 ```
 
-The daemon creates its state directory at `~/.sandboxd/` (SQLite database, session data, CA certificates) and listens on `~/.sandboxd/sandboxd.sock`.
+The daemon creates its state directory at `~/.sandboxd/` (SQLite database, session data, CA certificates) and listens on `~/.sandboxd/sandboxd.sock`. No root or sudo is needed -- the daemon runs as your regular user.
 
 To customize paths:
 

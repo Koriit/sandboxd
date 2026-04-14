@@ -16,6 +16,9 @@ var log = clog.NewWithPlugin(pluginName)
 // domainSet is an immutable snapshot of allowed domains. It is swapped
 // atomically so the request path never needs to acquire a lock.
 type domainSet struct {
+	// allowAll is true when the policy file contains a bare "*" entry,
+	// meaning all domains are permitted (no filtering).
+	allowAll bool
 	// exact holds domains that must match exactly (e.g. "example.com").
 	exact map[string]struct{}
 	// wildcard holds parent domains from wildcard entries (e.g. "example.com"
@@ -52,6 +55,12 @@ func NewPolicyStore() *PolicyStore {
 // method normalises it internally.
 func (ps *PolicyStore) IsAllowed(name string) bool {
 	ds := ps.domains.Load().(*domainSet)
+
+	// A bare "*" in the policy file means allow everything.
+	if ds.allowAll {
+		return true
+	}
+
 	// Normalise: lowercase, strip trailing dot.
 	n := strings.TrimSuffix(strings.ToLower(name), ".")
 
@@ -80,8 +89,12 @@ func (ps *PolicyStore) LoadFile(path string) error {
 		return err
 	}
 	ps.domains.Store(ds)
-	log.Infof("loaded policy: %d exact, %d wildcard domains from %s",
-		len(ds.exact), len(ds.wildcard), path)
+	if ds.allowAll {
+		log.Infof("loaded policy: allow-all (*) from %s", path)
+	} else {
+		log.Infof("loaded policy: %d exact, %d wildcard domains from %s",
+			len(ds.exact), len(ds.wildcard), path)
+	}
 	return nil
 }
 
@@ -151,6 +164,12 @@ func parsePolicyFile(path string) (*domainSet, error) {
 
 		// Normalise: lowercase, strip trailing dot.
 		domain := strings.TrimSuffix(strings.ToLower(line), ".")
+
+		// A bare "*" means allow all domains — no filtering.
+		if domain == "*" {
+			ds.allowAll = true
+			continue
+		}
 
 		if strings.HasPrefix(domain, "*.") {
 			// Wildcard entry: "*.example.com" → store "example.com" in wildcard map.

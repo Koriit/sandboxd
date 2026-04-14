@@ -45,11 +45,6 @@ func parseConfig(c *caddy.Controller) (*SandboxPolicy, error) {
 	}
 
 	for c.Next() {
-		// No arguments expected on the directive line itself.
-		if c.NextArg() {
-			return nil, c.ArgErr()
-		}
-
 		for c.NextBlock() {
 			switch c.Val() {
 			case "policy_file":

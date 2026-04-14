@@ -18,6 +18,7 @@
 - [M6: Hardening](#m6-hardening) — QEMU sandboxing, device model lockdown
 - [M7: Documentation](#m7-documentation) — polish and consolidate user, operator, and contributor docs
 - [M8: Polish and Deferred TODOs](#m8-polish-and-deferred-todos) — resolve accumulated TODOs, deferred findings, technical debt
+- [M8.5: E2E Fix-up](#m85-e2e-fix-up--portability-and-runtime-correctness) — fix all runtime issues preventing E2E tests from passing
 - [M9: macOS Support](#m9-macos-support) — socket_vmnet, Colima, macvlan
 - [Risks](#risks)
 - [Session count](#session-count)
@@ -768,6 +769,81 @@ Tests require a Linux host with KVM and Docker.
 
 ---
 
+## M8.5: E2E Fix-up — Portability, Privilege Model, and Runtime Correctness
+
+> **Remediation milestone.** M0–M8 wrote E2E tests but never ran them against real infrastructure. Running them revealed gateway container failures, QEMU wrapper portability issues, and a fundamental privilege model problem: the daemon was designed assuming root access, but Lima refuses root. This milestone redesigns the privilege model (no root, no sudo) and fixes all runtime issues.
+>
+> **Key architectural decision:** sandboxd runs as a regular user (docker + kvm groups). Privileged operations are handled by purpose-built mechanisms: `qemu-bridge-helper` (setuid, ships with QEMU) for TAP device creation, `docker exec` with `CAP_NET_ADMIN` for nftables inside the gateway container. No sudo, no sudoers, no root daemon.
+
+### M8.5-S1: Gateway fixes and privilege model design
+
+**Entry criteria:** M8 complete. Gateway container fails to start; QEMU wrapper has portability issues; privilege model needs redesign.
+
+**Tasks (completed):**
+- Fix CoreDNS plugin Corefile parser: removed `c.NextArg()` guard that rejected `{` as unexpected argument.
+- Add tmpfs mounts: `/etc/coredns:rw`, move Corefile to `/opt/coredns/Corefile`.
+- Move mitmproxy policy path to `/tmp/mitmproxy/policy.json` (already on tmpfs).
+- Fix QEMU wrapper: PATH resolution, probe passthrough, self-recursion prevention, cgroup headroom, remove `-no-hpet`.
+- Fix limactl PATH resolution (no hardcoded paths).
+- Simplify `parse_limactl_error` to preserve raw stderr.
+- **Design decisions:** Reversed root-daemon architecture after discovering limactl refuses root. Evaluated three approaches: (A) regular user + targeted sudo, (B) root daemon + privilege de-escalation for Lima, (C) regular user + docker exec + qemu-bridge-helper. Chose (C) — strictly better security, no sudo/sudoers/setuid in sandboxd.
+
+**Exit criteria:** Gateway image builds clean. Rust workspace compiles. Privilege model design decided and documented.
+
+---
+
+### M8.5-S2: Privilege model implementation — docker exec and qemu-bridge-helper
+
+**Entry criteria:** M8.5-S1 complete. Design decided: no root, docker exec for nftables, qemu-bridge-helper for TAP.
+
+**Tasks:**
+- **Gateway container (Dockerfile):** Add `nftables` package so `nft` is available inside the container.
+- **gateway.rs — docker exec for nftables:**
+  - Replace `inject_nftables_ruleset()`: change from `nsenter --net=/proc/{pid}/ns/net nft -f -` to `docker exec -i <container> nft -f -`. Remove `container_pid()` method (no longer needed).
+  - Add `CAP_NET_ADMIN` to container creation (`--cap-add NET_ADMIN` in docker run args).
+  - Update all nftables injection call sites (deny-all, DNAT, policy).
+  - Update gateway.rs doc comments to reflect docker exec model.
+- **policy_distributor.rs — docker exec for reads/writes:**
+  - Replace nsenter-based `read_nftables_state()` with `docker exec <container> nft list table ...`.
+  - Replace nsenter-based policy file writes with `docker exec -i <container> tee /path/to/file`.
+- **network.rs — qemu-bridge-helper for TAP:**
+  - Remove entire host-side bridge/TAP/veth setup (`run_privileged()` calls, `run_nsenter()` calls).
+  - Remove `run_privileged()` and `run_nsenter()` helper functions.
+  - Configure QEMU second NIC via Lima template to use `-netdev bridge,br=<docker_bridge>` which invokes `qemu-bridge-helper`.
+  - Update `NetworkInfo` struct if bridge/TAP/veth fields are no longer needed.
+  - Ensure `/etc/qemu/bridge.conf` allows the Docker bridge (document in installation.md).
+- **lima.rs — QEMU wrapper update:**
+  - Update QEMU wrapper script to handle bridge-based networking (no manual TAP creation).
+- **main.rs — remove root model:**
+  - Remove `is_running_as_root()` function and root check.
+  - Remove sandbox group / socket permission code. Socket uses default permissions in user's home dir (`~/.sandboxd/`).
+- **conftest.py — remove sudo:**
+  - Remove `sudo` from daemon launch (`Popen`).
+  - Remove `sudo kill` from teardown.
+  - Remove `groupadd` setup.
+- **Update tests:** Fix any unit tests that reference nsenter, run_privileged, or root.
+
+**Exit criteria:** `cargo build --workspace` compiles clean. `cargo test --workspace` passes. No references to nsenter, sudo, run_privileged, or is_running_as_root remain in non-test production code. Gateway container starts with `CAP_NET_ADMIN`. Single E2E test (`test_create_and_destroy`) passes.
+
+---
+
+### M8.5-S3: Full E2E suite green and documentation update
+
+**Entry criteria:** M8.5-S2 complete. Single VM lifecycle test passes with new privilege model.
+
+**Tasks:**
+- Run the full E2E suite (`make test-e2e`) and fix any remaining failures.
+- Expected areas: networking (bridge-helper integration, Docker bridge discovery), policy distribution (docker exec writes), workspace provisioning.
+- Add pre-flight checks to `conftest.py`: Docker accessible, KVM available, Lima installed, gateway image exists, `qemu-bridge-helper` installed. Skip with clear message if prerequisites missing.
+- Update documentation:
+  - `installation.md`: remove root daemon / sandbox group sections; document docker + kvm group membership; document qemu-bridge-helper setup and `/etc/qemu/bridge.conf`.
+  - `networking-design.md` / `sandbox-design.md`: update privilege model sections to reflect docker exec + bridge-helper architecture.
+  - `hardening.md`: update security layer table.
+
+**Exit criteria:** All E2E tests pass. Documentation reflects the actual privilege model. No manual setup beyond group membership, `make gateway-image`, `cargo build`, and bridge.conf is required.
+
+---
+
 ## M9: macOS Support
 
 > **Separate track.** macOS support requires access to macOS hardware and can be executed independently of M6 (Hardening). It is not on the critical path for Linux-only deployments.
@@ -845,7 +921,8 @@ Tests require a Linux host with KVM and Docker.
 | M6 | 3 |
 | M7 | 1 |
 | M8 | 3 |
+| M8.5 | 3 |
 | M9 | 2 |
-| **Total** | **32** |
+| **Total** | **35** |
 
-Linux critical path: 30 sessions (M0 through M8). M9 (macOS) is an independent track (2 sessions) that can be interleaved or appended when macOS hardware is available.
+Linux critical path: 33 sessions (M0 through M8.5). M9 (macOS) is an independent track (2 sessions) that can be interleaved or appended when macOS hardware is available.

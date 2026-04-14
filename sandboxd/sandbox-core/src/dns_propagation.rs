@@ -317,7 +317,8 @@ pub fn generate_domain_ip_rules(
 
     let rules_block = allow_rules.join("\n");
     format!(
-        r#"flush table inet sandbox_policy
+        r#"table inet sandbox_policy {{}}
+flush table inet sandbox_policy
 table inet sandbox_policy {{
     chain forward {{
         type filter hook forward priority -1; policy drop;
@@ -339,6 +340,84 @@ table inet sandbox_policy {{
 "#,
         subnet = network_info.subnet,
         gateway_ip = network_info.gateway_ip,
+    )
+}
+
+/// Generate nftables NAT rules that redirect L3 (full/MITM) traffic
+/// directly to mitmproxy (port 8080), bypassing Envoy.
+///
+/// In transparent mode, mitmproxy uses `SO_ORIGINAL_DST` to determine
+/// the real upstream server.  When traffic flows through Envoy first
+/// (Envoy creates a new TCP connection to mitmproxy), `SO_ORIGINAL_DST`
+/// returns `127.0.0.1:8080` — mitmproxy's own address — causing a
+/// connection loop and SSL errors.
+///
+/// By redirecting L3 traffic at the nftables level (before the catch-all
+/// Envoy DNAT rule), the original destination is preserved in conntrack,
+/// and mitmproxy's `SO_ORIGINAL_DST` call returns the real server address.
+///
+/// This table uses priority `dstnat - 10` (= -110) so its rules are
+/// evaluated before the `sandbox_dnat` table (priority `dstnat` = -100).
+/// Only the first NAT action per connection takes effect, so matched L3
+/// packets skip the Envoy DNAT rule entirely.
+pub fn generate_l3_redirect_rules(
+    policy: &Policy,
+    cache: &DnsCache,
+    vm_subnet: &str,
+    gateway_ip: &str,
+) -> String {
+    let mut redirect_rules = Vec::new();
+
+    for rule in &policy.rules {
+        if rule.level != AssuranceLevel::Full {
+            continue;
+        }
+
+        match &rule.destination {
+            Destination::Cidr(cidr) => {
+                let ip_or_cidr = cidr.as_str();
+                redirect_rules.push(format!(
+                    "        ip saddr {vm_subnet} ip daddr {ip_or_cidr} tcp dport {{ 80, 443 }} \
+                     dnat to {gateway_ip}:8080 # L3 CIDR"
+                ));
+            }
+            Destination::Domain(domain) => {
+                if let Some(entry) = cache.entries().get(domain.as_str()) {
+                    for ip in &entry.ips {
+                        redirect_rules.push(format!(
+                            "        ip saddr {vm_subnet} ip daddr {ip} tcp dport {{ 80, 443 }} \
+                             dnat to {gateway_ip}:8080 # L3 {domain}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    if redirect_rules.is_empty() {
+        return String::new();
+    }
+
+    let rules_block = redirect_rules.join("\n");
+    // Use "delete table ... ; add table ..." to handle both first-time
+    // creation and subsequent updates.  The delete may fail silently on
+    // first run (table doesn't exist yet), but nft -f processes all
+    // commands, so the subsequent add+rules always succeed.
+    // We use a simpler approach: always define the table (nft merges
+    // if it exists), and flush the chain to replace rules.
+    format!(
+        r#"table inet sandbox_l3 {{}}
+flush table inet sandbox_l3
+table inet sandbox_l3 {{
+    chain prerouting {{
+        type nat hook prerouting priority dstnat - 10;
+
+        # L3 (full/MITM) destinations: redirect HTTPS to mitmproxy
+        # so SO_ORIGINAL_DST preserves the real upstream address.
+{rules_block}
+    }}
+}}
+"#
     )
 }
 
@@ -366,7 +445,27 @@ pub fn propagate_dns_changes(
         "propagating DNS-resolved IPs to nftables"
     );
 
-    gateway.inject_nftables_ruleset_public(session_id, &ruleset, "policy-dns-update")
+    gateway.inject_nftables_ruleset_public(session_id, &ruleset, "policy-dns-update")?;
+
+    // For L3 (full/MITM) destinations, inject NAT redirect rules that
+    // send HTTPS traffic directly to mitmproxy, bypassing Envoy.
+    // This preserves SO_ORIGINAL_DST so mitmproxy can determine the
+    // real upstream server in transparent mode.
+    let l3_ruleset = generate_l3_redirect_rules(
+        policy,
+        cache,
+        &network_info.subnet,
+        &network_info.gateway_ip,
+    );
+    if !l3_ruleset.is_empty() {
+        info!(
+            session_id = %session_id,
+            "injecting L3 redirect rules for mitmproxy transparent mode"
+        );
+        gateway.inject_nftables_ruleset_public(session_id, &l3_ruleset, "l3-redirect")?;
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -761,5 +860,206 @@ mod tests {
         let json = r#"{"mappings": []}"#;
         let report: ResolvedReport = serde_json::from_str(json).unwrap();
         assert!(report.mappings.is_empty());
+    }
+
+    // -- L3 redirect rules tests ---------------------------------------------
+
+    #[test]
+    fn l3_redirect_empty_for_non_full_policy() {
+        let policy = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![PolicyRule {
+                destination: Destination::Domain("example.com".to_string()),
+                level: AssuranceLevel::Transport,
+                protocol: Protocol::Any,
+                constraints: None,
+                reason: None,
+            }],
+        };
+
+        let mut cache = DnsCache::new();
+        let report = ResolvedReport {
+            mappings: vec![ResolvedMapping {
+                domain: "example.com".to_string(),
+                ips: vec!["93.184.216.34".to_string()],
+                ttl: 3600,
+                timestamp: "2024-01-01T00:00:00Z".to_string(),
+            }],
+        };
+        cache.update(&report);
+
+        let rules = generate_l3_redirect_rules(
+            &policy, &cache, "10.209.0.0/28", "10.209.0.2",
+        );
+        assert!(
+            rules.is_empty(),
+            "transport-only policy should produce no L3 redirect rules"
+        );
+    }
+
+    #[test]
+    fn l3_redirect_includes_full_level_ips() {
+        let policy = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![PolicyRule {
+                destination: Destination::Domain("example.com".to_string()),
+                level: AssuranceLevel::Full,
+                protocol: Protocol::Https,
+                constraints: None,
+                reason: None,
+            }],
+        };
+
+        let mut cache = DnsCache::new();
+        let report = ResolvedReport {
+            mappings: vec![ResolvedMapping {
+                domain: "example.com".to_string(),
+                ips: vec!["93.184.216.34".to_string()],
+                ttl: 3600,
+                timestamp: "2024-01-01T00:00:00Z".to_string(),
+            }],
+        };
+        cache.update(&report);
+
+        let rules = generate_l3_redirect_rules(
+            &policy, &cache, "10.209.0.0/28", "10.209.0.2",
+        );
+
+        assert!(
+            rules.contains("sandbox_l3"),
+            "must define sandbox_l3 table"
+        );
+        assert!(
+            rules.contains("93.184.216.34"),
+            "must include resolved IP for L3 domain"
+        );
+        assert!(
+            rules.contains("dnat to 10.209.0.2:8080"),
+            "must redirect to gateway mitmproxy port"
+        );
+        assert!(
+            rules.contains("tcp dport { 80, 443 }"),
+            "must match HTTP and HTTPS ports"
+        );
+        assert!(
+            rules.contains("priority dstnat - 10"),
+            "must use higher priority than sandbox_dnat"
+        );
+    }
+
+    #[test]
+    fn l3_redirect_includes_cidr() {
+        let policy = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![PolicyRule {
+                destination: Destination::Cidr("10.0.0.0/8".to_string()),
+                level: AssuranceLevel::Full,
+                protocol: Protocol::Https,
+                constraints: None,
+                reason: None,
+            }],
+        };
+
+        let cache = DnsCache::new();
+        let rules = generate_l3_redirect_rules(
+            &policy, &cache, "10.209.0.0/28", "10.209.0.2",
+        );
+
+        assert!(
+            rules.contains("10.0.0.0/8"),
+            "must include CIDR for L3 rule"
+        );
+        assert!(
+            rules.contains("dnat to 10.209.0.2:8080"),
+            "must redirect to mitmproxy"
+        );
+    }
+
+    #[test]
+    fn l3_redirect_empty_for_unresolved_domain() {
+        let policy = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![PolicyRule {
+                destination: Destination::Domain("not-yet-resolved.com".to_string()),
+                level: AssuranceLevel::Full,
+                protocol: Protocol::Https,
+                constraints: None,
+                reason: None,
+            }],
+        };
+
+        let cache = DnsCache::new();
+        let rules = generate_l3_redirect_rules(
+            &policy, &cache, "10.209.0.0/28", "10.209.0.2",
+        );
+
+        assert!(
+            rules.is_empty(),
+            "unresolved L3 domain should produce no redirect rules"
+        );
+    }
+
+    #[test]
+    fn l3_redirect_mixed_levels_only_includes_full() {
+        let policy = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![
+                PolicyRule {
+                    destination: Destination::Domain("transport.com".to_string()),
+                    level: AssuranceLevel::Transport,
+                    protocol: Protocol::Any,
+                    constraints: None,
+                    reason: None,
+                },
+                PolicyRule {
+                    destination: Destination::Domain("tls.com".to_string()),
+                    level: AssuranceLevel::Tls,
+                    protocol: Protocol::Https,
+                    constraints: None,
+                    reason: None,
+                },
+                PolicyRule {
+                    destination: Destination::Domain("full.com".to_string()),
+                    level: AssuranceLevel::Full,
+                    protocol: Protocol::Https,
+                    constraints: None,
+                    reason: None,
+                },
+            ],
+        };
+
+        let mut cache = DnsCache::new();
+        let report = ResolvedReport {
+            mappings: vec![
+                ResolvedMapping {
+                    domain: "transport.com".to_string(),
+                    ips: vec!["1.1.1.1".to_string()],
+                    ttl: 3600,
+                    timestamp: "2024-01-01T00:00:00Z".to_string(),
+                },
+                ResolvedMapping {
+                    domain: "tls.com".to_string(),
+                    ips: vec!["2.2.2.2".to_string()],
+                    ttl: 3600,
+                    timestamp: "2024-01-01T00:00:00Z".to_string(),
+                },
+                ResolvedMapping {
+                    domain: "full.com".to_string(),
+                    ips: vec!["3.3.3.3".to_string()],
+                    ttl: 3600,
+                    timestamp: "2024-01-01T00:00:00Z".to_string(),
+                },
+            ],
+        };
+        cache.update(&report);
+
+        let rules = generate_l3_redirect_rules(
+            &policy, &cache, "10.209.0.0/28", "10.209.0.2",
+        );
+
+        // Only full.com (3.3.3.3) should be in the redirect rules.
+        assert!(rules.contains("3.3.3.3"), "must include L3 IP");
+        assert!(!rules.contains("1.1.1.1"), "must not include transport IP");
+        assert!(!rules.contains("2.2.2.2"), "must not include TLS IP");
     }
 }

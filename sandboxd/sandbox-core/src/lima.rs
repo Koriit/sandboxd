@@ -50,8 +50,8 @@ Environment=RUST_LOG=info
 [Install]
 WantedBy=multi-user.target";
 
-/// QEMU wrapper script that injects PCIe root-port, seccomp sandbox, and
-/// optional cgroup resource limits via `systemd-run`.
+/// QEMU wrapper script that injects PCIe root-port, bridge networking,
+/// seccomp sandbox, and optional cgroup resource limits via `systemd-run`.
 ///
 /// Extracted as a constant so tests can verify the content without writing
 /// to the filesystem.
@@ -61,28 +61,85 @@ const QEMU_WRAPPER_SCRIPT: &str = r#"#!/bin/sh
 # Always:
 # 1. Adds a PCIe root-port so that NIC hot-add via QMP works on q35 machines.
 #
+# When SANDBOX_DOCKER_BRIDGE is set:
+# 2. Adds a second NIC connected to the Docker bridge via qemu-bridge-helper.
+#    For rootless Docker the bridge lives inside rootlesskit's network
+#    namespace, so a wrapper helper runs qemu-bridge-helper via nsenter.
+#
 # When SANDBOX_QEMU_HARDENED=1:
-# 2. Enables QEMU seccomp sandbox to restrict syscalls.
-# 3. Disables unnecessary devices (USB, sound, display, floppy, HPET, etc.)
+# 3. Enables QEMU seccomp sandbox to restrict syscalls.
+# 4. Disables unnecessary devices (USB, sound, display, floppy, HPET, etc.)
 #    and adds virtio-rng for guest entropy.
 #
 # When SANDBOX_QEMU_MEMORY_MB and SANDBOX_QEMU_CPUS are set:
-# 4. Applies cgroup resource limits via systemd-run.
+# 5. Applies cgroup resource limits via systemd-run.
 
-REAL_QEMU="$(command -v qemu-system-x86_64)" || { echo "qemu-system-x86_64 not found on PATH" >&2; exit 1; }
+# Find the real QEMU binary, excluding this wrapper's directory to prevent
+# infinite recursion if Lima prepends it to PATH.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REAL_QEMU=""
+IFS=:
+for dir in $PATH; do
+    [ "$dir" = "$SCRIPT_DIR" ] && continue
+    if [ -x "$dir/qemu-system-x86_64" ]; then
+        REAL_QEMU="$dir/qemu-system-x86_64"
+        break
+    fi
+done
+unset IFS
+[ -z "$REAL_QEMU" ] && { echo "qemu-system-x86_64 not found on PATH (excluding wrapper dir $SCRIPT_DIR)" >&2; exit 1; }
+
+# Lima runs probe commands (-machine help, -cpu help, -accel help, --version,
+# etc.) through the wrapper.  Pass these straight to QEMU without extra flags.
+for arg in "$@"; do
+    case "$arg" in
+        help|--version|--help|-help)
+            exec "$REAL_QEMU" "$@" ;;
+    esac
+done
 
 # PCIe root-port is always needed for NIC hot-add.
-QEMU_ARGS="-device pcie-root-port,id=pcie-hotplug-port,bus=pcie.0,chassis=1"
+EXTRA_ARGS="-device pcie-root-port,id=pcie-hotplug-port,bus=pcie.0,chassis=1"
+
+# Bridge networking: if SANDBOX_DOCKER_BRIDGE is set, add a second NIC
+# connected to the Docker bridge via qemu-bridge-helper.
+if [ -n "$SANDBOX_DOCKER_BRIDGE" ]; then
+    BRIDGE_HELPER="${SANDBOX_BRIDGE_HELPER:-/usr/lib/qemu/qemu-bridge-helper}"
+
+    # Rootless Docker: the bridge lives inside rootlesskit's network+user
+    # namespace.  QEMU stays on the host (so Lima SSH port-forwarding works),
+    # but qemu-bridge-helper must run inside the namespace to find the bridge
+    # and create the TAP device there.  The TAP fd is passed back over a unix
+    # socket, which works across namespace boundaries.
+    CHILD_PID_FILE="/run/user/$(id -u)/dockerd-rootless/child_pid"
+    if [ -f "$CHILD_PID_FILE" ]; then
+        RLKIT_PID="$(cat "$CHILD_PID_FILE")"
+        if [ -n "$RLKIT_PID" ] && [ -d "/proc/$RLKIT_PID" ]; then
+            # Create a small wrapper script that nsenter's the helper
+            NSHELPER="$SCRIPT_DIR/bridge-helper-ns"
+            cat > "$NSHELPER" <<'HELPEREOF'
+#!/bin/sh
+exec nsenter --preserve-credentials -U -n -t "$SANDBOX_RLKIT_PID" -- "$SANDBOX_REAL_BRIDGE_HELPER" "$@"
+HELPEREOF
+            chmod +x "$NSHELPER"
+            export SANDBOX_RLKIT_PID="$RLKIT_PID"
+            export SANDBOX_REAL_BRIDGE_HELPER="$BRIDGE_HELPER"
+            BRIDGE_HELPER="$NSHELPER"
+        fi
+    fi
+
+    EXTRA_ARGS="$EXTRA_ARGS \
+        -netdev bridge,id=net_sandbox,br=$SANDBOX_DOCKER_BRIDGE,helper=$BRIDGE_HELPER \
+        -device virtio-net-pci,netdev=net_sandbox,mac=$SANDBOX_VM_MAC,bus=pcie-hotplug-port"
+fi
 
 # Hardened mode: seccomp + device lockdown.
 if [ "$SANDBOX_QEMU_HARDENED" = "1" ]; then
-    QEMU_ARGS="$QEMU_ARGS \
-        -sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny \
-        -nodefaults \
+    EXTRA_ARGS="$EXTRA_ARGS \
+        -sandbox on,obsolete=deny,elevateprivileges=deny,spawn=allow \
         -no-user-config \
-        -nographic \
+        -display none \
         -vga none \
-        -no-hpet \
         -device virtio-rng-pci"
 fi
 
@@ -90,12 +147,12 @@ fi
 # QEMU in a transient systemd scope with memory and CPU limits.
 if [ -n "$SANDBOX_QEMU_MEMORY_MB" ] && [ -n "$SANDBOX_QEMU_CPUS" ] && command -v systemd-run >/dev/null 2>&1; then
     exec systemd-run --user --scope --slice=sandbox.slice \
-        -p MemoryMax="${SANDBOX_QEMU_MEMORY_MB}M" \
+        -p MemoryMax="$((SANDBOX_QEMU_MEMORY_MB + 512))M" \
         -p "CPUQuota=${SANDBOX_QEMU_CPUS}00%" \
         -p TasksMax=256 \
-        "$REAL_QEMU" $QEMU_ARGS "$@"
+        "$REAL_QEMU" $EXTRA_ARGS "$@"
 else
-    exec "$REAL_QEMU" $QEMU_ARGS "$@"
+    exec "$REAL_QEMU" $EXTRA_ARGS "$@"
 fi
 "#;
 
@@ -229,10 +286,16 @@ impl LimaManager {
     ///
     /// The `config` parameter controls hardening and propagates resource limits
     /// (memory, CPU) to the QEMU wrapper script via environment variables.
+    ///
+    /// When `bridge_name` and `vm_mac` are provided, the QEMU wrapper adds a
+    /// second NIC connected to the Docker bridge via `qemu-bridge-helper`.
+    /// This eliminates the need for host-side TAP/veth setup.
     pub fn start_vm(
         &self,
         session_id: &Uuid,
         config: &SessionConfig,
+        bridge_name: Option<&str>,
+        vm_mac: Option<&str>,
     ) -> Result<(), SandboxError> {
         let vm_name = vm_name(session_id);
         let qemu_wrapper = self.ensure_qemu_wrapper()?;
@@ -241,17 +304,26 @@ impl LimaManager {
             session_id = %session_id,
             vm = %vm_name,
             hardened = config.hardened,
+            bridge = ?bridge_name,
             "starting VM"
         );
 
         let hardened_flag = if config.hardened { "1" } else { "0" };
-        let output = Command::new(&self.limactl)
-            .args(["start", &vm_name])
+        let mut cmd = Command::new(&self.limactl);
+        cmd.args(["start", &vm_name])
             .arg("--tty=false")
             .env("QEMU_SYSTEM_X86_64", &qemu_wrapper)
             .env("SANDBOX_QEMU_HARDENED", hardened_flag)
             .env("SANDBOX_QEMU_MEMORY_MB", config.memory_mb.to_string())
-            .env("SANDBOX_QEMU_CPUS", config.cpus.to_string())
+            .env("SANDBOX_QEMU_CPUS", config.cpus.to_string());
+
+        // Pass bridge networking env vars to the QEMU wrapper when provided.
+        if let (Some(bridge), Some(mac)) = (bridge_name, vm_mac) {
+            cmd.env("SANDBOX_DOCKER_BRIDGE", bridge)
+                .env("SANDBOX_VM_MAC", mac);
+        }
+
+        let output = cmd
             .output()
             .map_err(|e| lima_io_error("limactl start", e))?;
 
@@ -486,11 +558,12 @@ impl LimaManager {
         let disk_gib = format!("{}GiB", config.disk_gb);
 
         // Build the mounts section: empty by default, populated for shared
-        // workspace mode.  Lima supports several mount types; we use
-        // `virtiofs` for performance when the user explicitly opts in via
-        // `--workspace shared:<path>`.
+        // workspace mode.  We use `9p` (built into QEMU) rather than
+        // `virtiofs` because virtiofs requires virtiofsd + shared memory
+        // (memfd) which conflicts with QEMU's seccomp sandbox in hardened
+        // mode.  9p runs inside the QEMU process itself.
         //
-        // SECURITY NOTE: virtiofs adds a virtio-fs device to the VM, which
+        // SECURITY NOTE: 9p adds a virtio-9p device to the VM, which
         // expands the attack surface compared to a fully isolated VM.  The
         // host directory is writable by the guest.  This is a documented
         // trade-off — see docs/workspaces.md.
@@ -498,11 +571,14 @@ impl LimaManager {
             Some(WorkspaceMode::Shared { host_path }) => {
                 format!(
                     "\
-mountType: \"virtiofs\"
+mountType: \"9p\"
 mounts:
 - location: \"{host_path}\"
   mountPoint: \"/home/agent/workspace\"
-  writable: true"
+  writable: true
+  9p:
+    securityModel: mapped-xattr
+    cache: mmap"
                 )
             }
             _ => "mounts: []".to_string(),
@@ -570,11 +646,13 @@ provision:
     #!/bin/bash
     set -eux -o pipefail
     export DEBIAN_FRONTEND=noninteractive
-    # Install socat (needed for host-guest communication bridge)
-    if ! command -v socat &>/dev/null; then
+    # Install socat (needed for host-guest communication bridge) and git
+    if ! command -v socat &>/dev/null || ! command -v git &>/dev/null; then
       apt-get update -qq
-      apt-get install -y socat
+      apt-get install -y socat git
     fi
+    # Ensure the workspace directory exists for repo cloning
+    mkdir -p /root/workspace
 - mode: system
   script: |
     #!/bin/bash
@@ -607,7 +685,8 @@ provision:
     ///    virtio-net-pci) can be hot-added via QMP.
     ///
     /// 2. **Seccomp sandbox** — Enables QEMU's built-in seccomp filter to deny
-    ///    obsolete syscalls, privilege escalation, and process spawning.
+    ///    obsolete syscalls and privilege escalation.  Process spawning is
+    ///    allowed because `qemu-bridge-helper` must be launched as a subprocess.
     ///
     /// 3. **Cgroup limits** — When `SANDBOX_QEMU_MEMORY_MB` and
     ///    `SANDBOX_QEMU_CPUS` environment variables are set (propagated from
@@ -746,29 +825,10 @@ fn lima_io_error(context: &str, err: std::io::Error) -> SandboxError {
     }
 }
 
-/// Attempt to produce a more specific error from limactl stderr.
+/// Produce an error from limactl stderr, always preserving the raw output.
 fn parse_limactl_error(subcommand: &str, stderr: &str) -> SandboxError {
     let stderr = stderr.trim();
-
-    if stderr.contains("already exists") {
-        SandboxError::Lima(format!(
-            "limactl {subcommand}: VM already exists"
-        ))
-    } else if stderr.contains("does not exist")
-        || stderr.contains("not found")
-    {
-        SandboxError::Lima(format!(
-            "limactl {subcommand}: VM not found"
-        ))
-    } else if stderr.contains("KVM") || stderr.contains("kvm") {
-        SandboxError::Lima(format!(
-            "limactl {subcommand}: KVM not available — is /dev/kvm accessible?"
-        ))
-    } else {
-        SandboxError::Lima(format!(
-            "limactl {subcommand} failed: {stderr}"
-        ))
-    }
+    SandboxError::Lima(format!("limactl {subcommand} failed: {stderr}"))
 }
 
 /// Resolve a binary name to its absolute path using the system `PATH`.
@@ -921,8 +981,8 @@ mod tests {
             "template should grant passwordless sudo"
         );
         assert!(
-            template.contains("apt-get install -y socat"),
-            "template should install socat for host-guest communication"
+            template.contains("apt-get install -y socat git"),
+            "template should install socat and git"
         );
         assert!(
             template.contains("get.docker.com"),
@@ -1009,10 +1069,10 @@ mod tests {
             "shared workspace template must not have empty mounts"
         );
 
-        // Should contain virtiofs mount type.
+        // Should contain 9p mount type.
         assert!(
-            template.contains("mountType: \"virtiofs\""),
-            "template should specify virtiofs mount type"
+            template.contains("mountType: \"9p\""),
+            "template should specify 9p mount type"
         );
 
         // Should mount the host path to /home/agent/workspace.
@@ -1052,8 +1112,8 @@ mod tests {
             "clone workspace should not produce mounts"
         );
         assert!(
-            !template.contains("virtiofs"),
-            "clone workspace should not reference virtiofs"
+            !template.contains("9p:"),
+            "clone workspace should not reference 9p mount config"
         );
     }
 
@@ -1073,24 +1133,20 @@ mod tests {
 
         // Hardened-only args
         assert!(
-            script.contains("-nodefaults"),
-            "wrapper should disable default devices when hardened"
+            !script.contains("-nodefaults"),
+            "wrapper must NOT use -nodefaults (it strips serial console and 9p filesystem backend)"
         );
         assert!(
             script.contains("-no-user-config"),
             "wrapper should disable user config when hardened"
         );
         assert!(
-            script.contains("-nographic"),
-            "wrapper should disable graphics when hardened"
+            script.contains("-display none"),
+            "wrapper should disable display when hardened"
         );
         assert!(
             script.contains("-vga none"),
             "wrapper should disable VGA when hardened"
-        );
-        assert!(
-            script.contains("-no-hpet"),
-            "wrapper should disable HPET when hardened"
         );
         assert!(
             script.contains("virtio-rng-pci"),
@@ -1111,17 +1167,17 @@ mod tests {
     #[test]
     fn test_qemu_wrapper_hardened_conditional() {
         // Verify the device lockdown args are inside the hardened conditional,
-        // not unconditionally applied. The script should have -nodefaults only
-        // within the if-block checking SANDBOX_QEMU_HARDENED.
+        // not unconditionally applied. The script should have -no-user-config
+        // only within the if-block checking SANDBOX_QEMU_HARDENED.
         let script = QEMU_WRAPPER_SCRIPT;
 
-        // Find the position of the hardened check and the -nodefaults arg.
+        // Find the position of the hardened check and the -no-user-config arg.
         let hardened_check_pos = script.find("SANDBOX_QEMU_HARDENED").unwrap();
-        let nodefaults_pos = script.find("-nodefaults").unwrap();
+        let no_user_config_pos = script.find("-no-user-config").unwrap();
 
         assert!(
-            nodefaults_pos > hardened_check_pos,
-            "-nodefaults should come after the SANDBOX_QEMU_HARDENED check"
+            no_user_config_pos > hardened_check_pos,
+            "-no-user-config should come after the SANDBOX_QEMU_HARDENED check"
         );
     }
 
@@ -1192,7 +1248,7 @@ mod tests {
             "wrapper should reference SANDBOX_QEMU_HARDENED"
         );
         assert!(
-            content.contains("-nodefaults"),
+            content.contains("-no-user-config"),
             "wrapper should contain device lockdown args"
         );
     }
@@ -1282,56 +1338,15 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_limactl_error_already_exists() {
-        let err = parse_limactl_error(
-            "create",
-            "FATA[0000] Instance \"sandbox-abc\" already exists",
-        );
-        match err {
-            SandboxError::Lima(msg) => {
-                assert!(msg.contains("already exists"));
-            }
-            _ => panic!("expected Lima error variant"),
-        }
-    }
-
-    #[test]
-    fn test_parse_limactl_error_not_found() {
+    fn test_parse_limactl_error_preserves_stderr() {
         let err = parse_limactl_error(
             "start",
             "FATA[0000] Instance \"sandbox-abc\" does not exist",
         );
         match err {
             SandboxError::Lima(msg) => {
-                assert!(msg.contains("not found"));
-            }
-            _ => panic!("expected Lima error variant"),
-        }
-    }
-
-    #[test]
-    fn test_parse_limactl_error_kvm() {
-        let err = parse_limactl_error(
-            "create",
-            "FATA[0000] Failed to initialize KVM: Permission denied",
-        );
-        match err {
-            SandboxError::Lima(msg) => {
-                assert!(msg.contains("KVM not available"));
-            }
-            _ => panic!("expected Lima error variant"),
-        }
-    }
-
-    #[test]
-    fn test_parse_limactl_error_generic() {
-        let err = parse_limactl_error(
-            "stop",
-            "FATA[0000] Something completely unexpected happened",
-        );
-        match err {
-            SandboxError::Lima(msg) => {
-                assert!(msg.contains("Something completely unexpected"));
+                assert!(msg.contains("limactl start failed:"));
+                assert!(msg.contains("does not exist"));
             }
             _ => panic!("expected Lima error variant"),
         }
@@ -1398,10 +1413,30 @@ mod tests {
     }
 
     #[test]
+    fn test_qemu_wrapper_includes_bridge_networking() {
+        assert!(
+            QEMU_WRAPPER_SCRIPT.contains("SANDBOX_DOCKER_BRIDGE"),
+            "wrapper must check SANDBOX_DOCKER_BRIDGE env var"
+        );
+        assert!(
+            QEMU_WRAPPER_SCRIPT.contains("qemu-bridge-helper"),
+            "wrapper must reference qemu-bridge-helper"
+        );
+        assert!(
+            QEMU_WRAPPER_SCRIPT.contains("-netdev bridge,id=net_sandbox"),
+            "wrapper must add bridge netdev when SANDBOX_DOCKER_BRIDGE is set"
+        );
+        assert!(
+            QEMU_WRAPPER_SCRIPT.contains("SANDBOX_VM_MAC"),
+            "wrapper must use SANDBOX_VM_MAC for the NIC MAC address"
+        );
+    }
+
+    #[test]
     fn test_qemu_wrapper_includes_seccomp_sandbox() {
         assert!(
             QEMU_WRAPPER_SCRIPT.contains(
-                "-sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny"
+                "-sandbox on,obsolete=deny,elevateprivileges=deny,spawn=allow"
             ),
             "wrapper must enable QEMU seccomp sandbox"
         );
@@ -1463,11 +1498,35 @@ mod tests {
         // The else branch should exec QEMU directly.
         let lines: Vec<&str> = QEMU_WRAPPER_SCRIPT.lines().collect();
         let has_else_exec = lines.iter().any(|line| {
-            line.trim() == r#"exec "$REAL_QEMU" $QEMU_ARGS "$@""#
+            let trimmed = line.trim();
+            trimmed == r#"exec "$REAL_QEMU" $EXTRA_ARGS "$@""#
         });
         assert!(
             has_else_exec,
             "wrapper must have a fallback exec without systemd-run"
+        );
+    }
+
+    #[test]
+    fn test_qemu_wrapper_probe_passthrough() {
+        // Lima runs probe commands (-machine help, -cpu help, --version, etc.)
+        // through the wrapper.  The wrapper must detect these and exec the
+        // real QEMU without adding extra flags or cgroup wrapping.
+
+        // Must detect "help" as a probe trigger (covers -machine help,
+        // -accel help, -cpu help, -netdev help).
+        assert!(
+            QEMU_WRAPPER_SCRIPT.contains("help|--version"),
+            "wrapper must detect help and --version as probe triggers"
+        );
+        // When a probe is detected, wrapper must exec without extra args.
+        let lines: Vec<&str> = QEMU_WRAPPER_SCRIPT.lines().collect();
+        let has_probe_exec = lines.iter().any(|line| {
+            line.trim().starts_with("exec \"$REAL_QEMU\" \"$@\"")
+        });
+        assert!(
+            has_probe_exec,
+            "wrapper must pass probe invocations through without extra args"
         );
     }
 

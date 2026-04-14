@@ -47,9 +47,9 @@ const COMPONENT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// and mitmproxy. The gateway sits on the session's Docker bridge network and
 /// intercepts all VM traffic via nftables DNAT rules.
 ///
-/// nftables rules are injected from the host into the container's network
-/// namespace using `nsenter`, since the container intentionally has no
-/// `CAP_NET_ADMIN` or nftables tools.
+/// nftables rules are injected into the container via `docker exec`. The
+/// container is granted `CAP_NET_ADMIN` and includes the `nft` binary so it
+/// can manage its own nftables rules without requiring host-level privileges.
 pub struct GatewayManager;
 
 impl GatewayManager {
@@ -63,17 +63,27 @@ impl GatewayManager {
     /// Create and start the gateway container on the session's Docker network.
     ///
     /// After starting the container, this method:
-    /// 1. Immediately injects deny-all nftables rules
-    /// 2. Waits for all components (Envoy, CoreDNS, mitmproxy) to be ready
-    /// 3. Injects DNAT rules to route traffic through the gateway
+    /// 1. Writes the initial DNS policy file (if provided) so CoreDNS
+    ///    loads it on first startup, avoiding a race with the reload timer
+    /// 2. Immediately injects deny-all nftables rules
+    /// 3. Waits for all components (Envoy, CoreDNS, mitmproxy) to be ready
+    /// 4. Injects DNAT rules to route traffic through the gateway
     ///
     /// This ordering ensures no traffic can flow until all components are ready
     /// and the full nftables ruleset is in place.
+    ///
+    /// The `initial_dns_policy` parameter, when `Some`, is written to the
+    /// gateway's `/etc/coredns/policy.conf` immediately after the container
+    /// starts but before CoreDNS initialises.  This ensures the very first
+    /// `LoadFile` call inside CoreDNS sees the intended policy, eliminating
+    /// the window where CoreDNS would serve NXDOMAIN for all queries while
+    /// waiting for its reload timer to detect the file change.
     pub fn create_gateway(
         &self,
         session_id: &Uuid,
         network_info: &NetworkInfo,
         ca_dir: Option<&Path>,
+        initial_dns_policy: Option<&str>,
     ) -> Result<(), SandboxError> {
         let container_name = container_name(session_id);
 
@@ -102,6 +112,8 @@ impl GatewayManager {
             "--ip".to_string(),
             network_info.gateway_ip.clone(),
             "--read-only".to_string(),
+            "--cap-add".to_string(),
+            "NET_ADMIN".to_string(),
             "--tmpfs".to_string(),
             "/var/log:rw,noexec,nosuid".to_string(),
             "--tmpfs".to_string(),
@@ -110,6 +122,10 @@ impl GatewayManager {
             "/tmp:rw,exec,nosuid".to_string(),
             "--tmpfs".to_string(),
             "/root/.mitmproxy:rw".to_string(),
+            "--tmpfs".to_string(),
+            "/etc/coredns:rw,noexec,nosuid".to_string(),
+            "--tmpfs".to_string(),
+            "/etc/envoy:rw,noexec,nosuid".to_string(),
         ];
 
         // When a CA directory is provided, bind-mount the mitmproxy CA
@@ -174,16 +190,49 @@ impl GatewayManager {
             "gateway container started"
         );
 
-        // Step 2: Immediately inject deny-all nftables rules.
+        // Step 2: Write the initial DNS policy file if one was provided.
+        //
+        // The entrypoint creates a deny-all default at
+        // /etc/coredns/policy.conf only if the file does not yet exist.
+        // By writing the policy here (before the entrypoint's check runs
+        // or before CoreDNS calls LoadFile), we ensure the first policy
+        // load sees the correct content — no reload-timer race.
+        if let Some(policy_content) = initial_dns_policy {
+            use crate::policy_distributor::write_file_to_container;
+            match write_file_to_container(
+                &container_name,
+                "/etc/coredns/policy.conf",
+                policy_content,
+            ) {
+                Ok(()) => {
+                    debug!(
+                        session_id = %session_id,
+                        "wrote initial DNS policy to gateway container"
+                    );
+                }
+                Err(e) => {
+                    // Non-fatal: the entrypoint will create a deny-all default
+                    // and sandboxd can overwrite it later, but there will be
+                    // a brief window where DNS queries are denied.
+                    warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "failed to write initial DNS policy (CoreDNS may briefly deny queries)"
+                    );
+                }
+            }
+        }
+
+        // Step 3: Immediately inject deny-all nftables rules.
         //
         // This must happen before components finish initialising so no traffic
         // can leak before the full ruleset is in place.
         self.inject_deny_all(session_id)?;
 
-        // Step 3: Wait for all components to become ready.
+        // Step 4: Wait for all components to become ready.
         self.wait_for_components(session_id)?;
 
-        // Step 4: Inject DNAT rules (now that all components are serving).
+        // Step 5: Inject DNAT rules (now that all components are serving).
         // Use the explicit gateway IP from NetworkInfo as the DNAT target.
         self.inject_dnat(session_id, network_info, &network_info.gateway_ip)?;
 
@@ -277,6 +326,7 @@ impl GatewayManager {
         session_id: &Uuid,
         network_info: &NetworkInfo,
         ca_dir: Option<&Path>,
+        initial_dns_policy: Option<&str>,
     ) -> Result<(), SandboxError> {
         info!(
             session_id = %session_id,
@@ -293,7 +343,7 @@ impl GatewayManager {
         }
 
         // Create fresh container with full setup.
-        self.create_gateway(session_id, network_info, ca_dir)
+        self.create_gateway(session_id, network_info, ca_dir, initial_dns_policy)
     }
 
     /// Check gateway health by running the healthcheck script inside the
@@ -523,70 +573,24 @@ impl GatewayManager {
         Ok(ip)
     }
 
-    /// Get the PID of the gateway container (needed for nsenter).
-    fn container_pid(&self, session_id: &Uuid) -> Result<u32, SandboxError> {
-        let container_name = container_name(session_id);
-
-        let output = Command::new("docker")
-            .args([
-                "inspect",
-                "--format",
-                "{{.State.Pid}}",
-                &container_name,
-            ])
-            .output()
-            .map_err(|e| {
-                SandboxError::Gateway(format!(
-                    "failed to inspect container {container_name}: {e}"
-                ))
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(SandboxError::Gateway(format!(
-                "docker inspect failed for {container_name}: {stderr}"
-            )));
-        }
-
-        let pid_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let pid: u32 = pid_str.parse().map_err(|e| {
-            SandboxError::Gateway(format!(
-                "invalid PID '{pid_str}' for container {container_name}: {e}"
-            ))
-        })?;
-
-        if pid == 0 {
-            return Err(SandboxError::Gateway(format!(
-                "container {container_name} is not running (PID=0)"
-            )));
-        }
-
-        Ok(pid)
-    }
-
-    /// Inject an nftables ruleset into the container's network namespace
-    /// using `nsenter`.
+    /// Inject an nftables ruleset into the container via `docker exec`.
     fn inject_nftables_ruleset(
         &self,
         session_id: &Uuid,
         ruleset: &str,
         label: &str,
     ) -> Result<(), SandboxError> {
-        let pid = self.container_pid(session_id)?;
-        let ns_path = format!("/proc/{pid}/ns/net");
+        let container = container_name(session_id);
 
         debug!(
             session_id = %session_id,
-            pid = pid,
+            container = %container,
             label = label,
-            "injecting nftables ruleset"
+            "injecting nftables ruleset via docker exec"
         );
 
-        let net_arg = format!("--net={ns_path}");
-        let output = Command::new("sudo")
-            .arg("nsenter")
-            .arg(&net_arg)
-            .args(["nft", "-f", "-"])
+        let output = Command::new("docker")
+            .args(["exec", "-i", &container, "nft", "-f", "-"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -596,7 +600,6 @@ impl GatewayManager {
                 if let Some(ref mut stdin) = child.stdin {
                     stdin.write_all(ruleset.as_bytes())?;
                 }
-                // Drop stdin to signal EOF.
                 child.stdin.take();
                 child.wait_with_output()
             })
@@ -811,9 +814,10 @@ pub fn generate_dnat_ruleset(vm_subnet: &str, gateway_ip: &str) -> String {
 ///
 /// The initial deny-all ruleset blocks all inbound traffic.  After DNAT
 /// is configured, traffic from the VM subnet is rewritten to the
-/// gateway's own IP on port 53 (DNS) and 10000 (Envoy proxy).  The
-/// input chain must accept this traffic, otherwise the DNATted packets
-/// are rejected.
+/// gateway's own IP on port 53 (DNS), 10000 (Envoy proxy), or
+/// 8080 (mitmproxy for L3 HTTPS inspection).  The input chain must
+/// accept this traffic, otherwise the DNATted/redirected packets are
+/// rejected.
 pub fn generate_input_allow_ruleset(vm_subnet: &str) -> String {
     format!(
         r#"flush chain inet sandbox input
@@ -834,6 +838,9 @@ table inet sandbox {{
 
         # Allow HTTP proxy from VM subnet (Envoy)
         ip saddr {vm_subnet} tcp dport 10000 accept
+
+        # Allow HTTPS inspection from VM subnet (mitmproxy, L3 redirect)
+        ip saddr {vm_subnet} tcp dport 8080 accept
 
         # Reject everything else (fast failure)
         reject
@@ -1137,7 +1144,7 @@ mod tests {
         let network_info = net_mgr.create_network(&session_id).unwrap();
 
         // Create the gateway container with nftables rules.
-        let create_result = gw_mgr.create_gateway(&session_id, &network_info, None);
+        let create_result = gw_mgr.create_gateway(&session_id, &network_info, None, None);
         if let Err(ref e) = create_result {
             // Clean up on failure.
             let _ = gw_mgr.stop_gateway(&session_id);
@@ -1149,13 +1156,12 @@ mod tests {
         let status = gw_mgr.gateway_status(&session_id).unwrap();
         assert_eq!(status, GatewayStatus::Healthy, "gateway should be healthy");
 
-        // Verify nftables rules are present in the container's network namespace.
-        let pid = gw_mgr.container_pid(&session_id).unwrap();
-        let output = Command::new("nsenter")
-            .arg(format!("--net=/proc/{pid}/ns/net"))
-            .args(["nft", "list", "ruleset"])
+        // Verify nftables rules are present in the container.
+        let gw_container = container_name(&session_id);
+        let output = Command::new("docker")
+            .args(["exec", &gw_container, "nft", "list", "ruleset"])
             .output()
-            .expect("nsenter nft list should succeed");
+            .expect("docker exec nft list should succeed");
 
         let nft_output = String::from_utf8_lossy(&output.stdout);
         assert!(
@@ -1197,8 +1203,9 @@ mod tests {
         // Create network and a minimal container (no need for full gateway here).
         let network_info = net_mgr.create_network(&session_id).unwrap();
 
-        // Start a minimal container (alpine) on the network without --ip
-        // (just to have a network namespace to inject nftables into).
+        // Start the gateway image with CAP_NET_ADMIN so nft works inside the
+        // container. Override entrypoint with sleep so we can test nftables
+        // injection without the full gateway stack.
         let container_name = container_name(&session_id);
         let output = Command::new("docker")
             .args([
@@ -1208,10 +1215,13 @@ mod tests {
                 &container_name,
                 "--network",
                 &network_info.docker_network_name,
+                "--cap-add",
+                "NET_ADMIN",
                 "--sysctl",
                 "net.ipv4.ip_forward=1",
-                "alpine:latest",
+                "--entrypoint",
                 "sleep",
+                GATEWAY_IMAGE,
                 "300",
             ])
             .output()
@@ -1232,10 +1242,8 @@ mod tests {
         gw_mgr.inject_deny_all(&session_id).unwrap();
 
         // Verify rules are present.
-        let pid = gw_mgr.container_pid(&session_id).unwrap();
-        let output = Command::new("nsenter")
-            .arg(format!("--net=/proc/{pid}/ns/net"))
-            .args(["nft", "list", "ruleset"])
+        let output = Command::new("docker")
+            .args(["exec", &container_name, "nft", "list", "ruleset"])
             .output()
             .expect("nft list should succeed");
 
@@ -1254,9 +1262,8 @@ mod tests {
             .inject_dnat(&session_id, &network_info, &container_ip)
             .unwrap();
 
-        let output = Command::new("nsenter")
-            .arg(format!("--net=/proc/{pid}/ns/net"))
-            .args(["nft", "list", "ruleset"])
+        let output = Command::new("docker")
+            .args(["exec", &container_name, "nft", "list", "ruleset"])
             .output()
             .expect("nft list should succeed");
 
@@ -1273,9 +1280,8 @@ mod tests {
         // Remove DNAT rules.
         gw_mgr.remove_dnat_rules(&session_id).unwrap();
 
-        let output = Command::new("nsenter")
-            .arg(format!("--net=/proc/{pid}/ns/net"))
-            .args(["nft", "list", "ruleset"])
+        let output = Command::new("docker")
+            .args(["exec", &container_name, "nft", "list", "ruleset"])
             .output()
             .expect("nft list should succeed");
 

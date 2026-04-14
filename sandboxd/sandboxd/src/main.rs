@@ -12,14 +12,16 @@ use axum::{
 };
 use clap::Parser;
 use sandbox_core::{
-    ApiError, CaManager, CreateSessionRequest, DnsCache, ExecRequest, ExecResponse,
-    FileDownloadRequest, FileDownloadResponse, FileUploadRequest, GatewayHealth, GatewayManager,
-    GatewayStatus, GitRequest, GitResponse, GuestConnector, GuestRequest, GuestResponse,
-    LimaManager, NetworkHealth, NetworkManager, Policy, PolicyCompiler, PolicyDistributor,
-    SandboxError, Session, SessionConfig, SessionHealth, SessionResponse, SessionState,
-    SessionStore, UpdatePolicyRequest, VmStatus, attach_vm_to_bridge, detach_vm_from_bridge,
-    generate_ca_inject_script, propagate_dns_changes, read_resolved_json,
+    ApiError, AssuranceLevel, CaManager, CoreDnsConfig, CreateSessionRequest, Destination,
+    DnsCache, ExecRequest, ExecResponse, FileDownloadRequest, FileDownloadResponse,
+    FileUploadRequest, GatewayHealth, GatewayManager, GatewayStatus, GitRequest, GitResponse,
+    GuestConnector, GuestRequest, GuestResponse, LimaManager, NetworkHealth, NetworkManager,
+    Policy, PolicyCompiler, PolicyDistributor, SandboxError, Session, SessionConfig, SessionHealth,
+    SessionResponse, SessionState, SessionStore, UpdatePolicyRequest, VmStatus,
+    attach_vm_to_bridge, detach_vm_from_bridge, generate_ca_inject_script, mac_from_uuid,
+    propagate_dns_changes, read_resolved_json, write_file_to_container,
 };
+use sandbox_core::gateway::container_name as gateway_container_name;
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -40,6 +42,7 @@ struct Args {
     #[arg(long, default_value_t = default_base_dir())]
     base_dir: String,
 }
+
 
 fn default_socket_path() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
@@ -151,9 +154,32 @@ async fn create_session(
     };
 
     let session_id = session.id;
-    info!(%session_id, "creating VM");
 
-    // Create the Lima VM (with optional custom template).
+    // 1. Create Docker network BEFORE the VM so the bridge exists at QEMU boot.
+    //    Also generate the per-session CA certificate (needed by the gateway).
+    let ca_dir = match CaManager::generate_session_ca(&state.base_dir, &session_id) {
+        Ok(dir) => dir,
+        Err(e) => {
+            let _ = state.store.update_state(&session_id, SessionState::Error);
+            return error_response(e).into_response();
+        }
+    };
+
+    let network_info = match state.network.create_network(&session_id) {
+        Ok(info) => info,
+        Err(e) => {
+            let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
+            let _ = state.store.update_state(&session_id, SessionState::Error);
+            return error_response(e).into_response();
+        }
+    };
+
+    // Generate MAC address for the VM's bridge NIC.
+    let vm_mac = mac_from_uuid(&session_id);
+
+    info!(%session_id, bridge = %network_info.bridge_name, mac = %vm_mac, "creating VM");
+
+    // 2. Create the Lima VM (with optional custom template).
     let create_result = if let Some(template_path) = &req.template {
         state
             .lima
@@ -163,23 +189,36 @@ async fn create_session(
     };
 
     if let Err(e) = create_result {
+        let _ = state.network.delete_network(&session_id);
+        let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
         let _ = state.store.update_state(&session_id, SessionState::Error);
         return error_response(e).into_response();
     }
 
-    // Start the VM.
-    if let Err(e) = state.lima.start_vm(&session_id, &config) {
+    // 3. Start the VM with bridge networking env vars so QEMU attaches to
+    //    the Docker bridge via qemu-bridge-helper at boot.
+    if let Err(e) = state.lima.start_vm(
+        &session_id,
+        &config,
+        Some(&network_info.bridge_name),
+        Some(&vm_mac),
+    ) {
+        let _ = state.network.delete_network(&session_id);
+        let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
         let _ = state.store.update_state(&session_id, SessionState::Error);
         return error_response(e).into_response();
     }
 
-    // Install the guest agent into the VM.
+    // 4. Install the guest agent into the VM.
     let guest_binary_path = match std::env::current_exe() {
         Ok(exe) => exe
             .parent()
             .expect("executable must have a parent directory")
             .join("sandbox-guest"),
         Err(e) => {
+            let _ = state.lima.delete_vm(&session_id);
+            let _ = state.network.delete_network(&session_id);
+            let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
             let _ = state.store.update_state(&session_id, SessionState::Error);
             return error_response(SandboxError::Internal(format!(
                 "failed to determine daemon executable path: {e}"
@@ -190,11 +229,14 @@ async fn create_session(
 
     if let Err(e) = state.lima.install_guest_agent(&session_id, &guest_binary_path) {
         error!(%session_id, error = %e, "failed to install guest agent");
+        let _ = state.lima.delete_vm(&session_id);
+        let _ = state.network.delete_network(&session_id);
+        let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
         let _ = state.store.update_state(&session_id, SessionState::Error);
         return error_response(e).into_response();
     }
 
-    // Verify the guest agent is responsive.
+    // 5. Verify the guest agent is responsive.
     match state.guest.ping(&session_id).await {
         Ok(true) => {
             info!(%session_id, "guest agent responded to ping");
@@ -204,11 +246,17 @@ async fn create_session(
                 "guest agent returned unexpected response to ping".into(),
             );
             error!(%session_id, "guest agent ping: unexpected response");
+            let _ = state.lima.delete_vm(&session_id);
+            let _ = state.network.delete_network(&session_id);
+            let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
             let _ = state.store.update_state(&session_id, SessionState::Error);
             return error_response(err).into_response();
         }
         Err(e) => {
             error!(%session_id, error = %e, "guest agent ping failed");
+            let _ = state.lima.delete_vm(&session_id);
+            let _ = state.network.delete_network(&session_id);
+            let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
             let _ = state.store.update_state(&session_id, SessionState::Error);
             return error_response(e).into_response();
         }
@@ -219,8 +267,33 @@ async fn create_session(
         return error_response(e).into_response();
     }
 
-    // Set up networking: Docker bridge, gateway container, VM NIC attachment.
-    match setup_session_networking(&session_id, &state).await {
+    // 6. Set up remaining networking: gateway container, guest NIC config, CA injection.
+    //
+    // Pass an initial DNS policy into the gateway setup so CoreDNS loads it
+    // on first startup.  This eliminates the race where CoreDNS would start
+    // with a deny-all default and only pick up the real policy after its
+    // reload timer fires (~1s).
+    let initial_dns_policy_owned: String;
+    let initial_dns_policy = if let Some(ref policy) = req.policy {
+        // Extract domain names from the policy and format as CoreDNS config.
+        let domains: Vec<String> = policy
+            .rules
+            .iter()
+            .filter(|r| r.level != AssuranceLevel::Deny)
+            .filter_map(|r| match &r.destination {
+                Destination::Domain(d) => Some(d.clone()),
+                Destination::Cidr(_) => None,
+            })
+            .collect();
+        let config = CoreDnsConfig { allowed_domains: domains };
+        initial_dns_policy_owned = config.to_file_content();
+        Some(initial_dns_policy_owned.as_str())
+    } else {
+        Some("# Default allow-all policy (no policy specified)\n*\n")
+    };
+    match setup_session_networking(
+        &session_id, &network_info, &ca_dir, &state, initial_dns_policy,
+    ).await {
         Ok(()) => {
             info!(%session_id, "session networking configured");
         }
@@ -233,7 +306,9 @@ async fn create_session(
         }
     }
 
-    // If a policy was provided, compile and distribute it.
+    // If a policy was provided, compile and distribute it now that the
+    // gateway is running.  The DNS policy for the no-policy case was already
+    // written during gateway creation above.
     if let Some(policy) = req.policy {
         match apply_policy(&session_id, &policy, &state).await {
             Ok(()) => {
@@ -506,8 +581,32 @@ async fn start_session(
 
     info!(session_id = %session.id, "starting session");
 
-    // Start the Lima VM.
-    if let Err(e) = state.lima.start_vm(&session.id, &session.config) {
+    // Ensure the Docker bridge network exists BEFORE starting the VM so the
+    // QEMU wrapper can attach the bridge NIC via qemu-bridge-helper at boot.
+    let (bridge_name, vm_mac) = match state.network.ensure_network(&session.id) {
+        Ok(info) => {
+            let mac = mac_from_uuid(&session.id);
+            (Some(info.bridge_name), Some(mac))
+        }
+        Err(e) => {
+            // If network info is not available (e.g. session created before
+            // networking was set up), start without bridge networking.
+            warn!(
+                session_id = %session.id,
+                error = %e,
+                "could not ensure Docker bridge (starting VM without bridge NIC)"
+            );
+            (None, None)
+        }
+    };
+
+    // Start the Lima VM with bridge networking env vars.
+    if let Err(e) = state.lima.start_vm(
+        &session.id,
+        &session.config,
+        bridge_name.as_deref(),
+        vm_mac.as_deref(),
+    ) {
         let _ = state.store.update_state(&session.id, SessionState::Error);
         return error_response(e).into_response();
     }
@@ -537,7 +636,7 @@ async fn start_session(
         return error_response(e).into_response();
     }
 
-    // Recreate networking from existing network info (if available).
+    // Restore remaining networking: gateway container, guest config, CA injection.
     match restore_session_networking(&session.id, &state).await {
         Ok(()) => {
             info!(session_id = %session.id, "session networking restored after start");
@@ -1077,7 +1176,7 @@ async fn dns_propagation_loop(
     network_info: sandbox_core::NetworkInfo,
     session_policies: Arc<Mutex<HashMap<uuid::Uuid, Policy>>>,
 ) {
-    let poll_interval = Duration::from_secs(15);
+    let poll_interval = Duration::from_secs(2);
     let mut cache = DnsCache::new();
 
     info!(
@@ -1087,8 +1186,6 @@ async fn dns_propagation_loop(
     );
 
     loop {
-        tokio::time::sleep(poll_interval).await;
-
         // Read the current policy (it may have been updated).
         let policy = {
             let policies = session_policies.lock().await;
@@ -1113,6 +1210,7 @@ async fn dns_propagation_loop(
                     error = %e,
                     "DNS propagation: failed to read resolved.json"
                 );
+                tokio::time::sleep(poll_interval).await;
                 continue;
             }
         };
@@ -1121,6 +1219,7 @@ async fn dns_propagation_loop(
         let changes = cache.update(&report);
 
         if changes.is_empty() && !cache.has_expired_entries() {
+            tokio::time::sleep(poll_interval).await;
             continue;
         }
 
@@ -1156,6 +1255,10 @@ async fn dns_propagation_loop(
                 "DNS propagation: failed to update nftables"
             );
         }
+
+        // Sleep at the end so the first iteration runs immediately after
+        // policy application, resolving domain IPs as fast as possible.
+        tokio::time::sleep(poll_interval).await;
     }
 }
 
@@ -1163,54 +1266,40 @@ async fn dns_propagation_loop(
 // Networking helpers
 // ---------------------------------------------------------------------------
 
-/// Set up full networking for a new session.
+/// Set up remaining networking for a new session.
 ///
-/// 1. Generate per-session CA certificate
-/// 2. Create Docker bridge network
-/// 3. Create gateway container with nftables (mounting the CA)
-/// 4. Attach VM to bridge (TAP + QMP hot-add + guest config)
-/// 5. Inject CA certificate into VM trust store
-/// 6. Store network info in DB
+/// The Docker bridge network and CA certificate are created before the VM
+/// boots (so the QEMU wrapper can attach to the bridge via
+/// `qemu-bridge-helper`). This function handles the post-boot steps:
+///
+/// 1. Create gateway container with nftables (mounting the CA)
+/// 2. Configure the bridge NIC inside the VM (guest-side IP/routing/DNS)
+/// 3. Inject CA certificate into VM trust store
+/// 4. Store network info in DB
 async fn setup_session_networking(
     session_id: &uuid::Uuid,
+    network_info: &sandbox_core::NetworkInfo,
+    ca_dir: &std::path::Path,
     state: &AppState,
+    initial_dns_policy: Option<&str>,
 ) -> Result<(), SandboxError> {
-    // 1. Generate per-session CA certificate.
-    let ca_dir = CaManager::generate_session_ca(&state.base_dir, session_id)?;
+    // 1. Create gateway container with nftables, mounting the CA.
+    //    Pass the initial DNS policy so it is written to the container
+    //    before CoreDNS starts, avoiding a reload-timer race.
+    state
+        .gateway
+        .create_gateway(session_id, network_info, Some(ca_dir), initial_dns_policy)?;
 
-    // 2. Create Docker bridge network.
-    let network_info = match state.network.create_network(session_id) {
-        Ok(info) => info,
-        Err(e) => {
-            let _ = CaManager::remove_session_ca(&state.base_dir, session_id);
-            return Err(e);
-        }
-    };
-
-    // 3. Create gateway container with nftables, mounting the CA.
+    // 2. Configure the bridge NIC inside the VM (already present from boot).
     if let Err(e) =
-        state
-            .gateway
-            .create_gateway(session_id, &network_info, Some(&ca_dir))
+        attach_vm_to_bridge(session_id, network_info, &state.guest).await
     {
-        // Roll back the Docker network and CA on gateway failure.
-        let _ = state.network.delete_network(session_id);
-        let _ = CaManager::remove_session_ca(&state.base_dir, session_id);
-        return Err(e);
-    }
-
-    // 4. Attach VM to bridge (TAP + QMP hot-add + guest config).
-    if let Err(e) =
-        attach_vm_to_bridge(session_id, &network_info, &state.network, &state.guest).await
-    {
-        // Roll back gateway, Docker network, and CA on attach failure.
+        // Roll back gateway on attach failure.
         let _ = state.gateway.stop_gateway(session_id);
-        let _ = state.network.delete_network(session_id);
-        let _ = CaManager::remove_session_ca(&state.base_dir, session_id);
         return Err(e);
     }
 
-    // 5. Inject CA certificate into VM trust store via guest agent.
+    // 3. Inject CA certificate into VM trust store via guest agent.
     let cert_pem = std::fs::read_to_string(ca_dir.join("cert.pem")).map_err(|e| {
         SandboxError::Ca(format!("failed to read CA cert for injection: {e}"))
     })?;
@@ -1263,23 +1352,26 @@ async fn setup_session_networking(
         }
     }
 
-    // 6. Store network info in DB.
-    state.store.set_network_info(session_id, &network_info)?;
+    // 4. Store network info in DB.
+    state.store.set_network_info(session_id, network_info)?;
 
     Ok(())
 }
 
 /// Tear down session networking infrastructure (best-effort, ignores errors).
 ///
-/// Removes the TAP device, stops the gateway container, and removes the
-/// Docker bridge network. The subnet allocation and network_info in the DB
-/// are preserved so `start` can recreate everything.
+/// Stops the gateway container and removes the Docker bridge network.
+/// The TAP device is owned by QEMU and destroyed when the VM stops.
+/// The subnet allocation and network_info in the DB are preserved so
+/// `start` can recreate everything.
 ///
 /// The CA certificate files on disk are NOT removed — they are reused on
 /// start.
 fn teardown_session_networking(session_id: &uuid::Uuid, state: &AppState) {
     debug!(session_id = %session_id, "tearing down session networking (preserving allocation)");
-    if let Err(e) = detach_vm_from_bridge(session_id, &state.network) {
+    // detach_vm_from_bridge is a no-op (TAP owned by QEMU), but call it
+    // for completeness / future-proofing.
+    if let Err(e) = detach_vm_from_bridge(session_id) {
         warn!(%session_id, error = %e, "failed to detach VM from bridge (best-effort)");
     }
     if let Err(e) = state.gateway.stop_gateway(session_id) {
@@ -1294,7 +1386,7 @@ fn teardown_session_networking(session_id: &uuid::Uuid, state: &AppState) {
 /// allocation. Used when deleting a session permanently.
 fn teardown_session_networking_full(session_id: &uuid::Uuid, state: &AppState) {
     debug!(session_id = %session_id, "tearing down session networking (full cleanup)");
-    if let Err(e) = detach_vm_from_bridge(session_id, &state.network) {
+    if let Err(e) = detach_vm_from_bridge(session_id) {
         warn!(%session_id, error = %e, "failed to detach VM from bridge (best-effort)");
     }
     if let Err(e) = state.gateway.stop_gateway(session_id) {
@@ -1308,29 +1400,88 @@ fn teardown_session_networking_full(session_id: &uuid::Uuid, state: &AppState) {
     }
 }
 
+/// Re-apply the session's policy to a freshly created gateway container.
+///
+/// When a gateway is recreated (restart, crash recovery, reconciliation),
+/// its tmpfs is wiped. This helper restores the policy that was active
+/// before the gateway went away. If no policy is stored (session created
+/// without one), it writes the allow-all wildcard so CoreDNS permits all
+/// DNS queries.
+///
+/// Policy re-application is best-effort: failures are logged but do not
+/// propagate, matching the non-fatal semantics of initial policy setup.
+async fn reapply_session_policy(session_id: &uuid::Uuid, state: &AppState) {
+    let container = gateway_container_name(session_id);
+
+    // Check the in-memory policy store.
+    let policy = {
+        let policies = state.session_policies.lock().await;
+        policies.get(session_id).cloned()
+    };
+
+    if let Some(policy) = policy {
+        match apply_policy(session_id, &policy, state).await {
+            Ok(()) => {
+                info!(
+                    session_id = %session_id,
+                    "re-applied session policy to restored gateway"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "failed to re-apply policy to restored gateway"
+                );
+            }
+        }
+    } else {
+        // No policy stored — write allow-all wildcard so CoreDNS permits
+        // all DNS resolution (same as the else branch in create_session).
+        let allow_all = "# Default allow-all policy (no policy specified)\n*\n";
+        match write_file_to_container(&container, "/etc/coredns/policy.conf", allow_all) {
+            Ok(()) => {
+                debug!(
+                    session_id = %session_id,
+                    "wrote default allow-all DNS policy to restored gateway"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "failed to write default DNS policy to restored gateway"
+                );
+            }
+        }
+    }
+}
+
 /// Restore session networking from existing network info in the DB.
 ///
 /// This is called by the `start` handler and by startup reconciliation.
-/// It recreates the Docker bridge, gateway container, TAP attachment, and
-/// CA injection using the same IPs that were originally allocated.
+/// The Docker bridge is recreated (if needed) before the VM is started, so
+/// the bridge NIC is attached at boot via `qemu-bridge-helper`. This
+/// function then creates the gateway container, configures the guest NIC,
+/// and injects the CA certificate — the same post-boot steps as initial
+/// setup.
 async fn restore_session_networking(
     session_id: &uuid::Uuid,
     state: &AppState,
 ) -> Result<(), SandboxError> {
     // Check that network info exists in DB (otherwise there's nothing to restore).
-    if state.store.get_network_info(session_id)?.is_none() {
-        info!(
-            session_id = %session_id,
-            "no network info in DB, skipping networking restore"
-        );
-        return Ok(());
-    }
+    let network_info = match state.store.get_network_info(session_id)? {
+        Some(info) => info,
+        None => {
+            info!(
+                session_id = %session_id,
+                "no network info in DB, skipping networking restore"
+            );
+            return Ok(());
+        }
+    };
 
-    // 1. Ensure the Docker bridge network exists (recreate if needed).
-    //    This uses the NetworkManager's in-memory map (restored from DB at startup).
-    let network_info = state.network.ensure_network(session_id)?;
-
-    // 2. Get or regenerate the CA certificate.
+    // 1. Get or regenerate the CA certificate.
     let ca_dir = CaManager::ca_dir(&state.base_dir, session_id);
     let ca_dir = if ca_dir.join("cert.pem").exists() {
         info!(
@@ -1346,20 +1497,38 @@ async fn restore_session_networking(
         CaManager::generate_session_ca(&state.base_dir, session_id)?
     };
 
-    // 3. Create gateway container with nftables, mounting the CA.
+    // 2. Create gateway container with nftables, mounting the CA.
+    //    When no explicit policy is stored for this session, pass an
+    //    allow-all DNS policy so CoreDNS loads it at startup (same race
+    //    fix as in create_session).
+    let has_stored_policy = {
+        let policies = state.session_policies.lock().await;
+        policies.contains_key(session_id)
+    };
+    let initial_dns_policy = if !has_stored_policy {
+        Some("# Default allow-all policy (no policy specified)\n*\n")
+    } else {
+        None
+    };
     if let Err(e) =
         state
             .gateway
-            .create_gateway(session_id, &network_info, Some(&ca_dir))
+            .create_gateway(session_id, &network_info, Some(&ca_dir), initial_dns_policy)
     {
         // Roll back the Docker network on gateway failure.
         let _ = state.network.remove_docker_network(session_id);
         return Err(e);
     }
 
-    // 4. Attach VM to bridge (TAP + QMP hot-add + guest config).
+    // 2b. Re-apply the session's policy to the fresh gateway container.
+    // If a policy is stored, compile and distribute it to the running
+    // gateway.  If no policy is stored, the allow-all was already written
+    // during gateway creation above, so reapply only writes if needed.
+    reapply_session_policy(session_id, state).await;
+
+    // 3. Configure the bridge NIC inside the VM (already present from boot).
     if let Err(e) =
-        attach_vm_to_bridge(session_id, &network_info, &state.network, &state.guest).await
+        attach_vm_to_bridge(session_id, &network_info, &state.guest).await
     {
         // Roll back gateway and Docker network on attach failure.
         let _ = state.gateway.stop_gateway(session_id);
@@ -1367,7 +1536,7 @@ async fn restore_session_networking(
         return Err(e);
     }
 
-    // 5. Inject CA certificate into VM trust store.
+    // 4. Inject CA certificate into VM trust store.
     let cert_pem = std::fs::read_to_string(ca_dir.join("cert.pem")).map_err(|e| {
         SandboxError::Ca(format!("failed to read CA cert for injection: {e}"))
     })?;
@@ -1511,7 +1680,9 @@ async fn session_health(
             )
         };
 
-    // Network health: check if bridge and TAP exist.
+    // Network health: check if the Docker bridge exists.
+    // TAP devices are now managed by QEMU via qemu-bridge-helper and are
+    // created/destroyed with the VM process — no separate host-side check.
     let network_info = state.store.get_network_info(&session.id).ok().flatten();
     let bridge_exists = network_info
         .as_ref()
@@ -1523,14 +1694,8 @@ async fn session_health(
                 .unwrap_or(false)
         })
         .unwrap_or(false);
-    let tap_exists = {
-        let tap_name = sandbox_core::tap_name_for_session(&session.id);
-        std::process::Command::new("ip")
-            .args(["link", "show", &tap_name])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    };
+    // TAP is owned by QEMU; report as present when the VM is running.
+    let tap_exists = vm_status == "running";
 
     let health = SessionHealth {
         session_id: session.id,
@@ -1678,7 +1843,7 @@ fn reconcile(store: &SessionStore, lima: &LimaManager) {
 /// restart it if needed.
 ///
 /// For each Stopped session: ensure gateway is stopped and TAP is removed.
-fn reconcile_networking(state: &AppState) {
+async fn reconcile_networking(state: &AppState) {
     let sessions = match state.store.list_sessions() {
         Ok(s) => s,
         Err(e) => {
@@ -1747,10 +1912,21 @@ fn reconcile_networking(state: &AppState) {
                             None
                         };
 
+                        // Determine initial DNS policy for the gateway.
+                        let has_policy = {
+                            let policies = state.session_policies.lock().await;
+                            policies.contains_key(&session.id)
+                        };
+                        let init_dns = if !has_policy {
+                            Some("# Default allow-all policy (no policy specified)\n*\n")
+                        } else {
+                            None
+                        };
+
                         // Restart the gateway.
                         if let Err(e) = state
                             .gateway
-                            .restart_gateway(&session.id, &network_info, ca_ref)
+                            .restart_gateway(&session.id, &network_info, ca_ref, init_dns)
                         {
                             warn!(
                                 session_id = %session.id,
@@ -1762,6 +1938,8 @@ fn reconcile_networking(state: &AppState) {
                                 session_id = %session.id,
                                 "network reconciliation: gateway restarted"
                             );
+                            // Re-apply the session's policy to the fresh gateway.
+                            reapply_session_policy(&session.id, state).await;
                             restored += 1;
                         }
                     }
@@ -1793,8 +1971,8 @@ fn reconcile_networking(state: &AppState) {
                     }
                 }
 
-                // Best-effort TAP cleanup.
-                let _ = detach_vm_from_bridge(&session.id, &state.network);
+                // Best-effort TAP cleanup (no-op: TAP is owned by QEMU).
+                let _ = detach_vm_from_bridge(&session.id);
             }
             _ => {}
         }
@@ -1895,16 +2073,29 @@ async fn gateway_monitor(state: Arc<AppState>) {
                         None
                     };
 
+                    // Determine initial DNS policy for the gateway.
+                    let has_policy = {
+                        let policies = state.session_policies.lock().await;
+                        policies.contains_key(&session.id)
+                    };
+                    let init_dns = if !has_policy {
+                        Some("# Default allow-all policy (no policy specified)\n*\n")
+                    } else {
+                        None
+                    };
+
                     // Restart the gateway.
                     match state
                         .gateway
-                        .restart_gateway(&session.id, &network_info, ca_ref)
+                        .restart_gateway(&session.id, &network_info, ca_ref, init_dns)
                     {
                         Ok(()) => {
                             info!(
                                 session_id = %session.id,
                                 "gateway monitor: gateway recovered successfully"
                             );
+                            // Re-apply the session's policy to the fresh gateway.
+                            reapply_session_policy(&session.id, &state).await;
                         }
                         Err(e) => {
                             error!(
@@ -1926,14 +2117,14 @@ async fn gateway_monitor(state: Arc<AppState>) {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-
-    let args = Args::parse();
     let base_dir = PathBuf::from(&args.base_dir);
     let socket_path = PathBuf::from(&args.socket);
 
@@ -1986,7 +2177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run networking reconciliation: restart crashed gateways, clean up
     // lingering resources for stopped sessions.
-    reconcile_networking(&state);
+    reconcile_networking(&state).await;
 
     // Spawn background gateway monitor for crash recovery.
     let monitor_state = Arc::clone(&state);
@@ -2001,6 +2192,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let listener = UnixListener::bind(&socket_path)?;
+
     info!(socket = %socket_path.display(), "sandboxd listening");
 
     let app = app(Arc::clone(&state));

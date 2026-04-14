@@ -19,8 +19,8 @@ set -euo pipefail
 LOG_DIR="${LOG_DIR:-/var/log/gateway}"
 READY_TIMEOUT="${READY_TIMEOUT:-30}"
 
-# Ensure the log directory exists (tmpfs mounts wipe it out).
-mkdir -p "${LOG_DIR}"
+# Ensure runtime directories exist (tmpfs mounts wipe them out).
+mkdir -p "${LOG_DIR}" /tmp/mitmproxy
 
 # PIDs of managed processes
 MITM_PID=""
@@ -70,6 +70,23 @@ on_signal() {
 
 trap on_signal SIGTERM SIGINT SIGQUIT
 
+# ── SIGHUP handler: restart Envoy with updated config ──────────────
+
+restart_envoy() {
+    log "Restarting Envoy with updated config..."
+    kill "$ENVOY_PID" 2>/dev/null
+    wait "$ENVOY_PID" 2>/dev/null
+    envoy \
+        -c /etc/envoy/envoy.yaml \
+        --log-level warning \
+        --log-path "${LOG_DIR}/envoy.log" \
+        &
+    ENVOY_PID=$!
+    log "Envoy restarted (PID=${ENVOY_PID})"
+}
+
+trap restart_envoy HUP
+
 # ── Readiness checks ────────────────────────────────────────────────
 
 wait_for_ready() {
@@ -102,10 +119,10 @@ if [[ -f /etc/mitmproxy/policy_addon.py ]]; then
     MITM_ADDON="/etc/mitmproxy/policy_addon.py"
 fi
 
-log "Starting mitmproxy (mitmdump) on 127.0.0.1:8080 (addon=${MITM_ADDON})..."
+log "Starting mitmproxy (mitmdump) on 0.0.0.0:8080 (addon=${MITM_ADDON})..."
 mitmdump \
-    --mode regular \
-    --listen-host 127.0.0.1 \
+    --mode transparent \
+    --listen-host 0.0.0.0 \
     --listen-port 8080 \
     --set stream_large_bodies=1 \
     -s "${MITM_ADDON}" \
@@ -119,6 +136,11 @@ wait_for_ready "mitmproxy" \
     "kill -0 ${MITM_PID} 2>/dev/null && bash -c '</dev/tcp/127.0.0.1/8080' 2>/dev/null"
 
 # ── Start Envoy ─────────────────────────────────────────────────────
+
+# Copy base Envoy config from read-only /opt/envoy into the writable /etc/envoy
+# tmpfs. PolicyDistributor will overwrite this when a policy is applied.
+mkdir -p /etc/envoy
+cp /opt/envoy/envoy-base.yaml /etc/envoy/envoy.yaml
 
 log "Starting Envoy..."
 envoy \
@@ -134,17 +156,18 @@ wait_for_ready "Envoy" "curl -sf http://127.0.0.1:9901/ready"
 # ── Start CoreDNS ───────────────────────────────────────────────────
 
 # Ensure the policy file exists. sandboxd writes the real policy, but
-# CoreDNS needs the file present at startup. An empty file means
-# deny-all (no domains allowed) until sandboxd writes the actual policy.
+# CoreDNS needs the file present at startup. The default is deny-all
+# (empty) so no traffic leaks before sandboxd applies the session policy.
+# For sessions without an explicit policy, sandboxd writes allow-all ("*").
 COREDNS_POLICY_FILE="${COREDNS_POLICY_FILE:-/etc/coredns/policy.conf}"
 if [[ ! -f "$COREDNS_POLICY_FILE" ]]; then
-    log "Creating empty policy file at ${COREDNS_POLICY_FILE} (deny-all until sandboxd writes policy)"
-    echo "# Empty policy — deny all (placeholder until sandboxd writes policy)" > "$COREDNS_POLICY_FILE"
+    log "Creating default deny-all policy at ${COREDNS_POLICY_FILE} (sandboxd will overwrite)"
+    printf '# Default deny-all — sandboxd writes the real policy after gateway starts\n' > "$COREDNS_POLICY_FILE"
 fi
 
 log "Starting CoreDNS..."
 coredns \
-    -conf /etc/coredns/Corefile \
+    -conf /opt/coredns/Corefile \
     >>"${LOG_DIR}/coredns.log" 2>&1 &
 COREDNS_PID=$!
 log "CoreDNS started (PID=${COREDNS_PID})"
@@ -154,7 +177,7 @@ wait_for_ready "CoreDNS" "curl -sf http://127.0.0.1:8180/health"
 # ── All components running ──────────────────────────────────────────
 
 log "All components are running and healthy."
-log "  mitmproxy  PID=${MITM_PID}  (127.0.0.1:8080)"
+log "  mitmproxy  PID=${MITM_PID}  (0.0.0.0:8080)"
 log "  Envoy      PID=${ENVOY_PID}  (0.0.0.0:10000, admin 127.0.0.1:9901)"
 log "  CoreDNS    PID=${COREDNS_PID}  (DNS :53, health :8180)"
 

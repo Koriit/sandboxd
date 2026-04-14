@@ -8,7 +8,7 @@ claude-sandbox provides isolated, policy-controlled sandbox environments for cod
 - **Per-session networking** -- every session gets a dedicated Docker bridge network with a gateway container running the proxy pipeline (Envoy, mitmproxy, CoreDNS).
 - **Policy engine** -- deny-by-default network policies control which destinations a session can reach and at what level of inspection (transport, TLS-verified, or full HTTP inspection).
 - **TLS interception** -- per-session CA certificates enable transparent HTTPS inspection through mitmproxy. The CA is automatically injected into the VM's trust store.
-- **Workspace provisioning** -- clone git repositories, mount host directories via virtio-fs, copy files, or push/pull via git-over-vsock.
+- **Workspace provisioning** -- clone git repositories, mount host directories via 9p, copy files, or push/pull via git-over-vsock.
 - **Guest agent** -- a lightweight agent inside each VM communicates with the host over vsock, enabling command execution, file transfer, and git operations without network access.
 
 ## Architecture

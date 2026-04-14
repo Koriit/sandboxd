@@ -1,84 +1,51 @@
-//! VM networking orchestration — attaches a sandbox VM to its Docker bridge.
+//! VM networking orchestration — configures a sandbox VM's bridge NIC.
 //!
-//! This module coordinates the three-step process of connecting a VM to the
-//! session's isolated network:
+//! With `qemu-bridge-helper`, the NIC is attached to the Docker bridge at
+//! VM boot time by the QEMU wrapper script. This module handles only the
+//! guest-side configuration:
 //!
-//! 1. **TAP device** — created on the host and attached to the Docker bridge
-//! 2. **QMP hot-add** — adds the TAP as a NIC to the running QEMU VM
-//! 3. **Guest config** — configures the new NIC inside the VM with a static IP
+//! 1. **Wait** for the bridge NIC to appear inside the VM (by MAC address)
+//! 2. **Configure** the NIC with a static IP, default route, and DNS
 
 use tracing::info;
 use uuid::Uuid;
 
 use crate::error::SandboxError;
 use crate::guest::{GuestConnector, GuestResponse};
-use crate::network::{NetworkInfo, NetworkManager};
-use crate::qmp::{QmpClient, generate_guest_network_script, mac_from_uuid, tap_name_for_session};
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/// QMP netdev backend ID for the hot-added NIC.
-const NETDEV_ID: &str = "net1";
-
-/// QMP device frontend ID for the hot-added NIC.
-const DEVICE_ID: &str = "nic1";
+use crate::network::NetworkInfo;
+use crate::qmp::{generate_guest_network_script, mac_from_uuid};
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Attach a sandbox VM to its session's Docker bridge network.
+/// Configure the bridge NIC inside a sandbox VM.
 ///
-/// This is the main orchestration function called after the VM has booted
-/// and the guest agent is responsive. It:
+/// The NIC is already present at boot (added by the QEMU wrapper via
+/// `qemu-bridge-helper`). This function configures it with a static IP,
+/// default route through the gateway, and DNS pointing to the gateway's
+/// CoreDNS instance.
 ///
-/// 1. Creates a TAP device on the host, attached to the Docker bridge
-/// 2. Hot-adds the TAP as a NIC to the VM via QMP
-/// 3. Configures the NIC inside the VM via the guest agent
-///
-/// On failure, it attempts to clean up the TAP device.
+/// Called after the VM has booted and the guest agent is responsive.
 pub async fn attach_vm_to_bridge(
     session_id: &Uuid,
     network_info: &NetworkInfo,
-    network_manager: &NetworkManager,
     guest: &GuestConnector,
 ) -> Result<(), SandboxError> {
-    let tap_name = tap_name_for_session(session_id);
     let mac = mac_from_uuid(session_id);
 
     info!(
         session_id = %session_id,
-        tap = %tap_name,
         mac = %mac,
         bridge = %network_info.bridge_name,
         vm_ip = %network_info.vm_ip,
         gateway_ip = %network_info.gateway_ip,
-        "attaching VM to bridge network"
+        "configuring bridge NIC inside VM"
     );
 
-    // Step 1: Create TAP device on host, attached to Docker bridge.
-    let tap_name = network_manager.create_tap(session_id, network_info)?;
-
-    // Step 2: Hot-add the TAP as a NIC via QMP.
-    let qmp = QmpClient::for_session(session_id)?;
-
-    info!(
-        session_id = %session_id,
-        qmp_socket = %qmp.socket_path().display(),
-        "hot-adding NIC via QMP"
-    );
-
-    if let Err(e) = qmp.add_tap_nic(&tap_name, NETDEV_ID, DEVICE_ID, &mac) {
-        // Clean up the TAP on failure.
-        let _ = network_manager.delete_tap(session_id);
-        return Err(SandboxError::Network(format!(
-            "QMP NIC hot-add failed: {e}"
-        )));
-    }
-
-    // Step 3: Configure the NIC inside the VM via the guest agent.
+    // Configure the NIC inside the VM via the guest agent.
+    // The NIC is found by MAC address — it was added at boot by the QEMU
+    // wrapper and should already be visible inside the guest.
     let script =
         generate_guest_network_script(&network_info.gateway_ip, &network_info.vm_ip, &mac);
 
@@ -129,20 +96,19 @@ pub async fn attach_vm_to_bridge(
     Ok(())
 }
 
-/// Detach a sandbox VM from its Docker bridge network by removing the TAP device.
+/// Detach a sandbox VM from its Docker bridge network.
 ///
-/// The TAP deletion is idempotent — if it was already cleaned up, this succeeds.
-/// The in-VM NIC configuration is not cleaned up because the VM is typically
-/// being shut down when this is called.
+/// With `qemu-bridge-helper`, the TAP device is owned by QEMU and is
+/// automatically destroyed when the VM stops. This function is a no-op
+/// but retained for API compatibility during teardown sequences.
 pub fn detach_vm_from_bridge(
     session_id: &Uuid,
-    network_manager: &NetworkManager,
 ) -> Result<(), SandboxError> {
     info!(
         session_id = %session_id,
-        "detaching VM from bridge network"
+        "detaching VM from bridge network (no-op: TAP owned by QEMU)"
     );
-    network_manager.delete_tap(session_id)
+    Ok(())
 }
 
 // ===========================================================================
@@ -154,21 +120,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_constants() {
-        // Verify the QMP IDs are sensible strings.
-        assert_eq!(NETDEV_ID, "net1");
-        assert_eq!(DEVICE_ID, "nic1");
-    }
-
-    #[test]
-    fn test_attach_generates_correct_tap_name() {
-        let id =
-            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
-        let tap = tap_name_for_session(&id);
-        assert_eq!(tap, "tap-sb-550e84");
-    }
-
-    #[test]
     fn test_attach_generates_correct_mac() {
         let id =
             Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
@@ -177,12 +128,10 @@ mod tests {
     }
 
     #[test]
-    fn test_detach_uses_correct_tap_name() {
-        // Verify that detach would use the same TAP name as attach.
+    fn test_detach_is_noop() {
         let id = Uuid::new_v4();
-        let tap_attach = tap_name_for_session(&id);
-        let tap_detach = tap_name_for_session(&id);
-        assert_eq!(tap_attach, tap_detach);
+        // detach should always succeed (it's a no-op).
+        assert!(detach_vm_from_bridge(&id).is_ok());
     }
 
     #[test]

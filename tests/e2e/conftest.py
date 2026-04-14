@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-import signal
+import stat
 import subprocess
 import time
 from dataclasses import dataclass
@@ -23,6 +23,173 @@ SANDBOX_BIN = CARGO_WORKSPACE / "target" / "debug" / "sandbox"
 
 # Maximum time to wait for the daemon socket to appear (seconds).
 DAEMON_STARTUP_TIMEOUT = 10
+
+# Paths to check for qemu-bridge-helper.
+QEMU_BRIDGE_HELPER_PATHS = [
+    Path("/usr/lib/qemu/qemu-bridge-helper"),
+    Path("/usr/libexec/qemu-bridge-helper"),
+]
+
+BRIDGE_CONF_PATH = Path("/etc/qemu/bridge.conf")
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight prerequisite checks
+# ---------------------------------------------------------------------------
+
+def _find_qemu_bridge_helper() -> Path | None:
+    """Return the first existing qemu-bridge-helper path, or None."""
+    for p in QEMU_BRIDGE_HELPER_PATHS:
+        if p.exists():
+            return p
+    return None
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _preflight_checks():
+    """Verify that all host prerequisites are met before running any test.
+
+    Each check produces a clear, actionable skip message so the developer
+    knows exactly what to install or configure.
+    """
+    # 1. Docker accessible
+    try:
+        subprocess.run(
+            ["docker", "info"],
+            capture_output=True, timeout=30, check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        pytest.skip(
+            "Docker not accessible. Install Docker and ensure the current "
+            "user is in the docker group (then re-login)."
+        )
+
+    # 2. KVM available
+    kvm = Path("/dev/kvm")
+    if not kvm.exists():
+        pytest.skip(
+            "/dev/kvm not found. Enable KVM in your kernel / BIOS, or "
+            "load the kvm module: sudo modprobe kvm_intel  (or kvm_amd)."
+        )
+    if not os.access(kvm, os.R_OK):
+        pytest.skip(
+            "/dev/kvm exists but is not readable by the current user. "
+            "Add your user to the kvm group: sudo usermod -aG kvm $USER"
+        )
+
+    # 3. Lima installed
+    try:
+        subprocess.run(
+            ["limactl", "--version"],
+            capture_output=True, timeout=15, check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        pytest.skip(
+            "Lima not installed. Install limactl: "
+            "https://lima-vm.io/docs/installation/"
+        )
+
+    # 4. Gateway image exists
+    try:
+        subprocess.run(
+            ["docker", "image", "inspect", "sandbox-gateway"],
+            capture_output=True, timeout=30, check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        pytest.skip(
+            "Docker image 'sandbox-gateway' not found. Build it with: "
+            "make gateway-image"
+        )
+
+    # 5. qemu-bridge-helper installed
+    helper = _find_qemu_bridge_helper()
+    if helper is None:
+        searched = ", ".join(str(p) for p in QEMU_BRIDGE_HELPER_PATHS)
+        pytest.skip(
+            f"qemu-bridge-helper not found (checked: {searched}). "
+            "Install the qemu-system-x86 (or qemu-utils) package."
+        )
+
+    # 6. qemu-bridge-helper has setuid bit
+    helper_stat = helper.stat()
+    if not (helper_stat.st_mode & stat.S_ISUID):
+        pytest.skip(
+            f"qemu-bridge-helper at {helper} is missing the setuid bit. "
+            f"Run: sudo chmod u+s {helper}"
+        )
+
+    # 7. bridge.conf exists
+    if not BRIDGE_CONF_PATH.exists():
+        pytest.skip(
+            f"{BRIDGE_CONF_PATH} not found. Create it with: "
+            f"sudo mkdir -p {BRIDGE_CONF_PATH.parent} && "
+            f'echo "allow br0" | sudo tee {BRIDGE_CONF_PATH}'
+        )
+
+    # 8. Clean up stale sandbox resources from previous runs to prevent
+    #    Docker subnet pool overlap errors.
+    try:
+        stale_containers = subprocess.run(
+            ["docker", "ps", "-a", "--filter", "name=sandbox-",
+             "--format", "{{.Names}}"],
+            capture_output=True, text=True, timeout=15,
+        )
+        for name in stale_containers.stdout.strip().splitlines():
+            if name:
+                subprocess.run(
+                    ["docker", "rm", "-f", name],
+                    capture_output=True, timeout=30,
+                )
+    except Exception:
+        pass
+
+    try:
+        stale_networks = subprocess.run(
+            ["docker", "network", "ls", "--filter", "name=sandbox-",
+             "--format", "{{.Name}}"],
+            capture_output=True, text=True, timeout=15,
+        )
+        for name in stale_networks.stdout.strip().splitlines():
+            if name:
+                subprocess.run(
+                    ["docker", "network", "rm", name],
+                    capture_output=True, timeout=30,
+                )
+    except Exception:
+        pass
+
+    try:
+        lima_vms = subprocess.run(
+            ["limactl", "list", "--json"],
+            capture_output=True, text=True, timeout=30,
+        )
+        for line in (lima_vms.stdout or "").strip().splitlines():
+            try:
+                entry = json.loads(line)
+                vm_name = entry.get("name", "")
+                if vm_name.startswith("sandbox-"):
+                    subprocess.run(
+                        ["limactl", "delete", "--force", vm_name],
+                        capture_output=True, timeout=60,
+                    )
+            except json.JSONDecodeError:
+                pass
+    except Exception:
+        pass
+
+    # Also remove orphan ~/.lima/sandbox-* directories that are not tracked
+    # by limactl (e.g. from hard crashes or incomplete teardowns).  These
+    # cause "open .../lima.yaml: no such file or directory" on subsequent
+    # runs when limactl tries to reuse the stale instance directory.
+    try:
+        lima_dir = Path.home() / ".lima"
+        if lima_dir.is_dir():
+            for entry in lima_dir.iterdir():
+                if entry.is_dir() and entry.name.startswith("sandbox-"):
+                    import shutil
+                    shutil.rmtree(entry, ignore_errors=True)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +316,7 @@ def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path: Path):
 
     # Send SIGTERM and wait for graceful shutdown.
     if proc.poll() is None:
-        proc.send_signal(signal.SIGTERM)
+        proc.terminate()
         try:
             proc.wait(timeout=15)
         except subprocess.TimeoutExpired:
@@ -165,6 +332,38 @@ def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path: Path):
             )
         except Exception:
             pass
+
+    # Force-remove any leftover Docker containers and networks so they don't
+    # block subsequent tests with subnet-pool overlap errors.
+    try:
+        containers = subprocess.run(
+            ["docker", "ps", "-a", "--filter", "name=sandbox-",
+             "--format", "{{.Names}}"],
+            capture_output=True, text=True, timeout=15,
+        )
+        for name in containers.stdout.strip().splitlines():
+            if name:
+                subprocess.run(
+                    ["docker", "rm", "-f", name],
+                    capture_output=True, timeout=30,
+                )
+    except Exception:
+        pass
+
+    try:
+        networks = subprocess.run(
+            ["docker", "network", "ls", "--filter", "name=sandbox-",
+             "--format", "{{.Name}}"],
+            capture_output=True, text=True, timeout=15,
+        )
+        for name in networks.stdout.strip().splitlines():
+            if name:
+                subprocess.run(
+                    ["docker", "network", "rm", name],
+                    capture_output=True, timeout=30,
+                )
+    except Exception:
+        pass
 
 
 @pytest.fixture

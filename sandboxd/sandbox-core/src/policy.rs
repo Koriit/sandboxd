@@ -469,9 +469,16 @@ impl PolicyCompiler {
             }
         }
 
-        // If no allow rules, return an empty string — the base deny-all is
-        // sufficient.
-        if allow_rules.is_empty() {
+        // If no *real* allow rules (excluding comment placeholders for
+        // unresolved domains), return an empty string — the base deny-all
+        // forward chain is sufficient.  Domain-only policies will rely on
+        // the existing `sandbox` forward chain until the DNS propagation
+        // loop resolves IPs and injects real rules via
+        // `generate_domain_ip_rules`.
+        let has_real_rules = allow_rules
+            .iter()
+            .any(|r| !r.trim_start().starts_with('#'));
+        if !has_real_rules {
             return String::new();
         }
 
@@ -581,7 +588,20 @@ impl PolicyCompiler {
             ));
         }
 
-        // Level 3 (full): SNI-matched chains → mitmproxy.
+        // Level 3 (full): SNI-matched chains → original_dst (passthrough).
+        //
+        // L3 traffic is redirected to mitmproxy at the nftables level
+        // (sandbox_l3 DNAT rules) which preserves SO_ORIGINAL_DST.
+        // Envoy MUST NOT route L3 traffic to the mitmproxy cluster
+        // directly because Envoy creates a new TCP connection to
+        // 127.0.0.1:8080, destroying the conntrack entry — mitmproxy's
+        // SO_ORIGINAL_DST then returns its own address and the request
+        // fails with "destination unknown".
+        //
+        // During the brief window before DNS propagation installs the
+        // sandbox_l3 rules (first ~2 seconds), L3 traffic falls through
+        // to Envoy and gets passthrough to the real server.  Once the
+        // sandbox_l3 rules are in place, traffic bypasses Envoy entirely.
         for rule in policy.rules.iter().filter(|r| r.level == AssuranceLevel::Full) {
             let domain = rule.destination.to_string();
             let stat_name = Self::sanitize_stat_prefix(&domain);
@@ -592,7 +612,7 @@ impl PolicyCompiler {
             - name: envoy.filters.network.tcp_proxy
               typed_config:
                 "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
-                cluster: mitmproxy
+                cluster: original_dst
                 stat_prefix: level3_{stat_name}"#
             ));
         }
@@ -627,22 +647,9 @@ impl PolicyCompiler {
                 .to_string(),
         );
 
-        if has_full {
-            clusters.push(
-                r#"    - name: mitmproxy
-      type: STATIC
-      load_assignment:
-        cluster_name: mitmproxy
-        endpoints:
-          - lb_endpoints:
-              - endpoint:
-                  address:
-                    socket_address:
-                      address: 127.0.0.1
-                      port_value: 8080"#
-                    .to_string(),
-            );
-        }
+        // Note: the mitmproxy cluster is no longer needed in Envoy.
+        // L3 traffic reaches mitmproxy via nftables sandbox_l3 DNAT
+        // rules (which preserve SO_ORIGINAL_DST), not through Envoy.
 
         let clusters_yaml = clusters.join("\n");
 
@@ -1382,6 +1389,33 @@ mod tests {
     }
 
     #[test]
+    fn compile_domain_only_policy_skips_sandbox_policy_table() {
+        // A policy with only domain-based rules (no CIDRs) should NOT create
+        // the sandbox_policy table, because the only entries in allow_rules
+        // are comment placeholders.  The base forward chain allows forwarding
+        // until the DNS propagation loop resolves IPs and injects real rules.
+        let policy = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![PolicyRule {
+                destination: Destination::Domain("github.com".to_string()),
+                level: AssuranceLevel::Transport,
+                protocol: Protocol::Https,
+                constraints: None,
+                reason: Some("GitHub access".to_string()),
+            }],
+        };
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        assert!(
+            compiled.nftables_rules.is_empty(),
+            "domain-only policy should not produce sandbox_policy table; \
+             got: {}",
+            compiled.nftables_rules
+        );
+    }
+
+    #[test]
     fn compile_level1_nftables_allows_dns() {
         let policy = transport_policy();
         let net = test_network_info();
@@ -2075,19 +2109,18 @@ mod tests {
     }
 
     #[test]
-    fn compile_level2_nftables_includes_domains() {
+    fn compile_level2_domain_only_produces_no_nftables() {
         let policy = tls_policy();
         let net = test_network_info();
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
-        // Domain rules produce placeholder comments in nftables.
+        // Domain-only policies produce no sandbox_policy table; the DNS
+        // propagation loop will inject real rules once IPs are resolved.
         assert!(
-            compiled.nftables_rules.contains("# domain: secure.example.com"),
-            "nftables should contain L2 domain placeholder"
-        );
-        assert!(
-            compiled.nftables_rules.contains("(level: tls"),
-            "nftables placeholder should indicate tls level"
+            compiled.nftables_rules.is_empty(),
+            "TLS domain-only policy should not produce sandbox_policy table; \
+             got: {}",
+            compiled.nftables_rules
         );
     }
 
@@ -2108,7 +2141,7 @@ mod tests {
     }
 
     #[test]
-    fn compile_level3_envoy_routes_to_mitmproxy() {
+    fn compile_level3_envoy_routes_to_original_dst() {
         let policy = full_policy();
         let net = test_network_info();
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
@@ -2117,9 +2150,16 @@ mod tests {
             compiled.envoy_config.contains("server_names: [\"inspected.example.com\"]"),
             "L3 Envoy config must have SNI match for the inspected domain"
         );
+        // L3 traffic routes to original_dst (passthrough) in Envoy.
+        // The actual redirect to mitmproxy happens at the nftables
+        // level (sandbox_l3 DNAT rules) to preserve SO_ORIGINAL_DST.
         assert!(
-            compiled.envoy_config.contains("cluster: mitmproxy"),
-            "L3 filter chain must route to mitmproxy cluster"
+            compiled.envoy_config.contains("cluster: original_dst"),
+            "L3 filter chain must route to original_dst (mitmproxy redirect is via nftables)"
+        );
+        assert!(
+            !compiled.envoy_config.contains("cluster: mitmproxy"),
+            "L3 filter chain must NOT route to mitmproxy cluster (breaks SO_ORIGINAL_DST)"
         );
         assert!(
             compiled.envoy_config.contains("level3_inspected_example_com"),
@@ -2128,26 +2168,16 @@ mod tests {
     }
 
     #[test]
-    fn compile_level3_envoy_has_mitmproxy_cluster() {
+    fn compile_level3_envoy_no_mitmproxy_cluster() {
         let policy = full_policy();
         let net = test_network_info();
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
+        // mitmproxy cluster should not be in Envoy config — L3 traffic
+        // reaches mitmproxy via nftables sandbox_l3 DNAT rules, not Envoy.
         assert!(
-            compiled.envoy_config.contains("name: mitmproxy"),
-            "L3 Envoy config must define mitmproxy cluster"
-        );
-        assert!(
-            compiled.envoy_config.contains("type: STATIC"),
-            "mitmproxy cluster must be STATIC type"
-        );
-        assert!(
-            compiled.envoy_config.contains("port_value: 8080"),
-            "mitmproxy cluster must point to port 8080"
-        );
-        assert!(
-            compiled.envoy_config.contains("address: 127.0.0.1"),
-            "mitmproxy cluster must point to 127.0.0.1"
+            !compiled.envoy_config.contains("name: mitmproxy"),
+            "L3 Envoy config must not define mitmproxy cluster"
         );
     }
 
@@ -2278,7 +2308,7 @@ mod tests {
     }
 
     #[test]
-    fn compile_mixed_l1_l2_l3_envoy_has_both_clusters() {
+    fn compile_mixed_l1_l2_l3_envoy_has_original_dst_cluster() {
         let policy = mixed_l1_l2_l3_policy();
         let net = test_network_info();
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
@@ -2287,9 +2317,10 @@ mod tests {
             compiled.envoy_config.contains("name: original_dst"),
             "mixed policy must have original_dst cluster"
         );
+        // mitmproxy cluster is no longer in Envoy — L3 redirects via nftables.
         assert!(
-            compiled.envoy_config.contains("name: mitmproxy"),
-            "mixed policy must have mitmproxy cluster"
+            !compiled.envoy_config.contains("name: mitmproxy"),
+            "mixed policy must not have mitmproxy cluster (L3 via nftables)"
         );
     }
 
@@ -2325,15 +2356,20 @@ mod tests {
     }
 
     #[test]
-    fn compile_mixed_l1_l2_l3_nftables_includes_all_allowed() {
+    fn compile_mixed_l1_l2_l3_domain_only_produces_no_nftables() {
         let policy = mixed_l1_l2_l3_policy();
         let net = test_network_info();
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
-        // All non-deny domain rules produce nftables placeholders.
-        assert!(compiled.nftables_rules.contains("# domain: github.com"));
-        assert!(compiled.nftables_rules.contains("# domain: pinned.example.com"));
-        assert!(compiled.nftables_rules.contains("# domain: monitored.example.com"));
+        // All rules are domain-based (no CIDRs), so only comment placeholders
+        // are generated.  The sandbox_policy table should NOT be created;
+        // the DNS propagation loop injects real rules once IPs are resolved.
+        assert!(
+            compiled.nftables_rules.is_empty(),
+            "mixed domain-only policy should not produce sandbox_policy table; \
+             got: {}",
+            compiled.nftables_rules
+        );
     }
 
     // -- Edge cases: wildcard domains in SNI -----------------------------------
@@ -2385,8 +2421,12 @@ mod tests {
             "wildcard domain should appear in L3 SNI match"
         );
         assert!(
-            compiled.envoy_config.contains("cluster: mitmproxy"),
-            "wildcard L3 chain must route to mitmproxy"
+            compiled.envoy_config.contains("cluster: original_dst"),
+            "wildcard L3 chain must route to original_dst (mitmproxy redirect via nftables)"
+        );
+        assert!(
+            !compiled.envoy_config.contains("cluster: mitmproxy"),
+            "wildcard L3 chain must not route to mitmproxy cluster"
         );
         assert!(
             compiled.envoy_config.contains("level3_wildcard_inspected_io"),
@@ -2463,9 +2503,11 @@ mod tests {
         let net = test_network_info();
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
-        // Both L3 destinations get SNI chains to mitmproxy.
+        // Both L3 destinations get SNI chains to original_dst (L3 redirect via nftables).
         assert!(compiled.envoy_config.contains("server_names: [\"api.one.com\"]"));
         assert!(compiled.envoy_config.contains("server_names: [\"api.two.com\"]"));
+        assert!(!compiled.envoy_config.contains("cluster: mitmproxy"),
+            "L3 filter chains must not route to mitmproxy cluster");
 
         // mitmproxy config has rules for both.
         let config: MitmproxyConfig =

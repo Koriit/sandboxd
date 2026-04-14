@@ -28,6 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         gnupg \
+        nftables \
         procps \
         wget \
     && mkdir -p /etc/apt/keyrings \
@@ -53,12 +54,16 @@ RUN curl -fsSL "https://downloads.mitmproxy.org/${MITMPROXY_VERSION}/mitmproxy-$
 
 # ---------- create runtime directories ----------
 RUN mkdir -p /var/log/gateway /var/run/gateway /tmp/gateway \
-    && mkdir -p /etc/envoy /etc/coredns /etc/mitmproxy
+    && mkdir -p /etc/envoy /etc/coredns /etc/mitmproxy \
+    && mkdir -p /opt/envoy
 
 # ---------- copy configuration files ----------
 # Build context is networking/ (parent of gateway/)
+# Base Envoy config goes to /opt/envoy/ (read-only) since /etc/envoy is a
+# tmpfs at runtime. The entrypoint copies it into /etc/envoy on startup.
+COPY envoy/envoy-base.yaml /opt/envoy/envoy-base.yaml
 COPY envoy/envoy-base.yaml /etc/envoy/envoy.yaml
-COPY gateway/Corefile /etc/coredns/Corefile
+COPY gateway/Corefile /opt/coredns/Corefile
 COPY mitmproxy/passthrough_addon.py /etc/mitmproxy/passthrough_addon.py
 COPY mitmproxy/policy_addon.py /etc/mitmproxy/policy_addon.py
 COPY gateway/entrypoint.sh /entrypoint.sh

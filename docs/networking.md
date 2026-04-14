@@ -10,7 +10,16 @@ Every sandbox session gets an isolated network stack with:
 - **Gateway container** -- a Docker container running the proxy pipeline (Envoy, mitmproxy, CoreDNS) that mediates all outbound traffic from the VM.
 - **DNS interception** -- all DNS queries from the VM are redirected to a CoreDNS instance inside the gateway, regardless of what resolver the application tries to use.
 - **TLS interception** -- a per-session CA certificate is generated at session creation time. mitmproxy uses it to inspect HTTPS traffic. The CA public certificate is injected into the VM's trust store so applications accept the intercepted connections transparently.
-- **nftables firewall** -- deny-by-default rules in the gateway's network namespace block all traffic until the full pipeline is ready, then DNAT rules redirect traffic into the proxy pipeline.
+- **nftables firewall** -- deny-by-default rules in the gateway container block all traffic until the full pipeline is ready, then DNAT rules redirect traffic into the proxy pipeline. Rules are managed via `docker exec` (the container has `CAP_NET_ADMIN`), not via sudo/nft on the host.
+
+The nftables configuration uses four tables:
+
+| Table | Purpose |
+|-------|---------|
+| `sandbox` | Deny-all base rules (forward chain drops all traffic) |
+| `sandbox_dnat` | NAT routing (PREROUTING DNAT: DNS to CoreDNS, TCP to Envoy) |
+| `sandbox_policy` | DNS-resolved IP allow rules (created by the DNS propagation loop) |
+| `sandbox_l3` | L3 MITM DNAT for full-inspection destinations (redirects HTTPS to mitmproxy) |
 
 The VM has no way to bypass this pipeline. Its single network interface routes through the gateway, and there are no alternate paths out.
 
@@ -25,7 +34,7 @@ The VM has no way to bypass this pipeline. Its single network interface routes t
 |  eth1 (virtio-net, data plane)     eth0 (management, Lima SSH)    |
 +-------|-----------------------------------------------------------+
         |
-        |  TAP device on host
+        |  TAP device (created by qemu-bridge-helper)
         v
 +------------------------------------------------------------------+
 |  Docker bridge  (sandbox-net-{session_id})                        |
@@ -53,9 +62,9 @@ The VM has no way to bypass this pipeline. Its single network interface routes t
 
 **Key points:**
 
-- The VM's data NIC (hot-added after boot via QMP) connects to the Docker bridge through a TAP device on the host.
+- The VM's data NIC is attached to the Docker bridge at boot time via `qemu-bridge-helper`, which creates a TAP device and connects it to the bridge. No host-side TAP/veth creation code exists in sandboxd. For rootless Docker, the bridge lives inside rootlesskit's network namespace, so an `nsenter` wrapper runs `qemu-bridge-helper` inside the namespace.
 - The gateway container sits on the same bridge, receiving all forwarded traffic from the VM.
-- nftables PREROUTING DNAT rules intercept the forwarded traffic and redirect it into the pipeline components.
+- nftables rules are managed via `docker exec` inside the gateway container (which has `CAP_NET_ADMIN`). PREROUTING DNAT rules intercept the forwarded traffic and redirect it into the pipeline components.
 - The gateway's own outbound connections (Envoy forwarding to real destinations) follow standard Docker NAT to reach the internet.
 
 ## Per-session network
@@ -193,14 +202,13 @@ When a session is created, sandboxd performs these steps in order:
 1. Generate per-session CA certificate.
 2. Create Docker bridge network (`sandbox-net-{id}`) with a /28 subnet.
 3. Start gateway container (`sandbox-gw-{id}`) on the bridge, with CA files mounted.
-4. Inject deny-all nftables rules into the gateway's network namespace (immediate, before any component is ready).
+4. Inject deny-all nftables rules via `docker exec` into the gateway container (immediate, before any component is ready).
 5. Wait for all gateway components to become ready (mitmproxy, Envoy, CoreDNS).
-6. Inject DNAT rules (traffic routing starts only after all components are healthy).
-7. Create a TAP device on the host, attached to the Docker bridge.
-8. Hot-add the TAP as a NIC to the running VM via QMP.
-9. Configure the NIC inside the VM with a static IP and default route to the gateway.
-10. Inject the CA certificate into the VM's trust store.
-11. Store network info in the database.
+6. Inject DNAT rules via `docker exec` (traffic routing starts only after all components are healthy).
+7. Boot the VM with a bridge NIC attached via `qemu-bridge-helper` (the TAP device is created automatically by the helper and owned by QEMU).
+8. Configure the NIC inside the VM with a static IP and default route to the gateway.
+9. Inject the CA certificate into the VM's trust store.
+10. Store network info in the database.
 
 If any step fails, all preceding steps are rolled back (gateway stopped, network deleted, CA removed).
 
@@ -208,7 +216,7 @@ If any step fails, all preceding steps are rolled back (gateway stopped, network
 
 On stop, networking is torn down in reverse order (best-effort, errors are logged but do not block):
 
-1. Detach the VM from the bridge (remove TAP device).
+1. Stop the VM (the TAP device, owned by QEMU, is destroyed automatically).
 2. Stop and remove the gateway container.
 3. Remove the Docker bridge network.
 
@@ -220,17 +228,16 @@ When a stopped session is started again, sandboxd recreates the networking infra
 
 1. Recreate the Docker bridge network with the stored subnet.
 2. Create a new gateway container with the existing CA files.
-3. Inject nftables rules and wait for component readiness.
-4. Reattach the VM to the bridge.
+3. Inject nftables rules via `docker exec` and wait for component readiness.
+4. Boot the VM (the bridge NIC is reattached via `qemu-bridge-helper`).
 5. Re-inject the CA certificate into the VM.
 
 ### Remove
 
 Full teardown -- all resources are released:
 
-1. Tear down networking (TAP, gateway, bridge).
-2. Delete the Docker network and release the subnet allocation back to the pool.
-3. Delete the CA certificate files from disk.
+1. Stop the VM and gateway container, remove the Docker bridge network, and release the subnet allocation back to the pool.
+2. Delete the CA certificate files from disk.
 
 ## Gateway health
 
@@ -363,14 +370,10 @@ docker exec sandbox-gw-{session_id} cat /var/log/gateway/coredns.log
 
 ### Inspect nftables rules
 
-nftables rules live in the gateway container's network namespace. To inspect them:
+nftables rules are managed via `docker exec` inside the gateway container (which has `CAP_NET_ADMIN`). To inspect them:
 
 ```bash
-# Get the container PID
-PID=$(docker inspect --format '{{.State.Pid}}' sandbox-gw-{session_id})
-
-# List all rules
-sudo nsenter --net=/proc/$PID/ns/net nft list ruleset
+docker exec sandbox-gw-{session_id} nft list ruleset
 ```
 
 ### Check Docker network
@@ -410,8 +413,7 @@ docker network inspect sandbox-net-{session_id}
 
 3. **Check nftables rules.** If the DNAT rules are missing (e.g., after a crash), traffic will hit the deny-all rules and be rejected.
    ```bash
-   PID=$(docker inspect --format '{{.State.Pid}}' sandbox-gw-{session_id})
-   sudo nsenter --net=/proc/$PID/ns/net nft list ruleset
+   docker exec sandbox-gw-{session_id} nft list ruleset
    ```
    Look for the `sandbox_dnat` table with PREROUTING rules. If missing, restart the session.
 
@@ -508,4 +510,4 @@ journalctl -u sandboxd  # If running as a systemd service
 # Or check wherever sandboxd logs are directed
 ```
 
-The error will indicate which step failed (CA generation, network creation, gateway creation, TAP attachment, QMP hot-add, guest configuration, or CA injection).
+The error will indicate which step failed (CA generation, network creation, gateway creation, VM boot, guest NIC configuration, or CA injection).

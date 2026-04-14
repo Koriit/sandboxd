@@ -61,8 +61,8 @@ API equivalent:
 ## Shared mount
 
 Shared mount mode exposes a host directory directly inside the VM using
-Lima's virtiofs (virtio-fs) mount support.  File changes are
-bidirectional and visible immediately on both sides.
+Lima's 9p mount support.  File changes are bidirectional and visible
+immediately on both sides.
 
 ### Usage
 
@@ -92,8 +92,8 @@ API equivalent:
   time.  The CLI and daemon validate this before starting the VM.
 - The host directory is mounted at `/home/agent/workspace` inside the
   VM, writable by the guest.
-- The mount uses Lima's `virtiofs` mount type, which provides better
-  performance than the default reverse-sshfs or 9p options.
+- The mount uses Lima's `9p` mount type, which is built into QEMU and
+  compatible with the seccomp sandbox in hardened mode.
 - Changes made by the guest are **immediately visible** on the host, and
   vice versa.  There is no synchronization delay.
 - `--workspace` is **mutually exclusive** with `--repo`.  Use one or the
@@ -101,16 +101,15 @@ API equivalent:
 
 ### Security considerations
 
-Shared mount mode adds a virtio-fs device to the VM.  This **expands
+Shared mount mode adds a 9p filesystem device to the VM.  This **expands
 the attack surface** compared to a fully isolated session:
 
 1. **Host filesystem exposure.** The guest has read-write access to the
    mounted host directory.  A malicious or compromised process in the VM
    could modify or delete host files within that directory.
 
-2. **virtio-fs device.** The virtiofs implementation is a kernel-level
-   component.  While mature, it represents additional code running in
-   the host kernel that is reachable from the guest.
+2. **9p device.** The 9p filesystem server runs inside the QEMU process.
+   While mature, it represents additional code reachable from the guest.
 
 3. **No network policy bypass.** The shared mount does not affect
    network isolation.  Gateway policies still apply normally.

@@ -31,7 +31,7 @@ This document provides a high-level overview of claude-sandbox's architecture fo
 Inside each VM:
                +-----------------+
                |  sandbox-guest  |
-               |  (vsock agent)  |
+               |  (TCP agent)    |
                +-----------------+
 ```
 
@@ -42,7 +42,7 @@ The central process that manages the full sandbox lifecycle. It listens on a Uni
 **Responsibilities:**
 - Create, start, stop, and remove sessions.
 - Manage Lima VMs (create, start, stop, delete).
-- Set up and tear down per-session networking (Docker bridge, gateway container, TAP device, QMP NIC hot-add).
+- Set up and tear down per-session networking (Docker bridge, gateway container, bridge NIC via `qemu-bridge-helper`).
 - Generate and inject per-session CA certificates.
 - Compile and distribute network policies to gateway components.
 - Relay command execution, file transfer, and git operations to the guest agent.
@@ -52,7 +52,7 @@ The central process that manages the full sandbox lifecycle. It listens on a Uni
 **Key modules (in sandbox-core):**
 - `SessionStore` -- SQLite-backed session persistence.
 - `LimaManager` -- drives `limactl` for VM lifecycle operations.
-- `GuestConnector` -- communicates with the guest agent over vsock (via `limactl shell`).
+- `GuestConnector` -- communicates with the guest agent over TCP via SSH tunnel (`limactl shell ... socat - TCP:127.0.0.1:5123`).
 - `NetworkManager` -- manages Docker bridge networks and subnet allocation.
 - `GatewayManager` -- creates and monitors gateway containers.
 - `CaManager` -- generates and manages per-session CA certificates.
@@ -73,7 +73,7 @@ A thin client that builds HTTP requests and sends them to the daemon over the Un
 
 ### sandbox-guest (VM agent)
 
-A lightweight binary running inside each VM that listens on a vsock socket. The daemon communicates with it through `limactl shell` to execute commands, transfer files, and relay git operations.
+A lightweight binary running inside each VM that listens on TCP port 5123 (localhost only). The daemon communicates with it through `limactl shell` (SSH tunnel) piped to `socat` to bridge stdin/stdout to the agent's TCP port. Lima does not support kernel AF_VSOCK, so TCP-over-SSH is used instead.
 
 **Supported operations:**
 - Ping (liveness check)
@@ -128,16 +128,16 @@ A session moves through these states:
 2. **Lima VM.** A QEMU/KVM virtual machine is created and booted via `limactl`. An auto-generated Lima YAML template configures CPU, memory, disk, and firmware settings. If `--template` is provided, the custom template is used instead.
 3. **Guest agent.** The `sandbox-guest` binary is copied into the VM and started. The daemon verifies connectivity with a ping.
 4. **State transition.** Session state moves to `Running`.
-5. **Networking.** A per-session Docker bridge, gateway container, and TAP device are created. The VM's NIC is hot-added via QMP. The per-session CA certificate is generated and injected into the VM's trust store.
+5. **Networking.** A per-session Docker bridge and gateway container are created. The VM's bridge NIC is attached at boot time via `qemu-bridge-helper` (no QMP hot-add). The per-session CA certificate is generated and injected into the VM's trust store.
 6. **Policy.** If `--policy` was provided, the policy is compiled and distributed to gateway components. A DNS propagation loop is started.
-7. **Workspace.** If `--repo` was provided, the repository is cloned into `/root/workspace/`. If `--workspace shared:<path>` was provided, the host directory is mounted via virtio-fs.
+7. **Workspace.** If `--repo` was provided, the repository is cloned into `/root/workspace/`. If `--workspace shared:<path>` was provided, the host directory is mounted via 9p.
 8. **Boot command.** If `--boot-cmd` was provided, it is executed via the guest agent.
 
 ### Stop
 
 1. Cancel the DNS propagation loop.
-2. Tear down networking (remove TAP device, stop gateway container, remove Docker bridge). The subnet allocation and CA certificate are preserved.
-3. Stop the Lima VM.
+2. Stop the Lima VM (the TAP device, owned by QEMU, is destroyed automatically).
+3. Tear down networking (stop gateway container, remove Docker bridge). The subnet allocation and CA certificate are preserved.
 4. Session state moves to `Stopped`.
 
 ### Start (resume)
@@ -171,7 +171,7 @@ sandbox exec my-vm -- ls /root
 sandboxd receives request
     |
     +-- GuestConnector.exec(session_id, "ls", ["/root"])
-    |       (via limactl shell -> vsock -> guest agent)
+    |       (via limactl shell -> SSH -> socat -> TCP:5123 -> guest agent)
     v
 sandbox-guest executes "ls /root"
     |
