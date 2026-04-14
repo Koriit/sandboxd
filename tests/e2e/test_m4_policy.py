@@ -13,6 +13,7 @@ and are SLOW (3-10 minutes per test).  Run with generous timeouts:
 from __future__ import annotations
 
 import re
+import subprocess
 import time
 
 import pytest

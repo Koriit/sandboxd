@@ -67,23 +67,28 @@ All 10 milestones delivered:
 7. **Source doc comments** still said "virtio-fs" in 3 files — updated to "9p".
 8. **"git-over-vsock" naming** — renamed to "git remote transport" throughout workspaces.md.
 
-## Deferred Items
+## Deferred Items Resolved (M85-S5)
 
-These require structural refactoring beyond the review scope:
+All 4 deferred items from the review have been resolved:
 
-1. **Blocking I/O on async threads** — All `std::process::Command` calls run on tokio executor threads without `spawn_blocking`. Works at current scale but will become a bottleneck with concurrent sessions.
-2. **Duplicated CA injection logic** — ~50 lines duplicated between `setup_session_networking` and `restore_session_networking` in main.rs.
-3. **Git remote tests don't test actual transport** — Both `test_git_push_from_vm` and `test_git_pull_to_vm` only test in-VM git operations, not the host-to-VM daemon endpoint.
-4. **sandboxd daemon binary has zero unit tests** — HTTP handlers, error mapping, and session lifecycle orchestration are only covered by E2E tests.
+1. **Blocking I/O on async threads** — All `std::process::Command` calls in HTTP handlers wrapped in `tokio::task::spawn_blocking`. Handlers use match on `Ok(Ok(v))/Ok(Err(e))/Err(e)` pattern since `impl IntoResponse` doesn't support `?`.
+2. **Duplicated CA injection logic** — Extracted `inject_ca_into_vm` async helper called from both `setup_session_networking` and `restore_session_networking`.
+3. **Git remote tests don't test actual transport** — Rewritten to use proper `git-remote-sandbox` remote helper with `sandbox::` URLs. Tests exercise real host-to-VM git push/fetch through the daemon via SSH tunnel.
+4. **sandboxd daemon binary has zero unit tests** — Added 15 unit tests covering `error_response` status code mapping, JSON body serialization, and utility functions.
+
+### Additional improvements (M85-S5)
+
+- **Proper git remote helper** — Replaced `ext::` transport (blocked by modern git) with `git-remote-sandbox` implementing the git remote helper protocol. Uses `connect` capability with bidirectional SSH transport via `sandbox ssh`.
+- **5 new CLI unit tests** — URL parsing for the remote helper (`parse_remote_helper_url`).
 
 ## Final Numbers
 
 | Metric | Value |
 |--------|-------|
-| Unit tests | 385 passing, 5 ignored |
-| E2E tests | 30 passing (verified in prior session) |
+| Unit tests | 405 passing, 5 ignored |
+| E2E tests | 30 passing |
 | Tautological tests removed | 7 |
 | Stale doc references fixed | 15+ |
 | Bug fixes | 1 (envoy_written) |
 | Security fixes | 1 (shell quoting) |
-| Deferred items | 4 |
+| Deferred items resolved | 4/4 |

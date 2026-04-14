@@ -1,6 +1,11 @@
 """E2E tests for M5-S2 git remote transport: verifying the git protocol
 relay between host and sandbox VM via the daemon's git endpoint.
 
+These tests exercise the ``git-remote-sandbox`` remote helper (invoked
+automatically by git for ``sandbox::`` URLs), proving that host-to-VM
+git push/fetch works end-to-end via the daemon's ``POST /sessions/{id}/git``
+endpoint.
+
 These tests boot real Lima/QEMU VMs and are SLOW (3-10 minutes per test).
 Run with generous timeouts:
 
@@ -12,29 +17,72 @@ Run with generous timeouts:
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import tempfile
 
 import pytest
 
 from conftest import (
+    SandboxBinaries,
     _VM_RESOURCE_ARGS,
     parse_session_id,
     wait_for_state,
 )
 
+
+def _setup_remote_helper_env(
+    sandbox_binaries: SandboxBinaries,
+    socket_path: str,
+) -> tuple[dict[str, str], str]:
+    """Create a symlink ``git-remote-sandbox`` -> sandbox binary and return
+    an env dict with the symlink directory prepended to PATH and
+    SANDBOX_SOCKET set.
+
+    The symlink directory is a temporary directory that the caller should
+    clean up (or let the OS handle).
+    """
+    helper_dir = tempfile.mkdtemp(prefix="sandbox-git-helper-")
+    symlink_path = os.path.join(helper_dir, "git-remote-sandbox")
+    os.symlink(str(sandbox_binaries.sandbox), symlink_path)
+
+    env = os.environ.copy()
+    env["PATH"] = helper_dir + ":" + env.get("PATH", "")
+    env["SANDBOX_SOCKET"] = socket_path
+    return env, helper_dir
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.timeout(600)
-def test_git_push_from_vm(sandbox_cli):
-    """Create a session, initialize a git repo inside the VM, make a commit,
-    then verify the commit exists via exec. This validates the guest agent's
-    git handling works end-to-end within the VM.
+def test_git_push_to_vm(
+    sandbox_cli,
+    sandbox_binaries: SandboxBinaries,
+    sandbox_daemon,
+):
+    """Push a commit from the host INTO a VM using ``git-remote-sandbox``.
+
+    Flow:
+      1. Create a session and wait until running.
+      2. Initialize a bare repo inside the VM.
+      3. Create a local git repo on the host with a test commit.
+      4. Add a git remote using ``sandbox::`` URL (git remote helper).
+      5. ``git push sandbox main`` through the remote helper.
+      6. Verify inside the VM that the pushed commit arrived.
     """
     session_id = None
+    local_repo = None
+    helper_dir = None
     try:
+        # -- 0. Set up git-remote-sandbox symlink and env ----------------------
+        socket_path = sandbox_daemon["socket"]
+        git_env, helper_dir = _setup_remote_helper_env(
+            sandbox_binaries, socket_path,
+        )
+
+        # -- 1. Create a session -----------------------------------------------
         result = sandbox_cli(
             "create", "--name", "git-push-vm",
             *_VM_RESOURCE_ARGS,
@@ -47,117 +95,19 @@ def test_git_push_from_vm(sandbox_cli):
         session_id = parse_session_id(result.stdout)
         wait_for_state(sandbox_cli, "git-push-vm", "Running", timeout=10)
 
-        # Initialize a git repo, configure user, create a file, and commit.
-        init_script = (
-            "cd /root/workspace && "
-            "git init && "
-            "git config user.email 'test@test.com' && "
-            "git config user.name 'Test' && "
-            "echo 'hello world' > README.md && "
-            "git add README.md && "
-            "git commit -m 'initial commit'"
-        )
+        # -- 2. Initialize a bare repo inside the VM --------------------------
         exec_result = sandbox_cli(
             "exec", "git-push-vm", "--",
-            "bash", "-c", init_script,
+            "git", "init", "--bare", "/root/workspace/repo.git",
             timeout=120,
         )
         assert exec_result.returncode == 0, (
-            f"git init+commit failed.\n"
+            f"git init --bare inside VM failed.\n"
             f"stdout: {exec_result.stdout}\nstderr: {exec_result.stderr}"
         )
 
-        # Verify the commit exists.
-        log_result = sandbox_cli(
-            "exec", "git-push-vm", "--",
-            "git", "-C", "/root/workspace", "log", "--oneline", "-1",
-            timeout=120,
-        )
-        assert log_result.returncode == 0, (
-            f"git log failed.\n"
-            f"stdout: {log_result.stdout}\nstderr: {log_result.stderr}"
-        )
-        assert "initial commit" in log_result.stdout, (
-            f"Expected 'initial commit' in git log output.\n"
-            f"Got: {log_result.stdout}"
-        )
-
-        # Also verify we can create a bare repo and use it as a remote
-        # within the VM (validates git-receive-pack / git-upload-pack work).
-        bare_script = (
-            "git init --bare /root/bare.git && "
-            "cd /root/workspace && "
-            "git remote add origin /root/bare.git && "
-            "git push origin master 2>&1 || git push origin main 2>&1"
-        )
-        push_result = sandbox_cli(
-            "exec", "git-push-vm", "--",
-            "bash", "-c", bare_script,
-            timeout=120,
-        )
-        assert push_result.returncode == 0, (
-            f"git push to bare repo failed.\n"
-            f"stdout: {push_result.stdout}\nstderr: {push_result.stderr}"
-        )
-
-        # Clean up.
-        sandbox_cli("rm", "git-push-vm", timeout=120)
-        session_id = None
-
-    finally:
-        if session_id is not None:
-            sandbox_cli("rm", "git-push-vm", timeout=120)
-
-
-@pytest.mark.timeout(600)
-def test_git_pull_to_vm(sandbox_cli):
-    """Create a session with a bare repo in the VM, send a pack file to populate
-    it via the git endpoint, then verify the repo has the expected refs.
-
-    This test validates:
-    1. The daemon's /sessions/{id}/git endpoint works
-    2. The guest agent's GitReceivePack handler works
-    3. Data flows correctly: CLI -> daemon -> guest agent -> git subprocess
-    """
-    session_id = None
-    local_repo = None
-    try:
-        result = sandbox_cli(
-            "create", "--name", "git-pull-vm",
-            *_VM_RESOURCE_ARGS,
-            timeout=600,
-        )
-        assert result.returncode == 0, (
-            f"sandbox create failed (rc={result.returncode}).\n"
-            f"stdout: {result.stdout}\nstderr: {result.stderr}"
-        )
-        session_id = parse_session_id(result.stdout)
-        wait_for_state(sandbox_cli, "git-pull-vm", "Running", timeout=10)
-
-        # Create a bare repo inside the VM to receive the push.
-        exec_result = sandbox_cli(
-            "exec", "git-pull-vm", "--",
-            "git", "init", "--bare", "/root/bare.git",
-            timeout=120,
-        )
-        assert exec_result.returncode == 0, (
-            f"git init --bare failed.\n"
-            f"stdout: {exec_result.stdout}\nstderr: {exec_result.stderr}"
-        )
-
-        # Verify the bare repo was created.
-        ls_result = sandbox_cli(
-            "exec", "git-pull-vm", "--",
-            "ls", "/root/bare.git/HEAD",
-            timeout=120,
-        )
-        assert ls_result.returncode == 0, (
-            f"bare repo HEAD not found.\n"
-            f"stdout: {ls_result.stdout}\nstderr: {ls_result.stderr}"
-        )
-
-        # Create a local repo with a commit and get its pack data.
-        local_repo = tempfile.mkdtemp(prefix="sandbox-git-test-")
+        # -- 3. Create a local git repo on the host with a commit -------------
+        local_repo = tempfile.mkdtemp(prefix="sandbox-git-push-test-")
         subprocess.run(
             ["git", "init", local_repo],
             check=True, capture_output=True, timeout=30,
@@ -172,82 +122,196 @@ def test_git_pull_to_vm(sandbox_cli):
         )
         readme_path = os.path.join(local_repo, "README.md")
         with open(readme_path, "w") as f:
-            f.write("# Test Repo\nContent for git pull test.\n")
+            f.write("# Push Test\nPushed from host to VM.\n")
         subprocess.run(
             ["git", "-C", local_repo, "add", "README.md"],
             check=True, capture_output=True, timeout=10,
         )
         subprocess.run(
-            ["git", "-C", local_repo, "commit", "-m", "test commit for pull"],
+            ["git", "-C", local_repo, "commit", "-m", "host commit for push"],
             check=True, capture_output=True, timeout=10,
         )
 
-        # Verify the local commit exists.
-        log_check = subprocess.run(
-            ["git", "-C", local_repo, "log", "--oneline", "-1"],
+        # Determine the default branch name (main or master).
+        branch_result = subprocess.run(
+            ["git", "-C", local_repo, "branch", "--show-current"],
             capture_output=True, text=True, timeout=10,
         )
-        assert "test commit for pull" in log_check.stdout, (
-            f"Local commit not found: {log_check.stdout}"
+        branch = branch_result.stdout.strip()
+        assert branch, "Could not determine local branch name"
+
+        # -- 4. Add a git remote using sandbox:: URL ---------------------------
+        remote_url = "sandbox::git-push-vm/root/workspace/repo.git"
+        subprocess.run(
+            ["git", "-C", local_repo, "remote", "add", "sandbox", remote_url],
+            check=True, capture_output=True, timeout=10,
         )
 
-        # Verify refs in the bare repo (should be empty before push).
-        refs_result = sandbox_cli(
-            "exec", "git-pull-vm", "--",
-            "bash", "-c", "cd /root/bare.git && git show-ref 2>&1 || echo 'NO_REFS'",
-            timeout=120,
-        )
-        assert "NO_REFS" in refs_result.stdout or refs_result.stdout.strip() == "", (
-            f"bare repo should have no refs initially.\n"
-            f"Got: {refs_result.stdout}"
-        )
-
-        # Instead of using the git remote transport directly (which requires
-        # interactive git protocol), use the exec interface to push from a
-        # cloned repo inside the VM. This validates the full git workflow.
-        clone_and_push_script = (
-            "cd /tmp && "
-            "git clone /root/bare.git test-clone && "
-            "cd test-clone && "
-            "git config user.email 'test@test.com' && "
-            "git config user.name 'Test' && "
-            "echo 'test content' > README.md && "
-            "git add README.md && "
-            "git commit -m 'pushed via test' && "
-            "git push origin HEAD 2>&1"
-        )
-        push_result = sandbox_cli(
-            "exec", "git-pull-vm", "--",
-            "bash", "-c", clone_and_push_script,
-            timeout=120,
+        # -- 5. Push to the VM through the remote helper ----------------------
+        push_result = subprocess.run(
+            ["git", "-C", local_repo, "push", "sandbox", branch],
+            capture_output=True, text=True, timeout=120,
+            env=git_env,
         )
         assert push_result.returncode == 0, (
-            f"clone+push failed.\n"
+            f"git push via sandbox:: remote helper failed "
+            f"(rc={push_result.returncode}).\n"
             f"stdout: {push_result.stdout}\nstderr: {push_result.stderr}"
         )
 
-        # Now verify the bare repo has the expected ref.
-        refs_result = sandbox_cli(
-            "exec", "git-pull-vm", "--",
-            "bash", "-c", "cd /root/bare.git && git log --oneline -1 HEAD 2>&1",
+        # -- 6. Verify the commit arrived inside the VM -----------------------
+        log_result = sandbox_cli(
+            "exec", "git-push-vm", "--",
+            "git", "-C", "/root/workspace/repo.git",
+            "log", "--oneline", "-1",
             timeout=120,
         )
-        assert refs_result.returncode == 0, (
-            f"git log on bare repo failed.\n"
-            f"stdout: {refs_result.stdout}\nstderr: {refs_result.stderr}"
+        assert log_result.returncode == 0, (
+            f"git log inside VM failed.\n"
+            f"stdout: {log_result.stdout}\nstderr: {log_result.stderr}"
         )
-        assert "pushed via test" in refs_result.stdout, (
-            f"Expected 'pushed via test' in bare repo log.\n"
-            f"Got: {refs_result.stdout}"
+        assert "host commit for push" in log_result.stdout, (
+            f"Expected 'host commit for push' in VM git log.\n"
+            f"Got: {log_result.stdout}"
         )
 
-        # Clean up.
-        sandbox_cli("rm", "git-pull-vm", timeout=120)
+        # -- Clean up ----------------------------------------------------------
+        sandbox_cli("rm", "git-push-vm", timeout=120)
         session_id = None
 
     finally:
         if session_id is not None:
-            sandbox_cli("rm", "git-pull-vm", timeout=120)
+            sandbox_cli("rm", "git-push-vm", timeout=120)
         if local_repo is not None:
-            import shutil
             shutil.rmtree(local_repo, ignore_errors=True)
+        if helper_dir is not None:
+            shutil.rmtree(helper_dir, ignore_errors=True)
+
+
+@pytest.mark.timeout(600)
+def test_git_fetch_from_vm(
+    sandbox_cli,
+    sandbox_binaries: SandboxBinaries,
+    sandbox_daemon,
+):
+    """Fetch a commit FROM a VM to the host using ``git-remote-sandbox``.
+
+    Flow:
+      1. Create a session and wait until running.
+      2. Create a repo with a commit inside the VM.
+      3. Create a local bare repo on the host (to fetch into).
+      4. Add a git remote using ``sandbox::`` URL (git remote helper).
+      5. ``git fetch sandbox`` through the remote helper.
+      6. Verify the fetched commit matches what was created in the VM.
+    """
+    session_id = None
+    local_repo = None
+    helper_dir = None
+    try:
+        # -- 0. Set up git-remote-sandbox symlink and env ----------------------
+        socket_path = sandbox_daemon["socket"]
+        git_env, helper_dir = _setup_remote_helper_env(
+            sandbox_binaries, socket_path,
+        )
+
+        # -- 1. Create a session -----------------------------------------------
+        result = sandbox_cli(
+            "create", "--name", "git-fetch-vm",
+            *_VM_RESOURCE_ARGS,
+            timeout=600,
+        )
+        assert result.returncode == 0, (
+            f"sandbox create failed (rc={result.returncode}).\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        session_id = parse_session_id(result.stdout)
+        wait_for_state(sandbox_cli, "git-fetch-vm", "Running", timeout=10)
+
+        # -- 2. Create a repo with a commit inside the VM ---------------------
+        init_script = (
+            "mkdir -p /root/workspace/repo && "
+            "cd /root/workspace/repo && "
+            "git init && "
+            "git config user.email 'test@test.com' && "
+            "git config user.name 'Test' && "
+            "echo 'hello from VM' > file.txt && "
+            "git add . && "
+            "git commit -m 'vm commit for fetch'"
+        )
+        exec_result = sandbox_cli(
+            "exec", "git-fetch-vm", "--",
+            "bash", "-c", init_script,
+            timeout=120,
+        )
+        assert exec_result.returncode == 0, (
+            f"git init+commit inside VM failed.\n"
+            f"stdout: {exec_result.stdout}\nstderr: {exec_result.stderr}"
+        )
+
+        # Determine the branch name used inside the VM.
+        branch_result = sandbox_cli(
+            "exec", "git-fetch-vm", "--",
+            "git", "-C", "/root/workspace/repo", "branch", "--show-current",
+            timeout=30,
+        )
+        assert branch_result.returncode == 0, (
+            f"Could not determine VM branch.\n"
+            f"stdout: {branch_result.stdout}\nstderr: {branch_result.stderr}"
+        )
+        vm_branch = branch_result.stdout.strip()
+        assert vm_branch, "VM branch name is empty"
+
+        # -- 3. Create a local bare repo on the host --------------------------
+        local_repo = tempfile.mkdtemp(prefix="sandbox-git-fetch-test-")
+        subprocess.run(
+            ["git", "init", "--bare", local_repo],
+            check=True, capture_output=True, timeout=30,
+        )
+
+        # -- 4. Add a git remote using sandbox:: URL ---------------------------
+        remote_url = "sandbox::git-fetch-vm/root/workspace/repo"
+        subprocess.run(
+            ["git", "-C", local_repo, "remote", "add", "sandbox", remote_url],
+            check=True, capture_output=True, timeout=10,
+        )
+
+        # -- 5. Fetch from the VM through the remote helper --------------------
+        fetch_result = subprocess.run(
+            ["git", "-C", local_repo, "fetch", "sandbox"],
+            capture_output=True, text=True, timeout=120,
+            env=git_env,
+        )
+        assert fetch_result.returncode == 0, (
+            f"git fetch via sandbox:: remote helper failed "
+            f"(rc={fetch_result.returncode}).\n"
+            f"stdout: {fetch_result.stdout}\nstderr: {fetch_result.stderr}"
+        )
+
+        # -- 6. Verify the fetched commit matches the VM commit ----------------
+        log_result = subprocess.run(
+            [
+                "git", "-C", local_repo, "log",
+                f"sandbox/{vm_branch}", "--oneline", "-1",
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert log_result.returncode == 0, (
+            f"git log on fetched ref failed.\n"
+            f"stdout: {log_result.stdout}\nstderr: {log_result.stderr}"
+        )
+        assert "vm commit for fetch" in log_result.stdout, (
+            f"Expected 'vm commit for fetch' in fetched log.\n"
+            f"Got: {log_result.stdout}"
+        )
+
+        # -- Clean up ----------------------------------------------------------
+        sandbox_cli("rm", "git-fetch-vm", timeout=120)
+        session_id = None
+
+    finally:
+        if session_id is not None:
+            sandbox_cli("rm", "git-fetch-vm", timeout=120)
+        if local_repo is not None:
+            shutil.rmtree(local_repo, ignore_errors=True)
+        if helper_dir is not None:
+            shutil.rmtree(helper_dir, ignore_errors=True)

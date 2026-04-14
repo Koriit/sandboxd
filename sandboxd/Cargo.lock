@@ -1289,6 +1289,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "clap",
+ "rusqlite",
  "sandbox-core",
  "serde",
  "serde_json",

@@ -157,20 +157,50 @@ async fn create_session(
 
     // 1. Create Docker network BEFORE the VM so the bridge exists at QEMU boot.
     //    Also generate the per-session CA certificate (needed by the gateway).
-    let ca_dir = match CaManager::generate_session_ca(&state.base_dir, &session_id) {
-        Ok(dir) => dir,
-        Err(e) => {
-            let _ = state.store.update_state(&session_id, SessionState::Error);
-            return error_response(e).into_response();
+    let ca_dir = {
+        let base_dir = state.base_dir.clone();
+        let sid = session_id;
+        match tokio::task::spawn_blocking(move || CaManager::generate_session_ca(&base_dir, &sid))
+            .await
+        {
+            Ok(Ok(dir)) => dir,
+            Ok(Err(e)) => {
+                let _ = state.store.update_state(&session_id, SessionState::Error);
+                return error_response(e).into_response();
+            }
+            Err(e) => {
+                let _ = state.store.update_state(&session_id, SessionState::Error);
+                return error_response(SandboxError::Internal(format!(
+                    "task join error: {e}"
+                )))
+                .into_response();
+            }
         }
     };
 
-    let network_info = match state.network.create_network(&session_id) {
-        Ok(info) => info,
-        Err(e) => {
-            let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
-            let _ = state.store.update_state(&session_id, SessionState::Error);
-            return error_response(e).into_response();
+    let network_info = {
+        let network = state.network.clone();
+        let sid = session_id;
+        match tokio::task::spawn_blocking(move || network.create_network(&sid))
+            .await
+        {
+            Ok(Ok(info)) => info,
+            Ok(Err(e)) => {
+                let base_dir = state.base_dir.clone();
+                let sid = session_id;
+                let _ = tokio::task::spawn_blocking(move || {
+                    CaManager::remove_session_ca(&base_dir, &sid)
+                }).await;
+                let _ = state.store.update_state(&session_id, SessionState::Error);
+                return error_response(e).into_response();
+            }
+            Err(e) => {
+                let _ = state.store.update_state(&session_id, SessionState::Error);
+                return error_response(SandboxError::Internal(format!(
+                    "task join error: {e}"
+                )))
+                .into_response();
+            }
         }
     };
 
@@ -180,33 +210,89 @@ async fn create_session(
     info!(%session_id, bridge = %network_info.bridge_name, mac = %vm_mac, "creating VM");
 
     // 2. Create the Lima VM (with optional custom template).
-    let create_result = if let Some(template_path) = &req.template {
-        state
-            .lima
-            .create_vm_with_custom_template(&session_id, template_path.as_ref())
-    } else {
-        state.lima.create_vm(&session_id, &config)
-    };
-
-    if let Err(e) = create_result {
-        let _ = state.network.delete_network(&session_id);
-        let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
-        let _ = state.store.update_state(&session_id, SessionState::Error);
-        return error_response(e).into_response();
+    {
+        let lima = state.lima.clone();
+        let sid = session_id;
+        let cfg = config.clone();
+        let template = req.template.clone();
+        match tokio::task::spawn_blocking(move || {
+            if let Some(template_path) = &template {
+                lima.create_vm_with_custom_template(&sid, template_path.as_ref())
+            } else {
+                lima.create_vm(&sid, &cfg)
+            }
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let network = state.network.clone();
+                let base_dir = state.base_dir.clone();
+                let sid = session_id;
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = network.delete_network(&sid);
+                    let _ = CaManager::remove_session_ca(&base_dir, &sid);
+                }).await;
+                let _ = state.store.update_state(&session_id, SessionState::Error);
+                return error_response(e).into_response();
+            }
+            Err(e) => {
+                let network = state.network.clone();
+                let base_dir = state.base_dir.clone();
+                let sid = session_id;
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = network.delete_network(&sid);
+                    let _ = CaManager::remove_session_ca(&base_dir, &sid);
+                }).await;
+                let _ = state.store.update_state(&session_id, SessionState::Error);
+                return error_response(SandboxError::Internal(format!(
+                    "task join error: {e}"
+                )))
+                .into_response();
+            }
+        }
     }
 
     // 3. Start the VM with bridge networking env vars so QEMU attaches to
     //    the Docker bridge via qemu-bridge-helper at boot.
-    if let Err(e) = state.lima.start_vm(
-        &session_id,
-        &config,
-        Some(&network_info.bridge_name),
-        Some(&vm_mac),
-    ) {
-        let _ = state.network.delete_network(&session_id);
-        let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
-        let _ = state.store.update_state(&session_id, SessionState::Error);
-        return error_response(e).into_response();
+    {
+        let lima = state.lima.clone();
+        let sid = session_id;
+        let cfg = config.clone();
+        let bridge = network_info.bridge_name.clone();
+        let mac = vm_mac.clone();
+        match tokio::task::spawn_blocking(move || {
+            lima.start_vm(&sid, &cfg, Some(&bridge), Some(&mac))
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let network = state.network.clone();
+                let base_dir = state.base_dir.clone();
+                let sid = session_id;
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = network.delete_network(&sid);
+                    let _ = CaManager::remove_session_ca(&base_dir, &sid);
+                }).await;
+                let _ = state.store.update_state(&session_id, SessionState::Error);
+                return error_response(e).into_response();
+            }
+            Err(e) => {
+                let network = state.network.clone();
+                let base_dir = state.base_dir.clone();
+                let sid = session_id;
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = network.delete_network(&sid);
+                    let _ = CaManager::remove_session_ca(&base_dir, &sid);
+                }).await;
+                let _ = state.store.update_state(&session_id, SessionState::Error);
+                return error_response(SandboxError::Internal(format!(
+                    "task join error: {e}"
+                )))
+                .into_response();
+            }
+        }
     }
 
     // 4. Install the guest agent into the VM.
@@ -216,9 +302,15 @@ async fn create_session(
             .expect("executable must have a parent directory")
             .join("sandbox-guest"),
         Err(e) => {
-            let _ = state.lima.delete_vm(&session_id);
-            let _ = state.network.delete_network(&session_id);
-            let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
+            let lima = state.lima.clone();
+            let network = state.network.clone();
+            let base_dir = state.base_dir.clone();
+            let sid = session_id;
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = lima.delete_vm(&sid);
+                let _ = network.delete_network(&sid);
+                let _ = CaManager::remove_session_ca(&base_dir, &sid);
+            }).await;
             let _ = state.store.update_state(&session_id, SessionState::Error);
             return error_response(SandboxError::Internal(format!(
                 "failed to determine daemon executable path: {e}"
@@ -227,13 +319,47 @@ async fn create_session(
         }
     };
 
-    if let Err(e) = state.lima.install_guest_agent(&session_id, &guest_binary_path) {
-        error!(%session_id, error = %e, "failed to install guest agent");
-        let _ = state.lima.delete_vm(&session_id);
-        let _ = state.network.delete_network(&session_id);
-        let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
-        let _ = state.store.update_state(&session_id, SessionState::Error);
-        return error_response(e).into_response();
+    {
+        let lima = state.lima.clone();
+        let sid = session_id;
+        let guest_bin = guest_binary_path.clone();
+        match tokio::task::spawn_blocking(move || {
+            lima.install_guest_agent(&sid, &guest_bin)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                error!(%session_id, error = %e, "failed to install guest agent");
+                let lima = state.lima.clone();
+                let network = state.network.clone();
+                let base_dir = state.base_dir.clone();
+                let sid = session_id;
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = lima.delete_vm(&sid);
+                    let _ = network.delete_network(&sid);
+                    let _ = CaManager::remove_session_ca(&base_dir, &sid);
+                }).await;
+                let _ = state.store.update_state(&session_id, SessionState::Error);
+                return error_response(e).into_response();
+            }
+            Err(e) => {
+                let lima = state.lima.clone();
+                let network = state.network.clone();
+                let base_dir = state.base_dir.clone();
+                let sid = session_id;
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = lima.delete_vm(&sid);
+                    let _ = network.delete_network(&sid);
+                    let _ = CaManager::remove_session_ca(&base_dir, &sid);
+                }).await;
+                let _ = state.store.update_state(&session_id, SessionState::Error);
+                return error_response(SandboxError::Internal(format!(
+                    "task join error: {e}"
+                )))
+                .into_response();
+            }
+        }
     }
 
     // 5. Verify the guest agent is responsive.
@@ -246,17 +372,29 @@ async fn create_session(
                 "guest agent returned unexpected response to ping".into(),
             );
             error!(%session_id, "guest agent ping: unexpected response");
-            let _ = state.lima.delete_vm(&session_id);
-            let _ = state.network.delete_network(&session_id);
-            let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
+            let lima = state.lima.clone();
+            let network = state.network.clone();
+            let base_dir = state.base_dir.clone();
+            let sid = session_id;
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = lima.delete_vm(&sid);
+                let _ = network.delete_network(&sid);
+                let _ = CaManager::remove_session_ca(&base_dir, &sid);
+            }).await;
             let _ = state.store.update_state(&session_id, SessionState::Error);
             return error_response(err).into_response();
         }
         Err(e) => {
             error!(%session_id, error = %e, "guest agent ping failed");
-            let _ = state.lima.delete_vm(&session_id);
-            let _ = state.network.delete_network(&session_id);
-            let _ = CaManager::remove_session_ca(&state.base_dir, &session_id);
+            let lima = state.lima.clone();
+            let network = state.network.clone();
+            let base_dir = state.base_dir.clone();
+            let sid = session_id;
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = lima.delete_vm(&sid);
+                let _ = network.delete_network(&sid);
+                let _ = CaManager::remove_session_ca(&base_dir, &sid);
+            }).await;
             let _ = state.store.update_state(&session_id, SessionState::Error);
             return error_response(e).into_response();
         }
@@ -448,7 +586,10 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     };
 
     // Enrich with VM status (best-effort).
-    let vm_list = state.lima.list_vms().unwrap_or_default();
+    let lima = state.lima.clone();
+    let vm_list = tokio::task::spawn_blocking(move || lima.list_vms().unwrap_or_default())
+        .await
+        .unwrap_or_default();
 
     let reconciled: Vec<Session> = sessions
         .into_iter()
@@ -490,7 +631,13 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse 
             None
         };
         let gateway_status = if session.state == SessionState::Running {
-            Some(format_gateway_status(&state.gateway, &session.id))
+            let gateway = state.gateway.clone();
+            let sid = session.id;
+            Some(
+                tokio::task::spawn_blocking(move || format_gateway_status(&gateway, &sid))
+                    .await
+                    .unwrap_or_else(|_| "error: task join failed".to_string()),
+            )
         } else {
             None
         };
@@ -518,17 +665,23 @@ async fn get_session(
 
     // Enrich with VM status (best-effort).
     let mut session = session;
-    if let Ok(vm_status) = state.lima.vm_status(&session.id) {
-        match (&session.state, &vm_status) {
-            (SessionState::Running, VmStatus::Stopped) => {
-                session.state = SessionState::Stopped;
-                let _ = state.store.update_state(&session.id, SessionState::Stopped);
+    {
+        let lima = state.lima.clone();
+        let sid = session.id;
+        if let Ok(Ok(vm_status)) =
+            tokio::task::spawn_blocking(move || lima.vm_status(&sid)).await
+        {
+            match (&session.state, &vm_status) {
+                (SessionState::Running, VmStatus::Stopped) => {
+                    session.state = SessionState::Stopped;
+                    let _ = state.store.update_state(&session.id, SessionState::Stopped);
+                }
+                (SessionState::Stopped, VmStatus::Running) => {
+                    session.state = SessionState::Running;
+                    let _ = state.store.update_state(&session.id, SessionState::Running);
+                }
+                _ => {}
             }
-            (SessionState::Stopped, VmStatus::Running) => {
-                session.state = SessionState::Running;
-                let _ = state.store.update_state(&session.id, SessionState::Running);
-            }
-            _ => {}
         }
     }
 
@@ -548,7 +701,13 @@ async fn get_session(
     };
 
     let gateway_status = if session.state == SessionState::Running {
-        Some(format_gateway_status(&state.gateway, &session.id))
+        let gateway = state.gateway.clone();
+        let sid = session.id;
+        Some(
+            tokio::task::spawn_blocking(move || format_gateway_status(&gateway, &sid))
+                .await
+                .unwrap_or_else(|_| "error: task join failed".to_string()),
+        )
     } else {
         None
     };
@@ -583,32 +742,62 @@ async fn start_session(
 
     // Ensure the Docker bridge network exists BEFORE starting the VM so the
     // QEMU wrapper can attach the bridge NIC via qemu-bridge-helper at boot.
-    let (bridge_name, vm_mac) = match state.network.ensure_network(&session.id) {
-        Ok(info) => {
-            let mac = mac_from_uuid(&session.id);
-            (Some(info.bridge_name), Some(mac))
-        }
-        Err(e) => {
-            // If network info is not available (e.g. session created before
-            // networking was set up), start without bridge networking.
-            warn!(
-                session_id = %session.id,
-                error = %e,
-                "could not ensure Docker bridge (starting VM without bridge NIC)"
-            );
-            (None, None)
+    let (bridge_name, vm_mac) = {
+        let network = state.network.clone();
+        let sid = session.id;
+        match tokio::task::spawn_blocking(move || network.ensure_network(&sid))
+            .await
+        {
+            Ok(Ok(info)) => {
+                let mac = mac_from_uuid(&session.id);
+                (Some(info.bridge_name), Some(mac))
+            }
+            Ok(Err(e)) => {
+                // If network info is not available (e.g. session created before
+                // networking was set up), start without bridge networking.
+                warn!(
+                    session_id = %session.id,
+                    error = %e,
+                    "could not ensure Docker bridge (starting VM without bridge NIC)"
+                );
+                (None, None)
+            }
+            Err(e) => {
+                warn!(
+                    session_id = %session.id,
+                    error = %e,
+                    "could not ensure Docker bridge (task join error, starting VM without bridge NIC)"
+                );
+                (None, None)
+            }
         }
     };
 
     // Start the Lima VM with bridge networking env vars.
-    if let Err(e) = state.lima.start_vm(
-        &session.id,
-        &session.config,
-        bridge_name.as_deref(),
-        vm_mac.as_deref(),
-    ) {
-        let _ = state.store.update_state(&session.id, SessionState::Error);
-        return error_response(e).into_response();
+    {
+        let lima = state.lima.clone();
+        let sid = session.id;
+        let cfg = session.config.clone();
+        let bridge = bridge_name.clone();
+        let mac = vm_mac.clone();
+        match tokio::task::spawn_blocking(move || {
+            lima.start_vm(&sid, &cfg, bridge.as_deref(), mac.as_deref())
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = state.store.update_state(&session.id, SessionState::Error);
+                return error_response(e).into_response();
+            }
+            Err(e) => {
+                let _ = state.store.update_state(&session.id, SessionState::Error);
+                return error_response(SandboxError::Internal(format!(
+                    "task join error: {e}"
+                )))
+                .into_response();
+            }
+        }
     }
 
     // Wait for the guest agent to become responsive before proceeding.
@@ -688,11 +877,43 @@ async fn stop_session(
     // stopping the VM. The network_info is kept in the DB so `start` can
     // recreate everything. The subnet remains allocated in the
     // NetworkManager so it is not reused by another session.
-    teardown_session_networking(&session.id, &state);
+    {
+        let gateway = state.gateway.clone();
+        let network = state.network.clone();
+        let sid = session.id;
+        let _ = tokio::task::spawn_blocking(move || {
+            debug!(session_id = %sid, "tearing down session networking (preserving allocation)");
+            if let Err(e) = detach_vm_from_bridge(&sid) {
+                warn!(%sid, error = %e, "failed to detach VM from bridge (best-effort)");
+            }
+            if let Err(e) = gateway.stop_gateway(&sid) {
+                warn!(%sid, error = %e, "failed to stop gateway (best-effort)");
+            }
+            if let Err(e) = network.remove_docker_network(&sid) {
+                warn!(%sid, error = %e, "failed to remove Docker network (best-effort)");
+            }
+        }).await;
+    }
 
-    if let Err(e) = state.lima.stop_vm(&session.id) {
-        let _ = state.store.update_state(&session.id, SessionState::Error);
-        return error_response(e).into_response();
+    {
+        let lima = state.lima.clone();
+        let sid = session.id;
+        match tokio::task::spawn_blocking(move || lima.stop_vm(&sid))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = state.store.update_state(&session.id, SessionState::Error);
+                return error_response(e).into_response();
+            }
+            Err(e) => {
+                let _ = state.store.update_state(&session.id, SessionState::Error);
+                return error_response(SandboxError::Internal(format!(
+                    "task join error: {e}"
+                )))
+                .into_response();
+            }
+        }
     }
 
     if let Err(e) = state.store.update_state(&session.id, SessionState::Stopped) {
@@ -731,16 +952,38 @@ async fn remove_session(
     // Cancel DNS propagation loop before teardown.
     cancel_dns_propagation_loop(&session.id, &state).await;
 
-    // Stop VM if running (ignore errors -- it might already be stopped).
-    if session.state == SessionState::Running {
-        let _ = state.lima.stop_vm(&session.id);
+    // Stop VM if running, then delete from Lima, then full network teardown.
+    // All of these are best-effort blocking calls.
+    {
+        let lima = state.lima.clone();
+        let gateway = state.gateway.clone();
+        let network = state.network.clone();
+        let base_dir = state.base_dir.clone();
+        let sid = session.id;
+        let is_running = session.state == SessionState::Running;
+        let _ = tokio::task::spawn_blocking(move || {
+            // Stop VM if running (ignore errors -- it might already be stopped).
+            if is_running {
+                let _ = lima.stop_vm(&sid);
+            }
+            // Delete the VM from Lima (ignore errors -- it might not exist).
+            let _ = lima.delete_vm(&sid);
+            // Full teardown: networking + CA + release subnet allocation.
+            debug!(session_id = %sid, "tearing down session networking (full cleanup)");
+            if let Err(e) = detach_vm_from_bridge(&sid) {
+                warn!(%sid, error = %e, "failed to detach VM from bridge (best-effort)");
+            }
+            if let Err(e) = gateway.stop_gateway(&sid) {
+                warn!(%sid, error = %e, "failed to stop gateway (best-effort)");
+            }
+            if let Err(e) = network.delete_network(&sid) {
+                warn!(%sid, error = %e, "failed to delete network (best-effort)");
+            }
+            if let Err(e) = CaManager::remove_session_ca(&base_dir, &sid) {
+                warn!(%sid, error = %e, "failed to remove session CA (best-effort)");
+            }
+        }).await;
     }
-
-    // Delete the VM from Lima (ignore errors -- it might not exist).
-    let _ = state.lima.delete_vm(&session.id);
-
-    // Full teardown: networking + CA + release subnet allocation.
-    teardown_session_networking_full(&session.id, &state);
 
     // Delete the session from the store.
     if let Err(e) = state.store.delete_session(&session.id) {
@@ -1266,6 +1509,63 @@ async fn dns_propagation_loop(
 // Networking helpers
 // ---------------------------------------------------------------------------
 
+/// Inject CA certificate into the VM's trust store via the guest agent.
+///
+/// Reads the PEM certificate from `ca_dir/cert.pem`, generates a shell script
+/// that installs it and runs `update-ca-certificates`, then executes it inside
+/// the VM.
+async fn inject_ca_into_vm(
+    guest: &GuestConnector,
+    session_id: &uuid::Uuid,
+    ca_dir: &std::path::Path,
+) -> Result<(), SandboxError> {
+    let cert_pem = std::fs::read_to_string(ca_dir.join("cert.pem")).map_err(|e| {
+        SandboxError::Ca(format!("failed to read CA cert for injection: {e}"))
+    })?;
+    let inject_script = generate_ca_inject_script(&cert_pem);
+
+    info!(session_id = %session_id, "injecting CA certificate into VM");
+
+    match guest
+        .exec(session_id, "bash", &["-c", &inject_script])
+        .await
+    {
+        Ok(GuestResponse::ExecResult {
+            exit_code,
+            stdout,
+            stderr,
+        }) => {
+            if exit_code != 0 {
+                warn!(
+                    session_id = %session_id,
+                    exit_code,
+                    stdout = %stdout.trim(),
+                    stderr = %stderr.trim(),
+                    "CA injection script returned non-zero exit code"
+                );
+                return Err(SandboxError::Ca(format!(
+                    "CA injection failed (exit {exit_code}): {stderr}"
+                )));
+            }
+            info!(
+                session_id = %session_id,
+                output = %stdout.trim(),
+                "CA certificate injected into VM"
+            );
+            Ok(())
+        }
+        Ok(GuestResponse::Error { message }) => Err(SandboxError::Ca(format!(
+            "guest agent error during CA injection: {message}"
+        ))),
+        Ok(other) => Err(SandboxError::Ca(format!(
+            "unexpected guest response during CA injection: {other:?}"
+        ))),
+        Err(e) => Err(SandboxError::Ca(format!(
+            "failed to inject CA certificate into VM: {e}"
+        ))),
+    }
+}
+
 /// Set up remaining networking for a new session.
 ///
 /// The Docker bridge network and CA certificate are created before the VM
@@ -1300,57 +1600,7 @@ async fn setup_session_networking(
     }
 
     // 3. Inject CA certificate into VM trust store via guest agent.
-    let cert_pem = std::fs::read_to_string(ca_dir.join("cert.pem")).map_err(|e| {
-        SandboxError::Ca(format!("failed to read CA cert for injection: {e}"))
-    })?;
-    let inject_script = generate_ca_inject_script(&cert_pem);
-
-    info!(session_id = %session_id, "injecting CA certificate into VM");
-
-    match state
-        .guest
-        .exec(session_id, "bash", &["-c", &inject_script])
-        .await
-    {
-        Ok(GuestResponse::ExecResult {
-            exit_code,
-            stdout,
-            stderr,
-        }) => {
-            if exit_code != 0 {
-                warn!(
-                    session_id = %session_id,
-                    exit_code,
-                    stdout = %stdout.trim(),
-                    stderr = %stderr.trim(),
-                    "CA injection script returned non-zero exit code"
-                );
-                return Err(SandboxError::Ca(format!(
-                    "CA injection failed (exit {exit_code}): {stderr}"
-                )));
-            }
-            info!(
-                session_id = %session_id,
-                output = %stdout.trim(),
-                "CA certificate injected into VM"
-            );
-        }
-        Ok(GuestResponse::Error { message }) => {
-            return Err(SandboxError::Ca(format!(
-                "guest agent error during CA injection: {message}"
-            )));
-        }
-        Ok(other) => {
-            return Err(SandboxError::Ca(format!(
-                "unexpected guest response during CA injection: {other:?}"
-            )));
-        }
-        Err(e) => {
-            return Err(SandboxError::Ca(format!(
-                "failed to inject CA certificate into VM: {e}"
-            )));
-        }
-    }
+    inject_ca_into_vm(&state.guest, session_id, ca_dir).await?;
 
     // 4. Store network info in DB.
     state.store.set_network_info(session_id, network_info)?;
@@ -1379,24 +1629,6 @@ fn teardown_session_networking(session_id: &uuid::Uuid, state: &AppState) {
     }
     if let Err(e) = state.network.remove_docker_network(session_id) {
         warn!(%session_id, error = %e, "failed to remove Docker network (best-effort)");
-    }
-}
-
-/// Full teardown: remove all networking resources AND release the subnet
-/// allocation. Used when deleting a session permanently.
-fn teardown_session_networking_full(session_id: &uuid::Uuid, state: &AppState) {
-    debug!(session_id = %session_id, "tearing down session networking (full cleanup)");
-    if let Err(e) = detach_vm_from_bridge(session_id) {
-        warn!(%session_id, error = %e, "failed to detach VM from bridge (best-effort)");
-    }
-    if let Err(e) = state.gateway.stop_gateway(session_id) {
-        warn!(%session_id, error = %e, "failed to stop gateway (best-effort)");
-    }
-    if let Err(e) = state.network.delete_network(session_id) {
-        warn!(%session_id, error = %e, "failed to delete network (best-effort)");
-    }
-    if let Err(e) = CaManager::remove_session_ca(&state.base_dir, session_id) {
-        warn!(%session_id, error = %e, "failed to remove session CA (best-effort)");
     }
 }
 
@@ -1537,59 +1769,7 @@ async fn restore_session_networking(
     }
 
     // 4. Inject CA certificate into VM trust store.
-    let cert_pem = std::fs::read_to_string(ca_dir.join("cert.pem")).map_err(|e| {
-        SandboxError::Ca(format!("failed to read CA cert for injection: {e}"))
-    })?;
-    let inject_script = generate_ca_inject_script(&cert_pem);
-
-    info!(session_id = %session_id, "injecting CA certificate into VM");
-
-    match state
-        .guest
-        .exec(session_id, "bash", &["-c", &inject_script])
-        .await
-    {
-        Ok(GuestResponse::ExecResult {
-            exit_code,
-            stdout,
-            stderr,
-        }) => {
-            if exit_code != 0 {
-                warn!(
-                    session_id = %session_id,
-                    exit_code,
-                    stdout = %stdout.trim(),
-                    stderr = %stderr.trim(),
-                    "CA injection script returned non-zero exit code"
-                );
-                return Err(SandboxError::Ca(format!(
-                    "CA injection failed (exit {exit_code}): {stderr}"
-                )));
-            }
-            info!(
-                session_id = %session_id,
-                output = %stdout.trim(),
-                "CA certificate injected into VM"
-            );
-        }
-        Ok(GuestResponse::Error { message }) => {
-            return Err(SandboxError::Ca(format!(
-                "guest agent error during CA injection: {message}"
-            )));
-        }
-        Ok(other) => {
-            return Err(SandboxError::Ca(format!(
-                "unexpected guest response during CA injection: {other:?}"
-            )));
-        }
-        Err(e) => {
-            return Err(SandboxError::Ca(format!(
-                "failed to inject CA certificate into VM: {e}"
-            )));
-        }
-    }
-
-    Ok(())
+    inject_ca_into_vm(&state.guest, session_id, &ca_dir).await
 }
 
 /// Format a `GatewayStatus` into a human-readable string for the API response.
@@ -1620,11 +1800,17 @@ async fn session_health(
     };
 
     // VM status.
-    let vm_status = match state.lima.vm_status(&session.id) {
-        Ok(VmStatus::Running) => "running".to_string(),
-        Ok(VmStatus::Stopped) => "stopped".to_string(),
-        Ok(VmStatus::Unknown(s)) => s,
-        Err(e) => format!("error: {e}"),
+    let vm_status = {
+        let lima = state.lima.clone();
+        let sid = session.id;
+        tokio::task::spawn_blocking(move || match lima.vm_status(&sid) {
+            Ok(VmStatus::Running) => "running".to_string(),
+            Ok(VmStatus::Stopped) => "stopped".to_string(),
+            Ok(VmStatus::Unknown(s)) => s,
+            Err(e) => format!("error: {e}"),
+        })
+        .await
+        .unwrap_or_else(|e| format!("error: task join error: {e}"))
     };
 
     // Guest agent status.
@@ -1647,7 +1833,12 @@ async fn session_health(
     // Gateway health.
     let (container_status, envoy, mitmproxy, coredns) =
         if session.state == SessionState::Running {
-            match state.gateway.gateway_status(&session.id) {
+            let gateway = state.gateway.clone();
+            let sid = session.id;
+            let gw_result = tokio::task::spawn_blocking(move || gateway.gateway_status(&sid))
+                .await
+                .unwrap_or_else(|e| Err(SandboxError::Internal(format!("task join error: {e}"))));
+            match gw_result {
                 Ok(GatewayStatus::Healthy) => (
                     "running".to_string(),
                     "healthy".to_string(),
@@ -1684,16 +1875,20 @@ async fn session_health(
     // TAP devices are now managed by QEMU via qemu-bridge-helper and are
     // created/destroyed with the VM process — no separate host-side check.
     let network_info = state.store.get_network_info(&session.id).ok().flatten();
-    let bridge_exists = network_info
-        .as_ref()
-        .map(|info| {
+    let bridge_exists = if let Some(ref info) = network_info {
+        let docker_network_name = info.docker_network_name.clone();
+        tokio::task::spawn_blocking(move || {
             std::process::Command::new("docker")
-                .args(["network", "inspect", &info.docker_network_name])
+                .args(["network", "inspect", &docker_network_name])
                 .output()
                 .map(|o| o.status.success())
                 .unwrap_or(false)
         })
-        .unwrap_or(false);
+        .await
+        .unwrap_or(false)
+    } else {
+        false
+    };
     // TAP is owned by QEMU; report as present when the VM is running.
     let tap_exists = vm_status == "running";
 
@@ -1730,7 +1925,11 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         if session.state != SessionState::Running {
             continue;
         }
-        let gw_status = format_gateway_status(&state.gateway, &session.id);
+        let gateway = state.gateway.clone();
+        let sid = session.id;
+        let gw_status = tokio::task::spawn_blocking(move || format_gateway_status(&gateway, &sid))
+            .await
+            .unwrap_or_else(|_| "error: task join failed".to_string());
         statuses.push(serde_json::json!({
             "session_id": session.id,
             "name": session.name,
@@ -2224,5 +2423,211 @@ async fn shutdown_signal() {
         _ = sigint.recv() => {
             info!("received SIGINT, shutting down");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // Helper: extract the JSON body from an error_response tuple.
+    // -----------------------------------------------------------------------
+
+    fn error_body(err: SandboxError) -> (StatusCode, ApiError) {
+        let (status, Json(body)) = error_response(err);
+        (status, body)
+    }
+
+    // -----------------------------------------------------------------------
+    // error_response: status code mapping
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn error_response_session_not_found_returns_404() {
+        let (status, body) = error_body(SandboxError::SessionNotFound("abc-123".into()));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(
+            body.error.contains("abc-123"),
+            "expected body to contain session id, got: {}",
+            body.error
+        );
+    }
+
+    #[test]
+    fn error_response_invalid_state_returns_400() {
+        let (status, body) = error_body(SandboxError::InvalidState(
+            "cannot start from stopped".into(),
+        ));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body.error.contains("cannot start from stopped"),
+            "expected body to contain reason, got: {}",
+            body.error
+        );
+    }
+
+    #[test]
+    fn error_response_network_returns_500() {
+        let (status, body) = error_body(SandboxError::Network("bridge down".into()));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.error, "bridge down");
+    }
+
+    #[test]
+    fn error_response_ca_returns_500() {
+        let (status, body) = error_body(SandboxError::Ca("cert gen failed".into()));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.error, "cert gen failed");
+    }
+
+    #[test]
+    fn error_response_gateway_returns_500() {
+        let (status, body) = error_body(SandboxError::Gateway("container crash".into()));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.error, "container crash");
+    }
+
+    #[test]
+    fn error_response_lima_returns_500() {
+        let (status, body) = error_body(SandboxError::Lima("vm boot timeout".into()));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.error, "vm boot timeout");
+    }
+
+    #[test]
+    fn error_response_io_returns_500() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied");
+        let (status, body) = error_body(SandboxError::Io(io_err));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            body.error.contains("access denied"),
+            "expected body to contain io error message, got: {}",
+            body.error
+        );
+    }
+
+    #[test]
+    fn error_response_database_returns_500() {
+        // Construct a rusqlite error via the QueryReturnedNoRows variant
+        // which requires no parameters.
+        let db_err = rusqlite::Error::QueryReturnedNoRows;
+        let (status, body) = error_body(SandboxError::Database(db_err));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            !body.error.is_empty(),
+            "expected non-empty error body for Database variant"
+        );
+    }
+
+    #[test]
+    fn error_response_http_returns_500() {
+        let (status, body) = error_body(SandboxError::Http("connection refused".into()));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            body.error.contains("connection refused"),
+            "expected body to contain http error message, got: {}",
+            body.error
+        );
+    }
+
+    #[test]
+    fn error_response_internal_returns_500() {
+        let (status, body) = error_body(SandboxError::Internal("unexpected panic".into()));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            body.error.contains("unexpected panic"),
+            "expected body to contain internal error message, got: {}",
+            body.error
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // error_response: JSON body structure
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn error_response_body_serializes_as_api_error_json() {
+        // Use a Network variant since it passes the raw inner string
+        // (no Display prefix), making the assertion straightforward.
+        let (_, Json(body)) =
+            error_response(SandboxError::Network("test message".into()));
+        let json = serde_json::to_value(&body).expect("failed to serialize ApiError");
+        assert_eq!(
+            json.get("error").and_then(|v| v.as_str()),
+            Some("test message"),
+        );
+        // Ensure only the "error" key exists (no extra fields).
+        let obj = json.as_object().expect("expected JSON object");
+        assert_eq!(obj.len(), 1, "ApiError JSON should have exactly one key");
+    }
+
+    // -----------------------------------------------------------------------
+    // error_response: Network/Ca/Gateway/Lima use the inner msg directly
+    // (not the Display impl with prefix)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn error_response_string_variants_use_inner_message_not_display() {
+        // For the string-wrapping variants (Network, Ca, Gateway, Lima),
+        // error_response clones the inner string rather than calling
+        // err.to_string(), so the body should NOT contain the "network error:"
+        // prefix that the Display impl adds.
+        let (_, body) = error_body(SandboxError::Network("oops".into()));
+        assert_eq!(body.error, "oops", "Network body should be the raw inner message");
+
+        let (_, body) = error_body(SandboxError::Ca("oops".into()));
+        assert_eq!(body.error, "oops", "Ca body should be the raw inner message");
+
+        let (_, body) = error_body(SandboxError::Gateway("oops".into()));
+        assert_eq!(body.error, "oops", "Gateway body should be the raw inner message");
+
+        let (_, body) = error_body(SandboxError::Lima("oops".into()));
+        assert_eq!(body.error, "oops", "Lima body should be the raw inner message");
+    }
+
+    // -----------------------------------------------------------------------
+    // error_response: Display-based variants include the thiserror prefix
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn error_response_display_variants_include_prefix() {
+        let (_, body) = error_body(SandboxError::SessionNotFound("xyz".into()));
+        assert_eq!(body.error, "session not found: xyz");
+
+        let (_, body) = error_body(SandboxError::InvalidState("bad".into()));
+        assert_eq!(body.error, "invalid state transition: bad");
+
+        let (_, body) = error_body(SandboxError::Internal("fail".into()));
+        assert_eq!(body.error, "internal error: fail");
+
+        let (_, body) = error_body(SandboxError::Http("timeout".into()));
+        assert_eq!(body.error, "HTTP error: timeout");
+    }
+
+    // -----------------------------------------------------------------------
+    // default_socket_path / default_base_dir
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn default_socket_path_ends_with_sock() {
+        let path = default_socket_path();
+        assert!(
+            path.ends_with("sandboxd.sock"),
+            "expected path to end with sandboxd.sock, got: {path}"
+        );
+    }
+
+    #[test]
+    fn default_base_dir_ends_with_sandboxd() {
+        let dir = default_base_dir();
+        assert!(
+            dir.ends_with(".sandboxd"),
+            "expected dir to end with .sandboxd, got: {dir}"
+        );
     }
 }

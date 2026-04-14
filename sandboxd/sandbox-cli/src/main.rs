@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::process;
 
 use base64::Engine;
@@ -243,7 +244,7 @@ fn build_request(command: &Command) -> Option<Request<String>> {
                     eprintln!("Error: --workspace shared: path must not be empty");
                     process::exit(1);
                 }
-                let p = std::path::Path::new(path_part);
+                let p = Path::new(path_part);
                 if !p.is_absolute() {
                     eprintln!("Error: --workspace path must be absolute, got: {path_part}");
                     process::exit(1);
@@ -1052,8 +1053,197 @@ async fn handle_git_remote(
     }
 }
 
+/// Check whether this binary was invoked as `git-remote-sandbox` (i.e. as a
+/// git remote helper).  Returns `true` if argv[0] ends with
+/// `git-remote-sandbox`, in which case the caller should enter remote-helper
+/// mode instead of normal CLI parsing.
+fn invoked_as_remote_helper() -> bool {
+    std::env::args_os()
+        .next()
+        .map(|arg0| {
+            let p = Path::new(&arg0);
+            p.file_name()
+                .map(|name| name == "git-remote-sandbox")
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+/// Parse a `sandbox::` URL into (session, repo_path).
+///
+/// URL format: `sandbox::<session>/<repo-path>`
+/// The part after `sandbox::` is passed as the second argument to the
+/// remote helper. It has the form `<session>/<repo-path>` where repo-path
+/// can contain slashes.
+///
+/// Returns `(session, repo_path)`.
+fn parse_remote_helper_url(url: &str) -> Result<(String, String), String> {
+    // The URL git passes to us is the part after "sandbox::" — but git may
+    // also pass the full URL including the scheme prefix in some cases.
+    let payload = url.strip_prefix("sandbox::").unwrap_or(url);
+
+    // Split on the first slash to get session and repo-path.
+    if let Some(idx) = payload.find('/') {
+        let session = &payload[..idx];
+        let repo_path = &payload[idx..]; // keeps the leading slash
+        if session.is_empty() {
+            return Err(format!("empty session name in URL: {url}"));
+        }
+        if repo_path.is_empty() || repo_path == "/" {
+            return Err(format!("empty repo path in URL: {url}"));
+        }
+        Ok((session.to_string(), repo_path.to_string()))
+    } else {
+        // No slash — treat the whole thing as session, use default repo path.
+        if payload.is_empty() {
+            return Err(format!("empty URL: {url}"));
+        }
+        Ok((payload.to_string(), "/root/workspace".to_string()))
+    }
+}
+
+/// Run as a git remote helper.
+///
+/// Git invokes: `git-remote-sandbox <remote-name> <url>`
+///
+/// Protocol (on stdin/stdout):
+/// - Git sends `capabilities\n` → we respond `connect\n\n`
+/// - Git sends `connect <service>\n` → we respond `\n` then proxy
+///   stdin/stdout to the daemon's git endpoint for that service.
+fn run_remote_helper() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 3 {
+        eprintln!("Usage: git-remote-sandbox <remote-name> <url>");
+        eprintln!("This is a git remote helper, invoked by git automatically.");
+        process::exit(1);
+    }
+
+    let url = &args[2];
+
+    let (session, repo_path) = match parse_remote_helper_url(url) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    };
+
+    // Determine socket path: SANDBOX_SOCKET env var, or default.
+    let socket_path = std::env::var("SANDBOX_SOCKET").unwrap_or_else(|_| default_socket_path());
+
+    // Read commands from stdin line by line.
+    // We track a pending `connect` service so we can break out of the loop
+    // (dropping the StdinLock) before spawning the SSH subprocess.
+    use std::io::{BufRead, Write};
+    let mut connect_service: Option<String> = None;
+
+    {
+        let stdin = std::io::stdin();
+        let mut stdout = std::io::stdout();
+
+        for line in stdin.lock().lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("Error reading from stdin: {e}");
+                    process::exit(1);
+                }
+            };
+
+            let line = line.trim().to_string();
+
+            if line.is_empty() {
+                // Blank line — ignore (protocol allows trailing blank lines).
+                continue;
+            }
+
+            if line == "capabilities" {
+                // Respond with our capabilities: we support the `connect` protocol.
+                if let Err(e) = writeln!(stdout, "connect") {
+                    eprintln!("Error writing capabilities: {e}");
+                    process::exit(1);
+                }
+                // Blank line terminates the capability listing.
+                if let Err(e) = writeln!(stdout) {
+                    eprintln!("Error writing capabilities terminator: {e}");
+                    process::exit(1);
+                }
+                if let Err(e) = stdout.flush() {
+                    eprintln!("Error flushing stdout: {e}");
+                    process::exit(1);
+                }
+            } else if let Some(service) = line.strip_prefix("connect ") {
+                // Respond with a blank line to indicate we're ready.
+                if let Err(e) = writeln!(stdout) {
+                    eprintln!("Error writing connect ack: {e}");
+                    process::exit(1);
+                }
+                if let Err(e) = stdout.flush() {
+                    eprintln!("Error flushing stdout: {e}");
+                    process::exit(1);
+                }
+
+                // Record the service and break out of the loop so the StdinLock
+                // is dropped before we spawn the child process.
+                connect_service = Some(service.to_string());
+                break;
+            } else {
+                eprintln!("Error: unsupported remote helper command: {line}");
+                process::exit(1);
+            }
+        }
+    } // StdinLock is dropped here.
+
+    if let Some(service) = connect_service {
+        // Spawn `sandbox ssh <session> -- <service> <repo_path>` with inherited
+        // stdin/stdout/stderr so git gets a true bidirectional pipe to the
+        // remote git process inside the VM via SSH.
+        let sandbox_bin = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Error: failed to determine sandbox binary path: {e}");
+                process::exit(1);
+            }
+        };
+
+        // Use sudo because the guest agent (which creates repos) runs as root,
+        // but limactl shell connects as the default (non-root) Lima user.
+        let status = std::process::Command::new(&sandbox_bin)
+            .args([
+                "--socket",
+                &socket_path,
+                "ssh",
+                &session,
+                "--",
+                "sudo",
+                &service,
+                &repo_path,
+            ])
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .status();
+
+        match status {
+            Ok(exit_status) => {
+                process::exit(exit_status.code().unwrap_or(1));
+            }
+            Err(e) => {
+                eprintln!("Error: failed to execute sandbox ssh: {e}");
+                process::exit(128);
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
+    // Check if we were invoked as git-remote-sandbox (git remote helper mode).
+    if invoked_as_remote_helper() {
+        run_remote_helper();
+        return;
+    }
+
     let cli = Cli::parse();
 
     // Handle ssh specially — it doesn't follow the normal request/response flow.
@@ -1894,5 +2084,43 @@ mod tests {
             repo_path: "/root/workspace".into(),
         };
         assert!(build_request(&cmd).is_none());
+    }
+
+    // -- Remote helper URL parsing tests ------------------------------------
+
+    #[test]
+    fn parse_remote_helper_url_session_and_path() {
+        let (session, repo_path) =
+            parse_remote_helper_url("my-session/root/workspace/repo.git").unwrap();
+        assert_eq!(session, "my-session");
+        assert_eq!(repo_path, "/root/workspace/repo.git");
+    }
+
+    #[test]
+    fn parse_remote_helper_url_with_scheme_prefix() {
+        // git may pass the full URL including the sandbox:: prefix.
+        let (session, repo_path) =
+            parse_remote_helper_url("sandbox::my-session/root/workspace/repo").unwrap();
+        assert_eq!(session, "my-session");
+        assert_eq!(repo_path, "/root/workspace/repo");
+    }
+
+    #[test]
+    fn parse_remote_helper_url_session_only() {
+        // No slash — defaults to /root/workspace.
+        let (session, repo_path) = parse_remote_helper_url("my-session").unwrap();
+        assert_eq!(session, "my-session");
+        assert_eq!(repo_path, "/root/workspace");
+    }
+
+    #[test]
+    fn parse_remote_helper_url_empty() {
+        assert!(parse_remote_helper_url("").is_err());
+    }
+
+    #[test]
+    fn parse_remote_helper_url_empty_session() {
+        // Starts with slash — empty session name.
+        assert!(parse_remote_helper_url("/root/workspace").is_err());
     }
 }
