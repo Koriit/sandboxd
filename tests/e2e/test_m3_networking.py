@@ -212,27 +212,83 @@ def test_denied_traffic(sandbox_cli):
             f"Output:\n{output}"
         )
 
-        # 3. Verify that UDP traffic to a non-DNS port on an external IP is
-        #    blocked. The DNAT rules only redirect DNS (port 53) and TCP;
-        #    other UDP traffic from the VM should be dropped by the forward
-        #    chain once it hits the gateway's nftables namespace.
-        #
-        #    We attempt a UDP connection to a public IP on a non-standard
-        #    port. The expectation is that it either times out or is rejected.
-        udp_result = sandbox_cli(
-            "exec", "net-deny-test", "--",
-            "bash", "-c",
-            "echo test | nc -u -w 3 8.8.8.8 9999; echo EXIT:$?",
-            timeout=120,
+        # 3. Structural check: verify nftables rules in the gateway container.
+        gw_container = gateway_container_name(session_id)
+        nft_result = subprocess.run(
+            ["docker", "exec", gw_container, "nft", "list", "ruleset"],
+            capture_output=True, text=True, timeout=30,
         )
-        # nc with -w 3 should time out if traffic is blocked. The exit code
-        # will be non-zero (1) on timeout.  We just verify it didn't succeed
-        # cleanly in an unexpected way.  This is a best-effort check since
-        # UDP is connectionless.
-        assert udp_result.returncode != 0 or "EXIT:0" not in udp_result.stdout, (
-            f"UDP traffic to 8.8.8.8:9999 should have been blocked by nftables.\n"
-            f"stdout: {udp_result.stdout}\nstderr: {udp_result.stderr}"
+        assert nft_result.returncode == 0, (
+            f"Failed to list nftables rules in gateway container.\n"
+            f"stdout: {nft_result.stdout}\nstderr: {nft_result.stderr}"
         )
+        nft_rules = nft_result.stdout
+
+        # Verify DNS DNAT rules exist (UDP and TCP port 53 -> CoreDNS).
+        assert re.search(r"udp dport 53 dnat", nft_rules), (
+            f"Missing UDP DNS DNAT rule in gateway nftables.\n"
+            f"nftables output:\n{nft_rules}"
+        )
+        assert re.search(r"tcp dport 53 dnat", nft_rules), (
+            f"Missing TCP DNS DNAT rule in gateway nftables.\n"
+            f"nftables output:\n{nft_rules}"
+        )
+
+        # Verify TCP DNAT rule exists (all non-DNS TCP -> Envoy on port 10000).
+        assert re.search(r"tcp dport != 53 dnat", nft_rules), (
+            f"Missing TCP-to-Envoy DNAT rule in gateway nftables.\n"
+            f"nftables output:\n{nft_rules}"
+        )
+
+        # Verify there is NO DNAT rule for non-DNS UDP traffic.
+        # The only UDP DNAT should be for port 53.  A blanket "udp dnat"
+        # without a port restriction would be a misconfiguration.
+        udp_dnat_lines = [
+            line.strip() for line in nft_rules.splitlines()
+            if "udp" in line and "dnat" in line
+        ]
+        for line in udp_dnat_lines:
+            assert "dport 53" in line, (
+                f"Found unexpected non-DNS UDP DNAT rule: {line!r}\n"
+                f"Only DNS (port 53) UDP should be DNATted.\n"
+                f"nftables output:\n{nft_rules}"
+            )
+
+        # Verify cloud metadata (169.254.169.254) is blocked in the rules.
+        assert "169.254.169.254" in nft_rules and "drop" in nft_rules, (
+            f"Missing cloud metadata block rule in gateway nftables.\n"
+            f"nftables output:\n{nft_rules}"
+        )
+
+        # Verify the forward chain restricts traffic to the gateway IP
+        # (not a blanket accept from VM subnet).  After DNAT, legitimate
+        # traffic has its destination rewritten to the gateway.  The forward
+        # chain should require "ip daddr <gateway_ip>" so non-DNS UDP
+        # (which was NOT DNAT'd) gets rejected.
+        forward_lines = []
+        in_forward = False
+        for line in nft_rules.splitlines():
+            if "chain forward" in line:
+                in_forward = True
+            elif in_forward and "}" in line:
+                break
+            elif in_forward:
+                forward_lines.append(line.strip())
+
+        # The forward chain should have "ip daddr" restriction — no blanket accept.
+        accept_lines = [l for l in forward_lines if "accept" in l and "saddr" in l]
+        for line in accept_lines:
+            assert "daddr" in line, (
+                f"Forward chain has blanket accept without daddr restriction: {line!r}\n"
+                f"Non-DNS UDP would escape the sandbox unproxied.\n"
+                f"nftables output:\n{nft_rules}"
+            )
+
+        # Note: we do NOT behaviorally test UDP blocking here. UDP is
+        # connectionless — nc -u sendto() succeeds immediately before the
+        # kernel's ICMP reject arrives, making behavioral assertions unreliable.
+        # The structural check above (forward chain requires daddr match)
+        # verifies the rules are correct; the kernel enforces them.
 
         # 4. Clean up.
         sandbox_cli("rm", "net-deny-test", timeout=120)

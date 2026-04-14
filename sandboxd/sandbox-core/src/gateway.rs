@@ -488,7 +488,7 @@ impl GatewayManager {
         self.inject_nftables_ruleset(session_id, &ruleset, "DNAT")?;
 
         // Also update the forward chain to allow forwarding from the VM subnet.
-        let forward_rules = generate_forward_allow_ruleset(&network_info.subnet);
+        let forward_rules = generate_forward_allow_ruleset(&network_info.subnet, container_ip);
         self.inject_nftables_ruleset(session_id, &forward_rules, "forward-allow")?;
 
         // Open the input chain for service ports (DNS, Envoy) from the VM
@@ -855,16 +855,22 @@ table inet sandbox {{
 ///
 /// This replaces the initial deny-all forward chain with one that allows
 /// forwarding from the VM subnet and established return traffic.
-pub fn generate_forward_allow_ruleset(vm_subnet: &str) -> String {
+pub fn generate_forward_allow_ruleset(vm_subnet: &str, gateway_ip: &str) -> String {
     // We use "table inet sandbox" with just the chain we want to replace.
     // nft merges chain definitions, but since we're replacing the forward chain,
     // we first flush it and then add the new rules.
+    //
+    // After DNAT in the prerouting chain, legitimate traffic has its destination
+    // rewritten to the gateway IP.  Non-DNS UDP has no DNAT rule and retains its
+    // original external destination.  By requiring `ip daddr {gateway_ip}` we
+    // only allow traffic that was successfully DNAT'd, blocking non-DNS UDP that
+    // would otherwise escape the sandbox unproxied.
     format!(
         r#"flush chain inet sandbox forward
 table inet sandbox {{
     chain forward {{
-        # Allow forwarding from VM subnet to anywhere (for outbound)
-        ip saddr {vm_subnet} accept
+        # Allow DNAT'd traffic (destination rewritten to gateway by prerouting)
+        ip saddr {vm_subnet} ip daddr {gateway_ip} accept
 
         # Allow established return traffic
         ct state established,related accept
@@ -1085,7 +1091,7 @@ mod tests {
 
     #[test]
     fn test_forward_allow_ruleset() {
-        let ruleset = generate_forward_allow_ruleset("10.209.0.0/28");
+        let ruleset = generate_forward_allow_ruleset("10.209.0.0/28", "10.209.0.2");
 
         // Must flush the existing forward chain first.
         assert!(
@@ -1093,10 +1099,20 @@ mod tests {
             "must flush existing forward chain"
         );
 
-        // Must allow forwarding from VM subnet.
+        // Must allow forwarding from VM subnet ONLY to gateway IP (DNAT'd traffic).
         assert!(
-            ruleset.contains("ip saddr 10.209.0.0/28 accept"),
-            "must allow forwarding from VM subnet"
+            ruleset.contains("ip saddr 10.209.0.0/28 ip daddr 10.209.0.2 accept"),
+            "must allow forwarding from VM subnet only to gateway IP\nruleset:\n{ruleset}"
+        );
+
+        // Must NOT have a blanket accept from VM subnet (the old security gap).
+        let has_blanket_accept = ruleset.lines().any(|line| {
+            line.contains("ip saddr 10.209.0.0/28 accept")
+                && !line.contains("ip daddr")
+        });
+        assert!(
+            !has_blanket_accept,
+            "must NOT have blanket accept without daddr restriction\nruleset:\n{ruleset}"
         );
 
         // Must allow established return traffic.
