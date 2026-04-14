@@ -219,10 +219,43 @@ const ALLOWED_DIRS: &[&str] = &["/home/agent/", "/root/", "/tmp/"];
 /// under an allowed prefix (defense-in-depth).
 const DENIED_PREFIXES: &[&str] = &["/proc", "/sys", "/dev", "/etc"];
 
+/// Check whether a path string falls within the allowed directories and
+/// is not in any denied prefix.  Returns `Ok(())` or an error message.
+fn check_path_allowlist(path_str: &str) -> Result<(), String> {
+    // Check against denied system prefixes.
+    for denied in DENIED_PREFIXES {
+        if path_str.starts_with(denied) {
+            return Err(format!("access to {denied} is not allowed"));
+        }
+    }
+
+    // Check that the path is within an allowed directory.
+    let allowed = ALLOWED_DIRS.iter().any(|dir| path_str.starts_with(dir));
+
+    if !allowed {
+        return Err(format!(
+            "path must be within one of: {}",
+            ALLOWED_DIRS.join(", ")
+        ));
+    }
+
+    Ok(())
+}
+
 /// Validate and resolve a guest filesystem path for file transfer.
 ///
 /// The path must resolve to a location within one of [`ALLOWED_DIRS`] and
 /// must not contain `..` traversal components.
+///
+/// After the initial string-prefix check, the function also attempts to
+/// resolve symlinks via [`std::fs::canonicalize`] and re-checks the
+/// resolved path.  This prevents symlink-based escapes where, e.g.,
+/// `/home/agent/link -> /etc/shadow` would pass the prefix check but
+/// actually read a file outside the sandbox.
+///
+/// For paths that do not yet exist (common for uploads), the function
+/// canonicalizes the nearest existing ancestor and verifies that the
+/// ancestor + remaining components still fall within the allowlist.
 fn validate_path(raw: &str) -> Result<PathBuf, String> {
     // Reject empty paths.
     if raw.is_empty() {
@@ -243,32 +276,63 @@ fn validate_path(raw: &str) -> Result<PathBuf, String> {
         PathBuf::from("/home/agent").join(raw)
     };
 
-    // Convert to a string for prefix checks (we cannot canonicalize because
-    // the file may not exist yet for uploads).
+    // First pass: string-prefix check on the literal path.
     let path_str = path.to_string_lossy();
+    check_path_allowlist(&path_str)?;
 
-    // Check against denied system prefixes.
-    for denied in DENIED_PREFIXES {
-        if path_str.starts_with(denied) {
-            return Err(format!(
-                "access to {denied} is not allowed"
-            ));
+    // Second pass: resolve symlinks and re-check.
+    //
+    // `canonicalize` requires the full path to exist.  For uploads the
+    // target file often does not exist yet, so we walk up to find the
+    // nearest existing ancestor, canonicalize that, then append the
+    // remaining (non-existent) tail components and re-check.
+    let resolved = resolve_through_symlinks(&path)?;
+    let resolved_str = resolved.to_string_lossy();
+    check_path_allowlist(&resolved_str).map_err(|e| {
+        format!("{e} (after resolving symlinks: {})", resolved_str)
+    })?;
+
+    Ok(resolved)
+}
+
+/// Resolve a path through symlinks, handling non-existent trailing
+/// components by canonicalizing the deepest existing ancestor.
+fn resolve_through_symlinks(path: &PathBuf) -> Result<PathBuf, String> {
+    // Fast path: if the full path exists, canonicalize directly.
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return Ok(canonical);
+    }
+
+    // Walk up the path to find the deepest existing ancestor.
+    let mut existing = path.clone();
+    let mut tail_components: Vec<std::ffi::OsString> = Vec::new();
+
+    while !existing.exists() {
+        if let Some(file_name) = existing.file_name() {
+            tail_components.push(file_name.to_os_string());
+        } else {
+            // We've reached the root and nothing exists — unusual,
+            // but just return the original path.
+            return Ok(path.clone());
         }
+        existing = match existing.parent() {
+            Some(p) => p.to_path_buf(),
+            None => return Ok(path.clone()),
+        };
     }
 
-    // Check that the path is within an allowed directory.
-    let allowed = ALLOWED_DIRS
-        .iter()
-        .any(|dir| path_str.starts_with(dir));
+    // Canonicalize the existing ancestor (resolves symlinks).
+    let canonical_base = std::fs::canonicalize(&existing).map_err(|e| {
+        format!("failed to resolve path: {e}")
+    })?;
 
-    if !allowed {
-        return Err(format!(
-            "path must be within one of: {}",
-            ALLOWED_DIRS.join(", ")
-        ));
+    // Re-append the non-existent tail components.
+    let mut result = canonical_base;
+    for component in tail_components.into_iter().rev() {
+        result.push(component);
     }
 
-    Ok(path)
+    Ok(result)
 }
 
 /// Handle a file upload request: validate path, decode base64, write file.
@@ -937,6 +1001,60 @@ mod tests {
             result.unwrap(),
             PathBuf::from("/home/agent/workspace/file.txt")
         );
+    }
+
+    #[test]
+    fn test_validate_path_symlink_escape_blocked() {
+        // Create a symlink inside /tmp/ (an allowed dir) that points to
+        // /etc/ (a denied dir).  validate_path should reject the path
+        // because canonicalization reveals the true destination.
+        let link_path = format!(
+            "/tmp/sandbox-symlink-test-{}",
+            std::process::id()
+        );
+        // Clean up any leftover symlink from a previous run.
+        let _ = std::fs::remove_file(&link_path);
+
+        // Create symlink: /tmp/sandbox-symlink-test-PID -> /etc
+        std::os::unix::fs::symlink("/etc", &link_path).expect(
+            "failed to create test symlink"
+        );
+
+        // Accessing a file "through" the symlink should fail even though
+        // the literal path starts with /tmp/.
+        let result = validate_path(&format!("{link_path}/passwd"));
+        assert!(
+            result.is_err(),
+            "symlink escaping /tmp/ to /etc/ should be rejected, got: {:?}",
+            result,
+        );
+
+        // Clean up.
+        let _ = std::fs::remove_file(&link_path);
+    }
+
+    #[test]
+    fn test_validate_path_symlink_within_allowed_dir_ok() {
+        // A symlink that stays within an allowed directory should be fine.
+        let target_dir = format!("/tmp/sandbox-symlink-target-{}", std::process::id());
+        let link_path = format!("/tmp/sandbox-symlink-ok-{}", std::process::id());
+        let _ = std::fs::remove_file(&link_path);
+        let _ = std::fs::create_dir_all(&target_dir);
+
+        std::os::unix::fs::symlink(&target_dir, &link_path).expect(
+            "failed to create test symlink"
+        );
+
+        let result = validate_path(&format!("{link_path}/file.txt"));
+        assert!(
+            result.is_ok(),
+            "symlink within /tmp/ should be allowed, got: {:?}",
+            result,
+        );
+
+        // Clean up.
+        let _ = std::fs::remove_file(&link_path);
+        let _ = std::fs::remove_dir(&target_dir);
     }
 
     // -- File upload/download handler tests ---------------------------------

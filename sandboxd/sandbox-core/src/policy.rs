@@ -636,16 +636,12 @@ impl PolicyCompiler {
 
         // -- Clusters -----------------------------------------------------------
 
-        let mut clusters = Vec::new();
-
         // original_dst is always needed (L1 passthrough and L2 forwarding).
-        clusters.push(
-            r#"    - name: original_dst
+        let clusters = [r#"    - name: original_dst
       type: ORIGINAL_DST
       lb_policy: CLUSTER_PROVIDED
       connect_timeout: 10s"#
-                .to_string(),
-        );
+            .to_string()];
 
         // Note: the mitmproxy cluster is no longer needed in Envoy.
         // L3 traffic reaches mitmproxy via nftables sandbox_l3 DNAT

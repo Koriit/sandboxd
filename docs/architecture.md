@@ -125,13 +125,14 @@ A session moves through these states:
 ### Create
 
 1. **Session record.** A new session is created in the SQLite database with state `Creating`.
-2. **Lima VM.** A QEMU/KVM virtual machine is created and booted via `limactl`. An auto-generated Lima YAML template configures CPU, memory, disk, and firmware settings. If `--template` is provided, the custom template is used instead.
-3. **Guest agent.** The `sandbox-guest` binary is copied into the VM and started. The daemon verifies connectivity with a ping.
-4. **State transition.** Session state moves to `Running`.
-5. **Networking.** A per-session Docker bridge and gateway container are created. The VM's bridge NIC is attached at boot time via `qemu-bridge-helper` (no QMP hot-add). The per-session CA certificate is generated and injected into the VM's trust store.
-6. **Policy.** If `--policy` was provided, the policy is compiled and distributed to gateway components. A DNS propagation loop is started.
-7. **Workspace.** If `--repo` was provided, the repository is cloned into `/home/agent/workspace/`. If `--workspace shared:<path>` was provided, the host directory is mounted via 9p.
-8. **Boot command.** If `--boot-cmd` was provided, it is executed via the guest agent.
+2. **CA + Networking.** The per-session CA certificate is generated. A per-session Docker bridge network is created (the bridge must exist before VM boot so `qemu-bridge-helper` can attach the NIC).
+3. **Lima VM.** A QEMU/KVM virtual machine is created and booted via `limactl`. An auto-generated Lima YAML template configures CPU, memory, disk, and firmware settings. The bridge NIC is attached at boot time via `qemu-bridge-helper` (no QMP hot-add). If `--template` is provided, the custom template is used instead.
+4. **Guest agent.** The `sandbox-guest` binary is copied into the VM and started. The daemon verifies connectivity with a ping.
+5. **Gateway + Network config.** The gateway container is created on the Docker bridge. The VM's bridge NIC is configured with a static IP via the guest agent. The CA certificate is injected into the VM's trust store.
+6. **State transition.** Session state moves to `Running`.
+7. **Policy.** If `--policy` was provided, the policy is compiled and distributed to gateway components. A DNS propagation loop is started.
+8. **Workspace.** If `--repo` was provided, the repository is cloned into `/home/agent/workspace/`. If `--workspace shared:<path>` was provided, the host directory is mounted via 9p.
+9. **Boot command.** If `--boot-cmd` was provided, it is executed via the guest agent.
 
 ### Stop
 
@@ -231,7 +232,7 @@ Without a policy, all outbound network traffic is blocked. DNS queries return NX
 
 ### SQLite database
 
-The daemon stores session metadata in a SQLite database at `<base-dir>/sandboxd.db`. The database contains:
+The daemon stores session metadata in a SQLite database at `<base-dir>/sessions.db`. The database contains:
 
 - Session records (ID, name, state, config, timestamps)
 - Network info per session (subnet, IPs, Docker network name, TAP name)

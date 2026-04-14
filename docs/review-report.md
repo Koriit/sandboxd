@@ -81,14 +81,69 @@ All 4 deferred items from the review have been resolved:
 - **Proper git remote helper** — Replaced `ext::` transport (blocked by modern git) with `git-remote-sandbox` implementing the git remote helper protocol. Uses `connect` capability with bidirectional SSH transport via `sandbox ssh`.
 - **5 new CLI unit tests** — URL parsing for the remote helper (`parse_remote_helper_url`).
 
+## Review 2 Findings (M85-S8)
+
+Comprehensive 6-track audit with cargo-llvm-cov code coverage analysis.
+
+### Code quality (4 fixes)
+1. **Clippy warning** — `vec_init_then_push` in policy.rs, replaced with array literal.
+2. **`#[allow(dead_code)]` on unused field** — `prefix_len` in SubnetAllocator renamed to `_prefix_len`.
+3. **`expect()` in HTTP handler** — could crash daemon on edge-case filesystem state. Replaced with proper error handling.
+4. **Blocking `std::process::Command` in 3 async background loops** — `dns_propagation_loop`, `gateway_monitor`, `reconcile_networking` now use `spawn_blocking` (10+ call sites wrapped).
+
+### Unit test quality (4 fixes)
+1. **4 tautological tests removed** from gateway.rs — tested compiler-derived traits (PartialEq, Debug, Clone) and duplicated exact-value test.
+2. **8 new unit tests added** — 6 for YAML path sanitization in lima.rs, 2 for symlink traversal protection in guest agent.
+
+### E2E test quality (6 fixes)
+1. **Created `test_m6_hardening.py`** — 3 new E2E tests for QEMU hardening verification (seccomp, device lockdown, cgroup limits, `--no-hardening` flag).
+2. **Strengthened 4 "example" substring assertions** in test_m4_policy.py — now check for `"Example Domain"` instead of `"example"`.
+3. **Strengthened TLS certificate verification** — now checks for Organization field in issuer, not just string presence.
+
+### Security (2 fixes)
+1. **YAML template injection** — SharedWorkspace `host_path` now validated against shell/YAML metacharacters before interpolation into Lima template.
+2. **Symlink traversal in guest agent** — path validation now canonicalizes paths through symlinks and re-checks against allowlist. Handles non-existent paths by canonicalizing the nearest existing ancestor.
+
+### Documentation (3 fixes)
+1. **Wrong DB filename** — architecture.md said `sandboxd.db`, actual code uses `sessions.db`.
+2. **Wrong session create ordering** — architecture.md listed VM before networking. Corrected: networking (Docker bridge) is created first so it exists at VM boot time for `qemu-bridge-helper`.
+3. **Wrong E2E test count** — CLAUDE.md said "30 tests across 8 files", corrected to "33 tests across 7 files".
+
+### Coverage report
+
+| File | Line Coverage |
+|------|-------------|
+| policy.rs | 99.45% |
+| api.rs | 100% |
+| error.rs | 100% |
+| session.rs | 98.26% |
+| dns_propagation.rs | 87.41% |
+| guest.rs (sandbox-guest) | 87.78% |
+| store.rs | 85.44% |
+| ca.rs | 81.31% |
+| guest.rs (connector) | 82.83% |
+| lima.rs | 58.10% |
+| qmp.rs | 56.18% |
+| network.rs | 48.26% |
+| sandbox-cli/main.rs | 49.33% |
+| vm_network.rs | 42.67% |
+| gateway.rs | 22.97% (Docker integration) |
+| sandboxd/main.rs | 8.00% (HTTP handlers) |
+| policy_distributor.rs | 0% (Docker integration) |
+| **TOTAL** | **62.77%** |
+
+Low-coverage files are integration-heavy (Docker/Lima operations). The pure logic modules (policy, api, error, session, store) have excellent coverage.
+
 ## Final Numbers
 
 | Metric | Value |
 |--------|-------|
-| Unit tests | 405 passing, 5 ignored |
-| E2E tests | 30 passing |
-| Tautological tests removed | 7 |
-| Stale doc references fixed | 15+ |
+| Unit tests | 409 passing, 5 ignored |
+| E2E tests | 33 (across 7 files) |
+| Tautological tests removed | 11 total (7 in review 1, 4 in review 2) |
+| Stale doc references fixed | 18+ |
 | Bug fixes | 1 (envoy_written) |
-| Security fixes | 1 (shell quoting) |
+| Security fixes | 3 (shell quoting, YAML injection, symlink traversal) |
+| Async correctness fixes | 2 rounds (handlers in M85-S5, background loops in M85-S8) |
 | Deferred items resolved | 4/4 |
+| Overall line coverage | 62.77% |

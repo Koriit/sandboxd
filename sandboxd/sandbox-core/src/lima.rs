@@ -547,6 +547,14 @@ impl LimaManager {
     // -- template generation ------------------------------------------------
 
     /// Generate the Lima YAML template for a session.
+    ///
+    /// # Panics
+    ///
+    /// Panics (via `sanitize_yaml_path`) if a shared-workspace `host_path`
+    /// contains characters that are unsafe for YAML interpolation.  In
+    /// practice this cannot happen because `WorkspaceMode::parse_flag`
+    /// validates the path before it reaches this point, but the check here
+    /// acts as defense-in-depth.
     pub fn generate_template(
         &self,
         session_id: &Uuid,
@@ -571,11 +579,16 @@ impl LimaManager {
         // trade-off — see docs/workspaces.md.
         let mounts_section = match &config.workspace_mode {
             Some(WorkspaceMode::Shared { host_path }) => {
+                // Validate the host_path contains only characters safe for
+                // YAML string interpolation.  This prevents injection of
+                // arbitrary YAML via crafted directory names containing
+                // quotes, newlines, or other YAML-special characters.
+                let safe_path = sanitize_yaml_path(host_path);
                 format!(
                     "\
 mountType: \"9p\"
 mounts:
-- location: \"{host_path}\"
+- location: \"{safe_path}\"
   mountPoint: \"/home/agent/workspace\"
   writable: true
   9p:
@@ -864,6 +877,37 @@ fn resolve_binary_from_path(name: &str) -> Result<PathBuf, SandboxError> {
     Ok(PathBuf::from(path))
 }
 
+/// Sanitise a filesystem path for safe interpolation into a YAML
+/// double-quoted string.
+///
+/// YAML double-quoted strings interpret backslash escapes and treat `"`
+/// as the string terminator.  A malicious directory name such as
+/// `foo"\nnewkey: injected` could therefore inject arbitrary YAML when
+/// interpolated with `format!("location: \"{path}\"")`.
+///
+/// This function validates that every character in the path is in a
+/// known-safe set for filesystem paths:
+///
+///   alphanumeric, `/`, `-`, `_`, `.`, ` `, `+`, `@`, `~`, `:`
+///
+/// If any other character is found the function panics — this is
+/// intentional because an unsafe path reaching template generation is a
+/// programming error (the caller should validate earlier).
+fn sanitize_yaml_path(path: &str) -> &str {
+    for (i, ch) in path.char_indices() {
+        if !(ch.is_alphanumeric()
+            || matches!(ch, '/' | '-' | '_' | '.' | ' ' | '+' | '@' | '~' | ':'))
+        {
+            panic!(
+                "host_path contains unsafe character {:?} at index {} — \
+                 refusing to interpolate into YAML template: {:?}",
+                ch, i, path,
+            );
+        }
+    }
+    path
+}
+
 /// Convert MiB to GiB as a human-friendly string.
 ///
 /// If the value divides evenly into GiB, returns a whole number (e.g. "4").
@@ -1118,6 +1162,50 @@ mod tests {
             !template.contains("9p:"),
             "clone workspace should not reference 9p mount config"
         );
+    }
+
+    // -- YAML path sanitization -----------------------------------------------
+
+    #[test]
+    fn test_sanitize_yaml_path_normal_paths() {
+        // Normal filesystem paths should pass through unchanged.
+        assert_eq!(sanitize_yaml_path("/home/user/project"), "/home/user/project");
+        assert_eq!(sanitize_yaml_path("/tmp/my-dir_v2"), "/tmp/my-dir_v2");
+        assert_eq!(sanitize_yaml_path("/home/user/My Project"), "/home/user/My Project");
+        assert_eq!(
+            sanitize_yaml_path("/home/user/.config/app"),
+            "/home/user/.config/app"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "unsafe character")]
+    fn test_sanitize_yaml_path_rejects_double_quote() {
+        sanitize_yaml_path("/home/user/project\"injected");
+    }
+
+    #[test]
+    #[should_panic(expected = "unsafe character")]
+    fn test_sanitize_yaml_path_rejects_newline() {
+        sanitize_yaml_path("/home/user/project\nnewkey: injected");
+    }
+
+    #[test]
+    #[should_panic(expected = "unsafe character")]
+    fn test_sanitize_yaml_path_rejects_backslash() {
+        sanitize_yaml_path("/home/user/project\\evil");
+    }
+
+    #[test]
+    #[should_panic(expected = "unsafe character")]
+    fn test_sanitize_yaml_path_rejects_backtick() {
+        sanitize_yaml_path("/home/user/`command`");
+    }
+
+    #[test]
+    #[should_panic(expected = "unsafe character")]
+    fn test_sanitize_yaml_path_rejects_dollar() {
+        sanitize_yaml_path("/home/user/$HOME");
     }
 
     // -- QEMU hardening / device lockdown ------------------------------------

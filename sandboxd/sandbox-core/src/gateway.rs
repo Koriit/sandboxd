@@ -902,51 +902,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_gateway_container_name_format() {
-        let session_id = Uuid::new_v4();
-        let name = container_name(&session_id);
-        assert!(name.starts_with("sandbox-gw-"));
-        assert!(name.len() > "sandbox-gw-".len());
-    }
-
-    // -- GatewayStatus tests ------------------------------------------------
-
-    #[test]
-    fn test_gateway_status_types() {
-        let healthy = GatewayStatus::Healthy;
-        let unhealthy = GatewayStatus::Unhealthy("Envoy not ready".into());
-        let not_running = GatewayStatus::NotRunning;
-
-        assert_eq!(healthy, GatewayStatus::Healthy);
-        assert_eq!(
-            unhealthy,
-            GatewayStatus::Unhealthy("Envoy not ready".into())
-        );
-        assert_eq!(not_running, GatewayStatus::NotRunning);
-        assert_ne!(healthy, not_running);
-    }
-
-    #[test]
-    fn test_gateway_status_debug() {
-        // Verify Debug is implemented.
-        let status = GatewayStatus::Healthy;
-        let debug_str = format!("{:?}", status);
-        assert_eq!(debug_str, "Healthy");
-
-        let status = GatewayStatus::Unhealthy("test".into());
-        let debug_str = format!("{:?}", status);
-        assert!(debug_str.contains("Unhealthy"));
-        assert!(debug_str.contains("test"));
-    }
-
-    #[test]
-    fn test_gateway_status_clone() {
-        let original = GatewayStatus::Unhealthy("something broke".into());
-        let cloned = original.clone();
-        assert_eq!(original, cloned);
-    }
-
     // -- Deny-all ruleset tests ---------------------------------------------
 
     #[test]

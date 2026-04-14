@@ -297,10 +297,25 @@ async fn create_session(
 
     // 4. Install the guest agent into the VM.
     let guest_binary_path = match std::env::current_exe() {
-        Ok(exe) => exe
-            .parent()
-            .expect("executable must have a parent directory")
-            .join("sandbox-guest"),
+        Ok(exe) => match exe.parent() {
+            Some(dir) => dir.join("sandbox-guest"),
+            None => {
+                let lima = state.lima.clone();
+                let network = state.network.clone();
+                let base_dir = state.base_dir.clone();
+                let sid = session_id;
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = lima.delete_vm(&sid);
+                    let _ = network.delete_network(&sid);
+                    let _ = CaManager::remove_session_ca(&base_dir, &sid);
+                }).await;
+                let _ = state.store.update_state(&session_id, SessionState::Error);
+                return error_response(SandboxError::Internal(
+                    "executable path has no parent directory".to_string(),
+                ))
+                .into_response();
+            }
+        },
         Err(e) => {
             let lima = state.lima.clone();
             let network = state.network.clone();
@@ -1445,13 +1460,25 @@ async fn dns_propagation_loop(
         };
 
         // Read resolved.json from the gateway container.
-        let report = match read_resolved_json(&session_id) {
-            Ok(r) => r,
-            Err(e) => {
+        let sid = session_id;
+        let report = match tokio::task::spawn_blocking(move || {
+            read_resolved_json(&sid)
+        }).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
                 warn!(
                     session_id = %session_id,
                     error = %e,
                     "DNS propagation: failed to read resolved.json"
+                );
+                tokio::time::sleep(poll_interval).await;
+                continue;
+            }
+            Err(e) => {
+                warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "DNS propagation: spawn_blocking join error reading resolved.json"
                 );
                 tokio::time::sleep(poll_interval).await;
                 continue;
@@ -1489,14 +1516,30 @@ async fn dns_propagation_loop(
         }
 
         // Propagate the current cache state to nftables.
-        if let Err(e) =
-            propagate_dns_changes(&session_id, &policy, &cache, &gateway, &network_info)
-        {
-            warn!(
-                session_id = %session_id,
-                error = %e,
-                "DNS propagation: failed to update nftables"
-            );
+        let gw = Arc::clone(&gateway);
+        let pol = policy.clone();
+        let c = cache.clone();
+        let ni = network_info.clone();
+        let sid = session_id;
+        let propagate_result = tokio::task::spawn_blocking(move || {
+            propagate_dns_changes(&sid, &pol, &c, &gw, &ni)
+        }).await;
+        match propagate_result {
+            Ok(Err(e)) => {
+                warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "DNS propagation: failed to update nftables"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "DNS propagation: spawn_blocking join error updating nftables"
+                );
+            }
+            Ok(Ok(())) => {}
         }
 
         // Sleep at the end so the first iteration runs immediately after
@@ -2060,11 +2103,36 @@ async fn reconcile_networking(state: &AppState) {
         match session.state {
             SessionState::Running => {
                 // Check if gateway is running.
-                match state.gateway.gateway_status(&session.id) {
-                    Ok(GatewayStatus::Healthy) => {
+                let gw = Arc::clone(&state.gateway);
+                let sid = session.id;
+                let status_result = tokio::task::spawn_blocking(move || {
+                    gw.gateway_status(&sid)
+                }).await;
+                let gw_status = match status_result {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
+                        warn!(
+                            session_id = %session.id,
+                            error = %e,
+                            "network reconciliation: failed to check gateway status"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(
+                            session_id = %session.id,
+                            error = %e,
+                            "network reconciliation: spawn_blocking join error checking gateway status"
+                        );
+                        continue;
+                    }
+                };
+
+                match gw_status {
+                    GatewayStatus::Healthy => {
                         // Gateway is healthy, nothing to do.
                     }
-                    Ok(status) => {
+                    status => {
                         warn!(
                             session_id = %session.id,
                             gateway_status = ?status,
@@ -2092,13 +2160,29 @@ async fn reconcile_networking(state: &AppState) {
                             };
 
                         // Ensure Docker network exists.
-                        if let Err(e) = state.network.ensure_network(&session.id) {
-                            warn!(
-                                session_id = %session.id,
-                                error = %e,
-                                "network reconciliation: failed to ensure Docker network"
-                            );
-                            continue;
+                        let net = Arc::clone(&state.network);
+                        let sid = session.id;
+                        let ensure_result = tokio::task::spawn_blocking(move || {
+                            net.ensure_network(&sid)
+                        }).await;
+                        match ensure_result {
+                            Ok(Err(e)) => {
+                                warn!(
+                                    session_id = %session.id,
+                                    error = %e,
+                                    "network reconciliation: failed to ensure Docker network"
+                                );
+                                continue;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    session_id = %session.id,
+                                    error = %e,
+                                    "network reconciliation: spawn_blocking join error ensuring Docker network"
+                                );
+                                continue;
+                            }
+                            Ok(Ok(_)) => {}
                         }
 
                         // Get CA directory.
@@ -2118,62 +2202,88 @@ async fn reconcile_networking(state: &AppState) {
                             let policies = state.session_policies.lock().await;
                             policies.contains_key(&session.id)
                         };
+                        let init_dns_str = "# Default allow-all policy (no policy specified)\n*\n";
                         let init_dns = if !has_policy {
-                            Some("# Default allow-all policy (no policy specified)\n*\n")
+                            Some(init_dns_str)
                         } else {
                             None
                         };
 
                         // Restart the gateway.
-                        if let Err(e) = state
-                            .gateway
-                            .restart_gateway(&session.id, &network_info, ca_ref, init_dns)
-                        {
-                            warn!(
-                                session_id = %session.id,
-                                error = %e,
-                                "network reconciliation: failed to restart gateway"
-                            );
-                        } else {
-                            info!(
-                                session_id = %session.id,
-                                "network reconciliation: gateway restarted"
-                            );
-                            // Re-apply the session's policy to the fresh gateway.
-                            reapply_session_policy(&session.id, state).await;
-                            restored += 1;
+                        let gw = Arc::clone(&state.gateway);
+                        let sid = session.id;
+                        let ni = network_info.clone();
+                        let ca_owned = ca_ref.map(|p| p.to_path_buf());
+                        let init_dns_owned = init_dns.map(|s| s.to_string());
+                        let restart_result = tokio::task::spawn_blocking(move || {
+                            gw.restart_gateway(
+                                &sid,
+                                &ni,
+                                ca_owned.as_deref(),
+                                init_dns_owned.as_deref(),
+                            )
+                        }).await;
+                        match restart_result {
+                            Ok(Err(e)) => {
+                                warn!(
+                                    session_id = %session.id,
+                                    error = %e,
+                                    "network reconciliation: failed to restart gateway"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    session_id = %session.id,
+                                    error = %e,
+                                    "network reconciliation: spawn_blocking join error restarting gateway"
+                                );
+                            }
+                            Ok(Ok(())) => {
+                                info!(
+                                    session_id = %session.id,
+                                    "network reconciliation: gateway restarted"
+                                );
+                                // Re-apply the session's policy to the fresh gateway.
+                                reapply_session_policy(&session.id, state).await;
+                                restored += 1;
+                            }
                         }
-                    }
-                    Err(e) => {
-                        warn!(
-                            session_id = %session.id,
-                            error = %e,
-                            "network reconciliation: failed to check gateway status"
-                        );
                     }
                 }
             }
             SessionState::Stopped => {
                 // Ensure lingering gateway and TAP are cleaned up.
-                match state.gateway.gateway_status(&session.id) {
-                    Ok(GatewayStatus::NotRunning) => {
+                let gw = Arc::clone(&state.gateway);
+                let sid = session.id;
+                let status_result = tokio::task::spawn_blocking(move || {
+                    gw.gateway_status(&sid)
+                }).await;
+                match status_result {
+                    Ok(Ok(GatewayStatus::NotRunning)) => {
                         // Already clean.
                     }
-                    Ok(_) => {
+                    Ok(Ok(_)) => {
                         info!(
                             session_id = %session.id,
                             "network reconciliation: cleaning up lingering gateway for stopped session"
                         );
-                        let _ = state.gateway.stop_gateway(&session.id);
+                        let gw = Arc::clone(&state.gateway);
+                        let sid = session.id;
+                        let _ = tokio::task::spawn_blocking(move || {
+                            gw.stop_gateway(&sid)
+                        }).await;
                         cleaned += 1;
                     }
-                    Err(_) => {
-                        // Container doesn't exist, that's fine.
+                    Ok(Err(_)) | Err(_) => {
+                        // Container doesn't exist or join error, that's fine.
                     }
                 }
 
                 // Best-effort TAP cleanup (no-op: TAP is owned by QEMU).
-                let _ = detach_vm_from_bridge(&session.id);
+                let sid = session.id;
+                let _ = tokio::task::spawn_blocking(move || {
+                    detach_vm_from_bridge(&sid)
+                }).await;
             }
             _ => {}
         }
@@ -2214,13 +2324,26 @@ async fn gateway_monitor(state: Arc<AppState>) {
                 continue;
             }
 
-            let status = match state.gateway.gateway_status(&session.id) {
-                Ok(s) => s,
-                Err(e) => {
+            let gw = Arc::clone(&state.gateway);
+            let sid = session.id;
+            let status_result = tokio::task::spawn_blocking(move || {
+                gw.gateway_status(&sid)
+            }).await;
+            let status = match status_result {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
                     warn!(
                         session_id = %session.id,
                         error = %e,
                         "gateway monitor: failed to check gateway status"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    warn!(
+                        session_id = %session.id,
+                        error = %e,
+                        "gateway monitor: spawn_blocking join error checking gateway status"
                     );
                     continue;
                 }
@@ -2257,13 +2380,29 @@ async fn gateway_monitor(state: Arc<AppState>) {
                     };
 
                     // Ensure Docker network is present.
-                    if let Err(e) = state.network.ensure_network(&session.id) {
-                        warn!(
-                            session_id = %session.id,
-                            error = %e,
-                            "gateway monitor: failed to ensure Docker network"
-                        );
-                        continue;
+                    let net = Arc::clone(&state.network);
+                    let sid = session.id;
+                    let ensure_result = tokio::task::spawn_blocking(move || {
+                        net.ensure_network(&sid)
+                    }).await;
+                    match ensure_result {
+                        Ok(Err(e)) => {
+                            warn!(
+                                session_id = %session.id,
+                                error = %e,
+                                "gateway monitor: failed to ensure Docker network"
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!(
+                                session_id = %session.id,
+                                error = %e,
+                                "gateway monitor: spawn_blocking join error ensuring Docker network"
+                            );
+                            continue;
+                        }
+                        Ok(Ok(_)) => {}
                     }
 
                     // Get CA directory.
@@ -2279,18 +2418,29 @@ async fn gateway_monitor(state: Arc<AppState>) {
                         let policies = state.session_policies.lock().await;
                         policies.contains_key(&session.id)
                     };
+                    let init_dns_str = "# Default allow-all policy (no policy specified)\n*\n";
                     let init_dns = if !has_policy {
-                        Some("# Default allow-all policy (no policy specified)\n*\n")
+                        Some(init_dns_str)
                     } else {
                         None
                     };
 
                     // Restart the gateway.
-                    match state
-                        .gateway
-                        .restart_gateway(&session.id, &network_info, ca_ref, init_dns)
-                    {
-                        Ok(()) => {
+                    let gw = Arc::clone(&state.gateway);
+                    let sid = session.id;
+                    let ni = network_info.clone();
+                    let ca_owned = ca_ref.map(|p| p.to_path_buf());
+                    let init_dns_owned = init_dns.map(|s| s.to_string());
+                    let restart_result = tokio::task::spawn_blocking(move || {
+                        gw.restart_gateway(
+                            &sid,
+                            &ni,
+                            ca_owned.as_deref(),
+                            init_dns_owned.as_deref(),
+                        )
+                    }).await;
+                    match restart_result {
+                        Ok(Ok(())) => {
                             info!(
                                 session_id = %session.id,
                                 "gateway monitor: gateway recovered successfully"
@@ -2298,11 +2448,18 @@ async fn gateway_monitor(state: Arc<AppState>) {
                             // Re-apply the session's policy to the fresh gateway.
                             reapply_session_policy(&session.id, &state).await;
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             error!(
                                 session_id = %session.id,
                                 error = %e,
                                 "gateway monitor: failed to recover gateway"
+                            );
+                        }
+                        Err(e) => {
+                            error!(
+                                session_id = %session.id,
+                                error = %e,
+                                "gateway monitor: spawn_blocking join error recovering gateway"
                             );
                         }
                     }

@@ -44,8 +44,7 @@ struct SubnetAllocator {
     /// Base network address, e.g. `10.209.0.0`.
     base: Ipv4Addr,
     /// Prefix length of the base range (e.g. 24). Retained for diagnostics.
-    #[allow(dead_code)]
-    prefix_len: u8,
+    _prefix_len: u8,
     /// Set of allocated /28 block indices (0..max_blocks).
     allocated: HashSet<u8>,
     /// Maximum number of /28 blocks: 2^(32 - prefix_len) / 16.
@@ -79,7 +78,7 @@ impl SubnetAllocator {
 
         Ok(Self {
             base,
-            prefix_len,
+            _prefix_len: prefix_len,
             allocated: HashSet::new(),
             max_blocks: max_blocks as u8,
         })

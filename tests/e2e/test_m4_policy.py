@@ -136,9 +136,9 @@ def test_level1_transport_tcp(sandbox_cli):
             f"stdout: {curl_result.stdout}\nstderr: {curl_result.stderr}\n"
             f"{capture_lima_logs(session_id)}"
         )
-        # The response body should contain HTML from example.com.
-        assert "example" in curl_result.stdout.lower(), (
-            f"Response does not contain expected content from example.com.\n"
+        # The response body should contain the well-known Example Domain page.
+        assert "Example Domain" in curl_result.stdout, (
+            f"Response does not contain 'Example Domain' from example.com.\n"
             f"stdout: {curl_result.stdout}"
         )
 
@@ -260,8 +260,8 @@ def test_level2_tls_verified(sandbox_cli):
             f"stdout: {curl_result.stdout}\nstderr: {curl_result.stderr}\n"
             f"{capture_lima_logs(session_id)}"
         )
-        assert "example" in curl_result.stdout.lower(), (
-            f"Response does not contain expected content from example.com.\n"
+        assert "Example Domain" in curl_result.stdout, (
+            f"Response does not contain 'Example Domain' from example.com.\n"
             f"stdout: {curl_result.stdout}"
         )
 
@@ -273,21 +273,32 @@ def test_level2_tls_verified(sandbox_cli):
             "echo | openssl s_client -connect example.com:443 -servername example.com 2>/dev/null | openssl x509 -noout -issuer 2>/dev/null",
             timeout=120,
         )
-        issuer_output = cert_result.stdout.lower()
-        # The real cert issuer should NOT contain mitmproxy or sandbox CA.
-        assert "mitmproxy" not in issuer_output, (
-            f"Certificate issuer contains 'mitmproxy' at TLS level (should be real cert).\n"
-            f"Issuer: {cert_result.stdout}"
-        )
-        assert "sandbox" not in issuer_output, (
-            f"Certificate issuer contains 'sandbox' at TLS level (should be real cert).\n"
-            f"Issuer: {cert_result.stdout}"
-        )
-        # The issuer should be a well-known CA (DigiCert, Let's Encrypt, etc.)
-        # We just verify the field is non-empty and looks like a real issuer.
-        assert "issuer" in issuer_output, (
-            f"Could not extract certificate issuer.\n"
+        issuer_output = cert_result.stdout.strip()
+        issuer_lower = issuer_output.lower()
+
+        # The issuer field must be present and non-empty.
+        assert issuer_output and "issuer" in issuer_lower, (
+            f"Could not extract certificate issuer (empty or missing).\n"
             f"stdout: {cert_result.stdout}\nstderr: {cert_result.stderr}"
+        )
+
+        # The real cert issuer should NOT contain mitmproxy or sandbox CA.
+        assert "mitmproxy" not in issuer_lower, (
+            f"Certificate issuer contains 'mitmproxy' at TLS level (should be real cert).\n"
+            f"Issuer: {issuer_output}"
+        )
+        assert "sandbox" not in issuer_lower, (
+            f"Certificate issuer contains 'sandbox' at TLS level (should be real cert).\n"
+            f"Issuer: {issuer_output}"
+        )
+
+        # The issuer should be a well-known CA.  example.com is typically
+        # signed by DigiCert, but other CAs are possible.  Verify it contains
+        # an organization name (O = ...) which real CAs always provide.
+        assert re.search(r"O\s*=\s*\S", issuer_output), (
+            f"Certificate issuer does not contain an Organization (O=...) field, "
+            f"which is expected from a real CA.\n"
+            f"Issuer: {issuer_output}"
         )
 
         # Clean up.
@@ -356,8 +367,8 @@ def test_level3_http_inspected(sandbox_cli):
             f"stdout: {curl_result.stdout}\nstderr: {curl_result.stderr}\n"
             f"{capture_lima_logs(session_id)}"
         )
-        assert "example" in curl_result.stdout.lower(), (
-            f"Response does not contain expected content from example.com.\n"
+        assert "Example Domain" in curl_result.stdout, (
+            f"Response does not contain 'Example Domain' from example.com.\n"
             f"stdout: {curl_result.stdout}"
         )
 
@@ -650,8 +661,8 @@ def test_policy_update(sandbox_cli):
             f"curl to example.com failed with initial policy.\n"
             f"stdout: {curl_result.stdout}\nstderr: {curl_result.stderr}"
         )
-        assert "example" in curl_result.stdout.lower(), (
-            f"Response does not contain expected content from example.com.\n"
+        assert "Example Domain" in curl_result.stdout, (
+            f"Response does not contain 'Example Domain' from example.com.\n"
             f"stdout: {curl_result.stdout}"
         )
 
