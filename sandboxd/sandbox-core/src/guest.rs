@@ -13,6 +13,7 @@
 //!   the guest via `limactl shell` and sends requests.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -32,6 +33,9 @@ pub const GUEST_AGENT_PORT: u16 = 5123;
 
 /// Maximum message size (1 MB).
 pub const MAX_MESSAGE_SIZE: u32 = 1_048_576;
+
+/// Timeout for a single guest agent request/response cycle.
+const GUEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------
 // Protocol types
@@ -271,43 +275,60 @@ impl GuestConnector {
                 ))
             })?;
 
-        let mut stdin = child.stdin.take().ok_or_else(|| {
-            SandboxError::Internal("failed to capture stdin of limactl shell".into())
-        })?;
-        let mut stdout = child.stdout.take().ok_or_else(|| {
-            SandboxError::Internal("failed to capture stdout of limactl shell".into())
-        })?;
-
-        // Send the request.
-        let payload = serde_json::to_vec(&request).map_err(|e| {
-            SandboxError::Internal(format!("failed to serialize request: {e}"))
-        })?;
-        write_message(&mut stdin, &payload).await?;
-
-        // NOTE: we intentionally keep stdin open until after reading the
-        // response.  Closing it early causes socat (inside the VM, reached
-        // via limactl shell / SSH) to tear down the TCP connection before
-        // the guest agent can send its reply — resulting in
-        // "connection closed while reading message length".  The flush()
-        // inside write_message is sufficient to ensure the data reaches socat.
-
-        // Read the response.
-        let response_bytes = read_message(&mut stdout).await?;
-
-        // Now close stdin so socat exits cleanly.
-        drop(stdin);
-
-        let response: GuestResponse =
-            serde_json::from_slice(&response_bytes).map_err(|e| {
-                SandboxError::Internal(format!(
-                    "failed to deserialize guest response: {e}"
-                ))
+        let result = tokio::time::timeout(GUEST_REQUEST_TIMEOUT, async {
+            let mut stdin = child.stdin.take().ok_or_else(|| {
+                SandboxError::Internal("failed to capture stdin of limactl shell".into())
+            })?;
+            let mut stdout = child.stdout.take().ok_or_else(|| {
+                SandboxError::Internal("failed to capture stdout of limactl shell".into())
             })?;
 
-        // Wait for the child to exit (don't leave zombies).
-        let _ = child.wait().await;
+            // Send the request.
+            let payload = serde_json::to_vec(&request).map_err(|e| {
+                SandboxError::Internal(format!("failed to serialize request: {e}"))
+            })?;
+            write_message(&mut stdin, &payload).await?;
 
-        Ok(response)
+            // NOTE: we intentionally keep stdin open until after reading the
+            // response.  Closing it early causes socat (inside the VM, reached
+            // via limactl shell / SSH) to tear down the TCP connection before
+            // the guest agent can send its reply — resulting in
+            // "connection closed while reading message length".  The flush()
+            // inside write_message is sufficient to ensure the data reaches socat.
+
+            // Read the response.
+            let response_bytes = read_message(&mut stdout).await?;
+
+            // Now close stdin so socat exits cleanly.
+            drop(stdin);
+
+            let response: GuestResponse =
+                serde_json::from_slice(&response_bytes).map_err(|e| {
+                    SandboxError::Internal(format!(
+                        "failed to deserialize guest response: {e}"
+                    ))
+                })?;
+
+            Ok(response)
+        })
+        .await;
+
+        match result {
+            Ok(response) => {
+                // Wait for the child to exit (don't leave zombies).
+                let _ = child.wait().await;
+                response
+            }
+            Err(_elapsed) => {
+                // Timeout: kill the child process to avoid leaving zombies.
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                Err(SandboxError::Timeout {
+                    operation: format!("guest agent request via {vm_name}"),
+                    duration: GUEST_REQUEST_TIMEOUT.as_secs(),
+                })
+            }
+        }
     }
 
     /// Ping the guest agent. Returns `true` if it responds with `Pong`.

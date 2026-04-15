@@ -103,6 +103,7 @@ fn error_response(err: SandboxError) -> (StatusCode, Json<ApiError>) {
         SandboxError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
         SandboxError::Http(_) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
         SandboxError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        SandboxError::Timeout { .. } => (StatusCode::GATEWAY_TIMEOUT, err.to_string()),
     };
     error!(%status, error = %msg, "handler error");
     (status, Json(ApiError::new(msg)))

@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::process;
+use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -422,45 +423,62 @@ fn display_session(session: &Session) {
     println!("Updated:  {} ({})", session.updated_at.format("%Y-%m-%d %H:%M:%S UTC"), format_relative_time(&session.updated_at));
 }
 
+/// Maximum time to wait for the daemon to respond to an HTTP request.
+///
+/// Session creation involves VM boot, guest agent install, and networking
+/// setup, so this must be generous.
+const CLI_HTTP_TIMEOUT: Duration = Duration::from_secs(600);
+
 async fn send_request(
     socket_path: &str,
     req: Request<String>,
 ) -> Result<(hyper::StatusCode, String), String> {
-    let stream = UnixStream::connect(socket_path).await.map_err(|e| {
-        format!(
-            "Cannot connect to sandboxd at {socket_path} \u{2014} is the daemon running? ({e})"
-        )
-    })?;
+    let uri = req.uri().to_string();
 
-    let io = TokioIo::new(stream);
+    tokio::time::timeout(CLI_HTTP_TIMEOUT, async {
+        let stream = UnixStream::connect(socket_path).await.map_err(|e| {
+            format!(
+                "Cannot connect to sandboxd at {socket_path} \u{2014} is the daemon running? ({e})"
+            )
+        })?;
 
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-        .await
-        .map_err(|e| format!("HTTP handshake failed: {e}"))?;
+        let io = TokioIo::new(stream);
 
-    // Spawn the connection driver.
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            eprintln!("connection error: {e}");
-        }
-    });
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .map_err(|e| format!("HTTP handshake failed: {e}"))?;
 
-    let response = sender
-        .send_request(req)
-        .await
-        .map_err(|e| format!("request failed: {e}"))?;
+        // Spawn the connection driver.
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                eprintln!("connection error: {e}");
+            }
+        });
 
-    let status = response.status();
-    let body_bytes = response
-        .into_body()
-        .collect()
-        .await
-        .map_err(|e| format!("failed to read response body: {e}"))?
-        .to_bytes();
+        let response = sender
+            .send_request(req)
+            .await
+            .map_err(|e| format!("request failed: {e}"))?;
 
-    let body = String::from_utf8_lossy(&body_bytes).to_string();
+        let status = response.status();
+        let body_bytes = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| format!("failed to read response body: {e}"))?
+            .to_bytes();
 
-    Ok((status, body))
+        let body = String::from_utf8_lossy(&body_bytes).to_string();
+
+        Ok((status, body))
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(format!(
+            "request to {uri} timed out after {}s",
+            CLI_HTTP_TIMEOUT.as_secs()
+        ))
+    })
 }
 
 /// Handle the response based on the command and status code.

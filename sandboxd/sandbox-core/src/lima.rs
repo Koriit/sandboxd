@@ -1,12 +1,36 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use serde::Deserialize;
 use tracing::{debug, info};
 use uuid::Uuid;
 
 use crate::error::SandboxError;
+use crate::process::run_with_timeout;
 use crate::session::{SessionConfig, WorkspaceMode};
+
+// ---------------------------------------------------------------------------
+// Timeout constants
+// ---------------------------------------------------------------------------
+
+/// Timeout for `limactl create`.
+const CREATE_VM_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Timeout for `limactl start` (VM boot is slow).
+const START_VM_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Timeout for `limactl stop`.
+const STOP_VM_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Timeout for `limactl delete`.
+const DELETE_VM_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Timeout for each step of the guest agent installation sequence.
+const INSTALL_GUEST_AGENT_STEP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Timeout for `limactl list`.
+const LIST_VMS_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -227,12 +251,20 @@ impl LimaManager {
             "creating VM"
         );
 
-        let output = Command::new(&self.limactl)
-            .args(["create", "--name", &vm_name])
-            .arg(&template_path)
-            .arg("--tty=false")
-            .output()
-            .map_err(|e| lima_io_error("limactl create", e))?;
+        let output = run_with_timeout(
+            Command::new(&self.limactl)
+                .args(["create", "--name", &vm_name])
+                .arg(&template_path)
+                .arg("--tty=false"),
+            CREATE_VM_TIMEOUT,
+            "limactl create",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                lima_io_error("limactl create", std::io::Error::new(std::io::ErrorKind::Other, msg))
+            }
+            other => other,
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -267,12 +299,20 @@ impl LimaManager {
             "creating VM with custom template"
         );
 
-        let output = Command::new(&self.limactl)
-            .args(["create", "--name", &vm_name])
-            .arg(&dest)
-            .arg("--tty=false")
-            .output()
-            .map_err(|e| lima_io_error("limactl create", e))?;
+        let output = run_with_timeout(
+            Command::new(&self.limactl)
+                .args(["create", "--name", &vm_name])
+                .arg(&dest)
+                .arg("--tty=false"),
+            CREATE_VM_TIMEOUT,
+            "limactl create",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                lima_io_error("limactl create", std::io::Error::new(std::io::ErrorKind::Other, msg))
+            }
+            other => other,
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -328,9 +368,17 @@ impl LimaManager {
                 .env("SANDBOX_VM_MAC", mac);
         }
 
-        let output = cmd
-            .output()
-            .map_err(|e| lima_io_error("limactl start", e))?;
+        let output = run_with_timeout(
+            &mut cmd,
+            START_VM_TIMEOUT,
+            "limactl start",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                lima_io_error("limactl start", std::io::Error::new(std::io::ErrorKind::Other, msg))
+            }
+            other => other,
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -347,11 +395,19 @@ impl LimaManager {
 
         info!(session_id = %session_id, vm = %vm_name, "stopping VM");
 
-        let output = Command::new(&self.limactl)
-            .args(["stop", &vm_name])
-            .arg("--tty=false")
-            .output()
-            .map_err(|e| lima_io_error("limactl stop", e))?;
+        let output = run_with_timeout(
+            Command::new(&self.limactl)
+                .args(["stop", &vm_name])
+                .arg("--tty=false"),
+            STOP_VM_TIMEOUT,
+            "limactl stop",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                lima_io_error("limactl stop", std::io::Error::new(std::io::ErrorKind::Other, msg))
+            }
+            other => other,
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -368,11 +424,19 @@ impl LimaManager {
 
         info!(session_id = %session_id, vm = %vm_name, "deleting VM");
 
-        let output = Command::new(&self.limactl)
-            .args(["delete", "--force", &vm_name])
-            .arg("--tty=false")
-            .output()
-            .map_err(|e| lima_io_error("limactl delete", e))?;
+        let output = run_with_timeout(
+            Command::new(&self.limactl)
+                .args(["delete", "--force", &vm_name])
+                .arg("--tty=false"),
+            DELETE_VM_TIMEOUT,
+            "limactl delete",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                lima_io_error("limactl delete", std::io::Error::new(std::io::ErrorKind::Other, msg))
+            }
+            other => other,
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -408,10 +472,18 @@ impl LimaManager {
         debug!(vm = %vm_name, binary = %binary_path.display(), "copying guest agent binary");
         let copy_src = binary_path.to_string_lossy().to_string();
         let copy_dst = format!("{vm_name}:/tmp/sandbox-guest");
-        let output = Command::new(&self.limactl)
-            .args(["copy", &copy_src, &copy_dst])
-            .output()
-            .map_err(|e| lima_io_error("limactl copy (guest agent)", e))?;
+        let output = run_with_timeout(
+            Command::new(&self.limactl)
+                .args(["copy", &copy_src, &copy_dst]),
+            INSTALL_GUEST_AGENT_STEP_TIMEOUT,
+            "limactl copy (guest agent)",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                lima_io_error("limactl copy (guest agent)", std::io::Error::new(std::io::ErrorKind::Other, msg))
+            }
+            other => other,
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -422,13 +494,21 @@ impl LimaManager {
 
         // 2. Move the binary to /usr/local/bin with sudo and make it executable.
         debug!(vm = %vm_name, "installing guest agent binary");
-        let output = Command::new(&self.limactl)
-            .args([
-                "shell", &vm_name, "--",
-                "sudo", "mv", "/tmp/sandbox-guest", "/usr/local/bin/sandbox-guest",
-            ])
-            .output()
-            .map_err(|e| lima_io_error("limactl shell mv", e))?;
+        let output = run_with_timeout(
+            Command::new(&self.limactl)
+                .args([
+                    "shell", &vm_name, "--",
+                    "sudo", "mv", "/tmp/sandbox-guest", "/usr/local/bin/sandbox-guest",
+                ]),
+            INSTALL_GUEST_AGENT_STEP_TIMEOUT,
+            "limactl shell mv",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                lima_io_error("limactl shell mv", std::io::Error::new(std::io::ErrorKind::Other, msg))
+            }
+            other => other,
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -437,13 +517,21 @@ impl LimaManager {
             )));
         }
 
-        let output = Command::new(&self.limactl)
-            .args([
-                "shell", &vm_name, "--",
-                "sudo", "chmod", "+x", "/usr/local/bin/sandbox-guest",
-            ])
-            .output()
-            .map_err(|e| lima_io_error("limactl shell chmod", e))?;
+        let output = run_with_timeout(
+            Command::new(&self.limactl)
+                .args([
+                    "shell", &vm_name, "--",
+                    "sudo", "chmod", "+x", "/usr/local/bin/sandbox-guest",
+                ]),
+            INSTALL_GUEST_AGENT_STEP_TIMEOUT,
+            "limactl shell chmod",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                lima_io_error("limactl shell chmod", std::io::Error::new(std::io::ErrorKind::Other, msg))
+            }
+            other => other,
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -455,16 +543,24 @@ impl LimaManager {
         // 3. Create a systemd service file.
         debug!(vm = %vm_name, "creating systemd service");
         let service_unit = GUEST_AGENT_SERVICE_UNIT;
-        let output = Command::new(&self.limactl)
-            .args([
-                "shell", &vm_name, "--",
-                "sudo", "bash", "-c",
-                &format!(
-                    "cat > /etc/systemd/system/sandbox-guest.service << 'UNIT_EOF'\n{service_unit}\nUNIT_EOF"
-                ),
-            ])
-            .output()
-            .map_err(|e| lima_io_error("limactl shell (create service)", e))?;
+        let output = run_with_timeout(
+            Command::new(&self.limactl)
+                .args([
+                    "shell", &vm_name, "--",
+                    "sudo", "bash", "-c",
+                    &format!(
+                        "cat > /etc/systemd/system/sandbox-guest.service << 'UNIT_EOF'\n{service_unit}\nUNIT_EOF"
+                    ),
+                ]),
+            INSTALL_GUEST_AGENT_STEP_TIMEOUT,
+            "limactl shell (create service)",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                lima_io_error("limactl shell (create service)", std::io::Error::new(std::io::ErrorKind::Other, msg))
+            }
+            other => other,
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -475,13 +571,21 @@ impl LimaManager {
 
         // 4. Reload systemd and start the service.
         debug!(vm = %vm_name, "starting guest agent service");
-        let output = Command::new(&self.limactl)
-            .args([
-                "shell", &vm_name, "--",
-                "sudo", "systemctl", "daemon-reload",
-            ])
-            .output()
-            .map_err(|e| lima_io_error("limactl shell (daemon-reload)", e))?;
+        let output = run_with_timeout(
+            Command::new(&self.limactl)
+                .args([
+                    "shell", &vm_name, "--",
+                    "sudo", "systemctl", "daemon-reload",
+                ]),
+            INSTALL_GUEST_AGENT_STEP_TIMEOUT,
+            "limactl shell (daemon-reload)",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                lima_io_error("limactl shell (daemon-reload)", std::io::Error::new(std::io::ErrorKind::Other, msg))
+            }
+            other => other,
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -490,13 +594,21 @@ impl LimaManager {
             )));
         }
 
-        let output = Command::new(&self.limactl)
-            .args([
-                "shell", &vm_name, "--",
-                "sudo", "systemctl", "enable", "--now", "sandbox-guest",
-            ])
-            .output()
-            .map_err(|e| lima_io_error("limactl shell (enable service)", e))?;
+        let output = run_with_timeout(
+            Command::new(&self.limactl)
+                .args([
+                    "shell", &vm_name, "--",
+                    "sudo", "systemctl", "enable", "--now", "sandbox-guest",
+                ]),
+            INSTALL_GUEST_AGENT_STEP_TIMEOUT,
+            "limactl shell (enable service)",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                lima_io_error("limactl shell (enable service)", std::io::Error::new(std::io::ErrorKind::Other, msg))
+            }
+            other => other,
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -748,10 +860,18 @@ provision:
 
     /// Run `limactl list --json` and deserialize the raw entries.
     fn list_vms_raw(&self) -> Result<Vec<LimactlListEntry>, SandboxError> {
-        let output = Command::new(&self.limactl)
-            .args(["list", "--json"])
-            .output()
-            .map_err(|e| lima_io_error("limactl list", e))?;
+        let output = run_with_timeout(
+            Command::new(&self.limactl)
+                .args(["list", "--json"]),
+            LIST_VMS_TIMEOUT,
+            "limactl list",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                lima_io_error("limactl list", std::io::Error::other(msg))
+            }
+            other => other,
+        })?;
 
         // Lima writes a warning to stderr and returns empty stdout when no
         // instances exist.  Treat empty stdout as an empty list.

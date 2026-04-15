@@ -8,6 +8,7 @@ pub mod lima;
 pub mod network;
 pub mod policy;
 pub mod policy_distributor;
+pub mod process;
 pub mod qmp;
 pub mod session;
 pub mod store;
@@ -32,6 +33,7 @@ pub use guest::{
 };
 pub use lima::{LimaManager, VmInfo, VmStatus};
 pub use network::{NetworkInfo, NetworkManager};
+pub use process::run_with_timeout;
 pub use policy::{
     AssuranceLevel, CompiledPolicy, CoreDnsConfig, Destination, HttpConstraints, MitmproxyConfig,
     MitmproxyRule, Policy, PolicyCompiler, PolicyRule, Protocol,

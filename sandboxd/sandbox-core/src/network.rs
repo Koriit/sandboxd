@@ -2,12 +2,27 @@ use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::process::Command;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::error::SandboxError;
+use crate::process::run_with_timeout;
+
+// ---------------------------------------------------------------------------
+// Timeout constants
+// ---------------------------------------------------------------------------
+
+/// Timeout for `docker network create`.
+const CREATE_NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Timeout for `docker network rm`.
+const DELETE_NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Timeout for `docker network inspect`.
+const INSPECT_NETWORK_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -267,24 +282,30 @@ impl NetworkManager {
                 "creating Docker bridge network"
             );
 
-            let output = Command::new("docker")
-                .args([
-                    "network",
-                    "create",
-                    "--driver",
-                    "bridge",
-                    "--subnet",
-                    &subnet,
-                    "--label",
-                    &format!("sandbox.session_id={session_id}"),
-                    "--opt",
-                    &format!("com.docker.network.bridge.name={bridge_name}"),
-                    &docker_network_name,
-                ])
-                .output()
-                .map_err(|e| {
-                    SandboxError::Network(format!("failed to run docker network create: {e}"))
-                })?;
+            let output = run_with_timeout(
+                Command::new("docker")
+                    .args([
+                        "network",
+                        "create",
+                        "--driver",
+                        "bridge",
+                        "--subnet",
+                        &subnet,
+                        "--label",
+                        &format!("sandbox.session_id={session_id}"),
+                        "--opt",
+                        &format!("com.docker.network.bridge.name={bridge_name}"),
+                        &docker_network_name,
+                    ]),
+                CREATE_NETWORK_TIMEOUT,
+                "docker network create",
+            )
+            .map_err(|e| match e {
+                SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                    SandboxError::Network(format!("failed to run docker network create: {msg}"))
+                }
+                other => other,
+            })?;
 
             if output.status.success() {
                 let info = NetworkInfo {
@@ -369,12 +390,18 @@ impl NetworkManager {
             "deleting Docker bridge network"
         );
 
-        let output = Command::new("docker")
-            .args(["network", "rm", &info.docker_network_name])
-            .output()
-            .map_err(|e| {
-                SandboxError::Network(format!("failed to run docker network rm: {e}"))
-            })?;
+        let output = run_with_timeout(
+            Command::new("docker")
+                .args(["network", "rm", &info.docker_network_name]),
+            DELETE_NETWORK_TIMEOUT,
+            "docker network rm",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                SandboxError::Network(format!("failed to run docker network rm: {msg}"))
+            }
+            other => other,
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -438,14 +465,20 @@ impl NetworkManager {
         };
 
         // Check if the Docker network already exists.
-        let check = Command::new("docker")
-            .args(["network", "inspect", &info.docker_network_name])
-            .output()
-            .map_err(|e| {
+        let check = run_with_timeout(
+            Command::new("docker")
+                .args(["network", "inspect", &info.docker_network_name]),
+            INSPECT_NETWORK_TIMEOUT,
+            "docker network inspect",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
                 SandboxError::Network(format!(
-                    "failed to run docker network inspect: {e}"
+                    "failed to run docker network inspect: {msg}"
                 ))
-            })?;
+            }
+            other => other,
+        })?;
 
         if check.status.success() {
             debug!(
@@ -465,26 +498,32 @@ impl NetworkManager {
             "recreating Docker bridge network"
         );
 
-        let output = Command::new("docker")
-            .args([
-                "network",
-                "create",
-                "--driver",
-                "bridge",
-                "--subnet",
-                &info.subnet,
-                "--label",
-                &format!("sandbox.session_id={session_id}"),
-                "--opt",
-                &format!("com.docker.network.bridge.name={}", info.bridge_name),
-                &info.docker_network_name,
-            ])
-            .output()
-            .map_err(|e| {
+        let output = run_with_timeout(
+            Command::new("docker")
+                .args([
+                    "network",
+                    "create",
+                    "--driver",
+                    "bridge",
+                    "--subnet",
+                    &info.subnet,
+                    "--label",
+                    &format!("sandbox.session_id={session_id}"),
+                    "--opt",
+                    &format!("com.docker.network.bridge.name={}", info.bridge_name),
+                    &info.docker_network_name,
+                ]),
+            CREATE_NETWORK_TIMEOUT,
+            "docker network create (ensure)",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
                 SandboxError::Network(format!(
-                    "failed to run docker network create: {e}"
+                    "failed to run docker network create: {msg}"
                 ))
-            })?;
+            }
+            other => other,
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -533,12 +572,18 @@ impl NetworkManager {
             "removing Docker bridge network (keeping allocation)"
         );
 
-        let output = Command::new("docker")
-            .args(["network", "rm", &info.docker_network_name])
-            .output()
-            .map_err(|e| {
-                SandboxError::Network(format!("failed to run docker network rm: {e}"))
-            })?;
+        let output = run_with_timeout(
+            Command::new("docker")
+                .args(["network", "rm", &info.docker_network_name]),
+            DELETE_NETWORK_TIMEOUT,
+            "docker network rm (remove)",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                SandboxError::Network(format!("failed to run docker network rm: {msg}"))
+            }
+            other => other,
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

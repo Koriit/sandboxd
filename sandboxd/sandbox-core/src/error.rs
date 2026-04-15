@@ -34,6 +34,12 @@ pub enum SandboxError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    #[error("{operation} timed out after {duration}s")]
+    Timeout {
+        operation: String,
+        duration: u64,
+    },
 }
 
 /// API error response body returned by the daemon.

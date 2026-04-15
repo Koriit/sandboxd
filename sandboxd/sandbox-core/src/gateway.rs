@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::error::SandboxError;
 use crate::network::NetworkInfo;
+use crate::process::run_with_timeout;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -36,6 +37,21 @@ const COMPONENT_READY_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Interval between component readiness polls.
 const COMPONENT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Timeout for `docker run` when starting the gateway container.
+const DOCKER_RUN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Timeout for `docker stop` when stopping the gateway container.
+const DOCKER_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Timeout for `docker rm` when removing the gateway container.
+const DOCKER_RM_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Timeout for `docker inspect` when checking gateway status.
+const DOCKER_INSPECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Timeout for `docker inspect` when retrieving the container IP.
+const CONTAINER_IP_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
 // GatewayManager
@@ -107,9 +123,12 @@ impl GatewayManager {
         // `docker rm -f` handles both running and stopped containers and
         // exits with an error only when the container does not exist, which
         // we intentionally ignore.
-        let rm_output = Command::new("docker")
-            .args(["rm", "--force", &container_name])
-            .output();
+        let rm_output = run_with_timeout(
+            Command::new("docker")
+                .args(["rm", "--force", &container_name]),
+            DOCKER_RM_TIMEOUT,
+            "docker rm (pre-cleanup)",
+        );
         match rm_output {
             Ok(output) if output.status.success() => {
                 info!(
@@ -197,12 +216,18 @@ impl GatewayManager {
 
         let args_refs: Vec<&str> =
             args.iter().map(|s| s.as_str()).collect();
-        let output = Command::new("docker")
-            .args(&args_refs)
-            .output()
-            .map_err(|e| {
-                SandboxError::Gateway(format!("failed to run docker run: {e}"))
-            })?;
+        let output = run_with_timeout(
+            Command::new("docker")
+                .args(&args_refs),
+            DOCKER_RUN_TIMEOUT,
+            "docker run (gateway)",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                SandboxError::Gateway(format!("failed to run docker run: {msg}"))
+            }
+            other => other,
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -299,12 +324,18 @@ impl GatewayManager {
         }
 
         // Step 2: Stop the container.
-        let output = Command::new("docker")
-            .args(["stop", "--time", "10", &container_name])
-            .output()
-            .map_err(|e| {
-                SandboxError::Gateway(format!("failed to run docker stop: {e}"))
-            })?;
+        let output = run_with_timeout(
+            Command::new("docker")
+                .args(["stop", "--time", "10", &container_name]),
+            DOCKER_STOP_TIMEOUT,
+            "docker stop (gateway)",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                SandboxError::Gateway(format!("failed to run docker stop: {msg}"))
+            }
+            other => other,
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -317,12 +348,18 @@ impl GatewayManager {
         }
 
         // Step 3: Remove the container.
-        let output = Command::new("docker")
-            .args(["rm", "--force", &container_name])
-            .output()
-            .map_err(|e| {
-                SandboxError::Gateway(format!("failed to run docker rm: {e}"))
-            })?;
+        let output = run_with_timeout(
+            Command::new("docker")
+                .args(["rm", "--force", &container_name]),
+            DOCKER_RM_TIMEOUT,
+            "docker rm (gateway)",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                SandboxError::Gateway(format!("failed to run docker rm: {msg}"))
+            }
+            other => other,
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -383,19 +420,23 @@ impl GatewayManager {
         let container_name = container_name(session_id);
 
         // First check if the container is running.
-        let output = Command::new("docker")
-            .args([
-                "inspect",
-                "--format",
-                "{{.State.Running}}",
-                &container_name,
-            ])
-            .output()
-            .map_err(|e| {
-                SandboxError::Gateway(format!(
-                    "failed to run docker inspect: {e}"
-                ))
-            })?;
+        let output = run_with_timeout(
+            Command::new("docker")
+                .args([
+                    "inspect",
+                    "--format",
+                    "{{.State.Running}}",
+                    &container_name,
+                ]),
+            DOCKER_INSPECT_TIMEOUT,
+            "docker inspect (gateway status)",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                SandboxError::Gateway(format!("failed to run docker inspect: {msg}"))
+            }
+            other => other,
+        })?;
 
         if !output.status.success() {
             return Ok(GatewayStatus::NotRunning);
@@ -408,14 +449,18 @@ impl GatewayManager {
         }
 
         // Run the healthcheck script.
-        let output = Command::new("docker")
-            .args(["exec", &container_name, "/healthcheck.sh"])
-            .output()
-            .map_err(|e| {
-                SandboxError::Gateway(format!(
-                    "failed to run healthcheck: {e}"
-                ))
-            })?;
+        let output = run_with_timeout(
+            Command::new("docker")
+                .args(["exec", &container_name, "/healthcheck.sh"]),
+            DOCKER_INSPECT_TIMEOUT,
+            "docker exec (healthcheck)",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                SandboxError::Gateway(format!("failed to run healthcheck: {msg}"))
+            }
+            other => other,
+        })?;
 
         let stdout =
             String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -432,14 +477,17 @@ impl GatewayManager {
     pub fn container_status_str(&self, session_id: &Uuid) -> String {
         let container_name = container_name(session_id);
 
-        let output = Command::new("docker")
-            .args([
-                "inspect",
-                "--format",
-                "{{.State.Status}}",
-                &container_name,
-            ])
-            .output();
+        let output = run_with_timeout(
+            Command::new("docker")
+                .args([
+                    "inspect",
+                    "--format",
+                    "{{.State.Status}}",
+                    &container_name,
+                ]),
+            DOCKER_INSPECT_TIMEOUT,
+            "docker inspect (container status)",
+        );
 
         match output {
             Ok(o) if o.status.success() => {
@@ -474,7 +522,11 @@ impl GatewayManager {
         let mut args = vec!["exec", &container_name];
         args.extend(check_cmd);
 
-        match Command::new("docker").args(&args).output() {
+        match run_with_timeout(
+            Command::new("docker").args(&args),
+            DOCKER_INSPECT_TIMEOUT,
+            &format!("docker exec ({component} health)"),
+        ) {
             Ok(output) if output.status.success() => {
                 "healthy".to_string()
             }
@@ -569,19 +621,25 @@ impl GatewayManager {
     pub fn container_ip(&self, session_id: &Uuid) -> Result<String, SandboxError> {
         let container_name = container_name(session_id);
 
-        let output = Command::new("docker")
-            .args([
-                "inspect",
-                "--format",
-                "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
-                &container_name,
-            ])
-            .output()
-            .map_err(|e| {
+        let output = run_with_timeout(
+            Command::new("docker")
+                .args([
+                    "inspect",
+                    "--format",
+                    "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+                    &container_name,
+                ]),
+            CONTAINER_IP_TIMEOUT,
+            "docker inspect (container IP)",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
                 SandboxError::Gateway(format!(
-                    "failed to inspect container IP for {container_name}: {e}"
+                    "failed to inspect container IP for {container_name}: {msg}"
                 ))
-            })?;
+            }
+            other => other,
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
