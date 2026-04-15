@@ -1,10 +1,13 @@
-.PHONY: build test test-e2e gateway-image clean
+.PHONY: build test test-integration test-e2e gateway-image clean
 
 build:
 	cd sandboxd && cargo build --workspace
 
 test:
 	cd sandboxd && cargo test --workspace --quiet
+
+test-integration: test
+	cd sandboxd && cargo test --package sandbox-core --lib -- --ignored
 
 tests/e2e/.venv/.installed: tests/e2e/pyproject.toml
 	python3 -m venv tests/e2e/.venv
