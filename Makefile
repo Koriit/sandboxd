@@ -7,7 +7,7 @@ test:
 	cd sandboxd && cargo test --workspace --quiet
 
 test-integration: test
-	cd sandboxd && cargo test --package sandbox-core --lib -- --ignored
+	cd sandboxd && cargo test --package sandbox-core --test '*'
 
 tests/e2e/.venv/.installed: tests/e2e/pyproject.toml
 	python3 -m venv tests/e2e/.venv
