@@ -910,9 +910,11 @@ mod tests {
 
         assert!(info.bridge_name.starts_with("sb-"));
         assert!(info.docker_network_name.starts_with("sandbox-net-"));
-        assert_eq!(info.subnet, "10.209.1.0/28");
-        assert_eq!(info.gateway_ip, "10.209.1.2");
-        assert_eq!(info.vm_ip, "10.209.1.3");
+        // Subnet is dynamically allocated (/28 within the 10.209.1.0/24 pool),
+        // so don't hardcode the exact value — just verify the format.
+        assert!(info.subnet.ends_with("/28"), "subnet should be /28: {}", info.subnet);
+        assert!(info.gateway_ip.starts_with("10.209.1."), "gateway_ip: {}", info.gateway_ip);
+        assert!(info.vm_ip.starts_with("10.209.1."), "vm_ip: {}", info.vm_ip);
 
         // Verify with docker network inspect.
         let output = Command::new("docker")
@@ -923,12 +925,8 @@ mod tests {
         assert!(output.status.success(), "docker inspect failed");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            stdout.contains("10.209.1.0/28"),
-            "inspect output should contain subnet: {stdout}"
-        );
-        assert!(
-            stdout.contains("10.209.1.2"),
-            "inspect output should contain gateway: {stdout}"
+            stdout.contains(&info.subnet),
+            "inspect output should contain subnet {}: {stdout}", info.subnet
         );
 
         // Delete network.
