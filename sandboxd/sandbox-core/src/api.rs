@@ -65,6 +65,11 @@ pub struct CreateSessionRequest {
     /// Defaults to `true`. Set to `false` for debugging or when the
     /// hardened configuration causes compatibility issues.
     pub hardened: Option<bool>,
+    /// Skip the pre-baked golden image and use the full create path.
+    ///
+    /// When `true`, the daemon always creates a fresh VM from scratch
+    /// instead of cloning from the base image.
+    pub no_cache: Option<bool>,
 }
 
 /// Request body for `POST /sessions/{id}/upload`.
@@ -212,6 +217,7 @@ mod tests {
         assert!(req.boot_cmd.is_none());
         assert!(req.workspace.is_none());
         assert!(req.hardened.is_none());
+        assert!(req.no_cache.is_none());
     }
 
     #[test]
@@ -515,6 +521,24 @@ mod tests {
         assert!(
             req.hardened.is_none(),
             "hardened should be None when absent from request"
+        );
+    }
+
+    #[test]
+    fn deserialize_create_request_with_no_cache() {
+        let json = r#"{"name": "no-cache-test", "no_cache": true}"#;
+        let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.name.as_deref(), Some("no-cache-test"));
+        assert_eq!(req.no_cache, Some(true));
+    }
+
+    #[test]
+    fn deserialize_create_request_no_cache_defaults_none() {
+        let json = r#"{"name": "normal"}"#;
+        let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
+        assert!(
+            req.no_cache.is_none(),
+            "no_cache should be None when absent from request"
         );
     }
 

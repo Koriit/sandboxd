@@ -20,6 +20,10 @@ struct Cli {
     #[arg(long, global = true, default_value_t = default_socket_path())]
     socket: String,
 
+    /// Suppress interactive prompts (use defaults silently).
+    #[arg(long, short = 'q', global = true)]
+    quiet: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -66,6 +70,9 @@ enum Command {
         /// or when the hardened configuration causes compatibility issues.
         #[arg(long)]
         no_hardening: bool,
+        /// Skip pre-baked image, use full create path.
+        #[arg(long)]
+        no_cache: bool,
     },
     /// Start a sandbox session.
     Start {
@@ -156,6 +163,8 @@ enum Command {
         #[arg(long, default_value = "/home/agent/workspace")]
         repo_path: String,
     },
+    /// Rebuild the pre-baked base VM image.
+    RebuildImage,
 }
 
 /// Policy subcommands.
@@ -203,6 +212,7 @@ fn build_request(command: &Command) -> Option<Request<String>> {
             boot_cmd,
             workspace,
             no_hardening,
+            no_cache,
         } => {
             let mut body = serde_json::Map::new();
             if let Some(n) = name {
@@ -261,6 +271,9 @@ fn build_request(command: &Command) -> Option<Request<String>> {
             }
             if *no_hardening {
                 body.insert("hardened".into(), serde_json::json!(false));
+            }
+            if *no_cache {
+                body.insert("no_cache".into(), serde_json::json!(true));
             }
             let body_str = serde_json::Value::Object(body).to_string();
             Request::builder()
@@ -336,6 +349,11 @@ fn build_request(command: &Command) -> Option<Request<String>> {
         Command::Health { session } => Request::builder()
             .method("GET")
             .uri(format!("/sessions/{session}/health"))
+            .body(String::new())
+            .expect("failed to build request"),
+        Command::RebuildImage => Request::builder()
+            .method("POST")
+            .uri("/rebuild-image")
             .body(String::new())
             .expect("failed to build request"),
         // Ssh, Logs, Cp, and GitRemote are handled specially -- not via a single HTTP request.
@@ -557,6 +575,9 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
             println!("Network:");
             println!("  Bridge:  {}", if health.network.bridge_exists { "exists" } else { "missing" });
             println!("  TAP:     {}", if health.network.tap_exists { "exists" } else { "missing" });
+        }
+        Command::RebuildImage => {
+            eprintln!("Done.");
         }
         Command::Ssh { .. } | Command::Logs { .. } | Command::Cp { .. } | Command::GitRemote { .. } => {
             // Ssh, Logs, Cp, and GitRemote are handled separately, should not reach here.
@@ -1256,6 +1277,74 @@ fn run_remote_helper() {
     }
 }
 
+/// Pre-flight check for base image staleness before creating a session.
+///
+/// Queries the daemon's `GET /base-image-status` endpoint. If the image is
+/// stale, prompts the user on stderr and optionally rebuilds before proceeding.
+async fn check_base_image_staleness(socket_path: &str) {
+    let req = match Request::builder()
+        .method("GET")
+        .uri("/base-image-status")
+        .body(String::new())
+    {
+        Ok(r) => r,
+        Err(_) => return, // Best-effort; don't block create on pre-flight failure.
+    };
+
+    let (status, body) = match send_request(socket_path, req).await {
+        Ok(r) => r,
+        Err(_) => return, // Daemon might not support the endpoint yet.
+    };
+
+    if !status.is_success() {
+        return; // Best-effort.
+    }
+
+    let json: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    let status_str = json.get("status").and_then(|s| s.as_str()).unwrap_or("");
+    if status_str != "stale" {
+        return;
+    }
+
+    let age_days = json.get("age_days").and_then(|v| v.as_u64()).unwrap_or(0);
+    eprintln!(
+        "Warning: base image is {} days old.",
+        age_days
+    );
+    eprint!("Rebuild before creating session? [y/N] ");
+
+    // Read user response from stdin.
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return;
+    }
+    let answer = input.trim().to_lowercase();
+    if answer == "y" || answer == "yes" {
+        eprintln!("Rebuilding base image...");
+        let rebuild_req = Request::builder()
+            .method("POST")
+            .uri("/rebuild-image")
+            .body(String::new())
+            .expect("failed to build rebuild request");
+
+        match send_request(socket_path, rebuild_req).await {
+            Ok((s, _)) if s.is_success() => {
+                eprintln!("Done.");
+            }
+            Ok((s, resp_body)) => {
+                eprintln!("Warning: rebuild failed ({s}): {resp_body}");
+            }
+            Err(e) => {
+                eprintln!("Warning: rebuild failed: {e}");
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Check if we were invoked as git-remote-sandbox (git remote helper mode).
@@ -1302,6 +1391,18 @@ async fn main() {
         return;
     }
 
+    // Pre-flight base image staleness check for create commands.
+    if let Command::Create { no_cache, .. } = &cli.command {
+        if !cli.quiet && !*no_cache {
+            check_base_image_staleness(&cli.socket).await;
+        }
+    }
+
+    // Print progress message for rebuild-image before sending the request.
+    if matches!(&cli.command, Command::RebuildImage) {
+        eprintln!("Rebuilding base image...");
+    }
+
     let req = match build_request(&cli.command) {
         Some(r) => r,
         None => {
@@ -1345,6 +1446,7 @@ mod tests {
                 boot_cmd: None,
                 workspace: None,
                 no_hardening: false,
+                no_cache: false,
             }
         ));
     }
@@ -1483,6 +1585,7 @@ mod tests {
             boot_cmd: None,
             workspace: None,
             no_hardening: false,
+            no_cache: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         assert_eq!(req.method(), "POST");
@@ -1507,6 +1610,7 @@ mod tests {
             boot_cmd: None,
             workspace: None,
             no_hardening: false,
+            no_cache: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         assert_eq!(req.method(), "POST");
@@ -1531,6 +1635,7 @@ mod tests {
             boot_cmd: None,
             workspace: None,
             no_hardening: false,
+            no_cache: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -1889,6 +1994,7 @@ mod tests {
             boot_cmd: None,
             workspace: None,
             no_hardening: false,
+            no_cache: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -1909,6 +2015,7 @@ mod tests {
             boot_cmd: Some("npm install".into()),
             workspace: None,
             no_hardening: false,
+            no_cache: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -1957,6 +2064,7 @@ mod tests {
             boot_cmd: None,
             workspace: None,
             no_hardening: true,
+            no_cache: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -1979,6 +2087,7 @@ mod tests {
             boot_cmd: None,
             workspace: None,
             no_hardening: false,
+            no_cache: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -2142,5 +2251,113 @@ mod tests {
     fn parse_remote_helper_url_empty_session() {
         // Starts with slash — empty session name.
         assert!(parse_remote_helper_url("/home/agent/workspace").is_err());
+    }
+
+    // -- No-cache and quiet flag tests ----------------------------------------
+
+    #[test]
+    fn parse_create_with_no_cache() {
+        let cli = Cli::parse_from(["sandbox", "create", "--no-cache"]);
+        match &cli.command {
+            Command::Create { no_cache, .. } => {
+                assert!(*no_cache, "--no-cache flag should set no_cache to true");
+            }
+            _ => panic!("expected Create command"),
+        }
+    }
+
+    #[test]
+    fn parse_create_default_no_cache_off() {
+        let cli = Cli::parse_from(["sandbox", "create"]);
+        match &cli.command {
+            Command::Create { no_cache, .. } => {
+                assert!(
+                    !*no_cache,
+                    "no_cache should be false by default"
+                );
+            }
+            _ => panic!("expected Create command"),
+        }
+    }
+
+    #[test]
+    fn build_create_request_with_no_cache() {
+        let cmd = Command::Create {
+            name: Some("cached".into()),
+            cpus: 2,
+            memory: 4096,
+            disk: 20,
+            template: None,
+            policy: None,
+            repo: None,
+            boot_cmd: None,
+            workspace: None,
+            no_hardening: false,
+            no_cache: true,
+        };
+        let req = build_request(&cmd).expect("should produce request");
+        let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
+        assert_eq!(
+            body["no_cache"], true,
+            "--no-cache should set no_cache=true in request body"
+        );
+    }
+
+    #[test]
+    fn build_create_request_default_omits_no_cache() {
+        let cmd = Command::Create {
+            name: Some("normal".into()),
+            cpus: 2,
+            memory: 4096,
+            disk: 20,
+            template: None,
+            policy: None,
+            repo: None,
+            boot_cmd: None,
+            workspace: None,
+            no_hardening: false,
+            no_cache: false,
+        };
+        let req = build_request(&cmd).expect("should produce request");
+        let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
+        assert!(
+            body.get("no_cache").is_none(),
+            "default (no_cache=false) should omit the field from request body"
+        );
+    }
+
+    #[test]
+    fn parse_quiet_flag_global() {
+        let cli = Cli::parse_from(["sandbox", "-q", "create"]);
+        assert!(cli.quiet, "-q should set quiet to true");
+    }
+
+    #[test]
+    fn parse_quiet_flag_long() {
+        let cli = Cli::parse_from(["sandbox", "--quiet", "ps"]);
+        assert!(cli.quiet, "--quiet should set quiet to true");
+    }
+
+    #[test]
+    fn parse_quiet_default_off() {
+        let cli = Cli::parse_from(["sandbox", "ps"]);
+        assert!(!cli.quiet, "quiet should be false by default");
+    }
+
+    // -- Rebuild-image tests --------------------------------------------------
+
+    #[test]
+    fn parse_rebuild_image() {
+        let cli = Cli::parse_from(["sandbox", "rebuild-image"]);
+        assert!(matches!(cli.command, Command::RebuildImage));
+    }
+
+    #[test]
+    fn build_rebuild_image_request() {
+        let cmd = Command::RebuildImage;
+        let req = build_request(&cmd).expect("should produce request");
+        assert_eq!(req.method(), "POST");
+        assert_eq!(req.uri(), "/rebuild-image");
+        assert!(req.body().is_empty());
     }
 }

@@ -12,8 +12,8 @@ use axum::{
 };
 use clap::Parser;
 use sandbox_core::{
-    ApiError, AssuranceLevel, CaManager, CoreDnsConfig, CreateSessionRequest, Destination,
-    DnsCache, ExecRequest, ExecResponse, FileDownloadRequest, FileDownloadResponse,
+    ApiError, AssuranceLevel, BaseImageStatus, CaManager, CoreDnsConfig, CreateSessionRequest,
+    Destination, DnsCache, ExecRequest, ExecResponse, FileDownloadRequest, FileDownloadResponse,
     FileUploadRequest, GatewayHealth, GatewayManager, GatewayStatus, GitRequest, GitResponse,
     GuestConnector, GuestRequest, GuestResponse, LimaManager, NetworkHealth, NetworkManager,
     Policy, PolicyCompiler, PolicyDistributor, SandboxError, Session, SessionConfig, SessionHealth,
@@ -127,6 +127,8 @@ fn app(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}/git", post(git_in_session))
         .route("/sessions/{id}/policy", post(update_policy))
         .route("/sessions/{id}/health", get(session_health))
+        .route("/rebuild-image", post(rebuild_image))
+        .route("/base-image-status", get(base_image_status))
         .route("/health", get(health_check))
         .with_state(state)
 }
@@ -223,170 +225,285 @@ async fn create_session(
 
     info!(%session_id, bridge = %network_info.bridge_name, mac = %vm_mac, "creating VM");
 
-    // 2. Create the Lima VM (with optional custom template).
-    {
-        let lima = state.lima.clone();
-        let sid = session_id;
-        let cfg = config.clone();
-        let template = req.template.clone();
-        match tokio::task::spawn_blocking(move || {
-            if let Some(template_path) = &template {
-                lima.create_vm_with_custom_template(&sid, template_path.as_ref())
-            } else {
-                lima.create_vm(&sid, &cfg)
-            }
-        })
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                let network = state.network.clone();
-                let base_dir = state.base_dir.clone();
-                let sid = session_id;
-                let _ = tokio::task::spawn_blocking(move || {
-                    let _ = network.delete_network(&sid);
-                    let _ = CaManager::remove_session_ca(&base_dir, &sid);
-                }).await;
-                let _ = state.store.update_state(&session_id, SessionState::Error);
-                return error_response(e).into_response();
-            }
-            Err(e) => {
-                let network = state.network.clone();
-                let base_dir = state.base_dir.clone();
-                let sid = session_id;
-                let _ = tokio::task::spawn_blocking(move || {
-                    let _ = network.delete_network(&sid);
-                    let _ = CaManager::remove_session_ca(&base_dir, &sid);
-                }).await;
-                let _ = state.store.update_state(&session_id, SessionState::Error);
-                return error_response(SandboxError::Internal(format!(
-                    "task join error: {e}"
-                )))
-                .into_response();
-            }
-        }
-    }
+    // 2. Create and start the VM -- fast path (clone from golden image) or
+    //    legacy path (full create from scratch).
+    //
+    // Use the fast path when: no --no-cache flag, no custom template.
+    // The fast path clones the pre-provisioned base image and skips the
+    // guest agent install (it's already baked in).
+    let use_cache = !req.no_cache.unwrap_or(false) && req.template.is_none();
 
-    // 3. Start the VM with bridge networking env vars so QEMU attaches to
-    //    the Docker bridge via qemu-bridge-helper at boot.
-    {
-        let lima = state.lima.clone();
-        let sid = session_id;
-        let cfg = config.clone();
-        let bridge = network_info.bridge_name.clone();
-        let mac = vm_mac.clone();
-        match tokio::task::spawn_blocking(move || {
-            lima.start_vm(&sid, &cfg, Some(&bridge), Some(&mac))
-        })
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                let network = state.network.clone();
-                let base_dir = state.base_dir.clone();
-                let sid = session_id;
-                let _ = tokio::task::spawn_blocking(move || {
-                    let _ = network.delete_network(&sid);
-                    let _ = CaManager::remove_session_ca(&base_dir, &sid);
-                }).await;
-                let _ = state.store.update_state(&session_id, SessionState::Error);
-                return error_response(e).into_response();
-            }
-            Err(e) => {
-                let network = state.network.clone();
-                let base_dir = state.base_dir.clone();
-                let sid = session_id;
-                let _ = tokio::task::spawn_blocking(move || {
-                    let _ = network.delete_network(&sid);
-                    let _ = CaManager::remove_session_ca(&base_dir, &sid);
-                }).await;
-                let _ = state.store.update_state(&session_id, SessionState::Error);
-                return error_response(SandboxError::Internal(format!(
-                    "task join error: {e}"
-                )))
-                .into_response();
-            }
-        }
-    }
-
-    // 4. Install the guest agent into the VM.
-    let guest_binary_path = match std::env::current_exe() {
-        Ok(exe) => match exe.parent() {
-            Some(dir) => dir.join("sandbox-guest"),
-            None => {
-                let lima = state.lima.clone();
-                let network = state.network.clone();
-                let base_dir = state.base_dir.clone();
-                let sid = session_id;
-                let _ = tokio::task::spawn_blocking(move || {
-                    let _ = lima.delete_vm(&sid);
-                    let _ = network.delete_network(&sid);
-                    let _ = CaManager::remove_session_ca(&base_dir, &sid);
-                }).await;
-                let _ = state.store.update_state(&session_id, SessionState::Error);
-                return error_response(SandboxError::Internal(
-                    "executable path has no parent directory".to_string(),
-                ))
-                .into_response();
-            }
-        },
-        Err(e) => {
-            let lima = state.lima.clone();
-            let network = state.network.clone();
-            let base_dir = state.base_dir.clone();
-            let sid = session_id;
+    // Helper closure: cleanup VM + network + CA on failure, set state to Error.
+    // This macro avoids repeating the cleanup pattern in every error branch.
+    macro_rules! cleanup_and_return {
+        ($state:expr, $session_id:expr, $err_resp:expr) => {{
+            let lima = $state.lima.clone();
+            let network = $state.network.clone();
+            let base_dir = $state.base_dir.clone();
+            let sid = $session_id;
             let _ = tokio::task::spawn_blocking(move || {
                 let _ = lima.delete_vm(&sid);
                 let _ = network.delete_network(&sid);
                 let _ = CaManager::remove_session_ca(&base_dir, &sid);
-            }).await;
-            let _ = state.store.update_state(&session_id, SessionState::Error);
-            return error_response(SandboxError::Internal(format!(
-                "failed to determine daemon executable path: {e}"
-            )))
-            .into_response();
-        }
-    };
+            })
+            .await;
+            let _ = $state.store.update_state(&$session_id, SessionState::Error);
+            return $err_resp;
+        }};
+    }
 
-    {
-        let lima = state.lima.clone();
-        let sid = session_id;
-        let guest_bin = guest_binary_path.clone();
-        match tokio::task::spawn_blocking(move || {
-            lima.install_guest_agent(&sid, &guest_bin)
-        })
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                error!(%session_id, error = %e, "failed to install guest agent");
-                let lima = state.lima.clone();
-                let network = state.network.clone();
-                let base_dir = state.base_dir.clone();
-                let sid = session_id;
-                let _ = tokio::task::spawn_blocking(move || {
-                    let _ = lima.delete_vm(&sid);
-                    let _ = network.delete_network(&sid);
-                    let _ = CaManager::remove_session_ca(&base_dir, &sid);
-                }).await;
-                let _ = state.store.update_state(&session_id, SessionState::Error);
-                return error_response(e).into_response();
+    // Helper closure: cleanup network + CA only (VM not yet created).
+    macro_rules! cleanup_net_ca_and_return {
+        ($state:expr, $session_id:expr, $err_resp:expr) => {{
+            let network = $state.network.clone();
+            let base_dir = $state.base_dir.clone();
+            let sid = $session_id;
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = network.delete_network(&sid);
+                let _ = CaManager::remove_session_ca(&base_dir, &sid);
+            })
+            .await;
+            let _ = $state.store.update_state(&$session_id, SessionState::Error);
+            return $err_resp;
+        }};
+    }
+
+    if use_cache {
+        // ---- Fast path: clone from golden base image ----
+
+        // Check if the base image exists and is fresh.
+        let base_status = {
+            let lima_check = state.lima.clone();
+            match tokio::task::spawn_blocking(move || lima_check.check_base_image()).await {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
+                    cleanup_net_ca_and_return!(state, session_id, error_response(e).into_response());
+                }
+                Err(e) => {
+                    cleanup_net_ca_and_return!(
+                        state,
+                        session_id,
+                        error_response(SandboxError::Internal(format!("task join error: {e}")))
+                            .into_response()
+                    );
+                }
             }
+        };
+
+        match base_status {
+            BaseImageStatus::Missing => {
+                // Must build -- no choice.
+                info!("base image missing, building...");
+                let lima_build = state.lima.clone();
+                match tokio::task::spawn_blocking(move || lima_build.build_base_image()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        cleanup_net_ca_and_return!(
+                            state,
+                            session_id,
+                            error_response(e).into_response()
+                        );
+                    }
+                    Err(e) => {
+                        cleanup_net_ca_and_return!(
+                            state,
+                            session_id,
+                            error_response(SandboxError::Internal(format!(
+                                "task join error: {e}"
+                            )))
+                            .into_response()
+                        );
+                    }
+                }
+            }
+            BaseImageStatus::Stale { .. } => {
+                // Don't auto-rebuild on create -- use the stale image.
+                // User can run `sandbox rebuild-image` to refresh.
+                info!("base image is stale, using anyway");
+            }
+            BaseImageStatus::Fresh => {
+                // Good to go.
+            }
+        }
+
+        // Clone from the base image.
+        {
+            let lima_clone = state.lima.clone();
+            let sid = session_id;
+            let cpus = config.cpus;
+            let memory_mb = config.memory_mb;
+            let disk_gb = config.disk_gb;
+            match tokio::task::spawn_blocking(move || {
+                lima_clone.clone_vm(sid, cpus, memory_mb, disk_gb)
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    cleanup_net_ca_and_return!(
+                        state,
+                        session_id,
+                        error_response(e).into_response()
+                    );
+                }
+                Err(e) => {
+                    cleanup_net_ca_and_return!(
+                        state,
+                        session_id,
+                        error_response(SandboxError::Internal(format!(
+                            "task join error: {e}"
+                        )))
+                        .into_response()
+                    );
+                }
+            }
+        }
+
+        // Start the cloned VM (no guest agent install needed -- already in image).
+        {
+            let lima_start = state.lima.clone();
+            let sid = session_id;
+            let cfg_start = config.clone();
+            let bridge = network_info.bridge_name.clone();
+            let mac = vm_mac.clone();
+            match tokio::task::spawn_blocking(move || {
+                lima_start.start_vm(&sid, &cfg_start, Some(&bridge), Some(&mac))
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    cleanup_and_return!(state, session_id, error_response(e).into_response());
+                }
+                Err(e) => {
+                    cleanup_and_return!(
+                        state,
+                        session_id,
+                        error_response(SandboxError::Internal(format!(
+                            "task join error: {e}"
+                        )))
+                        .into_response()
+                    );
+                }
+            }
+        }
+    } else {
+        // ---- Legacy path: full create from scratch ----
+
+        // 2a. Create the Lima VM (with optional custom template).
+        {
+            let lima = state.lima.clone();
+            let sid = session_id;
+            let cfg = config.clone();
+            let template = req.template.clone();
+            match tokio::task::spawn_blocking(move || {
+                if let Some(template_path) = &template {
+                    lima.create_vm_with_custom_template(&sid, template_path.as_ref())
+                } else {
+                    lima.create_vm(&sid, &cfg)
+                }
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    cleanup_net_ca_and_return!(
+                        state,
+                        session_id,
+                        error_response(e).into_response()
+                    );
+                }
+                Err(e) => {
+                    cleanup_net_ca_and_return!(
+                        state,
+                        session_id,
+                        error_response(SandboxError::Internal(format!(
+                            "task join error: {e}"
+                        )))
+                        .into_response()
+                    );
+                }
+            }
+        }
+
+        // 2b. Start the VM with bridge networking env vars.
+        {
+            let lima = state.lima.clone();
+            let sid = session_id;
+            let cfg = config.clone();
+            let bridge = network_info.bridge_name.clone();
+            let mac = vm_mac.clone();
+            match tokio::task::spawn_blocking(move || {
+                lima.start_vm(&sid, &cfg, Some(&bridge), Some(&mac))
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    cleanup_and_return!(state, session_id, error_response(e).into_response());
+                }
+                Err(e) => {
+                    cleanup_and_return!(
+                        state,
+                        session_id,
+                        error_response(SandboxError::Internal(format!(
+                            "task join error: {e}"
+                        )))
+                        .into_response()
+                    );
+                }
+            }
+        }
+
+        // 2c. Install the guest agent into the VM.
+        let guest_binary_path = match std::env::current_exe() {
+            Ok(exe) => match exe.parent() {
+                Some(dir) => dir.join("sandbox-guest"),
+                None => {
+                    cleanup_and_return!(
+                        state,
+                        session_id,
+                        error_response(SandboxError::Internal(
+                            "executable path has no parent directory".to_string(),
+                        ))
+                        .into_response()
+                    );
+                }
+            },
             Err(e) => {
-                let lima = state.lima.clone();
-                let network = state.network.clone();
-                let base_dir = state.base_dir.clone();
-                let sid = session_id;
-                let _ = tokio::task::spawn_blocking(move || {
-                    let _ = lima.delete_vm(&sid);
-                    let _ = network.delete_network(&sid);
-                    let _ = CaManager::remove_session_ca(&base_dir, &sid);
-                }).await;
-                let _ = state.store.update_state(&session_id, SessionState::Error);
-                return error_response(SandboxError::Internal(format!(
-                    "task join error: {e}"
-                )))
-                .into_response();
+                cleanup_and_return!(
+                    state,
+                    session_id,
+                    error_response(SandboxError::Internal(format!(
+                        "failed to determine daemon executable path: {e}"
+                    )))
+                    .into_response()
+                );
+            }
+        };
+
+        {
+            let lima = state.lima.clone();
+            let sid = session_id;
+            let guest_bin = guest_binary_path.clone();
+            match tokio::task::spawn_blocking(move || lima.install_guest_agent(&sid, &guest_bin))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    error!(%session_id, error = %e, "failed to install guest agent");
+                    cleanup_and_return!(state, session_id, error_response(e).into_response());
+                }
+                Err(e) => {
+                    cleanup_and_return!(
+                        state,
+                        session_id,
+                        error_response(SandboxError::Internal(format!(
+                            "task join error: {e}"
+                        )))
+                        .into_response()
+                    );
+                }
             }
         }
     }
@@ -401,31 +518,11 @@ async fn create_session(
                 "guest agent returned unexpected response to ping".into(),
             );
             error!(%session_id, "guest agent ping: unexpected response");
-            let lima = state.lima.clone();
-            let network = state.network.clone();
-            let base_dir = state.base_dir.clone();
-            let sid = session_id;
-            let _ = tokio::task::spawn_blocking(move || {
-                let _ = lima.delete_vm(&sid);
-                let _ = network.delete_network(&sid);
-                let _ = CaManager::remove_session_ca(&base_dir, &sid);
-            }).await;
-            let _ = state.store.update_state(&session_id, SessionState::Error);
-            return error_response(err).into_response();
+            cleanup_and_return!(state, session_id, error_response(err).into_response());
         }
         Err(e) => {
             error!(%session_id, error = %e, "guest agent ping failed");
-            let lima = state.lima.clone();
-            let network = state.network.clone();
-            let base_dir = state.base_dir.clone();
-            let sid = session_id;
-            let _ = tokio::task::spawn_blocking(move || {
-                let _ = lima.delete_vm(&sid);
-                let _ = network.delete_network(&sid);
-                let _ = CaManager::remove_session_ca(&base_dir, &sid);
-            }).await;
-            let _ = state.store.update_state(&session_id, SessionState::Error);
-            return error_response(e).into_response();
+            cleanup_and_return!(state, session_id, error_response(e).into_response());
         }
     }
 
@@ -1983,6 +2080,42 @@ async fn session_health(
     };
 
     (StatusCode::OK, Json(health)).into_response()
+}
+
+/// `POST /rebuild-image` -- rebuild the pre-baked golden base VM image.
+async fn rebuild_image(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let lima = state.lima.clone();
+    match tokio::task::spawn_blocking(move || lima.rebuild_base_image()).await {
+        Ok(Ok(())) => (StatusCode::OK, "base image rebuilt").into_response(),
+        Ok(Err(e)) => error_response(e).into_response(),
+        Err(e) => {
+            error_response(SandboxError::Internal(format!("task join: {e}"))).into_response()
+        }
+    }
+}
+
+/// `GET /base-image-status` -- check the status of the golden base image.
+async fn base_image_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let lima = state.lima.clone();
+    match tokio::task::spawn_blocking(move || lima.check_base_image()).await {
+        Ok(Ok(status)) => {
+            let json = match status {
+                BaseImageStatus::Missing => serde_json::json!({"status": "missing"}),
+                BaseImageStatus::Fresh => serde_json::json!({"status": "fresh"}),
+                BaseImageStatus::Stale {
+                    age_days,
+                    hash_mismatch,
+                } => {
+                    serde_json::json!({"status": "stale", "age_days": age_days, "hash_mismatch": hash_mismatch})
+                }
+            };
+            (StatusCode::OK, Json(json)).into_response()
+        }
+        Ok(Err(e)) => error_response(e).into_response(),
+        Err(e) => {
+            error_response(SandboxError::Internal(format!("task join: {e}"))).into_response()
+        }
+    }
 }
 
 /// Global health endpoint: `GET /health`
