@@ -17,8 +17,9 @@ tests/e2e/.venv/.installed: tests/e2e/pyproject.toml
 		subprocess.check_call([sys.executable, '-m', 'pip', 'install'] + deps)"
 	touch tests/e2e/.venv/.installed
 
+TEST ?=
 test-e2e: tests/e2e/.venv/.installed
-	cd tests/e2e && . .venv/bin/activate && python -m pytest -v -rs
+	cd tests/e2e && . .venv/bin/activate && python -m pytest -v -rs $(TEST)
 
 gateway-image:
 	docker build -t sandbox-gateway -f networking/gateway/Dockerfile networking/

@@ -12,10 +12,11 @@ Sandbox daemon providing isolated Linux VMs (Lima/QEMU) for coding agents.
 ## Build and test
 
 ```bash
-make build          # cargo build --workspace
-make test           # cargo test --workspace --quiet (unit tests, ~5s)
-make test-e2e       # full E2E suite (boots real VMs, ~30-45 min)
-make gateway-image  # docker build for gateway container
+make build            # cargo build --workspace
+make test             # cargo test --workspace --quiet (unit tests, ~5s)
+make test-integration # integration tests (requires Docker + Lima)
+make test-e2e         # full E2E suite (boots real VMs, ~30-45 min)
+make gateway-image    # docker build for gateway container
 ```
 
 ## E2E tests
@@ -45,7 +46,7 @@ cd sandboxd && cargo test --workspace
 cd sandboxd && cargo clippy --workspace
 ```
 
-Unit test count: ~405 tests across 4 crates, 5 ignored.
+Unit test count: ~413 tests across 4 crates.
 
 ## Key conventions
 
@@ -53,5 +54,5 @@ Unit test count: ~405 tests across 4 crates, 5 ignored.
 - Guest agent communication (TCP-over-SSH) is already async — do not wrap in spawn_blocking
 - Error responses use `error_response()` helper that maps `SandboxError` variants to HTTP status codes
 - Handler return type is `impl IntoResponse` — use `match` on spawn_blocking results, not `?` operator
-- Socket path default: `~/.sandboxd/sandboxd.sock`
+- Socket path default: `$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock` (falls back to `~/.local/share/sandboxd/sandboxd.sock`)
 - Git remote helper: `git-remote-sandbox` symlink to `sandbox` binary, uses `sandbox::session/repo-path` URLs
