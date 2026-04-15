@@ -931,6 +931,21 @@ Tests require a Linux host with KVM and Docker.
 
 ---
 
+### M9-S4: Test runner optimizations
+
+**Entry criteria:** M9-S3 complete.
+
+**Tasks:**
+- Session-scoped daemon for E2E tests: convert `sandbox_daemon` fixture from function-scoped to session-scoped so all tests share one daemon process, eliminating 33 startup/shutdown cycles
+- Add pytest-xdist support: add dependency, add `PARALLEL` variable to Makefile (default 1, user overrides with `make test-e2e PARALLEL=4`)
+- Adopt cargo-nextest for Rust unit and integration tests: faster test execution with parallel test running, better output formatting
+- Update Makefile `test` and `test-integration` targets to use nextest
+- Update CLAUDE.md build/test commands
+
+**Exit criteria:** `make test` uses nextest. `make test-e2e` supports `PARALLEL=N`. E2E daemon is session-scoped. All tests pass.
+
+---
+
 ## Risks
 
 | Risk | Impact | Mitigation |
@@ -957,8 +972,8 @@ Tests require a Linux host with KVM and Docker.
 | M7 | 1 |
 | M8 | 3 |
 | M8.5 | 4 |
-| M9 | 3 |
-| **Total** | **37** |
+| M9 | 4 |
+| **Total** | **38** |
 
 ---
 
