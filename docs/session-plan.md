@@ -911,6 +911,26 @@ Tests require a Linux host with KVM and Docker.
 
 ---
 
+### M9-S3: Timeout protection for session creation flow
+
+**Entry criteria:** M9-S2 complete. Flaky E2E test (`test_dns_nxdomain`) identified — 50% failure rate due to `sandbox create` hanging indefinitely.
+
+**Tasks:**
+- Add HTTP request timeout in CLI (`sandbox-cli`): hard cap on request to daemon
+- Add per-step timeouts in daemon create handler (`sandboxd/src/main.rs`):
+  - Lima VM create/start
+  - Guest agent install and ping
+  - Docker network and gateway creation
+  - NIC hot-add and guest network configuration
+- Add timeouts to external process calls (`limactl`, `docker`) in sandbox-core
+- Ensure timeout errors propagate clearly: log which step timed out
+- Proper cleanup on timeout: if creation fails mid-way, clean up partial state
+- Verify fix: run `test_dns_nxdomain` repeatedly to confirm stability
+
+**Exit criteria:** All external process calls have bounded timeouts. CLI has HTTP timeout. Timeout failures report which step stalled. E2E test flakiness resolved.
+
+---
+
 ## Risks
 
 | Risk | Impact | Mitigation |
@@ -937,8 +957,8 @@ Tests require a Linux host with KVM and Docker.
 | M7 | 1 |
 | M8 | 3 |
 | M8.5 | 4 |
-| M9 | 2 |
-| **Total** | **36** |
+| M9 | 3 |
+| **Total** | **37** |
 
 ---
 
