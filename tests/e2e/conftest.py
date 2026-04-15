@@ -45,7 +45,7 @@ _ID_RE = re.compile(r"^ID:\s+([0-9a-f-]{36})$", re.MULTILINE)
 
 # Default VM resource args -- kept small so tests work on hosts with limited
 # memory (e.g. 4 GB total).
-_VM_RESOURCE_ARGS = ("--cpus", "1", "--memory", "1024", "--disk", "10")
+_VM_RESOURCE_ARGS = ("--cpus", "1", "--memory", "1024", "--disk", "10", "--no-cache")
 
 
 def parse_session_id(create_output: str) -> str:
