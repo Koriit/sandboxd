@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -71,6 +71,13 @@ struct AppState {
     /// Active policies for sessions, keyed by session ID.
     /// Uses Arc so it can be shared with spawned DNS propagation tasks.
     session_policies: Arc<Mutex<HashMap<uuid::Uuid, Policy>>>,
+    /// Sessions currently being stopped.
+    ///
+    /// Tracks session IDs that are in the middle of the stop sequence
+    /// (networking teardown + VM stop).  The gateway monitor and network
+    /// reconciliation loops check this set so they don't accidentally
+    /// restart a gateway that was intentionally stopped.
+    sessions_stopping: Mutex<HashSet<uuid::Uuid>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -885,6 +892,10 @@ async fn stop_session(
 
     info!(session_id = %session.id, "stopping session");
 
+    // Mark this session as "stopping" so the gateway monitor doesn't restart
+    // the gateway container while we are tearing it down.
+    state.sessions_stopping.lock().await.insert(session.id);
+
     // Cancel DNS propagation loop before tearing down networking.
     cancel_dns_propagation_loop(&session.id, &state).await;
 
@@ -918,10 +929,12 @@ async fn stop_session(
         {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
+                state.sessions_stopping.lock().await.remove(&session.id);
                 let _ = state.store.update_state(&session.id, SessionState::Error);
                 return error_response(e).into_response();
             }
             Err(e) => {
+                state.sessions_stopping.lock().await.remove(&session.id);
                 let _ = state.store.update_state(&session.id, SessionState::Error);
                 return error_response(SandboxError::Internal(format!(
                     "task join error: {e}"
@@ -932,8 +945,11 @@ async fn stop_session(
     }
 
     if let Err(e) = state.store.update_state(&session.id, SessionState::Stopped) {
+        state.sessions_stopping.lock().await.remove(&session.id);
         return error_response(e).into_response();
     }
+
+    state.sessions_stopping.lock().await.remove(&session.id);
 
     info!(session_id = %session.id, "session stopped");
 
@@ -963,6 +979,9 @@ async fn remove_session(
         state = %session.state,
         "removing session"
     );
+
+    // Mark as stopping so the gateway monitor skips this session.
+    state.sessions_stopping.lock().await.insert(session.id);
 
     // Cancel DNS propagation loop before teardown.
     cancel_dns_propagation_loop(&session.id, &state).await;
@@ -999,6 +1018,9 @@ async fn remove_session(
             }
         }).await;
     }
+
+    // Remove from the stopping set now that teardown is complete.
+    state.sessions_stopping.lock().await.remove(&session.id);
 
     // Delete the session from the store.
     if let Err(e) = state.store.delete_session(&session.id) {
@@ -2099,9 +2121,21 @@ async fn reconcile_networking(state: &AppState) {
     let mut restored = 0u32;
     let mut cleaned = 0u32;
 
+    // Snapshot the set of sessions being stopped so we don't restart their
+    // gateway while the stop handler is tearing it down.
+    let stopping = state.sessions_stopping.lock().await.clone();
+
     for session in &sessions {
         match session.state {
             SessionState::Running => {
+                // Skip sessions that are in the middle of a stop sequence.
+                if stopping.contains(&session.id) {
+                    debug!(
+                        session_id = %session.id,
+                        "network reconciliation: skipping session (stop in progress)"
+                    );
+                    continue;
+                }
                 // Check if gateway is running.
                 let gw = Arc::clone(&state.gateway);
                 let sid = session.id;
@@ -2319,8 +2353,21 @@ async fn gateway_monitor(state: Arc<AppState>) {
             }
         };
 
+        // Snapshot the set of sessions currently being stopped so we skip
+        // them and don't accidentally restart their gateway.
+        let stopping = state.sessions_stopping.lock().await.clone();
+
         for session in &sessions {
             if session.state != SessionState::Running {
+                continue;
+            }
+
+            // Skip sessions that are in the middle of a stop sequence.
+            if stopping.contains(&session.id) {
+                debug!(
+                    session_id = %session.id,
+                    "gateway monitor: skipping session (stop in progress)"
+                );
                 continue;
             }
 
@@ -2531,6 +2578,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         gateway,
         dns_loop_handles: Mutex::new(HashMap::new()),
         session_policies: Arc::new(Mutex::new(HashMap::new())),
+        sessions_stopping: Mutex::new(HashSet::new()),
     });
 
     // Run networking reconciliation: restart crashed gateways, clean up

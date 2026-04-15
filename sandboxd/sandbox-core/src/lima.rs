@@ -135,10 +135,13 @@ HELPEREOF
         -device virtio-net-pci,netdev=net_sandbox,mac=$SANDBOX_VM_MAC,bus=pcie-hotplug-port"
 fi
 
-# Hardened mode: seccomp + device lockdown.
+# Hardened mode: device lockdown.
 if [ "$SANDBOX_QEMU_HARDENED" = "1" ]; then
+    # Note: QEMU seccomp (-sandbox) is NOT used because it requires
+    # PR_SET_NO_NEW_PRIVS, which strips setuid from qemu-bridge-helper
+    # and breaks bridge networking.  Defence-in-depth still comes from
+    # device lockdown, cgroup limits, and KVM hardware isolation.
     EXTRA_ARGS="$EXTRA_ARGS \
-        -sandbox on,obsolete=deny,elevateprivileges=deny,spawn=allow \
         -no-user-config \
         -display none \
         -vga none \
@@ -1243,10 +1246,6 @@ mod tests {
             script.contains("virtio-rng-pci"),
             "wrapper should add virtio-rng for entropy when hardened"
         );
-        assert!(
-            script.contains("-sandbox on"),
-            "wrapper should enable seccomp when hardened"
-        );
 
         // Verify these are gated on the env var
         assert!(
@@ -1524,22 +1523,16 @@ mod tests {
     }
 
     #[test]
-    fn test_qemu_wrapper_includes_seccomp_sandbox() {
+    fn test_qemu_wrapper_no_seccomp_sandbox() {
+        // QEMU seccomp sandbox requires PR_SET_NO_NEW_PRIVS which strips
+        // the setuid bit from qemu-bridge-helper, breaking bridge networking.
         assert!(
-            QEMU_WRAPPER_SCRIPT.contains(
-                "-sandbox on,obsolete=deny,elevateprivileges=deny,spawn=allow"
-            ),
-            "wrapper must enable QEMU seccomp sandbox"
+            !QEMU_WRAPPER_SCRIPT.contains("-sandbox on"),
+            "wrapper must NOT use -sandbox on (incompatible with qemu-bridge-helper setuid)"
         );
-    }
-
-    #[test]
-    fn test_qemu_wrapper_seccomp_gated_on_hardened() {
-        // Seccomp should only be applied when SANDBOX_QEMU_HARDENED=1.
         assert!(
-            QEMU_WRAPPER_SCRIPT
-                .contains(r#"SANDBOX_QEMU_HARDENED" = "1"#),
-            "seccomp sandbox must be gated on SANDBOX_QEMU_HARDENED=1"
+            QEMU_WRAPPER_SCRIPT.contains("PR_SET_NO_NEW_PRIVS"),
+            "wrapper should document why seccomp is not used"
         );
     }
 

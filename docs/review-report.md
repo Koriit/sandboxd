@@ -17,7 +17,7 @@ All 10 milestones delivered:
 | M3: Gateway + networking | Complete | Docker bridge, Envoy/mitmproxy/CoreDNS, nftables, crash recovery |
 | M4: Policy engine | Complete | 4 assurance levels, CoreDNS plugin, mitmproxy addon, live updates |
 | M5: Workspace provisioning | Complete | Clone, shared mount (9p), `sandbox cp`, git remote transport |
-| M6: Hardening | Complete | QEMU seccomp, device lockdown, cgroup limits |
+| M6: Hardening | Complete | Device lockdown, cgroup limits (seccomp removed — incompatible with bridge networking) |
 | M7: Documentation | Complete | 9 docs covering all aspects |
 | M8: Polish | Complete | Structured logging, error handling, no outstanding TODOs |
 | M8.5: Privilege model fix-up | Complete | No root/sudo, docker exec for nftables, qemu-bridge-helper |
@@ -27,7 +27,7 @@ All 10 milestones delivered:
 | Planned | Implemented | Reason |
 |---------|-------------|--------|
 | Kernel vsock for guest agent | TCP-over-SSH via `limactl shell` + `socat` | Lima doesn't support AF_VSOCK; TCP-over-SSH is simpler and transport-agnostic |
-| virtio-fs for shared mounts | 9p built into QEMU | virtiofs requires virtiofsd + memfd, incompatible with QEMU seccomp sandbox |
+| virtio-fs for shared mounts | 9p built into QEMU | virtiofs requires virtiofsd + memfd; 9p is built into QEMU and simpler to configure |
 | QMP NIC hot-add | qemu-bridge-helper at boot | Simpler, avoids boot-time delay, no QMP complexity |
 | Host-side nftables via sudo/nsenter | docker exec with CAP_NET_ADMIN | Eliminates all sudo/root requirements |
 
@@ -96,7 +96,7 @@ Comprehensive 6-track audit with cargo-llvm-cov code coverage analysis.
 2. **8 new unit tests added** — 6 for YAML path sanitization in lima.rs, 2 for symlink traversal protection in guest agent.
 
 ### E2E test quality (6 fixes)
-1. **Created `test_m6_hardening.py`** — 3 new E2E tests for QEMU hardening verification (seccomp, device lockdown, cgroup limits, `--no-hardening` flag).
+1. **Created `test_m6_hardening.py`** — 3 new E2E tests for QEMU hardening verification (device lockdown, cgroup limits, `--no-hardening` flag).
 2. **Strengthened 4 "example" substring assertions** in test_m4_policy.py — now check for `"Example Domain"` instead of `"example"`.
 3. **Strengthened TLS certificate verification** — now checks for Organization field in issuer, not just string presence.
 

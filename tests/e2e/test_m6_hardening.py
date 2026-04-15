@@ -1,5 +1,5 @@
-"""E2E tests for M6 QEMU hardening: seccomp sandbox, device lockdown,
-cgroup resource limits, and the --no-hardening escape hatch.
+"""E2E tests for M6 QEMU hardening: device lockdown, cgroup resource
+limits, and the --no-hardening escape hatch.
 
 These tests boot real Lima/QEMU VMs and are SLOW (3-10 minutes per test).
 Run with generous timeouts:
@@ -63,8 +63,9 @@ def get_qemu_cmdline_for_vm(session_id: str) -> str:
 @pytest.mark.timeout(600)
 def test_hardened_qemu_args(sandbox_cli):
     """Create a session with default settings (hardening ON). Verify the QEMU
-    process command line includes seccomp sandbox and device lockdown args,
-    and does NOT include unnecessary devices.
+    process command line includes device lockdown args, does NOT include
+    seccomp sandbox (incompatible with bridge networking), and does NOT
+    include unnecessary devices.
     """
     session_id = None
     try:
@@ -88,9 +89,11 @@ def test_hardened_qemu_args(sandbox_cli):
             f"{capture_lima_logs(session_id)}"
         )
 
-        # Verify seccomp sandbox is enabled.
-        assert "-sandbox on" in cmdline, (
-            f"QEMU process missing '-sandbox on' (seccomp) flag.\n"
+        # Verify seccomp sandbox is NOT enabled (incompatible with
+        # qemu-bridge-helper setuid required for bridge networking).
+        assert "-sandbox on" not in cmdline, (
+            f"QEMU process contains '-sandbox on' (seccomp) flag — this is "
+            f"incompatible with qemu-bridge-helper bridge networking.\n"
             f"Command line: {cmdline}"
         )
 
@@ -280,8 +283,12 @@ def test_no_hardening_flag(sandbox_cli):
             f"QEMU process contains '-sandbox on' despite --no-hardening.\n"
             f"Command line: {cmdline}"
         )
-        assert "-display none" not in cmdline or "-nographic" in cmdline, (
-            f"QEMU process contains '-display none' despite --no-hardening.\n"
+        # Note: we check for '-vga none' rather than '-display none' because
+        # Lima itself adds '-display none' for headless VMs regardless of our
+        # wrapper's hardening settings.  '-vga none' is only added by the QEMU
+        # wrapper when SANDBOX_QEMU_HARDENED=1.
+        assert "-vga none" not in cmdline, (
+            f"QEMU process contains '-vga none' despite --no-hardening.\n"
             f"Command line: {cmdline}"
         )
 

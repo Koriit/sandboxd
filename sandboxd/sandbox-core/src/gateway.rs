@@ -96,6 +96,34 @@ impl GatewayManager {
             "creating gateway container"
         );
 
+        // Pre-cleanup: remove any leftover container with the same name.
+        //
+        // When a session is stopped, the gateway container is normally removed
+        // by `stop_gateway`. However, if that removal failed (e.g. daemon
+        // crash, Docker transient error) or the session was force-killed, a
+        // stopped container may still exist. `docker run` would then fail with
+        // "container name is already in use". We defensively remove it here.
+        //
+        // `docker rm -f` handles both running and stopped containers and
+        // exits with an error only when the container does not exist, which
+        // we intentionally ignore.
+        let rm_output = Command::new("docker")
+            .args(["rm", "--force", &container_name])
+            .output();
+        match rm_output {
+            Ok(output) if output.status.success() => {
+                info!(
+                    session_id = %session_id,
+                    container = %container_name,
+                    "removed leftover gateway container before recreation"
+                );
+            }
+            _ => {
+                // Container did not exist or docker rm failed — either way,
+                // proceed to create a fresh one.
+            }
+        }
+
         // Step 1: Start the container.
         //
         // With /28 subnets, Docker bridge claims .1 as the gateway. We

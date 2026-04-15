@@ -229,7 +229,7 @@ def _preflight_checks():
         pytest.skip(
             f"{BRIDGE_CONF_PATH} not found. Create it with: "
             f"sudo mkdir -p {BRIDGE_CONF_PATH.parent} && "
-            f'echo "allow br0" | sudo tee {BRIDGE_CONF_PATH}'
+            f'echo "allow all" | sudo tee {BRIDGE_CONF_PATH}'
         )
 
     # 8. Clean up stale sandbox resources from previous runs to prevent

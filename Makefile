@@ -15,7 +15,7 @@ tests/e2e/.venv/.installed: tests/e2e/pyproject.toml
 	touch tests/e2e/.venv/.installed
 
 test-e2e: tests/e2e/.venv/.installed
-	cd tests/e2e && . .venv/bin/activate && python -m pytest -v
+	cd tests/e2e && . .venv/bin/activate && python -m pytest -v -rs
 
 gateway-image:
 	docker build -t sandbox-gateway -f networking/gateway/Dockerfile networking/

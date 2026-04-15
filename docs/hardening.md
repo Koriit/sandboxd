@@ -8,35 +8,25 @@ Hardening operates at five layers:
 
 | Layer | What it protects against |
 |-------|--------------------------|
-| QEMU sandboxing | VM escape via QEMU process exploitation |
-| Device model lockdown | Attack surface from unnecessary emulated hardware |
+| Device model lockdown + cgroup limits | VM escape via QEMU process exploitation |
+| KVM hardware isolation | Guest/host memory separation via hardware virtualization |
 | Network isolation | Cross-session communication, direct internet access |
 | TLS interception | Unmonitored outbound HTTPS traffic |
 | Guest OS | Privilege escalation, path traversal within the VM |
 
-All layers are enabled when `SessionConfig.hardened` is `true`, which is the default. The `--no-hardening` CLI flag disables the QEMU-level protections (seccomp, device lockdown, cgroup limits) but does not affect network isolation or TLS interception.
+All layers are enabled when `SessionConfig.hardened` is `true`, which is the default. The `--no-hardening` CLI flag disables the QEMU-level protections (device lockdown, cgroup limits) but does not affect network isolation or TLS interception.
 
-## QEMU sandboxing
+## QEMU hardening
 
 The sandbox runs QEMU through a wrapper script (`~/.sandboxd/libexec/qemu-system-x86_64`) that injects security flags and resource limits. Lima invokes this wrapper via the `QEMU_SYSTEM_X86_64` environment variable.
 
-### Seccomp filter
+### Seccomp filter (not used)
 
-When hardened mode is active (`SANDBOX_QEMU_HARDENED=1`), the wrapper adds:
+QEMU provides a built-in seccomp sandbox (`-sandbox on`) that restricts syscalls available to the QEMU process. However, this feature is **not used** in sandboxd because it is incompatible with bridge networking.
 
-```
--sandbox on,obsolete=deny,elevateprivileges=deny,spawn=allow
-```
+The `-sandbox on` flag requires `PR_SET_NO_NEW_PRIVS`, which is a kernel-level restriction that strips the setuid bit from all child processes. Since `qemu-bridge-helper` relies on its setuid bit to create TAP devices on the Docker bridge, enabling seccomp would break network connectivity for every session.
 
-This enables QEMU's built-in seccomp sandbox with two deny policies and one allow:
-
-| Policy | Effect |
-|--------|--------|
-| `obsolete=deny` | Blocks deprecated syscalls that have known exploitation patterns |
-| `elevateprivileges=deny` | Prevents the QEMU process from gaining elevated privileges |
-| `spawn=allow` | Allows QEMU to spawn child processes (required for `qemu-bridge-helper` to create TAP devices) |
-
-The seccomp filter is applied by QEMU itself at startup, before the guest begins executing. If a vulnerability allows code execution within the QEMU process, these restrictions limit what the attacker can do.
+Defence-in-depth is maintained through the remaining layers: device model lockdown, cgroup resource limits, KVM hardware isolation, and the gateway-enforced network pipeline.
 
 ### Cgroup resource limits
 
@@ -64,7 +54,7 @@ systemctl --user status sandbox.slice
 
 ### Fallback behavior
 
-If `systemd-run` is not available (e.g., on systems without systemd user sessions), the wrapper falls back to running QEMU directly without cgroup limits. The seccomp sandbox and device lockdown still apply. Resource limits in this configuration depend on the host OS kernel's default cgroup policies.
+If `systemd-run` is not available (e.g., on systems without systemd user sessions), the wrapper falls back to running QEMU directly without cgroup limits. Device lockdown still applies. Resource limits in this configuration depend on the host OS kernel's default cgroup policies.
 
 To check whether cgroup limits are active for a running session:
 
@@ -260,7 +250,6 @@ sandbox create --name debug-session --no-hardening
 
 | Feature | Disabled? |
 |---------|-----------|
-| Seccomp filter | Yes |
 | Cgroup resource limits | Yes |
 | Device lockdown (`-no-user-config`, `-display none`, `-vga none`) | Yes |
 | Lima template `video: none`, `audio: none` | Yes |
@@ -275,7 +264,7 @@ sandbox create --name debug-session --no-hardening
 
 - **Debugging VM boot issues.** The hardened device model can cause compatibility problems with certain guest configurations. If a VM fails to boot, disabling hardening can help isolate whether the issue is caused by the restricted device model.
 - **Running graphical applications.** If the workload requires a display device (unlikely in sandbox use cases), hardening must be disabled.
-- **Diagnosing QEMU crashes.** The seccomp filter may block syscalls that QEMU needs for specific operations. Disabling hardening removes the seccomp filter, allowing you to determine if the crash is seccomp-related.
+- **Diagnosing QEMU crashes.** The restricted device model may cause compatibility issues. Disabling hardening removes device lockdown, allowing you to determine if the crash is related to the restricted configuration.
 
 Do not use `--no-hardening` in production. The hardened configuration is the tested and supported default.
 
