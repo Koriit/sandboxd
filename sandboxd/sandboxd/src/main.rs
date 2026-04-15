@@ -565,7 +565,7 @@ async fn create_session(
             error!(%session_id, error = %e, "networking setup failed");
             let _ = state.store.update_state(&session_id, SessionState::Error);
             // Best-effort teardown of any partial networking state.
-            teardown_session_networking(&session_id, &state);
+            teardown_session_networking(&session_id, &state).await;
             return error_response(e).into_response();
         }
     }
@@ -726,12 +726,12 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse 
                     // DB says Running but Lima says Stopped => update to Stopped
                     (SessionState::Running, VmStatus::Stopped) => {
                         s.state = SessionState::Stopped;
-                        let _ = state.store.update_state(&s.id, SessionState::Stopped);
+                        let _ = state.store.update_state_forced(&s.id, SessionState::Stopped);
                     }
                     // DB says Stopped but Lima says Running => update to Running
                     (SessionState::Stopped, VmStatus::Running) => {
                         s.state = SessionState::Running;
-                        let _ = state.store.update_state(&s.id, SessionState::Running);
+                        let _ = state.store.update_state_forced(&s.id, SessionState::Running);
                     }
                     _ => {}
                 }
@@ -800,11 +800,11 @@ async fn get_session(
             match (&session.state, &vm_status) {
                 (SessionState::Running, VmStatus::Stopped) => {
                     session.state = SessionState::Stopped;
-                    let _ = state.store.update_state(&session.id, SessionState::Stopped);
+                    let _ = state.store.update_state_forced(&session.id, SessionState::Stopped);
                 }
                 (SessionState::Stopped, VmStatus::Running) => {
                     session.state = SessionState::Running;
-                    let _ = state.store.update_state(&session.id, SessionState::Running);
+                    let _ = state.store.update_state_forced(&session.id, SessionState::Running);
                 }
                 _ => {}
             }
@@ -960,7 +960,7 @@ async fn start_session(
             error!(session_id = %session.id, error = %e, "networking restore failed after start");
             let _ = state.store.update_state(&session.id, SessionState::Error);
             // Best-effort teardown of any partial networking state.
-            teardown_session_networking(&session.id, &state);
+            teardown_session_networking(&session.id, &state).await;
             return error_response(e).into_response();
         }
     }
@@ -1757,16 +1757,37 @@ async fn setup_session_networking(
     // 1. Create gateway container with nftables, mounting the CA.
     //    Pass the initial DNS policy so it is written to the container
     //    before CoreDNS starts, avoiding a reload-timer race.
-    state
-        .gateway
-        .create_gateway(session_id, network_info, Some(ca_dir), initial_dns_policy)?;
+    //    Wrapped in spawn_blocking because create_gateway runs Docker
+    //    commands and polls for readiness with thread::sleep loops.
+    {
+        let gw = state.gateway.clone();
+        let sid = *session_id;
+        let ni = network_info.clone();
+        let ca = ca_dir.to_path_buf();
+        let dns = initial_dns_policy.map(|s| s.to_string());
+        match tokio::task::spawn_blocking(move || {
+            gw.create_gateway(&sid, &ni, Some(&ca), dns.as_deref())
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => {
+                return Err(SandboxError::Internal(format!(
+                    "task join error creating gateway: {e}"
+                )));
+            }
+        }
+    }
 
     // 2. Configure the bridge NIC inside the VM (already present from boot).
     if let Err(e) =
         attach_vm_to_bridge(session_id, network_info, &state.guest).await
     {
         // Roll back gateway on attach failure.
-        let _ = state.gateway.stop_gateway(session_id);
+        let gw = state.gateway.clone();
+        let sid = *session_id;
+        let _ = tokio::task::spawn_blocking(move || gw.stop_gateway(&sid)).await;
         return Err(e);
     }
 
@@ -1788,19 +1809,26 @@ async fn setup_session_networking(
 ///
 /// The CA certificate files on disk are NOT removed — they are reused on
 /// start.
-fn teardown_session_networking(session_id: &uuid::Uuid, state: &AppState) {
+async fn teardown_session_networking(session_id: &uuid::Uuid, state: &AppState) {
     debug!(session_id = %session_id, "tearing down session networking (preserving allocation)");
-    // detach_vm_from_bridge is a no-op (TAP owned by QEMU), but call it
-    // for completeness / future-proofing.
-    if let Err(e) = detach_vm_from_bridge(session_id) {
-        warn!(%session_id, error = %e, "failed to detach VM from bridge (best-effort)");
-    }
-    if let Err(e) = state.gateway.stop_gateway(session_id) {
-        warn!(%session_id, error = %e, "failed to stop gateway (best-effort)");
-    }
-    if let Err(e) = state.network.remove_docker_network(session_id) {
-        warn!(%session_id, error = %e, "failed to remove Docker network (best-effort)");
-    }
+    // Blocking Docker calls (stop_gateway, remove_docker_network) are
+    // wrapped in spawn_blocking to avoid stalling the Tokio runtime.
+    let gateway = state.gateway.clone();
+    let network = state.network.clone();
+    let sid = *session_id;
+    let _ = tokio::task::spawn_blocking(move || {
+        // detach_vm_from_bridge is a no-op (TAP owned by QEMU), but call it
+        // for completeness / future-proofing.
+        if let Err(e) = detach_vm_from_bridge(&sid) {
+            warn!(%sid, error = %e, "failed to detach VM from bridge (best-effort)");
+        }
+        if let Err(e) = gateway.stop_gateway(&sid) {
+            warn!(%sid, error = %e, "failed to stop gateway (best-effort)");
+        }
+        if let Err(e) = network.remove_docker_network(&sid) {
+            warn!(%sid, error = %e, "failed to remove Docker network (best-effort)");
+        }
+    }).await;
 }
 
 /// Re-apply the session's policy to a freshly created gateway container.
@@ -1913,14 +1941,40 @@ async fn restore_session_networking(
     } else {
         None
     };
-    if let Err(e) =
-        state
-            .gateway
-            .create_gateway(session_id, &network_info, Some(&ca_dir), initial_dns_policy)
+    // Wrapped in spawn_blocking because create_gateway runs Docker
+    // commands and polls for readiness with thread::sleep loops.
     {
-        // Roll back the Docker network on gateway failure.
-        let _ = state.network.remove_docker_network(session_id);
-        return Err(e);
+        let gw = state.gateway.clone();
+        let sid = *session_id;
+        let ni = network_info.clone();
+        let ca = ca_dir.clone();
+        let dns = initial_dns_policy.map(|s| s.to_string());
+        match tokio::task::spawn_blocking(move || {
+            gw.create_gateway(&sid, &ni, Some(&ca), dns.as_deref())
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                // Roll back the Docker network on gateway failure.
+                let net = state.network.clone();
+                let sid = *session_id;
+                let _ = tokio::task::spawn_blocking(move || {
+                    net.remove_docker_network(&sid)
+                }).await;
+                return Err(e);
+            }
+            Err(e) => {
+                let net = state.network.clone();
+                let sid = *session_id;
+                let _ = tokio::task::spawn_blocking(move || {
+                    net.remove_docker_network(&sid)
+                }).await;
+                return Err(SandboxError::Internal(format!(
+                    "task join error creating gateway: {e}"
+                )));
+            }
+        }
     }
 
     // 2b. Re-apply the session's policy to the fresh gateway container.
@@ -1934,8 +1988,13 @@ async fn restore_session_networking(
         attach_vm_to_bridge(session_id, &network_info, &state.guest).await
     {
         // Roll back gateway and Docker network on attach failure.
-        let _ = state.gateway.stop_gateway(session_id);
-        let _ = state.network.remove_docker_network(session_id);
+        let gw = state.gateway.clone();
+        let net = state.network.clone();
+        let sid = *session_id;
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = gw.stop_gateway(&sid);
+            net.remove_docker_network(&sid)
+        }).await;
         return Err(e);
     }
 
@@ -2199,7 +2258,7 @@ fn reconcile(store: &SessionStore, lima: &LimaManager) {
                     state = %session.state,
                     "reconciliation: VM missing, marking session as Error"
                 );
-                let _ = store.update_state(&session.id, SessionState::Error);
+                let _ = store.update_state_forced(&session.id, SessionState::Error);
                 fixed_count += 1;
             }
             // VM missing, session already stopped or errored -> OK
@@ -2216,7 +2275,7 @@ fn reconcile(store: &SessionStore, lima: &LimaManager) {
                             session_id = %session.id,
                             "reconciliation: VM stopped but session says Running, updating to Stopped"
                         );
-                        let _ = store.update_state(&session.id, SessionState::Stopped);
+                        let _ = store.update_state_forced(&session.id, SessionState::Stopped);
                         fixed_count += 1;
                     }
                     (SessionState::Stopped, VmStatus::Running) => {
@@ -2224,7 +2283,7 @@ fn reconcile(store: &SessionStore, lima: &LimaManager) {
                             session_id = %session.id,
                             "reconciliation: VM running but session says Stopped, updating to Running"
                         );
-                        let _ = store.update_state(&session.id, SessionState::Running);
+                        let _ = store.update_state_forced(&session.id, SessionState::Running);
                         fixed_count += 1;
                     }
                     _ => {

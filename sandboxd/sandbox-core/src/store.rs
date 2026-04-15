@@ -142,7 +142,60 @@ impl SessionStore {
     }
 
     /// Update the state of a session and refresh its `updated_at` timestamp.
+    ///
+    /// Validates that the transition is allowed by the session state machine
+    /// (see [`SessionState::can_transition_to`]).  Returns
+    /// `SandboxError::InvalidState` if the transition is not valid.
+    ///
+    /// For reconciliation or crash-recovery code that must force a state
+    /// regardless of the current value, use [`update_state_forced`] instead.
     pub fn update_state(
+        &self,
+        id: &Uuid,
+        new_state: SessionState,
+    ) -> Result<(), SandboxError> {
+        let conn = self.conn.lock().map_err(|e| {
+            SandboxError::Internal(format!("lock poisoned: {e}"))
+        })?;
+
+        // Fetch the current state so we can validate the transition.
+        let current_state = {
+            let mut stmt = conn.prepare(
+                "SELECT state FROM sessions WHERE id = ?1",
+            )?;
+            let mut rows = stmt.query(params![id.to_string()])?;
+            match rows.next()? {
+                Some(row) => {
+                    let state_str: String = row.get(0)?;
+                    SessionState::from_str(&state_str)?
+                }
+                None => return Err(SandboxError::SessionNotFound(id.to_string())),
+            }
+        };
+
+        if !current_state.can_transition_to(new_state) {
+            return Err(SandboxError::InvalidState(format!(
+                "cannot transition from {} to {}",
+                current_state, new_state
+            )));
+        }
+
+        let now = Utc::now();
+        conn.execute(
+            "UPDATE sessions SET state = ?1, updated_at = ?2 WHERE id = ?3",
+            params![new_state.to_string(), now.to_rfc3339(), id.to_string()],
+        )?;
+
+        Ok(())
+    }
+
+    /// Forcibly set the state of a session, bypassing state machine validation.
+    ///
+    /// This is intended **only** for reconciliation and crash-recovery code
+    /// that must align the DB with external reality (e.g. a VM that was
+    /// found running when the DB says Stopped).  Normal handler code should
+    /// use [`update_state`] which enforces the state machine.
+    pub fn update_state_forced(
         &self,
         id: &Uuid,
         state: SessionState,
@@ -822,5 +875,101 @@ mod tests {
         let ids: Vec<Uuid> = entries.iter().map(|(id, _)| *id).collect();
         assert!(ids.contains(&s1.id));
         assert!(ids.contains(&s2.id));
+    }
+
+    // -- State machine validation tests ------------------------------------
+
+    #[test]
+    fn test_update_state_validates_transition() {
+        let (store, _dir) = test_store();
+
+        let session = store
+            .create_session(SessionConfig::default(), None)
+            .expect("create");
+
+        // Creating -> Running: valid
+        store
+            .update_state(&session.id, SessionState::Running)
+            .expect("Creating -> Running should succeed");
+
+        // Running -> Stopped: valid
+        store
+            .update_state(&session.id, SessionState::Stopped)
+            .expect("Running -> Stopped should succeed");
+
+        // Stopped -> Running: valid
+        store
+            .update_state(&session.id, SessionState::Running)
+            .expect("Stopped -> Running should succeed");
+    }
+
+    #[test]
+    fn test_update_state_rejects_invalid_transition() {
+        let (store, _dir) = test_store();
+
+        let session = store
+            .create_session(SessionConfig::default(), None)
+            .expect("create");
+
+        // Creating -> Stopped: invalid
+        let result = store.update_state(&session.id, SessionState::Stopped);
+        assert!(
+            matches!(result, Err(SandboxError::InvalidState(_))),
+            "Creating -> Stopped should be rejected, got: {result:?}"
+        );
+
+        // Advance to Error
+        store
+            .update_state(&session.id, SessionState::Error)
+            .expect("Creating -> Error should succeed");
+
+        // Error -> Running: invalid (Error is terminal)
+        let result = store.update_state(&session.id, SessionState::Running);
+        assert!(
+            matches!(result, Err(SandboxError::InvalidState(_))),
+            "Error -> Running should be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_update_state_forced_bypasses_validation() {
+        let (store, _dir) = test_store();
+
+        let session = store
+            .create_session(SessionConfig::default(), None)
+            .expect("create");
+
+        // Creating -> Stopped: normally invalid, but forced should work
+        store
+            .update_state_forced(&session.id, SessionState::Stopped)
+            .expect("forced Creating -> Stopped should succeed");
+
+        let fetched = store
+            .get_session(&session.id)
+            .expect("get")
+            .expect("exists");
+        assert_eq!(fetched.state, SessionState::Stopped);
+
+        // Set to Error, then force back to Running
+        store
+            .update_state_forced(&session.id, SessionState::Error)
+            .expect("forced -> Error");
+        store
+            .update_state_forced(&session.id, SessionState::Running)
+            .expect("forced Error -> Running should succeed");
+
+        let fetched = store
+            .get_session(&session.id)
+            .expect("get")
+            .expect("exists");
+        assert_eq!(fetched.state, SessionState::Running);
+    }
+
+    #[test]
+    fn test_update_state_forced_nonexistent() {
+        let (store, _dir) = test_store();
+
+        let result = store.update_state_forced(&Uuid::new_v4(), SessionState::Running);
+        assert!(matches!(result, Err(SandboxError::SessionNotFound(_))));
     }
 }

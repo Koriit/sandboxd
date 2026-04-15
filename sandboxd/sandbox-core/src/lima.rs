@@ -129,7 +129,7 @@ Environment=RUST_LOG=info
 WantedBy=multi-user.target";
 
 /// QEMU wrapper script that injects PCIe root-port, bridge networking,
-/// seccomp sandbox, and optional cgroup resource limits via `systemd-run`.
+/// device lockdown, and optional cgroup resource limits via `systemd-run`.
 ///
 /// Extracted as a constant so tests can verify the content without writing
 /// to the filesystem.
@@ -145,12 +145,11 @@ const QEMU_WRAPPER_SCRIPT: &str = r#"#!/bin/sh
 #    namespace, so a wrapper helper runs qemu-bridge-helper via nsenter.
 #
 # When SANDBOX_QEMU_HARDENED=1:
-# 3. Enables QEMU seccomp sandbox to restrict syscalls.
-# 4. Disables unnecessary devices (USB, sound, display, floppy, HPET, etc.)
+# 3. Disables unnecessary devices (USB, sound, display, floppy, HPET, etc.)
 #    and adds virtio-rng for guest entropy.
 #
 # When SANDBOX_QEMU_MEMORY_MB and SANDBOX_QEMU_CPUS are set:
-# 5. Applies cgroup resource limits via systemd-run.
+# 4. Applies cgroup resource limits via systemd-run.
 
 # Find the real QEMU binary, excluding this wrapper's directory to prevent
 # infinite recursion if Lima prepends it to PATH.
@@ -378,8 +377,8 @@ impl LimaManager {
     /// Start an existing (stopped) VM.
     ///
     /// A QEMU wrapper script is injected via `QEMU_SYSTEM_X86_64` so that the
-    /// resulting VM has a PCIe root-port available for NIC hot-add, seccomp
-    /// sandboxing, device lockdown, and cgroup resource limits.
+    /// resulting VM has a PCIe root-port available for NIC hot-add,
+    /// device lockdown, and cgroup resource limits.
     ///
     /// The `config` parameter controls hardening and propagates resource limits
     /// (memory, CPU) to the QEMU wrapper script via environment variables.
@@ -990,9 +989,9 @@ impl LimaManager {
                     "--cpus",
                     &cpus.to_string(),
                     "--memory",
-                    &format!("{memory_mb}MiB"),
+                    &mib_to_gib_string(memory_mb),
                     "--disk",
-                    &format!("{disk_gb}GiB"),
+                    &disk_gb.to_string(),
                 ]),
             CLONE_VM_TIMEOUT,
             "limactl clone",
@@ -1128,8 +1127,8 @@ provision:
         // Build the mounts section: empty by default, populated for shared
         // workspace mode.  We use `9p` (built into QEMU) rather than
         // `virtiofs` because virtiofs requires virtiofsd + shared memory
-        // (memfd) which conflicts with QEMU's seccomp sandbox in hardened
-        // mode.  9p runs inside the QEMU process itself.
+        // (memfd) which adds complexity and an additional process.
+        // 9p runs inside the QEMU process itself.
         //
         // SECURITY NOTE: 9p adds a virtio-9p device to the VM, which
         // expands the attack surface compared to a fully isolated VM.  The
@@ -1258,9 +1257,8 @@ provision:
     ///    root-port by default, which means no PCIe device (including
     ///    virtio-net-pci) can be hot-added via QMP.
     ///
-    /// 2. **Seccomp sandbox** — Enables QEMU's built-in seccomp filter to deny
-    ///    obsolete syscalls and privilege escalation.  Process spawning is
-    ///    allowed because `qemu-bridge-helper` must be launched as a subprocess.
+    /// 2. **Device lockdown** — Disables unnecessary QEMU devices (USB, sound,
+    ///    display, floppy, HPET) and adds virtio-rng for guest entropy.
     ///
     /// 3. **Cgroup limits** — When `SANDBOX_QEMU_MEMORY_MB` and
     ///    `SANDBOX_QEMU_CPUS` environment variables are set (propagated from

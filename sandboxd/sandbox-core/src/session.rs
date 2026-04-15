@@ -62,6 +62,27 @@ pub enum SessionState {
     Error,
 }
 
+impl SessionState {
+    /// Check whether a transition from `self` to `new_state` is valid.
+    ///
+    /// Valid transitions:
+    /// - Creating -> Running | Error
+    /// - Running -> Stopped | Error
+    /// - Stopped -> Running | Error
+    /// - Error -> (terminal, no transitions)
+    pub fn can_transition_to(self, new_state: SessionState) -> bool {
+        matches!(
+            (self, new_state),
+            (SessionState::Creating, SessionState::Running)
+                | (SessionState::Creating, SessionState::Error)
+                | (SessionState::Running, SessionState::Stopped)
+                | (SessionState::Running, SessionState::Error)
+                | (SessionState::Stopped, SessionState::Running)
+                | (SessionState::Stopped, SessionState::Error)
+        )
+    }
+}
+
 impl std::fmt::Display for SessionState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -101,10 +122,10 @@ pub struct SessionConfig {
     /// How the workspace is provided to the VM (if at all).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_mode: Option<WorkspaceMode>,
-    /// Enable QEMU hardening (device lockdown, seccomp).
+    /// Enable QEMU hardening (device lockdown, cgroup limits).
     ///
     /// When `true` (the default), the QEMU wrapper disables unnecessary
-    /// devices and enables seccomp sandboxing.  Set to `false` for debugging
+    /// devices and applies cgroup resource limits.  Set to `false` for debugging
     /// or when the hardened configuration causes compatibility issues.
     #[serde(default = "default_hardened")]
     pub hardened: bool,
@@ -176,17 +197,7 @@ impl Session {
         &mut self,
         new_state: SessionState,
     ) -> Result<(), crate::SandboxError> {
-        let valid = matches!(
-            (self.state, new_state),
-            (SessionState::Creating, SessionState::Running)
-                | (SessionState::Creating, SessionState::Error)
-                | (SessionState::Running, SessionState::Stopped)
-                | (SessionState::Running, SessionState::Error)
-                | (SessionState::Stopped, SessionState::Running)
-                | (SessionState::Stopped, SessionState::Error)
-        );
-
-        if !valid {
+        if !self.state.can_transition_to(new_state) {
             return Err(crate::SandboxError::InvalidState(format!(
                 "cannot transition from {} to {}",
                 self.state, new_state
@@ -273,6 +284,33 @@ mod tests {
         let result = session.transition_to(SessionState::Running);
         assert!(result.is_err());
         assert_eq!(session.state, SessionState::Error);
+    }
+
+    #[test]
+    fn can_transition_to_valid() {
+        assert!(SessionState::Creating.can_transition_to(SessionState::Running));
+        assert!(SessionState::Creating.can_transition_to(SessionState::Error));
+        assert!(SessionState::Running.can_transition_to(SessionState::Stopped));
+        assert!(SessionState::Running.can_transition_to(SessionState::Error));
+        assert!(SessionState::Stopped.can_transition_to(SessionState::Running));
+        assert!(SessionState::Stopped.can_transition_to(SessionState::Error));
+    }
+
+    #[test]
+    fn can_transition_to_invalid() {
+        // Error is terminal
+        assert!(!SessionState::Error.can_transition_to(SessionState::Running));
+        assert!(!SessionState::Error.can_transition_to(SessionState::Stopped));
+        assert!(!SessionState::Error.can_transition_to(SessionState::Creating));
+
+        // Creating cannot go directly to Stopped
+        assert!(!SessionState::Creating.can_transition_to(SessionState::Stopped));
+
+        // No self-transitions
+        assert!(!SessionState::Running.can_transition_to(SessionState::Running));
+        assert!(!SessionState::Stopped.can_transition_to(SessionState::Stopped));
+        assert!(!SessionState::Creating.can_transition_to(SessionState::Creating));
+        assert!(!SessionState::Error.can_transition_to(SessionState::Error));
     }
 
     #[test]

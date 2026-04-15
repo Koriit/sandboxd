@@ -64,7 +64,7 @@ enum Command {
         /// Mutually exclusive with --repo.
         #[arg(long, conflicts_with = "repo")]
         workspace: Option<String>,
-        /// Disable QEMU hardening (device lockdown, seccomp).
+        /// Disable QEMU hardening (device lockdown, cgroup limits).
         ///
         /// By default, hardening is enabled. Use this flag for debugging
         /// or when the hardened configuration causes compatibility issues.

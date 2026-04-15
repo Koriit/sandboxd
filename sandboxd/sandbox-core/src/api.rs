@@ -60,7 +60,7 @@ pub struct CreateSessionRequest {
     /// host directory is mounted into the VM at `/home/agent/workspace`
     /// via 9p.
     pub workspace: Option<String>,
-    /// Enable QEMU hardening (device lockdown, seccomp).
+    /// Enable QEMU hardening (device lockdown, cgroup limits).
     ///
     /// Defaults to `true`. Set to `false` for debugging or when the
     /// hardened configuration causes compatibility issues.
