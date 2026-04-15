@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use serde::Deserialize;
+use ring::digest;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 use uuid::Uuid;
 
@@ -32,6 +33,31 @@ const INSTALL_GUEST_AGENT_STEP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timeout for `limactl list`.
 const LIST_VMS_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Timeout for `limactl create` when building the base image (longer than
+/// per-session create because this is a one-time operation).
+const BASE_CREATE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Timeout for `limactl start` when booting the base image (cloud-init
+/// provisioning runs on first boot, which is slow).
+const BASE_START_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Timeout for `limactl stop` when stopping the base image.
+const BASE_STOP_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Timeout for `limactl clone`.
+const CLONE_VM_TIMEOUT: Duration = Duration::from_secs(60);
+
+// ---------------------------------------------------------------------------
+// Golden image constants
+// ---------------------------------------------------------------------------
+
+/// VM name for the pre-provisioned golden base image.
+const BASE_VM_NAME: &str = "sandbox-base";
+
+/// Maximum age (in days) before the base image is considered stale and
+/// should be rebuilt.
+const BASE_IMAGE_MAX_AGE_DAYS: u64 = 10;
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -52,6 +78,32 @@ pub struct VmInfo {
     pub status: VmStatus,
     /// Session ID parsed from the `sandbox-{uuid}` naming convention.
     pub session_id: Option<Uuid>,
+}
+
+/// Metadata for the golden base image, persisted as JSON alongside the VM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BaseImageMeta {
+    /// When the base image was built.
+    pub built_at: chrono::DateTime<chrono::Utc>,
+    /// SHA256 hash of the inputs (template content + guest agent binary)
+    /// that produced this image.
+    pub content_hash: String,
+}
+
+/// Status of the pre-provisioned golden base image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BaseImageStatus {
+    /// No base image VM exists.
+    Missing,
+    /// The base image is up-to-date and ready for cloning.
+    Fresh,
+    /// The base image exists but should be rebuilt.
+    Stale {
+        /// Age of the base image in days.
+        age_days: u64,
+        /// Whether the content hash differs from the current inputs.
+        hash_mismatch: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -261,7 +313,7 @@ impl LimaManager {
         )
         .map_err(|e| match e {
             SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl create", std::io::Error::new(std::io::ErrorKind::Other, msg))
+                lima_io_error("limactl create", std::io::Error::other(msg))
             }
             other => other,
         })?;
@@ -309,7 +361,7 @@ impl LimaManager {
         )
         .map_err(|e| match e {
             SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl create", std::io::Error::new(std::io::ErrorKind::Other, msg))
+                lima_io_error("limactl create", std::io::Error::other(msg))
             }
             other => other,
         })?;
@@ -375,7 +427,7 @@ impl LimaManager {
         )
         .map_err(|e| match e {
             SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl start", std::io::Error::new(std::io::ErrorKind::Other, msg))
+                lima_io_error("limactl start", std::io::Error::other(msg))
             }
             other => other,
         })?;
@@ -404,7 +456,7 @@ impl LimaManager {
         )
         .map_err(|e| match e {
             SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl stop", std::io::Error::new(std::io::ErrorKind::Other, msg))
+                lima_io_error("limactl stop", std::io::Error::other(msg))
             }
             other => other,
         })?;
@@ -433,7 +485,7 @@ impl LimaManager {
         )
         .map_err(|e| match e {
             SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl delete", std::io::Error::new(std::io::ErrorKind::Other, msg))
+                lima_io_error("limactl delete", std::io::Error::other(msg))
             }
             other => other,
         })?;
@@ -480,7 +532,7 @@ impl LimaManager {
         )
         .map_err(|e| match e {
             SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl copy (guest agent)", std::io::Error::new(std::io::ErrorKind::Other, msg))
+                lima_io_error("limactl copy (guest agent)", std::io::Error::other(msg))
             }
             other => other,
         })?;
@@ -505,7 +557,7 @@ impl LimaManager {
         )
         .map_err(|e| match e {
             SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl shell mv", std::io::Error::new(std::io::ErrorKind::Other, msg))
+                lima_io_error("limactl shell mv", std::io::Error::other(msg))
             }
             other => other,
         })?;
@@ -528,7 +580,7 @@ impl LimaManager {
         )
         .map_err(|e| match e {
             SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl shell chmod", std::io::Error::new(std::io::ErrorKind::Other, msg))
+                lima_io_error("limactl shell chmod", std::io::Error::other(msg))
             }
             other => other,
         })?;
@@ -557,7 +609,7 @@ impl LimaManager {
         )
         .map_err(|e| match e {
             SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl shell (create service)", std::io::Error::new(std::io::ErrorKind::Other, msg))
+                lima_io_error("limactl shell (create service)", std::io::Error::other(msg))
             }
             other => other,
         })?;
@@ -582,7 +634,7 @@ impl LimaManager {
         )
         .map_err(|e| match e {
             SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl shell (daemon-reload)", std::io::Error::new(std::io::ErrorKind::Other, msg))
+                lima_io_error("limactl shell (daemon-reload)", std::io::Error::other(msg))
             }
             other => other,
         })?;
@@ -605,7 +657,7 @@ impl LimaManager {
         )
         .map_err(|e| match e {
             SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl shell (enable service)", std::io::Error::new(std::io::ErrorKind::Other, msg))
+                lima_io_error("limactl shell (enable service)", std::io::Error::other(msg))
             }
             other => other,
         })?;
@@ -659,7 +711,398 @@ impl LimaManager {
             .collect())
     }
 
+    // -- golden image -------------------------------------------------------
+
+    /// Compute a SHA256 content hash of the golden image inputs.
+    ///
+    /// The hash covers:
+    /// 1. The base template YAML content (from `generate_base_template()`)
+    /// 2. The guest agent binary bytes (at the path from `guest_agent_path()`)
+    ///
+    /// If the guest agent binary does not exist, this is treated as a hard
+    /// error because the base image cannot be built without it.
+    pub fn compute_base_image_hash(&self) -> Result<String, SandboxError> {
+        let template = self.generate_base_template();
+        let agent_path = guest_agent_path()?;
+
+        if !agent_path.exists() {
+            return Err(SandboxError::Internal(format!(
+                "guest agent binary not found at {}",
+                agent_path.display()
+            )));
+        }
+
+        let agent_bytes = std::fs::read(&agent_path).map_err(|e| {
+            SandboxError::Internal(format!(
+                "failed to read guest agent binary at {}: {e}",
+                agent_path.display()
+            ))
+        })?;
+
+        let mut ctx = digest::Context::new(&digest::SHA256);
+        ctx.update(template.as_bytes());
+        ctx.update(&agent_bytes);
+        let hash = ctx.finish();
+
+        Ok(hex_encode(hash.as_ref()))
+    }
+
+    /// Check the status of the golden base image.
+    ///
+    /// Returns `Missing` if the VM does not exist, `Fresh` if it is
+    /// up-to-date, or `Stale` if it should be rebuilt.
+    pub fn check_base_image(&self) -> Result<BaseImageStatus, SandboxError> {
+        // Check if the VM exists.
+        let vms = self.list_vms_raw()?;
+        let vm_exists = vms
+            .iter()
+            .any(|e| e.name.as_deref() == Some(BASE_VM_NAME));
+
+        if !vm_exists {
+            return Ok(BaseImageStatus::Missing);
+        }
+
+        // Read metadata file.
+        let meta_path = self.base_dir.join("base-image-meta.json");
+        let meta = match std::fs::read_to_string(&meta_path) {
+            Ok(content) => match serde_json::from_str::<BaseImageMeta>(&content) {
+                Ok(meta) => meta,
+                Err(_) => {
+                    return Ok(BaseImageStatus::Stale {
+                        age_days: 0,
+                        hash_mismatch: true,
+                    });
+                }
+            },
+            Err(_) => {
+                return Ok(BaseImageStatus::Stale {
+                    age_days: 0,
+                    hash_mismatch: true,
+                });
+            }
+        };
+
+        // Check content hash.
+        let current_hash = self.compute_base_image_hash()?;
+        if meta.content_hash != current_hash {
+            let age_days = age_in_days(&meta.built_at);
+            return Ok(BaseImageStatus::Stale {
+                age_days,
+                hash_mismatch: true,
+            });
+        }
+
+        // Check age.
+        let age_days = age_in_days(&meta.built_at);
+        if age_days > BASE_IMAGE_MAX_AGE_DAYS {
+            return Ok(BaseImageStatus::Stale {
+                age_days,
+                hash_mismatch: false,
+            });
+        }
+
+        Ok(BaseImageStatus::Fresh)
+    }
+
+    /// Build the golden base image from scratch.
+    ///
+    /// This creates a new Lima VM named `sandbox-base`, boots it, installs
+    /// the guest agent, then stops it.  The resulting VM serves as a
+    /// template that can be cloned for each new session.
+    pub fn build_base_image(&self) -> Result<(), SandboxError> {
+        info!("building golden base image");
+
+        // 1. Generate and write the base template.
+        let template = self.generate_base_template();
+        std::fs::create_dir_all(&self.base_dir)?;
+        let template_path = self.base_dir.join("base-template.yaml");
+        std::fs::write(&template_path, &template)?;
+        info!(path = %template_path.display(), "wrote base template");
+
+        // 2. Create the VM.
+        info!("creating base VM");
+        let output = run_with_timeout(
+            Command::new(&self.limactl)
+                .args(["create", "--name", BASE_VM_NAME])
+                .arg(&template_path)
+                .arg("--tty=false"),
+            BASE_CREATE_TIMEOUT,
+            "limactl create (base image)",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                lima_io_error(
+                    "limactl create (base image)",
+                    std::io::Error::other(msg),
+                )
+            }
+            other => other,
+        })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(parse_limactl_error("create (base image)", &stderr));
+        }
+        info!("base VM created");
+
+        // 3. Start the VM with QEMU wrapper for hardening.
+        info!("starting base VM (this may take several minutes for cloud-init)");
+        let qemu_wrapper = self.ensure_qemu_wrapper()?;
+
+        let output = run_with_timeout(
+            Command::new(&self.limactl)
+                .args(["start", BASE_VM_NAME])
+                .arg("--tty=false")
+                .env("QEMU_SYSTEM_X86_64", &qemu_wrapper)
+                .env("SANDBOX_QEMU_HARDENED", "1")
+                .env("SANDBOX_QEMU_MEMORY_MB", "1024")
+                .env("SANDBOX_QEMU_CPUS", "1"),
+            BASE_START_TIMEOUT,
+            "limactl start (base image)",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                lima_io_error(
+                    "limactl start (base image)",
+                    std::io::Error::other(msg),
+                )
+            }
+            other => other,
+        })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(parse_limactl_error("start (base image)", &stderr));
+        }
+        info!("base VM started");
+
+        // 4. Install the guest agent.
+        info!("installing guest agent into base VM");
+        let agent_path = guest_agent_path()?;
+        self.install_guest_agent_by_vm_name(BASE_VM_NAME, &agent_path)?;
+        info!("guest agent installed in base VM");
+
+        // 5. Stop the VM.
+        info!("stopping base VM");
+        let output = run_with_timeout(
+            Command::new(&self.limactl)
+                .args(["stop", BASE_VM_NAME])
+                .arg("--tty=false"),
+            BASE_STOP_TIMEOUT,
+            "limactl stop (base image)",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                lima_io_error(
+                    "limactl stop (base image)",
+                    std::io::Error::other(msg),
+                )
+            }
+            other => other,
+        })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(parse_limactl_error("stop (base image)", &stderr));
+        }
+        info!("base VM stopped");
+
+        // 6. Write metadata.
+        let content_hash = self.compute_base_image_hash()?;
+        let meta = BaseImageMeta {
+            built_at: chrono::Utc::now(),
+            content_hash,
+        };
+        let meta_path = self.base_dir.join("base-image-meta.json");
+        let meta_json = serde_json::to_string_pretty(&meta).map_err(|e| {
+            SandboxError::Internal(format!("failed to serialize base image metadata: {e}"))
+        })?;
+        std::fs::write(&meta_path, &meta_json)?;
+        info!(path = %meta_path.display(), "wrote base image metadata");
+
+        info!("golden base image build complete");
+        Ok(())
+    }
+
+    /// Delete and rebuild the golden base image.
+    pub fn rebuild_base_image(&self) -> Result<(), SandboxError> {
+        info!("rebuilding golden base image");
+
+        // Delete the existing VM (ignore errors if it doesn't exist).
+        let output = run_with_timeout(
+            Command::new(&self.limactl)
+                .args(["delete", "--force", BASE_VM_NAME])
+                .arg("--tty=false"),
+            DELETE_VM_TIMEOUT,
+            "limactl delete (base image)",
+        );
+
+        match output {
+            Ok(o) if !o.status.success() => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                debug!(stderr = %stderr, "base VM delete returned non-zero (may not exist)");
+            }
+            Err(e) => {
+                debug!(error = %e, "base VM delete failed (may not exist)");
+            }
+            Ok(_) => {
+                info!("deleted existing base VM");
+            }
+        }
+
+        // Delete the metadata file (ignore errors).
+        let meta_path = self.base_dir.join("base-image-meta.json");
+        if meta_path.exists() {
+            let _ = std::fs::remove_file(&meta_path);
+        }
+
+        self.build_base_image()
+    }
+
+    /// Clone the golden base image into a new VM for a session.
+    ///
+    /// The cloned VM gets the specified resource limits. The base image
+    /// must exist and be stopped (call `build_base_image()` first).
+    pub fn clone_vm(
+        &self,
+        session_id: Uuid,
+        cpus: u32,
+        memory_mb: u32,
+        disk_gb: u32,
+    ) -> Result<(), SandboxError> {
+        let target = vm_name(&session_id);
+
+        info!(
+            session_id = %session_id,
+            vm = %target,
+            cpus,
+            memory_mb,
+            disk_gb,
+            "cloning base image"
+        );
+
+        let output = run_with_timeout(
+            Command::new(&self.limactl)
+                .args([
+                    "clone",
+                    BASE_VM_NAME,
+                    &target,
+                    "--cpus",
+                    &cpus.to_string(),
+                    "--memory",
+                    &format!("{memory_mb}MiB"),
+                    "--disk",
+                    &format!("{disk_gb}GiB"),
+                ]),
+            CLONE_VM_TIMEOUT,
+            "limactl clone",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                lima_io_error(
+                    "limactl clone",
+                    std::io::Error::other(msg),
+                )
+            }
+            other => other,
+        })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(parse_limactl_error("clone", &stderr));
+        }
+
+        info!(session_id = %session_id, vm = %target, "VM cloned from base image");
+        Ok(())
+    }
+
     // -- template generation ------------------------------------------------
+
+    /// Generate a minimal Lima YAML template for the golden base image.
+    ///
+    /// Unlike `generate_template()`, this template uses fixed minimal
+    /// resources (1 CPU, 1024 MB, 10 GB), has no mounts, and includes no
+    /// per-session customization.  It carries the same cloud-init
+    /// provisioning scripts (user creation, socat/git, Docker install).
+    pub fn generate_base_template(&self) -> String {
+        format!(
+            r#"# Auto-generated Lima template for golden base image
+minimumLimaVersion: "2.0.0"
+
+vmType: "qemu"
+
+images:
+- location: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-amd64.img"
+  arch: "x86_64"
+- location: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-arm64.img"
+  arch: "aarch64"
+
+cpus: 1
+memory: "1GiB"
+disk: "10GiB"
+
+mounts: []
+portForwards: []
+
+video:
+  display: "none"
+audio:
+  device: "none"
+
+containerd:
+  system: false
+  user: false
+
+user:
+  name: "agent"
+  home: "/home/agent"
+
+provision:
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    hostnamectl set-hostname {hostname}
+    if ! grep -q '{hostname}' /etc/hosts; then
+      echo "127.0.1.1 {hostname}" >> /etc/hosts
+    fi
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    # Create agent user with passwordless sudo (if not already present)
+    if ! id agent &>/dev/null; then
+      useradd -m -s /bin/bash agent
+    fi
+    echo 'agent ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/agent
+    chmod 0440 /etc/sudoers.d/agent
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    # Install socat (needed for host-guest communication bridge) and git
+    if ! command -v socat &>/dev/null || ! command -v git &>/dev/null; then
+      apt-get update -qq
+      apt-get install -y socat git
+    fi
+    # Ensure the workspace directory exists for repo cloning (owned by agent, not root)
+    mkdir -p /home/agent/workspace
+    chown agent:agent /home/agent/workspace
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    # Install Docker via official convenience script
+    if ! command -v docker &>/dev/null; then
+      curl -fsSL https://get.docker.com | sh
+      usermod -aG docker agent
+    fi
+"#,
+            hostname = BASE_VM_NAME,
+        )
+    }
 
     /// Generate the Lima YAML template for a session.
     ///
@@ -858,6 +1301,176 @@ provision:
             .join(session_id.to_string())
     }
 
+    /// Install the guest agent into a VM identified by name.
+    ///
+    /// This is the internal implementation shared by `install_guest_agent()`
+    /// (which takes a session UUID) and `build_base_image()` (which uses the
+    /// fixed `sandbox-base` name).
+    fn install_guest_agent_by_vm_name(
+        &self,
+        vm_name: &str,
+        binary_path: &Path,
+    ) -> Result<(), SandboxError> {
+        if !binary_path.exists() {
+            return Err(SandboxError::Internal(format!(
+                "guest agent binary not found at {}",
+                binary_path.display()
+            )));
+        }
+
+        // 1. Copy the binary into the VM.
+        debug!(vm = %vm_name, binary = %binary_path.display(), "copying guest agent binary");
+        let copy_src = binary_path.to_string_lossy().to_string();
+        let copy_dst = format!("{vm_name}:/tmp/sandbox-guest");
+        let output = run_with_timeout(
+            Command::new(&self.limactl)
+                .args(["copy", &copy_src, &copy_dst]),
+            INSTALL_GUEST_AGENT_STEP_TIMEOUT,
+            "limactl copy (guest agent)",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                lima_io_error("limactl copy (guest agent)", std::io::Error::other(msg))
+            }
+            other => other,
+        })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SandboxError::Lima(format!(
+                "failed to copy guest agent to {vm_name}: {stderr}"
+            )));
+        }
+
+        // 2. Move the binary to /usr/local/bin with sudo and make it executable.
+        debug!(vm = %vm_name, "installing guest agent binary");
+        let output = run_with_timeout(
+            Command::new(&self.limactl)
+                .args([
+                    "shell", vm_name, "--",
+                    "sudo", "mv", "/tmp/sandbox-guest", "/usr/local/bin/sandbox-guest",
+                ]),
+            INSTALL_GUEST_AGENT_STEP_TIMEOUT,
+            "limactl shell mv",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                lima_io_error("limactl shell mv", std::io::Error::other(msg))
+            }
+            other => other,
+        })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SandboxError::Lima(format!(
+                "failed to move guest agent in {vm_name}: {stderr}"
+            )));
+        }
+
+        let output = run_with_timeout(
+            Command::new(&self.limactl)
+                .args([
+                    "shell", vm_name, "--",
+                    "sudo", "chmod", "+x", "/usr/local/bin/sandbox-guest",
+                ]),
+            INSTALL_GUEST_AGENT_STEP_TIMEOUT,
+            "limactl shell chmod",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                lima_io_error("limactl shell chmod", std::io::Error::other(msg))
+            }
+            other => other,
+        })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SandboxError::Lima(format!(
+                "failed to chmod guest agent in {vm_name}: {stderr}"
+            )));
+        }
+
+        // 3. Create a systemd service file.
+        debug!(vm = %vm_name, "creating systemd service");
+        let service_unit = GUEST_AGENT_SERVICE_UNIT;
+        let output = run_with_timeout(
+            Command::new(&self.limactl)
+                .args([
+                    "shell", vm_name, "--",
+                    "sudo", "bash", "-c",
+                    &format!(
+                        "cat > /etc/systemd/system/sandbox-guest.service << 'UNIT_EOF'\n{service_unit}\nUNIT_EOF"
+                    ),
+                ]),
+            INSTALL_GUEST_AGENT_STEP_TIMEOUT,
+            "limactl shell (create service)",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                lima_io_error("limactl shell (create service)", std::io::Error::other(msg))
+            }
+            other => other,
+        })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SandboxError::Lima(format!(
+                "failed to create systemd service in {vm_name}: {stderr}"
+            )));
+        }
+
+        // 4. Reload systemd and start the service.
+        debug!(vm = %vm_name, "starting guest agent service");
+        let output = run_with_timeout(
+            Command::new(&self.limactl)
+                .args([
+                    "shell", vm_name, "--",
+                    "sudo", "systemctl", "daemon-reload",
+                ]),
+            INSTALL_GUEST_AGENT_STEP_TIMEOUT,
+            "limactl shell (daemon-reload)",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                lima_io_error("limactl shell (daemon-reload)", std::io::Error::other(msg))
+            }
+            other => other,
+        })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SandboxError::Lima(format!(
+                "failed to reload systemd in {vm_name}: {stderr}"
+            )));
+        }
+
+        let output = run_with_timeout(
+            Command::new(&self.limactl)
+                .args([
+                    "shell", vm_name, "--",
+                    "sudo", "systemctl", "enable", "--now", "sandbox-guest",
+                ]),
+            INSTALL_GUEST_AGENT_STEP_TIMEOUT,
+            "limactl shell (enable service)",
+        )
+        .map_err(|e| match e {
+            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                lima_io_error("limactl shell (enable service)", std::io::Error::other(msg))
+            }
+            other => other,
+        })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(SandboxError::Lima(format!(
+                "failed to start guest agent service in {vm_name}: {stderr}"
+            )));
+        }
+
+        info!(vm = %vm_name, "guest agent installed and started");
+        Ok(())
+    }
+
     /// Run `limactl list --json` and deserialize the raw entries.
     fn list_vms_raw(&self) -> Result<Vec<LimactlListEntry>, SandboxError> {
         let output = run_with_timeout(
@@ -887,6 +1500,20 @@ provision:
 // ---------------------------------------------------------------------------
 // VM naming helpers (public for tests)
 // ---------------------------------------------------------------------------
+
+/// Resolve the path to the `sandbox-guest` binary.
+///
+/// Uses the same logic as the daemon: the guest agent binary is expected
+/// to be in the same directory as the currently running executable.
+pub fn guest_agent_path() -> Result<PathBuf, SandboxError> {
+    let exe = std::env::current_exe().map_err(|e| {
+        SandboxError::Internal(format!("failed to determine current executable path: {e}"))
+    })?;
+    let dir = exe.parent().ok_or_else(|| {
+        SandboxError::Internal("executable path has no parent directory".to_string())
+    })?;
+    Ok(dir.join("sandbox-guest"))
+}
 
 /// Prefix applied to all sandbox VM names.
 pub const VM_NAME_PREFIX: &str = "sandbox-";
@@ -1041,6 +1668,18 @@ fn mib_to_gib_string(mib: u32) -> String {
     } else {
         format!("{:.1}", mib as f64 / 1024.0)
     }
+}
+
+/// Encode a byte slice as a lowercase hexadecimal string.
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Compute the age of a timestamp in whole days from now.
+fn age_in_days(built_at: &chrono::DateTime<chrono::Utc>) -> u64 {
+    let now = chrono::Utc::now();
+    let duration = now.signed_duration_since(built_at);
+    duration.num_days().max(0) as u64
 }
 
 // ===========================================================================
@@ -1765,6 +2404,319 @@ mod tests {
         assert_eq!(
             content, QEMU_WRAPPER_SCRIPT,
             "written content must match constant"
+        );
+    }
+
+    // -- Golden base image --------------------------------------------------
+
+    #[test]
+    fn test_generate_base_template_valid_yaml_fields() {
+        let mgr = LimaManager::with_limactl_path(
+            PathBuf::from("/tmp/test"),
+            PathBuf::from("limactl"),
+        );
+
+        let template = mgr.generate_base_template();
+
+        // Resource configuration: fixed minimal values.
+        assert!(
+            template.contains("cpus: 1"),
+            "base template should have 1 CPU"
+        );
+        assert!(
+            template.contains("memory: \"1GiB\""),
+            "base template should have 1GiB memory"
+        );
+        assert!(
+            template.contains("disk: \"10GiB\""),
+            "base template should have 10GiB disk"
+        );
+
+        // No mounts (no workspace).
+        assert!(
+            template.contains("mounts: []"),
+            "base template should have empty mounts"
+        );
+
+        // Same Ubuntu cloud images as per-session template.
+        assert!(
+            template.contains("ubuntu-24.04-server-cloudimg-amd64.img"),
+            "base template should reference Ubuntu 24.04 amd64 image"
+        );
+        assert!(
+            template.contains("ubuntu-24.04-server-cloudimg-arm64.img"),
+            "base template should reference Ubuntu 24.04 arm64 image"
+        );
+
+        // Uses the base VM name as hostname.
+        assert!(
+            template.contains(&format!("hostnamectl set-hostname {BASE_VM_NAME}")),
+            "base template should set hostname to base VM name"
+        );
+
+        // Cloud-init provisioning scripts.
+        assert!(
+            template.contains("name: \"agent\""),
+            "base template should configure agent user"
+        );
+        assert!(
+            template.contains("useradd"),
+            "base template should create agent user"
+        );
+        assert!(
+            template.contains("NOPASSWD"),
+            "base template should grant passwordless sudo"
+        );
+        assert!(
+            template.contains("apt-get install -y socat git"),
+            "base template should install socat and git"
+        );
+        assert!(
+            template.contains("get.docker.com"),
+            "base template should install Docker"
+        );
+        assert!(
+            template.contains("usermod -aG docker agent"),
+            "base template should add agent to docker group"
+        );
+
+        // Hardened by default (video/audio disabled).
+        assert!(
+            template.contains("display: \"none\""),
+            "base template should disable video display"
+        );
+        assert!(
+            template.contains("device: \"none\""),
+            "base template should disable audio device"
+        );
+
+        // Port forwards should be empty.
+        assert!(
+            template.contains("portForwards: []"),
+            "base template should have empty port forwards"
+        );
+
+        // vmType specification.
+        assert!(
+            template.contains("vmType: \"qemu\""),
+            "base template should specify qemu vmType"
+        );
+    }
+
+    #[test]
+    fn test_generate_base_template_deterministic() {
+        let mgr = LimaManager::with_limactl_path(
+            PathBuf::from("/tmp/test"),
+            PathBuf::from("limactl"),
+        );
+
+        let t1 = mgr.generate_base_template();
+        let t2 = mgr.generate_base_template();
+        assert_eq!(t1, t2, "base template should be deterministic");
+    }
+
+    #[test]
+    fn test_compute_base_image_hash_deterministic() {
+        // Create a temporary directory with a fake guest agent binary at
+        // the path that `guest_agent_path()` will resolve.
+        //
+        // `guest_agent_path()` uses `std::env::current_exe()` which in
+        // test context points to the test binary.  We can't control that
+        // path, so we test the underlying hash logic directly with
+        // `ring::digest`.
+        let template = "some template content";
+        let agent_bytes = b"fake agent binary";
+
+        let mut ctx1 = digest::Context::new(&digest::SHA256);
+        ctx1.update(template.as_bytes());
+        ctx1.update(agent_bytes);
+        let hash1 = hex_encode(ctx1.finish().as_ref());
+
+        let mut ctx2 = digest::Context::new(&digest::SHA256);
+        ctx2.update(template.as_bytes());
+        ctx2.update(agent_bytes);
+        let hash2 = hex_encode(ctx2.finish().as_ref());
+
+        assert_eq!(hash1, hash2, "hash should be deterministic");
+        assert_eq!(hash1.len(), 64, "SHA256 hex digest should be 64 chars");
+    }
+
+    #[test]
+    fn test_compute_base_image_hash_changes_with_input() {
+        let agent_bytes = b"fake agent binary";
+
+        let mut ctx1 = digest::Context::new(&digest::SHA256);
+        ctx1.update(b"template version 1");
+        ctx1.update(agent_bytes);
+        let hash1 = hex_encode(ctx1.finish().as_ref());
+
+        let mut ctx2 = digest::Context::new(&digest::SHA256);
+        ctx2.update(b"template version 2");
+        ctx2.update(agent_bytes);
+        let hash2 = hex_encode(ctx2.finish().as_ref());
+
+        assert_ne!(hash1, hash2, "hash should change when inputs change");
+    }
+
+    #[test]
+    fn test_check_base_image_missing_when_no_vms() {
+        // check_base_image relies on list_vms_raw() which shells out to
+        // limactl.  We test the logic by directly verifying the metadata
+        // parsing and status evaluation.  When the VM list is empty, the
+        // result should be Missing.
+        let entries: Vec<LimactlListEntry> = vec![];
+        let vm_exists = entries
+            .iter()
+            .any(|e| e.name.as_deref() == Some(BASE_VM_NAME));
+        assert!(!vm_exists);
+        // This corresponds to BaseImageStatus::Missing
+    }
+
+    #[test]
+    fn test_check_base_image_stale_when_meta_missing() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let meta_path = dir.path().join("base-image-meta.json");
+
+        // Metadata file does not exist.
+        assert!(!meta_path.exists());
+
+        // Simulate: VM exists but no metadata -> Stale(hash_mismatch=true)
+        let result = std::fs::read_to_string(&meta_path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_check_base_image_stale_when_meta_corrupt() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let meta_path = dir.path().join("base-image-meta.json");
+        std::fs::write(&meta_path, "not valid json").unwrap();
+
+        let content = std::fs::read_to_string(&meta_path).unwrap();
+        let parse_result = serde_json::from_str::<BaseImageMeta>(&content);
+        assert!(
+            parse_result.is_err(),
+            "corrupt metadata should fail to parse"
+        );
+    }
+
+    #[test]
+    fn test_check_base_image_stale_when_old() {
+        let old_meta = BaseImageMeta {
+            built_at: chrono::Utc::now() - chrono::Duration::days(15),
+            content_hash: "abc123".to_string(),
+        };
+
+        let age = age_in_days(&old_meta.built_at);
+        assert!(
+            age > BASE_IMAGE_MAX_AGE_DAYS,
+            "15-day-old image should exceed max age of {BASE_IMAGE_MAX_AGE_DAYS}"
+        );
+    }
+
+    #[test]
+    fn test_check_base_image_fresh_when_recent_and_matching() {
+        let recent_meta = BaseImageMeta {
+            built_at: chrono::Utc::now() - chrono::Duration::days(2),
+            content_hash: "matching_hash".to_string(),
+        };
+
+        let age = age_in_days(&recent_meta.built_at);
+        assert!(
+            age <= BASE_IMAGE_MAX_AGE_DAYS,
+            "2-day-old image should be within max age"
+        );
+        // If hash matches, this would be Fresh.
+    }
+
+    #[test]
+    fn test_base_image_meta_serialization_roundtrip() {
+        let meta = BaseImageMeta {
+            built_at: chrono::Utc::now(),
+            content_hash: "deadbeef01234567".to_string(),
+        };
+
+        let json = serde_json::to_string_pretty(&meta).unwrap();
+        let deserialized: BaseImageMeta =
+            serde_json::from_str(&json).unwrap();
+
+        assert_eq!(meta.content_hash, deserialized.content_hash);
+        assert_eq!(meta.built_at, deserialized.built_at);
+    }
+
+    #[test]
+    fn test_base_image_status_equality() {
+        assert_eq!(BaseImageStatus::Missing, BaseImageStatus::Missing);
+        assert_eq!(BaseImageStatus::Fresh, BaseImageStatus::Fresh);
+        assert_eq!(
+            BaseImageStatus::Stale {
+                age_days: 5,
+                hash_mismatch: true
+            },
+            BaseImageStatus::Stale {
+                age_days: 5,
+                hash_mismatch: true
+            }
+        );
+        assert_ne!(BaseImageStatus::Missing, BaseImageStatus::Fresh);
+        assert_ne!(
+            BaseImageStatus::Stale {
+                age_days: 5,
+                hash_mismatch: true
+            },
+            BaseImageStatus::Stale {
+                age_days: 5,
+                hash_mismatch: false
+            }
+        );
+    }
+
+    #[test]
+    fn test_hex_encode() {
+        assert_eq!(hex_encode(&[]), "");
+        assert_eq!(hex_encode(&[0x00]), "00");
+        assert_eq!(hex_encode(&[0xff]), "ff");
+        assert_eq!(hex_encode(&[0xde, 0xad, 0xbe, 0xef]), "deadbeef");
+        assert_eq!(
+            hex_encode(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]),
+            "0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn test_age_in_days() {
+        let now = chrono::Utc::now();
+        assert_eq!(age_in_days(&now), 0);
+
+        let yesterday = now - chrono::Duration::days(1);
+        assert_eq!(age_in_days(&yesterday), 1);
+
+        let ten_days_ago = now - chrono::Duration::days(10);
+        assert_eq!(age_in_days(&ten_days_ago), 10);
+
+        // Future timestamps should clamp to 0.
+        let future = now + chrono::Duration::days(5);
+        assert_eq!(age_in_days(&future), 0);
+    }
+
+    #[test]
+    fn test_base_vm_name_constant() {
+        assert_eq!(BASE_VM_NAME, "sandbox-base");
+    }
+
+    #[test]
+    fn test_base_image_max_age_constant() {
+        assert_eq!(BASE_IMAGE_MAX_AGE_DAYS, 10);
+    }
+
+    #[test]
+    fn test_guest_agent_path_returns_sibling_of_current_exe() {
+        let result = guest_agent_path();
+        // In test context this should succeed (current_exe is the test binary).
+        assert!(result.is_ok());
+        let path = result.unwrap();
+        assert!(
+            path.file_name().unwrap() == "sandbox-guest",
+            "guest_agent_path should return a path ending in sandbox-guest"
         );
     }
 

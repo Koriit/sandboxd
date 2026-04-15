@@ -31,7 +31,7 @@ pub use guest::{
     GuestConnector, GuestRequest, GuestResponse, GUEST_AGENT_PORT, MAX_MESSAGE_SIZE,
     read_message, write_message,
 };
-pub use lima::{LimaManager, VmInfo, VmStatus};
+pub use lima::{BaseImageMeta, BaseImageStatus, LimaManager, VmInfo, VmStatus, guest_agent_path};
 pub use network::{NetworkInfo, NetworkManager};
 pub use process::run_with_timeout;
 pub use policy::{
