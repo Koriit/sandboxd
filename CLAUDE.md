@@ -12,11 +12,12 @@ Sandbox daemon providing isolated Linux VMs (Lima/QEMU) for coding agents.
 ## Build and test
 
 ```bash
-make build            # cargo build --workspace
-make test             # cargo test --workspace --quiet (unit tests, ~5s)
-make test-integration # integration tests (requires Docker + Lima)
-make test-e2e         # full E2E suite (boots real VMs, ~30-45 min)
-make gateway-image    # docker build for gateway container
+make build                  # cargo build --workspace
+make test                   # cargo nextest run --workspace (unit tests, ~5s)
+make test-integration       # integration tests (requires Docker + Lima)
+make test-e2e               # full E2E suite (boots real VMs, ~30-45 min)
+make test-e2e PARALLEL=4    # E2E suite with 4 parallel workers (pytest-xdist)
+make gateway-image          # docker build for gateway container
 ```
 
 ## E2E tests
@@ -42,11 +43,11 @@ Working directory for cargo commands: `sandboxd/`
 
 ```bash
 cd sandboxd && cargo build --workspace
-cd sandboxd && cargo test --workspace
+cd sandboxd && cargo nextest run --workspace
 cd sandboxd && cargo clippy --workspace
 ```
 
-Unit test count: ~413 tests across 4 crates.
+Unit test count: ~413 tests across 4 crates. Test runner: cargo-nextest (config at `sandboxd/.config/nextest.toml`).
 
 ## Key conventions
 

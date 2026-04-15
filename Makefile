@@ -4,10 +4,10 @@ build:
 	cd sandboxd && cargo build --workspace
 
 test:
-	cd sandboxd && cargo test --workspace --quiet
+	cd sandboxd && cargo nextest run --workspace
 
 test-integration: test
-	cd sandboxd && cargo test --package sandbox-core --test '*'
+	cd sandboxd && cargo nextest run --package sandbox-core --test '*'
 
 tests/e2e/.venv/.installed: tests/e2e/pyproject.toml
 	python3 -m venv tests/e2e/.venv
@@ -18,8 +18,9 @@ tests/e2e/.venv/.installed: tests/e2e/pyproject.toml
 	touch tests/e2e/.venv/.installed
 
 TEST ?=
+PARALLEL ?= 1
 test-e2e: tests/e2e/.venv/.installed
-	cd tests/e2e && . .venv/bin/activate && python -m pytest -v -rs $(TEST)
+	cd tests/e2e && . .venv/bin/activate && python -m pytest -v -rs -n $(PARALLEL) $(TEST)
 
 gateway-image:
 	docker build -t sandbox-gateway -f networking/gateway/Dockerfile networking/

@@ -345,19 +345,23 @@ def sandbox_binaries() -> SandboxBinaries:
     return SandboxBinaries(sandboxd=SANDBOXD_BIN, sandbox=SANDBOX_BIN)
 
 
-@pytest.fixture
-def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path: Path):
+@pytest.fixture(scope="session")
+def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path_factory: pytest.TempPathFactory):
     """Start a sandboxd instance with a temporary socket and base-dir.
+
+    Session-scoped: all tests in one pytest worker share the same daemon.
+    With pytest-xdist (-n N), each worker gets its own daemon instance.
 
     Yields a dict with:
       - socket: path to the Unix socket
       - base_dir: path to the temporary base directory
       - process: the Popen object for the daemon
 
-    Shuts down the daemon (SIGTERM) and cleans up on teardown, even if the
-    test fails.  Also force-deletes any Lima VMs that were created during the
-    test (identified by the daemon's session database).
+    Shuts down the daemon (SIGTERM) and cleans up on teardown.  Also
+    force-deletes any Lima VMs / Docker containers that leaked during the
+    session as a safety net (individual tests clean up via try/finally).
     """
+    tmp_path = tmp_path_factory.mktemp("sandboxd")
     socket_path = tmp_path / "sandboxd.sock"
     base_dir = tmp_path / "state"
     base_dir.mkdir(parents=True, exist_ok=True)
