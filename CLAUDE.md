@@ -47,7 +47,7 @@ cd sandboxd && cargo nextest run --workspace
 cd sandboxd && cargo clippy --workspace
 ```
 
-Unit test count: ~444 tests across 4 crates. Test runner: cargo-nextest (config at `sandboxd/.config/nextest.toml`).
+Unit test count: ~450 tests across 4 crates. Test runner: cargo-nextest (config at `sandboxd/.config/nextest.toml`).
 
 ## Key conventions
 
