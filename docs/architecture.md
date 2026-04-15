@@ -201,6 +201,8 @@ sandbox prints stdout, exits with code 0
 | POST | `/sessions/{id}/policy` | `update_policy` | Update network policy |
 | GET | `/sessions/{id}/health` | `session_health` | Per-session health |
 | GET | `/health` | `health_check` | Global health |
+| POST | `/rebuild-image` | `rebuild_image` | Rebuild the pre-baked base VM image |
+| GET | `/base-image-status` | `base_image_status` | Check base image build status |
 
 The `{id}` parameter accepts either a session UUID or a session name.
 

@@ -4,7 +4,7 @@ claude-sandbox provides isolated, policy-controlled sandbox environments for cod
 
 ## Key features
 
-- **Isolated VMs** -- each session runs in its own QEMU/KVM virtual machine with configurable CPU, memory, and disk resources. QEMU hardening (device lockdown, seccomp) is enabled by default.
+- **Isolated VMs** -- each session runs in its own QEMU/KVM virtual machine with configurable CPU, memory, and disk resources. QEMU hardening (device lockdown, cgroup limits) is enabled by default.
 - **Per-session networking** -- every session gets a dedicated Docker bridge network with a gateway container running the proxy pipeline (Envoy, mitmproxy, CoreDNS).
 - **Policy engine** -- deny-by-default network policies control which destinations a session can reach and at what level of inspection (transport, TLS-verified, or full HTTP inspection).
 - **TLS interception** -- per-session CA certificates enable transparent HTTPS inspection through mitmproxy. The CA is automatically injected into the VM's trust store.
@@ -132,7 +132,7 @@ sandbox rm my-sandbox
 
 ```bash
 make build         # cargo build --workspace
-make test          # cargo test --workspace
+make test          # cargo nextest run --workspace
 make test-e2e      # E2E test suite (pytest)
 make gateway-image # build the gateway container image
 make clean         # cargo clean

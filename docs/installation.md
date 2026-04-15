@@ -212,7 +212,7 @@ echo "allow all" | sudo tee /etc/qemu/bridge.conf
 ### Run tests
 
 ```bash
-make test          # Unit and integration tests (cargo test)
+make test          # Unit and integration tests (cargo nextest run)
 make test-e2e      # End-to-end tests (pytest, requires running daemon)
 ```
 

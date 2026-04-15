@@ -93,7 +93,7 @@ API equivalent:
 - The host directory is mounted at `/home/agent/workspace` inside the
   VM, writable by the guest.
 - The mount uses Lima's `9p` mount type, which is built into QEMU and
-  compatible with the seccomp sandbox in hardened mode.
+  compatible with device lockdown in hardened mode.
 - Changes made by the guest are **immediately visible** on the host, and
   vice versa.  There is no synchronization delay.
 - `--workspace` is **mutually exclusive** with `--repo`.  Use one or the

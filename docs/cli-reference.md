@@ -7,8 +7,9 @@ Complete reference for the `sandbox` command-line tool. The CLI communicates wit
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--socket <path>` | `$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock` | Path to the sandboxd Unix socket (falls back to `~/.local/share/sandboxd/sandboxd.sock`) |
+| `--quiet`, `-q` | | Suppress interactive prompts (use defaults silently) |
 
-All commands accept the `--socket` option to connect to a non-default daemon instance:
+All commands accept the `--socket` and `--quiet` options:
 
 ```bash
 sandbox --socket /tmp/custom.sock ps
@@ -39,13 +40,14 @@ sandbox create [OPTIONS]
 | `--boot-cmd <cmd>` | | Command to execute after provisioning |
 | `--policy <path>` | | Path to a policy JSON file to apply after creation |
 | `--template <path>` | | Path to a custom Lima YAML template |
-| `--no-hardening` | | Disable QEMU hardening (device lockdown, seccomp) |
+| `--no-hardening` | | Disable QEMU hardening (device lockdown, cgroup limits) |
+| `--no-cache` | | Skip the pre-baked base image and use the full create path |
 
 **Notes:**
 - `--repo` and `--workspace` are mutually exclusive.
 - `--workspace` must use the `shared:<absolute-path>` format. The path must exist.
 - `--boot-cmd` runs as `bash -c "<cmd>"` via the guest agent after all other provisioning.
-- `--no-hardening` disables QEMU device lockdown and seccomp sandboxing. Use for debugging only.
+- `--no-hardening` disables QEMU device lockdown and cgroup resource limits. Use for debugging only.
 
 ### Examples
 
@@ -486,4 +488,22 @@ git remote add sandbox \
 # Remote with custom socket
 git remote add sandbox \
     "ext::sandbox --socket /tmp/sandbox.sock git-remote %S my-session"
+```
+
+---
+
+## sandbox rebuild-image
+
+Rebuild the pre-baked base VM image. The base image is a fully provisioned Lima VM snapshot that accelerates `sandbox create` by skipping the cloud-init provisioning steps. Use this command after updating provisioning scripts or when the base image is stale.
+
+### Synopsis
+
+```
+sandbox rebuild-image
+```
+
+### Examples
+
+```bash
+sandbox rebuild-image
 ```

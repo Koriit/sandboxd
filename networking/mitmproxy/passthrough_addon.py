@@ -1,9 +1,8 @@
 """
-mitmproxy pass-through addon — M3 (no policy enforcement).
+mitmproxy transport-level passthrough addon for assurance levels 0-1.
 
 Logs all HTTP requests without modifying or blocking anything.
-In M4, this will be replaced with a policy-enforcement addon that
-checks each request against the session's network policy.
+Used for sessions with no policy enforcement or transport-level-only policies.
 """
 
 from mitmproxy import http
