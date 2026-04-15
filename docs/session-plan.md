@@ -19,7 +19,7 @@
 - [M7: Documentation](#m7-documentation) — polish and consolidate user, operator, and contributor docs
 - [M8: Polish and Deferred TODOs](#m8-polish-and-deferred-todos) — resolve accumulated TODOs, deferred findings, technical debt
 - [M8.5: E2E Fix-up](#m85-e2e-fix-up--portability-and-runtime-correctness) — fix all runtime issues preventing E2E tests from passing
-- [M9: User Polish and Refactors](#m9-user-polish-and-refactors) — XDG paths, root-level README and CLAUDE.md
+- [M9: User Polish and Refactors](#m9-user-polish-and-refactors) — XDG paths, docs, timeouts, test runners, pre-baked images
 - [Risks](#risks)
 - [Completed session count](#completed-session-count)
 - [Future Milestones](#future-milestones)
@@ -946,6 +946,44 @@ Tests require a Linux host with KVM and Docker.
 
 ---
 
+### M9-S5: Pre-baked golden image infrastructure
+
+**Entry criteria:** M9-S4 complete.
+
+**Tasks:**
+- Add golden image management to `LimaManager`:
+  - `build_base_image()`: create a Lima VM from stock cloud image, run cloud-init, install guest agent, stop VM. The resulting stopped VM (`sandbox-base`) is the golden image.
+  - `check_base_image()`: returns status (missing, fresh, stale). Stale = age > 10 days OR content hash mismatch.
+  - Content hash: hash of Lima template + guest agent binary + cloud-init/init scripts. Store in metadata file alongside the golden VM.
+  - `rebuild_base_image()`: delete old golden VM, build fresh one.
+- Add `limactl clone` support to `LimaManager`:
+  - `clone_vm(source, target)`: wraps `limactl clone --name=<target> <source>`
+- Daemon startup: if golden image is missing, build it (blocking, with tracing logs for progress).
+- Fallback: if golden image doesn't exist and can't be built, fall back to current full-create path.
+
+**Exit criteria:** Golden image builds on daemon startup. Content hash detects staleness. `limactl clone` works. Fallback path preserved.
+
+---
+
+### M9-S6: Fast session create and CLI UX
+
+**Entry criteria:** M9-S5 complete.
+
+**Tasks:**
+- Modify session create flow:
+  - If golden image exists and fresh: `limactl clone sandbox-base → sandbox-{uuid}`, then `limactl start`, skip guest agent install.
+  - If golden image missing: build it first (blocking), then clone.
+  - If golden image stale: prompt user interactively ("Pre-baked image is N days old. Rebuild first? [y/N]"). If declined or `--quiet`, use the stale image. If no image at all, must build even with `--quiet`.
+- Add `--quiet` / `-q` flag to CLI: suppress interactive prompts, use stale images without asking. Intended for scripted usage.
+- Add `--no-cache` flag to `sandbox create`: skip the golden image entirely, use the current full-create path (boot from stock image, run cloud-init, install guest agent). For debugging or when the pre-baked image is suspected broken.
+- Add `sandbox rebuild-image` CLI command: explicit manual rebuild of the golden image.
+- Progress feedback: during image build, stream status to CLI (e.g. "Building base image... booting VM... installing guest agent... done (92s)").
+- Update E2E tests: tests need to work with clone-based creation. The session-scoped daemon should build the golden image once, then all tests benefit from fast clones.
+
+**Exit criteria:** `sandbox create` uses clone path (~10s instead of ~90s). Stale image prompts user. `--quiet` suppresses prompts. `sandbox rebuild-image` works. E2E tests pass with clone-based creation.
+
+---
+
 ## Risks
 
 | Risk | Impact | Mitigation |
@@ -972,8 +1010,8 @@ Tests require a Linux host with KVM and Docker.
 | M7 | 1 |
 | M8 | 3 |
 | M8.5 | 4 |
-| M9 | 4 |
-| **Total** | **38** |
+| M9 | 6 |
+| **Total** | **40** |
 
 ---
 
