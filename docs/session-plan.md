@@ -19,9 +19,11 @@
 - [M7: Documentation](#m7-documentation) — polish and consolidate user, operator, and contributor docs
 - [M8: Polish and Deferred TODOs](#m8-polish-and-deferred-todos) — resolve accumulated TODOs, deferred findings, technical debt
 - [M8.5: E2E Fix-up](#m85-e2e-fix-up--portability-and-runtime-correctness) — fix all runtime issues preventing E2E tests from passing
-- [M9: macOS Support](#m9-macos-support) — socket_vmnet, Colima, macvlan
+- [M9: User Polish and Refactors](#m9-user-polish-and-refactors) — XDG paths, root-level README and CLAUDE.md
 - [Risks](#risks)
-- [Session count](#session-count)
+- [Completed session count](#completed-session-count)
+- [Future Milestones](#future-milestones)
+  - [F1: macOS Support](#f1-macos-support) — socket_vmnet, Colima, macvlan
 
 ## Repo structure
 
@@ -48,7 +50,7 @@ claude-sandbox/
 
 Sessions are linearized for single-agent tracking. Some sessions could theoretically run in parallel based on their entry criteria, but we execute one at a time in session-number order. Each session is implemented by a subagent delegated from the main orchestrating agent.
 
-M9 (macOS) is an independent track that can be interleaved or appended when macOS hardware is available.
+Future milestones (F-series) are documented at the end of this plan but are not on the critical path.
 
 ### Branch model
 
@@ -67,7 +69,7 @@ The orchestrator follows a two-phase protocol: during a session, it appends entr
 
 Format reference: `.claude/skills/session-tracking/progress-schema.json`
 
-Initialize with `progress init --total-sessions 30` (the Linux critical path: M0 through M8). M9 (macOS) is a separate track — add it via `replan` when macOS work begins.
+Initialize with `progress init --total-sessions 30` (the Linux critical path: M0 through M8). Future milestones (F-series) are a separate track — add via `replan` when ready.
 
 ### Context recovery
 
@@ -864,11 +866,89 @@ Tests require a Linux host with KVM and Docker.
 
 ---
 
-## M9: macOS Support
+## M9: User Polish and Refactors
 
-> **Separate track.** macOS support requires access to macOS hardware and can be executed independently of M6 (Hardening). It is not on the critical path for Linux-only deployments.
+### M9-S1: XDG Base Directory Specification
 
-### M9-S1: socket_vmnet and Colima integration
+**Entry criteria:** M8.5 complete.
+
+**Tasks:**
+- Replace hardcoded `~/.sandboxd/` with XDG-compliant paths:
+  - `$XDG_DATA_HOME/sandboxd/` (default `~/.local/share/sandboxd/`) — session database, Lima VM data, CA certificates
+  - `$XDG_CONFIG_HOME/sandboxd/` (default `~/.config/sandboxd/`) — configuration files
+  - `$XDG_RUNTIME_DIR/sandboxd/` (default `/run/user/$UID/sandboxd/`) — Unix socket, PID file, transient runtime state
+- Update `default_socket_path()` and `default_base_dir()` in `sandboxd/src/main.rs`
+- Update CLI `--socket` default and any path references in sandbox-cli
+- Update Lima template paths if they reference the base directory
+- Update docs to reflect new default paths
+- Ensure backwards compatibility: if `~/.sandboxd/` exists and XDG dirs don't, log a migration hint
+- Update E2E test helpers if they reference `~/.sandboxd/`
+- Update unit tests for path defaults
+
+**Exit criteria:** All paths follow XDG spec. Socket in `$XDG_RUNTIME_DIR`, data in `$XDG_DATA_HOME`, config in `$XDG_CONFIG_HOME`. All tests pass. Old `~/.sandboxd/` no longer created on fresh installs.
+
+---
+
+### M9-S2: Root-level documentation
+
+**Entry criteria:** M9-S1 complete.
+
+**Tasks:**
+- Create root-level `README.md`:
+  - Project description: what sandboxd is and what problem it solves
+  - Architecture overview: daemon, CLI, guest agent, gateway container
+  - Prerequisites: Lima, QEMU, Docker, KVM
+  - Quick start: build, run daemon, create a session
+  - Link to `docs/` for detailed documentation
+- Create root-level `CLAUDE.md`:
+  - Project structure overview (crate names and roles, not file-by-file)
+  - Build and test commands (`make build`, `make test`, `make test-e2e`, `make test-integration`)
+  - Key architectural conventions (async handlers, spawn_blocking for process commands, error response pattern)
+  - Pointer to `docs/session-plan.md` for implementation history
+  - Keep it stable — describe conventions and structure, not current implementation details that change with each commit
+
+**Exit criteria:** Both files exist at repo root. README gives a newcomer enough to build and try sandboxd. CLAUDE.md gives an AI coding agent enough context to navigate and contribute to the codebase without frequent updates.
+
+---
+
+## Risks
+
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| Lima vsock support is incomplete or buggy | Blocks M2 | Verify vsock works in a manual Lima VM before starting M2. Fall back to SSH-over-IP as temporary bridge if needed. |
+| Lima TAP-on-Docker-bridge networking doesn't work as expected | Blocks M3 | Test Lima network attachment to a Docker bridge manually before M3-S4. Lima's `networks` YAML stanza should support this. |
+| nftables injection into gateway container namespace is fragile | Blocks M3 | Prefer `nsenter --net` over `docker exec` for reliability. Test the injection approach in isolation before M3-S3. |
+| CoreDNS external plugin build process is complex | Delays M4-S3 | Follow the documented external plugin pattern exactly. Build in a Docker container for reproducibility. |
+| Envoy filter chain config for 4 assurance levels is complex | Delays M4-S1/M4-S2 | Start with level 0 (deny) and level 1 (TCP passthrough) in M4-S1. Add level 2 and 3 in M4-S2. |
+| socket_vmnet availability on macOS | Blocks F1 | socket_vmnet must be installed separately (Homebrew). Document as a prerequisite. Test early on a macOS machine. |
+| QEMU hardening flags conflict with Lima's defaults | Delays M6 | Lima may set its own QEMU flags. Check for conflicts. May need to use Lima's `qemu.args` override mechanism. |
+
+## Completed session count
+
+| Milestone | Sessions |
+|-----------|----------|
+| M0 | 1 |
+| M1 | 4 |
+| M2 | 3 |
+| M3 | 6 |
+| M4 | 6 |
+| M5 | 3 |
+| M6 | 3 |
+| M7 | 1 |
+| M8 | 3 |
+| M8.5 | 4 |
+| M9 | 2 |
+| **Total** | **36** |
+
+---
+
+## Future Milestones
+
+### F1: macOS Support (2 sessions)
+
+> **Separate track.** macOS support requires access to macOS hardware and can be executed independently. It is not on the critical path for Linux-only deployments.
+
+#### F1-S1: socket_vmnet and Colima integration
 
 **Entry criteria:** M5 complete.
 
@@ -897,9 +977,9 @@ Tests require a Linux host with KVM and Docker.
 
 ---
 
-### M9-S2: Colima failure recovery and cross-platform consolidation
+#### F1-S2: Colima failure recovery and cross-platform consolidation
 
-**Entry criteria:** M9-S1 complete.
+**Entry criteria:** F1-S1 complete.
 
 **Tasks:**
 - Implement Colima crash detection and recovery:
@@ -913,36 +993,3 @@ Tests require a Linux host with KVM and Docker.
 - Verify all E2E tests pass on both Linux and macOS
 
 **Exit criteria:** Colima crash recovery works. All E2E tests pass on both platforms.
-
----
-
-## Risks
-
-| Risk | Impact | Mitigation |
-|------|--------|------------|
-| Lima vsock support is incomplete or buggy | Blocks M2 | Verify vsock works in a manual Lima VM before starting M2. Fall back to SSH-over-IP as temporary bridge if needed. |
-| Lima TAP-on-Docker-bridge networking doesn't work as expected | Blocks M3 | Test Lima network attachment to a Docker bridge manually before M3-S4. Lima's `networks` YAML stanza should support this. |
-| nftables injection into gateway container namespace is fragile | Blocks M3 | Prefer `nsenter --net` over `docker exec` for reliability. Test the injection approach in isolation before M3-S3. |
-| CoreDNS external plugin build process is complex | Delays M4-S3 | Follow the documented external plugin pattern exactly. Build in a Docker container for reproducibility. |
-| Envoy filter chain config for 4 assurance levels is complex | Delays M4-S1/M4-S2 | Start with level 0 (deny) and level 1 (TCP passthrough) in M4-S1. Add level 2 and 3 in M4-S2. |
-| socket_vmnet availability on macOS | Blocks M9 | socket_vmnet must be installed separately (Homebrew). Document as a prerequisite. Test early on a macOS machine. |
-| QEMU hardening flags conflict with Lima's defaults | Delays M6 | Lima may set its own QEMU flags. Check for conflicts. May need to use Lima's `qemu.args` override mechanism. |
-
-## Session count
-
-| Milestone | Sessions |
-|-----------|----------|
-| M0 | 1 |
-| M1 | 4 |
-| M2 | 3 |
-| M3 | 6 |
-| M4 | 6 |
-| M5 | 3 |
-| M6 | 3 |
-| M7 | 1 |
-| M8 | 3 |
-| M8.5 | 4 |
-| M9 | 2 |
-| **Total** | **35** |
-
-Linux critical path: 34 sessions (M0 through M8.5). M9 (macOS) is an independent track (2 sessions) that can be interleaved or appended when macOS hardware is available.
