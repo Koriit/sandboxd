@@ -984,6 +984,27 @@ Tests require a Linux host with KVM and Docker.
 
 ---
 
+### M9-S7: Review 3 — comprehensive quality audit
+
+**Entry criteria:** M9-S6 complete.
+
+**Tasks:**
+Six review tracks, each producing findings that are fixed in-session:
+
+1. **Plan vs. implementation audit** — compare each milestone's promised exit criteria and deliverables against the actual codebase. Identify gaps, deviations, and anything that was planned but not delivered (or delivered differently than specified).
+2. **Code quality review** — correctness, clarity, consistency, error handling, security, idiomatic Rust patterns. Focus on production-readiness.
+3. **Unit test quality review** — set up code coverage (cargo-llvm-cov or tarpaulin), identify untested code paths. Check for tautological tests (assertions that can never fail, mocking away the thing under test). Verify edge cases and error paths are covered.
+4. **E2E test quality review** — verify tests assert real observable behavior, not implementation details. Check coverage of user-facing scenarios. Identify missing test cases. Fix any currently-failing E2E tests.
+5. **Documentation quality review** — README, CLAUDE.md, inline doc comments, design docs. Check accuracy, completeness, and consistency with current code.
+6. **Workarounds and deprecated patterns** — find temporary hacks, TODO/FIXME/HACK comments, deprecated API usage, and patterns that should be replaced with proper solutions.
+
+**Exit criteria:**
+1. All review findings fixed (or explicitly deferred with justification).
+2. Report comparing final implementation against original plan promises.
+3. All unit tests pass. All E2E tests pass.
+
+---
+
 ## Risks
 
 | Risk | Impact | Mitigation |
@@ -1010,8 +1031,8 @@ Tests require a Linux host with KVM and Docker.
 | M7 | 1 |
 | M8 | 3 |
 | M8.5 | 4 |
-| M9 | 6 |
-| **Total** | **40** |
+| M9 | 7 |
+| **Total** | **41** |
 
 ---
 
