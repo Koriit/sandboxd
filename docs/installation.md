@@ -226,7 +226,7 @@ make test-e2e      # End-to-end tests (pytest, requires running daemon)
 sandboxd/target/debug/sandboxd
 ```
 
-The daemon creates its state directory at `~/.sandboxd/` (SQLite database, session data, CA certificates) and listens on `~/.sandboxd/sandboxd.sock`. No root or sudo is needed -- the daemon runs as your regular user.
+The daemon creates its state directory at `~/.local/share/sandboxd/` (SQLite database, session data, CA certificates) and listens on `$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock` (typically `/run/user/$UID/sandboxd/sandboxd.sock`). Set `$XDG_DATA_HOME` or `$XDG_RUNTIME_DIR` to customize, or use `--base-dir` and `--socket` flags. No root or sudo is needed -- the daemon runs as your regular user.
 
 To customize paths:
 
@@ -276,7 +276,7 @@ sandbox rm hello
 The CLI cannot reach the daemon socket. Check that:
 
 1. The daemon is running (`ps aux | grep sandboxd`).
-2. The socket path matches. The default is `~/.sandboxd/sandboxd.sock`. If you started the daemon with a custom `--socket`, pass the same path to the CLI: `sandbox --socket /path/to/sock ps`.
+2. The socket path matches. The default is `$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock` (falls back to `~/.local/share/sandboxd/sandboxd.sock` if `$XDG_RUNTIME_DIR` is not set). If you started the daemon with a custom `--socket`, pass the same path to the CLI: `sandbox --socket /path/to/sock ps`.
 
 ### "Permission denied" on `/dev/kvm`
 

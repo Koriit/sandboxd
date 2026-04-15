@@ -299,7 +299,7 @@ Each running session in the output includes agent and gateway status columns.
 <summary>Direct API alternative</summary>
 
 ```bash
-curl -s --unix-socket ~/.sandboxd/sandboxd.sock http://localhost/sessions | jq .
+curl -s --unix-socket $XDG_RUNTIME_DIR/sandboxd/sandboxd.sock http://localhost/sessions | jq .
 ```
 
 </details>
@@ -330,7 +330,7 @@ Network:
 <summary>Direct API alternative</summary>
 
 ```bash
-curl -s --unix-socket ~/.sandboxd/sandboxd.sock \
+curl -s --unix-socket $XDG_RUNTIME_DIR/sandboxd/sandboxd.sock \
   http://localhost/sessions/{id}/health | jq .
 ```
 
@@ -405,7 +405,7 @@ docker network inspect sandbox-net-{session_id}
    <summary>Direct API alternative</summary>
 
    ```bash
-   curl -s --unix-socket ~/.sandboxd/sandboxd.sock \
+   curl -s --unix-socket $XDG_RUNTIME_DIR/sandboxd/sandboxd.sock \
      http://localhost/sessions/{id}/health | jq .gateway
    ```
 

@@ -18,7 +18,7 @@ All layers are enabled when `SessionConfig.hardened` is `true`, which is the def
 
 ## QEMU hardening
 
-The sandbox runs QEMU through a wrapper script (`~/.sandboxd/libexec/qemu-system-x86_64`) that injects security flags and resource limits. Lima invokes this wrapper via the `QEMU_SYSTEM_X86_64` environment variable.
+The sandbox runs QEMU through a wrapper script (`~/.local/share/sandboxd/libexec/qemu-system-x86_64`) that injects security flags and resource limits. Lima invokes this wrapper via the `QEMU_SYSTEM_X86_64` environment variable. The path follows `$XDG_DATA_HOME/sandboxd/libexec/` when `$XDG_DATA_HOME` is set.
 
 ### Seccomp filter (not used)
 
@@ -190,7 +190,7 @@ At session creation, sandboxd generates an ECDSA P-256 CA keypair. The CA uses S
 CA files are stored in the session directory:
 
 ```
-~/.sandboxd/sessions/{session_id}/ca/
+~/.local/share/sandboxd/sessions/{session_id}/ca/
     cert.pem                  # CA certificate (public)
     key.pem                   # CA private key (PKCS#8 PEM)
     mitmproxy-ca.pem          # key + cert concatenated (mitmproxy format)

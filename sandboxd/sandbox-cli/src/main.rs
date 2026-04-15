@@ -179,8 +179,11 @@ enum LogComponent {
 }
 
 fn default_socket_path() -> String {
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        return format!("{runtime_dir}/sandboxd/sandboxd.sock");
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    format!("{home}/.sandboxd/sandboxd.sock")
+    format!("{home}/.local/share/sandboxd/sandboxd.sock")
 }
 
 /// Build the HTTP request for the given CLI command.

@@ -6,7 +6,7 @@ Complete reference for the `sandbox` command-line tool. The CLI communicates wit
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--socket <path>` | `~/.sandboxd/sandboxd.sock` | Path to the sandboxd Unix socket |
+| `--socket <path>` | `$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock` | Path to the sandboxd Unix socket (falls back to `~/.local/share/sandboxd/sandboxd.sock`) |
 
 All commands accept the `--socket` option to connect to a non-default daemon instance:
 
@@ -454,7 +454,7 @@ Add a sandbox VM as a git remote using the `ext::` transport:
 
 ```bash
 git remote add sandbox \
-    "ext::sandbox --socket ~/.sandboxd/sandboxd.sock git-remote %S my-session"
+    "ext::sandbox git-remote %S my-session"
 ```
 
 Then use standard git operations:

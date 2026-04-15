@@ -62,7 +62,7 @@ make gateway-image
 sandboxd/target/debug/sandboxd
 ```
 
-The daemon listens on `~/.sandboxd/sandboxd.sock` and stores state in `~/.sandboxd/`.
+The daemon listens on `$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock` (default: `/run/user/$UID/sandboxd/sandboxd.sock`) and stores state in `$XDG_DATA_HOME/sandboxd/` (default: `~/.local/share/sandboxd/`). Override with `--socket` and `--base-dir`.
 
 ### 3. Create a session
 

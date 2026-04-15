@@ -174,8 +174,8 @@ pub struct LimaManager {
 impl LimaManager {
     /// Create a new manager rooted at the given base directory.
     ///
-    /// `base_dir` is typically `~/.sandboxd/` — the same directory used by
-    /// [`crate::SessionStore`].
+    /// `base_dir` is typically `~/.local/share/sandboxd/` (`$XDG_DATA_HOME/sandboxd`)
+    /// — the same directory used by [`crate::SessionStore`].
     ///
     /// Resolves the `limactl` binary from `PATH` at construction time so
     /// that a missing installation is detected early with a clear error.

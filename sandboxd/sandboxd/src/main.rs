@@ -45,13 +45,19 @@ struct Args {
 
 
 fn default_socket_path() -> String {
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        return format!("{runtime_dir}/sandboxd/sandboxd.sock");
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    format!("{home}/.sandboxd/sandboxd.sock")
+    format!("{home}/.local/share/sandboxd/sandboxd.sock")
 }
 
 fn default_base_dir() -> String {
+    if let Ok(data_home) = std::env::var("XDG_DATA_HOME") {
+        return format!("{data_home}/sandboxd");
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    format!("{home}/.sandboxd")
+    format!("{home}/.local/share/sandboxd")
 }
 
 // ---------------------------------------------------------------------------
@@ -2833,8 +2839,8 @@ mod tests {
     fn default_base_dir_ends_with_sandboxd() {
         let dir = default_base_dir();
         assert!(
-            dir.ends_with(".sandboxd"),
-            "expected dir to end with .sandboxd, got: {dir}"
+            dir.ends_with("/sandboxd"),
+            "expected dir to end with /sandboxd, got: {dir}"
         );
     }
 }

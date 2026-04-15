@@ -161,7 +161,7 @@ network access.  It uses the `ext::` remote transport built into git.
 ```bash
 # Add the sandbox as a git remote
 git remote add sandbox \
-    "ext::sandbox --socket ~/.sandboxd/sandboxd.sock git-remote %S my-session"
+    "ext::sandbox git-remote %S my-session"
 
 # Push local changes into the VM
 git push sandbox main
