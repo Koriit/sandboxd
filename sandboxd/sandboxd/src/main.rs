@@ -84,6 +84,14 @@ struct AppState {
     /// reconciliation loops check this set so they don't accidentally
     /// restart a gateway that was intentionally stopped.
     sessions_stopping: Mutex<HashSet<uuid::Uuid>>,
+    /// Serializes base image check-and-build operations.
+    ///
+    /// Without this lock, concurrent `create_session` requests can each
+    /// see `BaseImageStatus::Missing` and independently trigger
+    /// `build_base_image()`.  The second build starts a new base VM in
+    /// Running state, which causes all `limactl clone` calls to fail
+    /// with "cannot clone a running instance."
+    base_image_lock: Mutex<()>,
 }
 
 // ---------------------------------------------------------------------------
@@ -271,60 +279,66 @@ async fn create_session(
     if use_cache {
         // ---- Fast path: clone from golden base image ----
 
-        // Check if the base image exists and is fresh.
-        let base_status = {
-            let lima_check = state.lima.clone();
-            match tokio::task::spawn_blocking(move || lima_check.check_base_image()).await {
-                Ok(Ok(s)) => s,
-                Ok(Err(e)) => {
-                    cleanup_net_ca_and_return!(state, session_id, error_response(e).into_response());
-                }
-                Err(e) => {
-                    cleanup_net_ca_and_return!(
-                        state,
-                        session_id,
-                        error_response(SandboxError::Internal(format!("task join error: {e}")))
-                            .into_response()
-                    );
-                }
-            }
-        };
+        // Serialize check + build behind a lock so that concurrent
+        // create_session requests don't each see Missing and all
+        // independently trigger build_base_image().
+        {
+            let _base_guard = state.base_image_lock.lock().await;
 
-        match base_status {
-            BaseImageStatus::Missing => {
-                // Must build -- no choice.
-                info!("base image missing, building...");
-                let lima_build = state.lima.clone();
-                match tokio::task::spawn_blocking(move || lima_build.build_base_image()).await {
-                    Ok(Ok(())) => {}
+            let base_status = {
+                let lima_check = state.lima.clone();
+                match tokio::task::spawn_blocking(move || lima_check.check_base_image()).await {
+                    Ok(Ok(s)) => s,
                     Ok(Err(e)) => {
-                        cleanup_net_ca_and_return!(
-                            state,
-                            session_id,
-                            error_response(e).into_response()
-                        );
+                        cleanup_net_ca_and_return!(state, session_id, error_response(e).into_response());
                     }
                     Err(e) => {
                         cleanup_net_ca_and_return!(
                             state,
                             session_id,
-                            error_response(SandboxError::Internal(format!(
-                                "task join error: {e}"
-                            )))
-                            .into_response()
+                            error_response(SandboxError::Internal(format!("task join error: {e}")))
+                                .into_response()
                         );
                     }
                 }
+            };
+
+            match base_status {
+                BaseImageStatus::Missing => {
+                    // Must build -- no choice.
+                    info!("base image missing, building...");
+                    let lima_build = state.lima.clone();
+                    match tokio::task::spawn_blocking(move || lima_build.build_base_image()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            cleanup_net_ca_and_return!(
+                                state,
+                                session_id,
+                                error_response(e).into_response()
+                            );
+                        }
+                        Err(e) => {
+                            cleanup_net_ca_and_return!(
+                                state,
+                                session_id,
+                                error_response(SandboxError::Internal(format!(
+                                    "task join error: {e}"
+                                )))
+                                .into_response()
+                            );
+                        }
+                    }
+                }
+                BaseImageStatus::Stale { .. } => {
+                    // Don't auto-rebuild on create -- use the stale image.
+                    // User can run `sandbox rebuild-image` to refresh.
+                    info!("base image is stale, using anyway");
+                }
+                BaseImageStatus::Fresh => {
+                    // Good to go.
+                }
             }
-            BaseImageStatus::Stale { .. } => {
-                // Don't auto-rebuild on create -- use the stale image.
-                // User can run `sandbox rebuild-image` to refresh.
-                info!("base image is stale, using anyway");
-            }
-            BaseImageStatus::Fresh => {
-                // Good to go.
-            }
-        }
+        } // drop _base_guard — other requests can now check/build
 
         // Clone from the base image.
         {
@@ -1090,20 +1104,18 @@ async fn remove_session(
     // Cancel DNS propagation loop before teardown.
     cancel_dns_propagation_loop(&session.id, &state).await;
 
-    // Stop VM if running, then delete from Lima, then full network teardown.
+    // Delete VM from Lima, then full network teardown.
     // All of these are best-effort blocking calls.
+    // Note: `delete_vm` uses `limactl delete --force` which already stops
+    // a running VM, so we skip the separate `stop_vm` call to avoid
+    // doubling the Lima wait time (~60s each).
     {
         let lima = state.lima.clone();
         let gateway = state.gateway.clone();
         let network = state.network.clone();
         let base_dir = state.base_dir.clone();
         let sid = session.id;
-        let is_running = session.state == SessionState::Running;
         let _ = tokio::task::spawn_blocking(move || {
-            // Stop VM if running (ignore errors -- it might already be stopped).
-            if is_running {
-                let _ = lima.stop_vm(&sid);
-            }
             // Delete the VM from Lima (ignore errors -- it might not exist).
             let _ = lima.delete_vm(&sid);
             // Full teardown: networking + CA + release subnet allocation.
@@ -2143,6 +2155,10 @@ async fn session_health(
 
 /// `POST /rebuild-image` -- rebuild the pre-baked golden base VM image.
 async fn rebuild_image(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // Hold the base image lock for the entire rebuild so that concurrent
+    // create_session requests wait until the rebuild finishes before
+    // checking the image status.
+    let _base_guard = state.base_image_lock.lock().await;
     let lima = state.lima.clone();
     match tokio::task::spawn_blocking(move || lima.rebuild_base_image()).await {
         Ok(Ok(())) => (StatusCode::OK, "base image rebuilt").into_response(),
@@ -2778,6 +2794,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dns_loop_handles: Mutex::new(HashMap::new()),
         session_policies: Arc::new(Mutex::new(HashMap::new())),
         sessions_stopping: Mutex::new(HashSet::new()),
+        base_image_lock: Mutex::new(()),
     });
 
     // Run networking reconciliation: restart crashed gateways, clean up
