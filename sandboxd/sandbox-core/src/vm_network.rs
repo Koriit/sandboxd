@@ -8,12 +8,12 @@
 //! 2. **Configure** the NIC with a static IP, default route, and DNS
 
 use tracing::info;
-use uuid::Uuid;
 
 use crate::error::SandboxError;
 use crate::guest::{GuestConnector, GuestResponse};
 use crate::network::NetworkInfo;
-use crate::qmp::{generate_guest_network_script, mac_from_uuid};
+use crate::qmp::{generate_guest_network_script, mac_from_session_id};
+use crate::session::SessionId;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -28,11 +28,11 @@ use crate::qmp::{generate_guest_network_script, mac_from_uuid};
 ///
 /// Called after the VM has booted and the guest agent is responsive.
 pub async fn attach_vm_to_bridge(
-    session_id: &Uuid,
+    session_id: &SessionId,
     network_info: &NetworkInfo,
     guest: &GuestConnector,
 ) -> Result<(), SandboxError> {
-    let mac = mac_from_uuid(session_id);
+    let mac = mac_from_session_id(session_id);
 
     info!(
         session_id = %session_id,
@@ -104,7 +104,7 @@ pub async fn attach_vm_to_bridge(
 /// automatically destroyed when the VM stops. This function is a no-op
 /// but retained for API compatibility during teardown sequences.
 pub fn detach_vm_from_bridge(
-    session_id: &Uuid,
+    session_id: &SessionId,
 ) -> Result<(), SandboxError> {
     info!(
         session_id = %session_id,
@@ -123,15 +123,14 @@ mod tests {
 
     #[test]
     fn test_attach_generates_correct_mac() {
-        let id =
-            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
-        let mac = mac_from_uuid(&id);
+        let id = SessionId::parse("550e8400e29b").unwrap();
+        let mac = mac_from_session_id(&id);
         assert_eq!(mac, "52:54:00:55:0e:84");
     }
 
     #[test]
     fn test_detach_is_noop() {
-        let id = Uuid::new_v4();
+        let id = SessionId::generate();
         // detach should always succeed (it's a no-op).
         assert!(detach_vm_from_bridge(&id).is_ok());
     }
@@ -139,7 +138,7 @@ mod tests {
     #[test]
     fn test_guest_script_for_network_info() {
         let info = NetworkInfo {
-            bridge_name: "sb-550e8400-e2".to_string(),
+            bridge_name: "sb-550e8400e29b".to_string(),
             subnet: "10.209.0.0/28".to_string(),
             gateway_ip: "10.209.0.2".to_string(),
             vm_ip: "10.209.0.3".to_string(),

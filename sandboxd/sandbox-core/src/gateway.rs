@@ -4,11 +4,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
-use uuid::Uuid;
 
 use crate::error::SandboxError;
 use crate::network::NetworkInfo;
 use crate::process::run_with_timeout;
+use crate::session::SessionId;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -99,7 +99,7 @@ impl GatewayManager {
     /// waiting for its reload timer to detect the file change.
     pub fn create_gateway(
         &self,
-        session_id: &Uuid,
+        session_id: &SessionId,
         network_info: &NetworkInfo,
         ca_dir: Option<&Path>,
         initial_dns_policy: Option<&str>,
@@ -308,7 +308,7 @@ impl GatewayManager {
     /// 2. Stop the container (which stops all components)
     /// 3. Remove the container (network namespace disappears, cleaning up
     ///    the deny-all rules automatically)
-    pub fn stop_gateway(&self, session_id: &Uuid) -> Result<(), SandboxError> {
+    pub fn stop_gateway(&self, session_id: &SessionId) -> Result<(), SandboxError> {
         let container_name = container_name(session_id);
 
         info!(
@@ -391,7 +391,7 @@ impl GatewayManager {
     /// the full rule injection sequence.
     pub fn restart_gateway(
         &self,
-        session_id: &Uuid,
+        session_id: &SessionId,
         network_info: &NetworkInfo,
         ca_dir: Option<&Path>,
         initial_dns_policy: Option<&str>,
@@ -418,7 +418,7 @@ impl GatewayManager {
     /// container.
     pub fn gateway_status(
         &self,
-        session_id: &Uuid,
+        session_id: &SessionId,
     ) -> Result<GatewayStatus, SandboxError> {
         let container_name = container_name(session_id);
 
@@ -477,7 +477,7 @@ impl GatewayManager {
 
     /// Return the container status as a string: "running", "stopped", or
     /// "not_found".
-    pub fn container_status_str(&self, session_id: &Uuid) -> String {
+    pub fn container_status_str(&self, session_id: &SessionId) -> String {
         let container_name = container_name(session_id);
 
         let output = run_with_timeout(
@@ -506,7 +506,7 @@ impl GatewayManager {
     /// running or the check cannot be performed).
     pub fn component_health(
         &self,
-        session_id: &Uuid,
+        session_id: &SessionId,
         component: &str,
     ) -> String {
         let container_name = container_name(session_id);
@@ -545,7 +545,7 @@ impl GatewayManager {
     ///
     /// This is the first ruleset applied, before any components are ready.
     /// It drops all inbound and forwarded traffic while allowing outbound.
-    pub fn inject_deny_all(&self, session_id: &Uuid) -> Result<(), SandboxError> {
+    pub fn inject_deny_all(&self, session_id: &SessionId) -> Result<(), SandboxError> {
         let ruleset = generate_deny_all_ruleset();
         self.inject_nftables_ruleset(session_id, &ruleset, "deny-all")
     }
@@ -560,7 +560,7 @@ impl GatewayManager {
     /// (explicitly assigned via `--ip` from NetworkInfo.gateway_ip).
     pub fn inject_dnat(
         &self,
-        session_id: &Uuid,
+        session_id: &SessionId,
         network_info: &NetworkInfo,
         container_ip: &str,
     ) -> Result<(), SandboxError> {
@@ -588,7 +588,7 @@ impl GatewayManager {
     /// deny-all base rules and DNAT rules.
     pub fn inject_nftables(
         &self,
-        session_id: &Uuid,
+        session_id: &SessionId,
         network_info: &NetworkInfo,
     ) -> Result<(), SandboxError> {
         self.inject_deny_all(session_id)?;
@@ -601,7 +601,7 @@ impl GatewayManager {
     /// nftables rules outside the base deny-all/DNAT lifecycle.
     pub fn inject_nftables_ruleset_public(
         &self,
-        session_id: &Uuid,
+        session_id: &SessionId,
         ruleset: &str,
         label: &str,
     ) -> Result<(), SandboxError> {
@@ -610,7 +610,7 @@ impl GatewayManager {
 
     /// Remove the DNAT nftables rules from the gateway container's network
     /// namespace. Called before shutdown to stop routing new traffic.
-    pub fn remove_dnat_rules(&self, session_id: &Uuid) -> Result<(), SandboxError> {
+    pub fn remove_dnat_rules(&self, session_id: &SessionId) -> Result<(), SandboxError> {
         let ruleset = "delete table inet sandbox_dnat\n";
         self.inject_nftables_ruleset(session_id, ruleset, "remove-DNAT")
     }
@@ -621,7 +621,7 @@ impl GatewayManager {
     ///
     /// With /28 subnets the gateway container gets an explicit IP via `--ip`,
     /// but this method is retained for verification and integration tests.
-    pub fn container_ip(&self, session_id: &Uuid) -> Result<String, SandboxError> {
+    pub fn container_ip(&self, session_id: &SessionId) -> Result<String, SandboxError> {
         let container_name = container_name(session_id);
 
         let output = run_with_timeout(
@@ -664,7 +664,7 @@ impl GatewayManager {
     /// Inject an nftables ruleset into the container via `docker exec`.
     fn inject_nftables_ruleset(
         &self,
-        session_id: &Uuid,
+        session_id: &SessionId,
         ruleset: &str,
         label: &str,
     ) -> Result<(), SandboxError> {
@@ -742,7 +742,7 @@ impl GatewayManager {
     }
 
     /// Wait for all gateway components to become ready.
-    fn wait_for_components(&self, session_id: &Uuid) -> Result<(), SandboxError> {
+    fn wait_for_components(&self, session_id: &SessionId) -> Result<(), SandboxError> {
         let container_name = container_name(session_id);
         let deadline = Instant::now() + COMPONENT_READY_TIMEOUT;
 
@@ -842,7 +842,7 @@ impl Default for GatewayManager {
 // ---------------------------------------------------------------------------
 
 /// Generate the Docker container name for a session's gateway.
-pub fn container_name(session_id: &Uuid) -> String {
+pub fn container_name(session_id: &SessionId) -> String {
     format!("sandbox-gw-{session_id}")
 }
 
@@ -1010,11 +1010,10 @@ mod tests {
 
     #[test]
     fn test_gateway_container_name() {
-        let session_id =
-            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let session_id = SessionId::parse("550e8400e29b").unwrap();
         assert_eq!(
             container_name(&session_id),
-            "sandbox-gw-550e8400-e29b-41d4-a716-446655440000"
+            "sandbox-gw-550e8400e29b"
         );
     }
 

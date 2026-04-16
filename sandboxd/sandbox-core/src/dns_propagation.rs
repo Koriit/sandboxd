@@ -5,12 +5,12 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use tracing::{debug, info};
-use uuid::Uuid;
 
 use crate::error::SandboxError;
 use crate::gateway::{self, GatewayManager};
 use crate::network::NetworkInfo;
 use crate::policy::{AssuranceLevel, Destination, Policy};
+use crate::session::SessionId;
 
 // ---------------------------------------------------------------------------
 // Resolved.json types (matches CoreDNS plugin output)
@@ -195,7 +195,7 @@ pub enum DnsChangeType {
 // ---------------------------------------------------------------------------
 
 /// Read the resolved.json file from a gateway container via `docker exec`.
-pub fn read_resolved_json(session_id: &Uuid) -> Result<ResolvedReport, SandboxError> {
+pub fn read_resolved_json(session_id: &SessionId) -> Result<ResolvedReport, SandboxError> {
     let container = gateway::container_name(session_id);
 
     let output = Command::new("docker")
@@ -428,7 +428,7 @@ table inet sandbox_l3 {{
 /// Propagate DNS changes to nftables by regenerating the policy rules
 /// with the current DNS cache state.
 pub fn propagate_dns_changes(
-    session_id: &Uuid,
+    session_id: &SessionId,
     policy: &Policy,
     cache: &DnsCache,
     gateway: &GatewayManager,

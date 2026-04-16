@@ -15,9 +15,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tracing::debug;
-use uuid::Uuid;
 
 use crate::error::SandboxError;
+use crate::session::SessionId;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -47,7 +47,7 @@ impl QmpClient {
     /// Construct the QMP socket path for a Lima-managed sandbox VM.
     ///
     /// Lima stores QMP sockets at `~/.lima/{vm_name}/qmp.sock`.
-    pub fn for_session(session_id: &Uuid) -> Result<Self, SandboxError> {
+    pub fn for_session(session_id: &SessionId) -> Result<Self, SandboxError> {
         let home = std::env::var("HOME").map_err(|_| {
             SandboxError::Internal("HOME environment variable not set".into())
         })?;
@@ -271,13 +271,13 @@ impl QmpClient {
 // MAC address generation
 // ---------------------------------------------------------------------------
 
-/// Generate a deterministic MAC address from a session UUID.
+/// Generate a deterministic MAC address from a session ID.
 ///
 /// Format: `52:54:00:XX:YY:ZZ` where XX, YY, ZZ are derived from the
-/// first 3 bytes of the UUID. The `52:54:00` prefix is the QEMU OUI
+/// first 3 bytes of the session id. The `52:54:00` prefix is the QEMU OUI
 /// (Organizationally Unique Identifier).
-pub fn mac_from_uuid(session_id: &Uuid) -> String {
-    let bytes = session_id.as_bytes();
+pub fn mac_from_session_id(session_id: &SessionId) -> String {
+    let bytes = session_id.as_bytes_array();
     format!(
         "52:54:00:{:02x}:{:02x}:{:02x}",
         bytes[0], bytes[1], bytes[2]
@@ -286,11 +286,10 @@ pub fn mac_from_uuid(session_id: &Uuid) -> String {
 
 /// Generate the TAP device name for a session.
 ///
-/// Format: `tap-sb-{first 6 chars of session_id}`.
-/// Total length: 4 + 3 + 6 = 13 chars (well under the 15-char kernel limit).
-pub fn tap_name_for_session(session_id: &Uuid) -> String {
-    let short_id = &session_id.to_string()[..6];
-    format!("tap-sb-{short_id}")
+/// Format: `tb-{session_id}`, where the session id is 12 hex chars.
+/// Total length: 3 + 12 = 15 chars, exactly at the kernel's IFNAMSIZ limit.
+pub fn tap_name_for_session(session_id: &SessionId) -> String {
+    format!("tb-{session_id}")
 }
 
 // ---------------------------------------------------------------------------
@@ -399,9 +398,8 @@ mod tests {
 
     #[test]
     fn test_mac_address_format() {
-        let id =
-            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
-        let mac = mac_from_uuid(&id);
+        let id = SessionId::parse("550e8400e29b").unwrap();
+        let mac = mac_from_session_id(&id);
 
         // Must start with QEMU OUI prefix.
         assert!(
@@ -424,30 +422,26 @@ mod tests {
 
     #[test]
     fn test_mac_address_determinism() {
-        let id =
-            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
-        let mac1 = mac_from_uuid(&id);
-        let mac2 = mac_from_uuid(&id);
+        let id = SessionId::parse("550e8400e29b").unwrap();
+        let mac1 = mac_from_session_id(&id);
+        let mac2 = mac_from_session_id(&id);
         assert_eq!(mac1, mac2, "MAC address must be deterministic");
     }
 
     #[test]
     fn test_mac_address_uniqueness() {
-        let id1 =
-            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
-        let id2 =
-            Uuid::parse_str("a1b2c3d4-e5f6-7890-abcd-ef1234567890").unwrap();
-        let mac1 = mac_from_uuid(&id1);
-        let mac2 = mac_from_uuid(&id2);
-        assert_ne!(mac1, mac2, "different UUIDs should produce different MACs");
+        let id1 = SessionId::parse("550e8400e29b").unwrap();
+        let id2 = SessionId::parse("a1b2c3d4e5f6").unwrap();
+        let mac1 = mac_from_session_id(&id1);
+        let mac2 = mac_from_session_id(&id2);
+        assert_ne!(mac1, mac2, "different ids should produce different MACs");
     }
 
     #[test]
     fn test_mac_address_specific_bytes() {
-        // UUID 550e8400-... => first 3 bytes are 0x55, 0x0e, 0x84
-        let id =
-            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
-        let mac = mac_from_uuid(&id);
+        // Session id 550e8400e29b -> first 3 bytes are 0x55, 0x0e, 0x84.
+        let id = SessionId::parse("550e8400e29b").unwrap();
+        let mac = mac_from_session_id(&id);
         assert_eq!(mac, "52:54:00:55:0e:84");
     }
 
@@ -455,36 +449,33 @@ mod tests {
 
     #[test]
     fn test_tap_name_format() {
-        let id =
-            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let id = SessionId::parse("550e8400e29b").unwrap();
         let name = tap_name_for_session(&id);
 
         assert!(
-            name.starts_with("tap-sb-"),
-            "TAP name must start with 'tap-sb-': {name}"
+            name.starts_with("tb-"),
+            "TAP name must start with 'tb-': {name}"
         );
+        assert_eq!(name, "tb-550e8400e29b");
     }
 
     #[test]
     fn test_tap_name_length() {
-        // Kernel interface names are limited to 15 characters (IFNAMSIZ - 1).
-        let id = Uuid::new_v4();
+        // Kernel interface names are limited to 15 characters (IFNAMSIZ).
+        // "tb-" (3) + 12 hex = exactly 15.
+        let id = SessionId::generate();
         let name = tap_name_for_session(&id);
 
-        assert!(
-            name.len() <= 15,
-            "TAP name '{}' is {} chars (max 15)",
-            name,
-            name.len()
+        assert_eq!(
+            name.len(),
+            15,
+            "TAP name '{name}' should be exactly 15 chars (IFNAMSIZ)"
         );
-        // Should be exactly 13 chars: "tap-sb-" (7) + 6 chars of UUID.
-        assert_eq!(name.len(), 13);
     }
 
     #[test]
     fn test_tap_name_determinism() {
-        let id =
-            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let id = SessionId::parse("550e8400e29b").unwrap();
         let name1 = tap_name_for_session(&id);
         let name2 = tap_name_for_session(&id);
         assert_eq!(name1, name2, "TAP name must be deterministic");
@@ -631,12 +622,11 @@ mod tests {
     fn test_qmp_client_for_session() {
         // This test may fail in environments without HOME set, but that's
         // expected.
-        let id =
-            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let id = SessionId::parse("550e8400e29b").unwrap();
         if let Ok(client) = QmpClient::for_session(&id) {
             let path = client.socket_path().to_string_lossy();
             assert!(
-                path.contains(".lima/sandbox-550e8400-e29b-41d4-a716-446655440000/qmp.sock"),
+                path.contains(".lima/sandbox-550e8400e29b/qmp.sock"),
                 "socket path should contain Lima VM directory: {path}"
             );
         }

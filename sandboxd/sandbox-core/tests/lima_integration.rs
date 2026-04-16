@@ -9,8 +9,7 @@
 //! and boot.
 
 use sandbox_core::lima::{vm_name, LimaManager};
-use sandbox_core::session::SessionConfig;
-use uuid::Uuid;
+use sandbox_core::session::{SessionConfig, SessionId};
 
 #[test]
 fn test_lima_create_and_delete() {
@@ -18,7 +17,7 @@ fn test_lima_create_and_delete() {
     let mgr = LimaManager::new(dir.path().to_path_buf())
         .expect("limactl must be on PATH for integration test");
 
-    let session_id = Uuid::new_v4();
+    let session_id = SessionId::generate();
     let config = SessionConfig {
         cpus: 1,
         memory_mb: 1024,

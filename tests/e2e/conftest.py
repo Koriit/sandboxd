@@ -39,9 +39,9 @@ BRIDGE_CONF_PATH = Path("/etc/qemu/bridge.conf")
 # Shared test helpers
 # ---------------------------------------------------------------------------
 
-# Regex to extract the session ID (UUID) from `sandbox create` output.
-# The CLI prints lines like:  ID:       <uuid>
-_ID_RE = re.compile(r"^ID:\s+([0-9a-f-]{36})$", re.MULTILINE)
+# Regex to extract the session ID from `sandbox create` output.
+# The CLI prints lines like:  ID:       <12-hex-id>
+_ID_RE = re.compile(r"^ID:\s+([0-9a-f]{12})$", re.MULTILINE)
 
 # Default VM resource args -- kept small so tests work on hosts with limited
 # memory (e.g. 4 GB total).

@@ -9,8 +9,8 @@ use std::process::Command;
 
 use sandbox_core::gateway::{container_name, GatewayManager, GatewayStatus, GATEWAY_IMAGE};
 use sandbox_core::network::NetworkManager;
+use sandbox_core::session::SessionId;
 use std::net::Ipv4Addr;
-use uuid::Uuid;
 
 #[test]
 fn test_gateway_lifecycle() {
@@ -18,7 +18,7 @@ fn test_gateway_lifecycle() {
     let net_mgr =
         NetworkManager::new(Ipv4Addr::new(10, 209, 3, 0), 24).unwrap();
     let gw_mgr = GatewayManager::new();
-    let session_id = Uuid::new_v4();
+    let session_id = SessionId::generate();
 
     // Create the Docker network.
     let network_info = net_mgr.create_network(&session_id).unwrap();
@@ -74,7 +74,7 @@ fn test_gateway_nftables_injection_standalone() {
     let net_mgr =
         NetworkManager::new(Ipv4Addr::new(10, 209, 4, 0), 24).unwrap();
     let gw_mgr = GatewayManager::new();
-    let session_id = Uuid::new_v4();
+    let session_id = SessionId::generate();
 
     // Create network and a minimal container (no need for full gateway here).
     let network_info = net_mgr.create_network(&session_id).unwrap();

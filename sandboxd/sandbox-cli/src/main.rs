@@ -404,7 +404,7 @@ fn display_sessions_table(sessions: &[SessionResponse]) {
 
     // Header.
     println!(
-        "{:<36}  {:<16}  {:<10}  {:<11}  {:<11}  CREATED",
+        "{:<12}  {:<16}  {:<10}  {:<11}  {:<11}  CREATED",
         "ID", "NAME", "STATE", "AGENT", "GATEWAY"
     );
 
@@ -422,7 +422,7 @@ fn display_sessions_table(sessions: &[SessionResponse]) {
         let created = format_relative_time(&session.created_at);
 
         println!(
-            "{:<36}  {:<16}  {:<10}  {:<11}  {:<11}  {created}",
+            "{:<12}  {:<16}  {:<10}  {:<11}  {:<11}  {created}",
             session.id, name, state, agent, gateway
         );
     }

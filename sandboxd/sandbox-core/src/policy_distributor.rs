@@ -1,11 +1,11 @@
 use std::process::Command;
 
 use tracing::{debug, error, info, warn};
-use uuid::Uuid;
 
 use crate::error::SandboxError;
 use crate::gateway::{self, GatewayManager};
 use crate::policy::CompiledPolicy;
+use crate::session::SessionId;
 
 // ---------------------------------------------------------------------------
 // Distribution step tracking (for rollback)
@@ -42,7 +42,7 @@ impl PolicyDistributor {
     ///
     /// On partial failure, previously completed steps are rolled back.
     pub fn distribute(
-        session_id: &Uuid,
+        session_id: &SessionId,
         compiled: &CompiledPolicy,
         gateway: &GatewayManager,
     ) -> Result<(), SandboxError> {
@@ -165,7 +165,7 @@ impl PolicyDistributor {
 
     /// Rollback previously completed distribution steps.
     fn rollback_steps(
-        session_id: &Uuid,
+        session_id: &SessionId,
         state: &DistributionState,
         previous: &PreviousConfigs,
     ) {
@@ -248,7 +248,7 @@ struct PreviousConfigs {
 
 impl PreviousConfigs {
     /// Best-effort read of current configs from the container.
-    fn read(session_id: &Uuid) -> Self {
+    fn read(session_id: &SessionId) -> Self {
         let container = gateway::container_name(session_id);
 
         let coredns = read_file_from_container(&container, "/etc/coredns/policy.conf").ok();
@@ -346,7 +346,7 @@ fn read_file_from_container(
 
 /// Read the current nftables sandbox_policy table state from the container
 /// via `docker exec`.
-fn read_nftables_state(session_id: &Uuid) -> Result<String, SandboxError> {
+fn read_nftables_state(session_id: &SessionId) -> Result<String, SandboxError> {
     let container = gateway::container_name(session_id);
 
     let output = Command::new("docker")

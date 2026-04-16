@@ -17,8 +17,8 @@ use sandbox_core::{
     FileUploadRequest, GatewayHealth, GatewayManager, GatewayStatus, GitRequest, GitResponse,
     GuestConnector, GuestRequest, GuestResponse, LimaManager, NetworkHealth, NetworkManager,
     Policy, PolicyCompiler, PolicyDistributor, SandboxError, Session, SessionConfig, SessionHealth,
-    SessionResponse, SessionState, SessionStore, UpdatePolicyRequest, VmStatus,
-    attach_vm_to_bridge, detach_vm_from_bridge, generate_ca_inject_script, mac_from_uuid,
+    SessionId, SessionResponse, SessionState, SessionStore, UpdatePolicyRequest, VmStatus,
+    attach_vm_to_bridge, detach_vm_from_bridge, generate_ca_inject_script, mac_from_session_id,
     propagate_dns_changes, read_resolved_json, write_file_to_container,
 };
 use sandbox_core::gateway::container_name as gateway_container_name;
@@ -73,17 +73,17 @@ struct AppState {
     gateway: Arc<GatewayManager>,
     /// Handles for DNS propagation background tasks, keyed by session ID.
     /// Used to cancel the loop when a session is stopped or deleted.
-    dns_loop_handles: Mutex<HashMap<uuid::Uuid, tokio::task::JoinHandle<()>>>,
+    dns_loop_handles: Mutex<HashMap<SessionId, tokio::task::JoinHandle<()>>>,
     /// Active policies for sessions, keyed by session ID.
     /// Uses Arc so it can be shared with spawned DNS propagation tasks.
-    session_policies: Arc<Mutex<HashMap<uuid::Uuid, Policy>>>,
+    session_policies: Arc<Mutex<HashMap<SessionId, Policy>>>,
     /// Sessions currently being stopped.
     ///
     /// Tracks session IDs that are in the middle of the stop sequence
     /// (networking teardown + VM stop).  The gateway monitor and network
     /// reconciliation loops check this set so they don't accidentally
     /// restart a gateway that was intentionally stopped.
-    sessions_stopping: Mutex<HashSet<uuid::Uuid>>,
+    sessions_stopping: Mutex<HashSet<SessionId>>,
     /// Serializes base image check-and-build operations.
     ///
     /// Without this lock, concurrent `create_session` requests can each
@@ -103,6 +103,7 @@ fn error_response(err: SandboxError) -> (StatusCode, Json<ApiError>) {
     let (status, msg) = match &err {
         SandboxError::SessionNotFound(_) => (StatusCode::NOT_FOUND, err.to_string()),
         SandboxError::InvalidState(_) => (StatusCode::BAD_REQUEST, err.to_string()),
+        SandboxError::InvalidArgument(_) => (StatusCode::BAD_REQUEST, err.to_string()),
         SandboxError::Network(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
         SandboxError::Ca(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
         SandboxError::Gateway(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
@@ -229,7 +230,7 @@ async fn create_session(
     };
 
     // Generate MAC address for the VM's bridge NIC.
-    let vm_mac = mac_from_uuid(&session_id);
+    let vm_mac = mac_from_session_id(&session_id);
 
     info!(%session_id, bridge = %network_info.bridge_name, mac = %vm_mac, "creating VM");
 
@@ -896,7 +897,7 @@ async fn start_session(
             .await
         {
             Ok(Ok(info)) => {
-                let mac = mac_from_uuid(&session.id);
+                let mac = mac_from_session_id(&session.id);
                 (Some(info.bridge_name), Some(mac))
             }
             Ok(Err(e)) => {
@@ -1473,7 +1474,7 @@ async fn update_policy(
 
 /// Apply a policy to a running session: compile, distribute, and start DNS loop.
 async fn apply_policy(
-    session_id: &uuid::Uuid,
+    session_id: &SessionId,
     policy: &Policy,
     state: &AppState,
 ) -> Result<(), SandboxError> {
@@ -1508,7 +1509,7 @@ async fn apply_policy(
 /// Start (or restart) the DNS propagation background loop for a session.
 ///
 /// If a loop is already running for this session, it is cancelled first.
-async fn start_dns_propagation_loop(session_id: &uuid::Uuid, state: &AppState) {
+async fn start_dns_propagation_loop(session_id: &SessionId, state: &AppState) {
     // Cancel any existing loop for this session (but preserve the policy).
     {
         let mut handles = state.dns_loop_handles.lock().await;
@@ -1554,7 +1555,7 @@ async fn start_dns_propagation_loop(session_id: &uuid::Uuid, state: &AppState) {
 }
 
 /// Cancel the DNS propagation loop for a session.
-async fn cancel_dns_propagation_loop(session_id: &uuid::Uuid, state: &AppState) {
+async fn cancel_dns_propagation_loop(session_id: &SessionId, state: &AppState) {
     let mut handles = state.dns_loop_handles.lock().await;
     if let Some(handle) = handles.remove(session_id) {
         handle.abort();
@@ -1574,10 +1575,10 @@ async fn cancel_dns_propagation_loop(session_id: &uuid::Uuid, state: &AppState) 
 /// Periodically reads resolved.json from the gateway container, updates
 /// the DNS cache, and propagates IP changes to nftables.
 async fn dns_propagation_loop(
-    session_id: uuid::Uuid,
+    session_id: SessionId,
     gateway: Arc<GatewayManager>,
     network_info: sandbox_core::NetworkInfo,
-    session_policies: Arc<Mutex<HashMap<uuid::Uuid, Policy>>>,
+    session_policies: Arc<Mutex<HashMap<SessionId, Policy>>>,
 ) {
     let poll_interval = Duration::from_secs(2);
     let mut cache = DnsCache::new();
@@ -1704,7 +1705,7 @@ async fn dns_propagation_loop(
 /// the VM.
 async fn inject_ca_into_vm(
     guest: &GuestConnector,
-    session_id: &uuid::Uuid,
+    session_id: &SessionId,
     ca_dir: &std::path::Path,
 ) -> Result<(), SandboxError> {
     let cert_pem = std::fs::read_to_string(ca_dir.join("cert.pem")).map_err(|e| {
@@ -1767,7 +1768,7 @@ async fn inject_ca_into_vm(
 /// 3. Inject CA certificate into VM trust store
 /// 4. Store network info in DB
 async fn setup_session_networking(
-    session_id: &uuid::Uuid,
+    session_id: &SessionId,
     network_info: &sandbox_core::NetworkInfo,
     ca_dir: &std::path::Path,
     state: &AppState,
@@ -1828,7 +1829,7 @@ async fn setup_session_networking(
 ///
 /// The CA certificate files on disk are NOT removed — they are reused on
 /// start.
-async fn teardown_session_networking(session_id: &uuid::Uuid, state: &AppState) {
+async fn teardown_session_networking(session_id: &SessionId, state: &AppState) {
     debug!(session_id = %session_id, "tearing down session networking (preserving allocation)");
     // Blocking Docker calls (stop_gateway, remove_docker_network) are
     // wrapped in spawn_blocking to avoid stalling the Tokio runtime.
@@ -1860,7 +1861,7 @@ async fn teardown_session_networking(session_id: &uuid::Uuid, state: &AppState) 
 ///
 /// Policy re-application is best-effort: failures are logged but do not
 /// propagate, matching the non-fatal semantics of initial policy setup.
-async fn reapply_session_policy(session_id: &uuid::Uuid, state: &AppState) {
+async fn reapply_session_policy(session_id: &SessionId, state: &AppState) {
     let container = gateway_container_name(session_id);
 
     // Check the in-memory policy store.
@@ -1916,7 +1917,7 @@ async fn reapply_session_policy(session_id: &uuid::Uuid, state: &AppState) {
 /// and injects the CA certificate — the same post-boot steps as initial
 /// setup.
 async fn restore_session_networking(
-    session_id: &uuid::Uuid,
+    session_id: &SessionId,
     state: &AppState,
 ) -> Result<(), SandboxError> {
     // Check that network info exists in DB (otherwise there's nothing to restore).
@@ -2022,7 +2023,7 @@ async fn restore_session_networking(
 }
 
 /// Format a `GatewayStatus` into a human-readable string for the API response.
-fn format_gateway_status(gateway: &GatewayManager, session_id: &uuid::Uuid) -> String {
+fn format_gateway_status(gateway: &GatewayManager, session_id: &SessionId) -> String {
     match gateway.gateway_status(session_id) {
         Ok(GatewayStatus::Healthy) => "healthy".to_string(),
         Ok(GatewayStatus::Unhealthy(reason)) => format!("unhealthy: {reason}"),

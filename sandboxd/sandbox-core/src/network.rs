@@ -6,10 +6,10 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
-use uuid::Uuid;
 
 use crate::error::SandboxError;
 use crate::process::run_with_timeout;
+use crate::session::SessionId;
 
 // ---------------------------------------------------------------------------
 // Timeout constants
@@ -31,7 +31,8 @@ const INSPECT_NETWORK_TIMEOUT: Duration = Duration::from_secs(10);
 /// Information about a session's Docker bridge network.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkInfo {
-    /// Kernel bridge interface name (max 15 chars): `sb-{session_id[0..11]}`.
+    /// Kernel bridge interface name: `sb-{session_id}` (3 + 12 = 15 chars,
+    /// the Linux IFNAMSIZ maximum).
     pub bridge_name: String,
     /// Subnet in CIDR notation, e.g. `"10.209.0.0/28"`.
     pub subnet: String,
@@ -176,7 +177,7 @@ impl SubnetAllocator {
 pub struct NetworkManager {
     subnet_allocator: Mutex<SubnetAllocator>,
     /// Maps session_id -> (block_index, NetworkInfo) for active networks.
-    networks: Mutex<std::collections::HashMap<Uuid, (u8, NetworkInfo)>>,
+    networks: Mutex<std::collections::HashMap<SessionId, (u8, NetworkInfo)>>,
 }
 
 impl NetworkManager {
@@ -203,7 +204,7 @@ impl NetworkManager {
     /// is marked as allocated.
     pub fn restore_from_infos(
         &self,
-        entries: &[(Uuid, NetworkInfo)],
+        entries: &[(SessionId, NetworkInfo)],
     ) -> Result<(), SandboxError> {
         let mut alloc = self.subnet_allocator.lock().map_err(|e| {
             SandboxError::Internal(format!("lock poisoned: {e}"))
@@ -235,7 +236,7 @@ impl NetworkManager {
     ///
     /// If Docker reports a subnet pool overlap (stale network from a previous
     /// daemon), the allocator advances to the next block and retries.
-    pub fn create_network(&self, session_id: &Uuid) -> Result<NetworkInfo, SandboxError> {
+    pub fn create_network(&self, session_id: &SessionId) -> Result<NetworkInfo, SandboxError> {
         // Check if the session already has a network.
         {
             let nets = self.networks.lock().map_err(|e| {
@@ -267,9 +268,7 @@ impl NetworkManager {
                 alloc.allocate()?
             };
 
-            let session_str = session_id.to_string();
-            let short_id = &session_str[..11.min(session_str.len())];
-            let bridge_name = format!("sb-{short_id}");
+            let bridge_name = format!("sb-{session_id}");
             let docker_network_name = format!("sandbox-net-{session_id}");
             let subnet = format!("{subnet_base}/28");
 
@@ -370,7 +369,7 @@ impl NetworkManager {
     }
 
     /// Delete the Docker bridge network for the given session.
-    pub fn delete_network(&self, session_id: &Uuid) -> Result<(), SandboxError> {
+    pub fn delete_network(&self, session_id: &SessionId) -> Result<(), SandboxError> {
         let (block_idx, info) = {
             let nets = self.networks.lock().map_err(|e| {
                 SandboxError::Internal(format!("lock poisoned: {e}"))
@@ -434,7 +433,7 @@ impl NetworkManager {
     }
 
     /// Retrieve the `NetworkInfo` for a session, if it has a network.
-    pub fn network_info(&self, session_id: &Uuid) -> Result<Option<NetworkInfo>, SandboxError> {
+    pub fn network_info(&self, session_id: &SessionId) -> Result<Option<NetworkInfo>, SandboxError> {
         let nets = self.networks.lock().map_err(|e| {
             SandboxError::Internal(format!("lock poisoned: {e}"))
         })?;
@@ -450,7 +449,7 @@ impl NetworkManager {
     ///
     /// If the Docker network already exists, this is a no-op. If it was
     /// removed (e.g. during `stop`), it is recreated with the same subnet.
-    pub fn ensure_network(&self, session_id: &Uuid) -> Result<NetworkInfo, SandboxError> {
+    pub fn ensure_network(&self, session_id: &SessionId) -> Result<NetworkInfo, SandboxError> {
         let info = {
             let nets = self.networks.lock().map_err(|e| {
                 SandboxError::Internal(format!("lock poisoned: {e}"))
@@ -549,7 +548,7 @@ impl NetworkManager {
     /// allocated so it cannot be reused by another session.
     ///
     /// If the Docker network does not exist, this is a no-op (returns Ok).
-    pub fn remove_docker_network(&self, session_id: &Uuid) -> Result<(), SandboxError> {
+    pub fn remove_docker_network(&self, session_id: &SessionId) -> Result<(), SandboxError> {
         let info = {
             let nets = self.networks.lock().map_err(|e| {
                 SandboxError::Internal(format!("lock poisoned: {e}"))
@@ -790,7 +789,7 @@ mod tests {
         let mgr =
             NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24).unwrap();
 
-        let session_id = Uuid::new_v4();
+        let session_id = SessionId::generate();
 
         // We can't call create_network without Docker, so test the allocator
         // and info construction manually.
@@ -799,9 +798,7 @@ mod tests {
             alloc.allocate().unwrap()
         };
 
-        let session_str = session_id.to_string();
-        let short_id = &session_str[..11];
-        let bridge_name = format!("sb-{short_id}");
+        let bridge_name = format!("sb-{session_id}");
         let docker_network_name = format!("sandbox-net-{session_id}");
 
         let info = NetworkInfo {
@@ -821,21 +818,16 @@ mod tests {
 
     #[test]
     fn test_bridge_name_length() {
-        // Kernel interface names are limited to 15 characters.
-        // "sb-" is 3 chars + 11 chars of UUID = 14 chars max.
-        let session_id = Uuid::new_v4();
-        let session_str = session_id.to_string();
-        let short_id = &session_str[..11];
-        let bridge_name = format!("sb-{short_id}");
+        // Kernel interface names are limited to 15 characters (IFNAMSIZ).
+        // "sb-" is 3 chars + 12 chars of session id = exactly 15.
+        let session_id = SessionId::generate();
+        let bridge_name = format!("sb-{session_id}");
 
-        assert!(
-            bridge_name.len() <= 15,
-            "bridge name '{}' is {} chars (max 15)",
-            bridge_name,
-            bridge_name.len()
+        assert_eq!(
+            bridge_name.len(),
+            15,
+            "bridge name '{bridge_name}' should be exactly 15 chars (IFNAMSIZ)"
         );
-        // Should be exactly 14 chars: "sb-" (3) + 11 chars.
-        assert_eq!(bridge_name.len(), 14);
     }
 
     #[test]
@@ -867,8 +859,8 @@ mod tests {
         let mgr =
             NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24).unwrap();
 
-        let id1 = Uuid::new_v4();
-        let id2 = Uuid::new_v4();
+        let id1 = SessionId::generate();
+        let id2 = SessionId::generate();
 
         let info1 = NetworkInfo {
             bridge_name: "sb-aaaaaaaaaaa".to_string(),
@@ -923,7 +915,7 @@ mod tests {
         let mgr =
             NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24).unwrap();
 
-        let result = mgr.network_info(&Uuid::new_v4()).unwrap();
+        let result = mgr.network_info(&SessionId::generate()).unwrap();
         assert!(result.is_none());
     }
 

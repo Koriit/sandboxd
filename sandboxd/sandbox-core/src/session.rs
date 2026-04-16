@@ -5,6 +5,127 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Docker-style 12-hex-character session identifier.
+///
+/// Generated from the first 12 hex characters of a UUID v4 (simple form).
+/// Provides a compact, copy-pastable ID (like Docker container IDs) while
+/// maintaining uniform distribution and ~48 bits of entropy.
+///
+/// Internal storage is a fixed-size `[u8; 12]` of ASCII hex bytes so the
+/// type is `Copy`, matching the ergonomics of `uuid::Uuid`.
+///
+/// Validation: exactly 12 characters, all lowercase hexadecimal `[0-9a-f]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct SessionId([u8; Self::LEN]);
+
+impl SessionId {
+    /// Length of a session ID in characters.
+    pub const LEN: usize = 12;
+
+    /// Generate a new random session ID.
+    ///
+    /// Uses the first 12 hex characters of a UUID v4 (simple form). The
+    /// uniform distribution of UUID v4 means the truncated prefix is also
+    /// uniformly distributed — but with only 48 bits, callers should catch
+    /// and retry on collision when inserting into a unique index.
+    pub fn generate() -> Self {
+        let full = Uuid::new_v4().simple().to_string();
+        // simple() is always 32 hex chars.
+        debug_assert!(full.len() >= Self::LEN);
+        let mut bytes = [0u8; Self::LEN];
+        bytes.copy_from_slice(&full.as_bytes()[..Self::LEN]);
+        Self(bytes)
+    }
+
+    /// Parse a session ID from a string.
+    ///
+    /// Requires exactly 12 characters of lowercase hexadecimal.
+    pub fn parse(s: &str) -> Result<Self, crate::SandboxError> {
+        if s.len() != Self::LEN {
+            return Err(crate::SandboxError::Internal(format!(
+                "invalid session id: expected {} chars, got {}",
+                Self::LEN,
+                s.len()
+            )));
+        }
+        if !s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            return Err(crate::SandboxError::Internal(format!(
+                "invalid session id: must be lowercase hex [0-9a-f], got {s:?}"
+            )));
+        }
+        let mut bytes = [0u8; Self::LEN];
+        bytes.copy_from_slice(s.as_bytes());
+        Ok(Self(bytes))
+    }
+
+    /// Return the raw string representation.
+    ///
+    /// Since `parse` / `generate` guarantee ASCII hex bytes, the conversion
+    /// from `&[u8; 12]` to `&str` is infallible.
+    pub fn as_str(&self) -> &str {
+        // SAFETY: bytes are validated to be ASCII hex (UTF-8 compatible)
+        // by parse()/generate(), so this is sound.
+        std::str::from_utf8(&self.0).expect("session id bytes are validated ASCII hex")
+    }
+
+    /// Decode the ID into its 6 raw bytes.
+    ///
+    /// Used for deriving deterministic MAC addresses. Since `parse` /
+    /// `generate` guarantee 12 hex chars, this decode is infallible.
+    pub fn as_bytes_array(&self) -> [u8; 6] {
+        let mut out = [0u8; 6];
+        for (i, chunk) in self.0.chunks_exact(2).enumerate() {
+            out[i] = (hex_val(chunk[0]) << 4) | hex_val(chunk[1]);
+        }
+        out
+    }
+}
+
+#[inline]
+fn hex_val(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        // parse() guarantees only [0-9a-f] bytes reach here.
+        _ => unreachable!("non-hex byte in validated SessionId"),
+    }
+}
+
+impl std::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SessionId {
+    type Err = crate::SandboxError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
+impl TryFrom<String> for SessionId {
+    type Error = crate::SandboxError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(&value)
+    }
+}
+
+impl From<SessionId> for String {
+    fn from(id: SessionId) -> Self {
+        id.as_str().to_string()
+    }
+}
+
+impl AsRef<str> for SessionId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
 /// How the workspace directory is made available inside the VM.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -150,7 +271,7 @@ impl Default for SessionConfig {
 /// A sandbox session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
-    pub id: Uuid,
+    pub id: SessionId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub state: SessionState,
@@ -164,7 +285,7 @@ impl Session {
     pub fn new(name: Option<String>) -> Self {
         let now = Utc::now();
         Self {
-            id: Uuid::new_v4(),
+            id: SessionId::generate(),
             name,
             state: SessionState::Creating,
             created_at: now,
@@ -177,7 +298,7 @@ impl Session {
     pub fn with_config(name: Option<String>, config: SessionConfig) -> Self {
         let now = Utc::now();
         Self {
-            id: Uuid::new_v4(),
+            id: SessionId::generate(),
             name,
             state: SessionState::Creating,
             created_at: now,
@@ -446,5 +567,107 @@ mod tests {
         let json = serde_json::to_string(&mode).unwrap();
         let deser: WorkspaceMode = serde_json::from_str(&json).unwrap();
         assert_eq!(deser, mode);
+    }
+
+    // -----------------------------------------------------------------
+    // SessionId tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn session_id_generate_has_correct_format() {
+        for _ in 0..32 {
+            let id = SessionId::generate();
+            let s = id.as_str();
+            assert_eq!(s.len(), SessionId::LEN, "id={s}");
+            assert!(
+                s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "id {s} must be lowercase hex"
+            );
+        }
+    }
+
+    #[test]
+    fn session_id_generate_uniqueness() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1024 {
+            assert!(seen.insert(SessionId::generate()), "collision in 1024 iterations");
+        }
+    }
+
+    #[test]
+    fn session_id_parse_accepts_valid() {
+        let id = SessionId::parse("0123456789ab").unwrap();
+        assert_eq!(id.as_str(), "0123456789ab");
+        let id = SessionId::parse("abcdef012345").unwrap();
+        assert_eq!(id.as_str(), "abcdef012345");
+    }
+
+    #[test]
+    fn session_id_parse_rejects_wrong_length() {
+        assert!(SessionId::parse("").is_err());
+        assert!(SessionId::parse("abc").is_err());
+        assert!(SessionId::parse("0123456789a").is_err()); // 11
+        assert!(SessionId::parse("0123456789abc").is_err()); // 13
+        assert!(SessionId::parse(&"a".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn session_id_parse_rejects_uppercase() {
+        assert!(SessionId::parse("ABCDEF012345").is_err());
+        assert!(SessionId::parse("0123456789AB").is_err());
+    }
+
+    #[test]
+    fn session_id_parse_rejects_non_hex() {
+        assert!(SessionId::parse("0123456789ag").is_err());
+        assert!(SessionId::parse("0123456789 a").is_err());
+        assert!(SessionId::parse("gggggggggggg").is_err());
+        assert!(SessionId::parse("xxxxxxxxxxxx").is_err());
+    }
+
+    #[test]
+    fn session_id_from_str_roundtrip() {
+        use std::str::FromStr;
+        let id = SessionId::generate();
+        let parsed = SessionId::from_str(id.as_str()).unwrap();
+        assert_eq!(id, parsed);
+    }
+
+    #[test]
+    fn session_id_display_matches_as_str() {
+        let id = SessionId::parse("deadbeef0123").unwrap();
+        assert_eq!(format!("{id}"), "deadbeef0123");
+    }
+
+    #[test]
+    fn session_id_as_bytes_array_decodes_correctly() {
+        let id = SessionId::parse("0123456789ab").unwrap();
+        assert_eq!(id.as_bytes_array(), [0x01, 0x23, 0x45, 0x67, 0x89, 0xab]);
+        let id = SessionId::parse("deadbeef0000").unwrap();
+        assert_eq!(id.as_bytes_array(), [0xde, 0xad, 0xbe, 0xef, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn session_id_serialization_is_plain_string() {
+        let id = SessionId::parse("abcdef012345").unwrap();
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, "\"abcdef012345\"");
+        let deser: SessionId = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser, id);
+    }
+
+    #[test]
+    fn session_id_deserialization_rejects_invalid() {
+        let err = serde_json::from_str::<SessionId>("\"BADHEX!!!!!!\"");
+        assert!(err.is_err());
+        let err = serde_json::from_str::<SessionId>("\"short\"");
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn session_id_as_ref_str() {
+        let id = SessionId::parse("0123456789ab").unwrap();
+        let s: &str = id.as_ref();
+        assert_eq!(s, "0123456789ab");
     }
 }

@@ -17,6 +17,9 @@ pub enum SandboxError {
     #[error("invalid state transition: {0}")]
     InvalidState(String),
 
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
 

@@ -5,11 +5,10 @@ use std::time::Duration;
 use ring::digest;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
-use uuid::Uuid;
 
 use crate::error::SandboxError;
 use crate::process::run_with_timeout;
-use crate::session::{SessionConfig, WorkspaceMode};
+use crate::session::{SessionConfig, SessionId, WorkspaceMode};
 
 // ---------------------------------------------------------------------------
 // Timeout constants
@@ -77,8 +76,8 @@ pub enum VmStatus {
 pub struct VmInfo {
     pub name: String,
     pub status: VmStatus,
-    /// Session ID parsed from the `sandbox-{uuid}` naming convention.
-    pub session_id: Option<Uuid>,
+    /// Session ID parsed from the `sandbox-{id}` naming convention.
+    pub session_id: Option<SessionId>,
 }
 
 /// Metadata for the golden base image, persisted as JSON alongside the VM.
@@ -281,7 +280,7 @@ impl LimaManager {
     /// shells out to `limactl create`.
     pub fn create_vm(
         &self,
-        session_id: &Uuid,
+        session_id: &SessionId,
         config: &SessionConfig,
     ) -> Result<(), SandboxError> {
         let template = self.generate_template(session_id, config);
@@ -333,7 +332,7 @@ impl LimaManager {
     /// `limactl create`.
     pub fn create_vm_with_custom_template(
         &self,
-        session_id: &Uuid,
+        session_id: &SessionId,
         template_path: &std::path::Path,
     ) -> Result<(), SandboxError> {
         let session_dir = self.session_dir(session_id);
@@ -389,7 +388,7 @@ impl LimaManager {
     /// This eliminates the need for host-side TAP/veth setup.
     pub fn start_vm(
         &self,
-        session_id: &Uuid,
+        session_id: &SessionId,
         config: &SessionConfig,
         bridge_name: Option<&str>,
         vm_mac: Option<&str>,
@@ -443,7 +442,7 @@ impl LimaManager {
     }
 
     /// Stop a running VM.
-    pub fn stop_vm(&self, session_id: &Uuid) -> Result<(), SandboxError> {
+    pub fn stop_vm(&self, session_id: &SessionId) -> Result<(), SandboxError> {
         let vm_name = vm_name(session_id);
 
         info!(session_id = %session_id, vm = %vm_name, "stopping VM");
@@ -472,7 +471,7 @@ impl LimaManager {
     }
 
     /// Force-delete a VM and its Lima data.
-    pub fn delete_vm(&self, session_id: &Uuid) -> Result<(), SandboxError> {
+    pub fn delete_vm(&self, session_id: &SessionId) -> Result<(), SandboxError> {
         let vm_name = vm_name(session_id);
 
         info!(session_id = %session_id, vm = %vm_name, "deleting VM");
@@ -507,7 +506,7 @@ impl LimaManager {
     /// or `create_vm` + start).
     pub fn install_guest_agent(
         &self,
-        session_id: &Uuid,
+        session_id: &SessionId,
         binary_path: &Path,
     ) -> Result<(), SandboxError> {
         let vm_name = vm_name(session_id);
@@ -675,7 +674,7 @@ impl LimaManager {
     }
 
     /// Query the status of a single VM.
-    pub fn vm_status(&self, session_id: &Uuid) -> Result<VmStatus, SandboxError> {
+    pub fn vm_status(&self, session_id: &SessionId) -> Result<VmStatus, SandboxError> {
         let vms = self.list_vms_raw()?;
         let vm_name = vm_name(session_id);
         for entry in &vms {
@@ -993,7 +992,7 @@ impl LimaManager {
     /// must exist and be stopped (call `build_base_image()` first).
     pub fn clone_vm(
         &self,
-        session_id: Uuid,
+        session_id: SessionId,
         cpus: u32,
         memory_mb: u32,
         disk_gb: u32,
@@ -1169,11 +1168,12 @@ provision:
     /// acts as defense-in-depth.
     pub fn generate_template(
         &self,
-        session_id: &Uuid,
+        session_id: &SessionId,
         config: &SessionConfig,
     ) -> String {
-        let short_id = &session_id.to_string()[..8];
-        let hostname = format!("sandbox-{short_id}");
+        // Hostname includes the full 12-hex session id. At 20 chars it is
+        // well under the POSIX HOST_NAME_MAX of 64.
+        let hostname = format!("sandbox-{session_id}");
 
         // Lima expects memory as a string like "4GiB" and disk as "20GiB".
         let memory_gib = format!("{}GiB", mib_to_gib_string(config.memory_mb));
@@ -1374,10 +1374,8 @@ provision:
         Ok(wrapper_path)
     }
 
-    fn session_dir(&self, session_id: &Uuid) -> PathBuf {
-        self.base_dir
-            .join("sessions")
-            .join(session_id.to_string())
+    fn session_dir(&self, session_id: &SessionId) -> PathBuf {
+        self.base_dir.join("sessions").join(session_id.as_str())
     }
 
     /// Install the guest agent into a VM identified by name.
@@ -1598,14 +1596,14 @@ pub fn guest_agent_path() -> Result<PathBuf, SandboxError> {
 pub const VM_NAME_PREFIX: &str = "sandbox-";
 
 /// Canonical VM name for a session.
-pub fn vm_name(session_id: &Uuid) -> String {
+pub fn vm_name(session_id: &SessionId) -> String {
     format!("{VM_NAME_PREFIX}{session_id}")
 }
 
-/// Try to extract a session UUID from a VM name of the form `sandbox-{uuid}`.
-pub fn parse_session_id_from_name(name: &str) -> Option<Uuid> {
+/// Try to extract a session ID from a VM name of the form `sandbox-{id}`.
+pub fn parse_session_id_from_name(name: &str) -> Option<SessionId> {
     name.strip_prefix(VM_NAME_PREFIX)
-        .and_then(|s| Uuid::parse_str(s).ok())
+        .and_then(|s| SessionId::parse(s).ok())
 }
 
 // ---------------------------------------------------------------------------
@@ -1773,17 +1771,15 @@ mod tests {
 
     #[test]
     fn test_vm_name_format() {
-        let id =
-            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let id = SessionId::parse("550e8400e29b").unwrap();
         let name = vm_name(&id);
-        assert_eq!(name, "sandbox-550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(name, "sandbox-550e8400e29b");
         assert!(name.starts_with(VM_NAME_PREFIX));
     }
 
     #[test]
     fn test_parse_session_id_from_name() {
-        let id =
-            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let id = SessionId::parse("550e8400e29b").unwrap();
         let name = vm_name(&id);
         assert_eq!(parse_session_id_from_name(&name), Some(id));
     }
@@ -1795,9 +1791,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_session_id_bad_uuid() {
+    fn test_parse_session_id_bad_id() {
+        assert_eq!(parse_session_id_from_name("sandbox-not-a-sessionid"), None);
+        // Old-style full UUID is no longer accepted.
         assert_eq!(
-            parse_session_id_from_name("sandbox-not-a-uuid"),
+            parse_session_id_from_name(
+                "sandbox-550e8400-e29b-41d4-a716-446655440000"
+            ),
             None
         );
     }
@@ -1808,7 +1808,7 @@ mod tests {
     fn test_generate_template() {
         let mgr = LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
         let id =
-            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+            SessionId::parse("550e8400e29b").unwrap();
         let config = SessionConfig::default(); // 2 CPU, 4096 MB, 20 GB
 
         let template = mgr.generate_template(&id, &config);
@@ -1847,8 +1847,8 @@ mod tests {
             "template should reference Ubuntu 24.04 image"
         );
         assert!(
-            template.contains("sandbox-550e8400"),
-            "template should set hostname with short ID"
+            template.contains("sandbox-550e8400e29b"),
+            "template should set hostname including the full session id"
         );
         assert!(
             template.contains("name: \"agent\""),
@@ -1886,7 +1886,7 @@ mod tests {
     fn test_generate_template_custom_config() {
         let mgr = LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
         let id =
-            Uuid::parse_str("a1b2c3d4-e5f6-7890-abcd-ef1234567890").unwrap();
+            SessionId::parse("a1b2c3d4e5f6").unwrap();
         let config = SessionConfig {
             cpus: 8,
             memory_mb: 16384,
@@ -1910,15 +1910,15 @@ mod tests {
             "template should reflect custom disk"
         );
         assert!(
-            template.contains("sandbox-a1b2c3d4"),
-            "hostname should use first 8 chars of custom session ID"
+            template.contains("sandbox-a1b2c3d4e5f6"),
+            "hostname should include the full 12-hex session id"
         );
     }
 
     #[test]
     fn test_generate_template_fractional_memory() {
         let mgr = LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
-        let id = Uuid::new_v4();
+        let id = SessionId::generate();
         let config = SessionConfig {
             cpus: 1,
             memory_mb: 1536, // 1.5 GiB
@@ -1938,7 +1938,7 @@ mod tests {
     fn test_generate_template_shared_workspace() {
         let mgr = LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
         let id =
-            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+            SessionId::parse("550e8400e29b").unwrap();
         let config = SessionConfig {
             cpus: 2,
             memory_mb: 4096,
@@ -1981,7 +1981,7 @@ mod tests {
     #[test]
     fn test_generate_template_clone_workspace_no_mount() {
         let mgr = LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
-        let id = Uuid::new_v4();
+        let id = SessionId::generate();
         let config = SessionConfig {
             cpus: 1,
             memory_mb: 1024,
@@ -2112,7 +2112,7 @@ mod tests {
     #[test]
     fn test_generate_template_hardened_video_audio() {
         let mgr = LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
-        let id = Uuid::new_v4();
+        let id = SessionId::generate();
         let config = SessionConfig {
             cpus: 2,
             memory_mb: 4096,
@@ -2136,7 +2136,7 @@ mod tests {
     #[test]
     fn test_generate_template_not_hardened_no_video_audio() {
         let mgr = LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
-        let id = Uuid::new_v4();
+        let id = SessionId::generate();
         let config = SessionConfig {
             cpus: 2,
             memory_mb: 4096,
@@ -2200,8 +2200,8 @@ mod tests {
     #[test]
     fn test_parse_vm_list() {
         // Simulated NDJSON output from `limactl list --json`
-        let output = r#"{"name":"sandbox-550e8400-e29b-41d4-a716-446655440000","status":"Running","arch":"x86_64","cpus":2,"memory":4294967296,"disk":21474836480,"dir":"/home/user/.lima/sandbox-550e8400-e29b-41d4-a716-446655440000"}
-{"name":"sandbox-a1b2c3d4-e5f6-7890-abcd-ef1234567890","status":"Stopped","arch":"x86_64","cpus":4,"memory":8589934592,"disk":107374182400,"dir":"/home/user/.lima/sandbox-a1b2c3d4-e5f6-7890-abcd-ef1234567890"}
+        let output = r#"{"name":"sandbox-550e8400e29b","status":"Running","arch":"x86_64","cpus":2,"memory":4294967296,"disk":21474836480,"dir":"/home/user/.lima/sandbox-550e8400e29b"}
+{"name":"sandbox-a1b2c3d4e5f6","status":"Stopped","arch":"x86_64","cpus":4,"memory":8589934592,"disk":107374182400,"dir":"/home/user/.lima/sandbox-a1b2c3d4e5f6"}
 {"name":"default","status":"Running","arch":"x86_64","cpus":4,"memory":4294967296,"disk":107374182400,"dir":"/home/user/.lima/default"}
 "#;
 
@@ -2229,30 +2229,18 @@ mod tests {
 
         assert_eq!(vms.len(), 2, "should filter out non-sandbox VMs");
 
-        assert_eq!(
-            vms[0].name,
-            "sandbox-550e8400-e29b-41d4-a716-446655440000"
-        );
+        assert_eq!(vms[0].name, "sandbox-550e8400e29b");
         assert_eq!(vms[0].status, VmStatus::Running);
         assert_eq!(
             vms[0].session_id,
-            Some(
-                Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
-                    .unwrap()
-            )
+            Some(SessionId::parse("550e8400e29b").unwrap())
         );
 
-        assert_eq!(
-            vms[1].name,
-            "sandbox-a1b2c3d4-e5f6-7890-abcd-ef1234567890"
-        );
+        assert_eq!(vms[1].name, "sandbox-a1b2c3d4e5f6");
         assert_eq!(vms[1].status, VmStatus::Stopped);
         assert_eq!(
             vms[1].session_id,
-            Some(
-                Uuid::parse_str("a1b2c3d4-e5f6-7890-abcd-ef1234567890")
-                    .unwrap()
-            )
+            Some(SessionId::parse("a1b2c3d4e5f6").unwrap())
         );
     }
 
@@ -2315,7 +2303,7 @@ mod tests {
     fn test_install_guest_agent_missing_binary() {
         let dir = tempfile::TempDir::new().expect("create temp dir");
         let mgr = LimaManager::with_limactl_path(dir.path().to_path_buf(), PathBuf::from("limactl"));
-        let session_id = Uuid::new_v4();
+        let session_id = SessionId::generate();
 
         let result = mgr.install_guest_agent(
             &session_id,

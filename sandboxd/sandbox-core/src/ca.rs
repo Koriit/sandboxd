@@ -19,9 +19,9 @@ use rcgen::{
 };
 use ring::digest;
 use tracing::{debug, info, warn};
-use uuid::Uuid;
 
 use crate::error::SandboxError;
+use crate::session::SessionId;
 
 // ---------------------------------------------------------------------------
 // CaManager
@@ -46,10 +46,9 @@ impl CaManager {
     /// - `mitmproxy-ca-cert.pem` — cert only (mitmproxy alias)
     pub fn generate_session_ca(
         base_dir: &Path,
-        session_id: &Uuid,
+        session_id: &SessionId,
     ) -> Result<PathBuf, SandboxError> {
         let ca_dir = Self::ca_dir(base_dir, session_id);
-        let short_id = &session_id.to_string()[..8];
 
         info!(
             session_id = %session_id,
@@ -85,7 +84,7 @@ impl CaManager {
         let mut params = CertificateParams::default();
         params
             .distinguished_name
-            .push(DnType::CommonName, format!("Sandbox CA {short_id}"));
+            .push(DnType::CommonName, format!("Sandbox CA {session_id}"));
         params
             .distinguished_name
             .push(DnType::OrganizationName, "claude-sandbox");
@@ -167,7 +166,7 @@ impl CaManager {
     /// not exist.
     pub fn remove_session_ca(
         base_dir: &Path,
-        session_id: &Uuid,
+        session_id: &SessionId,
     ) -> Result<(), SandboxError> {
         let ca_dir = Self::ca_dir(base_dir, session_id);
 
@@ -202,10 +201,10 @@ impl CaManager {
     }
 
     /// Get the CA directory path for a session.
-    pub fn ca_dir(base_dir: &Path, session_id: &Uuid) -> PathBuf {
+    pub fn ca_dir(base_dir: &Path, session_id: &SessionId) -> PathBuf {
         base_dir
             .join("sessions")
-            .join(session_id.to_string())
+            .join(session_id.as_str())
             .join("ca")
     }
 }
@@ -279,15 +278,12 @@ mod tests {
     #[test]
     fn test_ca_dir_path() {
         let base = Path::new("/tmp/sandboxd");
-        let id =
-            Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let id = SessionId::parse("550e8400e29b").unwrap();
 
         let dir = CaManager::ca_dir(base, &id);
         assert_eq!(
             dir,
-            PathBuf::from(
-                "/tmp/sandboxd/sessions/550e8400-e29b-41d4-a716-446655440000/ca"
-            )
+            PathBuf::from("/tmp/sandboxd/sessions/550e8400e29b/ca")
         );
     }
 
@@ -295,7 +291,7 @@ mod tests {
     fn test_generate_session_ca_creates_files() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path();
-        let id = Uuid::new_v4();
+        let id = SessionId::generate();
 
         let ca_dir =
             CaManager::generate_session_ca(base, &id).unwrap();
@@ -327,7 +323,7 @@ mod tests {
     fn test_generate_session_ca_cert_is_valid_pem() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path();
-        let id = Uuid::new_v4();
+        let id = SessionId::generate();
 
         let ca_dir =
             CaManager::generate_session_ca(base, &id).unwrap();
@@ -360,7 +356,7 @@ mod tests {
     fn test_mitmproxy_ca_pem_is_key_plus_cert() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path();
-        let id = Uuid::new_v4();
+        let id = SessionId::generate();
 
         let ca_dir =
             CaManager::generate_session_ca(base, &id).unwrap();
@@ -381,7 +377,7 @@ mod tests {
     fn test_mitmproxy_ca_cert_pem_matches_cert() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path();
-        let id = Uuid::new_v4();
+        let id = SessionId::generate();
 
         let ca_dir =
             CaManager::generate_session_ca(base, &id).unwrap();
@@ -399,8 +395,8 @@ mod tests {
     fn test_different_sessions_get_different_certs() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path();
-        let id1 = Uuid::new_v4();
-        let id2 = Uuid::new_v4();
+        let id1 = SessionId::generate();
+        let id2 = SessionId::generate();
 
         let dir1 =
             CaManager::generate_session_ca(base, &id1).unwrap();
@@ -422,7 +418,7 @@ mod tests {
     fn test_remove_session_ca() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path();
-        let id = Uuid::new_v4();
+        let id = SessionId::generate();
 
         let ca_dir =
             CaManager::generate_session_ca(base, &id).unwrap();
@@ -436,7 +432,7 @@ mod tests {
     fn test_remove_session_ca_nonexistent_is_ok() {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path();
-        let id = Uuid::new_v4();
+        let id = SessionId::generate();
 
         // Removing a non-existent CA dir should succeed.
         CaManager::remove_session_ca(base, &id).unwrap();
@@ -447,7 +443,7 @@ mod tests {
         // Generating twice should overwrite without error.
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path();
-        let id = Uuid::new_v4();
+        let id = SessionId::generate();
 
         let dir1 =
             CaManager::generate_session_ca(base, &id).unwrap();

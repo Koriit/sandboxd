@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::session::{Session, SessionConfig, SessionState};
+use crate::session::{Session, SessionConfig, SessionId, SessionState};
 
 // ---------------------------------------------------------------------------
 // Health types
@@ -9,7 +9,7 @@ use crate::session::{Session, SessionConfig, SessionState};
 /// Detailed health status for a sandbox session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionHealth {
-    pub session_id: uuid::Uuid,
+    pub session_id: SessionId,
     pub vm_status: String,
     pub guest_agent: String,
     pub gateway: GatewayHealth,
@@ -151,7 +151,7 @@ pub struct ExecResponse {
 /// Enriched session response with optional guest agent health status.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionResponse {
-    pub id: uuid::Uuid,
+    pub id: SessionId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub state: SessionState,
@@ -314,7 +314,7 @@ mod tests {
     #[test]
     fn session_health_serialization() {
         let health = SessionHealth {
-            session_id: uuid::Uuid::nil(),
+            session_id: SessionId::parse("000000000000").unwrap(),
             vm_status: "running".into(),
             guest_agent: "healthy".into(),
             gateway: GatewayHealth {
@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn session_health_unhealthy_serialization() {
         let health = SessionHealth {
-            session_id: uuid::Uuid::nil(),
+            session_id: SessionId::parse("000000000000").unwrap(),
             vm_status: "stopped".into(),
             guest_agent: "unknown".into(),
             gateway: GatewayHealth {

@@ -19,10 +19,10 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
 use tracing::debug;
-use uuid::Uuid;
 
 use crate::error::SandboxError;
 use crate::lima::LimaManager;
+use crate::session::SessionId;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -245,7 +245,7 @@ impl GuestConnector {
     /// that pipe.
     pub async fn send_request(
         &self,
-        session_id: &Uuid,
+        session_id: &SessionId,
         request: GuestRequest,
     ) -> Result<GuestResponse, SandboxError> {
         let vm_name = crate::lima::vm_name(session_id);
@@ -332,7 +332,7 @@ impl GuestConnector {
     }
 
     /// Ping the guest agent. Returns `true` if it responds with `Pong`.
-    pub async fn ping(&self, session_id: &Uuid) -> Result<bool, SandboxError> {
+    pub async fn ping(&self, session_id: &SessionId) -> Result<bool, SandboxError> {
         match self.send_request(session_id, GuestRequest::Ping).await {
             Ok(GuestResponse::Pong) => Ok(true),
             Ok(other) => {
@@ -346,7 +346,7 @@ impl GuestConnector {
     /// Execute a command inside the guest VM.
     pub async fn exec(
         &self,
-        session_id: &Uuid,
+        session_id: &SessionId,
         command: &str,
         args: &[&str],
     ) -> Result<GuestResponse, SandboxError> {

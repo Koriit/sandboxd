@@ -7,14 +7,14 @@ use std::net::Ipv4Addr;
 use std::process::Command;
 
 use sandbox_core::network::NetworkManager;
-use uuid::Uuid;
+use sandbox_core::session::SessionId;
 
 #[test]
 fn test_docker_create_and_delete_network() {
     // Use 10.209.1.0/24 to avoid collisions with the labels test.
     let mgr =
         NetworkManager::new(Ipv4Addr::new(10, 209, 1, 0), 24).unwrap();
-    let session_id = Uuid::new_v4();
+    let session_id = SessionId::generate();
 
     // Create network.
     let info = mgr.create_network(&session_id).unwrap();
@@ -56,7 +56,7 @@ fn test_docker_network_labels() {
     // Use 10.209.2.0/24 to avoid collisions with the create/delete test.
     let mgr =
         NetworkManager::new(Ipv4Addr::new(10, 209, 2, 0), 24).unwrap();
-    let session_id = Uuid::new_v4();
+    let session_id = SessionId::generate();
 
     let info = mgr.create_network(&session_id).unwrap();
 

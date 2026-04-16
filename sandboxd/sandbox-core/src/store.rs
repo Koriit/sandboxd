@@ -5,15 +5,28 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
-use uuid::Uuid;
 
 use crate::error::SandboxError;
-use crate::session::{Session, SessionConfig, SessionState};
+use crate::session::{Session, SessionConfig, SessionId, SessionState};
 
 mod embedded {
     use refinery::embed_migrations;
     embed_migrations!("migrations");
 }
+
+/// Outcome of a session ID prefix lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolveOutcome {
+    /// No session matches the given prefix.
+    NotFound,
+    /// Exactly one session matches; returns the full ID.
+    Found(SessionId),
+    /// Multiple sessions match; returns all matches (at least 2).
+    Ambiguous(Vec<SessionId>),
+}
+
+/// Maximum number of collision retries when inserting a session.
+const INSERT_COLLISION_RETRIES: u32 = 3;
 
 /// Persistent store for sandbox sessions backed by SQLite.
 ///
@@ -54,49 +67,85 @@ impl SessionStore {
     }
 
     /// Directory for per-session data: `{base_dir}/sessions/{id}/`.
-    fn session_dir(&self, id: &Uuid) -> PathBuf {
-        self.base_dir.join("sessions").join(id.to_string())
+    fn session_dir(&self, id: &SessionId) -> PathBuf {
+        self.base_dir.join("sessions").join(id.as_str())
     }
 
     /// Create a new session, insert it into the database, and create its
     /// per-session directory.
+    ///
+    /// If the generated 12-hex ID collides with an existing session (rare but
+    /// possible with 48 bits of entropy), the session is regenerated and
+    /// re-inserted up to [`INSERT_COLLISION_RETRIES`] times before failing.
     pub fn create_session(
         &self,
         config: SessionConfig,
         name: Option<String>,
     ) -> Result<Session, SandboxError> {
-        let session = Session::with_config(name, config);
-
-        let config_json =
-            serde_json::to_string(&session.config).map_err(|e| {
-                SandboxError::Internal(format!("failed to serialize config: {e}"))
-            })?;
-
-        let conn = self.conn.lock().map_err(|e| {
-            SandboxError::Internal(format!("lock poisoned: {e}"))
+        let config_json = serde_json::to_string(&config).map_err(|e| {
+            SandboxError::Internal(format!("failed to serialize config: {e}"))
         })?;
 
-        conn.execute(
+        let mut attempt = 0u32;
+        loop {
+            let session = Session::with_config(name.clone(), config.clone());
+            match self.try_insert_session(&session, &config_json) {
+                Ok(()) => {
+                    fs::create_dir_all(self.session_dir(&session.id))?;
+                    return Ok(session);
+                }
+                Err(InsertError::Collision) if attempt < INSERT_COLLISION_RETRIES => {
+                    attempt += 1;
+                    continue;
+                }
+                Err(InsertError::Collision) => {
+                    return Err(SandboxError::Internal(format!(
+                        "session id collision after {INSERT_COLLISION_RETRIES} retries"
+                    )));
+                }
+                Err(InsertError::Other(e)) => return Err(e),
+            }
+        }
+    }
+
+    /// Insert a session row. Returns `InsertError::Collision` if the id
+    /// violates the PRIMARY KEY uniqueness constraint; all other DB errors
+    /// surface as `InsertError::Other`.
+    fn try_insert_session(
+        &self,
+        session: &Session,
+        config_json: &str,
+    ) -> Result<(), InsertError> {
+        let conn = self.conn.lock().map_err(|e| {
+            InsertError::Other(SandboxError::Internal(format!("lock poisoned: {e}")))
+        })?;
+
+        let res = conn.execute(
             "INSERT INTO sessions (id, name, state, config, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
-                session.id.to_string(),
+                session.id.as_str(),
                 session.name,
                 session.state.to_string(),
                 config_json,
                 session.created_at.to_rfc3339(),
                 session.updated_at.to_rfc3339(),
             ],
-        )?;
+        );
 
-        // Create the per-session directory.
-        fs::create_dir_all(self.session_dir(&session.id))?;
-
-        Ok(session)
+        match res {
+            Ok(_) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                Err(InsertError::Collision)
+            }
+            Err(e) => Err(InsertError::Other(SandboxError::from(e))),
+        }
     }
 
     /// Retrieve a session by ID, or `None` if it does not exist.
-    pub fn get_session(&self, id: &Uuid) -> Result<Option<Session>, SandboxError> {
+    pub fn get_session(&self, id: &SessionId) -> Result<Option<Session>, SandboxError> {
         let conn = self.conn.lock().map_err(|e| {
             SandboxError::Internal(format!("lock poisoned: {e}"))
         })?;
@@ -106,7 +155,7 @@ impl SessionStore {
              FROM sessions WHERE id = ?1",
         )?;
 
-        let mut rows = stmt.query(params![id.to_string()])?;
+        let mut rows = stmt.query(params![id.as_str()])?;
         match rows.next()? {
             Some(row) => Ok(Some(row_to_session(row)?)),
             None => Ok(None),
@@ -151,7 +200,7 @@ impl SessionStore {
     /// regardless of the current value, use [`update_state_forced`] instead.
     pub fn update_state(
         &self,
-        id: &Uuid,
+        id: &SessionId,
         new_state: SessionState,
     ) -> Result<(), SandboxError> {
         let conn = self.conn.lock().map_err(|e| {
@@ -163,7 +212,7 @@ impl SessionStore {
             let mut stmt = conn.prepare(
                 "SELECT state FROM sessions WHERE id = ?1",
             )?;
-            let mut rows = stmt.query(params![id.to_string()])?;
+            let mut rows = stmt.query(params![id.as_str()])?;
             match rows.next()? {
                 Some(row) => {
                     let state_str: String = row.get(0)?;
@@ -183,7 +232,7 @@ impl SessionStore {
         let now = Utc::now();
         conn.execute(
             "UPDATE sessions SET state = ?1, updated_at = ?2 WHERE id = ?3",
-            params![new_state.to_string(), now.to_rfc3339(), id.to_string()],
+            params![new_state.to_string(), now.to_rfc3339(), id.as_str()],
         )?;
 
         Ok(())
@@ -197,7 +246,7 @@ impl SessionStore {
     /// use [`update_state`] which enforces the state machine.
     pub fn update_state_forced(
         &self,
-        id: &Uuid,
+        id: &SessionId,
         state: SessionState,
     ) -> Result<(), SandboxError> {
         let now = Utc::now();
@@ -208,7 +257,7 @@ impl SessionStore {
 
         let rows_affected = conn.execute(
             "UPDATE sessions SET state = ?1, updated_at = ?2 WHERE id = ?3",
-            params![state.to_string(), now.to_rfc3339(), id.to_string()],
+            params![state.to_string(), now.to_rfc3339(), id.as_str()],
         )?;
 
         if rows_affected == 0 {
@@ -218,40 +267,140 @@ impl SessionStore {
         Ok(())
     }
 
-    /// Look up a session by name or UUID string.
+    /// Look up a session by exact name, exact session ID, or unique ID prefix.
     ///
-    /// Tries to parse `query` as a UUID first; if that fails, searches by name.
-    /// Returns `None` if no session matches.
+    /// Lookup order:
+    /// 1. If `query` is a full 12-char session ID, try exact ID lookup.
+    /// 2. Otherwise, try exact name lookup.
+    /// 3. If still not found and `query` looks like a hex prefix (1..=12
+    ///    lowercase hex chars), try [`resolve_id_prefix`]. Returns the matching
+    ///    session if exactly one ID has this prefix.
+    ///
+    /// Returns `None` if no session matches. Returns
+    /// [`SandboxError::InvalidArgument`] if the prefix matches multiple
+    /// sessions (ambiguous).
     pub fn get_session_by_name_or_id(
         &self,
         query: &str,
     ) -> Result<Option<Session>, SandboxError> {
-        // Try UUID first.
-        if let Ok(uuid) = Uuid::parse_str(query) {
-            return self.get_session(&uuid);
+        // Try exact SessionId first.
+        if let Ok(id) = SessionId::parse(query) {
+            if let Some(session) = self.get_session(&id)? {
+                return Ok(Some(session));
+            }
         }
 
-        // Fall back to name lookup.
+        // Try exact name lookup.
+        {
+            let conn = self.conn.lock().map_err(|e| {
+                SandboxError::Internal(format!("lock poisoned: {e}"))
+            })?;
+
+            let mut stmt = conn.prepare(
+                "SELECT id, name, state, config, created_at, updated_at
+                 FROM sessions WHERE name = ?1",
+            )?;
+
+            let mut rows = stmt.query(params![query])?;
+            if let Some(row) = rows.next()? {
+                return Ok(Some(row_to_session(row)?));
+            }
+        }
+
+        // Fall back to ID prefix resolution.
+        match self.resolve_id_prefix(query)? {
+            ResolveOutcome::Found(id) => self.get_session(&id),
+            ResolveOutcome::Ambiguous(ids) => {
+                let list = ids
+                    .iter()
+                    .map(|id| id.as_str().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(SandboxError::InvalidArgument(format!(
+                    "session id prefix {query:?} is ambiguous; matches: {list}"
+                )))
+            }
+            ResolveOutcome::NotFound => Ok(None),
+        }
+    }
+
+    /// Resolve a session ID prefix to a full ID.
+    ///
+    /// The prefix must be between 1 and 12 lowercase hex characters. Returns:
+    /// - [`ResolveOutcome::Found`] if exactly one session ID starts with the
+    ///   prefix.
+    /// - [`ResolveOutcome::NotFound`] if no session matches.
+    /// - [`ResolveOutcome::Ambiguous`] if multiple sessions match, listing all
+    ///   matching IDs.
+    ///
+    /// An empty prefix returns `NotFound` (it would otherwise match every
+    /// session and the ambiguity list would be unbounded). A prefix longer
+    /// than 12 chars or containing non-hex characters returns `NotFound`.
+    pub fn resolve_id_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<ResolveOutcome, SandboxError> {
+        if prefix.is_empty() || prefix.len() > SessionId::LEN {
+            return Ok(ResolveOutcome::NotFound);
+        }
+        if !prefix.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            return Ok(ResolveOutcome::NotFound);
+        }
+
         let conn = self.conn.lock().map_err(|e| {
             SandboxError::Internal(format!("lock poisoned: {e}"))
         })?;
 
+        // `LIMIT 2` is sufficient — we only need to distinguish 0 / 1 / 2+
+        // matches. When ambiguous we fall through to a second query that
+        // returns all matches for a helpful error message.
         let mut stmt = conn.prepare(
-            "SELECT id, name, state, config, created_at, updated_at
-             FROM sessions WHERE name = ?1",
+            "SELECT id FROM sessions WHERE id LIKE ?1 || '%' LIMIT 2",
         )?;
+        let rows = stmt.query_map(params![prefix], |row| {
+            let s: String = row.get(0)?;
+            Ok(s)
+        })?;
 
-        let mut rows = stmt.query(params![query])?;
-        match rows.next()? {
-            Some(row) => Ok(Some(row_to_session(row)?)),
-            None => Ok(None),
+        let mut ids: Vec<String> = Vec::new();
+        for row in rows {
+            ids.push(row?);
+        }
+
+        match ids.len() {
+            0 => Ok(ResolveOutcome::NotFound),
+            1 => {
+                let id = SessionId::parse(&ids[0]).map_err(|e| {
+                    SandboxError::Internal(format!("invalid id in database: {e}"))
+                })?;
+                Ok(ResolveOutcome::Found(id))
+            }
+            _ => {
+                // Fetch all matches for a helpful error message.
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM sessions WHERE id LIKE ?1 || '%' ORDER BY id",
+                )?;
+                let rows = stmt.query_map(params![prefix], |row| {
+                    let s: String = row.get(0)?;
+                    Ok(s)
+                })?;
+                let mut all = Vec::new();
+                for row in rows {
+                    let s = row?;
+                    let id = SessionId::parse(&s).map_err(|e| {
+                        SandboxError::Internal(format!("invalid id in database: {e}"))
+                    })?;
+                    all.push(id);
+                }
+                Ok(ResolveOutcome::Ambiguous(all))
+            }
         }
     }
 
     /// Store network info for a session (serialized as JSON).
     pub fn set_network_info(
         &self,
-        id: &Uuid,
+        id: &SessionId,
         info: &crate::network::NetworkInfo,
     ) -> Result<(), SandboxError> {
         let json = serde_json::to_string(info).map_err(|e| {
@@ -264,7 +413,7 @@ impl SessionStore {
 
         let rows_affected = conn.execute(
             "UPDATE sessions SET network_info = ?1 WHERE id = ?2",
-            params![json, id.to_string()],
+            params![json, id.as_str()],
         )?;
 
         if rows_affected == 0 {
@@ -277,7 +426,7 @@ impl SessionStore {
     /// Retrieve network info for a session, if it has been set.
     pub fn get_network_info(
         &self,
-        id: &Uuid,
+        id: &SessionId,
     ) -> Result<Option<crate::network::NetworkInfo>, SandboxError> {
         let conn = self.conn.lock().map_err(|e| {
             SandboxError::Internal(format!("lock poisoned: {e}"))
@@ -287,7 +436,7 @@ impl SessionStore {
             "SELECT network_info FROM sessions WHERE id = ?1",
         )?;
 
-        let mut rows = stmt.query(params![id.to_string()])?;
+        let mut rows = stmt.query(params![id.as_str()])?;
         match rows.next()? {
             Some(row) => {
                 let json: Option<String> = row.get(0)?;
@@ -311,7 +460,7 @@ impl SessionStore {
     /// Load all sessions that have network info, for rebuilding allocator state.
     pub fn list_sessions_with_network_info(
         &self,
-    ) -> Result<Vec<(Uuid, crate::network::NetworkInfo)>, SandboxError> {
+    ) -> Result<Vec<(SessionId, crate::network::NetworkInfo)>, SandboxError> {
         let conn = self.conn.lock().map_err(|e| {
             SandboxError::Internal(format!("lock poisoned: {e}"))
         })?;
@@ -329,8 +478,8 @@ impl SessionStore {
         let mut result = Vec::new();
         for row in rows {
             let (id_str, json) = row?;
-            let id = Uuid::parse_str(&id_str).map_err(|e| {
-                SandboxError::Internal(format!("invalid UUID in database: {e}"))
+            let id = SessionId::parse(&id_str).map_err(|e| {
+                SandboxError::Internal(format!("invalid session id in database: {e}"))
             })?;
             let info: crate::network::NetworkInfo =
                 serde_json::from_str(&json).map_err(|e| {
@@ -345,14 +494,14 @@ impl SessionStore {
     }
 
     /// Delete a session from the database and remove its per-session directory.
-    pub fn delete_session(&self, id: &Uuid) -> Result<(), SandboxError> {
+    pub fn delete_session(&self, id: &SessionId) -> Result<(), SandboxError> {
         let conn = self.conn.lock().map_err(|e| {
             SandboxError::Internal(format!("lock poisoned: {e}"))
         })?;
 
         let rows_affected = conn.execute(
             "DELETE FROM sessions WHERE id = ?1",
-            params![id.to_string()],
+            params![id.as_str()],
         )?;
 
         if rows_affected == 0 {
@@ -369,6 +518,14 @@ impl SessionStore {
     }
 }
 
+/// Internal error type for the insert retry loop.
+enum InsertError {
+    /// Primary-key uniqueness violation — the id clashed with an existing row.
+    Collision,
+    /// Any other DB or serialization failure.
+    Other(SandboxError),
+}
+
 /// Parse a row from the sessions table into a `Session`.
 fn row_to_session(row: &rusqlite::Row<'_>) -> Result<Session, SandboxError> {
     let id_str: String = row.get(0)?;
@@ -378,8 +535,8 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> Result<Session, SandboxError> {
     let created_at_str: String = row.get(4)?;
     let updated_at_str: String = row.get(5)?;
 
-    let id = Uuid::parse_str(&id_str).map_err(|e| {
-        SandboxError::Internal(format!("invalid UUID in database: {e}"))
+    let id = SessionId::parse(&id_str).map_err(|e| {
+        SandboxError::Internal(format!("invalid session id in database: {e}"))
     })?;
 
     let state = SessionState::from_str(&state_str)?;
@@ -426,6 +583,11 @@ mod tests {
         (store, dir)
     }
 
+    /// Return a `SessionId` that is guaranteed not to exist in the store.
+    fn missing_id() -> SessionId {
+        SessionId::parse("ffffffffffff").unwrap()
+    }
+
     #[test]
     fn test_create_and_get_session() {
         let (store, _dir) = test_store();
@@ -437,6 +599,7 @@ mod tests {
 
         assert_eq!(session.state, SessionState::Creating);
         assert!(session.name.is_none());
+        assert_eq!(session.id.as_str().len(), SessionId::LEN);
 
         let fetched = store
             .get_session(&session.id)
@@ -487,7 +650,7 @@ mod tests {
         let list = store.list_sessions().expect("list failed");
         assert_eq!(list.len(), 3);
 
-        let ids: Vec<Uuid> = list.iter().map(|s| s.id).collect();
+        let ids: Vec<SessionId> = list.iter().map(|s| s.id).collect();
         assert!(ids.contains(&s1.id));
         assert!(ids.contains(&s2.id));
         assert!(ids.contains(&s3.id));
@@ -555,7 +718,7 @@ mod tests {
     fn test_get_nonexistent() {
         let (store, _dir) = test_store();
 
-        let result = store.get_session(&Uuid::new_v4()).expect("get");
+        let result = store.get_session(&missing_id()).expect("get");
         assert!(result.is_none());
     }
 
@@ -614,7 +777,7 @@ mod tests {
             }));
         }
 
-        let ids: Vec<Uuid> = handles
+        let ids: Vec<SessionId> = handles
             .into_iter()
             .map(|h| h.join().expect("thread panicked"))
             .collect();
@@ -655,7 +818,7 @@ mod tests {
     fn test_update_state_nonexistent() {
         let (store, _dir) = test_store();
 
-        let result = store.update_state(&Uuid::new_v4(), SessionState::Running);
+        let result = store.update_state(&missing_id(), SessionState::Running);
         assert!(matches!(result, Err(SandboxError::SessionNotFound(_))));
     }
 
@@ -663,7 +826,7 @@ mod tests {
     fn test_delete_nonexistent() {
         let (store, _dir) = test_store();
 
-        let result = store.delete_session(&Uuid::new_v4());
+        let result = store.delete_session(&missing_id());
         assert!(matches!(result, Err(SandboxError::SessionNotFound(_))));
     }
 
@@ -704,13 +867,13 @@ mod tests {
         let expected = dir
             .path()
             .join("sessions")
-            .join(session.id.to_string());
+            .join(session.id.as_str());
         assert!(expected.exists());
         assert!(expected.is_dir());
     }
 
     #[test]
-    fn test_get_by_name_or_id_with_uuid() {
+    fn test_get_by_name_or_id_with_id() {
         let (store, _dir) = test_store();
 
         let session = store
@@ -718,8 +881,8 @@ mod tests {
             .expect("create");
 
         let fetched = store
-            .get_session_by_name_or_id(&session.id.to_string())
-            .expect("get by uuid")
+            .get_session_by_name_or_id(session.id.as_str())
+            .expect("get by id")
             .expect("should exist");
 
         assert_eq!(fetched.id, session.id);
@@ -754,14 +917,147 @@ mod tests {
     }
 
     #[test]
-    fn test_get_by_name_or_id_with_unknown_uuid() {
+    fn test_get_by_name_or_id_with_unknown_id() {
         let (store, _dir) = test_store();
 
         let result = store
-            .get_session_by_name_or_id(&Uuid::new_v4().to_string())
+            .get_session_by_name_or_id(missing_id().as_str())
             .expect("should not error");
 
         assert!(result.is_none());
+    }
+
+    // -- Prefix resolution -------------------------------------------------
+
+    #[test]
+    fn test_resolve_id_prefix_found() {
+        let (store, _dir) = test_store();
+
+        let session = store
+            .create_session(SessionConfig::default(), None)
+            .expect("create");
+
+        // First 6 chars should be enough to uniquely identify it in a store
+        // with only one session.
+        let prefix = &session.id.as_str()[..6];
+        let outcome = store
+            .resolve_id_prefix(prefix)
+            .expect("resolve should not error");
+        assert_eq!(outcome, ResolveOutcome::Found(session.id));
+    }
+
+    #[test]
+    fn test_resolve_id_prefix_full_id_found() {
+        let (store, _dir) = test_store();
+
+        let session = store
+            .create_session(SessionConfig::default(), None)
+            .expect("create");
+
+        let outcome = store
+            .resolve_id_prefix(session.id.as_str())
+            .expect("resolve full id");
+        assert_eq!(outcome, ResolveOutcome::Found(session.id));
+    }
+
+    #[test]
+    fn test_resolve_id_prefix_not_found() {
+        let (store, _dir) = test_store();
+        let _session = store
+            .create_session(SessionConfig::default(), None)
+            .expect("create");
+
+        // Use a prefix unlikely to collide: the all-f prefix is extremely
+        // rare in UUID v4 output.
+        let outcome = store
+            .resolve_id_prefix("fffffff")
+            .expect("resolve should not error");
+        // If by astronomical chance the session starts with fffffff, rerun.
+        match outcome {
+            ResolveOutcome::NotFound => {}
+            other => panic!("unexpected outcome for unlikely prefix: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_id_prefix_ambiguous() {
+        // We cannot easily force a real collision with random ids, so insert
+        // two rows manually with shared prefix via direct DB access.
+        let (store, _dir) = test_store();
+
+        {
+            let conn = store.conn.lock().unwrap();
+            let base_config = serde_json::to_string(&SessionConfig::default()).unwrap();
+            let now = Utc::now().to_rfc3339();
+            for suffix in ["aa", "bb"] {
+                let id = format!("cafebabe00{suffix}");
+                conn.execute(
+                    "INSERT INTO sessions (id, name, state, config, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        id,
+                        Option::<String>::None,
+                        "Creating",
+                        base_config,
+                        now,
+                        now,
+                    ],
+                )
+                .unwrap();
+            }
+        }
+
+        let outcome = store
+            .resolve_id_prefix("cafebabe")
+            .expect("resolve ambiguous");
+        match outcome {
+            ResolveOutcome::Ambiguous(ids) => {
+                assert_eq!(ids.len(), 2);
+                assert!(ids.iter().any(|i| i.as_str() == "cafebabe00aa"));
+                assert!(ids.iter().any(|i| i.as_str() == "cafebabe00bb"));
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+
+        // A more specific prefix resolves uniquely.
+        let outcome = store
+            .resolve_id_prefix("cafebabe00a")
+            .expect("resolve specific");
+        match outcome {
+            ResolveOutcome::Found(id) => assert_eq!(id.as_str(), "cafebabe00aa"),
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_id_prefix_empty_or_invalid() {
+        let (store, _dir) = test_store();
+        let _ = store
+            .create_session(SessionConfig::default(), None)
+            .expect("create");
+
+        // Empty prefix: NotFound.
+        assert_eq!(
+            store.resolve_id_prefix("").expect("empty"),
+            ResolveOutcome::NotFound
+        );
+        // Non-hex chars: NotFound.
+        assert_eq!(
+            store.resolve_id_prefix("xyz").expect("non-hex"),
+            ResolveOutcome::NotFound
+        );
+        // Uppercase: NotFound (ids are stored lowercase).
+        assert_eq!(
+            store.resolve_id_prefix("ABC").expect("upper"),
+            ResolveOutcome::NotFound
+        );
+        // Too long: NotFound.
+        assert_eq!(
+            store
+                .resolve_id_prefix(&"a".repeat(SessionId::LEN + 1))
+                .expect("too long"),
+            ResolveOutcome::NotFound
+        );
     }
 
     // -- NetworkInfo persistence tests ---------------------------------------
@@ -821,7 +1117,7 @@ mod tests {
             docker_network_name: "sandbox-net-xxx".to_string(),
         };
 
-        let result = store.set_network_info(&Uuid::new_v4(), &net_info);
+        let result = store.set_network_info(&missing_id(), &net_info);
         assert!(matches!(result, Err(SandboxError::SessionNotFound(_))));
     }
 
@@ -829,7 +1125,7 @@ mod tests {
     fn test_get_network_info_nonexistent_session() {
         let (store, _dir) = test_store();
 
-        let result = store.get_network_info(&Uuid::new_v4());
+        let result = store.get_network_info(&missing_id());
         assert!(matches!(result, Err(SandboxError::SessionNotFound(_))));
     }
 
@@ -872,7 +1168,7 @@ mod tests {
 
         assert_eq!(entries.len(), 2);
 
-        let ids: Vec<Uuid> = entries.iter().map(|(id, _)| *id).collect();
+        let ids: Vec<SessionId> = entries.iter().map(|(id, _)| *id).collect();
         assert!(ids.contains(&s1.id));
         assert!(ids.contains(&s2.id));
     }
@@ -969,7 +1265,7 @@ mod tests {
     fn test_update_state_forced_nonexistent() {
         let (store, _dir) = test_store();
 
-        let result = store.update_state_forced(&Uuid::new_v4(), SessionState::Running);
+        let result = store.update_state_forced(&missing_id(), SessionState::Running);
         assert!(matches!(result, Err(SandboxError::SessionNotFound(_))));
     }
 }

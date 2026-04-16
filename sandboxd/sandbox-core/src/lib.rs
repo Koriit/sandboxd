@@ -39,7 +39,7 @@ pub use policy::{
     MitmproxyRule, Policy, PolicyCompiler, PolicyRule, Protocol,
 };
 pub use policy_distributor::{PolicyDistributor, write_file_to_container};
-pub use qmp::{QmpClient, mac_from_uuid};
-pub use session::{Session, SessionConfig, SessionState, WorkspaceMode};
-pub use store::SessionStore;
+pub use qmp::{QmpClient, mac_from_session_id};
+pub use session::{Session, SessionConfig, SessionId, SessionState, WorkspaceMode};
+pub use store::{ResolveOutcome, SessionStore};
 pub use vm_network::{attach_vm_to_bridge, detach_vm_from_bridge};
