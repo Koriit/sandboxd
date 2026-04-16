@@ -41,6 +41,17 @@ struct Args {
     /// Base directory for daemon state (database, session data).
     #[arg(long, default_value_t = default_base_dir())]
     base_dir: String,
+
+    /// Append tracing output to this file instead of stderr.
+    ///
+    /// When set, stderr logging is disabled (writing to both would duplicate
+    /// log lines under an init system that captures stderr). When unset,
+    /// logs go to stderr -- which is captured automatically by systemd
+    /// (`StandardOutput=journal`) and launchd (`StandardErrorPath`).
+    ///
+    /// If the file cannot be opened, the daemon fails fast on startup.
+    #[arg(long)]
+    log_file: Option<PathBuf>,
 }
 
 
@@ -58,6 +69,77 @@ fn default_base_dir() -> String {
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     format!("{home}/.local/share/sandboxd")
+}
+
+// ---------------------------------------------------------------------------
+// Logging setup
+// ---------------------------------------------------------------------------
+
+/// Where tracing output is routed.
+///
+/// Returned from [`resolve_log_destination`] so that the selection logic is
+/// pure and unit-testable. [`init_tracing`] is the impure wrapper that
+/// actually installs the global subscriber.
+enum LogDestination {
+    /// Append tracing output to the given file (opened in append mode).
+    File(std::fs::File),
+    /// Write tracing output to stderr (default behavior).
+    Stderr,
+}
+
+/// Decide where tracing output should go, based on the `--log-file` flag.
+///
+/// - `Some(path)`: open the file in append+create mode. Returns an error
+///   if the file cannot be opened -- the caller is expected to fail fast
+///   before daemon startup.
+/// - `None`: return [`LogDestination::Stderr`] (the default behavior).
+///
+/// This is a pure function: given the same input, it either opens the
+/// file or returns `Stderr`. No global state is touched.
+fn resolve_log_destination(
+    log_file: Option<&std::path::Path>,
+) -> std::io::Result<LogDestination> {
+    match log_file {
+        Some(path) => {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?;
+            Ok(LogDestination::File(file))
+        }
+        None => Ok(LogDestination::Stderr),
+    }
+}
+
+/// Install the global tracing subscriber, routing output per
+/// [`resolve_log_destination`].
+///
+/// Uses `RUST_LOG` via `EnvFilter`, defaulting to `info` when unset.
+fn init_tracing(log_file: Option<&std::path::Path>) -> std::io::Result<()> {
+    let dest = resolve_log_destination(log_file)?;
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    match dest {
+        LogDestination::File(file) => {
+            // `std::sync::Mutex<File>` implements `MakeWriter`, so we can
+            // hand it directly to the fmt subscriber. The mutex serializes
+            // writes from multiple threads; file append mode means the OS
+            // also guarantees atomic appends for small writes.
+            let writer = std::sync::Mutex::new(file);
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .with_ansi(false)
+                .with_writer(writer)
+                .init();
+        }
+        LogDestination::Stderr => {
+            tracing_subscriber::fmt()
+                .with_env_filter(env_filter)
+                .init();
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2747,12 +2829,17 @@ async fn gateway_monitor(state: Arc<AppState>) {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Install the tracing subscriber. If `--log-file` was provided but the
+    // file cannot be opened, abort early with a clear error -- we do NOT
+    // silently fall back to stderr.
+    if let Err(e) = init_tracing(args.log_file.as_deref()) {
+        eprintln!(
+            "sandboxd: failed to open log file {:?}: {}",
+            args.log_file, e
+        );
+        return Err(e.into());
+    }
+
     let base_dir = PathBuf::from(&args.base_dir);
     let socket_path = PathBuf::from(&args.socket);
 
@@ -3059,6 +3146,78 @@ mod tests {
         assert!(
             dir.ends_with("/sandboxd"),
             "expected dir to end with /sandboxd, got: {dir}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_log_destination: pure selection logic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_log_destination_none_returns_stderr() {
+        let dest =
+            resolve_log_destination(None).expect("None should always succeed");
+        assert!(
+            matches!(dest, LogDestination::Stderr),
+            "expected Stderr when log_file is None"
+        );
+    }
+
+    #[test]
+    fn resolve_log_destination_some_opens_file_in_append_mode() {
+        use std::io::Write;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("sandboxd.log");
+
+        // Pre-seed the file with existing content; append mode must preserve it.
+        std::fs::write(&path, b"existing-line\n").expect("seed file");
+
+        let dest =
+            resolve_log_destination(Some(&path)).expect("should open existing file");
+        match dest {
+            LogDestination::File(mut f) => {
+                f.write_all(b"new-line\n").expect("write");
+                f.sync_all().expect("sync");
+            }
+            LogDestination::Stderr => panic!("expected File variant"),
+        }
+
+        let contents = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            contents.contains("existing-line"),
+            "append mode must preserve prior content, got: {contents:?}"
+        );
+        assert!(
+            contents.contains("new-line"),
+            "new write should be appended, got: {contents:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_log_destination_some_creates_missing_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("does-not-exist-yet.log");
+        assert!(!path.exists(), "precondition: file should not exist");
+
+        let dest = resolve_log_destination(Some(&path))
+            .expect("create+append should succeed on missing file");
+        assert!(
+            matches!(dest, LogDestination::File(_)),
+            "expected File variant"
+        );
+        assert!(path.exists(), "file should be created by open()");
+    }
+
+    #[test]
+    fn resolve_log_destination_some_returns_error_on_bad_path() {
+        // Parent directory does not exist -- open() cannot create the file.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bad = tmp.path().join("no-such-subdir").join("sandboxd.log");
+        let result = resolve_log_destination(Some(&bad));
+        assert!(
+            result.is_err(),
+            "expected error when parent dir is missing, got Ok"
         );
     }
 }
