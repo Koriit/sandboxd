@@ -108,6 +108,16 @@ impl PolicyDistributor {
             }
             state.nftables_injected = true;
             debug!(session_id = %session_id, "nftables policy rules injected");
+        } else {
+            // When no nftables rules are needed, flush any stale
+            // sandbox_policy table left from a previous policy distribution.
+            let flush_script = "delete table inet sandbox_policy\n";
+            let _ = gateway.inject_nftables_ruleset_public(
+                session_id,
+                flush_script,
+                "policy-flush",
+            );
+            debug!(session_id = %session_id, "flushed stale sandbox_policy table (if any)");
         }
 
         // Step 4: Write Envoy config and trigger reload.
