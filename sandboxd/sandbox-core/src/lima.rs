@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use ring::digest;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::error::SandboxError;
@@ -38,7 +38,8 @@ const LIST_VMS_TIMEOUT: Duration = Duration::from_secs(10);
 const BASE_CREATE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Timeout for `limactl start` when booting the base image (cloud-init
-/// provisioning runs on first boot, which is slow).
+/// provisioning runs on first boot: installs socat, git, Docker via
+/// apt, guest agent).
 const BASE_START_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Timeout for `limactl stop` when stopping the base image.
@@ -400,7 +401,7 @@ impl LimaManager {
             session_id = %session_id,
             vm = %vm_name,
             hardened = config.hardened,
-            bridge = ?bridge_name,
+            bridge = bridge_name.unwrap_or("none"),
             "starting VM"
         );
 
@@ -408,6 +409,7 @@ impl LimaManager {
         let mut cmd = Command::new(&self.limactl);
         cmd.args(["start", &vm_name])
             .arg("--tty=false")
+            .arg(format!("--timeout={}s", START_VM_TIMEOUT.as_secs()))
             .env("QEMU_SYSTEM_X86_64", &qemu_wrapper)
             .env("SANDBOX_QEMU_HARDENED", hardened_flag)
             .env("SANDBOX_QEMU_MEMORY_MB", config.memory_mb.to_string())
@@ -844,6 +846,31 @@ impl LimaManager {
         }
         info!("base VM created");
 
+        // Steps 3-6 are wrapped so that a failure cleans up the partially-
+        // built VM.  Without this, a broken `sandbox-base` VM is left in
+        // Lima's inventory and subsequent `create` calls try to clone from
+        // it, producing non-functional VMs.
+        match self.build_base_image_inner() {
+            Ok(()) => {
+                info!("golden base image build complete");
+                Ok(())
+            }
+            Err(e) => {
+                warn!(error = %e, "base image build failed, cleaning up partial VM");
+                let _ = run_with_timeout(
+                    Command::new(&self.limactl)
+                        .args(["delete", "--force", BASE_VM_NAME]),
+                    Duration::from_secs(60),
+                    "limactl delete (base image cleanup)",
+                );
+                Err(e)
+            }
+        }
+    }
+
+    /// Inner build steps (start, install agent, stop, write metadata).
+    /// Separated from `build_base_image` so the caller can clean up on error.
+    fn build_base_image_inner(&self) -> Result<(), SandboxError> {
         // 3. Start the VM with QEMU wrapper for hardening.
         info!("starting base VM (this may take several minutes for cloud-init)");
         let qemu_wrapper = self.ensure_qemu_wrapper()?;
@@ -852,11 +879,14 @@ impl LimaManager {
             Command::new(&self.limactl)
                 .args(["start", BASE_VM_NAME])
                 .arg("--tty=false")
+                .arg(format!("--timeout={}s", BASE_START_TIMEOUT.as_secs()))
                 .env("QEMU_SYSTEM_X86_64", &qemu_wrapper)
                 .env("SANDBOX_QEMU_HARDENED", "1")
-                .env("SANDBOX_QEMU_MEMORY_MB", "1024")
-                .env("SANDBOX_QEMU_CPUS", "1"),
-            BASE_START_TIMEOUT,
+                .env("SANDBOX_QEMU_MEMORY_MB", "4096")
+                .env("SANDBOX_QEMU_CPUS", "4"),
+            // Our process timeout is slightly longer than Lima's to let Lima
+            // report its own error message instead of being killed.
+            BASE_START_TIMEOUT + Duration::from_secs(30),
             "limactl start (base image)",
         )
         .map_err(|e| match e {
@@ -919,7 +949,6 @@ impl LimaManager {
         std::fs::write(&meta_path, &meta_json)?;
         info!(path = %meta_path.display(), "wrote base image metadata");
 
-        info!("golden base image build complete");
         Ok(())
     }
 
@@ -1036,8 +1065,8 @@ images:
 - location: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-arm64.img"
   arch: "aarch64"
 
-cpus: 1
-memory: "1GiB"
+cpus: 4
+memory: "4GiB"
 disk: "10GiB"
 
 mounts: []
@@ -1061,43 +1090,69 @@ provision:
   script: |
     #!/bin/bash
     set -eux -o pipefail
+    echo "[sandbox-provision] step=hostname start=$(date -u +%Y-%m-%dT%H:%M:%S)"
     hostnamectl set-hostname {hostname}
     if ! grep -q '{hostname}' /etc/hosts; then
       echo "127.0.1.1 {hostname}" >> /etc/hosts
     fi
+    echo "[sandbox-provision] step=hostname done=$(date -u +%Y-%m-%dT%H:%M:%S)"
 - mode: system
   script: |
     #!/bin/bash
     set -eux -o pipefail
+    echo "[sandbox-provision] step=user start=$(date -u +%Y-%m-%dT%H:%M:%S)"
     # Create agent user with passwordless sudo (if not already present)
     if ! id agent &>/dev/null; then
       useradd -m -s /bin/bash agent
     fi
     echo 'agent ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/agent
     chmod 0440 /etc/sudoers.d/agent
+    echo "[sandbox-provision] step=user done=$(date -u +%Y-%m-%dT%H:%M:%S)"
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    echo "[sandbox-provision] step=apt-config start=$(date -u +%Y-%m-%dT%H:%M:%S)"
+    # Switch apt sources to HTTPS and configure fast timeouts
+    sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources
+    cat > /etc/apt/apt.conf.d/99sandbox <<'APTEOF'
+    Acquire::http::Timeout "5";
+    Acquire::https::Timeout "5";
+    Acquire::Retries "5";
+    Acquire::ForceIPv4 "true";
+    APTEOF
+    echo "[sandbox-provision] step=apt-config done=$(date -u +%Y-%m-%dT%H:%M:%S)"
 - mode: system
   script: |
     #!/bin/bash
     set -eux -o pipefail
     export DEBIAN_FRONTEND=noninteractive
+    echo "[sandbox-provision] step=apt-socat-git start=$(date -u +%Y-%m-%dT%H:%M:%S)"
     # Install socat (needed for host-guest communication bridge) and git
     if ! command -v socat &>/dev/null || ! command -v git &>/dev/null; then
+      echo "[sandbox-provision] apt-get update start=$(date -u +%Y-%m-%dT%H:%M:%S)"
       apt-get update -qq
+      echo "[sandbox-provision] apt-get update done=$(date -u +%Y-%m-%dT%H:%M:%S)"
+      echo "[sandbox-provision] apt-get install socat git start=$(date -u +%Y-%m-%dT%H:%M:%S)"
       apt-get install -y socat git
+      echo "[sandbox-provision] apt-get install socat git done=$(date -u +%Y-%m-%dT%H:%M:%S)"
     fi
     # Ensure the workspace directory exists for repo cloning (owned by agent, not root)
     mkdir -p /home/agent/workspace
     chown agent:agent /home/agent/workspace
+    echo "[sandbox-provision] step=apt-socat-git done=$(date -u +%Y-%m-%dT%H:%M:%S)"
 - mode: system
   script: |
     #!/bin/bash
     set -eux -o pipefail
     export DEBIAN_FRONTEND=noninteractive
+    echo "[sandbox-provision] step=docker start=$(date -u +%Y-%m-%dT%H:%M:%S)"
     # Install Docker via official convenience script
     if ! command -v docker &>/dev/null; then
       curl -fsSL https://get.docker.com | sh
       usermod -aG docker agent
     fi
+    echo "[sandbox-provision] step=docker done=$(date -u +%Y-%m-%dT%H:%M:%S)"
 "#,
             hostname = BASE_VM_NAME,
         )
@@ -1197,45 +1252,71 @@ provision:
   script: |
     #!/bin/bash
     set -eux -o pipefail
+    echo "[sandbox-provision] step=hostname start=$(date -u +%Y-%m-%dT%H:%M:%S)"
     hostnamectl set-hostname {hostname}
     # Add hostname to /etc/hosts so 'sudo' and other tools that resolve
     # the local hostname do not emit "unable to resolve host" warnings.
     if ! grep -q '{hostname}' /etc/hosts; then
       echo "127.0.1.1 {hostname}" >> /etc/hosts
     fi
+    echo "[sandbox-provision] step=hostname done=$(date -u +%Y-%m-%dT%H:%M:%S)"
 - mode: system
   script: |
     #!/bin/bash
     set -eux -o pipefail
+    echo "[sandbox-provision] step=user start=$(date -u +%Y-%m-%dT%H:%M:%S)"
     # Create agent user with passwordless sudo (if not already present)
     if ! id agent &>/dev/null; then
       useradd -m -s /bin/bash agent
     fi
     echo 'agent ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/agent
     chmod 0440 /etc/sudoers.d/agent
+    echo "[sandbox-provision] step=user done=$(date -u +%Y-%m-%dT%H:%M:%S)"
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    echo "[sandbox-provision] step=apt-config start=$(date -u +%Y-%m-%dT%H:%M:%S)"
+    # Switch apt sources to HTTPS and configure fast timeouts
+    sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources
+    cat > /etc/apt/apt.conf.d/99sandbox <<'APTEOF'
+    Acquire::http::Timeout "5";
+    Acquire::https::Timeout "5";
+    Acquire::Retries "5";
+    Acquire::ForceIPv4 "true";
+    APTEOF
+    echo "[sandbox-provision] step=apt-config done=$(date -u +%Y-%m-%dT%H:%M:%S)"
 - mode: system
   script: |
     #!/bin/bash
     set -eux -o pipefail
     export DEBIAN_FRONTEND=noninteractive
+    echo "[sandbox-provision] step=apt-socat-git start=$(date -u +%Y-%m-%dT%H:%M:%S)"
     # Install socat (needed for host-guest communication bridge) and git
     if ! command -v socat &>/dev/null || ! command -v git &>/dev/null; then
+      echo "[sandbox-provision] apt-get update start=$(date -u +%Y-%m-%dT%H:%M:%S)"
       apt-get update -qq
+      echo "[sandbox-provision] apt-get update done=$(date -u +%Y-%m-%dT%H:%M:%S)"
+      echo "[sandbox-provision] apt-get install socat git start=$(date -u +%Y-%m-%dT%H:%M:%S)"
       apt-get install -y socat git
+      echo "[sandbox-provision] apt-get install socat git done=$(date -u +%Y-%m-%dT%H:%M:%S)"
     fi
     # Ensure the workspace directory exists for repo cloning (owned by agent, not root)
     mkdir -p /home/agent/workspace
     chown agent:agent /home/agent/workspace
+    echo "[sandbox-provision] step=apt-socat-git done=$(date -u +%Y-%m-%dT%H:%M:%S)"
 - mode: system
   script: |
     #!/bin/bash
     set -eux -o pipefail
     export DEBIAN_FRONTEND=noninteractive
+    echo "[sandbox-provision] step=docker start=$(date -u +%Y-%m-%dT%H:%M:%S)"
     # Install Docker via official convenience script
     if ! command -v docker &>/dev/null; then
       curl -fsSL https://get.docker.com | sh
       usermod -aG docker agent
     fi
+    echo "[sandbox-provision] step=docker done=$(date -u +%Y-%m-%dT%H:%M:%S)"
 "#,
             session_id = session_id,
             cpus = config.cpus,
@@ -1788,7 +1869,7 @@ mod tests {
             "template should grant passwordless sudo"
         );
         assert!(
-            template.contains("apt-get install -y socat git"),
+            template.contains("apt-get") && template.contains("install -y socat git"),
             "template should install socat and git"
         );
         assert!(
@@ -2416,14 +2497,14 @@ mod tests {
 
         let template = mgr.generate_base_template();
 
-        // Resource configuration: fixed minimal values.
+        // Resource configuration: fixed values for base image build.
         assert!(
-            template.contains("cpus: 1"),
-            "base template should have 1 CPU"
+            template.contains("cpus: 4"),
+            "base template should have 4 CPUs"
         );
         assert!(
-            template.contains("memory: \"1GiB\""),
-            "base template should have 1GiB memory"
+            template.contains("memory: \"4GiB\""),
+            "base template should have 4GiB memory"
         );
         assert!(
             template.contains("disk: \"10GiB\""),
@@ -2466,7 +2547,7 @@ mod tests {
             "base template should grant passwordless sudo"
         );
         assert!(
-            template.contains("apt-get install -y socat git"),
+            template.contains("apt-get") && template.contains("install -y socat git"),
             "base template should install socat and git"
         );
         assert!(
