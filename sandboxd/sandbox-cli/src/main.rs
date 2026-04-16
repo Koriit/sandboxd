@@ -447,13 +447,22 @@ fn display_session(session: &Session) {
 /// setup, so this must be generous.
 const CLI_HTTP_TIMEOUT: Duration = Duration::from_secs(600);
 
+
 async fn send_request(
     socket_path: &str,
     req: Request<String>,
 ) -> Result<(hyper::StatusCode, String), String> {
+    send_request_with_timeout(socket_path, req, CLI_HTTP_TIMEOUT).await
+}
+
+async fn send_request_with_timeout(
+    socket_path: &str,
+    req: Request<String>,
+    timeout: Duration,
+) -> Result<(hyper::StatusCode, String), String> {
     let uri = req.uri().to_string();
 
-    tokio::time::timeout(CLI_HTTP_TIMEOUT, async {
+    tokio::time::timeout(timeout, async {
         let stream = UnixStream::connect(socket_path).await.map_err(|e| {
             format!(
                 "Cannot connect to sandboxd at {socket_path} \u{2014} is the daemon running? ({e})"
@@ -494,7 +503,7 @@ async fn send_request(
     .unwrap_or_else(|_| {
         Err(format!(
             "request to {uri} timed out after {}s",
-            CLI_HTTP_TIMEOUT.as_secs()
+            timeout.as_secs()
         ))
     })
 }
@@ -1331,7 +1340,7 @@ async fn check_base_image_staleness(socket_path: &str) {
             .body(String::new())
             .expect("failed to build rebuild request");
 
-        match send_request(socket_path, rebuild_req).await {
+        match send_request_with_timeout(socket_path, rebuild_req, CLI_HTTP_TIMEOUT).await {
             Ok((s, _)) if s.is_success() => {
                 eprintln!("Done.");
             }
@@ -1412,7 +1421,7 @@ async fn main() {
         }
     };
 
-    match send_request(&cli.socket, req).await {
+    match send_request_with_timeout(&cli.socket, req, CLI_HTTP_TIMEOUT).await {
         Ok((status, body)) => {
             if let Err(e) = handle_response(&cli.command, status, &body) {
                 eprintln!("{e}");
