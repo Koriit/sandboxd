@@ -1029,6 +1029,41 @@ Six review tracks, each producing findings that are fixed in-session:
 
 ---
 
+### M9-S9: Deferred follow-ups — clone E2E coverage, daemon logging, parallel E2E
+
+**Entry criteria:** M9-S8 complete.
+
+**Rationale:** Three deferred items accumulated across M9-S6/S7 that didn't fit earlier sessions: the E2E suite has no dedicated coverage of the clone-based VM creation path introduced in M8.5, daemon logging still writes to stderr only, and `make test-e2e PARALLEL=N` is broken because pytest-xdist workers race on the shared golden base image. Bundled here as the final polish session before M9 closes.
+
+**Tasks:**
+
+- **Clone-path E2E coverage (todo #12).**
+  - Test that `rebuild-image` builds the golden `sandbox-base` Lima VM from scratch and the resulting image is usable.
+  - Test that session creation uses the clone path (not the legacy fresh-VM path) when the golden image is fresh.
+  - Test staleness detection: mutate the base image mtime / source dockerfile and confirm `rebuild-image` is re-triggered on next session create (or gated by a documented policy).
+  - Add these to a new file `tests/e2e/test_m85_golden_image.py` or extend an existing M8.5 file. Keep runtime under ~5 min per test.
+
+- **Proper daemon logging (todo #13).**
+  - Add `--log-file <PATH>` flag to `sandboxd`: when set, write tracing output to that file (append). Stderr is skipped when `--log-file` is present — writing to both duplicates logs under init-system capture.
+  - Stderr remains the default when `--log-file` is not set. Under systemd (`StandardOutput=journal`) and launchd (`StandardErrorPath`), the init system captures stderr automatically — no daemon-side changes needed for service deployments.
+  - No `tracing-journald` integration. Capture-as-text via stderr is sufficient for a solo-user daemon; structured journal fields can be added later if query needs emerge.
+  - Document sample systemd unit and launchd plist fragments in `docs/` showing both flag-based and init-captured logging setups.
+  - Unit-test the flag/stderr selection logic. Integration-test that `--log-file PATH` produces at least one parseable log line.
+
+- **Fix PARALLEL in E2E tests (todo #14).**
+  - Wrap `_ensure_base_image` fixture in a `filelock.FileLock` on a path tied to the base image (e.g. `~/.lima/sandbox-base/.e2e-rebuild.lock`). Workers serialize on the lock; first worker rebuilds, others skip when image is fresh.
+  - Audit Docker's default-bridge subnet pool for contention under N workers. If the pool is exhausted or collides, switch the gateway-bridge helper to use non-overlapping /24 ranges per-worker (or a larger pool).
+  - Audit concurrent `nftables` injection into the gateway container namespace — ensure rules from worker A don't clobber worker B. If collisions are possible, move to per-session chains or per-worker gateway containers.
+  - Verify: `make test-e2e PARALLEL=2` and `PARALLEL=4` complete faster than serial, all 33 tests green, no flakes across 3 consecutive runs.
+
+**Exit criteria:**
+1. E2E suite covers the clone path: golden image build, clone-based create, staleness detection.
+2. `sandboxd --log-file /tmp/sb.log` writes logs to the file; no flag keeps current stderr behavior; sample systemd unit + launchd plist documented.
+3. `make test-e2e PARALLEL=4` completes all 33 tests with wall time strictly less than serial runtime; three consecutive runs with zero flakes.
+4. Todos #12, #13, #14 resolved.
+
+---
+
 ## Risks
 
 | Risk | Impact | Mitigation |
@@ -1055,8 +1090,8 @@ Six review tracks, each producing findings that are fixed in-session:
 | M7 | 1 |
 | M8 | 3 |
 | M8.5 | 4 |
-| M9 | 8 |
-| **Total** | **42** |
+| M9 | 9 |
+| **Total** | **43** |
 
 ---
 
