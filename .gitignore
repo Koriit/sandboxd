@@ -13,5 +13,6 @@
 /tests/e2e/.venv/
 *.pyc
 __pycache__/
+*.egg-info/
 
 .claude/*.local.md
