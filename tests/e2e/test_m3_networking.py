@@ -716,17 +716,47 @@ def test_daemon_restart_recovery(sandbox_binaries, sandbox_daemon, sandbox_cli):
         sandbox_cli("rm", "net-daemon-test", timeout=120)
         session_id = None
 
+        # 7. Hand the restarted daemon back to the session-scoped fixture so
+        #    subsequent tests (and fixture teardown) use the live process.
+        sandbox_daemon["process"] = restarted_proc
+        restarted_proc = None  # prevent finally from killing it
+
     finally:
         if session_id is not None:
             sandbox_cli("rm", "net-daemon-test", timeout=120)
-        # Clean up the restarted daemon if it's still running.
-        if restarted_proc is not None and restarted_proc.poll() is None:
-            restarted_proc.send_signal(signal.SIGTERM)
-            try:
-                restarted_proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                restarted_proc.kill()
-                restarted_proc.wait(timeout=5)
+
+        # Ensure a live daemon exists for subsequent tests.  If the handoff
+        # already happened (restarted_proc is None), the fixture is fine.
+        # Otherwise we need to either adopt the restarted proc or start a
+        # fresh one so the session-scoped daemon isn't left dead.
+        if restarted_proc is not None:
+            if restarted_proc.poll() is None:
+                # Restarted daemon is alive but wasn't handed off — adopt it.
+                sandbox_daemon["process"] = restarted_proc
+            else:
+                # Restarted daemon also died.  Start a fresh one.
+                restarted_proc = None  # fall through to recovery below
+
+        # If the daemon (original or restarted) is dead, start a fresh one
+        # so subsequent tests don't cascade-fail.
+        if sandbox_daemon["process"].poll() is not None:
+            fresh_proc = subprocess.Popen(
+                [
+                    str(sandbox_binaries.sandboxd),
+                    "--socket", sandbox_daemon["socket"],
+                    "--base-dir", sandbox_daemon["base_dir"],
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if os.path.exists(sandbox_daemon["socket"]):
+                    break
+                if fresh_proc.poll() is not None:
+                    break
+                time.sleep(0.2)
+            sandbox_daemon["process"] = fresh_proc
 
 
 @pytest.mark.timeout(600)
