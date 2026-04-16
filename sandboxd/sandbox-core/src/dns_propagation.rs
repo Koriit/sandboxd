@@ -266,12 +266,12 @@ pub fn generate_domain_ip_rules(
                     | crate::policy::Protocol::Http
                     | crate::policy::Protocol::Any => {
                         allow_rules.push(format!(
-                            "        ct original ip daddr {ip_or_cidr} ct original proto-dst {{ 80, 443 }} accept"
+                            "        ct original ip daddr {ip_or_cidr} tcp dport {{ 80, 443 }} accept"
                         ));
                     }
                     crate::policy::Protocol::Udp => {
                         allow_rules.push(format!(
-                            "        ct original ip daddr {ip_or_cidr} ct original proto-dst {{ 80, 443 }} accept"
+                            "        ct original ip daddr {ip_or_cidr} udp dport {{ 80, 443 }} accept"
                         ));
                     }
                 }
@@ -288,13 +288,13 @@ pub fn generate_domain_ip_rules(
                             | crate::policy::Protocol::Http
                             | crate::policy::Protocol::Any => {
                                 allow_rules.push(format!(
-                                    "        ct original ip daddr {ip} ct original proto-dst {{ 80, 443 }} accept \
+                                    "        ct original ip daddr {ip} tcp dport {{ 80, 443 }} accept \
                                      # {domain}"
                                 ));
                             }
                             crate::policy::Protocol::Udp => {
                                 allow_rules.push(format!(
-                                    "        ct original ip daddr {ip} ct original proto-dst {{ 80, 443 }} accept \
+                                    "        ct original ip daddr {ip} udp dport {{ 80, 443 }} accept \
                                      # {domain}"
                                 ));
                             }

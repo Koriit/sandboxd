@@ -449,12 +449,12 @@ impl PolicyCompiler {
                     match rule.protocol {
                         Protocol::Tcp | Protocol::Https | Protocol::Http | Protocol::Any => {
                             allow_rules.push(format!(
-                                "        ct original ip daddr {ip_or_cidr} ct original proto-dst {{ 80, 443 }} accept"
+                                "        ct original ip daddr {ip_or_cidr} tcp dport {{ 80, 443 }} accept"
                             ));
                         }
                         Protocol::Udp => {
                             allow_rules.push(format!(
-                                "        ct original ip daddr {ip_or_cidr} ct original proto-dst {{ 80, 443 }} accept"
+                                "        ct original ip daddr {ip_or_cidr} udp dport {{ 80, 443 }} accept"
                             ));
                         }
                     }
@@ -1899,8 +1899,8 @@ mod tests {
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
         assert!(
-            compiled.nftables_rules.contains("ct original proto-dst"),
-            "UDP protocol should produce conntrack-based nftables rules"
+            compiled.nftables_rules.contains("udp dport"),
+            "UDP protocol should produce udp dport nftables rules"
         );
         assert!(
             compiled.nftables_rules.contains("8.8.8.0/24"),
