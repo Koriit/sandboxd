@@ -1005,6 +1005,30 @@ Six review tracks, each producing findings that are fixed in-session:
 
 ---
 
+### M9-S8: Docker-style session IDs with prefix matching
+
+**Entry criteria:** M9-S7 complete.
+
+**Rationale:** UUIDs with hyphens visually read as "opaque, copy the whole thing" — users do not attempt prefix matching. Docker-style hex hashes invite prefix matching because the format affords it. With 12 hex chars (48 bits) we also stop truncating resource names: 3-char prefix + 12 hex chars = 15 chars, fitting Linux IFNAMSIZ (15) exactly. Bridge stays as `sb-{id}`; TAP prefix shortens from `tap-sb-` to `tb-`.
+
+**Tasks:**
+- Introduce a `SessionId` newtype (or type alias) wrapping a 12-hex-char string. Generate via `Uuid::new_v4().simple().to_string()[..12]` — the first 6 bytes of a v4 UUID are all CSPRNG random (version/variant bits live in bytes 6 and 8). Zero new deps.
+- Wrap `store.insert_session` in a collision-retry loop (SQLite `PRIMARY KEY` constraint catches dupes; retry up to 3 times before surfacing the error).
+- Update all call sites that construct or parse session IDs: handlers, CLI, tests, integration tests, display formatting.
+- Add `Store::resolve_id_prefix(prefix) -> Result<SessionId, ResolveError>` with `NotFound` / `Ambiguous(Vec<SessionId>)` variants. Use `WHERE id LIKE ?1 || '%'` with `LIMIT 2` to detect ambiguity cheaply.
+- Wire prefix resolution into every CLI subcommand that takes an ID argument (`rm`, `stop`, `start`, `exec`, `ssh`, `cp`, `inspect`, etc.). Also accept full IDs and session names unchanged.
+- Shorten TAP device name prefix from `tap-sb-` to `tb-` (3 chars + 12-hex-id = 15 chars, IFNAMSIZ). Update `generate_tap_name` + its tests + any string assertions.
+- Remove the `short_id = &session_id[..N]` truncation sites — resource names now use the full ID.
+- Update E2E test helpers / fixtures that currently parse UUIDs (`_ID_RE` regex in conftest.py, any `parse_session_id` assumptions).
+
+**Exit criteria:**
+1. All new sessions have 12-hex-char IDs (e.g. `ab4f7523c636`).
+2. `sandbox rm ab4f` works when exactly one session starts with `ab4f`; ambiguity reports all matches; no match reports not-found.
+3. No call site truncates the session ID — bridge and TAP device names are constructed from the full ID.
+4. All unit tests pass. All E2E tests pass.
+
+---
+
 ## Risks
 
 | Risk | Impact | Mitigation |
@@ -1031,8 +1055,8 @@ Six review tracks, each producing findings that are fixed in-session:
 | M7 | 1 |
 | M8 | 3 |
 | M8.5 | 4 |
-| M9 | 7 |
-| **Total** | **41** |
+| M9 | 8 |
+| **Total** | **42** |
 
 ---
 
