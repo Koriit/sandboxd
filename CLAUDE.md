@@ -26,7 +26,8 @@ E2E tests boot real Lima/QEMU VMs and are SLOW. Individual test files take 3-10 
 
 **Running E2E tests from Claude Code:**
 - Never run the full suite in a foreground bash call — it will hit the 10-minute timeout.
-- Use `run_in_background: true` and poll with `bash sleep 60` between status checks.
+- Delegate to a subagent, or use `run_in_background: true`.
+- To poll between checks, use foreground `true && sleep 120 && <check-command>` — this saves tokens vs. background sleep + separate poll. Set timeout high enough for the sleep.
 - For faster iteration, run individual test files: `python -m pytest test_m5_git_remote.py -v`
 - Run a single test first before running the full suite.
 
