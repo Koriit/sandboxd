@@ -257,6 +257,8 @@ pub fn generate_domain_ip_rules(
         match &rule.destination {
             Destination::Cidr(cidr) => {
                 // CIDR rules are static -- include them directly.
+                // Use conntrack original-direction matching so rules work
+                // correctly after DNAT has rewritten packet headers.
                 let ip_or_cidr = cidr.as_str();
                 match rule.protocol {
                     crate::policy::Protocol::Tcp
@@ -264,18 +266,20 @@ pub fn generate_domain_ip_rules(
                     | crate::policy::Protocol::Http
                     | crate::policy::Protocol::Any => {
                         allow_rules.push(format!(
-                            "        ip daddr {ip_or_cidr} tcp dport {{ 80, 443 }} accept"
+                            "        ct original ip daddr {ip_or_cidr} ct original proto-dst {{ 80, 443 }} accept"
                         ));
                     }
                     crate::policy::Protocol::Udp => {
                         allow_rules.push(format!(
-                            "        ip daddr {ip_or_cidr} udp dport {{ 80, 443 }} accept"
+                            "        ct original ip daddr {ip_or_cidr} ct original proto-dst {{ 80, 443 }} accept"
                         ));
                     }
                 }
             }
             Destination::Domain(domain) => {
                 // Look up resolved IPs from the cache.
+                // Use conntrack original-direction matching so rules work
+                // correctly after DNAT has rewritten packet headers.
                 if let Some(entry) = cache.entries().get(domain.as_str()) {
                     for ip in &entry.ips {
                         match rule.protocol {
@@ -284,13 +288,13 @@ pub fn generate_domain_ip_rules(
                             | crate::policy::Protocol::Http
                             | crate::policy::Protocol::Any => {
                                 allow_rules.push(format!(
-                                    "        ip daddr {ip} tcp dport {{ 80, 443 }} accept \
+                                    "        ct original ip daddr {ip} ct original proto-dst {{ 80, 443 }} accept \
                                      # {domain}"
                                 ));
                             }
                             crate::policy::Protocol::Udp => {
                                 allow_rules.push(format!(
-                                    "        ip daddr {ip} udp dport {{ 80, 443 }} accept \
+                                    "        ct original ip daddr {ip} ct original proto-dst {{ 80, 443 }} accept \
                                      # {domain}"
                                 ));
                             }

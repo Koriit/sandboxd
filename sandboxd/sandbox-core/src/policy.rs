@@ -442,17 +442,19 @@ impl PolicyCompiler {
             match &rule.destination {
                 Destination::Cidr(cidr) => {
                     // For CIDR destinations, generate direct IP-based rules.
+                    // Use conntrack original-direction matching so rules work
+                    // correctly after DNAT has rewritten packet headers.
                     let ip_or_cidr = cidr.as_str();
 
                     match rule.protocol {
                         Protocol::Tcp | Protocol::Https | Protocol::Http | Protocol::Any => {
                             allow_rules.push(format!(
-                                "        ip daddr {ip_or_cidr} tcp dport {{ 80, 443 }} accept"
+                                "        ct original ip daddr {ip_or_cidr} ct original proto-dst {{ 80, 443 }} accept"
                             ));
                         }
                         Protocol::Udp => {
                             allow_rules.push(format!(
-                                "        ip daddr {ip_or_cidr} udp dport {{ 80, 443 }} accept"
+                                "        ct original ip daddr {ip_or_cidr} ct original proto-dst {{ 80, 443 }} accept"
                             ));
                         }
                     }
@@ -1897,8 +1899,8 @@ mod tests {
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
         assert!(
-            compiled.nftables_rules.contains("udp dport"),
-            "UDP protocol should produce UDP nftables rules"
+            compiled.nftables_rules.contains("ct original proto-dst"),
+            "UDP protocol should produce conntrack-based nftables rules"
         );
         assert!(
             compiled.nftables_rules.contains("8.8.8.0/24"),
