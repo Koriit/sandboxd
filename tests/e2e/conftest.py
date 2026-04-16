@@ -45,7 +45,7 @@ _ID_RE = re.compile(r"^ID:\s+([0-9a-f-]{36})$", re.MULTILINE)
 
 # Default VM resource args -- kept small so tests work on hosts with limited
 # memory (e.g. 4 GB total).
-_VM_RESOURCE_ARGS = ("--cpus", "1", "--memory", "1024", "--disk", "10", "--no-cache")
+_VM_RESOURCE_ARGS = ("--cpus", "2", "--memory", "2048", "--disk", "10", "--no-cache")
 
 
 def parse_session_id(create_output: str) -> str:
@@ -366,14 +366,23 @@ def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path_factory: pytest.T
     base_dir = tmp_path / "state"
     base_dir.mkdir(parents=True, exist_ok=True)
 
+    # Redirect daemon output to files instead of PIPE to avoid pipe-buffer
+    # deadlock.  With PIPE, nobody reads the daemon's stderr during the test
+    # session; after enough log output the 64 KB buffer fills and the daemon
+    # blocks, deadlocking the entire test suite.
+    stdout_log = tmp_path / "sandboxd.stdout.log"
+    stderr_log = tmp_path / "sandboxd.stderr.log"
+    stdout_fh = open(stdout_log, "w")
+    stderr_fh = open(stderr_log, "w")
+
     proc = subprocess.Popen(
         [
             str(sandbox_binaries.sandboxd),
             "--socket", str(socket_path),
             "--base-dir", str(base_dir),
         ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=stdout_fh,
+        stderr=stderr_fh,
     )
 
     # Wait for the socket to appear.
@@ -383,26 +392,37 @@ def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path_factory: pytest.T
             break
         # Check if the daemon crashed.
         if proc.poll() is not None:
-            stdout = proc.stdout.read().decode() if proc.stdout else ""
-            stderr = proc.stderr.read().decode() if proc.stderr else ""
+            stdout_fh.close()
+            stderr_fh.close()
             pytest.fail(
                 f"sandboxd exited early (code {proc.returncode}).\n"
-                f"stdout: {stdout}\nstderr: {stderr}"
+                f"stdout: {stdout_log.read_text()}\n"
+                f"stderr: {stderr_log.read_text()}"
             )
         time.sleep(0.1)
     else:
         proc.kill()
+        stdout_fh.close()
+        stderr_fh.close()
         pytest.fail(f"sandboxd socket did not appear within {DAEMON_STARTUP_TIMEOUT}s")
 
     info = {
         "socket": str(socket_path),
         "base_dir": str(base_dir),
         "process": proc,
+        "_stdout_fh": stdout_fh,
+        "_stderr_fh": stderr_fh,
+        "_stdout_log": stdout_log,
+        "_stderr_log": stderr_log,
     }
 
     yield info
 
     # --- Teardown ---
+
+    # Close daemon log file handles.
+    stdout_fh.close()
+    stderr_fh.close()
 
     # Collect any Lima VM names from the daemon's session db so we can clean
     # them up even if the test forgot to `rm`.
@@ -425,13 +445,16 @@ def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path_factory: pytest.T
         pass
 
     # Send SIGTERM and wait for graceful shutdown.
-    if proc.poll() is None:
-        proc.terminate()
+    # Use info["process"] (not the local `proc`) because a test like
+    # test_daemon_restart_recovery may have replaced it with a new Popen.
+    current_proc = info["process"]
+    if current_proc.poll() is None:
+        current_proc.terminate()
         try:
-            proc.wait(timeout=15)
+            current_proc.wait(timeout=15)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
+            current_proc.kill()
+            current_proc.wait(timeout=5)
 
     # Force-delete any leftover VMs.
     for vm_name in vm_names_to_clean:
