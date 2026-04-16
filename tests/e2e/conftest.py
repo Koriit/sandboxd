@@ -45,7 +45,7 @@ _ID_RE = re.compile(r"^ID:\s+([0-9a-f-]{36})$", re.MULTILINE)
 
 # Default VM resource args -- kept small so tests work on hosts with limited
 # memory (e.g. 4 GB total).
-_VM_RESOURCE_ARGS = ("--cpus", "2", "--memory", "2048", "--disk", "10", "--no-cache")
+_VM_RESOURCE_ARGS = ("--cpus", "2", "--memory", "2048", "--disk", "10")
 
 
 def parse_session_id(create_output: str) -> str:
@@ -499,8 +499,32 @@ def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path_factory: pytest.T
         pass
 
 
+@pytest.fixture(scope="session")
+def _ensure_base_image(sandbox_binaries: SandboxBinaries, sandbox_daemon):
+    """Build the golden base image once per test session.
+
+    This runs `sandbox rebuild-image` so that tests using clone-based
+    creation (without --no-cache) have a base image available.  With the
+    HTTPS apt sources and fast timeout config, this typically completes
+    in ~90 seconds.
+    """
+    socket_path = sandbox_daemon["socket"]
+    result = subprocess.run(
+        [str(sandbox_binaries.sandbox), "--socket", socket_path, "rebuild-image"],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    if result.returncode != 0:
+        pytest.fail(
+            f"Failed to build base image (exit {result.returncode}).\n"
+            f"stdout: {result.stdout}\n"
+            f"stderr: {result.stderr}"
+        )
+
+
 @pytest.fixture
-def sandbox_cli(sandbox_binaries: SandboxBinaries, sandbox_daemon):
+def sandbox_cli(sandbox_binaries: SandboxBinaries, sandbox_daemon, _ensure_base_image):
     """Return a helper that invokes the sandbox CLI with the correct --socket.
 
     The helper returns a subprocess.CompletedProcess.  By default it does NOT
