@@ -53,6 +53,9 @@ const DOCKER_INSPECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout for `docker inspect` when retrieving the container IP.
 const CONTAINER_IP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Timeout for `docker exec nft` when injecting nftables rulesets.
+const NFT_EXEC_TIMEOUT: Duration = Duration::from_secs(15);
+
 // ---------------------------------------------------------------------------
 // GatewayManager
 // ---------------------------------------------------------------------------
@@ -674,25 +677,53 @@ impl GatewayManager {
             "injecting nftables ruleset via docker exec"
         );
 
-        let output = Command::new("docker")
+        let mut child = Command::new("docker")
             .args(["exec", "-i", &container, "nft", "-f", "-"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .and_then(|mut child| {
-                use std::io::Write;
-                if let Some(ref mut stdin) = child.stdin {
-                    stdin.write_all(ruleset.as_bytes())?;
-                }
-                child.stdin.take();
-                child.wait_with_output()
-            })
             .map_err(|e| {
                 SandboxError::Gateway(format!(
-                    "failed to inject {label} nftables rules: {e}"
+                    "failed to spawn {label} nftables injection: {e}"
                 ))
             })?;
+
+        // Write the ruleset to stdin, then close it.
+        {
+            use std::io::Write;
+            if let Some(ref mut stdin) = child.stdin {
+                let _ = stdin.write_all(ruleset.as_bytes());
+            }
+            child.stdin.take();
+        }
+
+        // Wait with timeout to avoid unbounded hangs.
+        let deadline = Instant::now() + NFT_EXEC_TIMEOUT;
+        let output = loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break child.wait_with_output().map_err(|e| {
+                    SandboxError::Gateway(format!(
+                        "failed to collect output from {label} nftables injection: {e}"
+                    ))
+                })?,
+                Ok(None) if Instant::now() >= deadline => {
+                    warn!(label = label, "nftables injection timed out, killing");
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(SandboxError::Gateway(format!(
+                        "nftables {label} injection timed out after {}s",
+                        NFT_EXEC_TIMEOUT.as_secs()
+                    )));
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(50)),
+                Err(e) => {
+                    return Err(SandboxError::Gateway(format!(
+                        "failed to poll {label} nftables injection: {e}"
+                    )));
+                }
+            }
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
