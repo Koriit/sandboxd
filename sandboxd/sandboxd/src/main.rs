@@ -239,7 +239,14 @@ async fn create_session(
     // Use the fast path when: no --no-cache flag, no custom template.
     // The fast path clones the pre-provisioned base image and skips the
     // guest agent install (it's already baked in).
-    let use_cache = !req.no_cache.unwrap_or(false) && req.template.is_none();
+    //
+    // Shared workspace (9p mount) requires the legacy path because the
+    // clone doesn't carry mount configuration from the session template.
+    let has_shared_mount = matches!(
+        &config.workspace_mode,
+        Some(sandbox_core::WorkspaceMode::Shared { .. })
+    );
+    let use_cache = !req.no_cache.unwrap_or(false) && req.template.is_none() && !has_shared_mount;
 
     // Helper closure: cleanup VM + network + CA on failure, set state to Error.
     // This macro avoids repeating the cleanup pattern in every error branch.
