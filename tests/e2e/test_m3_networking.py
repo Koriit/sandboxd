@@ -658,14 +658,22 @@ def test_daemon_restart_recovery(sandbox_binaries, sandbox_daemon, sandbox_cli):
         # 3. Restart the daemon with the same socket and base-dir.
         #    The daemon should reconcile state from the session store and
         #    Lima VM inventory on startup.
+        #
+        #    Redirect stdout/stderr to the existing daemon log files so the
+        #    restarted daemon doesn't deadlock on a full pipe buffer once the
+        #    session-scoped fixture adopts it for the rest of the suite.
+        stdout_log = sandbox_daemon["_stdout_log"]
+        stderr_log = sandbox_daemon["_stderr_log"]
+        new_stdout_fh = open(stdout_log, "a")
+        new_stderr_fh = open(stderr_log, "a")
         restarted_proc = subprocess.Popen(
             [
                 str(sandbox_binaries.sandboxd),
                 "--socket", socket_path,
                 "--base-dir", base_dir,
             ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=new_stdout_fh,
+            stderr=new_stderr_fh,
         )
 
         # Wait for the new socket to appear.
@@ -674,15 +682,18 @@ def test_daemon_restart_recovery(sandbox_binaries, sandbox_daemon, sandbox_cli):
             if os.path.exists(socket_path):
                 break
             if restarted_proc.poll() is not None:
-                stdout = restarted_proc.stdout.read().decode() if restarted_proc.stdout else ""
-                stderr = restarted_proc.stderr.read().decode() if restarted_proc.stderr else ""
+                new_stdout_fh.close()
+                new_stderr_fh.close()
                 pytest.fail(
                     f"Restarted daemon exited early (code {restarted_proc.returncode}).\n"
-                    f"stdout: {stdout}\nstderr: {stderr}"
+                    f"stdout: {stdout_log.read_text()}\n"
+                    f"stderr: {stderr_log.read_text()}"
                 )
             time.sleep(0.2)
         else:
             restarted_proc.kill()
+            new_stdout_fh.close()
+            new_stderr_fh.close()
             pytest.fail("Restarted daemon socket did not appear within 15s")
 
         # Allow time for reconciliation (gateway restart, network restoration).
@@ -719,6 +730,8 @@ def test_daemon_restart_recovery(sandbox_binaries, sandbox_daemon, sandbox_cli):
         # 7. Hand the restarted daemon back to the session-scoped fixture so
         #    subsequent tests (and fixture teardown) use the live process.
         sandbox_daemon["process"] = restarted_proc
+        sandbox_daemon["_stdout_fh"] = new_stdout_fh
+        sandbox_daemon["_stderr_fh"] = new_stderr_fh
         restarted_proc = None  # prevent finally from killing it
 
     finally:
@@ -738,16 +751,19 @@ def test_daemon_restart_recovery(sandbox_binaries, sandbox_daemon, sandbox_cli):
                 restarted_proc = None  # fall through to recovery below
 
         # If the daemon (original or restarted) is dead, start a fresh one
-        # so subsequent tests don't cascade-fail.
+        # so subsequent tests don't cascade-fail.  Redirect output to the
+        # existing log files (see comment in step 3 for rationale).
         if sandbox_daemon["process"].poll() is not None:
+            fresh_stdout_fh = open(sandbox_daemon["_stdout_log"], "a")
+            fresh_stderr_fh = open(sandbox_daemon["_stderr_log"], "a")
             fresh_proc = subprocess.Popen(
                 [
                     str(sandbox_binaries.sandboxd),
                     "--socket", sandbox_daemon["socket"],
                     "--base-dir", sandbox_daemon["base_dir"],
                 ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=fresh_stdout_fh,
+                stderr=fresh_stderr_fh,
             )
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline:
@@ -757,6 +773,8 @@ def test_daemon_restart_recovery(sandbox_binaries, sandbox_daemon, sandbox_cli):
                     break
                 time.sleep(0.2)
             sandbox_daemon["process"] = fresh_proc
+            sandbox_daemon["_stdout_fh"] = fresh_stdout_fh
+            sandbox_daemon["_stderr_fh"] = fresh_stderr_fh
 
 
 @pytest.mark.timeout(600)

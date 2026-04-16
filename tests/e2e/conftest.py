@@ -420,9 +420,15 @@ def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path_factory: pytest.T
 
     # --- Teardown ---
 
-    # Close daemon log file handles.
-    stdout_fh.close()
-    stderr_fh.close()
+    # Close daemon log file handles.  Use the current handles from info
+    # because test_daemon_restart_recovery may have swapped them out.
+    info["_stdout_fh"].close()
+    info["_stderr_fh"].close()
+    # Also close the originals if they weren't the current ones.
+    if stdout_fh is not info["_stdout_fh"] and not stdout_fh.closed:
+        stdout_fh.close()
+    if stderr_fh is not info["_stderr_fh"] and not stderr_fh.closed:
+        stderr_fh.close()
 
     # Collect any Lima VM names from the daemon's session db so we can clean
     # them up even if the test forgot to `rm`.
