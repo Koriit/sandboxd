@@ -16,8 +16,8 @@ pub mod vm_network;
 
 pub use api::{
     CreateSessionRequest, ExecRequest, ExecResponse, FileDownloadRequest, FileDownloadResponse,
-    FileUploadRequest, GatewayHealth, NetworkHealth, SessionHealth, SessionResponse,
-    UpdatePolicyRequest,
+    FileUploadRequest, GatewayHealth, NetworkHealth, PolicyDto, PolicyLevelDto, PolicyRuleDto,
+    SessionConfigDto, SessionDto, SessionHealth, UpdatePolicyRequest,
 };
 pub use ca::{CaManager, generate_ca_inject_script};
 pub use dns_propagation::{
@@ -34,8 +34,8 @@ pub use guest::{
 pub use lima::{BaseImageMeta, BaseImageStatus, LimaManager, VmInfo, VmStatus, guest_agent_path};
 pub use network::{NetworkInfo, NetworkManager};
 pub use policy::{
-    AssuranceLevel, CompiledPolicy, CoreDnsConfig, Destination, HttpConstraints, MitmproxyConfig,
-    MitmproxyRule, Policy, PolicyCompiler, PolicyRule, Protocol,
+    AssuranceLevel, CompiledPolicy, CoreDnsConfig, Destination, HttpFilter, HttpMethod,
+    MitmproxyConfig, MitmproxyFilter, MitmproxyRule, Policy, PolicyCompiler, PolicyRule, Protocol,
 };
 pub use policy_distributor::{PolicyDistributor, write_file_to_container};
 pub use process::run_with_timeout;

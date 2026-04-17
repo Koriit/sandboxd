@@ -32,23 +32,93 @@ pub struct Policy {
     pub rules: Vec<PolicyRule>,
 }
 
+impl Policy {
+    /// Construct the synthetic **unrestricted** policy — a single Http rule
+    /// allowing any method on any path for any destination.
+    ///
+    /// This is a real [`Policy`] value (not a sentinel / separate variant /
+    /// sidecar flag): it round-trips through the DTO + store layers like any
+    /// user-authored policy.  Compiled output is permissive **and** logged
+    /// through mitmproxy — callers get a structured audit trail of every
+    /// request.  Used by `sandbox create --unrestricted` and
+    /// `sandbox policy update --unrestricted`.
+    pub fn unrestricted() -> Policy {
+        Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![PolicyRule {
+                destination: Destination::Domain("*".to_string()),
+                level: AssuranceLevel::Http {
+                    http_filters: vec![HttpFilter {
+                        method: HttpMethod::Any,
+                        path: "/*".to_string(),
+                    }],
+                },
+                protocol: Protocol::Any,
+                reason: Some("unrestricted network access (logged)".to_string()),
+            }],
+        }
+    }
+
+    /// Return `true` when this policy matches the exact shape produced by
+    /// [`Policy::unrestricted`]: a single Http rule on wildcard destination
+    /// `*` with an `ANY /*` filter.
+    ///
+    /// Used by the `describe` renderer to print the `unrestricted (logged)`
+    /// sentinel line instead of a full rule block.  Extra fields (`reason`,
+    /// `protocol`) are ignored to keep the detection stable against cosmetic
+    /// edits.
+    pub fn is_unrestricted(&self) -> bool {
+        if self.rules.len() != 1 {
+            return false;
+        }
+        let rule = &self.rules[0];
+        if !matches!(&rule.destination, Destination::Domain(d) if d == "*") {
+            return false;
+        }
+        match &rule.level {
+            AssuranceLevel::Http { http_filters } => {
+                http_filters.len() == 1
+                    && http_filters[0].method == HttpMethod::Any
+                    && http_filters[0].path == "/*"
+            }
+            _ => false,
+        }
+    }
+}
+
 /// A single policy rule describing the allowed assurance level for a
 /// destination.
+///
+/// The wire format is flat: the assurance level's tag (`"level"`) and any
+/// per-variant data (currently `http_filters` for the `http` level) live
+/// alongside `destination`, `protocol`, and `reason` at the rule object's
+/// top level.  Example:
+///
+/// ```json
+/// {
+///   "destination": "github.com",
+///   "protocol": "tcp",
+///   "level": "http",
+///   "http_filters": [{"method": "GET", "path": "/*"}]
+/// }
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PolicyRule {
     /// Destination: domain name, IP address, or CIDR block.
     pub destination: Destination,
-    /// Assurance level (deny, transport, tls, full).
-    pub level: AssuranceLevel,
     /// Protocol constraint.
     #[serde(default = "default_protocol")]
     pub protocol: Protocol,
-    /// HTTP method/path constraints (level `full` only).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub constraints: Option<HttpConstraints>,
     /// Human-readable reason for the rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Assurance level, flattened into the rule object.
+    ///
+    /// Deserializes from the `level` tag at the rule object's top level.
+    /// For `http`, the `http_filters` array is read from the same level
+    /// (not from a nested `constraints` object).
+    #[serde(flatten)]
+    pub level: AssuranceLevel,
 }
 
 /// Assurance level for a destination.
@@ -57,14 +127,25 @@ pub struct PolicyRule {
 /// - **Deny** (0): No traffic allowed.
 /// - **Transport** (1): Opaque TCP/UDP passthrough. No inspection.
 /// - **Tls** (2): TLS-verified passthrough. SNI extraction, no MITM.
-/// - **Full** (3): HTTPS through mitmproxy (MITM with session CA).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
+/// - **Http** (3): HTTPS through mitmproxy (MITM with session CA), with
+///   `(method, path)` filter pairs enforced on every request.
+///
+/// The variant is tagged with a `"level"` discriminator on the wire.  When
+/// flattened into a [`PolicyRule`], variant-carried data (`http_filters`)
+/// appears alongside the tag at the rule object's top level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(tag = "level", rename_all = "snake_case")]
 pub enum AssuranceLevel {
     Deny,
     Transport,
     Tls,
-    Full,
+    Http {
+        /// Ordered list of `(method, path)` filter pairs.  Each incoming
+        /// request is matched against the filters in order; the first pair
+        /// whose method and path both match permits the request.  Must be
+        /// non-empty (validated by [`PolicyCompiler::compile`]).
+        http_filters: Vec<HttpFilter>,
+    },
 }
 
 impl AssuranceLevel {
@@ -74,19 +155,152 @@ impl AssuranceLevel {
             Self::Deny => 0,
             Self::Transport => 1,
             Self::Tls => 2,
-            Self::Full => 3,
+            Self::Http { .. } => 3,
+        }
+    }
+
+    /// Return a stable short name for the variant (independent of any
+    /// per-variant data).  Used for contradiction detection, where we want
+    /// to compare levels without comparing `http_filters` content.
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::Transport => "transport",
+            Self::Tls => "tls",
+            Self::Http { .. } => "http",
         }
     }
 }
 
 impl fmt::Display for AssuranceLevel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Deny => write!(f, "deny"),
-            Self::Transport => write!(f, "transport"),
-            Self::Tls => write!(f, "tls"),
-            Self::Full => write!(f, "full"),
+        f.write_str(self.variant_name())
+    }
+}
+
+// Custom `Deserialize` impl for `AssuranceLevel` that emits a clear,
+// targeted error when callers pass the old (pre-M9-S10) rule shape:
+//
+//   { "level": "full", "constraints": { "methods": [...], "paths": [...] } }
+//
+// Without this impl serde's default message would be
+// "unknown variant `full`, expected one of `deny`, `transport`, `tls`, `http`",
+// which is accurate but does not tell the caller where to put their methods
+// and paths.  We spell it out.
+impl<'de> Deserialize<'de> for AssuranceLevel {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        // Materialize into a generic JSON value so we can:
+        //   1. detect the legacy shape and return a targeted error,
+        //   2. fall back to standard tagged-enum deserialization on the
+        //      modern shape.
+        let value = serde_json::Value::deserialize(deserializer)?;
+
+        let obj = value.as_object().ok_or_else(|| {
+            D::Error::custom(
+                "AssuranceLevel must be an object with a `level` tag; \
+                 expected one of `deny`, `transport`, `tls`, `http`",
+            )
+        })?;
+
+        let level_tag = obj.get("level").and_then(|v| v.as_str());
+
+        // Legacy sentinel: `"full"` was renamed to `"http"` in M9-S10 and
+        // the `constraints: {methods, paths}` wrapper was replaced by a
+        // flat `http_filters: [{method, path}, ...]` array.
+        if level_tag == Some("full") {
+            return Err(D::Error::custom(
+                "policy rule uses legacy level `full` — rename to `http` and \
+                 replace `constraints: {methods, paths}` with a flat \
+                 `http_filters: [{method, path}, ...]` array",
+            ));
         }
+
+        // Any `constraints` field is a leftover from the legacy shape,
+        // regardless of the current `level` value.  Surface it explicitly.
+        if obj.contains_key("constraints") {
+            return Err(D::Error::custom(
+                "policy rule contains legacy `constraints` field — replace \
+                 with `http_filters: [{method, path}, ...]` on an `http` \
+                 level rule",
+            ));
+        }
+
+        // Happy path: delegate to the derived tagged-enum deserializer.
+        // We re-derive it on a private shadow type to avoid infinite
+        // recursion through this impl.
+        #[derive(Deserialize)]
+        #[serde(tag = "level", rename_all = "snake_case")]
+        enum Shadow {
+            Deny,
+            Transport,
+            Tls,
+            Http { http_filters: Vec<HttpFilter> },
+        }
+
+        let shadow = Shadow::deserialize(value).map_err(D::Error::custom)?;
+        Ok(match shadow {
+            Shadow::Deny => AssuranceLevel::Deny,
+            Shadow::Transport => AssuranceLevel::Transport,
+            Shadow::Tls => AssuranceLevel::Tls,
+            Shadow::Http { http_filters } => AssuranceLevel::Http { http_filters },
+        })
+    }
+}
+
+/// A single HTTP method/path filter pair for an `http`-level rule.
+///
+/// Matching is evaluated as a pair: both `method` and `path` must match
+/// for the filter to permit the request.  This is different from the
+/// pre-M9-S10 shape that held two independent vectors and allowed any
+/// combination — the new shape can express "GET /foo but POST /bar".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct HttpFilter {
+    /// Allowed HTTP method.
+    pub method: HttpMethod,
+    /// Allowed path glob pattern.  Supports `fnmatch`-style wildcards
+    /// (`*`, `?`, `[...]`).  Examples: `/api/*`, `/*`, `/repos/?/commits`.
+    pub path: String,
+}
+
+/// HTTP method accepted by an [`HttpFilter`].  Closed enum — no free-form
+/// strings.  Use [`HttpMethod::Any`] as an explicit wildcard instead of
+/// "empty means everything".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum HttpMethod {
+    Get,
+    Post,
+    Put,
+    Delete,
+    Patch,
+    Head,
+    Options,
+    Trace,
+    Connect,
+    /// Explicit "any method" marker.  Equivalent to listing every other
+    /// variant; an empty filter list is never treated as "match all".
+    Any,
+}
+
+impl fmt::Display for HttpMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+            Self::Put => "PUT",
+            Self::Delete => "DELETE",
+            Self::Patch => "PATCH",
+            Self::Head => "HEAD",
+            Self::Options => "OPTIONS",
+            Self::Trace => "TRACE",
+            Self::Connect => "CONNECT",
+            Self::Any => "ANY",
+        })
     }
 }
 
@@ -152,19 +366,11 @@ fn default_protocol() -> Protocol {
     Protocol::default()
 }
 
-/// HTTP-level constraints for assurance level `full`.
-///
-/// When present, the mitmproxy addon enforces these constraints on each
-/// request. An empty list means "allow all" for that field.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct HttpConstraints {
-    /// Allowed HTTP methods (e.g. `["GET", "POST"]`). Empty = allow all.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub methods: Vec<String>,
-    /// Allowed path prefixes (e.g. `["/api/v1/"]`). Empty = allow all.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub paths: Vec<String>,
-}
+// NOTE: the old `HttpConstraints { methods, paths }` wrapper struct was
+// removed in M9-S10.  Its cartesian-product semantics (any method × any
+// path) could not express "GET /foo but POST /bar" rules.  Use
+// [`AssuranceLevel::Http { http_filters }`] with explicit `(method, path)`
+// pairs instead.
 
 // ---------------------------------------------------------------------------
 // JSON Schema generation
@@ -187,21 +393,18 @@ pub fn preset_allow_github() -> Vec<PolicyRule> {
             destination: Destination::Domain("github.com".to_string()),
             level: AssuranceLevel::Transport,
             protocol: Protocol::Https,
-            constraints: None,
             reason: Some("GitHub web and API".to_string()),
         },
         PolicyRule {
             destination: Destination::Domain("*.github.com".to_string()),
             level: AssuranceLevel::Transport,
             protocol: Protocol::Https,
-            constraints: None,
             reason: Some("GitHub subdomains (API, uploads, etc.)".to_string()),
         },
         PolicyRule {
             destination: Destination::Domain("*.githubusercontent.com".to_string()),
             level: AssuranceLevel::Transport,
             protocol: Protocol::Https,
-            constraints: None,
             reason: Some("GitHub raw content and assets".to_string()),
         },
     ]
@@ -214,21 +417,18 @@ pub fn preset_allow_npm() -> Vec<PolicyRule> {
             destination: Destination::Domain("registry.npmjs.org".to_string()),
             level: AssuranceLevel::Transport,
             protocol: Protocol::Https,
-            constraints: None,
             reason: Some("npm package registry".to_string()),
         },
         PolicyRule {
             destination: Destination::Domain("*.npmjs.org".to_string()),
             level: AssuranceLevel::Transport,
             protocol: Protocol::Https,
-            constraints: None,
             reason: Some("npm registry CDN".to_string()),
         },
         PolicyRule {
             destination: Destination::Domain("*.npmjs.com".to_string()),
             level: AssuranceLevel::Transport,
             protocol: Protocol::Https,
-            constraints: None,
             reason: Some("npm website and API".to_string()),
         },
     ]
@@ -261,6 +461,21 @@ impl CoreDnsConfig {
         }
         content
     }
+
+    /// Render the CoreDNS config that means **deny everything** — the two
+    /// header comments and an empty allowed-domains body.  CoreDNS treats
+    /// absence from the list as NXDOMAIN, so this is the fail-closed
+    /// default used whenever a session has no policy installed yet.
+    ///
+    /// Shared helper so every call site that needs the "no policy" string
+    /// produces byte-identical content (and so a single edit changes them
+    /// all).
+    pub fn empty_policy_file_content() -> String {
+        CoreDnsConfig {
+            allowed_domains: Vec::new(),
+        }
+        .to_file_content()
+    }
 }
 
 /// mitmproxy policy configuration (JSON).
@@ -274,16 +489,32 @@ pub struct MitmproxyConfig {
 }
 
 /// A single mitmproxy rule for a host.
+///
+/// A request is permitted when its host matches [`Self::host`] **and** at
+/// least one of [`Self::filters`] matches its `(method, path)` pair.  The
+/// addon iterates the list in order.  An empty list means no request is
+/// allowed — the upstream [`PolicyCompiler`] rejects such configurations
+/// at compile time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MitmproxyRule {
     /// Hostname to match (exact or wildcard like `*.example.com`).
     pub host: String,
-    /// Allowed HTTP methods. `None` means allow all.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub methods: Option<Vec<String>>,
-    /// Allowed path prefixes. `None` means allow all.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub paths: Option<Vec<String>>,
+    /// Ordered `(method, path)` filter pairs.  Each request is checked
+    /// against the list in order; the first matching pair permits it.
+    pub filters: Vec<MitmproxyFilter>,
+}
+
+/// A `(method, path)` filter pair emitted into the mitmproxy addon config.
+///
+/// Method and path are both strings on the wire for the benefit of the
+/// Python addon — the Rust-side [`HttpMethod`] / [`HttpFilter`] types are
+/// stringified here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MitmproxyFilter {
+    /// Uppercase HTTP method name (`"GET"`, `"POST"`, ..., or `"ANY"`).
+    pub method: String,
+    /// Path glob pattern (`fnmatch` syntax).
+    pub path: String,
 }
 
 impl MitmproxyConfig {
@@ -342,8 +573,11 @@ impl PolicyCompiler {
     ///
     /// Checks:
     /// - Schema version is compatible
-    /// - HTTP constraints only appear on HTTP/HTTPS protocols at level `full`
-    /// - No contradictory rules (same destination with conflicting levels)
+    /// - `Http`-level rules have a non-empty `http_filters` list and an
+    ///   HTTP-capable protocol (`http`, `https`, `any`)
+    /// - No contradictory rules (same destination with different assurance
+    ///   level variants; duplicate `Http` entries are permitted and their
+    ///   filter lists merged by the downstream addon)
     /// - CIDR blocks are syntactically valid
     /// - Domain names are syntactically valid
     pub fn validate(policy: &Policy) -> Result<(), SandboxError> {
@@ -361,17 +595,21 @@ impl PolicyCompiler {
             )));
         }
 
-        // Track destinations to detect contradictions.
-        let mut seen_destinations: HashMap<String, AssuranceLevel> = HashMap::new();
+        // Track destinations to detect contradictions.  Compare by variant
+        // name (not full equality) so two `Http` rules on the same
+        // destination with different filter lists are not flagged — they
+        // compose rather than conflict.
+        let mut seen_destinations: HashMap<String, &'static str> = HashMap::new();
 
         for (i, rule) in policy.rules.iter().enumerate() {
             let ctx = format!("rule {i} (destination: {})", rule.destination);
 
-            // HTTP constraints require level full + HTTP/HTTPS protocol.
-            if rule.constraints.is_some() {
-                if rule.level != AssuranceLevel::Full {
+            // `Http`-specific invariants.
+            if let AssuranceLevel::Http { http_filters } = &rule.level {
+                if http_filters.is_empty() {
                     return Err(SandboxError::Internal(format!(
-                        "{ctx}: HTTP constraints are only valid at assurance level 'full'"
+                        "{ctx}: assurance level 'http' requires a non-empty \
+                         `http_filters` array — list at least one {{method, path}} pair"
                     )));
                 }
                 if !matches!(
@@ -379,16 +617,11 @@ impl PolicyCompiler {
                     Protocol::Http | Protocol::Https | Protocol::Any
                 ) {
                     return Err(SandboxError::Internal(format!(
-                        "{ctx}: HTTP constraints require protocol 'http', 'https', or 'any'"
+                        "{ctx}: assurance level 'http' requires protocol \
+                         'http', 'https', or 'any' (got '{:?}')",
+                        rule.protocol
                     )));
                 }
-            }
-
-            // Level full requires HTTP-capable protocol.
-            if rule.level == AssuranceLevel::Full && matches!(rule.protocol, Protocol::Udp) {
-                return Err(SandboxError::Internal(format!(
-                    "{ctx}: assurance level 'full' is not compatible with protocol 'udp'"
-                )));
             }
 
             // Validate destination syntax.
@@ -405,17 +638,18 @@ impl PolicyCompiler {
             }
 
             // Check for contradictory rules: same destination string with
-            // different assurance levels.
+            // different assurance-level variants.
             let dest_key = rule.destination.to_string();
-            if let Some(prev_level) = seen_destinations.get(&dest_key) {
-                if *prev_level != rule.level {
+            let variant = rule.level.variant_name();
+            if let Some(prev_variant) = seen_destinations.get(&dest_key) {
+                if *prev_variant != variant {
                     return Err(SandboxError::Internal(format!(
                         "{ctx}: contradicts earlier rule (level '{}' vs '{}')",
-                        prev_level, rule.level
+                        prev_variant, variant
                     )));
                 }
             } else {
-                seen_destinations.insert(dest_key, rule.level);
+                seen_destinations.insert(dest_key, variant);
             }
         }
 
@@ -436,7 +670,7 @@ impl PolicyCompiler {
         let mut allow_rules = Vec::new();
 
         for rule in &policy.rules {
-            if rule.level == AssuranceLevel::Deny {
+            if matches!(rule.level, AssuranceLevel::Deny) {
                 continue;
             }
 
@@ -457,6 +691,38 @@ impl PolicyCompiler {
                             allow_rules.push(format!(
                                 "        ct original ip daddr {ip_or_cidr} udp dport {{ 80, 443 }} accept"
                             ));
+                        }
+                    }
+                }
+                Destination::Domain(domain) if domain == "*" => {
+                    // Unrestricted wildcard destination: accept any daddr on
+                    // 80/443 directly.  We emit a real allow rule rather than
+                    // waiting for DNS propagation because `*` cannot be
+                    // resolved — the DNS cache only ever holds concrete
+                    // FQDNs, so `generate_domain_ip_rules` alone would never
+                    // materialise an allow-rule for this shape.
+                    //
+                    // Match on the original-direction L4 port via
+                    // `ct original proto-dst` so the rule still catches the
+                    // pre-DNAT port 80/443 even after the base chain has
+                    // redirected the flow to the gateway's Envoy listener
+                    // on port 10000.  Bare `tcp dport { 80, 443 }` would
+                    // only match traffic that had not yet been DNAT'd —
+                    // which is never the case at the forward hook.  Pair
+                    // with `meta l4proto` to keep the TCP/UDP split the
+                    // other arms use.
+                    match rule.protocol {
+                        Protocol::Tcp | Protocol::Https | Protocol::Http | Protocol::Any => {
+                            allow_rules.push(
+                                "        meta l4proto tcp ct original proto-dst { 80, 443 } accept # unrestricted"
+                                    .to_string(),
+                            );
+                        }
+                        Protocol::Udp => {
+                            allow_rules.push(
+                                "        meta l4proto udp ct original proto-dst { 80, 443 } accept # unrestricted"
+                                    .to_string(),
+                            );
                         }
                     }
                 }
@@ -529,17 +795,23 @@ impl PolicyCompiler {
         let has_transport = policy
             .rules
             .iter()
-            .any(|r| r.level == AssuranceLevel::Transport);
-        let has_tls = policy.rules.iter().any(|r| r.level == AssuranceLevel::Tls);
-        let has_full = policy.rules.iter().any(|r| r.level == AssuranceLevel::Full);
+            .any(|r| matches!(r.level, AssuranceLevel::Transport));
+        let has_tls = policy
+            .rules
+            .iter()
+            .any(|r| matches!(r.level, AssuranceLevel::Tls));
+        let has_http = policy
+            .rules
+            .iter()
+            .any(|r| matches!(r.level, AssuranceLevel::Http { .. }));
 
         // For a policy with only deny rules, or no rules at all, return a
         // minimal Envoy config that rejects everything.
-        if !has_transport && !has_tls && !has_full {
+        if !has_transport && !has_tls && !has_http {
             return Self::envoy_deny_all();
         }
 
-        let needs_tls_inspector = has_tls || has_full;
+        let needs_tls_inspector = has_tls || has_http;
 
         // -- Listener filters ---------------------------------------------------
 
@@ -571,7 +843,7 @@ impl PolicyCompiler {
         for rule in policy
             .rules
             .iter()
-            .filter(|r| r.level == AssuranceLevel::Tls)
+            .filter(|r| matches!(r.level, AssuranceLevel::Tls))
         {
             let domain = rule.destination.to_string();
             let stat_name = Self::sanitize_stat_prefix(&domain);
@@ -604,10 +876,27 @@ impl PolicyCompiler {
         for rule in policy
             .rules
             .iter()
-            .filter(|r| r.level == AssuranceLevel::Full)
+            .filter(|r| matches!(r.level, AssuranceLevel::Http { .. }))
         {
             let domain = rule.destination.to_string();
             let stat_name = Self::sanitize_stat_prefix(&domain);
+            // Unrestricted wildcard (`*`) destination: Envoy's
+            // `filter_chain_match.server_names` does not accept a bare `*`,
+            // so emit a catch-all chain (no `filter_chain_match`) instead.
+            // The sandbox_l3 nftables redirect still handles the MITM
+            // path once DNS propagation installs it; Envoy is the pre-
+            // propagation fallback (opaque passthrough).
+            if domain == "*" {
+                filter_chains.push(format!(
+                    r#"        - filters:
+            - name: envoy.filters.network.tcp_proxy
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+                cluster: original_dst
+                stat_prefix: level3_{stat_name}"#
+                ));
+                continue;
+            }
             filter_chains.push(format!(
                 r#"        - filter_chain_match:
             server_names: ["{domain}"]
@@ -690,34 +979,25 @@ admin:
 
     /// Compile mitmproxy configuration for the policy.
     ///
-    /// Only level `full` rules produce mitmproxy rules. For level 0-2,
-    /// mitmproxy is not involved.
+    /// Only `Http`-level rules produce mitmproxy rules.  Each rule's
+    /// `http_filters` list is emitted verbatim as `(method, path)` pairs
+    /// — the addon matches them as pairs, not as a cartesian product.
     fn compile_mitmproxy(policy: &Policy) -> String {
         let rules: Vec<MitmproxyRule> = policy
             .rules
             .iter()
-            .filter(|r| r.level == AssuranceLevel::Full)
-            .map(|r| {
-                let host = r.destination.to_string();
-                let methods = r.constraints.as_ref().and_then(|c| {
-                    if c.methods.is_empty() {
-                        None
-                    } else {
-                        Some(c.methods.clone())
-                    }
-                });
-                let paths = r.constraints.as_ref().and_then(|c| {
-                    if c.paths.is_empty() {
-                        None
-                    } else {
-                        Some(c.paths.clone())
-                    }
-                });
-                MitmproxyRule {
-                    host,
-                    methods,
-                    paths,
-                }
+            .filter_map(|r| match &r.level {
+                AssuranceLevel::Http { http_filters } => Some(MitmproxyRule {
+                    host: r.destination.to_string(),
+                    filters: http_filters
+                        .iter()
+                        .map(|f| MitmproxyFilter {
+                            method: f.method.to_string(),
+                            path: f.path.clone(),
+                        })
+                        .collect(),
+                }),
+                _ => None,
             })
             .collect();
 
@@ -734,7 +1014,7 @@ admin:
         let domains: Vec<String> = policy
             .rules
             .iter()
-            .filter(|r| r.level != AssuranceLevel::Deny)
+            .filter(|r| !matches!(r.level, AssuranceLevel::Deny))
             .filter_map(|r| match &r.destination {
                 Destination::Domain(d) => Some(d.clone()),
                 Destination::Cidr(_) => None,
@@ -774,6 +1054,14 @@ admin:
     fn validate_domain(domain: &str) -> Result<(), String> {
         if domain.is_empty() {
             return Err("domain must not be empty".to_string());
+        }
+
+        // Bare `*` is the synthetic unrestricted-policy wildcard — it matches
+        // every FQDN rather than a specific label.  It is intentionally only
+        // producible by `Policy::unrestricted()`; humans authoring policy
+        // files should use `*.foo.com` style instead.
+        if domain == "*" {
+            return Ok(());
         }
 
         // Allow wildcard prefix.
@@ -866,17 +1154,22 @@ mod tests {
                     destination: Destination::Domain("github.com".to_string()),
                     level: AssuranceLevel::Transport,
                     protocol: Protocol::Https,
-                    constraints: None,
                     reason: Some("GitHub access".to_string()),
                 },
                 PolicyRule {
                     destination: Destination::Cidr("140.82.112.0/20".to_string()),
                     level: AssuranceLevel::Transport,
                     protocol: Protocol::Tcp,
-                    constraints: None,
                     reason: Some("GitHub IP range".to_string()),
                 },
             ],
+        }
+    }
+
+    fn http_filter(method: HttpMethod, path: &str) -> HttpFilter {
+        HttpFilter {
+            method,
+            path: path.to_string(),
         }
     }
 
@@ -921,7 +1214,40 @@ mod tests {
     }
 
     #[test]
-    fn parse_policy_with_constraints() {
+    fn parse_policy_with_http_filters() {
+        let json = r#"{
+            "version": "1.0.0",
+            "rules": [
+                {
+                    "destination": "api.example.com",
+                    "level": "http",
+                    "protocol": "https",
+                    "http_filters": [
+                        {"method": "GET", "path": "/api/v1/*"},
+                        {"method": "POST", "path": "/api/v1/*"}
+                    ]
+                }
+            ]
+        }"#;
+
+        let policy: Policy = serde_json::from_str(json).unwrap();
+        assert_eq!(policy.rules.len(), 1);
+
+        let filters = match &policy.rules[0].level {
+            AssuranceLevel::Http { http_filters } => http_filters.clone(),
+            other => panic!("expected Http level, got {other:?}"),
+        };
+        assert_eq!(filters.len(), 2);
+        assert_eq!(filters[0].method, HttpMethod::Get);
+        assert_eq!(filters[0].path, "/api/v1/*");
+        assert_eq!(filters[1].method, HttpMethod::Post);
+        assert_eq!(filters[1].path, "/api/v1/*");
+    }
+
+    #[test]
+    fn parse_rejects_legacy_full_level_with_clear_error() {
+        // The pre-M9-S10 shape: `level: "full"` + `constraints: {methods,
+        // paths}`.  No auto-conversion — the error must name the new shape.
         let json = r#"{
             "version": "1.0.0",
             "rules": [
@@ -937,13 +1263,41 @@ mod tests {
             ]
         }"#;
 
-        let policy: Policy = serde_json::from_str(json).unwrap();
-        assert_eq!(policy.rules.len(), 1);
-        assert_eq!(policy.rules[0].level, AssuranceLevel::Full);
+        let err = serde_json::from_str::<Policy>(json)
+            .expect_err("legacy `full` level must fail to deserialize");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("legacy level `full`") && msg.contains("http_filters"),
+            "error must explain the migration path; got: {msg}"
+        );
+    }
 
-        let constraints = policy.rules[0].constraints.as_ref().unwrap();
-        assert_eq!(constraints.methods, vec!["GET", "POST"]);
-        assert_eq!(constraints.paths, vec!["/api/v1/"]);
+    #[test]
+    fn parse_rejects_legacy_constraints_field_with_clear_error() {
+        // Any `constraints` field — even without `level: "full"` — is a
+        // leftover from the old shape.
+        let json = r#"{
+            "version": "1.0.0",
+            "rules": [
+                {
+                    "destination": "api.example.com",
+                    "level": "http",
+                    "protocol": "https",
+                    "constraints": {
+                        "methods": ["GET"],
+                        "paths": ["/api"]
+                    }
+                }
+            ]
+        }"#;
+
+        let err = serde_json::from_str::<Policy>(json)
+            .expect_err("legacy `constraints` field must fail to deserialize");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("legacy `constraints` field") && msg.contains("http_filters"),
+            "error must explain the migration path; got: {msg}"
+        );
     }
 
     #[test]
@@ -1028,8 +1382,16 @@ mod tests {
             "schema must include 'tls' level"
         );
         assert!(
-            schema_str.contains("full"),
-            "schema must include 'full' level"
+            schema_str.contains("\"http\""),
+            "schema must include 'http' level (renamed from 'full' in M9-S10)"
+        );
+        assert!(
+            !schema_str.contains("\"full\""),
+            "schema must not include legacy 'full' level"
+        );
+        assert!(
+            schema_str.contains("http_filters"),
+            "schema must describe `http_filters` array"
         );
     }
 
@@ -1077,70 +1439,44 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_level_full_with_udp() {
+    fn validate_rejects_http_level_with_udp() {
         let policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
                 destination: Destination::Domain("example.com".to_string()),
-                level: AssuranceLevel::Full,
+                level: AssuranceLevel::Http {
+                    http_filters: vec![http_filter(HttpMethod::Get, "/*")],
+                },
                 protocol: Protocol::Udp,
-                constraints: None,
                 reason: None,
             }],
         };
         let err = PolicyCompiler::validate(&policy).unwrap_err();
         assert!(
             err.to_string()
-                .contains("not compatible with protocol 'udp'"),
-            "expected full+udp error, got: {err}"
+                .contains("assurance level 'http' requires protocol"),
+            "expected http+udp protocol error, got: {err}"
         );
     }
 
     #[test]
-    fn validate_rejects_constraints_on_non_full_level() {
+    fn validate_rejects_http_level_with_empty_http_filters() {
         let policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
                 destination: Destination::Domain("example.com".to_string()),
-                level: AssuranceLevel::Transport,
+                level: AssuranceLevel::Http {
+                    http_filters: vec![],
+                },
                 protocol: Protocol::Https,
-                constraints: Some(HttpConstraints {
-                    methods: vec!["GET".to_string()],
-                    paths: vec![],
-                }),
                 reason: None,
             }],
         };
         let err = PolicyCompiler::validate(&policy).unwrap_err();
+        let msg = err.to_string();
         assert!(
-            err.to_string()
-                .contains("HTTP constraints are only valid at assurance level 'full'"),
-            "expected constraints error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_rejects_constraints_on_udp_protocol() {
-        let policy = Policy {
-            version: SCHEMA_VERSION.to_string(),
-            rules: vec![PolicyRule {
-                destination: Destination::Domain("example.com".to_string()),
-                level: AssuranceLevel::Full,
-                protocol: Protocol::Udp,
-                constraints: Some(HttpConstraints {
-                    methods: vec!["GET".to_string()],
-                    paths: vec![],
-                }),
-                reason: None,
-            }],
-        };
-        // This should fail on both the full+udp check and the constraints+udp check.
-        let err = PolicyCompiler::validate(&policy).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("not compatible with protocol 'udp'")
-                || err.to_string().contains("HTTP constraints require"),
-            "expected protocol incompatibility error, got: {err}"
+            msg.contains("requires a non-empty") && msg.contains("http_filters"),
+            "expected empty-http_filters error, got: {msg}"
         );
     }
 
@@ -1153,14 +1489,14 @@ mod tests {
                     destination: Destination::Domain("example.com".to_string()),
                     level: AssuranceLevel::Transport,
                     protocol: Protocol::Any,
-                    constraints: None,
                     reason: None,
                 },
                 PolicyRule {
                     destination: Destination::Domain("example.com".to_string()),
-                    level: AssuranceLevel::Full,
-                    protocol: Protocol::Any,
-                    constraints: None,
+                    level: AssuranceLevel::Http {
+                        http_filters: vec![http_filter(HttpMethod::Get, "/*")],
+                    },
+                    protocol: Protocol::Https,
                     reason: None,
                 },
             ],
@@ -1181,14 +1517,41 @@ mod tests {
                     destination: Destination::Domain("example.com".to_string()),
                     level: AssuranceLevel::Transport,
                     protocol: Protocol::Any,
-                    constraints: None,
                     reason: None,
                 },
                 PolicyRule {
                     destination: Destination::Domain("example.com".to_string()),
                     level: AssuranceLevel::Transport,
                     protocol: Protocol::Https,
-                    constraints: None,
+                    reason: None,
+                },
+            ],
+        };
+        assert!(PolicyCompiler::validate(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_allows_duplicate_http_rules_with_different_filters() {
+        // Two `Http` rules on the same destination with different filter
+        // lists are NOT a contradiction — they compose.  The downstream
+        // addon sees both filter sets for the same host.
+        let policy = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![
+                PolicyRule {
+                    destination: Destination::Domain("example.com".to_string()),
+                    level: AssuranceLevel::Http {
+                        http_filters: vec![http_filter(HttpMethod::Get, "/api/*")],
+                    },
+                    protocol: Protocol::Https,
+                    reason: None,
+                },
+                PolicyRule {
+                    destination: Destination::Domain("example.com".to_string()),
+                    level: AssuranceLevel::Http {
+                        http_filters: vec![http_filter(HttpMethod::Post, "/webhook")],
+                    },
+                    protocol: Protocol::Https,
                     reason: None,
                 },
             ],
@@ -1204,7 +1567,6 @@ mod tests {
                 destination: Destination::Cidr("999.999.999.999/24".to_string()),
                 level: AssuranceLevel::Transport,
                 protocol: Protocol::Any,
-                constraints: None,
                 reason: None,
             }],
         };
@@ -1223,7 +1585,6 @@ mod tests {
                 destination: Destination::Cidr("10.0.0.0/33".to_string()),
                 level: AssuranceLevel::Transport,
                 protocol: Protocol::Any,
-                constraints: None,
                 reason: None,
             }],
         };
@@ -1242,7 +1603,6 @@ mod tests {
                 destination: Destination::Domain("not a domain!".to_string()),
                 level: AssuranceLevel::Transport,
                 protocol: Protocol::Any,
-                constraints: None,
                 reason: None,
             }],
         };
@@ -1261,7 +1621,6 @@ mod tests {
                 destination: Destination::Domain("-example.com".to_string()),
                 level: AssuranceLevel::Transport,
                 protocol: Protocol::Any,
-                constraints: None,
                 reason: None,
             }],
         };
@@ -1280,7 +1639,6 @@ mod tests {
                 destination: Destination::Domain("*.github.com".to_string()),
                 level: AssuranceLevel::Transport,
                 protocol: Protocol::Any,
-                constraints: None,
                 reason: None,
             }],
         };
@@ -1332,7 +1690,6 @@ mod tests {
                 destination: Destination::Domain("blocked.com".to_string()),
                 level: AssuranceLevel::Deny,
                 protocol: Protocol::Any,
-                constraints: None,
                 reason: Some("Explicitly blocked".to_string()),
             }],
         };
@@ -1399,7 +1756,6 @@ mod tests {
                 destination: Destination::Domain("github.com".to_string()),
                 level: AssuranceLevel::Transport,
                 protocol: Protocol::Https,
-                constraints: None,
                 reason: Some("GitHub access".to_string()),
             }],
         };
@@ -1540,14 +1896,12 @@ mod tests {
                     destination: Destination::Domain("allowed.com".to_string()),
                     level: AssuranceLevel::Transport,
                     protocol: Protocol::Any,
-                    constraints: None,
                     reason: None,
                 },
                 PolicyRule {
                     destination: Destination::Domain("denied.com".to_string()),
                     level: AssuranceLevel::Deny,
                     protocol: Protocol::Any,
-                    constraints: None,
                     reason: None,
                 },
             ],
@@ -1597,17 +1951,15 @@ mod tests {
     }
 
     #[test]
-    fn mitmproxy_config_includes_full_level_rules() {
+    fn mitmproxy_config_includes_http_level_rules() {
         let policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
                 destination: Destination::Domain("api.example.com".to_string()),
-                level: AssuranceLevel::Full,
+                level: AssuranceLevel::Http {
+                    http_filters: vec![http_filter(HttpMethod::Get, "/api/*")],
+                },
                 protocol: Protocol::Https,
-                constraints: Some(HttpConstraints {
-                    methods: vec!["GET".to_string()],
-                    paths: vec!["/api/".to_string()],
-                }),
                 reason: None,
             }],
         };
@@ -1617,14 +1969,43 @@ mod tests {
         let config: MitmproxyConfig = serde_json::from_str(&compiled.mitmproxy_config).unwrap();
         assert_eq!(config.rules.len(), 1);
         assert_eq!(config.rules[0].host, "api.example.com");
-        assert_eq!(
-            config.rules[0].methods.as_ref().unwrap(),
-            &["GET".to_string()]
-        );
-        assert_eq!(
-            config.rules[0].paths.as_ref().unwrap(),
-            &["/api/".to_string()]
-        );
+        assert_eq!(config.rules[0].filters.len(), 1);
+        assert_eq!(config.rules[0].filters[0].method, "GET");
+        assert_eq!(config.rules[0].filters[0].path, "/api/*");
+    }
+
+    #[test]
+    fn mitmproxy_config_emits_filter_pairs_not_cartesian_product() {
+        // A rule with {GET /api, POST /webhook} should emit exactly two
+        // filter pairs — not four (GET /api, GET /webhook, POST /api,
+        // POST /webhook) as the old cartesian-product shape did.
+        let policy = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![PolicyRule {
+                destination: Destination::Domain("api.example.com".to_string()),
+                level: AssuranceLevel::Http {
+                    http_filters: vec![
+                        http_filter(HttpMethod::Get, "/api"),
+                        http_filter(HttpMethod::Post, "/webhook"),
+                    ],
+                },
+                protocol: Protocol::Https,
+                reason: None,
+            }],
+        };
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+
+        let config: MitmproxyConfig = serde_json::from_str(&compiled.mitmproxy_config).unwrap();
+        assert_eq!(config.rules.len(), 1);
+        assert_eq!(config.rules[0].filters.len(), 2);
+
+        let pairs: Vec<(&str, &str)> = config.rules[0]
+            .filters
+            .iter()
+            .map(|f| (f.method.as_str(), f.path.as_str()))
+            .collect();
+        assert_eq!(pairs, vec![("GET", "/api"), ("POST", "/webhook")]);
     }
 
     #[test]
@@ -1632,13 +2013,68 @@ mod tests {
         let config = MitmproxyConfig {
             rules: vec![MitmproxyRule {
                 host: "example.com".to_string(),
-                methods: None,
-                paths: None,
+                filters: vec![MitmproxyFilter {
+                    method: "GET".to_string(),
+                    path: "/*".to_string(),
+                }],
             }],
         };
         let json = config.to_json();
         let parsed: MitmproxyConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.rules.len(), 1);
+        assert_eq!(parsed.rules[0].filters.len(), 1);
+    }
+
+    /// Emits the compiled mitmproxy JSON for the two policies used by the
+    /// failing E2E tests (`test_level3_method_restriction` and
+    /// `test_level3_path_restriction`).  Locked down to a verbatim string so
+    /// any accidental reshaping of the wire format — e.g., extra wrapper
+    /// keys, key-case drift, or cartesian-product regression — trips the
+    /// test instead of leaking to the runtime.
+    #[test]
+    fn mitmproxy_config_matches_e2e_failing_policies() {
+        // M4 test_level3_method_restriction: `{GET /*}` — POST must deny.
+        let method_policy = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![PolicyRule {
+                destination: Destination::Domain("httpbin.org".to_string()),
+                level: AssuranceLevel::Http {
+                    http_filters: vec![http_filter(HttpMethod::Get, "/*")],
+                },
+                protocol: Protocol::Https,
+                reason: None,
+            }],
+        };
+        // M4 test_level3_path_restriction: `{ANY /api/*}` — `/other/path`
+        // must deny.
+        let path_policy = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![PolicyRule {
+                destination: Destination::Domain("httpbin.org".to_string()),
+                level: AssuranceLevel::Http {
+                    http_filters: vec![http_filter(HttpMethod::Any, "/api/*")],
+                },
+                protocol: Protocol::Https,
+                reason: None,
+            }],
+        };
+
+        let net = test_network_info();
+        let method_json = PolicyCompiler::compile(&method_policy, &net)
+            .unwrap()
+            .mitmproxy_config;
+        let path_json = PolicyCompiler::compile(&path_policy, &net)
+            .unwrap()
+            .mitmproxy_config;
+
+        // Intentionally verbatim — the wire format is a contract with the
+        // Python addon, not an implementation detail.  Pretty-printed JSON
+        // is intentional (see `MitmproxyConfig::to_json`): Python's
+        // `json.load` parses both compact and pretty forms identically.
+        let expected_method = "{\n  \"rules\": [\n    {\n      \"host\": \"httpbin.org\",\n      \"filters\": [\n        {\n          \"method\": \"GET\",\n          \"path\": \"/*\"\n        }\n      ]\n    }\n  ]\n}";
+        let expected_path = "{\n  \"rules\": [\n    {\n      \"host\": \"httpbin.org\",\n      \"filters\": [\n        {\n          \"method\": \"ANY\",\n          \"path\": \"/api/*\"\n        }\n      ]\n    }\n  ]\n}";
+        assert_eq!(method_json, expected_method);
+        assert_eq!(path_json, expected_path);
     }
 
     // -- Preset policies -----------------------------------------------------
@@ -1734,7 +2170,13 @@ mod tests {
         assert_eq!(AssuranceLevel::Deny.as_u8(), 0);
         assert_eq!(AssuranceLevel::Transport.as_u8(), 1);
         assert_eq!(AssuranceLevel::Tls.as_u8(), 2);
-        assert_eq!(AssuranceLevel::Full.as_u8(), 3);
+        assert_eq!(
+            AssuranceLevel::Http {
+                http_filters: vec![http_filter(HttpMethod::Any, "/*")]
+            }
+            .as_u8(),
+            3
+        );
     }
 
     #[test]
@@ -1742,7 +2184,13 @@ mod tests {
         assert_eq!(AssuranceLevel::Deny.to_string(), "deny");
         assert_eq!(AssuranceLevel::Transport.to_string(), "transport");
         assert_eq!(AssuranceLevel::Tls.to_string(), "tls");
-        assert_eq!(AssuranceLevel::Full.to_string(), "full");
+        assert_eq!(
+            AssuranceLevel::Http {
+                http_filters: vec![http_filter(HttpMethod::Any, "/*")]
+            }
+            .to_string(),
+            "http"
+        );
     }
 
     // -- Destination parsing -------------------------------------------------
@@ -1808,6 +2256,194 @@ mod tests {
         assert!(PolicyCompiler::validate_domain("exam!ple.com").is_err());
     }
 
+    #[test]
+    fn validate_domain_accepts_bare_wildcard() {
+        // Bare `*` is the synthetic unrestricted-policy destination — it
+        // must pass validation even though label rules reject it.  Pinned
+        // here so a future tightening of `validate_domain` does not
+        // accidentally break `Policy::unrestricted()` compilation.
+        assert!(PolicyCompiler::validate_domain("*").is_ok());
+    }
+
+    // -- Unrestricted policy --------------------------------------------------
+
+    #[test]
+    fn policy_unrestricted_shape() {
+        let policy = Policy::unrestricted();
+        assert_eq!(policy.version, SCHEMA_VERSION);
+        assert_eq!(policy.rules.len(), 1);
+        let rule = &policy.rules[0];
+        assert!(matches!(&rule.destination, Destination::Domain(d) if d == "*"));
+        assert_eq!(rule.protocol, Protocol::Any);
+        match &rule.level {
+            AssuranceLevel::Http { http_filters } => {
+                assert_eq!(http_filters.len(), 1);
+                assert_eq!(http_filters[0].method, HttpMethod::Any);
+                assert_eq!(http_filters[0].path, "/*");
+            }
+            _ => panic!("unrestricted rule must be Http level"),
+        }
+        assert!(policy.is_unrestricted());
+    }
+
+    #[test]
+    fn policy_is_unrestricted_rejects_mismatched_shapes() {
+        // Empty policy is not unrestricted.
+        let empty = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![],
+        };
+        assert!(!empty.is_unrestricted());
+
+        // Single Http rule but wrong destination.
+        let wrong_dest = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![PolicyRule {
+                destination: Destination::Domain("example.com".into()),
+                protocol: Protocol::Any,
+                reason: None,
+                level: AssuranceLevel::Http {
+                    http_filters: vec![HttpFilter {
+                        method: HttpMethod::Any,
+                        path: "/*".into(),
+                    }],
+                },
+            }],
+        };
+        assert!(!wrong_dest.is_unrestricted());
+
+        // Right dest + Http but specific method.
+        let specific_method = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![PolicyRule {
+                destination: Destination::Domain("*".into()),
+                protocol: Protocol::Any,
+                reason: None,
+                level: AssuranceLevel::Http {
+                    http_filters: vec![HttpFilter {
+                        method: HttpMethod::Get,
+                        path: "/*".into(),
+                    }],
+                },
+            }],
+        };
+        assert!(!specific_method.is_unrestricted());
+
+        // Right dest + Http but wrong level variant.
+        let wrong_level = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![PolicyRule {
+                destination: Destination::Domain("*".into()),
+                protocol: Protocol::Any,
+                reason: None,
+                level: AssuranceLevel::Transport,
+            }],
+        };
+        assert!(!wrong_level.is_unrestricted());
+
+        // Two rules that individually look unrestricted — still not the
+        // canonical shape.
+        let mut two_rules = Policy::unrestricted();
+        two_rules.rules.push(two_rules.rules[0].clone());
+        assert!(!two_rules.is_unrestricted());
+    }
+
+    #[test]
+    fn policy_unrestricted_compiles_permissive_and_logged() {
+        let policy = Policy::unrestricted();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).expect("unrestricted must compile");
+
+        // CoreDNS: wildcard entry in the allowed-domains body so CoreDNS
+        // resolves anything the guest asks for.
+        assert!(
+            compiled.coredns_config.contains("\n*\n") || compiled.coredns_config.ends_with("*\n"),
+            "CoreDNS config must include wildcard allow-all line:\n{}",
+            compiled.coredns_config
+        );
+
+        // nftables: a non-empty allow rule covering tcp 80/443 without a
+        // specific daddr (no IP literal).  This is the pre-DNS-resolve
+        // allow-all rule that lets traffic through while awaiting
+        // propagation.  It must match the *original-direction* L4 port
+        // via `ct original proto-dst` — a bare `tcp dport { 80, 443 }`
+        // would never fire because the gateway's base chain DNATs the
+        // flow to the Envoy listener (port 10000) before the
+        // sandbox_policy forward chain gets to evaluate it.  Regression
+        // guard: the `ct original` statement must only pair with a ct
+        // key (`proto-dst`, `ip daddr`, ...), never a plain L4 match
+        // like `tcp dport` — that combination is a syntax error nftables
+        // rejects at load time.
+        assert!(
+            compiled
+                .nftables_rules
+                .contains("ct original proto-dst { 80, 443 } accept"),
+            "nftables ruleset must allow tcp 80/443 via ct original proto-dst:\n{}",
+            compiled.nftables_rules
+        );
+        assert!(
+            !compiled.nftables_rules.contains("ct original tcp dport"),
+            "nftables ruleset must not pair `ct original` with `tcp dport` \
+             (invalid nftables syntax):\n{}",
+            compiled.nftables_rules
+        );
+        assert!(
+            compiled.nftables_rules.contains("# unrestricted"),
+            "nftables ruleset must mark the unrestricted allow line:\n{}",
+            compiled.nftables_rules
+        );
+
+        // mitmproxy: one rule with host `*` and a single ANY /* filter.
+        let config: MitmproxyConfig =
+            serde_json::from_str(&compiled.mitmproxy_config).expect("mitmproxy config must parse");
+        assert_eq!(config.rules.len(), 1);
+        assert_eq!(config.rules[0].host, "*");
+        assert_eq!(config.rules[0].filters.len(), 1);
+        assert_eq!(config.rules[0].filters[0].method, "ANY");
+        assert_eq!(config.rules[0].filters[0].path, "/*");
+
+        // Envoy: the Http rule must emit a filter chain, but with no
+        // `server_names` match (bare `*` is not a valid Envoy SNI value),
+        // so traffic falls through to the default chain — i.e. original_dst
+        // passthrough.  Pinned so a future compiler change cannot re-
+        // introduce the invalid `server_names: ["*"]` shape.
+        assert!(
+            compiled.envoy_config.contains("level3_wildcard"),
+            "Envoy config must emit a level-3 chain for the `*` rule:\n{}",
+            compiled.envoy_config
+        );
+        assert!(
+            !compiled.envoy_config.contains("server_names: [\"*\"]"),
+            "Envoy config must NOT use `server_names: [\"*\"]` (invalid SNI match):\n{}",
+            compiled.envoy_config
+        );
+    }
+
+    #[test]
+    fn policy_unrestricted_dto_round_trip() {
+        use crate::api::{PolicyDto, PolicyLevelDto};
+
+        let original = Policy::unrestricted();
+        let dto: PolicyDto = (&original).into();
+        assert_eq!(dto.rules.len(), 1);
+        match &dto.rules[0].level {
+            PolicyLevelDto::Http { http_filters } => {
+                assert_eq!(http_filters.len(), 1);
+                assert_eq!(http_filters[0].method, HttpMethod::Any);
+                assert_eq!(http_filters[0].path, "/*");
+            }
+            _ => panic!("DTO must carry Http level"),
+        }
+
+        // JSON round-trip: serialize the domain Policy, parse it back,
+        // and confirm the round-tripped Policy still satisfies
+        // `is_unrestricted()` — this is the shape the daemon stores and
+        // that `describe` detects.
+        let json = serde_json::to_string(&original).expect("Policy must serialize");
+        let parsed: Policy = serde_json::from_str(&json).expect("Policy must deserialize");
+        assert!(parsed.is_unrestricted());
+    }
+
     // -- End-to-end compilation with mixed levels ----------------------------
 
     #[test]
@@ -1819,21 +2455,18 @@ mod tests {
                     destination: Destination::Domain("github.com".to_string()),
                     level: AssuranceLevel::Transport,
                     protocol: Protocol::Https,
-                    constraints: None,
                     reason: None,
                 },
                 PolicyRule {
                     destination: Destination::Domain("blocked.com".to_string()),
                     level: AssuranceLevel::Deny,
                     protocol: Protocol::Any,
-                    constraints: None,
                     reason: None,
                 },
                 PolicyRule {
                     destination: Destination::Cidr("10.0.0.0/8".to_string()),
                     level: AssuranceLevel::Transport,
                     protocol: Protocol::Tcp,
-                    constraints: None,
                     reason: None,
                 },
             ],
@@ -1886,7 +2519,6 @@ mod tests {
                 destination: Destination::Cidr("8.8.8.0/24".to_string()),
                 level: AssuranceLevel::Transport,
                 protocol: Protocol::Udp,
-                constraints: None,
                 reason: Some("DNS servers".to_string()),
             }],
         };
@@ -1913,28 +2545,30 @@ mod tests {
                     destination: Destination::Domain("secure.example.com".to_string()),
                     level: AssuranceLevel::Tls,
                     protocol: Protocol::Https,
-                    constraints: None,
                     reason: Some("TLS passthrough".to_string()),
                 },
                 PolicyRule {
                     destination: Destination::Domain("api.secure.io".to_string()),
                     level: AssuranceLevel::Tls,
                     protocol: Protocol::Https,
-                    constraints: None,
                     reason: Some("Another TLS destination".to_string()),
                 },
             ],
         }
     }
 
+    /// Http-level policy with a single `(ANY, /*)` wildcard filter —
+    /// semantically equivalent to pre-M9-S10 "level: full, no constraints"
+    /// (permit any HTTP request to the host).
     fn full_policy() -> Policy {
         Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
                 destination: Destination::Domain("inspected.example.com".to_string()),
-                level: AssuranceLevel::Full,
+                level: AssuranceLevel::Http {
+                    http_filters: vec![http_filter(HttpMethod::Any, "/*")],
+                },
                 protocol: Protocol::Https,
-                constraints: None,
                 reason: Some("Full inspection".to_string()),
             }],
         }
@@ -1945,12 +2579,15 @@ mod tests {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
                 destination: Destination::Domain("api.example.com".to_string()),
-                level: AssuranceLevel::Full,
+                level: AssuranceLevel::Http {
+                    http_filters: vec![
+                        http_filter(HttpMethod::Get, "/api/v1/*"),
+                        http_filter(HttpMethod::Get, "/health"),
+                        http_filter(HttpMethod::Post, "/api/v1/*"),
+                        http_filter(HttpMethod::Post, "/health"),
+                    ],
+                },
                 protocol: Protocol::Https,
-                constraints: Some(HttpConstraints {
-                    methods: vec!["GET".to_string(), "POST".to_string()],
-                    paths: vec!["/api/v1/".to_string(), "/health".to_string()],
-                }),
                 reason: Some("Constrained API access".to_string()),
             }],
         }
@@ -1964,24 +2601,20 @@ mod tests {
                     destination: Destination::Domain("github.com".to_string()),
                     level: AssuranceLevel::Transport,
                     protocol: Protocol::Https,
-                    constraints: None,
                     reason: Some("L1 transport".to_string()),
                 },
                 PolicyRule {
                     destination: Destination::Domain("pinned.example.com".to_string()),
                     level: AssuranceLevel::Tls,
                     protocol: Protocol::Https,
-                    constraints: None,
                     reason: Some("L2 TLS passthrough".to_string()),
                 },
                 PolicyRule {
                     destination: Destination::Domain("monitored.example.com".to_string()),
-                    level: AssuranceLevel::Full,
+                    level: AssuranceLevel::Http {
+                        http_filters: vec![http_filter(HttpMethod::Get, "/api/*")],
+                    },
                     protocol: Protocol::Https,
-                    constraints: Some(HttpConstraints {
-                        methods: vec!["GET".to_string()],
-                        paths: vec!["/api/".to_string()],
-                    }),
                     reason: Some("L3 full inspection".to_string()),
                 },
             ],
@@ -2190,9 +2823,10 @@ mod tests {
         let config: MitmproxyConfig = serde_json::from_str(&compiled.mitmproxy_config).unwrap();
         assert_eq!(config.rules.len(), 1);
         assert_eq!(config.rules[0].host, "inspected.example.com");
-        // No constraints = methods and paths are None (allow all).
-        assert!(config.rules[0].methods.is_none());
-        assert!(config.rules[0].paths.is_none());
+        // `full_policy()` uses a wildcard filter `(ANY, /*)`.
+        assert_eq!(config.rules[0].filters.len(), 1);
+        assert_eq!(config.rules[0].filters[0].method, "ANY");
+        assert_eq!(config.rules[0].filters[0].path, "/*");
     }
 
     #[test]
@@ -2205,11 +2839,20 @@ mod tests {
         assert_eq!(config.rules.len(), 1);
         assert_eq!(config.rules[0].host, "api.example.com");
 
-        let methods = config.rules[0].methods.as_ref().unwrap();
-        assert_eq!(methods, &["GET", "POST"]);
-
-        let paths = config.rules[0].paths.as_ref().unwrap();
-        assert_eq!(paths, &["/api/v1/", "/health"]);
+        let pairs: Vec<(&str, &str)> = config.rules[0]
+            .filters
+            .iter()
+            .map(|f| (f.method.as_str(), f.path.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("GET", "/api/v1/*"),
+                ("GET", "/health"),
+                ("POST", "/api/v1/*"),
+                ("POST", "/health"),
+            ]
+        );
     }
 
     #[test]
@@ -2340,11 +2983,10 @@ mod tests {
         assert_eq!(config.rules.len(), 1);
         assert_eq!(config.rules[0].host, "monitored.example.com");
 
-        // L3 rule with constraints should have methods and paths.
-        let methods = config.rules[0].methods.as_ref().unwrap();
-        assert_eq!(methods, &["GET"]);
-        let paths = config.rules[0].paths.as_ref().unwrap();
-        assert_eq!(paths, &["/api/"]);
+        // L3 rule with one `(GET, /api/*)` filter pair.
+        assert_eq!(config.rules[0].filters.len(), 1);
+        assert_eq!(config.rules[0].filters[0].method, "GET");
+        assert_eq!(config.rules[0].filters[0].path, "/api/*");
     }
 
     #[test]
@@ -2385,7 +3027,6 @@ mod tests {
                 destination: Destination::Domain("*.example.com".to_string()),
                 level: AssuranceLevel::Tls,
                 protocol: Protocol::Https,
-                constraints: None,
                 reason: None,
             }],
         };
@@ -2414,9 +3055,10 @@ mod tests {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
                 destination: Destination::Domain("*.inspected.io".to_string()),
-                level: AssuranceLevel::Full,
+                level: AssuranceLevel::Http {
+                    http_filters: vec![http_filter(HttpMethod::Any, "/*")],
+                },
                 protocol: Protocol::Https,
-                constraints: None,
                 reason: None,
             }],
         };
@@ -2456,21 +3098,18 @@ mod tests {
                     destination: Destination::Domain("a.example.com".to_string()),
                     level: AssuranceLevel::Tls,
                     protocol: Protocol::Https,
-                    constraints: None,
                     reason: None,
                 },
                 PolicyRule {
                     destination: Destination::Domain("b.example.com".to_string()),
                     level: AssuranceLevel::Tls,
                     protocol: Protocol::Https,
-                    constraints: None,
                     reason: None,
                 },
                 PolicyRule {
                     destination: Destination::Domain("c.example.com".to_string()),
                     level: AssuranceLevel::Tls,
                     protocol: Protocol::Https,
-                    constraints: None,
                     reason: None,
                 },
             ],
@@ -2506,19 +3145,18 @@ mod tests {
             rules: vec![
                 PolicyRule {
                     destination: Destination::Domain("api.one.com".to_string()),
-                    level: AssuranceLevel::Full,
+                    level: AssuranceLevel::Http {
+                        http_filters: vec![http_filter(HttpMethod::Get, "/*")],
+                    },
                     protocol: Protocol::Https,
-                    constraints: Some(HttpConstraints {
-                        methods: vec!["GET".to_string()],
-                        paths: vec![],
-                    }),
                     reason: None,
                 },
                 PolicyRule {
                     destination: Destination::Domain("api.two.com".to_string()),
-                    level: AssuranceLevel::Full,
+                    level: AssuranceLevel::Http {
+                        http_filters: vec![http_filter(HttpMethod::Any, "/*")],
+                    },
                     protocol: Protocol::Https,
-                    constraints: None,
                     reason: None,
                 },
             ],
@@ -2549,22 +3187,23 @@ mod tests {
         assert!(hosts.contains(&"api.one.com"));
         assert!(hosts.contains(&"api.two.com"));
 
-        // First rule has method constraint, second has none.
         let one_rule = config
             .rules
             .iter()
             .find(|r| r.host == "api.one.com")
             .unwrap();
-        assert_eq!(one_rule.methods.as_ref().unwrap(), &["GET"]);
-        assert!(one_rule.paths.is_none()); // empty vec → None
+        assert_eq!(one_rule.filters.len(), 1);
+        assert_eq!(one_rule.filters[0].method, "GET");
+        assert_eq!(one_rule.filters[0].path, "/*");
 
         let two_rule = config
             .rules
             .iter()
             .find(|r| r.host == "api.two.com")
             .unwrap();
-        assert!(two_rule.methods.is_none());
-        assert!(two_rule.paths.is_none());
+        assert_eq!(two_rule.filters.len(), 1);
+        assert_eq!(two_rule.filters[0].method, "ANY");
+        assert_eq!(two_rule.filters[0].path, "/*");
     }
 
     // -- L2-only policy (no L1) does not produce default chain ----------------

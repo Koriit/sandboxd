@@ -24,6 +24,9 @@ fn test_lima_create_and_delete() {
         disk_gb: 10,
         workspace_mode: None,
         hardened: true,
+        repo: None,
+        boot_cmd: None,
+        template: None,
     };
 
     // Create the VM

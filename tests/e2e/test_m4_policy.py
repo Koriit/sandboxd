@@ -314,7 +314,7 @@ def test_level2_tls_verified(sandbox_cli):
 
 @pytest.mark.timeout(600)
 def test_level3_http_inspected(sandbox_cli):
-    """Policy allows example.com at level 'full'. HTTPS should succeed but the
+    """Policy allows example.com at level 'http'. HTTPS should succeed but the
     certificate should show mitmproxy/Sandbox CA (MITM inspection is active).
     """
     session_id = None
@@ -323,7 +323,11 @@ def test_level3_http_inspected(sandbox_cli):
         policy = {
             "version": "1.0.0",
             "rules": [
-                {"destination": "example.com", "level": "full"},
+                {
+                    "destination": "example.com",
+                    "level": "http",
+                    "http_filters": [{"method": "ANY", "path": "/*"}],
+                },
             ],
         }
         policy_path = write_policy_file(policy)
@@ -399,7 +403,7 @@ def test_level3_http_inspected(sandbox_cli):
 
 @pytest.mark.timeout(600)
 def test_level3_host_mismatch(sandbox_cli):
-    """Policy allows only api.github.com at level 'full'. Accessing
+    """Policy allows only api.github.com at level 'http'. Accessing
     evil.example.com should be blocked at the DNS level (NXDOMAIN).
 
     In the DNS-first architecture, CoreDNS denies resolution of domains
@@ -411,7 +415,11 @@ def test_level3_host_mismatch(sandbox_cli):
         policy = {
             "version": "1.0.0",
             "rules": [
-                {"destination": "api.github.com", "level": "full"},
+                {
+                    "destination": "api.github.com",
+                    "level": "http",
+                    "http_filters": [{"method": "ANY", "path": "/*"}],
+                },
             ],
         }
         policy_path = write_policy_file(policy)
@@ -463,7 +471,7 @@ def test_level3_host_mismatch(sandbox_cli):
 
 @pytest.mark.timeout(600)
 def test_level3_method_restriction(sandbox_cli):
-    """Policy allows httpbin.org at level 'full' with methods=["GET"].
+    """Policy allows httpbin.org at level 'http' with only GET filters.
     A POST request should get HTTP 599 (policy-denied).
     """
     session_id = None
@@ -474,8 +482,8 @@ def test_level3_method_restriction(sandbox_cli):
             "rules": [
                 {
                     "destination": "httpbin.org",
-                    "level": "full",
-                    "constraints": {"methods": ["GET"]},
+                    "level": "http",
+                    "http_filters": [{"method": "GET", "path": "/*"}],
                 },
             ],
         }
@@ -541,7 +549,7 @@ def test_level3_method_restriction(sandbox_cli):
 
 @pytest.mark.timeout(600)
 def test_level3_path_restriction(sandbox_cli):
-    """Policy allows a host at level 'full' with paths=["/api/"].
+    """Policy allows a host at level 'http' with a single `/api/*` filter.
     Requests to /other/path should get HTTP 599 (policy-denied).
     """
     session_id = None
@@ -552,8 +560,8 @@ def test_level3_path_restriction(sandbox_cli):
             "rules": [
                 {
                     "destination": "httpbin.org",
-                    "level": "full",
-                    "constraints": {"paths": ["/api/"]},
+                    "level": "http",
+                    "http_filters": [{"method": "ANY", "path": "/api/*"}],
                 },
             ],
         }
@@ -588,6 +596,7 @@ def test_level3_path_restriction(sandbox_cli):
             timeout=120,
         )
         bad_code = bad_path_result.stdout.strip()
+
         assert bad_code == "599", (
             f"Expected HTTP 599 for disallowed path /other/path, got: {bad_code}.\n"
             f"stdout: {bad_path_result.stdout}\nstderr: {bad_path_result.stderr}"
@@ -889,5 +898,264 @@ def test_dns_ip_propagation(sandbox_cli):
     finally:
         if session_id is not None:
             sandbox_cli("rm", "pol-dns-ip", timeout=120)
+        if policy_path is not None:
+            cleanup_policy_file(policy_path)
+
+
+@pytest.mark.timeout(600)
+def test_empty_policy_denies_dns(sandbox_cli):
+    """Creating a session with no `--policy` must produce a fail-closed default:
+    CoreDNS returns NXDOMAIN for everything and HTTP is unreachable.
+    """
+    session_id = None
+    try:
+        result = sandbox_cli(
+            "create", "--name", "pol-empty-default",
+            *_VM_RESOURCE_ARGS,
+            timeout=600,
+        )
+        assert result.returncode == 0, (
+            f"sandbox create (no policy) failed (rc={result.returncode}).\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        session_id = parse_session_id(result.stdout)
+        wait_for_state(sandbox_cli, "pol-empty-default", "Running", timeout=10)
+
+        # DNS should fail-closed: NXDOMAIN for any domain.
+        dns_result = sandbox_cli(
+            "ssh", "pol-empty-default", "--",
+            "nslookup", "example.com",
+            timeout=120,
+        )
+        combined = (dns_result.stdout + dns_result.stderr).lower()
+        assert (
+            dns_result.returncode != 0
+            or "nxdomain" in combined
+            or "can't find" in combined
+        ), (
+            f"DNS lookup should return NXDOMAIN with no policy (fail-closed default).\n"
+            f"stdout: {dns_result.stdout}\nstderr: {dns_result.stderr}"
+        )
+
+        # HTTP should fail as well.
+        curl_result = sandbox_cli(
+            "ssh", "pol-empty-default", "--",
+            "bash", "-c",
+            "curl -s --connect-timeout 10 --max-time 15 http://example.com/ 2>&1; echo EXIT:$?",
+            timeout=120,
+        )
+        assert "EXIT:0" not in curl_result.stdout, (
+            f"HTTP request should have failed with no policy (fail-closed default).\n"
+            f"Output:\n{curl_result.stdout}"
+        )
+
+        sandbox_cli("rm", "pol-empty-default", timeout=120)
+        session_id = None
+
+    finally:
+        if session_id is not None:
+            sandbox_cli("rm", "pol-empty-default", timeout=120)
+
+
+@pytest.mark.timeout(600)
+def test_unrestricted_allows_and_logs(sandbox_cli):
+    """`sandbox create --unrestricted` should allow arbitrary HTTP traffic while
+    still being proxied through mitmproxy (so requests are logged).
+    """
+    session_id = None
+    try:
+        result = sandbox_cli(
+            "create", "--name", "pol-unrestricted",
+            *_VM_RESOURCE_ARGS, "--unrestricted",
+            timeout=600,
+        )
+        assert result.returncode == 0, (
+            f"sandbox create --unrestricted failed (rc={result.returncode}).\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        session_id = parse_session_id(result.stdout)
+        wait_for_state(sandbox_cli, "pol-unrestricted", "Running", timeout=10)
+
+        # describe should render the sentinel line.
+        describe_result = sandbox_cli(
+            "describe", "pol-unrestricted",
+            timeout=60,
+        )
+        assert describe_result.returncode == 0, (
+            f"sandbox describe failed (rc={describe_result.returncode}).\n"
+            f"stdout: {describe_result.stdout}\nstderr: {describe_result.stderr}"
+        )
+        assert "unrestricted (logged)" in describe_result.stdout, (
+            f"describe output missing 'unrestricted (logged)' sentinel.\n"
+            f"stdout: {describe_result.stdout}"
+        )
+
+        # Warm DNS cache: the first lookup seeds the daemon's DNS propagation
+        # loop, which then installs the sandbox_l3 DNAT rules that route
+        # egress TCP 80/443 through mitmproxy.  Until those rules land the
+        # forward chain falls back to Envoy passthrough (so curl would work
+        # but mitmproxy would never see the request, and the log assertion
+        # below would fail).
+        sandbox_cli(
+            "ssh", "pol-unrestricted", "--",
+            "nslookup", "example.com",
+            timeout=60,
+        )
+        # DNS propagation loop polls every ~2s; sleep a bit longer to let the
+        # sandbox_l3 rules land.
+        time.sleep(6)
+
+        # HTTP to an arbitrary domain should succeed and be proxied through
+        # mitmproxy.
+        curl_result = sandbox_cli(
+            "ssh", "pol-unrestricted", "--",
+            "curl", "-s", "--connect-timeout", "15", "--max-time", "30",
+            "http://example.com/",
+            timeout=120,
+        )
+        assert curl_result.returncode == 0, (
+            f"curl to example.com failed under --unrestricted policy.\n"
+            f"stdout: {curl_result.stdout}\nstderr: {curl_result.stderr}"
+        )
+        assert "Example Domain" in curl_result.stdout, (
+            f"Response missing 'Example Domain'; --unrestricted should allow and proxy.\n"
+            f"stdout: {curl_result.stdout}"
+        )
+
+        # Allow a moment for mitmproxy to flush its log.
+        time.sleep(2)
+
+        # Verify the request was logged by mitmproxy in the gateway container.
+        gw_container = gateway_container_name(session_id)
+        log_result = subprocess.run(
+            [
+                "docker", "exec", gw_container,
+                "cat", "/var/log/gateway/mitmproxy.log",
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        # mitmproxy log format varies, but the host and/or method should
+        # appear once a request has been routed through it.
+        assert log_result.returncode == 0, (
+            f"Failed to read mitmproxy log from {gw_container}.\n"
+            f"stdout: {log_result.stdout}\nstderr: {log_result.stderr}"
+        )
+        assert "example.com" in log_result.stdout or "GET /" in log_result.stdout, (
+            f"mitmproxy log did not record an allowed request under --unrestricted.\n"
+            f"log:\n{log_result.stdout}"
+        )
+
+        sandbox_cli("rm", "pol-unrestricted", timeout=120)
+        session_id = None
+
+    finally:
+        if session_id is not None:
+            sandbox_cli("rm", "pol-unrestricted", timeout=120)
+
+
+@pytest.mark.timeout(600)
+def test_policy_clear_reverts_to_deny_all(sandbox_cli):
+    """Create a session with an HTTP-level policy, then clear it via
+    `sandbox policy update --clear`. Afterwards traffic must be denied.
+    """
+    session_id = None
+    policy_path = None
+    try:
+        # Start with an HTTP-level policy allowing example.com GET /*.
+        policy = {
+            "version": "1.0.0",
+            "rules": [
+                {
+                    "destination": "example.com",
+                    "level": "http",
+                    "http_filters": [
+                        {"method": "GET", "path": "/*"},
+                    ],
+                },
+            ],
+        }
+        policy_path = write_policy_file(policy)
+
+        result = sandbox_cli(
+            "create", "--name", "pol-clear",
+            *_VM_RESOURCE_ARGS, "--policy", policy_path,
+            timeout=600,
+        )
+        assert result.returncode == 0, (
+            f"sandbox create failed (rc={result.returncode}).\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        session_id = parse_session_id(result.stdout)
+        wait_for_state(sandbox_cli, "pol-clear", "Running", timeout=10)
+
+        # Warm DNS to trigger the propagation loop installing sandbox_l3
+        # DNAT rules for example.com; without this, the first HTTP flow may
+        # hit an incomplete L3 redirect and get reset by Envoy/mitmproxy.
+        sandbox_cli(
+            "ssh", "pol-clear", "--",
+            "nslookup", "example.com",
+            timeout=60,
+        )
+        time.sleep(6)
+
+        # Sanity: example.com should be reachable while policy is active.
+        curl_before = sandbox_cli(
+            "ssh", "pol-clear", "--",
+            "curl", "-s", "--connect-timeout", "15", "--max-time", "30",
+            "http://example.com/",
+            timeout=120,
+        )
+        assert curl_before.returncode == 0, (
+            f"Initial curl should have succeeded with active policy.\n"
+            f"stdout: {curl_before.stdout}\nstderr: {curl_before.stderr}"
+        )
+
+        # Clear the policy.
+        clear_result = sandbox_cli(
+            "policy", "update", "pol-clear", "--clear",
+            timeout=120,
+        )
+        assert clear_result.returncode == 0, (
+            f"sandbox policy update --clear failed (rc={clear_result.returncode}).\n"
+            f"stdout: {clear_result.stdout}\nstderr: {clear_result.stderr}"
+        )
+
+        # Allow a moment for gateway components to reconfigure.
+        time.sleep(5)
+
+        # DNS should now fail (NXDOMAIN for example.com).
+        dns_result = sandbox_cli(
+            "ssh", "pol-clear", "--",
+            "nslookup", "example.com",
+            timeout=120,
+        )
+        combined = (dns_result.stdout + dns_result.stderr).lower()
+        assert (
+            dns_result.returncode != 0
+            or "nxdomain" in combined
+            or "can't find" in combined
+        ), (
+            f"DNS should return NXDOMAIN after policy --clear.\n"
+            f"stdout: {dns_result.stdout}\nstderr: {dns_result.stderr}"
+        )
+
+        # HTTP should also fail now.
+        curl_after = sandbox_cli(
+            "ssh", "pol-clear", "--",
+            "bash", "-c",
+            "curl -s --connect-timeout 10 --max-time 15 http://example.com/ 2>&1; echo EXIT:$?",
+            timeout=120,
+        )
+        assert "EXIT:0" not in curl_after.stdout, (
+            f"HTTP should fail after policy --clear.\n"
+            f"Output:\n{curl_after.stdout}"
+        )
+
+        sandbox_cli("rm", "pol-clear", timeout=120)
+        session_id = None
+
+    finally:
+        if session_id is not None:
+            sandbox_cli("rm", "pol-clear", timeout=120)
         if policy_path is not None:
             cleanup_policy_file(policy_path)

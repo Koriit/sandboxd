@@ -1216,6 +1216,47 @@ Six review tracks, each producing findings that are fixed in-session:
 
 ---
 
+### M9-S15: Fail-closed DNS default and `--unrestricted` / `--clear` policy controls
+
+**Entry criteria:** M9-S14 complete.
+
+**Rationale:** Today a session with no policy has fail-closed nftables (FORWARD drop) but fail-open CoreDNS (wildcard `*`). DNS resolution succeeds for arbitrary domains even though outbound traffic is dropped — a confusing asymmetry and a subtle exfiltration vector (DNS payloads, leaky resolvers). Fix by making the empty-policy default deny-all at every layer, then expose two explicit escape hatches:
+
+1. `--unrestricted` on `sandbox create` and `sandbox policy update` — installs a real, persisted synthetic policy that allows all traffic but still routes HTTP through mitmproxy so methods/paths are logged for discovery.
+2. `--clear` on `sandbox policy update` — removes any stored policy and re-applies the empty deny-all default.
+
+Unrestricted mode is intentionally a normal `Policy` value (stored in SQLite, round-trips through `inspect`/`describe`) — not a session-level flag. This keeps one source of truth and preserves existing persistence guarantees.
+
+**Tasks:**
+
+- **Fail-closed DNS default.** In `sandboxd/src/main.rs`, replace the three `"# Default allow-all policy ...\n*\n"` literals (around lines 657, 1937, 2005) with an empty `CoreDnsConfig { allowed_domains: vec![] }.to_file_content()` rendering. Add a constant helper in `sandbox-core::policy` (e.g. `CoreDnsConfig::empty_policy_file_content()`) so the three sites agree.
+- **Unrestricted synthetic policy constructor.** In `sandbox-core::policy` add `Policy::unrestricted()` returning a real `Policy` with a single wildcard rule: destination `*`, `AssuranceLevel::Http { http_filters: [HttpFilter { method: HttpMethod::Any, path: "/*" }] }`. Compile-time test that it round-trips through the SQL store and through the DTO layer.
+- **Policy compiler + unrestricted visibility.** Extend `PolicyCompiler` so the wildcard-host + HTTP level + `ANY /*` filter expands to: CoreDNS `*` (allow all), nftables allow-all egress, Envoy SNI allow-all, mitmproxy `ANY /*` on `*`. Traffic still flows through gateway components so connections are logged for discovery.
+- **CLI `sandbox create --unrestricted`.** Flag is mutually exclusive with `--policy`. When set, the CLI posts the synthetic unrestricted policy alongside session creation (re-using the existing `PUT /sessions/{id}/policy` path).
+- **CLI `sandbox policy update --unrestricted` / `--clear`.** Both mutually exclusive with `--policy` (file-based path) and with each other. `--unrestricted` applies the synthetic policy. `--clear` issues a `DELETE /sessions/{id}/policy` (add the endpoint if missing) that removes the row from SQLite, drops it from the in-memory `session_policies` map, and re-pushes the empty deny-all config to the gateway.
+- **`sandbox describe` renderer.** Detect the unrestricted shape (wildcard host + HTTP + `ANY /*`) and render a dedicated `Policy: unrestricted (logged)` line rather than the generic rule block. Plain JSON `inspect` output is unchanged — the shape is the source of truth.
+- **Unit tests.**
+  - `policy.rs`: `Policy::unrestricted()` produces an `AssuranceLevel::Http` rule with wildcard destination and `ANY /*` filter; `PolicyCompiler` expands it to the all-four-layers permissive config; DNS empty policy file content is exactly the two-comment header with no entries.
+  - `dto`: unrestricted policy round-trips through `PolicyDto` serialization.
+  - `store.rs`: `set_policy(unrestricted())` + reload survives the same as any other policy; `delete_policy` (new) drops the row and subsequent `get_policy` returns `None`.
+  - CLI: `create --unrestricted --policy foo.json` errors; `policy update --unrestricted --clear` errors; `policy update --clear` on a session with no policy is a no-op success.
+  - `describe`: unrestricted policy renders the sentinel line.
+- **E2E tests.**
+  - New test in `test_m4_policy.py`: empty-policy session — `dig google.com` inside the VM must return NXDOMAIN (was: succeed). Audit existing M4 tests for the same assumption and update where needed.
+  - New test: `sandbox create --unrestricted` — `dig` and `curl https://example.com` both succeed, and the mitmproxy access log shows the GET line.
+  - New test: `sandbox policy update --clear` reverts an existing level-3 session to deny-all (confirm denial via `dig` + `curl`).
+
+**Exit criteria:**
+
+1. With no policy applied, `dig google.com` inside the sandbox returns NXDOMAIN and `curl` to any host fails at the TCP layer.
+2. `sandbox create --unrestricted` produces a session where DNS, TCP, TLS, and HTTP all succeed, with mitmproxy logging method + path for HTTP flows.
+3. `sandbox policy update --unrestricted` and `--clear` behave identically to their create-time and no-policy counterparts respectively; both are rejected when combined with `--policy` or with each other.
+4. `sandbox inspect` exposes the unrestricted policy as a normal `PolicyDto` JSON value; `sandbox describe` collapses it to the `unrestricted (logged)` sentinel line.
+5. Persistence: `sandbox policy update --unrestricted` survives daemon restart via the existing SQL store; `--clear` leaves no row behind.
+6. Unit suite green; full E2E suite green with the new tests added.
+
+---
+
 ## Risks
 
 | Risk | Impact | Mitigation |
@@ -1242,8 +1283,8 @@ Six review tracks, each producing findings that are fixed in-session:
 | M7 | 1 |
 | M8 | 3 |
 | M8.5 | 4 |
-| M9 | 13 |
-| **Total** | **47** |
+| M9 | 15 |
+| **Total** | **49** |
 
 ---
 

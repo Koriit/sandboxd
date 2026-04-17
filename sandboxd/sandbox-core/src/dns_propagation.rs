@@ -244,7 +244,7 @@ pub fn generate_domain_ip_rules(
     let mut allow_rules = Vec::new();
 
     for rule in &policy.rules {
-        if rule.level == AssuranceLevel::Deny {
+        if matches!(rule.level, AssuranceLevel::Deny) {
             continue;
         }
 
@@ -267,6 +267,35 @@ pub fn generate_domain_ip_rules(
                         allow_rules.push(format!(
                             "        ct original ip daddr {ip_or_cidr} udp dport {{ 80, 443 }} accept"
                         ));
+                    }
+                }
+            }
+            Destination::Domain(domain) if domain == "*" => {
+                // Unrestricted wildcard destination: accept any daddr.  The
+                // DNS cache never holds `*`, so the regular resolved-IP
+                // path below would be a no-op.  Mirror the baseline rule
+                // emitted by `PolicyCompiler::compile_nftables` so the
+                // post-propagation ruleset stays permissive.
+                //
+                // `ct original proto-dst` matches the original-direction
+                // L4 port — required here because the gateway's base chain
+                // DNATs the flow to the Envoy listener before this rule
+                // gets evaluated, so a bare `tcp dport` would not match.
+                match rule.protocol {
+                    crate::policy::Protocol::Tcp
+                    | crate::policy::Protocol::Https
+                    | crate::policy::Protocol::Http
+                    | crate::policy::Protocol::Any => {
+                        allow_rules.push(
+                            "        meta l4proto tcp ct original proto-dst { 80, 443 } accept # unrestricted"
+                                .to_string(),
+                        );
+                    }
+                    crate::policy::Protocol::Udp => {
+                        allow_rules.push(
+                            "        meta l4proto udp ct original proto-dst { 80, 443 } accept # unrestricted"
+                                .to_string(),
+                        );
                     }
                 }
             }
@@ -365,7 +394,7 @@ pub fn generate_l3_redirect_rules(
     let mut redirect_rules = Vec::new();
 
     for rule in &policy.rules {
-        if rule.level != AssuranceLevel::Full {
+        if !matches!(rule.level, AssuranceLevel::Http { .. }) {
             continue;
         }
 
@@ -375,6 +404,16 @@ pub fn generate_l3_redirect_rules(
                 redirect_rules.push(format!(
                     "        ip saddr {vm_subnet} ip daddr {ip_or_cidr} tcp dport {{ 80, 443 }} \
                      dnat to {gateway_ip}:8080 # L3 CIDR"
+                ));
+            }
+            Destination::Domain(domain) if domain == "*" => {
+                // Unrestricted Http rule: redirect every egress TCP 80/443
+                // from the VM to mitmproxy.  Matches any daddr, so
+                // SO_ORIGINAL_DST in mitmproxy will recover the real
+                // upstream regardless of what the guest connected to.
+                redirect_rules.push(format!(
+                    "        ip saddr {vm_subnet} tcp dport {{ 80, 443 }} \
+                     dnat to {gateway_ip}:8080 # L3 unrestricted"
                 ));
             }
             Destination::Domain(domain) => {
@@ -473,7 +512,8 @@ mod tests {
     use super::*;
     use crate::network::NetworkInfo;
     use crate::policy::{
-        AssuranceLevel, Destination, Policy, PolicyRule, Protocol, SCHEMA_VERSION,
+        AssuranceLevel, Destination, HttpFilter, HttpMethod, Policy, PolicyRule, Protocol,
+        SCHEMA_VERSION,
     };
 
     fn test_network_info() -> NetworkInfo {
@@ -684,7 +724,6 @@ mod tests {
                 destination: Destination::Domain("evil.com".to_string()),
                 level: AssuranceLevel::Deny,
                 protocol: Protocol::Any,
-                constraints: None,
                 reason: None,
             }],
         };
@@ -703,7 +742,6 @@ mod tests {
                 destination: Destination::Domain("github.com".to_string()),
                 level: AssuranceLevel::Transport,
                 protocol: Protocol::Https,
-                constraints: None,
                 reason: None,
             }],
         };
@@ -735,7 +773,6 @@ mod tests {
                 destination: Destination::Cidr("140.82.112.0/20".to_string()),
                 level: AssuranceLevel::Transport,
                 protocol: Protocol::Tcp,
-                constraints: None,
                 reason: None,
             }],
         };
@@ -755,7 +792,6 @@ mod tests {
                 destination: Destination::Domain("not-resolved.com".to_string()),
                 level: AssuranceLevel::Transport,
                 protocol: Protocol::Any,
-                constraints: None,
                 reason: None,
             }],
         };
@@ -777,14 +813,12 @@ mod tests {
                     destination: Destination::Cidr("10.0.0.0/8".to_string()),
                     level: AssuranceLevel::Transport,
                     protocol: Protocol::Any,
-                    constraints: None,
                     reason: None,
                 },
                 PolicyRule {
                     destination: Destination::Domain("example.com".to_string()),
                     level: AssuranceLevel::Transport,
                     protocol: Protocol::Https,
-                    constraints: None,
                     reason: None,
                 },
             ],
@@ -871,7 +905,6 @@ mod tests {
                 destination: Destination::Domain("example.com".to_string()),
                 level: AssuranceLevel::Transport,
                 protocol: Protocol::Any,
-                constraints: None,
                 reason: None,
             }],
         };
@@ -900,9 +933,13 @@ mod tests {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
                 destination: Destination::Domain("example.com".to_string()),
-                level: AssuranceLevel::Full,
+                level: AssuranceLevel::Http {
+                    http_filters: vec![HttpFilter {
+                        method: HttpMethod::Any,
+                        path: "/*".to_string(),
+                    }],
+                },
                 protocol: Protocol::Https,
-                constraints: None,
                 reason: None,
             }],
         };
@@ -945,9 +982,13 @@ mod tests {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
                 destination: Destination::Cidr("10.0.0.0/8".to_string()),
-                level: AssuranceLevel::Full,
+                level: AssuranceLevel::Http {
+                    http_filters: vec![HttpFilter {
+                        method: HttpMethod::Any,
+                        path: "/*".to_string(),
+                    }],
+                },
                 protocol: Protocol::Https,
-                constraints: None,
                 reason: None,
             }],
         };
@@ -971,9 +1012,13 @@ mod tests {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
                 destination: Destination::Domain("not-yet-resolved.com".to_string()),
-                level: AssuranceLevel::Full,
+                level: AssuranceLevel::Http {
+                    http_filters: vec![HttpFilter {
+                        method: HttpMethod::Any,
+                        path: "/*".to_string(),
+                    }],
+                },
                 protocol: Protocol::Https,
-                constraints: None,
                 reason: None,
             }],
         };
@@ -996,21 +1041,23 @@ mod tests {
                     destination: Destination::Domain("transport.com".to_string()),
                     level: AssuranceLevel::Transport,
                     protocol: Protocol::Any,
-                    constraints: None,
                     reason: None,
                 },
                 PolicyRule {
                     destination: Destination::Domain("tls.com".to_string()),
                     level: AssuranceLevel::Tls,
                     protocol: Protocol::Https,
-                    constraints: None,
                     reason: None,
                 },
                 PolicyRule {
                     destination: Destination::Domain("full.com".to_string()),
-                    level: AssuranceLevel::Full,
+                    level: AssuranceLevel::Http {
+                        http_filters: vec![HttpFilter {
+                            method: HttpMethod::Any,
+                            path: "/*".to_string(),
+                        }],
+                    },
                     protocol: Protocol::Https,
-                    constraints: None,
                     reason: None,
                 },
             ],

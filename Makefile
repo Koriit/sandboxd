@@ -24,12 +24,29 @@ tests/e2e/.venv/.installed: tests/e2e/pyproject.toml
 	touch tests/e2e/.venv/.installed
 
 TEST ?=
-test-e2e: tests/e2e/.venv/.installed
+# test-e2e depends on gateway-image so the container running mitmproxy /
+# Envoy / CoreDNS always reflects the current `networking/` sources.
+# Forgetting to rebuild baked stale addon code into the image and produced
+# silent semantic drift between sandboxd (Rust) and the enforcement layer.
+test-e2e: tests/e2e/.venv/.installed gateway-image
 	cd tests/e2e && . .venv/bin/activate && python -m pytest -v -rs $(TEST)
 
-gateway-image:
+# Stamp-driven rebuild: only rebuild the docker image when one of its
+# inputs (Dockerfile, addon, entrypoint, Envoy/CoreDNS configs) changes.
+# The phony `gateway-image` target remains as an unconditional rebuild
+# entry point for callers who want to force a rebuild.
+GATEWAY_INPUTS := $(shell find networking -type f \
+	\( -name '*.py' -o -name '*.sh' -o -name 'Dockerfile' \
+	   -o -name '*.yaml' -o -name '*.yml' -o -name 'Corefile' \) \
+	-not -path '*/__pycache__/*')
+
+.gateway-image.stamp: $(GATEWAY_INPUTS)
 	docker build -t sandbox-gateway -f networking/gateway/Dockerfile networking/
+	@touch $@
+
+gateway-image: .gateway-image.stamp
 
 clean:
 	cd sandboxd && cargo clean
 	rm -rf tests/e2e/.venv/
+	rm -f .gateway-image.stamp

@@ -403,6 +403,151 @@ sandbox health 9f8e7d6c5b4a
 
 ---
 
+## sandbox inspect
+
+Print the full state of one or more sandbox sessions as a JSON array. Output is pretty-printed and valid for piping into `jq`.
+
+### Synopsis
+
+```
+sandbox inspect <session>...
+```
+
+### Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `<session>...` | One or more session names or session IDs (see [Session identifiers](#session-identifiers)). |
+
+### Details
+
+- Emits a JSON array of `SessionDto` objects — one element per argument, in input order.
+- The CLI resolves every id against the daemon first. If any is missing, it writes an error naming the first missing id to stderr, exits non-zero, and emits **no** stdout. Successful lookups earlier in the argument list are not printed.
+- Requests are issued in parallel; ordering of the response array follows the command line, not wall-clock completion.
+- The `policy` field is present only when a policy has been applied to the session; it is omitted otherwise.
+
+### Output
+
+```json
+[
+  {
+    "id": "a1b2c3d4e5f6",
+    "name": "dev",
+    "state": "running",
+    "created_at": "2026-04-17T12:34:56Z",
+    "updated_at": "2026-04-17T12:40:02Z",
+    "config": {
+      "cpus": 2,
+      "memory_mb": 4096,
+      "disk_gb": 20,
+      "workspace_mode": "shared:/home/olek/project",
+      "hardened": true,
+      "repo": "https://github.com/example/app.git",
+      "boot_cmd": "make setup",
+      "template": null
+    },
+    "guest_agent_status": "connected",
+    "gateway_status": "running",
+    "policy": {
+      "version": "1.0",
+      "rules": [
+        {
+          "destination": { "domain": "github.com" },
+          "protocol": "tcp",
+          "level": "http",
+          "http_filters": [{ "method": "GET", "path": "/repos/*" }],
+          "reason": "fetch repo metadata"
+        }
+      ]
+    }
+  }
+]
+```
+
+### Examples
+
+```bash
+# Inspect a single session
+sandbox inspect my-sandbox
+
+# Inspect multiple sessions and extract IDs with jq
+sandbox inspect dev ci-run | jq -r '.[].id'
+
+# Inspect by a unique ID prefix
+sandbox inspect a1b2
+```
+
+---
+
+## sandbox describe
+
+Render one or more sandbox sessions in a human-readable layout, similar to `kubectl describe`. Shows header fields, `Config`, `Runtime`, and the currently applied `Policy` (if any).
+
+### Synopsis
+
+```
+sandbox describe <session>...
+```
+
+### Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `<session>...` | One or more session names or session IDs (see [Session identifiers](#session-identifiers)). |
+
+### Details
+
+- Multiple sessions are rendered as separate blocks separated by a single blank line; input order is preserved.
+- The CLI resolves every id against the daemon first. If any is missing, it writes an error naming the first missing id to stderr, exits non-zero, and emits **no** stdout. Successful lookups earlier in the argument list are not printed.
+- When no policy is applied to a session, the policy section collapses to a single `Policy: none` line.
+
+### Output
+
+```
+Session:      a1b2c3d4e5f6
+Name:         dev
+State:        running
+Created:      2026-04-17 12:34:56 UTC (5m ago)
+Updated:      2026-04-17 12:40:02 UTC
+
+Config:
+  CPUs:        2
+  Memory:      4096 MB
+  Disk:        20 GB
+  Workspace:   shared:/home/olek/project
+  Hardened:    true
+  Repo:        https://github.com/example/app.git
+  Boot cmd:    make setup
+  Template:    -
+
+Runtime:
+  Guest agent: connected
+  Gateway:     running
+
+Policy (v1.0, 3 rules):
+  [0] allow http      github.com
+        protocol:    tcp
+        http_filters: GET /repos/*
+        reason:      fetch repo metadata
+  [1] allow tls       registry.npmjs.org
+        protocol:    tcp
+  [2] deny            *
+        protocol:    any
+        reason:      default deny
+```
+
+### Examples
+
+```bash
+# Describe a single session
+sandbox describe my-sandbox
+
+# Describe several sessions in one go
+sandbox describe dev ci-run staging
+```
+
+---
+
 ## sandbox policy update
 
 Apply a new network policy to a running sandbox session. The new policy completely replaces the existing one -- there is no merging. All gateway components (CoreDNS, nftables, Envoy, mitmproxy) are reconfigured and hot-reloaded without restarting the session.

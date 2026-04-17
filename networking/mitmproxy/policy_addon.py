@@ -8,19 +8,37 @@ reason for denial.
 When no config file is present, operates in pass-through mode (allow all)
 for backwards compatibility.
 
-Config format (from sandboxd MitmproxyConfig):
+Config format (from sandboxd MitmproxyConfig, post-M9-S10):
 
     {
       "rules": [
-        {"host": "api.github.com", "methods": ["GET", "POST"], "paths": ["/repos/", "/user/"]},
-        {"host": "registry.npmjs.org", "methods": null, "paths": null}
+        {
+          "host": "api.github.com",
+          "filters": [
+            {"method": "GET",  "path": "/repos/*"},
+            {"method": "POST", "path": "/user/*"}
+          ]
+        },
+        {
+          "host": "registry.npmjs.org",
+          "filters": [
+            {"method": "ANY", "path": "/*"}
+          ]
+        }
       ]
     }
 
-- methods: null → all methods allowed
-- paths: null → all paths allowed
-- methods: ["GET"] → only GET allowed
-- paths: ["/api/"] → path must start with one of the listed prefixes
+- Each `filters[i]` is a `(method, path)` pair — both must match together.
+  This differs from the pre-M9-S10 shape (independent `methods` / `paths`
+  lists with cartesian-product semantics).
+- `method` is an uppercase HTTP method name (`GET`, `POST`, ...) or the
+  special marker `ANY` meaning "match any method".
+- `path` is an fnmatch-style glob (`*`, `?`, `[...]`); examples: `/api/*`,
+  `/repos/?/commits`.  Use `/*` to match any path.
+- An empty `filters` list means no request matches — sandboxd's policy
+  compiler rejects such configurations at compile time, so the addon
+  never receives them in practice.  If it does (hand-edited config), all
+  requests to that host are denied with `"no filter matched"`.
 """
 
 from __future__ import annotations
@@ -147,35 +165,52 @@ class PolicyAddon:
 
         Returns (allowed, reason).  *reason* is meaningful only when
         *allowed* is False.
+
+        Semantics (post-M9-S10): all rules with a matching host contribute
+        their `filters` lists.  A request is permitted iff at least one
+        filter from any matching rule matches the `(method, path)` pair.
+        This lets users split a single host's policy across multiple rules
+        without losing any allowed pair.
         """
         with self._lock:
             rules = list(self._rules)
 
-        # Find a matching rule by host.
-        matching_rule: dict[str, Any] | None = None
+        request_method = method.upper()
+
+        # Walk every rule whose host matches the request host and look for
+        # a filter pair that matches (method, path).
+        matched_any_host = False
         for rule in rules:
             rule_host = rule.get("host", "")
-            if self._match_host(host, rule_host):
-                matching_rule = rule
-                break
+            if not self._match_host(host, rule_host):
+                continue
+            matched_any_host = True
 
-        if matching_rule is None:
+            for flt in rule.get("filters", []):
+                if self._filter_matches(flt, request_method, path):
+                    return True, ""
+
+        if not matched_any_host:
             return False, "host not in policy"
 
-        # Check method constraint.
-        allowed_methods = matching_rule.get("methods")
-        if allowed_methods is not None:
-            upper_methods = [m.upper() for m in allowed_methods]
-            if method.upper() not in upper_methods:
-                return False, f"method {method} not allowed"
+        return False, f"no filter matched {method} {path}"
 
-        # Check path constraint.
-        allowed_paths = matching_rule.get("paths")
-        if allowed_paths is not None:
-            if not any(path.startswith(prefix) for prefix in allowed_paths):
-                return False, f"path {path} not allowed"
+    @staticmethod
+    def _filter_matches(flt: dict[str, Any], method: str, path: str) -> bool:
+        """Return True iff `flt` permits this (method, path) pair.
 
-        return True, ""
+        `flt` is a `{method, path}` object from the config.  `method` must
+        equal the filter's method (uppercase) or the filter's method must
+        be the wildcard marker `ANY`.  `path` is matched against the
+        filter's path with `fnmatch`.
+        """
+        flt_method = str(flt.get("method", "")).upper()
+        flt_path = str(flt.get("path", ""))
+        if not flt_method or not flt_path:
+            return False
+        if flt_method != "ANY" and flt_method != method:
+            return False
+        return fnmatch.fnmatchcase(path, flt_path)
 
     @staticmethod
     def _match_host(host: str, rule_host: str) -> bool:

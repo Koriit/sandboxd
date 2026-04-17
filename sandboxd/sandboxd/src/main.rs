@@ -17,10 +17,10 @@ use sandbox_core::{
     Destination, DnsCache, ExecRequest, ExecResponse, FileDownloadRequest, FileDownloadResponse,
     FileUploadRequest, GatewayHealth, GatewayManager, GatewayStatus, GuestConnector, GuestRequest,
     GuestResponse, LimaManager, NetworkHealth, NetworkManager, Policy, PolicyCompiler,
-    PolicyDistributor, SandboxError, Session, SessionConfig, SessionHealth, SessionId,
-    SessionResponse, SessionState, SessionStore, UpdatePolicyRequest, VmStatus,
-    attach_vm_to_bridge, detach_vm_from_bridge, generate_ca_inject_script, mac_from_session_id,
-    propagate_dns_changes, read_resolved_json, write_file_to_container,
+    PolicyDistributor, SandboxError, Session, SessionConfig, SessionDto, SessionHealth, SessionId,
+    SessionState, SessionStore, UpdatePolicyRequest, VmStatus, attach_vm_to_bridge,
+    detach_vm_from_bridge, generate_ca_inject_script, mac_from_session_id, propagate_dns_changes,
+    read_resolved_json, write_file_to_container,
 };
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
@@ -215,7 +215,10 @@ fn app(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}/exec", post(exec_in_session))
         .route("/sessions/{id}/upload", post(upload_to_session))
         .route("/sessions/{id}/download", post(download_from_session))
-        .route("/sessions/{id}/policy", post(update_policy))
+        .route(
+            "/sessions/{id}/policy",
+            post(update_policy).delete(clear_policy),
+        )
         .route("/sessions/{id}/health", get(session_health))
         .route("/rebuild-image", post(rebuild_image))
         .route("/base-image-status", get(base_image_status))
@@ -253,6 +256,13 @@ async fn create_session(
         disk_gb: req.disk_gb.unwrap_or(20),
         workspace_mode,
         hardened: req.hardened.unwrap_or(true),
+        // Record the creation inputs so `sandbox inspect`/`describe` can
+        // surface them later.  These are persisted in `config_json` and
+        // forward-compatible via `#[serde(default)]`; records written by
+        // pre-M9-S11 daemons keep `None` on these three fields.
+        repo: req.repo.clone(),
+        boot_cmd: req.boot_cmd.clone(),
+        template: req.template.clone(),
     };
 
     // Create session record in store (state = Creating).
@@ -648,7 +658,11 @@ async fn create_session(
         initial_dns_policy_owned = config.to_file_content();
         Some(initial_dns_policy_owned.as_str())
     } else {
-        Some("# Default allow-all policy (no policy specified)\n*\n")
+        // Fail-closed: no policy → empty allowed-domains list so CoreDNS
+        // returns NXDOMAIN for everything.  The caller can lift this via
+        // a later policy update (or `--unrestricted` at create time).
+        initial_dns_policy_owned = CoreDnsConfig::empty_policy_file_content();
+        Some(initial_dns_policy_owned.as_str())
     };
     match setup_session_networking(
         &session_id,
@@ -798,13 +812,68 @@ async fn create_session(
     }
 
     // Re-fetch the session to get the updated state and timestamp.
-    match state.store.get_session(&session_id) {
-        Ok(Some(s)) => (StatusCode::CREATED, Json(s)).into_response(),
+    let created = match state.store.get_session(&session_id) {
+        Ok(Some(s)) => s,
         Ok(None) => {
-            error_response(SandboxError::SessionNotFound(session_id.to_string())).into_response()
+            return error_response(SandboxError::SessionNotFound(session_id.to_string()))
+                .into_response();
         }
-        Err(e) => error_response(e).into_response(),
+        Err(e) => return error_response(e).into_response(),
+    };
+
+    // Probe guest agent / gateway health so the echoed DTO matches the
+    // shape returned by `GET /sessions/{id}`.  `policy` is populated from
+    // the in-memory map if the caller supplied an initial policy.
+    let agent_status = probe_agent_status(&state, &created).await;
+    let gateway_status = probe_gateway_status(&state, &created).await;
+
+    let policy_opt = {
+        let policies = state.session_policies.lock().await;
+        policies.get(&session_id).cloned()
+    };
+
+    let dto = SessionDto::from(&created)
+        .with_status(agent_status, gateway_status)
+        .with_policy(policy_opt.as_ref());
+
+    (StatusCode::CREATED, Json(dto)).into_response()
+}
+
+/// Probe the guest agent with a short timeout and return the status string
+/// used by the `SessionDto.guest_agent_status` field.
+///
+/// Returns `None` when the session is not `Running`; callers treat `None`
+/// as "omit from wire" via `skip_serializing_if`.
+async fn probe_agent_status(state: &AppState, session: &Session) -> Option<String> {
+    if session.state != SessionState::Running {
+        return None;
     }
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state.guest.ping(&session.id),
+    )
+    .await
+    {
+        Ok(Ok(true)) => Some("connected".to_string()),
+        _ => Some("unreachable".to_string()),
+    }
+}
+
+/// Probe the session's gateway container and format a status string for
+/// the `SessionDto.gateway_status` field.
+///
+/// Returns `None` when the session is not `Running`.
+async fn probe_gateway_status(state: &AppState, session: &Session) -> Option<String> {
+    if session.state != SessionState::Running {
+        return None;
+    }
+    let gateway = state.gateway.clone();
+    let sid = session.id;
+    Some(
+        tokio::task::spawn_blocking(move || format_gateway_status(&gateway, &sid))
+            .await
+            .unwrap_or_else(|_| "error: task join failed".to_string()),
+    )
 }
 
 async fn list_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -846,38 +915,15 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         })
         .collect();
 
-    // Probe guest agent and gateway for running sessions (with a short timeout).
-    let mut enriched: Vec<SessionResponse> = Vec::with_capacity(reconciled.len());
+    // Probe guest agent and gateway for running sessions (with a short
+    // timeout).  Deliberately does NOT populate `policy` — the list
+    // endpoint is meant to stay cheap and `policy` is omitted from the
+    // wire via `skip_serializing_if` on the DTO.
+    let mut enriched: Vec<SessionDto> = Vec::with_capacity(reconciled.len());
     for session in reconciled {
-        let agent_status = if session.state == SessionState::Running {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                state.guest.ping(&session.id),
-            )
-            .await
-            {
-                Ok(Ok(true)) => Some("connected".to_string()),
-                _ => Some("unreachable".to_string()),
-            }
-        } else {
-            None
-        };
-        let gateway_status = if session.state == SessionState::Running {
-            let gateway = state.gateway.clone();
-            let sid = session.id;
-            Some(
-                tokio::task::spawn_blocking(move || format_gateway_status(&gateway, &sid))
-                    .await
-                    .unwrap_or_else(|_| "error: task join failed".to_string()),
-            )
-        } else {
-            None
-        };
-        enriched.push(SessionResponse::from_session_with_status(
-            session,
-            agent_status,
-            gateway_status,
-        ));
+        let agent_status = probe_agent_status(&state, &session).await;
+        let gateway_status = probe_gateway_status(&state, &session).await;
+        enriched.push(SessionDto::from(&session).with_status(agent_status, gateway_status));
     }
 
     (StatusCode::OK, Json(enriched)).into_response()
@@ -918,34 +964,21 @@ async fn get_session(
     }
 
     // Probe guest agent and gateway for running sessions.
-    let agent_status = if session.state == SessionState::Running {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            state.guest.ping(&session.id),
-        )
-        .await
-        {
-            Ok(Ok(true)) => Some("connected".to_string()),
-            _ => Some("unreachable".to_string()),
-        }
-    } else {
-        None
+    let agent_status = probe_agent_status(&state, &session).await;
+    let gateway_status = probe_gateway_status(&state, &session).await;
+
+    // Look up the currently applied policy in the in-memory map.
+    // Persistence of the policy across daemon restarts is M9-S12's
+    // responsibility; until then, this map is the source of truth.
+    let policy_opt = {
+        let policies = state.session_policies.lock().await;
+        policies.get(&session.id).cloned()
     };
 
-    let gateway_status = if session.state == SessionState::Running {
-        let gateway = state.gateway.clone();
-        let sid = session.id;
-        Some(
-            tokio::task::spawn_blocking(move || format_gateway_status(&gateway, &sid))
-                .await
-                .unwrap_or_else(|_| "error: task join failed".to_string()),
-        )
-    } else {
-        None
-    };
-
-    let response = SessionResponse::from_session_with_status(session, agent_status, gateway_status);
-    (StatusCode::OK, Json(response)).into_response()
+    let dto = SessionDto::from(&session)
+        .with_status(agent_status, gateway_status)
+        .with_policy(policy_opt.as_ref());
+    (StatusCode::OK, Json(dto)).into_response()
 }
 
 async fn start_session(
@@ -1065,13 +1098,25 @@ async fn start_session(
     }
 
     // Re-fetch the session to get the updated state and timestamp.
-    match state.store.get_session(&session.id) {
-        Ok(Some(s)) => (StatusCode::OK, Json(s)).into_response(),
+    let refreshed = match state.store.get_session(&session.id) {
+        Ok(Some(s)) => s,
         Ok(None) => {
-            error_response(SandboxError::SessionNotFound(session.id.to_string())).into_response()
+            return error_response(SandboxError::SessionNotFound(session.id.to_string()))
+                .into_response();
         }
-        Err(e) => error_response(e).into_response(),
-    }
+        Err(e) => return error_response(e).into_response(),
+    };
+
+    let agent_status = probe_agent_status(&state, &refreshed).await;
+    let gateway_status = probe_gateway_status(&state, &refreshed).await;
+    let policy_opt = {
+        let policies = state.session_policies.lock().await;
+        policies.get(&refreshed.id).cloned()
+    };
+    let dto = SessionDto::from(&refreshed)
+        .with_status(agent_status, gateway_status)
+        .with_policy(policy_opt.as_ref());
+    (StatusCode::OK, Json(dto)).into_response()
 }
 
 async fn stop_session(
@@ -1152,13 +1197,21 @@ async fn stop_session(
 
     info!(session_id = %session.id, "session stopped");
 
-    match state.store.get_session(&session.id) {
-        Ok(Some(s)) => (StatusCode::OK, Json(s)).into_response(),
+    let refreshed = match state.store.get_session(&session.id) {
+        Ok(Some(s)) => s,
         Ok(None) => {
-            error_response(SandboxError::SessionNotFound(session.id.to_string())).into_response()
+            return error_response(SandboxError::SessionNotFound(session.id.to_string()))
+                .into_response();
         }
-        Err(e) => error_response(e).into_response(),
-    }
+        Err(e) => return error_response(e).into_response(),
+    };
+
+    // After stop, agent/gateway are expected to be offline; `policy` is no
+    // longer meaningful (the gateway is gone) but the map cleanup is
+    // handled by `cancel_dns_propagation_loop` above.  `with_policy(None)`
+    // makes this explicit.
+    let dto = SessionDto::from(&refreshed).with_status(None, None);
+    (StatusCode::OK, Json(dto)).into_response()
 }
 
 async fn remove_session(
@@ -1458,7 +1511,127 @@ async fn update_policy(
     }
 }
 
-/// Apply a policy to a running session: compile, distribute, and start DNS loop.
+/// `DELETE /sessions/{id}/policy` -- remove the policy from a running session
+/// and revert to the fail-closed default (empty CoreDNS allow-list, deny-all
+/// mitmproxy + Envoy, flushed nftables policy/l3 tables).
+///
+/// Idempotent: calling this on a session with no stored policy still writes
+/// the fail-closed configuration to the gateway (so a stale rollback state
+/// cannot linger) and returns 200.
+async fn clear_policy(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let session = match state.store.get_session_by_name_or_id(&id) {
+        Ok(Some(s)) => s,
+        Ok(None) => return error_response(SandboxError::SessionNotFound(id)).into_response(),
+        Err(e) => return error_response(e).into_response(),
+    };
+
+    if session.state != SessionState::Running {
+        return error_response(SandboxError::InvalidState(format!(
+            "cannot clear policy for session in {} state (must be running)",
+            session.state
+        )))
+        .into_response();
+    }
+
+    match clear_session_policy(&session.id, &state).await {
+        Ok(()) => {
+            info!(session_id = %session.id, "policy cleared (fail-closed)");
+            let body = serde_json::json!({
+                "status": "ok",
+                "message": "policy cleared; session is now fail-closed",
+            });
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Err(e) => {
+            error!(session_id = %session.id, error = %e, "policy clear failed");
+            error_response(e).into_response()
+        }
+    }
+}
+
+/// Clear a session's policy: cancel the DNS propagation loop, delete the
+/// persisted row, drop the in-memory entry, and push the fail-closed empty
+/// configuration to the gateway (CoreDNS empty allow-list, deny-all
+/// mitmproxy/Envoy, flushed sandbox_policy and sandbox_l3 nftables tables).
+///
+/// Ordering mirrors [`apply_policy`]:
+/// 1. Gateway distribution of the empty-policy output.
+/// 2. Explicit `sandbox_l3` flush (the standard distributor only manages
+///    `sandbox_policy`, so stale L3 DNAT rules from a prior Http policy would
+///    survive without this).
+/// 3. Store delete.
+/// 4. In-memory map removal + DNS loop cancellation.
+///
+/// Steps 3–4 happen after a successful distribution: if the gateway step
+/// fails we leave the DB row in place so a retry can complete the clear.
+async fn clear_session_policy(
+    session_id: &SessionId,
+    state: &AppState,
+) -> Result<(), SandboxError> {
+    let network_info = state.store.get_network_info(session_id)?.ok_or_else(|| {
+        SandboxError::Internal(format!(
+            "no network info for session {session_id} (networking not configured)"
+        ))
+    })?;
+
+    // Compile an empty policy — CoreDnsConfig becomes empty allow-list,
+    // mitmproxy rules become empty (deny-all), Envoy becomes deny-all,
+    // nftables allow-rules become empty (distributor flushes
+    // `sandbox_policy`).
+    let empty_policy = Policy {
+        version: sandbox_core::policy::SCHEMA_VERSION.to_string(),
+        rules: Vec::new(),
+    };
+    let compiled = PolicyCompiler::compile(&empty_policy, &network_info)?;
+    PolicyDistributor::distribute(session_id, &compiled, &state.gateway)?;
+
+    // Flush the sandbox_l3 DNAT table explicitly.  The distributor only
+    // manages `sandbox_policy`; without this, L3 redirect rules from a
+    // previous Http-level policy would keep forwarding VM egress to
+    // mitmproxy even though the policy is gone.
+    let flush_l3 = "delete table inet sandbox_l3\n";
+    if let Err(e) =
+        state
+            .gateway
+            .inject_nftables_ruleset_public(session_id, flush_l3, "policy-clear-l3")
+    {
+        // Best-effort: the table may not exist (e.g. previous policy
+        // never had Http rules), which is the common case.  Log and
+        // continue so the rest of the clear still takes effect.
+        debug!(
+            session_id = %session_id,
+            error = %e,
+            "sandbox_l3 flush failed (likely absent); continuing clear"
+        );
+    }
+
+    // Persist the clear.  Idempotent: safe to call when no row exists.
+    state.store.delete_policy(session_id)?;
+
+    // Drop the in-memory entry so the DNS propagation loop — if any — has
+    // nothing to work with, then cancel the loop itself.
+    {
+        let mut policies = state.session_policies.lock().await;
+        policies.remove(session_id);
+    }
+    cancel_dns_propagation_loop(session_id, state).await;
+
+    Ok(())
+}
+
+/// Apply a policy to a running session: compile, distribute, persist, and
+/// start the DNS propagation loop.
+///
+/// The persistence step happens **after** gateway distribution but
+/// **before** the in-memory map is updated.  If persistence fails, the
+/// caller sees an error and the in-memory `session_policies` map is
+/// untouched — the DNS loop continues to serve whatever policy was
+/// active before this call.  If the daemon crashes between the DB
+/// commit and the memory insert, startup hydration rebuilds the map
+/// from the DB on the next launch, closing the silent allow-all window.
 async fn apply_policy(
     session_id: &SessionId,
     policy: &Policy,
@@ -1477,7 +1650,18 @@ async fn apply_policy(
     // Distribute to gateway components.
     PolicyDistributor::distribute(session_id, &compiled, &state.gateway)?;
 
-    // Store the policy for the DNS propagation loop.
+    // Persist the policy to SQLite before touching the in-memory map.
+    // Matches the pattern used elsewhere for `store.*` calls from async
+    // handlers: the SQLite Mutex is held only for the duration of the
+    // transaction, which is expected to be well under the handler's
+    // budget.  If the transaction fails, propagate the error upward —
+    // the in-memory map below is not touched, so the DNS propagation
+    // loop keeps serving whatever policy was active before this call.
+    state.store.set_policy(session_id, policy)?;
+
+    // Store the policy for the DNS propagation loop.  Done last so a
+    // partially-persisted state cannot leave the in-memory map advertising
+    // a policy that is not yet on disk.
     {
         let mut policies = state.session_policies.lock().await;
         policies.insert(*session_id, policy.clone());
@@ -1835,8 +2019,8 @@ async fn teardown_session_networking(session_id: &SessionId, state: &AppState) {
 /// When a gateway is recreated (restart, crash recovery, reconciliation),
 /// its tmpfs is wiped. This helper restores the policy that was active
 /// before the gateway went away. If no policy is stored (session created
-/// without one), it writes the allow-all wildcard so CoreDNS permits all
-/// DNS queries.
+/// without one, or `--clear`ed), it writes the fail-closed empty CoreDNS
+/// policy so every DNS query receives NXDOMAIN until a policy is installed.
 ///
 /// Policy re-application is best-effort: failures are logged but do not
 /// propagate, matching the non-fatal semantics of initial policy setup.
@@ -1866,21 +2050,21 @@ async fn reapply_session_policy(session_id: &SessionId, state: &AppState) {
             }
         }
     } else {
-        // No policy stored — write allow-all wildcard so CoreDNS permits
-        // all DNS resolution (same as the else branch in create_session).
-        let allow_all = "# Default allow-all policy (no policy specified)\n*\n";
-        match write_file_to_container(&container, "/etc/coredns/policy.conf", allow_all) {
+        // No policy stored — write the fail-closed empty policy so CoreDNS
+        // returns NXDOMAIN for every query until a policy is installed.
+        let empty = CoreDnsConfig::empty_policy_file_content();
+        match write_file_to_container(&container, "/etc/coredns/policy.conf", &empty) {
             Ok(()) => {
                 debug!(
                     session_id = %session_id,
-                    "wrote default allow-all DNS policy to restored gateway"
+                    "wrote empty (fail-closed) DNS policy to restored gateway"
                 );
             }
             Err(e) => {
                 warn!(
                     session_id = %session_id,
                     error = %e,
-                    "failed to write default DNS policy to restored gateway"
+                    "failed to write empty DNS policy to restored gateway"
                 );
             }
         }
@@ -1928,15 +2112,18 @@ async fn restore_session_networking(
     };
 
     // 2. Create gateway container with nftables, mounting the CA.
-    //    When no explicit policy is stored for this session, pass an
-    //    allow-all DNS policy so CoreDNS loads it at startup (same race
-    //    fix as in create_session).
+    //    When no explicit policy is stored for this session, pass the
+    //    fail-closed empty DNS policy so CoreDNS loads it at startup
+    //    (same race fix as in create_session).  The daemon re-applies
+    //    any stored policy below after the container is up.
     let has_stored_policy = {
         let policies = state.session_policies.lock().await;
         policies.contains_key(session_id)
     };
+    let initial_dns_policy_owned: String;
     let initial_dns_policy = if !has_stored_policy {
-        Some("# Default allow-all policy (no policy specified)\n*\n")
+        initial_dns_policy_owned = CoreDnsConfig::empty_policy_file_content();
+        Some(initial_dns_policy_owned.as_str())
     } else {
         None
     };
@@ -2417,13 +2604,17 @@ async fn reconcile_networking(state: &AppState) {
                         };
 
                         // Determine initial DNS policy for the gateway.
+                        // Fail-closed: no stored policy → empty allowed-
+                        // domains list so CoreDNS returns NXDOMAIN.  The
+                        // reconciliation loop re-applies any stored policy
+                        // after the gateway is back up.
                         let has_policy = {
                             let policies = state.session_policies.lock().await;
                             policies.contains_key(&session.id)
                         };
-                        let init_dns_str = "# Default allow-all policy (no policy specified)\n*\n";
+                        let init_dns_str = CoreDnsConfig::empty_policy_file_content();
                         let init_dns = if !has_policy {
-                            Some(init_dns_str)
+                            Some(init_dns_str.as_str())
                         } else {
                             None
                         };
@@ -2639,13 +2830,16 @@ async fn gateway_monitor(state: Arc<AppState>) {
                     };
 
                     // Determine initial DNS policy for the gateway.
+                    // Fail-closed: no stored policy → empty allowed-
+                    // domains list so CoreDNS returns NXDOMAIN.  Any
+                    // stored policy is re-applied after restart.
                     let has_policy = {
                         let policies = state.session_policies.lock().await;
                         policies.contains_key(&session.id)
                     };
-                    let init_dns_str = "# Default allow-all policy (no policy specified)\n*\n";
+                    let init_dns_str = CoreDnsConfig::empty_policy_file_content();
                     let init_dns = if !has_policy {
-                        Some(init_dns_str)
+                        Some(init_dns_str.as_str())
                     } else {
                         None
                     };
@@ -2753,6 +2947,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Run startup reconciliation (VM state).
     reconcile(&store, &lima);
 
+    // Hydrate the in-memory policy map from SQLite **before**
+    // `reconcile_networking` runs.  Gateway restoration inside the
+    // reconciliation loop calls `reapply_session_policy`, which looks
+    // up `state.session_policies`.  Without this hydration step the map
+    // is empty on restart and the restored gateway would fall back to
+    // the fail-closed empty DNS policy (post-M9-S15), locking out the
+    // session until its stored policy is reapplied — which is less bad
+    // than the pre-M9-S15 allow-all fallback but still wrong.
+    let hydrated_policies: HashMap<SessionId, Policy> = match store.load_all_policies() {
+        Ok(entries) => {
+            if !entries.is_empty() {
+                info!(
+                    count = entries.len(),
+                    "restored persisted network policies from SQLite"
+                );
+            }
+            entries.into_iter().collect()
+        }
+        Err(e) => {
+            // A hard DB failure here is surprising (the store is the
+            // same one we just opened), but we prefer to start with an
+            // empty map and warn rather than abort the daemon — that
+            // matches the existing tolerance for corrupt rows inside
+            // `load_all_policies` and keeps sandbox creation paths
+            // usable even when the policy table itself is unreadable.
+            warn!(
+                error = %e,
+                "failed to hydrate session policies from SQLite; continuing with empty map"
+            );
+            HashMap::new()
+        }
+    };
+
     let state = Arc::new(AppState {
         base_dir,
         store,
@@ -2761,13 +2988,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         network,
         gateway,
         dns_loop_handles: Mutex::new(HashMap::new()),
-        session_policies: Arc::new(Mutex::new(HashMap::new())),
+        session_policies: Arc::new(Mutex::new(hydrated_policies)),
         sessions_stopping: Mutex::new(HashSet::new()),
         base_image_lock: Mutex::new(()),
     });
 
     // Run networking reconciliation: restart crashed gateways, clean up
-    // lingering resources for stopped sessions.
+    // lingering resources for stopped sessions.  The hydrated policy
+    // map above makes `reapply_session_policy` find the right policy
+    // for each restored gateway.
     reconcile_networking(&state).await;
 
     // Spawn background gateway monitor for crash recovery.

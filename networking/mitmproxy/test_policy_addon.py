@@ -11,7 +11,6 @@ import json
 import os
 import sys
 import tempfile
-import textwrap
 import time
 import types
 from typing import Any
@@ -96,6 +95,11 @@ from policy_addon import PolicyAddon
 # ── Helpers ─────────────────────────────────────────────────────────
 
 
+# A filter object that permits every (method, path) pair — useful
+# shorthand for tests that only care about host matching.
+ANY_FILTER: dict[str, Any] = {"method": "ANY", "path": "/*"}
+
+
 def _write_config(path: str, rules: list[dict[str, Any]]) -> None:
     """Write a policy config file."""
     with open(path, "w", encoding="utf-8") as fh:
@@ -128,7 +132,7 @@ def _make_flow(
 class TestAllowMatchingHost:
     def test_allow_matching_host(self) -> None:
         addon = _make_addon([
-            {"host": "api.github.com", "methods": None, "paths": None},
+            {"host": "api.github.com", "filters": [ANY_FILTER]},
         ])
         flow = _make_flow(host="api.github.com", path="/repos/foo")
         addon.request(flow)
@@ -138,7 +142,7 @@ class TestAllowMatchingHost:
 class TestDenyUnknownHost:
     def test_deny_unknown_host(self) -> None:
         addon = _make_addon([
-            {"host": "api.github.com", "methods": None, "paths": None},
+            {"host": "api.github.com", "filters": [ANY_FILTER]},
         ])
         flow = _make_flow(host="evil.com", path="/")
         addon.request(flow)
@@ -151,26 +155,31 @@ class TestDenyUnknownHost:
 class TestMethodRestriction:
     def test_method_restriction(self) -> None:
         addon = _make_addon([
-            {"host": "api.github.com", "methods": ["GET"], "paths": None},
+            {"host": "api.github.com", "filters": [
+                {"method": "GET", "path": "/*"},
+            ]},
         ])
         # GET should pass.
         flow_get = _make_flow(method="GET", host="api.github.com", path="/")
         addon.request(flow_get)
         assert flow_get.response is None
 
-        # POST should be denied.
+        # POST should be denied — no filter matches POST.
         flow_post = _make_flow(method="POST", host="api.github.com", path="/")
         addon.request(flow_post)
         assert flow_post.response is not None
         assert flow_post.response.status_code == 599
         body = json.loads(flow_post.response.content)
-        assert "method POST not allowed" in body["reason"]
+        assert body["reason"] == "no filter matched POST /"
 
 
 class TestPathRestriction:
     def test_path_restriction(self) -> None:
         addon = _make_addon([
-            {"host": "api.github.com", "methods": None, "paths": ["/repos/", "/user/"]},
+            {"host": "api.github.com", "filters": [
+                {"method": "ANY", "path": "/repos/*"},
+                {"method": "ANY", "path": "/user/*"},
+            ]},
         ])
         # Allowed path prefix.
         flow_ok = _make_flow(host="api.github.com", path="/repos/foo")
@@ -183,13 +192,13 @@ class TestPathRestriction:
         assert flow_bad.response is not None
         assert flow_bad.response.status_code == 599
         body = json.loads(flow_bad.response.content)
-        assert "path /admin/settings not allowed" in body["reason"]
+        assert body["reason"] == "no filter matched GET /admin/settings"
 
 
 class TestWildcardHost:
     def test_wildcard_host(self) -> None:
         addon = _make_addon([
-            {"host": "*.github.com", "methods": None, "paths": None},
+            {"host": "*.github.com", "filters": [ANY_FILTER]},
         ])
         flow = _make_flow(host="api.github.com", path="/")
         addon.request(flow)
@@ -197,7 +206,7 @@ class TestWildcardHost:
 
     def test_wildcard_does_not_match_root(self) -> None:
         addon = _make_addon([
-            {"host": "*.github.com", "methods": None, "paths": None},
+            {"host": "*.github.com", "filters": [ANY_FILTER]},
         ])
         flow = _make_flow(host="github.com", path="/")
         addon.request(flow)
@@ -208,7 +217,7 @@ class TestWildcardHost:
 class TestDenyResponseFormat:
     def test_deny_response_format(self) -> None:
         addon = _make_addon([
-            {"host": "allowed.com", "methods": None, "paths": None},
+            {"host": "allowed.com", "filters": [ANY_FILTER]},
         ])
         flow = _make_flow(host="evil.com", method="POST", path="/hack")
         addon.request(flow)
@@ -228,7 +237,7 @@ class TestDenyResponseFormat:
 class TestConfigReload:
     def test_config_reload(self) -> None:
         addon = _make_addon([
-            {"host": "old.com", "methods": None, "paths": None},
+            {"host": "old.com", "filters": [ANY_FILTER]},
         ])
 
         # Initially old.com is allowed.
@@ -247,7 +256,7 @@ class TestConfigReload:
         # Ensure the mtime changes (filesystem resolution may be 1s).
         time.sleep(0.05)
         _write_config(config_path, [
-            {"host": "new.com", "methods": None, "paths": None},
+            {"host": "new.com", "filters": [ANY_FILTER]},
         ])
 
         # Trigger reload directly (don't wait for the watcher thread).
@@ -268,7 +277,7 @@ class TestConfigReload:
 class TestHealthEndpoint:
     def test_health_endpoint(self) -> None:
         addon = _make_addon([
-            {"host": "allowed.com", "methods": None, "paths": None},
+            {"host": "allowed.com", "filters": [ANY_FILTER]},
         ])
         flow = _make_flow(host="anything.com", path="/__sandbox_health")
         addon.request(flow)
@@ -287,26 +296,26 @@ class TestHealthEndpoint:
         assert flow.response.status_code == 200
 
 
-class TestNullMethodsAllowsAll:
-    def test_null_methods_allows_all(self) -> None:
+class TestAnyMethodAllowsAll:
+    def test_any_method_allows_all(self) -> None:
         addon = _make_addon([
-            {"host": "api.example.com", "methods": None, "paths": None},
+            {"host": "api.example.com", "filters": [ANY_FILTER]},
         ])
         for method in ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]:
             flow = _make_flow(method=method, host="api.example.com")
             addon.request(flow)
-            assert flow.response is None, f"{method} should be allowed when methods is null"
+            assert flow.response is None, f"{method} should be allowed when filter method is ANY"
 
 
-class TestNullPathsAllowsAll:
-    def test_null_paths_allows_all(self) -> None:
+class TestWildcardPathAllowsAll:
+    def test_wildcard_path_allows_all(self) -> None:
         addon = _make_addon([
-            {"host": "api.example.com", "methods": None, "paths": None},
+            {"host": "api.example.com", "filters": [ANY_FILTER]},
         ])
         for path in ["/", "/foo", "/bar/baz", "/deeply/nested/path"]:
             flow = _make_flow(host="api.example.com", path=path)
             addon.request(flow)
-            assert flow.response is None, f"Path {path} should be allowed when paths is null"
+            assert flow.response is None, f"Path {path} should be allowed when filter path is /*"
 
 
 class TestEmptyRulesDenyAll:
@@ -328,7 +337,7 @@ class TestEmptyRulesDenyAll:
 class TestCaseInsensitiveHost:
     def test_case_insensitive_host(self) -> None:
         addon = _make_addon([
-            {"host": "API.GitHub.Com", "methods": None, "paths": None},
+            {"host": "API.GitHub.Com", "filters": [ANY_FILTER]},
         ])
         flow = _make_flow(host="api.github.com")
         addon.request(flow)
@@ -336,7 +345,7 @@ class TestCaseInsensitiveHost:
 
     def test_case_insensitive_host_reverse(self) -> None:
         addon = _make_addon([
-            {"host": "api.github.com", "methods": None, "paths": None},
+            {"host": "api.github.com", "filters": [ANY_FILTER]},
         ])
         flow = _make_flow(host="API.GITHUB.COM")
         addon.request(flow)
@@ -352,22 +361,201 @@ class TestPassthroughMode:
         assert flow.response is None, "Pass-through mode should allow all requests"
 
 
+class TestLegacyPreM9S10ShapeIsRejected:
+    """Regression guard against the M9-S10 wire-format drift.
+
+    Pre-M9-S10, the addon accepted top-level `methods` / `paths` arrays on
+    each rule and treated both being absent/null as "allow every request on
+    this host".  Post-M9-S10, the contract is strict `filters = [{method,
+    path}, ...]` pair matching.
+
+    If a stale addon (old code) is paired with a new-shape config file —
+    exactly what happened in CI when the gateway image wasn't rebuilt after
+    the addon rewrite — every request to a matched host was silently
+    allowed, defeating all level-3 HTTP filtering.  The failing E2E tests
+    (`test_level3_method_restriction`, `test_level3_path_restriction`)
+    surfaced the drift by observing that supposedly-blocked requests
+    reached upstream and came back as 404 rather than the expected 599.
+
+    The fix lives in the Makefile (rebuild on source change), but this
+    test pins the runtime behavior: feeding the addon a legacy-shape
+    rule object MUST NOT silently allow traffic — missing `filters`
+    means no match, which is a 599 deny.
+    """
+
+    def test_legacy_shape_with_null_method_and_path_denies(self) -> None:
+        """Old shape `{host, methods: null, paths: null}` denies."""
+        addon = _make_addon([
+            {"host": "httpbin.org", "methods": None, "paths": None},
+        ])
+        flow = _make_flow(method="GET", host="httpbin.org", path="/anything")
+        addon.request(flow)
+        assert flow.response is not None, (
+            "Legacy-shape rule must not silently pass — missing `filters` "
+            "means no filter matched, which is deny."
+        )
+        assert flow.response.status_code == 599
+
+    def test_legacy_shape_with_method_and_path_arrays_denies(self) -> None:
+        """Old shape `{host, methods: [...], paths: [...]}` denies."""
+        addon = _make_addon([
+            {
+                "host": "httpbin.org",
+                "methods": ["GET"],
+                "paths": ["/api/"],
+            },
+        ])
+        flow = _make_flow(method="GET", host="httpbin.org", path="/api/thing")
+        addon.request(flow)
+        assert flow.response is not None
+        assert flow.response.status_code == 599
+
+    def test_failing_e2e_method_restriction_denies_post(self) -> None:
+        """Replica of `test_level3_method_restriction`.
+
+        Policy `{httpbin.org, filters: [{GET, /*}]}` must deny POST.  This
+        is the exact shape sandboxd writes for the E2E test; it exists
+        here so a future addon regression is caught in <1 second instead
+        of a ~3-minute E2E round-trip.
+        """
+        addon = _make_addon([
+            {
+                "host": "httpbin.org",
+                "filters": [{"method": "GET", "path": "/*"}],
+            },
+        ])
+        flow = _make_flow(method="POST", host="httpbin.org", path="/post")
+        addon.request(flow)
+        assert flow.response is not None
+        assert flow.response.status_code == 599
+
+    def test_failing_e2e_path_restriction_denies_other_path(self) -> None:
+        """Replica of `test_level3_path_restriction`.
+
+        Policy `{httpbin.org, filters: [{ANY, /api/*}]}` must deny a
+        request to `/other/path`.
+        """
+        addon = _make_addon([
+            {
+                "host": "httpbin.org",
+                "filters": [{"method": "ANY", "path": "/api/*"}],
+            },
+        ])
+        flow = _make_flow(method="GET", host="httpbin.org", path="/other/path")
+        addon.request(flow)
+        assert flow.response is not None
+        assert flow.response.status_code == 599
+
+
+class TestPairMatching:
+    """(method, path) pairs must match together — not cartesian product.
+
+    Under the pre-M9-S10 shape, two independent lists `methods=[GET, POST]`
+    and `paths=[/a, /b]` would permit the cartesian product {GET /a, GET /b,
+    POST /a, POST /b}.  The new shape expresses the mixed pairs directly:
+    `filters=[{GET /a}, {POST /b}]` means *exactly* those two pairs.
+    """
+
+    def test_mixed_pairs_are_not_cartesian(self) -> None:
+        """`GET /foo` and `POST /bar` must NOT also allow `POST /foo` or
+        `GET /bar`."""
+        addon = _make_addon([
+            {"host": "api.com", "filters": [
+                {"method": "GET", "path": "/foo"},
+                {"method": "POST", "path": "/bar"},
+            ]},
+        ])
+
+        # Declared pairs succeed.
+        flow_get_foo = _make_flow(method="GET", host="api.com", path="/foo")
+        addon.request(flow_get_foo)
+        assert flow_get_foo.response is None, "GET /foo should be allowed"
+
+        flow_post_bar = _make_flow(method="POST", host="api.com", path="/bar")
+        addon.request(flow_post_bar)
+        assert flow_post_bar.response is None, "POST /bar should be allowed"
+
+        # Cross pairs (cartesian product) must be denied.
+        flow_post_foo = _make_flow(method="POST", host="api.com", path="/foo")
+        addon.request(flow_post_foo)
+        assert flow_post_foo.response is not None
+        assert flow_post_foo.response.status_code == 599
+        body_pf = json.loads(flow_post_foo.response.content)
+        assert body_pf["reason"] == "no filter matched POST /foo"
+
+        flow_get_bar = _make_flow(method="GET", host="api.com", path="/bar")
+        addon.request(flow_get_bar)
+        assert flow_get_bar.response is not None
+        assert flow_get_bar.response.status_code == 599
+        body_gb = json.loads(flow_get_bar.response.content)
+        assert body_gb["reason"] == "no filter matched GET /bar"
+
+
+class TestFnmatchGlobs:
+    """Filter paths support fnmatch-style globs (*, ?, [...])."""
+
+    def test_star_matches_single_segment(self) -> None:
+        addon = _make_addon([
+            {"host": "api.com", "filters": [
+                {"method": "GET", "path": "/repos/*"},
+            ]},
+        ])
+        # `*` in fnmatch matches any characters including slashes.
+        flow_ok = _make_flow(host="api.com", path="/repos/foo")
+        addon.request(flow_ok)
+        assert flow_ok.response is None
+
+        flow_deeper = _make_flow(host="api.com", path="/repos/foo/commits")
+        addon.request(flow_deeper)
+        assert flow_deeper.response is None
+
+    def test_question_mark_matches_single_char(self) -> None:
+        addon = _make_addon([
+            {"host": "api.com", "filters": [
+                {"method": "GET", "path": "/v?/users"},
+            ]},
+        ])
+        flow_ok = _make_flow(host="api.com", path="/v1/users")
+        addon.request(flow_ok)
+        assert flow_ok.response is None
+
+        flow_bad = _make_flow(host="api.com", path="/v10/users")
+        addon.request(flow_bad)
+        assert flow_bad.response is not None
+        assert flow_bad.response.status_code == 599
+
+
+class TestMultipleRulesCompose:
+    """Multiple rules for the same host compose — any matching filter in any
+    matching rule permits the request."""
+
+    def test_two_rules_same_host_compose(self) -> None:
+        addon = _make_addon([
+            {"host": "api.github.com", "filters": [
+                {"method": "GET", "path": "/*"},
+            ]},
+            {"host": "api.github.com", "filters": [
+                {"method": "POST", "path": "/*"},
+            ]},
+        ])
+        # GET allowed by rule 1.
+        allowed_get, _ = addon._check_request("api.github.com", "GET", "/")
+        assert allowed_get
+
+        # POST allowed by rule 2 (must not be blocked by rule 1's filters).
+        allowed_post, _ = addon._check_request("api.github.com", "POST", "/")
+        assert allowed_post
+
+
 class TestCheckRequestDirect:
     """Test the _check_request method directly for edge cases."""
 
-    def test_multiple_rules_first_match_wins(self) -> None:
+    def test_path_glob_matching(self) -> None:
         addon = _make_addon([
-            {"host": "api.github.com", "methods": ["GET"], "paths": None},
-            {"host": "api.github.com", "methods": ["POST"], "paths": None},
-        ])
-        # First rule matches — only GET allowed.
-        allowed, reason = addon._check_request("api.github.com", "POST", "/")
-        assert not allowed
-        assert "method POST not allowed" in reason
-
-    def test_path_prefix_matching(self) -> None:
-        addon = _make_addon([
-            {"host": "api.com", "methods": None, "paths": ["/v1/", "/v2/"]},
+            {"host": "api.com", "filters": [
+                {"method": "ANY", "path": "/v1/*"},
+                {"method": "ANY", "path": "/v2/*"},
+            ]},
         ])
         allowed1, _ = addon._check_request("api.com", "GET", "/v1/users")
         assert allowed1
@@ -377,17 +565,30 @@ class TestCheckRequestDirect:
 
         allowed3, reason = addon._check_request("api.com", "GET", "/v3/other")
         assert not allowed3
-        assert "path /v3/other not allowed" in reason
+        assert reason == "no filter matched GET /v3/other"
 
     def test_method_case_insensitive(self) -> None:
-        """Methods in rules are compared case-insensitively."""
+        """Request methods are uppercased before comparison."""
         addon = _make_addon([
-            {"host": "api.com", "methods": ["get", "post"], "paths": None},
+            {"host": "api.com", "filters": [
+                {"method": "GET", "path": "/*"},
+                {"method": "POST", "path": "/*"},
+            ]},
         ])
         allowed, _ = addon._check_request("api.com", "GET", "/")
         assert allowed
         allowed2, _ = addon._check_request("api.com", "Post", "/")
         assert allowed2
+
+    def test_empty_filters_list_denies(self) -> None:
+        """A rule with an empty `filters` list matches the host but no
+        filter matches, so every request is denied with 'no filter matched'."""
+        addon = _make_addon([
+            {"host": "api.com", "filters": []},
+        ])
+        allowed, reason = addon._check_request("api.com", "GET", "/")
+        assert not allowed
+        assert reason == "no filter matched GET /"
 
 
 class TestMatchHost:
@@ -407,6 +608,32 @@ class TestMatchHost:
         assert not PolicyAddon._match_host("other.com", "example.com")
 
 
+class TestFilterMatches:
+    """Direct tests of the `_filter_matches` helper."""
+
+    def test_any_method_wildcard(self) -> None:
+        flt = {"method": "ANY", "path": "/foo"}
+        assert PolicyAddon._filter_matches(flt, "GET", "/foo")
+        assert PolicyAddon._filter_matches(flt, "POST", "/foo")
+        assert PolicyAddon._filter_matches(flt, "DELETE", "/foo")
+
+    def test_method_must_match_exactly(self) -> None:
+        flt = {"method": "GET", "path": "/foo"}
+        assert PolicyAddon._filter_matches(flt, "GET", "/foo")
+        assert not PolicyAddon._filter_matches(flt, "POST", "/foo")
+
+    def test_path_fnmatch(self) -> None:
+        flt = {"method": "ANY", "path": "/repos/*"}
+        assert PolicyAddon._filter_matches(flt, "GET", "/repos/foo")
+        assert not PolicyAddon._filter_matches(flt, "GET", "/users/foo")
+
+    def test_empty_fields_reject(self) -> None:
+        """A filter with a missing method or path rejects every request."""
+        assert not PolicyAddon._filter_matches({"method": "", "path": "/foo"}, "GET", "/foo")
+        assert not PolicyAddon._filter_matches({"method": "GET", "path": ""}, "GET", "/foo")
+        assert not PolicyAddon._filter_matches({}, "GET", "/foo")
+
+
 class TestConfigFileWatcher:
     def test_watcher_thread_is_daemon(self) -> None:
         """The config watcher thread should be a daemon so it doesn't
@@ -424,7 +651,7 @@ class TestConfigFileWatcher:
         """Invalid JSON in config file should not crash — existing rules
         should be preserved."""
         addon = _make_addon([
-            {"host": "good.com", "methods": None, "paths": None},
+            {"host": "good.com", "filters": [ANY_FILTER]},
         ])
 
         # Write invalid JSON to the config file.
@@ -450,7 +677,7 @@ class TestConfigFileWatcher:
 
         # Now create the file.
         _write_config(path, [
-            {"host": "new.com", "methods": None, "paths": None},
+            {"host": "new.com", "filters": [ANY_FILTER]},
         ])
         addon._load_config()
         assert addon._passthrough is False

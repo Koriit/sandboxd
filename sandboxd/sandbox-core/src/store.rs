@@ -5,8 +5,12 @@ use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
+use tracing::warn;
 
 use crate::error::SandboxError;
+use crate::policy::{
+    AssuranceLevel, Destination, HttpFilter, HttpMethod, Policy, PolicyRule, Protocol,
+};
 use crate::session::{Session, SessionConfig, SessionId, SessionState};
 
 mod embedded {
@@ -49,6 +53,11 @@ impl SessionStore {
 
         // Enable WAL mode for better concurrent read performance.
         conn.pragma_update(None, "journal_mode", "WAL")?;
+
+        // Enable foreign-key enforcement so `ON DELETE CASCADE` on the
+        // policy tables actually runs when a session (or session_policies
+        // row) is deleted. SQLite requires this pragma per-connection.
+        conn.pragma_update(None, "foreign_keys", "ON")?;
 
         // Run embedded migrations.
         embedded::migrations::runner()
@@ -485,6 +494,189 @@ impl SessionStore {
         Ok(result)
     }
 
+    // ----------------------------------------------------------------------
+    // Policy persistence
+    // ----------------------------------------------------------------------
+
+    /// Persist a policy for a session, replacing any previously stored
+    /// policy for the same session.
+    ///
+    /// The write is performed in a single SQLite transaction: the existing
+    /// `session_policies` row is deleted (cascading to `policy_rules` and
+    /// `policy_rule_http_filters`), the new rows are inserted in order,
+    /// and the transaction is committed.  If any step fails, the
+    /// transaction is rolled back and the previous policy remains intact.
+    ///
+    /// The `session_id` **must** reference an existing row in the
+    /// `sessions` table (the FK from `session_policies` is enforced).
+    pub fn set_policy(&self, id: &SessionId, policy: &Policy) -> Result<(), SandboxError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
+
+        let tx = conn.transaction()?;
+
+        // DELETE parent row; CASCADE clears the children.  If no row
+        // exists this is a no-op — matches "first-time apply" semantics.
+        tx.execute(
+            "DELETE FROM session_policies WHERE session_id = ?1",
+            params![id.as_str()],
+        )?;
+
+        tx.execute(
+            "INSERT INTO session_policies (session_id, version) VALUES (?1, ?2)",
+            params![id.as_str(), policy.version],
+        )?;
+
+        for (rule_order, rule) in policy.rules.iter().enumerate() {
+            let (dest_kind, dest_value) = destination_columns(&rule.destination);
+            tx.execute(
+                "INSERT INTO policy_rules (
+                    session_id, rule_order, destination_kind, destination_value,
+                    level, protocol, reason
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    id.as_str(),
+                    rule_order as i64,
+                    dest_kind,
+                    dest_value,
+                    level_column(&rule.level),
+                    protocol_column(rule.protocol),
+                    rule.reason,
+                ],
+            )?;
+
+            if let AssuranceLevel::Http { http_filters } = &rule.level {
+                for (filter_order, filter) in http_filters.iter().enumerate() {
+                    tx.execute(
+                        "INSERT INTO policy_rule_http_filters (
+                            session_id, rule_order, filter_order, method, path_pattern
+                         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            id.as_str(),
+                            rule_order as i64,
+                            filter_order as i64,
+                            method_column(filter.method),
+                            filter.path,
+                        ],
+                    )?;
+                }
+            }
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Delete any stored policy for a session.
+    ///
+    /// The write is performed in a single transaction: the `session_policies`
+    /// row (if any) is deleted, cascading to `policy_rules` and
+    /// `policy_rule_http_filters`.  Calling this on a session that has no
+    /// policy row is a silent no-op — deletion is idempotent so callers can
+    /// treat `--clear` as "reach the no-policy state" regardless of the
+    /// prior contents.
+    ///
+    /// The `session_id` must reference an existing row in `sessions`; if the
+    /// session was already removed the DELETE is still a safe no-op because
+    /// the FK only constrains writes into `session_policies`, not deletes
+    /// out of it.
+    pub fn delete_policy(&self, id: &SessionId) -> Result<(), SandboxError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
+
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM session_policies WHERE session_id = ?1",
+            params![id.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Retrieve the policy stored for a session.
+    ///
+    /// Returns `Ok(None)` if no row exists in `session_policies` for this
+    /// session.  If a row is present but the policy cannot be reassembled
+    /// (missing/invalid enum values, broken child rows), the failure is
+    /// logged and `Ok(None)` is returned — callers must treat this the
+    /// same as "no policy" so the daemon does not crash on a corrupted
+    /// row.  The next successful `set_policy` overwrites the entry.
+    pub fn get_policy(&self, id: &SessionId) -> Result<Option<Policy>, SandboxError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
+
+        match read_policy(&conn, id) {
+            Ok(Some(policy)) => Ok(Some(policy)),
+            Ok(None) => Ok(None),
+            Err(e) => {
+                warn!(
+                    session_id = %id,
+                    error = %e,
+                    "failed to reassemble persisted policy; treating as absent"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Load every persisted policy, for startup hydration.
+    ///
+    /// Sessions with a corrupt/undecodable persisted policy are skipped
+    /// with a warning; they do not abort the startup sequence.  The next
+    /// `set_policy` for such a session overwrites the bad row.
+    pub fn load_all_policies(&self) -> Result<Vec<(SessionId, Policy)>, SandboxError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
+
+        let mut stmt = conn.prepare("SELECT session_id FROM session_policies")?;
+        let rows = stmt.query_map([], |row| {
+            let s: String = row.get(0)?;
+            Ok(s)
+        })?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            let id_str = row?;
+            let id = match SessionId::parse(&id_str) {
+                Ok(id) => id,
+                Err(e) => {
+                    warn!(
+                        session_id = %id_str,
+                        error = %e,
+                        "skipping policy row with invalid session id"
+                    );
+                    continue;
+                }
+            };
+            match read_policy(&conn, &id) {
+                Ok(Some(policy)) => out.push((id, policy)),
+                Ok(None) => {
+                    // Parent row exists (we just iterated it) but the
+                    // policy is empty enough to return None.  Treat as
+                    // "no policy" and skip — matches the get_policy
+                    // contract.
+                }
+                Err(e) => {
+                    warn!(
+                        session_id = %id,
+                        error = %e,
+                        "skipping corrupt persisted policy during hydration"
+                    );
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
     /// Delete a session from the database and remove its per-session directory.
     pub fn delete_session(&self, id: &SessionId) -> Result<(), SandboxError> {
         let conn = self
@@ -507,6 +699,197 @@ impl SessionStore {
 
         Ok(())
     }
+}
+
+// ----------------------------------------------------------------------
+// Policy row helpers
+// ----------------------------------------------------------------------
+
+/// Break a `Destination` into the (kind, value) columns the schema uses.
+/// The kind column is constrained by a SQL CHECK to `'domain' | 'cidr'`;
+/// keep this mapping aligned with the migration.
+fn destination_columns(dest: &Destination) -> (&'static str, String) {
+    match dest {
+        Destination::Domain(d) => ("domain", d.clone()),
+        Destination::Cidr(c) => ("cidr", c.clone()),
+    }
+}
+
+fn destination_from_columns(kind: &str, value: String) -> Result<Destination, SandboxError> {
+    match kind {
+        "domain" => Ok(Destination::Domain(value)),
+        "cidr" => Ok(Destination::Cidr(value)),
+        other => Err(SandboxError::Internal(format!(
+            "unknown destination_kind in policy_rules: {other}"
+        ))),
+    }
+}
+
+/// Stable lowercase tag for the `level` column (matches the SQL CHECK).
+fn level_column(level: &AssuranceLevel) -> &'static str {
+    match level {
+        AssuranceLevel::Deny => "deny",
+        AssuranceLevel::Transport => "transport",
+        AssuranceLevel::Tls => "tls",
+        AssuranceLevel::Http { .. } => "http",
+    }
+}
+
+/// Lowercase protocol tag (matches `#[serde(rename_all = "lowercase")]`
+/// on `Protocol` and the SQL CHECK).
+fn protocol_column(p: Protocol) -> &'static str {
+    match p {
+        Protocol::Tcp => "tcp",
+        Protocol::Udp => "udp",
+        Protocol::Http => "http",
+        Protocol::Https => "https",
+        Protocol::Any => "any",
+    }
+}
+
+fn protocol_from_column(s: &str) -> Result<Protocol, SandboxError> {
+    Ok(match s {
+        "tcp" => Protocol::Tcp,
+        "udp" => Protocol::Udp,
+        "http" => Protocol::Http,
+        "https" => Protocol::Https,
+        "any" => Protocol::Any,
+        other => {
+            return Err(SandboxError::Internal(format!(
+                "unknown protocol in policy_rules: {other}"
+            )));
+        }
+    })
+}
+
+/// Uppercase HTTP method tag (matches `#[serde(rename_all = "UPPERCASE")]`
+/// on `HttpMethod` and the SQL CHECK).
+fn method_column(m: HttpMethod) -> &'static str {
+    match m {
+        HttpMethod::Get => "GET",
+        HttpMethod::Post => "POST",
+        HttpMethod::Put => "PUT",
+        HttpMethod::Delete => "DELETE",
+        HttpMethod::Patch => "PATCH",
+        HttpMethod::Head => "HEAD",
+        HttpMethod::Options => "OPTIONS",
+        HttpMethod::Trace => "TRACE",
+        HttpMethod::Connect => "CONNECT",
+        HttpMethod::Any => "ANY",
+    }
+}
+
+fn method_from_column(s: &str) -> Result<HttpMethod, SandboxError> {
+    Ok(match s {
+        "GET" => HttpMethod::Get,
+        "POST" => HttpMethod::Post,
+        "PUT" => HttpMethod::Put,
+        "DELETE" => HttpMethod::Delete,
+        "PATCH" => HttpMethod::Patch,
+        "HEAD" => HttpMethod::Head,
+        "OPTIONS" => HttpMethod::Options,
+        "TRACE" => HttpMethod::Trace,
+        "CONNECT" => HttpMethod::Connect,
+        "ANY" => HttpMethod::Any,
+        other => {
+            return Err(SandboxError::Internal(format!(
+                "unknown method in policy_rule_http_filters: {other}"
+            )));
+        }
+    })
+}
+
+/// Reassemble a `Policy` from its normalized rows.  Returns `Ok(None)`
+/// if no parent `session_policies` row exists; errors otherwise mean a
+/// real DB failure or a row that violates a documented invariant (e.g.
+/// an `http`-level rule with no filters).
+fn read_policy(conn: &Connection, id: &SessionId) -> Result<Option<Policy>, SandboxError> {
+    // Parent row?
+    let version: String = {
+        let mut stmt =
+            conn.prepare("SELECT version FROM session_policies WHERE session_id = ?1")?;
+        let mut rows = stmt.query(params![id.as_str()])?;
+        match rows.next()? {
+            Some(row) => row.get(0)?,
+            None => return Ok(None),
+        }
+    };
+
+    // Rules, in order.
+    let mut rules_raw: Vec<(i64, String, String, String, String, Option<String>)> = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT rule_order, destination_kind, destination_value, level, protocol, reason
+             FROM policy_rules WHERE session_id = ?1 ORDER BY rule_order ASC",
+        )?;
+        let rows = stmt.query_map(params![id.as_str()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+        for row in rows {
+            rules_raw.push(row?);
+        }
+    }
+
+    let mut rules = Vec::with_capacity(rules_raw.len());
+    for (rule_order, dest_kind, dest_value, level_tag, protocol_str, reason) in rules_raw {
+        let destination = destination_from_columns(&dest_kind, dest_value)?;
+        let protocol = protocol_from_column(&protocol_str)?;
+
+        let level = match level_tag.as_str() {
+            "deny" => AssuranceLevel::Deny,
+            "transport" => AssuranceLevel::Transport,
+            "tls" => AssuranceLevel::Tls,
+            "http" => {
+                let mut stmt = conn.prepare(
+                    "SELECT method, path_pattern
+                     FROM policy_rule_http_filters
+                     WHERE session_id = ?1 AND rule_order = ?2
+                     ORDER BY filter_order ASC",
+                )?;
+                let rows = stmt.query_map(params![id.as_str(), rule_order], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                let mut filters = Vec::new();
+                for row in rows {
+                    let (method, path) = row?;
+                    filters.push(HttpFilter {
+                        method: method_from_column(&method)?,
+                        path,
+                    });
+                }
+                if filters.is_empty() {
+                    return Err(SandboxError::Internal(format!(
+                        "http-level policy rule (session {id}, rule_order {rule_order}) \
+                         has no filter rows — should have been rejected at validation"
+                    )));
+                }
+                AssuranceLevel::Http {
+                    http_filters: filters,
+                }
+            }
+            other => {
+                return Err(SandboxError::Internal(format!(
+                    "unknown level in policy_rules: {other}"
+                )));
+            }
+        };
+
+        rules.push(PolicyRule {
+            destination,
+            protocol,
+            reason,
+            level,
+        });
+    }
+
+    Ok(Some(Policy { version, rules }))
 }
 
 /// Internal error type for the insert retry loop.
@@ -554,6 +937,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> Result<Session, SandboxError> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
     use std::thread;
 
@@ -823,6 +1207,9 @@ mod tests {
             disk_gb: 100,
             workspace_mode: None,
             hardened: true,
+            repo: None,
+            boot_cmd: None,
+            template: None,
         };
 
         let session = store
@@ -837,6 +1224,79 @@ mod tests {
         assert_eq!(fetched.config.cpus, 8);
         assert_eq!(fetched.config.memory_mb, 16384);
         assert_eq!(fetched.config.disk_gb, 100);
+    }
+
+    #[test]
+    fn test_new_config_fields_round_trip_through_store() {
+        // End-to-end: SessionConfig{repo, boot_cmd, template} → SQLite
+        // config_json → read back via get_session.  Protects against a
+        // regression where the store path serializes/deserializes the
+        // new fields but one side forgets to include them.
+        let (store, _dir) = test_store();
+
+        let config = SessionConfig {
+            cpus: 2,
+            memory_mb: 4096,
+            disk_gb: 20,
+            workspace_mode: None,
+            hardened: true,
+            repo: Some("https://github.com/example/app.git".into()),
+            boot_cmd: Some("make setup".into()),
+            template: Some("/tmp/custom.yaml".into()),
+        };
+
+        let session = store
+            .create_session(config, Some("enriched".into()))
+            .expect("create");
+
+        let fetched = store
+            .get_session(&session.id)
+            .expect("get")
+            .expect("exists");
+
+        assert_eq!(
+            fetched.config.repo.as_deref(),
+            Some("https://github.com/example/app.git")
+        );
+        assert_eq!(fetched.config.boot_cmd.as_deref(), Some("make setup"));
+        assert_eq!(fetched.config.template.as_deref(), Some("/tmp/custom.yaml"));
+    }
+
+    #[test]
+    fn test_legacy_config_json_is_readable() {
+        // A row written by an older daemon has a `config` JSON blob that
+        // lacks the new repo/boot_cmd/template fields entirely.  Open
+        // the underlying SQLite DB directly, rewrite the `config`
+        // column to the legacy shape, and confirm the new daemon
+        // decodes it cleanly with `None` on the three new fields.
+        let (store, dir) = test_store();
+
+        let session = store
+            .create_session(SessionConfig::default(), Some("legacy".into()))
+            .expect("create");
+
+        // Open a separate connection to rewrite the column.  The store's
+        // own connection is private; a direct rusqlite handle against the
+        // same file mirrors what an older daemon would have produced.
+        let legacy_json = r#"{"cpus": 2, "memory_mb": 4096, "disk_gb": 20, "hardened": true}"#;
+        {
+            let conn = rusqlite::Connection::open(dir.path().join("sessions.db")).expect("open db");
+            conn.execute(
+                "UPDATE sessions SET config = ?1 WHERE id = ?2",
+                rusqlite::params![legacy_json, session.id.as_str()],
+            )
+            .expect("update");
+        }
+
+        let fetched = store
+            .get_session(&session.id)
+            .expect("get")
+            .expect("exists");
+
+        assert_eq!(fetched.config.cpus, 2);
+        assert!(fetched.config.repo.is_none());
+        assert!(fetched.config.boot_cmd.is_none());
+        assert!(fetched.config.template.is_none());
     }
 
     #[test]
@@ -1244,5 +1704,412 @@ mod tests {
 
         let result = store.update_state_forced(&missing_id(), SessionState::Running);
         assert!(matches!(result, Err(SandboxError::SessionNotFound(_))));
+    }
+
+    // ----------------------------------------------------------------------
+    // Policy persistence tests
+    // ----------------------------------------------------------------------
+
+    fn sample_http_policy() -> Policy {
+        Policy {
+            version: crate::policy::SCHEMA_VERSION.into(),
+            rules: vec![
+                PolicyRule {
+                    destination: Destination::Domain("github.com".into()),
+                    protocol: Protocol::Tcp,
+                    reason: Some("fetch repo".into()),
+                    level: AssuranceLevel::Http {
+                        http_filters: vec![
+                            HttpFilter {
+                                method: HttpMethod::Get,
+                                path: "/repos/*".into(),
+                            },
+                            HttpFilter {
+                                method: HttpMethod::Post,
+                                path: "/repos/*/issues".into(),
+                            },
+                        ],
+                    },
+                },
+                PolicyRule {
+                    destination: Destination::Cidr("10.0.0.0/8".into()),
+                    protocol: Protocol::Any,
+                    reason: None,
+                    level: AssuranceLevel::Deny,
+                },
+                PolicyRule {
+                    destination: Destination::Domain("example.com".into()),
+                    protocol: Protocol::Https,
+                    reason: Some("tls only".into()),
+                    level: AssuranceLevel::Tls,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn test_set_and_get_policy_round_trip_with_http_filters() {
+        let (store, _dir) = test_store();
+        let session = store
+            .create_session(SessionConfig::default(), Some("pol".into()))
+            .expect("create");
+
+        // No policy yet.
+        assert!(store.get_policy(&session.id).expect("get_policy").is_none());
+
+        let policy = sample_http_policy();
+        store
+            .set_policy(&session.id, &policy)
+            .expect("set_policy should succeed");
+
+        let loaded = store
+            .get_policy(&session.id)
+            .expect("get_policy should not error")
+            .expect("policy should be present");
+
+        assert_eq!(loaded.version, policy.version);
+        assert_eq!(loaded.rules.len(), policy.rules.len());
+
+        // Rule 0: http with two filters, in insertion order.
+        match &loaded.rules[0].level {
+            AssuranceLevel::Http { http_filters } => {
+                assert_eq!(http_filters.len(), 2);
+                assert_eq!(http_filters[0].method, HttpMethod::Get);
+                assert_eq!(http_filters[0].path, "/repos/*");
+                assert_eq!(http_filters[1].method, HttpMethod::Post);
+                assert_eq!(http_filters[1].path, "/repos/*/issues");
+            }
+            other => panic!("expected Http variant, got {other:?}"),
+        }
+        assert_eq!(loaded.rules[0].protocol, Protocol::Tcp);
+        assert_eq!(loaded.rules[0].reason.as_deref(), Some("fetch repo"));
+        assert!(matches!(
+            loaded.rules[0].destination,
+            Destination::Domain(ref s) if s == "github.com"
+        ));
+
+        // Rule 1: deny, cidr destination, no filters, no reason.
+        assert_eq!(loaded.rules[1].level, AssuranceLevel::Deny);
+        assert_eq!(loaded.rules[1].protocol, Protocol::Any);
+        assert!(loaded.rules[1].reason.is_none());
+        assert!(matches!(
+            loaded.rules[1].destination,
+            Destination::Cidr(ref s) if s == "10.0.0.0/8"
+        ));
+
+        // Rule 2: tls.
+        assert_eq!(loaded.rules[2].level, AssuranceLevel::Tls);
+        assert_eq!(loaded.rules[2].protocol, Protocol::Https);
+    }
+
+    #[test]
+    fn test_set_policy_replaces_previous() {
+        let (store, _dir) = test_store();
+        let session = store
+            .create_session(SessionConfig::default(), None)
+            .expect("create");
+
+        let first = sample_http_policy();
+        store.set_policy(&session.id, &first).expect("set first");
+
+        // Overwrite with a single-rule policy.
+        let second = Policy {
+            version: "1.0.0".into(),
+            rules: vec![PolicyRule {
+                destination: Destination::Domain("other.test".into()),
+                protocol: Protocol::Tcp,
+                reason: None,
+                level: AssuranceLevel::Transport,
+            }],
+        };
+        store.set_policy(&session.id, &second).expect("set second");
+
+        let loaded = store
+            .get_policy(&session.id)
+            .expect("get")
+            .expect("present");
+        assert_eq!(loaded.rules.len(), 1);
+        assert_eq!(loaded.rules[0].level, AssuranceLevel::Transport);
+
+        // Child filter rows for the replaced http rule must have been
+        // cascaded away — count rows directly.
+        let conn = store.conn.lock().unwrap();
+        let filter_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM policy_rule_http_filters WHERE session_id = ?1",
+                params![session.id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            filter_count, 0,
+            "http filters for replaced rule must be gone"
+        );
+    }
+
+    #[test]
+    fn test_get_policy_returns_none_when_unset() {
+        let (store, _dir) = test_store();
+        let session = store
+            .create_session(SessionConfig::default(), None)
+            .expect("create");
+
+        assert!(store.get_policy(&session.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_load_all_policies_returns_every_persisted_policy() {
+        let (store, _dir) = test_store();
+
+        let s1 = store
+            .create_session(SessionConfig::default(), Some("one".into()))
+            .expect("create s1");
+        let s2 = store
+            .create_session(SessionConfig::default(), Some("two".into()))
+            .expect("create s2");
+        let _s3 = store
+            .create_session(SessionConfig::default(), Some("three".into()))
+            .expect("create s3");
+
+        let p1 = sample_http_policy();
+        let p2 = Policy {
+            version: "1.0.0".into(),
+            rules: vec![PolicyRule {
+                destination: Destination::Domain("deny.example".into()),
+                protocol: Protocol::Any,
+                reason: None,
+                level: AssuranceLevel::Deny,
+            }],
+        };
+
+        store.set_policy(&s1.id, &p1).expect("set p1");
+        store.set_policy(&s2.id, &p2).expect("set p2");
+
+        let all = store.load_all_policies().expect("load_all_policies");
+        assert_eq!(
+            all.len(),
+            2,
+            "only sessions with a policy applied should appear"
+        );
+
+        let map: HashMap<SessionId, Policy> = all.into_iter().collect();
+        let loaded1 = map.get(&s1.id).expect("s1 present");
+        assert_eq!(loaded1.rules.len(), p1.rules.len());
+        let loaded2 = map.get(&s2.id).expect("s2 present");
+        assert_eq!(loaded2.rules.len(), 1);
+        assert_eq!(loaded2.rules[0].level, AssuranceLevel::Deny);
+    }
+
+    #[test]
+    fn test_load_all_policies_skips_corrupt_row_without_panicking() {
+        // Force an `http` rule to have zero child filters — a state the
+        // normal write path rejects (`set_policy` always inserts at
+        // least one filter when the variant is Http) but which a
+        // partial write or external tamper could leave behind.  The
+        // reassembler must log and skip, not panic or return an error
+        // to the caller.
+        let (store, _dir) = test_store();
+        let session = store
+            .create_session(SessionConfig::default(), Some("corrupt".into()))
+            .expect("create");
+
+        // Insert a parent row and an http rule — but no filter rows.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO session_policies (session_id, version) VALUES (?1, ?2)",
+                params![session.id.as_str(), "1.0.0"],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO policy_rules (
+                    session_id, rule_order, destination_kind, destination_value,
+                    level, protocol, reason
+                 ) VALUES (?1, 0, 'domain', 'corrupt.test', 'http', 'tcp', NULL)",
+                params![session.id.as_str()],
+            )
+            .unwrap();
+        }
+
+        // get_policy swallows the corrupt row.
+        assert!(store.get_policy(&session.id).unwrap().is_none());
+
+        // load_all_policies returns an entry-free result for this session,
+        // alongside any valid siblings.
+        let other = store
+            .create_session(SessionConfig::default(), Some("ok".into()))
+            .expect("create sibling");
+        let good = Policy {
+            version: "1.0.0".into(),
+            rules: vec![PolicyRule {
+                destination: Destination::Domain("ok.test".into()),
+                protocol: Protocol::Tcp,
+                reason: None,
+                level: AssuranceLevel::Transport,
+            }],
+        };
+        store.set_policy(&other.id, &good).expect("set sibling");
+
+        let all = store.load_all_policies().expect("load_all_policies");
+        assert_eq!(
+            all.len(),
+            1,
+            "corrupt row must be skipped, valid sibling preserved"
+        );
+        assert_eq!(all[0].0, other.id);
+    }
+
+    #[test]
+    fn test_set_policy_fails_for_unknown_session() {
+        // `session_id` is FK-constrained to sessions(id).  Inserting a
+        // policy for a session that doesn't exist must fail — and
+        // leave no stray rows in the child tables.
+        let (store, _dir) = test_store();
+
+        let result = store.set_policy(&missing_id(), &sample_http_policy());
+        assert!(
+            result.is_err(),
+            "set_policy for missing session must fail, got {result:?}"
+        );
+
+        // No leftover rows in any of the policy tables.
+        let conn = store.conn.lock().unwrap();
+        for table in [
+            "session_policies",
+            "policy_rules",
+            "policy_rule_http_filters",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "table {table} must be empty after failed set");
+        }
+    }
+
+    #[test]
+    fn test_set_policy_is_atomic_on_failure() {
+        // Applying a valid policy first, then attempting to apply an
+        // invalid one (here: an `http` rule with zero filters is fine
+        // at the store layer since validation lives in the compiler,
+        // so we inject an invalid destination_kind via direct SQL to
+        // cause a CHECK failure inside the transaction).  The previous
+        // policy must still be retrievable afterwards.
+        let (store, _dir) = test_store();
+        let session = store
+            .create_session(SessionConfig::default(), None)
+            .expect("create");
+
+        let initial = sample_http_policy();
+        store
+            .set_policy(&session.id, &initial)
+            .expect("set initial");
+
+        // Force a mid-transaction failure by starting a second
+        // transaction that inserts a row with an invalid destination_kind.
+        // We wrap the bad insert in its own TX to simulate the failure
+        // path inside `set_policy`.
+        let invalid = {
+            let conn = store.conn.lock().unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            tx.execute(
+                "DELETE FROM session_policies WHERE session_id = ?1",
+                params![session.id.as_str()],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO session_policies (session_id, version) VALUES (?1, '1.0.0')",
+                params![session.id.as_str()],
+            )
+            .unwrap();
+            let res = tx.execute(
+                "INSERT INTO policy_rules (
+                    session_id, rule_order, destination_kind, destination_value,
+                    level, protocol, reason
+                 ) VALUES (?1, 0, 'bogus', 'x', 'tls', 'tcp', NULL)",
+                params![session.id.as_str()],
+            );
+            let result = res.is_err();
+            // Force rollback regardless to leave the DB in the pre-TX state.
+            drop(tx);
+            result
+        };
+        assert!(invalid, "bad destination_kind must be rejected by CHECK");
+
+        // The original policy survives because the rollback undid the
+        // destructive DELETE.
+        let still_there = store
+            .get_policy(&session.id)
+            .expect("get")
+            .expect("original policy must survive rolled-back transaction");
+        assert_eq!(still_there.rules.len(), initial.rules.len());
+    }
+
+    #[test]
+    fn test_delete_session_cascades_policy_rows() {
+        let (store, _dir) = test_store();
+        let session = store
+            .create_session(SessionConfig::default(), None)
+            .expect("create");
+        store
+            .set_policy(&session.id, &sample_http_policy())
+            .expect("set_policy");
+
+        store.delete_session(&session.id).expect("delete");
+
+        // Cascade should have cleared every policy row for this session.
+        let conn = store.conn.lock().unwrap();
+        for table in [
+            "session_policies",
+            "policy_rules",
+            "policy_rule_http_filters",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE session_id = ?1"),
+                    params![session.id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                count, 0,
+                "table {table} must be empty after session deletion (cascade)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_policy_survives_store_reopen() {
+        // Open a store, persist a policy, drop the store, reopen on the
+        // same path.  The policy must still be readable — this is the
+        // store-side contract that startup hydration depends on.
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().to_path_buf();
+
+        let session_id;
+        let expected_rule_count;
+        {
+            let store = SessionStore::new(path.clone()).expect("open");
+            let session = store
+                .create_session(SessionConfig::default(), Some("pol".into()))
+                .expect("create");
+            session_id = session.id;
+            let policy = sample_http_policy();
+            expected_rule_count = policy.rules.len();
+            store.set_policy(&session_id, &policy).expect("set_policy");
+        }
+
+        // Drop and reopen.
+        let reopened = SessionStore::new(path).expect("reopen");
+        let loaded = reopened
+            .get_policy(&session_id)
+            .expect("get_policy after reopen")
+            .expect("policy should still be present after reopen");
+        assert_eq!(loaded.rules.len(), expected_rule_count);
+
+        let all = reopened.load_all_policies().expect("load_all_policies");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, session_id);
     }
 }

@@ -233,6 +233,12 @@ impl FromStr for SessionState {
 }
 
 /// Resource configuration for a sandbox session.
+///
+/// Persisted on disk as a JSON blob in the `sessions.config_json` column.
+/// Any new field here MUST be `Option<T>` with `#[serde(default)]` so
+/// records written by older daemons still deserialize cleanly and records
+/// written by newer daemons can be read back on rollback.  See
+/// `CLAUDE.md` → "On-disk compatibility" for the full rule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
     /// Number of CPU cores allocated.
@@ -251,6 +257,27 @@ pub struct SessionConfig {
     /// or when the hardened configuration causes compatibility issues.
     #[serde(default = "default_hardened")]
     pub hardened: bool,
+    /// Git repository URL cloned into `/home/agent/workspace/` at creation.
+    ///
+    /// Captured so `sandbox inspect`/`sandbox describe` can surface the
+    /// original creation input.  `None` on records written by daemons
+    /// predating M9-S11 (forward-compatible via `#[serde(default)]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// Command executed inside the VM once setup completes.
+    ///
+    /// Captured so `sandbox inspect`/`sandbox describe` can surface the
+    /// original creation input.  `None` on records written by daemons
+    /// predating M9-S11 (forward-compatible via `#[serde(default)]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_cmd: Option<String>,
+    /// Path to a custom Lima template used for creation, if any.
+    ///
+    /// Captured so `sandbox inspect`/`sandbox describe` can surface the
+    /// original creation input.  `None` on records written by daemons
+    /// predating M9-S11 (forward-compatible via `#[serde(default)]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
 }
 
 fn default_hardened() -> bool {
@@ -265,6 +292,9 @@ impl Default for SessionConfig {
             disk_gb: 20,
             workspace_mode: None,
             hardened: true,
+            repo: None,
+            boot_cmd: None,
+            template: None,
         }
     }
 }
@@ -358,6 +388,9 @@ mod tests {
             disk_gb: 50,
             workspace_mode: None,
             hardened: true,
+            repo: None,
+            boot_cmd: None,
+            template: None,
         };
         let session = Session::with_config(Some("custom".into()), config);
         assert_eq!(session.config.cpus, 4);
@@ -487,6 +520,9 @@ mod tests {
         assert_eq!(config.disk_gb, 20);
         assert!(config.workspace_mode.is_none());
         assert!(config.hardened, "hardened should default to true");
+        assert!(config.repo.is_none(), "repo defaults to None");
+        assert!(config.boot_cmd.is_none(), "boot_cmd defaults to None");
+        assert!(config.template.is_none(), "template defaults to None");
     }
 
     #[test]
@@ -509,6 +545,9 @@ mod tests {
             disk_gb: 20,
             workspace_mode: None,
             hardened: false,
+            repo: None,
+            boot_cmd: None,
+            template: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         let deser: SessionConfig = serde_json::from_str(&json).unwrap();
@@ -516,6 +555,66 @@ mod tests {
             !deser.hardened,
             "hardened=false should survive serialization round-trip"
         );
+    }
+
+    #[test]
+    fn legacy_config_json_deserializes_with_none_for_new_fields() {
+        // A record written by a pre-M9-S11 daemon has no `repo`,
+        // `boot_cmd`, or `template` keys at all.  The new fields must
+        // deserialize to `None` via `#[serde(default)]` so that rolling
+        // upgrades (and mid-conversation rollbacks) do not fail to load.
+        let json = r#"{"cpus": 2, "memory_mb": 4096, "disk_gb": 20, "hardened": true}"#;
+        let config: SessionConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.cpus, 2);
+        assert_eq!(config.memory_mb, 4096);
+        assert_eq!(config.disk_gb, 20);
+        assert!(config.hardened);
+        assert!(config.workspace_mode.is_none());
+        assert!(
+            config.repo.is_none(),
+            "repo must default to None on legacy records"
+        );
+        assert!(
+            config.boot_cmd.is_none(),
+            "boot_cmd must default to None on legacy records"
+        );
+        assert!(
+            config.template.is_none(),
+            "template must default to None on legacy records"
+        );
+    }
+
+    #[test]
+    fn new_fields_round_trip_through_serde() {
+        let config = SessionConfig {
+            cpus: 4,
+            memory_mb: 8192,
+            disk_gb: 50,
+            workspace_mode: None,
+            hardened: true,
+            repo: Some("https://github.com/example/app.git".into()),
+            boot_cmd: Some("make setup".into()),
+            template: Some("/tmp/custom.yaml".into()),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let deser: SessionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            deser.repo.as_deref(),
+            Some("https://github.com/example/app.git")
+        );
+        assert_eq!(deser.boot_cmd.as_deref(), Some("make setup"));
+        assert_eq!(deser.template.as_deref(), Some("/tmp/custom.yaml"));
+    }
+
+    #[test]
+    fn none_fields_are_omitted_from_wire() {
+        let config = SessionConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        // workspace_mode, repo, boot_cmd, template all skip when None.
+        assert!(!json.contains("workspace_mode"), "wire JSON: {json}");
+        assert!(!json.contains("\"repo\""), "wire JSON: {json}");
+        assert!(!json.contains("boot_cmd"), "wire JSON: {json}");
+        assert!(!json.contains("template"), "wire JSON: {json}");
     }
 
     #[test]

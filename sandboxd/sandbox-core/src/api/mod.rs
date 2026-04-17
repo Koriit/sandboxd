@@ -1,6 +1,11 @@
 use serde::{Deserialize, Serialize};
 
-use crate::session::{Session, SessionConfig, SessionId, SessionState};
+use crate::session::SessionId;
+
+pub mod dto;
+pub mod mapper;
+
+pub use dto::{PolicyDto, PolicyLevelDto, PolicyRuleDto, SessionConfigDto, SessionDto};
 
 // ---------------------------------------------------------------------------
 // Health types
@@ -126,58 +131,6 @@ pub struct ExecResponse {
     pub stderr: String,
 }
 
-/// Enriched session response with optional guest agent health status.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionResponse {
-    pub id: SessionId,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    pub state: SessionState,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-    pub updated_at: chrono::DateTime<chrono::Utc>,
-    pub config: SessionConfig,
-    /// Guest agent connectivity status: "connected", "unreachable", or null.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub guest_agent_status: Option<String>,
-    /// Gateway container status: "running", "stopped", "not_found", or null.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub gateway_status: Option<String>,
-}
-
-impl SessionResponse {
-    /// Create from a `Session` without guest agent status.
-    pub fn from_session(session: Session) -> Self {
-        Self {
-            id: session.id,
-            name: session.name,
-            state: session.state,
-            created_at: session.created_at,
-            updated_at: session.updated_at,
-            config: session.config,
-            guest_agent_status: None,
-            gateway_status: None,
-        }
-    }
-
-    /// Create from a `Session` with guest agent and gateway status.
-    pub fn from_session_with_status(
-        session: Session,
-        agent_status: Option<String>,
-        gateway_status: Option<String>,
-    ) -> Self {
-        Self {
-            id: session.id,
-            name: session.name,
-            state: session.state,
-            created_at: session.created_at,
-            updated_at: session.updated_at,
-            config: session.config,
-            guest_agent_status: agent_status,
-            gateway_status,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,39 +207,6 @@ mod tests {
         assert_eq!(deserialized.exit_code, 0);
         assert_eq!(deserialized.stdout, "hello\n");
         assert!(deserialized.stderr.is_empty());
-    }
-
-    #[test]
-    fn session_response_from_session() {
-        let session = Session::new(Some("test".into()));
-        let resp = SessionResponse::from_session(session.clone());
-        assert_eq!(resp.id, session.id);
-        assert_eq!(resp.name, session.name);
-        assert!(resp.guest_agent_status.is_none());
-    }
-
-    #[test]
-    fn session_response_with_status() {
-        let session = Session::new(Some("test".into()));
-        let resp = SessionResponse::from_session_with_status(
-            session.clone(),
-            Some("connected".into()),
-            Some("healthy".into()),
-        );
-        assert_eq!(resp.id, session.id);
-        assert_eq!(resp.guest_agent_status, Some("connected".into()));
-        assert_eq!(resp.gateway_status, Some("healthy".into()));
-    }
-
-    #[test]
-    fn session_response_serialization_omits_none() {
-        let session = Session::new(None);
-        let resp = SessionResponse::from_session(session);
-        let json = serde_json::to_string(&resp).unwrap();
-        // name, guest_agent_status, and gateway_status should be omitted when None
-        assert!(!json.contains("name"));
-        assert!(!json.contains("guest_agent_status"));
-        assert!(!json.contains("gateway_status"));
     }
 
     #[test]
@@ -369,20 +289,6 @@ mod tests {
         let deser: NetworkHealth = serde_json::from_str(&json).unwrap();
         assert!(deser.bridge_exists);
         assert!(!deser.tap_exists);
-    }
-
-    #[test]
-    fn session_response_with_gateway_status() {
-        let session = Session::new(Some("gw-test".into()));
-        let resp = SessionResponse::from_session_with_status(
-            session.clone(),
-            Some("connected".into()),
-            Some("running".into()),
-        );
-        assert_eq!(resp.gateway_status, Some("running".into()));
-
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("\"gateway_status\":\"running\""));
     }
 
     #[test]

@@ -80,8 +80,9 @@ class TestMitmproxyIntegration:
                     "rules": [
                         {
                             "host": "httpbin.org",
-                            "methods": ["GET"],
-                            "paths": None,
+                            "filters": [
+                                {"method": "GET", "path": "/*"},
+                            ],
                         }
                     ]
                 },
@@ -161,4 +162,4 @@ class TestMitmproxyIntegration:
         assert resp.status_code == 599
         body = resp.json()
         assert body["error"] == "sandbox_policy_denied"
-        assert "method POST not allowed" in body["reason"]
+        assert body["reason"] == "no filter matched POST /post"

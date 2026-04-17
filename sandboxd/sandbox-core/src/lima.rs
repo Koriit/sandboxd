@@ -1875,6 +1875,9 @@ mod tests {
             disk_gb: 100,
             workspace_mode: None,
             hardened: true,
+            repo: None,
+            boot_cmd: None,
+            template: None,
         };
 
         let template = mgr.generate_template(&id, &config);
@@ -1908,6 +1911,9 @@ mod tests {
             disk_gb: 10,
             workspace_mode: None,
             hardened: true,
+            repo: None,
+            boot_cmd: None,
+            template: None,
         };
 
         let template = mgr.generate_template(&id, &config);
@@ -1930,6 +1936,9 @@ mod tests {
                 host_path: "/home/user/project".into(),
             }),
             hardened: true,
+            repo: None,
+            boot_cmd: None,
+            template: None,
         };
 
         let template = mgr.generate_template(&id, &config);
@@ -1974,6 +1983,9 @@ mod tests {
                 repo_url: "https://github.com/example/repo.git".into(),
             }),
             hardened: true,
+            repo: None,
+            boot_cmd: None,
+            template: None,
         };
 
         let template = mgr.generate_template(&id, &config);
@@ -2110,6 +2122,9 @@ mod tests {
             disk_gb: 20,
             workspace_mode: None,
             hardened: true,
+            repo: None,
+            boot_cmd: None,
+            template: None,
         };
 
         let template = mgr.generate_template(&id, &config);
@@ -2135,6 +2150,9 @@ mod tests {
             disk_gb: 20,
             workspace_mode: None,
             hardened: false,
+            repo: None,
+            boot_cmd: None,
+            template: None,
         };
 
         let template = mgr.generate_template(&id, &config);

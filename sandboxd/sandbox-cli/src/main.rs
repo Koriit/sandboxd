@@ -9,7 +9,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use http_body_util::BodyExt;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
-use sandbox_core::{ApiError, ExecResponse, Policy, Session, SessionHealth, SessionResponse};
+use sandbox_core::{
+    ApiError, ExecResponse, Policy, PolicyDto, PolicyLevelDto, PolicyRuleDto, SessionDto,
+    SessionHealth,
+};
 use tokio::net::UnixStream;
 
 /// CLI client for managing sandbox sessions.
@@ -50,6 +53,11 @@ enum Command {
         /// Path to a policy JSON file to apply after creation.
         #[arg(long)]
         policy: Option<String>,
+        /// Create the session with the synthetic unrestricted policy —
+        /// all destinations, all methods, all paths, traffic logged through
+        /// mitmproxy.  Mutually exclusive with `--policy`.
+        #[arg(long, conflicts_with = "policy")]
+        unrestricted: bool,
         /// Git repository URL to clone into /home/agent/workspace/ after session setup.
         ///
         /// Mutually exclusive with --workspace.
@@ -144,6 +152,28 @@ enum Command {
         /// Session name or ID.
         session: String,
     },
+    /// Dump one or more sessions as pretty-printed JSON.
+    ///
+    /// Emits a JSON array of `SessionDto` objects (one per argument) in
+    /// input order. Intended for scripts and `jq` consumers. If any named
+    /// session is missing, the CLI writes an error to stderr naming the
+    /// first missing id, exits non-zero, and produces no stdout.
+    Inspect {
+        /// One or more session names or IDs to inspect.
+        #[arg(required = true)]
+        sessions: Vec<String>,
+    },
+    /// Render a human-readable description of one or more sessions.
+    ///
+    /// Prints session header, config, runtime, and policy sections per
+    /// argument. Blocks are separated by a single blank line. If any
+    /// named session is missing, the CLI writes an error to stderr naming
+    /// the first missing id, exits non-zero, and produces no stdout.
+    Describe {
+        /// One or more session names or IDs to describe.
+        #[arg(required = true)]
+        sessions: Vec<String>,
+    },
     /// Rebuild the pre-baked base VM image.
     RebuildImage,
 }
@@ -151,12 +181,37 @@ enum Command {
 /// Policy subcommands.
 #[derive(Subcommand, Debug, Clone)]
 enum PolicyAction {
-    /// Apply a policy from a JSON file to a session.
+    /// Update the policy for a session.
+    ///
+    /// Exactly one of `--policy`, `--unrestricted`, or `--clear` must be
+    /// supplied.  `--clear` is idempotent (safe to call on a session that
+    /// already has no policy).
     Update {
         /// Session name or ID.
         session: String,
-        /// Path to the policy JSON file.
-        policy_path: String,
+        /// Path to the policy JSON file to apply.
+        #[arg(
+            long,
+            conflicts_with_all = ["unrestricted", "clear"],
+        )]
+        policy: Option<String>,
+        /// Apply the synthetic unrestricted policy — all destinations, all
+        /// methods, all paths, traffic logged through mitmproxy.  Mutually
+        /// exclusive with `--policy` and `--clear`.
+        #[arg(
+            long,
+            conflicts_with_all = ["policy", "clear"],
+        )]
+        unrestricted: bool,
+        /// Remove any policy from the session and revert to the fail-closed
+        /// default (empty CoreDNS allow-list, deny-all mitmproxy/Envoy).
+        /// Idempotent.  Mutually exclusive with `--policy` and
+        /// `--unrestricted`.
+        #[arg(
+            long,
+            conflicts_with_all = ["policy", "unrestricted"],
+        )]
+        clear: bool,
     },
 }
 
@@ -195,6 +250,7 @@ fn build_request(command: &Command) -> Option<Request<String>> {
             disk,
             template,
             policy,
+            unrestricted,
             repo,
             boot_cmd,
             workspace,
@@ -226,6 +282,16 @@ fn build_request(command: &Command) -> Option<Request<String>> {
                         process::exit(1);
                     }
                 };
+                body.insert("policy".into(), policy_value);
+            } else if *unrestricted {
+                // The synthetic unrestricted policy is constructed from
+                // `Policy::unrestricted()` and serialized as normal JSON.
+                // This keeps the wire format identical to a user-authored
+                // unrestricted policy — the daemon does not treat it
+                // specially (no flag, no sidecar), only the describe
+                // renderer recognises the shape for display.
+                let policy_value = serde_json::to_value(Policy::unrestricted())
+                    .expect("Policy::unrestricted must serialize");
                 body.insert("policy".into(), policy_value);
             }
             if let Some(r) = repo {
@@ -313,26 +379,65 @@ fn build_request(command: &Command) -> Option<Request<String>> {
         Command::Policy { action } => match action {
             PolicyAction::Update {
                 session,
-                policy_path,
+                policy,
+                unrestricted,
+                clear,
             } => {
-                let policy_json = match std::fs::read_to_string(policy_path) {
-                    Ok(content) => content,
-                    Err(e) => {
-                        eprintln!("Error: cannot read policy file '{policy_path}': {e}");
-                        process::exit(1);
-                    }
-                };
-                // Validate that it parses as a Policy before sending.
-                if let Err(e) = serde_json::from_str::<Policy>(&policy_json) {
-                    eprintln!("Error: invalid policy JSON in '{policy_path}': {e}");
+                // Exactly one of the three must be present.  clap's
+                // `conflicts_with_all` catches the "more than one" case, but
+                // "none" has to be validated here.
+                let selected = [policy.is_some(), *unrestricted, *clear]
+                    .iter()
+                    .filter(|x| **x)
+                    .count();
+                if selected != 1 {
+                    eprintln!(
+                        "Error: `sandbox policy update` requires exactly one of \
+                         `--policy <path>`, `--unrestricted`, or `--clear`."
+                    );
                     process::exit(1);
                 }
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/sessions/{session}/policy"))
-                    .header("content-type", "application/json")
-                    .body(policy_json)
-                    .expect("failed to build request")
+
+                if *clear {
+                    // Revert to fail-closed.  No request body — the daemon
+                    // handler reads the session id from the URL.
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(format!("/sessions/{session}/policy"))
+                        .body(String::new())
+                        .expect("failed to build request")
+                } else {
+                    // POST a policy document — either user-supplied or the
+                    // synthetic unrestricted one.  `UpdatePolicyRequest` is
+                    // `#[serde(flatten)]` over the inner `Policy`, so the
+                    // wire body is the raw policy JSON at the top level.
+                    let policy_json = if let Some(path) = policy {
+                        let body = match std::fs::read_to_string(path) {
+                            Ok(content) => content,
+                            Err(e) => {
+                                eprintln!("Error: cannot read policy file '{path}': {e}");
+                                process::exit(1);
+                            }
+                        };
+                        if let Err(e) = serde_json::from_str::<Policy>(&body) {
+                            eprintln!("Error: invalid policy JSON in '{path}': {e}");
+                            process::exit(1);
+                        }
+                        body
+                    } else {
+                        // `*unrestricted` — synthetic policy serialized on
+                        // the client so the daemon only ever sees a normal
+                        // `Policy` JSON document.
+                        serde_json::to_string(&Policy::unrestricted())
+                            .expect("Policy::unrestricted must serialize")
+                    };
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/sessions/{session}/policy"))
+                        .header("content-type", "application/json")
+                        .body(policy_json)
+                        .expect("failed to build request")
+                }
             }
         },
         Command::Health { session } => Request::builder()
@@ -345,8 +450,14 @@ fn build_request(command: &Command) -> Option<Request<String>> {
             .uri("/rebuild-image")
             .body(String::new())
             .expect("failed to build request"),
-        // Ssh, Logs, and Cp are handled specially -- not via a single HTTP request.
-        Command::Ssh { .. } | Command::Logs { .. } | Command::Cp { .. } => return None,
+        // Ssh, Logs, Cp, Inspect, and Describe are handled specially --
+        // not via a single HTTP request. Inspect and Describe issue one
+        // GET /sessions/{id} per argument and render client-side.
+        Command::Ssh { .. }
+        | Command::Logs { .. }
+        | Command::Cp { .. }
+        | Command::Inspect { .. }
+        | Command::Describe { .. } => return None,
     };
     Some(req)
 }
@@ -385,7 +496,7 @@ fn format_relative_time(dt: &DateTime<Utc>) -> String {
 }
 
 /// Display a list of sessions as a formatted table.
-fn display_sessions_table(sessions: &[SessionResponse]) {
+fn display_sessions_table(sessions: &[SessionDto]) {
     if sessions.is_empty() {
         println!("No sessions found.");
         return;
@@ -412,7 +523,7 @@ fn display_sessions_table(sessions: &[SessionResponse]) {
 }
 
 /// Display a single session in detail.
-fn display_session(session: &Session) {
+fn display_session(session: &SessionDto) {
     let name = session.name.as_deref().unwrap_or("-");
     println!("ID:       {}", session.id);
     println!("Name:     {name}");
@@ -512,7 +623,7 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
 
     match command {
         Command::Ps | Command::Ls => {
-            let sessions: Vec<SessionResponse> =
+            let sessions: Vec<SessionDto> =
                 serde_json::from_str(body).map_err(|e| format!("failed to parse response: {e}"))?;
             display_sessions_table(&sessions);
         }
@@ -521,19 +632,19 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
             println!("Session removed.");
         }
         Command::Create { .. } => {
-            let session: Session =
+            let session: SessionDto =
                 serde_json::from_str(body).map_err(|e| format!("failed to parse response: {e}"))?;
             println!("Session created:");
             display_session(&session);
         }
         Command::Start { .. } => {
-            let session: Session =
+            let session: SessionDto =
                 serde_json::from_str(body).map_err(|e| format!("failed to parse response: {e}"))?;
             println!("Session started:");
             display_session(&session);
         }
         Command::Stop { .. } => {
-            let session: Session =
+            let session: SessionDto =
                 serde_json::from_str(body).map_err(|e| format!("failed to parse response: {e}"))?;
             println!("Session stopped:");
             display_session(&session);
@@ -551,13 +662,18 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
                 process::exit(result.exit_code);
             }
         }
-        Command::Policy { .. } => {
+        Command::Policy { action } => {
             let result: serde_json::Value = serde_json::from_str(body)
                 .map_err(|e| format!("failed to parse policy response: {e}"))?;
             if let Some(message) = result.get("message").and_then(|m| m.as_str()) {
                 println!("{message}");
             } else {
-                println!("Policy updated.");
+                // Fallback when the daemon response lacks a message field.
+                // Choose the verb by subcommand to keep output truthful.
+                match action {
+                    PolicyAction::Update { clear: true, .. } => println!("Policy cleared."),
+                    _ => println!("Policy updated."),
+                }
             }
         }
         Command::Health { .. } => {
@@ -592,13 +708,342 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
         Command::RebuildImage => {
             eprintln!("Done.");
         }
-        Command::Ssh { .. } | Command::Logs { .. } | Command::Cp { .. } => {
-            // Ssh, Logs, and Cp are handled separately, should not reach here.
-            unreachable!("ssh/logs/cp commands should be handled before send_request");
+        Command::Ssh { .. }
+        | Command::Logs { .. }
+        | Command::Cp { .. }
+        | Command::Inspect { .. }
+        | Command::Describe { .. } => {
+            // These commands are handled separately and never call
+            // handle_response. Reaching here indicates a dispatch bug.
+            unreachable!(
+                "ssh/logs/cp/inspect/describe commands should be handled before send_request"
+            );
         }
     }
 
     Ok(())
+}
+
+/// Fetch each session by name or ID via `GET /sessions/{id}` in parallel,
+/// returning the DTOs in the same order as the input.
+///
+/// Used by `inspect` and `describe` to implement strict atomic error
+/// behaviour: if **any** lookup fails, the caller writes an error to
+/// stderr naming the **first** missing id (in input order), exits
+/// non-zero, and emits **no** stdout.
+///
+/// No batch endpoint is introduced on the daemon — this is purely
+/// client-side fan-out.  The cost of one GET per session is negligible
+/// against the UX of a single atomic call from the user's point of view.
+async fn fetch_sessions_parallel(
+    socket_path: &str,
+    sessions: &[String],
+) -> Result<Vec<SessionDto>, String> {
+    let mut handles: Vec<tokio::task::JoinHandle<Result<SessionDto, String>>> =
+        Vec::with_capacity(sessions.len());
+
+    for session in sessions {
+        let socket = socket_path.to_string();
+        let id = session.clone();
+        handles.push(tokio::spawn(async move {
+            let req = Request::builder()
+                .method("GET")
+                .uri(format!("/sessions/{id}"))
+                .body(String::new())
+                .expect("failed to build request");
+
+            let (status, body) = send_request(&socket, req).await?;
+
+            if status == hyper::StatusCode::NOT_FOUND {
+                return Err(format!("session not found: {id}"));
+            }
+
+            if !status.is_success() {
+                if let Ok(api_err) = serde_json::from_str::<ApiError>(&body) {
+                    return Err(format!("failed to look up session {id}: {}", api_err.error));
+                }
+                return Err(format!("failed to look up session {id} ({status}): {body}"));
+            }
+
+            serde_json::from_str::<SessionDto>(&body)
+                .map_err(|e| format!("failed to parse session {id}: {e}"))
+        }));
+    }
+
+    // Await every task. Collect results preserving input order; surface
+    // the FIRST error in input order, mirroring the spec's "names the
+    // first missing id" requirement.
+    let mut results: Vec<Result<SessionDto, String>> = Vec::with_capacity(handles.len());
+    for handle in handles {
+        match handle.await {
+            Ok(r) => results.push(r),
+            Err(join_err) => results.push(Err(format!("task join error: {join_err}"))),
+        }
+    }
+
+    // Find first error in input order.
+    if let Some(err) = results.iter().find_map(|r| r.as_ref().err().cloned()) {
+        return Err(err);
+    }
+
+    Ok(results
+        .into_iter()
+        .map(|r| r.expect("checked above"))
+        .collect())
+}
+
+/// Render a slice of `SessionDto` as the human-readable `sandbox describe`
+/// output. Separator between sessions is a single blank line.
+///
+/// Layout follows the spec §2:
+/// - header block (Session, Name, State, Created, Updated)
+/// - `Config:` block
+/// - `Runtime:` block
+/// - `Policy:` block — either `Policy: none` or a version/count header
+///   followed by one indented rule entry per rule.
+///
+/// Timestamps are rendered as absolute UTC plus the existing relative
+/// age suffix (e.g. `5m ago`), matching the sample in the spec.
+fn render_describe(sessions: &[SessionDto]) -> String {
+    let mut out = String::new();
+    for (idx, session) in sessions.iter().enumerate() {
+        if idx > 0 {
+            // Single blank line between session blocks.
+            out.push('\n');
+        }
+        render_describe_one(session, &mut out);
+    }
+    out
+}
+
+fn render_describe_one(session: &SessionDto, out: &mut String) {
+    use std::fmt::Write as _;
+
+    let name = session.name.as_deref().unwrap_or("-");
+    let _ = writeln!(out, "Session:      {}", session.id);
+    let _ = writeln!(out, "Name:         {name}");
+    // Render state in lowercase to match spec §2 (and the wire/JSON
+    // snake_case serde representation), not the capitalized `Display`
+    // impl used by `ps` table headers.
+    let _ = writeln!(
+        out,
+        "State:        {}",
+        session.state.to_string().to_lowercase()
+    );
+    let _ = writeln!(
+        out,
+        "Created:      {} ({})",
+        session.created_at.format("%Y-%m-%d %H:%M:%S UTC"),
+        format_relative_time(&session.created_at)
+    );
+    let _ = writeln!(
+        out,
+        "Updated:      {} ({})",
+        session.updated_at.format("%Y-%m-%d %H:%M:%S UTC"),
+        format_relative_time(&session.updated_at)
+    );
+    out.push('\n');
+
+    let _ = writeln!(out, "Config:");
+    let _ = writeln!(out, "  CPUs:        {}", session.config.cpus);
+    let _ = writeln!(out, "  Memory:      {} MB", session.config.memory_mb);
+    let _ = writeln!(out, "  Disk:        {} GB", session.config.disk_gb);
+    let _ = writeln!(
+        out,
+        "  Workspace:   {}",
+        session.config.workspace_mode.as_deref().unwrap_or("-")
+    );
+    let _ = writeln!(out, "  Hardened:    {}", session.config.hardened);
+    let _ = writeln!(
+        out,
+        "  Repo:        {}",
+        session.config.repo.as_deref().unwrap_or("-")
+    );
+    let _ = writeln!(
+        out,
+        "  Boot cmd:    {}",
+        session.config.boot_cmd.as_deref().unwrap_or("-")
+    );
+    let _ = writeln!(
+        out,
+        "  Template:    {}",
+        session.config.template.as_deref().unwrap_or("-")
+    );
+    out.push('\n');
+
+    let _ = writeln!(out, "Runtime:");
+    let _ = writeln!(
+        out,
+        "  Guest agent: {}",
+        session.guest_agent_status.as_deref().unwrap_or("-")
+    );
+    let _ = writeln!(
+        out,
+        "  Gateway:     {}",
+        session.gateway_status.as_deref().unwrap_or("-")
+    );
+    out.push('\n');
+
+    render_policy_block(session.policy.as_ref(), out);
+}
+
+fn render_policy_block(policy: Option<&PolicyDto>, out: &mut String) {
+    use std::fmt::Write as _;
+    let policy = match policy {
+        None => {
+            let _ = writeln!(out, "Policy: none");
+            return;
+        }
+        Some(p) => p,
+    };
+
+    // Unrestricted policies round-trip through the DTO like any other
+    // policy; detect the shape on the DTO side so we can collapse it to a
+    // single-line summary for `describe`.  `inspect` (pretty JSON) remains
+    // the authoritative full dump.
+    if is_unrestricted_dto(policy) {
+        let _ = writeln!(out, "Policy: unrestricted (logged)");
+        return;
+    }
+
+    let _ = writeln!(
+        out,
+        "Policy (v{}, {} rules):",
+        policy.version,
+        policy.rules.len()
+    );
+    for (i, rule) in policy.rules.iter().enumerate() {
+        render_policy_rule(i, rule, out);
+    }
+}
+
+/// Return `true` when a wire-shape policy matches what
+/// [`sandbox_core::Policy::unrestricted`] produces: exactly one rule with
+/// destination `*`, Http level, single `ANY /*` filter.  Extra fields
+/// (`reason`, `protocol`) are ignored so a user-tagged unrestricted policy
+/// still collapses to the short summary.
+fn is_unrestricted_dto(policy: &PolicyDto) -> bool {
+    use sandbox_core::{Destination, HttpMethod};
+    if policy.rules.len() != 1 {
+        return false;
+    }
+    let rule = &policy.rules[0];
+    if !matches!(&rule.destination, Destination::Domain(d) if d == "*") {
+        return false;
+    }
+    match &rule.level {
+        PolicyLevelDto::Http { http_filters } => {
+            http_filters.len() == 1
+                && http_filters[0].method == HttpMethod::Any
+                && http_filters[0].path == "/*"
+        }
+        _ => false,
+    }
+}
+
+fn render_policy_rule(idx: usize, rule: &PolicyRuleDto, out: &mut String) {
+    use std::fmt::Write as _;
+
+    // Top line: `  [i] <action> <protocol>  <destination>`.
+    //
+    // "action" is the level variant name (`allow` for any non-deny level
+    // keeps faith with the sample in the spec, which uses `allow http`,
+    // `allow tls`, etc.; `deny` is left as-is).  We map each level to a
+    // (action, level_word) pair so the top line stays compact and the
+    // sub-lines carry the detail.
+    let (action, level_word) = match &rule.level {
+        PolicyLevelDto::Deny => ("deny", ""),
+        PolicyLevelDto::Transport => ("allow", "transport"),
+        PolicyLevelDto::Tls => ("allow", "tls"),
+        PolicyLevelDto::Http { .. } => ("allow", "http"),
+    };
+
+    let protocol_str = protocol_to_str(&rule.protocol);
+    let destination_str: String = rule.destination.clone().into();
+
+    // Layout: `  [i] <action> <level><pad><destination>`. The combined
+    // `<action> <level>` segment is padded to a fixed width (16) so the
+    // destination column lines up across rules regardless of level.  For
+    // `deny` (no level word) we emit the action alone and rely on the
+    // same padding to align the column.
+    let header = if level_word.is_empty() {
+        format!("  [{idx}] {:<16}{destination_str}", action)
+    } else {
+        format!(
+            "  [{idx}] {:<16}{destination_str}",
+            format!("{action} {level_word}")
+        )
+    };
+    let _ = writeln!(out, "{header}");
+
+    let _ = writeln!(out, "        protocol:    {protocol_str}");
+
+    if let PolicyLevelDto::Http { http_filters } = &rule.level {
+        for filter in http_filters {
+            let _ = writeln!(
+                out,
+                "        http_filters: {} {}",
+                filter.method, filter.path
+            );
+        }
+    }
+
+    if let Some(reason) = &rule.reason {
+        let _ = writeln!(out, "        reason:      {reason}");
+    }
+}
+
+fn protocol_to_str(protocol: &sandbox_core::Protocol) -> &'static str {
+    use sandbox_core::Protocol;
+    match protocol {
+        Protocol::Tcp => "tcp",
+        Protocol::Udp => "udp",
+        Protocol::Http => "http",
+        Protocol::Https => "https",
+        Protocol::Any => "any",
+    }
+}
+
+/// Handle `sandbox inspect <session>...`: emit a pretty-printed JSON array
+/// of `SessionDto`, one element per argument, in input order. Any missing
+/// session causes a non-zero exit with an error on stderr and no stdout.
+async fn handle_inspect(socket_path: &str, sessions: &[String]) {
+    let dtos = match fetch_sessions_parallel(socket_path, sessions).await {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    };
+
+    match serde_json::to_string_pretty(&dtos) {
+        Ok(s) => {
+            println!("{s}");
+        }
+        Err(e) => {
+            eprintln!("Error: failed to serialize sessions: {e}");
+            process::exit(1);
+        }
+    }
+}
+
+/// Handle `sandbox describe <session>...`: render human-readable sections
+/// for each session per the spec §2 layout. Any missing session causes a
+/// non-zero exit with an error on stderr and no stdout.
+async fn handle_describe(socket_path: &str, sessions: &[String]) {
+    let dtos = match fetch_sessions_parallel(socket_path, sessions).await {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    };
+
+    let rendered = render_describe(&dtos);
+    // `print!` so we do not add a trailing blank line beyond what the
+    // renderer already emitted (the last block ends with `\n` after the
+    // last `writeln!` line).
+    print!("{rendered}");
 }
 
 /// Handle the `ssh` subcommand: resolve session via daemon API, then exec
@@ -628,7 +1073,7 @@ async fn handle_ssh(socket_path: &str, session: &str, command: &[String]) {
         process::exit(1);
     }
 
-    let session_resp: SessionResponse = match serde_json::from_str(&body) {
+    let session_resp: SessionDto = match serde_json::from_str(&body) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Failed to parse session response: {e}");
@@ -694,7 +1139,7 @@ async fn handle_logs(
         process::exit(1);
     }
 
-    let session_resp: SessionResponse = match serde_json::from_str(&body) {
+    let session_resp: SessionDto = match serde_json::from_str(&body) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Failed to parse session response: {e}");
@@ -1270,6 +1715,17 @@ async fn main() {
         return;
     }
 
+    // Handle inspect/describe specially — they fan out N parallel HTTP
+    // requests and render client-side.
+    if let Command::Inspect { sessions } = &cli.command {
+        handle_inspect(&cli.socket, sessions).await;
+        return;
+    }
+    if let Command::Describe { sessions } = &cli.command {
+        handle_describe(&cli.socket, sessions).await;
+        return;
+    }
+
     // Pre-flight base image staleness check for create commands.
     if let Command::Create { no_cache, .. } = &cli.command {
         if !cli.yes && !*no_cache {
@@ -1326,6 +1782,7 @@ mod tests {
                 workspace: None,
                 no_hardening: false,
                 no_cache: false,
+                unrestricted: false,
             }
         ));
     }
@@ -1520,6 +1977,7 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: false,
+            unrestricted: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         assert_eq!(req.method(), "POST");
@@ -1545,6 +2003,7 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: false,
+            unrestricted: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         assert_eq!(req.method(), "POST");
@@ -1570,6 +2029,7 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: false,
+            unrestricted: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -1780,12 +2240,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_policy_update() {
+    fn parse_policy_update_with_file() {
         let cli = Cli::parse_from([
             "sandbox",
             "policy",
             "update",
             "my-session",
+            "--policy",
             "/tmp/policy.json",
         ]);
         match &cli.command {
@@ -1793,14 +2254,150 @@ mod tests {
                 action:
                     PolicyAction::Update {
                         session,
-                        policy_path,
+                        policy,
+                        unrestricted,
+                        clear,
                     },
             } => {
                 assert_eq!(session, "my-session");
-                assert_eq!(policy_path, "/tmp/policy.json");
+                assert_eq!(policy.as_deref(), Some("/tmp/policy.json"));
+                assert!(!unrestricted);
+                assert!(!clear);
             }
             _ => panic!("expected Policy Update command"),
         }
+    }
+
+    #[test]
+    fn parse_policy_update_with_unrestricted() {
+        let cli = Cli::parse_from([
+            "sandbox",
+            "policy",
+            "update",
+            "my-session",
+            "--unrestricted",
+        ]);
+        match &cli.command {
+            Command::Policy {
+                action:
+                    PolicyAction::Update {
+                        session,
+                        policy,
+                        unrestricted,
+                        clear,
+                    },
+            } => {
+                assert_eq!(session, "my-session");
+                assert!(policy.is_none());
+                assert!(*unrestricted);
+                assert!(!clear);
+            }
+            _ => panic!("expected Policy Update command"),
+        }
+    }
+
+    #[test]
+    fn parse_policy_update_with_clear() {
+        let cli = Cli::parse_from(["sandbox", "policy", "update", "my-session", "--clear"]);
+        match &cli.command {
+            Command::Policy {
+                action:
+                    PolicyAction::Update {
+                        session,
+                        policy,
+                        unrestricted,
+                        clear,
+                    },
+            } => {
+                assert_eq!(session, "my-session");
+                assert!(policy.is_none());
+                assert!(!unrestricted);
+                assert!(*clear);
+            }
+            _ => panic!("expected Policy Update command"),
+        }
+    }
+
+    #[test]
+    fn parse_policy_update_conflicts_policy_and_unrestricted() {
+        // clap should reject --policy + --unrestricted via `conflicts_with_all`.
+        let result = Cli::try_parse_from([
+            "sandbox",
+            "policy",
+            "update",
+            "my-session",
+            "--policy",
+            "/tmp/p.json",
+            "--unrestricted",
+        ]);
+        assert!(
+            result.is_err(),
+            "expected clap error for conflicting --policy + --unrestricted"
+        );
+    }
+
+    #[test]
+    fn parse_policy_update_conflicts_clear_and_unrestricted() {
+        let result = Cli::try_parse_from([
+            "sandbox",
+            "policy",
+            "update",
+            "my-session",
+            "--clear",
+            "--unrestricted",
+        ]);
+        assert!(
+            result.is_err(),
+            "expected clap error for conflicting --clear + --unrestricted"
+        );
+    }
+
+    #[test]
+    fn parse_policy_update_conflicts_policy_and_clear() {
+        let result = Cli::try_parse_from([
+            "sandbox",
+            "policy",
+            "update",
+            "my-session",
+            "--policy",
+            "/tmp/p.json",
+            "--clear",
+        ]);
+        assert!(
+            result.is_err(),
+            "expected clap error for conflicting --policy + --clear"
+        );
+    }
+
+    #[test]
+    fn parse_create_with_unrestricted_flag() {
+        let cli = Cli::parse_from(["sandbox", "create", "--unrestricted"]);
+        match &cli.command {
+            Command::Create {
+                policy,
+                unrestricted,
+                ..
+            } => {
+                assert!(policy.is_none());
+                assert!(*unrestricted);
+            }
+            _ => panic!("expected Create command"),
+        }
+    }
+
+    #[test]
+    fn parse_create_conflicts_policy_and_unrestricted() {
+        let result = Cli::try_parse_from([
+            "sandbox",
+            "create",
+            "--policy",
+            "/tmp/p.json",
+            "--unrestricted",
+        ]);
+        assert!(
+            result.is_err(),
+            "expected clap error for conflicting --policy + --unrestricted on create"
+        );
     }
 
     #[test]
@@ -1898,6 +2495,7 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: false,
+            unrestricted: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -1919,6 +2517,7 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: false,
+            unrestricted: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -1968,6 +2567,7 @@ mod tests {
             workspace: None,
             no_hardening: true,
             no_cache: false,
+            unrestricted: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -1991,6 +2591,7 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: false,
+            unrestricted: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -2138,6 +2739,7 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: true,
+            unrestricted: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -2161,6 +2763,7 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: false,
+            unrestricted: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -2203,5 +2806,533 @@ mod tests {
         assert_eq!(req.method(), "POST");
         assert_eq!(req.uri(), "/rebuild-image");
         assert!(req.body().is_empty());
+    }
+
+    // -- Inspect / describe tests --------------------------------------------
+
+    use sandbox_core::{
+        Destination, HttpFilter, HttpMethod, Protocol, SessionConfigDto, SessionId, SessionState,
+    };
+
+    fn make_session_dto(
+        id: &str,
+        name: Option<&str>,
+        policy: Option<PolicyDto>,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> SessionDto {
+        SessionDto {
+            id: SessionId::parse(id).expect("valid session id"),
+            name: name.map(|s| s.to_string()),
+            state: SessionState::Running,
+            created_at,
+            updated_at: created_at,
+            config: SessionConfigDto {
+                cpus: 2,
+                memory_mb: 4096,
+                disk_gb: 20,
+                workspace_mode: Some("shared:/home/olek/project".into()),
+                hardened: true,
+                repo: Some("https://github.com/example/app.git".into()),
+                boot_cmd: Some("make setup".into()),
+                template: None,
+            },
+            guest_agent_status: Some("connected".into()),
+            gateway_status: Some("running".into()),
+            policy,
+        }
+    }
+
+    #[test]
+    fn parse_inspect_two_sessions() {
+        let cli = Cli::parse_from(["sandbox", "inspect", "alpha", "beta"]);
+        match &cli.command {
+            Command::Inspect { sessions } => {
+                assert_eq!(sessions, &vec!["alpha".to_string(), "beta".to_string()]);
+            }
+            _ => panic!("expected Inspect command"),
+        }
+    }
+
+    #[test]
+    fn parse_describe_one_session() {
+        let cli = Cli::parse_from(["sandbox", "describe", "alpha"]);
+        match &cli.command {
+            Command::Describe { sessions } => {
+                assert_eq!(sessions, &vec!["alpha".to_string()]);
+            }
+            _ => panic!("expected Describe command"),
+        }
+    }
+
+    #[test]
+    fn inspect_build_request_returns_none() {
+        // Inspect is handled outside the single-request pipeline.
+        let cmd = Command::Inspect {
+            sessions: vec!["alpha".into()],
+        };
+        assert!(build_request(&cmd).is_none());
+    }
+
+    #[test]
+    fn describe_build_request_returns_none() {
+        let cmd = Command::Describe {
+            sessions: vec!["alpha".into()],
+        };
+        assert!(build_request(&cmd).is_none());
+    }
+
+    #[test]
+    fn describe_renders_unrestricted_sentinel_line() {
+        // Mirror the wire shape of `Policy::unrestricted()` — a single Http
+        // rule on `*` with an ANY /* filter — and confirm the describe
+        // renderer collapses it to a single-line summary.
+        let policy = PolicyDto {
+            version: sandbox_core::policy::SCHEMA_VERSION.to_string(),
+            rules: vec![PolicyRuleDto {
+                destination: Destination::Domain("*".into()),
+                protocol: Protocol::Any,
+                level: PolicyLevelDto::Http {
+                    http_filters: vec![HttpFilter {
+                        method: HttpMethod::Any,
+                        path: "/*".into(),
+                    }],
+                },
+                reason: Some("unrestricted network access (logged)".into()),
+            }],
+        };
+        let dto = make_session_dto(
+            "0123456789ab",
+            Some("unrestricted"),
+            Some(policy),
+            chrono::Utc::now() - chrono::Duration::minutes(1),
+        );
+        let rendered = render_describe(std::slice::from_ref(&dto));
+        assert!(
+            rendered.contains("Policy: unrestricted (logged)"),
+            "expected unrestricted sentinel line, got:\n{rendered}"
+        );
+        // Full rule block must NOT be emitted — the sentinel replaces it.
+        assert!(
+            !rendered.contains("Policy (v"),
+            "unrestricted must not emit versioned header, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("http_filters"),
+            "unrestricted must not emit per-rule filter lines, got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn describe_renders_policy_none_when_dto_omits_policy() {
+        let dto = make_session_dto(
+            "0123456789ab",
+            Some("no-policy"),
+            None,
+            chrono::Utc::now() - chrono::Duration::minutes(5),
+        );
+        let rendered = render_describe(std::slice::from_ref(&dto));
+        assert!(
+            rendered.contains("Policy: none"),
+            "expected 'Policy: none' line, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("Policy ("),
+            "must not emit versioned header when policy is absent, got:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn describe_renders_full_rule_block_with_filters_and_reason() {
+        let policy = PolicyDto {
+            version: "1.0".into(),
+            rules: vec![
+                PolicyRuleDto {
+                    destination: Destination::Domain("github.com".into()),
+                    protocol: Protocol::Tcp,
+                    level: PolicyLevelDto::Http {
+                        http_filters: vec![HttpFilter {
+                            method: HttpMethod::Get,
+                            path: "/repos/*".into(),
+                        }],
+                    },
+                    reason: Some("fetch repo metadata".into()),
+                },
+                PolicyRuleDto {
+                    destination: Destination::Domain("registry.npmjs.org".into()),
+                    protocol: Protocol::Tcp,
+                    level: PolicyLevelDto::Tls,
+                    reason: None,
+                },
+                PolicyRuleDto {
+                    destination: Destination::Domain("*".into()),
+                    protocol: Protocol::Any,
+                    level: PolicyLevelDto::Deny,
+                    reason: Some("default deny".into()),
+                },
+            ],
+        };
+
+        let dto = make_session_dto(
+            "abcdef012345",
+            Some("policy-box"),
+            Some(policy),
+            chrono::Utc::now() - chrono::Duration::minutes(5),
+        );
+        let rendered = render_describe(std::slice::from_ref(&dto));
+
+        // Header.
+        assert!(
+            rendered.contains("Policy (v1.0, 3 rules):"),
+            "policy header missing, got:\n{rendered}"
+        );
+
+        // Per-rule top lines and sub-fields.
+        assert!(
+            rendered.contains("[0] allow http"),
+            "expected rule 0 action/level, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("github.com"),
+            "expected rule 0 destination, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("http_filters: GET /repos/*"),
+            "expected http_filters line, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("reason:      fetch repo metadata"),
+            "expected reason line for rule 0, got:\n{rendered}"
+        );
+
+        assert!(
+            rendered.contains("[1] allow tls"),
+            "expected rule 1 action/level, got:\n{rendered}"
+        );
+        // Rule 1 has no reason → no reason line for that block.  We check
+        // presence of the destination and protocol to make sure rule 1 was
+        // rendered at all.
+        assert!(
+            rendered.contains("registry.npmjs.org"),
+            "expected rule 1 destination, got:\n{rendered}"
+        );
+
+        assert!(
+            rendered.contains("[2] deny"),
+            "expected rule 2 action, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("reason:      default deny"),
+            "expected reason line for rule 2, got:\n{rendered}"
+        );
+    }
+
+    // Visual regression harness: render a realistic multi-rule example and
+    // eprint it (invisible under normal test runs, visible under
+    // `--no-capture`). Keeps the spec sample near the implementation.
+    #[test]
+    fn describe_visual_preview() {
+        let policy = PolicyDto {
+            version: "1.0".into(),
+            rules: vec![
+                PolicyRuleDto {
+                    destination: Destination::Domain("github.com".into()),
+                    protocol: Protocol::Tcp,
+                    level: PolicyLevelDto::Http {
+                        http_filters: vec![HttpFilter {
+                            method: HttpMethod::Get,
+                            path: "/repos/*".into(),
+                        }],
+                    },
+                    reason: Some("fetch repo metadata".into()),
+                },
+                PolicyRuleDto {
+                    destination: Destination::Domain("registry.npmjs.org".into()),
+                    protocol: Protocol::Tcp,
+                    level: PolicyLevelDto::Tls,
+                    reason: None,
+                },
+                PolicyRuleDto {
+                    destination: Destination::Domain("*".into()),
+                    protocol: Protocol::Any,
+                    level: PolicyLevelDto::Deny,
+                    reason: Some("default deny".into()),
+                },
+            ],
+        };
+        let dto = make_session_dto(
+            "abcdef012345",
+            Some("preview"),
+            Some(policy),
+            chrono::Utc::now() - chrono::Duration::minutes(5),
+        );
+        let rendered = render_describe(std::slice::from_ref(&dto));
+        eprintln!("--- describe preview ---\n{rendered}--- end preview ---");
+    }
+
+    #[test]
+    fn describe_renders_multiple_http_filters_one_per_line() {
+        let policy = PolicyDto {
+            version: "1.0".into(),
+            rules: vec![PolicyRuleDto {
+                destination: Destination::Domain("api.example.com".into()),
+                protocol: Protocol::Tcp,
+                level: PolicyLevelDto::Http {
+                    http_filters: vec![
+                        HttpFilter {
+                            method: HttpMethod::Get,
+                            path: "/v1/*".into(),
+                        },
+                        HttpFilter {
+                            method: HttpMethod::Post,
+                            path: "/v1/upload".into(),
+                        },
+                    ],
+                },
+                reason: None,
+            }],
+        };
+        let dto = make_session_dto(
+            "aaaabbbbcccc",
+            Some("multi-filter"),
+            Some(policy),
+            chrono::Utc::now(),
+        );
+        let rendered = render_describe(std::slice::from_ref(&dto));
+        let filter_lines: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.contains("http_filters:"))
+            .collect();
+        assert_eq!(
+            filter_lines.len(),
+            2,
+            "expected one http_filters line per filter, got:\n{rendered}"
+        );
+        assert!(filter_lines[0].contains("GET /v1/*"));
+        assert!(filter_lines[1].contains("POST /v1/upload"));
+    }
+
+    #[test]
+    fn describe_separates_sessions_by_exactly_one_blank_line() {
+        let now = chrono::Utc::now();
+        let a = make_session_dto("111111111111", Some("a"), None, now);
+        let b = make_session_dto("222222222222", Some("b"), None, now);
+        let c = make_session_dto("333333333333", Some("c"), None, now);
+        let rendered = render_describe(&[a, b, c]);
+
+        // Find each "Session:      " line and ensure exactly one blank
+        // line precedes each subsequent session block.
+        let lines: Vec<&str> = rendered.lines().collect();
+        let session_line_indices: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(i, line)| {
+                if line.starts_with("Session:") {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(session_line_indices.len(), 3);
+
+        for &idx in session_line_indices.iter().skip(1) {
+            assert!(
+                idx >= 2,
+                "session block must be preceded by content + blank line"
+            );
+            let blank = lines[idx - 1];
+            let prev = lines[idx - 2];
+            assert!(
+                blank.is_empty(),
+                "expected blank line before Session header at line {idx}, got: {blank:?}"
+            );
+            assert!(
+                !prev.is_empty(),
+                "expected non-blank content two lines before Session header at line {idx}, got: {prev:?}"
+            );
+        }
+
+        // Sanity: no run of more than one consecutive blank line within
+        // the whole render.
+        let mut prev_blank = false;
+        for line in &lines {
+            let blank = line.is_empty();
+            if blank && prev_blank {
+                panic!("found two consecutive blank lines in render:\n{rendered}");
+            }
+            prev_blank = blank;
+        }
+    }
+
+    // -- Inspect / describe end-to-end over a local Unix socket ----------------
+
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::net::UnixListener;
+    use std::thread;
+
+    /// Spawn a tiny blocking HTTP server on a Unix socket that serves
+    /// canned responses. `route` maps a request path (e.g.
+    /// `/sessions/alpha`) to an `(HTTP status line, body)` pair.
+    ///
+    /// Runs in a background thread, accepting connections in a loop and
+    /// handling each request sequentially (each connection serves one
+    /// request). Returns the socket path to pass to the CLI.
+    fn spawn_fake_daemon(
+        routes: std::collections::HashMap<String, (u16, String)>,
+    ) -> (tempfile::TempDir, String) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sock_path = tmp.path().join("sandboxd.sock");
+        let sock_str = sock_path.to_string_lossy().to_string();
+
+        let listener = UnixListener::bind(&sock_path).expect("bind unix socket");
+        // The listener is moved into the server thread; the TempDir stays
+        // in the caller so the socket file lives for the duration of the
+        // test.
+        thread::spawn(move || {
+            for conn in listener.incoming() {
+                let mut stream = match conn {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let mut buf = [0u8; 4096];
+                let n = match stream.read(&mut buf) {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                // Parse the request line (first line).
+                let request_line = req.lines().next().unwrap_or("");
+                // Format: "GET /path HTTP/1.1"
+                let path = request_line.split_whitespace().nth(1).unwrap_or("");
+
+                let (status, body) = routes
+                    .get(path)
+                    .cloned()
+                    .unwrap_or_else(|| (500, "{\"error\":\"unhandled path\"}".into()));
+
+                let status_text = match status {
+                    200 => "OK",
+                    404 => "Not Found",
+                    _ => "Internal Server Error",
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+            }
+        });
+
+        (tmp, sock_str)
+    }
+
+    fn session_dto_json(id: &str, name: &str) -> String {
+        // Build a minimal SessionDto JSON response that the CLI can
+        // deserialize. Keep the shape in sync with `SessionDto`.
+        let dto = make_session_dto(id, Some(name), None, chrono::Utc::now());
+        serde_json::to_string(&dto).expect("serialize session dto")
+    }
+
+    #[tokio::test]
+    async fn inspect_two_sessions_emits_json_array_in_input_order() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "/sessions/aaaaaaaaaaaa".to_string(),
+            (200, session_dto_json("aaaaaaaaaaaa", "alpha")),
+        );
+        routes.insert(
+            "/sessions/bbbbbbbbbbbb".to_string(),
+            (200, session_dto_json("bbbbbbbbbbbb", "beta")),
+        );
+        let (_tmp, sock) = spawn_fake_daemon(routes);
+
+        let dtos = fetch_sessions_parallel(
+            &sock,
+            &["aaaaaaaaaaaa".to_string(), "bbbbbbbbbbbb".to_string()],
+        )
+        .await
+        .expect("both sessions should resolve");
+
+        assert_eq!(dtos.len(), 2);
+        assert_eq!(dtos[0].id.as_str(), "aaaaaaaaaaaa");
+        assert_eq!(dtos[0].name.as_deref(), Some("alpha"));
+        assert_eq!(dtos[1].id.as_str(), "bbbbbbbbbbbb");
+        assert_eq!(dtos[1].name.as_deref(), Some("beta"));
+
+        // And the pretty-printed JSON array is valid JSON of length 2.
+        let pretty = serde_json::to_string_pretty(&dtos).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&pretty).expect("valid json");
+        let arr = parsed.as_array().expect("top-level array");
+        assert_eq!(arr.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn inspect_with_one_missing_session_returns_error_naming_first_missing() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "/sessions/aaaaaaaaaaaa".to_string(),
+            (200, session_dto_json("aaaaaaaaaaaa", "alpha")),
+        );
+        routes.insert(
+            "/sessions/missing-one".to_string(),
+            (404, "{\"error\":\"session not found\"}".into()),
+        );
+        routes.insert(
+            "/sessions/cccccccccccc".to_string(),
+            (200, session_dto_json("cccccccccccc", "gamma")),
+        );
+        let (_tmp, sock) = spawn_fake_daemon(routes);
+
+        let result = fetch_sessions_parallel(
+            &sock,
+            &[
+                "aaaaaaaaaaaa".to_string(),
+                "missing-one".to_string(),
+                "cccccccccccc".to_string(),
+            ],
+        )
+        .await;
+
+        let err = result.expect_err("expected a missing-session error");
+        // Spec: "names the first missing id". Here "missing-one" is the
+        // only missing one; the error string must contain its id.
+        assert!(
+            err.contains("missing-one"),
+            "error must name the missing id, got: {err}"
+        );
+        assert!(
+            !err.contains("aaaaaaaaaaaa") || err.contains("missing-one"),
+            "must focus on the missing id: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_first_missing_id_is_named_when_multiple_missing() {
+        // When multiple sessions are missing, the error must identify the
+        // first missing id in argument order — not whichever happens to
+        // complete first across the parallel fan-out.
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "/sessions/first-miss".to_string(),
+            (404, "{\"error\":\"not found\"}".into()),
+        );
+        routes.insert(
+            "/sessions/second-miss".to_string(),
+            (404, "{\"error\":\"not found\"}".into()),
+        );
+        let (_tmp, sock) = spawn_fake_daemon(routes);
+
+        let err = fetch_sessions_parallel(
+            &sock,
+            &["first-miss".to_string(), "second-miss".to_string()],
+        )
+        .await
+        .expect_err("both missing");
+
+        assert!(
+            err.contains("first-miss"),
+            "first missing id must win, got: {err}"
+        );
     }
 }

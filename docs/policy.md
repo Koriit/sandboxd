@@ -11,7 +11,7 @@ Policies are enforced by four components working together:
 - **CoreDNS** resolves only the domains listed in the policy. Everything else returns NXDOMAIN.
 - **nftables** blocks traffic to IPs not covered by the policy.
 - **Envoy** routes allowed connections according to their assurance level.
-- **mitmproxy** inspects traffic at the highest assurance level, enforcing HTTP method and path constraints.
+- **mitmproxy** inspects traffic at the highest assurance level, enforcing per-request `(method, path)` filter pairs.
 
 ## Assurance levels
 
@@ -35,11 +35,13 @@ TLS-verified passthrough. Envoy extracts the SNI (Server Name Indication) from t
 
 **Use case:** Destinations where you want to verify the agent is connecting to the expected hostname, but do not need to inspect HTTP request content. Good for APIs with certificate pinning that still need hostname verification.
 
-### Level 3 -- full
+### Level 3 -- http
 
-Full HTTPS inspection through mitmproxy. The sandbox terminates TLS using a per-session CA certificate, inspects the HTTP request (method, path, headers, body), and can enforce fine-grained constraints. The request is then re-encrypted and forwarded to the destination.
+Full HTTPS inspection through mitmproxy. The sandbox terminates TLS using a per-session CA certificate, inspects the HTTP request (method, path, headers, body), and enforces fine-grained filter rules. The request is then re-encrypted and forwarded to the destination.
 
 **Use case:** APIs where you want to restrict which HTTP methods or URL paths the agent can access. For example, allowing `GET` on a read-only API but blocking `DELETE`.
+
+At this level the rule must carry `http_filters`: an ordered list of `(method, path)` pairs. A request is allowed only if at least one filter's method **and** path both match the request. Methods are uppercase HTTP verbs (`GET`, `POST`, ...) or the wildcard `ANY`; paths are `fnmatch`-style globs (`*`, `?`, `[...]`). Because the method and path of a filter must both match together, `http_filters` express mixed-pair rules precisely (e.g. "`GET /repos/*` and `POST /user/*`" — not the cartesian product of `{GET, POST} x {/repos/*, /user/*}`).
 
 ## Policy file format
 
@@ -72,9 +74,9 @@ An ordered array of rule objects. Each rule has:
 | Field | Required | Description |
 |-------|----------|-------------|
 | `destination` | yes | Domain name, wildcard domain, IP address, or CIDR block |
-| `level` | yes | Assurance level: `"deny"`, `"transport"`, `"tls"`, or `"full"` |
+| `level` | yes | Assurance level: `"deny"`, `"transport"`, `"tls"`, or `"http"` |
 | `protocol` | no | Protocol constraint: `"tcp"`, `"udp"`, `"http"`, `"https"`, or `"any"` (default: `"any"`) |
-| `constraints` | no | HTTP method/path restrictions (level `"full"` only) |
+| `http_filters` | conditional | Array of `{method, path}` filter pairs -- required when `level` is `"http"`; not permitted for other levels |
 | `reason` | no | Human-readable explanation for the rule |
 
 #### Destinations
@@ -88,23 +90,25 @@ Destinations are parsed from plain strings:
 
 Domain names follow standard DNS label rules (alphanumeric and hyphens, no label longer than 63 characters). Wildcards are only supported as the `*.` prefix.
 
-#### Constraints
+#### HTTP filters
 
-The `constraints` object is valid only at level `"full"` with an HTTP-capable protocol (`"http"`, `"https"`, or `"any"`). It supports:
+The `http_filters` array is valid -- and required -- only at level `"http"` with an HTTP-capable protocol (`"http"`, `"https"`, or `"any"`). Each element is a single `(method, path)` pair:
 
-- **`methods`** -- array of allowed HTTP methods (e.g., `["GET", "POST"]`). Empty or omitted means all methods are allowed.
-- **`paths`** -- array of allowed path prefixes (e.g., `["/api/v1/"]`). Empty or omitted means all paths are allowed.
+- **`method`** -- uppercase HTTP method (`"GET"`, `"POST"`, `"PUT"`, `"DELETE"`, `"PATCH"`, `"HEAD"`, `"OPTIONS"`, `"TRACE"`, `"CONNECT"`) or the wildcard `"ANY"`.
+- **`path`** -- an `fnmatch`-style glob such as `"/api/v1/*"`, `"/repos/?/commits"`, or `"/*"`. Use `"/*"` to match any path.
+
+A request is allowed when at least one filter's method and path both match. Because the two fields are paired inside a single filter object, policies can express mixed combinations that independent method/path lists cannot (for example, `GET /read/*` together with `POST /write/*` but nothing else). The `http_filters` array must be non-empty -- an empty list is rejected at compile time because it would make the rule unreachable.
 
 ```json
 {
   "destination": "api.example.com",
-  "level": "full",
+  "level": "http",
   "protocol": "https",
-  "constraints": {
-    "methods": ["GET"],
-    "paths": ["/api/v1/"]
-  },
-  "reason": "Read-only access to API v1"
+  "http_filters": [
+    {"method": "GET", "path": "/api/v1/*"},
+    {"method": "POST", "path": "/api/v1/write/*"}
+  ],
+  "reason": "Read-only API v1 plus scoped POSTs to /write/*"
 }
 ```
 
@@ -113,9 +117,9 @@ The `constraints` object is valid only at level `"full"` with an HTTP-capable pr
 The policy compiler checks these conditions and rejects invalid policies:
 
 - The `version` major version must match the supported schema version.
-- `constraints` can only appear on rules with level `"full"`.
-- `constraints` require protocol `"http"`, `"https"`, or `"any"`.
-- Level `"full"` is not compatible with protocol `"udp"`.
+- `http_filters` can only appear on rules with level `"http"`; other levels must omit the field.
+- Level `"http"` rules require a non-empty `http_filters` array and an HTTP-capable protocol (`"http"`, `"https"`, or `"any"`).
+- Level `"http"` is not compatible with protocol `"udp"`.
 - CIDR blocks must be syntactically valid IPv4 addresses with optional prefix length (0-32).
 - Domain names must follow DNS label rules.
 - Two rules for the same destination cannot have different assurance levels (this is treated as a contradiction).
@@ -178,7 +182,7 @@ Allow GitHub, npm, and PyPI for a typical development workflow. Uses transport-l
 
 ### Locked down
 
-Only allow a specific internal API with method and path restrictions. Full inspection ensures the agent cannot call dangerous endpoints.
+Only allow a specific internal API with method and path restrictions. HTTP-level inspection ensures the agent cannot call dangerous endpoints.
 
 ```json
 {
@@ -186,22 +190,21 @@ Only allow a specific internal API with method and path restrictions. Full inspe
   "rules": [
     {
       "destination": "api.internal.example.com",
-      "level": "full",
+      "level": "http",
       "protocol": "https",
-      "constraints": {
-        "methods": ["GET", "POST"],
-        "paths": ["/api/v2/read/", "/api/v2/write/"]
-      },
-      "reason": "Internal API -- read and write endpoints only"
+      "http_filters": [
+        {"method": "GET",  "path": "/api/v2/read/*"},
+        {"method": "POST", "path": "/api/v2/write/*"}
+      ],
+      "reason": "Internal API -- GETs to /read/*, POSTs to /write/*"
     },
     {
       "destination": "auth.internal.example.com",
-      "level": "full",
+      "level": "http",
       "protocol": "https",
-      "constraints": {
-        "methods": ["POST"],
-        "paths": ["/oauth/token"]
-      },
+      "http_filters": [
+        {"method": "POST", "path": "/oauth/token"}
+      ],
       "reason": "Auth server -- token endpoint only"
     }
   ]
@@ -321,6 +324,20 @@ sandbox policy update my-agent locked-down.json
 sandbox policy update a1b2c3d4-5678-... research.json
 ```
 
+### Inspecting the currently applied policy
+
+To confirm which policy is active on a running session, use `sandbox describe` for a human-readable summary or `sandbox inspect` for the full JSON representation:
+
+```bash
+# Human-readable rule listing, including http_filters and reasons
+sandbox describe my-agent
+
+# Full JSON including the policy object — pipe into jq for further processing
+sandbox inspect my-agent | jq '.[0].policy'
+```
+
+When no policy has been applied, `sandbox describe` shows `Policy: none` and the `policy` field is omitted from `sandbox inspect` output. See [cli-reference.md § sandbox inspect](cli-reference.md#sandbox-inspect) and [§ sandbox describe](cli-reference.md#sandbox-describe) for the full output layout.
+
 ## How it works
 
 When a policy is applied, the sandbox compiles it into four separate configurations -- one for each enforcement component. Here is what happens at each layer:
@@ -345,15 +362,15 @@ Envoy receives all TCP connections that pass through the firewall and routes the
 
 - **Level 1 (transport):** TCP passthrough to the original destination. No inspection.
 - **Level 2 (tls):** Envoy extracts the SNI from the TLS ClientHello, verifies it matches a policy rule, and forwards the connection to the original destination.
-- **Level 3 (full):** Envoy forwards the connection to mitmproxy for HTTP inspection.
+- **Level 3 (http):** Envoy forwards the connection to mitmproxy for HTTP inspection.
 
 ### 4. mitmproxy -- HTTP inspection
 
-mitmproxy handles only level 3 (full) traffic. It terminates TLS using the per-session CA certificate, inspects the HTTP request, and enforces constraints:
+mitmproxy handles only level 3 (http) traffic. It terminates TLS using the per-session CA certificate, inspects the HTTP request, and enforces the rule's `http_filters`:
 
-- **Method check:** If the rule specifies allowed methods, requests using other methods are rejected with a 599 response.
-- **Path check:** If the rule specifies allowed path prefixes, requests to other paths are rejected.
-- **Pass:** If all constraints pass (or none are specified), the request is forwarded to the real destination.
+- **Filter match:** The request method and path are compared against each `(method, path)` filter in any rule matching the request host. A filter matches when its method equals the request method (or is `ANY`) **and** its path-glob matches the request path.
+- **Pass:** If at least one filter matches, the request is forwarded to the real destination.
+- **Reject:** If no filter matches -- or the host is not covered by any rule -- the request is rejected with a 599 response whose body names the reason (`"host not in policy"` or `"no filter matched <METHOD> <PATH>"`).
 
 ## Troubleshooting
 
@@ -382,11 +399,11 @@ CoreDNS is blocking DNS resolution because the domain is not in the policy.
 
 ### 599 response from mitmproxy
 
-The request reached mitmproxy (level 3) but was denied by an HTTP constraint.
+The request reached mitmproxy (level 3) but no `http_filters` entry matched.
 
 **What to check:**
-1. Verify the HTTP method is in the rule's `constraints.methods` list.
-2. Verify the request path starts with one of the rule's `constraints.paths` prefixes.
+1. Verify the rule's `http_filters` include a `(method, path)` pair that matches the request. Method must equal the request method exactly (or be `"ANY"`), and the glob in `path` must match the full request path (for example `"/api/v1/*"` matches `/api/v1/anything` but not `/api/v2/...`).
+2. If the deny body says `"host not in policy"`, the request host is not covered by any rule. If it says `"no filter matched <METHOD> <PATH>"`, the host matched but no filter did -- adjust the filter list accordingly.
 3. Check mitmproxy logs for the denial details:
    ```bash
    sandbox logs <session> --component mitmproxy
