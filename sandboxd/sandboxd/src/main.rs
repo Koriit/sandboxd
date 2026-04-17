@@ -322,7 +322,7 @@ async fn create_session(
     // The fast path clones the pre-provisioned base image and skips the
     // guest agent install (it's already baked in).
     //
-    // Shared workspace (9p mount) requires the legacy path because the
+    // Shared workspace (9p mount) requires the slow path because the
     // clone doesn't carry mount configuration from the session template.
     let has_shared_mount = matches!(
         &config.workspace_mode,
@@ -491,7 +491,7 @@ async fn create_session(
             }
         }
     } else {
-        // ---- Legacy path: full create from scratch ----
+        // ---- Slow path: full create from scratch ----
 
         // 2a. Create the Lima VM (with optional custom template).
         {
