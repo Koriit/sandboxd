@@ -13,7 +13,7 @@ A sandbox session can receive workspace files through several mechanisms:
 | Clone               | `--repo <url>`              | One-shot pull | Minutes       | Full      |
 | Shared mount        | `--workspace shared:<path>` | Bidirectional | Instant       | Reduced   |
 | sandbox cp          | `sandbox cp`                | Bidirectional | Per-transfer  | Full      |
-| git remote transport      | `ext::sandbox git-remote`   | Push / pull   | Per-operation | Full      |
+| git remote transport      | `sandbox::<session>/<path>` | Push / pull   | Per-operation | Full      |
 
 The sections below describe each mode in detail.
 
@@ -154,14 +154,15 @@ sandbox cp my-session:/home/agent/output.log ./output.log
 
 The git remote transport allows standard `git push` and `git pull`
 operations against a repository inside a sandbox VM, without requiring
-network access.  It uses the `ext::` remote transport built into git.
+network access.  It uses git's remote-helper protocol: the `sandbox`
+binary is also installed as a `git-remote-sandbox` symlink, and git
+invokes that symlink whenever it resolves a `sandbox::` URL.
 
 ### Usage
 
 ```bash
 # Add the sandbox as a git remote
-git remote add sandbox \
-    "ext::sandbox git-remote %S my-session"
+git remote add sandbox sandbox::my-session/home/agent/workspace
 
 # Push local changes into the VM
 git push sandbox main
@@ -172,11 +173,17 @@ git pull sandbox main
 
 ### Details
 
-- The `sandbox git-remote` subcommand acts as a git remote helper.  Git
-  invokes it via the `ext::` transport, and it relays the git protocol
-  stream through the daemon's API to the guest agent.
-- The repository path inside the VM defaults to `/home/agent/workspace`.  Use
-  `--repo-path` to specify a different path.
+- The URL format is `sandbox::<session>/<repo-path>`, where `<repo-path>`
+  is the absolute path to the git repository inside the VM.  If the path
+  is omitted, it defaults to `/home/agent/workspace`.
+- Git invokes the `git-remote-sandbox` symlink, which speaks the remote-
+  helper protocol on stdin/stdout and advertises the `connect` capability.
+  It then spawns `sandbox ssh <session>` to tunnel the git pack protocol
+  to the `git-upload-pack` or `git-receive-pack` process running against
+  the target repository inside the VM.
+- The `git-remote-sandbox` symlink must be installed on `PATH` alongside
+  the `sandbox` binary.  The daemon socket path can be overridden with
+  the `SANDBOX_SOCKET` environment variable.
 - Both `git-upload-pack` (fetch/pull) and `git-receive-pack` (push)
   operations are supported.
 - No network policy rules are needed because the communication path is
@@ -296,8 +303,7 @@ sandbox create --name review
 sandbox cp ./my-patch.diff review:/home/agent/workspace/patch.diff
 
 # Or use git remote transport for full repo sync
-git remote add review \
-    "ext::sandbox git-remote %S review"
+git remote add review sandbox::review/home/agent/workspace
 git push review main
 
 # Apply and test in the sandbox

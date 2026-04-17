@@ -429,66 +429,71 @@ sandbox policy update a1b2c3d4-... restricted-policy.json
 
 ## sandbox git-remote
 
-Act as a git remote helper for the `ext::` transport. This command is not typically invoked directly -- it is designed to be called by git's ext:: remote transport to relay git protocol streams between a local git client and a repository inside a sandbox VM.
+Relay the git pack protocol to a repository inside a sandbox VM. End users do not invoke this directly -- the `sandbox` binary is also installed as a `git-remote-sandbox` symlink, and git calls that symlink automatically when it sees a `sandbox::` URL. The symlink speaks the git remote-helper protocol on stdin/stdout and tunnels the git pack protocol to the repository inside the target session VM.
 
-### Synopsis
+### URL format
 
 ```
-sandbox git-remote <service> <session> [OPTIONS]
+sandbox::<session>/<repo-path>
 ```
 
-### Arguments
-
-| Argument | Description |
-|----------|-------------|
-| `<service>` | Git service name (e.g., `git-upload-pack`, `git-receive-pack`), passed by git as `%S` |
+| Part | Description |
+|------|-------------|
 | `<session>` | Session name or UUID |
-
-### Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--repo-path <path>` | `/home/agent/workspace` | Path to the git repository inside the VM |
+| `<repo-path>` | Absolute path to the git repository inside the VM (e.g., `/home/agent/workspace`). If omitted, defaults to `/home/agent/workspace`. |
 
 ### Usage
 
-Add a sandbox VM as a git remote using the `ext::` transport:
+Add a sandbox VM as a git remote using a `sandbox::` URL:
 
 ```bash
-git remote add sandbox \
-    "ext::sandbox git-remote %S my-session"
+git remote add origin sandbox::my-session/home/agent/workspace
 ```
 
 Then use standard git operations:
 
 ```bash
 # Push local changes into the VM
-git push sandbox main
+git push origin main
 
 # Pull changes from the VM
-git pull sandbox main
+git pull origin main
 ```
 
 ### Details
 
-- Supports `git-upload-pack` (fetch/pull) and `git-receive-pack` (push) operations.
-- Communication is entirely host-local (CLI to daemon socket to guest agent). No network policy rules are needed.
-- Use `--repo-path` to target a repository at a non-default location inside the VM.
+- Git invokes the `git-remote-sandbox` symlink as `git-remote-sandbox <remote-name> <url>` whenever it resolves a `sandbox::` URL. The symlink must be installed on `PATH` alongside the `sandbox` binary.
+- Supports `git-upload-pack` (fetch/pull) and `git-receive-pack` (push) operations via the `connect` remote-helper capability.
+- Communication is entirely host-local: the helper advertises `connect`, then spawns `sandbox ssh <session>` to tunnel the git pack protocol to the `git-upload-pack` or `git-receive-pack` process running against the target repository inside the VM. No network policy rules are needed.
+- The daemon socket path can be overridden with the `SANDBOX_SOCKET` environment variable (the `--socket` global flag is not available in remote-helper mode because git controls the argv).
 
 ### Examples
 
 ```bash
-# Remote with default repo path (/home/agent/workspace)
-git remote add sandbox "ext::sandbox git-remote %S my-session"
+# Default repo path (/home/agent/workspace)
+git remote add origin sandbox::my-session/home/agent/workspace
 
-# Remote with custom repo path
-git remote add sandbox \
-    "ext::sandbox git-remote %S my-session --repo-path /home/agent/project"
+# Custom repo path inside the VM
+git remote add origin sandbox::my-session/home/agent/project
 
-# Remote with custom socket
-git remote add sandbox \
-    "ext::sandbox --socket /tmp/sandbox.sock git-remote %S my-session"
+# Custom daemon socket
+SANDBOX_SOCKET=/tmp/sandbox.sock \
+    git remote add origin sandbox::my-session/home/agent/workspace
 ```
+
+### Synopsis (internal subcommand)
+
+The same binary also exposes a low-level `sandbox git-remote` subcommand used by the remote helper itself. It is not intended for direct use.
+
+```
+sandbox git-remote <service> <session> [--repo-path <path>]
+```
+
+| Argument | Description |
+|----------|-------------|
+| `<service>` | Git service name (`git-upload-pack` or `git-receive-pack`) |
+| `<session>` | Session name or UUID |
+| `--repo-path <path>` | Path to the git repository inside the VM (default: `/home/agent/workspace`) |
 
 ---
 

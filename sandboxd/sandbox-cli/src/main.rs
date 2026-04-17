@@ -144,14 +144,19 @@ enum Command {
         /// Session name or ID.
         session: String,
     },
-    /// Act as a git remote helper for the ext:: transport.
+    /// Relay the git pack protocol to a repository inside a sandbox VM.
     ///
-    /// This command is designed to be invoked by git's ext:: remote transport.
-    /// It relays the git protocol stream between the local git client and a
-    /// repository inside a sandbox VM.
+    /// End users do not invoke this directly. Instead, the `sandbox` binary is
+    /// symlinked as `git-remote-sandbox`, and git calls that symlink whenever it
+    /// encounters a `sandbox::<session-id>/<repo-path>` URL. The symlink speaks
+    /// the git remote-helper protocol on stdin/stdout and tunnels the git pack
+    /// protocol to the repository inside the target session VM.
     ///
     /// Example:
-    ///   git remote add sandbox "ext::sandbox --socket /tmp/s.sock git-remote %S my-session"
+    ///
+    ///     git remote add origin sandbox::my-session/home/agent/workspace
+    ///
+    /// Then use `git push origin main`, `git pull origin main`, etc.
     #[command(name = "git-remote")]
     GitRemote {
         /// Git service name (e.g., git-upload-pack or git-receive-pack),
@@ -994,9 +999,11 @@ async fn handle_cp_download(
 /// Handle the `git-remote` subcommand: relay git protocol between stdin/stdout
 /// and the sandbox VM via the daemon's git endpoint.
 ///
-/// This function is designed to be called by git's `ext::` remote transport.
-/// Git invokes it as a subprocess, sends git protocol data on stdin, and
-/// expects git protocol response data on stdout.
+/// This is the low-level handler for the `sandbox git-remote <service> <session>`
+/// clap subcommand.  It is not reached by the git-remote-sandbox helper flow
+/// (see `run_remote_helper`), which tunnels the pack protocol via `sandbox ssh`
+/// instead.  Reads git protocol data from stdin, forwards it to the daemon's
+/// git endpoint, and writes the response bytes back to stdout.
 async fn handle_git_remote(
     socket_path: &str,
     service: &str,
