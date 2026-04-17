@@ -3046,11 +3046,23 @@ mod tests {
 
     #[test]
     fn default_socket_path_ends_with_sock() {
+        // Ensure the test is not perturbed by an inherited SANDBOX_SOCKET
+        // from the surrounding shell -- the default value should end with
+        // `sandboxd.sock` regardless of outside state.
+        let prior = std::env::var("SANDBOX_SOCKET").ok();
+        // SAFETY: Tests in this module that touch SANDBOX_SOCKET mutate and
+        // restore it in a single test body to avoid cross-test races under
+        // `cargo test` (nextest already provides per-test process isolation).
+        unsafe { std::env::remove_var("SANDBOX_SOCKET") };
         let path = default_socket_path();
         assert!(
             path.ends_with("sandboxd.sock"),
             "expected path to end with sandboxd.sock, got: {path}"
         );
+        // Restore prior state.
+        if let Some(v) = prior {
+            unsafe { std::env::set_var("SANDBOX_SOCKET", v) };
+        }
     }
 
     #[test]
