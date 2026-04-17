@@ -19,7 +19,6 @@ clap = { version = "4", features = ["derive"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
-hyperlocal = { version = "0.9", features = ["client"] }
 refinery = { version = "0.9", features = ["rusqlite"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

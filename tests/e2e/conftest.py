@@ -73,7 +73,7 @@ _VM_RESOURCE_ARGS = ("--cpus", "2", "--memory", "2048", "--disk", "10")
 
 
 def parse_session_id(create_output: str) -> str:
-    """Extract the session UUID from `sandbox create` stdout."""
+    """Extract the 12-character hex session ID from `sandbox create` stdout."""
     m = _ID_RE.search(create_output)
     if not m:
         raise ValueError(

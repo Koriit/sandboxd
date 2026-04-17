@@ -316,7 +316,7 @@ async fn create_session(
     info!(%session_id, bridge = %network_info.bridge_name, mac = %vm_mac, "creating VM");
 
     // 2. Create and start the VM -- fast path (clone from golden image) or
-    //    legacy path (full create from scratch).
+    //    slow path: full create from scratch (no base-image cache hit).
     //
     // Use the fast path when: no --no-cache flag, no custom template.
     // The fast path clones the pre-provisioned base image and skips the
