@@ -1,0 +1,54 @@
+
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0B1220"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#000000" flood-opacity="0.28"/>
+    </filter>
+  </defs>
+
+  <rect x="32" y="32" width="960" height="960" rx="224" fill="url(#bg)"/>
+
+  <!-- Sandbox frame -->
+  <rect x="176" y="176" width="672" height="672" rx="168"
+        fill="none" stroke="#7DD3FC" stroke-width="72" opacity="0.95"/>
+
+  <!-- Frame gaps for controlled ingress/egress -->
+  <rect x="138" y="418" width="150" height="188" rx="50" fill="url(#bg)"/>
+  <rect x="736" y="418" width="150" height="188" rx="50" fill="url(#bg)"/>
+
+  <!-- Gate bars -->
+  <rect x="234" y="412" width="40" height="200" rx="20" fill="#7DD3FC"/>
+  <rect x="750" y="412" width="40" height="200" rx="20" fill="#7DD3FC"/>
+
+  <!-- Ingress arrow -->
+  <g filter="url(#shadow)">
+    <rect x="92" y="468" width="220" height="88" rx="44" fill="#22D3EE"/>
+    <polygon points="312,424 396,512 312,600" fill="#22D3EE"/>
+  </g>
+
+  <!-- Egress arrow -->
+  <g filter="url(#shadow)">
+    <rect x="612" y="468" width="220" height="88" rx="44" fill="#A78BFA"/>
+    <polygon points="832,424 916,512 832,600" fill="#A78BFA"/>
+  </g>
+
+  <!-- Agent spark -->
+  <g filter="url(#shadow)">
+    <path d="M512 360
+             C526 438 586 498 664 512
+             C586 526 526 586 512 664
+             C498 586 438 526 360 512
+             C438 498 498 438 512 360Z"
+          fill="#FDE047"/>
+    <path d="M512 430
+             C519 469 543 493 582 500
+             C543 507 519 531 512 570
+             C505 531 481 507 442 500
+             C481 493 505 469 512 430Z"
+          fill="#0B1220" opacity="0.18"/>
+  </g>
+</svg>
