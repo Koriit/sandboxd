@@ -1,7 +1,13 @@
-.PHONY: build test test-integration test-e2e gateway-image clean
+.PHONY: build fmt fmt-check test test-integration test-e2e gateway-image clean
 
-build:
+build: fmt-check
 	cd sandboxd && cargo build --workspace
+
+fmt:
+	cd sandboxd && cargo fmt --all
+
+fmt-check:
+	cd sandboxd && cargo fmt --all -- --check
 
 test:
 	cd sandboxd && cargo nextest run --workspace

@@ -28,6 +28,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Format check
+        working-directory: sandboxd
+        run: cargo fmt --all -- --check
+
       - name: Build
         working-directory: sandboxd
         run: cargo build --workspace
