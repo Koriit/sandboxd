@@ -86,12 +86,14 @@ For example, the first session gets `10.209.0.0/28`: the gateway container is `1
 
 ### Naming conventions
 
+Session IDs are 12 lowercase hex characters, so the bridge and TAP names are engineered to fit Linux's 15-character `IFNAMSIZ` limit exactly (3-char prefix + 12 hex chars = 15).
+
 | Resource | Name pattern |
 |----------|-------------|
 | Docker network | `sandbox-net-{session_id}` |
-| Docker bridge interface | `sb-{session_id[0..11]}` (max 15 chars) |
+| Docker bridge interface | `sb-{session_id}` (3 + 12 = 15 chars) |
 | Gateway container | `sandbox-gw-{session_id}` |
-| TAP device | `tap-sb-{session_id[0..6]}` (max 15 chars) |
+| TAP device | `tb-{session_id}` (3 + 12 = 15 chars) |
 
 ### Isolation
 
@@ -162,7 +164,7 @@ The sandbox inspects HTTPS traffic by generating a per-session CA certificate an
 
 ### Certificate lifecycle
 
-1. **Generation.** At session creation, sandboxd generates an ECDSA P-256 CA keypair. The CA is named `Sandbox CA {short_id}` (where `short_id` is the first 8 characters of the session UUID). Files are stored in the session's `ca/` directory:
+1. **Generation.** At session creation, sandboxd generates an ECDSA P-256 CA keypair. The CA certificate's Common Name is `Sandbox CA {session_id}`, where `{session_id}` is the session's full 12-character hex ID. Files are stored in the session's `ca/` directory:
    - `cert.pem` -- CA certificate (public)
    - `key.pem` -- CA private key (PKCS#8 PEM)
    - `mitmproxy-ca.pem` -- key + cert concatenated (mitmproxy format)
@@ -313,7 +315,7 @@ sandbox health <session>
 Example output:
 
 ```
-Session:   a1b2c3d4-...
+Session:   deadbeef0123
 VM:        running
 Agent:     connected
 Gateway:

@@ -58,7 +58,7 @@ sandbox rm my-sandbox
 
 ```bash
 make build            # cargo build --workspace
-make test             # unit tests (~444 tests, ~5s)
+make test             # unit tests (~5s)
 make test-integration # integration tests (requires Docker + Lima)
 make test-e2e         # full E2E suite (boots real VMs, ~45 min)
 make gateway-image    # build gateway container

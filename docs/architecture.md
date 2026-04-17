@@ -203,7 +203,7 @@ sandbox prints stdout, exits with code 0
 | POST | `/rebuild-image` | `rebuild_image` | Rebuild the pre-baked base VM image |
 | GET | `/base-image-status` | `base_image_status` | Check base image build status |
 
-The `{id}` parameter accepts either a session UUID or a session name.
+The `{id}` parameter accepts a session's human-readable name, its full 12-character hex session ID, or any unique prefix of the session ID (Docker-style). See [CLI reference — Session identifiers](cli-reference.md#session-identifiers).
 
 ## Security model
 

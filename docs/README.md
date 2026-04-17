@@ -88,8 +88,8 @@ sandbox ps
 ```
 
 ```
-ID                                    NAME        STATE       AGENT        GATEWAY      CREATED
-a1b2c3d4-e5f6-7890-abcd-ef1234567890  my-sandbox  running     connected    healthy      2m ago
+ID            NAME        STATE       AGENT        GATEWAY      CREATED
+1a2b3c4d5e6f  my-sandbox  running     connected    healthy      2m ago
 ```
 
 ### 5. Run commands

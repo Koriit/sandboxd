@@ -15,6 +15,16 @@ All commands accept the `--socket` and `--quiet` options:
 sandbox --socket /tmp/custom.sock ps
 ```
 
+## Session identifiers
+
+Every session has an auto-generated 12-character lowercase hex **session ID** (e.g. `550e8400e29b`). Commands that take a `<session>` argument accept any of:
+
+- the session's human-readable `--name` (if one was set at creation time),
+- the full 12-character session ID, or
+- any unique prefix of the session ID (Docker-style). If the prefix matches multiple sessions, the CLI reports the ambiguity and lists the matching IDs.
+
+For example, if a session has ID `550e8400e29b`, then `sandbox start 550e` works as long as no other session ID starts with `550e`.
+
 ---
 
 ## sandbox create
@@ -31,7 +41,7 @@ sandbox create [OPTIONS]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--name <name>` | (auto-generated UUID) | Human-readable name for the session |
+| `--name <name>` | (optional) | Human-readable name for the session. If omitted, the session is identified solely by its auto-generated 12-character hex session ID. |
 | `--cpus <n>` | `2` | Number of CPU cores |
 | `--memory <mb>` | `4096` | Memory in megabytes |
 | `--disk <gb>` | `20` | Disk size in gigabytes |
@@ -88,13 +98,14 @@ sandbox start <session>
 
 | Argument | Description |
 |----------|-------------|
-| `<session>` | Session name or UUID |
+| `<session>` | Session name or session ID (see [Session identifiers](#session-identifiers)). |
 
 ### Examples
 
 ```bash
 sandbox start my-sandbox
-sandbox start a1b2c3d4-e5f6-7890-abcd-ef1234567890
+sandbox start 550e8400e29b
+sandbox start 550e           # prefix match (if unique)
 ```
 
 ---
@@ -113,7 +124,7 @@ sandbox stop <session>
 
 | Argument | Description |
 |----------|-------------|
-| `<session>` | Session name or UUID |
+| `<session>` | Session name or session ID (see [Session identifiers](#session-identifiers)). |
 
 ### Examples
 
@@ -137,13 +148,13 @@ sandbox rm <session>
 
 | Argument | Description |
 |----------|-------------|
-| `<session>` | Session name or UUID |
+| `<session>` | Session name or session ID (see [Session identifiers](#session-identifiers)). |
 
 ### Examples
 
 ```bash
 sandbox rm my-sandbox
-sandbox rm a1b2c3d4-e5f6-7890-abcd-ef1234567890
+sandbox rm 0123456789ab
 ```
 
 ---
@@ -166,7 +177,7 @@ sandbox ps
 
 | Column | Description |
 |--------|-------------|
-| ID | Session UUID |
+| ID | 12-character hex session ID |
 | NAME | Human-readable name (or `-` if unnamed) |
 | STATE | `running`, `stopped`, `creating`, or `error` |
 | AGENT | Guest agent status: `connected`, `unreachable`, or `-` (not checked) |
@@ -180,9 +191,9 @@ sandbox ps
 ```
 
 ```
-ID                                    NAME        STATE       AGENT        GATEWAY      CREATED
-a1b2c3d4-e5f6-7890-abcd-ef1234567890  dev         running     connected    healthy      5m ago
-b2c3d4e5-f6a7-8901-bcde-f23456789012  ci-run      stopped     -            -            2h ago
+ID            NAME        STATE       AGENT        GATEWAY      CREATED
+a1b2c3d4e5f6  dev         running     connected    healthy      5m ago
+cafebabe1234  ci-run      stopped     -            -            2h ago
 ```
 
 ---
@@ -201,7 +212,7 @@ sandbox ssh <session> [-- <command> [args...]]
 
 | Argument | Description |
 |----------|-------------|
-| `<session>` | Session name or UUID |
+| `<session>` | Session name or session ID (see [Session identifiers](#session-identifiers)). |
 | `<command>` | Optional command to run non-interactively (after `--`) |
 
 ### Examples
@@ -239,7 +250,7 @@ sandbox exec <session> -- <command> [args...]
 
 | Argument | Description |
 |----------|-------------|
-| `<session>` | Session name or UUID |
+| `<session>` | Session name or session ID (see [Session identifiers](#session-identifiers)). |
 | `<command>` | Command and arguments to execute |
 
 ### Output
@@ -317,7 +328,7 @@ sandbox logs <session> [OPTIONS]
 
 | Argument | Description |
 |----------|-------------|
-| `<session>` | Session name or UUID |
+| `<session>` | Session name or session ID (see [Session identifiers](#session-identifiers)). |
 
 ### Options
 
@@ -365,12 +376,12 @@ sandbox health <session>
 
 | Argument | Description |
 |----------|-------------|
-| `<session>` | Session name or UUID |
+| `<session>` | Session name or session ID (see [Session identifiers](#session-identifiers)). |
 
 ### Output
 
 ```
-Session:   a1b2c3d4-e5f6-7890-abcd-ef1234567890
+Session:   9f8e7d6c5b4a
 VM:        running
 Agent:     connected
 Gateway:
@@ -387,7 +398,7 @@ Network:
 
 ```bash
 sandbox health my-sandbox
-sandbox health a1b2c3d4-e5f6-7890-abcd-ef1234567890
+sandbox health 9f8e7d6c5b4a
 ```
 
 ---
@@ -406,7 +417,7 @@ sandbox policy update <session> <policy-path>
 
 | Argument | Description |
 |----------|-------------|
-| `<session>` | Session name or UUID |
+| `<session>` | Session name or session ID (see [Session identifiers](#session-identifiers)). |
 | `<policy-path>` | Path to a policy JSON file |
 
 ### Details
@@ -421,8 +432,8 @@ sandbox policy update <session> <policy-path>
 # Apply a policy by session name
 sandbox policy update my-sandbox policy.json
 
-# Apply a policy by session ID
-sandbox policy update a1b2c3d4-... restricted-policy.json
+# Apply a policy by session ID (or unique ID prefix)
+sandbox policy update feedfacecafe restricted-policy.json
 ```
 
 ---
@@ -439,7 +450,7 @@ sandbox::<session>/<repo-path>
 
 | Part | Description |
 |------|-------------|
-| `<session>` | Session name or UUID |
+| `<session>` | Session name or session ID (see [Session identifiers](#session-identifiers)). |
 | `<repo-path>` | Absolute path to the git repository inside the VM (e.g., `/home/agent/workspace`). If omitted, defaults to `/home/agent/workspace`. |
 
 ### Usage
@@ -492,7 +503,7 @@ sandbox git-remote <service> <session> [--repo-path <path>]
 | Argument | Description |
 |----------|-------------|
 | `<service>` | Git service name (`git-upload-pack` or `git-receive-pack`) |
-| `<session>` | Session name or UUID |
+| `<session>` | Session name or session ID (see [Session identifiers](#session-identifiers)). |
 | `--repo-path <path>` | Path to the git repository inside the VM (default: `/home/agent/workspace`) |
 
 ---
