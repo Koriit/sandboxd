@@ -89,6 +89,7 @@ def test_gateway_traffic_flow(sandbox_cli):
         # 1. Create a session.
         result = sandbox_cli(
             "create", "--name", "net-flow-test", *_VM_RESOURCE_ARGS,
+            "--unrestricted",
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -311,6 +312,7 @@ def test_dns_interception(sandbox_cli):
         # 1. Create a session.
         result = sandbox_cli(
             "create", "--name", "net-dns-test", *_VM_RESOURCE_ARGS,
+            "--unrestricted",
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -385,6 +387,7 @@ def test_stop_start_with_networking(sandbox_cli):
         # 1. Create a session.
         result = sandbox_cli(
             "create", "--name", "net-restart-test", *_VM_RESOURCE_ARGS,
+            "--unrestricted",
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -787,6 +790,7 @@ def test_gateway_crash_recovery(sandbox_cli):
         # 1. Create a session.
         result = sandbox_cli(
             "create", "--name", "net-gwcrash-test", *_VM_RESOURCE_ARGS,
+            "--unrestricted",
             timeout=600,
         )
         assert result.returncode == 0, (

@@ -2027,10 +2027,26 @@ async fn teardown_session_networking(session_id: &SessionId, state: &AppState) {
 async fn reapply_session_policy(session_id: &SessionId, state: &AppState) {
     let container = gateway_container_name(session_id);
 
-    // Check the in-memory policy store.
+    // The in-memory map is cleared on stop, so fall back to the persistent
+    // store — otherwise a stop/start cycle silently reverts the session to
+    // the fail-closed default, dropping a policy the user explicitly set.
     let policy = {
         let policies = state.session_policies.lock().await;
         policies.get(session_id).cloned()
+    };
+    let policy = match policy {
+        Some(p) => Some(p),
+        None => match state.store.get_policy(session_id) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "failed to load policy from store during restore"
+                );
+                None
+            }
+        },
     };
 
     if let Some(policy) = policy {
@@ -2116,10 +2132,14 @@ async fn restore_session_networking(
     //    fail-closed empty DNS policy so CoreDNS loads it at startup
     //    (same race fix as in create_session).  The daemon re-applies
     //    any stored policy below after the container is up.
+    // The in-memory map is cleared on stop but the persistent store keeps
+    // the policy; consult both so the gateway isn't briefly started with the
+    // fail-closed default (which would otherwise race with
+    // `reapply_session_policy` below).
     let has_stored_policy = {
         let policies = state.session_policies.lock().await;
         policies.contains_key(session_id)
-    };
+    } || matches!(state.store.get_policy(session_id), Ok(Some(_)));
     let initial_dns_policy_owned: String;
     let initial_dns_policy = if !has_stored_policy {
         initial_dns_policy_owned = CoreDnsConfig::empty_policy_file_content();

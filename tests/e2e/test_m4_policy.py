@@ -685,7 +685,7 @@ def test_policy_update(sandbox_cli):
         policy_path_2 = write_policy_file(policy_2)
 
         update_result = sandbox_cli(
-            "policy", "update", "pol-update", policy_path_2,
+            "policy", "update", "pol-update", "--policy", policy_path_2,
             timeout=120,
         )
         assert update_result.returncode == 0, (
