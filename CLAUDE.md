@@ -16,7 +16,6 @@ make build                  # cargo build --workspace
 make test                   # cargo nextest run --workspace (unit tests, ~5s)
 make test-integration       # integration tests (requires Docker + Lima)
 make test-e2e               # full E2E suite (boots real VMs, ~30-45 min)
-make test-e2e PARALLEL=4    # E2E suite with 4 parallel workers (pytest-xdist)
 make gateway-image          # docker build for gateway container
 ```
 

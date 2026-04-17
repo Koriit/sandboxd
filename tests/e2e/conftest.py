@@ -1,8 +1,30 @@
-"""Shared fixtures and helpers for sandbox E2E tests."""
+"""Shared fixtures and helpers for sandbox E2E tests.
+
+pytest-xdist parallelization is NOT supported
+---------------------------------------------
+
+This suite must run serially.  Do not add ``-n N`` to the pytest invocation
+and do not reintroduce cross-worker locking.  Three independent reasons:
+
+* **Per-worker daemons duplicate cost.**  Each xdist worker is a separate
+  Python process, so session-scoped fixtures spawn one ``sandboxd`` daemon
+  per worker.  Fine in isolation, but compounds the next two problems.
+* **Shared Lima state races.**  All daemons share the user-global
+  ``~/.lima/`` directory.  Session cleanup (stale ``sandbox-*`` VM
+  removal) and golden base-image rebuilds from different workers race
+  on the same on-disk state and corrupt Lima VMs mid-boot.
+* **Host resource ceiling.**  Each session VM consumes 2 CPU / 2 GB; the
+  base image build peaks at 4 CPU / 4 GB.  On an 8 CPU / 8 GB host there
+  is no headroom for two concurrent session VMs plus daemon overhead.
+
+Earlier revisions used ``filelock`` + ``fcntl.flock`` rwlocks to paper over
+the first two points, but the host-resource ceiling is a hard physical
+limit.  We removed the locking scaffolding rather than ship a knob that
+only works on unobtainable hardware.
+"""
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import re
@@ -15,7 +37,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from filelock import FileLock
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -28,40 +49,6 @@ SANDBOX_BIN = CARGO_WORKSPACE / "target" / "debug" / "sandbox"
 
 # Maximum time to wait for the daemon socket to appear (seconds).
 DAEMON_STARTUP_TIMEOUT = 10
-
-# ---------------------------------------------------------------------------
-# Golden base image locking (cross-worker, for pytest-xdist PARALLEL runs)
-# ---------------------------------------------------------------------------
-#
-# The Lima base VM at ``~/.lima/sandbox-base`` is SHARED host state: every
-# pytest-xdist worker sees the same directory.  Without coordination, two
-# workers that each run ``_ensure_base_image`` at session start race on
-# ``sandbox rebuild-image`` (delete + re-provision), and any worker running
-# a destructive rebuild test (m85's ``test_rebuild_image_from_scratch``)
-# can clobber clones in flight on other workers.
-#
-# We use two locks on the same file, distinguished by lock mode:
-#
-# * ``BASE_IMAGE_REBUILD_LOCK_PATH`` held EXCLUSIVELY during destructive
-#   rebuild operations (``_ensure_base_image`` and the m85 destructive test).
-# * The same file taken SHARED (via ``fcntl.LOCK_SH``) for any test that
-#   may clone from the base VM via ``sandbox create``.
-#
-# Exclusive rebuild blocks all shared clones; shared clones from multiple
-# workers proceed in parallel.  First worker to acquire exclusive rebuilds
-# the image; subsequent workers see it as fresh (via the daemon's
-# ``/base-image-status`` endpoint) and skip the rebuild.
-#
-# Lock file lives in ``~/.lima`` when that directory exists (Lima creates
-# it on first use), otherwise in ``/tmp`` as a fallback.
-def _base_image_lock_path() -> Path:
-    lima_dir = Path.home() / ".lima"
-    if lima_dir.is_dir():
-        return lima_dir / "sandbox-base.rebuild.lock"
-    return Path("/tmp/sandbox-base.rebuild.lock")
-
-
-BASE_IMAGE_REBUILD_LOCK_PATH = _base_image_lock_path()
 
 # Paths to check for qemu-bridge-helper.
 QEMU_BRIDGE_HELPER_PATHS = [
@@ -189,21 +176,11 @@ def _find_qemu_bridge_helper() -> Path | None:
 
 
 @pytest.fixture(scope="session", autouse=True)
-def _preflight_checks(request):
+def _preflight_checks():
     """Verify that all host prerequisites are met before running any test.
 
     Each check produces a clear, actionable skip message so the developer
     knows exactly what to install or configure.
-
-    Under ``pytest-xdist`` (PARALLEL > 1) every worker runs this fixture
-    at session start.  Steps 1-7 (prerequisite checks) are idempotent
-    and safe to run concurrently.  Step 8 (cleanup of stale
-    ``sandbox-*`` Lima VMs / Docker resources) is destructive and
-    must run exactly ONCE per host -- otherwise a slow worker's
-    cleanup can delete VMs another worker has already created.
-    We detect xdist and run the cleanup only on the first worker
-    (``gw0``), with a filelock so other workers wait for it to finish
-    before proceeding.
     """
     # 1. Docker accessible
     try:
@@ -281,99 +258,68 @@ def _preflight_checks(request):
 
     # 8. Clean up stale sandbox resources from previous runs to prevent
     #    Docker subnet pool overlap errors.
-    #
-    # Under pytest-xdist, only one worker should run this cleanup (it's
-    # destructive to ALL ``sandbox-*`` VMs/networks, including ones that
-    # OTHER workers may have just created).  The ``worker_id`` fixture
-    # from pytest-xdist reports ``master`` for serial runs and ``gw0``,
-    # ``gw1``, ... for parallel workers.  We cleanup only when:
-    #   - serial (``master``); or
-    #   - parallel and we're the first worker (``gw0``).
-    # Other parallel workers wait on the same exclusive filelock so they
-    # don't start creating sessions until cleanup finishes.
     try:
-        worker_id = request.getfixturevalue("worker_id")
+        stale_containers = subprocess.run(
+            ["docker", "ps", "-a", "--filter", "name=sandbox-",
+             "--format", "{{.Names}}"],
+            capture_output=True, text=True, timeout=15,
+        )
+        for name in stale_containers.stdout.strip().splitlines():
+            if name:
+                subprocess.run(
+                    ["docker", "rm", "-f", name],
+                    capture_output=True, timeout=30,
+                )
     except Exception:
-        worker_id = "master"
-    is_primary_worker = worker_id in ("master", "gw0")
+        pass
 
-    # A barrier file lock ensures non-primary workers wait for gw0's
-    # cleanup to finish.  We reuse the base-image rebuild lock (held
-    # exclusively here) because cleanup and rebuild are mutually
-    # destructive operations; serializing on one file keeps the design
-    # simple.
-    BASE_IMAGE_REBUILD_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        stale_networks = subprocess.run(
+            ["docker", "network", "ls", "--filter", "name=sandbox-",
+             "--format", "{{.Name}}"],
+            capture_output=True, text=True, timeout=15,
+        )
+        for name in stale_networks.stdout.strip().splitlines():
+            if name:
+                subprocess.run(
+                    ["docker", "network", "rm", name],
+                    capture_output=True, timeout=30,
+                )
+    except Exception:
+        pass
 
-    with FileLock(str(BASE_IMAGE_REBUILD_LOCK_PATH), timeout=-1):
-        if not is_primary_worker:
-            # Non-primary workers take the lock (blocking until gw0
-            # releases) and immediately release -- they do NOT cleanup.
-            # This gives gw0 time to complete cleanup before other
-            # workers start creating sessions.
-            return
-
-        try:
-            stale_containers = subprocess.run(
-                ["docker", "ps", "-a", "--filter", "name=sandbox-",
-                 "--format", "{{.Names}}"],
-                capture_output=True, text=True, timeout=15,
-            )
-            for name in stale_containers.stdout.strip().splitlines():
-                if name:
+    try:
+        lima_vms = subprocess.run(
+            ["limactl", "list", "--json"],
+            capture_output=True, text=True, timeout=30,
+        )
+        for line in (lima_vms.stdout or "").strip().splitlines():
+            try:
+                entry = json.loads(line)
+                vm_name = entry.get("name", "")
+                if vm_name.startswith("sandbox-"):
                     subprocess.run(
-                        ["docker", "rm", "-f", name],
-                        capture_output=True, timeout=30,
+                        ["limactl", "delete", "--force", vm_name],
+                        capture_output=True, timeout=60,
                     )
-        except Exception:
-            pass
+            except json.JSONDecodeError:
+                pass
+    except Exception:
+        pass
 
-        try:
-            stale_networks = subprocess.run(
-                ["docker", "network", "ls", "--filter", "name=sandbox-",
-                 "--format", "{{.Name}}"],
-                capture_output=True, text=True, timeout=15,
-            )
-            for name in stale_networks.stdout.strip().splitlines():
-                if name:
-                    subprocess.run(
-                        ["docker", "network", "rm", name],
-                        capture_output=True, timeout=30,
-                    )
-        except Exception:
-            pass
-
-        try:
-            lima_vms = subprocess.run(
-                ["limactl", "list", "--json"],
-                capture_output=True, text=True, timeout=30,
-            )
-            for line in (lima_vms.stdout or "").strip().splitlines():
-                try:
-                    entry = json.loads(line)
-                    vm_name = entry.get("name", "")
-                    if vm_name.startswith("sandbox-"):
-                        subprocess.run(
-                            ["limactl", "delete", "--force", vm_name],
-                            capture_output=True, timeout=60,
-                        )
-                except json.JSONDecodeError:
-                    pass
-        except Exception:
-            pass
-
-        # Also remove orphan ~/.lima/sandbox-* directories that are not tracked
-        # by limactl (e.g. from hard crashes or incomplete teardowns).  These
-        # cause "open .../lima.yaml: no such file or directory" on subsequent
-        # runs when limactl tries to reuse the stale instance directory.
-        try:
-            lima_dir = Path.home() / ".lima"
-            if lima_dir.is_dir():
-                for entry in lima_dir.iterdir():
-                    if entry.is_dir() and entry.name.startswith("sandbox-"):
-                        import shutil
-                        shutil.rmtree(entry, ignore_errors=True)
-        except Exception:
-            pass
+    # Also remove orphan ~/.lima/sandbox-* directories that are not tracked
+    # by limactl (e.g. from hard crashes or incomplete teardowns).  These
+    # cause "open .../lima.yaml: no such file or directory" on subsequent
+    # runs when limactl tries to reuse the stale instance directory.
+    try:
+        lima_dir = Path.home() / ".lima"
+        if lima_dir.is_dir():
+            for entry in lima_dir.iterdir():
+                if entry.is_dir() and entry.name.startswith("sandbox-"):
+                    import shutil
+                    shutil.rmtree(entry, ignore_errors=True)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -427,8 +373,7 @@ def sandbox_binaries() -> SandboxBinaries:
 def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path_factory: pytest.TempPathFactory):
     """Start a sandboxd instance with a temporary socket and base-dir.
 
-    Session-scoped: all tests in one pytest worker share the same daemon.
-    With pytest-xdist (-n N), each worker gets its own daemon instance.
+    Session-scoped: all tests share the same daemon process.
 
     Yields a dict with:
       - socket: path to the Unix socket
@@ -632,90 +577,29 @@ def _ensure_base_image(sandbox_binaries: SandboxBinaries, sandbox_daemon):
     HTTPS apt sources and fast timeout config, this typically completes
     in ~90 seconds.
 
-    Cross-worker coordination
-    -------------------------
-
-    Under pytest-xdist (``make test-e2e PARALLEL=N``) every worker runs this
-    fixture at session start.  Without coordination, all N workers would
-    concurrently shell out to ``sandbox rebuild-image`` and race on the
-    single shared Lima VM at ``~/.lima/sandbox-base``.
-
-    We serialize with an exclusive ``filelock.FileLock`` on a stable host
-    path.  The first worker to acquire the lock rebuilds the image; any
-    worker that acquires the lock afterwards checks
-    ``GET /base-image-status`` and skips the rebuild if it's already fresh.
+    If the daemon reports the image is already ``fresh`` (e.g. a previous
+    test run left a valid base VM on disk), the rebuild is skipped.
     """
     socket_path = sandbox_daemon["socket"]
 
-    # Acquire the exclusive rebuild lock.  ``timeout=-1`` means block
-    # forever; under PARALLEL=4 the worst-case wait is ~90s (one rebuild).
-    lock_path = BASE_IMAGE_REBUILD_LOCK_PATH
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    status = _query_base_image_status(socket_path)
+    if status == "fresh":
+        return
 
-    with FileLock(str(lock_path), timeout=-1):
-        # We now hold the exclusive rebuild lock.  Query the daemon's
-        # base-image-status endpoint to see if a previous worker already
-        # rebuilt; if fresh, skip the ~90s rebuild.
-        status = _query_base_image_status(socket_path)
-        if status == "fresh":
-            return
-
-        # Image is missing/stale (or we couldn't query -- rebuild to be
-        # safe; rebuild is idempotent).
-        result = subprocess.run(
-            [str(sandbox_binaries.sandbox), "--socket", socket_path, "rebuild-image"],
-            capture_output=True,
-            text=True,
-            timeout=600,
+    # Image is missing/stale (or we couldn't query -- rebuild to be
+    # safe; rebuild is idempotent).
+    result = subprocess.run(
+        [str(sandbox_binaries.sandbox), "--socket", socket_path, "rebuild-image"],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    if result.returncode != 0:
+        pytest.fail(
+            f"Failed to build base image (exit {result.returncode}).\n"
+            f"stdout: {result.stdout}\n"
+            f"stderr: {result.stderr}"
         )
-        if result.returncode != 0:
-            pytest.fail(
-                f"Failed to build base image (exit {result.returncode}).\n"
-                f"stdout: {result.stdout}\n"
-                f"stderr: {result.stderr}"
-            )
-
-
-@pytest.fixture(autouse=True)
-def _base_image_rwlock(request):
-    """Coordinate base-VM access across pytest-xdist workers.
-
-    Per-test rwlock around the base VM using ``fcntl.flock`` on
-    ``BASE_IMAGE_REBUILD_LOCK_PATH``:
-
-    * ``test_rebuild_image_from_scratch`` (m85) deletes the base VM and
-      rebuilds it.  Runs under an EXCLUSIVE lock so no other worker can be
-      mid-clone when the VM is deleted.
-    * Every other test that may clone the base VM (i.e. any test that uses
-      ``sandbox_cli``) runs under a SHARED lock.  Many workers can hold
-      SHARED concurrently, preserving parallelism; EXCLUSIVE waits for all
-      shared holders to release.
-
-    Tests that don't touch the VM at all (none in the current suite) still
-    take the shared lock -- cheap, and protects against any future test
-    that forgets to request ``sandbox_cli``.
-    """
-    # Skip the lock for the rebuild lock file itself: the ``_ensure_base_image``
-    # fixture already holds the FileLock (exclusive) during rebuild, and
-    # fcntl advisory locks on the same file don't conflict with flock-style
-    # FileLock on the same fd in the same process.  In practice the
-    # FileLock is released before any test runs, so this note is mostly
-    # informational.
-    lock_path = BASE_IMAGE_REBUILD_LOCK_PATH
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-
-    exclusive = "test_rebuild_image_from_scratch" in request.node.name
-
-    # Open file in a mode that doesn't truncate so multiple workers can
-    # coexist.  ``a+`` opens for append (creating if needed) and doesn't
-    # truncate.
-    with open(lock_path, "a+") as f:
-        mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-        fcntl.flock(f.fileno(), mode)
-        try:
-            yield
-        finally:
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
 @pytest.fixture
