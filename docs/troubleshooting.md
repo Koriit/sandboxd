@@ -136,7 +136,7 @@ Applications that hardcode resolvers (e.g., `8.8.8.8`) are still forced through 
 
 ```bash
 # Host: check TAP device
-ip link show | grep tap-sb
+ip link show | grep tb-
 
 # VM: check data interface and routes
 ip addr show       # Look for .3 address
@@ -263,7 +263,7 @@ ip route                                      # Routes
 systemctl status sandbox-guest                # Guest agent
 
 # Host
-ip link show | grep -E 'tap-sb|sb-'          # TAP/bridge devices
+ip link show | grep -E 'tb-|sb-'             # TAP/bridge devices
 systemctl --user status sandbox.slice         # Cgroup usage
 journalctl -u sandboxd --since "1 hour ago"  # Daemon logs
 ```

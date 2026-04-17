@@ -21,7 +21,7 @@ make gateway-image          # docker build for gateway container
 
 ## E2E tests
 
-E2E tests boot real Lima/QEMU VMs and are SLOW. Individual test files take 3-10 minutes. The full suite (33 tests across 7 files) takes 30-45 minutes.
+E2E tests boot real Lima/QEMU VMs and are SLOW. Individual test files take 3-10 minutes. The full suite takes 30-45 minutes.
 
 **Running E2E tests from Claude Code:**
 - Never run the full suite in a foreground bash call — it will hit the 10-minute timeout.
@@ -47,7 +47,7 @@ cd sandboxd && cargo nextest run --workspace
 cd sandboxd && cargo clippy --workspace
 ```
 
-Unit test count: ~450 tests across 4 crates. Test runner: cargo-nextest (config at `sandboxd/.config/nextest.toml`).
+Test runner: cargo-nextest (config at `sandboxd/.config/nextest.toml`).
 
 ## Key conventions
 
