@@ -8,9 +8,6 @@ pub enum SandboxError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("HTTP error: {0}")]
-    Http(String),
-
     #[error("session not found: {0}")]
     SessionNotFound(String),
 
@@ -76,12 +73,6 @@ mod tests {
             "file not found",
         ));
         assert_eq!(err.to_string(), "I/O error: file not found");
-    }
-
-    #[test]
-    fn http_error_display() {
-        let err = SandboxError::Http("connection refused".into());
-        assert_eq!(err.to_string(), "HTTP error: connection refused");
     }
 
     #[test]

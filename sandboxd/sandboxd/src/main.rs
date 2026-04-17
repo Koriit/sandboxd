@@ -192,7 +192,6 @@ fn error_response(err: SandboxError) -> (StatusCode, Json<ApiError>) {
         SandboxError::Lima(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
         SandboxError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
         SandboxError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
-        SandboxError::Http(_) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
         SandboxError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
         SandboxError::Timeout { .. } => (StatusCode::GATEWAY_TIMEOUT, err.to_string()),
     };
@@ -2965,17 +2964,6 @@ mod tests {
     }
 
     #[test]
-    fn error_response_http_returns_500() {
-        let (status, body) = error_body(SandboxError::Http("connection refused".into()));
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(
-            body.error.contains("connection refused"),
-            "expected body to contain http error message, got: {}",
-            body.error
-        );
-    }
-
-    #[test]
     fn error_response_internal_returns_500() {
         let (status, body) = error_body(SandboxError::Internal("unexpected panic".into()));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -3044,9 +3032,6 @@ mod tests {
 
         let (_, body) = error_body(SandboxError::Internal("fail".into()));
         assert_eq!(body.error, "internal error: fail");
-
-        let (_, body) = error_body(SandboxError::Http("timeout".into()));
-        assert_eq!(body.error, "HTTP error: timeout");
     }
 
     // -----------------------------------------------------------------------
