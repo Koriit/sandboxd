@@ -438,9 +438,9 @@ sandbox policy update feedfacecafe restricted-policy.json
 
 ---
 
-## sandbox git-remote
+## git-remote-sandbox (symlink)
 
-Relay the git pack protocol to a repository inside a sandbox VM. End users do not invoke this directly -- the `sandbox` binary is also installed as a `git-remote-sandbox` symlink, and git calls that symlink automatically when it sees a `sandbox::` URL. The symlink speaks the git remote-helper protocol on stdin/stdout and tunnels the git pack protocol to the repository inside the target session VM.
+`git-remote-sandbox` is a symlink to the `sandbox` binary, not a subcommand. Users never invoke it directly: git does, automatically, whenever it resolves a `sandbox::<session>/<repo-path>` URL. The binary detects it was invoked under that name (via argv[0]) and switches into git remote-helper mode, tunneling the git pack protocol over `sandbox ssh` to the repository inside the target session VM.
 
 ### URL format
 
@@ -455,56 +455,22 @@ sandbox::<session>/<repo-path>
 
 ### Usage
 
-Add a sandbox VM as a git remote using a `sandbox::` URL:
-
 ```bash
+# Clone straight out of a session VM
+git clone sandbox::my-session/home/agent/workspace local-checkout
+
+# Or add the VM as a remote on an existing repo and push/pull normally
 git remote add origin sandbox::my-session/home/agent/workspace
-```
-
-Then use standard git operations:
-
-```bash
-# Push local changes into the VM
 git push origin main
-
-# Pull changes from the VM
 git pull origin main
 ```
 
-### Details
+### Requirements and notes
 
-- Git invokes the `git-remote-sandbox` symlink as `git-remote-sandbox <remote-name> <url>` whenever it resolves a `sandbox::` URL. The symlink must be installed on `PATH` alongside the `sandbox` binary.
-- Supports `git-upload-pack` (fetch/pull) and `git-receive-pack` (push) operations via the `connect` remote-helper capability.
-- Communication is entirely host-local: the helper advertises `connect`, then spawns `sandbox ssh <session>` to tunnel the git pack protocol to the `git-upload-pack` or `git-receive-pack` process running against the target repository inside the VM. No network policy rules are needed.
-- The daemon socket path can be overridden with the `SANDBOX_SOCKET` environment variable (the `--socket` global flag is not available in remote-helper mode because git controls the argv).
+- The `git-remote-sandbox` symlink must be installed on `PATH` alongside the `sandbox` binary; git looks it up by name.
+- The daemon socket path can be overridden with the `SANDBOX_SOCKET` environment variable. The `--socket` global flag is not available in remote-helper mode because git controls argv.
 
-### Examples
-
-```bash
-# Default repo path (/home/agent/workspace)
-git remote add origin sandbox::my-session/home/agent/workspace
-
-# Custom repo path inside the VM
-git remote add origin sandbox::my-session/home/agent/project
-
-# Custom daemon socket
-SANDBOX_SOCKET=/tmp/sandbox.sock \
-    git remote add origin sandbox::my-session/home/agent/workspace
-```
-
-### Synopsis (internal subcommand)
-
-The same binary also exposes a low-level `sandbox git-remote` subcommand used by the remote helper itself. It is not intended for direct use.
-
-```
-sandbox git-remote <service> <session> [--repo-path <path>]
-```
-
-| Argument | Description |
-|----------|-------------|
-| `<service>` | Git service name (`git-upload-pack` or `git-receive-pack`) |
-| `<session>` | Session name or session ID (see [Session identifiers](#session-identifiers)). |
-| `--repo-path <path>` | Path to the git repository inside the VM (default: `/home/agent/workspace`) |
+See [workspaces.md § git remote transport](workspaces.md#git-remote-transport) for the full description of the transport, including how isolation is preserved and how the helper interacts with the daemon.
 
 ---
 

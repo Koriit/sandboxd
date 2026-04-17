@@ -1,7 +1,7 @@
 # sandboxd Documentation Site — Design
 
 **Date:** 2026-04-17
-**Status:** Draft for review
+**Status:** Approved
 **Scope:** Stand up a published documentation site for sandboxd, and reshape existing docs around user journeys rather than reformatting them in place.
 
 ---

@@ -36,7 +36,7 @@
 
 | Planned Item | Status | Notes |
 |---|---|---|
-| **M1-S1:** CLI with subcommands (create, start, stop, rm, ps, ls) | Delivered | Plus: ssh, exec, cp, logs, policy, health, git-remote, rebuild-image |
+| **M1-S1:** CLI with subcommands (create, start, stop, rm, ps, ls) | Delivered | Plus: ssh, exec, cp, logs, policy, health, rebuild-image; git remote handled via `git-remote-sandbox` symlink, not a subcommand |
 | HTTP API server on Unix socket (axum) | Delivered | 15 endpoints (well beyond initial 6 stubs) |
 | Session types (id, name, state enum, timestamps, config) | Delivered | SessionState: Creating, Running, Stopped, Error |
 | SandboxError enum with thiserror | Delivered | 10 variants (Io, Http, SessionNotFound, InvalidState, Database, Network, Ca, Gateway, Lima, Internal, Timeout) |

@@ -69,7 +69,8 @@ A thin client that builds HTTP requests and sends them to the daemon over the Un
 - `ssh` -- resolves the session via the API, then invokes `limactl shell` directly.
 - `logs` -- resolves the session via the API, then invokes `docker logs` or `docker exec` to read gateway logs.
 - `cp` -- reads/writes local files and transfers via the daemon's upload/download API endpoints.
-- `git-remote` -- acts as a git remote helper, relaying git protocol streams through the daemon's git API endpoint.
+
+The same binary is also installed as a `git-remote-sandbox` symlink. When git invokes it under that name for a `sandbox::` URL, it acts as a git remote helper and spawns `sandbox ssh <session>` to tunnel the git pack protocol to `git-upload-pack` / `git-receive-pack` inside the VM.
 
 ### sandbox-guest (VM agent)
 
