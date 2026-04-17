@@ -1,7 +1,7 @@
 # `sandbox inspect` / `sandbox describe` — Design
 
 **Date:** 2026-04-17
-**Status:** Draft for review
+**Status:** Approved
 **Scope:** New CLI commands to view session state + policy persistence fix + `HttpConstraints` domain model refactor.
 
 ---

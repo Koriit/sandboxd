@@ -170,6 +170,12 @@ enum LogComponent {
 }
 
 fn default_socket_path() -> String {
+    // Honor SANDBOX_SOCKET as an override (symmetric with the daemon). The
+    // `--socket` flag, when passed explicitly, still takes precedence
+    // because clap only computes this default when no value is given.
+    if let Ok(sock) = std::env::var("SANDBOX_SOCKET") {
+        return sock;
+    }
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
         return format!("{runtime_dir}/sandboxd/sandboxd.sock");
     }
@@ -1047,8 +1053,11 @@ fn run_remote_helper() {
         }
     };
 
-    // Determine socket path: SANDBOX_SOCKET env var, or default.
-    let socket_path = std::env::var("SANDBOX_SOCKET").unwrap_or_else(|_| default_socket_path());
+    // Determine socket path via the shared helper, which honors SANDBOX_SOCKET
+    // and falls back to the XDG/HOME default. The `--socket` global flag is
+    // not available in remote-helper mode (git controls argv), so the env var
+    // is the only override path here.
+    let socket_path = default_socket_path();
 
     // Read commands from stdin line by line.
     // We track a pending `connect` service so we can break out of the loop
@@ -1428,14 +1437,59 @@ mod tests {
 
     #[test]
     fn default_socket_path_set() {
+        // Ensure the test is not perturbed by an inherited SANDBOX_SOCKET
+        // from the surrounding shell -- the default value should end with
+        // `sandboxd.sock` regardless of outside state.
+        let prior = std::env::var("SANDBOX_SOCKET").ok();
+        // SAFETY: Tests in this module that touch SANDBOX_SOCKET mutate and
+        // restore it in a single test body to avoid cross-test races under
+        // `cargo test` (nextest already provides per-test process isolation).
+        unsafe { std::env::remove_var("SANDBOX_SOCKET") };
         let cli = Cli::parse_from(["sandbox", "ps"]);
         assert!(cli.socket.ends_with("sandboxd.sock"));
+        // Restore prior state.
+        if let Some(v) = prior {
+            unsafe { std::env::set_var("SANDBOX_SOCKET", v) };
+        }
     }
 
     #[test]
     fn custom_socket_path() {
         let cli = Cli::parse_from(["sandbox", "--socket", "/tmp/custom.sock", "ps"]);
         assert_eq!(cli.socket, "/tmp/custom.sock");
+    }
+
+    #[test]
+    fn default_socket_path_honors_sandbox_socket_env() {
+        // Save and restore the env var to keep the test hermetic. Both
+        // assertions live in one test so that parallel threads under
+        // `cargo test` cannot race on the same var (nextest runs each test
+        // in its own process, so this is belt-and-suspenders there).
+        let prior = std::env::var("SANDBOX_SOCKET").ok();
+
+        // SANDBOX_SOCKET is honored when no --socket flag is given. This
+        // matches the daemon's precedence: `--socket` > env > XDG/HOME.
+        // SAFETY: see note on the restore block; the test body is the only
+        // window in which the variable is mutated.
+        unsafe { std::env::set_var("SANDBOX_SOCKET", "/tmp/from-env.sock") };
+        assert_eq!(default_socket_path(), "/tmp/from-env.sock");
+        let cli = Cli::parse_from(["sandbox", "ps"]);
+        assert_eq!(cli.socket, "/tmp/from-env.sock");
+
+        // An explicit --socket still wins over the env var.
+        let cli = Cli::parse_from(["sandbox", "--socket", "/tmp/explicit.sock", "ps"]);
+        assert_eq!(cli.socket, "/tmp/explicit.sock");
+
+        // When SANDBOX_SOCKET is unset the XDG/HOME default applies.
+        unsafe { std::env::remove_var("SANDBOX_SOCKET") };
+        assert!(default_socket_path().ends_with("sandboxd.sock"));
+
+        // Restore prior state so other tests that happen to share the
+        // process (under `cargo test`) are unaffected.
+        match prior {
+            Some(v) => unsafe { std::env::set_var("SANDBOX_SOCKET", v) },
+            None => unsafe { std::env::remove_var("SANDBOX_SOCKET") },
+        }
     }
 
     #[test]
