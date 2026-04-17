@@ -199,12 +199,7 @@ pub fn read_resolved_json(session_id: &SessionId) -> Result<ResolvedReport, Sand
     let container = gateway::container_name(session_id);
 
     let output = Command::new("docker")
-        .args([
-            "exec",
-            &container,
-            "cat",
-            "/etc/coredns/resolved.json",
-        ])
+        .args(["exec", &container, "cat", "/etc/coredns/resolved.json"])
         .output()
         .map_err(|e| {
             SandboxError::Gateway(format!(
@@ -233,9 +228,8 @@ pub fn read_resolved_json(session_id: &SessionId) -> Result<ResolvedReport, Sand
         });
     }
 
-    serde_json::from_str(&content).map_err(|e| {
-        SandboxError::Gateway(format!("failed to parse resolved.json: {e}"))
-    })
+    serde_json::from_str(&content)
+        .map_err(|e| SandboxError::Gateway(format!("failed to parse resolved.json: {e}")))
 }
 
 /// Generate nftables rules for resolved domain IPs.
@@ -312,9 +306,7 @@ pub fn generate_domain_ip_rules(
     }
 
     // If no allow rules (excluding comments), return empty.
-    let has_real_rules = allow_rules
-        .iter()
-        .any(|r| !r.trim_start().starts_with('#'));
+    let has_real_rules = allow_rules.iter().any(|r| !r.trim_start().starts_with('#'));
     if !has_real_rules {
         return String::new();
     }
@@ -524,7 +516,10 @@ mod tests {
 
         assert_eq!(cache.entries().len(), 1);
         let entry = cache.entries().get("example.com").unwrap();
-        assert_eq!(entry.ips, vec!["93.184.216.34".parse::<Ipv4Addr>().unwrap()]);
+        assert_eq!(
+            entry.ips,
+            vec!["93.184.216.34".parse::<Ipv4Addr>().unwrap()]
+        );
     }
 
     #[test]
@@ -892,9 +887,7 @@ mod tests {
         };
         cache.update(&report);
 
-        let rules = generate_l3_redirect_rules(
-            &policy, &cache, "10.209.0.0/28", "10.209.0.2",
-        );
+        let rules = generate_l3_redirect_rules(&policy, &cache, "10.209.0.0/28", "10.209.0.2");
         assert!(
             rules.is_empty(),
             "transport-only policy should produce no L3 redirect rules"
@@ -925,14 +918,9 @@ mod tests {
         };
         cache.update(&report);
 
-        let rules = generate_l3_redirect_rules(
-            &policy, &cache, "10.209.0.0/28", "10.209.0.2",
-        );
+        let rules = generate_l3_redirect_rules(&policy, &cache, "10.209.0.0/28", "10.209.0.2");
 
-        assert!(
-            rules.contains("sandbox_l3"),
-            "must define sandbox_l3 table"
-        );
+        assert!(rules.contains("sandbox_l3"), "must define sandbox_l3 table");
         assert!(
             rules.contains("93.184.216.34"),
             "must include resolved IP for L3 domain"
@@ -965,9 +953,7 @@ mod tests {
         };
 
         let cache = DnsCache::new();
-        let rules = generate_l3_redirect_rules(
-            &policy, &cache, "10.209.0.0/28", "10.209.0.2",
-        );
+        let rules = generate_l3_redirect_rules(&policy, &cache, "10.209.0.0/28", "10.209.0.2");
 
         assert!(
             rules.contains("10.0.0.0/8"),
@@ -993,9 +979,7 @@ mod tests {
         };
 
         let cache = DnsCache::new();
-        let rules = generate_l3_redirect_rules(
-            &policy, &cache, "10.209.0.0/28", "10.209.0.2",
-        );
+        let rules = generate_l3_redirect_rules(&policy, &cache, "10.209.0.0/28", "10.209.0.2");
 
         assert!(
             rules.is_empty(),
@@ -1057,9 +1041,7 @@ mod tests {
         };
         cache.update(&report);
 
-        let rules = generate_l3_redirect_rules(
-            &policy, &cache, "10.209.0.0/28", "10.209.0.2",
-        );
+        let rules = generate_l3_redirect_rules(&policy, &cache, "10.209.0.0/28", "10.209.0.2");
 
         // Only full.com (3.3.3.3) should be in the redirect rules.
         assert!(rules.contains("3.3.3.3"), "must include L3 IP");

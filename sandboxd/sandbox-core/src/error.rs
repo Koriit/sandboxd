@@ -36,10 +36,7 @@ pub enum SandboxError {
     Internal(String),
 
     #[error("{operation} timed out after {duration}s")]
-    Timeout {
-        operation: String,
-        duration: u64,
-    },
+    Timeout { operation: String, duration: u64 },
 }
 
 /// API error response body returned by the daemon.
@@ -50,9 +47,7 @@ pub struct ApiError {
 
 impl ApiError {
     pub fn new(msg: impl Into<String>) -> Self {
-        Self {
-            error: msg.into(),
-        }
+        Self { error: msg.into() }
     }
 }
 

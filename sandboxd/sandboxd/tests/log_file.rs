@@ -34,11 +34,8 @@ fn sandboxd_bin() -> PathBuf {
 /// We don't need a strict regex -- a quick shape check is enough.
 fn looks_like_tracing_line(line: &str) -> bool {
     // Starts with a year (4 digits + '-') and contains a known level keyword.
-    let starts_with_iso = line
-        .chars()
-        .take(4)
-        .all(|c| c.is_ascii_digit())
-        && line.chars().nth(4) == Some('-');
+    let starts_with_iso =
+        line.chars().take(4).all(|c| c.is_ascii_digit()) && line.chars().nth(4) == Some('-');
     let has_level = line.contains(" INFO ")
         || line.contains(" WARN ")
         || line.contains(" DEBUG ")

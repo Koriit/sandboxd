@@ -127,8 +127,7 @@ impl GatewayManager {
         // exits with an error only when the container does not exist, which
         // we intentionally ignore.
         let rm_output = run_with_timeout(
-            Command::new("docker")
-                .args(["rm", "--force", &container_name]),
+            Command::new("docker").args(["rm", "--force", &container_name]),
             DOCKER_RM_TIMEOUT,
             "docker rm (pre-cleanup)",
         );
@@ -217,11 +216,9 @@ impl GatewayManager {
             GATEWAY_IMAGE.to_string(),
         ]);
 
-        let args_refs: Vec<&str> =
-            args.iter().map(|s| s.as_str()).collect();
+        let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let output = run_with_timeout(
-            Command::new("docker")
-                .args(&args_refs),
+            Command::new("docker").args(&args_refs),
             DOCKER_RUN_TIMEOUT,
             "docker run (gateway)",
         )
@@ -328,8 +325,7 @@ impl GatewayManager {
 
         // Step 2: Stop the container.
         let output = run_with_timeout(
-            Command::new("docker")
-                .args(["stop", "--time", "10", &container_name]),
+            Command::new("docker").args(["stop", "--time", "10", &container_name]),
             DOCKER_STOP_TIMEOUT,
             "docker stop (gateway)",
         )
@@ -352,8 +348,7 @@ impl GatewayManager {
 
         // Step 3: Remove the container.
         let output = run_with_timeout(
-            Command::new("docker")
-                .args(["rm", "--force", &container_name]),
+            Command::new("docker").args(["rm", "--force", &container_name]),
             DOCKER_RM_TIMEOUT,
             "docker rm (gateway)",
         )
@@ -416,21 +411,17 @@ impl GatewayManager {
 
     /// Check gateway health by running the healthcheck script inside the
     /// container.
-    pub fn gateway_status(
-        &self,
-        session_id: &SessionId,
-    ) -> Result<GatewayStatus, SandboxError> {
+    pub fn gateway_status(&self, session_id: &SessionId) -> Result<GatewayStatus, SandboxError> {
         let container_name = container_name(session_id);
 
         // First check if the container is running.
         let output = run_with_timeout(
-            Command::new("docker")
-                .args([
-                    "inspect",
-                    "--format",
-                    "{{.State.Running}}",
-                    &container_name,
-                ]),
+            Command::new("docker").args([
+                "inspect",
+                "--format",
+                "{{.State.Running}}",
+                &container_name,
+            ]),
             DOCKER_INSPECT_TIMEOUT,
             "docker inspect (gateway status)",
         )
@@ -445,16 +436,14 @@ impl GatewayManager {
             return Ok(GatewayStatus::NotRunning);
         }
 
-        let running =
-            String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let running = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if running != "true" {
             return Ok(GatewayStatus::NotRunning);
         }
 
         // Run the healthcheck script.
         let output = run_with_timeout(
-            Command::new("docker")
-                .args(["exec", &container_name, "/healthcheck.sh"]),
+            Command::new("docker").args(["exec", &container_name, "/healthcheck.sh"]),
             DOCKER_INSPECT_TIMEOUT,
             "docker exec (healthcheck)",
         )
@@ -465,8 +454,7 @@ impl GatewayManager {
             other => other,
         })?;
 
-        let stdout =
-            String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
         if output.status.success() {
             Ok(GatewayStatus::Healthy)
@@ -481,21 +469,18 @@ impl GatewayManager {
         let container_name = container_name(session_id);
 
         let output = run_with_timeout(
-            Command::new("docker")
-                .args([
-                    "inspect",
-                    "--format",
-                    "{{.State.Status}}",
-                    &container_name,
-                ]),
+            Command::new("docker").args([
+                "inspect",
+                "--format",
+                "{{.State.Status}}",
+                &container_name,
+            ]),
             DOCKER_INSPECT_TIMEOUT,
             "docker inspect (container status)",
         );
 
         match output {
-            Ok(o) if o.status.success() => {
-                String::from_utf8_lossy(&o.stdout).trim().to_string()
-            }
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
             _ => "not_found".to_string(),
         }
     }
@@ -504,20 +489,12 @@ impl GatewayManager {
     ///
     /// Returns "healthy", "unhealthy", or "unknown" (if the container is not
     /// running or the check cannot be performed).
-    pub fn component_health(
-        &self,
-        session_id: &SessionId,
-        component: &str,
-    ) -> String {
+    pub fn component_health(&self, session_id: &SessionId, component: &str) -> String {
         let container_name = container_name(session_id);
 
         let check_cmd: &[&str] = match component {
-            "envoy" => {
-                &["curl", "-sf", "http://127.0.0.1:9901/ready"]
-            }
-            "coredns" => {
-                &["curl", "-sf", "http://127.0.0.1:8180/health"]
-            }
+            "envoy" => &["curl", "-sf", "http://127.0.0.1:9901/ready"],
+            "coredns" => &["curl", "-sf", "http://127.0.0.1:8180/health"],
             "mitmproxy" => &["pgrep", "-x", "mitmdump"],
             _ => return "unknown".to_string(),
         };
@@ -530,9 +507,7 @@ impl GatewayManager {
             DOCKER_INSPECT_TIMEOUT,
             &format!("docker exec ({component} health)"),
         ) {
-            Ok(output) if output.status.success() => {
-                "healthy".to_string()
-            }
+            Ok(output) if output.status.success() => "healthy".to_string(),
             Ok(_) => "unhealthy".to_string(),
             Err(_) => "unknown".to_string(),
         }
@@ -564,10 +539,7 @@ impl GatewayManager {
         network_info: &NetworkInfo,
         container_ip: &str,
     ) -> Result<(), SandboxError> {
-        let ruleset = generate_dnat_ruleset(
-            &network_info.subnet,
-            container_ip,
-        );
+        let ruleset = generate_dnat_ruleset(&network_info.subnet, container_ip);
         self.inject_nftables_ruleset(session_id, &ruleset, "DNAT")?;
 
         // Also update the forward chain to allow forwarding from the VM subnet.
@@ -625,13 +597,12 @@ impl GatewayManager {
         let container_name = container_name(session_id);
 
         let output = run_with_timeout(
-            Command::new("docker")
-                .args([
-                    "inspect",
-                    "--format",
-                    "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
-                    &container_name,
-                ]),
+            Command::new("docker").args([
+                "inspect",
+                "--format",
+                "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+                &container_name,
+            ]),
             CONTAINER_IP_TIMEOUT,
             "docker inspect (container IP)",
         )
@@ -684,9 +655,7 @@ impl GatewayManager {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| {
-                SandboxError::Gateway(format!(
-                    "failed to spawn {label} nftables injection: {e}"
-                ))
+                SandboxError::Gateway(format!("failed to spawn {label} nftables injection: {e}"))
             })?;
 
         // Write the ruleset to stdin, then close it.
@@ -702,11 +671,13 @@ impl GatewayManager {
         let deadline = Instant::now() + NFT_EXEC_TIMEOUT;
         let output = loop {
             match child.try_wait() {
-                Ok(Some(_)) => break child.wait_with_output().map_err(|e| {
-                    SandboxError::Gateway(format!(
-                        "failed to collect output from {label} nftables injection: {e}"
-                    ))
-                })?,
+                Ok(Some(_)) => {
+                    break child.wait_with_output().map_err(|e| {
+                        SandboxError::Gateway(format!(
+                            "failed to collect output from {label} nftables injection: {e}"
+                        ))
+                    })?;
+                }
                 Ok(None) if Instant::now() >= deadline => {
                     warn!(label = label, "nftables injection timed out, killing");
                     let _ = child.kill();
@@ -803,14 +774,9 @@ impl GatewayManager {
             let mut args = vec!["exec", container_name];
             args.extend(check_cmd);
 
-            let output = Command::new("docker")
-                .args(&args)
-                .output()
-                .map_err(|e| {
-                    SandboxError::Gateway(format!(
-                        "failed to check {component_name} readiness: {e}"
-                    ))
-                })?;
+            let output = Command::new("docker").args(&args).output().map_err(|e| {
+                SandboxError::Gateway(format!("failed to check {component_name} readiness: {e}"))
+            })?;
 
             if output.status.success() {
                 debug!(
@@ -1011,10 +977,7 @@ mod tests {
     #[test]
     fn test_gateway_container_name() {
         let session_id = SessionId::parse("550e8400e29b").unwrap();
-        assert_eq!(
-            container_name(&session_id),
-            "sandbox-gw-550e8400e29b"
-        );
+        assert_eq!(container_name(&session_id), "sandbox-gw-550e8400e29b");
     }
 
     // -- Deny-all ruleset tests ---------------------------------------------
@@ -1030,10 +993,7 @@ mod tests {
         );
 
         // Must have input chain with drop policy.
-        assert!(
-            ruleset.contains("chain input"),
-            "must define input chain"
-        );
+        assert!(ruleset.contains("chain input"), "must define input chain");
         assert!(
             ruleset.contains("policy drop"),
             "input chain must have drop policy"
@@ -1046,10 +1006,7 @@ mod tests {
         );
 
         // Must have output chain with accept policy.
-        assert!(
-            ruleset.contains("chain output"),
-            "must define output chain"
-        );
+        assert!(ruleset.contains("chain output"), "must define output chain");
         assert!(
             ruleset.contains("policy accept"),
             "output chain must have accept policy"
@@ -1110,9 +1067,7 @@ mod tests {
 
         // TCP DNAT to Envoy (excluding DNS).
         assert!(
-            ruleset.contains(
-                "ip saddr 10.209.0.0/28 tcp dport != 53 dnat to 10.209.0.2:10000"
-            ),
+            ruleset.contains("ip saddr 10.209.0.0/28 tcp dport != 53 dnat to 10.209.0.2:10000"),
             "must DNAT non-DNS TCP to Envoy"
         );
 
@@ -1177,8 +1132,7 @@ mod tests {
 
         // Must NOT have a blanket accept from VM subnet (the old security gap).
         let has_blanket_accept = ruleset.lines().any(|line| {
-            line.contains("ip saddr 10.209.0.0/28 accept")
-                && !line.contains("ip daddr")
+            line.contains("ip saddr 10.209.0.0/28 accept") && !line.contains("ip daddr")
         });
         assert!(
             !has_blanket_accept,
@@ -1197,5 +1151,4 @@ mod tests {
             "must reject unmatched forwarded traffic"
         );
     }
-
 }

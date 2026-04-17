@@ -14,8 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use rcgen::{
-    BasicConstraints, CertificateParams, DnType, IsCa, KeyIdMethod, KeyPair,
-    KeyUsagePurpose,
+    BasicConstraints, CertificateParams, DnType, IsCa, KeyIdMethod, KeyPair, KeyUsagePurpose,
 };
 use ring::digest;
 use tracing::{debug, info, warn};
@@ -65,10 +64,8 @@ impl CaManager {
         })?;
 
         // Generate ECDSA P-256 key pair.
-        let key_pair =
-            KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).map_err(|e| {
-                SandboxError::Ca(format!("failed to generate CA key pair: {e}"))
-            })?;
+        let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+            .map_err(|e| SandboxError::Ca(format!("failed to generate CA key pair: {e}")))?;
 
         // Compute Subject Key Identifier as SHA-1 of the raw public key
         // (RFC 5280 section 4.2.1.2, method 1).  This matches how Python's
@@ -98,19 +95,15 @@ impl CaManager {
         // what it can sign for, and even `anyExtendedKeyUsage` causes
         // OpenSSL to reject the cert as "unsuitable certificate purpose"
         // when verifying TLS server certs signed by it.
-        params.key_identifier_method =
-            KeyIdMethod::PreSpecified(ski_bytes);
+        params.key_identifier_method = KeyIdMethod::PreSpecified(ski_bytes);
         // 1-year validity — generous to avoid clock-skew issues in
         // short-lived sessions.
         params.not_before = time::OffsetDateTime::now_utc();
-        params.not_after =
-            params.not_before + time::Duration::days(365);
+        params.not_after = params.not_before + time::Duration::days(365);
 
-        let cert = params.self_signed(&key_pair).map_err(|e| {
-            SandboxError::Ca(format!(
-                "failed to self-sign CA certificate: {e}"
-            ))
-        })?;
+        let cert = params
+            .self_signed(&key_pair)
+            .map_err(|e| SandboxError::Ca(format!("failed to self-sign CA certificate: {e}")))?;
 
         // Serialize.
         let cert_pem = cert.pem();
@@ -122,33 +115,21 @@ impl CaManager {
         let mitm_ca_path = ca_dir.join("mitmproxy-ca.pem");
         let mitm_cert_path = ca_dir.join("mitmproxy-ca-cert.pem");
 
-        fs::write(&cert_path, &cert_pem).map_err(|e| {
-            SandboxError::Ca(format!(
-                "failed to write cert.pem: {e}"
-            ))
-        })?;
-        fs::write(&key_path, &key_pem).map_err(|e| {
-            SandboxError::Ca(format!(
-                "failed to write key.pem: {e}"
-            ))
-        })?;
+        fs::write(&cert_path, &cert_pem)
+            .map_err(|e| SandboxError::Ca(format!("failed to write cert.pem: {e}")))?;
+        fs::write(&key_path, &key_pem)
+            .map_err(|e| SandboxError::Ca(format!("failed to write key.pem: {e}")))?;
 
         // mitmproxy-ca.pem: key + cert concatenated (mitmproxy reads
         // both from a single file).
         let mitm_combined = format!("{key_pem}{cert_pem}");
-        fs::write(&mitm_ca_path, &mitm_combined).map_err(|e| {
-            SandboxError::Ca(format!(
-                "failed to write mitmproxy-ca.pem: {e}"
-            ))
-        })?;
+        fs::write(&mitm_ca_path, &mitm_combined)
+            .map_err(|e| SandboxError::Ca(format!("failed to write mitmproxy-ca.pem: {e}")))?;
 
         // mitmproxy-ca-cert.pem: cert only (some tools want just the
         // public cert).
-        fs::write(&mitm_cert_path, &cert_pem).map_err(|e| {
-            SandboxError::Ca(format!(
-                "failed to write mitmproxy-ca-cert.pem: {e}"
-            ))
-        })?;
+        fs::write(&mitm_cert_path, &cert_pem)
+            .map_err(|e| SandboxError::Ca(format!("failed to write mitmproxy-ca-cert.pem: {e}")))?;
 
         debug!(
             session_id = %session_id,
@@ -164,10 +145,7 @@ impl CaManager {
     ///
     /// Best-effort: logs a warning and returns Ok if the directory does
     /// not exist.
-    pub fn remove_session_ca(
-        base_dir: &Path,
-        session_id: &SessionId,
-    ) -> Result<(), SandboxError> {
+    pub fn remove_session_ca(base_dir: &Path, session_id: &SessionId) -> Result<(), SandboxError> {
         let ca_dir = Self::ca_dir(base_dir, session_id);
 
         if !ca_dir.exists() {
@@ -281,10 +259,7 @@ mod tests {
         let id = SessionId::parse("550e8400e29b").unwrap();
 
         let dir = CaManager::ca_dir(base, &id);
-        assert_eq!(
-            dir,
-            PathBuf::from("/tmp/sandboxd/sessions/550e8400e29b/ca")
-        );
+        assert_eq!(dir, PathBuf::from("/tmp/sandboxd/sessions/550e8400e29b/ca"));
     }
 
     #[test]
@@ -293,22 +268,15 @@ mod tests {
         let base = tmp.path();
         let id = SessionId::generate();
 
-        let ca_dir =
-            CaManager::generate_session_ca(base, &id).unwrap();
+        let ca_dir = CaManager::generate_session_ca(base, &id).unwrap();
 
         // Verify directory exists.
         assert!(ca_dir.exists());
         assert!(ca_dir.is_dir());
 
         // Verify all expected files exist.
-        assert!(
-            ca_dir.join("cert.pem").exists(),
-            "cert.pem should exist"
-        );
-        assert!(
-            ca_dir.join("key.pem").exists(),
-            "key.pem should exist"
-        );
+        assert!(ca_dir.join("cert.pem").exists(), "cert.pem should exist");
+        assert!(ca_dir.join("key.pem").exists(), "key.pem should exist");
         assert!(
             ca_dir.join("mitmproxy-ca.pem").exists(),
             "mitmproxy-ca.pem should exist"
@@ -325,13 +293,10 @@ mod tests {
         let base = tmp.path();
         let id = SessionId::generate();
 
-        let ca_dir =
-            CaManager::generate_session_ca(base, &id).unwrap();
+        let ca_dir = CaManager::generate_session_ca(base, &id).unwrap();
 
-        let cert_pem =
-            fs::read_to_string(ca_dir.join("cert.pem")).unwrap();
-        let key_pem =
-            fs::read_to_string(ca_dir.join("key.pem")).unwrap();
+        let cert_pem = fs::read_to_string(ca_dir.join("cert.pem")).unwrap();
+        let key_pem = fs::read_to_string(ca_dir.join("key.pem")).unwrap();
 
         // Verify PEM markers.
         assert!(
@@ -358,15 +323,11 @@ mod tests {
         let base = tmp.path();
         let id = SessionId::generate();
 
-        let ca_dir =
-            CaManager::generate_session_ca(base, &id).unwrap();
+        let ca_dir = CaManager::generate_session_ca(base, &id).unwrap();
 
-        let cert_pem =
-            fs::read_to_string(ca_dir.join("cert.pem")).unwrap();
-        let key_pem =
-            fs::read_to_string(ca_dir.join("key.pem")).unwrap();
-        let mitm_pem =
-            fs::read_to_string(ca_dir.join("mitmproxy-ca.pem")).unwrap();
+        let cert_pem = fs::read_to_string(ca_dir.join("cert.pem")).unwrap();
+        let key_pem = fs::read_to_string(ca_dir.join("key.pem")).unwrap();
+        let mitm_pem = fs::read_to_string(ca_dir.join("mitmproxy-ca.pem")).unwrap();
 
         // mitmproxy-ca.pem should be key + cert.
         let expected = format!("{key_pem}{cert_pem}");
@@ -379,14 +340,10 @@ mod tests {
         let base = tmp.path();
         let id = SessionId::generate();
 
-        let ca_dir =
-            CaManager::generate_session_ca(base, &id).unwrap();
+        let ca_dir = CaManager::generate_session_ca(base, &id).unwrap();
 
-        let cert_pem =
-            fs::read_to_string(ca_dir.join("cert.pem")).unwrap();
-        let mitm_cert_pem =
-            fs::read_to_string(ca_dir.join("mitmproxy-ca-cert.pem"))
-                .unwrap();
+        let cert_pem = fs::read_to_string(ca_dir.join("cert.pem")).unwrap();
+        let mitm_cert_pem = fs::read_to_string(ca_dir.join("mitmproxy-ca-cert.pem")).unwrap();
 
         assert_eq!(cert_pem, mitm_cert_pem);
     }
@@ -398,19 +355,15 @@ mod tests {
         let id1 = SessionId::generate();
         let id2 = SessionId::generate();
 
-        let dir1 =
-            CaManager::generate_session_ca(base, &id1).unwrap();
-        let dir2 =
-            CaManager::generate_session_ca(base, &id2).unwrap();
+        let dir1 = CaManager::generate_session_ca(base, &id1).unwrap();
+        let dir2 = CaManager::generate_session_ca(base, &id2).unwrap();
 
         // Directories should be different.
         assert_ne!(dir1, dir2);
 
         // Certificates should be different (different key pairs).
-        let cert1 =
-            fs::read_to_string(dir1.join("cert.pem")).unwrap();
-        let cert2 =
-            fs::read_to_string(dir2.join("cert.pem")).unwrap();
+        let cert1 = fs::read_to_string(dir1.join("cert.pem")).unwrap();
+        let cert2 = fs::read_to_string(dir2.join("cert.pem")).unwrap();
         assert_ne!(cert1, cert2);
     }
 
@@ -420,8 +373,7 @@ mod tests {
         let base = tmp.path();
         let id = SessionId::generate();
 
-        let ca_dir =
-            CaManager::generate_session_ca(base, &id).unwrap();
+        let ca_dir = CaManager::generate_session_ca(base, &id).unwrap();
         assert!(ca_dir.exists());
 
         CaManager::remove_session_ca(base, &id).unwrap();
@@ -445,15 +397,11 @@ mod tests {
         let base = tmp.path();
         let id = SessionId::generate();
 
-        let dir1 =
-            CaManager::generate_session_ca(base, &id).unwrap();
-        let cert1 =
-            fs::read_to_string(dir1.join("cert.pem")).unwrap();
+        let dir1 = CaManager::generate_session_ca(base, &id).unwrap();
+        let cert1 = fs::read_to_string(dir1.join("cert.pem")).unwrap();
 
-        let dir2 =
-            CaManager::generate_session_ca(base, &id).unwrap();
-        let cert2 =
-            fs::read_to_string(dir2.join("cert.pem")).unwrap();
+        let dir2 = CaManager::generate_session_ca(base, &id).unwrap();
+        let cert2 = fs::read_to_string(dir2.join("cert.pem")).unwrap();
 
         // Same directory.
         assert_eq!(dir1, dir2);

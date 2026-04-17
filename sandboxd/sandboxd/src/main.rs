@@ -11,6 +11,7 @@ use axum::{
     routing::{delete, get, post},
 };
 use clap::Parser;
+use sandbox_core::gateway::container_name as gateway_container_name;
 use sandbox_core::{
     ApiError, AssuranceLevel, BaseImageStatus, CaManager, CoreDnsConfig, CreateSessionRequest,
     Destination, DnsCache, ExecRequest, ExecResponse, FileDownloadRequest, FileDownloadResponse,
@@ -21,7 +22,6 @@ use sandbox_core::{
     attach_vm_to_bridge, detach_vm_from_bridge, generate_ca_inject_script, mac_from_session_id,
     propagate_dns_changes, read_resolved_json, write_file_to_container,
 };
-use sandbox_core::gateway::container_name as gateway_container_name;
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -53,7 +53,6 @@ struct Args {
     #[arg(long)]
     log_file: Option<PathBuf>,
 }
-
 
 fn default_socket_path() -> String {
     // Honor SANDBOX_SOCKET as an override (symmetric with the CLI). The
@@ -102,9 +101,7 @@ enum LogDestination {
 ///
 /// This is a pure function: given the same input, it either opens the
 /// file or returns `Stderr`. No global state is touched.
-fn resolve_log_destination(
-    log_file: Option<&std::path::Path>,
-) -> std::io::Result<LogDestination> {
+fn resolve_log_destination(log_file: Option<&std::path::Path>) -> std::io::Result<LogDestination> {
     match log_file {
         Some(path) => {
             let file = std::fs::OpenOptions::new()
@@ -140,9 +137,7 @@ fn init_tracing(log_file: Option<&std::path::Path>) -> std::io::Result<()> {
                 .init();
         }
         LogDestination::Stderr => {
-            tracing_subscriber::fmt()
-                .with_env_filter(env_filter)
-                .init();
+            tracing_subscriber::fmt().with_env_filter(env_filter).init();
         }
     }
     Ok(())
@@ -245,9 +240,11 @@ async fn create_session(
             }
         }
     } else {
-        req.repo.as_ref().map(|repo_url| sandbox_core::WorkspaceMode::Clone {
-            repo_url: repo_url.clone(),
-        })
+        req.repo
+            .as_ref()
+            .map(|repo_url| sandbox_core::WorkspaceMode::Clone {
+                repo_url: repo_url.clone(),
+            })
     };
 
     let config = SessionConfig {
@@ -281,10 +278,8 @@ async fn create_session(
             }
             Err(e) => {
                 let _ = state.store.update_state(&session_id, SessionState::Error);
-                return error_response(SandboxError::Internal(format!(
-                    "task join error: {e}"
-                )))
-                .into_response();
+                return error_response(SandboxError::Internal(format!("task join error: {e}")))
+                    .into_response();
             }
         }
     };
@@ -292,25 +287,22 @@ async fn create_session(
     let network_info = {
         let network = state.network.clone();
         let sid = session_id;
-        match tokio::task::spawn_blocking(move || network.create_network(&sid))
-            .await
-        {
+        match tokio::task::spawn_blocking(move || network.create_network(&sid)).await {
             Ok(Ok(info)) => info,
             Ok(Err(e)) => {
                 let base_dir = state.base_dir.clone();
                 let sid = session_id;
                 let _ = tokio::task::spawn_blocking(move || {
                     CaManager::remove_session_ca(&base_dir, &sid)
-                }).await;
+                })
+                .await;
                 let _ = state.store.update_state(&session_id, SessionState::Error);
                 return error_response(e).into_response();
             }
             Err(e) => {
                 let _ = state.store.update_state(&session_id, SessionState::Error);
-                return error_response(SandboxError::Internal(format!(
-                    "task join error: {e}"
-                )))
-                .into_response();
+                return error_response(SandboxError::Internal(format!("task join error: {e}")))
+                    .into_response();
             }
         }
     };
@@ -384,7 +376,11 @@ async fn create_session(
                 match tokio::task::spawn_blocking(move || lima_check.check_base_image()).await {
                     Ok(Ok(s)) => s,
                     Ok(Err(e)) => {
-                        cleanup_net_ca_and_return!(state, session_id, error_response(e).into_response());
+                        cleanup_net_ca_and_return!(
+                            state,
+                            session_id,
+                            error_response(e).into_response()
+                        );
                     }
                     Err(e) => {
                         cleanup_net_ca_and_return!(
@@ -458,10 +454,8 @@ async fn create_session(
                     cleanup_net_ca_and_return!(
                         state,
                         session_id,
-                        error_response(SandboxError::Internal(format!(
-                            "task join error: {e}"
-                        )))
-                        .into_response()
+                        error_response(SandboxError::Internal(format!("task join error: {e}")))
+                            .into_response()
                     );
                 }
             }
@@ -487,10 +481,8 @@ async fn create_session(
                     cleanup_and_return!(
                         state,
                         session_id,
-                        error_response(SandboxError::Internal(format!(
-                            "task join error: {e}"
-                        )))
-                        .into_response()
+                        error_response(SandboxError::Internal(format!("task join error: {e}")))
+                            .into_response()
                     );
                 }
             }
@@ -525,10 +517,8 @@ async fn create_session(
                     cleanup_net_ca_and_return!(
                         state,
                         session_id,
-                        error_response(SandboxError::Internal(format!(
-                            "task join error: {e}"
-                        )))
-                        .into_response()
+                        error_response(SandboxError::Internal(format!("task join error: {e}")))
+                            .into_response()
                     );
                 }
             }
@@ -554,10 +544,8 @@ async fn create_session(
                     cleanup_and_return!(
                         state,
                         session_id,
-                        error_response(SandboxError::Internal(format!(
-                            "task join error: {e}"
-                        )))
-                        .into_response()
+                        error_response(SandboxError::Internal(format!("task join error: {e}")))
+                            .into_response()
                     );
                 }
             }
@@ -606,10 +594,8 @@ async fn create_session(
                     cleanup_and_return!(
                         state,
                         session_id,
-                        error_response(SandboxError::Internal(format!(
-                            "task join error: {e}"
-                        )))
-                        .into_response()
+                        error_response(SandboxError::Internal(format!("task join error: {e}")))
+                            .into_response()
                     );
                 }
             }
@@ -622,9 +608,8 @@ async fn create_session(
             info!(%session_id, "guest agent responded to ping");
         }
         Ok(false) => {
-            let err = SandboxError::Internal(
-                "guest agent returned unexpected response to ping".into(),
-            );
+            let err =
+                SandboxError::Internal("guest agent returned unexpected response to ping".into());
             error!(%session_id, "guest agent ping: unexpected response");
             cleanup_and_return!(state, session_id, error_response(err).into_response());
         }
@@ -657,15 +642,23 @@ async fn create_session(
                 Destination::Cidr(_) => None,
             })
             .collect();
-        let config = CoreDnsConfig { allowed_domains: domains };
+        let config = CoreDnsConfig {
+            allowed_domains: domains,
+        };
         initial_dns_policy_owned = config.to_file_content();
         Some(initial_dns_policy_owned.as_str())
     } else {
         Some("# Default allow-all policy (no policy specified)\n*\n")
     };
     match setup_session_networking(
-        &session_id, &network_info, &ca_dir, &state, initial_dns_policy,
-    ).await {
+        &session_id,
+        &network_info,
+        &ca_dir,
+        &state,
+        initial_dns_policy,
+    )
+    .await
+    {
         Ok(()) => {
             info!(%session_id, "session networking configured");
         }
@@ -807,8 +800,9 @@ async fn create_session(
     // Re-fetch the session to get the updated state and timestamp.
     match state.store.get_session(&session_id) {
         Ok(Some(s)) => (StatusCode::CREATED, Json(s)).into_response(),
-        Ok(None) => error_response(SandboxError::SessionNotFound(session_id.to_string()))
-            .into_response(),
+        Ok(None) => {
+            error_response(SandboxError::SessionNotFound(session_id.to_string())).into_response()
+        }
         Err(e) => error_response(e).into_response(),
     }
 }
@@ -834,12 +828,16 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse 
                     // DB says Running but Lima says Stopped => update to Stopped
                     (SessionState::Running, VmStatus::Stopped) => {
                         s.state = SessionState::Stopped;
-                        let _ = state.store.update_state_forced(&s.id, SessionState::Stopped);
+                        let _ = state
+                            .store
+                            .update_state_forced(&s.id, SessionState::Stopped);
                     }
                     // DB says Stopped but Lima says Running => update to Running
                     (SessionState::Stopped, VmStatus::Running) => {
                         s.state = SessionState::Running;
-                        let _ = state.store.update_state_forced(&s.id, SessionState::Running);
+                        let _ = state
+                            .store
+                            .update_state_forced(&s.id, SessionState::Running);
                     }
                     _ => {}
                 }
@@ -891,9 +889,7 @@ async fn get_session(
 ) -> impl IntoResponse {
     let session = match state.store.get_session_by_name_or_id(&id) {
         Ok(Some(s)) => s,
-        Ok(None) => {
-            return error_response(SandboxError::SessionNotFound(id)).into_response()
-        }
+        Ok(None) => return error_response(SandboxError::SessionNotFound(id)).into_response(),
         Err(e) => return error_response(e).into_response(),
     };
 
@@ -902,17 +898,19 @@ async fn get_session(
     {
         let lima = state.lima.clone();
         let sid = session.id;
-        if let Ok(Ok(vm_status)) =
-            tokio::task::spawn_blocking(move || lima.vm_status(&sid)).await
-        {
+        if let Ok(Ok(vm_status)) = tokio::task::spawn_blocking(move || lima.vm_status(&sid)).await {
             match (&session.state, &vm_status) {
                 (SessionState::Running, VmStatus::Stopped) => {
                     session.state = SessionState::Stopped;
-                    let _ = state.store.update_state_forced(&session.id, SessionState::Stopped);
+                    let _ = state
+                        .store
+                        .update_state_forced(&session.id, SessionState::Stopped);
                 }
                 (SessionState::Stopped, VmStatus::Running) => {
                     session.state = SessionState::Running;
-                    let _ = state.store.update_state_forced(&session.id, SessionState::Running);
+                    let _ = state
+                        .store
+                        .update_state_forced(&session.id, SessionState::Running);
                 }
                 _ => {}
             }
@@ -946,8 +944,7 @@ async fn get_session(
         None
     };
 
-    let response =
-        SessionResponse::from_session_with_status(session, agent_status, gateway_status);
+    let response = SessionResponse::from_session_with_status(session, agent_status, gateway_status);
     (StatusCode::OK, Json(response)).into_response()
 }
 
@@ -957,9 +954,7 @@ async fn start_session(
 ) -> impl IntoResponse {
     let session = match state.store.get_session_by_name_or_id(&id) {
         Ok(Some(s)) => s,
-        Ok(None) => {
-            return error_response(SandboxError::SessionNotFound(id)).into_response()
-        }
+        Ok(None) => return error_response(SandboxError::SessionNotFound(id)).into_response(),
         Err(e) => return error_response(e).into_response(),
     };
 
@@ -979,9 +974,7 @@ async fn start_session(
     let (bridge_name, vm_mac) = {
         let network = state.network.clone();
         let sid = session.id;
-        match tokio::task::spawn_blocking(move || network.ensure_network(&sid))
-            .await
-        {
+        match tokio::task::spawn_blocking(move || network.ensure_network(&sid)).await {
             Ok(Ok(info)) => {
                 let mac = mac_from_session_id(&session.id);
                 (Some(info.bridge_name), Some(mac))
@@ -1026,10 +1019,8 @@ async fn start_session(
             }
             Err(e) => {
                 let _ = state.store.update_state(&session.id, SessionState::Error);
-                return error_response(SandboxError::Internal(format!(
-                    "task join error: {e}"
-                )))
-                .into_response();
+                return error_response(SandboxError::Internal(format!("task join error: {e}")))
+                    .into_response();
             }
         }
     }
@@ -1076,8 +1067,9 @@ async fn start_session(
     // Re-fetch the session to get the updated state and timestamp.
     match state.store.get_session(&session.id) {
         Ok(Some(s)) => (StatusCode::OK, Json(s)).into_response(),
-        Ok(None) => error_response(SandboxError::SessionNotFound(session.id.to_string()))
-            .into_response(),
+        Ok(None) => {
+            error_response(SandboxError::SessionNotFound(session.id.to_string())).into_response()
+        }
         Err(e) => error_response(e).into_response(),
     }
 }
@@ -1088,9 +1080,7 @@ async fn stop_session(
 ) -> impl IntoResponse {
     let session = match state.store.get_session_by_name_or_id(&id) {
         Ok(Some(s)) => s,
-        Ok(None) => {
-            return error_response(SandboxError::SessionNotFound(id)).into_response()
-        }
+        Ok(None) => return error_response(SandboxError::SessionNotFound(id)).into_response(),
         Err(e) => return error_response(e).into_response(),
     };
 
@@ -1130,15 +1120,14 @@ async fn stop_session(
             if let Err(e) = network.remove_docker_network(&sid) {
                 warn!(%sid, error = %e, "failed to remove Docker network (best-effort)");
             }
-        }).await;
+        })
+        .await;
     }
 
     {
         let lima = state.lima.clone();
         let sid = session.id;
-        match tokio::task::spawn_blocking(move || lima.stop_vm(&sid))
-            .await
-        {
+        match tokio::task::spawn_blocking(move || lima.stop_vm(&sid)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 state.sessions_stopping.lock().await.remove(&session.id);
@@ -1148,10 +1137,8 @@ async fn stop_session(
             Err(e) => {
                 state.sessions_stopping.lock().await.remove(&session.id);
                 let _ = state.store.update_state(&session.id, SessionState::Error);
-                return error_response(SandboxError::Internal(format!(
-                    "task join error: {e}"
-                )))
-                .into_response();
+                return error_response(SandboxError::Internal(format!("task join error: {e}")))
+                    .into_response();
             }
         }
     }
@@ -1167,8 +1154,9 @@ async fn stop_session(
 
     match state.store.get_session(&session.id) {
         Ok(Some(s)) => (StatusCode::OK, Json(s)).into_response(),
-        Ok(None) => error_response(SandboxError::SessionNotFound(session.id.to_string()))
-            .into_response(),
+        Ok(None) => {
+            error_response(SandboxError::SessionNotFound(session.id.to_string())).into_response()
+        }
         Err(e) => error_response(e).into_response(),
     }
 }
@@ -1179,9 +1167,7 @@ async fn remove_session(
 ) -> impl IntoResponse {
     let session = match state.store.get_session_by_name_or_id(&id) {
         Ok(Some(s)) => s,
-        Ok(None) => {
-            return error_response(SandboxError::SessionNotFound(id)).into_response()
-        }
+        Ok(None) => return error_response(SandboxError::SessionNotFound(id)).into_response(),
         Err(e) => return error_response(e).into_response(),
     };
 
@@ -1226,7 +1212,8 @@ async fn remove_session(
             if let Err(e) = CaManager::remove_session_ca(&base_dir, &sid) {
                 warn!(%sid, error = %e, "failed to remove session CA (best-effort)");
             }
-        }).await;
+        })
+        .await;
     }
 
     // Remove from the stopping set now that teardown is complete.
@@ -1248,9 +1235,7 @@ async fn exec_in_session(
 ) -> impl IntoResponse {
     let session = match state.store.get_session_by_name_or_id(&id) {
         Ok(Some(s)) => s,
-        Ok(None) => {
-            return error_response(SandboxError::SessionNotFound(id)).into_response()
-        }
+        Ok(None) => return error_response(SandboxError::SessionNotFound(id)).into_response(),
         Err(e) => return error_response(e).into_response(),
     };
 
@@ -1313,9 +1298,7 @@ async fn upload_to_session(
 ) -> impl IntoResponse {
     let session = match state.store.get_session_by_name_or_id(&id) {
         Ok(Some(s)) => s,
-        Ok(None) => {
-            return error_response(SandboxError::SessionNotFound(id)).into_response()
-        }
+        Ok(None) => return error_response(SandboxError::SessionNotFound(id)).into_response(),
         Err(e) => return error_response(e).into_response(),
     };
 
@@ -1348,10 +1331,8 @@ async fn upload_to_session(
                 (StatusCode::OK, Json(body)).into_response()
             } else {
                 let msg = error.unwrap_or_else(|| "unknown error".into());
-                error_response(SandboxError::Internal(format!(
-                    "file upload failed: {msg}"
-                )))
-                .into_response()
+                error_response(SandboxError::Internal(format!("file upload failed: {msg}")))
+                    .into_response()
             }
         }
         Ok(GuestResponse::Error { message }) => {
@@ -1383,9 +1364,7 @@ async fn download_from_session(
 ) -> impl IntoResponse {
     let session = match state.store.get_session_by_name_or_id(&id) {
         Ok(Some(s)) => s,
-        Ok(None) => {
-            return error_response(SandboxError::SessionNotFound(id)).into_response()
-        }
+        Ok(None) => return error_response(SandboxError::SessionNotFound(id)).into_response(),
         Err(e) => return error_response(e).into_response(),
     };
 
@@ -1451,9 +1430,7 @@ async fn update_policy(
 ) -> impl IntoResponse {
     let session = match state.store.get_session_by_name_or_id(&id) {
         Ok(Some(s)) => s,
-        Ok(None) => {
-            return error_response(SandboxError::SessionNotFound(id)).into_response()
-        }
+        Ok(None) => return error_response(SandboxError::SessionNotFound(id)).into_response(),
         Err(e) => return error_response(e).into_response(),
     };
 
@@ -1488,14 +1465,11 @@ async fn apply_policy(
     state: &AppState,
 ) -> Result<(), SandboxError> {
     // Look up network info for this session.
-    let network_info = state
-        .store
-        .get_network_info(session_id)?
-        .ok_or_else(|| {
-            SandboxError::Internal(format!(
-                "no network info for session {session_id} (networking not configured)"
-            ))
-        })?;
+    let network_info = state.store.get_network_info(session_id)?.ok_or_else(|| {
+        SandboxError::Internal(format!(
+            "no network info for session {session_id} (networking not configured)"
+        ))
+    })?;
 
     // Compile the policy.
     let compiled = PolicyCompiler::compile(policy, &network_info)?;
@@ -1616,9 +1590,7 @@ async fn dns_propagation_loop(
 
         // Read resolved.json from the gateway container.
         let sid = session_id;
-        let report = match tokio::task::spawn_blocking(move || {
-            read_resolved_json(&sid)
-        }).await {
+        let report = match tokio::task::spawn_blocking(move || read_resolved_json(&sid)).await {
             Ok(Ok(r)) => r,
             Ok(Err(e)) => {
                 warn!(
@@ -1676,9 +1648,9 @@ async fn dns_propagation_loop(
         let c = cache.clone();
         let ni = network_info.clone();
         let sid = session_id;
-        let propagate_result = tokio::task::spawn_blocking(move || {
-            propagate_dns_changes(&sid, &pol, &c, &gw, &ni)
-        }).await;
+        let propagate_result =
+            tokio::task::spawn_blocking(move || propagate_dns_changes(&sid, &pol, &c, &gw, &ni))
+                .await;
         match propagate_result {
             Ok(Err(e)) => {
                 warn!(
@@ -1717,9 +1689,8 @@ async fn inject_ca_into_vm(
     session_id: &SessionId,
     ca_dir: &std::path::Path,
 ) -> Result<(), SandboxError> {
-    let cert_pem = std::fs::read_to_string(ca_dir.join("cert.pem")).map_err(|e| {
-        SandboxError::Ca(format!("failed to read CA cert for injection: {e}"))
-    })?;
+    let cert_pem = std::fs::read_to_string(ca_dir.join("cert.pem"))
+        .map_err(|e| SandboxError::Ca(format!("failed to read CA cert for injection: {e}")))?;
     let inject_script = generate_ca_inject_script(&cert_pem);
 
     info!(session_id = %session_id, "injecting CA certificate into VM");
@@ -1810,9 +1781,7 @@ async fn setup_session_networking(
     }
 
     // 2. Configure the bridge NIC inside the VM (already present from boot).
-    if let Err(e) =
-        attach_vm_to_bridge(session_id, network_info, &state.guest).await
-    {
+    if let Err(e) = attach_vm_to_bridge(session_id, network_info, &state.guest).await {
         // Roll back gateway on attach failure.
         let gw = state.gateway.clone();
         let sid = *session_id;
@@ -1857,7 +1826,8 @@ async fn teardown_session_networking(session_id: &SessionId, state: &AppState) {
         if let Err(e) = network.remove_docker_network(&sid) {
             warn!(%sid, error = %e, "failed to remove Docker network (best-effort)");
         }
-    }).await;
+    })
+    .await;
 }
 
 /// Re-apply the session's policy to a freshly created gateway container.
@@ -1988,17 +1958,13 @@ async fn restore_session_networking(
                 // Roll back the Docker network on gateway failure.
                 let net = state.network.clone();
                 let sid = *session_id;
-                let _ = tokio::task::spawn_blocking(move || {
-                    net.remove_docker_network(&sid)
-                }).await;
+                let _ = tokio::task::spawn_blocking(move || net.remove_docker_network(&sid)).await;
                 return Err(e);
             }
             Err(e) => {
                 let net = state.network.clone();
                 let sid = *session_id;
-                let _ = tokio::task::spawn_blocking(move || {
-                    net.remove_docker_network(&sid)
-                }).await;
+                let _ = tokio::task::spawn_blocking(move || net.remove_docker_network(&sid)).await;
                 return Err(SandboxError::Internal(format!(
                     "task join error creating gateway: {e}"
                 )));
@@ -2013,9 +1979,7 @@ async fn restore_session_networking(
     reapply_session_policy(session_id, state).await;
 
     // 3. Configure the bridge NIC inside the VM (already present from boot).
-    if let Err(e) =
-        attach_vm_to_bridge(session_id, &network_info, &state.guest).await
-    {
+    if let Err(e) = attach_vm_to_bridge(session_id, &network_info, &state.guest).await {
         // Roll back gateway and Docker network on attach failure.
         let gw = state.gateway.clone();
         let net = state.network.clone();
@@ -2023,7 +1987,8 @@ async fn restore_session_networking(
         let _ = tokio::task::spawn_blocking(move || {
             let _ = gw.stop_gateway(&sid);
             net.remove_docker_network(&sid)
-        }).await;
+        })
+        .await;
         return Err(e);
     }
 
@@ -2052,9 +2017,7 @@ async fn session_health(
 ) -> impl IntoResponse {
     let session = match state.store.get_session_by_name_or_id(&id) {
         Ok(Some(s)) => s,
-        Ok(None) => {
-            return error_response(SandboxError::SessionNotFound(id)).into_response()
-        }
+        Ok(None) => return error_response(SandboxError::SessionNotFound(id)).into_response(),
         Err(e) => return error_response(e).into_response(),
     };
 
@@ -2090,45 +2053,44 @@ async fn session_health(
     };
 
     // Gateway health.
-    let (container_status, envoy, mitmproxy, coredns) =
-        if session.state == SessionState::Running {
-            let gateway = state.gateway.clone();
-            let sid = session.id;
-            let gw_result = tokio::task::spawn_blocking(move || gateway.gateway_status(&sid))
-                .await
-                .unwrap_or_else(|e| Err(SandboxError::Internal(format!("task join error: {e}"))));
-            match gw_result {
-                Ok(GatewayStatus::Healthy) => (
-                    "running".to_string(),
-                    "healthy".to_string(),
-                    "healthy".to_string(),
-                    "healthy".to_string(),
-                ),
-                Ok(GatewayStatus::Unhealthy(reason)) => (
-                    "running".to_string(),
-                    "unknown".to_string(),
-                    "unknown".to_string(),
-                    format!("unhealthy: {reason}"),
-                ),
-                Ok(GatewayStatus::NotRunning) => (
-                    "not_running".to_string(),
-                    "not_running".to_string(),
-                    "not_running".to_string(),
-                    "not_running".to_string(),
-                ),
-                Err(e) => {
-                    let msg = format!("error: {e}");
-                    (msg.clone(), msg.clone(), msg.clone(), msg)
-                }
+    let (container_status, envoy, mitmproxy, coredns) = if session.state == SessionState::Running {
+        let gateway = state.gateway.clone();
+        let sid = session.id;
+        let gw_result = tokio::task::spawn_blocking(move || gateway.gateway_status(&sid))
+            .await
+            .unwrap_or_else(|e| Err(SandboxError::Internal(format!("task join error: {e}"))));
+        match gw_result {
+            Ok(GatewayStatus::Healthy) => (
+                "running".to_string(),
+                "healthy".to_string(),
+                "healthy".to_string(),
+                "healthy".to_string(),
+            ),
+            Ok(GatewayStatus::Unhealthy(reason)) => (
+                "running".to_string(),
+                "unknown".to_string(),
+                "unknown".to_string(),
+                format!("unhealthy: {reason}"),
+            ),
+            Ok(GatewayStatus::NotRunning) => (
+                "not_running".to_string(),
+                "not_running".to_string(),
+                "not_running".to_string(),
+                "not_running".to_string(),
+            ),
+            Err(e) => {
+                let msg = format!("error: {e}");
+                (msg.clone(), msg.clone(), msg.clone(), msg)
             }
-        } else {
-            (
-                "not_checked".to_string(),
-                "not_checked".to_string(),
-                "not_checked".to_string(),
-                "not_checked".to_string(),
-            )
-        };
+        }
+    } else {
+        (
+            "not_checked".to_string(),
+            "not_checked".to_string(),
+            "not_checked".to_string(),
+            "not_checked".to_string(),
+        )
+    };
 
     // Network health: check if the Docker bridge exists.
     // TAP devices are now managed by QEMU via qemu-bridge-helper and are
@@ -2180,9 +2142,7 @@ async fn rebuild_image(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     match tokio::task::spawn_blocking(move || lima.rebuild_base_image()).await {
         Ok(Ok(())) => (StatusCode::OK, "base image rebuilt").into_response(),
         Ok(Err(e)) => error_response(e).into_response(),
-        Err(e) => {
-            error_response(SandboxError::Internal(format!("task join: {e}"))).into_response()
-        }
+        Err(e) => error_response(SandboxError::Internal(format!("task join: {e}"))).into_response(),
     }
 }
 
@@ -2204,9 +2164,7 @@ async fn base_image_status(State(state): State<Arc<AppState>>) -> impl IntoRespo
             (StatusCode::OK, Json(json)).into_response()
         }
         Ok(Err(e)) => error_response(e).into_response(),
-        Err(e) => {
-            error_response(SandboxError::Internal(format!("task join: {e}"))).into_response()
-        }
+        Err(e) => error_response(SandboxError::Internal(format!("task join: {e}"))).into_response(),
     }
 }
 
@@ -2299,31 +2257,29 @@ fn reconcile(store: &SessionStore, lima: &LimaManager) {
                 ok_count += 1;
             }
             // VM exists
-            (Some(vm_info), _) => {
-                match (&session.state, &vm_info.status) {
-                    (SessionState::Running, VmStatus::Running) => ok_count += 1,
-                    (SessionState::Stopped, VmStatus::Stopped) => ok_count += 1,
-                    (SessionState::Running, VmStatus::Stopped) => {
-                        info!(
-                            session_id = %session.id,
-                            "reconciliation: VM stopped but session says Running, updating to Stopped"
-                        );
-                        let _ = store.update_state_forced(&session.id, SessionState::Stopped);
-                        fixed_count += 1;
-                    }
-                    (SessionState::Stopped, VmStatus::Running) => {
-                        info!(
-                            session_id = %session.id,
-                            "reconciliation: VM running but session says Stopped, updating to Running"
-                        );
-                        let _ = store.update_state_forced(&session.id, SessionState::Running);
-                        fixed_count += 1;
-                    }
-                    _ => {
-                        ok_count += 1;
-                    }
+            (Some(vm_info), _) => match (&session.state, &vm_info.status) {
+                (SessionState::Running, VmStatus::Running) => ok_count += 1,
+                (SessionState::Stopped, VmStatus::Stopped) => ok_count += 1,
+                (SessionState::Running, VmStatus::Stopped) => {
+                    info!(
+                        session_id = %session.id,
+                        "reconciliation: VM stopped but session says Running, updating to Stopped"
+                    );
+                    let _ = store.update_state_forced(&session.id, SessionState::Stopped);
+                    fixed_count += 1;
                 }
-            }
+                (SessionState::Stopped, VmStatus::Running) => {
+                    info!(
+                        session_id = %session.id,
+                        "reconciliation: VM running but session says Stopped, updating to Running"
+                    );
+                    let _ = store.update_state_forced(&session.id, SessionState::Running);
+                    fixed_count += 1;
+                }
+                _ => {
+                    ok_count += 1;
+                }
+            },
         }
     }
 
@@ -2371,9 +2327,8 @@ async fn reconcile_networking(state: &AppState) {
                 // Check if gateway is running.
                 let gw = Arc::clone(&state.gateway);
                 let sid = session.id;
-                let status_result = tokio::task::spawn_blocking(move || {
-                    gw.gateway_status(&sid)
-                }).await;
+                let status_result =
+                    tokio::task::spawn_blocking(move || gw.gateway_status(&sid)).await;
                 let gw_status = match status_result {
                     Ok(Ok(s)) => s,
                     Ok(Err(e)) => {
@@ -2405,32 +2360,30 @@ async fn reconcile_networking(state: &AppState) {
                             "network reconciliation: gateway not healthy, attempting restart"
                         );
 
-                        let network_info =
-                            match state.store.get_network_info(&session.id) {
-                                Ok(Some(info)) => info,
-                                Ok(None) => {
-                                    warn!(
-                                        session_id = %session.id,
-                                        "network reconciliation: no network info, skipping"
-                                    );
-                                    continue;
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        session_id = %session.id,
-                                        error = %e,
-                                        "network reconciliation: failed to get network info"
-                                    );
-                                    continue;
-                                }
-                            };
+                        let network_info = match state.store.get_network_info(&session.id) {
+                            Ok(Some(info)) => info,
+                            Ok(None) => {
+                                warn!(
+                                    session_id = %session.id,
+                                    "network reconciliation: no network info, skipping"
+                                );
+                                continue;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    session_id = %session.id,
+                                    error = %e,
+                                    "network reconciliation: failed to get network info"
+                                );
+                                continue;
+                            }
+                        };
 
                         // Ensure Docker network exists.
                         let net = Arc::clone(&state.network);
                         let sid = session.id;
-                        let ensure_result = tokio::task::spawn_blocking(move || {
-                            net.ensure_network(&sid)
-                        }).await;
+                        let ensure_result =
+                            tokio::task::spawn_blocking(move || net.ensure_network(&sid)).await;
                         match ensure_result {
                             Ok(Err(e)) => {
                                 warn!(
@@ -2488,7 +2441,8 @@ async fn reconcile_networking(state: &AppState) {
                                 ca_owned.as_deref(),
                                 init_dns_owned.as_deref(),
                             )
-                        }).await;
+                        })
+                        .await;
                         match restart_result {
                             Ok(Err(e)) => {
                                 warn!(
@@ -2521,9 +2475,8 @@ async fn reconcile_networking(state: &AppState) {
                 // Ensure lingering gateway and TAP are cleaned up.
                 let gw = Arc::clone(&state.gateway);
                 let sid = session.id;
-                let status_result = tokio::task::spawn_blocking(move || {
-                    gw.gateway_status(&sid)
-                }).await;
+                let status_result =
+                    tokio::task::spawn_blocking(move || gw.gateway_status(&sid)).await;
                 match status_result {
                     Ok(Ok(GatewayStatus::NotRunning)) => {
                         // Already clean.
@@ -2535,9 +2488,7 @@ async fn reconcile_networking(state: &AppState) {
                         );
                         let gw = Arc::clone(&state.gateway);
                         let sid = session.id;
-                        let _ = tokio::task::spawn_blocking(move || {
-                            gw.stop_gateway(&sid)
-                        }).await;
+                        let _ = tokio::task::spawn_blocking(move || gw.stop_gateway(&sid)).await;
                         cleaned += 1;
                     }
                     Ok(Err(_)) | Err(_) => {
@@ -2547,9 +2498,7 @@ async fn reconcile_networking(state: &AppState) {
 
                 // Best-effort TAP cleanup (no-op: TAP is owned by QEMU).
                 let sid = session.id;
-                let _ = tokio::task::spawn_blocking(move || {
-                    detach_vm_from_bridge(&sid)
-                }).await;
+                let _ = tokio::task::spawn_blocking(move || detach_vm_from_bridge(&sid)).await;
             }
             _ => {}
         }
@@ -2605,9 +2554,7 @@ async fn gateway_monitor(state: Arc<AppState>) {
 
             let gw = Arc::clone(&state.gateway);
             let sid = session.id;
-            let status_result = tokio::task::spawn_blocking(move || {
-                gw.gateway_status(&sid)
-            }).await;
+            let status_result = tokio::task::spawn_blocking(move || gw.gateway_status(&sid)).await;
             let status = match status_result {
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
@@ -2661,9 +2608,8 @@ async fn gateway_monitor(state: Arc<AppState>) {
                     // Ensure Docker network is present.
                     let net = Arc::clone(&state.network);
                     let sid = session.id;
-                    let ensure_result = tokio::task::spawn_blocking(move || {
-                        net.ensure_network(&sid)
-                    }).await;
+                    let ensure_result =
+                        tokio::task::spawn_blocking(move || net.ensure_network(&sid)).await;
                     match ensure_result {
                         Ok(Err(e)) => {
                             warn!(
@@ -2717,7 +2663,8 @@ async fn gateway_monitor(state: Arc<AppState>) {
                             ca_owned.as_deref(),
                             init_dns_owned.as_deref(),
                         )
-                    }).await;
+                    })
+                    .await;
                     match restart_result {
                         Ok(Ok(())) => {
                             info!(
@@ -2856,10 +2803,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn shutdown_signal() {
     use tokio::signal::unix::{SignalKind, signal};
 
-    let mut sigterm =
-        signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
-    let mut sigint =
-        signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
 
     tokio::select! {
         _ = sigterm.recv() => {
@@ -2988,8 +2933,7 @@ mod tests {
     fn error_response_body_serializes_as_api_error_json() {
         // Use a Network variant since it passes the raw inner string
         // (no Display prefix), making the assertion straightforward.
-        let (_, Json(body)) =
-            error_response(SandboxError::Network("test message".into()));
+        let (_, Json(body)) = error_response(SandboxError::Network("test message".into()));
         let json = serde_json::to_value(&body).expect("failed to serialize ApiError");
         assert_eq!(
             json.get("error").and_then(|v| v.as_str()),
@@ -3012,16 +2956,28 @@ mod tests {
         // err.to_string(), so the body should NOT contain the "network error:"
         // prefix that the Display impl adds.
         let (_, body) = error_body(SandboxError::Network("oops".into()));
-        assert_eq!(body.error, "oops", "Network body should be the raw inner message");
+        assert_eq!(
+            body.error, "oops",
+            "Network body should be the raw inner message"
+        );
 
         let (_, body) = error_body(SandboxError::Ca("oops".into()));
-        assert_eq!(body.error, "oops", "Ca body should be the raw inner message");
+        assert_eq!(
+            body.error, "oops",
+            "Ca body should be the raw inner message"
+        );
 
         let (_, body) = error_body(SandboxError::Gateway("oops".into()));
-        assert_eq!(body.error, "oops", "Gateway body should be the raw inner message");
+        assert_eq!(
+            body.error, "oops",
+            "Gateway body should be the raw inner message"
+        );
 
         let (_, body) = error_body(SandboxError::Lima("oops".into()));
-        assert_eq!(body.error, "oops", "Lima body should be the raw inner message");
+        assert_eq!(
+            body.error, "oops",
+            "Lima body should be the raw inner message"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -3080,8 +3036,7 @@ mod tests {
 
     #[test]
     fn resolve_log_destination_none_returns_stderr() {
-        let dest =
-            resolve_log_destination(None).expect("None should always succeed");
+        let dest = resolve_log_destination(None).expect("None should always succeed");
         assert!(
             matches!(dest, LogDestination::Stderr),
             "expected Stderr when log_file is None"
@@ -3098,8 +3053,7 @@ mod tests {
         // Pre-seed the file with existing content; append mode must preserve it.
         std::fs::write(&path, b"existing-line\n").expect("seed file");
 
-        let dest =
-            resolve_log_destination(Some(&path)).expect("should open existing file");
+        let dest = resolve_log_destination(Some(&path)).expect("should open existing file");
         match dest {
             LogDestination::File(mut f) => {
                 f.write_all(b"new-line\n").expect("write");

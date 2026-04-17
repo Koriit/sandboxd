@@ -48,12 +48,13 @@ impl QmpClient {
     ///
     /// Lima stores QMP sockets at `~/.lima/{vm_name}/qmp.sock`.
     pub fn for_session(session_id: &SessionId) -> Result<Self, SandboxError> {
-        let home = std::env::var("HOME").map_err(|_| {
-            SandboxError::Internal("HOME environment variable not set".into())
-        })?;
+        let home = std::env::var("HOME")
+            .map_err(|_| SandboxError::Internal("HOME environment variable not set".into()))?;
         let vm_name = crate::lima::vm_name(session_id);
-        let socket_path =
-            PathBuf::from(home).join(".lima").join(vm_name).join("qmp.sock");
+        let socket_path = PathBuf::from(home)
+            .join(".lima")
+            .join(vm_name)
+            .join("qmp.sock");
         Ok(Self { socket_path })
     }
 
@@ -153,17 +154,14 @@ impl QmpClient {
     // -- Internal helpers -----------------------------------------------------
 
     /// Connect to the QMP socket and complete the capability negotiation.
-    fn connect_and_negotiate(
-        &self,
-    ) -> Result<BufReader<UnixStream>, SandboxError> {
+    fn connect_and_negotiate(&self) -> Result<BufReader<UnixStream>, SandboxError> {
         let stream = UnixStream::connect_addr(
-            &std::os::unix::net::SocketAddr::from_pathname(&self.socket_path)
-                .map_err(|e| {
-                    SandboxError::Internal(format!(
-                        "invalid QMP socket path {}: {e}",
-                        self.socket_path.display()
-                    ))
-                })?,
+            &std::os::unix::net::SocketAddr::from_pathname(&self.socket_path).map_err(|e| {
+                SandboxError::Internal(format!(
+                    "invalid QMP socket path {}: {e}",
+                    self.socket_path.display()
+                ))
+            })?,
         )
         .or_else(|_| UnixStream::connect(&self.socket_path))
         .map_err(|e| {
@@ -189,10 +187,8 @@ impl QmpClient {
         debug!("QMP greeting received");
 
         // Send qmp_capabilities to enter command mode.
-        let capabilities_cmd =
-            serde_json::json!({ "execute": "qmp_capabilities" });
-        let response =
-            self.send_command(&mut reader, &capabilities_cmd)?;
+        let capabilities_cmd = serde_json::json!({ "execute": "qmp_capabilities" });
+        let response = self.send_command(&mut reader, &capabilities_cmd)?;
         Self::check_qmp_response(&response, "qmp_capabilities")?;
 
         debug!("QMP capabilities negotiated");
@@ -206,25 +202,20 @@ impl QmpClient {
         reader: &mut BufReader<UnixStream>,
         cmd: &serde_json::Value,
     ) -> Result<serde_json::Value, SandboxError> {
-        let cmd_bytes = serde_json::to_vec(cmd).map_err(|e| {
-            SandboxError::Internal(format!(
-                "failed to serialize QMP command: {e}"
-            ))
-        })?;
+        let cmd_bytes = serde_json::to_vec(cmd)
+            .map_err(|e| SandboxError::Internal(format!("failed to serialize QMP command: {e}")))?;
 
         // Get mutable access to the underlying stream for writing.
         let stream = reader.get_mut();
-        stream.write_all(&cmd_bytes).map_err(|e| {
-            SandboxError::Internal(format!("failed to write QMP command: {e}"))
-        })?;
+        stream
+            .write_all(&cmd_bytes)
+            .map_err(|e| SandboxError::Internal(format!("failed to write QMP command: {e}")))?;
         stream.write_all(b"\n").map_err(|e| {
-            SandboxError::Internal(format!(
-                "failed to write QMP command newline: {e}"
-            ))
+            SandboxError::Internal(format!("failed to write QMP command newline: {e}"))
         })?;
-        stream.flush().map_err(|e| {
-            SandboxError::Internal(format!("failed to flush QMP socket: {e}"))
-        })?;
+        stream
+            .flush()
+            .map_err(|e| SandboxError::Internal(format!("failed to flush QMP socket: {e}")))?;
 
         // Read lines until we get a response with "return" or "error".
         // QMP may emit asynchronous event messages between commands; skip them.
@@ -365,13 +356,11 @@ echo "$IFACE configured: {vm_ip}/28 via {gateway_ip}"
 // ---------------------------------------------------------------------------
 
 /// Read a single line of JSON from the QMP socket.
-fn read_qmp_line(
-    reader: &mut BufReader<UnixStream>,
-) -> Result<serde_json::Value, SandboxError> {
+fn read_qmp_line(reader: &mut BufReader<UnixStream>) -> Result<serde_json::Value, SandboxError> {
     let mut line = String::new();
-    reader.read_line(&mut line).map_err(|e| {
-        SandboxError::Internal(format!("failed to read from QMP socket: {e}"))
-    })?;
+    reader
+        .read_line(&mut line)
+        .map_err(|e| SandboxError::Internal(format!("failed to read from QMP socket: {e}")))?;
 
     if line.is_empty() {
         return Err(SandboxError::Internal(
@@ -380,9 +369,7 @@ fn read_qmp_line(
     }
 
     serde_json::from_str(line.trim()).map_err(|e| {
-        SandboxError::Internal(format!(
-            "failed to parse QMP JSON: {e} (line: {line})"
-        ))
+        SandboxError::Internal(format!("failed to parse QMP JSON: {e} (line: {line})"))
     })
 }
 
@@ -612,10 +599,7 @@ mod tests {
     #[test]
     fn test_qmp_client_new() {
         let client = QmpClient::new(PathBuf::from("/tmp/test.sock"));
-        assert_eq!(
-            client.socket_path(),
-            Path::new("/tmp/test.sock")
-        );
+        assert_eq!(client.socket_path(), Path::new("/tmp/test.sock"));
     }
 
     #[test]

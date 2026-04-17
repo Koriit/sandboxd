@@ -95,9 +95,7 @@ async fn handle_request(request: GuestRequest) -> GuestResponse {
         GuestRequest::Ping => GuestResponse::Pong,
         GuestRequest::Exec { command, args } => handle_exec(command, args).await,
         GuestRequest::Status => handle_status().await,
-        GuestRequest::FileUpload { path, data, mode } => {
-            handle_file_upload(path, data, mode).await
-        }
+        GuestRequest::FileUpload { path, data, mode } => handle_file_upload(path, data, mode).await,
         GuestRequest::FileDownload { path } => handle_file_download(path).await,
     }
 }
@@ -140,11 +138,8 @@ async fn handle_exec(command: String, args: Vec<String>) -> GuestResponse {
     // Read stdout, stderr, and wait for the process all concurrently,
     // wrapped in a timeout.
     let result = tokio::time::timeout(EXEC_TIMEOUT, async {
-        let (stdout, stderr, status) = tokio::join!(
-            read_pipe(stdout_pipe),
-            read_pipe(stderr_pipe),
-            child.wait(),
-        );
+        let (stdout, stderr, status) =
+            tokio::join!(read_pipe(stdout_pipe), read_pipe(stderr_pipe), child.wait(),);
         (stdout, stderr, status)
     })
     .await;
@@ -176,9 +171,7 @@ async fn handle_exec(command: String, args: Vec<String>) -> GuestResponse {
 }
 
 /// Read all bytes from an optional async reader.
-async fn read_pipe<R: tokio::io::AsyncRead + Unpin>(
-    pipe: Option<R>,
-) -> Vec<u8> {
+async fn read_pipe<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>) -> Vec<u8> {
     use tokio::io::AsyncReadExt;
     match pipe {
         Some(mut p) => {
@@ -282,9 +275,8 @@ fn validate_path(raw: &str) -> Result<PathBuf, String> {
     // remaining (non-existent) tail components and re-check.
     let resolved = resolve_through_symlinks(&path)?;
     let resolved_str = resolved.to_string_lossy();
-    check_path_allowlist(&resolved_str).map_err(|e| {
-        format!("{e} (after resolving symlinks: {})", resolved_str)
-    })?;
+    check_path_allowlist(&resolved_str)
+        .map_err(|e| format!("{e} (after resolving symlinks: {})", resolved_str))?;
 
     Ok(resolved)
 }
@@ -316,9 +308,8 @@ fn resolve_through_symlinks(path: &PathBuf) -> Result<PathBuf, String> {
     }
 
     // Canonicalize the existing ancestor (resolves symlinks).
-    let canonical_base = std::fs::canonicalize(&existing).map_err(|e| {
-        format!("failed to resolve path: {e}")
-    })?;
+    let canonical_base =
+        std::fs::canonicalize(&existing).map_err(|e| format!("failed to resolve path: {e}"))?;
 
     // Re-append the non-existent tail components.
     let mut result = canonical_base;
@@ -330,11 +321,7 @@ fn resolve_through_symlinks(path: &PathBuf) -> Result<PathBuf, String> {
 }
 
 /// Handle a file upload request: validate path, decode base64, write file.
-async fn handle_file_upload(
-    path: String,
-    data: String,
-    mode: Option<u32>,
-) -> GuestResponse {
+async fn handle_file_upload(path: String, data: String, mode: Option<u32>) -> GuestResponse {
     let file_path = match validate_path(&path) {
         Ok(p) => p,
         Err(e) => {
@@ -381,9 +368,7 @@ async fn handle_file_upload(
         if let Err(e) = tokio::fs::set_permissions(&file_path, perms).await {
             return GuestResponse::FileUploadResult {
                 success: false,
-                error: Some(format!(
-                    "file written but failed to set permissions: {e}"
-                )),
+                error: Some(format!("file written but failed to set permissions: {e}")),
             };
         }
     }
@@ -446,14 +431,10 @@ async fn read_hostname() -> String {
     // Try /etc/hostname first, fall back to `hostname` command.
     match tokio::fs::read_to_string("/etc/hostname").await {
         Ok(s) => s.trim().to_string(),
-        Err(_) => {
-            match Command::new("hostname").output().await {
-                Ok(output) => {
-                    String::from_utf8_lossy(&output.stdout).trim().to_string()
-                }
-                Err(_) => "unknown".to_string(),
-            }
-        }
+        Err(_) => match Command::new("hostname").output().await {
+            Ok(output) => String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            Err(_) => "unknown".to_string(),
+        },
     }
 }
 
@@ -577,10 +558,7 @@ mod tests {
                 load_average: _,
             } => {
                 // Hostname should be non-empty on any reasonable system.
-                assert!(
-                    !hostname.is_empty(),
-                    "hostname should not be empty"
-                );
+                assert!(!hostname.is_empty(), "hostname should not be empty");
             }
             other => panic!("expected StatusResult, got: {other:?}"),
         }
@@ -712,8 +690,9 @@ mod tests {
 
         // Connect as a client and send a Ping.
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let response =
-            send_request_over(&mut stream, &GuestRequest::Ping).await.unwrap();
+        let response = send_request_over(&mut stream, &GuestRequest::Ping)
+            .await
+            .unwrap();
 
         assert!(
             matches!(response, GuestResponse::Pong),
@@ -767,8 +746,9 @@ mod tests {
         });
 
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let response =
-            send_request_over(&mut stream, &GuestRequest::Status).await.unwrap();
+        let response = send_request_over(&mut stream, &GuestRequest::Status)
+            .await
+            .unwrap();
 
         match response {
             GuestResponse::StatusResult {
@@ -803,8 +783,7 @@ mod tests {
                 command: "echo".into(),
                 args: vec![format!("iter-{i}")],
             };
-            let response =
-                send_request_over(&mut stream, &request).await.unwrap();
+            let response = send_request_over(&mut stream, &request).await.unwrap();
 
             match response {
                 GuestResponse::ExecResult { stdout, .. } => {
@@ -872,17 +851,12 @@ mod tests {
         // Create a symlink inside /tmp/ (an allowed dir) that points to
         // /etc/ (a denied dir).  validate_path should reject the path
         // because canonicalization reveals the true destination.
-        let link_path = format!(
-            "/tmp/sandbox-symlink-test-{}",
-            std::process::id()
-        );
+        let link_path = format!("/tmp/sandbox-symlink-test-{}", std::process::id());
         // Clean up any leftover symlink from a previous run.
         let _ = std::fs::remove_file(&link_path);
 
         // Create symlink: /tmp/sandbox-symlink-test-PID -> /etc
-        std::os::unix::fs::symlink("/etc", &link_path).expect(
-            "failed to create test symlink"
-        );
+        std::os::unix::fs::symlink("/etc", &link_path).expect("failed to create test symlink");
 
         // Accessing a file "through" the symlink should fail even though
         // the literal path starts with /tmp/.
@@ -905,9 +879,7 @@ mod tests {
         let _ = std::fs::remove_file(&link_path);
         let _ = std::fs::create_dir_all(&target_dir);
 
-        std::os::unix::fs::symlink(&target_dir, &link_path).expect(
-            "failed to create test symlink"
-        );
+        std::os::unix::fs::symlink(&target_dir, &link_path).expect("failed to create test symlink");
 
         let result = validate_path(&format!("{link_path}/file.txt"));
         assert!(
@@ -930,12 +902,7 @@ mod tests {
 
         // Upload.
         let data = BASE64.encode(b"hello from upload test");
-        let response = handle_file_upload(
-            path.clone(),
-            data,
-            Some(0o644),
-        )
-        .await;
+        let response = handle_file_upload(path.clone(), data, Some(0o644)).await;
 
         match response {
             GuestResponse::FileUploadResult { success, error } => {
@@ -984,12 +951,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_file_upload_path_denied() {
-        let response = handle_file_upload(
-            "/etc/malicious".into(),
-            BASE64.encode(b"bad"),
-            None,
-        )
-        .await;
+        let response =
+            handle_file_upload("/etc/malicious".into(), BASE64.encode(b"bad"), None).await;
 
         match response {
             GuestResponse::FileUploadResult { success, error } => {
@@ -1003,8 +966,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_file_download_nonexistent() {
         let response =
-            handle_file_download("/tmp/nonexistent-file-that-does-not-exist-12345".into())
-                .await;
+            handle_file_download("/tmp/nonexistent-file-that-does-not-exist-12345".into()).await;
 
         match response {
             GuestResponse::FileDownloadResult { data, error } => {
@@ -1100,5 +1062,4 @@ mod tests {
         let _ = tokio::fs::remove_file(&test_path).await;
         server.await.unwrap();
     }
-
 }

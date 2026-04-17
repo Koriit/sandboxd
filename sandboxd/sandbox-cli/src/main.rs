@@ -292,7 +292,9 @@ fn build_request(command: &Command) -> Option<Request<String>> {
             .expect("failed to build request"),
         Command::Exec { session, command } => {
             if command.is_empty() {
-                eprintln!("Error: exec requires a command. Usage: sandbox exec <session> -- <command> [args...]");
+                eprintln!(
+                    "Error: exec requires a command. Usage: sandbox exec <session> -- <command> [args...]"
+                );
                 process::exit(1);
             }
             let cmd = &command[0];
@@ -398,14 +400,8 @@ fn display_sessions_table(sessions: &[SessionResponse]) {
     for session in sessions {
         let name = session.name.as_deref().unwrap_or("-");
         let state = session.state.to_string();
-        let agent = session
-            .guest_agent_status
-            .as_deref()
-            .unwrap_or("-");
-        let gateway = session
-            .gateway_status
-            .as_deref()
-            .unwrap_or("-");
+        let agent = session.guest_agent_status.as_deref().unwrap_or("-");
+        let gateway = session.gateway_status.as_deref().unwrap_or("-");
         let created = format_relative_time(&session.created_at);
 
         println!(
@@ -424,8 +420,16 @@ fn display_session(session: &Session) {
     println!("CPUs:     {}", session.config.cpus);
     println!("Memory:   {} MB", session.config.memory_mb);
     println!("Disk:     {} GB", session.config.disk_gb);
-    println!("Created:  {} ({})", session.created_at.format("%Y-%m-%d %H:%M:%S UTC"), format_relative_time(&session.created_at));
-    println!("Updated:  {} ({})", session.updated_at.format("%Y-%m-%d %H:%M:%S UTC"), format_relative_time(&session.updated_at));
+    println!(
+        "Created:  {} ({})",
+        session.created_at.format("%Y-%m-%d %H:%M:%S UTC"),
+        format_relative_time(&session.created_at)
+    );
+    println!(
+        "Updated:  {} ({})",
+        session.updated_at.format("%Y-%m-%d %H:%M:%S UTC"),
+        format_relative_time(&session.updated_at)
+    );
 }
 
 /// Maximum time to wait for the daemon to respond to an HTTP request.
@@ -433,7 +437,6 @@ fn display_session(session: &Session) {
 /// Session creation involves VM boot, guest agent install, and networking
 /// setup, so this must be generous.
 const CLI_HTTP_TIMEOUT: Duration = Duration::from_secs(600);
-
 
 async fn send_request(
     socket_path: &str,
@@ -509,8 +512,8 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
 
     match command {
         Command::Ps | Command::Ls => {
-            let sessions: Vec<SessionResponse> = serde_json::from_str(body)
-                .map_err(|e| format!("failed to parse response: {e}"))?;
+            let sessions: Vec<SessionResponse> =
+                serde_json::from_str(body).map_err(|e| format!("failed to parse response: {e}"))?;
             display_sessions_table(&sessions);
         }
         Command::Rm { .. } => {
@@ -518,20 +521,20 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
             println!("Session removed.");
         }
         Command::Create { .. } => {
-            let session: Session = serde_json::from_str(body)
-                .map_err(|e| format!("failed to parse response: {e}"))?;
+            let session: Session =
+                serde_json::from_str(body).map_err(|e| format!("failed to parse response: {e}"))?;
             println!("Session created:");
             display_session(&session);
         }
         Command::Start { .. } => {
-            let session: Session = serde_json::from_str(body)
-                .map_err(|e| format!("failed to parse response: {e}"))?;
+            let session: Session =
+                serde_json::from_str(body).map_err(|e| format!("failed to parse response: {e}"))?;
             println!("Session started:");
             display_session(&session);
         }
         Command::Stop { .. } => {
-            let session: Session = serde_json::from_str(body)
-                .map_err(|e| format!("failed to parse response: {e}"))?;
+            let session: Session =
+                serde_json::from_str(body).map_err(|e| format!("failed to parse response: {e}"))?;
             println!("Session stopped:");
             display_session(&session);
         }
@@ -569,8 +572,22 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
             println!("  mitmproxy: {}", health.gateway.mitmproxy);
             println!("  CoreDNS:   {}", health.gateway.coredns);
             println!("Network:");
-            println!("  Bridge:  {}", if health.network.bridge_exists { "exists" } else { "missing" });
-            println!("  TAP:     {}", if health.network.tap_exists { "exists" } else { "missing" });
+            println!(
+                "  Bridge:  {}",
+                if health.network.bridge_exists {
+                    "exists"
+                } else {
+                    "missing"
+                }
+            );
+            println!(
+                "  TAP:     {}",
+                if health.network.tap_exists {
+                    "exists"
+                } else {
+                    "missing"
+                }
+            );
         }
         Command::RebuildImage => {
             eprintln!("Done.");
@@ -774,12 +791,7 @@ async fn handle_cp(socket_path: &str, src: &str, dst: &str) {
 }
 
 /// Upload a local file to a sandbox VM.
-async fn handle_cp_upload(
-    socket_path: &str,
-    local_path: &str,
-    session: &str,
-    remote_path: &str,
-) {
+async fn handle_cp_upload(socket_path: &str, local_path: &str, session: &str, remote_path: &str) {
     // Read the local file.
     let data = match std::fs::read(local_path) {
         Ok(d) => d,
@@ -909,12 +921,7 @@ async fn handle_cp_upload(
 }
 
 /// Download a file from a sandbox VM to the local filesystem.
-async fn handle_cp_download(
-    socket_path: &str,
-    session: &str,
-    remote_path: &str,
-    local_path: &str,
-) {
+async fn handle_cp_download(socket_path: &str, session: &str, remote_path: &str, local_path: &str) {
     let body = serde_json::json!({
         "path": remote_path,
     });
@@ -1197,10 +1204,7 @@ async fn check_base_image_staleness(socket_path: &str) {
     }
 
     let age_days = json.get("age_days").and_then(|v| v.as_u64()).unwrap_or(0);
-    eprintln!(
-        "Warning: base image is {} days old.",
-        age_days
-    );
+    eprintln!("Warning: base image is {} days old.", age_days);
     eprint!("Rebuild before creating session? [y/N] ");
 
     // Read user response from stdin.
@@ -1338,8 +1342,18 @@ mod tests {
     #[test]
     fn parse_create_with_all_options() {
         let cli = Cli::parse_from([
-            "sandbox", "create", "--name", "full", "--cpus", "4", "--memory", "8192", "--disk",
-            "50", "--template", "/tmp/custom.yaml",
+            "sandbox",
+            "create",
+            "--name",
+            "full",
+            "--cpus",
+            "4",
+            "--memory",
+            "8192",
+            "--disk",
+            "50",
+            "--template",
+            "/tmp/custom.yaml",
         ]);
         match &cli.command {
             Command::Create {
@@ -1636,7 +1650,10 @@ mod tests {
         let now = Utc::now();
         let dt = now - chrono::Duration::seconds(30);
         let result = format_relative_time(&dt);
-        assert!(result.contains("s ago"), "expected seconds ago, got: {result}");
+        assert!(
+            result.contains("s ago"),
+            "expected seconds ago, got: {result}"
+        );
     }
 
     #[test]
@@ -1684,13 +1701,7 @@ mod tests {
 
     #[test]
     fn parse_logs_with_component() {
-        let cli = Cli::parse_from([
-            "sandbox",
-            "logs",
-            "my-session",
-            "--component",
-            "envoy",
-        ]);
+        let cli = Cli::parse_from(["sandbox", "logs", "my-session", "--component", "envoy"]);
         match &cli.command {
             Command::Logs {
                 session, component, ..
@@ -1704,18 +1715,9 @@ mod tests {
 
     #[test]
     fn parse_logs_with_follow_and_tail() {
-        let cli = Cli::parse_from([
-            "sandbox",
-            "logs",
-            "my-session",
-            "--follow",
-            "--tail",
-            "50",
-        ]);
+        let cli = Cli::parse_from(["sandbox", "logs", "my-session", "--follow", "--tail", "50"]);
         match &cli.command {
-            Command::Logs {
-                follow, tail, ..
-            } => {
+            Command::Logs { follow, tail, .. } => {
                 assert!(*follow);
                 assert_eq!(*tail, 50);
             }
@@ -1725,13 +1727,7 @@ mod tests {
 
     #[test]
     fn parse_logs_component_mitmproxy() {
-        let cli = Cli::parse_from([
-            "sandbox",
-            "logs",
-            "my-session",
-            "--component",
-            "mitmproxy",
-        ]);
+        let cli = Cli::parse_from(["sandbox", "logs", "my-session", "--component", "mitmproxy"]);
         match &cli.command {
             Command::Logs { component, .. } => {
                 assert!(matches!(component, LogComponent::Mitmproxy));
@@ -1742,13 +1738,7 @@ mod tests {
 
     #[test]
     fn parse_logs_component_coredns() {
-        let cli = Cli::parse_from([
-            "sandbox",
-            "logs",
-            "my-session",
-            "--component",
-            "coredns",
-        ]);
+        let cli = Cli::parse_from(["sandbox", "logs", "my-session", "--component", "coredns"]);
         match &cli.command {
             Command::Logs { component, .. } => {
                 assert!(matches!(component, LogComponent::Coredns));
@@ -1800,10 +1790,11 @@ mod tests {
         ]);
         match &cli.command {
             Command::Policy {
-                action: PolicyAction::Update {
-                    session,
-                    policy_path,
-                },
+                action:
+                    PolicyAction::Update {
+                        session,
+                        policy_path,
+                    },
             } => {
                 assert_eq!(session, "my-session");
                 assert_eq!(policy_path, "/tmp/policy.json");
@@ -1864,12 +1855,7 @@ mod tests {
 
     #[test]
     fn parse_create_with_boot_cmd() {
-        let cli = Cli::parse_from([
-            "sandbox",
-            "create",
-            "--boot-cmd",
-            "npm install",
-        ]);
+        let cli = Cli::parse_from(["sandbox", "create", "--boot-cmd", "npm install"]);
         match &cli.command {
             Command::Create { repo, boot_cmd, .. } => {
                 assert!(repo.is_none());
@@ -1891,10 +1877,7 @@ mod tests {
         ]);
         match &cli.command {
             Command::Create { repo, boot_cmd, .. } => {
-                assert_eq!(
-                    repo.as_deref(),
-                    Some("https://github.com/example/repo.git")
-                );
+                assert_eq!(repo.as_deref(), Some("https://github.com/example/repo.git"));
                 assert_eq!(boot_cmd.as_deref(), Some("make build"));
             }
             _ => panic!("expected Create command"),
@@ -2135,10 +2118,7 @@ mod tests {
         let cli = Cli::parse_from(["sandbox", "create"]);
         match &cli.command {
             Command::Create { no_cache, .. } => {
-                assert!(
-                    !*no_cache,
-                    "no_cache should be false by default"
-                );
+                assert!(!*no_cache, "no_cache should be false by default");
             }
             _ => panic!("expected Create command"),
         }

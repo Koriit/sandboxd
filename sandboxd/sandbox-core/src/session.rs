@@ -49,7 +49,10 @@ impl SessionId {
                 s.len()
             )));
         }
-        if !s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        if !s
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
             return Err(crate::SandboxError::Internal(format!(
                 "invalid session id: must be lowercase hex [0-9a-f], got {s:?}"
             )));
@@ -158,9 +161,7 @@ impl WorkspaceMode {
                 ));
             }
             if !Path::new(path).exists() {
-                return Err(format!(
-                    "shared workspace path does not exist: {path}"
-                ));
+                return Err(format!("shared workspace path does not exist: {path}"));
             }
             Ok(Self::Shared {
                 host_path: path.to_string(),
@@ -314,10 +315,7 @@ impl Session {
     /// - Running -> Stopped | Error
     /// - Stopped -> Running | Error
     /// - Error -> (terminal, no transitions)
-    pub fn transition_to(
-        &mut self,
-        new_state: SessionState,
-    ) -> Result<(), crate::SandboxError> {
+    pub fn transition_to(&mut self, new_state: SessionState) -> Result<(), crate::SandboxError> {
         if !self.state.can_transition_to(new_state) {
             return Err(crate::SandboxError::InvalidState(format!(
                 "cannot transition from {} to {}",
@@ -580,7 +578,8 @@ mod tests {
             let s = id.as_str();
             assert_eq!(s.len(), SessionId::LEN, "id={s}");
             assert!(
-                s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
                 "id {s} must be lowercase hex"
             );
         }
@@ -590,7 +589,10 @@ mod tests {
     fn session_id_generate_uniqueness() {
         let mut seen = std::collections::HashSet::new();
         for _ in 0..1024 {
-            assert!(seen.insert(SessionId::generate()), "collision in 1024 iterations");
+            assert!(
+                seen.insert(SessionId::generate()),
+                "collision in 1024 iterations"
+            );
         }
     }
 

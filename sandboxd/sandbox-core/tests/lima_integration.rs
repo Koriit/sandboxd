@@ -8,7 +8,7 @@
 //! WARNING: This is slow (minutes) -- the VM must download the cloud image
 //! and boot.
 
-use sandbox_core::lima::{vm_name, LimaManager};
+use sandbox_core::lima::{LimaManager, vm_name};
 use sandbox_core::session::{SessionConfig, SessionId};
 
 #[test]

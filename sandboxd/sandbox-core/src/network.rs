@@ -206,12 +206,14 @@ impl NetworkManager {
         &self,
         entries: &[(SessionId, NetworkInfo)],
     ) -> Result<(), SandboxError> {
-        let mut alloc = self.subnet_allocator.lock().map_err(|e| {
-            SandboxError::Internal(format!("lock poisoned: {e}"))
-        })?;
-        let mut nets = self.networks.lock().map_err(|e| {
-            SandboxError::Internal(format!("lock poisoned: {e}"))
-        })?;
+        let mut alloc = self
+            .subnet_allocator
+            .lock()
+            .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
+        let mut nets = self
+            .networks
+            .lock()
+            .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
 
         for (session_id, info) in entries {
             // Parse the subnet base from the CIDR string.
@@ -239,9 +241,10 @@ impl NetworkManager {
     pub fn create_network(&self, session_id: &SessionId) -> Result<NetworkInfo, SandboxError> {
         // Check if the session already has a network.
         {
-            let nets = self.networks.lock().map_err(|e| {
-                SandboxError::Internal(format!("lock poisoned: {e}"))
-            })?;
+            let nets = self
+                .networks
+                .lock()
+                .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
             if let Some((_, info)) = nets.get(session_id) {
                 return Err(SandboxError::Network(format!(
                     "session {} already has network {}",
@@ -251,9 +254,10 @@ impl NetworkManager {
         }
 
         let max_attempts = {
-            let alloc = self.subnet_allocator.lock().map_err(|e| {
-                SandboxError::Internal(format!("lock poisoned: {e}"))
-            })?;
+            let alloc = self
+                .subnet_allocator
+                .lock()
+                .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
             alloc.max_blocks as usize
         };
 
@@ -262,9 +266,10 @@ impl NetworkManager {
         for attempt in 0..max_attempts {
             // Allocate a /28 subnet.
             let (block_idx, subnet_base, gateway_ip, vm_ip) = {
-                let mut alloc = self.subnet_allocator.lock().map_err(|e| {
-                    SandboxError::Internal(format!("lock poisoned: {e}"))
-                })?;
+                let mut alloc = self
+                    .subnet_allocator
+                    .lock()
+                    .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
                 alloc.allocate()?
             };
 
@@ -282,20 +287,19 @@ impl NetworkManager {
             );
 
             let output = run_with_timeout(
-                Command::new("docker")
-                    .args([
-                        "network",
-                        "create",
-                        "--driver",
-                        "bridge",
-                        "--subnet",
-                        &subnet,
-                        "--label",
-                        &format!("sandbox.session_id={session_id}"),
-                        "--opt",
-                        &format!("com.docker.network.bridge.name={bridge_name}"),
-                        &docker_network_name,
-                    ]),
+                Command::new("docker").args([
+                    "network",
+                    "create",
+                    "--driver",
+                    "bridge",
+                    "--subnet",
+                    &subnet,
+                    "--label",
+                    &format!("sandbox.session_id={session_id}"),
+                    "--opt",
+                    &format!("com.docker.network.bridge.name={bridge_name}"),
+                    &docker_network_name,
+                ]),
                 CREATE_NETWORK_TIMEOUT,
                 "docker network create",
             )
@@ -317,9 +321,10 @@ impl NetworkManager {
 
                 // Track the network.
                 {
-                    let mut nets = self.networks.lock().map_err(|e| {
-                        SandboxError::Internal(format!("lock poisoned: {e}"))
-                    })?;
+                    let mut nets = self
+                        .networks
+                        .lock()
+                        .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
                     nets.insert(*session_id, (block_idx, info.clone()));
                 }
 
@@ -352,9 +357,10 @@ impl NetworkManager {
 
             // Non-overlap error — release the block and fail immediately.
             {
-                let mut alloc = self.subnet_allocator.lock().map_err(|e| {
-                    SandboxError::Internal(format!("lock poisoned: {e}"))
-                })?;
+                let mut alloc = self
+                    .subnet_allocator
+                    .lock()
+                    .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
                 alloc.release(block_idx);
             }
 
@@ -371,16 +377,13 @@ impl NetworkManager {
     /// Delete the Docker bridge network for the given session.
     pub fn delete_network(&self, session_id: &SessionId) -> Result<(), SandboxError> {
         let (block_idx, info) = {
-            let nets = self.networks.lock().map_err(|e| {
-                SandboxError::Internal(format!("lock poisoned: {e}"))
-            })?;
-            nets.get(session_id)
-                .cloned()
-                .ok_or_else(|| {
-                    SandboxError::Network(format!(
-                        "no network found for session {session_id}"
-                    ))
-                })?
+            let nets = self
+                .networks
+                .lock()
+                .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
+            nets.get(session_id).cloned().ok_or_else(|| {
+                SandboxError::Network(format!("no network found for session {session_id}"))
+            })?
         };
 
         debug!(
@@ -390,8 +393,7 @@ impl NetworkManager {
         );
 
         let output = run_with_timeout(
-            Command::new("docker")
-                .args(["network", "rm", &info.docker_network_name]),
+            Command::new("docker").args(["network", "rm", &info.docker_network_name]),
             DELETE_NETWORK_TIMEOUT,
             "docker network rm",
         )
@@ -411,15 +413,17 @@ impl NetworkManager {
 
         // Release the subnet and remove tracking.
         {
-            let mut alloc = self.subnet_allocator.lock().map_err(|e| {
-                SandboxError::Internal(format!("lock poisoned: {e}"))
-            })?;
+            let mut alloc = self
+                .subnet_allocator
+                .lock()
+                .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
             alloc.release(block_idx);
         }
         {
-            let mut nets = self.networks.lock().map_err(|e| {
-                SandboxError::Internal(format!("lock poisoned: {e}"))
-            })?;
+            let mut nets = self
+                .networks
+                .lock()
+                .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
             nets.remove(session_id);
         }
 
@@ -433,10 +437,14 @@ impl NetworkManager {
     }
 
     /// Retrieve the `NetworkInfo` for a session, if it has a network.
-    pub fn network_info(&self, session_id: &SessionId) -> Result<Option<NetworkInfo>, SandboxError> {
-        let nets = self.networks.lock().map_err(|e| {
-            SandboxError::Internal(format!("lock poisoned: {e}"))
-        })?;
+    pub fn network_info(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<NetworkInfo>, SandboxError> {
+        let nets = self
+            .networks
+            .lock()
+            .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
         Ok(nets.get(session_id).map(|(_, info)| info.clone()))
     }
 
@@ -451,9 +459,10 @@ impl NetworkManager {
     /// removed (e.g. during `stop`), it is recreated with the same subnet.
     pub fn ensure_network(&self, session_id: &SessionId) -> Result<NetworkInfo, SandboxError> {
         let info = {
-            let nets = self.networks.lock().map_err(|e| {
-                SandboxError::Internal(format!("lock poisoned: {e}"))
-            })?;
+            let nets = self
+                .networks
+                .lock()
+                .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
             nets.get(session_id)
                 .map(|(_, info)| info.clone())
                 .ok_or_else(|| {
@@ -465,16 +474,13 @@ impl NetworkManager {
 
         // Check if the Docker network already exists.
         let check = run_with_timeout(
-            Command::new("docker")
-                .args(["network", "inspect", &info.docker_network_name]),
+            Command::new("docker").args(["network", "inspect", &info.docker_network_name]),
             INSPECT_NETWORK_TIMEOUT,
             "docker network inspect",
         )
         .map_err(|e| match e {
             SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                SandboxError::Network(format!(
-                    "failed to run docker network inspect: {msg}"
-                ))
+                SandboxError::Network(format!("failed to run docker network inspect: {msg}"))
             }
             other => other,
         })?;
@@ -498,28 +504,25 @@ impl NetworkManager {
         );
 
         let output = run_with_timeout(
-            Command::new("docker")
-                .args([
-                    "network",
-                    "create",
-                    "--driver",
-                    "bridge",
-                    "--subnet",
-                    &info.subnet,
-                    "--label",
-                    &format!("sandbox.session_id={session_id}"),
-                    "--opt",
-                    &format!("com.docker.network.bridge.name={}", info.bridge_name),
-                    &info.docker_network_name,
-                ]),
+            Command::new("docker").args([
+                "network",
+                "create",
+                "--driver",
+                "bridge",
+                "--subnet",
+                &info.subnet,
+                "--label",
+                &format!("sandbox.session_id={session_id}"),
+                "--opt",
+                &format!("com.docker.network.bridge.name={}", info.bridge_name),
+                &info.docker_network_name,
+            ]),
             CREATE_NETWORK_TIMEOUT,
             "docker network create (ensure)",
         )
         .map_err(|e| match e {
             SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                SandboxError::Network(format!(
-                    "failed to run docker network create: {msg}"
-                ))
+                SandboxError::Network(format!("failed to run docker network create: {msg}"))
             }
             other => other,
         })?;
@@ -550,9 +553,10 @@ impl NetworkManager {
     /// If the Docker network does not exist, this is a no-op (returns Ok).
     pub fn remove_docker_network(&self, session_id: &SessionId) -> Result<(), SandboxError> {
         let info = {
-            let nets = self.networks.lock().map_err(|e| {
-                SandboxError::Internal(format!("lock poisoned: {e}"))
-            })?;
+            let nets = self
+                .networks
+                .lock()
+                .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
             match nets.get(session_id) {
                 Some((_, info)) => info.clone(),
                 None => {
@@ -572,8 +576,7 @@ impl NetworkManager {
         );
 
         let output = run_with_timeout(
-            Command::new("docker")
-                .args(["network", "rm", &info.docker_network_name]),
+            Command::new("docker").args(["network", "rm", &info.docker_network_name]),
             DELETE_NETWORK_TIMEOUT,
             "docker network rm (remove)",
         )
@@ -607,7 +610,6 @@ impl NetworkManager {
 
         Ok(())
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -637,8 +639,7 @@ mod tests {
 
     #[test]
     fn test_allocate_subnet() {
-        let mut alloc =
-            SubnetAllocator::new(Ipv4Addr::new(10, 209, 0, 0), 24).unwrap();
+        let mut alloc = SubnetAllocator::new(Ipv4Addr::new(10, 209, 0, 0), 24).unwrap();
 
         let (idx, subnet_base, gateway, vm) = alloc.allocate().unwrap();
         assert_eq!(idx, 0);
@@ -649,8 +650,7 @@ mod tests {
 
     #[test]
     fn test_allocate_multiple() {
-        let mut alloc =
-            SubnetAllocator::new(Ipv4Addr::new(10, 209, 0, 0), 24).unwrap();
+        let mut alloc = SubnetAllocator::new(Ipv4Addr::new(10, 209, 0, 0), 24).unwrap();
 
         let (idx0, base0, gw0, vm0) = alloc.allocate().unwrap();
         let (idx1, base1, gw1, vm1) = alloc.allocate().unwrap();
@@ -677,8 +677,7 @@ mod tests {
 
     #[test]
     fn test_release_and_reuse() {
-        let mut alloc =
-            SubnetAllocator::new(Ipv4Addr::new(10, 209, 0, 0), 24).unwrap();
+        let mut alloc = SubnetAllocator::new(Ipv4Addr::new(10, 209, 0, 0), 24).unwrap();
 
         let (idx0, _, _, _) = alloc.allocate().unwrap();
         let (idx1, _, _, _) = alloc.allocate().unwrap();
@@ -699,8 +698,7 @@ mod tests {
     #[test]
     fn test_pool_exhaustion() {
         // Use a /28 base -- that gives exactly 1 /28 block.
-        let mut alloc =
-            SubnetAllocator::new(Ipv4Addr::new(10, 209, 0, 0), 28).unwrap();
+        let mut alloc = SubnetAllocator::new(Ipv4Addr::new(10, 209, 0, 0), 28).unwrap();
 
         assert_eq!(alloc.max_blocks, 1);
 
@@ -721,8 +719,7 @@ mod tests {
     #[test]
     fn test_pool_exhaustion_full_24() {
         // A /24 gives 16 /28 blocks.
-        let mut alloc =
-            SubnetAllocator::new(Ipv4Addr::new(10, 209, 0, 0), 24).unwrap();
+        let mut alloc = SubnetAllocator::new(Ipv4Addr::new(10, 209, 0, 0), 24).unwrap();
 
         assert_eq!(alloc.max_blocks, 16);
 
@@ -741,13 +738,9 @@ mod tests {
 
     #[test]
     fn test_block_index_for() {
-        let alloc =
-            SubnetAllocator::new(Ipv4Addr::new(10, 209, 0, 0), 24).unwrap();
+        let alloc = SubnetAllocator::new(Ipv4Addr::new(10, 209, 0, 0), 24).unwrap();
 
-        assert_eq!(
-            alloc.block_index_for(Ipv4Addr::new(10, 209, 0, 0)),
-            Some(0)
-        );
+        assert_eq!(alloc.block_index_for(Ipv4Addr::new(10, 209, 0, 0)), Some(0));
         assert_eq!(
             alloc.block_index_for(Ipv4Addr::new(10, 209, 0, 16)),
             Some(1)
@@ -758,20 +751,11 @@ mod tests {
         );
 
         // Not on a /28 boundary.
-        assert_eq!(
-            alloc.block_index_for(Ipv4Addr::new(10, 209, 0, 3)),
-            None
-        );
+        assert_eq!(alloc.block_index_for(Ipv4Addr::new(10, 209, 0, 3)), None);
         // Out of range.
-        assert_eq!(
-            alloc.block_index_for(Ipv4Addr::new(10, 210, 0, 0)),
-            None
-        );
+        assert_eq!(alloc.block_index_for(Ipv4Addr::new(10, 210, 0, 0)), None);
         // Before base.
-        assert_eq!(
-            alloc.block_index_for(Ipv4Addr::new(10, 208, 0, 0)),
-            None
-        );
+        assert_eq!(alloc.block_index_for(Ipv4Addr::new(10, 208, 0, 0)), None);
     }
 
     #[test]
@@ -786,8 +770,7 @@ mod tests {
 
     #[test]
     fn test_network_info_fields() {
-        let mgr =
-            NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24).unwrap();
+        let mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24).unwrap();
 
         let session_id = SessionId::generate();
 
@@ -837,8 +820,7 @@ mod tests {
             subnet: "10.209.0.0/28".to_string(),
             gateway_ip: "10.209.0.2".to_string(),
             vm_ip: "10.209.0.3".to_string(),
-            docker_network_name: "sandbox-net-550e8400-e29b-41d4-a716-446655440000"
-                .to_string(),
+            docker_network_name: "sandbox-net-550e8400-e29b-41d4-a716-446655440000".to_string(),
         };
 
         let json = serde_json::to_string(&info).unwrap();
@@ -848,16 +830,12 @@ mod tests {
         assert_eq!(deserialized.subnet, info.subnet);
         assert_eq!(deserialized.gateway_ip, info.gateway_ip);
         assert_eq!(deserialized.vm_ip, info.vm_ip);
-        assert_eq!(
-            deserialized.docker_network_name,
-            info.docker_network_name
-        );
+        assert_eq!(deserialized.docker_network_name, info.docker_network_name);
     }
 
     #[test]
     fn test_restore_from_infos() {
-        let mgr =
-            NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24).unwrap();
+        let mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24).unwrap();
 
         let id1 = SessionId::generate();
         let id2 = SessionId::generate();
@@ -912,8 +890,7 @@ mod tests {
 
     #[test]
     fn test_network_info_not_found() {
-        let mgr =
-            NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24).unwrap();
+        let mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24).unwrap();
 
         let result = mgr.network_info(&SessionId::generate()).unwrap();
         assert!(result.is_none());
@@ -931,5 +908,4 @@ mod tests {
         );
         assert!(parse_subnet_base("not-an-ip/28").is_err());
     }
-
 }

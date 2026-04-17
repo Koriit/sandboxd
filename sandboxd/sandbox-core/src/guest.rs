@@ -127,9 +127,7 @@ pub async fn write_message<W: AsyncWrite + Unpin>(
 /// Wire format: 4 bytes big-endian u32 length, then the payload bytes.
 /// Returns an error if the declared length exceeds [`MAX_MESSAGE_SIZE`],
 /// or if the stream ends before delivering the full payload.
-pub async fn read_message<R: AsyncRead + Unpin>(
-    reader: &mut R,
-) -> Result<Vec<u8>, SandboxError> {
+pub async fn read_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>, SandboxError> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::UnexpectedEof {
@@ -176,9 +174,8 @@ pub async fn send_request_over<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     request: &GuestRequest,
 ) -> Result<GuestResponse, SandboxError> {
-    let payload = serde_json::to_vec(request).map_err(|e| {
-        SandboxError::Internal(format!("failed to serialize request: {e}"))
-    })?;
+    let payload = serde_json::to_vec(request)
+        .map_err(|e| SandboxError::Internal(format!("failed to serialize request: {e}")))?;
 
     // Split the stream into read/write halves is not needed when we own &mut S.
     // We write first, then read — the protocol is strictly request-then-response.
@@ -190,10 +187,8 @@ pub async fn send_request_over<S: AsyncRead + AsyncWrite + Unpin>(
 
     let response_bytes = read_message(&mut reader).await?;
 
-    let response: GuestResponse =
-        serde_json::from_slice(&response_bytes).map_err(|e| {
-            SandboxError::Internal(format!("failed to deserialize response: {e}"))
-        })?;
+    let response: GuestResponse = serde_json::from_slice(&response_bytes)
+        .map_err(|e| SandboxError::Internal(format!("failed to deserialize response: {e}")))?;
 
     Ok(response)
 }
@@ -252,9 +247,7 @@ impl GuestConnector {
             .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|e| {
-                SandboxError::Lima(format!(
-                    "failed to spawn limactl shell for {vm_name}: {e}"
-                ))
+                SandboxError::Lima(format!("failed to spawn limactl shell for {vm_name}: {e}"))
             })?;
 
         let result = tokio::time::timeout(GUEST_REQUEST_TIMEOUT, async {
@@ -266,9 +259,8 @@ impl GuestConnector {
             })?;
 
             // Send the request.
-            let payload = serde_json::to_vec(&request).map_err(|e| {
-                SandboxError::Internal(format!("failed to serialize request: {e}"))
-            })?;
+            let payload = serde_json::to_vec(&request)
+                .map_err(|e| SandboxError::Internal(format!("failed to serialize request: {e}")))?;
             write_message(&mut stdin, &payload).await?;
 
             // NOTE: we intentionally keep stdin open until after reading the
@@ -284,12 +276,9 @@ impl GuestConnector {
             // Now close stdin so socat exits cleanly.
             drop(stdin);
 
-            let response: GuestResponse =
-                serde_json::from_slice(&response_bytes).map_err(|e| {
-                    SandboxError::Internal(format!(
-                        "failed to deserialize guest response: {e}"
-                    ))
-                })?;
+            let response: GuestResponse = serde_json::from_slice(&response_bytes).map_err(|e| {
+                SandboxError::Internal(format!("failed to deserialize guest response: {e}"))
+            })?;
 
             Ok(response)
         })
@@ -623,16 +612,13 @@ mod tests {
 
     /// Spawn a TCP server that reads one framed request, applies `handler`, and
     /// sends back the framed response.
-    async fn mock_guest_server<F>(
-        listener: &TcpListener,
-        handler: F,
-    ) where
+    async fn mock_guest_server<F>(listener: &TcpListener, handler: F)
+    where
         F: FnOnce(GuestRequest) -> GuestResponse + Send + 'static,
     {
         let (mut stream, _addr) = listener.accept().await.unwrap();
         let request_bytes = read_message(&mut stream).await.unwrap();
-        let request: GuestRequest =
-            serde_json::from_slice(&request_bytes).unwrap();
+        let request: GuestRequest = serde_json::from_slice(&request_bytes).unwrap();
         let response = handler(request);
         let response_bytes = serde_json::to_vec(&response).unwrap();
         write_message(&mut stream, &response_bytes).await.unwrap();
@@ -654,8 +640,9 @@ mod tests {
         });
 
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        let response =
-            send_request_over(&mut stream, &GuestRequest::Ping).await.unwrap();
+        let response = send_request_over(&mut stream, &GuestRequest::Ping)
+            .await
+            .unwrap();
 
         assert!(matches!(response, GuestResponse::Pong));
         server.await.unwrap();
@@ -723,8 +710,9 @@ mod tests {
         });
 
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        let response =
-            send_request_over(&mut stream, &GuestRequest::Status).await.unwrap();
+        let response = send_request_over(&mut stream, &GuestRequest::Status)
+            .await
+            .unwrap();
 
         match response {
             GuestResponse::StatusResult {
@@ -757,8 +745,7 @@ mod tests {
         });
 
         let mut stream = TcpStream::connect(addr).await.unwrap();
-        let result =
-            send_request_over(&mut stream, &GuestRequest::Ping).await;
+        let result = send_request_over(&mut stream, &GuestRequest::Ping).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -781,17 +768,14 @@ mod tests {
             for i in 0..5 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let request_bytes = read_message(&mut stream).await.unwrap();
-                let request: GuestRequest =
-                    serde_json::from_slice(&request_bytes).unwrap();
+                let request: GuestRequest = serde_json::from_slice(&request_bytes).unwrap();
 
                 let response = match request {
-                    GuestRequest::Exec { command, .. } => {
-                        GuestResponse::ExecResult {
-                            exit_code: i,
-                            stdout: format!("output from request {i}: {command}"),
-                            stderr: String::new(),
-                        }
-                    }
+                    GuestRequest::Exec { command, .. } => GuestResponse::ExecResult {
+                        exit_code: i,
+                        stdout: format!("output from request {i}: {command}"),
+                        stderr: String::new(),
+                    },
                     GuestRequest::Ping => GuestResponse::Pong,
                     GuestRequest::Status => GuestResponse::StatusResult {
                         hostname: "test".into(),

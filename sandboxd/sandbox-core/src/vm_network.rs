@@ -46,8 +46,7 @@ pub async fn attach_vm_to_bridge(
     // Configure the NIC inside the VM via the guest agent.
     // The NIC is found by MAC address — it was added at boot by the QEMU
     // wrapper and should already be visible inside the guest.
-    let script =
-        generate_guest_network_script(&network_info.gateway_ip, &network_info.vm_ip, &mac);
+    let script = generate_guest_network_script(&network_info.gateway_ip, &network_info.vm_ip, &mac);
 
     info!(
         session_id = %session_id,
@@ -60,9 +59,7 @@ pub async fn attach_vm_to_bridge(
         .exec(session_id, "sudo", &["bash", "-c", &script])
         .await
         .map_err(|e| {
-            SandboxError::Network(format!(
-                "failed to execute network config in VM: {e}"
-            ))
+            SandboxError::Network(format!("failed to execute network config in VM: {e}"))
         })?;
 
     match response {
@@ -103,9 +100,7 @@ pub async fn attach_vm_to_bridge(
 /// With `qemu-bridge-helper`, the TAP device is owned by QEMU and is
 /// automatically destroyed when the VM stops. This function is a no-op
 /// but retained for API compatibility during teardown sequences.
-pub fn detach_vm_from_bridge(
-    session_id: &SessionId,
-) -> Result<(), SandboxError> {
+pub fn detach_vm_from_bridge(session_id: &SessionId) -> Result<(), SandboxError> {
     info!(
         session_id = %session_id,
         "detaching VM from bridge network (no-op: TAP owned by QEMU)"
@@ -146,8 +141,7 @@ mod tests {
         };
 
         let mac = "52:54:00:55:0e:84";
-        let script =
-            generate_guest_network_script(&info.gateway_ip, &info.vm_ip, mac);
+        let script = generate_guest_network_script(&info.gateway_ip, &info.vm_ip, mac);
 
         assert!(script.contains("10.209.0.3/28"));
         assert!(script.contains("via 10.209.0.2"));

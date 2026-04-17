@@ -82,9 +82,8 @@ impl SessionStore {
         config: SessionConfig,
         name: Option<String>,
     ) -> Result<Session, SandboxError> {
-        let config_json = serde_json::to_string(&config).map_err(|e| {
-            SandboxError::Internal(format!("failed to serialize config: {e}"))
-        })?;
+        let config_json = serde_json::to_string(&config)
+            .map_err(|e| SandboxError::Internal(format!("failed to serialize config: {e}")))?;
 
         let mut attempt = 0u32;
         loop {
@@ -111,11 +110,7 @@ impl SessionStore {
     /// Insert a session row. Returns `InsertError::Collision` if the id
     /// violates the PRIMARY KEY uniqueness constraint; all other DB errors
     /// surface as `InsertError::Other`.
-    fn try_insert_session(
-        &self,
-        session: &Session,
-        config_json: &str,
-    ) -> Result<(), InsertError> {
+    fn try_insert_session(&self, session: &Session, config_json: &str) -> Result<(), InsertError> {
         let conn = self.conn.lock().map_err(|e| {
             InsertError::Other(SandboxError::Internal(format!("lock poisoned: {e}")))
         })?;
@@ -146,9 +141,10 @@ impl SessionStore {
 
     /// Retrieve a session by ID, or `None` if it does not exist.
     pub fn get_session(&self, id: &SessionId) -> Result<Option<Session>, SandboxError> {
-        let conn = self.conn.lock().map_err(|e| {
-            SandboxError::Internal(format!("lock poisoned: {e}"))
-        })?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
 
         let mut stmt = conn.prepare(
             "SELECT id, name, state, config, created_at, updated_at
@@ -164,9 +160,10 @@ impl SessionStore {
 
     /// List all sessions.
     pub fn list_sessions(&self) -> Result<Vec<Session>, SandboxError> {
-        let conn = self.conn.lock().map_err(|e| {
-            SandboxError::Internal(format!("lock poisoned: {e}"))
-        })?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
 
         let mut stmt = conn.prepare(
             "SELECT id, name, state, config, created_at, updated_at
@@ -178,7 +175,10 @@ impl SessionStore {
                 rusqlite::Error::FromSqlConversionFailure(
                     0,
                     rusqlite::types::Type::Text,
-                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        e.to_string(),
+                    )),
                 )
             })
         })?;
@@ -203,15 +203,14 @@ impl SessionStore {
         id: &SessionId,
         new_state: SessionState,
     ) -> Result<(), SandboxError> {
-        let conn = self.conn.lock().map_err(|e| {
-            SandboxError::Internal(format!("lock poisoned: {e}"))
-        })?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
 
         // Fetch the current state so we can validate the transition.
         let current_state = {
-            let mut stmt = conn.prepare(
-                "SELECT state FROM sessions WHERE id = ?1",
-            )?;
+            let mut stmt = conn.prepare("SELECT state FROM sessions WHERE id = ?1")?;
             let mut rows = stmt.query(params![id.as_str()])?;
             match rows.next()? {
                 Some(row) => {
@@ -251,9 +250,10 @@ impl SessionStore {
     ) -> Result<(), SandboxError> {
         let now = Utc::now();
 
-        let conn = self.conn.lock().map_err(|e| {
-            SandboxError::Internal(format!("lock poisoned: {e}"))
-        })?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
 
         let rows_affected = conn.execute(
             "UPDATE sessions SET state = ?1, updated_at = ?2 WHERE id = ?3",
@@ -279,10 +279,7 @@ impl SessionStore {
     /// Returns `None` if no session matches. Returns
     /// [`SandboxError::InvalidArgument`] if the prefix matches multiple
     /// sessions (ambiguous).
-    pub fn get_session_by_name_or_id(
-        &self,
-        query: &str,
-    ) -> Result<Option<Session>, SandboxError> {
+    pub fn get_session_by_name_or_id(&self, query: &str) -> Result<Option<Session>, SandboxError> {
         // Try exact SessionId first.
         if let Ok(id) = SessionId::parse(query) {
             if let Some(session) = self.get_session(&id)? {
@@ -292,9 +289,10 @@ impl SessionStore {
 
         // Try exact name lookup.
         {
-            let conn = self.conn.lock().map_err(|e| {
-                SandboxError::Internal(format!("lock poisoned: {e}"))
-            })?;
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
 
             let mut stmt = conn.prepare(
                 "SELECT id, name, state, config, created_at, updated_at
@@ -336,27 +334,26 @@ impl SessionStore {
     /// An empty prefix returns `NotFound` (it would otherwise match every
     /// session and the ambiguity list would be unbounded). A prefix longer
     /// than 12 chars or containing non-hex characters returns `NotFound`.
-    pub fn resolve_id_prefix(
-        &self,
-        prefix: &str,
-    ) -> Result<ResolveOutcome, SandboxError> {
+    pub fn resolve_id_prefix(&self, prefix: &str) -> Result<ResolveOutcome, SandboxError> {
         if prefix.is_empty() || prefix.len() > SessionId::LEN {
             return Ok(ResolveOutcome::NotFound);
         }
-        if !prefix.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        if !prefix
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
             return Ok(ResolveOutcome::NotFound);
         }
 
-        let conn = self.conn.lock().map_err(|e| {
-            SandboxError::Internal(format!("lock poisoned: {e}"))
-        })?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
 
         // `LIMIT 2` is sufficient — we only need to distinguish 0 / 1 / 2+
         // matches. When ambiguous we fall through to a second query that
         // returns all matches for a helpful error message.
-        let mut stmt = conn.prepare(
-            "SELECT id FROM sessions WHERE id LIKE ?1 || '%' LIMIT 2",
-        )?;
+        let mut stmt = conn.prepare("SELECT id FROM sessions WHERE id LIKE ?1 || '%' LIMIT 2")?;
         let rows = stmt.query_map(params![prefix], |row| {
             let s: String = row.get(0)?;
             Ok(s)
@@ -370,16 +367,14 @@ impl SessionStore {
         match ids.len() {
             0 => Ok(ResolveOutcome::NotFound),
             1 => {
-                let id = SessionId::parse(&ids[0]).map_err(|e| {
-                    SandboxError::Internal(format!("invalid id in database: {e}"))
-                })?;
+                let id = SessionId::parse(&ids[0])
+                    .map_err(|e| SandboxError::Internal(format!("invalid id in database: {e}")))?;
                 Ok(ResolveOutcome::Found(id))
             }
             _ => {
                 // Fetch all matches for a helpful error message.
-                let mut stmt = conn.prepare(
-                    "SELECT id FROM sessions WHERE id LIKE ?1 || '%' ORDER BY id",
-                )?;
+                let mut stmt =
+                    conn.prepare("SELECT id FROM sessions WHERE id LIKE ?1 || '%' ORDER BY id")?;
                 let rows = stmt.query_map(params![prefix], |row| {
                     let s: String = row.get(0)?;
                     Ok(s)
@@ -407,9 +402,10 @@ impl SessionStore {
             SandboxError::Internal(format!("failed to serialize network info: {e}"))
         })?;
 
-        let conn = self.conn.lock().map_err(|e| {
-            SandboxError::Internal(format!("lock poisoned: {e}"))
-        })?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
 
         let rows_affected = conn.execute(
             "UPDATE sessions SET network_info = ?1 WHERE id = ?2",
@@ -428,13 +424,12 @@ impl SessionStore {
         &self,
         id: &SessionId,
     ) -> Result<Option<crate::network::NetworkInfo>, SandboxError> {
-        let conn = self.conn.lock().map_err(|e| {
-            SandboxError::Internal(format!("lock poisoned: {e}"))
-        })?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
 
-        let mut stmt = conn.prepare(
-            "SELECT network_info FROM sessions WHERE id = ?1",
-        )?;
+        let mut stmt = conn.prepare("SELECT network_info FROM sessions WHERE id = ?1")?;
 
         let mut rows = stmt.query(params![id.as_str()])?;
         match rows.next()? {
@@ -461,13 +456,13 @@ impl SessionStore {
     pub fn list_sessions_with_network_info(
         &self,
     ) -> Result<Vec<(SessionId, crate::network::NetworkInfo)>, SandboxError> {
-        let conn = self.conn.lock().map_err(|e| {
-            SandboxError::Internal(format!("lock poisoned: {e}"))
-        })?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
 
-        let mut stmt = conn.prepare(
-            "SELECT id, network_info FROM sessions WHERE network_info IS NOT NULL",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT id, network_info FROM sessions WHERE network_info IS NOT NULL")?;
 
         let rows = stmt.query_map([], |row| {
             let id_str: String = row.get(0)?;
@@ -481,12 +476,9 @@ impl SessionStore {
             let id = SessionId::parse(&id_str).map_err(|e| {
                 SandboxError::Internal(format!("invalid session id in database: {e}"))
             })?;
-            let info: crate::network::NetworkInfo =
-                serde_json::from_str(&json).map_err(|e| {
-                    SandboxError::Internal(format!(
-                        "invalid network_info JSON in database: {e}"
-                    ))
-                })?;
+            let info: crate::network::NetworkInfo = serde_json::from_str(&json).map_err(|e| {
+                SandboxError::Internal(format!("invalid network_info JSON in database: {e}"))
+            })?;
             result.push((id, info));
         }
 
@@ -495,14 +487,13 @@ impl SessionStore {
 
     /// Delete a session from the database and remove its per-session directory.
     pub fn delete_session(&self, id: &SessionId) -> Result<(), SandboxError> {
-        let conn = self.conn.lock().map_err(|e| {
-            SandboxError::Internal(format!("lock poisoned: {e}"))
-        })?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
 
-        let rows_affected = conn.execute(
-            "DELETE FROM sessions WHERE id = ?1",
-            params![id.as_str()],
-        )?;
+        let rows_affected =
+            conn.execute("DELETE FROM sessions WHERE id = ?1", params![id.as_str()])?;
 
         if rows_affected == 0 {
             return Err(SandboxError::SessionNotFound(id.to_string()));
@@ -535,26 +526,20 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> Result<Session, SandboxError> {
     let created_at_str: String = row.get(4)?;
     let updated_at_str: String = row.get(5)?;
 
-    let id = SessionId::parse(&id_str).map_err(|e| {
-        SandboxError::Internal(format!("invalid session id in database: {e}"))
-    })?;
+    let id = SessionId::parse(&id_str)
+        .map_err(|e| SandboxError::Internal(format!("invalid session id in database: {e}")))?;
 
     let state = SessionState::from_str(&state_str)?;
 
-    let config: SessionConfig = serde_json::from_str(&config_json).map_err(|e| {
-        SandboxError::Internal(format!("invalid config JSON in database: {e}"))
-    })?;
+    let config: SessionConfig = serde_json::from_str(&config_json)
+        .map_err(|e| SandboxError::Internal(format!("invalid config JSON in database: {e}")))?;
 
     let created_at = DateTime::parse_from_rfc3339(&created_at_str)
-        .map_err(|e| {
-            SandboxError::Internal(format!("invalid created_at timestamp: {e}"))
-        })?
+        .map_err(|e| SandboxError::Internal(format!("invalid created_at timestamp: {e}")))?
         .with_timezone(&Utc);
 
     let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
-        .map_err(|e| {
-            SandboxError::Internal(format!("invalid updated_at timestamp: {e}"))
-        })?
+        .map_err(|e| SandboxError::Internal(format!("invalid updated_at timestamp: {e}")))?
         .with_timezone(&Utc);
 
     Ok(Session {
@@ -578,8 +563,7 @@ mod tests {
     /// Create a `SessionStore` in a fresh temporary directory.
     fn test_store() -> (SessionStore, TempDir) {
         let dir = TempDir::new().expect("failed to create temp dir");
-        let store =
-            SessionStore::new(dir.path().to_path_buf()).expect("failed to create store");
+        let store = SessionStore::new(dir.path().to_path_buf()).expect("failed to create store");
         (store, dir)
     }
 
@@ -593,9 +577,7 @@ mod tests {
         let (store, _dir) = test_store();
 
         let config = SessionConfig::default();
-        let session = store
-            .create_session(config, None)
-            .expect("create failed");
+        let session = store.create_session(config, None).expect("create failed");
 
         assert_eq!(session.state, SessionState::Creating);
         assert!(session.name.is_none());
@@ -705,7 +687,10 @@ mod tests {
             .expect("create");
 
         let session_dir = store.session_dir(&session.id);
-        assert!(session_dir.exists(), "session dir should exist after create");
+        assert!(
+            session_dir.exists(),
+            "session dir should exist after create"
+        );
 
         store.delete_session(&session.id).expect("delete");
         assert!(
@@ -795,9 +780,7 @@ mod tests {
 
         let conn = store.conn.lock().expect("lock");
         let mut stmt = conn
-            .prepare(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'",
-            )
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'")
             .expect("prepare");
         let exists = stmt.exists([]).expect("query");
         assert!(exists, "sessions table should exist after migrations");
@@ -864,10 +847,7 @@ mod tests {
             .create_session(SessionConfig::default(), None)
             .expect("create");
 
-        let expected = dir
-            .path()
-            .join("sessions")
-            .join(session.id.as_str());
+        let expected = dir.path().join("sessions").join(session.id.as_str());
         assert!(expected.exists());
         assert!(expected.is_dir());
     }
@@ -1099,10 +1079,7 @@ mod tests {
         assert_eq!(fetched.subnet, net_info.subnet);
         assert_eq!(fetched.gateway_ip, net_info.gateway_ip);
         assert_eq!(fetched.vm_ip, net_info.vm_ip);
-        assert_eq!(
-            fetched.docker_network_name,
-            net_info.docker_network_name
-        );
+        assert_eq!(fetched.docker_network_name, net_info.docker_network_name);
     }
 
     #[test]

@@ -112,20 +112,15 @@ impl PolicyDistributor {
             // When no nftables rules are needed, flush any stale
             // sandbox_policy table left from a previous policy distribution.
             let flush_script = "delete table inet sandbox_policy\n";
-            let _ = gateway.inject_nftables_ruleset_public(
-                session_id,
-                flush_script,
-                "policy-flush",
-            );
+            let _ =
+                gateway.inject_nftables_ruleset_public(session_id, flush_script, "policy-flush");
             debug!(session_id = %session_id, "flushed stale sandbox_policy table (if any)");
         }
 
         // Step 4: Write Envoy config and trigger reload.
-        if let Err(e) = write_file_to_container(
-            &container,
-            "/etc/envoy/envoy.yaml",
-            &compiled.envoy_config,
-        ) {
+        if let Err(e) =
+            write_file_to_container(&container, "/etc/envoy/envoy.yaml", &compiled.envoy_config)
+        {
             error!(
                 session_id = %session_id,
                 error = %e,
@@ -134,8 +129,11 @@ impl PolicyDistributor {
             Self::rollback_steps(session_id, &state, &previous);
             return Err(e);
         }
-        #[allow(unused_assignments)] // Consistent with prior steps; enables rollback if steps are added.
-        { state.envoy_written = true; }
+        #[allow(unused_assignments)]
+        // Consistent with prior steps; enables rollback if steps are added.
+        {
+            state.envoy_written = true;
+        }
         debug!(session_id = %session_id, "Envoy config written");
 
         // Signal Envoy to reload by hitting the admin endpoint.
@@ -208,21 +206,13 @@ impl PolicyDistributor {
 
         if state.mitmproxy_written {
             if let Some(ref config) = previous.mitmproxy {
-                let _ = write_file_to_container(
-                    &container,
-                    "/tmp/mitmproxy/policy.json",
-                    config,
-                );
+                let _ = write_file_to_container(&container, "/tmp/mitmproxy/policy.json", config);
             }
         }
 
         if state.coredns_written {
             if let Some(ref config) = previous.coredns {
-                let _ = write_file_to_container(
-                    &container,
-                    "/etc/coredns/policy.conf",
-                    config,
-                );
+                let _ = write_file_to_container(&container, "/etc/coredns/policy.conf", config);
             }
         }
 
@@ -252,8 +242,7 @@ impl PreviousConfigs {
         let container = gateway::container_name(session_id);
 
         let coredns = read_file_from_container(&container, "/etc/coredns/policy.conf").ok();
-        let mitmproxy =
-            read_file_from_container(&container, "/tmp/mitmproxy/policy.json").ok();
+        let mitmproxy = read_file_from_container(&container, "/tmp/mitmproxy/policy.json").ok();
         let envoy = read_file_from_container(&container, "/etc/envoy/envoy.yaml").ok();
 
         // Reading current nftables state from the namespace.
@@ -283,15 +272,20 @@ pub fn write_file_to_container(
     use std::io::Write;
 
     let mut child = Command::new("docker")
-        .args(["exec", "-i", container, "sh", "-c", &format!("cat > '{path}'")])
+        .args([
+            "exec",
+            "-i",
+            container,
+            "sh",
+            "-c",
+            &format!("cat > '{path}'"),
+        ])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| {
-            SandboxError::Gateway(format!(
-                "failed to write {path} to {container}: {e}"
-            ))
+            SandboxError::Gateway(format!("failed to write {path} to {container}: {e}"))
         })?;
 
     if let Some(ref mut stdin) = child.stdin {
@@ -321,17 +315,12 @@ pub fn write_file_to_container(
 }
 
 /// Read a file from inside a Docker container.
-fn read_file_from_container(
-    container: &str,
-    path: &str,
-) -> Result<String, SandboxError> {
+fn read_file_from_container(container: &str, path: &str) -> Result<String, SandboxError> {
     let output = Command::new("docker")
         .args(["exec", container, "cat", path])
         .output()
         .map_err(|e| {
-            SandboxError::Gateway(format!(
-                "failed to read {path} from {container}: {e}"
-            ))
+            SandboxError::Gateway(format!("failed to read {path} from {container}: {e}"))
         })?;
 
     if !output.status.success() {
@@ -351,13 +340,16 @@ fn read_nftables_state(session_id: &SessionId) -> Result<String, SandboxError> {
 
     let output = Command::new("docker")
         .args([
-            "exec", &container,
-            "nft", "list", "table", "inet", "sandbox_policy",
+            "exec",
+            &container,
+            "nft",
+            "list",
+            "table",
+            "inet",
+            "sandbox_policy",
         ])
         .output()
-        .map_err(|e| {
-            SandboxError::Gateway(format!("failed to list nftables policy table: {e}"))
-        })?;
+        .map_err(|e| SandboxError::Gateway(format!("failed to list nftables policy table: {e}")))?;
 
     if !output.status.success() {
         // Table may not exist yet -- that's OK.
@@ -377,9 +369,7 @@ fn reload_envoy(container: &str) -> Result<(), SandboxError> {
         .args(["exec", container, "kill", "-HUP", "1"])
         .output()
         .map_err(|e| {
-            SandboxError::Gateway(format!(
-                "failed to signal Envoy reload in {container}: {e}"
-            ))
+            SandboxError::Gateway(format!("failed to signal Envoy reload in {container}: {e}"))
         })?;
 
     if !output.status.success() {

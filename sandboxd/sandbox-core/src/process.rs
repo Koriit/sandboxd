@@ -27,9 +27,7 @@ pub fn run_with_timeout(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| {
-            SandboxError::Internal(format!("failed to spawn {operation}: {e}"))
-        })?;
+        .map_err(|e| SandboxError::Internal(format!("failed to spawn {operation}: {e}")))?;
 
     let deadline = Instant::now() + timeout;
 

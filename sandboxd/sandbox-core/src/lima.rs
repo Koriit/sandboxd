@@ -420,17 +420,13 @@ impl LimaManager {
                 .env("SANDBOX_VM_MAC", mac);
         }
 
-        let output = run_with_timeout(
-            &mut cmd,
-            START_VM_TIMEOUT,
-            "limactl start",
-        )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl start", std::io::Error::other(msg))
-            }
-            other => other,
-        })?;
+        let output =
+            run_with_timeout(&mut cmd, START_VM_TIMEOUT, "limactl start").map_err(|e| match e {
+                SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                    lima_io_error("limactl start", std::io::Error::other(msg))
+                }
+                other => other,
+            })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -525,8 +521,7 @@ impl LimaManager {
         let copy_src = binary_path.to_string_lossy().to_string();
         let copy_dst = format!("{vm_name}:/tmp/sandbox-guest");
         let output = run_with_timeout(
-            Command::new(&self.limactl)
-                .args(["copy", &copy_src, &copy_dst]),
+            Command::new(&self.limactl).args(["copy", &copy_src, &copy_dst]),
             INSTALL_GUEST_AGENT_STEP_TIMEOUT,
             "limactl copy (guest agent)",
         )
@@ -547,11 +542,15 @@ impl LimaManager {
         // 2. Move the binary to /usr/local/bin with sudo and make it executable.
         debug!(vm = %vm_name, "installing guest agent binary");
         let output = run_with_timeout(
-            Command::new(&self.limactl)
-                .args([
-                    "shell", &vm_name, "--",
-                    "sudo", "mv", "/tmp/sandbox-guest", "/usr/local/bin/sandbox-guest",
-                ]),
+            Command::new(&self.limactl).args([
+                "shell",
+                &vm_name,
+                "--",
+                "sudo",
+                "mv",
+                "/tmp/sandbox-guest",
+                "/usr/local/bin/sandbox-guest",
+            ]),
             INSTALL_GUEST_AGENT_STEP_TIMEOUT,
             "limactl shell mv",
         )
@@ -570,11 +569,15 @@ impl LimaManager {
         }
 
         let output = run_with_timeout(
-            Command::new(&self.limactl)
-                .args([
-                    "shell", &vm_name, "--",
-                    "sudo", "chmod", "+x", "/usr/local/bin/sandbox-guest",
-                ]),
+            Command::new(&self.limactl).args([
+                "shell",
+                &vm_name,
+                "--",
+                "sudo",
+                "chmod",
+                "+x",
+                "/usr/local/bin/sandbox-guest",
+            ]),
             INSTALL_GUEST_AGENT_STEP_TIMEOUT,
             "limactl shell chmod",
         )
@@ -624,11 +627,14 @@ impl LimaManager {
         // 4. Reload systemd and start the service.
         debug!(vm = %vm_name, "starting guest agent service");
         let output = run_with_timeout(
-            Command::new(&self.limactl)
-                .args([
-                    "shell", &vm_name, "--",
-                    "sudo", "systemctl", "daemon-reload",
-                ]),
+            Command::new(&self.limactl).args([
+                "shell",
+                &vm_name,
+                "--",
+                "sudo",
+                "systemctl",
+                "daemon-reload",
+            ]),
             INSTALL_GUEST_AGENT_STEP_TIMEOUT,
             "limactl shell (daemon-reload)",
         )
@@ -647,11 +653,16 @@ impl LimaManager {
         }
 
         let output = run_with_timeout(
-            Command::new(&self.limactl)
-                .args([
-                    "shell", &vm_name, "--",
-                    "sudo", "systemctl", "enable", "--now", "sandbox-guest",
-                ]),
+            Command::new(&self.limactl).args([
+                "shell",
+                &vm_name,
+                "--",
+                "sudo",
+                "systemctl",
+                "enable",
+                "--now",
+                "sandbox-guest",
+            ]),
             INSTALL_GUEST_AGENT_STEP_TIMEOUT,
             "limactl shell (enable service)",
         )
@@ -679,9 +690,7 @@ impl LimaManager {
         let vm_name = vm_name(session_id);
         for entry in &vms {
             if entry.name.as_deref() == Some(vm_name.as_str()) {
-                return Ok(parse_status_field(
-                    entry.status.as_deref().unwrap_or(""),
-                ));
+                return Ok(parse_status_field(entry.status.as_deref().unwrap_or("")));
             }
         }
         Err(SandboxError::Lima(format!(
@@ -699,8 +708,7 @@ impl LimaManager {
                 if !name.starts_with(VM_NAME_PREFIX) {
                     return None;
                 }
-                let status =
-                    parse_status_field(e.status.as_deref().unwrap_or(""));
+                let status = parse_status_field(e.status.as_deref().unwrap_or(""));
                 let session_id = parse_session_id_from_name(&name);
                 Some(VmInfo {
                     name,
@@ -754,9 +762,7 @@ impl LimaManager {
     pub fn check_base_image(&self) -> Result<BaseImageStatus, SandboxError> {
         // Check if the VM exists.
         let vms = self.list_vms_raw()?;
-        let vm_exists = vms
-            .iter()
-            .any(|e| e.name.as_deref() == Some(BASE_VM_NAME));
+        let vm_exists = vms.iter().any(|e| e.name.as_deref() == Some(BASE_VM_NAME));
 
         if !vm_exists {
             return Ok(BaseImageStatus::Missing);
@@ -831,10 +837,7 @@ impl LimaManager {
         )
         .map_err(|e| match e {
             SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error(
-                    "limactl create (base image)",
-                    std::io::Error::other(msg),
-                )
+                lima_io_error("limactl create (base image)", std::io::Error::other(msg))
             }
             other => other,
         })?;
@@ -857,8 +860,7 @@ impl LimaManager {
             Err(e) => {
                 warn!(error = %e, "base image build failed, cleaning up partial VM");
                 let _ = run_with_timeout(
-                    Command::new(&self.limactl)
-                        .args(["delete", "--force", BASE_VM_NAME]),
+                    Command::new(&self.limactl).args(["delete", "--force", BASE_VM_NAME]),
                     Duration::from_secs(60),
                     "limactl delete (base image cleanup)",
                 );
@@ -890,10 +892,7 @@ impl LimaManager {
         )
         .map_err(|e| match e {
             SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error(
-                    "limactl start (base image)",
-                    std::io::Error::other(msg),
-                )
+                lima_io_error("limactl start (base image)", std::io::Error::other(msg))
             }
             other => other,
         })?;
@@ -921,10 +920,7 @@ impl LimaManager {
         )
         .map_err(|e| match e {
             SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error(
-                    "limactl stop (base image)",
-                    std::io::Error::other(msg),
-                )
+                lima_io_error("limactl stop (base image)", std::io::Error::other(msg))
             }
             other => other,
         })?;
@@ -1009,27 +1005,23 @@ impl LimaManager {
         );
 
         let output = run_with_timeout(
-            Command::new(&self.limactl)
-                .args([
-                    "clone",
-                    BASE_VM_NAME,
-                    &target,
-                    "--cpus",
-                    &cpus.to_string(),
-                    "--memory",
-                    &mib_to_gib_string(memory_mb),
-                    "--disk",
-                    &disk_gb.to_string(),
-                ]),
+            Command::new(&self.limactl).args([
+                "clone",
+                BASE_VM_NAME,
+                &target,
+                "--cpus",
+                &cpus.to_string(),
+                "--memory",
+                &mib_to_gib_string(memory_mb),
+                "--disk",
+                &disk_gb.to_string(),
+            ]),
             CLONE_VM_TIMEOUT,
             "limactl clone",
         )
         .map_err(|e| match e {
             SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error(
-                    "limactl clone",
-                    std::io::Error::other(msg),
-                )
+                lima_io_error("limactl clone", std::io::Error::other(msg))
             }
             other => other,
         })?;
@@ -1166,11 +1158,7 @@ provision:
     /// practice this cannot happen because `WorkspaceMode::parse_flag`
     /// validates the path before it reaches this point, but the check here
     /// acts as defense-in-depth.
-    pub fn generate_template(
-        &self,
-        session_id: &SessionId,
-        config: &SessionConfig,
-    ) -> String {
+    pub fn generate_template(&self, session_id: &SessionId, config: &SessionConfig) -> String {
         // Hostname includes the full 12-hex session id. At 20 chars it is
         // well under the POSIX HOST_NAME_MAX of 64.
         let hostname = format!("sandbox-{session_id}");
@@ -1364,10 +1352,7 @@ provision:
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(
-                &wrapper_path,
-                std::fs::Permissions::from_mode(0o755),
-            )?;
+            std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755))?;
         }
 
         debug!(path = %wrapper_path.display(), "QEMU wrapper script ready");
@@ -1400,8 +1385,7 @@ provision:
         let copy_src = binary_path.to_string_lossy().to_string();
         let copy_dst = format!("{vm_name}:/tmp/sandbox-guest");
         let output = run_with_timeout(
-            Command::new(&self.limactl)
-                .args(["copy", &copy_src, &copy_dst]),
+            Command::new(&self.limactl).args(["copy", &copy_src, &copy_dst]),
             INSTALL_GUEST_AGENT_STEP_TIMEOUT,
             "limactl copy (guest agent)",
         )
@@ -1422,11 +1406,15 @@ provision:
         // 2. Move the binary to /usr/local/bin with sudo and make it executable.
         debug!(vm = %vm_name, "installing guest agent binary");
         let output = run_with_timeout(
-            Command::new(&self.limactl)
-                .args([
-                    "shell", vm_name, "--",
-                    "sudo", "mv", "/tmp/sandbox-guest", "/usr/local/bin/sandbox-guest",
-                ]),
+            Command::new(&self.limactl).args([
+                "shell",
+                vm_name,
+                "--",
+                "sudo",
+                "mv",
+                "/tmp/sandbox-guest",
+                "/usr/local/bin/sandbox-guest",
+            ]),
             INSTALL_GUEST_AGENT_STEP_TIMEOUT,
             "limactl shell mv",
         )
@@ -1445,11 +1433,15 @@ provision:
         }
 
         let output = run_with_timeout(
-            Command::new(&self.limactl)
-                .args([
-                    "shell", vm_name, "--",
-                    "sudo", "chmod", "+x", "/usr/local/bin/sandbox-guest",
-                ]),
+            Command::new(&self.limactl).args([
+                "shell",
+                vm_name,
+                "--",
+                "sudo",
+                "chmod",
+                "+x",
+                "/usr/local/bin/sandbox-guest",
+            ]),
             INSTALL_GUEST_AGENT_STEP_TIMEOUT,
             "limactl shell chmod",
         )
@@ -1499,11 +1491,14 @@ provision:
         // 4. Reload systemd and start the service.
         debug!(vm = %vm_name, "starting guest agent service");
         let output = run_with_timeout(
-            Command::new(&self.limactl)
-                .args([
-                    "shell", vm_name, "--",
-                    "sudo", "systemctl", "daemon-reload",
-                ]),
+            Command::new(&self.limactl).args([
+                "shell",
+                vm_name,
+                "--",
+                "sudo",
+                "systemctl",
+                "daemon-reload",
+            ]),
             INSTALL_GUEST_AGENT_STEP_TIMEOUT,
             "limactl shell (daemon-reload)",
         )
@@ -1522,11 +1517,16 @@ provision:
         }
 
         let output = run_with_timeout(
-            Command::new(&self.limactl)
-                .args([
-                    "shell", vm_name, "--",
-                    "sudo", "systemctl", "enable", "--now", "sandbox-guest",
-                ]),
+            Command::new(&self.limactl).args([
+                "shell",
+                vm_name,
+                "--",
+                "sudo",
+                "systemctl",
+                "enable",
+                "--now",
+                "sandbox-guest",
+            ]),
             INSTALL_GUEST_AGENT_STEP_TIMEOUT,
             "limactl shell (enable service)",
         )
@@ -1551,8 +1551,7 @@ provision:
     /// Run `limactl list --json` and deserialize the raw entries.
     fn list_vms_raw(&self) -> Result<Vec<LimactlListEntry>, SandboxError> {
         let output = run_with_timeout(
-            Command::new(&self.limactl)
-                .args(["list", "--json"]),
+            Command::new(&self.limactl).args(["list", "--json"]),
             LIST_VMS_TIMEOUT,
             "limactl list",
         )
@@ -1624,21 +1623,15 @@ struct LimactlListEntry {
 /// Parse the NDJSON output of `limactl list --json`.
 ///
 /// Each line is a self-contained JSON object.
-fn parse_limactl_list_output(
-    output: &str,
-) -> Result<Vec<LimactlListEntry>, SandboxError> {
+fn parse_limactl_list_output(output: &str) -> Result<Vec<LimactlListEntry>, SandboxError> {
     let mut entries = Vec::new();
     for line in output.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let entry: LimactlListEntry =
-            serde_json::from_str(trimmed).map_err(|e| {
-                SandboxError::Lima(format!(
-                    "failed to parse limactl JSON: {e}"
-                ))
-            })?;
+        let entry: LimactlListEntry = serde_json::from_str(trimmed)
+            .map_err(|e| SandboxError::Lima(format!("failed to parse limactl JSON: {e}")))?;
         entries.push(entry);
     }
     Ok(entries)
@@ -1660,9 +1653,7 @@ fn parse_status_field(s: &str) -> VmStatus {
 /// Wrap an I/O error from spawning limactl.
 fn lima_io_error(context: &str, err: std::io::Error) -> SandboxError {
     if err.kind() == std::io::ErrorKind::NotFound {
-        SandboxError::Lima(format!(
-            "{context}: limactl not found (is Lima installed?)"
-        ))
+        SandboxError::Lima(format!("{context}: limactl not found (is Lima installed?)"))
     } else {
         SandboxError::Lima(format!("{context}: {err}"))
     }
@@ -1682,11 +1673,7 @@ fn resolve_binary_from_path(name: &str) -> Result<PathBuf, SandboxError> {
     let output = Command::new("sh")
         .args(["-c", &format!("command -v {name}")])
         .output()
-        .map_err(|e| {
-            SandboxError::Internal(format!(
-                "failed to run 'command -v {name}': {e}"
-            ))
-        })?;
+        .map_err(|e| SandboxError::Internal(format!("failed to run 'command -v {name}': {e}")))?;
 
     if !output.status.success() {
         return Err(SandboxError::Lima(format!(
@@ -1795,9 +1782,7 @@ mod tests {
         assert_eq!(parse_session_id_from_name("sandbox-not-a-sessionid"), None);
         // Old-style full UUID is no longer accepted.
         assert_eq!(
-            parse_session_id_from_name(
-                "sandbox-550e8400-e29b-41d4-a716-446655440000"
-            ),
+            parse_session_id_from_name("sandbox-550e8400-e29b-41d4-a716-446655440000"),
             None
         );
     }
@@ -1806,9 +1791,9 @@ mod tests {
 
     #[test]
     fn test_generate_template() {
-        let mgr = LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
-        let id =
-            SessionId::parse("550e8400e29b").unwrap();
+        let mgr =
+            LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
+        let id = SessionId::parse("550e8400e29b").unwrap();
         let config = SessionConfig::default(); // 2 CPU, 4096 MB, 20 GB
 
         let template = mgr.generate_template(&id, &config);
@@ -1822,10 +1807,7 @@ mod tests {
             template.contains("vmType: \"qemu\""),
             "template should specify qemu vmType"
         );
-        assert!(
-            template.contains("cpus: 2"),
-            "template should have cpus: 2"
-        );
+        assert!(template.contains("cpus: 2"), "template should have cpus: 2");
         assert!(
             template.contains("memory: \"4GiB\""),
             "template should have memory: 4GiB"
@@ -1884,9 +1866,9 @@ mod tests {
 
     #[test]
     fn test_generate_template_custom_config() {
-        let mgr = LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
-        let id =
-            SessionId::parse("a1b2c3d4e5f6").unwrap();
+        let mgr =
+            LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
+        let id = SessionId::parse("a1b2c3d4e5f6").unwrap();
         let config = SessionConfig {
             cpus: 8,
             memory_mb: 16384,
@@ -1917,7 +1899,8 @@ mod tests {
 
     #[test]
     fn test_generate_template_fractional_memory() {
-        let mgr = LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
+        let mgr =
+            LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
         let id = SessionId::generate();
         let config = SessionConfig {
             cpus: 1,
@@ -1936,9 +1919,9 @@ mod tests {
 
     #[test]
     fn test_generate_template_shared_workspace() {
-        let mgr = LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
-        let id =
-            SessionId::parse("550e8400e29b").unwrap();
+        let mgr =
+            LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
+        let id = SessionId::parse("550e8400e29b").unwrap();
         let config = SessionConfig {
             cpus: 2,
             memory_mb: 4096,
@@ -1980,7 +1963,8 @@ mod tests {
 
     #[test]
     fn test_generate_template_clone_workspace_no_mount() {
-        let mgr = LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
+        let mgr =
+            LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
         let id = SessionId::generate();
         let config = SessionConfig {
             cpus: 1,
@@ -2010,9 +1994,15 @@ mod tests {
     #[test]
     fn test_sanitize_yaml_path_normal_paths() {
         // Normal filesystem paths should pass through unchanged.
-        assert_eq!(sanitize_yaml_path("/home/user/project"), "/home/user/project");
+        assert_eq!(
+            sanitize_yaml_path("/home/user/project"),
+            "/home/user/project"
+        );
         assert_eq!(sanitize_yaml_path("/tmp/my-dir_v2"), "/tmp/my-dir_v2");
-        assert_eq!(sanitize_yaml_path("/home/user/My Project"), "/home/user/My Project");
+        assert_eq!(
+            sanitize_yaml_path("/home/user/My Project"),
+            "/home/user/My Project"
+        );
         assert_eq!(
             sanitize_yaml_path("/home/user/.config/app"),
             "/home/user/.config/app"
@@ -2111,7 +2101,8 @@ mod tests {
 
     #[test]
     fn test_generate_template_hardened_video_audio() {
-        let mgr = LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
+        let mgr =
+            LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
         let id = SessionId::generate();
         let config = SessionConfig {
             cpus: 2,
@@ -2135,7 +2126,8 @@ mod tests {
 
     #[test]
     fn test_generate_template_not_hardened_no_video_audio() {
-        let mgr = LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
+        let mgr =
+            LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
         let id = SessionId::generate();
         let config = SessionConfig {
             cpus: 2,
@@ -2160,7 +2152,8 @@ mod tests {
     #[test]
     fn test_ensure_qemu_wrapper_creates_file() {
         let dir = tempfile::TempDir::new().expect("create temp dir");
-        let mgr = LimaManager::with_limactl_path(dir.path().to_path_buf(), PathBuf::from("limactl"));
+        let mgr =
+            LimaManager::with_limactl_path(dir.path().to_path_buf(), PathBuf::from("limactl"));
 
         let wrapper = mgr.ensure_qemu_wrapper().unwrap();
 
@@ -2191,10 +2184,7 @@ mod tests {
             parse_status_field("Broken"),
             VmStatus::Unknown("Broken".to_string())
         );
-        assert_eq!(
-            parse_status_field(""),
-            VmStatus::Unknown(String::new())
-        );
+        assert_eq!(parse_status_field(""), VmStatus::Unknown(String::new()));
     }
 
     #[test]
@@ -2216,8 +2206,7 @@ mod tests {
                 if !name.starts_with(VM_NAME_PREFIX) {
                     return None;
                 }
-                let status =
-                    parse_status_field(e.status.as_deref().unwrap_or(""));
+                let status = parse_status_field(e.status.as_deref().unwrap_or(""));
                 let session_id = parse_session_id_from_name(&name);
                 Some(VmInfo {
                     name,
@@ -2302,7 +2291,8 @@ mod tests {
     #[test]
     fn test_install_guest_agent_missing_binary() {
         let dir = tempfile::TempDir::new().expect("create temp dir");
-        let mgr = LimaManager::with_limactl_path(dir.path().to_path_buf(), PathBuf::from("limactl"));
+        let mgr =
+            LimaManager::with_limactl_path(dir.path().to_path_buf(), PathBuf::from("limactl"));
         let session_id = SessionId::generate();
 
         let result = mgr.install_guest_agent(
@@ -2365,9 +2355,7 @@ mod tests {
     #[test]
     fn test_qemu_wrapper_includes_cgroup_limits() {
         assert!(
-            QEMU_WRAPPER_SCRIPT.contains(
-                "systemd-run --user --scope --slice=sandbox.slice"
-            ),
+            QEMU_WRAPPER_SCRIPT.contains("systemd-run --user --scope --slice=sandbox.slice"),
             "wrapper must use systemd-run for cgroup limits"
         );
         assert!(
@@ -2431,9 +2419,9 @@ mod tests {
         );
         // When a probe is detected, wrapper must exec without extra args.
         let lines: Vec<&str> = QEMU_WRAPPER_SCRIPT.lines().collect();
-        let has_probe_exec = lines.iter().any(|line| {
-            line.trim().starts_with("exec \"$REAL_QEMU\" \"$@\"")
-        });
+        let has_probe_exec = lines
+            .iter()
+            .any(|line| line.trim().starts_with("exec \"$REAL_QEMU\" \"$@\""));
         assert!(
             has_probe_exec,
             "wrapper must pass probe invocations through without extra args"
@@ -2443,7 +2431,8 @@ mod tests {
     #[test]
     fn test_qemu_wrapper_written_to_filesystem() {
         let dir = tempfile::TempDir::new().expect("create temp dir");
-        let mgr = LimaManager::with_limactl_path(dir.path().to_path_buf(), PathBuf::from("limactl"));
+        let mgr =
+            LimaManager::with_limactl_path(dir.path().to_path_buf(), PathBuf::from("limactl"));
 
         let wrapper_path = mgr
             .ensure_qemu_wrapper()
@@ -2466,8 +2455,7 @@ mod tests {
         }
 
         // Verify content matches the constant.
-        let content =
-            std::fs::read_to_string(&wrapper_path).expect("read wrapper");
+        let content = std::fs::read_to_string(&wrapper_path).expect("read wrapper");
         assert_eq!(
             content, QEMU_WRAPPER_SCRIPT,
             "written content must match constant"
@@ -2478,10 +2466,8 @@ mod tests {
 
     #[test]
     fn test_generate_base_template_valid_yaml_fields() {
-        let mgr = LimaManager::with_limactl_path(
-            PathBuf::from("/tmp/test"),
-            PathBuf::from("limactl"),
-        );
+        let mgr =
+            LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
 
         let template = mgr.generate_base_template();
 
@@ -2572,10 +2558,8 @@ mod tests {
 
     #[test]
     fn test_generate_base_template_deterministic() {
-        let mgr = LimaManager::with_limactl_path(
-            PathBuf::from("/tmp/test"),
-            PathBuf::from("limactl"),
-        );
+        let mgr =
+            LimaManager::with_limactl_path(PathBuf::from("/tmp/test"), PathBuf::from("limactl"));
 
         let t1 = mgr.generate_base_template();
         let t2 = mgr.generate_base_template();
@@ -2703,8 +2687,7 @@ mod tests {
         };
 
         let json = serde_json::to_string_pretty(&meta).unwrap();
-        let deserialized: BaseImageMeta =
-            serde_json::from_str(&json).unwrap();
+        let deserialized: BaseImageMeta = serde_json::from_str(&json).unwrap();
 
         assert_eq!(meta.content_hash, deserialized.content_hash);
         assert_eq!(meta.built_at, deserialized.built_at);
@@ -2786,5 +2769,4 @@ mod tests {
             "guest_agent_path should return a path ending in sandbox-guest"
         );
     }
-
 }

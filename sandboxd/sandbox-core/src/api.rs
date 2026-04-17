@@ -477,10 +477,7 @@ mod tests {
         let json = r#"{"name": "shared-ws", "workspace": "shared:/home/user/project"}"#;
         let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.name.as_deref(), Some("shared-ws"));
-        assert_eq!(
-            req.workspace.as_deref(),
-            Some("shared:/home/user/project")
-        );
+        assert_eq!(req.workspace.as_deref(), Some("shared:/home/user/project"));
         assert!(req.repo.is_none());
     }
 
@@ -553,5 +550,4 @@ mod tests {
         let deser: FileDownloadResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(deser.data, "aGVsbG8=");
     }
-
 }

@@ -7,7 +7,7 @@
 
 use std::process::Command;
 
-use sandbox_core::gateway::{container_name, GatewayManager, GatewayStatus, GATEWAY_IMAGE};
+use sandbox_core::gateway::{GATEWAY_IMAGE, GatewayManager, GatewayStatus, container_name};
 use sandbox_core::network::NetworkManager;
 use sandbox_core::session::SessionId;
 use std::net::Ipv4Addr;
@@ -15,8 +15,7 @@ use std::net::Ipv4Addr;
 #[test]
 fn test_gateway_lifecycle() {
     // Use 10.209.3.0/24 to avoid collisions with other tests.
-    let net_mgr =
-        NetworkManager::new(Ipv4Addr::new(10, 209, 3, 0), 24).unwrap();
+    let net_mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 3, 0), 24).unwrap();
     let gw_mgr = GatewayManager::new();
     let session_id = SessionId::generate();
 
@@ -71,8 +70,7 @@ fn test_gateway_lifecycle() {
 #[test]
 fn test_gateway_nftables_injection_standalone() {
     // Use 10.209.4.0/24 to avoid collisions.
-    let net_mgr =
-        NetworkManager::new(Ipv4Addr::new(10, 209, 4, 0), 24).unwrap();
+    let net_mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 4, 0), 24).unwrap();
     let gw_mgr = GatewayManager::new();
     let session_id = SessionId::generate();
 
@@ -148,10 +146,7 @@ fn test_gateway_nftables_injection_standalone() {
         nft_output.contains("table inet sandbox_dnat"),
         "DNAT table should exist"
     );
-    assert!(
-        nft_output.contains("dnat"),
-        "DNAT rules should be present"
-    );
+    assert!(nft_output.contains("dnat"), "DNAT rules should be present");
 
     // Remove DNAT rules.
     gw_mgr.remove_dnat_rules(&session_id).unwrap();
