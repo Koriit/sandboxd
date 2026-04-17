@@ -61,18 +61,6 @@ pub enum GuestRequest {
     FileDownload {
         path: String,
     },
-    /// Run `git upload-pack` on a repository (used by git fetch/clone).
-    /// `data` is the base64-encoded git protocol input from the client.
-    GitUploadPack {
-        repo_path: String,
-        data: String,
-    },
-    /// Run `git receive-pack` on a repository (used by git push).
-    /// `data` is the base64-encoded git protocol input from the client.
-    GitReceivePack {
-        repo_path: String,
-        data: String,
-    },
 }
 
 /// A response sent from the guest agent back to the host.
@@ -102,12 +90,6 @@ pub enum GuestResponse {
     },
     Error {
         message: String,
-    },
-    /// Result of a git operation. `data` is base64-encoded git protocol output.
-    GitResult {
-        data: String,
-        exit_code: i32,
-        stderr: String,
     },
 }
 
@@ -509,21 +491,6 @@ mod tests {
         };
         let json = serde_json::to_string(&download).unwrap();
         assert!(json.contains(r#""type":"FileDownload"#));
-
-        let git_upload = GuestRequest::GitUploadPack {
-            repo_path: "/home/agent/workspace".into(),
-            data: "aGVsbG8=".into(),
-        };
-        let json = serde_json::to_string(&git_upload).unwrap();
-        assert!(json.contains(r#""type":"GitUploadPack"#));
-        assert!(json.contains(r#""repo_path":"/home/agent/workspace"#));
-
-        let git_receive = GuestRequest::GitReceivePack {
-            repo_path: "/home/agent/workspace".into(),
-            data: "aGVsbG8=".into(),
-        };
-        let json = serde_json::to_string(&git_receive).unwrap();
-        assert!(json.contains(r#""type":"GitReceivePack"#));
     }
 
     #[test]
@@ -570,16 +537,6 @@ mod tests {
         };
         let json = serde_json::to_string(&error).unwrap();
         assert!(json.contains(r#""type":"Error"#));
-
-        let git_result = GuestResponse::GitResult {
-            data: "aGVsbG8=".into(),
-            exit_code: 0,
-            stderr: String::new(),
-        };
-        let json = serde_json::to_string(&git_result).unwrap();
-        assert!(json.contains(r#""type":"GitResult"#));
-        assert!(json.contains(r#""data":"aGVsbG8="#));
-        assert!(json.contains(r#""exit_code":0"#));
     }
 
     #[test]
@@ -603,14 +560,6 @@ mod tests {
             },
             GuestRequest::FileDownload {
                 path: "/home/agent/test.txt".into(),
-            },
-            GuestRequest::GitUploadPack {
-                repo_path: "/home/agent/workspace".into(),
-                data: "aGVsbG8=".into(),
-            },
-            GuestRequest::GitReceivePack {
-                repo_path: "/home/agent/workspace".into(),
-                data: "dGVzdA==".into(),
             },
         ];
 
@@ -657,16 +606,6 @@ mod tests {
             },
             GuestResponse::Error {
                 message: "fail".into(),
-            },
-            GuestResponse::GitResult {
-                data: "aGVsbG8=".into(),
-                exit_code: 0,
-                stderr: String::new(),
-            },
-            GuestResponse::GitResult {
-                data: String::new(),
-                exit_code: 128,
-                stderr: "fatal: not a git repository".into(),
             },
         ];
 

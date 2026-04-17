@@ -1,10 +1,10 @@
-"""E2E tests for M5-S2 git remote transport: verifying the git protocol
-relay between host and sandbox VM via the daemon's git endpoint.
+"""E2E tests for M5-S2 git remote transport: verifying host-to-VM git
+push/fetch via the ``git-remote-sandbox`` remote helper.
 
-These tests exercise the ``git-remote-sandbox`` remote helper (invoked
-automatically by git for ``sandbox::`` URLs), proving that host-to-VM
-git push/fetch works end-to-end via the daemon's ``POST /sessions/{id}/git``
-endpoint.
+Git invokes the ``git-remote-sandbox`` symlink (pointing at the ``sandbox``
+binary) for ``sandbox::`` URLs. The helper speaks git's remote-helper
+protocol on its stdio and tunnels the pack protocol to the in-VM git
+subprocess over ``sandbox ssh``.
 
 These tests boot real Lima/QEMU VMs and are SLOW (3-10 minutes per test).
 Run with generous timeouts:
