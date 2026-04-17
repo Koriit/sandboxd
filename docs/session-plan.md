@@ -24,6 +24,7 @@
 - [Completed session count](#completed-session-count)
 - [Future Milestones](#future-milestones)
   - [F1: macOS Support](#f1-macos-support) — socket_vmnet, Colima, macvlan
+  - [F2: Policy Persistence Hardening](#f2-policy-persistence-hardening) — schema migration playbook, encryption at rest
 
 ## Repo structure
 
@@ -1146,3 +1147,33 @@ Six review tracks, each producing findings that are fixed in-session:
 - Verify all E2E tests pass on both Linux and macOS
 
 **Exit criteria:** Colima crash recovery works. All E2E tests pass on both platforms.
+
+---
+
+### F2: Policy Persistence Hardening (2 sessions)
+
+> **Separate track.** Follow-ups from the `inspect`/`describe` spec that introduced normalized policy persistence. Not on the critical path — the initial persistence change already closes the restart-regression gap.
+
+#### F2-S1: Policy domain-model migration playbook
+
+**Entry criteria:** `inspect`/`describe` spec delivered (policy persistence landed).
+
+**Tasks:**
+- Document the SQL-migration protocol for evolving `Policy` or its nested types beyond what `CREATE TABLE IF NOT EXISTS` tolerates (renaming or removing columns, restructuring rules, changing `CHECK` constraint domains).
+- Define versioning: whether the `session_policies.version` column should be promoted to a load-bearing schema discriminator, or whether migrations rely on code-level SQL generation in `SessionStore::open`.
+- Provide a worked example — at least one fabricated multi-version migration — with data transforms covered by unit tests.
+
+**Exit criteria:** Migration protocol is documented and tested. A fabricated multi-version migration is green in CI.
+
+---
+
+#### F2-S2: Policy blob encryption at rest
+
+**Entry criteria:** F2-S1 complete.
+
+**Tasks:**
+- Evaluate whether `policy_rules` / `policy_rule_http_filters` require at-rest encryption beyond the daemon-user filesystem permission (threat model: multi-tenant host, compromised backup, disk image leak).
+- If needed: integrate with an existing secret source (kernel keyring, platform keychain) and encrypt sensitive columns on write, decrypt on read.
+- If not needed: document the decision in `docs/hardening.md` and close this session.
+
+**Exit criteria:** Explicit decision — encrypted or documented-as-not-needed — landed in the repo.

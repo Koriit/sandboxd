@@ -57,3 +57,11 @@ Unit test count: ~450 tests across 4 crates. Test runner: cargo-nextest (config 
 - Handler return type is `impl IntoResponse` — use `match` on spawn_blocking results, not `?` operator
 - Socket path default: `$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock` (falls back to `~/.local/share/sandboxd/sandboxd.sock`)
 - Git remote helper: `git-remote-sandbox` symlink to `sandbox` binary, uses `sandbox::session/repo-path` URLs
+
+## On-disk compatibility
+
+Session state persists across daemon restarts in `{base_dir}/sessions.db` (SQLite). Schema evolution rules:
+
+- **SQLite columns** (`sessions`, `network_info`, etc.) — adding or changing a column requires an explicit migration step in `SessionStore::open`. Never drop a column without verifying no older daemon needs it.
+- **JSON blob fields** (columns like `config_json`, `network_info` JSON payloads) — when adding a field to a persisted struct (`SessionConfig`, `NetworkInfo`, etc.), make it `Option<T>` with `#[serde(default)]` so records written by older versions still deserialize. Never remove or rename a persisted blob field without a migration.
+- **Forward-compat on rollback** — records written by a newer daemon may be read by an older one during rollback. Use `#[serde(default)]` + unknown-field tolerance to keep this safe.

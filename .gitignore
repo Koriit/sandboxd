@@ -1,6 +1,7 @@
 .obsidian/
 .stfolder/
-.tasks/
+/.tasks/*
+!/.tasks/specs/
 .trash/
 *.swp
 .venv/
