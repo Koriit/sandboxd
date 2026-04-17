@@ -55,7 +55,7 @@ Test runner: cargo-nextest (config at `sandboxd/.config/nextest.toml`).
 - Guest agent communication (TCP-over-SSH) is already async — do not wrap in spawn_blocking
 - Error responses use `error_response()` helper that maps `SandboxError` variants to HTTP status codes
 - Handler return type is `impl IntoResponse` — use `match` on spawn_blocking results, not `?` operator
-- Socket path default: `$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock` (falls back to `~/.local/share/sandboxd/sandboxd.sock`)
+- Socket path default: `$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock` (falls back to `~/.local/share/sandboxd/sandboxd.sock`). Both the daemon and CLI honor the `SANDBOX_SOCKET` env var as an override; an explicit `--socket` flag takes precedence over the env var.
 - Git remote helper: `git-remote-sandbox` symlink to `sandbox` binary, uses `sandbox::session/repo-path` URLs
 
 ## On-disk compatibility

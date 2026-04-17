@@ -20,9 +20,9 @@ struct Cli {
     #[arg(long, global = true, default_value_t = default_socket_path())]
     socket: String,
 
-    /// Suppress interactive prompts (use defaults silently).
-    #[arg(long, short = 'q', global = true)]
-    quiet: bool,
+    /// Assume yes to interactive prompts (use defaults without prompting).
+    #[arg(long, short = 'y', global = true)]
+    yes: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -1259,7 +1259,7 @@ async fn main() {
 
     // Pre-flight base image staleness check for create commands.
     if let Command::Create { no_cache, .. } = &cli.command {
-        if !cli.quiet && !*no_cache {
+        if !cli.yes && !*no_cache {
             check_base_image_staleness(&cli.socket).await;
         }
     }
@@ -2063,7 +2063,7 @@ mod tests {
         assert!(parse_remote_helper_url("/home/agent/workspace").is_err());
     }
 
-    // -- No-cache and quiet flag tests ----------------------------------------
+    // -- No-cache and yes flag tests ------------------------------------------
 
     #[test]
     fn parse_create_with_no_cache() {
@@ -2137,21 +2137,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_quiet_flag_global() {
-        let cli = Cli::parse_from(["sandbox", "-q", "create"]);
-        assert!(cli.quiet, "-q should set quiet to true");
+    fn parse_yes_flag_global() {
+        let cli = Cli::parse_from(["sandbox", "-y", "create"]);
+        assert!(cli.yes, "-y should set yes to true");
     }
 
     #[test]
-    fn parse_quiet_flag_long() {
-        let cli = Cli::parse_from(["sandbox", "--quiet", "ps"]);
-        assert!(cli.quiet, "--quiet should set quiet to true");
+    fn parse_yes_flag_long() {
+        let cli = Cli::parse_from(["sandbox", "--yes", "ps"]);
+        assert!(cli.yes, "--yes should set yes to true");
     }
 
     #[test]
-    fn parse_quiet_default_off() {
+    fn parse_yes_default_off() {
         let cli = Cli::parse_from(["sandbox", "ps"]);
-        assert!(!cli.quiet, "quiet should be false by default");
+        assert!(!cli.yes, "yes should be false by default");
     }
 
     // -- Rebuild-image tests --------------------------------------------------

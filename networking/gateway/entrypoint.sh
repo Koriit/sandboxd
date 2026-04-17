@@ -109,11 +109,12 @@ wait_for_ready() {
 
 # ── Start mitmproxy ─────────────────────────────────────────────────
 
-# Choose the mitmproxy addon: policy enforcement when a config file is
-# present (written by sandboxd), otherwise fall back to pass-through.
-# The policy addon also falls back internally when the config file is
-# absent, but using the dedicated pass-through addon avoids loading the
-# policy machinery when it is not needed.
+# Select the mitmproxy addon based on image variant. Both addon scripts
+# (passthrough_addon.py and policy_addon.py) are baked into the image at
+# build time; the presence of policy_addon.py indicates this image was
+# built with policy enforcement enabled. The dynamic policy data lives
+# at /tmp/mitmproxy/policy.json (written by sandboxd) and is separate
+# from the addon code selected here.
 MITM_ADDON="/etc/mitmproxy/passthrough_addon.py"
 if [[ -f /etc/mitmproxy/policy_addon.py ]]; then
     MITM_ADDON="/etc/mitmproxy/policy_addon.py"

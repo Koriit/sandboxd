@@ -6,10 +6,10 @@ Complete reference for the `sandbox` command-line tool. The CLI communicates wit
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--socket <path>` | `$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock` | Path to the sandboxd Unix socket (falls back to `~/.local/share/sandboxd/sandboxd.sock`) |
-| `--quiet`, `-q` | | Suppress interactive prompts (use defaults silently) |
+| `--socket <path>` | `$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock` | Path to the sandboxd Unix socket (falls back to `~/.local/share/sandboxd/sandboxd.sock`). Also honored by the daemon. Can be overridden by the `SANDBOX_SOCKET` env var; an explicit `--socket` flag takes precedence. |
+| `--yes`, `-y` | | Assume yes to interactive prompts (use defaults without prompting) |
 
-All commands accept the `--socket` and `--quiet` options:
+All commands accept the `--socket` and `--yes` options:
 
 ```bash
 sandbox --socket /tmp/custom.sock ps

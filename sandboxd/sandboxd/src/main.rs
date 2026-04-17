@@ -56,6 +56,12 @@ struct Args {
 
 
 fn default_socket_path() -> String {
+    // Honor SANDBOX_SOCKET as an override (symmetric with the CLI). The
+    // `--socket` flag, when passed explicitly, still takes precedence
+    // because clap only computes this default when no value is given.
+    if let Ok(sock) = std::env::var("SANDBOX_SOCKET") {
+        return sock;
+    }
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
         return format!("{runtime_dir}/sandboxd/sandboxd.sock");
     }

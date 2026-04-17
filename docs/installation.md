@@ -276,7 +276,7 @@ sandbox rm hello
 The CLI cannot reach the daemon socket. Check that:
 
 1. The daemon is running (`ps aux | grep sandboxd`).
-2. The socket path matches. The default is `$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock` (falls back to `~/.local/share/sandboxd/sandboxd.sock` if `$XDG_RUNTIME_DIR` is not set). If you started the daemon with a custom `--socket`, pass the same path to the CLI: `sandbox --socket /path/to/sock ps`.
+2. The socket path matches. The default is `$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock` (falls back to `~/.local/share/sandboxd/sandboxd.sock` if `$XDG_RUNTIME_DIR` is not set). Both the daemon and CLI honor the `SANDBOX_SOCKET` environment variable as an override; if you started the daemon with a custom `--socket` (or via `SANDBOX_SOCKET`), pass the same path to the CLI: `sandbox --socket /path/to/sock ps` or `SANDBOX_SOCKET=/path/to/sock sandbox ps`.
 
 ### "Permission denied" on `/dev/kvm`
 
