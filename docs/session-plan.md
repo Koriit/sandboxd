@@ -1065,6 +1065,157 @@ Six review tracks, each producing findings that are fixed in-session:
 
 ---
 
+### M9-S10: Policy domain refactor — tagged `AssuranceLevel`
+
+**Entry criteria:** M9-S9 complete.
+
+**Spec:** `.tasks/specs/2026-04-17-sandbox-inspect-describe-design.md` — § 5 "Policy persistence (normalized)" → "Domain refactor (prerequisite)" and "Downstream touches". This session delivers the domain-model prerequisite; storage and CLI surfaces arrive in S12 and S13.
+
+**Rationale:** Prerequisite for policy persistence and the `inspect`/`describe` commands. Today `HttpConstraints` expresses rules as independent `methods` and `paths` vecs and the addon enforces them as a cartesian product — so "GET /foo but POST /bar" cannot be written. Refactoring the domain before adding storage and CLI surfaces avoids locking an ambiguous shape into SQL and JSON wire format.
+
+**Tasks:**
+- Refactor `sandboxd/sandbox-core/src/policy.rs`:
+  - Convert `AssuranceLevel` to a tagged enum with `#[serde(tag = "level", rename_all = "snake_case")]`; variants `Deny`, `Transport`, `Tls`, `Http { http_filters: Vec<HttpFilter> }`.
+  - Introduce `HttpFilter { method: HttpMethod, path: String }`.
+  - Introduce `HttpMethod` as a closed enum (`Get`, `Post`, `Put`, `Delete`, `Patch`, `Head`, `Options`, `Trace`, `Connect`, `Any`) — no free-form strings.
+  - Drop the `HttpConstraints` wrapper struct.
+  - `PolicyRule`: add `#[serde(flatten)] level: AssuranceLevel` and `#[serde(default, skip_serializing_if = "Option::is_none")] reason: Option<String>`.
+  - `AssuranceLevel::as_u8`: `Self::Http => 3`.
+- Validation: `PolicyCompiler::compile` rejects `AssuranceLevel::Http { http_filters: vec![] }` with a clear error.
+- Clean break: old-format policy JSON (`{methods, paths}`) fails to deserialize with a message naming the new shape. No auto-conversion.
+- Update `PolicyCompiler` match arms: `Full` → `Http { http_filters }`; mitmproxy JSON emits filter pairs (not independent arrays).
+- Rewrite `networking/mitmproxy/` addon request-match logic to iterate filter pairs and match `(method, path)` — not cartesian. Update addon unit tests.
+- Regenerate JSON schema via `schemars`; confirm `"full"` → `"http"` in any published schema.
+- Update policy unit tests (fixtures, assertions, old-format deserialization failure).
+- Update `docs/policy.md` examples to the new flat wire shape.
+- Verify nftables / CoreDNS / Envoy compilation paths are unaffected (none handle HTTP-level filters).
+
+**Exit criteria:**
+1. `AssuranceLevel` is a tagged enum carrying `http_filters` only in the `Http` variant; `HttpConstraints` removed.
+2. Mitmproxy addon matches `(method, path)` pairs, not cartesian products — covered by unit tests.
+3. Old-format policy JSON fails deserialization with a clear error; no fallback path exists.
+4. Empty `http_filters` rejected at compile time.
+5. All Rust unit tests, mitmproxy addon tests, and existing policy E2E tests pass.
+
+---
+
+### M9-S11: Session config enrichment and API DTO layer
+
+**Entry criteria:** M9-S10 complete.
+
+**Spec:** `.tasks/specs/2026-04-17-sandbox-inspect-describe-design.md` — § 3 "API surface" (DTO layer, endpoint behaviour) and § 4 "Session persistence schema". Prepares the wire contract and persisted fields that S12 and S13 rely on.
+
+**Rationale:** `SessionConfig` currently drops the `repo`, `boot_cmd`, and `template` inputs once the session is created — so `inspect`/`describe` could never show them. At the same time, the API still flattens domain structs into wire responses; adding fields to a domain type silently changes the wire contract. This session plumbs the missing config fields and introduces the explicit DTO boundary required by the design.
+
+**Tasks:**
+- Extend `SessionConfig` in `sandboxd/sandbox-core/src/session.rs`:
+  - Add `repo: Option<String>`, `boot_cmd: Option<String>`, `template: Option<String>` — each `#[serde(default)]` for forward-compat with existing `config_json` records.
+  - No SQL migration needed (JSON blob column); document the choice inline per `CLAUDE.md` on-disk compat rules.
+- Wire `POST /sessions` handler to copy `repo` / `boot_cmd` / `template` from `CreateSessionRequest` into `SessionConfig` before persisting.
+- New DTO module `sandboxd/sandbox-core/src/api.rs` (or similar):
+  - `SessionDto { id, name, state, created_at, updated_at, config: SessionConfigDto, guest_agent_status, gateway_status, policy: Option<PolicyDto> }`.
+  - `SessionConfigDto { cpus, memory_mb, disk_gb, workspace_mode, hardened, repo, boot_cmd, template }`.
+  - `PolicyDto` — wrapper controlling wire representation of domain `Policy` independently.
+  - `policy` uses `#[serde(skip_serializing_if = "Option::is_none")]`.
+- New mapper module `sandboxd/sandbox-core/src/api/mapper.rs`: explicit `From<&Session> for SessionDto`, `From<&Policy> for PolicyDto`, etc. Adding a new domain field is inert on the wire until the mapper is updated.
+- Update endpoint wiring:
+  - `GET /sessions` returns `Vec<SessionDto>` with `policy: None` for every entry (cheap list).
+  - `GET /sessions/{id}` populates `policy` by looking up the in-memory map.
+  - `POST /sessions` response echoes the created `SessionDto`.
+  - `GET /sessions/{id}/health` unchanged — keeps its focused schema.
+- Unit tests: old `config_json` round-trips without the new fields; `From<&Session>` omits `policy` when `None`; `PolicyDto` serializes `AssuranceLevel::Http` with flattened `http_filters`.
+- Integration tests: `GET /sessions` omits `policy` field; `POST /sessions` with all three new fields round-trips to a later `GET /sessions/{id}`.
+
+**Exit criteria:**
+1. `SessionConfig` persists `repo`/`boot_cmd`/`template`; pre-existing records deserialize cleanly with `None`.
+2. API responses go through explicit DTOs — no `#[serde(flatten)]` of domain structs into wire types.
+3. `GET /sessions/{id}` returns `policy` when an in-memory policy exists; `GET /sessions` omits it.
+4. All unit and integration tests pass.
+
+---
+
+### M9-S12: Policy persistence — normalized SQL storage
+
+**Entry criteria:** M9-S11 complete.
+
+**Spec:** `.tasks/specs/2026-04-17-sandbox-inspect-describe-design.md` — § 5 "Policy persistence (normalized)" (Storage schema, Write path, Read path, Startup hydration, Corrupt data handling) and § 6 "Testing" → "E2E test". The restart-survival E2E test here is the concrete deliverable named by § 1's motivation.
+
+**Rationale:** Closes a silent security regression. Today applied policies live only in an in-memory `HashMap`; on daemon restart the map is empty and gateways are reconstituted with an allow-all DNS policy. This session normalizes policies into SQLite and hydrates them on startup before gateway reconciliation.
+
+**Tasks:**
+- Add three tables to `SessionStore::open` (idempotent `CREATE TABLE IF NOT EXISTS`):
+  - `session_policies(session_id PK, version)` — FK to `sessions` with `ON DELETE CASCADE`.
+  - `policy_rules(session_id, rule_order, destination_kind, destination_value, level, protocol, reason)` — composite PK, `CHECK` on enum columns, `ON DELETE CASCADE` from `session_policies`.
+  - `policy_rule_http_filters(session_id, rule_order, filter_order, method, path_pattern)` — composite PK, `CHECK` on `method`, `ON DELETE CASCADE` from `policy_rules`.
+- Implement in `sandboxd/sandbox-core/src/store.rs`:
+  - `set_policy(session_id, &Policy)` — transactional: DELETE parent (cascades), INSERT parent, INSERT rules in order, INSERT http filters for `Http` rules.
+  - `get_policy(session_id) -> Option<Policy>` — absent parent row means no policy; reassemble rules and filters in `ORDER BY rule_order` / `filter_order`.
+  - `load_all_policies() -> Vec<(SessionId, Policy)>` — startup hydration source.
+- Update `POST /sessions/{id}/policy` handler:
+  - Validate/compile → distribute to gateway → DB transaction (set_policy) → in-memory map insert.
+  - DB failure surfaces to client; memory map untouched. Crash between DB commit and memory write is recovered from DB on next startup.
+- Daemon startup (`sandboxd/sandboxd/src/main.rs`): iterate `load_all_policies` before `reconcile_networking`. Gateway restore then finds policies warm and `reapply_session_policy` pushes them to fresh gateway containers.
+- Corrupt-data handling: if reassembly fails (missing parent, constraint violation, deserialization error), log a warning with `session_id` + error and leave the map entry absent. Next policy apply overwrites. Do not crash the daemon.
+- Unit tests:
+  - `SessionStore::set_policy` + `get_policy` round-trip, including `Http` rules with multiple filters.
+  - `load_all_policies` returns every persisted policy.
+  - Corrupt row (e.g. forced constraint failure in a detached fixture) logs and returns `None` without panicking.
+- Integration test: apply policy → drop and reopen `SessionStore` → in-memory map rebuilt from DB and equals the applied policy.
+- E2E test (`tests/e2e/`): new file covering the restart regression fix.
+  1. Start daemon (standard fixture), create a session, apply a restrictive policy (allow `github.com:443`, deny the rest).
+  2. Curl from inside the guest: allowed destination succeeds, denied destination fails.
+  3. SIGTERM the daemon, await exit, restart with the same `base_dir`.
+  4. Re-run both curls — without re-posting the policy. Allowed still succeeds; denied still fails.
+
+**Exit criteria:**
+1. Policies persist to SQLite and survive daemon restart; no silent allow-all regression on restart.
+2. Write path is atomic: DB commit precedes in-memory update; failures leave the in-memory map untouched.
+3. Corrupt persisted rows are logged and skipped; daemon starts successfully.
+4. New E2E test passes on two consecutive runs with zero flakes.
+5. All unit and integration tests pass.
+
+---
+
+### M9-S13: `sandbox inspect` and `sandbox describe` CLI commands
+
+**Entry criteria:** M9-S12 complete.
+
+**Spec:** `.tasks/specs/2026-04-17-sandbox-inspect-describe-design.md` — § 2 "CLI surface" (error behaviour, `describe` output layout, `inspect` output, multi-session semantics) and § 6 "Testing" → "CLI unit tests". This session closes out the user-facing deliverable named in § 1.
+
+**Rationale:** With the DTO boundary and policy persistence in place, surface session state to users. `inspect` targets machine consumers (jq, scripts); `describe` targets humans debugging a running session.
+
+**Tasks:**
+- Add `sandbox inspect <session>...` subcommand:
+  - Accepts N session names or UUIDs; resolves each via the existing name-or-id lookup.
+  - Emits a pretty-printed JSON array of `SessionDto`, in input order.
+  - Issues N parallel `GET /sessions/{id}` calls; collects responses in input order.
+- Add `sandbox describe <session>...` subcommand:
+  - Accepts N session names or UUIDs.
+  - Renders human-readable sections (header, `Config:`, `Runtime:`, `Policy:`), separated by blank lines between sessions, per the layout in the spec.
+  - Policy block: version + rule count header, then indented rule blocks with `protocol`, `http_filters` lines (one per filter), and `reason` when present. Collapse to `Policy: none` when DTO omits `policy`.
+- Strict atomic error handling for both commands:
+  - Resolve every id against the daemon first. If any resolves to not-found, write to stderr naming the first missing id, exit non-zero, emit no stdout.
+  - Successful sessions earlier in the argument list are not printed.
+- No batch API endpoint — N parallel per-session GETs.
+- CLI unit tests:
+  - `inspect` with two ids → stdout parses as a JSON array of length 2 in input order.
+  - `inspect` with one missing id → non-zero exit, stderr message naming the missing id, no stdout.
+  - `describe` renders `Policy: none` when DTO has no `policy`.
+  - `describe` renders full rule block for N rules including `http_filters` lines.
+  - `describe` sections for M sessions are separated by blank lines.
+- Docs:
+  - Add `inspect` and `describe` sections to `docs/cli-reference.md` with sample output.
+  - Cross-link from `docs/policy.md` where current-policy visibility matters.
+
+**Exit criteria:**
+1. `sandbox inspect <a> <b>` emits a JSON array of length 2 parseable by `jq`.
+2. `sandbox describe <a>` renders the full layout (header, Config, Runtime, Policy) and collapses to `Policy: none` when absent.
+3. Any missing id among N arguments causes non-zero exit with no stdout.
+4. CLI unit tests pass; `docs/cli-reference.md` documents both commands.
+5. Manual smoke test: create a session, apply a policy, run both commands and confirm output matches the spec layout.
+
+---
+
 ## Risks
 
 | Risk | Impact | Mitigation |
@@ -1091,8 +1242,8 @@ Six review tracks, each producing findings that are fixed in-session:
 | M7 | 1 |
 | M8 | 3 |
 | M8.5 | 4 |
-| M9 | 9 |
-| **Total** | **43** |
+| M9 | 13 |
+| **Total** | **47** |
 
 ---
 
