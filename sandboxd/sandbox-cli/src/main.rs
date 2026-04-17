@@ -144,30 +144,6 @@ enum Command {
         /// Session name or ID.
         session: String,
     },
-    /// Relay the git pack protocol to a repository inside a sandbox VM.
-    ///
-    /// End users do not invoke this directly. Instead, the `sandbox` binary is
-    /// symlinked as `git-remote-sandbox`, and git calls that symlink whenever it
-    /// encounters a `sandbox::<session-id>/<repo-path>` URL. The symlink speaks
-    /// the git remote-helper protocol on stdin/stdout and tunnels the git pack
-    /// protocol to the repository inside the target session VM.
-    ///
-    /// Example:
-    ///
-    ///     git remote add origin sandbox::my-session/home/agent/workspace
-    ///
-    /// Then use `git push origin main`, `git pull origin main`, etc.
-    #[command(name = "git-remote")]
-    GitRemote {
-        /// Git service name (e.g., git-upload-pack or git-receive-pack),
-        /// passed by git as %S.
-        service: String,
-        /// Session name or ID.
-        session: String,
-        /// Path to the git repository inside the VM (default: /home/agent/workspace).
-        #[arg(long, default_value = "/home/agent/workspace")]
-        repo_path: String,
-    },
     /// Rebuild the pre-baked base VM image.
     RebuildImage,
 }
@@ -361,8 +337,8 @@ fn build_request(command: &Command) -> Option<Request<String>> {
             .uri("/rebuild-image")
             .body(String::new())
             .expect("failed to build request"),
-        // Ssh, Logs, Cp, and GitRemote are handled specially -- not via a single HTTP request.
-        Command::Ssh { .. } | Command::Logs { .. } | Command::Cp { .. } | Command::GitRemote { .. } => return None,
+        // Ssh, Logs, and Cp are handled specially -- not via a single HTTP request.
+        Command::Ssh { .. } | Command::Logs { .. } | Command::Cp { .. } => return None,
     };
     Some(req)
 }
@@ -593,9 +569,9 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
         Command::RebuildImage => {
             eprintln!("Done.");
         }
-        Command::Ssh { .. } | Command::Logs { .. } | Command::Cp { .. } | Command::GitRemote { .. } => {
-            // Ssh, Logs, Cp, and GitRemote are handled separately, should not reach here.
-            unreachable!("ssh/logs/cp/git-remote commands should be handled before send_request");
+        Command::Ssh { .. } | Command::Logs { .. } | Command::Cp { .. } => {
+            // Ssh, Logs, and Cp are handled separately, should not reach here.
+            unreachable!("ssh/logs/cp commands should be handled before send_request");
         }
     }
 
@@ -996,121 +972,6 @@ async fn handle_cp_download(
     }
 }
 
-/// Handle the `git-remote` subcommand: relay git protocol between stdin/stdout
-/// and the sandbox VM via the daemon's git endpoint.
-///
-/// This is the low-level handler for the `sandbox git-remote <service> <session>`
-/// clap subcommand.  It is not reached by the git-remote-sandbox helper flow
-/// (see `run_remote_helper`), which tunnels the pack protocol via `sandbox ssh`
-/// instead.  Reads git protocol data from stdin, forwards it to the daemon's
-/// git endpoint, and writes the response bytes back to stdout.
-async fn handle_git_remote(
-    socket_path: &str,
-    service: &str,
-    session: &str,
-    repo_path: &str,
-) {
-    use std::io::Read;
-
-    // Map the git service name to our operation.
-    let operation = match service {
-        "git-upload-pack" => "upload-pack",
-        "git-receive-pack" => "receive-pack",
-        other => {
-            eprintln!("Error: unsupported git service: {other}");
-            eprintln!("Supported: git-upload-pack, git-receive-pack");
-            process::exit(1);
-        }
-    };
-
-    // Read all of stdin (the git protocol data from the local git client).
-    let mut stdin_data = Vec::new();
-    if let Err(e) = std::io::stdin().read_to_end(&mut stdin_data) {
-        eprintln!("Error: failed to read git data from stdin: {e}");
-        process::exit(1);
-    }
-
-    // Base64-encode the input data.
-    let encoded_input = BASE64.encode(&stdin_data);
-
-    // Build and send the request to the daemon.
-    let body = serde_json::json!({
-        "operation": operation,
-        "repo_path": repo_path,
-        "data": encoded_input,
-    });
-    let req = Request::builder()
-        .method("POST")
-        .uri(format!("/sessions/{session}/git"))
-        .header("content-type", "application/json")
-        .body(body.to_string())
-        .expect("failed to build request");
-
-    let (status, resp_body) = match send_request(socket_path, req).await {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("{e}");
-            process::exit(128);
-        }
-    };
-
-    if !status.is_success() {
-        if let Ok(api_err) = serde_json::from_str::<ApiError>(&resp_body) {
-            eprintln!("Error: {}", api_err.error);
-        } else {
-            eprintln!("Error ({status}): {resp_body}");
-        }
-        process::exit(128);
-    }
-
-    // Parse the response.
-    let git_resp: serde_json::Value = match serde_json::from_str(&resp_body) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("Error: failed to parse git response: {e}");
-            process::exit(128);
-        }
-    };
-
-    // Decode the base64 output data and write to stdout.
-    if let Some(data_b64) = git_resp.get("data").and_then(|d| d.as_str()) {
-        let decoded = match BASE64.decode(data_b64) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("Error: failed to decode git response data: {e}");
-                process::exit(128);
-            }
-        };
-
-        use std::io::Write;
-        if let Err(e) = std::io::stdout().write_all(&decoded) {
-            eprintln!("Error: failed to write git data to stdout: {e}");
-            process::exit(128);
-        }
-        if let Err(e) = std::io::stdout().flush() {
-            eprintln!("Error: failed to flush stdout: {e}");
-            process::exit(128);
-        }
-    }
-
-    // Print stderr from the git subprocess (if any) to our stderr.
-    if let Some(stderr) = git_resp.get("stderr").and_then(|s| s.as_str()) {
-        if !stderr.is_empty() {
-            eprint!("{stderr}");
-        }
-    }
-
-    // Exit with the git subprocess exit code.
-    let exit_code = git_resp
-        .get("exit_code")
-        .and_then(|c| c.as_i64())
-        .unwrap_or(0) as i32;
-
-    if exit_code != 0 {
-        process::exit(exit_code);
-    }
-}
-
 /// Check whether this binary was invoked as `git-remote-sandbox` (i.e. as a
 /// git remote helper).  Returns `true` if argv[0] ends with
 /// `git-remote-sandbox`, in which case the caller should enter remote-helper
@@ -1393,17 +1254,6 @@ async fn main() {
     } = &cli.command
     {
         handle_logs(&cli.socket, session, component, *follow, *tail).await;
-        return;
-    }
-
-    // Handle git-remote specially — it relays git protocol via stdin/stdout.
-    if let Command::GitRemote {
-        service,
-        session,
-        repo_path,
-    } = &cli.command
-    {
-        handle_git_remote(&cli.socket, service, session, repo_path).await;
         return;
     }
 
@@ -2173,62 +2023,6 @@ mod tests {
         // Only splits on first colon.
         let result = parse_remote_spec("session:/path/with:colon");
         assert_eq!(result, Some(("session", "/path/with:colon")));
-    }
-
-    #[test]
-    fn parse_git_remote() {
-        let cli = Cli::parse_from([
-            "sandbox",
-            "git-remote",
-            "git-upload-pack",
-            "my-session",
-        ]);
-        match &cli.command {
-            Command::GitRemote {
-                service,
-                session,
-                repo_path,
-            } => {
-                assert_eq!(service, "git-upload-pack");
-                assert_eq!(session, "my-session");
-                assert_eq!(repo_path, "/home/agent/workspace");
-            }
-            _ => panic!("expected GitRemote command"),
-        }
-    }
-
-    #[test]
-    fn parse_git_remote_with_repo_path() {
-        let cli = Cli::parse_from([
-            "sandbox",
-            "git-remote",
-            "git-receive-pack",
-            "my-session",
-            "--repo-path",
-            "/root/myrepo",
-        ]);
-        match &cli.command {
-            Command::GitRemote {
-                service,
-                session,
-                repo_path,
-            } => {
-                assert_eq!(service, "git-receive-pack");
-                assert_eq!(session, "my-session");
-                assert_eq!(repo_path, "/root/myrepo");
-            }
-            _ => panic!("expected GitRemote command"),
-        }
-    }
-
-    #[test]
-    fn build_git_remote_returns_none() {
-        let cmd = Command::GitRemote {
-            service: "git-upload-pack".into(),
-            session: "abc".into(),
-            repo_path: "/home/agent/workspace".into(),
-        };
-        assert!(build_request(&cmd).is_none());
     }
 
     // -- Remote helper URL parsing tests ------------------------------------

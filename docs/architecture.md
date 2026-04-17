@@ -197,7 +197,6 @@ sandbox prints stdout, exits with code 0
 | POST | `/sessions/{id}/exec` | `exec_in_session` | Execute a command |
 | POST | `/sessions/{id}/upload` | `upload_to_session` | Upload a file |
 | POST | `/sessions/{id}/download` | `download_from_session` | Download a file |
-| POST | `/sessions/{id}/git` | `git_in_session` | Relay a git operation |
 | POST | `/sessions/{id}/policy` | `update_policy` | Update network policy |
 | GET | `/sessions/{id}/health` | `session_health` | Per-session health |
 | GET | `/health` | `health_check` | Global health |

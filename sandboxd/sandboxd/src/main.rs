@@ -14,10 +14,10 @@ use clap::Parser;
 use sandbox_core::{
     ApiError, AssuranceLevel, BaseImageStatus, CaManager, CoreDnsConfig, CreateSessionRequest,
     Destination, DnsCache, ExecRequest, ExecResponse, FileDownloadRequest, FileDownloadResponse,
-    FileUploadRequest, GatewayHealth, GatewayManager, GatewayStatus, GitRequest, GitResponse,
-    GuestConnector, GuestRequest, GuestResponse, LimaManager, NetworkHealth, NetworkManager,
-    Policy, PolicyCompiler, PolicyDistributor, SandboxError, Session, SessionConfig, SessionHealth,
-    SessionId, SessionResponse, SessionState, SessionStore, UpdatePolicyRequest, VmStatus,
+    FileUploadRequest, GatewayHealth, GatewayManager, GatewayStatus, GuestConnector, GuestRequest,
+    GuestResponse, LimaManager, NetworkHealth, NetworkManager, Policy, PolicyCompiler,
+    PolicyDistributor, SandboxError, Session, SessionConfig, SessionHealth, SessionId,
+    SessionResponse, SessionState, SessionStore, UpdatePolicyRequest, VmStatus,
     attach_vm_to_bridge, detach_vm_from_bridge, generate_ca_inject_script, mac_from_session_id,
     propagate_dns_changes, read_resolved_json, write_file_to_container,
 };
@@ -215,7 +215,6 @@ fn app(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}/exec", post(exec_in_session))
         .route("/sessions/{id}/upload", post(upload_to_session))
         .route("/sessions/{id}/download", post(download_from_session))
-        .route("/sessions/{id}/git", post(git_in_session))
         .route("/sessions/{id}/policy", post(update_policy))
         .route("/sessions/{id}/health", get(session_health))
         .route("/rebuild-image", post(rebuild_image))
@@ -1430,83 +1429,6 @@ async fn download_from_session(
         }
         Err(e) => {
             error!(session_id = %session.id, error = %e, "guest agent download failed");
-            error_response(e).into_response()
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Git transport handler
-// ---------------------------------------------------------------------------
-
-/// `POST /sessions/{id}/git` -- relay a git protocol operation to the VM.
-async fn git_in_session(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(req): Json<GitRequest>,
-) -> impl IntoResponse {
-    let session = match state.store.get_session_by_name_or_id(&id) {
-        Ok(Some(s)) => s,
-        Ok(None) => {
-            return error_response(SandboxError::SessionNotFound(id)).into_response()
-        }
-        Err(e) => return error_response(e).into_response(),
-    };
-
-    if session.state != SessionState::Running {
-        return error_response(SandboxError::InvalidState(format!(
-            "cannot run git operation in session with state {} (must be running)",
-            session.state
-        )))
-        .into_response();
-    }
-
-    let guest_request = match req.operation.as_str() {
-        "upload-pack" => GuestRequest::GitUploadPack {
-            repo_path: req.repo_path,
-            data: req.data,
-        },
-        "receive-pack" => GuestRequest::GitReceivePack {
-            repo_path: req.repo_path,
-            data: req.data,
-        },
-        other => {
-            return error_response(SandboxError::InvalidState(format!(
-                "unsupported git operation: {other} (must be 'upload-pack' or 'receive-pack')"
-            )))
-            .into_response();
-        }
-    };
-
-    match state.guest.send_request(&session.id, guest_request).await {
-        Ok(GuestResponse::GitResult {
-            data,
-            exit_code,
-            stderr,
-        }) => {
-            let response = GitResponse {
-                data,
-                exit_code,
-                stderr,
-            };
-            (StatusCode::OK, Json(response)).into_response()
-        }
-        Ok(GuestResponse::Error { message }) => {
-            error!(session_id = %session.id, %message, "guest agent git error");
-            error_response(SandboxError::Internal(format!(
-                "guest agent error: {message}"
-            )))
-            .into_response()
-        }
-        Ok(other) => {
-            error!(session_id = %session.id, ?other, "unexpected guest response to git");
-            error_response(SandboxError::Internal(
-                "unexpected response from guest agent".into(),
-            ))
-            .into_response()
-        }
-        Err(e) => {
-            error!(session_id = %session.id, error = %e, "guest agent git failed");
             error_response(e).into_response()
         }
     }
