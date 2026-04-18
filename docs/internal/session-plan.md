@@ -1257,6 +1257,91 @@ Unrestricted mode is intentionally a normal `Policy` value (stored in SQLite, ro
 
 ---
 
+### M9-S16: Docs site — framework and Session 1 content
+
+**Entry criteria:** M9-S15 complete.
+
+**Spec:** `.tasks/specs/2026-04-17-docs-site-design.md` — §§ 2, 3, 4, 5, 6, 9, 10 and the Session-1 rows of § 7.1. Promotes the spec's "Session 1 — Site is live and useful" phase into an implementation session.
+
+**Rationale:** Stand up the documentation site as a live, deployable artifact before churning the full content surface. Delivering the landing page plus the quickstart → install → architecture → CLI → troubleshooting arc first means every subsequent page lands on a working framework, and the primary 5-minute user journey (land → install → run first session → look up commands) is satisfied end-to-end from day one.
+
+**Tasks:**
+- Scaffold Astro Starlight under `site/`:
+  - `site/package.json`, `site/astro.config.mjs`, `site/.nvmrc` (Node pin), `site/src/` as needed.
+  - Content loader pointed at `../docs/**/*.md`; keep `docs/` as pure markdown (GitHub-readable, no build-file pollution).
+  - Left-hand nav groups ordered per § 3: `Start here`, `Guides`, `Concepts`, `Reference`.
+  - Starlight frontmatter schema enforcing required `title` and `description`.
+- Move planning docs out of the published tree into `docs/internal/`:
+  - `docs/session-plan.md`, `docs/plan-vs-implementation.md`, `docs/review-report.md`.
+  - Delete `docs/README.md` (replaced by the Starlight landing at `docs/index.md`).
+- Move logo asset from `.tasks/specs/sandboxd-icon.svg` to `site/public/logo.svg`; wire it as both favicon and header logo via `astro.config.mjs`.
+- Diagram toolchain: add `rehype-mermaid` with SVG output (no client-side JS) and register two Mermaid themes that Starlight swaps on light/dark mode. Author diagrams as fenced ```` ```mermaid ```` blocks inside `.md` so GitHub still renders them.
+- Makefile targets: `make docs-dev` → `cd site && npm install && npm run dev`; `make docs-build` → `cd site && npm install && npm run build`.
+- GitHub Actions workflow `.github/workflows/docs.yml`:
+  - Trigger on push to `main` touching `docs/**` or `site/**`.
+  - Install Node per `site/.nvmrc`, `npm install`, run `astro check` + `tsc`, run build (which also runs `starlight-links-validator`), and deploy via `actions/deploy-pages` (Actions-as-source; no `gh-pages` branch).
+- CI quality gates on every build: `astro check` + `tsc` pass; `starlight-links-validator` fails the build on broken internal links; frontmatter schema rejects missing `title`/`description`.
+- Author the 7 Session-1 pages with frontmatter (`title`, `description`) and kebab-case URLs:
+  - `docs/index.md` — landing: hero, value prop, 3 CTAs (Quickstart, Concepts, Reference). Fresh content.
+  - `docs/start/what-is-sandboxd.md` — one-pager: what it is, problems it solves, when to use. Fresh, seeded from repo-root `README.md` intro.
+  - `docs/start/quickstart.md` — 5-minute install → run first session → shell into it. Fresh.
+  - `docs/start/installation.md` — light migration merging `installation.md` + `lima-linux-install.md`.
+  - `docs/concepts/architecture.md` — light migration of `architecture.md` plus one new Mermaid architecture diagram.
+  - `docs/reference/cli.md` — light migration of `cli-reference.md`.
+  - `docs/guides/troubleshooting.md` — light migration of `troubleshooting.md`.
+
+**Exit criteria:**
+1. `make docs-build` exits 0 locally and in CI.
+2. `.github/workflows/docs.yml` deploys the site to GitHub Pages via `actions/deploy-pages` on push to `main` touching `docs/**` or `site/**`; no `gh-pages` branch exists.
+3. The 7 Session-1 pages exist under `docs/` with required frontmatter and are reachable from the left-hand nav groups `Start here`, `Guides`, `Concepts`, `Reference`.
+4. `starlight-links-validator` passes; `astro check` + `tsc` pass as part of the CI build.
+5. Mermaid blocks in `concepts/architecture` render as SVG at build time and remain natively rendered on GitHub when browsing the `.md` file.
+6. Planning docs have moved to `docs/internal/` (`session-plan.md`, `plan-vs-implementation.md`, `review-report.md`); `docs/README.md` is deleted; the repo-root `README.md` is untouched.
+7. `site/public/logo.svg` exists and serves as both favicon and header logo; `.tasks/specs/sandboxd-icon.svg` is removed.
+8. `make docs-dev` serves the site locally and a first-time visitor can walk the primary journey: land → install → run first session → look up commands.
+
+---
+
+### M9-S17: Docs site — complete content
+
+**Entry criteria:** M9-S16 complete.
+
+**Spec:** `.tasks/specs/2026-04-17-docs-site-design.md` — Session-2 rows of § 7.1 and § 9 Session-2 diagrams. Promotes the spec's "Session 2 — Docs are complete" phase into an implementation session.
+
+**Rationale:** Session 1 leaves 12 pages unwritten, including the concept/how-to splits that are the core of the content rewrite. Finish the taxonomy so every nav entry resolves to real content and the site stops leaning on the legacy `docs/*.md` pages that live underneath it.
+
+**Tasks:**
+- Split existing combined concept+how-to docs into separate guide and concept pages (6 rewrites):
+  - `docs/guides/workspaces.md` and `docs/concepts/workspaces.md` from `workspaces.md`.
+  - `docs/guides/network-policies.md` and `docs/concepts/networking.md` from `policy.md` (how-to half) and `networking.md` (concept half).
+  - `docs/guides/hardening.md` from `hardening.md`.
+  - `docs/concepts/policy-model.md` from `policy.md` (concept half).
+  - Each split page is a real rewrite, not a copy: concept pages explain the model; guide pages are task-oriented, imperative, copy-pasteable.
+- Author fresh pages:
+  - `docs/concepts/sessions.md` — what a session is, lifecycle, persistence.
+  - `docs/guides/first-real-session.md` — beyond quickstart: workspaces, policies, realistic flow.
+  - `docs/guides/integrate-agent.md` — plug into Claude Code / other agents / CI.
+  - `docs/reference/http-api.md` — the HTTP socket API (currently undocumented in the repo).
+  - `docs/reference/config.md` — daemon config reference.
+- Light migrations:
+  - `docs/concepts/logging.md` from `deployment-logging.md`.
+- Session-2 Mermaid diagrams, authored as ```` ```mermaid ```` fenced blocks so GitHub still renders them natively:
+  - Networking flow sequence diagram inside `concepts/networking`.
+  - Session lifecycle state diagram inside `concepts/sessions`.
+- Voice and length per § 8: second person, present tense, imperative for steps; split any page exceeding roughly 400 lines.
+- Every new page carries the required `title` and `description` frontmatter; URLs are kebab-case.
+- Update the left-hand nav wiring in `astro.config.mjs` so all 19 total pages appear under the four groups in the order defined by § 3.
+
+**Exit criteria:**
+1. All 19 pages defined in § 3 / § 7.1 exist under `docs/` with required frontmatter and appear in the left-hand nav.
+2. `make docs-build` exits 0 locally and in CI with `starlight-links-validator`, `astro check`, and `tsc` passing.
+3. The six rewrite pages are materially distinct from their source files — concept pages focus on the model, guide pages focus on tasks; neither is a straight copy of the legacy combined doc.
+4. The networking sequence diagram and session lifecycle state diagram render as SVG at build time and render natively on GitHub when browsing the `.md` source.
+5. No page exceeds roughly 400 lines; any that would are split.
+6. The legacy `docs/*.md` sources superseded by the new structure are no longer referenced from the published nav (light-migration sources that have been absorbed are either removed or relocated so they don't produce duplicate pages).
+
+---
+
 ## Risks
 
 | Risk | Impact | Mitigation |
@@ -1283,8 +1368,8 @@ Unrestricted mode is intentionally a normal `Policy` value (stored in SQLite, ro
 | M7 | 1 |
 | M8 | 3 |
 | M8.5 | 4 |
-| M9 | 15 |
-| **Total** | **49** |
+| M9 | 17 |
+| **Total** | **51** |
 
 ---
 

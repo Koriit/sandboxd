@@ -1,6 +1,11 @@
-# Troubleshooting
+---
+title: Troubleshooting
+description: Diagnose and fix common sandboxd issues — VM boot failures, gateway health, TLS errors, DNS, networking, and policy propagation.
+---
 
-Common issues and solutions for claude-sandbox operators. Each section lists the symptom, how to diagnose it, and how to fix it.
+Common issues and solutions for sandboxd operators. Each section lists the symptom, how to diagnose it, and how to fix it.
+
+If you are just getting started, check [Installation](/start/installation/) for setup-time errors. For command reference, see the [CLI reference](/reference/cli/).
 
 ## VM won't boot
 
@@ -25,7 +30,7 @@ dmesg | grep -i oom | tail -20            # OOM kill events
 systemctl --user status sandbox.slice     # Cgroup memory usage
 ```
 
-The default VM uses 4096 MB. The host needs ~3.8 GB free per session. Fix: create sessions with less memory (`sandbox create --memory 2048`) or increase host RAM.
+The default VM uses 4096 MB. The host needs about 3.8 GB free per session. Fix: create sessions with less memory (`sandbox create --memory 2048`) or increase host RAM.
 
 If `systemd-run` is not available, QEMU runs without cgroup limits and a memory-hungry guest can trigger the host OOM killer. Check with `command -v systemd-run`. Enable user sessions with `loginctl enable-linger $USER`.
 
@@ -51,9 +56,10 @@ docker logs --tail 50 sandbox-gw-<session_id>
 ```
 
 Common causes:
-- **Port conflict** -- another process on the host is using a gateway port.
-- **CA files missing** -- the CA directory was deleted while the session was stopped.
-- **Resource exhaustion** -- host out of memory or file descriptors.
+
+- **Port conflict** — another process on the host is using a gateway port.
+- **CA files missing** — the CA directory was deleted while the session was stopped.
+- **Resource exhaustion** — host out of memory or file descriptors.
 
 Fix: for missing CA files, `sandbox rm` and recreate the session. For resource issues, free host resources. Component-specific logs: `sandbox logs <session> --component envoy|mitmproxy|coredns`.
 
@@ -71,7 +77,7 @@ ls /usr/local/share/ca-certificates/sandbox-ca.crt
 echo $SSL_CERT_FILE $NODE_EXTRA_CA_CERTS
 ```
 
-Fix: if the CA file exists, re-run `sudo update-ca-certificates` inside the VM. If missing, stop and start the session -- CA injection is re-performed on every start.
+Fix: if the CA file exists, re-run `sudo update-ca-certificates` inside the VM. If missing, stop and start the session — CA injection is re-performed on every start.
 
 ### mitmproxy not running
 
@@ -114,7 +120,7 @@ Fix: restart the session to recreate the gateway with fresh components.
 
 ### Policy not allowing the domain
 
-**Symptom:** Specific domains return NXDOMAIN.
+**Symptom:** Specific domains return `NXDOMAIN`.
 
 Wildcard rules (`*.github.com`) do **not** match the apex domain (`github.com`). You need both rules. Check CoreDNS logs for denied queries:
 
@@ -122,7 +128,7 @@ Wildcard rules (`*.github.com`) do **not** match the apex domain (`github.com`).
 sandbox logs <session> --component coredns --tail 200
 ```
 
-Fix: update the policy -- `sandbox policy update <session> corrected-policy.json`.
+Fix: update the policy — `sandbox policy update <session> corrected-policy.json`.
 
 ### Hardcoded DNS resolvers
 
@@ -143,7 +149,7 @@ ip addr show       # Look for .3 address
 ip route           # Default route should go through .2 with metric 50
 ```
 
-If the TAP is missing, the bridge/TAP setup via qemu-bridge-helper may have failed. Check: `journalctl -u sandboxd | grep -i "bridge\|tap\|qemu-bridge-helper"`. Fix: stop and start the session.
+If the TAP is missing, the bridge/TAP setup via `qemu-bridge-helper` may have failed. Check: `journalctl -u sandboxd | grep -i "bridge\|tap\|qemu-bridge-helper"`. Fix: stop and start the session.
 
 ### Docker bridge missing
 
@@ -180,7 +186,7 @@ journalctl -u sandboxd --since "5 minutes ago" | grep -i "policy\|compile"
 
 The policy must compile into all four component configs (CoreDNS, nftables, Envoy, mitmproxy). If any step fails, the previous policy remains active.
 
-After a successful update, there is a brief reload window (under 1 second) where the old policy is still active. DNS TTL caching in the guest OS can also cause stale behavior -- restart the application to force fresh resolution.
+After a successful update, there is a brief reload window (under 1 second) where the old policy is still active. DNS TTL caching in the guest OS can also cause stale behavior — restart the application to force fresh resolution.
 
 ## File transfer failures
 
@@ -196,7 +202,7 @@ Fix: use an allowed path (`sandbox cp file.txt <session>:/home/agent/workspace/f
 
 **Symptom:** `message size exceeds maximum`
 
-The protocol has a 1 MB limit. Files larger than ~750 KB (after base64 overhead) will fail.
+The protocol has a 1 MB limit. Files larger than about 750 KB (after base64 overhead) will fail.
 
 Fix: use Lima's copy (`limactl copy file.tar.gz sandbox-<session_id>:/tmp/`) or shared workspace mode.
 

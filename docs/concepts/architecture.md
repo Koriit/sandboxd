@@ -1,45 +1,44 @@
-# Architecture
+---
+title: Architecture
+description: High-level overview of sandboxd components — CLI, daemon, Lima VM, guest agent, and gateway container — and how they fit together.
+---
 
-This document provides a high-level overview of claude-sandbox's architecture for contributors and operators. For networking-specific details, see [networking.md](networking.md). For policy enforcement, see [policy.md](policy.md).
+This page gives you a high-level overview of sandboxd's architecture. For the CLI surface, see the [CLI reference](/reference/cli/). For the full end-to-end install path, see [Installation](/start/installation/).
 
-## Components
+## Components at a glance
 
-```text
-                                     +-----------------------+
-                                     |   sandbox (CLI)       |
-                                     |   sandbox-cli crate   |
-                                     +-----------+-----------+
-                                                 |
-                                          Unix socket (HTTP)
-                                                 |
-                                     +-----------v-----------+
-                                     |   sandboxd (daemon)   |
-                                     |                       |
-                                     |  Session management   |
-                                     |  Policy compilation   |
-                                     |  Networking setup     |
-                                     |  Guest communication  |
-                                     +--+------+------+------+
-                                        |      |      |
-                        +---------------+      |      +---------------+
-                        |                      |                      |
-               +--------v--------+    +--------v--------+    +--------v--------+
-               |  Lima / QEMU    |    |  Docker          |    |  SQLite         |
-               |  VM management  |    |  Gateway + bridge |    |  Session store  |
-               +-----------------+    +-----------------+    +-----------------+
+```mermaid
+flowchart LR
+    CLI["sandbox (CLI)"]
+    Daemon["sandboxd (daemon)"]
+    Store[("SQLite<br/>session store")]
+    Lima["Lima / QEMU"]
+    VM["Session VM"]
+    Guest["sandbox-guest<br/>(TCP :5123)"]
+    Bridge["Docker bridge<br/>(per session)"]
+    Gateway["Gateway container<br/>Envoy · mitmproxy · CoreDNS"]
+    Internet(["Internet"])
 
-Inside each VM:
-               +-----------------+
-               |  sandbox-guest  |
-               |  (TCP agent)    |
-               +-----------------+
+    CLI -- "HTTP over<br/>Unix socket" --> Daemon
+    Daemon --> Store
+    Daemon -- "limactl" --> Lima
+    Lima --> VM
+    VM -. "SSH + socat" .-> Guest
+    Daemon -- "guest channel" --> Guest
+    Daemon --> Bridge
+    Bridge --> Gateway
+    VM -- "data NIC" --> Bridge
+    Gateway -- "policy-filtered" --> Internet
 ```
+
+The diagram shows three traffic paths: the control path (CLI → daemon → guest agent for commands and files), the VM lifecycle path (daemon → Lima → QEMU VM), and the data path (VM → Docker bridge → gateway → internet).
 
 ### sandboxd (daemon)
 
 The central process that manages the full sandbox lifecycle. It listens on a Unix socket for HTTP API requests and coordinates all other components.
 
-**Responsibilities:**
+Responsibilities:
+
 - Create, start, stop, and remove sessions.
 - Manage Lima VMs (create, start, stop, delete).
 - Set up and tear down per-session networking (Docker bridge, gateway container, bridge NIC via `qemu-bridge-helper`).
@@ -49,26 +48,28 @@ The central process that manages the full sandbox lifecycle. It listens on a Uni
 - Maintain a SQLite database of sessions and their network info.
 - Run background DNS propagation loops that update nftables rules as DNS resolutions change.
 
-**Key modules (in sandbox-core):**
-- `SessionStore` -- SQLite-backed session persistence.
-- `LimaManager` -- drives `limactl` for VM lifecycle operations.
-- `GuestConnector` -- communicates with the guest agent over TCP via SSH tunnel (`limactl shell ... socat - TCP:127.0.0.1:5123`).
-- `NetworkManager` -- manages Docker bridge networks and subnet allocation.
-- `GatewayManager` -- creates and monitors gateway containers.
-- `CaManager` -- generates and manages per-session CA certificates.
-- `PolicyCompiler` -- transforms policy rules into component-specific configurations.
-- `PolicyDistributor` -- pushes compiled configurations to gateway components.
+Key modules (in `sandbox-core`):
+
+- `SessionStore` — SQLite-backed session persistence.
+- `LimaManager` — drives `limactl` for VM lifecycle operations.
+- `GuestConnector` — communicates with the guest agent over TCP via SSH tunnel (`limactl shell ... socat - TCP:127.0.0.1:5123`).
+- `NetworkManager` — manages Docker bridge networks and subnet allocation.
+- `GatewayManager` — creates and monitors gateway containers.
+- `CaManager` — generates and manages per-session CA certificates.
+- `PolicyCompiler` — transforms policy rules into component-specific configurations.
+- `PolicyDistributor` — pushes compiled configurations to gateway components.
 
 ### sandbox (CLI)
 
 A thin client that builds HTTP requests and sends them to the daemon over the Unix socket. Most commands map directly to a single API call.
 
-**Commands handled via HTTP API:** `create`, `start`, `stop`, `rm`, `ps`/`ls`, `exec`, `policy update`, `health`.
+Commands handled via the HTTP API: `create`, `start`, `stop`, `rm`, `ps`/`ls`, `exec`, `policy update`, `health`.
 
-**Commands handled specially:**
-- `ssh` -- resolves the session via the API, then invokes `limactl shell` directly.
-- `logs` -- resolves the session via the API, then invokes `docker logs` or `docker exec` to read gateway logs.
-- `cp` -- reads/writes local files and transfers via the daemon's upload/download API endpoints.
+Commands handled specially:
+
+- `ssh` — resolves the session via the API, then invokes `limactl shell` directly.
+- `logs` — resolves the session via the API, then invokes `docker logs` or `docker exec` to read gateway logs.
+- `cp` — reads/writes local files and transfers via the daemon's upload/download API endpoints.
 
 The same binary is also installed as a `git-remote-sandbox` symlink. When git invokes it under that name for a `sandbox::` URL, it acts as a git remote helper and spawns `sandbox ssh <session>` to tunnel the git pack protocol to `git-upload-pack` / `git-receive-pack` inside the VM.
 
@@ -76,23 +77,24 @@ The same binary is also installed as a `git-remote-sandbox` symlink. When git in
 
 A lightweight binary running inside each VM that listens on TCP port 5123 (localhost only). The daemon communicates with it through `limactl shell` (SSH tunnel) piped to `socat` to bridge stdin/stdout to the agent's TCP port. Lima does not support kernel AF_VSOCK, so TCP-over-SSH is used instead.
 
-**Supported operations:**
-- Ping (liveness check)
-- Command execution (arbitrary command + args, returns stdout/stderr/exit code)
-- File upload (base64-encoded data written to a path)
-- File download (read a path, return base64-encoded data)
-- Git upload-pack and receive-pack (relay git protocol streams)
+Supported operations:
+
+- Ping (liveness check).
+- Command execution (arbitrary command + args, returns stdout/stderr/exit code).
+- File upload (base64-encoded data written to a path).
+- File download (read a path, return base64-encoded data).
+- Git upload-pack and receive-pack (relay git protocol streams).
 
 ### sandbox-core (shared library)
 
 Contains all shared types, configuration structures, and business logic used by both the daemon and CLI:
 
-- API request/response types (`CreateSessionRequest`, `ExecRequest`, `ExecResponse`, etc.)
-- Session model (`Session`, `SessionConfig`, `SessionState`, `SessionResponse`)
-- Policy types (`Policy`, `Rule`, `AssuranceLevel`, `Constraints`)
-- Error types (`SandboxError`, `ApiError`)
-- Infrastructure managers (`LimaManager`, `NetworkManager`, `GatewayManager`, `CaManager`)
-- Policy compilation and distribution
+- API request/response types (`CreateSessionRequest`, `ExecRequest`, `ExecResponse`, etc.).
+- Session model (`Session`, `SessionConfig`, `SessionState`, `SessionResponse`).
+- Policy types (`Policy`, `Rule`, `AssuranceLevel`, `Constraints`).
+- Error types (`SandboxError`, `ApiError`).
+- Infrastructure managers (`LimaManager`, `NetworkManager`, `GatewayManager`, `CaManager`).
+- Policy compilation and distribution.
 
 ### Gateway container
 
@@ -105,8 +107,6 @@ A Docker container running per session that mediates all outbound traffic from t
 | **CoreDNS** | DNS server with policy filtering (blocks disallowed domains) |
 
 The gateway also runs nftables rules in its network namespace to enforce deny-by-default firewall behavior and DNAT traffic into the proxy pipeline.
-
-See [networking.md](networking.md) for the full traffic flow.
 
 ## Session lifecycle
 
@@ -204,31 +204,32 @@ sandbox prints stdout, exits with code 0
 | POST | `/rebuild-image` | `rebuild_image` | Rebuild the pre-baked base VM image |
 | GET | `/base-image-status` | `base_image_status` | Check base image build status |
 
-The `{id}` parameter accepts a session's human-readable name, its full 12-character hex session ID, or any unique prefix of the session ID (Docker-style). See [CLI reference — Session identifiers](cli-reference.md#session-identifiers).
+The `{id}` parameter accepts a session's human-readable name, its full 12-character hex session ID, or any unique prefix of the session ID (Docker-style). See [CLI reference](/reference/cli/) for details.
 
 ## Security model
 
 ### VM isolation
 
-Each session runs in a separate QEMU/KVM virtual machine. The VM provides hardware-level isolation -- processes inside the VM cannot access host memory, filesystems, or other VMs.
+Each session runs in a separate QEMU/KVM virtual machine. The VM provides hardware-level isolation — processes inside the VM cannot access host memory, filesystems, or other VMs.
 
 QEMU hardening is enabled by default (disabled with `--no-hardening`):
-- **Device lockdown** -- unnecessary virtual devices are disabled.
-- **Seccomp sandboxing** -- the QEMU process is restricted to the minimum set of system calls.
+
+- **Device lockdown** — unnecessary virtual devices are disabled.
+- **Seccomp sandboxing** — the QEMU process is restricted to the minimum set of system calls.
 
 ### Network isolation
 
 Each session gets its own Docker bridge network. There is no cross-session traffic path. The gateway container sits on the session's bridge and has no access to the host network or other sessions.
 
-All outbound traffic from the VM passes through the gateway's proxy pipeline. The VM cannot bypass this -- its single data NIC routes through the Docker bridge, and nftables deny-all rules block any traffic that doesn't match the proxy pipeline.
+All outbound traffic from the VM passes through the gateway's proxy pipeline. The VM cannot bypass this — its single data NIC routes through the Docker bridge, and nftables deny-all rules block any traffic that does not match the proxy pipeline.
 
 ### TLS interception
 
-A per-session CA is generated for each session. The CA private key exists only in the gateway container (never in the VM). mitmproxy uses the CA to perform HTTPS inspection for level 3 (full) policy rules. Each session's CA is independent -- compromise of one does not affect others.
+A per-session CA is generated for each session. The CA private key exists only in the gateway container (never in the VM). mitmproxy uses the CA to perform HTTPS inspection for level 3 (full) policy rules. Each session's CA is independent — compromise of one does not affect others.
 
 ### Default-deny networking
 
-Without a policy, all outbound network traffic is blocked. DNS queries return NXDOMAIN for all domains. Only explicitly allowed destinations (by policy rules) can be reached.
+Without a policy, all outbound network traffic is blocked. DNS queries return `NXDOMAIN` for all domains. Only explicitly allowed destinations (by policy rules) can be reached.
 
 ## Storage
 
@@ -236,8 +237,8 @@ Without a policy, all outbound network traffic is blocked. DNS queries return NX
 
 The daemon stores session metadata in a SQLite database at `<base-dir>/sessions.db`. The database contains:
 
-- Session records (ID, name, state, config, timestamps)
-- Network info per session (subnet, IPs, Docker network name, TAP name)
+- Session records (ID, name, state, config, timestamps).
+- Network info per session (subnet, IPs, Docker network name, TAP name).
 
 Migrations are managed by the `refinery` crate and run automatically at daemon startup.
 
@@ -245,7 +246,7 @@ Migrations are managed by the `refinery` crate and run automatically at daemon s
 
 Each session has a directory at `<base-dir>/sessions/<session-id>/` containing:
 
-- `ca/` -- per-session CA certificate files (`cert.pem`, `key.pem`, `mitmproxy-ca.pem`, `mitmproxy-ca-cert.pem`)
+- `ca/` — per-session CA certificate files (`cert.pem`, `key.pem`, `mitmproxy-ca.pem`, `mitmproxy-ca-cert.pem`).
 
 ### Lima data
 

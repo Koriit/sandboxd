@@ -1,6 +1,11 @@
-# CLI Reference
+---
+title: CLI reference
+description: Complete reference for the sandbox command-line tool — every subcommand, flag, and session-identifier rule.
+---
 
 Complete reference for the `sandbox` command-line tool. The CLI communicates with the `sandboxd` daemon over a Unix socket.
+
+For a condensed tour of the main commands, see the [Quickstart](/start/quickstart/). For the daemon's HTTP API that backs the CLI, see [Architecture](/concepts/architecture/).
 
 ## Global options
 
@@ -53,7 +58,8 @@ sandbox create [OPTIONS]
 | `--no-hardening` | | Disable QEMU hardening (device lockdown, cgroup limits) |
 | `--no-cache` | | Skip the pre-baked base image and use the full create path |
 
-**Notes:**
+Notes:
+
 - `--repo` and `--workspace` are mutually exclusive.
 - `--workspace` must use the `shared:<absolute-path>` format. The path must exist.
 - `--boot-cmd` runs as `bash -c "<cmd>"` via the guest agent after all other provisioning.
@@ -550,7 +556,7 @@ sandbox describe dev ci-run staging
 
 ## sandbox policy update
 
-Apply a new network policy to a running sandbox session. The new policy completely replaces the existing one -- there is no merging. All gateway components (CoreDNS, nftables, Envoy, mitmproxy) are reconfigured and hot-reloaded without restarting the session.
+Apply a new network policy to a running sandbox session. The new policy completely replaces the existing one — there is no merging. All gateway components (CoreDNS, nftables, Envoy, mitmproxy) are reconfigured and hot-reloaded without restarting the session.
 
 ### Synopsis
 
@@ -568,7 +574,7 @@ sandbox policy update <session> <policy-path>
 ### Details
 
 - The policy file is validated client-side before sending to the daemon.
-- The policy must parse as a valid `Policy` JSON structure (see [policy.md](policy.md) for the format).
+- The policy must parse as a valid `Policy` JSON structure.
 - If validation fails, no request is sent and the error is printed.
 
 ### Examples
@@ -585,7 +591,7 @@ sandbox policy update feedfacecafe restricted-policy.json
 
 ## git-remote-sandbox (symlink)
 
-`git-remote-sandbox` is a symlink to the `sandbox` binary, not a subcommand. Users never invoke it directly: git does, automatically, whenever it resolves a `sandbox::<session>/<repo-path>` URL. The binary detects it was invoked under that name (via argv[0]) and switches into git remote-helper mode, tunneling the git pack protocol over `sandbox ssh` to the repository inside the target session VM.
+`git-remote-sandbox` is a symlink to the `sandbox` binary, not a subcommand. You never invoke it directly: git does, automatically, whenever it resolves a `sandbox::<session>/<repo-path>` URL. The binary detects it was invoked under that name (via `argv[0]`) and switches into git remote-helper mode, tunneling the git pack protocol over `sandbox ssh` to the repository inside the target session VM.
 
 ### URL format
 
@@ -614,8 +620,6 @@ git pull origin main
 
 - The `git-remote-sandbox` symlink must be installed on `PATH` alongside the `sandbox` binary; git looks it up by name.
 - The daemon socket path can be overridden with the `SANDBOX_SOCKET` environment variable. The `--socket` global flag is not available in remote-helper mode because git controls argv.
-
-See [workspaces.md § git remote transport](workspaces.md#git-remote-transport) for the full description of the transport, including how isolation is preserved and how the helper interacts with the daemon.
 
 ---
 

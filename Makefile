@@ -1,4 +1,4 @@
-.PHONY: build fmt fmt-check test test-integration test-e2e gateway-image clean
+.PHONY: build fmt fmt-check test test-integration test-e2e gateway-image docs-dev docs-build clean
 
 build: fmt-check
 	cd sandboxd && cargo build --workspace
@@ -46,7 +46,14 @@ GATEWAY_INPUTS := $(shell find networking -type f \
 
 gateway-image: .gateway-image.stamp
 
+docs-dev:
+	cd site && npm install && npm run dev
+
+docs-build:
+	cd site && npm install && npm run build
+
 clean:
 	cd sandboxd && cargo clean
 	rm -rf tests/e2e/.venv/
 	rm -f .gateway-image.stamp
+	rm -rf site/node_modules site/dist
