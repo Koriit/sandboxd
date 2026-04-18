@@ -27,10 +27,15 @@ import rehypeMermaid from 'rehype-mermaid';
 // `prefers-color-scheme`). This does mean CI must install Playwright +
 // Chromium; see the top-level docs CI workflow for that step.
 //
-// If in the future we want to avoid Playwright in CI, the choice is between
-// `pre-mermaid` (client-side JS, violates §9) or pre-rendering SVGs out of
-// band and committing them. Either is a spec change.
+// In `astro dev`, Playwright's per-request browser launch blanks the whole
+// markdown body of any page containing a mermaid fence (silent failure that
+// swallows the rest of the rehype output). We fall back to `pre-mermaid` in
+// dev so iteration stays usable; builds keep `img-svg` for the published
+// artifact. The dev-only client-side renderer is wired up below.
 // ---------------------------------------------------------------------------
+
+const isDev = process.argv[2] === 'dev';
+const mermaidStrategy = isDev ? 'pre-mermaid' : 'img-svg';
 
 // https://astro.build/config
 export default defineConfig({
@@ -56,10 +61,11 @@ export default defineConfig({
       [
         rehypeMermaid,
         {
-          strategy: 'img-svg',
+          strategy: mermaidStrategy,
           // Emits a <picture> element with both light and dark SVGs so the
           // diagram follows the user's color-scheme preference, which
-          // Starlight's dark/light toggle drives.
+          // Starlight's dark/light toggle drives. Only meaningful under
+          // Playwright-based strategies; ignored for `pre-mermaid`.
           dark: true,
         },
       ],
@@ -76,6 +82,20 @@ export default defineConfig({
         replacesTitle: false,
       },
       favicon: '/logo.svg',
+      // In dev, rehype-mermaid runs under `pre-mermaid`, emitting raw <pre
+      // class="mermaid"> blocks that expect a client-side Mermaid renderer.
+      // Ship it from a CDN only in dev — builds render SVGs at the rehype
+      // phase and need no client runtime.
+      head: isDev
+        ? [
+            {
+              tag: 'script',
+              attrs: { type: 'module' },
+              content:
+                "import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs'; mermaid.initialize({ startOnLoad: true });",
+            },
+          ]
+        : [],
       // Fail the build on broken internal links (spec §6, quality gates).
       plugins: [starlightLinksValidator()],
       // Taxonomy per spec §3: four top-level groups in this order.
