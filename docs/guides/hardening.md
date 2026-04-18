@@ -182,9 +182,15 @@ Use clone mode (`--repo`) plus `sandbox cp` or git remote transport when isolati
 
 ### SLIRP management network
 
-Lima uses SLIRP — user-mode networking — for the VM's management interface (`eth0`). SLIRP provides SSH-based management without TAP or root, but it runs inside the QEMU process and adds to the QEMU attack surface.
+The VM has two NICs. `eth1` is a TAP device on the per-session Docker bridge — the data plane that routes through the gateway. `eth0` is a **SLIRP** interface used only for Lima's SSH management channel. This section explains what SLIRP is and why it's the trade-off it is.
 
-The data plane (`eth1`) is separate: a real TAP device attached to the per-session Docker bridge. A lower route metric on `eth1` ensures internet-bound traffic prefers the gateway path. SSH and Lima management traffic still rides SLIRP.
+**What SLIRP is.** SLIRP is a user-mode networking stack bundled with QEMU. Rather than bridging the guest NIC to a real host interface (which requires a TAP device and elevated privileges), SLIRP implements a small TCP/IP stack inside the QEMU process itself: it terminates the guest's packets, translates them into ordinary socket calls on the host, and proxies the responses back. The guest sees a functioning network; the host sees QEMU making normal outbound connections. SLIRP also forwards selected host ports into the guest, which is how Lima obtains its SSH channel without any privileged networking setup.
+
+**Why Lima uses it.** No TAP device, no bridge configuration, no root — it works out of the box on any developer machine. That is a real portability win for a per-session VM.
+
+**What it costs.** SLIRP runs in-process with QEMU, so any bug in its packet-handling code executes in the same address space as the hypervisor. That widens the QEMU attack surface compared to a plain TAP bridge, where the kernel does the forwarding. SLIRP is also slower than a TAP bridge and emulates some protocols (ICMP, raw sockets) only partially.
+
+**How the sandbox contains that.** SLIRP is confined to `eth0` and carries only Lima's SSH traffic — all outbound application traffic goes over `eth1` to the gateway. The guest adds a default route over `eth1` with a lower metric than SLIRP's, so internet-bound traffic prefers the gateway path; SSH and Lima management still ride SLIRP. The policy layer (DNS filtering, nftables, Envoy, mitmproxy) only applies to traffic that reaches the gateway — that is by construction true for the data plane, since SLIRP has no route to anything a user workload would use.
 
 Removing SLIRP would require replacing Lima's SSH provisioning; it is not currently configurable.
 

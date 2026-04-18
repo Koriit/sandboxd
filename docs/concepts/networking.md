@@ -14,7 +14,20 @@ Each session is a closed loop:
 - Inside the gateway: **nftables** for default-deny firewalling and DNAT, **CoreDNS** for policy-filtered DNS, **Envoy** for connection routing, **mitmproxy** for TLS inspection.
 - A **per-session CA** trusted inside the VM, with the private key living only inside the gateway.
 
-There is no alternate path out. The VM has a single data NIC, it routes through the gateway, and the gateway denies everything by default.
+There is no alternate path out for application traffic. The VM's data NIC routes through the gateway, and the gateway denies everything by default.
+
+## The two NICs: management vs. data plane
+
+Each VM has two network interfaces, with very different roles:
+
+| Interface | Type | Carries | Reaches |
+|---|---|---|---|
+| `eth0` | SLIRP (QEMU user-mode networking) | Lima's SSH management channel | The host, via QEMU's in-process TCP/IP stack |
+| `eth1` | TAP on the per-session Docker bridge | All application traffic | The gateway container — and nothing else |
+
+`eth0` exists because Lima needs an SSH channel to the VM and SLIRP provides one without requiring TAP devices or root on the host. It is **not** a path for user workloads: the guest installs a default route over `eth1` with a lower metric than SLIRP's, so any `connect()` from an application inside the VM goes out through the gateway, not through SLIRP. The SLIRP interface is effectively invisible to applications running inside the VM.
+
+This matters for the threat model: the policy layer (DNS filtering, nftables, Envoy, mitmproxy) applies to traffic that reaches the gateway. That covers the entire data plane by construction. SLIRP carries only the Lima management channel; it doesn't and can't carry application traffic to arbitrary internet destinations. See [SLIRP management network](/guides/hardening/#slirp-management-network) in the hardening guide for the trade-offs this design makes.
 
 ## Per-session isolation
 
