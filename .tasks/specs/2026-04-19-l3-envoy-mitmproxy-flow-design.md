@@ -52,6 +52,27 @@ an upstream transport socket wrapper. This is an off-the-shelf,
 kernel-privilege-free mechanism for passing the original source and
 destination across a proxy hop.
 
+### Operating constraints
+
+Two constraints shape the implementation choices below.
+
+**No external backwards compatibility required.** sandboxd has no
+production users yet. Changes that break wire compatibility, on-disk
+format, port numbers, or Envoy config shape with pre-change sessions
+are acceptable. Running sessions at upgrade time stop/start rather
+than migrating in place. The only compatibility concern is
+intra-session: the daemon must be able to restart without losing
+session state, which the existing persistence model already handles.
+
+**Connection preservation during policy changes is required.** A
+sandbox workload routinely holds many concurrent connections —
+HTTP/2 streams, long-lived gRPC, websockets, SSE. Terminating all of
+them on every policy change or DNS-cache update is an unacceptable
+UX degradation and can look like random-seeming workload failures.
+Config updates must be applied in a way that preserves in-flight
+connections and only affects *new* ones. This rules out process
+restart as the propagation mechanism.
+
 ## Target design
 
 ### High-level flow
@@ -76,7 +97,7 @@ VM app
             └─ no match → connection closed (deny by default)
 ```
 
-### Three properties this restores
+### Four properties this restores
 
 - **Single mediated egress path.** All TCP hits Envoy. Envoy is the
   sole routing decision point. No split responsibility, no second DNAT
@@ -92,6 +113,12 @@ VM app
   closed. Traffic to a destination whose IPs haven't been propagated
   into Envoy's config yet is dropped; applications retry naturally
   after propagation completes.
+- **Connection preservation across policy changes.** Listener config
+  is delivered to Envoy via xDS (filesystem subscription), not by
+  restarting the process. Existing connections continue on the old
+  listener generation and complete naturally; only *new* connections
+  use the updated filter chains. Long-lived workloads (HTTP/2 streams,
+  gRPC, websockets) are unaffected by unrelated policy edits.
 
 ### Ports (after this change)
 
@@ -110,6 +137,20 @@ fail closed rather than silently working.
 ## Component changes
 
 ### Envoy
+
+**Bootstrap split.** The Envoy configuration is split into a static
+bootstrap file and a dynamic listener file:
+
+- Bootstrap (static, written once per session): admin, clusters
+  (including the new `mitmproxy` cluster and the existing
+  `original_dst` cluster), and a `dynamic_resources.lds_config`
+  pointing at a filesystem `path` for the listener.
+- Listener file (dynamic, rewritten on each DNS propagation event):
+  the listener's `filter_chains` — the only piece of Envoy config
+  that changes at runtime.
+
+Clusters stay in the static bootstrap because their definitions never
+change during a session's lifetime.
 
 **New cluster `mitmproxy`**:
 
@@ -183,22 +224,44 @@ Today DNS propagation writes only nftables rules. After this change
 it also rewrites Envoy's listener filter chains when the resolved IPs
 for an L3 domain change.
 
-**Mechanism: regenerate the Envoy config file and restart the Envoy
-process inside the gateway container.** Envoy does not support
-SIGHUP-triggered config reload; xDS and hot restart (parent-child
-process swap) both preserve connections but add machinery we don't
-need for a single-Envoy-per-session gateway. A plain process restart
-is ~1s and drops any in-flight connections through Envoy; applications
-retry, consistent with the fail-closed-during-propagation semantics
-already mandated by the design.
+**Mechanism: xDS via filesystem subscription (LDS).** Envoy's static
+bootstrap config points its Listener Discovery Service (LDS) at a
+filesystem path inside the gateway container. sandboxd writes the
+updated listener YAML to that path on each DNS propagation event,
+using an atomic rename so Envoy observes a consistent file. Envoy
+detects the change, creates a new listener generation with the
+updated filter chains, and routes *new* connections through it. The
+old generation keeps serving existing connections until they close
+naturally. **No connection drops for unrelated destinations, no
+process restart, no request failures for in-flight work.**
 
-**Ordering.** For L3 destinations the Envoy config *is* the gate —
-there is no per-IP nftables rule to sequence after it. The existing
-outside-in propagation order (`networking-design.md:1345-1349`)
-continues to govern L1/L2: `sandbox_policy` nftables rules are
-installed last, after inner components are consistent. L3 propagation
-fits inside the same window — Envoy restart happens alongside the
-inner-component updates, before nftables.
+This satisfies the connection-preservation constraint stated above.
+Process restart was considered and rejected for this reason: a
+workload holding dozens of concurrent connections would see all of
+them reset on every policy change, which manifests as random-seeming
+failures to the workload author and breaks long-lived protocols
+(HTTP/2, gRPC streams, websockets) outright.
+
+Filesystem subscription is a standard Envoy xDS transport — it
+requires only that sandboxd can write files into a volume the gateway
+container reads. No gRPC xDS server. CDS for the mitmproxy cluster is
+not required (cluster definition is static; only the listener's
+filter chains change).
+
+**Publication mechanism from sandboxd to the container.** sandboxd
+writes to a bind-mounted directory on the gateway container (the
+same mechanism already used for other gateway configuration).
+Write-then-rename makes the update atomic; Envoy's inotify-based
+file watcher picks it up without races.
+
+**Ordering.** For L3 destinations the Envoy listener file *is* the
+gate — there is no per-IP nftables rule to sequence after it. The
+existing outside-in propagation order
+(`networking-design.md:1345-1349`) continues to govern L1/L2:
+`sandbox_policy` nftables rules are installed last, after inner
+components are consistent. L3 propagation fits inside the same window
+— the Envoy listener file is written alongside the inner-component
+updates, before nftables.
 
 ## Design doc amendment (`networking-design.md`)
 
@@ -315,6 +378,12 @@ In `sandbox-core/src/policy.rs` and `sandbox-core/src/dns_propagation.rs`:
   log AND the mitmproxy log (verifies both are on the path).
 - **New assertion**: raw TCP (non-HTTP) to an L3 destination's IP on
   port 443 is rejected at mitmproxy — not opaquely passed through.
+- **New assertion (connection preservation)**: open a long-lived HTTP
+  response stream to an allowed L3 destination; while it is open,
+  apply a policy update that adds an *unrelated* domain; verify the
+  original stream receives its remaining bytes without reset. This is
+  the headline property xDS-based propagation buys us; a process
+  restart would visibly break this test.
 
 The originally-proposed "first connection may fail ~1–2s then succeeds"
 e2e test is **not** included. It would be timing-dependent and flaky;
