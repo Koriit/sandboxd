@@ -1,4 +1,4 @@
-# L3 flow: restore Envoy → mitmproxy via PROXY protocol v2
+# L3 flow: restore Envoy → mitmproxy via HTTP CONNECT tunneling
 
 ## Summary
 
@@ -11,7 +11,9 @@ by using a higher-priority nftables table (`sandbox_l3`) that DNATs TCP
 
 This spec restores the design-faithful flow by filling the one gap the
 design left open: **how Envoy hands the original destination to mitmproxy
-across the proxy hop**. We fill it with PROXY protocol v2.
+across the proxy hop**. We fill it with HTTP/1.1 CONNECT tunneling
+(Envoy's `tcp_proxy.tunneling_config`, terminated by mitmproxy in
+regular/forward-proxy mode).
 
 ## Context
 
@@ -46,11 +48,16 @@ the cost of violating three design points:
 
 ### Why the design-faithful flow is achievable
 
-Mitmproxy does not have to use `SO_ORIGINAL_DST`. Latest mitmproxy
-supports PROXY protocol v2 on its listener; Envoy supports PROXY v2 as
-an upstream transport socket wrapper. This is an off-the-shelf,
-kernel-privilege-free mechanism for passing the original source and
-destination across a proxy hop.
+- Mitmproxy does not have to use `SO_ORIGINAL_DST`. Its **regular
+  (forward) proxy mode** reads the destination from the
+  `CONNECT host:port` line and has always done so — it is mitmproxy's
+  original design.
+- Envoy's TCP proxy filter has `tunneling_config` that wraps the
+  upstream leg in an HTTP/1.1 CONNECT tunnel whose authority is
+  derived from the downstream original destination. (Envoy PR
+  `#21067`, 2022.)
+- This is an off-the-shelf, kernel-privilege-free mechanism supported
+  by both projects without custom code.
 
 ### Operating constraints
 
@@ -85,11 +92,12 @@ VM app
         → all TCP ≠ 53 → Envoy :10000 (original_dst listener)
           → Envoy filter-chain match (by destination IP or catch-all)
             ├─ matched L3 chain → mitmproxy cluster
-            │     ↳ upstream transport wraps outbound TCP with
-            │       PROXY protocol v2 header
-            │       (src = VM IP:port, dst = real external IP:port)
-            │     ↳ mitmproxy reads PROXY v2 on its listener, uses dst
-            │       as upstream target (no SO_ORIGINAL_DST dependency)
+            │     ↳ Envoy `tcp_proxy.tunneling_config` emits
+            │       `CONNECT <orig-dst>:<port> HTTP/1.1` upstream,
+            │       then streams the original TCP bytes through the tunnel
+            │     ↳ mitmproxy (regular mode) reads the CONNECT authority
+            │       as upstream target and opens the real connection
+            │       (no SO_ORIGINAL_DST dependency)
             │     ↳ mitmproxy terminates TLS, inspects HTTP, forwards
             │       to real destination
             ├─ matched L2 chain → original_dst passthrough (unchanged)
@@ -105,9 +113,10 @@ VM app
 - **Policy-driven, not port-driven.** L3 filter chains are keyed on
   destination identity (resolved IPs, CIDR, or catch-all for wildcard).
   All traffic to an L3 destination — any port, any protocol on the
-  wire — routes to mitmproxy. Mitmproxy rejects non-HTTP content, per
-  the design's rule that wire behavior contradicting the declared
-  level is denied.
+  wire — routes to mitmproxy. Non-HTTP content inside the L3 CONNECT
+  tunnel is not cleanly inspected by mitmproxy's HTTP pipeline and
+  will close noisily on parse failure (strict "reject non-HTTP" is a
+  separate design property not provided by this swap).
 - **Fail-closed during propagation.** Envoy has no default passthrough
   chain. Connections that don't match any explicit filter chain are
   closed. Traffic to a destination whose IPs haven't been propagated
@@ -155,11 +164,18 @@ change during a session's lifetime.
 **New cluster `mitmproxy`**:
 
 - `type: STATIC`, single endpoint `127.0.0.1:18080`
-- upstream transport socket wrapped in
-  `envoy.transport_sockets.upstream_proxy_protocol` (v3) with
-  `version: V2`, inner transport `raw_buffer`
+- `typed_extension_protocol_options` set to
+  `envoy.extensions.upstreams.http.v3.HttpProtocolOptions` with
+  `explicit_http_config.http_protocol_options: {}` — forces HTTP/1.1
+  (HTTP/2 CONNECT is unsupported by mitmproxy, upstream issue
+  `#1138`)
 - TCP health check (1s timeout, 5s interval) so a dead mitmproxy shows
   up in Envoy's admin stats
+- **No transport-socket wrapping.** The cluster uses the default
+  `raw_buffer` upstream transport. There is no
+  `upstream_proxy_protocol` wrapper — the CONNECT preface is emitted
+  by `tunneling_config` on the per-chain `tcp_proxy` filter, not by
+  a transport-socket header.
 
 **L3 filter-chain compilation** (in `sandbox-core/src/policy.rs`):
 
@@ -173,6 +189,22 @@ change during a session's lifetime.
   routing to `cluster: mitmproxy`.
 - **No port predicate** on any L3 chain. L3 applies to all traffic to
   the destination.
+- In each L3 chain the `tcp_proxy` filter sets
+  `tunneling_config.hostname = "%DOWNSTREAM_LOCAL_ADDRESS%"` so the
+  CONNECT authority Envoy sends upstream is the downstream original
+  destination (IP:port as observed on the `original_dst` listener).
+  If the format-string interpolation misbehaves in the chosen Envoy
+  build (Envoy issue `#23700` documents friction around this), the
+  documented fallback is to populate dynamic metadata via
+  `set_filter_state` earlier in the chain and reference it from the
+  `tunneling_config.hostname` field via
+  `%DYNAMIC_METADATA(...)%`.
+- `tunneling_config.protocol` is left unset — Envoy's default is
+  HTTP/1.1, which matches the cluster's `HttpProtocolOptions` pin.
+  If a future Envoy change flips the default, the cluster-level
+  `HttpProtocolOptions` still forces HTTP/1.1 upstream, so the wire
+  protocol is pinned end-to-end by the cluster config regardless of
+  the per-filter default.
 
 **No default passthrough chain.** Envoy's listener has no catch-all
 chain for non-L3 destinations. Unmatched connections are closed.
@@ -184,14 +216,19 @@ after SNI validation for L2, opaque TCP for L1) stay as they are.
 ### mitmproxy
 
 - Bind: `127.0.0.1:18080` (was `0.0.0.0:8080` or equivalent).
-- Mode: transparent with PROXY protocol v2 reception enabled.
-- Behaviour change: uses the PROXY v2 header's destination as the
-  upstream target instead of `SO_ORIGINAL_DST`; uses the header's
-  source as the logged client IP (VM's IP appears in logs instead of
-  `127.0.0.1` — a side benefit).
-- Latest mitmproxy is pinned in the gateway Dockerfile. The specific
-  config option for PROXY v2 reception is verified against the pinned
-  version during implementation.
+- Mode: **`regular`** (forward proxy), not transparent. Flags:
+  `--mode regular --listen-host 127.0.0.1 --listen-port 18080`.
+- Reads the upstream destination from the `CONNECT host:port` request
+  line emitted by Envoy's tunneling config; opens the upstream
+  connection to that target; MITMs the tunneled TLS using the
+  per-session CA (identical TLS MITM behaviour to transparent mode).
+- Proxy-Authorization not required; mitmproxy's regular mode does not
+  enable auth unless the `proxyauth` addon is loaded (it isn't).
+- The current pinned version (`mitmproxy 11.1.3`) supports this
+  natively — no upgrade required.
+- Existing addons (`policy_addon.py`, `passthrough_addon.py`) run
+  unchanged — they operate on the inner HTTP request/response, not on
+  how the connection was established.
 
 ### nftables (in `sandbox-core/src/gateway.rs` and
 `sandbox-core/src/dns_propagation.rs`)
@@ -248,11 +285,48 @@ container reads. No gRPC xDS server. CDS for the mitmproxy cluster is
 not required (cluster definition is static; only the listener's
 filter chains change).
 
-**Publication mechanism from sandboxd to the container.** sandboxd
-writes to a bind-mounted directory on the gateway container (the
-same mechanism already used for other gateway configuration).
-Write-then-rename makes the update atomic; Envoy's inotify-based
-file watcher picks it up without races.
+**Publication mechanism from sandboxd to the container.** Today
+sandboxd delivers gateway configuration via `docker exec` piping
+stdin into a file inside the container (see
+`sandboxd/sandbox-core/src/policy_distributor.rs`,
+`write_file_to_container`, approx. lines 267–315). That mechanism
+produces `Modified` inotify events on the destination file. Envoy's
+filesystem LDS **only fires on `MovedTo` inotify events**, not on
+`Modified` events — this is acknowledged upstream design (issue
+`envoyproxy/envoy#20474`). A direct `docker exec > file` write will
+therefore be silently ignored by the listener watcher.
+
+Two implementation options for the delegate:
+
+(a) Introduce a bind-mounted directory on the gateway container for
+    the listener file specifically, and write from the host using
+    tempfile + `fs::rename` on the same filesystem. This is the
+    standard Envoy xDS filesystem-subscription idiom; it gives
+    sandboxd direct control over atomicity without a shell
+    round-trip per update. **Preferred.**
+(b) Keep `docker exec` and run
+    `sh -c 'cat > tmp && mv tmp final'` inside the container so the
+    rename happens there, producing the required `MovedTo` event.
+
+The bootstrap must set `dynamic_resources.lds_config.path_config_source.path`
+to the listener file and `watched_directory` to the parent directory
+(the watcher needs to observe rename-into events on the directory,
+not edits to the file path directly).
+
+**Writer-level invariant.** Between any two generations, **only
+`filter_chains` and `default_filter_chain` should differ**. Changes
+to `listener_filters`, `metadata`, `socket_options`,
+`traffic_direction`, the bind address, or
+`per_connection_buffer_limit_bytes` force a full listener drain and
+reset existing connections, which destroys the connection-preservation
+property. The writer should assert that no other field diffs between
+generations and fail loudly if it does.
+
+**Static-listener caveat.** Envoy refuses to update a
+statically-defined listener via LDS — the listener must be delivered
+via LDS from session start. The bootstrap/LDS split must happen on
+day one and cannot be retrofitted to a running session that started
+with a static listener.
 
 **Ordering.** For L3 destinations the Envoy listener file *is* the
 gate — there is no per-IP nftables rule to sequence after it. The
@@ -271,16 +345,17 @@ destination to mitmproxy. Minimal targeted amendment.
 **Add to `##### Envoy` classification list (around line 512):**
 
 > level 3 destinations: route to the mitmproxy cluster on gateway
-> loopback; the upstream transport encodes the original source and
-> destination in a PROXY protocol v2 header, so mitmproxy does not
-> depend on `SO_ORIGINAL_DST` across the Envoy proxy hop.
+> loopback, wrapping the upstream leg in an HTTP/1.1 CONNECT tunnel
+> whose authority is the downstream original destination (Envoy
+> `tcp_proxy.tunneling_config`); mitmproxy reads the CONNECT
+> authority as its upstream target, so no `SO_ORIGINAL_DST` dependency
+> survives the proxy hop.
 
 **Add to `##### mitmproxy` bullet list (around line 520):**
 
-> learns the original source and destination from the PROXY protocol
-> v2 header emitted by Envoy on its upstream connection, and uses the
-> destination as the upstream target (transparent mode without
-> `SO_ORIGINAL_DST`).
+> runs in regular (forward) proxy mode; receives an HTTP/1.1 CONNECT
+> on its listener from Envoy, parses the authority as the upstream
+> target, and performs TLS MITM on the tunneled connection.
 
 The traffic-flow ASCII art (lines 139–147) and the assurance-level
 exit-point table (line 395, "Level 3 — HTTP inspected → Full pipeline
@@ -292,10 +367,10 @@ mechanism gap without restructuring the document.
 ### `docs/concepts/networking.md`
 
 - Fix the request-flow mermaid diagram (lines 78–107): the L3 branch
-  becomes `Envoy ▸ mitmproxy ▸ External`. Remove the
+  becomes `Envoy ▸ CONNECT tunnel ▸ mitmproxy ▸ External`. Remove the
   `Forward to 127.0.0.1:8080` wording that will no longer be accurate;
-  replace with a line describing PROXY v2 as the Envoy→mitmproxy
-  contract.
+  replace with a prose line describing HTTP/1.1 CONNECT as the
+  Envoy→mitmproxy contract.
 - New subsection **"Policy changes are fail-closed during
   propagation"**: when a policy is applied, updated, or a session
   starts, components are reconfigured in outside-in order; newly-allowed
@@ -304,8 +379,12 @@ mechanism gap without restructuring the document.
   to retry. Links back to `networking-design.md`'s fail-closed section.
 - Explicit statement in the nftables / request-flow prose that L3
   applies to all traffic to an L3-declared destination regardless of
-  port, and non-HTTP content on those connections is rejected at
-  mitmproxy (not silently passed through).
+  port. Note that L3 inspects HTTP — with or without TLS; HTTPS is
+  MITM'd using the per-session CA, and plain HTTP flows through the
+  CONNECT tunnel and is inspected directly. Non-HTTP protocols inside
+  the L3 CONNECT tunnel are not cleanly inspected by mitmproxy's HTTP
+  pipeline and will close on parse failure rather than being silently
+  passed through.
 
 ### `docs/guides/network-policies.md`
 
@@ -314,9 +393,12 @@ mechanism gap without restructuring the document.
   fail briefly, then succeed; standard retry logic handles this;
   applies equally to `policy apply`, `policy update`, session `start`,
   and cache-TTL expiry events.
-- Note on L3 level: "Declaring a destination at L3 means HTTP-only.
-  Non-HTTP traffic to that destination — raw TCP, custom TLS protocols
-  — is rejected. Use L1 (transport) or L2 (TLS-verified) for those."
+- Note on L3 level: L3 inspects HTTP — with or without TLS (HTTPS is
+  MITM'd using the per-session CA; plain HTTP is inspected directly
+  through the tunnel). Non-HTTP protocols inside the L3 tunnel (raw
+  TCP, custom TLS protocols) will not be cleanly inspected and may
+  close on parse failure — use L1 (transport) or L2 (TLS-verified)
+  for those.
 
 ### `docs/guides/troubleshooting.md`
 
@@ -349,7 +431,12 @@ In `sandbox-core/src/policy.rs` and `sandbox-core/src/dns_propagation.rs`:
 - **Flip assertions** in `compile_level3_envoy_no_mitmproxy_cluster`
   and any sibling tests that assert the mitmproxy cluster is absent
   from Envoy config. Mitmproxy cluster must now be present, with
-  `upstream_proxy_protocol` transport socket at `version: V2`.
+  `typed_extension_protocol_options` set to
+  `envoy.extensions.upstreams.http.v3.HttpProtocolOptions` and
+  `explicit_http_config.http_protocol_options` populated (HTTP/1.1).
+- **New test**: L3 filter chain's `tcp_proxy` filter has
+  `tunneling_config.hostname` set to the expected format string
+  (`%DOWNSTREAM_LOCAL_ADDRESS%` or the dynamic-metadata fallback).
 - **New test**: L3 filter chains match on `prefix_ranges` derived from
   DNS cache IPs, not `server_names`.
 - **New test**: L3 wildcard (`*`) produces a default filter chain
@@ -376,8 +463,16 @@ In `sandbox-core/src/policy.rs` and `sandbox-core/src/dns_propagation.rs`:
   CA; HTTP inspection works end-to-end).
 - **New assertion**: an L3 connection appears in both the Envoy access
   log AND the mitmproxy log (verifies both are on the path).
-- **New assertion**: raw TCP (non-HTTP) to an L3 destination's IP on
-  port 443 is rejected at mitmproxy — not opaquely passed through.
+- **New assertion**: the Envoy access log entry for an L3 connection
+  shows an HTTP CONNECT request with `:authority` set to the original
+  destination (IP:port), confirming the tunnel is in place. This
+  doubles as the "appears in both logs" assertion above.
+- **New assertion (empirical, non-HTTP behaviour)**: raw TCP
+  (non-HTTP) to an L3 destination's IP on port 443 is observed to
+  close during mitmproxy's HTTP-parse phase — not opaquely passed
+  through. The assertion should be written against the actual
+  observed failure mode (connection close with parser error), not
+  against a claim that mitmproxy "rejects" non-HTTP cleanly.
 - **New assertion (connection preservation)**: open a long-lived HTTP
   response stream to an allowed L3 destination; while it is open,
   apply a policy update that adds an *unrelated* domain; verify the
@@ -395,18 +490,40 @@ above (empty DNS cache → no L3 chain → traffic dropped).
 After the code change is complete and tests pass, run a structured
 sweep to catch second-order staleness.
 
-**Grep sweep across the repo** (code, tests, docs, comments):
+**Grep sweep across the repo** (code, tests, docs, comments).
 
-- `sandbox_l3` — should have zero matches.
+*Negative-presence (must each have zero matches in implementation code;
+matches acceptable only in rationale/historical comments):*
+
+- `sandbox_l3`.
 - `8080` — only intentional references remain (none expected in sandbox
   code after the port flip).
-- `SO_ORIGINAL_DST` — appears only in comments explaining *why* we use
-  PROXY v2 instead.
-- `bypasses Envoy` / `skip Envoy` / `Envoy is bypassed` — gone.
-- `pre-propagation` / `falls through to Envoy` / `~2 seconds` — gone.
-- `tcp dport 8080 accept` — gone.
-- `original_dst` cluster in an L3 context — gone.
-- `dport { 80, 443 }` / port-based routing in L3 context — gone.
+- `SO_ORIGINAL_DST` — remains on Envoy's `original_dst` listener
+  filter (that part is correct and unchanged); does **not** appear in
+  the mitmproxy codepath post-change.
+- `upstream_proxy_protocol` — never adopted.
+- `PROXY protocol v2` / `PROXY v2` — absent from implementation code
+  and comments; acceptable only in historical notes or rejected-option
+  writeups.
+- `transparent mode` / `--mode transparent` — zero matches in
+  implementation code, gateway `entrypoint.sh`, and Dockerfile;
+  acceptable only in rationale comments explaining why we chose
+  regular mode.
+- `bypasses Envoy` / `skip Envoy` / `Envoy is bypassed`.
+- `pre-propagation` / `falls through to Envoy` / `~2 seconds`.
+- `tcp dport 8080 accept`.
+- `original_dst` cluster referenced in an L3 context.
+- `dport { 80, 443 }` / any port-based routing in an L3 context.
+
+*Positive-presence (must each have at least one match):*
+
+- `tunneling_config` — appears in `sandbox-core/src/policy.rs` in the
+  L3 chain compiler.
+- `--mode regular` — appears in the gateway `entrypoint.sh` in place
+  of any prior `--mode transparent`.
+- `HttpProtocolOptions` (or `explicit_http_config`) — appears in
+  `sandbox-core/src/policy.rs` in the mitmproxy cluster compiler,
+  pinning HTTP/1.1 upstream.
 
 **File-level read-through** — not just grep, re-read end-to-end for
 subtle inconsistencies:
@@ -420,7 +537,8 @@ subtle inconsistencies:
   structure?
 - `sandbox-core/src/policy.rs` — the comment block that currently
   justifies bypassing Envoy (lines 862–888) is replaced with accurate
-  commentary on the PROXY v2 flow.
+  commentary on the CONNECT-tunneling flow (Envoy
+  `tunneling_config` → mitmproxy regular mode).
 - `sandbox-core/src/dns_propagation.rs` — module docs; no lingering
   references to L3 redirect rules.
 - `sandbox-core/src/gateway.rs` — `generate_input_allow_ruleset` and
@@ -438,9 +556,11 @@ explicitly deferred with a note.
 - **Running sessions**: keep their existing gateway container and
   config until stop/start. New sessions use the new flow. No in-place
   migration step.
-- **Gateway image**: `make gateway-image` rebuilds with latest
-  mitmproxy and PROXY v2 enabled. Daemon pins the image digest as
-  usual.
+- **Gateway image**: no mitmproxy rebuild or version bump required —
+  the pinned `mitmproxy 11.1.3` supports regular-mode CONNECT
+  natively. The gateway `entrypoint.sh` mitmproxy startup line does
+  need updating (`--mode regular --listen-host 127.0.0.1
+  --listen-port 18080`). Daemon pins the image digest as usual.
 - **Daemon binary**: compiles new Envoy config and deletes the
   `sandbox_l3` codepaths.
 - **Backwards compatibility**: none required — the change is fully

@@ -1342,6 +1342,107 @@ Unrestricted mode is intentionally a normal `Policy` value (stored in SQLite, ro
 
 ---
 
+### M9-S18: L3 via Envoy — xDS listener plumbing and mitmproxy cluster scaffolding
+
+**Entry criteria:** M9-S17 complete.
+
+**Spec:** `.tasks/specs/2026-04-19-l3-envoy-mitmproxy-flow-design.md`.
+
+**Rationale:** Foundation session — **purely additive**, no traffic-path change. Land the Envoy bootstrap/LDS split (static bootstrap + dynamic listener file served via filesystem LDS), the HTTP/1.1-pinned `mitmproxy` cluster (defined but not yet routed to by any filter chain), and the atomic listener-file writer that M9-S19 will drive on DNS-propagation events. The initial listener file is emitted with today's filter chains byte-for-byte, so listener behavior is unchanged. **Mitmproxy stays in transparent mode on `0.0.0.0:8080` and the `sandbox_l3` shortcut stays in place** — the mode flip, port flip, L3 filter-chain wiring, and `sandbox_l3` removal all happen together in M9-S19 as one atomic cutover. Splitting the mitmproxy reconfiguration across M9-S18 and M9-S19 would leave an intermediate state where `sandbox_l3`-DNAT'd traffic hits a mitmproxy that no longer understands transparent routing.
+
+**In scope (pointers into the spec):**
+- Spec § "Component changes → Envoy → Bootstrap split": static bootstrap (admin, all clusters, `dynamic_resources.lds_config`) + dynamic listener YAML at a filesystem path. The initial listener file emits today's filter chains unchanged — semantic parity with the pre-split unified config is a regression test of its own.
+- Spec § "Component changes → Envoy → New cluster `mitmproxy`": `STATIC` cluster, single endpoint `127.0.0.1:18080`, `typed_extension_protocol_options` set to `envoy.extensions.upstreams.http.v3.HttpProtocolOptions` with `explicit_http_config.http_protocol_options: {}` (forces HTTP/1.1 upstream — HTTP/2 CONNECT is unsupported by mitmproxy per upstream `#1138`), 1s/5s TCP health check, **no `upstream_proxy_protocol` transport-socket wrapping** (default `raw_buffer`). Cluster is defined but no filter chain routes to it yet — M9-S19 adds the L3 chains with `tcp_proxy.tunneling_config`.
+- Spec § "Configuration propagation" — filesystem-LDS wiring and the write-then-rename listener-file writer infrastructure. Note the `#20474` constraint: Envoy's filesystem LDS only fires on `MovedTo` inotify events, not `Modified` — so the current `docker exec` + stdin pipe delivery path (`policy_distributor.rs::write_file_to_container`, ~lines 267–315) would be silently ignored for the listener file. **Preferred option:** introduce a bind-mounted directory on the gateway container for the listener file and write from the host via tempfile + `fs::rename` on the same filesystem (standard Envoy xDS idiom, no shell round-trip per update). This is a new gateway-container mechanism — it requires a container bind-mount setup change in `networking/gateway/` (Dockerfile or the daemon's `docker run` wiring in `sandbox-core/src/gateway.rs`) and a new Rust write path in `sandbox-core` that parallels `write_file_to_container` (both mechanisms coexist — the old one for coredns/mitmproxy config, the new one only for the Envoy listener file). Fallback if the bind-mount proves unworkable: keep `docker exec` and run `sh -c 'cat > tmp && mv tmp final'` inside the container so the rename produces the required `MovedTo`. Bootstrap sets `dynamic_resources.lds_config.path_config_source.path` to the listener file and `watched_directory` to its parent. Writer invariant: between any two generations only `filter_chains` and `default_filter_chain` may differ — any diff in `listener_filters`, `metadata`, `socket_options`, `traffic_direction`, bind address, or `per_connection_buffer_limit_bytes` forces a full listener drain and destroys connection preservation; the writer asserts this and fails loudly if violated. Static-listener caveat: Envoy refuses to promote a statically-defined listener to LDS mid-session, so the bootstrap/LDS split must ship on day one — it cannot be retrofitted later, which is why it lands here rather than in M9-S19. The writer is exercised by unit tests here; DNS-propagation wires it up in M9-S19.
+- **Integration-test assertion (new listener infrastructure):** Envoy starts successfully against the split bootstrap; the listener is served via LDS (observable in Envoy admin `/config_dump` as a dynamically-added listener, not a static one); an atomic listener-file rewrite is detected by Envoy without connection drops on in-flight traffic. Existing L3 traffic still flows via `sandbox_l3` unchanged (assertion: `sandbox_l3` table still present, mitmproxy still listening on `0.0.0.0:8080`).
+
+**Explicitly deferred to M9-S19:** mitmproxy mode flip to `regular` and port flip from `0.0.0.0:8080` to `127.0.0.1:18080` (including the `entrypoint.sh` change); L3 filter-chain compilation + per-chain `tcp_proxy.tunneling_config`; removal of `sandbox_l3` and its DNS-propagation call site; removal of `tcp dport 8080 accept` from `generate_input_allow_ruleset`; DNS-propagation rewrite of the listener file.
+**Explicitly deferred to M9-S20:** E2E assertions, design-doc amendment, user-facing docs, consistency sweep.
+
+**Exit criteria:**
+
+1. Every in-scope spec bullet above is landed.
+2. `cd sandboxd && cargo nextest run --workspace` green; `make test-integration` green (includes the listen-address assertion above).
+3. **Full E2E suite** — `make test-e2e` end-to-end — green. Partial runs (single-file, keyword-filtered, xdist-only) do not count; bootstrap-split regressions show up in L1/L2 paths and only the full suite catches them.
+4. **Code review pass.** `/review` (or the `kio-reviewer` agent) run over the full diff; every finding addressed in-branch or logged as a `progress.json` todo with explicit user approval.
+5. **Docs check.** `make docs-build` green; `starlight-links-validator` clean. (No user-facing doc changes expected in this session — this is a sanity check, not a doc edit.)
+6. Session does not close unless (3), (4), AND (5) all hold.
+
+---
+
+### M9-S19: L3 atomic cutover — mitmproxy mode flip, filter chains, and removal of the `sandbox_l3` shortcut
+
+**Entry criteria:** M9-S18 complete.
+
+**Spec:** `.tasks/specs/2026-04-19-l3-envoy-mitmproxy-flow-design.md`.
+
+**Rationale:** Atomic cutover session. In a single session, (a) flip mitmproxy from transparent on `0.0.0.0:8080` to regular (forward-proxy) mode on `127.0.0.1:18080`, (b) wire L3 filter chains in Envoy to the `mitmproxy` cluster with `tcp_proxy.tunneling_config` emitting CONNECT, and (c) delete the `sandbox_l3` DNAT table, the `tcp dport 8080 accept` input rule, and all related DNS-propagation codepaths. These must land together — a partial cutover leaves an inconsistent intermediate state (e.g. `sandbox_l3`-DNAT'd traffic hitting a mitmproxy that expects CONNECT). After this session, Envoy is the sole TCP entry point, L3 routing is policy-driven (not port-driven), and fail-closed behavior holds during DNS propagation.
+
+**First-step verification before building out the chain compiler:** write a focused test that takes a minimal Envoy filter chain with `tcp_proxy.tunneling_config.hostname = "%DOWNSTREAM_LOCAL_ADDRESS%"` targeting the `mitmproxy` cluster, runs a real CONNECT through it against a stub upstream, and asserts the `:authority` of the emitted CONNECT equals the downstream original destination (IP:port). Envoy issue `#23700` documents friction with format-string interpolation on `tunneling_config.hostname` — if this primary path fails on the chosen Envoy build, pivot to the documented fallback (`set_filter_state` + `%DYNAMIC_METADATA(...)%`) before investing in the full compiler. Do not assume the primary path works.
+
+**In scope (pointers into the spec):**
+- Spec § "Component changes → mitmproxy": flip to regular (forward-proxy) mode — flags `--mode regular --listen-host 127.0.0.1 --listen-port 18080` in the gateway `entrypoint.sh`. Upstream target is read from the `CONNECT host:port` line Envoy sends; no `SO_ORIGINAL_DST` dependency in mitmproxy post-flip. The pinned `mitmproxy 11.1.3` supports this natively — no version bump required.
+- Spec § "Component changes → Envoy → L3 filter-chain compilation": `prefix_ranges` from DNS cache for domains, `prefix_ranges` on `Destination::Cidr`, default filter chain for wildcard `*`. No port predicate on L3 chains. In each L3 chain the `tcp_proxy` filter sets `tunneling_config.hostname = "%DOWNSTREAM_LOCAL_ADDRESS%"` (or the dynamic-metadata fallback per the first-step verification above).
+- Spec § "Component changes → Envoy → No default passthrough chain": unmatched connections are closed. L1/L2 chains unchanged.
+- Spec § "Component changes → nftables → Deleted": `generate_l3_redirect_rules`, the `sandbox_l3` table, DNS-propagation call site, `sandbox_l3` teardown, `tcp dport 8080 accept` in `generate_input_allow_ruleset`.
+- Spec § "Configuration propagation" — DNS propagation now also rewrites the Envoy listener file (atomic rename via the M9-S18 writer), keeping the outside-in ordering from `networking-design.md:1345-1349`.
+- Spec § "Ports" table — port flip 8080 → 18080 with loopback-only bind lands here (the integration-test assertion below gates this).
+- **Addon peer-IP verification:** grep `networking/mitmproxy/addons/policy_addon.py` and `networking/mitmproxy/addons/passthrough_addon.py` for any use of `client_conn.peername`, `client_addr`, or similar. Post-flip, this will be `127.0.0.1:<envoy-ephemeral-port>` instead of the VM IP that transparent mode surfaced via conntrack. If any hit, either migrate the addon to read the VM identity from a forwarded-metadata header that Envoy can inject (e.g. via `set_request_headers` on the L3 chain) or accept the change consciously and update the corresponding tests. If no hits, document in the session log that the addons are peer-IP-agnostic and proceed.
+- Spec § "Testing plan → Unit tests (Rust)": flip `compile_level3_envoy_no_mitmproxy_cluster` and siblings — mitmproxy cluster must now be present, carrying `typed_extension_protocol_options` = `envoy.extensions.upstreams.http.v3.HttpProtocolOptions` with `explicit_http_config.http_protocol_options` populated (HTTP/1.1); new test asserting the L3 filter chain's `tcp_proxy` filter has `tunneling_config.hostname` set to `%DOWNSTREAM_LOCAL_ADDRESS%` (or the documented dynamic-metadata fallback per issue `#23700`); new `prefix_ranges` test (L3 chains match on `prefix_ranges` from the DNS cache, not `server_names`); new wildcard test (`*` L3 destination produces a default filter chain routing to `mitmproxy`); new fail-closed test (empty DNS cache → no L3 filter chain for that domain → traffic dropped, no passthrough); `generate_dnat_ruleset` emits nothing L3-specific; `generate_input_allow_ruleset` no longer contains `tcp dport 8080 accept`; remove `generate_l3_redirect_rules` tests entirely.
+- Spec § "Testing plan → Gateway integration test": exactly three nftables tables after session start (`sandbox`, `sandbox_dnat`, `sandbox_policy`); **mitmproxy is listening on `127.0.0.1:18080`; nothing is listening on `8080`; nothing is listening on `18080` on the VM-facing IP**.
+
+**Explicitly deferred to M9-S20:** all E2E assertions, design-doc amendment, user-facing docs, grep + read-through sweep.
+
+**Exit criteria:**
+
+1. Every in-scope spec bullet above is landed; the three-table gateway integration assertion holds.
+2. `cd sandboxd && cargo nextest run --workspace` green; `make test-integration` green.
+3. **Full E2E suite** — `make test-e2e` end-to-end — green. Existing L3 HTTP-inspection coverage still passes; a "run only M4 tests" shortcut does not count. Flakiness warrants investigation, not retries.
+4. **Code review pass.** `/review` (or `kio-reviewer`) run over the full diff; every finding addressed in-branch or logged as a todo with user approval.
+5. **Docs check.** `make docs-build` green. Re-read `docs/concepts/networking.md` and `docs/concepts/architecture.md`; any stale L3-flow claim is either fixed here or logged as a todo explicitly owned by M9-S20 (not silently left behind).
+6. Session does not close unless (3), (4), AND (5) all hold.
+
+---
+
+### M9-S20: L3 flow — E2E assertions, design-doc amendment, user-facing docs, consistency sweep
+
+**Entry criteria:** M9-S19 complete.
+
+**Spec:** `.tasks/specs/2026-04-19-l3-envoy-mitmproxy-flow-design.md`.
+
+**Rationale:** Verify the observable L3 contract, update `networking-design.md`, rewrite the five user-facing docs the spec names, and run the structured grep + read-through sweep the spec prescribes. This session is where the design doc and the user-facing surface catch up to the code.
+
+**In scope (pointers into the spec):**
+- Spec § "Testing plan → E2E tests" — all four bullets: existing L3 inspection still passes; L3 connection appears in BOTH Envoy access log AND mitmproxy log, and the Envoy access-log entry for an L3 connection shows an HTTP CONNECT with `:authority` set to the original destination (IP:port), which doubles as the "appears in both logs" check; raw TCP (non-HTTP) to an L3 destination's IP on port 443 is observed to close during mitmproxy's HTTP-parse phase — the assertion is written against the empirical failure mode (connection close with parser error), not against any claim that mitmproxy "rejects" non-HTTP cleanly; connection-preservation across an unrelated policy update (open a long-lived HTTP response stream to an allowed L3 destination; while it is open, apply a policy update that adds an unrelated domain; verify the original stream receives its remaining bytes without reset — this is the headline property xDS-based propagation buys us, and a process restart would visibly break it). The "first-connection-fails-~1–2s" test is intentionally NOT added (spec: flaky; covered deterministically by M9-S19's empty-DNS-cache unit test).
+- Spec § "Design doc amendment (`networking-design.md`)" — the two prescribed additions (Envoy classification list around line 512; mitmproxy bullet list around line 520).
+- Spec § "User-facing doc updates" — all five files exactly as specified:
+  - `docs/concepts/networking.md` (mermaid diagram fix, new "fail-closed during propagation" subsection, L3-applies-to-all-ports prose).
+  - `docs/guides/network-policies.md` (new "What happens when you apply or change a policy" subsection; L3-is-HTTP-only note).
+  - `docs/guides/troubleshooting.md` (three new entries).
+  - `docs/concepts/architecture.md` (one-line L3 prose fix if any).
+  - `docs/guides/hardening.md` (verify L3 flow description if any).
+- Spec § "Post-implementation consistency pass → Grep sweep" — every pattern from the spec. **Negative-presence** (must each have zero matches in implementation code; matches acceptable only in rationale/historical comments): `sandbox_l3`; stray `8080` (no references in sandbox code after the port flip); `SO_ORIGINAL_DST` (remains on Envoy's `original_dst` listener filter — correct and unchanged — but must NOT appear in the mitmproxy codepath post-change); `upstream_proxy_protocol` (we never adopt it); `PROXY protocol v2` / `PROXY v2` (absent from implementation code and comments; acceptable only in historical notes or rejected-option writeups); `transparent mode` / `--mode transparent` (zero in implementation code, gateway `entrypoint.sh`, and Dockerfile; acceptable only in rationale comments explaining why we chose regular mode); `bypasses Envoy` / `skip Envoy` / `Envoy is bypassed`; `pre-propagation` / `falls through to Envoy` / `~2 seconds`; `tcp dport 8080 accept`; `original_dst` cluster referenced in an L3 context; `dport { 80, 443 }` / any port-based routing in an L3 context. **Positive-presence** (must each have at least one match): `tunneling_config` in `sandbox-core/src/policy.rs` (L3 chain compiler); `--mode regular` in the gateway `entrypoint.sh` (in place of any prior `--mode transparent`); `HttpProtocolOptions` (or `explicit_http_config`) in `sandbox-core/src/policy.rs` (mitmproxy cluster compiler, pinning HTTP/1.1 upstream).
+- Spec § "Post-implementation consistency pass → File-level read-through" — every listed file: `networking-design.md`, `docs/concepts/networking.md`, `docs/concepts/architecture.md`, `docs/guides/hardening.md`, `docs/guides/network-policies.md`, `docs/guides/troubleshooting.md`, `sandbox-core/src/policy.rs` (including the comment block around lines 862–888), `sandbox-core/src/dns_propagation.rs`, `sandbox-core/src/gateway.rs`, `tests/e2e/test_m4_policy.py`, `CLAUDE.md`.
+
+**Exit criteria:**
+
+1. Every in-scope spec bullet above is landed.
+2. **Whole spec implemented.** Re-read `.tasks/specs/2026-04-19-l3-envoy-mitmproxy-flow-design.md` end-to-end and confirm that every non-deferred item — across M9-S18, M9-S19, and M9-S20 — is either in the tree or explicitly covered by an item in the spec's "Explicitly out of scope" section. Anything that is neither shipped nor out-of-scope is a blocker; it must be landed in-branch or logged as a `progress.json` todo with the user's explicit approval before this session can close.
+3. New E2E assertions pass on **two consecutive full-suite runs** of `make test-e2e`. The connection-preservation test is green without retries.
+4. **Full E2E suite** — `make test-e2e` end-to-end — green. The full 30–45-minute suite is the gate; single-file or keyword-filtered runs do not count.
+5. `make docs-build` green; `starlight-links-validator` clean; updated Mermaid in `concepts/networking` renders as SVG locally and as native markdown on GitHub.
+6. Grep sweep returns zero matches for every pattern in the spec, OR each remaining match carries an inline rationale in-branch.
+7. Every file in the spec's read-through list has been re-read end-to-end; findings are fixed in-branch or logged as `progress.json` todos. The session log records which files were read and what was found.
+8. **Code review pass.** `/review` (or `kio-reviewer`) run over the full diff; every finding addressed in-branch before the session closes.
+9. **Hard gate — do not mark this session complete unless ALL of the following hold:**
+   1. The whole spec (§ 2 above) has been re-read and every non-deferred item is either shipped or explicitly captured as a user-approved todo.
+   2. `/review` (or `kio-reviewer`) has been run and every finding is resolved.
+   3. `make test-e2e` has run end-to-end to completion and is green on two consecutive runs.
+   4. Every doc in the read-through list has been re-read and `make docs-build` is green.
+   Substituting a partial E2E run, a grep-only "docs check", or "it compiled, close enough" fails the session.
+
+---
+
 ## Risks
 
 | Risk | Impact | Mitigation |
@@ -1354,28 +1455,9 @@ Unrestricted mode is intentionally a normal `Policy` value (stored in SQLite, ro
 | socket_vmnet availability on macOS | Blocks F1 | socket_vmnet must be installed separately (Homebrew). Document as a prerequisite. Test early on a macOS machine. |
 | QEMU hardening flags conflict with Lima's defaults | Delays M6 | Lima may set its own QEMU flags. Check for conflicts. May need to use Lima's `qemu.args` override mechanism. |
 
-## Completed session count
-
-| Milestone | Sessions |
-|-----------|----------|
-| M0 | 1 |
-| M1 | 4 |
-| M2 | 3 |
-| M3 | 6 |
-| M4 | 6 |
-| M5 | 3 |
-| M6 | 3 |
-| M7 | 1 |
-| M8 | 3 |
-| M8.5 | 4 |
-| M9 | 17 |
-| **Total** | **51** |
-
----
-
 ## Future Milestones
 
-### F1: macOS Support (2 sessions)
+### F1: macOS Support
 
 > **Separate track.** macOS support requires access to macOS hardware and can be executed independently. It is not on the critical path for Linux-only deployments.
 
@@ -1427,7 +1509,7 @@ Unrestricted mode is intentionally a normal `Policy` value (stored in SQLite, ro
 
 ---
 
-### F2: Policy Persistence Hardening (2 sessions)
+### F2: Policy Persistence Hardening
 
 > **Separate track.** Follow-ups from the `inspect`/`describe` spec that introduced normalized policy persistence. Not on the critical path — the initial persistence change already closes the restart-regression gap.
 
