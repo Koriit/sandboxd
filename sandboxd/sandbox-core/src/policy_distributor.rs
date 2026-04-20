@@ -299,7 +299,8 @@ impl PreviousConfigs {
 
         let coredns = read_file_from_container(&container, "/etc/coredns/policy.conf").ok();
         let mitmproxy = read_file_from_container(&container, "/tmp/mitmproxy/policy.json").ok();
-        let envoy_bootstrap = read_file_from_container(&container, BOOTSTRAP_FILE_IN_CONTAINER).ok();
+        let envoy_bootstrap =
+            read_file_from_container(&container, BOOTSTRAP_FILE_IN_CONTAINER).ok();
 
         // The listener file is on the host (bind-mounted into the
         // container) — read it directly so rollback works even if the

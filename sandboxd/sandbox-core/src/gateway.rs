@@ -173,12 +173,12 @@ impl GatewayManager {
         // fail-closed default is deny-all. For sessions started without
         // a policy, this means the Envoy listener is deny-all rather
         // than L1 pass-through; net user-visible behaviour is unchanged
-        // because the nftables layers (`sandbox_policy`, `sandbox_l3`)
-        // gate traffic first and are also empty on a no-policy session,
-        // and DNS is deny-by-default since M9-S15. M9-S19 replaces this
-        // default with the policy-driven L3 filter chains. See
-        // `PolicyCompiler::compile_initial_envoy_listener` for the full
-        // rationale.
+        // because the nftables layer (`sandbox_policy`) gates traffic
+        // first and is also empty on a no-policy session, and DNS is
+        // deny-by-default since M9-S15. As of M9-S19, the policy-driven
+        // L3 filter chains replace this default once a policy is
+        // applied. See `PolicyCompiler::compile_initial_envoy_listener`
+        // for the full rationale.
         let listener_host_dir = session_listener_host_dir(session_id);
         // Best-effort cleanup of any leftover dir from a crashed previous
         // session with the same ID (extremely unlikely given UUIDs, but
@@ -1039,9 +1039,6 @@ table inet sandbox {{
         # Allow HTTP proxy from VM subnet (Envoy)
         ip saddr {vm_subnet} tcp dport 10000 accept
 
-        # Allow HTTPS inspection from VM subnet (mitmproxy, L3 redirect)
-        ip saddr {vm_subnet} tcp dport 8080 accept
-
         # Reject everything else (fast failure)
         reject
     }}
@@ -1267,6 +1264,44 @@ mod tests {
         assert!(
             ruleset.contains("reject"),
             "must reject unmatched forwarded traffic"
+        );
+    }
+
+    // -- Input-allow ruleset tests ------------------------------------------
+
+    #[test]
+    fn generate_input_allow_ruleset_has_no_tcp_8080_accept() {
+        // M9-S19: mitmproxy moved from transparent mode on 0.0.0.0:8080
+        // to regular mode on 127.0.0.1:18080. Nothing in the VM subnet
+        // should reach mitmproxy directly over TCP/8080 anymore — Envoy
+        // terminates the connection and opens a CONNECT tunnel to
+        // mitmproxy over loopback. The input-allow chain must drop the
+        // stale accept so the gateway surface remains tight.
+        let ruleset = generate_input_allow_ruleset("10.209.0.0/28");
+
+        assert!(
+            !ruleset.contains("tcp dport 8080"),
+            "sandbox input chain must no longer accept tcp dport 8080 \
+             (mitmproxy runs on 127.0.0.1:18080 post-M9-S19):\n{ruleset}"
+        );
+        assert!(
+            !ruleset.contains("tcp dport 18080"),
+            "mitmproxy's 18080 is loopback-only and must NOT be opened to \
+             the VM subnet:\n{ruleset}"
+        );
+
+        // The other intentional allows must stay intact.
+        assert!(
+            ruleset.contains("udp dport 53"),
+            "DNS (UDP) must still be allowed from the VM subnet:\n{ruleset}"
+        );
+        assert!(
+            ruleset.contains("tcp dport 53"),
+            "DNS (TCP) must still be allowed from the VM subnet:\n{ruleset}"
+        );
+        assert!(
+            ruleset.contains("tcp dport 10000"),
+            "Envoy HTTP proxy port must still be allowed from the VM subnet:\n{ruleset}"
         );
     }
 }

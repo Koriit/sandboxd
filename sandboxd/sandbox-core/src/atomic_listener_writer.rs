@@ -46,9 +46,7 @@ use std::path::{Path, PathBuf};
 use tempfile::Builder as TempFileBuilder;
 use tracing::{debug, info};
 
-use crate::policy::{
-    FILTER_CHAINS_BEGIN_MARKER, FILTER_CHAINS_END_MARKER, LISTENER_FILE_NAME,
-};
+use crate::policy::{FILTER_CHAINS_BEGIN_MARKER, FILTER_CHAINS_END_MARKER, LISTENER_FILE_NAME};
 use crate::session::SessionId;
 
 /// Root directory on the host under which per-session listener directories
@@ -185,11 +183,10 @@ impl AtomicListenerWriter {
         let is_initial = !self.target.exists();
 
         if !is_initial {
-            let current =
-                fs::read_to_string(&self.target).map_err(|e| ListenerWriteError::Io {
-                    path: self.target.clone(),
-                    source: e,
-                })?;
+            let current = fs::read_to_string(&self.target).map_err(|e| ListenerWriteError::Io {
+                path: self.target.clone(),
+                source: e,
+            })?;
             enforce_invariant(&current, new_content)?;
         }
 
@@ -230,12 +227,12 @@ impl AtomicListenerWriter {
         // `MovedTo` inotify event on the parent directory, which is
         // exactly what Envoy's LDS watcher subscribes to (upstream
         // issue `#20474`).
-        let persisted = tempfile.persist(&self.target).map_err(|e| {
-            ListenerWriteError::Io {
+        let persisted = tempfile
+            .persist(&self.target)
+            .map_err(|e| ListenerWriteError::Io {
                 path: self.target.clone(),
                 source: e.error,
-            }
-        })?;
+            })?;
         // Drop the returned File explicitly; we don't need the handle
         // past the rename.
         drop(persisted);
@@ -473,11 +470,7 @@ mod tests {
             .unwrap();
 
         let err = writer
-            .write(&framed(
-                "head\n",
-                "    filter_chains: []",
-                "traffic: out\n",
-            ))
+            .write(&framed("head\n", "    filter_chains: []", "traffic: out\n"))
             .unwrap_err();
         assert!(
             matches!(err, ListenerWriteError::InvariantViolated { diff_summary } if diff_summary.contains("tail")),

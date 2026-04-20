@@ -1555,17 +1555,17 @@ async fn clear_policy(
 /// Clear a session's policy: cancel the DNS propagation loop, delete the
 /// persisted row, drop the in-memory entry, and push the fail-closed empty
 /// configuration to the gateway (CoreDNS empty allow-list, deny-all
-/// mitmproxy/Envoy, flushed sandbox_policy and sandbox_l3 nftables tables).
+/// mitmproxy/Envoy, flushed `sandbox_policy` nftables table).
 ///
 /// Ordering mirrors [`apply_policy`]:
-/// 1. Gateway distribution of the empty-policy output.
-/// 2. Explicit `sandbox_l3` flush (the standard distributor only manages
-///    `sandbox_policy`, so stale L3 DNAT rules from a prior Http policy would
-///    survive without this).
-/// 3. Store delete.
-/// 4. In-memory map removal + DNS loop cancellation.
+/// 1. Gateway distribution of the empty-policy output. This rewrites the
+///    Envoy listener to its deny-all form (no filter chains), pushes empty
+///    CoreDNS/mitmproxy configs, and flushes the `sandbox_policy` nftables
+///    table in a single distributor call.
+/// 2. Store delete (DB row removal).
+/// 3. In-memory map removal + DNS propagation loop cancellation.
 ///
-/// Steps 3–4 happen after a successful distribution: if the gateway step
+/// Steps 2–3 happen after a successful distribution: if the gateway step
 /// fails we leave the DB row in place so a retry can complete the clear.
 async fn clear_session_policy(
     session_id: &SessionId,
@@ -1578,35 +1578,15 @@ async fn clear_session_policy(
     })?;
 
     // Compile an empty policy — CoreDnsConfig becomes empty allow-list,
-    // mitmproxy rules become empty (deny-all), Envoy becomes deny-all,
-    // nftables allow-rules become empty (distributor flushes
-    // `sandbox_policy`).
+    // mitmproxy rules become empty (deny-all), Envoy listener becomes an
+    // empty deny-all (no filter chains emitted), nftables allow-rules
+    // become empty (distributor flushes `sandbox_policy`).
     let empty_policy = Policy {
         version: sandbox_core::policy::SCHEMA_VERSION.to_string(),
         rules: Vec::new(),
     };
     let compiled = PolicyCompiler::compile(&empty_policy, &network_info)?;
     PolicyDistributor::distribute(session_id, &compiled, &state.gateway)?;
-
-    // Flush the sandbox_l3 DNAT table explicitly.  The distributor only
-    // manages `sandbox_policy`; without this, L3 redirect rules from a
-    // previous Http-level policy would keep forwarding VM egress to
-    // mitmproxy even though the policy is gone.
-    let flush_l3 = "delete table inet sandbox_l3\n";
-    if let Err(e) =
-        state
-            .gateway
-            .inject_nftables_ruleset_public(session_id, flush_l3, "policy-clear-l3")
-    {
-        // Best-effort: the table may not exist (e.g. previous policy
-        // never had Http rules), which is the common case.  Log and
-        // continue so the rest of the clear still takes effect.
-        debug!(
-            session_id = %session_id,
-            error = %e,
-            "sandbox_l3 flush failed (likely absent); continuing clear"
-        );
-    }
 
     // Persist the clear.  Idempotent: safe to call when no row exists.
     state.store.delete_policy(session_id)?;

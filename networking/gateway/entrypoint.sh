@@ -123,11 +123,11 @@ if [[ -f /etc/mitmproxy/policy_addon.py ]]; then
     MITM_ADDON="/etc/mitmproxy/policy_addon.py"
 fi
 
-log "Starting mitmproxy (mitmdump) on 0.0.0.0:8080 (addon=${MITM_ADDON})..."
+log "Starting mitmproxy (mitmdump) on 127.0.0.1:18080 in regular (forward-proxy) mode (addon=${MITM_ADDON})..."
 mitmdump \
-    --mode transparent \
-    --listen-host 0.0.0.0 \
-    --listen-port 8080 \
+    --mode regular \
+    --listen-host 127.0.0.1 \
+    --listen-port 18080 \
     --set stream_large_bodies=1 \
     -s "${MITM_ADDON}" \
     >>"${LOG_DIR}/mitmproxy.log" 2>&1 &
@@ -137,7 +137,7 @@ log "mitmproxy started (PID=${MITM_PID})"
 # mitmdump has no health endpoint; check that the process is alive and
 # the port is open. The port check is the real readiness signal.
 wait_for_ready "mitmproxy" \
-    "kill -0 ${MITM_PID} 2>/dev/null && bash -c '</dev/tcp/127.0.0.1/8080' 2>/dev/null"
+    "kill -0 ${MITM_PID} 2>/dev/null && bash -c '</dev/tcp/127.0.0.1/18080' 2>/dev/null"
 
 # ── Start Envoy ─────────────────────────────────────────────────────
 
@@ -192,7 +192,7 @@ wait_for_ready "CoreDNS" "curl -sf http://127.0.0.1:8180/health"
 # ── All components running ──────────────────────────────────────────
 
 log "All components are running and healthy."
-log "  mitmproxy  PID=${MITM_PID}  (0.0.0.0:8080)"
+log "  mitmproxy  PID=${MITM_PID}  (127.0.0.1:18080 regular mode; reached via Envoy CONNECT)"
 log "  Envoy      PID=${ENVOY_PID}  (0.0.0.0:10000, admin 127.0.0.1:9901)"
 log "  CoreDNS    PID=${COREDNS_PID}  (DNS :53, health :8180)"
 

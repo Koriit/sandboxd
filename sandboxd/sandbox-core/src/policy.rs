@@ -5,6 +5,7 @@ use std::net::Ipv4Addr;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::dns_propagation::DnsCache;
 use crate::error::SandboxError;
 use crate::network::NetworkInfo;
 
@@ -617,7 +618,14 @@ impl PolicyCompiler {
 
         let nftables_rules = Self::compile_nftables(policy, network_info);
         let envoy_bootstrap_config = Self::compile_envoy_bootstrap();
-        let envoy_listener_config = Self::compile_envoy_listener(policy);
+        // At apply-policy time the DNS cache is empty (domain→IP
+        // mappings live in the DNS propagation loop's per-session
+        // cache). That's intentional and fail-closed: L3 domain chains
+        // emit no filter chain on the first write, so traffic is denied
+        // until CoreDNS resolves the domain and the DNS loop rewrites
+        // the listener via `AtomicListenerWriter::write`.
+        let empty_cache = DnsCache::new();
+        let envoy_listener_config = Self::compile_envoy_listener(policy, &empty_cache);
         let mitmproxy_config = Self::compile_mitmproxy(policy);
         let coredns_config = Self::compile_coredns(policy);
 
@@ -860,10 +868,13 @@ impl PolicyCompiler {
     /// the bootstrap file inside the container before Envoy starts.
     pub fn compile_envoy_bootstrap() -> String {
         // Cluster definitions. Both `original_dst` (L1 passthrough, L2
-        // TLS forwarding) and `mitmproxy` (L3 CONNECT-tunneled target)
-        // are defined statically. The `mitmproxy` cluster is defined
-        // here from M9-S18 onwards; no filter chain routes to it yet
-        // (that's M9-S19, which adds `tcp_proxy.tunneling_config`).
+        // TLS forwarding) and `mitmproxy` (L3 CONNECT-tunnel target) are
+        // defined statically. L3 filter chains route to the `mitmproxy`
+        // cluster via per-chain `tcp_proxy.tunneling_config` that emits
+        // an HTTP/1.1 CONNECT preface with `:authority` set to the
+        // original downstream destination — mitmproxy runs in regular
+        // (forward-proxy) mode on `127.0.0.1:18080` and uses the CONNECT
+        // authority to pick the upstream target.
         //
         // `mitmproxy` cluster specifics:
         // - `127.0.0.1:18080` — loopback-only; not a VM-facing DNAT
@@ -872,29 +883,14 @@ impl PolicyCompiler {
         // - `typed_extension_protocol_options` pins HTTP/1.1 upstream
         //   via `HttpProtocolOptions.explicit_http_config.http_protocol_options`.
         //   mitmproxy does not implement HTTP/2 CONNECT (upstream issue
-        //   `#1138`), so HTTP/2 upstream would break the CONNECT tunnel
-        //   M9-S19 will wire up.
+        //   `#1138`), so HTTP/2 upstream would break the CONNECT tunnel.
         // - No `upstream_proxy_protocol` transport-socket wrapping. The
         //   default `raw_buffer` upstream transport is used; the CONNECT
-        //   preface is (will be, in M9-S19) emitted by a per-chain
+        //   preface is emitted by each filter chain's
         //   `tcp_proxy.tunneling_config`, not by a transport-socket
         //   header.
         // - TCP health check (1s timeout, 5s interval) so a dead
         //   mitmproxy surfaces in Envoy admin stats.
-        //
-        //   Transient M9-S18 behaviour: until M9-S19 flips the
-        //   mitmproxy entrypoint to `--mode regular --listen-host
-        //   127.0.0.1 --listen-port 18080`, mitmproxy still listens on
-        //   `0.0.0.0:8080`, so this probe connects to a closed port
-        //   and fails on every 5s tick. Expect a steady drip of
-        //   "upstream cluster_mitmproxy health check failed" warnings
-        //   and a climbing `cluster.mitmproxy.health_check.failure`
-        //   stat for the duration of the one-session gap between
-        //   M9-S18 and M9-S19 landing. Operators seeing "mitmproxy
-        //   unhealthy" in `/clusters` during this window should treat
-        //   it as expected, not as a bug. The health check stays in
-        //   the cluster definition per spec — we're documenting the
-        //   transient, not gating it behind a feature flag.
         let clusters_yaml = r#"    - name: original_dst
       type: ORIGINAL_DST
       lb_policy: CLUSTER_PROVIDED
@@ -963,9 +959,9 @@ admin:
     /// Compile the Envoy **listener file** (LDS `DiscoveryResponse`).
     ///
     /// This is the only piece of Envoy config that changes during a
-    /// session's lifetime. It is written initially alongside the bootstrap
-    /// and will be rewritten by DNS propagation (wired up in M9-S19) on
-    /// each change to the resolved-IP set.
+    /// session's lifetime. It is written initially alongside the
+    /// bootstrap and is rewritten by the DNS propagation loop on each
+    /// change to the resolved-IP set for domain L3 destinations.
     ///
     /// The format is a filesystem-LDS `DiscoveryResponse` with a single
     /// `envoy.config.listener.v3.Listener` resource. Between the
@@ -977,29 +973,45 @@ admin:
     /// connection-preservation property.
     ///
     /// Supports all assurance levels:
-    /// - Level 1 (transport): default filter chain with TCP passthrough
-    ///   to `original_dst`. nftables controls which IPs reach Envoy.
-    /// - Level 2 (TLS): SNI-matched filter chains forwarding to
-    ///   `original_dst`. The `tls_inspector` listener filter extracts
-    ///   SNI from ClientHello.
-    /// - Level 3 (full): SNI-matched filter chains forwarding to
-    ///   `original_dst` (passthrough). **M9-S18 preserves the
-    ///   pre-split chain shape byte-for-byte** so the cutover in
-    ///   M9-S19 is a clean, isolated change. L3 traffic is currently
-    ///   redirected to mitmproxy at the nftables level (`sandbox_l3`
-    ///   DNAT rules); Envoy does not yet route L3 to the `mitmproxy`
-    ///   cluster. That rewiring — and the per-chain
-    ///   `tcp_proxy.tunneling_config` that emits the CONNECT preface —
-    ///   lands in M9-S19.
+    /// - Level 1 (transport): default catch-all chain with TCP
+    ///   passthrough to `original_dst`. nftables controls which IPs
+    ///   reach Envoy.
+    /// - Level 2 (TLS): SNI-matched chains forwarding to `original_dst`.
+    ///   The `tls_inspector` listener filter extracts SNI from the
+    ///   ClientHello.
+    /// - Level 3 (full / MITM): per-destination filter chains matching
+    ///   on IP `prefix_ranges` (domain → DNS-cache-resolved IPs, CIDR
+    ///   → CIDR directly, `*` → `default_filter_chain`). Each chain
+    ///   routes to the `mitmproxy` cluster via
+    ///   `tcp_proxy.tunneling_config.hostname =
+    ///   "%DOWNSTREAM_LOCAL_ADDRESS%"`, which emits an HTTP/1.1
+    ///   CONNECT preface whose authority is the original downstream
+    ///   destination recovered by the `original_dst` listener filter.
+    ///   mitmproxy (regular mode, `127.0.0.1:18080`) reads that
+    ///   authority to pick the upstream target — no transparent-DNAT
+    ///   shortcut and no `SO_ORIGINAL_DST` plumbing past Envoy.
+    ///
+    /// **Fail-closed behaviour.** A domain L3 destination with an empty
+    /// DNS cache entry produces **no filter chain at all** — the
+    /// connection is closed by Envoy rather than passed through. Traffic
+    /// only reaches mitmproxy after CoreDNS has resolved the domain and
+    /// the DNS propagation loop has rewritten the listener via the
+    /// atomic writer.
     ///
     /// When L2 or L3 rules are present, `tls_inspector` is added as a
     /// listener filter. The `original_dst` listener filter is always
-    /// present.
+    /// present — L3 chains depend on it to recover the original
+    /// destination address for `%DOWNSTREAM_LOCAL_ADDRESS%`.
     ///
-    /// Filter chain ordering: L2/L3 SNI-matched chains first (order does
-    /// not matter among them since SNI matches are disjoint), then the
-    /// L1 default catch-all chain last.
-    pub fn compile_envoy_listener(policy: &Policy) -> String {
+    /// Filter chain ordering: L2 SNI-matched chains first, then L3
+    /// IP-matched chains, then the L1 default catch-all chain. The L3
+    /// wildcard (`*`) destination, if present, becomes the listener's
+    /// `default_filter_chain` — it cannot coexist with an L1
+    /// default-chain entry today because the design allows at most one
+    /// default chain per listener. Policy validation guarantees that
+    /// shape (a wildcard L3 rule precludes additional L1 rules reaching
+    /// the listener as default chains in practice).
+    pub fn compile_envoy_listener(policy: &Policy, dns_cache: &DnsCache) -> String {
         let has_transport = policy
             .rules
             .iter()
@@ -1023,7 +1035,12 @@ admin:
 
         // -- Filter chains -----------------------------------------------------
 
-        let mut filter_chains = Vec::new();
+        let mut filter_chains: Vec<String> = Vec::new();
+        // A separate `default_filter_chain` section. Populated by a
+        // wildcard L3 rule (`destination: "*"`). At most one default
+        // chain per listener; an L1-only policy uses the L1 catch-all
+        // at the end of `filter_chains` instead.
+        let mut default_filter_chain: Option<String> = None;
 
         // Level 2 (TLS): SNI-matched chains → original_dst.
         for rule in policy
@@ -1045,61 +1062,108 @@ admin:
             ));
         }
 
-        // Level 3 (full): SNI-matched chains → original_dst (passthrough).
+        // Level 3 (full / MITM): per-destination chains matched on IP
+        // `prefix_ranges`, routed to the `mitmproxy` cluster via
+        // `tcp_proxy.tunneling_config.hostname =
+        // "%DOWNSTREAM_LOCAL_ADDRESS%"`. The Envoy `original_dst`
+        // listener filter recovers the pre-DNAT local address from the
+        // kernel `SO_ORIGINAL_DST` socket option and populates
+        // %DOWNSTREAM_LOCAL_ADDRESS% per connection; `tunneling_config`
+        // emits a `CONNECT <orig-ip>:<orig-port> HTTP/1.1` preface on
+        // the upstream TCP stream before forwarding the downstream
+        // bytes unchanged. mitmproxy (regular mode, 127.0.0.1:18080)
+        // reads the CONNECT authority to pick the upstream target.
         //
-        // **M9-S18 note.** The listener file is emitted with today's
-        // filter-chain shape byte-for-byte so the split is purely
-        // additive — no traffic-path change, no new test baseline. L3
-        // traffic still reaches mitmproxy via the `sandbox_l3` nftables
-        // DNAT shortcut (which preserves `SO_ORIGINAL_DST`); Envoy does
-        // not yet route L3 to the `mitmproxy` cluster. That cutover is
-        // M9-S19, which wires each L3 chain through
-        // `tcp_proxy.tunneling_config` (HTTP/1.1 CONNECT) to the
-        // mitmproxy cluster defined in the static bootstrap.
-        //
-        // During the brief window before DNS propagation installs the
-        // `sandbox_l3` rules (first ~2 seconds), L3 traffic falls
-        // through Envoy as opaque passthrough. Once the `sandbox_l3`
-        // rules are in place, traffic bypasses Envoy entirely. Both of
-        // these properties go away in M9-S19.
+        // Destination shapes:
+        // - `Destination::Domain(d)` with resolved IPs → one
+        //   `prefix_ranges` entry per IP (`/32` masks). **No IPs →
+        //   no chain (fail-closed).**
+        // - `Destination::Cidr(c)` → a single `prefix_ranges` entry
+        //   carrying the CIDR directly.
+        // - `Destination::Domain("*")` → the listener's
+        //   `default_filter_chain` (no match predicate). This replaces
+        //   the L1 default catch-all for the session; the two never
+        //   coexist because there is only one default slot and an
+        //   unrestricted L3 rule takes precedence.
         for rule in policy
             .rules
             .iter()
             .filter(|r| matches!(r.level, AssuranceLevel::Http { .. }))
         {
-            let domain = rule.destination.to_string();
-            let stat_name = Self::sanitize_stat_prefix(&domain);
-            // Unrestricted wildcard (`*`) destination: Envoy's
-            // `filter_chain_match.server_names` does not accept a bare
-            // `*`, so emit a catch-all chain (no `filter_chain_match`).
-            if domain == "*" {
-                filter_chains.push(format!(
-                    r#"    - filters:
-        - name: envoy.filters.network.tcp_proxy
-          typed_config:
-            "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
-            cluster: original_dst
-            stat_prefix: level3_{stat_name}"#
-                ));
-                continue;
-            }
-            filter_chains.push(format!(
-                r#"    - filter_chain_match:
-        server_names: ["{domain}"]
+            match &rule.destination {
+                Destination::Domain(domain) if domain == "*" => {
+                    let stat_name = Self::sanitize_stat_prefix(domain);
+                    // `default_filter_chain` is a sibling of `address`,
+                    // `listener_filters`, and `filter_chains` on the
+                    // Listener resource — all sit at 4-space indent
+                    // because the listener is the first (and only) list
+                    // item under `resources:`.
+                    default_filter_chain = Some(format!(
+                        r#"    default_filter_chain:
       filters:
         - name: envoy.filters.network.tcp_proxy
           typed_config:
             "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
-            cluster: original_dst
-            stat_prefix: level3_{stat_name}"#
-            ));
+            cluster: mitmproxy
+            stat_prefix: level3_{stat_name}
+            tunneling_config:
+              hostname: "%DOWNSTREAM_LOCAL_ADDRESS%""#
+                    ));
+                }
+                Destination::Domain(domain) => {
+                    // Look up resolved IPs from the DNS cache. Empty →
+                    // emit no chain (fail-closed). The DNS propagation
+                    // loop will rewrite the listener once CoreDNS
+                    // resolves the domain.
+                    let Some(entry) = dns_cache.entries().get(domain.as_str()) else {
+                        continue;
+                    };
+                    if entry.ips.is_empty() {
+                        continue;
+                    }
+                    let stat_name = Self::sanitize_stat_prefix(domain);
+                    let prefix_ranges = Self::emit_prefix_ranges_from_ips(&entry.ips);
+                    filter_chains.push(format!(
+                        r#"    - filter_chain_match:
+        prefix_ranges:
+{prefix_ranges}
+      filters:
+        - name: envoy.filters.network.tcp_proxy
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+            cluster: mitmproxy
+            stat_prefix: level3_{stat_name}
+            tunneling_config:
+              hostname: "%DOWNSTREAM_LOCAL_ADDRESS%""#
+                    ));
+                }
+                Destination::Cidr(cidr) => {
+                    let stat_name = Self::sanitize_stat_prefix(cidr);
+                    let prefix_ranges = Self::emit_prefix_ranges_from_cidr(cidr);
+                    filter_chains.push(format!(
+                        r#"    - filter_chain_match:
+        prefix_ranges:
+{prefix_ranges}
+      filters:
+        - name: envoy.filters.network.tcp_proxy
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+            cluster: mitmproxy
+            stat_prefix: level3_{stat_name}
+            tunneling_config:
+              hostname: "%DOWNSTREAM_LOCAL_ADDRESS%""#
+                    ));
+                }
+            }
         }
 
         // Level 1 (transport): default catch-all chain → original_dst.
-        // This must be last since it has no filter_chain_match and acts
-        // as the default route for traffic that does not match any
-        // SNI-specific chain.
-        if has_transport {
+        // Only emitted when no L3 wildcard already owns the default
+        // slot. The chain is appended to `filter_chains` rather than
+        // placed in `default_filter_chain` so the listener framing
+        // matches older policy shapes that use catch-all chains via
+        // `filter_chains` with no match predicate.
+        if has_transport && default_filter_chain.is_none() {
             filter_chains.push(
                 r#"    - filters:
         - name: envoy.filters.network.tcp_proxy
@@ -1112,10 +1176,38 @@ admin:
         }
 
         let filter_chains_yaml = filter_chains.join("\n");
+        let body = match default_filter_chain {
+            Some(default) => {
+                if filter_chains.is_empty() {
+                    default
+                } else {
+                    format!("    filter_chains:\n{filter_chains_yaml}\n{default}")
+                }
+            }
+            None => format!("    filter_chains:\n{filter_chains_yaml}"),
+        };
 
-        Self::listener_yaml_for_filter_chains(&format!(
-            "    filter_chains:\n{filter_chains_yaml}"
-        ))
+        Self::listener_yaml_for_filter_chains(&body)
+    }
+
+    /// Render a `prefix_ranges` block from a list of resolved IPv4
+    /// addresses, one `/32` entry per IP.
+    fn emit_prefix_ranges_from_ips(ips: &[Ipv4Addr]) -> String {
+        ips.iter()
+            .map(|ip| format!("          - address_prefix: {ip}\n            prefix_len: 32"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Render a `prefix_ranges` block from a CIDR string (accepts bare
+    /// IP or `IP/prefix`). The CIDR is already validated by
+    /// [`PolicyCompiler::validate`] — we split and re-emit it here.
+    fn emit_prefix_ranges_from_cidr(cidr: &str) -> String {
+        let (address, prefix_len) = match cidr.split_once('/') {
+            Some((ip, prefix)) => (ip.to_string(), prefix.to_string()),
+            None => (cidr.to_string(), "32".to_string()),
+        };
+        format!("          - address_prefix: {address}\n            prefix_len: {prefix_len}")
     }
 
     /// Emit the listener YAML (head + filter-chains body + tail).
@@ -1331,14 +1423,16 @@ resources:
     /// For sessions started without a policy (`--clear` / no-policy
     /// startup) this means the Envoy listener is deny-all instead of
     /// L1 pass-through. Net user-visible behaviour is unchanged because
-    /// the nftables layers (`sandbox_policy`, `sandbox_l3`) gate traffic
-    /// first and are also empty on a no-policy session, and DNS is
-    /// deny-by-default since M9-S15. This is consistent with the
-    /// fail-closed design principle — no-policy sessions must not leak.
+    /// the nftables `sandbox_policy` layer gates traffic first and is
+    /// also empty on a no-policy session, and DNS is deny-by-default
+    /// since M9-S15. This is consistent with the fail-closed design
+    /// principle — no-policy sessions must not leak.
     ///
-    /// M9-S19 replaces this default with the policy-driven L3 filter
-    /// chains; at that point the initial listener will carry the real
-    /// compiled chains rather than a deny-all placeholder.
+    /// Policy-driven L3 filter chains are emitted by
+    /// [`Self::compile_envoy_listener`]; those chains appear on disk
+    /// via `PolicyCompiler::compile` at apply-policy time and are
+    /// rewritten by the DNS propagation loop as domain→IP mappings
+    /// settle.
     pub fn compile_initial_envoy_listener() -> String {
         Self::envoy_deny_all_listener()
     }
@@ -1369,8 +1463,21 @@ resources:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dns_propagation::{ResolvedMapping, ResolvedReport};
 
     // -- Test helpers --------------------------------------------------------
+
+    /// Build a `ResolvedMapping` with the boilerplate `timestamp` filled
+    /// in. The listener compiler does not read `timestamp`; it exists
+    /// only to satisfy the struct.
+    fn resolved_mapping(domain: &str, ips: &[&str], ttl: u32) -> ResolvedMapping {
+        ResolvedMapping {
+            domain: domain.to_string(),
+            ips: ips.iter().map(|s| (*s).to_string()).collect(),
+            ttl,
+            timestamp: "2026-04-20T00:00:00Z".to_string(),
+        }
+    }
 
     fn test_network_info() -> NetworkInfo {
         NetworkInfo {
@@ -1904,7 +2011,9 @@ mod tests {
 
         // Envoy: deny-all config.
         assert!(
-            compiled.envoy_config_combined().contains("filter_chains: []"),
+            compiled
+                .envoy_config_combined()
+                .contains("filter_chains: []"),
             "deny-all policy should produce empty Envoy filter chains"
         );
 
@@ -2656,7 +2765,9 @@ mod tests {
             compiled.envoy_config_combined()
         );
         assert!(
-            !compiled.envoy_config_combined().contains("server_names: [\"*\"]"),
+            !compiled
+                .envoy_config_combined()
+                .contains("server_names: [\"*\"]"),
             "Envoy config must NOT use `server_names: [\"*\"]` (invalid SNI match):\n{}",
             compiled.envoy_config_combined()
         );
@@ -2908,11 +3019,15 @@ mod tests {
 
         // Both L2 filter chains should route to original_dst (no MITM).
         assert!(
-            compiled.envoy_config_combined().contains("level2_secure_example_com"),
+            compiled
+                .envoy_config_combined()
+                .contains("level2_secure_example_com"),
             "L2 filter chain should have level2_ stat prefix"
         );
         assert!(
-            compiled.envoy_config_combined().contains("level2_api_secure_io"),
+            compiled
+                .envoy_config_combined()
+                .contains("level2_api_secure_io"),
             "L2 filter chain should have level2_ stat prefix for second domain"
         );
     }
@@ -2960,7 +3075,9 @@ mod tests {
 
         // Without L1 transport rules, there should be no default (unmatch) chain.
         assert!(
-            !compiled.envoy_config_combined().contains("policy_tcp_passthrough"),
+            !compiled
+                .envoy_config_combined()
+                .contains("policy_tcp_passthrough"),
             "L2-only Envoy config should not include a default passthrough chain"
         );
     }
@@ -3021,56 +3138,186 @@ mod tests {
     }
 
     #[test]
-    fn compile_level3_envoy_routes_to_original_dst() {
+    fn compile_level3_domain_with_empty_dns_cache_emits_no_chain() {
+        // M9-S19: L3 domain chains now require resolved IPs because
+        // filter_chain_match uses `prefix_ranges` (by-IP) rather than
+        // `server_names` (by-SNI). `PolicyCompiler::compile` runs at
+        // apply-policy time with an empty DnsCache — so a domain-only
+        // L3 policy must fail-closed with no chain emitted. The DNS
+        // propagation loop rewrites the listener once CoreDNS resolves
+        // the domain (see `dns_propagation::propagate_dns_changes`).
         let policy = full_policy();
         let net = test_network_info();
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
+        let listener = &compiled.envoy_listener_config;
         assert!(
-            compiled
-                .envoy_config_combined()
-                .contains("server_names: [\"inspected.example.com\"]"),
-            "L3 Envoy config must have SNI match for the inspected domain"
-        );
-        // L3 traffic routes to original_dst (passthrough) in Envoy.
-        // The actual redirect to mitmproxy happens at the nftables
-        // level (sandbox_l3 DNAT rules) to preserve SO_ORIGINAL_DST.
-        assert!(
-            compiled.envoy_config_combined().contains("cluster: original_dst"),
-            "L3 filter chain must route to original_dst (mitmproxy redirect is via nftables)"
+            !listener.contains("inspected.example.com"),
+            "L3 domain must not appear in listener before DNS resolution\n{listener}"
         );
         assert!(
-            !compiled.envoy_config_combined().contains("cluster: mitmproxy"),
-            "L3 filter chain must NOT route to mitmproxy cluster (breaks SO_ORIGINAL_DST)"
+            !listener.contains("cluster: mitmproxy"),
+            "L3 domain with no resolved IPs must emit no mitmproxy chain (fail-closed)\n{listener}"
         );
         assert!(
-            compiled
-                .envoy_config_combined()
-                .contains("level3_inspected_example_com"),
-            "L3 filter chain should have level3_ stat prefix"
+            !listener.contains("prefix_ranges:"),
+            "L3 domain with no resolved IPs must emit no prefix_ranges entry\n{listener}"
         );
     }
 
     #[test]
-    fn compile_level3_listener_does_not_route_to_mitmproxy_yet() {
+    fn compile_l3_domain_chain_uses_dns_cache_prefix_ranges() {
+        // When the DNS cache carries resolved IPs, the L3 domain chain
+        // is emitted with `prefix_ranges` (one `/32` per IP) and routes
+        // to the mitmproxy cluster via CONNECT tunneling.
         let policy = full_policy();
-        let net = test_network_info();
-        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+        let mut cache = DnsCache::new();
+        cache.update(&ResolvedReport {
+            mappings: vec![resolved_mapping(
+                "inspected.example.com",
+                &["10.0.0.1", "10.0.0.2"],
+                300,
+            )],
+        });
 
-        // **M9-S18 semantics.** The mitmproxy cluster is defined in the
-        // static bootstrap from this session onwards, but no filter
-        // chain routes traffic to it yet — L3 traffic continues to reach
-        // mitmproxy via the `sandbox_l3` nftables DNAT shortcut
-        // established in M9-S6. M9-S19 will cut every L3 chain over to
-        // the mitmproxy cluster via `tcp_proxy.tunneling_config` and
-        // remove the `sandbox_l3` table.
+        let listener = PolicyCompiler::compile_envoy_listener(&policy, &cache);
+
         assert!(
-            !compiled
-                .envoy_listener_config
-                .contains("cluster: mitmproxy"),
-            "L3 listener must not route any filter chain to mitmproxy yet (that's M9-S19)\n\
-             listener:\n{}",
-            compiled.envoy_listener_config
+            listener.contains("prefix_ranges:"),
+            "L3 domain chain must use prefix_ranges (not SNI):\n{listener}"
+        );
+        assert!(
+            listener.contains("address_prefix: 10.0.0.1")
+                && listener.contains("address_prefix: 10.0.0.2"),
+            "L3 domain chain must emit a prefix range for each resolved IP:\n{listener}"
+        );
+        assert!(
+            listener.contains("prefix_len: 32"),
+            "L3 domain chain must emit /32 prefixes for resolved IPs:\n{listener}"
+        );
+        assert!(
+            !listener.contains("server_names: [\"inspected.example.com\"]"),
+            "L3 domain chain must NOT use SNI matching (pre-M9-S19 shape):\n{listener}"
+        );
+        assert!(
+            listener.contains("cluster: mitmproxy"),
+            "L3 domain chain must route to mitmproxy cluster:\n{listener}"
+        );
+        assert!(
+            listener.contains("level3_inspected_example_com"),
+            "L3 domain chain must carry level3_ stat prefix:\n{listener}"
+        );
+    }
+
+    #[test]
+    fn compile_l3_tunneling_config_hostname_is_downstream_local_address() {
+        // The entire point of M9-S19: every L3 filter chain (domain-
+        // backed, CIDR-backed, and wildcard) must carry a
+        // `tunneling_config.hostname` formatted as
+        // `%DOWNSTREAM_LOCAL_ADDRESS%`. Envoy formats this per-
+        // connection using the address recovered by the `original_dst`
+        // listener filter (the kernel's `SO_ORIGINAL_DST`), then emits
+        // a CONNECT <orig-ip>:<orig-port> HTTP/1.1 preface on the
+        // upstream stream. mitmproxy (regular mode) reads the CONNECT
+        // authority to pick the real upstream.
+        let mut cache = DnsCache::new();
+        cache.update(&ResolvedReport {
+            mappings: vec![resolved_mapping(
+                "inspected.example.com",
+                &["10.0.0.1"],
+                300,
+            )],
+        });
+
+        // Domain-backed L3 chain.
+        let listener_domain = PolicyCompiler::compile_envoy_listener(&full_policy(), &cache);
+        assert!(
+            listener_domain.contains("tunneling_config:"),
+            "L3 domain chain must carry tunneling_config block:\n{listener_domain}"
+        );
+        assert!(
+            listener_domain.contains(r#"hostname: "%DOWNSTREAM_LOCAL_ADDRESS%""#),
+            "L3 domain chain must use %DOWNSTREAM_LOCAL_ADDRESS% formatter:\n{listener_domain}"
+        );
+
+        // CIDR-backed L3 chain — same invariant.
+        let cidr_policy = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![PolicyRule {
+                destination: Destination::Cidr("10.0.0.0/24".to_string()),
+                level: AssuranceLevel::Http {
+                    http_filters: vec![http_filter(HttpMethod::Any, "/*")],
+                },
+                protocol: Protocol::Https,
+                reason: None,
+            }],
+        };
+        let listener_cidr = PolicyCompiler::compile_envoy_listener(&cidr_policy, &DnsCache::new());
+        assert!(
+            listener_cidr.contains(r#"hostname: "%DOWNSTREAM_LOCAL_ADDRESS%""#),
+            "L3 CIDR chain must use %DOWNSTREAM_LOCAL_ADDRESS% formatter:\n{listener_cidr}"
+        );
+        assert!(
+            listener_cidr.contains("cluster: mitmproxy"),
+            "L3 CIDR chain must route to mitmproxy cluster:\n{listener_cidr}"
+        );
+    }
+
+    #[test]
+    fn compile_l3_wildcard_emits_default_filter_chain() {
+        // An L3 rule with `destination: "*"` has no match predicate —
+        // it becomes the listener's `default_filter_chain`, which Envoy
+        // runs for any connection that does not match an earlier
+        // (SNI/prefix-range) chain. It must still tunnel via CONNECT
+        // so mitmproxy sees the original destination.
+        let policy = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![PolicyRule {
+                destination: Destination::Domain("*".to_string()),
+                level: AssuranceLevel::Http {
+                    http_filters: vec![http_filter(HttpMethod::Any, "/*")],
+                },
+                protocol: Protocol::Https,
+                reason: None,
+            }],
+        };
+
+        let listener = PolicyCompiler::compile_envoy_listener(&policy, &DnsCache::new());
+
+        assert!(
+            listener.contains("default_filter_chain:"),
+            "L3 wildcard must emit default_filter_chain block:\n{listener}"
+        );
+        assert!(
+            listener.contains("cluster: mitmproxy"),
+            "L3 wildcard default_filter_chain must route to mitmproxy:\n{listener}"
+        );
+        assert!(
+            listener.contains(r#"hostname: "%DOWNSTREAM_LOCAL_ADDRESS%""#),
+            "L3 wildcard default_filter_chain must carry the CONNECT formatter:\n{listener}"
+        );
+        assert!(
+            listener.contains("level3_wildcard"),
+            "L3 wildcard default_filter_chain must carry level3_wildcard stat prefix:\n{listener}"
+        );
+
+        // Structural guard: `default_filter_chain` must sit at 4-space
+        // indent so YAML parses it as a field of the Listener resource
+        // (sibling of `address`, `listener_filters`, etc.). A bug that
+        // emits it at 2-space indent makes YAML treat it as a new
+        // top-level key — the Listener ends up with no chains, Envoy
+        // closes every connection silently, and the cluster looks
+        // healthy to admin endpoints. This regression actually shipped
+        // once (mid-M9-S19); guard against it at the source.
+        let default_line = listener
+            .lines()
+            .find(|l| l.trim_start() == "default_filter_chain:")
+            .expect("default_filter_chain line must exist");
+        let indent = default_line.len() - default_line.trim_start().len();
+        assert_eq!(
+            indent, 4,
+            "default_filter_chain must be at 4-space indent (field of the Listener \
+             resource), got {indent}. Full listener:\n{listener}"
         );
     }
 
@@ -3147,35 +3394,60 @@ mod tests {
     }
 
     #[test]
-    fn compile_mixed_l1_l2_l3_envoy_has_sni_chains() {
+    fn compile_mixed_l1_l2_l3_envoy_chain_shapes() {
+        // Mixed policies exercise all three chain shapes together:
+        //   * L2 uses SNI match + cluster: original_dst.
+        //   * L3 uses prefix_ranges (once DNS resolves) +
+        //     cluster: mitmproxy + CONNECT tunneling config.
+        //   * L1 remains a `filter_chains`-level catch-all to
+        //     original_dst (wildcard `*` destination would instead
+        //     occupy `default_filter_chain`, but this mixed fixture
+        //     uses named destinations only).
         let policy = mixed_l1_l2_l3_policy();
-        let net = test_network_info();
-        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
-        // L2 SNI chain
+        // Exercise the DNS-resolved path so the L3 chain is actually
+        // emitted (compile() at apply-policy time uses an empty cache
+        // and fails-closed until the propagation loop updates it).
+        let mut cache = DnsCache::new();
+        cache.update(&ResolvedReport {
+            mappings: vec![resolved_mapping(
+                "monitored.example.com",
+                &["10.3.3.3"],
+                300,
+            )],
+        });
+        let listener = PolicyCompiler::compile_envoy_listener(&policy, &cache);
+
+        // L2 chain — still SNI-matched, still original_dst.
         assert!(
-            compiled
-                .envoy_config_combined()
-                .contains("server_names: [\"pinned.example.com\"]"),
-            "mixed policy must have L2 SNI chain"
+            listener.contains("server_names: [\"pinned.example.com\"]"),
+            "mixed policy must have L2 SNI chain:\n{listener}"
         );
         assert!(
-            compiled.envoy_config_combined().contains("level2_pinned_example_com"),
-            "mixed policy must have L2 stat prefix"
+            listener.contains("level2_pinned_example_com"),
+            "mixed policy must have L2 stat prefix:\n{listener}"
         );
 
-        // L3 SNI chain
+        // L3 chain — prefix_ranges, mitmproxy cluster, CONNECT formatter.
         assert!(
-            compiled
-                .envoy_config_combined()
-                .contains("server_names: [\"monitored.example.com\"]"),
-            "mixed policy must have L3 SNI chain"
+            listener.contains("level3_monitored_example_com"),
+            "mixed policy must have L3 stat prefix:\n{listener}"
         );
         assert!(
-            compiled
-                .envoy_config_combined()
-                .contains("level3_monitored_example_com"),
-            "mixed policy must have L3 stat prefix"
+            listener.contains("address_prefix: 10.3.3.3"),
+            "mixed policy L3 chain must match the resolved IP:\n{listener}"
+        );
+        assert!(
+            listener.contains("cluster: mitmproxy"),
+            "mixed policy L3 chain must route to mitmproxy cluster:\n{listener}"
+        );
+        assert!(
+            listener.contains(r#"hostname: "%DOWNSTREAM_LOCAL_ADDRESS%""#),
+            "mixed policy L3 chain must carry the CONNECT formatter:\n{listener}"
+        );
+        assert!(
+            !listener.contains("server_names: [\"monitored.example.com\"]"),
+            "mixed policy L3 chain must NOT use SNI (pre-M9-S19 shape):\n{listener}"
         );
     }
 
@@ -3186,7 +3458,9 @@ mod tests {
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
         assert!(
-            compiled.envoy_config_combined().contains("policy_tcp_passthrough"),
+            compiled
+                .envoy_config_combined()
+                .contains("policy_tcp_passthrough"),
             "mixed policy must have L1 default passthrough chain"
         );
     }
@@ -3323,7 +3597,13 @@ mod tests {
     }
 
     #[test]
-    fn compile_level3_wildcard_domain_sni() {
+    fn compile_level3_wildcard_subdomain_uses_dns_cache() {
+        // A wildcard-subdomain destination like `*.inspected.io` is a
+        // normal `Destination::Domain` from the compiler's point of
+        // view — it is NOT the listener-level wildcard (`*`) that maps
+        // to `default_filter_chain`. CoreDNS resolves concrete
+        // subdomains under it, and `propagate_dns_changes` rewrites
+        // the listener with prefix_ranges per resolved IP.
         let policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
@@ -3335,28 +3615,42 @@ mod tests {
                 reason: None,
             }],
         };
-        let net = test_network_info();
-        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
+        // Empty DNS cache — fail-closed: no chain, no default_filter_chain.
+        let listener_empty = PolicyCompiler::compile_envoy_listener(&policy, &DnsCache::new());
         assert!(
-            compiled
-                .envoy_config_combined()
-                .contains("server_names: [\"*.inspected.io\"]"),
-            "wildcard domain should appear in L3 SNI match"
+            !listener_empty.contains("cluster: mitmproxy"),
+            "wildcard-subdomain with empty DNS cache must emit no chain:\n{listener_empty}"
         );
         assert!(
-            compiled.envoy_config_combined().contains("cluster: original_dst"),
-            "wildcard L3 chain must route to original_dst (mitmproxy redirect via nftables)"
+            !listener_empty.contains("default_filter_chain:"),
+            "wildcard-subdomain is NOT the listener-level wildcard — it must not \
+             become default_filter_chain:\n{listener_empty}"
+        );
+
+        // Once DNS resolves a concrete subdomain, a prefix_ranges chain
+        // is emitted under the wildcard key.
+        let mut cache = DnsCache::new();
+        cache.update(&ResolvedReport {
+            mappings: vec![resolved_mapping("*.inspected.io", &["10.1.1.1"], 300)],
+        });
+        let listener_resolved = PolicyCompiler::compile_envoy_listener(&policy, &cache);
+        assert!(
+            listener_resolved.contains("prefix_ranges:"),
+            "resolved wildcard-subdomain must emit prefix_ranges chain:\n{listener_resolved}"
         );
         assert!(
-            !compiled.envoy_config_combined().contains("cluster: mitmproxy"),
-            "wildcard L3 chain must not route to mitmproxy cluster"
+            listener_resolved.contains("address_prefix: 10.1.1.1"),
+            "resolved wildcard-subdomain must carry the resolved IP:\n{listener_resolved}"
         );
         assert!(
-            compiled
-                .envoy_config_combined()
-                .contains("level3_wildcard_inspected_io"),
-            "wildcard L3 stat prefix should use 'wildcard' replacement"
+            listener_resolved.contains("cluster: mitmproxy"),
+            "resolved wildcard-subdomain chain must route to mitmproxy:\n{listener_resolved}"
+        );
+        assert!(
+            listener_resolved.contains("level3_wildcard_inspected_io"),
+            "wildcard-subdomain stat prefix should use 'wildcard' replacement:\n\
+             {listener_resolved}"
         );
     }
 
@@ -3408,11 +3702,21 @@ mod tests {
         );
 
         // All route to original_dst (not mitmproxy).
-        assert!(!compiled.envoy_config_combined().contains("cluster: mitmproxy"));
+        assert!(
+            !compiled
+                .envoy_config_combined()
+                .contains("cluster: mitmproxy")
+        );
     }
 
     #[test]
     fn compile_multiple_level3_destinations() {
+        // Two L3 destinations with distinct resolved IPs must produce
+        // two prefix_ranges chains that both route to the mitmproxy
+        // cluster via the CONNECT tunneling formatter. The mitmproxy
+        // config (served over the `/etc/mitmproxy/policy.json` path)
+        // must still carry one rule per destination for HTTP-level
+        // enforcement once CONNECT is consumed.
         let policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![
@@ -3434,26 +3738,45 @@ mod tests {
                 },
             ],
         };
-        let net = test_network_info();
-        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
-        // Both L3 destinations get SNI chains to original_dst (L3 redirect via nftables).
-        assert!(
-            compiled
-                .envoy_config_combined()
-                .contains("server_names: [\"api.one.com\"]")
+        let mut cache = DnsCache::new();
+        cache.update(&ResolvedReport {
+            mappings: vec![
+                resolved_mapping("api.one.com", &["10.1.1.1"], 300),
+                resolved_mapping("api.two.com", &["10.2.2.2"], 300),
+            ],
+        });
+
+        let listener = PolicyCompiler::compile_envoy_listener(&policy, &cache);
+
+        // Every chain carries prefix_ranges matching the resolved IPs,
+        // not SNI.
+        assert!(listener.contains("address_prefix: 10.1.1.1"));
+        assert!(listener.contains("address_prefix: 10.2.2.2"));
+        assert!(!listener.contains("server_names: [\"api.one.com\"]"));
+        assert!(!listener.contains("server_names: [\"api.two.com\"]"));
+
+        // Each destination emits a distinct level3 stat prefix.
+        assert!(listener.contains("level3_api_one_com"));
+        assert!(listener.contains("level3_api_two_com"));
+
+        // Both chains route to mitmproxy via CONNECT tunneling.
+        assert_eq!(
+            listener.matches("cluster: mitmproxy").count(),
+            2,
+            "expected two L3 chains routed to mitmproxy:\n{listener}"
         );
-        assert!(
-            compiled
-                .envoy_config_combined()
-                .contains("server_names: [\"api.two.com\"]")
-        );
-        assert!(
-            !compiled.envoy_config_combined().contains("cluster: mitmproxy"),
-            "L3 filter chains must not route to mitmproxy cluster"
+        assert_eq!(
+            listener
+                .matches(r#"hostname: "%DOWNSTREAM_LOCAL_ADDRESS%""#)
+                .count(),
+            2,
+            "expected every L3 chain to carry the CONNECT formatter:\n{listener}"
         );
 
-        // mitmproxy config has rules for both.
+        // Policy-level enforcement (post-CONNECT) still drives a
+        // mitmproxy rule per destination.
+        let compiled = PolicyCompiler::compile(&policy, &test_network_info()).unwrap();
         let config: MitmproxyConfig = serde_json::from_str(&compiled.mitmproxy_config).unwrap();
         assert_eq!(config.rules.len(), 2);
         let hosts: Vec<&str> = config.rules.iter().map(|r| r.host.as_str()).collect();
@@ -3489,12 +3812,18 @@ mod tests {
 
         // Without L1 rules, no default passthrough chain.
         assert!(
-            !compiled.envoy_config_combined().contains("policy_tcp_passthrough"),
+            !compiled
+                .envoy_config_combined()
+                .contains("policy_tcp_passthrough"),
             "L2-only should not have a default passthrough chain"
         );
 
         // But should still have original_dst cluster (for L2 forwarding).
-        assert!(compiled.envoy_config_combined().contains("name: original_dst"));
+        assert!(
+            compiled
+                .envoy_config_combined()
+                .contains("name: original_dst")
+        );
     }
 
     // -- L3-only policy (no L1) does not produce default chain ----------------
@@ -3506,7 +3835,9 @@ mod tests {
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
         assert!(
-            !compiled.envoy_config_combined().contains("policy_tcp_passthrough"),
+            !compiled
+                .envoy_config_combined()
+                .contains("policy_tcp_passthrough"),
             "L3-only should not have a default passthrough chain"
         );
     }
@@ -3804,22 +4135,34 @@ mod tests {
     }
 
     #[test]
-    fn listener_routes_every_chain_to_original_dst_today() {
-        // M9-S18 preserves today's chain shape byte-for-byte. Every
-        // filter chain — L1, L2, L3 — must still target the
-        // `original_dst` cluster so this session is purely additive.
-        // M9-S19 flips L3 chains over to the `mitmproxy` cluster via
-        // `tcp_proxy.tunneling_config`.
-        let compiled = PolicyCompiler::compile(&full_policy(), &test_network_info()).unwrap();
-        let listener = &compiled.envoy_listener_config;
+    fn listener_routes_l2_to_original_dst_and_l3_to_mitmproxy() {
+        // M9-S19 cutover: L2 TLS chains continue to target
+        // `original_dst` (no inspection beyond SNI), but every L3
+        // chain now routes to the `mitmproxy` cluster via
+        // `tcp_proxy.tunneling_config.hostname =
+        // "%DOWNSTREAM_LOCAL_ADDRESS%"`. Exercise the mixed fixture
+        // so both clusters appear in the same listener.
+        let mut cache = DnsCache::new();
+        cache.update(&ResolvedReport {
+            mappings: vec![resolved_mapping(
+                "monitored.example.com",
+                &["10.3.3.3"],
+                300,
+            )],
+        });
+        let listener = PolicyCompiler::compile_envoy_listener(&mixed_l1_l2_l3_policy(), &cache);
 
         assert!(
             listener.contains("cluster: original_dst"),
-            "listener must have at least one chain routing to original_dst:\n{listener}"
+            "listener must still have chains routing to original_dst (L1/L2):\n{listener}"
         );
         assert!(
-            !listener.contains("cluster: mitmproxy"),
-            "M9-S18 listener must NOT yet route any chain to mitmproxy (cutover is M9-S19):\n{listener}"
+            listener.contains("cluster: mitmproxy"),
+            "listener must have L3 chains routed to mitmproxy cluster:\n{listener}"
+        );
+        assert!(
+            listener.contains(r#"hostname: "%DOWNSTREAM_LOCAL_ADDRESS%""#),
+            "every L3 chain must carry the CONNECT formatter:\n{listener}"
         );
     }
 

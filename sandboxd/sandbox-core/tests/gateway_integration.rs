@@ -44,13 +44,90 @@ fn test_gateway_lifecycle() {
         .expect("docker exec nft list should succeed");
 
     let nft_output = String::from_utf8_lossy(&output.stdout);
+
+    // M9-S19: the gateway post-cutover exposes exactly two nftables
+    // tables after `create_gateway` (before any policy is applied):
+    // `sandbox` (deny-all forward/input baseline) and `sandbox_dnat`
+    // (DNS → CoreDNS, all other TCP → Envoy:10000). Once a policy is
+    // applied, `sandbox_policy` joins the set — giving the spec's
+    // three-table steady state. The legacy `sandbox_l3` transparent-
+    // DNAT table is gone: L3 traffic reaches mitmproxy via Envoy
+    // CONNECT tunneling, not kernel-level redirection.
+    //
+    // We positively assert the full set rather than just checking for
+    // known tables, so a future regression that leaks a fourth table
+    // (e.g. a debug `sandbox_tmp`) fails here.
+    let tables: std::collections::HashSet<&str> = nft_output
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            // `nft list ruleset` emits `table inet <name> {` as the
+            // header for each table; strip whitespace and the opening
+            // brace.
+            trimmed
+                .strip_prefix("table inet ")
+                .and_then(|rest| rest.split_whitespace().next())
+        })
+        .collect();
+    let expected: std::collections::HashSet<&str> =
+        ["sandbox", "sandbox_dnat"].into_iter().collect();
+    assert_eq!(
+        tables, expected,
+        "gateway nftables tables must be exactly {{sandbox, sandbox_dnat}} \
+         after create_gateway (no policy applied yet); got {tables:?}. \
+         Full ruleset:\n{nft_output}"
+    );
+
+    // M9-S19: mitmproxy now runs in regular (forward-proxy) mode on
+    // loopback — it must NOT listen on 0.0.0.0:8080 anymore, the
+    // loopback 18080 port must be open inside the container, and
+    // crucially nothing must be listening on 18080 on the VM-facing
+    // IP (spec requirement: "nothing is listening on 18080 on the
+    // VM-facing IP"). A regression that bound mitmproxy to 0.0.0.0:18080
+    // instead of 127.0.0.1:18080 would expose the forward proxy to the
+    // sandboxed VM and short-circuit the Envoy filter chains.
+    //
+    // The gateway image is minimal (no `ss` / `netstat` binaries), so we
+    // parse `/proc/net/tcp` directly. Each listening socket has state
+    // `0A`; local_address is `<IP>:<PORT>` — IP is little-endian hex,
+    // port is big-endian hex (network byte order).
+    //   127.0.0.1:18080 → `0100007F:46A0`
+    //   0.0.0.0:8080    → `00000000:1F90`
+    //   0.0.0.0:18080   → `00000000:46A0` (must never appear)
+    let proc_net_tcp = Command::new("docker")
+        .args(["exec", &gw_container, "cat", "/proc/net/tcp"])
+        .output()
+        .expect("docker exec cat /proc/net/tcp should succeed");
+    let listeners = String::from_utf8_lossy(&proc_net_tcp.stdout);
+    // Listening sockets: second column = local addr; fourth column = state (0A = LISTEN).
+    let mut listen_addrs: Vec<&str> = Vec::new();
+    for line in listeners.lines().skip(1) {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() >= 4 && cols[3] == "0A" {
+            listen_addrs.push(cols[1]);
+        }
+    }
     assert!(
-        nft_output.contains("table inet sandbox"),
-        "deny-all table should exist in nft ruleset: {nft_output}"
+        listen_addrs.contains(&"0100007F:46A0"),
+        "mitmproxy must listen on 127.0.0.1:18080 post-M9-S19; listening sockets: {listen_addrs:?}\n{listeners}"
     );
     assert!(
-        nft_output.contains("table inet sandbox_dnat"),
-        "DNAT table should exist in nft ruleset: {nft_output}"
+        !listen_addrs.contains(&"00000000:1F90"),
+        "mitmproxy must no longer listen on 0.0.0.0:8080 (transparent-mode leftover); listening sockets: {listen_addrs:?}"
+    );
+    // Loopback-bind guard: the only listener on port 46A0 (18080) must
+    // be on 0100007F (127.0.0.1). Any other 18080 binding (most
+    // importantly 00000000:46A0 for 0.0.0.0) would mean mitmproxy's
+    // forward proxy is reachable from the VM-facing IP.
+    let rogue_18080: Vec<&&str> = listen_addrs
+        .iter()
+        .filter(|a| a.ends_with(":46A0") && !a.starts_with("0100007F:"))
+        .collect();
+    assert!(
+        rogue_18080.is_empty(),
+        "mitmproxy must be bound to loopback only; found non-loopback \
+         listeners on port 18080: {rogue_18080:?}. Full listening sockets: \
+         {listen_addrs:?}"
     );
 
     // Stop and remove the gateway.
@@ -190,7 +267,8 @@ fn test_gateway_nftables_injection_standalone() {
 ///     the new generation (i.e. the `MovedTo` inotify event reached
 ///     Envoy's LDS watcher).
 ///   - The `mitmproxy` cluster is present under `static_clusters` in the
-///     bootstrap, scaffolded but not yet routed to (routing is M9-S19).
+///     bootstrap. (M9-S19 completes the cutover by routing every L3
+///     filter chain to this cluster via `tcp_proxy.tunneling_config`.)
 #[test]
 fn test_gateway_lds_listener_and_atomic_rewrite() {
     // Use 10.209.5.0/24 to avoid collisions with other tests.
@@ -247,7 +325,7 @@ fn test_gateway_lds_listener_and_atomic_rewrite() {
     );
     assert!(
         bootstrap_contents.contains("name: mitmproxy"),
-        "mitmproxy cluster must be scaffolded in bootstrap (M9-S18):\n{bootstrap_contents}"
+        "mitmproxy cluster must be defined in bootstrap:\n{bootstrap_contents}"
     );
 
     // ---------- 2. Verify listener appears as a DYNAMIC listener ----------
@@ -309,7 +387,7 @@ fn test_gateway_lds_listener_and_atomic_rewrite() {
     assert!(
         static_clusters.contains("\"name\": \"mitmproxy\"")
             || static_clusters.contains("\"name\":\"mitmproxy\""),
-        "static_clusters must include mitmproxy cluster (M9-S18 scaffolding):\n{static_clusters}"
+        "static_clusters must include mitmproxy cluster (M9-S19 cutover target):\n{static_clusters}"
     );
     assert!(
         static_clusters.contains("\"name\": \"original_dst\"")
@@ -366,9 +444,8 @@ fn test_gateway_lds_listener_and_atomic_rewrite() {
     // filter chain body.
     use sandbox_core::policy::{FILTER_CHAINS_BEGIN_MARKER, FILTER_CHAINS_END_MARKER};
     let mut updated_listener = PolicyCompiler::envoy_deny_all_listener();
-    let old_body = format!(
-        "{FILTER_CHAINS_BEGIN_MARKER}\n    filter_chains: []\n{FILTER_CHAINS_END_MARKER}"
-    );
+    let old_body =
+        format!("{FILTER_CHAINS_BEGIN_MARKER}\n    filter_chains: []\n{FILTER_CHAINS_END_MARKER}");
     let new_body = format!(
         "{FILTER_CHAINS_BEGIN_MARKER}\n    default_filter_chain:\n      filters:\n        - name: envoy.filters.network.tcp_proxy\n          typed_config:\n            \"@type\": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy\n            stat_prefix: sandbox_l1_passthrough\n            cluster: original_dst\n{FILTER_CHAINS_END_MARKER}"
     );

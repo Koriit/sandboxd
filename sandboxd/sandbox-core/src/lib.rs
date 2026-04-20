@@ -27,8 +27,7 @@ pub use atomic_listener_writer::{
 pub use ca::{CaManager, generate_ca_inject_script};
 pub use dns_propagation::{
     DnsCache, DnsCacheEntry, DnsChange, DnsChangeType, ResolvedMapping, ResolvedReport,
-    generate_domain_ip_rules, generate_l3_redirect_rules, propagate_dns_changes,
-    read_resolved_json,
+    generate_domain_ip_rules, propagate_dns_changes, read_resolved_json,
 };
 pub use error::{ApiError, SandboxError};
 pub use gateway::{GatewayManager, GatewayStatus};
