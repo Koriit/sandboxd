@@ -46,7 +46,7 @@ Responsibilities:
 - Compile and distribute network policies to gateway components.
 - Relay command execution, file transfer, and git operations to the guest agent.
 - Maintain a SQLite database of sessions and their network info.
-- Run background DNS propagation loops that update nftables rules as DNS resolutions change.
+- Run background DNS propagation loops that update nftables rules and Envoy L3 filter chains as DNS resolutions change.
 
 Key modules (in `sandbox-core`):
 

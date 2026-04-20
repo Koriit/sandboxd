@@ -1,87 +1,52 @@
 {
   "current_state": {
     "milestone": "M9",
-    "session": "M9-S19",
+    "session": "M9-S20",
     "status": "in_progress",
-    "completed_sessions": 57,
+    "completed_sessions": 58,
     "total_sessions": 59,
-    "next": "M9-S20: L3 flow \u2014 E2E assertions, design-doc amendment, user-facing docs, consistency sweep",
+    "next": "M9 milestone complete after this session",
     "block_reason": "Spec premise falsified: mitmproxy 11.1.3 does not support PROXY protocol v2 reception \u2014 the design-spec's core mechanism for bridging Envoy\u2192mitmproxy cannot be used off-the-shelf. User must choose between (A) write custom mitmproxy layer/addon in-tree that parses PROXY v2 header before TransparentProxy runs (~80-120 lines Python parser + nontrivial hook into layer stack); (B) fork/alternative mitmproxy version (no upstream release has it); (C) different destination-preservation mechanism (TPROXY / reverse-proxy-per-dest \u2014 both defeat the single-mediated-egress design goal); (D) split the spec \u2014 ship Envoy-half in M9-S18 with mitmproxy still on SO_ORIGINAL_DST, amend M9-S19/S20 to cover the missing mitmproxy PROXY-v2 addon work. Planner recommends Option A with low confidence; cheapest alternative is Option D but requires spec amendment. Full verification + source refs + option analysis in the planner CLARIFY (last subagent response) and referenced in .tasks/handoffs/20260419-172418-explore-envoy-mitmproxy-current-state.md."
   },
   "current_log": {
-    "session": "M9-S19",
-    "title": "L3 atomic cutover \u2014 mitmproxy mode flip, filter chains, and removal of the sandbox_l3 shortcut",
-    "started": "2026-04-20T08:48:47.441317Z",
+    "session": "M9-S20",
+    "title": "L3 flow \u2014 E2E assertions, design-doc amendment, user-facing docs, consistency sweep",
+    "started": "2026-04-20T21:15:30.816497Z",
     "entries": [
       {
-        "timestamp": "2026-04-20T17:54:55.802582Z",
+        "timestamp": "2026-04-20T21:19:37.142974Z",
+        "type": "discovery",
+        "note": "M9-S20 scoping (handoff: 20260420-m9s20-scoping.md): 4 stale-text items (test_m4_policy.py docstrings at 347-359 + 993-1006 still describe sandbox_l3 DNAT mechanism \u2014 plus 3 others), 4 design-spec amendments (dynamic-metadata fallback downgrade to 'not needed', YAML indent sharp edge, past-tense conversion, verification harness pointer), 5 E2E assertion gaps (mitmproxy bind to 127.0.0.1:18080, CONNECT tunnel observable, original authority preservation, fail-closed behavior routing, three-table post-apply steady state)."
+      },
+      {
+        "timestamp": "2026-04-20T21:24:45.467756Z",
+        "type": "discovery",
+        "note": "Agent A (docs) DONE. Touched 5 files: docs/concepts/networking.md (sandbox_l3 row removed, sequence diagram \u2192 CONNECT over 127.0.0.1:18080, new fail-closed L3 subsection), docs/guides/network-policies.md (policy-change propagation + L3 limitations subsections), docs/guides/troubleshooting.md (3 new FAQ entries), docs/concepts/architecture.md (Envoy listener mention), docs/reference/http-api.md (DELETE /sessions/{id}/policy description updated). make docs-build PASS, 20 pages. docs/guides/hardening.md verified clean. Residual matches only in docs/internal/session-plan.md (historical)."
+      },
+      {
+        "timestamp": "2026-04-20T21:25:50.861150Z",
+        "type": "discovery",
+        "note": "Agent B (design spec) DONE. 11 amendments applied to .tasks/specs/2026-04-19-l3-envoy-mitmproxy-flow-design.md: tense conversion across summary/context/ports/rollout, dynamic-metadata fallback block rewritten to 'verified primary path on Envoy 1.32.2, fallback not implemented, re-run harness on version bump', YAML indent sharp-edge added (4-space correct per shipped templates; 2-space was the failure), verification-harness link inserted in testing plan, writer-invariant text upgraded from aspirational to shipped (marker-delimited + InvariantViolated), publication mechanism rewritten to reflect shipped option (a). HttpProtocolOptions verified PRESENT at policy.rs:911-915 with test at 4027-4036 \u2014 scoping item 2.4 closed. No inline TODOs left behind."
+      },
+      {
+        "timestamp": "2026-04-20T21:55:12.396144Z",
+        "type": "discovery",
+        "note": "Agent C (E2E) DONE. tests/e2e/test_m4_policy.py: 4 new helpers (_gateway_listen_addrs, _assert_mitmproxy_loopback_only, _gateway_nft_tables, _read_gateway_log); new test test_l3_fail_closed_before_dns_propagation (Gap 4 \u2014 uses curl --resolve to bypass CoreDNS, asserts pre-warmup fail-closed, polls post-warmup success); test_level3_http_inspected gained Gap 1/2/3/5 assertions; stale-text fixes in test_level3_http_inspected + test_unrestricted_allows_and_logs + test_policy_clear_reverts_to_deny_all. Gap-5 placement moved post-DNS-warmup (sandbox_policy nftables table is created by DNS propagation loop for domain-only policies, not by sync compile). Gap 2 scoped to mitmproxy log only (Envoy runs --log-level warning, no access log configured \u2014 envoy.log effectively empty post-startup). L3 subset 6/6 green in 402s (6m42s)."
+      },
+      {
+        "timestamp": "2026-04-20T22:08:38.158935Z",
+        "type": "discovery",
+        "note": "kio-reviewer M9-S20 verdict: NEEDS CHANGES. 1 MAJOR: stale sandbox_l3 comments at tests/e2e/test_m4_policy.py:699-700 + :777-778 (agent C missed these). 2 MINOR: stale generate_input_allow_ruleset docstring at sandboxd/sandbox-core/src/gateway.rs:1013-1020 (missed from M9-S19 review); flake risk in test_l3_fail_closed_before_dns_propagation from host-side vs VM-side DNS divergence. 3 NITs. Spec + user-facing docs + E2E assertions otherwise accurate vs shipped code."
+      },
+      {
+        "timestamp": "2026-04-20T22:15:22.082250Z",
         "type": "decision",
-        "note": "Approach: phased execution. (1) Parallel exploration \u2014 map current L3/Envoy/mitmproxy/nftables code seams. (2) First-step verification (spec-required): standalone integration test that tunneling_config.hostname='%DOWNSTREAM_LOCAL_ADDRESS%' produces CONNECT with correct :authority; pivot to dynamic-metadata fallback (Envoy #23700) only if primary fails. (3) Implementation in one coherent delegation (cutover is atomic by design). (4) kio-reviewer pass + fixes. (5) Full E2E + docs-build. Stale L3 claims in docs/concepts/* logged as M9-S20 todos per plan."
+        "note": "Review-fix pass complete. All 5 fixes applied: stale sandbox_l3 comments at test_m4_policy.py:699 + :777 (httpbin.org wording), gateway.rs:1013-1021 docstring (53/10000 with CONNECT-tunnel mention), flake-risk fix (step 3 uses VM-resolved IP from step 2 nslookup, fail-fast if empty), spec 'separate top-level key' \u2192 'peer of resources: at the DiscoveryResponse root', troubleshooting.md mitmproxy grep prose + pattern. Verification green: cargo fmt/clippy/nextest 523/523, fail-closed E2E 169s, docs-build 20 pages."
       },
       {
-        "timestamp": "2026-04-20T18:01:19.350141Z",
-        "type": "discovery",
-        "note": "Explore handoff: 20260420-explore-l3-cutover-seams.md. Key seams: (1) compile_envoy_listener in policy.rs:1002-1119 today emits SNI-matched L3 chains routing to cluster:original_dst (lines 1048-1096) \u2014 this is the core rewrite target; signature must thread DNS cache through to build prefix_ranges. (2) dns_propagation.rs: delete generate_l3_redirect_rules (388-457), delete 5 test_dns_propagate_l3_* tests, delete call site in propagate_dns_changes (485-501), insert AtomicListenerWriter call before sandbox_policy nftables. (3) gateway.rs:1043 \u2014 delete tcp dport 8080 accept line. (4) entrypoint.sh lines 126-135+140+195 \u2014 flip to regular mode 127.0.0.1:18080. (5) addons verified peer-IP-agnostic: zero hits for client_conn.peername/client_addr/peer_addr across policy_addon.py + passthrough_addon.py. (6) Tests to flip: compile_level3_envoy_routes_to_original_dst (line 3024), compile_level3_listener_does_not_route_to_mitmproxy_yet (3055). AtomicListenerWriter callers today: gateway::create_gateway and policy_distributor::apply_policy \u2014 dns_propagation joins as third caller."
-      },
-      {
-        "timestamp": "2026-04-20T18:08:46.914088Z",
-        "type": "discovery",
-        "note": "First-step verification (handoff: 20260420-first-step-connect-tunneling-verification.md) \u2014 primary path GREEN on Envoy 1.32.2 (pinned in sandbox-gateway:latest). tcp_proxy.tunneling_config.hostname='%DOWNSTREAM_LOCAL_ADDRESS%' emits exact CONNECT request-line 'CONNECT <orig-ip>:<orig-port> HTTP/1.1' plus a 'host:' header with same authority. Formatter is dynamic per-connection (verified with two-destination test). Fallback (set_filter_state + %DYNAMIC_METADATA%) not needed; not built out. Gotcha: %DOWNSTREAM_LOCAL_ADDRESS% resolves to listener's post-DNAT local unless envoy.filters.listener.original_dst is in the listener_filter chain \u2014 compiler must ensure original_dst listener filter is present (already is in today's shape). Harness preserved at .tasks/verification/20260420-connect-tunneling/ (shell scripts; not a cargo test \u2014 requires --privileged + OUTPUT DNAT, per-Envoy-version-bump artifact)."
-      },
-      {
-        "timestamp": "2026-04-20T18:08:46.995702Z",
+        "timestamp": "2026-04-20T22:17:58.168916Z",
         "type": "decision",
-        "note": "Proceed with primary path (tcp_proxy.tunneling_config.hostname='%DOWNSTREAM_LOCAL_ADDRESS%'). Fallback path deferred indefinitely (will be revisited only if an Envoy version bump breaks the formatter \u2014 harness re-run is the gate)."
-      },
-      {
-        "timestamp": "2026-04-20T18:17:17.037387Z",
-        "type": "decision",
-        "note": "Delegation infeasible \u2014 Agent tool unavailable in this session (verified via ToolSearch; TeamCreate created team but no teammate spawner exists). Executing M9-S19 implementation directly from main agent context, accepting context pollution as necessary tradeoff. Session directive is autonomous \u2014 cannot ask user to switch environments."
-      },
-      {
-        "timestamp": "2026-04-20T18:36:38.635058Z",
-        "type": "discovery",
-        "note": "Gateway container image has neither ss nor netstat \u2014 gateway_lifecycle test must parse /proc/net/tcp directly (state 0A = LISTEN; ports in little-endian hex)."
-      },
-      {
-        "timestamp": "2026-04-20T18:50:18.646833Z",
-        "type": "discovery",
-        "note": "M9-S19 L3 E2E subset GREEN: test_level3_{http_inspected,host_mismatch,method_restriction,path_restriction} + test_policy_clear_reverts_to_deny_all all pass via Envoy CONNECT \u2192 mitmproxy:18080 (406s; ~6m46s)."
-      },
-      {
-        "timestamp": "2026-04-20T19:47:32.945419Z",
-        "type": "discovery",
-        "note": "M9-S19 regression: test_unrestricted_allows_and_logs fails rc=7 (curl no connect) on HTTP/port 80 to example.com. L3 HTTPS tests pass. Unrestricted policy uses default_filter_chain (wildcard) \u2192 cluster:mitmproxy + tunneling_config.hostname=%DOWNSTREAM_LOCAL_ADDRESS%. Hypothesis: original_dst listener filter may not fire when Envoy never saw the original SYN because nftables conntrack state carries the pre-DNAT tuple; OR mitmproxy regular mode rejects CONNECT to non-443 authorities; OR default_filter_chain is not picking up traffic. Need diagnostic with gateway/Envoy/mitmproxy logs."
-      },
-      {
-        "timestamp": "2026-04-20T20:15:49.228766Z",
-        "type": "discovery",
-        "note": "Root cause of test_unrestricted_allows_and_logs failure: default_filter_chain emitted at 2-space indent \u2014 YAML parsed it as a top-level key rather than a Listener field. Envoy saw an empty Listener with no chains and silently closed every connection. Fixed by shifting default_filter_chain block to 4-space indent (sibling of address/listener_filters). Added regression test (compile_l3_wildcard_emits_default_filter_chain) asserting exact 4-space indent on the emitted line \u2014 prior substring check missed the structural bug."
-      },
-      {
-        "timestamp": "2026-04-20T20:17:03.358333Z",
-        "type": "discovery",
-        "note": "Implementer (agent af43d4deba15af0a9) completed the cutover landed: L3 chain rewrite to prefix_ranges+tunneling_config\u2192mitmproxy cluster, sandbox_l3 deletion (table + generate_l3_redirect_rules + 5 tests + propagate call site), tcp dport 8080 accept removal, mitmproxy entrypoint flip (regular/127.0.0.1:18080). Unit tests green (523/523), clippy/fmt clean, make docs-build green (20 pages). Agent paused awaiting full E2E result. Added regression test compile_l3_wildcard_emits_default_filter_chain (indent guard). An indent bug was found and fixed that had previously caused test_unrestricted_allows_and_logs to fail (rc=7); now green in 178s. LSP surfaced a stale 'unresolved import generate_l3_redirect_rules' diagnostic after deletion \u2014 verified stale by cargo build --workspace green from sandboxd/."
-      },
-      {
-        "timestamp": "2026-04-20T20:57:13.374964Z",
-        "type": "discovery",
-        "note": "M9-S19 implementation complete, full verification green. Unit 523/523 (13.4s), fmt/clippy clean, make docs-build 20 pages green, full E2E 40/40 in 38:02. Files changed (logic): entrypoint.sh (mitmproxy regular mode flip), policy.rs (L3 rewrite: cluster:mitmproxy + tunneling_config + default_filter_chain indent fix + new compile_l3_wildcard_emits_default_filter_chain regression test), dns_propagation.rs (-340 lines, generate_l3_redirect_rules + 5 tests + sandbox_l3 gone, AtomicListenerWriter now driven by DNS cache), gateway.rs (tcp dport 8080 accept removed), gateway_integration.rs (/proc/net/tcp probe \u2014 gateway image has no ss/netstat), lib.rs + sandboxd/src/main.rs + policy_distributor.rs + atomic_listener_writer.rs (wiring + fmt). Previously-flaky test_unrestricted_allows_and_logs now green standalone and in-suite \u2014 the default_filter_chain 4-space indent fix was load-bearing. Ambient drift: site/package-lock.json (matches deferred todo #24) and .tasks/progress.json (session tracking). Not yet committed; handing to kio-reviewer first."
-      },
-      {
-        "timestamp": "2026-04-20T21:06:26.945415Z",
-        "type": "discovery",
-        "note": "kio-reviewer (agent a969f1c4587fc1c90) verdict: NEEDS CHANGES. Review at .tasks/handoffs/20260420-kio-reviewer-m9s19.md. No correctness or design-fidelity issues found. Findings: 1 major (M1: clear_session_policy docstring in main.rs:1555-1566 enumerates 4 steps but body has 3, and carries leftover 'stale L3 DNAT rules' prose from deleted sandbox_l3 flush); 3 minors (m1: gateway.rs:178-179 future-tense 'M9-S19 replaces' should be past/present; m2: gateway.rs:176-177 subject-verb 'layer...gate...are'\u2192'gates...is'; m3: gateway_integration.rs /proc/net/tcp port-encoding comment says 'little-endian hex' for port but port is network-byte-order big-endian \u2014 test is correct, only the comment is wrong); 2 nits (n1: assert exactly three nftables tables \u2014 actually spec-required; n2: assert nothing listening on 18080 on VM-facing IP \u2014 spec-required). All positive design-fidelity items confirmed green: CONNECT tunneling primary path, fail-closed, writer invariant scoping, outside-in ordering, error mapping via error_response, no new spawn_blocking violations, tests flipped per spec, sandbox_l3 fully deleted."
-      },
-      {
-        "timestamp": "2026-04-20T21:11:07.210793Z",
-        "type": "discovery",
-        "note": "Review-fix pass complete. M1 (clear_session_policy docstring rewritten to 3-phase match, sandbox_l3/L3-DNAT prose scrubbed), m1 (gateway.rs 'As of M9-S19, ...replace'), m2 (gates/is), m3 (comment: IP little-endian, port big-endian + added 0.0.0.0:18080 example) all in. n1 set-equality (HashSet == {sandbox, sandbox_dnat}) and n2 loopback-bind guard (no entry ending :46A0 without prefix 0100007F:) added. Deviation on n1: implementer correctly scoped to 2-table set because test_gateway_lifecycle doesn't apply a policy (sandbox_policy arrives only via PolicyDistributor::distribute on apply_policy); spec's three-table assertion is post-apply steady state, documented in-place comment. Verification: cargo fmt clean, clippy clean, nextest 523/523 (12.7s), make test-integration 6/6 (9.2s \u2014 real container with new set-equality + loopback-bind assertions green). E2E + docs-build skipped per my instruction (text + test-side only, no runtime change)."
-      },
-      {
-        "timestamp": "2026-04-20T21:13:54.944752Z",
-        "type": "decision",
-        "note": "Reviewer confirmation pass: APPROVE. All six findings (M1, m1, m2, m3, promoted-n1, promoted-n2) verified correctly landed. Two-table n1 deviation confirmed correct (create_gateway installs sandbox+sandbox_dnat; sandbox_policy joins only after PolicyDistributor::distribute)."
+        "note": "kio-reviewer confirmation pass: APPROVE. All 5 M9-S20 review findings (1 MAJOR + 2 MINOR + 2 NITs) verified correctly landed without collateral changes."
       }
     ]
   },
@@ -1030,6 +995,38 @@
         "test_gateway_lds_listener_and_atomic_rewrite",
         "listener_framing_is_identical_across_policy_shapes"
       ]
+    },
+    {
+      "session": "M9-S19",
+      "title": "L3 atomic cutover \u2014 mitmproxy mode flip, filter chains, and removal of the sandbox_l3 shortcut",
+      "summary": "L3 atomic cutover landed on Envoy CONNECT tunneling. mitmproxy flipped transparent\u2192regular (127.0.0.1:18080). Envoy L3 filter chains rewritten: prefix_ranges match on DNS cache, default_filter_chain wildcard (fail-closed), tcp_proxy.tunneling_config.hostname=%DOWNSTREAM_LOCAL_ADDRESS% produces CONNECT to mitmproxy with original-destination authority. First-step verification proved primary path green on Envoy 1.32.2; dynamic-metadata fallback not needed. sandbox_l3 nftables table and generate_l3_redirect_rules (~340 lines + 5 tests + call site) fully removed; 'tcp dport 8080 accept' input rule removed. AtomicListenerWriter wired into propagate_dns_changes ahead of sandbox_policy (outside-in ordering preserved). Regression guard: compile_l3_wildcard_emits_default_filter_chain asserts 4-space indent after a 2-space bug left Envoy seeing empty Listener. kio-reviewer pass: 1 major (docstring) + 3 minors (grammar/comment) + 2 promoted nits (nftables table set-equality, loopback-bind guard) all applied; confirmation pass APPROVE. Verification: cargo nextest 523/523, fmt/clippy clean, make test-integration 6/6, make docs-build 20 pages, full E2E 40/40 in 38:02. Committed as 6a9a48b. Deferred to M9-S20: design-doc amendment, user-facing docs consistency sweep, any additional E2E assertions.",
+      "completed": "2026-04-20T21:15:27.987783Z",
+      "decisions": [
+        "Approach: phased execution. (1) Parallel exploration \u2014 map current L3/Envoy/mitmproxy/nftables code seams. (2) First-step verification (spec-required): standalone integration test that tunneling_config.hostname='%DOWNSTREAM_LOCAL_ADDRESS%' produces CONNECT with correct :authority; pivot to dynamic-metadata fallback (Envoy #23700) only if primary fails. (3) Implementation in one coherent delegation (cutover is atomic by design). (4) kio-reviewer pass + fixes. (5) Full E2E + docs-build. Stale L3 claims in docs/concepts/* logged as M9-S20 todos per plan.",
+        "Proceed with primary path (tcp_proxy.tunneling_config.hostname='%DOWNSTREAM_LOCAL_ADDRESS%'). Fallback path deferred indefinitely (will be revisited only if an Envoy version bump breaks the formatter \u2014 harness re-run is the gate).",
+        "Delegation infeasible \u2014 Agent tool unavailable in this session (verified via ToolSearch; TeamCreate created team but no teammate spawner exists). Executing M9-S19 implementation directly from main agent context, accepting context pollution as necessary tradeoff. Session directive is autonomous \u2014 cannot ask user to switch environments.",
+        "Reviewer confirmation pass: APPROVE. All six findings (M1, m1, m2, m3, promoted-n1, promoted-n2) verified correctly landed. Two-table n1 deviation confirmed correct (create_gateway installs sandbox+sandbox_dnat; sandbox_policy joins only after PolicyDistributor::distribute).",
+        "M9-S19 committed as 6a9a48b (feat(gateway): L3 cutover to Envoy CONNECT tunneling). 10 files, +823/-587. site/package-lock.json excluded (pre-existing make docs-build drift, todo #24)."
+      ],
+      "discoveries": [
+        "Explore handoff: 20260420-explore-l3-cutover-seams.md. Key seams: (1) compile_envoy_listener in policy.rs:1002-1119 today emits SNI-matched L3 chains routing to cluster:original_dst (lines 1048-1096) \u2014 this is the core rewrite target; signature must thread DNS cache through to build prefix_ranges. (2) dns_propagation.rs: delete generate_l3_redirect_rules (388-457), delete 5 test_dns_propagate_l3_* tests, delete call site in propagate_dns_changes (485-501), insert AtomicListenerWriter call before sandbox_policy nftables. (3) gateway.rs:1043 \u2014 delete tcp dport 8080 accept line. (4) entrypoint.sh lines 126-135+140+195 \u2014 flip to regular mode 127.0.0.1:18080. (5) addons verified peer-IP-agnostic: zero hits for client_conn.peername/client_addr/peer_addr across policy_addon.py + passthrough_addon.py. (6) Tests to flip: compile_level3_envoy_routes_to_original_dst (line 3024), compile_level3_listener_does_not_route_to_mitmproxy_yet (3055). AtomicListenerWriter callers today: gateway::create_gateway and policy_distributor::apply_policy \u2014 dns_propagation joins as third caller.",
+        "First-step verification (handoff: 20260420-first-step-connect-tunneling-verification.md) \u2014 primary path GREEN on Envoy 1.32.2 (pinned in sandbox-gateway:latest). tcp_proxy.tunneling_config.hostname='%DOWNSTREAM_LOCAL_ADDRESS%' emits exact CONNECT request-line 'CONNECT <orig-ip>:<orig-port> HTTP/1.1' plus a 'host:' header with same authority. Formatter is dynamic per-connection (verified with two-destination test). Fallback (set_filter_state + %DYNAMIC_METADATA%) not needed; not built out. Gotcha: %DOWNSTREAM_LOCAL_ADDRESS% resolves to listener's post-DNAT local unless envoy.filters.listener.original_dst is in the listener_filter chain \u2014 compiler must ensure original_dst listener filter is present (already is in today's shape). Harness preserved at .tasks/verification/20260420-connect-tunneling/ (shell scripts; not a cargo test \u2014 requires --privileged + OUTPUT DNAT, per-Envoy-version-bump artifact).",
+        "Gateway container image has neither ss nor netstat \u2014 gateway_lifecycle test must parse /proc/net/tcp directly (state 0A = LISTEN; ports in little-endian hex).",
+        "M9-S19 L3 E2E subset GREEN: test_level3_{http_inspected,host_mismatch,method_restriction,path_restriction} + test_policy_clear_reverts_to_deny_all all pass via Envoy CONNECT \u2192 mitmproxy:18080 (406s; ~6m46s).",
+        "M9-S19 regression: test_unrestricted_allows_and_logs fails rc=7 (curl no connect) on HTTP/port 80 to example.com. L3 HTTPS tests pass. Unrestricted policy uses default_filter_chain (wildcard) \u2192 cluster:mitmproxy + tunneling_config.hostname=%DOWNSTREAM_LOCAL_ADDRESS%. Hypothesis: original_dst listener filter may not fire when Envoy never saw the original SYN because nftables conntrack state carries the pre-DNAT tuple; OR mitmproxy regular mode rejects CONNECT to non-443 authorities; OR default_filter_chain is not picking up traffic. Need diagnostic with gateway/Envoy/mitmproxy logs.",
+        "Root cause of test_unrestricted_allows_and_logs failure: default_filter_chain emitted at 2-space indent \u2014 YAML parsed it as a top-level key rather than a Listener field. Envoy saw an empty Listener with no chains and silently closed every connection. Fixed by shifting default_filter_chain block to 4-space indent (sibling of address/listener_filters). Added regression test (compile_l3_wildcard_emits_default_filter_chain) asserting exact 4-space indent on the emitted line \u2014 prior substring check missed the structural bug.",
+        "Implementer (agent af43d4deba15af0a9) completed the cutover landed: L3 chain rewrite to prefix_ranges+tunneling_config\u2192mitmproxy cluster, sandbox_l3 deletion (table + generate_l3_redirect_rules + 5 tests + propagate call site), tcp dport 8080 accept removal, mitmproxy entrypoint flip (regular/127.0.0.1:18080). Unit tests green (523/523), clippy/fmt clean, make docs-build green (20 pages). Agent paused awaiting full E2E result. Added regression test compile_l3_wildcard_emits_default_filter_chain (indent guard). An indent bug was found and fixed that had previously caused test_unrestricted_allows_and_logs to fail (rc=7); now green in 178s. LSP surfaced a stale 'unresolved import generate_l3_redirect_rules' diagnostic after deletion \u2014 verified stale by cargo build --workspace green from sandboxd/.",
+        "M9-S19 implementation complete, full verification green. Unit 523/523 (13.4s), fmt/clippy clean, make docs-build 20 pages green, full E2E 40/40 in 38:02. Files changed (logic): entrypoint.sh (mitmproxy regular mode flip), policy.rs (L3 rewrite: cluster:mitmproxy + tunneling_config + default_filter_chain indent fix + new compile_l3_wildcard_emits_default_filter_chain regression test), dns_propagation.rs (-340 lines, generate_l3_redirect_rules + 5 tests + sandbox_l3 gone, AtomicListenerWriter now driven by DNS cache), gateway.rs (tcp dport 8080 accept removed), gateway_integration.rs (/proc/net/tcp probe \u2014 gateway image has no ss/netstat), lib.rs + sandboxd/src/main.rs + policy_distributor.rs + atomic_listener_writer.rs (wiring + fmt). Previously-flaky test_unrestricted_allows_and_logs now green standalone and in-suite \u2014 the default_filter_chain 4-space indent fix was load-bearing. Ambient drift: site/package-lock.json (matches deferred todo #24) and .tasks/progress.json (session tracking). Not yet committed; handing to kio-reviewer first.",
+        "kio-reviewer (agent a969f1c4587fc1c90) verdict: NEEDS CHANGES. Review at .tasks/handoffs/20260420-kio-reviewer-m9s19.md. No correctness or design-fidelity issues found. Findings: 1 major (M1: clear_session_policy docstring in main.rs:1555-1566 enumerates 4 steps but body has 3, and carries leftover 'stale L3 DNAT rules' prose from deleted sandbox_l3 flush); 3 minors (m1: gateway.rs:178-179 future-tense 'M9-S19 replaces' should be past/present; m2: gateway.rs:176-177 subject-verb 'layer...gate...are'\u2192'gates...is'; m3: gateway_integration.rs /proc/net/tcp port-encoding comment says 'little-endian hex' for port but port is network-byte-order big-endian \u2014 test is correct, only the comment is wrong); 2 nits (n1: assert exactly three nftables tables \u2014 actually spec-required; n2: assert nothing listening on 18080 on VM-facing IP \u2014 spec-required). All positive design-fidelity items confirmed green: CONNECT tunneling primary path, fail-closed, writer invariant scoping, outside-in ordering, error mapping via error_response, no new spawn_blocking violations, tests flipped per spec, sandbox_l3 fully deleted.",
+        "Review-fix pass complete. M1 (clear_session_policy docstring rewritten to 3-phase match, sandbox_l3/L3-DNAT prose scrubbed), m1 (gateway.rs 'As of M9-S19, ...replace'), m2 (gates/is), m3 (comment: IP little-endian, port big-endian + added 0.0.0.0:18080 example) all in. n1 set-equality (HashSet == {sandbox, sandbox_dnat}) and n2 loopback-bind guard (no entry ending :46A0 without prefix 0100007F:) added. Deviation on n1: implementer correctly scoped to 2-table set because test_gateway_lifecycle doesn't apply a policy (sandbox_policy arrives only via PolicyDistributor::distribute on apply_policy); spec's three-table assertion is post-apply steady state, documented in-place comment. Verification: cargo fmt clean, clippy clean, nextest 523/523 (12.7s), make test-integration 6/6 (9.2s \u2014 real container with new set-equality + loopback-bind assertions green). E2E + docs-build skipped per my instruction (text + test-side only, no runtime change)."
+      ],
+      "artifacts": [
+        "6a9a48b",
+        "AtomicListenerWriter",
+        "compile_envoy_listener",
+        "compile_l3_wildcard_emits_default_filter_chain",
+        ".tasks/verification/20260420-connect-tunneling/"
+      ]
     }
   ],
   "todos": [
@@ -1256,6 +1253,13 @@
       "text": "IPv6 %DOWNSTREAM_LOCAL_ADDRESS% format uses brackets ([::1]:443); not relevant now (gateway IPv4-only) but any future IPv6 re-enable must re-verify via first-step harness.",
       "added_session": "M9-S19",
       "added_timestamp": "2026-04-20T18:08:47.165235Z",
+      "status": "deferred"
+    },
+    {
+      "id": 27,
+      "text": "Enable a minimal Envoy access log (or JSON log) in the L3 listener generated by compile_envoy_listener \u2014 would make the CONNECT-tunnel invariant observable from Envoy's side (today only mitmproxy's log exposes it). Defense-in-depth against a silent mitmproxy-log format regression. Out of M9-S20 scope per explicit agent-C deferral.",
+      "added_session": "M9-S20",
+      "added_timestamp": "2026-04-20T21:55:15.447201Z",
       "status": "deferred"
     }
   ],

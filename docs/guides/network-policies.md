@@ -138,6 +138,25 @@ EOF
 sandbox policy update dev /tmp/empty-policy.json
 ```
 
+## How quickly a policy change takes effect
+
+`sandbox policy update` re-compiles and hot-reloads all four enforcement components without dropping in-flight connections, but a few milliseconds to a few hundred milliseconds may elapse before a given destination behaves per the new policy:
+
+- **CoreDNS, mitmproxy, Envoy static config** — swapped atomically on reload. The old answer set / filter set is replaced as soon as the new config lands.
+- **Envoy L3 filter chains (level `http` destinations)** — driven by DNS. Envoy only knows which IPs belong to an L3-inspected domain after CoreDNS resolves that domain and sandboxd rewrites the listener file. For a brand-new L3 rule, the first request races the propagation loop: if the client's TLS handshake begins before Envoy picks up the rewritten listener (typically sub-second), Envoy finds no matching filter chain and drops the connection. Retrying or warming DNS with a prior `getent hosts` / `nslookup` closes the race.
+- **nftables allow rules** — follow the same DNS-driven path. An IP literal dialed before CoreDNS has answered for its name is dropped.
+
+The behavior is deliberately fail-closed: an unknown destination is denied, never silently passed through. See [networking → Fail-closed propagation](/concepts/networking/#fail-closed-propagation-for-level-3) for the mechanism.
+
+## L3 limitations
+
+Level `http` (HTTPS inspection) has a few constraints worth calling out:
+
+- **TCP only.** mitmproxy's forward-proxy mode inspects HTTP/HTTPS over TCP. Non-TCP protocols (QUIC/HTTP/3, raw UDP) cannot be inspected at this level. QUIC is blocked by the deny-all firewall since no rule opens UDP/443.
+- **Destinations must resolve via the intercepted DNS path.** L3 filter chains are keyed on IPs learned from CoreDNS (or explicit CIDR literals in the policy). A destination that is never resolved through CoreDNS will have no L3 chain and will fail closed. Pre-populating CIDRs in the policy works around this for known IP ranges.
+- **Inspection is done with the per-session CA.** The client inside the VM sees the mitmproxy-issued certificate, not the real server's. Applications that pin the real certificate cannot use level `http`; drop them to `tls` or `transport`. See [TLS certificate errors](#tls-certificate-errors) below.
+- **No `CONNECT` from the guest.** The mitmproxy forward proxy is bound to loopback inside the gateway container and is not reachable from the VM. The only way to reach it is through the Envoy L3 filter chain's internal CONNECT tunnel. This is deliberate — it keeps the inspection path off the VM's attack surface.
+
 ## Verify what is active
 
 `sandbox describe` prints a human-readable summary, including each rule's level, filters, and reason:

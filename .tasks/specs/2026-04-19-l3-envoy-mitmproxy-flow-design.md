@@ -2,18 +2,19 @@
 
 ## Summary
 
-The implementation of L3 (HTTP-inspected) traffic flow diverged from the
-original design in `networking-design.md`. The design requires all TCP
-from the VM to traverse Envoy, with Envoy routing L3 traffic to mitmproxy
-on gateway loopback. The implementation currently bypasses Envoy for L3
-by using a higher-priority nftables table (`sandbox_l3`) that DNATs TCP
-80/443 for policy-allowed IPs directly to mitmproxy.
+Prior to M9-S19 the implementation of L3 (HTTP-inspected) traffic flow
+diverged from the original design in `networking-design.md`. The design
+requires all TCP from the VM to traverse Envoy, with Envoy routing L3
+traffic to mitmproxy on gateway loopback. The pre-cutover implementation
+bypassed Envoy for L3 by using a higher-priority nftables table
+(`sandbox_l3`) that DNATed TCP 80/443 for policy-allowed IPs directly to
+mitmproxy.
 
-This spec restores the design-faithful flow by filling the one gap the
-design left open: **how Envoy hands the original destination to mitmproxy
-across the proxy hop**. We fill it with HTTP/1.1 CONNECT tunneling
-(Envoy's `tcp_proxy.tunneling_config`, terminated by mitmproxy in
-regular/forward-proxy mode).
+This spec (shipped in M9-S19) restored the design-faithful flow by
+filling the one gap the design left open: **how Envoy hands the original
+destination to mitmproxy across the proxy hop**. It is filled with
+HTTP/1.1 CONNECT tunneling (Envoy's `tcp_proxy.tunneling_config`,
+terminated by mitmproxy in regular/forward-proxy mode).
 
 ## Context
 
@@ -28,22 +29,22 @@ socket has no conntrack history tied to the original destination, so
 real upstream.
 
 Mitmproxy's transparent mode defaults to `SO_ORIGINAL_DST`. The
-implementation responded to this by routing L3 traffic around Envoy
-entirely (the `sandbox_l3` DNAT table), preserving `SO_ORIGINAL_DST` at
-the cost of violating three design points:
+pre-M9-S19 implementation responded to this by routing L3 traffic around
+Envoy entirely (the `sandbox_l3` DNAT table), preserving
+`SO_ORIGINAL_DST` at the cost of violating three design points:
 
 1. **Envoy as the single TCP entry point** — the design says *"TCP →
    Envoy (original_dst, protocol-aware routing)"* is the sole TCP path;
-   the implementation has a second path (nftables → mitmproxy).
+   the old implementation had a second path (nftables → mitmproxy).
 2. **Policy-driven classification** — the design principle is
-   *"Policy drives classification, not protocol sniffing."* The
+   *"Policy drives classification, not protocol sniffing."* The old
    implementation reintroduced port-based routing for L3 (DNAT only for
    TCP 80/443), which made non-HTTP ports to an L3 destination silently
    downgrade to opaque passthrough.
 3. **Fail-closed during config propagation** — the design says *"No
    traffic is permitted to a new destination until all components are
-   consistent."* The implementation has a ~2s window where L3 traffic
-   falls through Envoy as SNI-verified passthrough with no HTTP
+   consistent."* The old implementation had a ~2s window where L3
+   traffic fell through Envoy as SNI-verified passthrough with no HTTP
    inspection.
 
 ### Why the design-faithful flow is achievable
@@ -129,7 +130,7 @@ VM app
   use the updated filter chains. Long-lived workloads (HTTP/2 streams,
   gRPC, websockets) are unaffected by unrelated policy edits.
 
-### Ports (after this change)
+### Ports (after M9-S19)
 
 | Port  | Role                                           | Bind              |
 |-------|------------------------------------------------|-------------------|
@@ -137,10 +138,10 @@ VM app
 | 10000 | Envoy `original_dst` listener                  | Gateway IP        |
 | 18080 | mitmproxy listener (Envoy upstream endpoint)   | `127.0.0.1` only  |
 
-The mitmproxy port moves from `8080` to `18080`, and the bind moves to
-loopback only. Two reasons: (a) signalling — the port is an internal
-Envoy→mitmproxy link, not a VM-facing DNAT target; (b) defence in
-depth — if a future change added a DNAT back to port 8080, it would
+M9-S19 moved the mitmproxy port from `8080` to `18080` and moved the
+bind to loopback only. Two reasons: (a) signalling — the port is an
+internal Envoy→mitmproxy link, not a VM-facing DNAT target; (b) defence
+in depth — if a future change added a DNAT back to port 8080, it would
 fail closed rather than silently working.
 
 ## Component changes
@@ -181,24 +182,40 @@ change during a session's lifetime.
 
 - Per-domain L3 destination: filter chain matched by `prefix_ranges`
   built from the DNS cache's current resolved IPs for the domain,
-  routing to `cluster: mitmproxy`. (Replaces today's SNI-only match
-  routing to `original_dst`.)
+  routing to `cluster: mitmproxy`. (Replaces the pre-M9-S19 SNI-only
+  match routing to `original_dst`.)
 - `Destination::Cidr` at L3: filter chain matched by `prefix_ranges`
   on the CIDR, routing to `cluster: mitmproxy`.
 - Wildcard `*` L3 destination: default filter chain (no match),
   routing to `cluster: mitmproxy`.
+- **YAML indent sharp edge** (discovered during M9-S19): the emitted
+  `default_filter_chain:` key must sit at the same indent as
+  `filter_chains:` — both are direct fields of the Listener resource
+  (sibling of `address`, `listener_filters`, etc.). The project
+  templates use 4-space indent at that level today. A two-space
+  slip once caused `default_filter_chain` to be parsed as a peer of
+  `resources:` at the DiscoveryResponse root, leaving the Listener
+  with no chains at all; Envoy then silently closed every connection
+  while admin stats still looked healthy. The compiler regression test
+  `compile_l3_wildcard_emits_default_filter_chain` in
+  `sandboxd/sandbox-core/src/policy.rs` guards the exact indent.
 - **No port predicate** on any L3 chain. L3 applies to all traffic to
   the destination.
 - In each L3 chain the `tcp_proxy` filter sets
   `tunneling_config.hostname = "%DOWNSTREAM_LOCAL_ADDRESS%"` so the
   CONNECT authority Envoy sends upstream is the downstream original
   destination (IP:port as observed on the `original_dst` listener).
-  If the format-string interpolation misbehaves in the chosen Envoy
-  build (Envoy issue `#23700` documents friction around this), the
-  documented fallback is to populate dynamic metadata via
-  `set_filter_state` earlier in the chain and reference it from the
-  `tunneling_config.hostname` field via
-  `%DYNAMIC_METADATA(...)%`.
+  This primary path was validated end-to-end during M9-S19 on Envoy
+  1.32.2 (the pinned version) — see
+  `.tasks/verification/20260420-connect-tunneling/` for the
+  reproducible shell harness. A dynamic-metadata fallback (populate
+  via `set_filter_state` earlier in the chain, reference from
+  `tunneling_config.hostname` as `%DYNAMIC_METADATA(...)%`) remains
+  documented as a contingency should a future Envoy version regress
+  around Envoy issue `#23700`; it has **not** been implemented. The
+  verification harness should be re-run on any Envoy version bump so
+  this contingency is invoked deliberately, not discovered at
+  runtime.
 - `tunneling_config.protocol` is left unset — Envoy's default is
   HTTP/1.1, which matches the cluster's `HttpProtocolOptions` pin.
   If a future Envoy change flips the default, the cluster-level
@@ -252,14 +269,14 @@ after SNI validation for L2, opaque TCP for L1) stay as they are.
   connections to L1/L2 destinations).
 - `sandbox` (deny-all forward baseline).
 
-Gateway nftables tables after this change: three (`sandbox`,
+Gateway nftables tables after M9-S19: three (`sandbox`,
 `sandbox_dnat`, `sandbox_policy`).
 
 ### Configuration propagation (new subsystem concern)
 
-Today DNS propagation writes only nftables rules. After this change
-it also rewrites Envoy's listener filter chains when the resolved IPs
-for an L3 domain change.
+Before M9-S19 the DNS propagation loop wrote only nftables rules.
+Post-cutover it also rewrites Envoy's listener filter chains when the
+resolved IPs for an L3 domain change.
 
 **Mechanism: xDS via filesystem subscription (LDS).** Envoy's static
 bootstrap config points its Listener Discovery Service (LDS) at a
@@ -285,28 +302,34 @@ container reads. No gRPC xDS server. CDS for the mitmproxy cluster is
 not required (cluster definition is static; only the listener's
 filter chains change).
 
-**Publication mechanism from sandboxd to the container.** Today
-sandboxd delivers gateway configuration via `docker exec` piping
-stdin into a file inside the container (see
+**Publication mechanism from sandboxd to the container.** Other gateway
+configuration (bootstrap, mitmproxy policy, CoreDNS config) is delivered
+via `docker exec` piping stdin into a file inside the container (see
 `sandboxd/sandbox-core/src/policy_distributor.rs`,
 `write_file_to_container`, approx. lines 267–315). That mechanism
 produces `Modified` inotify events on the destination file. Envoy's
 filesystem LDS **only fires on `MovedTo` inotify events**, not on
 `Modified` events — this is acknowledged upstream design (issue
-`envoyproxy/envoy#20474`). A direct `docker exec > file` write will
+`envoyproxy/envoy#20474`). A direct `docker exec > file` write would
 therefore be silently ignored by the listener watcher.
 
-Two implementation options for the delegate:
+M9-S18/S19 adopted option (a) below; option (b) is kept for historical
+context:
 
-(a) Introduce a bind-mounted directory on the gateway container for
-    the listener file specifically, and write from the host using
-    tempfile + `fs::rename` on the same filesystem. This is the
-    standard Envoy xDS filesystem-subscription idiom; it gives
-    sandboxd direct control over atomicity without a shell
-    round-trip per update. **Preferred.**
+(a) **[Shipped.]** A per-session host directory
+    (`/tmp/sandboxd-listeners/<session-id>/`) is bind-mounted into the
+    gateway container at `/etc/envoy/listeners/`. sandboxd writes the
+    listener file from the host via tempfile + `fs::rename` on the same
+    filesystem, producing the `MovedTo` event Envoy requires. The
+    implementation lives in
+    `sandboxd/sandbox-core/src/atomic_listener_writer.rs` and enforces
+    the writer-level invariant below by parsing the
+    `FILTER_CHAINS_BEGIN_MARKER` / `FILTER_CHAINS_END_MARKER` boundary
+    and rejecting any diff outside that region.
 (b) Keep `docker exec` and run
     `sh -c 'cat > tmp && mv tmp final'` inside the container so the
-    rename happens there, producing the required `MovedTo` event.
+    rename happens there, producing the required `MovedTo` event. Not
+    adopted.
 
 The bootstrap must set `dynamic_resources.lds_config.path_config_source.path`
 to the listener file and `watched_directory` to the parent directory
@@ -319,8 +342,11 @@ to `listener_filters`, `metadata`, `socket_options`,
 `traffic_direction`, the bind address, or
 `per_connection_buffer_limit_bytes` force a full listener drain and
 reset existing connections, which destroys the connection-preservation
-property. The writer should assert that no other field diffs between
-generations and fail loudly if it does.
+property. `AtomicListenerWriter` enforces this by marker-delimited
+content comparison (`FILTER_CHAINS_BEGIN_MARKER` /
+`FILTER_CHAINS_END_MARKER`); any non-matching diff outside that region
+returns `ListenerWriteError::InvariantViolated` and the new generation
+is rejected.
 
 **Static-listener caveat.** Envoy refuses to update a
 statically-defined listener via LDS — the listener must be delivered
@@ -368,7 +394,7 @@ mechanism gap without restructuring the document.
 
 - Fix the request-flow mermaid diagram (lines 78–107): the L3 branch
   becomes `Envoy ▸ CONNECT tunnel ▸ mitmproxy ▸ External`. Remove the
-  `Forward to 127.0.0.1:8080` wording that will no longer be accurate;
+  `Forward to 127.0.0.1:8080` wording (no longer accurate post-M9-S19);
   replace with a prose line describing HTTP/1.1 CONNECT as the
   Envoy→mitmproxy contract.
 - New subsection **"Policy changes are fail-closed during
@@ -423,6 +449,19 @@ Verify the L3 flow description (if any) is still accurate; update in
 the consistency pass.
 
 ## Testing plan
+
+### Verification harness (Envoy CONNECT tunneling)
+
+`.tasks/verification/20260420-connect-tunneling/` contains a standalone
+shell harness (`run-verification.sh` + `in-container.sh` +
+`envoy-primary.yaml`) that reproduces the CONNECT-tunnel flow end-to-end
+against the pinned gateway image. It proves that
+`tunneling_config.hostname = "%DOWNSTREAM_LOCAL_ADDRESS%"` interpolates
+correctly on the current Envoy version (1.32.2 at M9-S19 time) and that
+the CONNECT `:authority` emitted upstream equals the downstream
+original destination. Re-run this harness on any Envoy version bump
+before landing the bump — it is the deterministic signal that the
+documented dynamic-metadata fallback is still not required.
 
 ### Unit tests (Rust)
 
@@ -535,10 +574,11 @@ subtle inconsistencies:
 - `docs/guides/network-policies.md` — new propagation section fits?
 - `docs/guides/troubleshooting.md` — new entries fit existing
   structure?
-- `sandbox-core/src/policy.rs` — the comment block that currently
-  justifies bypassing Envoy (lines 862–888) is replaced with accurate
-  commentary on the CONNECT-tunneling flow (Envoy
-  `tunneling_config` → mitmproxy regular mode).
+- `sandbox-core/src/policy.rs` — the comment block near
+  `compile_envoy_bootstrap` (was lines 862–888 pre-cutover) has been
+  replaced with accurate commentary on the CONNECT-tunneling flow
+  (Envoy `tunneling_config` → mitmproxy regular mode). Post-M9-S20 the
+  line numbers may shift; anchor on the function name.
 - `sandbox-core/src/dns_propagation.rs` — module docs; no lingering
   references to L3 redirect rules.
 - `sandbox-core/src/gateway.rs` — `generate_input_allow_ruleset` and
@@ -556,14 +596,14 @@ explicitly deferred with a note.
 - **Running sessions**: keep their existing gateway container and
   config until stop/start. New sessions use the new flow. No in-place
   migration step.
-- **Gateway image**: no mitmproxy rebuild or version bump required —
+- **Gateway image**: no mitmproxy rebuild or version bump was required —
   the pinned `mitmproxy 11.1.3` supports regular-mode CONNECT
-  natively. The gateway `entrypoint.sh` mitmproxy startup line does
-  need updating (`--mode regular --listen-host 127.0.0.1
-  --listen-port 18080`). Daemon pins the image digest as usual.
-- **Daemon binary**: compiles new Envoy config and deletes the
-  `sandbox_l3` codepaths.
-- **Backwards compatibility**: none required — the change is fully
+  natively. The gateway `entrypoint.sh` mitmproxy startup line was
+  updated to `--mode regular --listen-host 127.0.0.1 --listen-port
+  18080`. Daemon pins the image digest as usual.
+- **Daemon binary**: compiles the new Envoy config and the
+  `sandbox_l3` codepaths have been deleted.
+- **Backwards compatibility**: none required — the change was fully
   internal to the gateway.
 
 ## Explicitly out of scope

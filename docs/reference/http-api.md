@@ -203,7 +203,7 @@ For the full policy schema (assurance levels, HTTP filters, destinations, protoc
 
 ### `DELETE /sessions/{id}/policy` — clear policy
 
-No request body. Idempotent. Compiles an empty policy, pushes it to the gateway (empty CoreDNS allow-list, deny-all mitmproxy + Envoy), flushes L3 DNAT rules, deletes the persisted row, and cancels the DNS propagation loop. Session must be `running`.
+No request body. Idempotent. Compiles an empty policy, pushes it to the gateway (empty CoreDNS allow-list, deny-all mitmproxy + Envoy, empty Envoy L3 filter chains), deletes the persisted row, and cancels the DNS propagation loop. Session must be `running`.
 
 Success: `200 OK` with `{ "status": "ok", "message": "policy cleared; session is now fail-closed" }`.
 

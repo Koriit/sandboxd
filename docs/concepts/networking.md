@@ -61,16 +61,15 @@ The gateway container is the session's single exit. It runs three cooperating pr
 
 ### nftables
 
-The gateway holds four nftables tables, each with a distinct role:
+The gateway holds three nftables tables, each with a distinct role:
 
 | Table | Purpose |
 |---|---|
 | `sandbox` | Deny-all baseline — forward chain drops everything |
 | `sandbox_dnat` | PREROUTING DNAT — DNS to CoreDNS, TCP to Envoy |
 | `sandbox_policy` | Allow rules for IPs learned from DNS responses |
-| `sandbox_l3` | DNAT for L3 MITM — redirects HTTPS to mitmproxy |
 
-The deny-all baseline is the safety net. Traffic reaches the internet only after being matched by the DNAT rules, forwarded to a gateway component, and allowed out by the policy-driven `sandbox_policy` table.
+The deny-all baseline is the safety net. Traffic reaches the internet only after being matched by the DNAT rules, forwarded to a gateway component, and allowed out by the policy-driven `sandbox_policy` table. Level-3 (HTTPS inspection) traffic is no longer routed through nftables DNAT; Envoy sends it to mitmproxy itself over a loopback CONNECT tunnel (see [Request flow](#request-flow) below).
 
 ### Three processes
 
@@ -105,7 +104,7 @@ sequenceDiagram
     App->>NFT: TCP SYN to resolved IP:443
     NFT->>Envoy: DNAT TCP -> Envoy :10000
     alt Level 3 (http) destination
-        Envoy->>MITM: Forward to 127.0.0.1:8080
+        Envoy->>MITM: CONNECT <orig-dst>:<port><br/>over 127.0.0.1:18080
         MITM->>Ext: Re-encrypt with real cert, forward
         Ext-->>MITM: Response
         MITM-->>Envoy: Response
@@ -119,6 +118,8 @@ sequenceDiagram
     Envoy-->>App: Response
 ```
 
+On the Level 3 path, Envoy routes the TCP flow into its `mitmproxy` upstream cluster with a per-chain `tcp_proxy.tunneling_config` whose hostname is `%DOWNSTREAM_LOCAL_ADDRESS%` — the original destination recovered from `SO_ORIGINAL_DST` on the intercepting listener. That produces an HTTP/1.1 `CONNECT <orig-ip>:<port>` request to mitmproxy on `127.0.0.1:18080`, which runs in regular forward-proxy mode. mitmproxy terminates TLS inside the tunnel with the per-session CA, inspects the request, and re-establishes a verified TLS connection to the real destination. mitmproxy is bound to loopback only; the VM cannot reach it directly.
+
 Two things are worth highlighting:
 
 - **DNS is intercepted twice.** The VM's `resolv.conf` points at the gateway, *and* nftables DNATs port 53 regardless of destination. An application that ignores `resolv.conf` and hardcodes `8.8.8.8` still ends up at CoreDNS.
@@ -131,6 +132,17 @@ CoreDNS is the only resolver the VM reaches.
 - **With a policy applied**, CoreDNS answers only the domains the policy lists; everything else returns `NXDOMAIN`. ECH/HTTPS SVCB records are stripped from answers so Encrypted Client Hello cannot hide the hostname from downstream inspection.
 - **Without a policy**, DNS resolution returns `NXDOMAIN` for everything — the default is deny.
 - **IPs learned from CoreDNS** are reported back to sandboxd, which writes them into the `sandbox_policy` table so the firewall matches the live IPs for each allowed domain.
+
+### Fail-closed propagation for Level 3
+
+Level-3 (HTTPS-inspected) destinations are selected by matching the connection's original destination IP against per-chain `prefix_ranges` on Envoy's filter chains. Those IPs come from the same DNS learning loop that drives `sandbox_policy`: when CoreDNS answers a policy-allowed name, sandboxd rewrites the Envoy listener file and Envoy picks up the new chain via xDS.
+
+The propagation is **fail-closed**, not fail-open:
+
+- Between the moment CoreDNS answers and the moment Envoy's listener is updated (sub-second in practice, but non-zero), the destination IP has no matching L3 filter chain. A connection to it during that window hits no chain and is dropped by Envoy — it is **not** silently forwarded as passthrough.
+- An application that dials an IP literal it learned out-of-band, or uses a stale cached DNS answer after a policy change that removed the name, will also fail closed for the same reason.
+
+The practical consequence is that the very first request to a brand-new L3 destination, issued immediately after a `policy update`, can race the propagation loop and be refused. Retrying — or warming DNS with a prior lookup — closes the race. See [troubleshooting](/guides/troubleshooting/#l3-destination-fails-on-first-request-after-policy-change) for the operator-side view of this.
 
 ## TLS interception
 

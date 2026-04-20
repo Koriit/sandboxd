@@ -188,6 +188,53 @@ The policy must compile into all four component configs (CoreDNS, nftables, Envo
 
 After a successful update, there is a brief reload window (under 1 second) where the old policy is still active. DNS TTL caching in the guest OS can also cause stale behavior — restart the application to force fresh resolution.
 
+### L3 destination fails on first request after policy change
+
+**Symptom:** A freshly added level `http` destination returns `Connection refused` or a TLS handshake timeout on the very first request, then succeeds on retry.
+
+This is the fail-closed DNS-propagation window. Envoy's L3 filter chains match on the connection's original destination IP, and sandboxd can only populate those IPs after CoreDNS has resolved the name. Between the policy taking effect and the first DNS answer being propagated into Envoy's listener file, a connection to the unresolved IP hits no filter chain and is dropped — deliberately, not silently forwarded.
+
+Fix: warm DNS before the first real request, or just retry. Either is harmless.
+
+```bash
+# Inside the VM:
+getent hosts api.newdestination.example   # triggers CoreDNS -> propagation
+curl -sSf https://api.newdestination.example/...
+```
+
+See [networking → Fail-closed propagation](/concepts/networking/#fail-closed-propagation-for-level-3) for why this is the designed behavior.
+
+### Non-HTTP traffic to a level `http` destination
+
+**Symptom:** A non-HTTP protocol (SSH, raw TCP, binary RPC) to a host covered by a level `http` rule connects, but the client then sees an immediate connection reset or a garbled protocol error.
+
+mitmproxy expects HTTP/HTTPS on its forward-proxy port. The Envoy L3 filter chain will happily establish the CONNECT tunnel into mitmproxy — the TCP handshake works — but mitmproxy rejects the bytes once they fail HTTP parsing. The client sees whatever the application layer makes of a closed tunnel: usually a reset mid-handshake or a spurious HTTP error frame.
+
+Fix: do not put non-HTTP destinations at level `http`. Drop them to `tls` (SNI-verified passthrough) or `transport` (opaque TCP):
+
+```json
+{"destination": "git.example.com", "level": "transport", "protocol": "https"}
+```
+
+### Verify L3 inspection is actually happening
+
+**Symptom:** You want to confirm a level `http` destination is being intercepted, not silently passed through.
+
+The simplest indicator is the certificate: a level `http` destination must serve the per-session CA's certificate, not the real origin's. An intercepted response has an issuer of `Sandbox CA {session_id}`.
+
+```bash
+# Inside the VM — should print "Sandbox CA <12-hex>"
+openssl s_client -connect api.example.com:443 -servername api.example.com </dev/null 2>/dev/null \
+    | openssl x509 -noout -issuer
+
+# Complementary check from the gateway — mitmproxy logs a
+# `server connect <orig-ip>:<port>` line for each tunneled flow.
+sandbox logs <session> --component mitmproxy --tail 50 \
+    | grep -Ei 'server connect|\[ALLOW\]'
+```
+
+If the issuer is anything other than `Sandbox CA ...`, the destination is not being inspected. The two likely reasons are: the rule is at level `tls` or `transport` rather than `http`; or the destination does not have a resolved IP yet and the request was denied (see the propagation-window FAQ above).
+
 ## File transfer failures
 
 ### Path validation

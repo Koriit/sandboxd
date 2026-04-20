@@ -1012,12 +1012,13 @@ pub fn generate_dnat_ruleset(vm_subnet: &str, gateway_ip: &str) -> String {
 
 /// Generate rules that open the input chain for service ports.
 ///
-/// The initial deny-all ruleset blocks all inbound traffic.  After DNAT
+/// The initial deny-all ruleset blocks all inbound traffic. After DNAT
 /// is configured, traffic from the VM subnet is rewritten to the
-/// gateway's own IP on port 53 (DNS), 10000 (Envoy proxy), or
-/// 8080 (mitmproxy for L3 HTTPS inspection).  The input chain must
-/// accept this traffic, otherwise the DNATted/redirected packets are
-/// rejected.
+/// gateway's own IP on port 53 (DNS) or 10000 (Envoy's `original_dst`
+/// listener, which terminates TCP and — for L3 destinations — opens a
+/// CONNECT tunnel to mitmproxy on the loopback 127.0.0.1:18080). The
+/// input chain must accept this traffic, otherwise the DNATted packets
+/// are rejected.
 pub fn generate_input_allow_ruleset(vm_subnet: &str) -> String {
     format!(
         r#"flush chain inet sandbox input
