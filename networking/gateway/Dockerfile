@@ -59,10 +59,14 @@ RUN mkdir -p /var/log/gateway /var/run/gateway /tmp/gateway \
 
 # ---------- copy configuration files ----------
 # Build context is networking/ (parent of gateway/)
-# Base Envoy config goes to /opt/envoy/ (read-only) since /etc/envoy is a
-# tmpfs at runtime. The entrypoint copies it into /etc/envoy on startup.
-COPY envoy/envoy-base.yaml /opt/envoy/envoy-base.yaml
-COPY envoy/envoy-base.yaml /etc/envoy/envoy.yaml
+#
+# M9-S18: Envoy configuration is now provided at runtime by sandboxd.
+#  - `/etc/envoy/envoy-bootstrap.yaml` is written via `docker exec` after
+#    `docker run` but before the entrypoint starts Envoy.
+#  - `/etc/envoy/listeners/listener.yaml` lives in a per-session host
+#    directory bind-mounted into the container (see `atomic_listener_writer`
+#    in `sandbox-core`). Docker creates the mountpoint automatically.
+# We therefore no longer ship `envoy-base.yaml` inside the image.
 COPY gateway/Corefile /opt/coredns/Corefile
 COPY mitmproxy/passthrough_addon.py /etc/mitmproxy/passthrough_addon.py
 COPY mitmproxy/policy_addon.py /etc/mitmproxy/policy_addon.py

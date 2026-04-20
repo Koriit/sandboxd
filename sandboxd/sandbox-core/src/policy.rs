@@ -537,13 +537,72 @@ pub struct PolicyCompiler;
 pub struct CompiledPolicy {
     /// nftables rules to inject (extends the base deny-all + DNAT ruleset).
     pub nftables_rules: String,
-    /// Envoy filter chain configuration (YAML).
-    pub envoy_config: String,
+    /// Envoy static bootstrap configuration (YAML). Written once per session.
+    ///
+    /// Contains admin, clusters (including the `mitmproxy` cluster), and a
+    /// `dynamic_resources.lds_config` pointing at a filesystem path where
+    /// the listener is served via LDS. See [`LISTENER_FILE_NAME`] and
+    /// [`LISTENER_DIR_IN_CONTAINER`].
+    pub envoy_bootstrap_config: String,
+    /// Envoy listener file content (LDS `DiscoveryResponse` YAML). Rewritten
+    /// on each DNS-propagation event to update filter chains without a full
+    /// listener drain. The file between the `FILTER_CHAINS_BEGIN_MARKER`
+    /// and `FILTER_CHAINS_END_MARKER` comment markers is the only region
+    /// allowed to differ between generations.
+    pub envoy_listener_config: String,
     /// mitmproxy addon configuration (JSON).
     pub mitmproxy_config: String,
     /// CoreDNS policy file content (one domain per line).
     pub coredns_config: String,
 }
+
+impl CompiledPolicy {
+    /// Concatenation of the bootstrap and listener YAML.
+    ///
+    /// Intended for **tests and ad-hoc diagnostics** that need to assert
+    /// on the combined Envoy configuration without caring which file a
+    /// particular piece of content lives in. Production call sites
+    /// write each half to its own destination path and should use
+    /// [`Self::envoy_bootstrap_config`] / [`Self::envoy_listener_config`]
+    /// directly.
+    pub fn envoy_config_combined(&self) -> String {
+        format!(
+            "{bootstrap}\n# --- listener ---\n{listener}",
+            bootstrap = self.envoy_bootstrap_config,
+            listener = self.envoy_listener_config,
+        )
+    }
+}
+
+/// Absolute path inside the gateway container for the Envoy static bootstrap.
+///
+/// Written once per session by [`policy_distributor`](crate::policy_distributor)
+/// before Envoy starts. The bootstrap references the listener file at
+/// [`LISTENER_FILE_IN_CONTAINER`] via `dynamic_resources.lds_config`.
+pub const BOOTSTRAP_FILE_IN_CONTAINER: &str = "/etc/envoy/envoy-bootstrap.yaml";
+
+/// Absolute path inside the gateway container for the LDS-watched directory.
+///
+/// Envoy's filesystem LDS subscription is pinned to this directory so that
+/// `MovedTo` inotify events produced by atomic renames trigger a listener
+/// reload. See Envoy upstream issue `#20474`.
+pub const LISTENER_DIR_IN_CONTAINER: &str = "/etc/envoy/listeners";
+
+/// Basename of the LDS-watched listener file inside
+/// [`LISTENER_DIR_IN_CONTAINER`].
+pub const LISTENER_FILE_NAME: &str = "listener.yaml";
+
+/// Absolute path inside the gateway container for the LDS-served listener
+/// file.
+pub const LISTENER_FILE_IN_CONTAINER: &str = "/etc/envoy/listeners/listener.yaml";
+
+/// Marker comment demarcating the start of the mutable filter-chains region
+/// inside a listener file. Used by the atomic listener-file writer to
+/// enforce the "only filter chains differ between generations" invariant.
+pub const FILTER_CHAINS_BEGIN_MARKER: &str = "# >>> FILTER_CHAINS_BEGIN";
+
+/// Marker comment demarcating the end of the mutable filter-chains region.
+pub const FILTER_CHAINS_END_MARKER: &str = "# <<< FILTER_CHAINS_END";
 
 impl PolicyCompiler {
     /// Validate and compile a policy into per-component configurations.
@@ -557,13 +616,15 @@ impl PolicyCompiler {
         Self::validate(policy)?;
 
         let nftables_rules = Self::compile_nftables(policy, network_info);
-        let envoy_config = Self::compile_envoy(policy);
+        let envoy_bootstrap_config = Self::compile_envoy_bootstrap();
+        let envoy_listener_config = Self::compile_envoy_listener(policy);
         let mitmproxy_config = Self::compile_mitmproxy(policy);
         let coredns_config = Self::compile_coredns(policy);
 
         Ok(CompiledPolicy {
             nftables_rules,
-            envoy_config,
+            envoy_bootstrap_config,
+            envoy_listener_config,
             mitmproxy_config,
             coredns_config,
         })
@@ -775,23 +836,170 @@ impl PolicyCompiler {
         )
     }
 
-    /// Compile Envoy configuration for the policy.
+    /// Compile the Envoy **static bootstrap** config.
+    ///
+    /// Written once per session before Envoy starts. Contains:
+    /// - `admin` server on `127.0.0.1:9901`
+    /// - all clusters (both `original_dst` and `mitmproxy`) — cluster
+    ///   definitions never change during a session
+    /// - `dynamic_resources.lds_config` pointing at a filesystem `path` for
+    ///   the listener, with `watched_directory` set to the containing
+    ///   directory (Envoy's filesystem LDS watcher keys on `MovedTo`
+    ///   inotify events on the parent dir; see upstream issue `#20474`)
+    ///
+    /// The listener itself is served via LDS from
+    /// [`LISTENER_FILE_IN_CONTAINER`] — Envoy refuses to promote a
+    /// statically-defined listener to LDS mid-session, so the listener
+    /// must ship via LDS from session start.
+    ///
+    /// The bootstrap is policy-agnostic: it has the same content for every
+    /// session regardless of the policy rules. Per-policy content lives in
+    /// the listener file (see [`Self::compile_envoy_listener`]).
+    ///
+    /// Public because `gateway::create_gateway` also calls this to seed
+    /// the bootstrap file inside the container before Envoy starts.
+    pub fn compile_envoy_bootstrap() -> String {
+        // Cluster definitions. Both `original_dst` (L1 passthrough, L2
+        // TLS forwarding) and `mitmproxy` (L3 CONNECT-tunneled target)
+        // are defined statically. The `mitmproxy` cluster is defined
+        // here from M9-S18 onwards; no filter chain routes to it yet
+        // (that's M9-S19, which adds `tcp_proxy.tunneling_config`).
+        //
+        // `mitmproxy` cluster specifics:
+        // - `127.0.0.1:18080` — loopback-only; not a VM-facing DNAT
+        //   target. Port 18080 (rather than 8080) is a defence-in-depth
+        //   signal: an accidental DNAT back to 8080 would fail closed.
+        // - `typed_extension_protocol_options` pins HTTP/1.1 upstream
+        //   via `HttpProtocolOptions.explicit_http_config.http_protocol_options`.
+        //   mitmproxy does not implement HTTP/2 CONNECT (upstream issue
+        //   `#1138`), so HTTP/2 upstream would break the CONNECT tunnel
+        //   M9-S19 will wire up.
+        // - No `upstream_proxy_protocol` transport-socket wrapping. The
+        //   default `raw_buffer` upstream transport is used; the CONNECT
+        //   preface is (will be, in M9-S19) emitted by a per-chain
+        //   `tcp_proxy.tunneling_config`, not by a transport-socket
+        //   header.
+        // - TCP health check (1s timeout, 5s interval) so a dead
+        //   mitmproxy surfaces in Envoy admin stats.
+        //
+        //   Transient M9-S18 behaviour: until M9-S19 flips the
+        //   mitmproxy entrypoint to `--mode regular --listen-host
+        //   127.0.0.1 --listen-port 18080`, mitmproxy still listens on
+        //   `0.0.0.0:8080`, so this probe connects to a closed port
+        //   and fails on every 5s tick. Expect a steady drip of
+        //   "upstream cluster_mitmproxy health check failed" warnings
+        //   and a climbing `cluster.mitmproxy.health_check.failure`
+        //   stat for the duration of the one-session gap between
+        //   M9-S18 and M9-S19 landing. Operators seeing "mitmproxy
+        //   unhealthy" in `/clusters` during this window should treat
+        //   it as expected, not as a bug. The health check stays in
+        //   the cluster definition per spec — we're documenting the
+        //   transient, not gating it behind a feature flag.
+        let clusters_yaml = r#"    - name: original_dst
+      type: ORIGINAL_DST
+      lb_policy: CLUSTER_PROVIDED
+      connect_timeout: 10s
+    - name: mitmproxy
+      type: STATIC
+      lb_policy: ROUND_ROBIN
+      connect_timeout: 10s
+      load_assignment:
+        cluster_name: mitmproxy
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 18080
+      typed_extension_protocol_options:
+        envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+          "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+          explicit_http_config:
+            http_protocol_options: {}
+      health_checks:
+        - timeout: 1s
+          interval: 5s
+          no_traffic_interval: 5s
+          unhealthy_threshold: 2
+          healthy_threshold: 1
+          tcp_health_check: {}"#;
+
+        format!(
+            r#"# Envoy static bootstrap (generated by sandbox policy engine, M9-S18)
+#
+# The listener is served via LDS from a filesystem `path_config_source`;
+# sandboxd writes the listener file via an atomic rename so Envoy's
+# inotify watcher observes a `MovedTo` event (upstream issue `#20474`).
+# Cluster definitions never change mid-session, so they stay here.
+node:
+  id: sandbox-gateway
+  cluster: sandbox-gateway
+
+dynamic_resources:
+  lds_config:
+    resource_api_version: V3
+    path_config_source:
+      path: {listener_file}
+      watched_directory:
+        path: {listener_dir}
+
+static_resources:
+  clusters:
+{clusters_yaml}
+
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 9901
+"#,
+            listener_file = LISTENER_FILE_IN_CONTAINER,
+            listener_dir = LISTENER_DIR_IN_CONTAINER,
+            clusters_yaml = clusters_yaml,
+        )
+    }
+
+    /// Compile the Envoy **listener file** (LDS `DiscoveryResponse`).
+    ///
+    /// This is the only piece of Envoy config that changes during a
+    /// session's lifetime. It is written initially alongside the bootstrap
+    /// and will be rewritten by DNS propagation (wired up in M9-S19) on
+    /// each change to the resolved-IP set.
+    ///
+    /// The format is a filesystem-LDS `DiscoveryResponse` with a single
+    /// `envoy.config.listener.v3.Listener` resource. Between the
+    /// [`FILTER_CHAINS_BEGIN_MARKER`] and [`FILTER_CHAINS_END_MARKER`]
+    /// comment markers is the only region the atomic writer permits to
+    /// differ between generations — changes to the framing region (bind
+    /// address, `listener_filters`, `socket_options`, etc.) force a full
+    /// listener drain and reset existing connections, destroying the
+    /// connection-preservation property.
     ///
     /// Supports all assurance levels:
-    /// - Level 1 (transport): default filter chain with TCP passthrough to
-    ///   `original_dst`. nftables controls which IPs reach Envoy.
-    /// - Level 2 (TLS): SNI-matched filter chains forwarding to `original_dst`.
-    ///   The `tls_inspector` listener filter extracts SNI from ClientHello.
-    /// - Level 3 (full): SNI-matched filter chains forwarding to `mitmproxy`
-    ///   cluster (127.0.0.1:8080) for HTTPS inspection.
+    /// - Level 1 (transport): default filter chain with TCP passthrough
+    ///   to `original_dst`. nftables controls which IPs reach Envoy.
+    /// - Level 2 (TLS): SNI-matched filter chains forwarding to
+    ///   `original_dst`. The `tls_inspector` listener filter extracts
+    ///   SNI from ClientHello.
+    /// - Level 3 (full): SNI-matched filter chains forwarding to
+    ///   `original_dst` (passthrough). **M9-S18 preserves the
+    ///   pre-split chain shape byte-for-byte** so the cutover in
+    ///   M9-S19 is a clean, isolated change. L3 traffic is currently
+    ///   redirected to mitmproxy at the nftables level (`sandbox_l3`
+    ///   DNAT rules); Envoy does not yet route L3 to the `mitmproxy`
+    ///   cluster. That rewiring — and the per-chain
+    ///   `tcp_proxy.tunneling_config` that emits the CONNECT preface —
+    ///   lands in M9-S19.
     ///
-    /// When L2 or L3 rules are present, `tls_inspector` is added as a listener
-    /// filter. The `original_dst` listener filter is always present.
+    /// When L2 or L3 rules are present, `tls_inspector` is added as a
+    /// listener filter. The `original_dst` listener filter is always
+    /// present.
     ///
-    /// Filter chain ordering: L2/L3 SNI-matched chains first (order does not
-    /// matter among them since SNI matches are disjoint), then the L1 default
-    /// catch-all chain last.
-    fn compile_envoy(policy: &Policy) -> String {
+    /// Filter chain ordering: L2/L3 SNI-matched chains first (order does
+    /// not matter among them since SNI matches are disjoint), then the
+    /// L1 default catch-all chain last.
+    pub fn compile_envoy_listener(policy: &Policy) -> String {
         let has_transport = policy
             .rules
             .iter()
@@ -805,37 +1013,15 @@ impl PolicyCompiler {
             .iter()
             .any(|r| matches!(r.level, AssuranceLevel::Http { .. }));
 
-        // For a policy with only deny rules, or no rules at all, return a
-        // minimal Envoy config that rejects everything.
+        // For a policy with only deny rules, or no rules at all, return
+        // a listener with no filter chains — unmatched traffic is
+        // closed (Envoy has no default passthrough chain unless
+        // explicitly emitted by L1).
         if !has_transport && !has_tls && !has_http {
-            return Self::envoy_deny_all();
+            return Self::envoy_deny_all_listener();
         }
 
-        let needs_tls_inspector = has_tls || has_http;
-
-        // -- Listener filters ---------------------------------------------------
-
-        let mut listener_filters = Vec::new();
-
-        if needs_tls_inspector {
-            listener_filters.push(
-                r#"        - name: envoy.filters.listener.tls_inspector
-          typed_config:
-            "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector"#
-                    .to_string(),
-            );
-        }
-
-        listener_filters.push(
-            r#"        - name: envoy.filters.listener.original_dst
-          typed_config:
-            "@type": type.googleapis.com/envoy.extensions.filters.listener.original_dst.v3.OriginalDst"#
-                .to_string(),
-        );
-
-        let listener_filters_yaml = listener_filters.join("\n");
-
-        // -- Filter chains ------------------------------------------------------
+        // -- Filter chains -----------------------------------------------------
 
         let mut filter_chains = Vec::new();
 
@@ -848,31 +1034,34 @@ impl PolicyCompiler {
             let domain = rule.destination.to_string();
             let stat_name = Self::sanitize_stat_prefix(&domain);
             filter_chains.push(format!(
-                r#"        - filter_chain_match:
-            server_names: ["{domain}"]
-          filters:
-            - name: envoy.filters.network.tcp_proxy
-              typed_config:
-                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
-                cluster: original_dst
-                stat_prefix: level2_{stat_name}"#
+                r#"    - filter_chain_match:
+        server_names: ["{domain}"]
+      filters:
+        - name: envoy.filters.network.tcp_proxy
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+            cluster: original_dst
+            stat_prefix: level2_{stat_name}"#
             ));
         }
 
         // Level 3 (full): SNI-matched chains → original_dst (passthrough).
         //
-        // L3 traffic is redirected to mitmproxy at the nftables level
-        // (sandbox_l3 DNAT rules) which preserves SO_ORIGINAL_DST.
-        // Envoy MUST NOT route L3 traffic to the mitmproxy cluster
-        // directly because Envoy creates a new TCP connection to
-        // 127.0.0.1:8080, destroying the conntrack entry — mitmproxy's
-        // SO_ORIGINAL_DST then returns its own address and the request
-        // fails with "destination unknown".
+        // **M9-S18 note.** The listener file is emitted with today's
+        // filter-chain shape byte-for-byte so the split is purely
+        // additive — no traffic-path change, no new test baseline. L3
+        // traffic still reaches mitmproxy via the `sandbox_l3` nftables
+        // DNAT shortcut (which preserves `SO_ORIGINAL_DST`); Envoy does
+        // not yet route L3 to the `mitmproxy` cluster. That cutover is
+        // M9-S19, which wires each L3 chain through
+        // `tcp_proxy.tunneling_config` (HTTP/1.1 CONNECT) to the
+        // mitmproxy cluster defined in the static bootstrap.
         //
         // During the brief window before DNS propagation installs the
-        // sandbox_l3 rules (first ~2 seconds), L3 traffic falls through
-        // to Envoy and gets passthrough to the real server.  Once the
-        // sandbox_l3 rules are in place, traffic bypasses Envoy entirely.
+        // `sandbox_l3` rules (first ~2 seconds), L3 traffic falls
+        // through Envoy as opaque passthrough. Once the `sandbox_l3`
+        // rules are in place, traffic bypasses Envoy entirely. Both of
+        // these properties go away in M9-S19.
         for rule in policy
             .rules
             .iter()
@@ -881,89 +1070,114 @@ impl PolicyCompiler {
             let domain = rule.destination.to_string();
             let stat_name = Self::sanitize_stat_prefix(&domain);
             // Unrestricted wildcard (`*`) destination: Envoy's
-            // `filter_chain_match.server_names` does not accept a bare `*`,
-            // so emit a catch-all chain (no `filter_chain_match`) instead.
-            // The sandbox_l3 nftables redirect still handles the MITM
-            // path once DNS propagation installs it; Envoy is the pre-
-            // propagation fallback (opaque passthrough).
+            // `filter_chain_match.server_names` does not accept a bare
+            // `*`, so emit a catch-all chain (no `filter_chain_match`).
             if domain == "*" {
                 filter_chains.push(format!(
-                    r#"        - filters:
-            - name: envoy.filters.network.tcp_proxy
-              typed_config:
-                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
-                cluster: original_dst
-                stat_prefix: level3_{stat_name}"#
+                    r#"    - filters:
+        - name: envoy.filters.network.tcp_proxy
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+            cluster: original_dst
+            stat_prefix: level3_{stat_name}"#
                 ));
                 continue;
             }
             filter_chains.push(format!(
-                r#"        - filter_chain_match:
-            server_names: ["{domain}"]
-          filters:
-            - name: envoy.filters.network.tcp_proxy
-              typed_config:
-                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
-                cluster: original_dst
-                stat_prefix: level3_{stat_name}"#
+                r#"    - filter_chain_match:
+        server_names: ["{domain}"]
+      filters:
+        - name: envoy.filters.network.tcp_proxy
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+            cluster: original_dst
+            stat_prefix: level3_{stat_name}"#
             ));
         }
 
         // Level 1 (transport): default catch-all chain → original_dst.
-        // This must be last since it has no filter_chain_match and acts as the
-        // default route for traffic that does not match any SNI-specific chain.
+        // This must be last since it has no filter_chain_match and acts
+        // as the default route for traffic that does not match any
+        // SNI-specific chain.
         if has_transport {
             filter_chains.push(
-                r#"        - filters:
-            - name: envoy.filters.network.tcp_proxy
-              typed_config:
-                "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
-                stat_prefix: policy_tcp_passthrough
-                cluster: original_dst"#
+                r#"    - filters:
+        - name: envoy.filters.network.tcp_proxy
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+            stat_prefix: policy_tcp_passthrough
+            cluster: original_dst"#
                     .to_string(),
             );
         }
 
         let filter_chains_yaml = filter_chains.join("\n");
 
-        // -- Clusters -----------------------------------------------------------
+        Self::listener_yaml_for_filter_chains(&format!(
+            "    filter_chains:\n{filter_chains_yaml}"
+        ))
+    }
 
-        // original_dst is always needed (L1 passthrough and L2 forwarding).
-        let clusters = [r#"    - name: original_dst
-      type: ORIGINAL_DST
-      lb_policy: CLUSTER_PROVIDED
-      connect_timeout: 10s"#
-            .to_string()];
-
-        // Note: the mitmproxy cluster is no longer needed in Envoy.
-        // L3 traffic reaches mitmproxy via nftables sandbox_l3 DNAT
-        // rules (which preserve SO_ORIGINAL_DST), not through Envoy.
-
-        let clusters_yaml = clusters.join("\n");
-
+    /// Emit the listener YAML (head + filter-chains body + tail).
+    ///
+    /// The `filter_chains_body` argument contains the YAML fragment that
+    /// sits between [`FILTER_CHAINS_BEGIN_MARKER`] and
+    /// [`FILTER_CHAINS_END_MARKER`] — typically either `filter_chains: []`
+    /// (deny-all) or a populated `filter_chains:` list.
+    ///
+    /// This helper guarantees that every listener generation we emit has
+    /// the **same head and tail regions**, which is the core invariant
+    /// the atomic listener writer enforces: only the filter-chains body
+    /// may differ between generations, so Envoy's LDS update path does
+    /// not drain the listener or reset in-flight connections.
+    ///
+    /// In particular this means `listener_filters` is populated with the
+    /// same two filters (`tls_inspector`, `original_dst`) for every
+    /// policy — including deny-all — so an L1-only policy and an
+    /// L2/L3 policy can transition between each other without touching
+    /// the head region. The `tls_inspector` listener filter is a no-op
+    /// for non-TLS traffic (it simply peeks at the ClientHello and, if
+    /// none is present, lets the connection proceed), so carrying it in
+    /// every listener is correct.
+    fn listener_yaml_for_filter_chains(filter_chains_body: &str) -> String {
+        // Note: the preamble deliberately avoids embedding the literal
+        // marker strings. The sentinel comments below must each occur
+        // EXACTLY ONCE in the file so the atomic writer can split the
+        // content cleanly — embedding them in prose would confuse the
+        // split. The preamble therefore describes the markers in words.
         format!(
-            r#"# Envoy configuration (generated by sandbox policy engine)
-static_resources:
-  listeners:
-    - name: policy_listener
-      address:
-        socket_address:
-          address: 0.0.0.0
-          port_value: 10000
-      listener_filters:
-{listener_filters_yaml}
-      filter_chains:
-{filter_chains_yaml}
-
-  clusters:
-{clusters_yaml}
-
-admin:
-  address:
-    socket_address:
-      address: 127.0.0.1
-      port_value: 9901
-"#
+            r#"# Envoy listener (LDS DiscoveryResponse, generated by sandbox policy engine)
+#
+# Served via filesystem LDS from `{listener_file}`. sandboxd rewrites
+# this file via atomic rename — see `atomic_listener_writer` in
+# `sandbox-core`. Between any two generations, only the region framed
+# by the filter-chains BEGIN and END sentinel comments below is
+# permitted to differ; the writer enforces this invariant so that
+# connection preservation holds across filter-chain updates (Envoy
+# drains the listener on metadata, socket-option, bind-address, or
+# listener-filter changes).
+resources:
+  - "@type": type.googleapis.com/envoy.config.listener.v3.Listener
+    name: policy_listener
+    address:
+      socket_address:
+        address: 0.0.0.0
+        port_value: 10000
+    listener_filters:
+    - name: envoy.filters.listener.tls_inspector
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
+    - name: envoy.filters.listener.original_dst
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.listener.original_dst.v3.OriginalDst
+{begin_marker}
+{filter_chains_body}
+{end_marker}
+"#,
+            listener_file = LISTENER_FILE_IN_CONTAINER,
+            begin_marker = FILTER_CHAINS_BEGIN_MARKER,
+            end_marker = FILTER_CHAINS_END_MARKER,
+            filter_chains_body = filter_chains_body,
         )
     }
 
@@ -1094,28 +1308,57 @@ admin:
         Ok(())
     }
 
-    /// Generate a minimal Envoy config that has no filter chains (deny all).
-    fn envoy_deny_all() -> String {
-        r#"# Envoy configuration (generated by sandbox policy engine)
-# Deny-all: no filter chains configured.
-static_resources:
-  listeners:
-    - name: policy_listener
-      address:
-        socket_address:
-          address: 0.0.0.0
-          port_value: 10000
-      filter_chains: []
+    /// Emit the initial (pre-policy) Envoy listener file written before
+    /// Envoy first boots.
+    ///
+    /// This is identical to [`Self::envoy_deny_all_listener`] today — the
+    /// initial listener is a framed deny-all that Envoy loads successfully
+    /// but which closes every connection until the session policy is
+    /// applied. It is published as its own method so call sites document
+    /// the intent (first write vs. post-rollback recovery).
+    ///
+    /// # Behaviour change vs. pre-M9-S18
+    ///
+    /// Before M9-S18 the gateway shipped with `envoy-base.yaml` baked into
+    /// the container, which installed an **L1 pass-through** listener on
+    /// first boot. From M9-S18 onwards the bootstrap is policy-agnostic
+    /// and the day-one listener is served via LDS — and Envoy refuses to
+    /// promote a static listener to LDS mid-session, so the very first
+    /// listener published on the filesystem must itself be deliverable
+    /// via LDS. The simplest fail-closed default that satisfies this
+    /// constraint is a framed deny-all (empty `filter_chains`).
+    ///
+    /// For sessions started without a policy (`--clear` / no-policy
+    /// startup) this means the Envoy listener is deny-all instead of
+    /// L1 pass-through. Net user-visible behaviour is unchanged because
+    /// the nftables layers (`sandbox_policy`, `sandbox_l3`) gate traffic
+    /// first and are also empty on a no-policy session, and DNS is
+    /// deny-by-default since M9-S15. This is consistent with the
+    /// fail-closed design principle — no-policy sessions must not leak.
+    ///
+    /// M9-S19 replaces this default with the policy-driven L3 filter
+    /// chains; at that point the initial listener will carry the real
+    /// compiled chains rather than a deny-all placeholder.
+    pub fn compile_initial_envoy_listener() -> String {
+        Self::envoy_deny_all_listener()
+    }
 
-  clusters: []
-
-admin:
-  address:
-    socket_address:
-      address: 127.0.0.1
-      port_value: 9901
-"#
-        .to_string()
+    /// Emit a deny-all Envoy listener file (LDS `DiscoveryResponse`).
+    ///
+    /// Public so policy_distributor / gateway can emit it during
+    /// rollback and initial-boot scenarios without going through the
+    /// full `Policy` compilation path.
+    ///
+    /// The listener is still framed (bind address, empty
+    /// `listener_filters`, marker comments) so the writer invariant
+    /// check treats the transition to a populated policy as a pure
+    /// filter-chains diff, not a framing change.
+    pub fn envoy_deny_all_listener() -> String {
+        // Deny-all is just an empty filter_chains list wrapped in the
+        // common listener framing. Keeping the head/tail identical to
+        // the policy-compiled listener is what lets sandboxd swap in a
+        // populated policy without Envoy draining the listener.
+        Self::listener_yaml_for_filter_chains("    filter_chains: []")
     }
 }
 
@@ -1661,7 +1904,7 @@ mod tests {
 
         // Envoy: deny-all config.
         assert!(
-            compiled.envoy_config.contains("filter_chains: []"),
+            compiled.envoy_config_combined().contains("filter_chains: []"),
             "deny-all policy should produce empty Envoy filter chains"
         );
 
@@ -1821,15 +2064,15 @@ mod tests {
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
         assert!(
-            compiled.envoy_config.contains("tcp_proxy"),
+            compiled.envoy_config_combined().contains("tcp_proxy"),
             "Envoy config must include TCP proxy filter"
         );
         assert!(
-            compiled.envoy_config.contains("original_dst"),
+            compiled.envoy_config_combined().contains("original_dst"),
             "Envoy config must use original_dst cluster"
         );
         assert!(
-            compiled.envoy_config.contains("policy_listener"),
+            compiled.envoy_config_combined().contains("policy_listener"),
             "Envoy config must define policy_listener"
         );
     }
@@ -1842,7 +2085,7 @@ mod tests {
 
         assert!(
             compiled
-                .envoy_config
+                .envoy_config_combined()
                 .contains("envoy.filters.listener.original_dst"),
             "Envoy config must include original_dst listener filter"
         );
@@ -1855,7 +2098,7 @@ mod tests {
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
         assert!(
-            compiled.envoy_config.contains("9901"),
+            compiled.envoy_config_combined().contains("9901"),
             "Envoy config must include admin port 9901"
         );
     }
@@ -2408,14 +2651,14 @@ mod tests {
         // passthrough.  Pinned so a future compiler change cannot re-
         // introduce the invalid `server_names: ["*"]` shape.
         assert!(
-            compiled.envoy_config.contains("level3_wildcard"),
+            compiled.envoy_config_combined().contains("level3_wildcard"),
             "Envoy config must emit a level-3 chain for the `*` rule:\n{}",
-            compiled.envoy_config
+            compiled.envoy_config_combined()
         );
         assert!(
-            !compiled.envoy_config.contains("server_names: [\"*\"]"),
+            !compiled.envoy_config_combined().contains("server_names: [\"*\"]"),
             "Envoy config must NOT use `server_names: [\"*\"]` (invalid SNI match):\n{}",
-            compiled.envoy_config
+            compiled.envoy_config_combined()
         );
     }
 
@@ -2631,7 +2874,7 @@ mod tests {
 
         assert!(
             compiled
-                .envoy_config
+                .envoy_config_combined()
                 .contains("envoy.filters.listener.tls_inspector"),
             "L2 Envoy config must include tls_inspector listener filter"
         );
@@ -2645,13 +2888,13 @@ mod tests {
 
         assert!(
             compiled
-                .envoy_config
+                .envoy_config_combined()
                 .contains("server_names: [\"secure.example.com\"]"),
             "L2 Envoy config must have SNI match for secure.example.com"
         );
         assert!(
             compiled
-                .envoy_config
+                .envoy_config_combined()
                 .contains("server_names: [\"api.secure.io\"]"),
             "L2 Envoy config must have SNI match for api.secure.io"
         );
@@ -2665,11 +2908,11 @@ mod tests {
 
         // Both L2 filter chains should route to original_dst (no MITM).
         assert!(
-            compiled.envoy_config.contains("level2_secure_example_com"),
+            compiled.envoy_config_combined().contains("level2_secure_example_com"),
             "L2 filter chain should have level2_ stat prefix"
         );
         assert!(
-            compiled.envoy_config.contains("level2_api_secure_io"),
+            compiled.envoy_config_combined().contains("level2_api_secure_io"),
             "L2 filter chain should have level2_ stat prefix for second domain"
         );
     }
@@ -2682,22 +2925,30 @@ mod tests {
 
         assert!(
             compiled
-                .envoy_config
+                .envoy_config_combined()
                 .contains("envoy.filters.listener.original_dst"),
             "L2 Envoy config must still include original_dst listener filter"
         );
     }
 
     #[test]
-    fn compile_level2_no_mitmproxy_cluster() {
+    fn compile_level2_listener_does_not_route_to_mitmproxy() {
         let policy = tls_policy();
         let net = test_network_info();
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
-        // L2-only should not include mitmproxy cluster.
+        // As of M9-S18 the mitmproxy cluster is **always present in the
+        // bootstrap** — it is scaffolded now so that M9-S19's L3 cutover
+        // to HTTP/1.1 CONNECT tunnelling is a pure listener change. The
+        // behavioural guarantee for L2 is that no listener filter chain
+        // routes traffic to the mitmproxy cluster; L2 traffic must still
+        // flow through `original_dst`.
         assert!(
-            !compiled.envoy_config.contains("name: mitmproxy"),
-            "L2-only Envoy config should not include mitmproxy cluster"
+            !compiled
+                .envoy_listener_config
+                .contains("cluster: mitmproxy"),
+            "L2 listener must not route any filter chain to the mitmproxy cluster\nlistener:\n{}",
+            compiled.envoy_listener_config
         );
     }
 
@@ -2709,7 +2960,7 @@ mod tests {
 
         // Without L1 transport rules, there should be no default (unmatch) chain.
         assert!(
-            !compiled.envoy_config.contains("policy_tcp_passthrough"),
+            !compiled.envoy_config_combined().contains("policy_tcp_passthrough"),
             "L2-only Envoy config should not include a default passthrough chain"
         );
     }
@@ -2763,7 +3014,7 @@ mod tests {
 
         assert!(
             compiled
-                .envoy_config
+                .envoy_config_combined()
                 .contains("envoy.filters.listener.tls_inspector"),
             "L3 Envoy config must include tls_inspector listener filter"
         );
@@ -2777,7 +3028,7 @@ mod tests {
 
         assert!(
             compiled
-                .envoy_config
+                .envoy_config_combined()
                 .contains("server_names: [\"inspected.example.com\"]"),
             "L3 Envoy config must have SNI match for the inspected domain"
         );
@@ -2785,32 +3036,41 @@ mod tests {
         // The actual redirect to mitmproxy happens at the nftables
         // level (sandbox_l3 DNAT rules) to preserve SO_ORIGINAL_DST.
         assert!(
-            compiled.envoy_config.contains("cluster: original_dst"),
+            compiled.envoy_config_combined().contains("cluster: original_dst"),
             "L3 filter chain must route to original_dst (mitmproxy redirect is via nftables)"
         );
         assert!(
-            !compiled.envoy_config.contains("cluster: mitmproxy"),
+            !compiled.envoy_config_combined().contains("cluster: mitmproxy"),
             "L3 filter chain must NOT route to mitmproxy cluster (breaks SO_ORIGINAL_DST)"
         );
         assert!(
             compiled
-                .envoy_config
+                .envoy_config_combined()
                 .contains("level3_inspected_example_com"),
             "L3 filter chain should have level3_ stat prefix"
         );
     }
 
     #[test]
-    fn compile_level3_envoy_no_mitmproxy_cluster() {
+    fn compile_level3_listener_does_not_route_to_mitmproxy_yet() {
         let policy = full_policy();
         let net = test_network_info();
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
-        // mitmproxy cluster should not be in Envoy config — L3 traffic
-        // reaches mitmproxy via nftables sandbox_l3 DNAT rules, not Envoy.
+        // **M9-S18 semantics.** The mitmproxy cluster is defined in the
+        // static bootstrap from this session onwards, but no filter
+        // chain routes traffic to it yet — L3 traffic continues to reach
+        // mitmproxy via the `sandbox_l3` nftables DNAT shortcut
+        // established in M9-S6. M9-S19 will cut every L3 chain over to
+        // the mitmproxy cluster via `tcp_proxy.tunneling_config` and
+        // remove the `sandbox_l3` table.
         assert!(
-            !compiled.envoy_config.contains("name: mitmproxy"),
-            "L3 Envoy config must not define mitmproxy cluster"
+            !compiled
+                .envoy_listener_config
+                .contains("cluster: mitmproxy"),
+            "L3 listener must not route any filter chain to mitmproxy yet (that's M9-S19)\n\
+             listener:\n{}",
+            compiled.envoy_listener_config
         );
     }
 
@@ -2874,13 +3134,13 @@ mod tests {
 
         assert!(
             compiled
-                .envoy_config
+                .envoy_config_combined()
                 .contains("envoy.filters.listener.tls_inspector"),
             "mixed policy must include tls_inspector"
         );
         assert!(
             compiled
-                .envoy_config
+                .envoy_config_combined()
                 .contains("envoy.filters.listener.original_dst"),
             "mixed policy must include original_dst listener filter"
         );
@@ -2895,25 +3155,25 @@ mod tests {
         // L2 SNI chain
         assert!(
             compiled
-                .envoy_config
+                .envoy_config_combined()
                 .contains("server_names: [\"pinned.example.com\"]"),
             "mixed policy must have L2 SNI chain"
         );
         assert!(
-            compiled.envoy_config.contains("level2_pinned_example_com"),
+            compiled.envoy_config_combined().contains("level2_pinned_example_com"),
             "mixed policy must have L2 stat prefix"
         );
 
         // L3 SNI chain
         assert!(
             compiled
-                .envoy_config
+                .envoy_config_combined()
                 .contains("server_names: [\"monitored.example.com\"]"),
             "mixed policy must have L3 SNI chain"
         );
         assert!(
             compiled
-                .envoy_config
+                .envoy_config_combined()
                 .contains("level3_monitored_example_com"),
             "mixed policy must have L3 stat prefix"
         );
@@ -2926,7 +3186,7 @@ mod tests {
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
         assert!(
-            compiled.envoy_config.contains("policy_tcp_passthrough"),
+            compiled.envoy_config_combined().contains("policy_tcp_passthrough"),
             "mixed policy must have L1 default passthrough chain"
         );
     }
@@ -2941,11 +3201,11 @@ mod tests {
         // the SNI-specific chains. We verify by checking that
         // "policy_tcp_passthrough" appears after all "server_names" entries.
         let passthrough_pos = compiled
-            .envoy_config
+            .envoy_config_combined()
             .find("policy_tcp_passthrough")
             .expect("must contain passthrough");
         let last_sni_pos = compiled
-            .envoy_config
+            .envoy_config_combined()
             .rfind("server_names")
             .expect("must contain server_names");
         assert!(
@@ -2955,19 +3215,32 @@ mod tests {
     }
 
     #[test]
-    fn compile_mixed_l1_l2_l3_envoy_has_original_dst_cluster() {
+    fn compile_mixed_l1_l2_l3_bootstrap_has_both_clusters() {
         let policy = mixed_l1_l2_l3_policy();
         let net = test_network_info();
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
+        // As of M9-S18 the bootstrap defines **both** clusters
+        // (`original_dst` and `mitmproxy`) on every session regardless
+        // of policy content. The `mitmproxy` cluster is scaffolded so
+        // M9-S19's cutover is an isolated listener change.
         assert!(
-            compiled.envoy_config.contains("name: original_dst"),
-            "mixed policy must have original_dst cluster"
+            compiled
+                .envoy_bootstrap_config
+                .contains("name: original_dst"),
+            "bootstrap must define the original_dst cluster"
         );
-        // mitmproxy cluster is no longer in Envoy — L3 redirects via nftables.
         assert!(
-            !compiled.envoy_config.contains("name: mitmproxy"),
-            "mixed policy must not have mitmproxy cluster (L3 via nftables)"
+            compiled.envoy_bootstrap_config.contains("name: mitmproxy"),
+            "bootstrap must define the mitmproxy cluster (M9-S18+)"
+        );
+        // The behavioural guarantee survives the split: the listener
+        // must not yet route traffic to mitmproxy (that's M9-S19).
+        assert!(
+            !compiled
+                .envoy_listener_config
+                .contains("cluster: mitmproxy"),
+            "listener must not route to mitmproxy yet"
         );
     }
 
@@ -3037,13 +3310,13 @@ mod tests {
         // supports wildcard SNI matching in filter_chain_match.
         assert!(
             compiled
-                .envoy_config
+                .envoy_config_combined()
                 .contains("server_names: [\"*.example.com\"]"),
             "wildcard domain should appear in SNI match"
         );
         assert!(
             compiled
-                .envoy_config
+                .envoy_config_combined()
                 .contains("level2_wildcard_example_com"),
             "wildcard stat prefix should use 'wildcard' replacement"
         );
@@ -3067,21 +3340,21 @@ mod tests {
 
         assert!(
             compiled
-                .envoy_config
+                .envoy_config_combined()
                 .contains("server_names: [\"*.inspected.io\"]"),
             "wildcard domain should appear in L3 SNI match"
         );
         assert!(
-            compiled.envoy_config.contains("cluster: original_dst"),
+            compiled.envoy_config_combined().contains("cluster: original_dst"),
             "wildcard L3 chain must route to original_dst (mitmproxy redirect via nftables)"
         );
         assert!(
-            !compiled.envoy_config.contains("cluster: mitmproxy"),
+            !compiled.envoy_config_combined().contains("cluster: mitmproxy"),
             "wildcard L3 chain must not route to mitmproxy cluster"
         );
         assert!(
             compiled
-                .envoy_config
+                .envoy_config_combined()
                 .contains("level3_wildcard_inspected_io"),
             "wildcard L3 stat prefix should use 'wildcard' replacement"
         );
@@ -3120,22 +3393,22 @@ mod tests {
         // Each L2 destination gets its own filter chain.
         assert!(
             compiled
-                .envoy_config
+                .envoy_config_combined()
                 .contains("server_names: [\"a.example.com\"]")
         );
         assert!(
             compiled
-                .envoy_config
+                .envoy_config_combined()
                 .contains("server_names: [\"b.example.com\"]")
         );
         assert!(
             compiled
-                .envoy_config
+                .envoy_config_combined()
                 .contains("server_names: [\"c.example.com\"]")
         );
 
         // All route to original_dst (not mitmproxy).
-        assert!(!compiled.envoy_config.contains("cluster: mitmproxy"));
+        assert!(!compiled.envoy_config_combined().contains("cluster: mitmproxy"));
     }
 
     #[test]
@@ -3167,16 +3440,16 @@ mod tests {
         // Both L3 destinations get SNI chains to original_dst (L3 redirect via nftables).
         assert!(
             compiled
-                .envoy_config
+                .envoy_config_combined()
                 .contains("server_names: [\"api.one.com\"]")
         );
         assert!(
             compiled
-                .envoy_config
+                .envoy_config_combined()
                 .contains("server_names: [\"api.two.com\"]")
         );
         assert!(
-            !compiled.envoy_config.contains("cluster: mitmproxy"),
+            !compiled.envoy_config_combined().contains("cluster: mitmproxy"),
             "L3 filter chains must not route to mitmproxy cluster"
         );
 
@@ -3216,12 +3489,12 @@ mod tests {
 
         // Without L1 rules, no default passthrough chain.
         assert!(
-            !compiled.envoy_config.contains("policy_tcp_passthrough"),
+            !compiled.envoy_config_combined().contains("policy_tcp_passthrough"),
             "L2-only should not have a default passthrough chain"
         );
 
         // But should still have original_dst cluster (for L2 forwarding).
-        assert!(compiled.envoy_config.contains("name: original_dst"));
+        assert!(compiled.envoy_config_combined().contains("name: original_dst"));
     }
 
     // -- L3-only policy (no L1) does not produce default chain ----------------
@@ -3233,7 +3506,7 @@ mod tests {
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
         assert!(
-            !compiled.envoy_config.contains("policy_tcp_passthrough"),
+            !compiled.envoy_config_combined().contains("policy_tcp_passthrough"),
             "L3-only should not have a default passthrough chain"
         );
     }
@@ -3264,17 +3537,26 @@ mod tests {
         );
     }
 
-    // -- L1-only policy still has no tls_inspector ----------------------------
+    // -- M9-S18 invariant: listener framing is identical across policies ----
+    //
+    // Every listener generation (deny-all, L1-only, L2, L3, mixed) must
+    // share the same `listener_filters` block so the atomic listener
+    // writer can transition between them without draining the listener.
+    // As a consequence `tls_inspector` is now present in every listener
+    // — it is a no-op for non-TLS traffic and is necessary for L2/L3
+    // SNI-based filter_chain_match routing.
 
     #[test]
-    fn compile_level1_no_tls_inspector() {
+    fn compile_level1_includes_tls_inspector_for_framing_stability() {
         let policy = transport_policy();
         let net = test_network_info();
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
         assert!(
-            !compiled.envoy_config.contains("tls_inspector"),
-            "L1-only policy should NOT include tls_inspector"
+            compiled.envoy_config_combined().contains("tls_inspector"),
+            "M9-S18: L1-only listener must include tls_inspector so the \
+             listener-filters block stays identical across LDS generations \
+             (required by the atomic listener writer's invariant)"
         );
     }
 
@@ -3287,7 +3569,7 @@ mod tests {
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
         assert!(
-            compiled.envoy_config.contains("9901"),
+            compiled.envoy_config_combined().contains("9901"),
             "L2 Envoy config must include admin port 9901"
         );
     }
@@ -3299,8 +3581,315 @@ mod tests {
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
         assert!(
-            compiled.envoy_config.contains("9901"),
+            compiled.envoy_config_combined().contains("9901"),
             "L3 Envoy config must include admin port 9901"
         );
+    }
+
+    // -- M9-S18: Bootstrap / listener split -----------------------------------
+    //
+    // These tests verify the xDS-based split introduced in M9-S18. The
+    // invariants under test are:
+    //   * The bootstrap is policy-agnostic and contains the LDS config,
+    //     both clusters (`original_dst` + `mitmproxy`), and the admin
+    //     endpoint.
+    //   * The mitmproxy cluster carries the HTTP/1.1 pin required by
+    //     mitmproxy's lack of HTTP/2 CONNECT support (upstream `#1138`)
+    //     and a TCP health check.
+    //   * The listener file is framed by the filter-chains marker
+    //     comments and is written through the filesystem LDS path.
+    //   * The listener file emitted today still routes every filter
+    //     chain to `original_dst` (M9-S19 performs the L3 → mitmproxy
+    //     cutover).
+
+    #[test]
+    fn bootstrap_is_policy_agnostic() {
+        let net = test_network_info();
+        let deny_all = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![],
+        };
+        let compiled_deny = PolicyCompiler::compile(&deny_all, &net).unwrap();
+        let compiled_l1 = PolicyCompiler::compile(&transport_policy(), &net).unwrap();
+        let compiled_l2 = PolicyCompiler::compile(&tls_policy(), &net).unwrap();
+        let compiled_l3 = PolicyCompiler::compile(&full_policy(), &net).unwrap();
+
+        // Every policy produces the exact same bootstrap content —
+        // changes go into the listener file, not the bootstrap.
+        assert_eq!(
+            compiled_deny.envoy_bootstrap_config,
+            compiled_l1.envoy_bootstrap_config
+        );
+        assert_eq!(
+            compiled_l1.envoy_bootstrap_config,
+            compiled_l2.envoy_bootstrap_config
+        );
+        assert_eq!(
+            compiled_l2.envoy_bootstrap_config,
+            compiled_l3.envoy_bootstrap_config
+        );
+    }
+
+    #[test]
+    fn bootstrap_contains_lds_config_pointing_at_listener_file() {
+        let compiled = PolicyCompiler::compile(&tls_policy(), &test_network_info()).unwrap();
+        let bootstrap = &compiled.envoy_bootstrap_config;
+
+        assert!(
+            bootstrap.contains("dynamic_resources:"),
+            "bootstrap must carry dynamic_resources:\n{bootstrap}"
+        );
+        assert!(
+            bootstrap.contains("lds_config:"),
+            "bootstrap must carry lds_config:\n{bootstrap}"
+        );
+        assert!(
+            bootstrap.contains("path_config_source:"),
+            "bootstrap must use path_config_source for filesystem LDS:\n{bootstrap}"
+        );
+        assert!(
+            bootstrap.contains(&format!("path: {LISTENER_FILE_IN_CONTAINER}")),
+            "lds_config.path must point at {LISTENER_FILE_IN_CONTAINER}\n{bootstrap}"
+        );
+        assert!(
+            bootstrap.contains("watched_directory:"),
+            "lds_config must set watched_directory (required for MovedTo inotify events, upstream #20474):\n{bootstrap}"
+        );
+        assert!(
+            bootstrap.contains(&format!("path: {LISTENER_DIR_IN_CONTAINER}")),
+            "watched_directory must be {LISTENER_DIR_IN_CONTAINER}\n{bootstrap}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_has_no_static_listener() {
+        let compiled = PolicyCompiler::compile(&tls_policy(), &test_network_info()).unwrap();
+        let bootstrap = &compiled.envoy_bootstrap_config;
+
+        // Envoy refuses to promote a statically-declared listener to
+        // LDS mid-session. The bootstrap therefore **must not** declare
+        // any listener — `static_resources` is clusters-only.
+        assert!(
+            !bootstrap.contains("listeners:"),
+            "bootstrap must not declare a static listener (breaks LDS handover):\n{bootstrap}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_defines_mitmproxy_cluster_with_http11_pin() {
+        let compiled = PolicyCompiler::compile(&tls_policy(), &test_network_info()).unwrap();
+        let bootstrap = &compiled.envoy_bootstrap_config;
+
+        assert!(
+            bootstrap.contains("name: mitmproxy"),
+            "bootstrap must define the mitmproxy cluster:\n{bootstrap}"
+        );
+        assert!(
+            bootstrap.contains("address: 127.0.0.1"),
+            "mitmproxy cluster must target loopback 127.0.0.1:\n{bootstrap}"
+        );
+        assert!(
+            bootstrap.contains("port_value: 18080"),
+            "mitmproxy cluster must target port 18080 (not 8080 — see design spec):\n{bootstrap}"
+        );
+        assert!(
+            bootstrap.contains("envoy.extensions.upstreams.http.v3.HttpProtocolOptions"),
+            "mitmproxy cluster must pin HTTP/1.1 upstream via HttpProtocolOptions (mitmproxy lacks HTTP/2 CONNECT — upstream #1138):\n{bootstrap}"
+        );
+        assert!(
+            bootstrap.contains("explicit_http_config:"),
+            "HttpProtocolOptions must use explicit_http_config:\n{bootstrap}"
+        );
+        assert!(
+            bootstrap.contains("http_protocol_options: {}"),
+            "explicit_http_config must select http_protocol_options (HTTP/1.1 — not http2_protocol_options):\n{bootstrap}"
+        );
+    }
+
+    #[test]
+    fn mitmproxy_cluster_has_tcp_health_check() {
+        let compiled = PolicyCompiler::compile(&tls_policy(), &test_network_info()).unwrap();
+        let bootstrap = &compiled.envoy_bootstrap_config;
+
+        // TCP health check — 1s timeout, 5s interval, failing after 2
+        // unhealthy probes. A dead mitmproxy surfaces in Envoy admin
+        // stats so operators can detect it before traffic impact.
+        assert!(
+            bootstrap.contains("tcp_health_check:"),
+            "mitmproxy cluster must declare a tcp_health_check:\n{bootstrap}"
+        );
+        assert!(
+            bootstrap.contains("timeout: 1s"),
+            "tcp health-check must use 1s timeout:\n{bootstrap}"
+        );
+        assert!(
+            bootstrap.contains("interval: 5s"),
+            "tcp health-check must use 5s interval:\n{bootstrap}"
+        );
+    }
+
+    #[test]
+    fn mitmproxy_cluster_has_no_upstream_proxy_protocol_wrapper() {
+        let compiled = PolicyCompiler::compile(&tls_policy(), &test_network_info()).unwrap();
+        let bootstrap = &compiled.envoy_bootstrap_config;
+
+        // The design spec explicitly forbids wrapping the upstream
+        // transport socket in PROXY protocol. The CONNECT preface for
+        // M9-S19 is emitted via per-chain `tcp_proxy.tunneling_config`,
+        // not via a transport-socket header.
+        assert!(
+            !bootstrap.contains("upstream_proxy_protocol"),
+            "mitmproxy cluster must NOT wrap its transport in upstream_proxy_protocol:\n{bootstrap}"
+        );
+    }
+
+    #[test]
+    fn listener_file_is_framed_by_filter_chains_markers() {
+        let compiled = PolicyCompiler::compile(&tls_policy(), &test_network_info()).unwrap();
+        let listener = &compiled.envoy_listener_config;
+
+        assert!(
+            listener.contains(FILTER_CHAINS_BEGIN_MARKER),
+            "listener must contain BEGIN marker '{FILTER_CHAINS_BEGIN_MARKER}':\n{listener}"
+        );
+        assert!(
+            listener.contains(FILTER_CHAINS_END_MARKER),
+            "listener must contain END marker '{FILTER_CHAINS_END_MARKER}':\n{listener}"
+        );
+
+        let begin = listener.find(FILTER_CHAINS_BEGIN_MARKER).unwrap();
+        let end = listener.find(FILTER_CHAINS_END_MARKER).unwrap();
+        assert!(
+            begin < end,
+            "BEGIN marker must precede END marker\n{listener}"
+        );
+
+        // The region between the markers must contain `filter_chains:`.
+        let between = &listener[begin + FILTER_CHAINS_BEGIN_MARKER.len()..end];
+        assert!(
+            between.contains("filter_chains:"),
+            "mutable region must carry the filter_chains: key\nbetween:\n{between}"
+        );
+    }
+
+    #[test]
+    fn listener_file_is_lds_discovery_response() {
+        let compiled = PolicyCompiler::compile(&tls_policy(), &test_network_info()).unwrap();
+        let listener = &compiled.envoy_listener_config;
+
+        assert!(
+            listener.contains("resources:"),
+            "listener file must be an LDS DiscoveryResponse (needs `resources:`):\n{listener}"
+        );
+        assert!(
+            listener.contains("type.googleapis.com/envoy.config.listener.v3.Listener"),
+            "LDS resource must carry the v3.Listener type URL:\n{listener}"
+        );
+        assert!(
+            listener.contains("name: policy_listener"),
+            "listener must be named `policy_listener`:\n{listener}"
+        );
+    }
+
+    #[test]
+    fn initial_listener_helper_matches_deny_all() {
+        // The initial listener written at gateway-create time is the
+        // same as the deny-all listener. Keeping them equal means the
+        // atomic writer's invariant check treats the first post-policy
+        // write as a pure filter_chains diff.
+        assert_eq!(
+            PolicyCompiler::compile_initial_envoy_listener(),
+            PolicyCompiler::envoy_deny_all_listener()
+        );
+    }
+
+    #[test]
+    fn listener_routes_every_chain_to_original_dst_today() {
+        // M9-S18 preserves today's chain shape byte-for-byte. Every
+        // filter chain — L1, L2, L3 — must still target the
+        // `original_dst` cluster so this session is purely additive.
+        // M9-S19 flips L3 chains over to the `mitmproxy` cluster via
+        // `tcp_proxy.tunneling_config`.
+        let compiled = PolicyCompiler::compile(&full_policy(), &test_network_info()).unwrap();
+        let listener = &compiled.envoy_listener_config;
+
+        assert!(
+            listener.contains("cluster: original_dst"),
+            "listener must have at least one chain routing to original_dst:\n{listener}"
+        );
+        assert!(
+            !listener.contains("cluster: mitmproxy"),
+            "M9-S18 listener must NOT yet route any chain to mitmproxy (cutover is M9-S19):\n{listener}"
+        );
+    }
+
+    /// Split a listener YAML into (head, middle, tail) at the filter-chains
+    /// markers. Mirrors `atomic_listener_writer::split_at_markers`.
+    fn listener_head_middle_tail(listener: &str) -> (String, String, String) {
+        let begin = listener
+            .find(FILTER_CHAINS_BEGIN_MARKER)
+            .expect("listener must contain BEGIN marker");
+        let after_begin = begin + FILTER_CHAINS_BEGIN_MARKER.len();
+        let end_rel = listener[after_begin..]
+            .find(FILTER_CHAINS_END_MARKER)
+            .expect("listener must contain END marker");
+        let end = after_begin + end_rel;
+        (
+            listener[..begin].to_string(),
+            listener[after_begin..end].to_string(),
+            listener[end + FILTER_CHAINS_END_MARKER.len()..].to_string(),
+        )
+    }
+
+    /// CRITICAL M9-S18 INVARIANT: the listener file's head and tail regions
+    /// (everything outside the filter-chains markers) must be IDENTICAL
+    /// across every policy shape, otherwise
+    /// [`AtomicListenerWriter`](crate::atomic_listener_writer::AtomicListenerWriter)
+    /// will reject the transition with
+    /// [`ListenerWriteError::InvariantViolated`](crate::atomic_listener_writer::ListenerWriteError::InvariantViolated)
+    /// and policy updates will fail.
+    ///
+    /// This test caught a regression where `listener_filters` was emitted
+    /// conditionally (only when `has_tls || has_http`), so a transition
+    /// from the deny-all initial listener to an L1-only policy differed in
+    /// the head region and was rejected by the writer — breaking every
+    /// policy-applying E2E test.
+    #[test]
+    fn listener_framing_is_identical_across_policy_shapes() {
+        // Reference: the deny-all initial listener that sandboxd seeds
+        // into the bind-mount before Envoy starts.
+        let (ref_head, _, ref_tail) =
+            listener_head_middle_tail(&PolicyCompiler::envoy_deny_all_listener());
+
+        // Exercise every distinct policy shape and confirm that each
+        // listener's head/tail matches the reference exactly.
+        let empty_policy = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![],
+        };
+        let shapes: Vec<(&str, Policy)> = vec![
+            ("empty policy (deny-all)", empty_policy),
+            ("transport-only (L1)", transport_policy()),
+            ("tls-only (L2)", tls_policy()),
+            ("http-only (L3)", full_policy()),
+            ("http-with-constraints (L3)", full_policy_with_constraints()),
+        ];
+
+        for (label, policy) in shapes {
+            let compiled = PolicyCompiler::compile(&policy, &test_network_info()).unwrap();
+            let (head, _, tail) = listener_head_middle_tail(&compiled.envoy_listener_config);
+            assert_eq!(
+                head, ref_head,
+                "policy shape `{label}` produced a DIFFERENT head region — \
+                 this will break the atomic listener writer's invariant:\n\
+                 expected head:\n{ref_head}\n\nactual head:\n{head}"
+            );
+            assert_eq!(
+                tail, ref_tail,
+                "policy shape `{label}` produced a DIFFERENT tail region — \
+                 this will break the atomic listener writer's invariant:\n\
+                 expected tail:\n{ref_tail}\n\nactual tail:\n{tail}"
+            );
+        }
     }
 }

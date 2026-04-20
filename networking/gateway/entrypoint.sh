@@ -11,6 +11,17 @@
 #
 # nftables rules are managed externally by sandboxd, not by this script.
 #
+# **M9-S18**: Envoy config is split into a **static bootstrap**
+# (`/etc/envoy/envoy-bootstrap.yaml`) and a **dynamic listener file** served
+# via filesystem LDS from `/etc/envoy/listeners/listener.yaml`. The bootstrap
+# is written into the tmpfs by sandboxd via `docker exec` right after the
+# container starts; the listener directory is a bind-mount from the host so
+# sandboxd can atomically rewrite the listener file via host-side rename
+# (Envoy's filesystem LDS watcher only fires on `MovedTo` inotify events —
+# upstream issue `#20474`). Changes to the listener are picked up via xDS
+# without process restart, so the SIGHUP restart handler used before M9-S18
+# has been removed.
+#
 # If any process exits, this script logs the failure and exits non-zero
 # so Docker can restart the container.
 
@@ -18,6 +29,9 @@ set -euo pipefail
 
 LOG_DIR="${LOG_DIR:-/var/log/gateway}"
 READY_TIMEOUT="${READY_TIMEOUT:-30}"
+ENVOY_BOOTSTRAP_FILE="${ENVOY_BOOTSTRAP_FILE:-/etc/envoy/envoy-bootstrap.yaml}"
+ENVOY_LISTENER_FILE="${ENVOY_LISTENER_FILE:-/etc/envoy/listeners/listener.yaml}"
+ENVOY_CONFIG_WAIT_TIMEOUT="${ENVOY_CONFIG_WAIT_TIMEOUT:-30}"
 
 # Ensure runtime directories exist (tmpfs mounts wipe them out).
 mkdir -p "${LOG_DIR}" /tmp/mitmproxy
@@ -70,22 +84,11 @@ on_signal() {
 
 trap on_signal SIGTERM SIGINT SIGQUIT
 
-# ── SIGHUP handler: restart Envoy with updated config ──────────────
-
-restart_envoy() {
-    log "Restarting Envoy with updated config..."
-    kill "$ENVOY_PID" 2>/dev/null
-    wait "$ENVOY_PID" 2>/dev/null
-    envoy \
-        -c /etc/envoy/envoy.yaml \
-        --log-level warning \
-        --log-path "${LOG_DIR}/envoy.log" \
-        &
-    ENVOY_PID=$!
-    log "Envoy restarted (PID=${ENVOY_PID})"
-}
-
-trap restart_envoy HUP
+# M9-S18: Envoy configuration now updates via xDS (filesystem LDS for
+# listener, in-process cluster definitions for clusters). A SIGHUP-driven
+# process restart would drain the listener and reset in-flight
+# connections, defeating the whole point of the xDS path. The previous
+# SIGHUP restart trap has therefore been removed.
 
 # ── Readiness checks ────────────────────────────────────────────────
 
@@ -138,14 +141,25 @@ wait_for_ready "mitmproxy" \
 
 # ── Start Envoy ─────────────────────────────────────────────────────
 
-# Copy base Envoy config from read-only /opt/envoy into the writable /etc/envoy
-# tmpfs. PolicyDistributor will overwrite this when a policy is applied.
-mkdir -p /etc/envoy
-cp /opt/envoy/envoy-base.yaml /etc/envoy/envoy.yaml
+# M9-S18: the bootstrap config is written into the tmpfs at
+# ${ENVOY_BOOTSTRAP_FILE} by sandboxd right after `docker run` (via
+# `docker exec`). The listener file at ${ENVOY_LISTENER_FILE} lives in a
+# bind-mounted host directory and is seeded by sandboxd before the
+# container starts. Wait for both to appear before launching Envoy so we
+# don't race sandboxd's bootstrap write on first boot.
+mkdir -p "$(dirname "${ENVOY_BOOTSTRAP_FILE}")" "$(dirname "${ENVOY_LISTENER_FILE}")"
 
-log "Starting Envoy..."
+wait_for_ready "Envoy bootstrap file" \
+    "[[ -s '${ENVOY_BOOTSTRAP_FILE}' ]]" \
+    "${ENVOY_CONFIG_WAIT_TIMEOUT}"
+
+wait_for_ready "Envoy listener file" \
+    "[[ -s '${ENVOY_LISTENER_FILE}' ]]" \
+    "${ENVOY_CONFIG_WAIT_TIMEOUT}"
+
+log "Starting Envoy (bootstrap=${ENVOY_BOOTSTRAP_FILE})..."
 envoy \
-    -c /etc/envoy/envoy.yaml \
+    -c "${ENVOY_BOOTSTRAP_FILE}" \
     --log-level warning \
     --log-path "${LOG_DIR}/envoy.log" \
     &

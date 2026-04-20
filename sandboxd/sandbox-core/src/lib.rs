@@ -1,4 +1,5 @@
 pub mod api;
+pub mod atomic_listener_writer;
 pub mod ca;
 pub mod dns_propagation;
 pub mod error;
@@ -19,6 +20,10 @@ pub use api::{
     FileUploadRequest, GatewayHealth, NetworkHealth, PolicyDto, PolicyLevelDto, PolicyRuleDto,
     SessionConfigDto, SessionDto, SessionHealth, UpdatePolicyRequest,
 };
+pub use atomic_listener_writer::{
+    AtomicListenerWriter, LISTENER_HOST_ROOT, ListenerWriteError, session_listener_host_dir,
+    session_listener_host_path,
+};
 pub use ca::{CaManager, generate_ca_inject_script};
 pub use dns_propagation::{
     DnsCache, DnsCacheEntry, DnsChange, DnsChangeType, ResolvedMapping, ResolvedReport,
@@ -34,8 +39,10 @@ pub use guest::{
 pub use lima::{BaseImageMeta, BaseImageStatus, LimaManager, VmInfo, VmStatus, guest_agent_path};
 pub use network::{NetworkInfo, NetworkManager};
 pub use policy::{
-    AssuranceLevel, CompiledPolicy, CoreDnsConfig, Destination, HttpFilter, HttpMethod,
-    MitmproxyConfig, MitmproxyFilter, MitmproxyRule, Policy, PolicyCompiler, PolicyRule, Protocol,
+    AssuranceLevel, BOOTSTRAP_FILE_IN_CONTAINER, CompiledPolicy, CoreDnsConfig, Destination,
+    FILTER_CHAINS_BEGIN_MARKER, FILTER_CHAINS_END_MARKER, HttpFilter, HttpMethod,
+    LISTENER_DIR_IN_CONTAINER, LISTENER_FILE_IN_CONTAINER, LISTENER_FILE_NAME, MitmproxyConfig,
+    MitmproxyFilter, MitmproxyRule, Policy, PolicyCompiler, PolicyRule, Protocol,
 };
 pub use policy_distributor::{PolicyDistributor, write_file_to_container};
 pub use process::run_with_timeout;

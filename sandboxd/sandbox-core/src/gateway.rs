@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::thread;
@@ -5,8 +6,12 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
+use crate::atomic_listener_writer::{
+    AtomicListenerWriter, session_listener_host_dir, session_listener_host_path,
+};
 use crate::error::SandboxError;
 use crate::network::NetworkInfo;
+use crate::policy::{LISTENER_DIR_IN_CONTAINER, PolicyCompiler};
 use crate::process::run_with_timeout;
 use crate::session::SessionId;
 
@@ -145,6 +150,64 @@ impl GatewayManager {
             }
         }
 
+        // Pre-setup: ensure the per-session listener host directory exists
+        // and seed it with the initial LDS listener file before `docker run`.
+        //
+        // Envoy's filesystem LDS watches a directory for `MovedTo` inotify
+        // events (upstream `#20474`). Sandboxd bind-mounts this host dir
+        // into the container as [`LISTENER_DIR_IN_CONTAINER`] — when
+        // sandboxd atomically replaces the listener file via host-side
+        // `fs::rename`, the rename produces a `MovedTo` event visible to
+        // Envoy's watcher inside the container.
+        //
+        // The initial listener file is a deny-all listener (no filter
+        // chains) written now so Envoy has something valid to load on
+        // first boot. PolicyDistributor rewrites it later when the
+        // session policy is applied.
+        //
+        // Pre-M9-S18 the gateway container shipped with `envoy-base.yaml`
+        // baked in, which installed an L1 pass-through listener on first
+        // boot. From M9-S18 onwards the bootstrap is policy-agnostic and
+        // the day-one listener is served via LDS — so the initial
+        // listener must itself be deliverable via LDS, and the simplest
+        // fail-closed default is deny-all. For sessions started without
+        // a policy, this means the Envoy listener is deny-all rather
+        // than L1 pass-through; net user-visible behaviour is unchanged
+        // because the nftables layers (`sandbox_policy`, `sandbox_l3`)
+        // gate traffic first and are also empty on a no-policy session,
+        // and DNS is deny-by-default since M9-S15. M9-S19 replaces this
+        // default with the policy-driven L3 filter chains. See
+        // `PolicyCompiler::compile_initial_envoy_listener` for the full
+        // rationale.
+        let listener_host_dir = session_listener_host_dir(session_id);
+        // Best-effort cleanup of any leftover dir from a crashed previous
+        // session with the same ID (extremely unlikely given UUIDs, but
+        // cheap to handle).
+        let _ = fs::remove_dir_all(&listener_host_dir);
+        fs::create_dir_all(&listener_host_dir).map_err(|e| {
+            SandboxError::Gateway(format!(
+                "failed to create listener host dir {}: {e}",
+                listener_host_dir.display()
+            ))
+        })?;
+
+        let listener_host_path = session_listener_host_path(session_id);
+        let initial_listener = PolicyCompiler::compile_initial_envoy_listener();
+        AtomicListenerWriter::new(&listener_host_path)
+            .write(&initial_listener)
+            .map_err(|e| {
+                SandboxError::Gateway(format!(
+                    "failed to write initial Envoy listener at {}: {e}",
+                    listener_host_path.display()
+                ))
+            })?;
+
+        debug!(
+            session_id = %session_id,
+            listener_host_dir = %listener_host_dir.display(),
+            "initial Envoy listener file written; bind-mounting into container"
+        );
+
         // Step 1: Start the container.
         //
         // With /28 subnets, Docker bridge claims .1 as the gateway. We
@@ -175,6 +238,17 @@ impl GatewayManager {
             "/etc/coredns:rw,noexec,nosuid".to_string(),
             "--tmpfs".to_string(),
             "/etc/envoy:rw,noexec,nosuid".to_string(),
+            // Bind-mount the per-session listener host directory into the
+            // LDS-watched directory inside the container. sandboxd rewrites
+            // the listener file via host-side `fs::rename` — see
+            // `atomic_listener_writer` — which produces the `MovedTo`
+            // inotify event Envoy's filesystem LDS watcher subscribes to.
+            "-v".to_string(),
+            format!(
+                "{}:{}:rw",
+                listener_host_dir.display(),
+                LISTENER_DIR_IN_CONTAINER,
+            ),
         ];
 
         // When a CA directory is provided, bind-mount the mitmproxy CA
@@ -243,7 +317,36 @@ impl GatewayManager {
             "gateway container started"
         );
 
-        // Step 2: Write the initial DNS policy file if one was provided.
+        // Step 2a: Write the Envoy static bootstrap into the container.
+        //
+        // The bootstrap is policy-agnostic (admin endpoint, cluster
+        // definitions, `dynamic_resources.lds_config` pointing at the
+        // LDS-watched listener file) so the content is the same for every
+        // session. It is written here so the entrypoint can start Envoy
+        // pointing at `/etc/envoy/envoy-bootstrap.yaml`.
+        //
+        // The entrypoint script waits for this file to appear before
+        // launching Envoy, so the write must happen before Envoy
+        // readiness is awaited below.
+        {
+            use crate::policy::BOOTSTRAP_FILE_IN_CONTAINER;
+            use crate::policy_distributor::write_file_to_container;
+            let bootstrap = PolicyCompiler::compile_envoy_bootstrap();
+            if let Err(e) =
+                write_file_to_container(&container_name, BOOTSTRAP_FILE_IN_CONTAINER, &bootstrap)
+            {
+                // Fatal: without the bootstrap Envoy cannot start.
+                return Err(SandboxError::Gateway(format!(
+                    "failed to write Envoy bootstrap to {container_name}: {e}"
+                )));
+            }
+            debug!(
+                session_id = %session_id,
+                "wrote Envoy static bootstrap to gateway container"
+            );
+        }
+
+        // Step 2b: Write the initial DNS policy file if one was provided.
         //
         // The entrypoint creates a deny-all default at
         // /etc/coredns/policy.conf only if the file does not yet exist.
@@ -364,6 +467,21 @@ impl GatewayManager {
             return Err(SandboxError::Gateway(format!(
                 "docker rm failed for gateway container: {stderr}"
             )));
+        }
+
+        // Step 4: Remove the per-session listener host directory that was
+        // bind-mounted into the container. Best-effort: nothing else
+        // depends on this path surviving after the container is gone.
+        let listener_host_dir = session_listener_host_dir(session_id);
+        if let Err(e) = fs::remove_dir_all(&listener_host_dir) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    session_id = %session_id,
+                    dir = %listener_host_dir.display(),
+                    error = %e,
+                    "failed to remove listener host dir (non-fatal)"
+                );
+            }
         }
 
         info!(
