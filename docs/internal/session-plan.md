@@ -48,6 +48,10 @@ Sandbox daemon providing isolated Linux VMs (Lima/QEMU) for coding agents. Per-m
 **Goal.** XDG paths, docs, timeouts, test runners, pre-baked images.
 **Status.** completed · **Sessions.** 19 · **Details.** [milestones/M9.md](milestones/M9.md)
 
+## M10 — Port-explicit policies, presets, and observability
+**Goal.** v2 policy schema with explicit ports, CLI-local preset system, unified event surface across all policy layers.
+**Status.** not_started · **Sessions.** 7 · **Details.** [milestones/M10.md](milestones/M10.md)
+
 ---
 
 ## Future milestones
