@@ -10,7 +10,9 @@ use crate::atomic_listener_writer::{AtomicListenerWriter, session_listener_host_
 use crate::error::SandboxError;
 use crate::gateway::{self, GatewayManager};
 use crate::network::NetworkInfo;
-use crate::policy::{AssuranceLevel, Destination, Policy, PolicyCompiler};
+use crate::policy::{
+    AssuranceLevel, Destination, Policy, PolicyCompiler, format_nft_set_elements,
+};
 use crate::session::SessionId;
 
 // ---------------------------------------------------------------------------
@@ -236,13 +238,39 @@ pub fn read_resolved_json(session_id: &SessionId) -> Result<ResolvedReport, Sand
 /// Generate nftables rules for resolved domain IPs.
 ///
 /// This produces rules for the `sandbox_policy` table that allow traffic
-/// to the resolved IPs for domains in the policy.
+/// to the resolved IPs for domains in the policy, joined with the
+/// rule's explicit port (v2 schema).
+///
+/// **v2 shape (M10-S1 / Phase 3B):** matches the shape emitted by
+/// [`PolicyCompiler::compile_nftables`]. Per-destination allowance
+/// lives in two nftables concat sets keyed on
+/// `ipv4_addr . inet_service`, one per L4 protocol
+/// (`policy_allow_tcp`, `policy_allow_udp`). Set elements are
+/// `<ip_or_cidr> . <port>` pairs.
+///
+/// **DNS → policy join happens here.** The DNS cache itself
+/// (CoreDNS `ReportEntry`) is unchanged — it stays a pure
+/// `(domain, ip, ttl)` stream. This function attaches the rule's
+/// `port` (and routes to the `tcp`/`udp` set based on the rule's
+/// protocol) when it materialises the effective nftables ruleset.
+/// See `.tasks/specs/2026-04-21-port-explicit-policies-presets-observability-design.md`
+/// §"Compiler consequences — nftables" (Part 1, lines 173-177).
+///
+/// Called by the DNS propagation loop; the full table is regenerated
+/// on each call (not an incremental `nft add element` update — the
+/// "rebuild-the-whole-table" pattern matches the existing
+/// `propagate_dns_changes` design).
+///
+/// Fail-closed: domains with no cache entry contribute no set elements,
+/// so traffic to them is rejected by the forward chain's trailing
+/// `reject` rule.
 pub fn generate_domain_ip_rules(
     policy: &Policy,
     cache: &DnsCache,
     network_info: &NetworkInfo,
 ) -> String {
-    let mut allow_rules = Vec::new();
+    let mut tcp_elements: Vec<String> = Vec::new();
+    let mut udp_elements: Vec<String> = Vec::new();
 
     for rule in &policy.rules {
         if matches!(rule.level, AssuranceLevel::Deny) {
@@ -252,66 +280,54 @@ pub fn generate_domain_ip_rules(
         let port = rule.port;
         match &rule.host {
             Destination::Cidr(cidr) => {
-                // CIDR rules are static -- include them directly.
-                // Use conntrack original-direction matching so rules work
-                // correctly after DNAT has rewritten packet headers.
-                let ip_or_cidr = cidr.as_str();
+                let element = format!("{cidr} . {port}");
                 match rule.protocol {
-                    crate::policy::Protocol::Tcp => {
-                        allow_rules.push(format!(
-                            "        ct original ip daddr {ip_or_cidr} tcp dport {port} accept"
-                        ));
-                    }
-                    crate::policy::Protocol::Udp => {
-                        allow_rules.push(format!(
-                            "        ct original ip daddr {ip_or_cidr} udp dport {port} accept"
-                        ));
-                    }
+                    crate::policy::Protocol::Tcp => tcp_elements.push(element),
+                    crate::policy::Protocol::Udp => udp_elements.push(element),
                 }
             }
             Destination::Domain(domain) => {
-                // Look up resolved IPs from the cache.
-                // Use conntrack original-direction matching so rules work
-                // correctly after DNAT has rewritten packet headers.
-                if let Some(entry) = cache.entries().get(domain.as_str()) {
-                    for ip in &entry.ips {
-                        match rule.protocol {
-                            crate::policy::Protocol::Tcp => {
-                                allow_rules.push(format!(
-                                    "        ct original ip daddr {ip} tcp dport {port} accept \
-                                     # {domain}"
-                                ));
-                            }
-                            crate::policy::Protocol::Udp => {
-                                allow_rules.push(format!(
-                                    "        ct original ip daddr {ip} udp dport {port} accept \
-                                     # {domain}"
-                                ));
-                            }
-                        }
+                // Join the DNS cache's (domain, ip) entries with the
+                // rule's (port, protocol) to produce (ip, port) set
+                // elements. A domain with no cache entry produces no
+                // elements — fail-closed by default.
+                let Some(entry) = cache.entries().get(domain.as_str()) else {
+                    continue;
+                };
+                for ip in &entry.ips {
+                    let element = format!("{ip} . {port}");
+                    match rule.protocol {
+                        crate::policy::Protocol::Tcp => tcp_elements.push(element),
+                        crate::policy::Protocol::Udp => udp_elements.push(element),
                     }
-                } else {
-                    // Domain not yet resolved -- generate a comment placeholder.
-                    // Fail-closed: no allow rule means traffic is denied.
-                    allow_rules.push(format!(
-                        "        # domain: {domain} (not yet resolved, denied by default)"
-                    ));
                 }
             }
         }
     }
 
-    // If no allow rules (excluding comments), return empty.
-    let has_real_rules = allow_rules.iter().any(|r| !r.trim_start().starts_with('#'));
-    if !has_real_rules {
+    // If neither set has any elements, return empty — nothing to
+    // inject. The base deny-all forward chain stays in place.
+    if tcp_elements.is_empty() && udp_elements.is_empty() {
         return String::new();
     }
 
-    let rules_block = allow_rules.join("\n");
+    let tcp_elements_block = format_nft_set_elements(&tcp_elements);
+    let udp_elements_block = format_nft_set_elements(&udp_elements);
+
     format!(
         r#"table inet sandbox_policy {{}}
 flush table inet sandbox_policy
 table inet sandbox_policy {{
+    set policy_allow_tcp {{
+        type ipv4_addr . inet_service
+        flags interval{tcp_elements_block}
+    }}
+
+    set policy_allow_udp {{
+        type ipv4_addr . inet_service
+        flags interval{udp_elements_block}
+    }}
+
     chain forward {{
         type filter hook forward priority -1; policy drop;
 
@@ -322,8 +338,9 @@ table inet sandbox_policy {{
         ip saddr {subnet} ip daddr {gateway_ip} udp dport 53 accept
         ip saddr {subnet} ip daddr {gateway_ip} tcp dport 53 accept
 
-        # Policy allow rules (with resolved IPs)
-{rules_block}
+        # Policy allow rules — concat-set lookups keyed on (daddr, dport)
+        ct original ip daddr . tcp dport @policy_allow_tcp accept
+        ct original ip daddr . udp dport @policy_allow_udp accept
 
         # Reject everything else (fast failure for denied destinations)
         reject
@@ -652,9 +669,20 @@ mod tests {
         let net = test_network_info();
         let rules = generate_domain_ip_rules(&policy, &cache, &net);
 
-        assert!(rules.contains("140.82.121.3"));
+        // v2 shape: the resolved `(ip, port)` pair is a concat-set
+        // element inside `policy_allow_tcp`. The domain name itself
+        // does not appear in the generated ruleset — the DNS-to-IP
+        // binding happens upstream in the cache; what lands in
+        // nftables is the post-join `(ip, port)` tuple.
         assert!(rules.contains("sandbox_policy"));
-        assert!(rules.contains("github.com"));
+        assert!(rules.contains("set policy_allow_tcp"));
+        assert!(rules.contains("type ipv4_addr . inet_service"));
+        assert!(
+            rules.contains("140.82.121.3 . 443"),
+            "policy_allow_tcp must contain the (ip . port) element for \
+             the resolved domain; got:\n{rules}"
+        );
+        assert!(rules.contains("ct original ip daddr . tcp dport @policy_allow_tcp accept"));
     }
 
     #[test]
@@ -674,7 +702,13 @@ mod tests {
         let net = test_network_info();
         let rules = generate_domain_ip_rules(&policy, &cache, &net);
 
-        assert!(rules.contains("140.82.112.0/20"));
+        // CIDR rules go directly into the concat set keyed on
+        // `ipv4_addr . inet_service` — no DNS cache lookup needed.
+        assert!(
+            rules.contains("140.82.112.0/20 . 443"),
+            "policy_allow_tcp must contain the (cidr . port) element for \
+             the CIDR rule; got:\n{rules}"
+        );
     }
 
     #[test]
@@ -694,7 +728,9 @@ mod tests {
         let net = test_network_info();
         let rules = generate_domain_ip_rules(&policy, &cache, &net);
 
-        // Only a comment, no real rules -> empty output.
+        // Unresolved domain → no set element → empty ruleset → no
+        // injection. Traffic to `not-resolved.com` is rejected by the
+        // base deny-all forward chain (fail-closed).
         assert!(rules.is_empty());
     }
 
@@ -734,8 +770,106 @@ mod tests {
         let net = test_network_info();
         let rules = generate_domain_ip_rules(&policy, &cache, &net);
 
-        assert!(rules.contains("10.0.0.0/8"));
-        assert!(rules.contains("93.184.216.34"));
+        assert!(
+            rules.contains("10.0.0.0/8 . 443"),
+            "CIDR element must appear in policy_allow_tcp; got:\n{rules}"
+        );
+        assert!(
+            rules.contains("93.184.216.34 . 443"),
+            "resolved-domain element must appear in policy_allow_tcp; \
+             got:\n{rules}"
+        );
+    }
+
+    #[test]
+    fn domain_ip_rules_segregate_tcp_and_udp_rules() {
+        // Pin that protocol routing is correct end-to-end through the
+        // DNS-propagation layer: a TCP rule lands in `policy_allow_tcp`
+        // only, a UDP rule lands in `policy_allow_udp` only. No
+        // cross-protocol leakage, same invariant as the compiler-side
+        // `compile_mixed_tcp_and_udp_cidrs_segregate_by_protocol` test.
+        let policy = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![
+                PolicyRule {
+                    host: Destination::Domain("tcp.example.com".to_string()),
+                    port: 443,
+                    protocol: Protocol::Tcp,
+                    level: AssuranceLevel::Transport,
+                    reason: None,
+                },
+                PolicyRule {
+                    host: Destination::Domain("udp.example.com".to_string()),
+                    port: 53,
+                    protocol: Protocol::Udp,
+                    level: AssuranceLevel::Transport,
+                    reason: None,
+                },
+            ],
+        };
+
+        let mut cache = DnsCache::new();
+        let report = ResolvedReport {
+            mappings: vec![
+                ResolvedMapping {
+                    domain: "tcp.example.com".to_string(),
+                    ips: vec!["1.2.3.4".to_string()],
+                    ttl: 3600,
+                    timestamp: "2024-01-01T00:00:00Z".to_string(),
+                },
+                ResolvedMapping {
+                    domain: "udp.example.com".to_string(),
+                    ips: vec!["5.6.7.8".to_string()],
+                    ttl: 3600,
+                    timestamp: "2024-01-01T00:00:00Z".to_string(),
+                },
+            ],
+        };
+        cache.update(&report);
+
+        let net = test_network_info();
+        let rules = generate_domain_ip_rules(&policy, &cache, &net);
+
+        // Extract the TCP set body.
+        let tcp_start = rules
+            .find("set policy_allow_tcp")
+            .expect("policy_allow_tcp set should exist");
+        let tcp_end = rules[tcp_start..]
+            .find("\n    }")
+            .map(|i| tcp_start + i)
+            .expect("policy_allow_tcp set should terminate");
+        let tcp_body = &rules[tcp_start..tcp_end];
+
+        // Extract the UDP set body.
+        let udp_start = rules
+            .find("set policy_allow_udp")
+            .expect("policy_allow_udp set should exist");
+        let udp_end = rules[udp_start..]
+            .find("\n    }")
+            .map(|i| udp_start + i)
+            .expect("policy_allow_udp set should terminate");
+        let udp_body = &rules[udp_start..udp_end];
+
+        assert!(
+            tcp_body.contains("1.2.3.4 . 443"),
+            "TCP-rule resolved IP must be in policy_allow_tcp; got tcp \
+             body:\n{tcp_body}"
+        );
+        assert!(
+            !udp_body.contains("1.2.3.4"),
+            "TCP-rule IP must not leak into policy_allow_udp; got udp \
+             body:\n{udp_body}"
+        );
+        assert!(
+            udp_body.contains("5.6.7.8 . 53"),
+            "UDP-rule resolved IP must be in policy_allow_udp; got udp \
+             body:\n{udp_body}"
+        );
+        assert!(
+            !tcp_body.contains("5.6.7.8"),
+            "UDP-rule IP must not leak into policy_allow_tcp; got tcp \
+             body:\n{tcp_body}"
+        );
     }
 
     // -- ResolvedReport parsing tests -----------------------------------------
