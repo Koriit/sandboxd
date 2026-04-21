@@ -113,7 +113,8 @@ pub struct PolicyDto {
 /// until [`super::mapper`] is updated.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyRuleDto {
-    pub destination: Destination,
+    pub host: Destination,
+    pub port: u16,
     pub protocol: Protocol,
     #[serde(flatten)]
     pub level: PolicyLevelDto,

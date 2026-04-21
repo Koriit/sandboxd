@@ -647,7 +647,7 @@ async fn create_session(
             .rules
             .iter()
             .filter(|r| r.level != AssuranceLevel::Deny)
-            .filter_map(|r| match &r.destination {
+            .filter_map(|r| match &r.host {
                 Destination::Domain(d) => Some(d.clone()),
                 Destination::Cidr(_) => None,
             })

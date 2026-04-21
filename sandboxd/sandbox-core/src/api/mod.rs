@@ -294,18 +294,19 @@ mod tests {
     #[test]
     fn deserialize_update_policy_request() {
         let json = r#"{
-            "version": "1.0.0",
+            "version": "2.0.0",
             "rules": [
                 {
-                    "destination": "github.com",
-                    "level": "transport",
-                    "protocol": "https"
+                    "host": "github.com",
+                    "port": 443,
+                    "protocol": "tcp",
+                    "level": "transport"
                 }
             ]
         }"#;
 
         let req: UpdatePolicyRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.policy.version, "1.0.0");
+        assert_eq!(req.policy.version, "2.0.0");
         assert_eq!(req.policy.rules.len(), 1);
     }
 
@@ -315,10 +316,12 @@ mod tests {
             "name": "with-policy",
             "cpus": 2,
             "policy": {
-                "version": "1.0.0",
+                "version": "2.0.0",
                 "rules": [
                     {
-                        "destination": "example.com",
+                        "host": "example.com",
+                        "port": 443,
+                        "protocol": "tcp",
                         "level": "transport"
                     }
                 ]
@@ -329,7 +332,7 @@ mod tests {
         assert_eq!(req.name.as_deref(), Some("with-policy"));
         assert!(req.policy.is_some());
         let policy = req.policy.unwrap();
-        assert_eq!(policy.version, "1.0.0");
+        assert_eq!(policy.version, "2.0.0");
         assert_eq!(policy.rules.len(), 1);
     }
 

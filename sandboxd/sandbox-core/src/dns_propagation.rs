@@ -249,54 +249,23 @@ pub fn generate_domain_ip_rules(
             continue;
         }
 
-        match &rule.destination {
+        let port = rule.port;
+        match &rule.host {
             Destination::Cidr(cidr) => {
                 // CIDR rules are static -- include them directly.
                 // Use conntrack original-direction matching so rules work
                 // correctly after DNAT has rewritten packet headers.
                 let ip_or_cidr = cidr.as_str();
                 match rule.protocol {
-                    crate::policy::Protocol::Tcp
-                    | crate::policy::Protocol::Https
-                    | crate::policy::Protocol::Http
-                    | crate::policy::Protocol::Any => {
+                    crate::policy::Protocol::Tcp => {
                         allow_rules.push(format!(
-                            "        ct original ip daddr {ip_or_cidr} tcp dport {{ 80, 443 }} accept"
+                            "        ct original ip daddr {ip_or_cidr} tcp dport {port} accept"
                         ));
                     }
                     crate::policy::Protocol::Udp => {
                         allow_rules.push(format!(
-                            "        ct original ip daddr {ip_or_cidr} udp dport {{ 80, 443 }} accept"
+                            "        ct original ip daddr {ip_or_cidr} udp dport {port} accept"
                         ));
-                    }
-                }
-            }
-            Destination::Domain(domain) if domain == "*" => {
-                // Unrestricted wildcard destination: accept any daddr.  The
-                // DNS cache never holds `*`, so the regular resolved-IP
-                // path below would be a no-op.  Mirror the baseline rule
-                // emitted by `PolicyCompiler::compile_nftables` so the
-                // post-propagation ruleset stays permissive.
-                //
-                // `ct original proto-dst` matches the original-direction
-                // L4 port — required here because the gateway's base chain
-                // DNATs the flow to the Envoy listener before this rule
-                // gets evaluated, so a bare `tcp dport` would not match.
-                match rule.protocol {
-                    crate::policy::Protocol::Tcp
-                    | crate::policy::Protocol::Https
-                    | crate::policy::Protocol::Http
-                    | crate::policy::Protocol::Any => {
-                        allow_rules.push(
-                            "        meta l4proto tcp ct original proto-dst { 80, 443 } accept # unrestricted"
-                                .to_string(),
-                        );
-                    }
-                    crate::policy::Protocol::Udp => {
-                        allow_rules.push(
-                            "        meta l4proto udp ct original proto-dst { 80, 443 } accept # unrestricted"
-                                .to_string(),
-                        );
                     }
                 }
             }
@@ -307,18 +276,15 @@ pub fn generate_domain_ip_rules(
                 if let Some(entry) = cache.entries().get(domain.as_str()) {
                     for ip in &entry.ips {
                         match rule.protocol {
-                            crate::policy::Protocol::Tcp
-                            | crate::policy::Protocol::Https
-                            | crate::policy::Protocol::Http
-                            | crate::policy::Protocol::Any => {
+                            crate::policy::Protocol::Tcp => {
                                 allow_rules.push(format!(
-                                    "        ct original ip daddr {ip} tcp dport {{ 80, 443 }} accept \
+                                    "        ct original ip daddr {ip} tcp dport {port} accept \
                                      # {domain}"
                                 ));
                             }
                             crate::policy::Protocol::Udp => {
                                 allow_rules.push(format!(
-                                    "        ct original ip daddr {ip} udp dport {{ 80, 443 }} accept \
+                                    "        ct original ip daddr {ip} udp dport {port} accept \
                                      # {domain}"
                                 ));
                             }
@@ -645,9 +611,10 @@ mod tests {
         let policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
-                destination: Destination::Domain("evil.com".to_string()),
+                host: Destination::Domain("evil.com".to_string()),
+                port: 443,
+                protocol: Protocol::Tcp,
                 level: AssuranceLevel::Deny,
-                protocol: Protocol::Any,
                 reason: None,
             }],
         };
@@ -663,9 +630,10 @@ mod tests {
         let policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
-                destination: Destination::Domain("github.com".to_string()),
+                host: Destination::Domain("github.com".to_string()),
+                port: 443,
+                protocol: Protocol::Tcp,
                 level: AssuranceLevel::Transport,
-                protocol: Protocol::Https,
                 reason: None,
             }],
         };
@@ -694,9 +662,10 @@ mod tests {
         let policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
-                destination: Destination::Cidr("140.82.112.0/20".to_string()),
-                level: AssuranceLevel::Transport,
+                host: Destination::Cidr("140.82.112.0/20".to_string()),
+                port: 443,
                 protocol: Protocol::Tcp,
+                level: AssuranceLevel::Transport,
                 reason: None,
             }],
         };
@@ -713,9 +682,10 @@ mod tests {
         let policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
-                destination: Destination::Domain("not-resolved.com".to_string()),
+                host: Destination::Domain("not-resolved.com".to_string()),
+                port: 443,
+                protocol: Protocol::Tcp,
                 level: AssuranceLevel::Transport,
-                protocol: Protocol::Any,
                 reason: None,
             }],
         };
@@ -734,15 +704,17 @@ mod tests {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![
                 PolicyRule {
-                    destination: Destination::Cidr("10.0.0.0/8".to_string()),
+                    host: Destination::Cidr("10.0.0.0/8".to_string()),
+                    port: 443,
+                    protocol: Protocol::Tcp,
                     level: AssuranceLevel::Transport,
-                    protocol: Protocol::Any,
                     reason: None,
                 },
                 PolicyRule {
-                    destination: Destination::Domain("example.com".to_string()),
+                    host: Destination::Domain("example.com".to_string()),
+                    port: 443,
+                    protocol: Protocol::Tcp,
                     level: AssuranceLevel::Transport,
-                    protocol: Protocol::Https,
                     reason: None,
                 },
             ],

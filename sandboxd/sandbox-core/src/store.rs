@@ -530,7 +530,11 @@ impl SessionStore {
         )?;
 
         for (rule_order, rule) in policy.rules.iter().enumerate() {
-            let (dest_kind, dest_value) = destination_columns(&rule.destination);
+            let (dest_kind, dest_value) = destination_columns(&rule.host);
+            // TODO(M10-S1 Commit 5): insert `rule.port` into the `port`
+            // column once migration V004 adds it.  Until then the store
+            // path compiles but does not round-trip the port — deferred
+            // alongside the migration.
             tx.execute(
                 "INSERT INTO policy_rules (
                     session_id, rule_order, destination_kind, destination_value,
@@ -741,22 +745,23 @@ fn protocol_column(p: Protocol) -> &'static str {
     match p {
         Protocol::Tcp => "tcp",
         Protocol::Udp => "udp",
-        Protocol::Http => "http",
-        Protocol::Https => "https",
-        Protocol::Any => "any",
     }
 }
 
+/// Parse a protocol column value read from `policy_rules.protocol`.
+///
+/// Under v2 schema only `tcp` and `udp` are valid.  Legacy v1 values
+/// (`http`, `https`, `any`) are rejected — migration V004 guarantees
+/// that no row with those values survives, so this arm is defensive
+/// dead code in practice.
 fn protocol_from_column(s: &str) -> Result<Protocol, SandboxError> {
     Ok(match s {
         "tcp" => Protocol::Tcp,
         "udp" => Protocol::Udp,
-        "http" => Protocol::Http,
-        "https" => Protocol::Https,
-        "any" => Protocol::Any,
         other => {
             return Err(SandboxError::Internal(format!(
-                "unknown protocol in policy_rules: {other}"
+                "unknown protocol in policy_rules: {other} \
+                 (v1 values http/https/any were purged by migration V004)"
             )));
         }
     })
@@ -882,7 +887,11 @@ fn read_policy(conn: &Connection, id: &SessionId) -> Result<Option<Policy>, Sand
         };
 
         rules.push(PolicyRule {
-            destination,
+            host: destination,
+            // TODO(M10-S1 Commit 5): read port from the port column once V004
+            // migration adds it. Until then, v1-shaped rows lack port data;
+            // V004 will purge them before this code path can load them.
+            port: 443,
             protocol,
             reason,
             level,
@@ -1715,7 +1724,8 @@ mod tests {
             version: crate::policy::SCHEMA_VERSION.into(),
             rules: vec![
                 PolicyRule {
-                    destination: Destination::Domain("github.com".into()),
+                    host: Destination::Domain("github.com".into()),
+                    port: 443,
                     protocol: Protocol::Tcp,
                     reason: Some("fetch repo".into()),
                     level: AssuranceLevel::Http {
@@ -1732,14 +1742,16 @@ mod tests {
                     },
                 },
                 PolicyRule {
-                    destination: Destination::Cidr("10.0.0.0/8".into()),
-                    protocol: Protocol::Any,
+                    host: Destination::Cidr("10.0.0.0/8".into()),
+                    port: 80,
+                    protocol: Protocol::Tcp,
                     reason: None,
                     level: AssuranceLevel::Deny,
                 },
                 PolicyRule {
-                    destination: Destination::Domain("example.com".into()),
-                    protocol: Protocol::Https,
+                    host: Destination::Domain("example.com".into()),
+                    port: 443,
+                    protocol: Protocol::Tcp,
                     reason: Some("tls only".into()),
                     level: AssuranceLevel::Tls,
                 },
@@ -1784,22 +1796,22 @@ mod tests {
         assert_eq!(loaded.rules[0].protocol, Protocol::Tcp);
         assert_eq!(loaded.rules[0].reason.as_deref(), Some("fetch repo"));
         assert!(matches!(
-            loaded.rules[0].destination,
+            loaded.rules[0].host,
             Destination::Domain(ref s) if s == "github.com"
         ));
 
-        // Rule 1: deny, cidr destination, no filters, no reason.
+        // Rule 1: deny, cidr host, no filters, no reason.
         assert_eq!(loaded.rules[1].level, AssuranceLevel::Deny);
-        assert_eq!(loaded.rules[1].protocol, Protocol::Any);
+        assert_eq!(loaded.rules[1].protocol, Protocol::Tcp);
         assert!(loaded.rules[1].reason.is_none());
         assert!(matches!(
-            loaded.rules[1].destination,
+            loaded.rules[1].host,
             Destination::Cidr(ref s) if s == "10.0.0.0/8"
         ));
 
         // Rule 2: tls.
         assert_eq!(loaded.rules[2].level, AssuranceLevel::Tls);
-        assert_eq!(loaded.rules[2].protocol, Protocol::Https);
+        assert_eq!(loaded.rules[2].protocol, Protocol::Tcp);
     }
 
     #[test]
@@ -1814,9 +1826,10 @@ mod tests {
 
         // Overwrite with a single-rule policy.
         let second = Policy {
-            version: "1.0.0".into(),
+            version: "2.0.0".into(),
             rules: vec![PolicyRule {
-                destination: Destination::Domain("other.test".into()),
+                host: Destination::Domain("other.test".into()),
+                port: 443,
                 protocol: Protocol::Tcp,
                 reason: None,
                 level: AssuranceLevel::Transport,
@@ -1873,10 +1886,11 @@ mod tests {
 
         let p1 = sample_http_policy();
         let p2 = Policy {
-            version: "1.0.0".into(),
+            version: "2.0.0".into(),
             rules: vec![PolicyRule {
-                destination: Destination::Domain("deny.example".into()),
-                protocol: Protocol::Any,
+                host: Destination::Domain("deny.example".into()),
+                port: 80,
+                protocol: Protocol::Tcp,
                 reason: None,
                 level: AssuranceLevel::Deny,
             }],
@@ -1940,9 +1954,10 @@ mod tests {
             .create_session(SessionConfig::default(), Some("ok".into()))
             .expect("create sibling");
         let good = Policy {
-            version: "1.0.0".into(),
+            version: "2.0.0".into(),
             rules: vec![PolicyRule {
-                destination: Destination::Domain("ok.test".into()),
+                host: Destination::Domain("ok.test".into()),
+                port: 443,
                 protocol: Protocol::Tcp,
                 reason: None,
                 level: AssuranceLevel::Transport,

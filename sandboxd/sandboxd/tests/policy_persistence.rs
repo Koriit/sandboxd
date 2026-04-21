@@ -26,10 +26,11 @@ use tempfile::TempDir;
 
 fn restrictive_policy() -> Policy {
     Policy {
-        version: "1.0.0".into(),
+        version: "2.0.0".into(),
         rules: vec![
             PolicyRule {
-                destination: Destination::Domain("github.com".into()),
+                host: Destination::Domain("github.com".into()),
+                port: 443,
                 protocol: Protocol::Tcp,
                 reason: Some("fetch repo metadata".into()),
                 level: AssuranceLevel::Http {
@@ -40,8 +41,9 @@ fn restrictive_policy() -> Policy {
                 },
             },
             PolicyRule {
-                destination: Destination::Cidr("0.0.0.0/0".into()),
-                protocol: Protocol::Any,
+                host: Destination::Cidr("0.0.0.0/0".into()),
+                port: 443,
+                protocol: Protocol::Tcp,
                 reason: Some("default deny".into()),
                 level: AssuranceLevel::Deny,
             },
@@ -113,9 +115,10 @@ fn load_all_policies_hydrates_in_memory_map() {
 
     let p1 = restrictive_policy();
     let p2 = Policy {
-        version: "1.0.0".into(),
+        version: "2.0.0".into(),
         rules: vec![PolicyRule {
-            destination: Destination::Domain("example.com".into()),
+            host: Destination::Domain("example.com".into()),
+            port: 443,
             protocol: Protocol::Tcp,
             reason: None,
             level: AssuranceLevel::Transport,

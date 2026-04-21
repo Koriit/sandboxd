@@ -14,7 +14,7 @@ use crate::network::NetworkInfo;
 // ---------------------------------------------------------------------------
 
 /// Current policy schema version.
-pub const SCHEMA_VERSION: &str = "1.0.0";
+pub const SCHEMA_VERSION: &str = "2.0.0";
 
 // ---------------------------------------------------------------------------
 // Policy document types
@@ -25,12 +25,63 @@ pub const SCHEMA_VERSION: &str = "1.0.0";
 /// A policy contains an ordered list of rules that are evaluated to determine
 /// which network destinations are allowed and at what assurance level. The
 /// default (unmatched) destination is deny-all (level 0).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct Policy {
-    /// Schema version (semver). Must be compatible with [`SCHEMA_VERSION`].
+    /// Schema version (semver). Must be exactly [`SCHEMA_VERSION`].
     pub version: String,
     /// Policy rules, evaluated in order.
     pub rules: Vec<PolicyRule>,
+}
+
+// Custom `Deserialize` impl for `Policy` that hard-rejects v1 policy
+// documents at parse time with a clear error message pointing operators
+// at the migration guidance.  The v1 schema (`version: "1.0.0"`) conflated
+// L7 protocol (`http`/`https`) with L4 protocol and did not carry a
+// `port` field — v2 requires an explicit `(host, port)` tuple per rule
+// and an L4-only `protocol` value.  There is no auto-migration: the
+// silent promotion `protocol: https` → `protocol: tcp, port: 443` would
+// hide exactly the decision v2 is trying to make explicit.
+impl<'de> Deserialize<'de> for Policy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        #[derive(Deserialize)]
+        struct Shadow {
+            version: String,
+            rules: Vec<PolicyRule>,
+        }
+
+        // We read `version` as a raw string from a generic JSON value
+        // first so the v1 hard-reject fires before rule-shape
+        // deserialization (which would otherwise surface as a confusing
+        // "missing field `port`" error on every v1 rule).
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if let Some(version) = value.get("version").and_then(|v| v.as_str()) {
+            if version == "1.0.0" {
+                return Err(D::Error::custom(
+                    "policy file uses schema v1.0.0, which is no longer supported. \
+                     v1 conflated port and protocol; v2 requires an explicit port per rule. \
+                     See .tasks/specs/2026-04-21-port-explicit-policies-presets-observability-design.md \
+                     for migration examples.",
+                ));
+            }
+            if version != SCHEMA_VERSION {
+                return Err(D::Error::custom(format!(
+                    "policy file uses unsupported schema version {version:?}; \
+                     expected {SCHEMA_VERSION:?}"
+                )));
+            }
+        }
+
+        let shadow: Shadow = serde_json::from_value(value).map_err(D::Error::custom)?;
+        Ok(Policy {
+            version: shadow.version,
+            rules: shadow.rules,
+        })
+    }
 }
 
 /// A single policy rule describing the allowed assurance level for a
@@ -38,23 +89,32 @@ pub struct Policy {
 ///
 /// The wire format is flat: the assurance level's tag (`"level"`) and any
 /// per-variant data (currently `http_filters` for the `http` level) live
-/// alongside `destination`, `protocol`, and `reason` at the rule object's
+/// alongside `host`, `port`, `protocol`, and `reason` at the rule object's
 /// top level.  Example:
 ///
 /// ```json
 /// {
-///   "destination": "github.com",
+///   "host": "github.com",
+///   "port": 443,
 ///   "protocol": "tcp",
 ///   "level": "http",
 ///   "http_filters": [{"method": "GET", "path": "/*"}]
 /// }
 /// ```
+///
+/// Rule identity is the `(host, port)` tuple — the effective policy must
+/// contain at most one rule per `(host, port)` pair.  See
+/// [`PolicyCompiler::validate`].
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PolicyRule {
-    /// Destination: domain name, IP address, or CIDR block.
-    pub destination: Destination,
-    /// Protocol constraint.
-    #[serde(default = "default_protocol")]
+    /// Destination host: domain name, subdomain wildcard
+    /// (`*.example.com`), IPv4 literal, or IPv4 CIDR.  Bare `*` is
+    /// rejected.  Named `host` on the wire.
+    pub host: Destination,
+    /// Destination L4 port.  Required; must be in `1..=65535`.  No
+    /// ranges, no lists.
+    pub port: u16,
+    /// L4 protocol.  Required; must be exactly `tcp` or `udp`.
     pub protocol: Protocol,
     /// Human-readable reason for the rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -297,20 +357,17 @@ impl fmt::Display for Destination {
     }
 }
 
-/// Protocol constraint for a policy rule.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// L4 protocol constraint for a policy rule.
+///
+/// v2 accepts only `tcp` and `udp` — `http`, `https`, and `any` were
+/// removed when the schema gained an explicit `port` field.  Historical
+/// v1 rules using those values fail v1 hard-reject at parse time and
+/// are purged from the store by migration V004.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
     Tcp,
     Udp,
-    Http,
-    Https,
-    #[default]
-    Any,
-}
-
-fn default_protocol() -> Protocol {
-    Protocol::default()
 }
 
 // NOTE: the old `HttpConstraints { methods, paths }` wrapper struct was
@@ -337,21 +394,24 @@ pub fn generate_json_schema() -> serde_json::Value {
 pub fn preset_allow_github() -> Vec<PolicyRule> {
     vec![
         PolicyRule {
-            destination: Destination::Domain("github.com".to_string()),
+            host: Destination::Domain("github.com".to_string()),
+            port: 443,
+            protocol: Protocol::Tcp,
             level: AssuranceLevel::Transport,
-            protocol: Protocol::Https,
             reason: Some("GitHub web and API".to_string()),
         },
         PolicyRule {
-            destination: Destination::Domain("*.github.com".to_string()),
+            host: Destination::Domain("*.github.com".to_string()),
+            port: 443,
+            protocol: Protocol::Tcp,
             level: AssuranceLevel::Transport,
-            protocol: Protocol::Https,
             reason: Some("GitHub subdomains (API, uploads, etc.)".to_string()),
         },
         PolicyRule {
-            destination: Destination::Domain("*.githubusercontent.com".to_string()),
+            host: Destination::Domain("*.githubusercontent.com".to_string()),
+            port: 443,
+            protocol: Protocol::Tcp,
             level: AssuranceLevel::Transport,
-            protocol: Protocol::Https,
             reason: Some("GitHub raw content and assets".to_string()),
         },
     ]
@@ -361,21 +421,24 @@ pub fn preset_allow_github() -> Vec<PolicyRule> {
 pub fn preset_allow_npm() -> Vec<PolicyRule> {
     vec![
         PolicyRule {
-            destination: Destination::Domain("registry.npmjs.org".to_string()),
+            host: Destination::Domain("registry.npmjs.org".to_string()),
+            port: 443,
+            protocol: Protocol::Tcp,
             level: AssuranceLevel::Transport,
-            protocol: Protocol::Https,
             reason: Some("npm package registry".to_string()),
         },
         PolicyRule {
-            destination: Destination::Domain("*.npmjs.org".to_string()),
+            host: Destination::Domain("*.npmjs.org".to_string()),
+            port: 443,
+            protocol: Protocol::Tcp,
             level: AssuranceLevel::Transport,
-            protocol: Protocol::Https,
             reason: Some("npm registry CDN".to_string()),
         },
         PolicyRule {
-            destination: Destination::Domain("*.npmjs.com".to_string()),
+            host: Destination::Domain("*.npmjs.com".to_string()),
+            port: 443,
+            protocol: Protocol::Tcp,
             level: AssuranceLevel::Transport,
-            protocol: Protocol::Https,
             reason: Some("npm website and API".to_string()),
         },
     ]
@@ -634,7 +697,7 @@ impl PolicyCompiler {
         let mut seen_destinations: HashMap<String, &'static str> = HashMap::new();
 
         for (i, rule) in policy.rules.iter().enumerate() {
-            let ctx = format!("rule {i} (destination: {})", rule.destination);
+            let ctx = format!("rule {i} (host: {})", rule.host);
 
             // `Http`-specific invariants.
             if let AssuranceLevel::Http { http_filters } = &rule.level {
@@ -644,20 +707,17 @@ impl PolicyCompiler {
                          `http_filters` array — list at least one {{method, path}} pair"
                     )));
                 }
-                if !matches!(
-                    rule.protocol,
-                    Protocol::Http | Protocol::Https | Protocol::Any
-                ) {
+                if rule.protocol != Protocol::Tcp {
                     return Err(SandboxError::Internal(format!(
-                        "{ctx}: assurance level 'http' requires protocol \
-                         'http', 'https', or 'any' (got '{:?}')",
+                        "{ctx}: assurance level 'http' requires protocol 'tcp' \
+                         (got '{:?}')",
                         rule.protocol
                     )));
                 }
             }
 
             // Validate destination syntax.
-            match &rule.destination {
+            match &rule.host {
                 Destination::Cidr(cidr) => {
                     Self::validate_cidr(cidr)
                         .map_err(|e| SandboxError::Internal(format!("{ctx}: invalid CIDR: {e}")))?;
@@ -671,7 +731,7 @@ impl PolicyCompiler {
 
             // Check for contradictory rules: same destination string with
             // different assurance-level variants.
-            let dest_key = rule.destination.to_string();
+            let dest_key = rule.host.to_string();
             let variant = rule.level.variant_name();
             if let Some(prev_variant) = seen_destinations.get(&dest_key) {
                 if *prev_variant != variant {
@@ -706,15 +766,21 @@ impl PolicyCompiler {
                 continue;
             }
 
-            match &rule.destination {
+            match &rule.host {
                 Destination::Cidr(cidr) => {
                     // For CIDR destinations, generate direct IP-based rules.
                     // Use conntrack original-direction matching so rules work
                     // correctly after DNAT has rewritten packet headers.
+                    //
+                    // NOTE: This arm still emits the hardcoded `{80, 443}`
+                    // port set — it is kept verbatim during Phase 2 so the
+                    // compiler continues to build.  Phase 3 rewrites it to
+                    // use the rule's explicit `port` field and concat sets
+                    // (`policy_allow_tcp`, `policy_allow_udp`).
                     let ip_or_cidr = cidr.as_str();
 
                     match rule.protocol {
-                        Protocol::Tcp | Protocol::Https | Protocol::Http | Protocol::Any => {
+                        Protocol::Tcp => {
                             allow_rules.push(format!(
                                 "        ct original ip daddr {ip_or_cidr} tcp dport {{ 80, 443 }} accept"
                             ));
@@ -723,38 +789,6 @@ impl PolicyCompiler {
                             allow_rules.push(format!(
                                 "        ct original ip daddr {ip_or_cidr} udp dport {{ 80, 443 }} accept"
                             ));
-                        }
-                    }
-                }
-                Destination::Domain(domain) if domain == "*" => {
-                    // Unrestricted wildcard destination: accept any daddr on
-                    // 80/443 directly.  We emit a real allow rule rather than
-                    // waiting for DNS propagation because `*` cannot be
-                    // resolved — the DNS cache only ever holds concrete
-                    // FQDNs, so `generate_domain_ip_rules` alone would never
-                    // materialise an allow-rule for this shape.
-                    //
-                    // Match on the original-direction L4 port via
-                    // `ct original proto-dst` so the rule still catches the
-                    // pre-DNAT port 80/443 even after the base chain has
-                    // redirected the flow to the gateway's Envoy listener
-                    // on port 10000.  Bare `tcp dport { 80, 443 }` would
-                    // only match traffic that had not yet been DNAT'd —
-                    // which is never the case at the forward hook.  Pair
-                    // with `meta l4proto` to keep the TCP/UDP split the
-                    // other arms use.
-                    match rule.protocol {
-                        Protocol::Tcp | Protocol::Https | Protocol::Http | Protocol::Any => {
-                            allow_rules.push(
-                                "        meta l4proto tcp ct original proto-dst { 80, 443 } accept # unrestricted"
-                                    .to_string(),
-                            );
-                        }
-                        Protocol::Udp => {
-                            allow_rules.push(
-                                "        meta l4proto udp ct original proto-dst { 80, 443 } accept # unrestricted"
-                                    .to_string(),
-                            );
                         }
                     }
                 }
@@ -1011,7 +1045,7 @@ admin:
             .iter()
             .filter(|r| matches!(r.level, AssuranceLevel::Tls))
         {
-            let domain = rule.destination.to_string();
+            let domain = rule.host.to_string();
             let stat_name = Self::sanitize_stat_prefix(&domain);
             filter_chains.push(format!(
                 r#"    - filter_chain_match:
@@ -1060,7 +1094,7 @@ admin:
             .iter()
             .filter(|r| matches!(r.level, AssuranceLevel::Http { .. }))
         {
-            match &rule.destination {
+            match &rule.host {
                 Destination::Domain(domain) if domain == "*" => {
                     let stat_name = Self::sanitize_stat_prefix(domain);
                     // `default_filter_chain` is a sibling of `address`,
@@ -1321,7 +1355,7 @@ resources:
             .iter()
             .filter_map(|r| match &r.level {
                 AssuranceLevel::Http { http_filters } => Some(MitmproxyRule {
-                    host: r.destination.to_string(),
+                    host: r.host.to_string(),
                     filters: http_filters
                         .iter()
                         .map(|f| MitmproxyFilter {
@@ -1348,7 +1382,7 @@ resources:
             .rules
             .iter()
             .filter(|r| !matches!(r.level, AssuranceLevel::Deny))
-            .filter_map(|r| match &r.destination {
+            .filter_map(|r| match &r.host {
                 Destination::Domain(d) => Some(d.clone()),
                 Destination::Cidr(_) => None,
             })
@@ -1384,17 +1418,20 @@ resources:
     }
 
     /// Validate a domain name (basic checks).
+    ///
+    /// Under v2 schema, bare `*` is **rejected** — subdomain wildcards
+    /// like `*.example.com` remain valid.  The v1 synthetic
+    /// unrestricted-policy wildcard is gone; allow-all posture is not
+    /// expressible in v2 and is replaced by deny-log-driven iteration.
     fn validate_domain(domain: &str) -> Result<(), String> {
         if domain.is_empty() {
             return Err("domain must not be empty".to_string());
         }
 
-        // Bare `*` is the synthetic unrestricted-policy wildcard — it matches
-        // every FQDN rather than a specific label.  It is intentionally only
-        // producible by `Policy::unrestricted()`; humans authoring policy
-        // files should use `*.foo.com` style instead.
         if domain == "*" {
-            return Ok(());
+            return Err("bare `*` host is not allowed under schema v2.0.0; \
+                 use a specific domain or a subdomain wildcard like `*.example.com`"
+                .to_string());
         }
 
         // Allow wildcard prefix.
@@ -1528,14 +1565,16 @@ mod tests {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![
                 PolicyRule {
-                    destination: Destination::Domain("github.com".to_string()),
+                    host: Destination::Domain("github.com".to_string()),
                     level: AssuranceLevel::Transport,
-                    protocol: Protocol::Https,
+                    port: 443,
+                    protocol: Protocol::Tcp,
                     reason: Some("GitHub access".to_string()),
                 },
                 PolicyRule {
-                    destination: Destination::Cidr("140.82.112.0/20".to_string()),
+                    host: Destination::Cidr("140.82.112.0/20".to_string()),
                     level: AssuranceLevel::Transport,
+                    port: 443,
                     protocol: Protocol::Tcp,
                     reason: Some("GitHub IP range".to_string()),
                 },
@@ -1555,16 +1594,19 @@ mod tests {
     #[test]
     fn parse_policy_from_json() {
         let json = r#"{
-            "version": "1.0.0",
+            "version": "2.0.0",
             "rules": [
                 {
-                    "destination": "github.com",
+                    "host": "github.com",
+                    "port": 443,
+                    "protocol": "tcp",
                     "level": "transport",
-                    "protocol": "https",
                     "reason": "GitHub access"
                 },
                 {
-                    "destination": "140.82.112.0/20",
+                    "host": "140.82.112.0/20",
+                    "port": 443,
+                    "protocol": "tcp",
                     "level": "transport",
                     "reason": "GitHub IP range"
                 }
@@ -1572,33 +1614,35 @@ mod tests {
         }"#;
 
         let policy: Policy = serde_json::from_str(json).unwrap();
-        assert_eq!(policy.version, "1.0.0");
+        assert_eq!(policy.version, "2.0.0");
         assert_eq!(policy.rules.len(), 2);
 
         assert!(matches!(
-            &policy.rules[0].destination,
+            &policy.rules[0].host,
             Destination::Domain(d) if d == "github.com"
         ));
+        assert_eq!(policy.rules[0].port, 443);
         assert_eq!(policy.rules[0].level, AssuranceLevel::Transport);
-        assert_eq!(policy.rules[0].protocol, Protocol::Https);
+        assert_eq!(policy.rules[0].protocol, Protocol::Tcp);
 
         assert!(matches!(
-            &policy.rules[1].destination,
+            &policy.rules[1].host,
             Destination::Cidr(c) if c == "140.82.112.0/20"
         ));
-        // Default protocol when omitted.
-        assert_eq!(policy.rules[1].protocol, Protocol::Any);
+        assert_eq!(policy.rules[1].port, 443);
+        assert_eq!(policy.rules[1].protocol, Protocol::Tcp);
     }
 
     #[test]
     fn parse_policy_with_http_filters() {
         let json = r#"{
-            "version": "1.0.0",
+            "version": "2.0.0",
             "rules": [
                 {
-                    "destination": "api.example.com",
+                    "host": "api.example.com",
+                    "port": 443,
+                    "protocol": "tcp",
                     "level": "http",
-                    "protocol": "https",
                     "http_filters": [
                         {"method": "GET", "path": "/api/v1/*"},
                         {"method": "POST", "path": "/api/v1/*"}
@@ -1626,12 +1670,13 @@ mod tests {
         // The pre-M9-S10 shape: `level: "full"` + `constraints: {methods,
         // paths}`.  No auto-conversion — the error must name the new shape.
         let json = r#"{
-            "version": "1.0.0",
+            "version": "2.0.0",
             "rules": [
                 {
-                    "destination": "api.example.com",
+                    "host": "api.example.com",
+                    "port": 443,
+                    "protocol": "tcp",
                     "level": "full",
-                    "protocol": "https",
                     "constraints": {
                         "methods": ["GET", "POST"],
                         "paths": ["/api/v1/"]
@@ -1654,12 +1699,13 @@ mod tests {
         // Any `constraints` field — even without `level: "full"` — is a
         // leftover from the old shape.
         let json = r#"{
-            "version": "1.0.0",
+            "version": "2.0.0",
             "rules": [
                 {
-                    "destination": "api.example.com",
+                    "host": "api.example.com",
+                    "port": 443,
+                    "protocol": "tcp",
                     "level": "http",
-                    "protocol": "https",
                     "constraints": {
                         "methods": ["GET"],
                         "paths": ["/api"]
@@ -1678,12 +1724,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_policy_with_bare_ip_destination() {
+    fn parse_policy_with_bare_ip_host() {
         let json = r#"{
-            "version": "1.0.0",
+            "version": "2.0.0",
             "rules": [
                 {
-                    "destination": "1.2.3.4",
+                    "host": "1.2.3.4",
+                    "port": 443,
+                    "protocol": "tcp",
                     "level": "transport"
                 }
             ]
@@ -1691,7 +1739,7 @@ mod tests {
 
         let policy: Policy = serde_json::from_str(json).unwrap();
         assert!(matches!(
-            &policy.rules[0].destination,
+            &policy.rules[0].host,
             Destination::Cidr(c) if c == "1.2.3.4"
         ));
     }
@@ -1699,10 +1747,12 @@ mod tests {
     #[test]
     fn parse_deny_level() {
         let json = r#"{
-            "version": "1.0.0",
+            "version": "2.0.0",
             "rules": [
                 {
-                    "destination": "evil.com",
+                    "host": "evil.com",
+                    "port": 443,
+                    "protocol": "tcp",
                     "level": "deny"
                 }
             ]
@@ -1796,7 +1846,7 @@ mod tests {
     #[test]
     fn validate_rejects_incompatible_major_version() {
         let policy = Policy {
-            version: "2.0.0".to_string(),
+            version: "3.0.0".to_string(),
             rules: vec![],
         };
         let err = PolicyCompiler::validate(&policy).unwrap_err();
@@ -1809,7 +1859,7 @@ mod tests {
     #[test]
     fn validate_accepts_compatible_minor_version() {
         let policy = Policy {
-            version: "1.1.0".to_string(),
+            version: "2.1.0".to_string(),
             rules: vec![],
         };
         assert!(PolicyCompiler::validate(&policy).is_ok());
@@ -1820,10 +1870,11 @@ mod tests {
         let policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
-                destination: Destination::Domain("example.com".to_string()),
+                host: Destination::Domain("example.com".to_string()),
                 level: AssuranceLevel::Http {
                     http_filters: vec![http_filter(HttpMethod::Get, "/*")],
                 },
+                port: 53,
                 protocol: Protocol::Udp,
                 reason: None,
             }],
@@ -1841,11 +1892,12 @@ mod tests {
         let policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
-                destination: Destination::Domain("example.com".to_string()),
+                host: Destination::Domain("example.com".to_string()),
                 level: AssuranceLevel::Http {
                     http_filters: vec![],
                 },
-                protocol: Protocol::Https,
+                port: 443,
+                protocol: Protocol::Tcp,
                 reason: None,
             }],
         };
@@ -1863,17 +1915,19 @@ mod tests {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![
                 PolicyRule {
-                    destination: Destination::Domain("example.com".to_string()),
+                    host: Destination::Domain("example.com".to_string()),
                     level: AssuranceLevel::Transport,
-                    protocol: Protocol::Any,
+                    port: 443,
+                    protocol: Protocol::Tcp,
                     reason: None,
                 },
                 PolicyRule {
-                    destination: Destination::Domain("example.com".to_string()),
+                    host: Destination::Domain("example.com".to_string()),
                     level: AssuranceLevel::Http {
                         http_filters: vec![http_filter(HttpMethod::Get, "/*")],
                     },
-                    protocol: Protocol::Https,
+                    port: 443,
+                    protocol: Protocol::Tcp,
                     reason: None,
                 },
             ],
@@ -1891,15 +1945,17 @@ mod tests {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![
                 PolicyRule {
-                    destination: Destination::Domain("example.com".to_string()),
+                    host: Destination::Domain("example.com".to_string()),
                     level: AssuranceLevel::Transport,
-                    protocol: Protocol::Any,
+                    port: 443,
+                    protocol: Protocol::Tcp,
                     reason: None,
                 },
                 PolicyRule {
-                    destination: Destination::Domain("example.com".to_string()),
+                    host: Destination::Domain("example.com".to_string()),
                     level: AssuranceLevel::Transport,
-                    protocol: Protocol::Https,
+                    port: 443,
+                    protocol: Protocol::Tcp,
                     reason: None,
                 },
             ],
@@ -1916,19 +1972,21 @@ mod tests {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![
                 PolicyRule {
-                    destination: Destination::Domain("example.com".to_string()),
+                    host: Destination::Domain("example.com".to_string()),
                     level: AssuranceLevel::Http {
                         http_filters: vec![http_filter(HttpMethod::Get, "/api/*")],
                     },
-                    protocol: Protocol::Https,
+                    port: 443,
+                    protocol: Protocol::Tcp,
                     reason: None,
                 },
                 PolicyRule {
-                    destination: Destination::Domain("example.com".to_string()),
+                    host: Destination::Domain("example.com".to_string()),
                     level: AssuranceLevel::Http {
                         http_filters: vec![http_filter(HttpMethod::Post, "/webhook")],
                     },
-                    protocol: Protocol::Https,
+                    port: 443,
+                    protocol: Protocol::Tcp,
                     reason: None,
                 },
             ],
@@ -1941,9 +1999,10 @@ mod tests {
         let policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
-                destination: Destination::Cidr("999.999.999.999/24".to_string()),
+                host: Destination::Cidr("999.999.999.999/24".to_string()),
                 level: AssuranceLevel::Transport,
-                protocol: Protocol::Any,
+                port: 443,
+                protocol: Protocol::Tcp,
                 reason: None,
             }],
         };
@@ -1959,9 +2018,10 @@ mod tests {
         let policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
-                destination: Destination::Cidr("10.0.0.0/33".to_string()),
+                host: Destination::Cidr("10.0.0.0/33".to_string()),
                 level: AssuranceLevel::Transport,
-                protocol: Protocol::Any,
+                port: 443,
+                protocol: Protocol::Tcp,
                 reason: None,
             }],
         };
@@ -1977,9 +2037,10 @@ mod tests {
         let policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
-                destination: Destination::Domain("not a domain!".to_string()),
+                host: Destination::Domain("not a domain!".to_string()),
                 level: AssuranceLevel::Transport,
-                protocol: Protocol::Any,
+                port: 443,
+                protocol: Protocol::Tcp,
                 reason: None,
             }],
         };
@@ -1995,9 +2056,10 @@ mod tests {
         let policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
-                destination: Destination::Domain("-example.com".to_string()),
+                host: Destination::Domain("-example.com".to_string()),
                 level: AssuranceLevel::Transport,
-                protocol: Protocol::Any,
+                port: 443,
+                protocol: Protocol::Tcp,
                 reason: None,
             }],
         };
@@ -2013,9 +2075,10 @@ mod tests {
         let policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
-                destination: Destination::Domain("*.github.com".to_string()),
+                host: Destination::Domain("*.github.com".to_string()),
                 level: AssuranceLevel::Transport,
-                protocol: Protocol::Any,
+                port: 443,
+                protocol: Protocol::Tcp,
                 reason: None,
             }],
         };
@@ -2066,9 +2129,10 @@ mod tests {
         let policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
-                destination: Destination::Domain("blocked.com".to_string()),
+                host: Destination::Domain("blocked.com".to_string()),
                 level: AssuranceLevel::Deny,
-                protocol: Protocol::Any,
+                port: 443,
+                protocol: Protocol::Tcp,
                 reason: Some("Explicitly blocked".to_string()),
             }],
         };
@@ -2132,9 +2196,10 @@ mod tests {
         let policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
-                destination: Destination::Domain("github.com".to_string()),
+                host: Destination::Domain("github.com".to_string()),
                 level: AssuranceLevel::Transport,
-                protocol: Protocol::Https,
+                port: 443,
+                protocol: Protocol::Tcp,
                 reason: Some("GitHub access".to_string()),
             }],
         };
@@ -2272,15 +2337,17 @@ mod tests {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![
                 PolicyRule {
-                    destination: Destination::Domain("allowed.com".to_string()),
+                    host: Destination::Domain("allowed.com".to_string()),
                     level: AssuranceLevel::Transport,
-                    protocol: Protocol::Any,
+                    port: 443,
+                    protocol: Protocol::Tcp,
                     reason: None,
                 },
                 PolicyRule {
-                    destination: Destination::Domain("denied.com".to_string()),
+                    host: Destination::Domain("denied.com".to_string()),
                     level: AssuranceLevel::Deny,
-                    protocol: Protocol::Any,
+                    port: 443,
+                    protocol: Protocol::Tcp,
                     reason: None,
                 },
             ],
@@ -2334,11 +2401,12 @@ mod tests {
         let policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
-                destination: Destination::Domain("api.example.com".to_string()),
+                host: Destination::Domain("api.example.com".to_string()),
                 level: AssuranceLevel::Http {
                     http_filters: vec![http_filter(HttpMethod::Get, "/api/*")],
                 },
-                protocol: Protocol::Https,
+                port: 443,
+                protocol: Protocol::Tcp,
                 reason: None,
             }],
         };
@@ -2361,14 +2429,15 @@ mod tests {
         let policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
-                destination: Destination::Domain("api.example.com".to_string()),
+                host: Destination::Domain("api.example.com".to_string()),
                 level: AssuranceLevel::Http {
                     http_filters: vec![
                         http_filter(HttpMethod::Get, "/api"),
                         http_filter(HttpMethod::Post, "/webhook"),
                     ],
                 },
-                protocol: Protocol::Https,
+                port: 443,
+                protocol: Protocol::Tcp,
                 reason: None,
             }],
         };
@@ -2416,11 +2485,12 @@ mod tests {
         let method_policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
-                destination: Destination::Domain("httpbin.org".to_string()),
+                host: Destination::Domain("httpbin.org".to_string()),
                 level: AssuranceLevel::Http {
                     http_filters: vec![http_filter(HttpMethod::Get, "/*")],
                 },
-                protocol: Protocol::Https,
+                port: 443,
+                protocol: Protocol::Tcp,
                 reason: None,
             }],
         };
@@ -2429,11 +2499,12 @@ mod tests {
         let path_policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
-                destination: Destination::Domain("httpbin.org".to_string()),
+                host: Destination::Domain("httpbin.org".to_string()),
                 level: AssuranceLevel::Http {
                     http_filters: vec![http_filter(HttpMethod::Any, "/api/*")],
                 },
-                protocol: Protocol::Https,
+                port: 443,
+                protocol: Protocol::Tcp,
                 reason: None,
             }],
         };
@@ -2478,7 +2549,7 @@ mod tests {
         let rules = preset_allow_github();
         let domains: Vec<String> = rules
             .iter()
-            .filter_map(|r| match &r.destination {
+            .filter_map(|r| match &r.host {
                 Destination::Domain(d) => Some(d.clone()),
                 _ => None,
             })
@@ -2508,7 +2579,7 @@ mod tests {
         let rules = preset_allow_npm();
         let domains: Vec<String> = rules
             .iter()
-            .filter_map(|r| match &r.destination {
+            .filter_map(|r| match &r.host {
                 Destination::Domain(d) => Some(d.clone()),
                 _ => None,
             })
@@ -2643,20 +2714,23 @@ mod tests {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![
                 PolicyRule {
-                    destination: Destination::Domain("github.com".to_string()),
+                    host: Destination::Domain("github.com".to_string()),
                     level: AssuranceLevel::Transport,
-                    protocol: Protocol::Https,
+                    port: 443,
+                    protocol: Protocol::Tcp,
                     reason: None,
                 },
                 PolicyRule {
-                    destination: Destination::Domain("blocked.com".to_string()),
+                    host: Destination::Domain("blocked.com".to_string()),
                     level: AssuranceLevel::Deny,
-                    protocol: Protocol::Any,
+                    port: 443,
+                    protocol: Protocol::Tcp,
                     reason: None,
                 },
                 PolicyRule {
-                    destination: Destination::Cidr("10.0.0.0/8".to_string()),
+                    host: Destination::Cidr("10.0.0.0/8".to_string()),
                     level: AssuranceLevel::Transport,
+                    port: 443,
                     protocol: Protocol::Tcp,
                     reason: None,
                 },
@@ -2677,23 +2751,11 @@ mod tests {
         assert!(config.rules.is_empty());
     }
 
-    // -- Protocol default behavior -------------------------------------------
-
-    #[test]
-    fn protocol_default_is_any() {
-        assert_eq!(Protocol::default(), Protocol::Any);
-    }
+    // -- Protocol serialization ---------------------------------------------
 
     #[test]
     fn protocol_serde_roundtrip() {
-        let protocols = vec![
-            Protocol::Tcp,
-            Protocol::Udp,
-            Protocol::Http,
-            Protocol::Https,
-            Protocol::Any,
-        ];
-        for proto in protocols {
+        for proto in [Protocol::Tcp, Protocol::Udp] {
             let json = serde_json::to_string(&proto).unwrap();
             let parsed: Protocol = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, proto);
@@ -2707,8 +2769,9 @@ mod tests {
         let policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
-                destination: Destination::Cidr("8.8.8.0/24".to_string()),
+                host: Destination::Cidr("8.8.8.0/24".to_string()),
                 level: AssuranceLevel::Transport,
+                port: 53,
                 protocol: Protocol::Udp,
                 reason: Some("DNS servers".to_string()),
             }],
@@ -2733,15 +2796,17 @@ mod tests {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![
                 PolicyRule {
-                    destination: Destination::Domain("secure.example.com".to_string()),
+                    host: Destination::Domain("secure.example.com".to_string()),
                     level: AssuranceLevel::Tls,
-                    protocol: Protocol::Https,
+                    port: 443,
+                    protocol: Protocol::Tcp,
                     reason: Some("TLS passthrough".to_string()),
                 },
                 PolicyRule {
-                    destination: Destination::Domain("api.secure.io".to_string()),
+                    host: Destination::Domain("api.secure.io".to_string()),
                     level: AssuranceLevel::Tls,
-                    protocol: Protocol::Https,
+                    port: 443,
+                    protocol: Protocol::Tcp,
                     reason: Some("Another TLS destination".to_string()),
                 },
             ],
@@ -2755,11 +2820,12 @@ mod tests {
         Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
-                destination: Destination::Domain("inspected.example.com".to_string()),
+                host: Destination::Domain("inspected.example.com".to_string()),
                 level: AssuranceLevel::Http {
                     http_filters: vec![http_filter(HttpMethod::Any, "/*")],
                 },
-                protocol: Protocol::Https,
+                port: 443,
+                protocol: Protocol::Tcp,
                 reason: Some("Full inspection".to_string()),
             }],
         }
@@ -2769,7 +2835,7 @@ mod tests {
         Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
-                destination: Destination::Domain("api.example.com".to_string()),
+                host: Destination::Domain("api.example.com".to_string()),
                 level: AssuranceLevel::Http {
                     http_filters: vec![
                         http_filter(HttpMethod::Get, "/api/v1/*"),
@@ -2778,7 +2844,8 @@ mod tests {
                         http_filter(HttpMethod::Post, "/health"),
                     ],
                 },
-                protocol: Protocol::Https,
+                port: 443,
+                protocol: Protocol::Tcp,
                 reason: Some("Constrained API access".to_string()),
             }],
         }
@@ -2789,23 +2856,26 @@ mod tests {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![
                 PolicyRule {
-                    destination: Destination::Domain("github.com".to_string()),
+                    host: Destination::Domain("github.com".to_string()),
                     level: AssuranceLevel::Transport,
-                    protocol: Protocol::Https,
+                    port: 443,
+                    protocol: Protocol::Tcp,
                     reason: Some("L1 transport".to_string()),
                 },
                 PolicyRule {
-                    destination: Destination::Domain("pinned.example.com".to_string()),
+                    host: Destination::Domain("pinned.example.com".to_string()),
                     level: AssuranceLevel::Tls,
-                    protocol: Protocol::Https,
+                    port: 443,
+                    protocol: Protocol::Tcp,
                     reason: Some("L2 TLS passthrough".to_string()),
                 },
                 PolicyRule {
-                    destination: Destination::Domain("monitored.example.com".to_string()),
+                    host: Destination::Domain("monitored.example.com".to_string()),
                     level: AssuranceLevel::Http {
                         http_filters: vec![http_filter(HttpMethod::Get, "/api/*")],
                     },
-                    protocol: Protocol::Https,
+                    port: 443,
+                    protocol: Protocol::Tcp,
                     reason: Some("L3 full inspection".to_string()),
                 },
             ],
@@ -3081,11 +3151,12 @@ mod tests {
         let cidr_policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
-                destination: Destination::Cidr("10.0.0.0/24".to_string()),
+                host: Destination::Cidr("10.0.0.0/24".to_string()),
                 level: AssuranceLevel::Http {
                     http_filters: vec![http_filter(HttpMethod::Any, "/*")],
                 },
-                protocol: Protocol::Https,
+                port: 443,
+                protocol: Protocol::Tcp,
                 reason: None,
             }],
         };
@@ -3161,11 +3232,12 @@ mod tests {
         let cidr_policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
-                destination: Destination::Cidr("10.0.0.0/24".to_string()),
+                host: Destination::Cidr("10.0.0.0/24".to_string()),
                 level: AssuranceLevel::Http {
                     http_filters: vec![http_filter(HttpMethod::Any, "/*")],
                 },
-                protocol: Protocol::Https,
+                port: 443,
+                protocol: Protocol::Tcp,
                 reason: None,
             }],
         };
@@ -3185,11 +3257,12 @@ mod tests {
         let wildcard_policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
-                destination: Destination::Domain("*".to_string()),
+                host: Destination::Domain("*".to_string()),
                 level: AssuranceLevel::Http {
                     http_filters: vec![http_filter(HttpMethod::Any, "/*")],
                 },
-                protocol: Protocol::Https,
+                port: 443,
+                protocol: Protocol::Tcp,
                 reason: None,
             }],
         };
@@ -3236,11 +3309,12 @@ mod tests {
         let policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
-                destination: Destination::Domain("*".to_string()),
+                host: Destination::Domain("*".to_string()),
                 level: AssuranceLevel::Http {
                     http_filters: vec![http_filter(HttpMethod::Any, "/*")],
                 },
-                protocol: Protocol::Https,
+                port: 443,
+                protocol: Protocol::Tcp,
                 reason: None,
             }],
         };
@@ -3534,9 +3608,10 @@ mod tests {
         let policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
-                destination: Destination::Domain("*.example.com".to_string()),
+                host: Destination::Domain("*.example.com".to_string()),
                 level: AssuranceLevel::Tls,
-                protocol: Protocol::Https,
+                port: 443,
+                protocol: Protocol::Tcp,
                 reason: None,
             }],
         };
@@ -3570,11 +3645,12 @@ mod tests {
         let policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![PolicyRule {
-                destination: Destination::Domain("*.inspected.io".to_string()),
+                host: Destination::Domain("*.inspected.io".to_string()),
                 level: AssuranceLevel::Http {
                     http_filters: vec![http_filter(HttpMethod::Any, "/*")],
                 },
-                protocol: Protocol::Https,
+                port: 443,
+                protocol: Protocol::Tcp,
                 reason: None,
             }],
         };
@@ -3625,21 +3701,24 @@ mod tests {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![
                 PolicyRule {
-                    destination: Destination::Domain("a.example.com".to_string()),
+                    host: Destination::Domain("a.example.com".to_string()),
                     level: AssuranceLevel::Tls,
-                    protocol: Protocol::Https,
+                    port: 443,
+                    protocol: Protocol::Tcp,
                     reason: None,
                 },
                 PolicyRule {
-                    destination: Destination::Domain("b.example.com".to_string()),
+                    host: Destination::Domain("b.example.com".to_string()),
                     level: AssuranceLevel::Tls,
-                    protocol: Protocol::Https,
+                    port: 443,
+                    protocol: Protocol::Tcp,
                     reason: None,
                 },
                 PolicyRule {
-                    destination: Destination::Domain("c.example.com".to_string()),
+                    host: Destination::Domain("c.example.com".to_string()),
                     level: AssuranceLevel::Tls,
-                    protocol: Protocol::Https,
+                    port: 443,
+                    protocol: Protocol::Tcp,
                     reason: None,
                 },
             ],
@@ -3684,19 +3763,21 @@ mod tests {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![
                 PolicyRule {
-                    destination: Destination::Domain("api.one.com".to_string()),
+                    host: Destination::Domain("api.one.com".to_string()),
                     level: AssuranceLevel::Http {
                         http_filters: vec![http_filter(HttpMethod::Get, "/*")],
                     },
-                    protocol: Protocol::Https,
+                    port: 443,
+                    protocol: Protocol::Tcp,
                     reason: None,
                 },
                 PolicyRule {
-                    destination: Destination::Domain("api.two.com".to_string()),
+                    host: Destination::Domain("api.two.com".to_string()),
                     level: AssuranceLevel::Http {
                         http_filters: vec![http_filter(HttpMethod::Any, "/*")],
                     },
-                    protocol: Protocol::Https,
+                    port: 443,
+                    protocol: Protocol::Tcp,
                     reason: None,
                 },
             ],

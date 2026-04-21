@@ -111,7 +111,8 @@ impl From<&Policy> for PolicyDto {
 impl From<&PolicyRule> for PolicyRuleDto {
     fn from(rule: &PolicyRule) -> Self {
         Self {
-            destination: rule.destination.clone(),
+            host: rule.host.clone(),
+            port: rule.port,
             protocol: rule.protocol,
             level: (&rule.level).into(),
             reason: rule.reason.clone(),
@@ -156,9 +157,10 @@ mod tests {
     fn session_dto_includes_policy_when_attached() {
         let session = Session::new(Some("attached".into()));
         let policy = Policy {
-            version: "1.0.0".into(),
+            version: "2.0.0".into(),
             rules: vec![PolicyRule {
-                destination: Destination::Domain("example.com".into()),
+                host: Destination::Domain("example.com".into()),
+                port: 443,
                 protocol: Protocol::Tcp,
                 reason: None,
                 level: AssuranceLevel::Transport,
@@ -168,20 +170,21 @@ mod tests {
         let dto = SessionDto::from(&session).with_policy(Some(&policy));
         let json = serde_json::to_string(&dto).unwrap();
         assert!(json.contains("\"policy\""), "json = {json}");
-        assert!(json.contains("\"version\":\"1.0.0\""), "json = {json}");
+        assert!(json.contains("\"version\":\"2.0.0\""), "json = {json}");
     }
 
     #[test]
     fn policy_dto_serializes_http_variant_with_flattened_filters() {
         // The wire shape for an http-level rule is:
-        //   {"destination": "...", "protocol": "tcp",
+        //   {"host": "...", "port": 443, "protocol": "tcp",
         //    "level": "http",
         //    "http_filters": [{"method": "GET", "path": "/*"}]}
         // With `level` and `http_filters` at the rule object's top level.
         let policy = Policy {
-            version: "1.0.0".into(),
+            version: "2.0.0".into(),
             rules: vec![PolicyRule {
-                destination: Destination::Domain("api.example.com".into()),
+                host: Destination::Domain("api.example.com".into()),
+                port: 443,
                 protocol: Protocol::Tcp,
                 reason: Some("api access".into()),
                 level: AssuranceLevel::Http {
@@ -221,22 +224,25 @@ mod tests {
     fn policy_dto_non_http_variants_omit_http_filters_on_wire() {
         // `deny`, `transport`, `tls` must not emit an `http_filters` key.
         let policy = Policy {
-            version: "1.0.0".into(),
+            version: "2.0.0".into(),
             rules: vec![
                 PolicyRule {
-                    destination: Destination::Domain("a.test".into()),
+                    host: Destination::Domain("a.test".into()),
+                    port: 443,
                     protocol: Protocol::Tcp,
                     reason: None,
                     level: AssuranceLevel::Deny,
                 },
                 PolicyRule {
-                    destination: Destination::Domain("b.test".into()),
+                    host: Destination::Domain("b.test".into()),
+                    port: 443,
                     protocol: Protocol::Tcp,
                     reason: None,
                     level: AssuranceLevel::Transport,
                 },
                 PolicyRule {
-                    destination: Destination::Domain("c.test".into()),
+                    host: Destination::Domain("c.test".into()),
+                    port: 443,
                     protocol: Protocol::Tcp,
                     reason: None,
                     level: AssuranceLevel::Tls,

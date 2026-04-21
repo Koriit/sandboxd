@@ -883,20 +883,19 @@ fn render_policy_rule(idx: usize, rule: &PolicyRuleDto, out: &mut String) {
     };
 
     let protocol_str = protocol_to_str(&rule.protocol);
-    let destination_str: String = rule.destination.clone().into();
+    let host_str: String = rule.host.clone().into();
+    let port = rule.port;
 
-    // Layout: `  [i] <action> <level><pad><destination>`. The combined
+    // Layout: `  [i] <action> <level><pad><host>:<port>`. The combined
     // `<action> <level>` segment is padded to a fixed width (16) so the
-    // destination column lines up across rules regardless of level.  For
+    // host column lines up across rules regardless of level.  For
     // `deny` (no level word) we emit the action alone and rely on the
     // same padding to align the column.
+    let target = format!("{host_str}:{port}");
     let header = if level_word.is_empty() {
-        format!("  [{idx}] {:<16}{destination_str}", action)
+        format!("  [{idx}] {:<16}{target}", action)
     } else {
-        format!(
-            "  [{idx}] {:<16}{destination_str}",
-            format!("{action} {level_word}")
-        )
+        format!("  [{idx}] {:<16}{target}", format!("{action} {level_word}"))
     };
     let _ = writeln!(out, "{header}");
 
@@ -922,9 +921,6 @@ fn protocol_to_str(protocol: &sandbox_core::Protocol) -> &'static str {
     match protocol {
         Protocol::Tcp => "tcp",
         Protocol::Udp => "udp",
-        Protocol::Http => "http",
-        Protocol::Https => "https",
-        Protocol::Any => "any",
     }
 }
 
@@ -1706,7 +1702,7 @@ mod tests {
                 workspace: None,
                 no_hardening: false,
                 no_cache: false,
-                }
+            }
         ));
     }
 
@@ -2720,10 +2716,11 @@ mod tests {
     #[test]
     fn describe_renders_full_rule_block_with_filters_and_reason() {
         let policy = PolicyDto {
-            version: "1.0".into(),
+            version: "2.0".into(),
             rules: vec![
                 PolicyRuleDto {
-                    destination: Destination::Domain("github.com".into()),
+                    host: Destination::Domain("github.com".into()),
+                    port: 443,
                     protocol: Protocol::Tcp,
                     level: PolicyLevelDto::Http {
                         http_filters: vec![HttpFilter {
@@ -2734,14 +2731,16 @@ mod tests {
                     reason: Some("fetch repo metadata".into()),
                 },
                 PolicyRuleDto {
-                    destination: Destination::Domain("registry.npmjs.org".into()),
+                    host: Destination::Domain("registry.npmjs.org".into()),
+                    port: 443,
                     protocol: Protocol::Tcp,
                     level: PolicyLevelDto::Tls,
                     reason: None,
                 },
                 PolicyRuleDto {
-                    destination: Destination::Domain("*".into()),
-                    protocol: Protocol::Any,
+                    host: Destination::Cidr("0.0.0.0/0".into()),
+                    port: 443,
+                    protocol: Protocol::Tcp,
                     level: PolicyLevelDto::Deny,
                     reason: Some("default deny".into()),
                 },
@@ -2758,7 +2757,7 @@ mod tests {
 
         // Header.
         assert!(
-            rendered.contains("Policy (v1.0, 3 rules):"),
+            rendered.contains("Policy (v2.0, 3 rules):"),
             "policy header missing, got:\n{rendered}"
         );
 
@@ -2768,8 +2767,8 @@ mod tests {
             "expected rule 0 action/level, got:\n{rendered}"
         );
         assert!(
-            rendered.contains("github.com"),
-            "expected rule 0 destination, got:\n{rendered}"
+            rendered.contains("github.com:443"),
+            "expected rule 0 host:port, got:\n{rendered}"
         );
         assert!(
             rendered.contains("http_filters: GET /repos/*"),
@@ -2785,11 +2784,11 @@ mod tests {
             "expected rule 1 action/level, got:\n{rendered}"
         );
         // Rule 1 has no reason → no reason line for that block.  We check
-        // presence of the destination and protocol to make sure rule 1 was
+        // presence of the host and protocol to make sure rule 1 was
         // rendered at all.
         assert!(
-            rendered.contains("registry.npmjs.org"),
-            "expected rule 1 destination, got:\n{rendered}"
+            rendered.contains("registry.npmjs.org:443"),
+            "expected rule 1 host:port, got:\n{rendered}"
         );
 
         assert!(
@@ -2808,10 +2807,11 @@ mod tests {
     #[test]
     fn describe_visual_preview() {
         let policy = PolicyDto {
-            version: "1.0".into(),
+            version: "2.0".into(),
             rules: vec![
                 PolicyRuleDto {
-                    destination: Destination::Domain("github.com".into()),
+                    host: Destination::Domain("github.com".into()),
+                    port: 443,
                     protocol: Protocol::Tcp,
                     level: PolicyLevelDto::Http {
                         http_filters: vec![HttpFilter {
@@ -2822,14 +2822,16 @@ mod tests {
                     reason: Some("fetch repo metadata".into()),
                 },
                 PolicyRuleDto {
-                    destination: Destination::Domain("registry.npmjs.org".into()),
+                    host: Destination::Domain("registry.npmjs.org".into()),
+                    port: 443,
                     protocol: Protocol::Tcp,
                     level: PolicyLevelDto::Tls,
                     reason: None,
                 },
                 PolicyRuleDto {
-                    destination: Destination::Domain("*".into()),
-                    protocol: Protocol::Any,
+                    host: Destination::Cidr("0.0.0.0/0".into()),
+                    port: 443,
+                    protocol: Protocol::Tcp,
                     level: PolicyLevelDto::Deny,
                     reason: Some("default deny".into()),
                 },
@@ -2848,9 +2850,10 @@ mod tests {
     #[test]
     fn describe_renders_multiple_http_filters_one_per_line() {
         let policy = PolicyDto {
-            version: "1.0".into(),
+            version: "2.0".into(),
             rules: vec![PolicyRuleDto {
-                destination: Destination::Domain("api.example.com".into()),
+                host: Destination::Domain("api.example.com".into()),
+                port: 443,
                 protocol: Protocol::Tcp,
                 level: PolicyLevelDto::Http {
                     http_filters: vec![
