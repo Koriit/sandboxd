@@ -53,11 +53,6 @@ enum Command {
         /// Path to a policy JSON file to apply after creation.
         #[arg(long)]
         policy: Option<String>,
-        /// Create the session with the synthetic unrestricted policy —
-        /// all destinations, all methods, all paths, traffic logged through
-        /// mitmproxy.  Mutually exclusive with `--policy`.
-        #[arg(long, conflicts_with = "policy")]
-        unrestricted: bool,
         /// Git repository URL to clone into /home/agent/workspace/ after session setup.
         ///
         /// Mutually exclusive with --workspace.
@@ -183,34 +178,18 @@ enum Command {
 enum PolicyAction {
     /// Update the policy for a session.
     ///
-    /// Exactly one of `--policy`, `--unrestricted`, or `--clear` must be
-    /// supplied.  `--clear` is idempotent (safe to call on a session that
-    /// already has no policy).
+    /// Exactly one of `--policy` or `--clear` must be supplied.  `--clear` is
+    /// idempotent (safe to call on a session that already has no policy).
     Update {
         /// Session name or ID.
         session: String,
         /// Path to the policy JSON file to apply.
-        #[arg(
-            long,
-            conflicts_with_all = ["unrestricted", "clear"],
-        )]
+        #[arg(long, conflicts_with = "clear")]
         policy: Option<String>,
-        /// Apply the synthetic unrestricted policy — all destinations, all
-        /// methods, all paths, traffic logged through mitmproxy.  Mutually
-        /// exclusive with `--policy` and `--clear`.
-        #[arg(
-            long,
-            conflicts_with_all = ["policy", "clear"],
-        )]
-        unrestricted: bool,
         /// Remove any policy from the session and revert to the fail-closed
         /// default (empty CoreDNS allow-list, deny-all mitmproxy/Envoy).
-        /// Idempotent.  Mutually exclusive with `--policy` and
-        /// `--unrestricted`.
-        #[arg(
-            long,
-            conflicts_with_all = ["policy", "unrestricted"],
-        )]
+        /// Idempotent.  Mutually exclusive with `--policy`.
+        #[arg(long, conflicts_with = "policy")]
         clear: bool,
     },
 }
@@ -250,7 +229,6 @@ fn build_request(command: &Command) -> Option<Request<String>> {
             disk,
             template,
             policy,
-            unrestricted,
             repo,
             boot_cmd,
             workspace,
@@ -282,16 +260,6 @@ fn build_request(command: &Command) -> Option<Request<String>> {
                         process::exit(1);
                     }
                 };
-                body.insert("policy".into(), policy_value);
-            } else if *unrestricted {
-                // The synthetic unrestricted policy is constructed from
-                // `Policy::unrestricted()` and serialized as normal JSON.
-                // This keeps the wire format identical to a user-authored
-                // unrestricted policy — the daemon does not treat it
-                // specially (no flag, no sidecar), only the describe
-                // renderer recognises the shape for display.
-                let policy_value = serde_json::to_value(Policy::unrestricted())
-                    .expect("Policy::unrestricted must serialize");
                 body.insert("policy".into(), policy_value);
             }
             if let Some(r) = repo {
@@ -380,20 +348,16 @@ fn build_request(command: &Command) -> Option<Request<String>> {
             PolicyAction::Update {
                 session,
                 policy,
-                unrestricted,
                 clear,
             } => {
-                // Exactly one of the three must be present.  clap's
-                // `conflicts_with_all` catches the "more than one" case, but
-                // "none" has to be validated here.
-                let selected = [policy.is_some(), *unrestricted, *clear]
-                    .iter()
-                    .filter(|x| **x)
-                    .count();
+                // Exactly one of the two must be present.  clap's
+                // `conflicts_with` catches the "both" case, but "none" has to
+                // be validated here.
+                let selected = [policy.is_some(), *clear].iter().filter(|x| **x).count();
                 if selected != 1 {
                     eprintln!(
                         "Error: `sandbox policy update` requires exactly one of \
-                         `--policy <path>`, `--unrestricted`, or `--clear`."
+                         `--policy <path>` or `--clear`."
                     );
                     process::exit(1);
                 }
@@ -407,35 +371,28 @@ fn build_request(command: &Command) -> Option<Request<String>> {
                         .body(String::new())
                         .expect("failed to build request")
                 } else {
-                    // POST a policy document — either user-supplied or the
-                    // synthetic unrestricted one.  `UpdatePolicyRequest` is
+                    // POST a policy document.  `UpdatePolicyRequest` is
                     // `#[serde(flatten)]` over the inner `Policy`, so the
                     // wire body is the raw policy JSON at the top level.
-                    let policy_json = if let Some(path) = policy {
-                        let body = match std::fs::read_to_string(path) {
-                            Ok(content) => content,
-                            Err(e) => {
-                                eprintln!("Error: cannot read policy file '{path}': {e}");
-                                process::exit(1);
-                            }
-                        };
-                        if let Err(e) = serde_json::from_str::<Policy>(&body) {
-                            eprintln!("Error: invalid policy JSON in '{path}': {e}");
+                    let path = policy
+                        .as_ref()
+                        .expect("selected == 1 and !*clear implies policy.is_some()");
+                    let body = match std::fs::read_to_string(path) {
+                        Ok(content) => content,
+                        Err(e) => {
+                            eprintln!("Error: cannot read policy file '{path}': {e}");
                             process::exit(1);
                         }
-                        body
-                    } else {
-                        // `*unrestricted` — synthetic policy serialized on
-                        // the client so the daemon only ever sees a normal
-                        // `Policy` JSON document.
-                        serde_json::to_string(&Policy::unrestricted())
-                            .expect("Policy::unrestricted must serialize")
                     };
+                    if let Err(e) = serde_json::from_str::<Policy>(&body) {
+                        eprintln!("Error: invalid policy JSON in '{path}': {e}");
+                        process::exit(1);
+                    }
                     Request::builder()
                         .method("POST")
                         .uri(format!("/sessions/{session}/policy"))
                         .header("content-type", "application/json")
-                        .body(policy_json)
+                        .body(body)
                         .expect("failed to build request")
                 }
             }
@@ -897,15 +854,6 @@ fn render_policy_block(policy: Option<&PolicyDto>, out: &mut String) {
         Some(p) => p,
     };
 
-    // Unrestricted policies round-trip through the DTO like any other
-    // policy; detect the shape on the DTO side so we can collapse it to a
-    // single-line summary for `describe`.  `inspect` (pretty JSON) remains
-    // the authoritative full dump.
-    if is_unrestricted_dto(policy) {
-        let _ = writeln!(out, "Policy: unrestricted (logged)");
-        return;
-    }
-
     let _ = writeln!(
         out,
         "Policy (v{}, {} rules):",
@@ -914,30 +862,6 @@ fn render_policy_block(policy: Option<&PolicyDto>, out: &mut String) {
     );
     for (i, rule) in policy.rules.iter().enumerate() {
         render_policy_rule(i, rule, out);
-    }
-}
-
-/// Return `true` when a wire-shape policy matches what
-/// [`sandbox_core::Policy::unrestricted`] produces: exactly one rule with
-/// destination `*`, Http level, single `ANY /*` filter.  Extra fields
-/// (`reason`, `protocol`) are ignored so a user-tagged unrestricted policy
-/// still collapses to the short summary.
-fn is_unrestricted_dto(policy: &PolicyDto) -> bool {
-    use sandbox_core::{Destination, HttpMethod};
-    if policy.rules.len() != 1 {
-        return false;
-    }
-    let rule = &policy.rules[0];
-    if !matches!(&rule.destination, Destination::Domain(d) if d == "*") {
-        return false;
-    }
-    match &rule.level {
-        PolicyLevelDto::Http { http_filters } => {
-            http_filters.len() == 1
-                && http_filters[0].method == HttpMethod::Any
-                && http_filters[0].path == "/*"
-        }
-        _ => false,
     }
 }
 
@@ -1782,8 +1706,7 @@ mod tests {
                 workspace: None,
                 no_hardening: false,
                 no_cache: false,
-                unrestricted: false,
-            }
+                }
         ));
     }
 
@@ -1977,7 +1900,6 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: false,
-            unrestricted: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         assert_eq!(req.method(), "POST");
@@ -2003,7 +1925,6 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: false,
-            unrestricted: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         assert_eq!(req.method(), "POST");
@@ -2029,7 +1950,6 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: false,
-            unrestricted: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -2255,41 +2175,11 @@ mod tests {
                     PolicyAction::Update {
                         session,
                         policy,
-                        unrestricted,
                         clear,
                     },
             } => {
                 assert_eq!(session, "my-session");
                 assert_eq!(policy.as_deref(), Some("/tmp/policy.json"));
-                assert!(!unrestricted);
-                assert!(!clear);
-            }
-            _ => panic!("expected Policy Update command"),
-        }
-    }
-
-    #[test]
-    fn parse_policy_update_with_unrestricted() {
-        let cli = Cli::parse_from([
-            "sandbox",
-            "policy",
-            "update",
-            "my-session",
-            "--unrestricted",
-        ]);
-        match &cli.command {
-            Command::Policy {
-                action:
-                    PolicyAction::Update {
-                        session,
-                        policy,
-                        unrestricted,
-                        clear,
-                    },
-            } => {
-                assert_eq!(session, "my-session");
-                assert!(policy.is_none());
-                assert!(*unrestricted);
                 assert!(!clear);
             }
             _ => panic!("expected Policy Update command"),
@@ -2305,51 +2195,15 @@ mod tests {
                     PolicyAction::Update {
                         session,
                         policy,
-                        unrestricted,
                         clear,
                     },
             } => {
                 assert_eq!(session, "my-session");
                 assert!(policy.is_none());
-                assert!(!unrestricted);
                 assert!(*clear);
             }
             _ => panic!("expected Policy Update command"),
         }
-    }
-
-    #[test]
-    fn parse_policy_update_conflicts_policy_and_unrestricted() {
-        // clap should reject --policy + --unrestricted via `conflicts_with_all`.
-        let result = Cli::try_parse_from([
-            "sandbox",
-            "policy",
-            "update",
-            "my-session",
-            "--policy",
-            "/tmp/p.json",
-            "--unrestricted",
-        ]);
-        assert!(
-            result.is_err(),
-            "expected clap error for conflicting --policy + --unrestricted"
-        );
-    }
-
-    #[test]
-    fn parse_policy_update_conflicts_clear_and_unrestricted() {
-        let result = Cli::try_parse_from([
-            "sandbox",
-            "policy",
-            "update",
-            "my-session",
-            "--clear",
-            "--unrestricted",
-        ]);
-        assert!(
-            result.is_err(),
-            "expected clap error for conflicting --clear + --unrestricted"
-        );
     }
 
     #[test]
@@ -2366,37 +2220,6 @@ mod tests {
         assert!(
             result.is_err(),
             "expected clap error for conflicting --policy + --clear"
-        );
-    }
-
-    #[test]
-    fn parse_create_with_unrestricted_flag() {
-        let cli = Cli::parse_from(["sandbox", "create", "--unrestricted"]);
-        match &cli.command {
-            Command::Create {
-                policy,
-                unrestricted,
-                ..
-            } => {
-                assert!(policy.is_none());
-                assert!(*unrestricted);
-            }
-            _ => panic!("expected Create command"),
-        }
-    }
-
-    #[test]
-    fn parse_create_conflicts_policy_and_unrestricted() {
-        let result = Cli::try_parse_from([
-            "sandbox",
-            "create",
-            "--policy",
-            "/tmp/p.json",
-            "--unrestricted",
-        ]);
-        assert!(
-            result.is_err(),
-            "expected clap error for conflicting --policy + --unrestricted on create"
         );
     }
 
@@ -2495,7 +2318,6 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: false,
-            unrestricted: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -2517,7 +2339,6 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: false,
-            unrestricted: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -2567,7 +2388,6 @@ mod tests {
             workspace: None,
             no_hardening: true,
             no_cache: false,
-            unrestricted: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -2591,7 +2411,6 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: false,
-            unrestricted: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -2739,7 +2558,6 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: true,
-            unrestricted: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -2763,7 +2581,6 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: false,
-            unrestricted: false,
         };
         let req = build_request(&cmd).expect("should produce request");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -2879,47 +2696,6 @@ mod tests {
             sessions: vec!["alpha".into()],
         };
         assert!(build_request(&cmd).is_none());
-    }
-
-    #[test]
-    fn describe_renders_unrestricted_sentinel_line() {
-        // Mirror the wire shape of `Policy::unrestricted()` — a single Http
-        // rule on `*` with an ANY /* filter — and confirm the describe
-        // renderer collapses it to a single-line summary.
-        let policy = PolicyDto {
-            version: sandbox_core::policy::SCHEMA_VERSION.to_string(),
-            rules: vec![PolicyRuleDto {
-                destination: Destination::Domain("*".into()),
-                protocol: Protocol::Any,
-                level: PolicyLevelDto::Http {
-                    http_filters: vec![HttpFilter {
-                        method: HttpMethod::Any,
-                        path: "/*".into(),
-                    }],
-                },
-                reason: Some("unrestricted network access (logged)".into()),
-            }],
-        };
-        let dto = make_session_dto(
-            "0123456789ab",
-            Some("unrestricted"),
-            Some(policy),
-            chrono::Utc::now() - chrono::Duration::minutes(1),
-        );
-        let rendered = render_describe(std::slice::from_ref(&dto));
-        assert!(
-            rendered.contains("Policy: unrestricted (logged)"),
-            "expected unrestricted sentinel line, got:\n{rendered}"
-        );
-        // Full rule block must NOT be emitted — the sentinel replaces it.
-        assert!(
-            !rendered.contains("Policy (v"),
-            "unrestricted must not emit versioned header, got:\n{rendered}"
-        );
-        assert!(
-            !rendered.contains("http_filters"),
-            "unrestricted must not emit per-rule filter lines, got:\n{rendered}"
-        );
     }
 
     #[test]

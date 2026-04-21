@@ -660,7 +660,7 @@ async fn create_session(
     } else {
         // Fail-closed: no policy → empty allowed-domains list so CoreDNS
         // returns NXDOMAIN for everything.  The caller can lift this via
-        // a later policy update (or `--unrestricted` at create time).
+        // a later policy update.
         initial_dns_policy_owned = CoreDnsConfig::empty_policy_file_content();
         Some(initial_dns_policy_owned.as_str())
     };
