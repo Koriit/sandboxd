@@ -64,10 +64,66 @@ impl SessionStore {
             .run(&mut conn)
             .map_err(|e| SandboxError::Internal(format!("migration error: {e}")))?;
 
+        // V004 turns v1-shaped policy rules into `session_policies` rows
+        // with no children.  Sweep those orphans here and emit a
+        // `policy_reset_on_upgrade` tracing event per affected session
+        // so operators know which sessions need a v2 policy re-applied.
+        //
+        // The sweep is idempotent: on subsequent boots there are no
+        // orphans left, so the query returns an empty set and no events
+        // are emitted.  Running it unconditionally (not gated on "is
+        // this the first boot after V004") is deliberately simple — the
+        // cost is one SELECT and this keeps the code path uniform.
+        Self::purge_orphaned_policies_and_emit_reset_events(&conn)?;
+
         Ok(Self {
             conn: Mutex::new(conn),
             base_dir,
         })
+    }
+
+    /// Delete `session_policies` rows that have no surviving rules in
+    /// `policy_rules` and emit a `policy_reset_on_upgrade` tracing event
+    /// for each.  Invoked from [`SessionStore::new`] right after the
+    /// migration runner so orphaned v1 policies (whose child rows V004
+    /// purged) never leak back out via [`SessionStore::get_policy`] or
+    /// [`SessionStore::load_all_policies`].
+    ///
+    /// Operators subscribed to the `policy_reset_on_upgrade` event know
+    /// exactly which sessions need a v2 policy re-applied.  M10-S2 wires
+    /// the tracing subscriber into the sandboxd ring buffer so the event
+    /// is observable without stdout scraping.
+    fn purge_orphaned_policies_and_emit_reset_events(
+        conn: &Connection,
+    ) -> Result<(), SandboxError> {
+        let mut stmt = conn.prepare(
+            "SELECT sp.session_id
+             FROM session_policies sp
+             LEFT JOIN policy_rules pr ON pr.session_id = sp.session_id
+             WHERE pr.session_id IS NULL",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+
+        let mut orphans = Vec::new();
+        for row in rows {
+            orphans.push(row?);
+        }
+        drop(stmt);
+
+        for session_id in &orphans {
+            tracing::info!(
+                event = "policy_reset_on_upgrade",
+                session_id = %session_id,
+                "v1 policy rules were purged by migration V004; \
+                 operator must re-apply a v2 policy for this session"
+            );
+            conn.execute(
+                "DELETE FROM session_policies WHERE session_id = ?1",
+                params![session_id],
+            )?;
+        }
+
+        Ok(())
     }
 
     /// Return the base directory used by this store.
@@ -531,20 +587,17 @@ impl SessionStore {
 
         for (rule_order, rule) in policy.rules.iter().enumerate() {
             let (dest_kind, dest_value) = destination_columns(&rule.host);
-            // TODO(M10-S1 Commit 5): insert `rule.port` into the `port`
-            // column once migration V004 adds it.  Until then the store
-            // path compiles but does not round-trip the port — deferred
-            // alongside the migration.
             tx.execute(
                 "INSERT INTO policy_rules (
-                    session_id, rule_order, destination_kind, destination_value,
-                    level, protocol, reason
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    session_id, rule_order, destination_kind, host_value,
+                    port, level, protocol, reason
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     id.as_str(),
                     rule_order as i64,
                     dest_kind,
                     dest_value,
+                    rule.port as i64,
                     level_column(&rule.level),
                     protocol_column(rule.protocol),
                     rule.reason,
@@ -820,22 +873,34 @@ fn read_policy(conn: &Connection, id: &SessionId) -> Result<Option<Policy>, Sand
         }
     };
 
-    // Rules, in order.
-    let mut rules_raw: Vec<(i64, String, String, String, String, Option<String>)> = Vec::new();
+    // Rules, in order.  Split the raw SELECT into a named struct so the
+    // 7-column tuple doesn't trip `clippy::type_complexity`.
+    struct RawRule {
+        rule_order: i64,
+        destination_kind: String,
+        host_value: String,
+        port: i64,
+        level: String,
+        protocol: String,
+        reason: Option<String>,
+    }
+
+    let mut rules_raw: Vec<RawRule> = Vec::new();
     {
         let mut stmt = conn.prepare(
-            "SELECT rule_order, destination_kind, destination_value, level, protocol, reason
+            "SELECT rule_order, destination_kind, host_value, port, level, protocol, reason
              FROM policy_rules WHERE session_id = ?1 ORDER BY rule_order ASC",
         )?;
         let rows = stmt.query_map(params![id.as_str()], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<String>>(5)?,
-            ))
+            Ok(RawRule {
+                rule_order: row.get::<_, i64>(0)?,
+                destination_kind: row.get::<_, String>(1)?,
+                host_value: row.get::<_, String>(2)?,
+                port: row.get::<_, i64>(3)?,
+                level: row.get::<_, String>(4)?,
+                protocol: row.get::<_, String>(5)?,
+                reason: row.get::<_, Option<String>>(6)?,
+            })
         })?;
         for row in rows {
             rules_raw.push(row?);
@@ -843,9 +908,30 @@ fn read_policy(conn: &Connection, id: &SessionId) -> Result<Option<Policy>, Sand
     }
 
     let mut rules = Vec::with_capacity(rules_raw.len());
-    for (rule_order, dest_kind, dest_value, level_tag, protocol_str, reason) in rules_raw {
+    for raw in rules_raw {
+        let RawRule {
+            rule_order,
+            destination_kind: dest_kind,
+            host_value: dest_value,
+            port: port_raw,
+            level: level_tag,
+            protocol: protocol_str,
+            reason,
+        } = raw;
         let destination = destination_from_columns(&dest_kind, dest_value)?;
         let protocol = protocol_from_column(&protocol_str)?;
+        // Defensive: the V004 CHECK constraint already enforces
+        // port BETWEEN 1 AND 65535, so this fallible cast should
+        // never actually reject a row — but the conversion from
+        // the SQL i64 column to our u16 field is not infallible at
+        // the type level, so we guard it here.
+        let port: u16 = u16::try_from(port_raw).map_err(|_| {
+            SandboxError::Internal(format!(
+                "policy_rules.port out of u16 range \
+                 (session {id}, rule_order {rule_order}, value {port_raw}) \
+                 — V004 CHECK should have caught this"
+            ))
+        })?;
 
         let level = match level_tag.as_str() {
             "deny" => AssuranceLevel::Deny,
@@ -888,10 +974,7 @@ fn read_policy(conn: &Connection, id: &SessionId) -> Result<Option<Policy>, Sand
 
         rules.push(PolicyRule {
             host: destination,
-            // TODO(M10-S1 Commit 5): read port from the port column once V004
-            // migration adds it. Until then, v1-shaped rows lack port data;
-            // V004 will purge them before this code path can load them.
-            port: 443,
+            port,
             protocol,
             reason,
             level,
@@ -1937,9 +2020,9 @@ mod tests {
             .unwrap();
             conn.execute(
                 "INSERT INTO policy_rules (
-                    session_id, rule_order, destination_kind, destination_value,
-                    level, protocol, reason
-                 ) VALUES (?1, 0, 'domain', 'corrupt.test', 'http', 'tcp', NULL)",
+                    session_id, rule_order, destination_kind, host_value,
+                    port, level, protocol, reason
+                 ) VALUES (?1, 0, 'domain', 'corrupt.test', 443, 'http', 'tcp', NULL)",
                 params![session.id.as_str()],
             )
             .unwrap();
@@ -2040,9 +2123,9 @@ mod tests {
             .unwrap();
             let res = tx.execute(
                 "INSERT INTO policy_rules (
-                    session_id, rule_order, destination_kind, destination_value,
-                    level, protocol, reason
-                 ) VALUES (?1, 0, 'bogus', 'x', 'tls', 'tcp', NULL)",
+                    session_id, rule_order, destination_kind, host_value,
+                    port, level, protocol, reason
+                 ) VALUES (?1, 0, 'bogus', 'x', 443, 'tls', 'tcp', NULL)",
                 params![session.id.as_str()],
             );
             let result = res.is_err();
