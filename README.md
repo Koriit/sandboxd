@@ -60,10 +60,19 @@ sandbox rm my-sandbox
 make build            # cargo build --workspace
 make test             # unit tests (~5s)
 make test-integration # integration tests (requires Docker + Lima)
+make test-validators  # policy-compiler outputs vs real tools (nft -c, envoy --mode validate)
 make test-e2e         # full E2E suite (boots real VMs, ~45 min)
 make gateway-image    # build gateway container
 make clean            # cargo clean
 ```
+
+`make test-validators` rebuilds the `sandbox-gateway` image and runs
+a small set of env-gated Rust tests that feed the policy compiler's
+outputs through the real consumers (`nft -c` for the ruleset,
+`envoy --mode validate` for the bootstrap + listener, and a
+`serde_json` round-trip for the mitmproxy config). The tests are
+`#[ignore]`d and additionally gate on `SANDBOX_TEST_VALIDATORS=1`, so
+they never run under the default `make test` path.
 
 ## Project structure
 

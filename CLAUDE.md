@@ -15,9 +15,17 @@ Sandbox daemon providing isolated Linux VMs (Lima/QEMU) for coding agents.
 make build                  # cargo build --workspace
 make test                   # cargo nextest run --workspace (unit tests, ~5s)
 make test-integration       # integration tests (requires Docker + Lima)
+make test-validators        # policy-compiler outputs vs nft -c / envoy --mode validate
 make test-e2e               # full E2E suite (boots real VMs, ~30-45 min)
 make gateway-image          # docker build for gateway container
 ```
+
+`make test-validators` runs env-gated (`SANDBOX_TEST_VALIDATORS=1`),
+`#[ignore]`d Rust integration tests that feed the policy compiler's
+outputs through the real tools that consume them in production
+(nftables parser with `CAP_NET_ADMIN`, Envoy `--mode validate`, and a
+`serde_json` round-trip of the mitmproxy config). They depend on
+`make gateway-image` but stay out of the default `make test` path.
 
 ## E2E tests
 

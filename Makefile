@@ -1,4 +1,4 @@
-.PHONY: build fmt fmt-check test test-integration test-e2e gateway-image docs-dev docs-build clean
+.PHONY: build fmt fmt-check test test-integration test-validators test-e2e gateway-image docs-dev docs-build clean
 
 build: fmt-check
 	cd sandboxd && cargo build --workspace
@@ -30,6 +30,19 @@ TEST ?=
 # silent semantic drift between sandboxd (Rust) and the enforcement layer.
 test-e2e: tests/e2e/.venv/.installed gateway-image
 	cd tests/e2e && . .venv/bin/activate && python -m pytest -v -rs $(TEST)
+
+# External-validator harness: feeds the policy compiler's outputs
+# through the real tools that consume them in production — `nft -c`
+# inside a CAP_NET_ADMIN container, `envoy --mode validate` against
+# the pinned Envoy version, and a `serde_json` round-trip of the
+# mitmproxy config. Each test is `#[ignore]`d and additionally gates
+# on `SANDBOX_TEST_VALIDATORS=1`, so the default `make test` /
+# `cargo nextest run --workspace` path stays hermetic (no Docker
+# dependency). Depends on `gateway-image` so the container tooling
+# reflects current `networking/` sources.
+test-validators: gateway-image
+	cd sandboxd && SANDBOX_TEST_VALIDATORS=1 cargo nextest run \
+		--workspace --run-ignored only -E 'test(/validator_/)'
 
 # Stamp-driven rebuild: only rebuild the docker image when one of its
 # inputs (Dockerfile, addon, entrypoint, Envoy/CoreDNS configs) changes.
