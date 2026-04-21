@@ -2718,9 +2718,7 @@ mod tests {
         // Sanity: the sibling CIDR rule still populates the TCP set so
         // the table is non-empty for this mixed policy.
         assert!(
-            compiled
-                .nftables_rules
-                .contains("140.82.112.0/20 . 443"),
+            compiled.nftables_rules.contains("140.82.112.0/20 . 443"),
             "sibling CIDR rule should populate policy_allow_tcp with the \
              (cidr . port) element; got:\n{}",
             compiled.nftables_rules

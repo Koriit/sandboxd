@@ -2279,7 +2279,8 @@ mod tests {
                         // Display via record_debug depending on the formatter.
                         // Capture it the same way to be safe.
                         if field.name() == "session_id" {
-                            self.session_id = Some(format!("{value:?}").trim_matches('"').to_string());
+                            self.session_id =
+                                Some(format!("{value:?}").trim_matches('"').to_string());
                         }
                     }
                 }

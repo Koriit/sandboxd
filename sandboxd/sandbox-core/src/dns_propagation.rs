@@ -10,9 +10,7 @@ use crate::atomic_listener_writer::{AtomicListenerWriter, session_listener_host_
 use crate::error::SandboxError;
 use crate::gateway::{self, GatewayManager};
 use crate::network::NetworkInfo;
-use crate::policy::{
-    AssuranceLevel, Destination, Policy, PolicyCompiler, format_nft_set_elements,
-};
+use crate::policy::{AssuranceLevel, Destination, Policy, PolicyCompiler, format_nft_set_elements};
 use crate::session::SessionId;
 
 // ---------------------------------------------------------------------------
