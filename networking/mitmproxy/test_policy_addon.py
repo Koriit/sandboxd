@@ -103,7 +103,12 @@ from policy_addon import PolicyAddon
 
 # A filter object that permits every (method, path) pair — useful
 # shorthand for tests that only care about host matching.
-ANY_FILTER: dict[str, Any] = {"method": "ANY", "path": "/*"}
+#
+# The path is ``/**`` (recursive wildcard) rather than ``/*`` because
+# under the v2 per-segment glob semantics ``*`` does not cross ``/`` —
+# ``/*`` alone matches a single path segment (``/foo`` but not
+# ``/foo/bar``).  ``/**`` is the "any path" pattern.
+ANY_FILTER: dict[str, Any] = {"method": "ANY", "path": "/**"}
 
 
 def _write_config(path: str, rules: list[dict[str, Any]]) -> None:
@@ -372,25 +377,32 @@ class TestPassthroughMode:
 
 
 class TestLegacyPreM9S10ShapeIsRejected:
-    """Regression guard against the M9-S10 wire-format drift.
+    """Regression guard against wire-format drift across schema flips.
 
-    Pre-M9-S10, the addon accepted top-level `methods` / `paths` arrays on
-    each rule and treated both being absent/null as "allow every request on
-    this host".  Post-M9-S10, the contract is strict `filters = [{method,
-    path}, ...]` pair matching.
+    Two historical hazards are pinned here:
 
-    If a stale addon (old code) is paired with a new-shape config file —
-    exactly what happened in CI when the gateway image wasn't rebuilt after
-    the addon rewrite — every request to a matched host was silently
-    allowed, defeating all level-3 HTTP filtering.  The failing E2E tests
-    (`test_level3_method_restriction`, `test_level3_path_restriction`)
-    surfaced the drift by observing that supposedly-blocked requests
-    reached upstream and came back as 404 rather than the expected 599.
+    1. **Pre-M9-S10 shape** — the addon accepted top-level ``methods``
+       / ``paths`` arrays on each rule and treated both being
+       absent/null as "allow every request on this host".  Post-M9-S10,
+       the contract is strict ``filters = [{method, path}, ...]`` pair
+       matching.  A stale addon paired with a new-shape config file
+       (exactly what happened in CI when the gateway image wasn't
+       rebuilt after the addon rewrite) silently allowed every request
+       to a matched host, defeating all level-3 HTTP filtering.  The
+       failing E2E tests (``test_level3_method_restriction``,
+       ``test_level3_path_restriction``) surfaced the drift by
+       observing supposedly-blocked requests reaching upstream as 404
+       rather than the expected 599.
 
-    The fix lives in the Makefile (rebuild on source change), but this
-    test pins the runtime behavior: feeding the addon a legacy-shape
-    rule object MUST NOT silently allow traffic — missing `filters`
-    means no match, which is a 599 deny.
+    2. **Missing-port (pre-M10-S1)** — v1 rules had no ``port`` field;
+       v2 treats the field as mandatory.  A v1-shape rule paired with
+       a v2 addon must deny, not silently allow — a rule without an
+       integer ``port`` is skipped by ``_check_request``.
+
+    The fix for #1 lives in the Makefile (rebuild on source change);
+    #2 lives in the addon's port-integer check.  This class pins the
+    runtime behaviour — feeding the addon any legacy-shape rule MUST
+    NOT silently allow traffic.
     """
 
     def test_legacy_shape_with_null_method_and_path_denies(self) -> None:
@@ -416,6 +428,59 @@ class TestLegacyPreM9S10ShapeIsRejected:
             },
         ])
         flow = _make_flow(method="GET", host="httpbin.org", path="/api/thing")
+        addon.request(flow)
+        assert flow.response is not None
+        assert flow.response.status_code == 599
+
+    def test_v1_rule_without_port_denies(self) -> None:
+        """v1-shape rule (no ``port`` field) must deny every request.
+
+        This is the M10-S1 analogue of the M9-S10 legacy-shape guard:
+        if a v2 addon is fed a v1 config file, the port check short-
+        circuits the rule-walk and every request falls through to
+        "host not in policy".
+        """
+        addon = _make_addon([
+            {
+                "host": "httpbin.org",
+                "filters": [{"method": "GET", "path": "/*"}],
+            },
+        ])
+        flow = _make_flow(method="GET", host="httpbin.org", path="/anything")
+        addon.request(flow)
+        assert flow.response is not None, (
+            "v1 rule without `port` must not silently pass — missing port "
+            "means no rule matched, which is deny."
+        )
+        assert flow.response.status_code == 599
+        body = json.loads(flow.response.content)
+        assert body["reason"] == "host not in policy"
+
+    def test_v1_rule_with_null_port_denies(self) -> None:
+        """Explicit ``port: null`` is treated the same as missing."""
+        addon = _make_addon([
+            {
+                "host": "httpbin.org",
+                "port": None,
+                "filters": [{"method": "GET", "path": "/*"}],
+            },
+        ])
+        flow = _make_flow(method="GET", host="httpbin.org", path="/anything")
+        addon.request(flow)
+        assert flow.response is not None
+        assert flow.response.status_code == 599
+
+    def test_v1_rule_with_string_port_denies(self) -> None:
+        """A ``port`` field of the wrong type (stringly-typed config)
+        must also deny — the check is ``isinstance(rule_port, int)``."""
+        addon = _make_addon([
+            {
+                "host": "httpbin.org",
+                "port": "443",
+                "filters": [{"method": "GET", "path": "/*"}],
+            },
+        ])
+        flow = _make_flow(method="GET", host="httpbin.org", path="/anything")
         addon.request(flow)
         assert flow.response is not None
         assert flow.response.status_code == 599
@@ -457,6 +522,72 @@ class TestLegacyPreM9S10ShapeIsRejected:
         addon.request(flow)
         assert flow.response is not None
         assert flow.response.status_code == 599
+
+
+class TestPortMatching:
+    """Rule identity is ``(host, port)``: a port mismatch denies.
+
+    Introduced in M10-S1.  The addon reads ``flow.request.port`` and
+    compares against the rule's ``port`` field before walking its
+    ``filters``.  A request whose destination port differs from every
+    matching-host rule falls through to "host not in policy" — the
+    same reason code the addon uses when no rule host matched at all.
+    """
+
+    def test_matching_host_wrong_port_denies(self) -> None:
+        """Rule for `(httpbin.org, 443)` must deny a request to
+        `httpbin.org:8443`, even with a filter that permits the
+        `(method, path)` pair."""
+        addon = _make_addon([
+            {"host": "httpbin.org", "port": 443, "filters": [ANY_FILTER]},
+        ])
+        flow = _make_flow(host="httpbin.org", path="/anything", port=8443)
+        addon.request(flow)
+        assert flow.response is not None, (
+            "Rule port is 443 but request port is 8443 — must deny."
+        )
+        assert flow.response.status_code == 599
+        body = json.loads(flow.response.content)
+        assert body["reason"] == "host not in policy"
+        assert body["port"] == 8443
+
+    def test_multiple_rules_same_host_different_ports(self) -> None:
+        """Two rules for the same host but different ports select by
+        the request's port; filters from non-selected rules do not
+        contribute."""
+        addon = _make_addon([
+            {"host": "api.com", "port": 443, "filters": [
+                {"method": "GET", "path": "/**"},
+            ]},
+            {"host": "api.com", "port": 8443, "filters": [
+                {"method": "POST", "path": "/**"},
+            ]},
+        ])
+        # :443 permits GET; POST must deny (rule for :8443 can't help).
+        flow_get = _make_flow(method="GET", host="api.com", path="/x", port=443)
+        addon.request(flow_get)
+        assert flow_get.response is None, "GET to api.com:443 should pass (rule 1)"
+
+        flow_post_443 = _make_flow(
+            method="POST", host="api.com", path="/x", port=443
+        )
+        addon.request(flow_post_443)
+        assert flow_post_443.response is not None, (
+            "POST to api.com:443 must deny — rule 2's filters only apply to :8443"
+        )
+        assert flow_post_443.response.status_code == 599
+        body_post = json.loads(flow_post_443.response.content)
+        # Host+port did match rule 1, so this is a filter-miss (not host-miss).
+        assert body_post["reason"] == "no filter matched POST /x"
+
+        # :8443 permits POST symmetrically.
+        flow_post_8443 = _make_flow(
+            method="POST", host="api.com", path="/x", port=8443
+        )
+        addon.request(flow_post_8443)
+        assert flow_post_8443.response is None, (
+            "POST to api.com:8443 should pass (rule 2)"
+        )
 
 
 class TestPairMatching:
@@ -503,31 +634,94 @@ class TestPairMatching:
         assert body_gb["reason"] == "no filter matched GET /bar"
 
 
-class TestFnmatchGlobs:
-    """Filter paths support fnmatch-style globs (*, ?, [...]).
+class TestPerSegmentGlob:
+    """Filter paths use a per-segment glob (M10-S1 v2 semantics).
 
-    NOTE (M10-S1 Commit 1): these tests still assert the old fnmatch
-    behaviour where `*` crosses `/`.  Commit 2 renames this class to
-    ``TestPerSegmentGlob`` and inverts the expected semantics to match
-    the new per-segment matcher.
+    - ``?``  matches exactly one non-``/`` character.
+    - ``*``  matches zero or more non-``/`` characters — within a
+             single path segment, never crossing ``/``.
+    - ``**`` matches zero or more characters *including* ``/`` —
+             the recursive wildcard that spans segments.
+    - All other characters are literal (case-sensitive, anchored
+      full-path match).
+
+    This is a deliberate tightening of the pre-v2 ``fnmatch``
+    semantics — ``/api/*`` used to match ``/api/v1/users`` and now
+    does not.  Operators migrating policies must review path filters
+    during the v1→v2 rewrite.  The spec at
+    ``.tasks/specs/2026-04-21-port-explicit-policies-presets-observability-design.md``
+    (lines 221-243) is authoritative.
     """
 
-    def test_star_matches_single_segment(self) -> None:
+    def test_star_does_not_cross_slash(self) -> None:
+        """The single-star metachar must not match across ``/``.
+
+        A pattern like ``/repos/*`` permits exactly one additional
+        segment after ``/repos``.  A deeper path must fail — this is
+        the concrete safety property that motivated the v1→v2
+        matcher flip (``github-pr`` preset could be bypassed with
+        ``/pulls/PR/attacker-crafted-subpath``).
+        """
         addon = _make_addon([
             {"host": "api.com", "port": 443, "filters": [
                 {"method": "GET", "path": "/repos/*"},
             ]},
         ])
-        # `*` in fnmatch matches any characters including slashes.
+        # One segment after `/repos` — allowed.
         flow_ok = _make_flow(host="api.com", path="/repos/foo")
         addon.request(flow_ok)
-        assert flow_ok.response is None
+        assert flow_ok.response is None, "/repos/* must match /repos/foo"
 
+        # Two segments after `/repos` — denied under v2.
         flow_deeper = _make_flow(host="api.com", path="/repos/foo/commits")
         addon.request(flow_deeper)
-        assert flow_deeper.response is None
+        assert flow_deeper.response is not None, (
+            "/repos/* must NOT match /repos/foo/commits under per-segment glob"
+        )
+        assert flow_deeper.response.status_code == 599
 
-    def test_question_mark_matches_single_char(self) -> None:
+    def test_star_matches_zero_chars_within_segment(self) -> None:
+        """``*`` matches the empty string within a segment."""
+        addon = _make_addon([
+            {"host": "api.com", "port": 443, "filters": [
+                {"method": "GET", "path": "/api/*"},
+            ]},
+        ])
+        # Exactly `/api/` — empty segment after the slash, matches `*`
+        # against zero characters.
+        flow = _make_flow(host="api.com", path="/api/")
+        addon.request(flow)
+        assert flow.response is None, "/api/* must match /api/ (empty trailing segment)"
+
+    def test_double_star_crosses_segments(self) -> None:
+        """``**`` spans ``/`` — the recursive wildcard."""
+        addon = _make_addon([
+            {"host": "api.com", "port": 443, "filters": [
+                {"method": "GET", "path": "/api/**"},
+            ]},
+        ])
+        # Zero trailing segments: the pattern still needs the literal
+        # trailing ``/`` so plain ``/api`` (no slash) must not match.
+        flow_no_slash = _make_flow(host="api.com", path="/api")
+        addon.request(flow_no_slash)
+        assert flow_no_slash.response is not None, (
+            "/api/** requires the literal trailing /, so /api (no slash) must deny"
+        )
+        assert flow_no_slash.response.status_code == 599
+
+        # `/api/` — `**` matches the empty remainder.
+        flow_slash = _make_flow(host="api.com", path="/api/")
+        addon.request(flow_slash)
+        assert flow_slash.response is None, "/api/** must match /api/"
+
+        # One segment and deeper — both allowed.
+        for path in ["/api/users", "/api/v1/users", "/api/a/b/c/d"]:
+            flow = _make_flow(host="api.com", path=path)
+            addon.request(flow)
+            assert flow.response is None, f"/api/** must match {path}"
+
+    def test_question_mark_matches_single_non_slash_char(self) -> None:
+        """``?`` is a single non-``/`` character."""
         addon = _make_addon([
             {"host": "api.com", "port": 443, "filters": [
                 {"method": "GET", "path": "/v?/users"},
@@ -537,7 +731,70 @@ class TestFnmatchGlobs:
         addon.request(flow_ok)
         assert flow_ok.response is None
 
-        flow_bad = _make_flow(host="api.com", path="/v10/users")
+        # Two characters — rejected.
+        flow_two = _make_flow(host="api.com", path="/v10/users")
+        addon.request(flow_two)
+        assert flow_two.response is not None
+        assert flow_two.response.status_code == 599
+
+        # Zero characters — rejected (``?`` requires exactly one).
+        flow_zero = _make_flow(host="api.com", path="/v/users")
+        addon.request(flow_zero)
+        assert flow_zero.response is not None
+        assert flow_zero.response.status_code == 599
+
+    def test_literals_are_case_sensitive(self) -> None:
+        """Path matching is case-sensitive (unlike host matching)."""
+        addon = _make_addon([
+            {"host": "api.com", "port": 443, "filters": [
+                {"method": "GET", "path": "/API/users"},
+            ]},
+        ])
+        flow_lower = _make_flow(host="api.com", path="/api/users")
+        addon.request(flow_lower)
+        assert flow_lower.response is not None, (
+            "/API/users must not match /api/users (path is case-sensitive)"
+        )
+        assert flow_lower.response.status_code == 599
+
+    def test_pattern_is_anchored(self) -> None:
+        """Patterns match the full path — not a prefix."""
+        addon = _make_addon([
+            {"host": "api.com", "port": 443, "filters": [
+                {"method": "GET", "path": "/exact"},
+            ]},
+        ])
+        # Exact match.
+        flow_exact = _make_flow(host="api.com", path="/exact")
+        addon.request(flow_exact)
+        assert flow_exact.response is None
+
+        # Trailing slash — not the same path.
+        flow_trailing = _make_flow(host="api.com", path="/exact/")
+        addon.request(flow_trailing)
+        assert flow_trailing.response is not None
+
+        # Prefix — rejected.
+        flow_prefix = _make_flow(host="api.com", path="/exactly")
+        addon.request(flow_prefix)
+        assert flow_prefix.response is not None
+
+    def test_regex_metacharacters_are_literal(self) -> None:
+        """Regex specials (``.``, ``+``, ``(`` ...) in a pattern must
+        be literal — the matcher is a glob, not a regex."""
+        addon = _make_addon([
+            {"host": "api.com", "port": 443, "filters": [
+                {"method": "GET", "path": "/api.v1/users"},
+            ]},
+        ])
+        # The literal ``.`` must match only itself, not "any char".
+        flow_ok = _make_flow(host="api.com", path="/api.v1/users")
+        addon.request(flow_ok)
+        assert flow_ok.response is None
+
+        # If ``.`` were interpreted as a regex metachar, this would
+        # match; under glob semantics it must not.
+        flow_bad = _make_flow(host="api.com", path="/apiXv1/users")
         addon.request(flow_bad)
         assert flow_bad.response is not None
         assert flow_bad.response.status_code == 599
@@ -640,16 +897,95 @@ class TestFilterMatches:
         assert PolicyAddon._filter_matches(flt, "GET", "/foo")
         assert not PolicyAddon._filter_matches(flt, "POST", "/foo")
 
-    def test_path_fnmatch(self) -> None:
+    def test_path_glob(self) -> None:
+        """Per-segment glob (v2): ``*`` is segment-local, ``**`` is
+        recursive.  See ``TestPerSegmentGlob`` for the full matrix."""
         flt = {"method": "ANY", "path": "/repos/*"}
         assert PolicyAddon._filter_matches(flt, "GET", "/repos/foo")
+        # Different first segment — deny.
         assert not PolicyAddon._filter_matches(flt, "GET", "/users/foo")
+        # Deeper than one segment — deny under v2.
+        assert not PolicyAddon._filter_matches(flt, "GET", "/repos/foo/commits")
+
+        flt_deep = {"method": "ANY", "path": "/repos/**"}
+        assert PolicyAddon._filter_matches(flt_deep, "GET", "/repos/foo")
+        assert PolicyAddon._filter_matches(flt_deep, "GET", "/repos/foo/commits")
 
     def test_empty_fields_reject(self) -> None:
         """A filter with a missing method or path rejects every request."""
         assert not PolicyAddon._filter_matches({"method": "", "path": "/foo"}, "GET", "/foo")
         assert not PolicyAddon._filter_matches({"method": "GET", "path": ""}, "GET", "/foo")
         assert not PolicyAddon._filter_matches({}, "GET", "/foo")
+
+
+class TestPathGlobMatcher:
+    """Direct tests of the ``_path_glob_match`` helper.
+
+    These exercise the matcher in isolation from the addon plumbing —
+    they catch regressions in the per-segment glob semantics before
+    they manifest as mysterious 599s.  The table covers the full
+    documented behaviour plus the edge cases noted in the spec:
+    anchoring, case-sensitivity, regex-metachar escaping, empty
+    inputs, trailing-slash distinction.
+    """
+
+    @pytest.mark.parametrize(
+        ("pattern", "path", "expected"),
+        [
+            # Single-star: one segment only.
+            ("/api/*", "/api", False),
+            ("/api/*", "/api/", True),
+            ("/api/*", "/api/users", True),
+            ("/api/*", "/api/v1/users", False),
+            # Double-star: recursive, requires literal ``/`` before.
+            ("/api/**", "/api", False),
+            ("/api/**", "/api/", True),
+            ("/api/**", "/api/users", True),
+            ("/api/**", "/api/v1/users", True),
+            ("/api/**", "/api/a/b/c/d", True),
+            # Question mark: single non-``/`` character.
+            ("/repos/?/commits", "/repos/a/commits", True),
+            ("/repos/?/commits", "/repos/ab/commits", False),
+            ("/repos/?/commits", "/repos//commits", False),
+            ("/v?/users", "/v1/users", True),
+            ("/v?/users", "/v10/users", False),
+            # Literals and anchoring.
+            ("/exact", "/exact", True),
+            ("/exact", "/exact/", False),
+            ("/exact", "/exactly", False),
+            ("/", "/", True),
+            ("/", "", False),
+            # Top-level single-star.
+            ("/*", "/", True),
+            ("/*", "/foo", True),
+            ("/*", "/foo/bar", False),
+            # Top-level double-star.
+            ("/**", "/", True),
+            ("/**", "/foo", True),
+            ("/**", "/foo/bar", True),
+            ("/**", "", False),
+            # Case-sensitive literals.
+            ("/API/users", "/api/users", False),
+            ("/API/users", "/API/users", True),
+            # Regex metacharacters must be treated as literals.
+            ("/api.v1", "/api.v1", True),
+            ("/api.v1", "/apiXv1", False),
+            ("/a+b", "/a+b", True),
+            ("/a+b", "/ab", False),
+            ("/(x)", "/(x)", True),
+            # Empty pattern.
+            ("", "", True),
+            ("", "/", False),
+        ],
+    )
+    def test_matcher_behaviour(
+        self, pattern: str, path: str, expected: bool
+    ) -> None:
+        from policy_addon import _path_glob_match
+
+        assert _path_glob_match(pattern, path) is expected, (
+            f"pattern={pattern!r} path={path!r}: expected {expected}"
+        )
 
 
 class TestConfigFileWatcher:

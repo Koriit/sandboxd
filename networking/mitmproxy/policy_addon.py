@@ -65,6 +65,7 @@ import fnmatch
 import json
 import logging
 import os
+import re
 import threading
 import time
 from typing import Any
@@ -81,6 +82,80 @@ DEFAULT_CONFIG_PATH = "/tmp/mitmproxy/policy.json"
 CONFIG_POLL_INTERVAL = 5
 # Internal health-check endpoint.
 HEALTH_PATH = "/__sandbox_health"
+
+
+# ── Per-segment path glob matcher ───────────────────────────────────
+#
+# Request paths are matched against a glob in which:
+#
+#   * ``?``  matches exactly one non-``/`` character
+#   * ``*``  matches zero or more non-``/`` characters — does not
+#            cross ``/``
+#   * ``**`` matches zero or more characters *including* ``/`` (the
+#            recursive wildcard; spans segments)
+#   * every other character is a literal
+#
+# Matching is anchored (full-path) and case-sensitive.  Worked examples:
+#
+#   pattern           path                          match
+#   ----------------  ----------------------------  -----
+#   /api/*            /api                          no  (pattern needs `/`+segment)
+#   /api/*            /api/users                    yes
+#   /api/*            /api/v1/users                 no  (``*`` doesn't cross ``/``)
+#   /api/**           /api                          no  (pattern needs literal ``/``)
+#   /api/**           /api/                         yes (``**`` matches empty)
+#   /api/**           /api/users                    yes
+#   /api/**           /api/v1/users                 yes
+#   /repos/?/commits  /repos/a/commits              yes
+#   /repos/?/commits  /repos/ab/commits             no
+#   /v?/users         /v1/users                     yes
+#   /v?/users         /v10/users                    no
+#   /exact            /exact                        yes
+#   /exact            /exact/                       no  (trailing ``/`` not in pattern)
+#
+# Implementation: compile the pattern to a regular expression once per
+# call.  Patterns are tiny (≤64 chars, ≤10 metachars) so
+# ``re.fullmatch`` is cheap and we don't cache — simpler wins.
+# Reference implementations exist in Express.js ``path-to-regexp`` and
+# Go ``path.Match``; the spec calls them out as precedent.
+
+
+def _path_glob_match(pattern: str, path: str) -> bool:
+    """Return True iff *path* matches *pattern* under the glob above."""
+    return _compile_path_glob(pattern).fullmatch(path) is not None
+
+
+def _compile_path_glob(pattern: str) -> re.Pattern[str]:
+    """Translate a path glob into a compiled :mod:`re` pattern.
+
+    Each metacharacter is rewritten into its regex equivalent and every
+    other character is regex-escaped so ``.``, ``+``, ``(`` etc. in
+    real paths stay literal.  Done in a single left-to-right pass with
+    a two-character lookahead for ``**``.
+    """
+    out: list[str] = ["^"]
+    i = 0
+    n = len(pattern)
+    while i < n:
+        ch = pattern[i]
+        if ch == "*":
+            # ``**`` → ``.*`` (any chars including ``/``);
+            # ``*``  → ``[^/]*`` (within-segment wildcard).
+            if i + 1 < n and pattern[i + 1] == "*":
+                out.append(".*")
+                i += 2
+            else:
+                out.append("[^/]*")
+                i += 1
+        elif ch == "?":
+            # Single non-``/`` character.
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(ch))
+            i += 1
+    out.append("$")
+    return re.compile("".join(out))
 
 
 class PolicyAddon:
@@ -245,7 +320,9 @@ class PolicyAddon:
         `flt` is a `{method, path}` object from the config.  `method` must
         equal the filter's method (uppercase) or the filter's method must
         be the wildcard marker `ANY`.  `path` is matched against the
-        filter's path with `fnmatch`.
+        filter's path with the per-segment glob matcher (see
+        :func:`_path_glob_match`) — case-sensitive, anchored, with
+        segment-aware ``*`` / ``?`` and a recursive ``**`` wildcard.
         """
         flt_method = str(flt.get("method", "")).upper()
         flt_path = str(flt.get("path", ""))
@@ -253,14 +330,17 @@ class PolicyAddon:
             return False
         if flt_method != "ANY" and flt_method != method:
             return False
-        return fnmatch.fnmatchcase(path, flt_path)
+        return _path_glob_match(flt_path, path)
 
     @staticmethod
     def _match_host(host: str, rule_host: str) -> bool:
         """Match a request host against a rule host pattern.
 
         Supports exact match and wildcard patterns like ``*.example.com``.
-        Matching is case-insensitive.
+        Matching is case-insensitive.  Host globs use ``fnmatch`` because
+        hostnames are a flat dot-separated namespace where a single
+        ``*`` is the idiomatic subdomain wildcard; the per-segment glob
+        semantics used for request paths are inappropriate here.
         """
         return fnmatch.fnmatch(host.lower(), rule_host.lower())
 
