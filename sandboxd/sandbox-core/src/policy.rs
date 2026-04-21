@@ -605,6 +605,23 @@ pub const FILTER_CHAINS_BEGIN_MARKER: &str = "# >>> FILTER_CHAINS_BEGIN";
 /// Marker comment demarcating the end of the mutable filter-chains region.
 pub const FILTER_CHAINS_END_MARKER: &str = "# <<< FILTER_CHAINS_END";
 
+/// Absolute path inside the gateway container for Envoy's L3 `tcp_proxy`
+/// access log.
+///
+/// Each L3 filter chain (domain-, CIDR-, and wildcard-backed) attaches a
+/// `FileAccessLog` here, making the CONNECT-tunnel invariant —
+/// original destination preserved, upstream = mitmproxy cluster at
+/// `127.0.0.1:18080` — observable from Envoy's own logs rather than
+/// inferred from mitmproxy's flow log. The E2E suite
+/// (`test_level3_http_inspected`) reads this file via
+/// `docker exec cat` to assert the invariant directly against Envoy.
+///
+/// The log lives under the existing `/var/log/gateway` directory that
+/// `gateway/entrypoint.sh` already creates and that other components
+/// (mitmproxy, CoreDNS, Envoy's application log) already write into —
+/// no new mountpoints or permissions are required.
+pub const ENVOY_ACCESS_LOG_IN_CONTAINER: &str = "/var/log/gateway/envoy_access.log";
+
 impl PolicyCompiler {
     /// Validate and compile a policy into per-component configurations.
     ///
@@ -1085,6 +1102,13 @@ admin:
         //   the L1 default catch-all for the session; the two never
         //   coexist because there is only one default slot and an
         //   unrestricted L3 rule takes precedence.
+        // Access-log stanza attached to every L3 `tcp_proxy` filter. The
+        // same YAML fragment is interpolated into all three L3 chain
+        // shapes (domain, CIDR, wildcard) so the access-log format and
+        // output path stay identical across chains — divergence would
+        // make the E2E invariant check order-dependent.
+        let l3_access_log_yaml = Self::l3_tcp_proxy_access_log_yaml();
+
         for rule in policy
             .rules
             .iter()
@@ -1107,7 +1131,8 @@ admin:
             cluster: mitmproxy
             stat_prefix: level3_{stat_name}
             tunneling_config:
-              hostname: "%DOWNSTREAM_LOCAL_ADDRESS%""#
+              hostname: "%DOWNSTREAM_LOCAL_ADDRESS%"
+{l3_access_log_yaml}"#
                     ));
                 }
                 Destination::Domain(domain) => {
@@ -1134,7 +1159,8 @@ admin:
             cluster: mitmproxy
             stat_prefix: level3_{stat_name}
             tunneling_config:
-              hostname: "%DOWNSTREAM_LOCAL_ADDRESS%""#
+              hostname: "%DOWNSTREAM_LOCAL_ADDRESS%"
+{l3_access_log_yaml}"#
                     ));
                 }
                 Destination::Cidr(cidr) => {
@@ -1151,7 +1177,8 @@ admin:
             cluster: mitmproxy
             stat_prefix: level3_{stat_name}
             tunneling_config:
-              hostname: "%DOWNSTREAM_LOCAL_ADDRESS%""#
+              hostname: "%DOWNSTREAM_LOCAL_ADDRESS%"
+{l3_access_log_yaml}"#
                     ));
                 }
             }
@@ -1208,6 +1235,60 @@ admin:
             None => (cidr.to_string(), "32".to_string()),
         };
         format!("          - address_prefix: {address}\n            prefix_len: {prefix_len}")
+    }
+
+    /// Render the `access_log` YAML fragment attached to every L3
+    /// `tcp_proxy` filter.
+    ///
+    /// The fragment is emitted as a **sibling of `tunneling_config:`**
+    /// under the `tcp_proxy` `typed_config`, i.e. at 12-space indent
+    /// (the YAML list item `- name: envoy.filters.network.tcp_proxy`
+    /// sits at 8 spaces, `typed_config:` at 10, its fields at 12). Every
+    /// line below therefore starts with 12 spaces so the fragment drops
+    /// into the chain body without reshaping.
+    ///
+    /// **Tokens chosen.** All operators below are documented as valid
+    /// for TCP (`tcp_proxy`) access-log contexts in Envoy's access-log
+    /// command-operator reference — unlike several HTTP-only tokens
+    /// (`%REQ(...)%`, `%RESP(...)%`, `%REQUEST_DURATION%` etc.) that
+    /// would silently render empty under `tcp_proxy`.
+    ///
+    /// - `%START_TIME%` — connection accept time, for correlating with
+    ///   mitmproxy's flow log by wall clock.
+    /// - `%DOWNSTREAM_LOCAL_ADDRESS%` — the listener-local address as
+    ///   seen by Envoy after the `original_dst` listener filter has
+    ///   recovered `SO_ORIGINAL_DST`. **This is the invariant the E2E
+    ///   suite asserts on**: if the value is the VM's intended
+    ///   destination IP (not `0.0.0.0:10000`, Envoy's bind address, or
+    ///   `127.0.0.1`), then `original_dst` is wired correctly and the
+    ///   CONNECT preface's `%DOWNSTREAM_LOCAL_ADDRESS%` interpolation
+    ///   in `tunneling_config.hostname` is observing the same value.
+    /// - `%UPSTREAM_CLUSTER%` — must be `mitmproxy`; proves the L3
+    ///   chain did not fall back to `original_dst`.
+    /// - `%UPSTREAM_HOST%` — must be `127.0.0.1:18080`; proves the
+    ///   `mitmproxy` cluster's loopback endpoint is in use (not a
+    ///   rogue DNAT target).
+    /// - `%BYTES_SENT%` / `%BYTES_RECEIVED%` — proves bytes actually
+    ///   flowed, not just that the TCP connection was accepted.
+    /// - `%RESPONSE_FLAGS%` — short-code summary of failure modes
+    ///   (empty / `"-"` for a clean connection).
+    ///
+    /// The format is a single-line, space-separated `key=value`
+    /// layout. `key=` prefixes make each column self-describing so the
+    /// E2E matcher doesn't hinge on column position — future additions
+    /// to the format won't silently break the existing assertions.
+    fn l3_tcp_proxy_access_log_yaml() -> String {
+        format!(
+            r#"            access_log:
+              - name: envoy.access_loggers.file
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+                  path: {log_path}
+                  log_format:
+                    text_format_source:
+                      inline_string: "[%START_TIME%] downstream_local=%DOWNSTREAM_LOCAL_ADDRESS% upstream_cluster=%UPSTREAM_CLUSTER% upstream_host=%UPSTREAM_HOST% bytes_sent=%BYTES_SENT% bytes_received=%BYTES_RECEIVED% response_flags=%RESPONSE_FLAGS%\n""#,
+            log_path = ENVOY_ACCESS_LOG_IN_CONTAINER,
+        )
     }
 
     /// Emit the listener YAML (head + filter-chains body + tail).
@@ -3260,6 +3341,132 @@ mod tests {
         assert!(
             listener_cidr.contains("cluster: mitmproxy"),
             "L3 CIDR chain must route to mitmproxy cluster:\n{listener_cidr}"
+        );
+    }
+
+    #[test]
+    fn compile_l3_tcp_proxy_carries_envoy_access_log() {
+        // Every L3 `tcp_proxy` filter must attach a `FileAccessLog`
+        // writing to `ENVOY_ACCESS_LOG_IN_CONTAINER` so the
+        // CONNECT-tunnel invariant (original destination preserved,
+        // upstream = `mitmproxy` cluster at 127.0.0.1:18080) is
+        // observable from Envoy's own log, not just inferred from
+        // mitmproxy's flow log. The E2E test
+        // `test_level3_http_inspected` reads this file and asserts on
+        // its contents; if we drop the access_log here or change its
+        // format, the E2E assertion goes mute rather than failing, so
+        // pin the key shape at the unit level.
+        //
+        // Exercise all three L3 shapes — domain-backed, CIDR-backed,
+        // and wildcard (default_filter_chain) — because the access_log
+        // YAML is interpolated into three distinct `format!` call
+        // sites.
+        let mut cache = DnsCache::new();
+        cache.update(&ResolvedReport {
+            mappings: vec![resolved_mapping(
+                "inspected.example.com",
+                &["10.0.0.1"],
+                300,
+            )],
+        });
+
+        // Required keys we assert on in every L3 listener. Each is a
+        // command operator that Envoy supports inside a `tcp_proxy`
+        // access-log context — the docstring on
+        // `l3_tcp_proxy_access_log_yaml` explains why each one is
+        // load-bearing for the E2E invariant check.
+        let required_tokens = [
+            r#""@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog"#,
+            "name: envoy.access_loggers.file",
+            &format!("path: {ENVOY_ACCESS_LOG_IN_CONTAINER}"),
+            "%START_TIME%",
+            "downstream_local=%DOWNSTREAM_LOCAL_ADDRESS%",
+            "upstream_cluster=%UPSTREAM_CLUSTER%",
+            "upstream_host=%UPSTREAM_HOST%",
+            "bytes_sent=%BYTES_SENT%",
+            "bytes_received=%BYTES_RECEIVED%",
+            "response_flags=%RESPONSE_FLAGS%",
+        ];
+
+        // Domain-backed L3 chain.
+        let listener_domain = PolicyCompiler::compile_envoy_listener(&full_policy(), &cache);
+        assert!(
+            listener_domain.contains("access_log:"),
+            "L3 domain chain must carry an access_log stanza:\n{listener_domain}"
+        );
+        for token in &required_tokens {
+            assert!(
+                listener_domain.contains(token),
+                "L3 domain chain access_log missing required token `{token}`:\n{listener_domain}"
+            );
+        }
+
+        // CIDR-backed L3 chain.
+        let cidr_policy = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![PolicyRule {
+                destination: Destination::Cidr("10.0.0.0/24".to_string()),
+                level: AssuranceLevel::Http {
+                    http_filters: vec![http_filter(HttpMethod::Any, "/*")],
+                },
+                protocol: Protocol::Https,
+                reason: None,
+            }],
+        };
+        let listener_cidr = PolicyCompiler::compile_envoy_listener(&cidr_policy, &DnsCache::new());
+        assert!(
+            listener_cidr.contains("access_log:"),
+            "L3 CIDR chain must carry an access_log stanza:\n{listener_cidr}"
+        );
+        for token in &required_tokens {
+            assert!(
+                listener_cidr.contains(token),
+                "L3 CIDR chain access_log missing required token `{token}`:\n{listener_cidr}"
+            );
+        }
+
+        // Wildcard L3 rule → `default_filter_chain`. Same invariant.
+        let wildcard_policy = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![PolicyRule {
+                destination: Destination::Domain("*".to_string()),
+                level: AssuranceLevel::Http {
+                    http_filters: vec![http_filter(HttpMethod::Any, "/*")],
+                },
+                protocol: Protocol::Https,
+                reason: None,
+            }],
+        };
+        let listener_wild =
+            PolicyCompiler::compile_envoy_listener(&wildcard_policy, &DnsCache::new());
+        assert!(
+            listener_wild.contains("default_filter_chain:"),
+            "wildcard fixture must produce default_filter_chain:\n{listener_wild}"
+        );
+        assert!(
+            listener_wild.contains("access_log:"),
+            "L3 wildcard chain must carry an access_log stanza:\n{listener_wild}"
+        );
+        for token in &required_tokens {
+            assert!(
+                listener_wild.contains(token),
+                "L3 wildcard chain access_log missing required token `{token}`:\n{listener_wild}"
+            );
+        }
+
+        // Sanity: `access_log:` must appear under `typed_config` of a
+        // `tcp_proxy` filter, not elsewhere (e.g. the listener root or
+        // an L2 chain). Scope the check to the L3 domain fixture.
+        let tcp_proxy_idx = listener_domain
+            .find("envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy")
+            .expect("L3 listener must contain a tcp_proxy filter");
+        let access_log_idx = listener_domain
+            .find("access_log:")
+            .expect("L3 listener must contain an access_log entry");
+        assert!(
+            access_log_idx > tcp_proxy_idx,
+            "access_log must be nested inside the tcp_proxy typed_config, \
+             not hoisted to the listener root:\n{listener_domain}"
         );
     }
 

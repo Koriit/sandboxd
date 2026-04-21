@@ -2,54 +2,13 @@
   "current_state": {
     "milestone": "M9",
     "session": "M9-S20",
-    "status": "in_progress",
-    "completed_sessions": 58,
+    "status": "finished",
+    "completed_sessions": 59,
     "total_sessions": 59,
     "next": "M9 milestone complete after this session",
     "block_reason": "Spec premise falsified: mitmproxy 11.1.3 does not support PROXY protocol v2 reception \u2014 the design-spec's core mechanism for bridging Envoy\u2192mitmproxy cannot be used off-the-shelf. User must choose between (A) write custom mitmproxy layer/addon in-tree that parses PROXY v2 header before TransparentProxy runs (~80-120 lines Python parser + nontrivial hook into layer stack); (B) fork/alternative mitmproxy version (no upstream release has it); (C) different destination-preservation mechanism (TPROXY / reverse-proxy-per-dest \u2014 both defeat the single-mediated-egress design goal); (D) split the spec \u2014 ship Envoy-half in M9-S18 with mitmproxy still on SO_ORIGINAL_DST, amend M9-S19/S20 to cover the missing mitmproxy PROXY-v2 addon work. Planner recommends Option A with low confidence; cheapest alternative is Option D but requires spec amendment. Full verification + source refs + option analysis in the planner CLARIFY (last subagent response) and referenced in .tasks/handoffs/20260419-172418-explore-envoy-mitmproxy-current-state.md."
   },
-  "current_log": {
-    "session": "M9-S20",
-    "title": "L3 flow \u2014 E2E assertions, design-doc amendment, user-facing docs, consistency sweep",
-    "started": "2026-04-20T21:15:30.816497Z",
-    "entries": [
-      {
-        "timestamp": "2026-04-20T21:19:37.142974Z",
-        "type": "discovery",
-        "note": "M9-S20 scoping (handoff: 20260420-m9s20-scoping.md): 4 stale-text items (test_m4_policy.py docstrings at 347-359 + 993-1006 still describe sandbox_l3 DNAT mechanism \u2014 plus 3 others), 4 design-spec amendments (dynamic-metadata fallback downgrade to 'not needed', YAML indent sharp edge, past-tense conversion, verification harness pointer), 5 E2E assertion gaps (mitmproxy bind to 127.0.0.1:18080, CONNECT tunnel observable, original authority preservation, fail-closed behavior routing, three-table post-apply steady state)."
-      },
-      {
-        "timestamp": "2026-04-20T21:24:45.467756Z",
-        "type": "discovery",
-        "note": "Agent A (docs) DONE. Touched 5 files: docs/concepts/networking.md (sandbox_l3 row removed, sequence diagram \u2192 CONNECT over 127.0.0.1:18080, new fail-closed L3 subsection), docs/guides/network-policies.md (policy-change propagation + L3 limitations subsections), docs/guides/troubleshooting.md (3 new FAQ entries), docs/concepts/architecture.md (Envoy listener mention), docs/reference/http-api.md (DELETE /sessions/{id}/policy description updated). make docs-build PASS, 20 pages. docs/guides/hardening.md verified clean. Residual matches only in docs/internal/session-plan.md (historical)."
-      },
-      {
-        "timestamp": "2026-04-20T21:25:50.861150Z",
-        "type": "discovery",
-        "note": "Agent B (design spec) DONE. 11 amendments applied to .tasks/specs/2026-04-19-l3-envoy-mitmproxy-flow-design.md: tense conversion across summary/context/ports/rollout, dynamic-metadata fallback block rewritten to 'verified primary path on Envoy 1.32.2, fallback not implemented, re-run harness on version bump', YAML indent sharp-edge added (4-space correct per shipped templates; 2-space was the failure), verification-harness link inserted in testing plan, writer-invariant text upgraded from aspirational to shipped (marker-delimited + InvariantViolated), publication mechanism rewritten to reflect shipped option (a). HttpProtocolOptions verified PRESENT at policy.rs:911-915 with test at 4027-4036 \u2014 scoping item 2.4 closed. No inline TODOs left behind."
-      },
-      {
-        "timestamp": "2026-04-20T21:55:12.396144Z",
-        "type": "discovery",
-        "note": "Agent C (E2E) DONE. tests/e2e/test_m4_policy.py: 4 new helpers (_gateway_listen_addrs, _assert_mitmproxy_loopback_only, _gateway_nft_tables, _read_gateway_log); new test test_l3_fail_closed_before_dns_propagation (Gap 4 \u2014 uses curl --resolve to bypass CoreDNS, asserts pre-warmup fail-closed, polls post-warmup success); test_level3_http_inspected gained Gap 1/2/3/5 assertions; stale-text fixes in test_level3_http_inspected + test_unrestricted_allows_and_logs + test_policy_clear_reverts_to_deny_all. Gap-5 placement moved post-DNS-warmup (sandbox_policy nftables table is created by DNS propagation loop for domain-only policies, not by sync compile). Gap 2 scoped to mitmproxy log only (Envoy runs --log-level warning, no access log configured \u2014 envoy.log effectively empty post-startup). L3 subset 6/6 green in 402s (6m42s)."
-      },
-      {
-        "timestamp": "2026-04-20T22:08:38.158935Z",
-        "type": "discovery",
-        "note": "kio-reviewer M9-S20 verdict: NEEDS CHANGES. 1 MAJOR: stale sandbox_l3 comments at tests/e2e/test_m4_policy.py:699-700 + :777-778 (agent C missed these). 2 MINOR: stale generate_input_allow_ruleset docstring at sandboxd/sandbox-core/src/gateway.rs:1013-1020 (missed from M9-S19 review); flake risk in test_l3_fail_closed_before_dns_propagation from host-side vs VM-side DNS divergence. 3 NITs. Spec + user-facing docs + E2E assertions otherwise accurate vs shipped code."
-      },
-      {
-        "timestamp": "2026-04-20T22:15:22.082250Z",
-        "type": "decision",
-        "note": "Review-fix pass complete. All 5 fixes applied: stale sandbox_l3 comments at test_m4_policy.py:699 + :777 (httpbin.org wording), gateway.rs:1013-1021 docstring (53/10000 with CONNECT-tunnel mention), flake-risk fix (step 3 uses VM-resolved IP from step 2 nslookup, fail-fast if empty), spec 'separate top-level key' \u2192 'peer of resources: at the DiscoveryResponse root', troubleshooting.md mitmproxy grep prose + pattern. Verification green: cargo fmt/clippy/nextest 523/523, fail-closed E2E 169s, docs-build 20 pages."
-      },
-      {
-        "timestamp": "2026-04-20T22:17:58.168916Z",
-        "type": "decision",
-        "note": "kio-reviewer confirmation pass: APPROVE. All 5 M9-S20 review findings (1 MAJOR + 2 MINOR + 2 NITs) verified correctly landed without collateral changes."
-      }
-    ]
-  },
+  "current_log": null,
   "log": [
     {
       "session": "M0-S1",
@@ -1027,6 +986,32 @@
         "compile_l3_wildcard_emits_default_filter_chain",
         ".tasks/verification/20260420-connect-tunneling/"
       ]
+    },
+    {
+      "session": "M9-S20",
+      "title": "L3 flow \u2014 E2E assertions, design-doc amendment, user-facing docs, consistency sweep",
+      "summary": "L3-cutover follow-up pass. (1) User-facing docs: docs/concepts/networking.md (sandbox_l3 row removed, sequence diagram \u2192 CONNECT on 127.0.0.1:18080, new fail-closed L3 subsection), docs/guides/network-policies.md (+ policy-change propagation + L3 limitations), docs/guides/troubleshooting.md (+3 FAQ entries), docs/concepts/architecture.md + docs/reference/http-api.md tweaks. (2) Design spec: 11 amendments to .tasks/specs/2026-04-19-l3-envoy-mitmproxy-flow-design.md \u2014 tense conversion, dynamic-metadata fallback marked 'not implemented; primary %DOWNSTREAM_LOCAL_ADDRESS% validated on Envoy 1.32.2; re-run harness on version bump', YAML-indent sharp-edge note (peer of resources: at DiscoveryResponse root), verification-harness link, writer-invariant upgraded to shipped (marker-delimited + InvariantViolated), publication mechanism rewritten to shipped option (a). HttpProtocolOptions verified PRESENT at policy.rs:911-915. (3) E2E: tests/e2e/test_m4_policy.py \u2014 4 new gateway-container helpers (_gateway_listen_addrs, _assert_mitmproxy_loopback_only, _gateway_nft_tables, _read_gateway_log), new test test_l3_fail_closed_before_dns_propagation (VM-resolved IP avoids host/VM resolver divergence), Gap 1/2/3/5 assertions in test_level3_http_inspected, stale-text fixes across 5 L3 tests. (4) Code docstring: gateway.rs::generate_input_allow_ruleset rewritten (ports 53/10000, no more 8080). (5) Review cycle: kio-reviewer flagged 1 MAJOR (2 stale comments missed by scoping) + 2 MINOR (gateway.rs docstring, flake risk in fail-closed test from CDN anycast) + 3 NITs; all 5 actionable items fixed; confirmation pass APPROVE. Verification: cargo fmt/clippy/nextest 523/523, fail-closed E2E 169s, L3 subset 6/6 green in 402s, make docs-build 20 pages. Committed as 7b2fcf8.",
+      "completed": "2026-04-20T22:19:42.158769Z",
+      "decisions": [
+        "Review-fix pass complete. All 5 fixes applied: stale sandbox_l3 comments at test_m4_policy.py:699 + :777 (httpbin.org wording), gateway.rs:1013-1021 docstring (53/10000 with CONNECT-tunnel mention), flake-risk fix (step 3 uses VM-resolved IP from step 2 nslookup, fail-fast if empty), spec 'separate top-level key' \u2192 'peer of resources: at the DiscoveryResponse root', troubleshooting.md mitmproxy grep prose + pattern. Verification green: cargo fmt/clippy/nextest 523/523, fail-closed E2E 169s, docs-build 20 pages.",
+        "kio-reviewer confirmation pass: APPROVE. All 5 M9-S20 review findings (1 MAJOR + 2 MINOR + 2 NITs) verified correctly landed without collateral changes.",
+        "M9-S20 committed as 7b2fcf8 (docs(gateway): L3 follow-up \u2014 E2E assertions, spec amend, docs sweep). 9 files, +640/-150. site/package-lock.json excluded (pre-existing drift, todo #24)."
+      ],
+      "discoveries": [
+        "M9-S20 scoping (handoff: 20260420-m9s20-scoping.md): 4 stale-text items (test_m4_policy.py docstrings at 347-359 + 993-1006 still describe sandbox_l3 DNAT mechanism \u2014 plus 3 others), 4 design-spec amendments (dynamic-metadata fallback downgrade to 'not needed', YAML indent sharp edge, past-tense conversion, verification harness pointer), 5 E2E assertion gaps (mitmproxy bind to 127.0.0.1:18080, CONNECT tunnel observable, original authority preservation, fail-closed behavior routing, three-table post-apply steady state).",
+        "Agent A (docs) DONE. Touched 5 files: docs/concepts/networking.md (sandbox_l3 row removed, sequence diagram \u2192 CONNECT over 127.0.0.1:18080, new fail-closed L3 subsection), docs/guides/network-policies.md (policy-change propagation + L3 limitations subsections), docs/guides/troubleshooting.md (3 new FAQ entries), docs/concepts/architecture.md (Envoy listener mention), docs/reference/http-api.md (DELETE /sessions/{id}/policy description updated). make docs-build PASS, 20 pages. docs/guides/hardening.md verified clean. Residual matches only in docs/internal/session-plan.md (historical).",
+        "Agent B (design spec) DONE. 11 amendments applied to .tasks/specs/2026-04-19-l3-envoy-mitmproxy-flow-design.md: tense conversion across summary/context/ports/rollout, dynamic-metadata fallback block rewritten to 'verified primary path on Envoy 1.32.2, fallback not implemented, re-run harness on version bump', YAML indent sharp-edge added (4-space correct per shipped templates; 2-space was the failure), verification-harness link inserted in testing plan, writer-invariant text upgraded from aspirational to shipped (marker-delimited + InvariantViolated), publication mechanism rewritten to reflect shipped option (a). HttpProtocolOptions verified PRESENT at policy.rs:911-915 with test at 4027-4036 \u2014 scoping item 2.4 closed. No inline TODOs left behind.",
+        "Agent C (E2E) DONE. tests/e2e/test_m4_policy.py: 4 new helpers (_gateway_listen_addrs, _assert_mitmproxy_loopback_only, _gateway_nft_tables, _read_gateway_log); new test test_l3_fail_closed_before_dns_propagation (Gap 4 \u2014 uses curl --resolve to bypass CoreDNS, asserts pre-warmup fail-closed, polls post-warmup success); test_level3_http_inspected gained Gap 1/2/3/5 assertions; stale-text fixes in test_level3_http_inspected + test_unrestricted_allows_and_logs + test_policy_clear_reverts_to_deny_all. Gap-5 placement moved post-DNS-warmup (sandbox_policy nftables table is created by DNS propagation loop for domain-only policies, not by sync compile). Gap 2 scoped to mitmproxy log only (Envoy runs --log-level warning, no access log configured \u2014 envoy.log effectively empty post-startup). L3 subset 6/6 green in 402s (6m42s).",
+        "kio-reviewer M9-S20 verdict: NEEDS CHANGES. 1 MAJOR: stale sandbox_l3 comments at tests/e2e/test_m4_policy.py:699-700 + :777-778 (agent C missed these). 2 MINOR: stale generate_input_allow_ruleset docstring at sandboxd/sandbox-core/src/gateway.rs:1013-1020 (missed from M9-S19 review); flake risk in test_l3_fail_closed_before_dns_propagation from host-side vs VM-side DNS divergence. 3 NITs. Spec + user-facing docs + E2E assertions otherwise accurate vs shipped code."
+      ],
+      "artifacts": [
+        "7b2fcf8",
+        "test_l3_fail_closed_before_dns_propagation",
+        "_assert_mitmproxy_loopback_only",
+        "_gateway_nft_tables",
+        "20260420-kio-reviewer-m9s20.md",
+        "20260420-m9s20-scoping.md"
+      ]
     }
   ],
   "todos": [
@@ -1246,7 +1231,9 @@
       "text": "Envoy version-bump gate: add comment to networking/gateway/Dockerfile pointing at .tasks/verification/20260420-connect-tunneling/run-verification.sh \u2014 rerun before trusting %DOWNSTREAM_LOCAL_ADDRESS% on a new Envoy version.",
       "added_session": "M9-S19",
       "added_timestamp": "2026-04-20T18:08:47.085145Z",
-      "status": "deferred"
+      "status": "dropped",
+      "resolved_session": "M9-S20",
+      "resolved_timestamp": "2026-04-21T07:52:58.996392Z"
     },
     {
       "id": 26,

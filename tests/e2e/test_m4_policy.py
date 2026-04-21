@@ -545,8 +545,14 @@ def test_level3_http_inspected(sandbox_cli):
         # tunneled HTTPS request. Either `server connect` or `[ALLOW]`
         # is sufficient positive evidence that the CONNECT tunnel was
         # established and traffic flowed.
-        # (Envoy's access log is not enabled by the policy compiler, so
-        # we don't assert on envoy.log here.)
+        #
+        # The Envoy access-log assertions further down close the other
+        # half of this observation: mitmproxy tells us what the CONNECT
+        # authority looked like from mitmproxy's side; Envoy's own log
+        # tells us what `%DOWNSTREAM_LOCAL_ADDRESS%` and `UPSTREAM_HOST`
+        # looked like from Envoy's side. An Envoy-level regression
+        # (listener misconfig, tunneling_config drift, listener-update
+        # breaking original_dst) must show up on both sides.
         assert (
             "server connect" in mitm_log
             or "[ALLOW]" in mitm_log
@@ -583,6 +589,90 @@ def test_level3_http_inspected(sandbox_cli):
             f"appears to have tunneled to a loopback address, which would "
             f"indicate %DOWNSTREAM_LOCAL_ADDRESS% interpolation failure.\n"
             f"mitmproxy.log tail:\n{mitm_log[-4000:]}"
+        )
+
+        # M9-S20 gap 4: observe the CONNECT-tunnel invariant from
+        # **Envoy's own access log**, independent of mitmproxy's flow
+        # log. The L3 `tcp_proxy` filter writes one line per tunneled
+        # connection to `/var/log/gateway/envoy_access.log` with
+        # key=value columns (see `l3_tcp_proxy_access_log_yaml` in
+        # `sandbox-core/src/policy.rs`). A mitmproxy-only assertion is
+        # vulnerable to mitmproxy log-format regressions and to Envoy
+        # misconfigurations that bypass mitmproxy entirely (e.g. a
+        # listener update that dropped `tunneling_config`, sending
+        # bytes to `mitmproxy` as raw TCP). Asserting on Envoy's log
+        # directly catches both failure modes.
+        envoy_access_log = _read_gateway_log(session_id, "envoy_access.log")
+        assert envoy_access_log.strip(), (
+            f"envoy_access.log is empty after L3 curl; Envoy's tcp_proxy "
+            f"access log may be misconfigured or no L3 chain matched the "
+            f"traffic.\nmitmproxy.log tail (for cross-reference):\n"
+            f"{mitm_log[-2000:]}"
+        )
+
+        # Split into lines and filter to the L3 chain entries. Every
+        # line the format produces starts with `[<timestamp>] `, so a
+        # prefix test is adequate.
+        envoy_lines = [
+            line for line in envoy_access_log.splitlines()
+            if line.startswith("[") and "downstream_local=" in line
+        ]
+        assert envoy_lines, (
+            f"envoy_access.log has content but no parseable L3 entries "
+            f"(lines starting with `[` and carrying `downstream_local=`).\n"
+            f"full log:\n{envoy_access_log[-4000:]}"
+        )
+
+        # Invariant A: at least one line has
+        # `downstream_local=<resolved-ip>:443` — the VM's intended
+        # destination IP preserved by `original_dst`. Mirrors the
+        # mitmproxy `server connect <ip>:443` assertion above.
+        downstream_hits = [
+            line for line in envoy_lines
+            if any(
+                f"downstream_local={ip}:443" in line for ip in resolved_ips
+            )
+        ]
+        assert downstream_hits, (
+            f"envoy_access.log does not record downstream_local=<ip>:443 for "
+            f"any of example.com's resolved IPs ({resolved_ips}); Envoy's "
+            f"`original_dst` listener filter may be failing to recover "
+            f"SO_ORIGINAL_DST, or the L3 prefix_ranges match is missing.\n"
+            f"envoy_access.log tail:\n{envoy_access_log[-4000:]}"
+        )
+
+        # Invariant B: none of the downstream-local addresses may be
+        # `127.0.0.1` — that would indicate the L3 chain pointed Envoy
+        # at its own loopback (e.g. a direct-to-internet bypass that
+        # routed back through mitmproxy without preserving the original
+        # destination). This is the Envoy-side mirror of the mitmproxy
+        # `server connect 127.0.0.1:` negative check above.
+        assert "downstream_local=127.0.0.1:" not in envoy_access_log, (
+            f"envoy_access.log records downstream_local=127.0.0.1:* — Envoy "
+            f"tunneled to a loopback address as the original destination, "
+            f"which would indicate `original_dst` or prefix_ranges misbehaved.\n"
+            f"envoy_access.log tail:\n{envoy_access_log[-4000:]}"
+        )
+
+        # Invariant C: the upstream cluster must be `mitmproxy` and the
+        # upstream host must be the loopback endpoint of that cluster.
+        # A regression that routes L3 traffic back to `original_dst`
+        # (e.g. if `tunneling_config` is dropped on a listener update)
+        # would flip `upstream_cluster` and break this check without
+        # touching mitmproxy at all.
+        assert any("upstream_cluster=mitmproxy" in line for line in envoy_lines), (
+            f"envoy_access.log does not record any line with "
+            f"upstream_cluster=mitmproxy; L3 chains may have regressed to "
+            f"routing via original_dst.\n"
+            f"envoy_access.log tail:\n{envoy_access_log[-4000:]}"
+        )
+        assert any(
+            "upstream_host=127.0.0.1:18080" in line for line in envoy_lines
+        ), (
+            f"envoy_access.log does not record any line with "
+            f"upstream_host=127.0.0.1:18080; the `mitmproxy` cluster's "
+            f"loopback endpoint may have drifted.\n"
+            f"envoy_access.log tail:\n{envoy_access_log[-4000:]}"
         )
 
         # Clean up.
