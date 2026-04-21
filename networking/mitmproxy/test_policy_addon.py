@@ -33,11 +33,17 @@ class _FakeRequest:
         method: str = "GET",
         host: str = "example.com",
         path: str = "/",
+        port: int = 443,
         pretty_host: str | None = None,
     ) -> None:
         self.method = method
         self.host = host
         self.path = path
+        # `port` mirrors mitmproxy's `request.port` — the destination
+        # L4 port.  M10-S1 rules match on `(host, port)`, so every test
+        # flow must carry one.  443 is the default for the HTTPS path
+        # we're actually MITM-ing in production.
+        self.port = port
         self.pretty_host = pretty_host or host
 
 
@@ -121,9 +127,12 @@ def _make_flow(
     method: str = "GET",
     host: str = "example.com",
     path: str = "/",
+    port: int = 443,
 ) -> _FakeHTTPFlow:
     """Create a fake HTTPFlow for testing."""
-    return _FakeHTTPFlow(_FakeRequest(method=method, host=host, path=path))
+    return _FakeHTTPFlow(
+        _FakeRequest(method=method, host=host, path=path, port=port)
+    )
 
 
 # ── Tests ───────────────────────────────────────────────────────────
@@ -132,7 +141,7 @@ def _make_flow(
 class TestAllowMatchingHost:
     def test_allow_matching_host(self) -> None:
         addon = _make_addon([
-            {"host": "api.github.com", "filters": [ANY_FILTER]},
+            {"host": "api.github.com", "port": 443, "filters": [ANY_FILTER]},
         ])
         flow = _make_flow(host="api.github.com", path="/repos/foo")
         addon.request(flow)
@@ -142,7 +151,7 @@ class TestAllowMatchingHost:
 class TestDenyUnknownHost:
     def test_deny_unknown_host(self) -> None:
         addon = _make_addon([
-            {"host": "api.github.com", "filters": [ANY_FILTER]},
+            {"host": "api.github.com", "port": 443, "filters": [ANY_FILTER]},
         ])
         flow = _make_flow(host="evil.com", path="/")
         addon.request(flow)
@@ -155,7 +164,7 @@ class TestDenyUnknownHost:
 class TestMethodRestriction:
     def test_method_restriction(self) -> None:
         addon = _make_addon([
-            {"host": "api.github.com", "filters": [
+            {"host": "api.github.com", "port": 443, "filters": [
                 {"method": "GET", "path": "/*"},
             ]},
         ])
@@ -176,7 +185,7 @@ class TestMethodRestriction:
 class TestPathRestriction:
     def test_path_restriction(self) -> None:
         addon = _make_addon([
-            {"host": "api.github.com", "filters": [
+            {"host": "api.github.com", "port": 443, "filters": [
                 {"method": "ANY", "path": "/repos/*"},
                 {"method": "ANY", "path": "/user/*"},
             ]},
@@ -198,7 +207,7 @@ class TestPathRestriction:
 class TestWildcardHost:
     def test_wildcard_host(self) -> None:
         addon = _make_addon([
-            {"host": "*.github.com", "filters": [ANY_FILTER]},
+            {"host": "*.github.com", "port": 443, "filters": [ANY_FILTER]},
         ])
         flow = _make_flow(host="api.github.com", path="/")
         addon.request(flow)
@@ -206,7 +215,7 @@ class TestWildcardHost:
 
     def test_wildcard_does_not_match_root(self) -> None:
         addon = _make_addon([
-            {"host": "*.github.com", "filters": [ANY_FILTER]},
+            {"host": "*.github.com", "port": 443, "filters": [ANY_FILTER]},
         ])
         flow = _make_flow(host="github.com", path="/")
         addon.request(flow)
@@ -217,7 +226,7 @@ class TestWildcardHost:
 class TestDenyResponseFormat:
     def test_deny_response_format(self) -> None:
         addon = _make_addon([
-            {"host": "allowed.com", "filters": [ANY_FILTER]},
+            {"host": "allowed.com", "port": 443, "filters": [ANY_FILTER]},
         ])
         flow = _make_flow(host="evil.com", method="POST", path="/hack")
         addon.request(flow)
@@ -228,6 +237,7 @@ class TestDenyResponseFormat:
             "error": "sandbox_policy_denied",
             "reason": "host not in policy",
             "host": "evil.com",
+            "port": 443,
             "method": "POST",
             "path": "/hack",
         }
@@ -237,7 +247,7 @@ class TestDenyResponseFormat:
 class TestConfigReload:
     def test_config_reload(self) -> None:
         addon = _make_addon([
-            {"host": "old.com", "filters": [ANY_FILTER]},
+            {"host": "old.com", "port": 443, "filters": [ANY_FILTER]},
         ])
 
         # Initially old.com is allowed.
@@ -256,7 +266,7 @@ class TestConfigReload:
         # Ensure the mtime changes (filesystem resolution may be 1s).
         time.sleep(0.05)
         _write_config(config_path, [
-            {"host": "new.com", "filters": [ANY_FILTER]},
+            {"host": "new.com", "port": 443, "filters": [ANY_FILTER]},
         ])
 
         # Trigger reload directly (don't wait for the watcher thread).
@@ -277,7 +287,7 @@ class TestConfigReload:
 class TestHealthEndpoint:
     def test_health_endpoint(self) -> None:
         addon = _make_addon([
-            {"host": "allowed.com", "filters": [ANY_FILTER]},
+            {"host": "allowed.com", "port": 443, "filters": [ANY_FILTER]},
         ])
         flow = _make_flow(host="anything.com", path="/__sandbox_health")
         addon.request(flow)
@@ -299,7 +309,7 @@ class TestHealthEndpoint:
 class TestAnyMethodAllowsAll:
     def test_any_method_allows_all(self) -> None:
         addon = _make_addon([
-            {"host": "api.example.com", "filters": [ANY_FILTER]},
+            {"host": "api.example.com", "port": 443, "filters": [ANY_FILTER]},
         ])
         for method in ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]:
             flow = _make_flow(method=method, host="api.example.com")
@@ -310,7 +320,7 @@ class TestAnyMethodAllowsAll:
 class TestWildcardPathAllowsAll:
     def test_wildcard_path_allows_all(self) -> None:
         addon = _make_addon([
-            {"host": "api.example.com", "filters": [ANY_FILTER]},
+            {"host": "api.example.com", "port": 443, "filters": [ANY_FILTER]},
         ])
         for path in ["/", "/foo", "/bar/baz", "/deeply/nested/path"]:
             flow = _make_flow(host="api.example.com", path=path)
@@ -337,7 +347,7 @@ class TestEmptyRulesDenyAll:
 class TestCaseInsensitiveHost:
     def test_case_insensitive_host(self) -> None:
         addon = _make_addon([
-            {"host": "API.GitHub.Com", "filters": [ANY_FILTER]},
+            {"host": "API.GitHub.Com", "port": 443, "filters": [ANY_FILTER]},
         ])
         flow = _make_flow(host="api.github.com")
         addon.request(flow)
@@ -345,7 +355,7 @@ class TestCaseInsensitiveHost:
 
     def test_case_insensitive_host_reverse(self) -> None:
         addon = _make_addon([
-            {"host": "api.github.com", "filters": [ANY_FILTER]},
+            {"host": "api.github.com", "port": 443, "filters": [ANY_FILTER]},
         ])
         flow = _make_flow(host="API.GITHUB.COM")
         addon.request(flow)
@@ -413,14 +423,15 @@ class TestLegacyPreM9S10ShapeIsRejected:
     def test_failing_e2e_method_restriction_denies_post(self) -> None:
         """Replica of `test_level3_method_restriction`.
 
-        Policy `{httpbin.org, filters: [{GET, /*}]}` must deny POST.  This
-        is the exact shape sandboxd writes for the E2E test; it exists
-        here so a future addon regression is caught in <1 second instead
-        of a ~3-minute E2E round-trip.
+        Policy `{httpbin.org:443, filters: [{GET, /*}]}` must deny POST.
+        This is the exact shape sandboxd writes for the E2E test; it
+        exists here so a future addon regression is caught in <1 second
+        instead of a ~3-minute E2E round-trip.
         """
         addon = _make_addon([
             {
                 "host": "httpbin.org",
+                "port": 443,
                 "filters": [{"method": "GET", "path": "/*"}],
             },
         ])
@@ -432,12 +443,13 @@ class TestLegacyPreM9S10ShapeIsRejected:
     def test_failing_e2e_path_restriction_denies_other_path(self) -> None:
         """Replica of `test_level3_path_restriction`.
 
-        Policy `{httpbin.org, filters: [{ANY, /api/*}]}` must deny a
+        Policy `{httpbin.org:443, filters: [{ANY, /api/*}]}` must deny a
         request to `/other/path`.
         """
         addon = _make_addon([
             {
                 "host": "httpbin.org",
+                "port": 443,
                 "filters": [{"method": "ANY", "path": "/api/*"}],
             },
         ])
@@ -460,7 +472,7 @@ class TestPairMatching:
         """`GET /foo` and `POST /bar` must NOT also allow `POST /foo` or
         `GET /bar`."""
         addon = _make_addon([
-            {"host": "api.com", "filters": [
+            {"host": "api.com", "port": 443, "filters": [
                 {"method": "GET", "path": "/foo"},
                 {"method": "POST", "path": "/bar"},
             ]},
@@ -492,11 +504,17 @@ class TestPairMatching:
 
 
 class TestFnmatchGlobs:
-    """Filter paths support fnmatch-style globs (*, ?, [...])."""
+    """Filter paths support fnmatch-style globs (*, ?, [...]).
+
+    NOTE (M10-S1 Commit 1): these tests still assert the old fnmatch
+    behaviour where `*` crosses `/`.  Commit 2 renames this class to
+    ``TestPerSegmentGlob`` and inverts the expected semantics to match
+    the new per-segment matcher.
+    """
 
     def test_star_matches_single_segment(self) -> None:
         addon = _make_addon([
-            {"host": "api.com", "filters": [
+            {"host": "api.com", "port": 443, "filters": [
                 {"method": "GET", "path": "/repos/*"},
             ]},
         ])
@@ -511,7 +529,7 @@ class TestFnmatchGlobs:
 
     def test_question_mark_matches_single_char(self) -> None:
         addon = _make_addon([
-            {"host": "api.com", "filters": [
+            {"host": "api.com", "port": 443, "filters": [
                 {"method": "GET", "path": "/v?/users"},
             ]},
         ])
@@ -531,19 +549,19 @@ class TestMultipleRulesCompose:
 
     def test_two_rules_same_host_compose(self) -> None:
         addon = _make_addon([
-            {"host": "api.github.com", "filters": [
+            {"host": "api.github.com", "port": 443, "filters": [
                 {"method": "GET", "path": "/*"},
             ]},
-            {"host": "api.github.com", "filters": [
+            {"host": "api.github.com", "port": 443, "filters": [
                 {"method": "POST", "path": "/*"},
             ]},
         ])
         # GET allowed by rule 1.
-        allowed_get, _ = addon._check_request("api.github.com", "GET", "/")
+        allowed_get, _ = addon._check_request("api.github.com", 443, "GET", "/")
         assert allowed_get
 
         # POST allowed by rule 2 (must not be blocked by rule 1's filters).
-        allowed_post, _ = addon._check_request("api.github.com", "POST", "/")
+        allowed_post, _ = addon._check_request("api.github.com", 443, "POST", "/")
         assert allowed_post
 
 
@@ -552,41 +570,41 @@ class TestCheckRequestDirect:
 
     def test_path_glob_matching(self) -> None:
         addon = _make_addon([
-            {"host": "api.com", "filters": [
+            {"host": "api.com", "port": 443, "filters": [
                 {"method": "ANY", "path": "/v1/*"},
                 {"method": "ANY", "path": "/v2/*"},
             ]},
         ])
-        allowed1, _ = addon._check_request("api.com", "GET", "/v1/users")
+        allowed1, _ = addon._check_request("api.com", 443, "GET", "/v1/users")
         assert allowed1
 
-        allowed2, _ = addon._check_request("api.com", "GET", "/v2/data")
+        allowed2, _ = addon._check_request("api.com", 443, "GET", "/v2/data")
         assert allowed2
 
-        allowed3, reason = addon._check_request("api.com", "GET", "/v3/other")
+        allowed3, reason = addon._check_request("api.com", 443, "GET", "/v3/other")
         assert not allowed3
         assert reason == "no filter matched GET /v3/other"
 
     def test_method_case_insensitive(self) -> None:
         """Request methods are uppercased before comparison."""
         addon = _make_addon([
-            {"host": "api.com", "filters": [
+            {"host": "api.com", "port": 443, "filters": [
                 {"method": "GET", "path": "/*"},
                 {"method": "POST", "path": "/*"},
             ]},
         ])
-        allowed, _ = addon._check_request("api.com", "GET", "/")
+        allowed, _ = addon._check_request("api.com", 443, "GET", "/")
         assert allowed
-        allowed2, _ = addon._check_request("api.com", "Post", "/")
+        allowed2, _ = addon._check_request("api.com", 443, "Post", "/")
         assert allowed2
 
     def test_empty_filters_list_denies(self) -> None:
         """A rule with an empty `filters` list matches the host but no
         filter matches, so every request is denied with 'no filter matched'."""
         addon = _make_addon([
-            {"host": "api.com", "filters": []},
+            {"host": "api.com", "port": 443, "filters": []},
         ])
-        allowed, reason = addon._check_request("api.com", "GET", "/")
+        allowed, reason = addon._check_request("api.com", 443, "GET", "/")
         assert not allowed
         assert reason == "no filter matched GET /"
 
@@ -651,7 +669,7 @@ class TestConfigFileWatcher:
         """Invalid JSON in config file should not crash — existing rules
         should be preserved."""
         addon = _make_addon([
-            {"host": "good.com", "filters": [ANY_FILTER]},
+            {"host": "good.com", "port": 443, "filters": [ANY_FILTER]},
         ])
 
         # Write invalid JSON to the config file.
@@ -677,7 +695,7 @@ class TestConfigFileWatcher:
 
         # Now create the file.
         _write_config(path, [
-            {"host": "new.com", "filters": [ANY_FILTER]},
+            {"host": "new.com", "port": 443, "filters": [ANY_FILTER]},
         ])
         addon._load_config()
         assert addon._passthrough is False

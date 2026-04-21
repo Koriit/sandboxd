@@ -8,12 +8,13 @@ reason for denial.
 When no config file is present, operates in pass-through mode (allow all)
 for backwards compatibility.
 
-Config format (from sandboxd MitmproxyConfig, post-M9-S10):
+Config format (from sandboxd MitmproxyConfig, M10-S1 v2 schema):
 
     {
       "rules": [
         {
           "host": "api.github.com",
+          "port": 443,
           "filters": [
             {"method": "GET",  "path": "/repos/*"},
             {"method": "POST", "path": "/user/*"}
@@ -21,6 +22,7 @@ Config format (from sandboxd MitmproxyConfig, post-M9-S10):
         },
         {
           "host": "registry.npmjs.org",
+          "port": 443,
           "filters": [
             {"method": "ANY", "path": "/*"}
           ]
@@ -28,17 +30,33 @@ Config format (from sandboxd MitmproxyConfig, post-M9-S10):
       ]
     }
 
-- Each `filters[i]` is a `(method, path)` pair — both must match together.
-  This differs from the pre-M9-S10 shape (independent `methods` / `paths`
-  lists with cartesian-product semantics).
+- Rule identity on the wire is `(host, port)`: a rule only matches a
+  request whose destination port equals the rule's `port`.  A port
+  mismatch skips the rule — the request is denied with
+  `"host not in policy"` if no other rule matches.  This lets policies
+  express "HTTP to api.example.com:443 only, nothing on :8443" without
+  a separate deny rule.  Added in M10-S1 — prior versions omitted the
+  field.
+- Each `filters[i]` is a `(method, path)` pair — both must match
+  together.  This differs from the pre-M9-S10 shape (independent
+  `methods` / `paths` lists with cartesian-product semantics).
 - `method` is an uppercase HTTP method name (`GET`, `POST`, ...) or the
   special marker `ANY` meaning "match any method".
-- `path` is an fnmatch-style glob (`*`, `?`, `[...]`); examples: `/api/*`,
-  `/repos/?/commits`.  Use `/*` to match any path.
+- `path` is a per-segment glob (M10-S1):
+    * `?` matches exactly one non-`/` character.
+    * `*` matches zero or more non-`/` characters — within a single
+      path segment, never crossing `/`.
+    * `**` (only when it is a whole segment) matches zero or more
+      complete path segments, including `/` separators.
+    * Any other character is a literal (case-sensitive, anchored
+      full-path match).
+  Examples: `/api/*` matches `/api/users` but *not* `/api/v1/users`;
+  `/api/**` matches both; `/repos/?/commits` matches `/repos/a/commits`
+  but not `/repos/ab/commits`.
 - An empty `filters` list means no request matches — sandboxd's policy
   compiler rejects such configurations at compile time, so the addon
-  never receives them in practice.  If it does (hand-edited config), all
-  requests to that host are denied with `"no filter matched"`.
+  never receives them in practice.  If it does (hand-edited config),
+  all requests to that host are denied with `"no filter matched"`.
 """
 
 from __future__ import annotations
@@ -94,6 +112,11 @@ class PolicyAddon:
         host = flow.request.pretty_host
         method = flow.request.method
         path = flow.request.path
+        # `flow.request.port` is the destination L4 port.  In M10-S1 the
+        # addon matches on `(host, port)`, so a missing attribute on a
+        # fake/test request defaults to 0 — which will never match a
+        # real rule (rule ports are `1..=65535`).
+        port = int(getattr(flow.request, "port", 0) or 0)
 
         # Health endpoint — always respond, regardless of policy.
         if path == HEALTH_PATH:
@@ -106,20 +129,25 @@ class PolicyAddon:
 
         # Pass-through mode: no config loaded → allow everything.
         if self._passthrough:
-            logger.info("[ALLOW] %s %s%s (pass-through)", method, host, path)
+            logger.info(
+                "[ALLOW] %s %s:%d%s (pass-through)", method, host, port, path
+            )
             return
 
-        allowed, reason = self._check_request(host, method, path)
+        allowed, reason = self._check_request(host, port, method, path)
         if allowed:
-            logger.info("[ALLOW] %s %s%s", method, host, path)
+            logger.info("[ALLOW] %s %s:%d%s", method, host, port, path)
         else:
-            logger.warning("[DENY] %s %s%s (%s)", method, host, path, reason)
+            logger.warning(
+                "[DENY] %s %s:%d%s (%s)", method, host, port, path, reason
+            )
             flow.response = http.Response.make(
                 599,
                 json.dumps({
                     "error": "sandbox_policy_denied",
                     "reason": reason,
                     "host": host,
+                    "port": port,
                     "method": method,
                     "path": path,
                 }),
@@ -159,38 +187,53 @@ class PolicyAddon:
     # ── Request validation ──────────────────────────────────────────
 
     def _check_request(
-        self, host: str, method: str, path: str
+        self, host: str, port: int, method: str, path: str
     ) -> tuple[bool, str]:
         """Check a request against the loaded rules.
 
         Returns (allowed, reason).  *reason* is meaningful only when
         *allowed* is False.
 
-        Semantics (post-M9-S10): all rules with a matching host contribute
-        their `filters` lists.  A request is permitted iff at least one
-        filter from any matching rule matches the `(method, path)` pair.
-        This lets users split a single host's policy across multiple rules
-        without losing any allowed pair.
+        Semantics (M10-S1 v2): rule identity is `(host, port)`.  A rule
+        only matches when its host pattern matches the request host
+        **and** its `port` field equals the request's destination port.
+        Rules with a host match but port mismatch are skipped — if no
+        other rule matches, the request is denied with "host not in
+        policy".
+
+        When at least one rule matches on both host and port, their
+        `filters` lists contribute as a union: the request is permitted
+        iff at least one filter from any matching rule matches the
+        `(method, path)` pair.  This lets users split a single
+        `(host, port)` policy across multiple rules without losing any
+        allowed pair.
         """
         with self._lock:
             rules = list(self._rules)
 
         request_method = method.upper()
 
-        # Walk every rule whose host matches the request host and look for
-        # a filter pair that matches (method, path).
-        matched_any_host = False
+        # Walk every rule whose (host, port) matches and look for a
+        # filter pair that matches (method, path).
+        matched_any_rule = False
         for rule in rules:
             rule_host = rule.get("host", "")
             if not self._match_host(host, rule_host):
                 continue
-            matched_any_host = True
+            # v2 schema: rule must carry a `port` and it must equal the
+            # request's destination port.  A missing or non-integer
+            # `port` means this is a legacy/malformed rule — skip it
+            # rather than silently allowing.
+            rule_port = rule.get("port")
+            if not isinstance(rule_port, int) or rule_port != port:
+                continue
+            matched_any_rule = True
 
             for flt in rule.get("filters", []):
                 if self._filter_matches(flt, request_method, path):
                     return True, ""
 
-        if not matched_any_host:
+        if not matched_any_rule:
             return False, "host not in policy"
 
         return False, f"no filter matched {method} {path}"

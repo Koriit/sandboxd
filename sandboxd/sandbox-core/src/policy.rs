@@ -498,17 +498,26 @@ pub struct MitmproxyConfig {
     pub rules: Vec<MitmproxyRule>,
 }
 
-/// A single mitmproxy rule for a host.
+/// A single mitmproxy rule for a host/port pair.
 ///
-/// A request is permitted when its host matches [`Self::host`] **and** at
-/// least one of [`Self::filters`] matches its `(method, path)` pair.  The
-/// addon iterates the list in order.  An empty list means no request is
+/// A request is permitted when its host matches [`Self::host`], its
+/// destination port equals [`Self::port`], **and** at least one of
+/// [`Self::filters`] matches its `(method, path)` pair.  The addon
+/// iterates the list in order.  An empty list means no request is
 /// allowed — the upstream [`PolicyCompiler`] rejects such configurations
 /// at compile time.
+///
+/// Rule identity on the wire is `(host, port)`: a port mismatch at the
+/// mitmproxy layer is itself a deny reason, letting policies express
+/// "HTTP to api.example.com:443 only, nothing on :8443" without needing
+/// a separate deny rule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MitmproxyRule {
     /// Hostname to match (exact or wildcard like `*.example.com`).
     pub host: String,
+    /// Destination L4 port this rule matches.  The addon compares it
+    /// against `flow.request.port`; a mismatch skips the rule.
+    pub port: u16,
     /// Ordered `(method, path)` filter pairs.  Each request is checked
     /// against the list in order; the first matching pair permits it.
     pub filters: Vec<MitmproxyFilter>,
@@ -1512,8 +1521,9 @@ resources:
     /// Compile mitmproxy configuration for the policy.
     ///
     /// Only `Http`-level rules produce mitmproxy rules.  Each rule's
-    /// `http_filters` list is emitted verbatim as `(method, path)` pairs
-    /// — the addon matches them as pairs, not as a cartesian product.
+    /// `host`, `port`, and `http_filters` list is emitted verbatim — the
+    /// addon matches `(host, port)` up front and then walks the filter
+    /// list as `(method, path)` pairs (no cartesian product).
     fn compile_mitmproxy(policy: &Policy) -> String {
         let rules: Vec<MitmproxyRule> = policy
             .rules
@@ -1521,6 +1531,7 @@ resources:
             .filter_map(|r| match &r.level {
                 AssuranceLevel::Http { http_filters } => Some(MitmproxyRule {
                     host: r.host.to_string(),
+                    port: r.port,
                     filters: http_filters
                         .iter()
                         .map(|f| MitmproxyFilter {
@@ -2945,6 +2956,7 @@ mod tests {
         let config: MitmproxyConfig = serde_json::from_str(&compiled.mitmproxy_config).unwrap();
         assert_eq!(config.rules.len(), 1);
         assert_eq!(config.rules[0].host, "api.example.com");
+        assert_eq!(config.rules[0].port, 443);
         assert_eq!(config.rules[0].filters.len(), 1);
         assert_eq!(config.rules[0].filters[0].method, "GET");
         assert_eq!(config.rules[0].filters[0].path, "/api/*");
@@ -2990,6 +3002,7 @@ mod tests {
         let config = MitmproxyConfig {
             rules: vec![MitmproxyRule {
                 host: "example.com".to_string(),
+                port: 443,
                 filters: vec![MitmproxyFilter {
                     method: "GET".to_string(),
                     path: "/*".to_string(),
@@ -2999,6 +3012,7 @@ mod tests {
         let json = config.to_json();
         let parsed: MitmproxyConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.rules.len(), 1);
+        assert_eq!(parsed.rules[0].port, 443);
         assert_eq!(parsed.rules[0].filters.len(), 1);
     }
 
@@ -3050,8 +3064,8 @@ mod tests {
         // Python addon, not an implementation detail.  Pretty-printed JSON
         // is intentional (see `MitmproxyConfig::to_json`): Python's
         // `json.load` parses both compact and pretty forms identically.
-        let expected_method = "{\n  \"rules\": [\n    {\n      \"host\": \"httpbin.org\",\n      \"filters\": [\n        {\n          \"method\": \"GET\",\n          \"path\": \"/*\"\n        }\n      ]\n    }\n  ]\n}";
-        let expected_path = "{\n  \"rules\": [\n    {\n      \"host\": \"httpbin.org\",\n      \"filters\": [\n        {\n          \"method\": \"ANY\",\n          \"path\": \"/api/*\"\n        }\n      ]\n    }\n  ]\n}";
+        let expected_method = "{\n  \"rules\": [\n    {\n      \"host\": \"httpbin.org\",\n      \"port\": 443,\n      \"filters\": [\n        {\n          \"method\": \"GET\",\n          \"path\": \"/*\"\n        }\n      ]\n    }\n  ]\n}";
+        let expected_path = "{\n  \"rules\": [\n    {\n      \"host\": \"httpbin.org\",\n      \"port\": 443,\n      \"filters\": [\n        {\n          \"method\": \"ANY\",\n          \"path\": \"/api/*\"\n        }\n      ]\n    }\n  ]\n}";
         assert_eq!(method_json, expected_method);
         assert_eq!(path_json, expected_path);
     }
@@ -3942,6 +3956,7 @@ mod tests {
         let config: MitmproxyConfig = serde_json::from_str(&compiled.mitmproxy_config).unwrap();
         assert_eq!(config.rules.len(), 1);
         assert_eq!(config.rules[0].host, "inspected.example.com");
+        assert_eq!(config.rules[0].port, 443);
         // `full_policy()` uses a wildcard filter `(ANY, /*)`.
         assert_eq!(config.rules[0].filters.len(), 1);
         assert_eq!(config.rules[0].filters[0].method, "ANY");
@@ -4226,6 +4241,7 @@ mod tests {
         // Only L3 destinations appear in mitmproxy config.
         assert_eq!(config.rules.len(), 1);
         assert_eq!(config.rules[0].host, "monitored.example.com");
+        assert_eq!(config.rules[0].port, 443);
 
         // L3 rule with one `(GET, /api/*)` filter pair.
         assert_eq!(config.rules[0].filters.len(), 1);
@@ -4528,6 +4544,7 @@ mod tests {
             .iter()
             .find(|r| r.host == "api.one.com")
             .unwrap();
+        assert_eq!(one_rule.port, 443);
         assert_eq!(one_rule.filters.len(), 1);
         assert_eq!(one_rule.filters[0].method, "GET");
         assert_eq!(one_rule.filters[0].path, "/*");
@@ -4537,6 +4554,7 @@ mod tests {
             .iter()
             .find(|r| r.host == "api.two.com")
             .unwrap();
+        assert_eq!(two_rule.port, 443);
         assert_eq!(two_rule.filters.len(), 1);
         assert_eq!(two_rule.filters[0].method, "ANY");
         assert_eq!(two_rule.filters[0].path, "/*");
