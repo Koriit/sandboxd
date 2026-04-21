@@ -2210,4 +2210,366 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].0, session_id);
     }
+
+    /// V004 migration integration test.
+    ///
+    /// Seeds a database at the V003 shape with v1-tokened policy rows
+    /// (including a mix of `tcp`, `udp`, `http`, `https`, and `any`
+    /// protocol values, plus a `policy_rule_http_filters` child row for
+    /// the `http`-leveled parent), then opens the DB via
+    /// `SessionStore::new` — which runs V004 and the orphan sweep.
+    ///
+    /// Exit criterion (M10.md § "Exit criteria"): "a seed DB containing
+    /// v1-shaped rows lands cleanly, emits `policy_reset_on_upgrade`
+    /// per affected session (tracing), and leaves those sessions with
+    /// no attached policy."
+    ///
+    /// The tracing event assertion goes through a custom
+    /// `tracing-subscriber` layer that records every `INFO` event with
+    /// its `event` field value — this is the same contract M10-S2 will
+    /// consume off the ring buffer.
+    #[test]
+    fn test_v004_migration_from_v1_seed_db() {
+        use std::sync::{Arc, Mutex as StdMutex};
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::{Layer, Registry};
+
+        // Simple Layer that records the values of the `event` and
+        // `session_id` fields for every event whose target matches
+        // the store module.  Using a custom Layer avoids coupling the
+        // test to the env-filter / fmt subscriber stack.
+        #[derive(Clone, Default)]
+        struct EventRecorder {
+            // (event_name, session_id) tuples.
+            events: Arc<StdMutex<Vec<(String, String)>>>,
+        }
+
+        struct RecorderLayer {
+            recorder: EventRecorder,
+        }
+
+        impl<S> Layer<S> for RecorderLayer
+        where
+            S: tracing::Subscriber,
+        {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Visitor {
+                    event_name: Option<String>,
+                    session_id: Option<String>,
+                }
+                impl tracing::field::Visit for Visitor {
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        match field.name() {
+                            "event" => self.event_name = Some(value.to_string()),
+                            "session_id" => self.session_id = Some(value.to_string()),
+                            _ => {}
+                        }
+                    }
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        // `session_id = %id` with a SessionId shows up as
+                        // Display via record_debug depending on the formatter.
+                        // Capture it the same way to be safe.
+                        if field.name() == "session_id" {
+                            self.session_id = Some(format!("{value:?}").trim_matches('"').to_string());
+                        }
+                    }
+                }
+                let mut v = Visitor {
+                    event_name: None,
+                    session_id: None,
+                };
+                event.record(&mut v);
+                if let (Some(name), Some(sid)) = (v.event_name, v.session_id) {
+                    self.recorder.events.lock().unwrap().push((name, sid));
+                }
+            }
+        }
+
+        let recorder = EventRecorder::default();
+        let subscriber = Registry::default().with(RecorderLayer {
+            recorder: recorder.clone(),
+        });
+
+        // Seed the DB in two stages:
+        //   1. Run refinery with Target::Version(3), so V001-V003 are
+        //      applied exactly as they exist on disk — this gives us
+        //      a correctly-populated `refinery_schema_history` with
+        //      the right checksums, without hand-rolling them.
+        //   2. Insert v1-tokened rows manually, honoring the V003
+        //      CHECK constraints (which still permit http/https/any).
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("sessions.db");
+
+        let v1_session_purge_only: String; // session with only v1-tokened rules (fully purged)
+        let v1_session_mixed: String; // session with mixed v1 + tcp rules (all purged, tcp too)
+        let v2_session_should_survive: String; // session without any policy — must not appear as orphan
+
+        {
+            let mut conn = Connection::open(&db_path).expect("open raw");
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+
+            // Apply only V001..V003.  Refinery fills in history rows
+            // for us; when SessionStore::new runs later it will see
+            // V004 as the only pending migration.
+            embedded::migrations::runner()
+                .set_target(refinery::Target::Version(3))
+                .run(&mut conn)
+                .expect("apply V001..V003");
+
+            // Seed three sessions.
+            v1_session_purge_only = "aaaaaaaaaaaa".to_string();
+            v1_session_mixed = "bbbbbbbbbbbb".to_string();
+            v2_session_should_survive = "cccccccccccc".to_string();
+
+            for id in [
+                &v1_session_purge_only,
+                &v1_session_mixed,
+                &v2_session_should_survive,
+            ] {
+                conn.execute(
+                    "INSERT INTO sessions (id, name, state, config, created_at, updated_at)
+                     VALUES (?1, NULL, 'Stopped', '{}', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z')",
+                    params![id],
+                )
+                .expect("insert session");
+            }
+
+            // session 1: only v1-tokened rules (http, https, any) —
+            //            parent policy must be swept at boot.
+            conn.execute(
+                "INSERT INTO session_policies (session_id, version) VALUES (?1, '1.0.0')",
+                params![v1_session_purge_only],
+            )
+            .expect("seed policy 1");
+            conn.execute(
+                "INSERT INTO policy_rules
+                   (session_id, rule_order, destination_kind, destination_value, level, protocol, reason)
+                 VALUES (?1, 0, 'domain', 'legacy.test', 'http', 'http', 'v1 http token')",
+                params![v1_session_purge_only],
+            )
+            .expect("seed v1 http rule");
+            conn.execute(
+                "INSERT INTO policy_rule_http_filters
+                   (session_id, rule_order, filter_order, method, path_pattern)
+                 VALUES (?1, 0, 0, 'GET', '/*')",
+                params![v1_session_purge_only],
+            )
+            .expect("seed http filter");
+            conn.execute(
+                "INSERT INTO policy_rules
+                   (session_id, rule_order, destination_kind, destination_value, level, protocol, reason)
+                 VALUES (?1, 1, 'cidr', '10.0.0.0/8', 'tls', 'https', 'v1 https token')",
+                params![v1_session_purge_only],
+            )
+            .expect("seed v1 https rule");
+            conn.execute(
+                "INSERT INTO policy_rules
+                   (session_id, rule_order, destination_kind, destination_value, level, protocol, reason)
+                 VALUES (?1, 2, 'cidr', '0.0.0.0/0', 'deny', 'any', 'v1 any token')",
+                params![v1_session_purge_only],
+            )
+            .expect("seed v1 any rule");
+
+            // session 2: mixed rules — a tcp rule alongside v1 tokens.
+            //            Per the V004 migration comment (Step 4/5), the
+            //            tcp rule is *also* purged because no safe port
+            //            value can be invented.  So this session is
+            //            swept as well.
+            conn.execute(
+                "INSERT INTO session_policies (session_id, version) VALUES (?1, '1.0.0')",
+                params![v1_session_mixed],
+            )
+            .expect("seed policy 2");
+            conn.execute(
+                "INSERT INTO policy_rules
+                   (session_id, rule_order, destination_kind, destination_value, level, protocol, reason)
+                 VALUES (?1, 0, 'domain', 'api.test', 'transport', 'tcp', 'tcp rule — no port in v1')",
+                params![v1_session_mixed],
+            )
+            .expect("seed v1 tcp rule");
+            conn.execute(
+                "INSERT INTO policy_rules
+                   (session_id, rule_order, destination_kind, destination_value, level, protocol, reason)
+                 VALUES (?1, 1, 'cidr', '192.168.0.0/16', 'http', 'http', 'v1 http token')",
+                params![v1_session_mixed],
+            )
+            .expect("seed v1 http rule session 2");
+            conn.execute(
+                "INSERT INTO policy_rule_http_filters
+                   (session_id, rule_order, filter_order, method, path_pattern)
+                 VALUES (?1, 1, 0, 'GET', '/v1/*')",
+                params![v1_session_mixed],
+            )
+            .expect("seed http filter session 2");
+
+            // session 3: no policy at all — must not surface as an
+            //            orphan.  `session_policies` has no row for
+            //            this session, so the sweep has nothing to
+            //            find.
+            // (no inserts for session 3)
+        }
+
+        // Open via SessionStore::new — this runs V004 + the orphan
+        // sweep.  Run under the recording subscriber so we capture the
+        // `policy_reset_on_upgrade` events.
+        let swept_sessions = with_default(subscriber, || {
+            let store = SessionStore::new(dir.path().to_path_buf()).expect("open v2 store");
+
+            // Assert: both v1-shaped sessions are gone from session_policies.
+            let conn = store.conn.lock().unwrap();
+            let remaining: i64 = conn
+                .query_row("SELECT COUNT(*) FROM session_policies", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                remaining, 0,
+                "session_policies must be empty after orphan sweep — \
+                 both seeded sessions had v1-tokened rules"
+            );
+
+            // Assert: policy_rules is empty (V004 deleted them).
+            let remaining_rules: i64 = conn
+                .query_row("SELECT COUNT(*) FROM policy_rules", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                remaining_rules, 0,
+                "policy_rules must be empty after V004 deletes v1 rows"
+            );
+
+            // Assert: policy_rule_http_filters is empty — V004 Step 2
+            // deletes filters whose v1 parent was purged, and the
+            // session_policies CASCADE cleans up the rest.
+            let remaining_filters: i64 = conn
+                .query_row("SELECT COUNT(*) FROM policy_rule_http_filters", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                remaining_filters, 0,
+                "policy_rule_http_filters must be empty after V004"
+            );
+
+            // Assert: the sessions themselves still exist (we do not
+            // delete the session rows — only the attached policy).
+            let remaining_sessions: i64 = conn
+                .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(
+                remaining_sessions, 3,
+                "session rows must not be touched by V004"
+            );
+
+            drop(conn);
+            (v1_session_purge_only.clone(), v1_session_mixed.clone())
+        });
+
+        // Assert: exactly two `policy_reset_on_upgrade` events were
+        // emitted, one per affected session.
+        let events = recorder.events.lock().unwrap();
+        let reset_events: Vec<&(String, String)> = events
+            .iter()
+            .filter(|(name, _)| name == "policy_reset_on_upgrade")
+            .collect();
+        assert_eq!(
+            reset_events.len(),
+            2,
+            "expected two policy_reset_on_upgrade events, got {events:?}"
+        );
+
+        let got_session_ids: std::collections::HashSet<&str> =
+            reset_events.iter().map(|(_, sid)| sid.as_str()).collect();
+        assert!(
+            got_session_ids.contains(swept_sessions.0.as_str()),
+            "missing event for session {}: {got_session_ids:?}",
+            swept_sessions.0
+        );
+        assert!(
+            got_session_ids.contains(swept_sessions.1.as_str()),
+            "missing event for session {}: {got_session_ids:?}",
+            swept_sessions.1
+        );
+    }
+
+    /// V004 migration idempotence: reopening the same DB must not
+    /// re-emit `policy_reset_on_upgrade` (there are no orphans left
+    /// to sweep).
+    #[test]
+    fn test_v004_orphan_sweep_is_idempotent() {
+        use std::sync::{Arc, Mutex as StdMutex};
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::{Layer, Registry};
+
+        #[derive(Clone, Default)]
+        struct Counter(Arc<StdMutex<usize>>);
+        struct CountLayer(Counter);
+        impl<S> Layer<S> for CountLayer
+        where
+            S: tracing::Subscriber,
+        {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct V(bool);
+                impl tracing::field::Visit for V {
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        if field.name() == "event" && value == "policy_reset_on_upgrade" {
+                            self.0 = true;
+                        }
+                    }
+                    fn record_debug(
+                        &mut self,
+                        _f: &tracing::field::Field,
+                        _v: &dyn std::fmt::Debug,
+                    ) {
+                    }
+                }
+                let mut v = V(false);
+                event.record(&mut v);
+                if v.0 {
+                    *self.0.0.lock().unwrap() += 1;
+                }
+            }
+        }
+
+        // First open: a fresh DB with no policies → no events.
+        let dir = TempDir::new().expect("tempdir");
+        let counter = Counter::default();
+        {
+            let subscriber = Registry::default().with(CountLayer(counter.clone()));
+            with_default(subscriber, || {
+                let _ = SessionStore::new(dir.path().to_path_buf()).expect("first open");
+            });
+        }
+        assert_eq!(
+            *counter.0.lock().unwrap(),
+            0,
+            "fresh DB has no v1 rows to sweep"
+        );
+
+        // Second open on the same path: still no events (V004 already
+        // ran, nothing left).
+        let counter2 = Counter::default();
+        {
+            let subscriber = Registry::default().with(CountLayer(counter2.clone()));
+            with_default(subscriber, || {
+                let _ = SessionStore::new(dir.path().to_path_buf()).expect("second open");
+            });
+        }
+        assert_eq!(
+            *counter2.0.lock().unwrap(),
+            0,
+            "reopen must not re-emit reset events once the sweep has run"
+        );
+    }
 }
