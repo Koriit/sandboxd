@@ -41,7 +41,7 @@ pub use policy::{
     AssuranceLevel, BOOTSTRAP_FILE_IN_CONTAINER, CompiledPolicy, CoreDnsConfig, Destination,
     FILTER_CHAINS_BEGIN_MARKER, FILTER_CHAINS_END_MARKER, HttpFilter, HttpMethod,
     LISTENER_DIR_IN_CONTAINER, LISTENER_FILE_IN_CONTAINER, LISTENER_FILE_NAME, MitmproxyConfig,
-    MitmproxyFilter, MitmproxyRule, Policy, PolicyCompiler, PolicyRule, Protocol,
+    MitmproxyFilter, MitmproxyRule, Policy, PolicyCompiler, PolicyRule, Protocol, RuleSource,
 };
 pub use policy_distributor::{PolicyDistributor, write_file_to_container};
 pub use process::run_with_timeout;

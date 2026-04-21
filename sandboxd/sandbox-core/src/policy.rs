@@ -631,6 +631,72 @@ pub const FILTER_CHAINS_END_MARKER: &str = "# <<< FILTER_CHAINS_END";
 /// no new mountpoints or permissions are required.
 pub const ENVOY_ACCESS_LOG_IN_CONTAINER: &str = "/var/log/gateway/envoy_access.log";
 
+/// Origin of a `PolicyRule` in the effective policy.
+///
+/// Used by [`PolicyCompiler::validate_with_sources`] to attribute
+/// `(host, port)` collisions to their originating source (policy file,
+/// preset application). The spec mandates that duplicate errors name
+/// every contributing source so operators can resolve collisions
+/// without guessing.
+///
+/// A caller that does not distinguish sources can pass an empty slice
+/// and the validator will report every rule as [`RuleSource::PolicyFile`]
+/// with no path — adequate for the single-source case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleSource {
+    /// Rule came from the user-supplied policy file at `path`, or from
+    /// an inline policy with no file path when `path` is `None`.
+    PolicyFile { path: Option<String> },
+    /// Rule came from preset expansion. `invocation` is the exact CLI
+    /// argument string (e.g. `"github-repo:repo=foo/bar"`) or, for the
+    /// built-in defaults, `"built-in preset <name>"`.
+    Preset { invocation: String },
+}
+
+impl RuleSource {
+    /// Human-readable label for the duplicate-rule error shape per spec:
+    ///
+    /// - `"policy file <path>"`        — [`RuleSource::PolicyFile`] with a path
+    /// - `"inline policy"`             — [`RuleSource::PolicyFile`] with no path
+    /// - `"preset '<invocation>'"`     — [`RuleSource::Preset`]
+    fn label(&self) -> String {
+        match self {
+            RuleSource::PolicyFile { path: Some(p) } => format!("policy file {p}"),
+            RuleSource::PolicyFile { path: None } => "inline policy".to_string(),
+            RuleSource::Preset { invocation } => format!("preset '{invocation}'"),
+        }
+    }
+}
+
+/// Format the spec-mandated duplicate-rule error naming both sources:
+///
+/// ```text
+/// policy validation failed: duplicate destination (api.github.com, 443)
+///   - declared by preset 'github'
+///   - declared by policy file /path/to/policy.json
+/// ```
+///
+/// When `sources` is shorter than the rule indices — the common
+/// single-source case — missing entries default to an inline policy.
+fn format_duplicate_error(
+    host: &Destination,
+    port: u16,
+    prev_idx: usize,
+    curr_idx: usize,
+    sources: &[RuleSource],
+) -> String {
+    let default = RuleSource::PolicyFile { path: None };
+    let prev_src = sources.get(prev_idx).unwrap_or(&default);
+    let curr_src = sources.get(curr_idx).unwrap_or(&default);
+    format!(
+        "policy validation failed: duplicate destination ({host}, {port})\n  \
+         - declared by {}\n  \
+         - declared by {}",
+        prev_src.label(),
+        curr_src.label()
+    )
+}
+
 impl PolicyCompiler {
     /// Validate and compile a policy into per-component configurations.
     ///
@@ -668,14 +734,35 @@ impl PolicyCompiler {
     ///
     /// Checks:
     /// - Schema version is compatible
-    /// - `Http`-level rules have a non-empty `http_filters` list and an
-    ///   HTTP-capable protocol (`http`, `https`, `any`)
-    /// - No contradictory rules (same destination with different assurance
-    ///   level variants; duplicate `Http` entries are permitted and their
-    ///   filter lists merged by the downstream addon)
+    /// - `Http`-level rules have a non-empty `http_filters` list and
+    ///   require `protocol: tcp`
+    /// - Rule identity is `(host, port)`: any duplicate is a hard error,
+    ///   regardless of whether the duplicates differ on `protocol`,
+    ///   `level`, `http_filters`, or other fields (v2 semantics — no
+    ///   compose-on-duplicate)
     /// - CIDR blocks are syntactically valid
-    /// - Domain names are syntactically valid
+    /// - Domain names are syntactically valid (no bare `*`)
     pub fn validate(policy: &Policy) -> Result<(), SandboxError> {
+        Self::validate_with_sources(policy, &[])
+    }
+
+    /// Validate a policy whose rules may come from multiple sources
+    /// (policy file, preset expansions). Used by the CLI before sending
+    /// the effective policy to the daemon, and by the daemon as a
+    /// defensive check.
+    ///
+    /// `sources` is parallel to `policy.rules`: `sources[i]` names the
+    /// origin of `policy.rules[i]`. When empty (or shorter than
+    /// `policy.rules`), missing entries default to
+    /// [`RuleSource::PolicyFile`] with no path — the single-source case.
+    ///
+    /// Duplicate `(host, port)` rules produce the spec-mandated error
+    /// shape naming every source, so operators can resolve policy-file /
+    /// preset collisions.
+    pub fn validate_with_sources(
+        policy: &Policy,
+        sources: &[RuleSource],
+    ) -> Result<(), SandboxError> {
         // Check schema version compatibility.
         let version = semver::Version::parse(&policy.version).map_err(|e| {
             SandboxError::Internal(format!(
@@ -690,14 +777,13 @@ impl PolicyCompiler {
             )));
         }
 
-        // Track destinations to detect contradictions.  Compare by variant
-        // name (not full equality) so two `Http` rules on the same
-        // destination with different filter lists are not flagged — they
-        // compose rather than conflict.
-        let mut seen_destinations: HashMap<String, &'static str> = HashMap::new();
+        // Rule identity in v2 is `(host, port)` — track every rule's
+        // first-seen index so we can attribute collisions to their
+        // original sources.
+        let mut seen: HashMap<(String, u16), usize> = HashMap::new();
 
         for (i, rule) in policy.rules.iter().enumerate() {
-            let ctx = format!("rule {i} (host: {})", rule.host);
+            let ctx = format!("rule {i} (host: {}, port: {})", rule.host, rule.port);
 
             // `Http`-specific invariants.
             if let AssuranceLevel::Http { http_filters } = &rule.level {
@@ -716,7 +802,7 @@ impl PolicyCompiler {
                 }
             }
 
-            // Validate destination syntax.
+            // Validate host syntax.
             match &rule.host {
                 Destination::Cidr(cidr) => {
                     Self::validate_cidr(cidr)
@@ -729,20 +815,14 @@ impl PolicyCompiler {
                 }
             }
 
-            // Check for contradictory rules: same destination string with
-            // different assurance-level variants.
-            let dest_key = rule.host.to_string();
-            let variant = rule.level.variant_name();
-            if let Some(prev_variant) = seen_destinations.get(&dest_key) {
-                if *prev_variant != variant {
-                    return Err(SandboxError::Internal(format!(
-                        "{ctx}: contradicts earlier rule (level '{}' vs '{}')",
-                        prev_variant, variant
-                    )));
-                }
-            } else {
-                seen_destinations.insert(dest_key, variant);
+            // `(host, port)` uniqueness across the effective policy.
+            let key = (rule.host.to_string(), rule.port);
+            if let Some(&prev_idx) = seen.get(&key) {
+                return Err(SandboxError::Internal(format_duplicate_error(
+                    &rule.host, rule.port, prev_idx, i, sources,
+                )));
             }
+            seen.insert(key, i);
         }
 
         Ok(())
@@ -1910,7 +1990,10 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_contradictory_rules() {
+    fn validate_rejects_duplicate_host_port_different_levels() {
+        // v1 called this a "contradiction"; v2 treats it as a plain
+        // duplicate because rule identity is `(host, port)` regardless
+        // of level.
         let policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![
@@ -1934,13 +2017,16 @@ mod tests {
         };
         let err = PolicyCompiler::validate(&policy).unwrap_err();
         assert!(
-            err.to_string().contains("contradicts"),
-            "expected contradiction error, got: {err}"
+            err.to_string().contains("duplicate destination"),
+            "expected duplicate-destination error, got: {err}"
         );
     }
 
     #[test]
-    fn validate_allows_duplicate_rules_same_level() {
+    fn validate_rejects_duplicate_host_port_same_level() {
+        // v2: rule identity is `(host, port)`. Two rules on the same
+        // host+port are a hard error even when otherwise identical —
+        // composition on duplicates was a v1 behavior that hid intent.
         let policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![
@@ -1960,14 +2046,23 @@ mod tests {
                 },
             ],
         };
-        assert!(PolicyCompiler::validate(&policy).is_ok());
+        let err = PolicyCompiler::validate(&policy).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate destination"),
+            "expected duplicate-destination error, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("(example.com, 443)"),
+            "expected host:port tuple in error, got: {err}"
+        );
     }
 
     #[test]
-    fn validate_allows_duplicate_http_rules_with_different_filters() {
-        // Two `Http` rules on the same destination with different filter
-        // lists are NOT a contradiction — they compose.  The downstream
-        // addon sees both filter sets for the same host.
+    fn validate_rejects_duplicate_http_rules_with_different_filters() {
+        // v2 removes the "compose duplicates" escape hatch — two `Http`
+        // rules on the same `(host, port)` are a hard error even when
+        // their filter lists differ. Operators must express intent as a
+        // single rule with a combined filter set.
         let policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![
@@ -1991,7 +2086,84 @@ mod tests {
                 },
             ],
         };
+        let err = PolicyCompiler::validate(&policy).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate destination"),
+            "expected duplicate-destination error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_allows_same_host_different_ports() {
+        // `(host, port)` is the identity — two rules on the same host but
+        // different ports are distinct and must coexist.
+        let policy = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![
+                PolicyRule {
+                    host: Destination::Domain("example.com".to_string()),
+                    level: AssuranceLevel::Transport,
+                    port: 443,
+                    protocol: Protocol::Tcp,
+                    reason: None,
+                },
+                PolicyRule {
+                    host: Destination::Domain("example.com".to_string()),
+                    level: AssuranceLevel::Transport,
+                    port: 80,
+                    protocol: Protocol::Tcp,
+                    reason: None,
+                },
+            ],
+        };
         assert!(PolicyCompiler::validate(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_duplicate_error_names_both_sources() {
+        // Spec error shape — sources are named so the operator can
+        // resolve policy-file / preset collisions without guessing.
+        let policy = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![
+                PolicyRule {
+                    host: Destination::Domain("api.github.com".to_string()),
+                    level: AssuranceLevel::Transport,
+                    port: 443,
+                    protocol: Protocol::Tcp,
+                    reason: None,
+                },
+                PolicyRule {
+                    host: Destination::Domain("api.github.com".to_string()),
+                    level: AssuranceLevel::Tls,
+                    port: 443,
+                    protocol: Protocol::Tcp,
+                    reason: None,
+                },
+            ],
+        };
+        let sources = vec![
+            RuleSource::Preset {
+                invocation: "github".to_string(),
+            },
+            RuleSource::PolicyFile {
+                path: Some("/path/to/policy.json".to_string()),
+            },
+        ];
+        let err = PolicyCompiler::validate_with_sources(&policy, &sources).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("duplicate destination (api.github.com, 443)"),
+            "expected spec duplicate-header; got: {msg}"
+        );
+        assert!(
+            msg.contains("declared by preset 'github'"),
+            "expected preset source; got: {msg}"
+        );
+        assert!(
+            msg.contains("declared by policy file /path/to/policy.json"),
+            "expected policy-file source; got: {msg}"
+        );
     }
 
     #[test]
