@@ -697,6 +697,28 @@ fn format_duplicate_error(
     )
 }
 
+/// Format concat-set elements for an nftables `set` block.
+///
+/// Shared between `PolicyCompiler::compile_nftables` and
+/// `dns_propagation::generate_domain_ip_rules` so both callers produce
+/// identical set bodies. Elements are `<ip_or_cidr> . <port>` pairs
+/// matching the `ipv4_addr . inet_service` concat type.
+///
+/// Returns the body fragment to embed directly after `flags interval`
+/// inside a `set` block:
+///
+/// - Empty input → `""` (no `elements = { ... }` clause). nftables
+///   accepts a set with no `elements` entry; a lookup against an empty
+///   set matches nothing, which is the fail-closed default.
+/// - Non-empty input → `"\n        elements = { <el>, <el>, ... }"`,
+///   indented to sit inside the set block as emitted by the callers.
+pub(crate) fn format_nft_set_elements(elements: &[String]) -> String {
+    if elements.is_empty() {
+        return String::new();
+    }
+    format!("\n        elements = {{ {} }}", elements.join(", "))
+}
+
 impl PolicyCompiler {
     /// Validate and compile a policy into per-component configurations.
     ///
@@ -838,66 +860,81 @@ impl PolicyCompiler {
     ///
     /// For level 0 (deny): no rules needed — the base deny-all handles it.
     /// For level 1 (transport): IP allow rules + TCP redirect to Envoy.
+    ///
+    /// **v2 shape (M10-S1 / Phase 3B):** the per-destination allow rules
+    /// live in two **nftables concat sets** keyed on
+    /// `ipv4_addr . inet_service`, one per L4 protocol
+    /// (`policy_allow_tcp`, `policy_allow_udp`). The `forward` chain
+    /// contains a single set-lookup rule per protocol rather than one
+    /// rule per `(ip, port)` destination — see
+    /// `.tasks/specs/2026-04-21-port-explicit-policies-presets-observability-design.md`
+    /// §"Compiler consequences — nftables" (Part 1, lines 162-180).
+    /// The hardcoded `dport { 80, 443 }` port set from v1 is gone; each
+    /// allow element carries the explicit port from its policy rule.
+    ///
+    /// Set placement for S1: sets live inside `sandbox_policy`. S3
+    /// (deny-logger spec, Part 3) later moves the filtering decision
+    /// into `sandbox_dnat` with conditional DNAT to Envoy vs.
+    /// deny-logger; at that point the concat sets migrate to
+    /// `sandbox_dnat`. Until then, `sandbox_dnat` remains policy-agnostic
+    /// (it DNATs every non-53 TCP to Envoy:10000 unconditionally — see
+    /// `gateway::generate_dnat_ruleset`) and `sandbox_policy` is the
+    /// filtering gate.
+    ///
+    /// Domain destinations: CIDR rules populate the sets directly;
+    /// domain rules become `(resolved_ip, port)` set elements once DNS
+    /// propagation resolves them via
+    /// [`crate::dns_propagation::generate_domain_ip_rules`]. A policy
+    /// containing only domain rules therefore compiles to an **empty**
+    /// ruleset at policy-apply time — the DNS propagation loop emits
+    /// the full table once resolutions land. This preserves v1's
+    /// "no table on domain-only policy" behavior.
     fn compile_nftables(policy: &Policy, network_info: &NetworkInfo) -> String {
-        let mut allow_rules = Vec::new();
+        let mut tcp_elements: Vec<String> = Vec::new();
+        let mut udp_elements: Vec<String> = Vec::new();
 
         for rule in &policy.rules {
             if matches!(rule.level, AssuranceLevel::Deny) {
                 continue;
             }
 
-            match &rule.host {
-                Destination::Cidr(cidr) => {
-                    // For CIDR destinations, generate direct IP-based rules.
-                    // Use conntrack original-direction matching so rules work
-                    // correctly after DNAT has rewritten packet headers.
-                    //
-                    // NOTE: This arm still emits the hardcoded `{80, 443}`
-                    // port set — it is kept verbatim during Phase 2 so the
-                    // compiler continues to build.  Phase 3 rewrites it to
-                    // use the rule's explicit `port` field and concat sets
-                    // (`policy_allow_tcp`, `policy_allow_udp`).
-                    let ip_or_cidr = cidr.as_str();
+            // Only CIDR destinations produce concrete set elements at
+            // compile time. Domain destinations require DNS resolution
+            // and are populated by `generate_domain_ip_rules` once the
+            // DNS cache has entries.
+            let Destination::Cidr(cidr) = &rule.host else {
+                continue;
+            };
 
-                    match rule.protocol {
-                        Protocol::Tcp => {
-                            allow_rules.push(format!(
-                                "        ct original ip daddr {ip_or_cidr} tcp dport {{ 80, 443 }} accept"
-                            ));
-                        }
-                        Protocol::Udp => {
-                            allow_rules.push(format!(
-                                "        ct original ip daddr {ip_or_cidr} udp dport {{ 80, 443 }} accept"
-                            ));
-                        }
-                    }
-                }
-                Destination::Domain(domain) => {
-                    // Domain destinations require DNS resolution for IP-based
-                    // firewall rules. For now, generate a comment placeholder.
-                    // M4-S5 will implement DNS-to-nftables propagation.
-                    allow_rules.push(format!(
-                        "        # domain: {domain} (level: {level}, resolved IPs injected at runtime)",
-                        level = rule.level,
-                    ));
-                }
+            let element = format!("{cidr} . {port}", port = rule.port);
+            match rule.protocol {
+                Protocol::Tcp => tcp_elements.push(element),
+                Protocol::Udp => udp_elements.push(element),
             }
         }
 
-        // If no *real* allow rules (excluding comment placeholders for
-        // unresolved domains), return an empty string — the base deny-all
-        // forward chain is sufficient.  Domain-only policies will rely on
-        // the existing `sandbox` forward chain until the DNS propagation
-        // loop resolves IPs and injects real rules via
-        // `generate_domain_ip_rules`.
-        let has_real_rules = allow_rules.iter().any(|r| !r.trim_start().starts_with('#'));
-        if !has_real_rules {
+        // If no CIDR-backed allow rules exist, emit nothing. Domain-only
+        // policies rely on the existing `sandbox` forward chain until
+        // `generate_domain_ip_rules` populates the sets.
+        if tcp_elements.is_empty() && udp_elements.is_empty() {
             return String::new();
         }
 
-        let rules_block = allow_rules.join("\n");
+        let tcp_elements_block = format_nft_set_elements(&tcp_elements);
+        let udp_elements_block = format_nft_set_elements(&udp_elements);
+
         format!(
             r#"table inet sandbox_policy {{
+    set policy_allow_tcp {{
+        type ipv4_addr . inet_service
+        flags interval{tcp_elements_block}
+    }}
+
+    set policy_allow_udp {{
+        type ipv4_addr . inet_service
+        flags interval{udp_elements_block}
+    }}
+
     chain forward {{
         type filter hook forward priority -1; policy drop;
 
@@ -908,8 +945,9 @@ impl PolicyCompiler {
         ip saddr {subnet} ip daddr {gateway_ip} udp dport 53 accept
         ip saddr {subnet} ip daddr {gateway_ip} tcp dport 53 accept
 
-        # Policy allow rules
-{rules_block}
+        # Policy allow rules — concat-set lookups keyed on (daddr, dport)
+        ct original ip daddr . tcp dport @policy_allow_tcp accept
+        ct original ip daddr . udp dport @policy_allow_udp accept
 
         # Reject everything else (fast failure for denied destinations)
         reject
@@ -2606,33 +2644,75 @@ mod tests {
         let net = test_network_info();
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
-        // Should produce nftables rules for the CIDR destination.
+        let nft = &compiled.nftables_rules;
+
+        // v2 shape: the CIDR destination appears as a concat-set element
+        // `<cidr> . <port>` inside `policy_allow_tcp`, not as an inline
+        // `ct original ip daddr <cidr> tcp dport { 80, 443 } accept` rule.
         assert!(
-            compiled.nftables_rules.contains("140.82.112.0/20"),
-            "nftables should contain the CIDR allow rule"
+            nft.contains("table inet sandbox_policy"),
+            "nftables should define sandbox_policy table; got:\n{nft}"
         );
         assert!(
-            compiled
-                .nftables_rules
-                .contains("table inet sandbox_policy"),
-            "nftables should define sandbox_policy table"
+            nft.contains("set policy_allow_tcp"),
+            "nftables should declare the policy_allow_tcp concat set; \
+             got:\n{nft}"
         );
         assert!(
-            compiled.nftables_rules.contains("accept"),
-            "nftables should contain accept rules"
+            nft.contains("set policy_allow_udp"),
+            "nftables should declare the policy_allow_udp concat set; \
+             got:\n{nft}"
+        );
+        assert!(
+            nft.contains("type ipv4_addr . inet_service"),
+            "concat sets must be typed `ipv4_addr . inet_service`; \
+             got:\n{nft}"
+        );
+        assert!(
+            nft.contains("140.82.112.0/20 . 443"),
+            "policy_allow_tcp must contain the (cidr . port) element for \
+             the CIDR rule; got:\n{nft}"
+        );
+        assert!(
+            nft.contains("ct original ip daddr . tcp dport @policy_allow_tcp accept"),
+            "forward chain must carry the concat-set lookup rule for TCP; \
+             got:\n{nft}"
+        );
+        assert!(
+            nft.contains("ct original ip daddr . udp dport @policy_allow_udp accept"),
+            "forward chain must carry the concat-set lookup rule for UDP; \
+             got:\n{nft}"
         );
     }
 
     #[test]
-    fn compile_level1_domain_produces_placeholder() {
+    fn compile_level1_domain_does_not_emit_placeholder() {
+        // Under v2, domain rules do NOT produce inline comment placeholders
+        // in the compile-time nftables output. Domain-backed allowance is
+        // populated into the `policy_allow_{tcp,udp}` concat sets by the
+        // DNS propagation loop (`generate_domain_ip_rules`) once the
+        // resolver caches entries for the domain.
         let policy = transport_policy();
         let net = test_network_info();
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
-        // Domain destinations produce comments (resolved at runtime).
         assert!(
-            compiled.nftables_rules.contains("# domain: github.com"),
-            "nftables should contain domain placeholder comment"
+            !compiled.nftables_rules.contains("# domain: github.com"),
+            "v2 compile_nftables must not emit `# domain: ...` comment \
+             placeholders; domain rules are materialised via concat-set \
+             elements emitted by `generate_domain_ip_rules` once DNS \
+             resolves. Found in:\n{}",
+            compiled.nftables_rules
+        );
+        // Sanity: the sibling CIDR rule still populates the TCP set so
+        // the table is non-empty for this mixed policy.
+        assert!(
+            compiled
+                .nftables_rules
+                .contains("140.82.112.0/20 . 443"),
+            "sibling CIDR rule should populate policy_allow_tcp with the \
+             (cidr . port) element; got:\n{}",
+            compiled.nftables_rules
         );
     }
 
@@ -3228,13 +3308,104 @@ mod tests {
         let net = test_network_info();
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
+        let nft = &compiled.nftables_rules;
+
+        // UDP CIDR rule must populate the UDP concat set, not the TCP one.
         assert!(
-            compiled.nftables_rules.contains("udp dport"),
-            "UDP protocol should produce udp dport nftables rules"
+            nft.contains("8.8.8.0/24 . 53"),
+            "policy_allow_udp must contain the (cidr . port) element for the \
+             UDP rule; got:\n{nft}"
+        );
+        // Extract the policy_allow_tcp set body and verify it has no
+        // `elements = { ... }` clause (no TCP rules in this policy).
+        let tcp_set_start = nft
+            .find("set policy_allow_tcp")
+            .expect("policy_allow_tcp set should exist");
+        let tcp_set_end = nft[tcp_set_start..]
+            .find("\n    }")
+            .map(|i| tcp_set_start + i)
+            .expect("policy_allow_tcp set should terminate");
+        let tcp_set_body = &nft[tcp_set_start..tcp_set_end];
+        assert!(
+            !tcp_set_body.contains("elements"),
+            "policy_allow_tcp should have no elements when only UDP rules \
+             exist; got body:\n{tcp_set_body}"
         );
         assert!(
-            compiled.nftables_rules.contains("8.8.8.0/24"),
-            "nftables should contain the UDP CIDR"
+            nft.contains("ct original ip daddr . udp dport @policy_allow_udp accept"),
+            "forward chain must carry the concat-set lookup rule for UDP; \
+             got:\n{nft}"
+        );
+    }
+
+    #[test]
+    fn compile_mixed_tcp_and_udp_cidrs_segregate_by_protocol() {
+        // Pin that TCP rules populate only `policy_allow_tcp` and UDP
+        // rules populate only `policy_allow_udp` — a TCP CIDR must not
+        // leak into the UDP set and vice versa. This is the inverse
+        // regression pin of the pre-v2 hardcoded `dport { 80, 443 }`
+        // shape, which conflated protocol and port.
+        let policy = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![
+                PolicyRule {
+                    host: Destination::Cidr("10.1.0.0/16".to_string()),
+                    level: AssuranceLevel::Transport,
+                    port: 443,
+                    protocol: Protocol::Tcp,
+                    reason: None,
+                },
+                PolicyRule {
+                    host: Destination::Cidr("10.2.0.0/16".to_string()),
+                    level: AssuranceLevel::Transport,
+                    port: 53,
+                    protocol: Protocol::Udp,
+                    reason: None,
+                },
+            ],
+        };
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+        let nft = &compiled.nftables_rules;
+
+        // Extract the TCP set body.
+        let tcp_start = nft
+            .find("set policy_allow_tcp")
+            .expect("policy_allow_tcp set should exist");
+        let tcp_end = nft[tcp_start..]
+            .find("\n    }")
+            .map(|i| tcp_start + i)
+            .expect("policy_allow_tcp set should terminate");
+        let tcp_body = &nft[tcp_start..tcp_end];
+
+        // Extract the UDP set body.
+        let udp_start = nft
+            .find("set policy_allow_udp")
+            .expect("policy_allow_udp set should exist");
+        let udp_end = nft[udp_start..]
+            .find("\n    }")
+            .map(|i| udp_start + i)
+            .expect("policy_allow_udp set should terminate");
+        let udp_body = &nft[udp_start..udp_end];
+
+        // TCP rule element must appear in TCP set only.
+        assert!(
+            tcp_body.contains("10.1.0.0/16 . 443"),
+            "TCP CIDR element must be in policy_allow_tcp; got tcp body:\n{tcp_body}"
+        );
+        assert!(
+            !udp_body.contains("10.1.0.0/16"),
+            "TCP CIDR must not leak into policy_allow_udp; got udp body:\n{udp_body}"
+        );
+
+        // UDP rule element must appear in UDP set only.
+        assert!(
+            udp_body.contains("10.2.0.0/16 . 53"),
+            "UDP CIDR element must be in policy_allow_udp; got udp body:\n{udp_body}"
+        );
+        assert!(
+            !tcp_body.contains("10.2.0.0/16"),
+            "UDP CIDR must not leak into policy_allow_tcp; got tcp body:\n{tcp_body}"
         );
     }
 
