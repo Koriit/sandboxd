@@ -1120,6 +1120,11 @@ admin:
         let mut default_filter_chain: Option<String> = None;
 
         // Level 2 (TLS): SNI-matched chains → original_dst.
+        //
+        // Each chain carries a `destination_port` predicate on
+        // `FilterChainMatch` alongside `server_names`, so the chain only
+        // matches connections whose TLS SNI AND destination port both
+        // match the rule's `(host, port)` tuple (schema v2).
         for rule in policy
             .rules
             .iter()
@@ -1127,9 +1132,11 @@ admin:
         {
             let domain = rule.host.to_string();
             let stat_name = Self::sanitize_stat_prefix(&domain);
+            let port = rule.port;
             filter_chains.push(format!(
                 r#"    - filter_chain_match:
         server_names: ["{domain}"]
+        destination_port: {port}
       filters:
         - name: envoy.filters.network.tcp_proxy
           typed_config:
@@ -1208,10 +1215,12 @@ admin:
                     }
                     let stat_name = Self::sanitize_stat_prefix(domain);
                     let prefix_ranges = Self::emit_prefix_ranges_from_ips(&entry.ips);
+                    let port = rule.port;
                     filter_chains.push(format!(
                         r#"    - filter_chain_match:
         prefix_ranges:
 {prefix_ranges}
+        destination_port: {port}
       filters:
         - name: envoy.filters.network.tcp_proxy
           typed_config:
@@ -1226,10 +1235,12 @@ admin:
                 Destination::Cidr(cidr) => {
                     let stat_name = Self::sanitize_stat_prefix(cidr);
                     let prefix_ranges = Self::emit_prefix_ranges_from_cidr(cidr);
+                    let port = rule.port;
                     filter_chains.push(format!(
                         r#"    - filter_chain_match:
         prefix_ranges:
 {prefix_ranges}
+        destination_port: {port}
       filters:
         - name: envoy.filters.network.tcp_proxy
           typed_config:
@@ -3318,6 +3329,18 @@ mod tests {
                 .contains("server_names: [\"api.secure.io\"]"),
             "L2 Envoy config must have SNI match for api.secure.io"
         );
+        // Schema v2: every L2 chain carries a `destination_port` predicate
+        // alongside `server_names`. Both tls_policy() rules use port 443.
+        let chain_count = compiled
+            .envoy_listener_config
+            .matches("destination_port: 443")
+            .count();
+        assert_eq!(
+            chain_count, 2,
+            "L2 listener must carry destination_port: 443 on each chain \
+             (one per rule, v2 schema):\n{}",
+            compiled.envoy_listener_config
+        );
     }
 
     #[test]
@@ -3516,6 +3539,12 @@ mod tests {
             listener.contains("level3_inspected_example_com"),
             "L3 domain chain must carry level3_ stat prefix:\n{listener}"
         );
+        // Schema v2: L3 chain carries `destination_port` predicate
+        // alongside `prefix_ranges`. full_policy() uses port 443.
+        assert!(
+            listener.contains("destination_port: 443"),
+            "L3 domain chain must carry destination_port: 443 (v2 schema):\n{listener}"
+        );
     }
 
     #[test]
@@ -3548,6 +3577,10 @@ mod tests {
             listener_domain.contains(r#"hostname: "%DOWNSTREAM_LOCAL_ADDRESS%""#),
             "L3 domain chain must use %DOWNSTREAM_LOCAL_ADDRESS% formatter:\n{listener_domain}"
         );
+        assert!(
+            listener_domain.contains("destination_port: 443"),
+            "L3 domain chain must carry destination_port predicate (v2 schema):\n{listener_domain}"
+        );
 
         // CIDR-backed L3 chain — same invariant.
         let cidr_policy = Policy {
@@ -3570,6 +3603,10 @@ mod tests {
         assert!(
             listener_cidr.contains("cluster: mitmproxy"),
             "L3 CIDR chain must route to mitmproxy cluster:\n{listener_cidr}"
+        );
+        assert!(
+            listener_cidr.contains("destination_port: 443"),
+            "L3 CIDR chain must carry destination_port predicate (v2 schema):\n{listener_cidr}"
         );
     }
 
@@ -3655,35 +3692,11 @@ mod tests {
             );
         }
 
-        // Wildcard L3 rule → `default_filter_chain`. Same invariant.
-        let wildcard_policy = Policy {
-            version: SCHEMA_VERSION.to_string(),
-            rules: vec![PolicyRule {
-                host: Destination::Domain("*".to_string()),
-                level: AssuranceLevel::Http {
-                    http_filters: vec![http_filter(HttpMethod::Any, "/*")],
-                },
-                port: 443,
-                protocol: Protocol::Tcp,
-                reason: None,
-            }],
-        };
-        let listener_wild =
-            PolicyCompiler::compile_envoy_listener(&wildcard_policy, &DnsCache::new());
-        assert!(
-            listener_wild.contains("default_filter_chain:"),
-            "wildcard fixture must produce default_filter_chain:\n{listener_wild}"
-        );
-        assert!(
-            listener_wild.contains("access_log:"),
-            "L3 wildcard chain must carry an access_log stanza:\n{listener_wild}"
-        );
-        for token in &required_tokens {
-            assert!(
-                listener_wild.contains(token),
-                "L3 wildcard chain access_log missing required token `{token}`:\n{listener_wild}"
-            );
-        }
+        // Schema v2 removes the bare-`*` L3 wildcard arm — bare-`*` is
+        // rejected at validation, and `compile_envoy_listener` no longer
+        // has a special code path that maps `Destination::Domain("*")`
+        // to `default_filter_chain`. Only domain-backed (DNS-resolved)
+        // and CIDR-backed L3 chains remain.
 
         // Sanity: `access_log:` must appear under `typed_config` of a
         // `tcp_proxy` filter, not elsewhere (e.g. the listener root or
@@ -4034,6 +4047,15 @@ mod tests {
                 .contains("level2_wildcard_example_com"),
             "wildcard stat prefix should use 'wildcard' replacement"
         );
+        // Schema v2: wildcard-subdomain L2 chain still carries a
+        // `destination_port` predicate on its `FilterChainMatch`.
+        assert!(
+            compiled
+                .envoy_listener_config
+                .contains("destination_port: 443"),
+            "wildcard-subdomain L2 chain must carry destination_port predicate (v2):\n{}",
+            compiled.envoy_listener_config
+        );
     }
 
     #[test]
@@ -4093,6 +4115,12 @@ mod tests {
             "wildcard-subdomain stat prefix should use 'wildcard' replacement:\n\
              {listener_resolved}"
         );
+        // Schema v2: wildcard-subdomain L3 chain carries `destination_port`.
+        assert!(
+            listener_resolved.contains("destination_port: 443"),
+            "wildcard-subdomain L3 chain must carry destination_port predicate (v2):\n\
+             {listener_resolved}"
+        );
     }
 
     // -- Edge cases: multiple destinations at same level -----------------------
@@ -4150,6 +4178,16 @@ mod tests {
             !compiled
                 .envoy_config_combined()
                 .contains("cluster: mitmproxy")
+        );
+        // Schema v2: each chain carries destination_port — one per rule.
+        let port_occurrences = compiled
+            .envoy_listener_config
+            .matches("destination_port: 443")
+            .count();
+        assert_eq!(
+            port_occurrences, 3,
+            "each L2 chain must carry destination_port: 443 (one per rule, v2):\n{}",
+            compiled.envoy_listener_config
         );
     }
 
@@ -4218,6 +4256,13 @@ mod tests {
                 .count(),
             2,
             "expected every L3 chain to carry the CONNECT formatter:\n{listener}"
+        );
+        // Schema v2: every L3 chain carries destination_port — one per
+        // rule, here both 443.
+        assert_eq!(
+            listener.matches("destination_port: 443").count(),
+            2,
+            "expected every L3 chain to carry destination_port: 443 (v2):\n{listener}"
         );
 
         // Policy-level enforcement (post-CONNECT) still drives a
