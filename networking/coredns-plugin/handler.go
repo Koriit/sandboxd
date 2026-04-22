@@ -19,6 +19,13 @@ type SandboxPolicy struct {
 	reloadInterval time.Duration
 	policy         *PolicyStore
 	reporter       *Reporter
+	// eventsFile is the path parsed from the `events_file` Corefile
+	// directive. Empty means structured emission is disabled.
+	eventsFile string
+	// events, when non-nil, receives one JSONL line per query-allow /
+	// query-deny decision. Structured output is additive — the existing
+	// log.Infof lines stay for human debugging.
+	events *EventWriter
 }
 
 // Name implements the plugin.Handler interface.
@@ -31,6 +38,8 @@ func (sp *SandboxPolicy) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *
 	state := request.Request{W: w, Req: r}
 	qname := state.Name() // lowercase, trailing dot
 	qtype := state.QType()
+	qtypeStr := dns.TypeToString[qtype]
+	clientIP := state.IP()
 
 	// Normalised name for logging (no trailing dot).
 	displayName := strings.TrimSuffix(qname, ".")
@@ -38,7 +47,8 @@ func (sp *SandboxPolicy) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *
 	// If the query is for an AAAA record, respond with empty answer directly.
 	// This avoids forwarding AAAA queries upstream at all.
 	if qtype == dns.TypeAAAA {
-		log.Infof("query %s %s -> denied (AAAA stripped)", displayName, dns.TypeToString[qtype])
+		log.Infof("query %s %s -> denied (AAAA stripped)", displayName, qtypeStr)
+		sp.emitDenied(displayName, qtypeStr, "AAAA stripped", clientIP)
 		m := new(dns.Msg).SetReply(r)
 		m.Authoritative = false
 		m.RecursionAvailable = true
@@ -48,7 +58,8 @@ func (sp *SandboxPolicy) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *
 
 	// For SVCB/HTTPS queries, respond with empty answer to prevent ECH negotiation.
 	if qtype == dnsTypeSVCB || qtype == dnsTypeHTTPS {
-		log.Infof("query %s %s -> denied (SVCB/HTTPS stripped)", displayName, dns.TypeToString[qtype])
+		log.Infof("query %s %s -> denied (SVCB/HTTPS stripped)", displayName, qtypeStr)
+		sp.emitDenied(displayName, qtypeStr, "SVCB/HTTPS stripped", clientIP)
 		m := new(dns.Msg).SetReply(r)
 		m.Authoritative = false
 		m.RecursionAvailable = true
@@ -58,7 +69,8 @@ func (sp *SandboxPolicy) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *
 
 	// Check policy.
 	if !sp.policy.IsAllowed(qname) {
-		log.Infof("query %s %s -> denied (policy)", displayName, dns.TypeToString[qtype])
+		log.Infof("query %s %s -> denied (policy)", displayName, qtypeStr)
+		sp.emitDenied(displayName, qtypeStr, "policy", clientIP)
 		m := new(dns.Msg).SetRcode(r, dns.RcodeNameError) // NXDOMAIN
 		m.RecursionAvailable = true
 		w.WriteMsg(m)
@@ -77,9 +89,33 @@ func (sp *SandboxPolicy) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *
 	rcode, err := plugin.NextOrFailure(sp.Name(), sp.Next, ctx, rw, r)
 
 	log.Infof("query %s %s -> allowed (rcode=%s, ips=%v)",
-		displayName, dns.TypeToString[qtype], dns.RcodeToString[rcode], rw.resolvedIPs)
+		displayName, qtypeStr, dns.RcodeToString[rcode], rw.resolvedIPs)
+	sp.emitAllowed(displayName, qtypeStr, rw.resolvedIPs, clientIP)
 
 	return rcode, err
+}
+
+// emitAllowed writes a structured `query_allowed` event if the plugin is
+// configured with an events_file. Emission failures are logged but never
+// propagated — the JSONL stream is a best-effort observability sink and
+// must not break DNS service.
+func (sp *SandboxPolicy) emitAllowed(query, qtype string, resolvedIPs []string, clientIP string) {
+	if sp.events == nil {
+		return
+	}
+	if err := sp.events.EmitQueryAllowed(query, qtype, resolvedIPs, clientIP); err != nil {
+		log.Warningf("events write failed: %v", err)
+	}
+}
+
+// emitDenied mirrors emitAllowed for the deny path.
+func (sp *SandboxPolicy) emitDenied(query, qtype, reason, clientIP string) {
+	if sp.events == nil {
+		return
+	}
+	if err := sp.events.EmitQueryDenied(query, qtype, reason, clientIP); err != nil {
+		log.Warningf("events write failed: %v", err)
+	}
 }
 
 // responseInterceptor wraps a dns.ResponseWriter to post-process responses
