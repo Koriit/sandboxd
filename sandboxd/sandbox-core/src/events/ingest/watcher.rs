@@ -47,20 +47,27 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::events::ingest::coredns::{ParsedDnsEvent, parse_coredns_line};
+use crate::events::ingest::deny_logger::{ParsedDenyLoggerEvent, parse_deny_logger_line};
 use crate::events::ingest::envoy::{ParsedEnvoyEvent, parse_envoy_line};
 use crate::events::ingest::jsonl_reader::JsonlTailer;
 use crate::events::ingest::mitmproxy::{ParsedMitmEvent, parse_mitmproxy_line};
 use crate::events::{Event, EventBus, EventEnvelope, TrafficEvent, VmIpSessionMap};
 use crate::session::SessionId;
 
-/// File names of the three producers. Kept private to this module —
+/// File names of the four producers. Kept private to this module —
 /// the producer side (gateway-container Docker image) is the source of
 /// truth. If a new layer ships, add it here and a matching parser.
 const ENVOY_JSONL: &str = "envoy.jsonl";
 const COREDNS_JSONL: &str = "coredns.jsonl";
 const MITMPROXY_JSONL: &str = "mitmproxy.jsonl";
+const DENY_LOGGER_JSONL: &str = "deny-logger.jsonl";
 
-const KNOWN_FILES: &[&str] = &[ENVOY_JSONL, COREDNS_JSONL, MITMPROXY_JSONL];
+const KNOWN_FILES: &[&str] = &[
+    ENVOY_JSONL,
+    COREDNS_JSONL,
+    MITMPROXY_JSONL,
+    DENY_LOGGER_JSONL,
+];
 
 /// Fallback-poll interval. Matches the plan's "2-second poll even in
 /// the absence of inotify events" requirement. Not configurable — the
@@ -73,6 +80,7 @@ enum Layer {
     Envoy,
     Coredns,
     Mitmproxy,
+    DenyLogger,
 }
 
 impl Layer {
@@ -81,6 +89,7 @@ impl Layer {
             ENVOY_JSONL => Some(Layer::Envoy),
             COREDNS_JSONL => Some(Layer::Coredns),
             MITMPROXY_JSONL => Some(Layer::Mitmproxy),
+            DENY_LOGGER_JSONL => Some(Layer::DenyLogger),
             _ => None,
         }
     }
@@ -91,6 +100,7 @@ impl Layer {
             Layer::Envoy => ENVOY_JSONL,
             Layer::Coredns => COREDNS_JSONL,
             Layer::Mitmproxy => MITMPROXY_JSONL,
+            Layer::DenyLogger => DENY_LOGGER_JSONL,
         }
     }
 }
@@ -365,6 +375,21 @@ fn dispatch_line(
         }
         Layer::Mitmproxy => parse_mitmproxy_line(line)
             .map(|p: ParsedMitmEvent| (p.timestamp, p.client_ip, p.traffic)),
+        // Deny-logger records carry `src_ip` only on `deny`; the
+        // `rate_limited` summary has no 5-tuple (a subsequent commit
+        // wires that fallback case to the ingestor's own session).
+        // For now, treat a missing `src_ip` as a soft error so the
+        // record is dropped rather than mis-attributed.
+        Layer::DenyLogger => parse_deny_logger_line(line).and_then(
+            |p: ParsedDenyLoggerEvent| match p.src_ip {
+                Some(ip) => Ok((p.timestamp, ip, p.traffic)),
+                None => Err(crate::error::SandboxError::Internal(
+                    "deny-logger record has no src_ip (rate_limited summary); \
+                     fallback routing not yet wired"
+                        .into(),
+                )),
+            },
+        ),
     };
     let (timestamp, client_ip, traffic) = match parsed {
         Ok(v) => v,
@@ -428,6 +453,10 @@ mod tests {
             Layer::from_file_name("mitmproxy.jsonl"),
             Some(Layer::Mitmproxy)
         );
+        assert_eq!(
+            Layer::from_file_name("deny-logger.jsonl"),
+            Some(Layer::DenyLogger)
+        );
     }
 
     #[test]
@@ -435,11 +464,19 @@ mod tests {
         assert_eq!(Layer::from_file_name("unknown.jsonl"), None);
         assert_eq!(Layer::from_file_name("envoy.log"), None);
         assert_eq!(Layer::from_file_name(""), None);
+        // Underscore vs. hyphen variant — easy-to-make typo, must not
+        // match.
+        assert_eq!(Layer::from_file_name("deny_logger.jsonl"), None);
     }
 
     #[test]
     fn layer_round_trip_through_file_name() {
-        for &l in &[Layer::Envoy, Layer::Coredns, Layer::Mitmproxy] {
+        for &l in &[
+            Layer::Envoy,
+            Layer::Coredns,
+            Layer::Mitmproxy,
+            Layer::DenyLogger,
+        ] {
             assert_eq!(Layer::from_file_name(l.file_name()), Some(l));
         }
     }
