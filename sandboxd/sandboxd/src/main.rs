@@ -63,7 +63,7 @@ struct Args {
     /// `{base_dir}/sessions/{session_id}/events/{layer}-YYYY-MM-DD.jsonl`
     /// (UTC-rotated). Disabled by default — operators opt-in per-
     /// deployment.  See `events::persist` in `sandbox-core` for the
-    /// task-graph shape (bounded mpsc + drop-oldest on overflow).
+    /// task-graph shape (bounded mpsc + drop-newest on overflow).
     #[arg(long, default_value_t = false)]
     events_persist: bool,
 

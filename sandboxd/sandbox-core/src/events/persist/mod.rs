@@ -16,7 +16,7 @@
 //!   global broadcast ──► relay ──► bounded mpsc ──► sink ──► rotating writers
 //!                                    (100k)
 //!                                      │
-//!                                      └── drop-oldest on overflow + warn!
+//!                                      └── drop-newest on overflow + warn!
 //!
 //!   timer (hourly) ───► pruner ──► filesystem sweep
 //! ```
@@ -24,7 +24,8 @@
 //! The **relay** task owns the broadcast [`Receiver`][r] and pushes
 //! every event into a bounded [`tokio::sync::mpsc`] channel using
 //! `try_send`. When the channel is full (the sink task is not draining
-//! fast enough), the relay drops the oldest queued event to make room
+//! fast enough), `try_send` returns `TrySendError::Full` and the relay
+//! drops the incoming (newest) event, preserving the queue contents,
 //! and logs a `warn!` with a running drop counter. The rationale —
 //! per Phase 0 Q8 — is that persistent logging must never stall the
 //! in-memory bus; a burst that outruns the disk is observable via the
