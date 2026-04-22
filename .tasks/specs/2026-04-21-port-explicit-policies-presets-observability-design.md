@@ -856,11 +856,15 @@ The deny-logger is treated as a hard gateway invariant. No
 degraded-observability mode.
 
 - **Startup:** the gateway container's `HEALTHCHECK` probes
-  `http://<gateway_ip>:10003/health` (or `127.0.0.1:10003` from inside
-  the container, since the listener is bound on the bridge IP which is
-  reachable via the container's own interfaces). The container is not
-  `healthy` (and sandboxd refuses to route VM traffic to it) until the
-  healthcheck passes.
+  `http://<gateway_ip>:10003/health`. The probe runs *inside* the
+  container, but it still has to target the bridge IP — the listener
+  binds on `<gateway_ip>` (see "Listener design / Bind address" above),
+  and `127.0.0.1:10003` is not reachable because `route_localnet` is
+  not enabled and the listener is not bound to loopback. The script
+  therefore rediscovers the bridge IP the same way the entrypoint does
+  (`$(hostname -i | awk '{print $1}')`) so both scripts stay consistent.
+  The container is not `healthy` (and sandboxd refuses to route VM
+  traffic to it) until the healthcheck passes.
 - **Runtime:** if the healthcheck begins failing, Docker marks the
   container unhealthy. sandboxd's existing gateway health polling
   observes this and restarts the gateway container. Existing VM
