@@ -815,10 +815,28 @@ impl GatewayManager {
         self.inject_nftables_ruleset(session_id, ruleset, label)
     }
 
-    /// Remove the DNAT nftables rules from the gateway container's network
-    /// namespace. Called before shutdown to stop routing new traffic.
+    /// Remove the DNAT + policy nftables tables from the gateway container's
+    /// network namespace. Called before shutdown to stop routing new traffic.
+    ///
+    /// **M10-S3:** `sandbox_dnat` and `sandbox_policy` are both managed as
+    /// a pair — `sandbox_dnat` holds the conditional-DNAT + set declarations,
+    /// `sandbox_policy` holds the Envoy-egress output-chain allow rules.
+    /// Tear both down atomically in a single `nft -f` input so the gateway
+    /// doesn't briefly run with only half the pair present (which could
+    /// leak traffic through the orphaned chain on the way to container
+    /// stop).
     pub fn remove_dnat_rules(&self, session_id: &SessionId) -> Result<(), SandboxError> {
-        let ruleset = "delete table inet sandbox_dnat\n";
+        // `table inet X {}` + `delete table inet X` is the idempotent
+        // delete idiom: `add table` (what `table inet X {}` is shorthand
+        // for) is a no-op when the table exists, and the subsequent
+        // `delete table` always succeeds. Without the add-first line,
+        // tearing down a session whose policy never landed (so
+        // `sandbox_policy` was never created) would fail with
+        // "No such file or directory".
+        let ruleset = "table inet sandbox_dnat {}\n\
+                       table inet sandbox_policy {}\n\
+                       delete table inet sandbox_dnat\n\
+                       delete table inet sandbox_policy\n";
         self.inject_nftables_ruleset(session_id, ruleset, "remove-DNAT")
     }
 
@@ -1091,23 +1109,66 @@ pub fn generate_deny_all_ruleset() -> String {
 
 /// Generate the DNAT ruleset that routes VM traffic through the gateway.
 ///
-/// - DNS (port 53) -> CoreDNS
-/// - All other TCP -> Envoy (port 10000)
+/// **M10-S3 shape (two-table conditional DNAT).** The `sandbox_dnat` table
+/// now makes the allow/deny decision for VM egress via conditional DNAT
+/// keyed on the `policy_allow_{tcp,udp}` concat sets:
+///
+/// - DNS (port 53) → CoreDNS (unchanged)
+/// - VM TCP matching `(ip daddr, tcp dport)` in `@policy_allow_tcp` →
+///   Envoy :10000
+/// - VM UDP matching `(ip daddr, udp dport)` in `@policy_allow_udp` →
+///   Envoy :10000 (future-proofed; Envoy drops UDP today)
+/// - All other VM TCP → deny-logger :10001
+/// - All other VM UDP → deny-logger :10002
 /// - Block cloud metadata (169.254.169.254)
 /// - Drop non-loopback IPv6
 /// - MASQUERADE outgoing traffic
+///
+/// The concat sets are declared here *empty*. `PolicyCompiler::compile_nftables`
+/// and `dns_propagation::generate_domain_ip_rules` rewrite the set elements
+/// when a policy lands / resolves. Until then, every non-53 VM packet DNATs
+/// to the deny-logger, surfacing as a structured `deny` event with the
+/// original 5-tuple — this is the intentional fail-closed default.
+///
+/// **Cross-table set refs vs. duplication.** nftables 1.0.6 on kernel 6.8
+/// (as pinned in the gateway image) does **not** support the
+/// `@<table>::<set>` cross-table reference syntax; `nft -c` rejects it
+/// with "No such file or directory". As a consequence the set
+/// declarations are duplicated in both `sandbox_dnat` and `sandbox_policy`
+/// and populated identically by the compile / DNS-propagation paths.
+/// Verified empirically via `nft -c -f -` on the gateway image before the
+/// landing commit. See the M10-S3 plan risk §1.
 pub fn generate_dnat_ruleset(vm_subnet: &str, gateway_ip: &str) -> String {
     format!(
         r#"table inet sandbox_dnat {{
+    set {tcp_set} {{
+        type ipv4_addr . inet_service
+        flags interval
+    }}
+
+    set {udp_set} {{
+        type ipv4_addr . inet_service
+        flags interval
+    }}
+
     chain prerouting {{
         type nat hook prerouting priority dstnat;
 
         # DNS -> CoreDNS (port 53)
-        ip saddr {vm_subnet} udp dport 53 dnat to {gateway_ip}:53
-        ip saddr {vm_subnet} tcp dport 53 dnat to {gateway_ip}:53
+        ip saddr {vm_subnet} udp dport {dns_port} dnat to {gateway_ip}:{dns_port}
+        ip saddr {vm_subnet} tcp dport {dns_port} dnat to {gateway_ip}:{dns_port}
 
-        # TCP -> Envoy (port 10000) for all other TCP traffic
-        ip saddr {vm_subnet} tcp dport != 53 dnat to {gateway_ip}:10000
+        # Policy-allowed destinations -> Envoy (conditional DNAT keyed on
+        # (ip daddr, dport) concat sets populated by the policy compiler
+        # and DNS propagation loop).
+        ip saddr {vm_subnet} meta l4proto tcp ip daddr . tcp dport @{tcp_set} dnat to {gateway_ip}:{envoy_port}
+        ip saddr {vm_subnet} meta l4proto udp ip daddr . udp dport @{udp_set} dnat to {gateway_ip}:{envoy_port}
+
+        # Everything else -> deny-logger (per L4). Fail-closed: pre-policy
+        # VM traffic hits these rules too and is surfaced as a structured
+        # `deny` event instead of a silent RST.
+        ip saddr {vm_subnet} meta l4proto tcp dnat to {gateway_ip}:{deny_tcp_port}
+        ip saddr {vm_subnet} meta l4proto udp dnat to {gateway_ip}:{deny_udp_port}
 
         # Block cloud metadata
         ip daddr 169.254.169.254 drop
@@ -1123,7 +1184,13 @@ pub fn generate_dnat_ruleset(vm_subnet: &str, gateway_ip: &str) -> String {
         masquerade
     }}
 }}
-"#
+"#,
+        dns_port = GATEWAY_DNS_PORT,
+        envoy_port = GATEWAY_ENVOY_PORT,
+        deny_tcp_port = GATEWAY_DENY_LOGGER_TCP_PORT,
+        deny_udp_port = GATEWAY_DENY_LOGGER_UDP_PORT,
+        tcp_set = NFT_POLICY_ALLOW_TCP_SET,
+        udp_set = NFT_POLICY_ALLOW_UDP_SET,
     )
 }
 
@@ -1310,6 +1377,21 @@ mod tests {
             "must define 'table inet sandbox_dnat'"
         );
 
+        // Must declare both concat sets (M10-S3: filtering moved from
+        // sandbox_policy.forward to sandbox_dnat.prerouting).
+        assert!(
+            ruleset.contains("set policy_allow_tcp"),
+            "must declare policy_allow_tcp concat set"
+        );
+        assert!(
+            ruleset.contains("set policy_allow_udp"),
+            "must declare policy_allow_udp concat set"
+        );
+        assert!(
+            ruleset.contains("type ipv4_addr . inet_service"),
+            "concat sets must be typed ipv4_addr . inet_service"
+        );
+
         // Must have prerouting chain.
         assert!(
             ruleset.contains("chain prerouting"),
@@ -1326,10 +1408,41 @@ mod tests {
             "must DNAT TCP DNS to CoreDNS"
         );
 
-        // TCP DNAT to Envoy (excluding DNS).
+        // Conditional DNAT to Envoy for policy-allowed destinations.
         assert!(
-            ruleset.contains("ip saddr 10.209.0.0/28 tcp dport != 53 dnat to 10.209.0.2:10000"),
-            "must DNAT non-DNS TCP to Envoy"
+            ruleset.contains(
+                "ip saddr 10.209.0.0/28 meta l4proto tcp ip daddr . tcp dport \
+                 @policy_allow_tcp dnat to 10.209.0.2:10000"
+            ),
+            "must conditionally DNAT policy-allowed TCP to Envoy:10000 via \
+             @policy_allow_tcp set lookup:\n{ruleset}"
+        );
+        assert!(
+            ruleset.contains(
+                "ip saddr 10.209.0.0/28 meta l4proto udp ip daddr . udp dport \
+                 @policy_allow_udp dnat to 10.209.0.2:10000"
+            ),
+            "must conditionally DNAT policy-allowed UDP to Envoy:10000 via \
+             @policy_allow_udp set lookup:\n{ruleset}"
+        );
+
+        // Deny-logger fall-through DNAT rules.
+        assert!(
+            ruleset.contains("ip saddr 10.209.0.0/28 meta l4proto tcp dnat to 10.209.0.2:10001"),
+            "must DNAT non-allowed VM TCP to deny-logger :10001:\n{ruleset}"
+        );
+        assert!(
+            ruleset.contains("ip saddr 10.209.0.0/28 meta l4proto udp dnat to 10.209.0.2:10002"),
+            "must DNAT non-allowed VM UDP to deny-logger :10002:\n{ruleset}"
+        );
+
+        // The old unconditional "tcp dport != 53 dnat to Envoy" rule is
+        // gone; filtering now happens in sandbox_dnat itself via the
+        // conditional-DNAT-to-Envoy and deny-logger fall-through rules.
+        assert!(
+            !ruleset.contains("tcp dport != 53 dnat to"),
+            "must NOT retain the old unconditional 'tcp dport != 53' DNAT \
+             rule:\n{ruleset}"
         );
 
         // Cloud metadata blocking.
@@ -1370,6 +1483,94 @@ mod tests {
         assert!(
             ruleset.contains("dnat to 10.209.0.18:10000"),
             "must use the provided gateway IP for Envoy"
+        );
+        assert!(
+            ruleset.contains("dnat to 10.209.0.18:10001"),
+            "must use the provided gateway IP for deny-logger TCP"
+        );
+        assert!(
+            ruleset.contains("dnat to 10.209.0.18:10002"),
+            "must use the provided gateway IP for deny-logger UDP"
+        );
+    }
+
+    #[test]
+    fn generate_dnat_ruleset_contains_both_deny_logger_ports() {
+        // M10-S3 explicit pin: non-allowed TCP must DNAT to :10001, UDP to
+        // :10002. Any future reshuffle that silently drops either arm
+        // would reintroduce the silent-denial gap the deny-logger exists
+        // to close.
+        let ruleset = generate_dnat_ruleset("10.10.10.0/28", "10.10.10.2");
+
+        assert!(
+            ruleset.contains(":10001"),
+            "ruleset must DNAT denied TCP to deny-logger :10001:\n{ruleset}"
+        );
+        assert!(
+            ruleset.contains(":10002"),
+            "ruleset must DNAT denied UDP to deny-logger :10002:\n{ruleset}"
+        );
+    }
+
+    #[test]
+    fn generate_dnat_ruleset_orders_allow_before_deny() {
+        // The conditional-DNAT-to-Envoy rules must appear *before* the
+        // unconditional fall-through DNAT-to-deny-logger rules, otherwise
+        // nftables evaluates the first-match fall-through and no traffic
+        // ever reaches Envoy.
+        let ruleset = generate_dnat_ruleset("10.10.10.0/28", "10.10.10.2");
+
+        let envoy_pos = ruleset
+            .find("dnat to 10.10.10.2:10000")
+            .expect("allow-to-Envoy rule must be present");
+        let deny_tcp_pos = ruleset
+            .find("dnat to 10.10.10.2:10001")
+            .expect("deny-logger TCP fall-through must be present");
+        let deny_udp_pos = ruleset
+            .find("dnat to 10.10.10.2:10002")
+            .expect("deny-logger UDP fall-through must be present");
+
+        assert!(
+            envoy_pos < deny_tcp_pos,
+            "allow-to-Envoy rule must appear before deny-logger TCP \
+             fall-through; envoy_pos={envoy_pos} deny_tcp_pos={deny_tcp_pos} \
+             ruleset:\n{ruleset}"
+        );
+        assert!(
+            envoy_pos < deny_udp_pos,
+            "allow-to-Envoy rule must appear before deny-logger UDP \
+             fall-through; envoy_pos={envoy_pos} deny_udp_pos={deny_udp_pos} \
+             ruleset:\n{ruleset}"
+        );
+    }
+
+    #[test]
+    fn generate_dnat_ruleset_dns_precedes_filter_decision() {
+        // DNS (port 53) must DNAT to CoreDNS *before* the policy-allow
+        // and deny-logger rules are evaluated, otherwise a VM's first
+        // DNS query would be misdirected to the deny-logger (and
+        // subsequently RST'd) before it ever reaches CoreDNS.
+        let ruleset = generate_dnat_ruleset("10.10.10.0/28", "10.10.10.2");
+
+        let dns_pos = ruleset
+            .find("udp dport 53 dnat to 10.10.10.2:53")
+            .expect("DNS DNAT rule must be present");
+        let allow_pos = ruleset
+            .find("@policy_allow_tcp")
+            .expect("policy-allow rule must be present");
+        let deny_pos = ruleset
+            .find("dnat to 10.10.10.2:10001")
+            .expect("deny-logger fall-through must be present");
+
+        assert!(
+            dns_pos < allow_pos,
+            "DNS rule must precede policy-allow rule; dns={dns_pos} \
+             allow={allow_pos}"
+        );
+        assert!(
+            dns_pos < deny_pos,
+            "DNS rule must precede deny-logger fall-through; dns={dns_pos} \
+             deny={deny_pos}"
         );
     }
 
