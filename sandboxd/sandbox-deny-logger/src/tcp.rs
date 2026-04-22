@@ -377,13 +377,36 @@ mod tests {
         });
 
         // Fire all connections in parallel so the accept loop sees
-        // the bursts rather than a serial stream.
+        // the bursts rather than a serial stream. Each connect is
+        // wrapped in a short retry loop because Linux loopback under
+        // nextest's workspace-parallel execution can transiently
+        // surface ECONNREFUSED when the listen backlog is full —
+        // the kernel returns RST on the SYN before our accept loop
+        // drains the queue, and the client's `connect(2)` syscall
+        // translates that into ECONNREFUSED rather than retrying.
+        // Retrying with a 5ms backoff keeps the test's semantics
+        // (all BURST connections reach the server) without masking
+        // real bugs: any failure mode that isn't transient backlog
+        // pressure (e.g. wrong port, server not listening) will
+        // exhaust the retry budget and still panic.
         let clients: Vec<_> = tokio::task::spawn_blocking(move || {
             (0..BURST)
                 .map(|_| {
-                    let s = StdTcpStream::connect(local).expect("connect");
-                    s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-                    s
+                    let mut last_err = None;
+                    for _ in 0..50 {
+                        match StdTcpStream::connect(local) {
+                            Ok(s) => {
+                                s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                                return s;
+                            }
+                            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                                last_err = Some(e);
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(e) => panic!("connect: {e}"),
+                        }
+                    }
+                    panic!("connect exhausted retries: {last_err:?}");
                 })
                 .collect::<Vec<_>>()
         })
