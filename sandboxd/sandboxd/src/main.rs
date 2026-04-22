@@ -703,6 +703,20 @@ async fn create_session(
 
     // If a repo URL was provided, clone it into /home/agent/workspace/.
     if let Some(repo_url) = &req.repo {
+        // Pre-warm DNS for the repo host so the DNS propagation loop
+        // has installed the policy's L1/L3 filter chain (Envoy
+        // prefix_ranges + sandbox_policy concat-set) before `git clone`
+        // opens its first TCP connection. Under schema v2 domain
+        // allow-rules are fail-closed at empty DNS cache; the loop
+        // polls every 2s, and a clone firing faster than that hits the
+        // empty ruleset and is rejected. Host extraction is
+        // best-effort: if the URL parses as a local path or we can't
+        // identify a host, we skip the pre-warm and let clone proceed.
+        if let Some(host) = extract_repo_host(repo_url) {
+            info!(%session_id, %host, "pre-warming DNS for repo clone");
+            prewarm_guest_dns(&state.guest, &session_id, &host).await;
+        }
+
         info!(%session_id, repo = %repo_url, "cloning repository into VM");
         match state
             .guest
@@ -1899,6 +1913,84 @@ async fn inject_ca_into_vm(
             "failed to inject CA certificate into VM: {e}"
         ))),
     }
+}
+
+/// Extract the hostname from a git remote URL.
+///
+/// Supports the common shapes accepted by `git clone`:
+///
+/// * HTTPS:  `https://github.com/user/repo.git`
+/// * HTTP:   `http://host.example/repo`
+/// * SSH URL: `ssh://git@github.com:22/user/repo.git`
+/// * SCP-like: `git@github.com:user/repo.git`
+/// * Local paths / file URLs: returns `None` (no DNS pre-warm needed).
+///
+/// Userinfo (`user@`) and trailing port (`:N`) are stripped.  Returns
+/// `None` if the URL does not name a network host — the caller treats
+/// that as "nothing to pre-warm".
+fn extract_repo_host(repo_url: &str) -> Option<String> {
+    // file:// or bare local path — nothing to resolve.
+    if repo_url.starts_with("file://") || repo_url.starts_with('/') || repo_url.starts_with('.') {
+        return None;
+    }
+
+    // scheme://...
+    let after_scheme = if let Some(idx) = repo_url.find("://") {
+        &repo_url[idx + 3..]
+    } else if let Some(idx) = repo_url.find('@') {
+        // SCP-like: user@host:path
+        let rest = &repo_url[idx + 1..];
+        return rest
+            .split(':')
+            .next()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+    } else {
+        return None;
+    };
+
+    // Strip userinfo.
+    let without_user = after_scheme.splitn(2, '@').last().unwrap_or(after_scheme);
+
+    // Take host segment up to first `/` (path) or `:` (port).
+    let host = without_user.split(['/', ':']).next().unwrap_or("");
+
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
+    }
+}
+
+/// Pre-warm DNS for a host so the daemon's DNS propagation loop
+/// installs the corresponding Envoy filter chain + `sandbox_policy`
+/// concat-set entry before the caller issues a network operation.
+///
+/// Under schema v2 every domain allow-rule is fail-closed at an empty
+/// DNS cache — the nftables `sandbox_policy` forward chain and the
+/// per-rule Envoy filter chains only carry (ip, port) entries once
+/// CoreDNS has resolved the domain. The propagation loop polls
+/// `resolved.json` every 2s; a VM-initiated connection that races that
+/// interval hits the empty ruleset and is rejected.
+///
+/// This helper issues `nslookup <host>` from inside the guest (via the
+/// guest agent) to trigger CoreDNS, then sleeps long enough for the
+/// propagation loop's next tick to land. All failures are swallowed —
+/// the pre-warm is a best-effort optimisation for domains that the
+/// policy already allows; policy-denied hosts continue to fail closed
+/// and the caller's subsequent operation still enforces policy.
+async fn prewarm_guest_dns(guest: &GuestConnector, session_id: &SessionId, host: &str) {
+    // The `|| true` guard makes this a no-op if nslookup/getent is
+    // missing from the image. `> /dev/null 2>&1` keeps the guest
+    // agent response payload small regardless of A/AAAA contents.
+    let script =
+        format!("nslookup {host} > /dev/null 2>&1 || getent hosts {host} > /dev/null 2>&1 || true");
+    let _ = guest.exec(session_id, "sh", &["-c", script.as_str()]).await;
+
+    // DNS propagation loop polls every 2s; sleeping 3s covers one
+    // complete iteration (read resolved.json → rewrite Envoy
+    // listener → inject nftables) with a small margin.
+    tokio::time::sleep(Duration::from_secs(3)).await;
 }
 
 /// Set up remaining networking for a new session.
@@ -3327,5 +3419,76 @@ mod tests {
             result.is_err(),
             "expected error when parent dir is missing, got Ok"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_repo_host: recognise the host component of a git remote URL so
+    // the DNS pre-warm before `git clone` targets the right domain.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_repo_host_https_url() {
+        assert_eq!(
+            extract_repo_host("https://github.com/octocat/Hello-World.git"),
+            Some("github.com".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_repo_host_http_url() {
+        assert_eq!(
+            extract_repo_host("http://gitserver.example/repo"),
+            Some("gitserver.example".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_repo_host_https_with_userinfo_and_port() {
+        assert_eq!(
+            extract_repo_host("https://user:pass@git.example.com:8443/owner/repo"),
+            Some("git.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_repo_host_ssh_url() {
+        assert_eq!(
+            extract_repo_host("ssh://git@github.com:22/octocat/Hello-World.git"),
+            Some("github.com".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_repo_host_scp_style() {
+        // `git@host:path` is the SCP-like short form; it has no `://`.
+        assert_eq!(
+            extract_repo_host("git@github.com:octocat/Hello-World.git"),
+            Some("github.com".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_repo_host_file_url_returns_none() {
+        assert_eq!(extract_repo_host("file:///srv/git/repo.git"), None);
+    }
+
+    #[test]
+    fn extract_repo_host_bare_local_path_returns_none() {
+        assert_eq!(extract_repo_host("/srv/git/repo.git"), None);
+        assert_eq!(extract_repo_host("./relative.git"), None);
+    }
+
+    #[test]
+    fn extract_repo_host_handles_trailing_port_without_userinfo() {
+        assert_eq!(
+            extract_repo_host("https://host.example:2222/repo"),
+            Some("host.example".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_repo_host_no_scheme_no_userinfo_returns_none() {
+        // Bare "host/path" is ambiguous; treat as no recognisable host.
+        assert_eq!(extract_repo_host("github.com/user/repo"), None);
     }
 }

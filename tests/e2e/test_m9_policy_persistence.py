@@ -170,6 +170,22 @@ def test_policy_survives_daemon_restart(
         session_id = parse_session_id(create_result.stdout)
         wait_for_state(sandbox_cli, session_name, "Running", timeout=10)
 
+        # Warm DNS for example.com so the daemon's DNS propagation loop
+        # materialises the L1 transport filter chain (Envoy prefix_ranges
+        # + sandbox_policy concat-set entry). Schema v2 L1 transport is
+        # fail-closed at an empty DNS cache; without this warm-up the
+        # pre-restart curl would race the 2-second propagation poll.
+        # Post-restart curl does not need a repeat warm-up — the gateway
+        # container survives daemon restart, so CoreDNS's resolved.json
+        # stays populated and the hydrated policy re-propagates with the
+        # cached IPs.
+        sandbox_cli(
+            "ssh", session_name, "--",
+            "nslookup", "example.com",
+            timeout=120,
+        )
+        time.sleep(5)
+
         # 3. Sanity-check enforcement BEFORE the restart. The allowed
         #    destination must succeed and the denied destination must fail.
         _assert_allowed_succeeds(
