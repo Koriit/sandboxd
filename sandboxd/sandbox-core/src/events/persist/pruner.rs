@@ -10,9 +10,11 @@
 //!
 //! # Retention semantics
 //!
-//! - `retention_days = 14`, today = 2026-04-22: anything dated
-//!   2026-04-08 or earlier is removed (inclusive bound via
-//!   `date < cutoff` where `cutoff = today - 14`).
+//! - `retention_days = 14`, today = 2026-04-22: `cutoff = today - 14 =
+//!   2026-04-08`, and the filter is `date < cutoff`, so a file dated
+//!   `2026-04-08` survives; only files dated `2026-04-07` or earlier
+//!   are removed. Equivalently: a file dated `today - retention_days`
+//!   survives; one dated `today - retention_days - 1` is removed.
 //! - `retention_days = 0`: every dated file is older than the
 //!   cutoff (`today - 0 == today` → a file dated `today` is *not*
 //!   older and survives; `today-1` or earlier is removed). This
