@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 axum.workspace = true
 clap.workspace = true
+ring.workspace = true
 sandbox-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true

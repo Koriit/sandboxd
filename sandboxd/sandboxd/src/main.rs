@@ -18,11 +18,11 @@ use sandbox_core::{
     Destination, DnsCache, EventBus, EventBusConfig, ExecRequest, ExecResponse,
     FileDownloadRequest, FileDownloadResponse, FileUploadRequest, GatewayHealth, GatewayManager,
     GatewayShutdownReason, GatewayStatus, GuestConnector, GuestRequest, GuestResponse, LimaManager,
-    NetworkHealth, NetworkManager, Policy, PolicyCompiler, PolicyDistributor, SandboxError,
-    Session, SessionConfig, SessionDto, SessionHealth, SessionId, SessionState, SessionStore,
-    UpdatePolicyRequest, VmIpSessionMap, VmStatus, attach_vm_to_bridge, detach_vm_from_bridge,
-    generate_ca_inject_script, mac_from_session_id, propagate_dns_changes, read_resolved_json,
-    write_file_to_container,
+    NetworkHealth, NetworkManager, Policy, PolicyApplyStatus, PolicyCompiler, PolicyDistributor,
+    SandboxError, Session, SessionConfig, SessionDto, SessionHealth, SessionId, SessionState,
+    SessionStore, UpdatePolicyRequest, VmIpSessionMap, VmStatus, attach_vm_to_bridge,
+    detach_vm_from_bridge, generate_ca_inject_script, mac_from_session_id, propagate_dns_changes,
+    read_resolved_json, write_file_to_container,
 };
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
@@ -704,7 +704,17 @@ async fn create_session(
     // gateway is running.  The DNS policy for the no-policy case was already
     // written during gateway creation above.
     if let Some(policy) = req.policy {
-        match apply_policy(&session_id, &policy, &state).await {
+        let initial_presets = req.source_presets.clone();
+        match apply_policy(
+            &session_id,
+            &policy,
+            &state,
+            ApplyKind::Initial {
+                source_presets: initial_presets,
+            },
+        )
+        .await
+        {
             Ok(()) => {
                 info!(%session_id, "initial policy applied");
             }
@@ -1580,7 +1590,16 @@ async fn update_policy(
         .into_response();
     }
 
-    match apply_policy(&session.id, &req.policy, &state).await {
+    match apply_policy(
+        &session.id,
+        &req.policy,
+        &state,
+        ApplyKind::Update {
+            source_presets: req.source_presets.clone(),
+        },
+    )
+    .await
+    {
         Ok(()) => {
             info!(session_id = %session.id, "policy updated");
             let body = serde_json::json!({
@@ -1687,6 +1706,40 @@ async fn clear_session_policy(
     Ok(())
 }
 
+/// Classifies a call to [`apply_policy`] so the lifecycle emitter
+/// picks the correct event variant (or skips emission entirely for
+/// internal re-pushes).
+#[derive(Debug, Clone)]
+enum ApplyKind {
+    /// User-triggered first policy apply at session creation time.
+    /// Emits `policy_applied` on success or failure.
+    Initial { source_presets: Vec<String> },
+    /// User-triggered update of an already-applied policy. Emits
+    /// `policy_updated` with `previous_policy_hash` attributing the
+    /// diff.
+    Update { source_presets: Vec<String> },
+    /// Internal restoration on gateway recreation (daemon restart,
+    /// crash recovery, reconciliation). The policy was already
+    /// observed by the bus in a prior `Initial`/`Update` emission;
+    /// re-emitting here would double-count. No event is published.
+    Restoration,
+}
+
+/// Compute a stable sha256 hex digest of a [`Policy`] for use as
+/// `previous_policy_hash` on `policy_updated` events. Hashes the
+/// serde-JSON representation so the digest is deterministic across
+/// processes (the in-memory struct layout is not).
+fn hash_policy(policy: &Policy) -> Option<String> {
+    let bytes = serde_json::to_vec(policy).ok()?;
+    let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
+    let mut s = String::with_capacity(digest.as_ref().len() * 2);
+    for byte in digest.as_ref() {
+        use std::fmt::Write;
+        let _ = write!(s, "{byte:02x}");
+    }
+    Some(s)
+}
+
 /// Apply a policy to a running session: compile, distribute, persist, and
 /// start the DNS propagation loop.
 ///
@@ -1697,7 +1750,79 @@ async fn clear_session_policy(
 /// active before this call.  If the daemon crashes between the DB
 /// commit and the memory insert, startup hydration rebuilds the map
 /// from the DB on the next launch, closing the silent allow-all window.
+///
+/// `kind` tells the lifecycle emitter which event to publish:
+///  - `Initial` → `policy_applied`
+///  - `Update`  → `policy_updated` (with `previous_policy_hash`)
+///  - `Restoration` → no event (the policy was already announced when
+///    it was first applied; re-emitting on every gateway recreation
+///    would double-count)
+///
+/// The emission always happens — both on success (`status == Ok`) and
+/// on failure (`status == Error`, with the error attached) — so
+/// subscribers can alert on failed applies without polling.
 async fn apply_policy(
+    session_id: &SessionId,
+    policy: &Policy,
+    state: &AppState,
+    kind: ApplyKind,
+) -> Result<(), SandboxError> {
+    // Snapshot the prior in-memory policy *before* distribution so
+    // `policy_updated` can attach a `previous_policy_hash` even when
+    // the distribution + persist chain succeeds and mutates the map.
+    // Restoration skips the snapshot — no event will be emitted.
+    let previous_policy_hash = match &kind {
+        ApplyKind::Update { .. } => {
+            let policies = state.session_policies.lock().await;
+            policies.get(session_id).and_then(hash_policy)
+        }
+        ApplyKind::Initial { .. } | ApplyKind::Restoration => None,
+    };
+
+    let result = apply_policy_inner(session_id, policy, state).await;
+
+    // Emit the lifecycle event after the apply has either fully
+    // succeeded or failed — never in the middle of a partial state.
+    // Restoration skips emission entirely.
+    match &kind {
+        ApplyKind::Initial { source_presets } => {
+            let (status, error) = match &result {
+                Ok(()) => (PolicyApplyStatus::Ok, None),
+                Err(e) => (PolicyApplyStatus::Error, Some(e.to_string())),
+            };
+            state.event_bus.publish(lifecycle_events::policy_applied(
+                *session_id,
+                policy.clone(),
+                source_presets.clone(),
+                status,
+                error,
+            ));
+        }
+        ApplyKind::Update { source_presets } => {
+            let (status, error) = match &result {
+                Ok(()) => (PolicyApplyStatus::Ok, None),
+                Err(e) => (PolicyApplyStatus::Error, Some(e.to_string())),
+            };
+            state.event_bus.publish(lifecycle_events::policy_updated(
+                *session_id,
+                policy.clone(),
+                source_presets.clone(),
+                status,
+                error,
+                previous_policy_hash,
+            ));
+        }
+        ApplyKind::Restoration => {}
+    }
+
+    result
+}
+
+/// Inner body of [`apply_policy`], split out so the public wrapper can
+/// emit one `policy_applied` / `policy_updated` event reporting the
+/// overall success/failure without duplicating the hot-path logic or
+/// leaking emission behavior into call sites.
+async fn apply_policy_inner(
     session_id: &SessionId,
     policy: &Policy,
     state: &AppState,
@@ -2234,7 +2359,7 @@ async fn reapply_session_policy(session_id: &SessionId, state: &AppState) {
     };
 
     if let Some(policy) = policy {
-        match apply_policy(session_id, &policy, state).await {
+        match apply_policy(session_id, &policy, state, ApplyKind::Restoration).await {
             Ok(()) => {
                 info!(
                     session_id = %session_id,
