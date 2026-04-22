@@ -988,7 +988,9 @@ impl GatewayManager {
         for (component, log_name) in KNOWN_COMPONENTS {
             let probe = component_probe(component).unwrap_or_else(|| {
                 // Unreachable: KNOWN_COMPONENTS and component_probe are
-                // kept in sync by `known_components_all_have_probes`.
+                // kept in sync by the
+                // `component_probe_returns_some_for_every_known_component`
+                // unit test.
                 panic!("no probe command registered for known component {component:?}");
             });
             self.wait_for_component(&container_name, log_name, probe, deadline)?;
