@@ -33,8 +33,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sandbox_core::{
-    DnsEvent, EnvoyEvent, Event, EventBus, EventBusConfig, MitmproxyEvent, SessionId,
-    SessionIngestor, TrafficEvent, VmIpSessionMap,
+    DenyLoggerEvent, DenyProtocol, DnsEvent, EnvoyEvent, Event, EventBus, EventBusConfig,
+    MitmproxyEvent, SessionId, SessionIngestor, TrafficEvent, VmIpSessionMap,
 };
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
@@ -269,4 +269,85 @@ async fn ingestor_abort_stops_further_publishes() {
             // Timeout — expected. Aborted ingestor stayed silent.
         }
     }
+}
+
+/// End-to-end: `deny-logger.jsonl` records are parsed and surface on the
+/// session bus. Covers both event shapes prescribed by spec Part 3:
+///
+/// 1. A TCP `deny` record — the 5-tuple drives a `vm_ip_map.lookup` on
+///    the VM's bridge IP, stamping the same session as the other
+///    producers.
+/// 2. A `rate_limited` summary record — no 5-tuple, so attribution
+///    falls back to the ingestor's owning session (M10-S3 Phase 5
+///    watcher rule).
+#[tokio::test]
+async fn deny_logger_jsonl_appears_on_bus() {
+    let tmp = TempDir::new().expect("create tempdir");
+    let events_dir = tmp.path().to_path_buf();
+    let sid = SessionId::parse("dddddddddddd").expect("valid fixture id");
+
+    let bus = EventBus::new(EventBusConfig::default());
+    bus.register_session(sid);
+    let vm_ip_map = VmIpSessionMap::new();
+    vm_ip_map.bind(VM_IP_STR.parse::<Ipv4Addr>().expect("valid vm ip"), sid);
+    let (mut replay, mut rx) = bus.subscribe(&sid).expect("session registered");
+
+    let ingestor = SessionIngestor::spawn(sid, events_dir.clone(), bus.clone(), vm_ip_map.clone());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // --- Deny (TCP) — the 5-tuple shape authored by the deny-logger
+    // component per spec Part 3 / "Traffic events" row for `deny-logger`:
+    // `orig_dst_ip`, `orig_dst_port`, `protocol`, `src_ip`, `src_port`.
+    let deny_line = r#"{"timestamp":"2026-04-22T09:45:10.000Z","layer":"deny-logger","event":"deny","orig_dst_ip":"203.0.113.1","orig_dst_port":8443,"protocol":"tcp","src_ip":"10.0.0.42","src_port":51234}"#;
+    append_jsonl_line(&events_dir.join("deny-logger.jsonl"), deny_line).await;
+
+    // --- Rate-limited summary — no 5-tuple; `rate_limited_count` +
+    // `since_ts` per spec Part 3 / "Hardening rules" § 5. Attribution
+    // must fall back to the ingestor's own session.
+    let rate_limited_line = r#"{"timestamp":"2026-04-22T09:45:11.000Z","layer":"deny-logger","event":"rate_limited","rate_limited_count":17,"since_ts":"2026-04-22T09:45:10.000Z"}"#;
+    append_jsonl_line(&events_dir.join("deny-logger.jsonl"), rate_limited_line).await;
+
+    let mut saw_deny = false;
+    let mut saw_rate_limited = false;
+    for i in 0..2 {
+        let ev = next_event(&mut replay, &mut rx, &format!("deny-logger event #{i}")).await;
+        match &*ev {
+            Event::Traffic { envelope, event } => {
+                assert_eq!(
+                    envelope.session,
+                    Some(sid),
+                    "every deny-logger event must carry the ingestor's session id; got {envelope:?}"
+                );
+                match event {
+                    TrafficEvent::DenyLogger(DenyLoggerEvent::Deny(d)) => {
+                        assert_eq!(d.orig_dst_ip, "203.0.113.1".parse::<Ipv4Addr>().unwrap());
+                        assert_eq!(d.orig_dst_port, 8443);
+                        assert_eq!(d.protocol, DenyProtocol::Tcp);
+                        assert_eq!(d.src_ip, "10.0.0.42".parse::<Ipv4Addr>().unwrap());
+                        assert_eq!(d.src_port, 51234);
+                        assert!(!saw_deny, "duplicate deny event");
+                        saw_deny = true;
+                    }
+                    TrafficEvent::DenyLogger(DenyLoggerEvent::RateLimited {
+                        rate_limited_count,
+                        ..
+                    }) => {
+                        assert_eq!(*rate_limited_count, 17);
+                        assert!(!saw_rate_limited, "duplicate rate_limited event");
+                        saw_rate_limited = true;
+                    }
+                    other => panic!("unexpected traffic event variant: {other:?}"),
+                }
+            }
+            Event::Lifecycle { .. } => {
+                panic!("unexpected lifecycle event on deny-logger traffic test")
+            }
+        }
+    }
+    assert!(
+        saw_deny && saw_rate_limited,
+        "missing deny-logger coverage: deny={saw_deny}, rate_limited={saw_rate_limited}"
+    );
+
+    ingestor.abort();
 }
