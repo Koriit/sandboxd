@@ -1,6 +1,8 @@
-# Gateway container: Envoy + mitmproxy + CoreDNS proxy pipeline
+# Gateway container: Envoy + mitmproxy + CoreDNS + deny-logger pipeline.
 # CoreDNS is built from source with the sandboxpolicy plugin for DNS-level
 # policy enforcement. Envoy and mitmproxy handle TCP/HTTP proxying.
+# `sandbox-deny-logger` catches denied VM egress via nftables DNAT and
+# emits structured `deny` events to the shared JSONL stream.
 #
 # Build context is the repository root (see Makefile `.gateway-image.stamp`
 # target); `.dockerignore` prunes heavyweight directories.
@@ -18,7 +20,31 @@ WORKDIR /build/coredns-plugin
 RUN go mod download \
     && CGO_ENABLED=0 go build -o /coredns ./cmd/coredns
 
-# ---------- Stage 2: Runtime image ----------
+# ---------- Stage 2: Build sandbox-deny-logger binary ----------
+#
+# Compiled in a dedicated Rust builder stage so the runtime image stays
+# free of the Rust toolchain (~1.5 GB compressed). Linked against glibc
+# (the builder's debian:bookworm and the runtime's debian:bookworm-slim
+# ship compatible glibc versions); no musl gymnastics required.
+#
+# The `sandboxd/` workspace is copied wholesale because
+# `sandbox-deny-logger` resolves against workspace-level `Cargo.toml` /
+# `Cargo.lock` and the shared `[workspace.dependencies]` table. Sibling
+# crates are not dragged in by `cargo build -p sandbox-deny-logger` —
+# cargo builds only the requested package plus its actual dependency
+# graph. `.dockerignore` already excludes `sandboxd/target/`.
+FROM rust:1.85-bookworm AS deny-logger-builder
+
+WORKDIR /src
+
+COPY sandboxd/ ./sandboxd/
+
+WORKDIR /src/sandboxd
+
+RUN cargo build --release -p sandbox-deny-logger \
+    && install -D -m 0755 target/release/sandbox-deny-logger /out/sandbox-deny-logger
+
+# ---------- Stage 3: Runtime image ----------
 FROM debian:bookworm-slim
 
 # Versions — pinned for reproducibility
@@ -48,6 +74,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ---------- install custom CoreDNS with sandboxpolicy plugin ----------
 COPY --from=coredns-builder /coredns /usr/local/bin/coredns
 RUN chmod +x /usr/local/bin/coredns
+
+# ---------- install sandbox-deny-logger ----------
+# Runtime-only dependency is glibc (≥ the debian:bookworm version the
+# builder stage linked against); no extra packages needed.
+COPY --from=deny-logger-builder /out/sandbox-deny-logger /usr/local/bin/sandbox-deny-logger
+RUN chmod +x /usr/local/bin/sandbox-deny-logger
 
 # ---------- install mitmproxy static binary ----------
 RUN curl -fsSL "https://downloads.mitmproxy.org/${MITMPROXY_VERSION}/mitmproxy-${MITMPROXY_VERSION}-linux-x86_64.tar.gz" \

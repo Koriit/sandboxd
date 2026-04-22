@@ -45,18 +45,23 @@ test-validators: gateway-image
 		--workspace --run-ignored only -E 'test(/validator_/)'
 
 # Stamp-driven rebuild: only rebuild the docker image when one of its
-# inputs (Dockerfile, addon, entrypoint, Envoy/CoreDNS configs) changes.
-# The phony `gateway-image` target remains as an unconditional rebuild
-# entry point for callers who want to force a rebuild.
+# inputs (Dockerfile, addon, entrypoint, Envoy/CoreDNS configs, or the
+# `sandbox-deny-logger` crate — compiled from source in a Dockerfile
+# build stage) changes. The phony `gateway-image` target remains as an
+# unconditional rebuild entry point for callers who want to force a
+# rebuild.
 #
-# Build context is the repository root so upcoming Dockerfile stages can
-# reach into `sandboxd/` for source-compiled components. `.dockerignore`
-# at the repo root keeps `sandboxd/target/` and other heavy directories
-# out of the context upload.
+# Build context is the repository root so the Rust deny-logger build
+# stage can `COPY sandboxd/` into its builder. `.dockerignore` at the
+# repo root keeps `sandboxd/target/` and other heavy directories out of
+# the context upload.
 GATEWAY_INPUTS := $(shell find networking -type f \
 	\( -name '*.py' -o -name '*.sh' -o -name 'Dockerfile' \
 	   -o -name '*.yaml' -o -name '*.yml' -o -name 'Corefile' \) \
 	-not -path '*/__pycache__/*') \
+	$(shell find sandboxd/sandbox-deny-logger -type f \
+	   \( -name '*.rs' -o -name 'Cargo.toml' \)) \
+	sandboxd/Cargo.toml sandboxd/Cargo.lock \
 	.dockerignore
 
 .gateway-image.stamp: $(GATEWAY_INPUTS)
