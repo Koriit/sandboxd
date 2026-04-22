@@ -3,6 +3,7 @@ members = [
     "sandboxd",
     "sandbox-cli",
     "sandbox-core",
+    "sandbox-deny-logger",
     "sandbox-guest",
 ]
 resolver = "2"
