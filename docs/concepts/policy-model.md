@@ -34,16 +34,17 @@ Because level 3 requires mitmproxy to impersonate the server, and the client has
 
 ## Rule shape
 
-A policy is a JSON document with a `version` and an ordered `rules` array.
+A policy is a JSON document with a `version` and an ordered `rules` array. Every rule names the `(host, port, protocol)` tuple it allows at a given assurance level.
 
 ```json
 {
-  "version": "1.0.0",
+  "version": "2.0.0",
   "rules": [
     {
-      "destination": "api.example.com",
+      "host": "api.example.com",
+      "port": 443,
+      "protocol": "tcp",
       "level": "tls",
-      "protocol": "https",
       "reason": "Example API access"
     }
   ]
@@ -54,38 +55,48 @@ A policy is a JSON document with a `version` and an ordered `rules` array.
 
 | Field | Required | Meaning |
 |---|---|---|
-| `destination` | yes | Domain, wildcard domain (`*.example.com`), IP, or CIDR |
+| `host` | yes | Domain, wildcard domain (`*.example.com`), IP, or CIDR. Bare `*` is rejected. |
+| `port` | yes | L4 port number, `1..=65535`. No ranges, no lists. |
+| `protocol` | yes | L4 protocol — `tcp` or `udp`. No other values are accepted. |
 | `level` | yes | `deny`, `transport`, `tls`, or `http` |
-| `protocol` | no | `tcp`, `udp`, `http`, `https`, `any` (default `any`) |
 | `http_filters` | conditional | `(method, path)` pairs — **required** at level `http`, forbidden elsewhere |
 | `reason` | no | Free-form explanation |
 
-### Destinations
+Rule identity is the `(host, port)` pair: at most one rule per pair in any effective policy.
+
+### Hosts
 
 - **Exact domain:** `"github.com"` — just that host.
 - **Wildcard domain:** `"*.github.com"` — subdomains only, not the apex. To cover both, list both.
 - **IP:** `"140.82.112.4"` — single address.
 - **CIDR:** `"140.82.112.0/20"` — range.
 
-Wildcards only work as a `*.` prefix. Domain labels must follow DNS rules.
+Wildcards only work as a `*.` prefix. A bare `*` is not a valid host; to allow a port broadly, pair it with `0.0.0.0/0` and be explicit about it. Domain labels must follow DNS rules.
 
 ### HTTP filters
 
 At level `http`, a rule must carry `http_filters`: an ordered list of `(method, path)` pairs.
 
 - **Method:** an uppercase HTTP verb (`GET`, `POST`, ...) or the wildcard `ANY`.
-- **Path:** an fnmatch glob (`*`, `?`, `[...]`).
+- **Path:** a per-segment glob, anchored to the full request path.
+
+Path matcher semantics:
+
+- `**` matches any run of characters, including `/` — crosses path segments.
+- `*` matches any run of non-`/` characters — stays inside a single segment.
+- `?` matches exactly one non-`/` character.
+- Literals match themselves.
 
 A request is allowed when at least one filter's method **and** path both match. Because method and path live inside the same object, you can express mixed pairs precisely:
 
 ```json
 "http_filters": [
-  {"method": "GET",  "path": "/api/v1/*"},
-  {"method": "POST", "path": "/api/v1/write/*"}
+  {"method": "GET",  "path": "/api/v1/**"},
+  {"method": "POST", "path": "/api/v1/write/**"}
 ]
 ```
 
-That is not the cartesian product of `{GET, POST} x {/api/v1/*, /api/v1/write/*}` — it is exactly two pairs. Independent method and path lists cannot express this.
+That is not the cartesian product of `{GET, POST} x {/api/v1/**, /api/v1/write/**}` — it is exactly two pairs. Independent method and path lists cannot express this.
 
 The array must be non-empty. An empty list would make the rule unreachable, and the compiler rejects it.
 
@@ -94,11 +105,13 @@ The array must be non-empty. An empty list would make the rule unreachable, and 
 The policy compiler rejects a policy if:
 
 - The major `version` does not match.
+- Any rule omits `host`, `port`, or `protocol`, or uses `protocol` values other than `tcp` / `udp`.
+- A `host` is a bare `*`.
 - `http_filters` appear on a rule whose level is not `http`.
-- A level-`http` rule is missing `http_filters`, or uses a protocol incompatible with HTTP.
+- A level-`http` rule is missing `http_filters`.
 - A CIDR is syntactically invalid.
 - A domain name violates DNS label rules.
-- Two rules name the same destination with different levels — treated as a contradiction.
+- Two rules share the same `(host, port)` pair with different levels — treated as a contradiction.
 
 ## How each level maps onto enforcement
 

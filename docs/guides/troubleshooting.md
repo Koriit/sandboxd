@@ -213,7 +213,7 @@ mitmproxy expects HTTP/HTTPS on its forward-proxy port. The Envoy L3 filter chai
 Fix: do not put non-HTTP destinations at level `http`. Drop them to `tls` (SNI-verified passthrough) or `transport` (opaque TCP):
 
 ```json
-{"destination": "git.example.com", "level": "transport", "protocol": "https"}
+{"host": "git.example.com", "port": 443, "protocol": "tcp", "level": "transport"}
 ```
 
 ### Verify L3 inspection is actually happening

@@ -18,40 +18,45 @@ By the end you will have:
 
 ## 1. Write a policy file
 
-Before you create the session, write the policy it will run under. A policy is JSON: a `version` and an ordered list of rules. Each rule specifies a destination, a protocol, and an assurance level. Unmatched destinations are denied.
+Before you create the session, write the policy it will run under. A policy is JSON: a `version` and an ordered list of rules. Each rule specifies a `host`, an explicit `port`, an L4 `protocol` (`tcp` or `udp`), and an assurance level. Unmatched destinations are denied.
 
 Save this as `~/policies/rust-build.json`:
 
 ```json
 {
-  "version": "1.0.0",
+  "version": "2.0.0",
   "rules": [
     {
-      "destination": "github.com",
+      "host": "github.com",
+      "port": 443,
       "protocol": "tcp",
       "level": "tls",
       "reason": "source fetch"
     },
     {
-      "destination": "codeload.github.com",
+      "host": "codeload.github.com",
+      "port": 443,
       "protocol": "tcp",
       "level": "tls",
       "reason": "GitHub tarball CDN"
     },
     {
-      "destination": "static.crates.io",
+      "host": "static.crates.io",
+      "port": 443,
       "protocol": "tcp",
       "level": "tls",
       "reason": "crate downloads"
     },
     {
-      "destination": "index.crates.io",
+      "host": "index.crates.io",
+      "port": 443,
       "protocol": "tcp",
       "level": "tls",
       "reason": "crates.io sparse index"
     },
     {
-      "destination": "crates.io",
+      "host": "crates.io",
+      "port": 443,
       "protocol": "tcp",
       "level": "tls",
       "reason": "crates.io metadata"
@@ -146,7 +151,7 @@ chmod +x ./rg
 You can swap the active policy on a running session without restarting the VM. To tighten (say, revoke GitHub):
 
 ```bash
-jq 'del(.rules[] | select(.destination=="github.com"))' \
+jq 'del(.rules[] | select(.host=="github.com"))' \
     ~/policies/rust-build.json > ~/policies/rust-build-no-gh.json
 sandbox policy update rust-build --policy ~/policies/rust-build-no-gh.json
 ```
@@ -157,13 +162,7 @@ To wipe the policy entirely and go fail-closed (empty allow-list — nothing rea
 sandbox policy update rust-build --clear
 ```
 
-To go the other direction and temporarily allow everything (with the traffic still logged through mitmproxy):
-
-```bash
-sandbox policy update rust-build --unrestricted
-```
-
-`--unrestricted` is explicitly a single rule that allows all destinations at HTTP assurance, meaning mitmproxy sees every request. Use it for triage; switch back when you are done.
+`--clear` is idempotent: it leaves the session in the same fail-closed state as a freshly created session with no `--policy`. There is no built-in "allow everything" escape hatch — denials surface through gateway logs, and the workflow is to widen the policy to cover what the build actually needs.
 
 ## 7. Clean up
 

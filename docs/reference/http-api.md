@@ -52,7 +52,7 @@ Request body (all fields optional):
   "memory_mb": 4096,
   "disk_gb": 20,
   "template": "/path/to/lima.yaml",
-  "policy": { "version": "1.0.0", "rules": [] },
+  "policy": { "version": "2.0.0", "rules": [] },
   "repo": "https://github.com/example/app.git",
   "boot_cmd": "make setup",
   "workspace": "shared:/home/you/project",
@@ -183,10 +183,11 @@ Request body is a policy document (the `Policy` shape flattened at the top level
 
 ```json
 {
-  "version": "1.0.0",
+  "version": "2.0.0",
   "rules": [
     {
-      "destination": "github.com",
+      "host": "github.com",
+      "port": 443,
       "protocol": "tcp",
       "level": "tls",
       "reason": "source fetch"
@@ -268,7 +269,7 @@ Success: `200 OK` with:
   },
   "guest_agent_status": "connected",
   "gateway_status": "running",
-  "policy": { "version": "1.0.0", "rules": [] }
+  "policy": { "version": "2.0.0", "rules": [] }
 }
 ```
 

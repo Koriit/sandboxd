@@ -13,28 +13,31 @@ This guide walks you through writing a policy file, attaching it to a session, u
 
 ## Write a policy file
 
-A policy is a JSON file with a `version` and a `rules` array. Create `policy.json`:
+A policy is a JSON file with a `version` and a `rules` array. Every rule names a `host`, a `port`, and an L4 `protocol` (`tcp` or `udp`). Create `policy.json`:
 
 ```json
 {
-  "version": "1.0.0",
+  "version": "2.0.0",
   "rules": [
     {
-      "destination": "github.com",
+      "host": "github.com",
+      "port": 443,
+      "protocol": "tcp",
       "level": "transport",
-      "protocol": "https",
       "reason": "GitHub web and git"
     },
     {
-      "destination": "*.github.com",
+      "host": "*.github.com",
+      "port": 443,
+      "protocol": "tcp",
       "level": "transport",
-      "protocol": "https",
       "reason": "GitHub API and subdomains"
     },
     {
-      "destination": "registry.npmjs.org",
+      "host": "registry.npmjs.org",
+      "port": 443,
+      "protocol": "tcp",
       "level": "transport",
-      "protocol": "https",
       "reason": "npm package registry"
     }
   ]
@@ -43,9 +46,12 @@ A policy is a JSON file with a `version` and a `rules` array. Create `policy.jso
 
 Points to note:
 
+- **Every rule must declare an explicit `port`** (1–65535) and `protocol` (`tcp` or `udp`). There are no defaults — the compiler rejects a rule that omits either field.
 - **`"*.github.com"` does not match `"github.com"`** — the apex needs its own rule.
+- **A bare `*` host is rejected.** To open a port broadly, pair it with a CIDR (for example `0.0.0.0/0`) and be explicit that you are doing so.
 - **Use `transport` for pinned-certificate hosts** (GitHub, npm, PyPI, container registries). HTTPS inspection breaks pinning.
 - **Every `http` rule needs an `http_filters` array** — see below.
+- **Rule identity is the `(host, port)` pair.** Two rules with the same host and port but different levels are a contradiction and are rejected.
 
 ### An HTTP-filter rule
 
@@ -53,18 +59,26 @@ When you want to restrict which methods and paths the agent can call, use level 
 
 ```json
 {
-  "destination": "api.internal.example.com",
+  "host": "api.internal.example.com",
+  "port": 443,
+  "protocol": "tcp",
   "level": "http",
-  "protocol": "https",
   "http_filters": [
-    {"method": "GET",  "path": "/api/v2/read/*"},
-    {"method": "POST", "path": "/api/v2/write/*"}
+    {"method": "GET",  "path": "/api/v2/read/**"},
+    {"method": "POST", "path": "/api/v2/write/**"}
   ],
   "reason": "Internal API — reads and scoped writes only"
 }
 ```
 
-Paths are fnmatch globs: `*` matches any run of characters, `?` matches a single character. A request is allowed if any filter's method and path both match.
+Paths are matched per segment and are anchored (the whole request path must match):
+
+- `**` matches any run of characters, including `/` — use it to match across path segments.
+- `*` matches any run of non-`/` characters — it stays inside a single segment.
+- `?` matches exactly one non-`/` character.
+- Literal characters match themselves.
+
+A request is allowed if any filter's method and path both match.
 
 ### A broader research policy
 
@@ -72,13 +86,13 @@ TLS-verified passthrough for sites where you want hostname verification but do n
 
 ```json
 {
-  "version": "1.0.0",
+  "version": "2.0.0",
   "rules": [
-    {"destination": "*.wikipedia.org",   "level": "tls", "protocol": "https"},
-    {"destination": "*.stackoverflow.com","level": "tls", "protocol": "https"},
-    {"destination": "*.readthedocs.io",  "level": "tls", "protocol": "https"},
-    {"destination": "github.com",        "level": "transport", "protocol": "https"},
-    {"destination": "*.github.com",      "level": "transport", "protocol": "https"}
+    {"host": "*.wikipedia.org",     "port": 443, "protocol": "tcp", "level": "tls"},
+    {"host": "*.stackoverflow.com", "port": 443, "protocol": "tcp", "level": "tls"},
+    {"host": "*.readthedocs.io",    "port": 443, "protocol": "tcp", "level": "tls"},
+    {"host": "github.com",          "port": 443, "protocol": "tcp", "level": "transport"},
+    {"host": "*.github.com",        "port": 443, "protocol": "tcp", "level": "transport"}
   ]
 }
 ```
@@ -104,13 +118,13 @@ sandbox create --name dev \
 The `policy update` subcommand swaps the policy on a live session. The new policy fully replaces the old one — no merging. All four enforcement components (CoreDNS, nftables, Envoy, mitmproxy) are re-compiled and hot-reloaded; the session stays `Running`.
 
 ```bash
-sandbox policy update dev ./new-policy.json
+sandbox policy update dev --policy ./new-policy.json
 ```
 
 The session argument accepts a name or ID:
 
 ```bash
-sandbox policy update a1b2c3d4e5f6 ./new-policy.json
+sandbox policy update a1b2c3d4e5f6 --policy ./new-policy.json
 ```
 
 ## Create a session with no policy
@@ -121,22 +135,15 @@ Without a policy, everything is denied. That is sometimes what you want — an a
 sandbox create --name air-gapped
 ```
 
-## Drop all restrictions for debugging
+## Clear the policy on a running session
 
-`--unrestricted` creates a session with no policy engine at all — raw outbound connectivity. Use only for diagnosis, never for real workloads.
-
-```bash
-sandbox create --name debug --unrestricted
-```
-
-To drop the current policy from a running session (returning it to full deny), apply an empty rule set:
+To drop the current policy from a running session and return it to full deny, use `--clear`:
 
 ```bash
-cat > /tmp/empty-policy.json <<'EOF'
-{"version": "1.0.0", "rules": []}
-EOF
-sandbox policy update dev /tmp/empty-policy.json
+sandbox policy update dev --clear
 ```
+
+`--clear` is idempotent — applying it to a session that already has no policy is a successful no-op. The session's DNS returns `NXDOMAIN` for every query and the gateway drops every outbound packet, exactly like a session created without `--policy`.
 
 ## How quickly a policy change takes effect
 
@@ -188,7 +195,7 @@ sandbox logs dev --component coredns
 Fix by adding the missing domain and updating the policy:
 
 ```bash
-sandbox policy update dev ./policy.json
+sandbox policy update dev --policy ./policy.json
 ```
 
 Remember: `"*.example.com"` does not match `"example.com"` itself.
@@ -224,13 +231,13 @@ Adjust the `http_filters` array and hot-reload with `sandbox policy update`.
 The client is rejecting the per-session CA — typically because the application pins certificates. Drop to `tls` or `transport` for that destination:
 
 ```json
-{"destination": "pinned.example.com", "level": "tls", "protocol": "https"}
+{"host": "pinned.example.com", "port": 443, "protocol": "tcp", "level": "tls"}
 ```
 
 Then update:
 
 ```bash
-sandbox policy update dev ./policy.json
+sandbox policy update dev --policy ./policy.json
 ```
 
 ### Inspect the live state
