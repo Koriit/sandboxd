@@ -229,6 +229,21 @@ def test_level1_transport_tcp(sandbox_cli):
         session_id = parse_session_id(result.stdout)
         wait_for_state(sandbox_cli, "pol-l1-tcp", "Running", timeout=10)
 
+        # Warm DNS so the daemon's propagation loop materialises the per-rule
+        # Envoy filter chain (prefix_ranges = resolved IPs) and the
+        # sandbox_policy nftables concat-set entry (ip, 80) for example.com.
+        # Under schema v2 L1 transport is fail-closed at empty cache — the
+        # listener has no filter chain and the forward chain rejects until
+        # CoreDNS resolves and the 2-second poll runs. Without this warmup
+        # the first connection race-loses: see test_l3_fail_closed_before_dns_propagation
+        # for a deliberate exercise of the same property at L3.
+        sandbox_cli(
+            "ssh", "pol-l1-tcp", "--",
+            "nslookup", "example.com",
+            timeout=120,
+        )
+        time.sleep(5)
+
         # curl http://example.com should succeed (TCP passthrough).
         curl_result = sandbox_cli(
             "ssh", "pol-l1-tcp", "--",
@@ -1149,6 +1164,18 @@ def test_policy_update(sandbox_cli):
         session_id = parse_session_id(result.stdout)
         wait_for_state(sandbox_cli, "pol-update", "Running", timeout=10)
 
+        # Warm DNS for example.com so the L1 transport filter chain
+        # (Envoy prefix_ranges + sandbox_policy concat-set) is in place
+        # before the first curl. Schema v2 L1 transport is fail-closed
+        # at empty DNS cache; without this the first connection races
+        # the propagation loop (2-second poll).
+        sandbox_cli(
+            "ssh", "pol-update", "--",
+            "nslookup", "example.com",
+            timeout=120,
+        )
+        time.sleep(5)
+
         # Verify example.com is reachable.
         curl_result = sandbox_cli(
             "ssh", "pol-update", "--",
@@ -1204,6 +1231,17 @@ def test_policy_update(sandbox_cli):
             f"DNS for example.com should fail after policy update.\n"
             f"stdout: {denied_dns.stdout}\nstderr: {denied_dns.stderr}"
         )
+
+        # Warm DNS for httpbin.org (the post-update allow) and let the
+        # propagation loop materialise the L1 transport filter chain +
+        # sandbox_policy concat-set entry. Same fail-closed race as the
+        # initial-policy curl above.
+        sandbox_cli(
+            "ssh", "pol-update", "--",
+            "nslookup", "httpbin.org",
+            timeout=120,
+        )
+        time.sleep(5)
 
         # Verify httpbin.org is now reachable.
         httpbin_result = sandbox_cli(
