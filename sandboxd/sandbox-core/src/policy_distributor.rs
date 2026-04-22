@@ -441,9 +441,7 @@ fn read_nftables_state(session_id: &SessionId) -> Result<String, SandboxError> {
 
     for table in ["sandbox_dnat", "sandbox_policy"] {
         let output = Command::new("docker")
-            .args([
-                "exec", &container, "nft", "list", "table", "inet", table,
-            ])
+            .args(["exec", &container, "nft", "list", "table", "inet", table])
             .output()
             .map_err(|e| {
                 SandboxError::Gateway(format!("failed to list nftables table {table}: {e}"))
