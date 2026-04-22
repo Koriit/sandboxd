@@ -124,7 +124,9 @@ fn parse_protocol(value: &str) -> Result<DenyProtocol, SandboxError> {
 
 fn require<T>(field: &str, value: Option<T>) -> Result<T, SandboxError> {
     value.ok_or_else(|| {
-        SandboxError::Internal(format!("deny-logger record: missing required `{field}` field"))
+        SandboxError::Internal(format!(
+            "deny-logger record: missing required `{field}` field"
+        ))
     })
 }
 
@@ -253,9 +255,10 @@ mod tests {
                 since_ts,
             }) => {
                 assert_eq!(rate_limited_count, 42);
-                let expected_since = chrono::DateTime::parse_from_rfc3339("2026-04-22T09:45:04.000Z")
-                    .unwrap()
-                    .with_timezone(&Utc);
+                let expected_since =
+                    chrono::DateTime::parse_from_rfc3339("2026-04-22T09:45:04.000Z")
+                        .unwrap()
+                        .with_timezone(&Utc);
                 assert_eq!(since_ts, expected_since);
             }
             other => panic!("expected RateLimited variant, got {other:?}"),
