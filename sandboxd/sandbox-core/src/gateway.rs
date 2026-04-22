@@ -31,6 +31,73 @@ pub enum GatewayStatus {
     NotRunning,
 }
 
+/// Docker's native per-container health verdict, as surfaced by
+/// `docker inspect --format '{{.State.Health.Status}}' <container>`.
+///
+/// This is the verdict Docker itself maintains by invoking the container's
+/// `HEALTHCHECK` directive on a cadence (interval / timeout / retries /
+/// start-period) — for the gateway image that directive runs
+/// `/healthcheck.sh`, which Phase 4 extended to include the deny-logger
+/// probe. Reading this value is strictly cheaper than re-running the
+/// healthcheck ourselves: Docker has already run it, applied the
+/// retry/debounce window, and cached the verdict.
+///
+/// `gateway_monitor` uses this enum as a first-pass signal — an
+/// `Unhealthy` verdict here means Docker has already observed `retries`
+/// consecutive failures and is the canonical "container unhealthy"
+/// signal the spec calls for (see the M10-S3 spec:
+/// *"Docker marks the container unhealthy. sandboxd's existing gateway
+/// health polling observes this and restarts the gateway container."*).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockerHealth {
+    /// Within the HEALTHCHECK `start-period` — Docker has not yet
+    /// produced a verdict. Callers should keep waiting rather than
+    /// interpreting this as failure.
+    Starting,
+    /// Docker's last HEALTHCHECK invocation succeeded.
+    Healthy,
+    /// Docker has seen `retries` consecutive HEALTHCHECK failures and
+    /// has flipped the container to unhealthy. This is the signal
+    /// `gateway_monitor` acts on to trigger a restart.
+    Unhealthy,
+    /// The container has no HEALTHCHECK configured, so Docker has no
+    /// opinion. Callers should fall back to their own probe (e.g.
+    /// `gateway_status`). The gateway image *does* configure a
+    /// HEALTHCHECK, so seeing this on a running gateway is unusual and
+    /// worth falling back on rather than treating as a verdict.
+    None,
+    /// The container does not exist, is not running, or `docker
+    /// inspect` failed in a way we cannot attribute to a specific
+    /// health state. Treat as "don't act on this" and fall back to
+    /// `gateway_status`, which has its own "not running" handling.
+    Unknown,
+}
+
+impl DockerHealth {
+    /// Parse the raw stdout of
+    /// `docker inspect --format '{{.State.Health.Status}}' <container>`.
+    ///
+    /// Docker emits one of `starting`, `healthy`, `unhealthy`, or
+    /// `<no value>` (when no HEALTHCHECK is configured) followed by a
+    /// newline. Older / edge cases may emit an empty string. Anything
+    /// we do not recognise maps to [`DockerHealth::Unknown`] so the
+    /// caller falls back to its own probe rather than acting on a
+    /// verdict we cannot interpret.
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim() {
+            "starting" => DockerHealth::Starting,
+            "healthy" => DockerHealth::Healthy,
+            "unhealthy" => DockerHealth::Unhealthy,
+            // `docker inspect` emits the literal string "<no value>"
+            // when the template field is missing (no HEALTHCHECK).
+            // Some Docker versions also just emit "none".
+            "none" | "<no value>" => DockerHealth::None,
+            "" => DockerHealth::Unknown,
+            _ => DockerHealth::Unknown,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -717,6 +784,53 @@ impl GatewayManager {
         match output {
             Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
             _ => "not_found".to_string(),
+        }
+    }
+
+    /// Read Docker's native per-container health verdict via
+    /// `docker inspect --format '{{.State.Health.Status}}' <container>`.
+    ///
+    /// This is the verdict Docker maintains from the container's
+    /// `HEALTHCHECK` directive (interval / timeout / retries / start-
+    /// period already applied). It is strictly cheaper than re-running
+    /// the healthcheck script from outside — Docker has already run it
+    /// on the inside.
+    ///
+    /// Callers should use this as a first-pass signal; the aggregate
+    /// [`GatewayStatus`] verdict (from [`Self::gateway_status`]) remains
+    /// authoritative for the full Healthy / Unhealthy / NotRunning
+    /// mapping (e.g. it also catches `.State.Running == false` without
+    /// a health directive). See [`DockerHealth`] for the individual
+    /// variants and how to react to each.
+    ///
+    /// This performs a single blocking `docker inspect` call. Async
+    /// callers must wrap this in `tokio::task::spawn_blocking` per
+    /// project conventions (it uses `std::process::Command`
+    /// internally).
+    pub fn container_health_status(&self, session_id: &SessionId) -> DockerHealth {
+        let container_name = container_name(session_id);
+
+        let output = run_with_timeout(
+            Command::new("docker").args([
+                "inspect",
+                "--format",
+                "{{.State.Health.Status}}",
+                &container_name,
+            ]),
+            DOCKER_INSPECT_TIMEOUT,
+            "docker inspect (container health)",
+        );
+
+        match output {
+            Ok(o) if o.status.success() => {
+                let raw = String::from_utf8_lossy(&o.stdout);
+                DockerHealth::parse(raw.as_ref())
+            }
+            // Container missing, inspect failed, or stderr-only output:
+            // we cannot attribute a verdict, so fall back to Unknown.
+            // Callers fall back to `gateway_status`, which has its own
+            // NotRunning handling.
+            _ => DockerHealth::Unknown,
         }
     }
 
@@ -1804,6 +1918,76 @@ mod tests {
             "deny-logger /health endpoint port :10003 must be admitted by \
              the input chain so HEALTHCHECK and sandboxd's component_health \
              probe succeed:\n{ruleset}"
+        );
+    }
+
+    // -- DockerHealth parser tests ------------------------------------------
+
+    #[test]
+    fn docker_health_parse_known_states() {
+        // The four verdicts Docker documents for `.State.Health.Status`.
+        // gateway_monitor's restart trigger keys off the Unhealthy
+        // variant, so each mapping is load-bearing.
+        assert_eq!(DockerHealth::parse("starting"), DockerHealth::Starting);
+        assert_eq!(DockerHealth::parse("healthy"), DockerHealth::Healthy);
+        assert_eq!(DockerHealth::parse("unhealthy"), DockerHealth::Unhealthy);
+        assert_eq!(DockerHealth::parse("none"), DockerHealth::None);
+    }
+
+    #[test]
+    fn docker_health_parse_strips_trailing_newline() {
+        // `docker inspect` appends a trailing newline to its output —
+        // if the parser does not trim whitespace, every real probe
+        // lands on the catch-all Unknown branch and the refinement is
+        // effectively dead. Exercise each verdict with the newline
+        // Docker actually emits.
+        assert_eq!(DockerHealth::parse("starting\n"), DockerHealth::Starting);
+        assert_eq!(DockerHealth::parse("healthy\n"), DockerHealth::Healthy);
+        assert_eq!(DockerHealth::parse("unhealthy\n"), DockerHealth::Unhealthy);
+        assert_eq!(DockerHealth::parse("none\n"), DockerHealth::None);
+    }
+
+    #[test]
+    fn docker_health_parse_no_healthcheck_configured() {
+        // When no HEALTHCHECK directive is set, Go's `text/template`
+        // renders the empty interface as the literal string
+        // "<no value>". Older Docker versions / edge cases may render
+        // as "none". Both must map to DockerHealth::None so the caller
+        // knows to fall back to its own probe rather than treating the
+        // missing verdict as a failure.
+        assert_eq!(
+            DockerHealth::parse("<no value>"),
+            DockerHealth::None,
+            "\"<no value>\" is Docker's render of an absent HEALTHCHECK \
+             and must map to DockerHealth::None, not Unknown — the gateway \
+             image ships with a HEALTHCHECK so this is unusual but defensible"
+        );
+        assert_eq!(DockerHealth::parse("<no value>\n"), DockerHealth::None);
+    }
+
+    #[test]
+    fn docker_health_parse_empty_and_malformed_map_to_unknown() {
+        // Empty output means the inspect call succeeded but produced
+        // nothing parseable (container gone between the `running`
+        // check and the health read, for instance). Malformed output
+        // from a future / unsupported Docker version must also fall
+        // through rather than silently mis-triggering a restart.
+        assert_eq!(DockerHealth::parse(""), DockerHealth::Unknown);
+        assert_eq!(DockerHealth::parse("\n"), DockerHealth::Unknown);
+        assert_eq!(DockerHealth::parse("   "), DockerHealth::Unknown);
+        assert_eq!(
+            DockerHealth::parse("HEALTHY"),
+            DockerHealth::Unknown,
+            "Docker emits the lowercase form; anything else is not the \
+             canonical verdict and must not be interpreted"
+        );
+        assert_eq!(DockerHealth::parse("up"), DockerHealth::Unknown);
+        assert_eq!(
+            DockerHealth::parse("unhealthy: deny-logger down"),
+            DockerHealth::Unknown,
+            "Docker does not append reasons to Health.Status — any \
+             adorned verdict is malformed and must fall through rather \
+             than matching the Unhealthy arm by prefix"
         );
     }
 }
