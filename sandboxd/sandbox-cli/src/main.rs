@@ -4010,4 +4010,426 @@ mod tests {
             "first missing id must win, got: {err}"
         );
     }
+
+    // -----------------------------------------------------------------
+    // `sandbox events` subcommand — Phase 4 of M10-S4.
+    //
+    // Coverage matrix (aligned with the implementation plan):
+    //
+    //   * `parse_since_rfc3339`   — accepts / rejects RFC 3339 input
+    //   * `parse_since_duration`  — accepts `Ns`/`Nm`/`Nh`/`Nd`, rejects
+    //                               garbage, rejects leading `-`
+    //   * `resolve_since`         — dispatches both branches, formats
+    //                               the result with millis + `Z`
+    //   * clap parsing            — repeatable flags, mutually
+    //                               exclusive `--json` / `--table`, and
+    //                               the missing-positional error
+    //   * `build_events_query_string` — deterministic ordering,
+    //                               percent-encoding, empty case
+    //   * `split_jsonl_lines`     — cross-chunk partial-tail buffering
+    //   * `format_table_row`      — happy path + `!`-prefix fallback
+    //                               for the `ring_buffer_lag` synthetic
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn events_parse_since_rfc3339_accepts_z_suffix() {
+        let ts = parse_since_rfc3339("2026-04-22T12:00:00Z").expect("z-form rfc3339");
+        assert_eq!(
+            ts.to_rfc3339_opts(SecondsFormat::Secs, true),
+            "2026-04-22T12:00:00Z"
+        );
+    }
+
+    #[test]
+    fn events_parse_since_rfc3339_rejects_garbage() {
+        let err = parse_since_rfc3339("garbage").expect_err("non-rfc3339 must fail");
+        assert!(err.contains("garbage"), "error must cite input: {err}");
+    }
+
+    #[test]
+    fn events_parse_since_duration_accepts_all_units() {
+        let now: DateTime<Utc> = "2026-04-22T12:00:00Z".parse().unwrap();
+        let cases = [
+            ("5s", 5_i64),
+            ("2m", 2 * 60),
+            ("3h", 3 * 60 * 60),
+            ("7d", 7 * 24 * 60 * 60),
+        ];
+        for (raw, secs) in cases {
+            let got = parse_since_duration(raw, now)
+                .unwrap_or_else(|e| panic!("duration `{raw}` must parse: {e}"));
+            let expected = now - chrono::Duration::seconds(secs);
+            assert_eq!(
+                got, expected,
+                "duration `{raw}`: want {expected}, got {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn events_parse_since_duration_accepts_zero() {
+        let now: DateTime<Utc> = "2026-04-22T12:00:00Z".parse().unwrap();
+        assert_eq!(parse_since_duration("0s", now).unwrap(), now);
+    }
+
+    #[test]
+    fn events_parse_since_duration_rejects_bad_inputs() {
+        let now: DateTime<Utc> = "2026-04-22T12:00:00Z".parse().unwrap();
+        // Leading `-` (negative number) — u64 parse rejects it.
+        assert!(
+            parse_since_duration("-5s", now).is_err(),
+            "negative prefix must not parse"
+        );
+        // Unknown unit.
+        assert!(
+            parse_since_duration("5x", now).is_err(),
+            "unknown unit `x` must not parse"
+        );
+        // Bare integer (no unit).
+        assert!(
+            parse_since_duration("5", now).is_err(),
+            "missing unit must not parse"
+        );
+        // Non-integer prefix.
+        assert!(
+            parse_since_duration("foo", now).is_err(),
+            "letters must not parse"
+        );
+        // Empty string.
+        assert!(
+            parse_since_duration("", now).is_err(),
+            "empty must not parse"
+        );
+    }
+
+    #[test]
+    fn events_resolve_since_rfc3339_branch_normalises_to_millis_z() {
+        let now: DateTime<Utc> = "2026-04-22T12:00:00Z".parse().unwrap();
+        // Even though the input is second-precision, the output must
+        // carry `.000` millis + `Z`.
+        let out = resolve_since("2026-04-22T08:30:00Z", now).unwrap();
+        assert_eq!(out, "2026-04-22T08:30:00.000Z");
+    }
+
+    #[test]
+    fn events_resolve_since_duration_branch_formats_as_rfc3339_millis_z() {
+        let now: DateTime<Utc> = "2026-04-22T12:00:00Z".parse().unwrap();
+        let out = resolve_since("5m", now).unwrap();
+        // 5 minutes earlier than `now`, rendered with `.000` millis + `Z`.
+        assert_eq!(out, "2026-04-22T11:55:00.000Z");
+    }
+
+    #[test]
+    fn events_resolve_since_errors_surface_to_caller() {
+        let now: DateTime<Utc> = "2026-04-22T12:00:00Z".parse().unwrap();
+        assert!(resolve_since("nonsense", now).is_err());
+        assert!(resolve_since("5x", now).is_err());
+    }
+
+    #[test]
+    fn events_parse_repeatable_layer_and_event() {
+        let cli = Cli::parse_from([
+            "sandbox",
+            "events",
+            "abc123",
+            "--layer",
+            "dns",
+            "--layer",
+            "envoy",
+            "--event",
+            "query_denied",
+        ]);
+        match cli.command {
+            Command::Events {
+                session,
+                layer,
+                event,
+                follow,
+                decision,
+                since,
+                json,
+                table,
+            } => {
+                assert_eq!(session, "abc123");
+                assert_eq!(layer, vec!["dns".to_string(), "envoy".to_string()]);
+                assert_eq!(event, vec!["query_denied".to_string()]);
+                assert!(!follow);
+                assert!(decision.is_none());
+                assert!(since.is_none());
+                assert!(!json);
+                assert!(!table);
+            }
+            other => panic!("expected Events, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn events_parse_follow_and_single_decision() {
+        let cli = Cli::parse_from(["sandbox", "events", "abc123", "--follow", "--decision=deny"]);
+        match cli.command {
+            Command::Events {
+                follow, decision, ..
+            } => {
+                assert!(follow);
+                assert_eq!(decision.as_deref(), Some("deny"));
+            }
+            other => panic!("expected Events, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn events_parse_since_shorthand() {
+        let cli = Cli::parse_from(["sandbox", "events", "abc123", "--since=5m"]);
+        match cli.command {
+            Command::Events { since, .. } => {
+                assert_eq!(since.as_deref(), Some("5m"));
+            }
+            other => panic!("expected Events, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn events_parse_json_and_table_are_mutually_exclusive() {
+        let err = Cli::try_parse_from(["sandbox", "events", "abc123", "--json", "--table"])
+            .expect_err("--json and --table must conflict");
+        // clap surfaces ArgGroup violations via `ErrorKind::ArgumentConflict`.
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn events_parse_missing_session_is_an_error() {
+        let err =
+            Cli::try_parse_from(["sandbox", "events"]).expect_err("missing positional must fail");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn events_build_query_string_empty_when_no_flags() {
+        let args = EventsArgs {
+            session: "abc".into(),
+            follow: false,
+            layers: vec![],
+            events: vec![],
+            decision: None,
+            since: None,
+            mode: EventsOutputMode::Json,
+        };
+        assert_eq!(build_events_query_string(&args), "");
+    }
+
+    #[test]
+    fn events_build_query_string_only_emits_follow_when_set() {
+        let args = EventsArgs {
+            session: "abc".into(),
+            follow: false,
+            layers: vec!["dns".into()],
+            events: vec![],
+            decision: None,
+            since: None,
+            mode: EventsOutputMode::Json,
+        };
+        // follow=false must NOT appear on the wire (server default).
+        assert_eq!(build_events_query_string(&args), "layer=dns");
+    }
+
+    #[test]
+    fn events_build_query_string_full_combo_is_deterministic() {
+        let args = EventsArgs {
+            session: "abc".into(),
+            follow: true,
+            layers: vec!["dns".into(), "deny-logger".into()],
+            events: vec!["query_denied".into(), "deny".into()],
+            decision: Some("deny".into()),
+            since: Some("2026-04-22T12:00:00.000Z".into()),
+            mode: EventsOutputMode::Table,
+        };
+        let qs = build_events_query_string(&args);
+        // Input order is preserved per-axis; axes interleave in
+        // follow/layer/event/decision/since order.
+        assert_eq!(
+            qs,
+            concat!(
+                "follow=true",
+                "&layer=dns",
+                "&layer=deny-logger",
+                "&event=query_denied",
+                "&event=deny",
+                "&decision=deny",
+                "&since=2026-04-22T12%3A00%3A00.000Z",
+            )
+        );
+    }
+
+    #[test]
+    fn events_percent_encode_covers_reserved_chars() {
+        // `:` must be `%3A` (rfc3339 timestamps) — the critical case.
+        assert_eq!(percent_encode_query_value("a:b"), "a%3Ab");
+        // `&` and `=` must be escaped too.
+        assert_eq!(percent_encode_query_value("a&b=c"), "a%26b%3Dc");
+        // Unreserved characters pass through.
+        assert_eq!(percent_encode_query_value("deny-logger"), "deny-logger");
+        assert_eq!(percent_encode_query_value("query_denied"), "query_denied");
+    }
+
+    #[test]
+    fn events_split_jsonl_lines_handles_cross_chunk_split() {
+        // Simulate the body arriving as two frames. The server sends
+        // one-line-per-frame in the happy path, but chunked transfer
+        // may slice any line at any byte boundary.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"{\"a\":1}\n{\"b\":");
+        let lines = split_jsonl_lines(&mut buf);
+        assert_eq!(lines, vec!["{\"a\":1}".to_string()]);
+        // The partial `{"b":` must stay in the buffer for the next chunk.
+        assert_eq!(buf.as_slice(), b"{\"b\":");
+
+        // Second chunk completes the second line and adds a third.
+        buf.extend_from_slice(b"2}\n{\"c\":3}");
+        let lines = split_jsonl_lines(&mut buf);
+        assert_eq!(lines, vec!["{\"b\":2}".to_string()]);
+        // No trailing newline — `{"c":3}` stays buffered.
+        assert_eq!(buf.as_slice(), b"{\"c\":3}");
+    }
+
+    #[test]
+    fn events_split_jsonl_lines_returns_empty_on_no_newline() {
+        let mut buf: Vec<u8> = b"partial".to_vec();
+        let lines = split_jsonl_lines(&mut buf);
+        assert!(lines.is_empty());
+        assert_eq!(buf.as_slice(), b"partial");
+    }
+
+    #[test]
+    fn events_split_jsonl_lines_handles_multiple_lines_in_one_chunk() {
+        let mut buf: Vec<u8> = b"{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n".to_vec();
+        let lines = split_jsonl_lines(&mut buf);
+        assert_eq!(
+            lines,
+            vec![
+                "{\"a\":1}".to_string(),
+                "{\"b\":2}".to_string(),
+                "{\"c\":3}".to_string(),
+            ]
+        );
+        assert!(
+            buf.is_empty(),
+            "buffer must be drained when input ends in `\\n`"
+        );
+    }
+
+    #[test]
+    fn events_format_table_header_has_all_columns() {
+        let h = format_table_header();
+        for col in ["TIME", "SESSION", "LAYER", "EVENT", "HOST:PORT", "DETAIL"] {
+            assert!(h.contains(col), "header missing `{col}`: {h}");
+        }
+    }
+
+    #[test]
+    fn events_format_table_row_for_dns_query_denied() {
+        // Build a DNS deny event via the canonical wire shape.
+        let line = serde_json::json!({
+            "layer": "dns",
+            "timestamp": "2026-04-22T12:00:00.500Z",
+            "session": "abc12345-feed-dead-beef-cafebabe0000",
+            "event": "query_denied",
+            "query": "example.com",
+            "qtype": "A",
+            "reason": "no_matching_rule",
+        })
+        .to_string();
+
+        let row = format_table_row(&line, false);
+        assert!(row.contains("2026-04-22T12:00:00.500Z"), "time col: {row}");
+        assert!(
+            row.contains("abc12345"),
+            "session col truncated to 8: {row}"
+        );
+        assert!(row.contains("dns"), "layer col: {row}");
+        assert!(row.contains("query_denied"), "event col: {row}");
+        assert!(row.contains("example.com"), "host col uses query: {row}");
+        assert!(
+            row.contains("reason=no_matching_rule"),
+            "detail includes reason: {row}"
+        );
+        assert!(
+            row.contains("decision=deny"),
+            "detail tags the decision: {row}"
+        );
+        // No ANSI when colorize=false even for deny rows.
+        assert!(
+            !row.contains("\x1b["),
+            "non-tty path must not inject ANSI escapes: {row}"
+        );
+    }
+
+    #[test]
+    fn events_format_table_row_colorises_deny_rows_when_tty() {
+        let line = serde_json::json!({
+            "layer": "dns",
+            "timestamp": "2026-04-22T12:00:00.500Z",
+            "session": "abc12345-feed-dead-beef-cafebabe0000",
+            "event": "query_denied",
+            "query": "example.com",
+            "qtype": "A",
+            "reason": "no_matching_rule",
+        })
+        .to_string();
+
+        let row = format_table_row(&line, true);
+        assert!(
+            row.starts_with("\x1b[31m"),
+            "deny row must start with red ANSI: {row:?}"
+        );
+        assert!(
+            row.ends_with("\x1b[0m"),
+            "deny row must end with reset ANSI: {row:?}"
+        );
+    }
+
+    #[test]
+    fn events_format_table_row_does_not_colorise_allow_rows() {
+        let line = serde_json::json!({
+            "layer": "dns",
+            "timestamp": "2026-04-22T12:00:00.500Z",
+            "session": "abc12345",
+            "event": "query_allowed",
+            "query": "example.com",
+            "qtype": "A",
+            "resolved_ips": ["203.0.113.1"],
+        })
+        .to_string();
+
+        let row = format_table_row(&line, true);
+        // Allow rows must not wrap in ANSI regardless of colorize flag.
+        assert!(
+            !row.contains("\x1b["),
+            "allow row must not carry ANSI even with colorize=true: {row:?}"
+        );
+    }
+
+    #[test]
+    fn events_format_table_row_falls_back_to_bang_prefix_for_unparseable() {
+        // `lifecycle.ring_buffer_lag` is a streaming-only synthetic whose
+        // shape does not match `EventDto` (no `body` tagged-union wire
+        // form). The CLI must print the raw line prefixed with `!` rather
+        // than dropping it.
+        let raw = r#"{"layer":"lifecycle","event":"ring_buffer_lag","skipped":3,"timestamp":"2026-04-22T12:00:00.500Z"}"#;
+        let row = format_table_row(raw, false);
+        assert!(
+            row.starts_with("! "),
+            "unparseable fallback must start with `! `: {row}"
+        );
+        assert!(
+            row.contains(raw),
+            "fallback carries the raw line verbatim: {row}"
+        );
+    }
+
+    #[test]
+    fn events_format_table_row_bang_prefix_for_empty_or_garbage() {
+        assert_eq!(format_table_row("", false), "! ");
+        let garbage = "not json at all";
+        assert_eq!(format_table_row(garbage, false), format!("! {garbage}"));
+    }
 }
