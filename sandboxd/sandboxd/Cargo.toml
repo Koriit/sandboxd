@@ -19,6 +19,7 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+chrono.workspace = true
 refinery.workspace = true
 rusqlite.workspace = true
 tempfile.workspace = true
