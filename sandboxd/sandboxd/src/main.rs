@@ -12,6 +12,7 @@ use axum::{
 };
 use clap::Parser;
 use sandbox_core::events::lifecycle as lifecycle_events;
+use sandbox_core::events::session_events_host_dir;
 use sandbox_core::gateway::container_name as gateway_container_name;
 use sandbox_core::{
     ApiError, AssuranceLevel, BaseImageStatus, CaManager, CoreDnsConfig, CreateSessionRequest,
@@ -20,9 +21,10 @@ use sandbox_core::{
     GatewayShutdownReason, GatewayStatus, GuestConnector, GuestRequest, GuestResponse,
     HealthComponent, LimaManager, NetworkHealth, NetworkManager, Policy, PolicyApplyStatus,
     PolicyCompiler, PolicyDistributor, SandboxError, Session, SessionConfig, SessionDto,
-    SessionHealth, SessionId, SessionState, SessionStore, UpdatePolicyRequest, VmIpSessionMap,
-    VmStatus, attach_vm_to_bridge, detach_vm_from_bridge, generate_ca_inject_script,
-    mac_from_session_id, propagate_dns_changes, read_resolved_json, write_file_to_container,
+    SessionHealth, SessionId, SessionIngestor, SessionState, SessionStore, UpdatePolicyRequest,
+    VmIpSessionMap, VmStatus, attach_vm_to_bridge, detach_vm_from_bridge,
+    generate_ca_inject_script, mac_from_session_id, propagate_dns_changes, read_resolved_json,
+    write_file_to_container,
 };
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
@@ -198,6 +200,17 @@ struct AppState {
     /// components are recorded as `false` so the first healthy poll
     /// publishes `health_restored`.
     component_health_state: Mutex<HashMap<SessionId, HashMap<HealthComponent, bool>>>,
+    /// Per-session JSONL ingest tasks (M10-S2 Phase 7).
+    ///
+    /// Each [`SessionIngestor`] tails `envoy.jsonl` / `coredns.jsonl` /
+    /// `mitmproxy.jsonl` under [`session_events_host_dir`] and publishes
+    /// parsed [`sandbox_core::Event::Traffic`] records onto
+    /// [`AppState::event_bus`] after stamping the owning session via
+    /// [`AppState::vm_ip_map`]. Spawned after every successful
+    /// `create_gateway` / `restart_gateway`; aborted on stop, remove, and
+    /// gateway teardown. Keyed by session ID so a gateway bounce can
+    /// abort-and-respawn without leaking the previous ingestor.
+    ingestors: Mutex<HashMap<SessionId, SessionIngestor>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1204,6 +1217,11 @@ async fn stop_session(
         None,
     ));
 
+    // Abort the JSONL ingestor before the gateway container stops so
+    // its inotify watch and tailer file handles are released cleanly.
+    // No-op if none was ever spawned for this session.
+    abort_session_ingestor(&session.id, &state).await;
+
     // Tear down networking resources (TAP, gateway, Docker network) before
     // stopping the VM. The network_info is kept in the DB so `start` can
     // recreate everything. The subnet remains allocated in the
@@ -1308,6 +1326,12 @@ async fn remove_session(
             None,
         ));
     }
+
+    // Abort the JSONL ingestor before the gateway container disappears
+    // so its inotify watch and tailer file handles are released.
+    // No-op if none was ever spawned for this session (e.g., a session
+    // whose networking setup failed mid-way).
+    abort_session_ingestor(&session.id, &state).await;
 
     // Delete VM from Lima, then full network teardown.
     // All of these are best-effort blocking calls.
@@ -2204,6 +2228,64 @@ async fn prewarm_guest_dns(guest: &GuestConnector, session_id: &SessionId, host:
     tokio::time::sleep(Duration::from_secs(3)).await;
 }
 
+/// Spawn (or re-spawn) the session's JSONL ingest task.
+///
+/// Called after every successful `create_gateway` / `restart_gateway` so
+/// the tailers catch up with any records the three in-container producers
+/// (Envoy access log, CoreDNS plugin, mitmproxy addon) have already
+/// appended. Any previously-spawned ingestor for this session is aborted
+/// first, so a gateway bounce cleanly reseats the watcher and tailers —
+/// on fresh boot and on crash recovery alike.
+///
+/// The events directory is created eagerly (it is the bind-mount target
+/// used by `GatewayManager::create_gateway`) so the notify watcher has a
+/// path to watch even when no JSONL has been appended yet.
+async fn spawn_session_ingestor(session_id: &SessionId, state: &AppState) {
+    let events_dir = session_events_host_dir(session_id);
+    if let Err(e) = tokio::fs::create_dir_all(&events_dir).await {
+        warn!(
+            session_id = %session_id,
+            events_dir = %events_dir.display(),
+            error = %e,
+            "failed to create session events directory; ingestor not spawned"
+        );
+        return;
+    }
+
+    let ingestor = SessionIngestor::spawn(
+        *session_id,
+        events_dir,
+        state.event_bus.clone(),
+        state.vm_ip_map.clone(),
+    );
+
+    let previous = {
+        let mut ingestors = state.ingestors.lock().await;
+        ingestors.insert(*session_id, ingestor)
+    };
+    if let Some(prev) = previous {
+        // A prior ingestor was running (e.g., gateway recovered after a
+        // crash). Abort it so file handles and the inotify watch are
+        // released — the new ingestor already owns the directory.
+        prev.abort();
+    }
+}
+
+/// Abort the session's JSONL ingest task, if one is running.
+///
+/// Called on every path that tears the gateway down (stop, remove,
+/// `teardown_session_networking`, reconciliation cleanup). No-op when no
+/// ingestor is tracked for the session, so redundant calls are safe.
+async fn abort_session_ingestor(session_id: &SessionId, state: &AppState) {
+    let ingestor = {
+        let mut ingestors = state.ingestors.lock().await;
+        ingestors.remove(session_id)
+    };
+    if let Some(ingestor) = ingestor {
+        ingestor.abort();
+    }
+}
+
 /// Set up remaining networking for a new session.
 ///
 /// The Docker bridge network and CA certificate are created before the VM
@@ -2288,9 +2370,20 @@ async fn setup_session_networking(
         .event_bus
         .publish(lifecycle_events::gateway_ready(*session_id));
 
+    // Start the per-session JSONL ingest task now that the events
+    // directory has been bind-mounted into the container and the
+    // producers are live. Tailers seek to EOF on spawn, so any lines
+    // the producers have already written during readiness polling are
+    // skipped (they were not attributable to a live subscriber anyway).
+    spawn_session_ingestor(session_id, state).await;
+
     // 2. Configure the bridge NIC inside the VM (already present from boot).
     if let Err(e) = attach_vm_to_bridge(session_id, network_info, &state.guest).await {
-        // Roll back gateway on attach failure.
+        // Roll back gateway on attach failure. Abort the ingestor first
+        // so it releases its inotify watch on the events directory; the
+        // container is about to go away and no further events are
+        // attributable to this session.
+        abort_session_ingestor(session_id, state).await;
         let gw = state.gateway.clone();
         let sid = *session_id;
         let _ = tokio::task::spawn_blocking(move || gw.stop_gateway(&sid)).await;
@@ -2317,6 +2410,12 @@ async fn setup_session_networking(
 /// start.
 async fn teardown_session_networking(session_id: &SessionId, state: &AppState) {
     debug!(session_id = %session_id, "tearing down session networking (preserving allocation)");
+    // Abort the JSONL ingestor first so its inotify watch and file
+    // handles are released before the gateway container disappears.
+    // No-op when no ingestor is tracked (e.g., the gateway never
+    // finished starting).
+    abort_session_ingestor(session_id, state).await;
+
     // Blocking Docker calls (stop_gateway, remove_docker_network) are
     // wrapped in spawn_blocking to avoid stalling the Tokio runtime.
     let gateway = state.gateway.clone();
@@ -2518,6 +2617,12 @@ async fn restore_session_networking(
         .event_bus
         .publish(lifecycle_events::gateway_ready(*session_id));
 
+    // Start the per-session JSONL ingest task now that the fresh
+    // gateway is up. Tailers seek to EOF so pre-restart records (from
+    // a dead gateway) are not re-ingested; only events produced by the
+    // restored gateway are attributed.
+    spawn_session_ingestor(session_id, state).await;
+
     // 2b. Re-apply the session's policy to the fresh gateway container.
     // If a policy is stored, compile and distribute it to the running
     // gateway.  If no policy is stored, the allow-all was already written
@@ -2526,7 +2631,10 @@ async fn restore_session_networking(
 
     // 3. Configure the bridge NIC inside the VM (already present from boot).
     if let Err(e) = attach_vm_to_bridge(session_id, &network_info, &state.guest).await {
-        // Roll back gateway and Docker network on attach failure.
+        // Roll back gateway and Docker network on attach failure. Abort
+        // the ingestor first so its inotify watch is released before
+        // the events directory is left without a producer.
+        abort_session_ingestor(session_id, state).await;
         let gw = state.gateway.clone();
         let net = state.network.clone();
         let sid = *session_id;
@@ -3013,6 +3121,11 @@ async fn reconcile_networking(state: &AppState) {
                                     session_id = %session.id,
                                     "network reconciliation: gateway restarted"
                                 );
+                                // Spawn (or reseat) the ingestor for the
+                                // freshly-restarted gateway before re-applying
+                                // policy — the latter can produce Envoy
+                                // connection records on startup.
+                                spawn_session_ingestor(&session.id, state).await;
                                 // Re-apply the session's policy to the fresh gateway.
                                 reapply_session_policy(&session.id, state).await;
                                 restored += 1;
@@ -3333,6 +3446,13 @@ async fn gateway_monitor(state: Arc<AppState>) {
                                 session_id = %session.id,
                                 "gateway monitor: gateway recovered successfully"
                             );
+                            // Spawn (or reseat) the JSONL ingestor for the
+                            // recovered gateway. `spawn_session_ingestor`
+                            // aborts any prior ingestor first, so a stale
+                            // watch on the pre-crash container's events
+                            // directory is released here rather than
+                            // leaking until daemon exit.
+                            spawn_session_ingestor(&session.id, &state).await;
                             // Re-apply the session's policy to the fresh gateway.
                             reapply_session_policy(&session.id, &state).await;
                         }
@@ -3500,6 +3620,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         event_bus,
         vm_ip_map,
         component_health_state: Mutex::new(HashMap::new()),
+        ingestors: Mutex::new(HashMap::new()),
     });
 
     // Replay one `policy_reset_on_upgrade` lifecycle event per
