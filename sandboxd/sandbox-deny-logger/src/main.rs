@@ -25,8 +25,15 @@
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
+use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::Parser;
+
+mod event;
+mod tcp;
+
+use event::EventEmitter;
 
 /// CLI arguments for the deny-logger binary.
 ///
@@ -93,7 +100,7 @@ struct Args {
     conn_cap: u32,
 }
 
-fn main() {
+fn main() -> ExitCode {
     // Tracing subscriber on stderr — deny events go to `--event-path`
     // (JSONL); tracing logs are operator-facing and kept separate per
     // spec Part 3 / "Listener design" ("structured JSONL").
@@ -117,6 +124,42 @@ fn main() {
         "starting sandbox-deny-logger",
     );
 
-    // Runtime + listener wiring lands in follow-up commits.
-    tracing::warn!("deny-logger scaffold — listeners not yet wired");
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(err) => {
+            tracing::error!(error = %err, "tokio runtime build failed");
+            return ExitCode::from(1);
+        }
+    };
+
+    match runtime.block_on(run(args)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            tracing::error!(error = %err, "deny-logger exiting with error");
+            ExitCode::from(1)
+        }
+    }
+}
+
+async fn run(args: Args) -> std::io::Result<()> {
+    let emitter = Arc::new(EventEmitter::open(&args.event_path)?);
+
+    let tcp_listener = tcp::bind(args.bind_ip, args.tcp_port).await?;
+    tracing::info!(port = args.tcp_port, "tcp listener bound");
+
+    let tcp_emitter = Arc::clone(&emitter);
+    let tcp_task = tokio::spawn(async move {
+        if let Err(err) = tcp::run(tcp_listener, tcp_emitter).await {
+            tracing::error!(error = %err, "tcp listener exited with error");
+        }
+    });
+
+    // UDP + health listeners land in follow-up commits.
+    tcp_task
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    Ok(())
 }
