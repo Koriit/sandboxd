@@ -7,6 +7,13 @@ rust-version.workspace = true
 
 [dependencies]
 axum.workspace = true
+# M10-S4 Phase 2: `axum-extra::extract::Query` supports repeatable
+# query-string parameters (`?layer=a&layer=b` → `Vec<_>`).  The axum 0.8
+# built-in `Query` extractor delegates to `serde_urlencoded`, which fails
+# outright on repeated keys for `Vec<String>` fields; the `query` feature
+# here pulls in `serde_html_form` which does the right thing.  Version
+# tracks the axum 0.8 family (axum-extra 0.10.x).
+axum-extra = { version = "0.10", features = ["query"] }
 clap.workspace = true
 ring.workspace = true
 sandbox-core.workspace = true
