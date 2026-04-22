@@ -23,4 +23,9 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# axum provides the minimal HTTP/1.1 server used by the binary-level
+# regression test in `tests/events_binary.rs` to pin the `sandbox events`
+# (non-follow) process exit behavior. See the `Connection: close` +
+# drop-order fix in `src/main.rs::stream_events_to_stdout`.
+axum.workspace = true
 tempfile.workspace = true
