@@ -1776,10 +1776,18 @@ async fn stream_events_to_stdout(socket_path: &str, args: &EventsArgs) -> Result
     } else {
         format!("/sessions/{}/events?{}", args.session, qs)
     };
+    // `connection: close` asks the server to close the TCP/Unix socket
+    // after the response body ends. Combined with dropping the request
+    // machinery before awaiting the hyper conn driver (see the end of
+    // this function), it guarantees that non-follow `sandbox events`
+    // exits promptly once the daemon finishes streaming. Without it,
+    // the default HTTP/1.1 keep-alive leaves the driver idling for a
+    // next request that never arrives. See the Phase 6b fix for M10-S4.
     let req = Request::builder()
         .method("GET")
         .uri(&uri)
         .header("accept", "application/jsonl")
+        .header("connection", "close")
         .body(String::new())
         .expect("failed to build events request");
 
@@ -1917,8 +1925,18 @@ async fn stream_events_to_stdout(socket_path: &str, args: &EventsArgs) -> Result
         .flush()
         .await
         .map_err(|e| format!("stdout flush failed: {e}"))?;
-    // The connection driver completes naturally when the body ends;
-    // awaiting it here drains any lingering state cleanly.
+    // Drop the response body and the request sender *before* awaiting
+    // the hyper connection driver. Hyper's HTTP/1.1 driver only
+    // returns once both ends of the conversation signal they are done
+    // — on the client side, that means the sender is dropped and no
+    // response body is still borrowed. If we await the driver while
+    // `sender`/`response` are still alive, keep-alive semantics leave
+    // the driver idling for a next request that never arrives and the
+    // await never returns. Paired with `connection: close` on the
+    // outgoing request (see request builder above) this makes the
+    // shutdown robust across hyper minor versions.
+    drop(response);
+    drop(sender);
     let _ = conn_task.await;
     Ok(())
 }
