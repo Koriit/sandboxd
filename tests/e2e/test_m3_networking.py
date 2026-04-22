@@ -25,11 +25,49 @@ import pytest
 from conftest import (
     _VM_RESOURCE_ARGS,
     capture_lima_logs,
+    cleanup_policy_file,
     gateway_container_name,
     lima_vm_name,
     parse_session_id,
     wait_for_state,
+    write_policy_file,
 )
+
+
+def _networking_smoke_policy_file() -> str:
+    """Write a minimal v2 policy covering the hosts these M3 networking
+    tests nslookup / curl from inside the VM, and return the file path.
+
+    M10-S1 removed the ``--unrestricted`` discovery escape hatch; tests
+    that previously used it to get "any working session" must now carry
+    an explicit allow-list. These tests do not assert on policy
+    enforcement — they exercise the gateway container, second NIC, DNS
+    interception path, stop/start persistence, and gateway crash
+    recovery. They need the DNS allow-list to let ``nslookup
+    google.com`` and ``nslookup example.com`` resolve so the DNS-plane
+    assertions don't fall back to NXDOMAIN. No :80 / :443 traffic
+    leaves the VM in these tests, so transport-level rules on :443/tcp
+    are sufficient — they seed CoreDNS's allow list without opening any
+    L7 path.
+    """
+    policy = {
+        "version": "2.0.0",
+        "rules": [
+            {
+                "host": "google.com",
+                "port": 443,
+                "protocol": "tcp",
+                "level": "transport",
+            },
+            {
+                "host": "example.com",
+                "port": 443,
+                "protocol": "tcp",
+                "level": "transport",
+            },
+        ],
+    }
+    return write_policy_file(policy)
 
 # ---------------------------------------------------------------------------
 # Helpers (file-specific)
@@ -85,11 +123,14 @@ def test_gateway_traffic_flow(sandbox_cli):
     gateway container running, VM has second NIC, can ping gateway, DNS works.
     """
     session_id = None
+    policy_path = None
     try:
-        # 1. Create a session.
+        # 1. Create a session with a minimal v2 policy (post-M10-S1
+        #    replacement for the legacy --unrestricted flag).
+        policy_path = _networking_smoke_policy_file()
         result = sandbox_cli(
             "create", "--name", "net-flow-test", *_VM_RESOURCE_ARGS,
-            "--unrestricted",
+            "--policy", policy_path,
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -171,6 +212,8 @@ def test_gateway_traffic_flow(sandbox_cli):
     finally:
         if session_id is not None:
             sandbox_cli("rm", "net-flow-test", timeout=120)
+        if policy_path is not None:
+            cleanup_policy_file(policy_path)
 
 
 @pytest.mark.timeout(600)
@@ -308,11 +351,14 @@ def test_dns_interception(sandbox_cli):
     gateway container to confirm the query was intercepted.
     """
     session_id = None
+    policy_path = None
     try:
-        # 1. Create a session.
+        # 1. Create a session with a minimal v2 policy (post-M10-S1
+        #    replacement for the legacy --unrestricted flag).
+        policy_path = _networking_smoke_policy_file()
         result = sandbox_cli(
             "create", "--name", "net-dns-test", *_VM_RESOURCE_ARGS,
-            "--unrestricted",
+            "--policy", policy_path,
             timeout=600,
         )
         assert result.returncode == 0, (

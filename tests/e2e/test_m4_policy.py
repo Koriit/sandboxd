@@ -141,7 +141,7 @@ def test_level0_denied(sandbox_cli):
     policy_path = None
     try:
         # Create a policy with no rules (deny-all default).
-        policy = {"version": "1.0.0", "rules": []}
+        policy = {"version": "2.0.0", "rules": []}
         policy_path = write_policy_file(policy)
 
         # Create session with the empty policy.
@@ -198,16 +198,21 @@ def test_level0_denied(sandbox_cli):
 
 @pytest.mark.timeout(600)
 def test_level1_transport_tcp(sandbox_cli):
-    """Policy allows example.com at level 'transport'. curl http://example.com
+    """Policy allows example.com:80/tcp at level 'transport'. curl http://example.com
     should succeed via opaque TCP passthrough.
     """
     session_id = None
     policy_path = None
     try:
         policy = {
-            "version": "1.0.0",
+            "version": "2.0.0",
             "rules": [
-                {"destination": "example.com", "level": "transport"},
+                {
+                    "host": "example.com",
+                    "port": 80,
+                    "protocol": "tcp",
+                    "level": "transport",
+                },
             ],
         }
         policy_path = write_policy_file(policy)
@@ -265,14 +270,25 @@ def test_level1_transport_udp(sandbox_cli):
     session_id = None
     policy_path = None
     try:
+        # M10-S1 v2: DNS uses UDP/53. example.com needs its own rule so
+        # CoreDNS resolves it (DNS allow-list is keyed on rule.host).
+        # All :53 traffic is DNAT'd to CoreDNS regardless of target IP,
+        # but the policy must still carry an (ip, 53, udp) allow for
+        # completeness; the test asserts nslookup to 8.8.8.8 resolves.
         policy = {
-            "version": "1.0.0",
+            "version": "2.0.0",
             "rules": [
-                {"destination": "example.com", "level": "transport"},
                 {
-                    "destination": "8.8.8.8",
-                    "level": "transport",
+                    "host": "example.com",
+                    "port": 53,
                     "protocol": "udp",
+                    "level": "transport",
+                },
+                {
+                    "host": "8.8.8.8",
+                    "port": 53,
+                    "protocol": "udp",
+                    "level": "transport",
                 },
             ],
         }
@@ -329,9 +345,14 @@ def test_level2_tls_verified(sandbox_cli):
     policy_path = None
     try:
         policy = {
-            "version": "1.0.0",
+            "version": "2.0.0",
             "rules": [
-                {"destination": "example.com", "level": "tls"},
+                {
+                    "host": "example.com",
+                    "port": 443,
+                    "protocol": "tcp",
+                    "level": "tls",
+                },
             ],
         }
         policy_path = write_policy_file(policy)
@@ -421,10 +442,12 @@ def test_level3_http_inspected(sandbox_cli):
     policy_path = None
     try:
         policy = {
-            "version": "1.0.0",
+            "version": "2.0.0",
             "rules": [
                 {
-                    "destination": "example.com",
+                    "host": "example.com",
+                    "port": 443,
+                    "protocol": "tcp",
                     "level": "http",
                     "http_filters": [{"method": "ANY", "path": "/*"}],
                 },
@@ -698,10 +721,12 @@ def test_level3_host_mismatch(sandbox_cli):
     policy_path = None
     try:
         policy = {
-            "version": "1.0.0",
+            "version": "2.0.0",
             "rules": [
                 {
-                    "destination": "api.github.com",
+                    "host": "api.github.com",
+                    "port": 443,
+                    "protocol": "tcp",
                     "level": "http",
                     "http_filters": [{"method": "ANY", "path": "/*"}],
                 },
@@ -763,10 +788,12 @@ def test_level3_method_restriction(sandbox_cli):
     policy_path = None
     try:
         policy = {
-            "version": "1.0.0",
+            "version": "2.0.0",
             "rules": [
                 {
-                    "destination": "httpbin.org",
+                    "host": "httpbin.org",
+                    "port": 443,
+                    "protocol": "tcp",
                     "level": "http",
                     "http_filters": [{"method": "GET", "path": "/*"}],
                 },
@@ -843,10 +870,12 @@ def test_level3_path_restriction(sandbox_cli):
     policy_path = None
     try:
         policy = {
-            "version": "1.0.0",
+            "version": "2.0.0",
             "rules": [
                 {
-                    "destination": "httpbin.org",
+                    "host": "httpbin.org",
+                    "port": 443,
+                    "protocol": "tcp",
                     "level": "http",
                     "http_filters": [{"method": "ANY", "path": "/api/*"}],
                 },
@@ -943,10 +972,12 @@ def test_l3_fail_closed_before_dns_propagation(sandbox_cli):
     policy_path = None
     try:
         policy = {
-            "version": "1.0.0",
+            "version": "2.0.0",
             "rules": [
                 {
-                    "destination": "example.com",
+                    "host": "example.com",
+                    "port": 443,
+                    "protocol": "tcp",
                     "level": "http",
                     "http_filters": [{"method": "ANY", "path": "/*"}],
                 },
@@ -1092,11 +1123,16 @@ def test_policy_update(sandbox_cli):
     policy_path_1 = None
     policy_path_2 = None
     try:
-        # Initial policy: allow example.com at transport level.
+        # Initial policy: allow example.com:80/tcp at transport level.
         policy_1 = {
-            "version": "1.0.0",
+            "version": "2.0.0",
             "rules": [
-                {"destination": "example.com", "level": "transport"},
+                {
+                    "host": "example.com",
+                    "port": 80,
+                    "protocol": "tcp",
+                    "level": "transport",
+                },
             ],
         }
         policy_path_1 = write_policy_file(policy_1)
@@ -1129,11 +1165,16 @@ def test_policy_update(sandbox_cli):
             f"stdout: {curl_result.stdout}"
         )
 
-        # Update policy: allow httpbin.org instead of example.com.
+        # Update policy: allow httpbin.org:80/tcp instead of example.com.
         policy_2 = {
-            "version": "1.0.0",
+            "version": "2.0.0",
             "rules": [
-                {"destination": "httpbin.org", "level": "transport"},
+                {
+                    "host": "httpbin.org",
+                    "port": 80,
+                    "protocol": "tcp",
+                    "level": "transport",
+                },
             ],
         }
         policy_path_2 = write_policy_file(policy_2)
@@ -1198,9 +1239,14 @@ def test_dns_nxdomain(sandbox_cli):
     policy_path = None
     try:
         policy = {
-            "version": "1.0.0",
+            "version": "2.0.0",
             "rules": [
-                {"destination": "example.com", "level": "transport"},
+                {
+                    "host": "example.com",
+                    "port": 80,
+                    "protocol": "tcp",
+                    "level": "transport",
+                },
             ],
         }
         policy_path = write_policy_file(policy)
@@ -1260,9 +1306,14 @@ def test_dns_ip_propagation(sandbox_cli):
     policy_path = None
     try:
         policy = {
-            "version": "1.0.0",
+            "version": "2.0.0",
             "rules": [
-                {"destination": "example.com", "level": "transport"},
+                {
+                    "host": "example.com",
+                    "port": 80,
+                    "protocol": "tcp",
+                    "level": "transport",
+                },
             ],
         }
         policy_path = write_policy_file(policy)
@@ -1411,102 +1462,14 @@ def test_empty_policy_denies_dns(sandbox_cli):
             sandbox_cli("rm", "pol-empty-default", timeout=120)
 
 
-@pytest.mark.timeout(600)
-def test_unrestricted_allows_and_logs(sandbox_cli):
-    """`sandbox create --unrestricted` should allow arbitrary HTTP traffic while
-    still being proxied through mitmproxy (so requests are logged).
-    """
-    session_id = None
-    try:
-        result = sandbox_cli(
-            "create", "--name", "pol-unrestricted",
-            *_VM_RESOURCE_ARGS, "--unrestricted",
-            timeout=600,
-        )
-        assert result.returncode == 0, (
-            f"sandbox create --unrestricted failed (rc={result.returncode}).\n"
-            f"stdout: {result.stdout}\nstderr: {result.stderr}"
-        )
-        session_id = parse_session_id(result.stdout)
-        wait_for_state(sandbox_cli, "pol-unrestricted", "Running", timeout=10)
-
-        # describe should render the sentinel line.
-        describe_result = sandbox_cli(
-            "describe", "pol-unrestricted",
-            timeout=60,
-        )
-        assert describe_result.returncode == 0, (
-            f"sandbox describe failed (rc={describe_result.returncode}).\n"
-            f"stdout: {describe_result.stdout}\nstderr: {describe_result.stderr}"
-        )
-        assert "unrestricted (logged)" in describe_result.stdout, (
-            f"describe output missing 'unrestricted (logged)' sentinel.\n"
-            f"stdout: {describe_result.stdout}"
-        )
-
-        # Warm DNS cache: the first lookup seeds the daemon's DNS propagation
-        # loop, which then rewrites Envoy's L3 listener file to add a filter
-        # chain matching the resolved example.com IPs.  Envoy observes the
-        # listener rewrite via filesystem xDS (LDS) and starts tunneling
-        # matching TCP connections to mitmproxy over CONNECT.  Until the
-        # listener is rewritten there is no chain matching the resolved IPs,
-        # so mitmproxy would never see the request and the log assertion
-        # below would fail.
-        sandbox_cli(
-            "ssh", "pol-unrestricted", "--",
-            "nslookup", "example.com",
-            timeout=60,
-        )
-        # DNS propagation loop polls every ~2s; sleep a bit longer to let the
-        # Envoy listener rewrite land.
-        time.sleep(6)
-
-        # HTTP to an arbitrary domain should succeed and be proxied through
-        # mitmproxy.
-        curl_result = sandbox_cli(
-            "ssh", "pol-unrestricted", "--",
-            "curl", "-s", "--connect-timeout", "15", "--max-time", "30",
-            "http://example.com/",
-            timeout=120,
-        )
-        assert curl_result.returncode == 0, (
-            f"curl to example.com failed under --unrestricted policy.\n"
-            f"stdout: {curl_result.stdout}\nstderr: {curl_result.stderr}"
-        )
-        assert "Example Domain" in curl_result.stdout, (
-            f"Response missing 'Example Domain'; --unrestricted should allow and proxy.\n"
-            f"stdout: {curl_result.stdout}"
-        )
-
-        # Allow a moment for mitmproxy to flush its log.
-        time.sleep(2)
-
-        # Verify the request was logged by mitmproxy in the gateway container.
-        gw_container = gateway_container_name(session_id)
-        log_result = subprocess.run(
-            [
-                "docker", "exec", gw_container,
-                "cat", "/var/log/gateway/mitmproxy.log",
-            ],
-            capture_output=True, text=True, timeout=30,
-        )
-        # mitmproxy log format varies, but the host and/or method should
-        # appear once a request has been routed through it.
-        assert log_result.returncode == 0, (
-            f"Failed to read mitmproxy log from {gw_container}.\n"
-            f"stdout: {log_result.stdout}\nstderr: {log_result.stderr}"
-        )
-        assert "example.com" in log_result.stdout or "GET /" in log_result.stdout, (
-            f"mitmproxy log did not record an allowed request under --unrestricted.\n"
-            f"log:\n{log_result.stdout}"
-        )
-
-        sandbox_cli("rm", "pol-unrestricted", timeout=120)
-        session_id = None
-
-    finally:
-        if session_id is not None:
-            sandbox_cli("rm", "pol-unrestricted", timeout=120)
+# Note: the M9-era `test_unrestricted_allows_and_logs` test was removed in
+# M10-S1. The spec (`.tasks/specs/2026-04-21-port-explicit-policies-
+# presets-observability-design.md`, Part 1) removes `--unrestricted` /
+# `Policy::unrestricted()` as an escape hatch; the discovery workflow it
+# supported is replaced by deny-log-driven iteration delivered in Part 3
+# (`sandbox events --decision=deny --follow`), which lands in later M10
+# sessions. Until that ships there is no functional equivalent to assert
+# here.
 
 
 @pytest.mark.timeout(600)
@@ -1517,12 +1480,15 @@ def test_policy_clear_reverts_to_deny_all(sandbox_cli):
     session_id = None
     policy_path = None
     try:
-        # Start with an HTTP-level policy allowing example.com GET /*.
+        # Start with an HTTP-level policy allowing example.com:80 GET /*.
+        # M10-S1 v2: port and L4 protocol are mandatory per rule.
         policy = {
-            "version": "1.0.0",
+            "version": "2.0.0",
             "rules": [
                 {
-                    "destination": "example.com",
+                    "host": "example.com",
+                    "port": 80,
+                    "protocol": "tcp",
                     "level": "http",
                     "http_filters": [
                         {"method": "GET", "path": "/*"},

@@ -141,10 +141,18 @@ def test_policy_survives_daemon_restart(
         # 1. Build a restrictive policy: allow example.com only.
         #    Everything else is denied by the implicit default-deny that
         #    CoreDNS enforces (NXDOMAIN for any domain not in the policy).
+        #    M10-S1 v2 schema: (host, port) identity with explicit L4
+        #    protocol. The restart-recovery assertions curl
+        #    `http://example.com` (port 80), so the rule pins :80/tcp.
         policy = {
-            "version": "1.0.0",
+            "version": "2.0.0",
             "rules": [
-                {"destination": "example.com", "level": "transport"},
+                {
+                    "host": "example.com",
+                    "port": 80,
+                    "protocol": "tcp",
+                    "level": "transport",
+                },
             ],
         }
         policy_path = write_policy_file(policy)

@@ -37,10 +37,17 @@ def test_clone_repo(sandbox_cli):
     policy_path = None
     try:
         # We need a policy that allows github.com for the git clone to work.
+        # M10-S1 v2 schema: rule identity is (host, port); protocol is L4.
+        # `git clone https://…` over HTTPS → (github.com, 443, tcp).
         policy = {
-            "version": "1.0.0",
+            "version": "2.0.0",
             "rules": [
-                {"destination": "github.com", "level": "transport"},
+                {
+                    "host": "github.com",
+                    "port": 443,
+                    "protocol": "tcp",
+                    "level": "transport",
+                },
             ],
         }
         policy_path = write_policy_file(policy)
