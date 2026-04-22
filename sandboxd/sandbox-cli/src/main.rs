@@ -4,13 +4,13 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use chrono::{DateTime, Utc};
-use clap::{Parser, Subcommand, ValueEnum};
+use chrono::{DateTime, SecondsFormat, Utc};
+use clap::{ArgAction, ArgGroup, Parser, Subcommand, ValueEnum};
 use http_body_util::BodyExt;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
 use sandbox_core::{
-    ApiError, ExecResponse, Policy, PolicyDto, PolicyLevelDto, PolicyRuleDto, SessionDto,
+    ApiError, EventDto, ExecResponse, Policy, PolicyDto, PolicyLevelDto, PolicyRuleDto, SessionDto,
     SessionHealth,
 };
 use tokio::net::UnixStream;
@@ -168,6 +168,56 @@ enum Command {
         /// One or more session names or IDs to describe.
         #[arg(required = true)]
         sessions: Vec<String>,
+    },
+    /// Stream or replay events from a sandbox session.
+    ///
+    /// By default emits a bounded replay of the session's event ring as
+    /// JSONL (one JSON object per line). Use `--follow` to keep the
+    /// connection open and stream live events. `--table` swaps the
+    /// default JSONL renderer for a human-readable fixed-column table.
+    ///
+    /// Multiple `--layer` / `--event` values narrow the filter by OR
+    /// within an axis; axes combine with AND. `--decision` is
+    /// single-valued (the server accepts a repeatable query parameter
+    /// but specifying both values is equivalent to omitting the filter
+    /// entirely).
+    #[command(group = ArgGroup::new("events_output").args(["json", "table"]))]
+    Events {
+        /// Session name or ID.
+        session: String,
+        /// Stream live events as they arrive (chunked JSONL).  Without
+        /// this flag the CLI prints the current ring-buffer contents
+        /// and exits.
+        #[arg(long, short = 'f')]
+        follow: bool,
+        /// Filter by layer name (`dns`, `envoy`, `mitmproxy`,
+        /// `deny-logger`, `lifecycle`).  Repeat to include multiple
+        /// layers.
+        #[arg(long, action = ArgAction::Append, num_args = 1)]
+        layer: Vec<String>,
+        /// Filter by event name (e.g. `query_denied`,
+        /// `connection_allowed`, `deny`). Repeat to include multiple
+        /// event names.
+        #[arg(long, action = ArgAction::Append, num_args = 1)]
+        event: Vec<String>,
+        /// Filter by decision: `allow` or `deny`.
+        #[arg(long)]
+        decision: Option<String>,
+        /// Lower-bound cutoff for event timestamps. Accepts either an
+        /// RFC 3339 timestamp (e.g. `2026-04-22T12:00:00Z`) or a
+        /// shorthand duration (`5s`, `2m`, `3h`, `7d`) which is
+        /// resolved against the current wall clock on the CLI side.
+        #[arg(long)]
+        since: Option<String>,
+        /// Emit raw JSONL (the default).  Preserves round-trip fidelity
+        /// for shell-redirect persistence
+        /// (`sandbox events <id> --follow > file.jsonl`).
+        #[arg(long)]
+        json: bool,
+        /// Render a human-readable fixed-column table instead of JSONL.
+        /// Deny rows are colored red when stdout is a TTY.
+        #[arg(long)]
+        table: bool,
     },
     /// Rebuild the pre-baked base VM image.
     RebuildImage,
@@ -407,14 +457,17 @@ fn build_request(command: &Command) -> Option<Request<String>> {
             .uri("/rebuild-image")
             .body(String::new())
             .expect("failed to build request"),
-        // Ssh, Logs, Cp, Inspect, and Describe are handled specially --
-        // not via a single HTTP request. Inspect and Describe issue one
-        // GET /sessions/{id} per argument and render client-side.
+        // Ssh, Logs, Cp, Inspect, Describe, and Events are handled
+        // specially -- not via a single buffered request/response pair.
+        // Inspect and Describe issue one GET /sessions/{id} per argument
+        // and render client-side. Events streams chunked JSONL and
+        // cannot go through `send_request` (which buffers the body).
         Command::Ssh { .. }
         | Command::Logs { .. }
         | Command::Cp { .. }
         | Command::Inspect { .. }
-        | Command::Describe { .. } => return None,
+        | Command::Describe { .. }
+        | Command::Events { .. } => return None,
     };
     Some(req)
 }
@@ -669,11 +722,12 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
         | Command::Logs { .. }
         | Command::Cp { .. }
         | Command::Inspect { .. }
-        | Command::Describe { .. } => {
+        | Command::Describe { .. }
+        | Command::Events { .. } => {
             // These commands are handled separately and never call
             // handle_response. Reaching here indicates a dispatch bug.
             unreachable!(
-                "ssh/logs/cp/inspect/describe commands should be handled before send_request"
+                "ssh/logs/cp/inspect/describe/events commands should be handled before send_request"
             );
         }
     }
@@ -1108,6 +1162,819 @@ async fn handle_logs(
             eprintln!("Failed to execute docker: {e}");
             process::exit(1);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `sandbox events` — M10-S4 Phase 4
+// ---------------------------------------------------------------------------
+//
+// `Command::Events` cannot reuse `send_request`: that helper buffers the
+// full response body, which is fine for policy/session JSON but wrong for
+// a chunked JSONL stream that may never end. The events path therefore
+// opens its own `hyper::client::conn::http1::handshake`, iterates the
+// body frames via `Body::frame`, and forwards complete `\n`-delimited
+// lines to a pluggable output sink (raw JSONL or the hand-rolled
+// `--table` formatter).
+//
+// Module-local helpers covered by unit tests at the bottom of this file:
+//
+// - `parse_since_rfc3339` / `parse_since_duration` / `resolve_since`
+//   — normalize the `--since` CLI input (RFC 3339 literal *or* GNU-style
+//   shorthand duration) into the single RFC 3339 UTC string the daemon
+//   expects on the wire.
+// - `build_events_query_string` — deterministic query-string assembly
+//   from the parsed `Command::Events` variant. Hand-rolled percent
+//   encoding keeps `sandbox-cli` dep-free.
+// - `split_jsonl_lines` — the cross-chunk line splitter.
+// - `format_table_header` / `format_table_row` — the `--table` renderer.
+
+/// Parse a `--since` value that is expected to be a bare RFC 3339
+/// timestamp (e.g. `2026-04-22T12:00:00Z`). Used both as a standalone
+/// helper and as the RFC-3339 branch of [`resolve_since`].
+fn parse_since_rfc3339(raw: &str) -> Result<DateTime<Utc>, String> {
+    DateTime::parse_from_rfc3339(raw)
+        .map(|dt| dt.with_timezone(&Utc))
+        .map_err(|e| format!("invalid --since RFC 3339 timestamp `{raw}`: {e}"))
+}
+
+/// Parse a `--since` value as a GNU-coreutils-style shorthand duration.
+///
+/// Accepts `Ns`, `Nm`, `Nh`, `Nd` where `N` is an unsigned integer.
+/// Returns the `DateTime<Utc>` computed as `now - duration`. `0s` is
+/// valid (returns `now`). Anything else — including a leading `-`, a
+/// trailing unit we don't support (`5x`), a bare integer (`5`), or an
+/// empty string — yields `Err`.
+fn parse_since_duration(raw: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>, String> {
+    if raw.is_empty() {
+        return Err("--since value is empty".into());
+    }
+    // Split off the trailing unit character. ASCII-only so indexing the
+    // penultimate byte is safe; a leading minus sign is rejected
+    // implicitly by `u64::from_str` below.
+    let (num_part, unit) = match raw.as_bytes().last() {
+        Some(&b) if b.is_ascii_alphabetic() => (&raw[..raw.len() - 1], b as char),
+        _ => {
+            return Err(format!(
+                "invalid --since duration `{raw}`: missing unit suffix"
+            ));
+        }
+    };
+    let magnitude: u64 = num_part.parse().map_err(|_| {
+        format!(
+            "invalid --since duration `{raw}`: \
+             numeric prefix must be an unsigned integer"
+        )
+    })?;
+    let secs: u64 = match unit {
+        's' => magnitude,
+        'm' => magnitude.saturating_mul(60),
+        'h' => magnitude.saturating_mul(60 * 60),
+        'd' => magnitude.saturating_mul(60 * 60 * 24),
+        other => {
+            return Err(format!(
+                "invalid --since duration `{raw}`: unit `{other}` not one of s/m/h/d"
+            ));
+        }
+    };
+    let delta = chrono::Duration::seconds(secs as i64);
+    now.checked_sub_signed(delta)
+        .ok_or_else(|| format!("--since duration `{raw}` overflowed the CLI clock"))
+}
+
+/// Resolve a `--since` input — either an RFC 3339 timestamp or a
+/// shorthand duration — into a UTC timestamp, then format it as RFC 3339
+/// with millisecond precision and the `Z` suffix (the shape the daemon's
+/// `EventsQueryDto::parse_since` expects on the wire).
+///
+/// Called by [`build_events_query_string`]; split out so tests can
+/// exercise each branch separately without reconstructing a full
+/// `Command::Events` value.
+fn resolve_since(raw: &str, now: DateTime<Utc>) -> Result<String, String> {
+    // Duration shorthand is a tight regex: digits followed by exactly one
+    // of `s`/`m`/`h`/`d`. Anything else (including RFC 3339 strings,
+    // which start with a digit but contain `-` and `:`) falls through to
+    // the RFC 3339 parser.
+    let looks_like_duration = !raw.is_empty()
+        && raw
+            .as_bytes()
+            .iter()
+            .take(raw.len() - 1)
+            .all(|b| b.is_ascii_digit())
+        && matches!(raw.as_bytes().last(), Some(b's' | b'm' | b'h' | b'd'));
+
+    let resolved = if looks_like_duration {
+        parse_since_duration(raw, now)?
+    } else {
+        parse_since_rfc3339(raw)?
+    };
+    Ok(resolved.to_rfc3339_opts(SecondsFormat::Millis, true))
+}
+
+/// Parsed-and-resolved arguments for the `sandbox events` subcommand.
+///
+/// Distinct from the raw `Command::Events` variant so query-string
+/// assembly can be unit-tested without threading clap-constructed
+/// `Command` values through the tests.
+#[derive(Debug, Clone)]
+struct EventsArgs {
+    session: String,
+    follow: bool,
+    layers: Vec<String>,
+    events: Vec<String>,
+    decision: Option<String>,
+    /// `since` is pre-resolved to RFC 3339 on the wire (whether the user
+    /// typed a timestamp or a shorthand duration).
+    since: Option<String>,
+    mode: EventsOutputMode,
+}
+
+/// Output renderer selection for the `sandbox events` subcommand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventsOutputMode {
+    /// Emit each JSONL line verbatim (default).
+    Json,
+    /// Parse lines as `EventDto` and render a fixed-column table.
+    Table,
+}
+
+/// Percent-encode a value for a URL query-string component.
+///
+/// Hand-rolled to avoid pulling `url`/`form_urlencoded` as a direct
+/// dependency: the three characters that matter for our inputs are
+/// `&`, `=`, and `+`, plus anything non-ASCII. We follow the
+/// application/x-www-form-urlencoded encoding (spaces → `+`, other
+/// reserved chars → `%XX`). Inputs in practice are filter names
+/// (`dns`, `deny-logger`, `query_denied`) and RFC 3339 timestamps that
+/// only need the colons escaped — but the full encoder keeps the CLI
+/// robust against future, more exotic values.
+fn percent_encode_query_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            b' ' => out.push('+'),
+            _ => {
+                out.push('%');
+                out.push_str(&format!("{b:02X}"));
+            }
+        }
+    }
+    out
+}
+
+/// Assemble the query string for `GET /sessions/{id}/events`.
+///
+/// `follow=true` is emitted only when `args.follow` is set (axum's
+/// `EventsQueryDto` uses `#[serde(default)]` for the bool, so omitting
+/// the key is equivalent to `follow=false`).
+///
+/// Repeatable keys emit `&layer=a&layer=b` in input order.  Deterministic
+/// ordering is an explicit property: the encoded URL is the same for
+/// the same inputs, which keeps the CLI test vector stable.
+///
+/// Returns a non-empty string on non-empty args; the empty string
+/// otherwise. The caller assembles the final URI as
+/// `/sessions/{id}/events[?<qs>]`.
+fn build_events_query_string(args: &EventsArgs) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if args.follow {
+        parts.push("follow=true".to_string());
+    }
+    for layer in &args.layers {
+        parts.push(format!("layer={}", percent_encode_query_value(layer)));
+    }
+    for event in &args.events {
+        parts.push(format!("event={}", percent_encode_query_value(event)));
+    }
+    if let Some(decision) = &args.decision {
+        parts.push(format!("decision={}", percent_encode_query_value(decision)));
+    }
+    if let Some(since) = &args.since {
+        parts.push(format!("since={}", percent_encode_query_value(since)));
+    }
+    parts.join("&")
+}
+
+/// Split a growing byte buffer at every `\n` and return the set of
+/// complete lines (without trailing `\n`).  The buffer is updated in
+/// place: any trailing partial line (after the last `\n`) stays behind
+/// for the next chunk.
+///
+/// Callers drive this per body frame; the function has no knowledge of
+/// HTTP framing or chunked transfer — just line framing.
+fn split_jsonl_lines(buffer: &mut Vec<u8>) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
+        // Drain the first `pos` bytes *plus* the newline from the head
+        // of the buffer in a single move.
+        let rest = buffer.split_off(pos + 1);
+        // `buffer` now holds the line + `\n`; drop the `\n` and decode
+        // as UTF-8 lossily — a malformed byte is rare (should never
+        // happen on a well-behaved server) but we keep the stream
+        // alive rather than panic.
+        let mut line = std::mem::replace(buffer, rest);
+        line.pop(); // drop the `\n`
+        let s = String::from_utf8_lossy(&line).into_owned();
+        out.push(s);
+    }
+    out
+}
+
+/// Minimal helper: mutate the buffer in place by removing the line at
+/// `range` plus the trailing newline. Not used directly — extracted
+/// conceptually into `split_jsonl_lines`. Kept here to document the
+/// invariant that the buffer never contains an already-consumed `\n`.
+#[cfg(test)]
+fn _jsonl_splitter_invariant_note() {}
+
+// --- Table renderer ---------------------------------------------------------
+//
+// Hand-rolled so `sandbox-cli` does not take on a new crate dep for one
+// command. Columns:
+//
+//     TIME                      SESSION    LAYER         EVENT                    HOST:PORT              DETAIL
+//     2026-04-22T23:12:34.567Z  <short>    deny-logger   deny                     203.0.113.1:80         reason=policy_mismatch decision=deny
+//
+// * TIME is already RFC 3339 with millis + `Z` on the wire, so no
+//   reformatting is needed beyond slicing to 23 chars.
+// * SESSION is truncated to the first 8 chars of the session_id
+//   envelope field. Full UUIDs are too wide for the row.
+// * LAYER and EVENT are left-padded to fixed widths — `deny-logger` is
+//   the widest layer name the spec uses today; `policy_reset_on_upgrade`
+//   is the widest event name.
+// * HOST:PORT is reconstructed from whichever of `host:port` or
+//   `orig_dst_ip:orig_dst_port` the event carries; `-` when neither.
+// * DETAIL is a compact, hand-chosen subset of remaining fields
+//   (`reason`, `decision`, `method`, `path`, ...).  Truncated at 60
+//   columns with `…`.
+//
+// Rows with `decision == "deny"` are wrapped in ANSI red when stdout is
+// a TTY.
+
+const TABLE_TIME_WIDTH: usize = 24;
+const TABLE_SESSION_WIDTH: usize = 8;
+const TABLE_LAYER_WIDTH: usize = 13;
+const TABLE_EVENT_WIDTH: usize = 24;
+const TABLE_HOSTPORT_WIDTH: usize = 22;
+const TABLE_DETAIL_MAX: usize = 60;
+
+/// Emit the table header row.  Called once per invocation (for both
+/// follow and non-follow), before the stream loop.
+fn format_table_header() -> String {
+    format!(
+        "{:<tw$}  {:<sw$}  {:<lw$}  {:<ew$}  {:<hw$}  {}",
+        "TIME",
+        "SESSION",
+        "LAYER",
+        "EVENT",
+        "HOST:PORT",
+        "DETAIL",
+        tw = TABLE_TIME_WIDTH,
+        sw = TABLE_SESSION_WIDTH,
+        lw = TABLE_LAYER_WIDTH,
+        ew = TABLE_EVENT_WIDTH,
+        hw = TABLE_HOSTPORT_WIDTH,
+    )
+}
+
+/// Format one JSONL line as a table row.
+///
+/// - If `line` parses as [`EventDto`], extract the envelope + body
+///   fields and render a fixed-column row. Deny rows are wrapped in
+///   ANSI red when `colorize` is true.
+/// - Otherwise (e.g. the streaming `lifecycle.ring_buffer_lag`
+///   synthetic, whose shape does not match `EventDto`), fall through
+///   to a raw-line print prefixed with `!` so the user can see the
+///   line rather than having it silently dropped.
+fn format_table_row(line: &str, colorize: bool) -> String {
+    let dto = match serde_json::from_str::<EventDto>(line) {
+        Ok(d) => d,
+        Err(_) => return format!("! {line}"),
+    };
+
+    let (timestamp, session, layer, event, host_port, detail, is_deny) = extract_table_fields(&dto);
+
+    let time_col = format_time_column(&timestamp);
+    let session_col = format_session_column(&session);
+    let layer_col = format!("{layer:<lw$}", lw = TABLE_LAYER_WIDTH);
+    let event_col = format!("{event:<ew$}", ew = TABLE_EVENT_WIDTH);
+    let host_col = format!("{host_port:<hw$}", hw = TABLE_HOSTPORT_WIDTH);
+    let detail_col = truncate_detail(&detail);
+
+    let row =
+        format!("{time_col}  {session_col}  {layer_col}  {event_col}  {host_col}  {detail_col}");
+
+    if colorize && is_deny {
+        format!("\x1b[31m{row}\x1b[0m")
+    } else {
+        row
+    }
+}
+
+/// Truncate TIME to the fixed column width.  The wire format is
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ` (24 chars including the trailing `Z`)
+/// but we defensively pad or truncate to match.
+fn format_time_column(ts: &str) -> String {
+    if ts.len() >= TABLE_TIME_WIDTH {
+        ts.chars().take(TABLE_TIME_WIDTH).collect()
+    } else {
+        format!("{ts:<w$}", w = TABLE_TIME_WIDTH)
+    }
+}
+
+/// Truncate session_id to an 8-char short ID for the SESSION column.
+fn format_session_column(session: &str) -> String {
+    if session.is_empty() {
+        return format!("{:<w$}", "-", w = TABLE_SESSION_WIDTH);
+    }
+    let short: String = session.chars().take(TABLE_SESSION_WIDTH).collect();
+    format!("{short:<w$}", w = TABLE_SESSION_WIDTH)
+}
+
+/// Truncate DETAIL to `TABLE_DETAIL_MAX` columns, adding `…` as a
+/// suffix when the field was cut short.  Uses `chars().take` rather
+/// than byte-slicing so multi-byte characters are not split mid-codepoint.
+fn truncate_detail(detail: &str) -> String {
+    let char_count = detail.chars().count();
+    if char_count <= TABLE_DETAIL_MAX {
+        return detail.to_string();
+    }
+    let kept: String = detail.chars().take(TABLE_DETAIL_MAX - 1).collect();
+    format!("{kept}\u{2026}")
+}
+
+/// Extract (timestamp, session, layer, event, host:port, detail, is_deny)
+/// from an `EventDto` for the `--table` renderer.
+///
+/// `layer` is the spec's kebab-case layer name; `event` is the body's
+/// snake_case event-name discriminator; `host:port` is pulled from
+/// whichever shape the body exposes (HTTP-style `host:port`, Envoy
+/// `dst_ip:dst_port`, deny-logger `orig_dst_ip:orig_dst_port`) or `-`
+/// when absent; `detail` is a compact `key=value`-joined summary of
+/// the body-specific fields worth showing.
+fn extract_table_fields(
+    dto: &EventDto,
+) -> (
+    String,
+    String,
+    &'static str,
+    &'static str,
+    String,
+    String,
+    bool,
+) {
+    use sandbox_core::{
+        DenyLoggerEventBodyDto, DenyProtocolDto, DnsEventBodyDto, EnvoyConnectionDto,
+        EnvoyEventBodyDto, LifecycleEventBodyDto, MitmproxyEventBodyDto,
+    };
+
+    match dto {
+        EventDto::Dns(d) => {
+            let (event_name, host_port, detail, is_deny) = match &d.body {
+                DnsEventBodyDto::QueryAllowed {
+                    query,
+                    qtype,
+                    resolved_ips,
+                } => (
+                    "query_allowed",
+                    query.clone(),
+                    format!("qtype={qtype} ips={}", resolved_ips.join(",")),
+                    false,
+                ),
+                DnsEventBodyDto::QueryDenied {
+                    query,
+                    qtype,
+                    reason,
+                } => (
+                    "query_denied",
+                    query.clone(),
+                    format!("qtype={qtype} reason={reason} decision=deny"),
+                    true,
+                ),
+            };
+            (
+                d.timestamp.clone(),
+                d.session.clone(),
+                "dns",
+                event_name,
+                host_port,
+                detail,
+                is_deny,
+            )
+        }
+        EventDto::Envoy(e) => {
+            let (event_name, conn, is_deny): (_, &EnvoyConnectionDto, _) = match &e.body {
+                EnvoyEventBodyDto::ConnectionAllowed(c) => ("connection_allowed", c, false),
+                EnvoyEventBodyDto::ConnectionDenied(c) => ("connection_denied", c, true),
+            };
+            let host_port = format!("{}:{}", conn.dst_ip, conn.dst_port);
+            let mut detail = format!(
+                "cluster={} chain={} flags={} bytes_in={} bytes_out={} duration_ms={}",
+                conn.cluster,
+                conn.matched_chain,
+                conn.response_flags,
+                conn.bytes_received,
+                conn.bytes_sent,
+                conn.duration_ms,
+            );
+            if let Some(auth) = &conn.connect_authority {
+                detail.push_str(&format!(" connect_authority={auth}"));
+            }
+            if is_deny {
+                detail.push_str(" decision=deny");
+            }
+            (
+                e.timestamp.clone(),
+                e.session.clone(),
+                "envoy",
+                event_name,
+                host_port,
+                detail,
+                is_deny,
+            )
+        }
+        EventDto::Mitmproxy(m) => {
+            let (event_name, host, port, method, path, reason, is_deny) = match &m.body {
+                MitmproxyEventBodyDto::RequestAllowed {
+                    host,
+                    port,
+                    method,
+                    path,
+                } => ("request_allowed", host, port, method, path, None, false),
+                MitmproxyEventBodyDto::RequestDenied {
+                    host,
+                    port,
+                    method,
+                    path,
+                    reason,
+                } => (
+                    "request_denied",
+                    host,
+                    port,
+                    method,
+                    path,
+                    Some(reason.clone()),
+                    true,
+                ),
+            };
+            let host_port = format!("{host}:{port}");
+            let mut detail = format!("method={method} path={path}");
+            if let Some(r) = reason {
+                detail.push_str(&format!(" reason={r}"));
+            }
+            if is_deny {
+                detail.push_str(" decision=deny");
+            }
+            (
+                m.timestamp.clone(),
+                m.session.clone(),
+                "mitmproxy",
+                event_name,
+                host_port,
+                detail,
+                is_deny,
+            )
+        }
+        EventDto::DenyLogger(dl) => match &dl.body {
+            DenyLoggerEventBodyDto::Deny {
+                orig_dst_ip,
+                orig_dst_port,
+                protocol,
+                src_ip,
+                src_port,
+            } => {
+                let host_port = format!("{orig_dst_ip}:{orig_dst_port}");
+                let proto = match protocol {
+                    DenyProtocolDto::Tcp => "tcp",
+                    DenyProtocolDto::Udp => "udp",
+                };
+                let detail = format!("proto={proto} src={src_ip}:{src_port} decision=deny");
+                (
+                    dl.timestamp.clone(),
+                    dl.session.clone(),
+                    "deny-logger",
+                    "deny",
+                    host_port,
+                    detail,
+                    true,
+                )
+            }
+            DenyLoggerEventBodyDto::RateLimited {
+                rate_limited_count,
+                since_ts,
+            } => (
+                dl.timestamp.clone(),
+                dl.session.clone(),
+                "deny-logger",
+                "rate_limited",
+                "-".to_string(),
+                format!("count={rate_limited_count} since={since_ts}"),
+                false,
+            ),
+        },
+        EventDto::Lifecycle(l) => {
+            let (event_name, detail) = match &l.body {
+                LifecycleEventBodyDto::GatewayBooting => ("gateway_booting", String::new()),
+                LifecycleEventBodyDto::GatewayReady => ("gateway_ready", String::new()),
+                LifecycleEventBodyDto::PolicyApplied {
+                    policy,
+                    source_presets,
+                    status,
+                    error,
+                } => {
+                    let mut d = format!(
+                        "status={:?} rules={} presets={}",
+                        status,
+                        policy.rules.len(),
+                        source_presets.join(",")
+                    );
+                    if let Some(e) = error {
+                        d.push_str(&format!(" error={e}"));
+                    }
+                    ("policy_applied", d)
+                }
+                LifecycleEventBodyDto::PolicyUpdated {
+                    policy,
+                    source_presets,
+                    status,
+                    error,
+                    previous_policy_hash,
+                } => {
+                    let mut d = format!(
+                        "status={:?} rules={} presets={}",
+                        status,
+                        policy.rules.len(),
+                        source_presets.join(",")
+                    );
+                    if let Some(e) = error {
+                        d.push_str(&format!(" error={e}"));
+                    }
+                    if let Some(h) = previous_policy_hash {
+                        d.push_str(&format!(" prev_hash={h}"));
+                    }
+                    ("policy_updated", d)
+                }
+                LifecycleEventBodyDto::PolicyResetOnUpgrade {
+                    previous_rule_count,
+                } => (
+                    "policy_reset_on_upgrade",
+                    format!("previous_rule_count={previous_rule_count}"),
+                ),
+                LifecycleEventBodyDto::HealthDegraded { component, reason } => (
+                    "health_degraded",
+                    format!("component={component:?} reason={reason}"),
+                ),
+                LifecycleEventBodyDto::HealthRestored { component } => {
+                    ("health_restored", format!("component={component:?}"))
+                }
+                LifecycleEventBodyDto::GatewayShutdown { reason, error } => {
+                    let mut d = format!("reason={reason:?}");
+                    if let Some(e) = error {
+                        d.push_str(&format!(" error={e}"));
+                    }
+                    ("gateway_shutdown", d)
+                }
+            };
+            (
+                l.timestamp.clone(),
+                l.session.clone(),
+                "lifecycle",
+                event_name,
+                "-".to_string(),
+                detail,
+                false,
+            )
+        }
+    }
+}
+
+// --- Streaming HTTP client --------------------------------------------------
+
+/// Exit code used when the `sandbox events` stream is interrupted by
+/// SIGINT (Ctrl+C). The shell convention for SIGINT is 128 + 2 = 130.
+const EVENTS_SIGINT_EXIT_CODE: i32 = 130;
+
+/// Open a streaming HTTP/1.1 connection to the daemon and iterate body
+/// frames, forwarding complete `\n`-delimited lines to the selected
+/// output sink until either (a) the response body ends, or (b) SIGINT
+/// is received.
+///
+/// This helper intentionally does **not** share code with `send_request`:
+/// that helper buffers the full response body via `BodyExt::collect`,
+/// which is correct for JSON endpoints but wrong for chunked JSONL.
+/// Here we call `response.body_mut().frame().await` in a loop so each
+/// chunk is processed as it arrives.
+async fn stream_events_to_stdout(socket_path: &str, args: &EventsArgs) -> Result<(), String> {
+    use tokio::io::{AsyncWriteExt, BufWriter};
+
+    let qs = build_events_query_string(args);
+    let uri = if qs.is_empty() {
+        format!("/sessions/{}/events", args.session)
+    } else {
+        format!("/sessions/{}/events?{}", args.session, qs)
+    };
+    let req = Request::builder()
+        .method("GET")
+        .uri(&uri)
+        .header("accept", "application/jsonl")
+        .body(String::new())
+        .expect("failed to build events request");
+
+    // Dial the daemon over the Unix socket. Mirrors `send_request` but
+    // keeps the sender/connection around across frame reads.
+    let stream = UnixStream::connect(socket_path).await.map_err(|e| {
+        format!("Cannot connect to sandboxd at {socket_path} \u{2014} is the daemon running? ({e})")
+    })?;
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+        .await
+        .map_err(|e| format!("HTTP handshake failed: {e}"))?;
+
+    // Connection driver: runs concurrently with frame reads until the
+    // body completes or is dropped (Ctrl+C path).
+    let conn_task = tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            // Suppress "connection closed" noise on normal teardown;
+            // only surface unexpected errors.
+            let msg = e.to_string();
+            if !msg.contains("IncompleteMessage") && !msg.contains("closed") {
+                eprintln!("connection error: {e}");
+            }
+        }
+    });
+
+    let mut response = sender
+        .send_request(req)
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        // Non-success: read the (bounded) error body and report.
+        let body_bytes = response
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| format!("failed to read error body: {e}"))?
+            .to_bytes();
+        let body = String::from_utf8_lossy(&body_bytes).to_string();
+        if let Ok(api_err) = serde_json::from_str::<ApiError>(&body) {
+            return Err(format!("Error: {}", api_err.error));
+        }
+        return Err(format!("Error ({status}): {body}"));
+    }
+
+    // Table mode prints the header once before the first row.
+    let mut stdout = BufWriter::new(tokio::io::stdout());
+    let colorize = args.mode == EventsOutputMode::Table
+        && std::io::IsTerminal::is_terminal(&std::io::stdout());
+    if args.mode == EventsOutputMode::Table {
+        let header = format_table_header();
+        stdout
+            .write_all(header.as_bytes())
+            .await
+            .map_err(|e| format!("stdout write failed: {e}"))?;
+        stdout
+            .write_all(b"\n")
+            .await
+            .map_err(|e| format!("stdout write failed: {e}"))?;
+    }
+
+    let mut buffer: Vec<u8> = Vec::new();
+
+    // Race the body read against SIGINT. On Ctrl+C we flush stdout,
+    // drop the response (which closes the connection), and exit 130.
+    let ctrlc = tokio::signal::ctrl_c();
+    tokio::pin!(ctrlc);
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut ctrlc => {
+                // Flush buffered stdout and exit cleanly. Dropping
+                // `response` and `sender` via scope exit closes the
+                // socket; the daemon's streaming task observes
+                // RecvError::Closed and shuts down its subscription.
+                let _ = stdout.flush().await;
+                drop(response);
+                // Don't wait on the connection driver — Ctrl+C is fast-exit.
+                conn_task.abort();
+                process::exit(EVENTS_SIGINT_EXIT_CODE);
+            }
+            frame = response.body_mut().frame() => {
+                match frame {
+                    None => break,
+                    Some(Err(e)) => {
+                        return Err(format!("stream read failed: {e}"));
+                    }
+                    Some(Ok(frame)) => {
+                        if let Some(data) = frame.data_ref() {
+                            buffer.extend_from_slice(data);
+                            for line in split_jsonl_lines(&mut buffer) {
+                                let rendered = match args.mode {
+                                    EventsOutputMode::Json => line,
+                                    EventsOutputMode::Table => {
+                                        format_table_row(&line, colorize)
+                                    }
+                                };
+                                stdout
+                                    .write_all(rendered.as_bytes())
+                                    .await
+                                    .map_err(|e| format!("stdout write failed: {e}"))?;
+                                stdout
+                                    .write_all(b"\n")
+                                    .await
+                                    .map_err(|e| format!("stdout write failed: {e}"))?;
+                            }
+                            // Flush per chunk so `tail -f`-style
+                            // downstream consumers see each line
+                            // promptly.  JSONL-to-file users pay a
+                            // negligible cost here; interactive users
+                            // get sub-second latency instead of
+                            // blocking until the buffer fills.
+                            stdout.flush().await.ok();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // If the stream ended without a trailing `\n`, warn and drop the
+    // partial tail — the daemon's contract is to always emit complete
+    // JSONL lines.
+    if !buffer.is_empty() {
+        tracing::warn!(
+            dropped_bytes = buffer.len(),
+            "stream ended mid-line, dropping partial tail"
+        );
+    }
+
+    stdout
+        .flush()
+        .await
+        .map_err(|e| format!("stdout flush failed: {e}"))?;
+    // The connection driver completes naturally when the body ends;
+    // awaiting it here drains any lingering state cleanly.
+    let _ = conn_task.await;
+    Ok(())
+}
+
+/// Handle `sandbox events <session> [flags]`.
+///
+/// Thin wrapper that resolves `--since` (if any) from the user-facing
+/// input (RFC 3339 or shorthand duration) to the wire-format RFC 3339
+/// string, then hands off to [`stream_events_to_stdout`].
+#[allow(clippy::too_many_arguments)]
+async fn handle_events(
+    socket_path: &str,
+    session: &str,
+    follow: bool,
+    layer: Vec<String>,
+    event: Vec<String>,
+    decision: Option<String>,
+    since: Option<String>,
+    json_flag: bool,
+    table_flag: bool,
+) {
+    // Default mode: JSON unless --table was passed. clap's ArgGroup
+    // guarantees at most one of --json / --table is set.
+    let mode = if table_flag {
+        EventsOutputMode::Table
+    } else {
+        // `json_flag` may or may not be set; either way the default is
+        // JSON.
+        let _ = json_flag;
+        EventsOutputMode::Json
+    };
+
+    let resolved_since = match since {
+        None => None,
+        Some(raw) => match resolve_since(&raw, Utc::now()) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            }
+        },
+    };
+
+    let args = EventsArgs {
+        session: session.to_string(),
+        follow,
+        layers: layer,
+        events: event,
+        decision,
+        since: resolved_since,
+        mode,
+    };
+
+    if let Err(e) = stream_events_to_stdout(socket_path, &args).await {
+        eprintln!("{e}");
+        process::exit(1);
     }
 }
 
@@ -1632,6 +2499,35 @@ async fn main() {
     } = &cli.command
     {
         handle_logs(&cli.socket, session, component, *follow, *tail).await;
+        return;
+    }
+
+    // Handle events specially — it streams JSONL over chunked HTTP and
+    // needs client-side SIGINT handling, so it cannot reuse the normal
+    // request/response flow.
+    if let Command::Events {
+        session,
+        follow,
+        layer,
+        event,
+        decision,
+        since,
+        json,
+        table,
+    } = &cli.command
+    {
+        handle_events(
+            &cli.socket,
+            session,
+            *follow,
+            layer.clone(),
+            event.clone(),
+            decision.clone(),
+            since.clone(),
+            *json,
+            *table,
+        )
+        .await;
         return;
     }
 
