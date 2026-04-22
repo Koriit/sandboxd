@@ -36,9 +36,9 @@ pub use dns_propagation::{
 pub use error::{ApiError, SandboxError};
 pub use events::{
     DEFAULT_RING_BUFFER_SIZE, DnsEvent, EVENTS_DIR_IN_CONTAINER, EVENTS_HOST_ROOT, EnvoyConnection,
-    EnvoyEvent, Event, EventBus, EventBusConfig, EventEnvelope, GatewayShutdownReason,
-    HealthComponent, LifecycleEvent, MitmproxyEvent, PolicyApplyStatus, TrafficEvent,
-    VmIpSessionMap, session_events_host_dir,
+    EnvoyEvent, Event, EventBus, EventBusConfig, EventEnvelope, EventSubscription,
+    GatewayShutdownReason, HealthComponent, LifecycleEvent, MitmproxyEvent, PolicyApplyStatus,
+    TrafficEvent, VmIpSessionMap, session_events_host_dir,
 };
 pub use gateway::{GatewayManager, GatewayStatus};
 pub use guest::{

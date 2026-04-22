@@ -14,13 +14,14 @@ use clap::Parser;
 use sandbox_core::gateway::container_name as gateway_container_name;
 use sandbox_core::{
     ApiError, AssuranceLevel, BaseImageStatus, CaManager, CoreDnsConfig, CreateSessionRequest,
-    Destination, DnsCache, ExecRequest, ExecResponse, FileDownloadRequest, FileDownloadResponse,
-    FileUploadRequest, GatewayHealth, GatewayManager, GatewayStatus, GuestConnector, GuestRequest,
-    GuestResponse, LimaManager, NetworkHealth, NetworkManager, Policy, PolicyCompiler,
-    PolicyDistributor, SandboxError, Session, SessionConfig, SessionDto, SessionHealth, SessionId,
-    SessionState, SessionStore, UpdatePolicyRequest, VmStatus, attach_vm_to_bridge,
-    detach_vm_from_bridge, generate_ca_inject_script, mac_from_session_id, propagate_dns_changes,
-    read_resolved_json, write_file_to_container,
+    Destination, DnsCache, EventBus, EventBusConfig, ExecRequest, ExecResponse,
+    FileDownloadRequest, FileDownloadResponse, FileUploadRequest, GatewayHealth, GatewayManager,
+    GatewayStatus, GuestConnector, GuestRequest, GuestResponse, LimaManager, NetworkHealth,
+    NetworkManager, Policy, PolicyCompiler, PolicyDistributor, SandboxError, Session,
+    SessionConfig, SessionDto, SessionHealth, SessionId, SessionState, SessionStore,
+    UpdatePolicyRequest, VmIpSessionMap, VmStatus, attach_vm_to_bridge, detach_vm_from_bridge,
+    generate_ca_inject_script, mac_from_session_id, propagate_dns_changes, read_resolved_json,
+    write_file_to_container,
 };
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
@@ -175,6 +176,19 @@ struct AppState {
     /// Running state, which causes all `limactl clone` calls to fail
     /// with "cannot clone a running instance."
     base_image_lock: Mutex<()>,
+    /// Per-session unified event bus.
+    ///
+    /// Sessions are registered when their networking is set up and
+    /// unregistered on teardown / deletion.  Ingest tasks (M10-S2 Phase 7)
+    /// publish into the bus; SSE handlers (later milestone) subscribe.
+    /// See [`EventBus`] for the fan-out + ring-buffer replay semantics.
+    event_bus: EventBus,
+    /// VM-IP → session-ID lookup used by the ingest layer to stamp the
+    /// owning session on JSONL records whose on-wire identifier is the
+    /// VM bridge IP (Envoy `src_ip`, CoreDNS client IP, mitmproxy client
+    /// IP).  Bound at the same time the session is registered with
+    /// [`AppState::event_bus`]; removed in lock-step on teardown.
+    vm_ip_map: VmIpSessionMap,
 }
 
 // ---------------------------------------------------------------------------
@@ -1286,6 +1300,37 @@ async fn remove_session(
     // Remove from the stopping set now that teardown is complete.
     state.sessions_stopping.lock().await.remove(&session.id);
 
+    // Unbind the session's VM IP and unregister it from the event bus.
+    // Done after the networking teardown (no further events can be
+    // attributed to this session) and before `delete_session` to keep
+    // the window in which store + bus disagree as short as possible.
+    // The vm_ip is looked up from the store; if network_info was absent
+    // or unparseable, unbind is a no-op.
+    match state.store.get_network_info(&session.id) {
+        Ok(Some(ni)) => match ni.vm_ip.parse::<std::net::Ipv4Addr>() {
+            Ok(ip) => {
+                state.vm_ip_map.unbind(ip);
+            }
+            Err(e) => {
+                warn!(
+                    session_id = %session.id,
+                    vm_ip = %ni.vm_ip,
+                    error = %e,
+                    "failed to parse vm_ip during remove; skipping unbind"
+                );
+            }
+        },
+        Ok(None) => {}
+        Err(e) => {
+            warn!(
+                session_id = %session.id,
+                error = %e,
+                "failed to read network_info during remove; skipping unbind"
+            );
+        }
+    }
+    state.event_bus.unregister_session(&session.id);
+
     // Delete the session from the store.
     if let Err(e) = state.store.delete_session(&session.id) {
         return error_response(e).into_response();
@@ -2050,6 +2095,27 @@ async fn setup_session_networking(
 
     // 4. Store network info in DB.
     state.store.set_network_info(session_id, network_info)?;
+
+    // 5. Register the session with the event bus and bind its VM IP so
+    //    the ingest layer can route events (M10-S2 Phase 2). Failure to
+    //    parse `vm_ip` as IPv4 is surprising (we wrote it ourselves in
+    //    `create_network`) but we prefer a warning over an error path
+    //    that would tear down a successfully-networked session — the
+    //    event stream just stays empty for that session.
+    state.event_bus.register_session(*session_id);
+    match network_info.vm_ip.parse::<std::net::Ipv4Addr>() {
+        Ok(ip) => {
+            state.vm_ip_map.bind(ip, *session_id);
+        }
+        Err(e) => {
+            warn!(
+                session_id = %session_id,
+                vm_ip = %network_info.vm_ip,
+                error = %e,
+                "failed to parse vm_ip as IPv4; event attribution disabled for this session"
+            );
+        }
+    }
 
     Ok(())
 }
@@ -3036,6 +3102,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         network.restore_from_infos(&existing_networks)?;
     }
 
+    // Construct the event bus + vm-ip map and hydrate both from the same
+    // set of `existing_networks` entries.  After a daemon restart every
+    // session with persisted network info has a live allocation and a
+    // stable VM IP, so its event sink must be ready before the gateway
+    // is restored in `reconcile_networking` — otherwise any events
+    // emitted by a just-restored gateway could race ahead of the bus
+    // registration and be dropped.
+    let event_bus = EventBus::new(EventBusConfig::default());
+    let vm_ip_map = VmIpSessionMap::new();
+    for (sid, info) in &existing_networks {
+        event_bus.register_session(*sid);
+        match info.vm_ip.parse::<std::net::Ipv4Addr>() {
+            Ok(ip) => {
+                vm_ip_map.bind(ip, *sid);
+            }
+            Err(e) => {
+                warn!(
+                    session_id = %sid,
+                    vm_ip = %info.vm_ip,
+                    error = %e,
+                    "failed to parse vm_ip during startup hydration; event attribution disabled for this session"
+                );
+            }
+        }
+    }
+    if !existing_networks.is_empty() {
+        info!(
+            count = existing_networks.len(),
+            vm_ip_bindings = vm_ip_map.len(),
+            "hydrated event bus + vm-ip map from persisted sessions"
+        );
+    }
+
     // Run startup reconciliation (VM state).
     reconcile(&store, &lima);
 
@@ -3083,6 +3182,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         session_policies: Arc::new(Mutex::new(hydrated_policies)),
         sessions_stopping: Mutex::new(HashSet::new()),
         base_image_lock: Mutex::new(()),
+        event_bus,
+        vm_ip_map,
     });
 
     // Run networking reconciliation: restart crashed gateways, clean up

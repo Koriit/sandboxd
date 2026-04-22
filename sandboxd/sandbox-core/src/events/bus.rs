@@ -58,6 +58,16 @@ use tokio::sync::broadcast;
 use crate::events::Event;
 use crate::session::SessionId;
 
+/// A subscription handle: `(replay, receiver)`.
+///
+/// Returned by [`EventBus::subscribe`]. Callers drain `replay` (the
+/// events currently in the session's ring, in the order they were
+/// published) before switching to `receiver.recv().await` for live
+/// events. Returned as a tuple (not a struct) because the SSE handler
+/// destructures it immediately; the type alias just quiets
+/// `clippy::type_complexity` on the public API.
+pub type EventSubscription = (Vec<Arc<Event>>, broadcast::Receiver<Arc<Event>>);
+
 /// Default per-session ring buffer capacity.
 ///
 /// 10 000 events was picked to cover ~10 minutes of high-volume traffic
@@ -138,7 +148,7 @@ impl SessionEventSink {
     /// it arrives on the freshly-subscribed receiver. The trade-off is
     /// that boundary events can be seen twice; the SSE handler (M10-S2
     /// Phase 8) deduplicates by (timestamp, layer, event) when needed.
-    fn snapshot_and_subscribe(&self) -> (Vec<Arc<Event>>, broadcast::Receiver<Arc<Event>>) {
+    fn snapshot_and_subscribe(&self) -> EventSubscription {
         let rx = self.tx.subscribe();
         let ring = self.ring.lock().expect("event ring mutex poisoned");
         let snapshot: Vec<Arc<Event>> = ring.iter().cloned().collect();
@@ -230,10 +240,7 @@ impl EventBus {
     /// The returned tuple is `(replay, receiver)`; callers should drain
     /// `replay` first (it is the historical order the events were
     /// published in) before switching to `receiver.recv()`.
-    pub fn subscribe(
-        &self,
-        session_id: &SessionId,
-    ) -> Option<(Vec<Arc<Event>>, broadcast::Receiver<Arc<Event>>)> {
+    pub fn subscribe(&self, session_id: &SessionId) -> Option<EventSubscription> {
         let sessions = self
             .inner
             .sessions

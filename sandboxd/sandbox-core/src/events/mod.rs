@@ -21,7 +21,7 @@ pub mod bus;
 pub mod envelope;
 pub mod vm_ip_map;
 
-pub use bus::{DEFAULT_RING_BUFFER_SIZE, EventBus, EventBusConfig};
+pub use bus::{DEFAULT_RING_BUFFER_SIZE, EventBus, EventBusConfig, EventSubscription};
 pub use envelope::{
     DnsEvent, EnvoyConnection, EnvoyEvent, Event, EventEnvelope, GatewayShutdownReason,
     HealthComponent, LifecycleEvent, MitmproxyEvent, PolicyApplyStatus, TrafficEvent,
