@@ -79,6 +79,29 @@ pub enum Event {
     },
 }
 
+impl Event {
+    /// Return a reference to the common [`EventEnvelope`] regardless of
+    /// top-level variant. Callers can then inspect `timestamp` / `session`
+    /// without dispatching on the variant themselves.
+    pub fn envelope(&self) -> &EventEnvelope {
+        match self {
+            Event::Traffic { envelope, .. } => envelope,
+            Event::Lifecycle { envelope, .. } => envelope,
+        }
+    }
+
+    /// Session this event is attributed to, if any.
+    ///
+    /// Returns [`None`] for pre-session lifecycle events (e.g.,
+    /// `gateway_booting` emitted before the gateway is attached to a
+    /// session). The bus uses this to route events to the right per-session
+    /// sink; pre-session events currently have no per-session sink to land
+    /// in and are dropped by [`crate::events::EventBus::publish`].
+    pub fn session(&self) -> Option<&SessionId> {
+        self.envelope().session.as_ref()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Traffic events
 // ---------------------------------------------------------------------------

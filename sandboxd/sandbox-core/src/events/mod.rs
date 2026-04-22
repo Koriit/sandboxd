@@ -17,12 +17,16 @@ use std::path::PathBuf;
 
 use crate::session::SessionId;
 
+pub mod bus;
 pub mod envelope;
+pub mod vm_ip_map;
 
+pub use bus::{DEFAULT_RING_BUFFER_SIZE, EventBus, EventBusConfig};
 pub use envelope::{
     DnsEvent, EnvoyConnection, EnvoyEvent, Event, EventEnvelope, GatewayShutdownReason,
     HealthComponent, LifecycleEvent, MitmproxyEvent, PolicyApplyStatus, TrafficEvent,
 };
+pub use vm_ip_map::VmIpSessionMap;
 
 /// Root directory on the host under which per-session event directories
 /// live. `sandboxd` bind-mounts `${root}/<session-id>/` into each gateway
