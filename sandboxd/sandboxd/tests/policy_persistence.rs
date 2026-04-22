@@ -62,7 +62,7 @@ fn policy_survives_store_reopen() {
     let expected_json: serde_json::Value;
 
     {
-        let store = SessionStore::new(base_dir.clone()).expect("open store");
+        let (store, _orphans) = SessionStore::new(base_dir.clone()).expect("open store");
         let session = store
             .create_session(SessionConfig::default(), Some("restart-test".into()))
             .expect("create session");
@@ -78,7 +78,7 @@ fn policy_survives_store_reopen() {
     // restart).  The rehydrated policy must equal the original — we
     // compare via serde JSON so we catch any field drift, not just
     // struct field identity.
-    let reopened = SessionStore::new(base_dir).expect("reopen store");
+    let (reopened, _orphans) = SessionStore::new(base_dir).expect("reopen store");
 
     let loaded = reopened
         .get_policy(&session_id)
@@ -101,7 +101,7 @@ fn load_all_policies_hydrates_in_memory_map() {
     let dir = TempDir::new().expect("tempdir");
     let base_dir = dir.path().to_path_buf();
 
-    let store = SessionStore::new(base_dir.clone()).expect("open store");
+    let (store, _orphans) = SessionStore::new(base_dir.clone()).expect("open store");
 
     let s1 = store
         .create_session(SessionConfig::default(), Some("alpha".into()))
@@ -130,7 +130,7 @@ fn load_all_policies_hydrates_in_memory_map() {
 
     // Drop and reopen — the same pattern the daemon uses on startup.
     drop(store);
-    let reopened = SessionStore::new(base_dir).expect("reopen");
+    let (reopened, _orphans) = SessionStore::new(base_dir).expect("reopen");
 
     // This is the exact call `sandboxd::main` uses to hydrate.
     let hydrated: HashMap<SessionId, Policy> = reopened

@@ -3084,7 +3084,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Initialize store and Lima manager.
-    let store = SessionStore::new(base_dir.clone())?;
+    //
+    // `SessionStore::new` returns a list of sessions whose v1 policy
+    // was reset by the V004 migration; the replay of
+    // `policy_reset_on_upgrade` lifecycle events on the bus happens in
+    // the startup block below, once the `EventBus` is up.
+    let (store, _reset_orphans) = SessionStore::new(base_dir.clone())?;
     let lima = Arc::new(LimaManager::new(base_dir.clone())?);
     let guest = GuestConnector::new(Arc::clone(&lima));
 

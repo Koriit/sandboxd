@@ -29,6 +29,36 @@ pub enum ResolveOutcome {
     Ambiguous(Vec<SessionId>),
 }
 
+/// Information about a session whose v1 policy was purged by the
+/// M10-S2 V004 migration and swept from `session_policies`.
+///
+/// Returned by [`SessionStore::new`] so the caller (sandboxd `main`)
+/// can emit one `policy_reset_on_upgrade` lifecycle event per affected
+/// session once the [`crate::events::EventBus`] is constructed.  The
+/// tracing-level emission inside the sweep stays in place so existing
+/// integration tests that scrape tracing events (see
+/// `test_v004_migration_from_v1_seed_db`) continue to pass — the
+/// lifecycle event is *in addition to* the tracing record, not a
+/// replacement.
+///
+/// `previous_rule_count` is captured **before** V004 deletes the rows,
+/// by running migrations in two passes (V001..V003, snapshot counts,
+/// then the remaining targets).  Without the two-pass split this field
+/// would always be zero, since V004 Step 97 drops every rule in a
+/// single statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanInfo {
+    /// Session whose v1 policy was reset.  String rather than
+    /// [`SessionId`] because the migration seeds raw strings and this
+    /// struct only travels from [`SessionStore::new`] to the caller.
+    pub session_id: String,
+    /// Number of `policy_rules` rows that belonged to this session
+    /// just before V004 dropped them.  Reported on the
+    /// `policy_reset_on_upgrade` lifecycle event so operators can
+    /// gauge the blast radius of the upgrade.
+    pub previous_rule_count: u32,
+}
+
 /// Maximum number of collision retries when inserting a session.
 const INSERT_COLLISION_RETRIES: u32 = 3;
 
@@ -44,8 +74,16 @@ pub struct SessionStore {
 impl SessionStore {
     /// Open (or create) the session database at `{base_dir}/sessions.db`.
     ///
-    /// Enables WAL mode and runs any pending migrations.
-    pub fn new(base_dir: PathBuf) -> Result<Self, SandboxError> {
+    /// Enables WAL mode, runs any pending migrations, and performs the
+    /// V004 orphan sweep.  Returns the live store plus a list of
+    /// sessions whose v1 policy was reset by the upgrade so the caller
+    /// (sandboxd `main`) can emit one `policy_reset_on_upgrade`
+    /// lifecycle event per affected session once the event bus is
+    /// wired.
+    ///
+    /// Callers that do not care about the orphan list — tests,
+    /// embedded tooling — can discard the second tuple element.
+    pub fn new(base_dir: PathBuf) -> Result<(Self, Vec<OrphanInfo>), SandboxError> {
         fs::create_dir_all(&base_dir)?;
 
         let db_path = base_dir.join("sessions.db");
@@ -59,10 +97,30 @@ impl SessionStore {
         // row) is deleted. SQLite requires this pragma per-connection.
         conn.pragma_update(None, "foreign_keys", "ON")?;
 
-        // Run embedded migrations.
+        // Run migrations in two passes so V004's `DELETE FROM
+        // policy_rules` doesn't erase the rule counts we want to
+        // attribute onto the `policy_reset_on_upgrade` event.
+        //
+        //   Pass 1: Target::Version(3) — apply V001..V003, then
+        //           snapshot per-session rule counts from the v1
+        //           schema while rows still exist.
+        //   Pass 2: unbounded run() — apply V004 and anything later.
+        //
+        // On databases already at >= V004 (second boot, tests that
+        // seed at V004 directly), pass 1 is a no-op and the snapshot
+        // is empty; the sweep below finds no orphans and emits no
+        // events.  That keeps the two-pass split transparent to
+        // existing tests.
+        embedded::migrations::runner()
+            .set_target(refinery::Target::Version(3))
+            .run(&mut conn)
+            .map_err(|e| SandboxError::Internal(format!("migration error (V001..V003): {e}")))?;
+
+        let pre_v004_rule_counts = Self::snapshot_pre_v004_rule_counts(&conn)?;
+
         embedded::migrations::runner()
             .run(&mut conn)
-            .map_err(|e| SandboxError::Internal(format!("migration error: {e}")))?;
+            .map_err(|e| SandboxError::Internal(format!("migration error (V004+): {e}")))?;
 
         // V004 turns v1-shaped policy rules into `session_policies` rows
         // with no children.  Sweep those orphans here and emit a
@@ -74,12 +132,48 @@ impl SessionStore {
         // are emitted.  Running it unconditionally (not gated on "is
         // this the first boot after V004") is deliberately simple — the
         // cost is one SELECT and this keeps the code path uniform.
-        Self::purge_orphaned_policies_and_emit_reset_events(&conn)?;
+        let orphans =
+            Self::purge_orphaned_policies_and_emit_reset_events(&conn, &pre_v004_rule_counts)?;
 
-        Ok(Self {
-            conn: Mutex::new(conn),
-            base_dir,
-        })
+        Ok((
+            Self {
+                conn: Mutex::new(conn),
+                base_dir,
+            },
+            orphans,
+        ))
+    }
+
+    /// Snapshot per-session `policy_rules` row counts at the V003
+    /// schema, before V004 drops every rule in one statement.
+    ///
+    /// The snapshot is attached to each `OrphanInfo` returned by
+    /// [`SessionStore::new`] so the `policy_reset_on_upgrade` lifecycle
+    /// event carries the blast radius of the upgrade.  If the query
+    /// fails (for example, because `policy_rules` doesn't yet exist on
+    /// a very fresh DB where V001 hasn't created it) the snapshot is
+    /// treated as empty — rule counts are a best-effort diagnostic and
+    /// must never block startup.
+    fn snapshot_pre_v004_rule_counts(
+        conn: &Connection,
+    ) -> Result<std::collections::HashMap<String, u32>, SandboxError> {
+        let mut stmt = match conn
+            .prepare("SELECT session_id, COUNT(*) AS n FROM policy_rules GROUP BY session_id")
+        {
+            Ok(s) => s,
+            Err(_) => return Ok(std::collections::HashMap::new()),
+        };
+        let rows = stmt.query_map([], |row| {
+            let sid: String = row.get(0)?;
+            let n: i64 = row.get(1)?;
+            Ok((sid, n.max(0) as u32))
+        })?;
+        let mut counts = std::collections::HashMap::new();
+        for row in rows {
+            let (sid, n) = row?;
+            counts.insert(sid, n);
+        }
+        Ok(counts)
     }
 
     /// Delete `session_policies` rows that have no surviving rules in
@@ -90,12 +184,15 @@ impl SessionStore {
     /// [`SessionStore::load_all_policies`].
     ///
     /// Operators subscribed to the `policy_reset_on_upgrade` event know
-    /// exactly which sessions need a v2 policy re-applied.  M10-S2 wires
-    /// the tracing subscriber into the sandboxd ring buffer so the event
-    /// is observable without stdout scraping.
+    /// exactly which sessions need a v2 policy re-applied.  The tracing
+    /// event is kept for backwards compatibility with existing
+    /// subscribers and tests; M10-S2 additionally returns the orphan
+    /// list so the caller can publish a structured lifecycle event on
+    /// the in-memory bus.
     fn purge_orphaned_policies_and_emit_reset_events(
         conn: &Connection,
-    ) -> Result<(), SandboxError> {
+        pre_v004_rule_counts: &std::collections::HashMap<String, u32>,
+    ) -> Result<Vec<OrphanInfo>, SandboxError> {
         let mut stmt = conn.prepare(
             "SELECT sp.session_id
              FROM session_policies sp
@@ -110,10 +207,13 @@ impl SessionStore {
         }
         drop(stmt);
 
+        let mut infos = Vec::with_capacity(orphans.len());
         for session_id in &orphans {
+            let previous_rule_count = pre_v004_rule_counts.get(session_id).copied().unwrap_or(0);
             tracing::info!(
                 event = "policy_reset_on_upgrade",
                 session_id = %session_id,
+                previous_rule_count = previous_rule_count,
                 "v1 policy rules were purged by migration V004; \
                  operator must re-apply a v2 policy for this session"
             );
@@ -121,9 +221,13 @@ impl SessionStore {
                 "DELETE FROM session_policies WHERE session_id = ?1",
                 params![session_id],
             )?;
+            infos.push(OrphanInfo {
+                session_id: session_id.clone(),
+                previous_rule_count,
+            });
         }
 
-        Ok(())
+        Ok(infos)
     }
 
     /// Return the base directory used by this store.
@@ -1039,7 +1143,8 @@ mod tests {
     /// Create a `SessionStore` in a fresh temporary directory.
     fn test_store() -> (SessionStore, TempDir) {
         let dir = TempDir::new().expect("failed to create temp dir");
-        let store = SessionStore::new(dir.path().to_path_buf()).expect("failed to create store");
+        let (store, _orphans) =
+            SessionStore::new(dir.path().to_path_buf()).expect("failed to create store");
         (store, dir)
     }
 
@@ -2188,7 +2293,7 @@ mod tests {
         let session_id;
         let expected_rule_count;
         {
-            let store = SessionStore::new(path.clone()).expect("open");
+            let (store, _orphans) = SessionStore::new(path.clone()).expect("open");
             let session = store
                 .create_session(SessionConfig::default(), Some("pol".into()))
                 .expect("create");
@@ -2199,7 +2304,7 @@ mod tests {
         }
 
         // Drop and reopen.
-        let reopened = SessionStore::new(path).expect("reopen");
+        let (reopened, _orphans) = SessionStore::new(path).expect("reopen");
         let loaded = reopened
             .get_policy(&session_id)
             .expect("get_policy after reopen")
@@ -2423,7 +2528,31 @@ mod tests {
         // sweep.  Run under the recording subscriber so we capture the
         // `policy_reset_on_upgrade` events.
         let swept_sessions = with_default(subscriber, || {
-            let store = SessionStore::new(dir.path().to_path_buf()).expect("open v2 store");
+            let (store, orphans) =
+                SessionStore::new(dir.path().to_path_buf()).expect("open v2 store");
+
+            // Assert: the orphan list returned to the caller matches
+            // the two v1-shaped sessions, with the pre-V004 rule
+            // counts captured before the migration dropped them.
+            let mut orphan_by_session: std::collections::HashMap<&str, u32> = orphans
+                .iter()
+                .map(|o| (o.session_id.as_str(), o.previous_rule_count))
+                .collect();
+            assert_eq!(
+                orphan_by_session.len(),
+                2,
+                "expected two orphan infos, got {orphans:?}"
+            );
+            assert_eq!(
+                orphan_by_session.remove(v1_session_purge_only.as_str()),
+                Some(3),
+                "purge-only session had three v1 rules (http, https, any)"
+            );
+            assert_eq!(
+                orphan_by_session.remove(v1_session_mixed.as_str()),
+                Some(2),
+                "mixed session had two v1 rules (tcp, http)"
+            );
 
             // Assert: both v1-shaped sessions are gone from session_policies.
             let conn = store.conn.lock().unwrap();
@@ -2546,10 +2675,12 @@ mod tests {
         // First open: a fresh DB with no policies → no events.
         let dir = TempDir::new().expect("tempdir");
         let counter = Counter::default();
+        let first_orphans;
         {
             let subscriber = Registry::default().with(CountLayer(counter.clone()));
-            with_default(subscriber, || {
-                let _ = SessionStore::new(dir.path().to_path_buf()).expect("first open");
+            first_orphans = with_default(subscriber, || {
+                let (_, orphans) = SessionStore::new(dir.path().to_path_buf()).expect("first open");
+                orphans
             });
         }
         assert_eq!(
@@ -2557,16 +2688,27 @@ mod tests {
             0,
             "fresh DB has no v1 rows to sweep"
         );
+        assert!(
+            first_orphans.is_empty(),
+            "fresh DB yields an empty orphan list"
+        );
 
         // Second open on the same path: still no events (V004 already
         // ran, nothing left).
         let counter2 = Counter::default();
+        let second_orphans;
         {
             let subscriber = Registry::default().with(CountLayer(counter2.clone()));
-            with_default(subscriber, || {
-                let _ = SessionStore::new(dir.path().to_path_buf()).expect("second open");
+            second_orphans = with_default(subscriber, || {
+                let (_, orphans) =
+                    SessionStore::new(dir.path().to_path_buf()).expect("second open");
+                orphans
             });
         }
+        assert!(
+            second_orphans.is_empty(),
+            "reopened DB yields an empty orphan list"
+        );
         assert_eq!(
             *counter2.0.lock().unwrap(),
             0,
