@@ -175,10 +175,9 @@ pub enum MitmproxyEventBodyDto {
 //     | deny-logger | ... | deny | orig_dst_ip, orig_dst_port,
 //                              protocol (tcp/udp), src_ip, src_port |
 //
-// The `rate_limited` summary event carries `dropped_events_count` plus
-// `since_ts` marking the start of the summarised window. The spec names
-// the concept `rate_limited_count` in prose (Hardening rules § 5); the
-// M10-S3 plan's orchestrator-final field name is `dropped_events_count`.
+// The `rate_limited` summary event carries `rate_limited_count` plus
+// `since_ts` marking the start of the summarised window, per spec
+// Part 3 / "Hardening rules" § 5.
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DenyLoggerEventDto {
@@ -200,7 +199,7 @@ pub enum DenyLoggerEventBodyDto {
         src_port: u16,
     },
     RateLimited {
-        dropped_events_count: u32,
+        rate_limited_count: u32,
         /// Start of the summarised window, RFC 3339 with millisecond
         /// precision and `Z` suffix — same format as the envelope
         /// `timestamp`.

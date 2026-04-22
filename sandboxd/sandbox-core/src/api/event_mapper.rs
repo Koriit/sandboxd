@@ -208,10 +208,10 @@ fn deny_logger_body_dto(event: &DenyLoggerEvent) -> DenyLoggerEventBodyDto {
     match event {
         DenyLoggerEvent::Deny(d) => deny_body_dto(d),
         DenyLoggerEvent::RateLimited {
-            dropped_events_count,
+            rate_limited_count,
             since_ts,
         } => DenyLoggerEventBodyDto::RateLimited {
-            dropped_events_count: *dropped_events_count,
+            rate_limited_count: *rate_limited_count,
             since_ts: render_timestamp(since_ts),
         },
     }
@@ -628,7 +628,7 @@ mod tests {
                 Event::Traffic {
                     envelope: envelope.clone(),
                     event: TrafficEvent::DenyLogger(DenyLoggerEvent::RateLimited {
-                        dropped_events_count: 7,
+                        rate_limited_count: 7,
                         since_ts: envelope.timestamp,
                     }),
                 },
@@ -728,8 +728,8 @@ mod tests {
     // Wire shape comes from spec Part 3 "Traffic events" row for layer
     // `deny-logger`: the `deny` event carries `orig_dst_ip`,
     // `orig_dst_port`, `protocol` (`tcp`/`udp`), `src_ip`, `src_port`. The
-    // `rate_limited` summary event (M10-S3 plan, Hardening § 5) carries
-    // `dropped_events_count` and `since_ts`.
+    // `rate_limited` summary event (spec § "Hardening rules" #5) carries
+    // `rate_limited_count` and `since_ts`.
 
     #[test]
     fn dto_deny_logger_deny_tcp_wire_shape() {
@@ -794,11 +794,10 @@ mod tests {
 
     #[test]
     fn dto_deny_logger_rate_limited_wire_shape() {
-        // `rate_limited` summary event — `dropped_events_count` is the
-        // orchestrator-resolved field name (spec prose calls it
-        // `rate_limited_count`; M10-S3 plan Q5 overrides). `since_ts` must
-        // use the same RFC 3339 + ms + `Z` format as the envelope
-        // timestamp.
+        // `rate_limited` summary event — `rate_limited_count` is the
+        // spec-authoritative field name (spec § "Hardening rules" #5).
+        // `since_ts` must use the same RFC 3339 + ms + `Z` format as the
+        // envelope timestamp.
         let ts = Utc.with_ymd_and_hms(2026, 4, 22, 9, 45, 0).unwrap()
             + chrono::Duration::milliseconds(500);
         let since = Utc.with_ymd_and_hms(2026, 4, 22, 9, 44, 30).unwrap()
@@ -809,7 +808,7 @@ mod tests {
                 session: Some(sid()),
             },
             event: TrafficEvent::DenyLogger(DenyLoggerEvent::RateLimited {
-                dropped_events_count: 42,
+                rate_limited_count: 42,
                 since_ts: since,
             }),
         };
@@ -818,7 +817,7 @@ mod tests {
         assert_eq!(json["event"], "rate_limited");
         assert_eq!(json["timestamp"], "2026-04-22T09:45:00.500Z");
         assert_eq!(json["session"], "0123456789ab");
-        assert_eq!(json["dropped_events_count"], 42);
+        assert_eq!(json["rate_limited_count"], 42);
         assert_eq!(json["since_ts"], "2026-04-22T09:44:30.250Z");
         // `deny` fields must not leak into a `rate_limited` event.
         for absent in [

@@ -210,10 +210,8 @@ pub enum MitmproxyEvent {
 /// The `RateLimited` variant is a periodic summary event emitted when
 /// the component's per-session event rate cap is exceeded — individual
 /// denied attempts are dropped from the stream once the cap is hit and
-/// are reported in aggregate via this variant (spec Part 3 /
-/// "Hardening rules" § 5 — `rate_limited_count` summary; the plan's
-/// orchestrator-resolved field name is `dropped_events_count`, see
-/// M10-S3 plan question 5).
+/// are reported in aggregate via this variant. Carries
+/// `rate_limited_count` per spec Part 3 / "Hardening rules" § 5.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DenyLoggerEvent {
     /// Single denied connection attempt.
@@ -221,7 +219,7 @@ pub enum DenyLoggerEvent {
     /// Periodic cap-breach summary: how many deny events were dropped
     /// since the last summary tick.
     RateLimited {
-        dropped_events_count: u32,
+        rate_limited_count: u32,
         since_ts: DateTime<Utc>,
     },
 }
@@ -615,9 +613,9 @@ mod tests {
     // Per spec Part 3 "Traffic events" row for `deny-logger`: every `deny`
     // event carries `orig_dst_ip`, `orig_dst_port`, `protocol` (`tcp`/
     // `udp`), `src_ip`, `src_port`. The `rate_limited` summary event
-    // carries `dropped_events_count` and `since_ts` (M10-S3 plan Q5).
-    // Note the kebab-case `deny-logger` layer literal — the only multi-
-    // word `layer` value in the spec.
+    // carries `rate_limited_count` and `since_ts` (spec § "Hardening
+    // rules" #5). Note the kebab-case `deny-logger` layer literal — the
+    // only multi-word `layer` value in the spec.
 
     #[test]
     fn env_round_trip_traffic_deny_logger_tcp() {
@@ -653,10 +651,10 @@ mod tests {
         assert_eq!(json["protocol"], "tcp");
         assert_eq!(json["src_ip"], "10.0.0.42");
         assert_eq!(json["src_port"], 55123);
-        // `dropped_events_count` / `since_ts` must not leak into a `deny`.
+        // `rate_limited_count` / `since_ts` must not leak into a `deny`.
         assert!(
-            json.get("dropped_events_count").is_none(),
-            "dropped_events_count must not appear on deny; json = {json}"
+            json.get("rate_limited_count").is_none(),
+            "rate_limited_count must not appear on deny; json = {json}"
         );
         assert!(
             json.get("since_ts").is_none(),
@@ -691,12 +689,12 @@ mod tests {
         let event = Event::Traffic {
             envelope: fixture_envelope(),
             event: TrafficEvent::DenyLogger(DenyLoggerEvent::RateLimited {
-                dropped_events_count: 42,
+                rate_limited_count: 42,
                 since_ts: since,
             }),
         };
         let json = round_trip_traffic(event, "deny-logger", "rate_limited");
-        assert_eq!(json["dropped_events_count"], 42);
+        assert_eq!(json["rate_limited_count"], 42);
         assert_eq!(json["since_ts"], "2026-04-22T09:44:30.250Z");
         // `deny` fields must not leak into a `rate_limited` event.
         for absent in [
