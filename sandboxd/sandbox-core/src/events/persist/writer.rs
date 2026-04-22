@@ -131,9 +131,7 @@ mod tests {
         let p = file_path(Path::new("/var/lib/sandboxd"), &sid(), LayerKind::Dns, date);
         assert_eq!(
             p,
-            PathBuf::from(
-                "/var/lib/sandboxd/sessions/0123456789ab/events/dns-2026-04-22.jsonl"
-            ),
+            PathBuf::from("/var/lib/sandboxd/sessions/0123456789ab/events/dns-2026-04-22.jsonl"),
             "path layout must match spec (no extra events/ prefix)"
         );
     }
@@ -145,12 +143,7 @@ mod tests {
         // trailing `-YYYY-MM-DD` is what the pruner's date parser
         // strips, so preserving the kebab hyphen here is important.
         let date = NaiveDate::from_ymd_opt(2026, 4, 22).unwrap();
-        let p = file_path(
-            Path::new("/tmp/x"),
-            &sid(),
-            LayerKind::DenyLogger,
-            date,
-        );
+        let p = file_path(Path::new("/tmp/x"), &sid(), LayerKind::DenyLogger, date);
         assert!(
             p.file_name()
                 .and_then(|n| n.to_str())
@@ -169,7 +162,9 @@ mod tests {
         w.append_line("{\"hello\":\"world\"}\n")
             .await
             .expect("first append");
-        w.append_line("{\"line\":2}\n").await.expect("second append");
+        w.append_line("{\"line\":2}\n")
+            .await
+            .expect("second append");
         // Explicit flush before reading back; `tokio::fs::File` is
         // unbuffered at the tokio layer and writes go straight to the
         // kernel, but being explicit here keeps the test resilient if

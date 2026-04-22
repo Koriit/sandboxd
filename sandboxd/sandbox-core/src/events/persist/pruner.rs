@@ -284,10 +284,7 @@ mod tests {
         assert_eq!(removed, 0);
         assert!(p_bogus.exists(), "non-date .txt must be left alone");
         assert!(p_bogus_jsonl.exists(), "non-date .jsonl must be left alone");
-        assert!(
-            p_partial.exists(),
-            "partial-date .jsonl must be left alone"
-        );
+        assert!(p_partial.exists(), "partial-date .jsonl must be left alone");
     }
 
     #[tokio::test]
@@ -318,7 +315,11 @@ mod tests {
         // Lock the first session's events dir. Re-enable write at
         // the end of the test via RAII so tempdir cleanup succeeds.
         let locked_dir = base.join("sessions").join("aaaaaaaaaaaa").join("events");
-        let orig_mode = fs::metadata(&locked_dir).await.unwrap().permissions().mode();
+        let orig_mode = fs::metadata(&locked_dir)
+            .await
+            .unwrap()
+            .permissions()
+            .mode();
         fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o500))
             .await
             .unwrap();
@@ -371,6 +372,9 @@ mod tests {
         unsafe {
             std::env::remove_var(TEST_INTERVAL_ENV);
         }
-        assert_eq!(pruner_interval(), Duration::from_secs(DEFAULT_PRUNER_INTERVAL_SECS));
+        assert_eq!(
+            pruner_interval(),
+            Duration::from_secs(DEFAULT_PRUNER_INTERVAL_SECS)
+        );
     }
 }

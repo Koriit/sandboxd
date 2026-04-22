@@ -239,10 +239,7 @@ async fn relay_loop(
         match rx.recv().await {
             Ok(ev) => forward_or_drop(&tx, ev, &dropped),
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                warn!(
-                    lagged = n,
-                    "persistent sink relay: lagged; events skipped"
-                );
+                warn!(lagged = n, "persistent sink relay: lagged; events skipped");
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                 debug!("persistent sink relay: global bus closed; exiting");

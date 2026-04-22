@@ -146,9 +146,15 @@ mod tests {
         let mut map = RotatingWriterMap::new();
         let sid = sid();
 
-        map.write(&clock, dir.path(), &sid, LayerKind::Dns, "{\"day\":\"first\"}\n")
-            .await
-            .expect("first write");
+        map.write(
+            &clock,
+            dir.path(),
+            &sid,
+            LayerKind::Dns,
+            "{\"day\":\"first\"}\n",
+        )
+        .await
+        .expect("first write");
         clock.set(tomorrow);
         map.write(
             &clock,
@@ -215,9 +221,15 @@ mod tests {
         let sid_a = SessionId::parse("aaaaaaaaaaaa").unwrap();
         let sid_b = SessionId::parse("bbbbbbbbbbbb").unwrap();
 
-        map.write(&clock, dir.path(), &sid_a, LayerKind::Dns, "{\"a\":\"dns\"}\n")
-            .await
-            .unwrap();
+        map.write(
+            &clock,
+            dir.path(),
+            &sid_a,
+            LayerKind::Dns,
+            "{\"a\":\"dns\"}\n",
+        )
+        .await
+        .unwrap();
         map.write(
             &clock,
             dir.path(),
@@ -227,9 +239,15 @@ mod tests {
         )
         .await
         .unwrap();
-        map.write(&clock, dir.path(), &sid_b, LayerKind::Dns, "{\"b\":\"dns\"}\n")
-            .await
-            .unwrap();
+        map.write(
+            &clock,
+            dir.path(),
+            &sid_b,
+            LayerKind::Dns,
+            "{\"b\":\"dns\"}\n",
+        )
+        .await
+        .unwrap();
         drop(map);
 
         for (sid, layer, marker) in &[
