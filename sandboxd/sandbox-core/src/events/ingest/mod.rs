@@ -22,5 +22,7 @@
 //! [`jsonl_reader::JsonlTailer`] per file and forwards parsed records to
 //! the shared [`crate::events::EventBus`].
 
+pub mod coredns;
 pub mod envoy;
 pub mod jsonl_reader;
+pub mod mitmproxy;
