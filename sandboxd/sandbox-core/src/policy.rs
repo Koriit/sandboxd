@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::dns_propagation::DnsCache;
 use crate::error::SandboxError;
+use crate::gateway::{NFT_POLICY_ALLOW_TCP_SET, NFT_POLICY_ALLOW_UDP_SET};
 use crate::network::NetworkInfo;
 
 // ---------------------------------------------------------------------------
@@ -731,6 +732,129 @@ pub(crate) fn format_nft_set_elements(elements: &[String]) -> String {
     format!("\n        elements = {{ {} }}", elements.join(", "))
 }
 
+/// Render the M10-S3 two-table ruleset — `sandbox_dnat` (conditional
+/// DNAT keyed on `policy_allow_{tcp,udp}`) and `sandbox_policy`
+/// (Envoy-egress allow output chain).
+///
+/// Both tables carry identical copies of the two concat sets, populated
+/// from the same `tcp_elements` / `udp_elements` slices. The output
+/// starts with `table inet sandbox_dnat {}` + `flush table inet
+/// sandbox_dnat` (and the same pair for `sandbox_policy`) so a single
+/// `nft -f` invocation atomically replaces both table contents —
+/// matching the pattern `dns_propagation::generate_domain_ip_rules`
+/// uses for rebuild-the-whole-table updates.
+///
+/// **Why duplicate the sets.** nftables 1.0.6 on kernel 6.8 (the pinned
+/// gateway-image version) rejects the `@<table>::<setname>`
+/// cross-table reference syntax. Duplicating into both tables and
+/// populating them identically within the same transaction is the
+/// portable fallback. See `gateway::generate_dnat_ruleset` and the
+/// M10-S3 implementation plan risk §1 for the empirical `nft -c`
+/// verification.
+///
+/// The `sandbox_dnat` chain shape emitted here mirrors
+/// `gateway::generate_dnat_ruleset` byte-for-byte; at apply-policy
+/// time we rebuild the whole `sandbox_dnat` table (not just the set
+/// elements) so the chain rules and set elements remain consistent.
+pub(crate) fn render_two_table_ruleset(
+    tcp_elements: &[String],
+    udp_elements: &[String],
+    network_info: &NetworkInfo,
+) -> String {
+    let tcp_elements_block = format_nft_set_elements(tcp_elements);
+    let udp_elements_block = format_nft_set_elements(udp_elements);
+
+    format!(
+        r#"table inet sandbox_dnat {{}}
+flush table inet sandbox_dnat
+table inet sandbox_dnat {{
+    set {tcp_set} {{
+        type ipv4_addr . inet_service
+        flags interval{tcp_elements_block}
+    }}
+
+    set {udp_set} {{
+        type ipv4_addr . inet_service
+        flags interval{udp_elements_block}
+    }}
+
+    chain prerouting {{
+        type nat hook prerouting priority dstnat;
+
+        # DNS -> CoreDNS (port 53)
+        ip saddr {subnet} udp dport {dns_port} dnat to {gateway_ip}:{dns_port}
+        ip saddr {subnet} tcp dport {dns_port} dnat to {gateway_ip}:{dns_port}
+
+        # Policy-allowed destinations -> Envoy
+        ip saddr {subnet} meta l4proto tcp ip daddr . tcp dport @{tcp_set} dnat to {gateway_ip}:{envoy_port}
+        ip saddr {subnet} meta l4proto udp ip daddr . udp dport @{udp_set} dnat to {gateway_ip}:{envoy_port}
+
+        # Everything else -> deny-logger
+        ip saddr {subnet} meta l4proto tcp dnat to {gateway_ip}:{deny_tcp_port}
+        ip saddr {subnet} meta l4proto udp dnat to {gateway_ip}:{deny_udp_port}
+
+        # Block cloud metadata
+        ip daddr 169.254.169.254 drop
+
+        # Drop IPv6
+        ip6 daddr != ::1 drop
+    }}
+
+    chain postrouting {{
+        type nat hook postrouting priority srcnat;
+        masquerade
+    }}
+}}
+
+table inet sandbox_policy {{}}
+flush table inet sandbox_policy
+table inet sandbox_policy {{
+    set {tcp_set} {{
+        type ipv4_addr . inet_service
+        flags interval{tcp_elements_block}
+    }}
+
+    set {udp_set} {{
+        type ipv4_addr . inet_service
+        flags interval{udp_elements_block}
+    }}
+
+    chain output {{
+        type filter hook output priority 0; policy drop;
+
+        # Allow established/related return traffic
+        ct state established,related accept
+
+        # Allow the gateway's own DNS resolver lookups + loopback
+        # housekeeping regardless of policy content.
+        oif lo accept
+        ip daddr {gateway_ip} udp dport {dns_port} accept
+        ip daddr {gateway_ip} tcp dport {dns_port} accept
+
+        # Allow Envoy / mitmproxy to open upstream connections to
+        # policy-allowed destinations (L1 passthrough, L2 TLS pass, L3
+        # MITM). Keyed on the same set as the VM-egress DNAT decision so
+        # a rule that admits VM traffic also admits the gateway's
+        # upstream leg.
+        ip saddr {gateway_ip} ip daddr . tcp dport @{tcp_set} accept
+        ip saddr {gateway_ip} ip daddr . udp dport @{udp_set} accept
+
+        # Fall-through: reject anything else originated by the gateway.
+        reject
+    }}
+}}
+"#,
+        subnet = network_info.subnet,
+        gateway_ip = network_info.gateway_ip,
+        dns_port = crate::gateway::GATEWAY_DNS_PORT,
+        envoy_port = crate::gateway::GATEWAY_ENVOY_PORT,
+        deny_tcp_port = crate::gateway::GATEWAY_DENY_LOGGER_TCP_PORT,
+        deny_udp_port = crate::gateway::GATEWAY_DENY_LOGGER_UDP_PORT,
+        tcp_set = NFT_POLICY_ALLOW_TCP_SET,
+        udp_set = NFT_POLICY_ALLOW_UDP_SET,
+    )
+}
+
 impl PolicyCompiler {
     /// Validate and compile a policy into per-component configurations.
     ///
@@ -866,41 +990,52 @@ impl PolicyCompiler {
 
     /// Compile nftables rules for the policy.
     ///
-    /// Starts with the existing deny-all + DNAT base (generated elsewhere in
-    /// gateway.rs). This method generates an *additional* table
-    /// `sandbox_policy` with explicit allow rules for level >= 1 destinations.
+    /// Emits a **two-table** ruleset that combines a `flush`+rebuild of
+    /// `sandbox_dnat` (the filtering table) with a fresh
+    /// `sandbox_policy` (the Envoy-egress allow table). Both tables carry
+    /// identical copies of the `policy_allow_{tcp,udp}` concat sets (see
+    /// cross-table notes below) and get populated atomically by a single
+    /// `nft -f` transaction inside
+    /// [`crate::policy_distributor::PolicyDistributor`].
     ///
-    /// For level 0 (deny): no rules needed — the base deny-all handles it.
-    /// For level 1 (transport): IP allow rules + TCP redirect to Envoy.
+    /// **M10-S3 shape (post deny-logger).** The filtering decision moved
+    /// from `sandbox_policy.forward` into `sandbox_dnat.prerouting`'s
+    /// conditional DNAT — see
+    /// [`crate::gateway::generate_dnat_ruleset`]. `sandbox_policy` now
+    /// holds only an `output` chain that admits gateway-initiated egress
+    /// to policy-allowed destinations (Envoy opening upstream connections
+    /// for L1/L2 passthrough, mitmproxy opening upstream for L3 MITM),
+    /// keyed on the same `(ipv4_addr . inet_service)` concat sets.
     ///
-    /// **v2 shape (M10-S1 / Phase 3B):** the per-destination allow rules
-    /// live in two **nftables concat sets** keyed on
-    /// `ipv4_addr . inet_service`, one per L4 protocol
-    /// (`policy_allow_tcp`, `policy_allow_udp`). The `forward` chain
-    /// contains a single set-lookup rule per protocol rather than one
-    /// rule per `(ip, port)` destination — see
+    /// **v2 concat-set shape (M10-S1 / Phase 3B, unchanged here).** Each
+    /// allow element is `<ip_or_cidr> . <port>`. Each protocol gets its
+    /// own set (`policy_allow_tcp`, `policy_allow_udp`) keyed on
+    /// `ipv4_addr . inet_service`. The hardcoded `dport { 80, 443 }`
+    /// port set from v1 is gone; each allow element carries the explicit
+    /// port from its policy rule. See
     /// `.tasks/specs/2026-04-21-port-explicit-policies-presets-observability-design.md`
     /// §"Compiler consequences — nftables" (Part 1, lines 162-180).
-    /// The hardcoded `dport { 80, 443 }` port set from v1 is gone; each
-    /// allow element carries the explicit port from its policy rule.
     ///
-    /// Set placement for S1: sets live inside `sandbox_policy`. S3
-    /// (deny-logger spec, Part 3) later moves the filtering decision
-    /// into `sandbox_dnat` with conditional DNAT to Envoy vs.
-    /// deny-logger; at that point the concat sets migrate to
-    /// `sandbox_dnat`. Until then, `sandbox_dnat` remains policy-agnostic
-    /// (it DNATs every non-53 TCP to Envoy:10000 unconditionally — see
-    /// `gateway::generate_dnat_ruleset`) and `sandbox_policy` is the
-    /// filtering gate.
+    /// **Cross-table set references.** Ideally `sandbox_policy.output`
+    /// would reference the sets living in `sandbox_dnat` directly
+    /// (`@<table>::<setname>` syntax), but nftables 1.0.6 on kernel 6.8
+    /// (as pinned in the gateway image) rejects the syntax with "No
+    /// such file or directory". Verified empirically with `nft -c -f -`
+    /// before committing. The sets are therefore duplicated into both
+    /// tables and populated identically — one injection call writes both
+    /// copies.
     ///
-    /// Domain destinations: CIDR rules populate the sets directly;
+    /// **Domain destinations.** CIDR rules populate the sets directly;
     /// domain rules become `(resolved_ip, port)` set elements once DNS
     /// propagation resolves them via
     /// [`crate::dns_propagation::generate_domain_ip_rules`]. A policy
     /// containing only domain rules therefore compiles to an **empty**
     /// ruleset at policy-apply time — the DNS propagation loop emits
-    /// the full table once resolutions land. This preserves v1's
-    /// "no table on domain-only policy" behavior.
+    /// the full two-table ruleset once resolutions land. This preserves
+    /// v1's "no policy rules on domain-only policy" behaviour. At that
+    /// point `sandbox_dnat`'s chain shape (laid down by
+    /// `generate_dnat_ruleset` at gateway-create time) still fall-throughs
+    /// to the deny-logger, so pre-resolution traffic is fail-closed.
     fn compile_nftables(policy: &Policy, network_info: &NetworkInfo) -> String {
         let mut tcp_elements: Vec<String> = Vec::new();
         let mut udp_elements: Vec<String> = Vec::new();
@@ -926,49 +1061,14 @@ impl PolicyCompiler {
         }
 
         // If no CIDR-backed allow rules exist, emit nothing. Domain-only
-        // policies rely on the existing `sandbox` forward chain until
-        // `generate_domain_ip_rules` populates the sets.
+        // policies rely on the base `sandbox_dnat` chain (fall-through to
+        // the deny-logger) until `generate_domain_ip_rules` populates the
+        // sets, at which point the two-table ruleset is emitted in full.
         if tcp_elements.is_empty() && udp_elements.is_empty() {
             return String::new();
         }
 
-        let tcp_elements_block = format_nft_set_elements(&tcp_elements);
-        let udp_elements_block = format_nft_set_elements(&udp_elements);
-
-        format!(
-            r#"table inet sandbox_policy {{
-    set policy_allow_tcp {{
-        type ipv4_addr . inet_service
-        flags interval{tcp_elements_block}
-    }}
-
-    set policy_allow_udp {{
-        type ipv4_addr . inet_service
-        flags interval{udp_elements_block}
-    }}
-
-    chain forward {{
-        type filter hook forward priority -1; policy drop;
-
-        # Allow established/related return traffic
-        ct state established,related accept
-
-        # Allow DNS to gateway (CoreDNS)
-        ip saddr {subnet} ip daddr {gateway_ip} udp dport 53 accept
-        ip saddr {subnet} ip daddr {gateway_ip} tcp dport 53 accept
-
-        # Policy allow rules — concat-set lookups keyed on (daddr, dport)
-        ct original ip daddr . tcp dport @policy_allow_tcp accept
-        ct original ip daddr . udp dport @policy_allow_udp accept
-
-        # Reject everything else (fast failure for denied destinations)
-        reject
-    }}
-}}
-"#,
-            subnet = network_info.subnet,
-            gateway_ip = network_info.gateway_ip,
-        )
+        render_two_table_ruleset(&tcp_elements, &udp_elements, network_info)
     }
 
     /// Compile the Envoy **static bootstrap** config.
@@ -2816,9 +2916,16 @@ mod tests {
 
         let nft = &compiled.nftables_rules;
 
-        // v2 shape: the CIDR destination appears as a concat-set element
-        // `<cidr> . <port>` inside `policy_allow_tcp`, not as an inline
-        // `ct original ip daddr <cidr> tcp dport { 80, 443 } accept` rule.
+        // v2/M10-S3 shape: the CIDR destination appears as a concat-set
+        // element `<cidr> . <port>` inside `policy_allow_tcp`. Two tables
+        // carry identical copies of the sets — `sandbox_dnat` uses them to
+        // route VM-egress to Envoy via conditional DNAT, `sandbox_policy`
+        // uses them in its `output` chain to admit gateway-originated
+        // upstream connections.
+        assert!(
+            nft.contains("table inet sandbox_dnat"),
+            "nftables should define sandbox_dnat table; got:\n{nft}"
+        );
         assert!(
             nft.contains("table inet sandbox_policy"),
             "nftables should define sandbox_policy table; got:\n{nft}"
@@ -2843,15 +2950,132 @@ mod tests {
             "policy_allow_tcp must contain the (cidr . port) element for \
              the CIDR rule; got:\n{nft}"
         );
+        // sandbox_dnat.prerouting conditionally DNATs policy-allowed
+        // destinations to Envoy.
         assert!(
-            nft.contains("ct original ip daddr . tcp dport @policy_allow_tcp accept"),
-            "forward chain must carry the concat-set lookup rule for TCP; \
+            nft.contains(
+                "meta l4proto tcp ip daddr . tcp dport @policy_allow_tcp dnat to 10.209.0.2:10000"
+            ),
+            "sandbox_dnat.prerouting must route policy-allowed TCP to \
+             Envoy via conditional DNAT; got:\n{nft}"
+        );
+        assert!(
+            nft.contains(
+                "meta l4proto udp ip daddr . udp dport @policy_allow_udp dnat to 10.209.0.2:10000"
+            ),
+            "sandbox_dnat.prerouting must route policy-allowed UDP to \
+             Envoy via conditional DNAT; got:\n{nft}"
+        );
+        // sandbox_policy.output admits the gateway's own upstream
+        // connections to the same policy-allowed destinations.
+        assert!(
+            nft.contains("ip saddr 10.209.0.2 ip daddr . tcp dport @policy_allow_tcp accept"),
+            "sandbox_policy.output must admit gateway-originated TCP to \
+             policy-allowed destinations; got:\n{nft}"
+        );
+        assert!(
+            nft.contains("ip saddr 10.209.0.2 ip daddr . udp dport @policy_allow_udp accept"),
+            "sandbox_policy.output must admit gateway-originated UDP to \
+             policy-allowed destinations; got:\n{nft}"
+        );
+    }
+
+    #[test]
+    fn compile_nftables_emits_two_tables() {
+        // M10-S3 shape: compile emits BOTH `sandbox_dnat` (VM-egress
+        // filter + DNAT) and `sandbox_policy` (Envoy-egress allow), with
+        // `sandbox_dnat` declared first so the single `nft -f`
+        // transaction lays down the filter table before the egress table.
+        let policy = transport_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+        let nft = &compiled.nftables_rules;
+
+        let dnat_idx = nft
+            .find("table inet sandbox_dnat {")
+            .expect("sandbox_dnat table must be emitted");
+        let policy_idx = nft
+            .find("table inet sandbox_policy {")
+            .expect("sandbox_policy table must be emitted");
+        assert!(
+            dnat_idx < policy_idx,
+            "sandbox_dnat must be declared before sandbox_policy (DNAT \
+             decisions depend on the sets being in place before the egress \
+             table references them); got dnat@{dnat_idx} policy@{policy_idx} \
+             in:\n{nft}"
+        );
+
+        // Idempotent flush-and-redefine idiom must precede each table.
+        assert!(
+            nft.contains("table inet sandbox_dnat {}\nflush table inet sandbox_dnat"),
+            "sandbox_dnat must use the idempotent flush-and-redefine idiom; \
              got:\n{nft}"
         );
         assert!(
-            nft.contains("ct original ip daddr . udp dport @policy_allow_udp accept"),
-            "forward chain must carry the concat-set lookup rule for UDP; \
+            nft.contains("table inet sandbox_policy {}\nflush table inet sandbox_policy"),
+            "sandbox_policy must use the idempotent flush-and-redefine idiom; \
              got:\n{nft}"
+        );
+    }
+
+    #[test]
+    fn compile_nftables_dnat_prerouting_routes_allow_to_envoy_deny_to_deny_logger() {
+        // Pin the four prerouting DNAT rules that encode the VM-egress
+        // filter decision: DNS → CoreDNS :53, allow → Envoy :10000, TCP
+        // deny → deny-logger :10001, UDP deny → deny-logger :10002.
+        let policy = transport_policy();
+        let net = test_network_info();
+        let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
+        let nft = &compiled.nftables_rules;
+
+        // DNS to CoreDNS :53 (both TCP and UDP).
+        assert!(
+            nft.contains("ip saddr 10.209.0.0/28 udp dport 53 dnat to 10.209.0.2:53"),
+            "VM-egress UDP :53 must DNAT to CoreDNS; got:\n{nft}"
+        );
+        assert!(
+            nft.contains("ip saddr 10.209.0.0/28 tcp dport 53 dnat to 10.209.0.2:53"),
+            "VM-egress TCP :53 must DNAT to CoreDNS; got:\n{nft}"
+        );
+
+        // Policy-allowed destinations to Envoy :10000.
+        assert!(
+            nft.contains(
+                "ip saddr 10.209.0.0/28 meta l4proto tcp ip daddr . tcp dport \
+                 @policy_allow_tcp dnat to 10.209.0.2:10000"
+            ),
+            "policy-allowed TCP must DNAT to Envoy :10000; got:\n{nft}"
+        );
+        assert!(
+            nft.contains(
+                "ip saddr 10.209.0.0/28 meta l4proto udp ip daddr . udp dport \
+                 @policy_allow_udp dnat to 10.209.0.2:10000"
+            ),
+            "policy-allowed UDP must DNAT to Envoy :10000; got:\n{nft}"
+        );
+
+        // Fall-through to deny-logger (separate TCP and UDP ports).
+        assert!(
+            nft.contains("ip saddr 10.209.0.0/28 meta l4proto tcp dnat to 10.209.0.2:10001"),
+            "unmatched TCP must fall through to deny-logger :10001; got:\n{nft}"
+        );
+        assert!(
+            nft.contains("ip saddr 10.209.0.0/28 meta l4proto udp dnat to 10.209.0.2:10002"),
+            "unmatched UDP must fall through to deny-logger :10002; got:\n{nft}"
+        );
+
+        // Ordering: allow rules must appear before the deny-logger
+        // fall-through so nftables evaluates them first.
+        let allow_tcp_idx = nft
+            .find("dport @policy_allow_tcp dnat to 10.209.0.2:10000")
+            .expect("allow-to-envoy TCP rule missing");
+        let deny_tcp_idx = nft
+            .find("meta l4proto tcp dnat to 10.209.0.2:10001")
+            .expect("deny-logger TCP rule missing");
+        assert!(
+            allow_tcp_idx < deny_tcp_idx,
+            "allow-to-envoy TCP must precede deny-logger fall-through; got \
+             allow@{allow_tcp_idx} deny@{deny_tcp_idx} in:\n{nft}"
         );
     }
 
@@ -3487,25 +3711,45 @@ mod tests {
             "policy_allow_udp must contain the (cidr . port) element for the \
              UDP rule; got:\n{nft}"
         );
-        // Extract the policy_allow_tcp set body and verify it has no
-        // `elements = { ... }` clause (no TCP rules in this policy).
-        let tcp_set_start = nft
-            .find("set policy_allow_tcp")
-            .expect("policy_allow_tcp set should exist");
-        let tcp_set_end = nft[tcp_set_start..]
-            .find("\n    }")
-            .map(|i| tcp_set_start + i)
-            .expect("policy_allow_tcp set should terminate");
-        let tcp_set_body = &nft[tcp_set_start..tcp_set_end];
-        assert!(
-            !tcp_set_body.contains("elements"),
-            "policy_allow_tcp should have no elements when only UDP rules \
-             exist; got body:\n{tcp_set_body}"
+        // Extract every `set policy_allow_tcp` body (one per table under
+        // the two-table shape) and verify each has no `elements = { ... }`
+        // clause (no TCP rules in this policy).
+        let mut scan = nft.as_str();
+        let mut seen_tcp_sets = 0;
+        while let Some(start_rel) = scan.find("set policy_allow_tcp") {
+            let start = start_rel;
+            let end = scan[start..]
+                .find("\n    }")
+                .map(|i| start + i)
+                .expect("policy_allow_tcp set should terminate");
+            let tcp_set_body = &scan[start..end];
+            assert!(
+                !tcp_set_body.contains("elements"),
+                "policy_allow_tcp should have no elements when only UDP rules \
+                 exist; got body:\n{tcp_set_body}"
+            );
+            seen_tcp_sets += 1;
+            scan = &scan[end..];
+        }
+        assert_eq!(
+            seen_tcp_sets, 2,
+            "two-table shape should declare policy_allow_tcp once per table; \
+             got {seen_tcp_sets} occurrences in:\n{nft}"
         );
+        // sandbox_policy.output admits gateway-originated UDP to
+        // policy-allowed destinations via the concat set.
         assert!(
-            nft.contains("ct original ip daddr . udp dport @policy_allow_udp accept"),
-            "forward chain must carry the concat-set lookup rule for UDP; \
-             got:\n{nft}"
+            nft.contains("ip saddr 10.209.0.2 ip daddr . udp dport @policy_allow_udp accept"),
+            "sandbox_policy.output must admit gateway-originated UDP to \
+             policy-allowed destinations; got:\n{nft}"
+        );
+        // sandbox_dnat.prerouting DNATs policy-allowed UDP to Envoy.
+        assert!(
+            nft.contains(
+                "meta l4proto udp ip daddr . udp dport @policy_allow_udp dnat to 10.209.0.2:10000"
+            ),
+            "sandbox_dnat.prerouting must route policy-allowed UDP to \
+             Envoy via conditional DNAT; got:\n{nft}"
         );
     }
 
