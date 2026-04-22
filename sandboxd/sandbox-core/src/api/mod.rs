@@ -82,6 +82,21 @@ pub struct CreateSessionRequest {
     /// When `true`, the daemon always creates a fresh VM from scratch
     /// instead of cloning from the base image.
     pub no_cache: Option<bool>,
+    /// Original `--preset` invocation strings forwarded by the CLI.
+    ///
+    /// Populated by the CLI (M10-S5) when presets expanded into the
+    /// policy document above, so the daemon can surface them on the
+    /// `policy_applied` lifecycle event for operator debugging and
+    /// audit. Optional and additive on the wire: older CLIs that do
+    /// not send the field deserialize to an empty vector; newer
+    /// daemons reading records written without the field do the
+    /// same.
+    ///
+    /// The daemon never expands presets itself — preset expansion is
+    /// strictly a CLI-local feature (spec Part 2 "Presets are CLI-
+    /// local"). This field is a pure passthrough for attribution.
+    #[serde(default)]
+    pub source_presets: Vec<String>,
 }
 
 /// Request body for `POST /sessions/{id}/upload`.
@@ -113,11 +128,22 @@ pub struct FileDownloadResponse {
 ///
 /// Contains the full policy document to compile and distribute to the
 /// session's gateway components.
+///
+/// `source_presets` carries the CLI's original `--preset` invocation
+/// strings, if any, so the daemon can stamp them onto the emitted
+/// `policy_updated` lifecycle event. The field is additive and
+/// optional on the wire (`#[serde(default)]`): records from older
+/// CLIs decode cleanly, and the daemon never inspects the field for
+/// policy semantics — preset expansion stays CLI-local per spec
+/// Part 2.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UpdatePolicyRequest {
     /// The policy document to apply.
     #[serde(flatten)]
     pub policy: crate::policy::Policy,
+    /// Original `--preset` invocation strings forwarded by the CLI.
+    #[serde(default)]
+    pub source_presets: Vec<String>,
 }
 
 /// Request body for `POST /sessions/{id}/exec`.
@@ -156,6 +182,10 @@ mod tests {
         assert!(req.workspace.is_none());
         assert!(req.hardened.is_none());
         assert!(req.no_cache.is_none());
+        assert!(
+            req.source_presets.is_empty(),
+            "source_presets must default to empty on an empty request object"
+        );
     }
 
     #[test]
@@ -431,6 +461,73 @@ mod tests {
             req.no_cache.is_none(),
             "no_cache should be None when absent from request"
         );
+    }
+
+    #[test]
+    fn deserialize_create_request_without_source_presets_is_empty_vec() {
+        // Backward-compat: pre-M10-S5 CLIs never send source_presets.
+        // The default decode must be an empty vector, not an error.
+        let json = r#"{"name": "legacy-cli"}"#;
+        let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
+        assert!(
+            req.source_presets.is_empty(),
+            "source_presets must default to empty Vec when absent"
+        );
+    }
+
+    #[test]
+    fn deserialize_create_request_with_source_presets() {
+        let json = r#"{
+            "name": "preset-aware",
+            "source_presets": ["cargo", "github:api"]
+        }"#;
+        let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            req.source_presets,
+            vec!["cargo".to_string(), "github:api".to_string()]
+        );
+    }
+
+    #[test]
+    fn deserialize_update_policy_request_without_source_presets_is_empty_vec() {
+        // Flattened Policy + additive source_presets at the top level —
+        // older CLIs that don't send the field still decode cleanly.
+        let json = r#"{
+            "version": "2.0.0",
+            "rules": [
+                {
+                    "host": "github.com",
+                    "port": 443,
+                    "protocol": "tcp",
+                    "level": "transport"
+                }
+            ]
+        }"#;
+        let req: UpdatePolicyRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.policy.version, "2.0.0");
+        assert!(
+            req.source_presets.is_empty(),
+            "source_presets must default to empty Vec when absent"
+        );
+    }
+
+    #[test]
+    fn deserialize_update_policy_request_with_source_presets() {
+        let json = r#"{
+            "version": "2.0.0",
+            "rules": [
+                {
+                    "host": "github.com",
+                    "port": 443,
+                    "protocol": "tcp",
+                    "level": "transport"
+                }
+            ],
+            "source_presets": ["npm"]
+        }"#;
+        let req: UpdatePolicyRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.policy.version, "2.0.0");
+        assert_eq!(req.source_presets, vec!["npm".to_string()]);
     }
 
     #[test]
