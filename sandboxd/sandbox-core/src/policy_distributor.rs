@@ -127,8 +127,17 @@ impl PolicyDistributor {
             debug!(session_id = %session_id, "nftables policy rules injected");
         } else {
             // When no nftables rules are needed, flush any stale
-            // sandbox_policy table left from a previous policy distribution.
-            let flush_script = "delete table inet sandbox_policy\n";
+            // sandbox_policy table left from a previous policy
+            // distribution. `sandbox_dnat` is intentionally left
+            // intact — its chain shape was laid down at create_gateway
+            // time and an empty policy means empty concat sets, which
+            // the chain already fall-throughs to the deny-logger for
+            // (exactly the fail-closed behaviour we want). Use the
+            // idempotent `add table` + `delete table` idiom so the
+            // flush is safe whether or not `sandbox_policy` currently
+            // exists.
+            let flush_script = "table inet sandbox_policy {}\n\
+                                delete table inet sandbox_policy\n";
             let _ =
                 gateway.inject_nftables_ruleset_public(session_id, flush_script, "policy-flush");
             debug!(session_id = %session_id, "flushed stale sandbox_policy table (if any)");
@@ -237,21 +246,37 @@ impl PolicyDistributor {
 
         if state.nftables_injected {
             if let Some(ref rules) = previous.nftables {
-                // Re-inject previous nftables rules. If there were none, flush
-                // the policy table.
+                let gateway = GatewayManager::new();
                 if rules.is_empty() {
-                    let flush = "delete table inet sandbox_policy\n";
-                    let gateway = GatewayManager::new();
+                    // No prior policy state: flush sandbox_policy via
+                    // the idempotent idiom. sandbox_dnat is left
+                    // intact (its chain shape was laid down at
+                    // create_gateway time; empty concat sets already
+                    // give fail-closed behaviour).
+                    let flush = "table inet sandbox_policy {}\n\
+                                 delete table inet sandbox_policy\n";
                     let _ = gateway.inject_nftables_ruleset_public(
                         session_id,
                         flush,
                         "policy-rollback",
                     );
                 } else {
-                    let gateway = GatewayManager::new();
+                    // Re-inject the previous two-table snapshot. The
+                    // snapshot came from `read_nftables_state` as raw
+                    // `nft list table` output for each table; prepend
+                    // idempotent flushes so re-injection replaces
+                    // rather than merges on top of the half-applied
+                    // state we are rolling back from.
+                    let restore = format!(
+                        "table inet sandbox_dnat {{}}\n\
+                         flush table inet sandbox_dnat\n\
+                         table inet sandbox_policy {{}}\n\
+                         flush table inet sandbox_policy\n\
+                         {rules}"
+                    );
                     let _ = gateway.inject_nftables_ruleset_public(
                         session_id,
-                        rules,
+                        &restore,
                         "policy-rollback",
                     );
                 }
@@ -397,28 +422,40 @@ fn read_file_from_container(container: &str, path: &str) -> Result<String, Sandb
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// Read the current nftables sandbox_policy table state from the container
-/// via `docker exec`.
+/// Read the current nftables state for both policy tables
+/// (`sandbox_dnat` + `sandbox_policy`) from the container via `docker
+/// exec`. The snapshot is used by rollback to restore the pre-apply
+/// ruleset.
+///
+/// **M10-S3 shape.** Both tables are managed as a pair — `sandbox_dnat`
+/// carries the VM-egress conditional-DNAT decision and both concat
+/// sets; `sandbox_policy` carries the gateway-egress allow `output`
+/// chain keyed on the same sets. A rollback that restored only one
+/// would leave the gateway in a half-configured state, so the snapshot
+/// covers both. Each table is listed separately; either may be absent
+/// (e.g. when no policy has ever been applied) — the listing for a
+/// missing table is silently omitted.
 fn read_nftables_state(session_id: &SessionId) -> Result<String, SandboxError> {
     let container = gateway::container_name(session_id);
+    let mut combined = String::new();
 
-    let output = Command::new("docker")
-        .args([
-            "exec",
-            &container,
-            "nft",
-            "list",
-            "table",
-            "inet",
-            "sandbox_policy",
-        ])
-        .output()
-        .map_err(|e| SandboxError::Gateway(format!("failed to list nftables policy table: {e}")))?;
+    for table in ["sandbox_dnat", "sandbox_policy"] {
+        let output = Command::new("docker")
+            .args([
+                "exec", &container, "nft", "list", "table", "inet", table,
+            ])
+            .output()
+            .map_err(|e| {
+                SandboxError::Gateway(format!("failed to list nftables table {table}: {e}"))
+            })?;
 
-    if !output.status.success() {
-        // Table may not exist yet -- that's OK.
-        return Ok(String::new());
+        if output.status.success() {
+            combined.push_str(&String::from_utf8_lossy(&output.stdout));
+        }
+        // Missing table is fine — the gateway may not have any policy
+        // state yet (e.g. we snapshot right after create_gateway but
+        // before any apply).
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok(combined)
 }
