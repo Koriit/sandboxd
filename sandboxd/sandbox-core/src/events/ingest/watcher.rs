@@ -359,6 +359,17 @@ fn drain_all(
 
 /// Parse one line based on its layer, resolve session from the
 /// per-layer client / source IP, and publish.
+///
+/// The per-parser source IP is an [`Option`] because the deny-logger's
+/// `rate_limited` summary carries no 5-tuple — it is a per-session
+/// aggregate produced when the component's per-session event rate cap
+/// is hit (spec Part 3 / "Hardening rules" § 5). For that case we fall
+/// back to the ingestor's own `watcher_session`: every [`SessionIngestor`]
+/// instance runs for a single session by construction, so the owning
+/// session is already known at this layer. Every other parser returns
+/// `Some(ip)` and goes through the normal `vm_ip_map.lookup` path.
+///
+/// [`SessionIngestor`]: crate::events::ingest::SessionIngestor
 fn dispatch_line(
     watcher_session: &SessionId,
     bus: &EventBus,
@@ -366,32 +377,17 @@ fn dispatch_line(
     layer: Layer,
     line: &str,
 ) {
-    let parsed: Result<(DateTime<Utc>, std::net::Ipv4Addr, TrafficEvent), _> = match layer {
-        Layer::Envoy => {
-            parse_envoy_line(line).map(|p: ParsedEnvoyEvent| (p.timestamp, p.src_ip, p.traffic))
-        }
-        Layer::Coredns => {
-            parse_coredns_line(line).map(|p: ParsedDnsEvent| (p.timestamp, p.client_ip, p.traffic))
-        }
+    let parsed: Result<(DateTime<Utc>, Option<std::net::Ipv4Addr>, TrafficEvent), _> = match layer {
+        Layer::Envoy => parse_envoy_line(line)
+            .map(|p: ParsedEnvoyEvent| (p.timestamp, Some(p.src_ip), p.traffic)),
+        Layer::Coredns => parse_coredns_line(line)
+            .map(|p: ParsedDnsEvent| (p.timestamp, Some(p.client_ip), p.traffic)),
         Layer::Mitmproxy => parse_mitmproxy_line(line)
-            .map(|p: ParsedMitmEvent| (p.timestamp, p.client_ip, p.traffic)),
-        // Deny-logger records carry `src_ip` only on `deny`; the
-        // `rate_limited` summary has no 5-tuple (a subsequent commit
-        // wires that fallback case to the ingestor's own session).
-        // For now, treat a missing `src_ip` as a soft error so the
-        // record is dropped rather than mis-attributed.
-        Layer::DenyLogger => parse_deny_logger_line(line).and_then(
-            |p: ParsedDenyLoggerEvent| match p.src_ip {
-                Some(ip) => Ok((p.timestamp, ip, p.traffic)),
-                None => Err(crate::error::SandboxError::Internal(
-                    "deny-logger record has no src_ip (rate_limited summary); \
-                     fallback routing not yet wired"
-                        .into(),
-                )),
-            },
-        ),
+            .map(|p: ParsedMitmEvent| (p.timestamp, Some(p.client_ip), p.traffic)),
+        Layer::DenyLogger => parse_deny_logger_line(line)
+            .map(|p: ParsedDenyLoggerEvent| (p.timestamp, p.src_ip, p.traffic)),
     };
-    let (timestamp, client_ip, traffic) = match parsed {
+    let (timestamp, maybe_client_ip, traffic) = match parsed {
         Ok(v) => v,
         Err(e) => {
             warn!(
@@ -404,19 +400,33 @@ fn dispatch_line(
         }
     };
 
-    let Some(session_id) = vm_ip_map.lookup(client_ip) else {
-        // Dropping unattributable events is a deliberate design choice
-        // (spec Part 3, plan Phase 7): a fabricated / wrong session on
-        // the envelope would be silently misleading, whereas a dropped
-        // event surfaces as a clear gap that operators can investigate
-        // via the warn log.
-        warn!(
-            watcher_session = %watcher_session,
-            layer = ?layer,
-            client_ip = %client_ip,
-            "ingest: vm_ip not bound to a session; dropping event"
-        );
-        return;
+    let session_id = match maybe_client_ip {
+        Some(client_ip) => {
+            let Some(sid) = vm_ip_map.lookup(client_ip) else {
+                // Dropping unattributable events is a deliberate design
+                // choice (spec Part 3, plan Phase 7): a fabricated /
+                // wrong session on the envelope would be silently
+                // misleading, whereas a dropped event surfaces as a
+                // clear gap that operators can investigate via the warn
+                // log.
+                warn!(
+                    watcher_session = %watcher_session,
+                    layer = ?layer,
+                    client_ip = %client_ip,
+                    "ingest: vm_ip not bound to a session; dropping event"
+                );
+                return;
+            };
+            sid
+        }
+        None => {
+            // No peer IP on the parsed record — the only producer that
+            // emits this shape today is the deny-logger's
+            // `rate_limited` summary (spec Part 3 / "Hardening rules"
+            // § 5). The summary is per-session by construction, so the
+            // ingestor's own `watcher_session` is the correct owner.
+            *watcher_session
+        }
     };
 
     let envelope = EventEnvelope {
