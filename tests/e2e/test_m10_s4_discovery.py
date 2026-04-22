@@ -369,18 +369,26 @@ def test_discovery_workflow_surfaces_denials_then_policy_update_closes_them(
             f"stderr: {update_result.stderr}"
         )
 
-        # 11. Record a tz-aware UTC timestamp right after the update
-        #     lands. Events with timestamp >= this are "new" deny
-        #     events that must NOT appear for our two target hosts.
-        policy_update_ts = datetime.datetime.now(datetime.timezone.utc)
+        # 11. Let the policy update propagate to CoreDNS's deny-hostname
+        #     set before we trigger DNS resolution. Without this pre-warmup
+        #     sleep, the nslookup below can race the propagation and return
+        #     a DNS query_denied, which we would then have to filter out
+        #     of the post-update deny-event assertion (noisy and flaky).
+        time.sleep(5)
 
-        # Warm DNS so the daemon's propagation loop materialises the per-rule
-        # Envoy filter chain and the sandbox_policy nftables concat-set entry
-        # (ip, port) for each target host. Under schema v2 L1 transport is
-        # fail-closed at empty cache — without this warmup the curl --resolve
-        # workload would race against the 2-second DNS-driven propagation loop
-        # and lose. See test_m4_policy.test_level1_transport_tcp for the same
-        # pattern on a fresh session.
+        # 12. Warm DNS so the daemon's propagation loop materialises the
+        #     per-rule Envoy filter chain and the sandbox_policy nftables
+        #     concat-set entry (ip, port) for each target host. Under schema
+        #     v2 L1 transport is fail-closed at empty cache — without this
+        #     warmup the curl --resolve workload would race against the
+        #     2-second DNS-driven propagation loop and lose. See
+        #     test_m4_policy.test_level1_transport_tcp for the same pattern.
+        #
+        #     Note: these nslookup calls themselves may produce dns.query_denied
+        #     events if the policy update is still propagating. That's why
+        #     `policy_update_ts` is recorded *after* the warmup settles — the
+        #     assertion below only counts denials attributable to the
+        #     post-update workload, not to the propagation window.
         for host in TARGET_HOSTS:
             sandbox_cli(
                 "ssh", SESSION_NAME, "--", "nslookup", host,
@@ -388,11 +396,17 @@ def test_discovery_workflow_surfaces_denials_then_policy_update_closes_them(
             )
         time.sleep(5)
 
-        # 12. Re-run the same workload. With the new policy in effect,
+        # 12. Record a tz-aware UTC timestamp right before the post-update
+        #     workload. Events with timestamp >= this are "new" deny events
+        #     attributable to the workload — and must NOT appear for our two
+        #     target hosts if the allow policy took effect.
+        policy_update_ts = datetime.datetime.now(datetime.timezone.utc)
+
+        # 13. Re-run the same workload. With the new policy in effect,
         #     the deny-logger path should not fire for these hosts.
         _curl_both_targets(sandbox_cli, host_to_ips)
 
-        # 13. Propagation budget for any late deny events.
+        # 14. Propagation budget for any late deny events.
         time.sleep(EVENT_PROPAGATION_S)
 
         # 14. Run `sandbox events <session> --decision=deny` (non-follow)
