@@ -1958,15 +1958,23 @@ async fn handle_events(
     json_flag: bool,
     table_flag: bool,
 ) {
-    // Default mode: JSON unless --table was passed. clap's ArgGroup
-    // guarantees at most one of --json / --table is set.
+    // Three-way precedence for the output mode (matches
+    // `docs/reference/cli.md` documentation for `--json` / `--table`):
+    //
+    // 1. `--table` wins — explicit request for the human-friendly view.
+    // 2. `--json` wins — explicit request for machine-readable JSONL.
+    // 3. No flag set: auto-detect based on stdout — JSONL when piped
+    //    (scripts) and table when connected to a terminal (interactive).
+    //
+    // clap's ArgGroup guarantees at most one of `--json` / `--table` is
+    // set, so the two explicit branches are mutually exclusive.
+    let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
     let mode = if table_flag {
         EventsOutputMode::Table
-    } else {
-        // `json_flag` may or may not be set; either way the default is
-        // JSON.
-        let _ = json_flag;
+    } else if json_flag || !stdout_is_tty {
         EventsOutputMode::Json
+    } else {
+        EventsOutputMode::Table
     };
 
     let resolved_since = match since {
