@@ -530,14 +530,18 @@ class TestPortMatching:
     Introduced in M10-S1.  The addon reads ``flow.request.port`` and
     compares against the rule's ``port`` field before walking its
     ``filters``.  A request whose destination port differs from every
-    matching-host rule falls through to "host not in policy" — the
-    same reason code the addon uses when no rule host matched at all.
+    matching-host rule is denied — the deny reason distinguishes the
+    port-miss case from a genuine host-miss so operators reading
+    ``sandbox events --decision=deny`` can tell a missing-port policy
+    entry apart from a missing-host one.
     """
 
     def test_matching_host_wrong_port_denies(self) -> None:
         """Rule for `(httpbin.org, 443)` must deny a request to
         `httpbin.org:8443`, even with a filter that permits the
-        `(method, path)` pair."""
+        `(method, path)` pair.  The deny reason must call out the
+        port mismatch rather than pretending the host is unknown —
+        this is the M10-S2 deny-event discovery signal."""
         addon = _make_addon([
             {"host": "httpbin.org", "port": 443, "filters": [ANY_FILTER]},
         ])
@@ -548,7 +552,7 @@ class TestPortMatching:
         )
         assert flow.response.status_code == 599
         body = json.loads(flow.response.content)
-        assert body["reason"] == "host not in policy"
+        assert body["reason"] == "host matched but port 8443 not in policy"
         assert body["port"] == 8443
 
     def test_multiple_rules_same_host_different_ports(self) -> None:

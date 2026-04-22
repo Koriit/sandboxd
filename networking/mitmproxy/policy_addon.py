@@ -32,11 +32,15 @@ Config format (from sandboxd MitmproxyConfig, M10-S1 v2 schema):
 
 - Rule identity on the wire is `(host, port)`: a rule only matches a
   request whose destination port equals the rule's `port`.  A port
-  mismatch skips the rule — the request is denied with
-  `"host not in policy"` if no other rule matches.  This lets policies
-  express "HTTP to api.example.com:443 only, nothing on :8443" without
-  a separate deny rule.  Added in M10-S1 — prior versions omitted the
-  field.
+  mismatch skips the rule — if no other rule matches on both host and
+  port, the deny reason distinguishes the two cases:
+  `"host matched but port <port> not in policy"` when at least one rule
+  matched the host at a different port, and `"host not in policy"`
+  when no rule matched the host at all.  This lets policies express
+  "HTTP to api.example.com:443 only, nothing on :8443" without a
+  separate deny rule, and lets operators reading deny events tell a
+  missing-port entry apart from a missing-host entry.  Added in M10-S1
+  — prior versions omitted the field.
 - Each `filters[i]` is a `(method, path)` pair — both must match
   together.  This differs from the pre-M9-S10 shape (independent
   `methods` / `paths` lists with cartesian-product semantics).
@@ -273,8 +277,17 @@ class PolicyAddon:
         only matches when its host pattern matches the request host
         **and** its `port` field equals the request's destination port.
         Rules with a host match but port mismatch are skipped — if no
-        other rule matches, the request is denied with "host not in
-        policy".
+        other rule matches, the deny reason distinguishes the two
+        cases:
+
+        * `"host not in policy"` — no rule matched the request host at
+          any port.
+        * `"host matched but port <port> not in policy"` — at least one
+          rule matched the host, but none at the request's destination
+          port.  This is the discovery signal operators need to tell a
+          missing-port entry apart from a missing-host entry; the
+          string is part of the deny-event schema consumed by
+          `sandbox events --decision=deny` (M10-S2+).
 
         When at least one rule matches on both host and port, their
         `filters` lists contribute as a union: the request is permitted
@@ -289,8 +302,12 @@ class PolicyAddon:
         request_method = method.upper()
 
         # Walk every rule whose (host, port) matches and look for a
-        # filter pair that matches (method, path).
+        # filter pair that matches (method, path).  Track host-only
+        # matches separately so a port mismatch produces a distinct
+        # deny reason from a genuine no-host-match — operators reading
+        # deny events need to tell these cases apart.
         matched_any_rule = False
+        matched_host_only = False
         for rule in rules:
             rule_host = rule.get("host", "")
             if not self._match_host(host, rule_host):
@@ -300,7 +317,13 @@ class PolicyAddon:
             # `port` means this is a legacy/malformed rule — skip it
             # rather than silently allowing.
             rule_port = rule.get("port")
-            if not isinstance(rule_port, int) or rule_port != port:
+            if not isinstance(rule_port, int):
+                continue
+            if rule_port != port:
+                # Host matched but this rule is for a different port.
+                # Remember that so we can emit the port-miss reason if
+                # no other rule matches both host and port.
+                matched_host_only = True
                 continue
             matched_any_rule = True
 
@@ -309,6 +332,12 @@ class PolicyAddon:
                     return True, ""
 
         if not matched_any_rule:
+            if matched_host_only:
+                # Host appears in policy but not at this port — this is
+                # the discovery signal operators need.  The string is
+                # part of the deny-event schema; do not change without
+                # coordinating with consumers of `sandbox events`.
+                return False, f"host matched but port {port} not in policy"
             return False, "host not in policy"
 
         return False, f"no filter matched {method} {path}"

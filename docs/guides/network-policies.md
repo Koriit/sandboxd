@@ -215,8 +215,9 @@ If you are using a hardcoded IP, list it explicitly as a CIDR rule.
 
 The request reached mitmproxy (level `http`) but no filter matched. The response body names the reason:
 
-- `"host not in policy"` — no rule covers the request host.
-- `"no filter matched <METHOD> <PATH>"` — a rule covers the host but no `http_filters` entry matched.
+- `"host not in policy"` — no rule covers the request host at any port.
+- `"host matched but port <PORT> not in policy"` — at least one rule covers the host, but none at the request's destination port. Add a rule for `(host, PORT)` or change the client to use the port the existing rule covers.
+- `"no filter matched <METHOD> <PATH>"` — a rule covers the host and port but no `http_filters` entry matched.
 
 Inspect the details:
 
