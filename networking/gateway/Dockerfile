@@ -76,6 +76,11 @@ RUN mkdir -p /var/log/gateway/events /var/run/gateway /tmp/gateway \
 #    in `sandbox-core`). Docker creates the mountpoint automatically.
 # We therefore no longer ship `envoy-base.yaml` inside the image.
 COPY gateway/Corefile /opt/coredns/Corefile
+# M10-S2 Phase 6b: both addons import the shared EventEmitter from
+# ``events.py``, so it must sit alongside the addon scripts in
+# ``/etc/mitmproxy/`` — mitmdump loads the addon by path, and Python
+# resolves the sibling ``events`` module via the addon's own directory.
+COPY mitmproxy/events.py /etc/mitmproxy/events.py
 COPY mitmproxy/passthrough_addon.py /etc/mitmproxy/passthrough_addon.py
 COPY mitmproxy/policy_addon.py /etc/mitmproxy/policy_addon.py
 COPY gateway/entrypoint.sh /entrypoint.sh

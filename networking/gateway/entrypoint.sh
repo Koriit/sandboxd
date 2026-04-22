@@ -33,8 +33,18 @@ ENVOY_BOOTSTRAP_FILE="${ENVOY_BOOTSTRAP_FILE:-/etc/envoy/envoy-bootstrap.yaml}"
 ENVOY_LISTENER_FILE="${ENVOY_LISTENER_FILE:-/etc/envoy/listeners/listener.yaml}"
 ENVOY_CONFIG_WAIT_TIMEOUT="${ENVOY_CONFIG_WAIT_TIMEOUT:-30}"
 
+# M10-S2 Phase 6b: default path for the mitmproxy JSONL event stream.
+# `/var/log/gateway/events/` is the per-session bind-mount target
+# (host-side: `{events_host_root}/<session>/`), so writes here land on
+# the host filesystem where sandboxd's ingester tails them.  Export so
+# both policy_addon.py and passthrough_addon.py see it.
+export SANDBOX_MITMPROXY_EVENTS="${SANDBOX_MITMPROXY_EVENTS:-/var/log/gateway/events/mitmproxy.jsonl}"
+
 # Ensure runtime directories exist (tmpfs mounts wipe them out).
-mkdir -p "${LOG_DIR}" /tmp/mitmproxy
+# The events/ directory is normally a bind mount from the host, but
+# we pre-create it so the addon's append-mode open(…) never misses a
+# parent directory on cold start before sandboxd attaches the mount.
+mkdir -p "${LOG_DIR}" "${LOG_DIR}/events" /tmp/mitmproxy
 
 # PIDs of managed processes
 MITM_PID=""
