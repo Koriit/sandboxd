@@ -10,7 +10,10 @@ use std::process::Command;
 use sandbox_core::gateway::{GATEWAY_IMAGE, GatewayManager, GatewayStatus, container_name};
 use sandbox_core::network::NetworkManager;
 use sandbox_core::session::SessionId;
-use sandbox_core::{AtomicListenerWriter, PolicyCompiler, session_listener_host_path};
+use sandbox_core::{
+    AtomicListenerWriter, EVENTS_DIR_IN_CONTAINER, PolicyCompiler, session_events_host_dir,
+    session_listener_host_path,
+};
 use std::net::Ipv4Addr;
 
 #[test]
@@ -525,5 +528,125 @@ fn test_gateway_lds_listener_and_atomic_rewrite() {
 
     // ---------- Clean up ----------
     gw_mgr.stop_gateway(&session_id).unwrap();
+    net_mgr.delete_network(&session_id).unwrap();
+}
+
+/// M10-S2 Phase 3: the gateway container must expose a per-session
+/// events bind mount into which the three JSONL producers (Envoy
+/// access log, CoreDNS plugin, mitmproxy addon — all landing in later
+/// phases) append structured event lines that sandboxd tails via
+/// `inotify`.
+///
+/// This test asserts three lifecycle properties of that bind:
+///   1. `create_gateway` creates the host-side events dir.
+///   2. The mount is wired end-to-end — a file written on the host
+///      inside the events dir is visible inside the container at
+///      [`EVENTS_DIR_IN_CONTAINER`], and a file written inside the
+///      container at that path shows up on the host. Both directions
+///      are asserted because bind-mount misconfigurations often only
+///      fail one way (e.g. wrong `:ro` vs `:rw` spec, or the mount
+///      target getting shadowed by the `/var/log` tmpfs).
+///   3. `stop_gateway` removes the host events dir.
+#[test]
+fn gateway_container_has_events_bind_mount() {
+    // Use 10.209.6.0/24 to avoid collisions with the other gateway
+    // tests in this file.
+    let net_mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 6, 0), 24).unwrap();
+    let gw_mgr = GatewayManager::new();
+    let session_id = SessionId::generate();
+
+    let network_info = net_mgr.create_network(&session_id).unwrap();
+
+    let create_result = gw_mgr.create_gateway(&session_id, &network_info, None, None);
+    if let Err(ref e) = create_result {
+        let _ = gw_mgr.stop_gateway(&session_id);
+        let _ = net_mgr.delete_network(&session_id);
+        panic!("create_gateway failed: {e}");
+    }
+
+    let gw_container = container_name(&session_id);
+    let events_host_dir = session_events_host_dir(&session_id);
+
+    // ---------- 1. Host-side events dir exists post-create ----------
+    assert!(
+        events_host_dir.is_dir(),
+        "create_gateway must have created the events host dir at {}",
+        events_host_dir.display()
+    );
+
+    // ---------- 2a. Host → container propagation ----------
+    // Write a file on the host inside the events dir and assert the
+    // container sees it at EVENTS_DIR_IN_CONTAINER.
+    let host_probe = events_host_dir.join("host_probe.jsonl");
+    std::fs::write(&host_probe, b"{\"from\":\"host\"}\n")
+        .expect("writing host-side probe file should succeed");
+
+    let output = Command::new("docker")
+        .args([
+            "exec",
+            &gw_container,
+            "cat",
+            &format!("{EVENTS_DIR_IN_CONTAINER}/host_probe.jsonl"),
+        ])
+        .output()
+        .expect("docker exec cat host_probe should succeed");
+    assert!(
+        output.status.success(),
+        "host_probe.jsonl written to {} must be visible inside container at {EVENTS_DIR_IN_CONTAINER}; \
+         the bind mount is broken or the /var/log tmpfs is shadowing it. \
+         docker exec stderr: {}",
+        events_host_dir.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "{\"from\":\"host\"}",
+        "host → container content must round-trip through the bind mount"
+    );
+
+    // ---------- 2b. Container → host propagation ----------
+    // Write a file inside the container at EVENTS_DIR_IN_CONTAINER and
+    // assert it appears on the host under the events dir. Producers in
+    // later phases (Envoy, CoreDNS plugin, mitmproxy addon) will write
+    // here, so this direction is the one sandboxd's ingest layer
+    // depends on.
+    let output = Command::new("docker")
+        .args([
+            "exec",
+            &gw_container,
+            "sh",
+            "-c",
+            &format!(
+                "printf '{{\"from\":\"container\"}}\\n' > {EVENTS_DIR_IN_CONTAINER}/container_probe.jsonl"
+            ),
+        ])
+        .output()
+        .expect("docker exec write container_probe should succeed");
+    assert!(
+        output.status.success(),
+        "writing inside container at {EVENTS_DIR_IN_CONTAINER} must succeed \
+         (mount must be :rw, not :ro). stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let host_view = events_host_dir.join("container_probe.jsonl");
+    let contents =
+        std::fs::read_to_string(&host_view).expect("container_probe.jsonl must appear on host");
+    assert_eq!(
+        contents.trim(),
+        "{\"from\":\"container\"}",
+        "container → host content must round-trip through the bind mount"
+    );
+
+    // ---------- 3. Post-stop host dir cleanup ----------
+    gw_mgr.stop_gateway(&session_id).unwrap();
+
+    assert!(
+        !events_host_dir.exists(),
+        "stop_gateway must remove the events host dir at {}",
+        events_host_dir.display()
+    );
+
+    // ---------- Clean up the network ----------
     net_mgr.delete_network(&session_id).unwrap();
 }
