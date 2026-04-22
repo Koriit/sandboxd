@@ -173,7 +173,13 @@ fn init_tracing(log_file: Option<&std::path::Path>) -> std::io::Result<()> {
 
 struct AppState {
     base_dir: PathBuf,
-    store: SessionStore,
+    // M10-S4 Phase 2: wrapped in `Arc` so the events sub-router (built
+    // in [`app`]) can hold its own `Arc<SessionStore>` handle inside an
+    // `Arc<events_http::EventsApiState>` without the two routers having
+    // to share state via axum's `FromRef`. `SessionStore` is internally
+    // `Mutex`-guarded, so the shared handle is safe and adds no
+    // synchronization beyond what the store already performs.
+    store: Arc<SessionStore>,
     lima: Arc<LimaManager>,
     guest: GuestConnector,
     network: Arc<NetworkManager>,
@@ -261,6 +267,17 @@ fn error_response(err: SandboxError) -> (StatusCode, Json<ApiError>) {
 // ---------------------------------------------------------------------------
 
 fn app(state: Arc<AppState>) -> Router {
+    // M10-S4 Phase 2: build the events sub-router with its own minimal
+    // state (an `Arc` over the same `SessionStore` and the same
+    // `EventBus` clone the main state owns).  Merging rather than
+    // extending lets the sub-router keep its own typed state without
+    // forcing a `FromRef` impl on `AppState`.
+    let events_state = Arc::new(sandboxd::events_http::EventsApiState::new(
+        Arc::clone(&state.store),
+        state.event_bus.clone(),
+    ));
+    let events_router = sandboxd::events_http::events_router(events_state);
+
     Router::new()
         .route("/sessions", post(create_session))
         .route("/sessions", get(list_sessions))
@@ -280,6 +297,7 @@ fn app(state: Arc<AppState>) -> Router {
         .route("/base-image-status", get(base_image_status))
         .route("/health", get(health_check))
         .with_state(state)
+        .merge(events_router)
 }
 
 async fn create_session(
@@ -3619,7 +3637,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // was reset by the V004 migration; the replay of
     // `policy_reset_on_upgrade` lifecycle events on the bus happens in
     // the startup block below, once the `EventBus` is up.
+    // M10-S4 Phase 2: wrap the store in an `Arc` immediately so the
+    // events sub-router (built in `app()`) can hold its own handle
+    // without an additional `FromRef` binding on `AppState`.  All
+    // existing `store.*` call sites below keep working unchanged via
+    // `Arc`'s `Deref<Target = SessionStore>`.
     let (store, reset_orphans) = SessionStore::new(base_dir.clone())?;
+    let store = Arc::new(store);
     let lima = Arc::new(LimaManager::new(base_dir.clone())?);
     let guest = GuestConnector::new(Arc::clone(&lima));
 
