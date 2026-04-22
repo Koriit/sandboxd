@@ -20,12 +20,29 @@ func setup(c *caddy.Controller) error {
 		return plugin.Error(pluginName, fmt.Errorf("loading policy file %q: %w", sp.policyFile, err))
 	}
 
+	// Open the structured-events writer if a path was configured. This is
+	// opened here (not in parseConfig) so the file is created once per
+	// CoreDNS startup, matching the lifetime of the reload goroutine below.
+	if sp.eventsFile != "" {
+		ew, err := NewEventWriter(sp.eventsFile)
+		if err != nil {
+			return plugin.Error(pluginName, fmt.Errorf("opening events file %q: %w", sp.eventsFile, err))
+		}
+		sp.events = ew
+	}
+
 	// Start background policy file reload goroutine.
 	sp.policy.StartReload(sp.policyFile, sp.reloadInterval)
 
-	// Register shutdown hook to stop the reload goroutine.
+	// Register shutdown hook to stop the reload goroutine and close the
+	// events writer.
 	c.OnShutdown(func() error {
 		sp.policy.StopReload()
+		if sp.events != nil {
+			if err := sp.events.Close(); err != nil {
+				log.Warningf("closing events file: %v", err)
+			}
+		}
 		return nil
 	})
 
@@ -74,6 +91,13 @@ func parseConfig(c *caddy.Controller) (*SandboxPolicy, error) {
 					return nil, c.Errf("reload interval must be >= 1s, got %v", d)
 				}
 				sp.reloadInterval = d
+
+			case "events_file":
+				args := c.RemainingArgs()
+				if len(args) != 1 {
+					return nil, c.Errf("events_file requires exactly one argument")
+				}
+				sp.eventsFile = args[0]
 
 			default:
 				return nil, c.Errf("unknown property %q", c.Val())
