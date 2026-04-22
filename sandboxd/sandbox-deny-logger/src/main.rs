@@ -32,6 +32,7 @@ use clap::Parser;
 
 mod event;
 mod tcp;
+mod udp;
 
 use event::EventEmitter;
 
@@ -150,6 +151,9 @@ async fn run(args: Args) -> std::io::Result<()> {
     let tcp_listener = tcp::bind(args.bind_ip, args.tcp_port).await?;
     tracing::info!(port = args.tcp_port, "tcp listener bound");
 
+    let udp_socket = udp::bind(args.bind_ip, args.udp_port).await?;
+    tracing::info!(port = args.udp_port, "udp listener bound");
+
     let tcp_emitter = Arc::clone(&emitter);
     let tcp_task = tokio::spawn(async move {
         if let Err(err) = tcp::run(tcp_listener, tcp_emitter).await {
@@ -157,9 +161,19 @@ async fn run(args: Args) -> std::io::Result<()> {
         }
     });
 
-    // UDP + health listeners land in follow-up commits.
-    tcp_task
-        .await
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let udp_emitter = Arc::clone(&emitter);
+    let udp_task = tokio::spawn(async move {
+        if let Err(err) = udp::run(udp_socket, udp_emitter).await {
+            tracing::error!(error = %err, "udp listener exited with error");
+        }
+    });
+
+    // Health listener lands in the next commit. For now wait on both
+    // listener tasks — either exiting takes the process down so Docker
+    // flags the container unhealthy.
+    tokio::select! {
+        res = tcp_task => res.map_err(|e| std::io::Error::other(e.to_string()))?,
+        res = udp_task => res.map_err(|e| std::io::Error::other(e.to_string()))?,
+    }
     Ok(())
 }
