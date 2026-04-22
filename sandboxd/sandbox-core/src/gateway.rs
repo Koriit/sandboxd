@@ -727,11 +727,9 @@ impl GatewayManager {
     pub fn component_health(&self, session_id: &SessionId, component: &str) -> String {
         let container_name = container_name(session_id);
 
-        let check_cmd: &[&str] = match component {
-            "envoy" => &["curl", "-sf", "http://127.0.0.1:9901/ready"],
-            "coredns" => &["curl", "-sf", "http://127.0.0.1:8180/health"],
-            "mitmproxy" => &["pgrep", "-x", "mitmdump"],
-            _ => return "unknown".to_string(),
+        let check_cmd: &[&str] = match component_probe(component) {
+            Some(cmd) => cmd,
+            None => return "unknown".to_string(),
         };
 
         let mut args = vec!["exec", &container_name];
@@ -966,6 +964,17 @@ impl GatewayManager {
     }
 
     /// Wait for all gateway components to become ready.
+    ///
+    /// The probe commands are sourced from [`component_probe`], which is
+    /// also used by [`GatewayManager::component_health`] — keeping startup
+    /// readiness and steady-state health on the exact same probes.
+    ///
+    /// Order matches the historical wait order (Envoy → CoreDNS →
+    /// mitmproxy) with deny-logger appended last. deny-logger is the
+    /// data-path ingress for deny traffic and binds on the gateway
+    /// bridge IP rather than 127.0.0.1 (spec 2026-04-21 Part 3 /
+    /// "Deny-logger component / Listener design"), so its probe goes
+    /// through `$(hostname -i)`.
     fn wait_for_components(&self, session_id: &SessionId) -> Result<(), SandboxError> {
         let container_name = container_name(session_id);
         let deadline = Instant::now() + COMPONENT_READY_TIMEOUT;
@@ -976,29 +985,14 @@ impl GatewayManager {
             "waiting for gateway components to become ready"
         );
 
-        // Wait for Envoy readiness (admin endpoint).
-        self.wait_for_component(
-            &container_name,
-            "Envoy",
-            &["curl", "-sf", "http://127.0.0.1:9901/ready"],
-            deadline,
-        )?;
-
-        // Wait for CoreDNS readiness (health endpoint).
-        self.wait_for_component(
-            &container_name,
-            "CoreDNS",
-            &["curl", "-sf", "http://127.0.0.1:8180/health"],
-            deadline,
-        )?;
-
-        // Wait for mitmproxy readiness (process check).
-        self.wait_for_component(
-            &container_name,
-            "mitmproxy",
-            &["pgrep", "-x", "mitmdump"],
-            deadline,
-        )?;
+        for (component, log_name) in KNOWN_COMPONENTS {
+            let probe = component_probe(component).unwrap_or_else(|| {
+                // Unreachable: KNOWN_COMPONENTS and component_probe are
+                // kept in sync by `known_components_all_have_probes`.
+                panic!("no probe command registered for known component {component:?}");
+            });
+            self.wait_for_component(&container_name, log_name, probe, deadline)?;
+        }
 
         info!(
             session_id = %session_id,
@@ -1063,6 +1057,57 @@ impl Default for GatewayManager {
 /// Generate the Docker container name for a session's gateway.
 pub fn container_name(session_id: &SessionId) -> String {
     format!("sandbox-gw-{session_id}")
+}
+
+// ---------------------------------------------------------------------------
+// Component probes
+// ---------------------------------------------------------------------------
+
+/// The set of gateway subcomponents whose readiness is polled on startup
+/// (`wait_for_components`) and whose liveness is polled on steady state
+/// by sandboxd's gateway monitor (`component_health`).
+///
+/// Each entry pairs the canonical kebab-case probe label used by
+/// [`component_probe`] with a human-readable log/display name.
+///
+/// Order is the startup wait order — matches the historical sequence
+/// (Envoy → CoreDNS → mitmproxy) with deny-logger appended last so a
+/// deny-logger failure surfaces only once the other components are up.
+pub const KNOWN_COMPONENTS: &[(&str, &str)] = &[
+    ("envoy", "Envoy"),
+    ("coredns", "CoreDNS"),
+    ("mitmproxy", "mitmproxy"),
+    ("deny-logger", "deny-logger"),
+];
+
+/// Return the `docker exec` argv that probes `component`'s readiness,
+/// or `None` if `component` is not a recognised subcomponent name.
+///
+/// Used by both [`GatewayManager::component_health`] (steady-state
+/// liveness polling) and [`GatewayManager::wait_for_components`]
+/// (startup readiness wait) — keeping both paths on the identical
+/// probe command per component.
+///
+/// The deny-logger probe uses `sh -c` to discover the gateway bridge
+/// IP at runtime via `hostname -i`, because the deny-logger listeners
+/// bind on that address rather than 127.0.0.1 (PREROUTING DNAT to
+/// loopback is dropped by the kernel as a martian destination unless
+/// `route_localnet=1` is set, which the gateway container does not
+/// enable — see spec 2026-04-21 Part 3 / "Deny-logger component /
+/// Listener design"). The same pattern is used by the container's
+/// `healthcheck.sh` and `entrypoint.sh`.
+pub fn component_probe(component: &str) -> Option<&'static [&'static str]> {
+    match component {
+        "envoy" => Some(&["curl", "-sf", "http://127.0.0.1:9901/ready"]),
+        "coredns" => Some(&["curl", "-sf", "http://127.0.0.1:8180/health"]),
+        "mitmproxy" => Some(&["pgrep", "-x", "mitmdump"]),
+        "deny-logger" => Some(&[
+            "sh",
+            "-c",
+            "curl -sf \"http://$(hostname -i | awk '{print $1}'):10003/health\"",
+        ]),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1306,6 +1351,84 @@ mod tests {
     fn test_gateway_container_name() {
         let session_id = SessionId::parse("550e8400e29b").unwrap();
         assert_eq!(container_name(&session_id), "sandbox-gw-550e8400e29b");
+    }
+
+    // -- Component probe tests ----------------------------------------------
+
+    #[test]
+    fn component_probe_returns_some_for_every_known_component() {
+        for (probe_label, _log_name) in KNOWN_COMPONENTS {
+            assert!(
+                component_probe(probe_label).is_some(),
+                "component_probe must have a probe for known component {probe_label:?} \
+                 (KNOWN_COMPONENTS and component_probe must stay in sync)"
+            );
+        }
+    }
+
+    #[test]
+    fn component_probe_returns_none_for_unknown_component() {
+        assert!(component_probe("").is_none());
+        assert!(component_probe("nope").is_none());
+        // Rule out case-sensitivity accidents — the canonical form is
+        // lowercase kebab-case and we must not silently accept other
+        // shapes.
+        assert!(component_probe("Envoy").is_none());
+        assert!(component_probe("DENY-LOGGER").is_none());
+        assert!(component_probe("deny_logger").is_none());
+    }
+
+    #[test]
+    fn component_probe_deny_logger_uses_gateway_bridge_ip_not_loopback() {
+        // The deny-logger listener binds on the gateway bridge IP (not
+        // 127.0.0.1) because PREROUTING DNAT to loopback is dropped by
+        // the kernel as a martian destination unless
+        // `route_localnet=1` is set — and the gateway container does
+        // not enable it. A regression to `127.0.0.1:10003` here would
+        // produce false-negative health checks that match the exact
+        // empirical failure Phase 4 fixed in healthcheck.sh, so guard
+        // against it explicitly.
+        let probe = component_probe("deny-logger").expect("deny-logger must be a known probe");
+
+        // The probe must invoke a shell so `$(hostname -i)` expands at
+        // probe time; `docker exec` passes argv straight to execve and
+        // does not interpret `$(...)` itself.
+        assert_eq!(
+            probe.first().copied(),
+            Some("sh"),
+            "deny-logger probe must go through `sh -c` so hostname discovery \
+             happens inside the gateway container, not on the host"
+        );
+        assert!(
+            probe.iter().any(|arg| arg.contains("hostname -i")),
+            "deny-logger probe must discover the bridge IP via `hostname -i` \
+             (matches healthcheck.sh and entrypoint.sh)"
+        );
+        assert!(
+            probe.iter().any(|arg| arg.contains(":10003/health")),
+            "deny-logger probe must hit the health listener on port 10003"
+        );
+        assert!(
+            !probe.iter().any(|arg| arg.contains("127.0.0.1:10003")),
+            "deny-logger probe must NOT hardcode 127.0.0.1 — the listener \
+             binds on the gateway bridge IP (see Phase 4 / healthcheck.sh)"
+        );
+    }
+
+    #[test]
+    fn known_components_contain_deny_logger_last() {
+        // wait_for_components iterates KNOWN_COMPONENTS in order, so
+        // the ordering guarantee matters: deny-logger last means a
+        // deny-logger readiness failure surfaces only once the other
+        // components are up (making the failure unambiguously
+        // attributable to deny-logger rather than to an earlier
+        // component blocking its startup).
+        let labels: Vec<&str> = KNOWN_COMPONENTS.iter().map(|(l, _)| *l).collect();
+        assert_eq!(
+            labels,
+            vec!["envoy", "coredns", "mitmproxy", "deny-logger"],
+            "KNOWN_COMPONENTS order is load-bearing — deny-logger must be last"
+        );
     }
 
     // -- Deny-all ruleset tests ---------------------------------------------
