@@ -10,6 +10,7 @@ use crate::atomic_listener_writer::{
     AtomicListenerWriter, session_listener_host_dir, session_listener_host_path,
 };
 use crate::error::SandboxError;
+use crate::events::{EVENTS_DIR_IN_CONTAINER, session_events_host_dir};
 use crate::network::NetworkInfo;
 use crate::policy::{LISTENER_DIR_IN_CONTAINER, PolicyCompiler};
 use crate::process::run_with_timeout;
@@ -208,6 +209,34 @@ impl GatewayManager {
             "initial Envoy listener file written; bind-mounting into container"
         );
 
+        // Pre-setup: ensure the per-session events host directory exists
+        // and is empty before `docker run`. The three JSONL producers
+        // inside the container (Envoy access log, CoreDNS plugin,
+        // mitmproxy addon) append to envoy.jsonl / coredns.jsonl /
+        // mitmproxy.jsonl inside this directory, which sandboxd tails
+        // via `inotify` in the ingest layer (Phase 7 of M10-S2).
+        //
+        // Mirrors the listener host-dir handling above: best-effort
+        // cleanup of any leftover dir from a crashed previous session
+        // with the same ID, then create. Errors from create are fatal —
+        // without this directory the bind mount below would fail and the
+        // JSONL producers would write into the tmpfs (losing the
+        // ingest path).
+        let events_host_dir = session_events_host_dir(session_id);
+        let _ = fs::remove_dir_all(&events_host_dir);
+        fs::create_dir_all(&events_host_dir).map_err(|e| {
+            SandboxError::Gateway(format!(
+                "failed to create events host dir {}: {e}",
+                events_host_dir.display()
+            ))
+        })?;
+
+        debug!(
+            session_id = %session_id,
+            events_host_dir = %events_host_dir.display(),
+            "events host dir ready; bind-mounting into container at {EVENTS_DIR_IN_CONTAINER}"
+        );
+
         // Step 1: Start the container.
         //
         // With /28 subnets, Docker bridge claims .1 as the gateway. We
@@ -248,6 +277,27 @@ impl GatewayManager {
                 "{}:{}:rw",
                 listener_host_dir.display(),
                 LISTENER_DIR_IN_CONTAINER,
+            ),
+            // Bind-mount the per-session events host directory into
+            // [`EVENTS_DIR_IN_CONTAINER`]. The three JSONL producers
+            // inside the container append structured events to this
+            // path; sandboxd's Phase 7 ingest layer tails the files
+            // via `inotify`.
+            //
+            // This bind sits *underneath* the `/var/log` tmpfs mount
+            // above — Docker applies mounts in path-length order, so
+            // the tmpfs lands on `/var/log` first and this narrower
+            // bind then mounts onto `/var/log/gateway/events/`. The
+            // tmpfs starts empty, Docker auto-creates the mountpoint
+            // inside it, and operator-debug unstructured logs
+            // (envoy.log, mitmproxy.log, coredns.log) continue to
+            // live on the tmpfs beside this bind rather than on the
+            // host filesystem.
+            "-v".to_string(),
+            format!(
+                "{}:{}:rw",
+                events_host_dir.display(),
+                EVENTS_DIR_IN_CONTAINER,
             ),
         ];
 
@@ -480,6 +530,23 @@ impl GatewayManager {
                     dir = %listener_host_dir.display(),
                     error = %e,
                     "failed to remove listener host dir (non-fatal)"
+                );
+            }
+        }
+
+        // Step 5: Remove the per-session events host directory that
+        // held the three JSONL producer files. Same best-effort
+        // posture as the listener dir above — the ingest layer stops
+        // tailing as part of session teardown so the files are no
+        // longer referenced after `docker rm`.
+        let events_host_dir = session_events_host_dir(session_id);
+        if let Err(e) = fs::remove_dir_all(&events_host_dir) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    session_id = %session_id,
+                    dir = %events_host_dir.display(),
+                    error = %e,
+                    "failed to remove events host dir (non-fatal)"
                 );
             }
         }

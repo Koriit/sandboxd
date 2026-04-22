@@ -53,7 +53,15 @@ RUN curl -fsSL "https://downloads.mitmproxy.org/${MITMPROXY_VERSION}/mitmproxy-$
     && chmod +x /usr/local/bin/mitmdump /usr/local/bin/mitmproxy /usr/local/bin/mitmweb
 
 # ---------- create runtime directories ----------
-RUN mkdir -p /var/log/gateway /var/run/gateway /tmp/gateway \
+#
+# `/var/log/gateway/events/` is the bind-mount target for the per-session
+# events host directory (see sandbox-core::events::EVENTS_DIR_IN_CONTAINER
+# and gateway.rs::create_gateway). At runtime `/var/log` is a tmpfs and
+# the narrower bind lands on top of it, so the mountpoint created here
+# is strictly a documentation / image-inspection aid — Docker would
+# auto-create it anyway. Keeping it next to the other /var/log/gateway/
+# directories makes the intent visible to anyone reading the image.
+RUN mkdir -p /var/log/gateway/events /var/run/gateway /tmp/gateway \
     && mkdir -p /etc/envoy /etc/coredns /etc/mitmproxy \
     && mkdir -p /opt/envoy
 
