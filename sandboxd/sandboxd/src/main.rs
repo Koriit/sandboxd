@@ -17,12 +17,12 @@ use sandbox_core::{
     ApiError, AssuranceLevel, BaseImageStatus, CaManager, CoreDnsConfig, CreateSessionRequest,
     Destination, DnsCache, EventBus, EventBusConfig, ExecRequest, ExecResponse,
     FileDownloadRequest, FileDownloadResponse, FileUploadRequest, GatewayHealth, GatewayManager,
-    GatewayShutdownReason, GatewayStatus, GuestConnector, GuestRequest, GuestResponse, LimaManager,
-    NetworkHealth, NetworkManager, Policy, PolicyApplyStatus, PolicyCompiler, PolicyDistributor,
-    SandboxError, Session, SessionConfig, SessionDto, SessionHealth, SessionId, SessionState,
-    SessionStore, UpdatePolicyRequest, VmIpSessionMap, VmStatus, attach_vm_to_bridge,
-    detach_vm_from_bridge, generate_ca_inject_script, mac_from_session_id, propagate_dns_changes,
-    read_resolved_json, write_file_to_container,
+    GatewayShutdownReason, GatewayStatus, GuestConnector, GuestRequest, GuestResponse,
+    HealthComponent, LimaManager, NetworkHealth, NetworkManager, Policy, PolicyApplyStatus,
+    PolicyCompiler, PolicyDistributor, SandboxError, Session, SessionConfig, SessionDto,
+    SessionHealth, SessionId, SessionState, SessionStore, UpdatePolicyRequest, VmIpSessionMap,
+    VmStatus, attach_vm_to_bridge, detach_vm_from_bridge, generate_ca_inject_script,
+    mac_from_session_id, propagate_dns_changes, read_resolved_json, write_file_to_container,
 };
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
@@ -190,6 +190,14 @@ struct AppState {
     /// IP).  Bound at the same time the session is registered with
     /// [`AppState::event_bus`]; removed in lock-step on teardown.
     vm_ip_map: VmIpSessionMap,
+    /// Per-(session, component) healthcheck state tracked by the
+    /// [`gateway_monitor`] loop.  `true` = healthy, `false` = degraded.
+    /// The map is the source of truth for transition detection —
+    /// `health_degraded` and `health_restored` events fire only when a
+    /// poll flips the recorded state, not on every tick.  Unknown
+    /// components are recorded as `false` so the first healthy poll
+    /// publishes `health_restored`.
+    component_health_state: Mutex<HashMap<SessionId, HashMap<HealthComponent, bool>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1366,6 +1374,13 @@ async fn remove_session(
         }
     }
     state.event_bus.unregister_session(&session.id);
+    // Also drop any tracked component health state for this session
+    // so the map doesn't grow without bound as sessions churn.
+    state
+        .component_health_state
+        .lock()
+        .await
+        .remove(&session.id);
 
     // Delete the session from the store.
     if let Err(e) = state.store.delete_session(&session.id) {
@@ -3050,6 +3065,107 @@ async fn reconcile_networking(state: &AppState) {
 // Gateway crash recovery
 // ---------------------------------------------------------------------------
 
+/// Components the gateway monitor polls per tick.  Each entry pairs
+/// the `GatewayManager::component_health` label with the
+/// [`sandbox_core::HealthComponent`] used on
+/// `health_degraded`/`health_restored` events.
+///
+/// `DenyLogger` is intentionally absent: it's a log-tailer rather
+/// than a daemon with a healthcheck endpoint, so its liveness is
+/// inferred from the ingest layer (M10-S2 Phase 7) rather than
+/// polled here.
+const MONITORED_COMPONENTS: &[(&str, HealthComponent)] = &[
+    ("envoy", HealthComponent::Envoy),
+    ("coredns", HealthComponent::Coredns),
+    ("mitmproxy", HealthComponent::Mitmproxy),
+];
+
+/// Poll each monitored gateway component and publish
+/// `health_degraded` / `health_restored` events for any component
+/// whose state flipped since the previous tick.
+///
+/// The previous state lives in `AppState::component_health_state` —
+/// unknown components are treated as "healthy" on first observation
+/// so an initial healthy poll does **not** emit `health_restored`
+/// (which would be noise), while an initial unhealthy poll does emit
+/// `health_degraded` (which is the alert we want).  Subsequent
+/// transitions in either direction emit the matching event.
+///
+/// Runs inside the gateway monitor loop, so `component_health` —
+/// which shells out to `docker exec` — is wrapped in
+/// `spawn_blocking`.
+async fn poll_and_emit_component_health(state: &AppState, session_id: &SessionId) {
+    for (label, component) in MONITORED_COMPONENTS {
+        let gw = Arc::clone(&state.gateway);
+        let sid = *session_id;
+        let label_owned = (*label).to_string();
+        let health = match tokio::task::spawn_blocking(move || {
+            gw.component_health(&sid, &label_owned)
+        })
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    session_id = %session_id,
+                    component = ?component,
+                    error = %e,
+                    "component health poll join error; skipping this tick"
+                );
+                continue;
+            }
+        };
+
+        // Treat "unknown" (container not running, or the check
+        // itself couldn't reach the component) as unhealthy for the
+        // purposes of transition detection.  An "unknown" result
+        // during steady-state Healthy gateways is already logged
+        // above and we want subscribers alerted.
+        let is_healthy = health == "healthy";
+
+        let mut states = state.component_health_state.lock().await;
+        let session_map = states.entry(*session_id).or_default();
+        let previous = session_map.get(component).copied();
+
+        // First observation: seed the map with `true` (healthy)
+        // rather than recording and immediately emitting
+        // `health_restored`.  We only publish on a real transition.
+        match (previous, is_healthy) {
+            (None, true) => {
+                session_map.insert(*component, true);
+            }
+            (None, false) => {
+                session_map.insert(*component, false);
+                drop(states);
+                state.event_bus.publish(lifecycle_events::health_degraded(
+                    *session_id,
+                    *component,
+                    format!("component reported {health} on first poll"),
+                ));
+            }
+            (Some(true), false) => {
+                session_map.insert(*component, false);
+                drop(states);
+                state.event_bus.publish(lifecycle_events::health_degraded(
+                    *session_id,
+                    *component,
+                    format!("component reported {health}"),
+                ));
+            }
+            (Some(false), true) => {
+                session_map.insert(*component, true);
+                drop(states);
+                state
+                    .event_bus
+                    .publish(lifecycle_events::health_restored(*session_id, *component));
+            }
+            (Some(true), true) | (Some(false), false) => {
+                // No transition; leave the map untouched.
+            }
+        }
+    }
+}
+
 /// Background task that monitors gateway containers and restarts crashed ones.
 ///
 /// Runs every 30 seconds. For each Running session, checks if the gateway
@@ -3109,6 +3225,14 @@ async fn gateway_monitor(state: Arc<AppState>) {
                     continue;
                 }
             };
+
+            // Poll per-component health and emit transitions
+            // (M10-S2 Phase 5).  Only components that *flipped* since
+            // the last tick produce events, so the bus stays sparse
+            // under sustained outages.  Runs on every tick independent
+            // of the aggregate `gateway_status` so we can still record
+            // e.g. "mitmproxy restored" while Envoy remains down.
+            poll_and_emit_component_health(&state, &session.id).await;
 
             match status {
                 GatewayStatus::Healthy => {
@@ -3275,7 +3399,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // was reset by the V004 migration; the replay of
     // `policy_reset_on_upgrade` lifecycle events on the bus happens in
     // the startup block below, once the `EventBus` is up.
-    let (store, _reset_orphans) = SessionStore::new(base_dir.clone())?;
+    let (store, reset_orphans) = SessionStore::new(base_dir.clone())?;
     let lima = Arc::new(LimaManager::new(base_dir.clone())?);
     let guest = GuestConnector::new(Arc::clone(&lima));
 
@@ -3375,7 +3499,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         base_image_lock: Mutex::new(()),
         event_bus,
         vm_ip_map,
+        component_health_state: Mutex::new(HashMap::new()),
     });
+
+    // Replay one `policy_reset_on_upgrade` lifecycle event per
+    // session whose v1 policy was dropped by migration V004 (M10-S2
+    // Phase 5).  The store's `SessionStore::new` captured the
+    // affected session IDs and their pre-V004 rule counts; now that
+    // the `EventBus` is up and the per-session sinks are registered,
+    // publish them.  Subscribers connected late still observe these
+    // events because the bus retains them in the per-session ring
+    // buffer.
+    for orphan in &reset_orphans {
+        match SessionId::parse(&orphan.session_id) {
+            Ok(sid) => {
+                // The per-session sink might not be registered if
+                // this orphan session never had network info
+                // persisted (e.g., a session that was created but
+                // its networking setup failed).  Register it so the
+                // event lands in the ring buffer and can be
+                // replayed on reconnect.
+                state.event_bus.register_session(sid);
+                state
+                    .event_bus
+                    .publish(lifecycle_events::policy_reset_on_upgrade(
+                        sid,
+                        orphan.previous_rule_count as usize,
+                    ));
+            }
+            Err(e) => {
+                warn!(
+                    session_id = %orphan.session_id,
+                    error = %e,
+                    "failed to parse orphan session id; \
+                     policy_reset_on_upgrade event not emitted"
+                );
+            }
+        }
+    }
 
     // Run networking reconciliation: restart crashed gateways, clean up
     // lingering resources for stopped sessions.  The hydrated policy

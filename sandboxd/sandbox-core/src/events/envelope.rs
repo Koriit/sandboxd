@@ -266,7 +266,7 @@ pub enum PolicyApplyStatus {
 ///
 /// Matches the spec's enumeration of gateway subcomponents:
 /// `deny-logger`, `envoy`, `mitmproxy`, `coredns`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HealthComponent {
     DenyLogger,
     Envoy,
