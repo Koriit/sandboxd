@@ -16,7 +16,7 @@ use sandbox_core::events::session_events_host_dir;
 use sandbox_core::gateway::container_name as gateway_container_name;
 use sandbox_core::{
     ApiError, AssuranceLevel, BaseImageStatus, CaManager, CoreDnsConfig, CreateSessionRequest,
-    Destination, DnsCache, EventBus, EventBusConfig, ExecRequest, ExecResponse,
+    Destination, DnsCache, DockerHealth, EventBus, EventBusConfig, ExecRequest, ExecResponse,
     FileDownloadRequest, FileDownloadResponse, FileUploadRequest, GatewayHealth, GatewayManager,
     GatewayShutdownReason, GatewayStatus, GuestConnector, GuestRequest, GuestResponse,
     HealthComponent, LimaManager, NetworkHealth, NetworkManager, Policy, PolicyApplyStatus,
@@ -3319,45 +3319,122 @@ async fn gateway_monitor(state: Arc<AppState>) {
                 continue;
             }
 
-            let gw = Arc::clone(&state.gateway);
-            let sid = session.id;
-            let status_result = tokio::task::spawn_blocking(move || gw.gateway_status(&sid)).await;
-            let status = match status_result {
-                Ok(Ok(s)) => s,
-                Ok(Err(e)) => {
-                    warn!(
-                        session_id = %session.id,
-                        error = %e,
-                        "gateway monitor: failed to check gateway status"
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    warn!(
-                        session_id = %session.id,
-                        error = %e,
-                        "gateway monitor: spawn_blocking join error checking gateway status"
-                    );
-                    continue;
-                }
-            };
-
             // Poll per-component health and emit transitions
             // (M10-S2 Phase 5).  Only components that *flipped* since
             // the last tick produce events, so the bus stays sparse
             // under sustained outages.  Runs on every tick independent
-            // of the aggregate `gateway_status` so we can still record
-            // e.g. "mitmproxy restored" while Envoy remains down.
+            // of the container-level health verdict so we can still
+            // record e.g. "mitmproxy restored" while Envoy remains
+            // down — and so a deny-logger flap inside the start-period
+            // still produces a `health_degraded` event even before
+            // Docker has flipped the container to unhealthy.
             poll_and_emit_component_health(&state, &session.id).await;
+
+            // First-pass: read Docker's native per-container health
+            // verdict (`docker inspect --format
+            // '{{.State.Health.Status}}'`). Docker maintains this by
+            // running the image's HEALTHCHECK directive
+            // (`/healthcheck.sh`, which Phase 4 extended to cover the
+            // deny-logger) on its interval/retry/start-period cadence.
+            // Reading the cached verdict is strictly cheaper than
+            // re-running the script ourselves and — critically — it
+            // honours Docker's retry/debounce window, so we do not
+            // flap-restart on a single transient failure.
+            //
+            // See M10-S3 spec: "Docker marks the container unhealthy.
+            // sandboxd's existing gateway health polling observes this
+            // and restarts the gateway container."
+            let gw = Arc::clone(&state.gateway);
+            let sid = session.id;
+            let docker_health =
+                match tokio::task::spawn_blocking(move || gw.container_health_status(&sid)).await {
+                    Ok(h) => h,
+                    Err(e) => {
+                        warn!(
+                            session_id = %session.id,
+                            error = %e,
+                            "gateway monitor: spawn_blocking join error reading container health"
+                        );
+                        continue;
+                    }
+                };
+
+            // Decide whether to run the fallback `gateway_status`
+            // probe (which re-runs `/healthcheck.sh` from outside) and
+            // whether a restart is warranted.
+            //
+            //   * `Healthy` — Docker has observed the HEALTHCHECK
+            //     pass; skip the redundant full probe.
+            //   * `Unhealthy` — Docker has observed `retries`
+            //     consecutive failures; trigger the restart path
+            //     directly without re-running the same script.
+            //   * `Starting` — inside the start-period; keep waiting
+            //     without probing or restarting. The per-component
+            //     poll above still fires component-level events.
+            //   * `None` / `Unknown` — Docker has no verdict (no
+            //     HEALTHCHECK, container missing, inspect malformed);
+            //     fall back to the authoritative `gateway_status`
+            //     probe so we still catch NotRunning / Unhealthy from
+            //     outside.
+            let status = match docker_health {
+                DockerHealth::Healthy => {
+                    // Container is healthy per Docker — nothing to do
+                    // this tick.
+                    continue;
+                }
+                DockerHealth::Starting => {
+                    debug!(
+                        session_id = %session.id,
+                        "gateway monitor: container in HEALTHCHECK start-period, deferring verdict"
+                    );
+                    continue;
+                }
+                DockerHealth::Unhealthy => {
+                    // Docker has already applied the retry/debounce
+                    // window. Synthesise an `Unhealthy` verdict and
+                    // fall through to the restart path.
+                    GatewayStatus::Unhealthy("docker HEALTHCHECK reports unhealthy".to_string())
+                }
+                DockerHealth::None | DockerHealth::Unknown => {
+                    // Fall back to the full `gateway_status` probe —
+                    // it re-runs `/healthcheck.sh` and also returns
+                    // `NotRunning` if `.State.Running == false`.
+                    let gw = Arc::clone(&state.gateway);
+                    let sid = session.id;
+                    let status_result =
+                        tokio::task::spawn_blocking(move || gw.gateway_status(&sid)).await;
+                    match status_result {
+                        Ok(Ok(s)) => s,
+                        Ok(Err(e)) => {
+                            warn!(
+                                session_id = %session.id,
+                                error = %e,
+                                docker_health = ?docker_health,
+                                "gateway monitor: failed to check gateway status (fallback)"
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!(
+                                session_id = %session.id,
+                                error = %e,
+                                "gateway monitor: spawn_blocking join error checking gateway status"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            };
 
             match status {
                 GatewayStatus::Healthy => {
-                    // All good, nothing to do.
+                    // Fallback probe agreed it's healthy — nothing to do.
                 }
                 GatewayStatus::NotRunning | GatewayStatus::Unhealthy(_) => {
                     warn!(
                         session_id = %session.id,
                         gateway_status = ?status,
+                        docker_health = ?docker_health,
                         "gateway monitor: gateway not healthy, attempting recovery"
                     );
 
