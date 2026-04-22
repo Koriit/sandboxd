@@ -167,8 +167,9 @@ async fn run(args: Args) -> std::io::Result<()> {
 
     let tcp_emitter = Arc::clone(&emitter);
     let tcp_rate_cap = Arc::clone(&rate_cap);
+    let tcp_conn_cap = args.conn_cap;
     let tcp_task = tokio::spawn(async move {
-        if let Err(err) = tcp::run(tcp_listener, tcp_emitter, tcp_rate_cap).await {
+        if let Err(err) = tcp::run(tcp_listener, tcp_emitter, tcp_rate_cap, tcp_conn_cap).await {
             tracing::error!(error = %err, "tcp listener exited with error");
         }
     });

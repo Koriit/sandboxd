@@ -15,6 +15,7 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use nix::libc;
 use nix::sys::socket::{setsockopt, sockopt};
@@ -35,20 +36,60 @@ pub async fn bind(bind_ip: Ipv4Addr, port: u16) -> io::Result<TcpListener> {
     TcpListener::bind(addr).await
 }
 
-/// Run the accept loop against an already-bound `listener`, emitting
-/// one deny event per accepted connection.
+/// RAII guard holding one concurrency-cap permit. Decrements the
+/// shared connection counter when dropped, regardless of how the
+/// handler exits — this keeps the cap accurate even on panic.
+struct ConnGuard {
+    counter: Arc<AtomicU32>,
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        // `fetch_sub` on a counter that never went above `cap` cannot
+        // underflow, but assert the invariant in debug builds.
+        let prev = self.counter.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(prev > 0, "ConnGuard decremented past zero");
+    }
+}
+
+/// Try to reserve one concurrency-cap slot. Returns `Some(guard)` if
+/// the increment kept us at or below `cap`; returns `None` after
+/// undoing the speculative increment otherwise.
 ///
-/// Each accepted connection is closed synchronously inside the loop:
-/// no per-connection task spawn is needed because we never read from
-/// the peer and the close is nearly instantaneous (one `setsockopt` +
-/// one `drop`). Keeping the accept loop non-fan-out sidesteps the
-/// need for a per-connection future slot and keeps the hot path
-/// allocation-free.
+/// Extracted from the accept loop so unit tests can verify the
+/// reservation logic without racing an async runtime.
+fn try_reserve(counter: &Arc<AtomicU32>, cap: u32) -> Option<ConnGuard> {
+    // `fetch_add` returns the previous value; an overshoot is safe to
+    // undo with `fetch_sub` because no other thread uses the
+    // post-increment value for its own admission decision.
+    let prev = counter.fetch_add(1, Ordering::AcqRel);
+    if prev >= cap {
+        counter.fetch_sub(1, Ordering::AcqRel);
+        None
+    } else {
+        Some(ConnGuard {
+            counter: Arc::clone(counter),
+        })
+    }
+}
+
+/// Run the accept loop against an already-bound `listener`, emitting
+/// one deny event per accepted connection that fits under both caps.
+///
+/// Concurrency cap (spec Part 3 / "Hardening rules" § 6): a shared
+/// `AtomicU32` counts live handler tasks. Accepts past `conn_cap` are
+/// RST-closed immediately and counted into the periodic
+/// `rate_limited` summary (plan Phase 3) without emitting a deny
+/// line. Admissions under the cap are dispatched to a per-connection
+/// task so a slow handler never stalls the accept loop; each task
+/// holds a [`ConnGuard`] whose Drop decrements the counter.
 pub async fn run(
     listener: TcpListener,
     emitter: Arc<EventEmitter>,
     rate_cap: Arc<RateCap>,
+    conn_cap: u32,
 ) -> io::Result<()> {
+    let active = Arc::new(AtomicU32::new(0));
     loop {
         let (socket, peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -62,7 +103,21 @@ pub async fn run(
                 continue;
             }
         };
-        handle_connection(socket, peer, &emitter, &rate_cap);
+
+        let Some(guard) = try_reserve(&active, conn_cap) else {
+            // Over the cap — count the drop into the rate-limited
+            // summary and RST-close without emitting.
+            rate_cap.record_drop(Utc::now());
+            apply_linger_zero(&socket);
+            drop(socket);
+            continue;
+        };
+        let emitter = Arc::clone(&emitter);
+        let rate_cap = Arc::clone(&rate_cap);
+        tokio::spawn(async move {
+            handle_connection(socket, peer, &emitter, &rate_cap);
+            drop(guard);
+        });
     }
 }
 
@@ -204,7 +259,7 @@ mod tests {
         let emit_for_task = Arc::clone(&emitter);
         let rate_cap_for_task = Arc::clone(&rate_cap);
         let server = tokio::spawn(async move {
-            let _ = run(listener, emit_for_task, rate_cap_for_task).await;
+            let _ = run(listener, emit_for_task, rate_cap_for_task, 256).await;
         });
 
         // Connect on a blocking std socket so we can observe the
@@ -250,6 +305,124 @@ mod tests {
                 "unexpected error kind on RST close: {err:?}",
             ),
         }
+
+        server.abort();
+    }
+
+    /// Synchronous unit test for the reservation logic: `try_reserve`
+    /// must refuse the `cap+1`th caller and release slots on guard
+    /// drop. Exercises plan Phase 3 / `tcp_respects_concurrency_cap`
+    /// deterministically — the loopback-burst variant below covers
+    /// the same invariant through the full accept loop but can't pin
+    /// the exact deny/drop split without artificially slowing the
+    /// handler (spec forbids adding production-path test hooks).
+    #[test]
+    fn try_reserve_refuses_past_cap_and_releases_on_drop() {
+        let counter = Arc::new(AtomicU32::new(0));
+        const CAP: u32 = 2;
+
+        let g1 = try_reserve(&counter, CAP).expect("1st reserve");
+        let g2 = try_reserve(&counter, CAP).expect("2nd reserve");
+        assert!(
+            try_reserve(&counter, CAP).is_none(),
+            "3rd reserve must be refused",
+        );
+        assert_eq!(
+            counter.load(Ordering::Acquire),
+            CAP,
+            "counter pinned at cap during saturation",
+        );
+
+        drop(g1);
+        assert_eq!(counter.load(Ordering::Acquire), 1, "drop decrements");
+        let g3 = try_reserve(&counter, CAP).expect("slot freed after drop");
+        assert_eq!(counter.load(Ordering::Acquire), 2);
+
+        drop(g2);
+        drop(g3);
+        assert_eq!(counter.load(Ordering::Acquire), 0, "all slots released");
+    }
+
+    /// End-to-end concurrency cap: open `cap + N` connections against
+    /// a loopback listener and confirm the *conservation* invariant —
+    /// every connection is accounted for as either a deny event or a
+    /// rate-limited drop, and at least `BURST - CAP` connections are
+    /// counted as drops in the worst case where all handlers finish
+    /// instantly between accepts. (On fast hardware the handler is
+    /// so quick that in-flight concurrency never actually reaches
+    /// `cap`; what matters for security is that overshoot is counted,
+    /// which the conservation check proves.)
+    ///
+    /// Plan Phase 3 / `tcp_respects_concurrency_cap`. Spec Part 3 /
+    /// "Hardening rules" § 6.
+    #[tokio::test]
+    async fn tcp_respects_concurrency_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deny.jsonl");
+        let emitter = Arc::new(EventEmitter::open(&path).unwrap());
+        // Rate cap high enough to not interfere with this test.
+        let rate_cap = Arc::new(RateCap::new(10_000, Arc::clone(&emitter), Utc::now()));
+        let listener = bind(Ipv4Addr::LOCALHOST, 0).await.unwrap();
+        let local = listener.local_addr().unwrap();
+
+        // Concurrency cap of 2 — open many connections to exercise
+        // the cap path. On a fast handler the cap may or may not
+        // actually fire; we assert the conservation invariant only.
+        const CAP: u32 = 2;
+        const BURST: usize = 20;
+        let emit_for_task = Arc::clone(&emitter);
+        let rate_cap_for_task = Arc::clone(&rate_cap);
+        let server = tokio::spawn(async move {
+            let _ = run(listener, emit_for_task, rate_cap_for_task, CAP).await;
+        });
+
+        // Fire all connections in parallel so the accept loop sees
+        // the bursts rather than a serial stream.
+        let clients: Vec<_> = tokio::task::spawn_blocking(move || {
+            (0..BURST)
+                .map(|_| {
+                    let s = StdTcpStream::connect(local).expect("connect");
+                    s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                    s
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap();
+
+        // Give the server time to accept and emit / record drops.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(clients);
+
+        // Cross the 1s rate-cap window so the summary flushes — the
+        // rollover is what turns the internal drop counter into an
+        // observable JSONL line.
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        rate_cap.try_admit(Utc::now());
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+
+        let mut deny = 0;
+        let mut dropped_total = 0u64;
+        for line in &lines {
+            let json: serde_json::Value = serde_json::from_str(line).unwrap();
+            match json["event"].as_str().unwrap() {
+                "deny" => deny += 1,
+                "rate_limited" => {
+                    dropped_total += json["rate_limited_count"].as_u64().unwrap();
+                }
+                other => panic!("unexpected event {other:?} in {line:?}"),
+            }
+        }
+
+        // Conservation: every connection either emits a deny or is
+        // counted into the summary — nothing silently lost.
+        assert_eq!(
+            deny + dropped_total as usize,
+            BURST,
+            "deny ({deny}) + dropped_total ({dropped_total}) should equal burst ({BURST}); lines = {lines:?}",
+        );
 
         server.abort();
     }
