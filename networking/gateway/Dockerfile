@@ -1,6 +1,9 @@
 # Gateway container: Envoy + mitmproxy + CoreDNS proxy pipeline
 # CoreDNS is built from source with the sandboxpolicy plugin for DNS-level
 # policy enforcement. Envoy and mitmproxy handle TCP/HTTP proxying.
+#
+# Build context is the repository root (see Makefile `.gateway-image.stamp`
+# target); `.dockerignore` prunes heavyweight directories.
 
 # ---------- Stage 1: Build custom CoreDNS with sandboxpolicy plugin ----------
 FROM golang:1.22 AS coredns-builder
@@ -8,8 +11,7 @@ FROM golang:1.22 AS coredns-builder
 WORKDIR /build
 
 # Copy the plugin module and build the custom CoreDNS binary.
-# Build context is networking/ (parent of coredns-plugin/).
-COPY coredns-plugin/ ./coredns-plugin/
+COPY networking/coredns-plugin/ ./coredns-plugin/
 
 WORKDIR /build/coredns-plugin
 
@@ -66,7 +68,7 @@ RUN mkdir -p /var/log/gateway/events /var/run/gateway /tmp/gateway \
     && mkdir -p /opt/envoy
 
 # ---------- copy configuration files ----------
-# Build context is networking/ (parent of gateway/)
+# Build context is the repository root. Paths below are repo-relative.
 #
 # M9-S18: Envoy configuration is now provided at runtime by sandboxd.
 #  - `/etc/envoy/envoy-bootstrap.yaml` is written via `docker exec` after
@@ -75,16 +77,16 @@ RUN mkdir -p /var/log/gateway/events /var/run/gateway /tmp/gateway \
 #    directory bind-mounted into the container (see `atomic_listener_writer`
 #    in `sandbox-core`). Docker creates the mountpoint automatically.
 # We therefore no longer ship `envoy-base.yaml` inside the image.
-COPY gateway/Corefile /opt/coredns/Corefile
+COPY networking/gateway/Corefile /opt/coredns/Corefile
 # M10-S2 Phase 6b: both addons import the shared EventEmitter from
 # ``events.py``, so it must sit alongside the addon scripts in
 # ``/etc/mitmproxy/`` — mitmdump loads the addon by path, and Python
 # resolves the sibling ``events`` module via the addon's own directory.
-COPY mitmproxy/events.py /etc/mitmproxy/events.py
-COPY mitmproxy/passthrough_addon.py /etc/mitmproxy/passthrough_addon.py
-COPY mitmproxy/policy_addon.py /etc/mitmproxy/policy_addon.py
-COPY gateway/entrypoint.sh /entrypoint.sh
-COPY gateway/healthcheck.sh /healthcheck.sh
+COPY networking/mitmproxy/events.py /etc/mitmproxy/events.py
+COPY networking/mitmproxy/passthrough_addon.py /etc/mitmproxy/passthrough_addon.py
+COPY networking/mitmproxy/policy_addon.py /etc/mitmproxy/policy_addon.py
+COPY networking/gateway/entrypoint.sh /entrypoint.sh
+COPY networking/gateway/healthcheck.sh /healthcheck.sh
 
 RUN chmod +x /entrypoint.sh /healthcheck.sh
 

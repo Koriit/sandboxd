@@ -48,13 +48,19 @@ test-validators: gateway-image
 # inputs (Dockerfile, addon, entrypoint, Envoy/CoreDNS configs) changes.
 # The phony `gateway-image` target remains as an unconditional rebuild
 # entry point for callers who want to force a rebuild.
+#
+# Build context is the repository root so upcoming Dockerfile stages can
+# reach into `sandboxd/` for source-compiled components. `.dockerignore`
+# at the repo root keeps `sandboxd/target/` and other heavy directories
+# out of the context upload.
 GATEWAY_INPUTS := $(shell find networking -type f \
 	\( -name '*.py' -o -name '*.sh' -o -name 'Dockerfile' \
 	   -o -name '*.yaml' -o -name '*.yml' -o -name 'Corefile' \) \
-	-not -path '*/__pycache__/*')
+	-not -path '*/__pycache__/*') \
+	.dockerignore
 
 .gateway-image.stamp: $(GATEWAY_INPUTS)
-	docker build -t sandbox-gateway -f networking/gateway/Dockerfile networking/
+	docker build -t sandbox-gateway -f networking/gateway/Dockerfile .
 	@touch $@
 
 gateway-image: .gateway-image.stamp

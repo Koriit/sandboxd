@@ -1,0 +1,48 @@
+# Dockerignore for the gateway container build.
+#
+# The gateway Docker build context is the repository root (see `Makefile`
+# target `.gateway-image.stamp`). The build needs:
+#   - `networking/`    — gateway Dockerfile, addons, Corefile, entrypoint
+#   - `sandboxd/`      — Rust workspace; a build stage compiles
+#                        `sandbox-deny-logger` from sources
+#
+# Everything else is noise. The Rust `target/` directory alone is ~17 GB
+# on a hot workstation, so without this file the build context upload to
+# the Docker daemon would be prohibitively large and slow.
+
+# Rust build artifacts (per-workspace target dir, ~10-20 GB hot)
+sandboxd/target/
+
+# Python virtualenvs and caches
+tests/e2e/.venv/
+**/__pycache__/
+*.pyc
+*.egg-info/
+
+# Node / site tooling
+site/node_modules/
+site/dist/
+
+# Editor / IDE state
+.idea/
+.obsidian/
+.stfolder/
+.trash/
+*.swp
+
+# Git plumbing — we don't need history inside the build
+.git/
+.gitignore
+
+# Task tracker state (plans / progress) — not needed in the image
+.tasks/
+
+# Docs & top-level design notes — not consumed by the build
+docs/
+site/
+*.md
+!networking/**/*.md
+!sandboxd/**/*.md
+
+# Misc build stamps
+.gateway-image.stamp
