@@ -24,7 +24,10 @@ pub mod lifecycle;
 pub mod persist;
 pub mod vm_ip_map;
 
-pub use bus::{DEFAULT_RING_BUFFER_SIZE, EventBus, EventBusConfig, EventSubscription};
+pub use bus::{
+    DEFAULT_BROADCAST_CAPACITY, DEFAULT_RING_BUFFER_SIZE, EventBus, EventBusConfig,
+    EventSubscription,
+};
 pub use envelope::{
     DenyLoggerDeny, DenyLoggerEvent, DenyProtocol, DnsEvent, EnvoyConnection, EnvoyEvent, Event,
     EventEnvelope, GatewayShutdownReason, HealthComponent, LifecycleEvent, MitmproxyEvent,

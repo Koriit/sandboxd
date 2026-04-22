@@ -84,7 +84,7 @@ pub const DEFAULT_RING_BUFFER_SIZE: usize = 10_000;
 /// will never lag; a subscriber that falls more than this many messages
 /// behind receives [`tokio::sync::broadcast::error::RecvError::Lagged`]
 /// and is expected to recover via re-subscribe + ring replay.
-const BROADCAST_CHANNEL_CAPACITY: usize = DEFAULT_RING_BUFFER_SIZE;
+pub const DEFAULT_BROADCAST_CAPACITY: usize = DEFAULT_RING_BUFFER_SIZE;
 
 /// Tunables for [`EventBus`].
 #[derive(Debug, Clone, Copy)]
@@ -92,12 +92,22 @@ pub struct EventBusConfig {
     /// Maximum number of events retained per-session in the replay ring.
     /// Oldest events are dropped when the ring is full.
     pub ring_buffer_size: usize,
+    /// Maximum in-flight buffer of the per-session broadcast channel.
+    /// A subscriber that falls more than this many messages behind
+    /// receives [`tokio::sync::broadcast::error::RecvError::Lagged`]
+    /// and is expected to recover via re-subscribe + ring replay (or,
+    /// in the HTTP streaming path, by emitting a synthetic
+    /// `lifecycle.ring_buffer_lag` marker line). Exposed as a tunable
+    /// so tests can overflow the channel deterministically without
+    /// having to publish tens of thousands of events.
+    pub broadcast_capacity: usize,
 }
 
 impl Default for EventBusConfig {
     fn default() -> Self {
         Self {
             ring_buffer_size: DEFAULT_RING_BUFFER_SIZE,
+            broadcast_capacity: DEFAULT_BROADCAST_CAPACITY,
         }
     }
 }
@@ -113,8 +123,8 @@ struct SessionEventSink {
 }
 
 impl SessionEventSink {
-    fn new(ring_capacity: usize) -> Self {
-        let (tx, _rx) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
+    fn new(ring_capacity: usize, broadcast_capacity: usize) -> Self {
+        let (tx, _rx) = broadcast::channel(broadcast_capacity);
         Self {
             tx,
             ring: Mutex::new(VecDeque::with_capacity(ring_capacity)),
@@ -189,7 +199,7 @@ pub struct EventBus {
 impl EventBus {
     /// Construct an empty bus with the given tunables.
     pub fn new(config: EventBusConfig) -> Self {
-        let global = SessionEventSink::new(config.ring_buffer_size);
+        let global = SessionEventSink::new(config.ring_buffer_size, config.broadcast_capacity);
         Self {
             inner: Arc::new(BusInner {
                 config,
@@ -209,9 +219,12 @@ impl EventBus {
             .sessions
             .write()
             .expect("EventBus sessions lock poisoned");
-        sessions
-            .entry(session_id)
-            .or_insert_with(|| SessionEventSink::new(self.inner.config.ring_buffer_size));
+        sessions.entry(session_id).or_insert_with(|| {
+            SessionEventSink::new(
+                self.inner.config.ring_buffer_size,
+                self.inner.config.broadcast_capacity,
+            )
+        });
     }
 
     /// Unregister a session, discarding its ring buffer and closing the
@@ -475,6 +488,7 @@ mod tests {
     fn ring_buffer_evicts_oldest_on_overflow() {
         let bus = EventBus::new(EventBusConfig {
             ring_buffer_size: 3,
+            ..EventBusConfig::default()
         });
         let sid = SessionId::generate();
         bus.register_session(sid);
