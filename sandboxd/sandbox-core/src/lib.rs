@@ -35,8 +35,9 @@ pub use dns_propagation::{
 };
 pub use error::{ApiError, SandboxError};
 pub use events::{
-    DnsEvent, EnvoyConnection, EnvoyEvent, Event, EventEnvelope, GatewayShutdownReason,
-    HealthComponent, LifecycleEvent, MitmproxyEvent, PolicyApplyStatus, TrafficEvent,
+    DnsEvent, EVENTS_DIR_IN_CONTAINER, EVENTS_HOST_ROOT, EnvoyConnection, EnvoyEvent, Event,
+    EventEnvelope, GatewayShutdownReason, HealthComponent, LifecycleEvent, MitmproxyEvent,
+    PolicyApplyStatus, TrafficEvent, session_events_host_dir,
 };
 pub use gateway::{GatewayManager, GatewayStatus};
 pub use guest::{
