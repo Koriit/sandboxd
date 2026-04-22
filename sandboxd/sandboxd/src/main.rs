@@ -3183,14 +3183,17 @@ async fn reconcile_networking(state: &AppState) {
 /// [`sandbox_core::HealthComponent`] used on
 /// `health_degraded`/`health_restored` events.
 ///
-/// `DenyLogger` is intentionally absent: it's a log-tailer rather
-/// than a daemon with a healthcheck endpoint, so its liveness is
-/// inferred from the ingest layer (M10-S2 Phase 7) rather than
-/// polled here.
+/// `deny-logger` polls the `:10003/health` endpoint on the gateway
+/// bridge IP (M10-S3 Phase 6) — its data-path listeners on :10001/:10002
+/// are bound on the bridge IP as well (not 127.0.0.1), because DNAT to
+/// loopback would be dropped as a martian destination. The in-container
+/// probe discovers the bridge IP via `hostname -i` (see
+/// `gateway::component_probe` and the container's `healthcheck.sh`).
 const MONITORED_COMPONENTS: &[(&str, HealthComponent)] = &[
     ("envoy", HealthComponent::Envoy),
     ("coredns", HealthComponent::Coredns),
     ("mitmproxy", HealthComponent::Mitmproxy),
+    ("deny-logger", HealthComponent::DenyLogger),
 ];
 
 /// Poll each monitored gateway component and publish
@@ -4064,5 +4067,63 @@ mod tests {
     fn extract_repo_host_no_scheme_no_userinfo_returns_none() {
         // Bare "host/path" is ambiguous; treat as no recognisable host.
         assert_eq!(extract_repo_host("github.com/user/repo"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // MONITORED_COMPONENTS: membership and probe-table sync
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn monitored_components_every_label_has_a_probe() {
+        // The gateway monitor calls `component_health(label)` for each
+        // entry here, which dispatches via `component_probe`. A label
+        // without a matching probe would silently return "unknown" on
+        // every tick, making the monitor a no-op for that component.
+        for (label, component) in MONITORED_COMPONENTS {
+            assert!(
+                sandbox_core::gateway::component_probe(label).is_some(),
+                "MONITORED_COMPONENTS entry ({label:?}, {component:?}) has no \
+                 corresponding component_probe — gateway monitor would be a \
+                 no-op for this component"
+            );
+        }
+    }
+
+    #[test]
+    fn monitored_components_includes_deny_logger() {
+        // Regression guard for M10-S3 Phase 6: deny-logger is a
+        // first-class monitored subcomponent (it has a real TCP/UDP
+        // data path and a /health endpoint), so its liveness MUST
+        // participate in `health_degraded` / `health_restored` events.
+        assert!(
+            MONITORED_COMPONENTS
+                .iter()
+                .any(|(label, component)| *label == "deny-logger"
+                    && *component == HealthComponent::DenyLogger),
+            "MONITORED_COMPONENTS must contain (\"deny-logger\", \
+             HealthComponent::DenyLogger) — see M10-S3 Phase 6"
+        );
+    }
+
+    #[test]
+    fn monitored_components_covers_every_health_component_variant() {
+        // Every `HealthComponent` variant must appear in
+        // MONITORED_COMPONENTS — otherwise the enum carries a variant
+        // that sandboxd's gateway monitor will never emit, which
+        // desynchronises the event surface from the documented
+        // subcomponent set.
+        use sandbox_core::HealthComponent::*;
+        let monitored: std::collections::HashSet<HealthComponent> = MONITORED_COMPONENTS
+            .iter()
+            .map(|(_, component)| *component)
+            .collect();
+        for variant in [DenyLogger, Envoy, Mitmproxy, Coredns] {
+            assert!(
+                monitored.contains(&variant),
+                "HealthComponent::{variant:?} is not present in \
+                 MONITORED_COMPONENTS — either add a monitor entry or \
+                 remove the enum variant"
+            );
+        }
     }
 }
