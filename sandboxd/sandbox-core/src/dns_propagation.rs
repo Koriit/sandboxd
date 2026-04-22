@@ -10,7 +10,9 @@ use crate::atomic_listener_writer::{AtomicListenerWriter, session_listener_host_
 use crate::error::SandboxError;
 use crate::gateway::{self, GatewayManager};
 use crate::network::NetworkInfo;
-use crate::policy::{AssuranceLevel, Destination, Policy, PolicyCompiler, format_nft_set_elements};
+use crate::policy::{
+    AssuranceLevel, Destination, Policy, PolicyCompiler, render_two_table_ruleset,
+};
 use crate::session::SessionId;
 
 // ---------------------------------------------------------------------------
@@ -235,16 +237,26 @@ pub fn read_resolved_json(session_id: &SessionId) -> Result<ResolvedReport, Sand
 
 /// Generate nftables rules for resolved domain IPs.
 ///
-/// This produces rules for the `sandbox_policy` table that allow traffic
-/// to the resolved IPs for domains in the policy, joined with the
-/// rule's explicit port (v2 schema).
+/// This produces the full two-table ruleset (`sandbox_dnat` +
+/// `sandbox_policy`) that admits traffic to the resolved IPs for
+/// domains in the policy, joined with the rule's explicit port
+/// (v2 schema). The shape matches [`PolicyCompiler::compile_nftables`]
+/// byte-for-byte — both entry points delegate to the shared
+/// [`render_two_table_ruleset`] helper so the chains stay in lockstep.
 ///
-/// **v2 shape (M10-S1 / Phase 3B):** matches the shape emitted by
-/// [`PolicyCompiler::compile_nftables`]. Per-destination allowance
-/// lives in two nftables concat sets keyed on
-/// `ipv4_addr . inet_service`, one per L4 protocol
-/// (`policy_allow_tcp`, `policy_allow_udp`). Set elements are
-/// `<ip_or_cidr> . <port>` pairs.
+/// **v2 shape (M10-S1 / Phase 3B):** per-destination allowance lives in
+/// two nftables concat sets keyed on `ipv4_addr . inet_service`, one per
+/// L4 protocol (`policy_allow_tcp`, `policy_allow_udp`). Set elements
+/// are `<ip_or_cidr> . <port>` pairs.
+///
+/// **M10-S3 shape (post deny-logger):** the filtering decision lives in
+/// `sandbox_dnat.prerouting` as conditional DNAT — policy-allowed
+/// destinations route to Envoy :10000; everything else falls through to
+/// the deny-logger :10001 / :10002. `sandbox_policy` holds only an
+/// `output` chain admitting gateway-originated egress to policy-allowed
+/// destinations. Both tables carry identical copies of the concat sets
+/// (cross-table set references are unsupported on the pinned nft 1.0.6
+/// kernel — see policy.rs for details).
 ///
 /// **DNS → policy join happens here.** The DNS cache itself
 /// (CoreDNS `ReportEntry`) is unchanged — it stays a pure
@@ -254,14 +266,14 @@ pub fn read_resolved_json(session_id: &SessionId) -> Result<ResolvedReport, Sand
 /// See `.tasks/specs/2026-04-21-port-explicit-policies-presets-observability-design.md`
 /// §"Compiler consequences — nftables" (Part 1, lines 173-177).
 ///
-/// Called by the DNS propagation loop; the full table is regenerated
-/// on each call (not an incremental `nft add element` update — the
-/// "rebuild-the-whole-table" pattern matches the existing
-/// `propagate_dns_changes` design).
+/// Called by the DNS propagation loop; both tables are fully
+/// regenerated on each call (flush-and-redefine, not incremental
+/// `nft add element`). One atomic `nft -f` transaction updates both
+/// copies of each set.
 ///
 /// Fail-closed: domains with no cache entry contribute no set elements,
-/// so traffic to them is rejected by the forward chain's trailing
-/// `reject` rule.
+/// so traffic to them falls through `sandbox_dnat.prerouting` to the
+/// deny-logger.
 pub fn generate_domain_ip_rules(
     policy: &Policy,
     cache: &DnsCache,
@@ -304,50 +316,19 @@ pub fn generate_domain_ip_rules(
     }
 
     // If neither set has any elements, return empty — nothing to
-    // inject. The base deny-all forward chain stays in place.
+    // inject. The gateway's initial `sandbox_dnat` rule shape (laid down
+    // at create_gateway time) still fall-throughs to the deny-logger,
+    // so pre-resolution traffic is fail-closed.
     if tcp_elements.is_empty() && udp_elements.is_empty() {
         return String::new();
     }
 
-    let tcp_elements_block = format_nft_set_elements(&tcp_elements);
-    let udp_elements_block = format_nft_set_elements(&udp_elements);
-
-    format!(
-        r#"table inet sandbox_policy {{}}
-flush table inet sandbox_policy
-table inet sandbox_policy {{
-    set policy_allow_tcp {{
-        type ipv4_addr . inet_service
-        flags interval{tcp_elements_block}
-    }}
-
-    set policy_allow_udp {{
-        type ipv4_addr . inet_service
-        flags interval{udp_elements_block}
-    }}
-
-    chain forward {{
-        type filter hook forward priority -1; policy drop;
-
-        # Allow established/related return traffic
-        ct state established,related accept
-
-        # Allow DNS to gateway (CoreDNS)
-        ip saddr {subnet} ip daddr {gateway_ip} udp dport 53 accept
-        ip saddr {subnet} ip daddr {gateway_ip} tcp dport 53 accept
-
-        # Policy allow rules — concat-set lookups keyed on (daddr, dport)
-        ct original ip daddr . tcp dport @policy_allow_tcp accept
-        ct original ip daddr . udp dport @policy_allow_udp accept
-
-        # Reject everything else (fast failure for denied destinations)
-        reject
-    }}
-}}
-"#,
-        subnet = network_info.subnet,
-        gateway_ip = network_info.gateway_ip,
-    )
+    // Two-table emission matching `PolicyCompiler::compile_nftables`.
+    // The DNS propagation loop rewrites BOTH tables' concat sets on
+    // every resolved-domain change: `sandbox_dnat` so the VM-egress
+    // DNAT decision admits the new IPs, and `sandbox_policy` so the
+    // gateway's upstream connections to those IPs are admitted too.
+    render_two_table_ruleset(&tcp_elements, &udp_elements, network_info)
 }
 
 /// Propagate DNS changes by
@@ -667,12 +648,16 @@ mod tests {
         let net = test_network_info();
         let rules = generate_domain_ip_rules(&policy, &cache, &net);
 
-        // v2 shape: the resolved `(ip, port)` pair is a concat-set
-        // element inside `policy_allow_tcp`. The domain name itself
-        // does not appear in the generated ruleset — the DNS-to-IP
-        // binding happens upstream in the cache; what lands in
-        // nftables is the post-join `(ip, port)` tuple.
-        assert!(rules.contains("sandbox_policy"));
+        // M10-S3 shape: the resolved `(ip, port)` pair is a concat-set
+        // element inside `policy_allow_tcp`, duplicated across both
+        // tables. The domain name itself does not appear in the
+        // generated ruleset — the DNS-to-IP binding happens upstream in
+        // the cache; what lands in nftables is the post-join `(ip, port)`
+        // tuple. Both tables are emitted: `sandbox_dnat` routes VM-egress
+        // to Envoy via conditional DNAT, `sandbox_policy` admits the
+        // gateway's upstream connection to the resolved IP.
+        assert!(rules.contains("table inet sandbox_dnat"));
+        assert!(rules.contains("table inet sandbox_policy"));
         assert!(rules.contains("set policy_allow_tcp"));
         assert!(rules.contains("type ipv4_addr . inet_service"));
         assert!(
@@ -680,7 +665,21 @@ mod tests {
             "policy_allow_tcp must contain the (ip . port) element for \
              the resolved domain; got:\n{rules}"
         );
-        assert!(rules.contains("ct original ip daddr . tcp dport @policy_allow_tcp accept"));
+        // sandbox_dnat.prerouting DNATs policy-allowed TCP to Envoy.
+        assert!(
+            rules.contains(
+                "meta l4proto tcp ip daddr . tcp dport @policy_allow_tcp dnat to 10.209.0.2:10000"
+            ),
+            "sandbox_dnat.prerouting must DNAT policy-allowed TCP to \
+             Envoy :10000; got:\n{rules}"
+        );
+        // sandbox_policy.output admits gateway-originated TCP to the
+        // same destinations.
+        assert!(
+            rules.contains("ip saddr 10.209.0.2 ip daddr . tcp dport @policy_allow_tcp accept"),
+            "sandbox_policy.output must admit gateway-originated TCP to \
+             policy-allowed destinations; got:\n{rules}"
+        );
     }
 
     #[test]
