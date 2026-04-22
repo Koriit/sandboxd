@@ -387,21 +387,11 @@ async fn get_events_unknown_decision_returns_400() {
     );
 }
 
-/// `follow=true` is Phase 3; Phase 2 returns `501 Not Implemented`.
-/// The integration test pins the status so any accidental early enable
-/// of streaming is caught here until the streaming path lands.
-#[tokio::test]
-async fn get_events_follow_true_returns_501() {
-    let (store, _tmp) = fresh_store();
-    let bus = EventBus::default();
-    let sid = provision_session(&store, &bus, None);
-
-    let router = build_router(store, bus);
-    let uri = format!("/sessions/{sid}/events?follow=true");
-
-    let (status, _ctype, _body) = get_triple(router, &uri).await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-}
+// The Phase 2 `get_events_follow_true_returns_501` test that pinned the
+// interim `501 Not Implemented` behaviour was superseded by Phase 3 —
+// the handler now returns a streaming 200 body.  Follow-mode coverage
+// lives in `tests/events_http_follow.rs` (replay + live, client-drop,
+// broadcast lag marker).
 
 /// The spec names the response `Content-Type` literally as
 /// `application/jsonl`.  Other tests already assert this; this test

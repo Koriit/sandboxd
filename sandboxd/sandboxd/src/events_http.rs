@@ -1,8 +1,7 @@
 //! HTTP endpoint `GET /sessions/{id}/events`.
 //!
-//! This module owns the non-follow replay handler landed in M10-S4 Phase 2.
-//! The follow-streaming path is deferred to Phase 3 and guarded by a
-//! `501 Not Implemented` branch here so the route contract is stable.
+//! This module owns the non-follow replay handler landed in M10-S4 Phase 2
+//! and the follow-streaming handler landed in Phase 3.
 //!
 //! # Contract
 //!
@@ -18,19 +17,28 @@
 //! - `follow=false` (default): bounded replay of the session's ring
 //!   buffer, rendered as concatenated JSONL (one object per line,
 //!   `\n`-terminated) with `Content-Type: application/jsonl`.
-//! - `follow=true`: returns `501 Not Implemented` in Phase 2.  Phase 3
-//!   replaces this branch with a `Body::from_stream` wrapper around the
-//!   broadcast receiver returned by [`EventBus::subscribe`].
+//! - `follow=true`: chunked `Content-Type: application/jsonl` streaming
+//!   response. The handler subscribes atomically via
+//!   [`EventBus::subscribe`], drains the replay snapshot first, then
+//!   pulls live events from the broadcast receiver until either the
+//!   client disconnects (hyper drops the body future, which cancels the
+//!   stream `async fn` and frees the receiver) or the session is
+//!   unregistered (receiver reports `RecvError::Closed`).  Lag events
+//!   surface as a synthetic `lifecycle.ring_buffer_lag` line — see the
+//!   streaming branch below for the shape.  Chunked transfer encoding
+//!   is axum-default for unknown-length `Body::from_stream` bodies, so
+//!   the handler sets only `Content-Type`.
 //!
 //! # Wiring
 //!
 //! - The production daemon merges [`events_router`] into its top-level
 //!   axum router so the endpoint shares the same Unix socket as every
 //!   other `/sessions/*` route.
-//! - Integration tests (`tests/events_http_non_follow.rs`) build a
-//!   minimal [`EventsApiState`] of their own and drive the sub-router
-//!   through `tower::ServiceExt::oneshot` without constructing the full
-//!   daemon `AppState`.
+//! - Integration tests (`tests/events_http_non_follow.rs` and
+//!   `tests/events_http_follow.rs`) build a minimal [`EventsApiState`]
+//!   of their own and drive the sub-router through
+//!   `tower::ServiceExt::oneshot` without constructing the full daemon
+//!   `AppState`.
 //!
 //! Keep this module narrowly scoped to what the HTTP layer needs — the
 //! filter types, DTO, and JSONL helper all live in `sandbox-core`.
@@ -39,16 +47,19 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
+    body::{Body, Bytes},
     extract::{Path, State},
     http::{StatusCode, header::CONTENT_TYPE},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::get,
 };
 use axum_extra::extract::Query;
+use chrono::Utc;
 use sandbox_core::{
     ApiError, EventBus, EventsFilter, EventsQueryDto, SandboxError, SessionStore,
     event_to_jsonl_line,
 };
+use tokio::sync::broadcast::error::RecvError;
 use tracing::error;
 
 /// `Content-Type` header value for the JSONL response body.
@@ -57,13 +68,6 @@ use tracing::error;
 /// Exposed publicly so tests can assert against the exact literal without
 /// importing the constant's value twice.
 pub const APPLICATION_JSONL: &str = "application/jsonl";
-
-/// Body returned from the `follow=true` branch in Phase 2.
-///
-/// Replaced by the streaming implementation in Phase 3 (M10-S4). Kept as
-/// a module-scoped constant so the test that asserts this interim
-/// behaviour reads as an intent statement rather than a string compare.
-pub const FOLLOW_TRUE_NOT_IMPLEMENTED_BODY: &str = "follow=true not implemented yet";
 
 /// Minimal shared state for the events HTTP sub-router.
 ///
@@ -111,7 +115,8 @@ pub fn events_router(state: Arc<EventsApiState>) -> Router {
 ///   rest of the `/sessions/{id}/…` family).
 /// - Builds the domain [`EventsFilter`] via `EventsFilter::from_query`;
 ///   unknown layer / decision / event values yield 400.
-/// - `follow=true`: returns 501 (Phase 3 implements streaming).
+/// - `follow=true`: streams a chunked JSONL body built from the
+///   broadcast receiver (see [`follow_response`]).
 /// - `follow=false`: replays the session's ring buffer, applies the
 ///   filter, renders each surviving event to JSONL, concatenates into
 ///   a single body, and returns 200 with `Content-Type: application/jsonl`.
@@ -123,7 +128,7 @@ pub async fn get_session_events(
     State(state): State<Arc<EventsApiState>>,
     Path(id): Path<String>,
     Query(q): Query<EventsQueryDto>,
-) -> axum::response::Response {
+) -> Response {
     // Resolve session name-or-id.
     let session = match state.store.get_session_by_name_or_id(&id) {
         Ok(Some(s)) => s,
@@ -139,15 +144,7 @@ pub async fn get_session_events(
     };
 
     if q.follow {
-        // TODO(M10-S4 Phase 3): replace with a streaming `Body::from_stream`
-        // wrapping the broadcast receiver from `EventBus::subscribe`. See
-        // `.tasks/handoffs/20260422-205445-Plan-m10-s4-implementation-plan.md`
-        // § "Phase 3 — HTTP endpoint streaming path".
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            FOLLOW_TRUE_NOT_IMPLEMENTED_BODY,
-        )
-            .into_response();
+        return follow_response(&state.event_bus, &session.id, filter);
     }
 
     // Atomically snapshot the session's ring and drop the live receiver
@@ -180,6 +177,143 @@ pub async fn get_session_events(
     }
 
     (StatusCode::OK, [(CONTENT_TYPE, APPLICATION_JSONL)], body).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// `follow=true` streaming path
+// ---------------------------------------------------------------------------
+
+/// Build the `follow=true` response.
+///
+/// - Subscribes atomically via [`EventBus::subscribe`]; `None` means the
+///   session exists in the store but has no per-session sink on the
+///   bus.  Treated as an empty replay + a never-producing stream — the
+///   client receives `Content-Type: application/jsonl` with a 200 and
+///   the body stays open until the client disconnects.  This mirrors
+///   the non-follow branch's "session exists but is quiet" semantics.
+/// - Returns a [`Response`] whose body is [`Body::from_stream`] over
+///   an `async_stream::stream!` generator that (a) drains the replay
+///   snapshot through the filter, then (b) consumes the broadcast
+///   receiver indefinitely.  On `RecvError::Lagged(n)` the generator
+///   emits a stream-local synthetic `lifecycle.ring_buffer_lag` line
+///   (see [`lag_marker_line`]) and keeps going; on `RecvError::Closed`
+///   (session unregistered) it breaks cleanly and the body ends.
+/// - Does **not** set `Transfer-Encoding` explicitly — axum's HTTP/1
+///   layer defaults to chunked for a `Body::from_stream` with unknown
+///   length.
+fn follow_response(
+    event_bus: &EventBus,
+    session_id: &sandbox_core::SessionId,
+    filter: EventsFilter,
+) -> Response {
+    // Snapshot-and-subscribe under a single lock inside the bus.  An
+    // unregistered session surfaces as `None` here; we synthesise an
+    // empty replay with an already-closed receiver so the generator
+    // below terminates after the empty replay drain.  An already-
+    // closed receiver is constructed by subscribing to a fresh, never-
+    // sent-to broadcast channel whose only `Sender` is dropped
+    // immediately — `recv()` returns `RecvError::Closed` on the first
+    // call.
+    let (replay, mut rx) = match event_bus.subscribe(session_id) {
+        Some(sub) => sub,
+        None => {
+            let (tx, rx) = tokio::sync::broadcast::channel(1);
+            drop(tx);
+            (Vec::new(), rx)
+        }
+    };
+
+    // Drop-observing stream: the `async_stream::stream!` future is
+    // owned by hyper's body task.  When the client disconnects, hyper
+    // drops that task which drops the stream's future; that in turn
+    // drops `rx`, which calls `broadcast::Receiver::drop` and
+    // unregisters the subscriber on the bus.  No explicit cancel
+    // plumbing needed.
+    let body_stream = async_stream::stream! {
+        // --- Replay phase.  Apply the same filter used in the non-
+        // follow branch so the streaming client sees the identical
+        // pre-subscribe history the replay client would see.
+        for event in replay.into_iter() {
+            if !filter.matches(&event) {
+                continue;
+            }
+            match event_to_jsonl_line(&event) {
+                Ok(line) => yield Ok::<Bytes, std::io::Error>(Bytes::from(line)),
+                Err(e) => tracing::warn!(error = %e, "skipping event with JSONL render failure"),
+            }
+        }
+
+        // --- Live phase.  `recv` borrows `rx` exclusively so the loop
+        // owns the subscription for its entire lifetime.  The borrow
+        // is released when the stream future is dropped.
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if !filter.matches(&event) {
+                        continue;
+                    }
+                    match event_to_jsonl_line(&event) {
+                        Ok(line) => yield Ok::<Bytes, std::io::Error>(Bytes::from(line)),
+                        Err(e) => tracing::warn!(error = %e, "skipping live event with JSONL render failure"),
+                    }
+                }
+                Err(RecvError::Lagged(n)) => {
+                    // Stream-local synthetic; not a bus event; not
+                    // persisted.  The consumer fell behind and the
+                    // broadcast channel dropped `n` messages; surface
+                    // the gap so operators can see it in the raw JSONL
+                    // stream rather than silently losing fidelity.
+                    // The ring buffer still retains whatever the sink
+                    // hasn't evicted, but mid-stream we don't
+                    // re-snapshot — the next `recv` call continues
+                    // from the channel's current head.
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(lag_marker_line(n)));
+                }
+                Err(RecvError::Closed) => {
+                    // Session was unregistered (teardown).  Terminate
+                    // the stream cleanly — the body ends, the client
+                    // sees EOF.
+                    break;
+                }
+            }
+        }
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(CONTENT_TYPE, APPLICATION_JSONL)
+        .body(Body::from_stream(body_stream))
+        .expect("static header + stream body => builder cannot fail")
+}
+
+/// Render the stream-local `lifecycle.ring_buffer_lag` synthetic line.
+///
+/// This line is **not** a [`sandbox_core::Event`]: it is never
+/// published on the bus, never persisted, and does not flow through
+/// the domain → DTO mapper.  It exists only to signal, inline, that
+/// the streaming consumer fell behind the broadcast channel and
+/// `n` live events were skipped.  The shape is pinned by the
+/// M10-S4 Phase 3 handoff (Q5 answer):
+///
+/// ```json
+/// {"layer":"lifecycle","event":"ring_buffer_lag","skipped":<n>,"timestamp":"<RFC3339 now UTC>"}
+/// ```
+///
+/// Always `\n`-terminated so downstream line-splitters don't need a
+/// special case.
+fn lag_marker_line(skipped: u64) -> String {
+    // Hand-format with `serde_json::json!` to keep the field order
+    // locked down and avoid threading a throwaway struct through the
+    // DTO module (which is reserved for real domain events).
+    let value = serde_json::json!({
+        "layer": "lifecycle",
+        "event": "ring_buffer_lag",
+        "skipped": skipped,
+        "timestamp": Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    });
+    let mut line = value.to_string();
+    line.push('\n');
+    line
 }
 
 // ---------------------------------------------------------------------------

@@ -14,6 +14,17 @@ axum.workspace = true
 # here pulls in `serde_html_form` which does the right thing.  Version
 # tracks the axum 0.8 family (axum-extra 0.10.x).
 axum-extra = { version = "0.10", features = ["query"] }
+# M10-S4 Phase 3: `async_stream::stream!` lets the HTTP handler express
+# "emit replay lines, then loop on broadcast::Receiver::recv" as straight-
+# line async code.  Alternative is hand-rolling `futures::stream::unfold`,
+# which costs ~20 extra lines and obscures the ordering contract.
+async-stream = "0.3"
+# M10-S4 Phase 3: the follow streaming path stamps synthetic
+# `lifecycle.ring_buffer_lag` JSONL lines with an RFC-3339 UTC
+# timestamp.  chrono was already a dev-dep; promoted to a direct dep
+# so the handler can produce the timestamp without threading through
+# sandbox-core's domain types.
+chrono.workspace = true
 clap.workspace = true
 ring.workspace = true
 sandbox-core.workspace = true
@@ -26,7 +37,6 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-chrono.workspace = true
 http-body-util = { workspace = true }
 refinery.workspace = true
 rusqlite.workspace = true
