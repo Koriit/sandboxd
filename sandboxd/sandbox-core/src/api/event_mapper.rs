@@ -22,16 +22,18 @@
 use chrono::{DateTime, SecondsFormat, Utc};
 
 use crate::events::{
-    DnsEvent, EnvoyConnection, EnvoyEvent, Event, EventEnvelope, GatewayShutdownReason,
-    HealthComponent, LifecycleEvent, MitmproxyEvent, PolicyApplyStatus, TrafficEvent,
+    DenyLoggerDeny, DenyLoggerEvent, DenyProtocol, DnsEvent, EnvoyConnection, EnvoyEvent, Event,
+    EventEnvelope, GatewayShutdownReason, HealthComponent, LifecycleEvent, MitmproxyEvent,
+    PolicyApplyStatus, TrafficEvent,
 };
 use crate::session::SessionId;
 
 use super::dto::PolicyDto;
 use super::event_dto::{
-    DnsEventBodyDto, DnsEventDto, EnvoyConnectionDto, EnvoyEventBodyDto, EnvoyEventDto, EventDto,
-    GatewayShutdownReasonDto, HealthComponentDto, LifecycleEventBodyDto, LifecycleEventDto,
-    MitmproxyEventBodyDto, MitmproxyEventDto, PolicyApplyStatusDto,
+    DenyLoggerEventBodyDto, DenyLoggerEventDto, DenyProtocolDto, DnsEventBodyDto, DnsEventDto,
+    EnvoyConnectionDto, EnvoyEventBodyDto, EnvoyEventDto, EventDto, GatewayShutdownReasonDto,
+    HealthComponentDto, LifecycleEventBodyDto, LifecycleEventDto, MitmproxyEventBodyDto,
+    MitmproxyEventDto, PolicyApplyStatusDto,
 };
 
 // ---------------------------------------------------------------------------
@@ -67,6 +69,9 @@ impl From<&Event> for EventDto {
                 TrafficEvent::Dns(e) => EventDto::Dns(dns_event_dto(envelope, e)),
                 TrafficEvent::Envoy(e) => EventDto::Envoy(envoy_event_dto(envelope, e)),
                 TrafficEvent::Mitmproxy(e) => EventDto::Mitmproxy(mitmproxy_event_dto(envelope, e)),
+                TrafficEvent::DenyLogger(e) => {
+                    EventDto::DenyLogger(deny_logger_event_dto(envelope, e))
+                }
             },
             Event::Lifecycle { envelope, event } => {
                 EventDto::Lifecycle(lifecycle_event_dto(envelope, event))
@@ -184,6 +189,50 @@ fn mitmproxy_body_dto(event: &MitmproxyEvent) -> MitmproxyEventBodyDto {
             path: path.clone(),
             reason: reason.clone(),
         },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Deny-logger
+// ---------------------------------------------------------------------------
+
+fn deny_logger_event_dto(envelope: &EventEnvelope, event: &DenyLoggerEvent) -> DenyLoggerEventDto {
+    DenyLoggerEventDto {
+        timestamp: render_timestamp(&envelope.timestamp),
+        session: render_session(&envelope.session),
+        body: deny_logger_body_dto(event),
+    }
+}
+
+fn deny_logger_body_dto(event: &DenyLoggerEvent) -> DenyLoggerEventBodyDto {
+    match event {
+        DenyLoggerEvent::Deny(d) => deny_body_dto(d),
+        DenyLoggerEvent::RateLimited {
+            dropped_events_count,
+            since_ts,
+        } => DenyLoggerEventBodyDto::RateLimited {
+            dropped_events_count: *dropped_events_count,
+            since_ts: render_timestamp(since_ts),
+        },
+    }
+}
+
+fn deny_body_dto(d: &DenyLoggerDeny) -> DenyLoggerEventBodyDto {
+    DenyLoggerEventBodyDto::Deny {
+        orig_dst_ip: d.orig_dst_ip.to_string(),
+        orig_dst_port: d.orig_dst_port,
+        protocol: d.protocol.into(),
+        src_ip: d.src_ip.to_string(),
+        src_port: d.src_port,
+    }
+}
+
+impl From<DenyProtocol> for DenyProtocolDto {
+    fn from(p: DenyProtocol) -> Self {
+        match p {
+            DenyProtocol::Tcp => DenyProtocolDto::Tcp,
+            DenyProtocol::Udp => DenyProtocolDto::Udp,
+        }
     }
 }
 

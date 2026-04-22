@@ -109,8 +109,7 @@ impl Event {
 /// Per-layer traffic event.
 ///
 /// Variants correspond 1:1 to the `Layer` column of spec Part 3
-/// / "Traffic events" (minus `deny-logger`, which is the subject of
-/// M10-S3 and is intentionally not modeled here yet).
+/// / "Traffic events".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrafficEvent {
     /// CoreDNS policy-plugin decision on a client DNS query.
@@ -120,6 +119,9 @@ pub enum TrafficEvent {
     Envoy(EnvoyEvent),
     /// mitmproxy addon per-request decision.
     Mitmproxy(MitmproxyEvent),
+    /// Deny-logger per-attempt decision on a VM-egress connection that
+    /// matches no allow rule (see M10-S3).
+    DenyLogger(DenyLoggerEvent),
 }
 
 /// CoreDNS `query_allowed` / `query_denied`.
@@ -212,9 +214,6 @@ pub enum MitmproxyEvent {
 /// "Hardening rules" § 5 — `rate_limited_count` summary; the plan's
 /// orchestrator-resolved field name is `dropped_events_count`, see
 /// M10-S3 plan question 5).
-///
-/// The variant is not yet wired into [`TrafficEvent`]; that wiring lands
-/// in the follow-up commit that introduces the DTO and mapper arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DenyLoggerEvent {
     /// Single denied connection attempt.

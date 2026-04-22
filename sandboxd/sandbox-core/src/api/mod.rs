@@ -9,9 +9,10 @@ pub mod mapper;
 
 pub use dto::{PolicyDto, PolicyLevelDto, PolicyRuleDto, SessionConfigDto, SessionDto};
 pub use event_dto::{
-    DnsEventBodyDto, DnsEventDto, EnvoyConnectionDto, EnvoyEventBodyDto, EnvoyEventDto, EventDto,
-    GatewayShutdownReasonDto, HealthComponentDto, LifecycleEventBodyDto, LifecycleEventDto,
-    MitmproxyEventBodyDto, MitmproxyEventDto, PolicyApplyStatusDto,
+    DenyLoggerEventBodyDto, DenyLoggerEventDto, DenyProtocolDto, DnsEventBodyDto, DnsEventDto,
+    EnvoyConnectionDto, EnvoyEventBodyDto, EnvoyEventDto, EventDto, GatewayShutdownReasonDto,
+    HealthComponentDto, LifecycleEventBodyDto, LifecycleEventDto, MitmproxyEventBodyDto,
+    MitmproxyEventDto, PolicyApplyStatusDto,
 };
 
 // ---------------------------------------------------------------------------

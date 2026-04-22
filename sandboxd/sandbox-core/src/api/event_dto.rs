@@ -8,7 +8,7 @@
 //! {
 //!   "timestamp": "2026-04-21T12:34:56.789Z",
 //!   "session": "<session-id-or-empty-string>",
-//!   "layer": "dns|envoy|mitmproxy|lifecycle",
+//!   "layer": "dns|envoy|mitmproxy|deny-logger|lifecycle",
 //!   "event": "<event-name>",
 //!   ...layer-specific fields (flattened at top level)...
 //! }
@@ -20,13 +20,18 @@
 //!
 //! Implementation notes:
 //!
-//! - The outer [`EventDto`] uses `#[serde(tag = "layer")]` with a lowercase
-//!   rename so each variant's top-level JSON carries `"layer": "<name>"`
-//!   as its discriminator. The per-layer payload struct carries the
-//!   envelope fields (`timestamp`, `session`) and `#[serde(flatten)]`s its
-//!   per-event body. The body's own `#[serde(tag = "event")]` emits the
-//!   event-name discriminator and each variant's fields at the same level.
-//!   The net shape is exactly the flat JSON above.
+//! - The outer [`EventDto`] uses `#[serde(tag = "layer")]` with a
+//!   kebab-case rename so each variant's top-level JSON carries
+//!   `"layer": "<name>"` as its discriminator. Kebab-case is the
+//!   superset: single-word variants (`Dns`, `Envoy`, `Mitmproxy`,
+//!   `Lifecycle`) render identically to lowercase, while the
+//!   multi-word `DenyLogger` renders as `"deny-logger"` per spec Part 3
+//!   "Traffic events" (which names the layer `deny-logger`). The
+//!   per-layer payload struct carries the envelope fields (`timestamp`,
+//!   `session`) and `#[serde(flatten)]`s its per-event body. The body's
+//!   own `#[serde(tag = "event")]` emits the event-name discriminator
+//!   and each variant's fields at the same level. The net shape is
+//!   exactly the flat JSON above.
 //! - `timestamp` is formatted as RFC 3339 with millisecond precision and
 //!   `Z` suffix (`YYYY-MM-DDTHH:MM:SS.mmmZ`). The mapper rounds (truncates)
 //!   sub-millisecond precision from the [`chrono::DateTime<Utc>`] source.
@@ -46,8 +51,8 @@ use super::dto::PolicyDto;
 /// An event on the wire.
 ///
 /// The outer `layer` tag (`"dns"` / `"envoy"` / `"mitmproxy"` /
-/// `"lifecycle"`) discriminates variants; the inner body's `event` tag
-/// discriminates within the layer.
+/// `"deny-logger"` / `"lifecycle"`) discriminates variants; the inner
+/// body's `event` tag discriminates within the layer.
 ///
 /// No [`PartialEq`] derive: the `Lifecycle` variant transitively carries
 /// [`PolicyDto`], whose domain siblings ([`crate::policy::Policy`],
@@ -56,11 +61,12 @@ use super::dto::PolicyDto;
 /// structurally — tests can compare them directly, and lifecycle round-
 /// trip tests use [`serde_json::Value`] equality instead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "layer", rename_all = "lowercase")]
+#[serde(tag = "layer", rename_all = "kebab-case")]
 pub enum EventDto {
     Dns(DnsEventDto),
     Envoy(EnvoyEventDto),
     Mitmproxy(MitmproxyEventDto),
+    DenyLogger(DenyLoggerEventDto),
     Lifecycle(LifecycleEventDto),
 }
 
@@ -157,6 +163,60 @@ pub enum MitmproxyEventBodyDto {
         path: String,
         reason: String,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Deny-logger
+// ---------------------------------------------------------------------------
+//
+// Wire shape per spec Part 3 / "Traffic events" row for layer
+// `deny-logger`:
+//
+//     | deny-logger | ... | deny | orig_dst_ip, orig_dst_port,
+//                              protocol (tcp/udp), src_ip, src_port |
+//
+// The `rate_limited` summary event carries `dropped_events_count` plus
+// `since_ts` marking the start of the summarised window. The spec names
+// the concept `rate_limited_count` in prose (Hardening rules § 5); the
+// M10-S3 plan's orchestrator-final field name is `dropped_events_count`.
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DenyLoggerEventDto {
+    pub timestamp: String,
+    pub session: String,
+    #[serde(flatten)]
+    pub body: DenyLoggerEventBodyDto,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum DenyLoggerEventBodyDto {
+    Deny {
+        /// IPv4 rendered as `Ipv4Addr::to_string()` (e.g. `"203.0.113.1"`).
+        orig_dst_ip: String,
+        orig_dst_port: u16,
+        protocol: DenyProtocolDto,
+        src_ip: String,
+        src_port: u16,
+    },
+    RateLimited {
+        dropped_events_count: u32,
+        /// Start of the summarised window, RFC 3339 with millisecond
+        /// precision and `Z` suffix — same format as the envelope
+        /// `timestamp`.
+        since_ts: String,
+    },
+}
+
+/// Wire value of the deny-logger `deny` event's `protocol` field.
+///
+/// Spec Part 3 / "Traffic events" row for `deny-logger` prescribes the
+/// literals `"tcp"` and `"udp"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DenyProtocolDto {
+    Tcp,
+    Udp,
 }
 
 // ---------------------------------------------------------------------------
