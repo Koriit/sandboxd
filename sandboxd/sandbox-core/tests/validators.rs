@@ -301,14 +301,24 @@ fn write_file_in_container(container: &str, path: &str, content: &str) {
 /// Rationale: the kernel's nft parser is the ultimate arbiter of
 /// ruleset syntax validity, including concat-set element shapes
 /// (`ipv4_addr . inet_service`) and the flush+define pattern used by
-/// `generate_domain_ip_rules`. A regression that emits a malformed
-/// concat-set element would pass Rust-side string-match tests but be
-/// rejected by `nft -c`.
+/// both emitters.
 ///
-/// The two emitters share the `sandbox_policy` table — the DNS-join
-/// output flushes and re-adds the set elements — so we concatenate
-/// both and validate as one ruleset, mirroring how `policy_distributor`
-/// pipes them to the kernel in production.
+/// **M10-S3 shape.** Both emitters now produce the full two-table
+/// ruleset (`sandbox_dnat` + `sandbox_policy`) via the shared
+/// `render_two_table_ruleset` helper. Concatenation is therefore two
+/// full applies in sequence: the first lays down both tables with
+/// whatever CIDR elements the policy has; the second flushes and
+/// redefines both tables with the DNS-join elements (policy CIDRs +
+/// resolved domain IPs). `nft -c` validates both as one input stream
+/// — mirroring how `policy_distributor` and the DNS propagation loop
+/// pipe them to the kernel at different moments in production.
+///
+/// This also concretely exercises the decision documented in
+/// `policy::compile_nftables`' docstring: cross-table set references
+/// (`@<table>::<set>`) are rejected by the pinned nft 1.0.6, so both
+/// tables carry their own copy of `policy_allow_{tcp,udp}`. If that
+/// ever regresses — e.g. a kernel bump flips the behaviour — this
+/// test surfaces it via a concrete parse result.
 #[test]
 #[ignore = "requires Docker + sandbox-gateway image; enable with SANDBOX_TEST_VALIDATORS=1"]
 fn validator_nft_check() {
@@ -325,10 +335,23 @@ fn validator_nft_check() {
     let dns_rules = generate_domain_ip_rules(&policy, &dns_cache, &network_info);
 
     // Feed the base ruleset and the DNS-join output as one input.
-    // `generate_domain_ip_rules` is a self-contained flush+add script
-    // for the `policy_allow_{tcp,udp}` sets inside `sandbox_policy`,
-    // so concatenation produces the steady-state ruleset.
+    // Both are self-contained `table ... {} / flush / redefine` scripts
+    // for the two-table pair (sandbox_dnat + sandbox_policy), so
+    // concatenation produces a valid sequence of two full applies.
     let combined = format!("{}\n{}\n", compiled.nftables_rules, dns_rules);
+
+    // Sanity: the combined ruleset should carry both tables. This
+    // catches regressions where an emitter silently reverts to the
+    // pre-M10-S3 single-table shape and the nft validator would
+    // therefore only cover half the ruleset.
+    assert!(
+        combined.contains("table inet sandbox_dnat"),
+        "combined ruleset should include sandbox_dnat; got:\n{combined}"
+    );
+    assert!(
+        combined.contains("table inet sandbox_policy"),
+        "combined ruleset should include sandbox_policy; got:\n{combined}"
+    );
 
     let container = TestContainer::spawn("nft");
     let output = exec_with_stdin(&container.name, &["nft", "-c", "-f", "-"], &combined);
