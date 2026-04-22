@@ -19,6 +19,7 @@ use crate::session::SessionId;
 
 pub mod bus;
 pub mod envelope;
+pub mod lifecycle;
 pub mod vm_ip_map;
 
 pub use bus::{DEFAULT_RING_BUFFER_SIZE, EventBus, EventBusConfig, EventSubscription};
