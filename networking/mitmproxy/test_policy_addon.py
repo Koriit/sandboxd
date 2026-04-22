@@ -1043,3 +1043,225 @@ class TestConfigFileWatcher:
         flow = _make_flow(host="new.com")
         addon.request(flow)
         assert flow.response is None
+
+
+# ── JSONL event emission wiring (M10-S2 Phase 6b) ──────────────────
+#
+# The addon must call ``EventEmitter.emit_request_allowed`` /
+# ``emit_request_denied`` at every point it would emit a ``logger.info``
+# / ``logger.warning`` line.  These tests plug a mock emitter into the
+# addon and exercise each of the four decision sites:
+#
+#   1. allow (policy match)
+#   2. deny — host not in policy
+#   3. deny — host matched but port not in policy
+#   4. deny — no filter matched
+#
+# plus the pass-through path (no config loaded → always allow) and the
+# "no emitter wired" case (production-style env where
+# SANDBOX_MITMPROXY_EVENTS is unset — addon must still work).
+
+
+def _make_addon_with_events(
+    rules: list[dict[str, Any]],
+    events: Any,
+) -> PolicyAddon:
+    """Build a PolicyAddon with an injected events emitter (mock or real)."""
+    fd, path = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    _write_config(path, rules)
+    addon = PolicyAddon(config_path=path, events=events)
+    addon._test_config_path = path  # type: ignore[attr-defined]
+    return addon
+
+
+class _FakeClientConn:
+    """Stand-in for ``mitmproxy.connection.Client``'s ``peername``."""
+
+    def __init__(self, peername: Any) -> None:
+        self.peername = peername
+
+
+def _flow_with_peer(
+    *,
+    method: str = "GET",
+    host: str = "example.com",
+    path: str = "/",
+    port: int = 443,
+    peername: Any = ("192.168.87.2", 51234),
+) -> _FakeHTTPFlow:
+    flow = _make_flow(method=method, host=host, path=path, port=port)
+    # Attach a fake client_conn so `_peer_ip` returns a real value.
+    flow.client_conn = _FakeClientConn(peername)  # type: ignore[attr-defined]
+    return flow
+
+
+class TestEventEmissionAllow:
+    def test_allow_emits_request_allowed(self) -> None:
+        mock_events = mock.MagicMock()
+        addon = _make_addon_with_events(
+            [{"host": "api.github.com", "port": 443, "filters": [ANY_FILTER]}],
+            mock_events,
+        )
+        flow = _flow_with_peer(
+            host="api.github.com", path="/repos/foo", peername=("10.0.0.5", 4321)
+        )
+        addon.request(flow)
+        # Flow was allowed (no 599 response).
+        assert flow.response is None
+        # Emitter saw a single allow call with expected kwargs.
+        mock_events.emit_request_allowed.assert_called_once_with(
+            host="api.github.com",
+            port=443,
+            method="GET",
+            path="/repos/foo",
+            client_ip="10.0.0.5",
+        )
+        mock_events.emit_request_denied.assert_not_called()
+
+
+class TestEventEmissionDenyHostNotInPolicy:
+    def test_host_miss_emits_deny_with_exact_reason(self) -> None:
+        mock_events = mock.MagicMock()
+        addon = _make_addon_with_events(
+            [{"host": "api.github.com", "port": 443, "filters": [ANY_FILTER]}],
+            mock_events,
+        )
+        flow = _flow_with_peer(
+            host="evil.com", path="/", peername=("10.0.0.7", 1111)
+        )
+        addon.request(flow)
+        # Deny produces 599 response.
+        assert flow.response is not None
+        assert flow.response.status_code == 599
+        # And a deny event with the same reason the logger line uses.
+        mock_events.emit_request_denied.assert_called_once_with(
+            host="evil.com",
+            port=443,
+            method="GET",
+            path="/",
+            reason="host not in policy",
+            client_ip="10.0.0.7",
+        )
+        mock_events.emit_request_allowed.assert_not_called()
+
+
+class TestEventEmissionDenyPortMismatch:
+    def test_port_miss_emits_deny_with_exact_reason(self) -> None:
+        mock_events = mock.MagicMock()
+        addon = _make_addon_with_events(
+            [{"host": "api.github.com", "port": 443, "filters": [ANY_FILTER]}],
+            mock_events,
+        )
+        # Request lands on port 8443 — the host matches but port does not.
+        flow = _flow_with_peer(host="api.github.com", path="/", port=8443)
+        addon.request(flow)
+        assert flow.response is not None
+        assert flow.response.status_code == 599
+        mock_events.emit_request_denied.assert_called_once()
+        _, kwargs = mock_events.emit_request_denied.call_args
+        # Reason string must match the deny-event contract verbatim
+        # (consumed by ``sandbox events --decision=deny``).
+        assert kwargs["reason"] == "host matched but port 8443 not in policy"
+        assert kwargs["port"] == 8443
+
+
+class TestEventEmissionDenyNoFilterMatch:
+    def test_filter_miss_emits_deny_with_exact_reason(self) -> None:
+        mock_events = mock.MagicMock()
+        addon = _make_addon_with_events(
+            [{"host": "api.github.com", "port": 443, "filters": [
+                {"method": "GET", "path": "/repos/*"},
+            ]}],
+            mock_events,
+        )
+        # POST doesn't match any GET-only filter.
+        flow = _flow_with_peer(
+            method="POST", host="api.github.com", path="/secret"
+        )
+        addon.request(flow)
+        assert flow.response is not None
+        assert flow.response.status_code == 599
+        mock_events.emit_request_denied.assert_called_once()
+        _, kwargs = mock_events.emit_request_denied.call_args
+        # Again, reason must be identical to the logger.warning string.
+        assert kwargs["reason"] == "no filter matched POST /secret"
+
+
+class TestEventEmissionPassthrough:
+    def test_passthrough_emits_request_allowed(self) -> None:
+        """When no policy is loaded, every request is allowed and each
+        allow should still emit a structured event."""
+        mock_events = mock.MagicMock()
+        # Pass an unreadable config path so the addon enters passthrough.
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        os.unlink(path)
+        addon = PolicyAddon(config_path=path, events=mock_events)
+        assert addon._passthrough is True
+
+        flow = _flow_with_peer(
+            host="anywhere.invalid",
+            path="/x",
+            peername=("10.0.0.9", 55555),
+        )
+        addon.request(flow)
+        mock_events.emit_request_allowed.assert_called_once_with(
+            host="anywhere.invalid",
+            port=443,
+            method="GET",
+            path="/x",
+            client_ip="10.0.0.9",
+        )
+
+
+class TestEventEmissionOptional:
+    """The addon must keep working when no emitter is wired — this is
+    the unit-test default and also what happens in production if
+    ``SANDBOX_MITMPROXY_EVENTS`` is unset."""
+
+    def test_no_emitter_allow_succeeds(self) -> None:
+        addon = _make_addon([
+            {"host": "api.github.com", "port": 443, "filters": [ANY_FILTER]},
+        ])
+        assert addon._events is None
+        flow = _flow_with_peer(host="api.github.com", path="/repos/x")
+        addon.request(flow)
+        assert flow.response is None  # Allowed, no crash on missing emitter.
+
+    def test_no_emitter_deny_succeeds(self) -> None:
+        addon = _make_addon([
+            {"host": "api.github.com", "port": 443, "filters": [ANY_FILTER]},
+        ])
+        flow = _flow_with_peer(host="evil.com")
+        addon.request(flow)
+        assert flow.response is not None
+        assert flow.response.status_code == 599
+
+
+class TestEventEmissionClientIpMissing:
+    """When ``flow.client_conn`` is missing or ``peername`` is None,
+    ``client_ip`` must round-trip as ``None`` (serialized JSON null)."""
+
+    def test_no_client_conn_attr(self) -> None:
+        mock_events = mock.MagicMock()
+        addon = _make_addon_with_events(
+            [{"host": "api.github.com", "port": 443, "filters": [ANY_FILTER]}],
+            mock_events,
+        )
+        # Use the vanilla flow (no client_conn attached).
+        flow = _make_flow(host="api.github.com", path="/x")
+        addon.request(flow)
+        _, kwargs = mock_events.emit_request_allowed.call_args
+        assert kwargs["client_ip"] is None
+
+    def test_peername_is_none(self) -> None:
+        mock_events = mock.MagicMock()
+        addon = _make_addon_with_events(
+            [{"host": "api.github.com", "port": 443, "filters": [ANY_FILTER]}],
+            mock_events,
+        )
+        flow = _flow_with_peer(host="api.github.com", path="/x", peername=None)
+        addon.request(flow)
+        _, kwargs = mock_events.emit_request_allowed.call_args
+        assert kwargs["client_ip"] is None

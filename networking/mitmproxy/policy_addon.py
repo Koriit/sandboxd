@@ -61,6 +61,16 @@ Config format (from sandboxd MitmproxyConfig, M10-S1 v2 schema):
   compiler rejects such configurations at compile time, so the addon
   never receives them in practice.  If it does (hand-edited config),
   all requests to that host are denied with `"no filter matched"`.
+
+M10-S2 Phase 6b: in addition to the human-readable ``logger.info`` /
+``logger.warning`` lines, each decision is also emitted as a
+structured JSONL event via :class:`events.EventEmitter` when
+``SANDBOX_MITMPROXY_EVENTS`` is set in the environment.  The JSONL
+stream is the machine-readable contract consumed by sandboxd's
+ingester; ``logger`` lines remain for human operators tailing the
+container.  Emission is **additive** — it never alters request
+handling, and write failures are logged-and-swallowed so they cannot
+turn into HTTP 500s.
 """
 
 from __future__ import annotations
@@ -76,16 +86,46 @@ from typing import Any
 
 from mitmproxy import http
 
+from events import EventEmitter
+
 logger = logging.getLogger("policy_addon")
 
 # Environment variable for config file path (set by sandboxd).
 CONFIG_PATH_ENV = "SANDBOX_MITMPROXY_CONFIG"
 # Default config file location inside the gateway container.
 DEFAULT_CONFIG_PATH = "/tmp/mitmproxy/policy.json"
+# Environment variable for the JSONL event stream path.  When set, the
+# addon emits a structured event per decision to this file in addition
+# to the existing ``logger.info`` line.  See ``events.py`` for the
+# envelope definition.  Unset → no structured emission (unit tests).
+EVENTS_PATH_ENV = "SANDBOX_MITMPROXY_EVENTS"
 # How often (seconds) to poll the config file for changes.
 CONFIG_POLL_INTERVAL = 5
 # Internal health-check endpoint.
 HEALTH_PATH = "/__sandbox_health"
+
+
+def _peer_ip(flow: "http.HTTPFlow") -> "str | None":
+    """Extract the client IP from a flow, tolerant of missing peers.
+
+    ``flow.client_conn.peername`` is ``Optional[tuple[str, int]]`` on
+    real mitmproxy flows; on our ``_FakeHTTPFlow`` test fixtures it's
+    not set at all.  Either case is fine — we serialize the absence as
+    JSON ``null`` in the event envelope so the ingest parser can tell
+    "unknown peer" apart from "missing field".
+    """
+    try:
+        peer = getattr(flow.client_conn, "peername", None)
+    except AttributeError:
+        return None
+    if peer is None:
+        return None
+    # ``peername`` is a 2- or 4-tuple (IPv4 vs. IPv6).  Element 0 is
+    # always the address literal.
+    try:
+        return str(peer[0])
+    except (IndexError, TypeError):
+        return None
 
 
 # ── Per-segment path glob matcher ───────────────────────────────────
@@ -170,7 +210,11 @@ class PolicyAddon:
     If no config file exists, all requests are allowed (pass-through mode).
     """
 
-    def __init__(self, config_path: str | None = None) -> None:
+    def __init__(
+        self,
+        config_path: str | None = None,
+        events: EventEmitter | None = None,
+    ) -> None:
         self._config_path: str = (
             config_path
             or os.environ.get(CONFIG_PATH_ENV, "")
@@ -180,6 +224,10 @@ class PolicyAddon:
         self._passthrough: bool = True
         self._lock = threading.Lock()
         self._last_mtime: float = 0.0
+        # When ``events`` is None (unit tests, or production with
+        # SANDBOX_MITMPROXY_EVENTS unset) we skip structured emission
+        # and keep only the human-readable ``logger.info`` line.
+        self._events: EventEmitter | None = events
 
         self._load_config()
         self._start_watcher()
@@ -206,20 +254,51 @@ class PolicyAddon:
             )
             return
 
+        client_ip = _peer_ip(flow)
+
         # Pass-through mode: no config loaded → allow everything.
         if self._passthrough:
             logger.info(
                 "[ALLOW] %s %s:%d%s (pass-through)", method, host, port, path
             )
+            if self._events is not None:
+                self._events.emit_request_allowed(
+                    host=host,
+                    port=port,
+                    method=method,
+                    path=path,
+                    client_ip=client_ip,
+                )
             return
 
         allowed, reason = self._check_request(host, port, method, path)
         if allowed:
             logger.info("[ALLOW] %s %s:%d%s", method, host, port, path)
+            if self._events is not None:
+                self._events.emit_request_allowed(
+                    host=host,
+                    port=port,
+                    method=method,
+                    path=path,
+                    client_ip=client_ip,
+                )
         else:
             logger.warning(
                 "[DENY] %s %s:%d%s (%s)", method, host, port, path, reason
             )
+            if self._events is not None:
+                # ``reason`` is the exact string `_check_request`
+                # returned — the character-for-character match between
+                # the human log line above and the JSONL event is the
+                # contract consumed by `sandbox events --decision=deny`.
+                self._events.emit_request_denied(
+                    host=host,
+                    port=port,
+                    method=method,
+                    path=path,
+                    reason=reason,
+                    client_ip=client_ip,
+                )
             flow.response = http.Response.make(
                 599,
                 json.dumps({
@@ -406,4 +485,38 @@ def _resolve_config_path() -> str:
     return os.environ.get(CONFIG_PATH_ENV, "") or DEFAULT_CONFIG_PATH
 
 
-addons = [PolicyAddon(_resolve_config_path())]
+def _build_event_emitter() -> EventEmitter | None:
+    """Construct a shared :class:`EventEmitter` from the environment.
+
+    When ``SANDBOX_MITMPROXY_EVENTS`` is set (populated by
+    ``gateway/entrypoint.sh`` before launching mitmdump), the addon
+    writes one structured JSONL line per decision to that file.  When
+    it is unset (typical in unit tests) we return ``None`` and the
+    addon falls back to human-readable ``logger.info`` only.
+
+    Failures are swallowed: if the events directory is missing or
+    unwritable we log and keep going — structured emission is
+    additive, never a gate on request handling.
+    """
+    path = os.environ.get(EVENTS_PATH_ENV, "")
+    if not path:
+        return None
+    try:
+        # Make sure the parent directory exists; in production the
+        # bind-mount target ``/var/log/gateway/events/`` is present
+        # because sandboxd pre-creates the host side, but in local
+        # runs (e.g. ``make test-validators``) we want to be resilient.
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        return EventEmitter(path)
+    except OSError as exc:
+        logger.error(
+            "Failed to open events file %s: %s — structured emission disabled",
+            path,
+            exc,
+        )
+        return None
+
+
+addons = [PolicyAddon(_resolve_config_path(), _build_event_emitter())]
