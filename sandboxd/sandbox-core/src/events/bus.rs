@@ -161,6 +161,21 @@ impl SessionEventSink {
 struct BusInner {
     config: EventBusConfig,
     sessions: RwLock<HashMap<SessionId, SessionEventSink>>,
+    /// Global cross-session sink. Every [`EventBus::publish`] fans out
+    /// to the per-session sink **and** to this global sink, so a single
+    /// subscriber (today: the persistent sink — see
+    /// [`crate::events::persist`]) can observe every event on every
+    /// session without having to enumerate or subscribe to each one
+    /// individually.
+    ///
+    /// The fan-out is strict: a per-session publish succeeds even when
+    /// the global sink has no subscribers (`broadcast::Sender::send`
+    /// returns `Err` only when the receiver list is empty; we drop that
+    /// error silently — the persistent sink may not be enabled). The
+    /// global sink also keeps its own replay ring so a late subscriber
+    /// sees recent cross-session history in exactly the same way a
+    /// per-session subscriber does.
+    global: SessionEventSink,
 }
 
 /// In-process event fan-out facade.
@@ -174,10 +189,12 @@ pub struct EventBus {
 impl EventBus {
     /// Construct an empty bus with the given tunables.
     pub fn new(config: EventBusConfig) -> Self {
+        let global = SessionEventSink::new(config.ring_buffer_size);
         Self {
             inner: Arc::new(BusInner {
                 config,
                 sessions: RwLock::new(HashMap::new()),
+                global,
             }),
         }
     }
@@ -209,13 +226,19 @@ impl EventBus {
         sessions.remove(session_id);
     }
 
-    /// Route `event` to its session's sink.
+    /// Route `event` to its session's sink and to the global sink.
     ///
-    /// Silently drops the event when:
+    /// Silently drops the event (no per-session or global fan-out) when:
     /// - the event has no attributed session ([`Event::session`] is
     ///   [`None`]), or
     /// - the attributed session has not been registered (or was already
     ///   unregistered in a concurrent teardown race).
+    ///
+    /// When the event is accepted, a single `Arc<Event>` is cloned into
+    /// both the per-session sink and the global sink so downstream
+    /// subscribers share the same allocation. The global sink observes
+    /// every event from every session in a single stream — see
+    /// [`Self::subscribe_global`] for the consumer-side contract.
     ///
     /// Returns `true` if the event was routed to a sink, `false` otherwise.
     pub fn publish(&self, event: Event) -> bool {
@@ -230,7 +253,11 @@ impl EventBus {
         let Some(sink) = sessions.get(&session_id) else {
             return false;
         };
-        sink.publish(Arc::new(event));
+        let shared = Arc::new(event);
+        sink.publish(Arc::clone(&shared));
+        // Fan out to the global sink. Uses the same `Arc<Event>` so
+        // subscribers on either side point at the same allocation.
+        self.inner.global.publish(shared);
         true
     }
 
@@ -248,6 +275,18 @@ impl EventBus {
             .expect("EventBus sessions lock poisoned");
         let sink = sessions.get(session_id)?;
         Some(sink.snapshot_and_subscribe())
+    }
+
+    /// Atomically snapshot the global ring and subscribe for future
+    /// events across every session.
+    ///
+    /// Intended for system-wide consumers (today: the persistent sink).
+    /// Matches the shape of [`Self::subscribe`] — `(replay, receiver)`,
+    /// callers drain the replay first — but observes every published
+    /// event, regardless of attributed session. Never returns [`None`]:
+    /// the global sink exists for the lifetime of the [`EventBus`].
+    pub fn subscribe_global(&self) -> EventSubscription {
+        self.inner.global.snapshot_and_subscribe()
     }
 
     /// Number of registered sessions. Exposed for tests and future
@@ -494,6 +533,78 @@ mod tests {
             Err(TryRecvError::Empty) => {}
             other => panic!("expected empty on b; got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn global_broadcast_delivers_cross_session() {
+        // Q6 (Phase 0 decision): every `publish` fans out to both the
+        // per-session sink and the global sink. A single
+        // `subscribe_global` sees events from every registered session,
+        // while per-session subscribers continue to see only their
+        // own.
+        let bus = EventBus::default();
+        let sid_a = SessionId::generate();
+        let sid_b = SessionId::generate();
+        bus.register_session(sid_a);
+        bus.register_session(sid_b);
+
+        // Per-session subscribers first. Both start with empty replay.
+        let (_replay_a, mut rx_a) = bus.subscribe(&sid_a).unwrap();
+        let (_replay_b, mut rx_b) = bus.subscribe(&sid_b).unwrap();
+
+        // Publish 3 events: 2 on A, 1 on B.
+        bus.publish(dns_allow(Some(sid_a), "a1.example.com"));
+        bus.publish(envoy_deny(Some(sid_a)));
+        bus.publish(dns_allow(Some(sid_b), "b1.example.com"));
+
+        // Global subscriber sees all three. Replay would have caught
+        // them even if we subscribed after-the-fact; this assertion
+        // proves the live receiver path as well.
+        let (replay, mut rx_global) = bus.subscribe_global();
+        assert_eq!(
+            replay.len(),
+            3,
+            "global replay must contain every published event"
+        );
+
+        // Subscribe global a second time to verify replay-only path in
+        // isolation (the first subscriber was created after publish —
+        // its receiver is empty and its replay holds all three).
+        use tokio::sync::broadcast::error::TryRecvError;
+        match rx_global.try_recv() {
+            Err(TryRecvError::Empty) => {}
+            other => panic!("expected empty live channel after replay; got {other:?}"),
+        }
+
+        // Live fan-out: a new publish arrives on the global receiver.
+        bus.publish(dns_allow(Some(sid_b), "b2.example.com"));
+        let got = rx_global.recv().await.expect("live global event");
+        match &*got {
+            Event::Traffic {
+                event: TrafficEvent::Dns(DnsEvent::QueryAllowed { query, .. }),
+                ..
+            } => assert_eq!(query, "b2.example.com"),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // Per-session isolation is preserved: A sees 2, B sees 2, no
+        // cross-talk. Drain both with `try_recv` to count.
+        let mut a_seen = 0;
+        while let Ok(_ev) = rx_a.try_recv() {
+            a_seen += 1;
+        }
+        let mut b_seen = 0;
+        while let Ok(_ev) = rx_b.try_recv() {
+            b_seen += 1;
+        }
+        assert_eq!(
+            a_seen, 2,
+            "session A subscriber must see exactly its 2 events"
+        );
+        assert_eq!(
+            b_seen, 2,
+            "session B subscriber must see exactly its 2 events"
+        );
     }
 
     #[tokio::test]
