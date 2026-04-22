@@ -31,6 +31,7 @@ use std::sync::Arc;
 use clap::Parser;
 
 mod event;
+mod health;
 mod tcp;
 mod udp;
 
@@ -154,6 +155,9 @@ async fn run(args: Args) -> std::io::Result<()> {
     let udp_socket = udp::bind(args.bind_ip, args.udp_port).await?;
     tracing::info!(port = args.udp_port, "udp listener bound");
 
+    let health_listener = health::bind(args.bind_ip, args.health_port).await?;
+    tracing::info!(port = args.health_port, "health listener bound");
+
     let tcp_emitter = Arc::clone(&emitter);
     let tcp_task = tokio::spawn(async move {
         if let Err(err) = tcp::run(tcp_listener, tcp_emitter).await {
@@ -168,12 +172,21 @@ async fn run(args: Args) -> std::io::Result<()> {
         }
     });
 
-    // Health listener lands in the next commit. For now wait on both
-    // listener tasks — either exiting takes the process down so Docker
-    // flags the container unhealthy.
+    let health_emitter = Arc::clone(&emitter);
+    let health_task = tokio::spawn(async move {
+        if let Err(err) = health::run(health_listener, health_emitter).await {
+            tracing::error!(error = %err, "health listener exited with error");
+        }
+    });
+
+    // Any listener task exiting takes the process down so Docker's
+    // HEALTHCHECK flips the container unhealthy and sandboxd's gateway
+    // poller restarts it — spec Part 3 / "Liveness posture" forbids a
+    // degraded-observability mode.
     tokio::select! {
         res = tcp_task => res.map_err(|e| std::io::Error::other(e.to_string()))?,
         res = udp_task => res.map_err(|e| std::io::Error::other(e.to_string()))?,
+        res = health_task => res.map_err(|e| std::io::Error::other(e.to_string()))?,
     }
     Ok(())
 }

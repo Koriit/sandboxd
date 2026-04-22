@@ -138,17 +138,15 @@ impl EventEmitter {
         self.write_line(&line);
     }
 
-    /// Current value of the rolling events-per-window gauge.
-    // Consumed by the health listener in a later commit in this phase.
-    #[allow(dead_code)]
+    /// Current value of the rolling events-per-window gauge. Consumed
+    /// by the health listener for the `events_emitted_60s` JSON field.
     pub fn events_emitted_60s(&self) -> u64 {
         self.events_emitted_60s.load(Ordering::Relaxed)
     }
 
-    /// Reset the rolling gauge. Called by a background ticker every 60s
-    /// so the exposed value approximates "events in the last minute".
-    // Consumed by the health listener in a later commit in this phase.
-    #[allow(dead_code)]
+    /// Reset the rolling gauge. Called by the health listener's
+    /// background ticker every 60s so the exposed value approximates
+    /// "events in the last minute".
     pub fn reset_gauge(&self) {
         self.events_emitted_60s.store(0, Ordering::Relaxed);
     }
