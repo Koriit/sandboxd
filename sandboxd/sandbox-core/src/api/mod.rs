@@ -5,6 +5,7 @@ use crate::session::SessionId;
 pub mod dto;
 pub mod event_dto;
 pub mod event_mapper;
+pub mod events_filter;
 pub mod events_query_dto;
 pub mod mapper;
 
@@ -15,6 +16,7 @@ pub use event_dto::{
     HealthComponentDto, LifecycleEventBodyDto, LifecycleEventDto, MitmproxyEventBodyDto,
     MitmproxyEventDto, PolicyApplyStatusDto,
 };
+pub use events_filter::{EventName, EventsFilter, LayerKind};
 pub use events_query_dto::{DecisionKind, EventsQueryDto};
 
 // ---------------------------------------------------------------------------

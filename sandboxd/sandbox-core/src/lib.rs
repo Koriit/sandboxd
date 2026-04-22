@@ -19,11 +19,12 @@ pub mod vm_network;
 pub use api::{
     CreateSessionRequest, DecisionKind, DenyLoggerEventBodyDto, DenyLoggerEventDto,
     DenyProtocolDto, DnsEventBodyDto, DnsEventDto, EnvoyConnectionDto, EnvoyEventBodyDto,
-    EnvoyEventDto, EventDto, EventsQueryDto, ExecRequest, ExecResponse, FileDownloadRequest,
-    FileDownloadResponse, FileUploadRequest, GatewayHealth, GatewayShutdownReasonDto,
-    HealthComponentDto, LifecycleEventBodyDto, LifecycleEventDto, MitmproxyEventBodyDto,
-    MitmproxyEventDto, NetworkHealth, PolicyApplyStatusDto, PolicyDto, PolicyLevelDto,
-    PolicyRuleDto, SessionConfigDto, SessionDto, SessionHealth, UpdatePolicyRequest,
+    EnvoyEventDto, EventDto, EventName, EventsFilter, EventsQueryDto, ExecRequest, ExecResponse,
+    FileDownloadRequest, FileDownloadResponse, FileUploadRequest, GatewayHealth,
+    GatewayShutdownReasonDto, HealthComponentDto, LayerKind, LifecycleEventBodyDto,
+    LifecycleEventDto, MitmproxyEventBodyDto, MitmproxyEventDto, NetworkHealth,
+    PolicyApplyStatusDto, PolicyDto, PolicyLevelDto, PolicyRuleDto, SessionConfigDto, SessionDto,
+    SessionHealth, UpdatePolicyRequest,
 };
 pub use atomic_listener_writer::{
     AtomicListenerWriter, LISTENER_HOST_ROOT, ListenerWriteError, session_listener_host_dir,
