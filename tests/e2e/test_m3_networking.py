@@ -429,11 +429,14 @@ def test_stop_start_with_networking(sandbox_cli):
     start, verify persistence and networking restoration.
     """
     session_id = None
+    policy_path = None
     try:
-        # 1. Create a session.
+        # 1. Create a session with a minimal v2 policy (post-M10-S1
+        #    replacement for the legacy --unrestricted flag).
+        policy_path = _networking_smoke_policy_file()
         result = sandbox_cli(
             "create", "--name", "net-restart-test", *_VM_RESOURCE_ARGS,
-            "--unrestricted",
+            "--policy", policy_path,
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -536,6 +539,8 @@ def test_stop_start_with_networking(sandbox_cli):
     finally:
         if session_id is not None:
             sandbox_cli("rm", "net-restart-test", timeout=120)
+        if policy_path is not None:
+            cleanup_policy_file(policy_path)
 
 
 @pytest.mark.timeout(600)
@@ -832,11 +837,14 @@ def test_gateway_crash_recovery(sandbox_cli):
     detects and restarts it within the poll interval (30 seconds).
     """
     session_id = None
+    policy_path = None
     try:
-        # 1. Create a session.
+        # 1. Create a session with a minimal v2 policy (post-M10-S1
+        #    replacement for the legacy --unrestricted flag).
+        policy_path = _networking_smoke_policy_file()
         result = sandbox_cli(
             "create", "--name", "net-gwcrash-test", *_VM_RESOURCE_ARGS,
-            "--unrestricted",
+            "--policy", policy_path,
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -945,3 +953,5 @@ def test_gateway_crash_recovery(sandbox_cli):
     finally:
         if session_id is not None:
             sandbox_cli("rm", "net-gwcrash-test", timeout=120)
+        if policy_path is not None:
+            cleanup_policy_file(policy_path)
