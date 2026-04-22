@@ -3,6 +3,7 @@ pub mod atomic_listener_writer;
 pub mod ca;
 pub mod dns_propagation;
 pub mod error;
+pub mod events;
 pub mod gateway;
 pub mod guest;
 pub mod lima;
@@ -30,6 +31,10 @@ pub use dns_propagation::{
     generate_domain_ip_rules, propagate_dns_changes, read_resolved_json,
 };
 pub use error::{ApiError, SandboxError};
+pub use events::{
+    DnsEvent, EnvoyConnection, EnvoyEvent, Event, EventEnvelope, GatewayShutdownReason,
+    HealthComponent, LifecycleEvent, MitmproxyEvent, PolicyApplyStatus, TrafficEvent,
+};
 pub use gateway::{GatewayManager, GatewayStatus};
 pub use guest::{
     GUEST_AGENT_PORT, GuestConnector, GuestRequest, GuestResponse, MAX_MESSAGE_SIZE, read_message,
