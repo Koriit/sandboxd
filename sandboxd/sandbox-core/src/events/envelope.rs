@@ -261,3 +261,384 @@ pub enum GatewayShutdownReason {
     DaemonShutdown,
     Error,
 }
+
+// ---------------------------------------------------------------------------
+// Round-trip tests: domain → DTO → JSON → DTO → domain
+// ---------------------------------------------------------------------------
+//
+// Each round-trip test builds a fixture domain [`Event`], maps it to the
+// wire DTO, serializes to JSON, deserializes back, and asserts the full
+// round-trip preserves the shape. Traffic-layer tests use direct DTO
+// equality; lifecycle tests use [`serde_json::Value`] equality (the
+// lifecycle DTO does not derive [`PartialEq`], see the type's rustdoc for
+// why).
+//
+// Every test also asserts the serialized JSON carries the spec's exact
+// `layer` and `event` discriminators, plus the layer-specific field names
+// from spec Part 3 "Event categories".
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use chrono::TimeZone;
+    use serde_json::Value;
+
+    use crate::api::event_dto::EventDto;
+    use crate::policy::{
+        AssuranceLevel, Destination, HttpFilter, HttpMethod, Policy, PolicyRule, Protocol,
+    };
+
+    fn fixture_timestamp() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 4, 22, 9, 45, 0)
+            .unwrap()
+            .with_timezone(&Utc)
+            + chrono::Duration::milliseconds(123)
+    }
+
+    fn fixture_session() -> SessionId {
+        SessionId::parse("0123456789ab").expect("valid fixture id")
+    }
+
+    fn fixture_envelope() -> EventEnvelope {
+        EventEnvelope {
+            timestamp: fixture_timestamp(),
+            session: Some(fixture_session()),
+        }
+    }
+
+    fn fixture_policy() -> Policy {
+        Policy {
+            version: "2.0.0".into(),
+            rules: vec![PolicyRule {
+                host: Destination::Domain("api.example.com".into()),
+                port: 443,
+                protocol: Protocol::Tcp,
+                reason: None,
+                level: AssuranceLevel::Http {
+                    http_filters: vec![HttpFilter {
+                        method: HttpMethod::Get,
+                        path: "/v1/**".into(),
+                    }],
+                },
+            }],
+        }
+    }
+
+    /// Traffic-layer round-trip helper: serialize → parse back → compare.
+    fn round_trip_traffic(event: Event, expected_layer: &str, expected_event: &str) -> Value {
+        let dto = EventDto::from(&event);
+        let json = serde_json::to_value(&dto).expect("serialize");
+        let top = json.as_object().expect("event is a json object");
+        assert_eq!(
+            top.get("layer").and_then(Value::as_str),
+            Some(expected_layer)
+        );
+        assert_eq!(
+            top.get("event").and_then(Value::as_str),
+            Some(expected_event)
+        );
+        // Deserialize back and re-serialize; expect identical JSON.
+        let parsed: EventDto = serde_json::from_value(json.clone()).expect("parse back");
+        let reserialized = serde_json::to_value(&parsed).expect("re-serialize");
+        assert_eq!(json, reserialized, "round-trip must preserve JSON shape");
+        json
+    }
+
+    /// Lifecycle round-trip helper: same as traffic but always uses JSON
+    /// equality (no DTO PartialEq for lifecycle).
+    fn round_trip_lifecycle(event: Event, expected_event: &str) -> Value {
+        let dto = EventDto::from(&event);
+        let json = serde_json::to_value(&dto).expect("serialize");
+        let top = json.as_object().expect("event is a json object");
+        assert_eq!(
+            top.get("layer").and_then(Value::as_str),
+            Some("lifecycle"),
+            "lifecycle events must carry `layer: \"lifecycle\"`"
+        );
+        assert_eq!(
+            top.get("event").and_then(Value::as_str),
+            Some(expected_event)
+        );
+        let parsed: EventDto = serde_json::from_value(json.clone()).expect("parse back");
+        let reserialized = serde_json::to_value(&parsed).expect("re-serialize");
+        assert_eq!(json, reserialized, "round-trip must preserve JSON shape");
+        json
+    }
+
+    // ----- traffic: envoy ---------------------------------------------------
+
+    fn envoy_fixture(response_flags: &str, connect_authority: Option<&str>) -> EnvoyConnection {
+        EnvoyConnection {
+            src_ip: "10.0.0.42".parse().unwrap(),
+            src_port: 54321,
+            dst_ip: "93.184.216.34".parse().unwrap(),
+            dst_port: 443,
+            matched_chain: "chain_l3_example".into(),
+            cluster: "upstream_example_443".into(),
+            upstream_host: Some("93.184.216.34:443".into()),
+            bytes_sent: 1024,
+            bytes_received: 4096,
+            response_flags: response_flags.into(),
+            duration_ms: 42,
+            connect_authority: connect_authority.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn env_round_trip_traffic_envoy_allow() {
+        let event = Event::Traffic {
+            envelope: fixture_envelope(),
+            event: TrafficEvent::Envoy(EnvoyEvent::ConnectionAllowed(envoy_fixture(
+                "-",
+                Some("example.com:443"),
+            ))),
+        };
+        let json = round_trip_traffic(event, "envoy", "connection_allowed");
+        // Spot-check spec field names appear at the top level.
+        for field in [
+            "timestamp",
+            "session",
+            "layer",
+            "event",
+            "src_ip",
+            "src_port",
+            "dst_ip",
+            "dst_port",
+            "matched_chain",
+            "cluster",
+            "upstream_host",
+            "bytes_sent",
+            "bytes_received",
+            "response_flags",
+            "duration_ms",
+            "connect_authority",
+        ] {
+            assert!(
+                json.get(field).is_some(),
+                "missing `{field}` at top level; json = {json}"
+            );
+        }
+        assert_eq!(json["src_ip"], "10.0.0.42");
+        assert_eq!(json["dst_port"], 443);
+    }
+
+    #[test]
+    fn env_round_trip_traffic_envoy_deny() {
+        let event = Event::Traffic {
+            envelope: fixture_envelope(),
+            event: TrafficEvent::Envoy(EnvoyEvent::ConnectionDenied(envoy_fixture("NR", None))),
+        };
+        let json = round_trip_traffic(event, "envoy", "connection_denied");
+        assert_eq!(json["response_flags"], "NR");
+        // `connect_authority` absent on this fixture (L1/L2-style).
+        assert!(
+            json.get("connect_authority").is_none(),
+            "connect_authority should be omitted when None; json = {json}"
+        );
+    }
+
+    // ----- traffic: dns -----------------------------------------------------
+
+    #[test]
+    fn env_round_trip_traffic_dns_allow() {
+        let event = Event::Traffic {
+            envelope: fixture_envelope(),
+            event: TrafficEvent::Dns(DnsEvent::QueryAllowed {
+                query: "api.example.com".into(),
+                qtype: "A".into(),
+                resolved_ips: vec!["93.184.216.34".parse().unwrap()],
+            }),
+        };
+        let json = round_trip_traffic(event, "dns", "query_allowed");
+        assert_eq!(json["query"], "api.example.com");
+        assert_eq!(json["qtype"], "A");
+        assert_eq!(json["resolved_ips"][0], "93.184.216.34");
+    }
+
+    #[test]
+    fn env_round_trip_traffic_dns_deny() {
+        let event = Event::Traffic {
+            envelope: fixture_envelope(),
+            event: TrafficEvent::Dns(DnsEvent::QueryDenied {
+                query: "blocked.example.com".into(),
+                qtype: "AAAA".into(),
+                reason: "policy_deny".into(),
+            }),
+        };
+        let json = round_trip_traffic(event, "dns", "query_denied");
+        assert_eq!(json["query"], "blocked.example.com");
+        assert_eq!(json["qtype"], "AAAA");
+        assert_eq!(json["reason"], "policy_deny");
+        // `resolved_ips` must not appear on a deny event.
+        assert!(
+            json.get("resolved_ips").is_none(),
+            "resolved_ips must not appear on deny; json = {json}"
+        );
+    }
+
+    // ----- traffic: mitmproxy ----------------------------------------------
+
+    #[test]
+    fn env_round_trip_traffic_mitmproxy_allow() {
+        let event = Event::Traffic {
+            envelope: fixture_envelope(),
+            event: TrafficEvent::Mitmproxy(MitmproxyEvent::RequestAllowed {
+                host: "api.example.com".into(),
+                port: 443,
+                method: "GET".into(),
+                path: "/v1/widgets".into(),
+            }),
+        };
+        let json = round_trip_traffic(event, "mitmproxy", "request_allowed");
+        for field in ["host", "port", "method", "path"] {
+            assert!(
+                json.get(field).is_some(),
+                "mitmproxy allow missing `{field}`; json = {json}"
+            );
+        }
+        assert_eq!(json["host"], "api.example.com");
+        assert_eq!(json["port"], 443);
+        assert_eq!(json["method"], "GET");
+        assert_eq!(json["path"], "/v1/widgets");
+        // `reason` must not appear on an allow event.
+        assert!(
+            json.get("reason").is_none(),
+            "reason must not appear on allow; json = {json}"
+        );
+    }
+
+    #[test]
+    fn env_round_trip_traffic_mitmproxy_deny() {
+        let event = Event::Traffic {
+            envelope: fixture_envelope(),
+            event: TrafficEvent::Mitmproxy(MitmproxyEvent::RequestDenied {
+                host: "api.example.com".into(),
+                port: 443,
+                method: "DELETE".into(),
+                path: "/admin".into(),
+                reason: "no_matching_filter".into(),
+            }),
+        };
+        let json = round_trip_traffic(event, "mitmproxy", "request_denied");
+        assert_eq!(json["reason"], "no_matching_filter");
+        assert_eq!(json["method"], "DELETE");
+    }
+
+    // ----- lifecycle -------------------------------------------------------
+
+    #[test]
+    fn env_round_trip_lifecycle_gateway_booting() {
+        // `gateway_booting` is a pre-session event per spec; session is None.
+        let event = Event::Lifecycle {
+            envelope: EventEnvelope {
+                timestamp: fixture_timestamp(),
+                session: None,
+            },
+            event: LifecycleEvent::GatewayBooting,
+        };
+        let json = round_trip_lifecycle(event, "gateway_booting");
+        // No session attribution yet; wire must still carry the field as "".
+        assert_eq!(json["session"], "");
+    }
+
+    #[test]
+    fn env_round_trip_lifecycle_gateway_ready() {
+        let event = Event::Lifecycle {
+            envelope: fixture_envelope(),
+            event: LifecycleEvent::GatewayReady,
+        };
+        round_trip_lifecycle(event, "gateway_ready");
+    }
+
+    #[test]
+    fn env_round_trip_lifecycle_policy_applied() {
+        let event = Event::Lifecycle {
+            envelope: fixture_envelope(),
+            event: LifecycleEvent::PolicyApplied {
+                policy: fixture_policy(),
+                source_presets: vec!["cargo:".into()],
+                status: PolicyApplyStatus::Ok,
+                error: None,
+            },
+        };
+        let json = round_trip_lifecycle(event, "policy_applied");
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["source_presets"][0], "cargo:");
+        // Policy object carried through the `policy` field (nested object).
+        assert_eq!(json["policy"]["version"], "2.0.0");
+        // error is omitted on success.
+        assert!(json.get("error").is_none(), "error omitted on ok status");
+    }
+
+    #[test]
+    fn env_round_trip_lifecycle_policy_updated() {
+        let event = Event::Lifecycle {
+            envelope: fixture_envelope(),
+            event: LifecycleEvent::PolicyUpdated {
+                policy: fixture_policy(),
+                source_presets: vec![],
+                status: PolicyApplyStatus::Error,
+                error: Some("compile failed".into()),
+                previous_policy_hash: Some("deadbeef".into()),
+            },
+        };
+        let json = round_trip_lifecycle(event, "policy_updated");
+        assert_eq!(json["status"], "error");
+        assert_eq!(json["error"], "compile failed");
+        assert_eq!(json["previous_policy_hash"], "deadbeef");
+    }
+
+    #[test]
+    fn env_round_trip_lifecycle_policy_reset_on_upgrade() {
+        let event = Event::Lifecycle {
+            envelope: fixture_envelope(),
+            event: LifecycleEvent::PolicyResetOnUpgrade {
+                previous_rule_count: 7,
+            },
+        };
+        let json = round_trip_lifecycle(event, "policy_reset_on_upgrade");
+        assert_eq!(json["previous_rule_count"], 7);
+    }
+
+    #[test]
+    fn env_round_trip_lifecycle_health_degraded() {
+        let event = Event::Lifecycle {
+            envelope: fixture_envelope(),
+            event: LifecycleEvent::HealthDegraded {
+                component: HealthComponent::DenyLogger,
+                reason: "healthcheck timeout".into(),
+            },
+        };
+        let json = round_trip_lifecycle(event, "health_degraded");
+        // Kebab-case literal per spec.
+        assert_eq!(json["component"], "deny-logger");
+        assert_eq!(json["reason"], "healthcheck timeout");
+    }
+
+    #[test]
+    fn env_round_trip_lifecycle_health_restored() {
+        let event = Event::Lifecycle {
+            envelope: fixture_envelope(),
+            event: LifecycleEvent::HealthRestored {
+                component: HealthComponent::Coredns,
+            },
+        };
+        let json = round_trip_lifecycle(event, "health_restored");
+        assert_eq!(json["component"], "coredns");
+    }
+
+    #[test]
+    fn env_round_trip_lifecycle_gateway_shutdown() {
+        let event = Event::Lifecycle {
+            envelope: fixture_envelope(),
+            event: LifecycleEvent::GatewayShutdown {
+                reason: GatewayShutdownReason::SessionStopped,
+                error: None,
+            },
+        };
+        let json = round_trip_lifecycle(event, "gateway_shutdown");
+        assert_eq!(json["reason"], "session_stopped");
+        assert!(json.get("error").is_none());
+    }
+}

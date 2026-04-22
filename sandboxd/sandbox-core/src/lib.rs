@@ -17,8 +17,11 @@ pub mod store;
 pub mod vm_network;
 
 pub use api::{
-    CreateSessionRequest, ExecRequest, ExecResponse, FileDownloadRequest, FileDownloadResponse,
-    FileUploadRequest, GatewayHealth, NetworkHealth, PolicyDto, PolicyLevelDto, PolicyRuleDto,
+    CreateSessionRequest, DnsEventBodyDto, DnsEventDto, EnvoyConnectionDto, EnvoyEventBodyDto,
+    EnvoyEventDto, EventDto, ExecRequest, ExecResponse, FileDownloadRequest, FileDownloadResponse,
+    FileUploadRequest, GatewayHealth, GatewayShutdownReasonDto, HealthComponentDto,
+    LifecycleEventBodyDto, LifecycleEventDto, MitmproxyEventBodyDto, MitmproxyEventDto,
+    NetworkHealth, PolicyApplyStatusDto, PolicyDto, PolicyLevelDto, PolicyRuleDto,
     SessionConfigDto, SessionDto, SessionHealth, UpdatePolicyRequest,
 };
 pub use atomic_listener_writer::{

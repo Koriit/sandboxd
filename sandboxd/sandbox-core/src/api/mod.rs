@@ -3,9 +3,16 @@ use serde::{Deserialize, Serialize};
 use crate::session::SessionId;
 
 pub mod dto;
+pub mod event_dto;
+pub mod event_mapper;
 pub mod mapper;
 
 pub use dto::{PolicyDto, PolicyLevelDto, PolicyRuleDto, SessionConfigDto, SessionDto};
+pub use event_dto::{
+    DnsEventBodyDto, DnsEventDto, EnvoyConnectionDto, EnvoyEventBodyDto, EnvoyEventDto, EventDto,
+    GatewayShutdownReasonDto, HealthComponentDto, LifecycleEventBodyDto, LifecycleEventDto,
+    MitmproxyEventBodyDto, MitmproxyEventDto, PolicyApplyStatusDto,
+};
 
 // ---------------------------------------------------------------------------
 // Health types
