@@ -374,9 +374,18 @@ def test_discovery_workflow_surfaces_denials_then_policy_update_closes_them(
         #     events that must NOT appear for our two target hosts.
         policy_update_ts = datetime.datetime.now(datetime.timezone.utc)
 
-        # Give the policy time to propagate through Envoy / nft / CoreDNS.
-        # test_m4_policy.test_policy_update waits 5s between update and
-        # the re-verification curl; mirror that here.
+        # Warm DNS so the daemon's propagation loop materialises the per-rule
+        # Envoy filter chain and the sandbox_policy nftables concat-set entry
+        # (ip, port) for each target host. Under schema v2 L1 transport is
+        # fail-closed at empty cache — without this warmup the curl --resolve
+        # workload would race against the 2-second DNS-driven propagation loop
+        # and lose. See test_m4_policy.test_level1_transport_tcp for the same
+        # pattern on a fresh session.
+        for host in TARGET_HOSTS:
+            sandbox_cli(
+                "ssh", SESSION_NAME, "--", "nslookup", host,
+                timeout=120,
+            )
         time.sleep(5)
 
         # 12. Re-run the same workload. With the new policy in effect,
