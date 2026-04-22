@@ -11,14 +11,15 @@ use axum::{
     routing::{delete, get, post},
 };
 use clap::Parser;
+use sandbox_core::events::lifecycle as lifecycle_events;
 use sandbox_core::gateway::container_name as gateway_container_name;
 use sandbox_core::{
     ApiError, AssuranceLevel, BaseImageStatus, CaManager, CoreDnsConfig, CreateSessionRequest,
     Destination, DnsCache, EventBus, EventBusConfig, ExecRequest, ExecResponse,
     FileDownloadRequest, FileDownloadResponse, FileUploadRequest, GatewayHealth, GatewayManager,
-    GatewayStatus, GuestConnector, GuestRequest, GuestResponse, LimaManager, NetworkHealth,
-    NetworkManager, Policy, PolicyCompiler, PolicyDistributor, SandboxError, Session,
-    SessionConfig, SessionDto, SessionHealth, SessionId, SessionState, SessionStore,
+    GatewayShutdownReason, GatewayStatus, GuestConnector, GuestRequest, GuestResponse, LimaManager,
+    NetworkHealth, NetworkManager, Policy, PolicyCompiler, PolicyDistributor, SandboxError,
+    Session, SessionConfig, SessionDto, SessionHealth, SessionId, SessionState, SessionStore,
     UpdatePolicyRequest, VmIpSessionMap, VmStatus, attach_vm_to_bridge, detach_vm_from_bridge,
     generate_ca_inject_script, mac_from_session_id, propagate_dns_changes, read_resolved_json,
     write_file_to_container,
@@ -1174,6 +1175,17 @@ async fn stop_session(
     // Cancel DNS propagation loop before tearing down networking.
     cancel_dns_propagation_loop(&session.id, &state).await;
 
+    // Publish `gateway_shutdown` before the container is actually
+    // stopped so downstream subscribers see the intent even if the
+    // Docker `stop` call hangs or races with a crash.  The session's
+    // event sink is still live on the bus (we unregister below the
+    // state transition) so this event is retained in the ring buffer.
+    state.event_bus.publish(lifecycle_events::gateway_shutdown(
+        session.id,
+        GatewayShutdownReason::SessionStopped,
+        None,
+    ));
+
     // Tear down networking resources (TAP, gateway, Docker network) before
     // stopping the VM. The network_info is kept in the DB so `start` can
     // recreate everything. The subnet remains allocated in the
@@ -1264,6 +1276,20 @@ async fn remove_session(
 
     // Cancel DNS propagation loop before teardown.
     cancel_dns_propagation_loop(&session.id, &state).await;
+
+    // Publish `gateway_shutdown` before the container is stopped, but
+    // only if the session was actually running a gateway (a stopped
+    // session's gateway container is already gone).  Treating removal
+    // as a `SessionStopped` reason keeps the taxonomy simple — remove
+    // is stop-plus-delete, and graceful daemon teardown is the only
+    // case that uses `DaemonShutdown`.
+    if session.state == SessionState::Running {
+        state.event_bus.publish(lifecycle_events::gateway_shutdown(
+            session.id,
+            GatewayShutdownReason::SessionStopped,
+            None,
+        ));
+    }
 
     // Delete VM from Lima, then full network teardown.
     // All of these are best-effort blocking calls.
@@ -2055,6 +2081,40 @@ async fn setup_session_networking(
     state: &AppState,
     initial_dns_policy: Option<&str>,
 ) -> Result<(), SandboxError> {
+    // Register the session with the event bus *before* the gateway
+    // boots so the pre-readiness `gateway_booting` event lands on a
+    // live per-session sink. Binding the VM IP here (rather than
+    // post-create) likewise ensures the ingest layer can attribute
+    // any events emitted by the just-started gateway during readiness
+    // polling — without the binding the ingest layer would drop them
+    // as "unknown session". Failure to parse `vm_ip` as IPv4 is
+    // surprising (we wrote it ourselves in `create_network`) but we
+    // prefer a warning over an error path that would abort a
+    // successfully-networked session — the event stream just stays
+    // empty for that session.
+    state.event_bus.register_session(*session_id);
+    match network_info.vm_ip.parse::<std::net::Ipv4Addr>() {
+        Ok(ip) => {
+            state.vm_ip_map.bind(ip, *session_id);
+        }
+        Err(e) => {
+            warn!(
+                session_id = %session_id,
+                vm_ip = %network_info.vm_ip,
+                error = %e,
+                "failed to parse vm_ip as IPv4; event attribution disabled for this session"
+            );
+        }
+    }
+
+    // Publish `gateway_booting` before the Docker create call so the
+    // event stream records the boot intent even if gateway creation
+    // fails.  The bus already has a sink for the session (registered
+    // just above), so this event is retained in the ring buffer.
+    state
+        .event_bus
+        .publish(lifecycle_events::gateway_booting(*session_id));
+
     // 1. Create gateway container with nftables, mounting the CA.
     //    Pass the initial DNS policy so it is written to the container
     //    before CoreDNS starts, avoiding a reload-timer race.
@@ -2081,6 +2141,13 @@ async fn setup_session_networking(
         }
     }
 
+    // Gateway container is up and `create_gateway` passed its
+    // readiness checks — publish `gateway_ready` so subscribers can
+    // pair it with the earlier `gateway_booting`.
+    state
+        .event_bus
+        .publish(lifecycle_events::gateway_ready(*session_id));
+
     // 2. Configure the bridge NIC inside the VM (already present from boot).
     if let Err(e) = attach_vm_to_bridge(session_id, network_info, &state.guest).await {
         // Roll back gateway on attach failure.
@@ -2095,27 +2162,6 @@ async fn setup_session_networking(
 
     // 4. Store network info in DB.
     state.store.set_network_info(session_id, network_info)?;
-
-    // 5. Register the session with the event bus and bind its VM IP so
-    //    the ingest layer can route events (M10-S2 Phase 2). Failure to
-    //    parse `vm_ip` as IPv4 is surprising (we wrote it ourselves in
-    //    `create_network`) but we prefer a warning over an error path
-    //    that would tear down a successfully-networked session — the
-    //    event stream just stays empty for that session.
-    state.event_bus.register_session(*session_id);
-    match network_info.vm_ip.parse::<std::net::Ipv4Addr>() {
-        Ok(ip) => {
-            state.vm_ip_map.bind(ip, *session_id);
-        }
-        Err(e) => {
-            warn!(
-                session_id = %session_id,
-                vm_ip = %network_info.vm_ip,
-                error = %e,
-                "failed to parse vm_ip as IPv4; event attribution disabled for this session"
-            );
-        }
-    }
 
     Ok(())
 }
@@ -2285,6 +2331,15 @@ async fn restore_session_networking(
     } else {
         None
     };
+    // On the restoration path the session is still registered with
+    // the event bus (hydrated from `existing_networks` in `main`), so
+    // we can publish `gateway_booting` directly.  Emitting it here
+    // matches the create-session flow and keeps the booting/ready
+    // pair observable on daemon restarts too.
+    state
+        .event_bus
+        .publish(lifecycle_events::gateway_booting(*session_id));
+
     // Wrapped in spawn_blocking because create_gateway runs Docker
     // commands and polls for readiness with thread::sleep loops.
     {
@@ -2316,6 +2371,12 @@ async fn restore_session_networking(
             }
         }
     }
+
+    // Gateway is up and readiness checks passed — mirror the
+    // create-session path and publish `gateway_ready`.
+    state
+        .event_bus
+        .publish(lifecycle_events::gateway_ready(*session_id));
 
     // 2b. Re-apply the session's policy to the fresh gateway container.
     // If a policy is stored, compile and distribute it to the running
