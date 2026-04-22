@@ -124,10 +124,20 @@ RUN chmod +x /entrypoint.sh /healthcheck.sh
 
 # ---------- ports ----------
 # 10000 - Envoy listener (TCP pass-through)
+# 10001 - sandbox-deny-logger TCP listener (denied VM TCP, DNAT'd here)
+# 10002 - sandbox-deny-logger UDP listener (denied VM UDP, DNAT'd here)
+# 10003 - sandbox-deny-logger health endpoint
 # 8080  - mitmproxy listener (HTTP/HTTPS inspection)
 # 53    - CoreDNS (DNS)
 # 9901  - Envoy admin (loopback only in config, but declared for docs)
 # 8180  - CoreDNS health endpoint
+#
+# Only the externally reachable ports are `EXPOSE`d. 10001/10002/10003
+# are bridge-internal only: nftables DNAT routes denied VM packets to
+# 10001/10002, and the HEALTHCHECK probes 10003 from inside the
+# container (via the bridge IP since the listener binds on the bridge
+# IP, not 127.0.0.1 — see healthcheck.sh). They are not in the EXPOSE
+# list.
 EXPOSE 10000 8080 53/udp 53/tcp
 
 # ---------- health check ----------
