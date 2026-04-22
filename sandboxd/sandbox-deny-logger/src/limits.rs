@@ -150,11 +150,10 @@ impl RateCap {
         }
     }
 
-    /// Flush the current window unconditionally. Called from SIGTERM
-    /// so quiescent-tail drops are reported before the process exits.
-    // Wired into `main::run`'s shutdown path by the SIGTERM commit
-    // later in this phase; exercised by `flush_now_emits_pending_summary`.
-    #[allow(dead_code)]
+    /// Flush the current window unconditionally. Called from the
+    /// SIGTERM / SIGINT shutdown path so quiescent-tail drops are
+    /// reported before the process exits. Exercised by
+    /// `flush_now_emits_pending_summary`.
     pub fn flush_now(&self, now: DateTime<Utc>) {
         // Force a rollover — sets a fresh window and flushes the old
         // one (which may emit). If the current window has no drops,

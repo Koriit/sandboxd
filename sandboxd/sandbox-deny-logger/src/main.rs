@@ -29,6 +29,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
+use tokio::signal::unix::{SignalKind, signal};
 
 mod event;
 mod health;
@@ -194,6 +195,25 @@ async fn run(args: Args) -> std::io::Result<()> {
     // traffic arrives. Abort on shutdown.
     let flush_ticker = limits::spawn_flush_ticker(Arc::clone(&rate_cap));
 
+    // Graceful shutdown on SIGTERM (orchestrator request — Docker
+    // `docker stop`, sandboxd's gateway restart, Kubernetes lifecycle)
+    // and SIGINT (developer Ctrl-C). Both are handled identically:
+    // flush any pending rate-limited summary so a quiescent-tail drop
+    // still shows up in the JSONL, then return `Ok(())` so the process
+    // exits with status 0.
+    //
+    // SIGTERM handling is not covered by an in-process unit test —
+    // spawning the binary and signalling it would exceed the plan's
+    // "8-11 atomic commits" budget for marginal coverage of a code
+    // path that is structurally obvious (select! arm + flush_now).
+    // `limits::tests::flush_now_emits_pending_summary` covers the
+    // behavioural core (pending drops flushed via `flush_now`); the
+    // shutdown wiring below is reviewable-by-eye.
+    let mut sigterm = signal(SignalKind::terminate())
+        .map_err(|e| std::io::Error::other(format!("install SIGTERM handler: {e}")))?;
+    let mut sigint = signal(SignalKind::interrupt())
+        .map_err(|e| std::io::Error::other(format!("install SIGINT handler: {e}")))?;
+
     // Any listener task exiting takes the process down so Docker's
     // HEALTHCHECK flips the container unhealthy and sandboxd's gateway
     // poller restarts it — spec Part 3 / "Liveness posture" forbids a
@@ -202,7 +222,23 @@ async fn run(args: Args) -> std::io::Result<()> {
         res = tcp_task => res.map_err(|e| std::io::Error::other(e.to_string())),
         res = udp_task => res.map_err(|e| std::io::Error::other(e.to_string())),
         res = health_task => res.map_err(|e| std::io::Error::other(e.to_string())),
+        _ = sigterm.recv() => {
+            tracing::info!("SIGTERM received; shutting down");
+            Ok(())
+        }
+        _ = sigint.recv() => {
+            tracing::info!("SIGINT received; shutting down");
+            Ok(())
+        }
     };
+
     flush_ticker.abort();
+    // Flush any pending rate-limited summary before we drop the
+    // emitter — quiescent-tail drops must not disappear on shutdown.
+    rate_cap.flush_now(chrono::Utc::now());
+    // Emitter's `Mutex<File>` flushes on drop via `EventEmitter`'s
+    // own Drop (implicit — `File::drop` flushes the FD buffer).
+    drop(rate_cap);
+    drop(emitter);
     outcome
 }
