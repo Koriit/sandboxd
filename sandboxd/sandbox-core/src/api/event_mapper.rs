@@ -330,6 +330,31 @@ impl From<GatewayShutdownReason> for GatewayShutdownReasonDto {
 }
 
 // ---------------------------------------------------------------------------
+// Domain → JSONL line helper
+// ---------------------------------------------------------------------------
+
+/// Render a domain [`Event`] as a single JSONL line, terminated by `\n`.
+///
+/// Used by the `GET /sessions/{id}/events` HTTP handler and the
+/// persistent sink to produce wire bytes from domain events. The
+/// returned string contains exactly one JSON object followed by a
+/// trailing newline so callers can concatenate results into a valid
+/// JSONL stream without additional framing.
+///
+/// Returns the underlying [`serde_json::Error`] on the vanishingly
+/// rare serialization failure (only reachable if a DTO's serde impl
+/// itself panics — every [`EventDto`] variant serializes deterministic
+/// primitives, so in practice this path is unreachable in well-formed
+/// code, but we propagate the error anyway rather than panicking in a
+/// hot-path helper).
+pub fn event_to_jsonl_line(event: &Event) -> Result<String, serde_json::Error> {
+    let dto = EventDto::from(event);
+    let mut line = serde_json::to_string(&dto)?;
+    line.push('\n');
+    Ok(line)
+}
+
+// ---------------------------------------------------------------------------
 // DTO wire-shape assertions
 // ---------------------------------------------------------------------------
 //
@@ -835,5 +860,187 @@ mod tests {
         let dto: EventDto = serde_json::from_value(json.clone()).expect("parse back");
         let reserialized = serde_json::to_value(&dto).expect("re-serialize");
         assert_eq!(json, reserialized, "round-trip must preserve JSON shape");
+    }
+
+    // ----- event_to_jsonl_line --------------------------------------------
+    //
+    // Pin the wire contract of the single-line JSONL helper used by the
+    // HTTP handler and the persistent sink: every line must end with `\n`,
+    // carry exactly one JSON object, and round-trip back into an
+    // [`EventDto`] that re-serializes bit-identically.
+
+    fn jsonl_envelope() -> EventEnvelope {
+        EventEnvelope {
+            timestamp: Utc.with_ymd_and_hms(2026, 4, 22, 9, 45, 0).unwrap()
+                + chrono::Duration::milliseconds(123),
+            session: Some(sid()),
+        }
+    }
+
+    fn jsonl_pre_session_envelope() -> EventEnvelope {
+        EventEnvelope {
+            timestamp: Utc.with_ymd_and_hms(2026, 4, 22, 9, 45, 0).unwrap(),
+            session: None,
+        }
+    }
+
+    #[test]
+    fn event_to_jsonl_line_ends_with_newline_and_parses_back() {
+        // Cover one of each top-level variant so a regression in any
+        // mapper branch surfaces here rather than only in a distant
+        // integration test.
+        let conn = EnvoyConnection {
+            src_ip: Ipv4Addr::new(10, 0, 0, 42),
+            src_port: 54321,
+            dst_ip: Ipv4Addr::new(93, 184, 216, 34),
+            dst_port: 443,
+            matched_chain: "chain".into(),
+            cluster: "cluster".into(),
+            upstream_host: None,
+            bytes_sent: 0,
+            bytes_received: 0,
+            response_flags: "-".into(),
+            duration_ms: 0,
+            connect_authority: None,
+        };
+
+        let cases: Vec<Event> = vec![
+            Event::Traffic {
+                envelope: jsonl_envelope(),
+                event: TrafficEvent::Dns(DnsEvent::QueryAllowed {
+                    query: "api.example.com".into(),
+                    qtype: "A".into(),
+                    resolved_ips: vec![Ipv4Addr::new(93, 184, 216, 34)],
+                }),
+            },
+            Event::Traffic {
+                envelope: jsonl_envelope(),
+                event: TrafficEvent::Dns(DnsEvent::QueryDenied {
+                    query: "blocked.example.com".into(),
+                    qtype: "AAAA".into(),
+                    reason: "policy_deny".into(),
+                }),
+            },
+            Event::Traffic {
+                envelope: jsonl_envelope(),
+                event: TrafficEvent::Envoy(EnvoyEvent::ConnectionAllowed(conn.clone())),
+            },
+            Event::Traffic {
+                envelope: jsonl_envelope(),
+                event: TrafficEvent::Envoy(EnvoyEvent::ConnectionDenied(conn.clone())),
+            },
+            Event::Traffic {
+                envelope: jsonl_envelope(),
+                event: TrafficEvent::Mitmproxy(MitmproxyEvent::RequestAllowed {
+                    host: "api.example.com".into(),
+                    port: 443,
+                    method: "GET".into(),
+                    path: "/v1/widgets".into(),
+                }),
+            },
+            Event::Traffic {
+                envelope: jsonl_envelope(),
+                event: TrafficEvent::Mitmproxy(MitmproxyEvent::RequestDenied {
+                    host: "api.example.com".into(),
+                    port: 443,
+                    method: "DELETE".into(),
+                    path: "/admin".into(),
+                    reason: "no_matching_filter".into(),
+                }),
+            },
+            Event::Traffic {
+                envelope: jsonl_envelope(),
+                event: TrafficEvent::DenyLogger(DenyLoggerEvent::Deny(DenyLoggerDeny {
+                    orig_dst_ip: Ipv4Addr::new(203, 0, 113, 1),
+                    orig_dst_port: 443,
+                    protocol: DenyProtocol::Tcp,
+                    src_ip: Ipv4Addr::new(10, 0, 0, 42),
+                    src_port: 55123,
+                })),
+            },
+            Event::Traffic {
+                envelope: jsonl_envelope(),
+                event: TrafficEvent::DenyLogger(DenyLoggerEvent::RateLimited {
+                    rate_limited_count: 7,
+                    since_ts: jsonl_envelope().timestamp,
+                }),
+            },
+            Event::Lifecycle {
+                envelope: jsonl_pre_session_envelope(),
+                event: LifecycleEvent::GatewayBooting,
+            },
+            Event::Lifecycle {
+                envelope: jsonl_envelope(),
+                event: LifecycleEvent::GatewayReady,
+            },
+            Event::Lifecycle {
+                envelope: jsonl_envelope(),
+                event: LifecycleEvent::PolicyApplied {
+                    policy: policy(),
+                    source_presets: vec![],
+                    status: PolicyApplyStatus::Ok,
+                    error: None,
+                },
+            },
+            Event::Lifecycle {
+                envelope: jsonl_envelope(),
+                event: LifecycleEvent::HealthDegraded {
+                    component: HealthComponent::Envoy,
+                    reason: "timeout".into(),
+                },
+            },
+            Event::Lifecycle {
+                envelope: jsonl_envelope(),
+                event: LifecycleEvent::GatewayShutdown {
+                    reason: GatewayShutdownReason::SessionStopped,
+                    error: None,
+                },
+            },
+        ];
+
+        for (idx, event) in cases.iter().enumerate() {
+            let line = event_to_jsonl_line(event).expect("serialize should never fail");
+            assert!(
+                line.ends_with('\n'),
+                "case {idx}: line must end with `\\n`, got: {line:?}"
+            );
+            // Exactly one newline, and it must be at the end.
+            assert_eq!(
+                line.matches('\n').count(),
+                1,
+                "case {idx}: line must contain exactly one newline"
+            );
+
+            // Round-trip: parse the trimmed line back into an EventDto.
+            let parsed: EventDto = serde_json::from_str(line.trim_end())
+                .unwrap_or_else(|e| panic!("case {idx}: parse back must succeed: {e}"));
+            let parsed_value = serde_json::to_value(&parsed)
+                .unwrap_or_else(|e| panic!("case {idx}: re-serialize must succeed: {e}"));
+            // Compare against the original DTO rendered as a JSON value.
+            let original_value = serde_json::to_value(EventDto::from(event))
+                .unwrap_or_else(|e| panic!("case {idx}: serialize original: {e}"));
+            assert_eq!(
+                parsed_value, original_value,
+                "case {idx}: round-trip must preserve JSON shape"
+            );
+        }
+    }
+
+    #[test]
+    fn event_to_jsonl_line_is_single_json_object_per_line() {
+        // Spot-check: the produced line starts with `{` and has no
+        // intra-line newline. Guarantees clients can use a dead-simple
+        // line-splitter without worrying about multi-line JSON.
+        let event = Event::Lifecycle {
+            envelope: jsonl_envelope(),
+            event: LifecycleEvent::GatewayReady,
+        };
+        let line = event_to_jsonl_line(&event).expect("serialize");
+        assert!(line.starts_with('{'), "line must start with `{{`: {line}");
+        // Strip the trailing newline and confirm the body is a single
+        // parseable JSON object.
+        let body = line.trim_end_matches('\n');
+        assert!(!body.contains('\n'), "body must not contain newlines");
+        let _: serde_json::Value = serde_json::from_str(body).expect("body is valid json");
     }
 }
