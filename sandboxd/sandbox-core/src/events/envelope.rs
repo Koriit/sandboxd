@@ -194,6 +194,69 @@ pub enum MitmproxyEvent {
     },
 }
 
+/// Deny-logger `deny` / `rate_limited`.
+///
+/// The deny-logger component (spec Part 3 / "Deny-logger component")
+/// emits a structured record for every VM-egress connection attempt that
+/// lands in the deny-path of `sandbox_dnat` prerouting — i.e. that
+/// matches no policy allow rule. The `Deny` variant carries the
+/// pre-DNAT 5-tuple per spec Part 3 / "Traffic events" table row for
+/// layer `deny-logger`:
+/// `orig_dst_ip`, `orig_dst_port`, `protocol` (`tcp` / `udp`), `src_ip`,
+/// `src_port`.
+///
+/// The `RateLimited` variant is a periodic summary event emitted when
+/// the component's per-session event rate cap is exceeded — individual
+/// denied attempts are dropped from the stream once the cap is hit and
+/// are reported in aggregate via this variant (spec Part 3 /
+/// "Hardening rules" § 5 — `rate_limited_count` summary; the plan's
+/// orchestrator-resolved field name is `dropped_events_count`, see
+/// M10-S3 plan question 5).
+///
+/// The variant is not yet wired into [`TrafficEvent`]; that wiring lands
+/// in the follow-up commit that introduces the DTO and mapper arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DenyLoggerEvent {
+    /// Single denied connection attempt.
+    Deny(DenyLoggerDeny),
+    /// Periodic cap-breach summary: how many deny events were dropped
+    /// since the last summary tick.
+    RateLimited {
+        dropped_events_count: u32,
+        since_ts: DateTime<Utc>,
+    },
+}
+
+/// Payload of [`DenyLoggerEvent::Deny`].
+///
+/// Field names match spec Part 3 / "Traffic events" row for layer
+/// `deny-logger` character-for-character.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DenyLoggerDeny {
+    /// Pre-DNAT original destination IPv4 address (from `SO_ORIGINAL_DST`
+    /// / `IP_ORIGDSTADDR` cmsg).
+    pub orig_dst_ip: Ipv4Addr,
+    /// Pre-DNAT original destination port.
+    pub orig_dst_port: u16,
+    /// L4 protocol of the denied attempt.
+    pub protocol: DenyProtocol,
+    /// Source IPv4 address (VM bridge IP), from `getpeername` on TCP or
+    /// the datagram's peer address on UDP.
+    pub src_ip: Ipv4Addr,
+    /// Source port.
+    pub src_port: u16,
+}
+
+/// L4 protocol on a deny-logger `deny` event.
+///
+/// Serialized on the wire as `"tcp"` / `"udp"` per spec Part 3 /
+/// "Traffic events" row for layer `deny-logger`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenyProtocol {
+    Tcp,
+    Udp,
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle events
 // ---------------------------------------------------------------------------

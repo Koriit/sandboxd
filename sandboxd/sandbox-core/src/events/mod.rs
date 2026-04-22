@@ -25,8 +25,9 @@ pub mod vm_ip_map;
 
 pub use bus::{DEFAULT_RING_BUFFER_SIZE, EventBus, EventBusConfig, EventSubscription};
 pub use envelope::{
-    DnsEvent, EnvoyConnection, EnvoyEvent, Event, EventEnvelope, GatewayShutdownReason,
-    HealthComponent, LifecycleEvent, MitmproxyEvent, PolicyApplyStatus, TrafficEvent,
+    DenyLoggerDeny, DenyLoggerEvent, DenyProtocol, DnsEvent, EnvoyConnection, EnvoyEvent, Event,
+    EventEnvelope, GatewayShutdownReason, HealthComponent, LifecycleEvent, MitmproxyEvent,
+    PolicyApplyStatus, TrafficEvent,
 };
 pub use vm_ip_map::VmIpSessionMap;
 
