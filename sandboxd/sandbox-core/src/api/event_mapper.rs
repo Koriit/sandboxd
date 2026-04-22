@@ -349,8 +349,9 @@ mod tests {
     use serde_json::Value;
 
     use crate::events::{
-        DnsEvent, EnvoyConnection, EnvoyEvent, Event, EventEnvelope, GatewayShutdownReason,
-        HealthComponent, LifecycleEvent, MitmproxyEvent, PolicyApplyStatus, TrafficEvent,
+        DenyLoggerDeny, DenyLoggerEvent, DenyProtocol, DnsEvent, EnvoyConnection, EnvoyEvent,
+        Event, EventEnvelope, GatewayShutdownReason, HealthComponent, LifecycleEvent,
+        MitmproxyEvent, PolicyApplyStatus, TrafficEvent,
     };
     use crate::policy::{
         AssuranceLevel, Destination, HttpFilter, HttpMethod, Policy, PolicyRule, Protocol,
@@ -446,8 +447,10 @@ mod tests {
     #[test]
     fn dto_layer_field_matches_spec() {
         // Exhaustive check: every variant's serialized `layer` must be one
-        // of the spec's four values — `dns`, `envoy`, `mitmproxy`,
-        // `lifecycle`. No `sandboxd`, no `audit`, no surprises.
+        // of the spec's five values — `dns`, `envoy`, `mitmproxy`,
+        // `deny-logger`, `lifecycle`. No `sandboxd`, no `audit`, no
+        // surprises. Note the kebab-case on `deny-logger` (the only
+        // multi-word layer name).
         let envelope = EventEnvelope {
             timestamp: Utc.with_ymd_and_hms(2026, 4, 22, 9, 45, 0).unwrap(),
             session: Some(sid()),
@@ -483,6 +486,19 @@ mod tests {
                     }),
                 },
                 "mitmproxy",
+            ),
+            (
+                Event::Traffic {
+                    envelope: envelope.clone(),
+                    event: TrafficEvent::DenyLogger(DenyLoggerEvent::Deny(DenyLoggerDeny {
+                        orig_dst_ip: Ipv4Addr::new(203, 0, 113, 1),
+                        orig_dst_port: 443,
+                        protocol: DenyProtocol::Tcp,
+                        src_ip: Ipv4Addr::new(10, 0, 0, 42),
+                        src_port: 55123,
+                    })),
+                },
+                "deny-logger",
             ),
             (
                 Event::Lifecycle {
@@ -595,6 +611,29 @@ mod tests {
                 },
                 "request_denied",
             ),
+            (
+                Event::Traffic {
+                    envelope: envelope.clone(),
+                    event: TrafficEvent::DenyLogger(DenyLoggerEvent::Deny(DenyLoggerDeny {
+                        orig_dst_ip: Ipv4Addr::new(203, 0, 113, 1),
+                        orig_dst_port: 443,
+                        protocol: DenyProtocol::Tcp,
+                        src_ip: Ipv4Addr::new(10, 0, 0, 42),
+                        src_port: 55123,
+                    })),
+                },
+                "deny",
+            ),
+            (
+                Event::Traffic {
+                    envelope: envelope.clone(),
+                    event: TrafficEvent::DenyLogger(DenyLoggerEvent::RateLimited {
+                        dropped_events_count: 7,
+                        since_ts: envelope.timestamp,
+                    }),
+                },
+                "rate_limited",
+            ),
             // Lifecycle.
             (
                 Event::Lifecycle {
@@ -682,5 +721,120 @@ mod tests {
                 "event discriminator mismatch for expected={expected}; json = {json}"
             );
         }
+    }
+
+    // ----- deny-logger -----------------------------------------------------
+    //
+    // Wire shape comes from spec Part 3 "Traffic events" row for layer
+    // `deny-logger`: the `deny` event carries `orig_dst_ip`,
+    // `orig_dst_port`, `protocol` (`tcp`/`udp`), `src_ip`, `src_port`. The
+    // `rate_limited` summary event (M10-S3 plan, Hardening § 5) carries
+    // `dropped_events_count` and `since_ts`.
+
+    #[test]
+    fn dto_deny_logger_deny_tcp_wire_shape() {
+        let event = Event::Traffic {
+            envelope: EventEnvelope {
+                timestamp: Utc.with_ymd_and_hms(2026, 4, 22, 9, 45, 0).unwrap()
+                    + chrono::Duration::milliseconds(123),
+                session: Some(sid()),
+            },
+            event: TrafficEvent::DenyLogger(DenyLoggerEvent::Deny(DenyLoggerDeny {
+                orig_dst_ip: Ipv4Addr::new(203, 0, 113, 1),
+                orig_dst_port: 443,
+                protocol: DenyProtocol::Tcp,
+                src_ip: Ipv4Addr::new(10, 0, 0, 42),
+                src_port: 55123,
+            })),
+        };
+        let json = to_json(event);
+        assert_eq!(json["layer"], "deny-logger");
+        assert_eq!(json["event"], "deny");
+        assert_eq!(json["timestamp"], "2026-04-22T09:45:00.123Z");
+        assert_eq!(json["session"], "0123456789ab");
+        assert_eq!(json["orig_dst_ip"], "203.0.113.1");
+        assert_eq!(json["orig_dst_port"], 443);
+        assert_eq!(json["protocol"], "tcp");
+        assert_eq!(json["src_ip"], "10.0.0.42");
+        assert_eq!(json["src_port"], 55123);
+        // Round-trip: parsing back and re-serializing must preserve shape.
+        let dto: EventDto = serde_json::from_value(json.clone()).expect("parse back");
+        let reserialized = serde_json::to_value(&dto).expect("re-serialize");
+        assert_eq!(json, reserialized, "round-trip must preserve JSON shape");
+    }
+
+    #[test]
+    fn dto_deny_logger_deny_udp_wire_shape() {
+        // Same structural fields as the TCP case — the only difference is
+        // the `protocol` literal. This test pins the `udp` rename on
+        // `DenyProtocol::Udp`.
+        let event = Event::Traffic {
+            envelope: EventEnvelope {
+                timestamp: Utc.with_ymd_and_hms(2026, 4, 22, 9, 45, 0).unwrap(),
+                session: Some(sid()),
+            },
+            event: TrafficEvent::DenyLogger(DenyLoggerEvent::Deny(DenyLoggerDeny {
+                orig_dst_ip: Ipv4Addr::new(198, 51, 100, 7),
+                orig_dst_port: 53,
+                protocol: DenyProtocol::Udp,
+                src_ip: Ipv4Addr::new(10, 0, 0, 42),
+                src_port: 41234,
+            })),
+        };
+        let json = to_json(event);
+        assert_eq!(json["layer"], "deny-logger");
+        assert_eq!(json["event"], "deny");
+        assert_eq!(json["protocol"], "udp");
+        assert_eq!(json["orig_dst_ip"], "198.51.100.7");
+        assert_eq!(json["orig_dst_port"], 53);
+        let dto: EventDto = serde_json::from_value(json.clone()).expect("parse back");
+        let reserialized = serde_json::to_value(&dto).expect("re-serialize");
+        assert_eq!(json, reserialized, "round-trip must preserve JSON shape");
+    }
+
+    #[test]
+    fn dto_deny_logger_rate_limited_wire_shape() {
+        // `rate_limited` summary event — `dropped_events_count` is the
+        // orchestrator-resolved field name (spec prose calls it
+        // `rate_limited_count`; M10-S3 plan Q5 overrides). `since_ts` must
+        // use the same RFC 3339 + ms + `Z` format as the envelope
+        // timestamp.
+        let ts = Utc.with_ymd_and_hms(2026, 4, 22, 9, 45, 0).unwrap()
+            + chrono::Duration::milliseconds(500);
+        let since = Utc.with_ymd_and_hms(2026, 4, 22, 9, 44, 30).unwrap()
+            + chrono::Duration::milliseconds(250);
+        let event = Event::Traffic {
+            envelope: EventEnvelope {
+                timestamp: ts,
+                session: Some(sid()),
+            },
+            event: TrafficEvent::DenyLogger(DenyLoggerEvent::RateLimited {
+                dropped_events_count: 42,
+                since_ts: since,
+            }),
+        };
+        let json = to_json(event);
+        assert_eq!(json["layer"], "deny-logger");
+        assert_eq!(json["event"], "rate_limited");
+        assert_eq!(json["timestamp"], "2026-04-22T09:45:00.500Z");
+        assert_eq!(json["session"], "0123456789ab");
+        assert_eq!(json["dropped_events_count"], 42);
+        assert_eq!(json["since_ts"], "2026-04-22T09:44:30.250Z");
+        // `deny` fields must not leak into a `rate_limited` event.
+        for absent in [
+            "orig_dst_ip",
+            "orig_dst_port",
+            "protocol",
+            "src_ip",
+            "src_port",
+        ] {
+            assert!(
+                json.get(absent).is_none(),
+                "`{absent}` must not appear on rate_limited; json = {json}"
+            );
+        }
+        let dto: EventDto = serde_json::from_value(json.clone()).expect("parse back");
+        let reserialized = serde_json::to_value(&dto).expect("re-serialize");
+        assert_eq!(json, reserialized, "round-trip must preserve JSON shape");
     }
 }

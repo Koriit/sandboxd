@@ -610,6 +610,109 @@ mod tests {
         assert_eq!(json["method"], "DELETE");
     }
 
+    // ----- traffic: deny-logger --------------------------------------------
+    //
+    // Per spec Part 3 "Traffic events" row for `deny-logger`: every `deny`
+    // event carries `orig_dst_ip`, `orig_dst_port`, `protocol` (`tcp`/
+    // `udp`), `src_ip`, `src_port`. The `rate_limited` summary event
+    // carries `dropped_events_count` and `since_ts` (M10-S3 plan Q5).
+    // Note the kebab-case `deny-logger` layer literal — the only multi-
+    // word `layer` value in the spec.
+
+    #[test]
+    fn env_round_trip_traffic_deny_logger_tcp() {
+        let event = Event::Traffic {
+            envelope: fixture_envelope(),
+            event: TrafficEvent::DenyLogger(DenyLoggerEvent::Deny(DenyLoggerDeny {
+                orig_dst_ip: "203.0.113.1".parse().unwrap(),
+                orig_dst_port: 443,
+                protocol: DenyProtocol::Tcp,
+                src_ip: "10.0.0.42".parse().unwrap(),
+                src_port: 55123,
+            })),
+        };
+        let json = round_trip_traffic(event, "deny-logger", "deny");
+        for field in [
+            "timestamp",
+            "session",
+            "layer",
+            "event",
+            "orig_dst_ip",
+            "orig_dst_port",
+            "protocol",
+            "src_ip",
+            "src_port",
+        ] {
+            assert!(
+                json.get(field).is_some(),
+                "deny-logger deny missing `{field}`; json = {json}"
+            );
+        }
+        assert_eq!(json["orig_dst_ip"], "203.0.113.1");
+        assert_eq!(json["orig_dst_port"], 443);
+        assert_eq!(json["protocol"], "tcp");
+        assert_eq!(json["src_ip"], "10.0.0.42");
+        assert_eq!(json["src_port"], 55123);
+        // `dropped_events_count` / `since_ts` must not leak into a `deny`.
+        assert!(
+            json.get("dropped_events_count").is_none(),
+            "dropped_events_count must not appear on deny; json = {json}"
+        );
+        assert!(
+            json.get("since_ts").is_none(),
+            "since_ts must not appear on deny; json = {json}"
+        );
+    }
+
+    #[test]
+    fn env_round_trip_traffic_deny_logger_udp() {
+        let event = Event::Traffic {
+            envelope: fixture_envelope(),
+            event: TrafficEvent::DenyLogger(DenyLoggerEvent::Deny(DenyLoggerDeny {
+                orig_dst_ip: "198.51.100.7".parse().unwrap(),
+                orig_dst_port: 53,
+                protocol: DenyProtocol::Udp,
+                src_ip: "10.0.0.42".parse().unwrap(),
+                src_port: 41234,
+            })),
+        };
+        let json = round_trip_traffic(event, "deny-logger", "deny");
+        assert_eq!(json["protocol"], "udp");
+        assert_eq!(json["orig_dst_port"], 53);
+    }
+
+    #[test]
+    fn env_round_trip_traffic_deny_logger_rate_limited() {
+        let since = Utc
+            .with_ymd_and_hms(2026, 4, 22, 9, 44, 30)
+            .unwrap()
+            .with_timezone(&Utc)
+            + chrono::Duration::milliseconds(250);
+        let event = Event::Traffic {
+            envelope: fixture_envelope(),
+            event: TrafficEvent::DenyLogger(DenyLoggerEvent::RateLimited {
+                dropped_events_count: 42,
+                since_ts: since,
+            }),
+        };
+        let json = round_trip_traffic(event, "deny-logger", "rate_limited");
+        assert_eq!(json["dropped_events_count"], 42);
+        assert_eq!(json["since_ts"], "2026-04-22T09:44:30.250Z");
+        // `deny` fields must not leak into a `rate_limited` event.
+        for absent in [
+            "orig_dst_ip",
+            "orig_dst_port",
+            "protocol",
+            "src_ip",
+            "src_port",
+        ] {
+            assert!(
+                json.get(absent).is_none(),
+                "`{absent}` must not appear on rate_limited; json = {json}"
+            );
+        }
+    }
+
     // ----- lifecycle -------------------------------------------------------
 
     #[test]
