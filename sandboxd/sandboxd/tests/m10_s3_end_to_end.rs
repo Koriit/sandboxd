@@ -736,11 +736,10 @@ async fn udp_send_to_non_allowlisted_destination_emits_deny_event() {
     // destination. The 5-tuple's pre-DNAT accuracy is tracked upstream
     // as a deny-logger UDP follow-up.
     let want_src_ip = vm_ip;
-    let gateway_ip_parsed: Ipv4Addr = gw
-        .network_info
-        .gateway_ip
-        .parse()
-        .expect("gateway_ip parses");
+    // NOTE: if this assertion ever fails with orig_dst = 203.0.113.1:9999,
+    // the UDP pre-DNAT conntrack fix (deferred todo #29) has landed —
+    // update this test to the spec-prescribed pre-DNAT tuple instead of
+    // reverting.
     let sid = gw.session_id;
     let matched = wait_for_deny(&mut replay, &mut rx, move |ev| {
         let Event::Traffic { envelope, event } = ev else {
@@ -753,7 +752,7 @@ async fn udp_send_to_non_allowlisted_destination_emits_deny_event() {
             return false;
         };
         d.protocol == DenyProtocol::Udp
-            && d.orig_dst_ip == gateway_ip_parsed
+            && d.orig_dst_ip == gateway_ip
             && d.orig_dst_port == 10002
             && d.src_ip == want_src_ip
             && d.src_port > 0
@@ -767,7 +766,7 @@ async fn udp_send_to_non_allowlisted_destination_emits_deny_event() {
         } => {
             assert_eq!(envelope.session, Some(gw.session_id));
             assert_eq!(d.protocol, DenyProtocol::Udp);
-            assert_eq!(d.orig_dst_ip, gateway_ip_parsed);
+            assert_eq!(d.orig_dst_ip, gateway_ip);
             assert_eq!(d.orig_dst_port, 10002);
             assert_eq!(d.src_ip, vm_ip);
             assert!(d.src_port > 0, "src_port must be nonzero on UDP deny");

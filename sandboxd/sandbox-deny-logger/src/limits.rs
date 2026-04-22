@@ -164,6 +164,9 @@ impl RateCap {
             let start = self.window_start_millis.load(Ordering::Acquire);
             // Advance at least one window, even if we're mid-bucket,
             // so the closing flush always runs.
+            // Guard against clock regression: we advance by at least one
+            // window even if now < start (otherwise `now_ms - start` is
+            // negative and `.max(window_ms)` falls back to `window_ms`).
             let next = start.saturating_add(window_ms.max(now_ms - start));
             if self
                 .window_start_millis
