@@ -63,6 +63,56 @@ const CONTAINER_IP_TIMEOUT: Duration = Duration::from_secs(10);
 const NFT_EXEC_TIMEOUT: Duration = Duration::from_secs(15);
 
 // ---------------------------------------------------------------------------
+// Gateway listener ports
+// ---------------------------------------------------------------------------
+//
+// These are the destination ports DNAT'd VM traffic terminates on inside the
+// gateway container. They are centralised here because `gateway::…` ruleset
+// generators, `policy::compile_nftables`, and `dns_propagation::
+// generate_domain_ip_rules` all need to agree on the numeric values; having a
+// single source of truth prevents drift when ports are reshuffled (as happens
+// every time the deny-logger / mitmproxy / Envoy surface is renegotiated).
+
+/// DNS port handled by CoreDNS inside the gateway container.
+pub const GATEWAY_DNS_PORT: u16 = 53;
+
+/// TCP port handled by Envoy's `original_dst` listener inside the gateway
+/// container. All VM TCP traffic that matches a policy `allow` rule is DNAT'd
+/// to this port.
+pub const GATEWAY_ENVOY_PORT: u16 = 10000;
+
+/// TCP port handled by the deny-logger inside the gateway container. VM TCP
+/// connections to destinations *not* matched by a policy `allow` rule are
+/// DNAT'd here; the deny-logger reads `SO_ORIGINAL_DST`, emits a structured
+/// `deny` event, and closes the socket with RST.
+///
+/// See spec `.tasks/specs/2026-04-21-port-explicit-policies-presets-observability-design.md`
+/// Part 3 § "Listener design".
+pub const GATEWAY_DENY_LOGGER_TCP_PORT: u16 = 10001;
+
+/// UDP port handled by the deny-logger inside the gateway container. VM UDP
+/// datagrams to destinations *not* matched by a policy `allow` rule are
+/// DNAT'd here; the deny-logger reads `IP_ORIGDSTADDR` from the cmsg and
+/// emits a structured `deny` event without reply.
+pub const GATEWAY_DENY_LOGGER_UDP_PORT: u16 = 10002;
+
+/// TCP port exposing the deny-logger's `/health` endpoint inside the gateway
+/// container. **Not** in any DNAT set — reached only from inside the container
+/// via `docker exec`-driven healthchecks and sandboxd's `component_health`
+/// probe.
+pub const GATEWAY_DENY_LOGGER_HEALTH_PORT: u16 = 10003;
+
+/// Name of the nftables concat set (inside both `sandbox_dnat` and
+/// `sandbox_policy`) that holds `(ipv4_addr . inet_service)` allow tuples
+/// for TCP destinations.
+pub const NFT_POLICY_ALLOW_TCP_SET: &str = "policy_allow_tcp";
+
+/// Name of the nftables concat set (inside both `sandbox_dnat` and
+/// `sandbox_policy`) that holds `(ipv4_addr . inet_service)` allow tuples
+/// for UDP destinations.
+pub const NFT_POLICY_ALLOW_UDP_SET: &str = "policy_allow_udp";
+
+// ---------------------------------------------------------------------------
 // GatewayManager
 // ---------------------------------------------------------------------------
 
@@ -1081,11 +1131,25 @@ pub fn generate_dnat_ruleset(vm_subnet: &str, gateway_ip: &str) -> String {
 ///
 /// The initial deny-all ruleset blocks all inbound traffic. After DNAT
 /// is configured, traffic from the VM subnet is rewritten to the
-/// gateway's own IP on port 53 (DNS) or 10000 (Envoy's `original_dst`
-/// listener, which terminates TCP and — for L3 destinations — opens a
-/// CONNECT tunnel to mitmproxy on the loopback 127.0.0.1:18080). The
-/// input chain must accept this traffic, otherwise the DNATted packets
-/// are rejected.
+/// gateway's own IP on one of four destination ports:
+///
+/// - `:53` — DNS (CoreDNS)
+/// - `:10000` — Envoy's `original_dst` listener (policy-allowed TCP/UDP;
+///   Envoy terminates TCP and — for L3 destinations — opens a CONNECT
+///   tunnel to mitmproxy on loopback `127.0.0.1:18080`)
+/// - `:10001` — deny-logger TCP listener (VM TCP that *didn't* match any
+///   policy allow tuple)
+/// - `:10002` — deny-logger UDP listener (VM UDP that didn't match)
+///
+/// Plus `:10003` — the deny-logger's `/health` endpoint. This one is **not**
+/// reachable from the VM subnet (no DNAT rule), only from inside the
+/// container via `docker exec`-driven healthchecks and sandboxd's
+/// `component_health` probe. We still open it on the input chain so those
+/// in-container probes work even though they route via loopback + bridge.
+///
+/// The input chain must accept traffic on each of these ports, otherwise
+/// the DNATted packets (and in-container healthchecks) are rejected by
+/// the trailing `reject` rule.
 pub fn generate_input_allow_ruleset(vm_subnet: &str) -> String {
     format!(
         r#"flush chain inet sandbox input
@@ -1101,17 +1165,31 @@ table inet sandbox {{
         ip protocol icmp accept
 
         # Allow DNS from VM subnet (CoreDNS)
-        ip saddr {vm_subnet} udp dport 53 accept
-        ip saddr {vm_subnet} tcp dport 53 accept
+        ip saddr {vm_subnet} udp dport {dns_port} accept
+        ip saddr {vm_subnet} tcp dport {dns_port} accept
 
         # Allow HTTP proxy from VM subnet (Envoy)
-        ip saddr {vm_subnet} tcp dport 10000 accept
+        ip saddr {vm_subnet} tcp dport {envoy_port} accept
+
+        # Allow deny-logger TCP listener (denied VM TCP lands here via DNAT)
+        ip saddr {vm_subnet} tcp dport {deny_tcp_port} accept
+
+        # Allow deny-logger UDP listener (denied VM UDP lands here via DNAT)
+        ip saddr {vm_subnet} udp dport {deny_udp_port} accept
+
+        # Allow deny-logger /health probe (in-container only; no DNAT for it)
+        tcp dport {deny_health_port} accept
 
         # Reject everything else (fast failure)
         reject
     }}
 }}
-"#
+"#,
+        dns_port = GATEWAY_DNS_PORT,
+        envoy_port = GATEWAY_ENVOY_PORT,
+        deny_tcp_port = GATEWAY_DENY_LOGGER_TCP_PORT,
+        deny_udp_port = GATEWAY_DENY_LOGGER_UDP_PORT,
+        deny_health_port = GATEWAY_DENY_LOGGER_HEALTH_PORT,
     )
 }
 
@@ -1370,6 +1448,36 @@ mod tests {
         assert!(
             ruleset.contains("tcp dport 10000"),
             "Envoy HTTP proxy port must still be allowed from the VM subnet:\n{ruleset}"
+        );
+    }
+
+    #[test]
+    fn generate_input_allow_ruleset_admits_10001_10002_10003() {
+        // M10-S3: the deny-logger listens on three ports inside the
+        // gateway container — TCP :10001, UDP :10002, and :10003 for its
+        // `/health` endpoint. The first two receive DNATted VM traffic
+        // for destinations that did not match any policy allow tuple;
+        // the third is probed by the container's HEALTHCHECK and by
+        // sandboxd's `component_health`. All three must be admitted by
+        // the input chain, otherwise the DNATted packets (and the
+        // healthcheck) are rejected by the trailing `reject` rule.
+        let ruleset = generate_input_allow_ruleset("10.209.0.0/28");
+
+        assert!(
+            ruleset.contains("tcp dport 10001"),
+            "deny-logger TCP listener port :10001 must be admitted by the \
+             input chain so DNATted denied VM TCP reaches it:\n{ruleset}"
+        );
+        assert!(
+            ruleset.contains("udp dport 10002"),
+            "deny-logger UDP listener port :10002 must be admitted by the \
+             input chain so DNATted denied VM UDP reaches it:\n{ruleset}"
+        );
+        assert!(
+            ruleset.contains("tcp dport 10003"),
+            "deny-logger /health endpoint port :10003 must be admitted by \
+             the input chain so HEALTHCHECK and sandboxd's component_health \
+             probe succeed:\n{ruleset}"
         );
     }
 }

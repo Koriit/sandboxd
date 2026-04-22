@@ -42,7 +42,11 @@ pub use events::{
     LifecycleEvent, MitmproxyEvent, PolicyApplyStatus, TrafficEvent, VmIpSessionMap,
     ingest::SessionIngestor, session_events_host_dir,
 };
-pub use gateway::{GatewayManager, GatewayStatus};
+pub use gateway::{
+    GATEWAY_DENY_LOGGER_HEALTH_PORT, GATEWAY_DENY_LOGGER_TCP_PORT, GATEWAY_DENY_LOGGER_UDP_PORT,
+    GATEWAY_DNS_PORT, GATEWAY_ENVOY_PORT, GatewayManager, GatewayStatus, NFT_POLICY_ALLOW_TCP_SET,
+    NFT_POLICY_ALLOW_UDP_SET,
+};
 pub use guest::{
     GUEST_AGENT_PORT, GuestConnector, GuestRequest, GuestResponse, MAX_MESSAGE_SIZE, read_message,
     write_message,
