@@ -19,12 +19,12 @@ use sandbox_core::{
     Destination, DnsCache, DockerHealth, EventBus, EventBusConfig, ExecRequest, ExecResponse,
     FileDownloadRequest, FileDownloadResponse, FileUploadRequest, GatewayHealth, GatewayManager,
     GatewayShutdownReason, GatewayStatus, GuestConnector, GuestRequest, GuestResponse,
-    HealthComponent, LimaManager, NetworkHealth, NetworkManager, Policy, PolicyApplyStatus,
-    PolicyCompiler, PolicyDistributor, SandboxError, Session, SessionConfig, SessionDto,
-    SessionHealth, SessionId, SessionIngestor, SessionState, SessionStore, UpdatePolicyRequest,
-    VmIpSessionMap, VmStatus, attach_vm_to_bridge, detach_vm_from_bridge,
-    generate_ca_inject_script, mac_from_session_id, propagate_dns_changes, read_resolved_json,
-    write_file_to_container,
+    HealthComponent, LimaManager, NetworkHealth, NetworkManager, PersistConfig, PersistentSink,
+    Policy, PolicyApplyStatus, PolicyCompiler, PolicyDistributor, SandboxError, Session,
+    SessionConfig, SessionDto, SessionHealth, SessionId, SessionIngestor, SessionState,
+    SessionStore, UpdatePolicyRequest, VmIpSessionMap, VmStatus, attach_vm_to_bridge,
+    detach_vm_from_bridge, generate_ca_inject_script, mac_from_session_id, propagate_dns_changes,
+    read_resolved_json, write_file_to_container,
 };
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
@@ -56,6 +56,26 @@ struct Args {
     /// If the file cannot be opened, the daemon fails fast on startup.
     #[arg(long)]
     log_file: Option<PathBuf>,
+
+    /// Enable the persistent JSONL event sink.
+    ///
+    /// When set, every event published to the bus is also written to
+    /// `{base_dir}/sessions/{session_id}/events/{layer}-YYYY-MM-DD.jsonl`
+    /// (UTC-rotated). Disabled by default — operators opt-in per-
+    /// deployment.  See `events::persist` in `sandbox-core` for the
+    /// task-graph shape (bounded mpsc + drop-oldest on overflow).
+    #[arg(long, default_value_t = false)]
+    events_persist: bool,
+
+    /// How many days of persisted JSONL event files to retain.
+    ///
+    /// Only meaningful when `--events-persist` is set.  Files whose
+    /// filename-embedded `YYYY-MM-DD` is strictly older than
+    /// `today - retention_days` are removed by an hourly pruner.
+    /// Default of 14 days matches the M10-S4 Phase 0 Q10 decision;
+    /// TODO(M10-S6): replace with measurement-driven tuning.
+    #[arg(long, default_value_t = 14)]
+    events_persist_retention_days: u32,
 }
 
 fn default_socket_path() -> String {
@@ -3650,6 +3670,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Optional persistent event sink. Spawns relay + sink + pruner
+    // tasks that tail the global broadcast and mirror every event
+    // into per-session per-layer JSONL files under
+    // `{base_dir}/sessions/{id}/events/{layer}-YYYY-MM-DD.jsonl`.
+    // When `--events-persist` is not set, this returns a no-op
+    // handle and no tasks are launched (see
+    // `PersistentSink::spawn`).
+    let persistent_sink = PersistentSink::spawn(
+        &event_bus,
+        PersistConfig {
+            enabled: args.events_persist,
+            base_dir: base_dir.clone(),
+            retention_days: args.events_persist_retention_days,
+        },
+    );
+    if args.events_persist {
+        info!(
+            retention_days = args.events_persist_retention_days,
+            "persistent event sink enabled"
+        );
+    }
+
     // Run startup reconciliation (VM state).
     reconcile(&store, &lima);
 
@@ -3767,6 +3809,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+
+    // Tear down the persistent event sink before removing the socket.
+    // `shutdown` aborts and joins the relay / sink / pruner tasks so
+    // their owned file handles are closed deterministically.
+    persistent_sink.shutdown().await;
 
     // Clean up the socket file on exit.
     let _ = tokio::fs::remove_file(&socket_path).await;
