@@ -368,6 +368,112 @@ sandbox logs my-sandbox -f
 
 ---
 
+## sandbox events
+
+Replay or stream the session's event stream — every per-request decision made by the gateway's DNS, Envoy, mitmproxy, and deny-logger layers, plus the session's lifecycle events. Thin client over [`GET /sessions/{id}/events`](/reference/http-api/#get-sessionsidevents--replay-or-stream-events).
+
+### Synopsis
+
+```
+sandbox events <session> [--follow] [--layer <name>]... [--event <name>]... [--decision allow|deny] [--since <ts-or-duration>] [--json | --table]
+```
+
+### Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `<session>` | Session name or session ID (see [Session identifiers](#session-identifiers)). Required. |
+
+### Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--follow`, `-f` | off | Stream live events as they arrive, until interrupted with Ctrl+C. Without it, the CLI prints the current ring-buffer contents and exits when the response body ends. |
+| `--layer <name>` | | Filter by layer. Valid values: `dns`, `envoy`, `mitmproxy`, `deny-logger`, `lifecycle`. Repeat to include multiple layers; values within the flag combine with OR. |
+| `--event <name>` | | Filter by event name (e.g. `query_denied`, `connection_allowed`, `deny`, `rate_limited`, `policy_applied`). Repeat to include multiple names. |
+| `--decision <allow\|deny>` | | Filter by verdict. Single-valued at the CLI: the HTTP endpoint accepts a repeatable parameter, but passing both `allow` and `deny` is equivalent to omitting the filter entirely, so the CLI takes one or neither. |
+| `--since <ts-or-duration>` | | Lower-bound cutoff for event timestamps. Accepts either an RFC 3339 timestamp (`2026-04-22T12:00:00Z`) or a shorthand duration (`30s`, `5m`, `2h`, `7d`) resolved against the CLI's wall clock. The duration shorthand is a CLI convenience — the value sent on the wire is always an RFC 3339 timestamp. |
+| `--json` | on (non-TTY) | Emit raw JSONL, one event per line. Default when stdout is not a TTY so shell redirects (`sandbox events <id> --follow > file.jsonl`) preserve round-trip fidelity. |
+| `--table` | on (TTY) | Render a human-readable fixed-column table instead of JSONL. Default when stdout is a TTY. Deny rows are colored red. |
+
+`--json` and `--table` are mutually exclusive.
+
+### Filter semantics
+
+Axes combine with AND, values within an axis with OR. So
+
+```bash
+sandbox events dev --layer=dns --layer=mitmproxy --decision=deny
+```
+
+returns every DNS or mitmproxy event **and** whose decision is deny. An `--event` filter that names an event carrying no decision axis (any `lifecycle` event, or the deny-logger `rate_limited` summary) is valid on its own but produces no matches when combined with `--decision`.
+
+### Output
+
+- **JSONL** (default when stdout is not a TTY, or when `--json` is set): each line is a single JSON object matching the wire shape documented under [`GET /sessions/{id}/events`](/reference/http-api/#get-sessionsidevents--replay-or-stream-events). Lines the CLI cannot parse as an event — most notably the synthetic `lifecycle.ring_buffer_lag` marker the server emits when a follow stream falls behind — are passed through unchanged in JSONL mode.
+- **Table** (default when stdout is a TTY, or when `--table` is set): a fixed-column layout with `TIME`, `SESSION` (first 8 chars of the id), `LAYER`, `EVENT`, `HOST:PORT`, and `DETAIL` columns. `DETAIL` is truncated to 60 characters with `…`. Deny rows are wrapped in ANSI red when stdout is a TTY. Any line the table renderer cannot parse as an `EventDto` is emitted on its own row prefixed with `! ` so nothing is dropped silently.
+
+### Exit behavior
+
+- Non-follow: exits 0 when the response body ends (typically within ~1s of the last line).
+- Follow: runs until SIGINT. On Ctrl+C, pending output is flushed, the socket is closed, and the CLI exits 130 (128 + SIGINT).
+- Any HTTP-level error returned by the daemon (`404` for an unknown session, `400` for an invalid filter value or malformed `--since`) is printed to stderr and the CLI exits non-zero.
+
+### Examples
+
+```bash
+# Replay the current ring buffer as JSONL.
+sandbox events dev
+
+# Stream only deny decisions, live, rendered as a table.
+sandbox events dev --follow --decision=deny --table
+
+# Only DNS and mitmproxy events, from the last 5 minutes.
+sandbox events dev --layer=dns --layer=mitmproxy --since=5m
+
+# Capture a follow stream for later analysis; JSONL is the default for non-TTYs.
+sandbox events dev --follow > events.jsonl
+
+# Pinpoint the moment a policy was applied.
+sandbox events dev --event=policy_applied
+```
+
+### Discovery workflow
+
+The events stream is intended as the operator-facing feedback loop for tightening a network policy from scratch. The canonical pattern is:
+
+1. **Create the session under an empty or minimal policy.** Start from a fail-closed state (or a small starting allow-list) so every outbound attempt that should be legitimate ends up denied at least once.
+
+   ```bash
+   sandbox create --name dev --policy empty-policy.json
+   ```
+
+2. **Run the workload inside the session.** The commands the agent actually wants to execute — `git clone`, `npm install`, a test suite, a curl to an upstream API.
+
+   ```bash
+   sandbox exec dev -- bash -c "cd /home/agent/workspace && npm install"
+   ```
+
+3. **Inspect what was denied.** `--decision=deny` surfaces the denials from every layer (CoreDNS, Envoy, mitmproxy, and the deny-logger's raw packet observations). `--follow` streams them live while the workload is still running; omitting `--follow` replays whatever is already in the ring buffer.
+
+   ```bash
+   sandbox events dev --decision=deny --follow
+   ```
+
+4. **Write a tighter policy that allow-lists the required targets.** Each deny event names the host / port / protocol the workload tried to reach; fold those into the policy JSON.
+
+5. **Apply the new policy.** `sandbox policy update` hot-reloads every gateway component without restarting the session.
+
+   ```bash
+   sandbox policy update dev --policy dev-policy.json
+   ```
+
+6. **Re-run the workload.** Run `sandbox events dev --decision=deny` once more — no new denies means the policy is tight enough.
+
+The `tests/e2e/test_m10_s4_discovery.py` suite encodes this exact flow end-to-end. See [Network policies](/guides/network-policies/) for how to structure the policy JSON once you know which targets to allow.
+
+---
+
 ## sandbox health
 
 Show detailed health status of a sandbox session, including VM status, guest agent connectivity, gateway component health, and network resource status.

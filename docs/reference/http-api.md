@@ -175,6 +175,67 @@ Success: `200 OK` with:
 }
 ```
 
+### `GET /sessions/{id}/events` — replay or stream events
+
+Returns the session's event stream as newline-delimited JSON (one event per line). Every per-request and per-connection decision made by the gateway's DNS / Envoy / mitmproxy / deny-logger layers, plus the session's lifecycle events, flows through this endpoint. The corresponding CLI wrapper is [`sandbox events`](/reference/cli/#sandbox-events).
+
+Query parameters (all optional):
+
+| Parameter | Repeatable | Values | Description |
+|---|---|---|---|
+| `follow` | no | `true`, `false` (default `false`) | When `true`, the response stays open and streams new events as they arrive. When `false` (or omitted), the current ring-buffer snapshot is replayed and the response closes. |
+| `layer` | yes | `dns`, `envoy`, `mitmproxy`, `deny-logger`, `lifecycle` | Include only events emitted by these layers. Repeat the key (`?layer=dns&layer=deny-logger`) to union multiple values. |
+| `event` | yes | snake_case event name (e.g. `query_denied`, `connection_allowed`, `deny`, `rate_limited`, `policy_applied`, `gateway_ready`) | Include only events with these names. |
+| `decision` | yes | `allow`, `deny` | Include only traffic events whose verdict matches. Events that carry no decision (all lifecycle events, plus the deny-logger `rate_limited` summary) never match a non-empty `decision` filter. |
+| `since` | no | RFC 3339 timestamp (e.g. `2026-04-22T12:00:00Z`) | Events older than this timestamp are excluded. Both second-precision and fractional forms are accepted. The comparison is inclusive (`t >= since`). |
+
+Filters combine with AND across axes and OR within an axis. A request with no filter parameters matches every event.
+
+Unknown values on any enumerated axis fail loud with `400 Bad Request`; for example `?decision=reset` or `?layer=quic` returns an error naming the offending value rather than silently matching nothing. A malformed `since` value fails the same way.
+
+Response:
+
+- `Content-Type: application/jsonl`.
+- `200 OK` with a body of zero or more `\n`-terminated JSON lines. A session that exists but has no matching events returns an empty body.
+- With `follow=true`, the body uses HTTP/1.1 chunked transfer encoding and stays open until the client disconnects or the session is unregistered. Clients should consume it line by line.
+
+The session is resolved name-or-id, same as every other `/sessions/{id}/…` endpoint. A missing session returns `404 Not Found`. An unregistered-but-stored session (e.g. created but never started) returns `200 OK` with an empty body in non-follow mode; with `follow=true` the body stays open but never produces any lines until the session is started.
+
+Each event line is a flat JSON object with a common envelope plus layer-specific fields:
+
+```json
+{"timestamp":"2026-04-22T12:34:56.789Z","session":"a1b2c3d4e5f6","layer":"dns","event":"query_denied","query":"blocked.example.com","qtype":"AAAA","reason":"policy_deny"}
+```
+
+- `timestamp` is RFC 3339 with millisecond precision and a `Z` suffix.
+- `session` is the 12-character hex session id, or an empty string for pre-session lifecycle events.
+- `layer` is one of the values enumerated in the filter table above.
+- `event` is a snake_case discriminator whose remaining fields are layer-specific; see the lifecycle, DNS, Envoy, mitmproxy, and deny-logger source modules in `sandbox-core` for the exhaustive per-event schema.
+
+#### The `lifecycle.ring_buffer_lag` synthetic line
+
+When a `follow=true` consumer falls behind the in-memory broadcast channel, the handler emits a stream-local synthetic line so the gap is visible inline rather than being silently dropped:
+
+```json
+{"layer":"lifecycle","event":"ring_buffer_lag","skipped":42,"timestamp":"2026-04-22T12:35:01.004Z"}
+```
+
+This line is not a real bus event: it is never persisted and is not emitted to other subscribers or to the non-follow replay path. `skipped` is the number of live events the broadcast dropped since the previous receive.
+
+#### Example
+
+```bash
+# Replay every deny decision accumulated in the ring buffer.
+curl --unix-socket "$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock" \
+    "http://localhost/sessions/dev/events?decision=deny"
+
+# Stream DNS and deny-logger events live, starting from a specific wall-clock time.
+curl --no-buffer --unix-socket "$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock" \
+    "http://localhost/sessions/dev/events?follow=true&layer=dns&layer=deny-logger&since=2026-04-22T12:00:00Z"
+```
+
+`--no-buffer` is useful when following a stream so `curl` flushes each line to stdout as it arrives.
+
 ## Policy
 
 ### `POST /sessions/{id}/policy` — apply or update policy
