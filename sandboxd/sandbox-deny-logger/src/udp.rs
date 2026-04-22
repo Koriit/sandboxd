@@ -22,7 +22,10 @@ use nix::sys::socket::{ControlMessageOwned, MsgFlags, SockaddrIn, recvmsg, setso
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
 
+use chrono::Utc;
+
 use crate::event::{DenyRecord, EventEmitter, Protocol};
+use crate::limits::{Admit, RateCap};
 
 /// Fixed per-datagram receive buffer size. Anything longer than this is
 /// silently truncated by `recvmsg` — acceptable since we never inspect
@@ -50,11 +53,24 @@ pub async fn bind(bind_ip: Ipv4Addr, port: u16) -> io::Result<UdpSocket> {
 /// control to the reactor, and `try_io` keeps the call in non-blocking
 /// territory (returning `WouldBlock` → we re-await readiness rather than
 /// spinning).
-pub async fn run(socket: UdpSocket, emitter: Arc<EventEmitter>) -> io::Result<()> {
+pub async fn run(
+    socket: UdpSocket,
+    emitter: Arc<EventEmitter>,
+    rate_cap: Arc<RateCap>,
+) -> io::Result<()> {
     loop {
         socket.ready(Interest::READABLE).await?;
         match recv_one(&socket) {
-            Ok(Some((record, _payload_len))) => emitter.emit_deny(record),
+            Ok(Some((record, _payload_len))) => {
+                // Rate cap check happens *after* recvmsg — we must
+                // drain the datagram from the kernel queue regardless
+                // of whether we emit (leaving it would stall the
+                // listener). Over-cap datagrams are dropped silently
+                // and counted into the periodic summary.
+                if rate_cap.try_admit(Utc::now()) == Admit::Ok {
+                    emitter.emit_deny(record);
+                }
+            }
             Ok(None) => {
                 // Datagram arrived without an `Ipv4OrigDstAddr` cmsg —
                 // can happen pre-DNAT or when the kernel strips the
@@ -140,15 +156,20 @@ mod tests {
     /// with `protocol: "udp"` and the expected 5-tuple.
     #[tokio::test]
     async fn udp_emits_one_deny_event_per_datagram() {
+        use crate::limits::RateCap;
+        use chrono::Utc;
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("deny.jsonl");
         let emitter = Arc::new(EventEmitter::open(&path).unwrap());
+        let rate_cap = Arc::new(RateCap::new(1_000, Arc::clone(&emitter), Utc::now()));
         let socket = bind(Ipv4Addr::LOCALHOST, 0).await.unwrap();
         let local = socket.local_addr().unwrap();
 
         let emit_for_task = Arc::clone(&emitter);
+        let rate_cap_for_task = Arc::clone(&rate_cap);
         let task = tokio::spawn(async move {
-            let _ = run(socket, emit_for_task).await;
+            let _ = run(socket, emit_for_task, rate_cap_for_task).await;
         });
 
         // Send one datagram from a blocking std socket so the test

@@ -20,7 +20,10 @@ use nix::libc;
 use nix::sys::socket::{setsockopt, sockopt};
 use tokio::net::{TcpListener, TcpStream};
 
+use chrono::Utc;
+
 use crate::event::{DenyRecord, EventEmitter, Protocol};
+use crate::limits::{Admit, RateCap};
 
 /// Bind a TCP listener on `(bind_ip, port)`.
 ///
@@ -41,7 +44,11 @@ pub async fn bind(bind_ip: Ipv4Addr, port: u16) -> io::Result<TcpListener> {
 /// one `drop`). Keeping the accept loop non-fan-out sidesteps the
 /// need for a per-connection future slot and keeps the hot path
 /// allocation-free.
-pub async fn run(listener: TcpListener, emitter: Arc<EventEmitter>) -> io::Result<()> {
+pub async fn run(
+    listener: TcpListener,
+    emitter: Arc<EventEmitter>,
+    rate_cap: Arc<RateCap>,
+) -> io::Result<()> {
     loop {
         let (socket, peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -55,22 +62,57 @@ pub async fn run(listener: TcpListener, emitter: Arc<EventEmitter>) -> io::Resul
                 continue;
             }
         };
-        handle_connection(socket, peer, &emitter);
+        handle_connection(socket, peer, &emitter, &rate_cap);
     }
 }
 
-fn handle_connection(socket: TcpStream, peer: SocketAddr, emitter: &EventEmitter) {
-    let orig_dst = match read_original_dst(&socket) {
+fn handle_connection(
+    socket: TcpStream,
+    peer: SocketAddr,
+    emitter: &EventEmitter,
+    rate_cap: &RateCap,
+) {
+    // Rate cap check is the first operation — hardening invariant #5
+    // counts *attempts*, not successful reads. Over-cap attempts still
+    // get RST-closed but are not emitted individually.
+    let now = Utc::now();
+    let admit = rate_cap.try_admit(now);
+
+    if admit == Admit::Ok {
+        match resolve_tuple(&socket, peer) {
+            Some((orig_dst, src)) => {
+                emitter.emit_deny(DenyRecord {
+                    orig_dst_ip: *orig_dst.ip(),
+                    orig_dst_port: orig_dst.port(),
+                    protocol: Protocol::Tcp,
+                    src_ip: *src.ip(),
+                    src_port: src.port(),
+                });
+            }
+            None => {
+                // `resolve_tuple` already logged; still close with RST.
+            }
+        }
+    }
+
+    apply_linger_zero(&socket);
+    // Dropping the TcpStream closes the fd; with SO_LINGER{1,0} the
+    // kernel sends RST rather than completing the FIN handshake.
+    drop(socket);
+}
+
+/// Resolve the 5-tuple (pre-DNAT destination + IPv4 peer) or log and
+/// return `None`. Returning `None` signals the caller to skip the
+/// emit but still RST-close; the attempt is *not* counted against the
+/// rate cap rollback because we already admitted it.
+fn resolve_tuple(socket: &TcpStream, peer: SocketAddr) -> Option<(SocketAddrV4, SocketAddrV4)> {
+    let orig_dst = match read_original_dst(socket) {
         Ok(v) => v,
         Err(err) => {
             tracing::warn!(error = %err, "SO_ORIGINAL_DST failed");
-            // Still close with RST — we just can't attribute it.
-            apply_linger_zero(&socket);
-            drop(socket);
-            return;
+            return None;
         }
     };
-
     let src = match peer {
         SocketAddr::V4(v4) => v4,
         // IPv6 in PREROUTING DNAT is disabled on the gateway (see
@@ -78,24 +120,10 @@ fn handle_connection(socket: TcpStream, peer: SocketAddr, emitter: &EventEmitter
         // either a misconfig or an attacker — drop quietly.
         SocketAddr::V6(_) => {
             tracing::warn!("tcp accept: unexpected IPv6 peer");
-            apply_linger_zero(&socket);
-            drop(socket);
-            return;
+            return None;
         }
     };
-
-    emitter.emit_deny(DenyRecord {
-        orig_dst_ip: *orig_dst.ip(),
-        orig_dst_port: orig_dst.port(),
-        protocol: Protocol::Tcp,
-        src_ip: *src.ip(),
-        src_port: src.port(),
-    });
-
-    apply_linger_zero(&socket);
-    // Dropping the TcpStream closes the fd; with SO_LINGER{1,0} the
-    // kernel sends RST rather than completing the FIN handshake.
-    drop(socket);
+    Some((orig_dst, src))
 }
 
 /// `getsockopt(SOL_IP, SO_ORIGINAL_DST)` — returns the pre-DNAT
@@ -158,6 +186,8 @@ mod tests {
     use std::time::Duration;
 
     use crate::event::EventEmitter;
+    use crate::limits::RateCap;
+    use chrono::Utc;
 
     /// TCP accept without any PREROUTING DNAT in play: `SO_ORIGINAL_DST`
     /// returns the loopback-listener address itself. We assert that an
@@ -168,11 +198,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("deny.jsonl");
         let emitter = Arc::new(EventEmitter::open(&path).unwrap());
+        let rate_cap = Arc::new(RateCap::new(1_000, Arc::clone(&emitter), Utc::now()));
         let listener = bind(Ipv4Addr::LOCALHOST, 0).await.unwrap();
         let local = listener.local_addr().unwrap();
         let emit_for_task = Arc::clone(&emitter);
+        let rate_cap_for_task = Arc::clone(&rate_cap);
         let server = tokio::spawn(async move {
-            let _ = run(listener, emit_for_task).await;
+            let _ = run(listener, emit_for_task, rate_cap_for_task).await;
         });
 
         // Connect on a blocking std socket so we can observe the

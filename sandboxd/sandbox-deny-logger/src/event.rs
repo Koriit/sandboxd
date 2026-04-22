@@ -32,8 +32,6 @@ use serde::Serialize;
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {
     Tcp,
-    // Constructed by the UDP listener in a later commit in this phase.
-    #[allow(dead_code)]
     Udp,
 }
 
@@ -124,10 +122,8 @@ impl EventEmitter {
 
     /// Emit a `rate_limited` summary line. `since_ts` is the timestamp
     /// of the previous flush; `rate_limited_count` is the number of
-    /// denies that were dropped in that interval.
-    // Wired into `limits::RateCap` in the rate-cap commit later in this
-    // phase; unit-tested in `tests` below.
-    #[allow(dead_code)]
+    /// denies that were dropped in that interval. Called by
+    /// [`crate::limits::RateCap`] on window rollover.
     pub fn emit_rate_limited(&self, rate_limited_count: u32, since_ts: DateTime<Utc>) {
         let line = Line::RateLimited {
             timestamp: Utc::now(),

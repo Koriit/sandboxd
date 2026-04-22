@@ -32,10 +32,12 @@ use clap::Parser;
 
 mod event;
 mod health;
+mod limits;
 mod tcp;
 mod udp;
 
 use event::EventEmitter;
+use limits::RateCap;
 
 /// CLI arguments for the deny-logger binary.
 ///
@@ -148,6 +150,11 @@ fn main() -> ExitCode {
 
 async fn run(args: Args) -> std::io::Result<()> {
     let emitter = Arc::new(EventEmitter::open(&args.event_path)?);
+    let rate_cap = Arc::new(RateCap::new(
+        args.rate_cap,
+        Arc::clone(&emitter),
+        chrono::Utc::now(),
+    ));
 
     let tcp_listener = tcp::bind(args.bind_ip, args.tcp_port).await?;
     tracing::info!(port = args.tcp_port, "tcp listener bound");
@@ -159,15 +166,17 @@ async fn run(args: Args) -> std::io::Result<()> {
     tracing::info!(port = args.health_port, "health listener bound");
 
     let tcp_emitter = Arc::clone(&emitter);
+    let tcp_rate_cap = Arc::clone(&rate_cap);
     let tcp_task = tokio::spawn(async move {
-        if let Err(err) = tcp::run(tcp_listener, tcp_emitter).await {
+        if let Err(err) = tcp::run(tcp_listener, tcp_emitter, tcp_rate_cap).await {
             tracing::error!(error = %err, "tcp listener exited with error");
         }
     });
 
     let udp_emitter = Arc::clone(&emitter);
+    let udp_rate_cap = Arc::clone(&rate_cap);
     let udp_task = tokio::spawn(async move {
-        if let Err(err) = udp::run(udp_socket, udp_emitter).await {
+        if let Err(err) = udp::run(udp_socket, udp_emitter, udp_rate_cap).await {
             tracing::error!(error = %err, "udp listener exited with error");
         }
     });
@@ -179,14 +188,20 @@ async fn run(args: Args) -> std::io::Result<()> {
         }
     });
 
+    // Background ticker so a storm that ends on a window boundary
+    // still flushes its `rate_limited` summary even when no further
+    // traffic arrives. Abort on shutdown.
+    let flush_ticker = limits::spawn_flush_ticker(Arc::clone(&rate_cap));
+
     // Any listener task exiting takes the process down so Docker's
     // HEALTHCHECK flips the container unhealthy and sandboxd's gateway
     // poller restarts it — spec Part 3 / "Liveness posture" forbids a
     // degraded-observability mode.
-    tokio::select! {
-        res = tcp_task => res.map_err(|e| std::io::Error::other(e.to_string()))?,
-        res = udp_task => res.map_err(|e| std::io::Error::other(e.to_string()))?,
-        res = health_task => res.map_err(|e| std::io::Error::other(e.to_string()))?,
-    }
-    Ok(())
+    let outcome = tokio::select! {
+        res = tcp_task => res.map_err(|e| std::io::Error::other(e.to_string())),
+        res = udp_task => res.map_err(|e| std::io::Error::other(e.to_string())),
+        res = health_task => res.map_err(|e| std::io::Error::other(e.to_string())),
+    };
+    flush_ticker.abort();
+    outcome
 }
