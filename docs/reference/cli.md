@@ -455,13 +455,14 @@ sandbox inspect <session>...
     "guest_agent_status": "connected",
     "gateway_status": "running",
     "policy": {
-      "version": "1.0",
+      "version": "2.0.0",
       "rules": [
         {
-          "destination": { "domain": "github.com" },
+          "host": "github.com",
+          "port": 443,
           "protocol": "tcp",
           "level": "http",
-          "http_filters": [{ "method": "GET", "path": "/repos/*" }],
+          "http_filters": [{ "method": "GET", "path": "/repos/**" }],
           "reason": "fetch repo metadata"
         }
       ]
@@ -530,17 +531,19 @@ Runtime:
   Guest agent: connected
   Gateway:     running
 
-Policy (v1.0, 3 rules):
-  [0] allow http      github.com
+Policy (v2.0.0, 3 rules):
+  [0] allow http      github.com:443
         protocol:    tcp
-        http_filters: GET /repos/*
+        http_filters: GET /repos/**
         reason:      fetch repo metadata
-  [1] allow tls       registry.npmjs.org
+  [1] allow tls       registry.npmjs.org:443
         protocol:    tcp
-  [2] deny            *
-        protocol:    any
+  [2] deny            0.0.0.0/0:443
+        protocol:    tcp
         reason:      default deny
 ```
+
+Each rule prints its `(host, port)` identity on the top line, followed by indented `protocol:`, any `http_filters:` entries (one per filter), and an optional `reason:`.
 
 ### Examples
 
@@ -556,12 +559,12 @@ sandbox describe dev ci-run staging
 
 ## sandbox policy update
 
-Apply a new network policy to a running sandbox session. The new policy completely replaces the existing one — there is no merging. All gateway components (CoreDNS, nftables, Envoy, mitmproxy) are reconfigured and hot-reloaded without restarting the session.
+Apply a new network policy to a running sandbox session, or clear the existing one. A new policy completely replaces the old — there is no merging. All gateway components (CoreDNS, nftables, Envoy, mitmproxy) are reconfigured and hot-reloaded without restarting the session.
 
 ### Synopsis
 
 ```
-sandbox policy update <session> <policy-path>
+sandbox policy update <session> (--policy <path> | --clear)
 ```
 
 ### Arguments
@@ -569,22 +572,33 @@ sandbox policy update <session> <policy-path>
 | Argument | Description |
 |----------|-------------|
 | `<session>` | Session name or session ID (see [Session identifiers](#session-identifiers)). |
-| `<policy-path>` | Path to a policy JSON file |
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `--policy <path>` | Path to a policy JSON file to apply. Mutually exclusive with `--clear`. |
+| `--clear` | Remove any active policy and revert the session to the fail-closed default (empty CoreDNS allow-list, deny-all gateway). Idempotent. Mutually exclusive with `--policy`. |
+
+Exactly one of `--policy` or `--clear` must be supplied.
 
 ### Details
 
-- The policy file is validated client-side before sending to the daemon.
-- The policy must parse as a valid `Policy` JSON structure.
-- If validation fails, no request is sent and the error is printed.
+- With `--policy`, the policy file is validated client-side before sending to the daemon; invalid JSON or a rejected schema aborts the request.
+- The policy must parse as a valid `Policy` JSON structure (see [policy model](/concepts/policy-model/)).
+- `--clear` is a no-op when the session already has no policy.
 
 ### Examples
 
 ```bash
 # Apply a policy by session name
-sandbox policy update my-sandbox policy.json
+sandbox policy update my-sandbox --policy policy.json
 
 # Apply a policy by session ID (or unique ID prefix)
-sandbox policy update feedfacecafe restricted-policy.json
+sandbox policy update feedfacecafe --policy restricted-policy.json
+
+# Drop the active policy and return the session to fail-closed
+sandbox policy update my-sandbox --clear
 ```
 
 ---
