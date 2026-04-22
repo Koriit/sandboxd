@@ -12,6 +12,7 @@ and are SLOW (3-10 minutes per test).  Run with generous timeouts:
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 import time
@@ -126,6 +127,41 @@ def _read_gateway_log(session_id: str, filename: str) -> str:
         f"stdout: {out.stdout}\nstderr: {out.stderr}"
     )
     return out.stdout
+
+
+def _read_envoy_access_log(session_id: str) -> tuple[str, list[dict]]:
+    """Read and parse Envoy's access log from
+    ``/var/log/gateway/events/envoy.jsonl`` in the gateway container.
+
+    Returns ``(raw_text, parsed_entries)``. Each line in the log is a
+    JSON object emitted by Envoy's ``tcp_proxy`` filter (see the
+    ``l1/l2/l3_tcp_proxy_access_log_yaml`` helpers in
+    ``sandbox-core/src/policy.rs``). Lines that fail to parse as JSON
+    are silently skipped — the log is append-only and lines are flushed
+    whole, so a partial line would indicate a truncated read that a
+    retry would resolve, not a production bug.
+
+    The events path (``/var/log/gateway/events/``) is a per-session
+    bind mount established by ``spawn_gateway`` (M10-S2 Phase 3) so
+    the host-side ingest pipeline can tail the file via inotify. The
+    previous text-format log at ``/var/log/gateway/envoy_access.log``
+    lived on the container's tmpfs and is no longer emitted.
+    """
+    raw = _read_gateway_log(session_id, "events/envoy.jsonl")
+    parsed: list[dict] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            parsed.append(json.loads(line))
+        except json.JSONDecodeError:
+            # Skip unparseable lines rather than failing the test: a
+            # truncated tail read is the most likely cause, and the
+            # parsed-entry assertions below will fail clearly if the
+            # *expected* lines are missing.
+            continue
+    return raw, parsed
 
 
 # ---------------------------------------------------------------------------
@@ -629,88 +665,126 @@ def test_level3_http_inspected(sandbox_cli):
             f"mitmproxy.log tail:\n{mitm_log[-4000:]}"
         )
 
-        # M9-S20 gap 4: observe the CONNECT-tunnel invariant from
-        # **Envoy's own access log**, independent of mitmproxy's flow
-        # log. The L3 `tcp_proxy` filter writes one line per tunneled
-        # connection to `/var/log/gateway/envoy_access.log` with
-        # key=value columns (see `l3_tcp_proxy_access_log_yaml` in
+        # M9-S20 gap 4 + M10-S2 Phase 4: observe the CONNECT-tunnel
+        # invariant from **Envoy's own access log**, independent of
+        # mitmproxy's flow log. The L3 `tcp_proxy` filter writes one
+        # JSON object per tunneled connection to
+        # `/var/log/gateway/events/envoy.jsonl` (see
+        # `l3_tcp_proxy_access_log_yaml` in
         # `sandbox-core/src/policy.rs`). A mitmproxy-only assertion is
         # vulnerable to mitmproxy log-format regressions and to Envoy
         # misconfigurations that bypass mitmproxy entirely (e.g. a
         # listener update that dropped `tunneling_config`, sending
         # bytes to `mitmproxy` as raw TCP). Asserting on Envoy's log
         # directly catches both failure modes.
-        envoy_access_log = _read_gateway_log(session_id, "envoy_access.log")
+        envoy_access_log, envoy_entries = _read_envoy_access_log(session_id)
         assert envoy_access_log.strip(), (
-            f"envoy_access.log is empty after L3 curl; Envoy's tcp_proxy "
-            f"access log may be misconfigured or no L3 chain matched the "
-            f"traffic.\nmitmproxy.log tail (for cross-reference):\n"
+            f"envoy.jsonl is empty after L3 curl; Envoy's tcp_proxy "
+            f"access log may be misconfigured, the events bind mount "
+            f"may not be wired, or no L3 chain matched the traffic.\n"
+            f"mitmproxy.log tail (for cross-reference):\n"
             f"{mitm_log[-2000:]}"
         )
 
-        # Split into lines and filter to the L3 chain entries. Every
-        # line the format produces starts with `[<timestamp>] `, so a
-        # prefix test is adequate.
-        envoy_lines = [
-            line for line in envoy_access_log.splitlines()
-            if line.startswith("[") and "downstream_local=" in line
+        # Filter to the L3 chain entries. Each JSON entry has
+        # `layer=envoy` and a `matched_chain` populated by
+        # `%FILTER_CHAIN_NAME%`; the L3 chains are named
+        # `level3_<sanitized-host>_p<port>`.
+        l3_entries = [
+            e for e in envoy_entries
+            if e.get("layer") == "envoy"
+            and str(e.get("matched_chain", "")).startswith("level3_")
         ]
-        assert envoy_lines, (
-            f"envoy_access.log has content but no parseable L3 entries "
-            f"(lines starting with `[` and carrying `downstream_local=`).\n"
+        assert l3_entries, (
+            f"envoy.jsonl parsed {len(envoy_entries)} entries but none "
+            f"belong to an L3 chain (matched_chain starting with "
+            f"`level3_`). This usually indicates the filter chain name "
+            f"was not interpolated from %FILTER_CHAIN_NAME%, or the L3 "
+            f"chain did not match.\n"
             f"full log:\n{envoy_access_log[-4000:]}"
         )
 
-        # Invariant A: at least one line has
-        # `downstream_local=<resolved-ip>:443` — the VM's intended
-        # destination IP preserved by `original_dst`. Mirrors the
-        # mitmproxy `server connect <ip>:443` assertion above.
+        # Invariant A: at least one entry has
+        # `dst_ip=<resolved-ip>` and `dst_port=443` — the VM's intended
+        # destination preserved by `original_dst`. Mirrors the
+        # mitmproxy `server connect <ip>:443` assertion above. Envoy
+        # serializes all values as strings under `json_format`, so
+        # coerce `dst_port` to string for comparison robustness.
         downstream_hits = [
-            line for line in envoy_lines
-            if any(
-                f"downstream_local={ip}:443" in line for ip in resolved_ips
-            )
+            e for e in l3_entries
+            if e.get("dst_ip") in resolved_ips
+            and str(e.get("dst_port")) == "443"
         ]
         assert downstream_hits, (
-            f"envoy_access.log does not record downstream_local=<ip>:443 for "
-            f"any of example.com's resolved IPs ({resolved_ips}); Envoy's "
-            f"`original_dst` listener filter may be failing to recover "
-            f"SO_ORIGINAL_DST, or the L3 prefix_ranges match is missing.\n"
-            f"envoy_access.log tail:\n{envoy_access_log[-4000:]}"
+            f"envoy.jsonl does not record dst_ip=<ip>/dst_port=443 for "
+            f"any of example.com's resolved IPs ({resolved_ips}); "
+            f"Envoy's `original_dst` listener filter may be failing to "
+            f"recover SO_ORIGINAL_DST, or the L3 prefix_ranges match "
+            f"is missing. L3 entries observed:\n"
+            f"{json.dumps(l3_entries, indent=2)[-4000:]}"
         )
 
-        # Invariant B: none of the downstream-local addresses may be
-        # `127.0.0.1` — that would indicate the L3 chain pointed Envoy
-        # at its own loopback (e.g. a direct-to-internet bypass that
-        # routed back through mitmproxy without preserving the original
+        # Invariant B: none of the destination IPs may be `127.0.0.1`
+        # — that would indicate the L3 chain pointed Envoy at its own
+        # loopback (e.g. a direct-to-internet bypass that routed back
+        # through mitmproxy without preserving the original
         # destination). This is the Envoy-side mirror of the mitmproxy
         # `server connect 127.0.0.1:` negative check above.
-        assert "downstream_local=127.0.0.1:" not in envoy_access_log, (
-            f"envoy_access.log records downstream_local=127.0.0.1:* — Envoy "
-            f"tunneled to a loopback address as the original destination, "
-            f"which would indicate `original_dst` or prefix_ranges misbehaved.\n"
-            f"envoy_access.log tail:\n{envoy_access_log[-4000:]}"
+        loopback_hits = [
+            e for e in l3_entries if e.get("dst_ip") == "127.0.0.1"
+        ]
+        assert not loopback_hits, (
+            f"envoy.jsonl records dst_ip=127.0.0.1 for L3 entries — "
+            f"Envoy tunneled to a loopback address as the original "
+            f"destination, which would indicate `original_dst` or "
+            f"prefix_ranges misbehaved.\n"
+            f"offending entries:\n{json.dumps(loopback_hits, indent=2)}"
         )
 
-        # Invariant C: the upstream cluster must be `mitmproxy` and the
-        # upstream host must be the loopback endpoint of that cluster.
-        # A regression that routes L3 traffic back to `original_dst`
-        # (e.g. if `tunneling_config` is dropped on a listener update)
-        # would flip `upstream_cluster` and break this check without
-        # touching mitmproxy at all.
-        assert any("upstream_cluster=mitmproxy" in line for line in envoy_lines), (
-            f"envoy_access.log does not record any line with "
-            f"upstream_cluster=mitmproxy; L3 chains may have regressed to "
+        # Invariant C: the upstream cluster must be `mitmproxy` and
+        # the upstream host must be the loopback endpoint of that
+        # cluster. A regression that routes L3 traffic back to
+        # `original_dst` (e.g. if `tunneling_config` is dropped on a
+        # listener update) would flip `cluster` and break this check
+        # without touching mitmproxy at all.
+        assert any(e.get("cluster") == "mitmproxy" for e in l3_entries), (
+            f"envoy.jsonl does not record any L3 entry with "
+            f"cluster=mitmproxy; L3 chains may have regressed to "
             f"routing via original_dst.\n"
-            f"envoy_access.log tail:\n{envoy_access_log[-4000:]}"
+            f"L3 entries observed:\n"
+            f"{json.dumps(l3_entries, indent=2)[-4000:]}"
         )
         assert any(
-            "upstream_host=127.0.0.1:18080" in line for line in envoy_lines
+            e.get("upstream_host") == "127.0.0.1:18080" for e in l3_entries
         ), (
-            f"envoy_access.log does not record any line with "
+            f"envoy.jsonl does not record any L3 entry with "
             f"upstream_host=127.0.0.1:18080; the `mitmproxy` cluster's "
             f"loopback endpoint may have drifted.\n"
-            f"envoy_access.log tail:\n{envoy_access_log[-4000:]}"
+            f"L3 entries observed:\n"
+            f"{json.dumps(l3_entries, indent=2)[-4000:]}"
+        )
+
+        # Invariant D (Phase 4): the L3 entry carries
+        # `connect_authority` populated from
+        # `%REQUESTED_SERVER_NAME%`. For L3 traffic the downstream
+        # proxy (mitmproxy) issues a CONNECT with the policy host as
+        # authority, and Envoy records it in
+        # `tcp_proxy`'s access log via that substitution. This is the
+        # header that distinguishes L3 entries from L1/L2 ones and is
+        # the ingest pipeline's primary discriminator for CONNECT
+        # tunnels.
+        authority_hits = [
+            e for e in l3_entries
+            if e.get("connect_authority")
+            and e.get("connect_authority") != "-"
+        ]
+        assert authority_hits, (
+            f"envoy.jsonl L3 entries have no populated "
+            f"`connect_authority`; %REQUESTED_SERVER_NAME% may not be "
+            f"available on this Envoy version or the CONNECT tunnel "
+            f"was not taken.\n"
+            f"L3 entries observed:\n"
+            f"{json.dumps(l3_entries, indent=2)[-4000:]}"
         )
 
         # Clean up.
