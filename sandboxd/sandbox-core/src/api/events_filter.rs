@@ -285,7 +285,7 @@ impl EventsFilter {
 // ---------------------------------------------------------------------------
 
 /// Map a domain [`Event`] to its [`LayerKind`].
-fn layer_of(event: &Event) -> LayerKind {
+pub(crate) fn layer_of(event: &Event) -> LayerKind {
     match event {
         Event::Traffic { event, .. } => match event {
             TrafficEvent::Dns(_) => LayerKind::Dns,

@@ -21,6 +21,7 @@ pub mod bus;
 pub mod envelope;
 pub mod ingest;
 pub mod lifecycle;
+pub mod persist;
 pub mod vm_ip_map;
 
 pub use bus::{DEFAULT_RING_BUFFER_SIZE, EventBus, EventBusConfig, EventSubscription};
@@ -29,6 +30,7 @@ pub use envelope::{
     EventEnvelope, GatewayShutdownReason, HealthComponent, LifecycleEvent, MitmproxyEvent,
     PolicyApplyStatus, TrafficEvent,
 };
+pub use persist::{PersistConfig, PersistentSink};
 pub use vm_ip_map::VmIpSessionMap;
 
 /// Root directory on the host under which per-session event directories
