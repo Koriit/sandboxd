@@ -1990,4 +1990,45 @@ mod tests {
              than matching the Unhealthy arm by prefix"
         );
     }
+
+    #[test]
+    fn docker_health_variants_are_all_distinct() {
+        // `gateway_monitor` drives restart off a match on this enum:
+        //
+        //   Healthy   → no-op
+        //   Starting  → no-op, log at debug
+        //   Unhealthy → restart
+        //   None      → fall back to `gateway_status`
+        //   Unknown   → fall back to `gateway_status`
+        //
+        // Two variants collapsing to the same value would let a
+        // future refactor silently re-route one to the other's arm —
+        // e.g. `Starting == Healthy` would let a start-period
+        // container be treated as healthy, and `Unhealthy ==
+        // Unknown` would downgrade a real restart trigger to the
+        // fallback probe. Enumerate the full cross-product so any
+        // accidental identity gets caught at `cargo test` time rather
+        // than during a post-incident review.
+        let all = [
+            DockerHealth::Starting,
+            DockerHealth::Healthy,
+            DockerHealth::Unhealthy,
+            DockerHealth::None,
+            DockerHealth::Unknown,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                if i == j {
+                    assert_eq!(a, b, "variant must equal itself: {a:?}");
+                } else {
+                    assert_ne!(
+                        a, b,
+                        "DockerHealth variants must be pairwise distinct — \
+                         gateway_monitor's restart/fallback decisions rely \
+                         on the match arms not collapsing: {a:?} vs {b:?}"
+                    );
+                }
+            }
+        }
+    }
 }
