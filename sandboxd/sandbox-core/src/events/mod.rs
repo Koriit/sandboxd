@@ -19,6 +19,7 @@ use crate::session::SessionId;
 
 pub mod bus;
 pub mod envelope;
+pub mod ingest;
 pub mod lifecycle;
 pub mod vm_ip_map;
 

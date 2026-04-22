@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 base64.workspace = true
 chrono.workspace = true
+notify = "6"
 rcgen.workspace = true
 ring.workspace = true
 refinery.workspace = true
