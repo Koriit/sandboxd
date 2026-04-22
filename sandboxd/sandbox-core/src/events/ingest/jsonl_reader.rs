@@ -74,10 +74,7 @@ impl JsonlTailer {
             SandboxError::Internal(format!("failed to open {}: {e}", path.display()))
         })?;
         let offset = file.seek(SeekFrom::End(0)).map_err(|e| {
-            SandboxError::Internal(format!(
-                "failed to seek to EOF of {}: {e}",
-                path.display()
-            ))
+            SandboxError::Internal(format!("failed to seek to EOF of {}: {e}", path.display()))
         })?;
         Ok(Self {
             path: path.to_path_buf(),
@@ -195,7 +192,10 @@ mod tests {
         let mut tailer = JsonlTailer::new_at_start(tmp.path()).unwrap();
         let mut lines: Vec<String> = Vec::new();
         let outcome = tailer.read_to_eof(|l| lines.push(l.to_string()));
-        assert_eq!(lines, vec!["{\"a\":1}".to_string(), "{\"b\":2}".to_string()]);
+        assert_eq!(
+            lines,
+            vec!["{\"a\":1}".to_string(), "{\"b\":2}".to_string()]
+        );
         assert_eq!(outcome.lines_delivered, 2);
         assert_eq!(outcome.pending_bytes, 0);
     }
@@ -227,7 +227,10 @@ mod tests {
         let first = tailer.read_to_eof(|l| lines.push(l.to_string()));
         assert_eq!(lines, vec!["{\"a\":1}".to_string()]);
         assert_eq!(first.lines_delivered, 1);
-        assert!(first.pending_bytes > 0, "partial `{{\"b\":` must be buffered");
+        assert!(
+            first.pending_bytes > 0,
+            "partial `{{\"b\":` must be buffered"
+        );
 
         // Producer finishes the partial record.
         write(&mut tmp, "2}\n");
@@ -261,8 +264,10 @@ mod tests {
             .open(&path)
             .unwrap();
         // 0xFF is not a valid UTF-8 start byte.
-        f.write_all(&[b'{', 0xFF, b'}', b'\n', b'{', b'"', b'o', b'"', b':', b'1', b'}', b'\n'])
-            .unwrap();
+        f.write_all(&[
+            b'{', 0xFF, b'}', b'\n', b'{', b'"', b'o', b'"', b':', b'1', b'}', b'\n',
+        ])
+        .unwrap();
         f.flush().unwrap();
         drop(f);
 

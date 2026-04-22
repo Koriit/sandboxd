@@ -16,15 +16,15 @@
 //!    [`JsonlTailer::new_at_eof`]).
 //! 3. Run a `tokio::select!` loop that:
 //!    a. Handles inotify events delivered through an mpsc channel.
-//!       On the first [`Create`] / [`Modify`] event for a known file
-//!       name we have not already seen, spawn a
-//!       [`JsonlTailer::new_at_start`] for it. On any subsequent
-//!       event that touches a file we are already tailing, wake the
-//!       tailer and drain new bytes.
+//!    On the first [`Create`] / [`Modify`] event for a known file
+//!    name we have not already seen, spawn a
+//!    [`JsonlTailer::new_at_start`] for it. On any subsequent
+//!    event that touches a file we are already tailing, wake the
+//!    tailer and drain new bytes.
 //!    b. Fires a `tokio::time::interval(2s)` fallback poll that wakes
-//!       every active tailer, independent of inotify. This is the
-//!       "virtiofs / 9p inotify propagation unreliable under some
-//!       hypervisor configurations" safety net called out in the plan.
+//!    every active tailer, independent of inotify. This is the
+//!    "virtiofs / 9p inotify propagation unreliable under some
+//!    hypervisor configurations" safety net called out in the plan.
 //! 4. For every parsed line, look up `session_id` via
 //!    [`VmIpSessionMap::lookup`] on the per-layer `client_ip` /
 //!    `src_ip`. On miss, warn + drop — publishing to a fabricated or
@@ -113,18 +113,16 @@ pub async fn run_watcher(
     // filesystem notification lands here as `notify::Result<Event>`.
     let (tx, mut rx) = mpsc::unbounded_channel::<notify::Result<notify::Event>>();
     let events_dir_for_watcher = events_dir.clone();
-    let watcher = tokio::task::spawn_blocking(
-        move || -> notify::Result<RecommendedWatcher> {
-            let mut w = notify::recommended_watcher(move |res| {
-                // Send failure means the receiver has been dropped
-                // (ingestor aborted); ignore and let this closure die
-                // when the watcher is dropped.
-                let _ = tx.send(res);
-            })?;
-            w.watch(&events_dir_for_watcher, RecursiveMode::NonRecursive)?;
-            Ok(w)
-        },
-    )
+    let watcher = tokio::task::spawn_blocking(move || -> notify::Result<RecommendedWatcher> {
+        let mut w = notify::recommended_watcher(move |res| {
+            // Send failure means the receiver has been dropped
+            // (ingestor aborted); ignore and let this closure die
+            // when the watcher is dropped.
+            let _ = tx.send(res);
+        })?;
+        w.watch(&events_dir_for_watcher, RecursiveMode::NonRecursive)?;
+        Ok(w)
+    })
     .await;
 
     // `_watcher` must stay alive for the duration of the loop — the
@@ -359,9 +357,14 @@ fn dispatch_line(
     line: &str,
 ) {
     let parsed: Result<(DateTime<Utc>, std::net::Ipv4Addr, TrafficEvent), _> = match layer {
-        Layer::Envoy => parse_envoy_line(line).map(|p: ParsedEnvoyEvent| (p.timestamp, p.src_ip, p.traffic)),
-        Layer::Coredns => parse_coredns_line(line).map(|p: ParsedDnsEvent| (p.timestamp, p.client_ip, p.traffic)),
-        Layer::Mitmproxy => parse_mitmproxy_line(line).map(|p: ParsedMitmEvent| (p.timestamp, p.client_ip, p.traffic)),
+        Layer::Envoy => {
+            parse_envoy_line(line).map(|p: ParsedEnvoyEvent| (p.timestamp, p.src_ip, p.traffic))
+        }
+        Layer::Coredns => {
+            parse_coredns_line(line).map(|p: ParsedDnsEvent| (p.timestamp, p.client_ip, p.traffic))
+        }
+        Layer::Mitmproxy => parse_mitmproxy_line(line)
+            .map(|p: ParsedMitmEvent| (p.timestamp, p.client_ip, p.traffic)),
     };
     let (timestamp, client_ip, traffic) = match parsed {
         Ok(v) => v,

@@ -218,14 +218,22 @@ pub fn parse_envoy_line(line: &str) -> Result<ParsedEnvoyEvent, SandboxError> {
         upstream_host: raw.upstream_host.and_then(|s| {
             // Envoy writes `"-"` when the substitution has no value; do
             // not surface that as if it were a real upstream host.
-            if s == "-" || s.is_empty() { None } else { Some(s) }
+            if s == "-" || s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
         }),
         bytes_sent: raw.bytes_sent,
         bytes_received: raw.bytes_received,
         response_flags: raw.response_flags.clone(),
         duration_ms: raw.duration_ms,
         connect_authority: raw.connect_authority.and_then(|s| {
-            if s == "-" || s.is_empty() { None } else { Some(s) }
+            if s == "-" || s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
         }),
     };
 
@@ -262,25 +270,57 @@ mod tests {
         }
         let cases = [
             // Allow cases.
-            Case { flags: "", expect_allow: true },
-            Case { flags: "-", expect_allow: true },
+            Case {
+                flags: "",
+                expect_allow: true,
+            },
+            Case {
+                flags: "-",
+                expect_allow: true,
+            },
             // Deny cases — well-known Envoy short codes.
-            Case { flags: "NR", expect_allow: false },
-            Case { flags: "UF", expect_allow: false },
-            Case { flags: "UC", expect_allow: false },
-            Case { flags: "LR", expect_allow: false },
-            Case { flags: "UH", expect_allow: false },
-            Case { flags: "UT", expect_allow: false },
-            Case { flags: "DC", expect_allow: false },
+            Case {
+                flags: "NR",
+                expect_allow: false,
+            },
+            Case {
+                flags: "UF",
+                expect_allow: false,
+            },
+            Case {
+                flags: "UC",
+                expect_allow: false,
+            },
+            Case {
+                flags: "LR",
+                expect_allow: false,
+            },
+            Case {
+                flags: "UH",
+                expect_allow: false,
+            },
+            Case {
+                flags: "UT",
+                expect_allow: false,
+            },
+            Case {
+                flags: "DC",
+                expect_allow: false,
+            },
             // Composite flag — Envoy can chain codes; still a deny.
-            Case { flags: "UF,URX", expect_allow: false },
+            Case {
+                flags: "UF,URX",
+                expect_allow: false,
+            },
             // Future code we don't enumerate above — non-empty ⇒ deny.
-            Case { flags: "XX", expect_allow: false },
+            Case {
+                flags: "XX",
+                expect_allow: false,
+            },
         ];
         for c in cases {
-            let parsed = parse_envoy_line(&record(c.flags)).unwrap_or_else(|e| {
-                panic!("flags {:?} failed to parse: {e}", c.flags)
-            });
+            let parsed = parse_envoy_line(&record(c.flags))
+                .unwrap_or_else(|e| panic!("flags {:?} failed to parse: {e}", c.flags));
             let is_allow = matches!(
                 parsed.traffic,
                 TrafficEvent::Envoy(EnvoyEvent::ConnectionAllowed(_))
