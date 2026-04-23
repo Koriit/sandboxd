@@ -241,6 +241,14 @@ compiler and the mitmproxy addon):
   under v2 (e.g., `/api/*` in v1 matches `/api/v1/users`; in v2 it
   matches only one segment deeper — `/api/v1`). Operators migrating
   policies review `http_filters` paths as part of the v2 rewrite.
+- Filter paths match against the request's URI path **excluding** the
+  query string. `mitmproxy.http.Request.path` returns the full
+  request-target (path + query), so the addon strips `?<query>` before
+  matching. A filter like `/info/refs` therefore matches a request for
+  `/info/refs?service=git-upload-pack` — the concrete case required by
+  git's smart-HTTP clone. Preset authors write filter paths without
+  query strings; logged events echo the full request path so operators
+  still see the exact URL the client asked for.
 
 ### Schema bump and migration
 

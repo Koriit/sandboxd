@@ -239,6 +239,14 @@ class PolicyAddon:
         host = flow.request.pretty_host
         method = flow.request.method
         path = flow.request.path
+        # `flow.request.path` carries both the URI path and the query
+        # string (e.g. `/info/refs?service=git-upload-pack`).  Filter
+        # paths in policy config describe the request *path* only — they
+        # never include query strings — so strip `?<query>` before
+        # matching.  The original `path` (with query) is preserved for
+        # logging and structured events so operators see exactly what
+        # the client requested.
+        match_path = path.split("?", 1)[0]
         # `flow.request.port` is the destination L4 port.  In M10-S1 the
         # addon matches on `(host, port)`, so a missing attribute on a
         # fake/test request defaults to 0 — which will never match a
@@ -271,7 +279,7 @@ class PolicyAddon:
                 )
             return
 
-        allowed, reason = self._check_request(host, port, method, path)
+        allowed, reason = self._check_request(host, port, method, match_path)
         if allowed:
             logger.info("[ALLOW] %s %s:%d%s", method, host, port, path)
             if self._events is not None:

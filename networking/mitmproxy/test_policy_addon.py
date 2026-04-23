@@ -804,6 +804,82 @@ class TestPerSegmentGlob:
         assert flow_bad.response.status_code == 599
 
 
+class TestQueryStringStrippedBeforeMatching:
+    """Query strings on the request URL must not defeat path filters.
+
+    ``mitmproxy.http.Request.path`` returns the full request-target —
+    path **and** query string (``/info/refs?service=git-upload-pack``).
+    Policy filter paths describe the URI path only and never carry
+    query strings, so the addon strips ``?<query>`` before matching.
+
+    This is the concrete bug that blocked the ``github-repo`` preset:
+    ``git clone`` issues
+    ``GET /<owner>/<repo>.git/info/refs?service=git-upload-pack`` and
+    the filter path ``/<owner>/<repo>.git/info/refs`` must match it.
+    """
+
+    def test_path_with_query_matches_filter_without_query(self) -> None:
+        """The real-world github-repo preset case — a GET carrying a
+        query string is allowed by a filter whose path is the same
+        URI path without the query."""
+        addon = _make_addon([
+            {"host": "github.com", "port": 443, "filters": [
+                {"method": "GET", "path": "/rust-lang/rustlings.git/info/refs"},
+            ]},
+        ])
+        flow = _make_flow(
+            method="GET",
+            host="github.com",
+            path="/rust-lang/rustlings.git/info/refs?service=git-upload-pack",
+        )
+        addon.request(flow)
+        assert flow.response is None, (
+            "Filter path without query must match request path that "
+            "carries a query — git smart-HTTP depends on this."
+        )
+
+    def test_query_does_not_extend_path_match(self) -> None:
+        """Query string doesn't smuggle characters into the matched
+        path.  A filter for ``/exact`` must not accidentally start
+        matching ``/exacty`` just because the query string exists."""
+        addon = _make_addon([
+            {"host": "api.com", "port": 443, "filters": [
+                {"method": "GET", "path": "/exact"},
+            ]},
+        ])
+        # The URI path part ``/exacty`` is not ``/exact`` even though
+        # stripping ``?x=1`` yields the right-hand portion unchanged.
+        flow = _make_flow(host="api.com", path="/exacty?x=1")
+        addon.request(flow)
+        assert flow.response is not None
+        assert flow.response.status_code == 599
+
+    def test_deny_event_retains_query_in_path(self) -> None:
+        """When a request with a query string is denied, the deny
+        response (and by extension the deny event) keeps the original
+        ``path`` so operators see the exact request the client made —
+        query string included — not the stripped match form."""
+        addon = _make_addon([
+            {"host": "api.com", "port": 443, "filters": [
+                {"method": "GET", "path": "/allowed"},
+            ]},
+        ])
+        flow = _make_flow(
+            host="api.com", path="/blocked?token=secret"
+        )
+        addon.request(flow)
+        assert flow.response is not None
+        assert flow.response.status_code == 599
+        body = json.loads(flow.response.content)
+        assert body["path"] == "/blocked?token=secret", (
+            "Deny response must echo the full request path (including "
+            "query) so operators can see what was actually requested."
+        )
+        # The deny reason is computed against the stripped path so the
+        # message names the path-only form the filter compares against.
+        assert body["reason"] == "no filter matched GET /blocked"
+
+
 class TestMultipleRulesCompose:
     """Multiple rules for the same host compose — any matching filter in any
     matching rule permits the request."""
