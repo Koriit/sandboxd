@@ -4,11 +4,11 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::atomic_listener_writer::{AtomicListenerWriter, session_listener_host_path};
 use crate::error::SandboxError;
-use crate::gateway::{self, ENVOY_LDS_ACK_TIMEOUT, GatewayManager};
+use crate::gateway::{self, GatewayManager};
 use crate::network::NetworkInfo;
 use crate::policy::{
     AssuranceLevel, Destination, Policy, PolicyCompiler, render_two_table_ruleset,
@@ -338,21 +338,13 @@ pub fn generate_domain_ip_rules(
 ///    freshly resolved IPs so Envoy can start honouring matches for
 ///    them (xDS LDS picks up the `MovedTo` inotify event without
 ///    draining the listener);
-/// 2. waiting for Envoy to ACK the new listener snapshot via the
-///    `listener_manager.lds.update_success` admin counter, so
-///    subsequent steps do not race the worker-thread listener swap;
-/// 3. regenerating the `sandbox_policy` nftables ruleset — domain
+/// 2. regenerating the `sandbox_policy` nftables ruleset — domain
 ///    `allow` rules carry the now-resolved IPs so the kernel can
 ///    accept VM → IP traffic before it reaches Envoy.
 ///
 /// The listener is rewritten **first**, before the nftables injection,
 /// so Envoy has a matching filter chain ready by the time nftables
-/// starts admitting traffic for the new IPs. Step 2 is the M10-S6
-/// closure fix: without it, callers that flip `propagated=true` as
-/// soon as this function returns can observe the new IPs being
-/// admitted by the kernel before Envoy's worker threads have picked
-/// up the LDS update — yielding a TCP RST on the first connection
-/// because the listener is mid-reload.
+/// starts admitting traffic for the new IPs.
 pub fn propagate_dns_changes(
     session_id: &SessionId,
     policy: &Policy,
@@ -360,16 +352,7 @@ pub fn propagate_dns_changes(
     gateway: &GatewayManager,
     network_info: &NetworkInfo,
 ) -> Result<(), SandboxError> {
-    // (1a) Snapshot Envoy's current `listener_manager.lds.update_success`
-    // counter before the rewrite so we can detect the post-rewrite
-    // increment precisely. A `None` baseline (admin unreachable, parse
-    // failure) is preserved and forwarded to the waiter, which treats
-    // "any successful read" as "Envoy is back up to speed" — see
-    // [`GatewayManager::wait_for_envoy_lds_update`] for the back-off
-    // semantics.
-    let lds_baseline = gateway.envoy_lds_update_success(session_id);
-
-    // (1b) Envoy listener: compile the listener with the current DNS
+    // (1) Envoy listener: compile the listener with the current DNS
     // cache and write it via the atomic writer. Envoy's filesystem LDS
     // watcher picks up the `MovedTo` rename and reloads the listener
     // without dropping existing connections (only filter chains differ
@@ -384,31 +367,6 @@ pub fn propagate_dns_changes(
     AtomicListenerWriter::new(&listener_path)
         .write(&listener_yaml)
         .map_err(|e| SandboxError::Gateway(format!("listener rewrite failed: {e}")))?;
-
-    // (1c) Wait for Envoy to ACK the new listener snapshot. The atomic
-    // writer returns as soon as the rename syscall completes, but
-    // Envoy's inotify watcher and worker-thread listener swap run
-    // asynchronously afterwards — a VM-to-gateway connection that
-    // arrives in the intervening window hits a filter-chain set that
-    // may still reflect the previous generation (or be mid-replace),
-    // producing a TCP RST under the schema-v2 "no default passthrough
-    // chain" invariant. Blocking here until `listener_manager.lds.
-    // update_success` advances gives the rest of the propagation
-    // pipeline (and, by extension, the `policy_propagated` lifecycle
-    // event emitted by the DNS loop's caller) a rising-edge guarantee
-    // that Envoy is honouring the new config. Timeout is bounded so a
-    // wedged admin endpoint cannot stall the loop forever; a false
-    // return is logged but not propagated as an error — the next cycle
-    // retries anyway.
-    if !gateway.wait_for_envoy_lds_update(session_id, lds_baseline, ENVOY_LDS_ACK_TIMEOUT) {
-        warn!(
-            session_id = %session_id,
-            baseline = ?lds_baseline,
-            timeout_ms = ENVOY_LDS_ACK_TIMEOUT.as_millis() as u64,
-            "timed out waiting for Envoy LDS update_success; downstream readiness \
-             may briefly race the listener swap until the next DNS cycle re-attempts"
-        );
-    }
 
     // (2) nftables policy table: inject resolved-IP allow rules so the
     // kernel lets VM traffic through to Envoy. Rules for domains that

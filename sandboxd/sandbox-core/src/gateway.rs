@@ -129,32 +129,6 @@ const CONTAINER_IP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout for `docker exec nft` when injecting nftables rulesets.
 const NFT_EXEC_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Timeout for a single `docker exec curl` read against the Envoy admin
-/// `/stats` endpoint. The call is loopback-only inside the gateway
-/// container and the response is tiny (a single filtered counter), so
-/// anything above a couple of seconds indicates the container is
-/// wedged rather than merely slow — match the inspect timeout so we
-/// do not starve the caller's own deadline.
-const ENVOY_ADMIN_READ_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Interval between `listener_manager.lds.update_success` polls while
-/// waiting for Envoy to accept a freshly-rewritten listener. The
-/// integration test in `gateway_integration.rs` observes the counter
-/// landing within ~250ms under a warm container; 50ms gives us a few
-/// samples inside that window without pounding docker-exec in the
-/// (common) case where Envoy processes the `MovedTo` inotify event
-/// well before the deadline.
-const ENVOY_LDS_POLL_INTERVAL: Duration = Duration::from_millis(50);
-
-/// Default wall-clock budget for
-/// [`GatewayManager::wait_for_envoy_lds_update`]. Listener rewrites
-/// typically land inside Envoy in <300ms; the extra headroom covers
-/// cold containers, docker-exec cost on loaded hosts, and back-to-back
-/// rewrites produced by a DNS loop that resolves multiple domains
-/// across cycles. A bounded ceiling is critical: the DNS propagation
-/// loop must not block indefinitely on an unresponsive admin endpoint.
-pub const ENVOY_LDS_ACK_TIMEOUT: Duration = Duration::from_secs(5);
-
 // ---------------------------------------------------------------------------
 // Gateway listener ports
 // ---------------------------------------------------------------------------
@@ -886,93 +860,6 @@ impl GatewayManager {
         }
     }
 
-    // -- Envoy LDS readiness ---------------------------------------------------
-
-    /// Read Envoy's `listener_manager.lds.update_success` counter via
-    /// the gateway container's admin endpoint.
-    ///
-    /// The counter increments once per successfully accepted LDS update.
-    /// Returns `None` when the container is unreachable, Envoy is not
-    /// responding, or the counter cannot be parsed — callers use that as
-    /// "signal unavailable" and back off to a best-effort path rather
-    /// than blocking indefinitely. See `component_probe` for the sibling
-    /// `/ready` readiness signal used at startup.
-    ///
-    /// The admin endpoint is bound on `127.0.0.1:9901` inside the
-    /// container (see `PolicyCompiler::compile_envoy_bootstrap`), so
-    /// every call goes through `docker exec … curl`. This is the same
-    /// access path the integration suite (`gateway_integration.rs`)
-    /// uses and mirrors the `envoy` component probe shape.
-    ///
-    /// Blocking. Callers in async contexts must wrap the enclosing
-    /// operation in `tokio::task::spawn_blocking` per project
-    /// conventions.
-    pub fn envoy_lds_update_success(&self, session_id: &SessionId) -> Option<u64> {
-        let container = container_name(session_id);
-        // `filter` is an anchored regex; append `$` so we match the
-        // exact stat name and never pick up a sibling counter that
-        // happens to share the prefix.
-        let url = "http://127.0.0.1:9901/stats?filter=listener_manager\\.lds\\.update_success$&format=text";
-        let output = run_with_timeout(
-            Command::new("docker").args(["exec", &container, "curl", "-sf", url]),
-            ENVOY_ADMIN_READ_TIMEOUT,
-            "docker exec (envoy lds stats)",
-        )
-        .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        parse_lds_update_success(&String::from_utf8_lossy(&output.stdout))
-    }
-
-    /// Wait until Envoy reports a successfully-accepted LDS update
-    /// strictly newer than `baseline`, or the deadline elapses.
-    ///
-    /// Callers capture `baseline` from
-    /// [`Self::envoy_lds_update_success`] **before** atomically writing
-    /// a new listener generation; the return value says whether the
-    /// post-write counter surpassed the baseline within `timeout`.
-    ///
-    /// Returns:
-    ///
-    /// * `true` — the LDS watcher has ACKed a new listener snapshot;
-    ///   connections that arrive now will match the updated filter
-    ///   chains.
-    /// * `false` — the counter did not advance in time (Envoy may be
-    ///   hung, the admin endpoint may be unreachable, or the rewrite
-    ///   was rejected as invalid config). Callers should log and fall
-    ///   through to whatever downstream work they had planned; do not
-    ///   treat this as fatal because the DNS propagation loop will
-    ///   retry on the next cycle anyway.
-    ///
-    /// The poll is bounded by [`ENVOY_LDS_POLL_INTERVAL`]. Blocking —
-    /// async callers must wrap in `tokio::task::spawn_blocking`.
-    pub fn wait_for_envoy_lds_update(
-        &self,
-        session_id: &SessionId,
-        baseline: Option<u64>,
-        timeout: Duration,
-    ) -> bool {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(current) = self.envoy_lds_update_success(session_id) {
-                // If we never managed to read a baseline, treat any
-                // successful admin response as "Envoy is back up to
-                // speed" — the worst case is one extra cycle of lag
-                // before the next real rewrite, which is benign.
-                match baseline {
-                    None => return true,
-                    Some(b) if current > b => return true,
-                    _ => {}
-                }
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            thread::sleep(ENVOY_LDS_POLL_INTERVAL);
-        }
-    }
-
     // -- nftables injection ----------------------------------------------------
 
     /// Inject the deny-all nftables ruleset into the gateway container's
@@ -1286,34 +1173,6 @@ impl Default for GatewayManager {
 /// Generate the Docker container name for a session's gateway.
 pub fn container_name(session_id: &SessionId) -> String {
     format!("sandbox-gw-{session_id}")
-}
-
-// ---------------------------------------------------------------------------
-// Envoy admin stats parsing
-// ---------------------------------------------------------------------------
-
-/// Parse the raw body of Envoy's filtered `/stats?format=text` response
-/// for the `listener_manager.lds.update_success` counter.
-///
-/// Envoy emits one line per matched stat in the form `<name>: <value>`
-/// with `<value>` an unsigned integer. The filter we send is anchored
-/// so the response should contain at most one line — but we scan
-/// defensively and return the first parseable integer to stay tolerant
-/// of future admin-output quirks (trailing newlines, debug decorators,
-/// etc.).
-///
-/// Returns `None` when the body is empty, contains no `<name>: <int>`
-/// line, or the integer portion fails to parse. `None` is the
-/// caller-visible "signal unavailable" sentinel; see
-/// [`GatewayManager::envoy_lds_update_success`] for usage semantics.
-fn parse_lds_update_success(body: &str) -> Option<u64> {
-    for line in body.lines() {
-        let (_, value) = line.split_once(':')?;
-        if let Ok(n) = value.trim().parse::<u64>() {
-            return Some(n);
-        }
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1659,50 +1518,6 @@ mod tests {
             "deny-logger probe must NOT hardcode 127.0.0.1 — the listener \
              binds on the gateway bridge IP (see Phase 4 / healthcheck.sh)"
         );
-    }
-
-    // -- Envoy LDS stat parser tests ---------------------------------------
-
-    #[test]
-    fn parse_lds_update_success_parses_canonical_line() {
-        // Envoy's `/stats?format=text` emits `<name>: <value>` per match.
-        // Anchoring our filter to `listener_manager.lds.update_success$`
-        // yields a single line.
-        let body = "listener_manager.lds.update_success: 42\n";
-        assert_eq!(parse_lds_update_success(body), Some(42));
-    }
-
-    #[test]
-    fn parse_lds_update_success_tolerates_trailing_whitespace_and_no_trailing_newline() {
-        let body = "listener_manager.lds.update_success:   7";
-        assert_eq!(parse_lds_update_success(body), Some(7));
-    }
-
-    #[test]
-    fn parse_lds_update_success_returns_none_on_empty_body() {
-        assert_eq!(parse_lds_update_success(""), None);
-    }
-
-    #[test]
-    fn parse_lds_update_success_returns_none_when_no_integer_line_present() {
-        // A `curl -sf` against a bogus filter yields an empty body, but
-        // defensively handle the case where Envoy returns a banner or
-        // error page with `:` in it but no integer after the colon.
-        assert_eq!(
-            parse_lds_update_success("Error: bad filter\nsee --help"),
-            None
-        );
-    }
-
-    #[test]
-    fn parse_lds_update_success_picks_first_integer_when_multiple_lines_returned() {
-        // Should never happen with our anchored filter, but stay robust
-        // in case a future Envoy release adds a sibling counter or the
-        // admin format gains annotations — we want a deterministic
-        // pick, not a silent `None`.
-        let body =
-            "listener_manager.lds.update_success: 3\nlistener_manager.lds.update_attempt: 9\n";
-        assert_eq!(parse_lds_update_success(body), Some(3));
     }
 
     #[test]
