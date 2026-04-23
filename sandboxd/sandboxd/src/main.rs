@@ -15,7 +15,7 @@ use sandbox_core::events::lifecycle as lifecycle_events;
 use sandbox_core::events::session_events_host_dir;
 use sandbox_core::gateway::container_name as gateway_container_name;
 use sandbox_core::{
-    ApiError, AssuranceLevel, BaseImageStatus, CaManager, CoreDnsConfig, CreateSessionRequest,
+    AssuranceLevel, BaseImageStatus, CaManager, CoreDnsConfig, CreateSessionRequest,
     Destination, DnsCache, DockerHealth, EventBus, EventBusConfig, ExecRequest, ExecResponse,
     FileDownloadRequest, FileDownloadResponse, FileUploadRequest, GatewayHealth, GatewayManager,
     GatewayShutdownReason, GatewayStatus, GuestConnector, GuestRequest, GuestResponse,
@@ -243,24 +243,10 @@ struct AppState {
 // Error mapping
 // ---------------------------------------------------------------------------
 
-/// Convert a `SandboxError` into an HTTP response with appropriate status code.
-fn error_response(err: SandboxError) -> (StatusCode, Json<ApiError>) {
-    let (status, msg) = match &err {
-        SandboxError::SessionNotFound(_) => (StatusCode::NOT_FOUND, err.to_string()),
-        SandboxError::InvalidState(_) => (StatusCode::BAD_REQUEST, err.to_string()),
-        SandboxError::InvalidArgument(_) => (StatusCode::BAD_REQUEST, err.to_string()),
-        SandboxError::Network(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
-        SandboxError::Ca(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
-        SandboxError::Gateway(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
-        SandboxError::Lima(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
-        SandboxError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
-        SandboxError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
-        SandboxError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
-        SandboxError::Timeout { .. } => (StatusCode::GATEWAY_TIMEOUT, err.to_string()),
-    };
-    error!(%status, error = %msg, "handler error");
-    (status, Json(ApiError::new(msg)))
-}
+// The `SandboxError` → HTTP response mapping is shared with the events
+// sub-router via `sandboxd::error::error_response` — see that module for
+// the full mapping table and logging contract.
+use sandboxd::error::error_response;
 
 // ---------------------------------------------------------------------------
 // Handlers
@@ -3869,6 +3855,7 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sandbox_core::ApiError;
 
     // -----------------------------------------------------------------------
     // Helper: extract the JSON body from an error_response tuple.

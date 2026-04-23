@@ -18,4 +18,5 @@
 //! No other main-binary internals are re-exported here — keep this
 //! surface as narrow as possible.
 
+pub mod error;
 pub mod events_http;

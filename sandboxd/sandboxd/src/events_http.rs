@@ -46,7 +46,7 @@
 use std::sync::Arc;
 
 use axum::{
-    Json, Router,
+    Router,
     body::{Body, Bytes},
     extract::{Path, State},
     http::{StatusCode, header::CONTENT_TYPE},
@@ -56,11 +56,9 @@ use axum::{
 use axum_extra::extract::Query;
 use chrono::Utc;
 use sandbox_core::{
-    ApiError, EventBus, EventsFilter, EventsQueryDto, SandboxError, SessionStore,
-    event_to_jsonl_line,
+    EventBus, EventsFilter, EventsQueryDto, SandboxError, SessionStore, event_to_jsonl_line,
 };
 use tokio::sync::broadcast::error::RecvError;
-use tracing::error;
 
 /// `Content-Type` header value for the JSONL response body.
 ///
@@ -320,32 +318,22 @@ fn lag_marker_line(skipped: u64) -> String {
 // Local error mapping
 // ---------------------------------------------------------------------------
 
-/// Local copy of the daemon-wide `error_response` helper.
+/// Sub-router adapter around [`crate::error::error_response`].
 ///
-/// Duplicated here because `main.rs`'s `error_response` is a binary-only
-/// item and tests need the same status-code mapping when driving the
-/// sub-router directly. The two implementations must stay in lockstep;
-/// see `main.rs::error_response` for the canonical mapping table.
+/// The shared helper returns `(StatusCode, Json<ApiError>)` because the
+/// bulk of the daemon's handlers return `impl IntoResponse` and consume
+/// the tuple directly. The events sub-router's handlers return
+/// [`Response`] explicitly (several call sites do `return
+/// error_response(...)` from different match arms with different
+/// success shapes), so this thin adapter converts once at the call
+/// site and keeps the status-code / logging mapping in a single
+/// canonical location.
 ///
 /// Covered by the `maps_session_not_found_to_404` /
 /// `maps_invalid_argument_to_400` /
 /// `maps_internal_to_500` tests below.
-fn error_response(err: SandboxError) -> axum::response::Response {
-    let (status, msg) = match &err {
-        SandboxError::SessionNotFound(_) => (StatusCode::NOT_FOUND, err.to_string()),
-        SandboxError::InvalidState(_) => (StatusCode::BAD_REQUEST, err.to_string()),
-        SandboxError::InvalidArgument(_) => (StatusCode::BAD_REQUEST, err.to_string()),
-        SandboxError::Network(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
-        SandboxError::Ca(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
-        SandboxError::Gateway(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
-        SandboxError::Lima(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
-        SandboxError::Io(_) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
-        SandboxError::Database(_) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
-        SandboxError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
-        SandboxError::Timeout { .. } => (StatusCode::GATEWAY_TIMEOUT, err.to_string()),
-    };
-    error!(%status, error = %msg, "events handler error");
-    (status, Json(ApiError::new(msg))).into_response()
+fn error_response(err: SandboxError) -> Response {
+    crate::error::error_response(err).into_response()
 }
 
 #[cfg(test)]
