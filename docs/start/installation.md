@@ -13,7 +13,7 @@ This guide covers system requirements, dependency installation, and building san
 | KVM | `/dev/kvm` accessible | Required for hardware-accelerated VMs |
 | Docker | 24.0+ | For gateway containers and networking |
 | Lima | 2.1+ | VM management (`limactl` must be on PATH) |
-| Rust | 1.85+ (stable) | For building from source |
+| Rust | 1.88+ (stable) | For building from source |
 | QEMU | 8.0+ | `qemu-system-x86` with OVMF firmware |
 | Go | 1.22+ | For the CoreDNS policy plugin |
 | Python | 3.12+ | For E2E tests only |
@@ -210,7 +210,7 @@ source $HOME/.cargo/env
 
 ```bash
 rustc --version
-# Should be 1.85.0 or newer
+# Should be 1.88.0 or newer
 ```
 
 ## Build from source

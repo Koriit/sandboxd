@@ -40,7 +40,7 @@ CLI (sandbox) --> Unix socket --> Daemon (sandboxd) --> Lima/QEMU VMs
 - Docker 24.0+
 - Lima 2.1+
 - QEMU 8.0+ with OVMF
-- Rust 1.85+
+- Rust 1.88+
 
 See `docs/` for detailed installation and configuration instructions.
 

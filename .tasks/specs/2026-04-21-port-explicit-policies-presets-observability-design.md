@@ -718,6 +718,7 @@ Gateway and daemon control-plane state changes. All under `layer:
 | `gateway_ready` | — | Gateway passed startup checks (CoreDNS, Envoy, mitmproxy, deny-logger all responding) |
 | `policy_applied` | `policy` (full effective policy object), `source_presets` (array of `--preset` invocation strings sent by the CLI, empty if none), `status` (`ok` / `error`), `error` (on error) | Initial `sandbox create --policy ...` |
 | `policy_updated` | same shape as `policy_applied`, plus `previous_policy_hash` for diff attribution | Subsequent `sandbox policy update ...` |
+| `policy_propagated` | `policy_hash` (hex SHA-256 of the compiled policy that reached steady state) | Policy has propagated to all three enforcement layers (nftables, Envoy, mitmproxy) AND the DNS-driven loop has reconciled every `Destination::Domain` rule at level != `Deny`. Transition-only: emitted once per apply-propagation cycle; a re-apply with a new hash re-arms emission. For empty policies the edge fires synchronously from the apply path (no DNS loop to run) |
 | `policy_reset_on_upgrade` | `session`, `previous_rule_count` | Emitted once per session on first access after V004 migration removed its v1-shaped rules (see Part 1 schema bump) |
 | `health_degraded` | `component` (which subcomponent failed: `deny-logger`, `envoy`, `mitmproxy`, `coredns`), `reason` | Healthcheck failed |
 | `health_restored` | `component` | Healthcheck passed after being degraded |
