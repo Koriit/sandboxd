@@ -194,12 +194,19 @@ async fn ingestor_drops_events_with_unknown_source_ip() {
     let ingestor = SessionIngestor::spawn(sid, events_dir.clone(), bus.clone(), vm_ip_map.clone());
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // One mitmproxy line with an unbound `client_ip` — must not be
-    // published to any session's sink.
+    // One envoy access-log record with an unbound `src_ip` — must not
+    // be published to any session's sink. Envoy is used here (rather
+    // than mitmproxy as in older versions of this test) because
+    // mitmproxy attribution was intentionally moved off the vm_ip_map
+    // lookup path in M10-S5 Phase 7 — see the function-level doc on
+    // `dispatch_line` and the dedicated
+    // `mitmproxy_event_attributes_via_watcher_session_even_with_unbound_client_ip`
+    // test below. The drop-on-miss invariant continues to apply to the
+    // producers that do use vm_ip_map (envoy + coredns).
     let unknown_line = format!(
-        r#"{{"timestamp":"2026-04-22T09:45:01.000Z","layer":"mitmproxy","event":"request_allowed","host":"api.example.com","port":443,"method":"GET","path":"/","client_ip":"{UNBOUND_IP_STR}"}}"#,
+        r#"{{"timestamp":"2026-04-22T09:45:01.000Z","layer":"envoy","event":"connection_allowed","src_ip":"{UNBOUND_IP_STR}","src_port":"51234","dst_ip":"93.184.216.34","dst_port":"443","matched_chain":"l3_https","cluster":"upstream_https","upstream_host":"93.184.216.34:443","bytes_sent":"0","bytes_received":"0","response_flags":"-","duration_ms":"1","connect_authority":"api.example.com:443"}}"#,
     );
-    append_jsonl_line(&events_dir.join("mitmproxy.jsonl"), &unknown_line).await;
+    append_jsonl_line(&events_dir.join("envoy.jsonl"), &unknown_line).await;
 
     // Wait past the 2 s poll interval to give the tailer a chance to
     // read and drop; also covers the inotify path even on slow CI.
@@ -269,6 +276,69 @@ async fn ingestor_abort_stops_further_publishes() {
             // Timeout — expected. Aborted ingestor stayed silent.
         }
     }
+}
+
+/// Regression test for the mitmproxy attribution bug (M10-S5 Phase 7).
+///
+/// In production, mitmproxy runs on `127.0.0.1:18080` inside the gateway
+/// container and is reached by Envoy via a `tcp_proxy` filter. The
+/// mitmproxy addon reports `client_ip` as the kernel-chosen source of
+/// Envoy's upstream connect — typically the container's bridge IP
+/// (`10.209.0.2`-ish), not the VM's IP (`10.209.0.3`-ish). A naive
+/// `vm_ip_map.lookup(client_ip)`-based attribution therefore silently
+/// drops every mitmproxy event.
+///
+/// This test asserts the fix: a mitmproxy record whose `client_ip` is
+/// **not** bound in `vm_ip_map` still reaches the session's ring,
+/// attributed via the ingestor's own `watcher_session` (the same
+/// fallback path the deny-logger's `rate_limited` summary uses). The VM
+/// IP is deliberately bound to a *different* address to prove no
+/// lookup-by-client_ip is happening under the hood.
+#[tokio::test]
+async fn mitmproxy_event_attributes_via_watcher_session_even_with_unbound_client_ip() {
+    let tmp = TempDir::new().expect("create tempdir");
+    let events_dir = tmp.path().to_path_buf();
+    let sid = SessionId::parse("eeeeeeeeeeee").expect("valid fixture id");
+
+    let bus = EventBus::new(EventBusConfig::default());
+    bus.register_session(sid);
+    let vm_ip_map = VmIpSessionMap::new();
+    // Bind *only* the VM IP (10.209.0.3). The mitmproxy line below
+    // carries `client_ip=10.209.0.2` (the gateway's bridge IP), which
+    // is intentionally left unbound — the whole point of the fix is
+    // that mitmproxy attribution must not need the client_ip in the
+    // map.
+    let vm_ip: Ipv4Addr = "10.209.0.3".parse().expect("valid vm ip");
+    vm_ip_map.bind(vm_ip, sid);
+    let (mut replay, mut rx) = bus.subscribe(&sid).expect("session registered");
+
+    let ingestor = SessionIngestor::spawn(sid, events_dir.clone(), bus.clone(), vm_ip_map.clone());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mitm_line = r#"{"timestamp":"2026-04-22T09:45:20.000Z","layer":"mitmproxy","event":"request_allowed","host":"registry.npmjs.org","port":443,"method":"GET","path":"/leftpad","client_ip":"10.209.0.2"}"#;
+    append_jsonl_line(&events_dir.join("mitmproxy.jsonl"), mitm_line).await;
+
+    let ev = next_event(&mut replay, &mut rx, "mitmproxy unbound-client-ip").await;
+    match &*ev {
+        Event::Traffic { envelope, event } => {
+            assert_eq!(
+                envelope.session,
+                Some(sid),
+                "mitmproxy event must attribute to the ingestor's session, \
+                 not resolve through vm_ip_map (client_ip=10.209.0.2 is unbound)",
+            );
+            match event {
+                TrafficEvent::Mitmproxy(MitmproxyEvent::RequestAllowed { host, path, .. }) => {
+                    assert_eq!(host, "registry.npmjs.org");
+                    assert_eq!(path, "/leftpad");
+                }
+                other => panic!("expected mitmproxy RequestAllowed, got {other:?}"),
+            }
+        }
+        Event::Lifecycle { .. } => panic!("unexpected lifecycle event"),
+    }
+
+    ingestor.abort();
 }
 
 /// End-to-end: `deny-logger.jsonl` records are parsed and surface on the

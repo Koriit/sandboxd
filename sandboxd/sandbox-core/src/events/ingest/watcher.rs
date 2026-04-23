@@ -360,14 +360,25 @@ fn drain_all(
 /// Parse one line based on its layer, resolve session from the
 /// per-layer client / source IP, and publish.
 ///
-/// The per-parser source IP is an [`Option`] because the deny-logger's
-/// `rate_limited` summary carries no 5-tuple — it is a per-session
-/// aggregate produced when the component's per-session event rate cap
-/// is hit (spec Part 3 / "Hardening rules" § 5). For that case we fall
-/// back to the ingestor's own `watcher_session`: every [`SessionIngestor`]
-/// instance runs for a single session by construction, so the owning
-/// session is already known at this layer. Every other parser returns
-/// `Some(ip)` and goes through the normal `vm_ip_map.lookup` path.
+/// The per-parser source IP is an [`Option`] because two producer shapes
+/// cannot be attributed via `vm_ip_map.lookup`:
+///
+/// 1. The deny-logger's `rate_limited` summary carries no 5-tuple — it
+///    is a per-session aggregate produced when the component's
+///    per-session event rate cap is hit (spec Part 3 / "Hardening
+///    rules" § 5).
+/// 2. Every mitmproxy event's `client_ip` is the kernel-chosen source
+///    of Envoy's upstream connect to `127.0.0.1:18080` (typically the
+///    gateway's bridge IP), not the VM. Mitmproxy runs on loopback
+///    inside the gateway container and never sees the VM's IP on its
+///    listening socket, so there is nothing to look up in `vm_ip_map`.
+///
+/// For both cases we fall back to the ingestor's own `watcher_session`:
+/// every [`SessionIngestor`] instance runs for a single session by
+/// construction, so the owning session is already known at this layer.
+/// Envoy and CoreDNS see the VM as the origin peer on their respective
+/// listeners and return `Some(ip)`, going through the normal
+/// `vm_ip_map.lookup` path.
 ///
 /// [`SessionIngestor`]: crate::events::ingest::SessionIngestor
 fn dispatch_line(
@@ -383,7 +394,12 @@ fn dispatch_line(
         Layer::Coredns => parse_coredns_line(line)
             .map(|p: ParsedDnsEvent| (p.timestamp, Some(p.client_ip), p.traffic)),
         Layer::Mitmproxy => parse_mitmproxy_line(line)
-            .map(|p: ParsedMitmEvent| (p.timestamp, Some(p.client_ip), p.traffic)),
+            // client_ip on mitmproxy events is the gateway's upstream-socket
+            // source (set by the kernel for Envoy's connect to 127.0.0.1:18080),
+            // not the VM. Since SessionIngestor is per-session by construction,
+            // attribute via watcher_session — same treatment as deny-logger's
+            // rate_limited summary.
+            .map(|p: ParsedMitmEvent| (p.timestamp, None, p.traffic)),
         Layer::DenyLogger => parse_deny_logger_line(line)
             .map(|p: ParsedDenyLoggerEvent| (p.timestamp, p.src_ip, p.traffic)),
     };
@@ -420,11 +436,14 @@ fn dispatch_line(
             sid
         }
         None => {
-            // No peer IP on the parsed record — the only producer that
-            // emits this shape today is the deny-logger's
-            // `rate_limited` summary (spec Part 3 / "Hardening rules"
-            // § 5). The summary is per-session by construction, so the
-            // ingestor's own `watcher_session` is the correct owner.
+            // No peer IP to look up. Two producer shapes hit this path:
+            // (a) the deny-logger's `rate_limited` summary, which has no
+            // 5-tuple (spec Part 3 / "Hardening rules" § 5); and
+            // (b) every mitmproxy event, whose `client_ip` reflects the
+            // kernel-chosen source of Envoy's loopback connect and is
+            // not the VM. Both producers run per-session by
+            // construction, so the ingestor's own `watcher_session` is
+            // the correct owner. See the function-level doc above.
             *watcher_session
         }
     };
@@ -497,5 +516,99 @@ mod tests {
         // fails someone has changed the fallback poll rate — make sure
         // the corresponding docs + E2E waits get updated too.
         assert_eq!(POLL_INTERVAL, std::time::Duration::from_secs(2));
+    }
+
+    // ----- dispatch_line attribution tests -----
+
+    use crate::events::{EventBusConfig, MitmproxyEvent};
+    use std::net::Ipv4Addr;
+
+    /// Regression test for the mitmproxy attribution bug (M10-S5 Phase 7).
+    ///
+    /// Mitmproxy's `client_ip` is the kernel-chosen source of Envoy's
+    /// loopback connect — not the VM — so attempting to resolve it via
+    /// `vm_ip_map.lookup` always misses. Instead, dispatch_line must
+    /// attribute the event to the ingestor's `watcher_session` (the
+    /// same fallback the deny-logger's `rate_limited` summary uses),
+    /// since every ingestor runs for a single session by construction.
+    #[test]
+    fn dispatch_line_mitmproxy_attributes_via_watcher_session() {
+        let watcher_session = SessionId::parse("aaaaaaaaaaaa").expect("valid fixture session id");
+        let bus = EventBus::new(EventBusConfig::default());
+        bus.register_session(watcher_session);
+        // Deliberately leave `vm_ip_map` empty: the client_ip on the
+        // mitmproxy record below is the gateway's bridge IP, which is
+        // by design never bound in the map. A vm_ip_map.lookup()-based
+        // attribution would drop the event.
+        let vm_ip_map = VmIpSessionMap::new();
+
+        // client_ip=10.209.0.2 mimics the real-world failure: that is
+        // the gateway container's bridge IP on the VM-facing bridge
+        // (see handoff in .tasks/handoffs/20260423-061500-* for the
+        // root cause). Not bound, must still be attributed.
+        let line = r#"{"timestamp":"2026-04-22T09:45:00.000Z","layer":"mitmproxy","event":"request_allowed","host":"registry.npmjs.org","port":443,"method":"GET","path":"/leftpad","client_ip":"10.209.0.2"}"#;
+
+        dispatch_line(&watcher_session, &bus, &vm_ip_map, Layer::Mitmproxy, line);
+
+        // Snapshot the ring after publish; `subscribe` returns a
+        // replay vector seeded from the per-session ring so late
+        // consumers still observe the event. If the bug were still
+        // present, dispatch_line would drop the event via
+        // `vm_ip_map.lookup` miss and the replay would be empty.
+        let (mut replay, _rx) = bus.subscribe(&watcher_session).expect("registered");
+
+        assert_eq!(
+            replay.len(),
+            1,
+            "exactly one mitmproxy event must reach the ring; got {}",
+            replay.len()
+        );
+        match &*replay.remove(0) {
+            Event::Traffic { envelope, event } => {
+                assert_eq!(
+                    envelope.session,
+                    Some(watcher_session),
+                    "mitmproxy event must attribute to the ingestor's watcher_session, \
+                     not the gateway bridge ip in client_ip",
+                );
+                match event {
+                    TrafficEvent::Mitmproxy(MitmproxyEvent::RequestAllowed {
+                        host, path, ..
+                    }) => {
+                        assert_eq!(host, "registry.npmjs.org");
+                        assert_eq!(path, "/leftpad");
+                    }
+                    other => panic!("expected RequestAllowed, got {other:?}"),
+                }
+            }
+            Event::Lifecycle { .. } => panic!("expected traffic event"),
+        }
+    }
+
+    /// Negative control: the envoy branch still relies on
+    /// `vm_ip_map.lookup`, so an unbound src_ip must continue to drop
+    /// the event. Guards against a change to `Layer::Envoy` that
+    /// silently widened the `None`-fallback to the wrong producer.
+    #[test]
+    fn dispatch_line_envoy_drops_unbound_src_ip() {
+        let watcher_session = SessionId::parse("bbbbbbbbbbbb").expect("valid fixture session id");
+        let bus = EventBus::new(EventBusConfig::default());
+        bus.register_session(watcher_session);
+        let vm_ip_map = VmIpSessionMap::new();
+        // Bind a different IP so the map is non-empty; 10.0.0.99 below
+        // still misses.
+        vm_ip_map.bind("10.0.0.1".parse::<Ipv4Addr>().unwrap(), watcher_session);
+        let (replay, _rx) = bus.subscribe(&watcher_session).expect("registered");
+
+        let line = r#"{"timestamp":"2026-04-22T09:45:00.000Z","layer":"envoy","event":"connection_allowed","src_ip":"10.0.0.99","src_port":"51234","dst_ip":"93.184.216.34","dst_port":"443","matched_chain":"l3_https","cluster":"upstream_https","upstream_host":"93.184.216.34:443","bytes_sent":"0","bytes_received":"0","response_flags":"-","duration_ms":"1","connect_authority":"api.example.com:443"}"#;
+
+        dispatch_line(&watcher_session, &bus, &vm_ip_map, Layer::Envoy, line);
+
+        assert!(
+            replay.is_empty(),
+            "envoy events with unbound src_ip must be dropped; \
+             found {} published events",
+            replay.len(),
+        );
     }
 }
