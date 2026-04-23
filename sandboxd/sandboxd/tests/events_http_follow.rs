@@ -174,8 +174,7 @@ async fn read_n_lines(
     match tokio::time::timeout(max_wait, fut).await {
         Ok(res) => res,
         Err(_) => Err(format!(
-            "timed out after {:?} waiting for {count} lines",
-            max_wait
+            "timed out after {max_wait:?} waiting for {count} lines"
         )),
     }
 }

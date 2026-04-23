@@ -1207,7 +1207,7 @@ fn render_policy_rule(idx: usize, rule: &PolicyRuleDto, out: &mut String) {
     // same padding to align the column.
     let target = format!("{host_str}:{port}");
     let header = if level_word.is_empty() {
-        format!("  [{idx}] {:<16}{target}", action)
+        format!("  [{idx}] {action:<16}{target}")
     } else {
         format!("  [{idx}] {:<16}{target}", format!("{action} {level_word}"))
     };
@@ -2047,9 +2047,9 @@ fn format_table_row(line: &str, colorize: bool) -> String {
 
     let time_col = format_time_column(&timestamp);
     let session_col = format_session_column(&session);
-    let layer_col = format!("{layer:<lw$}", lw = TABLE_LAYER_WIDTH);
-    let event_col = format!("{event:<ew$}", ew = TABLE_EVENT_WIDTH);
-    let host_col = format!("{host_port:<hw$}", hw = TABLE_HOSTPORT_WIDTH);
+    let layer_col = format!("{layer:<TABLE_LAYER_WIDTH$}");
+    let event_col = format!("{event:<TABLE_EVENT_WIDTH$}");
+    let host_col = format!("{host_port:<TABLE_HOSTPORT_WIDTH$}");
     let detail_col = truncate_detail(&detail);
 
     let row =
@@ -2069,7 +2069,7 @@ fn format_time_column(ts: &str) -> String {
     if ts.len() >= TABLE_TIME_WIDTH {
         ts.chars().take(TABLE_TIME_WIDTH).collect()
     } else {
-        format!("{ts:<w$}", w = TABLE_TIME_WIDTH)
+        format!("{ts:<TABLE_TIME_WIDTH$}")
     }
 }
 
@@ -2079,7 +2079,7 @@ fn format_session_column(session: &str) -> String {
         return format!("{:<w$}", "-", w = TABLE_SESSION_WIDTH);
     }
     let short: String = session.chars().take(TABLE_SESSION_WIDTH).collect();
-    format!("{short:<w$}", w = TABLE_SESSION_WIDTH)
+    format!("{short:<TABLE_SESSION_WIDTH$}")
 }
 
 /// Truncate DETAIL to `TABLE_DETAIL_MAX` columns, adding `…` as a
@@ -3059,7 +3059,7 @@ async fn check_base_image_staleness(socket_path: &str) {
     }
 
     let age_days = json.get("age_days").and_then(|v| v.as_u64()).unwrap_or(0);
-    eprintln!("Warning: base image is {} days old.", age_days);
+    eprintln!("Warning: base image is {age_days} days old.");
     eprint!("Rebuild before creating session? [y/N] ");
 
     // Read user response from stdin.

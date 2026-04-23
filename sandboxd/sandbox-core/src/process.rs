@@ -114,8 +114,7 @@ mod tests {
         }
         assert!(
             err.to_string().contains("timed out"),
-            "error display should mention timeout: {}",
-            err
+            "error display should mention timeout: {err}"
         );
     }
 

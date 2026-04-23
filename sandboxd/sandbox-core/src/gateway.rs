@@ -1302,12 +1302,12 @@ pub fn generate_deny_all_ruleset() -> String {
 pub fn generate_dnat_ruleset(vm_subnet: &str, gateway_ip: &str) -> String {
     format!(
         r#"table inet sandbox_dnat {{
-    set {tcp_set} {{
+    set {NFT_POLICY_ALLOW_TCP_SET} {{
         type ipv4_addr . inet_service
         flags interval
     }}
 
-    set {udp_set} {{
+    set {NFT_POLICY_ALLOW_UDP_SET} {{
         type ipv4_addr . inet_service
         flags interval
     }}
@@ -1316,20 +1316,20 @@ pub fn generate_dnat_ruleset(vm_subnet: &str, gateway_ip: &str) -> String {
         type nat hook prerouting priority dstnat;
 
         # DNS -> CoreDNS (port 53)
-        ip saddr {vm_subnet} udp dport {dns_port} dnat to {gateway_ip}:{dns_port}
-        ip saddr {vm_subnet} tcp dport {dns_port} dnat to {gateway_ip}:{dns_port}
+        ip saddr {vm_subnet} udp dport {GATEWAY_DNS_PORT} dnat to {gateway_ip}:{GATEWAY_DNS_PORT}
+        ip saddr {vm_subnet} tcp dport {GATEWAY_DNS_PORT} dnat to {gateway_ip}:{GATEWAY_DNS_PORT}
 
         # Policy-allowed destinations -> Envoy (conditional DNAT keyed on
         # (ip daddr, dport) concat sets populated by the policy compiler
         # and DNS propagation loop).
-        ip saddr {vm_subnet} meta l4proto tcp ip daddr . tcp dport @{tcp_set} dnat to {gateway_ip}:{envoy_port}
-        ip saddr {vm_subnet} meta l4proto udp ip daddr . udp dport @{udp_set} dnat to {gateway_ip}:{envoy_port}
+        ip saddr {vm_subnet} meta l4proto tcp ip daddr . tcp dport @{NFT_POLICY_ALLOW_TCP_SET} dnat to {gateway_ip}:{GATEWAY_ENVOY_PORT}
+        ip saddr {vm_subnet} meta l4proto udp ip daddr . udp dport @{NFT_POLICY_ALLOW_UDP_SET} dnat to {gateway_ip}:{GATEWAY_ENVOY_PORT}
 
         # Everything else -> deny-logger (per L4). Fail-closed: pre-policy
         # VM traffic hits these rules too and is surfaced as a structured
         # `deny` event instead of a silent RST.
-        ip saddr {vm_subnet} meta l4proto tcp dnat to {gateway_ip}:{deny_tcp_port}
-        ip saddr {vm_subnet} meta l4proto udp dnat to {gateway_ip}:{deny_udp_port}
+        ip saddr {vm_subnet} meta l4proto tcp dnat to {gateway_ip}:{GATEWAY_DENY_LOGGER_TCP_PORT}
+        ip saddr {vm_subnet} meta l4proto udp dnat to {gateway_ip}:{GATEWAY_DENY_LOGGER_UDP_PORT}
 
         # Block cloud metadata
         ip daddr 169.254.169.254 drop
@@ -1346,12 +1346,6 @@ pub fn generate_dnat_ruleset(vm_subnet: &str, gateway_ip: &str) -> String {
     }}
 }}
 "#,
-        dns_port = GATEWAY_DNS_PORT,
-        envoy_port = GATEWAY_ENVOY_PORT,
-        deny_tcp_port = GATEWAY_DENY_LOGGER_TCP_PORT,
-        deny_udp_port = GATEWAY_DENY_LOGGER_UDP_PORT,
-        tcp_set = NFT_POLICY_ALLOW_TCP_SET,
-        udp_set = NFT_POLICY_ALLOW_UDP_SET,
     )
 }
 
@@ -1393,31 +1387,26 @@ table inet sandbox {{
         ip protocol icmp accept
 
         # Allow DNS from VM subnet (CoreDNS)
-        ip saddr {vm_subnet} udp dport {dns_port} accept
-        ip saddr {vm_subnet} tcp dport {dns_port} accept
+        ip saddr {vm_subnet} udp dport {GATEWAY_DNS_PORT} accept
+        ip saddr {vm_subnet} tcp dport {GATEWAY_DNS_PORT} accept
 
         # Allow HTTP proxy from VM subnet (Envoy)
-        ip saddr {vm_subnet} tcp dport {envoy_port} accept
+        ip saddr {vm_subnet} tcp dport {GATEWAY_ENVOY_PORT} accept
 
         # Allow deny-logger TCP listener (denied VM TCP lands here via DNAT)
-        ip saddr {vm_subnet} tcp dport {deny_tcp_port} accept
+        ip saddr {vm_subnet} tcp dport {GATEWAY_DENY_LOGGER_TCP_PORT} accept
 
         # Allow deny-logger UDP listener (denied VM UDP lands here via DNAT)
-        ip saddr {vm_subnet} udp dport {deny_udp_port} accept
+        ip saddr {vm_subnet} udp dport {GATEWAY_DENY_LOGGER_UDP_PORT} accept
 
         # Allow deny-logger /health probe (in-container only; no DNAT for it)
-        tcp dport {deny_health_port} accept
+        tcp dport {GATEWAY_DENY_LOGGER_HEALTH_PORT} accept
 
         # Reject everything else (fast failure)
         reject
     }}
 }}
 "#,
-        dns_port = GATEWAY_DNS_PORT,
-        envoy_port = GATEWAY_ENVOY_PORT,
-        deny_tcp_port = GATEWAY_DENY_LOGGER_TCP_PORT,
-        deny_udp_port = GATEWAY_DENY_LOGGER_UDP_PORT,
-        deny_health_port = GATEWAY_DENY_LOGGER_HEALTH_PORT,
     )
 }
 

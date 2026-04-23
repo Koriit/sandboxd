@@ -1082,9 +1082,9 @@ provision:
     #!/bin/bash
     set -eux -o pipefail
     echo "[sandbox-provision] step=hostname start=$(date -u +%Y-%m-%dT%H:%M:%S)"
-    hostnamectl set-hostname {hostname}
-    if ! grep -q '{hostname}' /etc/hosts; then
-      echo "127.0.1.1 {hostname}" >> /etc/hosts
+    hostnamectl set-hostname {BASE_VM_NAME}
+    if ! grep -q '{BASE_VM_NAME}' /etc/hosts; then
+      echo "127.0.1.1 {BASE_VM_NAME}" >> /etc/hosts
     fi
     echo "[sandbox-provision] step=hostname done=$(date -u +%Y-%m-%dT%H:%M:%S)"
 - mode: system
@@ -1145,7 +1145,6 @@ provision:
     fi
     echo "[sandbox-provision] step=docker done=$(date -u +%Y-%m-%dT%H:%M:%S)"
 "#,
-            hostname = BASE_VM_NAME,
         )
     }
 
@@ -1713,9 +1712,8 @@ fn sanitize_yaml_path(path: &str) -> &str {
             || matches!(ch, '/' | '-' | '_' | '.' | ' ' | '+' | '@' | '~' | ':'))
         {
             panic!(
-                "host_path contains unsafe character {:?} at index {} — \
-                 refusing to interpolate into YAML template: {:?}",
-                ch, i, path,
+                "host_path contains unsafe character {ch:?} at index {i} — \
+                 refusing to interpolate into YAML template: {path:?}",
             );
         }
     }

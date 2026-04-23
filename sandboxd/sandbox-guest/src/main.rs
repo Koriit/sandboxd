@@ -276,7 +276,7 @@ fn validate_path(raw: &str) -> Result<PathBuf, String> {
     let resolved = resolve_through_symlinks(&path)?;
     let resolved_str = resolved.to_string_lossy();
     check_path_allowlist(&resolved_str)
-        .map_err(|e| format!("{e} (after resolving symlinks: {})", resolved_str))?;
+        .map_err(|e| format!("{e} (after resolving symlinks: {resolved_str})"))?;
 
     Ok(resolved)
 }
@@ -863,8 +863,7 @@ mod tests {
         let result = validate_path(&format!("{link_path}/passwd"));
         assert!(
             result.is_err(),
-            "symlink escaping /tmp/ to /etc/ should be rejected, got: {:?}",
-            result,
+            "symlink escaping /tmp/ to /etc/ should be rejected, got: {result:?}",
         );
 
         // Clean up.
@@ -884,8 +883,7 @@ mod tests {
         let result = validate_path(&format!("{link_path}/file.txt"));
         assert!(
             result.is_ok(),
-            "symlink within /tmp/ should be allowed, got: {:?}",
-            result,
+            "symlink within /tmp/ should be allowed, got: {result:?}",
         );
 
         // Clean up.

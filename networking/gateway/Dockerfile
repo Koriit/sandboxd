@@ -33,7 +33,7 @@ RUN go mod download \
 # crates are not dragged in by `cargo build -p sandbox-deny-logger` —
 # cargo builds only the requested package plus its actual dependency
 # graph. `.dockerignore` already excludes `sandboxd/target/`.
-FROM rust:1.85-bookworm AS deny-logger-builder
+FROM rust:1.88-bookworm AS deny-logger-builder
 
 WORKDIR /src
 

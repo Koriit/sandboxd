@@ -70,8 +70,7 @@ pub async fn attach_vm_to_bridge(
         } => {
             if exit_code != 0 {
                 return Err(SandboxError::Network(format!(
-                    "guest network configuration failed (exit {}): stdout={stdout}, stderr={stderr}",
-                    exit_code
+                    "guest network configuration failed (exit {exit_code}): stdout={stdout}, stderr={stderr}"
                 )));
             }
             info!(

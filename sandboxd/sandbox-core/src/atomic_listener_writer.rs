@@ -354,11 +354,7 @@ mod tests {
     /// filter-chains body, and tail. The text layout mirrors what
     /// `PolicyCompiler::compile_envoy_listener` emits.
     fn framed(head: &str, body: &str, tail: &str) -> String {
-        format!(
-            "{head}\n{begin}\n{body}\n{end}\n{tail}",
-            begin = FILTER_CHAINS_BEGIN_MARKER,
-            end = FILTER_CHAINS_END_MARKER,
-        )
+        format!("{head}\n{FILTER_CHAINS_BEGIN_MARKER}\n{body}\n{FILTER_CHAINS_END_MARKER}\n{tail}",)
     }
 
     #[test]
@@ -383,9 +379,7 @@ mod tests {
         // Two BEGIN markers — the writer cannot split this
         // unambiguously, so it must refuse.
         let content = format!(
-            "header\n{begin}\n{begin}\n    filter_chains: []\n{end}\n",
-            begin = FILTER_CHAINS_BEGIN_MARKER,
-            end = FILTER_CHAINS_END_MARKER,
+            "header\n{FILTER_CHAINS_BEGIN_MARKER}\n{FILTER_CHAINS_BEGIN_MARKER}\n    filter_chains: []\n{FILTER_CHAINS_END_MARKER}\n",
         );
         let err = writer.write(&content).unwrap_err();
         assert!(

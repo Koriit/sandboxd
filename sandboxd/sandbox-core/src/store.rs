@@ -392,8 +392,7 @@ impl SessionStore {
 
         if !current_state.can_transition_to(new_state) {
             return Err(SandboxError::InvalidState(format!(
-                "cannot transition from {} to {}",
-                current_state, new_state
+                "cannot transition from {current_state} to {new_state}"
             )));
         }
 
