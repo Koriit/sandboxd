@@ -2100,6 +2100,15 @@ fn extract_table_fields(
                     "policy_reset_on_upgrade",
                     format!("previous_rule_count={previous_rule_count}"),
                 ),
+                LifecycleEventBodyDto::PolicyPropagated { policy_hash } => {
+                    // Truncate to the first 12 hex chars so the detail
+                    // column stays a reasonable width on typical
+                    // terminals. The full hash is still available via
+                    // the JSON renderer (`--json`), which serializes
+                    // `policy_hash` verbatim.
+                    let short = policy_hash.get(..12).unwrap_or(policy_hash.as_str());
+                    ("policy_propagated", format!("hash={short}"))
+                }
                 LifecycleEventBodyDto::HealthDegraded { component, reason } => (
                     "health_degraded",
                     format!("component={component:?} reason={reason}"),

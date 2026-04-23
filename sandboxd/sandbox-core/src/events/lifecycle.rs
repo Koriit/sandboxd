@@ -126,6 +126,25 @@ pub fn policy_reset_on_upgrade(session: SessionId, previous_rule_count: usize) -
     )
 }
 
+/// `policy_propagated`: the session's current effective policy has
+/// fully propagated across all three enforcement layers and (where
+/// applicable) the DNS loop has mirrored every `Destination::Domain`
+/// rule into the nftables allow sets.
+///
+/// Transition-only: the propagation loop tracks the last emitted hash
+/// per session and suppresses repeat emissions while the hash is
+/// stable. Emission resumes on any policy-apply that changes the hash.
+///
+/// `policy_hash` is the hex SHA-256 digest of the canonical JSON
+/// serialization of the [`crate::policy::Policy`] that propagated
+/// (see [`crate::policy::hash_policy`]).
+pub fn policy_propagated(session: SessionId, policy_hash: String) -> Event {
+    wrap(
+        Some(session),
+        LifecycleEvent::PolicyPropagated { policy_hash },
+    )
+}
+
 /// `health_degraded`: a subcomponent healthcheck flipped from healthy
 /// to failing. Publish on the transition only — not on every polling
 /// tick — so the event stream stays sparse even under a sustained
@@ -340,6 +359,20 @@ mod tests {
                 assert_eq!(*previous_rule_count, 7);
             }
             other => panic!("expected PolicyResetOnUpgrade, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn policy_propagated_builder_carries_hash() {
+        let sid = fixture_session();
+        let hash = "abc123def4567890abc123def4567890abc123def4567890abc123def4567890".to_string();
+        let event = policy_propagated(sid, hash.clone());
+        assert_eq!(event.session(), Some(&sid));
+        match expect_lifecycle(&event) {
+            LifecycleEvent::PolicyPropagated { policy_hash } => {
+                assert_eq!(policy_hash, &hash);
+            }
+            other => panic!("expected PolicyPropagated, got {other:?}"),
         }
     }
 

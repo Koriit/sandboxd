@@ -60,6 +60,7 @@ pub use policy::{
     FILTER_CHAINS_BEGIN_MARKER, FILTER_CHAINS_END_MARKER, HttpFilter, HttpMethod,
     LISTENER_DIR_IN_CONTAINER, LISTENER_FILE_IN_CONTAINER, LISTENER_FILE_NAME, MitmproxyConfig,
     MitmproxyFilter, MitmproxyRule, Policy, PolicyCompiler, PolicyRule, Protocol, RuleSource,
+    hash_policy,
 };
 pub use policy_distributor::{PolicyDistributor, write_file_to_container};
 pub use process::run_with_timeout;

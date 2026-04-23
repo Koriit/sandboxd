@@ -254,6 +254,9 @@ pub enum LifecycleEventBodyDto {
     PolicyResetOnUpgrade {
         previous_rule_count: u64,
     },
+    PolicyPropagated {
+        policy_hash: String,
+    },
     HealthDegraded {
         component: HealthComponentDto,
         reason: String,

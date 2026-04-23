@@ -296,6 +296,29 @@ pub enum LifecycleEvent {
     /// Emitted once per session on first access after V004 migration
     /// removed its v1-shaped rules.
     PolicyResetOnUpgrade { previous_rule_count: usize },
+    /// Policy has fully propagated across all three enforcement layers.
+    ///
+    /// Emit conditions (all must hold at the time of emission):
+    /// * The session's current effective [`Policy`] has been mirrored to
+    ///   the gateway (nftables `policy_allow_{tcp,udp}` sets, Envoy
+    ///   filter chains, mitmproxy rules).
+    /// * At least one full cycle of the DNS propagation loop has run
+    ///   after the policy was applied, so every `Destination::Domain`
+    ///   rule at `level != Deny` has been resolved and the resolved IPs
+    ///   mirrored into nftables.
+    /// * The hash of the reconciled policy matches the hash of the
+    ///   applied policy (i.e., no new apply has raced ahead).
+    ///
+    /// Transition-only: the loop tracks the last emitted hash per session
+    /// and suppresses duplicate emissions while the hash is stable. Fresh
+    /// emission resumes on any subsequent policy-apply that changes the
+    /// hash.
+    PolicyPropagated {
+        /// SHA-256 hex digest of the canonical JSON serialization of the
+        /// propagated [`Policy`]. Stable across processes; matches
+        /// `expected_hash` from the propagation-status endpoint.
+        policy_hash: String,
+    },
     /// A subcomponent healthcheck started failing.
     HealthDegraded {
         component: HealthComponent,
@@ -785,6 +808,22 @@ mod tests {
         };
         let json = round_trip_lifecycle(event, "policy_reset_on_upgrade");
         assert_eq!(json["previous_rule_count"], 7);
+    }
+
+    #[test]
+    fn env_round_trip_lifecycle_policy_propagated() {
+        let event = Event::Lifecycle {
+            envelope: fixture_envelope(),
+            event: LifecycleEvent::PolicyPropagated {
+                policy_hash: "abc123def4567890abc123def4567890abc123def4567890abc123def4567890"
+                    .into(),
+            },
+        };
+        let json = round_trip_lifecycle(event, "policy_propagated");
+        assert_eq!(
+            json["policy_hash"],
+            "abc123def4567890abc123def4567890abc123def4567890abc123def4567890"
+        );
     }
 
     #[test]

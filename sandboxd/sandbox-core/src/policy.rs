@@ -85,6 +85,26 @@ impl<'de> Deserialize<'de> for Policy {
     }
 }
 
+/// Compute a stable SHA-256 hex digest of a [`Policy`] for use as a
+/// content-addressable identifier on lifecycle events and the
+/// propagation-status endpoint.
+///
+/// Hashes the serde-JSON representation so the digest is deterministic
+/// across processes (the in-memory struct layout is not). Returns
+/// [`None`] only if JSON serialization fails, which is not expected for
+/// a well-formed [`Policy`] — every field implements [`Serialize`] and
+/// cannot fail mid-serialization short of OOM.
+pub fn hash_policy(policy: &Policy) -> Option<String> {
+    let bytes = serde_json::to_vec(policy).ok()?;
+    let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
+    let mut s = String::with_capacity(digest.as_ref().len() * 2);
+    for byte in digest.as_ref() {
+        use std::fmt::Write;
+        let _ = write!(s, "{byte:02x}");
+    }
+    Some(s)
+}
+
 /// A single policy rule describing the allowed assurance level for a
 /// destination.
 ///

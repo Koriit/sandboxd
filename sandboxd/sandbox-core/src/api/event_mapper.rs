@@ -281,6 +281,11 @@ fn lifecycle_body_dto(event: &LifecycleEvent) -> LifecycleEventBodyDto {
         } => LifecycleEventBodyDto::PolicyResetOnUpgrade {
             previous_rule_count: *previous_rule_count as u64,
         },
+        LifecycleEvent::PolicyPropagated { policy_hash } => {
+            LifecycleEventBodyDto::PolicyPropagated {
+                policy_hash: policy_hash.clone(),
+            }
+        }
         LifecycleEvent::HealthDegraded { component, reason } => {
             LifecycleEventBodyDto::HealthDegraded {
                 component: (*component).into(),
@@ -707,6 +712,15 @@ mod tests {
                     },
                 },
                 "policy_reset_on_upgrade",
+            ),
+            (
+                Event::Lifecycle {
+                    envelope: envelope.clone(),
+                    event: LifecycleEvent::PolicyPropagated {
+                        policy_hash: "deadbeef".into(),
+                    },
+                },
+                "policy_propagated",
             ),
             (
                 Event::Lifecycle {

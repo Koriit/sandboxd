@@ -23,8 +23,8 @@ use sandbox_core::{
     Policy, PolicyApplyStatus, PolicyCompiler, PolicyDistributor, SandboxError, Session,
     SessionConfig, SessionDto, SessionHealth, SessionId, SessionIngestor, SessionState,
     SessionStore, UpdatePolicyRequest, VmIpSessionMap, VmStatus, attach_vm_to_bridge,
-    detach_vm_from_bridge, generate_ca_inject_script, mac_from_session_id, propagate_dns_changes,
-    read_resolved_json, write_file_to_container,
+    detach_vm_from_bridge, generate_ca_inject_script, hash_policy, mac_from_session_id,
+    propagate_dns_changes, read_resolved_json, write_file_to_container,
 };
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
@@ -1796,21 +1796,6 @@ enum ApplyKind {
     /// observed by the bus in a prior `Initial`/`Update` emission;
     /// re-emitting here would double-count. No event is published.
     Restoration,
-}
-
-/// Compute a stable sha256 hex digest of a [`Policy`] for use as
-/// `previous_policy_hash` on `policy_updated` events. Hashes the
-/// serde-JSON representation so the digest is deterministic across
-/// processes (the in-memory struct layout is not).
-fn hash_policy(policy: &Policy) -> Option<String> {
-    let bytes = serde_json::to_vec(policy).ok()?;
-    let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
-    let mut s = String::with_capacity(digest.as_ref().len() * 2);
-    for byte in digest.as_ref() {
-        use std::fmt::Write;
-        let _ = write!(s, "{byte:02x}");
-    }
-    Some(s)
 }
 
 /// Apply a policy to a running session: compile, distribute, persist, and
