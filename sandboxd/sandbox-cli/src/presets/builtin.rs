@@ -11,13 +11,12 @@
 //!
 //! # Relationship to the spec
 //!
-//! The 11 entries mirror Part 2 of the spec at
+//! The 10 entries mirror Part 2 of the spec at
 //! `.tasks/specs/2026-04-21-port-explicit-policies-presets-observability-design.md`
 //! lines 428-568. The plain `github` preset unifies the two rows in
 //! the spec's table (interactive hosts + asset CDN) under a single
-//! preset name; `github-interactive` narrows that to the interactive
-//! subset only for operators who want the plain `github` preset's
-//! interactive posture without the asset-CDN surface.
+//! preset name; operators who need narrower scope than `github:`
+//! use `github-repo` / `github-pr` instead.
 //!
 //! # Determinism
 //!
@@ -117,11 +116,6 @@ pub const BUILTINS: &[BuiltinPreset] = &[
         name: "github-pr",
         description: "Allow GitHub access scoped to specific pull requests (params: repo=owner/name, pr=N).",
         expand: expand_github_pr,
-    },
-    BuiltinPreset {
-        name: "github-interactive",
-        description: "Allow only the interactive GitHub surfaces (github.com, api.github.com) with ANY /**.",
-        expand: expand_github_interactive,
     },
 ];
 
@@ -256,16 +250,6 @@ fn expand_github(_inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetError
         rules.push(http_rule(host, method::get_head()));
     }
     Ok(rules)
-}
-
-/// Interactive subset only: `github.com` + `api.github.com` with
-/// `ANY /**`. Useful as a narrow alternative to the plain `github`
-/// preset when the operator does not want the asset CDN surface.
-fn expand_github_interactive(_inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetError> {
-    Ok(GITHUB_INTERACTIVE_HOSTS
-        .iter()
-        .map(|host| http_rule(host, method::any_all_paths()))
-        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -708,8 +692,8 @@ mod tests {
     // ----- unparameterized presets -----------------------------------
 
     #[test]
-    fn builtins_has_eleven_entries() {
-        assert_eq!(BUILTINS.len(), 11);
+    fn builtins_has_ten_entries() {
+        assert_eq!(BUILTINS.len(), 10);
     }
 
     #[test]
@@ -908,30 +892,6 @@ mod tests {
             }
         }
 
-        assert_rules_round_trip(rules);
-    }
-
-    #[test]
-    fn expand_github_interactive_only_contains_interactive_hosts() {
-        // The narrow variant: interactive hosts only.
-        let rules = expand_builtin("github-interactive", "github-interactive:");
-        assert_eq!(rules.len(), 2);
-        let hosts: Vec<String> = rules
-            .iter()
-            .map(|r| match &r.host {
-                Destination::Domain(d) => d.clone(),
-                other => panic!("expected Domain, got {other:?}"),
-            })
-            .collect();
-        assert_eq!(hosts, vec!["github.com", "api.github.com"]);
-        for rule in &rules {
-            match &rule.level {
-                AssuranceLevel::Http { http_filters } => {
-                    assert_eq!(*http_filters, method::any_all_paths());
-                }
-                other => panic!("expected Http level, got {other:?}"),
-            }
-        }
         assert_rules_round_trip(rules);
     }
 

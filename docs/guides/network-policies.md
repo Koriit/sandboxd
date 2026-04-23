@@ -258,7 +258,7 @@ Preset expansion happens entirely client-side — the daemon receives the fully-
 
 ### Built-in catalog
 
-Eleven built-ins ship with every CLI release. Run `sandbox policy preset list` to see them, and `sandbox policy preset show <name>` for per-preset metadata.
+Ten built-ins ship with every CLI release. Run `sandbox policy preset list` to see them, and `sandbox policy preset show <name>` for per-preset metadata.
 
 Unparameterized ecosystem presets:
 
@@ -279,7 +279,6 @@ GitHub family:
 | Preset | Purpose |
 |---|---|
 | `github:` | Broad GitHub access: `github.com` and `api.github.com` with `ANY /**`, plus read-only access to the asset CDN hosts (`codeload.github.com`, `raw.githubusercontent.com`, `objects.githubusercontent.com`, `release-assets.githubusercontent.com`). |
-| `github-interactive:` | The narrow interactive subset: `github.com` and `api.github.com` with `ANY /**`, no asset CDN. |
 | `github-repo:repo=OWNER/REPO` | One-repo scope. Required repeatable `repo=owner/name` param — each value contributes its path filters. Covers git-pack URLs, the repo's REST API subtree, archive downloads, and raw-content reads. |
 | `github-pr:repo=OWNER/REPO,pr=N` | One-PR scope. Paired repeatable `repo=` / `pr=` params — both required, counts must match. Grants access to a single PR's metadata, comments, and files, nothing more (no git clone/fetch/push, no archive download). |
 

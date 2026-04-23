@@ -819,7 +819,6 @@ sandbox policy preset list
 cargo	built-in
 dockerhub	built-in
 github	built-in
-github-interactive	built-in
 github-pr	built-in
 github-repo	built-in
 goproxy	built-in

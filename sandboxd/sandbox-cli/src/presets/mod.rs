@@ -600,13 +600,13 @@ mod tests {
     }
 
     #[test]
-    fn list_includes_all_eleven_builtins_sorted() {
+    fn list_includes_all_ten_builtins_sorted() {
         let xdg = empty_xdg_override();
         let catalog = Catalog::load(Some(xdg.path())).expect("empty dir loads clean");
         let summaries = catalog.list();
-        // Phase 2 still ships only 11 built-ins (no user presets in
-        // the empty override dir).
-        assert_eq!(summaries.len(), 11);
+        // Phase 2 ships 10 built-ins (no user presets in the empty
+        // override dir).
+        assert_eq!(summaries.len(), 10);
         // Alphabetical sort.
         let names: Vec<&str> = summaries.iter().map(|s| s.name.as_str()).collect();
         let mut sorted = names.clone();
@@ -697,7 +697,7 @@ mod tests {
         let catalog = Catalog::load(Some(xdg.path())).expect("load succeeds");
 
         let summaries = catalog.list();
-        assert_eq!(summaries.len(), 12, "11 built-ins + 1 user preset");
+        assert_eq!(summaries.len(), 11, "10 built-ins + 1 user preset");
         let user_summary = summaries
             .iter()
             .find(|s| s.name == "my-internal")
