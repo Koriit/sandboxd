@@ -70,12 +70,12 @@ pub type EventSubscription = (Vec<Arc<Event>>, broadcast::Receiver<Arc<Event>>);
 
 /// Default per-session ring buffer capacity.
 ///
-/// 10 000 events was picked to cover ~10 minutes of high-volume traffic
-/// (a session pushing ~15 events/s) without tuning; operators with denser
-/// traffic can override via [`EventBusConfig`]. Chosen high enough that a
-/// cold SSE consumer reconnecting after a short network blip will still
-/// see its full history without hitting the cap in practice. TODO:
-/// M10-S6 will revisit this default with measurement-driven tuning.
+/// Default of 10 000 is a spec-justified starting point — see
+/// `docs/internal/measurement-defaults-m10-s6.md` for the rationale
+/// and revision policy. In short: it covers ~10 minutes of sustained
+/// ~15 events/s traffic so a reconnecting SSE consumer sees a useful
+/// replay, and operators with denser traffic can override via
+/// [`EventBusConfig`].
 pub const DEFAULT_RING_BUFFER_SIZE: usize = 10_000;
 
 /// Default broadcast channel capacity.

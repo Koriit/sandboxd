@@ -72,9 +72,19 @@ struct Args {
     /// Only meaningful when `--events-persist` is set.  Files whose
     /// filename-embedded `YYYY-MM-DD` is strictly older than
     /// `today - retention_days` are removed by an hourly pruner.
-    /// Default of 14 days matches the M10-S4 Phase 0 Q10 decision;
-    /// TODO(M10-S6): replace with measurement-driven tuning.
-    #[arg(long, default_value_t = 14)]
+    ///
+    /// Default of 14 days matches the 2026-04-21 spec Part 3 /
+    /// "Retention" suggested value and covers roughly two sprint
+    /// cycles of traffic for post-incident review. Overridable via
+    /// `SANDBOX_EVENTS_PERSIST_RETENTION_DAYS` (clap env-var fallback).
+    /// Final defaults are measurement-driven — see
+    /// `docs/internal/measurement-defaults-m10-s6.md` for the
+    /// rationale and revision policy.
+    #[arg(
+        long,
+        env = "SANDBOX_EVENTS_PERSIST_RETENTION_DAYS",
+        default_value_t = 14
+    )]
     events_persist_retention_days: u32,
 }
 
