@@ -15,8 +15,8 @@ use sandbox_core::events::lifecycle as lifecycle_events;
 use sandbox_core::events::session_events_host_dir;
 use sandbox_core::gateway::container_name as gateway_container_name;
 use sandbox_core::{
-    AssuranceLevel, BaseImageStatus, CaManager, CoreDnsConfig, CreateSessionRequest,
-    Destination, DnsCache, DockerHealth, EventBus, EventBusConfig, ExecRequest, ExecResponse,
+    AssuranceLevel, BaseImageStatus, CaManager, CoreDnsConfig, CreateSessionRequest, Destination,
+    DnsCache, DockerHealth, EventBus, EventBusConfig, ExecRequest, ExecResponse,
     FileDownloadRequest, FileDownloadResponse, FileUploadRequest, GatewayHealth, GatewayManager,
     GatewayShutdownReason, GatewayStatus, GuestConnector, GuestRequest, GuestResponse,
     HealthComponent, LimaManager, NetworkHealth, NetworkManager, PersistConfig, PersistentSink,
