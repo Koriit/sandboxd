@@ -434,7 +434,7 @@ parameters.
 |---|---|---|---|
 | `npm` | `registry.npmjs.org` | `http` | `GET /**`, `HEAD /**` |
 | `pypi` | `pypi.org`, `files.pythonhosted.org` | `http` | `GET /**`, `HEAD /**` |
-| `cargo` | `crates.io`, `static.crates.io` *(pending empirical verification — see known gaps)*, `index.crates.io` | `http` | `GET /**`, `HEAD /**` |
+| `cargo` | `crates.io`, `static.crates.io`, `index.crates.io` *(verified against documented endpoints, Rust 1.70+ sparse index; see known gaps for fixture + drift-detection test)* | `http` | `GET /**`, `HEAD /**` |
 | `goproxy` | `proxy.golang.org`, `sum.golang.org` | `http` | `GET /**`, `HEAD /**` |
 | `maven` | `repo1.maven.org`, `repo.maven.apache.org` | `http` | `GET /**`, `HEAD /**` |
 | `gradle` | `plugins.gradle.org`, `services.gradle.org`, `downloads.gradle.org` | `http` | `GET /**`, `HEAD /**` |
@@ -1082,14 +1082,20 @@ crash/disconnect are explicit and documented.
   presets. The authoritative list lives in the CLI source; this spec
   describes their shape and intent, not the exact path globs. A later
   implementation work item will enumerate them with test coverage.
-- **`cargo` preset: `static.crates.io` is pending empirical
-  verification.** `index.crates.io` is the sparse index (Rust 1.70+),
-  `crates.io` is the API and `cargo publish`/`search`. `static.crates.io`
-  per recent docs serves primarily RSS; tarball downloads flow via a
-  `crates.io` API path that 302-redirects to a signed CDN URL — the
-  final CDN host may not be on the current preset's list. A live
-  `cargo fetch` trace against an empty cache confirms or corrects the
-  host list before shipping.
+- **`cargo` preset: host set verified against documented endpoints
+  for Rust 1.70+.** The frozen fixture at
+  `sandboxd/sandbox-cli/tests/fixtures/cargo_fetch_trace.json` and the
+  `cargo_preset_matches_frozen_trace` drift-detection test in
+  `presets::builtin` lock the set to the three documented hosts:
+  `index.crates.io` (sparse index, default since Rust 1.70),
+  `crates.io` (registry API + the `/api/v1/crates/.../download`
+  redirector), and `static.crates.io` (CDN that serves the 302'd
+  tarballs). The fixture was built from cargo's published network
+  documentation rather than a live pcap because booting a guest with
+  full outbound network access for a single trace exceeded the M10-S5
+  budget; a future milestone with cheaper guest-network capture should
+  regenerate the fixture from an actual `cargo fetch` trace to catch
+  any undocumented endpoints (e.g. telemetry).
 - **Git LFS is not covered by `github-repo` / `github-pr`.** Repos with
   LFS content require additional rules for `lfs.github.com` (or
   `github-cloud.githubusercontent.com`) and the `/info/lfs/**` paths on

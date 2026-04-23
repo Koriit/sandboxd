@@ -185,10 +185,19 @@ fn expand_pypi(_inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetError> 
 }
 
 fn expand_cargo(_inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetError> {
-    // TODO(M10-S5 Phase 5a): empirical verification per D-9. The spec
-    // (line 437) marks `static.crates.io` as "pending empirical
-    // verification"; Phase 5a will either confirm or trim this list
-    // against a live `cargo fetch` trace and commit a fixture.
+    // Host set frozen against the documented cargo network endpoints
+    // for Rust 1.70+ (sparse-index default). See
+    // `tests/fixtures/cargo_fetch_trace.json` for the verified set and
+    // the `cargo_preset_matches_frozen_trace` drift-detection test
+    // below. When a future guest-network milestone makes live pcap
+    // capture cheap, the fixture should be regenerated from a real
+    // `cargo fetch` trace against an empty cache.
+    //
+    // Endpoint roles (per the fixture):
+    // - `index.crates.io`  — sparse registry index.
+    // - `crates.io`        — registry web API + download redirector.
+    // - `static.crates.io` — CDN host that serves crate tarballs
+    //                        (302 target of the download redirector).
     Ok(consume_rules(&[
         "crates.io",
         "index.crates.io",
@@ -738,6 +747,74 @@ mod tests {
             &["crates.io", "index.crates.io", "static.crates.io"],
         );
         assert_rules_round_trip(rules);
+    }
+
+    /// Drift detection: the `cargo` built-in's host list must match the
+    /// frozen `tests/fixtures/cargo_fetch_trace.json` fixture line for
+    /// line. The fixture is the verified network surface of `cargo
+    /// fetch` / `cargo build` against an empty cache on Rust 1.70+
+    /// (sparse-index default).
+    ///
+    /// If you are intentionally changing the host set, update the
+    /// fixture in the same commit — the test asserts equality in both
+    /// directions to catch adds and removes. Document the rationale in
+    /// the fixture's leading `_comment` block and, if the change
+    /// affects spec §"Known gaps", update that section too.
+    #[test]
+    fn cargo_preset_matches_frozen_trace() {
+        // Resolve the fixture path relative to the crate root so the
+        // test works from both `cargo test` and `cargo nextest run`
+        // (nextest does not cd into the test's runtime dir).
+        let fixture_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/cargo_fetch_trace.json");
+        let raw = std::fs::read_to_string(&fixture_path).unwrap_or_else(|e| {
+            panic!(
+                "failed to read cargo trace fixture at {}: {e}",
+                fixture_path.display()
+            )
+        });
+        let doc: serde_json::Value =
+            serde_json::from_str(&raw).unwrap_or_else(|e| panic!("fixture is not valid JSON: {e}"));
+
+        // Extract the `hosts[].host` list from the fixture.
+        let fixture_hosts: Vec<String> = doc["hosts"]
+            .as_array()
+            .expect("`hosts` must be a JSON array")
+            .iter()
+            .map(|row| {
+                row["host"]
+                    .as_str()
+                    .expect("`hosts[].host` must be a string")
+                    .to_string()
+            })
+            .collect();
+
+        // Build the preset's host list by expanding and collecting the
+        // unique host strings from the emitted rules.
+        let rules = expand_builtin("cargo", "cargo:");
+        let mut preset_hosts: Vec<String> = rules
+            .iter()
+            .map(|r| match &r.host {
+                Destination::Domain(d) => d.clone(),
+                other => panic!("expected Destination::Domain, got {other:?}"),
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        preset_hosts.sort();
+
+        let mut expected = fixture_hosts.clone();
+        expected.sort();
+
+        assert_eq!(
+            preset_hosts, expected,
+            "`cargo` preset host list drifted from frozen fixture.\n\
+             fixture hosts:\n  {expected:?}\n\
+             preset hosts:\n  {preset_hosts:?}\n\
+             If this change is intentional, update \
+             `tests/fixtures/cargo_fetch_trace.json` in the same commit \
+             and document the rationale."
+        );
     }
 
     #[test]
