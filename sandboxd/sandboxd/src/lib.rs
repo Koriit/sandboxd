@@ -1,23 +1,32 @@
 //! Library surface for the sandbox daemon.
 //!
-//! Today the only item that escapes the binary is the HTTP endpoint for
-//! the event access surface — `GET /sessions/{id}/events`, landed in
-//! M10-S4 Phase 2.  Integration tests under `sandboxd/sandboxd/tests/`
-//! drive it through tower's `ServiceExt::oneshot`, which requires the
-//! handler + minimal state to live in a library target rather than the
-//! binary.
+//! Items that escape the binary:
+//!
+//! * [`events_http`] — `GET /sessions/{id}/events` (M10-S4 Phase 2/3).
+//! * [`policy_http`] — `GET /sessions/{id}/policy/propagation-status`
+//!   (M10-S6 todo #37). The read-only status endpoint that the
+//!   `sandbox policy status [--wait]` CLI and the E2E suite poll to
+//!   decide when a just-applied policy has reached steady state.
+//! * [`propagation`] — the per-session propagation-state registry that
+//!   both sub-routers and the main binary's apply/clear paths mutate
+//!   and read.
+//!
+//! Integration tests under `sandboxd/sandboxd/tests/` drive each sub-
+//! router through tower's `ServiceExt::oneshot`, which requires the
+//! handlers + minimal state to live in a library target rather than
+//! the binary.
 //!
 //! The production daemon binary (`src/main.rs`) builds its full
-//! `AppState` independently and merges [`events_http::events_router`]
-//! into the top-level router.
-//! The sub-state owned by the events router (see
-//! [`events_http::EventsApiState`]) is a thin handle over shared
-//! [`sandbox_core::SessionStore`] + [`sandbox_core::EventBus`]
-//! references, so the daemon does not pay a double-allocation cost.
+//! `AppState` independently and merges every sub-router listed above
+//! into the top-level router. Each sub-state is a thin handle over
+//! shared [`sandbox_core::SessionStore`] + [`sandbox_core::EventBus`] +
+//! [`propagation::PropagationStates`] references, so the daemon does
+//! not pay a double-allocation cost.
 //!
 //! No other main-binary internals are re-exported here — keep this
 //! surface as narrow as possible.
 
 pub mod error;
 pub mod events_http;
+pub mod policy_http;
 pub mod propagation;

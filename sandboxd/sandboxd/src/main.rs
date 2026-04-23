@@ -286,6 +286,16 @@ fn app(state: Arc<AppState>) -> Router {
     ));
     let events_router = sandboxd::events_http::events_router(events_state);
 
+    // M10-S6 todo #37: build the policy status sub-router with its own
+    // minimal state (shared `SessionStore` + shared `PropagationStates`).
+    // Same merging rationale as `events_router` above — the read-only
+    // endpoint does not need the full `AppState` surface.
+    let policy_state = Arc::new(sandboxd::policy_http::PolicyApiState::new(
+        Arc::clone(&state.store),
+        Arc::clone(&state.propagation_states),
+    ));
+    let policy_router = sandboxd::policy_http::policy_router(policy_state);
+
     Router::new()
         .route("/sessions", post(create_session))
         .route("/sessions", get(list_sessions))
@@ -306,6 +316,7 @@ fn app(state: Arc<AppState>) -> Router {
         .route("/health", get(health_check))
         .with_state(state)
         .merge(events_router)
+        .merge(policy_router)
 }
 
 async fn create_session(
