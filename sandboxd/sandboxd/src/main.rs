@@ -247,6 +247,17 @@ struct AppState {
     /// gateway teardown. Keyed by session ID so a gateway bounce can
     /// abort-and-respawn without leaking the previous ingestor.
     ingestors: Mutex<HashMap<SessionId, SessionIngestor>>,
+    /// Per-session policy-propagation tracker (M10-S6 todo #37).
+    ///
+    /// Records, for each session, the hash of the most recently
+    /// applied policy and the hash of the most recently fully
+    /// reconciled one. Mutated by the apply path
+    /// ([`PropagationStates::mark_applied`]) and the DNS propagation
+    /// loop ([`PropagationStates::mark_propagated`]); read by the
+    /// `GET /sessions/{id}/policy/propagation-status` endpoint so the
+    /// CLI and E2E suite can wait deterministically for propagation
+    /// rather than sleeping on wall-clock time.
+    propagation_states: Arc<PropagationStates>,
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +268,7 @@ struct AppState {
 // sub-router via `sandboxd::error::error_response` — see that module for
 // the full mapping table and logging contract.
 use sandboxd::error::error_response;
+use sandboxd::propagation::{PropagatedEdge, PropagationStates};
 
 // ---------------------------------------------------------------------------
 // Handlers
@@ -1439,6 +1451,9 @@ async fn remove_session(
         .lock()
         .await
         .remove(&session.id);
+    // Drop propagation-tracker state for this session so the map
+    // doesn't grow without bound as sessions churn (M10-S6).
+    state.propagation_states.remove(&session.id).await;
 
     // Delete the session from the store.
     if let Err(e) = state.store.delete_session(&session.id) {
@@ -1765,6 +1780,33 @@ async fn clear_session_policy(
     let compiled = PolicyCompiler::compile(&empty_policy, &network_info)?;
     PolicyDistributor::distribute(session_id, &compiled, &state.gateway)?;
 
+    // Propagation tracking for the empty-policy case.
+    //
+    // An empty policy has no `Destination::Domain` rules, so there is
+    // nothing for the DNS loop to reconcile — and the loop is
+    // cancelled below. The apply → propagated edge must still be
+    // observable to waiters (CLI `--wait`, E2E), so mark the applied
+    // hash and immediately mark it propagated from this synchronous
+    // path, then emit `policy_propagated` on the `Fresh` edge. If
+    // hashing fails (bug-class: serde cannot serialise the empty
+    // policy), fall through — the distributor has already succeeded,
+    // so the clear itself remains correct.
+    if let Some(hash) = hash_policy(&empty_policy) {
+        state
+            .propagation_states
+            .mark_applied(*session_id, hash.clone())
+            .await;
+        let edge = state
+            .propagation_states
+            .mark_propagated(*session_id, &hash)
+            .await;
+        if matches!(edge, PropagatedEdge::Fresh) {
+            state
+                .event_bus
+                .publish(lifecycle_events::policy_propagated(*session_id, hash));
+        }
+    }
+
     // Persist the clear.  Idempotent: safe to call when no row exists.
     state.store.delete_policy(session_id)?;
 
@@ -1898,6 +1940,35 @@ async fn apply_policy_inner(
     // Distribute to gateway components.
     PolicyDistributor::distribute(session_id, &compiled, &state.gateway)?;
 
+    // Record the applied hash for the propagation tracker (M10-S6).
+    // Done immediately after the distributor succeeds so the DNS loop's
+    // very next reconciliation cycle — or the synchronous empty-policy
+    // edge below — observes the current target and can flip the
+    // propagated bit. A hash change here clears `propagated_hash` so
+    // waiters see the transient `propagated=false` window a new apply
+    // induces. Mark-then-emit: any pre-existing event stream observer
+    // must see the `policy_applied` / `policy_updated` event (emitted
+    // by the outer `apply_policy` wrapper on return) before any
+    // subsequent `policy_propagated` event, which the DNS loop cannot
+    // publish until at least one cycle has run after the mark. If
+    // `hash_policy` fails (serde cannot serialise the policy — a
+    // bug-class event), fall through without tracking: the distributor
+    // already succeeded, so the wrong thing to do is fail the apply;
+    // the propagation surface stays at "unknown" for this session
+    // until the next apply.
+    if let Some(hash) = hash_policy(policy) {
+        state
+            .propagation_states
+            .mark_applied(*session_id, hash)
+            .await;
+    } else {
+        warn!(
+            session_id = %session_id,
+            "failed to hash policy for propagation tracking; \
+             propagation-status endpoint will report unknown until next apply"
+        );
+    }
+
     // Persist the policy to SQLite before touching the in-memory map.
     // Matches the pattern used elsewhere for `store.*` calls from async
     // handlers: the SQLite Mutex is held only for the duration of the
@@ -1939,6 +2010,8 @@ async fn start_dns_propagation_loop(session_id: &SessionId, state: &AppState) {
 
     let sid = *session_id;
     let gateway = Arc::clone(&state.gateway);
+    let propagation_states = Arc::clone(&state.propagation_states);
+    let event_bus = state.event_bus.clone();
 
     let network_info = match state.store.get_network_info(session_id) {
         Ok(Some(info)) => info,
@@ -1962,7 +2035,15 @@ async fn start_dns_propagation_loop(session_id: &SessionId, state: &AppState) {
     let session_policies = Arc::clone(&state.session_policies);
 
     let handle = tokio::spawn(async move {
-        dns_propagation_loop(sid, gateway, network_info, session_policies).await;
+        dns_propagation_loop(
+            sid,
+            gateway,
+            network_info,
+            session_policies,
+            propagation_states,
+            event_bus,
+        )
+        .await;
     });
 
     let mut handles = state.dns_loop_handles.lock().await;
@@ -1989,11 +2070,30 @@ async fn cancel_dns_propagation_loop(session_id: &SessionId, state: &AppState) {
 ///
 /// Periodically reads resolved.json from the gateway container, updates
 /// the DNS cache, and propagates IP changes to nftables.
+///
+/// # Propagation tracking (M10-S6)
+///
+/// On each cycle the loop also reconciles the session's
+/// [`PropagationState`]: once every `Destination::Domain` rule in the
+/// current effective policy has a cache entry — meaning CoreDNS has
+/// reported an IP for every domain the policy permits — the loop
+/// marks the policy propagated and emits a single
+/// `policy_propagated` lifecycle event (transition-only; see
+/// [`PropagationStates::mark_propagated`]). Subsequent stable cycles
+/// do not re-emit.
+///
+/// An empty policy (no domain rules) is handled synchronously from
+/// the apply path, not here (the loop is cancelled in that case). A
+/// policy with only CIDR rules has no domains to resolve and so the
+/// "all domains resolved" check passes on the first successful
+/// propagate.
 async fn dns_propagation_loop(
     session_id: SessionId,
     gateway: Arc<GatewayManager>,
     network_info: sandbox_core::NetworkInfo,
     session_policies: Arc<Mutex<HashMap<SessionId, Policy>>>,
+    propagation_states: Arc<PropagationStates>,
+    event_bus: EventBus,
 ) {
     let poll_interval = Duration::from_secs(2);
     let mut cache = DnsCache::new();
@@ -2047,10 +2147,11 @@ async fn dns_propagation_loop(
         // Update the cache and check for changes.
         let changes = cache.update(&report);
 
-        if changes.is_empty() && !cache.has_expired_entries() {
-            tokio::time::sleep(poll_interval).await;
-            continue;
-        }
+        // Short-circuit when the cache is stable. We still run the
+        // propagation-tracker check (below) so a policy with only CIDR
+        // rules, or a re-apply that didn't actually change DNS state,
+        // can still flip `propagated_hash` on the first steady cycle.
+        let stable_cache = changes.is_empty() && !cache.has_expired_entries();
 
         if !changes.is_empty() {
             for change in &changes {
@@ -2074,37 +2175,86 @@ async fn dns_propagation_loop(
             );
         }
 
-        // Propagate the current cache state to nftables.
-        let gw = Arc::clone(&gateway);
-        let pol = policy.clone();
-        let c = cache.clone();
-        let ni = network_info.clone();
-        let sid = session_id;
-        let propagate_result =
-            tokio::task::spawn_blocking(move || propagate_dns_changes(&sid, &pol, &c, &gw, &ni))
-                .await;
-        match propagate_result {
-            Ok(Err(e)) => {
-                warn!(
-                    session_id = %session_id,
-                    error = %e,
-                    "DNS propagation: failed to update nftables"
-                );
+        // Propagate the current cache state to nftables + Envoy when
+        // there's work to do. When the cache is stable we skip the
+        // distributor call (nothing to rewrite) but still proceed to
+        // the reconciliation check below.
+        let propagate_ok = if stable_cache {
+            true
+        } else {
+            let gw = Arc::clone(&gateway);
+            let pol = policy.clone();
+            let c = cache.clone();
+            let ni = network_info.clone();
+            let sid = session_id;
+            let propagate_result = tokio::task::spawn_blocking(move || {
+                propagate_dns_changes(&sid, &pol, &c, &gw, &ni)
+            })
+            .await;
+            match propagate_result {
+                Ok(Err(e)) => {
+                    warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "DNS propagation: failed to update nftables"
+                    );
+                    false
+                }
+                Err(e) => {
+                    warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "DNS propagation: spawn_blocking join error updating nftables"
+                    );
+                    false
+                }
+                Ok(Ok(())) => true,
             }
-            Err(e) => {
-                warn!(
-                    session_id = %session_id,
-                    error = %e,
-                    "DNS propagation: spawn_blocking join error updating nftables"
-                );
+        };
+
+        // Reconciliation check. `policy_propagated` fires only on the
+        // transition to steady state: all non-Deny Destination::Domain
+        // rules have a cache entry (so the nftables allow sets are
+        // populated for every allow-able domain), and the distributor
+        // call above (if any) succeeded. Policies with zero domain
+        // rules trivially satisfy "all resolved" and so the edge fires
+        // on the first successful cycle.
+        if propagate_ok && all_domain_rules_resolved(&policy, &cache) {
+            if let Some(hash) = sandbox_core::hash_policy(&policy) {
+                let edge = propagation_states.mark_propagated(session_id, &hash).await;
+                if matches!(edge, PropagatedEdge::Fresh) {
+                    info!(
+                        session_id = %session_id,
+                        hash = %hash,
+                        "policy fully propagated across enforcement layers"
+                    );
+                    event_bus.publish(lifecycle_events::policy_propagated(session_id, hash));
+                }
             }
-            Ok(Ok(())) => {}
         }
 
         // Sleep at the end so the first iteration runs immediately after
         // policy application, resolving domain IPs as fast as possible.
         tokio::time::sleep(poll_interval).await;
     }
+}
+
+/// Return `true` iff every non-`Deny` `Destination::Domain` rule in
+/// `policy` has a cache entry in `cache`.
+///
+/// A `Deny` rule contributes no nftables allow entries regardless of
+/// resolution state, so it's excluded from the readiness check.
+/// Policies with only `Destination::Cidr` rules (or no rules) return
+/// `true` trivially — there are no domains to resolve.
+fn all_domain_rules_resolved(policy: &Policy, cache: &DnsCache) -> bool {
+    policy
+        .rules
+        .iter()
+        .filter(|r| !matches!(r.level, AssuranceLevel::Deny))
+        .all(|r| match &r.host {
+            Destination::Cidr(_) => true,
+            Destination::Domain(d) => cache.entries().contains_key(d.as_str()),
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -3748,6 +3898,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vm_ip_map,
         component_health_state: Mutex::new(HashMap::new()),
         ingestors: Mutex::new(HashMap::new()),
+        propagation_states: Arc::new(PropagationStates::new()),
     });
 
     // Replay one `policy_reset_on_upgrade` lifecycle event per

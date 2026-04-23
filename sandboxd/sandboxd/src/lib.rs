@@ -20,3 +20,4 @@
 
 pub mod error;
 pub mod events_http;
+pub mod propagation;
