@@ -27,12 +27,15 @@
 //! - Each [`BuiltinPreset`] carries an `expand` function pointer so
 //!   that each built-in can implement its own expansion logic (trivial
 //!   for `npm` / `pypi` / …, non-trivial for `github-repo` /
-//!   `github-pr`). Phase 1 wires every expander to return
-//!   [`PresetError::NotImplemented`]; real bodies land in Phase 3.
-//! - The [`PresetError`] hierarchy is exhaustive; Phases 3–6 attach to
-//!   existing variants rather than growing the enum. Every variant has
-//!   a `Display` impl that matches the wording called out in the spec
-//!   and Phase 0 decisions.
+//!   `github-pr`). Phase 1 wired every expander to return
+//!   [`PresetError::NotImplemented`]; Phase 3 replaces the stubs with
+//!   real bodies and introduces the parameter-validation variants
+//!   ([`PresetError::MissingRequiredParam`],
+//!   [`PresetError::UnknownParamRef`], …) shared by built-ins and the
+//!   user-preset expander.
+//! - The [`PresetError`] hierarchy grows as phases need new failure
+//!   shapes. Every variant has a `Display` impl that matches the
+//!   wording called out in the spec and the Phase 0 decisions.
 
 // Phase 1 of M10-S5 ships the type and parser surface but no call
 // sites inside the binary (the `--preset` flag and the `sandbox policy
@@ -48,11 +51,14 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 pub mod builtin;
+pub mod expand;
+pub mod method;
 pub mod param;
 pub mod user;
 
 // Re-export the public surface callers are expected to use in Phase 5.
 pub use builtin::{BUILTINS, BuiltinPreset};
+pub use expand::expand;
 pub use param::ParsedInvocation;
 pub use user::{
     ParamType, RawHttpFilter, RawHttpMethod, RawLevel, RawProtocol, RawRuleTemplate, UserParamSpec,
@@ -340,6 +346,16 @@ pub enum PresetError {
     /// `github-pr`) because the CLI needs hand-written pairing logic
     /// that a JSON template cannot express.
     TooManyRepeatableParams { path: PathBuf, count: usize },
+
+    /// An invocation omitted a parameter declared `required: true`.
+    /// Raised by the user-preset expander and by parameterized
+    /// built-ins (`github-repo`, `github-pr`) in Phase 3b.
+    MissingRequiredParam { preset: String, param: String },
+
+    /// A user preset's rule template references a `${param}` name
+    /// that is not in the preset's declared `params` list, or an
+    /// invocation carried an unknown param key.
+    UnknownParamRef { preset: String, ref_name: String },
 }
 
 impl fmt::Display for PresetError {
@@ -396,6 +412,13 @@ impl fmt::Display for PresetError {
                  at most one is allowed (the built-in 'github-pr' is the only \
                  multi-repeatable shape supported, and it lives in CLI code)",
                 path.display()
+            ),
+            PresetError::MissingRequiredParam { preset, param } => {
+                write!(f, "preset '{preset}': missing required param '{param}'")
+            }
+            PresetError::UnknownParamRef { preset, ref_name } => write!(
+                f,
+                "preset '{preset}': rule template references unknown param '${{{ref_name}}}'"
             ),
         }
     }
