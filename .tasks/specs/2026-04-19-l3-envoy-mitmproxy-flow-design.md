@@ -187,7 +187,11 @@ change during a session's lifetime.
 - `Destination::Cidr` at L3: filter chain matched by `prefix_ranges`
   on the CIDR, routing to `cluster: mitmproxy`.
 - Wildcard `*` L3 destination: default filter chain (no match),
-  routing to `cluster: mitmproxy`.
+  routing to `cluster: mitmproxy`. *(Superseded — bare-`*` host is
+  rejected under the v2 schema (M10-S1); the `default_filter_chain`
+  code path below is therefore unreachable in practice. See the
+  2026-04-21 spec for the v2 schema and the `*.<suffix>` wildcard
+  rules that replaced it.)*
 - **YAML indent sharp edge** (discovered during M9-S19): the emitted
   `default_filter_chain:` key must sit at the same indent as
   `filter_chains:` — both are direct fields of the Listener resource
@@ -199,8 +203,16 @@ change during a session's lifetime.
   while admin stats still looked healthy. The compiler regression test
   `compile_l3_wildcard_emits_default_filter_chain` in
   `sandboxd/sandbox-core/src/policy.rs` guards the exact indent.
-- **No port predicate** on any L3 chain. L3 applies to all traffic to
-  the destination.
+  *(Context: retained as defensive guidance — the `default_filter_chain`
+  emitter path is no longer exercised by v2 policies, but the indent
+  rule still applies if the emitter is reintroduced for a future
+  catch-all use case.)*
+- **Destination port predicate** on every L3 chain. L3 filter chains
+  match on destination identity (prefix_ranges from resolved IPs or
+  CIDR) and destination port derived from the rule. *(Amendment to
+  the original "No port predicate" decision — see
+  `.tasks/specs/2026-04-21-port-explicit-policies-presets-observability-design.md`
+  § "Amendments to the L3 spec and its landed implementation" item 1.)*
 - In each L3 chain the `tcp_proxy` filter sets
   `tunneling_config.hostname = "%DOWNSTREAM_LOCAL_ADDRESS%"` so the
   CONNECT authority Envoy sends upstream is the downstream original
@@ -264,9 +276,17 @@ after SNI validation for L2, opaque TCP for L1) stay as they are.
 **Kept unchanged:**
 
 - `sandbox_dnat` (DNS → CoreDNS, all other TCP → Envoy:10000,
-  cloud-metadata block, IPv6 drop, MASQUERADE).
-- `sandbox_policy` (DNS-derived IP allow rules for Envoy's outbound
-  connections to L1/L2 destinations).
+  cloud-metadata block, IPv6 drop, MASQUERADE). *(Amendment: VM-egress
+  filtering now happens inside this table as conditional DNAT over
+  `policy_allow_{tcp,udp}` concat sets — see
+  `.tasks/specs/2026-04-21-port-explicit-policies-presets-observability-design.md`
+  Part 3 / "Placement in the nftables pipeline".)*
+- Envoy-egress rules in `sandbox_policy` are kept unchanged (DNS-derived
+  IP allow rules for Envoy's outbound connections to L1/L2
+  destinations). *(Amendment: the prior VM-egress reject behavior of
+  this table is removed; those packets now flow through the DNAT path
+  above into the deny-logger. See the 2026-04-21 spec §
+  "Amendments to the L3 spec and its landed implementation" item 2.)*
 - `sandbox` (deny-all forward baseline).
 
 Gateway nftables tables after M9-S19: three (`sandbox`,
