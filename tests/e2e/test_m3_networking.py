@@ -278,25 +278,24 @@ def test_denied_traffic(sandbox_cli):
             f"nftables output:\n{nft_rules}"
         )
 
-        # Verify TCP DNAT rule exists (all non-DNS TCP -> Envoy on port 10000).
-        assert re.search(r"tcp dport != 53 dnat", nft_rules), (
-            f"Missing TCP-to-Envoy DNAT rule in gateway nftables.\n"
-            f"nftables output:\n{nft_rules}"
+        # Verify non-DNS TCP catch-all DNAT to the deny-logger TCP sink
+        # (port 10001). Post-M9-S10 + M10-S3 the ruleset uses an
+        # l4proto catch-all (`meta l4proto 6` = TCP) rather than the
+        # older `tcp dport != 53` shape, landing non-policy-allowed TCP
+        # on the deny-logger for visibility before being rejected.
+        assert re.search(r"meta l4proto 6 dnat", nft_rules), (
+            f"Missing non-DNS TCP catch-all DNAT (meta l4proto 6) in "
+            f"gateway nftables.\nnftables output:\n{nft_rules}"
         )
 
-        # Verify there is NO DNAT rule for non-DNS UDP traffic.
-        # The only UDP DNAT should be for port 53.  A blanket "udp dnat"
-        # without a port restriction would be a misconfiguration.
-        udp_dnat_lines = [
-            line.strip() for line in nft_rules.splitlines()
-            if "udp" in line and "dnat" in line
-        ]
-        for line in udp_dnat_lines:
-            assert "dport 53" in line, (
-                f"Found unexpected non-DNS UDP DNAT rule: {line!r}\n"
-                f"Only DNS (port 53) UDP should be DNATted.\n"
-                f"nftables output:\n{nft_rules}"
-            )
+        # Verify non-DNS UDP catch-all DNAT to the deny-logger UDP sink
+        # (port 10002). Same l4proto shape as TCP — the catch-all exists
+        # specifically so denied UDP is observed by the deny-logger
+        # rather than silently dropped.
+        assert re.search(r"meta l4proto 17 dnat", nft_rules), (
+            f"Missing non-DNS UDP catch-all DNAT (meta l4proto 17) in "
+            f"gateway nftables.\nnftables output:\n{nft_rules}"
+        )
 
         # Verify cloud metadata (169.254.169.254) is blocked in the rules.
         assert "169.254.169.254" in nft_rules and "drop" in nft_rules, (
