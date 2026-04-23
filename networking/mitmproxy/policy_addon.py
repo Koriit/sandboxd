@@ -254,7 +254,11 @@ class PolicyAddon:
         port = int(getattr(flow.request, "port", 0) or 0)
 
         # Health endpoint — always respond, regardless of policy.
-        if path == HEALTH_PATH:
+        # Compare against the stripped path so probes carrying a query
+        # string (e.g. `/__sandbox_health?_=1` used as a cache-buster)
+        # still short-circuit here instead of falling through to the
+        # rule matcher and getting denied.
+        if match_path == HEALTH_PATH:
             flow.response = http.Response.make(
                 200,
                 json.dumps({"status": "ok"}),

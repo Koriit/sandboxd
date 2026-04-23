@@ -879,6 +879,66 @@ class TestQueryStringStrippedBeforeMatching:
         # message names the path-only form the filter compares against.
         assert body["reason"] == "no filter matched GET /blocked"
 
+    def test_health_path_with_query_string_short_circuits(self) -> None:
+        """``/__sandbox_health?foo`` must be handled by the health
+        short-circuit, not fall through to the rule matcher.
+
+        The health check compares against the stripped ``match_path``
+        (same invariant the rule matcher uses) so operators can append
+        a cache-buster (``?_=1``, ``?noop``) to a health probe without
+        its request being denied for missing a policy filter."""
+        addon = _make_addon([
+            {"host": "gateway.internal", "port": 443, "filters": [
+                {"method": "GET", "path": "/allowed"},
+            ]},
+        ])
+        flow = _make_flow(
+            host="gateway.internal",
+            path="/__sandbox_health?_=1",
+        )
+        addon.request(flow)
+        assert flow.response is not None, (
+            "Health short-circuit must set a response regardless of query "
+            "string presence."
+        )
+        assert flow.response.status_code == 200
+        body = json.loads(flow.response.content)
+        assert body == {"status": "ok"}
+
+    def test_passthrough_preserves_query_in_emitted_path(self) -> None:
+        """In pass-through mode (no config loaded) the request is allowed
+        regardless of filter coverage, and the emitted ``path`` field
+        carries the original query string verbatim.
+
+        This pins the documented invariant that operator-visible events
+        always reflect the exact URL the client issued — stripping
+        happens only for *matching*, never for logging. No deny event
+        is ever emitted in pass-through mode."""
+        mock_events = mock.MagicMock()
+        # Pass an unreadable config path so the addon enters passthrough.
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        os.unlink(path)
+        addon = PolicyAddon(config_path=path, events=mock_events)
+        assert addon._passthrough is True
+
+        flow = _make_flow(
+            host="api.com",
+            path="/anywhere?token=secret&retry=3",
+        )
+        addon.request(flow)
+        # Pass-through never synthesises a response.
+        assert flow.response is None
+        # The allow event carries the raw path (with query intact).
+        mock_events.emit_request_allowed.assert_called_once()
+        _, kwargs = mock_events.emit_request_allowed.call_args
+        assert kwargs["path"] == "/anywhere?token=secret&retry=3", (
+            "Pass-through mode must preserve the query string in the "
+            "emitted event path — logs should carry the real URL."
+        )
+        # And no deny event ever fires in pass-through mode.
+        mock_events.emit_request_denied.assert_not_called()
+
 
 class TestMultipleRulesCompose:
     """Multiple rules for the same host compose — any matching filter in any
