@@ -110,7 +110,7 @@ async fn session_without_apply_reports_never_applied() {
     let states = Arc::new(PropagationStates::new());
     let router = build_router(store, states);
 
-    let (status, body) = get_status(router, &sid.to_string()).await;
+    let (status, body) = get_status(router, sid.as_str()).await;
     assert_eq!(status, StatusCode::OK);
     let body = body.expect("200 body");
     assert_eq!(body.expected_hash, None);
@@ -131,7 +131,7 @@ async fn applied_but_not_propagated_reports_expected_only() {
     states.mark_applied(sid, "hash-v1".into()).await;
 
     let router = build_router(store, states);
-    let (status, body) = get_status(router, &sid.to_string()).await;
+    let (status, body) = get_status(router, sid.as_str()).await;
     assert_eq!(status, StatusCode::OK);
     let body = body.expect("200 body");
     assert_eq!(body.expected_hash.as_deref(), Some("hash-v1"));
@@ -179,7 +179,7 @@ async fn second_apply_with_new_hash_flips_propagated_back_to_false() {
     states.mark_applied(sid, "hash-v2".into()).await;
 
     let router = build_router(store, states);
-    let (status, body) = get_status(router, &sid.to_string()).await;
+    let (status, body) = get_status(router, sid.as_str()).await;
     assert_eq!(status, StatusCode::OK);
     let body = body.expect("200 body");
     assert_eq!(body.expected_hash.as_deref(), Some("hash-v2"));
@@ -205,7 +205,7 @@ async fn resolves_by_name_and_by_id() {
     let body_by_name = body_by_name.expect("200 body");
 
     let router = build_router(store, states);
-    let (status_by_id, body_by_id) = get_status(router, &sid.to_string()).await;
+    let (status_by_id, body_by_id) = get_status(router, sid.as_str()).await;
     assert_eq!(status_by_id, StatusCode::OK);
     let body_by_id = body_by_id.expect("200 body");
 

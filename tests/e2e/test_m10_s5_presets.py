@@ -67,11 +67,15 @@ from conftest import (
 # publish.
 EVENT_PROPAGATION_S = 5
 
-# Seconds to wait after a ``sandbox create`` reaches Running before
-# exercising the workload. Gives the 2-second DNS-driven propagation loop
-# at least one cycle to materialise the per-rule Envoy filter chain and
-# the nftables concat-set entry for each preset-allowed host.
-POLICY_PROPAGATION_S = 5
+# Deadline for ``sandbox policy status --wait``: the CLI polls the
+# daemon's propagation-status endpoint until every enforcement layer
+# (nftables, Envoy, mitmproxy/CoreDNS) has reconciled the latest policy
+# and the DNS propagation loop has mirrored every ``Destination::Domain``
+# rule's resolved IPs into the allow sets. 60s is comfortably above the
+# 2s DNS loop cycle plus per-layer distribute latency observed in CI,
+# and the CLI exits 0 the moment the state flips — a fast-apply sees
+# sub-second wait, so the budget is only load-bearing on a slow runner.
+POLICY_PROPAGATION_TIMEOUT = "60s"
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +156,35 @@ def _warm_dns(sandbox_cli, session_name: str, hosts: list[str]) -> None:
         )
 
 
+def _wait_policy_propagated(
+    sandbox_cli,
+    session_name: str,
+    timeout: str = POLICY_PROPAGATION_TIMEOUT,
+) -> None:
+    """Block until the session's latest policy-apply has fully propagated.
+
+    Replaces the M10-S5 pattern of ``time.sleep(POLICY_PROPAGATION_S)``
+    wall-clock waits with a deterministic poll against
+    ``GET /sessions/{id}/policy/propagation-status`` (M10-S6 todo #37).
+    The CLI exits 0 the moment the propagation tracker reports
+    ``propagated=true`` — which in turn requires every enforcement
+    layer to have reconciled the policy *and* the DNS loop to have
+    cached an IP for every ``Destination::Domain`` allow rule. The
+    tests therefore warm DNS for the preset-allowed hosts before
+    calling this helper so the cache condition can be satisfied.
+    """
+    result = sandbox_cli(
+        "policy", "status", session_name,
+        "--wait", "--timeout", timeout,
+        timeout=120,
+    )
+    assert result.returncode == 0, (
+        f"policy status --wait failed for {session_name} "
+        f"(rc={result.returncode}).\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -193,11 +226,12 @@ def test_npm_preset_allows_npm_install(sandbox_cli):
         session_id = parse_session_id(create_result.stdout)
         wait_for_state(sandbox_cli, session_name, "Running", timeout=30)
 
-        # Let the gateway's propagation loop settle before the first request;
-        # then warm DNS so the per-rule Envoy chain + nftables set are populated.
-        time.sleep(POLICY_PROPAGATION_S)
+        # Warm DNS so the gateway's propagation loop can materialise the
+        # per-rule Envoy chain + nftables set, then wait deterministically
+        # for the state to flip to propagated=true before driving
+        # workload traffic.
         _warm_dns(sandbox_cli, session_name, ["registry.npmjs.org"])
-        time.sleep(POLICY_PROPAGATION_S)
+        _wait_policy_propagated(sandbox_cli, session_name)
 
         # Fetch ``leftpad`` metadata — exactly the first request ``npm
         # install leftpad`` issues. The package has been unpublished from
@@ -309,7 +343,12 @@ def test_npm_preset_denies_non_preset_host(sandbox_cli):
         )
         session_id = parse_session_id(create_result.stdout)
         wait_for_state(sandbox_cli, session_name, "Running", timeout=30)
-        time.sleep(POLICY_PROPAGATION_S)
+        # Warm DNS for the preset-allowed host so the propagation
+        # tracker's `all_domain_rules_resolved` check can be satisfied
+        # and --wait returns promptly; the deny assertion below targets
+        # a different host (example.com) and is unaffected by the warmup.
+        _warm_dns(sandbox_cli, session_name, ["registry.npmjs.org"])
+        _wait_policy_propagated(sandbox_cli, session_name)
 
         # Drive traffic to an off-preset host. The `|| true` guarantees
         # the ssh call succeeds: curl itself is expected to fail, we just
@@ -417,12 +456,11 @@ def test_cargo_preset_allows_cargo_fetch(sandbox_cli):
         session_id = parse_session_id(create_result.stdout)
         wait_for_state(sandbox_cli, session_name, "Running", timeout=30)
 
-        time.sleep(POLICY_PROPAGATION_S)
         _warm_dns(
             sandbox_cli, session_name,
             ["index.crates.io", "static.crates.io", "crates.io"],
         )
-        time.sleep(POLICY_PROPAGATION_S)
+        _wait_policy_propagated(sandbox_cli, session_name)
 
         # Sparse-registry metadata lookup for `serde` — this is exactly
         # the first request `cargo fetch` issues after parsing the
@@ -524,7 +562,6 @@ def test_github_repo_preset_scopes_to_one_repo(sandbox_cli):
         session_id = parse_session_id(create_result.stdout)
         wait_for_state(sandbox_cli, session_name, "Running", timeout=30)
 
-        time.sleep(POLICY_PROPAGATION_S)
         # ``github-repo`` expands to six hosts (github.com,
         # codeload.github.com, api.github.com, raw.githubusercontent.com,
         # objects.githubusercontent.com, release-assets.githubusercontent.com).
@@ -548,7 +585,7 @@ def test_github_repo_preset_scopes_to_one_repo(sandbox_cli):
                 "release-assets.githubusercontent.com",
             ],
         )
-        time.sleep(POLICY_PROPAGATION_S)
+        _wait_policy_propagated(sandbox_cli, session_name)
 
         # Happy path: shallow clone of the preset-allowed repo. `--depth 1`
         # keeps bandwidth + time reasonable; the preset covers both
