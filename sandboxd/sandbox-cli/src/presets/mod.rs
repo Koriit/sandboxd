@@ -27,10 +27,8 @@
 //! - Each [`BuiltinPreset`] carries an `expand` function pointer so
 //!   that each built-in can implement its own expansion logic (trivial
 //!   for `npm` / `pypi` / …, non-trivial for `github-repo` /
-//!   `github-pr`). Phase 1 wired every expander to return
-//!   [`PresetError::NotImplemented`]; Phase 3 replaced the stubs with
-//!   the real bodies and introduced the parameter-validation variants
-//!   ([`PresetError::MissingRequiredParam`],
+//!   `github-pr`). Phase 3 filled in every expander and introduced the
+//!   parameter-validation variants ([`PresetError::MissingRequiredParam`],
 //!   [`PresetError::InvalidRepoValue`], [`PresetError::InvalidPrValue`],
 //!   [`PresetError::UnbalancedPairedParams`], and
 //!   [`PresetError::UnknownParamRef`]) that built-ins and the
@@ -367,16 +365,6 @@ pub enum PresetError {
     /// Display-formatted message; this variant defers to it verbatim.
     PolicyValidation(sandbox_core::SandboxError),
 
-    /// A built-in preset whose expander has not been implemented yet.
-    /// Phase 1 seeds every built-in's `expand` fn pointer with this
-    /// error; Phase 3 replaced the stubs with real bodies, so no
-    /// shipped expander constructs this variant any more. It stays
-    /// in the enum as documented scaffolding for downstream forks
-    /// that add presets in stages, and because removing it would be
-    /// an API break for the `pub enum PresetError` surface.
-    #[allow(dead_code)]
-    NotImplemented { name: String },
-
     /// Two user preset files in the XDG preset directory declare the
     /// same `name`. This is a hard error (not warn-and-skip) — silent
     /// skipping would let whichever file won the directory-iteration
@@ -497,9 +485,6 @@ impl fmt::Display for PresetError {
                 // surface the wrapped error verbatim so the operator
                 // sees the existing `sandbox_core` wording unmodified.
                 write!(f, "{err}")
-            }
-            PresetError::NotImplemented { name } => {
-                write!(f, "preset '{name}' expander is not implemented yet")
             }
             PresetError::DuplicateUserPresetName {
                 name,
