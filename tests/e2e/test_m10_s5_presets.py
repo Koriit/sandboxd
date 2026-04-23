@@ -575,15 +575,19 @@ def test_github_repo_preset_scopes_to_one_repo(sandbox_cli):
         # path which has no matching filter → request_denied.
         denied_cmd = (
             "git clone --depth 1 "
-            "https://github.com/torvalds/linux /tmp/linux 2>&1 || true; "
+            "https://github.com/torvalds/linux /tmp/linux 2>&1; "
             "echo EXIT:$?"
         )
         denied_result = sandbox_cli(
             "ssh", session_name, "--", "bash", "-c", denied_cmd,
             timeout=180,
         )
-        # The outer ssh returns 0 because of `|| true`; but git's EXIT
-        # code must be non-zero.
+        # ``echo`` runs last so the outer ``bash -c`` always exits 0,
+        # which is why we assert against the printed ``EXIT:<code>``
+        # marker rather than ``denied_result.returncode``. Without an
+        # ``|| true`` masking the error, ``$?`` now captures git's real
+        # exit status, so the absence of ``EXIT:0`` in the combined
+        # output faithfully reflects a denied clone.
         combined = denied_result.stdout + denied_result.stderr
         assert "EXIT:0" not in combined, (
             f"git clone of torvalds/linux unexpectedly succeeded under "
