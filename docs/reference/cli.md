@@ -54,6 +54,7 @@ sandbox create [OPTIONS]
 | `--workspace <mode>` | | Workspace mode (e.g., `shared:/path/to/dir`) |
 | `--boot-cmd <cmd>` | | Command to execute after provisioning |
 | `--policy <path>` | | Path to a policy JSON file to apply after creation |
+| `--preset <invocation>` | | Preset invocation to apply on top of `--policy`. Repeatable. See [`--preset` invocations](#preset-invocations) below and the [Presets guide](/guides/network-policies/#presets). |
 | `--template <path>` | | Path to a custom Lima YAML template |
 | `--no-hardening` | | Disable QEMU hardening (device lockdown, cgroup limits) |
 | `--no-cache` | | Skip the pre-baked base image and use the full create path |
@@ -64,6 +65,71 @@ Notes:
 - `--workspace` must use the `shared:<absolute-path>` format. The path must exist.
 - `--boot-cmd` runs as `bash -c "<cmd>"` via the guest agent after all other provisioning.
 - `--no-hardening` disables QEMU device lockdown and cgroup resource limits. Use for debugging only.
+
+### Preset invocations
+
+Preset invocations are client-local macros that expand to v2 policy rules inside the CLI before the effective policy is sent to the daemon. `--preset` is repeatable; every invocation layers more rules on top of the `--policy` file (if any).
+
+Syntax:
+
+```
+--preset '<name>[:key=val[,key=val,...]]'
+```
+
+- `<name>` is the preset to apply, e.g. `npm`, `github-repo`. A bare name requires a trailing colon: `'npm:'`.
+- Each `key=val` segment supplies one parameter. Keys and values are separated by `=`; segments are separated by `,`.
+- Values may not contain a raw `,`, `:`, or `=`. There is no escape mechanism — a forbidden character in a value is a hard error. In practice no built-in preset param needs any of those characters, and user presets should pick param shapes that avoid them.
+- Repeated keys stack in invocation order (e.g. `'github-repo:repo=foo/bar,repo=baz/qux'` passes two repos).
+
+The flag is repeatable so multiple presets can be stacked on one command line:
+
+```bash
+sandbox create --name dev --preset 'npm:' --preset 'pypi:'
+```
+
+Interaction with `--policy`:
+
+- Presets merge **into** the policy file — both sets of rules contribute to the effective policy.
+- Rule identity is the `(host, port)` pair. Any collision between the policy file and a preset expansion (or between two preset expansions) is a hard error that names every contributing source. See [`(host, port)` uniqueness](/guides/network-policies/#host-and-port-uniqueness) for the exact error shape.
+
+Errors (text-identical to the CLI's `Error: <...>` line on stderr, exit code 1):
+
+- **Unknown preset** — `--preset 'foo:'` where `foo` is neither a built-in nor a user-configured preset:
+
+  ```
+  Error: unknown preset 'foo'
+  ```
+
+- **Malformed invocation** — missing `:` separator, empty name, or a param segment missing `=`:
+
+  ```
+  Error: malformed preset invocation 'npm': missing ':' separator between preset name and params
+  ```
+
+- **Forbidden character in value** — a raw `,`, `:`, or `=` inside a value:
+
+  ```
+  Error: preset 'github-repo': param 'repo=foo/bar:extra' contains forbidden character ':' in value; preset params must not contain , : or =
+  ```
+
+- **Duplicate `(host, port)`** across policy file + presets — every contributing source is named in the block:
+
+  ```
+  Error: policy validation failed: duplicate destination (registry.npmjs.org, 443)
+    - declared by policy file /tmp/policy.json
+    - declared by preset invocation 'npm:' (built-in 'npm')
+  ```
+
+See the [Presets guide](/guides/network-policies/#presets) for the built-in catalog and user-preset file format, and [`sandbox policy preset`](#sandbox-policy-preset) below for the client-local inspection subcommands.
+
+Example:
+
+```bash
+# Create a session whose agent can fetch npm packages and clone one GitHub repo.
+sandbox create --name dev \
+    --preset 'npm:' \
+    --preset 'github-repo:repo=rust-lang/rustlings'
+```
 
 ### Examples
 
@@ -670,7 +736,7 @@ Apply a new network policy to a running sandbox session, or clear the existing o
 ### Synopsis
 
 ```
-sandbox policy update <session> (--policy <path> | --clear)
+sandbox policy update <session> (--policy <path> | --preset <invocation>... | --clear)
 ```
 
 ### Arguments
@@ -683,15 +749,18 @@ sandbox policy update <session> (--policy <path> | --clear)
 
 | Option | Description |
 |--------|-------------|
-| `--policy <path>` | Path to a policy JSON file to apply. Mutually exclusive with `--clear`. |
-| `--clear` | Remove any active policy and revert the session to the fail-closed default (empty CoreDNS allow-list, deny-all gateway). Idempotent. Mutually exclusive with `--policy`. |
+| `--policy <path>` | Path to a policy JSON file to apply. Mutually exclusive with `--clear`. Composes with `--preset`. |
+| `--preset <invocation>` | Preset invocation to merge into the effective policy. Repeatable. Mutually exclusive with `--clear`. Same syntax and semantics as [`sandbox create --preset`](#preset-invocations). |
+| `--clear` | Remove any active policy and revert the session to the fail-closed default (empty CoreDNS allow-list, deny-all gateway). Idempotent. Mutually exclusive with `--policy` and `--preset`. |
 
-Exactly one of `--policy` or `--clear` must be supplied.
+At least one of `--policy`, `--preset`, or `--clear` must be supplied. `--policy` and `--preset` compose (presets expand and merge into the file's rules); `--clear` is mutually exclusive with both.
 
 ### Details
 
 - With `--policy`, the policy file is validated client-side before sending to the daemon; invalid JSON or a rejected schema aborts the request.
 - The policy must parse as a valid `Policy` JSON structure (see [policy model](/concepts/policy-model/)).
+- With `--preset`, each invocation is expanded locally into a rule set and merged with the (optional) `--policy` file. `(host, port)` collisions across the file and preset expansions are hard errors that name every contributing source — see [`(host, port)` uniqueness](/guides/network-policies/#host-and-port-uniqueness).
+- The original `--preset` invocation strings are sent to the daemon as a `source_presets` audit field alongside the effective policy.
 - `--clear` is a no-op when the session already has no policy.
 
 ### Examples
@@ -703,9 +772,178 @@ sandbox policy update my-sandbox --policy policy.json
 # Apply a policy by session ID (or unique ID prefix)
 sandbox policy update feedfacecafe --policy restricted-policy.json
 
+# Apply presets on top of an existing policy file
+sandbox policy update dev --policy policy.json \
+    --preset 'npm:' \
+    --preset 'github-repo:repo=rust-lang/rustlings'
+
+# Apply presets with no file policy (presets become the whole effective policy)
+sandbox policy update dev --preset 'cargo:'
+
 # Drop the active policy and return the session to fail-closed
 sandbox policy update my-sandbox --clear
 ```
+
+---
+
+## sandbox policy preset
+
+Inspect the built-in and user-configured preset catalog. All three subcommands are **client-local** — they do not contact the sandbox daemon and do not require the Unix socket to be reachable. User presets are loaded from `$XDG_CONFIG_HOME/sandboxd/presets/*.json` (falling back to `$HOME/.config/sandboxd/presets/*.json`); see the [Presets guide](/guides/network-policies/#user-presets) for the file format.
+
+### Synopsis
+
+```
+sandbox policy preset list
+sandbox policy preset show <name>
+sandbox policy preset expand '<invocation>'
+```
+
+### sandbox policy preset list
+
+Enumerate every preset available to the CLI, sorted alphabetically by name. Output is a two-column, tab-separated table:
+
+| Column | Description |
+|--------|-------------|
+| `NAME` | Preset name (the string typed before the `:` in an invocation). |
+| `SOURCE` | `built-in` for compile-time presets, or `user: <absolute-path>` for user-configured presets loaded from the XDG presets directory. |
+
+Pipe through `column -t -s $'\t'` for a pretty-printed table.
+
+Example:
+
+```bash
+sandbox policy preset list
+```
+
+```
+cargo	built-in
+dockerhub	built-in
+github	built-in
+github-interactive	built-in
+github-pr	built-in
+github-repo	built-in
+goproxy	built-in
+gradle	built-in
+maven	built-in
+npm	built-in
+pypi	built-in
+```
+
+With a user preset on disk, its row appears in alphabetical position with the full file path:
+
+```
+my-internal	user: /home/alice/.config/sandboxd/presets/my-internal.json
+```
+
+### sandbox policy preset show `<name>`
+
+Print the preset's description and parameter schema. Useful before invoking a parameterized preset to see which `key=val` pairs it accepts.
+
+Arguments:
+
+| Argument | Description |
+|----------|-------------|
+| `<name>` | Preset name, exactly as it appears in `sandbox policy preset list`. |
+
+Output shape: a multi-line block with `Preset:`, `Description:`, `Source:`, and a `Params:` section. Unparameterized presets render `Params: (none)`; parameterized presets list each declared parameter with `(required)` / `(repeatable)` flags.
+
+Example — an unparameterized preset:
+
+```bash
+sandbox policy preset show npm
+```
+
+```
+Preset: npm
+Description: Allow npm registry reads (registry.npmjs.org).
+Source: built-in
+Params: (none)
+```
+
+Example — a parameterized preset:
+
+```bash
+sandbox policy preset show github-repo
+```
+
+```
+Preset: github-repo
+Description: Allow narrow GitHub access scoped to one or more repos (param: repo=owner/name).
+Source: built-in
+Params:
+  - repo=owner/name (required, repeatable)
+```
+
+Looking up a name that does not exist in the catalog exits non-zero:
+
+```
+Error: unknown preset 'not-a-real-preset'
+```
+
+A user preset file whose `name` field collides with a built-in is a hard error at lookup time (user files cannot shadow built-ins):
+
+```
+Error: preset 'npm' is defined by both a built-in and a user file at
+  /home/alice/.config/sandboxd/presets/npm.json
+user presets cannot shadow built-ins; rename or delete the user file.
+```
+
+### sandbox policy preset expand `'<invocation>'`
+
+Expand a preset invocation into a v2 policy document and print it to stdout. The output is a complete `{"version":"2.0.0","rules":[...]}` document — you can redirect it to a file and feed it back into `sandbox create --policy` unchanged.
+
+Arguments:
+
+| Argument | Description |
+|----------|-------------|
+| `<invocation>` | Raw preset invocation (see [`sandbox create --preset`](#preset-invocations)). Quote the string to protect `:` / `,` / `=` from the shell. |
+
+Use cases:
+
+- **Dry-run before apply** — preview the exact rules a `--preset` flag would contribute before creating a session.
+- **Round-trip to a policy file** — capture an expansion as a starting point for a hand-edited policy.
+- **Drift / review** — compare `expand` output across CLI releases to see what a built-in preset's rule set became.
+
+Errors are the same set as [`--preset`](#preset-invocations) (unknown preset, malformed invocation, forbidden character in value, missing required param, invalid parameter value, ...), printed to stderr with a non-zero exit.
+
+Example — an unparameterized preset:
+
+```bash
+sandbox policy preset expand 'npm:'
+```
+
+```json
+{
+  "version": "2.0.0",
+  "rules": [
+    {
+      "host": "registry.npmjs.org",
+      "port": 443,
+      "protocol": "tcp",
+      "level": "http",
+      "http_filters": [
+        {
+          "method": "GET",
+          "path": "/**"
+        },
+        {
+          "method": "HEAD",
+          "path": "/**"
+        }
+      ]
+    }
+  ]
+}
+```
+
+Example — round-trip an expansion into a policy file:
+
+```bash
+sandbox policy preset expand 'github-repo:repo=rust-lang/rustlings' > /tmp/expanded.json
+sandbox create --name dev --policy /tmp/expanded.json
+```
+
+See the [Presets guide](/guides/network-policies/#presets) for a tour of the built-in catalog and the user-preset file format.
 
 ---
 
