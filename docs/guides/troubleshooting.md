@@ -7,6 +7,27 @@ Common issues and solutions for sandboxd operators. Each section lists the sympt
 
 If you are just getting started, check [Installation](/start/installation/) for setup-time errors. For command reference, see the [CLI reference](/reference/cli/).
 
+## Which layer denied my request?
+
+Before diving into component-specific symptoms below, check the unified event stream — every policy-enforcing layer (CoreDNS, nftables-via-deny-logger, Envoy, mitmproxy) writes a per-decision event there, and sandboxd exposes the whole stream through `sandbox events`.
+
+```bash
+# Live deny-only stream, auto-tabular in a TTY:
+sandbox events <session> --decision=deny --follow
+
+# Only the deny-logger (i.e. packets that matched no allow rule at all):
+sandbox events <session> --layer=deny-logger --follow
+```
+
+How to read the result:
+
+- **`layer: dns`, decision `deny`** — CoreDNS refused the name (`NXDOMAIN`). The domain is not covered by the policy, or the wildcard does not match the apex. See [DNS resolution issues](#dns-resolution-issues).
+- **`layer: deny-logger`** — a packet reached the firewall but matched no `policy_allow_{tcp,udp}` entry. Either the destination is truly unauthorized, or DNS hadn't propagated for it yet. See [L3 destination fails on first request](#l3-destination-fails-on-first-request-after-policy-change) for the race and [Non-HTTP traffic to a level `http` destination](#non-http-traffic-to-a-level-http-destination) for non-TCP-over-port-443 misses.
+- **`layer: envoy`, decision `deny`** — Envoy's listener / chain match rejected the connection (wrong SNI for a `tls` rule, no filter chain for the `(ip, port)` pair, etc.).
+- **`layer: mitmproxy`, decision `deny`** — the request reached mitmproxy but no `http_filters` entry matched. The event's `reason` names the specific check that failed (host, port, method/path). Mitmproxy strips the query string from the path before matching, so a filter like `GET /api/v1/**` matches regardless of whatever the caller appended after `?`.
+
+`sandbox events --event=policy_propagated --follow` is useful during policy churn: the event fires on each hash transition after all three enforcement layers reconcile, so you know the new rules are actually live rather than mid-propagation.
+
 ## VM won't boot
 
 ### KVM permissions
@@ -202,6 +223,16 @@ getent hosts api.newdestination.example   # triggers CoreDNS -> propagation
 curl -sSf https://api.newdestination.example/...
 ```
 
+From the host, scripts that apply a policy and then dial it can block on the propagation event directly rather than retrying:
+
+```bash
+# Apply the policy, then block until every enforcement layer has reconciled.
+sandbox policy update <session> --policy ./new-policy.json
+sandbox policy status <session> --wait --timeout 10s
+```
+
+`sandbox policy status --wait` polls until the session's applied policy hash matches the most recent `policy_propagated` lifecycle event, then exits 0. Under the hood the same event is available on the unified stream as `sandbox events <session> --event policy_propagated --follow`.
+
 See [networking → Fail-closed propagation](/concepts/networking/#fail-closed-propagation-for-level-3) for why this is the designed behavior.
 
 ### Non-HTTP traffic to a level `http` destination
@@ -234,6 +265,53 @@ sandbox logs <session> --component mitmproxy --tail 50 \
 ```
 
 If the issuer is anything other than `Sandbox CA ...`, the destination is not being inspected. The two likely reasons are: the rule is at level `tls` or `transport` rather than `http`; or the destination does not have a resolved IP yet and the request was denied (see the propagation-window FAQ above).
+
+## Preset errors
+
+### Unknown preset
+
+**Symptom:** `sandbox create --preset 'npm-internal:'` exits with `Error: unknown preset 'npm-internal'`.
+
+Either the preset name is mistyped, or the JSON file under `$XDG_CONFIG_HOME/sandboxd/presets/` failed to load. Malformed user-preset files emit a warning to stderr on every invocation and are skipped — run the command with `RUST_LOG=info` to see the warning, or inspect the preset directory:
+
+```bash
+ls "${XDG_CONFIG_HOME:-$HOME/.config}/sandboxd/presets/"
+sandbox policy preset list                              # what the CLI actually sees
+```
+
+Fix: correct the JSON (common culprits: unknown top-level fields, duplicate param names, `${param}` references to undeclared params, `name` containing `.` / `:` / `,` / `=`).
+
+### User preset shadows a built-in
+
+**Symptom:** `Error: preset 'npm' is defined by both a built-in and a user file at <path>; user presets cannot shadow built-ins; rename or delete the user file.`
+
+Each user-preset file's `name` field must not collide with a built-in. Shadowing is rejected at invocation time (not at load time — a latent shadow file does not break unrelated commands).
+
+Fix: rename the file and its `name` field to something that does not collide (for example, `npm-internal.json` with `"name": "npm-internal"`).
+
+### `(host, port)` collision across preset and policy
+
+**Symptom:** `Error: policy validation failed: duplicate destination (registry.npmjs.org, 443)` listing every contributing source (policy file path, preset invocation string).
+
+Every `(host, port)` pair in the effective policy must be declared exactly once. Overlapping rules across a `--policy` file and one or more `--preset` flags — or across two presets — are contradictions and are rejected.
+
+Fix: remove the overlapping rule from the policy file, drop one of the overlapping presets, or change the colliding `(host, port)` in the policy file to something that does not overlap.
+
+## Event-attribution gotchas
+
+### mitmproxy events do not carry the VM's bridge IP
+
+**Symptom:** You filter `sandbox events` by source IP and get no mitmproxy rows, or the rows look wrong.
+
+By the time a request reaches mitmproxy, the connection's peer is Envoy's loopback-connect source — not the VM. The mitmproxy ingestor therefore attributes its events to the per-session watcher that produced the record (one watcher per session, each tailing its own mitmproxy JSONL log), not via the `(vm_ip → session_id)` map used for the other layers. Sessions are still attributed correctly on the envelope; only the `client_ip` field, if you look at it, will not be a VM IP.
+
+Fix: filter by `layer=mitmproxy` and the session ID, not by a VM bridge IP. The envelope's `session` field is authoritative for attribution.
+
+### Deny-logger reports pre-DNAT 5-tuple
+
+**Symptom:** A deny event on the deny-logger layer shows a destination IP that does not match what the application dialed.
+
+Deny-logger records the original 5-tuple as recovered via `SO_ORIGINAL_DST` / `IP_ORIGDSTADDR` from the redirected socket — i.e. the destination *before* the nftables DNAT would have fired if the destination had been allowed. That is deliberate: the interesting field for an operator is what the VM was trying to reach, not `127.0.0.1:10001` on the gateway's loopback. See the spec's "Deny-logger component" section for the full field list.
 
 ## File transfer failures
 

@@ -155,6 +155,18 @@ sandbox policy update dev --clear
 
 The behavior is deliberately fail-closed: an unknown destination is denied, never silently passed through. See [networking → Fail-closed propagation](/concepts/networking/#fail-closed-propagation-for-level-3) for the mechanism.
 
+If you need to block until the new policy is live (e.g. in a setup script that immediately dials an L3 destination), sandboxd emits a `policy_propagated` lifecycle event once CoreDNS, nftables, and Envoy have all reconciled to the latest policy hash:
+
+```bash
+# Block until the applied policy's hash has propagated, up to 10 seconds.
+sandbox policy status <session> --wait --timeout 10s
+
+# Or observe the event directly.
+sandbox events <session> --event policy_propagated --follow
+```
+
+`sandbox policy status --wait` polls sandboxd until the session's currently-applied policy hash matches the last `policy_propagated` event — then exits 0. A `--timeout` expiry exits non-zero so scripts can fail loudly rather than race the loop.
+
 ## L3 limitations
 
 Level `http` (HTTPS inspection) has a few constraints worth calling out:
@@ -181,6 +193,15 @@ sandbox inspect dev | jq '.[0].policy'
 If nothing is applied, `describe` shows `Policy: none` and the `policy` field is absent from `inspect` output.
 
 ## Troubleshoot denials
+
+The fastest way to see *what* got denied and *which layer* denied it is the unified event stream:
+
+```bash
+# Every deny from every layer (DNS, Envoy, mitmproxy, deny-logger), live.
+sandbox events <session> --decision=deny --follow
+```
+
+Each event names the layer (`dns`, `envoy`, `mitmproxy`, `deny-logger`), the decision, and the reason — so you know at a glance whether a call was blocked by DNS allow-list filtering, by the firewall, by Envoy's SNI check, by an mitmproxy `http_filters` mismatch, or by never having matched any rule at all. See [`sandbox events`](/reference/cli/#sandbox-events) for filtering options; the subsections below cover each layer's failure modes in detail.
 
 ### `NXDOMAIN` on a domain you expect to work
 
