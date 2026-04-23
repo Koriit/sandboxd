@@ -54,6 +54,7 @@ use std::path::{Path, PathBuf};
 
 pub mod builtin;
 pub mod expand;
+pub mod merge;
 pub mod method;
 pub mod param;
 pub mod user;
@@ -61,6 +62,7 @@ pub mod user;
 // Re-export the public surface callers are expected to use in Phase 5.
 pub use builtin::{BUILTINS, BuiltinPreset};
 pub use expand::expand;
+pub use merge::merge_effective;
 pub use param::ParsedInvocation;
 pub use user::{
     ParamType, RawHttpFilter, RawHttpMethod, RawLevel, RawProtocol, RawRuleTemplate, UserParamSpec,
@@ -236,6 +238,14 @@ pub enum PresetSource {
 pub enum RuleSource {
     /// The rule came from the operator's `--policy <path>` file.
     PolicyFile { path: PathBuf },
+    /// The rule came from a policy value passed in-process without a
+    /// backing file path. Reserved for a future stdin-policy feature;
+    /// [`merge::merge_effective`] falls back to this when `file` is
+    /// `Some(_)` but `file_path` is `None` so the invariant "every
+    /// merged rule carries a Display-able source" holds. In practice
+    /// the CLI's `Command::Create` / `PolicyAction::Update` paths always
+    /// pair the loaded policy with the path they read it from.
+    InlinePolicy,
     /// The rule came from a built-in preset (e.g. `github`).
     Builtin { name: String, invocation: String },
     /// The rule came from a user-configured preset file.
@@ -252,6 +262,9 @@ impl fmt::Display for RuleSource {
             RuleSource::PolicyFile { path } => {
                 write!(f, "declared by policy file {}", path.display())
             }
+            RuleSource::InlinePolicy => {
+                write!(f, "declared by inline policy")
+            }
             RuleSource::Builtin { name, invocation } => write!(
                 f,
                 "declared by preset invocation '{invocation}' (built-in '{name}')"
@@ -267,18 +280,30 @@ impl fmt::Display for RuleSource {
     }
 }
 
-/// Payload for [`PresetError::DuplicateDestination`].
+/// Payload for [`PresetError::DuplicateDestination`] /
+/// [`PresetError::DuplicateDestinations`].
 ///
-/// Kept as a separate struct so the error enum itself stays compact
-/// (clippy's `result_large_err` lint). The field set mirrors the D-4
-/// scaffold verbatim; Phase 4's merge logic constructs these and
-/// [`PresetError::DuplicateDestination`] wraps each one in a `Box`.
+/// Carries the collided `(host, port)` identity plus the full list of
+/// contributing sources (length always ≥ 2). D-4 mandates that *every*
+/// contributing source is named in the output so operators can resolve
+/// policy-file / preset collisions without guessing; N-way collisions
+/// (e.g. three presets all emitting `github.com:443`) therefore list
+/// N sources, not just the first pair.
+///
+/// Kept as a separate struct so the enum itself stays compact under
+/// clippy's `result_large_err` lint; Phase 4's merge logic constructs
+/// these and [`PresetError::DuplicateDestination`] wraps a single one
+/// in a `Box`, while [`PresetError::DuplicateDestinations`] groups
+/// several.
 #[derive(Debug, Clone)]
 pub struct DuplicateDestination {
     pub host: String,
     pub port: u16,
-    pub source_a: RuleSource,
-    pub source_b: RuleSource,
+    /// Sources that declared this `(host, port)`, in the order they
+    /// appeared in the merged rule list. Always contains at least two
+    /// entries — a single-source destination is not a duplicate and
+    /// never reaches this payload.
+    pub sources: Vec<RuleSource>,
 }
 
 /// All errors the preset subsystem can produce.
@@ -317,14 +342,31 @@ pub enum PresetError {
 
     /// Two or more rules (across policy file + preset expansions) claim
     /// the same `(host, port)` identity. D-4 mandates that every
-    /// contributing source is named in the error output. The actual
-    /// merge logic that raises this variant lives in Phase 4; Phase 1
-    /// defines the shape.
+    /// contributing source is named in the error output — Phase 4's
+    /// [`merge::merge_effective`] pass raises this variant when exactly
+    /// one `(host, port)` has more than one contributing source.
     ///
     /// Payload is boxed to keep the enum small — the primary `Result`
     /// path (parser / catalog lookup) is hot; this variant is
     /// error-only and cold.
     DuplicateDestination(Box<DuplicateDestination>),
+
+    /// Two or more *distinct* `(host, port)` identities each had more
+    /// than one contributing source — e.g. `github:` and
+    /// `github-repo:repo=foo/bar` overlap on both `github.com:443` and
+    /// `api.github.com:443`. Reported as a single error (one block per
+    /// collision) rather than surfacing them incrementally, so the
+    /// operator sees the full set in one pass.
+    DuplicateDestinations(Vec<DuplicateDestination>),
+
+    /// The merged effective policy failed
+    /// [`sandbox_core::PolicyCompiler::validate`]. Serves as a catch-all
+    /// for rule-shape violations that a preset might introduce through
+    /// its own internal state (e.g. an empty `http_filters` list on a
+    /// user preset that declared `level: http`). The wrapped
+    /// [`sandbox_core::SandboxError`] already carries its own
+    /// Display-formatted message; this variant defers to it verbatim.
+    PolicyValidation(sandbox_core::SandboxError),
 
     /// A built-in preset whose expander has not been implemented yet.
     /// Phase 1 seeds every built-in's `expand` fn pointer with this
@@ -384,6 +426,26 @@ pub enum PresetError {
     UnknownParamRef { preset: String, ref_name: String },
 }
 
+/// Render a single `DuplicateDestination` collision block in the
+/// spec-mandated shape (Part 1 § "Error shape for duplicates", lines
+/// 140-150).  Shared between the single-collision
+/// [`PresetError::DuplicateDestination`] variant and each block of the
+/// multi-collision [`PresetError::DuplicateDestinations`] variant so
+/// both error shapes stay textually identical per collision.
+fn fmt_duplicate_block(dup: &DuplicateDestination) -> String {
+    use std::fmt::Write as _;
+    let mut out = format!(
+        "policy validation failed: duplicate destination ({host}, {port})",
+        host = dup.host,
+        port = dup.port
+    );
+    for source in &dup.sources {
+        // `write!` into a String is infallible.
+        let _ = write!(out, "\n  - {source}");
+    }
+    out
+}
+
 impl fmt::Display for PresetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -408,16 +470,29 @@ impl fmt::Display for PresetError {
                 "preset '{preset}': param '{key}={value}' contains forbidden character '{ch}' in value; preset params must not contain , : or ="
             ),
             PresetError::DuplicateDestination(dup) => {
-                let DuplicateDestination {
-                    host,
-                    port,
-                    source_a,
-                    source_b,
-                } = dup.as_ref();
-                write!(
-                    f,
-                    "policy validation failed: duplicate destination ({host}, {port})\n  - {source_a}\n  - {source_b}"
-                )
+                write!(f, "{}", fmt_duplicate_block(dup))
+            }
+            PresetError::DuplicateDestinations(dups) => {
+                // N collisions: one `policy validation failed:` block per
+                // collision, blank line between blocks.  Plan line:
+                // "N blocks separated by a blank line and a new
+                // `policy validation failed: ...` line".
+                for (i, dup) in dups.iter().enumerate() {
+                    if i > 0 {
+                        writeln!(f)?;
+                        writeln!(f)?;
+                    }
+                    write!(f, "{}", fmt_duplicate_block(dup))?;
+                }
+                Ok(())
+            }
+            PresetError::PolicyValidation(err) => {
+                // `SandboxError::Internal` already prefixes its Display
+                // with "internal error: " and the downstream validator
+                // writes the "policy validation failed: ..." text.  We
+                // surface the wrapped error verbatim so the operator
+                // sees the existing `sandbox_core` wording unmodified.
+                write!(f, "{err}")
             }
             PresetError::NotImplemented { name } => {
                 write!(f, "preset '{name}' expander is not implemented yet")
@@ -655,13 +730,15 @@ mod tests {
         let err = PresetError::DuplicateDestination(Box::new(DuplicateDestination {
             host: "api.github.com".to_string(),
             port: 443,
-            source_a: RuleSource::Builtin {
-                name: "github".to_string(),
-                invocation: "github:".to_string(),
-            },
-            source_b: RuleSource::PolicyFile {
-                path: PathBuf::from("/path/to/policy.json"),
-            },
+            sources: vec![
+                RuleSource::Builtin {
+                    name: "github".to_string(),
+                    invocation: "github:".to_string(),
+                },
+                RuleSource::PolicyFile {
+                    path: PathBuf::from("/path/to/policy.json"),
+                },
+            ],
         }));
         assert_eq!(
             err.to_string(),
