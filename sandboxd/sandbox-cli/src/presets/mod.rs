@@ -39,16 +39,6 @@
 //!   shapes. Every variant has a `Display` impl that matches the
 //!   wording called out in the spec and the Phase 0 decisions.
 
-// Commit 1 of Phase 5 wires `--preset` on `create` / `policy update`
-// (consumers: `Catalog::load`, `Catalog::find`, `ParsedInvocation::parse`,
-// `expand`, `merge_effective`). Commit 2 adds `sandbox policy preset
-// list|show|expand`, which activates `Catalog::list`, `PresetSummary`,
-// `PresetSource`, `Preset::{name, description}`, and the `description`
-// fields on built-in / user preset structs. Between commits those
-// items are dead, so suppress the lint at module scope for Commit 1.
-// The allow is removed in Commit 2 once the show/list paths wire up.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};

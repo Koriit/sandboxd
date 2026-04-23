@@ -1,16 +1,16 @@
-//! CLI surface tests for the M10-S5 preset system (Commit 1 — the
-//! `--preset` flag on `create` and `policy update`).
+//! CLI surface tests for the M10-S5 preset system.
 //!
 //! These tests spawn the compiled `sandbox` binary via
-//! `CARGO_BIN_EXE_sandbox` and exercise the preset touch-points that
-//! ship with the `--preset` flag:
+//! `CARGO_BIN_EXE_sandbox` and exercise every public preset touch-point:
 //!
+//! - `sandbox policy preset list | show | expand` — client-local, no
+//!   daemon I/O. Covered by [`policy_preset_list_emits_every_builtin`],
+//!   [`policy_preset_show_github_repo_documents_repo_param`],
+//!   [`policy_preset_expand_github_repo_emits_valid_policy`], and
+//!   [`policy_preset_expand_unknown_preset_exits_nonzero`].
 //! - `sandbox policy update <sid> --preset 'npm:' --clear` — clap-level
 //!   mutual exclusion. Covered by
 //!   [`policy_update_preset_plus_clear_is_parse_error`].
-//! - `sandbox policy update <sid>` with no flags — the three-option
-//!   error guidance (D-7). Covered by
-//!   [`policy_update_with_no_flags_errors_with_three_option_guidance`].
 //! - `sandbox create --policy ... --preset ... --preset ...` and
 //!   `sandbox policy update <sid> --preset ...` — end-to-end body
 //!   construction. Covered by
@@ -18,9 +18,6 @@
 //!   [`policy_update_with_preset_posts_merged_body`], and the
 //!   integration counterpart
 //!   [`integration_create_with_npm_preset_ships_source_presets`].
-//!
-//! `sandbox policy preset list|show|expand` lands in Commit 2 of this
-//! phase and adds its own unit tests here.
 //!
 //! The fake-daemon tests spin an in-process axum HTTP/1.1 server on a
 //! tempdir Unix socket, capture exactly one `POST /sessions` (or
@@ -200,6 +197,121 @@ async fn run_sandbox(
 // ---------------------------------------------------------------------------
 // Client-local subcommand tests
 // ---------------------------------------------------------------------------
+
+/// `sandbox policy preset list` prints one row per built-in (and any
+/// user preset), alphabetically by name.
+///
+/// Verifies every built-in name appears. Doesn't assert the exact
+/// format beyond the built-in set — the golden ordering is enforced by
+/// a unit test in `presets::mod::tests`.
+#[tokio::test]
+async fn policy_preset_list_emits_every_builtin() {
+    let (status, stdout, stderr) = run_sandbox(&["policy", "preset", "list"], None).await;
+    assert!(status.success(), "exit: {status:?}\nstderr: {stderr}");
+
+    // The 11 built-ins shipped in M10-S5 Phase 3.
+    let builtins = [
+        "npm",
+        "pypi",
+        "cargo",
+        "goproxy",
+        "maven",
+        "gradle",
+        "dockerhub",
+        "github",
+        "github-repo",
+        "github-pr",
+        "github-interactive",
+    ];
+    for name in builtins {
+        assert!(
+            stdout.contains(name),
+            "`list` stdout missing built-in '{name}'.\nfull output:\n{stdout}"
+        );
+    }
+    // Source column for built-ins must say `built-in` on at least one
+    // row. (Every row says it; sampling one proves the column exists.)
+    assert!(
+        stdout.contains("built-in"),
+        "`list` stdout should surface 'built-in' source label.\nfull:\n{stdout}"
+    );
+}
+
+/// `sandbox policy preset show github-repo` surfaces both the
+/// description and the `repo=owner/name` parameter schema.
+#[tokio::test]
+async fn policy_preset_show_github_repo_documents_repo_param() {
+    let (status, stdout, stderr) =
+        run_sandbox(&["policy", "preset", "show", "github-repo"], None).await;
+    assert!(status.success(), "exit: {status:?}\nstderr: {stderr}");
+
+    assert!(
+        stdout.contains("github-repo"),
+        "`show` missing preset name. output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("repo="),
+        "`show` missing `repo=` param docs. output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("owner/name"),
+        "`show` missing `owner/name` shape docs. output:\n{stdout}"
+    );
+}
+
+/// `sandbox policy preset expand 'github-repo:repo=foo/bar'` emits a
+/// `{"version":"2.0.0","rules":[...]}` document that round-trips
+/// through the `Policy` deserializer.
+#[tokio::test]
+async fn policy_preset_expand_github_repo_emits_valid_policy() {
+    let (status, stdout, stderr) = run_sandbox(
+        &["policy", "preset", "expand", "github-repo:repo=foo/bar"],
+        None,
+    )
+    .await;
+    assert!(status.success(), "exit: {status:?}\nstderr: {stderr}");
+
+    // D-10: the output is the JSON document shape the daemon accepts
+    // via `--policy`. Parse it as JSON and check the version + rules
+    // array are present.
+    let doc: Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("expand output is not valid JSON: {e}\noutput:\n{stdout}"));
+    assert_eq!(
+        doc["version"], "2.0.0",
+        "unexpected schema version.\ndoc:\n{doc}"
+    );
+    assert!(
+        doc["rules"].is_array(),
+        "expected rules array.\ndoc:\n{doc}"
+    );
+    let rules = doc["rules"].as_array().unwrap();
+    assert!(
+        !rules.is_empty(),
+        "github-repo:repo=foo/bar should emit at least one rule"
+    );
+}
+
+/// `sandbox policy preset expand 'does-not-exist:'` exits non-zero
+/// with the `UnknownPreset` error text on stderr. Verifies that the
+/// CLI surfaces the `PresetError::Display` output verbatim (spec
+/// Part 2 "Error shapes").
+#[tokio::test]
+async fn policy_preset_expand_unknown_preset_exits_nonzero() {
+    let (status, stdout, stderr) =
+        run_sandbox(&["policy", "preset", "expand", "does-not-exist:"], None).await;
+    assert!(
+        !status.success(),
+        "expected non-zero exit. stdout: {stdout}, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("unknown preset"),
+        "stderr missing `unknown preset` text. stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("does-not-exist"),
+        "stderr missing preset name. stderr:\n{stderr}"
+    );
+}
 
 /// `sandbox policy update <sid> --preset 'npm:' --clear` is rejected
 /// by clap — `--preset` and `--clear` are mutually exclusive per D-7.

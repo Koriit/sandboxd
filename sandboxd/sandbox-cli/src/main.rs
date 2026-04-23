@@ -17,7 +17,7 @@ use tokio::net::UnixStream;
 
 mod presets;
 
-use presets::{Catalog, ParsedInvocation};
+use presets::{Catalog, ParsedInvocation, Preset, PresetSource};
 
 /// CLI client for managing sandbox sessions.
 #[derive(Parser, Debug)]
@@ -268,6 +268,43 @@ enum PolicyAction {
         /// Idempotent. Mutually exclusive with `--policy` and `--preset`.
         #[arg(long, conflicts_with = "policy", conflicts_with = "preset")]
         clear: bool,
+    },
+    /// Inspect the built-in and user-configured preset catalog (client-local).
+    ///
+    /// All three subcommands run entirely inside the CLI — they do
+    /// not contact the sandbox daemon. User presets are loaded from
+    /// `$XDG_CONFIG_HOME/sandboxd/presets/*.json` (falling back to
+    /// `$HOME/.config/sandboxd/presets/`).
+    Preset {
+        #[command(subcommand)]
+        action: PresetAction,
+    },
+}
+
+/// `sandbox policy preset` subcommands.
+#[derive(Subcommand, Debug, Clone)]
+enum PresetAction {
+    /// List every preset available to the CLI, alphabetically.
+    ///
+    /// The output is a two-column table of `NAME | SOURCE` where
+    /// SOURCE is `built-in` or `user: /abs/path`.
+    List,
+    /// Show a preset's description and parameter schema.
+    Show {
+        /// Preset name (e.g. `npm`, `github-repo`).
+        name: String,
+    },
+    /// Expand a preset invocation into a v2 policy document and
+    /// print it as JSON.
+    ///
+    /// Output shape: `{"version":"2.0.0","rules":[...]}` — a copy-
+    /// pasteable policy document that the daemon will accept via
+    /// `--policy`. Errors in the invocation (unknown preset, missing
+    /// required param, forbidden character in a value, ...) exit
+    /// non-zero with the error text on stderr.
+    Expand {
+        /// Raw invocation string, e.g. `github-repo:repo=foo/bar`.
+        raw: String,
     },
 }
 
@@ -619,6 +656,18 @@ fn build_request(command: &Command) -> Option<Request<String>> {
                         .body(body)
                         .expect("failed to build request")
                 }
+            }
+            PolicyAction::Preset { .. } => {
+                // Handled entirely client-side before `build_request` is
+                // ever called — see the dispatch in `main()`. Returning
+                // `None` here would drop the request, so we panic
+                // defensively: reaching this branch indicates a dispatch
+                // bug where the preset subcommand was routed through the
+                // normal request pipeline.
+                unreachable!(
+                    "`sandbox policy preset ...` is handled client-side \
+                     in main() before build_request"
+                );
             }
         },
         Command::Health { session } => Request::builder()
@@ -1149,6 +1198,160 @@ fn protocol_to_str(protocol: &sandbox_core::Protocol) -> &'static str {
     match protocol {
         Protocol::Tcp => "tcp",
         Protocol::Udp => "udp",
+    }
+}
+
+/// Handle `sandbox policy preset {list,show,expand}` entirely
+/// client-local.
+///
+/// None of the three subcommands contact the daemon — they inspect
+/// the CLI's built-in catalog plus the user's XDG preset directory.
+/// Errors exit non-zero with the spec-mandated `PresetError` wording
+/// on stderr so operators can paste-and-compare against the spec.
+///
+/// Output contracts (enforced by unit tests in `tests/preset_cli.rs`):
+/// - `list`: one line per preset, `NAME<TAB>SOURCE`. SOURCE is
+///   `built-in` or `user: <abs-path>`. Alphabetical by name.
+/// - `show`: a multi-line block with the preset name on the first
+///   line, the description on the second, and a `Params:` section
+///   listing every declared parameter (built-in or user-configured).
+/// - `expand`: a single JSON document on stdout matching
+///   `{"version":"2.0.0","rules":[...]}` (D-10).
+fn handle_policy_preset(action: &PresetAction) {
+    let catalog = match Catalog::load(None) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    };
+
+    match action {
+        PresetAction::List => {
+            // Print one row per preset, alphabetical by name. Tab
+            // separator keeps the output column-friendly without
+            // pulling in a TUI dep; `column -t -s $'\t'` gives
+            // operators a pretty table if they want one.
+            for summary in catalog.list() {
+                let source_str = match &summary.source {
+                    PresetSource::Builtin => "built-in".to_string(),
+                    PresetSource::User { path } => format!("user: {}", path.display()),
+                };
+                println!("{}\t{}", summary.name, source_str);
+            }
+        }
+        PresetAction::Show { name } => {
+            let preset = match catalog.find(name) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                }
+            };
+            print_preset_details(&preset);
+        }
+        PresetAction::Expand { raw } => {
+            let inv = match ParsedInvocation::parse(raw) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                }
+            };
+            let rules = match presets::expand(&catalog, &inv) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Error: {e}");
+                    process::exit(1);
+                }
+            };
+            // D-10: `expand` outputs `{"version":"2.0.0","rules":[...]}`
+            // — the same shape the daemon accepts via `--policy`.
+            // Build it through `Policy` so the `version` field is
+            // sourced from the same constant the daemon uses.
+            let doc = Policy {
+                version: sandbox_core::policy::SCHEMA_VERSION.to_string(),
+                rules,
+            };
+            let rendered =
+                serde_json::to_string_pretty(&doc).expect("Policy always serializes to JSON");
+            println!("{rendered}");
+        }
+    }
+}
+
+/// Render the full body of `sandbox policy preset show <name>`.
+///
+/// Kept separate from [`handle_policy_preset`] because the `Show`
+/// branch is the most complex of the three and because unit tests in
+/// `tests/preset_cli.rs` exercise the rendering path directly by
+/// constructing a `Preset` and comparing the captured stdout.
+fn print_preset_details(preset: &Preset) {
+    println!("Preset: {}", preset.name());
+    if let Some(desc) = preset.description() {
+        println!("Description: {desc}");
+    }
+    match preset {
+        Preset::Builtin(b) => {
+            println!("Source: built-in");
+            // Built-in param schemas are hard-coded per the spec.
+            // Keep this table in lock-step with the expander bodies
+            // in `presets::builtin` — the unit test
+            // `show_github_repo_documents_repo_param` guards against
+            // drift.
+            let schema = builtin_param_schema(b.name);
+            if schema.is_empty() {
+                println!("Params: (none)");
+            } else {
+                println!("Params:");
+                for row in schema {
+                    println!("  - {row}");
+                }
+            }
+        }
+        Preset::User(u) => {
+            println!("Source: user: {}", u.source_path.display());
+            if u.params.is_empty() {
+                println!("Params: (none)");
+            } else {
+                println!("Params:");
+                for p in &u.params {
+                    let mut flags: Vec<&'static str> = Vec::new();
+                    if p.required {
+                        flags.push("required");
+                    }
+                    if p.repeatable {
+                        flags.push("repeatable");
+                    }
+                    let flags_str = if flags.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", flags.join(", "))
+                    };
+                    println!("  - {}: string{}", p.name, flags_str);
+                }
+            }
+        }
+    }
+}
+
+/// Parameter-schema rows shown by `sandbox policy preset show <name>`
+/// for built-in presets.
+///
+/// Returned as a `Vec<&'static str>` rather than a typed struct
+/// because the output is display-only; the one test that inspects
+/// the `github-repo` row (`show_github_repo_documents_repo_param`)
+/// asserts against substrings. Keep the wording in sync with the
+/// expander bodies in `presets::builtin`.
+fn builtin_param_schema(name: &str) -> Vec<&'static str> {
+    match name {
+        "github-repo" => vec!["repo=owner/name (required, repeatable)"],
+        "github-pr" => vec![
+            "repo=owner/name (required, repeatable, paired with pr=)",
+            "pr=<positive-integer> (required, repeatable, paired with repo=)",
+        ],
+        // Unparameterized built-ins — every other entry in BUILTINS.
+        _ => Vec::new(),
     }
 }
 
@@ -2739,6 +2942,18 @@ async fn main() {
     }
     if let Command::Describe { sessions } = &cli.command {
         handle_describe(&cli.socket, sessions).await;
+        return;
+    }
+
+    // `sandbox policy preset ...` is entirely client-local — it never
+    // contacts the daemon. Route it before any socket work so we don't
+    // spuriously fail when the daemon is down and the user only wants
+    // to inspect the preset catalog.
+    if let Command::Policy {
+        action: PolicyAction::Preset { action },
+    } = &cli.command
+    {
+        handle_policy_preset(action);
         return;
     }
 
