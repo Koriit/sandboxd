@@ -28,11 +28,13 @@
 //!   that each built-in can implement its own expansion logic (trivial
 //!   for `npm` / `pypi` / …, non-trivial for `github-repo` /
 //!   `github-pr`). Phase 1 wired every expander to return
-//!   [`PresetError::NotImplemented`]; Phase 3 replaces the stubs with
-//!   real bodies and introduces the parameter-validation variants
+//!   [`PresetError::NotImplemented`]; Phase 3 replaced the stubs with
+//!   the real bodies and introduced the parameter-validation variants
 //!   ([`PresetError::MissingRequiredParam`],
-//!   [`PresetError::UnknownParamRef`], …) shared by built-ins and the
-//!   user-preset expander.
+//!   [`PresetError::InvalidRepoValue`], [`PresetError::InvalidPrValue`],
+//!   [`PresetError::UnbalancedPairedParams`], and
+//!   [`PresetError::UnknownParamRef`]) that built-ins and the
+//!   user-preset expander share.
 //! - The [`PresetError`] hierarchy grows as phases need new failure
 //!   shapes. Every variant has a `Display` impl that matches the
 //!   wording called out in the spec and the Phase 0 decisions.
@@ -348,13 +350,37 @@ pub enum PresetError {
     TooManyRepeatableParams { path: PathBuf, count: usize },
 
     /// An invocation omitted a parameter declared `required: true`.
-    /// Raised by the user-preset expander and by parameterized
-    /// built-ins (`github-repo`, `github-pr`) in Phase 3b.
+    /// Raised by parameterized built-ins (`github-repo`, `github-pr`)
+    /// and by the user-preset expander.
     MissingRequiredParam { preset: String, param: String },
 
+    /// `github-repo` / `github-pr` received a `repo=` value that does
+    /// not match the `owner/name` shape (missing `/`, empty
+    /// component, or a character outside `[A-Za-z0-9._-]`).
+    InvalidRepoValue {
+        preset: String,
+        value: String,
+        reason: String,
+    },
+
+    /// `github-pr` received a `pr=` value that is not a positive
+    /// integer (empty, non-digit, zero, negative, overflowing `u64`).
+    InvalidPrValue { preset: String, value: String },
+
+    /// A preset declaring paired repeatable params received unequal
+    /// counts. Raised by `github-pr` on `len(repo) != len(pr)`. The
+    /// error text names both param names and both counts so the
+    /// operator can see exactly which side was short.
+    UnbalancedPairedParams {
+        preset: String,
+        a: String,
+        a_count: usize,
+        b: String,
+        b_count: usize,
+    },
+
     /// A user preset's rule template references a `${param}` name
-    /// that is not in the preset's declared `params` list, or an
-    /// invocation carried an unknown param key.
+    /// that is not in the preset's declared `params` list.
     UnknownParamRef { preset: String, ref_name: String },
 }
 
@@ -416,6 +442,30 @@ impl fmt::Display for PresetError {
             PresetError::MissingRequiredParam { preset, param } => {
                 write!(f, "preset '{preset}': missing required param '{param}'")
             }
+            PresetError::InvalidRepoValue {
+                preset,
+                value,
+                reason,
+            } => write!(
+                f,
+                "preset '{preset}': invalid repo value '{value}' ({reason}); \
+                 expected 'owner/name' with characters in [A-Za-z0-9._-]"
+            ),
+            PresetError::InvalidPrValue { preset, value } => write!(
+                f,
+                "preset '{preset}': invalid pr value '{value}'; expected a positive integer"
+            ),
+            PresetError::UnbalancedPairedParams {
+                preset,
+                a,
+                a_count,
+                b,
+                b_count,
+            } => write!(
+                f,
+                "preset '{preset}': paired params '{a}' and '{b}' must appear the same number of times \
+                 (got {a_count} '{a}=...' and {b_count} '{b}=...')"
+            ),
             PresetError::UnknownParamRef { preset, ref_name } => write!(
                 f,
                 "preset '{preset}': rule template references unknown param '${{{ref_name}}}'"
