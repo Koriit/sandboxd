@@ -11,26 +11,28 @@
 //! Part 2 for the design, and `docs/internal/milestones/M10.md` § M10-S5
 //! for the implementation milestone.
 //!
-//! # Phase 1 scope
+//! # Current scope
 //!
-//! This module in M10-S5 Phase 1 is scaffolding only:
+//! M10-S5 Phases 1–2 are live:
 //!
 //! - The [`Preset`] enum distinguishes [`BuiltinPreset`]s (compiled-in)
 //!   from [`UserPreset`]s (loaded from `$XDG_CONFIG_HOME/sandboxd/presets/`).
-//!   The split lets the shadowing check in Phase 2 be a trivial type
+//!   The split keeps the shadowing check (D-3) a trivial type-level
 //!   discrimination.
 //! - The [`Catalog`] composes both sources and exposes a read-only
-//!   lookup surface (`find`, `list`). Its [`Catalog::load`] is a no-op
-//!   stub in Phase 1 — the XDG loader lands in Phase 2.
-//! - Each [`BuiltinPreset`] carries an `expand` function pointer so that
-//!   each built-in can implement its own expansion logic (trivial for
-//!   `npm` / `pypi` / …, non-trivial for `github-repo` / `github-pr`).
-//!   Phase 1 wires every expander to return
+//!   lookup surface (`find`, `list`). [`Catalog::load`] runs the Phase
+//!   2 XDG loader in [`user::load_user_presets`], records shadow
+//!   conflicts, and defers the hard error to invocation time inside
+//!   [`Catalog::find`].
+//! - Each [`BuiltinPreset`] carries an `expand` function pointer so
+//!   that each built-in can implement its own expansion logic (trivial
+//!   for `npm` / `pypi` / …, non-trivial for `github-repo` /
+//!   `github-pr`). Phase 1 wires every expander to return
 //!   [`PresetError::NotImplemented`]; real bodies land in Phase 3.
-//! - The [`PresetError`] hierarchy is exhaustive at scaffolding time so
-//!   that Phases 2–6 can attach to existing variants rather than
-//!   growing the enum. Every variant has a `Display` impl that matches
-//!   the exact wording called out in the spec and Phase 0 decisions.
+//! - The [`PresetError`] hierarchy is exhaustive; Phases 3–6 attach to
+//!   existing variants rather than growing the enum. Every variant has
+//!   a `Display` impl that matches the wording called out in the spec
+//!   and Phase 0 decisions.
 
 // Phase 1 of M10-S5 ships the type and parser surface but no call
 // sites inside the binary (the `--preset` flag and the `sandbox policy
@@ -41,15 +43,21 @@
 #![allow(dead_code)]
 #![allow(unused_imports)]
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 pub mod builtin;
 pub mod param;
+pub mod user;
 
 // Re-export the public surface callers are expected to use in Phase 5.
 pub use builtin::{BUILTINS, BuiltinPreset};
 pub use param::ParsedInvocation;
+pub use user::{
+    ParamType, RawHttpFilter, RawHttpMethod, RawLevel, RawProtocol, RawRuleTemplate, UserParamSpec,
+    UserPreset,
+};
 
 /// A preset is either a compile-time built-in or a user-configured
 /// definition loaded from XDG.
@@ -85,28 +93,6 @@ impl Preset {
     }
 }
 
-/// A user-configured preset loaded from
-/// `$XDG_CONFIG_HOME/sandboxd/presets/<name>.json`.
-///
-/// Phase 1 defines the minimal shape. The Phase 2 XDG loader will
-/// populate these from disk; the raw `rules` blob (kept as
-/// `serde_json::Value`) is template-substituted at expand time in
-/// Phase 3.
-#[derive(Debug, Clone)]
-pub struct UserPreset {
-    /// Preset name (validated DNS-safe by the Phase 2 loader).
-    pub name: String,
-    /// Optional human-readable description.
-    pub description: Option<String>,
-    /// Raw `rules` JSON from the user file, retained verbatim so the
-    /// Phase 3 expander can template-substitute `${param}` references
-    /// in string positions before deserializing into [`sandbox_core::PolicyRule`]s.
-    pub rules: serde_json::Value,
-    /// Absolute path of the file this preset was loaded from.
-    /// Load-bearing for shadowing and duplicate-source error messages.
-    pub source_path: PathBuf,
-}
-
 /// In-memory index of all presets available to the running CLI
 /// invocation.
 #[derive(Debug)]
@@ -114,53 +100,83 @@ pub struct Catalog {
     /// Compile-time built-in presets.
     builtins: &'static [BuiltinPreset],
     /// User-configured presets loaded from the XDG presets dir.
-    /// Phase 1: always empty (loader lands in Phase 2).
     users: Vec<UserPreset>,
+    /// Names that exist as both a built-in and a user preset.
+    ///
+    /// D-3 makes shadowing a hard error, but fires it only when the
+    /// shadowed name is *invoked* — a latent user file that happens to
+    /// collide with a new built-in release should not break every
+    /// unrelated `sandbox` invocation. This map stores the path of the
+    /// offending user file keyed by the shadowed name so
+    /// [`Catalog::find`] can produce
+    /// [`PresetError::ShadowedName`] with full source attribution.
+    shadow_conflicts: HashMap<String, PathBuf>,
 }
 
 impl Catalog {
     /// Load the catalog, merging built-ins with user-configured presets.
     ///
-    /// `cli_xdg_override` is a test hook that the Phase 2 XDG loader
-    /// will honor (lets unit tests point at a tempdir instead of the
-    /// real `$XDG_CONFIG_HOME`). Phase 1's implementation ignores the
-    /// argument — the loader itself is scheduled for Phase 2.
-    pub fn load(cli_xdg_override: Option<&Path>) -> Self {
-        // TODO(M10-S5 Phase 2): XDG loader — populate `users` from
-        // `$XDG_CONFIG_HOME/sandboxd/presets/*.json`, honoring the
-        // `cli_xdg_override` test hook and the
-        // `$HOME/.config/sandboxd/presets/` fallback.
-        let _ = cli_xdg_override;
-        Catalog {
+    /// `cli_xdg_override` is a test hook honored by the XDG loader —
+    /// unit tests point at a tempdir instead of the real
+    /// `$XDG_CONFIG_HOME`. In production callers always pass `None`.
+    ///
+    /// Soft per-file errors (malformed JSON, invalid preset name,
+    /// duplicate params inside one preset) are written as warnings to
+    /// stderr by the loader and the offending file is skipped. Hard
+    /// cross-file errors (two files with the same `name`, or a preset
+    /// with more than one `repeatable` param) bubble up here as
+    /// [`PresetError`] and the CLI fails fast — these are operator
+    /// bugs that silent skipping would hide.
+    pub fn load(cli_xdg_override: Option<&Path>) -> Result<Self, PresetError> {
+        let users = user::load_user_presets(cli_xdg_override)?;
+
+        // Shadow-name detection runs at load time but the error fires
+        // only when the shadowed name is actually invoked (see
+        // `Catalog::find`). Rationale: a latent `my-internal.json` file
+        // that happens to collide with a future built-in must not break
+        // every unrelated CLI invocation.
+        let shadow_conflicts: HashMap<String, PathBuf> = users
+            .iter()
+            .filter(|u| BUILTINS.iter().any(|b| b.name == u.name.as_str()))
+            .map(|u| (u.name.clone(), u.source_path.clone()))
+            .collect();
+
+        Ok(Catalog {
             builtins: BUILTINS,
-            users: Vec::new(),
-        }
+            users,
+            shadow_conflicts,
+        })
     }
 
     /// Look up a preset by name.
     ///
-    /// Resolution:
-    /// - If the name exists as both a built-in and a user preset, this
-    ///   is a shadow error (D-3) regardless of any other consideration.
-    /// - Otherwise return the single matching preset.
-    /// - If no match exists, return [`PresetError::UnknownPreset`].
+    /// Resolution order (matches the spec's namespacing rule in Part 2
+    /// § "User-configured presets"):
+    /// 1. If `name` is in the shadow-conflict set (i.e. both a built-in
+    ///    and a user preset file declare it), return
+    ///    [`PresetError::ShadowedName`] naming the user file. D-3 is
+    ///    emphatic that user files cannot override built-ins.
+    /// 2. Otherwise return the matching built-in if any — built-ins
+    ///    win in the absence of a conflict.
+    /// 3. Otherwise return the matching user preset if any.
+    /// 4. Otherwise [`PresetError::UnknownPreset`].
     ///
     /// The returned user preset is cloned; built-ins are returned by
-    /// `&'static` reference.  Phase 1 has no user presets in play (the
-    /// XDG loader lands in Phase 2), so the clone cost is moot.
+    /// `&'static` reference.
     pub fn find(&self, name: &str) -> Result<Preset, PresetError> {
-        let user = self.users.iter().find(|u| u.name == name);
-        let builtin = self.builtins.iter().find(|b| b.name == name);
-
-        match (builtin, user) {
-            (Some(_), Some(u)) => Err(PresetError::ShadowedName {
+        if let Some(user_path) = self.shadow_conflicts.get(name) {
+            return Err(PresetError::ShadowedName {
                 name: name.to_string(),
-                user_path: u.source_path.clone(),
-            }),
-            (Some(b), None) => Ok(Preset::Builtin(b)),
-            (None, Some(u)) => Ok(Preset::User(u.clone())),
-            (None, None) => Err(PresetError::UnknownPreset(name.to_string())),
+                user_path: user_path.clone(),
+            });
         }
+        if let Some(b) = self.builtins.iter().find(|b| b.name == name) {
+            return Ok(Preset::Builtin(b));
+        }
+        if let Some(u) = self.users.iter().find(|u| u.name == name) {
+            return Ok(Preset::User(u.clone()));
+        }
+        Err(PresetError::UnknownPreset(name.to_string()))
     }
 
     /// Enumerate every preset in the catalog, sorted alphabetically by
@@ -306,6 +322,24 @@ pub enum PresetError {
     /// Phase 1 seeds every built-in's `expand` fn pointer with this
     /// error; Phase 3 replaces each one with the real body.
     NotImplemented { name: String },
+
+    /// Two user preset files in the XDG preset directory declare the
+    /// same `name`. This is a hard error (not warn-and-skip) — silent
+    /// skipping would let whichever file won the directory-iteration
+    /// race determine the preset bodies, which is exactly the class of
+    /// "explicit everything" bug the M10-S5 design exists to prevent.
+    DuplicateUserPresetName {
+        name: String,
+        path_a: PathBuf,
+        path_b: PathBuf,
+    },
+
+    /// A user preset file declared more than one `repeatable: true`
+    /// param. Spec Part 2 lines 601-607 reserve multi-repeatable
+    /// semantics for built-ins (the paired `repo=`/`pr=` shape of
+    /// `github-pr`) because the CLI needs hand-written pairing logic
+    /// that a JSON template cannot express.
+    TooManyRepeatableParams { path: PathBuf, count: usize },
 }
 
 impl fmt::Display for PresetError {
@@ -346,6 +380,23 @@ impl fmt::Display for PresetError {
             PresetError::NotImplemented { name } => {
                 write!(f, "preset '{name}' expander is not implemented yet")
             }
+            PresetError::DuplicateUserPresetName {
+                name,
+                path_a,
+                path_b,
+            } => write!(
+                f,
+                "preset '{name}' is defined by two user files:\n  - {}\n  - {}\nrename or delete one of them.",
+                path_a.display(),
+                path_b.display()
+            ),
+            PresetError::TooManyRepeatableParams { path, count } => write!(
+                f,
+                "user preset file {} declares {count} repeatable params; \
+                 at most one is allowed (the built-in 'github-pr' is the only \
+                 multi-repeatable shape supported, and it lives in CLI code)",
+                path.display()
+            ),
         }
     }
 }
@@ -355,10 +406,31 @@ impl std::error::Error for PresetError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    /// Build an empty-but-existent XDG preset override directory so
+    /// `Catalog::load` is hermetic with respect to the host
+    /// `$XDG_CONFIG_HOME` / `$HOME`. Returned `TempDir` lives as long
+    /// as the caller keeps the binding alive.
+    fn empty_xdg_override() -> TempDir {
+        TempDir::new().expect("tempdir")
+    }
+
+    /// Write a user preset file into the override dir.
+    fn write_user_preset(dir: &Path, filename: &str, body: &str) -> PathBuf {
+        let path = dir.join(filename);
+        let mut f = File::create(&path).expect("create user preset file");
+        f.write_all(body.as_bytes())
+            .expect("write user preset body");
+        path
+    }
 
     #[test]
     fn find_unknown_preset_returns_unknown_preset_error() {
-        let catalog = Catalog::load(None);
+        let xdg = empty_xdg_override();
+        let catalog = Catalog::load(Some(xdg.path())).expect("empty dir loads clean");
         let err = catalog.find("does-not-exist").expect_err("should fail");
         match err {
             PresetError::UnknownPreset(name) => assert_eq!(name, "does-not-exist"),
@@ -368,7 +440,8 @@ mod tests {
 
     #[test]
     fn find_known_builtin_returns_builtin_variant() {
-        let catalog = Catalog::load(None);
+        let xdg = empty_xdg_override();
+        let catalog = Catalog::load(Some(xdg.path())).expect("empty dir loads clean");
         let preset = catalog.find("npm").expect("npm is a scaffolded built-in");
         assert!(matches!(preset, Preset::Builtin(_)));
         assert_eq!(preset.name(), "npm");
@@ -376,19 +449,114 @@ mod tests {
 
     #[test]
     fn list_includes_all_eleven_builtins_sorted() {
-        let catalog = Catalog::load(None);
+        let xdg = empty_xdg_override();
+        let catalog = Catalog::load(Some(xdg.path())).expect("empty dir loads clean");
         let summaries = catalog.list();
-        // Phase 1 ships 11 built-ins (no user presets).
+        // Phase 2 still ships only 11 built-ins (no user presets in
+        // the empty override dir).
         assert_eq!(summaries.len(), 11);
         // Alphabetical sort.
         let names: Vec<&str> = summaries.iter().map(|s| s.name.as_str()).collect();
         let mut sorted = names.clone();
         sorted.sort();
         assert_eq!(names, sorted);
-        // Every row is a built-in (no user presets in Phase 1).
+        // Every row is a built-in (no user presets in the empty
+        // override).
         for s in &summaries {
             assert_eq!(s.source, PresetSource::Builtin);
         }
+    }
+
+    #[test]
+    fn find_shadowed_name_returns_shadowed_error_with_user_path() {
+        // A user file named `npm.json` tries to shadow the built-in
+        // `npm`. Per D-3 this is an invocation-time hard error.
+        let xdg = empty_xdg_override();
+        let body = r#"{
+            "name": "npm",
+            "description": "internal override",
+            "params": [],
+            "rules": []
+        }"#;
+        let user_path = write_user_preset(xdg.path(), "npm.json", body);
+        let catalog = Catalog::load(Some(xdg.path())).expect("load succeeds; shadow is deferred");
+
+        let err = catalog.find("npm").expect_err("shadowed name must error");
+        match err {
+            PresetError::ShadowedName {
+                name,
+                user_path: got,
+            } => {
+                assert_eq!(name, "npm");
+                assert_eq!(got, user_path);
+            }
+            other => panic!("expected ShadowedName, got {other:?}"),
+        }
+
+        // A non-shadowed built-in is unaffected by the latent shadow.
+        let pypi = catalog.find("pypi").expect("pypi remains reachable");
+        assert!(matches!(pypi, Preset::Builtin(_)));
+    }
+
+    #[test]
+    fn find_non_shadowed_user_preset_returns_user_variant() {
+        let xdg = empty_xdg_override();
+        let body = r#"{
+            "name": "my-internal",
+            "description": "internal thing",
+            "params": [
+                {"name": "env", "type": "string", "required": true, "repeatable": false}
+            ],
+            "rules": [
+                {
+                    "host": "api.${env}.internal",
+                    "port": 443,
+                    "protocol": "tcp",
+                    "level": "tls"
+                }
+            ]
+        }"#;
+        write_user_preset(xdg.path(), "my-internal.json", body);
+        let catalog = Catalog::load(Some(xdg.path())).expect("load succeeds");
+
+        let preset = catalog
+            .find("my-internal")
+            .expect("user preset should resolve when not shadowing");
+        match preset {
+            Preset::User(u) => {
+                assert_eq!(u.name, "my-internal");
+                assert_eq!(u.description.as_deref(), Some("internal thing"));
+                assert_eq!(u.rules.len(), 1);
+            }
+            other => panic!("expected User variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_includes_user_presets() {
+        let xdg = empty_xdg_override();
+        let body = r#"{
+            "name": "my-internal",
+            "description": "internal thing",
+            "params": [],
+            "rules": []
+        }"#;
+        let user_path = write_user_preset(xdg.path(), "my-internal.json", body);
+        let catalog = Catalog::load(Some(xdg.path())).expect("load succeeds");
+
+        let summaries = catalog.list();
+        assert_eq!(summaries.len(), 12, "11 built-ins + 1 user preset");
+        let user_summary = summaries
+            .iter()
+            .find(|s| s.name == "my-internal")
+            .expect("user preset must appear in list");
+        assert_eq!(
+            user_summary.source,
+            PresetSource::User {
+                path: user_path.clone()
+            }
+        );
+        assert_eq!(user_summary.description.as_deref(), Some("internal thing"));
     }
 
     #[test]
@@ -438,5 +606,30 @@ mod tests {
             err.to_string(),
             "preset 'npm' is defined by both a built-in and a user file at\n  /home/alice/.config/sandboxd/presets/npm.json\nuser presets cannot shadow built-ins; rename or delete the user file."
         );
+    }
+
+    #[test]
+    fn duplicate_user_preset_name_display_names_both_paths() {
+        let err = PresetError::DuplicateUserPresetName {
+            name: "samename".to_string(),
+            path_a: PathBuf::from("/etc/sandboxd/presets/a.json"),
+            path_b: PathBuf::from("/etc/sandboxd/presets/b.json"),
+        };
+        assert_eq!(
+            err.to_string(),
+            "preset 'samename' is defined by two user files:\n  - /etc/sandboxd/presets/a.json\n  - /etc/sandboxd/presets/b.json\nrename or delete one of them."
+        );
+    }
+
+    #[test]
+    fn too_many_repeatable_params_display_names_file_and_count() {
+        let err = PresetError::TooManyRepeatableParams {
+            path: PathBuf::from("/etc/sandboxd/presets/x.json"),
+            count: 3,
+        };
+        let rendered = err.to_string();
+        assert!(rendered.contains("/etc/sandboxd/presets/x.json"));
+        assert!(rendered.contains("3 repeatable params"));
+        assert!(rendered.contains("at most one is allowed"));
     }
 }
