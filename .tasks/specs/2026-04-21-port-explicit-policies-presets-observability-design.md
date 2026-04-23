@@ -373,11 +373,11 @@ shape) as a defensive check. It does not parse or expand presets.
 
 ### CLI shape
 
-**Application of presets** — via flags on `sandbox start` and `sandbox
+**Application of presets** — via flags on `sandbox create` and `sandbox
 policy update`:
 
 ```bash
-sandbox start --policy p.json \
+sandbox create --policy p.json \
   --preset 'cargo:' \
   --preset 'pypi:' \
   --preset 'github-repo:repo=foo/bar,repo=baz/qux'
@@ -716,7 +716,7 @@ Gateway and daemon control-plane state changes. All under `layer:
 |---|---|---|
 | `gateway_booting` | — | Gateway container starting (sandboxd initiated) |
 | `gateway_ready` | — | Gateway passed startup checks (CoreDNS, Envoy, mitmproxy, deny-logger all responding) |
-| `policy_applied` | `policy` (full effective policy object), `source_presets` (array of `--preset` invocation strings sent by the CLI, empty if none), `status` (`ok` / `error`), `error` (on error) | Initial `sandbox start --policy ...` |
+| `policy_applied` | `policy` (full effective policy object), `source_presets` (array of `--preset` invocation strings sent by the CLI, empty if none), `status` (`ok` / `error`), `error` (on error) | Initial `sandbox create --policy ...` |
 | `policy_updated` | same shape as `policy_applied`, plus `previous_policy_hash` for diff attribution | Subsequent `sandbox policy update ...` |
 | `policy_reset_on_upgrade` | `session`, `previous_rule_count` | Emitted once per session on first access after V004 migration removed its v1-shaped rules (see Part 1 schema bump) |
 | `health_degraded` | `component` (which subcomponent failed: `deny-logger`, `envoy`, `mitmproxy`, `coredns`), `reason` | Healthcheck failed |
@@ -1205,3 +1205,12 @@ these functions have no caller after this spec):*
 The doc edits under (1) and (2) should be applied to the L3 spec once
 this spec is accepted. The implementation changes in all four points
 are part of this spec's release.
+
+## Amendment (reconciliation) — CLI verb for session creation
+
+CLI verb for session creation is `create`, not `start`; `start` is
+resume-only. Earlier revisions of this spec placed `--policy` and
+`--preset` flags on `sandbox start` in the Part 2 "CLI shape" block
+and in the Part 3 `policy_applied` lifecycle-event row; both sites
+have been reconciled to `sandbox create`. No behavioral change — this
+is a documentation fix.
