@@ -420,6 +420,18 @@ def test_level2_tls_verified(sandbox_cli):
         session_id = parse_session_id(result.stdout)
         wait_for_state(sandbox_cli, "pol-l2-tls", "Running", timeout=10)
 
+        # Warm DNS so the daemon's propagation loop materialises the
+        # per-rule Envoy filter chain and the sandbox_policy nftables
+        # concat-set entry (ip, 443) for example.com. L2 is fail-closed
+        # at empty cache just like L1; mirrors the warmup in
+        # test_level1_transport_tcp.
+        sandbox_cli(
+            "ssh", "pol-l2-tls", "--",
+            "nslookup", "example.com",
+            timeout=120,
+        )
+        time.sleep(5)
+
         # curl https://example.com should succeed.
         curl_result = sandbox_cli(
             "ssh", "pol-l2-tls", "--",
