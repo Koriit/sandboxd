@@ -74,7 +74,7 @@ docs-dev:
 	cd site && npm install && npm run dev
 
 docs-build:
-	cd site && npm install && npm run build
+	cd site && npm ci && npm run build
 
 clean:
 	cd sandboxd && cargo clean
