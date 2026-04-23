@@ -186,8 +186,9 @@ def _wait_policy_propagated(
     # Multi-host presets: --wait returns when daemon's DNS-propagation loop
     # flips propagated=true, but multi-host cases still race against Envoy
     # cluster DNS resolution / nftables enforcement settling (~sub-second
-    # window). 3s settle is a band-aid until the real fix lands (todo #40).
-    time.sleep(3)
+    # window). 8s settle matches pre-M10-S6 timing baseline (sleep(5) +
+    # warm_dns + sleep(5) that passed 5/5 on e18baa2) until todo #40 lands.
+    time.sleep(8)
 
 
 # ---------------------------------------------------------------------------
