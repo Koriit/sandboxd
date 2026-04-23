@@ -15,6 +15,8 @@ use sandbox_core::{
 };
 use tokio::net::UnixStream;
 
+mod presets;
+
 /// CLI client for managing sandbox sessions.
 #[derive(Parser, Debug)]
 #[command(name = "sandbox", about = "Manage sandbox sessions")]
