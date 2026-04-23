@@ -76,6 +76,7 @@ Test runner: cargo-nextest (config at `sandboxd/.config/nextest.toml`).
 - Handler return type is `impl IntoResponse` — use `match` on spawn_blocking results, not `?` operator
 - Socket path default: `$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock` (falls back to `~/.local/share/sandboxd/sandboxd.sock`). Both the daemon and CLI honor the `SANDBOX_SOCKET` env var as an override; an explicit `--socket` flag takes precedence over the env var.
 - Git remote helper: `git-remote-sandbox` symlink to `sandbox` binary, uses `sandbox::session/repo-path` URLs
+- Config files: all config files (daemon, CLI, per-session metadata) use JSON — not TOML, not YAML
 
 ## On-disk compatibility
 
