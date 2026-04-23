@@ -122,7 +122,7 @@ flowchart TB
     Policy["Policy (JSON)"]
     Compiler["Policy compiler"]
     CoreDNS["CoreDNS<br/>(allowed domains)"]
-    NFT["nftables<br/>(allowed IPs / CIDRs)"]
+    NFT["nftables<br/>(allowed (IP, port) pairs)"]
     Envoy["Envoy<br/>(per-destination route)"]
     MITM["mitmproxy<br/>(HTTP filters)"]
 
@@ -134,17 +134,29 @@ flowchart TB
 ```
 
 - **CoreDNS** receives the allow-list of domains. Allowed names resolve normally; everything else returns `NXDOMAIN`. Resolved IPs are fed back to sandboxd to keep nftables current.
-- **nftables** blocks traffic to any IP not covered by the policy (either a CIDR literal or a DNS-learned IP). Default-deny; one rule's worth of opening per allowed destination.
-- **Envoy** receives all TCP that survives the firewall and picks a route per level: passthrough for `transport`, SNI-verified passthrough for `tls`, mitmproxy handoff for `http`.
-- **mitmproxy** handles only `http` traffic. It terminates TLS with the per-session CA, matches the request against the rule's `http_filters`, and either forwards or rejects with a 599 response carrying the denial reason.
+- **nftables** blocks traffic to any `(destination-IP, destination-port)` pair not covered by the policy — populated from CIDR literals (expanded to `/32` entries for resolved IPs of a domain, or the CIDR itself for literal rules) crossed with the rule's explicit port. Anything else is redirected to the deny-logger, which RST-closes the flow and emits a structured `deny` event.
+- **Envoy** receives all TCP that survives the firewall and picks a filter chain whose `filter_chain_match` combines `prefix_ranges` (destination IPs) with an explicit `destination_port`. The chain then routes per level: passthrough for `transport`, SNI-verified passthrough for `tls`, loopback CONNECT to mitmproxy for `http`.
+- **mitmproxy** handles only `http` traffic. It terminates TLS with the per-session CA, strips the query string from the request path, matches against the rule's `http_filters`, and either forwards or rejects with a 599 response carrying the denial reason.
 
 The practical consequence: a `transport` rule touches three components (DNS, nftables, Envoy) and a `http` rule touches all four. Moving a rule to a higher level does not add access — it adds inspection.
 
+Because every rule carries an explicit port and protocol (v2 policy schema), every layer matches on the same `(destination, port, protocol)` tuple. An `api.example.com:443` rule does not inadvertently open `api.example.com:80` — a connection to port 80 would miss every layer's allow predicate and be denied.
+
 ## Applying policies
 
-Policies are a property of a session. You attach one at creation with `--policy <file>` and update it live with `sandbox policy update`. The update path re-compiles and hot-reloads all four components without restarting the session. See the [network policies guide](/guides/network-policies/) for the commands.
+Policies are a property of a session. You attach one at creation with `--policy <file>` and/or one or more `--preset <invocation>` flags, and update them live with `sandbox policy update`. The update path re-compiles and hot-reloads all four components without restarting the session. See the [network policies guide](/guides/network-policies/) for the commands.
 
 For debugging what the active policy allows, `sandbox describe` prints a human summary and `sandbox inspect` returns the full JSON representation. See the [CLI reference](/reference/cli/) for output shapes.
+
+## Presets
+
+Presets are reusable host-list templates that the CLI expands into v2 policy rules before the request ever reaches the daemon. Ten built-ins ship with every CLI release (`npm:`, `pypi:`, `cargo:`, `goproxy:`, `maven:`, `gradle:`, `dockerhub:`, `github:`, `github-repo:`, `github-pr:`), and user-defined JSON presets under `$XDG_CONFIG_HOME/sandboxd/presets/` extend the catalog for site-specific destinations.
+
+Expansion is entirely client-side — the daemon receives the fully materialized effective policy and stores the original `--preset` invocation strings as a `source_presets` audit trail attached to the `policy_applied` / `policy_updated` events. See the [network policies guide → Presets](/guides/network-policies/#presets) for invocation syntax, built-in catalog, and user-preset authoring rules.
+
+## Observability
+
+Every policy-enforcing component (CoreDNS, Envoy, mitmproxy, deny-logger) emits a structured event per decision, and sandboxd itself emits lifecycle events — including `policy_applied`, `policy_updated`, `policy_propagated`, `gateway_ready`, and `gateway_shutdown`. All of them land in a unified per-session stream you can replay or follow with `sandbox events <session>`. The `policy_propagated` event in particular closes the DNS-propagation window: it fires once the applied policy's hash has reconciled across CoreDNS, the nftables `policy_allow_{tcp,udp}` sets, and Envoy's L3 filter chains. See [`sandbox events`](/reference/cli/#sandbox-events) for the full CLI surface and [networking → Fail-closed propagation](/concepts/networking/#fail-closed-propagation-for-level-3) for why the propagation is observable at all.
 
 ## Related reading
 

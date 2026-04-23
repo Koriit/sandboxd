@@ -16,7 +16,7 @@ flowchart LR
     VM["Session VM"]
     Guest["sandbox-guest<br/>(TCP :5123)"]
     Bridge["Docker bridge<br/>(per session)"]
-    Gateway["Gateway container<br/>Envoy · mitmproxy · CoreDNS"]
+    Gateway["Gateway container<br/>Envoy · mitmproxy · CoreDNS · deny-logger"]
     Internet(["Internet"])
 
     CLI -- "HTTP over<br/>Unix socket" --> Daemon
@@ -46,7 +46,8 @@ Responsibilities:
 - Compile and distribute network policies to gateway components.
 - Relay command execution, file transfer, and git operations to the guest agent.
 - Maintain a SQLite database of sessions and their network info.
-- Run background DNS propagation loops that update nftables rules and Envoy L3 filter chains as DNS resolutions change.
+- Run background DNS propagation loops that update nftables `policy_allow_{tcp,udp}` sets and Envoy L3 filter chains as DNS resolutions change, and emit a `policy_propagated` lifecycle event once the applied policy has reconciled across all three enforcement layers.
+- Ingest structured decisions from CoreDNS, Envoy, mitmproxy, and the deny-logger; publish them alongside sandboxd's own lifecycle events on a per-session event bus backed by a bounded ring buffer and a JSONL disk log.
 
 Key modules (in `sandbox-core`):
 
@@ -58,12 +59,13 @@ Key modules (in `sandbox-core`):
 - `CaManager` — generates and manages per-session CA certificates.
 - `PolicyCompiler` — transforms policy rules into component-specific configurations.
 - `PolicyDistributor` — pushes compiled configurations to gateway components.
+- `EventBus` and per-session ingestors — read the gateway's JSONL access logs (Envoy, mitmproxy, deny-logger) and the CoreDNS policy-plugin log, plus sandboxd's own lifecycle transitions, into a unified event stream with a per-session ring buffer and a disk-backed replay log.
 
 ### sandbox (CLI)
 
 A thin client that builds HTTP requests and sends them to the daemon over the Unix socket. Most commands map directly to a single API call.
 
-Commands handled via the HTTP API: `create`, `start`, `stop`, `rm`, `ps`/`ls`, `exec`, `policy update`, `health`.
+Commands handled via the HTTP API: `create`, `start`, `stop`, `rm`, `ps`/`ls`, `exec`, `policy update`, `policy preset`, `events`, `health`.
 
 Commands handled specially:
 
@@ -98,15 +100,16 @@ Contains all shared types, configuration structures, and business logic used by 
 
 ### Gateway container
 
-A Docker container running per session that mediates all outbound traffic from the VM. It bundles three components:
+A Docker container running per session that mediates all outbound traffic from the VM. It bundles four components:
 
 | Component | Role |
 |-----------|------|
 | **Envoy** | L4/L7 proxy that routes connections based on policy assurance levels |
 | **mitmproxy** | HTTPS interceptor for full-inspection (level 3) traffic |
 | **CoreDNS** | DNS server with policy filtering (blocks disallowed domains) |
+| **deny-logger** | Sink for VM traffic that matches no allow rule; recovers the pre-DNAT destination via `SO_ORIGINAL_DST` / `IP_ORIGDSTADDR` and emits a structured `deny` event per attempt |
 
-The gateway also runs nftables rules in its network namespace to enforce deny-by-default firewall behavior and DNAT traffic into the proxy pipeline.
+The gateway also runs nftables rules in its network namespace to enforce deny-by-default firewall behavior and route each packet either to Envoy (policy-allowed destinations) or to the deny-logger (everything else). Each component writes structured per-decision records to a per-session JSONL log on a host-side bind mount; sandboxd ingests those logs into the unified event stream and relays them to clients via `sandbox events`.
 
 ## Session lifecycle
 
@@ -131,7 +134,7 @@ A session moves through these states:
 4. **Guest agent.** The `sandbox-guest` binary is copied into the VM and started. The daemon verifies connectivity with a ping.
 5. **Gateway + Network config.** The gateway container is created on the Docker bridge. The VM's bridge NIC is configured with a static IP via the guest agent. The CA certificate is injected into the VM's trust store.
 6. **State transition.** Session state moves to `Running`.
-7. **Policy.** If `--policy` was provided, the policy is compiled and distributed to gateway components. A DNS propagation loop is started.
+7. **Policy.** If `--policy` or `--preset` was provided, the effective policy (preset expansions merged with the file) is compiled and distributed to gateway components. A `policy_applied` lifecycle event is emitted carrying the full effective policy plus the CLI's original `source_presets` invocation strings. A DNS propagation loop is started; once the loop has reconciled nftables allow sets and Envoy L3 filter chains to the applied policy, sandboxd emits `policy_propagated` with the policy's SHA-256 hash.
 8. **Workspace.** If `--repo` was provided, the repository is cloned into `/home/agent/workspace/`. If `--workspace shared:<path>` was provided, the host directory is mounted via 9p.
 9. **Boot command.** If `--boot-cmd` was provided, it is executed via the guest agent.
 
@@ -199,6 +202,7 @@ sandbox prints stdout, exits with code 0
 | POST | `/sessions/{id}/upload` | `upload_to_session` | Upload a file |
 | POST | `/sessions/{id}/download` | `download_from_session` | Download a file |
 | POST | `/sessions/{id}/policy` | `update_policy` | Update network policy |
+| GET | `/sessions/{id}/events` | `get_events` | Replay or stream the session's event stream (traffic + lifecycle) |
 | GET | `/sessions/{id}/health` | `session_health` | Per-session health |
 | GET | `/health` | `health_check` | Global health |
 | POST | `/rebuild-image` | `rebuild_image` | Rebuild the pre-baked base VM image |

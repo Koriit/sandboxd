@@ -11,7 +11,7 @@ Each session is a closed loop:
 
 - A **per-session Docker bridge** (a `/28` subnet) — the only L2 segment the VM touches.
 - A **gateway container** attached to that bridge — the only L3 next hop the VM can reach.
-- Inside the gateway: **nftables** for default-deny firewalling and DNAT, **CoreDNS** for policy-filtered DNS, **Envoy** for connection routing, **mitmproxy** for TLS inspection.
+- Inside the gateway: **nftables** for default-deny firewalling and conditional DNAT, **CoreDNS** for policy-filtered DNS, **Envoy** for connection routing, **mitmproxy** for TLS inspection, and a **deny-logger** that catches traffic no allow rule matched.
 - A **per-session CA** trusted inside the VM, with the private key living only inside the gateway.
 
 There is no alternate path out for application traffic. The VM's data NIC routes through the gateway, and the gateway denies everything by default.
@@ -57,7 +57,7 @@ Session IDs are 12 lowercase hex characters, chosen so the derived network-resou
 
 ## The gateway
 
-The gateway container is the session's single exit. It runs three cooperating processes plus an nftables ruleset in its own network namespace.
+The gateway container is the session's single exit. It runs four cooperating processes plus an nftables ruleset in its own network namespace.
 
 ### nftables
 
@@ -66,20 +66,23 @@ The gateway holds three nftables tables, each with a distinct role:
 | Table | Purpose |
 |---|---|
 | `sandbox` | Deny-all baseline — forward chain drops everything |
-| `sandbox_dnat` | PREROUTING DNAT — DNS to CoreDNS, TCP to Envoy |
-| `sandbox_policy` | Allow rules for IPs learned from DNS responses |
+| `sandbox_dnat` | PREROUTING DNAT — DNS to CoreDNS; policy-allowed TCP/UDP conditionally to Envoy, everything else to the deny-logger |
+| `sandbox_policy` | Envoy-egress allow list — IPs learned from DNS responses plus policy CIDRs |
 
-The deny-all baseline is the safety net. Traffic reaches the internet only after being matched by the DNAT rules, forwarded to a gateway component, and allowed out by the policy-driven `sandbox_policy` table. Level-3 (HTTPS inspection) traffic is no longer routed through nftables DNAT; Envoy sends it to mitmproxy itself over a loopback CONNECT tunnel (see [Request flow](#request-flow) below).
+`sandbox_dnat` carries two concat sets, `policy_allow_tcp` and `policy_allow_udp`, keyed on `(destination-IP, destination-port)`. PREROUTING packets whose `(daddr, dport)` is in the set are DNAT-redirected to Envoy's intercepting listener on `127.0.0.1:10000`; packets outside the set (TCP **or** UDP) are redirected to the deny-logger on `127.0.0.1:10001` (TCP) / `127.0.0.1:10002` (UDP). The deny-logger records the pre-DNAT 5-tuple (see the `deny` event under [`sandbox events`](/reference/cli/#sandbox-events)) and closes TCP with `SO_LINGER{1,0}` so the VM sees a RST immediately instead of a silent hang.
 
-### Three processes
+The deny-all baseline in the `sandbox` table is the safety net: even if `sandbox_dnat` disappeared, no forwarded packet would leave the namespace. Level-3 (HTTPS inspection) traffic is not routed through nftables DNAT a second time; Envoy itself opens a loopback CONNECT tunnel to mitmproxy on `127.0.0.1:18080` (see [Request flow](#request-flow) below).
+
+### Four processes
 
 | Component | What it does |
 |---|---|
 | **CoreDNS** | Answers all DNS queries; returns `NXDOMAIN` for anything the policy does not list |
 | **Envoy** | Receives redirected TCP; routes connections per the policy's assurance level |
 | **mitmproxy** | Terminates TLS with the per-session CA for HTTP-level inspection |
+| **deny-logger** | TCP `:10001`, UDP `:10002`, healthcheck `:10003`; recovers the pre-DNAT destination via `SO_ORIGINAL_DST` / `IP_ORIGDSTADDR` and emits a structured `deny` event per attempt |
 
-Startup is ordered to avoid a window where traffic could leak: mitmproxy comes up first, then Envoy, then CoreDNS. The DNAT rules in `sandbox_dnat` are installed only after all three pass their readiness checks.
+Startup is ordered to avoid a window where traffic could leak: deny-logger and mitmproxy come up first, then Envoy, then CoreDNS. The DNAT rules in `sandbox_dnat` are installed only after all four pass their readiness checks.
 
 ### Why a container, not the host
 
@@ -120,10 +123,14 @@ sequenceDiagram
 
 On the Level 3 path, Envoy routes the TCP flow into its `mitmproxy` upstream cluster with a per-chain `tcp_proxy.tunneling_config` whose hostname is `%DOWNSTREAM_LOCAL_ADDRESS%` — the original destination recovered from `SO_ORIGINAL_DST` on the intercepting listener. That produces an HTTP/1.1 `CONNECT <orig-ip>:<port>` request to mitmproxy on `127.0.0.1:18080`, which runs in regular forward-proxy mode. mitmproxy terminates TLS inside the tunnel with the per-session CA, inspects the request, and re-establishes a verified TLS connection to the real destination. mitmproxy is bound to loopback only; the VM cannot reach it directly.
 
+L3 filter-chain selection is **port-explicit**: Envoy's chain `filter_chain_match` predicate carries both a `prefix_ranges` list (the destination IPs learned for the rule's host) *and* a `destination_port`. A connection whose `(dst_ip, dst_port)` does not match both is passed to no L3 chain — it is dropped. That mirrors the v2 policy shape (every rule declares an explicit port), so an `api.example.com:443` rule does not inadvertently open `api.example.com:80`.
+
+When mitmproxy matches the request against a rule's `http_filters`, the path is stripped of its query string first — the matcher sees `/api/v1/resource`, not `/api/v1/resource?token=abc&redirect=...`. A `GET /api/v1/**` filter therefore matches the request regardless of what the caller appended after `?`. The full path (query string included) is still logged on the `request_allowed` / `request_denied` event so operators can see what the caller actually sent.
+
 Two things are worth highlighting:
 
 - **DNS is intercepted twice.** The VM's `resolv.conf` points at the gateway, *and* nftables DNATs port 53 regardless of destination. An application that ignores `resolv.conf` and hardcodes `8.8.8.8` still ends up at CoreDNS.
-- **Direct-IP access is not a loophole.** Even if an application skips DNS and dials an IP directly, it hits the `sandbox_policy` table. Unless the IP is already in the allow list (from a policy CIDR rule or a recent CoreDNS answer), the packet is dropped.
+- **Direct-IP access is not a loophole.** Even if an application skips DNS and dials an IP directly, its `(daddr, dport)` must be in `policy_allow_{tcp,udp}` (populated from policy CIDRs plus CoreDNS-learned IPs for the matching rule's port) for the DNAT to Envoy to fire. Anything else is redirected to the deny-logger, which records the attempt and RST-closes the flow.
 
 ## DNS
 
@@ -135,7 +142,7 @@ CoreDNS is the only resolver the VM reaches.
 
 ### Fail-closed propagation for Level 3
 
-Level-3 (HTTPS-inspected) destinations are selected by matching the connection's original destination IP against per-chain `prefix_ranges` on Envoy's filter chains. Those IPs come from the same DNS learning loop that drives `sandbox_policy`: when CoreDNS answers a policy-allowed name, sandboxd rewrites the Envoy listener file and Envoy picks up the new chain via xDS.
+Level-3 (HTTPS-inspected) destinations are selected by matching the connection's original destination IP *and* port against per-chain `prefix_ranges` + `destination_port` on Envoy's filter chains. Those IPs come from the same DNS learning loop that drives `sandbox_policy`: when CoreDNS answers a policy-allowed name, sandboxd rewrites the Envoy listener file and Envoy picks up the new chain via xDS.
 
 The propagation is **fail-closed**, not fail-open:
 
@@ -143,6 +150,12 @@ The propagation is **fail-closed**, not fail-open:
 - An application that dials an IP literal it learned out-of-band, or uses a stale cached DNS answer after a policy change that removed the name, will also fail closed for the same reason.
 
 The practical consequence is that the very first request to a brand-new L3 destination, issued immediately after a `policy update`, can race the propagation loop and be refused. Retrying — or warming DNS with a prior lookup — closes the race. See [troubleshooting](/guides/troubleshooting/#l3-destination-fails-on-first-request-after-policy-change) for the operator-side view of this.
+
+The propagation loop publishes a `policy_propagated` lifecycle event once all three enforcement layers (CoreDNS, nftables `policy_allow_{tcp,udp}` sets, and Envoy's L3 filter chains) have reconciled to the latest applied policy. The event carries `policy_hash`, the SHA-256 hex digest of the canonical JSON form of the effective policy, and is emitted only on hash transitions (so a steady state produces no repeat events). Scripts that need to wait for the new policy to be live can observe that event via `sandbox events --event policy_propagated --follow`, or invoke `sandbox policy status --wait` to block until the hash transitions.
+
+### Event attribution
+
+Every policy-enforcing component emits structured events that sandboxd ingests and publishes on a per-session ring buffer. Most layers carry the VM's bridge IP on the record, and sandboxd stamps the envelope `session` by looking up `(vm_ip → session_id)` at ingest time. mitmproxy is the exception: by the time a request reaches the addon, the TCP peer is Envoy's loopback-connect source, not the VM. So the mitmproxy ingestor attributes its events to the **per-session watcher** that produced the line — one watcher per session, reading that session's mitmproxy JSONL log — rather than via the VM-IP map. Deny-logger events use the pre-DNAT `src_ip` from `SO_ORIGINAL_DST` / `IP_ORIGDSTADDR`, which is the VM's bridge IP, and go back through the VM-IP map. See [`sandbox events`](/reference/cli/#sandbox-events) for the replay/stream surface.
 
 ## TLS interception
 
