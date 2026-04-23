@@ -1365,6 +1365,13 @@ fn build_events_query_string(args: &EventsArgs) -> String {
 ///
 /// Callers drive this per body frame; the function has no knowledge of
 /// HTTP framing or chunked transfer — just line framing.
+///
+/// # Invariant
+///
+/// After every call, the buffer never contains an already-consumed
+/// `\n`: each iteration drains bytes through the newline inclusively
+/// via `split_off(pos + 1)`, so the residue is strictly the bytes that
+/// come after the last `\n` seen so far.
 fn split_jsonl_lines(buffer: &mut Vec<u8>) -> Vec<String> {
     let mut out = Vec::new();
     while let Some(pos) = buffer.iter().position(|&b| b == b'\n') {
@@ -1382,13 +1389,6 @@ fn split_jsonl_lines(buffer: &mut Vec<u8>) -> Vec<String> {
     }
     out
 }
-
-/// Minimal helper: mutate the buffer in place by removing the line at
-/// `range` plus the trailing newline. Not used directly — extracted
-/// conceptually into `split_jsonl_lines`. Kept here to document the
-/// invariant that the buffer never contains an already-consumed `\n`.
-#[cfg(test)]
-fn _jsonl_splitter_invariant_note() {}
 
 // --- Table renderer ---------------------------------------------------------
 //

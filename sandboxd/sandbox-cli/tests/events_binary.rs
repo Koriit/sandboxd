@@ -32,7 +32,6 @@
 //! tests of helper functions cannot observe.
 
 use std::process::Stdio;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -80,26 +79,13 @@ async fn spawn_test_server() -> (TempDir, String, tokio::task::JoinHandle<()>) {
     // handler ignores the session id.
     let app: Router = Router::new().route("/sessions/{session}/events", get(events_handler));
 
-    // `axum::serve` over a `UnixListener` Just Works in axum 0.8. We
-    // use graceful shutdown on the server drop so a leftover task
-    // can't leak across test cases.
-    let shutdown = Arc::new(tokio::sync::Notify::new());
-    let shutdown_clone = Arc::clone(&shutdown);
-
+    // `axum::serve` over a `UnixListener` Just Works in axum 0.8.
+    // Teardown is driven by `server_task.abort()` at the end of each
+    // test — abort is clean here because the handler is stateless and
+    // the temp socket is removed when the enclosing `TempDir` drops.
     let server = tokio::spawn(async move {
-        let _ = axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                shutdown_clone.notified().await;
-            })
-            .await;
+        let _ = axum::serve(listener, app).await;
     });
-
-    // Stash the shutdown trigger inside the JoinHandle's task via a
-    // side channel would complicate the return type; simpler: leak
-    // the shutdown Arc into the server task above and rely on the
-    // test dropping the tempdir + aborting the server handle.
-    // The JoinHandle lets the test abort the server explicitly.
-    drop(shutdown);
 
     (tmp, socket_str, server)
 }
