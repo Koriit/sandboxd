@@ -526,9 +526,28 @@ def test_github_repo_preset_scopes_to_one_repo(sandbox_cli):
         wait_for_state(sandbox_cli, session_name, "Running", timeout=30)
 
         time.sleep(POLICY_PROPAGATION_S)
+        # ``github-repo`` expands to six hosts (github.com,
+        # codeload.github.com, api.github.com, raw.githubusercontent.com,
+        # objects.githubusercontent.com, release-assets.githubusercontent.com).
+        # Each host needs DNS resolution + an nftables concat-set entry +
+        # an Envoy filter chain update before the VM can reach it.  Warm
+        # every host the preset allow-lists so the 2s DNS-driven
+        # propagation loop has materialised all of them before the
+        # `git clone` runs.  Warming only `github.com` +
+        # `codeload.github.com` (the bare minimum for the clone itself)
+        # proved racy on under-provisioned hardware — the first TCP
+        # SYN landed ahead of the Envoy listener update and the gateway
+        # answered with RST.
         _warm_dns(
             sandbox_cli, session_name,
-            ["github.com", "codeload.github.com"],
+            [
+                "github.com",
+                "codeload.github.com",
+                "api.github.com",
+                "raw.githubusercontent.com",
+                "objects.githubusercontent.com",
+                "release-assets.githubusercontent.com",
+            ],
         )
         time.sleep(POLICY_PROPAGATION_S)
 
