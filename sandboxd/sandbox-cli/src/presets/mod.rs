@@ -39,14 +39,15 @@
 //!   shapes. Every variant has a `Display` impl that matches the
 //!   wording called out in the spec and the Phase 0 decisions.
 
-// Phase 1 of M10-S5 ships the type and parser surface but no call
-// sites inside the binary (the `--preset` flag and the `sandbox policy
-// preset` subcommand land in Phase 5).  Silence the transitive
-// dead-code and unused-import warnings inside the module rather than
-// sprinkling fine-grained attributes across every item.  Remove this
-// allow when Phase 5 wires the surface into `main.rs`.
+// Commit 1 of Phase 5 wires `--preset` on `create` / `policy update`
+// (consumers: `Catalog::load`, `Catalog::find`, `ParsedInvocation::parse`,
+// `expand`, `merge_effective`). Commit 2 adds `sandbox policy preset
+// list|show|expand`, which activates `Catalog::list`, `PresetSummary`,
+// `PresetSource`, `Preset::{name, description}`, and the `description`
+// fields on built-in / user preset structs. Between commits those
+// items are dead, so suppress the lint at module scope for Commit 1.
+// The allow is removed in Commit 2 once the show/list paths wire up.
 #![allow(dead_code)]
-#![allow(unused_imports)]
 
 use std::collections::HashMap;
 use std::fmt;
@@ -64,6 +65,14 @@ pub use builtin::{BUILTINS, BuiltinPreset};
 pub use expand::expand;
 pub use merge::merge_effective;
 pub use param::ParsedInvocation;
+// The raw deserialization scaffolding (ParamType, RawRuleTemplate,
+// …) is part of the `presets` module's public API so integration
+// tests in `tests/preset_cli.rs` and user-preset fixture builders
+// can construct synthetic files without touching private state.
+// The CLI binary itself does not call these directly, so suppress
+// the dead-code / unused-import lint here rather than leaking the
+// allow to every downstream site.
+#[allow(unused_imports)]
 pub use user::{
     ParamType, RawHttpFilter, RawHttpMethod, RawLevel, RawProtocol, RawRuleTemplate, UserParamSpec,
     UserPreset,
@@ -370,7 +379,12 @@ pub enum PresetError {
 
     /// A built-in preset whose expander has not been implemented yet.
     /// Phase 1 seeds every built-in's `expand` fn pointer with this
-    /// error; Phase 3 replaces each one with the real body.
+    /// error; Phase 3 replaced the stubs with real bodies, so no
+    /// shipped expander constructs this variant any more. It stays
+    /// in the enum as documented scaffolding for downstream forks
+    /// that add presets in stages, and because removing it would be
+    /// an API break for the `pub enum PresetError` surface.
+    #[allow(dead_code)]
     NotImplemented { name: String },
 
     /// Two user preset files in the XDG preset directory declare the

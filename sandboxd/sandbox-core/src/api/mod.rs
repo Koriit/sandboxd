@@ -142,13 +142,20 @@ pub struct FileDownloadResponse {
 /// CLIs decode cleanly, and the daemon never inspects the field for
 /// policy semantics — preset expansion stays CLI-local per spec
 /// Part 2.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UpdatePolicyRequest {
     /// The policy document to apply.
     #[serde(flatten)]
     pub policy: crate::policy::Policy,
     /// Original `--preset` invocation strings forwarded by the CLI.
-    #[serde(default)]
+    ///
+    /// Serialized when the field is non-empty; skipped when empty so
+    /// older daemons that still parse v1 policy JSON as a raw `Policy`
+    /// (via `#[serde(flatten)]`) see a bitwise-identical body when no
+    /// presets contributed to the update. M10-S5 CLI wiring populates
+    /// this from `--preset` invocations; callers without presets leave
+    /// it empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_presets: Vec<String>,
 }
 

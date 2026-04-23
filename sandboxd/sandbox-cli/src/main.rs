@@ -10,12 +10,14 @@ use http_body_util::BodyExt;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
 use sandbox_core::{
-    ApiError, EventDto, ExecResponse, Policy, PolicyDto, PolicyLevelDto, PolicyRuleDto, SessionDto,
-    SessionHealth,
+    ApiError, EventDto, ExecResponse, Policy, PolicyDto, PolicyLevelDto, PolicyRule, PolicyRuleDto,
+    SessionDto, SessionHealth, UpdatePolicyRequest,
 };
 use tokio::net::UnixStream;
 
 mod presets;
+
+use presets::{Catalog, ParsedInvocation};
 
 /// CLI client for managing sandbox sessions.
 #[derive(Parser, Debug)]
@@ -55,6 +57,18 @@ enum Command {
         /// Path to a policy JSON file to apply after creation.
         #[arg(long)]
         policy: Option<String>,
+        /// Preset invocation(s) to apply on top of the optional
+        /// `--policy` file. Repeatable. Each invocation has the form
+        /// `'<name>[:key=value[,key=value,...]]'` (e.g. `npm:`,
+        /// `github-repo:repo=foo/bar`). Presets expand client-side
+        /// into rules that merge with the policy file; the composed
+        /// effective policy is sent to the daemon, along with the
+        /// original invocation strings as `source_presets` for audit.
+        ///
+        /// Run `sandbox policy preset list` to see the built-in
+        /// catalog.
+        #[arg(long, action = ArgAction::Append, num_args = 1)]
+        preset: Vec<String>,
         /// Git repository URL to clone into /home/agent/workspace/ after session setup.
         ///
         /// Mutually exclusive with --workspace.
@@ -230,18 +244,29 @@ enum Command {
 enum PolicyAction {
     /// Update the policy for a session.
     ///
-    /// Exactly one of `--policy` or `--clear` must be supplied.  `--clear` is
-    /// idempotent (safe to call on a session that already has no policy).
+    /// At least one of `--policy`, `--preset`, or `--clear` must be
+    /// supplied. `--clear` is idempotent (safe to call on a session
+    /// that already has no policy) and is mutually exclusive with
+    /// both `--policy` and `--preset`. `--policy` and `--preset`
+    /// compose: presets expand into rules that merge with the policy
+    /// file's rules (see `sandbox policy preset`).
     Update {
         /// Session name or ID.
         session: String,
         /// Path to the policy JSON file to apply.
         #[arg(long, conflicts_with = "clear")]
         policy: Option<String>,
+        /// Preset invocation(s) to apply on top of the optional
+        /// `--policy` file. See `sandbox create --preset` for the
+        /// invocation syntax and `sandbox policy preset list` for
+        /// the built-in catalog. Repeatable. Mutually exclusive
+        /// with `--clear`.
+        #[arg(long, action = ArgAction::Append, num_args = 1, conflicts_with = "clear")]
+        preset: Vec<String>,
         /// Remove any policy from the session and revert to the fail-closed
         /// default (empty CoreDNS allow-list, deny-all mitmproxy/Envoy).
-        /// Idempotent.  Mutually exclusive with `--policy`.
-        #[arg(long, conflicts_with = "policy")]
+        /// Idempotent. Mutually exclusive with `--policy` and `--preset`.
+        #[arg(long, conflicts_with = "policy", conflicts_with = "preset")]
         clear: bool,
     },
 }
@@ -269,6 +294,79 @@ fn default_socket_path() -> String {
     format!("{home}/.local/share/sandboxd/sandboxd.sock")
 }
 
+/// Expand `--preset` invocations into a merged effective `Policy`.
+///
+/// Shared between `Command::Create` and `PolicyAction::Update`. Both
+/// call sites must produce the same `(effective_policy, source_presets)`
+/// tuple from the same `(file, file_path, raw_invocations)` inputs,
+/// so the helper centralizes the four-step pipeline:
+///
+/// 1. Load the preset [`Catalog`] (built-ins + XDG user presets).
+/// 2. Parse each raw `--preset` string into a [`ParsedInvocation`].
+/// 3. Call `presets::expand` per invocation to produce rule lists.
+/// 4. Call `presets::merge_effective` to combine the policy file + all
+///    expansions into a single validated [`Policy`].
+///
+/// Any [`PresetError`] along the way prints its `Display` impl to
+/// stderr and calls `process::exit(1)` **before** returning. The
+/// error wording is spec-mandated (Part 1 lines 140-150, Part 2
+/// "Error shapes"), so we defer to `PresetError`'s `Display` impl
+/// verbatim — callers must not reformat or add a prefix.
+///
+/// Returning `(Policy, Vec<String>)` keeps the call sites simple:
+/// `Vec<String>` is the list of `.raw` invocations for the
+/// `source_presets` wire field, in user-provided order.
+fn expand_and_merge_presets(
+    file_policy: Option<&Policy>,
+    file_path: Option<&Path>,
+    raw_invocations: &[String],
+) -> (Policy, Vec<String>) {
+    // Load built-ins + XDG user presets. In production `cli_xdg_override`
+    // is always `None`; the test hook lives in the `presets` module.
+    let catalog = match Catalog::load(None) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    };
+
+    // Parse every `--preset` value into `(ParsedInvocation, rules)`.
+    // Parse errors fire one-at-a-time so the operator sees the exact
+    // bad invocation; we surface the first one and exit.
+    let mut expansions: Vec<(ParsedInvocation, Vec<PolicyRule>)> =
+        Vec::with_capacity(raw_invocations.len());
+    for raw in raw_invocations {
+        let inv = match ParsedInvocation::parse(raw) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            }
+        };
+        let rules = match presets::expand(&catalog, &inv) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            }
+        };
+        expansions.push((inv, rules));
+    }
+
+    // Merge policy file + expansions into one validated Policy.
+    let effective = match presets::merge_effective(file_policy, file_path, &catalog, &expansions) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    };
+
+    let source_presets = expansions.into_iter().map(|(inv, _)| inv.raw).collect();
+    (effective, source_presets)
+}
+
 /// Build the HTTP request for the given CLI command.
 ///
 /// Returns `None` for commands that are handled specially (e.g. `ssh`).
@@ -281,6 +379,7 @@ fn build_request(command: &Command) -> Option<Request<String>> {
             disk,
             template,
             policy,
+            preset,
             repo,
             boot_cmd,
             workspace,
@@ -297,21 +396,61 @@ fn build_request(command: &Command) -> Option<Request<String>> {
             if let Some(t) = template {
                 body.insert("template".into(), serde_json::Value::String(t.clone()));
             }
-            if let Some(policy_path) = policy {
-                let policy_json = match std::fs::read_to_string(policy_path) {
-                    Ok(content) => content,
-                    Err(e) => {
-                        eprintln!("Error: cannot read policy file '{policy_path}': {e}");
-                        process::exit(1);
-                    }
+            // Compose `--policy` (optional file) with any `--preset`
+            // invocations (repeatable) into a single effective policy.
+            //
+            // - If neither is present, omit `policy` from the body
+            //   (legacy "no policy" shape — server defaults to
+            //   fail-closed).
+            // - If only `--policy` is present, parse it and pass it
+            //   through (matches the pre-M10-S5 wire shape).
+            // - If `--preset` is present (with or without `--policy`),
+            //   expand presets client-side, merge them with the file,
+            //   and send the effective `Policy` JSON plus
+            //   `source_presets` as a sibling field for audit.
+            //
+            // Preset errors short-circuit to stderr + exit(1) BEFORE
+            // any Unix-socket work — this matches the spec invariant
+            // "the daemon never sees a malformed preset invocation".
+            let (file_policy, file_path): (Option<Policy>, Option<std::path::PathBuf>) =
+                if let Some(policy_path) = policy {
+                    let policy_json = match std::fs::read_to_string(policy_path) {
+                        Ok(content) => content,
+                        Err(e) => {
+                            eprintln!("Error: cannot read policy file '{policy_path}': {e}");
+                            process::exit(1);
+                        }
+                    };
+                    let parsed: Policy = match serde_json::from_str(&policy_json) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("Error: invalid policy JSON in '{policy_path}': {e}");
+                            process::exit(1);
+                        }
+                    };
+                    (Some(parsed), Some(std::path::PathBuf::from(policy_path)))
+                } else {
+                    (None, None)
                 };
-                let policy_value: serde_json::Value = match serde_json::from_str(&policy_json) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("Error: invalid policy JSON in '{policy_path}': {e}");
-                        process::exit(1);
-                    }
-                };
+
+            if !preset.is_empty() {
+                let (effective, source_presets) =
+                    expand_and_merge_presets(file_policy.as_ref(), file_path.as_deref(), preset);
+                let policy_value =
+                    serde_json::to_value(&effective).expect("Policy always serializes to JSON");
+                body.insert("policy".into(), policy_value);
+                body.insert(
+                    "source_presets".into(),
+                    serde_json::Value::Array(
+                        source_presets
+                            .into_iter()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    ),
+                );
+            } else if let Some(effective) = file_policy {
+                let policy_value =
+                    serde_json::to_value(&effective).expect("Policy always serializes to JSON");
                 body.insert("policy".into(), policy_value);
             }
             if let Some(r) = repo {
@@ -400,46 +539,79 @@ fn build_request(command: &Command) -> Option<Request<String>> {
             PolicyAction::Update {
                 session,
                 policy,
+                preset,
                 clear,
             } => {
-                // Exactly one of the two must be present.  clap's
-                // `conflicts_with` catches the "both" case, but "none" has to
-                // be validated here.
-                let selected = [policy.is_some(), *clear].iter().filter(|x| **x).count();
-                if selected != 1 {
+                // At least one of `--policy`, `--preset`, or `--clear`
+                // must be supplied. clap's `conflicts_with` already
+                // catches the "clear + policy" and "clear + preset"
+                // cases; "none of the three" has to be validated here.
+                // `--policy` and `--preset` compose: presets merge on
+                // top of the optional file.
+                let any_provided = policy.is_some() || !preset.is_empty() || *clear;
+                if !any_provided {
                     eprintln!(
-                        "Error: `sandbox policy update` requires exactly one of \
-                         `--policy <path>` or `--clear`."
+                        "Error: `sandbox policy update` requires at least one of \
+                         `--policy <path>`, `--preset '<invocation>'`, or `--clear`."
                     );
                     process::exit(1);
                 }
 
                 if *clear {
-                    // Revert to fail-closed.  No request body — the daemon
-                    // handler reads the session id from the URL.
+                    // Revert to fail-closed. No request body — the
+                    // daemon handler reads the session id from the URL.
                     Request::builder()
                         .method("DELETE")
                         .uri(format!("/sessions/{session}/policy"))
                         .body(String::new())
                         .expect("failed to build request")
                 } else {
-                    // POST a policy document.  `UpdatePolicyRequest` is
-                    // `#[serde(flatten)]` over the inner `Policy`, so the
-                    // wire body is the raw policy JSON at the top level.
-                    let path = policy
-                        .as_ref()
-                        .expect("selected == 1 and !*clear implies policy.is_some()");
-                    let body = match std::fs::read_to_string(path) {
-                        Ok(content) => content,
-                        Err(e) => {
-                            eprintln!("Error: cannot read policy file '{path}': {e}");
-                            process::exit(1);
-                        }
+                    // POST an `UpdatePolicyRequest`. The DTO is
+                    // `#[serde(flatten)]` over the inner `Policy` with
+                    // `source_presets` as a sibling, so the wire shape
+                    // is `{"version":"2.0.0","rules":[...],"source_presets":[...]}`
+                    // when presets are present and bitwise-identical to
+                    // the pre-M10-S5 shape when they are not (thanks to
+                    // `skip_serializing_if = "Vec::is_empty"` on the DTO).
+                    let (file_policy, file_path): (Option<Policy>, Option<std::path::PathBuf>) =
+                        if let Some(path) = policy {
+                            let raw = match std::fs::read_to_string(path) {
+                                Ok(content) => content,
+                                Err(e) => {
+                                    eprintln!("Error: cannot read policy file '{path}': {e}");
+                                    process::exit(1);
+                                }
+                            };
+                            let parsed: Policy = match serde_json::from_str(&raw) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    eprintln!("Error: invalid policy JSON in '{path}': {e}");
+                                    process::exit(1);
+                                }
+                            };
+                            (Some(parsed), Some(std::path::PathBuf::from(path)))
+                        } else {
+                            (None, None)
+                        };
+
+                    let (effective, source_presets) = if !preset.is_empty() {
+                        expand_and_merge_presets(file_policy.as_ref(), file_path.as_deref(), preset)
+                    } else {
+                        // No presets — just use the file (guaranteed
+                        // present by the `any_provided` check above when
+                        // `clear` is false).
+                        let effective = file_policy.expect(
+                            "!clear && preset.is_empty() implies policy.is_some() per any_provided check",
+                        );
+                        (effective, Vec::new())
                     };
-                    if let Err(e) = serde_json::from_str::<Policy>(&body) {
-                        eprintln!("Error: invalid policy JSON in '{path}': {e}");
-                        process::exit(1);
-                    }
+
+                    let request_dto = UpdatePolicyRequest {
+                        policy: effective,
+                        source_presets,
+                    };
+                    let body = serde_json::to_string(&request_dto)
+                        .expect("UpdatePolicyRequest always serializes to JSON");
                     Request::builder()
                         .method("POST")
                         .uri(format!("/sessions/{session}/policy"))
@@ -2612,8 +2784,11 @@ mod tests {
     #[test]
     fn parse_create_no_name() {
         let cli = Cli::parse_from(["sandbox", "create"]);
-        assert!(matches!(
-            cli.command,
+        // Exhaustive match guarantees every field has its documented
+        // default. `preset` was added in M10-S5 Phase 5a; an empty
+        // vec is the "no presets requested" shape the `--preset`
+        // flag would populate.
+        match &cli.command {
             Command::Create {
                 name: None,
                 cpus: 2,
@@ -2621,13 +2796,15 @@ mod tests {
                 disk: 20,
                 template: None,
                 policy: None,
+                preset,
                 repo: None,
                 boot_cmd: None,
                 workspace: None,
                 no_hardening: false,
                 no_cache: false,
-            }
-        ));
+            } => assert!(preset.is_empty(), "default preset list should be empty"),
+            _ => panic!("expected Create command with default fields"),
+        }
     }
 
     #[test]
@@ -2815,6 +2992,7 @@ mod tests {
             disk: 20,
             template: None,
             policy: None,
+            preset: vec![],
             repo: None,
             boot_cmd: None,
             workspace: None,
@@ -2840,6 +3018,7 @@ mod tests {
             disk: 50,
             template: None,
             policy: None,
+            preset: vec![],
             repo: None,
             boot_cmd: None,
             workspace: None,
@@ -2865,6 +3044,7 @@ mod tests {
             disk: 20,
             template: Some("/tmp/my-template.yaml".into()),
             policy: None,
+            preset: vec![],
             repo: None,
             boot_cmd: None,
             workspace: None,
@@ -3095,11 +3275,13 @@ mod tests {
                     PolicyAction::Update {
                         session,
                         policy,
+                        preset,
                         clear,
                     },
             } => {
                 assert_eq!(session, "my-session");
                 assert_eq!(policy.as_deref(), Some("/tmp/policy.json"));
+                assert!(preset.is_empty());
                 assert!(!clear);
             }
             _ => panic!("expected Policy Update command"),
@@ -3115,11 +3297,13 @@ mod tests {
                     PolicyAction::Update {
                         session,
                         policy,
+                        preset,
                         clear,
                     },
             } => {
                 assert_eq!(session, "my-session");
                 assert!(policy.is_none());
+                assert!(preset.is_empty());
                 assert!(*clear);
             }
             _ => panic!("expected Policy Update command"),
@@ -3233,6 +3417,7 @@ mod tests {
             disk: 20,
             template: None,
             policy: None,
+            preset: vec![],
             repo: Some("https://github.com/octocat/Hello-World.git".into()),
             boot_cmd: None,
             workspace: None,
@@ -3254,6 +3439,7 @@ mod tests {
             disk: 20,
             template: None,
             policy: None,
+            preset: vec![],
             repo: None,
             boot_cmd: Some("npm install".into()),
             workspace: None,
@@ -3303,6 +3489,7 @@ mod tests {
             disk: 20,
             template: None,
             policy: None,
+            preset: vec![],
             repo: None,
             boot_cmd: None,
             workspace: None,
@@ -3326,6 +3513,7 @@ mod tests {
             disk: 20,
             template: None,
             policy: None,
+            preset: vec![],
             repo: None,
             boot_cmd: None,
             workspace: None,
@@ -3473,6 +3661,7 @@ mod tests {
             disk: 20,
             template: None,
             policy: None,
+            preset: vec![],
             repo: None,
             boot_cmd: None,
             workspace: None,
@@ -3496,6 +3685,7 @@ mod tests {
             disk: 20,
             template: None,
             policy: None,
+            preset: vec![],
             repo: None,
             boot_cmd: None,
             workspace: None,
