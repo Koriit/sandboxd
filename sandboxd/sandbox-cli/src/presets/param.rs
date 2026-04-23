@@ -89,10 +89,12 @@ impl ParsedInvocation {
 
                 // Reject raw `,`, `:`, `=` in values (D-2).
                 //
-                // Note: `,` cannot actually appear in a `segment` because we
-                // already split on `,`.  But we re-check here to keep the
-                // error surface symmetric and to guard against future
-                // grammar changes.
+                // The `,` arm is defensive: the current grammar splits
+                // on `,` before reaching here, so a literal comma in
+                // the value never arrives as a `ForbiddenChar`. The
+                // arm is kept to localize the "forbidden value chars"
+                // list to one place — if the split grammar is revised
+                // in the future, the check still fires.
                 if let Some(ch) = value.chars().find(|c| matches!(c, ',' | ':' | '=')) {
                     return Err(PresetError::ForbiddenChar {
                         preset: name.to_string(),

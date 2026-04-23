@@ -51,7 +51,6 @@ import pytest
 from conftest import (
     _VM_RESOURCE_ARGS,
     capture_lima_logs,
-    cleanup_policy_file,
     gateway_container_name,
     parse_session_id,
     wait_for_state,

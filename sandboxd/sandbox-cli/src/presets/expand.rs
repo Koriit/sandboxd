@@ -90,10 +90,14 @@ fn expand_user_preset(
             });
         }
         if !spec.repeatable && count > 1 {
-            // The wording piggybacks on `MalformedInvocation` because
-            // the user has effectively given an invocation shape the
-            // preset cannot accept. A more precise variant may be
-            // added in a later phase.
+            // Non-repeatable-appears-twice is returned as
+            // `MalformedInvocation` intentionally: the grammar parser
+            // cannot distinguish "legal syntax with a semantic
+            // violation" from "malformed syntax" without carrying
+            // repeatable-ness through the parser, which would leak
+            // preset schema into `ParsedInvocation`. Operators see the
+            // same diagnostic category either way and the `reason:`
+            // field carries the specific cause.
             return Err(PresetError::MalformedInvocation {
                 raw: inv.raw.clone(),
                 reason: format!(
