@@ -32,13 +32,14 @@ Path conventions (all absolute to repo root unless qualified):
 |------|-------:|------------:|-----------------:|-----------------:|---------:|
 | P1 — Port-explicit policies             |  37 |  37 | 0 | 0 | 0 |
 | P2 — Client-local presets               |  58 |  58 | 0 | 0 | 0 |
-| P3 — Unified observability              |  91 |  88 | 0 | 3 | 0 |
+| P3 — Unified observability              |  91 |  87 | 0 | 4 | 0 |
 | P4 — Cleanup/removal                    |  13 |  13 | 0 | 0 | 0 |
 | Amendments (L3 destination_port & log)  |   3 |   3 | 0 | 0 | 0 |
-| **Totals**                              | **202** | **199** | **0** | **3** | **0** |
+| **Grand total**                         | **202** | **198** | **0** | **4** | **0** |
 
-Proposed new todos: **0** (all deferred items are covered by the three
-existing "Known gaps" todos #41/#42/#43, logged in this session).
+Proposed new todos: **0** (all deferred items are covered by existing
+todos — the three "Known gaps" bullets map to #41/#42/#43 logged in this
+session, and the UDP pre-DNAT gap at P3.38 maps to pre-existing todo #29).
 
 ---
 
@@ -279,11 +280,11 @@ existing "Known gaps" todos #41/#42/#43, logged in this session).
 | P3.31 | Cross-table set references (sandbox_dnat.set → sandbox_policy.output) | (a) | `sandboxd/sandbox-core/src/policy.rs:981-994` doc comments | integration tests |
 | P3.32 | Policy-allow sets populated by DNS walker | (a) | `sandboxd/sandbox-core/src/dns_propagation.rs:277` | `dns_propagation.rs` unit tests |
 | P3.33 | deny-logger listens for TCP SYN | (a) | `sandboxd/sandbox-deny-logger/src/tcp.rs:1-452` | `tcp.rs` unit tests |
-| P3.34 | TCP listener port = 10001 | (a) | `sandboxd/sandbox-core/src/gateway.rs:158` `GATEWAY_DENY_LOGGER_TCP_PORT` | `sandbox-core/tests/gateway_integration.rs` `generate_dnat_ruleset_contains_both_deny_logger_ports` |
+| P3.34 | TCP listener port = 10001 | (a) | `sandboxd/sandbox-core/src/gateway.rs:158` `GATEWAY_DENY_LOGGER_TCP_PORT` | `sandboxd/sandbox-core/src/gateway.rs:1726` `generate_dnat_ruleset_contains_both_deny_logger_ports` |
 | P3.35 | deny-logger listens for UDP | (a) | `sandboxd/sandbox-deny-logger/src/udp.rs:1-198` | `udp.rs` unit tests |
 | P3.36 | UDP listener port = 10002 | (a) | `sandboxd/sandbox-core/src/gateway.rs:164` `GATEWAY_DENY_LOGGER_UDP_PORT` | `gateway.rs:1726` |
 | P3.37 | TCP uses SO_ORIGINAL_DST for pre-DNAT destination | (a) | `sandboxd/sandbox-deny-logger/src/tcp.rs` SO_ORIGINAL_DST usage | `tcp.rs` unit tests |
-| P3.38 | UDP uses IP_ORIGDSTADDR (post-DNAT limitation documented) | (c) #29 | `sandboxd/sandbox-deny-logger/src/udp.rs` | todo #29 "UDP deny events carry post-DNAT destination" |
+| P3.38 | UDP uses IP_ORIGDSTADDR (post-DNAT limitation documented) | (c) | `sandboxd/sandbox-deny-logger/src/udp.rs` | todo #29 → M11+ — UDP deny events carry post-DNAT destination (`gateway_ip:10002`) instead of pre-DNAT; TCP is correct via SO_ORIGINAL_DST. Fix requires conntrack netlink lookup in deny-logger UDP handler (`IP_ORIGDSTADDR` cmsg does not surface pre-DNAT for conntrack-DNAT'd UDP). |
 | P3.39 | Health endpoint bound to gateway bridge IP (not loopback) | (a) | `sandboxd/sandbox-deny-logger/src/health.rs:1-196` | per completed todo #28 (spec corrected) |
 | P3.40 | Rate limiter (`rate_limited` summary) | (a) | `sandboxd/sandbox-deny-logger/src/limits.rs:1-351` | `limits.rs` unit tests |
 | P3.41 | Per-flow concurrency cap | (a) | `sandboxd/sandbox-deny-logger/src/tcp.rs` + `limits.rs` | `tcp.rs::tests::tcp_respects_concurrency_cap` (flake → todo #33) |
@@ -297,12 +298,12 @@ existing "Known gaps" todos #41/#42/#43, logged in this session).
 
 | # | Claim | Status | Code | Test |
 |---|-------|--------|------|------|
-| P3.47 | L1 (loopback→cluster) tcp_proxy access log | (a) | `sandboxd/sandbox-core/src/policy.rs:1600+` `l1_tcp_proxy_access_log_yaml` | `policy.rs:4162` access-log path assertion |
-| P3.48 | L2 (HTTPS-inspected) access log | (a) | `sandboxd/sandbox-core/src/policy.rs` l2_*_access_log | `policy.rs:4214`, `:4307` |
-| P3.49 | L3 (CONNECT tunnel) access log | (a) | `sandboxd/sandbox-core/src/policy.rs:1557` `l3_tcp_proxy_access_log_yaml` | `policy.rs:4377` |
-| P3.50 | JSON format harmonized across L1/L2/L3 | (a) | `sandboxd/sandbox-core/src/policy.rs:1494-1522` | `policy.rs:4162-4377` |
-| P3.51 | Access log written to `ENVOY_ACCESS_LOG_IN_CONTAINER` | (a) | `sandboxd/sandbox-core/src/policy.rs:1566`, `:1606`, `:1643` | `policy.rs:4162+` |
-| P3.52 | L3 JSON access log includes `%DOWNSTREAM_LOCAL_ADDRESS%` (tunnel dst) | (a) | `sandboxd/sandbox-core/src/policy.rs:1503-1522` (tokens) | `policy.rs:4377` |
+| P3.47 | L1 (loopback→cluster) tcp_proxy access log | (a) | `sandboxd/sandbox-core/src/policy.rs:1600` `l1_tcp_proxy_access_log_yaml` | `sandboxd/sandbox-core/src/policy.rs:4271` `compile_l1_tcp_proxy_carries_envoy_access_log` |
+| P3.48 | L2 (HTTPS-inspected) access log | (a) | `sandboxd/sandbox-core/src/policy.rs:1637` `l2_tcp_proxy_access_log_yaml` | `sandboxd/sandbox-core/src/policy.rs:4355` `compile_l2_tcp_proxy_carries_envoy_access_log` |
+| P3.49 | L3 (CONNECT tunnel) access log | (a) | `sandboxd/sandbox-core/src/policy.rs:1557` `l3_tcp_proxy_access_log_yaml` | `sandboxd/sandbox-core/src/policy.rs:4171` `compile_l3_tcp_proxy_carries_envoy_access_log` |
+| P3.50 | JSON format harmonized across L1/L2/L3 | (a) | `sandboxd/sandbox-core/src/policy.rs:1494-1522` | `sandboxd/sandbox-core/src/policy.rs:4136` `compile_envoy_access_log_path_is_events_jsonl` (consolidated L1/L2/L3 harmonization) |
+| P3.51 | Access log written to `ENVOY_ACCESS_LOG_IN_CONTAINER` | (a) | `sandboxd/sandbox-core/src/policy.rs:1566`, `:1606`, `:1643` | `sandboxd/sandbox-core/src/policy.rs:4136` `compile_envoy_access_log_path_is_events_jsonl` |
+| P3.52 | L3 JSON access log includes `%DOWNSTREAM_LOCAL_ADDRESS%` (tunnel dst) | (a) | `sandboxd/sandbox-core/src/policy.rs:1503-1522` (tokens) | `sandboxd/sandbox-core/src/policy.rs:4171` `compile_l3_tcp_proxy_carries_envoy_access_log` |
 | P3.53 | L3 log includes session id | (a) | ibid. | ibid. |
 | P3.54 | L3 log includes connection verdict | (a) | ibid. | ibid. |
 | P3.55 | Tokens valid in Envoy substitution language | (a) | `sandboxd/sandbox-core/src/policy.rs:1503` "Tokens chosen" comment | Envoy validator in `sandbox-core/tests/validators.rs` |
@@ -348,14 +349,14 @@ existing "Known gaps" todos #41/#42/#43, logged in this session).
 
 | # | Claim | Status | Code | Test |
 |---|-------|--------|------|------|
-| P3.78 | `sandbox events <session>` | (a) | `sandboxd/sandbox-cli/src/main.rs:201` Events subcommand | `sandboxd/sandbox-cli/tests/events_binary.rs` |
-| P3.79 | `--follow`, `--layer`, `--event`, `--decision`, `--since`, `--json`, `--table` | (a) | `sandboxd/sandbox-cli/src/main.rs:2547-2602` `handle_events` | `events_binary.rs` |
-| P3.80 | Three-way output-mode precedence (table/json/auto) | (a) | `sandboxd/sandbox-cli/src/main.rs:2568-2575` | `events_binary.rs:4887+` |
-| P3.81 | `--since` relative duration + RFC3339 | (a) | `sandboxd/sandbox-cli/src/main.rs:1841` `resolve_since` | `events_binary.rs` |
+| P3.78 | `sandbox events <session>` | (a) | `sandboxd/sandbox-cli/src/main.rs:201` Events subcommand | `sandboxd/sandbox-cli/src/main.rs:4872` `events_parse_missing_session_is_an_error` + `sandboxd/sandbox-cli/tests/events_binary.rs:99` `sandbox_events_non_follow_exits_when_body_ends` (binary-level contract test) |
+| P3.79 | `--follow`, `--layer`, `--event`, `--decision`, `--since`, `--json`, `--table` | (a) | `sandboxd/sandbox-cli/src/main.rs:2547-2602` `handle_events` | `sandboxd/sandbox-cli/src/main.rs:4864` `events_parse_json_and_table_are_mutually_exclusive`, `:4853` `events_parse_since_shorthand`, `:4908` `events_build_query_string_full_combo_is_deterministic` |
+| P3.80 | Three-way output-mode precedence (table/json/auto) | (a) | `sandboxd/sandbox-cli/src/main.rs:2568-2575` | `sandboxd/sandbox-cli/src/main.rs:4879` `events_build_query_string_empty_when_no_flags` (Json variant), `:4908` `events_build_query_string_full_combo_is_deterministic` (Table variant) |
+| P3.81 | `--since` relative duration + RFC3339 | (a) | `sandboxd/sandbox-cli/src/main.rs:1841` `resolve_since` | `sandboxd/sandbox-cli/src/main.rs:4778` `events_resolve_since_rfc3339_branch_normalises_to_millis_z`, `:4787` `events_resolve_since_duration_branch_formats_as_rfc3339_millis_z`, `:4795` `events_resolve_since_errors_surface_to_caller` |
 | P3.82 | Default ring buffer size = 10000 | (a) | `sandboxd/sandbox-core/src/lib.rs:40` `DEFAULT_RING_BUFFER_SIZE` | `sandbox-core/src/events/bus.rs` unit tests |
 | P3.83 | Broadcast channel semantics (drop newest) | (a) | `sandboxd/sandbox-core/src/events/bus.rs` | bus tests |
-| P3.84 | Table output colorized on TTY | (a) | `sandboxd/sandbox-cli/src/main.rs:2437-2484` | `events_binary.rs:4916` `EventsOutputMode::Table` |
-| P3.85 | JSONL to non-TTY by default | (a) | `sandboxd/sandbox-cli/src/main.rs:2571-2573` | `events_binary.rs:4887` |
+| P3.84 | Table output colorized on TTY | (a) | `sandboxd/sandbox-cli/src/main.rs:2437-2484` (colorize = Table mode && IsTerminal) | `sandboxd/sandbox-cli/src/main.rs:4908` `events_build_query_string_full_combo_is_deterministic` (pins `EventsOutputMode::Table` variant); tty branch covered at E2E via `tests/e2e/test_m10_s4_discovery.py` |
+| P3.85 | JSONL to non-TTY by default | (a) | `sandboxd/sandbox-cli/src/main.rs:2571-2573` | `sandboxd/sandbox-cli/src/main.rs:4879` `events_build_query_string_empty_when_no_flags` (pins `EventsOutputMode::Json` default); non-tty branch covered at E2E |
 
 ### Persistence & retention (P3.86 – P3.91)
 
@@ -403,8 +404,33 @@ existing "Known gaps" todos #41/#42/#43, logged in this session).
 | # | Amendment | Status | Code | Test |
 |---|-----------|--------|------|------|
 | A1 | L3 listener chain carries `destination_port` predicate | (a) | `sandboxd/sandbox-core/src/policy.rs:1424`, `:1444` | `sandboxd/sandbox-core/src/policy.rs:4030`, `:4069`, `:4096` |
-| A2 | L3 CONNECT tunnel emits tcp_proxy access log (JSON) | (a) | `sandboxd/sandbox-core/src/policy.rs:1313` (embed), `:1557` (`l3_tcp_proxy_access_log_yaml`) | `sandboxd/sandbox-core/src/policy.rs:4377` |
+| A2 | L3 CONNECT tunnel emits tcp_proxy access log (JSON) | (a) | `sandboxd/sandbox-core/src/policy.rs:1313` (embed), `:1557` (`l3_tcp_proxy_access_log_yaml`) | `sandboxd/sandbox-core/src/policy.rs:4171` `compile_l3_tcp_proxy_carries_envoy_access_log` |
 | A3 | Spec amendment: deny-logger health bound to bridge IP (not loopback) | (a) | `sandboxd/sandbox-deny-logger/src/health.rs:1-196` | completed todo #28 |
+
+---
+
+## Prescribed example verification
+
+The spec's prescribed example walkthrough — the "Discovery workflow
+(what replaces `unrestricted`)" block at lines 308-326 of
+`.tasks/specs/2026-04-21-port-explicit-policies-presets-observability-design.md`
+— describes how an operator composes a policy from presets, observes
+denials, adds rules, and iterates until the workload runs clean. This
+section records how each step of that walkthrough is exercised
+end-to-end by the M10 test suite.
+
+| # | Walkthrough step (spec) | Exercised by |
+|---|-------------------------|--------------|
+| 1 | "Start the session with an empty policy (or with stacked presets covering the ecosystems the operator already knows the workload needs)" — preset composition path | `tests/e2e/test_m10_s5_presets.py:200` `test_npm_preset_allows_npm_install` (single-preset session boots and serves traffic); `tests/e2e/test_m10_s5_presets.py:691` `test_preset_expand_round_trip` (CLI-local compose path: `sandbox policy preset expand` → file → `sandbox create --policy`) |
+| 2 | "Run the workload. Failed connection attempts produce events" — denial emission across `dns`, `deny-logger`, `envoy`, `mitmproxy` streams | `tests/e2e/test_m10_s5_presets.py:325` `test_npm_preset_denies_non_preset_host` (preset-covered host succeeds; off-preset host denied and surfaces as event); `tests/e2e/test_m10_s4_discovery.py:216` `test_discovery_workflow_surfaces_denials_then_policy_update_closes_them` (denials observable via `sandbox events`) |
+| 3 | "`sandbox events --session=<id> --decision=deny --follow` shows every denial in real time, naming the host, port, protocol, and layer" — events surface step | `tests/e2e/test_m10_s4_discovery.py:216` — asserts the four-layer denial envelope shape from a live stream |
+| 4 | "Operator adds rules (or additional presets) for each denial they want to allow; applies the updated policy via `sandbox policy update`" — iteration/update step | `tests/e2e/test_m10_s4_discovery.py:216` — final phase applies an updated policy and asserts the previously-denied traffic now allowed |
+| 5 | "Repeat until the workload runs clean" — convergence | Captured as the "allow after update" assertion in the same `test_discovery_workflow_surfaces_denials_then_policy_update_closes_them` test; no separate E2E pins "repeat N times" because the workflow is idempotent — one successful iteration demonstrates the loop |
+
+**Known gaps for the walkthrough.** None. Each step has at least one
+covering E2E test. UDP traffic in step 2/3 is subject to the post-DNAT
+limitation captured as todo #29 (P3.38); TCP — the protocol exercised
+by the walkthrough's npm / discovery tests — is correct.
 
 ---
 
@@ -425,6 +451,14 @@ existing "Known gaps" todos #41/#42/#43, logged in this session).
   were already landed in `progress.json` as todos #41/#42/#43 during
   this M10-S7 session by a prior turn. They are covered by (c) with
   explicit milestone targets, so no new todos are proposed.
+- **Fourth category (c): todo #29 (P3.38).** Beyond the three "Known
+  gaps" items, P3.38 (UDP deny events carrying post-DNAT destination
+  instead of pre-DNAT) is category (c) under pre-existing todo #29.
+  The production code knowingly emits the post-DNAT tuple because
+  `IP_ORIGDSTADDR` cmsg does not surface pre-DNAT for conntrack-DNAT'd
+  UDP the way TCP's `SO_ORIGINAL_DST` does; fix requires a conntrack
+  netlink lookup in the deny-logger UDP handler. TCP is correct. This
+  brings the grand-total (c) count to 4 (#29 + #41 + #42 + #43).
 - **Progress CLI usage.** Task brief instructed running
   `progress todo list` as input data; Subagent-Start hook in this
   thread also forbids it. The Skill tool re-loaded session-tracking
@@ -473,3 +507,23 @@ existing "Known gaps" todos #41/#42/#43, logged in this session).
   todos (#29/#33/#38/#39/#40) are P-orthogonal (observability/
   reliability) and already tracked.
 
+---
+
+## Handoff artifacts
+
+Background work that informed this delivery map. Future readers tracing
+how a given row was categorized can consult these handoff files for the
+raw inventory, the amendment-verification evidence, and the
+out-of-scope conformance pass.
+
+- `.tasks/handoffs/20260423-m10-s7-spec-claim-inventory.md` — 1291-line
+  exhaustive claim inventory of the 2026-04-21 spec (source material
+  for the P1/P2/P3/P4 row enumeration).
+- `.tasks/handoffs/20260423-m10-s7-l3-amendment-verification.md` — all
+  three L3 amendments (A1/A2/A3) verified PASS against the current
+  tree; shipping locators confirmed.
+- `.tasks/handoffs/20260423-m10-s7-outofscope-conformance.md` — 10/10
+  out-of-scope items clean; spec gaps filed as todos #41/#42/#43.
+- `.tasks/handoffs/20260423-m10-s7-review-fixups.md` — reviewer
+  `a28a89e87c8d63001` findings addressed in this commit (3 IMPORTANT +
+  1 QUESTION answered + 4 MINOR).
