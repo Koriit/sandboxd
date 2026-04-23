@@ -23,8 +23,8 @@ pub use api::{
     FileDownloadRequest, FileDownloadResponse, FileUploadRequest, GatewayHealth,
     GatewayShutdownReasonDto, HealthComponentDto, LayerKind, LifecycleEventBodyDto,
     LifecycleEventDto, MitmproxyEventBodyDto, MitmproxyEventDto, NetworkHealth,
-    PolicyApplyStatusDto, PolicyDto, PolicyLevelDto, PolicyRuleDto, SessionConfigDto, SessionDto,
-    SessionHealth, UpdatePolicyRequest, event_to_jsonl_line,
+    PolicyApplyStatusDto, PolicyDto, PolicyLevelDto, PolicyRuleDto, PropagationStatusResponse,
+    SessionConfigDto, SessionDto, SessionHealth, UpdatePolicyRequest, event_to_jsonl_line,
 };
 pub use atomic_listener_writer::{
     AtomicListenerWriter, LISTENER_HOST_ROOT, ListenerWriteError, session_listener_host_dir,

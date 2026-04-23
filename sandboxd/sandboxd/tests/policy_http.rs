@@ -25,8 +25,8 @@ use http_body_util::BodyExt;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-use sandbox_core::{SessionConfig, SessionStore};
-use sandboxd::policy_http::{PolicyApiState, PropagationStatusResponse, policy_router};
+use sandbox_core::{PropagationStatusResponse, SessionConfig, SessionStore};
+use sandboxd::policy_http::{PolicyApiState, policy_router};
 use sandboxd::propagation::PropagationStates;
 
 // ---------------------------------------------------------------------------

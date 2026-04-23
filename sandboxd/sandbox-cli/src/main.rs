@@ -11,7 +11,7 @@ use hyper::Request;
 use hyper_util::rt::TokioIo;
 use sandbox_core::{
     ApiError, EventDto, ExecResponse, Policy, PolicyDto, PolicyLevelDto, PolicyRule, PolicyRuleDto,
-    SessionDto, SessionHealth, UpdatePolicyRequest,
+    PropagationStatusResponse, SessionDto, SessionHealth, UpdatePolicyRequest,
 };
 use tokio::net::UnixStream;
 
@@ -278,6 +278,33 @@ enum PolicyAction {
     Preset {
         #[command(subcommand)]
         action: PresetAction,
+    },
+    /// Report policy-propagation status for a session.
+    ///
+    /// Queries `GET /sessions/{id}/policy/propagation-status` and
+    /// prints the result. Use `--wait` to poll until the latest
+    /// policy-apply has reached steady state across all three
+    /// enforcement layers (nftables, Envoy, mitmproxy/CoreDNS).
+    ///
+    /// Exits 0 when the latest policy-apply has propagated, or when
+    /// no policy has ever been applied (nothing to wait for). Exits
+    /// non-zero on daemon errors. With `--wait`, exits non-zero if the
+    /// deadline passes before the policy propagates; the E2E suite and
+    /// scripts use this to fail fast instead of time.sleep()-ing.
+    Status {
+        /// Session name or ID.
+        session: String,
+        /// Poll until the latest apply has propagated or the timeout
+        /// elapses. Without this flag the command reads the status
+        /// once and exits.
+        #[arg(long)]
+        wait: bool,
+        /// Deadline for `--wait`. Accepts a human-readable duration:
+        /// plain seconds (`60`), seconds with `s` (`60s`), minutes
+        /// (`2m`), hours (`1h`), or milliseconds (`500ms`). Ignored
+        /// unless `--wait` is set.
+        #[arg(long, default_value = "60s")]
+        timeout: String,
     },
 }
 
@@ -666,6 +693,16 @@ fn build_request(command: &Command) -> Option<Request<String>> {
                 // normal request pipeline.
                 unreachable!(
                     "`sandbox policy preset ...` is handled client-side \
+                     in main() before build_request"
+                );
+            }
+            PolicyAction::Status { .. } => {
+                // Handled by `handle_policy_status` in `main()` before
+                // `build_request` is reached. The status command owns
+                // its own polling loop and exit-code mapping, which the
+                // generic request/response pipeline cannot express.
+                unreachable!(
+                    "`sandbox policy status ...` is handled client-side \
                      in main() before build_request"
                 );
             }
@@ -1277,6 +1314,180 @@ fn handle_policy_preset(action: &PresetAction) {
                 serde_json::to_string_pretty(&doc).expect("Policy always serializes to JSON");
             println!("{rendered}");
         }
+    }
+}
+
+/// Parse a human-readable duration into [`Duration`].
+///
+/// Accepted forms:
+/// - plain number: interpreted as seconds (`60` → 60s)
+/// - suffixed: `500ms`, `30s`, `2m`, `1h`
+///
+/// Returns `Err(String)` with a user-facing message on any parse
+/// failure — the CLI surfaces this directly on stderr.
+///
+/// Centralised here rather than pulled in as a dep because this is the
+/// only duration parse site in the CLI today, and the grammar is
+/// small enough that a handwritten parser is cheaper than a crate.
+fn parse_duration_arg(s: &str) -> Result<Duration, String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err("empty duration".to_string());
+    }
+    // Longest-suffix-first so `ms` wins over `s`.
+    let (num_str, multiplier_ms): (&str, u64) = if let Some(rest) = trimmed.strip_suffix("ms") {
+        (rest, 1)
+    } else if let Some(rest) = trimmed.strip_suffix('s') {
+        (rest, 1_000)
+    } else if let Some(rest) = trimmed.strip_suffix('m') {
+        (rest, 60 * 1_000)
+    } else if let Some(rest) = trimmed.strip_suffix('h') {
+        (rest, 60 * 60 * 1_000)
+    } else {
+        // No suffix — treat as seconds to match common CLI ergonomics
+        // (`--timeout 60` and `--timeout 60s` behave identically).
+        (trimmed, 1_000)
+    };
+    let n: u64 = num_str
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid duration '{s}': {e}"))?;
+    Ok(Duration::from_millis(n.saturating_mul(multiplier_ms)))
+}
+
+/// Handle the `sandbox policy status [--wait] [--timeout ...]`
+/// subcommand.
+///
+/// Client-side polling loop that queries
+/// `GET /sessions/{session}/policy/propagation-status` until either:
+/// - the response reports `propagated=true` (exit 0)
+/// - `--wait` is unset (always exit after one query)
+/// - the deadline passes (`--wait` + `--timeout` elapsed, exit 1)
+/// - the daemon returns a non-2xx error (exit 1)
+///
+/// Polling cadence is fixed at 200ms to keep the round-trip latency
+/// negligible vs. the actual DNS propagation loop (which cycles on
+/// the order of seconds). The loop streams a short human-readable
+/// status line on every poll so scripts and operators can see
+/// progress without running the full suite.
+async fn handle_policy_status(socket_path: &str, session: &str, wait: bool, timeout_str: &str) {
+    let timeout = if wait {
+        match parse_duration_arg(timeout_str) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            }
+        }
+    } else {
+        Duration::from_secs(0)
+    };
+
+    // Fixed poll cadence; empirically short enough that the CLI never
+    // shows a user-visible gap between the DNS loop completing and the
+    // next poll observing `propagated=true`.
+    const POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+    let start = std::time::Instant::now();
+    loop {
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/sessions/{session}/policy/propagation-status"))
+            .body(String::new())
+            .expect("failed to build request");
+
+        match send_request(socket_path, req).await {
+            Ok((status, body)) => {
+                if !status.is_success() {
+                    if let Ok(api_err) = serde_json::from_str::<ApiError>(&body) {
+                        eprintln!("Error: {}", api_err.error);
+                    } else {
+                        eprintln!("Error ({status}): {body}");
+                    }
+                    process::exit(1);
+                }
+                let resp: PropagationStatusResponse = match serde_json::from_str(&body) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("Error: failed to parse propagation-status response: {e}");
+                        process::exit(1);
+                    }
+                };
+                print_propagation_status(&resp);
+                if resp.propagated {
+                    return;
+                }
+                // No apply has ever happened — there is nothing to
+                // propagate, so treat it as success to keep scripts
+                // idempotent. A `--wait` that expected a propagation
+                // should provide a session that has had a policy
+                // applied.
+                if resp.expected_hash.is_none() {
+                    return;
+                }
+                if !wait {
+                    // One-shot read: exit non-zero to signal
+                    // "polled once, not yet propagated" so callers
+                    // can chain `|| sleep && retry`.
+                    process::exit(2);
+                }
+                if start.elapsed() >= timeout {
+                    eprintln!(
+                        "Error: policy did not propagate within {}",
+                        humanize_duration(timeout)
+                    );
+                    process::exit(1);
+                }
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                process::exit(1);
+            }
+        }
+
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Render a one-line human-readable status suitable for stdout.
+///
+/// Intentionally terse so `--wait` loops can print every poll without
+/// scrolling operator terminals off the screen.
+fn print_propagation_status(resp: &PropagationStatusResponse) {
+    let expected = resp.expected_hash.as_deref().map(short_hash).unwrap_or("-");
+    let propagated = resp
+        .propagated_hash
+        .as_deref()
+        .map(short_hash)
+        .unwrap_or("-");
+    println!(
+        "propagated={} expected={expected} actual={propagated} age={}s",
+        resp.propagated, resp.seconds_since_apply
+    );
+}
+
+/// Truncate a hex hash to 12 chars for user-facing output. Hashes are
+/// hex-encoded SHA-256 (64 chars); the first 12 is unambiguous for
+/// any real working set and fits on an 80-column terminal.
+fn short_hash(hash: &str) -> &str {
+    hash.get(..12).unwrap_or(hash)
+}
+
+/// Render a [`Duration`] back into its shortest human-readable form.
+/// Used only for the "did not propagate within ..." error line.
+fn humanize_duration(d: Duration) -> String {
+    let ms = d.as_millis();
+    if ms.is_multiple_of(1000) {
+        let secs = ms / 1000;
+        if secs.is_multiple_of(3600) {
+            format!("{}h", secs / 3600)
+        } else if secs.is_multiple_of(60) {
+            format!("{}m", secs / 60)
+        } else {
+            format!("{secs}s")
+        }
+    } else {
+        format!("{ms}ms")
     }
 }
 
@@ -2963,6 +3174,25 @@ async fn main() {
     } = &cli.command
     {
         handle_policy_preset(action);
+        return;
+    }
+
+    // `sandbox policy status ...` owns its own polling loop and
+    // non-standard exit codes (0 = propagated / never-applied,
+    // 1 = daemon error or --wait timeout, 2 = one-shot polled-once
+    // not-yet-propagated). Route it before the generic request/
+    // response pipeline, which cannot express either the loop or
+    // the exit-code mapping.
+    if let Command::Policy {
+        action:
+            PolicyAction::Status {
+                session,
+                wait,
+                timeout,
+            },
+    } = &cli.command
+    {
+        handle_policy_status(&cli.socket, session, *wait, timeout).await;
         return;
     }
 
@@ -4873,5 +5103,117 @@ mod tests {
         assert_eq!(format_table_row("", false), "! ");
         let garbage = "not json at all";
         assert_eq!(format_table_row(garbage, false), format!("! {garbage}"));
+    }
+
+    // ---------------------------------------------------------------
+    // `policy status` subcommand (M10-S6 todo #37)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_duration_plain_number_is_seconds() {
+        assert_eq!(parse_duration_arg("60").unwrap(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn parse_duration_with_s_suffix() {
+        assert_eq!(parse_duration_arg("30s").unwrap(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn parse_duration_with_ms_suffix() {
+        assert_eq!(
+            parse_duration_arg("500ms").unwrap(),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn parse_duration_with_m_suffix() {
+        assert_eq!(parse_duration_arg("2m").unwrap(), Duration::from_secs(120));
+    }
+
+    #[test]
+    fn parse_duration_with_h_suffix() {
+        assert_eq!(parse_duration_arg("1h").unwrap(), Duration::from_secs(3600));
+    }
+
+    #[test]
+    fn parse_duration_rejects_empty() {
+        assert!(parse_duration_arg("").is_err());
+    }
+
+    #[test]
+    fn parse_duration_rejects_non_numeric() {
+        assert!(parse_duration_arg("abc").is_err());
+        assert!(parse_duration_arg("5 minutes").is_err());
+    }
+
+    #[test]
+    fn humanize_duration_round_trips_common_values() {
+        assert_eq!(humanize_duration(Duration::from_secs(60)), "1m");
+        assert_eq!(humanize_duration(Duration::from_secs(3600)), "1h");
+        assert_eq!(humanize_duration(Duration::from_secs(45)), "45s");
+        assert_eq!(humanize_duration(Duration::from_millis(250)), "250ms");
+    }
+
+    #[test]
+    fn parse_policy_status_defaults() {
+        let cli = Cli::parse_from(["sandbox", "policy", "status", "my-session"]);
+        match &cli.command {
+            Command::Policy {
+                action:
+                    PolicyAction::Status {
+                        session,
+                        wait,
+                        timeout,
+                    },
+            } => {
+                assert_eq!(session, "my-session");
+                assert!(!wait);
+                // Default pinned in the derive attribute so operators can
+                // rely on it in scripts.
+                assert_eq!(timeout, "60s");
+            }
+            _ => panic!("expected Policy Status command"),
+        }
+    }
+
+    #[test]
+    fn parse_policy_status_with_wait_and_timeout() {
+        let cli = Cli::parse_from([
+            "sandbox",
+            "policy",
+            "status",
+            "my-session",
+            "--wait",
+            "--timeout",
+            "5m",
+        ]);
+        match &cli.command {
+            Command::Policy {
+                action:
+                    PolicyAction::Status {
+                        session,
+                        wait,
+                        timeout,
+                    },
+            } => {
+                assert_eq!(session, "my-session");
+                assert!(*wait);
+                assert_eq!(timeout, "5m");
+            }
+            _ => panic!("expected Policy Status command"),
+        }
+    }
+
+    #[test]
+    fn short_hash_truncates_to_12_chars() {
+        let full = "deadbeef1234567890abcdef";
+        assert_eq!(short_hash(full), "deadbeef1234");
+    }
+
+    #[test]
+    fn short_hash_passes_through_short_input() {
+        assert_eq!(short_hash("abc"), "abc");
     }
 }

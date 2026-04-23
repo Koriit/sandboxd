@@ -50,6 +50,41 @@ pub struct NetworkHealth {
     pub tap_exists: bool,
 }
 
+/// Wire-level response shape for
+/// `GET /sessions/{id}/policy/propagation-status`.
+///
+/// Produced by the daemon ([`sandboxd::policy_http`]) and consumed by
+/// the `sandbox policy status [--wait]` CLI subcommand and the E2E
+/// suite. Both sides share this type so a field rename at the HTTP
+/// layer cannot silently drift from the CLI's wait loop.
+///
+/// # Fields
+///
+/// * `expected_hash` — hash of the policy most recently handed to the
+///   distributor. `None` when no policy has ever been applied to the
+///   session.
+/// * `propagated_hash` — hash of the policy most recently observed to
+///   have fully reconciled across all three enforcement layers. `None`
+///   until the first reconciliation edge; cleared whenever
+///   `expected_hash` changes. Equal to `expected_hash` iff
+///   `propagated` is `true`.
+/// * `propagated` — convenience boolean, true iff both hashes are
+///   `Some` and equal.
+/// * `seconds_since_apply` — wall-clock seconds since `expected_hash`
+///   last changed. `0` when no policy has ever been applied.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PropagationStatusResponse {
+    /// Hash of the policy most recently handed to the distributor.
+    pub expected_hash: Option<String>,
+    /// Hash of the policy most recently observed to have fully
+    /// reconciled across all three enforcement layers.
+    pub propagated_hash: Option<String>,
+    /// Convenience: `true` iff the two hashes are `Some` and equal.
+    pub propagated: bool,
+    /// Wall-clock seconds since `expected_hash` last changed.
+    pub seconds_since_apply: u64,
+}
+
 /// Request body for `POST /sessions`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct CreateSessionRequest {

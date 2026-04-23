@@ -39,7 +39,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
-use sandbox_core::{SandboxError, SessionStore};
+use sandbox_core::{PropagationStatusResponse, SandboxError, SessionStore};
 
 use crate::error::error_response as map_error;
 use crate::propagation::PropagationStates;
@@ -87,42 +87,6 @@ pub fn policy_router(state: Arc<PolicyApiState>) -> Router {
             get(propagation_status),
         )
         .with_state(state)
-}
-
-/// Wire-level response shape for `GET /sessions/{id}/policy/propagation-status`.
-///
-/// See [`crate::propagation`] for the state machine behind the two
-/// hash fields.
-///
-/// # Fields
-///
-/// * `expected_hash` — hash of the policy most recently handed to the
-///   distributor. `None` when no policy has ever been applied to the
-///   session. Clients waiting for a specific apply should compare this
-///   against the hash they expect to see and treat a mismatch as
-///   "still pending".
-/// * `propagated_hash` — hash of the policy most recently observed to
-///   have fully reconciled. `None` until the first reconciliation edge;
-///   cleared whenever `expected_hash` changes. Equal to `expected_hash`
-///   iff `propagated` is `true`.
-/// * `propagated` — convenience boolean, true iff both hashes are `Some`
-///   and equal. Clients that do not care about the specific hash (e.g.
-///   "has *any* policy finished propagating?") can read this directly.
-/// * `seconds_since_apply` — wall-clock seconds since `expected_hash`
-///   last changed. Used by the CLI wait loop for user-facing progress
-///   and by the E2E suite for timeout accounting. `0` when no policy
-///   has ever been applied.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct PropagationStatusResponse {
-    /// Hash of the policy most recently handed to the distributor.
-    pub expected_hash: Option<String>,
-    /// Hash of the policy most recently observed to have fully
-    /// reconciled across all three enforcement layers.
-    pub propagated_hash: Option<String>,
-    /// Convenience: `true` iff the two hashes are `Some` and equal.
-    pub propagated: bool,
-    /// Wall-clock seconds since `expected_hash` last changed.
-    pub seconds_since_apply: u64,
 }
 
 /// Handler: `GET /sessions/{id}/policy/propagation-status`.
