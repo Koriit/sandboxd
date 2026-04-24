@@ -1133,6 +1133,11 @@ impl GatewayManager {
             "waiting for component readiness"
         );
 
+        let mut last_stdout = String::new();
+        let mut last_stderr = String::new();
+        let mut last_exit_code: Option<i32> = None;
+        let mut attempts: u32 = 0;
+
         while Instant::now() < deadline {
             let mut args = vec!["exec", container_name];
             args.extend(check_cmd);
@@ -1141,21 +1146,35 @@ impl GatewayManager {
                 SandboxError::Gateway(format!("failed to check {component_name} readiness: {e}"))
             })?;
 
+            attempts += 1;
+
             if output.status.success() {
                 debug!(
                     container = container_name,
                     component = component_name,
+                    attempts,
                     "component is ready"
                 );
                 return Ok(());
             }
 
+            last_exit_code = output.status.code();
+            last_stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            last_stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
             thread::sleep(COMPONENT_POLL_INTERVAL);
         }
 
         Err(SandboxError::Gateway(format!(
-            "{component_name} did not become ready within {}s",
-            COMPONENT_READY_TIMEOUT.as_secs()
+            "{component_name} did not become ready within {}s after {attempts} probes \
+             (last exit={exit}, stdout={stdout:?}, stderr={stderr:?}, probe={probe:?})",
+            COMPONENT_READY_TIMEOUT.as_secs(),
+            exit = last_exit_code
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".into()),
+            stdout = last_stdout,
+            stderr = last_stderr,
+            probe = check_cmd,
         )))
     }
 }

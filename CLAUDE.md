@@ -13,19 +13,32 @@ Sandbox daemon providing isolated Linux VMs (Lima/QEMU) for coding agents.
 
 ```bash
 make build                  # cargo build --workspace
-make test                   # cargo nextest run --workspace (unit tests, ~5s)
-make test-integration       # integration tests (requires Docker + Lima)
-make test-validators        # policy-compiler outputs vs nft -c / envoy --mode validate
+make test                   # hermetic unit tests only — fast, no Docker/Lima/nft
+make test-integration       # test + every #[ignore]d integration test (Docker required)
 make test-e2e               # full E2E suite (boots real VMs, ~30-45 min)
 make gateway-image          # docker build for gateway container
 ```
 
-`make test-validators` runs env-gated (`SANDBOX_TEST_VALIDATORS=1`),
-`#[ignore]`d Rust integration tests that feed the policy compiler's
-outputs through the real tools that consume them in production
-(nftables parser with `CAP_NET_ADMIN`, Envoy `--mode validate`, and a
-`serde_json` round-trip of the mitmproxy config). They depend on
-`make gateway-image` but stay out of the default `make test` path.
+### Integration-test convention
+
+Any test that needs out-of-process state (real gateway container,
+`nft -c` / `envoy --mode validate` CLIs, a Lima VM, etc.) is marked
+`#[ignore]` at the test site with a reason string pointing to
+`make test-integration`. This keeps `make test` hermetic (~5s, no
+Docker dependency) and lets `make test-integration` run everything
+via `cargo nextest run --run-ignored only`.
+
+Validator tests (policy-compiler outputs run through `nft -c` in a
+`CAP_NET_ADMIN` container, Envoy `--mode validate`, and a
+`serde_json` round-trip of the mitmproxy config) additionally
+short-circuit at the top of the test body unless
+`SANDBOX_TEST_VALIDATORS=1` is set — double-guard for environments
+that have Docker but lack the specific external binaries. The Make
+target always sets it.
+
+For iteration on a single integration test, run nextest directly
+with `--run-ignored only -E '<filter>'`:
+`cd sandboxd && cargo nextest run --run-ignored only -E 'test(gateway_lifecycle)'`.
 
 ## E2E tests
 

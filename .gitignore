@@ -10,9 +10,6 @@
 # Rust build artifacts
 /sandboxd/target/
 
-# Make stamp files (driven by the `make gateway-image` target)
-/.gateway-image.stamp
-
 # Python
 /tests/e2e/.venv/
 *.pyc

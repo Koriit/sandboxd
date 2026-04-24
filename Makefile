@@ -1,4 +1,4 @@
-.PHONY: build fmt fmt-check test test-integration test-validators test-e2e gateway-image docs-dev docs-build clean
+.PHONY: build fmt fmt-check test test-integration test-e2e gateway-image docs-dev docs-build clean
 
 build: fmt-check
 	cd sandboxd && cargo build --workspace
@@ -9,11 +9,25 @@ fmt:
 fmt-check:
 	cd sandboxd && cargo fmt --all -- --check
 
+# Hermetic unit tests: in-process, no Docker / Lima / nftables. Every test
+# that needs out-of-process state (real gateway container, external validator
+# binaries like `nft -c` / `envoy --mode validate`, Lima VMs) is marked
+# `#[ignore]` at the test site so this target stays fast and deterministic.
 test:
 	cd sandboxd && cargo nextest run --workspace
 
-test-integration: test
-	cd sandboxd && cargo nextest run --package sandbox-core --test '*'
+# Integration tests: every `#[ignore]`d test in the workspace. This runs both
+# (a) the gateway-container lifecycle tests in `sandbox-core/tests/gateway_integration.rs`
+# (need Docker + the sandbox-gateway image), and (b) the external-validator
+# tests in `sandbox-core/tests/validators.rs` (policy-compiler outputs run
+# through real `nft -c` / `envoy --mode validate` / mitmproxy JSON round-trip).
+# Validator tests additionally short-circuit in-body unless SANDBOX_TEST_VALIDATORS=1
+# is set — we always set it here because this Make target implies Docker is
+# present. Use `cargo nextest run --run-ignored only -E '<filter>'` directly
+# for finer selection when iterating.
+test-integration: gateway-image
+	cd sandboxd && SANDBOX_TEST_VALIDATORS=1 cargo nextest run \
+		--workspace --run-ignored only
 
 tests/e2e/.venv/.installed: tests/e2e/pyproject.toml
 	python3 -m venv tests/e2e/.venv
@@ -31,44 +45,20 @@ TEST ?=
 test-e2e: tests/e2e/.venv/.installed gateway-image
 	cd tests/e2e && . .venv/bin/activate && python -m pytest -v -rs $(TEST)
 
-# External-validator harness: feeds the policy compiler's outputs
-# through the real tools that consume them in production — `nft -c`
-# inside a CAP_NET_ADMIN container, `envoy --mode validate` against
-# the pinned Envoy version, and a `serde_json` round-trip of the
-# mitmproxy config. Each test is `#[ignore]`d and additionally gates
-# on `SANDBOX_TEST_VALIDATORS=1`, so the default `make test` /
-# `cargo nextest run --workspace` path stays hermetic (no Docker
-# dependency). Depends on `gateway-image` so the container tooling
-# reflects current `networking/` sources.
-test-validators: gateway-image
-	cd sandboxd && SANDBOX_TEST_VALIDATORS=1 cargo nextest run \
-		--workspace --run-ignored only -E 'test(/validator_/)'
-
-# Stamp-driven rebuild: only rebuild the docker image when one of its
-# inputs (Dockerfile, addon, entrypoint, Envoy/CoreDNS configs, or the
-# `sandbox-deny-logger` crate — compiled from source in a Dockerfile
-# build stage) changes. The phony `gateway-image` target remains as an
-# unconditional rebuild entry point for callers who want to force a
-# rebuild.
+# Always run `docker build`; Docker's layer cache handles the no-op case
+# cheaply (a few seconds for context upload when nothing has changed).
+# The previous stamp-file indirection attempted to skip the build when its
+# tracked inputs hadn't changed, but the input list would silently drift
+# from reality and the stale image would get used by integration / E2E
+# tests — see the gateway_integration flakiness that was actually stale-image
+# failures hitting the component-ready timeout.
 #
-# Build context is the repository root so the Rust deny-logger build
-# stage can `COPY sandboxd/` into its builder. `.dockerignore` at the
-# repo root keeps `sandboxd/target/` and other heavy directories out of
-# the context upload.
-GATEWAY_INPUTS := $(shell find networking -type f \
-	\( -name '*.py' -o -name '*.sh' -o -name 'Dockerfile' \
-	   -o -name '*.yaml' -o -name '*.yml' -o -name 'Corefile' \) \
-	-not -path '*/__pycache__/*') \
-	$(shell find sandboxd/sandbox-deny-logger -type f \
-	   \( -name '*.rs' -o -name 'Cargo.toml' \)) \
-	sandboxd/Cargo.toml sandboxd/Cargo.lock \
-	.dockerignore
-
-.gateway-image.stamp: $(GATEWAY_INPUTS)
+# Build context is the repository root so the Rust deny-logger build stage
+# can `COPY sandboxd/` into its builder. `.dockerignore` at the repo root
+# keeps `sandboxd/target/` and other heavy directories out of the context
+# upload.
+gateway-image:
 	docker build -t sandbox-gateway -f networking/gateway/Dockerfile .
-	@touch $@
-
-gateway-image: .gateway-image.stamp
 
 docs-dev:
 	cd site && npm install && npm run dev
@@ -79,5 +69,4 @@ docs-build:
 clean:
 	cd sandboxd && cargo clean
 	rm -rf tests/e2e/.venv/
-	rm -f .gateway-image.stamp
 	rm -rf site/node_modules site/dist

@@ -17,6 +17,7 @@ use sandbox_core::{
 use std::net::Ipv4Addr;
 
 #[test]
+#[ignore = "integration: requires Docker + gateway-image; run via `make test-integration`"]
 fn test_gateway_lifecycle() {
     // Use 10.209.3.0/24 to avoid collisions with other tests.
     let net_mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 3, 0), 24).unwrap();
@@ -273,6 +274,7 @@ fn test_gateway_nftables_injection_standalone() {
 ///     bootstrap. (M9-S19 completes the cutover by routing every L3
 ///     filter chain to this cluster via `tcp_proxy.tunneling_config`.)
 #[test]
+#[ignore = "integration: requires Docker + gateway-image; run via `make test-integration`"]
 fn test_gateway_lds_listener_and_atomic_rewrite() {
     // Use 10.209.5.0/24 to avoid collisions with other tests.
     let net_mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 5, 0), 24).unwrap();
@@ -548,6 +550,7 @@ fn test_gateway_lds_listener_and_atomic_rewrite() {
 ///      target getting shadowed by the `/var/log` tmpfs).
 ///   3. `stop_gateway` removes the host events dir.
 #[test]
+#[ignore = "integration: requires Docker + gateway-image; run via `make test-integration`"]
 fn gateway_container_has_events_bind_mount() {
     // Use 10.209.6.0/24 to avoid collisions with the other gateway
     // tests in this file.
