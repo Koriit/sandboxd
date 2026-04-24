@@ -9,25 +9,26 @@ fmt:
 fmt-check:
 	cd sandboxd && cargo fmt --all -- --check
 
-# Hermetic unit tests: in-process, no Docker / Lima / nftables. Every test
-# that needs out-of-process state (real gateway container, external validator
-# binaries like `nft -c` / `envoy --mode validate`, Lima VMs) is marked
-# `#[ignore]` at the test site so this target stays fast and deterministic.
+# Hermetic unit tests: in-process, no Docker / Lima / nftables. The
+# default nextest profile (`sandboxd/.config/nextest.toml`) filters out
+# every test named `integration_*`, so this target stays fast and
+# deterministic even as the workspace grows more integration tests.
 test:
 	cd sandboxd && cargo nextest run --workspace
 
-# Integration tests: every `#[ignore]`d test in the workspace. This runs both
-# (a) the gateway-container lifecycle tests in `sandbox-core/tests/gateway_integration.rs`
-# (need Docker + the sandbox-gateway image), and (b) the external-validator
-# tests in `sandbox-core/tests/validators.rs` (policy-compiler outputs run
-# through real `nft -c` / `envoy --mode validate` / mitmproxy JSON round-trip).
-# Validator tests additionally short-circuit in-body unless SANDBOX_TEST_VALIDATORS=1
-# is set — we always set it here because this Make target implies Docker is
-# present. Use `cargo nextest run --run-ignored only -E '<filter>'` directly
-# for finer selection when iterating.
+# Integration tests: every test named `integration_*` in the workspace.
+# These require out-of-process state — a real `sandbox-gateway`
+# container, the external validator CLIs (`nft -c` / `envoy --mode
+# validate`) that ship inside it, etc. The `integration` nextest profile
+# (`sandboxd/.config/nextest.toml`) selects them via the name prefix; the
+# default profile filters them out. No `#[ignore]`, no env gate —
+# membership is self-describing at the call site via the prefix.
+#
+# For finer selection while iterating, layer an `-E` filter on top of
+# the profile, e.g. `cargo nextest run --profile integration -E \
+# 'test(integration_gateway_lifecycle)'`.
 test-integration: gateway-image
-	cd sandboxd && SANDBOX_TEST_VALIDATORS=1 cargo nextest run \
-		--workspace --run-ignored only
+	cd sandboxd && cargo nextest run --workspace --profile integration
 
 tests/e2e/.venv/.installed: tests/e2e/pyproject.toml
 	python3 -m venv tests/e2e/.venv

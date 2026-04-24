@@ -33,16 +33,14 @@
 //!
 //! # Gate
 //!
-//! Every test in this file is `#[ignore]` and additionally short-
-//! circuits unless `SANDBOX_TEST_INTEGRATION=1` is set. This follows
-//! the same gating pattern as
-//! `sandbox-core/tests/validators.rs` (`SANDBOX_TEST_VALIDATORS=1`) —
-//! the default workspace test run (`cargo nextest run --workspace`)
-//! stays hermetic with no Docker dependency. A new env var is used
-//! instead of reusing `SANDBOX_TEST_VALIDATORS=1` because these tests
-//! exercise a different concern (end-to-end gateway + deny-logger vs.
-//! compiler-output validators) and the orchestrator may want to run
-//! one set without the other.
+//! Every test in this file is named `integration_*` and is selected
+//! by the `integration` nextest profile (see
+//! `sandboxd/.config/nextest.toml`). This matches the workspace-wide
+//! integration-test convention (see
+//! `sandbox-core/tests/validators.rs` and
+//! `sandbox-core/tests/gateway_integration.rs`) — the default
+//! profile filters these out so `cargo nextest run --workspace`
+//! stays hermetic with no Docker dependency.
 //!
 //! # Requirements when enabled
 //!
@@ -89,37 +87,6 @@ use sandbox_core::{
 };
 use tokio::sync::broadcast;
 use tokio::time::timeout;
-
-// ---------------------------------------------------------------------------
-// Env gate
-// ---------------------------------------------------------------------------
-
-const ENV_GATE: &str = "SANDBOX_TEST_INTEGRATION";
-
-/// Returns `true` when the integration harness is explicitly enabled.
-///
-/// We require `SANDBOX_TEST_INTEGRATION=1` (not any non-empty value) so
-/// accidental inheritance (e.g. a shell function exporting a debug
-/// string) does not silently flip the gate. This matches the
-/// convention in `sandbox-core/tests/validators.rs`.
-fn env_gate_enabled() -> bool {
-    std::env::var(ENV_GATE).map(|v| v == "1").unwrap_or(false)
-}
-
-/// Short-circuits the current test (returning `true`) unless the
-/// integration gate is enabled. Prints a standard `SKIP` line so
-/// cargo-nextest's output makes the skip reason obvious.
-fn skip_unless_enabled(test_name: &str) -> bool {
-    if env_gate_enabled() {
-        false
-    } else {
-        eprintln!(
-            "SKIP {test_name}: set {ENV_GATE}=1 to enable integration tests \
-             (requires Docker + `make gateway-image`)"
-        );
-        true
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Side container RAII guard
@@ -493,12 +460,7 @@ fn allow_10_over_8_443() -> Policy {
 /// deny-logger :10001 → deny-logger emits JSONL record → sandboxd's
 /// ingestor tails the file → stamped envelope lands on `EventBus`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Docker + sandbox-gateway image; enable with SANDBOX_TEST_INTEGRATION=1"]
-async fn tcp_connect_to_non_allowlisted_destination_emits_deny_event() {
-    if skip_unless_enabled("tcp_connect_to_non_allowlisted_destination_emits_deny_event") {
-        return;
-    }
-
+async fn integration_tcp_connect_to_non_allowlisted_destination_emits_deny_event() {
     let gw = GatewaySession::create(Ipv4Addr::new(10, 210, 0, 0));
     gw.apply_policy(&allow_10_over_8_443());
 
@@ -645,12 +607,7 @@ async fn tcp_connect_to_non_allowlisted_destination_emits_deny_event() {
 /// that socket so the logger can recover the original 5-tuple). The
 /// test pins that path: nft DNAT → UDP listener → JSONL `deny` record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Docker + sandbox-gateway image; enable with SANDBOX_TEST_INTEGRATION=1"]
-async fn udp_send_to_non_allowlisted_destination_emits_deny_event() {
-    if skip_unless_enabled("udp_send_to_non_allowlisted_destination_emits_deny_event") {
-        return;
-    }
-
+async fn integration_udp_send_to_non_allowlisted_destination_emits_deny_event() {
     let gw = GatewaySession::create(Ipv4Addr::new(10, 211, 0, 0));
     gw.apply_policy(&allow_10_over_8_443());
 
@@ -817,14 +774,7 @@ fn nft_tables(gw_container: &str) -> std::collections::BTreeSet<String> {
 /// conditional DNAT fallback, leaving `sandbox_policy` to hold only
 /// the Envoy-egress allow list on the `output` chain.
 #[test]
-#[ignore = "requires Docker + sandbox-gateway image; enable with SANDBOX_TEST_INTEGRATION=1"]
-fn session_start_produces_exactly_sandbox_sandbox_dnat_sandbox_policy_tables() {
-    if skip_unless_enabled(
-        "session_start_produces_exactly_sandbox_sandbox_dnat_sandbox_policy_tables",
-    ) {
-        return;
-    }
-
+fn integration_session_start_produces_exactly_sandbox_sandbox_dnat_sandbox_policy_tables() {
     let gw = GatewaySession::create(Ipv4Addr::new(10, 212, 0, 0));
 
     // Apply the same allow-10.0.0.0/8:443 policy so `sandbox_policy`
@@ -914,12 +864,7 @@ fn session_start_produces_exactly_sandbox_sandbox_dnat_sandbox_policy_tables() {
 /// production code uses. This keeps the assertion anchored to the
 /// public contracts without spinning up a full sandboxd / VM.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires Docker + sandbox-gateway image; enable with SANDBOX_TEST_INTEGRATION=1"]
-async fn killing_deny_logger_emits_health_degraded_then_restored() {
-    if skip_unless_enabled("killing_deny_logger_emits_health_degraded_then_restored") {
-        return;
-    }
-
+async fn integration_killing_deny_logger_emits_health_degraded_then_restored() {
     let gw = GatewaySession::create(Ipv4Addr::new(10, 213, 0, 0));
     let policy = allow_10_over_8_443();
     gw.apply_policy(&policy);

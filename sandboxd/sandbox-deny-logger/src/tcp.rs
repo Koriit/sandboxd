@@ -399,7 +399,19 @@ mod tests {
                                 s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
                                 return s;
                             }
-                            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                            // The server's over-cap rejection path applies
+                            // SO_LINGER{0} + drop, so the kernel may surface
+                            // either ECONNREFUSED (listen backlog overflow)
+                            // or ECONNRESET (in-flight handshake RST by the
+                            // server) depending on timing. Both are transient
+                            // "over-cap, retry" signals.
+                            Err(e)
+                                if matches!(
+                                    e.kind(),
+                                    io::ErrorKind::ConnectionRefused
+                                        | io::ErrorKind::ConnectionReset
+                                ) =>
+                            {
                                 last_err = Some(e);
                                 std::thread::sleep(Duration::from_millis(5));
                             }

@@ -1,3 +1,15 @@
 [profile.default]
 retries = 0
 fail-fast = true
+# Integration tests use the `integration_*` name prefix and are run via
+# the `integration` profile (see `make test-integration`). Filter them
+# out of the default profile so `make test` / `cargo nextest run` stay
+# hermetic with no Docker dependency.
+default-filter = 'not test(/^integration_/)'
+
+[profile.integration]
+# Opt-in profile for tests requiring out-of-process state (real gateway
+# container, `nft -c` / `envoy --mode validate` CLIs, etc.). Selected by
+# the `integration_*` name prefix so the set is self-describing at call
+# sites — no `#[ignore]`, no env gate.
+default-filter = 'test(/^integration_/)'

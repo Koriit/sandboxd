@@ -12,7 +12,7 @@ use sandbox_core::lima::{LimaManager, vm_name};
 use sandbox_core::session::{SessionConfig, SessionId};
 
 #[test]
-fn test_lima_create_and_delete() {
+fn integration_lima_create_and_delete() {
     let dir = tempfile::TempDir::new().expect("create temp dir");
     let mgr = LimaManager::new(dir.path().to_path_buf())
         .expect("limactl must be on PATH for integration test");

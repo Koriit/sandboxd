@@ -13,19 +13,16 @@
 //!   `destination_port` `FilterChainMatch` predicates added in M10-S1
 //!   Phase 3A) passes Envoy's own schema validation against the
 //!   version pinned in the gateway image.
-//! - `serde_json::from_str::<MitmproxyConfig>` round-trips the
-//!   compiler's mitmproxy JSON through the Rust-side `MitmproxyConfig`
-//!   Deserialize impl. This is a hermetic smoke test; it does not
-//!   require Docker.
 //!
 //! ## Gate
 //!
-//! Every test is `#[ignore]` and additionally short-circuits unless
-//! `SANDBOX_TEST_VALIDATORS=1` is set. The Makefile target
-//! `make test-validators` at the repo root sets the env var, builds
-//! the gateway image, and invokes `cargo nextest run` with
-//! `--run-ignored only -E 'test(/validator_/)'` so the default
-//! workspace test run stays hermetic (no Docker dependency).
+//! Every test in this file is named `integration_*` and is selected
+//! by the `integration` nextest profile (see
+//! `sandboxd/.config/nextest.toml`). The default profile filters
+//! these out so the hermetic workspace run (`make test` /
+//! `cargo nextest run --workspace`) carries no Docker dependency;
+//! `make test-integration` invokes the `integration` profile to run
+//! them after building the gateway image.
 //!
 //! ## Requirements when enabled
 //!
@@ -37,8 +34,8 @@
 //!
 //! ## Container lifecycle
 //!
-//! The two Docker-backed tests spawn a long-running `sleep infinity`
-//! container from the `sandbox-gateway` image and `docker exec` the
+//! Each Docker-backed test spawns a long-running `sleep infinity`
+//! container from the `sandbox-gateway` image and `docker exec`s the
 //! validators against it. A RAII wrapper (`TestContainer`) runs
 //! `docker rm -f` in its `Drop` impl so the container is cleaned up
 //! even on panic. Each test uses its own container with a unique name
@@ -51,40 +48,11 @@ use sandbox_core::network::NetworkInfo;
 use sandbox_core::policy::SCHEMA_VERSION;
 use sandbox_core::{
     AssuranceLevel, BOOTSTRAP_FILE_IN_CONTAINER, Destination, DnsCache, HttpFilter, HttpMethod,
-    LISTENER_DIR_IN_CONTAINER, LISTENER_FILE_IN_CONTAINER, MitmproxyConfig, Policy, PolicyCompiler,
-    PolicyRule, Protocol, ResolvedMapping, ResolvedReport, generate_domain_ip_rules,
+    LISTENER_DIR_IN_CONTAINER, LISTENER_FILE_IN_CONTAINER, Policy, PolicyCompiler, PolicyRule,
+    Protocol, ResolvedMapping, ResolvedReport, generate_domain_ip_rules,
 };
 
-// ---------------------------------------------------------------------------
-// Env gate
-// ---------------------------------------------------------------------------
-
-const ENV_GATE: &str = "SANDBOX_TEST_VALIDATORS";
 const GATEWAY_IMAGE: &str = "sandbox-gateway";
-
-/// Returns `true` when the validator harness is explicitly enabled.
-///
-/// We require `SANDBOX_TEST_VALIDATORS=1` rather than any non-empty
-/// value so accidental inheritance (e.g. a shell function exporting a
-/// debug string) does not silently flip the gate.
-fn env_gate_enabled() -> bool {
-    std::env::var(ENV_GATE).map(|v| v == "1").unwrap_or(false)
-}
-
-/// Short-circuits the current test (returning `true`) unless the
-/// validator gate is enabled. Prints a standard `SKIP` line so
-/// cargo-nextest's output makes the skip reason obvious.
-fn skip_unless_enabled(test_name: &str) -> bool {
-    if env_gate_enabled() {
-        false
-    } else {
-        eprintln!(
-            "SKIP {test_name}: set {ENV_GATE}=1 to enable external-validator tests \
-             (requires Docker + `make gateway-image`)"
-        );
-        true
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -320,12 +288,7 @@ fn write_file_in_container(container: &str, path: &str, content: &str) {
 /// ever regresses — e.g. a kernel bump flips the behaviour — this
 /// test surfaces it via a concrete parse result.
 #[test]
-#[ignore = "requires Docker + sandbox-gateway image; enable with SANDBOX_TEST_VALIDATORS=1"]
-fn validator_nft_check() {
-    if skip_unless_enabled("validator_nft_check") {
-        return;
-    }
-
+fn integration_validator_nft_check() {
     let policy = fixture_policy();
     let network_info = test_network_info();
     let dns_cache = seeded_dns_cache();
@@ -381,12 +344,7 @@ fn validator_nft_check() {
 /// container, a missing `typed_config.@type` URL, or a tunneling_config
 /// field that moved between Envoy releases.
 #[test]
-#[ignore = "requires Docker + sandbox-gateway image; enable with SANDBOX_TEST_VALIDATORS=1"]
-fn validator_envoy_check() {
-    if skip_unless_enabled("validator_envoy_check") {
-        return;
-    }
-
+fn integration_validator_envoy_check() {
     let policy = fixture_policy();
     let dns_cache = seeded_dns_cache();
 
@@ -428,60 +386,4 @@ fn validator_envoy_check() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-}
-
-/// `compile_mitmproxy` emits JSON that round-trips cleanly through
-/// `MitmproxyConfig`'s Deserialize impl.
-///
-/// Hermetic smoke test — no Docker required; still env-gated so the
-/// default workspace test run does not run it. The Python addon
-/// consumes this JSON on startup, and the addon's schema expectations
-/// line up 1:1 with `MitmproxyConfig` / `MitmproxyRule` /
-/// `MitmproxyFilter`. Deserializing through the Rust-side structs
-/// catches field-name drift that would silently be ignored by Python's
-/// dict-access pattern until a production flow exercised the missing
-/// field.
-#[test]
-#[ignore = "env-gated alongside the Docker-backed validators; enable with SANDBOX_TEST_VALIDATORS=1"]
-fn validator_mitmproxy_schema() {
-    if skip_unless_enabled("validator_mitmproxy_schema") {
-        return;
-    }
-
-    let policy = fixture_policy();
-    let network_info = test_network_info();
-
-    let compiled = PolicyCompiler::compile(&policy, &network_info)
-        .expect("fixture policy should compile cleanly");
-
-    let parsed: MitmproxyConfig =
-        serde_json::from_str(&compiled.mitmproxy_config).unwrap_or_else(|e| {
-            panic!(
-                "mitmproxy config should deserialize; err={e}\nconfig={}",
-                compiled.mitmproxy_config
-            )
-        });
-
-    // Only the L3 rule (monitored.example.com) should appear; L1/L2
-    // rules do not emit mitmproxy entries. This asserts the schema
-    // shape end-to-end: one (host, port, filters) tuple with the
-    // expected values.
-    assert_eq!(
-        parsed.rules.len(),
-        1,
-        "expected exactly one mitmproxy rule (from the single L3 fixture entry); got {}: {:?}",
-        parsed.rules.len(),
-        parsed.rules
-    );
-    let rule = &parsed.rules[0];
-    assert_eq!(rule.host, "monitored.example.com", "rule host mismatch");
-    assert_eq!(rule.port, 443, "rule port mismatch");
-    assert_eq!(
-        rule.filters.len(),
-        1,
-        "expected exactly one http filter; got {:?}",
-        rule.filters
-    );
-    assert_eq!(rule.filters[0].method, "GET", "filter method mismatch");
-    assert_eq!(rule.filters[0].path, "/api/*", "filter path mismatch");
 }

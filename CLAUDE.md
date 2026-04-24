@@ -22,23 +22,21 @@ make gateway-image          # docker build for gateway container
 ### Integration-test convention
 
 Any test that needs out-of-process state (real gateway container,
-`nft -c` / `envoy --mode validate` CLIs, a Lima VM, etc.) is marked
-`#[ignore]` at the test site with a reason string pointing to
-`make test-integration`. This keeps `make test` hermetic (~5s, no
-Docker dependency) and lets `make test-integration` run everything
-via `cargo nextest run --run-ignored only`.
+`nft -c` / `envoy --mode validate` CLIs, a Lima VM, etc.) is named
+with an `integration_*` prefix at the test site. The `integration`
+nextest profile (`sandboxd/.config/nextest.toml`) selects tests by
+that prefix; the default profile filters them out. No `#[ignore]`
+attribute, no env gate — membership is self-describing at the call
+site via the name.
 
-Validator tests (policy-compiler outputs run through `nft -c` in a
-`CAP_NET_ADMIN` container, Envoy `--mode validate`, and a
-`serde_json` round-trip of the mitmproxy config) additionally
-short-circuit at the top of the test body unless
-`SANDBOX_TEST_VALIDATORS=1` is set — double-guard for environments
-that have Docker but lack the specific external binaries. The Make
-target always sets it.
+This keeps `make test` hermetic (~5s, no Docker dependency) and lets
+`make test-integration` run the full integration set via
+`cargo nextest run --workspace --profile integration` after building
+the gateway image.
 
-For iteration on a single integration test, run nextest directly
-with `--run-ignored only -E '<filter>'`:
-`cd sandboxd && cargo nextest run --run-ignored only -E 'test(gateway_lifecycle)'`.
+For iteration on a single integration test, layer an `-E` filter on
+top of the profile:
+`cd sandboxd && cargo nextest run --profile integration -E 'test(integration_gateway_lifecycle)'`.
 
 ## E2E tests
 

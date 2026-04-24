@@ -17,7 +17,7 @@
 //!   [`create_with_policy_and_two_presets_posts_merged_body`],
 //!   [`policy_update_with_preset_posts_merged_body`], and the
 //!   integration counterpart
-//!   [`integration_create_with_npm_preset_ships_source_presets`].
+//!   [`create_with_npm_preset_ships_source_presets`].
 //!
 //! The fake-daemon tests spin an in-process axum HTTP/1.1 server on a
 //! tempdir Unix socket, capture exactly one `POST /sessions` (or
@@ -510,7 +510,7 @@ async fn policy_update_with_no_flags_errors_with_three_option_guidance() {
 /// This is the "daemon sees the wire shape M10-S5 specifies" test. It
 /// complements the unit tests that verify CLI-internal types.
 #[tokio::test]
-async fn integration_create_with_npm_preset_ships_source_presets() {
+async fn create_with_npm_preset_ships_source_presets() {
     let (_dtmp, sock, captured) = spawn_fake_daemon_for_create().await;
 
     let (status, stdout, stderr) =

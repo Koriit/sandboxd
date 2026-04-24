@@ -3403,6 +3403,86 @@ mod tests {
         assert_eq!(path_json, expected_path);
     }
 
+    /// Round-trip the compiled mitmproxy JSON through the Rust-side
+    /// `MitmproxyConfig` `Deserialize` impl for a mixed L1/L2/L3 policy
+    /// and assert that only the L3 rule surfaces in the config.
+    ///
+    /// The Python addon consumes this JSON on startup, and the addon's
+    /// schema expectations line up 1:1 with `MitmproxyConfig` /
+    /// `MitmproxyRule` / `MitmproxyFilter`. Deserializing through the
+    /// Rust-side structs catches field-name drift that would silently
+    /// be ignored by Python's dict-access pattern until a production
+    /// flow exercised the missing field.
+    #[test]
+    fn mitmproxy_config_skips_non_http_levels_in_mixed_policy() {
+        let policy = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![
+                PolicyRule {
+                    host: Destination::Domain("github.com".to_string()),
+                    port: 443,
+                    protocol: Protocol::Tcp,
+                    reason: Some("L1 transport passthrough".to_string()),
+                    level: AssuranceLevel::Transport,
+                },
+                PolicyRule {
+                    host: Destination::Domain("pinned.example.com".to_string()),
+                    port: 443,
+                    protocol: Protocol::Tcp,
+                    reason: Some("L2 TLS passthrough".to_string()),
+                    level: AssuranceLevel::Tls,
+                },
+                PolicyRule {
+                    host: Destination::Domain("monitored.example.com".to_string()),
+                    port: 443,
+                    protocol: Protocol::Tcp,
+                    reason: Some("L3 MITM with GET /api/* allowed".to_string()),
+                    level: AssuranceLevel::Http {
+                        http_filters: vec![HttpFilter {
+                            method: HttpMethod::Get,
+                            path: "/api/*".to_string(),
+                        }],
+                    },
+                },
+            ],
+        };
+        let net = test_network_info();
+
+        let compiled =
+            PolicyCompiler::compile(&policy, &net).expect("fixture policy should compile cleanly");
+
+        let parsed: MitmproxyConfig = serde_json::from_str(&compiled.mitmproxy_config)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "mitmproxy config should deserialize; err={e}\nconfig={}",
+                    compiled.mitmproxy_config
+                )
+            });
+
+        // Only the L3 rule (monitored.example.com) should appear; L1/L2
+        // rules do not emit mitmproxy entries. This asserts the schema
+        // shape end-to-end: one (host, port, filters) tuple with the
+        // expected values.
+        assert_eq!(
+            parsed.rules.len(),
+            1,
+            "expected exactly one mitmproxy rule (from the single L3 fixture entry); got {}: {:?}",
+            parsed.rules.len(),
+            parsed.rules
+        );
+        let rule = &parsed.rules[0];
+        assert_eq!(rule.host, "monitored.example.com", "rule host mismatch");
+        assert_eq!(rule.port, 443, "rule port mismatch");
+        assert_eq!(
+            rule.filters.len(),
+            1,
+            "expected exactly one http filter; got {:?}",
+            rule.filters
+        );
+        assert_eq!(rule.filters[0].method, "GET", "filter method mismatch");
+        assert_eq!(rule.filters[0].path, "/api/*", "filter path mismatch");
+    }
+
     // -- Assurance level properties ------------------------------------------
 
     #[test]

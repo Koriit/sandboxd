@@ -1,11 +1,12 @@
 //! Milestone-exit integration tests for M10-S4 Phase 5 (persistent
 //! event sink).
 //!
-//! Two contracts, both env-gated under `SANDBOX_TEST_INTEGRATION=1`
-//! and `#[ignore]`d so they stay out of the default workspace run
-//! (which intentionally boots nothing):
+//! Two contracts, both named `integration_*` so the `integration`
+//! nextest profile picks them up and the default profile filters
+//! them out of the hermetic workspace run (which intentionally
+//! boots nothing):
 //!
-//!   1. `persistent_sink_writes_rotated_jsonl` — with
+//!   1. `integration_persistent_sink_writes_rotated_jsonl` — with
 //!      `--events-persist` effectively on (via the Rust API, which
 //!      is what the daemon calls), events published to the bus land
 //!      as JSONL at
@@ -13,11 +14,12 @@
 //!      We publish a DNS event and a lifecycle event for the same
 //!      session, drop the sink, and verify both files exist with
 //!      valid JSON on every line.
-//!   2. `persistent_sink_pruner_removes_old_files` — fabricate
-//!      files at `today-20` and `today-1` under the spec layout,
-//!      spawn the sink with `retention_days = 14` and a fast test
-//!      interval (`SANDBOX_TEST_PRUNER_INTERVAL_SECS=1`), confirm
-//!      the stale file is removed and the recent one survives.
+//!   2. `integration_persistent_sink_pruner_removes_old_files` —
+//!      fabricate files at `today-20` and `today-1` under the spec
+//!      layout, spawn the sink with `retention_days = 14` and a
+//!      fast test interval (`SANDBOX_TEST_PRUNER_INTERVAL_SECS=1`),
+//!      confirm the stale file is removed and the recent one
+//!      survives.
 //!
 //! These tests drive `PersistentSink::spawn` directly rather than
 //! spawning the `sandboxd` binary.  The daemon's only added
@@ -37,25 +39,6 @@ use sandbox_core::{
 use tempfile::tempdir;
 use tokio::fs;
 use tokio::time::sleep;
-
-// ---------------------------------------------------------------------------
-// Env gate — mirrors m10_s3_end_to_end.rs
-// ---------------------------------------------------------------------------
-
-const ENV_GATE: &str = "SANDBOX_TEST_INTEGRATION";
-
-fn env_gate_enabled() -> bool {
-    std::env::var(ENV_GATE).map(|v| v == "1").unwrap_or(false)
-}
-
-fn skip_unless_enabled(test_name: &str) -> bool {
-    if env_gate_enabled() {
-        false
-    } else {
-        eprintln!("SKIP {test_name}: set {ENV_GATE}=1 to enable integration tests");
-        true
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Event fixtures
@@ -146,12 +129,7 @@ async fn wait_for_lines(path: &std::path::Path, at_least: usize) {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "requires SANDBOX_TEST_INTEGRATION=1"]
-async fn persistent_sink_writes_rotated_jsonl() {
-    if skip_unless_enabled("persistent_sink_writes_rotated_jsonl") {
-        return;
-    }
-
+async fn integration_persistent_sink_writes_rotated_jsonl() {
     let dir = tempdir().unwrap();
     let base = dir.path().to_path_buf();
 
@@ -218,12 +196,7 @@ async fn persistent_sink_writes_rotated_jsonl() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "requires SANDBOX_TEST_INTEGRATION=1"]
-async fn persistent_sink_pruner_removes_old_files() {
-    if skip_unless_enabled("persistent_sink_pruner_removes_old_files") {
-        return;
-    }
-
+async fn integration_persistent_sink_pruner_removes_old_files() {
     let dir = tempdir().unwrap();
     let base = dir.path().to_path_buf();
     let sid = SessionId::parse("0123456789ab").unwrap();
