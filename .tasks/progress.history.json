@@ -1,15 +1,62 @@
 {
   "current_state": {
     "milestone": "M10",
-    "session": "M10-S7",
-    "status": "finished",
+    "session": "M10-S8",
+    "status": "blocked",
     "completed_sessions": 66,
-    "total_sessions": 66,
-    "next": "Milestone M10 complete (final session); next plan step is M11 \u2014 out of scope for this conversation.",
-    "block_reason": "Spec premise falsified: mitmproxy 11.1.3 does not support PROXY protocol v2 reception \u2014 the design-spec's core mechanism for bridging Envoy\u2192mitmproxy cannot be used off-the-shelf. User must choose between (A) write custom mitmproxy layer/addon in-tree that parses PROXY v2 header before TransparentProxy runs (~80-120 lines Python parser + nontrivial hook into layer stack); (B) fork/alternative mitmproxy version (no upstream release has it); (C) different destination-preservation mechanism (TPROXY / reverse-proxy-per-dest \u2014 both defeat the single-mediated-egress design goal); (D) split the spec \u2014 ship Envoy-half in M9-S18 with mitmproxy still on SO_ORIGINAL_DST, amend M9-S19/S20 to cover the missing mitmproxy PROXY-v2 addon work. Planner recommends Option A with low confidence; cheapest alternative is Option D but requires spec amendment. Full verification + source refs + option analysis in the planner CLARIFY (last subagent response) and referenced in .tasks/handoffs/20260419-172418-explore-envoy-mitmproxy-current-state.md."
+    "total_sessions": 67,
+    "next": "M11 planning (starts with spec)",
+    "block_reason": "Spec premise falsified: mitmproxy 11.1.3 does not support PROXY protocol v2 reception \u2014 the design-spec's core mechanism for bridging Envoy\u2192mitmproxy cannot be used off-the-shelf. User must choose between (A) write custom mitmproxy layer/addon in-tree that parses PROXY v2 header before TransparentProxy runs (~80-120 lines Python parser + nontrivial hook into layer stack); (B) fork/alternative mitmproxy version (no upstream release has it); (C) different destination-preservation mechanism (TPROXY / reverse-proxy-per-dest \u2014 both defeat the single-mediated-egress design goal); (D) split the spec \u2014 ship Envoy-half in M9-S18 with mitmproxy still on SO_ORIGINAL_DST, amend M9-S19/S20 to cover the missing mitmproxy PROXY-v2 addon work. Planner recommends Option A with low confidence; cheapest alternative is Option D but requires spec amendment. Full verification + source refs + option analysis in the planner CLARIFY (last subagent response) and referenced in .tasks/handoffs/20260419-172418-explore-envoy-mitmproxy-current-state.md.",
+    "state_reason": "Awaiting user decisions on commit strategy (checkpoint-first vs final multi-commit) and commit granularity (per-todo vs logical grouping) before releasing the deferred-todo sweep subagent."
   },
   "append_system_prompt": "We are building sandbox daemon with Lima VMs for coding agents.  \nSpecifically: .tasks/specs/2026-04-21-port-explicit-policies-presets-observability-design.md  \nSession plan: docs/internal/session-plan.md\n\nUse /session-tracking for progress tracking. Log decisions and discoveries \u2014 they survive compaction. Block if design cannot be implemented.\n\nYou are running unsupervised \u2014 make autonomous decisions and do not wait for user input. If you hit an issue only the user can resolve, use progress block to pause the session.\n\nKeep context clean: delegate exploration and implementation to subagents. Reserve main conversation for decisions and coordination.\n\nLeverage teams, especially when there are build tools and tests involved, as those usually produce a lot of logs and are good fit for dedicated teammate to run them.\n\nYou are running in isolated VM with passwordless sudo. You can install packages and change system settings as needed.",
-  "current_log": null,
+  "current_log": {
+    "session": "M10-S8",
+    "title": "User polish & refactor \u2014 integration-test mechanism + flaky tcp fix",
+    "started": "2026-04-24T20:10:20.382323Z",
+    "entries": [
+      {
+        "timestamp": "2026-04-24T20:11:09.392694Z",
+        "type": "decision",
+        "note": "Integration-test mechanism: replace #[ignore] + env-gate helper with nextest profile + integration_* name prefix. Single source of truth in sandboxd/.config/nextest.toml; default profile filters out integration_*, integration profile runs only them."
+      },
+      {
+        "timestamp": "2026-04-24T20:11:09.478597Z",
+        "type": "decision",
+        "note": "Drop SANDBOX_TEST_VALIDATORS + SANDBOX_TEST_INTEGRATION entirely. Profile is the sole gate; Makefile test-integration target just adds --profile integration."
+      },
+      {
+        "timestamp": "2026-04-24T20:13:04.130458Z",
+        "type": "discovery",
+        "note": "Flaky tcp::tests::tcp_respects_concurrency_cap root cause: server's over-cap path does SO_LINGER{0} + drop \u2192 kernel surfaces either ECONNREFUSED (backlog overflow) or ECONNRESET (in-flight handshake RST) depending on timing. Client retry arm only matched ECONNREFUSED. Fix: broaden match to accept both kinds as transient over-cap signals."
+      },
+      {
+        "timestamp": "2026-04-24T20:13:07.264444Z",
+        "type": "discovery",
+        "note": "Latent bug: gateway_integration::test_gateway_nftables_injection_standalone was invoking docker in hermetic make test runs \u2014 had no #[ignore] attribute despite touching out-of-process state. Caught during integration_* rename sweep. Now gated by profile + prefix like the other gateway integration tests."
+      },
+      {
+        "timestamp": "2026-04-24T20:13:11.454175Z",
+        "type": "discovery",
+        "note": "Test classification sweep caught three mislabeled tests: (a) validator_mitmproxy_schema was hermetic (serde_json roundtrip, no external bin) \u2192 relocated to sandbox-core::policy unit tests; (b) integration_create_with_npm_preset_ships_source_presets was in-process cargo test \u2192 renamed to drop prefix; (c) test_lima_create_and_delete did shell out to limactl create \u2192 renamed to integration_lima_create_and_delete. Rule going forward: integration_ prefix means out-of-process state (real container, CLI validator, real VM), nothing else."
+      },
+      {
+        "timestamp": "2026-04-24T20:17:06.013426Z",
+        "type": "decision",
+        "note": "Expand M10-S8 scope to include a deferred-todo sweep (#16, #17, #18, #19, #20, #21, #22, #31, #32, #36). Single session, processed sequentially. #36 requires a live VM run (~30+ min); user explicitly waived time concern."
+      },
+      {
+        "timestamp": "2026-04-24T20:20:26.580616Z",
+        "type": "decision",
+        "note": "#29 (UDP deny events post-DNAT destination) explicitly deferred out of M10-S8 sweep. User suspicion: UDP path may have broader issues than just the conntrack-netlink lookup; warrants its own dedicated session rather than a point fix here."
+      },
+      {
+        "timestamp": "2026-04-24T20:27:26.313866Z",
+        "type": "decision",
+        "note": "Expand M10-S8 scope to also include #34, #38, #39, #40 \u2014 the todos blocking currently-skipped E2E tests (test_clone_repo, test_cargo_preset_allows_cargo_fetch, test_github_repo_preset_scopes_to_one_repo, plus the multi-host propagation race that blocks M10-close). New exit criterion: all E2E tests pass and no #[skip]/pytest.mark.skip decorators remain from M11-deferred fixes."
+      }
+    ]
+  },
   "log": [
     {
       "session": "M0-S1",
@@ -1391,56 +1438,65 @@
       "text": "Make apply_policy failure fatal for sandbox create when --policy/--unrestricted is explicit (today: warn! swallows error, session comes up with Policy: none)",
       "added_session": "M9-S15",
       "added_timestamp": "2026-04-17T21:48:20.728852Z",
-      "status": "deferred"
+      "status": "selected",
+      "selected_session": "M10-S8"
     },
     {
       "id": 17,
       "text": "Add nft -c validation for compiled nftables output in an integration test (catches syntax errors before E2E). Requires privileged container; hook into sandbox-core::gateway_integration.",
       "added_session": "M9-S15",
       "added_timestamp": "2026-04-17T21:48:26.738116Z",
-      "status": "deferred"
+      "status": "selected",
+      "selected_session": "M10-S8"
     },
     {
       "id": 18,
       "text": "Replace string-fragment assertions in PolicyCompiler unit tests with exact-shape or parser-validated checks (e.g. parse compiled nftables with nft -c, Envoy config with envoy --mode validate, mitmproxy JSON against a schema). Current contains() asserts let broken ct original tcp dport slip through.",
       "added_session": "M9-S15",
       "added_timestamp": "2026-04-17T22:16:27.811985Z",
-      "status": "deferred"
+      "status": "selected",
+      "selected_session": "M10-S8"
     },
     {
       "id": 19,
       "text": "Add apply_policy-through-real-gateway integration test in sandbox-core::gateway_integration. Covers compile \u2192 inject \u2192 nft/envoy/coredns acceptance. Catches syntax bugs, addon/daemon wire drift, and silent-failure swallowing before E2E.",
       "added_session": "M9-S15",
       "added_timestamp": "2026-04-17T22:16:32.191539Z",
-      "status": "deferred"
+      "status": "selected",
+      "selected_session": "M10-S8"
     },
     {
       "id": 20,
       "text": "Move LISTENER_HOST_ROOT from /tmp/sandboxd-listeners to $XDG_RUNTIME_DIR/sandboxd/listeners/ (fallback ~/.local/share/sandboxd/listeners/); optionally expose SANDBOX_LISTENER_DIR override. Convention alignment with socket-path precedent (CLAUDE.md).",
       "added_session": "M9-S18",
       "added_timestamp": "2026-04-20T00:12:59.136461Z",
-      "status": "deferred"
+      "status": "selected",
+      "selected_session": "M10-S8"
     },
     {
       "id": 21,
       "text": "Wrap PolicyDistributor::distribute call sites in tokio::task::spawn_blocking (pre-existing violation of CLAUDE.md 'all std::process::Command in async handlers wrapped in spawn_blocking'). Now also covers std::fs::rename via AtomicListenerWriter. Not M9-S18 scope but worth a dedicated follow-up.",
       "added_session": "M9-S18",
       "added_timestamp": "2026-04-20T00:13:01.524201Z",
-      "status": "deferred"
+      "status": "selected",
+      "selected_session": "M10-S8"
     },
     {
       "id": 22,
       "text": "Harden test_gateway_lds_listener_and_atomic_rewrite: also observe listener_manager.listener_create_success and total_listeners_active across rewrite to directly assert 'no drain, no recreate' (stronger than gateway_status()==Healthy). Consider /stats?format=json for robustness over text-parsing.",
       "added_session": "M9-S18",
       "added_timestamp": "2026-04-20T00:13:04.490985Z",
-      "status": "deferred"
+      "status": "selected",
+      "selected_session": "M10-S8"
     },
     {
       "id": 23,
       "text": "macOS/Lima cross-host bind-mount inotify MovedTo semantics for the Envoy listener file are unverified \u2014 tests only run on Linux. If macOS host support matters, add a platform-portability note or test for listener-file rename events across virtiofs/sshfs.",
       "added_session": "M9-S18",
       "added_timestamp": "2026-04-20T00:13:06.989338Z",
-      "status": "deferred"
+      "status": "dropped",
+      "resolved_session": "M10-S7",
+      "resolved_timestamp": "2026-04-24T20:08:54.149934Z"
     },
     {
       "id": 24,
@@ -1466,7 +1522,9 @@
       "text": "IPv6 %DOWNSTREAM_LOCAL_ADDRESS% format uses brackets ([::1]:443); not relevant now (gateway IPv4-only) but any future IPv6 re-enable must re-verify via first-step harness.",
       "added_session": "M9-S19",
       "added_timestamp": "2026-04-20T18:08:47.165235Z",
-      "status": "deferred"
+      "status": "dropped",
+      "resolved_session": "M10-S7",
+      "resolved_timestamp": "2026-04-24T20:08:54.149937Z"
     },
     {
       "id": 27,
@@ -1510,28 +1568,34 @@
       "text": "M10-S3 I3 follow-up: surface flush_ticker panics in sandbox-deny-logger. Options: (a) include flush_ticker JoinHandle in main's tokio::select! so panic takes process down, (b) install process-level std::panic::set_hook that logs and aborts. Current design hides panics silently; liveness posture should propagate listener-task exits to process termination consistently.",
       "added_session": "M10-S3",
       "added_timestamp": "2026-04-22T20:28:16.505220Z",
-      "status": "deferred"
+      "status": "selected",
+      "selected_session": "M10-S8"
     },
     {
       "id": 32,
       "text": "M10-S3 I4 follow-up: extract transition-detection core of poll_and_emit_component_health into a pure helper in sandbox-core. Currently Phase 8 test 4 re-implements ~150 lines of monitor-loop logic inline with a 500ms poll override and forced last_healthy reset. Shared helper removes double-maintenance risk when production monitor evolves (extra component, transition predicate, restart-gated policy reapply). Non-blocking - current structure is a pragmatic trade-off with good explanatory comments.",
       "added_session": "M10-S3",
       "added_timestamp": "2026-04-22T20:28:16.584941Z",
-      "status": "deferred"
+      "status": "selected",
+      "selected_session": "M10-S8"
     },
     {
       "id": 33,
       "text": "Flaky: sandbox-deny-logger tcp::tests::tcp_respects_concurrency_cap fails under load (passed in isolation + on re-run). Likely a timing/ordering bug in the concurrency-cap test setup. Investigate and either stabilize (stricter barriers, longer sleeps, #[ignore] with explicit rationale, or redesign) or pin as known-flaky. Pre-existing from M10-S3 Phase 3.",
       "added_session": "M10-S4",
       "added_timestamp": "2026-04-22T21:22:52.067563Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M10-S8",
+      "resolved_session": "M10-S8",
+      "resolved_timestamp": "2026-04-24T20:13:16.909697Z"
     },
     {
       "id": 34,
       "text": "daemon: propagate git clone failure from create --repo handler. Currently sandboxd/src/main.rs:805-820 logs a warning but returns CREATED even when the in-guest clone exited non-zero. Session ends up Running with empty /home/agent/workspace \u2014 test_m5_workspace::test_clone_repo observes this under full-suite load. Either fail the create call with SessionError::CloneFailed or leave session in a distinct Degraded state. Pre-existing since 2fd260c; surfaced during M10-S4 full E2E run.",
       "added_session": "M10-S4",
       "added_timestamp": "2026-04-23T01:43:55.796581Z",
-      "status": "deferred"
+      "status": "selected",
+      "selected_session": "M10-S8"
     },
     {
       "id": 35,
@@ -1548,7 +1612,8 @@
       "text": "M10-S5 Phase 5a' Option B: live cargo fetch trace in a sandbox VM to empirically verify the cargo preset host list. Agent chose Option A (documented endpoints) to save the 30+ min VM boot cost. Fixture at sandbox-cli/tests/fixtures/cargo_fetch_trace.json currently matches documented endpoints; spec cites 'verified against documented endpoints'. Live verification can update the fixture if the observed host set differs. Non-blocking.",
       "added_session": "M10-S5",
       "added_timestamp": "2026-04-23T03:35:54.908944Z",
-      "status": "deferred"
+      "status": "selected",
+      "selected_session": "M10-S8"
     },
     {
       "id": 37,
@@ -1565,42 +1630,51 @@
       "text": "M11: durable Envoy LDS/listener-ack in PropagationState. sandboxd/src/main.rs:2235 mark_propagated flips when listener YAML write returns, NOT when Envoy acks the new config. M10-S6 E2E surfaced: cargo curl Connection refused 53ms after --wait returns propagated=true, because cycle-2 listener rewrite may still be in flight. Fix: poll Envoy admin /config_dump (or /stats last_update_duration) for listener snapshot version before flipping propagated. Handoff 20260423-m10-s6-e2e-regression.md hypothesis 1.",
       "added_session": "M10-S6",
       "added_timestamp": "2026-04-23T09:30:09.334169Z",
-      "status": "deferred"
+      "status": "selected",
+      "selected_session": "M10-S8"
     },
     {
       "id": 39,
       "text": "M11: stabilize test_github_repo_preset_scopes_to_one_repo. Pre-existing ~80%-pass-rate flake. DNS rotation (github.com \u2192 rotating IPs 140.82.112.x/121.x/113.x/114.x) vs nftables allow-set causes torvalds/linux fetch to land on IP not in the github-repo preset set \u2192 deny at L3 (deny-logger) instead of L7 (mitmproxy) where the assertion expects. Handoff 20260423-m10-s6-e2e-regression.md failure 2 + prior 20260423-070500-* + 20260423-074500-*. Fix path: expand allow-set with suffix/CIDR matching for github.com pool, or add rule-level 'expand to common pool' semantics to the github-repo preset. Non-blocking for now.",
       "added_session": "M10-S6",
       "added_timestamp": "2026-04-23T09:30:14.313614Z",
-      "status": "deferred"
+      "status": "selected",
+      "selected_session": "M10-S8"
     },
     {
       "id": 40,
       "text": "Investigate real multi-host policy propagation race: curl TCP-RST within ~100ms post-propagated=true on presets with >1 host. Envoy listener_manager.lds.update_success stays at 0 (filesystem-watch no-op on content-identical rewrites). Candidates: (a) Envoy cluster STRICT_DNS endpoint resolution lag, (b) nftables set enforcement delay after add-element, (c) Envoy worker-thread filter-chain swap not atomic. See progress log discovery (post-fix rerun analysis) and .tasks/handoffs/20260423-m10-s6-e2e-regression.md. M11-S1 work \u2014 blocks M10-close.",
       "added_session": "M10-S6",
       "added_timestamp": "2026-04-23T10:31:21.920897Z",
-      "status": "deferred"
+      "status": "selected",
+      "selected_session": "M10-S8"
     },
     {
       "id": 41,
       "text": "M11+: Git LFS preset (github-lfs / lfs=true on github-repo and github-pr). Spec 'Known gaps' bullet. No partial leak in M10 tree; file when user hits it. Files: sandboxd/sandbox-cli/src/presets/builtin.rs (new entry).",
       "added_session": "M10-S7",
       "added_timestamp": "2026-04-23T11:26:49.271740Z",
-      "status": "deferred"
+      "status": "dropped",
+      "resolved_session": "M10-S7",
+      "resolved_timestamp": "2026-04-24T20:08:54.149855Z"
     },
     {
       "id": 42,
       "text": "M11-S1: user-preset versioning scheme. Spec 'Known gaps' calls out that user-authored presets need a version field so schema evolution doesn't silently break. No code yet; design-review task. Files: sandboxd/sandbox-cli/src/presets/ (user preset loader + schema).",
       "added_session": "M10-S7",
       "added_timestamp": "2026-04-23T11:26:50.699143Z",
-      "status": "deferred"
+      "status": "dropped",
+      "resolved_session": "M10-S7",
+      "resolved_timestamp": "2026-04-24T20:08:54.149929Z"
     },
     {
       "id": 43,
       "text": "M11+: daemon-level (non-session-scoped) lifecycle events endpoint. Spec 'Known gaps' item \u2014 currently events are per-session; operator-level events (daemon up/down, gateway-image-rebuild, CA-rotation) have no stream. Surface: GET /events on the daemon socket. Non-blocking.",
       "added_session": "M10-S7",
       "added_timestamp": "2026-04-23T11:26:53.358165Z",
-      "status": "deferred"
+      "status": "dropped",
+      "resolved_session": "M10-S8",
+      "resolved_timestamp": "2026-04-24T20:25:27.752022Z"
     }
   ],
   "plan": "docs/internal/session-plan.md",
@@ -1678,6 +1752,12 @@
       "old_total": 59,
       "new_total": 66,
       "reason": "M10 decomposed into 7 sessions (S1-S7) per docs/internal/milestones/M10.md; extending plan from 59 (M9-complete) to 66; M10-S1/S2 already landed in git (commits through 2d3b3e1), M10-S3 Phase 1 in progress on feat/m10-s3-deny-logger-dnat-restructure"
+    },
+    {
+      "timestamp": "2026-04-24T20:10:17.273446Z",
+      "old_total": 66,
+      "new_total": 67,
+      "reason": "Add M10-S8 for user polish & refactor: integration-test mechanism migration (naming prefix + nextest profile), flaky tcp-test root-cause fix, lima test categorization. Surfaced as needs while shipping M10."
     }
   ]
 }
