@@ -15,8 +15,8 @@ use sandbox_core::events::lifecycle as lifecycle_events;
 use sandbox_core::events::session_events_host_dir;
 use sandbox_core::gateway::container_name as gateway_container_name;
 use sandbox_core::{
-    AssuranceLevel, BaseImageStatus, CaManager, CoreDnsConfig, CreateSessionRequest, Destination,
-    DnsCache, DockerHealth, EventBus, EventBusConfig, ExecRequest, ExecResponse,
+    ApiError, AssuranceLevel, BaseImageStatus, CaManager, CoreDnsConfig, CreateSessionRequest,
+    Destination, DnsCache, DockerHealth, EventBus, EventBusConfig, ExecRequest, ExecResponse,
     FileDownloadRequest, FileDownloadResponse, FileUploadRequest, GatewayHealth, GatewayManager,
     GatewayShutdownReason, GatewayStatus, GuestConnector, GuestRequest, GuestResponse,
     HealthComponent, LimaManager, NetworkHealth, NetworkManager, PersistConfig, PersistentSink,
@@ -781,6 +781,17 @@ async fn create_session(
     // If a policy was provided, compile and distribute it now that the
     // gateway is running.  The DNS policy for the no-policy case was already
     // written during gateway creation above.
+    //
+    // Reaching this block means the caller provided `policy` explicitly
+    // (via `--policy <file>` and/or `--preset <invocation>` on the CLI —
+    // both paths populate the field on the wire). Compile/distribute
+    // failure on an *explicit* policy is fatal for the create call
+    // (M10-S8 #16): the alternative is silently returning a Running
+    // session with `Policy: none`, which violates the caller's stated
+    // intent. The implicit "no policy" default path never reaches this
+    // branch at all — for that path we've already written the
+    // fail-closed empty CoreDNS config during `setup_session_networking`
+    // above and there is nothing to do here.
     if let Some(policy) = req.policy {
         let initial_presets = req.source_presets.clone();
         match apply_policy(
@@ -797,9 +808,16 @@ async fn create_session(
                 info!(%session_id, "initial policy applied");
             }
             Err(e) => {
-                // Policy failure is non-fatal for session creation -- the
-                // session is still usable, just without policy enforcement.
-                warn!(%session_id, error = %e, "failed to apply initial policy (session created without policy)");
+                return fail_explicit_policy_apply(
+                    &state.store,
+                    &state.gateway,
+                    &state.network,
+                    &state.ingestors,
+                    &session_id,
+                    e,
+                )
+                .await
+                .into_response();
             }
         }
     }
@@ -2579,27 +2597,83 @@ async fn setup_session_networking(
     Ok(())
 }
 
-/// Tear down session networking infrastructure (best-effort, ignores errors).
+/// Fail a `POST /sessions` request after an explicit initial policy
+/// fails to apply.
 ///
-/// Stops the gateway container and removes the Docker bridge network.
-/// The TAP device is owned by QEMU and destroyed when the VM stops.
-/// The subnet allocation and network_info in the DB are preserved so
-/// `start` can recreate everything.
+/// Centralises the teardown contract for M10-S8 #16: when
+/// `create_session` reaches its `apply_policy` call, the caller has
+/// already supplied a non-`None` `req.policy` (either directly via
+/// `--policy <file>` or indirectly via `--preset` — both paths
+/// populate the wire field at the CLI layer). A failure here means
+/// the session would otherwise come up `Running` with `Policy: none`,
+/// silently violating the caller's stated intent. The only correct
+/// response is to fail the create call and surface the error through
+/// the HTTP response.
 ///
-/// The CA certificate files on disk are NOT removed — they are reused on
-/// start.
-async fn teardown_session_networking(session_id: &SessionId, state: &AppState) {
+/// The teardown performed here mirrors the failure path already used
+/// by `setup_session_networking` earlier in `create_session`: mark
+/// the session as `Error` (so `sandbox ps` / `inspect` surface the
+/// failure), and best-effort stop the gateway + remove the Docker
+/// network. VM and CA material are deliberately left in place so the
+/// operator can still run `sandbox rm` to reclaim the session.
+///
+/// Returns the `(StatusCode, Json<ApiError>)` pair the handler should
+/// hand back to axum. Logging of the underlying error is done once
+/// here with `error!`, and again by `error_response` with the HTTP
+/// status attached — matching the pattern used elsewhere in the
+/// create handler.
+///
+/// The function takes only the [`AppState`] fields it actually reads
+/// (rather than `&AppState` wholesale) so a hermetic unit test can
+/// drive it without standing up a full Lima / Docker stack — see
+/// `tests::fail_explicit_policy_apply_marks_session_error_and_returns_5xx`
+/// below.
+async fn fail_explicit_policy_apply(
+    store: &SessionStore,
+    gateway: &Arc<GatewayManager>,
+    network: &Arc<NetworkManager>,
+    ingestors: &Mutex<HashMap<SessionId, SessionIngestor>>,
+    session_id: &SessionId,
+    e: SandboxError,
+) -> (StatusCode, Json<ApiError>) {
+    error!(
+        %session_id,
+        error = %e,
+        "failed to apply explicit initial policy — failing create"
+    );
+    let _ = store.update_state(session_id, SessionState::Error);
+    teardown_session_networking_parts(session_id, gateway, network, ingestors).await;
+    error_response(e)
+}
+
+/// Inner body of [`teardown_session_networking`], parameterised on the
+/// exact fields it reads rather than the full [`AppState`]. This keeps
+/// the async teardown logic shared between the `setup_session_networking`
+/// failure path, the `apply_policy` failure path (M10-S8 #16), and the
+/// regular stop path, while letting the #16 unit test drive it without
+/// constructing every `AppState` field just to call it.
+async fn teardown_session_networking_parts(
+    session_id: &SessionId,
+    gateway: &Arc<GatewayManager>,
+    network: &Arc<NetworkManager>,
+    ingestors: &Mutex<HashMap<SessionId, SessionIngestor>>,
+) {
     debug!(session_id = %session_id, "tearing down session networking (preserving allocation)");
     // Abort the JSONL ingestor first so its inotify watch and file
     // handles are released before the gateway container disappears.
     // No-op when no ingestor is tracked (e.g., the gateway never
     // finished starting).
-    abort_session_ingestor(session_id, state).await;
+    {
+        let mut guard = ingestors.lock().await;
+        if let Some(ingestor) = guard.remove(session_id) {
+            ingestor.abort();
+        }
+    }
 
     // Blocking Docker calls (stop_gateway, remove_docker_network) are
     // wrapped in spawn_blocking to avoid stalling the Tokio runtime.
-    let gateway = state.gateway.clone();
-    let network = state.network.clone();
+    let gateway = gateway.clone();
+    let network = network.clone();
     let sid = *session_id;
     let _ = tokio::task::spawn_blocking(move || {
         // detach_vm_from_bridge is a no-op (TAP owned by QEMU), but call it
@@ -2615,6 +2689,28 @@ async fn teardown_session_networking(session_id: &SessionId, state: &AppState) {
         }
     })
     .await;
+}
+
+/// Tear down session networking infrastructure (best-effort, ignores errors).
+///
+/// Stops the gateway container and removes the Docker bridge network.
+/// The TAP device is owned by QEMU and destroyed when the VM stops.
+/// The subnet allocation and network_info in the DB are preserved so
+/// `start` can recreate everything.
+///
+/// The CA certificate files on disk are NOT removed — they are reused on
+/// start.
+///
+/// Thin wrapper around [`teardown_session_networking_parts`] that
+/// extracts the three [`AppState`] fields the teardown needs. Callers
+/// holding an [`AppState`] (every production call site) should prefer
+/// this wrapper; the unit-test-facing
+/// [`fail_explicit_policy_apply`] call is expressed in terms of the
+/// underlying `_parts` helper so it can be exercised without
+/// constructing a full [`AppState`].
+async fn teardown_session_networking(session_id: &SessionId, state: &AppState) {
+    teardown_session_networking_parts(session_id, &state.gateway, &state.network, &state.ingestors)
+        .await;
 }
 
 /// Re-apply the session's policy to a freshly created gateway container.
@@ -4417,5 +4513,107 @@ mod tests {
                  remove the enum variant"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // fail_explicit_policy_apply: M10-S8 #16 regression guard
+    //
+    // Pre-M10-S8, `create_session` `warn!`-swallowed an `apply_policy`
+    // error and returned a `Running` session with `Policy: none`,
+    // silently violating the caller's `--policy` / `--preset` intent.
+    // The helper extracted by M10-S8 flips this to a fatal failure:
+    //   - session state transitions Running → Error
+    //   - the HTTP response carries `error_response(e)` (5xx for the
+    //     `SandboxError` variants `apply_policy` can produce)
+    //   - teardown is issued for any partial networking state
+    //
+    // The test drives the helper directly (rather than the end-to-end
+    // `create_session` handler) because the latter requires Docker +
+    // Lima, which are banned from the `make test` hermetic tier
+    // (see repo CLAUDE.md "Integration-test convention"). Driving
+    // the helper with a real `SessionStore` + real `GatewayManager`
+    // and `NetworkManager` constructors (neither of which touches the
+    // network by itself) exercises the real state-transition + error-
+    // mapping contract while keeping the test hermetic.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn fail_explicit_policy_apply_marks_session_error_and_returns_5xx() {
+        use std::collections::HashMap;
+        use std::net::Ipv4Addr;
+
+        // Fresh store in a tempdir so the test is parallel-safe and
+        // leaves no filesystem residue after `TempDir` drops.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (store, _orphans) =
+            SessionStore::new(tmp.path().to_path_buf()).expect("open session store");
+        let store = Arc::new(store);
+
+        // Create a session and move it to `Running` — the only state
+        // from which `create_session` reaches the `apply_policy` call.
+        let session = store
+            .create_session(SessionConfig::default(), Some("policy-fail-test".into()))
+            .expect("create session");
+        store
+            .update_state(&session.id, SessionState::Running)
+            .expect("transition Creating → Running");
+
+        // Build the minimal manager surface the helper consumes. None
+        // of these constructors make external calls — `GatewayManager`
+        // is a unit struct and `NetworkManager::with_defaults` only
+        // allocates an in-memory subnet allocator. The spawn_blocking
+        // branch of the teardown will attempt to invoke `docker`
+        // subcommands and either no-op (no matching container /
+        // network) or log a best-effort warning; neither outcome is
+        // fatal for the helper, which is exactly what this test pins.
+        let gateway = Arc::new(GatewayManager::new());
+        let network = Arc::new(
+            NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24)
+                .expect("construct NetworkManager"),
+        );
+        let ingestors: Mutex<HashMap<SessionId, SessionIngestor>> = Mutex::new(HashMap::new());
+
+        // Use a `Gateway` error because that is the variant
+        // `PolicyDistributor::distribute` returns when it cannot reach
+        // the (nonexistent) gateway container — the realistic failure
+        // mode the #16 branch is designed to catch.
+        let synthetic_err = SandboxError::Gateway("synthetic: gateway unreachable".into());
+        let (status, Json(body)) = fail_explicit_policy_apply(
+            &store,
+            &gateway,
+            &network,
+            &ingestors,
+            &session.id,
+            synthetic_err,
+        )
+        .await;
+
+        // Contract 1: 5xx surfaces the failure to the caller. The
+        // mapping for `SandboxError::Gateway` is 500 (shared with the
+        // error_response tests above).
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "apply_policy failure must map to 500, not a 2xx that hides the failure"
+        );
+        assert!(
+            body.error.contains("gateway unreachable"),
+            "error body should pass the underlying message through unchanged, got: {}",
+            body.error
+        );
+
+        // Contract 2: the session is now in `Error` state. This is the
+        // signal `sandbox ps` / `inspect` surface to the operator so a
+        // failed create is distinguishable from an inconsistent
+        // `Running` session.
+        let reloaded = store
+            .get_session(&session.id)
+            .expect("store readable")
+            .expect("session row still present");
+        assert_eq!(
+            reloaded.state,
+            SessionState::Error,
+            "session must be marked Error so ps/inspect can surface the failed create"
+        );
     }
 }
