@@ -442,9 +442,27 @@ fn integration_gateway_lds_listener_and_atomic_rewrite() {
     fn lds_update_rejected(container: &str) -> u64 {
         lds_stat(container, "listener_manager.lds.update_rejected")
     }
+    // Witnesses for the post-rewrite "listener actually loaded, end-state
+    // stable" assertions further below.
+    fn listener_added(container: &str) -> u64 {
+        lds_stat(container, "listener_manager.listener_added")
+    }
+    fn listener_create_success(container: &str) -> u64 {
+        lds_stat(container, "listener_manager.listener_create_success")
+    }
+    fn total_listeners_active(container: &str) -> u64 {
+        lds_stat(container, "listener_manager.total_listeners_active")
+    }
+    fn total_listeners_draining(container: &str) -> u64 {
+        lds_stat(container, "listener_manager.total_listeners_draining")
+    }
 
     let initial_updates = lds_update_success(&gw_container);
     let initial_rejections = lds_update_rejected(&gw_container);
+    // Snapshot the listener-lifecycle witnesses *before* the rewrite —
+    // post-rewrite assertions below compare against these.
+    let initial_added = listener_added(&gw_container);
+    let initial_create_success = listener_create_success(&gw_container);
 
     // Build a new listener generation that differs only in filter_chains.
     // The initial listener is a deny-all with `filter_chains: []`; we
@@ -515,6 +533,82 @@ fn integration_gateway_lds_listener_and_atomic_rewrite() {
         status,
         GatewayStatus::Healthy,
         "gateway should remain healthy after atomic listener rewrite"
+    );
+
+    // ---------- 4b. Listener-lifecycle witnesses (stronger than `Healthy`) ----------
+    // `gateway_status() == Healthy` only proves the gateway processes
+    // (Envoy, CoreDNS, mitmproxy) are running — it currently passes even
+    // when Envoy has rejected the bootstrap listener and zero listeners
+    // are active (see deferred follow-up: gateway health check should
+    // witness an active listener). The stats below are the direct
+    // on-the-wire witnesses that the rewrite was actually accepted and
+    // left Envoy in a stable end state.
+    //
+    // Witnesses asserted (text-format /stats, matching the precedent
+    // helpers in this file at ~lines 423 and 723):
+    //   - `listener_manager.listener_added` advanced or
+    //     `listener_manager.listener_create_success` advanced — proves
+    //     Envoy actually processed the rewrite into an active listener
+    //     (defends against a "MovedTo arrived but Envoy never built the
+    //     listener" failure mode that `lds.update_success` alone does
+    //     not catch).
+    //   - `listener_manager.total_listeners_active >= 1` — proves a
+    //     listener is loaded and serving (the deny-all bootstrap is
+    //     rejected by Envoy, so this gauge is 0 before the rewrite —
+    //     the rewrite is what makes it 1).
+    //   - `listener_manager.total_listeners_draining == 0` once Envoy
+    //     finishes warming — proves no listener is stuck in drain. The
+    //     gauge can transiently be 1 mid-rewrite, so we poll briefly
+    //     for it to settle (mirrors the `update_success` poll above).
+    //
+    // What is intentionally NOT asserted:
+    //   - `listener_manager.listener_in_place_updated` — the original
+    //     todo (#22) wanted this as proof of a no-drain in-place
+    //     update. Runtime evidence shows the current emit shape
+    //     (`default_filter_chain:` rather than `filter_chains:`) goes
+    //     through warm-restart-with-drain, not the in-place path, so
+    //     this gauge stays at 0 today. The mismatch between the design
+    //     intent in `policy.rs` (filter-chain-only rewrite "does not
+    //     drain") and the observed warm-restart behavior is filed as
+    //     a separate follow-up; if/when that is fixed, swap the
+    //     witnesses here for `listener_in_place_updated > 0` plus
+    //     `listener_create_success` unchanged.
+    let final_added = listener_added(&gw_container);
+    let final_create_success = listener_create_success(&gw_container);
+    let final_total_active = total_listeners_active(&gw_container);
+    assert!(
+        final_added > initial_added || final_create_success > initial_create_success,
+        "neither listener_added ({initial_added} -> {final_added}) nor \
+         listener_create_success ({initial_create_success} -> {final_create_success}) \
+         advanced across the rewrite. Envoy reported lds.update_success but apparently \
+         never built the listener — check /config_dump for a stuck-in-warming listener."
+    );
+    assert!(
+        final_total_active >= 1,
+        "listener_manager.total_listeners_active = {final_total_active} after rewrite; \
+         expected >= 1. The deny-all bootstrap listener is rejected by Envoy, so the \
+         rewrite is what must produce an active listener. A value of 0 here means the \
+         rewritten listener was accepted by LDS but failed to come up (likely warming \
+         stuck or the listener was immediately drained)."
+    );
+    // Poll briefly for `total_listeners_draining` to settle to 0.
+    // Envoy's warm-restart path (the path the current emit shape uses)
+    // transiently bumps this gauge while the previous generation drains.
+    // It must return to 0 in the steady state — a non-zero terminal
+    // value would mean a listener is stuck draining.
+    let mut final_draining = total_listeners_draining(&gw_container);
+    for _ in 0..60 {
+        if final_draining == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        final_draining = total_listeners_draining(&gw_container);
+    }
+    assert_eq!(
+        final_draining, 0,
+        "listener_manager.total_listeners_draining = {final_draining} after waiting for \
+         drain to complete; expected 0 in the steady state. A listener is stuck draining \
+         after the rewrite — connections to it will be reset when the drain timer fires."
     );
 
     // ---------- 5. Verify the dynamic listener version_info advanced ----------
