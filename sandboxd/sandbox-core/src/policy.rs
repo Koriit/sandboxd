@@ -1312,6 +1312,34 @@ admin:
         // invariant check order-dependent.
         let l3_access_log_yaml = Self::l3_tcp_proxy_access_log_yaml();
 
+        // Aggregate L3 destinations into one filter chain per
+        // destination port. Two distinct allow rules may resolve to
+        // overlapping IPs (the cargo preset's `index.crates.io` and
+        // `static.crates.io` both live behind the Fastly Anycast pool
+        // and routinely share their entire A-record set), and Envoy
+        // rejects a listener whose filter chains share their full
+        // `(prefix_ranges, destination_port)` predicate — the listener
+        // builder must not emit those duplicates. Aggregating by port
+        // collapses overlapping IP sets into a single match. The
+        // routing layer at L3 is uniform (`cluster: mitmproxy` +
+        // `tunneling_config.hostname = "%DOWNSTREAM_LOCAL_ADDRESS%"`),
+        // so per-domain `stat_prefix` attribution is dropped here in
+        // favour of a per-port aggregate label (`level3_p{port}`);
+        // domain-level attribution of HTTP-filter decisions is
+        // preserved by mitmproxy via the request `Host:` header.
+        //
+        // BTreeMap + BTreeSet (rather than HashMap + HashSet) keeps
+        // emission order deterministic for diffability across LDS
+        // generations.
+        let mut l3_domain_ips_by_port: std::collections::BTreeMap<
+            u16,
+            std::collections::BTreeSet<Ipv4Addr>,
+        > = std::collections::BTreeMap::new();
+        let mut l3_cidrs_by_port: std::collections::BTreeMap<
+            u16,
+            std::collections::BTreeSet<String>,
+        > = std::collections::BTreeMap::new();
+
         for rule in policy
             .rules
             .iter()
@@ -1319,44 +1347,65 @@ admin:
         {
             match &rule.host {
                 Destination::Domain(domain) => {
-                    // Look up resolved IPs from the DNS cache. Empty →
-                    // emit no chain (fail-closed). The DNS propagation
-                    // loop will rewrite the listener once CoreDNS
-                    // resolves the domain.
+                    // Fail-closed: no cache entry → no chain. The DNS
+                    // propagation loop rewrites the listener once
+                    // CoreDNS resolves the domain.
                     let Some(entry) = dns_cache.entries().get(domain.as_str()) else {
                         continue;
                     };
                     if entry.ips.is_empty() {
                         continue;
                     }
-                    let stat_name = Self::sanitize_stat_prefix(domain);
-                    let prefix_ranges = Self::emit_prefix_ranges_from_ips(&entry.ips);
-                    let port = rule.port;
-                    let chain_name = format!("level3_{stat_name}_p{port}");
-                    filter_chains.push(format!(
-                        r#"    - name: {chain_name}
-      filter_chain_match:
-        prefix_ranges:
-{prefix_ranges}
-        destination_port: {port}
-      filters:
-        - name: envoy.filters.network.tcp_proxy
-          typed_config:
-            "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
-            cluster: mitmproxy
-            stat_prefix: level3_{stat_name}
-            tunneling_config:
-              hostname: "%DOWNSTREAM_LOCAL_ADDRESS%"
-{l3_access_log_yaml}"#
-                    ));
+                    let bucket = l3_domain_ips_by_port.entry(rule.port).or_default();
+                    for ip in &entry.ips {
+                        bucket.insert(*ip);
+                    }
                 }
                 Destination::Cidr(cidr) => {
-                    let stat_name = Self::sanitize_stat_prefix(cidr);
-                    let prefix_ranges = Self::emit_prefix_ranges_from_cidr(cidr);
-                    let port = rule.port;
-                    let chain_name = format!("level3_{stat_name}_p{port}");
-                    filter_chains.push(format!(
-                        r#"    - name: {chain_name}
+                    l3_cidrs_by_port
+                        .entry(rule.port)
+                        .or_default()
+                        .insert(cidr.clone());
+                }
+            }
+        }
+
+        // Emit one chain per (port, IP set) for domain-derived ranges
+        // and one chain per (port, CIDR) for CIDR rules. Domain
+        // aggregation avoids the Fastly-pool overlap; CIDR rules each
+        // get their own chain because two CIDRs at the same port may
+        // legitimately differ in shape (e.g. `10.0.0.0/8` vs
+        // `192.168.1.0/24`) and the listener compiler should not
+        // collapse those into a single prefix_ranges block — different
+        // operators may layer them with distinct intent.
+        for (port, ips) in &l3_domain_ips_by_port {
+            let ips_vec: Vec<Ipv4Addr> = ips.iter().copied().collect();
+            let prefix_ranges = Self::emit_prefix_ranges_from_ips(&ips_vec);
+            let chain_name = format!("level3_p{port}");
+            filter_chains.push(format!(
+                r#"    - name: {chain_name}
+      filter_chain_match:
+        prefix_ranges:
+{prefix_ranges}
+        destination_port: {port}
+      filters:
+        - name: envoy.filters.network.tcp_proxy
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+            cluster: mitmproxy
+            stat_prefix: level3_p{port}
+            tunneling_config:
+              hostname: "%DOWNSTREAM_LOCAL_ADDRESS%"
+{l3_access_log_yaml}"#
+            ));
+        }
+        for (port, cidrs) in &l3_cidrs_by_port {
+            for cidr in cidrs {
+                let stat_name = Self::sanitize_stat_prefix(cidr);
+                let prefix_ranges = Self::emit_prefix_ranges_from_cidr(cidr);
+                let chain_name = format!("level3_{stat_name}_p{port}");
+                filter_chains.push(format!(
+                    r#"    - name: {chain_name}
       filter_chain_match:
         prefix_ranges:
 {prefix_ranges}
@@ -1370,8 +1419,7 @@ admin:
             tunneling_config:
               hostname: "%DOWNSTREAM_LOCAL_ADDRESS%"
 {l3_access_log_yaml}"#
-                    ));
-                }
+                ));
             }
         }
 
@@ -1399,6 +1447,20 @@ admin:
         // `l1_tcp_proxy_access_log_yaml`.
         let l1_access_log_yaml = Self::l1_tcp_proxy_access_log_yaml();
 
+        // Aggregate L1 destinations by port using the same shape as
+        // L3: domain rules collapse into one chain per port (Envoy
+        // rejects duplicate `(prefix_ranges, destination_port)`
+        // predicates, and the L1 cluster `original_dst` is uniform
+        // across rules), while CIDR rules retain one chain each.
+        let mut l1_domain_ips_by_port: std::collections::BTreeMap<
+            u16,
+            std::collections::BTreeSet<Ipv4Addr>,
+        > = std::collections::BTreeMap::new();
+        let mut l1_cidrs_by_port: std::collections::BTreeMap<
+            u16,
+            std::collections::BTreeSet<String>,
+        > = std::collections::BTreeMap::new();
+
         for rule in policy
             .rules
             .iter()
@@ -1412,32 +1474,46 @@ admin:
                     if entry.ips.is_empty() {
                         continue;
                     }
-                    let stat_name = Self::sanitize_stat_prefix(domain);
-                    let prefix_ranges = Self::emit_prefix_ranges_from_ips(&entry.ips);
-                    let port = rule.port;
-                    let chain_name = format!("level1_{stat_name}_p{port}");
-                    filter_chains.push(format!(
-                        r#"    - name: {chain_name}
-      filter_chain_match:
-        prefix_ranges:
-{prefix_ranges}
-        destination_port: {port}
-      filters:
-        - name: envoy.filters.network.tcp_proxy
-          typed_config:
-            "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
-            cluster: original_dst
-            stat_prefix: level1_{stat_name}
-{l1_access_log_yaml}"#
-                    ));
+                    let bucket = l1_domain_ips_by_port.entry(rule.port).or_default();
+                    for ip in &entry.ips {
+                        bucket.insert(*ip);
+                    }
                 }
                 Destination::Cidr(cidr) => {
-                    let stat_name = Self::sanitize_stat_prefix(cidr);
-                    let prefix_ranges = Self::emit_prefix_ranges_from_cidr(cidr);
-                    let port = rule.port;
-                    let chain_name = format!("level1_{stat_name}_p{port}");
-                    filter_chains.push(format!(
-                        r#"    - name: {chain_name}
+                    l1_cidrs_by_port
+                        .entry(rule.port)
+                        .or_default()
+                        .insert(cidr.clone());
+                }
+            }
+        }
+
+        for (port, ips) in &l1_domain_ips_by_port {
+            let ips_vec: Vec<Ipv4Addr> = ips.iter().copied().collect();
+            let prefix_ranges = Self::emit_prefix_ranges_from_ips(&ips_vec);
+            let chain_name = format!("level1_p{port}");
+            filter_chains.push(format!(
+                r#"    - name: {chain_name}
+      filter_chain_match:
+        prefix_ranges:
+{prefix_ranges}
+        destination_port: {port}
+      filters:
+        - name: envoy.filters.network.tcp_proxy
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+            cluster: original_dst
+            stat_prefix: level1_p{port}
+{l1_access_log_yaml}"#
+            ));
+        }
+        for (port, cidrs) in &l1_cidrs_by_port {
+            for cidr in cidrs {
+                let stat_name = Self::sanitize_stat_prefix(cidr);
+                let prefix_ranges = Self::emit_prefix_ranges_from_cidr(cidr);
+                let chain_name = format!("level1_{stat_name}_p{port}");
+                filter_chains.push(format!(
+                    r#"    - name: {chain_name}
       filter_chain_match:
         prefix_ranges:
 {prefix_ranges}
@@ -1449,8 +1525,7 @@ admin:
             cluster: original_dst
             stat_prefix: level1_{stat_name}
 {l1_access_log_yaml}"#
-                    ));
-                }
+                ));
             }
         }
 
@@ -4155,9 +4230,16 @@ mod tests {
             listener.contains("cluster: mitmproxy"),
             "L3 domain chain must route to mitmproxy cluster:\n{listener}"
         );
+        // Per-port aggregation (M10-S8 / todo #40): two domain rules
+        // sharing IPs at the same port collapse into one chain named
+        // `level3_p{port}` to satisfy Envoy's
+        // unique-`(prefix_ranges, destination_port)` invariant.
+        // The chain still carries the `level3_` prefix that downstream
+        // log/metric tooling matches on.
         assert!(
-            listener.contains("level3_inspected_example_com"),
-            "L3 domain chain must carry level3_ stat prefix:\n{listener}"
+            listener.contains("level3_p443"),
+            "L3 domain chain must carry per-port aggregate stat prefix \
+             (level3_p<port>) under the post-#40 listener compiler:\n{listener}"
         );
         // Schema v2: L3 chain carries `destination_port` predicate
         // alongside `prefix_ranges`. full_policy() uses port 443.
@@ -4557,10 +4639,17 @@ mod tests {
         // The mixed fixture covers L1 (github.com), L2
         // (pinned.example.com), and L3 (monitored.example.com). Pin
         // each chain name verbatim so drift breaks the test loudly.
+        //
+        // Post-#40 (M10-S8): L1 and L3 domain rules aggregate into one
+        // chain per port (`level{1,3}_p<port>`) so distinct domains
+        // resolving to overlapping IPs do not produce
+        // duplicate-`(prefix_ranges, destination_port)` predicates
+        // (Envoy rejects those). L2 chains keep per-host SNI matching
+        // and so retain `level2_<host>_p<port>` naming.
         for expected_name in [
-            "- name: level1_github_com_p443",
+            "- name: level1_p443",
             "- name: level2_pinned_example_com_p443",
-            "- name: level3_monitored_example_com_p443",
+            "- name: level3_p443",
         ] {
             assert_eq!(
                 listener.matches(expected_name).count(),
@@ -4692,10 +4781,13 @@ mod tests {
             "mixed policy must have L2 stat prefix:\n{listener}"
         );
 
-        // L3 chain — prefix_ranges, mitmproxy cluster, CONNECT formatter.
+        // L3 chain — prefix_ranges, mitmproxy cluster, CONNECT
+        // formatter. Per-port aggregate naming (post-#40); see
+        // `compile_l3_domain_chain_uses_dns_cache_prefix_ranges` for
+        // the rationale.
         assert!(
-            listener.contains("level3_monitored_example_com"),
-            "mixed policy must have L3 stat prefix:\n{listener}"
+            listener.contains("level3_p443"),
+            "mixed policy must have L3 per-port stat prefix:\n{listener}"
         );
         assert!(
             listener.contains("address_prefix: 10.3.3.3"),
@@ -4795,17 +4887,20 @@ mod tests {
         let listener = PolicyCompiler::compile_envoy_listener(&policy, &cache);
 
         // L1 (github.com Transport) → prefix_ranges + destination_port,
-        // routed to original_dst with a level1_* stat prefix.
+        // routed to original_dst with a level1_p<port> stat prefix
+        // (per-port aggregate naming, post-#40).
         assert!(
             listener.contains("address_prefix: 140.82.114.4"),
             "L1 chain must match github.com's resolved IP:\n{listener}"
         );
         assert!(
-            listener.contains("level1_github_com"),
-            "L1 chain must carry level1_ stat prefix:\n{listener}"
+            listener.contains("level1_p443"),
+            "L1 chain must carry per-port stat prefix:\n{listener}"
         );
 
         // L2 (pinned.example.com Tls) → server_names + destination_port.
+        // L2 keeps per-host SNI naming because chain matches are
+        // unambiguous on `server_names`.
         assert!(
             listener.contains("server_names: [\"pinned.example.com\"]"),
             "L2 chain must use SNI match:\n{listener}"
@@ -4816,14 +4911,15 @@ mod tests {
         );
 
         // L3 (monitored.example.com Http) → prefix_ranges +
-        // destination_port, routed to mitmproxy.
+        // destination_port, routed to mitmproxy. Per-port aggregate
+        // naming.
         assert!(
             listener.contains("address_prefix: 10.3.3.3"),
             "L3 chain must match monitored.example.com's resolved IP:\n{listener}"
         );
         assert!(
-            listener.contains("level3_monitored_example_com"),
-            "L3 chain must carry level3_ stat prefix:\n{listener}"
+            listener.contains("level3_p443"),
+            "L3 chain must carry per-port stat prefix:\n{listener}"
         );
 
         // Every chain carries destination_port: 443. With 3 rules all
@@ -5011,9 +5107,17 @@ mod tests {
             listener_resolved.contains("cluster: mitmproxy"),
             "resolved wildcard-subdomain chain must route to mitmproxy:\n{listener_resolved}"
         );
+        // Per-port aggregate naming under post-#40 listener compiler.
+        // The wildcard-subdomain previously contributed a `level3_*`
+        // stat prefix derived from the host token (`level3_wildcard_inspected_io`);
+        // it now collapses into the per-port aggregate chain
+        // `level3_p<port>` along with any other domain-backed L3 rules
+        // on the same port. Domain-level attribution at the HTTP layer
+        // is preserved via mitmproxy.
         assert!(
-            listener_resolved.contains("level3_wildcard_inspected_io"),
-            "wildcard-subdomain stat prefix should use 'wildcard' replacement:\n\
+            listener_resolved.contains("level3_p443"),
+            "wildcard-subdomain stat prefix should use the per-port \
+             aggregate label under the post-#40 listener compiler:\n\
              {listener_resolved}"
         );
         // Schema v2: wildcard-subdomain L3 chain carries `destination_port`.
@@ -5135,35 +5239,43 @@ mod tests {
         let listener = PolicyCompiler::compile_envoy_listener(&policy, &cache);
 
         // Every chain carries prefix_ranges matching the resolved IPs,
-        // not SNI.
+        // not SNI. Both IPs land in the same per-port aggregate chain.
         assert!(listener.contains("address_prefix: 10.1.1.1"));
         assert!(listener.contains("address_prefix: 10.2.2.2"));
         assert!(!listener.contains("server_names: [\"api.one.com\"]"));
         assert!(!listener.contains("server_names: [\"api.two.com\"]"));
 
-        // Each destination emits a distinct level3 stat prefix.
-        assert!(listener.contains("level3_api_one_com"));
-        assert!(listener.contains("level3_api_two_com"));
-
-        // Both chains route to mitmproxy via CONNECT tunneling.
+        // Two domain rules sharing port 443 collapse into ONE chain
+        // (`level3_p443`) under the post-#40 listener compiler — see
+        // `compile_l3_domain_chain_uses_dns_cache_prefix_ranges` for
+        // why per-domain stat names are no longer emitted at the
+        // listener layer.
+        assert_eq!(
+            listener.matches("    - name: level3_p443").count(),
+            1,
+            "L3 domain rules at the same port must collapse into a \
+             single per-port aggregate chain:\n{listener}"
+        );
         assert_eq!(
             listener.matches("cluster: mitmproxy").count(),
-            2,
-            "expected two L3 chains routed to mitmproxy:\n{listener}"
+            1,
+            "expected one aggregated L3 chain routed to mitmproxy:\n{listener}"
         );
         assert_eq!(
             listener
                 .matches(r#"hostname: "%DOWNSTREAM_LOCAL_ADDRESS%""#)
                 .count(),
-            2,
-            "expected every L3 chain to carry the CONNECT formatter:\n{listener}"
+            1,
+            "expected the aggregated L3 chain to carry the CONNECT \
+             formatter exactly once:\n{listener}"
         );
-        // Schema v2: every L3 chain carries destination_port — one per
-        // rule, here both 443.
+        // Schema v2: the (now aggregated) L3 chain carries
+        // destination_port: 443 once.
         assert_eq!(
             listener.matches("destination_port: 443").count(),
-            2,
-            "expected every L3 chain to carry destination_port: 443 (v2):\n{listener}"
+            1,
+            "expected the aggregated L3 chain to carry \
+             destination_port: 443 (v2):\n{listener}"
         );
 
         // Policy-level enforcement (post-CONNECT) still drives a

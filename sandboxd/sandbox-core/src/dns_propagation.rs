@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::Ipv4Addr;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -64,6 +64,37 @@ impl DnsCache {
     /// Update the cache with fresh resolution data.
     ///
     /// Returns a list of domains whose IPs changed (added, removed, or modified).
+    ///
+    /// **UNION semantics for in-window rotations (todo #40).** When the
+    /// gateway's CoreDNS upstream returns a *different* slot of a
+    /// rotating multi-IP A-record (think `github.com` →
+    /// `140.82.112.0/20`, TTL ≤ 60s), naively replacing the cache entry
+    /// would evict an IP that the VM may have just observed via its own
+    /// upstream lookup. Within the same TTL window we therefore
+    /// **merge** the freshly-observed IPs into the existing entry's IP
+    /// set rather than replacing it. The TTL window is refreshed on
+    /// every observation so the merged entry survives as long as
+    /// resolutions keep arriving — entries still expire (and are
+    /// dropped from `self.entries` on the next [`Self::update`] call
+    /// with no observation, or via [`Self::expired_domains`] /
+    /// [`Self::has_expired_entries`]) when no further activity arrives
+    /// before `resolved_at + ttl`.
+    ///
+    /// Concretely:
+    /// * `NewDomain` — first time we see the domain; entry inserted as
+    ///   before, change emitted with `old_ips=[]`.
+    /// * `IpsChanged` — entry already exists and unexpired; merge new
+    ///   IPs into existing set. If the merge added at least one IP, a
+    ///   change is emitted carrying the merged IP set as `new_ips`
+    ///   (so the listener writer adds the new IP to the allow set
+    ///   without dropping the old). If the new IPs are a subset of the
+    ///   existing set, `resolved_at` and `ttl` are still refreshed but
+    ///   no change is emitted (nothing to propagate).
+    /// * `Removed` — domain absent from the report and existing entry
+    ///   has expired. The expiry check matters: a domain that is
+    ///   simply quiet for one cycle (e.g. CoreDNS hasn't been queried
+    ///   for it lately) does not get its allow rules torn down
+    ///   prematurely.
     pub fn update(&mut self, report: &ResolvedReport) -> Vec<DnsChange> {
         let mut changes = Vec::new();
         let now = Instant::now();
@@ -86,47 +117,97 @@ impl DnsCache {
 
             let ttl = Duration::from_secs(u64::from(mapping.ttl));
 
-            if let Some(existing) = self.entries.get(&mapping.domain) {
-                // Check if IPs changed.
-                let mut old_sorted = existing.ips.clone();
-                old_sorted.sort();
-                let mut new_sorted = new_ips.clone();
-                new_sorted.sort();
+            // Always UNION the new observation with any existing entry
+            // (regardless of TTL state). The DNS rotation race that
+            // motivated this design (todo #40) is precisely a case
+            // where the gateway and the VM resolve the SAME domain to
+            // DIFFERENT slots of the same authoritative pool within
+            // the same wall-clock second — and many CDN hosts ship
+            // single-digit-second TTLs (e.g. Fastly returns TTL=2 for
+            // index.crates.io). A strict TTL gate around the merge
+            // would erase the previously observed IPs literally one
+            // poll cycle later, re-opening the race we're trying to
+            // close. Instead the merge is unconditional; the
+            // truly-stale eviction lives in the `removed` sweep below
+            // (domain absent from the report AND past the entry's
+            // TTL).
+            //
+            // BTreeSet gives a stable sorted dedup that the
+            // emit_prefix_ranges_from_ips path can consume directly.
+            match self.entries.get(&mapping.domain) {
+                Some(existing) => {
+                    let old_set: BTreeSet<Ipv4Addr> = existing.ips.iter().copied().collect();
+                    let new_set: BTreeSet<Ipv4Addr> = new_ips.iter().copied().collect();
+                    let merged_set: BTreeSet<Ipv4Addr> = old_set.union(&new_set).copied().collect();
 
-                if old_sorted != new_sorted {
+                    let merged_vec: Vec<Ipv4Addr> = merged_set.iter().copied().collect();
+
+                    if merged_set != old_set {
+                        // Merge added at least one IP. Emit IpsChanged
+                        // so the listener writer + nft injector pick
+                        // up the expanded allow set; carry the merged
+                        // set as `new_ips` and the previous set as
+                        // `old_ips` so diagnostic logs show the full
+                        // picture.
+                        changes.push(DnsChange {
+                            domain: mapping.domain.clone(),
+                            old_ips: existing.ips.clone(),
+                            new_ips: merged_vec.clone(),
+                            change_type: DnsChangeType::IpsChanged,
+                        });
+                    }
+                    // Whether or not the merge expanded the set,
+                    // refresh `resolved_at` + `ttl` to the latest
+                    // observation. This keeps the entry alive as long
+                    // as observations keep arriving — even if every
+                    // observation hits a strict subset of the cached
+                    // IPs.
+                    self.entries.insert(
+                        mapping.domain.clone(),
+                        DnsCacheEntry {
+                            domain: mapping.domain.clone(),
+                            ips: merged_vec,
+                            ttl,
+                            resolved_at: now,
+                        },
+                    );
+                }
+                None => {
                     changes.push(DnsChange {
                         domain: mapping.domain.clone(),
-                        old_ips: existing.ips.clone(),
+                        old_ips: Vec::new(),
                         new_ips: new_ips.clone(),
-                        change_type: DnsChangeType::IpsChanged,
+                        change_type: DnsChangeType::NewDomain,
                     });
+                    self.entries.insert(
+                        mapping.domain.clone(),
+                        DnsCacheEntry {
+                            domain: mapping.domain.clone(),
+                            ips: new_ips,
+                            ttl,
+                            resolved_at: now,
+                        },
+                    );
                 }
-            } else {
-                changes.push(DnsChange {
-                    domain: mapping.domain.clone(),
-                    old_ips: Vec::new(),
-                    new_ips: new_ips.clone(),
-                    change_type: DnsChangeType::NewDomain,
-                });
             }
-
-            self.entries.insert(
-                mapping.domain.clone(),
-                DnsCacheEntry {
-                    domain: mapping.domain.clone(),
-                    ips: new_ips,
-                    ttl,
-                    resolved_at: now,
-                },
-            );
         }
 
-        // Check for domains that were previously resolved but are now missing.
+        // Sweep entries that are absent from the report AND have
+        // expired. A domain that is simply not in this cycle's report
+        // (e.g. CoreDNS hasn't received a query for it lately) should
+        // remain in the cache until its TTL elapses — otherwise we
+        // would tear down allow rules between queries on a slow-traffic
+        // domain. Combined with the UNION semantics above, this means
+        // an entry only disappears once both (a) no fresh observation
+        // arrives for the entire TTL window, and (b) the report stops
+        // mentioning the domain.
         let removed: Vec<String> = self
             .entries
-            .keys()
-            .filter(|d| !seen_domains.contains(d))
-            .cloned()
+            .iter()
+            .filter(|(d, entry)| {
+                !seen_domains.contains(d) && now.duration_since(entry.resolved_at) > entry.ttl
+            })
+            .map(|(d, _)| d.clone())
             .collect();
 
         for domain in &removed {
@@ -469,7 +550,11 @@ mod tests {
     }
 
     #[test]
-    fn dns_cache_update_ip_changed() {
+    fn dns_cache_update_ip_changed_unions_within_ttl() {
+        // Within the TTL window, a fresh observation that brings a
+        // disjoint IP must UNION (not replace) the existing IP set —
+        // this prevents a previously-allowed IP from being evicted
+        // mid-rotation. (todo #40 root-cause fix.)
         let mut cache = DnsCache::new();
 
         let report1 = ResolvedReport {
@@ -499,14 +584,192 @@ mod tests {
             changes[0].old_ips,
             vec!["93.184.216.34".parse::<Ipv4Addr>().unwrap()]
         );
+        // UNION semantics: the change carries BOTH the old and new IPs
+        // as `new_ips` so the listener writer adds the new IP to the
+        // allow set instead of dropping the old one.
         assert_eq!(
             changes[0].new_ips,
-            vec!["93.184.216.35".parse::<Ipv4Addr>().unwrap()]
+            vec![
+                "93.184.216.34".parse::<Ipv4Addr>().unwrap(),
+                "93.184.216.35".parse::<Ipv4Addr>().unwrap(),
+            ]
+        );
+        // The cache entry now contains both IPs.
+        let entry = cache.entries().get("example.com").unwrap();
+        assert_eq!(
+            entry.ips,
+            vec![
+                "93.184.216.34".parse::<Ipv4Addr>().unwrap(),
+                "93.184.216.35".parse::<Ipv4Addr>().unwrap(),
+            ]
         );
     }
 
     #[test]
-    fn dns_cache_update_domain_removed() {
+    fn dns_cache_update_subset_no_change_emitted_but_ttl_refreshed() {
+        // If the new observation is a SUBSET of the existing entry,
+        // no change is emitted (nothing to add to the allow set), but
+        // the entry's TTL window is refreshed so steady-state rotation
+        // doesn't expire the merged set mid-window.
+        let mut cache = DnsCache::new();
+
+        let report1 = ResolvedReport {
+            mappings: vec![ResolvedMapping {
+                domain: "example.com".to_string(),
+                ips: vec!["1.2.3.4".to_string(), "5.6.7.8".to_string()],
+                ttl: 3600,
+                timestamp: "2024-01-01T00:00:00Z".to_string(),
+            }],
+        };
+        cache.update(&report1);
+
+        let report2 = ResolvedReport {
+            mappings: vec![ResolvedMapping {
+                domain: "example.com".to_string(),
+                ips: vec!["1.2.3.4".to_string()],
+                ttl: 3600,
+                timestamp: "2024-01-01T00:01:00Z".to_string(),
+            }],
+        };
+        let changes = cache.update(&report2);
+
+        assert!(
+            changes.is_empty(),
+            "subset observation must not emit a change"
+        );
+        // Both IPs still present in the cache.
+        let entry = cache.entries().get("example.com").unwrap();
+        let mut sorted = entry.ips.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec![
+                "1.2.3.4".parse::<Ipv4Addr>().unwrap(),
+                "5.6.7.8".parse::<Ipv4Addr>().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn dns_cache_update_disjoint_unions_full_set() {
+        // Observations of fully-disjoint IP sets within the TTL window
+        // accumulate the full union — the gateway and VM may each see
+        // a different rotation slot of a multi-IP A record.
+        let mut cache = DnsCache::new();
+
+        let report1 = ResolvedReport {
+            mappings: vec![ResolvedMapping {
+                domain: "github.com".to_string(),
+                ips: vec!["140.82.121.4".to_string()],
+                ttl: 60,
+                timestamp: "2024-01-01T00:00:00Z".to_string(),
+            }],
+        };
+        cache.update(&report1);
+
+        let report2 = ResolvedReport {
+            mappings: vec![ResolvedMapping {
+                domain: "github.com".to_string(),
+                ips: vec!["140.82.121.3".to_string()],
+                ttl: 60,
+                timestamp: "2024-01-01T00:00:30Z".to_string(),
+            }],
+        };
+        let changes = cache.update(&report2);
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].change_type, DnsChangeType::IpsChanged);
+        let entry = cache.entries().get("github.com").unwrap();
+        let mut sorted = entry.ips.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec![
+                "140.82.121.3".parse::<Ipv4Addr>().unwrap(),
+                "140.82.121.4".parse::<Ipv4Addr>().unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn dns_cache_update_after_expiry_still_unions() {
+        // Even when an entry's TTL has elapsed, an observation that
+        // re-mentions the domain UNIONs with the existing entry — the
+        // expiration only fires when the domain is ALSO absent from
+        // the report (see `dns_cache_update_domain_absent_after_ttl_removed`).
+        //
+        // Why: short-TTL CDN hosts (Fastly, e.g. `index.crates.io`
+        // with TTL=2s) routinely return entries whose TTL has nominally
+        // elapsed by the time the next 2-second poll cycle observes
+        // them, yet the kernel-level connection from the VM is still
+        // in flight against the previously-cached IP. Dropping the
+        // cached IPs at the TTL boundary while CoreDNS keeps reporting
+        // the same domain re-opens the rotation race that this whole
+        // file exists to close. The truly-stale eviction lives in the
+        // sweep at the end of `update`, gated on `seen_domains`.
+        //
+        // We construct the cache directly with a stale `resolved_at`
+        // to avoid sleeping in the unit test (TTLs are seconds, not
+        // milliseconds, so a real sleep would make the test slow).
+        let mut cache = DnsCache::new();
+        let stale_resolved_at = Instant::now() - Duration::from_secs(120);
+        cache.entries.insert(
+            "example.com".to_string(),
+            DnsCacheEntry {
+                domain: "example.com".to_string(),
+                ips: vec!["1.2.3.4".parse().unwrap()],
+                ttl: Duration::from_secs(60),
+                resolved_at: stale_resolved_at,
+            },
+        );
+
+        let report = ResolvedReport {
+            mappings: vec![ResolvedMapping {
+                domain: "example.com".to_string(),
+                ips: vec!["5.6.7.8".to_string()],
+                ttl: 60,
+                timestamp: "2024-01-01T00:02:00Z".to_string(),
+            }],
+        };
+        let changes = cache.update(&report);
+
+        assert_eq!(changes.len(), 1);
+        // Disjoint observation merges into the existing set; emit
+        // IpsChanged carrying the merged list. `1.2.3.4` is preserved
+        // alongside `5.6.7.8` so any in-flight VM connection against
+        // the previously-cached IP survives the boundary.
+        assert_eq!(changes[0].change_type, DnsChangeType::IpsChanged);
+        let mut got: Vec<Ipv4Addr> = changes[0].new_ips.clone();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                "1.2.3.4".parse::<Ipv4Addr>().unwrap(),
+                "5.6.7.8".parse::<Ipv4Addr>().unwrap(),
+            ]
+        );
+        let entry = cache.entries().get("example.com").unwrap();
+        let mut entry_ips = entry.ips.clone();
+        entry_ips.sort();
+        assert_eq!(
+            entry_ips,
+            vec![
+                "1.2.3.4".parse::<Ipv4Addr>().unwrap(),
+                "5.6.7.8".parse::<Ipv4Addr>().unwrap(),
+            ]
+        );
+        // resolved_at refreshed to the new observation so a subsequent
+        // domain-absent cycle within the new TTL still keeps the entry.
+        assert!(entry.resolved_at > stale_resolved_at);
+    }
+
+    #[test]
+    fn dns_cache_update_domain_absent_within_ttl_kept() {
+        // A domain that is simply absent from this cycle's report but
+        // whose entry has not yet expired must remain in the cache —
+        // the gateway may not have received another query for it yet.
+        // Tearing down allow rules between queries on a slow-traffic
+        // domain would cause unnecessary RST events.
         let mut cache = DnsCache::new();
 
         let report1 = ResolvedReport {
@@ -519,17 +782,129 @@ mod tests {
         };
         cache.update(&report1);
 
-        // Empty report -- domain is gone.
+        // Empty report — but the entry above has 3600s TTL so should
+        // survive this cycle.
         let report2 = ResolvedReport {
             mappings: Vec::new(),
         };
         let changes = cache.update(&report2);
+
+        assert!(
+            changes.is_empty(),
+            "in-window absent domain must not emit a Removed change"
+        );
+        assert_eq!(cache.entries().len(), 1);
+    }
+
+    #[test]
+    fn dns_cache_update_domain_absent_after_ttl_removed() {
+        // Once the TTL has elapsed AND the domain is absent from the
+        // report, the entry is dropped and a `Removed` change fires
+        // so downstream layers tear down the allow rules.
+        let mut cache = DnsCache::new();
+        let stale_resolved_at = Instant::now() - Duration::from_secs(120);
+        cache.entries.insert(
+            "example.com".to_string(),
+            DnsCacheEntry {
+                domain: "example.com".to_string(),
+                ips: vec!["1.2.3.4".parse().unwrap()],
+                ttl: Duration::from_secs(60),
+                resolved_at: stale_resolved_at,
+            },
+        );
+
+        let report = ResolvedReport {
+            mappings: Vec::new(),
+        };
+        let changes = cache.update(&report);
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].domain, "example.com");
         assert_eq!(changes[0].change_type, DnsChangeType::Removed);
         assert!(changes[0].new_ips.is_empty());
         assert!(cache.entries().is_empty());
+    }
+
+    #[test]
+    fn rotation_race_listener_carries_both_ips() {
+        // Pin the end-to-end behaviour the UNION fix is designed to
+        // protect: when CoreDNS observes slot .4 then slot .3 of a
+        // rotating multi-IP A record (the exact pattern observed in
+        // the todo #40 baseline log against `github.com`), the
+        // post-update Envoy listener YAML must carry BOTH IPs in the
+        // rule's `prefix_ranges` so the in-flight VM connection to
+        // .3 is not RST'd while a freshly-resolved .4 is being
+        // installed (or vice versa).
+        let policy = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![PolicyRule {
+                host: Destination::Domain("github.com".to_string()),
+                port: 443,
+                protocol: Protocol::Tcp,
+                level: AssuranceLevel::Transport,
+                reason: None,
+            }],
+        };
+
+        let mut cache = DnsCache::new();
+        // Observation 1: gateway resolves slot .4
+        let report1 = ResolvedReport {
+            mappings: vec![ResolvedMapping {
+                domain: "github.com".to_string(),
+                ips: vec!["140.82.121.4".to_string()],
+                ttl: 60,
+                timestamp: "2024-01-01T00:00:30Z".to_string(),
+            }],
+        };
+        cache.update(&report1);
+
+        // Observation 2: a few seconds later, CoreDNS gets a different
+        // rotation slot — this is the pattern the todo #40 baseline
+        // captured between gateway-side resolution and VM-side
+        // resolution within the same TTL window.
+        let report2 = ResolvedReport {
+            mappings: vec![ResolvedMapping {
+                domain: "github.com".to_string(),
+                ips: vec!["140.82.121.3".to_string()],
+                ttl: 60,
+                timestamp: "2024-01-01T00:00:33Z".to_string(),
+            }],
+        };
+        cache.update(&report2);
+
+        // Now compile the listener with the post-rotation cache and
+        // assert both IPs appear in the L1 chain's prefix_ranges. The
+        // pre-fix REPLACE semantics would have produced a listener
+        // matching only .3, which is exactly what RST'd the in-flight
+        // VM connection in the baseline log.
+        let listener_yaml = crate::policy::PolicyCompiler::compile_envoy_listener(&policy, &cache);
+        assert!(
+            listener_yaml.contains("140.82.121.3"),
+            "listener must include freshly-observed rotation slot .3 in \
+             prefix_ranges; got:\n{listener_yaml}"
+        );
+        assert!(
+            listener_yaml.contains("140.82.121.4"),
+            "UNION semantics: listener must STILL include the \
+             previously-observed rotation slot .4 so the in-flight VM \
+             connection isn't RST'd; got:\n{listener_yaml}"
+        );
+
+        // Also verify the nftables generator picks up both IPs as
+        // concat-set elements, since the gateway's upstream connection
+        // depends on the `sandbox_policy` set admitting both rotation
+        // slots.
+        let net = test_network_info();
+        let rules = generate_domain_ip_rules(&policy, &cache, &net);
+        assert!(
+            rules.contains("140.82.121.3 . 443"),
+            "nft policy_allow_tcp must include rotation slot .3; got:\n{rules}"
+        );
+        assert!(
+            rules.contains("140.82.121.4 . 443"),
+            "UNION semantics: nft policy_allow_tcp must STILL include \
+             rotation slot .4; got:\n{rules}"
+        );
     }
 
     #[test]

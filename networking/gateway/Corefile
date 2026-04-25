@@ -20,7 +20,18 @@
         events_file /var/log/gateway/events/coredns.jsonl
         reload 1s
     }
-    forward . 8.8.8.8 8.8.4.4
+    # Forward to Docker's embedded DNS at 127.0.0.11. This sidesteps
+    # reachability flakiness we saw forwarding to public resolvers
+    # (8.8.8.8 / 8.8.4.4) from the gateway container — the gateway
+    # sits on a per-session Docker bridge that the host's `docker0`
+    # ip-forwards through SLIRP/QEMU when sandboxd itself runs inside
+    # a Lima VM, and that path occasionally drops responses for
+    # unrelated downstream sessions, surfacing as transient SERVFAIL
+    # for an allowed domain. 127.0.0.11 is Docker's container-local
+    # embedded resolver — it always lives on the same network
+    # namespace as the gateway, has zero hops, and proxies to the
+    # host's real upstream via dockerd's own resolver code.
+    forward . 127.0.0.11
     log
     health :8180
     ready :8181

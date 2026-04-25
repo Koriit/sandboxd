@@ -425,15 +425,6 @@ def test_npm_preset_denies_non_preset_host(sandbox_cli):
                 pass
 
 
-@pytest.mark.skip(
-    reason=(
-        "Multi-host preset propagation race: curl TCP-RST / DNS-resolve "
-        "failures within ~100ms of propagated=true. Not a settle-timing "
-        "issue (8s empirically insufficient; further buffer shifts the "
-        "failure mode). Real fix is deeper (Envoy cluster STRICT_DNS or "
-        "nftables enforcement settling). Tracked as todo #40 for M11-S1."
-    )
-)
 @pytest.mark.timeout(600)
 def test_cargo_preset_allows_cargo_fetch(sandbox_cli):
     """``sandbox create --preset 'cargo:'`` allows the HTTP requests that
