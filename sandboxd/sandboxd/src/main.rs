@@ -3553,52 +3553,33 @@ async fn poll_and_emit_component_health(state: &AppState, session_id: &SessionId
             }
         };
 
-        // Treat "unknown" (container not running, or the check
-        // itself couldn't reach the component) as unhealthy for the
-        // purposes of transition detection.  An "unknown" result
-        // during steady-state Healthy gateways is already logged
-        // above and we want subscribers alerted.
-        let is_healthy = health == "healthy";
-
+        // Pure transition detection (including the `"unknown"`-as-
+        // unhealthy convention and the first-poll-seeds-healthy
+        // policy) lives in `sandbox_core::events::health_transition` so
+        // integration tests can import the same logic instead of
+        // re-implementing it. We retain the lock-and-emit glue here
+        // because the bus publish is async and the lock must be
+        // dropped before the publish to avoid holding it across an
+        // await point.
         let mut states = state.component_health_state.lock().await;
         let session_map = states.entry(*session_id).or_default();
-        let previous = session_map.get(component).copied();
+        let transition = sandbox_core::events::detect_health_transition(
+            session_map,
+            *component,
+            &health,
+        );
+        drop(states);
 
-        // First observation: seed the map with `true` (healthy)
-        // rather than recording and immediately emitting
-        // `health_restored`.  We only publish on a real transition.
-        match (previous, is_healthy) {
-            (None, true) => {
-                session_map.insert(*component, true);
-            }
-            (None, false) => {
-                session_map.insert(*component, false);
-                drop(states);
-                state.event_bus.publish(lifecycle_events::health_degraded(
-                    *session_id,
-                    *component,
-                    format!("component reported {health} on first poll"),
-                ));
-            }
-            (Some(true), false) => {
-                session_map.insert(*component, false);
-                drop(states);
-                state.event_bus.publish(lifecycle_events::health_degraded(
-                    *session_id,
-                    *component,
-                    format!("component reported {health}"),
-                ));
-            }
-            (Some(false), true) => {
-                session_map.insert(*component, true);
-                drop(states);
-                state
-                    .event_bus
-                    .publish(lifecycle_events::health_restored(*session_id, *component));
-            }
-            (Some(true), true) | (Some(false), false) => {
-                // No transition; leave the map untouched.
-            }
+        if let Some(transition) = transition {
+            let event = match transition {
+                sandbox_core::events::HealthTransition::Degraded { component, reason } => {
+                    lifecycle_events::health_degraded(*session_id, component, reason)
+                }
+                sandbox_core::events::HealthTransition::Restored { component } => {
+                    lifecycle_events::health_restored(*session_id, component)
+                }
+            };
+            state.event_bus.publish(event);
         }
     }
 }

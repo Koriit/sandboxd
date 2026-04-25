@@ -193,7 +193,7 @@ async fn run(args: Args) -> std::io::Result<()> {
     // Background ticker so a storm that ends on a window boundary
     // still flushes its `rate_limited` summary even when no further
     // traffic arrives. Abort on shutdown.
-    let flush_ticker = limits::spawn_flush_ticker(Arc::clone(&rate_cap));
+    let mut flush_ticker = limits::spawn_flush_ticker(Arc::clone(&rate_cap));
 
     // Graceful shutdown on SIGTERM (orchestrator request — Docker
     // `docker stop`, sandboxd's gateway restart, Kubernetes lifecycle)
@@ -217,11 +217,38 @@ async fn run(args: Args) -> std::io::Result<()> {
     // Any listener task exiting takes the process down so Docker's
     // HEALTHCHECK flips the container unhealthy and sandboxd's gateway
     // poller restarts it — spec Part 3 / "Liveness posture" forbids a
-    // degraded-observability mode.
+    // degraded-observability mode. The flush ticker is on the same
+    // contract: if it panics or exits, rate-limited summaries silently
+    // stop being flushed for traffic that quiesces on a window
+    // boundary, so we let the process die rather than absorb the
+    // failure. Polling the ticker via `&mut` keeps ownership in
+    // `flush_ticker` so we can still `abort()` it on a non-ticker exit
+    // before flushing the closing window — preventing the ticker from
+    // racing `rate_cap.flush_now()` below.
     let outcome = tokio::select! {
         res = tcp_task => res.map_err(|e| std::io::Error::other(e.to_string())),
         res = udp_task => res.map_err(|e| std::io::Error::other(e.to_string())),
         res = health_task => res.map_err(|e| std::io::Error::other(e.to_string())),
+        res = &mut flush_ticker => {
+            // The ticker is `loop { tick; rollover }` — it should
+            // never exit on its own. Any resolution is therefore a
+            // bug (panic propagated as `JoinError::Panic`, or the
+            // task was cancelled out from under us). Surface it as a
+            // process error so the container goes unhealthy and
+            // sandboxd's gateway monitor restarts us — same posture
+            // as a listener task crash.
+            let err_msg = match res {
+                Err(join_err) if join_err.is_panic() => {
+                    format!("flush_ticker panicked: {join_err}")
+                }
+                Err(join_err) => {
+                    format!("flush_ticker task ended unexpectedly: {join_err}")
+                }
+                Ok(()) => "flush_ticker exited; ticker loop must be infinite".to_string(),
+            };
+            tracing::error!(error = %err_msg, "flush ticker exited unexpectedly");
+            Err(std::io::Error::other(err_msg))
+        }
         _ = sigterm.recv() => {
             tracing::info!("SIGTERM received; shutting down");
             Ok(())
@@ -241,4 +268,96 @@ async fn run(args: Args) -> std::io::Result<()> {
     drop(rate_cap);
     drop(emitter);
     outcome
+}
+
+#[cfg(test)]
+mod tests {
+    //! Wiring-level tests for the deny-logger's process-liveness
+    //! contract. The full `run()` happy path needs real network
+    //! listeners and a SIGTERM signal; these tests target the
+    //! invariants that are easy to break in isolation:
+    //!
+    //! - **Flush-ticker panic propagation** (M10-S8 #31): a panic in
+    //!   the `spawn_flush_ticker` task must not be silently absorbed
+    //!   by tokio's runtime; the `&mut JoinHandle` arm of `run`'s
+    //!   `tokio::select!` must observe it and surface an error so
+    //!   the process exits non-zero, Docker flips the container to
+    //!   unhealthy, and sandboxd's gateway monitor restarts it.
+    //!
+    //! We don't need to crash the test process — exercising the
+    //! `JoinHandle::await → JoinError::Panic` resolution and the
+    //! select! arm behaviour proves the wiring holds.
+
+    /// A panic inside a `tokio::spawn`ed task must surface as
+    /// `JoinError::is_panic()` when its `JoinHandle` is polled, and
+    /// the same handle must fire its `tokio::select!` arm even when
+    /// borrowed mutably (`&mut handle`) — the exact pattern used by
+    /// `run()` to keep ownership of the ticker through shutdown so
+    /// `flush_ticker.abort()` can run after the select returns.
+    #[tokio::test]
+    async fn flush_ticker_panic_resolves_select_arm_via_mut_borrow() {
+        let mut ticker: tokio::task::JoinHandle<()> = tokio::spawn(async {
+            // Yield once so the spawn site doesn't observe completion
+            // before the select! polls — otherwise the select arm
+            // could fire before the panic actually unwinds, masking
+            // the panic-detection path we want to exercise.
+            tokio::task::yield_now().await;
+            panic!("simulated flush_ticker panic");
+        });
+
+        // Mirror `run()`'s select! shape: a `&mut handle` arm plus a
+        // never-firing arm so the select doesn't degenerate to a
+        // bare await (which would also work but wouldn't exercise
+        // the same control flow).
+        let outcome = tokio::select! {
+            res = &mut ticker => {
+                match res {
+                    Err(e) if e.is_panic() => Err(format!("ticker panicked: {e}")),
+                    Err(e) => Err(format!("ticker task ended: {e}")),
+                    Ok(()) => Err("ticker exited cleanly".to_string()),
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                Ok(())
+            }
+        };
+
+        let err = outcome.expect_err("the panic arm must fire before the 5s sleep");
+        assert!(
+            err.contains("ticker panicked"),
+            "expected JoinError::is_panic() match arm to fire; got: {err}"
+        );
+        // Ownership preserved: even though select! polled `&mut
+        // ticker`, we still own the handle and could call
+        // `ticker.abort()` here. (The handle is already complete, so
+        // abort is a no-op, but the borrow-checker wouldn't allow
+        // this if the select! arm had consumed `ticker`.)
+        ticker.abort();
+    }
+
+    /// Sanity guard: `spawn_flush_ticker` itself is a `tokio::spawn`
+    /// of an `async move { … }`, which means a panic in
+    /// `cap.maybe_rollover` would be caught by the runtime and
+    /// surfaced via the `JoinHandle`. This test asserts the
+    /// JoinHandle is observable (i.e. not detached) and its panic
+    /// path matches the contract the select! arm relies on. We
+    /// exercise the panic path directly via a raw `tokio::spawn`
+    /// rather than corrupting `RateCap` state — there is no input
+    /// to `maybe_rollover` that panics today, but the wiring must
+    /// still surface a future regression.
+    #[tokio::test]
+    async fn join_handle_panic_path_matches_select_arm_contract() {
+        let h: tokio::task::JoinHandle<()> =
+            tokio::spawn(async { panic!("expected: panic-path contract probe") });
+        let res = h.await;
+        match res {
+            Err(e) => {
+                assert!(
+                    e.is_panic(),
+                    "tokio::spawn panic must surface as JoinError::is_panic(); got {e:?}"
+                );
+            }
+            Ok(()) => panic!("a panicking task must not resolve to Ok(())"),
+        }
+    }
 }

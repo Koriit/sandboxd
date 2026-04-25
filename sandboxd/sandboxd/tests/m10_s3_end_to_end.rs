@@ -975,6 +975,13 @@ async fn integration_killing_deny_logger_emits_health_degraded_then_restored() {
             ("mitmproxy", HealthComponent::Mitmproxy),
             ("deny-logger", HealthComponent::DenyLogger),
         ];
+        // Pre-seed every component as healthy so the first unhealthy
+        // poll fires `health_degraded` via the healthy→unhealthy arm of
+        // `detect_health_transition` (rather than its first-observation
+        // arm, which carries an "on first poll" reason marker that
+        // would diverge from the real monitor's steady-state behaviour
+        // — production has already established its healthy baseline
+        // by the time the deny-logger is killed).
         let mut last_healthy: std::collections::HashMap<HealthComponent, bool> =
             components.iter().map(|(_, c)| (*c, true)).collect();
 
@@ -986,7 +993,11 @@ async fn integration_killing_deny_logger_emits_health_degraded_then_restored() {
         for _ in 0..600 {
             tokio::time::sleep(Duration::from_millis(500)).await;
 
-            // Per-component transition detection.
+            // Per-component transition detection. We delegate to the
+            // shared `sandbox_core::events::detect_health_transition`
+            // helper so this test stays in sync with the production
+            // monitor's transition logic — see
+            // `sandboxd::main::poll_and_emit_component_health`.
             for (label, component) in &components {
                 let gw_mgr = Arc::clone(&monitor_gw_mgr);
                 let sid = monitor_sid;
@@ -996,24 +1007,22 @@ async fn integration_killing_deny_logger_emits_health_degraded_then_restored() {
                 })
                 .await
                 .unwrap_or_else(|_| "unknown".to_string());
-                let is_healthy = health == "healthy";
 
-                let previous = *last_healthy.get(component).unwrap_or(&true);
-                match (previous, is_healthy) {
-                    (true, false) => {
-                        last_healthy.insert(*component, false);
-                        let _ = monitor_bus.publish(lifecycle_events::health_degraded(
-                            monitor_sid,
-                            *component,
-                            format!("component reported {health}"),
-                        ));
-                    }
-                    (false, true) => {
-                        last_healthy.insert(*component, true);
-                        monitor_bus
-                            .publish(lifecycle_events::health_restored(monitor_sid, *component));
-                    }
-                    _ => {}
+                if let Some(transition) = sandbox_core::events::detect_health_transition(
+                    &mut last_healthy,
+                    *component,
+                    &health,
+                ) {
+                    let event = match transition {
+                        sandbox_core::events::HealthTransition::Degraded {
+                            component,
+                            reason,
+                        } => lifecycle_events::health_degraded(monitor_sid, component, reason),
+                        sandbox_core::events::HealthTransition::Restored { component } => {
+                            lifecycle_events::health_restored(monitor_sid, component)
+                        }
+                    };
+                    let _ = monitor_bus.publish(event);
                 }
             }
 

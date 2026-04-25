@@ -19,6 +19,7 @@ use crate::session::SessionId;
 
 pub mod bus;
 pub mod envelope;
+pub mod health_transition;
 pub mod ingest;
 pub mod lifecycle;
 pub mod persist;
@@ -33,6 +34,7 @@ pub use envelope::{
     EventEnvelope, GatewayShutdownReason, HealthComponent, LifecycleEvent, MitmproxyEvent,
     PolicyApplyStatus, TrafficEvent,
 };
+pub use health_transition::{HEALTHY, HealthTransition, detect_health_transition};
 pub use persist::{PersistConfig, PersistentSink};
 pub use vm_ip_map::VmIpSessionMap;
 
