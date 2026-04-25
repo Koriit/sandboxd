@@ -3156,6 +3156,7 @@ async fn restore_session_networking(
 fn format_gateway_status(gateway: &GatewayManager, session_id: &SessionId) -> String {
     match gateway.gateway_status(session_id) {
         Ok(GatewayStatus::Healthy) => "healthy".to_string(),
+        Ok(GatewayStatus::Starting) => "starting".to_string(),
         Ok(GatewayStatus::Unhealthy(reason)) => format!("unhealthy: {reason}"),
         Ok(GatewayStatus::NotRunning) => "not_running".to_string(),
         Err(e) => format!("error: {e}"),
@@ -3219,6 +3220,19 @@ async fn session_health(
             Ok(GatewayStatus::Healthy) => (
                 "running".to_string(),
                 "healthy".to_string(),
+                "healthy".to_string(),
+                "healthy".to_string(),
+            ),
+            Ok(GatewayStatus::Starting) => (
+                "running".to_string(),
+                // healthcheck.sh passes in `Starting`, so the in-
+                // container processes (Envoy admin /ready, mitmproxy,
+                // CoreDNS /health, deny-logger /health) are reporting
+                // healthy. The gap that flips us to `Starting` is
+                // `total_listeners_active == 0` — this surfaces as
+                // the listener-aware verdict and the per-component
+                // probes can stay `healthy`.
+                "starting".to_string(),
                 "healthy".to_string(),
                 "healthy".to_string(),
             ),
@@ -3506,8 +3520,14 @@ async fn reconcile_networking(state: &AppState) {
                 };
 
                 match gw_status {
-                    GatewayStatus::Healthy => {
-                        // Gateway is healthy, nothing to do.
+                    GatewayStatus::Healthy | GatewayStatus::Starting => {
+                        // Gateway is healthy or in the boot window
+                        // (Starting = container OK but no active
+                        // listener yet — typical pre-policy-apply or
+                        // post-LDS-rejection). Either way, network
+                        // reconciliation has no work to do; restart
+                        // logic for `Starting` is intentionally a
+                        // no-op (see gateway_status rustdoc).
                     }
                     status => {
                         warn!(
@@ -3909,6 +3929,20 @@ async fn gateway_monitor(state: Arc<AppState>) {
             match status {
                 GatewayStatus::Healthy => {
                     // Fallback probe agreed it's healthy — nothing to do.
+                }
+                GatewayStatus::Starting => {
+                    // Container processes are healthy but Envoy has no
+                    // active listener yet — boot window before first
+                    // policy apply, or post-rejection LDS state.
+                    // Restarting here would loop indefinitely (the
+                    // bootstrap deny-all listener is rejected by Envoy
+                    // by design); the right recovery is for upstream
+                    // code (policy distributor) to re-apply the policy.
+                    debug!(
+                        session_id = %session.id,
+                        "gateway monitor: gateway in Starting state \
+                         (no active listener yet), no restart"
+                    );
                 }
                 GatewayStatus::NotRunning | GatewayStatus::Unhealthy(_) => {
                     warn!(

@@ -46,9 +46,18 @@ fn integration_gateway_lifecycle() {
         panic!("create_gateway failed: {e}");
     }
 
-    // Verify health.
+    // Verify health. No policy has been applied yet, so the bootstrap
+    // listener (empty `filter_chains`) is rejected by Envoy and
+    // `total_listeners_active == 0`. The two-stage gateway_status
+    // probe (#52) reports this as `Starting`, not `Healthy` — the
+    // listener-aware verdict is the contract these tests pin.
     let status = gw_mgr.gateway_status(&session_id).unwrap();
-    assert_eq!(status, GatewayStatus::Healthy, "gateway should be healthy");
+    assert_eq!(
+        status,
+        GatewayStatus::Starting,
+        "gateway should be Starting (healthcheck OK but no active listener) immediately \
+         after create_gateway with no policy applied"
+    );
 
     // Verify nftables rules are present in the container.
     let gw_container = container_name(&session_id);
@@ -301,15 +310,18 @@ fn integration_gateway_lds_listener_and_atomic_rewrite() {
 
     let gw_container = container_name(&session_id);
 
-    // Healthy gateway = Envoy + CoreDNS + mitmproxy all ready. This is
-    // the first-order signal that the split bootstrap actually works
-    // (entrypoint.sh waits for both bootstrap and listener files, then
-    // starts Envoy pointing at the bootstrap).
+    // Pre-policy verdict: gateway processes (Envoy admin /ready, CoreDNS,
+    // mitmproxy, deny-logger) are all up — but the deny-all bootstrap
+    // listener (empty `filter_chains`) is rejected by Envoy at runtime
+    // so `total_listeners_active == 0`. The two-stage gateway_status
+    // probe reports this as `Starting`, not `Healthy` (#52). Post-#52,
+    // a `Healthy` verdict here would indicate the listener-aware probe
+    // regressed.
     let status = gw_mgr.gateway_status(&session_id).unwrap();
     assert_eq!(
         status,
-        GatewayStatus::Healthy,
-        "gateway should be healthy after create_gateway (LDS bootstrap must work)"
+        GatewayStatus::Starting,
+        "gateway should be Starting (no active listener pre-policy) after create_gateway"
     );
 
     // ---------- 1. Verify the bootstrap file landed in the container ----------
@@ -538,22 +550,25 @@ fn integration_gateway_lds_listener_and_atomic_rewrite() {
          host-side rename."
     );
 
-    // Post-rewrite, Envoy should still be healthy (no drain, no reset).
+    // Post-rewrite, the rewrite added a working listener — gateway
+    // verdict should flip from `Starting` (zero active listeners) to
+    // `Healthy` (>= 1 active listener). Post-#52 this transition is
+    // the load-bearing contract for the listener-aware health check.
     let status = gw_mgr.gateway_status(&session_id).unwrap();
     assert_eq!(
         status,
         GatewayStatus::Healthy,
-        "gateway should remain healthy after atomic listener rewrite"
+        "gateway should flip to Healthy after the rewrite installs an active listener"
     );
 
-    // ---------- 4b. Listener-lifecycle witnesses (stronger than `Healthy`) ----------
-    // `gateway_status() == Healthy` only proves the gateway processes
-    // (Envoy, CoreDNS, mitmproxy) are running — it currently passes even
-    // when Envoy has rejected the bootstrap listener and zero listeners
-    // are active (see deferred follow-up: gateway health check should
-    // witness an active listener). The stats below are the direct
-    // on-the-wire witnesses that the rewrite was actually accepted and
-    // left Envoy in a stable end state.
+    // ---------- 4b. Listener-lifecycle witnesses (post-#52 contract) ----------
+    // The `Healthy` verdict above already incorporates Envoy's
+    // `total_listeners_active >= 1` gauge (post-#52 two-stage probe).
+    // The stats checks below pin the underlying counters directly so
+    // a regression in the probe's parsing layer surfaces as a
+    // counter-mismatch rather than a green `gateway_status` masking
+    // an invisible regression — and to lock the warm-restart-with-
+    // drain witnesses introduced by Path B for #51.
     //
     // Witnesses asserted (text-format /stats, matching the precedent
     // helpers in this file at ~lines 423 and 723):
@@ -825,11 +840,16 @@ fn integration_wait_for_lds_ack_observes_real_envoy_ack() {
     }
 
     let gw_container = container_name(&session_id);
+    // Pre-policy: bootstrap listener is rejected, no active listener
+    // (#52). The wait_for_lds_ack helper exercises the LDS path
+    // independent of `gateway_status`, so `Starting` is the right
+    // pre-condition here — we are about to provoke a successful
+    // rewrite that flips `total_listeners_active` to 1 below.
     let status = gw_mgr.gateway_status(&session_id).unwrap();
     assert_eq!(
         status,
-        GatewayStatus::Healthy,
-        "gateway must be healthy before exercising LDS ack"
+        GatewayStatus::Starting,
+        "gateway should be Starting (no active listener pre-rewrite) before exercising LDS ack"
     );
 
     // We need a Tokio runtime because `wait_for_lds_ack` is async
@@ -1198,13 +1218,17 @@ fn integration_apply_policy_through_real_gateway() {
 
     let gw_container = container_name(&session_id);
 
-    // Sanity: gateway must be healthy *before* distribute, otherwise an
-    // unrelated startup flake would masquerade as a distribute failure.
+    // Sanity: gateway processes must be up *before* distribute,
+    // otherwise an unrelated startup flake would masquerade as a
+    // distribute failure. Pre-policy the verdict is `Starting`
+    // (healthcheck.sh OK, no active listener — #52); the distribute
+    // call below flips it to `Healthy` by installing a populated
+    // listener.
     let status = gw_mgr.gateway_status(&session_id).unwrap();
     assert_eq!(
         status,
-        GatewayStatus::Healthy,
-        "gateway should be healthy before policy distribution"
+        GatewayStatus::Starting,
+        "gateway should be Starting (no active listener pre-distribute) before policy distribution"
     );
 
     // Helper: read an Envoy stat counter via /stats?filter=...&format=text.
@@ -1426,6 +1450,124 @@ fn integration_apply_policy_through_real_gateway() {
         status,
         GatewayStatus::Healthy,
         "gateway must remain healthy after distribute"
+    );
+
+    // ---------- Clean up ----------
+    gw_mgr.stop_gateway(&session_id).unwrap();
+    net_mgr.delete_network(&session_id).unwrap();
+}
+
+/// Pins the listener-aware health-check contract (#52).
+///
+/// Before this fix, `gateway_status()` reported `Healthy` whenever
+/// `/healthcheck.sh` succeeded — i.e. as long as Envoy admin /ready,
+/// CoreDNS /health, mitmproxy and the deny-logger were all up. That
+/// missed the failure mode where Envoy is listening on the admin port
+/// but has zero data-plane listeners (the bootstrap listener with
+/// empty `filter_chains` is rejected, so until a policy lands the
+/// container *cannot* serve client traffic). To callers driving a
+/// session through readiness gates, `Healthy` was a lie.
+///
+/// Two-stage probe (`gateway.rs`):
+///   1. composite `/healthcheck.sh` — process liveness
+///   2. `listener_manager.total_listeners_active` via Envoy admin
+///      `/stats?filter=^listener_manager\.total_listeners_active$&format=text`
+///
+/// Verdict matrix:
+///   - stage 1 fails              → `Unhealthy`
+///   - stage 1 OK, count == 0     → `Starting`   (boot window)
+///   - stage 1 OK, count >= 1     → `Healthy`
+///   - stage 1 OK, stage 2 errors → `Healthy`    (fall back; admin
+///     stats reachability isn't strictly required for serving)
+///
+/// This test pins the count==0 → `Starting` and count>=1 → `Healthy`
+/// arms end-to-end against a real gateway container. The
+/// `/healthcheck.sh fails` arm is exercised by the `Unhealthy` arm
+/// in `integration_gateway_lifecycle` (kill-the-container path).
+#[test]
+fn integration_gateway_status_witnesses_active_listener() {
+    // Distinct subnet to avoid collisions with the other gateway tests.
+    let net_mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 8, 0), 24).unwrap();
+    let gw_mgr = GatewayManager::new();
+    let session_id = SessionId::generate();
+
+    let network_info = net_mgr.create_network(&session_id).unwrap();
+
+    let create_result = gw_mgr.create_gateway(&session_id, &network_info, None, None);
+    if let Err(ref e) = create_result {
+        let _ = gw_mgr.stop_gateway(&session_id);
+        let _ = net_mgr.delete_network(&session_id);
+        panic!("create_gateway failed: {e}");
+    }
+
+    // ---------- Stage A: pre-policy ----------
+    // create_gateway lays down the bootstrap listener YAML with empty
+    // `filter_chains`, which Envoy rejects. The composite healthcheck
+    // still succeeds (Envoy /ready returns 200, CoreDNS up, mitmproxy
+    // up, deny-logger up) — so the OLD verdict was `Healthy`. The
+    // listener-aware verdict is `Starting`: count is observably 0.
+    let count = gw_mgr.gateway_listener_active_count(&session_id);
+    assert_eq!(
+        count,
+        Some(0),
+        "pre-policy: total_listeners_active must be 0 (bootstrap listener rejected); \
+         got {count:?}. If this is None, Envoy admin /stats wasn't reachable — \
+         which makes the listener-aware probe fall back to Healthy."
+    );
+    let status = gw_mgr.gateway_status(&session_id).unwrap();
+    assert_eq!(
+        status,
+        GatewayStatus::Starting,
+        "pre-policy: gateway_status must be Starting (healthcheck.sh OK, \
+         active-listener count 0); got {status:?}"
+    );
+
+    // ---------- Stage B: apply L1 CIDR policy ----------
+    // The simplest policy that yields a populated listener: an L1 CIDR
+    // rule produces nftables `policy_allow_tcp` and an Envoy listener
+    // with a real filter chain. After distribute, Envoy's LDS accepts
+    // the rewrite and `total_listeners_active` flips to 1.
+    let policy = Policy {
+        version: "2.0.0".to_string(),
+        rules: vec![PolicyRule {
+            host: Destination::Cidr("140.82.112.0/20".to_string()),
+            level: AssuranceLevel::Transport,
+            port: 443,
+            protocol: Protocol::Tcp,
+            reason: Some("L1 CIDR — minimum to populate the listener".to_string()),
+        }],
+    };
+    let compiled = PolicyCompiler::compile(&policy, &network_info)
+        .expect("L1 CIDR policy should compile cleanly");
+
+    PolicyDistributor::distribute(&session_id, &compiled, &gw_mgr).unwrap_or_else(|e| {
+        let _ = gw_mgr.stop_gateway(&session_id);
+        let _ = net_mgr.delete_network(&session_id);
+        panic!("PolicyDistributor::distribute failed end-to-end: {e}");
+    });
+
+    // Poll up to 15s for active count to advance — in practice the
+    // LDS update lands in <1s, but CI is slow.
+    let mut final_count: Option<u64> = None;
+    for _ in 0..60 {
+        final_count = gw_mgr.gateway_listener_active_count(&session_id);
+        if matches!(final_count, Some(n) if n >= 1) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert!(
+        matches!(final_count, Some(n) if n >= 1),
+        "post-distribute: total_listeners_active should advance to >= 1 within 15s; \
+         got {final_count:?}. The LDS rewrite did not produce an accepted listener."
+    );
+
+    let status = gw_mgr.gateway_status(&session_id).unwrap();
+    assert_eq!(
+        status,
+        GatewayStatus::Healthy,
+        "post-distribute: gateway_status must flip to Healthy (active listener \
+         witnessed); got {status:?}"
     );
 
     // ---------- Clean up ----------

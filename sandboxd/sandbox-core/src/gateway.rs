@@ -23,8 +23,29 @@ use crate::session::SessionId;
 /// Health status of a gateway container.
 #[derive(Debug, Clone, PartialEq)]
 pub enum GatewayStatus {
-    /// All components (Envoy, CoreDNS, mitmproxy) are healthy.
+    /// All components (Envoy, CoreDNS, mitmproxy) are healthy AND
+    /// Envoy currently has at least one active LDS-served listener
+    /// (`listener_manager.total_listeners_active >= 1`).
     Healthy,
+    /// All container processes are healthy (the in-container
+    /// `/healthcheck.sh` script returned 0), but Envoy has no active
+    /// listener yet (`listener_manager.total_listeners_active == 0`).
+    ///
+    /// This is the expected verdict during the boot window between
+    /// `create_gateway` returning and the first
+    /// `PolicyDistributor::distribute` call landing — the deny-all
+    /// bootstrap listener (empty `filter_chains`) is rejected by
+    /// Envoy at runtime, so no listener is active until policy is
+    /// applied. It is also the verdict if a policy-compiled listener
+    /// is rejected by LDS at apply time (an on-the-wire regression
+    /// that pre-#52 was masked as `Healthy`).
+    ///
+    /// Recovery code paths (`gateway_monitor`, network reconciliation)
+    /// treat `Starting` as non-actionable — like `Healthy`, it does
+    /// not trigger a restart. The visibility this carries is for
+    /// external observers (CLI list, `/sessions/{id}/health`) and
+    /// future policy-distributor diagnostics.
+    Starting,
     /// At least one component reported unhealthy.
     Unhealthy(String),
     /// The container is not running (or does not exist).
@@ -727,8 +748,35 @@ impl GatewayManager {
         self.create_gateway(session_id, network_info, ca_dir, initial_dns_policy)
     }
 
-    /// Check gateway health by running the healthcheck script inside the
-    /// container.
+    /// Check gateway health.
+    ///
+    /// Two-stage probe:
+    /// 1. Run the in-container `/healthcheck.sh` script (Envoy /ready,
+    ///    CoreDNS /health, mitmproxy process, deny-logger /health).
+    ///    A non-zero exit code yields `Unhealthy`.
+    /// 2. If healthcheck.sh succeeded, query Envoy admin
+    ///    `/stats?filter=listener_manager.total_listeners_active$&format=text`
+    ///    via `docker exec`. A value `>= 1` yields `Healthy`; a value
+    ///    of `0` yields `Starting`.
+    ///
+    /// The listener-active probe closes the gap between "container
+    /// processes are running" and "Envoy is actually serving traffic".
+    /// Pre-#52 the bootstrap deny-all listener (empty `filter_chains`)
+    /// is rejected by Envoy at runtime — `total_listeners_active` is
+    /// `0` until the first apply-policy lands a populated listener via
+    /// LDS — but `gateway_status` mis-reported `Healthy` throughout
+    /// that window and continued to mis-report `Healthy` if a
+    /// policy-compiled listener was rejected at runtime
+    /// (`lds.update_rejected` ticked but `total_listeners_active`
+    /// stayed at `0`). The two-stage probe surfaces both cases as
+    /// `Starting` instead, distinct from both `Healthy` and `Unhealthy`.
+    ///
+    /// If the listener-count probe itself fails (e.g. admin endpoint
+    /// transient error, container racing through restart), the verdict
+    /// degrades to `Healthy` rather than `Starting` to avoid a flap-
+    /// driven false positive — `Healthy` is the prior behaviour and
+    /// any persistent listener regression will fail the next probe
+    /// cycle anyway.
     pub fn gateway_status(&self, session_id: &SessionId) -> Result<GatewayStatus, SandboxError> {
         let container_name = container_name(session_id);
 
@@ -774,11 +822,75 @@ impl GatewayManager {
 
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
-        if output.status.success() {
-            Ok(GatewayStatus::Healthy)
-        } else {
-            Ok(GatewayStatus::Unhealthy(stdout))
+        if !output.status.success() {
+            return Ok(GatewayStatus::Unhealthy(stdout));
         }
+
+        // Stage 2: probe Envoy's listener_manager.total_listeners_active.
+        // The container processes are healthy; we now distinguish
+        // `Healthy` (>= 1 active listener) from `Starting` (0 active
+        // listeners — boot window or LDS rejection).
+        match self.gateway_listener_active_count(session_id) {
+            Some(0) => Ok(GatewayStatus::Starting),
+            Some(_) => Ok(GatewayStatus::Healthy),
+            // Probe failure: fall through to `Healthy`. See the rustdoc
+            // above — flapping the verdict on a transient admin-endpoint
+            // hiccup would be worse than masking a single sample of a
+            // genuine problem (which surfaces on the next cycle).
+            None => Ok(GatewayStatus::Healthy),
+        }
+    }
+
+    /// Return the value of Envoy's
+    /// `listener_manager.total_listeners_active` gauge inside the
+    /// gateway container, or `None` if the probe fails (container not
+    /// running, admin endpoint not yet ready, transient `docker exec`
+    /// error, parse failure).
+    ///
+    /// This is the load-bearing primitive for `gateway_status`'s
+    /// `Healthy` vs `Starting` arm — see that method's rustdoc for
+    /// the contract — and is exposed publicly for two reasons:
+    ///   - Integration tests under `sandbox-core/tests/gateway_integration.rs`
+    ///     assert the count directly to lock in the contract.
+    ///   - Any future tooling that wants a raw "is Envoy serving?"
+    ///     signal independent of CoreDNS / mitmproxy / deny-logger
+    ///     can call this without re-implementing the docker-exec
+    ///     plumbing.
+    ///
+    /// Implementation: `docker exec <gw> curl -sf
+    /// 'http://127.0.0.1:9901/stats?filter=^listener_manager\\.total_listeners_active$&format=text'`
+    /// and parse the `name: value` text output. Same transport used by
+    /// `DockerExecLdsProbe` (cf. `lds_ack.rs`) — the `&` in the URL must
+    /// reach Envoy as a real query-string separator, so the URL is
+    /// passed verbatim as one argv element rather than built via shell.
+    pub fn gateway_listener_active_count(&self, session_id: &SessionId) -> Option<u64> {
+        let container_name = container_name(session_id);
+        let url = "http://127.0.0.1:9901/stats?\
+                   filter=^listener_manager\\.total_listeners_active$&\
+                   format=text";
+        let output = run_with_timeout(
+            Command::new("docker").args(["exec", &container_name, "curl", "-sf", url]),
+            DOCKER_INSPECT_TIMEOUT,
+            "docker exec (envoy listener_active probe)",
+        )
+        .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        // Expected: `listener_manager.total_listeners_active: <n>`.
+        // Envoy omits zero-valued counters from /stats but EMITS
+        // gauges (which `total_listeners_active` is) at their current
+        // value — a missing line for this gauge would be unusual but
+        // safest to treat as `None` rather than guessing 0.
+        for line in text.lines() {
+            if let Some((_, v)) = line.split_once(':') {
+                if let Ok(n) = v.trim().parse::<u64>() {
+                    return Some(n);
+                }
+            }
+        }
+        None
     }
 
     /// Return the container status as a string: "running", "stopped", or
