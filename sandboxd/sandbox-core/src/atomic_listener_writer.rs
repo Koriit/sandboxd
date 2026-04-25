@@ -19,16 +19,31 @@
 //!
 //! Between any two listener generations, **only the region between
 //! [`policy::FILTER_CHAINS_BEGIN_MARKER`] and
-//! [`policy::FILTER_CHAINS_END_MARKER`] may differ.** Any change outside
+//! [`policy::FILTER_CHAINS_END_MARKER`] may differ.** Changes outside
 //! that region (bind address, `listener_filters`, `metadata`,
 //! `socket_options`, `traffic_direction`,
-//! `per_connection_buffer_limit_bytes`, etc.) forces Envoy to drain the
-//! listener and reset in-flight connections, destroying the
-//! connection-preservation property the xDS-based propagation design
-//! relies on. [`AtomicListenerWriter::write`] compares the new content
-//! against the current on-disk content and fails loudly
-//! ([`ListenerWriteError::InvariantViolated`]) when the invariant would be
-//! breached.
+//! `per_connection_buffer_limit_bytes`, etc.) cause Envoy to treat the
+//! rewrite as a *new listener* rather than a mutation of the existing
+//! `policy_listener` resource — invalidating the
+//! `dynamic_listeners`-section identity invariants the integration tests
+//! pin via `/config_dump?resource=dynamic_listeners`.
+//! [`AtomicListenerWriter::write`] compares the new content against the
+//! current on-disk content and fails loudly
+//! ([`ListenerWriteError::InvariantViolated`]) when the invariant would
+//! be breached.
+//!
+//! Note on connection preservation: even framing-stable rewrites are
+//! serviced by Envoy via the warm-restart-with-drain path
+//! (`listener_modified` ticks, `total_listeners_draining` transits 0→1→0,
+//! `listener_in_place_updated` stays at 0). What this writer guarantees
+//! is *listener-identity preservation* across the rewrite — the
+//! `policy_listener` resource keeps the same name, bind, and dynamic
+//! placement — not in-flight-connection preservation. M10-S10 redesigns
+//! DNS-rotation propagation, so connection survival across rewrites is
+//! treated as a quality-of-implementation concern. See the rustdoc on
+//! [`policy::PolicyCompiler::compile_envoy_listener`] for the empirical
+//! evidence captured in
+//! `integration_gateway_lds_listener_and_atomic_rewrite`.
 //!
 //! # Ownership and call sites
 //!
@@ -127,8 +142,11 @@ pub enum ListenerWriteError {
 
     /// The new content differs from the previous generation in a region
     /// outside the filter-chains markers. Writing it would force Envoy
-    /// to drain the listener and reset in-flight connections, which
-    /// violates the connection-preservation constraint documented in
+    /// to treat the rewrite as a new listener rather than a mutation of
+    /// the existing `policy_listener` — breaking the listener-identity
+    /// invariants this design relies on (see the module-level rustdoc
+    /// for the empirical warm-restart-with-drain caveat) and the
+    /// connection-preservation guidance in
     /// `.tasks/specs/2026-04-19-l3-envoy-mitmproxy-flow-design.md`.
     #[error(
         "listener-file invariant violated: field(s) outside the \

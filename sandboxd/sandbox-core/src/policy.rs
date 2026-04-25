@@ -527,10 +527,14 @@ pub struct CompiledPolicy {
     /// [`LISTENER_DIR_IN_CONTAINER`].
     pub envoy_bootstrap_config: String,
     /// Envoy listener file content (LDS `DiscoveryResponse` YAML). Rewritten
-    /// on each DNS-propagation event to update filter chains without a full
-    /// listener drain. The file between the `FILTER_CHAINS_BEGIN_MARKER`
-    /// and `FILTER_CHAINS_END_MARKER` comment markers is the only region
-    /// allowed to differ between generations.
+    /// on each DNS-propagation event to update filter chains. The file
+    /// between the `FILTER_CHAINS_BEGIN_MARKER` and `FILTER_CHAINS_END_MARKER`
+    /// comment markers is the only region allowed to differ between
+    /// generations — keeping the framing byte-identical preserves the
+    /// listener's *identity* across the rewrite (each rewrite is a
+    /// single-listener LDS mutation of `policy_listener`), but Envoy still
+    /// services the rewrite via its warm-restart-with-drain path rather
+    /// than an in-place update — see `PolicyCompiler::compile_envoy_listener`.
     pub envoy_listener_config: String,
     /// mitmproxy addon configuration (JSON).
     pub mitmproxy_config: String,
@@ -1153,10 +1157,30 @@ admin:
     /// `envoy.config.listener.v3.Listener` resource. Between the
     /// [`FILTER_CHAINS_BEGIN_MARKER`] and [`FILTER_CHAINS_END_MARKER`]
     /// comment markers is the only region the atomic writer permits to
-    /// differ between generations — changes to the framing region (bind
-    /// address, `listener_filters`, `socket_options`, etc.) force a full
-    /// listener drain and reset existing connections, destroying the
-    /// connection-preservation property.
+    /// differ between generations: keeping the framing region (bind
+    /// address, `listener_filters`, `socket_options`, etc.) byte-identical
+    /// is what lets Envoy treat each rewrite as a single-listener LDS
+    /// update of the existing `policy_listener` resource rather than a
+    /// listener-replacement event (which would reject the rename outright
+    /// or churn the listener identity, breaking observability invariants
+    /// the integration tests pin via `/config_dump?resource=dynamic_listeners`).
+    ///
+    /// **Runtime caveat — warm restart, not in-place.** Empirically (see
+    /// `integration_gateway_lds_listener_and_atomic_rewrite`), Envoy
+    /// services each accepted rewrite via the **warm-restart-with-drain**
+    /// path, not the in-place update path: across a valid→valid filter-chain
+    /// rewrite `listener_manager.listener_modified` ticks, the previous
+    /// generation transits `total_listeners_draining` 0→1→0 while the new
+    /// generation warms in, and `listener_in_place_updated` stays at 0.
+    /// What is preserved across the rewrite is the listener's *identity*
+    /// (still `policy_listener`, still under `dynamic_listeners`,
+    /// `lds.update_success` ticks while `lds.update_rejected` does not).
+    /// In-flight connections to the old generation are subject to Envoy's
+    /// drain timer rather than carried over untouched. M10-S10 redesigns
+    /// DNS-rotation propagation, so this is treated as a quality-of-
+    /// implementation concern rather than a correctness one — the design
+    /// here ensures the rename is *accepted*, not that connections survive
+    /// the rewrite untouched.
     ///
     /// Supports all assurance levels, and every generated filter chain
     /// carries a `destination_port` predicate on its `FilterChainMatch`
@@ -1745,8 +1769,15 @@ admin:
     /// This helper guarantees that every listener generation we emit has
     /// the **same head and tail regions**, which is the core invariant
     /// the atomic listener writer enforces: only the filter-chains body
-    /// may differ between generations, so Envoy's LDS update path does
-    /// not drain the listener or reset in-flight connections.
+    /// may differ between generations, so Envoy's LDS update path
+    /// accepts each rewrite as a single-listener mutation of the
+    /// existing `policy_listener` resource (rather than rejecting it or
+    /// churning the listener's identity). See
+    /// [`Self::compile_envoy_listener`] for the runtime-observed caveat
+    /// that even framing-stable rewrites are serviced via Envoy's
+    /// warm-restart-with-drain path, not the in-place update path —
+    /// listener *identity* is preserved across the rewrite, but in-flight
+    /// connections still subject to the drain timer.
     ///
     /// In particular this means `listener_filters` is populated with the
     /// same two filters (`tls_inspector`, `original_dst`) for every
@@ -1769,10 +1800,11 @@ admin:
 # this file via atomic rename — see `atomic_listener_writer` in
 # `sandbox-core`. Between any two generations, only the region framed
 # by the filter-chains BEGIN and END sentinel comments below is
-# permitted to differ; the writer enforces this invariant so that
-# connection preservation holds across filter-chain updates (Envoy
-# drains the listener on metadata, socket-option, bind-address, or
-# listener-filter changes).
+# permitted to differ; the writer enforces this invariant so that the
+# listener's *identity* (name, bind, listener_filters) survives each
+# rewrite as a single-listener LDS mutation. Note: even framing-stable
+# rewrites go through Envoy's warm-restart-with-drain path rather than
+# the in-place update path — see `compile_envoy_listener` rustdoc.
 resources:
   - "@type": type.googleapis.com/envoy.config.listener.v3.Listener
     name: policy_listener
@@ -1977,7 +2009,11 @@ resources:
         // Deny-all is just an empty filter_chains list wrapped in the
         // common listener framing. Keeping the head/tail identical to
         // the policy-compiled listener is what lets sandboxd swap in a
-        // populated policy without Envoy draining the listener.
+        // populated policy as a single-listener LDS mutation that
+        // preserves the `policy_listener` identity (Envoy still services
+        // the rewrite via warm-restart-with-drain — see
+        // `compile_envoy_listener` rustdoc — but the listener's name and
+        // dynamic-listener placement under /config_dump survive intact).
         Self::listener_yaml_for_filter_chains("    filter_chains: []")
     }
 }
@@ -5378,10 +5414,13 @@ mod tests {
     //
     // Every listener generation (deny-all, L1-only, L2, L3, mixed) must
     // share the same `listener_filters` block so the atomic listener
-    // writer can transition between them without draining the listener.
-    // As a consequence `tls_inspector` is now present in every listener
-    // — it is a no-op for non-TLS traffic and is necessary for L2/L3
-    // SNI-based filter_chain_match routing.
+    // writer can transition between them as a single-listener LDS
+    // mutation that preserves the `policy_listener` identity (see
+    // `compile_envoy_listener` rustdoc — Envoy services the rewrite via
+    // warm-restart-with-drain, but the listener's name and dynamic-listener
+    // placement survive). As a consequence `tls_inspector` is now present
+    // in every listener — it is a no-op for non-TLS traffic and is
+    // necessary for L2/L3 SNI-based filter_chain_match routing.
 
     #[test]
     fn compile_level1_includes_tls_inspector_for_framing_stability() {

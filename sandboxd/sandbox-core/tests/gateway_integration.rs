@@ -451,6 +451,12 @@ fn integration_gateway_lds_listener_and_atomic_rewrite() {
     fn listener_create_success(container: &str) -> u64 {
         lds_stat(container, "listener_manager.listener_create_success")
     }
+    fn listener_modified(container: &str) -> u64 {
+        lds_stat(container, "listener_manager.listener_modified")
+    }
+    fn listener_in_place_updated(container: &str) -> u64 {
+        lds_stat(container, "listener_manager.listener_in_place_updated")
+    }
     fn total_listeners_active(container: &str) -> u64 {
         lds_stat(container, "listener_manager.total_listeners_active")
     }
@@ -461,7 +467,11 @@ fn integration_gateway_lds_listener_and_atomic_rewrite() {
     let initial_updates = lds_update_success(&gw_container);
     let initial_rejections = lds_update_rejected(&gw_container);
     // Snapshot the listener-lifecycle witnesses *before* the rewrite —
-    // post-rewrite assertions below compare against these.
+    // post-rewrite assertions below compare against these. (The
+    // `listener_modified` / `listener_in_place_updated` witnesses for
+    // the second rewrite — section 4c — capture their own pre-snapshots
+    // closer to the second `writer.write` call so the deltas attribute
+    // cleanly to that mutation.)
     let initial_added = listener_added(&gw_container);
     let initial_create_success = listener_create_success(&gw_container);
 
@@ -561,19 +571,6 @@ fn integration_gateway_lds_listener_and_atomic_rewrite() {
     //     finishes warming — proves no listener is stuck in drain. The
     //     gauge can transiently be 1 mid-rewrite, so we poll briefly
     //     for it to settle (mirrors the `update_success` poll above).
-    //
-    // What is intentionally NOT asserted:
-    //   - `listener_manager.listener_in_place_updated` — the original
-    //     todo (#22) wanted this as proof of a no-drain in-place
-    //     update. Runtime evidence shows the current emit shape
-    //     (`default_filter_chain:` rather than `filter_chains:`) goes
-    //     through warm-restart-with-drain, not the in-place path, so
-    //     this gauge stays at 0 today. The mismatch between the design
-    //     intent in `policy.rs` (filter-chain-only rewrite "does not
-    //     drain") and the observed warm-restart behavior is filed as
-    //     a separate follow-up; if/when that is fixed, swap the
-    //     witnesses here for `listener_in_place_updated > 0` plus
-    //     `listener_create_success` unchanged.
     let final_added = listener_added(&gw_container);
     let final_create_success = listener_create_success(&gw_container);
     let final_total_active = total_listeners_active(&gw_container);
@@ -610,6 +607,153 @@ fn integration_gateway_lds_listener_and_atomic_rewrite() {
         "listener_manager.total_listeners_draining = {final_draining} after waiting for \
          drain to complete; expected 0 in the steady state. A listener is stuck draining \
          after the rewrite — connections to it will be reset when the drain timer fires."
+    );
+
+    // ---------- 4c. Lock in the warm-restart-with-drain contract (#51) ----------
+    // The previous block witnessed that the FIRST rewrite (deny-all empty
+    // -> populated) is processed as a listener *add* (`listener_added`
+    // ticks). To exercise — and lock in — the path Envoy actually takes
+    // for a *mutation* of the populated listener (the steady-state shape
+    // hit by every DNS-rotation-driven rewrite), we perform a second
+    // rewrite that differs only in `stat_prefix` inside the
+    // filter-chains body and verify the warm-restart-with-drain witnesses.
+    //
+    // What this asserts (the Path B contract chosen for #51):
+    //   - The listener's *identity* is preserved across the rewrite: it
+    //     is still named `policy_listener`, still served as a dynamic
+    //     listener, and `lds.update_success` advances cleanly without
+    //     `lds.update_rejected` advancing.
+    //   - The mutation traverses Envoy's warm-restart-with-drain path,
+    //     not the in-place update path:
+    //       * `listener_manager.listener_modified` advances (the warm-
+    //         restart witness).
+    //       * `listener_manager.listener_in_place_updated` does NOT
+    //         advance (the in-place witness — pinned at 0 to lock the
+    //         current behavior; if Envoy ever activates the in-place
+    //         path here, this test must be updated alongside the
+    //         rustdoc on `PolicyCompiler::compile_envoy_listener` so
+    //         design comment and runtime stay aligned).
+    //       * `total_listeners_draining` settles back to 0 in the
+    //         steady state (re-checked after this rewrite).
+    //
+    // This is intentionally a tighter contract than #22's "Healthy and
+    // active" witnesses: we are pinning the runtime-observed semantics
+    // so future regressions (e.g. a framing change that flips Envoy
+    // into rebuild-as-new-listener, or a YAML shape that switches to
+    // in-place) surface as a test failure rather than a silent shift.
+    let pre2_updates = lds_update_success(&gw_container);
+    let pre2_rejections = lds_update_rejected(&gw_container);
+    let pre2_modified = listener_modified(&gw_container);
+    let pre2_in_place = listener_in_place_updated(&gw_container);
+    let pre2_draining = total_listeners_draining(&gw_container);
+
+    // Build a generation that differs from `updated_listener` only in the
+    // `stat_prefix` value — strictly inside the filter-chains body, no
+    // framing change. The atomic writer's invariant must accept this.
+    let updated_listener_v2 = updated_listener.replace(
+        "stat_prefix: sandbox_l1_passthrough",
+        "stat_prefix: sandbox_l1_passthrough_v2",
+    );
+    assert_ne!(
+        updated_listener, updated_listener_v2,
+        "second-rewrite content must differ from first-rewrite content \
+         (stat_prefix substitution should have changed the body)"
+    );
+    writer
+        .write(&updated_listener_v2)
+        .expect("second atomic listener rewrite (stat_prefix-only) should succeed");
+
+    // Wait up to 15s for Envoy to resolve the second rewrite.
+    let mut post2_updates = pre2_updates;
+    let mut post2_rejections = pre2_rejections;
+    for _ in 0..60 {
+        post2_updates = lds_update_success(&gw_container);
+        post2_rejections = lds_update_rejected(&gw_container);
+        if post2_rejections > pre2_rejections || post2_updates > pre2_updates {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    assert!(
+        post2_rejections == pre2_rejections,
+        "Envoy rejected the second listener rewrite ({pre2_rejections} -> \
+         {post2_rejections}). Stat-prefix-only diff should be a clean LDS update — \
+         a rejection indicates the framing changed unexpectedly or the YAML is \
+         malformed."
+    );
+    assert!(
+        post2_updates > pre2_updates,
+        "Envoy LDS update_success should have advanced from {pre2_updates} after \
+         the second atomic rewrite; got {post2_updates}. Either the MovedTo event \
+         did not reach Envoy or the writer reported success without renaming."
+    );
+
+    // The mutation should advance `listener_modified` (warm-restart witness)
+    // and leave `listener_in_place_updated` unchanged (in-place witness pinned
+    // at 0 — the Path B contract for #51). `total_listeners_draining`
+    // advances because the previous generation is now draining (Envoy's
+    // default drain timer is 600s, so we do NOT wait for it to return to
+    // 0 — its mere advancement is the witness).
+    let post2_modified = listener_modified(&gw_container);
+    let post2_in_place = listener_in_place_updated(&gw_container);
+    let post2_draining = total_listeners_draining(&gw_container);
+    let post2_active = total_listeners_active(&gw_container);
+    assert!(
+        post2_modified > pre2_modified,
+        "listener_manager.listener_modified did not advance ({pre2_modified} -> \
+         {post2_modified}) across a populated->populated filter-chains rewrite. \
+         Envoy is no longer treating this rewrite as a warm-restart — either it \
+         switched to the in-place path (check listener_in_place_updated and update \
+         this test + the design comment in policy.rs), or the rewrite was processed \
+         as a fresh add (check listener_added). Behavior change vs. the runtime \
+         contract documented on `PolicyCompiler::compile_envoy_listener`."
+    );
+    assert_eq!(
+        post2_in_place, pre2_in_place,
+        "listener_manager.listener_in_place_updated advanced ({pre2_in_place} -> \
+         {post2_in_place}) across a populated->populated filter-chains rewrite. \
+         Envoy has activated its in-place update path — connection preservation \
+         across edits may now be possible. Update both this assertion and the \
+         design comment on `PolicyCompiler::compile_envoy_listener` (it currently \
+         documents warm-restart-with-drain as the runtime path)."
+    );
+    assert!(
+        post2_draining > pre2_draining,
+        "listener_manager.total_listeners_draining did not advance ({pre2_draining} \
+         -> {post2_draining}) across the second rewrite. The warm-restart-with-drain \
+         contract requires the previous listener generation to enter drain when the \
+         new generation warms in; not seeing this means Envoy either took the \
+         in-place path (check listener_in_place_updated) or the new generation \
+         failed to install (check listener_modified and listener_added)."
+    );
+    assert!(
+        post2_active >= 1,
+        "listener_manager.total_listeners_active = {post2_active} after second \
+         rewrite; expected >= 1. The new (warm-restart) generation must be active \
+         before the old one drains — a value of 0 here indicates the new listener \
+         failed to come up."
+    );
+
+    // Listener identity is preserved across the second rewrite — the
+    // `policy_listener` resource is still served from the dynamic-listeners
+    // section. This is the load-bearing contract for /config_dump-driven
+    // observability and the apply-policy-through-real-gateway test.
+    let output = Command::new("docker")
+        .args([
+            "exec",
+            &gw_container,
+            "curl",
+            "-sf",
+            "http://127.0.0.1:9901/config_dump?resource=dynamic_listeners",
+        ])
+        .output()
+        .expect("docker exec curl config_dump (post-second-rewrite) should succeed");
+    let dynamic_listeners_v2 = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        dynamic_listeners_v2.contains("policy_listener"),
+        "policy_listener must still be present in dynamic_listeners after the \
+         stat-prefix-only second rewrite — listener identity must survive warm-\
+         restart-with-drain:\n{dynamic_listeners_v2}"
     );
 
     // ---------- 5. Verify the dynamic listener version_info advanced ----------
