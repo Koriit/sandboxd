@@ -1457,6 +1457,164 @@ fn integration_apply_policy_through_real_gateway() {
     net_mgr.delete_network(&session_id).unwrap();
 }
 
+/// Pins the fatal-create contract (M10-S8 #16, M10-S9 #46) end-to-end.
+///
+/// `fail_explicit_policy_apply_marks_session_error_and_returns_5xx`
+/// (in `sandboxd/src/main.rs` tests) is the hermetic unit test for the
+/// daemon-side handler: it injects a synthetic
+/// `SandboxError::Gateway(...)` into `fail_explicit_policy_apply` and
+/// pins the 500 + `SessionState::Error` contract. That test covers the
+/// state-transition + HTTP-mapping side of the failure but mocks out
+/// the trigger — it does not exercise a real
+/// `PolicyDistributor::distribute` failure.
+///
+/// This test fills the remaining gap. It builds a syntactically-valid
+/// policy whose compile output the live nft kernel parser rejects,
+/// runs `PolicyDistributor::distribute` against a real gateway
+/// container, and asserts:
+///
+///   1. `distribute()` returns `Err(SandboxError::Gateway(...))`.
+///      Variant — not message — because the daemon's
+///      `error_response()` mapping keys on the variant; the
+///      `Gateway` arm is the one that produces the 500 the unit
+///      test pins.
+///   2. The earlier distribute steps (CoreDNS + mitmproxy) reach the
+///      container before the nftables step fails, so we know the
+///      failure is genuinely from the kernel parser and not an
+///      unrelated step-1/step-2 wobble.
+///
+/// **Failure shape.** Two CIDR rules at the same `(port, protocol)`
+/// whose prefixes overlap: `10.0.0.0/8` and `10.1.0.0/16` both fall
+/// into the IPv4 space `10.0.0.0/8`. Both pass `validate_cidr`
+/// (parseable IPv4, prefix <= 32) and both are distinct
+/// `(host, port)` keys (different `Destination::Cidr` strings), so
+/// `PolicyCompiler::validate` accepts the policy. Compilation
+/// emits both as elements of the `policy_allow_tcp` set with
+/// `flags interval`, which is precisely the configuration the
+/// pinned nftables 1.0.6 (gateway image) rejects with
+/// `Error: Could not process rule: File exists`. Verified via
+/// `nft -c -f -` on the gateway image during the test design pass —
+/// see commit message for the captured stderr.
+///
+/// **Why this matters.** The unit test pins the helper's behaviour
+/// when an error is handed in, but a regression that broke the trigger
+/// path (e.g. a reordering that swallowed the distribute Err inside
+/// `apply_policy`, or a mapping change that demoted `Gateway` to a
+/// non-fatal variant) would let the unit test stay green while the
+/// real failure mode silently regressed. This test pins the trigger
+/// — the bridge between "distribute rejected the policy" and "the
+/// caller observes an Err the daemon can map to a 5xx".
+///
+/// Uses 10.209.9.0/24 to avoid collisions with the other
+/// `integration_*` gateway tests (8.0/24 is taken by
+/// `integration_gateway_status_witnesses_active_listener`).
+#[test]
+fn integration_distribute_returns_err_when_gateway_rejects_policy() {
+    let net_mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 9, 0), 24).unwrap();
+    let gw_mgr = GatewayManager::new();
+    let session_id = SessionId::generate();
+
+    let network_info = net_mgr.create_network(&session_id).unwrap();
+
+    let create_result = gw_mgr.create_gateway(&session_id, &network_info, None, None);
+    if let Err(ref e) = create_result {
+        let _ = gw_mgr.stop_gateway(&session_id);
+        let _ = net_mgr.delete_network(&session_id);
+        panic!("create_gateway failed: {e}");
+    }
+
+    // Pre-flight: gateway must be at least at the post-create
+    // baseline. If create_gateway returned Ok but the container is
+    // already wedged, an unrelated startup flake would masquerade as
+    // a distribute rejection. Pre-policy the listener-aware verdict
+    // is `Starting` (#52); the test does not depend on a populated
+    // listener — distribute fails on the nftables step (step 3),
+    // before it ever rewrites the listener file.
+    let pre_status = gw_mgr.gateway_status(&session_id).unwrap();
+    assert_eq!(
+        pre_status,
+        GatewayStatus::Starting,
+        "gateway must be Starting after create_gateway (no policy applied yet); \
+         got {pre_status:?}. An unhealthy gateway here would make a distribute \
+         failure ambiguous."
+    );
+
+    // Two overlapping `policy_allow_tcp` set elements at the same
+    // (port, protocol) — see test docstring for why this passes
+    // `compile` and is rejected by the live nft parser.
+    let policy = Policy {
+        version: "2.0.0".to_string(),
+        rules: vec![
+            PolicyRule {
+                host: Destination::Cidr("10.0.0.0/8".to_string()),
+                level: AssuranceLevel::Transport,
+                port: 443,
+                protocol: Protocol::Tcp,
+                reason: Some("supernet — overlaps with the /16 below".to_string()),
+            },
+            PolicyRule {
+                host: Destination::Cidr("10.1.0.0/16".to_string()),
+                level: AssuranceLevel::Transport,
+                port: 443,
+                protocol: Protocol::Tcp,
+                reason: Some("subnet of 10.0.0.0/8 — triggers nft interval overlap".to_string()),
+            },
+        ],
+    };
+
+    // Sanity: compile must succeed — the failure we are pinning is
+    // distribute-side, not validate-side. If a future
+    // `PolicyCompiler::validate` change adds a CIDR-overlap pre-check,
+    // that would short-circuit the production path before distribute
+    // is called and this test would lose its purpose.
+    let compiled = PolicyCompiler::compile(&policy, &network_info)
+        .expect("overlapping-CIDR policy must still compile (rejection is gateway-side)");
+    assert!(
+        compiled.nftables_rules.contains("10.0.0.0/8 . 443"),
+        "compile output must carry the supernet element so the kernel sees the overlap; \
+         got:\n{}",
+        compiled.nftables_rules
+    );
+    assert!(
+        compiled.nftables_rules.contains("10.1.0.0/16 . 443"),
+        "compile output must carry the subnet element so the kernel sees the overlap; \
+         got:\n{}",
+        compiled.nftables_rules
+    );
+
+    // ---------- Distribute: must fail at the nftables step ----------
+    let result = PolicyDistributor::distribute(&session_id, &compiled, &gw_mgr);
+
+    // Tear down before any further assertion so a panic doesn't leak
+    // the gateway container + network on the failure path.
+    let _ = gw_mgr.stop_gateway(&session_id);
+    let _ = net_mgr.delete_network(&session_id);
+
+    // Contract 1: distribute returns Err. Without the gateway-side
+    // rejection wired through, `inject_nftables_ruleset_public` would
+    // have to silently swallow the kernel's "File exists" error — that
+    // would be the regression this test catches.
+    let err = result.expect_err(
+        "PolicyDistributor::distribute must return Err when nft rejects the ruleset \
+         (overlapping CIDR intervals); production code's apply_policy depends on this Err \
+         to trigger fail_explicit_policy_apply (M10-S8 #16)",
+    );
+
+    // Contract 2: variant is `SandboxError::Gateway`. We pin on the
+    // variant rather than the message because:
+    //   - `error_response` maps `Gateway` to 500; a regression that
+    //     remapped distribute's error to e.g. `Internal` would leave
+    //     the unit test green but break the documented HTTP contract.
+    //   - The kernel error string (`File exists` vs `interval
+    //     overlaps` vs a future nft message) is upstream and likely to
+    //     drift; the variant is our contract.
+    assert!(
+        matches!(err, sandbox_core::SandboxError::Gateway(_)),
+        "distribute must surface nft rejection as SandboxError::Gateway so error_response \
+         maps it to 500 (the variant the M10-S8 #16 unit test pins); got: {err:?}"
+    );
+}
+
 /// Pins the listener-aware health-check contract (#52).
 ///
 /// Before this fix, `gateway_status()` reported `Healthy` whenever
