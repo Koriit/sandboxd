@@ -39,11 +39,10 @@ pub use dns_propagation::{
 pub use error::{ApiError, SandboxError};
 pub use events::{
     DEFAULT_BROADCAST_CAPACITY, DEFAULT_RING_BUFFER_SIZE, DenyLoggerDeny, DenyLoggerEvent,
-    DenyProtocol, DnsEvent, EVENTS_DIR_IN_CONTAINER, EVENTS_HOST_ROOT, EnvoyConnection, EnvoyEvent,
-    Event, EventBus, EventBusConfig, EventEnvelope, EventSubscription, GatewayShutdownReason,
-    HealthComponent, LifecycleEvent, MitmproxyEvent, PersistConfig, PersistentSink,
-    PolicyApplyStatus, TrafficEvent, VmIpSessionMap, ingest::SessionIngestor,
-    session_events_host_dir,
+    DenyProtocol, DnsEvent, EVENTS_DIR_IN_CONTAINER, EnvoyConnection, EnvoyEvent, Event, EventBus,
+    EventBusConfig, EventEnvelope, EventSubscription, GatewayShutdownReason, HealthComponent,
+    LifecycleEvent, MitmproxyEvent, PersistConfig, PersistentSink, PolicyApplyStatus, TrafficEvent,
+    VmIpSessionMap, events_host_root, ingest::SessionIngestor, session_events_host_dir,
 };
 pub use gateway::{
     DockerHealth, GATEWAY_DENY_LOGGER_HEALTH_PORT, GATEWAY_DENY_LOGGER_TCP_PORT,
