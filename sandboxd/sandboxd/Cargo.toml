@@ -25,7 +25,13 @@ async-stream = "0.3"
 # so the handler can produce the timestamp without threading through
 # sandbox-core's domain types.
 chrono.workspace = true
-clap.workspace = true
+# `env` enables the `#[arg(env = "...")]` derive attribute used on
+# `--events-persist-retention-days` to fall back to
+# `SANDBOX_EVENTS_PERSIST_RETENTION_DAYS`. The workspace clap dep only
+# carries `derive`; without re-stating `env` here the crate compiles only
+# under workspace feature unification (via `sandbox-deny-logger` which
+# also opts into `env`), so isolated `cargo check -p sandboxd` fails.
+clap = { workspace = true, features = ["env"] }
 ring.workspace = true
 sandbox-core.workspace = true
 serde.workspace = true
