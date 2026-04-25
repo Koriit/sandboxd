@@ -898,19 +898,66 @@ mod tests {
         assert_rules_round_trip(rules);
     }
 
-    /// Drift detection: the `cargo` built-in's host list must match the
-    /// frozen `tests/fixtures/cargo_fetch_trace.json` fixture line for
-    /// line. The fixture is the verified network surface of `cargo
-    /// fetch` / `cargo build` against an empty cache on Rust 1.70+
-    /// (sparse-index default).
+    /// Drift detection: the `cargo` built-in's host list AND its
+    /// per-host method posture must match the frozen
+    /// `tests/fixtures/cargo_fetch_trace.json` fixture. The fixture is
+    /// the verified network surface of `cargo fetch` / `cargo build`
+    /// against an empty cache on Rust 1.70+ (sparse-index default),
+    /// scoped to the consume-only methods the preset is intended to
+    /// allow.
     ///
-    /// If you are intentionally changing the host set, update the
-    /// fixture in the same commit — the test asserts equality in both
-    /// directions to catch adds and removes. Document the rationale in
-    /// the fixture's leading `_comment` block and, if the change
-    /// affects spec §"Known gaps", update that section too.
+    /// **Invariant (chosen path A — see todo #59).** Each domain host
+    /// in the preset's expansion appears in the fixture with a
+    /// `methods` array, and the set of methods emitted by the preset
+    /// for that host is exactly equal to the fixture's set. Catches
+    /// drift in both directions:
+    ///   - preset adds a method (e.g. POST on `crates.io`) without
+    ///     updating the fixture → test fails, forces a rationale;
+    ///   - fixture is re-captured against a future cargo version that
+    ///     uses a new method (e.g. PATCH on the sparse index) without
+    ///     updating the preset → test fails, forces a preset edit.
+    ///
+    /// **Why per-method, not per-host alone.** The previous shape only
+    /// compared host strings. A future cargo version that introduced a
+    /// new HTTP method on an existing host (e.g. PATCH against the
+    /// sparse index, or moving `cargo publish` to a different verb)
+    /// would have left the fixture rotted while the test stayed green.
+    /// The preset's posture is `(host, methods)`; the drift assertion
+    /// matches.
+    ///
+    /// **Why sets, not method-list-as-vec.** The order of `HttpFilter`
+    /// entries inside a preset rule is not load-bearing for any
+    /// downstream consumer (mitmproxy / Envoy / nft only care about
+    /// the membership). Comparing as sorted sets keeps the test
+    /// resilient to a refactor that swaps GET-then-HEAD for
+    /// HEAD-then-GET while still catching real drift.
+    ///
+    /// **Fixture `methods` semantics.** The `methods` field for each
+    /// host encodes "what the consume-only preset should allow", not
+    /// "every method the host's API technically accepts". For
+    /// `crates.io` in particular, the host accepts POST / PUT /
+    /// DELETE for publish / yank / owner management, but those
+    /// mutating workflows are deliberately scoped to an explicit
+    /// grant outside the built-in — see the fixture's `_comment`
+    /// block for the rationale and the spec's "Known gaps" section.
+    ///
+    /// CIDR-host rules (the Fastly Anycast pool from
+    /// [`CARGO_FASTLY_CIDR_POOL`]) are intentionally not part of this
+    /// drift check — the frozen fixture is a *hostname* trace; the
+    /// CIDR coverage is validated by
+    /// [`cargo_fastly_cidr_pool_covers_published_ranges`] below.
+    ///
+    /// If you are intentionally changing the host set or per-host
+    /// method posture, update the fixture in the same commit — the
+    /// test asserts equality in both directions to catch adds and
+    /// removes. Document the rationale in the fixture's leading
+    /// `_comment` block and, if the change affects spec §"Known
+    /// gaps", update that section too.
     #[test]
     fn cargo_preset_matches_frozen_trace() {
+        use std::collections::BTreeMap;
+        use std::collections::BTreeSet;
+
         // Resolve the fixture path relative to the crate root so the
         // test works from both `cargo test` and `cargo nextest run`
         // (nextest does not cd into the test's runtime dir).
@@ -925,49 +972,108 @@ mod tests {
         let doc: serde_json::Value =
             serde_json::from_str(&raw).unwrap_or_else(|e| panic!("fixture is not valid JSON: {e}"));
 
-        // Extract the `hosts[].host` list from the fixture.
-        let fixture_hosts: Vec<String> = doc["hosts"]
+        // Build a map host → BTreeSet<methods-as-uppercase-string> from
+        // the fixture. Method strings are compared as their `Display`
+        // form (`"GET"`, `"HEAD"`, ...) so we don't have to re-implement
+        // a JSON-string -> HttpMethod parser here — the preset side
+        // renders the same way via `HttpMethod::Display`.
+        let fixture_methods: BTreeMap<String, BTreeSet<String>> = doc["hosts"]
             .as_array()
             .expect("`hosts` must be a JSON array")
             .iter()
             .map(|row| {
-                row["host"]
+                let host = row["host"]
                     .as_str()
                     .expect("`hosts[].host` must be a string")
-                    .to_string()
+                    .to_string();
+                let methods: BTreeSet<String> = row["methods"]
+                    .as_array()
+                    .unwrap_or_else(|| {
+                        panic!("`hosts[].methods` must be a JSON array (host: {host})")
+                    })
+                    .iter()
+                    .map(|m| {
+                        m.as_str()
+                            .unwrap_or_else(|| {
+                                panic!("`hosts[].methods[]` must be a string (host: {host})")
+                            })
+                            .to_string()
+                    })
+                    .collect();
+                assert!(
+                    !methods.is_empty(),
+                    "`hosts[].methods` must be non-empty (host: {host}); a host with no \
+                     allowed methods would be dead weight in the preset"
+                );
+                (host, methods)
             })
             .collect();
 
-        // Build the preset's domain-host list by expanding and
-        // collecting the unique domain strings from the emitted rules.
-        // CIDR-host rules (the Fastly Anycast pool) are intentionally
-        // excluded — the frozen fixture is a *hostname* trace; the
-        // CIDR rules' coverage is validated by
-        // `cargo_fastly_cidr_pool_covers_published_ranges` below.
+        // Build the same shape from the preset expansion. CIDR-host
+        // rules are excluded (see docstring); the consume-posture for
+        // each domain host is encoded in the rule's `http_filters`.
         let rules = expand_builtin("cargo", "cargo:");
-        let mut preset_hosts: Vec<String> = rules
+        let preset_methods: BTreeMap<String, BTreeSet<String>> = rules
             .iter()
-            .filter_map(|r| match &r.host {
-                Destination::Domain(d) => Some(d.clone()),
-                Destination::Cidr(_) => None,
+            .filter_map(|r| match (&r.host, &r.level) {
+                (Destination::Domain(host), AssuranceLevel::Http { http_filters }) => {
+                    let methods: BTreeSet<String> = http_filters
+                        .iter()
+                        .map(|f| f.method.to_string())
+                        .collect();
+                    Some((host.clone(), methods))
+                }
+                // CIDR rules are out of scope; non-Http levels would
+                // also be out of scope but the cargo preset emits Http
+                // exclusively (asserted by `expand_cargo_matches_spec`
+                // above) so this branch is unreachable in practice.
+                _ => None,
             })
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
             .collect();
-        preset_hosts.sort();
 
-        let mut expected = fixture_hosts.clone();
-        expected.sort();
-
-        assert_eq!(
-            preset_hosts, expected,
-            "`cargo` preset host list drifted from frozen fixture.\n\
-             fixture hosts:\n  {expected:?}\n\
-             preset hosts:\n  {preset_hosts:?}\n\
-             If this change is intentional, update \
-             `tests/fixtures/cargo_fetch_trace.json` in the same commit \
-             and document the rationale."
-        );
+        // Single equality check first so the failure surface is the
+        // whole map — easier to read at a glance than a per-host loop
+        // when the preset adds or drops a host.
+        if preset_methods != fixture_methods {
+            // Build a per-host diff that names exactly which hosts'
+            // method sets drifted. Engineers fixing the test can then
+            // decide: update the preset (cargo really does use POST
+            // now) or update the fixture (re-capture the trace).
+            let mut diffs: Vec<String> = Vec::new();
+            let all_hosts: BTreeSet<&String> = preset_methods
+                .keys()
+                .chain(fixture_methods.keys())
+                .collect();
+            for host in all_hosts {
+                match (preset_methods.get(host), fixture_methods.get(host)) {
+                    (Some(p), Some(f)) if p != f => {
+                        diffs.push(format!(
+                            "  host {host:?}: preset {p:?} != fixture {f:?}"
+                        ));
+                    }
+                    (Some(p), None) => {
+                        diffs.push(format!(
+                            "  host {host:?}: preset has {p:?} but fixture has no entry"
+                        ));
+                    }
+                    (None, Some(f)) => {
+                        diffs.push(format!(
+                            "  host {host:?}: fixture has {f:?} but preset emits no rule"
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            panic!(
+                "`cargo` preset drifted from frozen fixture (per-host method posture).\n\
+                 Drift:\n{}\n\
+                 If this change is intentional, update \
+                 `tests/fixtures/cargo_fetch_trace.json` in the same commit \
+                 and document the rationale in the fixture's `_comment` block.\n\
+                 See the test's docstring for the per-host method invariant.",
+                diffs.join("\n")
+            );
+        }
     }
 
     /// DNS-rotation resilience (todo #40): each entry in
