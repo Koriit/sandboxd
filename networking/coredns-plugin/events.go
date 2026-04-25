@@ -99,6 +99,37 @@ func (w *EventWriter) EmitQueryDenied(query, qtype, reason, clientIP string) err
 	return w.writeEvent(&evt)
 }
 
+// dnsGateEvent records the outcome of one synchronous DNS-policy
+// gate round-trip (M10-S10 Phase 2). Outcome is one of `ok`,
+// `rejected`, `timed_out`, `protocol_error`, `unknown`.
+type dnsGateEvent struct {
+	Timestamp     string `json:"timestamp"`
+	Layer         string `json:"layer"`
+	Event         string `json:"event"`
+	Query         string `json:"query"`
+	Outcome       string `json:"outcome"`
+	CorrelationID string `json:"correlation_id,omitempty"`
+	Reason        string `json:"reason,omitempty"`
+	ElapsedMS     uint64 `json:"elapsed_ms,omitempty"`
+}
+
+// EmitGateOutcome writes a `dns_gate_*` JSONL line. The event name
+// itself is `dns_gate_<outcome>` so existing event-name filters can
+// pin a single outcome class without splitting on the inner field.
+func (w *EventWriter) EmitGateOutcome(query, outcome, correlationID, reason string, elapsedMS uint64) error {
+	evt := dnsGateEvent{
+		Timestamp:     timestampNow(),
+		Layer:         "dns",
+		Event:         "dns_gate_" + outcome,
+		Query:         query,
+		Outcome:       outcome,
+		CorrelationID: correlationID,
+		Reason:        reason,
+		ElapsedMS:     elapsedMS,
+	}
+	return w.writeEvent(&evt)
+}
+
 // Close releases the underlying file handle. Safe to call on a nil receiver
 // so setup/shutdown paths don't need to branch.
 func (w *EventWriter) Close() error {

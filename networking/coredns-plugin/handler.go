@@ -26,6 +26,17 @@ type SandboxPolicy struct {
 	// query-deny decision. Structured output is additive — the existing
 	// log.Infof lines stay for human debugging.
 	events *EventWriter
+	// gateSocketPath is the path to the per-session synchronous DNS
+	// gate UDS bound by sandboxd. Empty means the gate is disabled
+	// (legacy / fail-open path used by daemons that haven't enabled
+	// M10-S10 Phase 2 yet).
+	gateSocketPath string
+	// gateDeadline overrides the wall-clock deadline applied to each
+	// gate round-trip. Zero means use the package default
+	// (defaultGateDeadline).
+	gateDeadline time.Duration
+	// gate is the lazy-initialised client used by responseInterceptor.
+	gate *gateClient
 }
 
 // Name implements the plugin.Handler interface.
@@ -130,6 +141,15 @@ type responseInterceptor struct {
 
 // WriteMsg intercepts the response to strip AAAA and ECH records, then records
 // domain→IP mappings for the report.
+//
+// M10-S10 Phase 2: when the gate client is configured, this method
+// emits a `propagate_and_ack` request to sandboxd with the resolved
+// IPs and blocks on the daemon's ack until success or deadline. On
+// success / noop the answer is released to the client; on rejection
+// the answer is still released (fail-open per spec) so a transient
+// daemon issue does not punch a hole in DNS resolution. Every
+// outcome is reported via the structured-events sink so operators can
+// detect regressions.
 func (ri *responseInterceptor) WriteMsg(msg *dns.Msg) error {
 	if msg == nil {
 		return ri.ResponseWriter.WriteMsg(msg)
@@ -152,5 +172,95 @@ func (ri *responseInterceptor) WriteMsg(msg *dns.Msg) error {
 	// Record the resolution for the IP report file.
 	ri.plugin.reporter.RecordResponse(ri.domain, msg)
 
+	// Synchronous gate (M10-S10 Phase 2). Only A-record responses
+	// with at least one resolved IP need gating: AAAA responses are
+	// stripped above (no IPs to admit), and an empty-answer A
+	// response carries nothing for sandboxd to propagate.
+	if ri.qtype == dns.TypeA && len(ri.resolvedIPs) > 0 && ri.plugin.gate != nil && !ri.plugin.gate.disabled() {
+		ttl := ttlFromMsg(msg)
+		req := &gateRequest{
+			Domain:     ri.domain,
+			QType:      "A",
+			IPs:        ri.resolvedIPs,
+			TTLSeconds: ttl,
+		}
+		// Bound the entire gate round-trip by the configured
+		// wall-clock deadline; the gate client also enforces a
+		// connection-level deadline via SetDeadline.
+		ctx, cancel := context.WithTimeout(context.Background(), ri.plugin.gateDeadlineOrDefault())
+		outcome, ack := ri.plugin.gate.Submit(ctx, req)
+		cancel()
+
+		ri.plugin.emitGateOutcome(ri.domain, outcome, ack)
+
+		// Fail-open posture: regardless of outcome, the answer is
+		// released to the VM. The structured event makes the
+		// degraded-mode visible to operators without dropping
+		// queries.
+		_ = outcome
+	}
+
 	return ri.ResponseWriter.WriteMsg(msg)
+}
+
+// ttlFromMsg returns the smallest TTL across the answer section, or
+// 0 if no A records are present. The gate uses this to align the
+// daemon-side cache window with the client-visible TTL.
+func ttlFromMsg(msg *dns.Msg) uint32 {
+	var minTTL uint32
+	for _, rr := range msg.Answer {
+		if a, ok := rr.(*dns.A); ok {
+			t := a.Hdr.Ttl
+			if minTTL == 0 || t < minTTL {
+				minTTL = t
+			}
+		}
+	}
+	return minTTL
+}
+
+// gateDeadlineOrDefault returns the configured gate deadline, falling
+// back to the package default when no override was set.
+func (sp *SandboxPolicy) gateDeadlineOrDefault() time.Duration {
+	if sp.gateDeadline > 0 {
+		return sp.gateDeadline
+	}
+	return defaultGateDeadline
+}
+
+// emitGateOutcome writes a structured event and a log line for one
+// gate round-trip. Best-effort: a write failure on the events file is
+// logged but not propagated.
+func (sp *SandboxPolicy) emitGateOutcome(domain string, outcome gateOutcome, ack *gateAck) {
+	corr := ""
+	reason := ""
+	elapsed := uint64(0)
+	if ack != nil {
+		corr = ack.CorrelationID
+		reason = ack.Reason
+		elapsed = ack.ElapsedMS
+		if reason == "" && ack.Message != "" {
+			reason = ack.Message
+		}
+	}
+
+	switch outcome {
+	case gateOutcomeOK:
+		log.Debugf("gate %s -> ok (cid=%s elapsed_ms=%d)", domain, corr, elapsed)
+	case gateOutcomeRejected:
+		log.Warningf("gate %s -> rejected (cid=%s reason=%q)", domain, corr, reason)
+	case gateOutcomeTimedOut:
+		log.Warningf("gate %s -> timed out (cid=%s reason=%q) — failing OPEN", domain, corr, reason)
+	case gateOutcomeProtocolError:
+		log.Warningf("gate %s -> protocol error (cid=%s reason=%q) — failing OPEN", domain, corr, reason)
+	default:
+		log.Warningf("gate %s -> unknown (cid=%s reason=%q) — failing OPEN", domain, corr, reason)
+	}
+
+	if sp.events == nil {
+		return
+	}
+	if err := sp.events.EmitGateOutcome(domain, outcome.String(), corr, reason, elapsed); err != nil {
+		log.Warningf("events write failed: %v", err)
+	}
 }

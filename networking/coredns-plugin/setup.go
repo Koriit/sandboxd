@@ -31,6 +31,14 @@ func setup(c *caddy.Controller) error {
 		sp.events = ew
 	}
 
+	// Initialise the synchronous DNS-gate client if a socket path was
+	// configured. The dial itself is lazy (per request), so we don't
+	// block plugin setup on sandboxd binding the listener — but the
+	// path being set turns on gate behaviour on every WriteMsg.
+	if sp.gateSocketPath != "" {
+		sp.gate = newGateClient(sp.gateSocketPath, sp.gateDeadline)
+	}
+
 	// Start background policy file reload goroutine.
 	sp.policy.StartReload(sp.policyFile, sp.reloadInterval)
 
@@ -98,6 +106,27 @@ func parseConfig(c *caddy.Controller) (*SandboxPolicy, error) {
 					return nil, c.Errf("events_file requires exactly one argument")
 				}
 				sp.eventsFile = args[0]
+
+			case "gate_socket":
+				args := c.RemainingArgs()
+				if len(args) != 1 {
+					return nil, c.Errf("gate_socket requires exactly one argument (path)")
+				}
+				sp.gateSocketPath = args[0]
+
+			case "gate_deadline":
+				args := c.RemainingArgs()
+				if len(args) != 1 {
+					return nil, c.Errf("gate_deadline requires exactly one argument (duration)")
+				}
+				d, err := time.ParseDuration(args[0])
+				if err != nil {
+					return nil, c.Errf("invalid gate_deadline %q: %v", args[0], err)
+				}
+				if d <= 0 {
+					return nil, c.Errf("gate_deadline must be > 0, got %v", d)
+				}
+				sp.gateDeadline = d
 
 			default:
 				return nil, c.Errf("unknown property %q", c.Val())

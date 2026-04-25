@@ -16,16 +16,18 @@ use sandbox_core::events::session_events_host_dir;
 use sandbox_core::gateway::container_name as gateway_container_name;
 use sandbox_core::{
     ApiError, AssuranceLevel, BaseImageStatus, CaManager, CoreDnsConfig, CreateSessionRequest,
-    Destination, DnsCache, DockerExecLdsProbe, DockerHealth, EventBus, EventBusConfig, ExecRequest,
-    ExecResponse, FileDownloadRequest, FileDownloadResponse, FileUploadRequest, GatewayHealth,
-    GatewayManager, GatewayShutdownReason, GatewayStatus, GuestConnector, GuestRequest,
-    GuestResponse, HealthComponent, LdsAckOutcome, LdsStatsProbe, LimaManager, NetworkHealth,
-    NetworkManager, PersistConfig, PersistentSink, Policy, PolicyApplyStatus, PolicyCompiler,
-    PolicyDistributor, SandboxError, Session, SessionConfig, SessionDto, SessionHealth, SessionId,
-    SessionIngestor, SessionState, SessionStore, UpdatePolicyRequest, VmIpSessionMap, VmStatus,
-    attach_vm_to_bridge, detach_vm_from_bridge, generate_ca_inject_script, hash_policy,
-    mac_from_session_id, propagate_dns_changes, read_resolved_json, wait_for_lds_ack,
-    write_file_to_container,
+    DEFAULT_DEADLINE_MS as DNS_GATE_DEFAULT_DEADLINE_MS, Destination, DnsCache, DockerExecLdsProbe,
+    DockerHealth, EventBus, EventBusConfig, ExecRequest, ExecResponse, FileDownloadRequest,
+    FileDownloadResponse, FileUploadRequest, GateRequest, GateService, GateServiceOutcome,
+    GateStatus, GatewayHealth, GatewayManager, GatewayShutdownReason, GatewayStatus,
+    GuestConnector, GuestRequest, GuestResponse, HealthComponent, LdsAckOutcome, LdsStatsProbe,
+    LimaManager, NetworkHealth, NetworkInfo, NetworkManager, PersistConfig, PersistentSink, Policy,
+    PolicyApplyStatus, PolicyCompiler, PolicyDistributor, SandboxError, Session, SessionConfig,
+    SessionDto, SessionHealth, SessionId, SessionIngestor, SessionState, SessionStore,
+    UpdatePolicyRequest, VmIpSessionMap, VmStatus, attach_vm_to_bridge, bind_gate_listener,
+    detach_vm_from_bridge, generate_ca_inject_script, generate_domain_ip_rules, hash_policy,
+    mac_from_session_id, propagate_dns_changes, read_resolved_json, remove_gate_socket,
+    serve_gate_listener, wait_for_lds_ack, write_file_to_container,
 };
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
@@ -198,6 +200,19 @@ struct AppState {
     /// Handles for DNS propagation background tasks, keyed by session ID.
     /// Used to cancel the loop when a session is stopped or deleted.
     dns_loop_handles: Mutex<HashMap<SessionId, tokio::task::JoinHandle<()>>>,
+    /// Handles for the per-session synchronous DNS-gate listener tasks
+    /// (M10-S10 Phase 2). Each handle drives the UDS server bound at
+    /// `{events_host_root}/<session-id>/dns-gate.sock`, which the
+    /// gateway's CoreDNS plugin calls into to block answer delivery on
+    /// nft + Envoy LDS propagation. Aborted on stop / remove / teardown.
+    dns_gate_handles: Mutex<HashMap<SessionId, tokio::task::JoinHandle<()>>>,
+    /// Per-session DNS cache shared between the background propagation
+    /// loop and the synchronous gate handler. The loop's steady-state
+    /// reconciler and the gate's per-request UNION-merge both read
+    /// from and write to the same `DnsCache` so the two paths stay in
+    /// agreement on which IPs are currently authoritative for each
+    /// resolved domain.
+    dns_caches: Arc<Mutex<HashMap<SessionId, Arc<Mutex<DnsCache>>>>>,
     /// Active policies for sessions, keyed by session ID.
     /// Uses Arc so it can be shared with spawned DNS propagation tasks.
     session_policies: Arc<Mutex<HashMap<SessionId, Policy>>>,
@@ -1357,6 +1372,14 @@ async fn stop_session(
     // Cancel DNS propagation loop before tearing down networking.
     cancel_dns_propagation_loop(&session.id, &state).await;
 
+    // Cancel the synchronous DNS-gate listener (M10-S10 Phase 2)
+    // before the container disappears: the UDS file lives inside the
+    // events host directory `stop_gateway` is about to remove, and we
+    // want the listener task to exit cleanly rather than spin on
+    // `accept` against a vanished socket.
+    cancel_dns_gate_listener(&session.id, &state).await;
+    drop_dns_cache(&state, &session.id).await;
+
     // Publish `gateway_shutdown` before the container is actually
     // stopped so downstream subscribers see the intent even if the
     // Docker `stop` call hangs or races with a crash.  The session's
@@ -1461,8 +1484,12 @@ async fn remove_session(
     // Mark as stopping so the gateway monitor skips this session.
     state.sessions_stopping.lock().await.insert(session.id);
 
-    // Cancel DNS propagation loop before teardown.
+    // Cancel DNS propagation loop and synchronous DNS-gate listener
+    // before teardown — see the matching block in `stop_session` for
+    // why both must come down before `stop_gateway`.
     cancel_dns_propagation_loop(&session.id, &state).await;
+    cancel_dns_gate_listener(&session.id, &state).await;
+    drop_dns_cache(&state, &session.id).await;
 
     // Publish `gateway_shutdown` before the container is stopped, but
     // only if the session was actually running a gateway (a stopped
@@ -2216,6 +2243,315 @@ async fn cancel_dns_propagation_loop(session_id: &SessionId, state: &AppState) {
     policies.remove(session_id);
 }
 
+/// Look up (or lazily create) the per-session shared `DnsCache`.
+///
+/// Both the DNS propagation loop and the synchronous DNS-gate handler
+/// observe the same cache so cache writes from one path are visible to
+/// the other. The loop's `read_resolved_json`-driven update merges in
+/// CoreDNS's view; the gate's `propagate_and_ack` merges in the
+/// plugin-supplied IPs UNION-style for the current TTL window.
+async fn shared_dns_cache(state: &AppState, session_id: &SessionId) -> Arc<Mutex<DnsCache>> {
+    let mut guard = state.dns_caches.lock().await;
+    guard
+        .entry(*session_id)
+        .or_insert_with(|| Arc::new(Mutex::new(DnsCache::new())))
+        .clone()
+}
+
+/// Drop the per-session shared `DnsCache`, called from teardown so the
+/// next session reuse starts from an empty cache. Safe to call when no
+/// cache was ever installed.
+async fn drop_dns_cache(state: &AppState, session_id: &SessionId) {
+    let mut guard = state.dns_caches.lock().await;
+    guard.remove(session_id);
+}
+
+/// Start the per-session synchronous DNS-gate listener.
+///
+/// Binds the UDS at `{events_host_root}/<session-id>/dns-gate.sock`
+/// (which the gateway container has bind-mounted at
+/// `/var/log/gateway/events/dns-gate.sock`) and serves
+/// `propagate_and_ack` requests from the CoreDNS plugin. Each request
+/// triggers `generate_domain_ip_rules` + `inject_nftables_ruleset_public`
+/// and a `wait_for_lds_ack` round-trip before the listener returns
+/// `success` to the plugin.
+///
+/// Idempotent: if a handle already exists for this session it is
+/// aborted and replaced. Safe to call before the gateway is up
+/// (the events host directory is created by `create_gateway` itself, so
+/// this should run after `create_gateway` returns).
+async fn start_dns_gate_listener(session_id: &SessionId, state: &AppState) {
+    // Cancel any prior listener for this session before re-binding.
+    {
+        let mut handles = state.dns_gate_handles.lock().await;
+        if let Some(handle) = handles.remove(session_id) {
+            handle.abort();
+            debug!(
+                session_id = %session_id,
+                "cancelled existing DNS-gate listener for restart"
+            );
+        }
+    }
+
+    let network_info = match state.store.get_network_info(session_id) {
+        Ok(Some(info)) => info,
+        Ok(None) => {
+            warn!(
+                session_id = %session_id,
+                "cannot start DNS-gate listener: no network info"
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "cannot start DNS-gate listener: failed to read network info"
+            );
+            return;
+        }
+    };
+
+    let (listener, path) = match bind_gate_listener(session_id) {
+        Ok(pair) => pair,
+        Err(e) => {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "failed to bind DNS-gate listener UDS; \
+                 synchronous DNS gating disabled for this session"
+            );
+            return;
+        }
+    };
+
+    info!(
+        session_id = %session_id,
+        socket = %path.display(),
+        "DNS-gate listener bound"
+    );
+
+    let cache = shared_dns_cache(state, session_id).await;
+    let service = Arc::new(DaemonGateService {
+        session_id: *session_id,
+        gateway: Arc::clone(&state.gateway),
+        session_policies: Arc::clone(&state.session_policies),
+        dns_cache: cache,
+        network_info,
+    });
+
+    let handle = tokio::spawn(async move {
+        serve_gate_listener(listener, service, DNS_GATE_DEFAULT_DEADLINE_MS * 4).await
+    });
+
+    let mut handles = state.dns_gate_handles.lock().await;
+    handles.insert(*session_id, handle);
+}
+
+/// Cancel the per-session DNS-gate listener and remove its socket file.
+///
+/// Called from session stop / remove and from networking teardown.
+async fn cancel_dns_gate_listener(session_id: &SessionId, state: &AppState) {
+    let mut handles = state.dns_gate_handles.lock().await;
+    if let Some(handle) = handles.remove(session_id) {
+        handle.abort();
+        debug!(
+            session_id = %session_id,
+            "cancelled DNS-gate listener"
+        );
+    }
+    // Best-effort socket cleanup. If the events host dir is also being
+    // removed by `stop_gateway`, the socket inode is reclaimed via the
+    // parent removal; this call is the safe no-op fallback.
+    remove_gate_socket(session_id);
+}
+
+/// Production [`GateService`] implementation wired to the live
+/// `GatewayManager`, the in-memory `session_policies` map, and the
+/// per-session [`DnsCache`].
+///
+/// On a `propagate_and_ack` request the service:
+/// 1. Looks up the current policy (returns `unknown_session` when none).
+/// 2. Merges the plugin-supplied IPs into the shared cache for the
+///    current TTL window (UNION semantics — tolerates short-window
+///    rotation per spec).
+/// 3. Captures Envoy's pre-rewrite LDS counter triple via
+///    [`DockerExecLdsProbe`].
+/// 4. Short-circuits to `Noop` when the policy has no domain rules
+///    (empty ruleset preview from [`generate_domain_ip_rules`]).
+/// 5. Applies the policy effect via [`propagate_dns_changes`], which
+///    rewrites both the Envoy listener AND the nftables sets — the
+///    same call the steady-state DNS propagation loop makes.
+/// 6. Waits for Envoy LDS to ack the listener rewrite via
+///    [`wait_for_lds_ack`] up to the request deadline.
+///
+/// Returns:
+/// * `Ok` when the rewrite succeeded and Envoy acked.
+/// * `Noop` when the policy + cache produced an empty ruleset (nothing
+///   to inject; nft set is already empty).
+/// * `Rejected` when nft rejected the ruleset, Envoy rejected the
+///   listener, or the LDS ack timed out within the daemon-side deadline.
+struct DaemonGateService {
+    session_id: SessionId,
+    gateway: Arc<GatewayManager>,
+    session_policies: Arc<Mutex<HashMap<SessionId, Policy>>>,
+    dns_cache: Arc<Mutex<DnsCache>>,
+    network_info: NetworkInfo,
+}
+
+impl GateService for DaemonGateService {
+    async fn service(&self, req: &GateRequest) -> GateServiceOutcome {
+        // (1) Policy lookup.
+        let policy = {
+            let policies = self.session_policies.lock().await;
+            match policies.get(&self.session_id) {
+                Some(p) => p.clone(),
+                None => {
+                    return GateServiceOutcome {
+                        status: GateStatus::UnknownSession,
+                        reason: Some("no active policy for session".to_string()),
+                    };
+                }
+            }
+        };
+
+        // (2) Merge plugin-supplied IPs into the shared cache. We
+        // splice the (domain, ip, ttl) triple from the request into a
+        // synthetic `ResolvedReport` so we go through the cache's
+        // existing `update` path, which preserves the UNION-merge +
+        // expiry semantics the steady-state propagation loop relies
+        // on. Records a single mapping per request. `qtype` is
+        // informational on the wire and not stored in the cache.
+        {
+            use sandbox_core::{ResolvedMapping, ResolvedReport};
+            // RFC 3339 timestamp of "now" for the synthetic report.
+            // The cache only uses this to seed `resolved_at` on entry
+            // creation, so monotonic-clock-derived staleness is what
+            // matters; this string is for the producer side of the
+            // schema only.
+            let timestamp = chrono::Utc::now().to_rfc3339();
+            let report = ResolvedReport {
+                mappings: vec![ResolvedMapping {
+                    domain: req.domain.clone(),
+                    ips: req.ips.clone(),
+                    ttl: req.ttl_seconds,
+                    timestamp,
+                }],
+            };
+            let mut cache = self.dns_cache.lock().await;
+            let _changes = cache.update(&report);
+        }
+
+        // (3) Pre-snapshot Envoy LDS counters before the rewrite.
+        let probe = DockerExecLdsProbe::new(&self.session_id);
+        let pre_counters = match probe.fetch_counters().await {
+            Ok(c) => Some(c),
+            Err(e) => {
+                debug!(
+                    session_id = %self.session_id,
+                    error = %e,
+                    "DNS-gate: pre-rewrite LDS stats fetch failed; \
+                     ack-wait will be skipped (no snapshot)"
+                );
+                None
+            }
+        };
+
+        // (4) Pre-flight: short-circuit when the rendered ruleset is
+        // empty. This matches the DNS propagation loop's behaviour and
+        // saves the caller a redundant `noop` round-trip when the
+        // policy has no domain rules.
+        let ruleset_preview = {
+            let cache = self.dns_cache.lock().await;
+            generate_domain_ip_rules(&policy, &cache, &self.network_info)
+        };
+        if ruleset_preview.is_empty() {
+            return GateServiceOutcome {
+                status: GateStatus::Noop,
+                reason: None,
+            };
+        }
+
+        // (5) Apply the policy effect: rewrites BOTH the Envoy
+        // listener (for L3 matching of the freshly resolved IPs) AND
+        // the nftables `sandbox_dnat` / `sandbox_policy` set elements
+        // (for kernel-level admit). This is the same call the
+        // background DNS propagation loop makes, so the gate path
+        // and the steady-state path produce identical on-disk /
+        // in-kernel state — Envoy's filesystem-LDS watcher gets the
+        // `MovedTo` event from this call, which is what
+        // `wait_for_lds_ack` is waiting on.
+        let gw = Arc::clone(&self.gateway);
+        let sid = self.session_id;
+        let cache_snapshot = {
+            let cache = self.dns_cache.lock().await;
+            cache.clone()
+        };
+        let policy_clone = policy.clone();
+        let ni = self.network_info.clone();
+        let propagate_outcome = tokio::task::spawn_blocking(move || {
+            propagate_dns_changes(&sid, &policy_clone, &cache_snapshot, &gw, &ni)
+        })
+        .await;
+
+        match propagate_outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                return GateServiceOutcome {
+                    status: GateStatus::Rejected,
+                    reason: Some(format!("propagate failed: {e}")),
+                };
+            }
+            Err(e) => {
+                return GateServiceOutcome {
+                    status: GateStatus::Rejected,
+                    reason: Some(format!("propagate task join error: {e}")),
+                };
+            }
+        }
+
+        // (6) Wait for Envoy LDS to ack the new listener generation.
+        // The plugin's deadline is the wall-clock budget for this
+        // entire round-trip; the listener wraps our future in a
+        // tokio::time::timeout already, so we pick a slightly lower
+        // ack deadline to give the inject above some headroom. Floor
+        // at 100ms so very tight plugin deadlines still wait at all.
+        let plugin_deadline = Duration::from_millis(req.deadline_ms.max(1));
+        let ack_deadline = plugin_deadline
+            .saturating_sub(Duration::from_millis(150))
+            .max(Duration::from_millis(100));
+        let lds_poll = Duration::from_millis(50);
+
+        if let Some(pre) = pre_counters {
+            match wait_for_lds_ack(&probe, pre, ack_deadline, lds_poll).await {
+                LdsAckOutcome::Accepted => GateServiceOutcome {
+                    status: GateStatus::Ok,
+                    reason: None,
+                },
+                LdsAckOutcome::Rejected => GateServiceOutcome {
+                    status: GateStatus::Rejected,
+                    reason: Some("envoy rejected rewritten listener".to_string()),
+                },
+                LdsAckOutcome::TimedOut => GateServiceOutcome {
+                    status: GateStatus::Rejected,
+                    reason: Some(format!(
+                        "envoy LDS ack timed out after {} ms",
+                        ack_deadline.as_millis()
+                    )),
+                },
+            }
+        } else {
+            // No pre-snapshot — fall back to "rewrite succeeded"
+            // semantics (mirrors the propagation loop's behaviour
+            // when the probe is briefly unavailable).
+            GateServiceOutcome {
+                status: GateStatus::Ok,
+                reason: None,
+            }
+        }
+    }
+}
+
 /// Background DNS propagation loop for a single session.
 ///
 /// Periodically reads resolved.json from the gateway container, updates
@@ -2786,12 +3122,33 @@ async fn setup_session_networking(
     // skipped (they were not attributable to a live subscriber anyway).
     spawn_session_ingestor(session_id, state).await;
 
+    // Persist network info before the gate listener starts so the
+    // listener's `get_network_info` lookup finds it. The listener's
+    // lookup is a hard requirement: `generate_domain_ip_rules` needs
+    // the VM subnet + gateway IP to render the two-table ruleset. The
+    // call below was historically the last step (#4) of this function
+    // — hoisting it above the gate-listener spawn keeps it safe (the
+    // VM hasn't joined the bridge yet, so write order doesn't matter
+    // to traffic correctness) while ensuring the listener can come
+    // up.
+    state.store.set_network_info(session_id, network_info)?;
+
+    // Start the synchronous DNS-gate UDS listener (M10-S10 Phase 2).
+    // The events host directory was created by `create_gateway` and is
+    // bind-mounted into the container at `/var/log/gateway/events/`,
+    // so the socket file appears at the canonical container path
+    // without any extra mount. Started after `set_network_info` so the
+    // listener can resolve subnet/gateway-IP for ruleset generation.
+    start_dns_gate_listener(session_id, state).await;
+
     // 2. Configure the bridge NIC inside the VM (already present from boot).
     if let Err(e) = attach_vm_to_bridge(session_id, network_info, &state.guest).await {
         // Roll back gateway on attach failure. Abort the ingestor first
         // so it releases its inotify watch on the events directory; the
         // container is about to go away and no further events are
-        // attributable to this session.
+        // attributable to this session. Cancel the DNS-gate listener
+        // too so its UDS goes away with the container's bind mount.
+        cancel_dns_gate_listener(session_id, state).await;
         abort_session_ingestor(session_id, state).await;
         let gw = state.gateway.clone();
         let sid = *session_id;
@@ -2802,8 +3159,9 @@ async fn setup_session_networking(
     // 3. Inject CA certificate into VM trust store via guest agent.
     inject_ca_into_vm(&state.guest, session_id, ca_dir).await?;
 
-    // 4. Store network info in DB.
-    state.store.set_network_info(session_id, network_info)?;
+    // 4. Network info was already persisted earlier (before the gate
+    //    listener spawn) so the listener could read it; nothing more
+    //    to do here.
 
     Ok(())
 }
@@ -3027,6 +3385,13 @@ async fn teardown_session_networking_parts(
 /// underlying `_parts` helper so it can be exercised without
 /// constructing a full [`AppState`].
 async fn teardown_session_networking(session_id: &SessionId, state: &AppState) {
+    // Cancel the synchronous DNS-gate listener (M10-S10 Phase 2) and
+    // drop the per-session DnsCache before the events host directory
+    // disappears with the gateway container. Cheap no-ops when no
+    // listener was ever spawned (e.g., the session never reached
+    // `setup_session_networking`).
+    cancel_dns_gate_listener(session_id, state).await;
+    drop_dns_cache(state, session_id).await;
     teardown_session_networking_parts(session_id, &state.gateway, &state.network, &state.ingestors)
         .await;
 }
@@ -3217,6 +3582,12 @@ async fn restore_session_networking(
     // restored gateway are attributed.
     spawn_session_ingestor(session_id, state).await;
 
+    // Restart the synchronous DNS-gate UDS listener on a freshly
+    // bind-mounted socket inode. Network info is already in the DB
+    // (we read it at the top of this function), so the listener can
+    // resolve subnet/gateway-IP for ruleset generation.
+    start_dns_gate_listener(session_id, state).await;
+
     // 2b. Re-apply the session's policy to the fresh gateway container.
     // If a policy is stored, compile and distribute it to the running
     // gateway.  If no policy is stored, the allow-all was already written
@@ -3228,6 +3599,7 @@ async fn restore_session_networking(
         // Roll back gateway and Docker network on attach failure. Abort
         // the ingestor first so its inotify watch is released before
         // the events directory is left without a producer.
+        cancel_dns_gate_listener(session_id, state).await;
         abort_session_ingestor(session_id, state).await;
         let gw = state.gateway.clone();
         let net = state.network.clone();
@@ -4328,6 +4700,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         network,
         gateway,
         dns_loop_handles: Mutex::new(HashMap::new()),
+        dns_gate_handles: Mutex::new(HashMap::new()),
+        dns_caches: Arc::new(Mutex::new(HashMap::new())),
         session_policies: Arc::new(Mutex::new(hydrated_policies)),
         sessions_stopping: Mutex::new(HashSet::new()),
         base_image_lock: Mutex::new(()),

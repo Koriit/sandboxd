@@ -1,6 +1,7 @@
 pub mod api;
 pub mod atomic_listener_writer;
 pub mod ca;
+pub mod dns_gate;
 pub mod dns_propagation;
 pub mod error;
 pub mod events;
@@ -32,6 +33,12 @@ pub use atomic_listener_writer::{
     session_listener_host_path,
 };
 pub use ca::{CaManager, generate_ca_inject_script};
+pub use dns_gate::{
+    DEFAULT_DEADLINE_MS, DNS_GATE_SOCKET_FILENAME, DNS_GATE_SOCKET_IN_CONTAINER,
+    GATE_PROTOCOL_VERSION, GateAck, GateAckKind, GateError, GateErrorCode, GateErrorKind,
+    GateRequest, GateRequestKind, GateService, GateServiceOutcome, GateStatus, bind_gate_listener,
+    dns_gate_socket_host_path, log_serviced, remove_gate_socket, send_request, serve_gate_listener,
+};
 pub use dns_propagation::{
     DnsCache, DnsCacheEntry, DnsChange, DnsChangeType, ResolvedMapping, ResolvedReport,
     generate_domain_ip_rules, propagate_dns_changes, read_resolved_json,

@@ -18,6 +18,13 @@
         policy_file /etc/coredns/policy.conf
         report_file /etc/coredns/resolved.json
         events_file /var/log/gateway/events/coredns.jsonl
+        # M10-S10 Phase 2: synchronous DNS-policy gate. The plugin
+        # blocks each A-record response on a per-session UDS until
+        # sandboxd has injected the resolved IPs into nft and Envoy
+        # has acked the matching listener generation. Fail-open on
+        # deadline (default 1500ms) so a stuck daemon never punches
+        # a hole in DNS resolution.
+        gate_socket /var/log/gateway/events/dns-gate.sock
         reload 1s
     }
     # Forward to Docker's embedded DNS at 127.0.0.11. This sidesteps
