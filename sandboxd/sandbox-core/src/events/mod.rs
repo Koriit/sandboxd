@@ -42,10 +42,12 @@ pub use vm_ip_map::VmIpSessionMap;
 /// (Envoy access log, CoreDNS plugin, mitmproxy addon) can write structured
 /// events that sandboxd's ingest layer tails via `inotify`.
 ///
-/// Using `/tmp` mirrors [`crate::atomic_listener_writer::LISTENER_HOST_ROOT`]:
-/// short path (Docker on some platforms limits bind-mount path length),
-/// non-persistent across host reboots (sessions are ephemeral anyway),
-/// colocated with the session's other transient state.
+/// Using `/tmp` keeps the path short (Docker on some platforms limits
+/// bind-mount path length), non-persistent across host reboots (sessions
+/// are ephemeral anyway), and colocated with the session's other transient
+/// state. Note the listener directory uses an XDG-aware resolver
+/// ([`crate::atomic_listener_writer::listener_host_root`]); the events
+/// directory has not been migrated yet — see todo backlog.
 pub const EVENTS_HOST_ROOT: &str = "/tmp/sandboxd-events";
 
 /// Directory inside the gateway container where the three JSONL producers

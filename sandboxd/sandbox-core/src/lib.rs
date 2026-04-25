@@ -27,7 +27,7 @@ pub use api::{
     SessionConfigDto, SessionDto, SessionHealth, UpdatePolicyRequest, event_to_jsonl_line,
 };
 pub use atomic_listener_writer::{
-    AtomicListenerWriter, LISTENER_HOST_ROOT, ListenerWriteError, session_listener_host_dir,
+    AtomicListenerWriter, ListenerWriteError, listener_host_root, session_listener_host_dir,
     session_listener_host_path,
 };
 pub use ca::{CaManager, generate_ca_inject_script};

@@ -1807,7 +1807,30 @@ async fn clear_session_policy(
         rules: Vec::new(),
     };
     let compiled = PolicyCompiler::compile(&empty_policy, &network_info)?;
-    PolicyDistributor::distribute(session_id, &compiled, &state.gateway)?;
+
+    // `PolicyDistributor::distribute` shells out via `docker exec` and
+    // performs `fs::rename` for the listener file, so it must not run on
+    // the Tokio runtime thread (CLAUDE.md: blocking work in async handlers
+    // is wrapped in `spawn_blocking`). `state.gateway` is
+    // `Arc<GatewayManager>` so cloning is cheap; `compiled` is moved into
+    // the closure since it has no further use on this path.
+    {
+        let gw = state.gateway.clone();
+        let sid = *session_id;
+        match tokio::task::spawn_blocking(move || {
+            PolicyDistributor::distribute(&sid, &compiled, &gw)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => {
+                return Err(SandboxError::Internal(format!(
+                    "task join error distributing policy: {e}"
+                )));
+            }
+        }
+    }
 
     // Propagation tracking for the empty-policy case.
     //
@@ -1966,8 +1989,30 @@ async fn apply_policy_inner(
     // Compile the policy.
     let compiled = PolicyCompiler::compile(policy, &network_info)?;
 
-    // Distribute to gateway components.
-    PolicyDistributor::distribute(session_id, &compiled, &state.gateway)?;
+    // Distribute to gateway components. `PolicyDistributor::distribute`
+    // shells out via `docker exec` and performs `fs::rename` for the
+    // listener file, so it must not run on the Tokio runtime thread
+    // (CLAUDE.md: blocking work in async handlers is wrapped in
+    // `spawn_blocking`). `state.gateway` is `Arc<GatewayManager>` so
+    // cloning is cheap; `compiled` is moved into the closure since it
+    // has no further use on this path.
+    {
+        let gw = state.gateway.clone();
+        let sid = *session_id;
+        match tokio::task::spawn_blocking(move || {
+            PolicyDistributor::distribute(&sid, &compiled, &gw)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => {
+                return Err(SandboxError::Internal(format!(
+                    "task join error distributing policy: {e}"
+                )));
+            }
+        }
+    }
 
     // Record the applied hash for the propagation tracker (M10-S6).
     // Done immediately after the distributor succeeds so the DNS loop's

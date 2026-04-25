@@ -337,7 +337,10 @@ M9-S18/S19 adopted option (a) below; option (b) is kept for historical
 context:
 
 (a) **[Shipped.]** A per-session host directory
-    (`/tmp/sandboxd-listeners/<session-id>/`) is bind-mounted into the
+    (`$XDG_RUNTIME_DIR/sandboxd/listeners/<session-id>/`, with
+    `~/.local/share/sandboxd/listeners/<session-id>/` fallback when XDG
+    is unset, and a `SANDBOX_LISTENER_DIR` env override; see
+    [`listener_host_root`] for the resolver) is bind-mounted into the
     gateway container at `/etc/envoy/listeners/`. sandboxd writes the
     listener file from the host via tempfile + `fs::rename` on the same
     filesystem, producing the `MovedTo` event Envoy requires. The
