@@ -328,6 +328,94 @@ fn integration_validator_nft_check() {
     );
 }
 
+/// `nft -c -f -` accepts the bare `PolicyCompiler::compile` nftables
+/// output (no DNS-join overlay).
+///
+/// Complements [`integration_validator_nft_check`]: that test validates
+/// the post-DNS-join shape (`compile_nftables` + `generate_domain_ip_rules`
+/// concatenated), which is what lands at policy-distribution +
+/// DNS-propagation-loop time. This test instead pins the *day-one*
+/// compile output — what `PolicyDistributor::distribute` injects on the
+/// first apply, before the DNS resolver has populated the cache.
+///
+/// Catches the `ct original tcp dport`-class regression: a typo in the
+/// nftables emitter that produces syntactically invalid rules but still
+/// passes the unit-test `.contains()` assertions (those use substring
+/// matches, not parser-validated checks). The kernel parser is the only
+/// authoritative arbiter of nftables syntax.
+///
+/// Skips the DNS-join concat-set element shape on purpose so a future
+/// regression in `compile_nftables` itself surfaces here rather than
+/// being masked by a bug-correcting DNS-join overlay. Uses a fixture
+/// with at least one CIDR rule so `compile_nftables` actually emits
+/// the full two-table ruleset (domain-only policies short-circuit to
+/// empty output, deferring rule generation to the DNS-propagation loop).
+#[test]
+fn integration_compile_nftables_passes_nft_c() {
+    let policy = Policy {
+        version: SCHEMA_VERSION.to_string(),
+        rules: vec![
+            // CIDR rule — populates `policy_allow_tcp` so compile_nftables
+            // emits the full sandbox_dnat + sandbox_policy ruleset rather
+            // than the empty-output domain-only short-circuit.
+            PolicyRule {
+                host: Destination::Cidr("140.82.112.0/20".to_string()),
+                port: 443,
+                protocol: Protocol::Tcp,
+                reason: Some("L1 CIDR — exercises compile_nftables emitters".to_string()),
+                level: AssuranceLevel::Transport,
+            },
+            // UDP CIDR — populates `policy_allow_udp` so the UDP set is
+            // also non-empty (catches a regression in only one of the
+            // two protocol paths).
+            PolicyRule {
+                host: Destination::Cidr("8.8.8.0/24".to_string()),
+                port: 53,
+                protocol: Protocol::Udp,
+                reason: Some("UDP CIDR — exercises policy_allow_udp set".to_string()),
+                level: AssuranceLevel::Transport,
+            },
+        ],
+    };
+    let network_info = test_network_info();
+
+    let compiled = PolicyCompiler::compile(&policy, &network_info)
+        .expect("fixture policy should compile cleanly");
+
+    // Sanity: the bare compile output must carry both tables. A regression
+    // that flipped to single-table emission would otherwise produce a
+    // half-ruleset that nft -c happens to accept (each table is
+    // independently valid syntax).
+    assert!(
+        compiled.nftables_rules.contains("table inet sandbox_dnat"),
+        "compile output should declare sandbox_dnat; got:\n{}",
+        compiled.nftables_rules
+    );
+    assert!(
+        compiled
+            .nftables_rules
+            .contains("table inet sandbox_policy"),
+        "compile output should declare sandbox_policy; got:\n{}",
+        compiled.nftables_rules
+    );
+
+    let container = TestContainer::spawn("nft-compile");
+    let output = exec_with_stdin(
+        &container.name,
+        &["nft", "-c", "-f", "-"],
+        &compiled.nftables_rules,
+    );
+
+    assert!(
+        output.status.success(),
+        "nft -c rejected PolicyCompiler::compile output:\
+         \n--- ruleset ---\n{}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        compiled.nftables_rules,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// `envoy --mode validate` accepts the compiler's bootstrap + listener
 /// YAML (including destination_port-gated filter chains).
 ///

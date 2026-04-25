@@ -20,7 +20,8 @@ use sandbox_core::gateway::{GATEWAY_IMAGE, GatewayManager, GatewayStatus, contai
 use sandbox_core::network::NetworkManager;
 use sandbox_core::session::SessionId;
 use sandbox_core::{
-    AtomicListenerWriter, EVENTS_DIR_IN_CONTAINER, PolicyCompiler, session_events_host_dir,
+    AssuranceLevel, AtomicListenerWriter, Destination, EVENTS_DIR_IN_CONTAINER, Policy,
+    PolicyCompiler, PolicyDistributor, PolicyRule, Protocol, session_events_host_dir,
     session_listener_host_path,
 };
 use std::net::Ipv4Addr;
@@ -657,5 +658,289 @@ fn integration_gateway_container_has_events_bind_mount() {
     );
 
     // ---------- Clean up the network ----------
+    net_mgr.delete_network(&session_id).unwrap();
+}
+
+/// End-to-end policy distribution through a real gateway container.
+///
+/// Compiles a non-trivial policy (CIDR-backed L1 rule + L2 domain rule
+/// + L3 domain rule) and pushes it through `PolicyDistributor::distribute`
+/// against a live gateway. Asserts the four production-side acceptance
+/// signals:
+///   1. `distribute()` returns `Ok(())` end-to-end (no
+///      silent-failure-swallowing inside any of the five steps).
+///   2. nftables: `nft list ruleset` lists both `sandbox_dnat` and
+///      `sandbox_policy` after distribute, and `nft -c` accepts the
+///      live ruleset (the in-container parser is the authoritative
+///      arbiter; if `policy_distributor.inject_nftables_ruleset_public`
+///      had silently dropped a syntax error this catches it).
+///   3. Envoy: `listener_manager.lds.update_success` increments and
+///      `listener_manager.lds.update_rejected` does not change — the
+///      newly-served listener was accepted.
+///   4. CoreDNS: `/health` still responds 200, the policy file landed
+///      with the expected non-empty body, and the daemon picked it up
+///      (post-reload, the configured allowed domain appears in the
+///      `/etc/coredns/policy.conf` file inside the container — if the
+///      `write_file_to_container` step had silently failed the
+///      distributor would have returned Err, but we additionally pin
+///      the on-disk shape so a "wrote empty file" regression surfaces).
+///
+/// Catches: nft syntax bugs in `compile_nftables`, Envoy schema drift
+/// in `compile_envoy_listener`, mitmproxy/CoreDNS file-write addon
+/// drift, and silent-failure swallowing inside any distribute step.
+/// Complements the validator-only tests in `validators.rs`: those
+/// validate the static compiler output against the validator CLIs in
+/// isolation; this one runs the full inject path and observes the
+/// running daemons' reactions.
+#[test]
+fn integration_apply_policy_through_real_gateway() {
+    // Distinct subnet to avoid collisions with the other gateway tests.
+    let net_mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 7, 0), 24).unwrap();
+    let gw_mgr = GatewayManager::new();
+    let session_id = SessionId::generate();
+
+    let network_info = net_mgr.create_network(&session_id).unwrap();
+
+    let create_result = gw_mgr.create_gateway(&session_id, &network_info, None, None);
+    if let Err(ref e) = create_result {
+        let _ = gw_mgr.stop_gateway(&session_id);
+        let _ = net_mgr.delete_network(&session_id);
+        panic!("create_gateway failed: {e}");
+    }
+
+    let gw_container = container_name(&session_id);
+
+    // Sanity: gateway must be healthy *before* distribute, otherwise an
+    // unrelated startup flake would masquerade as a distribute failure.
+    let status = gw_mgr.gateway_status(&session_id).unwrap();
+    assert_eq!(
+        status,
+        GatewayStatus::Healthy,
+        "gateway should be healthy before policy distribution"
+    );
+
+    // Helper: read an Envoy stat counter via /stats?filter=...&format=text.
+    fn envoy_stat(container: &str, stat: &str) -> u64 {
+        let url = format!("http://127.0.0.1:9901/stats?filter={stat}$&format=text");
+        let out = Command::new("docker")
+            .args(["exec", container, "curl", "-sf", &url])
+            .output()
+            .expect("curl envoy /stats should succeed");
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            if let Some((_, v)) = line.split_once(':') {
+                if let Ok(n) = v.trim().parse::<u64>() {
+                    return n;
+                }
+            }
+        }
+        0
+    }
+
+    // Snapshot Envoy LDS counters so we can detect the listener reload
+    // triggered by PolicyDistributor's atomic listener rewrite.
+    let initial_updates = envoy_stat(&gw_container, "listener_manager.lds.update_success");
+    let initial_rejections = envoy_stat(&gw_container, "listener_manager.lds.update_rejected");
+
+    // Build a non-trivial policy that exercises every distribute step:
+    //   - L1 CIDR rule -> populates nftables `policy_allow_tcp` set
+    //     (so `compiled.nftables_rules` is non-empty and step 3
+    //     actually injects)
+    //   - L2 domain rule -> populates CoreDNS allowed list
+    //   - L3 domain rule -> emits Envoy listener filter chain (with
+    //     empty DnsCache the filter chain is suppressed; we still
+    //     route through `compile` so the listener differs from the
+    //     deny-all initial)
+    let policy = Policy {
+        version: "2.0.0".to_string(),
+        rules: vec![
+            PolicyRule {
+                host: Destination::Cidr("140.82.112.0/20".to_string()),
+                level: AssuranceLevel::Transport,
+                port: 443,
+                protocol: Protocol::Tcp,
+                reason: Some("L1 CIDR — populates policy_allow_tcp".to_string()),
+            },
+            PolicyRule {
+                host: Destination::Domain("pinned.example.com".to_string()),
+                level: AssuranceLevel::Tls,
+                port: 443,
+                protocol: Protocol::Tcp,
+                reason: Some("L2 — appears in CoreDNS allowlist".to_string()),
+            },
+            PolicyRule {
+                host: Destination::Domain("monitored.example.com".to_string()),
+                level: AssuranceLevel::Http {
+                    http_filters: vec![sandbox_core::HttpFilter {
+                        method: sandbox_core::HttpMethod::Get,
+                        path: "/api/*".to_string(),
+                    }],
+                },
+                port: 443,
+                protocol: Protocol::Tcp,
+                reason: Some("L3 — emits mitmproxy rule".to_string()),
+            },
+        ],
+    };
+
+    let compiled = PolicyCompiler::compile(&policy, &network_info)
+        .expect("non-trivial policy should compile cleanly");
+
+    // Sanity: ensure compile produced non-empty nftables rules so that
+    // the distribute path actually exercises nftables injection (a
+    // domain-only policy would short-circuit step 3 to a flush-only
+    // path, weakening the test's coverage).
+    assert!(
+        !compiled.nftables_rules.is_empty(),
+        "fixture must yield non-empty nftables rules so distribute exercises injection; \
+         got empty output for policy: {policy:?}"
+    );
+
+    // ---------- Distribute end-to-end ----------
+    PolicyDistributor::distribute(&session_id, &compiled, &gw_mgr).unwrap_or_else(|e| {
+        let _ = gw_mgr.stop_gateway(&session_id);
+        let _ = net_mgr.delete_network(&session_id);
+        panic!("PolicyDistributor::distribute failed end-to-end: {e}");
+    });
+
+    // ---------- 1. nftables acceptance ----------
+    // The live ruleset must contain both managed tables. If
+    // `inject_nftables_ruleset_public` had silently dropped a syntax
+    // error, the ruleset would be in some half-state — we positively
+    // pin both tables.
+    let nft_listing = Command::new("docker")
+        .args(["exec", &gw_container, "nft", "list", "ruleset"])
+        .output()
+        .expect("nft list ruleset should succeed");
+    assert!(
+        nft_listing.status.success(),
+        "nft list ruleset failed post-distribute: stderr={}",
+        String::from_utf8_lossy(&nft_listing.stderr)
+    );
+    let live_ruleset = String::from_utf8_lossy(&nft_listing.stdout);
+    assert!(
+        live_ruleset.contains("table inet sandbox_dnat"),
+        "live ruleset must include sandbox_dnat post-distribute; got:\n{live_ruleset}"
+    );
+    assert!(
+        live_ruleset.contains("table inet sandbox_policy"),
+        "live ruleset must include sandbox_policy post-distribute; got:\n{live_ruleset}"
+    );
+
+    // Re-validate the LIVE ruleset via `nft -c -f -`. The kernel parser
+    // is the authoritative arbiter of nftables syntax; this rejects
+    // any `ct original tcp dport`-class regression in `compile_nftables`
+    // that the unit-test `.contains()` assertions would let through.
+    let nft_check = {
+        use std::io::Write;
+        let mut child = Command::new("docker")
+            .args(["exec", "-i", &gw_container, "nft", "-c", "-f", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("docker exec nft -c should spawn");
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(compiled.nftables_rules.as_bytes())
+            .expect("piping ruleset to nft -c should succeed");
+        child.wait_with_output().expect("nft -c should complete")
+    };
+    assert!(
+        nft_check.status.success(),
+        "nft -c rejected the distributed ruleset (parser syntax check):\
+         \n--- ruleset ---\n{}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        compiled.nftables_rules,
+        String::from_utf8_lossy(&nft_check.stdout),
+        String::from_utf8_lossy(&nft_check.stderr)
+    );
+
+    // ---------- 2. Envoy acceptance ----------
+    // PolicyDistributor's step 5 atomically rewrites the listener file;
+    // Envoy's filesystem LDS watcher must accept it (update_success
+    // increments; update_rejected does not). Poll up to 15s — in
+    // practice the watcher fires within ~250ms but CI is slow.
+    let mut final_updates = initial_updates;
+    let mut final_rejections = initial_rejections;
+    for _ in 0..60 {
+        final_updates = envoy_stat(&gw_container, "listener_manager.lds.update_success");
+        final_rejections = envoy_stat(&gw_container, "listener_manager.lds.update_rejected");
+        if final_rejections > initial_rejections || final_updates > initial_updates {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    assert!(
+        final_rejections == initial_rejections,
+        "Envoy rejected the distributed listener config ({initial_rejections} -> \
+         {final_rejections}). The MovedTo event reached Envoy but the listener \
+         payload was refused — check /config_dump and the Envoy log for the \
+         validation error."
+    );
+    assert!(
+        final_updates > initial_updates,
+        "Envoy LDS update_success did not increment from {initial_updates} after \
+         distribute — the atomic listener rewrite did not produce a MovedTo \
+         event Envoy could see."
+    );
+
+    // ---------- 3. CoreDNS acceptance ----------
+    // The /health endpoint must still respond 200 (the daemon stayed
+    // up). The policy file must have landed inside the container with
+    // the expected allowed domains — if `write_file_to_container` had
+    // silently no-op'd, distribute would have failed, but we pin the
+    // on-disk shape so a "wrote empty file" regression surfaces too.
+    let coredns_health = Command::new("docker")
+        .args([
+            "exec",
+            &gw_container,
+            "curl",
+            "-sf",
+            "http://127.0.0.1:8180/health",
+        ])
+        .output()
+        .expect("curl coredns /health should succeed");
+    assert!(
+        coredns_health.status.success(),
+        "CoreDNS /health failed post-distribute: stderr={}",
+        String::from_utf8_lossy(&coredns_health.stderr)
+    );
+
+    let coredns_policy = Command::new("docker")
+        .args(["exec", &gw_container, "cat", "/etc/coredns/policy.conf"])
+        .output()
+        .expect("cat coredns policy.conf should succeed");
+    assert!(
+        coredns_policy.status.success(),
+        "reading /etc/coredns/policy.conf failed post-distribute: stderr={}",
+        String::from_utf8_lossy(&coredns_policy.stderr)
+    );
+    let coredns_text = String::from_utf8_lossy(&coredns_policy.stdout);
+    assert!(
+        coredns_text.contains("pinned.example.com"),
+        "CoreDNS policy file must list the L2 allowed domain post-distribute; got:\n{coredns_text}"
+    );
+    assert!(
+        coredns_text.contains("monitored.example.com"),
+        "CoreDNS policy file must list the L3 allowed domain post-distribute; got:\n{coredns_text}"
+    );
+
+    // ---------- 4. Gateway remains healthy ----------
+    // Composite signal: Envoy + CoreDNS + mitmproxy + deny-logger all
+    // still up. Catches the case where one component crashed mid-
+    // distribute (e.g. Envoy panicked on a malformed listener) but
+    // distribute happened to return Ok because the rejection happened
+    // in the daemon, not in the Rust-side write.
+    let status = gw_mgr.gateway_status(&session_id).unwrap();
+    assert_eq!(
+        status,
+        GatewayStatus::Healthy,
+        "gateway must remain healthy after distribute"
+    );
+
+    // ---------- Clean up ----------
+    gw_mgr.stop_gateway(&session_id).unwrap();
     net_mgr.delete_network(&session_id).unwrap();
 }

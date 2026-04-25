@@ -1976,6 +1976,25 @@ mod tests {
         }
     }
 
+    /// Assert that `nft` output contains a *complete* line whose
+    /// trimmed content equals `expected`.
+    ///
+    /// Substring `.contains()` lets a `ct original tcp dport 53 accept`-
+    /// class regression pass an `nft.contains("tcp dport 53 accept")`
+    /// assertion (the right substring is still present, even though the
+    /// line is now syntactically invalid). Pinning the trimmed line
+    /// catches that — every additional token in front of `tcp dport`
+    /// would fail the equality check.
+    fn assert_nft_line(nft: &str, expected: &str) {
+        let found = nft.lines().any(|l| l.trim() == expected);
+        assert!(
+            found,
+            "nftables ruleset must contain the line `{expected}` (exact match \
+             after trim — substring matches are too loose to catch a stray \
+             prefix like `ct original`); got:\n{nft}"
+        );
+    }
+
     // -- Policy parsing from JSON --------------------------------------------
 
     #[test]
@@ -3093,13 +3112,17 @@ mod tests {
         let net = test_network_info();
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
-        assert!(
-            compiled.nftables_rules.contains("udp dport 53 accept"),
-            "nftables must allow DNS traffic to gateway"
+        // Whole-line match (post-trim) — substring `.contains()` would
+        // pass even if the rule had a stray `ct original` prefix that
+        // would crash `nft -f`. The DNS allow rules live in the
+        // `sandbox_policy.output` chain.
+        assert_nft_line(
+            &compiled.nftables_rules,
+            "ip daddr 10.209.0.2 udp dport 53 accept",
         );
-        assert!(
-            compiled.nftables_rules.contains("tcp dport 53 accept"),
-            "nftables must allow TCP DNS traffic to gateway"
+        assert_nft_line(
+            &compiled.nftables_rules,
+            "ip daddr 10.209.0.2 tcp dport 53 accept",
         );
     }
 
@@ -3109,10 +3132,12 @@ mod tests {
         let net = test_network_info();
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
-        assert!(
-            compiled.nftables_rules.contains("reject"),
-            "nftables must reject unmatched traffic"
-        );
+        // The fall-through `reject` lives as its own line at the end of
+        // `sandbox_policy.output`. Pinning the trimmed line equality
+        // (vs. the previous substring match) catches both regressions
+        // where the keyword moves into a malformed rule and where it
+        // disappears entirely.
+        assert_nft_line(&compiled.nftables_rules, "reject");
     }
 
     #[test]
@@ -3121,13 +3146,20 @@ mod tests {
         let policy = transport_policy();
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
-        assert!(
-            compiled.nftables_rules.contains(&net.subnet),
-            "nftables must reference the VM subnet"
+        // Mere substring presence of the subnet / gateway IP is too
+        // loose: a regression that emitted `ct original ip saddr 10.x`
+        // or buried the IP inside a comment would still pass. Pin
+        // specific structural rules where the subnet and gateway IP
+        // anchor a real prerouting / output chain decision.
+        assert_nft_line(
+            &compiled.nftables_rules,
+            // sandbox_dnat.prerouting: DNS DNAT keyed on the VM subnet.
+            "ip saddr 10.209.0.0/28 udp dport 53 dnat to 10.209.0.2:53",
         );
-        assert!(
-            compiled.nftables_rules.contains(&net.gateway_ip),
-            "nftables must reference the gateway IP"
+        assert_nft_line(
+            &compiled.nftables_rules,
+            // sandbox_dnat.prerouting: TCP fall-through to deny-logger.
+            "ip saddr 10.209.0.0/28 meta l4proto tcp dnat to 10.209.0.2:10001",
         );
     }
 
@@ -3137,17 +3169,28 @@ mod tests {
         let net = test_network_info();
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
+        // Pin the typed_config @type URL — substring `tcp_proxy` /
+        // `original_dst` would pass against any unrelated mention
+        // (e.g. a comment or a stat-prefix string), while the fully-
+        // qualified protobuf URL only appears at the structural sites
+        // that actually wire the filter / cluster.
+        let combined = compiled.envoy_config_combined();
         assert!(
-            compiled.envoy_config_combined().contains("tcp_proxy"),
-            "Envoy config must include TCP proxy filter"
+            combined.contains(
+                "type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy"
+            ),
+            "Envoy config must wire the TcpProxy filter via its typed_config @type URL; \
+             got:\n{combined}"
         );
         assert!(
-            compiled.envoy_config_combined().contains("original_dst"),
-            "Envoy config must use original_dst cluster"
+            combined.contains("name: original_dst"),
+            "Envoy bootstrap must define a cluster named `original_dst` (exact key:value, \
+             not a stray substring); got:\n{combined}"
         );
         assert!(
-            compiled.envoy_config_combined().contains("policy_listener"),
-            "Envoy config must define policy_listener"
+            combined.contains("name: policy_listener"),
+            "Envoy listener must be named `policy_listener` (exact key:value); \
+             got:\n{combined}"
         );
     }
 
@@ -3171,9 +3214,18 @@ mod tests {
         let net = test_network_info();
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
+        // Pin the structural shape — the port number must appear inside
+        // an `admin:` block as a `port_value: 9901` line, not just as a
+        // bare token in some unrelated place (a comment, log path, etc).
+        let combined = compiled.envoy_config_combined();
         assert!(
-            compiled.envoy_config_combined().contains("9901"),
-            "Envoy config must include admin port 9901"
+            combined.contains("admin:"),
+            "Envoy bootstrap must declare an `admin:` block; got:\n{combined}"
+        );
+        assert!(
+            combined.contains("port_value: 9901"),
+            "Envoy admin must bind port 9901 via a `port_value: 9901` line \
+             (exact key:value, not a stray substring); got:\n{combined}"
         );
     }
 
