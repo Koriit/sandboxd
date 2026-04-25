@@ -142,6 +142,22 @@ fn http_rule(host: &str, filters: Vec<HttpFilter>) -> PolicyRule {
     }
 }
 
+/// Build an `http`-level rule for `(cidr, 443, tcp)` with the given
+/// method-filter set. Used by the github-repo preset to emit CIDR
+/// rules covering GitHub's interactive-infrastructure pool — see
+/// [`GITHUB_INTERACTIVE_CIDR_POOL`].
+fn http_rule_cidr(cidr: &str, filters: Vec<HttpFilter>) -> PolicyRule {
+    PolicyRule {
+        host: Destination::Cidr(cidr.to_string()),
+        port: 443,
+        protocol: Protocol::Tcp,
+        reason: None,
+        level: AssuranceLevel::Http {
+            http_filters: filters,
+        },
+    }
+}
+
 /// Build a `tls`-level rule for `(host, 443, tcp)`. Used by
 /// `github-repo` for `objects.githubusercontent.com` and
 /// `release-assets.githubusercontent.com`, whose URLs are signed and
@@ -385,6 +401,53 @@ const GITHUB_REPO_RAW_TEMPLATES: &[RepoTemplate] = &[
     },
 ];
 
+/// GitHub's published interactive-infrastructure IPv4 CIDR pool.
+///
+/// Sourced from `https://api.github.com/meta` (the `git`/`web` arrays).
+/// These two ranges cover the IP addresses that `github.com`,
+/// `codeload.github.com`, and `api.github.com` rotate through under
+/// DNS-based load balancing — the v2 schema's per-`(host, port)`
+/// nftables allow-set is keyed on the IP at the moment of CoreDNS
+/// resolution, so a client that resolves `github.com` independently
+/// (typical for `git`'s in-VM `getaddrinfo`) can land on an IP that
+/// isn't in the gateway's cached set. See todo #39 in
+/// `docs/internal/milestones/M10.md`.
+///
+/// The `185.199.108.0/22` (Pages CDN, raw.githubusercontent.com) and
+/// `143.55.64.0/20` (additional infrastructure) ranges are deliberately
+/// **excluded** from this pool: this preset routes
+/// `objects.githubusercontent.com` and `release-assets.githubusercontent.com`
+/// through TLS passthrough (`AssuranceLevel::Tls`) so they can hold
+/// signed-URL integrity, and a CIDR allow-rule whose IP space happens to
+/// overlap with those Fastly/Pages CDNs would risk pulling those flows
+/// through mitmproxy via the L3 listener chain. Keeping the pool
+/// constrained to the well-known interactive ranges (`140.82.112.0/20`
+/// + `192.30.252.0/22`) makes the rotation-resilience fix targeted and
+/// reversible.
+///
+/// **Contract.** A CIDR rule emitted from this pool is at
+/// `AssuranceLevel::Http` so it generates an L3 (mitmproxy) filter
+/// chain in the Envoy listener — that's the routing target for any
+/// VM-resolved IP that landed outside the cached `github.com` set.
+/// mitmproxy then matches the request against the *domain* rules
+/// (`host: github.com`, `host: api.github.com`, `host: codeload.github.com`)
+/// via fnmatch on the HTTP `Host` header — a CIDR-string `host`
+/// (e.g. `"140.82.112.0/20"`) never matches a hostname, so the CIDR
+/// rule's `http_filters` list is structurally required (validate
+/// rejects empty `http_filters`) but never exercised at runtime.
+/// We mirror the `github.com` filter shape on the CIDR rule so a
+/// future code path that *did* match by IP (e.g. a CIDR-aware host
+/// matcher) would still scope to the same allowed git-over-HTTPS
+/// surface.
+const GITHUB_INTERACTIVE_CIDR_POOL: &[&str] = &[
+    // Primary GitHub infrastructure pool — github.com, codeload, api,
+    // www. By far the most common rotation destination today.
+    "140.82.112.0/20",
+    // Legacy GitHub primary range; kept on the allow-set so historic
+    // resolutions still pass.
+    "192.30.252.0/22",
+];
+
 /// Always-needed API probes that are not per-repo. Spec line 515.
 fn api_github_com_shared_probes() -> Vec<HttpFilter> {
     vec![
@@ -456,8 +519,8 @@ fn expand_github_repo(inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetE
     let codeload_filters = fan_out(GITHUB_REPO_CODELOAD_TEMPLATES);
     let raw_filters = fan_out(GITHUB_REPO_RAW_TEMPLATES);
 
-    Ok(vec![
-        http_rule("github.com", github_com_filters),
+    let mut rules = vec![
+        http_rule("github.com", github_com_filters.clone()),
         http_rule("api.github.com", api_github_com_filters),
         http_rule("codeload.github.com", codeload_filters),
         http_rule("raw.githubusercontent.com", raw_filters),
@@ -465,7 +528,25 @@ fn expand_github_repo(inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetE
         // workable level (spec lines 518-522).
         tls_rule("objects.githubusercontent.com"),
         tls_rule("release-assets.githubusercontent.com"),
-    ])
+    ];
+
+    // DNS-rotation resilience: GitHub's interactive infrastructure
+    // (github.com, codeload, api) load-balances across a rotating IPv4
+    // pool. The v2 nftables allow-set is keyed on the IPs CoreDNS
+    // resolved at the moment the propagation loop ran; a `git clone`
+    // running its own `getaddrinfo` inside the VM can land on a
+    // rotation that is not in the cached set, producing an L3 deny
+    // (deny-logger) instead of an L7 deny (mitmproxy) when the path
+    // does not match the preset's `${repo}` filters. Adding CIDR-host
+    // rules covering the published pool admits those rotated-out IPs
+    // at L3 + Envoy and routes them through mitmproxy where the
+    // domain rule (`host: github.com`, ...) applies the path filter.
+    // See todo #39 in `docs/internal/milestones/M10.md`.
+    for cidr in GITHUB_INTERACTIVE_CIDR_POOL {
+        rules.push(http_rule_cidr(cidr, github_com_filters.clone()));
+    }
+
+    Ok(rules)
 }
 
 // ---------------------------------------------------------------------------
@@ -917,20 +998,21 @@ mod tests {
         let rules = expand_builtin("github-repo", "github-repo:repo=owner/proj");
         assert_eq!(
             rules.len(),
-            6,
-            "github-repo must emit six host rules (github.com, api.github.com, codeload, raw, objects, release-assets)"
+            6 + GITHUB_INTERACTIVE_CIDR_POOL.len(),
+            "github-repo must emit six host rules (github.com, api.github.com, codeload, raw, objects, release-assets) plus one CIDR-host rule per entry in the GitHub interactive-infrastructure pool"
         );
 
-        // Hosts are emitted in a deterministic order.
-        let hosts: Vec<String> = rules
+        // Domain hosts are emitted in a deterministic order, followed
+        // by the CIDR pool entries appended at the tail.
+        let domain_hosts: Vec<String> = rules
             .iter()
-            .map(|r| match &r.host {
-                Destination::Domain(d) => d.clone(),
-                other => panic!("expected Domain, got {other:?}"),
+            .filter_map(|r| match &r.host {
+                Destination::Domain(d) => Some(d.clone()),
+                Destination::Cidr(_) => None,
             })
             .collect();
         assert_eq!(
-            hosts,
+            domain_hosts,
             vec![
                 "github.com",
                 "api.github.com",
@@ -939,6 +1021,21 @@ mod tests {
                 "objects.githubusercontent.com",
                 "release-assets.githubusercontent.com",
             ]
+        );
+        let cidr_hosts: Vec<String> = rules
+            .iter()
+            .filter_map(|r| match &r.host {
+                Destination::Cidr(c) => Some(c.clone()),
+                Destination::Domain(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            cidr_hosts,
+            GITHUB_INTERACTIVE_CIDR_POOL
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+            "CIDR-host rules must be emitted in the order declared by GITHUB_INTERACTIVE_CIDR_POOL"
         );
 
         // github.com: seven git-pack templates, each with `${repo}` -> `owner/proj`.
@@ -1092,6 +1189,126 @@ mod tests {
             }
             other => panic!("expected InvalidRepoValue, got {other:?}"),
         }
+    }
+
+    /// DNS-rotation resilience (todo #39): each entry in
+    /// [`GITHUB_INTERACTIVE_CIDR_POOL`] becomes an HTTP-level
+    /// `Destination::Cidr` rule on `(<cidr>, 443, tcp)` whose
+    /// `http_filters` mirror the `github.com` git-pack template set.
+    /// This is the targeted fix for the
+    /// `test_github_repo_preset_scopes_to_one_repo` E2E flake — the
+    /// CIDR rules let the `policy_allow_tcp` nft set admit any IP in
+    /// the published GitHub interactive pool, so a `git clone` whose
+    /// in-VM resolver lands on a rotated-out IP still reaches Envoy +
+    /// mitmproxy where the path-level allow/deny decision happens.
+    #[test]
+    fn expand_github_repo_emits_cidr_pool_rules_at_http_level() {
+        let rules = expand_builtin("github-repo", "github-repo:repo=owner/proj");
+
+        // Pull out the CIDR-host rules in declaration order.
+        let cidr_rules: Vec<&PolicyRule> = rules
+            .iter()
+            .filter(|r| matches!(&r.host, Destination::Cidr(_)))
+            .collect();
+        assert_eq!(
+            cidr_rules.len(),
+            GITHUB_INTERACTIVE_CIDR_POOL.len(),
+            "one rule per pool entry — got {} rules for {} pool entries",
+            cidr_rules.len(),
+            GITHUB_INTERACTIVE_CIDR_POOL.len(),
+        );
+
+        // The expected http_filters shape — same as the github.com
+        // domain rule, since mitmproxy never reaches the CIDR rule
+        // (its `host` is a CIDR string, never matches a hostname);
+        // the filters are kept consistent so a future code path that
+        // matches by IP would still scope to the per-repo surface.
+        let github_com_filters = http_filters_of(rule_for_host(&rules, "github.com")).to_vec();
+
+        for (rule, expected_cidr) in cidr_rules.iter().zip(GITHUB_INTERACTIVE_CIDR_POOL.iter()) {
+            // Host is a CIDR with the exact pool value.
+            match &rule.host {
+                Destination::Cidr(c) => assert_eq!(c, expected_cidr),
+                other => panic!("expected Cidr({expected_cidr}), got {other:?}"),
+            }
+            assert_eq!(rule.port, 443);
+            assert_eq!(rule.protocol, Protocol::Tcp);
+            // Level is Http with the github.com filter shape — that's
+            // what gives Envoy an L3 chain routing the (rotated-out)
+            // IP through mitmproxy. The filter list itself is dead
+            // (mitmproxy host-matches by fnmatch on the request's
+            // HTTP `Host` header, never a CIDR string) but must be
+            // non-empty for `PolicyCompiler::validate` to accept the
+            // rule shape.
+            match &rule.level {
+                AssuranceLevel::Http { http_filters } => {
+                    assert_eq!(
+                        http_filters, &github_com_filters,
+                        "CIDR rule's http_filters must mirror github.com's git-pack template set"
+                    );
+                }
+                other => panic!("expected Http level on CIDR rule, got {other:?}"),
+            }
+        }
+
+        // The expanded policy must round-trip through the validator:
+        // a CIDR-host rule alongside the existing domain rules is a
+        // legal v2 shape (no `(host, port)` collisions because each
+        // CIDR string and each domain is a distinct host key).
+        assert_rules_round_trip(rules);
+    }
+
+    /// Pin that the CIDR rules cover the known github.com IP space.
+    /// `140.82.112.0/20` covers `140.82.112.0` through `140.82.127.255`
+    /// — the rotation pool seen in the M10-S6 regression handoff
+    /// (`140.82.121.4` was the failing IP).
+    #[test]
+    fn github_interactive_cidr_pool_covers_published_ranges() {
+        // The two ranges below are the only published IPv4 ranges
+        // shared across the `git` and `web` arrays in
+        // `https://api.github.com/meta` that map to GitHub's own
+        // interactive infrastructure (i.e. excluding the Pages /
+        // Fastly / Azure CDN-backed `*.githubusercontent.com` pools).
+        // Pin both ends so a future intentional change to the pool
+        // still requires updating this test.
+        assert!(
+            GITHUB_INTERACTIVE_CIDR_POOL.contains(&"140.82.112.0/20"),
+            "primary GitHub pool 140.82.112.0/20 must be in the CIDR pool"
+        );
+        assert!(
+            GITHUB_INTERACTIVE_CIDR_POOL.contains(&"192.30.252.0/22"),
+            "legacy GitHub pool 192.30.252.0/22 must be in the CIDR pool"
+        );
+    }
+
+    /// Multi-repo invocation must keep the CIDR-pool rules emitted
+    /// exactly once at the tail (the pool does not depend on `${repo}`,
+    /// so it must not fan out per-repo — that would produce
+    /// `(<cidr>, 443)` collisions in `merge_effective`).
+    #[test]
+    fn expand_github_repo_multi_repo_emits_cidr_pool_once() {
+        let rules = expand_builtin(
+            "github-repo",
+            "github-repo:repo=a/one,repo=b/two,repo=c/three",
+        );
+
+        let cidr_rules: Vec<&PolicyRule> = rules
+            .iter()
+            .filter(|r| matches!(&r.host, Destination::Cidr(_)))
+            .collect();
+        assert_eq!(
+            cidr_rules.len(),
+            GITHUB_INTERACTIVE_CIDR_POOL.len(),
+            "CIDR-pool rules must be emitted exactly once regardless of repo count, \
+             got {} rules for {} pool entries on a 3-repo invocation",
+            cidr_rules.len(),
+            GITHUB_INTERACTIVE_CIDR_POOL.len(),
+        );
+
+        // The expanded policy must still round-trip through the
+        // validator under multi-repo expansion (no
+        // `(host, port)` duplicates).
+        assert_rules_round_trip(rules);
     }
 
     // ----- github-pr (parameterized) ----------------------------------
