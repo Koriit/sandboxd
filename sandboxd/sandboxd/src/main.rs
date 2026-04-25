@@ -854,13 +854,20 @@ async fn create_session(
                 stderr,
             }) => {
                 if exit_code != 0 {
-                    warn!(
-                        %session_id,
-                        exit_code,
-                        stdout = %stdout.trim(),
-                        stderr = %stderr.trim(),
-                        "git clone returned non-zero exit code (non-fatal)"
-                    );
+                    let stderr_snip = truncate_for_diagnostic(stderr.trim(), 512);
+                    let err = SandboxError::Internal(format!(
+                        "git clone of {repo_url} failed with exit code {exit_code}: {stderr_snip}"
+                    ));
+                    return fail_explicit_repo_clone(
+                        &state.store,
+                        &state.gateway,
+                        &state.network,
+                        &state.ingestors,
+                        &session_id,
+                        err,
+                    )
+                    .await
+                    .into_response();
                 } else {
                     info!(
                         %session_id,
@@ -870,25 +877,49 @@ async fn create_session(
                 }
             }
             Ok(GuestResponse::Error { message }) => {
-                warn!(
-                    %session_id,
-                    %message,
-                    "guest agent error during git clone (non-fatal)"
-                );
+                let err = SandboxError::Internal(format!(
+                    "git clone of {repo_url} failed: guest agent error: {message}"
+                ));
+                return fail_explicit_repo_clone(
+                    &state.store,
+                    &state.gateway,
+                    &state.network,
+                    &state.ingestors,
+                    &session_id,
+                    err,
+                )
+                .await
+                .into_response();
             }
             Ok(other) => {
-                warn!(
-                    %session_id,
-                    ?other,
-                    "unexpected guest response during git clone (non-fatal)"
-                );
+                let err = SandboxError::Internal(format!(
+                    "git clone of {repo_url} failed: unexpected guest response: {other:?}"
+                ));
+                return fail_explicit_repo_clone(
+                    &state.store,
+                    &state.gateway,
+                    &state.network,
+                    &state.ingestors,
+                    &session_id,
+                    err,
+                )
+                .await
+                .into_response();
             }
             Err(e) => {
-                warn!(
-                    %session_id,
-                    error = %e,
-                    "failed to execute git clone in VM (non-fatal)"
-                );
+                let err = SandboxError::Internal(format!(
+                    "git clone of {repo_url} failed: transport error: {e}"
+                ));
+                return fail_explicit_repo_clone(
+                    &state.store,
+                    &state.gateway,
+                    &state.network,
+                    &state.ingestors,
+                    &session_id,
+                    err,
+                )
+                .await
+                .into_response();
             }
         }
     }
@@ -2689,6 +2720,65 @@ async fn fail_explicit_policy_apply(
     let _ = store.update_state(session_id, SessionState::Error);
     teardown_session_networking_parts(session_id, gateway, network, ingestors).await;
     error_response(e)
+}
+
+/// Fail the create call when an explicit `--repo <url>` clone fails
+/// in-guest (M10-S8 #34).
+///
+/// Mirrors the shape of [`fail_explicit_policy_apply`]: when the
+/// caller passes `--repo <url>`, the session is supposed to come up
+/// with `/home/agent/workspace/` populated. Pre-fix, the four
+/// failure branches (non-zero exit, `GuestResponse::Error`,
+/// unexpected guest response, transport error) all `warn!`-swallowed
+/// the failure and the handler returned 201 CREATED with a `Running`
+/// session and an empty workspace — silently violating the caller's
+/// stated intent. The only correct response is to fail the create
+/// call and surface the failure through the HTTP response so the
+/// CLI user can see *why* the clone did not succeed (exit code,
+/// stderr snippet, transport error, etc., carried through in the
+/// caller-supplied `e`).
+///
+/// Teardown shape matches [`fail_explicit_policy_apply`]:
+///   - mark session `Error` (so `sandbox ps` / `inspect` surface the
+///     failed create);
+///   - best-effort stop the gateway + remove the Docker network;
+///   - leave VM + CA material in place so the operator can still
+///     `sandbox rm` to reclaim the session.
+///
+/// Like its sibling, this helper takes only the [`AppState`] fields
+/// it actually reads so it can be exercised hermetically — see
+/// `tests::fail_explicit_repo_clone_marks_session_error_and_returns_5xx`.
+async fn fail_explicit_repo_clone(
+    store: &SessionStore,
+    gateway: &Arc<GatewayManager>,
+    network: &Arc<NetworkManager>,
+    ingestors: &Mutex<HashMap<SessionId, SessionIngestor>>,
+    session_id: &SessionId,
+    e: SandboxError,
+) -> (StatusCode, Json<ApiError>) {
+    error!(
+        %session_id,
+        error = %e,
+        "failed to clone explicit --repo URL into VM — failing create"
+    );
+    let _ = store.update_state(session_id, SessionState::Error);
+    teardown_session_networking_parts(session_id, gateway, network, ingestors).await;
+    error_response(e)
+}
+
+/// Truncate a free-form diagnostic string (e.g. `git clone` stderr)
+/// to at most `max_chars` characters, appending an ellipsis suffix
+/// when truncation actually drops content. Truncates on character
+/// boundaries (not bytes) so the result is always valid UTF-8.
+fn truncate_for_diagnostic(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max_chars).collect();
+        out.push_str("…[truncated]");
+        out
+    }
 }
 
 /// Inner body of [`teardown_session_networking`], parameterised on the
@@ -4641,5 +4731,149 @@ mod tests {
             SessionState::Error,
             "session must be marked Error so ps/inspect can surface the failed create"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // fail_explicit_repo_clone: M10-S8 #34 regression guard
+    //
+    // Pre-M10-S8, the four `git clone` failure branches in
+    // `create_session` `warn!`-swallowed the error and returned 201
+    // CREATED with a `Running` session and an empty
+    // `/home/agent/workspace/`. The CLI user observed success but
+    // had no usable repo — silently violating the caller's
+    // `--repo <url>` intent. The helper extracted by M10-S8 flips
+    // this to a fatal failure with the same shape as #16:
+    //   - session state transitions Running → Error
+    //   - the HTTP response carries `error_response(e)` with the
+    //     diagnostic message (exit code, stderr snippet, transport
+    //     error, etc.) the caller built at the failure site
+    //   - teardown is issued for any partial networking state
+    //
+    // The test drives the helper directly (rather than the end-to-end
+    // `create_session` handler) for the same reason as #16: the
+    // latter requires Docker + Lima, which are banned from
+    // `make test` (see CLAUDE.md "Integration-test convention").
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn fail_explicit_repo_clone_marks_session_error_and_returns_5xx() {
+        use std::collections::HashMap;
+        use std::net::Ipv4Addr;
+
+        // Fresh store in a tempdir — same hermetic shape as the #16
+        // test above.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (store, _orphans) =
+            SessionStore::new(tmp.path().to_path_buf()).expect("open session store");
+        let store = Arc::new(store);
+
+        // Move the session to `Running` — the only state from which
+        // `create_session` reaches the `git clone` block.
+        let session = store
+            .create_session(SessionConfig::default(), Some("clone-fail-test".into()))
+            .expect("create session");
+        store
+            .update_state(&session.id, SessionState::Running)
+            .expect("transition Creating → Running");
+
+        let gateway = Arc::new(GatewayManager::new());
+        let network = Arc::new(
+            NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24)
+                .expect("construct NetworkManager"),
+        );
+        let ingestors: Mutex<HashMap<SessionId, SessionIngestor>> = Mutex::new(HashMap::new());
+
+        // `Internal` matches what the four clone failure branches in
+        // `create_session` build at the call site — they wrap exit
+        // code / stderr / transport context in
+        // `SandboxError::Internal(...)` so the message is
+        // self-describing on the wire.
+        let synthetic_err = SandboxError::Internal(
+            "git clone of https://example.invalid/repo.git failed with exit code 128: \
+             fatal: unable to access: Could not resolve host"
+                .into(),
+        );
+        let (status, Json(body)) = fail_explicit_repo_clone(
+            &store,
+            &gateway,
+            &network,
+            &ingestors,
+            &session.id,
+            synthetic_err,
+        )
+        .await;
+
+        // Contract 1: 5xx surfaces the failure to the caller.
+        // `SandboxError::Internal` maps to 500 (see error_response
+        // mapping table above).
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "clone failure must map to 500, not a 2xx that hides the failure"
+        );
+        // Contract 1b: the diagnostic context built at the failure
+        // site (exit code, stderr snippet) reaches the wire body.
+        // Without this, the CLI user sees a 500 with no actionable
+        // hint about *why* the clone failed.
+        assert!(
+            body.error.contains("git clone of"),
+            "error body should mention the operation that failed, got: {}",
+            body.error
+        );
+        assert!(
+            body.error.contains("exit code 128"),
+            "error body should pass exit code through, got: {}",
+            body.error
+        );
+        assert!(
+            body.error.contains("Could not resolve host"),
+            "error body should pass stderr snippet through, got: {}",
+            body.error
+        );
+
+        // Contract 2: the session is in `Error` state so `sandbox ps`
+        // / `inspect` surface the failed create rather than a
+        // misleading `Running` row with an empty workspace.
+        let reloaded = store
+            .get_session(&session.id)
+            .expect("store readable")
+            .expect("session row still present");
+        assert_eq!(
+            reloaded.state,
+            SessionState::Error,
+            "session must be marked Error so ps/inspect can surface the failed create"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // truncate_for_diagnostic: stderr snippets in the error body must
+    // stay under a sane size and respect UTF-8 boundaries.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn truncate_for_diagnostic_passes_short_strings_through() {
+        assert_eq!(truncate_for_diagnostic("short", 100), "short");
+        assert_eq!(truncate_for_diagnostic("", 100), "");
+    }
+
+    #[test]
+    fn truncate_for_diagnostic_truncates_long_strings_with_marker() {
+        let input = "x".repeat(1024);
+        let out = truncate_for_diagnostic(&input, 16);
+        assert_eq!(out.chars().take(16).collect::<String>(), "x".repeat(16));
+        assert!(
+            out.ends_with("…[truncated]"),
+            "truncated output should carry an explicit marker, got: {out}"
+        );
+    }
+
+    #[test]
+    fn truncate_for_diagnostic_is_utf8_safe() {
+        // Multi-byte chars: each `é` is 2 bytes but 1 char. A naive
+        // byte-slice truncate would split the codepoint and panic.
+        let input: String = "é".repeat(100);
+        let out = truncate_for_diagnostic(&input, 10);
+        assert!(out.starts_with(&"é".repeat(10)));
+        assert!(out.ends_with("…[truncated]"));
     }
 }
