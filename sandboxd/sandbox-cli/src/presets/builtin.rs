@@ -208,12 +208,73 @@ fn expand_cargo(_inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetError>
     // - `crates.io`        — registry web API + download redirector.
     // - `static.crates.io` — CDN host that serves crate tarballs
     //                        (302 target of the download redirector).
-    Ok(consume_rules(&[
-        "crates.io",
-        "index.crates.io",
-        "static.crates.io",
-    ]))
+    let mut rules = consume_rules(&["crates.io", "index.crates.io", "static.crates.io"]);
+
+    // DNS-rotation resilience: `index.crates.io` and `static.crates.io`
+    // are served from Fastly's Anycast pool. Fastly publishes a low TTL
+    // (≤2s on these hostnames at time of writing), and consecutive
+    // resolutions from a guest VM's `getaddrinfo` can land on a
+    // different Fastly POP than the one CoreDNS observed and reported
+    // to sandboxd's nft propagation loop — so the v2 `policy_allow_tcp`
+    // set is keyed on a stale IP set, and the curl that follows hits
+    // the deny-logger and gets RST. The propagation loop's 2s poll
+    // cannot reliably out-pace a TTL=2s rotation. Adding CIDR-host
+    // rules covering the Fastly Anycast ranges admits all rotated IPs
+    // at L3 and routes them through Envoy + mitmproxy, where the
+    // domain rules (`host: index.crates.io`, ...) drive the HTTP-level
+    // allow/deny decision. See [`CARGO_FASTLY_CIDR_POOL`] for the
+    // ranges and rationale.
+    let crates_io_filters = method::get_head();
+    for cidr in CARGO_FASTLY_CIDR_POOL {
+        rules.push(http_rule_cidr(cidr, crates_io_filters.clone()));
+    }
+    Ok(rules)
 }
+
+/// Fastly's published Anycast IPv4 pool serving `index.crates.io` and
+/// `static.crates.io`.
+///
+/// Sourced from Fastly's public IP ranges
+/// (`https://api.fastly.com/public-ip-list`); the two `/16`-class
+/// supernets below collapse the dozens of Fastly POPs that crates.io's
+/// CDN rotates through under DNS-based load balancing into the
+/// minimal-viable allow-set. The v2 `policy_allow_tcp` nftables set is
+/// keyed on the IP at the moment CoreDNS resolves the hostname, so a
+/// guest that re-resolves `index.crates.io` between the propagation
+/// loop's 2s ticks (Fastly TTL is ≤2s) can land on an IP outside the
+/// cached set and get RST by the deny-logger. The CIDR rules emitted
+/// from this pool give Envoy an L3 filter chain for those rotated-out
+/// IPs, routing them through mitmproxy where the domain rules drive
+/// the actual allow/deny decision.
+///
+/// `crates.io` (the redirector) is **not** Fastly-fronted — it
+/// resolves to AWS / CloudFront IPs. We deliberately do not allow
+/// AWS supernets here: the redirector's typical workflow returns a
+/// 302 to `static.crates.io` quickly, the daemon's 2s poll picks up
+/// the AWS IPs once observed, and any over-broad CIDR (e.g.
+/// `3.0.0.0/8`) would let unrelated AWS infrastructure land in the
+/// L3 chain — counter to least-privilege. The Fastly pool is the
+/// minimum needed to fix the observed rotation race.
+///
+/// **Contract.** Each CIDR rule is `AssuranceLevel::Http` so it
+/// generates an L3 (mitmproxy) filter chain in the Envoy listener.
+/// mitmproxy then matches the request against the *domain* rules
+/// (`host: index.crates.io`, `host: static.crates.io`) by fnmatch on
+/// the HTTP `Host` header — a CIDR-string `host` never matches a
+/// hostname, so the CIDR rule's `http_filters` list is structurally
+/// required (validate rejects empty `http_filters`) but is dead at
+/// runtime. We mirror the consume-posture filter shape (`GET /**`,
+/// `HEAD /**`) so a future code path that *did* match by IP would
+/// still scope to the same allowed surface.
+const CARGO_FASTLY_CIDR_POOL: &[&str] = &[
+    // Fastly Anycast — primary supernet that contains the
+    // 151.101.x.137 IP set observed in pcap from a real
+    // `cargo fetch` against `static.crates.io`.
+    "151.101.0.0/16",
+    // Fastly Anycast — secondary supernet that contains the
+    // 146.75.x.137 IP set observed from `index.crates.io`.
+    "146.75.0.0/17",
+];
 
 fn expand_goproxy(_inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetError> {
     Ok(consume_rules(&["proxy.golang.org", "sum.golang.org"]))
@@ -807,10 +868,33 @@ mod tests {
     #[test]
     fn expand_cargo_matches_spec() {
         let rules = expand_builtin("cargo", "cargo:");
-        assert_consume_posture(
-            &rules,
-            &["crates.io", "index.crates.io", "static.crates.io"],
-        );
+
+        // The cargo preset emits one consume-posture rule per domain
+        // host (crates.io, index.crates.io, static.crates.io) plus one
+        // CIDR-host rule per entry in the Fastly Anycast pool. The
+        // domain rules carry the spec-mandated `(GET, HEAD) /**`
+        // posture; the CIDR rules are exercised in
+        // `expand_cargo_emits_cidr_pool_rules_at_http_level` below.
+        let domain_rules: Vec<&PolicyRule> = rules
+            .iter()
+            .filter(|r| matches!(&r.host, Destination::Domain(_)))
+            .collect();
+        assert_eq!(domain_rules.len(), 3);
+        let expected_hosts = ["crates.io", "index.crates.io", "static.crates.io"];
+        for (rule, expected_host) in domain_rules.iter().zip(expected_hosts.iter()) {
+            assert_eq!(rule.port, 443);
+            assert_eq!(rule.protocol, Protocol::Tcp);
+            match &rule.host {
+                Destination::Domain(d) => assert_eq!(d, expected_host),
+                other => panic!("expected Domain host, got {other:?}"),
+            }
+            match &rule.level {
+                AssuranceLevel::Http { http_filters } => {
+                    assert_eq!(*http_filters, method::get_head());
+                }
+                other => panic!("expected Http level, got {other:?}"),
+            }
+        }
         assert_rules_round_trip(rules);
     }
 
@@ -854,14 +938,18 @@ mod tests {
             })
             .collect();
 
-        // Build the preset's host list by expanding and collecting the
-        // unique host strings from the emitted rules.
+        // Build the preset's domain-host list by expanding and
+        // collecting the unique domain strings from the emitted rules.
+        // CIDR-host rules (the Fastly Anycast pool) are intentionally
+        // excluded — the frozen fixture is a *hostname* trace; the
+        // CIDR rules' coverage is validated by
+        // `cargo_fastly_cidr_pool_covers_published_ranges` below.
         let rules = expand_builtin("cargo", "cargo:");
         let mut preset_hosts: Vec<String> = rules
             .iter()
-            .map(|r| match &r.host {
-                Destination::Domain(d) => d.clone(),
-                other => panic!("expected Destination::Domain, got {other:?}"),
+            .filter_map(|r| match &r.host {
+                Destination::Domain(d) => Some(d.clone()),
+                Destination::Cidr(_) => None,
             })
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
@@ -879,6 +967,89 @@ mod tests {
              If this change is intentional, update \
              `tests/fixtures/cargo_fetch_trace.json` in the same commit \
              and document the rationale."
+        );
+    }
+
+    /// DNS-rotation resilience (todo #40): each entry in
+    /// [`CARGO_FASTLY_CIDR_POOL`] becomes an HTTP-level
+    /// `Destination::Cidr` rule on `(<cidr>, 443, tcp)` whose
+    /// `http_filters` mirror the consume-posture (`GET /**`, `HEAD /**`)
+    /// shape of the domain rules. This is the targeted fix for the
+    /// `test_cargo_preset_allows_cargo_fetch` E2E flake — the
+    /// CIDR rules let the `policy_allow_tcp` nft set admit any IP in
+    /// Fastly's published Anycast pool, so a `cargo fetch` whose
+    /// in-VM resolver lands on a rotated POP between the daemon's 2s
+    /// propagation polls still reaches Envoy + mitmproxy where the
+    /// host-header allow/deny decision happens.
+    #[test]
+    fn expand_cargo_emits_cidr_pool_rules_at_http_level() {
+        let rules = expand_builtin("cargo", "cargo:");
+
+        // Pull out the CIDR-host rules in declaration order.
+        let cidr_rules: Vec<&PolicyRule> = rules
+            .iter()
+            .filter(|r| matches!(&r.host, Destination::Cidr(_)))
+            .collect();
+        assert_eq!(
+            cidr_rules.len(),
+            CARGO_FASTLY_CIDR_POOL.len(),
+            "one rule per pool entry — got {} rules for {} pool entries",
+            cidr_rules.len(),
+            CARGO_FASTLY_CIDR_POOL.len(),
+        );
+
+        let expected_filters = method::get_head();
+
+        for (rule, expected_cidr) in cidr_rules.iter().zip(CARGO_FASTLY_CIDR_POOL.iter()) {
+            // Host is a CIDR with the exact pool value and order.
+            match &rule.host {
+                Destination::Cidr(c) => assert_eq!(c, expected_cidr),
+                other => panic!("expected Cidr({expected_cidr}), got {other:?}"),
+            }
+            assert_eq!(rule.port, 443);
+            assert_eq!(rule.protocol, Protocol::Tcp);
+            // Level is Http with the consume-posture filter shape —
+            // that's what gives Envoy an L3 chain routing the
+            // (rotated-out) IP through mitmproxy. The filter list
+            // itself is dead at runtime (mitmproxy host-matches by
+            // fnmatch on the request's HTTP `Host` header, never a
+            // CIDR string) but must be non-empty for
+            // `PolicyCompiler::validate` to accept the rule shape.
+            match &rule.level {
+                AssuranceLevel::Http { http_filters } => {
+                    assert_eq!(
+                        *http_filters, expected_filters,
+                        "CIDR rule's http_filters must mirror the consume-posture (GET, HEAD)"
+                    );
+                }
+                other => panic!("expected Http level on CIDR rule, got {other:?}"),
+            }
+        }
+
+        // The expanded policy must round-trip through the validator: a
+        // CIDR-host rule alongside the existing domain rules is a legal
+        // v2 shape (no `(host, port)` collisions because each CIDR
+        // string and each domain is a distinct host key).
+        assert_rules_round_trip(rules);
+    }
+
+    /// Pin that the CIDR rules cover Fastly's published Anycast IPv4
+    /// pool. The Fastly public ranges (sourced from
+    /// `https://api.fastly.com/public-ip-list`) include
+    /// `151.101.0.0/16` and `146.75.0.0/17` — these supernets contain
+    /// every `151.101.x.137` and `146.75.x.137` rotation we observed
+    /// during the M10-S8 cargo-preset flake investigation. Pin both
+    /// entries so a future intentional change requires updating this
+    /// test.
+    #[test]
+    fn cargo_fastly_cidr_pool_covers_published_ranges() {
+        assert!(
+            CARGO_FASTLY_CIDR_POOL.contains(&"151.101.0.0/16"),
+            "primary Fastly Anycast supernet 151.101.0.0/16 must be in the CIDR pool"
+        );
+        assert!(
+            CARGO_FASTLY_CIDR_POOL.contains(&"146.75.0.0/17"),
+            "secondary Fastly Anycast supernet 146.75.0.0/17 must be in the CIDR pool"
         );
     }
 
