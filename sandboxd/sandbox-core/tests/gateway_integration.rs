@@ -20,11 +20,12 @@ use sandbox_core::gateway::{GATEWAY_IMAGE, GatewayManager, GatewayStatus, contai
 use sandbox_core::network::NetworkManager;
 use sandbox_core::session::SessionId;
 use sandbox_core::{
-    AssuranceLevel, AtomicListenerWriter, Destination, EVENTS_DIR_IN_CONTAINER, Policy,
-    PolicyCompiler, PolicyDistributor, PolicyRule, Protocol, session_events_host_dir,
-    session_listener_host_path,
+    AssuranceLevel, AtomicListenerWriter, Destination, DockerExecLdsProbe, EVENTS_DIR_IN_CONTAINER,
+    LdsAckOutcome, LdsStatsProbe, Policy, PolicyCompiler, PolicyDistributor, PolicyRule, Protocol,
+    session_events_host_dir, session_listener_host_path, wait_for_lds_ack,
 };
 use std::net::Ipv4Addr;
+use std::time::Duration;
 
 #[test]
 fn integration_gateway_lifecycle() {
@@ -628,6 +629,168 @@ fn integration_gateway_lds_listener_and_atomic_rewrite() {
     assert!(
         dynamic_listeners_after.contains("policy_listener"),
         "policy_listener must still be dynamic after rewrite:\n{dynamic_listeners_after}"
+    );
+
+    // ---------- Clean up ----------
+    gw_mgr.stop_gateway(&session_id).unwrap();
+    net_mgr.delete_network(&session_id).unwrap();
+}
+
+/// End-to-end check that [`wait_for_lds_ack`] correctly waits for a
+/// real Envoy to ack an atomic listener rewrite (#38).
+///
+/// Background. Before this helper landed, the DNS propagation loop
+/// flipped `propagated=true` the moment the listener-file rename
+/// returned, leaving a 100–300 ms window where Envoy was still
+/// serving the prior generation (or briefly draining). The cargo
+/// and github-repo E2Es repro'd this as TCP-RST/Connection-refused
+/// failures within ~50 ms of `propagated=true`. The helper closes
+/// the race by polling Envoy admin `/stats` until
+/// `(lds.update_success + lds.update_rejected) >= pre_attempt + 1`
+/// — i.e. Envoy has resolved the rewrite, accept or reject. This
+/// test runs the helper against a real Envoy to confirm:
+///
+///   1. The pre-rewrite snapshot of `lds.update_attempt` returns
+///      from the `DockerExecLdsProbe` against a live admin port.
+///   2. `wait_for_lds_ack` returns `Accepted` after a benign
+///      filter-chain rewrite (the same one the M9-S18 listener
+///      test uses), within the deadline.
+///   3. By the time the helper returns `Accepted`, Envoy reports
+///      `update_success` strictly greater than the pre-rewrite
+///      snapshot — i.e. the `Accepted` outcome is not a false
+///      positive.
+///
+/// This is the production-side counterpart to the hermetic unit
+/// tests in `sandbox-core::lds_ack::tests`: those drive the helper
+/// with a fake probe to exercise the success / reject / timeout
+/// state machine; this test confirms the production probe and the
+/// production Envoy actually agree on the wire.
+#[test]
+fn integration_wait_for_lds_ack_observes_real_envoy_ack() {
+    // 10.209.8.0/24 — distinct from the other gateway tests.
+    let net_mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 8, 0), 24).unwrap();
+    let gw_mgr = GatewayManager::new();
+    let session_id = SessionId::generate();
+
+    let network_info = net_mgr.create_network(&session_id).unwrap();
+    let create_result = gw_mgr.create_gateway(&session_id, &network_info, None, None);
+    if let Err(ref e) = create_result {
+        let _ = gw_mgr.stop_gateway(&session_id);
+        let _ = net_mgr.delete_network(&session_id);
+        panic!("create_gateway failed: {e}");
+    }
+
+    let gw_container = container_name(&session_id);
+    let status = gw_mgr.gateway_status(&session_id).unwrap();
+    assert_eq!(
+        status,
+        GatewayStatus::Healthy,
+        "gateway must be healthy before exercising LDS ack"
+    );
+
+    // We need a Tokio runtime because `wait_for_lds_ack` is async
+    // and `DockerExecLdsProbe::fetch_counters` uses `tokio::process`.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime should build");
+
+    // Independent helper to read `lds.update_success` synchronously
+    // for the post-condition assertion below — keeps the test free
+    // of an additional async hop just for the witness check.
+    fn lds_update_success(container: &str) -> u64 {
+        let url = "http://127.0.0.1:9901/stats?\
+                   filter=^listener_manager\\.lds\\.update_success$&format=text";
+        let out = Command::new("docker")
+            .args(["exec", container, "curl", "-sf", url])
+            .output()
+            .expect("docker exec curl /stats should succeed");
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            if let Some((_, v)) = line.split_once(':') {
+                if let Ok(n) = v.trim().parse::<u64>() {
+                    return n;
+                }
+            }
+        }
+        0
+    }
+
+    // 1. Snapshot pre-rewrite counters via the production probe.
+    //    This is exactly the call sandboxd's DNS loop makes before
+    //    rewriting the listener — if it can't reach Envoy admin
+    //    here, the daemon side will fail the same way.
+    let probe = DockerExecLdsProbe::new(&session_id);
+    let pre = rt
+        .block_on(probe.fetch_counters())
+        .expect("DockerExecLdsProbe must reach Envoy admin in a healthy gateway");
+    let initial_success = lds_update_success(&gw_container);
+
+    // 2. Atomic listener rewrite — same shape as the M9-S18
+    //    integration test: switch the deny-all bootstrap body
+    //    (`filter_chains: []`) to a single L1 passthrough chain
+    //    routing to the pre-defined `original_dst` cluster. Envoy
+    //    must accept this; rejection here would mean the test
+    //    fixture itself is broken (assertion further down catches
+    //    that).
+    use sandbox_core::policy::{FILTER_CHAINS_BEGIN_MARKER, FILTER_CHAINS_END_MARKER};
+    let mut updated_listener = PolicyCompiler::envoy_deny_all_listener();
+    let old_body =
+        format!("{FILTER_CHAINS_BEGIN_MARKER}\n    filter_chains: []\n{FILTER_CHAINS_END_MARKER}");
+    let new_body = format!(
+        "{FILTER_CHAINS_BEGIN_MARKER}\n    default_filter_chain:\n      filters:\n        - name: envoy.filters.network.tcp_proxy\n          typed_config:\n            \"@type\": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy\n            stat_prefix: sandbox_l1_passthrough\n            cluster: original_dst\n{FILTER_CHAINS_END_MARKER}"
+    );
+    assert!(
+        updated_listener.contains(&old_body),
+        "initial deny-all listener must contain the framed `filter_chains: []` body so \
+         the test can swap it; the fixture is stale otherwise"
+    );
+    updated_listener = updated_listener.replace(&old_body, &new_body);
+
+    let host_path = session_listener_host_path(&session_id);
+    AtomicListenerWriter::new(&host_path)
+        .write(&updated_listener)
+        .expect("atomic listener rewrite should succeed");
+
+    // 3. The real ack-wait. 5s deadline matches sandboxd's runtime
+    //    setting; 100ms poll matches the daemon's poll_interval.
+    //    On CI the inotify event typically lands in <250 ms; if the
+    //    helper times out here it means either Envoy actually never
+    //    saw the rewrite (possible bind-mount or watcher bug) or
+    //    the 5s deadline is too aggressive for this host.
+    let outcome = rt.block_on(wait_for_lds_ack(
+        &probe,
+        pre,
+        Duration::from_secs(5),
+        Duration::from_millis(100),
+    ));
+
+    // 4. Assertions. We pin `Accepted` (not just "anything but
+    //    TimedOut") because a `Rejected` here would mean the
+    //    test-crafted listener body is malformed and the production
+    //    daemon's would-be propagation flip is being correctly
+    //    suppressed — a bug in the test fixture, not a regression
+    //    in the helper. We also pin that `update_success` actually
+    //    advanced past `initial_success`, ruling out the
+    //    "helper returned Accepted but Envoy never updated" failure
+    //    mode (would be a bug in the helper's edge-attribution).
+    assert_eq!(
+        outcome,
+        LdsAckOutcome::Accepted,
+        "wait_for_lds_ack must observe a real Envoy ack within the deadline; \
+         got {outcome:?}. If TimedOut, Envoy never re-read the listener — \
+         check the LDS filesystem watcher and the bind-mount path. If Rejected, \
+         the test-crafted listener body is malformed — Envoy refused it; \
+         inspect the Envoy log inside container {gw_container} for the \
+         validation error."
+    );
+    let final_success = lds_update_success(&gw_container);
+    assert!(
+        final_success > initial_success,
+        "lds.update_success must have incremented from {initial_success} after the \
+         rewrite was acked; got {final_success}. The helper returned Accepted but \
+         Envoy disagrees — the edge-attribution logic in `wait_for_lds_ack` is \
+         miscounting."
     );
 
     // ---------- Clean up ----------

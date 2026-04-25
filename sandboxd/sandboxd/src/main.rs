@@ -16,15 +16,16 @@ use sandbox_core::events::session_events_host_dir;
 use sandbox_core::gateway::container_name as gateway_container_name;
 use sandbox_core::{
     ApiError, AssuranceLevel, BaseImageStatus, CaManager, CoreDnsConfig, CreateSessionRequest,
-    Destination, DnsCache, DockerHealth, EventBus, EventBusConfig, ExecRequest, ExecResponse,
-    FileDownloadRequest, FileDownloadResponse, FileUploadRequest, GatewayHealth, GatewayManager,
-    GatewayShutdownReason, GatewayStatus, GuestConnector, GuestRequest, GuestResponse,
-    HealthComponent, LimaManager, NetworkHealth, NetworkManager, PersistConfig, PersistentSink,
-    Policy, PolicyApplyStatus, PolicyCompiler, PolicyDistributor, SandboxError, Session,
-    SessionConfig, SessionDto, SessionHealth, SessionId, SessionIngestor, SessionState,
-    SessionStore, UpdatePolicyRequest, VmIpSessionMap, VmStatus, attach_vm_to_bridge,
-    detach_vm_from_bridge, generate_ca_inject_script, hash_policy, mac_from_session_id,
-    propagate_dns_changes, read_resolved_json, write_file_to_container,
+    Destination, DnsCache, DockerExecLdsProbe, DockerHealth, EventBus, EventBusConfig, ExecRequest,
+    ExecResponse, FileDownloadRequest, FileDownloadResponse, FileUploadRequest, GatewayHealth,
+    GatewayManager, GatewayShutdownReason, GatewayStatus, GuestConnector, GuestRequest,
+    GuestResponse, HealthComponent, LdsAckOutcome, LdsStatsProbe, LimaManager, NetworkHealth,
+    NetworkManager, PersistConfig, PersistentSink, Policy, PolicyApplyStatus, PolicyCompiler,
+    PolicyDistributor, SandboxError, Session, SessionConfig, SessionDto, SessionHealth, SessionId,
+    SessionIngestor, SessionState, SessionStore, UpdatePolicyRequest, VmIpSessionMap, VmStatus,
+    attach_vm_to_bridge, detach_vm_from_bridge, generate_ca_inject_script, hash_policy,
+    mac_from_session_id, propagate_dns_changes, read_resolved_json, wait_for_lds_ack,
+    write_file_to_container,
 };
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
@@ -2284,9 +2285,54 @@ async fn dns_propagation_loop(
         // there's work to do. When the cache is stable we skip the
         // distributor call (nothing to rewrite) but still proceed to
         // the reconciliation check below.
+        //
+        // Envoy LDS-ack gate (#38). The listener-write inside
+        // `propagate_dns_changes` is filesystem-LDS: rename returns the
+        // moment the kernel commits the new inode, but Envoy only picks
+        // up the inotify event some milliseconds later, parses, then
+        // either accepts or rejects the new generation. Flipping
+        // `propagated=true` before that resolution leaves a 100–300 ms
+        // window where the daemon advertises propagation while Envoy
+        // is still serving the previous (or no) listener. To close the
+        // race, snapshot Envoy's full `listener_manager.lds.*` counter
+        // triple BEFORE the write and wait afterwards for the next
+        // edge of either `update_success` or `update_rejected` past
+        // the snapshot. Comparing against the full snapshot (not just
+        // a literal 0) avoids a false-Rejected when Envoy startup has
+        // already ticked `update_rejected` once (e.g. the deny-all
+        // bootstrap fails LDS validation on first parse).
+        // Wait deadline 5s with 100ms polls — typical Envoy reload
+        // observed at <250ms in the M9-S18 integration test. Empty
+        // (stable_cache) cycles skip both rewrite and ack-wait —
+        // there is no rewrite to ack.
+        let probe = DockerExecLdsProbe::new(&session_id);
+        let lds_ack_deadline = Duration::from_secs(5);
+        let lds_poll_interval = Duration::from_millis(100);
         let propagate_ok = if stable_cache {
             true
         } else {
+            // Snapshot pre-rewrite counters (full triple — see the
+            // doc comment above for why we need all three, not just
+            // `update_attempt`). A probe failure here (Envoy admin
+            // not yet reachable, etc.) is treated as "no snapshot
+            // available" — the rewrite proceeds and the ack-wait
+            // below skips, falling back to file-write-success-only
+            // semantics for this cycle. Subsequent cycles retry; the
+            // loop already polls every 2s so a transient admin
+            // glitch costs at most one cycle of un-acked propagation.
+            let pre_counters = match probe.fetch_counters().await {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "DNS propagation: pre-rewrite LDS stats fetch failed; \
+                         skipping ack-wait this cycle"
+                    );
+                    None
+                }
+            };
+
             let gw = Arc::clone(&gateway);
             let pol = policy.clone();
             let c = cache.clone();
@@ -2296,7 +2342,7 @@ async fn dns_propagation_loop(
                 propagate_dns_changes(&sid, &pol, &c, &gw, &ni)
             })
             .await;
-            match propagate_result {
+            let write_ok = match propagate_result {
                 Ok(Err(e)) => {
                     warn!(
                         session_id = %session_id,
@@ -2314,6 +2360,51 @@ async fn dns_propagation_loop(
                     false
                 }
                 Ok(Ok(())) => true,
+            };
+
+            // If the listener write succeeded, wait for Envoy's LDS
+            // ack before allowing the reconciliation check below to
+            // flip `propagated=true`. On reject or timeout we
+            // suppress propagation for this cycle so the next
+            // iteration retries; on a Rejected outcome we surface a
+            // loud warning because a rejected listener is a real
+            // failure (malformed YAML, schema drift), not a
+            // benign retry.
+            if write_ok {
+                if let Some(pre) = pre_counters {
+                    let outcome =
+                        wait_for_lds_ack(&probe, pre, lds_ack_deadline, lds_poll_interval).await;
+                    match outcome {
+                        LdsAckOutcome::Accepted => true,
+                        LdsAckOutcome::Rejected => {
+                            warn!(
+                                session_id = %session_id,
+                                "Envoy REJECTED the rewritten listener; \
+                                 propagation will not be flipped this cycle. \
+                                 Inspect /config_dump and the Envoy log for \
+                                 the validation error."
+                            );
+                            false
+                        }
+                        LdsAckOutcome::TimedOut => {
+                            warn!(
+                                session_id = %session_id,
+                                deadline_ms = lds_ack_deadline.as_millis() as u64,
+                                "Envoy did not ack the listener rewrite \
+                                 within the deadline; deferring \
+                                 propagation flip to the next cycle"
+                            );
+                            false
+                        }
+                    }
+                } else {
+                    // No pre-snapshot — fall back to write-success
+                    // semantics (legacy behaviour). The probe may
+                    // recover next cycle.
+                    true
+                }
+            } else {
+                false
             }
         };
 
@@ -3653,11 +3744,8 @@ async fn poll_and_emit_component_health(state: &AppState, session_id: &SessionId
         // await point.
         let mut states = state.component_health_state.lock().await;
         let session_map = states.entry(*session_id).or_default();
-        let transition = sandbox_core::events::detect_health_transition(
-            session_map,
-            *component,
-            &health,
-        );
+        let transition =
+            sandbox_core::events::detect_health_transition(session_map, *component, &health);
         drop(states);
 
         if let Some(transition) = transition {

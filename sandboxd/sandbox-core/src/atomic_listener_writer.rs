@@ -73,7 +73,9 @@ pub fn listener_host_root() -> PathBuf {
         return PathBuf::from(override_dir);
     }
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime_dir).join("sandboxd").join("listeners");
+        return PathBuf::from(runtime_dir)
+            .join("sandboxd")
+            .join("listeners");
     }
     if let Ok(home) = std::env::var("HOME") {
         return PathBuf::from(home)

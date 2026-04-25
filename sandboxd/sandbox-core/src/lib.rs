@@ -6,6 +6,7 @@ pub mod error;
 pub mod events;
 pub mod gateway;
 pub mod guest;
+pub mod lds_ack;
 pub mod lima;
 pub mod network;
 pub mod policy;
@@ -52,6 +53,10 @@ pub use gateway::{
 pub use guest::{
     GUEST_AGENT_PORT, GuestConnector, GuestRequest, GuestResponse, MAX_MESSAGE_SIZE, read_message,
     write_message,
+};
+pub use lds_ack::{
+    DockerExecLdsProbe, LdsAckOutcome, LdsCounters, LdsStatsProbe, parse_lds_counters,
+    wait_for_lds_ack,
 };
 pub use lima::{BaseImageMeta, BaseImageStatus, LimaManager, VmInfo, VmStatus, guest_agent_path};
 pub use network::{NetworkInfo, NetworkManager};

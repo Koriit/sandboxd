@@ -1014,10 +1014,9 @@ async fn integration_killing_deny_logger_emits_health_degraded_then_restored() {
                     &health,
                 ) {
                     let event = match transition {
-                        sandbox_core::events::HealthTransition::Degraded {
-                            component,
-                            reason,
-                        } => lifecycle_events::health_degraded(monitor_sid, component, reason),
+                        sandbox_core::events::HealthTransition::Degraded { component, reason } => {
+                            lifecycle_events::health_degraded(monitor_sid, component, reason)
+                        }
                         sandbox_core::events::HealthTransition::Restored { component } => {
                             lifecycle_events::health_restored(monitor_sid, component)
                         }
