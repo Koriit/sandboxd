@@ -30,20 +30,31 @@ test:
 test-integration: gateway-image
 	cd sandboxd && cargo nextest run --workspace --profile integration
 
-tests/e2e/.venv/.installed: tests/e2e/pyproject.toml
+# The stamp filename embeds the host's Python minor version (e.g.
+# `.installed.python3.12`) so a host interpreter upgrade — say
+# 3.12 → 3.13 — invalidates the marker and forces a venv rebuild.
+# Without the embedded version, the existing `.venv` becomes
+# ABI-incompatible with the new interpreter while the stamp remains
+# fresh, and `make test-e2e` crashes with `No module named pytest`
+# (this regression bit M10-S8 Group 1).
+PY_VERSION := $(shell python3 -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')
+VENV_STAMP := tests/e2e/.venv/.installed.$(PY_VERSION)
+
+$(VENV_STAMP): tests/e2e/pyproject.toml
+	rm -rf tests/e2e/.venv
 	python3 -m venv tests/e2e/.venv
 	tests/e2e/.venv/bin/python -c \
 		"import tomllib, subprocess, sys; \
 		deps = tomllib.load(open('tests/e2e/pyproject.toml', 'rb'))['project']['dependencies']; \
 		subprocess.check_call([sys.executable, '-m', 'pip', 'install'] + deps)"
-	touch tests/e2e/.venv/.installed
+	touch $(VENV_STAMP)
 
 TEST ?=
 # test-e2e depends on gateway-image so the container running mitmproxy /
 # Envoy / CoreDNS always reflects the current `networking/` sources.
 # Forgetting to rebuild baked stale addon code into the image and produced
 # silent semantic drift between sandboxd (Rust) and the enforcement layer.
-test-e2e: tests/e2e/.venv/.installed gateway-image
+test-e2e: $(VENV_STAMP) gateway-image
 	cd tests/e2e && . .venv/bin/activate && python -m pytest -v -rs $(TEST)
 
 # Always run `docker build`; Docker's layer cache handles the no-op case
