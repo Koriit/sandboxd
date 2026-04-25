@@ -918,6 +918,93 @@ fn integration_gateway_container_has_events_bind_mount() {
     net_mgr.delete_network(&session_id).unwrap();
 }
 
+/// Verify the `SANDBOX_KEEP_SESSION_EVENTS` debug flag preserves the
+/// per-session events host directory across `stop_gateway`. Required for
+/// post-mortem debugging of E2E failures: the JSONL files (`mitmproxy.jsonl`,
+/// `coredns.jsonl`, `envoy.jsonl`, plus the deny-logger output) are the
+/// proof of which layer denied a connection. Without this flag the
+/// session-removal cleanup wipes them before a human can look.
+///
+/// This test mutates a process env var. It is safe under nextest's
+/// default per-test-process isolation, but the test snapshots and
+/// restores the var to be robust against future runner changes that
+/// might serialise tests within a process.
+#[test]
+fn integration_gateway_keep_session_events_preserves_events_dir() {
+    // Use 10.209.7.0/24 to avoid collisions with the other gateway
+    // tests in this file.
+    let net_mgr = NetworkManager::new(Ipv4Addr::new(10, 209, 7, 0), 24).unwrap();
+    let gw_mgr = GatewayManager::new();
+    let session_id = SessionId::generate();
+
+    let network_info = net_mgr.create_network(&session_id).unwrap();
+
+    let create_result = gw_mgr.create_gateway(&session_id, &network_info, None, None);
+    if let Err(ref e) = create_result {
+        let _ = gw_mgr.stop_gateway(&session_id);
+        let _ = net_mgr.delete_network(&session_id);
+        panic!("create_gateway failed: {e}");
+    }
+
+    let events_host_dir = session_events_host_dir(&session_id);
+    assert!(
+        events_host_dir.is_dir(),
+        "create_gateway must have created the events host dir at {}",
+        events_host_dir.display()
+    );
+
+    // Drop a marker file so a successful preserve-on-stop is observable
+    // beyond just "the directory exists" — the actual JSONL contents are
+    // what a human looks at during debugging.
+    let marker = events_host_dir.join("debug_marker.jsonl");
+    std::fs::write(&marker, b"{\"from\":\"keep-session-events test\"}\n")
+        .expect("writing marker file should succeed");
+
+    // Snapshot and set the flag, run stop_gateway, restore. The unsafe
+    // block matches the env-mutation pattern used in
+    // `events_host_root` / `listener_host_root` unit tests.
+    let prior = std::env::var("SANDBOX_KEEP_SESSION_EVENTS").ok();
+    // SAFETY: env mutation is process-global; nextest gives each test
+    // its own process under the integration profile, so the unsafe
+    // block is sound.
+    unsafe {
+        std::env::set_var("SANDBOX_KEEP_SESSION_EVENTS", "1");
+    }
+
+    let stop_result = gw_mgr.stop_gateway(&session_id);
+
+    unsafe {
+        match prior {
+            Some(v) => std::env::set_var("SANDBOX_KEEP_SESSION_EVENTS", v),
+            None => std::env::remove_var("SANDBOX_KEEP_SESSION_EVENTS"),
+        }
+    }
+
+    stop_result.expect("stop_gateway must succeed even with KEEP_SESSION_EVENTS");
+
+    // The flag's contract: the events host dir AND its contents survive.
+    assert!(
+        events_host_dir.exists(),
+        "with SANDBOX_KEEP_SESSION_EVENTS set, stop_gateway must NOT \
+         remove the events host dir at {}",
+        events_host_dir.display()
+    );
+    let preserved = std::fs::read_to_string(&marker)
+        .expect("marker file must survive stop_gateway under the keep flag");
+    assert_eq!(
+        preserved.trim(),
+        "{\"from\":\"keep-session-events test\"}",
+        "preserved marker contents must round-trip unchanged"
+    );
+
+    // Manual cleanup: the test caused the leak deliberately, so it
+    // owns the cleanup. (The "leaked" dir lives on tmpfs and is at
+    // most a few KB; we still tidy up so successive test runs don't
+    // accumulate.)
+    let _ = std::fs::remove_dir_all(&events_host_dir);
+    net_mgr.delete_network(&session_id).unwrap();
+}
+
 /// End-to-end policy distribution through a real gateway container.
 ///
 /// Compiles a non-trivial policy (CIDR-backed L1 rule + L2 domain rule

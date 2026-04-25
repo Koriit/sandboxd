@@ -656,8 +656,24 @@ impl GatewayManager {
         // posture as the listener dir above — the ingest layer stops
         // tailing as part of session teardown so the files are no
         // longer referenced after `docker rm`.
+        //
+        // Debug escape hatch: when `SANDBOX_KEEP_SESSION_EVENTS` is set
+        // (any non-empty value), skip the cleanup so the per-session
+        // `mitmproxy.jsonl`, `coredns.jsonl`, `envoy.jsonl`, and
+        // `deny-logger.jsonl` files survive `sandbox rm`. E2E test
+        // failures often hinge on which layer denied a connection;
+        // without this flag, the proof is gone before a human can look.
+        // The keep semantics are per-process: any session removed while
+        // the env var is set leaks its events dir, intentionally — a
+        // human is expected to inspect and clean up afterwards.
         let events_host_dir = session_events_host_dir(session_id);
-        if let Err(e) = fs::remove_dir_all(&events_host_dir) {
+        if std::env::var_os("SANDBOX_KEEP_SESSION_EVENTS").is_some_and(|v| !v.is_empty()) {
+            info!(
+                session_id = %session_id,
+                dir = %events_host_dir.display(),
+                "SANDBOX_KEEP_SESSION_EVENTS set; preserving events host dir for debugging"
+            );
+        } else if let Err(e) = fs::remove_dir_all(&events_host_dir) {
             if e.kind() != std::io::ErrorKind::NotFound {
                 warn!(
                     session_id = %session_id,
