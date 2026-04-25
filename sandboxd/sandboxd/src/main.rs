@@ -926,6 +926,19 @@ async fn create_session(
     }
 
     // If a boot command was provided, execute it in the VM.
+    //
+    // Reaching this block means the caller passed `--boot-cmd <cmd>`
+    // explicitly (the wire field is `Option<String>` with no implicit
+    // default — the CLI only populates it when `--boot-cmd` is given).
+    // Any failure here therefore violates the caller's stated intent
+    // the same way #16 (`--policy`) and #34 (`--repo`) did pre-fix:
+    // returning a `Running` session with the boot command's side
+    // effects unrealised silently lies to the operator. Mirror the
+    // fatal-create pattern (M10-S9 #53): tag the session `Error`,
+    // tear down partial gateway/network state, and surface the
+    // failure in the HTTP response so the CLI user can see *why* the
+    // boot command did not succeed (exit code, stderr snippet,
+    // transport error, etc.).
     if let Some(boot_cmd) = &req.boot_cmd {
         info!(%session_id, cmd = %boot_cmd, "executing boot command in VM");
         match state
@@ -939,13 +952,20 @@ async fn create_session(
                 stderr,
             }) => {
                 if exit_code != 0 {
-                    warn!(
-                        %session_id,
-                        exit_code,
-                        stdout = %stdout.trim(),
-                        stderr = %stderr.trim(),
-                        "boot command returned non-zero exit code (non-fatal)"
-                    );
+                    let stderr_snip = truncate_for_diagnostic(stderr.trim(), 512);
+                    let err = SandboxError::Internal(format!(
+                        "boot command {boot_cmd:?} failed with exit code {exit_code}: {stderr_snip}"
+                    ));
+                    return fail_explicit_boot_cmd(
+                        &state.store,
+                        &state.gateway,
+                        &state.network,
+                        &state.ingestors,
+                        &session_id,
+                        err,
+                    )
+                    .await
+                    .into_response();
                 } else {
                     info!(
                         %session_id,
@@ -955,25 +975,49 @@ async fn create_session(
                 }
             }
             Ok(GuestResponse::Error { message }) => {
-                warn!(
-                    %session_id,
-                    %message,
-                    "guest agent error during boot command (non-fatal)"
-                );
+                let err = SandboxError::Internal(format!(
+                    "boot command {boot_cmd:?} failed: guest agent error: {message}"
+                ));
+                return fail_explicit_boot_cmd(
+                    &state.store,
+                    &state.gateway,
+                    &state.network,
+                    &state.ingestors,
+                    &session_id,
+                    err,
+                )
+                .await
+                .into_response();
             }
             Ok(other) => {
-                warn!(
-                    %session_id,
-                    ?other,
-                    "unexpected guest response during boot command (non-fatal)"
-                );
+                let err = SandboxError::Internal(format!(
+                    "boot command {boot_cmd:?} failed: unexpected guest response: {other:?}"
+                ));
+                return fail_explicit_boot_cmd(
+                    &state.store,
+                    &state.gateway,
+                    &state.network,
+                    &state.ingestors,
+                    &session_id,
+                    err,
+                )
+                .await
+                .into_response();
             }
             Err(e) => {
-                warn!(
-                    %session_id,
-                    error = %e,
-                    "failed to execute boot command in VM (non-fatal)"
-                );
+                let err = SandboxError::Internal(format!(
+                    "boot command {boot_cmd:?} failed: transport error: {e}"
+                ));
+                return fail_explicit_boot_cmd(
+                    &state.store,
+                    &state.gateway,
+                    &state.network,
+                    &state.ingestors,
+                    &session_id,
+                    err,
+                )
+                .await
+                .into_response();
             }
         }
     }
@@ -2851,6 +2895,54 @@ async fn fail_explicit_repo_clone(
         %session_id,
         error = %e,
         "failed to clone explicit --repo URL into VM — failing create"
+    );
+    let _ = store.update_state(session_id, SessionState::Error);
+    teardown_session_networking_parts(session_id, gateway, network, ingestors).await;
+    error_response(e)
+}
+
+/// Fail the create call when an explicit `--boot-cmd <cmd>` returns a
+/// non-zero exit code, a guest-agent error, an unexpected guest
+/// response, or a transport error (M10-S9 #53).
+///
+/// Symmetric completion of the fail-explicit triad with
+/// [`fail_explicit_policy_apply`] (#16) and
+/// [`fail_explicit_repo_clone`] (#34): the boot-cmd block had the
+/// same warn-and-continue shape as the pre-fix repo-clone block, and
+/// the same hazard — when `--boot-cmd` is provided the caller is
+/// stating "the session is not usable until this command has run
+/// successfully", and a `Running` session whose boot command exit-ed
+/// 1 (or never dispatched) silently lies to that contract.
+///
+/// `boot_cmd` has no implicit / defaulted form on the wire (the CLI
+/// only populates the field when `--boot-cmd <cmd>` is given), so
+/// reaching this helper always means the failure is on an *explicit*
+/// boot command — there is no warn-and-continue branch to preserve
+/// for an absent default the way `--policy` has for the no-policy
+/// case.
+///
+/// Teardown shape matches its siblings:
+///   - mark session `Error` (so `sandbox ps` / `inspect` surface the
+///     failed create);
+///   - best-effort stop the gateway + remove the Docker network;
+///   - leave VM + CA material in place so the operator can still
+///     `sandbox rm` to reclaim the session.
+///
+/// Like its siblings, this helper takes only the [`AppState`] fields
+/// it actually reads so it can be exercised hermetically — see
+/// `tests::fail_explicit_boot_cmd_marks_session_error_and_returns_5xx`.
+async fn fail_explicit_boot_cmd(
+    store: &SessionStore,
+    gateway: &Arc<GatewayManager>,
+    network: &Arc<NetworkManager>,
+    ingestors: &Mutex<HashMap<SessionId, SessionIngestor>>,
+    session_id: &SessionId,
+    e: SandboxError,
+) -> (StatusCode, Json<ApiError>) {
+    error!(
+        %session_id,
+        error = %e,
+        "failed to run explicit --boot-cmd in VM — failing create"
     );
     let _ = store.update_state(session_id, SessionState::Error);
     teardown_session_networking_parts(session_id, gateway, network, ingestors).await;
@@ -4997,5 +5089,126 @@ mod tests {
         let out = truncate_for_diagnostic(&input, 10);
         assert!(out.starts_with(&"é".repeat(10)));
         assert!(out.ends_with("…[truncated]"));
+    }
+
+    // -----------------------------------------------------------------------
+    // fail_explicit_boot_cmd: M10-S9 #53 regression guard
+    //
+    // Pre-M10-S9, the four boot-command failure branches in
+    // `create_session` (non-zero exit, `GuestResponse::Error`,
+    // unexpected guest response, transport error) all
+    // `warn!`-swallowed the failure and the handler returned 201
+    // CREATED with a `Running` session whose boot command's side
+    // effects were unrealised — the same shape that #16
+    // (`--policy`) and #34 (`--repo`) had pre-fix. The helper
+    // extracted by M10-S9 mirrors its two siblings: when the
+    // caller supplies `--boot-cmd <cmd>` and the command does not
+    // succeed in-guest, the create call must fail.
+    //
+    // Contracts pinned here mirror the #34 test verbatim:
+    //   - 5xx response (not a 2xx that hides the failure),
+    //   - the diagnostic context built at the failure site
+    //     (operation, exit code, stderr snippet) reaches the wire
+    //     body verbatim, so the CLI user sees *why* the boot
+    //     command did not succeed,
+    //   - the session row transitions to `Error`.
+    //
+    // Like #16 and #34, the test drives the helper directly because
+    // the end-to-end `create_session` handler requires Docker + Lima,
+    // which are banned from `make test` (see CLAUDE.md
+    // "Integration-test convention").
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn fail_explicit_boot_cmd_marks_session_error_and_returns_5xx() {
+        use std::collections::HashMap;
+        use std::net::Ipv4Addr;
+
+        // Fresh store in a tempdir — same hermetic shape as the #16
+        // and #34 tests above.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (store, _orphans) =
+            SessionStore::new(tmp.path().to_path_buf()).expect("open session store");
+        let store = Arc::new(store);
+
+        // Move the session to `Running` — the only state from which
+        // `create_session` reaches the boot-command block.
+        let session = store
+            .create_session(SessionConfig::default(), Some("boot-cmd-fail-test".into()))
+            .expect("create session");
+        store
+            .update_state(&session.id, SessionState::Running)
+            .expect("transition Creating → Running");
+
+        let gateway = Arc::new(GatewayManager::new());
+        let network = Arc::new(
+            NetworkManager::new(Ipv4Addr::new(10, 209, 0, 0), 24)
+                .expect("construct NetworkManager"),
+        );
+        let ingestors: Mutex<HashMap<SessionId, SessionIngestor>> = Mutex::new(HashMap::new());
+
+        // `Internal` matches what the four boot-command failure
+        // branches in `create_session` build at the call site — they
+        // wrap exit code / stderr / transport context in
+        // `SandboxError::Internal(...)` so the message is
+        // self-describing on the wire. The synthetic shape here
+        // mirrors what the non-zero-exit branch produces in
+        // production.
+        let synthetic_err = SandboxError::Internal(
+            "boot command \"make setup\" failed with exit code 2: \
+             make: *** [setup] Error 2"
+                .into(),
+        );
+        let (status, Json(body)) = fail_explicit_boot_cmd(
+            &store,
+            &gateway,
+            &network,
+            &ingestors,
+            &session.id,
+            synthetic_err,
+        )
+        .await;
+
+        // Contract 1: 5xx surfaces the failure to the caller.
+        // `SandboxError::Internal` maps to 500 (see error_response
+        // mapping table above).
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "boot-cmd failure must map to 500, not a 2xx that hides the failure"
+        );
+        // Contract 1b: the diagnostic context built at the failure
+        // site (operation, exit code, stderr snippet) reaches the
+        // wire body. Without this, the CLI user sees a 500 with no
+        // actionable hint about *why* the boot command failed.
+        assert!(
+            body.error.contains("boot command"),
+            "error body should mention the operation that failed, got: {}",
+            body.error
+        );
+        assert!(
+            body.error.contains("exit code 2"),
+            "error body should pass exit code through, got: {}",
+            body.error
+        );
+        assert!(
+            body.error.contains("Error 2"),
+            "error body should pass stderr snippet through, got: {}",
+            body.error
+        );
+
+        // Contract 2: the session is in `Error` state so `sandbox ps`
+        // / `inspect` surface the failed create rather than a
+        // misleading `Running` row whose boot command's side effects
+        // are unrealised.
+        let reloaded = store
+            .get_session(&session.id)
+            .expect("store readable")
+            .expect("session row still present");
+        assert_eq!(
+            reloaded.state,
+            SessionState::Error,
+            "session must be marked Error so ps/inspect can surface the failed create"
+        );
     }
 }
