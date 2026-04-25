@@ -1,12 +1,29 @@
 {
   "_comment": [
-    "Fixture: documented network endpoints exercised by `cargo fetch` / `cargo build`",
+    "Fixture: network endpoints exercised by `cargo fetch` / `cargo build`",
     "against an empty cache on Rust 1.70+ (sparse-index default).",
     "",
-    "Source of truth: cargo 1.70 release notes (sparse protocol default),",
-    "https://doc.rust-lang.org/cargo/reference/registry-index.html#web-api,",
-    "and https://doc.rust-lang.org/cargo/reference/environment-variables.html",
-    "for the default `CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse` setting.",
+    "Source of truth (documentation):",
+    "- cargo 1.70 release notes (sparse protocol default),",
+    "- https://doc.rust-lang.org/cargo/reference/registry-index.html#web-api,",
+    "- https://doc.rust-lang.org/cargo/reference/environment-variables.html",
+    "  for the default `CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse` setting.",
+    "",
+    "Source of truth (live verification — M10-S8 todo #36, 2026-04-25):",
+    "Booted a sandbox VM with a hand-rolled policy permitting Ubuntu apt",
+    "mirrors + the three documented cargo hosts + the Fastly Anycast CIDR",
+    "pool (151.101.0.0/16, 146.75.0.0/17). apt-installed cargo 1.75.0",
+    "inside the VM, then ran `cargo new` + `cargo add serde@1` + `cargo",
+    "fetch -v` against an empty CARGO_HOME. Captured mitmproxy events on",
+    "the gateway data plane and filtered to the cargo-phase window via an",
+    "RFC3339 timestamp marker. Observed cargo-phase hosts:",
+    "  - index.crates.io  (sparse index lookups)",
+    "  - static.crates.io (crate tarball downloads, ~7 crates pulled)",
+    "Did NOT observe `crates.io` (apex) — sparse mode bypasses the web-API",
+    "redirector and goes straight to the CDN. The apex is retained in the",
+    "preset because it remains required for `cargo publish`, `cargo",
+    "search`, `cargo yank`, and any tooling that hits the JSON web API.",
+    "Findings artifact (one-off): /tmp/m10s8-todo36-cargo-trace.json.",
     "",
     "This file freezes the set of hosts the `cargo` built-in preset must allow.",
     "The drift-detection unit test in `src/presets/builtin.rs` (see",
@@ -14,36 +31,34 @@
     "diverges from this fixture, forcing a conscious update with a",
     "corresponding spec/docs review (D-9 + \"Known gaps\" bullet).",
     "",
-    "Verification method: spec-documented endpoint enumeration rather than",
-    "a live trace — booting a throwaway VM + priming an empty cargo cache",
-    "+ running strace on cargo's TLS connections exceeded the M10-S5 time",
-    "budget. When a future milestone boots a guest with full outbound",
-    "network access, this file should be regenerated from a real pcap /",
-    "tcpdump + DNS log pair to catch any undocumented endpoints (e.g. new",
-    "telemetry hosts)."
+    "If a future cargo release introduces new telemetry / metrics hosts",
+    "(e.g. a sparse-index health-check endpoint or a publish-time",
+    "verification host), regenerate by running the live-trace methodology",
+    "above against the new toolchain and update both this fixture AND the",
+    "preset's host list in src/presets/builtin.rs::expand_cargo."
   ],
   "schema_version": 1,
-  "cargo_version": "1.87 (2026-04 toolchain — documented endpoint set)",
-  "captured_at": "2026-04-23",
-  "source": "documented",
+  "cargo_version": "1.75.0 (Ubuntu noble apt) — sparse-index protocol",
+  "captured_at": "2026-04-25",
+  "source": "live",
   "hosts": [
     {
       "host": "index.crates.io",
       "purpose": "Sparse-protocol registry index. Default since Rust 1.70.",
       "methods": ["GET", "HEAD"],
-      "notes": "Replaces the older git-based registry on crates.io-index.git. Cargo hits this first to resolve versions."
+      "notes": "Replaces the older git-based registry on crates.io-index.git. Cargo hits this first to resolve versions. Confirmed live (M10-S8 todo #36, 2026-04-25): observed during `cargo fetch` cargo-phase window."
     },
     {
       "host": "crates.io",
       "purpose": "Registry web API: search, yank, publish, owner management, and the `/api/v1/crates/<name>/<version>/download` redirector.",
       "methods": ["GET", "POST", "PUT", "DELETE", "HEAD"],
-      "notes": "The download endpoint is a 302 that points at `static.crates.io`; cargo follows it to fetch the tarball."
+      "notes": "Sparse-mode `cargo fetch` does NOT contact this host (verified live 2026-04-25 — sparse fetch goes index.crates.io → static.crates.io directly). Retained in preset because it remains required for `cargo publish`, `cargo search`, `cargo yank`, and any non-fetch web-API tooling."
     },
     {
       "host": "static.crates.io",
       "purpose": "CDN host that serves crate tarballs and (historically) RSS feeds.",
       "methods": ["GET", "HEAD"],
-      "notes": "Receives the redirected download requests from `crates.io/api/v1/crates/.../download`."
+      "notes": "Confirmed live (M10-S8 todo #36, 2026-04-25): every crate tarball download (serde, serde_core, serde_derive, syn, quote, proc-macro2, unicode-ident) hit this host. Fronted by Fastly Anycast (151.101.0.0/16, 146.75.0.0/17) — see CARGO_FASTLY_CIDR_POOL in `expand_cargo` for IP-pinning rationale (todo #40)."
     }
   ]
 }
