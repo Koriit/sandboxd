@@ -1,11 +1,11 @@
 {
   "current_state": {
     "milestone": "M10",
-    "session": "M10-S8",
-    "status": "finished",
-    "completed_sessions": 67,
-    "total_sessions": 67,
-    "next": "M11 planning (starts with spec)",
+    "session": "M10-S9",
+    "status": "completed",
+    "completed_sessions": 68,
+    "total_sessions": 69,
+    "next": "M10-S10: Synchronous DNS-policy gating",
     "block_reason": "Spec premise falsified: mitmproxy 11.1.3 does not support PROXY protocol v2 reception \u2014 the design-spec's core mechanism for bridging Envoy\u2192mitmproxy cannot be used off-the-shelf. User must choose between (A) write custom mitmproxy layer/addon in-tree that parses PROXY v2 header before TransparentProxy runs (~80-120 lines Python parser + nontrivial hook into layer stack); (B) fork/alternative mitmproxy version (no upstream release has it); (C) different destination-preservation mechanism (TPROXY / reverse-proxy-per-dest \u2014 both defeat the single-mediated-egress design goal); (D) split the spec \u2014 ship Envoy-half in M9-S18 with mitmproxy still on SO_ORIGINAL_DST, amend M9-S19/S20 to cover the missing mitmproxy PROXY-v2 addon work. Planner recommends Option A with low confidence; cheapest alternative is Option D but requires spec amendment. Full verification + source refs + option analysis in the planner CLARIFY (last subagent response) and referenced in .tasks/handoffs/20260419-172418-explore-envoy-mitmproxy-current-state.md."
   },
   "append_system_prompt": "We are building sandbox daemon with Lima VMs for coding agents.  \nSpecifically: .tasks/specs/2026-04-21-port-explicit-policies-presets-observability-design.md  \nSession plan: docs/internal/session-plan.md\n\nUse /session-tracking for progress tracking. Log decisions and discoveries \u2014 they survive compaction. Block if design cannot be implemented.\n\nYou are running unsupervised \u2014 make autonomous decisions and do not wait for user input. If you hit an issue only the user can resolve, use progress block to pause the session.\n\nKeep context clean: delegate exploration and implementation to subagents. Reserve main conversation for decisions and coordination.\n\nLeverage teams, especially when there are build tools and tests involved, as those usually produce a lot of logs and are good fit for dedicated teammate to run them.\n\nYou are running in isolated VM with passwordless sudo. You can install packages and change system settings as needed.",
@@ -1288,6 +1288,39 @@
         "Live cargo fetch trace fixture (source: live, captured 2026-04-25)",
         "M10-S8 closeout note in docs/internal/milestones/M10.md"
       ]
+    },
+    {
+      "session": "M10-S9",
+      "title": "Residual M10-S8 follow-up sweep",
+      "summary": "Residual M10-S8 follow-up sweep delivered: 9 todos resolved with code across 9 atomic commits (#44 ccd0fd7, #45 c7185be, #46 f410df1, #47 9258a3e, #51 05dbd48, #52 3579c11, #53 ca7b5b7, #54 472da76, #59 371ef00) + hygiene commit 293bda6. Gates: make test 955/955, make test-integration 19/19, make test-e2e 46/46 (46:05). Branch m10-s9-residual-sweep tip 293bda6 (no push, no PR). Five todos remain deferred: #29 UDP conntrack (M11), #55 DNS-rotation architectural fix (M10-S10 next), #56/#57 watch-only, #58 slow-test promotion.",
+      "completed": "2026-04-25T19:19:05.204177Z",
+      "decisions": [
+        "M10 expanded post-S8 closeout to add S9 (residual sweep, 9 todos: #44 #45 #46 #47 #51 #52 #53 #54 #59) and S10 (synchronous DNS-policy gating + CIDR-pool workaround removal, with new spec authored in-session at .tasks/specs/2026-04-25-synchronous-dns-policy-gating-design/). Branch m10-s9-residual-sweep cut from m10-s8-polish-sweep tip 65e2d37 (which carries the planning commit). Dropped duplicates #49 (subsumed by #51) and #50 (subsumed by #52). User signed off on per-session ALL-tests-pass gate for S10 and on a formal spec rather than a design note.",
+        "Group A landed in 4 atomic commits (c7185be #45 clap env feature, ccd0fd7 #44 venv version-stamp, 9258a3e #47 XDG events_host_root, 472da76 #54 SANDBOX_KEEP_SESSION_EVENTS). Subagent decisions: #44 used embedded-version-in-stamp-filename (.installed.python3.12) so make natively detects interpreter rolls; rm -rf .venv in recipe handles stale 3.13/ overlay; #54 gated only session-removal cleanup (line 660), NOT start-of-session cleanup (line 343) which defends against same-session-ID bind-mount collisions; used is_some_and(!v.is_empty()) so empty env value does not enable preservation; sibling integration test on 10.209.7.0/24 to avoid collision.",
+        "Group B #51 chose Path B (doc-correction over compiler rewrite). Commit 05dbd48 \u2014 corrected rustdoc in policy.rs (compile_envoy_listener, listener_yaml_for_filter_chains, envoy_deny_all_listener, CompiledPolicy.envoy_listener_config) and atomic_listener_writer.rs preamble; removed false 'in-place / non-draining' claims; documented real invariant (listener identity preserved, but Envoy services rewrites via warm-restart-with-drain). Locked contract via second synthetic stat_prefix-only rewrite in integration_gateway_lds_listener_and_atomic_rewrite asserting listener_modified ticks, listener_in_place_updated stays equal, total_listeners_draining advances (Envoy default 600s drain timer means gauge does NOT return to zero \u2014 test must witness gauge ADVANCING, not returning to zero), total_listeners_active >= 1, identity preserved in /config_dump.",
+        "Group B #52 commit 3579c11 added GatewayStatus::Starting variant + two-stage probe in gateway_status() \u2014 composite /healthcheck.sh THEN listener_manager.total_listeners_active via Envoy admin /stats?filter=^listener_manager\\.total_listeners_active. Public method gateway_listener_active_count() added. Updated 4 pre-policy assertions (Healthy \u2192 Starting), main.rs status formatter adds 'starting', gateway_monitor recovery does not restart on Starting, network reconciliation Healthy|Starting \u2192 no-op. Stage-2 fallback to Healthy on stat-fetch failure intentional: admin port reachability not strictly required for serving traffic; stage-1 process liveness already catches real Envoy crash. New integration_gateway_status_witnesses_active_listener (10.209.8.0/24) pins both transitions.",
+        "Group C #46 commit f410df1 \u2014 integration_distribute_returns_err_when_gateway_rejects_policy uses overlapping CIDR intervals (10.0.0.0/8 + 10.1.0.0/16) at same (port, protocol). Both pass validate_cidr and yield distinct (host, port) keys, so PolicyCompiler::validate accepts; both end up in policy_allow_tcp set with flags interval which nftables 1.0.6 rejects with 'File exists'. Asserts SandboxError::Gateway variant (not message) \u2014 matches error_response() 500 mapping. Subnet 10.209.9.0/24.",
+        "Group C #59 commit 371ef00 chose Path A (per-host method-set equality). Required fixture reshape: cargo_fetch_trace.json crates.io.methods was [GET POST PUT DELETE HEAD] (host capability surface) \u2014 tightened to [GET HEAD] to match consume-only preset's actual emission. Added _comment block documenting methods-encodes-preset-intent semantics. notes for crates.io still describe broader API surface so deferred grant remains discoverable. Equality on sets gives bidirectional drift detection; failure prints per-host diff.",
+        "Group D #53 commit ca7b5b7 \u2014 completes the fail-explicit triad (#16 policy, #34 repo, #53 boot-cmd). New helper fail_explicit_boot_cmd mirrors siblings: marks session Error, best-effort teardown_session_networking_parts, error_response(e) \u2192 5xx. Boot-cmd has no implicit-default on the wire (CLI populates only when --boot-cmd passed), so reaching the helper always means explicit failure \u2014 no warn-and-continue branch to preserve. All four failure branches funnel through helper: non-zero exit, GuestResponse::Error, unexpected guest response, transport error \u2014 each builds self-describing SandboxError::Internal carrying operation + exit code + truncated stderr (truncate_for_diagnostic). New hermetic unit test fail_explicit_boot_cmd_marks_session_error_and_returns_5xx mirrors the other two.",
+        "Hygiene commit 293bda6 cleared fmt drift (Group C #59 introduced) + clippy doc-lazy-continuation (preset/builtin.rs and gateway_integration.rs). Subagent fixed clippy by moving '+' to end of prior line rather than indenting \u2014 preserves markdown intent (parenthetical CIDR joiners, not list bullets). 955/955 nextest green, fmt clean, clippy clean."
+      ],
+      "discoveries": [
+        "Host python3 is 3.12 but tests/e2e/.venv/lib/ contains python3.13/ \u2014 the exact bug #44 fixes, evidence it bit this host already. New .installed.python3.12 stamp will not match, next make test-e2e triggers clean rebuild. Also: events/mod.rs had stale 'not migrated yet' comment from M10-S8 cf54d8b, replaced with the function's resolution-order docstring during #47.",
+        "Envoy default drain timer is 600s \u2014 total_listeners_draining stays at 1 for the entire window after warm-restart-with-drain. Tests must witness the gauge ADVANCING from prior reading, not returning to zero. Composite /healthcheck.sh already covers Envoy /ready, CoreDNS /health, mitmproxy, deny-logger \u2014 but Envoy /ready does not gate on listener count. The two-stage stat probe closes that gap.",
+        "nftables 1.0.6 rejects overlapping CIDR intervals in flags-interval concat-set with 'File exists' (verified via nft -c -f -). Pinning on SandboxError::Gateway variant rather than message keeps test resilient to nft string changes. Cargo fixture had pre-live-verification asymmetry between methods arrays and preset emission; cleared up incidentally during #59.",
+        "Full E2E gate: 46/46 passed in 46:05 wall clock on tip 293bda6 \u2014 same suite size as M10-S8 closeout (46 tests, 45:44 then). No new E2E tests added or removed in M10-S9. No flakes triggered (test_github_repo_preset_scopes_to_one_repo and test_cargo_preset_allows_cargo_fetch both passed first try). Log at /tmp/m10s9-final-e2e.log."
+      ],
+      "artifacts": [
+        ".tasks/specs/2026-04-25-synchronous-dns-policy-gating-design/",
+        "docs/internal/milestones/M10.md",
+        "sandboxd/sandbox-core/src/events/",
+        "sandboxd/sandbox-core/src/policy.rs",
+        "sandboxd/sandbox-core/src/gateway.rs",
+        "sandboxd/sandbox-core/src/atomic_listener_writer.rs",
+        "sandboxd/sandbox-core/tests/gateway_integration.rs",
+        "sandboxd/sandboxd/src/main.rs",
+        "sandboxd/sandbox-cli/src/presets/builtin.rs"
+      ]
     }
   ],
   "todos": [
@@ -1715,28 +1748,40 @@
       "text": "Add Python-version sentinel to tests/e2e/.venv/.installed Makefile rule so venv rebuilds when interpreter version changes (e.g., embed python-X.Y in stamp filename).",
       "added_session": "M10-S8",
       "added_timestamp": "2026-04-24T23:05:10.988398Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M10-S9",
+      "resolved_session": "M10-S9",
+      "resolved_timestamp": "2026-04-25T17:02:56.619913Z"
     },
     {
       "id": 45,
       "text": "Add clap/env to sandboxd's direct deps so 'cargo check -p sandboxd' works in isolation. Currently builds only via workspace feature unification through sandbox-deny-logger.",
       "added_session": "M10-S8",
       "added_timestamp": "2026-04-24T23:05:12.968832Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M10-S9",
+      "resolved_session": "M10-S9",
+      "resolved_timestamp": "2026-04-25T17:02:56.619959Z"
     },
     {
       "id": 46,
       "text": "Integration test for #16: trigger a real PolicyDistributor::distribute failure end-to-end (syntactically-valid policy the gateway rejects) to exercise the fatal-failure path through the full create flow. Hermetic unit test currently pins the contract; this would catch regressions in the trigger path itself.",
       "added_session": "M10-S8",
       "added_timestamp": "2026-04-24T23:05:14.481921Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M10-S9",
+      "resolved_session": "M10-S9",
+      "resolved_timestamp": "2026-04-25T17:56:10.850705Z"
     },
     {
       "id": 47,
       "text": "EVENTS_HOST_ROOT (/tmp/sandboxd-events) is the next candidate for XDG migration (same pattern as #20 listener path). Forward-pointing doc comment left in events/mod.rs for the next reader.",
       "added_session": "M10-S8",
       "added_timestamp": "2026-04-25T00:21:38.681165Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M10-S9",
+      "resolved_session": "M10-S9",
+      "resolved_timestamp": "2026-04-25T17:02:56.619964Z"
     },
     {
       "id": 48,
@@ -1752,42 +1797,58 @@
       "text": "Investigate LDS in-place vs warm-restart-with-drain mismatch: design comment at sandbox-core/src/policy.rs:1158 claims filter-chain-only rewrites don't drain, but runtime shows listener_modified ticks + total_listeners_draining 0\u21921 even on valid-\u2192valid rewrites. Hypothesis: Envoy in-place path applies only to changes within filter_chains: (named match list), not default_filter_chain: (catch-all). PolicyCompiler currently emits the latter for L1 passthrough. Either fix the compiler to use filter_chains: where in-place semantics matter, or correct the design comment. Discovered during Group 5 #22 investigation; full evidence in handoff 20260425-101213-m10-s8-group5-lds-test-hardening.md.",
       "added_session": "M10-S8",
       "added_timestamp": "2026-04-25T08:14:42.155221Z",
-      "status": "deferred"
+      "status": "dropped",
+      "resolved_session": "M10-S9",
+      "resolved_timestamp": "2026-04-25T16:37:17.896926Z"
     },
     {
       "id": 50,
       "text": "Gateway health check witnesses processes running, not an active listener. integration_gateway_lds_listener_and_atomic_rewrite shows gateway_status() == Healthy holds even when bootstrap listener is rejected by Envoy (total_listeners_active == 0). Health check should require at least one active listener after first successful LDS update. Discovered during Group 5 #22 investigation.",
       "added_session": "M10-S8",
       "added_timestamp": "2026-04-25T08:14:42.356830Z",
-      "status": "deferred"
+      "status": "dropped",
+      "resolved_session": "M10-S9",
+      "resolved_timestamp": "2026-04-25T16:37:17.896958Z"
     },
     {
       "id": 51,
       "text": "M10-S8 Group 5 follow-up: investigate in-place-vs-drain mismatch \u2014 design comment at sandbox-core/src/policy.rs:1158 says filter-chain-only rewrite is in-place; runtime stats show warm-restart-with-drain (listener_modified ticks, total_listeners_draining 0\u21921) for the test's emit shape (uses default_filter_chain:). Verify whether populated filter_chains: shape behaves the same. If yes, connection preservation across rule edits is not actually achieved.",
       "added_session": "M10-S8",
       "added_timestamp": "2026-04-25T08:24:57.031544Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M10-S9",
+      "resolved_session": "M10-S9",
+      "resolved_timestamp": "2026-04-25T17:35:42.422877Z"
     },
     {
       "id": 52,
       "text": "M10-S8 Group 5 follow-up: gateway health check should witness an active listener, not just running processes. Current Healthy state passes when bootstrap listener is rejected by Envoy (total_listeners_active=0, lds.update_rejected=1). Production risk: a policy-compiled listener rejected at runtime would still report Healthy in GatewayManager.",
       "added_session": "M10-S8",
       "added_timestamp": "2026-04-25T08:24:59.973691Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M10-S9",
+      "resolved_session": "M10-S9",
+      "resolved_timestamp": "2026-04-25T17:35:42.422925Z"
     },
     {
       "id": 53,
       "text": "Symmetry follow-up to #34: boot_cmd block in create_session (sandboxd/sandboxd/src/main.rs ~line 924-980) still has the warn-and-continue pattern for guest exec failures. If --boot-cmd fails, session ends up Running anyway. Consider extending fail_explicit_repo_clone-style fatal-failure path to boot_cmd for symmetry. Out of scope for #34 (no failing E2E).",
       "added_session": "M10-S8",
       "added_timestamp": "2026-04-25T08:45:30.591826Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M10-S9",
+      "resolved_session": "M10-S9",
+      "resolved_timestamp": "2026-04-25T18:07:35.935225Z"
     },
     {
       "id": 54,
       "text": "M10-S5: pytest cleanup deletes session events on remove \u2014 set SANDBOX_KEEP_SESSION_EVENTS or test-side preservation flag for E2E debugging (mitmproxy.jsonl + deny-logger.jsonl)",
       "added_session": "M10-S8",
       "added_timestamp": "2026-04-25T12:48:03.526075Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M10-S9",
+      "resolved_session": "M10-S9",
+      "resolved_timestamp": "2026-04-25T17:02:56.619967Z"
     },
     {
       "id": 55,
@@ -1822,7 +1883,10 @@
       "text": "Drift-detection unit test cargo_preset_matches_frozen_trace currently only compares hosts[].host strings against preset domains \u2014 does not catch drift in methods/purpose/notes fields. If a future cargo version introduces a new HTTP method or changes a host's role, the test stays green even though the fixture has rotted. Consider extending the assertion to compare methods sets too, or accept the gap as documentation-only and add a comment. Low-priority. Surfaced during M10-S8 Group 10 review.",
       "added_session": "M10-S8",
       "added_timestamp": "2026-04-25T14:04:14.084265Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M10-S9",
+      "resolved_session": "M10-S9",
+      "resolved_timestamp": "2026-04-25T17:56:10.850749Z"
     }
   ],
   "plan": "docs/internal/session-plan.md",
@@ -1906,6 +1970,12 @@
       "old_total": 66,
       "new_total": 67,
       "reason": "Add M10-S8 for user polish & refactor: integration-test mechanism migration (naming prefix + nextest profile), flaky tcp-test root-cause fix, lima test categorization. Surfaced as needs while shipping M10."
+    },
+    {
+      "timestamp": "2026-04-25T16:37:09.796191Z",
+      "old_total": 67,
+      "new_total": 69,
+      "reason": "M10 expanded post-S8: M10-S9 residual sweep + M10-S10 synchronous DNS-policy gating"
     }
   ]
 }
