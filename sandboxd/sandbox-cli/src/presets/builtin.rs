@@ -482,8 +482,8 @@ const GITHUB_REPO_RAW_TEMPLATES: &[RepoTemplate] = &[
 /// signed-URL integrity, and a CIDR allow-rule whose IP space happens to
 /// overlap with those Fastly/Pages CDNs would risk pulling those flows
 /// through mitmproxy via the L3 listener chain. Keeping the pool
-/// constrained to the well-known interactive ranges (`140.82.112.0/20`
-/// + `192.30.252.0/22`) makes the rotation-resilience fix targeted and
+/// constrained to the well-known interactive ranges (`140.82.112.0/20` +
+/// `192.30.252.0/22`) makes the rotation-resilience fix targeted and
 /// reversible.
 ///
 /// **Contract.** A CIDR rule emitted from this pool is at
@@ -1017,10 +1017,8 @@ mod tests {
             .iter()
             .filter_map(|r| match (&r.host, &r.level) {
                 (Destination::Domain(host), AssuranceLevel::Http { http_filters }) => {
-                    let methods: BTreeSet<String> = http_filters
-                        .iter()
-                        .map(|f| f.method.to_string())
-                        .collect();
+                    let methods: BTreeSet<String> =
+                        http_filters.iter().map(|f| f.method.to_string()).collect();
                     Some((host.clone(), methods))
                 }
                 // CIDR rules are out of scope; non-Http levels would
@@ -1047,9 +1045,7 @@ mod tests {
             for host in all_hosts {
                 match (preset_methods.get(host), fixture_methods.get(host)) {
                     (Some(p), Some(f)) if p != f => {
-                        diffs.push(format!(
-                            "  host {host:?}: preset {p:?} != fixture {f:?}"
-                        ));
+                        diffs.push(format!("  host {host:?}: preset {p:?} != fixture {f:?}"));
                     }
                     (Some(p), None) => {
                         diffs.push(format!(

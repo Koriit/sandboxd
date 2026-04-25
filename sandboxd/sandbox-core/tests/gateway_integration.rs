@@ -1171,8 +1171,8 @@ fn integration_gateway_keep_session_events_preserves_events_dir() {
 
 /// End-to-end policy distribution through a real gateway container.
 ///
-/// Compiles a non-trivial policy (CIDR-backed L1 rule + L2 domain rule
-/// + L3 domain rule) and pushes it through `PolicyDistributor::distribute`
+/// Compiles a non-trivial policy (CIDR-backed L1 rule + L2 domain rule +
+/// L3 domain rule) and pushes it through `PolicyDistributor::distribute`
 /// against a live gateway. Asserts the four production-side acceptance
 /// signals:
 ///   1. `distribute()` returns `Ok(())` end-to-end (no
