@@ -50,7 +50,7 @@ Sandbox daemon providing isolated Linux VMs (Lima/QEMU) for coding agents. Per-m
 
 ## M10 — Port-explicit policies, presets, and observability
 **Goal.** v2 policy schema with explicit ports, CLI-local preset system, unified event surface across all policy layers.
-**Status.** in_progress · **Sessions.** 8 · **Details.** [milestones/M10.md](milestones/M10.md)
+**Status.** in_progress (S8 done, S9 next) · **Sessions.** 10 · **Details.** [milestones/M10.md](milestones/M10.md)
 
 ---
 
