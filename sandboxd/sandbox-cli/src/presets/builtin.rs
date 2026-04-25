@@ -142,22 +142,6 @@ fn http_rule(host: &str, filters: Vec<HttpFilter>) -> PolicyRule {
     }
 }
 
-/// Build an `http`-level rule for `(cidr, 443, tcp)` with the given
-/// method-filter set. Used by the github-repo preset to emit CIDR
-/// rules covering GitHub's interactive-infrastructure pool — see
-/// [`GITHUB_INTERACTIVE_CIDR_POOL`].
-fn http_rule_cidr(cidr: &str, filters: Vec<HttpFilter>) -> PolicyRule {
-    PolicyRule {
-        host: Destination::Cidr(cidr.to_string()),
-        port: 443,
-        protocol: Protocol::Tcp,
-        reason: None,
-        level: AssuranceLevel::Http {
-            http_filters: filters,
-        },
-    }
-}
-
 /// Build a `tls`-level rule for `(host, 443, tcp)`. Used by
 /// `github-repo` for `objects.githubusercontent.com` and
 /// `release-assets.githubusercontent.com`, whose URLs are signed and
@@ -208,73 +192,20 @@ fn expand_cargo(_inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetError>
     // - `crates.io`        — registry web API + download redirector.
     // - `static.crates.io` — CDN host that serves crate tarballs
     //                        (302 target of the download redirector).
-    let mut rules = consume_rules(&["crates.io", "index.crates.io", "static.crates.io"]);
-
-    // DNS-rotation resilience: `index.crates.io` and `static.crates.io`
-    // are served from Fastly's Anycast pool. Fastly publishes a low TTL
-    // (≤2s on these hostnames at time of writing), and consecutive
-    // resolutions from a guest VM's `getaddrinfo` can land on a
-    // different Fastly POP than the one CoreDNS observed and reported
-    // to sandboxd's nft propagation loop — so the v2 `policy_allow_tcp`
-    // set is keyed on a stale IP set, and the curl that follows hits
-    // the deny-logger and gets RST. The propagation loop's 2s poll
-    // cannot reliably out-pace a TTL=2s rotation. Adding CIDR-host
-    // rules covering the Fastly Anycast ranges admits all rotated IPs
-    // at L3 and routes them through Envoy + mitmproxy, where the
-    // domain rules (`host: index.crates.io`, ...) drive the HTTP-level
-    // allow/deny decision. See [`CARGO_FASTLY_CIDR_POOL`] for the
-    // ranges and rationale.
-    let crates_io_filters = method::get_head();
-    for cidr in CARGO_FASTLY_CIDR_POOL {
-        rules.push(http_rule_cidr(cidr, crates_io_filters.clone()));
-    }
-    Ok(rules)
+    //
+    // Historical note: M10-S8 (#40, commit 9d1dca7) emitted an
+    // additional `Destination::Cidr` rule pool covering Fastly's
+    // Anycast supernets (`151.101.0.0/16` + `146.75.0.0/17`) to paper
+    // over a DNS-rotation propagation race. M10-S10 closes that race
+    // architecturally via synchronous DNS-policy gating; the CIDR pool
+    // was retired in this milestone — see
+    // `.tasks/specs/2026-04-25-synchronous-dns-policy-gating-design/`.
+    Ok(consume_rules(&[
+        "crates.io",
+        "index.crates.io",
+        "static.crates.io",
+    ]))
 }
-
-/// Fastly's published Anycast IPv4 pool serving `index.crates.io` and
-/// `static.crates.io`.
-///
-/// Sourced from Fastly's public IP ranges
-/// (`https://api.fastly.com/public-ip-list`); the two `/16`-class
-/// supernets below collapse the dozens of Fastly POPs that crates.io's
-/// CDN rotates through under DNS-based load balancing into the
-/// minimal-viable allow-set. The v2 `policy_allow_tcp` nftables set is
-/// keyed on the IP at the moment CoreDNS resolves the hostname, so a
-/// guest that re-resolves `index.crates.io` between the propagation
-/// loop's 2s ticks (Fastly TTL is ≤2s) can land on an IP outside the
-/// cached set and get RST by the deny-logger. The CIDR rules emitted
-/// from this pool give Envoy an L3 filter chain for those rotated-out
-/// IPs, routing them through mitmproxy where the domain rules drive
-/// the actual allow/deny decision.
-///
-/// `crates.io` (the redirector) is **not** Fastly-fronted — it
-/// resolves to AWS / CloudFront IPs. We deliberately do not allow
-/// AWS supernets here: the redirector's typical workflow returns a
-/// 302 to `static.crates.io` quickly, the daemon's 2s poll picks up
-/// the AWS IPs once observed, and any over-broad CIDR (e.g.
-/// `3.0.0.0/8`) would let unrelated AWS infrastructure land in the
-/// L3 chain — counter to least-privilege. The Fastly pool is the
-/// minimum needed to fix the observed rotation race.
-///
-/// **Contract.** Each CIDR rule is `AssuranceLevel::Http` so it
-/// generates an L3 (mitmproxy) filter chain in the Envoy listener.
-/// mitmproxy then matches the request against the *domain* rules
-/// (`host: index.crates.io`, `host: static.crates.io`) by fnmatch on
-/// the HTTP `Host` header — a CIDR-string `host` never matches a
-/// hostname, so the CIDR rule's `http_filters` list is structurally
-/// required (validate rejects empty `http_filters`) but is dead at
-/// runtime. We mirror the consume-posture filter shape (`GET /**`,
-/// `HEAD /**`) so a future code path that *did* match by IP would
-/// still scope to the same allowed surface.
-const CARGO_FASTLY_CIDR_POOL: &[&str] = &[
-    // Fastly Anycast — primary supernet that contains the
-    // 151.101.x.137 IP set observed in pcap from a real
-    // `cargo fetch` against `static.crates.io`.
-    "151.101.0.0/16",
-    // Fastly Anycast — secondary supernet that contains the
-    // 146.75.x.137 IP set observed from `index.crates.io`.
-    "146.75.0.0/17",
-];
 
 fn expand_goproxy(_inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetError> {
     Ok(consume_rules(&["proxy.golang.org", "sum.golang.org"]))
@@ -462,53 +393,6 @@ const GITHUB_REPO_RAW_TEMPLATES: &[RepoTemplate] = &[
     },
 ];
 
-/// GitHub's published interactive-infrastructure IPv4 CIDR pool.
-///
-/// Sourced from `https://api.github.com/meta` (the `git`/`web` arrays).
-/// These two ranges cover the IP addresses that `github.com`,
-/// `codeload.github.com`, and `api.github.com` rotate through under
-/// DNS-based load balancing — the v2 schema's per-`(host, port)`
-/// nftables allow-set is keyed on the IP at the moment of CoreDNS
-/// resolution, so a client that resolves `github.com` independently
-/// (typical for `git`'s in-VM `getaddrinfo`) can land on an IP that
-/// isn't in the gateway's cached set. See todo #39 in
-/// `docs/internal/milestones/M10.md`.
-///
-/// The `185.199.108.0/22` (Pages CDN, raw.githubusercontent.com) and
-/// `143.55.64.0/20` (additional infrastructure) ranges are deliberately
-/// **excluded** from this pool: this preset routes
-/// `objects.githubusercontent.com` and `release-assets.githubusercontent.com`
-/// through TLS passthrough (`AssuranceLevel::Tls`) so they can hold
-/// signed-URL integrity, and a CIDR allow-rule whose IP space happens to
-/// overlap with those Fastly/Pages CDNs would risk pulling those flows
-/// through mitmproxy via the L3 listener chain. Keeping the pool
-/// constrained to the well-known interactive ranges (`140.82.112.0/20` +
-/// `192.30.252.0/22`) makes the rotation-resilience fix targeted and
-/// reversible.
-///
-/// **Contract.** A CIDR rule emitted from this pool is at
-/// `AssuranceLevel::Http` so it generates an L3 (mitmproxy) filter
-/// chain in the Envoy listener — that's the routing target for any
-/// VM-resolved IP that landed outside the cached `github.com` set.
-/// mitmproxy then matches the request against the *domain* rules
-/// (`host: github.com`, `host: api.github.com`, `host: codeload.github.com`)
-/// via fnmatch on the HTTP `Host` header — a CIDR-string `host`
-/// (e.g. `"140.82.112.0/20"`) never matches a hostname, so the CIDR
-/// rule's `http_filters` list is structurally required (validate
-/// rejects empty `http_filters`) but never exercised at runtime.
-/// We mirror the `github.com` filter shape on the CIDR rule so a
-/// future code path that *did* match by IP (e.g. a CIDR-aware host
-/// matcher) would still scope to the same allowed git-over-HTTPS
-/// surface.
-const GITHUB_INTERACTIVE_CIDR_POOL: &[&str] = &[
-    // Primary GitHub infrastructure pool — github.com, codeload, api,
-    // www. By far the most common rotation destination today.
-    "140.82.112.0/20",
-    // Legacy GitHub primary range; kept on the allow-set so historic
-    // resolutions still pass.
-    "192.30.252.0/22",
-];
-
 /// Always-needed API probes that are not per-repo. Spec line 515.
 fn api_github_com_shared_probes() -> Vec<HttpFilter> {
     vec![
@@ -580,8 +464,16 @@ fn expand_github_repo(inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetE
     let codeload_filters = fan_out(GITHUB_REPO_CODELOAD_TEMPLATES);
     let raw_filters = fan_out(GITHUB_REPO_RAW_TEMPLATES);
 
-    let mut rules = vec![
-        http_rule("github.com", github_com_filters.clone()),
+    // Historical note: M10-S8 (#39, commit 874a9bb) emitted an
+    // additional `Destination::Cidr` rule pool covering GitHub's
+    // published interactive-infrastructure ranges
+    // (`140.82.112.0/20` + `192.30.252.0/22`) to paper over a
+    // DNS-rotation propagation race. M10-S10 closes that race
+    // architecturally via synchronous DNS-policy gating; the CIDR
+    // pool was retired in this milestone — see
+    // `.tasks/specs/2026-04-25-synchronous-dns-policy-gating-design/`.
+    Ok(vec![
+        http_rule("github.com", github_com_filters),
         http_rule("api.github.com", api_github_com_filters),
         http_rule("codeload.github.com", codeload_filters),
         http_rule("raw.githubusercontent.com", raw_filters),
@@ -589,25 +481,7 @@ fn expand_github_repo(inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetE
         // workable level (spec lines 518-522).
         tls_rule("objects.githubusercontent.com"),
         tls_rule("release-assets.githubusercontent.com"),
-    ];
-
-    // DNS-rotation resilience: GitHub's interactive infrastructure
-    // (github.com, codeload, api) load-balances across a rotating IPv4
-    // pool. The v2 nftables allow-set is keyed on the IPs CoreDNS
-    // resolved at the moment the propagation loop ran; a `git clone`
-    // running its own `getaddrinfo` inside the VM can land on a
-    // rotation that is not in the cached set, producing an L3 deny
-    // (deny-logger) instead of an L7 deny (mitmproxy) when the path
-    // does not match the preset's `${repo}` filters. Adding CIDR-host
-    // rules covering the published pool admits those rotated-out IPs
-    // at L3 + Envoy and routes them through mitmproxy where the
-    // domain rule (`host: github.com`, ...) applies the path filter.
-    // See todo #39 in `docs/internal/milestones/M10.md`.
-    for cidr in GITHUB_INTERACTIVE_CIDR_POOL {
-        rules.push(http_rule_cidr(cidr, github_com_filters.clone()));
-    }
-
-    Ok(rules)
+    ])
 }
 
 // ---------------------------------------------------------------------------
@@ -868,33 +742,10 @@ mod tests {
     #[test]
     fn expand_cargo_matches_spec() {
         let rules = expand_builtin("cargo", "cargo:");
-
-        // The cargo preset emits one consume-posture rule per domain
-        // host (crates.io, index.crates.io, static.crates.io) plus one
-        // CIDR-host rule per entry in the Fastly Anycast pool. The
-        // domain rules carry the spec-mandated `(GET, HEAD) /**`
-        // posture; the CIDR rules are exercised in
-        // `expand_cargo_emits_cidr_pool_rules_at_http_level` below.
-        let domain_rules: Vec<&PolicyRule> = rules
-            .iter()
-            .filter(|r| matches!(&r.host, Destination::Domain(_)))
-            .collect();
-        assert_eq!(domain_rules.len(), 3);
-        let expected_hosts = ["crates.io", "index.crates.io", "static.crates.io"];
-        for (rule, expected_host) in domain_rules.iter().zip(expected_hosts.iter()) {
-            assert_eq!(rule.port, 443);
-            assert_eq!(rule.protocol, Protocol::Tcp);
-            match &rule.host {
-                Destination::Domain(d) => assert_eq!(d, expected_host),
-                other => panic!("expected Domain host, got {other:?}"),
-            }
-            match &rule.level {
-                AssuranceLevel::Http { http_filters } => {
-                    assert_eq!(*http_filters, method::get_head());
-                }
-                other => panic!("expected Http level, got {other:?}"),
-            }
-        }
+        assert_consume_posture(
+            &rules,
+            &["crates.io", "index.crates.io", "static.crates.io"],
+        );
         assert_rules_round_trip(rules);
     }
 
@@ -940,12 +791,6 @@ mod tests {
     /// mutating workflows are deliberately scoped to an explicit
     /// grant outside the built-in — see the fixture's `_comment`
     /// block for the rationale and the spec's "Known gaps" section.
-    ///
-    /// CIDR-host rules (the Fastly Anycast pool from
-    /// [`CARGO_FASTLY_CIDR_POOL`]) are intentionally not part of this
-    /// drift check — the frozen fixture is a *hostname* trace; the
-    /// CIDR coverage is validated by
-    /// [`cargo_fastly_cidr_pool_covers_published_ranges`] below.
     ///
     /// If you are intentionally changing the host set or per-host
     /// method posture, update the fixture in the same commit — the
@@ -1009,9 +854,10 @@ mod tests {
             })
             .collect();
 
-        // Build the same shape from the preset expansion. CIDR-host
-        // rules are excluded (see docstring); the consume-posture for
-        // each domain host is encoded in the rule's `http_filters`.
+        // Build the same shape from the preset expansion. The cargo
+        // preset emits Domain + Http rules exclusively (asserted by
+        // `expand_cargo_matches_spec` above), so a single match arm
+        // covers every rule.
         let rules = expand_builtin("cargo", "cargo:");
         let preset_methods: BTreeMap<String, BTreeSet<String>> = rules
             .iter()
@@ -1021,10 +867,6 @@ mod tests {
                         http_filters.iter().map(|f| f.method.to_string()).collect();
                     Some((host.clone(), methods))
                 }
-                // CIDR rules are out of scope; non-Http levels would
-                // also be out of scope but the cargo preset emits Http
-                // exclusively (asserted by `expand_cargo_matches_spec`
-                // above) so this branch is unreachable in practice.
                 _ => None,
             })
             .collect();
@@ -1070,89 +912,6 @@ mod tests {
                 diffs.join("\n")
             );
         }
-    }
-
-    /// DNS-rotation resilience (todo #40): each entry in
-    /// [`CARGO_FASTLY_CIDR_POOL`] becomes an HTTP-level
-    /// `Destination::Cidr` rule on `(<cidr>, 443, tcp)` whose
-    /// `http_filters` mirror the consume-posture (`GET /**`, `HEAD /**`)
-    /// shape of the domain rules. This is the targeted fix for the
-    /// `test_cargo_preset_allows_cargo_fetch` E2E flake — the
-    /// CIDR rules let the `policy_allow_tcp` nft set admit any IP in
-    /// Fastly's published Anycast pool, so a `cargo fetch` whose
-    /// in-VM resolver lands on a rotated POP between the daemon's 2s
-    /// propagation polls still reaches Envoy + mitmproxy where the
-    /// host-header allow/deny decision happens.
-    #[test]
-    fn expand_cargo_emits_cidr_pool_rules_at_http_level() {
-        let rules = expand_builtin("cargo", "cargo:");
-
-        // Pull out the CIDR-host rules in declaration order.
-        let cidr_rules: Vec<&PolicyRule> = rules
-            .iter()
-            .filter(|r| matches!(&r.host, Destination::Cidr(_)))
-            .collect();
-        assert_eq!(
-            cidr_rules.len(),
-            CARGO_FASTLY_CIDR_POOL.len(),
-            "one rule per pool entry — got {} rules for {} pool entries",
-            cidr_rules.len(),
-            CARGO_FASTLY_CIDR_POOL.len(),
-        );
-
-        let expected_filters = method::get_head();
-
-        for (rule, expected_cidr) in cidr_rules.iter().zip(CARGO_FASTLY_CIDR_POOL.iter()) {
-            // Host is a CIDR with the exact pool value and order.
-            match &rule.host {
-                Destination::Cidr(c) => assert_eq!(c, expected_cidr),
-                other => panic!("expected Cidr({expected_cidr}), got {other:?}"),
-            }
-            assert_eq!(rule.port, 443);
-            assert_eq!(rule.protocol, Protocol::Tcp);
-            // Level is Http with the consume-posture filter shape —
-            // that's what gives Envoy an L3 chain routing the
-            // (rotated-out) IP through mitmproxy. The filter list
-            // itself is dead at runtime (mitmproxy host-matches by
-            // fnmatch on the request's HTTP `Host` header, never a
-            // CIDR string) but must be non-empty for
-            // `PolicyCompiler::validate` to accept the rule shape.
-            match &rule.level {
-                AssuranceLevel::Http { http_filters } => {
-                    assert_eq!(
-                        *http_filters, expected_filters,
-                        "CIDR rule's http_filters must mirror the consume-posture (GET, HEAD)"
-                    );
-                }
-                other => panic!("expected Http level on CIDR rule, got {other:?}"),
-            }
-        }
-
-        // The expanded policy must round-trip through the validator: a
-        // CIDR-host rule alongside the existing domain rules is a legal
-        // v2 shape (no `(host, port)` collisions because each CIDR
-        // string and each domain is a distinct host key).
-        assert_rules_round_trip(rules);
-    }
-
-    /// Pin that the CIDR rules cover Fastly's published Anycast IPv4
-    /// pool. The Fastly public ranges (sourced from
-    /// `https://api.fastly.com/public-ip-list`) include
-    /// `151.101.0.0/16` and `146.75.0.0/17` — these supernets contain
-    /// every `151.101.x.137` and `146.75.x.137` rotation we observed
-    /// during the M10-S8 cargo-preset flake investigation. Pin both
-    /// entries so a future intentional change requires updating this
-    /// test.
-    #[test]
-    fn cargo_fastly_cidr_pool_covers_published_ranges() {
-        assert!(
-            CARGO_FASTLY_CIDR_POOL.contains(&"151.101.0.0/16"),
-            "primary Fastly Anycast supernet 151.101.0.0/16 must be in the CIDR pool"
-        );
-        assert!(
-            CARGO_FASTLY_CIDR_POOL.contains(&"146.75.0.0/17"),
-            "secondary Fastly Anycast supernet 146.75.0.0/17 must be in the CIDR pool"
-        );
     }
 
     #[test]
@@ -1271,12 +1030,11 @@ mod tests {
         let rules = expand_builtin("github-repo", "github-repo:repo=owner/proj");
         assert_eq!(
             rules.len(),
-            6 + GITHUB_INTERACTIVE_CIDR_POOL.len(),
-            "github-repo must emit six host rules (github.com, api.github.com, codeload, raw, objects, release-assets) plus one CIDR-host rule per entry in the GitHub interactive-infrastructure pool"
+            6,
+            "github-repo must emit six host rules (github.com, api.github.com, codeload, raw, objects, release-assets)"
         );
 
-        // Domain hosts are emitted in a deterministic order, followed
-        // by the CIDR pool entries appended at the tail.
+        // Domain hosts are emitted in a deterministic order.
         let domain_hosts: Vec<String> = rules
             .iter()
             .filter_map(|r| match &r.host {
@@ -1294,21 +1052,6 @@ mod tests {
                 "objects.githubusercontent.com",
                 "release-assets.githubusercontent.com",
             ]
-        );
-        let cidr_hosts: Vec<String> = rules
-            .iter()
-            .filter_map(|r| match &r.host {
-                Destination::Cidr(c) => Some(c.clone()),
-                Destination::Domain(_) => None,
-            })
-            .collect();
-        assert_eq!(
-            cidr_hosts,
-            GITHUB_INTERACTIVE_CIDR_POOL
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>(),
-            "CIDR-host rules must be emitted in the order declared by GITHUB_INTERACTIVE_CIDR_POOL"
         );
 
         // github.com: seven git-pack templates, each with `${repo}` -> `owner/proj`.
@@ -1462,126 +1205,6 @@ mod tests {
             }
             other => panic!("expected InvalidRepoValue, got {other:?}"),
         }
-    }
-
-    /// DNS-rotation resilience (todo #39): each entry in
-    /// [`GITHUB_INTERACTIVE_CIDR_POOL`] becomes an HTTP-level
-    /// `Destination::Cidr` rule on `(<cidr>, 443, tcp)` whose
-    /// `http_filters` mirror the `github.com` git-pack template set.
-    /// This is the targeted fix for the
-    /// `test_github_repo_preset_scopes_to_one_repo` E2E flake — the
-    /// CIDR rules let the `policy_allow_tcp` nft set admit any IP in
-    /// the published GitHub interactive pool, so a `git clone` whose
-    /// in-VM resolver lands on a rotated-out IP still reaches Envoy +
-    /// mitmproxy where the path-level allow/deny decision happens.
-    #[test]
-    fn expand_github_repo_emits_cidr_pool_rules_at_http_level() {
-        let rules = expand_builtin("github-repo", "github-repo:repo=owner/proj");
-
-        // Pull out the CIDR-host rules in declaration order.
-        let cidr_rules: Vec<&PolicyRule> = rules
-            .iter()
-            .filter(|r| matches!(&r.host, Destination::Cidr(_)))
-            .collect();
-        assert_eq!(
-            cidr_rules.len(),
-            GITHUB_INTERACTIVE_CIDR_POOL.len(),
-            "one rule per pool entry — got {} rules for {} pool entries",
-            cidr_rules.len(),
-            GITHUB_INTERACTIVE_CIDR_POOL.len(),
-        );
-
-        // The expected http_filters shape — same as the github.com
-        // domain rule, since mitmproxy never reaches the CIDR rule
-        // (its `host` is a CIDR string, never matches a hostname);
-        // the filters are kept consistent so a future code path that
-        // matches by IP would still scope to the per-repo surface.
-        let github_com_filters = http_filters_of(rule_for_host(&rules, "github.com")).to_vec();
-
-        for (rule, expected_cidr) in cidr_rules.iter().zip(GITHUB_INTERACTIVE_CIDR_POOL.iter()) {
-            // Host is a CIDR with the exact pool value.
-            match &rule.host {
-                Destination::Cidr(c) => assert_eq!(c, expected_cidr),
-                other => panic!("expected Cidr({expected_cidr}), got {other:?}"),
-            }
-            assert_eq!(rule.port, 443);
-            assert_eq!(rule.protocol, Protocol::Tcp);
-            // Level is Http with the github.com filter shape — that's
-            // what gives Envoy an L3 chain routing the (rotated-out)
-            // IP through mitmproxy. The filter list itself is dead
-            // (mitmproxy host-matches by fnmatch on the request's
-            // HTTP `Host` header, never a CIDR string) but must be
-            // non-empty for `PolicyCompiler::validate` to accept the
-            // rule shape.
-            match &rule.level {
-                AssuranceLevel::Http { http_filters } => {
-                    assert_eq!(
-                        http_filters, &github_com_filters,
-                        "CIDR rule's http_filters must mirror github.com's git-pack template set"
-                    );
-                }
-                other => panic!("expected Http level on CIDR rule, got {other:?}"),
-            }
-        }
-
-        // The expanded policy must round-trip through the validator:
-        // a CIDR-host rule alongside the existing domain rules is a
-        // legal v2 shape (no `(host, port)` collisions because each
-        // CIDR string and each domain is a distinct host key).
-        assert_rules_round_trip(rules);
-    }
-
-    /// Pin that the CIDR rules cover the known github.com IP space.
-    /// `140.82.112.0/20` covers `140.82.112.0` through `140.82.127.255`
-    /// — the rotation pool seen in the M10-S6 regression handoff
-    /// (`140.82.121.4` was the failing IP).
-    #[test]
-    fn github_interactive_cidr_pool_covers_published_ranges() {
-        // The two ranges below are the only published IPv4 ranges
-        // shared across the `git` and `web` arrays in
-        // `https://api.github.com/meta` that map to GitHub's own
-        // interactive infrastructure (i.e. excluding the Pages /
-        // Fastly / Azure CDN-backed `*.githubusercontent.com` pools).
-        // Pin both ends so a future intentional change to the pool
-        // still requires updating this test.
-        assert!(
-            GITHUB_INTERACTIVE_CIDR_POOL.contains(&"140.82.112.0/20"),
-            "primary GitHub pool 140.82.112.0/20 must be in the CIDR pool"
-        );
-        assert!(
-            GITHUB_INTERACTIVE_CIDR_POOL.contains(&"192.30.252.0/22"),
-            "legacy GitHub pool 192.30.252.0/22 must be in the CIDR pool"
-        );
-    }
-
-    /// Multi-repo invocation must keep the CIDR-pool rules emitted
-    /// exactly once at the tail (the pool does not depend on `${repo}`,
-    /// so it must not fan out per-repo — that would produce
-    /// `(<cidr>, 443)` collisions in `merge_effective`).
-    #[test]
-    fn expand_github_repo_multi_repo_emits_cidr_pool_once() {
-        let rules = expand_builtin(
-            "github-repo",
-            "github-repo:repo=a/one,repo=b/two,repo=c/three",
-        );
-
-        let cidr_rules: Vec<&PolicyRule> = rules
-            .iter()
-            .filter(|r| matches!(&r.host, Destination::Cidr(_)))
-            .collect();
-        assert_eq!(
-            cidr_rules.len(),
-            GITHUB_INTERACTIVE_CIDR_POOL.len(),
-            "CIDR-pool rules must be emitted exactly once regardless of repo count, \
-             got {} rules for {} pool entries on a 3-repo invocation",
-            cidr_rules.len(),
-            GITHUB_INTERACTIVE_CIDR_POOL.len(),
-        );
-
-        // The expanded policy must still round-trip through the
-        // validator under multi-repo expansion (no
-        // `(host, port)` duplicates).
-        assert_rules_round_trip(rules);
     }
 
     // ----- github-pr (parameterized) ----------------------------------

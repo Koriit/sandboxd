@@ -11,12 +11,11 @@
     "",
     "Source of truth (live verification — M10-S8 todo #36, 2026-04-25):",
     "Booted a sandbox VM with a hand-rolled policy permitting Ubuntu apt",
-    "mirrors + the three documented cargo hosts + the Fastly Anycast CIDR",
-    "pool (151.101.0.0/16, 146.75.0.0/17). apt-installed cargo 1.75.0",
-    "inside the VM, then ran `cargo new` + `cargo add serde@1` + `cargo",
-    "fetch -v` against an empty CARGO_HOME. Captured mitmproxy events on",
-    "the gateway data plane and filtered to the cargo-phase window via an",
-    "RFC3339 timestamp marker. Observed cargo-phase hosts:",
+    "mirrors + the three documented cargo hosts. apt-installed cargo",
+    "1.75.0 inside the VM, then ran `cargo new` + `cargo add serde@1` +",
+    "`cargo fetch -v` against an empty CARGO_HOME. Captured mitmproxy",
+    "events on the gateway data plane and filtered to the cargo-phase",
+    "window via an RFC3339 timestamp marker. Observed cargo-phase hosts:",
     "  - index.crates.io  (sparse index lookups)",
     "  - static.crates.io (crate tarball downloads, ~7 crates pulled)",
     "Did NOT observe `crates.io` (apex) — sparse mode bypasses the web-API",
@@ -24,6 +23,13 @@
     "preset because it remains required for `cargo publish`, `cargo",
     "search`, `cargo yank`, and any tooling that hits the JSON web API.",
     "Findings artifact (one-off): /tmp/m10s8-todo36-cargo-trace.json.",
+    "",
+    "Note: the original M10-S8 verification policy also pre-allowed the",
+    "Fastly Anycast supernets (151.101.0.0/16, 146.75.0.0/17) as a",
+    "workaround for a DNS-rotation race. M10-S10's synchronous DNS-policy",
+    "gating closed that race architecturally, so the verification policy",
+    "no longer needs the CIDR pool — the host-only allow set is",
+    "sufficient.",
     "",
     "This file freezes the set of hosts AND the per-host method posture",
     "the `cargo` built-in preset must allow. The drift-detection unit",
@@ -74,7 +80,7 @@
       "host": "static.crates.io",
       "purpose": "CDN host that serves crate tarballs and (historically) RSS feeds.",
       "methods": ["GET", "HEAD"],
-      "notes": "Confirmed live (M10-S8 todo #36, 2026-04-25): every crate tarball download (serde, serde_core, serde_derive, syn, quote, proc-macro2, unicode-ident) hit this host. Fronted by Fastly Anycast (151.101.0.0/16, 146.75.0.0/17) — see CARGO_FASTLY_CIDR_POOL in `expand_cargo` for IP-pinning rationale (todo #40)."
+      "notes": "Confirmed live (M10-S8 todo #36, 2026-04-25): every crate tarball download (serde, serde_core, serde_derive, syn, quote, proc-macro2, unicode-ident) hit this host. Fronted by Fastly Anycast (151.101.0.0/16, 146.75.0.0/17). M10-S10 closed the DNS-rotation race architecturally via synchronous DNS-policy gating; the preset no longer pre-allows the Fastly supernets (the M10-S8 workaround was retired)."
     }
   ]
 }
