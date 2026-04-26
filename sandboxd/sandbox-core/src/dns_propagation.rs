@@ -360,8 +360,12 @@ pub fn generate_domain_ip_rules(
     cache: &DnsCache,
     network_info: &NetworkInfo,
 ) -> String {
-    let mut tcp_elements: Vec<String> = Vec::new();
-    let mut udp_elements: Vec<String> = Vec::new();
+    // BTreeSet gives stable sorted dedup so that two rules whose
+    // hosts resolve to a shared (ip, port) tuple — e.g. mirrors of
+    // the same archive backed by one IP — emit a single set element
+    // and `nft -f` does not log `File exists` on the duplicate add.
+    let mut tcp_elements: BTreeSet<String> = BTreeSet::new();
+    let mut udp_elements: BTreeSet<String> = BTreeSet::new();
 
     for rule in &policy.rules {
         if matches!(rule.level, AssuranceLevel::Deny) {
@@ -373,8 +377,12 @@ pub fn generate_domain_ip_rules(
             Destination::Cidr(cidr) => {
                 let element = format!("{cidr} . {port}");
                 match rule.protocol {
-                    crate::policy::Protocol::Tcp => tcp_elements.push(element),
-                    crate::policy::Protocol::Udp => udp_elements.push(element),
+                    crate::policy::Protocol::Tcp => {
+                        tcp_elements.insert(element);
+                    }
+                    crate::policy::Protocol::Udp => {
+                        udp_elements.insert(element);
+                    }
                 }
             }
             Destination::Domain(domain) => {
@@ -388,8 +396,12 @@ pub fn generate_domain_ip_rules(
                 for ip in &entry.ips {
                     let element = format!("{ip} . {port}");
                     match rule.protocol {
-                        crate::policy::Protocol::Tcp => tcp_elements.push(element),
-                        crate::policy::Protocol::Udp => udp_elements.push(element),
+                        crate::policy::Protocol::Tcp => {
+                            tcp_elements.insert(element);
+                        }
+                        crate::policy::Protocol::Udp => {
+                            udp_elements.insert(element);
+                        }
                     }
                 }
             }
@@ -403,6 +415,9 @@ pub fn generate_domain_ip_rules(
     if tcp_elements.is_empty() && udp_elements.is_empty() {
         return String::new();
     }
+
+    let tcp_elements: Vec<String> = tcp_elements.into_iter().collect();
+    let udp_elements: Vec<String> = udp_elements.into_iter().collect();
 
     // Two-table emission matching `PolicyCompiler::compile_nftables`.
     // The DNS propagation loop rewrites BOTH tables' concat sets on
@@ -1241,6 +1256,66 @@ mod tests {
             !tcp_body.contains("5.6.7.8"),
             "UDP-rule IP must not leak into policy_allow_tcp; got tcp \
              body:\n{tcp_body}"
+        );
+    }
+
+    #[test]
+    fn domain_ip_rules_dedup_shared_ip_across_hosts() {
+        // Two allowed hosts whose A-records share an IP — e.g. archive
+        // and security mirrors of the same Ubuntu pool — must contribute
+        // a single `(ip . port)` element to `policy_allow_tcp`. Without
+        // dedup, `nft -f` logs `File exists` on the duplicate add.
+        let policy = Policy {
+            version: SCHEMA_VERSION.to_string(),
+            rules: vec![
+                PolicyRule {
+                    host: Destination::Domain("archive.ubuntu.com".to_string()),
+                    port: 80,
+                    protocol: Protocol::Tcp,
+                    level: AssuranceLevel::Transport,
+                    reason: None,
+                },
+                PolicyRule {
+                    host: Destination::Domain("security.ubuntu.com".to_string()),
+                    port: 80,
+                    protocol: Protocol::Tcp,
+                    level: AssuranceLevel::Transport,
+                    reason: None,
+                },
+            ],
+        };
+
+        let mut cache = DnsCache::new();
+        let report = ResolvedReport {
+            mappings: vec![
+                ResolvedMapping {
+                    domain: "archive.ubuntu.com".to_string(),
+                    ips: vec!["91.189.91.81".to_string()],
+                    ttl: 3600,
+                    timestamp: "2024-01-01T00:00:00Z".to_string(),
+                },
+                ResolvedMapping {
+                    domain: "security.ubuntu.com".to_string(),
+                    ips: vec!["91.189.91.81".to_string()],
+                    ttl: 3600,
+                    timestamp: "2024-01-01T00:00:00Z".to_string(),
+                },
+            ],
+        };
+        cache.update(&report);
+
+        let net = test_network_info();
+        let rules = generate_domain_ip_rules(&policy, &cache, &net);
+
+        // The shared (ip . port) tuple appears once per table copy
+        // (sandbox_dnat + sandbox_policy = 2 occurrences total), never
+        // four — which is what the un-deduped pre-fix output produced.
+        let occurrences = rules.matches("91.189.91.81 . 80").count();
+        assert_eq!(
+            occurrences, 2,
+            "shared (ip . port) tuple must appear exactly once per table \
+             copy (2 total across sandbox_dnat + sandbox_policy); got \
+             {occurrences} occurrences in:\n{rules}"
         );
     }
 
