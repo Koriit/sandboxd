@@ -213,17 +213,9 @@ After a successful update, there is a brief reload window (under 1 second) where
 
 **Symptom:** A freshly added level `http` destination returns `Connection refused` or a TLS handshake timeout on the very first request, then succeeds on retry.
 
-This is the fail-closed DNS-propagation window. Envoy's L3 filter chains match on the connection's original destination IP, and sandboxd can only populate those IPs after CoreDNS has resolved the name. Between the policy taking effect and the first DNS answer being propagated into Envoy's listener file, a connection to the unresolved IP hits no filter chain and is dropped — deliberately, not silently forwarded.
+In normal operation this should not happen — the synchronous DNS-policy gate holds the DNS answer until sandboxd has injected the resolved IP into nft and Envoy has acked the new listener generation. If you are seeing this, the gate failed open at its deadline (default 1500 ms) and traffic that followed raced the steady-state reconciler. Look for a `dns_gate_timed_out` lifecycle event on the session's event stream — it confirms the fallback path fired and points at sandboxd-side latency (loaded host, slow Envoy LDS ack, etc.) as the underlying cause.
 
-Fix: warm DNS before the first real request, or just retry. Either is harmless.
-
-```bash
-# Inside the VM:
-getent hosts api.newdestination.example   # triggers CoreDNS -> propagation
-curl -sSf https://api.newdestination.example/...
-```
-
-From the host, scripts that apply a policy and then dial it can block on the propagation event directly rather than retrying:
+If a retry succeeds, the steady-state reconciler closed the gap. From the host, scripts that apply a policy and then dial it can block on the propagation event directly:
 
 ```bash
 # Apply the policy, then block until every enforcement layer has reconciled.
@@ -233,7 +225,7 @@ sandbox policy status <session> --wait --timeout 10s
 
 `sandbox policy status --wait` polls until the session's applied policy hash matches the most recent `policy_propagated` lifecycle event, then exits 0. Under the hood the same event is available on the unified stream as `sandbox events <session> --event policy_propagated --follow`.
 
-See [networking → Fail-closed propagation](/concepts/networking/#fail-closed-propagation-for-level-3) for why this is the designed behavior.
+See [networking → Synchronous DNS-policy gating](/concepts/networking/#synchronous-dns-policy-gating) for the design.
 
 ### Non-HTTP traffic to a level `http` destination
 

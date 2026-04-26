@@ -140,16 +140,18 @@ CoreDNS is the only resolver the VM reaches.
 - **Without a policy**, DNS resolution returns `NXDOMAIN` for everything — the default is deny.
 - **IPs learned from CoreDNS** are reported back to sandboxd, which writes them into the `sandbox_policy` table so the firewall matches the live IPs for each allowed domain.
 
-### Fail-closed propagation for Level 3
+### Synchronous DNS-policy gating
 
-Level-3 (HTTPS-inspected) destinations are selected by matching the connection's original destination IP *and* port against per-chain `prefix_ranges` + `destination_port` on Envoy's filter chains. Those IPs come from the same DNS learning loop that drives `sandbox_policy`: when CoreDNS answers a policy-allowed name, sandboxd rewrites the Envoy listener file and Envoy picks up the new chain via xDS.
+Level-3 (HTTPS-inspected) destinations are selected by matching the connection's original destination IP *and* port against per-chain `prefix_ranges` + `destination_port` on Envoy's filter chains. Those IPs come from the DNS learning loop that drives `sandbox_policy`: when CoreDNS answers a policy-allowed name, sandboxd injects the IP into the nft `policy_allow_{tcp,udp}` sets and rewrites the Envoy listener file so Envoy picks up the new chain via xDS.
 
-The propagation is **fail-closed**, not fail-open:
+The propagation is **synchronously gated** between CoreDNS and sandboxd:
 
-- Between the moment CoreDNS answers and the moment Envoy's listener is updated (sub-second in practice, but non-zero), the destination IP has no matching L3 filter chain. A connection to it during that window hits no chain and is dropped by Envoy — it is **not** silently forwarded as passthrough.
-- An application that dials an IP literal it learned out-of-band, or uses a stale cached DNS answer after a policy change that removed the name, will also fail closed for the same reason.
+- When the CoreDNS plugin is about to answer a policy-allowed name, it sends a `propagate_and_ack` request to sandboxd over a per-session Unix-domain socket and **holds the DNS response until sandboxd acks**. Sandboxd applies the nft injection and waits for Envoy's LDS to acknowledge the new listener generation before acking.
+- The VM only sees the DNS answer once the firewall and L3 chain are live for the resolved IPs, so the connect that immediately follows the resolution finds matching state — no race window, no first-request retry, no need to warm DNS.
 
-The practical consequence is that the very first request to a brand-new L3 destination, issued immediately after a `policy update`, can race the propagation loop and be refused. Retrying — or warming DNS with a prior lookup — closes the race. See [troubleshooting](/guides/troubleshooting/#l3-destination-fails-on-first-request-after-policy-change) for the operator-side view of this.
+The trade-off is **first-resolution latency**: a brand-new IP for a host adds the gate round-trip (nft injection + Envoy LDS ack) to the DNS-resolve time. Steady-state resolutions of already-admitted IPs short-circuit the gate and pay no extra cost.
+
+If sandboxd is slow or unreachable, the plugin **fails open** at a deadline (default 1500 ms) and releases the DNS answer anyway, emitting a `dns_gate_timed_out` lifecycle event. The traffic that follows may then race propagation and be dropped by Envoy until the steady-state reconciler closes the gap — but this is a deadline-bounded fallback, not the normal path. See [troubleshooting](/guides/troubleshooting/#l3-destination-fails-on-first-request-after-policy-change) for the operator-side view of the fallback case.
 
 The propagation loop publishes a `policy_propagated` lifecycle event once all three enforcement layers (CoreDNS, nftables `policy_allow_{tcp,udp}` sets, and Envoy's L3 filter chains) have reconciled to the latest applied policy. The event carries `policy_hash`, the SHA-256 hex digest of the canonical JSON form of the effective policy, and is emitted only on hash transitions (so a steady state produces no repeat events). Scripts that need to wait for the new policy to be live can observe that event via `sandbox events --event policy_propagated --follow`, or invoke `sandbox policy status --wait` to block until the hash transitions.
 

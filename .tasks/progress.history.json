@@ -1,15 +1,56 @@
 {
   "current_state": {
     "milestone": "M10",
-    "session": "M10-S9",
-    "status": "completed",
+    "session": "M10-S10",
+    "status": "in_progress",
     "completed_sessions": 68,
     "total_sessions": 69,
-    "next": "M10-S10: Synchronous DNS-policy gating",
+    "next": "M11+: future work",
     "block_reason": "Spec premise falsified: mitmproxy 11.1.3 does not support PROXY protocol v2 reception \u2014 the design-spec's core mechanism for bridging Envoy\u2192mitmproxy cannot be used off-the-shelf. User must choose between (A) write custom mitmproxy layer/addon in-tree that parses PROXY v2 header before TransparentProxy runs (~80-120 lines Python parser + nontrivial hook into layer stack); (B) fork/alternative mitmproxy version (no upstream release has it); (C) different destination-preservation mechanism (TPROXY / reverse-proxy-per-dest \u2014 both defeat the single-mediated-egress design goal); (D) split the spec \u2014 ship Envoy-half in M9-S18 with mitmproxy still on SO_ORIGINAL_DST, amend M9-S19/S20 to cover the missing mitmproxy PROXY-v2 addon work. Planner recommends Option A with low confidence; cheapest alternative is Option D but requires spec amendment. Full verification + source refs + option analysis in the planner CLARIFY (last subagent response) and referenced in .tasks/handoffs/20260419-172418-explore-envoy-mitmproxy-current-state.md."
   },
   "append_system_prompt": "We are building sandbox daemon with Lima VMs for coding agents.  \nSpecifically: .tasks/specs/2026-04-21-port-explicit-policies-presets-observability-design.md  \nSession plan: docs/internal/session-plan.md\n\nUse /session-tracking for progress tracking. Log decisions and discoveries \u2014 they survive compaction. Block if design cannot be implemented.\n\nYou are running unsupervised \u2014 make autonomous decisions and do not wait for user input. If you hit an issue only the user can resolve, use progress block to pause the session.\n\nKeep context clean: delegate exploration and implementation to subagents. Reserve main conversation for decisions and coordination.\n\nLeverage teams, especially when there are build tools and tests involved, as those usually produce a lot of logs and are good fit for dedicated teammate to run them.\n\nYou are running in isolated VM with passwordless sudo. You can install packages and change system settings as needed.",
-  "current_log": null,
+  "current_log": {
+    "session": "M10-S10",
+    "title": "Synchronous DNS-policy gating, workaround removal",
+    "started": "2026-04-25T22:41:03.864769Z",
+    "entries": [
+      {
+        "timestamp": "2026-04-25T22:54:53.743031Z",
+        "type": "decision",
+        "note": "M10-S10 Phase 1 (spec) committed at 84d39d2 \u2014 synchronous DNS-policy gating chosen (Path D). Per-session UDS at events_host_root/<session-id>/dns-gate.sock bind-mounted into gateway. Length-prefixed JSON 'propagate_and_ack' wire format. Default deadline 1500ms with fail-open + dns_gate_timed_out lifecycle event. Reuses sandboxd helpers wait_for_lds_ack + generate_domain_ip_rules. Keeps dns_propagation_loop as steady-state reconciler."
+      },
+      {
+        "timestamp": "2026-04-25T22:54:59.691140Z",
+        "type": "discovery",
+        "note": "Spec author surfaced 6 known gaps for downstream phases: (1) deadline_ms calibration vs measured nft+LDS p99 latency, (2) apply-side correlation when multiple gate requests in flight, (3) pooled vs per-request UDS connections, (4) event ordering between dns_gate_acked and existing propagation events, (5) gate-request signing/auth across IPC boundary, (6) ack cache invalidation when policy churns mid-flight."
+      },
+      {
+        "timestamp": "2026-04-25T23:34:44.409332Z",
+        "type": "decision",
+        "note": "Phase 2 implementation committed at 268704c. Plugin fail-open releases DNS answer regardless of ack outcome (per spec \u00a76 fail-open). DaemonGateService runs full propagate_dns_changes (listener + nft) + wait_for_lds_ack with ack_deadline = plugin_deadline-150ms (min 100ms). Per-session UDS lives at events_host_root/<sid>/dns-gate.sock and surfaces inside gateway via existing per-session events bind-mount \u2014 no new mount machinery required. dns_caches: HashMap<SessionId, Arc<Mutex<DnsCache>>> in AppState gives gate-handler and steady-state dns_propagation_loop shared UNION-merge state."
+      },
+      {
+        "timestamp": "2026-04-25T23:34:47.532109Z",
+        "type": "discovery",
+        "note": "Phase 2 verification: 964/964 hermetic + 21/21 integration green (incl. 2 new integration_dns_gate_* tests + 6 new Go gate tests). Bind-mount surface reuse means gateway entrypoint did not need new mount logic \u2014 UDS travels through the same per-session events host root that already gets mounted at /var/log/gateway/events/."
+      },
+      {
+        "timestamp": "2026-04-25T23:45:54.683747Z",
+        "type": "decision",
+        "note": "Phase 3 (CIDR-pool removal) committed at b381590. Removed CARGO_FASTLY_CIDR_POOL + GITHUB_INTERACTIVE_CIDR_POOL constants, http_rule_cidr helper, and 5 pinning tests. Re-baselined shape tests against host-only output. Net -395 LOC in sandbox-cli/src/presets/builtin.rs. Phase 2's synchronous gate is now the sole mechanism preventing the cargo Fastly + github-interactive races."
+      },
+      {
+        "timestamp": "2026-04-25T23:45:56.942935Z",
+        "type": "discovery",
+        "note": "Phase 3 verification: 959/959 hermetic + 21/21 integration green after CIDR removal. Hermetic count dropped from 964\u2192959 because 5 CIDR-pool pinning tests were correctly deleted (not regressed)."
+      },
+      {
+        "timestamp": "2026-04-26T00:34:23.092040Z",
+        "type": "discovery",
+        "note": "Phase 4 final E2E: 46/46 passed in 2752.92s (45:52). Critically test_cargo_preset_allows_cargo_fetch + test_github_repo_preset_scopes_to_one_repo passed without the deleted CIDR pools \u2014 Phase 2 synchronous gating successfully closes the DNS-rotation propagation race architecturally. All M10-S8 workaround coverage now subsumed by the gate. Exit criteria 'ALL tests pass' satisfied."
+      }
+    ]
+  },
   "log": [
     {
       "session": "M0-S1",
@@ -1855,7 +1896,10 @@
       "text": "M11: close the DNS-rotation propagation race architecturally. CoreDNS resolves new IP and answers VM in <1ms, but sandboxd dns_propagation_loop polls resolved.json every 2s \u2014 VM's TCP arrives at gateway nft set before the IP is admitted, deny-logger RSTs. Phase 3's CARGO_FASTLY_CIDR_POOL (9d1dca7) and #39 GITHUB_INTERACTIVE_CIDR_POOL (874a9bb) work around this for known CDN supernets but don't generalize. Two viable architectural fixes: (C) inline nft add element from sandboxpolicy CoreDNS plugin's WriteMsg interceptor BEFORE returning DNS answer to VM (race-free, cross-language coordination \u2014 Go plugin writes nft state managed by Rust daemon, risk of divergence with rebuild-from-cache model); (D) synchronous gating where CoreDNS plugin holds DNS response until sandboxd acks nft update (file/fifo barrier, adds DNS latency but architecturally clean). Both require redesigning the propagation contract; out of scope for polish session. Investigation handoff in M10-S8 progress log.",
       "added_session": "M10-S8",
       "added_timestamp": "2026-04-25T13:47:16.698251Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M10-S10",
+      "resolved_session": "M10-S10",
+      "resolved_timestamp": "2026-04-26T00:34:27.947016Z"
     },
     {
       "id": 56,
