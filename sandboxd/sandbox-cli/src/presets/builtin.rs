@@ -192,14 +192,6 @@ fn expand_cargo(_inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetError>
     // - `crates.io`        — registry web API + download redirector.
     // - `static.crates.io` — CDN host that serves crate tarballs
     //                        (302 target of the download redirector).
-    //
-    // Historical note: M10-S8 (#40, commit 9d1dca7) emitted an
-    // additional `Destination::Cidr` rule pool covering Fastly's
-    // Anycast supernets (`151.101.0.0/16` + `146.75.0.0/17`) to paper
-    // over a DNS-rotation propagation race. M10-S10 closes that race
-    // architecturally via synchronous DNS-policy gating; the CIDR pool
-    // was retired in this milestone — see
-    // `.tasks/specs/2026-04-25-synchronous-dns-policy-gating-design/`.
     Ok(consume_rules(&[
         "crates.io",
         "index.crates.io",
@@ -464,14 +456,6 @@ fn expand_github_repo(inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetE
     let codeload_filters = fan_out(GITHUB_REPO_CODELOAD_TEMPLATES);
     let raw_filters = fan_out(GITHUB_REPO_RAW_TEMPLATES);
 
-    // Historical note: M10-S8 (#39, commit 874a9bb) emitted an
-    // additional `Destination::Cidr` rule pool covering GitHub's
-    // published interactive-infrastructure ranges
-    // (`140.82.112.0/20` + `192.30.252.0/22`) to paper over a
-    // DNS-rotation propagation race. M10-S10 closes that race
-    // architecturally via synchronous DNS-policy gating; the CIDR
-    // pool was retired in this milestone — see
-    // `.tasks/specs/2026-04-25-synchronous-dns-policy-gating-design/`.
     Ok(vec![
         http_rule("github.com", github_com_filters),
         http_rule("api.github.com", api_github_com_filters),
