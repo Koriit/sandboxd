@@ -52,6 +52,10 @@ Sandbox daemon providing isolated Linux VMs (Lima/QEMU) for coding agents. Per-m
 **Goal.** v2 policy schema with explicit ports, CLI-local preset system, unified event surface across all policy layers.
 **Status.** completed · **Sessions.** 10 · **Details.** [milestones/M10.md](milestones/M10.md)
 
+## M11 — Lite mode: container backend
+**Goal.** Second `sandboxd` session backend (Docker container via `--lite`) behind a new backend abstraction; full UX parity with VM sessions, container-level isolation traded for fast session creation.
+**Status.** not_started (S1 next) · **Sessions.** 6 · **Details.** [milestones/M11.md](milestones/M11.md)
+
 ---
 
 ## Future milestones
