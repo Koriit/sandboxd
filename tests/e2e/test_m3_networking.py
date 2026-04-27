@@ -9,6 +9,22 @@ Run with generous timeouts:
     cd tests/e2e
     source .venv/bin/activate
     python -m pytest test_m3_networking.py -v --timeout=600
+
+Backend coverage: **mixed** — most tests are parametrized over
+``[lima, container]`` via the ``backend`` fixture (the gateway
+container, nftables ruleset, CoreDNS interception, and daemon /
+gateway crash-recovery monitors are shared between backends per the
+M11 gap-#70 closure). A subset asserts on the Lima-specific
+``10.209.x.x/28`` subnet shape and skip themselves on the container
+backend with an explicit ``pytest.skip()`` call:
+
+* ``test_gateway_traffic_flow``        — asserts 10.209.x.x VM IP + gateway ping.
+* ``test_stop_start_with_networking``  — same 10.209.x.x assertion.
+* ``test_concurrent_sessions``         — concurrent VMs, hardcoded subnet.
+
+These three are Lima-only **as written**; an agnostic refactor (replace
+the subnet regex with a ``sandbox info``-derived gateway IP) is a
+follow-up the M11 plan does not require for Phase 5C.
 """
 
 from __future__ import annotations
@@ -23,11 +39,11 @@ import time
 import pytest
 
 from conftest import (
-    _VM_RESOURCE_ARGS,
     capture_lima_logs,
     cleanup_policy_file,
     gateway_container_name,
     lima_vm_name,
+    make_create_args,
     parse_session_id,
     wait_for_state,
     write_policy_file,
@@ -118,10 +134,19 @@ def docker_container_exists(container_name: str) -> bool:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.timeout(600)
-def test_gateway_traffic_flow(sandbox_cli):
+def test_gateway_traffic_flow(sandbox_cli, backend):
     """Create a session and verify the full gateway networking pipeline:
     gateway container running, VM has second NIC, can ping gateway, DNS works.
     """
+    if backend == "container":
+        pytest.skip(
+            "Lima-only: assertion pins the VM IP to the 10.209.x.x/28 "
+            "Lima subnet shape and pings the per-VM gateway IP. The lite "
+            "container backend uses a per-session sandbox-net-<id> "
+            "Docker network and a different IP scheme; an agnostic "
+            "refactor (use sandbox info / inspect for the gateway IP) "
+            "is a follow-up not in M11 scope."
+        )
     session_id = None
     policy_path = None
     try:
@@ -129,8 +154,8 @@ def test_gateway_traffic_flow(sandbox_cli):
         #    replacement for the legacy --unrestricted flag).
         policy_path = _networking_smoke_policy_file()
         result = sandbox_cli(
-            "create", "--name", "net-flow-test", *_VM_RESOURCE_ARGS,
-            "--policy", policy_path,
+            "create",
+            *make_create_args(backend, "net-flow-test", "--policy", policy_path),
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -217,7 +242,7 @@ def test_gateway_traffic_flow(sandbox_cli):
 
 
 @pytest.mark.timeout(600)
-def test_denied_traffic(sandbox_cli):
+def test_denied_traffic(sandbox_cli, backend):
     """Verify nftables blocks direct outbound traffic that bypasses the gateway.
 
     The gateway container has nftables rules that DNAT all VM traffic through
@@ -229,7 +254,7 @@ def test_denied_traffic(sandbox_cli):
     try:
         # 1. Create a session.
         result = sandbox_cli(
-            "create", "--name", "net-deny-test", *_VM_RESOURCE_ARGS,
+            "create", *make_create_args(backend, "net-deny-test"),
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -343,7 +368,7 @@ def test_denied_traffic(sandbox_cli):
 
 
 @pytest.mark.timeout(600)
-def test_dns_interception(sandbox_cli):
+def test_dns_interception(sandbox_cli, backend):
     """Verify DNS queries from the VM go through the gateway's CoreDNS.
 
     Resolve a domain from inside the VM, then check CoreDNS logs in the
@@ -356,8 +381,8 @@ def test_dns_interception(sandbox_cli):
         #    replacement for the legacy --unrestricted flag).
         policy_path = _networking_smoke_policy_file()
         result = sandbox_cli(
-            "create", "--name", "net-dns-test", *_VM_RESOURCE_ARGS,
-            "--policy", policy_path,
+            "create",
+            *make_create_args(backend, "net-dns-test", "--policy", policy_path),
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -423,10 +448,18 @@ def test_dns_interception(sandbox_cli):
 
 
 @pytest.mark.timeout(600)
-def test_stop_start_with_networking(sandbox_cli):
+def test_stop_start_with_networking(sandbox_cli, backend):
     """Create a session, verify networking, stop, verify gateway gone,
     start, verify persistence and networking restoration.
     """
+    if backend == "container":
+        pytest.skip(
+            "Lima-only: assertion pins the VM IP to the 10.209.x.x/28 "
+            "Lima subnet shape and pings the per-VM gateway IP. The "
+            "stop/start lifecycle on lite is independently covered by "
+            "test_lite.py::test_lite_stop_start_persistence; an agnostic "
+            "refactor of this test is a follow-up not in M11 scope."
+        )
     session_id = None
     policy_path = None
     try:
@@ -434,8 +467,8 @@ def test_stop_start_with_networking(sandbox_cli):
         #    replacement for the legacy --unrestricted flag).
         policy_path = _networking_smoke_policy_file()
         result = sandbox_cli(
-            "create", "--name", "net-restart-test", *_VM_RESOURCE_ARGS,
-            "--policy", policy_path,
+            "create",
+            *make_create_args(backend, "net-restart-test", "--policy", policy_path),
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -547,16 +580,24 @@ def test_stop_start_with_networking(sandbox_cli):
     os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") < 6 * 1024**3,
     reason="Requires >= 6GB RAM for concurrent VMs",
 )
-def test_concurrent_sessions(sandbox_cli):
+def test_concurrent_sessions(sandbox_cli, backend):
     """Create two sessions and verify network isolation: different IPs/subnets,
     both functional, no cross-session traffic.
     """
+    if backend == "container":
+        pytest.skip(
+            "Lima-only: assertion pins both VM IPs to the 10.209.x.x/28 "
+            "Lima subnet pool and verifies subnet isolation by pattern. "
+            "Network isolation between lite container sessions is a "
+            "different concern (per-session sandbox-net-<id> Docker "
+            "networks) and not what this test exercises."
+        )
     session_id_a = None
     session_id_b = None
     try:
         # 1. Create first session.
         result_a = sandbox_cli(
-            "create", "--name", "net-multi-a", *_VM_RESOURCE_ARGS,
+            "create", *make_create_args(backend, "net-multi-a"),
             timeout=600,
         )
         assert result_a.returncode == 0, (
@@ -568,7 +609,7 @@ def test_concurrent_sessions(sandbox_cli):
 
         # 2. Create second session.
         result_b = sandbox_cli(
-            "create", "--name", "net-multi-b", *_VM_RESOURCE_ARGS,
+            "create", *make_create_args(backend, "net-multi-b"),
             timeout=600,
         )
         assert result_b.returncode == 0, (
@@ -677,7 +718,7 @@ def test_concurrent_sessions(sandbox_cli):
 
 
 @pytest.mark.timeout(600)
-def test_daemon_restart_recovery(sandbox_binaries, sandbox_daemon, sandbox_cli):
+def test_daemon_restart_recovery(sandbox_binaries, sandbox_daemon, sandbox_cli, backend):
     """Create a session, kill the daemon, restart it, verify the session
     is recovered and functional.
     """
@@ -686,7 +727,7 @@ def test_daemon_restart_recovery(sandbox_binaries, sandbox_daemon, sandbox_cli):
     try:
         # 1. Create a session.
         result = sandbox_cli(
-            "create", "--name", "net-daemon-test", *_VM_RESOURCE_ARGS,
+            "create", *make_create_args(backend, "net-daemon-test"),
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -831,7 +872,7 @@ def test_daemon_restart_recovery(sandbox_binaries, sandbox_daemon, sandbox_cli):
 
 
 @pytest.mark.timeout(600)
-def test_gateway_crash_recovery(sandbox_cli):
+def test_gateway_crash_recovery(sandbox_cli, backend):
     """Kill the gateway container and verify the daemon's background monitor
     detects and restarts it within the poll interval (30 seconds).
     """
@@ -842,8 +883,8 @@ def test_gateway_crash_recovery(sandbox_cli):
         #    replacement for the legacy --unrestricted flag).
         policy_path = _networking_smoke_policy_file()
         result = sandbox_cli(
-            "create", "--name", "net-gwcrash-test", *_VM_RESOURCE_ARGS,
-            "--policy", policy_path,
+            "create",
+            *make_create_args(backend, "net-gwcrash-test", "--policy", policy_path),
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -924,15 +965,21 @@ def test_gateway_crash_recovery(sandbox_cli):
         gateway_ip = f"{octets[0]}.{octets[1]}.{octets[2]}.{int(octets[3]) - 1}"
 
         # Ping the gateway to verify full recovery.
-        ping_result = sandbox_cli(
-            "exec", "net-gwcrash-test", "--",
-            "ping", "-c", "3", "-W", "5", gateway_ip,
-            timeout=120,
-        )
-        assert ping_result.returncode == 0, (
-            f"VM cannot ping gateway {gateway_ip} after crash recovery.\n"
-            f"stdout: {ping_result.stdout}\nstderr: {ping_result.stderr}"
-        )
+        # Lite-mode containers drop CAP_NET_RAW per spec § Hardening
+        # (line 561-562: "Raw network sockets. CAP_NET_RAW dropped; ping
+        # and similar tools fail."), so skip the ping step on container —
+        # the DNS check below still validates post-recovery networking
+        # without needing raw sockets.
+        if backend != "container":
+            ping_result = sandbox_cli(
+                "exec", "net-gwcrash-test", "--",
+                "ping", "-c", "3", "-W", "5", gateway_ip,
+                timeout=120,
+            )
+            assert ping_result.returncode == 0, (
+                f"VM cannot ping gateway {gateway_ip} after crash recovery.\n"
+                f"stdout: {ping_result.stdout}\nstderr: {ping_result.stderr}"
+            )
 
         # Verify DNS works after recovery.
         dns_result = sandbox_cli(

@@ -110,3 +110,4 @@ sandbox rm hello
 - [Architecture](/concepts/architecture/) for what the components do and how traffic flows.
 - [CLI reference](/reference/cli/) for every command and flag.
 - [Troubleshooting](/guides/troubleshooting/) when something does not work.
+- [Lite mode](/guides/lite-mode/) when you want sub-second session creation in exchange for container-level isolation instead of VM-grade.

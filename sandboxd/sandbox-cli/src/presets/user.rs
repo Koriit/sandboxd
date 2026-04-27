@@ -391,33 +391,19 @@ fn load_one(path: &Path, warn: &mut dyn FnMut(&str)) -> Result<Option<UserPreset
 
 /// Resolve the XDG preset base directory.
 ///
-/// Precedence: explicit override > `$XDG_CONFIG_HOME` > `$HOME/.config`.
-/// Returns `None` when the last fallback also fails (i.e. `$HOME` is
-/// unset and no override was given) — callers treat that as "no user
-/// presets to load".
+/// Delegates to [`crate::cli_xdg::resolve_sandboxd_config_dir`] —
+/// spec § "CLI & UX → Config file" mandates "one resolver, not two"
+/// for `~/.config/sandboxd/presets/` and
+/// `~/.config/sandboxd/config.json`. Both call sites append their own
+/// per-feature subpath after the shared resolver returns the base.
+///
+/// Returns `None` when neither `$XDG_CONFIG_HOME` nor `$HOME` is set —
+/// callers treat that as "no user presets to load".
 fn resolve_base_dir(xdg_override: Option<&Path>) -> Option<PathBuf> {
     if let Some(path) = xdg_override {
         return Some(path.to_path_buf());
     }
-
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        if !xdg.is_empty() {
-            return Some(PathBuf::from(xdg).join("sandboxd").join("presets"));
-        }
-    }
-
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() {
-            return Some(
-                PathBuf::from(home)
-                    .join(".config")
-                    .join("sandboxd")
-                    .join("presets"),
-            );
-        }
-    }
-
-    None
+    crate::cli_xdg::resolve_sandboxd_config_dir(None).map(|p| p.join("presets"))
 }
 
 /// Return true when `path` has a `.json` extension (case-sensitive,

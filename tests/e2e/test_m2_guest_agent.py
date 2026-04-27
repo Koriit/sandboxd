@@ -6,6 +6,13 @@ Run with generous timeouts:
     cd tests/e2e
     source .venv/bin/activate
     python -m pytest test_m2_guest_agent.py -v --timeout=600
+
+Backend coverage: **agnostic** — parametrized over ``[lima, container]``
+via the ``backend`` fixture from ``conftest.py``. The exec / ssh / ps
+contracts these tests verify hold for both backends (the lite backend
+re-implements ``sandbox ssh`` via ``docker exec -it`` and routes
+``sandbox exec`` through the daemon's ``/sessions/<id>/exec`` endpoint
+which dispatches per-backend internally).
 """
 
 from __future__ import annotations
@@ -13,7 +20,7 @@ from __future__ import annotations
 import pytest
 
 from conftest import (
-    _VM_RESOURCE_ARGS,
+    make_create_args,
     parse_session_id,
     wait_for_state,
 )
@@ -23,13 +30,13 @@ from conftest import (
 # ---------------------------------------------------------------------------
 
 @pytest.mark.timeout(600)
-def test_guest_agent_health_check(sandbox_cli):
+def test_guest_agent_health_check(sandbox_cli, backend):
     """Create a session and verify guest agent status shows 'connected' in ps."""
     session_id = None
     try:
         # Create a session.
         result = sandbox_cli(
-            "create", "--name", "health-test", *_VM_RESOURCE_ARGS, timeout=600,
+            "create", *make_create_args(backend, "health-test"), timeout=600,
         )
         assert result.returncode == 0, (
             f"sandbox create failed (rc={result.returncode}).\n"
@@ -68,13 +75,13 @@ def test_guest_agent_health_check(sandbox_cli):
 
 
 @pytest.mark.timeout(600)
-def test_guest_agent_exec(sandbox_cli, sandbox_daemon):
+def test_guest_agent_exec(sandbox_cli, sandbox_daemon, backend):
     """Create a session, exec 'uname -a' via the daemon exec endpoint, verify output."""
     session_id = None
     try:
         # Create a session.
         result = sandbox_cli(
-            "create", "--name", "exec-test", *_VM_RESOURCE_ARGS, timeout=600,
+            "create", *make_create_args(backend, "exec-test"), timeout=600,
         )
         assert result.returncode == 0, (
             f"sandbox create failed (rc={result.returncode}).\n"
@@ -112,13 +119,13 @@ def test_guest_agent_exec(sandbox_cli, sandbox_daemon):
 
 
 @pytest.mark.timeout(600)
-def test_ssh_session(sandbox_cli):
+def test_ssh_session(sandbox_cli, backend):
     """Create a session, run a non-interactive command via `sandbox ssh`, verify output."""
     session_id = None
     try:
         # Create a session.
         result = sandbox_cli(
-            "create", "--name", "ssh-test", *_VM_RESOURCE_ARGS, timeout=600,
+            "create", *make_create_args(backend, "ssh-test"), timeout=600,
         )
         assert result.returncode == 0, (
             f"sandbox create failed (rc={result.returncode}).\n"
@@ -148,13 +155,13 @@ def test_ssh_session(sandbox_cli):
 
 
 @pytest.mark.timeout(600)
-def test_exec_on_stopped_session(sandbox_cli):
+def test_exec_on_stopped_session(sandbox_cli, backend):
     """Verify that exec fails gracefully on a stopped session."""
     session_id = None
     try:
         # Create and then stop a session.
         result = sandbox_cli(
-            "create", "--name", "stop-exec-test", *_VM_RESOURCE_ARGS, timeout=600,
+            "create", *make_create_args(backend, "stop-exec-test"), timeout=600,
         )
         assert result.returncode == 0, (
             f"sandbox create failed (rc={result.returncode}).\n"

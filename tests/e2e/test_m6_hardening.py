@@ -7,6 +7,14 @@ Run with generous timeouts:
     cd tests/e2e
     source .venv/bin/activate
     python -m pytest test_m6_hardening.py -v --timeout=600
+
+Backend coverage: **Lima only**. The lite container backend has no QEMU
+process, no ``--hardened`` flag (the spec rejects it on lite —
+§ "Out of scope" line ~1175), and no systemd-scope cgroup wrapper
+around session execution. These tests therefore intentionally do NOT
+take the ``backend`` fixture and run unparametrised against the Lima
+backend only — analogous to how ``test_lite.py`` runs unparametrised
+against the container backend only.
 """
 
 from __future__ import annotations

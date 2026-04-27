@@ -68,8 +68,36 @@ BRIDGE_CONF_PATH = Path("/etc/qemu/bridge.conf")
 _ID_RE = re.compile(r"^ID:\s+([0-9a-f]{12})$", re.MULTILINE)
 
 # Default VM resource args -- kept small so tests work on hosts with limited
-# memory (e.g. 4 GB total).
+# memory (e.g. 4 GB total). Used only for the Lima backend; the lite container
+# backend ignores --cpus/--memory/--disk (host-80% defaults).
 _VM_RESOURCE_ARGS = ("--cpus", "2", "--memory", "2048", "--disk", "10")
+
+
+def make_create_args(backend: str, name: str, *extra: str) -> tuple[str, ...]:
+    """Build the argv for ``sandbox create`` parametrised on backend.
+
+    For ``backend == "lima"`` (the historical default), prepends
+    ``_VM_RESOURCE_ARGS`` and uses no flag.
+    For ``backend == "container"``, passes ``--lite`` and skips the
+    Lima-specific resource args (the lite backend uses host-80%
+    defaults — see spec § "Resource defaults", line ~620).
+
+    Tests should call this from inside a parametrized test that takes
+    the ``backend`` fixture::
+
+        result = sandbox_cli(
+            "create", *make_create_args(backend, "my-name"),
+            "--policy", policy_path,
+            timeout=600,
+        )
+
+    Any ``extra`` args are appended after the name (so any
+    backend-agnostic flags like ``--name`` and ``--policy`` keep their
+    natural order).
+    """
+    if backend == "container":
+        return ("--lite", "--name", name, *extra)
+    return ("--name", name, *_VM_RESOURCE_ARGS, *extra)
 
 
 def parse_session_id(create_output: str) -> str:
@@ -625,3 +653,37 @@ def sandbox_cli(sandbox_binaries: SandboxBinaries, sandbox_daemon, _ensure_base_
         )
 
     return run
+
+
+# ---------------------------------------------------------------------------
+# Backend parametrization (M11 § "E2E tests" → "Parametrization", spec lines
+# 990-1005)
+# ---------------------------------------------------------------------------
+#
+# Tests that exercise behavior contracts agnostic of backend (lifecycle,
+# exec, networking policy, git remote, workspace, presets, persistence)
+# request the ``backend`` fixture and use ``make_create_args(backend, ...)``
+# to build their ``sandbox create`` argv. pytest then runs each test twice
+# — once for ``backend == "lima"`` and once for ``backend == "container"``.
+#
+# Lima-only tests (``test_m1_vm_lifecycle.py``, ``test_m6_hardening.py``,
+# ``test_m85_golden_image.py``, ``test_m3_networking.py::
+# test_concurrent_sessions``) carry an ``@pytest.mark.skipif(backend ==
+# "container", reason=...)`` to declare why the backend pair is not
+# applicable. Tests in ``test_lite.py`` are container-only and don't take
+# this fixture.
+#
+# CI policy (spec lines 1060-1070): PR-time runs ``container`` only;
+# merge-to-main runs the full ``[lima, container]`` matrix; nightly adds
+# performance numbers.
+
+@pytest.fixture(params=["lima", "container"])
+def backend(request) -> str:
+    """Parametrize a test across the two session backends.
+
+    Yields ``"lima"`` then ``"container"`` (one test invocation each).
+    The test should pass the value to :func:`make_create_args` and any
+    other backend-aware helpers; nothing else should branch on the
+    fixture value directly.
+    """
+    return request.param

@@ -43,6 +43,12 @@ Runs with generous timeouts; a single iteration boots a VM so budget
     cd tests/e2e
     source .venv/bin/activate
     python -m pytest test_m10_s4_discovery.py -v --timeout=600
+
+Backend coverage: **agnostic** — parametrized over ``[lima, container]``
+via the ``backend`` fixture. The deny-logger / events ring / Envoy
+filter-chain machinery is shared between backends (the gateway
+container is wired into both per the M11 gap-#70 closure), so the
+discovery contract holds in both shapes.
 """
 
 from __future__ import annotations
@@ -59,10 +65,10 @@ from pathlib import Path
 import pytest
 
 from conftest import (
-    _VM_RESOURCE_ARGS,
     SANDBOX_BIN,
     capture_lima_logs,
     cleanup_policy_file,
+    make_create_args,
     parse_session_id,
     wait_for_state,
     write_policy_file,
@@ -217,6 +223,7 @@ def test_discovery_workflow_surfaces_denials_then_policy_update_closes_them(
     sandbox_cli,
     sandbox_daemon,
     tmp_path,
+    backend,
 ):
     """Empty policy + workload produces deny events via ``sandbox events
     --follow``; a subsequent policy update that allow-lists the targets
@@ -241,8 +248,8 @@ def test_discovery_workflow_surfaces_denials_then_policy_update_closes_them(
         policy_path_deny = write_policy_file(policy_deny)
 
         create_result = sandbox_cli(
-            "create", "--name", SESSION_NAME,
-            *_VM_RESOURCE_ARGS, "--policy", policy_path_deny,
+            "create",
+            *make_create_args(backend, SESSION_NAME, "--policy", policy_path_deny),
             timeout=600,
         )
         assert create_result.returncode == 0, (

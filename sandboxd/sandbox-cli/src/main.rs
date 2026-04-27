@@ -15,9 +15,13 @@ use sandbox_core::{
 };
 use tokio::net::UnixStream;
 
-mod presets;
-
-use presets::{Catalog, ParsedInvocation, Preset, PresetSource};
+use sandbox_cli::backend::{
+    BackendKindArg, BackendResolutionInputs, FeatureMismatchContext, RebuildImageBackend,
+    load_cli_config, render_feature_mismatch, render_isolation_warning,
+    render_no_cache_rejection_for_container, resolve_backend,
+};
+use sandbox_cli::backends_cache::BackendsCache;
+use sandbox_cli::presets::{self, Catalog, ParsedInvocation, Preset, PresetSource};
 
 /// CLI client for managing sandbox sessions.
 #[derive(Parser, Debug)]
@@ -42,12 +46,20 @@ enum Command {
         /// Optional name for the session.
         #[arg(long)]
         name: Option<String>,
-        /// Number of CPU cores (default: 2).
-        #[arg(long, default_value_t = 2)]
-        cpus: u32,
-        /// Memory in megabytes (default: 4096).
-        #[arg(long, default_value_t = 4096)]
-        memory: u32,
+        /// Number of CPU cores. Defaults are backend-specific:
+        /// `lima` falls back to 2 cores; `container` falls back to
+        /// the daemon's host-80% ceiling (spec § "Resource defaults").
+        /// Omit to take the backend default; pass an explicit value
+        /// to override.
+        #[arg(long)]
+        cpus: Option<u32>,
+        /// Memory in megabytes. Defaults are backend-specific:
+        /// `lima` falls back to 4096 MB; `container` falls back to
+        /// the daemon's host-80% ceiling (spec § "Resource defaults").
+        /// Omit to take the backend default; pass an explicit value
+        /// to override.
+        #[arg(long)]
+        memory: Option<u32>,
         /// Disk size in gigabytes (default: 20).
         #[arg(long, default_value_t = 20)]
         disk: u32,
@@ -92,6 +104,21 @@ enum Command {
         /// Skip pre-baked image, use full create path.
         #[arg(long)]
         no_cache: bool,
+        /// Backend that should host the session (`lima` or `container`).
+        ///
+        /// Mutually exclusive with `--lite`. When neither is set, the
+        /// backend is resolved from `SANDBOX_DEFAULT_BACKEND`, the
+        /// per-user config (`~/.config/sandboxd/config.json` →
+        /// `default_backend`), and finally the hardcoded default
+        /// `lima`. See spec § "CLI & UX → Invocation".
+        #[arg(long, value_enum)]
+        backend: Option<BackendKindArg>,
+        /// Sugar for `--backend container` — the container ("lite")
+        /// backend.
+        ///
+        /// Mutually exclusive with `--backend`.
+        #[arg(long, conflicts_with = "backend")]
+        lite: bool,
     },
     /// Start a sandbox session.
     Start {
@@ -180,10 +207,20 @@ enum Command {
     /// argument. Blocks are separated by a single blank line. If any
     /// named session is missing, the CLI writes an error to stderr naming
     /// the first missing id, exits non-zero, and produces no stdout.
+    ///
+    /// With `-v`/`--verbose`, appends a `Capabilities` block per session
+    /// showing the daemon-advertised capability matrix for that
+    /// session's backend (fetched once per invocation via
+    /// `GET /backends`). Failure to fetch the matrix degrades gracefully
+    /// — the rest of the describe output is unaffected.
     Describe {
         /// One or more session names or IDs to describe.
         #[arg(required = true)]
         sessions: Vec<String>,
+        /// Append the daemon-advertised capability matrix for each
+        /// session's backend. Spec § "sandbox inspect" → `-v` view.
+        #[arg(short, long)]
+        verbose: bool,
     },
     /// Stream or replay events from a sandbox session.
     ///
@@ -235,8 +272,31 @@ enum Command {
         #[arg(long)]
         table: bool,
     },
-    /// Rebuild the pre-baked base VM image.
-    RebuildImage,
+    /// Rebuild the pre-baked backend image(s).
+    ///
+    /// Spec § "`rebuild-image`: extend the existing flat command":
+    /// `--backend` selects which backend's image to rebuild
+    /// (`lima`, `container`, or `all`; default `all`); `--no-cache`
+    /// passes through to `docker build --no-cache` for the container
+    /// path and to the equivalent cache-bust mechanism for Lima's
+    /// golden image rebuild.
+    RebuildImage {
+        /// Which backend's image to rebuild.
+        ///
+        /// `all` (the default) rebuilds every installed backend's
+        /// image. For Lima, "rebuild" means cache-bust the golden VM
+        /// image; for container, it means rebuild the lite image.
+        #[arg(long, value_enum, default_value_t = RebuildImageBackend::All)]
+        backend: RebuildImageBackend,
+        /// Cache-bust the rebuild.
+        ///
+        /// Container: passes `--no-cache` to `docker build`. Lima:
+        /// already cache-busts on every rebuild (delete-then-build
+        /// the golden VM), so this flag is a no-op for Lima but kept
+        /// for symmetry with the container path.
+        #[arg(long)]
+        no_cache: bool,
+    },
 }
 
 /// Policy subcommands.
@@ -431,133 +491,192 @@ fn expand_and_merge_presets(
     (effective, source_presets)
 }
 
+/// Build the `POST /sessions` request from a `Command::Create` and the
+/// backend the preflight chose.
+///
+/// Pulled out of [`build_request`] because the resolved backend is the
+/// product of an async preflight (`/backends` fetch + `SessionSpec`
+/// validation) that cannot run inside `build_request`'s sync interface.
+/// The dispatch in `main` calls [`dispatch_create_preflight`] first
+/// and then this function with the result, threading the validated
+/// backend choice into the wire body.
+///
+/// Panics (via `unreachable!`) if `command` is not `Command::Create` —
+/// callers must only invoke this for the Create variant.
+fn build_create_request_body(
+    command: &Command,
+    resolved_backend: sandbox_core::BackendKind,
+) -> Request<String> {
+    let Command::Create {
+        name,
+        cpus,
+        memory,
+        disk,
+        template,
+        policy,
+        preset,
+        repo,
+        boot_cmd,
+        workspace,
+        no_hardening,
+        no_cache,
+        backend: _backend,
+        lite: _lite,
+    } = command
+    else {
+        unreachable!("build_create_request_body called with non-Create command");
+    };
+
+    let mut body = serde_json::Map::new();
+    if let Some(n) = name {
+        body.insert("name".into(), serde_json::Value::String(n.clone()));
+    }
+    // M11-S4 Phase 4D-pre gap #4: only stamp `cpus`/`memory_mb` on the
+    // wire when the operator passed an explicit value. Older daemons
+    // that ignore the absence treat it as "Lima-leaning 2/4096"; newer
+    // daemons fold absence into the container backend's host-80%
+    // default. Always sending a concrete number (the pre-fix
+    // `default_value_t` shape) made the host-80% ceiling unreachable
+    // through the public CLI. Forward-compatible with old daemons via
+    // their existing `unwrap_or` Lima fallback path.
+    if let Some(v) = cpus {
+        body.insert("cpus".into(), serde_json::json!(*v));
+    }
+    if let Some(v) = memory {
+        body.insert("memory_mb".into(), serde_json::json!(*v));
+    }
+    body.insert("disk_gb".into(), serde_json::json!(*disk));
+    if let Some(t) = template {
+        body.insert("template".into(), serde_json::Value::String(t.clone()));
+    }
+    // Compose `--policy` (optional file) with any `--preset`
+    // invocations (repeatable) into a single effective policy.
+    //
+    // - If neither is present, omit `policy` from the body
+    //   (legacy "no policy" shape — server defaults to fail-closed).
+    // - If only `--policy` is present, parse it and pass it through
+    //   (matches the pre-M10-S5 wire shape).
+    // - If `--preset` is present (with or without `--policy`),
+    //   expand presets client-side, merge them with the file, and
+    //   send the effective `Policy` JSON plus `source_presets` as a
+    //   sibling field for audit.
+    //
+    // Preset errors short-circuit to stderr + exit(1) BEFORE any
+    // Unix-socket work — this matches the spec invariant "the daemon
+    // never sees a malformed preset invocation".
+    let (file_policy, file_path): (Option<Policy>, Option<std::path::PathBuf>) =
+        if let Some(policy_path) = policy {
+            let policy_json = match std::fs::read_to_string(policy_path) {
+                Ok(content) => content,
+                Err(e) => {
+                    eprintln!("Error: cannot read policy file '{policy_path}': {e}");
+                    process::exit(1);
+                }
+            };
+            let parsed: Policy = match serde_json::from_str(&policy_json) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Error: invalid policy JSON in '{policy_path}': {e}");
+                    process::exit(1);
+                }
+            };
+            (Some(parsed), Some(std::path::PathBuf::from(policy_path)))
+        } else {
+            (None, None)
+        };
+
+    if !preset.is_empty() {
+        let (effective, source_presets) =
+            expand_and_merge_presets(file_policy.as_ref(), file_path.as_deref(), preset);
+        let policy_value =
+            serde_json::to_value(&effective).expect("Policy always serializes to JSON");
+        body.insert("policy".into(), policy_value);
+        body.insert(
+            "source_presets".into(),
+            serde_json::Value::Array(
+                source_presets
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        );
+    } else if let Some(effective) = file_policy {
+        let policy_value =
+            serde_json::to_value(&effective).expect("Policy always serializes to JSON");
+        body.insert("policy".into(), policy_value);
+    }
+    if let Some(r) = repo {
+        body.insert("repo".into(), serde_json::Value::String(r.clone()));
+    }
+    if let Some(cmd) = boot_cmd {
+        body.insert("boot_cmd".into(), serde_json::Value::String(cmd.clone()));
+    }
+    if let Some(ws) = workspace {
+        // Validate the workspace value client-side before sending.
+        let path_part = ws.strip_prefix("shared:").unwrap_or("");
+        if !ws.starts_with("shared:") {
+            eprintln!("Error: --workspace must start with 'shared:', got: {ws}");
+            process::exit(1);
+        }
+        if path_part.is_empty() {
+            eprintln!("Error: --workspace shared: path must not be empty");
+            process::exit(1);
+        }
+        let p = Path::new(path_part);
+        if !p.is_absolute() {
+            eprintln!("Error: --workspace path must be absolute, got: {path_part}");
+            process::exit(1);
+        }
+        if !p.exists() {
+            eprintln!("Error: --workspace path does not exist: {path_part}");
+            process::exit(1);
+        }
+        body.insert("workspace".into(), serde_json::Value::String(ws.clone()));
+    }
+    if *no_hardening {
+        body.insert("hardened".into(), serde_json::json!(false));
+    }
+    if *no_cache {
+        body.insert("no_cache".into(), serde_json::json!(true));
+    }
+    // M11-S4 Phase 4A: stamp the resolved backend onto the request
+    // body. The daemon's `CreateSessionRequest` carries this as
+    // `Option<BackendKind>` (added in M11-S3 Phase 3D); older daemons
+    // that ignore the field default to Lima, which is consistent with
+    // the resolver's tier-5 fallback. Always send the field (even for
+    // Lima) so the daemon-side audit / persistence sees an explicit
+    // choice rather than relying on the default.
+    body.insert(
+        "backend".into(),
+        serde_json::json!(resolved_backend.as_str()),
+    );
+    let body_str = serde_json::Value::Object(body).to_string();
+    Request::builder()
+        .method("POST")
+        .uri("/sessions")
+        .header("content-type", "application/json")
+        .body(body_str)
+        .expect("failed to build request")
+}
+
 /// Build the HTTP request for the given CLI command.
 ///
 /// Returns `None` for commands that are handled specially (e.g. `ssh`).
 fn build_request(command: &Command) -> Option<Request<String>> {
     let req = match command {
-        Command::Create {
-            name,
-            cpus,
-            memory,
-            disk,
-            template,
-            policy,
-            preset,
-            repo,
-            boot_cmd,
-            workspace,
-            no_hardening,
-            no_cache,
-        } => {
-            let mut body = serde_json::Map::new();
-            if let Some(n) = name {
-                body.insert("name".into(), serde_json::Value::String(n.clone()));
-            }
-            body.insert("cpus".into(), serde_json::json!(*cpus));
-            body.insert("memory_mb".into(), serde_json::json!(*memory));
-            body.insert("disk_gb".into(), serde_json::json!(*disk));
-            if let Some(t) = template {
-                body.insert("template".into(), serde_json::Value::String(t.clone()));
-            }
-            // Compose `--policy` (optional file) with any `--preset`
-            // invocations (repeatable) into a single effective policy.
-            //
-            // - If neither is present, omit `policy` from the body
-            //   (legacy "no policy" shape — server defaults to
-            //   fail-closed).
-            // - If only `--policy` is present, parse it and pass it
-            //   through (matches the pre-M10-S5 wire shape).
-            // - If `--preset` is present (with or without `--policy`),
-            //   expand presets client-side, merge them with the file,
-            //   and send the effective `Policy` JSON plus
-            //   `source_presets` as a sibling field for audit.
-            //
-            // Preset errors short-circuit to stderr + exit(1) BEFORE
-            // any Unix-socket work — this matches the spec invariant
-            // "the daemon never sees a malformed preset invocation".
-            let (file_policy, file_path): (Option<Policy>, Option<std::path::PathBuf>) =
-                if let Some(policy_path) = policy {
-                    let policy_json = match std::fs::read_to_string(policy_path) {
-                        Ok(content) => content,
-                        Err(e) => {
-                            eprintln!("Error: cannot read policy file '{policy_path}': {e}");
-                            process::exit(1);
-                        }
-                    };
-                    let parsed: Policy = match serde_json::from_str(&policy_json) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            eprintln!("Error: invalid policy JSON in '{policy_path}': {e}");
-                            process::exit(1);
-                        }
-                    };
-                    (Some(parsed), Some(std::path::PathBuf::from(policy_path)))
-                } else {
-                    (None, None)
-                };
-
-            if !preset.is_empty() {
-                let (effective, source_presets) =
-                    expand_and_merge_presets(file_policy.as_ref(), file_path.as_deref(), preset);
-                let policy_value =
-                    serde_json::to_value(&effective).expect("Policy always serializes to JSON");
-                body.insert("policy".into(), policy_value);
-                body.insert(
-                    "source_presets".into(),
-                    serde_json::Value::Array(
-                        source_presets
-                            .into_iter()
-                            .map(serde_json::Value::String)
-                            .collect(),
-                    ),
-                );
-            } else if let Some(effective) = file_policy {
-                let policy_value =
-                    serde_json::to_value(&effective).expect("Policy always serializes to JSON");
-                body.insert("policy".into(), policy_value);
-            }
-            if let Some(r) = repo {
-                body.insert("repo".into(), serde_json::Value::String(r.clone()));
-            }
-            if let Some(cmd) = boot_cmd {
-                body.insert("boot_cmd".into(), serde_json::Value::String(cmd.clone()));
-            }
-            if let Some(ws) = workspace {
-                // Validate the workspace value client-side before sending.
-                let path_part = ws.strip_prefix("shared:").unwrap_or("");
-                if !ws.starts_with("shared:") {
-                    eprintln!("Error: --workspace must start with 'shared:', got: {ws}");
-                    process::exit(1);
-                }
-                if path_part.is_empty() {
-                    eprintln!("Error: --workspace shared: path must not be empty");
-                    process::exit(1);
-                }
-                let p = Path::new(path_part);
-                if !p.is_absolute() {
-                    eprintln!("Error: --workspace path must be absolute, got: {path_part}");
-                    process::exit(1);
-                }
-                if !p.exists() {
-                    eprintln!("Error: --workspace path does not exist: {path_part}");
-                    process::exit(1);
-                }
-                body.insert("workspace".into(), serde_json::Value::String(ws.clone()));
-            }
-            if *no_hardening {
-                body.insert("hardened".into(), serde_json::json!(false));
-            }
-            if *no_cache {
-                body.insert("no_cache".into(), serde_json::json!(true));
-            }
-            let body_str = serde_json::Value::Object(body).to_string();
-            Request::builder()
-                .method("POST")
-                .uri("/sessions")
-                .header("content-type", "application/json")
-                .body(body_str)
-                .expect("failed to build request")
+        Command::Create { .. } => {
+            // M11-S4 Phase 4A: the `Create` branch is owned by
+            // [`build_create_request_body`] because the resolved
+            // backend (computed in the async preflight that runs
+            // before this function) must be threaded into the
+            // request body. `build_request`'s sync interface cannot
+            // host that fetch, so `main` short-circuits Create
+            // before this match is reached. Returning `None` here is
+            // defensive: a future caller that forgets the bypass
+            // hits the same "unhandled command" path `ssh` / `cp` /
+            // `logs` use, instead of silently sending an unvalidated
+            // request.
+            return None;
         }
         Command::Start { session } => Request::builder()
             .method("POST")
@@ -712,11 +831,19 @@ fn build_request(command: &Command) -> Option<Request<String>> {
             .uri(format!("/sessions/{session}/health"))
             .body(String::new())
             .expect("failed to build request"),
-        Command::RebuildImage => Request::builder()
-            .method("POST")
-            .uri("/rebuild-image")
-            .body(String::new())
-            .expect("failed to build request"),
+        Command::RebuildImage { .. } => {
+            // M11-S4 Phase 4C: rebuild-image fans out one HTTP call per
+            // selected backend (spec § "rebuild-image"). The single-
+            // request shape `build_request` returns cannot express that;
+            // `main` short-circuits this command into
+            // [`dispatch_rebuild_image`] before reaching this match,
+            // mirroring how `Create` is hosted by
+            // [`build_create_request_body`]. Returning `None` here is
+            // defensive: a future caller that forgets the bypass hits
+            // the same "unhandled command" path `ssh` / `cp` / `logs`
+            // use, instead of silently sending the wrong request shape.
+            return None;
+        }
         // Ssh, Logs, Cp, Inspect, Describe, and Events are handled
         // specially -- not via a single buffered request/response pair.
         // Inspect and Describe issue one GET /sessions/{id} per argument
@@ -766,28 +893,49 @@ fn format_relative_time(dt: &DateTime<Utc>) -> String {
 }
 
 /// Display a list of sessions as a formatted table.
+///
+/// Writes to stdout via the `Write` interface so unit tests can capture
+/// the rendered output into a buffer without wrestling stdout. The
+/// production caller passes a locked `std::io::stdout()` handle.
 fn display_sessions_table(sessions: &[SessionDto]) {
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    write_sessions_table(&mut handle, sessions);
+}
+
+/// Render the `sandbox list` (a.k.a. `ps` / `ls`) table to an arbitrary
+/// writer. Pulled out of [`display_sessions_table`] so unit tests can
+/// capture the output into a buffer; production wraps `stdout`.
+///
+/// Column ordering: `ID NAME STATE BACKEND AGENT GATEWAY CREATED`. The
+/// `BACKEND` column lands between `STATE` and `AGENT` so the operator's
+/// eye scans backend-affinity adjacent to the lifecycle state — both
+/// answer the same kind of question ("what *is* this session?"). 9
+/// chars is enough to print `container` without truncation.
+fn write_sessions_table(out: &mut dyn std::io::Write, sessions: &[SessionDto]) {
     if sessions.is_empty() {
-        println!("No sessions found.");
+        let _ = writeln!(out, "No sessions found.");
         return;
     }
 
-    // Header.
-    println!(
-        "{:<12}  {:<16}  {:<10}  {:<11}  {:<11}  CREATED",
-        "ID", "NAME", "STATE", "AGENT", "GATEWAY"
+    let _ = writeln!(
+        out,
+        "{:<12}  {:<16}  {:<10}  {:<9}  {:<11}  {:<11}  CREATED",
+        "ID", "NAME", "STATE", "BACKEND", "AGENT", "GATEWAY"
     );
 
     for session in sessions {
         let name = session.name.as_deref().unwrap_or("-");
         let state = session.state.to_string();
+        let backend = session.backend.as_str();
         let agent = session.guest_agent_status.as_deref().unwrap_or("-");
         let gateway = session.gateway_status.as_deref().unwrap_or("-");
         let created = format_relative_time(&session.created_at);
 
-        println!(
-            "{:<12}  {:<16}  {:<10}  {:<11}  {:<11}  {created}",
-            session.id, name, state, agent, gateway
+        let _ = writeln!(
+            out,
+            "{:<12}  {:<16}  {:<10}  {:<9}  {:<11}  {:<11}  {created}",
+            session.id, name, state, backend, agent, gateway
         );
     }
 }
@@ -975,8 +1123,14 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
                 }
             );
         }
-        Command::RebuildImage => {
-            eprintln!("Done.");
+        Command::RebuildImage { .. } => {
+            // Phase 4C: per-backend dispatch owns its own success /
+            // error reporting in `dispatch_rebuild_image`; reaching
+            // `handle_response` for a rebuild-image command means the
+            // dispatch bypass at the top of `main` was skipped. Treat
+            // this the same as the `ssh` / `cp` family (also dispatch-
+            // bypass commands).
+            unreachable!("rebuild-image is handled by dispatch_rebuild_image before send_request");
         }
         Command::Ssh { .. }
         | Command::Logs { .. }
@@ -1063,31 +1217,61 @@ async fn fetch_sessions_parallel(
         .collect())
 }
 
+/// Resolution of a `Capabilities` lookup for a single session's backend.
+///
+/// Carries either the daemon-advertised capability matrix or the error
+/// that prevented the lookup. The describe renderer surfaces the error
+/// inline ("<capability matrix unavailable: ...>") rather than failing
+/// — describe's primary contract is showing session data, capability
+/// info is an enhancement (handoff Task 2 plumbing-note).
+#[derive(Debug, Clone)]
+enum CapabilitiesLookup {
+    Available(sandbox_core::Capabilities),
+    Unavailable(String),
+}
+
 /// Render a slice of `SessionDto` as the human-readable `sandbox describe`
 /// output. Separator between sessions is a single blank line.
 ///
-/// Layout follows the spec §2:
-/// - header block (Session, Name, State, Created, Updated)
+/// Layout follows the spec §2 plus M11-S4 Phase 4B additions:
+/// - header block (Session, Name, State, **Backend**, Created, Updated)
 /// - `Config:` block
 /// - `Runtime:` block
 /// - `Policy:` block — either `Policy: none` or a version/count header
 ///   followed by one indented rule entry per rule.
+/// - `Capabilities:` block (only when `verbose_caps` is `Some`) showing
+///   the daemon-advertised capability matrix for that session's backend.
+///
+/// `verbose_caps` is `None` for the default view and `Some(map)` under
+/// `-v`. The map keys by backend kind so a multi-session render shows
+/// the right matrix per session even when both backends appear in the
+/// arg list.
 ///
 /// Timestamps are rendered as absolute UTC plus the existing relative
 /// age suffix (e.g. `5m ago`), matching the sample in the spec.
-fn render_describe(sessions: &[SessionDto]) -> String {
+fn render_describe(
+    sessions: &[SessionDto],
+    verbose_caps: Option<
+        &std::collections::HashMap<sandbox_core::backend::BackendKind, CapabilitiesLookup>,
+    >,
+) -> String {
     let mut out = String::new();
     for (idx, session) in sessions.iter().enumerate() {
         if idx > 0 {
             // Single blank line between session blocks.
             out.push('\n');
         }
-        render_describe_one(session, &mut out);
+        let caps = verbose_caps.and_then(|map| map.get(&session.backend));
+        render_describe_one(session, caps, &mut out);
     }
     out
 }
 
-fn render_describe_one(session: &SessionDto, out: &mut String) {
+fn render_describe_one(
+    session: &SessionDto,
+    verbose_caps: Option<&CapabilitiesLookup>,
+    out: &mut String,
+) {
     use std::fmt::Write as _;
 
     let name = session.name.as_deref().unwrap_or("-");
@@ -1101,6 +1285,10 @@ fn render_describe_one(session: &SessionDto, out: &mut String) {
         "State:        {}",
         session.state.to_string().to_lowercase()
     );
+    // Spec § "sandbox inspect" — backend prominently alongside session
+    // id, state, and IP. `as_str()` matches the wire/persisted spelling
+    // (`lima` / `container`).
+    let _ = writeln!(out, "Backend:      {}", session.backend.as_str());
     let _ = writeln!(
         out,
         "Created:      {} ({})",
@@ -1156,6 +1344,80 @@ fn render_describe_one(session: &SessionDto, out: &mut String) {
     out.push('\n');
 
     render_policy_block(session.policy.as_ref(), out);
+
+    if let Some(caps) = verbose_caps {
+        // Single blank line between Policy and Capabilities so the
+        // block separator pattern matches the rest of the layout.
+        out.push('\n');
+        render_capabilities_block(caps, out);
+    }
+}
+
+/// Render the daemon-advertised capability matrix as a key/value block.
+///
+/// Spec § "sandbox inspect → -v view" — capability matrix is the
+/// `Capabilities` struct rendered as a key/value table. The keys are
+/// the struct field identifiers (so they match `serde_json` keys an
+/// operator may have already seen via `inspect`); values use each
+/// nested type's serialize form for stability.
+///
+/// Only operator-meaningful fields render — `kind` is omitted because
+/// the parent block already shows `Backend:` adjacent to `State:`, and
+/// duplicating it here would muddy the output.
+fn render_capabilities_block(lookup: &CapabilitiesLookup, out: &mut String) {
+    use std::fmt::Write as _;
+    let _ = writeln!(out, "Capabilities:");
+    match lookup {
+        CapabilitiesLookup::Unavailable(err) => {
+            // The describe command's primary contract is showing
+            // session data; cap-matrix failures degrade gracefully so
+            // the rest of the output still reaches the operator.
+            let _ = writeln!(out, "  <capability matrix unavailable: {err}>");
+        }
+        CapabilitiesLookup::Available(caps) => {
+            let isolation = match caps.isolation {
+                sandbox_core::backend::IsolationLevel::Vm => "vm",
+                sandbox_core::backend::IsolationLevel::Container => "container",
+            };
+            let _ = writeln!(out, "  isolation:            {isolation}");
+            let _ = writeln!(out, "  nested_virt:          {}", caps.nested_virt);
+            let _ = writeln!(out, "  privileged_ops:       {}", caps.privileged_ops);
+            let _ = writeln!(out, "  raw_network:          {}", caps.raw_network);
+            let _ = writeln!(out, "  hardening_flag:       {}", caps.hardening_flag);
+            let _ = writeln!(out, "  per_session_no_cache: {}", caps.per_session_no_cache);
+            let _ = writeln!(
+                out,
+                "  workspace_modes:      {}",
+                render_workspace_modes(caps)
+            );
+        }
+    }
+}
+
+/// Render a `Capabilities`'s `workspace_modes` set as a stable comma-
+/// separated list using each kind's `snake_case` serde form. Empty
+/// sets render as `-` so the column is never blank.
+///
+/// Takes the full `Capabilities` (rather than the `EnumSet` directly)
+/// so this module need not depend on `enumset` — `sandbox-cli` does not
+/// pull the crate in, and re-exporting the type from `sandbox-core`
+/// would expand the public surface unnecessarily.
+fn render_workspace_modes(caps: &sandbox_core::Capabilities) -> String {
+    use sandbox_core::session::WorkspaceModeKind;
+    let modes = &caps.workspace_modes;
+    if modes.is_empty() {
+        return "-".to_string();
+    }
+    let mut parts: Vec<&'static str> = Vec::new();
+    // List explicitly in declaration order so the rendered string is
+    // stable across runs — keeps the byte-equality test contract simple.
+    if modes.contains(WorkspaceModeKind::Shared) {
+        parts.push("shared");
+    }
+    if modes.contains(WorkspaceModeKind::Clone) {
+        parts.push("clone");
+    }
+    parts.join(", ")
 }
 
 fn render_policy_block(policy: Option<&PolicyDto>, out: &mut String) {
@@ -1592,7 +1854,12 @@ async fn handle_inspect(socket_path: &str, sessions: &[String]) {
 /// Handle `sandbox describe <session>...`: render human-readable sections
 /// for each session per the spec §2 layout. Any missing session causes a
 /// non-zero exit with an error on stderr and no stdout.
-async fn handle_describe(socket_path: &str, sessions: &[String]) {
+///
+/// When `verbose` is set, additionally fetches the daemon's capability
+/// matrix once via `BackendsCache` and appends a `Capabilities:` block
+/// per session keyed off `SessionDto.backend`. Cache failures degrade
+/// gracefully — describe's primary contract is showing session data.
+async fn handle_describe(socket_path: &str, sessions: &[String], verbose: bool) {
     let dtos = match fetch_sessions_parallel(socket_path, sessions).await {
         Ok(d) => d,
         Err(e) => {
@@ -1601,15 +1868,111 @@ async fn handle_describe(socket_path: &str, sessions: &[String]) {
         }
     };
 
-    let rendered = render_describe(&dtos);
+    let caps_map = if verbose {
+        Some(fetch_capabilities_for(&dtos, socket_path).await)
+    } else {
+        None
+    };
+
+    let rendered = render_describe(&dtos, caps_map.as_ref());
     // `print!` so we do not add a trailing blank line beyond what the
     // renderer already emitted (the last block ends with `\n` after the
     // last `writeln!` line).
     print!("{rendered}");
 }
 
-/// Handle the `ssh` subcommand: resolve session via daemon API, then exec
-/// `limactl shell`.
+/// Fetch the capability matrix for every backend referenced by the
+/// supplied DTOs. The cache is constructed per-invocation per spec
+/// "exactly one /backends fetch per CLI invocation" — a single
+/// [`BackendsCache`] services every session in the slice.
+///
+/// Cache or per-backend failures surface as
+/// [`CapabilitiesLookup::Unavailable`] entries so the renderer can
+/// inline the error rather than aborting the entire describe.
+async fn fetch_capabilities_for(
+    dtos: &[SessionDto],
+    socket_path: &str,
+) -> std::collections::HashMap<sandbox_core::backend::BackendKind, CapabilitiesLookup> {
+    let mut map: std::collections::HashMap<sandbox_core::backend::BackendKind, CapabilitiesLookup> =
+        std::collections::HashMap::new();
+    let mut cache = BackendsCache::new(socket_path);
+    let mut seen: Vec<sandbox_core::backend::BackendKind> = Vec::new();
+    for dto in dtos {
+        if seen.contains(&dto.backend) {
+            continue;
+        }
+        seen.push(dto.backend);
+        let lookup = match cache.get(dto.backend).await {
+            Ok(Some(c)) => CapabilitiesLookup::Available(c.clone()),
+            Ok(None) => CapabilitiesLookup::Unavailable(format!(
+                "daemon did not advertise the {} backend on /backends",
+                dto.backend
+            )),
+            Err(e) => CapabilitiesLookup::Unavailable(e.to_string()),
+        };
+        map.insert(dto.backend, lookup);
+    }
+    map
+}
+
+/// Plan the program + argv `sandbox ssh` shells out to for a given
+/// session backend.
+///
+/// Pulled out of [`handle_ssh`] as a pure function so unit tests can
+/// drive the dispatch without spawning a subprocess. The shape is
+/// `(program, args)` where `args` already includes the session-name
+/// arg and any user-supplied trailing command — i.e. the caller can
+/// pass the values straight to [`std::process::Command`].
+///
+/// Backend-specific shapes (spec § "Lifecycle"):
+///
+/// - **Lima** — `limactl shell sandbox-<id> [-- <cmd>...]`. The
+///   pre-existing path; the `--` separator is omitted when the user
+///   did not pass a trailing command so an interactive shell starts.
+/// - **Container** — `docker exec -i [-t] sandbox-<id> [<cmd>...]`.
+///   Mirrors `ContainerRuntime::exec_interactive` (`docker exec -i …`).
+///   The `-t` (allocate TTY) flag is added only when the parent
+///   process's stdin is itself a terminal — `docker exec -t` fails
+///   fast with "cannot attach stdin to a TTY-enabled container
+///   because stdin is not a terminal" when the caller is e.g. a
+///   pytest subprocess or any other pipe-fed parent. No `--user`:
+///   the container is created with `--user uid:gid` already, and
+///   `docker exec` inherits that identity by default.
+fn plan_ssh_command(
+    backend: sandbox_core::backend::BackendKind,
+    session_id: &sandbox_core::SessionId,
+    command: &[String],
+    stdin_is_tty: bool,
+) -> (&'static str, Vec<String>) {
+    let target_name = format!("sandbox-{session_id}");
+    match backend {
+        sandbox_core::backend::BackendKind::Lima => {
+            let mut args = vec!["shell".to_string(), target_name];
+            if !command.is_empty() {
+                args.push("--".to_string());
+                args.extend(command.iter().cloned());
+            }
+            ("limactl", args)
+        }
+        sandbox_core::backend::BackendKind::Container => {
+            // Always pass `-i` so stdin is forwarded to the in-container
+            // process. Only add `-t` when the caller's stdin is a real
+            // TTY: `docker exec -t` aborts at startup if stdin isn't a
+            // terminal (e.g. pytest's PIPE stdin), so passing it
+            // unconditionally would break every non-interactive caller.
+            let flags = if stdin_is_tty { "-it" } else { "-i" };
+            let mut args = vec!["exec".to_string(), flags.to_string(), target_name];
+            if !command.is_empty() {
+                args.extend(command.iter().cloned());
+            }
+            ("docker", args)
+        }
+    }
+}
+
+/// Handle the `ssh` subcommand: resolve session via daemon API, then
+/// exec the backend-appropriate shell helper (`limactl shell` for Lima,
+/// `docker exec -it` for Container).
 async fn handle_ssh(socket_path: &str, session: &str, command: &[String]) {
     // Resolve the session name/id to a Session via the daemon API.
     let req = Request::builder()
@@ -1643,18 +2006,24 @@ async fn handle_ssh(socket_path: &str, session: &str, command: &[String]) {
         }
     };
 
-    let vm_name = format!("sandbox-{}", session_resp.id);
+    // M11-S4 Phase 4D-pre gap #2: dispatch on the persisted backend so
+    // container sessions reach `docker exec` instead of failing with
+    // `limactl shell sandbox-<id>: no such instance`.
+    //
+    // `stdin_is_tty` controls whether `docker exec` gets `-t`: passing
+    // `-t` when our own stdin is not a terminal (e.g. piped from a
+    // test harness) causes docker to abort with "cannot attach stdin
+    // to a TTY-enabled container because stdin is not a terminal".
+    let stdin_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let (program, args) = plan_ssh_command(
+        session_resp.backend,
+        &session_resp.id,
+        command,
+        stdin_is_tty,
+    );
 
-    // Build the limactl shell command.
-    let mut cmd = std::process::Command::new("limactl");
-    cmd.arg("shell").arg(&vm_name);
-
-    if !command.is_empty() {
-        cmd.arg("--");
-        for arg in command {
-            cmd.arg(arg);
-        }
-    }
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(&args);
 
     // Use .status() to inherit stdin/stdout/stderr for interactive use.
     match cmd.status() {
@@ -1662,7 +2031,7 @@ async fn handle_ssh(socket_path: &str, session: &str, command: &[String]) {
             process::exit(exit_status.code().unwrap_or(1));
         }
         Err(e) => {
-            eprintln!("Failed to execute limactl shell: {e}");
+            eprintln!("Failed to execute {program}: {e}");
             process::exit(1);
         }
     }
@@ -3090,6 +3459,287 @@ async fn check_base_image_staleness(socket_path: &str) {
     }
 }
 
+/// M11-S4 Phase 4C: per-backend dispatcher for `sandbox rebuild-image`.
+///
+/// Spec § "`rebuild-image`: extend the existing flat command" requires
+/// fanning out one HTTP call per selected backend, prefixing per-
+/// backend errors with `rebuild-image[<kind>]:`, and exiting non-zero
+/// if any selected backend fails. The fan-out is best-effort —
+/// remaining backends still run after one fails, so the operator sees
+/// every error in a single invocation rather than chasing them one
+/// rebuild at a time.
+///
+/// Process exit semantics:
+/// - All selected backends succeed → exit 0.
+/// - At least one backend fails → exit 1 (after attempting every
+///   selected backend).
+async fn dispatch_rebuild_image(socket_path: &str, backend: RebuildImageBackend, no_cache: bool) {
+    // Drive the dispatcher through the production HTTP layer; the
+    // unit tests below substitute a fake closure to drive the loop
+    // without a real Unix socket.
+    let result = run_rebuild_image_dispatch(backend, no_cache, |kind, body| {
+        let socket = socket_path.to_string();
+        Box::pin(async move { send_rebuild_image_request(&socket, kind, body).await })
+    })
+    .await;
+    if !result.all_ok {
+        process::exit(1);
+    }
+}
+
+/// Outcome of [`run_rebuild_image_dispatch`]. Two return signals: the
+/// per-backend stderr lines (already formatted with the spec's
+/// `rebuild-image[<kind>]:` prefix) and a final all-or-some flag that
+/// drives the exit code.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RebuildDispatchOutcome {
+    /// `true` iff every selected backend's HTTP call succeeded.
+    all_ok: bool,
+    /// One stderr line per backend, in dispatch order. Pre-formatted
+    /// per spec ("rebuild-image[<kind>]: ..." for failures, plain
+    /// status for successes).
+    lines: Vec<String>,
+}
+
+/// Inner dispatch loop, pulled out of [`dispatch_rebuild_image`] so
+/// the unit tests can substitute the HTTP call.
+///
+/// `send` is the per-backend transport: it receives the
+/// [`BackendKind`] and the JSON body string the daemon expects,
+/// returns either the daemon's success body (which is currently a
+/// short status string) or an error message ready to splice into the
+/// `rebuild-image[<kind>]:` prefix.
+async fn run_rebuild_image_dispatch<F>(
+    backend: RebuildImageBackend,
+    no_cache: bool,
+    mut send: F,
+) -> RebuildDispatchOutcome
+where
+    F: FnMut(
+        sandbox_core::backend::BackendKind,
+        String,
+    )
+        -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send>>,
+{
+    let kinds = backend.into_kinds();
+    let mut all_ok = true;
+    let mut lines: Vec<String> = Vec::with_capacity(kinds.len());
+
+    for kind in kinds {
+        // The wire body is `{"backend": "<kind>", "no_cache": <bool>}`
+        // per Phase 4C — JSON-only config / wire (CLAUDE.md). The
+        // daemon defaults an empty body to lima/no_cache=false for
+        // backwards compat with older CLIs; explicit-body callers
+        // (this CLI from Phase 4C onwards) always send the full
+        // shape so the daemon side never has to guess.
+        let body = serde_json::json!({
+            "backend": kind.as_str(),
+            "no_cache": no_cache,
+        })
+        .to_string();
+        eprintln!("rebuild-image[{kind}]: rebuilding...");
+        match send(kind, body).await {
+            Ok(_) => {
+                lines.push(format!("rebuild-image[{kind}]: done"));
+                eprintln!("rebuild-image[{kind}]: done");
+            }
+            Err(msg) => {
+                all_ok = false;
+                let line = format!("rebuild-image[{kind}]: {msg}");
+                lines.push(line.clone());
+                eprintln!("{line}");
+            }
+        }
+    }
+
+    RebuildDispatchOutcome { all_ok, lines }
+}
+
+/// Issue a single per-backend `POST /rebuild-image` with the JSON
+/// `body` and reduce the daemon response to either `Ok(body)` (any
+/// 2xx) or `Err(msg)` carrying a human-readable failure string.
+///
+/// On a non-2xx response the daemon ships an `ApiError` JSON with an
+/// `error` field; if the parse fails (older daemon, unexpected
+/// shape), fall through to a generic `<status>: <body>` rendering so
+/// the operator never sees an empty error.
+async fn send_rebuild_image_request(
+    socket_path: &str,
+    _kind: sandbox_core::backend::BackendKind,
+    body: String,
+) -> Result<String, String> {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/rebuild-image")
+        .header("content-type", "application/json")
+        .body(body)
+        .map_err(|e| format!("failed to build request: {e}"))?;
+    let (status, body) = send_request_with_timeout(socket_path, req, CLI_HTTP_TIMEOUT).await?;
+    if status.is_success() {
+        return Ok(body);
+    }
+    if let Ok(api_err) = serde_json::from_str::<ApiError>(&body) {
+        return Err(api_err.error);
+    }
+    Err(format!("{status}: {body}"))
+}
+
+/// M11-S4 Phase 4A: pre-flight gate for `sandbox create`.
+///
+/// Runs the work that must happen before the daemon is contacted, in
+/// the order the spec mandates:
+///
+/// 1. Resolve the backend across the five-tier precedence chain
+///    (`--lite`, `--backend`, env, config, hardcoded Lima).
+/// 2. If the resolved backend is `Container` and `--no-cache` is set,
+///    render the spec's three-line error and exit 2 — this never
+///    reaches the daemon.
+/// 3. Lazily fetch `/backends` once via [`BackendsCache`] and project
+///    the operator's flags into a [`sandbox_core::SessionSpec`].
+/// 4. Run [`SessionSpec::validate`] against the cached capabilities;
+///    on `Err`, render the spec's `error:`+`help:` shape and exit 2.
+///
+/// Returns `Ok(())` when every gate passes; the caller proceeds to
+/// build the request body and send it. Errors short-circuit by calling
+/// `process::exit(2)` directly so the dispatch flow stays linear.
+///
+/// `cli_yes` mirrors `Cli::yes` — currently unused by the preflight
+/// itself but threaded through for symmetry with future "skip
+/// confirmation" knobs (the staleness check above already consumes
+/// it).
+async fn dispatch_create_preflight(
+    socket_path: &str,
+    backend_arg: Option<BackendKindArg>,
+    lite_flag: bool,
+    no_hardening: bool,
+    no_cache: bool,
+    workspace: Option<&str>,
+    cli_config_xdg_override: Option<&Path>,
+) -> sandbox_core::BackendKind {
+    // Tier 4 of the precedence chain — load the per-user CLI config.
+    // Spec § "CLI & UX → Config file" treats a missing file as not-an-
+    // error and a malformed file as a hard error with a path pointer.
+    let cli_config = match load_cli_config(cli_config_xdg_override) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(2);
+        }
+    };
+
+    // Run the spec's five-tier resolver against the actual env + the
+    // loaded config.
+    let inputs = BackendResolutionInputs {
+        lite_flag,
+        backend_flag: backend_arg.map(BackendKindArg::into_kind),
+        env_default_backend: std::env::var("SANDBOX_DEFAULT_BACKEND").ok(),
+        config_default_backend: cli_config.default_backend,
+    };
+    let resolved_backend = match resolve_backend(&inputs) {
+        Ok(kind) => kind,
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(2);
+        }
+    };
+
+    // Spec § "Isolation warning" (lines 751-762): every container-
+    // backed create prints a per-invocation warning to stderr **before**
+    // the daemon round-trip. Lima creates emit nothing — the helper
+    // returns an empty string in that case, so the unconditional
+    // `eprint!` is a no-op for Lima. Emitting here (after the resolver,
+    // before any further validation or daemon contact) means the
+    // operator sees the warning even if the daemon is slow or
+    // unreachable.
+    eprint!("{}", render_isolation_warning(resolved_backend));
+
+    // Spec § "CLI & UX → `sandbox create --no-cache` is forbidden on
+    // container": the rejection runs *before* the daemon is
+    // contacted. Mirrors the daemon-side gate (which lives in
+    // `SessionSpec::validate` once SessionSpec carries no_cache) but
+    // executes earlier so the operator never burns a round-trip.
+    if no_cache && resolved_backend == sandbox_core::BackendKind::Container {
+        eprint!("{}", render_no_cache_rejection_for_container(lite_flag));
+        process::exit(2);
+    }
+
+    // Capability-driven validation: fetch `/backends` once and run
+    // `SessionSpec::validate` against the matrix the daemon
+    // advertised for the chosen backend. The cache is dropped at the
+    // end of this function — Phase 4A only needs one validation call
+    // per invocation; later phases that surface capability matrices
+    // (inspect -v) will thread the cache through the rest of the
+    // dispatch.
+    let mut cache = BackendsCache::new(socket_path);
+    let caps = match cache.get(resolved_backend).await {
+        Ok(Some(c)) => c.clone(),
+        Ok(None) => {
+            eprintln!(
+                "error: daemon did not advertise the {resolved_backend} backend on /backends"
+            );
+            eprintln!(
+                "   help: check that the daemon was built with the {resolved_backend} backend enabled"
+            );
+            process::exit(2);
+        }
+        Err(e) => {
+            eprintln!("error: failed to load backend capabilities: {e}");
+            process::exit(2);
+        }
+    };
+
+    // Project the args into a SessionSpec for validation.
+    let workspace_mode = workspace.and_then(|raw| {
+        // The full validation of `--workspace` (path exists, is
+        // absolute, etc.) lives later in `build_request` to preserve
+        // the existing error wording. Here we only need a kind-bearing
+        // value so the capability validator can route to the right
+        // `WorkspaceModeKind` arm; an empty payload is fine because
+        // `validate` only inspects `kind()`.
+        sandbox_core::WorkspaceMode::parse_flag(raw).ok()
+    });
+
+    let backend_specific = match resolved_backend {
+        sandbox_core::BackendKind::Lima => sandbox_core::BackendSpecific::Lima {
+            // The daemon-side `hardened` field defaults to true; the
+            // CLI inverts `--no-hardening` to that boolean. Mirror
+            // the same logic so the CLI-side validate sees the same
+            // effective spec the daemon will.
+            hardened: !no_hardening,
+            memory_mb: 0,
+            cpus: 0,
+        },
+        sandbox_core::BackendKind::Container => sandbox_core::BackendSpecific::Container {
+            memory_mb: 0,
+            cpus: 0,
+        },
+    };
+    let spec = sandbox_core::SessionSpec {
+        backend_specific,
+        workspace_mode,
+        repo: None,
+        boot_cmd: None,
+        template: None,
+        disk_gb: None,
+    };
+
+    if let Err(unsupported) = spec.validate(&caps) {
+        eprint!(
+            "{}",
+            render_feature_mismatch(
+                &unsupported,
+                &FeatureMismatchContext {
+                    lite_flag_used: lite_flag,
+                    no_hardening_flag_used: no_hardening,
+                },
+            )
+        );
+        process::exit(2);
+    }
+
+    resolved_backend
+}
+
 #[tokio::main]
 async fn main() {
     // Check if we were invoked as git-remote-sandbox (git remote helper mode).
@@ -3160,8 +3810,8 @@ async fn main() {
         handle_inspect(&cli.socket, sessions).await;
         return;
     }
-    if let Command::Describe { sessions } = &cli.command {
-        handle_describe(&cli.socket, sessions).await;
+    if let Command::Describe { sessions, verbose } = &cli.command {
+        handle_describe(&cli.socket, sessions, *verbose).await;
         return;
     }
 
@@ -3203,17 +3853,52 @@ async fn main() {
         }
     }
 
-    // Print progress message for rebuild-image before sending the request.
-    if matches!(&cli.command, Command::RebuildImage) {
-        eprintln!("Rebuilding base image...");
+    // M11-S4 Phase 4C: rebuild-image fans out one HTTP call per
+    // selected backend (spec § "rebuild-image"). The single-call
+    // build_request / send_request flow does not fit a multi-call
+    // command, so the dispatcher owns the full request loop, error
+    // formatting (`rebuild-image[<kind>]: <msg>` per spec), and
+    // exit-code mapping ("non-zero exit if any selected backend
+    // fails").
+    if let Command::RebuildImage { backend, no_cache } = &cli.command {
+        dispatch_rebuild_image(&cli.socket, *backend, *no_cache).await;
+        return;
     }
 
-    let req = match build_request(&cli.command) {
-        Some(r) => r,
-        None => {
-            // Should not happen — ssh and logs are handled above.
-            eprintln!("Internal error: unhandled command");
-            process::exit(1);
+    // M11-S4 Phase 4A: Create has a dedicated dispatch path because
+    // the request body depends on a backend choice that is the output
+    // of an async preflight (config load → resolver → /backends fetch
+    // → SessionSpec validation). Running it here keeps `build_request`
+    // sync for every other command and confines the new logic to one
+    // explicit branch.
+    let req = if let Command::Create {
+        backend,
+        lite,
+        no_hardening,
+        no_cache,
+        workspace,
+        ..
+    } = &cli.command
+    {
+        let resolved = dispatch_create_preflight(
+            &cli.socket,
+            *backend,
+            *lite,
+            *no_hardening,
+            *no_cache,
+            workspace.as_deref(),
+            None,
+        )
+        .await;
+        build_create_request_body(&cli.command, resolved)
+    } else {
+        match build_request(&cli.command) {
+            Some(r) => r,
+            None => {
+                // Should not happen — ssh and logs are handled above.
+                eprintln!("Internal error: unhandled command");
+                process::exit(1);
+            }
         }
     };
 
@@ -3245,8 +3930,8 @@ mod tests {
         match &cli.command {
             Command::Create {
                 name: None,
-                cpus: 2,
-                memory: 4096,
+                cpus: None,
+                memory: None,
                 disk: 20,
                 template: None,
                 policy: None,
@@ -3256,6 +3941,8 @@ mod tests {
                 workspace: None,
                 no_hardening: false,
                 no_cache: false,
+                backend: None,
+                lite: false,
             } => assert!(preset.is_empty(), "default preset list should be empty"),
             _ => panic!("expected Create command with default fields"),
         }
@@ -3296,8 +3983,8 @@ mod tests {
                 ..
             } => {
                 assert_eq!(name.as_deref(), Some("full"));
-                assert_eq!(*cpus, 4);
-                assert_eq!(*memory, 8192);
+                assert_eq!(*cpus, Some(4));
+                assert_eq!(*memory, Some(8192));
                 assert_eq!(*disk, 50);
                 assert_eq!(template.as_deref(), Some("/tmp/custom.yaml"));
             }
@@ -3441,8 +4128,8 @@ mod tests {
     fn build_create_request_with_name() {
         let cmd = Command::Create {
             name: Some("test".into()),
-            cpus: 2,
-            memory: 4096,
+            cpus: Some(2),
+            memory: Some(4096),
             disk: 20,
             template: None,
             policy: None,
@@ -3452,8 +4139,10 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: false,
+            backend: None,
+            lite: false,
         };
-        let req = build_request(&cmd).expect("should produce request");
+        let req = build_create_request_body(&cmd, sandbox_core::BackendKind::Lima);
         assert_eq!(req.method(), "POST");
         assert_eq!(req.uri(), "/sessions");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -3467,8 +4156,8 @@ mod tests {
     fn build_create_request_no_name() {
         let cmd = Command::Create {
             name: None,
-            cpus: 4,
-            memory: 8192,
+            cpus: Some(4),
+            memory: Some(8192),
             disk: 50,
             template: None,
             policy: None,
@@ -3478,8 +4167,10 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: false,
+            backend: None,
+            lite: false,
         };
-        let req = build_request(&cmd).expect("should produce request");
+        let req = build_create_request_body(&cmd, sandbox_core::BackendKind::Lima);
         assert_eq!(req.method(), "POST");
         assert_eq!(req.uri(), "/sessions");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -3493,8 +4184,8 @@ mod tests {
     fn build_create_request_with_template() {
         let cmd = Command::Create {
             name: Some("custom".into()),
-            cpus: 2,
-            memory: 4096,
+            cpus: Some(2),
+            memory: Some(4096),
             disk: 20,
             template: Some("/tmp/my-template.yaml".into()),
             policy: None,
@@ -3504,8 +4195,10 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: false,
+            backend: None,
+            lite: false,
         };
-        let req = build_request(&cmd).expect("should produce request");
+        let req = build_create_request_body(&cmd, sandbox_core::BackendKind::Lima);
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
         assert_eq!(body["template"], "/tmp/my-template.yaml");
     }
@@ -3866,8 +4559,8 @@ mod tests {
     fn build_create_request_with_repo() {
         let cmd = Command::Create {
             name: Some("with-repo".into()),
-            cpus: 2,
-            memory: 4096,
+            cpus: Some(2),
+            memory: Some(4096),
             disk: 20,
             template: None,
             policy: None,
@@ -3877,8 +4570,10 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: false,
+            backend: None,
+            lite: false,
         };
-        let req = build_request(&cmd).expect("should produce request");
+        let req = build_create_request_body(&cmd, sandbox_core::BackendKind::Lima);
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
         assert_eq!(body["repo"], "https://github.com/octocat/Hello-World.git");
         assert!(body.get("boot_cmd").is_none());
@@ -3888,8 +4583,8 @@ mod tests {
     fn build_create_request_with_boot_cmd() {
         let cmd = Command::Create {
             name: Some("with-boot".into()),
-            cpus: 2,
-            memory: 4096,
+            cpus: Some(2),
+            memory: Some(4096),
             disk: 20,
             template: None,
             policy: None,
@@ -3899,8 +4594,10 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: false,
+            backend: None,
+            lite: false,
         };
-        let req = build_request(&cmd).expect("should produce request");
+        let req = build_create_request_body(&cmd, sandbox_core::BackendKind::Lima);
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
         assert!(body.get("repo").is_none());
         assert_eq!(body["boot_cmd"], "npm install");
@@ -3938,8 +4635,8 @@ mod tests {
     fn build_create_request_with_no_hardening() {
         let cmd = Command::Create {
             name: Some("debug".into()),
-            cpus: 2,
-            memory: 4096,
+            cpus: Some(2),
+            memory: Some(4096),
             disk: 20,
             template: None,
             policy: None,
@@ -3949,8 +4646,10 @@ mod tests {
             workspace: None,
             no_hardening: true,
             no_cache: false,
+            backend: None,
+            lite: false,
         };
-        let req = build_request(&cmd).expect("should produce request");
+        let req = build_create_request_body(&cmd, sandbox_core::BackendKind::Lima);
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
         assert_eq!(
             body["hardened"], false,
@@ -3962,8 +4661,8 @@ mod tests {
     fn build_create_request_default_omits_hardened() {
         let cmd = Command::Create {
             name: Some("normal".into()),
-            cpus: 2,
-            memory: 4096,
+            cpus: Some(2),
+            memory: Some(4096),
             disk: 20,
             template: None,
             policy: None,
@@ -3973,8 +4672,10 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: false,
+            backend: None,
+            lite: false,
         };
-        let req = build_request(&cmd).expect("should produce request");
+        let req = build_create_request_body(&cmd, sandbox_core::BackendKind::Lima);
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
         assert!(
             body.get("hardened").is_none(),
@@ -4110,8 +4811,8 @@ mod tests {
     fn build_create_request_with_no_cache() {
         let cmd = Command::Create {
             name: Some("cached".into()),
-            cpus: 2,
-            memory: 4096,
+            cpus: Some(2),
+            memory: Some(4096),
             disk: 20,
             template: None,
             policy: None,
@@ -4121,8 +4822,10 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: true,
+            backend: None,
+            lite: false,
         };
-        let req = build_request(&cmd).expect("should produce request");
+        let req = build_create_request_body(&cmd, sandbox_core::BackendKind::Lima);
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
         assert_eq!(
             body["no_cache"], true,
@@ -4134,8 +4837,8 @@ mod tests {
     fn build_create_request_default_omits_no_cache() {
         let cmd = Command::Create {
             name: Some("normal".into()),
-            cpus: 2,
-            memory: 4096,
+            cpus: Some(2),
+            memory: Some(4096),
             disk: 20,
             template: None,
             policy: None,
@@ -4145,8 +4848,10 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: false,
+            backend: None,
+            lite: false,
         };
-        let req = build_request(&cmd).expect("should produce request");
+        let req = build_create_request_body(&cmd, sandbox_core::BackendKind::Lima);
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
         assert!(
             body.get("no_cache").is_none(),
@@ -4174,19 +4879,191 @@ mod tests {
 
     // -- Rebuild-image tests --------------------------------------------------
 
+    /// Default invocation: `--backend` defaults to `all`, `--no-cache`
+    /// defaults to `false` (spec § "rebuild-image": defaults).
     #[test]
-    fn parse_rebuild_image() {
+    fn parse_rebuild_image_defaults_to_all_no_cache_false() {
         let cli = Cli::parse_from(["sandbox", "rebuild-image"]);
-        assert!(matches!(cli.command, Command::RebuildImage));
+        match cli.command {
+            Command::RebuildImage { backend, no_cache } => {
+                assert_eq!(backend, RebuildImageBackend::All);
+                assert!(!no_cache);
+            }
+            other => panic!("expected RebuildImage, got: {other:?}"),
+        }
+    }
+
+    /// `--backend container --no-cache` is the spec's example shape;
+    /// pin both fields make it through the parser.
+    #[test]
+    fn parse_rebuild_image_backend_container_no_cache() {
+        let cli = Cli::parse_from([
+            "sandbox",
+            "rebuild-image",
+            "--backend",
+            "container",
+            "--no-cache",
+        ]);
+        match cli.command {
+            Command::RebuildImage { backend, no_cache } => {
+                assert_eq!(backend, RebuildImageBackend::Container);
+                assert!(no_cache);
+            }
+            other => panic!("expected RebuildImage, got: {other:?}"),
+        }
     }
 
     #[test]
-    fn build_rebuild_image_request() {
-        let cmd = Command::RebuildImage;
-        let req = build_request(&cmd).expect("should produce request");
-        assert_eq!(req.method(), "POST");
-        assert_eq!(req.uri(), "/rebuild-image");
-        assert!(req.body().is_empty());
+    fn parse_rebuild_image_backend_lima() {
+        let cli = Cli::parse_from(["sandbox", "rebuild-image", "--backend", "lima"]);
+        match cli.command {
+            Command::RebuildImage { backend, no_cache } => {
+                assert_eq!(backend, RebuildImageBackend::Lima);
+                assert!(!no_cache);
+            }
+            other => panic!("expected RebuildImage, got: {other:?}"),
+        }
+    }
+
+    /// `build_request` must short-circuit `RebuildImage` (its multi-call
+    /// shape cannot fit the single-request flow); the dispatch happens
+    /// in `dispatch_rebuild_image` instead.
+    #[test]
+    fn build_request_rebuild_image_returns_none() {
+        let cmd = Command::RebuildImage {
+            backend: RebuildImageBackend::All,
+            no_cache: false,
+        };
+        assert!(
+            build_request(&cmd).is_none(),
+            "rebuild-image is dispatched separately"
+        );
+    }
+
+    // -- Rebuild-image dispatch tests ----------------------------------------
+
+    /// Helper that builds a fake `send` closure recording every (kind,
+    /// body) pair it sees, returning success or a per-backend error
+    /// string. The closure intentionally returns owned `String`s so it
+    /// can be passed by `FnMut` into [`run_rebuild_image_dispatch`].
+    fn make_recording_sender(
+        responses: std::collections::HashMap<
+            sandbox_core::backend::BackendKind,
+            Result<String, String>,
+        >,
+        recorder: std::sync::Arc<
+            std::sync::Mutex<Vec<(sandbox_core::backend::BackendKind, String)>>,
+        >,
+    ) -> impl FnMut(
+        sandbox_core::backend::BackendKind,
+        String,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<String, String>> + Send>,
+    > {
+        move |kind, body| {
+            recorder.lock().unwrap().push((kind, body.clone()));
+            let outcome = responses
+                .get(&kind)
+                .cloned()
+                .unwrap_or_else(|| Ok("ok".into()));
+            Box::pin(async move { outcome })
+        }
+    }
+
+    /// Spec § "rebuild-image": `--backend all` issues two HTTP
+    /// requests in Lima-then-Container order, each with the per-
+    /// backend JSON body.
+    #[tokio::test]
+    async fn dispatch_rebuild_image_all_fans_out_lima_then_container() {
+        let recorder = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let send = make_recording_sender(std::collections::HashMap::new(), recorder.clone());
+        let outcome = run_rebuild_image_dispatch(RebuildImageBackend::All, false, send).await;
+        assert!(outcome.all_ok, "every fake response was Ok");
+        let calls = recorder.lock().unwrap().clone();
+        assert_eq!(calls.len(), 2, "all → two HTTP calls");
+        assert_eq!(calls[0].0, sandbox_core::backend::BackendKind::Lima);
+        assert_eq!(calls[1].0, sandbox_core::backend::BackendKind::Container);
+        // Spec § "rebuild-image": JSON wire body carries the resolved
+        // backend kind plus no_cache.
+        let lima_body: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
+        assert_eq!(lima_body["backend"], serde_json::json!("lima"));
+        assert_eq!(lima_body["no_cache"], serde_json::json!(false));
+        let container_body: serde_json::Value = serde_json::from_str(&calls[1].1).unwrap();
+        assert_eq!(container_body["backend"], serde_json::json!("container"));
+        assert_eq!(container_body["no_cache"], serde_json::json!(false));
+    }
+
+    /// Per-backend errors must be prefixed with `rebuild-image[<kind>]:`
+    /// (spec § "rebuild-image"); a single failing backend forces
+    /// `all_ok = false`, but remaining backends still run (best-effort
+    /// dispatch — operator sees every error in one invocation).
+    #[tokio::test]
+    async fn dispatch_rebuild_image_prefixes_per_backend_errors() {
+        let recorder = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut responses = std::collections::HashMap::new();
+        responses.insert(
+            sandbox_core::backend::BackendKind::Lima,
+            Err("limactl gone fishing".to_string()),
+        );
+        // Container left unset → defaults to Ok.
+        let send = make_recording_sender(responses, recorder.clone());
+        let outcome = run_rebuild_image_dispatch(RebuildImageBackend::All, true, send).await;
+        assert!(!outcome.all_ok, "any failure flips all_ok to false");
+        // Both backends were still attempted (best-effort dispatch).
+        assert_eq!(recorder.lock().unwrap().len(), 2);
+        // Lima line carries the spec's prefix shape and the daemon's
+        // raw error message.
+        assert!(
+            outcome
+                .lines
+                .iter()
+                .any(|l| l == "rebuild-image[lima]: limactl gone fishing"),
+            "expected lima failure line; got: {:?}",
+            outcome.lines
+        );
+        // Container line is the success shape ("done") because the
+        // fake responder returned Ok for it.
+        assert!(
+            outcome
+                .lines
+                .iter()
+                .any(|l| l == "rebuild-image[container]: done"),
+            "expected container success line; got: {:?}",
+            outcome.lines
+        );
+    }
+
+    /// `--no-cache` flag flows into the JSON body verbatim; pinned so a
+    /// future refactor of the body shape cannot silently drop the field.
+    #[tokio::test]
+    async fn dispatch_rebuild_image_threads_no_cache_into_body() {
+        let recorder = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let send = make_recording_sender(std::collections::HashMap::new(), recorder.clone());
+        let outcome = run_rebuild_image_dispatch(RebuildImageBackend::Container, true, send).await;
+        assert!(outcome.all_ok);
+        let calls = recorder.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        let body: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
+        assert_eq!(body["backend"], serde_json::json!("container"));
+        assert_eq!(body["no_cache"], serde_json::json!(true));
+    }
+
+    /// All-success path leaves `all_ok = true` and emits per-backend
+    /// "done" lines — pinned so a future refactor that swallows the
+    /// success line stays visible.
+    #[tokio::test]
+    async fn dispatch_rebuild_image_all_success_yields_done_lines() {
+        let recorder = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let send = make_recording_sender(std::collections::HashMap::new(), recorder.clone());
+        let outcome = run_rebuild_image_dispatch(RebuildImageBackend::All, false, send).await;
+        assert!(outcome.all_ok);
+        assert_eq!(
+            outcome.lines,
+            vec![
+                "rebuild-image[lima]: done".to_string(),
+                "rebuild-image[container]: done".to_string(),
+            ]
+        );
     }
 
     // -- Inspect / describe tests --------------------------------------------
@@ -4211,6 +5088,8 @@ mod tests {
                 cpus: 2,
                 memory_mb: 4096,
                 disk_gb: 20,
+                resolved_cpus: 2.0,
+                resolved_memory_mb: 4096,
                 workspace_mode: Some("shared:/home/olek/project".into()),
                 hardened: true,
                 repo: Some("https://github.com/example/app.git".into()),
@@ -4220,6 +5099,8 @@ mod tests {
             guest_agent_status: Some("connected".into()),
             gateway_status: Some("running".into()),
             policy,
+            warnings: Vec::new(),
+            backend: sandbox_core::backend::BackendKind::Lima,
         }
     }
 
@@ -4238,8 +5119,33 @@ mod tests {
     fn parse_describe_one_session() {
         let cli = Cli::parse_from(["sandbox", "describe", "alpha"]);
         match &cli.command {
-            Command::Describe { sessions } => {
+            Command::Describe { sessions, verbose } => {
                 assert_eq!(sessions, &vec!["alpha".to_string()]);
+                assert!(!verbose, "default describe is non-verbose");
+            }
+            _ => panic!("expected Describe command"),
+        }
+    }
+
+    #[test]
+    fn parse_describe_verbose_short_flag() {
+        let cli = Cli::parse_from(["sandbox", "describe", "-v", "alpha"]);
+        match &cli.command {
+            Command::Describe { sessions, verbose } => {
+                assert_eq!(sessions, &vec!["alpha".to_string()]);
+                assert!(*verbose, "-v should set verbose=true");
+            }
+            _ => panic!("expected Describe command"),
+        }
+    }
+
+    #[test]
+    fn parse_describe_verbose_long_flag() {
+        let cli = Cli::parse_from(["sandbox", "describe", "--verbose", "alpha"]);
+        match &cli.command {
+            Command::Describe { sessions, verbose } => {
+                assert_eq!(sessions, &vec!["alpha".to_string()]);
+                assert!(*verbose, "--verbose should set verbose=true");
             }
             _ => panic!("expected Describe command"),
         }
@@ -4258,6 +5164,7 @@ mod tests {
     fn describe_build_request_returns_none() {
         let cmd = Command::Describe {
             sessions: vec!["alpha".into()],
+            verbose: false,
         };
         assert!(build_request(&cmd).is_none());
     }
@@ -4270,7 +5177,7 @@ mod tests {
             None,
             chrono::Utc::now() - chrono::Duration::minutes(5),
         );
-        let rendered = render_describe(std::slice::from_ref(&dto));
+        let rendered = render_describe(std::slice::from_ref(&dto), None);
         assert!(
             rendered.contains("Policy: none"),
             "expected 'Policy: none' line, got:\n{rendered}"
@@ -4321,7 +5228,7 @@ mod tests {
             Some(policy),
             chrono::Utc::now() - chrono::Duration::minutes(5),
         );
-        let rendered = render_describe(std::slice::from_ref(&dto));
+        let rendered = render_describe(std::slice::from_ref(&dto), None);
 
         // Header.
         assert!(
@@ -4411,7 +5318,7 @@ mod tests {
             Some(policy),
             chrono::Utc::now() - chrono::Duration::minutes(5),
         );
-        let rendered = render_describe(std::slice::from_ref(&dto));
+        let rendered = render_describe(std::slice::from_ref(&dto), None);
         eprintln!("--- describe preview ---\n{rendered}--- end preview ---");
     }
 
@@ -4444,7 +5351,7 @@ mod tests {
             Some(policy),
             chrono::Utc::now(),
         );
-        let rendered = render_describe(std::slice::from_ref(&dto));
+        let rendered = render_describe(std::slice::from_ref(&dto), None);
         let filter_lines: Vec<&str> = rendered
             .lines()
             .filter(|line| line.contains("http_filters:"))
@@ -4464,7 +5371,7 @@ mod tests {
         let a = make_session_dto("111111111111", Some("a"), None, now);
         let b = make_session_dto("222222222222", Some("b"), None, now);
         let c = make_session_dto("333333333333", Some("c"), None, now);
-        let rendered = render_describe(&[a, b, c]);
+        let rendered = render_describe(&[a, b, c], None);
 
         // Find each "Session:      " line and ensure exactly one blank
         // line precedes each subsequent session block.
@@ -4509,6 +5416,203 @@ mod tests {
             }
             prev_blank = blank;
         }
+    }
+
+    // -- BACKEND column / describe backend prominence / capabilities ---------
+
+    /// `display_sessions_table` rendered into a buffer must include the
+    /// `BACKEND` column header between `STATE` and `AGENT`. M11-S4
+    /// Phase 4B contract pin.
+    #[test]
+    fn write_sessions_table_header_includes_backend_between_state_and_agent() {
+        let dto = make_session_dto("0123456789ab", Some("alpha"), None, chrono::Utc::now());
+        let mut buf = Vec::new();
+        write_sessions_table(&mut buf, std::slice::from_ref(&dto));
+        let rendered = String::from_utf8(buf).expect("table is UTF-8");
+        let header = rendered.lines().next().expect("header line");
+        let state_idx = header.find("STATE").expect("STATE in header");
+        let backend_idx = header.find("BACKEND").expect("BACKEND in header");
+        let agent_idx = header.find("AGENT").expect("AGENT in header");
+        assert!(
+            state_idx < backend_idx && backend_idx < agent_idx,
+            "expected STATE < BACKEND < AGENT in header, got: {header:?}"
+        );
+    }
+
+    /// Each row of the rendered table must show the lowercase backend
+    /// identifier (`lima` / `container`) for the corresponding session.
+    #[test]
+    fn write_sessions_table_rows_show_backend_per_session() {
+        let mut lima = make_session_dto("0123456789ab", Some("lima-box"), None, chrono::Utc::now());
+        lima.backend = sandbox_core::backend::BackendKind::Lima;
+        let mut container =
+            make_session_dto("ba9876543210", Some("ctr-box"), None, chrono::Utc::now());
+        container.backend = sandbox_core::backend::BackendKind::Container;
+
+        let mut buf = Vec::new();
+        write_sessions_table(&mut buf, &[lima, container]);
+        let rendered = String::from_utf8(buf).expect("table is UTF-8");
+        let lines: Vec<&str> = rendered.lines().collect();
+        // [0] = header, [1] = lima row, [2] = container row.
+        assert!(
+            lines[1].contains("lima"),
+            "lima row must include the `lima` backend tag, got:\n{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("container"),
+            "container row must include the `container` backend tag, got:\n{}",
+            lines[2]
+        );
+        // Defence against accidental confusion between the two rows.
+        assert!(
+            !lines[1].contains("container"),
+            "lima row must not show `container`, got:\n{}",
+            lines[1]
+        );
+    }
+
+    /// Empty session list still emits a friendly placeholder via the
+    /// writer interface.
+    #[test]
+    fn write_sessions_table_empty_emits_placeholder() {
+        let mut buf = Vec::new();
+        write_sessions_table(&mut buf, &[]);
+        let rendered = String::from_utf8(buf).expect("UTF-8");
+        assert_eq!(rendered, "No sessions found.\n");
+    }
+
+    /// Default-view `describe` (no `-v`) must show `Backend:` adjacent
+    /// to `State:` per spec § "sandbox inspect → Default view".
+    #[test]
+    fn describe_default_view_shows_backend_in_session_block() {
+        let mut dto = make_session_dto("abcdef012345", Some("lite-box"), None, chrono::Utc::now());
+        dto.backend = sandbox_core::backend::BackendKind::Container;
+        let rendered = render_describe(std::slice::from_ref(&dto), None);
+        assert!(
+            rendered.contains("Backend:      container"),
+            "expected `Backend:` line with container tag, got:\n{rendered}"
+        );
+        // Backend must precede Created in the header block.
+        let backend_pos = rendered.find("Backend:").expect("Backend line present");
+        let created_pos = rendered.find("Created:").expect("Created line present");
+        assert!(
+            backend_pos < created_pos,
+            "Backend must appear before Created in the header block, got:\n{rendered}"
+        );
+    }
+
+    /// Without `-v`, no `Capabilities` block is rendered — the matrix
+    /// is opt-in.
+    #[test]
+    fn describe_default_view_omits_capabilities_block() {
+        let dto = make_session_dto("abcdef012345", Some("plain"), None, chrono::Utc::now());
+        let rendered = render_describe(std::slice::from_ref(&dto), None);
+        assert!(
+            !rendered.contains("Capabilities:"),
+            "default view must not render a Capabilities block, got:\n{rendered}"
+        );
+    }
+
+    /// Verbose render with a Lima cap matrix pins the most distinctive
+    /// fields (isolation, hardening_flag, workspace_modes) so a future
+    /// re-shape of `Capabilities` surfaces here.
+    #[test]
+    fn describe_verbose_renders_lima_capabilities_block() {
+        let mut dto = make_session_dto("aaaabbbbcccc", Some("lima"), None, chrono::Utc::now());
+        dto.backend = sandbox_core::backend::BackendKind::Lima;
+        let mut caps = std::collections::HashMap::new();
+        caps.insert(
+            sandbox_core::backend::BackendKind::Lima,
+            CapabilitiesLookup::Available(sandbox_core::Capabilities::for_lima()),
+        );
+        let rendered = render_describe(std::slice::from_ref(&dto), Some(&caps));
+        assert!(
+            rendered.contains("Capabilities:"),
+            "expected Capabilities block, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("isolation:            vm"),
+            "Lima isolation should serialize to `vm`, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("hardening_flag:       true"),
+            "Lima honours hardening, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("workspace_modes:      shared, clone"),
+            "Lima advertises both workspace modes, got:\n{rendered}"
+        );
+    }
+
+    /// Verbose render with a Container cap matrix — distinct field
+    /// values from Lima (no hardening, empty workspace modes).
+    #[test]
+    fn describe_verbose_renders_container_capabilities_block() {
+        let mut dto = make_session_dto("ddddeeeeffff", Some("ctr"), None, chrono::Utc::now());
+        dto.backend = sandbox_core::backend::BackendKind::Container;
+        // Build a Container capabilities value via JSON round-trip
+        // because `Capabilities` is `#[non_exhaustive]` and external
+        // callers cannot brace-construct it. The wire shape mirrors
+        // `capabilities_for_container` in sandbox-core.
+        let caps_value: sandbox_core::Capabilities = serde_json::from_str(
+            r#"{
+                "kind": "container",
+                "isolation": "container",
+                "nested_virt": false,
+                "privileged_ops": false,
+                "raw_network": false,
+                "hardening_flag": false,
+                "per_session_no_cache": false,
+                "workspace_modes": []
+            }"#,
+        )
+        .expect("decode container caps");
+        let mut caps = std::collections::HashMap::new();
+        caps.insert(
+            sandbox_core::backend::BackendKind::Container,
+            CapabilitiesLookup::Available(caps_value),
+        );
+        let rendered = render_describe(std::slice::from_ref(&dto), Some(&caps));
+        assert!(
+            rendered.contains("isolation:            container"),
+            "Container isolation should serialize to `container`, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("hardening_flag:       false"),
+            "Container does not honour hardening, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("workspace_modes:      -"),
+            "empty workspace_modes set should render as `-`, got:\n{rendered}"
+        );
+    }
+
+    /// A cache failure surfaces as `<capability matrix unavailable: ...>`
+    /// — describe still completes, the rest of the output is intact.
+    #[test]
+    fn describe_verbose_unavailable_caps_renders_inline_marker() {
+        let dto = make_session_dto("eeee11112222", Some("oops"), None, chrono::Utc::now());
+        let mut caps = std::collections::HashMap::new();
+        caps.insert(
+            sandbox_core::backend::BackendKind::Lima,
+            CapabilitiesLookup::Unavailable("connect refused".into()),
+        );
+        let rendered = render_describe(std::slice::from_ref(&dto), Some(&caps));
+        assert!(
+            rendered.contains("Capabilities:"),
+            "block header still rendered, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("<capability matrix unavailable: connect refused>"),
+            "inline error marker missing, got:\n{rendered}"
+        );
+        // The session's own data must still be rendered above the
+        // failed-caps marker — describe degrades gracefully.
+        assert!(
+            rendered.contains("Session:      eeee11112222"),
+            "session data must still render despite caps failure, got:\n{rendered}"
+        );
     }
 
     // -- Inspect / describe end-to-end over a local Unix socket ----------------
@@ -4612,6 +5716,19 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&pretty).expect("valid json");
         let arr = parsed.as_array().expect("top-level array");
         assert_eq!(arr.len(), 2);
+        // M11-S4 Phase 4B: the JSON `inspect` automation contract picks
+        // up `backend` "for free" via SessionDto's additive field. Pin
+        // the wire key here so an accidental rename or removal in
+        // `SessionDto` lights up the inspect contract test, not just
+        // the deeper serde unit tests.
+        assert_eq!(
+            arr[0]
+                .get("backend")
+                .and_then(|v| v.as_str())
+                .expect("backend field present on inspect JSON"),
+            "lima",
+            "default backend in test fixture is Lima; JSON must reflect it"
+        );
     }
 
     #[tokio::test]
@@ -5215,5 +6332,144 @@ mod tests {
     #[test]
     fn short_hash_passes_through_short_input() {
         assert_eq!(short_hash("abc"), "abc");
+    }
+
+    // -----------------------------------------------------------------------
+    // plan_ssh_command — M11-S4 Phase 4D-pre gap #2 dispatch logic.
+    //
+    // Pure helper: returns `(program, args)` based on the session's
+    // backend kind. The handler then forwards them to
+    // `std::process::Command`, but the dispatch shape itself is what
+    // these tests pin so a future refactor cannot regress the
+    // Lima-only behaviour or wire the wrong `docker exec` flags.
+    // -----------------------------------------------------------------------
+
+    fn ssh_session_id() -> sandbox_core::SessionId {
+        sandbox_core::SessionId::parse("0123456789ab").expect("test fixture session id must parse")
+    }
+
+    #[test]
+    fn plan_ssh_lima_no_command_starts_interactive_shell() {
+        let sid = ssh_session_id();
+        let (program, args) =
+            plan_ssh_command(sandbox_core::backend::BackendKind::Lima, &sid, &[], true);
+        assert_eq!(program, "limactl");
+        assert_eq!(
+            args,
+            vec!["shell".to_string(), "sandbox-0123456789ab".to_string()]
+        );
+    }
+
+    #[test]
+    fn plan_ssh_lima_with_command_uses_double_dash_separator() {
+        let sid = ssh_session_id();
+        let cmd = vec!["echo".to_string(), "hello".to_string()];
+        let (program, args) =
+            plan_ssh_command(sandbox_core::backend::BackendKind::Lima, &sid, &cmd, true);
+        assert_eq!(program, "limactl");
+        assert_eq!(
+            args,
+            vec![
+                "shell".to_string(),
+                "sandbox-0123456789ab".to_string(),
+                "--".to_string(),
+                "echo".to_string(),
+                "hello".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_ssh_container_no_command_with_tty_uses_docker_exec_it() {
+        let sid = ssh_session_id();
+        let (program, args) = plan_ssh_command(
+            sandbox_core::backend::BackendKind::Container,
+            &sid,
+            &[],
+            true,
+        );
+        assert_eq!(program, "docker");
+        assert_eq!(
+            args,
+            vec![
+                "exec".to_string(),
+                "-it".to_string(),
+                "sandbox-0123456789ab".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_ssh_container_with_command_and_tty_appends_command_after_target() {
+        let sid = ssh_session_id();
+        let cmd = vec!["echo".to_string(), "hello".to_string()];
+        let (program, args) = plan_ssh_command(
+            sandbox_core::backend::BackendKind::Container,
+            &sid,
+            &cmd,
+            true,
+        );
+        assert_eq!(program, "docker");
+        // Spec § "Lifecycle" — `docker exec -it <ctr> <cmd>...`. No
+        // `--` separator: docker exec parses positional args after the
+        // container name as the command.
+        assert_eq!(
+            args,
+            vec![
+                "exec".to_string(),
+                "-it".to_string(),
+                "sandbox-0123456789ab".to_string(),
+                "echo".to_string(),
+                "hello".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_ssh_container_no_command_without_tty_drops_t_flag() {
+        // When the caller's stdin is not a TTY (pytest, CI, any
+        // pipe-fed parent), `docker exec -t` aborts at startup with
+        // "cannot attach stdin to a TTY-enabled container because
+        // stdin is not a terminal". Pin that we drop `-t` and keep
+        // `-i` so stdin is still forwarded.
+        let sid = ssh_session_id();
+        let (program, args) = plan_ssh_command(
+            sandbox_core::backend::BackendKind::Container,
+            &sid,
+            &[],
+            false,
+        );
+        assert_eq!(program, "docker");
+        assert_eq!(
+            args,
+            vec![
+                "exec".to_string(),
+                "-i".to_string(),
+                "sandbox-0123456789ab".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_ssh_container_with_command_without_tty_drops_t_flag() {
+        let sid = ssh_session_id();
+        let cmd = vec!["echo".to_string(), "hello".to_string()];
+        let (program, args) = plan_ssh_command(
+            sandbox_core::backend::BackendKind::Container,
+            &sid,
+            &cmd,
+            false,
+        );
+        assert_eq!(program, "docker");
+        assert_eq!(
+            args,
+            vec![
+                "exec".to_string(),
+                "-i".to_string(),
+                "sandbox-0123456789ab".to_string(),
+                "echo".to_string(),
+                "hello".to_string(),
+            ]
+        );
     }
 }

@@ -2,6 +2,9 @@
 //!
 //! Items that escape the binary:
 //!
+//! * [`backends_http`] — `GET /backends` (M11-S3 Phase 3C). Read-only
+//!   endpoint the CLI hits once per invocation to learn the daemon's
+//!   registered backends and their capability matrices.
 //! * [`events_http`] — `GET /sessions/{id}/events` (M10-S4 Phase 2/3).
 //! * [`policy_http`] — `GET /sessions/{id}/policy/propagation-status`
 //!   (M10-S6 todo #37). The read-only status endpoint that the
@@ -26,6 +29,7 @@
 //! No other main-binary internals are re-exported here — keep this
 //! surface as narrow as possible.
 
+pub mod backends_http;
 pub mod error;
 pub mod events_http;
 pub mod policy_http;

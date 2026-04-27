@@ -259,13 +259,16 @@ entirely (image already present).
 ### Dockerfile shape
 
 ```dockerfile
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       bash coreutils git socat ca-certificates iproute2 curl tini \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd --uid 1000 --user-group --create-home --shell /bin/bash agent
+# Ubuntu 24.04 ships a default `ubuntu` user at uid 1000; remove it so the
+# agent user can take that uid as the spec requires.
+RUN userdel --remove ubuntu 2>/dev/null || true \
+    && useradd --uid 1000 --user-group --create-home --shell /bin/bash agent
 
 COPY sandbox-guest /usr/local/bin/sandbox-guest
 RUN chmod +x /usr/local/bin/sandbox-guest
@@ -274,8 +277,9 @@ USER 1000:1000
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/sandbox-guest"]
 ```
 
-- **Base:** Ubuntu 22.04, same userland as the Lima VM image. Package
-  installs and shell-script invariants match between backends.
+- **Base:** Ubuntu 24.04 (noble), same userland as the Lima VM image
+  (also noble). Package installs and shell-script invariants match
+  between backends.
 - **`tini`** as PID 1 reaps zombies and forwards signals correctly to
   the agent.
 - **Non-root `agent` user** at uid 1000 / gid 1000.

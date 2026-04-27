@@ -13,3 +13,27 @@ default-filter = 'not test(/^integration_/)'
 # the `integration_*` name prefix so the set is self-describing at call
 # sites — no `#[ignore]`, no env gate.
 default-filter = 'test(/^integration_/)'
+
+[[profile.integration.overrides]]
+# Lima integration tests share the per-user `~/.lima/` state directory
+# (limactl does not honour an alternate base path). Running them in
+# parallel can race on golden-image / VM-creation locks. Serialise via
+# the `lima` test group below.
+filter = 'test(/^integration_lima/)'
+test-group = 'lima'
+
+[[profile.integration.overrides]]
+# The orphan reaper (M11-S5 Phase 5B) sweeps every `sandbox-{12hex}`
+# container/volume/network on the host whose session id isn't in the
+# live set passed in. If it runs in parallel with the container
+# runtime tests (which create `sandbox-{12hex}` containers with their
+# own random session ids) the reaper will happily delete those
+# containers out from under the lifecycle assertions. Serialise
+# anything that touches the lite-mode `sandbox-{id}` Docker namespace
+# via the shared `docker-sandbox-namespace` test group below.
+filter = 'test(/^integration_orphan_reaper/) | test(/^integration_container_runtime/)'
+test-group = 'docker-sandbox-namespace'
+
+[test-groups]
+lima = { max-threads = 1 }
+docker-sandbox-namespace = { max-threads = 1 }

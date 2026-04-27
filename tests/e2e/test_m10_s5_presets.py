@@ -37,6 +37,14 @@ seconds.
     cd tests/e2e
     source .venv/bin/activate
     python -m pytest test_m10_s5_presets.py -v --timeout=600
+
+Backend coverage: **agnostic** — parametrized over ``[lima, container]``
+via the ``backend`` fixture. Preset expansion is host-side; policy
+enforcement runs through the gateway container, which is shared
+between both backends per the M11 gap-#70 closure. The
+``test_preset_expand_round_trip`` test does still boot a session to
+verify the daemon accepts the expanded policy, so it is also
+parametrized.
 """
 
 from __future__ import annotations
@@ -49,9 +57,9 @@ from pathlib import Path
 import pytest
 
 from conftest import (
-    _VM_RESOURCE_ARGS,
     capture_lima_logs,
     gateway_container_name,
+    make_create_args,
     parse_session_id,
     wait_for_state,
 )
@@ -197,7 +205,7 @@ def _wait_policy_propagated(
 
 
 @pytest.mark.timeout(600)
-def test_npm_preset_allows_npm_install(sandbox_cli):
+def test_npm_preset_allows_npm_install(sandbox_cli, backend):
     """``sandbox create --preset 'npm:'`` allows an npm metadata + tarball
     fetch from ``registry.npmjs.org``, and the allow events surface via
     ``sandbox events --decision=allow``.
@@ -220,9 +228,8 @@ def test_npm_preset_allows_npm_install(sandbox_cli):
     session_id: str | None = None
     try:
         create_result = sandbox_cli(
-            "create", "--name", session_name,
-            *_VM_RESOURCE_ARGS,
-            "--preset", "npm:",
+            "create",
+            *make_create_args(backend, session_name, "--preset", "npm:"),
             timeout=600,
         )
         assert create_result.returncode == 0, (
@@ -322,7 +329,7 @@ def test_npm_preset_allows_npm_install(sandbox_cli):
 
 
 @pytest.mark.timeout(600)
-def test_npm_preset_denies_non_preset_host(sandbox_cli):
+def test_npm_preset_denies_non_preset_host(sandbox_cli, backend):
     """A session started with the ``npm:`` preset denies traffic to
     hosts outside ``registry.npmjs.org``.
 
@@ -338,9 +345,8 @@ def test_npm_preset_denies_non_preset_host(sandbox_cli):
     session_id: str | None = None
     try:
         create_result = sandbox_cli(
-            "create", "--name", session_name,
-            *_VM_RESOURCE_ARGS,
-            "--preset", "npm:",
+            "create",
+            *make_create_args(backend, session_name, "--preset", "npm:"),
             timeout=600,
         )
         assert create_result.returncode == 0, (
@@ -426,7 +432,7 @@ def test_npm_preset_denies_non_preset_host(sandbox_cli):
 
 
 @pytest.mark.timeout(600)
-def test_cargo_preset_allows_cargo_fetch(sandbox_cli):
+def test_cargo_preset_allows_cargo_fetch(sandbox_cli, backend):
     """``sandbox create --preset 'cargo:'`` allows the HTTP requests that
     ``cargo fetch`` issues against the three crates.io hosts.
 
@@ -449,9 +455,8 @@ def test_cargo_preset_allows_cargo_fetch(sandbox_cli):
     session_id: str | None = None
     try:
         create_result = sandbox_cli(
-            "create", "--name", session_name,
-            *_VM_RESOURCE_ARGS,
-            "--preset", "cargo:",
+            "create",
+            *make_create_args(backend, session_name, "--preset", "cargo:"),
             timeout=600,
         )
         assert create_result.returncode == 0, (
@@ -535,7 +540,7 @@ def test_cargo_preset_allows_cargo_fetch(sandbox_cli):
 
 
 @pytest.mark.timeout(600)
-def test_github_repo_preset_scopes_to_one_repo(sandbox_cli):
+def test_github_repo_preset_scopes_to_one_repo(sandbox_cli, backend):
     """``--preset 'github-repo:repo=<owner>/<name>'`` allows HTTPS-git
     clone of ``<owner>/<name>`` but denies any other repository.
 
@@ -555,9 +560,11 @@ def test_github_repo_preset_scopes_to_one_repo(sandbox_cli):
     session_id: str | None = None
     try:
         create_result = sandbox_cli(
-            "create", "--name", session_name,
-            *_VM_RESOURCE_ARGS,
-            "--preset", "github-repo:repo=rust-lang/rustlings",
+            "create",
+            *make_create_args(
+                backend, session_name,
+                "--preset", "github-repo:repo=rust-lang/rustlings",
+            ),
             timeout=600,
         )
         assert create_result.returncode == 0, (
@@ -668,7 +675,7 @@ def test_github_repo_preset_scopes_to_one_repo(sandbox_cli):
 
 
 @pytest.mark.timeout(600)
-def test_preset_expand_round_trip(sandbox_cli, tmp_path):
+def test_preset_expand_round_trip(sandbox_cli, tmp_path, backend):
     """``sandbox policy preset expand`` produces a policy document that
     the daemon accepts verbatim when passed as ``--policy``.
 
@@ -713,9 +720,8 @@ def test_preset_expand_round_trip(sandbox_cli, tmp_path):
 
         # 3. Pass the tempfile as --policy to `sandbox create` (no --preset).
         create_result = sandbox_cli(
-            "create", "--name", session_name,
-            *_VM_RESOURCE_ARGS,
-            "--policy", str(expanded_path),
+            "create",
+            *make_create_args(backend, session_name, "--policy", str(expanded_path)),
             timeout=600,
         )
         assert create_result.returncode == 0, (

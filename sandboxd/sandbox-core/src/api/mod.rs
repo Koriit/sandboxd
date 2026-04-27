@@ -138,6 +138,18 @@ pub struct CreateSessionRequest {
     /// local"). This field is a pure passthrough for attribution.
     #[serde(default)]
     pub source_presets: Vec<String>,
+    /// Which backend should host the session.
+    ///
+    /// Optional on the wire (M11-S3 Phase 3D): older CLIs that omit
+    /// the field decode to `None`, which the daemon treats as the
+    /// historical default of `BackendKind::Lima`. Setting this to
+    /// `Container` enables the lite-mode container backend (M11);
+    /// the daemon validates the request against the chosen backend's
+    /// capability matrix (e.g. rejects `--hardened` for Container)
+    /// and persists the choice in the `sessions.backend` SQLite
+    /// column so subsequent dispatch routes to the right runtime.
+    #[serde(default)]
+    pub backend: Option<crate::backend::BackendKind>,
 }
 
 /// Request body for `POST /sessions/{id}/upload`.
@@ -234,6 +246,26 @@ mod tests {
             req.source_presets.is_empty(),
             "source_presets must default to empty on an empty request object"
         );
+        assert!(
+            req.backend.is_none(),
+            "backend must default to None so older CLIs round-trip as Lima"
+        );
+    }
+
+    #[test]
+    fn deserialize_backend_container() {
+        // Wire shape: lower-case tag matches `BackendKind`'s
+        // `#[serde(rename_all = "lowercase")]` attribute and the
+        // SQLite column's CHECK constraint.
+        let req: CreateSessionRequest =
+            serde_json::from_str(r#"{"backend": "container"}"#).unwrap();
+        assert_eq!(req.backend, Some(crate::backend::BackendKind::Container));
+    }
+
+    #[test]
+    fn deserialize_backend_lima() {
+        let req: CreateSessionRequest = serde_json::from_str(r#"{"backend": "lima"}"#).unwrap();
+        assert_eq!(req.backend, Some(crate::backend::BackendKind::Lima));
     }
 
     #[test]

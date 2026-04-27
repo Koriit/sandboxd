@@ -2,6 +2,8 @@ use std::fmt;
 
 use thiserror::Error;
 
+use crate::users_conf::UsersConfigError;
+
 /// Top-level error type for sandbox-core operations.
 #[derive(Debug, Error)]
 pub enum SandboxError {
@@ -37,6 +39,22 @@ pub enum SandboxError {
 
     #[error("{operation} timed out after {duration}s")]
     Timeout { operation: String, duration: u64 },
+}
+
+/// Map a [`UsersConfigError`] into [`SandboxError::InvalidArgument`].
+///
+/// `UsersConfigError`'s `Display` already includes the file path and
+/// (for the `FileNotFound` variant) a pointer to the install docs, so a
+/// simple `to_string()` round-trip preserves the operator-facing
+/// information without growing `SandboxError` with a new variant. The
+/// daemon uses `?` to bubble loader errors out of its startup path; the
+/// "no matching subnet" case is constructed at the call site as a
+/// `SandboxError::InvalidArgument` directly because it is not a loader
+/// error.
+impl From<UsersConfigError> for SandboxError {
+    fn from(e: UsersConfigError) -> Self {
+        SandboxError::InvalidArgument(e.to_string())
+    }
 }
 
 /// API error response body returned by the daemon.
@@ -113,5 +131,31 @@ mod tests {
 
         let deserialized: ApiError = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.error, "test error");
+    }
+
+    #[test]
+    fn users_config_error_maps_to_invalid_argument_preserving_path_and_docs() {
+        // The `FileNotFound` variant's Display includes both the file
+        // path and the install-docs pointer; both must survive the
+        // mapping so operators see them in the daemon's error.
+        let path = std::path::PathBuf::from("/etc/sandboxd/users.conf");
+        let users_err = UsersConfigError::FileNotFound(path.clone());
+        let users_msg = users_err.to_string();
+
+        let sandbox_err: SandboxError = users_err.into();
+        match sandbox_err {
+            SandboxError::InvalidArgument(msg) => {
+                assert_eq!(msg, users_msg, "mapping must be lossless");
+                assert!(
+                    msg.contains(path.to_str().unwrap()),
+                    "mapped message must include the file path, got {msg}"
+                );
+                assert!(
+                    msg.contains("install docs"),
+                    "mapped message must point at install docs, got {msg}"
+                );
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
     }
 }

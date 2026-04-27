@@ -32,6 +32,12 @@ These tests boot real Lima/QEMU VMs and are SLOW. Run with:
     cd tests/e2e
     source .venv/bin/activate
     python -m pytest test_m9_policy_persistence.py -v --timeout=600
+
+Backend coverage: **agnostic** — parametrized over ``[lima, container]``
+via the ``backend`` fixture. The persistence path lives in
+``SessionStore`` and the daemon's startup hydration; both backends
+share that machinery (the policy is keyed on session id, not on
+backend kind), so the restart-survival contract is identical.
 """
 
 from __future__ import annotations
@@ -44,8 +50,8 @@ import time
 import pytest
 
 from conftest import (
-    _VM_RESOURCE_ARGS,
     cleanup_policy_file,
+    make_create_args,
     parse_session_id,
     wait_for_state,
     write_policy_file,
@@ -126,7 +132,7 @@ def _assert_denied_fails(
 
 @pytest.mark.timeout(600)
 def test_policy_survives_daemon_restart(
-    sandbox_binaries, sandbox_daemon, sandbox_cli
+    sandbox_binaries, sandbox_daemon, sandbox_cli, backend
 ):
     """Apply a restrictive policy, verify enforcement, SIGTERM+restart the
     daemon on the same ``base_dir``, and verify the policy still enforces
@@ -159,8 +165,8 @@ def test_policy_survives_daemon_restart(
 
         # 2. Create the session with the restrictive policy applied.
         create_result = sandbox_cli(
-            "create", "--name", session_name,
-            *_VM_RESOURCE_ARGS, "--policy", policy_path,
+            "create",
+            *make_create_args(backend, session_name, "--policy", policy_path),
             timeout=600,
         )
         assert create_result.returncode == 0, (

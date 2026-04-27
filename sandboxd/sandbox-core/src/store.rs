@@ -251,12 +251,30 @@ impl SessionStore {
         config: SessionConfig,
         name: Option<String>,
     ) -> Result<Session, SandboxError> {
+        // Back-compat shim: the public `create_session` defaults to
+        // the Lima backend so existing call sites (and tests) keep
+        // their behaviour unchanged. Container-backed sessions go
+        // through `create_session_with_backend`.
+        self.create_session_with_backend(config, name, crate::backend::BackendKind::Lima)
+    }
+
+    /// Like [`create_session`], but lets the caller pin which backend
+    /// owns the session. Threaded through by the M11-S3 Phase 3D
+    /// `POST /sessions` handler so the container path persists
+    /// `backend = 'container'` rather than relying on the SQL
+    /// `DEFAULT 'lima'`.
+    pub fn create_session_with_backend(
+        &self,
+        config: SessionConfig,
+        name: Option<String>,
+        backend: crate::backend::BackendKind,
+    ) -> Result<Session, SandboxError> {
         let config_json = serde_json::to_string(&config)
             .map_err(|e| SandboxError::Internal(format!("failed to serialize config: {e}")))?;
 
         let mut attempt = 0u32;
         loop {
-            let session = Session::with_config(name.clone(), config.clone());
+            let session = Session::with_config_and_backend(name.clone(), config.clone(), backend);
             match self.try_insert_session(&session, &config_json) {
                 Ok(()) => {
                     fs::create_dir_all(self.session_dir(&session.id))?;
@@ -285,8 +303,8 @@ impl SessionStore {
         })?;
 
         let res = conn.execute(
-            "INSERT INTO sessions (id, name, state, config, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO sessions (id, name, state, config, created_at, updated_at, backend)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 session.id.as_str(),
                 session.name,
@@ -294,6 +312,7 @@ impl SessionStore {
                 config_json,
                 session.created_at.to_rfc3339(),
                 session.updated_at.to_rfc3339(),
+                session.backend.as_str(),
             ],
         );
 
@@ -316,7 +335,7 @@ impl SessionStore {
             .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, name, state, config, created_at, updated_at
+            "SELECT id, name, state, config, created_at, updated_at, backend
              FROM sessions WHERE id = ?1",
         )?;
 
@@ -335,7 +354,7 @@ impl SessionStore {
             .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, name, state, config, created_at, updated_at
+            "SELECT id, name, state, config, created_at, updated_at, backend
              FROM sessions ORDER BY created_at ASC",
         )?;
 
@@ -463,7 +482,7 @@ impl SessionStore {
                 .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
 
             let mut stmt = conn.prepare(
-                "SELECT id, name, state, config, created_at, updated_at
+                "SELECT id, name, state, config, created_at, updated_at, backend
                  FROM sessions WHERE name = ?1",
             )?;
 
@@ -1103,6 +1122,13 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> Result<Session, SandboxError> {
     let config_json: String = row.get(3)?;
     let created_at_str: String = row.get(4)?;
     let updated_at_str: String = row.get(5)?;
+    // Column 6 (`backend`) was introduced by V005. The migration's
+    // SQL `DEFAULT 'lima'` ensures every legacy row has a value, so
+    // a hard read is safe — but `BackendKind::from_str` still
+    // surfaces unknown tags as `Internal` errors rather than
+    // silently mis-dispatching, in case operators ever hand-edit
+    // the SQLite file.
+    let backend_str: String = row.get(6)?;
 
     let id = SessionId::parse(&id_str)
         .map_err(|e| SandboxError::Internal(format!("invalid session id in database: {e}")))?;
@@ -1120,6 +1146,10 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> Result<Session, SandboxError> {
         .map_err(|e| SandboxError::Internal(format!("invalid updated_at timestamp: {e}")))?
         .with_timezone(&Utc);
 
+    let backend = backend_str
+        .parse::<crate::backend::BackendKind>()
+        .map_err(|e| SandboxError::Internal(format!("invalid backend in database: {e}")))?;
+
     Ok(Session {
         id,
         name,
@@ -1127,6 +1157,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> Result<Session, SandboxError> {
         config,
         created_at,
         updated_at,
+        backend,
     })
 }
 
@@ -2713,5 +2744,145 @@ mod tests {
             0,
             "reopen must not re-emit reset events once the sweep has run"
         );
+    }
+
+    /// V005 migration: `sessions.backend` column.
+    ///
+    /// Seeds a database at the V004 schema (no `backend` column),
+    /// inserts a few rows in the V004 shape, then runs the unbounded
+    /// migration runner so V005 lands. Verifies:
+    ///   1. The `backend` column exists after migration.
+    ///   2. Pre-existing rows pick up `'lima'` from the
+    ///      `DEFAULT 'lima'` clause.
+    ///   3. The `CHECK` constraint accepts `'lima'` and `'container'`
+    ///      and rejects any other token.
+    ///
+    /// Hermetic: no Docker, no Lima — just rusqlite + the embedded
+    /// migrations. Lives next to `test_v004_migration_from_v1_seed_db`
+    /// to follow the existing project convention for migration
+    /// coverage (V001..V004 tests live inline in this module). See
+    /// M11-S1 Phase 1A handoff for the spec mapping; the
+    /// `integration_*`-prefixed shim in `tests/migrations.rs` is a
+    /// thin wrapper that satisfies the handoff's verbatim verification
+    /// command.
+    #[test]
+    fn test_v005_backend_column_migration() {
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("sessions.db");
+
+        // Seed at V004: run the migration runner with an explicit
+        // target so V005 stays pending. Refinery fills in
+        // `refinery_schema_history` as part of the run, so when we
+        // re-open later via the unbounded runner V005 is the only
+        // pending step.
+        {
+            let mut conn = Connection::open(&db_path).expect("open raw");
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            embedded::migrations::runner()
+                .set_target(refinery::Target::Version(4))
+                .run(&mut conn)
+                .expect("V001..V004");
+
+            // Insert a couple of V004-shape rows. The `sessions`
+            // table at V004 has columns
+            //   (id, name, state, config, created_at, updated_at,
+            //    network_info)
+            // and no `backend` column.
+            let now = Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO sessions (id, name, state, config, created_at, updated_at)
+                 VALUES (?1, ?2, 'Stopped', '{}', ?3, ?3)",
+                params!["abc123abc123", "alpha", now],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, name, state, config, created_at, updated_at)
+                 VALUES (?1, ?2, 'Stopped', '{}', ?3, ?3)",
+                params!["def456def456", "beta", now],
+            )
+            .unwrap();
+
+            // Sanity: no `backend` column at V004.
+            let cols = column_names(&conn, "sessions");
+            assert!(
+                !cols.iter().any(|c| c == "backend"),
+                "sessions must not have a backend column at V004; got {cols:?}"
+            );
+        }
+
+        // Now run the full migration set — this applies V005.
+        let (_store, _orphans) = SessionStore::new(dir.path().to_path_buf()).expect("open at V005");
+
+        let conn = Connection::open(&db_path).unwrap();
+
+        // 1. The column exists.
+        let cols = column_names(&conn, "sessions");
+        assert!(
+            cols.iter().any(|c| c == "backend"),
+            "expected `backend` column after V005; got {cols:?}"
+        );
+
+        // 2. Pre-existing rows carry `backend = 'lima'`.
+        let mut stmt = conn
+            .prepare("SELECT id, backend FROM sessions ORDER BY id")
+            .unwrap();
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("abc123abc123".to_string(), "lima".to_string()),
+                ("def456def456".to_string(), "lima".to_string()),
+            ],
+            "pre-existing rows must default to backend='lima' after V005"
+        );
+
+        // 3a. The CHECK constraint accepts 'lima' and 'container'.
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO sessions (id, name, state, config, created_at, updated_at, backend)
+             VALUES (?1, ?2, 'Stopped', '{}', ?3, ?3, 'container')",
+            params!["111111111111", "ctr", now],
+        )
+        .expect("container backend must be accepted");
+        conn.execute(
+            "INSERT INTO sessions (id, name, state, config, created_at, updated_at, backend)
+             VALUES (?1, ?2, 'Stopped', '{}', ?3, ?3, 'lima')",
+            params!["222222222222", "lima-explicit", now],
+        )
+        .expect("lima backend must be accepted");
+
+        // 3b. The CHECK constraint rejects any other token.
+        let err = conn.execute(
+            "INSERT INTO sessions (id, name, state, config, created_at, updated_at, backend)
+             VALUES (?1, ?2, 'Stopped', '{}', ?3, ?3, 'foo')",
+            params!["333333333333", "bad", now],
+        );
+        assert!(
+            err.is_err(),
+            "CHECK constraint must reject backend='foo'; got Ok"
+        );
+        let msg = format!("{}", err.unwrap_err());
+        assert!(
+            msg.contains("CHECK constraint failed") || msg.contains("constraint"),
+            "expected CHECK constraint failure, got: {msg}"
+        );
+    }
+
+    /// Helper for the V005 migration test: read the column names of a
+    /// table via `PRAGMA table_info`.
+    fn column_names(conn: &Connection, table: &str) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
     }
 }

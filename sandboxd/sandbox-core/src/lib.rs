@@ -1,5 +1,6 @@
 pub mod api;
 pub mod atomic_listener_writer;
+pub mod backend;
 pub mod ca;
 pub mod dns_gate;
 pub mod dns_propagation;
@@ -16,6 +17,7 @@ pub mod process;
 pub mod qmp;
 pub mod session;
 pub mod store;
+pub mod users_conf;
 pub mod vm_network;
 
 pub use api::{
@@ -31,6 +33,14 @@ pub use api::{
 pub use atomic_listener_writer::{
     AtomicListenerWriter, ListenerWriteError, listener_host_root, session_listener_host_dir,
     session_listener_host_path,
+};
+pub use backend::{
+    AsyncReadWrite, BackendInfo, BackendKind, BackendSpecific, Capabilities, CliDockerOps,
+    ContainerNetwork, ContainerRuntime, ContainerTransport, DEFAULT_LITE_IMAGE_TAG, DockerOps,
+    EnsureImageOutcome, ExitCode, GuestTransport, IsolationLevel, LITE_FIRST_USE_WARNING,
+    LITE_IMAGE_REPOSITORY, LimaRuntime, LimaTransport, ReaperReport, RuntimeHandle,
+    RuntimeStartArgs, RuntimeStatus, SessionRuntime, SessionSpec, UnsupportedFeature,
+    compute_default_resource_limits, ensure_image, lite_image_tag_for_version, reap_orphans,
 };
 pub use ca::{CaManager, generate_ca_inject_script};
 pub use dns_gate::{
@@ -76,6 +86,12 @@ pub use policy::{
 pub use policy_distributor::{PolicyDistributor, write_file_to_container};
 pub use process::run_with_timeout;
 pub use qmp::{QmpClient, mac_from_session_id};
-pub use session::{Session, SessionConfig, SessionId, SessionState, WorkspaceMode};
+pub use session::{
+    Session, SessionConfig, SessionId, SessionState, WorkspaceMode, WorkspaceModeKind,
+};
 pub use store::{OrphanInfo, ResolveOutcome, SessionStore};
+pub use users_conf::{
+    Cidr4, DEFAULT_USERS_CONF_PATH, SubnetEntry, USERS_CONF_PATH_ENV, UsersConfig,
+    UsersConfigError, load_users_config, load_users_config_from, users_conf_path,
+};
 pub use vm_network::{attach_vm_to_bridge, detach_vm_from_bridge};

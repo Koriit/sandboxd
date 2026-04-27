@@ -2,6 +2,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
+use enumset::EnumSetType;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -145,7 +146,43 @@ pub enum WorkspaceMode {
     },
 }
 
+/// Kind discriminator for [`WorkspaceMode`], without the variant payload.
+///
+/// `WorkspaceMode` is data-bearing (`Shared { host_path }`,
+/// `Clone { repo_url }`), so it cannot itself participate in
+/// [`enumset::EnumSet`] — `EnumSetType` requires unit variants only.
+/// `WorkspaceModeKind` is the companion unit-only enum used by
+/// [`crate::backend::Capabilities::workspace_modes`] to declare which
+/// kinds of workspace handoff a backend supports, independent of any
+/// concrete instance.
+///
+/// The kind is derivable from a `WorkspaceMode` via [`WorkspaceMode::kind`].
+///
+/// See spec § "Capabilities model" — the spec sketches this set as
+/// `EnumSet<WorkspaceMode>`; in practice the discriminator is the
+/// kind, and validation never depends on the payload.
+#[derive(Debug, EnumSetType, Serialize, Deserialize)]
+#[enumset(serialize_repr = "list")]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceModeKind {
+    /// 9p host-mount; corresponds to [`WorkspaceMode::Shared`].
+    Shared,
+    /// Git clone into the VM/container; corresponds to [`WorkspaceMode::Clone`].
+    Clone,
+}
+
 impl WorkspaceMode {
+    /// Return the kind discriminator for this workspace mode.
+    ///
+    /// Used for capability checks where the payload (paths, URLs) is
+    /// irrelevant — only whether the backend supports the *kind*.
+    pub fn kind(&self) -> WorkspaceModeKind {
+        match self {
+            Self::Shared { .. } => WorkspaceModeKind::Shared,
+            Self::Clone { .. } => WorkspaceModeKind::Clone,
+        }
+    }
+
     /// Parse a workspace mode from the CLI `--workspace` flag value.
     ///
     /// Accepted formats:
@@ -309,10 +346,30 @@ pub struct Session {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub config: SessionConfig,
+    /// Which backend owns this session's runtime resources.
+    ///
+    /// Persisted as the `sessions.backend` SQLite column (V005
+    /// migration); legacy rows written before V005 default to
+    /// `BackendKind::Lima` via the column's SQL `DEFAULT 'lima'`,
+    /// so any session that exists today is unambiguously a Lima
+    /// session. M11-S3 Phase 3D introduces the container backend
+    /// and threads this kind through `runtime_for(...)` so handlers
+    /// dispatch to the right `SessionRuntime` for each persisted
+    /// row, without re-deriving the kind from per-handler heuristics.
+    ///
+    /// `#[serde(default)]` so JSON snapshots written by older code
+    /// paths still deserialize cleanly (defaulting to Lima); the
+    /// authoritative source remains the SQLite column.
+    #[serde(default)]
+    pub backend: crate::backend::BackendKind,
 }
 
 impl Session {
     /// Create a new session with the given name and default config.
+    ///
+    /// Defaults the backend to `Lima` to preserve the historical
+    /// shape of `Session::new`. New code paths that need a non-Lima
+    /// backend should use [`Session::with_config_and_backend`].
     pub fn new(name: Option<String>) -> Self {
         let now = Utc::now();
         Self {
@@ -322,11 +379,25 @@ impl Session {
             created_at: now,
             updated_at: now,
             config: SessionConfig::default(),
+            backend: crate::backend::BackendKind::Lima,
         }
     }
 
-    /// Create a new session with a specific config.
+    /// Create a new session with a specific config (Lima backend).
+    ///
+    /// Retained as a back-compat shim for tests and pre-Phase-3D
+    /// call sites; container-backed sessions go through
+    /// [`Session::with_config_and_backend`].
     pub fn with_config(name: Option<String>, config: SessionConfig) -> Self {
+        Self::with_config_and_backend(name, config, crate::backend::BackendKind::Lima)
+    }
+
+    /// Create a new session with a specific config and backend.
+    pub fn with_config_and_backend(
+        name: Option<String>,
+        config: SessionConfig,
+        backend: crate::backend::BackendKind,
+    ) -> Self {
         let now = Utc::now();
         Self {
             id: SessionId::generate(),
@@ -335,6 +406,7 @@ impl Session {
             created_at: now,
             updated_at: now,
             config,
+            backend,
         }
     }
 

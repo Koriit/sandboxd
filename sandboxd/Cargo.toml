@@ -5,6 +5,7 @@ members = [
     "sandbox-core",
     "sandbox-deny-logger",
     "sandbox-guest",
+    "sandbox-route-helper",
 ]
 resolver = "2"
 
@@ -14,9 +15,11 @@ license = "MIT"
 rust-version = "1.88"
 
 [workspace.dependencies]
+async-trait = "0.1"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+enumset = { version = "1", features = ["serde"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }

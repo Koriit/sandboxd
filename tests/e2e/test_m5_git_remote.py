@@ -12,6 +12,15 @@ Run with generous timeouts:
     cd tests/e2e
     source .venv/bin/activate
     python -m pytest test_m5_git_remote.py -v --timeout=600
+
+Backend coverage: **agnostic** — parametrized over ``[lima, container]``
+via the ``backend`` fixture. ``sandbox ssh`` (the transport the remote
+helper tunnels through) dispatches per-backend internally — to Lima's
+SSH for VM sessions and to ``docker exec -it`` for lite container
+sessions — so the remote helper protocol is identical from git's
+point of view. ``test_lite.py::test_lite_git_remote_sandbox`` already
+covers a single push/fetch round-trip on the container backend; this
+parametrization extends the broader push and fetch contracts.
 """
 
 from __future__ import annotations
@@ -25,7 +34,7 @@ import pytest
 
 from conftest import (
     SandboxBinaries,
-    _VM_RESOURCE_ARGS,
+    make_create_args,
     parse_session_id,
     wait_for_state,
 )
@@ -61,6 +70,7 @@ def test_git_push_to_vm(
     sandbox_cli,
     sandbox_binaries: SandboxBinaries,
     sandbox_daemon,
+    backend,
 ):
     """Push a commit from the host INTO a VM using ``git-remote-sandbox``.
 
@@ -84,8 +94,7 @@ def test_git_push_to_vm(
 
         # -- 1. Create a session -----------------------------------------------
         result = sandbox_cli(
-            "create", "--name", "git-push-vm",
-            *_VM_RESOURCE_ARGS,
+            "create", *make_create_args(backend, "git-push-vm"),
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -193,6 +202,7 @@ def test_git_fetch_from_vm(
     sandbox_cli,
     sandbox_binaries: SandboxBinaries,
     sandbox_daemon,
+    backend,
 ):
     """Fetch a commit FROM a VM to the host using ``git-remote-sandbox``.
 
@@ -216,8 +226,7 @@ def test_git_fetch_from_vm(
 
         # -- 1. Create a session -----------------------------------------------
         result = sandbox_cli(
-            "create", "--name", "git-fetch-vm",
-            *_VM_RESOURCE_ARGS,
+            "create", *make_create_args(backend, "git-fetch-vm"),
             timeout=600,
         )
         assert result.returncode == 0, (

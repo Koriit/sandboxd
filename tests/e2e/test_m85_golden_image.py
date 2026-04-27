@@ -1,5 +1,12 @@
 """E2E tests for the golden base image / clone-path (M8.5).
 
+Backend coverage: **Lima only**. The golden-image / clone-path machinery
+(``sandbox-base`` Lima VM, ``base-image-meta.json``, ``rebuild-image``)
+is entirely a Lima concept — the lite container backend pulls a
+prebuilt OCI image (``ghcr.io/.../sandbox-lite-base``) and has no
+clone path. These tests therefore do not take the ``backend`` fixture
+and run unparametrised against Lima only.
+
 These tests verify:
 
 1. ``sandbox rebuild-image`` builds the golden ``sandbox-base`` Lima VM from

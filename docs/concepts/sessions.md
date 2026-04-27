@@ -20,6 +20,8 @@ When you run `sandbox create`, the daemon provisions a bundle of resources that 
 
 All of this is session-scoped. Two sessions on the same host share nothing at runtime.
 
+Sessions can be backed by one of two runtimes: a Lima/QEMU VM (the default, VM-grade isolation) or a Docker container (lite mode, container-level isolation, faster session creation). The session contract — gateway, policy, workspace, persistence — is identical across both. See [Lite mode](/guides/lite-mode/) for the trade-off and when to choose each.
+
 ## Identifiers
 
 Every session has a 12-character lowercase-hex **session ID** (for example `550e8400e29b`). You can also give a session a human-readable `--name` at creation time. Commands that take a `<session>` argument accept:

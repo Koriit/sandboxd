@@ -1,0 +1,27 @@
+[package]
+name = "sandbox-route-helper"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "sandbox-route-helper"
+path = "src/main.rs"
+
+[dependencies]
+sandbox-core.workspace = true
+# Feature set:
+#   - "user"  — `User::from_uid` for stderr name lookup; transitively
+#               required by `sandbox-core`'s `SubnetEntry::allows_uid`.
+#   - "sched" — `setns(fd, CLONE_NEWNET)` to enter the container netns.
+#   - "net"   — `getifaddrs()` to enumerate netns IPv4 addresses (step 6).
+# `pidfd_open(2)` is NOT exposed by nix 0.29 (no module, no feature
+# gate); we invoke it via `libc::syscall(SYS_pidfd_open, ...)` instead.
+nix = { version = "0.29", features = ["user", "sched", "net"] }
+# Required only for the direct `pidfd_open` syscall and the matching
+# errno read. The rest of the crate uses nix wrappers.
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true

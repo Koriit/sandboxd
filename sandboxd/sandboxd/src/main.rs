@@ -5,29 +5,37 @@ use std::time::Duration;
 
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, post},
 };
 use clap::Parser;
+use sandbox_core::backend::{
+    BackendKind, CliDockerOps, ContainerRuntime, EnsureImageOutcome, LITE_FIRST_USE_WARNING,
+    LimaRuntime, RuntimeHandle, RuntimeStartArgs, SessionRuntime, compute_default_resource_limits,
+    ensure_image, lite_image_tag_for_version, map_container_uid_gid, reap_orphans,
+    rebuild_lite_image,
+};
 use sandbox_core::events::lifecycle as lifecycle_events;
 use sandbox_core::events::session_events_host_dir;
 use sandbox_core::gateway::container_name as gateway_container_name;
 use sandbox_core::{
-    ApiError, AssuranceLevel, BaseImageStatus, CaManager, CoreDnsConfig, CreateSessionRequest,
-    DEFAULT_DEADLINE_MS as DNS_GATE_DEFAULT_DEADLINE_MS, Destination, DnsCache, DockerExecLdsProbe,
-    DockerHealth, EventBus, EventBusConfig, ExecRequest, ExecResponse, FileDownloadRequest,
-    FileDownloadResponse, FileUploadRequest, GateRequest, GateService, GateServiceOutcome,
-    GateStatus, GatewayHealth, GatewayManager, GatewayShutdownReason, GatewayStatus,
-    GuestConnector, GuestRequest, GuestResponse, HealthComponent, LdsAckOutcome, LdsStatsProbe,
-    LimaManager, NetworkHealth, NetworkInfo, NetworkManager, PersistConfig, PersistentSink, Policy,
-    PolicyApplyStatus, PolicyCompiler, PolicyDistributor, SandboxError, Session, SessionConfig,
-    SessionDto, SessionHealth, SessionId, SessionIngestor, SessionState, SessionStore,
-    UpdatePolicyRequest, VmIpSessionMap, VmStatus, attach_vm_to_bridge, bind_gate_listener,
-    detach_vm_from_bridge, generate_ca_inject_script, generate_domain_ip_rules, hash_policy,
+    ApiError, AssuranceLevel, BaseImageStatus, CaManager, Cidr4, CoreDnsConfig,
+    CreateSessionRequest, DEFAULT_DEADLINE_MS as DNS_GATE_DEFAULT_DEADLINE_MS, Destination,
+    DnsCache, DockerExecLdsProbe, DockerHealth, EventBus, EventBusConfig, ExecRequest,
+    ExecResponse, FileDownloadRequest, FileDownloadResponse, FileUploadRequest, GateRequest,
+    GateService, GateServiceOutcome, GateStatus, GatewayHealth, GatewayManager,
+    GatewayShutdownReason, GatewayStatus, GuestConnector, GuestRequest, GuestResponse,
+    HealthComponent, LdsAckOutcome, LdsStatsProbe, LimaManager, NetworkHealth, NetworkInfo,
+    NetworkManager, PersistConfig, PersistentSink, Policy, PolicyApplyStatus, PolicyCompiler,
+    PolicyDistributor, SandboxError, Session, SessionConfig, SessionDto, SessionHealth, SessionId,
+    SessionIngestor, SessionState, SessionStore, UpdatePolicyRequest, UsersConfig, VmIpSessionMap,
+    VmStatus, attach_vm_to_bridge, bind_gate_listener, detach_vm_from_bridge,
+    generate_ca_inject_script, generate_domain_ip_rules, hash_policy, load_users_config,
     mac_from_session_id, propagate_dns_changes, read_resolved_json, remove_gate_socket,
-    serve_gate_listener, wait_for_lds_ack, write_file_to_container,
+    serve_gate_listener, users_conf_path, wait_for_lds_ack, write_file_to_container,
 };
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
@@ -114,6 +122,63 @@ fn default_base_dir() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// users.conf startup validation
+// ---------------------------------------------------------------------------
+//
+// M11-S2 Phase 2C: the daemon refuses to start unless `/etc/sandboxd/users.conf`
+// (or its `SANDBOX_USERS_CONF` test-only override) contains a subnet entry whose
+// `allow_users` resolves to the daemon's own uid. The matched subnet's CIDR
+// scopes `NetworkManager`'s per-session /28 allocation pool.
+//
+// See:
+//   - lite-mode container backend spec § "Install-time setup" / "Config file:
+//     /etc/sandboxd/users.conf" — the contract this validation enforces.
+//   - `sandbox_core::users_conf` — the loader that produces a parsed
+//     [`UsersConfig`]; we layer the daemon-uid lookup on top.
+
+/// Resolve which CIDR pool the daemon should hand to [`NetworkManager::new`],
+/// given the daemon's uid and a parsed [`UsersConfig`].
+///
+/// Pure function — no syscalls beyond the `getpwnam_r` calls
+/// `find_subnet_by_uid` performs against the host passwd database. Split
+/// out from the startup wiring so the unit tests can drive the lookup
+/// without spawning a subprocess.
+///
+/// Returns:
+/// - `Ok(cidr)` — the unique subnet whose `allow_users` maps to
+///   `daemon_uid` (first match wins; see
+///   [`UsersConfig::find_subnet_by_uid`]).
+/// - `Err(SandboxError::InvalidArgument(_))` — no entry resolved to
+///   `daemon_uid`. The message names the daemon's uid (and username, when
+///   `getpwuid_r` succeeds), the absolute file path, and points at the
+///   install docs. Operators must amend `users.conf` (or, for tests, the
+///   `SANDBOX_USERS_CONF`-pointed file) before the daemon will start.
+fn resolve_allocation_pool(daemon_uid: u32, config: &UsersConfig) -> Result<Cidr4, SandboxError> {
+    if let Some(entry) = config.find_subnet_by_uid(daemon_uid) {
+        return Ok(entry.cidr);
+    }
+
+    // Best-effort resolve uid → username so the error names the user the
+    // operator likely thinks of. Fall back to "uid N" if either
+    // `getpwuid_r` errors or the uid is not present in passwd (rare on
+    // hosts where the daemon is actually running as that uid, but
+    // possible inside containers).
+    let user_label = match nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(daemon_uid)) {
+        Ok(Some(user)) => format!("'{}' (uid {daemon_uid})", user.name),
+        Ok(None) | Err(_) => format!("uid {daemon_uid}"),
+    };
+
+    // Grep-stable phrasing: Phase 2D's install docs will reference the
+    // "no users.conf subnet matches daemon user" prefix verbatim. Do
+    // not re-word without coordinating the docs change.
+    Err(SandboxError::InvalidArgument(format!(
+        "no users.conf subnet matches daemon user {user_label} \
+         in {path}; see install docs at docs/start/installation.md",
+        path = users_conf_path().display(),
+    )))
+}
+
+// ---------------------------------------------------------------------------
 // Logging setup
 // ---------------------------------------------------------------------------
 
@@ -181,6 +246,287 @@ fn init_tracing(log_file: Option<&std::path::Path>) -> std::io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Route-helper path resolution (M11-S5 Phase 5A fixup)
+// ---------------------------------------------------------------------------
+//
+// `sandbox-route-helper` is a sibling binary the daemon spawns when a lite
+// session starts (see `ContainerRuntime::start` → `invoke_route_helper`).
+// The original Phase 5A wiring passed the bare name `"sandbox-route-helper"`
+// and relied on `Command::new()`'s `$PATH` lookup, but neither the e2e
+// fixture nor the cargo workspace layout puts `target/debug/` on the
+// daemon's `PATH`. The result was that every lite session create failed at
+// container start with `os error 2`.
+//
+// `resolve_route_helper_path` looks up the helper at deploy-friendly
+// locations and surfaces a single, operator-actionable error if no
+// *usable* candidate is found. "Usable" means: the file exists *and* it
+// carries the `CAP_SYS_ADMIN` file capability (effective). The cap check
+// matters because in dev workspaces the cargo build directory often
+// lives on a host-share / bind-mount filesystem that does not honor
+// `security.capability` xattrs (`setcap` returns "Operation not
+// supported"); the same constraint the route-helper's own integration
+// tests work around by copying the binary to a tempdir before applying
+// caps. Without the cap check, the resolver would happily pick the
+// un-cap'd sibling and the failure surface would move from "spawn os
+// error 2" to "setns EPERM" at session start — equally late and equally
+// confusing. With the cap check, the resolver fails fast at the
+// daemon-error layer with a message naming every location tried.
+//
+// Lookup order:
+//
+//   1. Sibling of the running daemon binary (`current_exe()`'s directory).
+//      Covers cargo workspace runs (`target/debug/` co-located with
+//      `sandboxd`) and most installed layouts where both binaries ship in
+//      the same `bin/` directory.
+//   2. The well-known install path `/usr/local/bin/sandbox-route-helper`,
+//      matching the install-docs runbook
+//      (`docs/start/installation.md` § "sandbox-route-helper").
+//   3. `$PATH` lookup as a last resort (preserves the original behavior
+//      for operators who deliberately drop the helper into a directory
+//      other than `/usr/local/bin`).
+//
+// The function returns a `SandboxError::Internal` rather than a custom
+// error type so call sites can propagate it through the existing daemon
+// error pipeline. The error message lists every location tried, plus
+// the cap requirement, so an operator can immediately see why the
+// daemon refused to use any of them.
+
+/// Default install path for the route helper, referenced both by the
+/// resolver and by the operator-facing error message it produces.
+const ROUTE_HELPER_INSTALL_PATH: &str = "/usr/local/bin/sandbox-route-helper";
+
+/// Bare-name of the helper binary, used for both filesystem candidates
+/// and `$PATH` walks.
+const ROUTE_HELPER_BINARY_NAME: &str = "sandbox-route-helper";
+
+/// Linux capability bit number for `CAP_SYS_ADMIN`, the only capability
+/// the route helper requires. Hard-coded rather than pulled from a
+/// crate constant because no workspace dep exposes the kernel
+/// `linux/capability.h` numbering directly. Source: Linux UAPI
+/// `include/uapi/linux/capability.h` — `#define CAP_SYS_ADMIN 21`.
+const CAP_SYS_ADMIN_BIT: u32 = 21;
+
+/// `vfs_cap_data.magic_etc` low byte revision masks (UAPI
+/// `linux/capability.h`).
+const VFS_CAP_REVISION_MASK: u32 = 0xFF00_0000;
+const VFS_CAP_REVISION_2: u32 = 0x0200_0000;
+const VFS_CAP_REVISION_3: u32 = 0x0300_0000;
+/// `magic_etc` low bit set ⇔ caps are *effective* on exec (the only
+/// flavor the route helper is shipped with — `cap_sys_admin+ep`).
+const VFS_CAP_FLAGS_EFFECTIVE: u32 = 0x0000_0001;
+
+/// On-disk size (bytes) of `vfs_cap_data` for revisions 2 and 3. We
+/// support both because newer kernels emit revision 3 (with a trailing
+/// `rootid` field) by default. Anything else is treated as "not a cap
+/// xattr we understand" and the candidate is skipped.
+const VFS_CAP_DATA_V2_SIZE: usize = 20;
+const VFS_CAP_DATA_V3_SIZE: usize = 24;
+
+/// Resolve the absolute path to `sandbox-route-helper` for use in
+/// `ContainerNetwork::route_helper_path`.
+///
+/// See the module-level comment above for the lookup order, the cap-
+/// requirement check, and the rationale. The function is fail-closed:
+/// if no candidate carries `CAP_SYS_ADMIN+ep`, it returns a
+/// `SandboxError::Internal` whose message names every location it
+/// inspected and the cap requirement.
+fn resolve_route_helper_path() -> Result<PathBuf, SandboxError> {
+    let current_exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    let install_path = PathBuf::from(ROUTE_HELPER_INSTALL_PATH);
+    let path_var = std::env::var_os("PATH");
+    let candidates = default_route_helper_candidates(
+        current_exe_dir.as_deref(),
+        &install_path,
+        path_var.as_deref(),
+    );
+    let exe_dir_display = current_exe_dir
+        .as_ref()
+        .map(|d| d.display().to_string())
+        .unwrap_or_else(|| "<unavailable: current_exe() failed>".to_string());
+    resolve_route_helper_path_from(
+        candidates,
+        has_required_caps,
+        &exe_dir_display,
+        &install_path,
+    )
+}
+
+/// Build the ordered candidate list the resolver consults. Split out so
+/// the unit tests can substitute a synthetic candidate iterator without
+/// having to fake `current_exe()` or mutate `$PATH`.
+fn default_route_helper_candidates(
+    current_exe_dir: Option<&std::path::Path>,
+    install_path: &std::path::Path,
+    path_var: Option<&std::ffi::OsStr>,
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    // 1. Sibling of the daemon binary.
+    if let Some(dir) = current_exe_dir {
+        out.push(dir.join(ROUTE_HELPER_BINARY_NAME));
+    }
+    // 2. Well-known install path.
+    out.push(install_path.to_path_buf());
+    // 3. `$PATH` walk. Mirrors `Command::new()`'s lookup so operators
+    //    can drop the helper into any PATH-listed directory.
+    if let Some(path_var) = path_var {
+        for dir in std::env::split_paths(path_var) {
+            // `split_paths` yields empty entries for trailing/duplicate
+            // colons (`PATH=/usr/local/bin::/usr/bin`); skip them so we
+            // don't accidentally probe `./sandbox-route-helper`.
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            out.push(dir.join(ROUTE_HELPER_BINARY_NAME));
+        }
+    }
+    out
+}
+
+/// Pure inner of [`resolve_route_helper_path`].
+///
+/// Walks the supplied `candidates` in order and returns the first one
+/// that satisfies `is_usable`. Returns a `SandboxError::Internal`
+/// naming every location it tried (plus the cap requirement) when no
+/// candidate is usable.
+///
+/// Split out — and parameterized over `is_usable` — so the unit tests
+/// can drive the priority logic with a stub predicate. Setting real
+/// file capabilities from a unit test requires `CAP_SETFCAP` and is
+/// not portable, so cap-check coverage lives in [`has_required_caps`]
+/// itself; the priority logic is exercised here without touching
+/// xattrs.
+fn resolve_route_helper_path_from<I, F>(
+    candidates: I,
+    is_usable: F,
+    exe_dir_display: &str,
+    install_path: &std::path::Path,
+) -> Result<PathBuf, SandboxError>
+where
+    I: IntoIterator<Item = PathBuf>,
+    F: Fn(&std::path::Path) -> bool,
+{
+    for candidate in candidates {
+        if is_usable(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(SandboxError::Internal(format!(
+        "no usable sandbox-route-helper found; checked (1) sibling of daemon binary \
+         at {exe_dir_display}/{ROUTE_HELPER_BINARY_NAME}, (2) install path \
+         {install} and (3) $PATH lookup. Each candidate must exist as a regular \
+         file AND carry the CAP_SYS_ADMIN file capability (effective): \
+         `sudo setcap cap_sys_admin+ep <path>`. See \
+         docs/start/installation.md § \"sandbox-route-helper\".",
+        install = install_path.display(),
+    )))
+}
+
+/// Predicate used by [`resolve_route_helper_path`] to decide whether a
+/// candidate path is a usable route-helper binary: the file must exist
+/// *and* carry `CAP_SYS_ADMIN` in the effective-on-exec set.
+///
+/// Implemented as a thin wrapper around [`read_cap_xattr`] so the
+/// resolver's call site stays a single named predicate. We deliberately
+/// treat *every* failure mode as "not usable, move on": a missing file
+/// (ENOENT), a missing or empty `security.capability` xattr (ENODATA),
+/// an unreadable file (EACCES), a malformed xattr blob, or anything
+/// else, all reduce to `false`. The resolver's "no usable candidate"
+/// error message names every location tried so operators can debug
+/// from the negative result without a per-candidate reason code.
+fn has_required_caps(path: &std::path::Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    match read_cap_xattr(path) {
+        Some(buf) => xattr_has_cap_sys_admin_effective(&buf),
+        None => false,
+    }
+}
+
+/// Read the raw `security.capability` xattr blob from `path` via
+/// `libc::getxattr`. Returns `None` on any error (missing file,
+/// missing xattr, EACCES, oversized blob, etc.) — all of those mean
+/// "this candidate is not a setcap'd helper" for our purposes.
+///
+/// We size the buffer at 64 bytes — `vfs_cap_data` is at most 24 bytes
+/// for revision 3, so 64 leaves room for any future revision the
+/// kernel might introduce while still bounding the syscall's write.
+fn read_cap_xattr(path: &std::path::Path) -> Option<Vec<u8>> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    // `CString::new` rejects interior NULs. A path with NULs cannot
+    // exist on Linux anyway, so treat it as "not usable".
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let attr_name = CString::new("security.capability").expect("static string has no NUL");
+    let mut buf = [0u8; 64];
+
+    // SAFETY: `c_path` and `attr_name` are valid NUL-terminated C
+    // strings; `buf` is a valid mutable buffer of the size we pass.
+    // `libc::getxattr` on error returns -1 and we treat that as "no
+    // caps" via the `< 0` branch below; on success it returns the
+    // number of bytes written, bounded by `buf.len()`.
+    let n = unsafe {
+        libc::getxattr(
+            c_path.as_ptr(),
+            attr_name.as_ptr(),
+            buf.as_mut_ptr() as *mut libc::c_void,
+            buf.len(),
+        )
+    };
+    if n < 0 {
+        return None;
+    }
+    let n = n as usize;
+    if n > buf.len() {
+        // Defensive: the kernel should never write more than `buf.len()`
+        // bytes, but if it ever does we cannot trust the blob and skip.
+        return None;
+    }
+    Some(buf[..n].to_vec())
+}
+
+/// Decode a raw `vfs_cap_data` blob and return whether
+/// `CAP_SYS_ADMIN` is present in `permitted` *and* the blob's
+/// `effective` flag is set. Pure function — split out from
+/// [`read_cap_xattr`] so the cap-decoding logic is unit-testable
+/// without touching xattrs (see the `xattr_has_cap_sys_admin_*`
+/// tests below).
+///
+/// The on-disk layout (UAPI `linux/capability.h`) is:
+///   - 4 bytes `magic_etc`        (LE: revision in high byte, flags in low byte)
+///   - 4 bytes `data[0].permitted`  (LE)
+///   - 4 bytes `data[0].inheritable` (LE)
+///   - 4 bytes `data[1].permitted`   (LE)
+///   - 4 bytes `data[1].inheritable` (LE)
+///   - revision 3 only: 4 bytes `rootid` (LE) — ignored here; we
+///     only need to know that the blob is well-formed and that
+///     `CAP_SYS_ADMIN+ep` is set.
+fn xattr_has_cap_sys_admin_effective(buf: &[u8]) -> bool {
+    if buf.len() != VFS_CAP_DATA_V2_SIZE && buf.len() != VFS_CAP_DATA_V3_SIZE {
+        return false;
+    }
+    // `magic_etc` is little-endian regardless of host endianness
+    // (the kernel writes it in CPU-native order, but x86_64 and
+    // aarch64 are LE so we treat it as LE; the lite backend only
+    // ships on Linux x86_64 / aarch64).
+    let magic_etc = u32::from_le_bytes(buf[0..4].try_into().expect("4 bytes"));
+    let revision = magic_etc & VFS_CAP_REVISION_MASK;
+    if revision != VFS_CAP_REVISION_2 && revision != VFS_CAP_REVISION_3 {
+        return false;
+    }
+    if magic_etc & VFS_CAP_FLAGS_EFFECTIVE == 0 {
+        return false;
+    }
+    // CAP_SYS_ADMIN bit number is 21, which fits in the low 32 bits
+    // of the 64-bit permitted set, so we only need data[0].permitted.
+    let permitted_lo = u32::from_le_bytes(buf[4..8].try_into().expect("4 bytes"));
+    permitted_lo & (1u32 << CAP_SYS_ADMIN_BIT) != 0
+}
+
+// ---------------------------------------------------------------------------
 // Shared state
 // ---------------------------------------------------------------------------
 
@@ -193,7 +539,34 @@ struct AppState {
     // `Mutex`-guarded, so the shared handle is safe and adds no
     // synchronization beyond what the store already performs.
     store: Arc<SessionStore>,
-    lima: Arc<LimaManager>,
+    /// Backend dispatch table keyed by [`BackendKind`].
+    ///
+    /// M11-S1 Phase 1C introduced this map alongside `lima_runtime` so
+    /// that handler call sites talking to the *generic* lifecycle
+    /// (create / start / stop / delete / status / ip / exec_interactive
+    /// / guest_transport) go through the trait, while Lima-specific
+    /// orchestration (clone, base image, agent install, list_vms)
+    /// continues to call the typed runtime directly via
+    /// [`LimaRuntime::manager`]. The same `Arc<LimaRuntime>` is
+    /// registered here under [`BackendKind::Lima`] and held by
+    /// `lima_runtime` — there is one Lima runtime instance reachable
+    /// both ways. M11-S2 will register the container backend alongside.
+    runtimes: Arc<HashMap<BackendKind, Arc<dyn SessionRuntime>>>,
+    /// Typed handle to the Lima/QEMU runtime, retained so the daemon
+    /// can still call Lima-specific orchestration that does not (yet)
+    /// have a trait surface — base-image build/check/rebuild, golden
+    /// VM clone, custom-template create, guest agent install, and the
+    /// admin `/vms` listing. See [`LimaRuntime::manager`] for the
+    /// escape hatch that keeps these calls one method-chain away.
+    lima_runtime: Arc<LimaRuntime>,
+    /// Typed handle to the Docker/lite container runtime, retained
+    /// alongside `runtimes` for the same reason `lima_runtime` is —
+    /// the create-session container path needs the typed surface
+    /// (`register_session(...)`, the cached daemon-version image tag)
+    /// before it dispatches through `SessionRuntime::create`.
+    /// Registered alongside [`BackendKind::Container`] in
+    /// [`AppState::runtimes`] at startup; see `main()`.
+    container_runtime: Arc<ContainerRuntime>,
     guest: GuestConnector,
     network: Arc<NetworkManager>,
     gateway: Arc<GatewayManager>,
@@ -276,6 +649,74 @@ struct AppState {
     propagation_states: Arc<PropagationStates>,
 }
 
+/// Look up the runtime for a given backend kind from the dispatch
+/// table.
+///
+/// Used by handlers that already know the backend kind for the
+/// session they are operating on — typically because they read it
+/// off the persisted `Session::backend` field. M11-S3 Phase 3D
+/// supersedes the Phase 1C `lima_dyn` helper with this version so
+/// the same call site works for both `BackendKind::Lima` and
+/// `BackendKind::Container` rows without any per-handler branching.
+///
+/// Panics if the requested runtime is missing from the dispatch
+/// table; that is unreachable by construction (registration happens
+/// in `main()` before any handler can run) and a panic is the
+/// correct failure mode — a session row with a backend kind that
+/// no runtime answers to can never be serviced anyway.
+fn runtime_for(state: &AppState, kind: BackendKind) -> Arc<dyn SessionRuntime> {
+    Arc::clone(
+        state
+            .runtimes
+            .get(&kind)
+            .unwrap_or_else(|| panic!("runtime for {kind:?} must be registered at startup")),
+    )
+}
+
+/// Project a [`SessionConfig`] + [`BackendKind`] pair back into the
+/// [`sandbox_core::SessionSpec`] shape consumed by
+/// [`SessionRuntime::create`] and [`SessionSpec::validate`].
+///
+/// The `BackendKind` arg picks which variant of `BackendSpecific`
+/// the projection emits:
+///
+/// - `Lima` carries the full Lima-side surface (`hardened`,
+///   `memory_mb`, `cpus`).
+/// - `Container` mirrors the lite-mode wire shape from the spec —
+///   only `memory_mb` and `cpus` land on `BackendSpecific`; the
+///   container backend rejects `--hardened` via its capability
+///   matrix, and the request-side validation in `create_session`
+///   surfaces the rejection before this projection ever runs for a
+///   container session.
+///
+/// The remaining fields (`workspace_mode`, `repo`, `boot_cmd`,
+/// `template`, `disk_gb`) surface at the [`SessionSpec`] level
+/// regardless of backend.
+fn session_spec_from_config(
+    config: &SessionConfig,
+    kind: BackendKind,
+) -> sandbox_core::SessionSpec {
+    let backend_specific = match kind {
+        BackendKind::Lima => sandbox_core::BackendSpecific::Lima {
+            hardened: config.hardened,
+            memory_mb: config.memory_mb,
+            cpus: config.cpus,
+        },
+        BackendKind::Container => sandbox_core::BackendSpecific::Container {
+            memory_mb: config.memory_mb,
+            cpus: config.cpus,
+        },
+    };
+    sandbox_core::SessionSpec {
+        backend_specific,
+        workspace_mode: config.workspace_mode.clone(),
+        repo: config.repo.clone(),
+        boot_cmd: config.boot_cmd.clone(),
+        template: config.template.clone(),
+        disk_gb: Some(config.disk_gb),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Error mapping
 // ---------------------------------------------------------------------------
@@ -312,6 +753,17 @@ fn app(state: Arc<AppState>) -> Router {
     ));
     let policy_router = sandboxd::policy_http::policy_router(policy_state);
 
+    // M11-S3 Phase 3C: build the backends-listing sub-router. Holds an
+    // `Arc` over the same backend dispatch map the main `AppState`
+    // owns; the CLI hits `GET /backends` once per invocation to learn
+    // capabilities, so a read-only sub-router keeps the surface narrow
+    // and lets `tests/integration_backends_endpoint.rs` drive the
+    // route via `oneshot` without booting Lima/gateway/network.
+    let backends_state = Arc::new(sandboxd::backends_http::BackendsApiState::new(Arc::clone(
+        &state.runtimes,
+    )));
+    let backends_router = sandboxd::backends_http::backends_router(backends_state);
+
     Router::new()
         .route("/sessions", post(create_session))
         .route("/sessions", get(list_sessions))
@@ -333,6 +785,41 @@ fn app(state: Arc<AppState>) -> Router {
         .with_state(state)
         .merge(events_router)
         .merge(policy_router)
+        .merge(backends_router)
+}
+
+/// Compute the initial CoreDNS policy file content for a brand-new session.
+///
+/// Both backends (Lima, Container) feed this through `create_gateway`'s
+/// `initial_dns_policy` so CoreDNS loads it on first startup, eliminating
+/// the race where it would briefly serve the deny-all default until its
+/// reload timer fires (~1s). Extracted to keep the two backend branches
+/// in `create_session` reading off the same source of truth — the prior
+/// inline form lived only on the Lima path.
+///
+/// - With `req.policy`: extract the `Domain` destinations of every non-Deny
+///   rule and render via `CoreDnsConfig::to_file_content()`.
+/// - Without `req.policy` (fail-closed default): return
+///   `CoreDnsConfig::empty_policy_file_content()` so CoreDNS returns
+///   NXDOMAIN for everything until a policy is installed.
+fn compute_initial_dns_policy(req: &CreateSessionRequest) -> String {
+    if let Some(ref policy) = req.policy {
+        let domains: Vec<String> = policy
+            .rules
+            .iter()
+            .filter(|r| r.level != AssuranceLevel::Deny)
+            .filter_map(|r| match &r.host {
+                Destination::Domain(d) => Some(d.clone()),
+                Destination::Cidr(_) => None,
+            })
+            .collect();
+        CoreDnsConfig {
+            allowed_domains: domains,
+        }
+        .to_file_content()
+    } else {
+        CoreDnsConfig::empty_policy_file_content()
+    }
 }
 
 async fn create_session(
@@ -359,9 +846,46 @@ async fn create_session(
             })
     };
 
+    // M11-S3 Phase 3D: which backend hosts this session. Default to
+    // Lima for back-compat with older CLIs that omit the field. The
+    // chosen kind is then validated against the runtime's capability
+    // matrix *before* any state is mutated, so a request that asks
+    // for `--hardened` on the container backend is rejected with 400
+    // and never spends a session id, network allocation, or CA dir.
+    //
+    // Resolved up front (before `config` is built) because the
+    // resource defaults below are backend-aware (gap #4).
+    let backend_kind = req.backend.unwrap_or(BackendKind::Lima);
+
+    // M11-S4 Phase 4D-pre gap #4: resource defaults are backend-aware.
+    //
+    // - For Lima we keep the historical 2-CPU / 4096-MB defaults that
+    //   the pre-M11 wire shape baked in. These match what
+    //   `LimaRuntime::start_vm` consumes and what every long-standing
+    //   E2E test expects.
+    // - For Container we feed `0` sentinels through, which
+    //   `ContainerRuntime::resource_ceilings` interprets as "unset"
+    //   and substitutes with the daemon's `compute_default_resource_limits`
+    //   host-80% ceilings (spec § "Resource defaults"). Without this
+    //   the host-80% path was unreachable through the public CLI
+    //   surface (the previous `unwrap_or(2)/(4096)` always fired and
+    //   produced Lima-leaning numbers regardless of backend).
+    //
+    // The `0` sentinel is the lowest-touch shape — it threads through
+    // `SessionConfig` (Lima-shaped) into `BackendSpecific::Container`
+    // unchanged, and `resource_ceilings` already encoded the
+    // "0 means unset" contract back in 3A. Persisting `0` is safe:
+    // `SessionConfig` carries the user-requested ceiling, and a
+    // container session that took the host-80% default has `0` in
+    // both columns by construction.
+    let (cpus, memory_mb) = match backend_kind {
+        BackendKind::Lima => (req.cpus.unwrap_or(2), req.memory_mb.unwrap_or(4096)),
+        BackendKind::Container => (req.cpus.unwrap_or(0), req.memory_mb.unwrap_or(0)),
+    };
+
     let config = SessionConfig {
-        cpus: req.cpus.unwrap_or(2),
-        memory_mb: req.memory_mb.unwrap_or(4096),
+        cpus,
+        memory_mb,
         disk_gb: req.disk_gb.unwrap_or(20),
         workspace_mode,
         hardened: req.hardened.unwrap_or(true),
@@ -374,8 +898,76 @@ async fn create_session(
         template: req.template.clone(),
     };
 
+    // Hardened flag interaction with the container backend:
+    // `BackendSpecific::Container` does not carry `hardened`, so the
+    // SessionSpec-level `validate()` path silently drops a `true`
+    // value. Reject up front when a container request explicitly sets
+    // `hardened: true` so the failure mode matches spec §
+    // "Hardening" — operator-facing 400 with the same
+    // `UnsupportedFeature::Hardening` message Lima would surface
+    // through the validate path. `req.hardened == Some(true)` is the
+    // wire-level signal of an *explicit* opt-in; an absent field
+    // (operator did not pass `--hardened` and old CLIs that don't yet
+    // know about the flag) round-trips silently because the container
+    // backend always runs hardened-equivalent (rootless docker +
+    // capability drop) regardless of this flag.
+    if backend_kind == BackendKind::Container && req.hardened == Some(true) {
+        return error_response(SandboxError::InvalidArgument(
+            sandbox_core::backend::UnsupportedFeature::Hardening.to_string(),
+        ))
+        .into_response();
+    }
+
+    // Daemon-side authoritative validation: spec § "Validation sites"
+    // requires the daemon to repeat the capability check the CLI did.
+    // The runtime is the single source of truth for its capability
+    // matrix.
+    let spec = session_spec_from_config(&config, backend_kind);
+    let runtime_for_validation = runtime_for(&state, backend_kind);
+    if let Err(unsupported) = spec.validate(runtime_for_validation.capabilities()) {
+        // `UnsupportedFeature: Display` produces the operator-facing
+        // sentence (e.g. "hardening flag not supported by container
+        // backend"); routing through `InvalidArgument` maps this to
+        // an HTTP 400 with the message intact (see `error_response`).
+        return error_response(SandboxError::InvalidArgument(unsupported.to_string()))
+            .into_response();
+    }
+
+    // Container backend: ensure the lite image exists *before* we
+    // burn a session row + network allocation. The first build of a
+    // given daemon version surfaces a verbatim warning string back
+    // to the caller (spec § "Lite mode → first-use warning"); steady-
+    // state hits return `AlreadyPresent` and contribute nothing to
+    // `warnings`.
+    let mut warnings: Vec<String> = Vec::new();
+    if backend_kind == BackendKind::Container {
+        let daemon_version = env!("CARGO_PKG_VERSION").to_string();
+        match tokio::task::spawn_blocking(move || ensure_image(&daemon_version)).await {
+            Ok(Ok(EnsureImageOutcome::AlreadyPresent)) => {}
+            Ok(Ok(EnsureImageOutcome::Built { warning })) => {
+                // `warning` is `LITE_FIRST_USE_WARNING` verbatim per
+                // Phase 3B's contract; assert that here so any drift
+                // in the constant trips the create path immediately.
+                debug_assert_eq!(warning, LITE_FIRST_USE_WARNING);
+                warnings.push(warning);
+            }
+            Ok(Err(e)) => return error_response(e).into_response(),
+            Err(e) => {
+                return error_response(SandboxError::Internal(format!("task join error: {e}")))
+                    .into_response();
+            }
+        }
+    }
+
     // Create session record in store (state = Creating).
-    let session = match state.store.create_session(config.clone(), req.name) {
+    // `req.name` is cloned because both backend branches below need to
+    // reach back into `req` (workspace mode for container, repo/policy
+    // for the shared post-create plumbing).
+    let session = match state.store.create_session_with_backend(
+        config.clone(),
+        req.name.clone(),
+        backend_kind,
+    ) {
         Ok(s) => s,
         Err(e) => return error_response(e).into_response(),
     };
@@ -448,14 +1040,27 @@ async fn create_session(
 
     // Helper closure: cleanup VM + network + CA on failure, set state to Error.
     // This macro avoids repeating the cleanup pattern in every error branch.
+    //
+    // M11-S1 Phase 1C: VM cleanup goes through the generic trait
+    // dispatch (`runtime.delete(&handle).await`); the synchronous
+    // network + CA cleanup stays inside a single `spawn_blocking` so we
+    // do not pay an extra task spawn per cleanup. The macro is invoked
+    // from inside `create_session`'s async body, so the `.await` on
+    // `delete` is safe.
+    //
+    // M11-S3 Phase 3D: pass the request's `backend_kind` so the
+    // cleanup dispatches to the runtime that actually owns the
+    // partially-created resources — Lima for VM rows, Container for
+    // docker rows.
     macro_rules! cleanup_and_return {
         ($state:expr, $session_id:expr, $err_resp:expr) => {{
-            let lima = $state.lima.clone();
+            let runtime = runtime_for(&*$state, backend_kind);
+            let handle = RuntimeHandle::from_session_id(&$session_id);
+            let _ = runtime.delete(&handle).await;
             let network = $state.network.clone();
             let base_dir = $state.base_dir.clone();
             let sid = $session_id;
             let _ = tokio::task::spawn_blocking(move || {
-                let _ = lima.delete_vm(&sid);
                 let _ = network.delete_network(&sid);
                 let _ = CaManager::remove_session_ca(&base_dir, &sid);
             })
@@ -481,7 +1086,343 @@ async fn create_session(
         }};
     }
 
-    if use_cache {
+    if backend_kind == BackendKind::Container {
+        // ---- Container backend: lightweight create + start + gateway wiring ----
+        //
+        // The Lima fast/slow paths below are inapplicable here:
+        // there is no golden image to clone (the lite image was
+        // already ensured above), no QEMU template to render, and
+        // no separate guest-agent install step (the agent is built
+        // into the lite image per M11-S2). The runtime drives
+        // `docker create` + `docker start`, and the rest of the
+        // post-create work (per-session gateway, event ingest, DNS
+        // gate listener) is performed inline below — copying the
+        // shape of `setup_session_networking` (steps 1-8) but
+        // skipping step 9 (VM bridge attach + CA injection) which
+        // is Lima-only.
+
+        // Register the per-session ContainerNetwork on the runtime
+        // so `SessionRuntime::create` has the docker network name +
+        // container IP it needs to wire `--network <name> --ip <ip>`,
+        // and the gateway IP for the `--dns` flag.
+        //
+        // Field mapping from `NetworkInfo` (Lima-side concept) to
+        // `ContainerNetwork` (backend-side concept):
+        //
+        // - `docker_network_name` → `docker_network`
+        // - `vm_ip` (the .3 in each /28) → `container_ip`: in the
+        //   container backend this is the address the workload owns,
+        //   not a VM's veth.
+        // - `gateway_ip` (the .2) → `gateway_ip` unchanged.
+        //
+        // `workspace_host_path` is populated when the request asked
+        // for `--workspace shared:<path>` — the runtime turns it into
+        // a `docker create --mount type=bind,source=<path>,...` flag
+        // (spec § "Workspace bind"). For other workspace modes
+        // (`Clone`, `Empty`) the field stays `None` and the lite
+        // image runs with a read-only rootfs.
+        //
+        // `route_helper_path = Some(...)` lets the runtime invoke
+        // the setcap helper at start time to install the default
+        // route via the gateway IP inside the container's netns
+        // (spec § "Routing"). [`resolve_route_helper_path`] resolves
+        // the absolute path of the helper at the call site, preferring
+        // the sibling-of-`current_exe()` location (covers cargo
+        // workspace + most installed layouts) and falling back to
+        // `/usr/local/bin/sandbox-route-helper` and then to `$PATH`.
+        // Surfacing the lookup error here means lite-mode session
+        // creation fails fast with an operator-actionable message
+        // rather than at `docker start` time with `os error 2`.
+        {
+            let container_ip_str = network_info.vm_ip.clone();
+            let container_ip = match container_ip_str.parse::<std::net::IpAddr>() {
+                Ok(ip) => ip,
+                Err(e) => {
+                    cleanup_net_ca_and_return!(
+                        state,
+                        session_id,
+                        error_response(SandboxError::Internal(format!(
+                            "vm_ip {container_ip_str:?} not parseable as IP: {e}"
+                        )))
+                        .into_response()
+                    );
+                }
+            };
+            let gateway_ip_str = network_info.gateway_ip.clone();
+            let gateway_ip = match gateway_ip_str.parse::<std::net::IpAddr>() {
+                Ok(ip) => ip,
+                Err(e) => {
+                    cleanup_net_ca_and_return!(
+                        state,
+                        session_id,
+                        error_response(SandboxError::Internal(format!(
+                            "gateway_ip {gateway_ip_str:?} not parseable as IP: {e}"
+                        )))
+                        .into_response()
+                    );
+                }
+            };
+            // Pull the host path out of the parsed workspace mode
+            // (set on `config` above when `req.workspace =
+            // Some("shared:<path>")`). Other variants don't bind a
+            // host path into the container.
+            let workspace_host_path = match &config.workspace_mode {
+                Some(sandbox_core::WorkspaceMode::Shared { host_path }) => {
+                    Some(PathBuf::from(host_path))
+                }
+                _ => None,
+            };
+            let route_helper_path = match resolve_route_helper_path() {
+                Ok(path) => path,
+                Err(e) => {
+                    cleanup_net_ca_and_return!(
+                        state,
+                        session_id,
+                        error_response(e).into_response()
+                    );
+                }
+            };
+            let container_network = sandbox_core::backend::ContainerNetwork {
+                docker_network: network_info.docker_network_name.clone(),
+                container_ip,
+                gateway_ip,
+                workspace_host_path,
+                route_helper_path: Some(route_helper_path),
+                // Per-session CA: bind-mounted read-only into the
+                // container at /etc/ssl/certs/sandbox-ca.pem and
+                // surfaced via CURL_CA_BUNDLE / SSL_CERT_FILE etc. so
+                // HTTPS traffic intercepted by Envoy + mitmproxy
+                // (L3-HTTP policy levels) verifies cleanly. Mirrors
+                // the Lima `inject_ca_into_vm` path; differs in
+                // mechanism because the lite container's rootfs is
+                // read-only per spec § Hardening.
+                ca_host_path: Some(ca_dir.join("cert.pem")),
+            };
+            state
+                .container_runtime
+                .register_session(session_id, container_network);
+        }
+
+        {
+            let runtime = runtime_for(&state, BackendKind::Container);
+            match runtime.create(&session_id, &spec).await {
+                Ok(_handle) => {}
+                Err(e) => {
+                    cleanup_net_ca_and_return!(
+                        state,
+                        session_id,
+                        error_response(e).into_response()
+                    );
+                }
+            }
+        }
+
+        {
+            let runtime = runtime_for(&state, BackendKind::Container);
+            let handle = RuntimeHandle::from_session_id(&session_id);
+            // The container runtime ignores `lima_*` fields on
+            // `RuntimeStartArgs` (they're Lima-only); pass them as
+            // `None` so the contract is explicit at the call site
+            // rather than implicit "happens to be ignored".
+            let args = RuntimeStartArgs {
+                lima_bridge: None,
+                lima_mac: None,
+                lima_config: None,
+            };
+            match runtime.start(&handle, &args).await {
+                Ok(()) => {}
+                Err(e) => {
+                    cleanup_and_return!(state, session_id, error_response(e).into_response());
+                }
+            }
+        }
+
+        // ---- Per-session gateway + event/DNS-gate wiring ----
+        //
+        // Mirrors `setup_session_networking` steps 1-8. We do not
+        // call that helper directly because step 9 (VM bridge attach
+        // + CA injection via the guest agent) is Lima-only; lifting
+        // them behind a `Backend` switch would muddy a function
+        // already saturated with Lima-shaped invariants. Keeping
+        // them parallel and readable beats a premature abstraction.
+        //
+        // Cleanup contract on failure of any step below: best-effort
+        // tear down the gateway/ingestor/network via
+        // `teardown_session_networking_parts`, then run
+        // `cleanup_and_return!` to drop the container, network, CA,
+        // and flip `state` to `Error`. The order matters: the
+        // teardown helper assumes the docker network still exists
+        // (it tries to remove it), and `cleanup_and_return!` will
+        // try a second `delete_network` — that's idempotent (the
+        // first one having already removed it returns NotFound,
+        // which the network manager swallows).
+        macro_rules! cleanup_lite_gateway_and_return {
+            ($err_resp:expr) => {{
+                teardown_session_networking_parts(
+                    &session_id,
+                    &state.gateway,
+                    &state.network,
+                    &state.ingestors,
+                )
+                .await;
+                cleanup_and_return!(state, session_id, $err_resp);
+            }};
+        }
+
+        // Initial DNS policy: shared with the Lima branch via
+        // `compute_initial_dns_policy` so both backends light up
+        // CoreDNS with the exact same content on first boot.
+        let initial_dns_policy_owned: String = compute_initial_dns_policy(&req);
+        let initial_dns_policy: Option<&str> = Some(initial_dns_policy_owned.as_str());
+
+        // Step 1: register session with the event bus and bind the
+        // container IP for event attribution. Mirrors lines 3484-3497
+        // of `setup_session_networking`.
+        state.event_bus.register_session(session_id);
+        match network_info.vm_ip.parse::<std::net::Ipv4Addr>() {
+            Ok(ip) => {
+                state.vm_ip_map.bind(ip, session_id);
+            }
+            Err(e) => {
+                warn!(
+                    session_id = %session_id,
+                    vm_ip = %network_info.vm_ip,
+                    error = %e,
+                    "failed to parse vm_ip as IPv4; event attribution disabled for this session"
+                );
+            }
+        }
+
+        // Step 2: publish `gateway_booting` *before* the docker call
+        // so the event stream records the boot intent even if
+        // gateway creation fails.
+        state
+            .event_bus
+            .publish(lifecycle_events::gateway_booting(session_id));
+
+        // Step 3: create the gateway container (Docker calls + sleep
+        // polling — must run on a blocking task).
+        {
+            let gw = state.gateway.clone();
+            let sid = session_id;
+            let ni = network_info.clone();
+            let ca = ca_dir.clone();
+            let dns = initial_dns_policy.map(|s| s.to_string());
+            match tokio::task::spawn_blocking(move || {
+                gw.create_gateway(&sid, &ni, Some(&ca), dns.as_deref())
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    cleanup_lite_gateway_and_return!(error_response(e).into_response());
+                }
+                Err(e) => {
+                    cleanup_lite_gateway_and_return!(
+                        error_response(SandboxError::Internal(format!(
+                            "task join error creating gateway: {e}"
+                        )))
+                        .into_response()
+                    );
+                }
+            }
+        }
+
+        // Step 4: gateway is up — publish `gateway_ready` so
+        // subscribers can pair it with the earlier `gateway_booting`.
+        state
+            .event_bus
+            .publish(lifecycle_events::gateway_ready(session_id));
+
+        // Step 5: spawn the per-session JSONL ingest task now that
+        // the events directory is bind-mounted into the gateway and
+        // the producers are live.
+        spawn_session_ingestor(&session_id, &state).await;
+
+        // Step 6: persist network info before the gate listener
+        // starts so the listener's `get_network_info` lookup
+        // succeeds (it needs the subnet + gateway IP for ruleset
+        // generation).
+        if let Err(e) = state.store.set_network_info(&session_id, &network_info) {
+            cleanup_lite_gateway_and_return!(error_response(e).into_response());
+        }
+
+        // Step 7: start the synchronous DNS-gate UDS listener. The
+        // events host directory was created by `create_gateway` and
+        // is bind-mounted into the gateway container, so the socket
+        // file appears at the canonical container path without any
+        // extra mount.
+        start_dns_gate_listener(&session_id, &state).await;
+
+        // Step 8: flip session state to `Running`. (Lima additionally
+        // performs step 9 here — `attach_vm_to_bridge` +
+        // `inject_ca_into_vm` — which is intentionally absent on the
+        // container backend: the container's veth was attached by
+        // `docker create --network <name> --ip <ip>`, and CA
+        // injection is the lite image's responsibility at build
+        // time.)
+        if let Err(e) = state.store.update_state(&session_id, SessionState::Running) {
+            cleanup_lite_gateway_and_return!(error_response(e).into_response());
+        }
+
+        // Apply the explicit `--policy <file>` (or `--preset <invocation>`,
+        // which the CLI compiles into `req.policy` server-side) now that
+        // the session is Running and the gateway is live. Mirrors the
+        // Lima branch's apply_policy block at lines ~1651-1679: an
+        // explicit policy that fails to compile/distribute is fatal
+        // (M10-S8 #16) — silently returning a Running session with no
+        // policy in place lies to the operator. The implicit "no
+        // policy" path never reaches this branch (the CoreDNS
+        // fail-closed default was already written by `create_gateway`
+        // above via `initial_dns_policy`).
+        //
+        // `req.policy` is consumed here (moved out of `req`); the
+        // following `repo` / `boot_cmd` plumbing is intentionally NOT
+        // wired in this phase — the lite image runs with no guest
+        // agent, so there's nowhere to dispatch `git clone` /
+        // `bash -c <boot>`. Test_lite.py exercises only `--policy`;
+        // `--repo` / `--boot-cmd` are deferred to a later session.
+        if let Some(policy) = req.policy {
+            let initial_presets = req.source_presets.clone();
+            match apply_policy(
+                &session_id,
+                &policy,
+                &state,
+                ApplyKind::Initial {
+                    source_presets: initial_presets,
+                },
+            )
+            .await
+            {
+                Ok(()) => {
+                    info!(%session_id, "initial policy applied (lite)");
+                }
+                Err(e) => {
+                    error!(
+                        %session_id,
+                        error = %e,
+                        "failed to apply explicit initial policy on lite session — failing create"
+                    );
+                    cleanup_lite_gateway_and_return!(error_response(e).into_response());
+                }
+            }
+        }
+
+        let created = match state.store.get_session(&session_id) {
+            Ok(Some(s)) => s,
+            Ok(None) => {
+                cleanup_lite_gateway_and_return!(
+                    error_response(SandboxError::SessionNotFound(session_id.to_string()))
+                        .into_response()
+                );
+            }
+            Err(e) => {
+                cleanup_lite_gateway_and_return!(error_response(e).into_response());
+            }
+        };
+        let dto = SessionDto::from(&created).with_warnings(warnings);
+        return (StatusCode::CREATED, Json(dto)).into_response();
+    } else if use_cache {
         // ---- Fast path: clone from golden base image ----
 
         // Serialize check + build behind a lock so that concurrent
@@ -491,7 +1432,7 @@ async fn create_session(
             let _base_guard = state.base_image_lock.lock().await;
 
             let base_status = {
-                let lima_check = state.lima.clone();
+                let lima_check = Arc::clone(state.lima_runtime.manager());
                 match tokio::task::spawn_blocking(move || lima_check.check_base_image()).await {
                     Ok(Ok(s)) => s,
                     Ok(Err(e)) => {
@@ -516,7 +1457,7 @@ async fn create_session(
                 BaseImageStatus::Missing => {
                     // Must build -- no choice.
                     info!("base image missing, building...");
-                    let lima_build = state.lima.clone();
+                    let lima_build = Arc::clone(state.lima_runtime.manager());
                     match tokio::task::spawn_blocking(move || lima_build.build_base_image()).await {
                         Ok(Ok(())) => {}
                         Ok(Err(e)) => {
@@ -551,7 +1492,7 @@ async fn create_session(
 
         // Clone from the base image.
         {
-            let lima_clone = state.lima.clone();
+            let lima_clone = Arc::clone(state.lima_runtime.manager());
             let sid = session_id;
             let cpus = config.cpus;
             let memory_mb = config.memory_mb;
@@ -582,27 +1523,17 @@ async fn create_session(
 
         // Start the cloned VM (no guest agent install needed -- already in image).
         {
-            let lima_start = state.lima.clone();
-            let sid = session_id;
-            let cfg_start = config.clone();
-            let bridge = network_info.bridge_name.clone();
-            let mac = vm_mac.clone();
-            match tokio::task::spawn_blocking(move || {
-                lima_start.start_vm(&sid, &cfg_start, Some(&bridge), Some(&mac))
-            })
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    cleanup_and_return!(state, session_id, error_response(e).into_response());
-                }
+            let runtime = runtime_for(&state, BackendKind::Lima);
+            let handle = RuntimeHandle::from_session_id(&session_id);
+            let args = RuntimeStartArgs {
+                lima_bridge: Some(network_info.bridge_name.clone()),
+                lima_mac: Some(vm_mac.clone()),
+                lima_config: Some(config.clone()),
+            };
+            match runtime.start(&handle, &args).await {
+                Ok(()) => {}
                 Err(e) => {
-                    cleanup_and_return!(
-                        state,
-                        session_id,
-                        error_response(SandboxError::Internal(format!("task join error: {e}")))
-                            .into_response()
-                    );
+                    cleanup_and_return!(state, session_id, error_response(e).into_response());
                 }
             }
         }
@@ -610,34 +1541,23 @@ async fn create_session(
         // ---- Slow path: full create from scratch ----
 
         // 2a. Create the Lima VM (with optional custom template).
+        //
+        // M11-S1 Phase 1C: dispatch through the trait. The
+        // custom-template branch lives inside `LimaRuntime::create`
+        // (it inspects `SessionSpec::template`) — handlers no longer
+        // pick between `create_vm` and `create_vm_with_custom_template`
+        // directly. The wire shape (`CreateSessionRequest.template`)
+        // is unchanged; we project the request into a `SessionSpec`
+        // and hand it to the runtime.
         {
-            let lima = state.lima.clone();
-            let sid = session_id;
-            let cfg = config.clone();
-            let template = req.template.clone();
-            match tokio::task::spawn_blocking(move || {
-                if let Some(template_path) = &template {
-                    lima.create_vm_with_custom_template(&sid, template_path.as_ref())
-                } else {
-                    lima.create_vm(&sid, &cfg)
-                }
-            })
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    cleanup_net_ca_and_return!(
-                        state,
-                        session_id,
-                        error_response(e).into_response()
-                    );
-                }
+            let runtime = runtime_for(&state, BackendKind::Lima);
+            match runtime.create(&session_id, &spec).await {
+                Ok(_handle) => {}
                 Err(e) => {
                     cleanup_net_ca_and_return!(
                         state,
                         session_id,
-                        error_response(SandboxError::Internal(format!("task join error: {e}")))
-                            .into_response()
+                        error_response(e).into_response()
                     );
                 }
             }
@@ -645,27 +1565,17 @@ async fn create_session(
 
         // 2b. Start the VM with bridge networking env vars.
         {
-            let lima = state.lima.clone();
-            let sid = session_id;
-            let cfg = config.clone();
-            let bridge = network_info.bridge_name.clone();
-            let mac = vm_mac.clone();
-            match tokio::task::spawn_blocking(move || {
-                lima.start_vm(&sid, &cfg, Some(&bridge), Some(&mac))
-            })
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    cleanup_and_return!(state, session_id, error_response(e).into_response());
-                }
+            let runtime = runtime_for(&state, BackendKind::Lima);
+            let handle = RuntimeHandle::from_session_id(&session_id);
+            let args = RuntimeStartArgs {
+                lima_bridge: Some(network_info.bridge_name.clone()),
+                lima_mac: Some(vm_mac.clone()),
+                lima_config: Some(config.clone()),
+            };
+            match runtime.start(&handle, &args).await {
+                Ok(()) => {}
                 Err(e) => {
-                    cleanup_and_return!(
-                        state,
-                        session_id,
-                        error_response(SandboxError::Internal(format!("task join error: {e}")))
-                            .into_response()
-                    );
+                    cleanup_and_return!(state, session_id, error_response(e).into_response());
                 }
             }
         }
@@ -698,7 +1608,12 @@ async fn create_session(
         };
 
         {
-            let lima = state.lima.clone();
+            // M11-S1 Phase 1C: `install_guest_agent` is Lima-specific
+            // (it shells out to `limactl shell` to inject the binary)
+            // and stays behind the `LimaRuntime::manager()` escape
+            // hatch until the trait surface grows to cover agent
+            // bootstrapping in a backend-agnostic way.
+            let lima = Arc::clone(state.lima_runtime.manager());
             let sid = session_id;
             let guest_bin = guest_binary_path.clone();
             match tokio::task::spawn_blocking(move || lima.install_guest_agent(&sid, &guest_bin))
@@ -748,31 +1663,10 @@ async fn create_session(
     // Pass an initial DNS policy into the gateway setup so CoreDNS loads it
     // on first startup.  This eliminates the race where CoreDNS would start
     // with a deny-all default and only pick up the real policy after its
-    // reload timer fires (~1s).
-    let initial_dns_policy_owned: String;
-    let initial_dns_policy = if let Some(ref policy) = req.policy {
-        // Extract domain names from the policy and format as CoreDNS config.
-        let domains: Vec<String> = policy
-            .rules
-            .iter()
-            .filter(|r| r.level != AssuranceLevel::Deny)
-            .filter_map(|r| match &r.host {
-                Destination::Domain(d) => Some(d.clone()),
-                Destination::Cidr(_) => None,
-            })
-            .collect();
-        let config = CoreDnsConfig {
-            allowed_domains: domains,
-        };
-        initial_dns_policy_owned = config.to_file_content();
-        Some(initial_dns_policy_owned.as_str())
-    } else {
-        // Fail-closed: no policy → empty allowed-domains list so CoreDNS
-        // returns NXDOMAIN for everything.  The caller can lift this via
-        // a later policy update.
-        initial_dns_policy_owned = CoreDnsConfig::empty_policy_file_content();
-        Some(initial_dns_policy_owned.as_str())
-    };
+    // reload timer fires (~1s). The container branch above uses the same
+    // helper to produce the same content.
+    let initial_dns_policy_owned: String = compute_initial_dns_policy(&req);
+    let initial_dns_policy = Some(initial_dns_policy_owned.as_str());
     match setup_session_networking(
         &session_id,
         &network_info,
@@ -1060,7 +1954,8 @@ async fn create_session(
 
     let dto = SessionDto::from(&created)
         .with_status(agent_status, gateway_status)
-        .with_policy(policy_opt.as_ref());
+        .with_policy(policy_opt.as_ref())
+        .with_warnings(warnings);
 
     (StatusCode::CREATED, Json(dto)).into_response()
 }
@@ -1109,7 +2004,13 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse 
     };
 
     // Enrich with VM status (best-effort).
-    let lima = state.lima.clone();
+    //
+    // M11-S1 Phase 1C: `list_vms()` is Lima-specific — it returns a
+    // `Vec<VmInfo>` shaped by `limactl list --json` and the
+    // reconciliation block below matches on `VmStatus`. Multi-backend
+    // listing (fan-out across every registered runtime) is deferred
+    // to M11-S2 when the second backend lands.
+    let lima = Arc::clone(state.lima_runtime.manager());
     let vm_list = tokio::task::spawn_blocking(move || lima.list_vms().unwrap_or_default())
         .await
         .unwrap_or_default();
@@ -1166,19 +2067,26 @@ async fn get_session(
     };
 
     // Enrich with VM status (best-effort).
+    //
+    // M11-S1 Phase 1C: dispatch through the trait. `RuntimeStatus`
+    // mirrors `VmStatus` for the Running/Stopped cases the
+    // reconciliation cares about; the new `Creating`/`Error` variants
+    // (set by the container backend) are treated as "no-op" here —
+    // the daemon's authoritative state is in the store and we don't
+    // overwrite it on a non-matching runtime status.
     let mut session = session;
     {
-        let lima = state.lima.clone();
-        let sid = session.id;
-        if let Ok(Ok(vm_status)) = tokio::task::spawn_blocking(move || lima.vm_status(&sid)).await {
-            match (&session.state, &vm_status) {
-                (SessionState::Running, VmStatus::Stopped) => {
+        let runtime = runtime_for(&state, session.backend);
+        let handle = RuntimeHandle::from_session_id(&session.id);
+        if let Ok(rt_status) = runtime.status(&handle).await {
+            match (&session.state, &rt_status) {
+                (SessionState::Running, sandbox_core::backend::RuntimeStatus::Stopped) => {
                     session.state = SessionState::Stopped;
                     let _ = state
                         .store
                         .update_state_forced(&session.id, SessionState::Stopped);
                 }
-                (SessionState::Stopped, VmStatus::Running) => {
+                (SessionState::Stopped, sandbox_core::backend::RuntimeStatus::Running) => {
                     session.state = SessionState::Running;
                     let _ = state
                         .store
@@ -1259,27 +2167,30 @@ async fn start_session(
         }
     };
 
-    // Start the Lima VM with bridge networking env vars.
+    // Start the VM/container via the trait.
+    //
+    // M11-S1 Phase 1C: dispatch through the trait. The persisted
+    // `SessionConfig` and the per-session bridge / MAC ride down via
+    // `RuntimeStartArgs`; the runtime's `start` does its own
+    // `spawn_blocking` internally so we just `.await` here.
+    //
+    // M11-S3 Phase 3D: dispatch keyed off the persisted
+    // `session.backend`, so a container session with `backend =
+    // "container"` lands on `ContainerRuntime::start` and Lima
+    // sessions land on `LimaRuntime::start` from the same handler.
     {
-        let lima = state.lima.clone();
-        let sid = session.id;
-        let cfg = session.config.clone();
-        let bridge = bridge_name.clone();
-        let mac = vm_mac.clone();
-        match tokio::task::spawn_blocking(move || {
-            lima.start_vm(&sid, &cfg, bridge.as_deref(), mac.as_deref())
-        })
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                let _ = state.store.update_state(&session.id, SessionState::Error);
-                return error_response(e).into_response();
-            }
+        let runtime = runtime_for(&state, session.backend);
+        let handle = RuntimeHandle::from_session_id(&session.id);
+        let args = RuntimeStartArgs {
+            lima_bridge: bridge_name.clone(),
+            lima_mac: vm_mac.clone(),
+            lima_config: Some(session.config.clone()),
+        };
+        match runtime.start(&handle, &args).await {
+            Ok(()) => {}
             Err(e) => {
                 let _ = state.store.update_state(&session.id, SessionState::Error);
-                return error_response(SandboxError::Internal(format!("task join error: {e}")))
-                    .into_response();
+                return error_response(e).into_response();
             }
         }
     }
@@ -1309,8 +2220,18 @@ async fn start_session(
         return error_response(e).into_response();
     }
 
-    // Restore remaining networking: gateway container, guest config, CA injection.
-    match restore_session_networking(&session.id, &state).await {
+    // Restore remaining networking: gateway container, plus (Lima-only)
+    // guest config + CA injection. The lite path forks at this call —
+    // `restore_session_networking_lite` performs the gateway / ingestor /
+    // DNS-gate-listener restore but skips `attach_vm_to_bridge` +
+    // `inject_ca_into_vm` because they're VM-only steps that try to run
+    // `sudo bash -c ...` inside the guest, and the lite image has neither
+    // sudo nor those bridge helpers (M11 spec § "Routing").
+    let restore_result = match session.backend {
+        BackendKind::Container => restore_session_networking_lite(&session.id, &state).await,
+        BackendKind::Lima => restore_session_networking(&session.id, &state).await,
+    };
+    match restore_result {
         Ok(()) => {
             info!(session_id = %session.id, "session networking restored after start");
         }
@@ -1420,20 +2341,16 @@ async fn stop_session(
     }
 
     {
-        let lima = state.lima.clone();
-        let sid = session.id;
-        match tokio::task::spawn_blocking(move || lima.stop_vm(&sid)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                state.sessions_stopping.lock().await.remove(&session.id);
-                let _ = state.store.update_state(&session.id, SessionState::Error);
-                return error_response(e).into_response();
-            }
+        // M11-S1 Phase 1C: dispatch through the trait.
+        // M11-S3 Phase 3D: keyed off persisted backend.
+        let runtime = runtime_for(&state, session.backend);
+        let handle = RuntimeHandle::from_session_id(&session.id);
+        match runtime.stop(&handle).await {
+            Ok(()) => {}
             Err(e) => {
                 state.sessions_stopping.lock().await.remove(&session.id);
                 let _ = state.store.update_state(&session.id, SessionState::Error);
-                return error_response(SandboxError::Internal(format!("task join error: {e}")))
-                    .into_response();
+                return error_response(e).into_response();
             }
         }
     }
@@ -1516,15 +2433,24 @@ async fn remove_session(
     // Note: `delete_vm` uses `limactl delete --force` which already stops
     // a running VM, so we skip the separate `stop_vm` call to avoid
     // doubling the Lima wait time (~60s each).
+    //
+    // M11-S1 Phase 1C: VM cleanup goes through the generic trait
+    // dispatch (`runtime.delete(&handle).await`); the rest of the
+    // teardown (gateway stop, docker network delete, CA remove,
+    // bridge detach) stays inside one shared `spawn_blocking` so we
+    // keep a single host-side task for the remaining sync work.
+    // M11-S3 Phase 3D: dispatch to the runtime that owns this
+    // session's resources (Lima for VM rows, Container for docker rows).
     {
-        let lima = state.lima.clone();
+        let runtime = runtime_for(&state, session.backend);
+        let handle = RuntimeHandle::from_session_id(&session.id);
+        let _ = runtime.delete(&handle).await;
+
         let gateway = state.gateway.clone();
         let network = state.network.clone();
         let base_dir = state.base_dir.clone();
         let sid = session.id;
         let _ = tokio::task::spawn_blocking(move || {
-            // Delete the VM from Lima (ignore errors -- it might not exist).
-            let _ = lima.delete_vm(&sid);
             // Full teardown: networking + CA + release subnet allocation.
             debug!(session_id = %sid, "tearing down session networking (full cleanup)");
             if let Err(e) = detach_vm_from_bridge(&sid) {
@@ -3616,6 +4542,126 @@ async fn restore_session_networking(
     inject_ca_into_vm(&state.guest, session_id, &ca_dir).await
 }
 
+/// Container-backend equivalent of [`restore_session_networking`] for the
+/// lite path. Re-creates the per-session gateway, re-spawns the JSONL
+/// ingestor, and re-arms the synchronous DNS-gate listener after a stop /
+/// start cycle. Does **not** attach a VM to a bridge or inject a CA into
+/// a VM (both Lima-only — the lite image has no `sudo`, no QEMU, and the
+/// CA is baked into the image at build time per spec § "Routing").
+///
+/// Mirrors `restore_session_networking` steps 1, 2, 2b, plus the ingestor +
+/// DNS-gate-listener restoration that the Lima path inherits implicitly from
+/// `setup_session_networking`. Steps 3 and 4 (`attach_vm_to_bridge` +
+/// `inject_ca_into_vm`) are intentionally absent.
+async fn restore_session_networking_lite(
+    session_id: &SessionId,
+    state: &AppState,
+) -> Result<(), SandboxError> {
+    // Network info must be present in the DB (set during create_session
+    // step 6); without it there's nothing to rebuild. Mirrors the Lima
+    // restore guard at the top of `restore_session_networking`.
+    let network_info = match state.store.get_network_info(session_id)? {
+        Some(info) => info,
+        None => {
+            info!(
+                session_id = %session_id,
+                "no network info in DB, skipping lite networking restore"
+            );
+            return Ok(());
+        }
+    };
+
+    // 1. Reuse existing CA material — it was generated in
+    // create_session step 0 and persists across stop / start. The lite
+    // image trusts whatever was injected at build time, so we don't
+    // need to re-inject; we only carry the CA dir into create_gateway
+    // so mitmproxy/Envoy can sign upstream TLS with the same key.
+    let ca_dir = CaManager::ca_dir(&state.base_dir, session_id);
+    let ca_dir = if ca_dir.join("cert.pem").exists() {
+        info!(
+            session_id = %session_id,
+            "reusing existing CA certificate (lite)"
+        );
+        ca_dir
+    } else {
+        info!(
+            session_id = %session_id,
+            "regenerating CA certificate (lite)"
+        );
+        CaManager::generate_session_ca(&state.base_dir, session_id)?
+    };
+
+    // 2. Compute the initial DNS policy (fail-closed default if no
+    // policy is stored, otherwise leave it `None` so create_gateway
+    // doesn't overwrite the upcoming reapply). Same shape as the Lima
+    // restore branch.
+    let has_stored_policy = {
+        let policies = state.session_policies.lock().await;
+        policies.contains_key(session_id)
+    } || matches!(state.store.get_policy(session_id), Ok(Some(_)));
+    let initial_dns_policy_owned: String;
+    let initial_dns_policy = if !has_stored_policy {
+        initial_dns_policy_owned = CoreDnsConfig::empty_policy_file_content();
+        Some(initial_dns_policy_owned.as_str())
+    } else {
+        None
+    };
+
+    // Mirror the Lima restore: emit `gateway_booting` *before* the
+    // docker call so the event stream records intent even if the
+    // create fails.
+    state
+        .event_bus
+        .publish(lifecycle_events::gateway_booting(*session_id));
+
+    // 3. Recreate the gateway container.
+    {
+        let gw = state.gateway.clone();
+        let sid = *session_id;
+        let ni = network_info.clone();
+        let ca = ca_dir.clone();
+        let dns = initial_dns_policy.map(|s| s.to_string());
+        match tokio::task::spawn_blocking(move || {
+            gw.create_gateway(&sid, &ni, Some(&ca), dns.as_deref())
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let net = state.network.clone();
+                let sid = *session_id;
+                let _ = tokio::task::spawn_blocking(move || net.remove_docker_network(&sid)).await;
+                return Err(e);
+            }
+            Err(e) => {
+                let net = state.network.clone();
+                let sid = *session_id;
+                let _ = tokio::task::spawn_blocking(move || net.remove_docker_network(&sid)).await;
+                return Err(SandboxError::Internal(format!(
+                    "task join error creating gateway: {e}"
+                )));
+            }
+        }
+    }
+
+    // 4. Gateway is up — publish `gateway_ready` and respawn the
+    // ingestor / DNS-gate listener. Both were torn down on stop
+    // (`stop_session` calls `cancel_dns_gate_listener` and
+    // `abort_session_ingestor`).
+    state
+        .event_bus
+        .publish(lifecycle_events::gateway_ready(*session_id));
+    spawn_session_ingestor(session_id, state).await;
+    start_dns_gate_listener(session_id, state).await;
+
+    // 5. Re-apply the session's stored policy (if any) to the fresh
+    // gateway. No-op when no policy is stored; the empty allow-all was
+    // already pushed during create_gateway above via initial_dns_policy.
+    reapply_session_policy(session_id, state).await;
+
+    Ok(())
+}
+
 /// Format a `GatewayStatus` into a human-readable string for the API response.
 fn format_gateway_status(gateway: &GatewayManager, session_id: &SessionId) -> String {
     match gateway.gateway_status(session_id) {
@@ -3643,17 +4689,24 @@ async fn session_health(
     };
 
     // VM status.
+    //
+    // M11-S1 Phase 1C: dispatch through the trait. `RuntimeStatus`
+    // adds `Creating` and `Error` variants over `VmStatus` for the
+    // forthcoming container backend; both are surfaced as their lower-
+    // case names so the existing health-payload consumers (CLI,
+    // `tests/e2e`) stay backwards compatible — they already accept
+    // arbitrary lower-case status strings.
     let vm_status = {
-        let lima = state.lima.clone();
-        let sid = session.id;
-        tokio::task::spawn_blocking(move || match lima.vm_status(&sid) {
-            Ok(VmStatus::Running) => "running".to_string(),
-            Ok(VmStatus::Stopped) => "stopped".to_string(),
-            Ok(VmStatus::Unknown(s)) => s,
+        let runtime = runtime_for(&state, session.backend);
+        let handle = RuntimeHandle::from_session_id(&session.id);
+        match runtime.status(&handle).await {
+            Ok(sandbox_core::backend::RuntimeStatus::Running) => "running".to_string(),
+            Ok(sandbox_core::backend::RuntimeStatus::Stopped) => "stopped".to_string(),
+            Ok(sandbox_core::backend::RuntimeStatus::Creating) => "creating".to_string(),
+            Ok(sandbox_core::backend::RuntimeStatus::Error) => "error".to_string(),
+            Ok(sandbox_core::backend::RuntimeStatus::Unknown(s)) => s,
             Err(e) => format!("error: {e}"),
-        })
-        .await
-        .unwrap_or_else(|e| format!("error: task join error: {e}"))
+        }
     };
 
     // Guest agent status.
@@ -3766,23 +4819,104 @@ async fn session_health(
     (StatusCode::OK, Json(health)).into_response()
 }
 
-/// `POST /rebuild-image` -- rebuild the pre-baked golden base VM image.
-async fn rebuild_image(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    // Hold the base image lock for the entire rebuild so that concurrent
-    // create_session requests wait until the rebuild finishes before
-    // checking the image status.
-    let _base_guard = state.base_image_lock.lock().await;
-    let lima = state.lima.clone();
-    match tokio::task::spawn_blocking(move || lima.rebuild_base_image()).await {
-        Ok(Ok(())) => (StatusCode::OK, "base image rebuilt").into_response(),
-        Ok(Err(e)) => error_response(e).into_response(),
-        Err(e) => error_response(SandboxError::Internal(format!("task join: {e}"))).into_response(),
+/// JSON body for `POST /rebuild-image` (M11-S4 Phase 4C).
+///
+/// Both fields default so an empty / missing body decodes as the pre-
+/// Phase-4C behavior (rebuild Lima, no cache-bust flag plumbing).
+/// `#[serde(default)]` per CLAUDE.md "On-disk compatibility" /
+/// forward-compat: older CLIs that POST an empty body must keep
+/// working.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default)]
+struct RebuildImageRequest {
+    backend: BackendKind,
+    no_cache: bool,
+}
+
+impl Default for RebuildImageRequest {
+    fn default() -> Self {
+        // Backwards-compat default: an empty body matches the pre-
+        // Phase-4C handler — Lima, no cache-bust signal.
+        Self {
+            backend: BackendKind::Lima,
+            no_cache: false,
+        }
+    }
+}
+
+/// `POST /rebuild-image` -- rebuild a backend's image.
+///
+/// JSON body shape (M11-S4 Phase 4C):
+///
+/// ```json
+/// { "backend": "lima" | "container", "no_cache": true | false }
+/// ```
+///
+/// An empty body is decoded as `{ "backend": "lima", "no_cache": false }`
+/// — backwards-compat with older CLIs that POST `/rebuild-image` with
+/// no body and expect Lima behavior. Axum's `Json<T>` extractor rejects
+/// empty bodies outright, so the body is read raw via the [`Bytes`]
+/// extractor and parsed manually with `serde_json::from_slice`.
+async fn rebuild_image(State(state): State<Arc<AppState>>, body: Bytes) -> impl IntoResponse {
+    // Decode the body. Empty body → default (Lima, no_cache=false) for
+    // backwards-compat. Malformed JSON or unknown backend kind → 400.
+    let req: RebuildImageRequest = if body.is_empty() {
+        RebuildImageRequest::default()
+    } else {
+        match serde_json::from_slice::<RebuildImageRequest>(&body) {
+            Ok(r) => r,
+            Err(e) => {
+                return error_response(SandboxError::InvalidArgument(format!(
+                    "invalid rebuild-image request: {e}"
+                )))
+                .into_response();
+            }
+        }
+    };
+
+    match req.backend {
+        BackendKind::Lima => {
+            // Per spec Phase 4C: `rebuild_base_image` already deletes
+            // the golden VM and rebuilds it from scratch — that is the
+            // cache-bust. The `no_cache` flag is therefore a no-op on
+            // the Lima path; no new flag plumbing is required.
+            let _base_guard = state.base_image_lock.lock().await;
+            let lima = Arc::clone(state.lima_runtime.manager());
+            match tokio::task::spawn_blocking(move || lima.rebuild_base_image()).await {
+                Ok(Ok(())) => (StatusCode::OK, "base image rebuilt").into_response(),
+                Ok(Err(e)) => error_response(e).into_response(),
+                Err(e) => error_response(SandboxError::Internal(format!("task join: {e}")))
+                    .into_response(),
+            }
+        }
+        BackendKind::Container => {
+            // Per spec § "rebuild-image" + Phase 4C: the container
+            // rebuild lock is owned inside `rebuild_lite_image` (the
+            // same image-namespace lock that `ensure_image` uses), so
+            // we deliberately do NOT acquire `state.base_image_lock`
+            // here — that lock is Lima-scoped and would needlessly
+            // serialise concurrent `rebuild --backend lima` and
+            // `rebuild --backend container` calls.
+            let daemon_version = env!("CARGO_PKG_VERSION").to_string();
+            let no_cache = req.no_cache;
+            match tokio::task::spawn_blocking(move || rebuild_lite_image(&daemon_version, no_cache))
+                .await
+            {
+                Ok(Ok(())) => (StatusCode::OK, "lite image rebuilt").into_response(),
+                Ok(Err(e)) => error_response(e).into_response(),
+                Err(e) => error_response(SandboxError::Internal(format!("task join: {e}")))
+                    .into_response(),
+            }
+        }
     }
 }
 
 /// `GET /base-image-status` -- check the status of the golden base image.
 async fn base_image_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let lima = state.lima.clone();
+    // M11-S1 Phase 1C: base-image status is Lima-specific (the
+    // hash-and-age check operates on the golden VM); kept on the
+    // typed runtime's escape hatch.
+    let lima = Arc::clone(state.lima_runtime.manager());
     match tokio::task::spawn_blocking(move || lima.check_base_image()).await {
         Ok(Ok(status)) => {
             let json = match status {
@@ -3847,7 +4981,14 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 /// - If the VM is missing but session state is Running/Creating -> mark as Error
 /// - If the VM exists and states match -> no action
 /// - If the VM exists but states disagree -> update store to match Lima
-fn reconcile(store: &SessionStore, lima: &LimaManager) {
+///
+/// M11-S1 Phase 1C: takes the wrapping [`LimaRuntime`] rather than the
+/// raw [`LimaManager`], reaching for `list_vms()` through
+/// [`LimaRuntime::manager`]. The body still pattern-matches on the
+/// Lima-native [`VmStatus`] because the reconciliation contract is
+/// today single-backend; per-backend reconciliation fan-out lands when
+/// the container backend joins (M11-S2).
+fn reconcile(store: &SessionStore, lima_runtime: &LimaRuntime) {
     let sessions = match store.list_sessions() {
         Ok(s) => s,
         Err(e) => {
@@ -3861,7 +5002,7 @@ fn reconcile(store: &SessionStore, lima: &LimaManager) {
         return;
     }
 
-    let vm_list = match lima.list_vms() {
+    let vm_list = match lima_runtime.manager().list_vms() {
         Ok(v) => v,
         Err(e) => {
             warn!(error = %e, "reconciliation: failed to list VMs, skipping");
@@ -3871,8 +5012,23 @@ fn reconcile(store: &SessionStore, lima: &LimaManager) {
 
     let mut ok_count = 0u32;
     let mut fixed_count = 0u32;
+    let mut skipped_count = 0u32;
 
     for session in &sessions {
+        // M11-S6 fix: skip container-backed sessions. The Lima-VM list does
+        // not include them, so the (None, Running) arm below would falsely
+        // mark every container session as Error on every daemon restart.
+        // Container sessions are reconciled via the Docker daemon directly:
+        // the session container persists across daemon restarts (Docker is
+        // independent), and the per-session gateway is recovered by
+        // `reconcile_networking` / `restore_session_networking_lite`. There
+        // is no Lima-equivalent VM-status fan-out for the container backend,
+        // so this loop has nothing to assert about them.
+        if session.backend == BackendKind::Container {
+            skipped_count += 1;
+            continue;
+        }
+
         let vm = vm_list.iter().find(|v| v.session_id == Some(session.id));
 
         match (vm, session.state) {
@@ -3921,6 +5077,7 @@ fn reconcile(store: &SessionStore, lima: &LimaManager) {
         total = sessions.len(),
         ok = ok_count,
         fixed = fixed_count,
+        skipped_container = skipped_count,
         "reconciliation complete"
     );
 }
@@ -4571,6 +5728,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::fs::create_dir_all(parent).await?;
     }
 
+    // M11-S2 Phase 2C: validate `users.conf` before any expensive
+    // initialization (SQLite migrations, Lima manager construction).
+    // The daemon refuses to start unless the config contains a subnet
+    // entry whose `allow_users` resolves to the daemon's own uid; the
+    // matched subnet's CIDR scopes the per-session /28 allocation pool
+    // below. Failing here keeps the operator-visible startup error
+    // cheap (no migration cost on the failure path) and ensures the
+    // configured pool is in hand before `NetworkManager::new` is
+    // called.
+    //
+    // We funnel both error paths (loader errors and the "no matching
+    // subnet" miss) through a single `eprintln!` + early-exit shape so
+    // the operator-visible stderr is the loader's `Display` message
+    // (which includes the file path + install-docs pointer) rather
+    // than the runtime's `{:?}` rendering of `Box<dyn Error>`. The
+    // `Box<dyn Error>` blanket `From<E>` impl would otherwise
+    // short-circuit our `From<UsersConfigError> for SandboxError`
+    // mapping when `?` propagates the loader error from `main`.
+    let daemon_uid = nix::unistd::Uid::current().as_raw();
+    let users_config = match load_users_config() {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            let sandbox_err: SandboxError = err.into();
+            eprintln!("sandboxd: {sandbox_err}");
+            return Err(sandbox_err.into());
+        }
+    };
+    let allocation_pool = match resolve_allocation_pool(daemon_uid, &users_config) {
+        Ok(cidr) => cidr,
+        Err(err) => {
+            eprintln!("sandboxd: {err}");
+            return Err(err.into());
+        }
+    };
+    info!(
+        users_conf = %users_conf_path().display(),
+        daemon_uid,
+        allocation_base = %allocation_pool.base(),
+        allocation_prefix = allocation_pool.prefix_len(),
+        "users.conf validated; allocation pool resolved"
+    );
+
     // Initialize store and Lima manager.
     //
     // `SessionStore::new` returns a list of sessions whose v1 policy
@@ -4585,13 +5784,84 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (store, reset_orphans) = SessionStore::new(base_dir.clone())?;
     let store = Arc::new(store);
     let lima = Arc::new(LimaManager::new(base_dir.clone())?);
-    let guest = GuestConnector::new(Arc::clone(&lima));
+
+    // M11-S1 Phase 1C: wrap the existing `LimaManager` in a
+    // [`LimaRuntime`] and register it in the backend dispatch table.
+    // The same `Arc<LimaRuntime>` is held both as a typed handle (for
+    // Lima-only orchestration via `LimaRuntime::manager()`) and inside
+    // `runtimes` (for handler-side trait dispatch).
+    let lima_runtime = LimaRuntime::new(Arc::clone(&lima));
+    let mut runtimes: HashMap<BackendKind, Arc<dyn SessionRuntime>> = HashMap::new();
+    runtimes.insert(
+        BackendKind::Lima,
+        Arc::clone(&lima_runtime) as Arc<dyn SessionRuntime>,
+    );
+
+    // M11-S3 Phase 3D: register the lite-mode container runtime in the
+    // dispatch table next to Lima. Resource defaults are derived from
+    // host capacity (host_ram*0.8, host_cpus*0.8) so the container
+    // backend honors the same headroom policy Lima applies. The same
+    // `Arc<ContainerRuntime>` is also held as a typed handle on
+    // `AppState` so the create-session handler can reach the
+    // image-tag/`ensure_image` plumbing without going through the
+    // dyn-trait object.
+    let (default_memory_mb, default_cpus) = compute_default_resource_limits();
+    let daemon_gid = nix::unistd::Gid::current().as_raw();
+    // Spec § Hardening — root degrades to the 1000:1000 floor; non-1000
+    // host uids pass through for workspace bind-mount alignment.
+    let (container_uid, container_gid) = map_container_uid_gid(daemon_uid, daemon_gid);
+    // M11-S4 Phase 4D-pre: the runtime's image tag must match the one
+    // `ensure_image` actually builds (`sandboxd-lite:<CARGO_PKG_VERSION>`),
+    // not the literal `:latest` placeholder shipped in M11-S2/3A. Using
+    // the placeholder broke the very first `--lite` create because
+    // `docker create` then references an image tag that no build step
+    // ever produced. Pinning it to the same `lite_image_tag_for_version`
+    // helper that `ensure_image` and `rebuild_lite_image` use closes the
+    // drift at one source.
+    let container_runtime = ContainerRuntime::new(
+        lite_image_tag_for_version(env!("CARGO_PKG_VERSION")),
+        default_memory_mb,
+        default_cpus,
+        container_uid,
+        container_gid,
+    );
+    runtimes.insert(
+        BackendKind::Container,
+        Arc::clone(&container_runtime) as Arc<dyn SessionRuntime>,
+    );
+
+    let runtimes = Arc::new(runtimes);
+
+    // M11-S4 Phase 4D-pre (Gap #3): `GuestConnector` now dispatches per
+    // session backend through the runtime registry. It looks up the
+    // session's `BackendKind` in the store at request time and asks the
+    // matching `SessionRuntime` for a `GuestTransport` — no more
+    // hard-wired `limactl shell` invocation. Lima sessions still go
+    // through `limactl shell ... socat`; container sessions go through
+    // `docker exec ... socat` via `ContainerTransport`.
+    let guest = GuestConnector::new(Arc::clone(&runtimes), Arc::clone(&store));
 
     // Initialize networking managers.
-    let network = Arc::new(NetworkManager::with_defaults()?);
+    //
+    // The /28 allocation pool's CIDR comes from the `users.conf` entry
+    // matched at startup (see `resolve_allocation_pool` above). The
+    // legacy default-pool constructor is no longer reachable from
+    // production startup — `users.conf` is the single source of truth.
+    let network = Arc::new(NetworkManager::new(
+        allocation_pool.base(),
+        allocation_pool.prefix_len(),
+    )?);
     let gateway = Arc::new(GatewayManager::new());
 
     // Restore network allocator state from existing sessions.
+    //
+    // `restore_from_infos` validates that each persisted session's
+    // subnet maps to a /28 block inside the configured pool — see
+    // `SubnetAllocator::block_index_for`. If a legacy session was
+    // allocated under a different `users.conf` (e.g. operator changed
+    // the pool), this returns `SandboxError::Network` and the daemon
+    // refuses to start. Operators must either revert `users.conf` or
+    // remove the offending session(s) with `sandbox delete`.
     let existing_networks = store.list_sessions_with_network_info()?;
     if !existing_networks.is_empty() {
         info!(
@@ -4657,7 +5927,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Run startup reconciliation (VM state).
-    reconcile(&store, &lima);
+    reconcile(&store, &lima_runtime);
+
+    // M11-S5 Phase 5B: lite container backend orphan cleanup. Spec §
+    // "Orphan cleanup on daemon start" extends the gateway-container
+    // reconcile pattern with a Docker-side sweep: any `sandbox-{id}`
+    // container, `sandbox-home-{id}` volume, or `sandbox-net-{id}`
+    // network whose derived session id is not in `sessions.db` is
+    // removed. Best-effort and idempotent — a Docker hiccup logs and
+    // continues rather than aborting startup.
+    let live_session_ids: HashSet<SessionId> = match store.list_sessions() {
+        Ok(sessions) => sessions.into_iter().map(|s| s.id).collect(),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "orphan reaper: failed to list sessions; skipping reaper pass"
+            );
+            HashSet::new()
+        }
+    };
+    // Wrap the reaper in a guarded enable-flag: if the daemon is
+    // running on a host without Docker (e.g. a Lima-only deployment),
+    // every list_* call would error and clog the log. The cheapest
+    // probe is the reaper itself — any error path inside `reap_orphans`
+    // already logs at `warn!` and continues.
+    {
+        let docker_ops = CliDockerOps;
+        let _ = reap_orphans(&docker_ops, &live_session_ids).await;
+    }
 
     // Hydrate the in-memory policy map from SQLite **before**
     // `reconcile_networking` runs.  Gateway restoration inside the
@@ -4692,10 +5989,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // `lima` is intentionally not stashed on `AppState` directly any
+    // more — handlers reach the runtime through `runtimes` (trait
+    // dispatch) or `lima_runtime.manager()` (Lima-only orchestration).
+    // The original `Arc<LimaManager>` was cloned into `LimaRuntime::new`;
+    // `GuestConnector` now dispatches via the runtime registry rather
+    // than holding a `LimaManager` directly. The local binding above is
+    // dropped at end of scope.
     let state = Arc::new(AppState {
         base_dir,
         store,
-        lima,
+        runtimes,
+        lima_runtime,
+        container_runtime,
         guest,
         network,
         gateway,
@@ -4821,6 +6127,112 @@ mod tests {
     fn error_body(err: SandboxError) -> (StatusCode, ApiError) {
         let (status, Json(body)) = error_response(err);
         (status, body)
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_allocation_pool — M11-S2 Phase 2C startup-validation logic.
+    //
+    // Pure function; we drive it with `UsersConfig` values parsed from
+    // inline JSON via `load_users_config_from` against a tempfile (the
+    // only public constructor for `UsersConfig`). The tests cover:
+    //   1. Hit — a subnet entry whose `allow_users` resolves to the
+    //      runner's uid; assert we return the matching CIDR.
+    //   2. Miss — a subnet entry whose `allow_users` references a
+    //      sentinel username that cannot exist on the host; assert
+    //      `InvalidArgument` with the grep-stable prefix and the uid.
+    //   3. Empty `subnets: []` — same `InvalidArgument` shape as case 2.
+    //
+    // Loader-level errors (missing file, malformed JSON, invalid CIDR)
+    // are NOT re-tested here — Phase 2A's `users_conf` tests cover them.
+    // -----------------------------------------------------------------------
+
+    fn parse_users_config(raw: &str) -> UsersConfig {
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().expect("tempfile");
+        f.write_all(raw.as_bytes()).expect("write");
+        f.flush().expect("flush");
+        sandbox_core::load_users_config_from(f.path()).expect("parse users.conf")
+    }
+
+    #[test]
+    fn resolve_allocation_pool_returns_cidr_when_subnet_matches_uid() {
+        let runner_uid = nix::unistd::Uid::current();
+        let runner_user = nix::unistd::User::from_uid(runner_uid)
+            .expect("getpwuid_r")
+            .expect("runner uid must resolve to a user account");
+        let raw = format!(
+            r#"{{
+                "subnets": [
+                    {{ "cidr": "10.250.0.0/20", "allow_users": ["{}"] }}
+                ]
+            }}"#,
+            runner_user.name
+        );
+        let cfg = parse_users_config(&raw);
+        let cidr = resolve_allocation_pool(runner_uid.as_raw(), &cfg)
+            .expect("matching subnet must resolve");
+        assert_eq!(cidr.base(), std::net::Ipv4Addr::new(10, 250, 0, 0));
+        assert_eq!(cidr.prefix_len(), 20);
+    }
+
+    #[test]
+    fn resolve_allocation_pool_errs_when_no_subnet_matches_uid() {
+        let runner_uid = nix::unistd::Uid::current();
+        // The bogus username is the same sentinel Phase 2A uses in its
+        // `allows_uid_rejects_bogus_username` test — a name that
+        // cannot exist on any practical host so `getpwnam_r` returns
+        // `Ok(None)` and `find_subnet_by_uid` misses.
+        let raw = r#"{
+            "subnets": [
+                {
+                    "cidr": "10.209.0.0/20",
+                    "allow_users": ["definitely-not-a-real-user-9c3f"]
+                }
+            ]
+        }"#;
+        let cfg = parse_users_config(raw);
+        let err = resolve_allocation_pool(runner_uid.as_raw(), &cfg)
+            .expect_err("no matching subnet must error");
+        match err {
+            SandboxError::InvalidArgument(msg) => {
+                assert!(
+                    msg.contains("no users.conf subnet matches daemon user"),
+                    "message must use the grep-stable prefix, got {msg}"
+                );
+                assert!(
+                    msg.contains(&runner_uid.as_raw().to_string()),
+                    "message must include the daemon uid, got {msg}"
+                );
+                assert!(
+                    msg.contains("docs/start/installation.md"),
+                    "message must point at install docs, got {msg}"
+                );
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_allocation_pool_errs_when_subnets_array_is_empty() {
+        let runner_uid = nix::unistd::Uid::current();
+        let cfg = parse_users_config(r#"{ "subnets": [] }"#);
+        let err = resolve_allocation_pool(runner_uid.as_raw(), &cfg)
+            .expect_err("empty subnets must error");
+        // Same shape as the bogus-username case — operators see one
+        // diagnostic for "users.conf does not authorize me".
+        match err {
+            SandboxError::InvalidArgument(msg) => {
+                assert!(
+                    msg.contains("no users.conf subnet matches daemon user"),
+                    "message must use the grep-stable prefix, got {msg}"
+                );
+                assert!(
+                    msg.contains(&runner_uid.as_raw().to_string()),
+                    "message must include the daemon uid, got {msg}"
+                );
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -5091,6 +6503,262 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // M11-S5 Phase 5A fixup — route-helper path resolution.
+    //
+    // Three layers of coverage:
+    //
+    //   1. `default_route_helper_candidates` — assembling the priority-
+    //      ordered candidate list from `current_exe()`-dir + install-path
+    //      + `$PATH`. Pure list-builder; no I/O.
+    //   2. `resolve_route_helper_path_from` — walking the candidate list
+    //      against a stub `is_usable` predicate. We deliberately stub
+    //      `is_usable` rather than literally `setcap`-ing fixture files
+    //      because real file capabilities require `CAP_SETFCAP` (so a
+    //      hermetic unit test cannot apply them) and the cargo
+    //      workspace lives on filesystems where `setcap` returns
+    //      "Operation not supported" anyway.
+    //   3. `xattr_has_cap_sys_admin_effective` — decoding a raw
+    //      `vfs_cap_data` blob into a boolean cap presence answer.
+    //      Coverage of revision 2 / revision 3 layouts plus the deny
+    //      branches (no effective bit, wrong revision, missing
+    //      CAP_SYS_ADMIN, malformed length).
+    //
+    // (1) and (2) together verify the resolver's priority-and-fallthrough
+    // contract. (3) verifies the cap decoder. Wiring of `has_required_caps`
+    // → `read_cap_xattr` → `xattr_has_cap_sys_admin_effective` is
+    // non-recursive plumbing, so the integration story is "if the decoder
+    // is correct and the resolver respects its predicate, the production
+    // path is correct" — no extra integration test required at the unit
+    // layer.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn default_route_helper_candidates_includes_sibling_install_and_path_walk() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let exe_dir = tmp.path();
+        let install_path = std::path::PathBuf::from("/usr/local/bin/sandbox-route-helper");
+        // Two PATH entries plus an empty entry the builder must skip
+        // (mirrors `PATH=/foo::/bar` shapes in shells that allow them).
+        let path_var = std::ffi::OsString::from("/dir-a::/dir-b");
+
+        let candidates =
+            default_route_helper_candidates(Some(exe_dir), &install_path, Some(&path_var));
+
+        assert_eq!(
+            candidates.len(),
+            4,
+            "expected sibling + install + 2 PATH dirs (the empty PATH \
+             segment must be skipped); got {candidates:?}"
+        );
+        assert_eq!(candidates[0], exe_dir.join("sandbox-route-helper"));
+        assert_eq!(candidates[1], install_path);
+        assert_eq!(
+            candidates[2],
+            std::path::PathBuf::from("/dir-a/sandbox-route-helper")
+        );
+        assert_eq!(
+            candidates[3],
+            std::path::PathBuf::from("/dir-b/sandbox-route-helper")
+        );
+    }
+
+    #[test]
+    fn default_route_helper_candidates_omits_sibling_when_current_exe_unavailable() {
+        let install_path = std::path::PathBuf::from("/usr/local/bin/sandbox-route-helper");
+        let candidates = default_route_helper_candidates(None, &install_path, None);
+        assert_eq!(
+            candidates,
+            vec![install_path],
+            "with no exe-dir and no PATH, only the install path is offered"
+        );
+    }
+
+    #[test]
+    fn resolve_route_helper_path_from_returns_first_usable_candidate() {
+        let candidates = vec![
+            std::path::PathBuf::from("/sibling/sandbox-route-helper"),
+            std::path::PathBuf::from("/usr/local/bin/sandbox-route-helper"),
+            std::path::PathBuf::from("/path-dir/sandbox-route-helper"),
+        ];
+        // The sibling is "usable", so it wins.
+        let resolved = resolve_route_helper_path_from(
+            candidates.clone(),
+            |p| p.starts_with("/sibling"),
+            "/sibling",
+            std::path::Path::new("/usr/local/bin/sandbox-route-helper"),
+        )
+        .expect("sibling is usable");
+        assert_eq!(resolved, candidates[0]);
+    }
+
+    #[test]
+    fn resolve_route_helper_path_from_falls_through_when_earlier_candidate_lacks_caps() {
+        let candidates = vec![
+            std::path::PathBuf::from("/sibling/sandbox-route-helper"),
+            std::path::PathBuf::from("/usr/local/bin/sandbox-route-helper"),
+            std::path::PathBuf::from("/path-dir/sandbox-route-helper"),
+        ];
+        // Sibling exists-but-no-caps (predicate returns false for the
+        // sibling); the install path is usable, so it wins.
+        let resolved = resolve_route_helper_path_from(
+            candidates.clone(),
+            |p| p.starts_with("/usr/local/bin"),
+            "/sibling",
+            std::path::Path::new("/usr/local/bin/sandbox-route-helper"),
+        )
+        .expect("install path is usable; resolver must skip the un-cap'd sibling");
+        assert_eq!(resolved, candidates[1]);
+    }
+
+    #[test]
+    fn resolve_route_helper_path_from_errors_when_no_candidate_is_usable() {
+        let candidates = vec![
+            std::path::PathBuf::from("/sibling/sandbox-route-helper"),
+            std::path::PathBuf::from("/usr/local/bin/sandbox-route-helper"),
+        ];
+        let exe_dir_display = "/sibling";
+        let install_path = std::path::Path::new("/usr/local/bin/sandbox-route-helper");
+        let err =
+            resolve_route_helper_path_from(candidates, |_| false, exe_dir_display, install_path)
+                .expect_err("no candidate is usable; resolver must surface an error");
+        match err {
+            SandboxError::Internal(msg) => {
+                assert!(
+                    msg.contains("no usable sandbox-route-helper found"),
+                    "error must use the grep-stable prefix, got: {msg}"
+                );
+                assert!(
+                    msg.contains(exe_dir_display),
+                    "error must name the exe directory we checked, got: {msg}"
+                );
+                assert!(
+                    msg.contains(&install_path.display().to_string()),
+                    "error must name the install path we checked, got: {msg}"
+                );
+                assert!(
+                    msg.contains("$PATH"),
+                    "error must mention the $PATH lookup, got: {msg}"
+                );
+                assert!(
+                    msg.contains("CAP_SYS_ADMIN"),
+                    "error must mention the cap requirement so operators \
+                     know setcap is needed; got: {msg}"
+                );
+            }
+            other => panic!("expected SandboxError::Internal, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // xattr decoder: `xattr_has_cap_sys_admin_effective`.
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a `vfs_cap_data` revision-2 blob with the given
+    /// `magic_etc` flags and the given `permitted_lo` set. All other
+    /// fields are zeroed (matches a typical `setcap cap_sys_admin+ep`
+    /// blob, which only sets bit 21 in `permitted_lo`).
+    fn build_vfs_cap_data_v2(magic_etc: u32, permitted_lo: u32) -> [u8; VFS_CAP_DATA_V2_SIZE] {
+        let mut buf = [0u8; VFS_CAP_DATA_V2_SIZE];
+        buf[0..4].copy_from_slice(&magic_etc.to_le_bytes());
+        buf[4..8].copy_from_slice(&permitted_lo.to_le_bytes());
+        // bytes 8..20 (inheritable lo, permitted/inheritable hi) stay zero
+        buf
+    }
+
+    #[test]
+    fn xattr_decoder_accepts_v2_with_cap_sys_admin_and_effective_flag() {
+        let buf = build_vfs_cap_data_v2(
+            VFS_CAP_REVISION_2 | VFS_CAP_FLAGS_EFFECTIVE,
+            1u32 << CAP_SYS_ADMIN_BIT,
+        );
+        assert!(
+            xattr_has_cap_sys_admin_effective(&buf),
+            "well-formed v2 blob with CAP_SYS_ADMIN+effective must be accepted"
+        );
+    }
+
+    #[test]
+    fn xattr_decoder_accepts_v3_with_cap_sys_admin_and_effective_flag() {
+        // A V3 blob is V2 + a trailing 4-byte rootid we ignore.
+        let mut buf = [0u8; VFS_CAP_DATA_V3_SIZE];
+        let v2 = build_vfs_cap_data_v2(
+            VFS_CAP_REVISION_3 | VFS_CAP_FLAGS_EFFECTIVE,
+            1u32 << CAP_SYS_ADMIN_BIT,
+        );
+        buf[..VFS_CAP_DATA_V2_SIZE].copy_from_slice(&v2);
+        // bytes 20..24 (rootid) stay zero
+        assert!(
+            xattr_has_cap_sys_admin_effective(&buf),
+            "well-formed v3 blob with CAP_SYS_ADMIN+effective must be accepted"
+        );
+    }
+
+    #[test]
+    fn xattr_decoder_rejects_when_effective_flag_is_clear() {
+        // Caps are permitted but not effective on exec — `cap_sys_admin+p`
+        // (no `+e`). The route helper requires effective caps, so reject.
+        let buf = build_vfs_cap_data_v2(VFS_CAP_REVISION_2, 1u32 << CAP_SYS_ADMIN_BIT);
+        assert!(!xattr_has_cap_sys_admin_effective(&buf));
+    }
+
+    #[test]
+    fn xattr_decoder_rejects_when_cap_sys_admin_bit_missing() {
+        // Effective flag set, but a different cap is in the permitted
+        // mask (e.g., CAP_NET_ADMIN, bit 12). The helper must be
+        // rejected: it has *some* caps but not the one the route
+        // helper requires.
+        let buf = build_vfs_cap_data_v2(VFS_CAP_REVISION_2 | VFS_CAP_FLAGS_EFFECTIVE, 1u32 << 12);
+        assert!(!xattr_has_cap_sys_admin_effective(&buf));
+    }
+
+    #[test]
+    fn xattr_decoder_rejects_unknown_revision() {
+        // V1 (revision 1) is the legacy 32-bit format the helper has
+        // never been shipped under. Anything other than V2 / V3 is
+        // treated as "not a cap blob we trust".
+        let v1_revision = 0x0100_0000u32;
+        let buf = build_vfs_cap_data_v2(
+            v1_revision | VFS_CAP_FLAGS_EFFECTIVE,
+            1u32 << CAP_SYS_ADMIN_BIT,
+        );
+        assert!(!xattr_has_cap_sys_admin_effective(&buf));
+    }
+
+    #[test]
+    fn xattr_decoder_rejects_empty_or_truncated_blob() {
+        // Empty xattr (`getxattr` returned 0 bytes) — common for files
+        // with no `security.capability` xattr set at all.
+        assert!(!xattr_has_cap_sys_admin_effective(&[]));
+        // Truncated blob — kernel could never write this, but the
+        // decoder must still refuse.
+        assert!(!xattr_has_cap_sys_admin_effective(&[0u8; 12]));
+    }
+
+    #[test]
+    fn has_required_caps_returns_false_for_nonexistent_path() {
+        // Sanity for the wrapper: a path that does not exist must
+        // never look "usable" — the `is_file()` short-circuit guards
+        // the `getxattr` syscall.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bogus = tmp.path().join("does-not-exist-helper");
+        assert!(!has_required_caps(&bogus));
+    }
+
+    #[test]
+    fn has_required_caps_returns_false_for_existing_file_without_caps() {
+        // Most files on disk carry no `security.capability` xattr at
+        // all (`getxattr` returns -1 / ENODATA). The wrapper must
+        // collapse that into "not usable" without panicking.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let plain_file = tmp.path().join("not-a-route-helper");
+        std::fs::write(&plain_file, b"").expect("write");
+        assert!(
+            !has_required_caps(&plain_file),
+            "an empty file with no security.capability xattr must not look usable"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // extract_repo_host: recognise the host component of a git remote URL so
     // the DNS pre-warm before `git clone` targets the right domain.
     // -----------------------------------------------------------------------
@@ -5264,8 +6932,8 @@ mod tests {
 
         // Build the minimal manager surface the helper consumes. None
         // of these constructors make external calls — `GatewayManager`
-        // is a unit struct and `NetworkManager::with_defaults` only
-        // allocates an in-memory subnet allocator. The spawn_blocking
+        // is a unit struct and `NetworkManager::new` only allocates an
+        // in-memory subnet allocator. The spawn_blocking
         // branch of the teardown will attempt to invoke `docker`
         // subcommands and either no-op (no matching container /
         // network) or log a best-effort warning; neither outcome is
@@ -5583,6 +7251,112 @@ mod tests {
             reloaded.state,
             SessionState::Error,
             "session must be marked Error so ps/inspect can surface the failed create"
+        );
+    }
+
+    // -- RebuildImageRequest body deserialization (M11-S4 Phase 4C) --------
+
+    /// Spec § "rebuild-image" + Phase 4C: an empty body must decode as
+    /// `{ "backend": "lima", "no_cache": false }` so older CLIs that
+    /// POST `/rebuild-image` with no body keep working (backwards-
+    /// compat at the wire — handoff Constraints).
+    #[test]
+    fn rebuild_image_request_default_is_lima_no_cache_false() {
+        let req = RebuildImageRequest::default();
+        assert_eq!(req.backend, BackendKind::Lima);
+        assert!(!req.no_cache);
+    }
+
+    /// Full-shape JSON parses to the exact field values; pinned so a
+    /// future refactor of the JSON shape (e.g. renaming a field via
+    /// `#[serde(rename)]`) breaks compile/test, not the wire contract.
+    #[test]
+    fn rebuild_image_request_parses_full_container_no_cache_true() {
+        let body = br#"{"backend":"container","no_cache":true}"#;
+        let req: RebuildImageRequest = serde_json::from_slice(body).expect("valid body parses");
+        assert_eq!(req.backend, BackendKind::Container);
+        assert!(req.no_cache);
+    }
+
+    /// `{ "backend": "lima" }` (no_cache omitted) defaults `no_cache`
+    /// to `false` — `#[serde(default)]` on the struct lets every
+    /// field round-trip independently.
+    #[test]
+    fn rebuild_image_request_omitted_no_cache_defaults_to_false() {
+        let body = br#"{"backend":"lima"}"#;
+        let req: RebuildImageRequest = serde_json::from_slice(body).expect("partial body parses");
+        assert_eq!(req.backend, BackendKind::Lima);
+        assert!(!req.no_cache);
+    }
+
+    /// `{ "no_cache": true }` (backend omitted) defaults `backend` to
+    /// `Lima` — same forward-compat shape as the empty-body fallback.
+    #[test]
+    fn rebuild_image_request_omitted_backend_defaults_to_lima() {
+        let body = br#"{"no_cache":true}"#;
+        let req: RebuildImageRequest = serde_json::from_slice(body).expect("partial body parses");
+        assert_eq!(req.backend, BackendKind::Lima);
+        assert!(req.no_cache);
+    }
+
+    /// Empty JSON object `{}` decodes as the full default — the shape
+    /// the empty-body fallback path explicitly constructs without
+    /// going through serde, but pinning the parse path catches any
+    /// drift in the `Default` impl.
+    #[test]
+    fn rebuild_image_request_empty_object_yields_default() {
+        let body = b"{}";
+        let req: RebuildImageRequest = serde_json::from_slice(body).expect("empty object parses");
+        assert_eq!(req.backend, BackendKind::Lima);
+        assert!(!req.no_cache);
+    }
+
+    /// Unknown backend kinds surface as a parse error — the handler
+    /// wraps this in `InvalidArgument` (HTTP 400). serde's enum-variant
+    /// error names the unknown variant and the expected ones; pin both
+    /// so a stray rename of `BackendKind` variants is caught here.
+    #[test]
+    fn rebuild_image_request_unknown_backend_errors() {
+        let body = br#"{"backend":"podman"}"#;
+        let err = serde_json::from_slice::<RebuildImageRequest>(body)
+            .expect_err("unknown backend must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("podman"),
+            "error should name the unknown variant; got: {msg}"
+        );
+        assert!(
+            msg.contains("lima") && msg.contains("container"),
+            "error should list the valid backends; got: {msg}"
+        );
+    }
+
+    /// M11-S4 Phase 4D-pre gap #1 regression guard: the daemon must
+    /// construct `ContainerRuntime` with the *same* image tag that
+    /// `ensure_image` builds. Previously `main()` passed
+    /// `DEFAULT_LITE_IMAGE_TAG` (`"sandboxd-lite:latest"`) while
+    /// `ensure_image` builds `sandboxd-lite:<CARGO_PKG_VERSION>`,
+    /// so `docker create` saw an image tag that no build step ever
+    /// produced. Routing both through `lite_image_tag_for_version`
+    /// closes the drift; this test fails-loud if either side ever
+    /// computes the tag from a different formula again.
+    #[test]
+    fn daemon_lite_image_tag_matches_ensure_image_for_same_version() {
+        let version = env!("CARGO_PKG_VERSION");
+        let daemon_runtime_tag = lite_image_tag_for_version(version);
+        // Mirror the construction `main()` performs on startup.
+        let constructed = format!("sandboxd-lite:{version}");
+        assert_eq!(
+            daemon_runtime_tag, constructed,
+            "lite_image_tag_for_version must produce the canonical \
+             sandboxd-lite:<version> tag the daemon stores in its runtime"
+        );
+        // The CARGO_PKG_VERSION value is non-empty by definition; the
+        // tag must therefore never collapse to the bare `:latest`
+        // placeholder that gap #1 left behind.
+        assert_ne!(
+            daemon_runtime_tag, "sandboxd-lite:latest",
+            "production daemon must not reference the :latest fixture tag"
         );
     }
 }

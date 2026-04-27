@@ -14,6 +14,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::backend::BackendKind;
 use crate::policy::{Destination, HttpFilter, Protocol};
 use crate::session::{SessionId, SessionState};
 
@@ -53,6 +54,25 @@ pub struct SessionDto {
     /// `GET /sessions` to keep the list response cheap.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicyDto>,
+    /// Operator-facing warnings produced during the request that
+    /// produced this DTO. Populated by `POST /sessions` with the
+    /// container backend's first-use lite-image build notice (spec
+    /// § "Lite mode → first-use warning"); empty (and therefore
+    /// omitted) on every other endpoint and on the steady-state
+    /// container path. Always treated as additive: older daemons
+    /// rolling forward to a newer record never see this field, and
+    /// older clients reading a newer response simply ignore it
+    /// (`#[serde(default)]` ensures that direction works too).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    /// Backend that owns this session's runtime resources. Surfaced
+    /// on the wire so HTTP-level integration tests and CLI consumers
+    /// can confirm `--backend container` actually routed to the
+    /// container runtime. Additive: pre-M11-S3 records and clients
+    /// that ignore the field still round-trip via `#[serde(default)]`
+    /// (defaults to Lima, matching the implicit pre-M11 contract).
+    #[serde(default)]
+    pub backend: BackendKind,
 }
 
 /// Wire representation of a session's resource configuration.
@@ -70,6 +90,29 @@ pub struct SessionConfigDto {
     pub cpus: u32,
     pub memory_mb: u32,
     pub disk_gb: u32,
+    /// Effective CPU ceiling actually applied at runtime.
+    ///
+    /// For Lima sessions, mirrors `cpus` (the persisted value is what
+    /// QEMU receives). For container sessions a stored `0` sentinel
+    /// (caller did not pass `--cpus`) is replaced by the daemon's
+    /// host-80% default per `compute_default_resource_limits`; the
+    /// resolved fraction (rounded to one decimal place to match
+    /// Docker's `--cpus` grammar) lands here so callers can verify
+    /// the actually-applied ceiling without inspecting cgroup files.
+    /// Additive: pre-M11-S4 records without this field deserialize to
+    /// `0.0` via `#[serde(default)]`; older clients reading a newer
+    /// response simply ignore the unknown field.
+    #[serde(default)]
+    pub resolved_cpus: f64,
+    /// Effective memory ceiling actually applied at runtime, in
+    /// megabytes.
+    ///
+    /// Same shape and motivation as `resolved_cpus`: a stored `0`
+    /// sentinel on a container session is replaced by the daemon's
+    /// host-80% default. Pre-M11-S4 records default to `0` via
+    /// `#[serde(default)]`.
+    #[serde(default)]
+    pub resolved_memory_mb: u32,
     /// Rendered workspace-mode summary, if any.  Format:
     /// `"shared:<absolute host path>"` or `"clone:<repo url>"`.
     #[serde(skip_serializing_if = "Option::is_none")]

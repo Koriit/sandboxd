@@ -9,20 +9,23 @@
 //!   binary framing over any async byte stream.
 //! - **Transport-agnostic request/response** ([`send_request_over`]) — serialize
 //!   a request, send it, read back a response.
-//! - **[`GuestConnector`]** — high-level client that establishes a transport to
-//!   the guest via `limactl shell` and sends requests.
+//! - **[`GuestConnector`]** — high-level client that dispatches to the
+//!   per-session backend (Lima or Container) via the
+//!   [`SessionRuntime::guest_transport`] seam, then exchanges framed JSON
+//!   over the returned bidirectional stream.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::process::Command;
 use tracing::debug;
 
+use crate::backend::{BackendKind, RuntimeHandle, SessionRuntime};
 use crate::error::SandboxError;
-use crate::lima::LimaManager;
 use crate::session::SessionId;
+use crate::store::SessionStore;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -198,107 +201,84 @@ pub async fn send_request_over<S: AsyncRead + AsyncWrite + Unpin>(
 // ---------------------------------------------------------------------------
 
 /// High-level client for sending requests to the guest agent inside a sandbox
-/// VM.
+/// session, regardless of backend.
 ///
-/// Uses `limactl shell` as the transport: spawns
-/// `limactl shell sandbox-{id} -- socat - TCP:127.0.0.1:5123`
-/// and pipes the framed protocol over the child process's stdin/stdout.
+/// At construction time the connector receives the daemon's per-backend
+/// dispatch table plus an [`Arc<SessionStore>`]. On every
+/// [`Self::send_request`] call it:
+///
+/// 1. Looks up the session in the store to learn its [`BackendKind`].
+/// 2. Dispatches to the matching [`SessionRuntime`] in the registry.
+/// 3. Asks that runtime for a [`GuestTransport`][crate::backend::GuestTransport],
+///    opens a fresh connection through it, and exchanges the framed JSON
+///    request/response over the returned bidirectional stream.
+///
+/// Backends own their own spawn/teardown logic — this connector is purely a
+/// dispatcher and protocol driver.
 pub struct GuestConnector {
-    /// Used to derive the VM name for a session.
-    lima_manager: Arc<LimaManager>,
+    /// Backend dispatch table — same `Arc` shared with `AppState::runtimes`.
+    runtimes: Arc<HashMap<BackendKind, Arc<dyn SessionRuntime>>>,
+    /// Used to look up the session's backend at request time. Without a
+    /// stored backend kind we cannot pick the right transport.
+    store: Arc<SessionStore>,
 }
 
 impl GuestConnector {
-    /// Create a new connector backed by the given Lima manager.
-    pub fn new(lima_manager: Arc<LimaManager>) -> Self {
-        Self { lima_manager }
+    /// Create a new connector backed by the daemon's runtime registry and
+    /// session store.
+    pub fn new(
+        runtimes: Arc<HashMap<BackendKind, Arc<dyn SessionRuntime>>>,
+        store: Arc<SessionStore>,
+    ) -> Self {
+        Self { runtimes, store }
     }
 
-    /// Send a request to the guest agent in the VM for `session_id` and return
-    /// the response.
+    /// Send a request to the guest agent for `session_id` and return the
+    /// response.
     ///
-    /// This spawns a `limactl shell` process with `socat` to bridge stdin/stdout
-    /// to the guest agent's TCP port. The framed JSON protocol is exchanged over
-    /// that pipe.
+    /// Picks the transport based on the session's persisted [`BackendKind`]:
+    /// `Lima` sessions go through `limactl shell ... socat`; `Container`
+    /// sessions go through `docker exec ... socat`. Both implementations
+    /// expose the same framed JSON protocol on TCP `127.0.0.1:5123` inside
+    /// the session.
     pub async fn send_request(
         &self,
         session_id: &SessionId,
         request: GuestRequest,
     ) -> Result<GuestResponse, SandboxError> {
-        let vm_name = crate::lima::vm_name(session_id);
+        let session = self
+            .store
+            .get_session(session_id)?
+            .ok_or_else(|| SandboxError::SessionNotFound(session_id.to_string()))?;
+
+        let runtime = self.runtimes.get(&session.backend).ok_or_else(|| {
+            SandboxError::Internal(format!(
+                "no runtime registered for backend {:?} (session {session_id})",
+                session.backend
+            ))
+        })?;
+
+        let handle = RuntimeHandle::from_session_id(session_id);
+        let transport = runtime.guest_transport(&handle);
 
         debug!(
-            vm = %vm_name,
+            session_id = %session_id,
+            backend = ?session.backend,
             request_type = ?std::mem::discriminant(&request),
             "sending request to guest agent"
         );
 
-        let mut child = Command::new(self.lima_manager.limactl_path())
-            .args([
-                "shell",
-                &vm_name,
-                "--",
-                "socat",
-                "-",
-                &format!("TCP:127.0.0.1:{GUEST_AGENT_PORT}"),
-            ])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                SandboxError::Lima(format!("failed to spawn limactl shell for {vm_name}: {e}"))
-            })?;
+        let exchange = async {
+            let mut stream = transport.connect().await?;
+            send_request_over(&mut stream, &request).await
+        };
 
-        let result = tokio::time::timeout(GUEST_REQUEST_TIMEOUT, async {
-            let mut stdin = child.stdin.take().ok_or_else(|| {
-                SandboxError::Internal("failed to capture stdin of limactl shell".into())
-            })?;
-            let mut stdout = child.stdout.take().ok_or_else(|| {
-                SandboxError::Internal("failed to capture stdout of limactl shell".into())
-            })?;
-
-            // Send the request.
-            let payload = serde_json::to_vec(&request)
-                .map_err(|e| SandboxError::Internal(format!("failed to serialize request: {e}")))?;
-            write_message(&mut stdin, &payload).await?;
-
-            // NOTE: we intentionally keep stdin open until after reading the
-            // response.  Closing it early causes socat (inside the VM, reached
-            // via limactl shell / SSH) to tear down the TCP connection before
-            // the guest agent can send its reply — resulting in
-            // "connection closed while reading message length".  The flush()
-            // inside write_message is sufficient to ensure the data reaches socat.
-
-            // Read the response.
-            let response_bytes = read_message(&mut stdout).await?;
-
-            // Now close stdin so socat exits cleanly.
-            drop(stdin);
-
-            let response: GuestResponse = serde_json::from_slice(&response_bytes).map_err(|e| {
-                SandboxError::Internal(format!("failed to deserialize guest response: {e}"))
-            })?;
-
-            Ok(response)
-        })
-        .await;
-
-        match result {
-            Ok(response) => {
-                // Wait for the child to exit (don't leave zombies).
-                let _ = child.wait().await;
-                response
-            }
-            Err(_elapsed) => {
-                // Timeout: kill the child process to avoid leaving zombies.
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                Err(SandboxError::Timeout {
-                    operation: format!("guest agent request via {vm_name}"),
-                    duration: GUEST_REQUEST_TIMEOUT.as_secs(),
-                })
-            }
+        match tokio::time::timeout(GUEST_REQUEST_TIMEOUT, exchange).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(SandboxError::Timeout {
+                operation: format!("guest agent request for {session_id}"),
+                duration: GUEST_REQUEST_TIMEOUT.as_secs(),
+            }),
         }
     }
 
@@ -314,7 +294,7 @@ impl GuestConnector {
         }
     }
 
-    /// Execute a command inside the guest VM.
+    /// Execute a command inside the session's guest agent.
     pub async fn exec(
         &self,
         session_id: &SessionId,
@@ -812,5 +792,269 @@ mod tests {
         }
 
         server.await.unwrap();
+    }
+
+    // -- GuestConnector dispatch tests --------------------------------------
+
+    use std::net::IpAddr;
+    use std::sync::Mutex as StdMutex;
+
+    use async_trait::async_trait;
+    use tempfile::TempDir;
+
+    use crate::backend::{
+        AsyncReadWrite, BackendKind, Capabilities, ExitCode, GuestTransport, IsolationLevel,
+        RuntimeHandle, RuntimeStartArgs, RuntimeStatus, SessionRuntime, SessionSpec,
+    };
+    use crate::session::SessionConfig;
+    use crate::store::SessionStore;
+
+    /// Records which backend the framework dispatched to and serves a fixed
+    /// `Pong` over an in-memory duplex stream — no subprocess, no socket.
+    struct StubTransport {
+        kind: BackendKind,
+        observed: Arc<StdMutex<Vec<BackendKind>>>,
+    }
+
+    #[async_trait]
+    impl GuestTransport for StubTransport {
+        async fn connect(&self) -> Result<Box<dyn AsyncReadWrite + Send + Unpin>, SandboxError> {
+            self.observed.lock().unwrap().push(self.kind);
+
+            // One side of the duplex goes to the caller (the connector
+            // exchanging the framed protocol); the other side acts as the
+            // in-memory "guest agent" that reads the request and replies.
+            let (client, mut server) = duplex(4096);
+
+            tokio::spawn(async move {
+                let request_bytes = match read_message(&mut server).await {
+                    Ok(b) => b,
+                    Err(_) => return,
+                };
+                let _request: GuestRequest = match serde_json::from_slice(&request_bytes) {
+                    Ok(r) => r,
+                    Err(_) => return,
+                };
+                let response = GuestResponse::Pong;
+                let response_bytes = serde_json::to_vec(&response).unwrap();
+                let _ = write_message(&mut server, &response_bytes).await;
+            });
+
+            Ok(Box::new(client))
+        }
+    }
+
+    /// Minimal `SessionRuntime` whose only meaningful behavior is yielding
+    /// a `StubTransport` — every other trait method panics so a regression
+    /// that calls them surfaces in the test rather than silently succeeding.
+    struct StubRuntime {
+        kind: BackendKind,
+        capabilities: Capabilities,
+        observed: Arc<StdMutex<Vec<BackendKind>>>,
+    }
+
+    #[async_trait]
+    impl SessionRuntime for StubRuntime {
+        fn kind(&self) -> BackendKind {
+            self.kind
+        }
+
+        fn capabilities(&self) -> &Capabilities {
+            &self.capabilities
+        }
+
+        async fn create(
+            &self,
+            _session_id: &SessionId,
+            _spec: &SessionSpec,
+        ) -> Result<RuntimeHandle, SandboxError> {
+            unimplemented!("StubRuntime::create — not exercised by guest dispatch tests")
+        }
+
+        async fn start(
+            &self,
+            _handle: &RuntimeHandle,
+            _args: &RuntimeStartArgs,
+        ) -> Result<(), SandboxError> {
+            unimplemented!("StubRuntime::start — not exercised by guest dispatch tests")
+        }
+
+        async fn stop(&self, _handle: &RuntimeHandle) -> Result<(), SandboxError> {
+            unimplemented!("StubRuntime::stop — not exercised by guest dispatch tests")
+        }
+
+        async fn delete(&self, _handle: &RuntimeHandle) -> Result<(), SandboxError> {
+            unimplemented!("StubRuntime::delete — not exercised by guest dispatch tests")
+        }
+
+        async fn status(&self, _handle: &RuntimeHandle) -> Result<RuntimeStatus, SandboxError> {
+            unimplemented!("StubRuntime::status — not exercised by guest dispatch tests")
+        }
+
+        async fn ip(&self, _handle: &RuntimeHandle) -> Result<IpAddr, SandboxError> {
+            unimplemented!("StubRuntime::ip — not exercised by guest dispatch tests")
+        }
+
+        fn guest_transport(&self, _handle: &RuntimeHandle) -> Arc<dyn GuestTransport> {
+            Arc::new(StubTransport {
+                kind: self.kind,
+                observed: Arc::clone(&self.observed),
+            })
+        }
+
+        async fn exec_interactive(
+            &self,
+            _handle: &RuntimeHandle,
+            _cmd: Vec<String>,
+            _stdin: Box<dyn AsyncRead + Unpin + Send>,
+            _stdout: Box<dyn AsyncWrite + Unpin + Send>,
+            _stderr: Box<dyn AsyncWrite + Unpin + Send>,
+        ) -> Result<ExitCode, SandboxError> {
+            unimplemented!("StubRuntime::exec_interactive — not exercised by guest dispatch tests")
+        }
+    }
+
+    fn stub_capabilities(kind: BackendKind) -> Capabilities {
+        // Field set is irrelevant for these tests — no validation runs.
+        let isolation = match kind {
+            BackendKind::Lima => IsolationLevel::Vm,
+            BackendKind::Container => IsolationLevel::Container,
+        };
+        Capabilities {
+            kind,
+            isolation,
+            nested_virt: false,
+            privileged_ops: false,
+            raw_network: false,
+            hardening_flag: false,
+            per_session_no_cache: false,
+            workspace_modes: enumset::EnumSet::empty(),
+        }
+    }
+
+    type RuntimeRegistry = Arc<HashMap<BackendKind, Arc<dyn SessionRuntime>>>;
+    type ObservedDispatches = Arc<StdMutex<Vec<BackendKind>>>;
+    type DispatchFixture = (
+        TempDir,
+        Arc<SessionStore>,
+        RuntimeRegistry,
+        ObservedDispatches,
+    );
+
+    fn build_dispatch_fixture() -> DispatchFixture {
+        let temp = TempDir::new().unwrap();
+        let (store, _orphans) = SessionStore::new(temp.path().to_path_buf()).unwrap();
+        let store = Arc::new(store);
+
+        let observed: Arc<StdMutex<Vec<BackendKind>>> = Arc::new(StdMutex::new(Vec::new()));
+
+        let lima_runtime: Arc<dyn SessionRuntime> = Arc::new(StubRuntime {
+            kind: BackendKind::Lima,
+            capabilities: stub_capabilities(BackendKind::Lima),
+            observed: Arc::clone(&observed),
+        });
+        let container_runtime: Arc<dyn SessionRuntime> = Arc::new(StubRuntime {
+            kind: BackendKind::Container,
+            capabilities: stub_capabilities(BackendKind::Container),
+            observed: Arc::clone(&observed),
+        });
+
+        let mut map: HashMap<BackendKind, Arc<dyn SessionRuntime>> = HashMap::new();
+        map.insert(BackendKind::Lima, lima_runtime);
+        map.insert(BackendKind::Container, container_runtime);
+        let runtimes = Arc::new(map);
+
+        (temp, store, runtimes, observed)
+    }
+
+    #[tokio::test]
+    async fn guest_connector_dispatches_to_lima_transport_for_lima_session() {
+        let (_temp, store, runtimes, observed) = build_dispatch_fixture();
+        let session = store
+            .create_session_with_backend(SessionConfig::default(), None, BackendKind::Lima)
+            .unwrap();
+
+        let connector = GuestConnector::new(runtimes, Arc::clone(&store));
+        let response = connector
+            .send_request(&session.id, GuestRequest::Ping)
+            .await
+            .unwrap();
+
+        assert!(matches!(response, GuestResponse::Pong));
+        let observed = observed.lock().unwrap();
+        assert_eq!(*observed, vec![BackendKind::Lima]);
+    }
+
+    #[tokio::test]
+    async fn guest_connector_dispatches_to_container_transport_for_container_session() {
+        let (_temp, store, runtimes, observed) = build_dispatch_fixture();
+        let session = store
+            .create_session_with_backend(SessionConfig::default(), None, BackendKind::Container)
+            .unwrap();
+
+        let connector = GuestConnector::new(runtimes, Arc::clone(&store));
+        let response = connector
+            .send_request(&session.id, GuestRequest::Ping)
+            .await
+            .unwrap();
+
+        assert!(matches!(response, GuestResponse::Pong));
+        let observed = observed.lock().unwrap();
+        assert_eq!(*observed, vec![BackendKind::Container]);
+    }
+
+    #[tokio::test]
+    async fn guest_connector_returns_session_not_found_for_unknown_id() {
+        let (_temp, store, runtimes, _observed) = build_dispatch_fixture();
+        let connector = GuestConnector::new(runtimes, Arc::clone(&store));
+
+        // A well-formed but never-inserted session id.
+        let unknown = SessionId::parse("0123456789ab").unwrap();
+        let err = connector
+            .send_request(&unknown, GuestRequest::Ping)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, SandboxError::SessionNotFound(_)),
+            "expected SessionNotFound, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn guest_connector_errors_when_runtime_for_session_backend_is_missing() {
+        let temp = TempDir::new().unwrap();
+        let (store, _orphans) = SessionStore::new(temp.path().to_path_buf()).unwrap();
+        let store = Arc::new(store);
+        let session = store
+            .create_session_with_backend(SessionConfig::default(), None, BackendKind::Container)
+            .unwrap();
+
+        // Registry holds Lima only — the container session has no
+        // runtime to dispatch to.
+        let observed: Arc<StdMutex<Vec<BackendKind>>> = Arc::new(StdMutex::new(Vec::new()));
+        let lima_runtime: Arc<dyn SessionRuntime> = Arc::new(StubRuntime {
+            kind: BackendKind::Lima,
+            capabilities: stub_capabilities(BackendKind::Lima),
+            observed: Arc::clone(&observed),
+        });
+        let mut map: HashMap<BackendKind, Arc<dyn SessionRuntime>> = HashMap::new();
+        map.insert(BackendKind::Lima, lima_runtime);
+        let runtimes = Arc::new(map);
+
+        let connector = GuestConnector::new(runtimes, Arc::clone(&store));
+        let err = connector
+            .send_request(&session.id, GuestRequest::Ping)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, SandboxError::Internal(ref msg) if msg.contains("no runtime registered")),
+            "expected Internal('no runtime registered ...'), got: {err:?}"
+        );
+        assert!(
+            observed.lock().unwrap().is_empty(),
+            "no transport should be opened"
+        );
     }
 }

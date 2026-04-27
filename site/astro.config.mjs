@@ -115,6 +115,7 @@ export default defineConfig({
             { label: 'Workspaces', slug: 'guides/workspaces' },
             { label: 'Network policies', slug: 'guides/network-policies' },
             { label: 'Hardening', slug: 'guides/hardening' },
+            { label: 'Lite mode', slug: 'guides/lite-mode' },
             { label: 'Integrate an agent', slug: 'guides/integrate-agent' },
             { label: 'Troubleshooting', slug: 'guides/troubleshooting' },
           ],

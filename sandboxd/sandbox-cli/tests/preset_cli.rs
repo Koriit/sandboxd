@@ -33,7 +33,7 @@ use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::Json;
-use axum::routing::{delete, post};
+use axum::routing::{delete, get, post};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
@@ -78,10 +78,32 @@ async fn spawn_fake_daemon_for_create() -> (TempDir, String, CapturedBody) {
                 },
             ),
         )
+        // M11-S4 Phase 4A: the CLI hits `GET /backends` once per
+        // invocation before sending `POST /sessions` (capability-driven
+        // client-side validation). Without this route the create
+        // would fail in the preflight with HTTP 404 before our
+        // `POST /sessions` capture runs. Serve a minimal Lima-only
+        // matrix so the preflight succeeds for these preset tests.
+        .route("/backends", get(fake_backends_lima_only))
         .with_state(captured_clone);
 
     spawn_unix_server(&sock_path, app).await;
     (tmp, sock_str, captured)
+}
+
+/// Minimal `/backends` body — a single Lima entry with the canonical
+/// capability matrix from [`sandbox_core::Capabilities::for_lima`].
+///
+/// Reused by every fake daemon in this file because Phase 4A's
+/// preflight does a single `GET /backends` per CLI invocation; without
+/// this route the CLI errors out before the test's request capture
+/// runs.
+async fn fake_backends_lima_only() -> Json<Value> {
+    let infos = vec![sandbox_core::backend::BackendInfo {
+        kind: sandbox_core::BackendKind::Lima,
+        capabilities: sandbox_core::Capabilities::for_lima(),
+    }];
+    Json(serde_json::to_value(infos).expect("BackendInfo always serializes"))
 }
 
 /// Build a JSON object that matches `sandbox_core::SessionDto` well

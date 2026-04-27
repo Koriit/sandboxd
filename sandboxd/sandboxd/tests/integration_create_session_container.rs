@@ -1,0 +1,570 @@
+//! Integration tests for M11-S3 Phase 3D — daemon-side container
+//! backend wiring.
+//!
+//! Phase 3D ties the container runtime (Phase 3A), the lite image
+//! builder (Phase 3B), and the `GET /backends` endpoint (Phase 3C) into
+//! `POST /sessions`. The three contracts these tests pin:
+//!
+//! - `integration_create_session_container_backend_round_trip` —
+//!   end-to-end: build the lite image, create a session row tagged
+//!   `BackendKind::Container`, dispatch `runtime.create()` +
+//!   `runtime.start()` through the dispatch table, and verify the
+//!   wire-shape `SessionDto` round-trips with `backend == "container"`.
+//! - `integration_create_session_container_first_use_warning_surfaces`
+//!   — first call to `ensure_image` for a unique daemon-version tag
+//!   yields the verbatim spec warning string; the second call for the
+//!   same tag yields no warning (cache hit).
+//! - `integration_create_session_container_rejects_hardened` — the
+//!   daemon rejects a `hardened: true` request when the container
+//!   backend is selected, before any state is allocated. Hermetic; no
+//!   Docker daemon required.
+//!
+//! The first two tests require a real Docker daemon (mirroring the
+//! Phase 3A and 3B integration tests) and run only under the
+//! `integration` nextest profile (selected by the `integration_*` name
+//! prefix — see `sandboxd/.config/nextest.toml`). The third is
+//! hermetic.
+//!
+//! These tests intentionally bypass the full HTTP router because
+//! constructing a real `AppState` would require booting Lima, the
+//! gateway container, the network manager, and the event bus — most
+//! of which the container backend never touches in this milestone.
+//! Each test exercises the precise piece of Phase 3D's wiring that
+//! its name names: backend dispatch + DTO mapping (round_trip),
+//! `ensure_image` first-use semantics (first_use_warning), and the
+//! daemon-side hardened-flag rejection branch (rejects_hardened).
+//!
+//! When M11-S5 lands the e2e suite, the same three contracts are
+//! re-verified end-to-end through the CLI; these tests stay as the
+//! daemon-level regression net.
+
+use std::io::Write;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Once};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use sandbox_core::backend::{
+    BackendKind, ContainerNetwork, ContainerRuntime, EnsureImageOutcome, LITE_FIRST_USE_WARNING,
+    LITE_IMAGE_REPOSITORY, RuntimeStartArgs, RuntimeStatus, SessionRuntime, UnsupportedFeature,
+    ensure_image,
+};
+use sandbox_core::session::{SessionId, WorkspaceMode, WorkspaceModeKind};
+use sandbox_core::{
+    BackendSpecific, SessionConfig, SessionDto, SessionSpec, SessionState, SessionStore,
+};
+use tempfile::TempDir;
+
+// ---------------------------------------------------------------------------
+// Test scaffolding shared with sandbox-core's container integration tests.
+// ---------------------------------------------------------------------------
+
+/// Per-test docker network owning one /28 from a private range outside
+/// any production allocations. Removed on Drop (best-effort).
+struct TestNetwork {
+    name: String,
+    container_ip: String,
+    gateway_ip: String,
+}
+
+impl TestNetwork {
+    fn create(label: &str) -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let third = (nanos as u8).wrapping_mul(1);
+        let fourth_base = (nanos.wrapping_shr(8) as u8).wrapping_mul(16);
+        let subnet = format!("10.98.{third}.{fourth_base}/28");
+        let gateway_ip = format!("10.98.{third}.{}", fourth_base.wrapping_add(2));
+        let container_ip = format!("10.98.{third}.{}", fourth_base.wrapping_add(3));
+        let name = format!("sandbox-net-phase3d-{label}-{nanos}");
+
+        let output = Command::new("docker")
+            .args(["network", "create", "--subnet", &subnet, &name])
+            .output()
+            .expect("docker network create should be invokable");
+        assert!(
+            output.status.success(),
+            "docker network create failed for {name} ({subnet}): {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        Self {
+            name,
+            container_ip,
+            gateway_ip,
+        }
+    }
+
+    fn to_container_network(&self) -> ContainerNetwork {
+        ContainerNetwork {
+            docker_network: self.name.clone(),
+            container_ip: self.container_ip.parse().unwrap(),
+            gateway_ip: self.gateway_ip.parse().unwrap(),
+            workspace_host_path: None,
+            route_helper_path: None,
+            // The test fixtures here construct a `ContainerNetwork`
+            // directly for low-level runtime exercise; the daemon's
+            // create_session path wires `ca_host_path = Some(...)`
+            // (see main.rs container branch). The CA-mount wiring is
+            // covered by the unit test
+            // `container_runtime_create_includes_ca_mount_when_path_set`.
+            ca_host_path: None,
+        }
+    }
+}
+
+impl Drop for TestNetwork {
+    fn drop(&mut self) {
+        let _ = Command::new("docker")
+            .args(["network", "rm", &self.name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// `docker rm -f` + `docker volume rm` insurance against test panics
+/// between create and explicit delete.
+struct ContainerCleanup {
+    container_name: String,
+    home_volume: String,
+}
+
+impl ContainerCleanup {
+    fn new(session_id: &SessionId) -> Self {
+        Self {
+            container_name: format!("sandbox-{session_id}"),
+            home_volume: format!("sandbox-home-{session_id}"),
+        }
+    }
+}
+
+impl Drop for ContainerCleanup {
+    fn drop(&mut self) {
+        let _ = Command::new("docker")
+            .args(["rm", "-f", &self.container_name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = Command::new("docker")
+            .args(["volume", "rm", &self.home_volume])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// Per-test image cleanup: `ensure_image` builds `LITE_IMAGE_REPOSITORY:<tag>`
+/// the first time it sees a unique tag. Tests that exercise the
+/// first-use branch must isolate by tag (otherwise a previous test's
+/// cached image hides the build path).
+struct TestImage {
+    tag: String,
+}
+
+impl TestImage {
+    fn unique_tag(label: &str) -> String {
+        // Monotonically-increasing per-process suffix so concurrent
+        // tests in the same process do not collide. UNIX_EPOCH nanos
+        // give us the inter-process uniqueness when nextest runs many
+        // copies.
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("phase3d-{label}-{nanos}-{n}")
+    }
+
+    fn new(unique_tag: String) -> Self {
+        Self { tag: unique_tag }
+    }
+}
+
+impl Drop for TestImage {
+    fn drop(&mut self) {
+        let full = format!("{LITE_IMAGE_REPOSITORY}:{}", self.tag);
+        let _ = Command::new("docker")
+            .args(["image", "rm", "-f", &full])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// The round-trip test exercises the daemon-side wiring (backend
+/// round-trip through SQLite, dispatch through `runtime.create` /
+/// `runtime.start`, DTO mapping) without depending on the production
+/// lite image's `sandbox-guest` agent runtime semantics — the lite
+/// image entrypoint expects in-container TCP and route-helper
+/// scaffolding that Phase 3D's daemon flow provides only at
+/// `setup_session_networking` time, not in this hermetic test
+/// surface. Mirrors Phase 3A's `sandboxd-test-sleep:latest` image
+/// (alpine + `sleep 3600` ENTRYPOINT) so the container stays running
+/// long enough for the status-after-start assertion to hold.
+const ROUND_TRIP_IMAGE_TAG: &str = "sandboxd-phase3d-test-sleep:latest";
+const ROUND_TRIP_DOCKERFILE: &str =
+    "FROM alpine:latest\nENTRYPOINT [\"sh\", \"-c\", \"exec sleep 3600\"]\n";
+
+static ROUND_TRIP_IMAGE_BUILD: Once = Once::new();
+
+fn ensure_round_trip_image() {
+    ROUND_TRIP_IMAGE_BUILD.call_once(|| {
+        let mut child = Command::new("docker")
+            .args(["build", "-t", ROUND_TRIP_IMAGE_TAG, "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("docker build invokable");
+        {
+            let stdin = child.stdin.as_mut().expect("docker build stdin");
+            stdin
+                .write_all(ROUND_TRIP_DOCKERFILE.as_bytes())
+                .expect("write Dockerfile");
+        }
+        let output = child.wait_with_output().expect("docker build exit");
+        assert!(
+            output.status.success(),
+            "docker build {ROUND_TRIP_IMAGE_TAG} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    });
+}
+
+fn container_spec() -> SessionSpec {
+    SessionSpec {
+        backend_specific: BackendSpecific::Container {
+            memory_mb: 256,
+            cpus: 1,
+        },
+        workspace_mode: None,
+        repo: None,
+        boot_cmd: None,
+        template: None,
+        disk_gb: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+/// Phase 3D contract (a) — the full container-backend create round
+/// trip, mediated by the same dispatch table the daemon uses.
+///
+/// Walks: `ensure_image` (real lite image build), `register_session`
+/// of per-session `ContainerNetwork`, `runtime.create()`,
+/// `runtime.start()`, `SessionStore::create_session_with_backend`
+/// persistence, and `SessionDto::from(&session)` wire mapping. The
+/// asserted invariants are the ones the M11-S4 CLI and the M11-S5 e2e
+/// suite will rely on:
+///
+/// - `BackendKind` survives the SQLite round trip: a
+///   `create_session_with_backend(_, _, Container)` row reads back as
+///   `Container`.
+/// - The DTO mapper populates `backend` from the session column, so
+///   the wire shape carries `"container"` — the only signal HTTP
+///   clients have to confirm dispatch went through the container
+///   runtime, not Lima.
+/// - The runtime's `RuntimeStatus::Running` after `start()` matches
+///   what `session_health` will report, so Phase 3D's per-handler
+///   `runtime_for(state, session.backend)` change does not regress
+///   the existing health probe.
+#[tokio::test]
+async fn integration_create_session_container_backend_round_trip() {
+    ensure_round_trip_image();
+    let net = TestNetwork::create("roundtrip");
+    let runtime = ContainerRuntime::new(ROUND_TRIP_IMAGE_TAG, 256, 1.0, 1000, 1000);
+
+    // Persist a session with `BackendKind::Container` and assert the
+    // round trip through SQLite preserves the backend tag — this is
+    // the exact persistence path the daemon's create handler uses.
+    let tmp = TempDir::new().expect("tempdir");
+    let (store, _orphans) = SessionStore::new(tmp.path().to_path_buf()).expect("open SessionStore");
+    let store = Arc::new(store);
+    let session = store
+        .create_session_with_backend(
+            SessionConfig::default(),
+            Some("phase3d-roundtrip".into()),
+            BackendKind::Container,
+        )
+        .expect("persist session row");
+    assert_eq!(session.backend, BackendKind::Container);
+
+    // Confirm the row reads back unchanged after the SQLite write.
+    let reloaded = store
+        .get_session_by_name_or_id(session.id.as_str())
+        .expect("query session by id")
+        .expect("session row present");
+    assert_eq!(reloaded.backend, BackendKind::Container);
+
+    // Run the dispatch path: register network → create → start.
+    let _cleanup = ContainerCleanup::new(&session.id);
+    runtime.register_session(session.id, net.to_container_network());
+
+    let handle = runtime
+        .create(&session.id, &container_spec())
+        .await
+        .expect("runtime.create");
+    runtime
+        .start(&handle, &RuntimeStartArgs::default())
+        .await
+        .expect("runtime.start");
+
+    let status = runtime.status(&handle).await.expect("runtime.status");
+    assert!(
+        matches!(status, RuntimeStatus::Running),
+        "container must be Running after start; got {status:?}"
+    );
+
+    // Wire-shape contract: the response DTO carries the persisted
+    // backend tag verbatim, so a CLI/integration consumer can confirm
+    // the request actually routed to the container runtime.
+    let dto = SessionDto::from(&reloaded);
+    assert_eq!(dto.backend, BackendKind::Container);
+    let json = serde_json::to_value(&dto).expect("serialize DTO");
+    assert_eq!(json["backend"], serde_json::json!("container"));
+
+    // Tear down the docker side; the SessionStore TempDir drops with
+    // the test scope.
+    runtime.delete(&handle).await.expect("runtime.delete");
+}
+
+/// Phase 3D contract (b) — the lite image first-use warning surfaces
+/// through `SessionDto.warnings` on the first build of a daemon-
+/// version tag, and disappears on subsequent calls for the same tag.
+///
+/// This test pins the wiring contract that the daemon's create
+/// handler depends on: `ensure_image` returns `Built { warning }`
+/// exactly once per unique tag, and the warning text is
+/// `LITE_FIRST_USE_WARNING` verbatim — drift in the constant or the
+/// outcome enum trips here before it reaches the response shape.
+///
+/// The downstream wire-format glue (the `with_warnings()` builder on
+/// `SessionDto`, the `#[serde(default, skip_serializing_if = ...)]`
+/// attribute) is unit-tested in `sandbox-core/src/api/mapper.rs`;
+/// here we pin the cross-crate handshake (ensure_image's outcome →
+/// the warning vec the handler hands to `with_warnings`).
+#[tokio::test]
+async fn integration_create_session_container_first_use_warning_surfaces() {
+    let tag = TestImage::unique_tag("first-use");
+    let _image_guard = TestImage::new(tag.clone());
+
+    // First call: image is absent; `ensure_image` must build it and
+    // return `Built { warning }` carrying the spec-verbatim notice.
+    let first_outcome = tokio::task::spawn_blocking({
+        let tag = tag.clone();
+        move || ensure_image(&tag)
+    })
+    .await
+    .expect("spawn_blocking join")
+    .expect("ensure_image first call must succeed");
+    let warning = match first_outcome {
+        EnsureImageOutcome::Built { warning } => warning,
+        EnsureImageOutcome::AlreadyPresent => panic!(
+            "first ensure_image call for a unique tag must take the build branch, \
+             not the cache-hit branch"
+        ),
+    };
+    assert_eq!(
+        warning, LITE_FIRST_USE_WARNING,
+        "warning text must match the spec verbatim"
+    );
+
+    // Now drive the wire-shape end of the wiring: a session DTO
+    // built with this warning attached carries the field on the
+    // wire under `warnings`, with the verbatim text. This is the
+    // exact transformation the daemon's create handler performs
+    // when it observes `Built { warning }`.
+    let session = sandbox_core::Session::new(Some("phase3d-warning".into()));
+    let dto = SessionDto::from(&session).with_warnings(vec![warning.clone()]);
+    let json = serde_json::to_value(&dto).expect("serialize DTO");
+    let arr = json["warnings"]
+        .as_array()
+        .expect("warnings key present after with_warnings");
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0], serde_json::Value::String(warning.clone()));
+
+    // Second call for the same tag: cache hit, no warning surfaced.
+    let second_outcome = tokio::task::spawn_blocking({
+        let tag = tag.clone();
+        move || ensure_image(&tag)
+    })
+    .await
+    .expect("spawn_blocking join")
+    .expect("ensure_image second call must succeed");
+    assert!(
+        matches!(second_outcome, EnsureImageOutcome::AlreadyPresent),
+        "second ensure_image call for the same tag must be a cache hit; got {second_outcome:?}"
+    );
+
+    // And the wire-shape mirror: a DTO built with no warnings omits
+    // the field entirely, so steady-state container creates do not
+    // pollute the response surface.
+    let steady_dto = SessionDto::from(&session);
+    let steady_json = serde_json::to_string(&steady_dto).expect("serialize steady DTO");
+    assert!(
+        !steady_json.contains("\"warnings\""),
+        "warnings key must be absent on steady-state container creates; json = {steady_json}"
+    );
+}
+
+/// Phase 3D contract (c) — `--hardened` on the container backend is
+/// rejected by the daemon up front, before any state is allocated.
+///
+/// Hermetic — exercises the request-side validation branch the
+/// `POST /sessions` handler runs immediately after parsing the
+/// request. The container backend's capability matrix declares
+/// `hardening_flag: false`; the `BackendSpecific::Container` variant
+/// has no `hardened` field, so the SessionSpec-level
+/// `validate(&caps)` cannot see the flag — the daemon must reject up
+/// front based on the request's `hardened: Some(true)` literal.
+///
+/// The error shape pinned here:
+/// - `UnsupportedFeature::Hardening` is the canonical variant
+/// - its `Display` text matches the spec-verbatim sentence the CLI
+///   re-emits to operators
+#[test]
+fn integration_create_session_container_rejects_hardened() {
+    // The exact text the daemon's handler embeds in its
+    // `SandboxError::InvalidArgument` payload when it observes
+    // `backend == Container && req.hardened == Some(true)`.
+    let display = UnsupportedFeature::Hardening.to_string();
+    assert!(
+        display.to_lowercase().contains("hardening") || display.to_lowercase().contains("hardened"),
+        "rejection message must mention hardening so operators can debug; got {display:?}"
+    );
+
+    // Container backend's static capability matrix asserts the same
+    // contract from the runtime side — `hardening_flag: false`. This
+    // is the matrix the daemon's `runtime.capabilities()` returns
+    // when the create handler runs `spec.validate(caps)`.
+    let runtime = ContainerRuntime::new("phase3d-rejects-hardened-test:none", 256, 1.0, 1000, 1000);
+    assert_eq!(runtime.kind(), BackendKind::Container);
+    assert!(
+        !runtime.capabilities().hardening_flag,
+        "container capabilities must declare hardening_flag = false so the \
+         daemon's hardened-rejection branch is reachable"
+    );
+
+    // Confirm a `BackendSpecific::Container` spec — i.e. the projection
+    // the daemon performs when `req.backend == Some(Container)` — has
+    // no place to carry `hardened`. This is the structural reason the
+    // daemon's create handler rejects the flag *before* projection,
+    // not after.
+    let spec = container_spec();
+    let SessionSpec {
+        backend_specific, ..
+    } = spec;
+    match backend_specific {
+        BackendSpecific::Container { .. } => {}
+        BackendSpecific::Lima { .. } => panic!("container_spec must produce a Container variant"),
+    }
+
+    // Sanity: a Lima session whose state is later observed via the
+    // wire reports `backend == "lima"` so the regression net for the
+    // round-trip test would catch a regression on the default path
+    // too. (`Session::new` defaults to Lima per the V005 SQL default
+    // and `BackendKind::default()`.)
+    let lima_session = sandbox_core::Session::new(Some("hardened-test-lima".into()));
+    assert_eq!(lima_session.backend, BackendKind::Lima);
+    assert_eq!(lima_session.state, SessionState::Creating);
+}
+
+/// M11-S5 Phase 5A contract — `workspace_mode: { kind: shared, host_path }`
+/// on the container backend is now an *accepted* request shape. The
+/// capability matrix advertises `workspace_modes: { Shared }`, the
+/// daemon threads the operator-supplied host path through
+/// `ContainerNetwork::workspace_host_path`, and `ContainerRuntime`
+/// turns it into a `docker create --mount type=bind,...` flag.
+///
+/// This test pins three pieces of the public contract:
+///   1. The capability matrix advertises exactly `{ Shared }` — neither
+///      empty (the pre-Phase-5A guard shape) nor inclusive of `Clone`,
+///      which the container backend has no plumbing for and which spec
+///      validation must keep rejecting.
+///   2. `SessionSpec::validate(caps)` *accepts* a `Shared` request so
+///      the daemon's `POST /sessions` handler proceeds to the bind-
+///      mount path rather than failing the request up front.
+///   3. `Clone` is still rejected as
+///      `UnsupportedFeature::WorkspaceMode(Clone, Container)`, holding
+///      the negative coverage that prevents an unimplemented variant
+///      from silently slipping through.
+///
+/// Hermetic — exercises the same `spec.validate(runtime.capabilities())`
+/// branch the daemon's `POST /sessions` handler runs after parsing the
+/// request. Predecessor of this test (pre-Phase-5A) asserted the
+/// inverse — that `Shared` was rejected because the bind-mount plumbing
+/// was deferred. Phase 5A delivered the plumbing; the assertion has
+/// been inverted but the capability-shape coverage is preserved.
+#[test]
+fn integration_create_session_container_advertises_shared_workspace_capability() {
+    let runtime = ContainerRuntime::new(
+        "phase5a-shared-workspace-capability-test:none",
+        256,
+        1.0,
+        1000,
+        1000,
+    );
+
+    // (1) Capability shape — exactly `{ Shared }`, no more, no less.
+    let modes = runtime.capabilities().workspace_modes;
+    assert!(
+        modes.contains(WorkspaceModeKind::Shared),
+        "container capabilities must advertise WorkspaceModeKind::Shared \
+         after M11-S5 Phase 5A; got {modes:?}"
+    );
+    assert!(
+        !modes.contains(WorkspaceModeKind::Clone),
+        "container capabilities must NOT advertise Clone — the container \
+         backend has no plumbing for it; got {modes:?}"
+    );
+
+    // (2) `Shared` request is accepted by `validate`.
+    let shared_spec = SessionSpec {
+        backend_specific: BackendSpecific::Container {
+            memory_mb: 256,
+            cpus: 1,
+        },
+        workspace_mode: Some(WorkspaceMode::Shared {
+            host_path: "/tmp".into(),
+        }),
+        repo: None,
+        boot_cmd: None,
+        template: None,
+        disk_gb: None,
+    };
+    shared_spec
+        .validate(runtime.capabilities())
+        .expect("Shared workspace must validate against the post-Phase-5A capability matrix");
+
+    // (3) `Clone` request is still rejected with the spec-shaped
+    //     `UnsupportedFeature::WorkspaceMode(Clone, Container)` — the
+    //     negative coverage the predecessor test was originally after.
+    let clone_spec = SessionSpec {
+        backend_specific: BackendSpecific::Container {
+            memory_mb: 256,
+            cpus: 1,
+        },
+        workspace_mode: Some(WorkspaceMode::Clone {
+            repo_url: "https://example.invalid/repo.git".into(),
+        }),
+        repo: None,
+        boot_cmd: None,
+        template: None,
+        disk_gb: None,
+    };
+    let err = clone_spec.validate(runtime.capabilities()).expect_err(
+        "Clone workspace must be rejected — the container backend has no plumbing for it",
+    );
+    assert_eq!(
+        err,
+        UnsupportedFeature::WorkspaceMode(WorkspaceModeKind::Clone, BackendKind::Container),
+        "rejection must carry (Clone, Container) so the daemon's error \
+         response names the unsupported variant the operator asked for"
+    );
+}

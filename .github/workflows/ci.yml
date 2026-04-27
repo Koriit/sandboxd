@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 jobs:
-  build-and-test:
+  cargo:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -43,3 +43,78 @@ jobs:
       - name: Clippy
         working-directory: sandboxd
         run: cargo clippy --workspace -- -D warnings
+
+  # PR-time + push-to-main: container backend only. Spec § "CI policy"
+  # (lines ~1060-1070): "PR | Full E2E against container only | ~5-10 min".
+  # Lite has no Lima/KVM dependency, so this job runs unmodified on stock
+  # GitHub-hosted `ubuntu-latest` runners.
+  e2e-container:
+    runs-on: ubuntu-latest
+    needs: cargo
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            sandboxd/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('sandboxd/**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run container-only E2E suite
+        run: make test-e2e-container
+
+  # Merge-to-main: full matrix -- both backends. Spec § "CI policy":
+  # "Merge to main | Full E2E matrix (both backends) | ~30-45 min".
+  #
+  # The Lima half of the matrix requires `/dev/kvm` (nested virtualization),
+  # which stock GitHub-hosted `ubuntu-latest` runners do NOT provide. The
+  # job is therefore gated on a `[self-hosted, kvm]` runner label. Until
+  # that runner is provisioned, the job will queue without scheduling and
+  # the matrix coverage will not run on push-to-main.
+  #
+  # We deliberately do NOT silently degrade this job to container-only:
+  # that would defeat the policy and lose the Lima coverage that the
+  # matrix exists to preserve. See the CI policy section in
+  # `docs/internal/milestones/M11.md` and the runner-provisioning handoff
+  # in `.tasks/handoffs/`.
+  e2e-matrix:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, kvm]
+    needs: cargo
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            sandboxd/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('sandboxd/**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run full-matrix E2E suite
+        run: make test-e2e-matrix

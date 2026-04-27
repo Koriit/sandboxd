@@ -12,6 +12,7 @@
 //! can build a DTO without consuming the owned domain value (which is
 //! often still needed elsewhere in the response path).
 
+use crate::backend::{BackendKind, compute_default_resource_limits};
 use crate::policy::{AssuranceLevel, Policy, PolicyRule};
 use crate::session::{Session, SessionConfig, WorkspaceMode};
 
@@ -23,16 +24,49 @@ use super::dto::{PolicyDto, PolicyLevelDto, PolicyRuleDto, SessionConfigDto, Ses
 
 impl From<&Session> for SessionDto {
     fn from(session: &Session) -> Self {
+        // Backend-aware resolved-default surfacing for the wire-only
+        // `resolved_cpus`/`resolved_memory_mb` fields. The container
+        // backend persists `0` as the "unset" sentinel and lets
+        // `ContainerRuntime::resource_ceilings` substitute the daemon's
+        // host-80% default at create-time (spec § "Resource defaults —
+        // container only"); surfacing that resolved pair on the wire
+        // lets HTTP-level callers confirm the actually-applied
+        // ceiling without inspecting cgroup files. Lima sessions don't
+        // use the sentinel — `cpus`/`memory_mb` are already the
+        // applied values.
+        let mut config: SessionConfigDto = (&session.config).into();
+        let (resolved_cpus, resolved_memory_mb) = match session.backend {
+            BackendKind::Container => {
+                let (default_memory_mb, default_cpus) = compute_default_resource_limits();
+                let cpus = if session.config.cpus == 0 {
+                    default_cpus
+                } else {
+                    session.config.cpus as f64
+                };
+                let memory_mb = if session.config.memory_mb == 0 {
+                    default_memory_mb
+                } else {
+                    session.config.memory_mb
+                };
+                (cpus, memory_mb)
+            }
+            BackendKind::Lima => (session.config.cpus as f64, session.config.memory_mb),
+        };
+        config.resolved_cpus = resolved_cpus;
+        config.resolved_memory_mb = resolved_memory_mb;
+
         Self {
             id: session.id,
             name: session.name.clone(),
             state: session.state,
             created_at: session.created_at,
             updated_at: session.updated_at,
-            config: (&session.config).into(),
+            config,
             guest_agent_status: None,
             gateway_status: None,
             policy: None,
+            warnings: Vec::new(),
+            backend: session.backend,
         }
     }
 }
@@ -65,14 +99,40 @@ impl SessionDto {
         self.policy = policy.map(PolicyDto::from);
         self
     }
+
+    /// Attach operator-facing warnings to the DTO.
+    ///
+    /// Currently exercised only by `POST /sessions` for the container
+    /// backend's first-use lite-image build notice (M11-S3 Phase 3D);
+    /// kept generic so future warnings (e.g. resource ceiling
+    /// substitutions) can plumb through the same path. An empty
+    /// `Vec` is a no-op and round-trips as the wire field being
+    /// omitted entirely (`#[serde(skip_serializing_if = "Vec::is_empty")]`
+    /// on the DTO field).
+    pub fn with_warnings(mut self, warnings: Vec<String>) -> Self {
+        self.warnings = warnings;
+        self
+    }
 }
 
 impl From<&SessionConfig> for SessionConfigDto {
+    /// Project the persisted [`SessionConfig`] onto the wire DTO.
+    ///
+    /// `resolved_cpus` / `resolved_memory_mb` start at the persisted
+    /// values here (Lima-style passthrough); the backend-aware
+    /// resolution lives in [`SessionDto::from`], which has access to
+    /// the session's backend kind. Callers that build a
+    /// `SessionConfigDto` outside of the `SessionDto` path therefore
+    /// see a Lima-shaped passthrough — accurate for VM sessions, and
+    /// safely the same as the persisted value for container sessions
+    /// that explicitly set non-zero `cpus`/`memory_mb`.
     fn from(config: &SessionConfig) -> Self {
         Self {
             cpus: config.cpus,
             memory_mb: config.memory_mb,
             disk_gb: config.disk_gb,
+            resolved_cpus: config.cpus as f64,
+            resolved_memory_mb: config.memory_mb,
             workspace_mode: config.workspace_mode.as_ref().map(render_workspace_mode),
             hardened: config.hardened,
             repo: config.repo.clone(),
@@ -150,6 +210,37 @@ mod tests {
         assert!(
             !json.contains("\"policy\""),
             "policy key must be absent from wire when None; json = {json}"
+        );
+    }
+
+    #[test]
+    fn session_dto_omits_warnings_when_empty() {
+        // No `warnings` populated → wire must not contain the key,
+        // matching the "additive on the wire" contract for Phase 3D.
+        let session = Session::new(Some("warnings-empty".into()));
+        let dto = SessionDto::from(&session);
+        assert!(dto.warnings.is_empty());
+
+        let json = serde_json::to_string(&dto).unwrap();
+        assert!(
+            !json.contains("\"warnings\""),
+            "warnings key must be omitted when empty; json = {json}"
+        );
+    }
+
+    #[test]
+    fn session_dto_includes_warnings_when_attached() {
+        let session = Session::new(Some("warnings-set".into()));
+        let dto = SessionDto::from(&session).with_warnings(vec![
+            "lite: first use on this daemon version — building lite image".into(),
+        ]);
+
+        let json = serde_json::to_value(&dto).unwrap();
+        let arr = json["warnings"].as_array().expect("warnings array on wire");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(
+            arr[0],
+            serde_json::json!("lite: first use on this daemon version — building lite image")
         );
     }
 
@@ -310,5 +401,90 @@ mod tests {
             clone_dto.workspace_mode.as_deref(),
             Some("clone:https://github.com/example/app.git")
         );
+    }
+
+    #[test]
+    fn session_dto_resolves_container_zero_sentinels_to_host_defaults() {
+        // Container session with the `0`-sentinel persisted shape (caller
+        // did not pass `--cpus`/`--memory`). The DTO must surface the
+        // daemon's host-80% default in `resolved_*`, not the stored 0,
+        // so HTTP clients can verify the actually-applied ceiling.
+        let config = SessionConfig {
+            cpus: 0,
+            memory_mb: 0,
+            disk_gb: 20,
+            workspace_mode: None,
+            hardened: false,
+            repo: None,
+            boot_cmd: None,
+            template: None,
+        };
+        let session = Session::with_config_and_backend(
+            Some("lite-resolve".into()),
+            config,
+            crate::backend::BackendKind::Container,
+        );
+        let dto = SessionDto::from(&session);
+
+        // Stored values pass through untouched.
+        assert_eq!(dto.config.cpus, 0);
+        assert_eq!(dto.config.memory_mb, 0);
+
+        // Resolved values match `compute_default_resource_limits`.
+        let (default_memory_mb, default_cpus) = compute_default_resource_limits();
+        assert!(
+            (dto.config.resolved_cpus - default_cpus).abs() < f64::EPSILON,
+            "resolved_cpus should equal compute_default_resource_limits.1; \
+             got {}, expected {}",
+            dto.config.resolved_cpus,
+            default_cpus,
+        );
+        assert_eq!(
+            dto.config.resolved_memory_mb, default_memory_mb,
+            "resolved_memory_mb should equal compute_default_resource_limits.0",
+        );
+    }
+
+    #[test]
+    fn session_dto_passes_explicit_container_resources_through_resolved_fields() {
+        // Container session with non-zero `cpus`/`memory_mb` (caller
+        // passed `--cpus`/`--memory`). The DTO must echo those values
+        // verbatim under `resolved_*` — no host-80% substitution.
+        let config = SessionConfig {
+            cpus: 4,
+            memory_mb: 8192,
+            disk_gb: 20,
+            workspace_mode: None,
+            hardened: false,
+            repo: None,
+            boot_cmd: None,
+            template: None,
+        };
+        let session = Session::with_config_and_backend(
+            Some("lite-explicit".into()),
+            config,
+            crate::backend::BackendKind::Container,
+        );
+        let dto = SessionDto::from(&session);
+
+        assert_eq!(dto.config.cpus, 4);
+        assert_eq!(dto.config.memory_mb, 8192);
+        assert!(
+            (dto.config.resolved_cpus - 4.0).abs() < f64::EPSILON,
+            "explicit cpus must round-trip as f64",
+        );
+        assert_eq!(dto.config.resolved_memory_mb, 8192);
+    }
+
+    #[test]
+    fn session_dto_lima_resolved_fields_mirror_stored() {
+        // Lima sessions never use the `0`-sentinel — `resolved_*`
+        // mirrors `cpus`/`memory_mb` as plain f64/u32 so consumers
+        // can rely on a single field for the applied value.
+        let session = Session::new(Some("lima-default".into()));
+        let dto = SessionDto::from(&session);
+        assert_eq!(dto.backend, crate::backend::BackendKind::Lima);
+        assert_eq!(dto.config.cpus, dto.config.resolved_cpus as u32);
+        assert_eq!(dto.config.memory_mb, dto.config.resolved_memory_mb);
     }
 }

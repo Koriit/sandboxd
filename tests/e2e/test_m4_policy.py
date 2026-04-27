@@ -8,6 +8,16 @@ and are SLOW (3-10 minutes per test).  Run with generous timeouts:
     cd tests/e2e
     source .venv/bin/activate
     python -m pytest test_m4_policy.py -v --timeout=600
+
+Backend coverage: **agnostic** — every test in this file is parametrized
+over ``[lima, container]`` via the ``backend`` fixture. Policy
+enforcement runs through the shared gateway container (Envoy +
+mitmproxy + CoreDNS + nftables) which is wired into both backends per
+the M11 gap-#70 closure, so the deny / transport / TLS / HTTP
+contracts hold identically. The fail-closed-before-DNS-propagation
+contract (``test_l3_fail_closed_before_dns_propagation``) likewise
+holds on both backends because it depends on the gateway's L1
+materialisation order, not on the session-runtime kind.
 """
 
 from __future__ import annotations
@@ -20,10 +30,10 @@ import time
 import pytest
 
 from conftest import (
-    _VM_RESOURCE_ARGS,
     capture_lima_logs,
     cleanup_policy_file,
     gateway_container_name,
+    make_create_args,
     parse_session_id,
     wait_for_state,
     write_policy_file,
@@ -169,7 +179,7 @@ def _read_envoy_access_log(session_id: str) -> tuple[str, list[dict]]:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.timeout(600)
-def test_level0_denied(sandbox_cli):
+def test_level0_denied(sandbox_cli, backend):
     """Empty policy (no rules) should deny all traffic: DNS returns NXDOMAIN,
     HTTP connections fail.
     """
@@ -182,8 +192,7 @@ def test_level0_denied(sandbox_cli):
 
         # Create session with the empty policy.
         result = sandbox_cli(
-            "create", "--name", "pol-deny-all",
-            *_VM_RESOURCE_ARGS, "--policy", policy_path,
+            "create", *make_create_args(backend, "pol-deny-all", "--policy", policy_path),
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -233,7 +242,7 @@ def test_level0_denied(sandbox_cli):
 
 
 @pytest.mark.timeout(600)
-def test_level1_transport_tcp(sandbox_cli):
+def test_level1_transport_tcp(sandbox_cli, backend):
     """Policy allows example.com:80/tcp at level 'transport'. curl http://example.com
     should succeed via opaque TCP passthrough.
     """
@@ -254,8 +263,7 @@ def test_level1_transport_tcp(sandbox_cli):
         policy_path = write_policy_file(policy)
 
         result = sandbox_cli(
-            "create", "--name", "pol-l1-tcp",
-            *_VM_RESOURCE_ARGS, "--policy", policy_path,
+            "create", *make_create_args(backend, "pol-l1-tcp", "--policy", policy_path),
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -310,7 +318,7 @@ def test_level1_transport_tcp(sandbox_cli):
 
 
 @pytest.mark.timeout(600)
-def test_level1_transport_udp(sandbox_cli):
+def test_level1_transport_udp(sandbox_cli, backend):
     """Policy allows DNS to 8.8.8.8 at level 'transport' protocol 'udp'.
     Verify DNS query to 8.8.8.8 works.
 
@@ -346,8 +354,7 @@ def test_level1_transport_udp(sandbox_cli):
         policy_path = write_policy_file(policy)
 
         result = sandbox_cli(
-            "create", "--name", "pol-l1-udp",
-            *_VM_RESOURCE_ARGS, "--policy", policy_path,
+            "create", *make_create_args(backend, "pol-l1-udp", "--policy", policy_path),
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -387,7 +394,7 @@ def test_level1_transport_udp(sandbox_cli):
 
 
 @pytest.mark.timeout(600)
-def test_level2_tls_verified(sandbox_cli):
+def test_level2_tls_verified(sandbox_cli, backend):
     """Policy allows example.com at level 'tls'. HTTPS should succeed and the
     certificate should be the REAL cert (not mitmproxy CA), since TLS level
     does SNI extraction without MITM.
@@ -409,8 +416,7 @@ def test_level2_tls_verified(sandbox_cli):
         policy_path = write_policy_file(policy)
 
         result = sandbox_cli(
-            "create", "--name", "pol-l2-tls",
-            *_VM_RESOURCE_ARGS, "--policy", policy_path,
+            "create", *make_create_args(backend, "pol-l2-tls", "--policy", policy_path),
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -497,7 +503,7 @@ def test_level2_tls_verified(sandbox_cli):
 
 
 @pytest.mark.timeout(600)
-def test_level3_http_inspected(sandbox_cli):
+def test_level3_http_inspected(sandbox_cli, backend):
     """Policy allows example.com at level 'http'. HTTPS should succeed but the
     certificate should show mitmproxy/Sandbox CA (MITM inspection is active).
     """
@@ -519,8 +525,7 @@ def test_level3_http_inspected(sandbox_cli):
         policy_path = write_policy_file(policy)
 
         result = sandbox_cli(
-            "create", "--name", "pol-l3-inspect",
-            *_VM_RESOURCE_ARGS, "--policy", policy_path,
+            "create", *make_create_args(backend, "pol-l3-inspect", "--policy", policy_path),
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -811,7 +816,7 @@ def test_level3_http_inspected(sandbox_cli):
 
 
 @pytest.mark.timeout(600)
-def test_level3_host_mismatch(sandbox_cli):
+def test_level3_host_mismatch(sandbox_cli, backend):
     """Policy allows only api.github.com at level 'http'. Accessing
     evil.example.com should be blocked at the DNS level (NXDOMAIN).
 
@@ -836,8 +841,7 @@ def test_level3_host_mismatch(sandbox_cli):
         policy_path = write_policy_file(policy)
 
         result = sandbox_cli(
-            "create", "--name", "pol-l3-host",
-            *_VM_RESOURCE_ARGS, "--policy", policy_path,
+            "create", *make_create_args(backend, "pol-l3-host", "--policy", policy_path),
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -881,7 +885,7 @@ def test_level3_host_mismatch(sandbox_cli):
 
 
 @pytest.mark.timeout(600)
-def test_level3_method_restriction(sandbox_cli):
+def test_level3_method_restriction(sandbox_cli, backend):
     """Policy allows httpbin.org at level 'http' with only GET filters.
     A POST request should get HTTP 599 (policy-denied).
     """
@@ -903,8 +907,7 @@ def test_level3_method_restriction(sandbox_cli):
         policy_path = write_policy_file(policy)
 
         result = sandbox_cli(
-            "create", "--name", "pol-l3-method",
-            *_VM_RESOURCE_ARGS, "--policy", policy_path,
+            "create", *make_create_args(backend, "pol-l3-method", "--policy", policy_path),
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -963,7 +966,7 @@ def test_level3_method_restriction(sandbox_cli):
 
 
 @pytest.mark.timeout(600)
-def test_level3_path_restriction(sandbox_cli):
+def test_level3_path_restriction(sandbox_cli, backend):
     """Policy allows a host at level 'http' with a single `/api/*` filter.
     Requests to /other/path should get HTTP 599 (policy-denied).
     """
@@ -985,8 +988,7 @@ def test_level3_path_restriction(sandbox_cli):
         policy_path = write_policy_file(policy)
 
         result = sandbox_cli(
-            "create", "--name", "pol-l3-path",
-            *_VM_RESOURCE_ARGS, "--policy", policy_path,
+            "create", *make_create_args(backend, "pol-l3-path", "--policy", policy_path),
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -1048,7 +1050,7 @@ def test_level3_path_restriction(sandbox_cli):
 
 
 @pytest.mark.timeout(600)
-def test_l3_fail_closed_before_dns_propagation(sandbox_cli):
+def test_l3_fail_closed_before_dns_propagation(sandbox_cli, backend):
     """Envoy must fail-closed for an L3-allowed domain whose IPs have not
     yet been propagated into the listener file.
 
@@ -1087,8 +1089,7 @@ def test_l3_fail_closed_before_dns_propagation(sandbox_cli):
         policy_path = write_policy_file(policy)
 
         result = sandbox_cli(
-            "create", "--name", "pol-l3-failclosed",
-            *_VM_RESOURCE_ARGS, "--policy", policy_path,
+            "create", *make_create_args(backend, "pol-l3-failclosed", "--policy", policy_path),
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -1215,7 +1216,7 @@ def test_l3_fail_closed_before_dns_propagation(sandbox_cli):
 
 
 @pytest.mark.timeout(600)
-def test_policy_update(sandbox_cli):
+def test_policy_update(sandbox_cli, backend):
     """Create with a policy allowing example.com. Verify it works. Update the
     policy to allow httpbin.org instead. Verify example.com is now denied and
     httpbin.org works.
@@ -1239,8 +1240,7 @@ def test_policy_update(sandbox_cli):
         policy_path_1 = write_policy_file(policy_1)
 
         result = sandbox_cli(
-            "create", "--name", "pol-update",
-            *_VM_RESOURCE_ARGS, "--policy", policy_path_1,
+            "create", *make_create_args(backend, "pol-update", "--policy", policy_path_1),
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -1355,7 +1355,7 @@ def test_policy_update(sandbox_cli):
 
 
 @pytest.mark.timeout(600)
-def test_dns_nxdomain(sandbox_cli):
+def test_dns_nxdomain(sandbox_cli, backend):
     """Policy allows only example.com. DNS lookup for notallowed.com should
     return NXDOMAIN.
     """
@@ -1376,8 +1376,7 @@ def test_dns_nxdomain(sandbox_cli):
         policy_path = write_policy_file(policy)
 
         result = sandbox_cli(
-            "create", "--name", "pol-dns-nx",
-            *_VM_RESOURCE_ARGS, "--policy", policy_path,
+            "create", *make_create_args(backend, "pol-dns-nx", "--policy", policy_path),
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -1422,7 +1421,7 @@ def test_dns_nxdomain(sandbox_cli):
 
 
 @pytest.mark.timeout(600)
-def test_dns_ip_propagation(sandbox_cli):
+def test_dns_ip_propagation(sandbox_cli, backend):
     """Policy allows example.com. After DNS resolution, nftables rules in the
     gateway container should contain the resolved IP for example.com.
     """
@@ -1443,8 +1442,7 @@ def test_dns_ip_propagation(sandbox_cli):
         policy_path = write_policy_file(policy)
 
         result = sandbox_cli(
-            "create", "--name", "pol-dns-ip",
-            *_VM_RESOURCE_ARGS, "--policy", policy_path,
+            "create", *make_create_args(backend, "pol-dns-ip", "--policy", policy_path),
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -1532,15 +1530,14 @@ def test_dns_ip_propagation(sandbox_cli):
 
 
 @pytest.mark.timeout(600)
-def test_empty_policy_denies_dns(sandbox_cli):
+def test_empty_policy_denies_dns(sandbox_cli, backend):
     """Creating a session with no `--policy` must produce a fail-closed default:
     CoreDNS returns NXDOMAIN for everything and HTTP is unreachable.
     """
     session_id = None
     try:
         result = sandbox_cli(
-            "create", "--name", "pol-empty-default",
-            *_VM_RESOURCE_ARGS,
+            "create", *make_create_args(backend, "pol-empty-default"),
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -1597,7 +1594,7 @@ def test_empty_policy_denies_dns(sandbox_cli):
 
 
 @pytest.mark.timeout(600)
-def test_policy_clear_reverts_to_deny_all(sandbox_cli):
+def test_policy_clear_reverts_to_deny_all(sandbox_cli, backend):
     """Create a session with an HTTP-level policy, then clear it via
     `sandbox policy update --clear`. Afterwards traffic must be denied.
     """
@@ -1623,8 +1620,7 @@ def test_policy_clear_reverts_to_deny_all(sandbox_cli):
         policy_path = write_policy_file(policy)
 
         result = sandbox_cli(
-            "create", "--name", "pol-clear",
-            *_VM_RESOURCE_ARGS, "--policy", policy_path,
+            "create", *make_create_args(backend, "pol-clear", "--policy", policy_path),
             timeout=600,
         )
         assert result.returncode == 0, (

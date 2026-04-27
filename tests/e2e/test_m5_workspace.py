@@ -7,6 +7,13 @@ Run with generous timeouts:
     cd tests/e2e
     source .venv/bin/activate
     python -m pytest test_m5_workspace.py -v --timeout=600
+
+Backend coverage: **agnostic** — parametrized over ``[lima, container]``
+via the ``backend`` fixture. ``--repo``, ``sandbox cp``, and
+``--workspace shared:`` are spec-required behaviours on both backends
+(spec § "Workspace" lines ~570-595); ``test_lite.py`` already covers
+``--workspace shared:`` for the container backend, and this
+parametrization extends the rest to the matrix.
 """
 
 from __future__ import annotations
@@ -17,8 +24,8 @@ import tempfile
 import pytest
 
 from conftest import (
-    _VM_RESOURCE_ARGS,
     cleanup_policy_file,
+    make_create_args,
     parse_session_id,
     wait_for_state,
     write_policy_file,
@@ -29,10 +36,19 @@ from conftest import (
 # ---------------------------------------------------------------------------
 
 @pytest.mark.timeout(600)
-def test_clone_repo(sandbox_cli):
+def test_clone_repo(sandbox_cli, backend):
     """Create a session with --repo pointing to a small public repo.
     Verify the repository is cloned into /home/agent/workspace/.
     """
+    if backend == "container":
+        pytest.skip(
+            "Clone workspace mode not supported on container backend. "
+            "Per spec § Capabilities, container backend advertises only "
+            "WorkspaceMode::Bind (Lima advertises Bind+Clone). The "
+            "container session-create path rejects --repo at the API "
+            "boundary with 'workspace mode Clone is not supported by "
+            "the container backend'."
+        )
     session_id = None
     policy_path = None
     try:
@@ -53,10 +69,12 @@ def test_clone_repo(sandbox_cli):
         policy_path = write_policy_file(policy)
 
         result = sandbox_cli(
-            "create", "--name", "ws-clone",
-            *_VM_RESOURCE_ARGS,
-            "--policy", policy_path,
-            "--repo", "https://github.com/octocat/Hello-World.git",
+            "create",
+            *make_create_args(
+                backend, "ws-clone",
+                "--policy", policy_path,
+                "--repo", "https://github.com/octocat/Hello-World.git",
+            ),
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -103,7 +121,7 @@ def test_clone_repo(sandbox_cli):
 
 
 @pytest.mark.timeout(600)
-def test_cp_host_to_vm(sandbox_cli):
+def test_cp_host_to_vm(sandbox_cli, backend):
     """Create a session, create a temp file locally, use `sandbox cp` to
     upload it into the VM, then verify contents via `sandbox exec`.
     """
@@ -111,8 +129,7 @@ def test_cp_host_to_vm(sandbox_cli):
     local_file = None
     try:
         result = sandbox_cli(
-            "create", "--name", "ws-cp-up",
-            *_VM_RESOURCE_ARGS,
+            "create", *make_create_args(backend, "ws-cp-up"),
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -167,7 +184,7 @@ def test_cp_host_to_vm(sandbox_cli):
 
 
 @pytest.mark.timeout(600)
-def test_cp_vm_to_host(sandbox_cli):
+def test_cp_vm_to_host(sandbox_cli, backend):
     """Create a session, create a file in the VM via `sandbox exec`, then
     use `sandbox cp` to download it to the host and verify contents.
     """
@@ -175,8 +192,7 @@ def test_cp_vm_to_host(sandbox_cli):
     local_file = None
     try:
         result = sandbox_cli(
-            "create", "--name", "ws-cp-down",
-            *_VM_RESOURCE_ARGS,
+            "create", *make_create_args(backend, "ws-cp-down"),
             timeout=600,
         )
         assert result.returncode == 0, (
@@ -234,10 +250,21 @@ def test_cp_vm_to_host(sandbox_cli):
 
 
 @pytest.mark.timeout(600)
-def test_shared_mount(sandbox_cli):
+def test_shared_mount(sandbox_cli, backend):
     """Create a session with --workspace shared:<tmpdir>.
     Verify bidirectional file visibility between host and VM.
     """
+    if backend == "container":
+        pytest.skip(
+            "Lima-only path assertions: this test reads/writes at "
+            "/home/agent/workspace/<file>, which is the Lima bind "
+            "target. Per spec § Workspace, the container backend "
+            "binds the host path to /workspace (line 569: 'Bind mount "
+            "/host/path -> /workspace'). The container-side bind-mount "
+            "lifecycle is covered end-to-end by "
+            "test_lite.py::test_lite_workspace_uid_alignment, so the "
+            "container-backend bind contract is already gated."
+        )
     session_id = None
     host_dir = None
     try:
@@ -245,9 +272,11 @@ def test_shared_mount(sandbox_cli):
         host_dir = tempfile.mkdtemp(prefix="sandbox-shared-ws-")
 
         result = sandbox_cli(
-            "create", "--name", "ws-shared",
-            *_VM_RESOURCE_ARGS,
-            "--workspace", f"shared:{host_dir}",
+            "create",
+            *make_create_args(
+                backend, "ws-shared",
+                "--workspace", f"shared:{host_dir}",
+            ),
             timeout=600,
         )
         assert result.returncode == 0, (
