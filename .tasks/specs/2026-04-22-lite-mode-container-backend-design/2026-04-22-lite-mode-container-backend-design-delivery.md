@@ -32,19 +32,24 @@ Path conventions (all absolute to repo root unless qualified):
 
 | Section | Claims | (a) shipped | (b) out-of-scope | (c) tracked-todo | Blockers |
 |---------|-------:|------------:|-----------------:|-----------------:|---------:|
-| LM1 — Context / Install-time setup        |  17 |  17 | 0 | 0 | 0 |
-| LM2 — Architecture                         |  21 |  21 | 0 | 0 | 0 |
-| LM3 — Image building                       |  18 |  18 | 0 | 0 | 0 |
-| LM4 — Container specifics: networking      |  36 |  36 | 0 | 0 | 0 |
-| LM5 — Container specifics: hardening       |  18 |  17 | 0 | 1 | 0 |
-| LM6 — Container specifics: workspace+home+resources+lifecycle | 19 | 19 | 0 | 0 | 0 |
-| LM7 — Capabilities model                   |  18 |  18 | 0 | 0 | 0 |
-| LM8 — CLI & UX                             |  29 |  28 | 0 | 1 | 0 |
-| LM9 — Persistence                          |  13 |  13 | 0 | 0 | 0 |
-| LM10 — Testing                             |  24 |  21 | 1 | 2 | 0 |
-| LM11 — Rollout                             |  16 |  16 | 0 | 0 | 0 |
+| LM1 — Context / Install-time setup        |  17 |  16 |  1 | 0 | 0 |
+| LM2 — Architecture                         |  21 |  21 |  0 | 0 | 0 |
+| LM3 — Image building                       |  18 |  16 |  2 | 0 | 0 |
+| LM4 — Container specifics: networking      |  36 |  36 |  0 | 0 | 0 |
+| LM5 — Container specifics: hardening       |  18 |  17 |  0 | 1 | 0 |
+| LM6 — Container specifics: workspace+home+resources+lifecycle | 19 | 18 |  1 | 0 | 0 |
+| LM7 — Capabilities model                   |  18 |  18 |  0 | 0 | 0 |
+| LM8 — CLI & UX                             |  29 |  27 |  1 | 1 | 0 |
+| LM9 — Persistence                          |  13 |  13 |  0 | 0 | 0 |
+| LM10 — Testing                             |  24 |  23 |  0 | 2 | 0 |
+| LM11 — Rollout                             |  16 |  16 |  0 | 0 | 0 |
 | LM12 — Non-goals (out-of-scope conformance)|  10 |   0 | 10 | 0 | 0 |
-| **Grand total**                            | **239** | **224** | **11** | **4** | **0** |
+| **Grand total**                            | **239** | **221** | **15** | **4** | **0** |
+
+Note: LM10.24 carries both `(a)` (PR/merge-to-main split shipped) and
+`(c)` (nightly perf benchmarks deferred — todos #73/#74); it is counted
+in both the (a) and (c) columns above. Subtract 1 from (a) for the
+unique-claim count (220 unique (a)).
 
 Proposed new todos: **0** (all deferred items are covered by existing
 todos #66/#69/#71/#72; the remaining gaps map to spec "Non-goals" /
