@@ -153,7 +153,7 @@ sandbox policy update dev --clear
 - **Envoy L3 filter chains (level `http` destinations)** — driven by DNS. Envoy only knows which IPs belong to an L3-inspected domain after CoreDNS resolves that domain and sandboxd rewrites the listener file. For a brand-new L3 rule, the first request races the propagation loop: if the client's TLS handshake begins before Envoy picks up the rewritten listener (typically sub-second), Envoy finds no matching filter chain and drops the connection. Retrying or warming DNS with a prior `getent hosts` / `nslookup` closes the race.
 - **nftables allow rules** — follow the same DNS-driven path. An IP literal dialed before CoreDNS has answered for its name is dropped.
 
-The behavior is deliberately fail-closed: an unknown destination is denied, never silently passed through. See [networking → Fail-closed propagation](/concepts/networking/#fail-closed-propagation-for-level-3) for the mechanism.
+The behavior is deliberately fail-closed: an unknown destination is denied, never silently passed through. See [networking → Synchronous DNS-policy gating](/concepts/networking/#synchronous-dns-policy-gating) for the mechanism.
 
 If you need to block until the new policy is live (e.g. in a setup script that immediately dials an L3 destination), sandboxd emits a `policy_propagated` lifecycle event once CoreDNS, nftables, and Envoy have all reconciled to the latest policy hash:
 

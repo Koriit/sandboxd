@@ -156,7 +156,7 @@ Expansion is entirely client-side — the daemon receives the fully materialized
 
 ## Observability
 
-Every policy-enforcing component (CoreDNS, Envoy, mitmproxy, deny-logger) emits a structured event per decision, and sandboxd itself emits lifecycle events — including `policy_applied`, `policy_updated`, `policy_propagated`, `gateway_ready`, and `gateway_shutdown`. All of them land in a unified per-session stream you can replay or follow with `sandbox events <session>`. The `policy_propagated` event in particular closes the DNS-propagation window: it fires once the applied policy's hash has reconciled across CoreDNS, the nftables `policy_allow_{tcp,udp}` sets, and Envoy's L3 filter chains. See [`sandbox events`](/reference/cli/#sandbox-events) for the full CLI surface and [networking → Fail-closed propagation](/concepts/networking/#fail-closed-propagation-for-level-3) for why the propagation is observable at all.
+Every policy-enforcing component (CoreDNS, Envoy, mitmproxy, deny-logger) emits a structured event per decision, and sandboxd itself emits lifecycle events — including `policy_applied`, `policy_updated`, `policy_propagated`, `gateway_ready`, and `gateway_shutdown`. All of them land in a unified per-session stream you can replay or follow with `sandbox events <session>`. The `policy_propagated` event in particular closes the DNS-propagation window: it fires once the applied policy's hash has reconciled across CoreDNS, the nftables `policy_allow_{tcp,udp}` sets, and Envoy's L3 filter chains. See [`sandbox events`](/reference/cli/#sandbox-events) for the full CLI surface and [networking → Synchronous DNS-policy gating](/concepts/networking/#synchronous-dns-policy-gating) for why the propagation is observable at all.
 
 ## Related reading
 
