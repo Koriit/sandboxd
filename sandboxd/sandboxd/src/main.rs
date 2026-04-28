@@ -930,7 +930,17 @@ async fn create_session(
             (cpus, None)
         }
         BackendKind::Container => match cpus_decimal_request {
-            None => (0, None),
+            // `Some(0.0)` is semantically identical to `None` — both
+            // mean "no caller-specified value, fall back to the
+            // host-80% default" (the mapper that consumes
+            // `cpus_decimal` substitutes the default whenever the
+            // stored f64 is 0.0). Normalise both inputs to `(0, None)`
+            // so the persisted state is bit-equal across the two
+            // shapes; otherwise an explicit `--cpus 0.0` would
+            // round-trip as `cpus_decimal: Some(0.0)` while an
+            // omitted flag round-trips as `cpus_decimal: None`,
+            // diverging on the wire for no semantic reason.
+            None | Some(0.0) => (0, None),
             Some(precise) => {
                 let normalised = round_cpus_one_decimal(precise);
                 // `cpus` (u32) holds the floored value as a fallback
@@ -1422,6 +1432,38 @@ async fn create_session(
         // time.)
         if let Err(e) = state.store.update_state(&session_id, SessionState::Running) {
             cleanup_lite_gateway_and_return!(error_response(e).into_response());
+        }
+
+        // Guest-readiness gate. Mirrors the Lima branch's
+        // `state.guest.ping` at line ~1911: gate every guest-touching
+        // dispatch below (apply_policy is gateway-only, but
+        // `prewarm_guest_dns`/`state.guest.exec` for `--repo` and
+        // `--boot-cmd` all go through the agent's TCP listener at
+        // 127.0.0.1:5123). Without this gate, a fast `connect-refused`
+        // before the agent has bound its socket would surface as a
+        // transport error and route through `fail_explicit_repo_clone` /
+        // `fail_explicit_boot_cmd`, marking the session `Error`
+        // flakily. The lite image's entrypoint is `sandbox-guest`, so
+        // the listener is up shortly after `docker start` returns; the
+        // 30s `GUEST_REQUEST_TIMEOUT` inside `ping` covers the boot
+        // tail-latency the same way it does for Lima. Failures take
+        // the gateway+network teardown path because the gateway has
+        // already been brought up above.
+        match state.guest.ping(&session_id).await {
+            Ok(true) => {
+                info!(%session_id, "guest agent responded to ping (lite)");
+            }
+            Ok(false) => {
+                let err = SandboxError::Internal(
+                    "guest agent returned unexpected response to ping".into(),
+                );
+                error!(%session_id, "guest agent ping: unexpected response (lite)");
+                cleanup_lite_gateway_and_return!(error_response(err).into_response());
+            }
+            Err(e) => {
+                error!(%session_id, error = %e, "guest agent ping failed (lite)");
+                cleanup_lite_gateway_and_return!(error_response(e).into_response());
+            }
         }
 
         // Apply the explicit `--policy <file>` (or `--preset <invocation>`,

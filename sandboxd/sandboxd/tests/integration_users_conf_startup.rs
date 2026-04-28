@@ -102,8 +102,9 @@ fn spawn_and_wait_for_exit(users_conf: Option<&str>) -> (String, i32) {
     }
 
     // `tmp` is held until end of function; on drop it cleans up the
-    // socket / base dir / users.conf.
-    // must come after stderr read
+    // socket / base dir / users.conf. Must come after stderr read —
+    // closing the tempdir while stderr is still draining drops the
+    // abstract socket binding underneath the daemon.
     drop(tmp);
 
     (stderr_output, exit_code)
