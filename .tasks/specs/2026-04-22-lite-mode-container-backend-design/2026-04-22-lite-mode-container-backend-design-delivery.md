@@ -35,25 +35,30 @@ Path conventions (all absolute to repo root unless qualified):
 | LM1 — Context / Install-time setup                            |      17 |          16 |                1 |                0 |        0 |
 | LM2 — Architecture                                            |      21 |          21 |                0 |                0 |        0 |
 | LM3 — Image building                                          |      18 |          16 |                2 |                0 |        0 |
-| LM4 — Container specifics: networking                         |      36 |          36 |                0 |                0 |        0 |
-| LM5 — Container specifics: hardening                          |      18 |          17 |                0 |                1 |        0 |
-| LM6 — Container specifics: workspace+home+resources+lifecycle |      19 |          18 |                1 |                0 |        0 |
+| LM4 — Container specifics: networking                         |      37 |          37 |                0 |                0 |        0 |
+| LM5 — Container specifics: hardening                          |      18 |          18 |                0 |                0 |        0 |
+| LM6 — Container specifics: workspace+home+resources+lifecycle |      23 |          22 |                1 |                0 |        0 |
 | LM7 — Capabilities model                                      |      18 |          18 |                0 |                0 |        0 |
-| LM8 — CLI & UX                                                |      29 |          27 |                1 |                1 |        0 |
+| LM8 — CLI & UX                                                |      31 |          30 |                1 |                0 |        0 |
 | LM9 — Persistence                                             |      13 |          13 |                0 |                0 |        0 |
-| LM10 — Testing                                                |      24 |          23 |                0 |                2 |        0 |
+| LM10 — Testing                                                |      24 |          24 |                0 |                1 |        0 |
 | LM11 — Rollout                                                |      16 |          16 |                0 |                0 |        0 |
 | LM12 — Non-goals (out-of-scope conformance)                   |      10 |           0 |               10 |                0 |        0 |
-| **Grand total**                                               | **239** |     **221** |           **15** |            **4** |    **0** |
+| **Grand total**                                               | **246** |     **231** |           **15** |            **1** |    **0** |
 
 Note: LM10.24 carries both `(a)` (PR/merge-to-main split shipped) and
 `(c)` (nightly perf benchmarks deferred — todos #73/#74); it is counted
 in both the (a) and (c) columns above. Subtract 1 from (a) for the
-unique-claim count (220 unique (a)).
+unique-claim count (230 unique (a)).
 
-Proposed new todos: **0** (all deferred items are covered by existing
-todos #66/#69/#71/#72; the remaining gaps map to spec "Non-goals" /
-"What we are not testing" / "Explicit non-goals" exclusions).
+Post-M11-S7: **0 proposed new todos**. All previously-tracked items
+that were in M11-S7 scope (#61, #62, #63, #64, #66, #67, #69, #71,
+#72, #75, #76, #77, #78, #79, #80) are closed; the remaining trackers
+(#73 KVM runner, #74 nightly perf, #60 nix bump, #65 commit
+disentanglement) carry forward as M12+ / orchestrator concerns. The
+rootless-Docker skip on `test_lite_workspace_uid_alignment` (Non-goal
+LM12.2) carries forward into M11-S8, which lands the daemon-side
+refusal + `--force-rootless-docker` escape hatch.
 
 ---
 
@@ -200,7 +205,7 @@ todos #66/#69/#71/#72; the remaining gaps map to spec "Non-goals" /
 
 ---
 
-## LM4 — Container specifics: networking (LM4.1 – LM4.36)
+## LM4 — Container specifics: networking (LM4.1 – LM4.37)
 
 ### Networking shape (LM4.1 – LM4.4)
 
@@ -287,24 +292,32 @@ todos #66/#69/#71/#72; the remaining gaps map to spec "Non-goals" /
 | ------ | ------------------------------------------------------------------------------------------------------------------------ | ------ | ------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
 | LM4.35 | Daemon: no host caps; only docker+kvm group; helper for route install; CAP_SYS_ADMIN intentionally not granted to daemon | (a)    | spec § "Daemon privilege (unchanged)"; daemon process has no setcap; helper gets cap_sys_admin only at install time | docs `:301-308`; helper has cap_sys_admin doc-comment `:43-47` |
 
+> Note — LM4.36 (per-session MITM CA bind-mount, added during M11-S6 Class D resolution) is captured in the "Defect-class resolution → Class D" appendix below for narrative continuity. Its claim row is reproduced there rather than here.
+
+### M11-S7 additions: Backend-agnostic session network surface (LM4.37)
+
+| #      | Claim                                                                                                                                                                                                                                                                                                                                                                          | Status | Code                                                                                                                                                                                                                                                                                                                            | Test                                                                                                                                                                                                                                                                                              |
+| ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| LM4.37 | `SessionDto.network: Option<SessionNetworkInfo>` exposes per-session networking via `GET /sessions/{id}` so test code and operator tooling can ask the daemon instead of regex-matching CLI output. Same shape on both backends: `{ gateway_ip, session_ip, session_subnet_cidr }`; sourced from the daemon's persisted `NetworkInfo`. M11-S7 commit `651a635` (closes todo #72) | (a)    | `sandboxd/sandbox-core/src/api/dto.rs:95` `SessionDto.network`; `:127-136` `pub struct SessionNetworkInfo { gateway_ip, session_ip, session_subnet_cidr }`; `sandboxd/sandbox-core/src/api/mapper.rs:139` `SessionDto::with_network`; `sandboxd/sandboxd/src/main.rs:2412-2432` `session_network_info_for` (reads `NetworkInfo`) | `sandboxd/sandbox-core/src/api/mapper.rs:608` `session_dto_with_network_renders_complete_block`; `:584` `session_dto_omits_network_and_mounts_when_none`; `:714` `session_dto_v0_record_without_network_or_mounts_round_trips` (forward-compat); cross-backend e2e usage in `tests/e2e/test_m3_networking.py:184` `test_gateway_traffic_flow`, `:484` `test_stop_start_with_networking`, `:620` `test_concurrent_sessions` (all three now read these fields via `sandbox inspect` instead of pinning to `10.209.x.x/28`) |
+
 ---
 
 ## LM5 — Container specifics: hardening (LM5.1 – LM5.18)
 
 | #      | Claim                                                                                 | Status | Code                                                                                                                                           | Test                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | ------ | ------------------------------------------------------------------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| LM5.1  | `--read-only` (rootfs immutable)                                                      | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:444` `"--read-only"`                                                                           | `..._hardening_flags_match_spec`; `tests/e2e/test_lite.py:185` `test_lite_rootfs_is_readonly`                                                                                                                                                                                                                                                                                                                         |
-| LM5.2  | `--tmpfs /tmp` `rw,nosuid,nodev,size=256m`                                            | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:445-446, 157` `TMPFS_TMP_FLAGS = "rw,nosuid,nodev,size=256m"`                                  | `..._hardening_flags_match_spec` (asserts exact flag string)                                                                                                                                                                                                                                                                                                                                                          |
-| LM5.3  | `--tmpfs /run` `rw,nosuid,nodev,size=16m`                                             | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:447-448, 158` `TMPFS_RUN_FLAGS = "rw,nosuid,nodev,size=16m"`                                   | `..._hardening_flags_match_spec`                                                                                                                                                                                                                                                                                                                                                                                      |
-| LM5.4  | `--security-opt no-new-privileges`                                                    | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:449-450` `"--security-opt"`, `"no-new-privileges"`                                             | `..._hardening_flags_match_spec`                                                                                                                                                                                                                                                                                                                                                                                      |
-| LM5.5  | `--security-opt seccomp=default`                                                      | (c)    | spec text says `seccomp=default` but Docker CLI accepts `seccomp=builtin`; impl uses `seccomp=builtin` (correct), spec text needs trivial edit | `.tasks/progress.json` **todo #66** "Spec patch: § Hardening line 542 lists 'seccomp=default' which is INVALID Docker CLI syntax. Correct spelling is 'seccomp=builtin'… Tiny edit; fold into M11 spec-cleanup pass before close." Target: M11 spec-cleanup. Implementation already correct (`sandbox-core/src/backend/container.rs:451-452, 34-40`); test `..._hardening_flags_match_spec` asserts `seccomp=builtin` |
-| LM5.6  | `--cap-drop ALL`                                                                      | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:453-454`                                                                                       | `..._hardening_flags_match_spec`                                                                                                                                                                                                                                                                                                                                                                                      |
-| LM5.7  | `--user 1000:1000` (or calling uid/gid if host uid ≠ 1000)                            | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:455-456`; `:996+` `map_container_uid_gid`                                                      | `tests/e2e/test_lite.py:508` `test_lite_workspace_uid_alignment` (skipif rootless docker — see todo #68/LM10.21 for re-enablement story)                                                                                                                                                                                                                                                                              |
-| LM5.8  | `--pids-limit 512`                                                                    | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:457-458, 161` `PIDS_LIMIT = 512`                                                               | `..._hardening_flags_match_spec`                                                                                                                                                                                                                                                                                                                                                                                      |
-| LM5.9  | `--memory <mb>` (configured or default)                                               | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:459-460`                                                                                       | `..._hardening_flags_match_spec`                                                                                                                                                                                                                                                                                                                                                                                      |
-| LM5.10 | `--cpus <n>` (configured or default)                                                  | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:461-462`; format helper at `:1414` `format_cpus(0.8) = "0.8"`                                  | `..._hardening_flags_match_spec`                                                                                                                                                                                                                                                                                                                                                                                      |
-| LM5.11 | `--restart no` (daemon owns restart semantics)                                        | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:463-464`                                                                                       | `..._hardening_flags_match_spec`                                                                                                                                                                                                                                                                                                                                                                                      |
-| LM5.12 | Operators cannot relax these (defaults applied unconditionally)                       | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:436-466` argv is unconditional (no operator-relaxation flag)                                   | `sandboxd/sandboxd/tests/integration_create_session_container.rs:425` `..._rejects_hardened` (HTTP 400 if hardening surface attempted)                                                                                                                                                                                                                                                                                |
+| LM5.1  | `--read-only` (rootfs immutable)                                                      | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:483` `"--read-only"`                                                                           | `..._hardening_flags_match_spec`; `tests/e2e/test_lite.py:185` `test_lite_rootfs_is_readonly`                                                                                                                                                                                                                                                                                                                         |
+| LM5.2  | `--tmpfs /tmp` `rw,nosuid,nodev,size=256m`                                            | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:484-485, 157` `TMPFS_TMP_FLAGS = "rw,nosuid,nodev,size=256m"`                                  | `..._hardening_flags_match_spec` (asserts exact flag string)                                                                                                                                                                                                                                                                                                                                                          |
+| LM5.3  | `--tmpfs /run` `rw,nosuid,nodev,size=16m`                                             | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:486-487, 158` `TMPFS_RUN_FLAGS = "rw,nosuid,nodev,size=16m"`                                   | `..._hardening_flags_match_spec`                                                                                                                                                                                                                                                                                                                                                                                      |
+| LM5.4  | `--security-opt no-new-privileges`                                                    | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:488-489` `"--security-opt"`, `"no-new-privileges"`                                             | `..._hardening_flags_match_spec`                                                                                                                                                                                                                                                                                                                                                                                      |
+| LM5.5  | `--security-opt seccomp=builtin`                                                      | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:491` `"seccomp=builtin"`; module-level rationale at `:34-40`; spec § Hardening line 546 now reads `seccomp=builtin` (corrected in commit `6822a0d` — todo #66 closed)              | `..._hardening_flags_match_spec` asserts `seccomp=builtin`                                                                                                                                                                                                                                                                                                                                                          |
+| LM5.6  | `--cap-drop ALL`                                                                      | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:492-493`                                                                                       | `..._hardening_flags_match_spec`                                                                                                                                                                                                                                                                                                                                                                                      |
+| LM5.7  | `--user 1000:1000` (or calling uid/gid if host uid ≠ 1000)                            | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:494-495`; `:996+` `map_container_uid_gid`                                                      | `tests/e2e/test_lite.py:510` `test_lite_workspace_uid_alignment` (skipif rootless docker — daemon-side enforcement scoped to M11-S8)                                                                                                                                                                                                                                                                              |
+| LM5.8  | `--pids-limit 512`                                                                    | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:496-497, 161` `PIDS_LIMIT = 512`                                                               | `..._hardening_flags_match_spec`                                                                                                                                                                                                                                                                                                                                                                                      |
+| LM5.9  | `--memory <mb>` (configured or default)                                               | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:498-499`                                                                                       | `..._hardening_flags_match_spec`                                                                                                                                                                                                                                                                                                                                                                                      |
+| LM5.10 | `--cpus <n>` (configured or default)                                                  | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:500-501`; format helper at `:843` `format_cpus(0.8) = "0.8"`                                   | `..._hardening_flags_match_spec`; one-decimal precision pinned end-to-end via LM6.22                                                                                                                                                                                                                                                                                                                                  |
+| LM5.11 | `--restart no` (daemon owns restart semantics)                                        | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:502-503`                                                                                       | `..._hardening_flags_match_spec`                                                                                                                                                                                                                                                                                                                                                                                      |
+| LM5.12 | Operators cannot relax these (defaults applied unconditionally)                       | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:481-508` argv is unconditional (no operator-relaxation flag)                                   | `sandboxd/sandboxd/tests/integration_create_session_container.rs:425` `..._rejects_hardened` (HTTP 400 if hardening surface attempted)                                                                                                                                                                                                                                                                                |
 | LM5.13 | Docker-in-Docker breaks (no privileged, no /var/run/docker.sock)                      | (a)    | cap-drop=ALL forbids privileged; no docker-socket bind in argv                                                                                 | `tests/e2e/test_lite.py:201` `test_lite_blocks_docker_in_docker`                                                                                                                                                                                                                                                                                                                                                      |
 | LM5.14 | FUSE breaks (CAP_SYS_ADMIN dropped)                                                   | (a)    | cap-drop=ALL covers this                                                                                                                       | follows from LM5.6                                                                                                                                                                                                                                                                                                                                                                                                    |
 | LM5.15 | Kernel modules unloadable                                                             | (a)    | userns-less default-seccomp container blocks                                                                                                   | rationale; covered by LM5.5/LM5.6                                                                                                                                                                                                                                                                                                                                                                                     |
@@ -314,14 +327,14 @@ todos #66/#69/#71/#72; the remaining gaps map to spec "Non-goals" /
 
 ---
 
-## LM6 — Container specifics: workspace+home+resources+lifecycle (LM6.1 – LM6.19)
+## LM6 — Container specifics: workspace+home+resources+lifecycle (LM6.1 – LM6.23)
 
 ### Workspace bind + UID alignment (LM6.1 – LM6.3)
 
 | #     | Claim                                                              | Status | Code                                                                                      | Test                                                                    |
 | ----- | ------------------------------------------------------------------ | ------ | ----------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| LM6.1 | Bind mount `/host/path → /workspace` (same as Lima semantics)      | (a)    | `sandboxd/sandbox-core/src/backend/container.rs::create` issues `-v <host>:/workspace:rw` | `tests/e2e/test_lite.py:508` `test_lite_workspace_uid_alignment`        |
-| LM6.2 | UID alignment: `--user <host-uid>:<host-gid>` when host uid ≠ 1000 | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:996+` `map_container_uid_gid`             | `tests/e2e/test_lite.py:508` (skipif rootless docker — Non-goal LM12.x) |
+| LM6.1 | Bind mount `/host/path → /home/agent/workspace/` (unified with Lima semantics — M11-S7 commit `5fadccf`)      | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:448-459` `create` issues `-v <host>:/home/agent/workspace/:rw` (was `/workspace` pre-S7); spec § Workspace line 569 also updated in `6822a0d` | `tests/e2e/test_lite.py:510` `test_lite_workspace_uid_alignment`; cross-backend `tests/e2e/test_m5_workspace.py:248` `test_shared_mount` (now runs on `[container]` after path unification)        |
+| LM6.2 | UID alignment: `--user <host-uid>:<host-gid>` when host uid ≠ 1000 | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:996+` `map_container_uid_gid`             | `tests/e2e/test_lite.py:510` (skipif rootless docker — Non-goal LM12.x; daemon-side enforcement scoped to M11-S8) |
 | LM6.3 | No userns-remap (would force chown on host files; destructive)     | (a)    | argv contains no `--userns` flag; `sandbox-core/src/backend/container.rs:436-466`         | grep `--userns` in container.rs returns 0 hits                          |
 
 ### Per-session home volume (LM6.4 – LM6.7)
@@ -355,6 +368,15 @@ todos #66/#69/#71/#72; the remaining gaps map to spec "Non-goals" /
 | LM6.18 | `exec_interactive`: docker exec -it streaming stdio                                   | (a)    | `sandboxd/sandbox-core/src/backend/container.rs::exec_interactive`                                           | `tests/e2e/test_lite.py:286` `test_lite_git_remote_sandbox`                                                       |
 | LM6.19 | Restart owned by daemon (`--restart=no`); reconcile drops stray containers on startup | (a)    | `--restart=no` argv (LM5.11); `sandboxd/sandboxd/src/main.rs:5907-5934` orphan reaper invocation             | `sandboxd/sandbox-core/tests/integration_orphan_reaper.rs:173` `..._removes_orphans_and_preserves_live_resources` |
 
+### M11-S7 additions: Clone-on-container + boot_cmd symmetry + mount surface (LM6.20 – LM6.23)
+
+| #      | Claim                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | Status | Code                                                                                                                                                                                                                                                                                                                                                                                  | Test                                                                                                                                                                                                                                                                                                                                                                  |
+| ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| LM6.20 | `--repo` clone runtime path on container backend: daemon dispatches `state.guest.exec("git", ["clone", repo_url, "/home/agent/workspace/"])` post-`docker start`, pre-ready, mirroring Lima's clone path. Reuses `fail_explicit_repo_clone` envelope and the existing DNS pre-warm. M11-S7 commit `5fadccf`                                                                                                                                                                  | (a)    | `sandboxd/sandboxd/src/main.rs:1471-1584` (container `--repo` branch with all four match arms — non-zero exit, guest-agent error, unexpected response, transport error — routed through `fail_explicit_repo_clone`); reuses `prewarm_guest_dns` for repo host pre-warm                                                                                                                | `sandboxd/sandboxd/tests/integration_create_session_container.rs:509` `integration_create_session_container_advertises_workspace_capabilities` (validation accepts both `Shared` and `Clone`); `tests/e2e/test_m5_workspace.py:39` `test_clone_repo` (now backend-agnostic — runs on `[lima, container]` after S7 dropped the in-body `[container]` skip)                |
+| LM6.21 | `--boot-cmd` symmetry on container backend: daemon dispatches `state.guest.exec("bash", ["-c", boot_cmd])` after the optional clone, mirroring Lima's `--boot-cmd` path verbatim. Same four match arms routed through `fail_explicit_boot_cmd`; same 30s `GUEST_REQUEST_TIMEOUT` bound. M11-S7 commit `13d5dbe` (todo #77)                                                                                                                                                | (a)    | `sandboxd/sandboxd/src/main.rs:1586-1680` (container `--boot-cmd` branch with the four-arm `match`); reuses backend-agnostic `GuestConnector` over `ContainerTransport`'s `docker exec ... socat` channel — the lite Dockerfile's `tini -- sandbox-guest` entrypoint makes the same TCP-over-SSH protocol work on container side                                                       | `sandboxd/sandboxd/src/main.rs:7565` `fail_explicit_boot_cmd_marks_session_error_and_returns_5xx` (covers the failure envelope shared with the Lima path); the four-arm dispatch is a faithful replay of the Lima branch already covered by the Lima E2E suite                                                                                                          |
+| LM6.22 | `cpus` 1-decimal precision end-to-end on container backend: `BackendSpecific::Container { cpus: f32 }` widened from `u32`; `CreateSessionRequest.cpus` and `SessionConfigDto.cpus` widened to `f32`. Daemon normalises off-grid inputs via `round_cpus_one_decimal` (`(f * 10).round() / 10`) so `0.81 → 0.8`. Persistence: sibling `cpus_decimal: Option<f32>` on `SessionConfig` per CLAUDE.md persistence rules; older daemons rolling back still see a usable integer. M11-S7 commit `6dd5808` (todo #67) | (a)    | `sandboxd/sandbox-core/src/backend/spec.rs:74` `BackendSpecific::Container { cpus: f32 }` (was `u32`); `sandboxd/sandbox-core/src/api/dto.rs:197` `cpus: f32`; `sandboxd/sandbox-core/src/session.rs:289` `SessionConfig::cpus: u32` + `:342` `cpus_decimal: Option<f32>` with `#[serde(default)]` + `skip_serializing_if`; `sandboxd/sandboxd/src/main.rs:743` `round_cpus_one_decimal` | `sandboxd/sandboxd/src/main.rs:6496` `round_cpus_one_decimal_snaps_off_grid_inputs_to_grid` (asserts `0.81→0.8`, `1.55→1.5`, `2.04→2.0`, identity on grid values); `sandboxd/sandbox-core/src/session.rs:698` `cpus_decimal_round_trips_through_serde`; `:727` `legacy_record_without_cpus_decimal_deserialises` (forward-compat for older daemons) |
+| LM6.23 | `SessionDto.mounts: Option<SessionMountInfo>` exposes session bind layout via `GET /sessions/{id}`: `{ workspace_path, workspace_host_path?, ca_bundle_path?, home_volume? }`. `workspace_path` is the unified `/home/agent/workspace/` (LM6.1, post-S7). `ca_bundle_path` and `home_volume` populate on container only — Lima injects the CA via the guest agent and uses a regular VM home directory rather than a named volume. M11-S7 commit `651a635`; surface fields publicised in commit `e06b2da` (todo #80)                                                                                                                  | (a)    | `sandboxd/sandbox-core/src/api/dto.rs:106` `SessionDto.mounts`; `:148-174` `pub struct SessionMountInfo { workspace_path, workspace_host_path?, ca_bundle_path?, home_volume? }` with `#[serde(skip_serializing_if = "Option::is_none")]`; `sandboxd/sandbox-core/src/api/mapper.rs:149` `SessionDto::with_mounts`; `sandboxd/sandboxd/src/main.rs:2439` `SESSION_WORKSPACE_PATH = "/home/agent/workspace/"`; `:2450-2474` `session_mount_info_for` (dispatches on `BackendKind`); reads `sandboxd/sandbox-core/src/backend/container.rs:836` `pub fn home_volume_name` and `:858` `pub const SANDBOX_CA_CONTAINER_PATH` (re-exported from `sandbox-core/src/backend/mod.rs:53`) | `sandboxd/sandbox-core/src/api/mapper.rs:632` `session_dto_with_mounts_container_shape_round_trips`; `:672` `session_dto_with_mounts_lima_omits_container_only_keys`; `:584` `session_dto_omits_network_and_mounts_when_none`; `:714` `session_dto_v0_record_without_network_or_mounts_round_trips` (forward-compat) |
+
 ---
 
 ## LM7 — Capabilities model (LM7.1 – LM7.18)
@@ -364,7 +386,7 @@ todos #66/#69/#71/#72; the remaining gaps map to spec "Non-goals" /
 | #     | Claim                                                       | Status | Code                                                                                                      | Test                                                                                                                                                                                                        |
 | ----- | ----------------------------------------------------------- | ------ | --------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | LM7.1 | `#[non_exhaustive] pub struct Capabilities`                 | (a)    | `sandboxd/sandbox-core/src/backend/capabilities.rs:102-104`                                               | `:253` `pub struct Capabilities` covered by capability-construction tests                                                                                                                                   |
-| LM7.2 | Field `isolation: IsolationLevel`                           | (a)    | `sandboxd/sandbox-core/src/backend/capabilities.rs:104+` (within Capabilities); `IsolationLevel` at `:83` | `sandboxd/sandbox-core/src/backend/lima.rs:601` `capabilities_for_lima_returns_expected_values`; `sandboxd/sandbox-core/src/backend/container.rs:1537` `capabilities_for_container_returns_expected_values` |
+| LM7.2 | Field `isolation: IsolationLevel`                           | (a)    | `sandboxd/sandbox-core/src/backend/capabilities.rs:104+` (within Capabilities); `IsolationLevel` at `:83` | `sandboxd/sandbox-core/src/backend/lima.rs:606` `capabilities_for_lima_returns_expected_values`; `sandboxd/sandbox-core/src/backend/container.rs:1767` `capabilities_for_container_returns_expected_values` |
 | LM7.3 | Field `nested_virt: bool`                                   | (a)    | capabilities.rs:104+                                                                                      | per-backend tests above                                                                                                                                                                                     |
 | LM7.4 | Field `privileged_ops: bool`                                | (a)    | capabilities.rs:104+                                                                                      | per-backend tests; container test asserts `!caps.privileged_ops` (`container.rs:1280`)                                                                                                                      |
 | LM7.5 | Field `raw_network: bool`                                   | (a)    | capabilities.rs:104+                                                                                      | per-backend tests                                                                                                                                                                                           |
@@ -375,7 +397,7 @@ todos #66/#69/#71/#72; the remaining gaps map to spec "Non-goals" /
 
 | #     | Claim                                                | Status | Code                                                                                                                                            | Test                                                                                                                                                |
 | ----- | ---------------------------------------------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| LM7.8 | `workspace_modes` field via `EnumSet<WorkspaceMode>` | (a)    | `sandboxd/sandbox-core/src/backend/capabilities.rs:104+` (Capabilities); container caps at `container.rs:374` advertise `WorkspaceMode::Shared` | `sandboxd/sandboxd/tests/integration_create_session_container.rs:498` `integration_create_session_container_advertises_shared_workspace_capability` |
+| LM7.8 | `workspace_modes` field via `EnumSet<WorkspaceMode>` | (a)    | `sandboxd/sandbox-core/src/backend/capabilities.rs:104+` (Capabilities); container caps at `container.rs:378-409` advertise `{ WorkspaceMode::Shared, WorkspaceMode::Clone }` (`EnumSet::all()`) — Clone added in M11-S7 commit `5fadccf` (the Shared-only matrix was a phasing artifact, not a deliberate exclusion) | `sandboxd/sandboxd/tests/integration_create_session_container.rs:509` `integration_create_session_container_advertises_workspace_capabilities` (renamed in `5fadccf`; pins `{Shared, Clone}` and asserts both `Shared` and `Clone` specs validate); `sandboxd/sandbox-core/src/backend/container.rs:1767` `capabilities_for_container_returns_expected_values` (asserts `EnumSet::all()`) |
 
 ### `IsolationLevel` (LM7.9 – LM7.10)
 
@@ -422,7 +444,7 @@ These are spec self-exclusions, mapped to (b):
 
 ---
 
-## LM8 — CLI & UX (LM8.1 – LM8.29)
+## LM8 — CLI & UX (LM8.1 – LM8.31)
 
 ### Invocation precedence (LM8.1 – LM8.6)
 
@@ -498,7 +520,14 @@ These are spec self-exclusions covered in LM12. Repeated here as ID pointers:
 | #      | Claim                                                                                                                                            | Status | Code                                             | Test                                                                                                                                                                                                                                                                                                                                      |
 | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------ | ------ | ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | LM8.28 | No `sandbox admin` subcommand group; no `prune-images` command; no gating flag for `--lite`; no auto-fallback; no separate `sandbox-lite` binary | (b)    | spec § "What's deliberately not done" (CLI & UX) | n/a                                                                                                                                                                                                                                                                                                                                       |
-| LM8.29 | `sandbox describe/inspect` on a container session created without --cpus/--memory shows `CPUs: 0, Memory: 0 MB` (cosmetic sentinel)              | (c)    | runtime behavior is correct; surface fix only    | **todo #69** "Cosmetic: 'sandbox describe/inspect' on a container session created without --cpus/--memory shows CPUs: 0, Memory: 0 MB (Phase 4D-pre sentinel display)…" Target: M11 follow-up. Not a spec violation, but worth tracking for cosmetic polish; spec only prescribes the field's data semantics, not the empty-render shape. |
+| LM8.29 | `sandbox describe/inspect` on a container session created without --cpus/--memory renders the resolved host-80% default with a `(default)` hint (e.g. `CPUs: 1.6 (default)`) instead of the pre-S7 `CPUs: 0, Memory: 0 MB` sentinel — todos #69/#75 closed in M11-S7 commit `6dd5808` | (a)    | `sandboxd/sandbox-cli/src/main.rs:996` `format_cpus_field`; `:1016` `format_memory_field`; `sandboxd/sandbox-core/src/api/dto.rs:213` `resolved_cpus`/`:222` `resolved_memory_mb` carry the host-80% default through the DTO    | `sandboxd/sandbox-cli/src/main.rs:5641` `format_cpus_field_default_path_renders_resolved_with_hint`; `:5662` `format_cpus_field_integer_value_renders_without_trailing_dot_zero`; `:5683` `format_cpus_field_fractional_value_renders_one_decimal`; `:5706` `describe_container_default_resources_render_as_resolved_with_hint` (regression net for the raw `0` sentinel) |
+
+### M11-S7 additions: `sandbox describe`/`inspect` Network + Mounts blocks (LM8.30 – LM8.31)
+
+| #      | Claim                                                                                                                                                                                                                                                                                                                                          | Status | Code                                                                                                                                                                                                                            | Test                                                                                                                                                                                                                                            |
+| ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| LM8.30 | `sandbox describe`/`inspect` renders a backend-neutral `Network:` block (Gateway IP, Session IP, Subnet) per session. Always emitted; missing data renders as `Network: none` to mirror the `Policy: none` shape. M11-S7 commit `651a635` (closes deferred todo #72)                                                                              | (a)    | `sandboxd/sandbox-cli/src/main.rs:1419` invocation in `render_describe_one`; `:1509-1523` `render_network_block` (label format `Gateway IP / Session IP / Subnet`)                                                                | DTO-side coverage `sandbox-core/src/api/mapper.rs:608` `session_dto_with_network_renders_complete_block`; e2e consumers `tests/e2e/test_m3_networking.py:184/484/620` parse the same `Network:` block via JSON `sandbox inspect` (no regex on Lima CIDRs)                                       |
+| LM8.31 | `sandbox describe`/`inspect` renders a backend-neutral `Mounts:` block (Workspace, Workspace host, CA bundle, Home volume) per session. `Mounts: none` fallback when the daemon has no mount info to surface; absent fields render as `-` so each row stays present. M11-S7 commit `651a635`                                                       | (a)    | `sandboxd/sandbox-cli/src/main.rs:1420` invocation in `render_describe_one`; `:1534-1561` `render_mounts_block` (label format `Workspace / Workspace host / CA bundle / Home volume`)                                            | DTO-side coverage `sandbox-core/src/api/mapper.rs:632` `session_dto_with_mounts_container_shape_round_trips`; `:672` `session_dto_with_mounts_lima_omits_container_only_keys`                                                                       |
 
 ---
 
@@ -590,7 +619,7 @@ These are spec self-exclusions covered in LM12. Repeated here as ID pointers:
 | LM10.18 | Gateway parity (policy + CoreDNS + Envoy + mitmproxy)                      | (a)    | `tests/e2e/test_lite.py:401` `test_lite_gateway_parity`                                                                                           | itself                                                                                                                                                                                                                                                                                                                                                                                  |
 | LM10.19 | Workspace UID alignment                                                    | (a)    | `tests/e2e/test_lite.py:508` `test_lite_workspace_uid_alignment` (skipif rootless docker — Non-goal)                                              | itself                                                                                                                                                                                                                                                                                                                                                                                  |
 | LM10.20 | β volume lifecycle: state survives stop/start, gone after delete           | (a)    | `tests/e2e/test_lite.py:580` `test_lite_home_volume_lifecycle_beta`                                                                               | itself                                                                                                                                                                                                                                                                                                                                                                                  |
-| LM10.21 | Orphan cleanup E2E: kill daemon mid-create, restart, assert reaped         | (c)    | Rust integration test exists (`integration_orphan_reaper_removes_orphans_and_preserves_live_resources`); E2E pytest variant deferred              | **todo #71** "Spec E2E orphan-cleanup test: kill daemon mid-create, restart, assert orphan reaped — Rust integration test landed in Phase 5B but the spec also calls for an E2E pytest equivalent. Defer to M11-S6 verification or a follow-on phase." Target: post-M11 follow-on. Phase 5B Rust test covers identical semantics; pytest variant is a nice-to-have, not a coverage gap. |
+| LM10.21 | Orphan cleanup E2E: kill daemon mid-create, restart, assert reaped         | (a)    | `sandboxd/sandboxd/src/main.rs:5907-5934` orphan reaper invocation at startup; `sandboxd/sandbox-core/src/backend/orphan_reaper.rs::reap_orphans`              | `tests/e2e/test_lite.py:659` `test_lite_orphan_cleanup_on_daemon_restart` (M11-S7 commit `169c7ea` — pytest equivalent of the Phase 5B Rust integration test, todo #71 closed); Rust integration test still in place at `sandboxd/sandbox-core/tests/integration_orphan_reaper.rs:173` `..._removes_orphans_and_preserves_live_resources` |
 
 ### Route-helper authorization tests (LM10.22)
 
@@ -710,10 +739,13 @@ compared character-for-character.
 | `sandbox-home-{session_id}` volume name pattern                         | "Per-session home volume" (LM6.4)           | `sandbox-core/src/backend/container.rs::create` `-v sandbox-home-<id>:/home/agent`                        | `sandbox-core/src/backend/orphan_reaper.rs:530` `parse_home_volume_session_id_accepts_canonical_name`                                                    |
 | `Capabilities` matrix shape from `GET /backends`                        | "GET /backends" (LM7.18)                    | `sandboxd/sandboxd/src/backends_http.rs:53-78` (sorted by kind)                                           | `integration_backends_endpoint_lists_registered_backends_in_stable_order`                                                                                |
 
-Spec-impl deltas captured: **one** — spec § Hardening line 542 says
-`seccomp=default` but Docker CLI accepts `seccomp=builtin`. Impl is
-correct; spec text needs trivial edit. Tracked under **todo #66**
-(see LM5.5).
+Spec-impl deltas captured: **none remaining** — the post-M11-S6
+delta on § Hardening line 542 (`seccomp=default` → `seccomp=builtin`,
+todo #66) was closed in M11-S7 commit `6822a0d`. Spec § Workspace
+line 569 was also brought into sync with the unified bind target
+`/home/agent/workspace/` in the same commit (todo for the unified
+target was M11-S7-in-scope; LM6.1 carries the implementation
+locator).
 
 ---
 
@@ -780,21 +812,28 @@ Every "deferred" / "future feature" / "out-of-scope" / "known gap"
 bullet in the spec is either (a) absent from the tree or (b) tracked
 as a `progress` todo with explicit target:
 
-| Bullet                                                                      | Status  | Target                                                                                    |
-| --------------------------------------------------------------------------- | ------- | ----------------------------------------------------------------------------------------- |
-| Spec § Hardening: `seccomp=default` → `seccomp=builtin` text fix            | tracked | **todo #66**, target: M11 spec-cleanup                                                    |
-| Cosmetic CPUs:0/Memory:0 display in describe/inspect                        | tracked | **todo #69**, target: M11 follow-up                                                       |
-| Spec E2E orphan-cleanup pytest test                                         | tracked | **todo #71**, target: post-M11 follow-on (Rust integration test already covers semantics) |
-| `test_m3_networking` agnostic refactor (3 tests skip in-body for container) | tracked | **todo #72**, target: M11+                                                                |
-| Self-hosted KVM runner provisioning                                         | tracked | **todo #73**, target: M12+                                                                |
-| Nightly perf-benchmarks job                                                 | tracked | **todo #74**, blocked on #73                                                              |
-| `cpus` precision normalization at HTTP boundary                             | tracked | **todo #67**, target: M11+ surface fix                                                    |
-| Bump nix dep when 0.30+ exposes pidfd_open                                  | tracked | **todo #60**, no urgency                                                                  |
-| NetworkManager error-message enrichment                                     | tracked | **todo #61**, M11 follow-up                                                               |
-| RUST_LOG polish in test stderr                                              | tracked | **todo #62**, trivial polish                                                              |
-| `i32::try_from` polish for pidfd_open cast                                  | tracked | **todo #63**, fold into next route-helper touch                                           |
-| `must come after stderr read` comment polish                                | tracked | **todo #64**, trivial                                                                     |
-| M11 commit disentanglement                                                  | tracked | **todo #65**, before merge to main (orchestrator-level concern, NOT a spec claim)         |
+| Bullet                                                                      | Status        | Target                                                                                    |
+| --------------------------------------------------------------------------- | ------------- | ----------------------------------------------------------------------------------------- |
+| Spec § Hardening: `seccomp=default` → `seccomp=builtin` text fix            | closed (S7)   | **todo #66**, M11-S7 commit `6822a0d`                                                     |
+| Cosmetic CPUs:0/Memory:0 display in describe/inspect                        | closed (S7)   | **todo #69** + **#75**, M11-S7 commit `6dd5808` (LM8.29 + LM6.22)                         |
+| Spec E2E orphan-cleanup pytest test                                         | closed (S7)   | **todo #71**, M11-S7 commit `169c7ea` (LM10.21 — `test_lite_orphan_cleanup_on_daemon_restart`) |
+| `test_m3_networking` agnostic refactor (3 tests skip in-body for container) | closed (S7)   | **todo #72**, M11-S7 commit `651a635` (LM4.37 / LM6.23 — backend-neutral DTOs)            |
+| `cpus` precision normalization at HTTP boundary                             | closed (S7)   | **todo #67**, M11-S7 commit `6dd5808` (LM6.22)                                            |
+| NetworkManager error-message enrichment                                     | closed (S7)   | **todo #61**, M11-S7 commit `a733398` (LM2.11 evidence in `network.rs:222-226`)           |
+| RUST_LOG polish in test stderr                                              | closed (S7)   | **todo #62**, M11-S7 commit `a733398`                                                     |
+| `i32::try_from` polish for pidfd_open cast                                  | closed (S7)   | **todo #63**, M11-S7 commit `a733398` (LM4.23 evidence in `route-helper/src/main.rs:208-209`) |
+| `must come after stderr read` comment polish                                | closed (S7)   | **todo #64**, M11-S7 commit `a733398`                                                     |
+| `--repo` clone path on container backend                                    | closed (S7)   | **todo (M11-S7 in-scope)**, M11-S7 commit `5fadccf` (LM6.20)                              |
+| `--boot-cmd` symmetry on container backend                                  | closed (S7)   | **todo #77**, M11-S7 commit `13d5dbe` (LM6.21)                                            |
+| `_prefix_len` no-longer-unused field rename                                 | closed (S7)   | **todo #76**, M11-S7 commit `e06b2da`                                                     |
+| `workspace_modes` mock literal in `integration_no_cache_rejection.rs`       | closed (S7)   | **todo #78**, M11-S7 commit `e06b2da`                                                     |
+| `guest_agent_path()` `current_exe()` parent-parent fallback under nextest   | closed (S7)   | **todo #79**, M11-S7 commit `e06b2da`                                                     |
+| Promote `SANDBOX_CA_CONTAINER_PATH` and `home_volume_name` to public        | closed (S7)   | **todo #80**, M11-S7 commit `e06b2da` (drift-risk closure cited in LM6.23)                |
+| Self-hosted KVM runner provisioning                                         | tracked       | **todo #73**, target: M12+                                                                |
+| Nightly perf-benchmarks job                                                 | tracked       | **todo #74**, blocked on #73                                                              |
+| Bump nix dep when 0.30+ exposes pidfd_open                                  | tracked       | **todo #60**, no urgency                                                                  |
+| Rootless-Docker enforcement at the daemon                                   | tracked       | **M11-S8** (full scope: probe + `--force-rootless-docker` flag + PATH-stub test substrate) |
+| M11 commit disentanglement                                                  | tracked       | **todo #65**, before merge to main (orchestrator-level concern, NOT a spec claim)         |
 
 All "Out of scope" / "Non-goal" / "Explicit non-goals" bullets in the
 spec are confirmed absent from the tree (LM12.1-LM12.10 + the
@@ -806,43 +845,63 @@ No silent drops detected.
 
 ## Gate results
 
-Conjunctive hard gates as specified by M11-S6 handoff:
+Conjunctive hard gates as specified by M11-S6 handoff (re-run after
+M11-S7 close):
 
 ```
 cd sandboxd
 
 cargo build --workspace                                  PASS
-cargo nextest run --workspace                           PASS — 1138 passed, 57 skipped (+1 new CA-mount test)
-cargo nextest run --workspace --profile integration     PASS — 57 passed, 1138 skipped (Lima + Container + Gateway integration)
+cargo nextest run --workspace                           PASS (Lima + Container + Gateway integration)
+cargo nextest run --workspace --profile integration     PASS
 cargo clippy --workspace --all-targets -- -D warnings   PASS — clean
 cargo fmt --all -- --check                              PASS — clean
 
-make test-e2e-container                                 PASS — 42 passed, 6 skipped, 0 failed in 741.22s
+make test-e2e-container                                 PASS — 0 skips, 0 failed
 ```
 
-The container-only `test_lite.py` file (9 tests covering hardening,
-resource defaults, git remote, gateway parity, home-volume lifecycle,
-docker-in-docker block, user-namespace block, hardened/no-cache
-flag rejection) is **fully green** — every lite-spec-specific
-behavior is verified.
+The container-only `test_lite.py` file (now 10 tests with the M11-S7
+addition of `test_lite_orphan_cleanup_on_daemon_restart` — covering
+hardening, resource defaults, git remote, gateway parity,
+home-volume lifecycle, docker-in-docker block, user-namespace block,
+hardened/no-cache flag rejection, workspace UID alignment, and
+boot-time orphan reaping) is **fully green** — every
+lite-spec-specific behavior is verified.
 
-All 33 backend-agnostic tests under the `[container]` parametrization
-also pass, after the four defect-class fixes documented in the
-"Defect-class resolution" appendix below. Six skips are acknowledged
-and pre-categorized:
+All backend-agnostic tests under the `[container]` parametrization
+also pass. Post-S7 the previously-tracked container skips are gone:
 
-- 1 rootless-Docker skip — `test_lite_workspace_uid_alignment`
-  (Non-goal LM12.2 / LM10.19).
-- 3 Lima-pin skips (Phase 5C-documented) — `test_gateway_traffic_flow`,
-  `test_stop_start_with_networking`, `test_concurrent_sessions`
-  (assert against the Lima `10.209.x.x/28` subnet pool; refactor to
-  query gateway IP via `sandbox info` is tracked under todo #72).
-- 1 Clone-unsupported skip — `test_clone_repo[container]` (added by
-  Class C2 fix; container backend advertises only
-  `WorkspaceMode::Bind` per LM7.8).
-- 1 Lima-only path skip — `test_shared_mount[container]` (added by
-  Class C2/C3 fix; the test exercises Lima's host-fs sharing path,
-  not the container backend's bind-mount semantics).
+- `test_clone_repo[container]`, `test_shared_mount[container]`,
+  `test_gateway_traffic_flow[container]`,
+  `test_stop_start_with_networking[container]`, and
+  `test_concurrent_sessions[container]` no longer carry an in-body
+  `if backend == "container": pytest.skip(...)`. The Clone-unsupported
+  branch was closed by extending the container's
+  `workspace_modes` to `{ Shared, Clone }` (LM7.8) and dispatching
+  `git clone` in-guest via `GuestConnector` (LM6.20). The shared-mount
+  and three Lima-pinned networking tests were closed by unifying the
+  workspace bind target at `/home/agent/workspace/` (LM6.1) and
+  surfacing gateway/session IPs via the new `SessionNetworkInfo` /
+  `SessionMountInfo` DTO substructs (LM4.37 / LM6.23) so those tests
+  read backend-neutral fields from `sandbox inspect` instead of
+  pinning to Lima's `10.209.x.x/28` regex.
+- `test_concurrent_sessions` retains a 6 GB host-RAM precondition,
+  but the check is now scoped to `backend == "lima"` (M11-S7 commit
+  `15e78c2`) — the container parameterization runs regardless of host
+  RAM. Two 2 GB Lima VMs require ≥6 GB; container sessions are tens
+  of MB and have no such precondition.
+- `test_m10_s4_discovery._resolve_targets` no longer skips on broken
+  host DNS — the terminal "zero IPs collected" branch is now a hard
+  `pytest.fail` (M11-S7 commit `7d39bb0`). E2E tests inherently
+  require working host DNS; a misconfigured host now fails loudly
+  instead of silently masking a setup error.
+- `test_lite_workspace_uid_alignment` retains its
+  `is_rootless_docker()` skip; this becomes a daemon-side refusal in
+  M11-S8 (out of S7 scope).
+
+Net: zero skips on `make test-e2e-container`; the only skip on the
+full matrix is the Lima-scoped 6 GB RAM check on
+`test_concurrent_sessions[lima]`.
 
 Note: `make test-e2e-matrix` (full Lima+container matrix) is **not**
 run locally — KVM runner provisioning is tracked under todo #73 and
@@ -905,16 +964,25 @@ not surfaced as healthy.
   rebuilt under the existing `lite-image` Make target; first-use
   warning still fires per LM3.12.
 - **C2** — `test_clone_repo[container]` invoked Clone workspace mode
-  unconditionally. Added an in-body skip gated on
+  unconditionally. M11-S6 added an in-body skip gated on
   `backend == "container"` (Phase 5C in-body pattern), citing
   `Capabilities.workspace_modes` per spec § Capabilities.
-  `test_shared_mount[container]` similarly skipped: it exercises a
+  `test_shared_mount[container]` similarly skipped: it exercised a
   Lima host-fs sharing path that the container backend's bind-mount
-  semantics do not expose.
+  semantics did not expose at the time. **Closed in M11-S7:** the
+  container's `workspace_modes` matrix was extended to
+  `{ Shared, Clone }` (LM7.8) and the daemon now dispatches
+  `git clone <url> /home/agent/workspace/` via the backend-agnostic
+  `GuestConnector` post-`docker start`, pre-ready, mirroring Lima's
+  clone path (LM6.20). The container bind target was also unified
+  with Lima at `/home/agent/workspace/` (LM6.1). Both in-body
+  `[container]` skips were removed; both tests now run on both
+  backends.
 - **C3** — `sandbox cp` visibility into the container workspace. The
   cp dispatch path was aligned to the container's bind-mount target
   so files written via cp surface inside the container at the
-  expected workspace path.
+  expected workspace path. (M11-S7 unified the bind target across
+  backends — see C2 above.)
 
 ### Class D — per-session MITM CA bind-mount (new spec coverage)
 
@@ -947,42 +1015,50 @@ asserts the argv emission.
 
 ## Verification verdict
 
-**Delivered.** All 239 concrete claims (238 original + LM4.36 added
-during Class D resolution) resolve to (a) a shipping locator+test,
-(b) an explicit Non-goal/out-of-scope bullet, or (c) a named,
-user-approved follow-up todo, with zero unmapped BLOCKERs. The
-implementation lands the spec end-to-end:
+**Delivered.** All 246 concrete claims (238 original + LM4.36 added
+during M11-S6 Class D resolution + 7 added during M11-S7 close —
+LM4.37, LM6.20, LM6.21, LM6.22, LM6.23, LM8.30, LM8.31) resolve to
+(a) a shipping locator+test, (b) an explicit Non-goal/out-of-scope
+bullet, or (c) a named, user-approved follow-up todo, with zero
+unmapped BLOCKERs. The implementation lands the spec end-to-end:
 
-- **Container-only behaviors are green** — `test_lite.py` (9 tests)
+- **Container-only behaviors are green** — `test_lite.py` (10 tests
+  post-S7, with the new `test_lite_orphan_cleanup_on_daemon_restart`)
   passes 100%. The Capabilities typed-feature mismatch model, the
   Docker hardening envelope, the per-session home volume, the
-  isolation warning, the `--hardened` / `--no-cache` rejections, and
-  the resource-defaults math are all behaviorally correct.
+  isolation warning, the `--hardened` / `--no-cache` rejections, the
+  resource-defaults math, and boot-time orphan reaping are all
+  behaviorally correct.
 
-- **Backend-agnostic policy/networking flows pass** under the
-  `[container]` parametrization. The four defect classes surfaced by
-  the initial verification run (Class A — gateway-config sync
-  subscription wiring; Class B — daemon-restart re-attach,
-  transitively gated by A; Class C — three test/image/fixture
-  mismatches; Class D — per-session MITM CA bind-mount, the only
-  one that was a real spec gap rather than test-side drift) were
-  resolved in-branch before this verdict was rendered. The Class D
-  fix added LM4.36 to the verification map and a new unit test
-  (`container_runtime_create_includes_ca_mount_when_path_set`).
+- **Backend-agnostic policy/networking/workspace flows pass** under
+  the `[container]` parametrization. The four defect classes
+  surfaced by M11-S6 (Class A — gateway-config sync subscription
+  wiring; Class B — daemon-restart re-attach, transitively gated by
+  A; Class C — three test/image/fixture mismatches; Class D —
+  per-session MITM CA bind-mount, the only one that was a real spec
+  gap rather than test-side drift) were resolved in M11-S6's branch.
+  M11-S7 then closed the residual `[container]` skips (Clone, shared
+  mount, gateway traffic flow, stop/start with networking,
+  concurrent sessions) by extending `workspace_modes` to
+  `{Shared, Clone}`, dispatching `git clone` in-guest, unifying the
+  bind target with Lima, and surfacing `SessionNetworkInfo` /
+  `SessionMountInfo` via `sandbox inspect`.
 
-- **Cargo gates all PASS** — `cargo nextest run --workspace` (1138
-  passed, +1 new CA-mount test); `cargo nextest run --workspace
---profile integration` (57 passed); clippy clean; fmt clean.
+- **Cargo gates all PASS** — `cargo nextest run --workspace`,
+  `--profile integration`; clippy clean; fmt clean.
 
-- **Six skips on `make test-e2e-container` are pre-categorized and
-  acknowledged**: 1 rootless-Docker (Non-goal LM12.2), 3 Lima-pin
-  (Phase 5C-documented, todo #72), 1 Clone-unsupported (Class C2 —
-  spec § Capabilities), 1 Lima-only host-fs path (Class C2/C3).
+- **Zero skips on `make test-e2e-container` post-S7.** The single
+  remaining skip in the full matrix is the Lima-scoped 6 GB RAM
+  precondition on `test_concurrent_sessions[lima]`. The
+  rootless-Docker skip on `test_lite_workspace_uid_alignment`
+  becomes a daemon-side refusal in M11-S8 (out of S7 scope).
 
-The pre-recorded follow-up todos (#66 #69 #71 #72 #73 #74) remain
-valid and unblocked. The four defect-class fixes are documented in
-the "Defect-class resolution" section above with file pointers and
-spec coverage rationale.
+The remaining open todos (#73 KVM runner, #74 nightly perf, #60 nix
+bump) are unblocked and parked for M12+. M11-S7 closed todos #61,
+#62, #63, #64, #66, #67, #69, #71, #72, #75, #76, #77, #78, #79, #80
+in-branch — see "Deferred-item reconciliation" above for the
+commit-by-commit map. The four M11-S6 defect-class fixes remain
+documented in the "Defect-class resolution" section.
 
 The implementation faithfully lands the spec end-to-end: the
 Capabilities typed-feature mismatch model, the route-helper
@@ -1010,5 +1086,18 @@ All claims delivered. Gate green.
 Background work that informed this delivery map:
 
 - `.tasks/handoffs/20260428-150000-implementer-m11-s6-spec-delivery-verification.md` — M11-S6 verification handoff defining tasks 1-7, exit criteria, and constraints.
-- `.tasks/specs/2026-04-21-port-explicit-policies-presets-observability-delivery.md` — M10-S7 prior verification map; structural template followed by this M11-S6 map.
-- `docs/internal/milestones/M11.md` — milestone definition with M11-S6 exit criteria (lines 206-239).
+- `.tasks/specs/2026-04-21-port-explicit-policies-presets-observability-delivery.md` — M10-S7 prior verification map; structural template followed by this map.
+- `docs/internal/milestones/M11.md` — milestone definition. § M11-S6 exit criteria at lines 206-239; § M11-S7 plan at lines 251-303 (residual quality polish + backend-symmetry refinements); § M11-S8 plan at lines 306-340 (rootless-Docker enforcement).
+
+M11-S7 commits mapped into this map (oldest → newest):
+
+- `a733398` — chore(m11-s7): route-helper polish — todos #61, #62, #63, #64.
+- `6822a0d` — docs(spec): correct seccomp flag and unify workspace bind target — todo #66.
+- `7d39bb0` — test(e2e): m10-s4 discovery — broken host DNS is a hard failure, not a skip.
+- `15e78c2` — test(e2e): m3 — scope `test_concurrent_sessions` RAM check to Lima-only.
+- `169c7ea` — test(e2e): lite orphan-cleanup on daemon restart — todo #71 (LM10.21).
+- `5fadccf` — feat(m11-s7): clone-on-container + unify workspace bind target (LM6.1, LM6.20, LM7.8).
+- `651a635` — feat(m11-s7): backend-neutral session network + mount info via inspect — todo #72 (LM4.37, LM6.23, LM8.30, LM8.31).
+- `6dd5808` — feat(m11-s7): cpus 1-decimal precision + drop "0" sentinel in describe — todos #67, #75 (LM6.22, LM8.29).
+- `13d5dbe` — feat(m11-s7): `--boot-cmd` symmetry on the container backend — todo #77 (LM6.21).
+- `e06b2da` — chore(m11-s7): fold-in polish — todos #76, #78, #79, #80 (LM6.23 / LM2.x publicization).
