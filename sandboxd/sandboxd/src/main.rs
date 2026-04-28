@@ -1440,7 +1440,8 @@ async fn create_session(
         // symmetry for `--repo` (the lite image's entrypoint is the
         // `sandbox-guest` agent, so the `state.guest.exec` dispatch the
         // Lima path uses works unchanged once the agent's TCP listener
-        // is up). `--boot-cmd` symmetry is deferred to a follow-up.
+        // is up). `--boot-cmd` symmetry follows the same dispatch right
+        // after the clone block.
         if let Some(policy) = req.policy {
             let initial_presets = req.source_presets.clone();
             match apply_policy(
@@ -1569,6 +1570,102 @@ async fn create_session(
                         "git clone of {repo_url} failed: transport error: {e}"
                     ));
                     return fail_explicit_repo_clone(
+                        &state.store,
+                        &state.gateway,
+                        &state.network,
+                        &state.ingestors,
+                        &session_id,
+                        err,
+                    )
+                    .await
+                    .into_response();
+                }
+            }
+        }
+
+        // M11-S7 — `--boot-cmd` symmetry on the container backend.
+        //
+        // Mirrors the Lima `--boot-cmd` path further down this handler:
+        // an explicit `--boot-cmd <cmd>` violates the caller's stated
+        // intent if it fails silently, so we route the four reachable
+        // outcomes (non-zero exit, guest-agent error, unexpected
+        // response, transport error) through `fail_explicit_boot_cmd`,
+        // which marks the session `Error` and tears down partial
+        // gateway/network state. The `bash -c <cmd>` argv shape and
+        // 30s `GUEST_REQUEST_TIMEOUT` bound are identical to the Lima
+        // path; the dispatch reaches the container via the
+        // backend-agnostic `GuestConnector` (routes through
+        // `ContainerTransport`'s `docker exec ... socat` channel).
+        if let Some(boot_cmd) = &req.boot_cmd {
+            info!(%session_id, cmd = %boot_cmd, "executing boot command in container");
+            match state
+                .guest
+                .exec(&session_id, "bash", &["-c", boot_cmd.as_str()])
+                .await
+            {
+                Ok(GuestResponse::ExecResult {
+                    exit_code,
+                    stdout,
+                    stderr,
+                }) => {
+                    if exit_code != 0 {
+                        let stderr_snip = truncate_for_diagnostic(stderr.trim(), 512);
+                        let err = SandboxError::Internal(format!(
+                            "boot command {boot_cmd:?} failed with exit code {exit_code}: {stderr_snip}"
+                        ));
+                        return fail_explicit_boot_cmd(
+                            &state.store,
+                            &state.gateway,
+                            &state.network,
+                            &state.ingestors,
+                            &session_id,
+                            err,
+                        )
+                        .await
+                        .into_response();
+                    } else {
+                        info!(
+                            %session_id,
+                            output = %stdout.trim(),
+                            "boot command completed successfully (lite)"
+                        );
+                    }
+                }
+                Ok(GuestResponse::Error { message }) => {
+                    let err = SandboxError::Internal(format!(
+                        "boot command {boot_cmd:?} failed: guest agent error: {message}"
+                    ));
+                    return fail_explicit_boot_cmd(
+                        &state.store,
+                        &state.gateway,
+                        &state.network,
+                        &state.ingestors,
+                        &session_id,
+                        err,
+                    )
+                    .await
+                    .into_response();
+                }
+                Ok(other) => {
+                    let err = SandboxError::Internal(format!(
+                        "boot command {boot_cmd:?} failed: unexpected guest response: {other:?}"
+                    ));
+                    return fail_explicit_boot_cmd(
+                        &state.store,
+                        &state.gateway,
+                        &state.network,
+                        &state.ingestors,
+                        &session_id,
+                        err,
+                    )
+                    .await
+                    .into_response();
+                }
+                Err(e) => {
+                    let err = SandboxError::Internal(format!(
+                        "boot command {boot_cmd:?} failed: transport error: {e}"
+                    ));
+                    return fail_explicit_boot_cmd(
                         &state.store,
                         &state.gateway,
                         &state.network,
