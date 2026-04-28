@@ -30,6 +30,7 @@ from conftest import (
     wait_for_state,
     write_policy_file,
 )
+from helpers import is_rootless_docker
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -253,6 +254,35 @@ def test_shared_mount(sandbox_cli, backend):
     is unified with Lima's at `/home/agent/workspace/`, so the path
     assertions below work on both backends.
     """
+    # Host->container file visibility requires that a file written by the
+    # host operator (uid 1000) is readable inside the container by the
+    # agent user (uid 1000). Default-hardened Docker keeps that mapping
+    # 1:1, but rootless Docker remaps host uid 1000 through /etc/subuid
+    # so the host-written file lands inside the container under a
+    # sub-uid that the agent user cannot read. The lite spec forbids
+    # userns-remap (§ Workspace lines 572-574: "Do not use userns-remap
+    # — that would force chown on host files, which is destructive and
+    # surprising") and rootless Docker is explicitly out of scope (§
+    # Out of scope line 1175: "Lite's target is default-hardened Docker.
+    # Alternative runtimes are a separate design"), so the failure on a
+    # rootless rig is a property of the host runtime, not the lite
+    # backend. The Lima parametrization is unaffected (it boots a real
+    # VM and does not traverse a userns), so the skip is conditional on
+    # the container backend only — mirrors the file-level skipif on
+    # `test_lite.py::test_lite_workspace_uid_alignment`.
+    if backend == "container" and is_rootless_docker():
+        pytest.skip(
+            "Workspace shared-mount host->container visibility requires "
+            "default-hardened Docker. Rootless Docker remaps uids through "
+            "/etc/subuid so a host-written file lands inside the container "
+            "as a sub-uid that the agent user cannot read; the lite spec "
+            "forbids userns-remap (§ Workspace lines 572-574: 'Do not use "
+            "userns-remap — that would force chown on host files, which "
+            "is destructive and surprising') and rootless Docker is "
+            "explicitly out of scope (§ Out of scope line 1175: 'Lite's "
+            "target is default-hardened Docker. Alternative runtimes are "
+            "a separate design')."
+        )
     session_id = None
     host_dir = None
     try:

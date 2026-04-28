@@ -55,10 +55,12 @@ Post-M11-S7: **0 proposed new todos**. All previously-tracked items
 that were in M11-S7 scope (#61, #62, #63, #64, #66, #67, #69, #71,
 #72, #75, #76, #77, #78, #79, #80) are closed; the remaining trackers
 (#73 KVM runner, #74 nightly perf, #60 nix bump, #65 commit
-disentanglement) carry forward as M12+ / orchestrator concerns. The
-rootless-Docker skip on `test_lite_workspace_uid_alignment` (Non-goal
-LM12.2) carries forward into M11-S8, which lands the daemon-side
-refusal + `--force-rootless-docker` escape hatch.
+disentanglement, #82 cross-session L4 isolation gateway-integration
+coverage) carry forward as M12+ / orchestrator concerns. The
+rootless-Docker skip on `test_lite_workspace_uid_alignment` and the
+in-body rootless-Docker skip on `test_shared_mount[container]` (both
+Non-goal LM12.2) carry forward into M11-S8, which lands the
+daemon-side refusal + `--force-rootless-docker` escape hatch.
 
 ---
 
@@ -298,7 +300,7 @@ refusal + `--force-rootless-docker` escape hatch.
 
 | #      | Claim                                                                                                                                                                                                                                                                                                                                                                          | Status | Code                                                                                                                                                                                                                                                                                                                            | Test                                                                                                                                                                                                                                                                                              |
 | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| LM4.37 | `SessionDto.network: Option<SessionNetworkInfo>` exposes per-session networking via `GET /sessions/{id}` so test code and operator tooling can ask the daemon instead of regex-matching CLI output. Same shape on both backends: `{ gateway_ip, session_ip, session_subnet_cidr }`; sourced from the daemon's persisted `NetworkInfo`. M11-S7 commit `651a635` (closes todo #72) | (a)    | `sandboxd/sandbox-core/src/api/dto.rs:95` `SessionDto.network`; `:127-136` `pub struct SessionNetworkInfo { gateway_ip, session_ip, session_subnet_cidr }`; `sandboxd/sandbox-core/src/api/mapper.rs:139` `SessionDto::with_network`; `sandboxd/sandboxd/src/main.rs:2412-2432` `session_network_info_for` (reads `NetworkInfo`) | `sandboxd/sandbox-core/src/api/mapper.rs:608` `session_dto_with_network_renders_complete_block`; `:584` `session_dto_omits_network_and_mounts_when_none`; `:714` `session_dto_v0_record_without_network_or_mounts_round_trips` (forward-compat); cross-backend e2e usage in `tests/e2e/test_m3_networking.py:184` `test_gateway_traffic_flow`, `:484` `test_stop_start_with_networking`, `:620` `test_concurrent_sessions` (all three now read these fields via `sandbox inspect` instead of pinning to `10.209.x.x/28`) |
+| LM4.37 | `SessionDto.network: Option<SessionNetworkInfo>` exposes per-session networking via `GET /sessions/{id}` so test code and operator tooling can ask the daemon instead of regex-matching CLI output. Same shape on both backends: `{ gateway_ip, session_ip, session_subnet_cidr }`; sourced from the daemon's persisted `NetworkInfo`. M11-S7 commit `651a635` (closes todo #72); `test_gateway_crash_recovery` brought into the same backend-neutral pattern as a follow-on, completing the four-test Bundle Y refactor | (a)    | `sandboxd/sandbox-core/src/api/dto.rs:95` `SessionDto.network`; `:127-136` `pub struct SessionNetworkInfo { gateway_ip, session_ip, session_subnet_cidr }`; `sandboxd/sandbox-core/src/api/mapper.rs:139` `SessionDto::with_network`; `sandboxd/sandboxd/src/main.rs:2412-2432` `session_network_info_for` (reads `NetworkInfo`) | `sandboxd/sandbox-core/src/api/mapper.rs:608` `session_dto_with_network_renders_complete_block`; `:584` `session_dto_omits_network_and_mounts_when_none`; `:714` `session_dto_v0_record_without_network_or_mounts_round_trips` (forward-compat); cross-backend e2e usage in `tests/e2e/test_m3_networking.py:184` `test_gateway_traffic_flow`, `:484` `test_stop_start_with_networking`, `:620` `test_concurrent_sessions`, and `:1071` `test_gateway_crash_recovery` (all four read `network.gateway_ip`/`session_subnet_cidr` via `inspect_session_network()` instead of regex-pinning Lima's `10.209.x.x/28`). The cross-backend L3+L4 reachability primitive used by all four is `tests/e2e/test_m3_networking.py::_probe_gateway_tcp` (TCP/53 to CoreDNS via bash's `</dev/tcp/<ip>/<port>` builtin), replacing the legacy `ping`-based check that is by-design unavailable on the lite container backend (spec § Hardening line 561-562: `CAP_NET_RAW` dropped, `ping` and similar tools fail) |
 
 ---
 
@@ -321,7 +323,7 @@ refusal + `--force-rootless-docker` escape hatch.
 | LM5.13 | Docker-in-Docker breaks (no privileged, no /var/run/docker.sock)                      | (a)    | cap-drop=ALL forbids privileged; no docker-socket bind in argv                                                                                 | `tests/e2e/test_lite.py:201` `test_lite_blocks_docker_in_docker`                                                                                                                                                                                                                                                                                                                                                      |
 | LM5.14 | FUSE breaks (CAP_SYS_ADMIN dropped)                                                   | (a)    | cap-drop=ALL covers this                                                                                                                       | follows from LM5.6                                                                                                                                                                                                                                                                                                                                                                                                    |
 | LM5.15 | Kernel modules unloadable                                                             | (a)    | userns-less default-seccomp container blocks                                                                                                   | rationale; covered by LM5.5/LM5.6                                                                                                                                                                                                                                                                                                                                                                                     |
-| LM5.16 | Raw network sockets fail (CAP_NET_RAW dropped)                                        | (a)    | cap-drop=ALL                                                                                                                                   | follows from LM5.6                                                                                                                                                                                                                                                                                                                                                                                                    |
+| LM5.16 | Raw network sockets fail (CAP_NET_RAW dropped)                                        | (a)    | cap-drop=ALL; spec § Hardening line 561-562 enumerates `ping` as a by-design forbidden tool                                                                                  | follows from LM5.6; cross-backend e2e tests that historically used `ping <gateway_ip>` for L3 reachability now use `tests/e2e/test_m3_networking.py::_probe_gateway_tcp` (TCP/53 to CoreDNS via bash's `</dev/tcp/<ip>/<port>` builtin) — see LM4.37 for the four call sites                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | LM5.17 | `/proc` writes dropped                                                                | (a)    | cap-drop=ALL + read-only                                                                                                                       | follows from LM5.1/LM5.6                                                                                                                                                                                                                                                                                                                                                                                              |
 | LM5.18 | Documented in `docs/lite.md` (renamed `docs/guides/lite-mode.md` per Astro structure) | (a)    | `docs/guides/lite-mode.md` (122 LoC)                                                                                                           | docs                                                                                                                                                                                                                                                                                                                                                                                                                  |
 
@@ -333,7 +335,7 @@ refusal + `--force-rootless-docker` escape hatch.
 
 | #     | Claim                                                              | Status | Code                                                                                      | Test                                                                    |
 | ----- | ------------------------------------------------------------------ | ------ | ----------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| LM6.1 | Bind mount `/host/path → /home/agent/workspace/` (unified with Lima semantics — M11-S7 commit `5fadccf`)      | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:448-459` `create` issues `-v <host>:/home/agent/workspace/:rw` (was `/workspace` pre-S7); spec § Workspace line 569 also updated in `6822a0d` | `tests/e2e/test_lite.py:510` `test_lite_workspace_uid_alignment`; cross-backend `tests/e2e/test_m5_workspace.py:248` `test_shared_mount` (now runs on `[container]` after path unification)        |
+| LM6.1 | Bind mount `/host/path → /home/agent/workspace/` (unified with Lima semantics — M11-S7 commit `5fadccf`)      | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:448-459` `create` issues `-v <host>:/home/agent/workspace/:rw` (was `/workspace` pre-S7); spec § Workspace line 569 also updated in `6822a0d` | `tests/e2e/test_lite.py:510` `test_lite_workspace_uid_alignment`; cross-backend `tests/e2e/test_m5_workspace.py:248` `test_shared_mount` (now runs on `[container]` after path unification — gated by an in-body `if backend == "container" and is_rootless_docker(): pytest.skip(...)` because rootless Docker remaps host uid 1000 through `/etc/subuid` so a host-written file lands inside the container as a sub-uid the agent user cannot read; the lite spec forbids userns-remap (§ Workspace lines 572-574: "Do not use userns-remap — that would force chown on host files, which is destructive and surprising") and rootless Docker is explicitly out of scope (§ Out of scope line 1175 / Non-goal LM12.2). Mirrors the file-level `skipif` on `test_lite_workspace_uid_alignment`; both become daemon-side refusals in M11-S8)        |
 | LM6.2 | UID alignment: `--user <host-uid>:<host-gid>` when host uid ≠ 1000 | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:996+` `map_container_uid_gid`             | `tests/e2e/test_lite.py:510` (skipif rootless docker — Non-goal LM12.x; daemon-side enforcement scoped to M11-S8) |
 | LM6.3 | No userns-remap (would force chown on host files; destructive)     | (a)    | argv contains no `--userns` flag; `sandbox-core/src/backend/container.rs:436-466`         | grep `--userns` in container.rs returns 0 hits                          |
 
@@ -832,6 +834,7 @@ as a `progress` todo with explicit target:
 | Self-hosted KVM runner provisioning                                         | tracked       | **todo #73**, target: M12+                                                                |
 | Nightly perf-benchmarks job                                                 | tracked       | **todo #74**, blocked on #73                                                              |
 | Bump nix dep when 0.30+ exposes pidfd_open                                  | tracked       | **todo #60**, no urgency                                                                  |
+| Cross-session L4 isolation gateway-integration coverage (container backend) | tracked       | **todo #82**, target M12+ (e2e `_probe_gateway_tcp` cannot exercise this from inside a session because gateway DNAT prerouting at `sandbox-core/src/gateway.rs:1462-1486` rewrites every TCP/UDP destination before the packet leaves the bridge; structural disjoint-subnet check at step 5 of `test_concurrent_sessions` already covers the architectural contract on both backends — todo #82 adds in-tree integration coverage of the runtime drop in the forward chain. No spec change required) |
 | Rootless-Docker enforcement at the daemon                                   | tracked       | **M11-S8** (full scope: probe + `--force-rootless-docker` flag + PATH-stub test substrate) |
 | M11 commit disentanglement                                                  | tracked       | **todo #65**, before merge to main (orchestrator-level concern, NOT a spec claim)         |
 
@@ -884,7 +887,46 @@ also pass. Post-S7 the previously-tracked container skips are gone:
   surfacing gateway/session IPs via the new `SessionNetworkInfo` /
   `SessionMountInfo` DTO substructs (LM4.37 / LM6.23) so those tests
   read backend-neutral fields from `sandbox inspect` instead of
-  pinning to Lima's `10.209.x.x/28` regex.
+  pinning to Lima's `10.209.x.x/28` regex. The cross-backend L3+L4
+  reachability primitive used by all four networking tests
+  (`test_gateway_traffic_flow`, `test_stop_start_with_networking`,
+  `test_concurrent_sessions`, `test_gateway_crash_recovery`) is
+  `tests/e2e/test_m3_networking.py::_probe_gateway_tcp` — a TCP/53
+  connect to the gateway's CoreDNS listener via bash's
+  `</dev/tcp/<ip>/<port>` builtin, which works without the
+  `CAP_NET_RAW` that spec § Hardening line 561-562 forbids
+  in-container (`ping` is by-design unavailable on the lite container
+  backend). `test_gateway_crash_recovery` was also folded into the
+  same backend-neutral pattern (regex-based gateway-IP derivation
+  replaced with `inspect_session_network()`), completing the
+  four-test Bundle Y refactor that started with todo #72.
+- `test_concurrent_sessions[container]` retains its step-5
+  structural disjoint-subnet check on both backends (the
+  architecturally-binding contract that A's bridge and B's bridge
+  occupy non-overlapping `/28` blocks) but the step-7 behavioural
+  cross-session negative check (session A cannot reach session B's
+  gateway) is now scoped to `backend == "lima"`. The gateway's
+  prerouting nftables ruleset (`sandbox-core/src/gateway.rs:1462-1486`)
+  DNATs every TCP/UDP packet originating from a session's `vm_subnet`
+  to one of three local sinks on its own gateway IP, so a TCP probe
+  from session A targeting session B's gateway IP is rewritten by
+  A's gateway before it leaves A's bridge — the connect succeeds
+  against A's deny-logger / CoreDNS regardless of whether B's bridge
+  is reachable, making behavioural cross-session isolation
+  untestable via TCP from inside the session. ICMP escapes the DNAT
+  rules so the Lima ping cleanly observes the no-route-to-host
+  outcome, but the lite container backend has no working ICMP path.
+  Container-side runtime traffic-isolation coverage at the gateway
+  nftables-integration level is tracked as **todo #82** (target
+  M12+; out of M11 scope, no spec change required).
+- `test_shared_mount[container]` retains a narrower in-body
+  `if backend == "container" and is_rootless_docker():
+  pytest.skip(...)` — `tests/e2e/test_m5_workspace.py:257-282`,
+  citing spec § Workspace lines 572-574 (no userns-remap) and § Out
+  of scope line 1175 (rootless Docker out of scope, Non-goal
+  LM12.2). Mirrors the file-level `skipif` on
+  `test_lite_workspace_uid_alignment`; both become daemon-side
+  refusals in M11-S8.
 - `test_concurrent_sessions` retains a 6 GB host-RAM precondition,
   but the check is now scoped to `backend == "lima"` (M11-S7 commit
   `15e78c2`) — the container parameterization runs regardless of host
@@ -977,7 +1019,15 @@ not surfaced as healthy.
   clone path (LM6.20). The container bind target was also unified
   with Lima at `/home/agent/workspace/` (LM6.1). Both in-body
   `[container]` skips were removed; both tests now run on both
-  backends.
+  backends. `test_shared_mount[container]` retains a narrower
+  in-body `if backend == "container" and is_rootless_docker():
+  pytest.skip(...)` — the spec forbids userns-remap (§ Workspace
+  lines 572-574) and rootless Docker is explicitly out of scope (§
+  Out of scope line 1175 / Non-goal LM12.2), so the host->container
+  uid mapping is undefined under rootless and the test is not
+  expected to pass; this skip mirrors the file-level `skipif` on
+  `test_lite.py:495-507`'s `test_lite_workspace_uid_alignment` and
+  becomes a daemon-side refusal in M11-S8.
 - **C3** — `sandbox cp` visibility into the container workspace. The
   cp dispatch path was aligned to the container's bind-mount target
   so files written via cp surface inside the container at the
@@ -1042,7 +1092,23 @@ unmapped BLOCKERs. The implementation lands the spec end-to-end:
   concurrent sessions) by extending `workspace_modes` to
   `{Shared, Clone}`, dispatching `git clone` in-guest, unifying the
   bind target with Lima, and surfacing `SessionNetworkInfo` /
-  `SessionMountInfo` via `sandbox inspect`.
+  `SessionMountInfo` via `sandbox inspect`. The four cross-backend
+  networking tests (`test_gateway_traffic_flow`,
+  `test_stop_start_with_networking`, `test_concurrent_sessions`,
+  `test_gateway_crash_recovery`) all use the same backend-neutral
+  `_probe_gateway_tcp` primitive (TCP/53 to CoreDNS) for L3+L4
+  reachability — `ping` is by-design forbidden on the lite container
+  backend (spec § Hardening line 561-562 enumerates `ping` as a
+  consequence of `CAP_NET_RAW` drop). One narrow caveat: the
+  cross-session negative-isolation check in `test_concurrent_sessions`
+  is `backend == "lima"`-only because the gateway DNAT prerouting
+  rewrites the destination of any TCP probe from inside the session
+  before it crosses the bridge boundary — the structural
+  disjoint-subnet check at step 5 covers the architectural contract
+  on both backends; the runtime traffic-isolation property is
+  tracked for nftables-integration coverage as **todo #82**.
+  `test_shared_mount[container]` retains a rootless-Docker skip per
+  Non-goal LM12.2.
 
 - **Cargo gates all PASS** — `cargo nextest run --workspace`,
   `--profile integration`; clippy clean; fmt clean.
@@ -1054,7 +1120,8 @@ unmapped BLOCKERs. The implementation lands the spec end-to-end:
   becomes a daemon-side refusal in M11-S8 (out of S7 scope).
 
 The remaining open todos (#73 KVM runner, #74 nightly perf, #60 nix
-bump) are unblocked and parked for M12+. M11-S7 closed todos #61,
+bump, #82 cross-session L4 isolation gateway-integration coverage)
+are unblocked and parked for M12+. M11-S7 closed todos #61,
 #62, #63, #64, #66, #67, #69, #71, #72, #75, #76, #77, #78, #79, #80
 in-branch — see "Deferred-item reconciliation" above for the
 commit-by-commit map. The four M11-S6 defect-class fixes remain

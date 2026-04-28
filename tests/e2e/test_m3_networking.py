@@ -176,6 +176,57 @@ def _ip_in_cidr(ip: str, cidr: str) -> bool:
     return ipaddress.ip_address(ip) in ipaddress.ip_network(cidr, strict=False)
 
 
+def _probe_gateway_tcp(sandbox_cli, name: str, ip: str, port: int = 53,
+                       timeout: int = 30):
+    """Backend-neutral L3+L4 reachability probe to the per-session gateway.
+
+    Replaces the legacy ``ping <gateway_ip>`` check used across the
+    M3 networking suite. ``ping`` relies on raw ICMP sockets, which
+    require ``CAP_NET_RAW`` — but the lite container backend's
+    spec-mandated hardening posture drops every Linux capability
+    (spec § Hardening line 547: ``--cap-drop ALL``) and § "What this
+    breaks" line 561-562 explicitly enumerates ``ping`` as a
+    by-design forbidden tool: *"Raw network sockets. ``CAP_NET_RAW``
+    dropped; ``ping`` and similar tools fail."* The Lima backend
+    runs an unhardened guest where ICMP is fine, but the test must
+    work on both backends, so we replace the L3 ICMP probe with an
+    L3+L4 TCP probe to a port the gateway always serves.
+
+    Probe primitive: bash's ``</dev/tcp/<ip>/<port>`` builtin. It is
+    a pure-bash redirection that opens a TCP socket without needing
+    raw-socket capabilities; available unconditionally in the lite
+    image (``bash`` installed in the Dockerfile) and the Lima image
+    (Ubuntu cloud-init image ships bash). No extra package needed.
+
+    Target port: 53 (CoreDNS, the gateway's DNS listener). The
+    gateway's nftables ruleset DNATs TCP/53 to CoreDNS for every
+    session (verified structurally by ``test_denied_traffic`` which
+    asserts the ``tcp dport 53 dnat`` rule is present), and CoreDNS
+    listens on both UDP and TCP 53 by default. So a successful TCP
+    connect to ``gateway_ip:53`` is equivalent — for reachability
+    purposes — to a successful ``ping``: it round-trips through the
+    same nftables DNAT path and the same per-session bridge.
+
+    The outer ``timeout 5`` wrapper bounds the wait when the route
+    is unreachable (e.g. the cross-session negative check), so the
+    test fails cleanly rather than hanging on an unanswered SYN.
+    On success, ``echo OK`` is emitted to stdout — callers assert
+    on ``rc == 0`` and ``"OK" in stdout``. On failure, returncode
+    is non-zero (124 from ``timeout`` or 1 from bash on connection
+    refused / network unreachable).
+
+    The wider ``sandbox_cli`` ``timeout`` argument is the upper
+    bound on the whole ``sandbox exec`` round-trip and is set with
+    a comfortable margin over the inner 5s probe.
+    """
+    return sandbox_cli(
+        "exec", name, "--",
+        "bash", "-c",
+        f"timeout 5 bash -c '</dev/tcp/{ip}/{port}' && echo OK",
+        timeout=timeout,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -235,15 +286,16 @@ def test_gateway_traffic_flow(sandbox_cli, backend):
             f"subnet {subnet_cidr}; inspect block: {net!r}"
         )
 
-        # 4. Verify the session can ping its gateway IP.
-        ping_result = sandbox_cli(
-            "exec", "net-flow-test", "--",
-            "ping", "-c", "3", "-W", "5", gateway_ip,
-            timeout=120,
-        )
-        assert ping_result.returncode == 0, (
-            f"Session cannot ping gateway {gateway_ip}.\n"
-            f"stdout: {ping_result.stdout}\nstderr: {ping_result.stderr}\n"
+        # 4. Verify the session can reach its gateway IP. Backend-neutral
+        #    TCP probe to the gateway's CoreDNS listener (port 53),
+        #    replacing the legacy ICMP ping — `CAP_NET_RAW` is dropped on
+        #    the lite container backend (spec § Hardening line 561-562),
+        #    so ping is by-design unavailable there. See
+        #    `_probe_gateway_tcp` for the rationale.
+        reach_result = _probe_gateway_tcp(sandbox_cli, "net-flow-test", gateway_ip)
+        assert reach_result.returncode == 0 and "OK" in reach_result.stdout, (
+            f"Session cannot reach gateway {gateway_ip} (TCP/53).\n"
+            f"stdout: {reach_result.stdout}\nstderr: {reach_result.stderr}\n"
             f"{capture_lima_logs(session_id)}"
         )
 
@@ -568,13 +620,18 @@ def test_stop_start_with_networking(sandbox_cli, backend):
             f"Expected 'net-persist-marker', got: {read_result.stdout.strip()!r}"
         )
 
-        # 8. Verify networking works again: ping gateway. Also re-pull
-        #    the network block via `sandbox inspect` and assert it
-        #    surfaces the same gateway IP / subnet — the daemon
+        # 8. Verify networking works again: TCP-probe the gateway. Also
+        #    re-pull the network block via `sandbox inspect` and assert
+        #    it surfaces the same gateway IP / subnet — the daemon
         #    re-uses the same persisted /28 block on stop/start
         #    (NetworkManager keeps the subnet allocation across the
         #    pair of `delete_network`/`ensure_network` calls), so any
-        #    drift here is a daemon-side regression.
+        #    drift here is a daemon-side regression. The reachability
+        #    probe targets gateway TCP/53 (CoreDNS) instead of ICMP
+        #    ping; the lite container backend drops `CAP_NET_RAW` per
+        #    spec § Hardening line 561-562, so ping is by-design
+        #    unavailable there. See `_probe_gateway_tcp` for the
+        #    rationale.
         post_restart_net = inspect_session_network(sandbox_cli, "net-restart-test")
         assert post_restart_net["gateway_ip"] == gateway_ip, (
             f"gateway IP changed across stop/start: "
@@ -584,14 +641,10 @@ def test_stop_start_with_networking(sandbox_cli, backend):
             f"session subnet changed across stop/start: "
             f"pre={subnet_cidr!r}, post={post_restart_net['session_subnet_cidr']!r}"
         )
-        ping_result = sandbox_cli(
-            "exec", "net-restart-test", "--",
-            "ping", "-c", "3", "-W", "5", gateway_ip,
-            timeout=120,
-        )
-        assert ping_result.returncode == 0, (
-            f"Session cannot ping gateway {gateway_ip} after restart.\n"
-            f"stdout: {ping_result.stdout}\nstderr: {ping_result.stderr}"
+        reach_result = _probe_gateway_tcp(sandbox_cli, "net-restart-test", gateway_ip)
+        assert reach_result.returncode == 0 and "OK" in reach_result.stdout, (
+            f"Session cannot reach gateway {gateway_ip} (TCP/53) after restart.\n"
+            f"stdout: {reach_result.stdout}\nstderr: {reach_result.stderr}"
         )
 
         # 9. Verify DNS works after restart.
@@ -717,40 +770,58 @@ def test_concurrent_sessions(sandbox_cli, backend):
             f"subnet {subnet_a}; subnets must be disjoint."
         )
 
-        # 6. Verify both can ping their respective gateways.
-        ping_a = sandbox_cli(
-            "exec", "net-multi-a", "--",
-            "ping", "-c", "3", "-W", "5", gw_ip_a,
-            timeout=120,
-        )
-        assert ping_a.returncode == 0, (
-            f"Session A cannot ping its gateway {gw_ip_a}.\n"
-            f"stdout: {ping_a.stdout}\nstderr: {ping_a.stderr}"
+        # 6. Verify both can reach their respective gateways. TCP probe
+        #    to the gateway's CoreDNS listener (port 53), replacing the
+        #    legacy ICMP ping — `CAP_NET_RAW` is dropped on the lite
+        #    container backend (spec § Hardening line 561-562), so ping
+        #    is by-design unavailable there. See `_probe_gateway_tcp`
+        #    for the rationale.
+        reach_a = _probe_gateway_tcp(sandbox_cli, "net-multi-a", gw_ip_a)
+        assert reach_a.returncode == 0 and "OK" in reach_a.stdout, (
+            f"Session A cannot reach its gateway {gw_ip_a} (TCP/53).\n"
+            f"stdout: {reach_a.stdout}\nstderr: {reach_a.stderr}"
         )
 
-        ping_b = sandbox_cli(
-            "exec", "net-multi-b", "--",
-            "ping", "-c", "3", "-W", "5", gw_ip_b,
-            timeout=120,
-        )
-        assert ping_b.returncode == 0, (
-            f"Session B cannot ping its gateway {gw_ip_b}.\n"
-            f"stdout: {ping_b.stdout}\nstderr: {ping_b.stderr}"
+        reach_b = _probe_gateway_tcp(sandbox_cli, "net-multi-b", gw_ip_b)
+        assert reach_b.returncode == 0 and "OK" in reach_b.stdout, (
+            f"Session B cannot reach its gateway {gw_ip_b} (TCP/53).\n"
+            f"stdout: {reach_b.stdout}\nstderr: {reach_b.stderr}"
         )
 
         # 7. Verify no cross-session traffic: session A cannot reach
         #    session B's gateway. The per-session subnets are isolated
         #    Docker bridges, so routing between them must not exist.
-        cross_ping = sandbox_cli(
-            "exec", "net-multi-a", "--",
-            "ping", "-c", "2", "-W", "3", gw_ip_b,
-            timeout=120,
-        )
-        assert cross_ping.returncode != 0, (
-            f"Session A should NOT be able to reach session B's gateway "
-            f"{gw_ip_b}, but ping succeeded.\n"
-            f"stdout: {cross_ping.stdout}\nstderr: {cross_ping.stderr}"
-        )
+        #
+        #    Lima-only: the gateway's prerouting nftables ruleset
+        #    (``sandbox-core/src/gateway.rs:1462-1486``) DNATs every
+        #    TCP/UDP packet originating from the session's VM subnet
+        #    to one of three local sinks (CoreDNS for dport 53, Envoy
+        #    for policy-allowed (ip,port) pairs, deny-logger for
+        #    everything else) on A's *own* gateway IP. So a TCP probe
+        #    from session A to session B's gateway IP gets its
+        #    destination rewritten by A's gateway before the packet
+        #    ever leaves A's bridge — the connect succeeds against A's
+        #    deny-logger / CoreDNS regardless of whether B's bridge is
+        #    actually reachable, making behavioural cross-session
+        #    isolation untestable via TCP. ICMP is not DNAT'd by these
+        #    rules so a Lima ping cleanly observes the
+        #    no-route-to-host outcome, but the lite container backend
+        #    drops ``CAP_NET_RAW`` (spec § Hardening line 561-562) and
+        #    has no working ICMP path. The structural disjoint-subnet
+        #    check at step 5 above is the architecturally-binding
+        #    contract on both backends; behavioural isolation
+        #    coverage is retained via Lima only.
+        if backend == "lima":
+            cross_ping = sandbox_cli(
+                "exec", "net-multi-a", "--",
+                "ping", "-c", "2", "-W", "3", gw_ip_b,
+                timeout=120,
+            )
+            assert cross_ping.returncode != 0, (
+                f"Session A should NOT be able to reach session B's gateway "
+                f"{gw_ip_b}, but ping succeeded.\n"
+                f"stdout: {cross_ping.stdout}\nstderr: {cross_ping.stderr}"
+            )
 
         # 8. Clean up both sessions.
         sandbox_cli("rm", "net-multi-a", timeout=120)
@@ -1000,34 +1071,32 @@ def test_gateway_crash_recovery(sandbox_cli, backend):
         #    Give the gateway a moment to finish nftables injection.
         time.sleep(5)
 
-        # Get the gateway IP from the VM's network config.
-        exec_result = sandbox_cli(
-            "exec", "net-gwcrash-test", "--", "ip", "-4", "addr", "show",
-            timeout=120,
-        )
-        assert exec_result.returncode == 0
-        vm_ip_match = re.search(r"(10\.209\.\d+\.\d+)/28", exec_result.stdout)
-        assert vm_ip_match
-        vm_ip = vm_ip_match.group(1)
-        octets = vm_ip.split(".")
-        gateway_ip = f"{octets[0]}.{octets[1]}.{octets[2]}.{int(octets[3]) - 1}"
+        # Pull the gateway IP from `sandbox inspect` (M11-S7 Bundle Y /
+        # todo #72) — the daemon-side `network` block populated from the
+        # persisted `NetworkInfo` row works for both backends, replacing
+        # the legacy in-VM `ip -4 addr show` regex against
+        # `10.209.x.x/28` plus octet arithmetic that this test used to
+        # carry. Brings this test in line with its three Bundle Y
+        # siblings (`test_gateway_traffic_flow`,
+        # `test_stop_start_with_networking`, `test_concurrent_sessions`).
+        net = inspect_session_network(sandbox_cli, "net-gwcrash-test")
+        gateway_ip = net["gateway_ip"]
 
-        # Ping the gateway to verify full recovery.
-        # Lite-mode containers drop CAP_NET_RAW per spec § Hardening
-        # (line 561-562: "Raw network sockets. CAP_NET_RAW dropped; ping
-        # and similar tools fail."), so skip the ping step on container —
-        # the DNS check below still validates post-recovery networking
-        # without needing raw sockets.
-        if backend != "container":
-            ping_result = sandbox_cli(
-                "exec", "net-gwcrash-test", "--",
-                "ping", "-c", "3", "-W", "5", gateway_ip,
-                timeout=120,
-            )
-            assert ping_result.returncode == 0, (
-                f"VM cannot ping gateway {gateway_ip} after crash recovery.\n"
-                f"stdout: {ping_result.stdout}\nstderr: {ping_result.stderr}"
-            )
+        # Verify the session can reach its gateway after crash recovery.
+        # Backend-neutral TCP probe to gateway TCP/53 (CoreDNS) — replaces
+        # the prior backend-conditional ping (skipped on container per
+        # spec § Hardening line 561-562: `CAP_NET_RAW` dropped, ping
+        # by-design fails on the lite container backend). The TCP probe
+        # works on both backends without raw sockets; see
+        # `_probe_gateway_tcp` for the rationale.
+        probe_result = _probe_gateway_tcp(
+            sandbox_cli, "net-gwcrash-test", gateway_ip,
+        )
+        assert probe_result.returncode == 0 and "OK" in probe_result.stdout, (
+            f"Gateway TCP/53 not reachable after crash recovery (backend={backend}, "
+            f"gw={gateway_ip}).\n"
+            f"stdout: {probe_result.stdout}\nstderr: {probe_result.stderr}"
+        )
 
         # Verify DNS works after recovery.
         dns_result = sandbox_cli(
