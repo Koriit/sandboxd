@@ -45,6 +45,7 @@ use tracing::error;
 /// | `SessionNotFound`          | `404 Not Found`             |
 /// | `InvalidState`             | `400 Bad Request`           |
 /// | `InvalidArgument`          | `400 Bad Request`           |
+/// | `RootlessDockerRefused`    | `400 Bad Request`           |
 /// | `Network` / `Ca` /         | `500 Internal Server Error` |
 /// | `Gateway` / `Lima`         |                             |
 /// | `Io` / `Database` /        | `500 Internal Server Error` |
@@ -61,6 +62,7 @@ pub fn error_response(err: SandboxError) -> (StatusCode, Json<ApiError>) {
         SandboxError::SessionNotFound(_) => (StatusCode::NOT_FOUND, err.to_string()),
         SandboxError::InvalidState(_) => (StatusCode::BAD_REQUEST, err.to_string()),
         SandboxError::InvalidArgument(_) => (StatusCode::BAD_REQUEST, err.to_string()),
+        SandboxError::RootlessDockerRefused => (StatusCode::BAD_REQUEST, err.to_string()),
         SandboxError::Network(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
         SandboxError::Ca(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
         SandboxError::Gateway(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),

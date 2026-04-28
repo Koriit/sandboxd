@@ -39,6 +39,34 @@ pub enum SandboxError {
 
     #[error("{operation} timed out after {duration}s")]
     Timeout { operation: String, duration: u64 },
+
+    /// The host's Docker daemon is running in **rootless** mode and
+    /// the operator did not opt in via `sandbox create
+    /// --force-rootless-docker`. Container-backend session creation
+    /// is refused because rootless Docker enables userns-remap, which
+    /// shifts ownership of bind-mounted workspace files in ways that
+    /// the spec § Workspace UID-alignment contract does not cover.
+    ///
+    /// Spec reference: § Non-goals line 1175 — "Lite's target is
+    /// default-hardened Docker. Alternative runtimes are a separate
+    /// design."
+    ///
+    /// The variant carries no payload because the rejection text is a
+    /// fixed contract message; the `Display` impl renders it
+    /// verbatim. The literal token `rootless docker` (lowercase) is
+    /// embedded so test assertions can match without depending on
+    /// surrounding prose.
+    ///
+    /// HTTP mapping: `400 Bad Request` (request invalid for the host
+    /// environment), per the daemon's `error_response` helper.
+    #[error(
+        "rootless docker is not supported (spec § Non-goals line 1175 — \
+        Lite's target is default-hardened Docker; alternative runtimes \
+        are a separate design); pass `sandbox create \
+        --force-rootless-docker` to opt in per-invocation if you accept \
+        operating outside the supported envelope"
+    )]
+    RootlessDockerRefused,
 }
 
 /// Map a [`UsersConfigError`] into [`SandboxError::InvalidArgument`].
@@ -131,6 +159,29 @@ mod tests {
 
         let deserialized: ApiError = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.error, "test error");
+    }
+
+    #[test]
+    fn rootless_docker_refused_display_carries_machine_greppable_token() {
+        // The daemon's container-backend gate cites § Non-goals line
+        // 1175 and points at `--force-rootless-docker`. Test
+        // assertions across waves match on the lowercase
+        // `rootless docker` substring, so any rewording of the
+        // Display string must keep that token intact.
+        let err = SandboxError::RootlessDockerRefused;
+        let msg = err.to_string();
+        assert!(
+            msg.contains("rootless docker"),
+            "missing greppable token `rootless docker`: {msg}"
+        );
+        assert!(
+            msg.contains("--force-rootless-docker"),
+            "missing escape-hatch flag pointer: {msg}"
+        );
+        assert!(
+            msg.contains("§ Non-goals line 1175"),
+            "missing spec citation: {msg}"
+        );
     }
 
     #[test]

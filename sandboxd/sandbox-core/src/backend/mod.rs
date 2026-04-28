@@ -26,6 +26,12 @@ use crate::session::{SessionConfig, SessionId};
 
 pub mod capabilities;
 pub mod container;
+/// Rootless-Docker probe used by the container backend's
+/// session-create path. Public so the daemon's create handler (M11-S8
+/// Wave 2) can call it; structurally placed alongside [`container`]
+/// so Lima code paths cannot reach it. See the module docs for the
+/// caching and error-handling contract.
+pub mod container_rootless_probe;
 pub mod lima;
 pub mod orphan_reaper;
 pub mod spec;
