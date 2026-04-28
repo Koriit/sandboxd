@@ -125,7 +125,7 @@ pub struct SessionDto {
 /// Wire representation of the rootless-Docker probe outcome stamped
 /// onto a container session at create time (M11-S8 Wave 2).
 ///
-/// Spec § Non-goals line 1175 declares rootless Docker out of scope
+/// Spec § Non-goals line 1195 declares rootless Docker out of scope
 /// for the lite container backend; the daemon enforces this at
 /// session-create time and records the probe outcome here so
 /// `sandbox inspect` and `sandbox describe` can render the operator-

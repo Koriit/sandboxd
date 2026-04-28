@@ -574,6 +574,26 @@ is not 1000, so files written inside the container are owned by the
 operator on the host. Do **not** use userns-remap — that would force
 chown on host files, which is destructive and surprising.
 
+### Rootless Docker
+
+The lite container backend's UID-alignment contract above and the
+spec's no-userns-remap rule together require **default-hardened
+Docker** as the host runtime. Rootless Docker enables userns-remap
+via `/etc/subuid`, which shifts ownership of bind-mounted workspace
+files in ways the UID-alignment contract does not cover. The daemon
+refuses session-create on rootless hosts by default; an explicit
+operator opt-in is available per-invocation for users who accept
+they are operating outside the supported envelope.
+
+| Aspect            | Behavior                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Probe shape       | `docker info --format '{{.SecurityOptions}}'`; rootless mode is detected by the literal substring `name=rootless` in the output (Docker emits the security-options list as `[name=seccomp,profile=builtin name=rootless]` on a rootless host).                                                                                                                                                                                |
+| Cache lifetime    | Process-lifetime cache on the daemon side. The Docker daemon's mode does not change without a daemon restart, so a per-`sandboxd`-startup probe is sufficient and a re-probe within the same daemon lifetime is wasted I/O. A daemon restart re-probes.                                                                                                                                                                       |
+| Refusal point     | Session-create handler, container backend only, before any container artifacts are touched (image build, network create, runtime `create`). Rejection error is `RootlessDockerRefused`, mapped to `400 Bad Request`. Lima session-create never calls the probe.                                                                                                                                                               |
+| Probe failure     | A `docker info` failure (binary missing, daemon down, malformed output, timeout) is propagated to the operator as a typed `Gateway` error — never silently treated as "not rootless." A daemon that cannot probe its own Docker is not in a state to safely create container sessions.                                                                                                                                          |
+| Escape hatch      | `sandbox create --force-rootless-docker` is per-invocation only. It is **not** preset-surfaced and **not** config-file-persisted, so accidental opt-in is not possible. The flag is container-only — combining it with `--backend lima` produces a CLI pre-flight rejection (exit 2). When the override is honored, the daemon still records the probe outcome on the session config.                                          |
+| Visibility        | `SessionDto.rootless: { detected, forced }` is stamped on every container session — `{ detected: false, forced: false }` for default-hardened hosts, `{ detected: true, forced: true }` for forced-rootless. Lima sessions omit the field entirely. `sandbox describe` and `sandbox inspect` render the pair so operators can audit a session's posture without re-probing.                                                    |
+
 ### Per-session home volume
 
 `/home/agent` lives in a named Docker volume: `sandbox-home-{session_id}`.
@@ -1173,8 +1193,11 @@ Explicit, deliberate exclusions:
 - **Bring-your-own image.** Future feature; applies to both backends
   when it lands, not lite-specific.
 - **Rootless Docker, gVisor, Kata Containers.** Lite's target is
-  **default-hardened Docker**. Alternative runtimes are a separate
-  design.
+  **default-hardened Docker**. The daemon refuses session-create on
+  rootless Docker by default; `sandbox create --force-rootless-docker`
+  is an explicit per-invocation escape hatch for users who accept
+  they are operating outside the supported envelope. Alternative
+  runtimes are a separate design.
 - **Cross-backend session migration.** Not a feature and not on the
   roadmap. Sessions live on the backend they were created on.
 - **Lima default resource tuning.** The 80%-of-host default is

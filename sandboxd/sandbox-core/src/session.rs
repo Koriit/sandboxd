@@ -378,7 +378,7 @@ pub struct SessionConfig {
 /// forced: true`.
 ///
 /// Lima sessions never construct this — the probe is gated to the
-/// container backend by spec § Non-goals 1175.
+/// container backend by spec § Non-goals 1195.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionRootlessDocker {
     /// `true` when the host's `docker info` reported `name=rootless`

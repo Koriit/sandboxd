@@ -255,7 +255,7 @@ def test_shared_mount(sandbox_cli, backend):
 
     Rootless-Docker handling moved daemon-side in M11-S8: the daemon
     refuses container session-create on rootless hosts by default
-    (spec § Non-goals line 1175 + `RootlessDockerRefused` mapped to
+    (spec § Non-goals line 1195 + `RootlessDockerRefused` mapped to
     HTTP 400). The previous in-body `is_rootless_docker()` skip is no
     longer needed — on a rootless rig the `sandbox create` call below
     fails loudly with the daemon's rejection text, which is the

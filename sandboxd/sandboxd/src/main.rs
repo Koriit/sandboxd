@@ -1009,7 +1009,7 @@ async fn create_session(
     }
 
     // M11-S8 Wave 2: rootless-Docker enforcement (spec § Non-goals
-    // line 1175). Run BEFORE any container artifacts are touched —
+    // line 1195). Run BEFORE any container artifacts are touched —
     // including the lite-image build below and every subsequent
     // session-create step (CA, network, runtime). On rootless hosts
     // without `--force-rootless-docker` the daemon refuses with

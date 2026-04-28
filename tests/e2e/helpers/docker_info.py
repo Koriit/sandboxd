@@ -8,8 +8,12 @@ from inside the container as ``host_uid`` lands on the host as a
 sub-uid — the test would fail through no fault of the lite backend.
 
 The lite spec calls out rootless Docker as out of scope (§
-"Out of scope" line 1175: *"Lite's target is **default-hardened
-Docker**. Alternative runtimes are a separate design."*).
+"Non-goals" line 1195: *"Lite's target is **default-hardened
+Docker**. The daemon refuses session-create on rootless Docker by
+default; ``sandbox create --force-rootless-docker`` is an explicit
+per-invocation escape hatch for users who accept they are operating
+outside the supported envelope. Alternative runtimes are a separate
+design."*).
 
 Since M11-S8 the daemon enforces the non-goal at session-create time
 (``RootlessDockerRefused`` returned as HTTP 400), so e2e tests no

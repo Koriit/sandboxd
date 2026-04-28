@@ -469,7 +469,7 @@ fn integration_rootless_docker_session_create_refused() {
     for token in &[
         "rootless docker",
         "--force-rootless-docker",
-        "§ Non-goals line 1175",
+        "§ Non-goals line 1195",
     ] {
         assert!(
             combined.contains(token),
@@ -616,7 +616,7 @@ fn integration_rootless_docker_force_flag_rejected_on_lima() {
     // output on stderr (no swallowing, no rewording).
     for line in &[
         "error: `--force-rootless-docker` is only meaningful for the container backend",
-        "help: rootless-Docker detection (spec § Non-goals 1175) is a container-backend gate",
+        "help: rootless-Docker detection (spec § Non-goals 1195) is a container-backend gate",
         "help: drop `--force-rootless-docker`, or pass `--backend container` / `--lite` if you intended a container session",
     ] {
         assert!(

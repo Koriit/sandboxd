@@ -1,6 +1,6 @@
 //! Rootless-Docker probe for the container backend.
 //!
-//! Spec § Non-goals line 1175 declares rootless Docker out of scope:
+//! Spec § Non-goals line 1195 declares rootless Docker out of scope:
 //! Lite's target is **default-hardened Docker**. The previous milestone
 //! (M11-S7) caught the gap between this prose contract and the daemon's
 //! actual behavior — a polarity-inverted `is_rootless_docker()` skipif

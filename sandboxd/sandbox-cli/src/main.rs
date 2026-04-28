@@ -129,7 +129,7 @@ enum Command {
         #[arg(long, conflicts_with = "backend")]
         lite: bool,
         /// Allow session-create on rootless Docker (operator opt-in;
-        /// spec § Non-goals 1175 — explicitly outside the supported
+        /// spec § Non-goals 1195 — explicitly outside the supported
         /// envelope).
         ///
         /// M11-S8 Wave 2: by default the daemon probes `docker info`
@@ -1599,7 +1599,7 @@ fn render_mounts_block(mounts: Option<&SessionMountInfo>, out: &mut String) {
 
 /// Render the M11-S8 Wave 2 rootless-Docker probe outcome.
 ///
-/// Spec § Non-goals line 1175 makes rootless Docker out-of-scope for
+/// Spec § Non-goals line 1195 makes rootless Docker out-of-scope for
 /// the lite container backend; the daemon stamps the probe outcome
 /// onto each container session at create time so operators can see
 /// (a) whether the host was detected as rootless, and (b) whether
@@ -3896,7 +3896,7 @@ async fn dispatch_create_preflight(
 
     // M11-S8 Wave 2: `--force-rootless-docker` is the operator's
     // per-invocation opt-in to allow session-create on a rootless
-    // Docker host (spec § Non-goals 1175); it is only meaningful for
+    // Docker host (spec § Non-goals 1195); it is only meaningful for
     // the container backend. Combining it with a resolved Lima
     // backend is operator confusion the CLI rejects up-front so the
     // daemon never sees a malformed request. Same shape as the

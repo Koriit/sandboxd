@@ -47,8 +47,12 @@ pub enum SandboxError {
     /// shifts ownership of bind-mounted workspace files in ways that
     /// the spec § Workspace UID-alignment contract does not cover.
     ///
-    /// Spec reference: § Non-goals line 1175 — "Lite's target is
-    /// default-hardened Docker. Alternative runtimes are a separate
+    /// Spec reference: § Non-goals line 1195 — "Lite's target is
+    /// default-hardened Docker. The daemon refuses session-create on
+    /// rootless Docker by default; `sandbox create
+    /// --force-rootless-docker` is an explicit per-invocation escape
+    /// hatch for users who accept they are operating outside the
+    /// supported envelope. Alternative runtimes are a separate
     /// design."
     ///
     /// The variant carries no payload because the rejection text is a
@@ -60,7 +64,7 @@ pub enum SandboxError {
     /// HTTP mapping: `400 Bad Request` (request invalid for the host
     /// environment), per the daemon's `error_response` helper.
     #[error(
-        "rootless docker is not supported (spec § Non-goals line 1175 — \
+        "rootless docker is not supported (spec § Non-goals line 1195 — \
         Lite's target is default-hardened Docker; alternative runtimes \
         are a separate design); pass `sandbox create \
         --force-rootless-docker` to opt in per-invocation if you accept \
@@ -164,7 +168,7 @@ mod tests {
     #[test]
     fn rootless_docker_refused_display_carries_machine_greppable_token() {
         // The daemon's container-backend gate cites § Non-goals line
-        // 1175 and points at `--force-rootless-docker`. Test
+        // 1195 and points at `--force-rootless-docker`. Test
         // assertions across waves match on the lowercase
         // `rootless docker` substring, so any rewording of the
         // Display string must keep that token intact.
@@ -179,7 +183,7 @@ mod tests {
             "missing escape-hatch flag pointer: {msg}"
         );
         assert!(
-            msg.contains("§ Non-goals line 1175"),
+            msg.contains("§ Non-goals line 1195"),
             "missing spec citation: {msg}"
         );
     }

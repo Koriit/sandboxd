@@ -165,7 +165,7 @@ pub struct CreateSessionRequest {
     #[serde(default)]
     pub backend: Option<crate::backend::BackendKind>,
     /// Operator opt-in to allow session-create on a rootless-Docker host
-    /// (M11-S8 Wave 2). Spec § Non-goals line 1175 declares rootless
+    /// (M11-S8 Wave 2). Spec § Non-goals line 1195 declares rootless
     /// Docker out of scope for the lite container backend; the daemon's
     /// create handler probes the host with `docker info` and refuses
     /// the request when the probe reports rootless mode unless this
@@ -299,7 +299,7 @@ mod tests {
     }
 
     /// Older CLIs that never send `force_rootless_docker` decode to
-    /// `false`, matching the spec § Non-goals 1175 default-deny shape.
+    /// `false`, matching the spec § Non-goals 1195 default-deny shape.
     #[test]
     fn deserialize_force_rootless_docker_absent_defaults_false() {
         let req: CreateSessionRequest =
