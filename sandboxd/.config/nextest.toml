@@ -31,7 +31,17 @@ test-group = 'lima'
 # containers out from under the lifecycle assertions. Serialise
 # anything that touches the lite-mode `sandbox-{id}` Docker namespace
 # via the shared `docker-sandbox-namespace` test group below.
-filter = 'test(/^integration_orphan_reaper/) | test(/^integration_container_runtime/)'
+#
+# M11-S8 Wave 3 added two more touch points:
+#   - `integration_rootless_docker_*` spawn full lite sessions (#2
+#     forced override, #4 default-hardened) and snapshot the
+#     `sandbox-*` namespace pre/post (#1 rejection); a parallel
+#     orphan-reaper or container-runtime test would either reap their
+#     in-flight containers or pollute the snapshot.
+#   - `integration_default_hardened_docker_proceeds` does the same
+#     positive-create exercise as #2 against the default-hardened
+#     stub.
+filter = 'test(/^integration_orphan_reaper/) | test(/^integration_container_runtime/) | test(/^integration_rootless_docker/) | test(/^integration_default_hardened_docker/)'
 test-group = 'docker-sandbox-namespace'
 
 [test-groups]
