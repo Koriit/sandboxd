@@ -532,6 +532,30 @@ pub fn render_no_cache_rejection_for_container(lite_flag_used: bool) -> String {
     )
 }
 
+/// Render the M11-S8 Wave 2 misuse error for `--force-rootless-docker`
+/// against a resolved Lima backend.
+///
+/// `--force-rootless-docker` is the operator's per-invocation opt-in
+/// to allow container-backend session-create on a rootless-Docker
+/// host (spec § Non-goals 1175). Lima sessions are unaffected by
+/// Docker mode entirely, so the combination is operator confusion the
+/// CLI rejects up-front before any daemon round-trip — same shape as
+/// [`render_no_cache_rejection_for_container`] (multi-line `error:` /
+/// `help:`), distinct text so `--no-cache`'s rejection and this one
+/// stay greppable independently.
+///
+/// **Wire-format contract** — pinned by a byte-equality unit test in
+/// this module so accidental drift in the operator-facing shape trips
+/// the test suite, not a downstream consumer.
+pub fn render_force_rootless_docker_lima_rejection() -> String {
+    "\
+error: `--force-rootless-docker` is only meaningful for the container backend
+   help: rootless-Docker detection (spec § Non-goals 1175) is a container-backend gate
+   help: drop `--force-rootless-docker`, or pass `--backend container` / `--lite` if you intended a container session
+"
+    .to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -836,6 +860,22 @@ error: `--no-cache` is not supported with `--backend container` / container back
    help: containers have no per-session slow-path equivalent to Lima's full-VM-create
    help: to rebuild the shared lite image, use:
          sandbox rebuild-image --backend container --no-cache
+";
+        assert_eq!(rendered, expected);
+    }
+
+    /// M11-S8 Wave 2: `--force-rootless-docker` with a resolved Lima
+    /// backend renders a three-line misuse error. Pin every byte so
+    /// downstream tests (Wave 3's
+    /// `integration_rootless_docker_force_flag_rejected_on_lima`) and
+    /// the spec text stay aligned.
+    #[test]
+    fn render_force_rootless_docker_lima_rejection_matches_spec() {
+        let rendered = render_force_rootless_docker_lima_rejection();
+        let expected = "\
+error: `--force-rootless-docker` is only meaningful for the container backend
+   help: rootless-Docker detection (spec § Non-goals 1175) is a container-backend gate
+   help: drop `--force-rootless-docker`, or pass `--backend container` / `--lite` if you intended a container session
 ";
         assert_eq!(rendered, expected);
     }

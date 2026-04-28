@@ -36,7 +36,7 @@ pub use api::{
     LifecycleEventDto, MitmproxyEventBodyDto, MitmproxyEventDto, NetworkHealth,
     PolicyApplyStatusDto, PolicyDto, PolicyLevelDto, PolicyRuleDto, PropagationStatusResponse,
     SessionConfigDto, SessionDto, SessionHealth, SessionMountInfo, SessionNetworkInfo,
-    UpdatePolicyRequest, event_to_jsonl_line,
+    SessionRootlessDockerDto, UpdatePolicyRequest, event_to_jsonl_line,
 };
 pub use atomic_listener_writer::{
     AtomicListenerWriter, ListenerWriteError, listener_host_root, session_listener_host_dir,
@@ -95,7 +95,8 @@ pub use policy_distributor::{PolicyDistributor, write_file_to_container};
 pub use process::run_with_timeout;
 pub use qmp::{QmpClient, mac_from_session_id};
 pub use session::{
-    Session, SessionConfig, SessionId, SessionState, WorkspaceMode, WorkspaceModeKind,
+    Session, SessionConfig, SessionId, SessionRootlessDocker, SessionState, WorkspaceMode,
+    WorkspaceModeKind,
 };
 pub use store::{OrphanInfo, ResolveOutcome, SessionStore};
 pub use users_conf::{

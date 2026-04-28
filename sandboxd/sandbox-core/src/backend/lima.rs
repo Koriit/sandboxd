@@ -134,6 +134,12 @@ impl LimaRuntime {
                 // container sessions. None here keeps the persisted
                 // shape consistent with the pre-todo-#67 Lima record.
                 cpus_decimal: None,
+                // M11-S8 Wave 2: rootless-Docker probe is gated to
+                // the container backend per spec § Non-goals 1175.
+                // Lima sessions never construct this state — the
+                // `None` keeps the persisted shape consistent with
+                // pre-Wave-2 Lima records.
+                rootless_docker: None,
             }),
             BackendSpecific::Container { .. } => Err(SandboxError::InvalidArgument(format!(
                 "LimaRuntime received a container-shaped SessionSpec (got backend={})",

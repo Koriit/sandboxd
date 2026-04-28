@@ -18,7 +18,7 @@ use crate::session::{Session, SessionConfig, WorkspaceMode};
 
 use super::dto::{
     PolicyDto, PolicyLevelDto, PolicyRuleDto, SessionConfigDto, SessionDto, SessionMountInfo,
-    SessionNetworkInfo,
+    SessionNetworkInfo, SessionRootlessDocker as SessionRootlessDockerDto,
 };
 
 // ---------------------------------------------------------------------------
@@ -83,6 +83,7 @@ impl From<&Session> for SessionDto {
             backend: session.backend,
             network: None,
             mounts: None,
+            rootless: None,
         }
     }
 }
@@ -149,6 +150,37 @@ impl SessionDto {
     pub fn with_mounts(mut self, mounts: Option<SessionMountInfo>) -> Self {
         self.mounts = mounts;
         self
+    }
+
+    /// Attach the rootless-Docker probe outcome captured at session-
+    /// create time (M11-S8 Wave 2).
+    ///
+    /// Same lean-list rationale as [`SessionDto::with_network`] and
+    /// [`SessionDto::with_mounts`]: the list endpoint deliberately
+    /// omits this so `GET /sessions` keeps a small payload;
+    /// `GET /sessions/{id}` and `POST /sessions` populate it from
+    /// the persisted [`crate::session::SessionConfig::rootless_docker`].
+    /// The mapper does not probe — it only projects state that the
+    /// daemon already stamped onto the session at create time
+    /// (deliverable 3 of the M11-S8 Wave 2 plumbing).
+    ///
+    /// `None` keeps the wire-key absent (`#[serde(skip_serializing_if]
+    /// = "Option::is_none"]`), matching the per-backend semantics on
+    /// the parent: Lima sessions never carry it, container sessions
+    /// always do. Pre-Wave-2 container records that lack the
+    /// persisted state also surface as `None` here.
+    pub fn with_rootless(mut self, rootless: Option<SessionRootlessDockerDto>) -> Self {
+        self.rootless = rootless;
+        self
+    }
+}
+
+impl From<&crate::session::SessionRootlessDocker> for SessionRootlessDockerDto {
+    fn from(s: &crate::session::SessionRootlessDocker) -> Self {
+        Self {
+            detected: s.detected,
+            forced: s.forced,
+        }
     }
 }
 
@@ -406,6 +438,7 @@ mod tests {
             boot_cmd: Some("make setup".into()),
             template: Some("/tmp/custom.yaml".into()),
             cpus_decimal: None,
+            rootless_docker: None,
         };
         let dto: SessionConfigDto = (&config).into();
         assert_eq!(
@@ -430,6 +463,7 @@ mod tests {
             boot_cmd: None,
             template: None,
             cpus_decimal: None,
+            rootless_docker: None,
         };
         let dto: SessionConfigDto = (&config).into();
         assert_eq!(
@@ -466,6 +500,7 @@ mod tests {
             boot_cmd: None,
             template: None,
             cpus_decimal: None,
+            rootless_docker: None,
         };
         let session = Session::with_config_and_backend(
             Some("lite-resolve".into()),
@@ -509,6 +544,7 @@ mod tests {
             boot_cmd: None,
             template: None,
             cpus_decimal: None,
+            rootless_docker: None,
         };
         let session = Session::with_config_and_backend(
             Some("lite-explicit".into()),
@@ -563,6 +599,7 @@ mod tests {
             boot_cmd: None,
             template: None,
             cpus_decimal: Some(1.5),
+            rootless_docker: None,
         };
         let session = Session::with_config_and_backend(
             Some("lite-fractional".into()),
@@ -645,6 +682,7 @@ mod tests {
                 boot_cmd: None,
                 template: None,
                 cpus_decimal: None,
+                rootless_docker: None,
             },
             crate::backend::BackendKind::Container,
         );
@@ -708,6 +746,126 @@ mod tests {
         let json = serde_json::to_string(&dto).unwrap();
         let deser: SessionDto = serde_json::from_str(&json).unwrap();
         assert_eq!(deser.mounts.as_ref(), Some(&mounts));
+    }
+
+    // -- M11-S8 Wave 2: SessionRootlessDocker wire shape ---------------------
+
+    #[test]
+    fn session_dto_omits_rootless_when_none() {
+        // Default `From<&Session>` path (used by `GET /sessions`)
+        // must NOT carry the block — the daemon attaches it only on
+        // `GET /sessions/{id}` / `POST /sessions` for container
+        // sessions. The DTO field's
+        // `skip_serializing_if = "Option::is_none"` guarantees the
+        // key disappears entirely (not as a `null` placeholder),
+        // matching the network/mounts shape pattern.
+        let session = Session::new(Some("rootless-empty".into()));
+        let dto = SessionDto::from(&session);
+        assert!(dto.rootless.is_none());
+
+        let json = serde_json::to_string(&dto).unwrap();
+        assert!(
+            !json.contains("\"rootless\""),
+            "rootless key must be omitted when None; json = {json}"
+        );
+    }
+
+    #[test]
+    fn session_dto_with_rootless_default_hardened_round_trips() {
+        // Container session on a default-hardened host: probe
+        // returned `false`, no force flag involved. Wire shape pins
+        // `{detected: false, forced: false}`; both keys present so
+        // the operator can disambiguate "Lima session (key absent)"
+        // from "container session on default-hardened (both fields
+        // false)".
+        let session = Session::with_config_and_backend(
+            Some("rootless-default".into()),
+            SessionConfig::default(),
+            crate::backend::BackendKind::Container,
+        );
+        let rootless = SessionRootlessDockerDto {
+            detected: false,
+            forced: false,
+        };
+        let dto = SessionDto::from(&session).with_rootless(Some(rootless));
+
+        let value = serde_json::to_value(&dto).unwrap();
+        let block = &value["rootless"];
+        assert_eq!(block["detected"], serde_json::json!(false));
+        assert_eq!(block["forced"], serde_json::json!(false));
+
+        let json = serde_json::to_string(&dto).unwrap();
+        let deser: SessionDto = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.rootless.as_ref(), Some(&rootless));
+    }
+
+    #[test]
+    fn session_dto_with_rootless_forced_overrides_round_trip() {
+        // Container session on a rootless host with the operator's
+        // `--force-rootless-docker` opt-in honored: probe returned
+        // `true`, the daemon proceeded, both fields are `true`.
+        let session = Session::with_config_and_backend(
+            Some("rootless-forced".into()),
+            SessionConfig::default(),
+            crate::backend::BackendKind::Container,
+        );
+        let rootless = SessionRootlessDockerDto {
+            detected: true,
+            forced: true,
+        };
+        let dto = SessionDto::from(&session).with_rootless(Some(rootless));
+
+        let value = serde_json::to_value(&dto).unwrap();
+        let block = &value["rootless"];
+        assert_eq!(block["detected"], serde_json::json!(true));
+        assert_eq!(block["forced"], serde_json::json!(true));
+
+        let json = serde_json::to_string(&dto).unwrap();
+        let deser: SessionDto = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.rootless.as_ref(), Some(&rootless));
+    }
+
+    /// Pre-Wave-2 records (and Lima sessions) lack the `rootless`
+    /// key entirely. Forward-compat via `#[serde(default)]` on the
+    /// parent — the deserializer must accept the absent key without
+    /// error.
+    #[test]
+    fn session_dto_legacy_record_without_rootless_round_trips() {
+        let v0_json = r#"{
+            "id": "0123456789ab",
+            "state": "running",
+            "created_at": "2026-04-22T00:00:00Z",
+            "updated_at": "2026-04-22T00:00:00Z",
+            "config": {
+                "cpus": 2,
+                "memory_mb": 4096,
+                "disk_gb": 20,
+                "hardened": true
+            },
+            "backend": "container"
+        }"#;
+
+        let dto: SessionDto = serde_json::from_str(v0_json)
+            .expect("pre-Wave-2 record must round-trip via #[serde(default)]");
+        assert!(
+            dto.rootless.is_none(),
+            "missing `rootless` key must default to None"
+        );
+    }
+
+    /// Mapper from the persisted `SessionRootlessDocker` to the wire
+    /// DTO is field-for-field identity. Pinned so a future shape
+    /// change in the persisted struct trips this test before reaching
+    /// the wire surface.
+    #[test]
+    fn session_rootless_docker_persisted_to_dto_round_trip() {
+        let persisted = crate::session::SessionRootlessDocker {
+            detected: true,
+            forced: false,
+        };
+        let dto: SessionRootlessDockerDto = (&persisted).into();
+        assert_eq!(dto.detected, persisted.detected);
+        assert_eq!(dto.forced, persisted.forced);
     }
 
     #[test]

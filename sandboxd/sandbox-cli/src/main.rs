@@ -12,14 +12,14 @@ use hyper_util::rt::TokioIo;
 use sandbox_core::{
     ApiError, EventDto, ExecResponse, Policy, PolicyDto, PolicyLevelDto, PolicyRule, PolicyRuleDto,
     PropagationStatusResponse, SessionDto, SessionHealth, SessionMountInfo, SessionNetworkInfo,
-    UpdatePolicyRequest,
+    SessionRootlessDockerDto, UpdatePolicyRequest,
 };
 use tokio::net::UnixStream;
 
 use sandbox_cli::backend::{
     BackendKindArg, BackendResolutionInputs, FeatureMismatchContext, RebuildImageBackend,
-    load_cli_config, render_feature_mismatch, render_isolation_warning,
-    render_no_cache_rejection_for_container, resolve_backend,
+    load_cli_config, render_feature_mismatch, render_force_rootless_docker_lima_rejection,
+    render_isolation_warning, render_no_cache_rejection_for_container, resolve_backend,
 };
 use sandbox_cli::backends_cache::BackendsCache;
 use sandbox_cli::presets::{self, Catalog, ParsedInvocation, Preset, PresetSource};
@@ -128,6 +128,29 @@ enum Command {
         /// Mutually exclusive with `--backend`.
         #[arg(long, conflicts_with = "backend")]
         lite: bool,
+        /// Allow session-create on rootless Docker (operator opt-in;
+        /// spec § Non-goals 1175 — explicitly outside the supported
+        /// envelope).
+        ///
+        /// M11-S8 Wave 2: by default the daemon probes `docker info`
+        /// and refuses container-backend session-create when the host
+        /// is in rootless mode. Pass this flag to override that
+        /// refusal for the current invocation only — the flag is
+        /// never persisted to any config file or preset, so accidental
+        /// opt-in across multiple invocations is not possible.
+        ///
+        /// Container-backend only: combining this flag with a
+        /// resolved Lima backend is a misuse error (exit 2); Lima
+        /// sessions are unaffected by Docker mode entirely.
+        //
+        // Implementation note (not in --help output): the rejection
+        // is programmatic in `dispatch_create_preflight` rather than
+        // `conflicts_with`-based because the resolved backend is the
+        // product of a five-tier precedence chain (`--lite`,
+        // `--backend`, env, config, hardcoded default) — not a single
+        // CLI flag clap could pin against.
+        #[arg(long)]
+        force_rootless_docker: bool,
     },
     /// Start a sandbox session.
     Start {
@@ -531,6 +554,7 @@ fn build_create_request_body(
         no_cache,
         backend: _backend,
         lite: _lite,
+        force_rootless_docker,
     } = command
     else {
         unreachable!("build_create_request_body called with non-Create command");
@@ -647,6 +671,18 @@ fn build_create_request_body(
     }
     if *no_cache {
         body.insert("no_cache".into(), serde_json::json!(true));
+    }
+    // M11-S8 Wave 2: only stamp `force_rootless_docker` when the
+    // operator explicitly passed `--force-rootless-docker`. The wire
+    // shape's `#[serde(skip_serializing_if = "is_false")]` keeps the
+    // body bit-equal to the pre-Wave-2 default-hardened path when the
+    // flag is absent, so older daemons that ignore the field see
+    // exactly the request they used to receive. Container-only by
+    // construction — `dispatch_create_preflight` already rejected the
+    // `--force-rootless-docker --backend lima` combination with
+    // exit 2 before this function runs.
+    if *force_rootless_docker {
+        body.insert("force_rootless_docker".into(), serde_json::json!(true));
     }
     // M11-S4 Phase 4A: stamp the resolved backend onto the request
     // body. The daemon's `CreateSessionRequest` carries this as
@@ -1418,6 +1454,7 @@ fn render_describe_one(
 
     render_network_block(session.network.as_ref(), out);
     render_mounts_block(session.mounts.as_ref(), out);
+    render_rootless_block(session.rootless.as_ref(), out);
 
     render_policy_block(session.policy.as_ref(), out);
 
@@ -1556,6 +1593,50 @@ fn render_mounts_block(mounts: Option<&SessionMountInfo>, out: &mut String) {
                 m.home_volume.as_deref().unwrap_or("-")
             );
         }
+    }
+    out.push('\n');
+}
+
+/// Render the M11-S8 Wave 2 rootless-Docker probe outcome.
+///
+/// Spec § Non-goals line 1175 makes rootless Docker out-of-scope for
+/// the lite container backend; the daemon stamps the probe outcome
+/// onto each container session at create time so operators can see
+/// (a) whether the host was detected as rootless, and (b) whether
+/// the `--force-rootless-docker` opt-in was actually applied.
+///
+/// Render contract:
+/// - `None` (Lima sessions, pre-Wave-2 container records): the block
+///   is omitted entirely. This matches the conditional rendering for
+///   `network` / `mounts` blocks — Lima sessions never carry
+///   container-only state, and printing `Rootless Docker: none` for
+///   them would be operator confusion (the answer is "n/a", not
+///   "none").
+/// - `Some({detected: false, forced: _})`: render only the `detected`
+///   line. `forced` is operator-irrelevant on a default-hardened
+///   host (the override has nothing to override) and printing it
+///   would muddy the output.
+/// - `Some({detected: true, forced: _})`: render both lines so the
+///   operator can confirm which mode actually applied.
+fn render_rootless_block(rootless: Option<&SessionRootlessDockerDto>, out: &mut String) {
+    use std::fmt::Write as _;
+    let Some(r) = rootless else {
+        // Field absent — nothing to render. Mirrors the network/mounts
+        // None-branch's "no key on the wire" semantics.
+        return;
+    };
+    let _ = writeln!(out, "Rootless Docker:");
+    let _ = writeln!(
+        out,
+        "  detected:    {}",
+        if r.detected { "yes" } else { "no" }
+    );
+    if r.detected {
+        let _ = writeln!(
+            out,
+            "  forced:      {}",
+            if r.forced { "yes" } else { "no" }
+        );
     }
     out.push('\n');
 }
@@ -3747,12 +3828,22 @@ async fn send_rebuild_image_request(
 /// itself but threaded through for symmetry with future "skip
 /// confirmation" knobs (the staleness check above already consumes
 /// it).
+// 8 args — one knob per CLI flag the preflight gate consults
+// (`--lite`, `--backend`, `--no-hardening`, `--no-cache`,
+// `--force-rootless-docker`) plus the socket path, the workspace
+// string, and the test-only XDG override. Bundling them into a
+// struct would obscure the call site (every arg is a distinct CLI
+// flag, not a coherent "preflight inputs" object that exists
+// elsewhere). Allow the warning at function scope so the clippy
+// signal still surfaces if the next gate ever adds a ninth knob.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_create_preflight(
     socket_path: &str,
     backend_arg: Option<BackendKindArg>,
     lite_flag: bool,
     no_hardening: bool,
     no_cache: bool,
+    force_rootless_docker: bool,
     workspace: Option<&str>,
     cli_config_xdg_override: Option<&Path>,
 ) -> sandbox_core::BackendKind {
@@ -3800,6 +3891,21 @@ async fn dispatch_create_preflight(
     // executes earlier so the operator never burns a round-trip.
     if no_cache && resolved_backend == sandbox_core::BackendKind::Container {
         eprint!("{}", render_no_cache_rejection_for_container(lite_flag));
+        process::exit(2);
+    }
+
+    // M11-S8 Wave 2: `--force-rootless-docker` is the operator's
+    // per-invocation opt-in to allow session-create on a rootless
+    // Docker host (spec § Non-goals 1175); it is only meaningful for
+    // the container backend. Combining it with a resolved Lima
+    // backend is operator confusion the CLI rejects up-front so the
+    // daemon never sees a malformed request. Same shape as the
+    // `--no-cache` rejection above (programmatic, exit 2, runs before
+    // daemon contact). `clap`'s `conflicts_with` cannot express this
+    // — the offending state is "resolved backend is Lima", which is
+    // the output of the five-tier resolver, not a single CLI flag.
+    if force_rootless_docker && resolved_backend == sandbox_core::BackendKind::Lima {
+        eprint!("{}", render_force_rootless_docker_lima_rejection());
         process::exit(2);
     }
 
@@ -4016,6 +4122,7 @@ async fn main() {
         lite,
         no_hardening,
         no_cache,
+        force_rootless_docker,
         workspace,
         ..
     } = &cli.command
@@ -4026,6 +4133,7 @@ async fn main() {
             *lite,
             *no_hardening,
             *no_cache,
+            *force_rootless_docker,
             workspace.as_deref(),
             None,
         )
@@ -4083,6 +4191,7 @@ mod tests {
                 no_cache: false,
                 backend: None,
                 lite: false,
+                force_rootless_docker: false,
             } => assert!(preset.is_empty(), "default preset list should be empty"),
             _ => panic!("expected Create command with default fields"),
         }
@@ -4282,6 +4391,7 @@ mod tests {
             no_cache: false,
             backend: None,
             lite: false,
+            force_rootless_docker: false,
         };
         let req = build_create_request_body(&cmd, sandbox_core::BackendKind::Lima);
         assert_eq!(req.method(), "POST");
@@ -4313,6 +4423,7 @@ mod tests {
             no_cache: false,
             backend: None,
             lite: false,
+            force_rootless_docker: false,
         };
         let req = build_create_request_body(&cmd, sandbox_core::BackendKind::Lima);
         assert_eq!(req.method(), "POST");
@@ -4341,6 +4452,7 @@ mod tests {
             no_cache: false,
             backend: None,
             lite: false,
+            force_rootless_docker: false,
         };
         let req = build_create_request_body(&cmd, sandbox_core::BackendKind::Lima);
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -4716,6 +4828,7 @@ mod tests {
             no_cache: false,
             backend: None,
             lite: false,
+            force_rootless_docker: false,
         };
         let req = build_create_request_body(&cmd, sandbox_core::BackendKind::Lima);
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -4740,6 +4853,7 @@ mod tests {
             no_cache: false,
             backend: None,
             lite: false,
+            force_rootless_docker: false,
         };
         let req = build_create_request_body(&cmd, sandbox_core::BackendKind::Lima);
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -4792,6 +4906,7 @@ mod tests {
             no_cache: false,
             backend: None,
             lite: false,
+            force_rootless_docker: false,
         };
         let req = build_create_request_body(&cmd, sandbox_core::BackendKind::Lima);
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -4818,6 +4933,7 @@ mod tests {
             no_cache: false,
             backend: None,
             lite: false,
+            force_rootless_docker: false,
         };
         let req = build_create_request_body(&cmd, sandbox_core::BackendKind::Lima);
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -4968,6 +5084,7 @@ mod tests {
             no_cache: true,
             backend: None,
             lite: false,
+            force_rootless_docker: false,
         };
         let req = build_create_request_body(&cmd, sandbox_core::BackendKind::Lima);
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -4994,6 +5111,7 @@ mod tests {
             no_cache: false,
             backend: None,
             lite: false,
+            force_rootless_docker: false,
         };
         let req = build_create_request_body(&cmd, sandbox_core::BackendKind::Lima);
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
@@ -5247,6 +5365,7 @@ mod tests {
             backend: sandbox_core::backend::BackendKind::Lima,
             network: None,
             mounts: None,
+            rootless: None,
         }
     }
 
@@ -6723,6 +6842,92 @@ mod tests {
                 "echo".to_string(),
                 "hello".to_string(),
             ]
+        );
+    }
+
+    // -- M11-S8 Wave 2: render_rootless_block ----------------------------------
+
+    /// `None` — Lima sessions and pre-Wave-2 records emit nothing.
+    /// Mirrors how `render_network_block`/`render_mounts_block` behave
+    /// for absent data, but without a `none` placeholder line: the
+    /// rootless-Docker block is container-only, and printing
+    /// `Rootless Docker: none` for a Lima session would mislead the
+    /// operator (the answer is "not applicable", not "none observed").
+    #[test]
+    fn render_rootless_block_none_emits_nothing() {
+        let mut out = String::new();
+        render_rootless_block(None, &mut out);
+        assert!(
+            out.is_empty(),
+            "rootless block must be silent when None; got: {out:?}"
+        );
+    }
+
+    /// Default-hardened host (probe returned `false`): render only
+    /// the `detected: no` line. `forced` is suppressed because the
+    /// override has nothing to override.
+    #[test]
+    fn render_rootless_block_default_hardened_omits_forced() {
+        let mut out = String::new();
+        render_rootless_block(
+            Some(&SessionRootlessDockerDto {
+                detected: false,
+                forced: false,
+            }),
+            &mut out,
+        );
+        assert!(out.contains("Rootless Docker:"), "header missing: {out:?}");
+        assert!(
+            out.contains("detected:    no"),
+            "detected line missing: {out:?}"
+        );
+        assert!(
+            !out.contains("forced:"),
+            "forced line must be suppressed when not detected: {out:?}"
+        );
+    }
+
+    /// Rootless host with the override applied: both lines present.
+    #[test]
+    fn render_rootless_block_forced_renders_both_lines() {
+        let mut out = String::new();
+        render_rootless_block(
+            Some(&SessionRootlessDockerDto {
+                detected: true,
+                forced: true,
+            }),
+            &mut out,
+        );
+        assert!(
+            out.contains("detected:    yes"),
+            "detected line missing: {out:?}"
+        );
+        assert!(
+            out.contains("forced:      yes"),
+            "forced line missing: {out:?}"
+        );
+    }
+
+    /// Rootless host but the operator did NOT pass the override —
+    /// this state cannot occur in practice today (the daemon refuses
+    /// such requests with `RootlessDockerRefused` before this DTO is
+    /// ever built), but the renderer must still produce a sensible
+    /// output if a future code path injects this shape (or if the
+    /// persisted record is read back by an inspect endpoint).
+    #[test]
+    fn render_rootless_block_detected_unforced_renders_both_lines() {
+        let mut out = String::new();
+        render_rootless_block(
+            Some(&SessionRootlessDockerDto {
+                detected: true,
+                forced: false,
+            }),
+            &mut out,
+        );
+        assert!(out.contains("detected:    yes"));
+        assert!(
+            out.contains("forced:      no"),
+            "forced: no must render when detected: yes; got {out:?}"
         );
     }
 }

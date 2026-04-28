@@ -104,6 +104,53 @@ pub struct SessionDto {
     /// stay `None` rather than carrying a placeholder string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mounts: Option<SessionMountInfo>,
+    /// Rootless-Docker probe outcome captured at session-create time
+    /// (M11-S8 Wave 2). `Some(_)` only for container sessions where
+    /// the daemon ran the probe; `None` for every Lima session and
+    /// for legacy container records written by pre-Wave-2 daemons
+    /// (forward-compatible via `#[serde(default)]` per CLAUDE.md
+    /// "On-disk compatibility").
+    ///
+    /// Wave 4 docs and Wave 3 integration tests both consume this
+    /// shape — `detected` mirrors the host's `docker info` output at
+    /// create time, and `forced` records whether the operator passed
+    /// `--force-rootless-docker` AND the probe actually returned
+    /// rootless (i.e. the override applied). Default-hardened hosts
+    /// stamp `{detected: false, forced: false}` and Lima sessions
+    /// omit the field entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rootless: Option<SessionRootlessDocker>,
+}
+
+/// Wire representation of the rootless-Docker probe outcome stamped
+/// onto a container session at create time (M11-S8 Wave 2).
+///
+/// Spec § Non-goals line 1175 declares rootless Docker out of scope
+/// for the lite container backend; the daemon enforces this at
+/// session-create time and records the probe outcome here so
+/// `sandbox inspect` and `sandbox describe` can render the operator-
+/// relevant pair without re-probing. Mirrors
+/// [`crate::session::SessionRootlessDocker`] field-for-field — the
+/// types are kept distinct so a future shape-change of the persisted
+/// struct cannot accidentally leak onto the wire (the same boundary
+/// pattern this module enforces for every other persisted →
+/// projected pair).
+///
+/// Pinned semantics:
+/// - `forced` implies `detected` — the daemon only sets
+///   `forced: true` when the probe returned rootless AND the
+///   operator passed `--force-rootless-docker`.
+/// - Default-hardened hosts stamp `{detected: false, forced: false}`.
+/// - Lima sessions never construct this — the field is `None` on the
+///   parent [`SessionDto::rootless`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionRootlessDocker {
+    /// `true` when the host's `docker info` reported `name=rootless`
+    /// at session-create time.
+    pub detected: bool,
+    /// `true` when `--force-rootless-docker` was passed AND
+    /// `detected` is `true`.
+    pub forced: bool,
 }
 
 /// Backend-neutral per-session networking summary surfaced on the

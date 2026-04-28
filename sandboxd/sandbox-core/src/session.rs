@@ -340,6 +340,56 @@ pub struct SessionConfig {
     /// "On-disk compatibility".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpus_decimal: Option<f32>,
+    /// Rootless-Docker probe outcome captured at session-create time
+    /// (M11-S8 Wave 2). `Some(_)` only for container sessions where
+    /// the daemon ran the probe; `None` for every Lima session and
+    /// for legacy container records written by pre-Wave-2 daemons.
+    ///
+    /// Surfaced on the wire by the [`crate::api::SessionDto::rootless`]
+    /// field so `sandbox inspect` and `sandbox describe` can render
+    /// the operator-relevant pair (`detected`, `forced`) without
+    /// re-running the probe. Persisted in `config_json` alongside
+    /// the rest of the session config; forward-compatible via
+    /// `#[serde(default)]` (older daemons rolling back ignore the
+    /// unknown field, newer daemons reading older records get
+    /// `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rootless_docker: Option<SessionRootlessDocker>,
+}
+
+/// Persisted rootless-Docker probe outcome for a container session
+/// (M11-S8 Wave 2).
+///
+/// Captured at `POST /sessions` time and stamped into
+/// [`SessionConfig::rootless_docker`] so `GET /sessions/{id}` can
+/// render the same pair without re-probing — the per-daemon-lifetime
+/// probe cache (`backend::container_rootless_probe`) means the value
+/// stamped here would never disagree with a fresh re-probe inside
+/// the same daemon process anyway, but threading the recorded value
+/// through the wire keeps the inspect surface consistent across
+/// daemon restarts and across the create-vs-inspect call boundary.
+///
+/// `forced` implies `detected`: the daemon only sets `forced = true`
+/// when the probe returned `true` AND the operator passed
+/// `--force-rootless-docker`. A default-hardened host stamps
+/// `detected: false, forced: false`; a rootless host without the
+/// override is refused at create time and never reaches this struct;
+/// a rootless host with the override stamps `detected: true,
+/// forced: true`.
+///
+/// Lima sessions never construct this — the probe is gated to the
+/// container backend by spec § Non-goals 1175.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionRootlessDocker {
+    /// `true` when the host's `docker info` reported `name=rootless`
+    /// at session-create time.
+    pub detected: bool,
+    /// `true` when the operator passed `--force-rootless-docker` AND
+    /// the probe detected rootless mode (i.e., the override actually
+    /// applied). `false` on default-hardened hosts even if the
+    /// operator passed the flag — the override is only meaningful in
+    /// the detected-rootless case.
+    pub forced: bool,
 }
 
 fn default_hardened() -> bool {
@@ -358,6 +408,7 @@ impl Default for SessionConfig {
             boot_cmd: None,
             template: None,
             cpus_decimal: None,
+            rootless_docker: None,
         }
     }
 }
@@ -490,6 +541,7 @@ mod tests {
             boot_cmd: None,
             template: None,
             cpus_decimal: None,
+            rootless_docker: None,
         };
         let session = Session::with_config(Some("custom".into()), config);
         assert_eq!(session.config.cpus, 4);
@@ -648,6 +700,7 @@ mod tests {
             boot_cmd: None,
             template: None,
             cpus_decimal: None,
+            rootless_docker: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         let deser: SessionConfig = serde_json::from_str(&json).unwrap();
@@ -706,6 +759,7 @@ mod tests {
             boot_cmd: None,
             template: None,
             cpus_decimal: Some(1.5),
+            rootless_docker: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         // Wire-form sanity: both keys present, integer is the floor.
@@ -743,6 +797,7 @@ mod tests {
             boot_cmd: Some("make setup".into()),
             template: Some("/tmp/custom.yaml".into()),
             cpus_decimal: None,
+            rootless_docker: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         let deser: SessionConfig = serde_json::from_str(&json).unwrap();

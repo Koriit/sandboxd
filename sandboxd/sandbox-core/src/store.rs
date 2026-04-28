@@ -1438,6 +1438,7 @@ mod tests {
             boot_cmd: None,
             template: None,
             cpus_decimal: None,
+            rootless_docker: None,
         };
 
         let session = store
@@ -1472,6 +1473,7 @@ mod tests {
             boot_cmd: Some("make setup".into()),
             template: Some("/tmp/custom.yaml".into()),
             cpus_decimal: None,
+            rootless_docker: None,
         };
 
         let session = store

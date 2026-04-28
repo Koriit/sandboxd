@@ -951,7 +951,12 @@ async fn create_session(
         },
     };
 
-    let config = SessionConfig {
+    // M11-S8 Wave 2: `rootless_docker` is stamped post-probe (after
+    // the rootless-Docker gate runs below) so the persisted config
+    // carries the probe outcome the same daemon used to make the
+    // refuse/accept decision. Initialised to `None` here and patched
+    // before the session row is written to the store.
+    let mut config = SessionConfig {
         cpus: cpus_persisted,
         memory_mb,
         disk_gb: req.disk_gb.unwrap_or(20),
@@ -965,6 +970,7 @@ async fn create_session(
         boot_cmd: req.boot_cmd.clone(),
         template: req.template.clone(),
         cpus_decimal,
+        rootless_docker: None,
     };
 
     // Hardened flag interaction with the container backend:
@@ -1000,6 +1006,40 @@ async fn create_session(
         // an HTTP 400 with the message intact (see `error_response`).
         return error_response(SandboxError::InvalidArgument(unsupported.to_string()))
             .into_response();
+    }
+
+    // M11-S8 Wave 2: rootless-Docker enforcement (spec § Non-goals
+    // line 1175). Run BEFORE any container artifacts are touched —
+    // including the lite-image build below and every subsequent
+    // session-create step (CA, network, runtime). On rootless hosts
+    // without `--force-rootless-docker` the daemon refuses with
+    // `RootlessDockerRefused` (mapped to HTTP 400 by `error_response`)
+    // so the call never reaches `docker pull` / `docker create` and
+    // no orphan resources get allocated.
+    //
+    // The probe outcome (detected, forced) is stamped onto `config`
+    // below so it persists with the session for `sandbox inspect`
+    // visibility (deliverable 3). On probe failure we propagate the
+    // error verbatim — a host whose `docker info` doesn't even
+    // respond is not in a state to safely create container sessions,
+    // and the operator deserves a clear "Docker daemon unreachable"
+    // diagnostic over a silent fallback.
+    //
+    // Lima sessions never call the probe — Docker mode is irrelevant
+    // to QEMU/Lima session creation by construction.
+    if backend_kind == BackendKind::Container {
+        let detected =
+            match sandbox_core::backend::container_rootless_probe::is_rootless_docker().await {
+                Ok(v) => v,
+                Err(e) => return error_response(e).into_response(),
+            };
+        if detected && !req.force_rootless_docker {
+            return error_response(SandboxError::RootlessDockerRefused).into_response();
+        }
+        config.rootless_docker = Some(sandbox_core::SessionRootlessDocker {
+            detected,
+            forced: detected && req.force_rootless_docker,
+        });
     }
 
     // Container backend: ensure the lite image exists *before* we
@@ -1733,7 +1773,19 @@ async fn create_session(
                 cleanup_lite_gateway_and_return!(error_response(e).into_response());
             }
         };
-        let dto = SessionDto::from(&created).with_warnings(warnings);
+        // M11-S8 Wave 2: surface the rootless-Docker probe outcome
+        // on the container create response so operators can confirm
+        // whether the daemon detected rootless and whether the
+        // `--force-rootless-docker` opt-in was actually applied,
+        // without an extra `GET /sessions/{id}` round-trip.
+        let rootless_dto = created
+            .config
+            .rootless_docker
+            .as_ref()
+            .map(sandbox_core::SessionRootlessDockerDto::from);
+        let dto = SessionDto::from(&created)
+            .with_warnings(warnings)
+            .with_rootless(rootless_dto);
         return (StatusCode::CREATED, Json(dto)).into_response();
     } else if use_cache {
         // ---- Fast path: clone from golden base image ----
@@ -2265,10 +2317,22 @@ async fn create_session(
         policies.get(&session_id).cloned()
     };
 
+    // M11-S8 Wave 2: rootless-Docker state is container-only; for
+    // Lima sessions `created.config.rootless_docker` stays `None` and
+    // the wire field is omitted entirely (`skip_serializing_if`).
+    // Mirroring the container response for shape symmetry — operators
+    // who pipe `POST /sessions` through `jq` see the same key set
+    // regardless of which branch served them.
+    let rootless_dto = created
+        .config
+        .rootless_docker
+        .as_ref()
+        .map(sandbox_core::SessionRootlessDockerDto::from);
     let dto = SessionDto::from(&created)
         .with_status(agent_status, gateway_status)
         .with_policy(policy_opt.as_ref())
-        .with_warnings(warnings);
+        .with_warnings(warnings)
+        .with_rootless(rootless_dto);
 
     (StatusCode::CREATED, Json(dto)).into_response()
 }
@@ -2433,11 +2497,21 @@ async fn get_session(
     let network = session_network_info_for(&state, &session.id);
     let mounts = Some(session_mount_info_for(&session));
 
+    // M11-S8 Wave 2: project the persisted rootless-Docker probe
+    // outcome onto the wire — `None` for Lima sessions and for
+    // pre-Wave-2 container records, `Some({detected, forced})` for
+    // any container session created post Wave 2.
+    let rootless_dto = session
+        .config
+        .rootless_docker
+        .as_ref()
+        .map(sandbox_core::SessionRootlessDockerDto::from);
     let dto = SessionDto::from(&session)
         .with_status(agent_status, gateway_status)
         .with_policy(policy_opt.as_ref())
         .with_network(network)
-        .with_mounts(mounts);
+        .with_mounts(mounts)
+        .with_rootless(rootless_dto);
     (StatusCode::OK, Json(dto)).into_response()
 }
 

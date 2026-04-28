@@ -11,7 +11,7 @@ pub mod mapper;
 
 pub use dto::{
     PolicyDto, PolicyLevelDto, PolicyRuleDto, SessionConfigDto, SessionDto, SessionMountInfo,
-    SessionNetworkInfo,
+    SessionNetworkInfo, SessionRootlessDocker as SessionRootlessDockerDto,
 };
 pub use event_dto::{
     DenyLoggerEventBodyDto, DenyLoggerEventDto, DenyProtocolDto, DnsEventBodyDto, DnsEventDto,
@@ -164,6 +164,34 @@ pub struct CreateSessionRequest {
     /// column so subsequent dispatch routes to the right runtime.
     #[serde(default)]
     pub backend: Option<crate::backend::BackendKind>,
+    /// Operator opt-in to allow session-create on a rootless-Docker host
+    /// (M11-S8 Wave 2). Spec § Non-goals line 1175 declares rootless
+    /// Docker out of scope for the lite container backend; the daemon's
+    /// create handler probes the host with `docker info` and refuses
+    /// the request when the probe reports rootless mode unless this
+    /// field is `true`.
+    ///
+    /// Container-backend only — combining this flag with
+    /// `--backend lima` is a CLI-level misuse error (clap rejects the
+    /// combination before the request is built).
+    ///
+    /// Per-invocation, never persisted to any config file or preset:
+    /// surfacing it on the wire as a request field guarantees a fresh
+    /// opt-in is required for every `sandbox create` call. Additive
+    /// on the wire — older daemons that ignore the field continue to
+    /// refuse on rootless because the probe runs unconditionally;
+    /// older clients that never set the field always trigger the
+    /// refusal on rootless hosts.
+    ///
+    /// `CreateSessionRequest` derives `Deserialize` only (not
+    /// `Serialize`); the CLI assembles the wire body via the
+    /// `serde_json::Map` helper in `build_create_request_body`, which
+    /// only inserts `"force_rootless_docker": true` when the operator
+    /// passed the flag. The default-hardened path therefore sends a
+    /// body bit-equal to the pre-Wave-2 shape without any
+    /// `skip_serializing_if` attribute on this field.
+    #[serde(default)]
+    pub force_rootless_docker: bool,
 }
 
 /// Request body for `POST /sessions/{id}/upload`.
@@ -264,6 +292,28 @@ mod tests {
             req.backend.is_none(),
             "backend must default to None so older CLIs round-trip as Lima"
         );
+        assert!(
+            !req.force_rootless_docker,
+            "force_rootless_docker must default to false so a fresh opt-in is required per invocation"
+        );
+    }
+
+    /// Older CLIs that never send `force_rootless_docker` decode to
+    /// `false`, matching the spec § Non-goals 1175 default-deny shape.
+    #[test]
+    fn deserialize_force_rootless_docker_absent_defaults_false() {
+        let req: CreateSessionRequest =
+            serde_json::from_str(r#"{"backend": "container"}"#).unwrap();
+        assert!(!req.force_rootless_docker);
+    }
+
+    /// Operator-explicit opt-in round-trips cleanly.
+    #[test]
+    fn deserialize_force_rootless_docker_true() {
+        let req: CreateSessionRequest =
+            serde_json::from_str(r#"{"backend": "container", "force_rootless_docker": true}"#)
+                .unwrap();
+        assert!(req.force_rootless_docker);
     }
 
     #[test]

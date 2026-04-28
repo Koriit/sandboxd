@@ -32,6 +32,7 @@ fn integration_lima_create_and_delete() {
         boot_cmd: None,
         template: None,
         cpus_decimal: None,
+        rootless_docker: None,
     };
 
     // Create the VM
