@@ -110,9 +110,9 @@ def _resolve_targets() -> dict[str, set[str]]:
             except OSError:
                 pass
         if not ips:
-            pytest.skip(
-                f"Could not resolve {host} on the test host; cannot run "
-                f"discovery E2E without ground-truth IPs.",
+            pytest.fail(
+                f"host DNS cannot resolve `{host}` — fix DNS before "
+                f"running the e2e suite.",
             )
         resolved[host] = ips
     return resolved
