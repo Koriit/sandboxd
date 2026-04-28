@@ -53,8 +53,8 @@ Sandbox daemon providing isolated Linux VMs (Lima/QEMU) for coding agents. Per-m
 **Status.** completed · **Sessions.** 10 · **Details.** [milestones/M10.md](milestones/M10.md)
 
 ## M11 — Lite mode: container backend
-**Goal.** Second `sandboxd` session backend (Docker container via `--lite`) behind a new backend abstraction; full UX parity with VM sessions, container-level isolation traded for fast session creation.
-**Status.** not_started (S1 next) · **Sessions.** 6 · **Details.** [milestones/M11.md](milestones/M11.md)
+**Goal.** Second `sandboxd` session backend (Docker container via `--lite`) behind a new backend abstraction; full UX parity with VM sessions, container-level isolation traded for fast session creation. M11-S7 added post-verification to clear residual quality items before merge to main.
+**Status.** in_progress (S7 in flight: polish) · **Sessions.** 7 · **Details.** [milestones/M11.md](milestones/M11.md)
 
 ---
 
