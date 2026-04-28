@@ -43,24 +43,31 @@ Path conventions (all absolute to repo root unless qualified):
 | LM9 — Persistence                                             |      13 |          13 |                0 |                0 |        0 |
 | LM10 — Testing                                                |      24 |          24 |                0 |                1 |        0 |
 | LM11 — Rollout                                                |      16 |          16 |                0 |                0 |        0 |
-| LM12 — Non-goals (out-of-scope conformance)                   |      10 |           0 |               10 |                0 |        0 |
-| **Grand total**                                               | **246** |     **231** |           **15** |            **1** |    **0** |
+| LM12 — Non-goals (out-of-scope conformance)                   |      16 |           7 |               11 |                0 |        0 |
+| **Grand total**                                               | **252** |     **238** |           **16** |            **1** |    **0** |
 
-Note: LM10.24 carries both `(a)` (PR/merge-to-main split shipped) and
-`(c)` (nightly perf benchmarks deferred — todos #73/#74); it is counted
-in both the (a) and (c) columns above. Subtract 1 from (a) for the
-unique-claim count (230 unique (a)).
+Note: two rows are dual-counted in the table. LM10.24 carries both
+`(a)` (PR/merge-to-main split shipped) and `(c)` (nightly perf
+benchmarks deferred — todos #73/#74). LM12.2 carries both `(b)`
+(rootless Docker / gVisor / Kata still excluded as a non-goal) and
+`(a)` (the rootless-Docker non-goal is now daemon-enforced — see
+cluster LM12.11–LM12.16 added in M11-S8). Subtract 2 from the
+status sums for the unique-claim count (236 unique (a), 15 unique
+(b)).
 
-Post-M11-S7: **0 proposed new todos**. All previously-tracked items
+Post-M11-S8: **0 proposed new todos**. All previously-tracked items
 that were in M11-S7 scope (#61, #62, #63, #64, #66, #67, #69, #71,
-#72, #75, #76, #77, #78, #79, #80) are closed; the remaining trackers
-(#73 KVM runner, #74 nightly perf, #60 nix bump, #65 commit
-disentanglement, #82 cross-session L4 isolation gateway-integration
-coverage) carry forward as M12+ / orchestrator concerns. The
-rootless-Docker skip on `test_lite_workspace_uid_alignment` and the
-in-body rootless-Docker skip on `test_shared_mount[container]` (both
-Non-goal LM12.2) carry forward into M11-S8, which lands the
-daemon-side refusal + `--force-rootless-docker` escape hatch.
+#72, #75, #76, #77, #78, #79, #80) closed in S7; the
+rootless-Docker skipifs that S7 explicitly carried forward
+(`test_lite_workspace_uid_alignment` file-level `skipif`, the
+in-body `is_rootless_docker()` skip on `test_shared_mount[container]`)
+both removed in S8 — the daemon now refuses container session-create
+on rootless Docker by default with `--force-rootless-docker` as the
+explicit per-invocation escape hatch (cluster LM12.11–LM12.16). The
+remaining trackers (#73 KVM runner, #74 nightly perf, #60 nix bump,
+#65 commit disentanglement, #82 cross-session L4 isolation
+gateway-integration coverage) carry forward as M12+ / orchestrator
+concerns.
 
 ---
 
@@ -214,7 +221,7 @@ daemon-side refusal + `--force-rootless-docker` escape hatch.
 | #     | Claim                                                                                             | Status | Code                                                                                                                                                                                    | Test                                                                                                                                                                                                                      |
 | ----- | ------------------------------------------------------------------------------------------------- | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | LM4.1 | Container attaches to per-session Docker bridge same as gateway container                         | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:436` `--network sb-{session_id}` argv                                                                                                   | `sandboxd/sandbox-core/tests/integration_container_runtime.rs:285` `integration_container_runtime_hardening_flags_match_spec` (asserts `--network` present)                                                               |
-| LM4.2 | Default route inside container installed from host by `sandbox-route-helper`                      | (a)    | `sandboxd/sandboxd/src/main.rs:1175-1212` (resolve_route_helper_path + invocation in create_session); helper at `sandboxd/sandbox-route-helper/src/main.rs:147` `install_default_route` | `sandboxd/sandbox-route-helper/tests/integration_route_helper.rs:388` `..._netns_ip_outside_caller_subnet` (deny path); helper-invocation success path covered by `tests/e2e/test_lite.py:401` `test_lite_gateway_parity` |
+| LM4.2 | Default route inside container installed from host by `sandbox-route-helper`                      | (a)    | `sandboxd/sandboxd/src/main.rs:1237-1294` (resolve_route_helper_path + invocation in create_session); helper at `sandboxd/sandbox-route-helper/src/main.rs:147` `install_default_route` | `sandboxd/sandbox-route-helper/tests/integration_route_helper.rs:388` `..._netns_ip_outside_caller_subnet` (deny path); helper-invocation success path covered by `tests/e2e/test_lite.py:401` `test_lite_gateway_parity` |
 | LM4.3 | Daemon stays unprivileged                                                                         | (a)    | spec § "Daemon privilege (unchanged)"; daemon binary has no `cap_sys_admin`; install docs `:301-308` only setcap the helper                                                             | install docs + privilege envelope unchanged from VM-only baseline                                                                                                                                                         |
 | LM4.4 | Docker handles bridge attach and DNS pointer; default route is the only thing the helper installs | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:436-441` `--network/--ip/--dns` flags emitted to docker; `install_default_route` is the helper's sole network-namespace mutation        | helper main.rs:147 single-route call                                                                                                                                                                                      |
 
@@ -230,7 +237,7 @@ daemon-side refusal + `--force-rootless-docker` escape hatch.
 | ------ | ------------------------------------------------------------------------------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | LM4.6  | Docker default-route → `.1` bypasses gateway                                                      | (a)    | spec rationale; `sandboxd/sandbox-core/src/backend/container.rs:30-50` doc-comment (cap-drop=ALL forbids in-container fix)                     | rationale; helper redirects to `.2`                                                                                            |
 | LM4.7  | Lima works around in cloud-init (CAP_NET_ADMIN); lite cannot because cap-drop=ALL                 | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:40-43` doc-comment ("route helper installs default route from host"); container drops all caps | hardening test: `..._hardening_flags_match_spec` confirms cap-drop=ALL                                                         |
-| LM4.8  | Default route installed from host, after `docker start`, before agent-ready wait                  | (a)    | `sandboxd/sandboxd/src/main.rs:1175-1212` invokes helper between start and agent-ready handshake                                               | `sandboxd/sandbox-route-helper/tests/integration_route_helper.rs:388` deny path; e2e `test_lite_gateway_parity` covers success |
+| LM4.8  | Default route installed from host, after `docker start`, before agent-ready wait                  | (a)    | `sandboxd/sandboxd/src/main.rs:1237-1294` invokes helper between start and agent-ready handshake                                               | `sandboxd/sandbox-route-helper/tests/integration_route_helper.rs:388` deny path; e2e `test_lite_gateway_parity` covers success |
 | LM4.9  | Helper invocation: `sandbox-route-helper <container-pid> <gateway-ip>` (positional, no stdin/env) | (a)    | `sandboxd/sandbox-route-helper/src/main.rs::main` (argv-only, no env reads)                                                                    | helper integration tests pass two positional args                                                                              |
 | LM4.10 | Daemon stays unprivileged; shells out to helper for one operation only                            | (a)    | `sandboxd/sandboxd/src/main.rs:5781-5810` ContainerRuntime registration with helper path threading; daemon process runs no setcap              | grep `cap_sys_admin` returns only helper                                                                                       |
 
@@ -247,8 +254,8 @@ daemon-side refusal + `--force-rootless-docker` escape hatch.
 | #      | Claim                                                                               | Status | Code                                                                                                                  | Test                                                       |
 | ------ | ----------------------------------------------------------------------------------- | ------ | --------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
 | LM4.14 | Step 1: `docker start <container>`                                                  | (a)    | `sandboxd/sandbox-core/src/backend/container.rs::start` shells out to `docker start`                                  | `..._create_start_stop_delete_round_trip`                  |
-| LM4.15 | Step 2: daemon reads container PID via `docker inspect -f '{{.State.Pid}}'`         | (a)    | `sandboxd/sandbox-core/src/backend/container.rs::status` and `sandboxd/sandboxd/src/main.rs:1175-1212` PID resolution | container runtime integration test                         |
-| LM4.16 | Step 3: daemon invokes `sandbox-route-helper <pid> <gateway-ip>`                    | (a)    | `sandboxd/sandboxd/src/main.rs:1175-1212` (Command::new(helper_path).arg(pid).arg(gateway_ip))                        | route-helper integration tests cover argv shape            |
+| LM4.15 | Step 2: daemon reads container PID via `docker inspect -f '{{.State.Pid}}'`         | (a)    | `sandboxd/sandbox-core/src/backend/container.rs::status` and `sandboxd/sandboxd/src/main.rs:1237-1294` PID resolution | container runtime integration test                         |
+| LM4.16 | Step 3: daemon invokes `sandbox-route-helper <pid> <gateway-ip>`                    | (a)    | `sandboxd/sandboxd/src/main.rs:1237-1294` (Command::new(helper_path).arg(pid).arg(gateway_ip))                        | route-helper integration tests cover argv shape            |
 | LM4.17 | Step 4: helper installs default route after 8-step authorization                    | (a)    | `sandboxd/sandbox-route-helper/src/main.rs:100-148` (steps 1-8)                                                       | three deny-path tests + success-path covered by e2e        |
 | LM4.18 | Step 5: daemon proceeds to agent-ready wait via `docker exec` on TCP:127.0.0.1:5123 | (a)    | `sandboxd/sandbox-core/src/backend/container.rs::ContainerTransport` (docker exec + socat TCP:127.0.0.1:5123)         | `tests/e2e/test_lite.py:286` git-remote-sandbox round-trip |
 
@@ -314,7 +321,7 @@ daemon-side refusal + `--force-rootless-docker` escape hatch.
 | LM5.4  | `--security-opt no-new-privileges`                                                    | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:488-489` `"--security-opt"`, `"no-new-privileges"`                                             | `..._hardening_flags_match_spec`                                                                                                                                                                                                                                                                                                                                                                                      |
 | LM5.5  | `--security-opt seccomp=builtin`                                                      | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:491` `"seccomp=builtin"`; module-level rationale at `:34-40`; spec § Hardening line 546 now reads `seccomp=builtin` (corrected in commit `6822a0d` — todo #66 closed)              | `..._hardening_flags_match_spec` asserts `seccomp=builtin`                                                                                                                                                                                                                                                                                                                                                          |
 | LM5.6  | `--cap-drop ALL`                                                                      | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:492-493`                                                                                       | `..._hardening_flags_match_spec`                                                                                                                                                                                                                                                                                                                                                                                      |
-| LM5.7  | `--user 1000:1000` (or calling uid/gid if host uid ≠ 1000)                            | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:494-495`; `:996+` `map_container_uid_gid`                                                      | `tests/e2e/test_lite.py:510` `test_lite_workspace_uid_alignment` (skipif rootless docker — daemon-side enforcement scoped to M11-S8)                                                                                                                                                                                                                                                                              |
+| LM5.7  | `--user 1000:1000` (or calling uid/gid if host uid ≠ 1000)                            | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:494-495`; `:996+` `map_container_uid_gid`                                                      | `tests/e2e/test_lite.py:495` `test_lite_workspace_uid_alignment` (hard contract post-M11-S8; rootless-Docker `skipif` dropped — the daemon now refuses container session-create on rootless hosts at the `RootlessDockerRefused` gate, cluster LM12.11–LM12.16)                                                                                                                                                                                                                                                                              |
 | LM5.8  | `--pids-limit 512`                                                                    | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:496-497, 161` `PIDS_LIMIT = 512`                                                               | `..._hardening_flags_match_spec`                                                                                                                                                                                                                                                                                                                                                                                      |
 | LM5.9  | `--memory <mb>` (configured or default)                                               | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:498-499`                                                                                       | `..._hardening_flags_match_spec`                                                                                                                                                                                                                                                                                                                                                                                      |
 | LM5.10 | `--cpus <n>` (configured or default)                                                  | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:500-501`; format helper at `:843` `format_cpus(0.8) = "0.8"`                                   | `..._hardening_flags_match_spec`; one-decimal precision pinned end-to-end via LM6.22                                                                                                                                                                                                                                                                                                                                  |
@@ -335,8 +342,8 @@ daemon-side refusal + `--force-rootless-docker` escape hatch.
 
 | #     | Claim                                                              | Status | Code                                                                                      | Test                                                                    |
 | ----- | ------------------------------------------------------------------ | ------ | ----------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| LM6.1 | Bind mount `/host/path → /home/agent/workspace/` (unified with Lima semantics — M11-S7 commit `5fadccf`)      | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:448-459` `create` issues `-v <host>:/home/agent/workspace/:rw` (was `/workspace` pre-S7); spec § Workspace line 569 also updated in `6822a0d` | `tests/e2e/test_lite.py:510` `test_lite_workspace_uid_alignment`; cross-backend `tests/e2e/test_m5_workspace.py:249` `test_shared_mount` (now runs on `[container]` after path unification — gated by an in-body `if backend == "container" and is_rootless_docker(): pytest.skip(...)` because rootless Docker remaps host uid 1000 through `/etc/subuid` so a host-written file lands inside the container as a sub-uid the agent user cannot read; the lite spec forbids userns-remap (§ Workspace lines 572-574: "Do not use userns-remap — that would force chown on host files, which is destructive and surprising") and rootless Docker is explicitly out of scope (§ Out of scope line 1175 / Non-goal LM12.2). Mirrors the file-level `skipif` on `test_lite_workspace_uid_alignment`; both become daemon-side refusals in M11-S8)        |
-| LM6.2 | UID alignment: `--user <host-uid>:<host-gid>` when host uid ≠ 1000 | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:996+` `map_container_uid_gid`             | `tests/e2e/test_lite.py:510` (skipif rootless docker — Non-goal LM12.x; daemon-side enforcement scoped to M11-S8) |
+| LM6.1 | Bind mount `/host/path → /home/agent/workspace/` (unified with Lima semantics — M11-S7 commit `5fadccf`)      | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:448-459` `create` issues `-v <host>:/home/agent/workspace/:rw` (was `/workspace` pre-S7); spec § Workspace line 569 also updated in `6822a0d` | `tests/e2e/test_lite.py:495` `test_lite_workspace_uid_alignment` (M11-S8: hard contract — the previous file-level rootless-Docker `skipif` was dropped, since the daemon now refuses container session-create on rootless hosts at the `RootlessDockerRefused` gate, and the test runs unconditionally on default-hardened Docker); cross-backend `tests/e2e/test_m5_workspace.py:249` `test_shared_mount` (M11-S8: also runs unconditionally on `[container]` — the previous in-body `is_rootless_docker()` skip was dropped for the same reason)        |
+| LM6.2 | UID alignment: `--user <host-uid>:<host-gid>` when host uid ≠ 1000 | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:996+` `map_container_uid_gid`             | `tests/e2e/test_lite.py:495` `test_lite_workspace_uid_alignment` (hard contract post-M11-S8; rootless Docker is now refused daemon-side at session-create per Non-goal LM12.2 / cluster LM12.11–LM12.16, so the test never reaches the assertion on an unsupported host) |
 | LM6.3 | No userns-remap (would force chown on host files; destructive)     | (a)    | argv contains no `--userns` flag; `sandbox-core/src/backend/container.rs:436-466`         | grep `--userns` in container.rs returns 0 hits                          |
 
 ### Per-session home volume (LM6.4 – LM6.7)
@@ -364,7 +371,7 @@ daemon-side refusal + `--force-rootless-docker` escape hatch.
 | #      | Claim                                                                                 | Status | Code                                                                                                         | Test                                                                                                              |
 | ------ | ------------------------------------------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------- |
 | LM6.14 | `create`: docker create + stash container id on RuntimeHandle                         | (a)    | `sandboxd/sandbox-core/src/backend/container.rs::create`                                                     | `..._create_start_stop_delete_round_trip`                                                                         |
-| LM6.15 | `start`: docker start + helper invocation for default route                           | (a)    | `sandboxd/sandbox-core/src/backend/container.rs::start`; daemon at `sandboxd/sandboxd/src/main.rs:1175-1212` | round-trip test + helper integration tests                                                                        |
+| LM6.15 | `start`: docker start + helper invocation for default route                           | (a)    | `sandboxd/sandbox-core/src/backend/container.rs::start`; daemon at `sandboxd/sandboxd/src/main.rs:1237-1294` | round-trip test + helper integration tests                                                                        |
 | LM6.16 | `stop`: docker stop with bounded timeout (10s)                                        | (a)    | `sandboxd/sandbox-core/src/backend/container.rs:101, 538` `DOCKER_STOP_GRACE_SECS = 10`                      | `..._create_start_stop_delete_round_trip`                                                                         |
 | LM6.17 | `delete`: docker rm -f + docker volume rm sandbox-home-<id>                           | (a)    | `sandboxd/sandbox-core/src/backend/container.rs::delete`                                                     | `..._create_start_stop_delete_round_trip`; idempotency: `:483` `..._delete_is_idempotent`                         |
 | LM6.18 | `exec_interactive`: docker exec -it streaming stdio                                   | (a)    | `sandboxd/sandbox-core/src/backend/container.rs::exec_interactive`                                           | `tests/e2e/test_lite.py:286` `test_lite_git_remote_sandbox`                                                       |
@@ -619,7 +626,7 @@ These are spec self-exclusions covered in LM12. Repeated here as ID pointers:
 | LM10.16 | Resource defaults match host's 80% ceiling (HostResources helper)          | (a)    | `tests/e2e/test_lite.py:232` `test_lite_resource_defaults_match_host_80pct`; `tests/e2e/helpers/host_resources.py::HostResources`                 | itself                                                                                                                                                                                                                                                                                                                                                                                  |
 | LM10.17 | git-remote-sandbox works against lite session                              | (a)    | `tests/e2e/test_lite.py:286` `test_lite_git_remote_sandbox`                                                                                       | itself                                                                                                                                                                                                                                                                                                                                                                                  |
 | LM10.18 | Gateway parity (policy + CoreDNS + Envoy + mitmproxy)                      | (a)    | `tests/e2e/test_lite.py:401` `test_lite_gateway_parity`                                                                                           | itself                                                                                                                                                                                                                                                                                                                                                                                  |
-| LM10.19 | Workspace UID alignment                                                    | (a)    | `tests/e2e/test_lite.py:508` `test_lite_workspace_uid_alignment` (skipif rootless docker — Non-goal)                                              | itself                                                                                                                                                                                                                                                                                                                                                                                  |
+| LM10.19 | Workspace UID alignment                                                    | (a)    | `tests/e2e/test_lite.py:495` `test_lite_workspace_uid_alignment` (hard contract post-M11-S8; rootless Docker is refused daemon-side per cluster LM12.11–LM12.16)                                              | itself                                                                                                                                                                                                                                                                                                                                                                                  |
 | LM10.20 | β volume lifecycle: state survives stop/start, gone after delete           | (a)    | `tests/e2e/test_lite.py:580` `test_lite_home_volume_lifecycle_beta`                                                                               | itself                                                                                                                                                                                                                                                                                                                                                                                  |
 | LM10.21 | Orphan cleanup E2E: kill daemon mid-create, restart, assert reaped         | (a)    | `sandboxd/sandboxd/src/main.rs:6349-6357` orphan reaper invocation at startup; `sandboxd/sandbox-core/src/backend/orphan_reaper.rs::reap_orphans`              | `tests/e2e/test_lite.py:659` `test_lite_orphan_cleanup_on_daemon_restart` (M11-S7 commit `169c7ea` — pytest equivalent of the Phase 5B Rust integration test, todo #71 closed); Rust integration test still in place at `sandboxd/sandbox-core/tests/integration_orphan_reaper.rs:173` `..._removes_orphans_and_preserves_live_resources` |
 
@@ -705,7 +712,7 @@ accidental implementation). Greps cited where useful:
 | #       | Non-goal                                                                                    | Status | Verification                                                                                                                                                                                                                                                                                    |
 | ------- | ------------------------------------------------------------------------------------------- | ------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | LM12.1  | Bring-your-own image (BYO Dockerfile)                                                       | (b)    | `grep -r "byo\|user_dockerfile\|custom_image" sandboxd/sandbox-core/src/backend/` returns 0 hits; only the in-tree `images/lite/Dockerfile` is referenced                                                                                                                                       |
-| LM12.2  | Rootless Docker, gVisor, Kata Containers                                                    | (b)    | `grep -r "gvisor\|kata\|runsc" sandboxd/` returns 0 hits; container path uses Docker default runtime; rootless docker is documented as a deployment but not a _backend variant_ (`tests/e2e/test_lite.py:508` `skipif` decorator scopes the workspace UID alignment test, not a runtime branch) |
+| LM12.2  | Rootless Docker, gVisor, Kata Containers                                                    | (b)+(a) | gVisor / Kata: `grep -r "gvisor\|kata\|runsc" sandboxd/` returns 0 hits; container path uses Docker default runtime — pure (b). Rootless Docker: pure (b) **was** the M11-S6/S7 status, but M11-S8 added daemon-side enforcement so this row is now (b)+(a) hybrid — the non-goal still stands ("Lite's target is default-hardened Docker"; alternative runtimes are a separate design), AND the daemon refuses session-create on rootless Docker by default with `--force-rootless-docker` as the explicit per-invocation escape hatch. See cluster **LM12.11 – LM12.16** below for the full code+test locator set covering the probe, the rejection error, the escape-hatch flag, and the four integration tests |
 | LM12.3  | Cross-backend session migration                                                             | (b)    | `grep -r "migrate.*backend\|backend_migration\|change_backend" sandboxd/` returns 0 hits; `BackendKind` is fixed at create time on the `sessions.backend` column (LM9.1)                                                                                                                        |
 | LM12.4  | Lima default resource tuning                                                                | (b)    | Lima defaults at `sandbox-core/src/backend/lima.rs::DEFAULT_MEMORY_MB`/`DEFAULT_CPUS` unchanged from pre-M11 baseline (2048/2); container 80% rule does NOT touch Lima path (`sandboxd/src/main.rs:860-863` resource-default branch is backend-aware)                                           |
 | LM12.5  | Registry distribution of the lite image                                                     | (b)    | image is built locally via `sandbox-core/src/backend/container.rs:1096+` `ensure_image`; no `docker pull sandboxd-lite` code path                                                                                                                                                               |
@@ -714,6 +721,29 @@ accidental implementation). Greps cited where useful:
 | LM12.8  | `sandbox admin` subcommand group                                                            | (b)    | `grep -n "admin" sandboxd/sandbox-cli/src/main.rs` returns no Subcommand::Admin variant; rebuild-image is a flat command                                                                                                                                                                        |
 | LM12.9  | `prune-images` command                                                                      | (b)    | `grep -n "prune.image\|PruneImages" sandboxd/sandbox-cli/src/main.rs` returns 0 hits                                                                                                                                                                                                            |
 | LM12.10 | Gating env var for `--lite`; auto-fallback between backends; separate `sandbox-lite` binary | (b)    | `grep -n "SANDBOX_ENABLE_LITE\|fallback.*backend\|sandbox-lite" sandboxd/` returns 0 hits except `SANDBOX_DEFAULT_BACKEND` (precedence selector, not a gate); resolve_backend has no auto-fallback branch                                                                                       |
+
+### Rootless-Docker enforcement (LM12.11 – LM12.16)
+
+LM12.2 above carries the spec self-exclusion as `(b)`; M11-S8 added
+the daemon-side enforcement that turns the non-goal into a verifiable
+contract. The non-goal still stands ("Lite's target is
+default-hardened Docker"; alternative runtimes are a separate
+design), AND every container session-create request is now probed
+and refused on rootless hosts unless the operator passes the
+explicit per-invocation override. The cluster below maps the probe,
+the rejection error, the escape-hatch flag, the persistence and
+inspect surface, and the four integration tests that pin the
+contract. Each row is `(a)` shipped — the daemon-side enforcement
+is fully verified.
+
+| #       | Claim                                                                                                                                                             | Status | Code                                                                                                                                                                                                                                                                                                                                       | Test                                                                                                                                                                                                                                                                                                                                            |
+| ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| LM12.11 | Rootless-Docker probe runs `docker info --format '{{.SecurityOptions}}'` and detects rootless mode by the literal `name=rootless` substring; cached per-daemon-lifetime; container backend only | (a)    | `sandboxd/sandbox-core/src/backend/container_rootless_probe.rs:119` `pub async fn is_rootless_docker`; cache primitive `:92-95`; parser `parse_security_options:215-217` matches the literal `name=rootless` token                                                                                                                          | `sandboxd/sandbox-core/src/backend/container_rootless_probe.rs:245-285` unit tests pinning the parser shapes; `:301-353` `probe_against_path_stub_round_trip` end-to-end exercise of the public async surface against the PATH-stub helper (Phase 1 ReportRootless ⇒ true; Phase 2 ReportDefault ⇒ false; Phase 3 Fail ⇒ typed Gateway error)   |
+| LM12.12 | Daemon refuses container session-create with `RootlessDockerRefused` (HTTP 400) on rootless hosts unless `force_rootless_docker: true`; runs BEFORE any container artifacts are touched (image build, network, runtime `create`)                       | (a)    | `sandboxd/sandbox-core/src/error.rs:69-73` `RootlessDockerRefused` variant + Display impl; `sandboxd/sandboxd/src/error.rs:65` HTTP 400 mapping; `sandboxd/sandboxd/src/main.rs:1011-1043` enforcement gate in `create_session` runs before `ensure_image` / `setup_session_networking_lite` / runtime `create`                              | `sandboxd/sandbox-core/src/error.rs:168-189` `rootless_docker_refused_display_carries_machine_greppable_token` (asserts greppable substrings in Display output); `sandboxd/sandboxd/tests/integration_rootless_docker.rs:434` `integration_rootless_docker_session_create_refused` (404 on `GET /sessions/{id}` post-rejection ⇒ no artifacts) |
+| LM12.13 | `--force-rootless-docker` CLI flag is a per-invocation operator opt-in; container-only; not preset-surfaced; not config-file-persisted; CLI rejects combination with `--backend lima` at exit 2 with byte-pinned error message                          | (a)    | `sandboxd/sandbox-cli/src/main.rs:131-153` `force_rootless_docker` clap field; `:3897-3909` pre-flight `--backend lima` rejection; `sandboxd/sandbox-cli/src/backend.rs:535-556` byte-pinned renderer `render_force_rootless_docker_lima_rejection`; HTTP body insertion at `sandbox-cli/src/main.rs:684-685` (only when flag is set)         | `sandboxd/sandbox-cli/src/backend.rs:867-881` byte-equality unit test for the misuse-error renderer; `sandboxd/sandboxd/tests/integration_rootless_docker.rs:590` `integration_rootless_docker_force_flag_rejected_on_lima` (CLI exit 2, no daemon contact, byte-pinned stderr)                                                                |
+| LM12.14 | When `--force-rootless-docker` is honored on a rootless host, session-create succeeds and the probe outcome is persisted on the session config; rendered by `sandbox describe` / `sandbox inspect` so operators can audit the posture                  | (a)    | `sandboxd/sandbox-core/src/api/mod.rs:194` `CreateSessionRequest.force_rootless_docker` (`#[serde(default)]`, additive); persistence at `sandboxd/sandbox-core/src/session.rs:355-357` `SessionConfig.rootless_docker`; struct `SessionRootlessDocker` at `:382-394`; CLI render at `sandbox-cli/src/main.rs:1600-1656` `render_rootless_block` | `sandboxd/sandboxd/tests/integration_rootless_docker.rs:503` `integration_rootless_docker_force_flag_overrides` (forced session reaches `Running`; `sandbox inspect` carries `rootless: { detected: true, forced: true }`); `sandbox-cli/src/main.rs:6848-6940` render_rootless_block unit tests (None / default-hardened / forced shapes)     |
+| LM12.15 | `SessionDto.rootless: Option<SessionRootlessDocker>` is stamped on every container session: `{ detected: false, forced: false }` for default-hardened hosts, `{ detected: true, forced: true }` for forced-rootless; absent for Lima sessions          | (a)    | `sandboxd/sandbox-core/src/api/dto.rs:107-152` `SessionDto.rootless` field + `SessionRootlessDocker` DTO with `#[serde(default, skip_serializing_if = "Option::is_none")]`; mapper `sandbox-core/src/api/mapper.rs:172-180` `with_rootless` + `From<&session::SessionRootlessDocker>`; daemon stamping at `sandboxd/src/main.rs:1039-1042`     | `sandboxd/sandbox-core/src/api/mapper.rs:751-870` round-trip tests (omits `rootless` key when None; emits the block for default-hardened and forced cases); `sandboxd/sandboxd/tests/integration_rootless_docker.rs:641` `integration_default_hardened_docker_proceeds` (default-hardened stub stamps `{detected: false, forced: false}`)     |
+| LM12.16 | PATH-stub test substrate (`DockerPathStub`) supports cross-crate integration tests by intercepting `docker info --format '{{.SecurityOptions}}'` while forwarding every other docker call to the real binary; nextest serialises tests via `docker-sandbox-namespace` test group | (a)    | `sandboxd/sandbox-core/src/test_support/mod.rs` (module-decl rationale + cross-crate placement note); `sandboxd/sandbox-core/src/test_support/docker_path_stub.rs` (`DockerPathStub`, `DockerInfoBehavior` enum, `SANDBOX_REAL_PATH` forwarding, RAII PATH guard); nextest filter at `sandboxd/.config/nextest.toml:34-44`                    | self-tested by `sandbox-core/src/backend/container_rootless_probe.rs:301-353` `probe_against_path_stub_round_trip`; consumed by all four `sandboxd/sandboxd/tests/integration_rootless_docker.rs` tests (lines 434, 503, 590, 641)                                                                                                              |
 
 Additional self-exclusions called out as "What's deliberately not done"
 (rolled into LM7 / LM8 sections above; restated here for completeness):
@@ -835,7 +865,7 @@ as a `progress` todo with explicit target:
 | Nightly perf-benchmarks job                                                 | tracked       | **todo #74**, blocked on #73                                                              |
 | Bump nix dep when 0.30+ exposes pidfd_open                                  | tracked       | **todo #60**, no urgency                                                                  |
 | Cross-session L4 isolation gateway-integration coverage (container backend) | tracked       | **todo #82**, target M12+ (e2e `_probe_gateway_tcp` cannot exercise this from inside a session because gateway DNAT prerouting at `sandbox-core/src/gateway.rs:1462-1486` rewrites every TCP/UDP destination before the packet leaves the bridge; structural disjoint-subnet check at step 5 of `test_concurrent_sessions` already covers the architectural contract on both backends — todo #82 adds in-tree integration coverage of the runtime drop in the forward chain. No spec change required) |
-| Rootless-Docker enforcement at the daemon                                   | tracked       | **M11-S8** (full scope: probe + `--force-rootless-docker` flag + PATH-stub test substrate) |
+| Rootless-Docker enforcement at the daemon                                   | closed (S8)   | M11-S8 commits (probe + `RootlessDockerRefused` + `--force-rootless-docker` + PATH-stub substrate + 4 integration tests + 2 e2e skipif removals + spec amendment + delivery-doc cluster LM12.11–LM12.16) |
 | M11 commit disentanglement                                                  | tracked       | **todo #65**, before merge to main (orchestrator-level concern, NOT a spec claim)         |
 
 All "Out of scope" / "Non-goal" / "Explicit non-goals" bullets in the
@@ -919,14 +949,20 @@ also pass. Post-S7 the previously-tracked container skips are gone:
   Container-side runtime traffic-isolation coverage at the gateway
   nftables-integration level is tracked as **todo #82** (target
   M12+; out of M11 scope, no spec change required).
-- `test_shared_mount[container]` retains a narrower in-body
-  `if backend == "container" and is_rootless_docker():
-  pytest.skip(...)` — `tests/e2e/test_m5_workspace.py:257-282`,
-  citing spec § Workspace lines 572-574 (no userns-remap) and § Out
-  of scope line 1175 (rootless Docker out of scope, Non-goal
-  LM12.2). Mirrors the file-level `skipif` on
-  `test_lite_workspace_uid_alignment`; both become daemon-side
-  refusals in M11-S8.
+- M11-S8 dropped both rootless-Docker e2e skipifs:
+  `test_shared_mount[container]`'s in-body
+  `if backend == "container" and is_rootless_docker(): pytest.skip(...)`
+  at `tests/e2e/test_m5_workspace.py:249` and the file-level
+  `is_rootless_docker()` `@pytest.mark.skipif` on
+  `test_lite_workspace_uid_alignment` at `tests/e2e/test_lite.py:495`.
+  Both ran for the same architectural reason — rootless Docker
+  remaps host uid 1000 through `/etc/subuid` so workspace
+  bind-mount semantics break — and S8's daemon-side refusal makes
+  test-side gating redundant. Both tests now run unconditionally
+  as hard contracts: on default-hardened Docker the assertions
+  hold; on rootless Docker the daemon's `RootlessDockerRefused`
+  fires during `sandbox create` setup and pytest reports a loud
+  ERROR rather than a silent SKIP. See cluster LM12.11–LM12.16.
 - `test_concurrent_sessions` retains a 6 GB host-RAM precondition,
   but the check is now scoped to `backend == "lima"` (M11-S7 commit
   `15e78c2`) — the container parameterization runs regardless of host
@@ -937,9 +973,6 @@ also pass. Post-S7 the previously-tracked container skips are gone:
   `pytest.fail` (M11-S7 commit `7d39bb0`). E2E tests inherently
   require working host DNS; a misconfigured host now fails loudly
   instead of silently masking a setup error.
-- `test_lite_workspace_uid_alignment` retains its
-  `is_rootless_docker()` skip; this becomes a daemon-side refusal in
-  M11-S8 (out of S7 scope).
 
 Net: zero skips on `make test-e2e-container`; the only skip on the
 full matrix is the Lima-scoped 6 GB RAM check on
@@ -1019,15 +1052,15 @@ not surfaced as healthy.
   clone path (LM6.20). The container bind target was also unified
   with Lima at `/home/agent/workspace/` (LM6.1). Both in-body
   `[container]` skips were removed; both tests now run on both
-  backends. `test_shared_mount[container]` retains a narrower
-  in-body `if backend == "container" and is_rootless_docker():
-  pytest.skip(...)` — the spec forbids userns-remap (§ Workspace
-  lines 572-574) and rootless Docker is explicitly out of scope (§
-  Out of scope line 1175 / Non-goal LM12.2), so the host->container
-  uid mapping is undefined under rootless and the test is not
-  expected to pass; this skip mirrors the file-level `skipif` on
-  `test_lite.py:495-507`'s `test_lite_workspace_uid_alignment` and
-  becomes a daemon-side refusal in M11-S8.
+  backends. M11-S8 then dropped the narrower in-body
+  `if backend == "container" and is_rootless_docker(): pytest.skip(...)`
+  on `test_shared_mount[container]` and the file-level
+  `is_rootless_docker()` `skipif` on `test_lite_workspace_uid_alignment`:
+  the daemon now refuses container session-create on rootless Docker
+  by default (`RootlessDockerRefused` ⇒ HTTP 400) with
+  `--force-rootless-docker` as the explicit per-invocation escape
+  hatch, so test-side skipping is redundant and both tests run
+  unconditionally as hard contracts (cluster LM12.11–LM12.16).
 - **C3** — `sandbox cp` visibility into the container workspace. The
   cp dispatch path was aligned to the container's bind-mount target
   so files written via cp surface inside the container at the
@@ -1107,17 +1140,20 @@ unmapped BLOCKERs. The implementation lands the spec end-to-end:
   disjoint-subnet check at step 5 covers the architectural contract
   on both backends; the runtime traffic-isolation property is
   tracked for nftables-integration coverage as **todo #82**.
-  `test_shared_mount[container]` retains a rootless-Docker skip per
-  Non-goal LM12.2.
+  M11-S8 then dropped the remaining rootless-Docker skipifs on
+  `test_shared_mount[container]` and `test_lite_workspace_uid_alignment`
+  by landing the daemon-side refusal — both tests now run as hard
+  contracts (cluster LM12.11–LM12.16).
 
 - **Cargo gates all PASS** — `cargo nextest run --workspace`,
   `--profile integration`; clippy clean; fmt clean.
 
-- **Zero skips on `make test-e2e-container` post-S7.** The single
+- **Zero skips on `make test-e2e-container` post-S8.** The single
   remaining skip in the full matrix is the Lima-scoped 6 GB RAM
-  precondition on `test_concurrent_sessions[lima]`. The
-  rootless-Docker skip on `test_lite_workspace_uid_alignment`
-  becomes a daemon-side refusal in M11-S8 (out of S7 scope).
+  precondition on `test_concurrent_sessions[lima]`. The previous
+  rootless-Docker skip on `test_lite_workspace_uid_alignment` was
+  removed in M11-S8 in favor of the daemon-side `RootlessDockerRefused`
+  gate (cluster LM12.11–LM12.16).
 
 The remaining open todos (#73 KVM runner, #74 nightly perf, #60 nix
 bump, #82 cross-session L4 isolation gateway-integration coverage)
