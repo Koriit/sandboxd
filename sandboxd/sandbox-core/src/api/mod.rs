@@ -178,10 +178,11 @@ pub struct CreateSessionRequest {
     /// Per-invocation, never persisted to any config file or preset:
     /// surfacing it on the wire as a request field guarantees a fresh
     /// opt-in is required for every `sandbox create` call. Additive
-    /// on the wire — older daemons that ignore the field continue to
-    /// refuse on rootless because the probe runs unconditionally;
-    /// older clients that never set the field always trigger the
-    /// refusal on rootless hosts.
+    /// on the wire — pre-Wave-2 daemons predate the probe and accept
+    /// rootless hosts silently (the gap this milestone closes);
+    /// Wave-2-or-newer daemons that see an absent field still run the
+    /// probe unconditionally and refuse rootless hosts unless this
+    /// flag is `true`.
     ///
     /// `CreateSessionRequest` derives `Deserialize` only (not
     /// `Serialize`); the CLI assembles the wire body via the

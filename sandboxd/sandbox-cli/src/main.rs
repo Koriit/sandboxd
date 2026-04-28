@@ -673,14 +673,17 @@ fn build_create_request_body(
         body.insert("no_cache".into(), serde_json::json!(true));
     }
     // M11-S8 Wave 2: only stamp `force_rootless_docker` when the
-    // operator explicitly passed `--force-rootless-docker`. The wire
-    // shape's `#[serde(skip_serializing_if = "is_false")]` keeps the
-    // body bit-equal to the pre-Wave-2 default-hardened path when the
-    // flag is absent, so older daemons that ignore the field see
-    // exactly the request they used to receive. Container-only by
-    // construction — `dispatch_create_preflight` already rejected the
-    // `--force-rootless-docker --backend lima` combination with
-    // exit 2 before this function runs.
+    // operator explicitly passed `--force-rootless-docker`. The
+    // conditional insert below keeps the body bit-equal to the
+    // pre-Wave-2 default-hardened path when the flag is absent, so
+    // older daemons that ignore the field see exactly the request
+    // they used to receive. (`CreateSessionRequest` derives
+    // `Deserialize` only, so there is no serialize-side
+    // `skip_serializing_if` attribute on the wire struct — the
+    // bit-equality is enforced here at the body-builder seam.)
+    // Container-only by construction — `dispatch_create_preflight`
+    // already rejected the `--force-rootless-docker --backend lima`
+    // combination with exit 2 before this function runs.
     if *force_rootless_docker {
         body.insert("force_rootless_docker".into(), serde_json::json!(true));
     }

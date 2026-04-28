@@ -55,13 +55,13 @@ def is_rootless_docker() -> bool:
 
     On any failure to invoke ``docker info`` (binary missing, daemon
     unreachable, non-zero exit) the function returns ``False`` —
-    the intent is "skip on confirmed rootless"; if we cannot
-    confirm, the caller (the test) should run and fail loudly
-    rather than skip silently. The session-scoped
-    ``_preflight_checks`` fixture in ``conftest.py`` already skips
-    the entire suite when Docker is unavailable, so a ``False``
-    return here in practice means "Docker is up and is not
-    rootless".
+    the helper is now an **assertion-side** signal (see module
+    docstring), so failing closed to ``False`` lets the caller run
+    its assertions and surface real divergence rather than masking
+    the host state. The session-scoped ``_preflight_checks`` fixture
+    in ``conftest.py`` already skips the entire suite when Docker is
+    unavailable, so a ``False`` return here in practice means
+    "Docker is up and is not rootless".
     """
     global _cached
     if _cached is not None:

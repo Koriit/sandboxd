@@ -43,8 +43,8 @@ Path conventions (all absolute to repo root unless qualified):
 | LM9 — Persistence                                             |      13 |          13 |                0 |                0 |        0 |
 | LM10 — Testing                                                |      24 |          24 |                0 |                1 |        0 |
 | LM11 — Rollout                                                |      16 |          16 |                0 |                0 |        0 |
-| LM12 — Non-goals (out-of-scope conformance)                   |      16 |           7 |               11 |                0 |        0 |
-| **Grand total**                                               | **252** |     **238** |           **16** |            **1** |    **0** |
+| LM12 — Non-goals (out-of-scope conformance)                   |      16 |           7 |               10 |                0 |        0 |
+| **Grand total**                                               | **252** |     **238** |           **15** |            **1** |    **0** |
 
 Note: two rows are dual-counted in the table. LM10.24 carries both
 `(a)` (PR/merge-to-main split shipped) and `(c)` (nightly perf
@@ -52,7 +52,7 @@ benchmarks deferred — todos #73/#74). LM12.2 carries both `(b)`
 (rootless Docker / gVisor / Kata still excluded as a non-goal) and
 `(a)` (the rootless-Docker non-goal is now daemon-enforced — see
 cluster LM12.11–LM12.16 added in M11-S8). Subtract 2 from the
-status sums for the unique-claim count (236 unique (a), 15 unique
+status sums for the unique-claim count (236 unique (a), 14 unique
 (b)).
 
 Post-M11-S8: **0 proposed new todos**. All previously-tracked items
