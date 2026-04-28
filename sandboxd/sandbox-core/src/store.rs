@@ -1437,6 +1437,7 @@ mod tests {
             repo: None,
             boot_cmd: None,
             template: None,
+            cpus_decimal: None,
         };
 
         let session = store
@@ -1470,6 +1471,7 @@ mod tests {
             repo: Some("https://github.com/example/app.git".into()),
             boot_cmd: Some("make setup".into()),
             template: Some("/tmp/custom.yaml".into()),
+            cpus_decimal: None,
         };
 
         let session = store

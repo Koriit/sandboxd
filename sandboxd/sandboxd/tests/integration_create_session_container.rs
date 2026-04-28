@@ -239,7 +239,7 @@ fn container_spec() -> SessionSpec {
     SessionSpec {
         backend_specific: BackendSpecific::Container {
             memory_mb: 256,
-            cpus: 1,
+            cpus: 1.0,
         },
         workspace_mode: None,
         repo: None,
@@ -533,7 +533,7 @@ fn integration_create_session_container_advertises_workspace_capabilities() {
     let shared_spec = SessionSpec {
         backend_specific: BackendSpecific::Container {
             memory_mb: 256,
-            cpus: 1,
+            cpus: 1.0,
         },
         workspace_mode: Some(WorkspaceMode::Shared {
             host_path: "/tmp".into(),
@@ -553,7 +553,7 @@ fn integration_create_session_container_advertises_workspace_capabilities() {
     let clone_spec = SessionSpec {
         backend_specific: BackendSpecific::Container {
             memory_mb: 256,
-            cpus: 1,
+            cpus: 1.0,
         },
         workspace_mode: Some(WorkspaceMode::Clone {
             repo_url: "https://example.invalid/repo.git".into(),

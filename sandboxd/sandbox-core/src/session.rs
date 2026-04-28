@@ -278,7 +278,14 @@ impl FromStr for SessionState {
 /// `CLAUDE.md` → "On-disk compatibility" for the full rule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
-    /// Number of CPU cores allocated.
+    /// Number of CPU cores allocated, integer-valued for backward
+    /// compatibility with the persisted `config_json` blob (a daemon
+    /// rollback to a pre-todo-#67 build must still be able to read
+    /// the integer field). On the container backend this carries the
+    /// floored representation of the operator-supplied fractional
+    /// value; the precise value lives in [`Self::cpus_decimal`] and
+    /// is the authoritative one for HTTP and runtime consumers when
+    /// present.
     pub cpus: u32,
     /// Memory in megabytes.
     pub memory_mb: u32,
@@ -315,6 +322,24 @@ pub struct SessionConfig {
     /// predating M9-S11 (forward-compatible via `#[serde(default)]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template: Option<String>,
+    /// 1-decimal CPU value for the container backend (`0.8`, `1.5`,
+    /// `2.0`, …). M11-S7 todo #67 widened the wire boundary to `f32`
+    /// so the spec § "Resource defaults — container only" precision
+    /// survives end-to-end (the prior `u32` shape silently truncated
+    /// `1.5` to `1` in `ContainerRuntime::resource_ceilings`).
+    ///
+    /// Persisted alongside the integer [`Self::cpus`] field rather
+    /// than replacing it: an older daemon rolling back must still
+    /// see a usable value in the original column. When this field is
+    /// `Some`, it is the authoritative precise value (used by the
+    /// runtime and the HTTP DTO render); `cpus` then carries the
+    /// floored representation as a fallback for older readers.
+    /// `None` on records written by pre-todo-#67 daemons (and on
+    /// every Lima session, where integer cpus is the spec).
+    /// Forward-compatible via `#[serde(default)]` per CLAUDE.md
+    /// "On-disk compatibility".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpus_decimal: Option<f32>,
 }
 
 fn default_hardened() -> bool {
@@ -332,6 +357,7 @@ impl Default for SessionConfig {
             repo: None,
             boot_cmd: None,
             template: None,
+            cpus_decimal: None,
         }
     }
 }
@@ -463,6 +489,7 @@ mod tests {
             repo: None,
             boot_cmd: None,
             template: None,
+            cpus_decimal: None,
         };
         let session = Session::with_config(Some("custom".into()), config);
         assert_eq!(session.config.cpus, 4);
@@ -620,6 +647,7 @@ mod tests {
             repo: None,
             boot_cmd: None,
             template: None,
+            cpus_decimal: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         let deser: SessionConfig = serde_json::from_str(&json).unwrap();
@@ -654,6 +682,53 @@ mod tests {
             config.template.is_none(),
             "template must default to None on legacy records"
         );
+        assert!(
+            config.cpus_decimal.is_none(),
+            "cpus_decimal must default to None on legacy records (M11-S7 todo #67)"
+        );
+    }
+
+    /// Forward-compat round-trip for [`SessionConfig::cpus_decimal`]
+    /// (M11-S7 todo #67). A daemon that persists a fractional cpus
+    /// value sets both `cpus` (floored) and `cpus_decimal`; on
+    /// rollback an older daemon ignores the unknown field and reads
+    /// the integer one. On forward read the new daemon picks up the
+    /// precise float value.
+    #[test]
+    fn cpus_decimal_round_trips_through_serde() {
+        let config = SessionConfig {
+            cpus: 1, // floor of 1.5
+            memory_mb: 4096,
+            disk_gb: 20,
+            workspace_mode: None,
+            hardened: false,
+            repo: None,
+            boot_cmd: None,
+            template: None,
+            cpus_decimal: Some(1.5),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        // Wire-form sanity: both keys present, integer is the floor.
+        assert!(
+            json.contains("\"cpus_decimal\""),
+            "cpus_decimal must be emitted when Some; got {json}"
+        );
+        let deser: SessionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.cpus, 1);
+        assert_eq!(deser.cpus_decimal, Some(1.5));
+    }
+
+    /// Forward-compat: a legacy record with no `cpus_decimal` key
+    /// must deserialise cleanly with `cpus_decimal: None`. This is
+    /// the rollback-from-newer-daemon scenario: the older daemon (us
+    /// here) reads a record that *might* be missing the field and
+    /// must not fail.
+    #[test]
+    fn legacy_record_without_cpus_decimal_deserialises() {
+        let json = r#"{"cpus": 2, "memory_mb": 4096, "disk_gb": 20, "hardened": true}"#;
+        let config: SessionConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.cpus, 2);
+        assert!(config.cpus_decimal.is_none());
     }
 
     #[test]
@@ -667,6 +742,7 @@ mod tests {
             repo: Some("https://github.com/example/app.git".into()),
             boot_cmd: Some("make setup".into()),
             template: Some("/tmp/custom.yaml".into()),
+            cpus_decimal: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         let deser: SessionConfig = serde_json::from_str(&json).unwrap();
@@ -682,11 +758,14 @@ mod tests {
     fn none_fields_are_omitted_from_wire() {
         let config = SessionConfig::default();
         let json = serde_json::to_string(&config).unwrap();
-        // workspace_mode, repo, boot_cmd, template all skip when None.
+        // workspace_mode, repo, boot_cmd, template, cpus_decimal all
+        // skip when None — keeps the persisted blob shape stable for
+        // the legacy Lima sessions that never carry these fields.
         assert!(!json.contains("workspace_mode"), "wire JSON: {json}");
         assert!(!json.contains("\"repo\""), "wire JSON: {json}");
         assert!(!json.contains("boot_cmd"), "wire JSON: {json}");
         assert!(!json.contains("template"), "wire JSON: {json}");
+        assert!(!json.contains("cpus_decimal"), "wire JSON: {json}");
     }
 
     #[test]

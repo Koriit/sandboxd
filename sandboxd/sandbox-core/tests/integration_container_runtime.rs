@@ -192,7 +192,7 @@ fn container_spec() -> SessionSpec {
     SessionSpec {
         backend_specific: BackendSpecific::Container {
             memory_mb: 256,
-            cpus: 1,
+            cpus: 1.0,
         },
         workspace_mode: None,
         repo: None,

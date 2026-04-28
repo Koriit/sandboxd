@@ -129,6 +129,11 @@ impl LimaRuntime {
                 repo: spec.repo.clone(),
                 boot_cmd: spec.boot_cmd.clone(),
                 template: spec.template.clone(),
+                // Lima's `BackendSpecific::Lima` carries integer `cpus`
+                // by spec — the precise `cpus_decimal` only applies to
+                // container sessions. None here keeps the persisted
+                // shape consistent with the pre-todo-#67 Lima record.
+                cpus_decimal: None,
             }),
             BackendSpecific::Container { .. } => Err(SandboxError::InvalidArgument(format!(
                 "LimaRuntime received a container-shaped SessionSpec (got backend={})",
@@ -680,7 +685,7 @@ mod tests {
         let spec = SessionSpec {
             backend_specific: BackendSpecific::Container {
                 memory_mb: 1024,
-                cpus: 1,
+                cpus: 1.0,
             },
             workspace_mode: None,
             repo: None,

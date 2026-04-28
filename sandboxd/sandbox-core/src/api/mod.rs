@@ -93,8 +93,19 @@ pub struct PropagationStatusResponse {
 pub struct CreateSessionRequest {
     /// Optional human-readable name for the session.
     pub name: Option<String>,
-    /// Number of CPU cores (default: 2).
-    pub cpus: Option<u32>,
+    /// Number of CPU cores (default: 2 for Lima, daemon host-80% for
+    /// Container).
+    ///
+    /// `f32` (M11-S7 todo #67) so the spec § "Resource defaults —
+    /// container only" 1-decimal grammar (`0.8`, `1.5`, `2.0`, …)
+    /// reaches the runtime without truncation. Older CLIs that send
+    /// integers (`"cpus": 2`) round-trip cleanly through serde — JSON
+    /// integers parse as `2.0_f32`. The daemon rounds to one decimal
+    /// at request-parse time so `0.81` lands on the grid as `0.8`.
+    /// Lima sessions still get the integer cores QEMU expects; the
+    /// daemon truncates the fractional part on the Lima path before
+    /// projecting into [`crate::backend::BackendSpecific::Lima`].
+    pub cpus: Option<f32>,
     /// Memory in megabytes (default: 4096).
     pub memory_mb: Option<u32>,
     /// Disk size in gigabytes (default: 20).
@@ -282,7 +293,9 @@ mod tests {
         }"#;
         let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.name.as_deref(), Some("test"));
-        assert_eq!(req.cpus, Some(4));
+        // M11-S7 todo #67: `cpus` is `f32`; integer JSON literal `4`
+        // parses as `4.0_f32` so older clients still round-trip.
+        assert_eq!(req.cpus, Some(4.0_f32));
         assert_eq!(req.memory_mb, Some(8192));
         assert_eq!(req.disk_gb, Some(50));
         assert_eq!(req.template.as_deref(), Some("/tmp/custom.yaml"));
@@ -293,10 +306,21 @@ mod tests {
         let json = r#"{"name": "partial", "cpus": 8}"#;
         let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.name.as_deref(), Some("partial"));
-        assert_eq!(req.cpus, Some(8));
+        assert_eq!(req.cpus, Some(8.0_f32));
         assert!(req.memory_mb.is_none());
         assert!(req.disk_gb.is_none());
         assert!(req.template.is_none());
+    }
+
+    /// M11-S7 todo #67: a fractional `cpus` value (`1.5`) on the wire
+    /// must deserialise as the precise `f32` rather than truncating
+    /// to `1` (the pre-todo-#67 `Option<u32>` behaviour). This is the
+    /// regression net for the lite-mode `--cpus 1.5` operator path.
+    #[test]
+    fn deserialize_fractional_cpus_request() {
+        let json = r#"{"name": "lite-fractional", "cpus": 1.5}"#;
+        let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.cpus, Some(1.5_f32));
     }
 
     #[test]

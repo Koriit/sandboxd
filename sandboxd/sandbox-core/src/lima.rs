@@ -1876,6 +1876,7 @@ mod tests {
             repo: None,
             boot_cmd: None,
             template: None,
+            cpus_decimal: None,
         };
 
         let template = mgr.generate_template(&id, &config);
@@ -1912,6 +1913,7 @@ mod tests {
             repo: None,
             boot_cmd: None,
             template: None,
+            cpus_decimal: None,
         };
 
         let template = mgr.generate_template(&id, &config);
@@ -1937,6 +1939,7 @@ mod tests {
             repo: None,
             boot_cmd: None,
             template: None,
+            cpus_decimal: None,
         };
 
         let template = mgr.generate_template(&id, &config);
@@ -1984,6 +1987,7 @@ mod tests {
             repo: None,
             boot_cmd: None,
             template: None,
+            cpus_decimal: None,
         };
 
         let template = mgr.generate_template(&id, &config);
@@ -2123,6 +2127,7 @@ mod tests {
             repo: None,
             boot_cmd: None,
             template: None,
+            cpus_decimal: None,
         };
 
         let template = mgr.generate_template(&id, &config);
@@ -2151,6 +2156,7 @@ mod tests {
             repo: None,
             boot_cmd: None,
             template: None,
+            cpus_decimal: None,
         };
 
         let template = mgr.generate_template(&id, &config);

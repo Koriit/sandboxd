@@ -186,7 +186,15 @@ pub struct SessionMountInfo {
 ///    enum object, which is what CLI consumers actually want to print.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfigDto {
-    pub cpus: u32,
+    /// User-requested CPU ceiling. M11-S7 todo #67 widened this from
+    /// `u32` to `f32` so the spec § "Resource defaults — container
+    /// only" 1-decimal precision survives the persisted round-trip.
+    /// Lima sessions still see whole-number values; container
+    /// sessions see whatever the operator passed (e.g. `1.5`) or
+    /// `0.0` when the operator omitted the flag and the daemon will
+    /// substitute the host-80% default at runtime — the resolved
+    /// applied value lives in [`Self::resolved_cpus`].
+    pub cpus: f32,
     pub memory_mb: u32,
     pub disk_gb: u32,
     /// Effective CPU ceiling actually applied at runtime.

@@ -693,6 +693,12 @@ fn runtime_for(state: &AppState, kind: BackendKind) -> Arc<dyn SessionRuntime> {
 /// The remaining fields (`workspace_mode`, `repo`, `boot_cmd`,
 /// `template`, `disk_gb`) surface at the [`SessionSpec`] level
 /// regardless of backend.
+///
+/// Container `cpus` is projected from the precise
+/// [`SessionConfig::cpus_decimal`] when present (M11-S7 todo #67 — the
+/// 1-decimal value the operator supplied), falling back to the
+/// integer [`SessionConfig::cpus`] otherwise. The Lima variant always
+/// projects the integer field — Lima/QEMU pin whole cores.
 fn session_spec_from_config(
     config: &SessionConfig,
     kind: BackendKind,
@@ -705,7 +711,7 @@ fn session_spec_from_config(
         },
         BackendKind::Container => sandbox_core::BackendSpecific::Container {
             memory_mb: config.memory_mb,
-            cpus: config.cpus,
+            cpus: config.cpus_decimal.unwrap_or(config.cpus as f32),
         },
     };
     sandbox_core::SessionSpec {
@@ -716,6 +722,27 @@ fn session_spec_from_config(
         template: config.template.clone(),
         disk_gb: Some(config.disk_gb),
     }
+}
+
+/// Round a request-supplied `cpus` value to the spec § "Resource
+/// defaults — container only" 1-decimal grid (e.g. `0.81 → 0.8`,
+/// `1.55 → 1.5`).
+///
+/// Mirrors the rounding [`compute_default_resource_limits`] applies to
+/// the daemon-side host-80% default so both code paths produce values
+/// on the same grid. M11-S7 todo #67 added this normalisation step
+/// alongside the wire boundary type widening — without it, an
+/// operator typing `--cpus 0.81` would reach `format_cpus` as
+/// `0.81` and render `--cpus 0.8` (truncating the trailing `1`)
+/// rather than the intended round-to-grid behaviour.
+///
+/// Math is in `f64` to keep the rounding precise for f32 inputs;
+/// the result is narrowed back to `f32` because the caller stores
+/// the value in [`sandbox_core::session::SessionConfig::cpus_decimal`]
+/// (an `f32` field).
+fn round_cpus_one_decimal(cpus: f32) -> f32 {
+    let scaled = (f64::from(cpus) * 10.0).round() / 10.0;
+    scaled as f32
 }
 
 // ---------------------------------------------------------------------------
@@ -879,13 +906,43 @@ async fn create_session(
     // `SessionConfig` carries the user-requested ceiling, and a
     // container session that took the host-80% default has `0` in
     // both columns by construction.
-    let (cpus, memory_mb) = match backend_kind {
-        BackendKind::Lima => (req.cpus.unwrap_or(2), req.memory_mb.unwrap_or(4096)),
-        BackendKind::Container => (req.cpus.unwrap_or(0), req.memory_mb.unwrap_or(0)),
+    //
+    // M11-S7 todo #67: `req.cpus` is `Option<f32>` so the spec §
+    // "Resource defaults — container only" 1-decimal grammar
+    // (`0.8`, `1.5`, …) reaches the runtime without truncation.
+    // Lima sessions still see whole-number cores (QEMU's `-smp`
+    // grammar pins integers), so we floor any fractional value on
+    // the Lima path. The container path normalises to one decimal
+    // place via `round_cpus_one_decimal` so `0.81` lands on the
+    // grid as `0.8` regardless of whether an operator typo'd extra
+    // precision.
+    let memory_mb = match backend_kind {
+        BackendKind::Lima => req.memory_mb.unwrap_or(4096),
+        BackendKind::Container => req.memory_mb.unwrap_or(0),
+    };
+    let cpus_decimal_request = req.cpus;
+    let (cpus_persisted, cpus_decimal) = match backend_kind {
+        BackendKind::Lima => {
+            // QEMU pins integer cores; ignore any sub-integer portion
+            // the operator passed and persist the integer ceiling
+            // unchanged.
+            let cpus = cpus_decimal_request.map(|c| c as u32).unwrap_or(2);
+            (cpus, None)
+        }
+        BackendKind::Container => match cpus_decimal_request {
+            None => (0, None),
+            Some(precise) => {
+                let normalised = round_cpus_one_decimal(precise);
+                // `cpus` (u32) holds the floored value as a fallback
+                // for older daemons rolling back; the precise value
+                // lives in `cpus_decimal`.
+                (normalised.floor() as u32, Some(normalised))
+            }
+        },
     };
 
     let config = SessionConfig {
-        cpus,
+        cpus: cpus_persisted,
         memory_mb,
         disk_gb: req.disk_gb.unwrap_or(20),
         workspace_mode,
@@ -897,6 +954,7 @@ async fn create_session(
         repo: req.repo.clone(),
         boot_cmd: req.boot_cmd.clone(),
         template: req.template.clone(),
+        cpus_decimal,
     };
 
     // Hardened flag interaction with the container backend:
@@ -6341,6 +6399,48 @@ mod tests {
     fn error_body(err: SandboxError) -> (StatusCode, ApiError) {
         let (status, Json(body)) = error_response(err);
         (status, body)
+    }
+
+    // -----------------------------------------------------------------------
+    // round_cpus_one_decimal — M11-S7 todo #67 boundary normalisation.
+    // Pins the request-parse-time grid: 0.81 → 0.8, 1.55 → 1.5, etc.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn round_cpus_one_decimal_snaps_off_grid_inputs_to_grid() {
+        // Operator typed extra precision past the 1-decimal grid. The
+        // request-parse-time normalisation rounds toward the nearest
+        // grid point so the value reaches `format_cpus` unchanged
+        // (no second rounding step) and so the persisted
+        // `cpus_decimal` field matches what the daemon actually
+        // applies via `--cpus`.
+        assert_eq!(round_cpus_one_decimal(0.81), 0.8);
+        assert_eq!(round_cpus_one_decimal(1.55), 1.5);
+        assert_eq!(round_cpus_one_decimal(2.04), 2.0);
+        // Banker's-rounding edge — `round` ties toward zero in `f64`?
+        // Not required by the contract; the spec only mandates the
+        // 1-decimal grid. We pin `1.5` and `2.0` (exactly on grid)
+        // round to themselves.
+        assert_eq!(round_cpus_one_decimal(1.5), 1.5);
+        assert_eq!(round_cpus_one_decimal(2.0), 2.0);
+        assert_eq!(round_cpus_one_decimal(0.8), 0.8);
+    }
+
+    /// Round-trip the spec § "Resource defaults — container only"
+    /// 1-decimal grid through the request-parse-time normalisation
+    /// without precision drift. Pins the contract todo #67 enforces:
+    /// `0.8`, `1.5`, `2.0` survive the parse → store → serialize
+    /// round-trip with bit-equality on the boundary helper.
+    #[test]
+    fn round_cpus_one_decimal_grid_values_survive_unchanged() {
+        for cpus in [0.8_f32, 1.5_f32, 2.0_f32] {
+            let normalised = round_cpus_one_decimal(cpus);
+            assert_eq!(
+                normalised, cpus,
+                "1-decimal grid value must be a round-to-self fixed point; \
+                 got {normalised} for input {cpus}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

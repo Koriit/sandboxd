@@ -31,6 +31,7 @@ fn integration_lima_create_and_delete() {
         repo: None,
         boot_cmd: None,
         template: None,
+        cpus_decimal: None,
     };
 
     // Create the VM

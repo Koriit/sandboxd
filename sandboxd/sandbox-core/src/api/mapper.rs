@@ -38,13 +38,24 @@ impl From<&Session> for SessionDto {
         // use the sentinel — `cpus`/`memory_mb` are already the
         // applied values.
         let mut config: SessionConfigDto = (&session.config).into();
+        // Container backend: substitute the daemon's host-80% defaults
+        // for any `0`-sentinel persisted value. The "stored" cpus
+        // value is `config.cpus_decimal` when set (the precise float
+        // M11-S7 todo #67 plumbed in) or the integer `config.cpus`
+        // cast to f64 otherwise. Lima passes through verbatim — the
+        // sentinel only applies to container sessions.
+        let stored_cpus_f64 = session
+            .config
+            .cpus_decimal
+            .map(|c| c as f64)
+            .unwrap_or(session.config.cpus as f64);
         let (resolved_cpus, resolved_memory_mb) = match session.backend {
             BackendKind::Container => {
                 let (default_memory_mb, default_cpus) = compute_default_resource_limits();
-                let cpus = if session.config.cpus == 0 {
+                let cpus = if stored_cpus_f64 == 0.0 {
                     default_cpus
                 } else {
-                    session.config.cpus as f64
+                    stored_cpus_f64
                 };
                 let memory_mb = if session.config.memory_mb == 0 {
                     default_memory_mb
@@ -53,7 +64,7 @@ impl From<&Session> for SessionDto {
                 };
                 (cpus, memory_mb)
             }
-            BackendKind::Lima => (session.config.cpus as f64, session.config.memory_mb),
+            BackendKind::Lima => (stored_cpus_f64, session.config.memory_mb),
         };
         config.resolved_cpus = resolved_cpus;
         config.resolved_memory_mb = resolved_memory_mb;
@@ -152,12 +163,20 @@ impl From<&SessionConfig> for SessionConfigDto {
     /// see a Lima-shaped passthrough — accurate for VM sessions, and
     /// safely the same as the persisted value for container sessions
     /// that explicitly set non-zero `cpus`/`memory_mb`.
+    ///
+    /// `cpus` is sourced from [`SessionConfig::cpus_decimal`] when
+    /// `Some` (M11-S7 todo #67 — the precise 1-decimal value the
+    /// operator supplied for a container session); otherwise it
+    /// falls back to the integer [`SessionConfig::cpus`] cast to
+    /// `f32`, which is exact for every value the persisted column
+    /// can hold (`u32` → `f32` is exact for inputs ≤ 2^24).
     fn from(config: &SessionConfig) -> Self {
+        let cpus_wire = config.cpus_decimal.unwrap_or(config.cpus as f32);
         Self {
-            cpus: config.cpus,
+            cpus: cpus_wire,
             memory_mb: config.memory_mb,
             disk_gb: config.disk_gb,
-            resolved_cpus: config.cpus as f64,
+            resolved_cpus: cpus_wire as f64,
             resolved_memory_mb: config.memory_mb,
             workspace_mode: config.workspace_mode.as_ref().map(render_workspace_mode),
             hardened: config.hardened,
@@ -386,6 +405,7 @@ mod tests {
             repo: Some("https://github.com/example/app.git".into()),
             boot_cmd: Some("make setup".into()),
             template: Some("/tmp/custom.yaml".into()),
+            cpus_decimal: None,
         };
         let dto: SessionConfigDto = (&config).into();
         assert_eq!(
@@ -409,6 +429,7 @@ mod tests {
             repo: None,
             boot_cmd: None,
             template: None,
+            cpus_decimal: None,
         };
         let dto: SessionConfigDto = (&config).into();
         assert_eq!(
@@ -444,6 +465,7 @@ mod tests {
             repo: None,
             boot_cmd: None,
             template: None,
+            cpus_decimal: None,
         };
         let session = Session::with_config_and_backend(
             Some("lite-resolve".into()),
@@ -452,8 +474,9 @@ mod tests {
         );
         let dto = SessionDto::from(&session);
 
-        // Stored values pass through untouched.
-        assert_eq!(dto.config.cpus, 0);
+        // Stored values pass through untouched. `cpus` is `f32`
+        // post-todo-#67; `0` parses on the wire as `0.0_f32`.
+        assert_eq!(dto.config.cpus, 0.0_f32);
         assert_eq!(dto.config.memory_mb, 0);
 
         // Resolved values match `compute_default_resource_limits`.
@@ -485,6 +508,7 @@ mod tests {
             repo: None,
             boot_cmd: None,
             template: None,
+            cpus_decimal: None,
         };
         let session = Session::with_config_and_backend(
             Some("lite-explicit".into()),
@@ -493,7 +517,7 @@ mod tests {
         );
         let dto = SessionDto::from(&session);
 
-        assert_eq!(dto.config.cpus, 4);
+        assert_eq!(dto.config.cpus, 4.0_f32);
         assert_eq!(dto.config.memory_mb, 8192);
         assert!(
             (dto.config.resolved_cpus - 4.0).abs() < f64::EPSILON,
@@ -510,8 +534,48 @@ mod tests {
         let session = Session::new(Some("lima-default".into()));
         let dto = SessionDto::from(&session);
         assert_eq!(dto.backend, crate::backend::BackendKind::Lima);
-        assert_eq!(dto.config.cpus, dto.config.resolved_cpus as u32);
+        // `cpus` is `f32` post-todo-#67; widened to f64 for the
+        // resolved-field comparison.
+        assert!(
+            (dto.config.cpus as f64 - dto.config.resolved_cpus).abs() < f64::EPSILON,
+            "lima resolved_cpus must mirror cpus; got cpus={} resolved={}",
+            dto.config.cpus,
+            dto.config.resolved_cpus
+        );
         assert_eq!(dto.config.memory_mb, dto.config.resolved_memory_mb);
+    }
+
+    /// M11-S7 todo #67: a container session whose persisted
+    /// `cpus_decimal` carries a fractional value (`1.5`) surfaces
+    /// that exact value on the wire `cpus` field — not the rounded-
+    /// down integer `cpus` column the older daemon's view would have
+    /// returned. Pins the round-trip the daemon's create handler
+    /// stamps when it parses `--cpus 1.5`.
+    #[test]
+    fn session_dto_surfaces_fractional_cpus_decimal_on_wire() {
+        let config = SessionConfig {
+            cpus: 1, // floor of the precise value
+            memory_mb: 4096,
+            disk_gb: 20,
+            workspace_mode: None,
+            hardened: false,
+            repo: None,
+            boot_cmd: None,
+            template: None,
+            cpus_decimal: Some(1.5),
+        };
+        let session = Session::with_config_and_backend(
+            Some("lite-fractional".into()),
+            config,
+            crate::backend::BackendKind::Container,
+        );
+        let dto = SessionDto::from(&session);
+        assert_eq!(dto.config.cpus, 1.5_f32);
+        assert!(
+            (dto.config.resolved_cpus - 1.5).abs() < f64::EPSILON,
+            "resolved_cpus must mirror the precise stored value; got {}",
+            dto.config.resolved_cpus
+        );
     }
 
     // -- M11-S7 Bundle Y: SessionNetworkInfo / SessionMountInfo wire shape ---
@@ -580,6 +644,7 @@ mod tests {
                 repo: None,
                 boot_cmd: None,
                 template: None,
+                cpus_decimal: None,
             },
             crate::backend::BackendKind::Container,
         );
@@ -678,7 +743,7 @@ mod tests {
         );
         // Spot-check that the rest of the fields didn't lose data.
         assert_eq!(dto.id.as_str(), "0123456789ab");
-        assert_eq!(dto.config.cpus, 2);
+        assert_eq!(dto.config.cpus, 2.0_f32);
         assert_eq!(dto.backend, crate::backend::BackendKind::Lima);
     }
 }

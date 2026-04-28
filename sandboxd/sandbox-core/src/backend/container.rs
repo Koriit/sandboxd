@@ -332,9 +332,16 @@ impl ContainerRuntime {
     }
 
     /// Resolve container memory/cpus from the spec, falling back to
-    /// the runtime's defaults when the spec carries 0 (treated as
-    /// "unset" by 3A — Phase 3D will normalise this at the request
-    /// boundary).
+    /// the runtime's defaults when the spec carries `0` (treated as
+    /// "unset" — the request-boundary handler in `sandboxd` stamps
+    /// `0`/`0.0` whenever the operator omitted `--cpus`/`--memory`,
+    /// and this is where we substitute the daemon's host-80% defaults).
+    ///
+    /// Returns `(memory_mb, cpus)` with `cpus` widened to `f64` for
+    /// the consumer (`format_cpus` formats with `{:.1}`). Pre-todo-#67
+    /// the `cpus` input was `u32` and the widening was a `as f64` on
+    /// every call; the f32 source eliminates the truncation that
+    /// previously dropped fractional values like `1.5` to `1`.
     fn resource_ceilings(&self, spec: &SessionSpec) -> Result<(u32, f64), SandboxError> {
         let (memory_mb, cpus) = match &spec.backend_specific {
             BackendSpecific::Container { memory_mb, cpus } => (*memory_mb, *cpus),
@@ -350,7 +357,12 @@ impl ContainerRuntime {
         } else {
             memory_mb
         };
-        let cpus = if cpus == 0 {
+        // `0.0` is the request-boundary "unset" sentinel (operator did
+        // not pass `--cpus`); substitute the daemon's host-80% default.
+        // Any other value is passed through after a lossless f32→f64
+        // widening so `format_cpus` sees the exact same one-decimal
+        // value the operator supplied.
+        let cpus = if cpus == 0.0 {
             self.default_cpus
         } else {
             cpus as f64
@@ -1015,13 +1027,13 @@ async fn invoke_route_helper(
 ///
 /// Internal type for the cpu default is `f64` so the spec's one-decimal
 /// precision survives all the way to docker's `--cpus <n>` flag (see
-/// [`format_cpus`]). The wire-level `BackendSpecific::Container` field
-/// is `cpus: u32` for now — switching that to `f64` is a wire migration
-/// scheduled for M11-S4 (deferred todo #67); until then, the request-
-/// boundary normalisation in [`ContainerRuntime::resource_ceilings`]
-/// applies the daemon-computed default whenever the request leaves the
-/// field at 0, so the daemon-side precision is preserved on the
-/// implicit-default path.
+/// [`format_cpus`]). M11-S7 todo #67 widened the wire-level
+/// [`BackendSpecific::Container`] field from `u32` to `f32`, so an
+/// explicit operator-supplied fractional value (e.g. `--cpus 1.5`) now
+/// reaches `format_cpus` without truncation. The implicit-default path
+/// (operator omits `--cpus`, request boundary stamps `0.0`) still
+/// resolves to this function's return value via
+/// [`ContainerRuntime::resource_ceilings`]'s `0.0 → default_cpus` arm.
 ///
 /// Best-effort fallbacks keep the daemon bootable even on hosts where
 /// /proc/meminfo or `available_parallelism` is unavailable: a 4096 MB
@@ -1674,17 +1686,19 @@ mod tests {
     }
 
     /// `resource_ceilings` falls back to the runtime's defaults when
-    /// the spec carries 0; passes through non-zero values unchanged.
-    /// This is the seam Phase 3D plugs into — request normalisation
-    /// at the HTTP boundary will eventually remove the 0-fallback,
-    /// but it is the 3A contract.
+    /// the spec carries `0`/`0.0`; passes through non-zero values
+    /// unchanged with f32→f64 lossless widening (M11-S7 todo #67).
+    ///
+    /// The pre-todo-#67 shape was `cpus: u32` with `as f64` widening
+    /// inside the function, which silently truncated `1.5` to `1`.
+    /// The fractional case is now pinned below.
     #[test]
     fn resource_ceilings_zero_falls_back_to_defaults() {
         let rt = test_runtime();
         let spec_zero = SessionSpec {
             backend_specific: BackendSpecific::Container {
                 memory_mb: 0,
-                cpus: 0,
+                cpus: 0.0,
             },
             workspace_mode: None,
             repo: None,
@@ -1694,12 +1708,12 @@ mod tests {
         };
         let (mem, cpus) = rt.resource_ceilings(&spec_zero).unwrap();
         assert_eq!(mem, 2048, "0 → default_memory_mb");
-        assert!((cpus - 2.0).abs() < f64::EPSILON, "0 → default_cpus");
+        assert!((cpus - 2.0).abs() < f64::EPSILON, "0.0 → default_cpus");
 
         let spec_explicit = SessionSpec {
             backend_specific: BackendSpecific::Container {
                 memory_mb: 4096,
-                cpus: 4,
+                cpus: 4.0,
             },
             workspace_mode: None,
             repo: None,
@@ -1710,6 +1724,27 @@ mod tests {
         let (mem, cpus) = rt.resource_ceilings(&spec_explicit).unwrap();
         assert_eq!(mem, 4096);
         assert!((cpus - 4.0).abs() < f64::EPSILON);
+
+        // Fractional value: pre-todo-#67 the `as f64` widening lost
+        // precision because the source was `u32`. With `f32` source
+        // the widening is exact, and `format_cpus` will render `1.5`
+        // verbatim into the `--cpus` flag.
+        let spec_fractional = SessionSpec {
+            backend_specific: BackendSpecific::Container {
+                memory_mb: 4096,
+                cpus: 1.5,
+            },
+            workspace_mode: None,
+            repo: None,
+            boot_cmd: None,
+            template: None,
+            disk_gb: None,
+        };
+        let (_mem, cpus) = rt.resource_ceilings(&spec_fractional).unwrap();
+        assert!(
+            (cpus - 1.5).abs() < f64::EPSILON,
+            "fractional cpus must survive f32→f64 widening; got {cpus}"
+        );
     }
 
     /// `capabilities_for_container` is the one source of truth for the

@@ -52,8 +52,16 @@ enum Command {
         /// the daemon's host-80% ceiling (spec § "Resource defaults").
         /// Omit to take the backend default; pass an explicit value
         /// to override.
+        ///
+        /// `f32` (M11-S7 todo #67) so the spec § "Resource defaults —
+        /// container only" 1-decimal grammar (`0.8`, `1.5`, `2.0`, …)
+        /// reaches the daemon without truncation. The daemon rounds
+        /// to one decimal at request-parse time so `0.81` lands on
+        /// the grid as `0.8`. Lima sessions truncate the fractional
+        /// part on the daemon side — QEMU's `-smp` flag pins integer
+        /// cores.
         #[arg(long)]
-        cpus: Option<u32>,
+        cpus: Option<f32>,
         /// Memory in megabytes. Defaults are backend-specific:
         /// `lima` falls back to 4096 MB; `container` falls back to
         /// the daemon's host-80% ceiling (spec § "Resource defaults").
@@ -947,8 +955,8 @@ fn display_session(session: &SessionDto) {
     println!("ID:       {}", session.id);
     println!("Name:     {name}");
     println!("State:    {}", session.state);
-    println!("CPUs:     {}", session.config.cpus);
-    println!("Memory:   {} MB", session.config.memory_mb);
+    println!("CPUs:     {}", format_cpus_field(&session.config));
+    println!("Memory:   {}", format_memory_field(&session.config));
     println!("Disk:     {} GB", session.config.disk_gb);
     println!(
         "Created:  {} ({})",
@@ -960,6 +968,57 @@ fn display_session(session: &SessionDto) {
         session.updated_at.format("%Y-%m-%d %H:%M:%S UTC"),
         format_relative_time(&session.updated_at)
     );
+}
+
+/// Render a [`SessionConfigDto`]'s `cpus` field for human-readable
+/// `sandbox describe` / inspect output (M11-S7 todo #75).
+///
+/// The container backend uses `0`/`0.0` as the "operator did not pass
+/// `--cpus`" sentinel, with the daemon substituting its host-80%
+/// default at runtime. Surfacing the raw `0` mislead operators into
+/// thinking the session had no CPU budget; the daemon already plumbs
+/// the resolved value through `resolved_cpus`, so this helper picks
+/// the right value to render and decorates the default case with a
+/// `(default)` suffix per spec § "Resource defaults — container only".
+///
+/// - Stored value > 0 (operator-supplied explicit ceiling): render
+///   the value verbatim. Lima sessions always take this branch
+///   because the request handler stamps the historical `2` Lima
+///   default when the operator omits `--cpus`.
+/// - Stored value == 0 (container default): render the resolved
+///   value with a `(default)` hint so operators see the actually-
+///   applied ceiling instead of `0`.
+///
+/// `f32` formatting omits a trailing `.0` for integer-valued
+/// fractions (e.g. `2.0` → `2`) so Lima sessions render the same
+/// way as before todo #67. The `:.1` formatting on container
+/// fractions preserves the spec's 1-decimal grammar.
+fn format_cpus_field(config: &sandbox_core::SessionConfigDto) -> String {
+    if config.cpus == 0.0 {
+        // Container "use the daemon default" path. `resolved_cpus`
+        // is the daemon's host-80% ceiling rendered to one decimal
+        // place; the parenthetical hint distinguishes this from an
+        // operator-supplied `0` (which the daemon rejects upstream).
+        format!("{:.1} (default)", config.resolved_cpus)
+    } else if config.cpus.fract() == 0.0 {
+        // Integer-valued fraction: render without trailing ".0" so
+        // Lima sessions ("CPUs:     2") and explicit container
+        // sessions ("CPUs:     4") produce the same output as
+        // pre-todo-#67 builds.
+        format!("{}", config.cpus as u32)
+    } else {
+        format!("{:.1}", config.cpus)
+    }
+}
+
+/// Render a [`SessionConfigDto`]'s `memory_mb` field with the same
+/// "stored 0 → daemon default" rule as [`format_cpus_field`].
+fn format_memory_field(config: &sandbox_core::SessionConfigDto) -> String {
+    if config.memory_mb == 0 {
+        format!("{} MB (default)", config.resolved_memory_mb)
+    } else {
+        format!("{} MB", config.memory_mb)
+    }
 }
 
 /// Maximum time to wait for the daemon to respond to an HTTP request.
@@ -1309,8 +1368,17 @@ fn render_describe_one(
     out.push('\n');
 
     let _ = writeln!(out, "Config:");
-    let _ = writeln!(out, "  CPUs:        {}", session.config.cpus);
-    let _ = writeln!(out, "  Memory:      {} MB", session.config.memory_mb);
+    // M11-S7 todo #75: when the operator omitted `--cpus`/`--memory`
+    // on a container session, the persisted column is `0` and the
+    // daemon substitutes its host-80% default at runtime. Rendering
+    // the raw `0` previously mislead operators; surface the resolved
+    // applied value with a `(default)` hint instead.
+    let _ = writeln!(out, "  CPUs:        {}", format_cpus_field(&session.config));
+    let _ = writeln!(
+        out,
+        "  Memory:      {}",
+        format_memory_field(&session.config)
+    );
     let _ = writeln!(out, "  Disk:        {} GB", session.config.disk_gb);
     let _ = writeln!(
         out,
@@ -3783,7 +3851,7 @@ async fn dispatch_create_preflight(
         },
         sandbox_core::BackendKind::Container => sandbox_core::BackendSpecific::Container {
             memory_mb: 0,
-            cpus: 0,
+            cpus: 0.0,
         },
     };
     let spec = sandbox_core::SessionSpec {
@@ -4055,7 +4123,8 @@ mod tests {
                 ..
             } => {
                 assert_eq!(name.as_deref(), Some("full"));
-                assert_eq!(*cpus, Some(4));
+                // M11-S7 todo #67: `--cpus 4` parses as `4.0_f32`.
+                assert_eq!(*cpus, Some(4.0_f32));
                 assert_eq!(*memory, Some(8192));
                 assert_eq!(*disk, 50);
                 assert_eq!(template.as_deref(), Some("/tmp/custom.yaml"));
@@ -4200,7 +4269,7 @@ mod tests {
     fn build_create_request_with_name() {
         let cmd = Command::Create {
             name: Some("test".into()),
-            cpus: Some(2),
+            cpus: Some(2.0),
             memory: Some(4096),
             disk: 20,
             template: None,
@@ -4219,7 +4288,10 @@ mod tests {
         assert_eq!(req.uri(), "/sessions");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
         assert_eq!(body["name"], "test");
-        assert_eq!(body["cpus"], 2);
+        // M11-S7 todo #67: cpus is `f32` on the wire; serde_json
+        // renders `2.0_f32` as JSON `2.0` (a `Number::Float`), so
+        // compare via `as_f64` rather than against an integer literal.
+        assert_eq!(body["cpus"].as_f64(), Some(2.0));
         assert_eq!(body["memory_mb"], 4096);
         assert_eq!(body["disk_gb"], 20);
     }
@@ -4228,7 +4300,7 @@ mod tests {
     fn build_create_request_no_name() {
         let cmd = Command::Create {
             name: None,
-            cpus: Some(4),
+            cpus: Some(4.0),
             memory: Some(8192),
             disk: 50,
             template: None,
@@ -4247,7 +4319,7 @@ mod tests {
         assert_eq!(req.uri(), "/sessions");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
         assert!(body.get("name").is_none());
-        assert_eq!(body["cpus"], 4);
+        assert_eq!(body["cpus"].as_f64(), Some(4.0));
         assert_eq!(body["memory_mb"], 8192);
         assert_eq!(body["disk_gb"], 50);
     }
@@ -4256,7 +4328,7 @@ mod tests {
     fn build_create_request_with_template() {
         let cmd = Command::Create {
             name: Some("custom".into()),
-            cpus: Some(2),
+            cpus: Some(2.0),
             memory: Some(4096),
             disk: 20,
             template: Some("/tmp/my-template.yaml".into()),
@@ -4631,7 +4703,7 @@ mod tests {
     fn build_create_request_with_repo() {
         let cmd = Command::Create {
             name: Some("with-repo".into()),
-            cpus: Some(2),
+            cpus: Some(2.0),
             memory: Some(4096),
             disk: 20,
             template: None,
@@ -4655,7 +4727,7 @@ mod tests {
     fn build_create_request_with_boot_cmd() {
         let cmd = Command::Create {
             name: Some("with-boot".into()),
-            cpus: Some(2),
+            cpus: Some(2.0),
             memory: Some(4096),
             disk: 20,
             template: None,
@@ -4707,7 +4779,7 @@ mod tests {
     fn build_create_request_with_no_hardening() {
         let cmd = Command::Create {
             name: Some("debug".into()),
-            cpus: Some(2),
+            cpus: Some(2.0),
             memory: Some(4096),
             disk: 20,
             template: None,
@@ -4733,7 +4805,7 @@ mod tests {
     fn build_create_request_default_omits_hardened() {
         let cmd = Command::Create {
             name: Some("normal".into()),
-            cpus: Some(2),
+            cpus: Some(2.0),
             memory: Some(4096),
             disk: 20,
             template: None,
@@ -4883,7 +4955,7 @@ mod tests {
     fn build_create_request_with_no_cache() {
         let cmd = Command::Create {
             name: Some("cached".into()),
-            cpus: Some(2),
+            cpus: Some(2.0),
             memory: Some(4096),
             disk: 20,
             template: None,
@@ -4909,7 +4981,7 @@ mod tests {
     fn build_create_request_default_omits_no_cache() {
         let cmd = Command::Create {
             name: Some("normal".into()),
-            cpus: Some(2),
+            cpus: Some(2.0),
             memory: Some(4096),
             disk: 20,
             template: None,
@@ -5157,7 +5229,7 @@ mod tests {
             created_at,
             updated_at: created_at,
             config: SessionConfigDto {
-                cpus: 2,
+                cpus: 2.0,
                 memory_mb: 4096,
                 disk_gb: 20,
                 resolved_cpus: 2.0,
@@ -5554,6 +5626,113 @@ mod tests {
         write_sessions_table(&mut buf, &[]);
         let rendered = String::from_utf8(buf).expect("UTF-8");
         assert_eq!(rendered, "No sessions found.\n");
+    }
+
+    // -- M11-S7 Bundle Z (todo #75): describe/inspect rendering of
+    //    cpus / memory must surface the daemon's host-80% default for
+    //    container sessions whose persisted column is `0` (operator
+    //    omitted `--cpus`/`--memory`). The pre-Bundle-Z render shape
+    //    rendered "CPUs: 0, Memory: 0 MB" which mislead operators.
+
+    /// Container session created without `--cpus` (`config.cpus == 0`).
+    /// `format_cpus_field` must surface the daemon's resolved host-80%
+    /// default with a `(default)` hint instead of the raw `0`.
+    #[test]
+    fn format_cpus_field_default_path_renders_resolved_with_hint() {
+        let dto_config = sandbox_core::SessionConfigDto {
+            cpus: 0.0,
+            memory_mb: 0,
+            disk_gb: 20,
+            resolved_cpus: 1.6,
+            resolved_memory_mb: 13107,
+            workspace_mode: None,
+            hardened: false,
+            repo: None,
+            boot_cmd: None,
+            template: None,
+        };
+        assert_eq!(format_cpus_field(&dto_config), "1.6 (default)");
+        assert_eq!(format_memory_field(&dto_config), "13107 MB (default)");
+    }
+
+    /// Operator-supplied integer ceiling (e.g. Lima default `2`):
+    /// render without trailing `.0` so the display matches the
+    /// pre-todo-#67 shape Lima operators are used to.
+    #[test]
+    fn format_cpus_field_integer_value_renders_without_trailing_dot_zero() {
+        let dto_config = sandbox_core::SessionConfigDto {
+            cpus: 2.0,
+            memory_mb: 4096,
+            disk_gb: 20,
+            resolved_cpus: 2.0,
+            resolved_memory_mb: 4096,
+            workspace_mode: None,
+            hardened: true,
+            repo: None,
+            boot_cmd: None,
+            template: None,
+        };
+        assert_eq!(format_cpus_field(&dto_config), "2");
+        assert_eq!(format_memory_field(&dto_config), "4096 MB");
+    }
+
+    /// Operator-supplied 1-decimal value (e.g. `--cpus 1.5` on a
+    /// container session): render with the `:.1` precision, no
+    /// `(default)` hint because the value is explicit.
+    #[test]
+    fn format_cpus_field_fractional_value_renders_one_decimal() {
+        let dto_config = sandbox_core::SessionConfigDto {
+            cpus: 1.5,
+            memory_mb: 2048,
+            disk_gb: 20,
+            resolved_cpus: 1.5,
+            resolved_memory_mb: 2048,
+            workspace_mode: None,
+            hardened: false,
+            repo: None,
+            boot_cmd: None,
+            template: None,
+        };
+        assert_eq!(format_cpus_field(&dto_config), "1.5");
+        assert_eq!(format_memory_field(&dto_config), "2048 MB");
+    }
+
+    /// End-to-end through `render_describe`: the rendered describe
+    /// output for a container session created without `--cpus` /
+    /// `--memory` must contain the resolved-default lines and must
+    /// NOT contain the raw `CPUs:        0` / `Memory:      0 MB`
+    /// strings the pre-Bundle-Z render would have produced.
+    #[test]
+    fn describe_container_default_resources_render_as_resolved_with_hint() {
+        let mut dto = make_session_dto(
+            "ccccdddddeee",
+            Some("lite-default"),
+            None,
+            chrono::Utc::now(),
+        );
+        dto.backend = sandbox_core::backend::BackendKind::Container;
+        dto.config.cpus = 0.0;
+        dto.config.memory_mb = 0;
+        dto.config.resolved_cpus = 1.6;
+        dto.config.resolved_memory_mb = 13107;
+        let rendered = render_describe(std::slice::from_ref(&dto), None);
+        assert!(
+            rendered.contains("CPUs:        1.6 (default)"),
+            "expected resolved cpus with `(default)` hint, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Memory:      13107 MB (default)"),
+            "expected resolved memory with `(default)` hint, got:\n{rendered}"
+        );
+        // Regression net for the pre-Bundle-Z misleading shape.
+        assert!(
+            !rendered.contains("CPUs:        0\n"),
+            "must not render the raw `0` sentinel, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("Memory:      0 MB\n"),
+            "must not render the raw `0` memory sentinel, got:\n{rendered}"
+        );
     }
 
     /// Default-view `describe` (no `-v`) must show `Backend:` adjacent
