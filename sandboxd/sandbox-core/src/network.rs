@@ -220,8 +220,9 @@ impl NetworkManager {
             let subnet_base = parse_subnet_base(&info.subnet)?;
             let block_idx = alloc.block_index_for(subnet_base).ok_or_else(|| {
                 SandboxError::Network(format!(
-                    "subnet {} does not map to a valid block in the base range",
-                    info.subnet
+                    "subnet {} does not map to a valid block in the base range \
+                     {}/{} (session {})",
+                    info.subnet, alloc.base, alloc._prefix_len, session_id
                 ))
             })?;
             alloc.mark_allocated(block_idx)?;

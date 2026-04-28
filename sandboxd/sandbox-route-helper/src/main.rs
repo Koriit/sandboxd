@@ -205,7 +205,9 @@ fn pidfd_open(pid: i32) -> Result<OwnedFd, i32> {
     }
     // SAFETY: `raw` is a non-negative kernel-issued fd we have
     // exclusive ownership of.
-    Ok(unsafe { OwnedFd::from_raw_fd(raw as i32) })
+    let fd = i32::try_from(raw)
+        .expect("pidfd_open returned a non-negative fd; kernel-allocated fd numbers fit in i32");
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// Render a `pidfd_open` errno into the helper's stderr phrasing.

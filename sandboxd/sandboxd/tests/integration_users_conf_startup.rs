@@ -63,8 +63,11 @@ fn spawn_and_wait_for_exit(users_conf: Option<&str>) -> (String, i32) {
         .env("XDG_RUNTIME_DIR", tmp.path())
         .env("SANDBOX_USERS_CONF", &users_conf_path)
         // Default tracing → stderr; we capture stderr to assert on
-        // the message text.
-        .env("RUST_LOG", "info")
+        // the message text. The substring assertions key off `eprintln`
+        // output, not log output, so `warn` is enough — it keeps any
+        // genuine warnings visible on failure without piping info-level
+        // init noise that pressures slow CI's stderr buffer.
+        .env("RUST_LOG", "warn")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -100,6 +103,7 @@ fn spawn_and_wait_for_exit(users_conf: Option<&str>) -> (String, i32) {
 
     // `tmp` is held until end of function; on drop it cleans up the
     // socket / base dir / users.conf.
+    // must come after stderr read
     drop(tmp);
 
     (stderr_output, exit_code)
