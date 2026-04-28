@@ -543,7 +543,7 @@ container; operators cannot relax them.
 | `--tmpfs /tmp`   | `rw,nosuid,nodev,size=256m`                         | Scratch space                                                                                       |
 | `--tmpfs /run`   | `rw,nosuid,nodev,size=16m`                          | Process-runtime state (pid files, lockfiles); not on the agent's critical path — the agent uses TCP |
 | `--security-opt` | `no-new-privileges`                                 | Prevents setuid escalation                                                                          |
-| `--security-opt` | `seccomp=default`                                   | Docker's default seccomp profile                                                                    |
+| `--security-opt` | `seccomp=builtin`                                   | Docker's default seccomp profile                                                                    |
 | `--cap-drop`     | `ALL`                                               | No Linux capabilities                                                                               |
 | `--user`         | `1000:1000` (or calling uid/gid if host uid ≠ 1000) | Non-root; uid alignment for workspace bind mount                                                    |
 | `--pids-limit`   | `512`                                               | Fork-bomb ceiling                                                                                   |
@@ -566,8 +566,8 @@ Documented in `docs/lite.md` (new, Phase 3).
 
 ### Workspace
 
-Bind mount `/host/path → /workspace`, same as Lima's workspace mount
-semantics.
+Bind mount `/host/path → /home/agent/workspace/`, same as Lima's workspace
+mount semantics (the bind target is unified across both backends).
 
 **UID alignment:** pass `--user <host-uid>:<host-gid>` when the host uid
 is not 1000, so files written inside the container are owned by the
