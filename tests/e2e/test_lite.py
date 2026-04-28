@@ -23,7 +23,9 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -642,3 +644,250 @@ def test_lite_home_volume_lifecycle_beta(lite_harness, sandbox_cli):
         f"named home volume {volume_name!r} still exists after rm; "
         f"docker volume ls listed: {listed}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 3.11 — orphan reaper cleans stranded container + home volume on daemon
+# restart (todo #71 — pytest equivalent of the Phase 5B Rust integration test
+# `integration_orphan_reaper_removes_orphans_and_preserves_live_resources`)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.timeout(600)
+def test_lite_orphan_cleanup_on_daemon_restart(
+    lite_harness, sandbox_binaries, sandbox_daemon
+):
+    """Spec § "Orphan cleanup on daemon start" / spec § Testing line 1023:
+    "kill the daemon mid-create, restart, assert orphan container and
+    volume are reaped".
+
+    We approximate "kill mid-create" with the simpler, deterministic
+    variant the spec authorises: create the lite session normally,
+    SIGKILL the daemon (so it has no chance to clean anything up),
+    then mutate ``sessions.db`` to delete the session row — that
+    leaves the ``sandbox-<id>`` container and ``sandbox-home-<id>``
+    volume on the host with no owning row, which is exactly the
+    invariant the boot-time reaper exists to fix. Restart the daemon
+    and assert both Docker artifacts are gone.
+
+    Restart mechanics mirror
+    ``test_m3_networking::test_daemon_restart_recovery``: SIGKILL the
+    process, append to the existing log files so the session-scoped
+    fixture can adopt the restarted daemon, and hand the new ``Popen``
+    back via ``sandbox_daemon["process"]`` so subsequent tests (and
+    fixture teardown) operate on the live process. Without that
+    handoff every test after this one cascade-fails on a dead socket.
+    """
+    sid = lite_harness.create("--name", "lite-orphan-reap")
+    container_name = f"sandbox-{sid}"
+    volume_name = f"sandbox-home-{sid}"
+
+    # Sanity precondition: both Docker artifacts exist before we kick
+    # the legs out from under the daemon.
+    pre_containers = subprocess.run(
+        ["docker", "ps", "-a", "--format", "{{.Names}}"],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert pre_containers.returncode == 0, (
+        f"docker ps -a failed.\nstderr: {pre_containers.stderr}"
+    )
+    assert container_name in pre_containers.stdout.splitlines(), (
+        f"precondition: container {container_name!r} should exist before "
+        f"the daemon is killed; docker ps -a listed:\n{pre_containers.stdout}"
+    )
+    pre_volumes = subprocess.run(
+        ["docker", "volume", "ls", "--format", "{{.Name}}"],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert pre_volumes.returncode == 0, (
+        f"docker volume ls failed.\nstderr: {pre_volumes.stderr}"
+    )
+    assert volume_name in pre_volumes.stdout.splitlines(), (
+        f"precondition: volume {volume_name!r} should exist before the "
+        f"daemon is killed; docker volume ls listed:\n{pre_volumes.stdout}"
+    )
+
+    daemon_proc = sandbox_daemon["process"]
+    socket_path = sandbox_daemon["socket"]
+    base_dir = sandbox_daemon["base_dir"]
+    db_path = os.path.join(base_dir, "sessions.db")
+
+    restarted_proc = None
+    new_stdout_fh = None
+    new_stderr_fh = None
+    try:
+        # 1. SIGKILL the daemon. Abrupt — no graceful shutdown, so the
+        #    daemon has no chance to remove the container/volume on the
+        #    way out. This is the regime the orphan reaper exists for.
+        daemon_proc.send_signal(signal.SIGKILL)
+        daemon_proc.wait(timeout=10)
+        assert daemon_proc.poll() is not None, (
+            "Daemon did not die after SIGKILL"
+        )
+        # Give the kernel a beat to release the abstract socket file so
+        # the restarted daemon can rebind on the same path without
+        # racing the EADDRINUSE window.
+        time.sleep(1)
+
+        # 2. Mutate `sessions.db` directly: drop the session row, which
+        #    leaves the docker container + sandbox-home-<id> volume
+        #    orphaned (no owning row). `foreign_keys = ON` cascades the
+        #    delete through `session_policies` / `policy_rules` /
+        #    `policy_rule_http_filters` (V003+V004 schema).
+        assert os.path.exists(db_path), (
+            f"sessions.db not found at {db_path}; can't synthesise an orphan."
+        )
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute("PRAGMA foreign_keys = ON")
+            cur = conn.execute(
+                "DELETE FROM sessions WHERE id = ?", (sid,)
+            )
+            assert cur.rowcount == 1, (
+                f"expected to delete exactly 1 session row for {sid}; "
+                f"DELETE matched {cur.rowcount} rows."
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        # 3. Restart the daemon with the same socket and base-dir.
+        #    Append to the existing log files (mirrors
+        #    test_m3_networking::test_daemon_restart_recovery) so the
+        #    fixture can adopt the restarted process without leaving a
+        #    dangling pipe behind.
+        stdout_log = sandbox_daemon["_stdout_log"]
+        stderr_log = sandbox_daemon["_stderr_log"]
+        new_stdout_fh = open(stdout_log, "a")
+        new_stderr_fh = open(stderr_log, "a")
+        restarted_proc = subprocess.Popen(
+            [
+                str(sandbox_binaries.sandboxd),
+                "--socket", socket_path,
+                "--base-dir", base_dir,
+            ],
+            stdout=new_stdout_fh,
+            stderr=new_stderr_fh,
+        )
+
+        # Wait for the restarted daemon's socket to reappear.
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if os.path.exists(socket_path):
+                break
+            if restarted_proc.poll() is not None:
+                pytest.fail(
+                    f"Restarted daemon exited early "
+                    f"(code {restarted_proc.returncode}).\n"
+                    f"stdout: {stdout_log.read_text()}\n"
+                    f"stderr: {stderr_log.read_text()}"
+                )
+            time.sleep(0.2)
+        else:
+            restarted_proc.kill()
+            pytest.fail("Restarted daemon socket did not appear within 15s")
+
+        # 4. Allow the boot-time orphan reaper to run. The reaper is
+        #    invoked once during startup before `serve` starts handling
+        #    requests, but `docker rm -f` against the still-running
+        #    container takes a moment; poll instead of a fixed sleep so
+        #    the test fails loudly with a clear "still present" message
+        #    rather than racing flakily.
+        post_containers_listed: list[str] = []
+        post_volumes_listed: list[str] = []
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            ps = subprocess.run(
+                ["docker", "ps", "-a", "--format", "{{.Names}}"],
+                capture_output=True, text=True, timeout=30,
+            )
+            vs = subprocess.run(
+                ["docker", "volume", "ls", "--format", "{{.Name}}"],
+                capture_output=True, text=True, timeout=30,
+            )
+            post_containers_listed = ps.stdout.splitlines()
+            post_volumes_listed = vs.stdout.splitlines()
+            if (
+                container_name not in post_containers_listed
+                and volume_name not in post_volumes_listed
+            ):
+                break
+            time.sleep(1)
+
+        # 5. Assertions: the orphan container AND the orphan home
+        #    volume must both be gone.
+        assert container_name not in post_containers_listed, (
+            f"orphan container {container_name!r} should have been reaped "
+            f"by the boot-time orphan reaper; docker ps -a still lists:\n"
+            f"{post_containers_listed}"
+        )
+        assert volume_name not in post_volumes_listed, (
+            f"orphan home volume {volume_name!r} should have been reaped "
+            f"by the boot-time orphan reaper; docker volume ls still "
+            f"lists:\n{post_volumes_listed}"
+        )
+
+        # 6. Hand the restarted daemon back to the session-scoped
+        #    fixture so subsequent tests (and fixture teardown) run
+        #    against the live process. Without this handoff the rest
+        #    of the suite cascade-fails on a dead socket.
+        sandbox_daemon["process"] = restarted_proc
+        sandbox_daemon["_stdout_fh"] = new_stdout_fh
+        sandbox_daemon["_stderr_fh"] = new_stderr_fh
+        restarted_proc = None  # prevent finally from killing it
+        new_stdout_fh = None
+        new_stderr_fh = None
+
+    finally:
+        # The lite_harness still tracks `sid` in its session list; the
+        # cleanup hook will issue `sandbox rm -y <sid>` against the
+        # restarted daemon, which returns "not found" (the row is
+        # gone), and the harness tolerates that branch — see
+        # `LiteBackendHarness.rm`.
+
+        # Recovery path mirrors test_m3_networking::test_daemon_restart_recovery:
+        # ensure the session-scoped fixture ends the test with a live
+        # daemon process. If our restart never made it that far (e.g. an
+        # assertion fired between SIGKILL and the handoff), spin up a
+        # fresh daemon so subsequent tests don't cascade-fail.
+        if restarted_proc is not None:
+            if restarted_proc.poll() is None:
+                # Alive but not yet handed off — adopt it.
+                sandbox_daemon["process"] = restarted_proc
+                sandbox_daemon["_stdout_fh"] = new_stdout_fh
+                sandbox_daemon["_stderr_fh"] = new_stderr_fh
+                restarted_proc = None
+                new_stdout_fh = None
+                new_stderr_fh = None
+            else:
+                # Restarted daemon died too — fall through to recovery.
+                if new_stdout_fh is not None and not new_stdout_fh.closed:
+                    new_stdout_fh.close()
+                if new_stderr_fh is not None and not new_stderr_fh.closed:
+                    new_stderr_fh.close()
+                restarted_proc = None
+                new_stdout_fh = None
+                new_stderr_fh = None
+
+        if sandbox_daemon["process"].poll() is not None:
+            fresh_stdout_fh = open(sandbox_daemon["_stdout_log"], "a")
+            fresh_stderr_fh = open(sandbox_daemon["_stderr_log"], "a")
+            fresh_proc = subprocess.Popen(
+                [
+                    str(sandbox_binaries.sandboxd),
+                    "--socket", sandbox_daemon["socket"],
+                    "--base-dir", sandbox_daemon["base_dir"],
+                ],
+                stdout=fresh_stdout_fh,
+                stderr=fresh_stderr_fh,
+            )
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if os.path.exists(sandbox_daemon["socket"]):
+                    break
+                if fresh_proc.poll() is not None:
+                    break
+                time.sleep(0.2)
+            sandbox_daemon["process"] = fresh_proc
+            sandbox_daemon["_stdout_fh"] = fresh_stdout_fh
+            sandbox_daemon["_stderr_fh"] = fresh_stderr_fh
