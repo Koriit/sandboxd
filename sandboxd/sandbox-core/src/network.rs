@@ -60,7 +60,7 @@ struct SubnetAllocator {
     /// Base network address, e.g. `10.209.0.0`.
     base: Ipv4Addr,
     /// Prefix length of the base range (e.g. 24). Retained for diagnostics.
-    _prefix_len: u8,
+    prefix_len: u8,
     /// Set of allocated /28 block indices (0..max_blocks).
     allocated: HashSet<u8>,
     /// Maximum number of /28 blocks: 2^(32 - prefix_len) / 16.
@@ -94,7 +94,7 @@ impl SubnetAllocator {
 
         Ok(Self {
             base,
-            _prefix_len: prefix_len,
+            prefix_len,
             allocated: HashSet::new(),
             max_blocks: max_blocks as u8,
         })
@@ -222,7 +222,7 @@ impl NetworkManager {
                 SandboxError::Network(format!(
                     "subnet {} does not map to a valid block in the base range \
                      {}/{} (session {})",
-                    info.subnet, alloc.base, alloc._prefix_len, session_id
+                    info.subnet, alloc.base, alloc.prefix_len, session_id
                 ))
             })?;
             alloc.mark_allocated(block_idx)?;

@@ -827,7 +827,13 @@ impl AsyncWrite for ContainerTransportStream {
 // ---------------------------------------------------------------------------
 
 /// Canonical home-volume name (spec § "Per-session home volume").
-fn home_volume_name(session_id: &SessionId) -> String {
+///
+/// Re-exported from `backend/mod.rs` so the daemon's inspect surface
+/// (`session_mount_info_for`) can reach the same string the runtime
+/// hands to `docker volume create`. Keeping the helper here keeps the
+/// container backend the single source of truth for its own resource
+/// names.
+pub fn home_volume_name(session_id: &SessionId) -> String {
     format!("sandbox-home-{session_id}")
 }
 
@@ -843,7 +849,13 @@ fn format_cpus(cpus: f64) -> String {
 /// by the four standard HTTPS-client trust env vars. Pinned here so the
 /// daemon-side wiring and the unit test that pins the contract share
 /// the same source of truth.
-const SANDBOX_CA_CONTAINER_PATH: &str = "/etc/ssl/certs/sandbox-ca.pem";
+///
+/// Re-exported from `backend/mod.rs` so the daemon's inspect surface
+/// (`session_mount_info_for`) can reach this constant without
+/// mirroring it. Lima sessions inject the CA into the system trust
+/// store via the guest agent rather than via a bind, so this path
+/// applies to the container backend only.
+pub const SANDBOX_CA_CONTAINER_PATH: &str = "/etc/ssl/certs/sandbox-ca.pem";
 
 /// HTTPS-client trust env var names that must point at the per-session
 /// CA file inside the container. Listed in the order `create()` emits

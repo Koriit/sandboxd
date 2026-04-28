@@ -14,9 +14,9 @@ use axum::{
 use clap::Parser;
 use sandbox_core::backend::{
     BackendKind, CliDockerOps, ContainerRuntime, EnsureImageOutcome, LITE_FIRST_USE_WARNING,
-    LimaRuntime, RuntimeHandle, RuntimeStartArgs, SessionRuntime, compute_default_resource_limits,
-    ensure_image, lite_image_tag_for_version, map_container_uid_gid, reap_orphans,
-    rebuild_lite_image,
+    LimaRuntime, RuntimeHandle, RuntimeStartArgs, SANDBOX_CA_CONTAINER_PATH, SessionRuntime,
+    compute_default_resource_limits, ensure_image, home_volume_name, lite_image_tag_for_version,
+    map_container_uid_gid, reap_orphans, rebuild_lite_image,
 };
 use sandbox_core::events::lifecycle as lifecycle_events;
 use sandbox_core::events::session_events_host_dir;
@@ -2438,16 +2438,6 @@ fn session_network_info_for(
 /// already use the same target.
 const SESSION_WORKSPACE_PATH: &str = "/home/agent/workspace/";
 
-/// In-container absolute path where the per-session MITM CA is
-/// bind-mounted read-only by the runtime (`ContainerNetwork::ca_host_path`
-/// → this destination). Mirrors the constant used internally by the
-/// container backend's argv builder; lifting it here as a daemon-side
-/// constant means the inspect surface does not need to reach into the
-/// backend module to render it. Lima sessions inject the CA into the
-/// system trust store via the guest agent rather than via a bind, so
-/// this path applies to the container backend only.
-const CONTAINER_CA_BUNDLE_PATH: &str = "/etc/ssl/certs/sandbox-ca.pem";
-
 /// Build a backend-neutral [`SessionMountInfo`] for a session.
 ///
 /// Container sessions populate every field. Lima sessions populate
@@ -2464,15 +2454,14 @@ fn session_mount_info_for(session: &Session) -> SessionMountInfo {
     };
     let (ca_bundle_path, home_volume) = match session.backend {
         sandbox_core::backend::BackendKind::Container => (
-            Some(CONTAINER_CA_BUNDLE_PATH.to_string()),
+            Some(SANDBOX_CA_CONTAINER_PATH.to_string()),
             // Container backend names the per-session named volume
             // `sandbox-home-{session_id}` (LM6.4 in spec / orphan
-            // reaper's `parse_home_volume_session_id`). Re-deriving
-            // the name here from the session id keeps the inspect
-            // surface independent of the backend module's private
-            // helper while staying byte-identical to the Docker
-            // resource that `docker volume ls` reports.
-            Some(format!("sandbox-home-{}", session.id)),
+            // reaper's `parse_home_volume_session_id`). The helper
+            // is re-exported from the backend module so the inspect
+            // surface stays byte-identical to the Docker resource
+            // that `docker volume ls` reports.
+            Some(home_volume_name(&session.id)),
         ),
         sandbox_core::backend::BackendKind::Lima => (None, None),
     };

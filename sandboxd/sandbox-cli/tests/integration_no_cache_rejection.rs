@@ -64,10 +64,13 @@ async fn spawn_dual_backend_daemon() -> (TempDir, String, SessionsCounter) {
                 // `capabilities_for_container()` in
                 // sandbox-core/backend/container.rs: no nested-virt,
                 // no privileged ops, no raw network, no hardening
-                // flag, no per-session no-cache, and an EMPTY
-                // workspace-modes set (Phase 1B intentionally rejects
-                // both `Shared` and `Clone` until M11-S4/S5 wire the
-                // bind-mount plumbing).
+                // flag, no per-session no-cache. Workspace modes
+                // ship `["shared", "clone"]` post M11-S7 once the
+                // bind-mount + clone-on-container plumbing landed
+                // (Bundle X). The `--no-cache` rejection asserted
+                // by these tests is independent of workspace modes;
+                // the mock is kept spec-accurate so the preflight
+                // does not skip on a malformed capability matrix.
                 Json(json!([
                     {
                         "kind": "lima",
@@ -92,7 +95,7 @@ async fn spawn_dual_backend_daemon() -> (TempDir, String, SessionsCounter) {
                             "raw_network": false,
                             "hardening_flag": false,
                             "per_session_no_cache": false,
-                            "workspace_modes": []
+                            "workspace_modes": ["shared", "clone"]
                         }
                     }
                 ]))

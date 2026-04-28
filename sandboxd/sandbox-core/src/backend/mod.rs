@@ -50,8 +50,8 @@ pub struct BackendInfo {
 }
 pub use container::{
     ContainerNetwork, ContainerRuntime, ContainerTransport, DEFAULT_LITE_IMAGE_TAG,
-    EnsureImageOutcome, LITE_FIRST_USE_WARNING, LITE_IMAGE_REPOSITORY,
-    compute_default_resource_limits, ensure_image, lite_image_tag_for_version,
+    EnsureImageOutcome, LITE_FIRST_USE_WARNING, LITE_IMAGE_REPOSITORY, SANDBOX_CA_CONTAINER_PATH,
+    compute_default_resource_limits, ensure_image, home_volume_name, lite_image_tag_for_version,
     map_container_uid_gid, rebuild_lite_image,
 };
 pub use lima::{LimaRuntime, LimaTransport};

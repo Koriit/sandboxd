@@ -1578,8 +1578,17 @@ provision:
 
 /// Resolve the path to the `sandbox-guest` binary.
 ///
-/// Uses the same logic as the daemon: the guest agent binary is expected
-/// to be in the same directory as the currently running executable.
+/// In production the agent binary lives next to the daemon binary
+/// (e.g. `target/debug/sandbox-guest` alongside `target/debug/sandboxd`,
+/// or `/usr/local/bin/sandbox-guest` next to `/usr/local/bin/sandboxd`).
+/// Under `cargo nextest`, however, `current_exe()` resolves to a test
+/// binary inside `target/debug/deps/<hash>` while `cargo build --bin
+/// sandbox-guest` writes to `target/debug/sandbox-guest` — one level up.
+/// To support integration tests that invoke this path on a clean
+/// `target/`, we look in both locations and return the first that
+/// exists. If neither exists, we fall back to the production-shaped
+/// sibling path so the resulting `SandboxError` from a downstream
+/// open/exec call still names the canonical location.
 pub fn guest_agent_path() -> Result<PathBuf, SandboxError> {
     let exe = std::env::current_exe().map_err(|e| {
         SandboxError::Internal(format!("failed to determine current executable path: {e}"))
@@ -1587,7 +1596,18 @@ pub fn guest_agent_path() -> Result<PathBuf, SandboxError> {
     let dir = exe.parent().ok_or_else(|| {
         SandboxError::Internal("executable path has no parent directory".to_string())
     })?;
-    Ok(dir.join("sandbox-guest"))
+    let primary = dir.join("sandbox-guest");
+    if primary.exists() {
+        return Ok(primary);
+    }
+    // Nextest: `target/debug/deps/<test>` → check `target/debug/`.
+    if let Some(parent) = dir.parent() {
+        let fallback = parent.join("sandbox-guest");
+        if fallback.exists() {
+            return Ok(fallback);
+        }
+    }
+    Ok(primary)
 }
 
 /// Prefix applied to all sandbox VM names.
