@@ -221,8 +221,8 @@ def _probe_gateway_tcp(sandbox_cli, name: str, ip: str, port: int = 53,
     """
     return sandbox_cli(
         "exec", name, "--",
-        "bash", "-c",
-        f"timeout 5 bash -c '</dev/tcp/{ip}/{port}' && echo OK",
+        "timeout", "5", "bash", "-c",
+        f"</dev/tcp/{ip}/{port} && echo OK",
         timeout=timeout,
     )
 
@@ -789,8 +789,8 @@ def test_concurrent_sessions(sandbox_cli, backend):
         )
 
         # 7. Verify no cross-session traffic: session A cannot reach
-        #    session B's gateway. The per-session subnets are isolated
-        #    Docker bridges, so routing between them must not exist.
+        #    session B's gateway. The per-session subnets are isolated,
+        #    so routing between them must not exist.
         #
         #    Lima-only: the gateway's prerouting nftables ruleset
         #    (``sandbox-core/src/gateway.rs:1462-1486``) DNATs every
