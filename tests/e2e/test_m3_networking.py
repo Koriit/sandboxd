@@ -682,8 +682,12 @@ def test_concurrent_sessions(sandbox_cli, backend):
       network.
     * Both sessions can reach their own gateway.
     * Session A cannot reach session B's gateway — the per-session
-      subnets are isolated Docker bridges so routing between them
-      must not exist.
+      subnets are isolated, so routing between them must not exist.
+      (Behaviourally exercised on Lima only; on the container backend
+      the gateway DNAT prerouting rewrites every TCP/UDP packet from
+      the session's own saddr, so cross-session L4 isolation is
+      invisible from inside the session — see step 7's in-line
+      comment for the full rationale.)
 
     Subnet shape (the old ``10.209.x.x/28`` Lima-pool regex) is no
     longer asserted here; the daemon owns the subnet allocator and
