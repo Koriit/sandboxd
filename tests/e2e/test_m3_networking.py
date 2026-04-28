@@ -576,10 +576,6 @@ def test_stop_start_with_networking(sandbox_cli, backend):
 
 
 @pytest.mark.timeout(600)
-@pytest.mark.skipif(
-    os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") < 6 * 1024**3,
-    reason="Requires >= 6GB RAM for concurrent VMs",
-)
 def test_concurrent_sessions(sandbox_cli, backend):
     """Create two sessions and verify network isolation: different IPs/subnets,
     both functional, no cross-session traffic.
@@ -592,6 +588,18 @@ def test_concurrent_sessions(sandbox_cli, backend):
             "different concern (per-session sandbox-net-<id> Docker "
             "networks) and not what this test exercises."
         )
+    # RAM precondition is Lima-only: the test boots two Lima VMs at 2 GB
+    # each, so a 6 GB host floor is required. Container sessions are tens
+    # of MB and have no such precondition; gating the check on
+    # backend == "lima" keeps the container parameterization runnable on
+    # memory-constrained hosts. (The container row is already skipped
+    # above for an unrelated subnet-shape reason — that is a separate
+    # follow-up; this RAM gate must still be Lima-scoped on its own
+    # merits.)
+    if backend == "lima" and (
+        os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") < 6 * 1024**3
+    ):
+        pytest.skip("Requires >= 6GB RAM for concurrent Lima VMs")
     session_id_a = None
     session_id_b = None
     try:
