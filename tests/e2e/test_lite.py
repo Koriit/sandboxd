@@ -39,7 +39,7 @@ from conftest import (
     wait_for_state,
     write_policy_file,
 )
-from helpers import HostResources, LiteBackendHarness, is_rootless_docker
+from helpers import HostResources, LiteBackendHarness
 
 
 # ---------------------------------------------------------------------------
@@ -492,20 +492,6 @@ def test_lite_gateway_parity(lite_harness, sandbox_cli):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(
-    is_rootless_docker(),
-    reason=(
-        "Workspace UID alignment requires default-hardened Docker. "
-        "Rootless Docker remaps uids through /etc/subuid so a file "
-        "written inside the container as host_uid lands on the host "
-        "as a sub-uid; the lite spec forbids userns-remap (§ Workspace "
-        "lines 572-574: 'Do not use userns-remap — that would force "
-        "chown on host files, which is destructive and surprising') "
-        "and rootless Docker is explicitly out of scope (§ Out of "
-        "scope line 1175: 'Lite's target is default-hardened Docker. "
-        "Alternative runtimes are a separate design')."
-    ),
-)
 @pytest.mark.timeout(300)
 def test_lite_workspace_uid_alignment(lite_harness, tmp_path):
     """Spec § "Workspace bind": mounting a host directory as

@@ -9,9 +9,16 @@ sub-uid — the test would fail through no fault of the lite backend.
 
 The lite spec calls out rootless Docker as out of scope (§
 "Out of scope" line 1175: *"Lite's target is **default-hardened
-Docker**. Alternative runtimes are a separate design."*); tests
-guarded by :func:`is_rootless_docker` skip on rootless rigs and run
-as live coverage on the spec's actual target environment.
+Docker**. Alternative runtimes are a separate design."*).
+
+Since M11-S8 the daemon enforces the non-goal at session-create time
+(``RootlessDockerRefused`` returned as HTTP 400), so e2e tests no
+longer skip on rootless hosts — the daemon's refusal is the
+loud-failure signal that the host is operating outside the supported
+envelope. This helper is retained for **assertion-side** uses (e.g.
+flag-flipping ``--force-rootless-docker`` in an e2e harness if/when
+we exercise the escape-hatch path end-to-end), not for skip-side
+gating.
 
 The probe runs ``docker info --format '{{.SecurityOptions}}'`` and
 matches ``name=rootless`` in the resulting list. The result is
