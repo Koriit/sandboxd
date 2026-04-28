@@ -9,7 +9,10 @@ pub mod events_filter;
 pub mod events_query_dto;
 pub mod mapper;
 
-pub use dto::{PolicyDto, PolicyLevelDto, PolicyRuleDto, SessionConfigDto, SessionDto};
+pub use dto::{
+    PolicyDto, PolicyLevelDto, PolicyRuleDto, SessionConfigDto, SessionDto, SessionMountInfo,
+    SessionNetworkInfo,
+};
 pub use event_dto::{
     DenyLoggerEventBodyDto, DenyLoggerEventDto, DenyProtocolDto, DnsEventBodyDto, DnsEventDto,
     EnvoyConnectionDto, EnvoyEventBodyDto, EnvoyEventDto, EventDto, GatewayShutdownReasonDto,

@@ -31,11 +31,12 @@ use sandbox_core::{
     HealthComponent, LdsAckOutcome, LdsStatsProbe, LimaManager, NetworkHealth, NetworkInfo,
     NetworkManager, PersistConfig, PersistentSink, Policy, PolicyApplyStatus, PolicyCompiler,
     PolicyDistributor, SandboxError, Session, SessionConfig, SessionDto, SessionHealth, SessionId,
-    SessionIngestor, SessionState, SessionStore, UpdatePolicyRequest, UsersConfig, VmIpSessionMap,
-    VmStatus, attach_vm_to_bridge, bind_gate_listener, detach_vm_from_bridge,
-    generate_ca_inject_script, generate_domain_ip_rules, hash_policy, load_users_config,
-    mac_from_session_id, propagate_dns_changes, read_resolved_json, remove_gate_socket,
-    serve_gate_listener, users_conf_path, wait_for_lds_ack, write_file_to_container,
+    SessionIngestor, SessionMountInfo, SessionNetworkInfo, SessionState, SessionStore,
+    UpdatePolicyRequest, UsersConfig, VmIpSessionMap, VmStatus, attach_vm_to_bridge,
+    bind_gate_listener, detach_vm_from_bridge, generate_ca_inject_script, generate_domain_ip_rules,
+    hash_policy, load_users_config, mac_from_session_id, propagate_dns_changes, read_resolved_json,
+    remove_gate_socket, serve_gate_listener, users_conf_path, wait_for_lds_ack,
+    write_file_to_container,
 };
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
@@ -2224,10 +2225,108 @@ async fn get_session(
         policies.get(&session.id).cloned()
     };
 
+    // Backend-neutral network/mount surfaces (M11-S7 Bundle Y / todo
+    // #72). Both pull from already-canonical sources: `network` from
+    // the persisted `NetworkInfo`, `mounts` from the session's own
+    // `config.workspace_mode` plus a small per-backend constant set
+    // (workspace path, CA bind path, home-volume name). Surfacing
+    // them here lets `sandbox inspect` consumers and the e2e suite
+    // assert on session-level networking/mount layout without
+    // reaching into backend-specific call sites.
+    let network = session_network_info_for(&state, &session.id);
+    let mounts = Some(session_mount_info_for(&session));
+
     let dto = SessionDto::from(&session)
         .with_status(agent_status, gateway_status)
-        .with_policy(policy_opt.as_ref());
+        .with_policy(policy_opt.as_ref())
+        .with_network(network)
+        .with_mounts(mounts);
     (StatusCode::OK, Json(dto)).into_response()
+}
+
+/// Build a backend-neutral [`SessionNetworkInfo`] for the given
+/// session id by reading the daemon's persisted `NetworkInfo`.
+///
+/// Returns `None` when no `NetworkInfo` is recorded for the session
+/// (e.g. mid-create state, or a record from a daemon version that
+/// failed before networking was persisted) or when the store read
+/// itself fails — `inspect` is read-only and degrades gracefully
+/// rather than failing the whole response over a missing networking
+/// row. The store error is logged at warn level so operators can
+/// still trace it through the daemon log.
+fn session_network_info_for(
+    state: &Arc<AppState>,
+    session_id: &SessionId,
+) -> Option<SessionNetworkInfo> {
+    match state.store.get_network_info(session_id) {
+        Ok(Some(ni)) => Some(SessionNetworkInfo {
+            gateway_ip: ni.gateway_ip,
+            session_ip: ni.vm_ip,
+            session_subnet_cidr: ni.subnet,
+        }),
+        Ok(None) => None,
+        Err(e) => {
+            warn!(
+                session_id = %session_id,
+                error = %e,
+                "failed to load network_info for inspect; surfacing absent network block"
+            );
+            None
+        }
+    }
+}
+
+/// In-session absolute path of the workspace, unified across backends
+/// post Bundle X (M11-S7). Both Lima and container plant the
+/// workspace at this path; the `WorkspaceMode::Shared` host bind and
+/// the `WorkspaceMode::Clone` `git clone <url> <path>` invocations
+/// already use the same target.
+const SESSION_WORKSPACE_PATH: &str = "/home/agent/workspace/";
+
+/// In-container absolute path where the per-session MITM CA is
+/// bind-mounted read-only by the runtime (`ContainerNetwork::ca_host_path`
+/// → this destination). Mirrors the constant used internally by the
+/// container backend's argv builder; lifting it here as a daemon-side
+/// constant means the inspect surface does not need to reach into the
+/// backend module to render it. Lima sessions inject the CA into the
+/// system trust store via the guest agent rather than via a bind, so
+/// this path applies to the container backend only.
+const CONTAINER_CA_BUNDLE_PATH: &str = "/etc/ssl/certs/sandbox-ca.pem";
+
+/// Build a backend-neutral [`SessionMountInfo`] for a session.
+///
+/// Container sessions populate every field. Lima sessions populate
+/// `workspace_path` always, `workspace_host_path` only for
+/// `WorkspaceMode::Shared`, and leave `ca_bundle_path` /
+/// `home_volume` `None` because Lima's CA injection and home
+/// directory are not bind-/volume-backed (the guest agent installs
+/// the CA into the system trust store; home is a regular VM
+/// directory).
+fn session_mount_info_for(session: &Session) -> SessionMountInfo {
+    let workspace_host_path = match &session.config.workspace_mode {
+        Some(sandbox_core::WorkspaceMode::Shared { host_path }) => Some(host_path.clone()),
+        _ => None,
+    };
+    let (ca_bundle_path, home_volume) = match session.backend {
+        sandbox_core::backend::BackendKind::Container => (
+            Some(CONTAINER_CA_BUNDLE_PATH.to_string()),
+            // Container backend names the per-session named volume
+            // `sandbox-home-{session_id}` (LM6.4 in spec / orphan
+            // reaper's `parse_home_volume_session_id`). Re-deriving
+            // the name here from the session id keeps the inspect
+            // surface independent of the backend module's private
+            // helper while staying byte-identical to the Docker
+            // resource that `docker volume ls` reports.
+            Some(format!("sandbox-home-{}", session.id)),
+        ),
+        sandbox_core::backend::BackendKind::Lima => (None, None),
+    };
+    SessionMountInfo {
+        workspace_path: SESSION_WORKSPACE_PATH.to_string(),
+        workspace_host_path,
+        ca_bundle_path,
+        home_volume,
+    }
 }
 
 async fn start_session(

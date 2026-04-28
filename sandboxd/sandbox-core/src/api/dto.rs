@@ -73,6 +73,105 @@ pub struct SessionDto {
     /// (defaults to Lima, matching the implicit pre-M11 contract).
     #[serde(default)]
     pub backend: BackendKind,
+    /// Backend-neutral session networking summary. Populated by
+    /// `GET /sessions/{id}` from the daemon's persisted `NetworkInfo`
+    /// (the same source `SessionStore::get_network_info` exposes
+    /// internally). For both backends the fields carry the same
+    /// meaning — only the *values* shift per backend (Lima: VM-side
+    /// `eth1` IP / per-session /28; container: container IP on
+    /// `sandbox-net-<id>`).
+    ///
+    /// Optional at the wrapper level so the response cleanly omits
+    /// the block for sessions that don't yet have networking
+    /// allocated (e.g. transient `Created`/`Error` states without a
+    /// persisted `network_info`). Inside the struct each field is
+    /// non-`Option` because they are populated together from the
+    /// same `NetworkInfo` row — splitting their availability would
+    /// only model an impossible state. Additive on the wire:
+    /// pre-Wave-2 records that lack the field round-trip via
+    /// `#[serde(default)]`; older clients reading a newer response
+    /// silently ignore the unknown key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<SessionNetworkInfo>,
+    /// Backend-neutral session mount surface. Surfaces the in-session
+    /// workspace path, the host-side bind source (when the session
+    /// was created with `--workspace shared:<path>`), the in-session
+    /// CA bundle path (container-only — Lima injects the CA into the
+    /// system trust store via the guest agent, not as a bind-mount),
+    /// and the named home volume (container-only — Lima has its own
+    /// home semantics). Same `Option` + `#[serde(default)]` shape as
+    /// `network` above; fields that don't apply to a given backend
+    /// stay `None` rather than carrying a placeholder string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mounts: Option<SessionMountInfo>,
+}
+
+/// Backend-neutral per-session networking summary surfaced on the
+/// wire by `GET /sessions/{id}`.
+///
+/// All three fields are sourced from the daemon's persisted
+/// [`crate::network::NetworkInfo`] for the session — they are
+/// allocated together at create-time and never independently, so the
+/// struct is "all-or-nothing" (either populated as a complete unit
+/// inside `Some(_)`, or absent via `None` on the parent
+/// [`SessionDto::network`]).
+///
+/// The field *names* are deliberately backend-neutral. Lima carries
+/// the VM's `eth1` IP in `session_ip`; container carries the
+/// container's IP on `sandbox-net-<id>` in the same field. Operators
+/// (and tests) read `session_ip` regardless of backend, which is the
+/// whole point of surfacing this — todo #72 was filed because
+/// `test_m3_networking` hard-coded the Lima `10.209.x.x/28` shape
+/// and skipped the container parameterization in-body.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionNetworkInfo {
+    /// Per-session gateway container IP (the `.2` in each /28). Same
+    /// value on both backends.
+    pub gateway_ip: String,
+    /// Session-side IP. Lima: VM `eth1` static IP (`.3` in the /28).
+    /// Container: container IP on `sandbox-net-<id>` (also `.3`).
+    pub session_ip: String,
+    /// CIDR of the per-session /28 block, e.g. `"10.209.0.0/28"`.
+    /// Backend-agnostic; tests use this in lieu of an IP-shape regex.
+    pub session_subnet_cidr: String,
+}
+
+/// Backend-neutral per-session mount-surface summary surfaced on the
+/// wire by `GET /sessions/{id}`.
+///
+/// Operators and tests use this to assert on the workspace bind layout
+/// without reaching into backend-specific code paths. Each field
+/// carries the same meaning across backends; fields whose mechanism
+/// only applies to one backend are `Option<String>` and stay `None` on
+/// the other.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionMountInfo {
+    /// In-session absolute path of the workspace. Unified across
+    /// backends post Bundle X (M11-S7) — both Lima and container use
+    /// `/home/agent/workspace/`.
+    pub workspace_path: String,
+    /// Absolute host path bound into the session at `workspace_path`.
+    /// Set only when the session was created with
+    /// `--workspace shared:<host_path>` (rendered on the wire as
+    /// `workspace_mode: "shared:<path>"` on `SessionConfigDto`); for
+    /// `WorkspaceMode::Clone` and the unset case the daemon does not
+    /// bind any host directory and this stays `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_host_path: Option<String>,
+    /// In-session absolute path of the per-session MITM CA bundle.
+    /// Container: `/etc/ssl/certs/sandbox-ca.pem` (bind-mounted
+    /// read-only by the runtime). Lima: `None` — the guest agent
+    /// installs the CA into the system trust store
+    /// (`/usr/local/share/ca-certificates/sandbox-ca.crt` plus
+    /// `update-ca-certificates`) rather than via a bind, so there is
+    /// no daemon-controlled mount path to surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_bundle_path: Option<String>,
+    /// Named Docker volume that backs `/home/agent` for container
+    /// sessions (`sandbox-home-{session_id}`). Lima: `None` — VM
+    /// home semantics are not volume-backed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_volume: Option<String>,
 }
 
 /// Wire representation of a session's resource configuration.

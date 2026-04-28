@@ -11,7 +11,8 @@ use hyper::Request;
 use hyper_util::rt::TokioIo;
 use sandbox_core::{
     ApiError, EventDto, ExecResponse, Policy, PolicyDto, PolicyLevelDto, PolicyRule, PolicyRuleDto,
-    PropagationStatusResponse, SessionDto, SessionHealth, UpdatePolicyRequest,
+    PropagationStatusResponse, SessionDto, SessionHealth, SessionMountInfo, SessionNetworkInfo,
+    UpdatePolicyRequest,
 };
 use tokio::net::UnixStream;
 
@@ -1237,6 +1238,10 @@ enum CapabilitiesLookup {
 /// - header block (Session, Name, State, **Backend**, Created, Updated)
 /// - `Config:` block
 /// - `Runtime:` block
+/// - `Network:` block — backend-neutral gateway IP, session IP, and
+///   per-session /28 CIDR (M11-S7 Bundle Y / todo #72).
+/// - `Mounts:` block — backend-neutral workspace path, host bind
+///   source, CA bundle path, and home volume (M11-S7 Bundle Y).
 /// - `Policy:` block — either `Policy: none` or a version/count header
 ///   followed by one indented rule entry per rule.
 /// - `Capabilities:` block (only when `verbose_caps` is `Some`) showing
@@ -1343,6 +1348,9 @@ fn render_describe_one(
     );
     out.push('\n');
 
+    render_network_block(session.network.as_ref(), out);
+    render_mounts_block(session.mounts.as_ref(), out);
+
     render_policy_block(session.policy.as_ref(), out);
 
     if let Some(caps) = verbose_caps {
@@ -1418,6 +1426,70 @@ fn render_workspace_modes(caps: &sandbox_core::Capabilities) -> String {
         parts.push("clone");
     }
     parts.join(", ")
+}
+
+/// Render the backend-neutral session networking block (M11-S7
+/// Bundle Y / todo #72). Always emitted so operators see a stable
+/// `Network:` heading per session block; missing data renders as
+/// `none` (matching the `Policy: none` shape) rather than absent.
+///
+/// Field labels mirror the spec's "operator-readable" naming so a
+/// human reader and the e2e suite parse the same surface — the e2e
+/// suite uses the JSON output of `sandbox inspect`, so the field
+/// *contents* (IPs / CIDR strings) are what matters for tests; the
+/// label format here is purely for `sandbox describe`.
+fn render_network_block(network: Option<&SessionNetworkInfo>, out: &mut String) {
+    use std::fmt::Write as _;
+    match network {
+        None => {
+            let _ = writeln!(out, "Network: none");
+        }
+        Some(n) => {
+            let _ = writeln!(out, "Network:");
+            let _ = writeln!(out, "  Gateway IP:  {}", n.gateway_ip);
+            let _ = writeln!(out, "  Session IP:  {}", n.session_ip);
+            let _ = writeln!(out, "  Subnet:      {}", n.session_subnet_cidr);
+        }
+    }
+    out.push('\n');
+}
+
+/// Render the backend-neutral session mount-surface block (M11-S7
+/// Bundle Y). Same emission contract as [`render_network_block`]:
+/// always emitted, with `none` fallback when the daemon has no
+/// mount info to surface.
+///
+/// `workspace_host_path`, `ca_bundle_path`, and `home_volume` are
+/// `Option<String>` on the wire and render as `-` when absent so
+/// each row stays present (operators never have to wonder if a row
+/// is missing because of a bug).
+fn render_mounts_block(mounts: Option<&SessionMountInfo>, out: &mut String) {
+    use std::fmt::Write as _;
+    match mounts {
+        None => {
+            let _ = writeln!(out, "Mounts: none");
+        }
+        Some(m) => {
+            let _ = writeln!(out, "Mounts:");
+            let _ = writeln!(out, "  Workspace:        {}", m.workspace_path);
+            let _ = writeln!(
+                out,
+                "  Workspace host:   {}",
+                m.workspace_host_path.as_deref().unwrap_or("-")
+            );
+            let _ = writeln!(
+                out,
+                "  CA bundle:        {}",
+                m.ca_bundle_path.as_deref().unwrap_or("-")
+            );
+            let _ = writeln!(
+                out,
+                "  Home volume:      {}",
+                m.home_volume.as_deref().unwrap_or("-")
+            );
+        }
+    }
+    out.push('\n');
 }
 
 fn render_policy_block(policy: Option<&PolicyDto>, out: &mut String) {
@@ -5101,6 +5173,8 @@ mod tests {
             policy,
             warnings: Vec::new(),
             backend: sandbox_core::backend::BackendKind::Lima,
+            network: None,
+            mounts: None,
         }
     }
 

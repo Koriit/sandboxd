@@ -10,21 +10,19 @@ Run with generous timeouts:
     source .venv/bin/activate
     python -m pytest test_m3_networking.py -v --timeout=600
 
-Backend coverage: **mixed** — most tests are parametrized over
-``[lima, container]`` via the ``backend`` fixture (the gateway
+Backend coverage: every test in this file is parametrized over
+``[lima, container]`` via the ``backend`` fixture. The gateway
 container, nftables ruleset, CoreDNS interception, and daemon /
 gateway crash-recovery monitors are shared between backends per the
-M11 gap-#70 closure). A subset asserts on the Lima-specific
-``10.209.x.x/28`` subnet shape and skip themselves on the container
-backend with an explicit ``pytest.skip()`` call:
-
-* ``test_gateway_traffic_flow``        — asserts 10.209.x.x VM IP + gateway ping.
-* ``test_stop_start_with_networking``  — same 10.209.x.x assertion.
-* ``test_concurrent_sessions``         — concurrent VMs, hardcoded subnet.
-
-These three are Lima-only **as written**; an agnostic refactor (replace
-the subnet regex with a ``sandbox info``-derived gateway IP) is a
-follow-up the M11 plan does not require for Phase 5C.
+M11 gap-#70 closure. The three tests previously pinned to Lima via an
+in-body ``pytest.skip()`` for the ``10.209.x.x/28`` regex —
+``test_gateway_traffic_flow``, ``test_stop_start_with_networking``,
+``test_concurrent_sessions`` — now read the gateway / session IP /
+subnet CIDR from ``sandbox inspect <name>`` (M11-S7 Bundle Y / todo
+#72) and run on both backends. The Lima-only RAM precondition in
+``test_concurrent_sessions`` (two 2 GB Lima VMs require ≥6 GB host
+RAM; container sessions are tens of MB) remains scoped to
+``backend == "lima"``.
 """
 
 from __future__ import annotations
@@ -42,7 +40,6 @@ from conftest import (
     capture_lima_logs,
     cleanup_policy_file,
     gateway_container_name,
-    lima_vm_name,
     make_create_args,
     parse_session_id,
     wait_for_state,
@@ -129,6 +126,56 @@ def docker_container_exists(container_name: str) -> bool:
     return result.returncode == 0
 
 
+def inspect_session_network(sandbox_cli, name: str) -> dict:
+    """Fetch a session's backend-neutral network block via `sandbox inspect`.
+
+    `sandbox inspect <name>` emits a JSON array of one ``SessionDto`` per
+    argument (one element here). The DTO carries a ``network`` object
+    populated by the daemon's ``GET /sessions/{id}`` handler with the
+    session's gateway IP, session-side IP, and per-session /28 CIDR —
+    same field names for both backends, so backend-parametrized tests
+    can read the operationally-equivalent values without backend-shape
+    regexes.
+
+    Returns the ``network`` sub-object verbatim. Asserts (rather than
+    skipping) on a missing block: the three Y.3 callers all create a
+    session and then read its network info, so a missing block here is
+    a daemon bug to surface, not a runtime quirk to paper over.
+    """
+    result = sandbox_cli("inspect", name, timeout=60)
+    assert result.returncode == 0, (
+        f"sandbox inspect {name} failed (rc={result.returncode}).\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    payload = json.loads(result.stdout)
+    assert isinstance(payload, list) and len(payload) == 1, (
+        f"sandbox inspect must emit a JSON array of one element; got: {payload!r}"
+    )
+    dto = payload[0]
+    assert "network" in dto, (
+        f"SessionDto must surface a `network` block via inspect; got keys "
+        f"{sorted(dto.keys())}"
+    )
+    net = dto["network"]
+    for key in ("gateway_ip", "session_ip", "session_subnet_cidr"):
+        assert key in net, (
+            f"SessionDto.network missing `{key}`; got keys {sorted(net.keys())}"
+        )
+    return net
+
+
+def _ip_in_cidr(ip: str, cidr: str) -> bool:
+    """Return True if ``ip`` falls inside ``cidr`` (e.g. ``10.209.0.0/28``).
+
+    Uses the stdlib ``ipaddress`` module so the helper is backend-neutral
+    (works for any /N block, not just the Lima-default /28). Imported
+    lazily so the import is colocated with its only consumer here, the
+    cross-session isolation assertion in ``test_concurrent_sessions``.
+    """
+    import ipaddress
+    return ipaddress.ip_address(ip) in ipaddress.ip_network(cidr, strict=False)
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -136,17 +183,13 @@ def docker_container_exists(container_name: str) -> bool:
 @pytest.mark.timeout(600)
 def test_gateway_traffic_flow(sandbox_cli, backend):
     """Create a session and verify the full gateway networking pipeline:
-    gateway container running, VM has second NIC, can ping gateway, DNS works.
+    gateway container running, session can reach gateway, DNS works.
+
+    Backend-neutral: gateway IP is read from ``sandbox inspect`` (the
+    daemon-side network block populated for both backends from the
+    same persisted ``NetworkInfo`` row), not from a regex against
+    in-VM ``ip addr`` output.
     """
-    if backend == "container":
-        pytest.skip(
-            "Lima-only: assertion pins the VM IP to the 10.209.x.x/28 "
-            "Lima subnet shape and pings the per-VM gateway IP. The lite "
-            "container backend uses a per-session sandbox-net-<id> "
-            "Docker network and a different IP scheme; an agnostic "
-            "refactor (use sandbox info / inspect for the gateway IP) "
-            "is a follow-up not in M11 scope."
-        )
     session_id = None
     policy_path = None
     try:
@@ -164,7 +207,6 @@ def test_gateway_traffic_flow(sandbox_cli, backend):
         )
         session_id = parse_session_id(result.stdout)
         gw_container = gateway_container_name(session_id)
-        vm_name = lima_vm_name(session_id)
 
         wait_for_state(sandbox_cli, "net-flow-test", "Running", timeout=10)
 
@@ -174,54 +216,45 @@ def test_gateway_traffic_flow(sandbox_cli, backend):
             f"Docker ps: {subprocess.run(['docker', 'ps', '-a'], capture_output=True, text=True, timeout=30).stdout}"
         )
 
-        # 3. Verify VM has a second NIC (eth1) with an IP in the 10.209.x.x range.
-        #    The guest agent configures eth1 with the VM's IP (.3 in the /28).
-        exec_result = sandbox_cli(
-            "exec", "net-flow-test", "--", "ip", "-4", "addr", "show",
-            timeout=120,
+        # 3. Pull the gateway / session IPs and the session subnet CIDR
+        #    from `sandbox inspect`. The daemon's `network` block is
+        #    populated from the persisted `NetworkInfo` row for both
+        #    backends, so the field names and meanings are the same
+        #    regardless of `backend`.
+        net = inspect_session_network(sandbox_cli, "net-flow-test")
+        gateway_ip = net["gateway_ip"]
+        session_ip = net["session_ip"]
+        subnet_cidr = net["session_subnet_cidr"]
+
+        assert _ip_in_cidr(session_ip, subnet_cidr), (
+            f"session_ip {session_ip} must fall inside the session's "
+            f"subnet {subnet_cidr}; inspect block: {net!r}"
         )
-        assert exec_result.returncode == 0, (
-            f"Failed to get IP addresses from VM.\n"
-            f"stdout: {exec_result.stdout}\nstderr: {exec_result.stderr}"
-        )
-        # Look for a 10.209.x.x IP on any interface (the hot-added NIC).
-        assert re.search(r"10\.209\.\d+\.\d+", exec_result.stdout), (
-            f"VM does not have a 10.209.x.x IP address.\n"
-            f"ip addr output:\n{exec_result.stdout}"
+        assert _ip_in_cidr(gateway_ip, subnet_cidr), (
+            f"gateway_ip {gateway_ip} must fall inside the session's "
+            f"subnet {subnet_cidr}; inspect block: {net!r}"
         )
 
-        # 4. Extract the gateway IP (the .2 in the /28 subnet).
-        # Parse the VM IP from ip addr output; gateway is VM_IP - 1.
-        vm_ip_match = re.search(r"(10\.209\.\d+\.\d+)/28", exec_result.stdout)
-        assert vm_ip_match, (
-            f"Could not find VM IP with /28 prefix in ip addr output.\n"
-            f"Output:\n{exec_result.stdout}"
-        )
-        vm_ip = vm_ip_match.group(1)
-        # VM is .3, gateway is .2.
-        octets = vm_ip.split(".")
-        gateway_ip = f"{octets[0]}.{octets[1]}.{octets[2]}.{int(octets[3]) - 1}"
-
-        # 5. Verify VM can ping the gateway IP.
+        # 4. Verify the session can ping its gateway IP.
         ping_result = sandbox_cli(
             "exec", "net-flow-test", "--",
             "ping", "-c", "3", "-W", "5", gateway_ip,
             timeout=120,
         )
         assert ping_result.returncode == 0, (
-            f"VM cannot ping gateway {gateway_ip}.\n"
+            f"Session cannot ping gateway {gateway_ip}.\n"
             f"stdout: {ping_result.stdout}\nstderr: {ping_result.stderr}\n"
             f"{capture_lima_logs(session_id)}"
         )
 
-        # 6. Verify DNS works from VM via gateway's CoreDNS.
+        # 5. Verify DNS works from the session via gateway's CoreDNS.
         dns_result = sandbox_cli(
             "exec", "net-flow-test", "--",
             "nslookup", "google.com",
             timeout=120,
         )
         assert dns_result.returncode == 0, (
-            f"DNS lookup failed inside VM.\n"
+            f"DNS lookup failed inside session.\n"
             f"stdout: {dns_result.stdout}\nstderr: {dns_result.stderr}"
         )
         # nslookup should return at least one address.
@@ -230,7 +263,7 @@ def test_gateway_traffic_flow(sandbox_cli, backend):
             f"nslookup output:\n{dns_result.stdout}"
         )
 
-        # 7. Clean up.
+        # 6. Clean up.
         sandbox_cli("rm", "net-flow-test", timeout=120)
         session_id = None
 
@@ -451,15 +484,11 @@ def test_dns_interception(sandbox_cli, backend):
 def test_stop_start_with_networking(sandbox_cli, backend):
     """Create a session, verify networking, stop, verify gateway gone,
     start, verify persistence and networking restoration.
+
+    Backend-neutral: gateway IP is read from ``sandbox inspect`` (M11-S7
+    Bundle Y / todo #72) so the same assertion shape works for both
+    Lima and container sessions.
     """
-    if backend == "container":
-        pytest.skip(
-            "Lima-only: assertion pins the VM IP to the 10.209.x.x/28 "
-            "Lima subnet shape and pings the per-VM gateway IP. The "
-            "stop/start lifecycle on lite is independently covered by "
-            "test_lite.py::test_lite_stop_start_persistence; an agnostic "
-            "refactor of this test is a follow-up not in M11 scope."
-        )
     session_id = None
     policy_path = None
     try:
@@ -479,20 +508,17 @@ def test_stop_start_with_networking(sandbox_cli, backend):
         gw_container = gateway_container_name(session_id)
         wait_for_state(sandbox_cli, "net-restart-test", "Running", timeout=10)
 
-        # 2. Get the gateway IP for later verification.
-        exec_result = sandbox_cli(
-            "exec", "net-restart-test", "--", "ip", "-4", "addr", "show",
-            timeout=120,
+        # 2. Pull the gateway IP from `sandbox inspect`. The daemon
+        #    surfaces a backend-neutral `network` block populated from
+        #    the persisted `NetworkInfo` row; we use it instead of an
+        #    in-VM `ip addr` regex so the test runs on both backends.
+        net = inspect_session_network(sandbox_cli, "net-restart-test")
+        gateway_ip = net["gateway_ip"]
+        subnet_cidr = net["session_subnet_cidr"]
+        assert _ip_in_cidr(gateway_ip, subnet_cidr), (
+            f"gateway_ip {gateway_ip} must fall inside session's "
+            f"subnet {subnet_cidr}; inspect block: {net!r}"
         )
-        assert exec_result.returncode == 0
-        vm_ip_match = re.search(r"(10\.209\.\d+\.\d+)/28", exec_result.stdout)
-        assert vm_ip_match, (
-            f"Could not find VM IP with /28 prefix.\n"
-            f"Output:\n{exec_result.stdout}"
-        )
-        vm_ip = vm_ip_match.group(1)
-        octets = vm_ip.split(".")
-        gateway_ip = f"{octets[0]}.{octets[1]}.{octets[2]}.{int(octets[3]) - 1}"
 
         # 3. Write a file inside VM to verify persistence across stop/start.
         #    Use home dir, not /tmp (tmpfs, cleared on reboot).
@@ -542,14 +568,29 @@ def test_stop_start_with_networking(sandbox_cli, backend):
             f"Expected 'net-persist-marker', got: {read_result.stdout.strip()!r}"
         )
 
-        # 8. Verify networking works again: ping gateway.
+        # 8. Verify networking works again: ping gateway. Also re-pull
+        #    the network block via `sandbox inspect` and assert it
+        #    surfaces the same gateway IP / subnet — the daemon
+        #    re-uses the same persisted /28 block on stop/start
+        #    (NetworkManager keeps the subnet allocation across the
+        #    pair of `delete_network`/`ensure_network` calls), so any
+        #    drift here is a daemon-side regression.
+        post_restart_net = inspect_session_network(sandbox_cli, "net-restart-test")
+        assert post_restart_net["gateway_ip"] == gateway_ip, (
+            f"gateway IP changed across stop/start: "
+            f"pre={gateway_ip!r}, post={post_restart_net['gateway_ip']!r}"
+        )
+        assert post_restart_net["session_subnet_cidr"] == subnet_cidr, (
+            f"session subnet changed across stop/start: "
+            f"pre={subnet_cidr!r}, post={post_restart_net['session_subnet_cidr']!r}"
+        )
         ping_result = sandbox_cli(
             "exec", "net-restart-test", "--",
             "ping", "-c", "3", "-W", "5", gateway_ip,
             timeout=120,
         )
         assert ping_result.returncode == 0, (
-            f"VM cannot ping gateway {gateway_ip} after restart.\n"
+            f"Session cannot ping gateway {gateway_ip} after restart.\n"
             f"stdout: {ping_result.stdout}\nstderr: {ping_result.stderr}"
         )
 
@@ -577,25 +618,29 @@ def test_stop_start_with_networking(sandbox_cli, backend):
 
 @pytest.mark.timeout(600)
 def test_concurrent_sessions(sandbox_cli, backend):
-    """Create two sessions and verify network isolation: different IPs/subnets,
-    both functional, no cross-session traffic.
+    """Create two sessions and verify network isolation.
+
+    Backend-neutral isolation property (M11-S7 Bundle Y / todo #72):
+
+    * Session A's session/gateway IPs are NOT inside session B's
+      subnet (and vice versa) — each session lives in a distinct /28
+      block, regardless of whether the underlying carrier is a Lima
+      Docker bridge or a per-session ``sandbox-net-<id>`` container
+      network.
+    * Both sessions can reach their own gateway.
+    * Session A cannot reach session B's gateway — the per-session
+      subnets are isolated Docker bridges so routing between them
+      must not exist.
+
+    Subnet shape (the old ``10.209.x.x/28`` Lima-pool regex) is no
+    longer asserted here; the daemon owns the subnet allocator and
+    `sandbox inspect` surfaces whatever it picked per backend.
     """
-    if backend == "container":
-        pytest.skip(
-            "Lima-only: assertion pins both VM IPs to the 10.209.x.x/28 "
-            "Lima subnet pool and verifies subnet isolation by pattern. "
-            "Network isolation between lite container sessions is a "
-            "different concern (per-session sandbox-net-<id> Docker "
-            "networks) and not what this test exercises."
-        )
     # RAM precondition is Lima-only: the test boots two Lima VMs at 2 GB
     # each, so a 6 GB host floor is required. Container sessions are tens
     # of MB and have no such precondition; gating the check on
     # backend == "lima" keeps the container parameterization runnable on
-    # memory-constrained hosts. (The container row is already skipped
-    # above for an unrelated subnet-shape reason — that is a separate
-    # follow-up; this RAM gate must still be Lima-scoped on its own
-    # merits.)
+    # memory-constrained hosts.
     if backend == "lima" and (
         os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") < 6 * 1024**3
     ):
@@ -627,55 +672,50 @@ def test_concurrent_sessions(sandbox_cli, backend):
         session_id_b = parse_session_id(result_b.stdout)
         wait_for_state(sandbox_cli, "net-multi-b", "Running", timeout=10)
 
-        # 3. Get IPs for both sessions.
-        ip_a = sandbox_cli(
-            "exec", "net-multi-a", "--", "ip", "-4", "addr", "show",
-            timeout=120,
-        )
-        assert ip_a.returncode == 0
-        ip_b = sandbox_cli(
-            "exec", "net-multi-b", "--", "ip", "-4", "addr", "show",
-            timeout=120,
-        )
-        assert ip_b.returncode == 0
+        # 3. Pull the network block for each session via `sandbox inspect`.
+        net_a = inspect_session_network(sandbox_cli, "net-multi-a")
+        net_b = inspect_session_network(sandbox_cli, "net-multi-b")
+        gw_ip_a = net_a["gateway_ip"]
+        gw_ip_b = net_b["gateway_ip"]
+        session_ip_a = net_a["session_ip"]
+        session_ip_b = net_b["session_ip"]
+        subnet_a = net_a["session_subnet_cidr"]
+        subnet_b = net_b["session_subnet_cidr"]
 
-        # Extract the 10.209.x.x IPs.
-        match_a = re.search(r"(10\.209\.\d+\.\d+)/28", ip_a.stdout)
-        match_b = re.search(r"(10\.209\.\d+\.\d+)/28", ip_b.stdout)
-        assert match_a, (
-            f"Session A does not have a 10.209.x.x/28 IP.\n"
-            f"ip addr output:\n{ip_a.stdout}"
+        # 4. Self-consistency: each session's gateway / session IP
+        #    must fall inside its own subnet.
+        assert _ip_in_cidr(session_ip_a, subnet_a) and _ip_in_cidr(gw_ip_a, subnet_a), (
+            f"session A's IPs do not fall inside its subnet; "
+            f"network block: {net_a!r}"
         )
-        assert match_b, (
-            f"Session B does not have a 10.209.x.x/28 IP.\n"
-            f"ip addr output:\n{ip_b.stdout}"
+        assert _ip_in_cidr(session_ip_b, subnet_b) and _ip_in_cidr(gw_ip_b, subnet_b), (
+            f"session B's IPs do not fall inside its subnet; "
+            f"network block: {net_b!r}"
         )
 
-        vm_ip_a = match_a.group(1)
-        vm_ip_b = match_b.group(1)
-
-        # 4. Verify different subnets (the /28 blocks should differ).
-        #    With /28 subnets, the third octet or the block offset differs.
-        assert vm_ip_a != vm_ip_b, (
-            f"Both sessions have the same IP: {vm_ip_a}"
+        # 5. Subnet-isolation property: session A's IPs must NOT fall
+        #    inside session B's subnet (and vice versa). Replaces the
+        #    old `10.209.x.x/28`-shaped block-index comparison with a
+        #    backend-neutral CIDR-membership check.
+        assert subnet_a != subnet_b, (
+            f"Both sessions landed in the same subnet: {subnet_a!r}"
         )
-        # Check that they're in different /28 blocks by comparing the
-        # network portion. In a /28, the last octet's upper nibble
-        # determines the block.
-        octets_a = [int(o) for o in vm_ip_a.split(".")]
-        octets_b = [int(o) for o in vm_ip_b.split(".")]
-        block_a = octets_a[3] // 16
-        block_b = octets_b[3] // 16
-        # If they share the same first 3 octets, blocks must differ.
-        if octets_a[:3] == octets_b[:3]:
-            assert block_a != block_b, (
-                f"Sessions are in the same /28 block: "
-                f"A={vm_ip_a} (block {block_a}), B={vm_ip_b} (block {block_b})"
-            )
-
-        # 5. Compute gateway IPs (VM is .3, gateway is .2).
-        gw_ip_a = f"{octets_a[0]}.{octets_a[1]}.{octets_a[2]}.{octets_a[3] - 1}"
-        gw_ip_b = f"{octets_b[0]}.{octets_b[1]}.{octets_b[2]}.{octets_b[3] - 1}"
+        assert not _ip_in_cidr(session_ip_a, subnet_b), (
+            f"Session A's session_ip {session_ip_a} falls inside session B's "
+            f"subnet {subnet_b}; subnets must be disjoint."
+        )
+        assert not _ip_in_cidr(gw_ip_a, subnet_b), (
+            f"Session A's gateway_ip {gw_ip_a} falls inside session B's "
+            f"subnet {subnet_b}; subnets must be disjoint."
+        )
+        assert not _ip_in_cidr(session_ip_b, subnet_a), (
+            f"Session B's session_ip {session_ip_b} falls inside session A's "
+            f"subnet {subnet_a}; subnets must be disjoint."
+        )
+        assert not _ip_in_cidr(gw_ip_b, subnet_a), (
+            f"Session B's gateway_ip {gw_ip_b} falls inside session A's "
+            f"subnet {subnet_a}; subnets must be disjoint."
+        )
 
         # 6. Verify both can ping their respective gateways.
         ping_a = sandbox_cli(
@@ -699,8 +739,8 @@ def test_concurrent_sessions(sandbox_cli, backend):
         )
 
         # 7. Verify no cross-session traffic: session A cannot reach
-        #    session B's gateway. The /28 subnets are isolated Docker
-        #    bridges, so routing between them should not exist.
+        #    session B's gateway. The per-session subnets are isolated
+        #    Docker bridges, so routing between them must not exist.
         cross_ping = sandbox_cli(
             "exec", "net-multi-a", "--",
             "ping", "-c", "2", "-W", "3", gw_ip_b,

@@ -16,7 +16,10 @@ use crate::backend::{BackendKind, compute_default_resource_limits};
 use crate::policy::{AssuranceLevel, Policy, PolicyRule};
 use crate::session::{Session, SessionConfig, WorkspaceMode};
 
-use super::dto::{PolicyDto, PolicyLevelDto, PolicyRuleDto, SessionConfigDto, SessionDto};
+use super::dto::{
+    PolicyDto, PolicyLevelDto, PolicyRuleDto, SessionConfigDto, SessionDto, SessionMountInfo,
+    SessionNetworkInfo,
+};
 
 // ---------------------------------------------------------------------------
 // Session mapping
@@ -67,6 +70,8 @@ impl From<&Session> for SessionDto {
             policy: None,
             warnings: Vec::new(),
             backend: session.backend,
+            network: None,
+            mounts: None,
         }
     }
 }
@@ -111,6 +116,27 @@ impl SessionDto {
     /// on the DTO field).
     pub fn with_warnings(mut self, warnings: Vec<String>) -> Self {
         self.warnings = warnings;
+        self
+    }
+
+    /// Attach the backend-neutral per-session networking summary.
+    ///
+    /// Distinct from `From<&Session>` so the list endpoint
+    /// (`GET /sessions`, which deliberately keeps the wire payload
+    /// lean) cannot accidentally include it; `GET /sessions/{id}`
+    /// is the sole caller.
+    pub fn with_network(mut self, network: Option<SessionNetworkInfo>) -> Self {
+        self.network = network;
+        self
+    }
+
+    /// Attach the backend-neutral per-session mount surface.
+    ///
+    /// Same lean-list rationale as [`SessionDto::with_network`]: the
+    /// list endpoint never populates this, so the wire stays cheap;
+    /// `GET /sessions/{id}` is the sole caller.
+    pub fn with_mounts(mut self, mounts: Option<SessionMountInfo>) -> Self {
+        self.mounts = mounts;
         self
     }
 }
@@ -486,5 +512,173 @@ mod tests {
         assert_eq!(dto.backend, crate::backend::BackendKind::Lima);
         assert_eq!(dto.config.cpus, dto.config.resolved_cpus as u32);
         assert_eq!(dto.config.memory_mb, dto.config.resolved_memory_mb);
+    }
+
+    // -- M11-S7 Bundle Y: SessionNetworkInfo / SessionMountInfo wire shape ---
+
+    #[test]
+    fn session_dto_omits_network_and_mounts_when_none() {
+        // Default `From<&Session>` path (used by `GET /sessions` and
+        // by `POST /sessions` on the create response) must NOT carry
+        // either block — the daemon attaches them only on
+        // `GET /sessions/{id}`. The DTO field's
+        // `skip_serializing_if = "Option::is_none"` guarantees the
+        // keys disappear entirely, not as `null` placeholders.
+        let session = Session::new(Some("net-mounts-empty".into()));
+        let dto = SessionDto::from(&session);
+        assert!(dto.network.is_none());
+        assert!(dto.mounts.is_none());
+
+        let json = serde_json::to_string(&dto).unwrap();
+        assert!(
+            !json.contains("\"network\""),
+            "network key must be omitted when None; json = {json}"
+        );
+        assert!(
+            !json.contains("\"mounts\""),
+            "mounts key must be omitted when None; json = {json}"
+        );
+    }
+
+    #[test]
+    fn session_dto_with_network_renders_complete_block() {
+        let session = Session::new(Some("net-attached".into()));
+        let net = SessionNetworkInfo {
+            gateway_ip: "10.209.0.2".into(),
+            session_ip: "10.209.0.3".into(),
+            session_subnet_cidr: "10.209.0.0/28".into(),
+        };
+        let dto = SessionDto::from(&session).with_network(Some(net.clone()));
+
+        let value = serde_json::to_value(&dto).unwrap();
+        let block = &value["network"];
+        assert_eq!(block["gateway_ip"], "10.209.0.2");
+        assert_eq!(block["session_ip"], "10.209.0.3");
+        assert_eq!(block["session_subnet_cidr"], "10.209.0.0/28");
+
+        // Round-trips back to an equal struct via `#[serde(default)]`
+        // on the parent — the explicit lock for both directions of
+        // forward-/backward-compat per CLAUDE.md persistence rules.
+        let json = serde_json::to_string(&dto).unwrap();
+        let deser: SessionDto = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.network.as_ref(), Some(&net));
+    }
+
+    #[test]
+    fn session_dto_with_mounts_container_shape_round_trips() {
+        // Container session shape: every field populated.
+        let session = Session::with_config_and_backend(
+            Some("mounts-container".into()),
+            SessionConfig {
+                cpus: 0,
+                memory_mb: 0,
+                disk_gb: 20,
+                workspace_mode: Some(WorkspaceMode::Shared {
+                    host_path: "/home/olek/proj".into(),
+                }),
+                hardened: false,
+                repo: None,
+                boot_cmd: None,
+                template: None,
+            },
+            crate::backend::BackendKind::Container,
+        );
+        let mounts = SessionMountInfo {
+            workspace_path: "/home/agent/workspace/".into(),
+            workspace_host_path: Some("/home/olek/proj".into()),
+            ca_bundle_path: Some("/etc/ssl/certs/sandbox-ca.pem".into()),
+            home_volume: Some("sandbox-home-aabbccddeeff".into()),
+        };
+        let dto = SessionDto::from(&session).with_mounts(Some(mounts.clone()));
+
+        let value = serde_json::to_value(&dto).unwrap();
+        let block = &value["mounts"];
+        assert_eq!(block["workspace_path"], "/home/agent/workspace/");
+        assert_eq!(block["workspace_host_path"], "/home/olek/proj");
+        assert_eq!(block["ca_bundle_path"], "/etc/ssl/certs/sandbox-ca.pem");
+        assert_eq!(block["home_volume"], "sandbox-home-aabbccddeeff");
+
+        let json = serde_json::to_string(&dto).unwrap();
+        let deser: SessionDto = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.mounts.as_ref(), Some(&mounts));
+    }
+
+    #[test]
+    fn session_dto_with_mounts_lima_omits_container_only_keys() {
+        // Lima session: ca_bundle_path is None (CA injected via guest
+        // agent, no bind), home_volume is None (no Docker volume).
+        // Both `Option<String>` fields with
+        // `skip_serializing_if = "Option::is_none"` so the wire JSON
+        // simply omits them — operators get a clean per-backend view.
+        let session = Session::new(Some("mounts-lima".into()));
+        let mounts = SessionMountInfo {
+            workspace_path: "/home/agent/workspace/".into(),
+            workspace_host_path: None,
+            ca_bundle_path: None,
+            home_volume: None,
+        };
+        let dto = SessionDto::from(&session).with_mounts(Some(mounts.clone()));
+
+        let value = serde_json::to_value(&dto).unwrap();
+        let block = value["mounts"]
+            .as_object()
+            .expect("mounts must be an object on the wire");
+        assert_eq!(
+            block.get("workspace_path").and_then(|v| v.as_str()),
+            Some("/home/agent/workspace/")
+        );
+        assert!(
+            !block.contains_key("workspace_host_path"),
+            "workspace_host_path must be omitted when None; mounts = {value:?}"
+        );
+        assert!(
+            !block.contains_key("ca_bundle_path"),
+            "ca_bundle_path must be omitted when None on Lima; mounts = {value:?}"
+        );
+        assert!(
+            !block.contains_key("home_volume"),
+            "home_volume must be omitted when None on Lima; mounts = {value:?}"
+        );
+
+        let json = serde_json::to_string(&dto).unwrap();
+        let deser: SessionDto = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser.mounts.as_ref(), Some(&mounts));
+    }
+
+    #[test]
+    fn session_dto_v0_record_without_network_or_mounts_round_trips() {
+        // CLAUDE.md persistence rule: records written by an older
+        // daemon (which never carried `network` / `mounts`) must
+        // deserialize without error on the newer reader, defaulting
+        // both blocks to `None`. This exercises the
+        // `#[serde(default)]` attribute on the parent fields.
+        let v0_json = r#"{
+            "id": "0123456789ab",
+            "state": "running",
+            "created_at": "2026-04-22T00:00:00Z",
+            "updated_at": "2026-04-22T00:00:00Z",
+            "config": {
+                "cpus": 2,
+                "memory_mb": 4096,
+                "disk_gb": 20,
+                "hardened": true
+            },
+            "backend": "lima"
+        }"#;
+
+        let dto: SessionDto = serde_json::from_str(v0_json)
+            .expect("pre-Wave-2 v0 record must round-trip via #[serde(default)]");
+        assert!(
+            dto.network.is_none(),
+            "missing `network` key must default to None"
+        );
+        assert!(
+            dto.mounts.is_none(),
+            "missing `mounts` key must default to None"
+        );
+        // Spot-check that the rest of the fields didn't lose data.
+        assert_eq!(dto.id.as_str(), "0123456789ab");
+        assert_eq!(dto.config.cpus, 2);
+        assert_eq!(dto.backend, crate::backend::BackendKind::Lima);
     }
 }
