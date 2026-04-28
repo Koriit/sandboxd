@@ -1377,11 +1377,11 @@ async fn create_session(
         // above via `initial_dns_policy`).
         //
         // `req.policy` is consumed here (moved out of `req`); the
-        // following `repo` / `boot_cmd` plumbing is intentionally NOT
-        // wired in this phase — the lite image runs with no guest
-        // agent, so there's nowhere to dispatch `git clone` /
-        // `bash -c <boot>`. Test_lite.py exercises only `--policy`;
-        // `--repo` / `--boot-cmd` are deferred to a later session.
+        // `req.repo` clone block immediately below is the M11-S7 backend
+        // symmetry for `--repo` (the lite image's entrypoint is the
+        // `sandbox-guest` agent, so the `state.guest.exec` dispatch the
+        // Lima path uses works unchanged once the agent's TCP listener
+        // is up). `--boot-cmd` symmetry is deferred to a follow-up.
         if let Some(policy) = req.policy {
             let initial_presets = req.source_presets.clone();
             match apply_policy(
@@ -1404,6 +1404,121 @@ async fn create_session(
                         "failed to apply explicit initial policy on lite session — failing create"
                     );
                     cleanup_lite_gateway_and_return!(error_response(e).into_response());
+                }
+            }
+        }
+
+        // M11-S7 — `--repo` symmetry on the container backend.
+        //
+        // Mirrors the Lima `--repo` path at the bottom of this handler:
+        // pre-warm DNS for the repo host through the guest, then
+        // dispatch `git clone <url> /home/agent/workspace/` via the
+        // backend-agnostic `GuestConnector` (which routes through
+        // `ContainerTransport`'s `docker exec ... socat` path for
+        // container sessions). Failures take the same fail-explicit
+        // path as Lima — `fail_explicit_repo_clone` marks the session
+        // `Error` and tears down the gateway/network/ingestors, leaving
+        // the container in place so `sandbox rm` can reclaim it.
+        //
+        // The lite image bakes `sandbox-guest` in as its entrypoint
+        // (`/usr/bin/tini -- /usr/local/bin/sandbox-guest`), so the
+        // agent's TCP listener at 127.0.0.1:5123 is up shortly after
+        // `docker start` returns. The 30s `GUEST_REQUEST_TIMEOUT`
+        // bound on `send_request` covers the boot tail-latency the
+        // same way it does for Lima.
+        if let Some(repo_url) = &req.repo {
+            // Pre-warm DNS for the repo host so the DNS propagation loop
+            // has installed the policy's L1/L3 filter chain before
+            // `git clone` opens its first TCP connection. Same rationale
+            // as the Lima branch — schema v2 domain allow-rules are
+            // fail-closed at empty DNS cache and the loop polls every 2s.
+            if let Some(host) = extract_repo_host(repo_url) {
+                info!(%session_id, %host, "pre-warming DNS for repo clone (lite)");
+                prewarm_guest_dns(&state.guest, &session_id, &host).await;
+            }
+
+            info!(%session_id, repo = %repo_url, "cloning repository into container");
+            match state
+                .guest
+                .exec(
+                    &session_id,
+                    "git",
+                    &["clone", repo_url.as_str(), "/home/agent/workspace/"],
+                )
+                .await
+            {
+                Ok(GuestResponse::ExecResult {
+                    exit_code,
+                    stdout,
+                    stderr,
+                }) => {
+                    if exit_code != 0 {
+                        let stderr_snip = truncate_for_diagnostic(stderr.trim(), 512);
+                        let err = SandboxError::Internal(format!(
+                            "git clone of {repo_url} failed with exit code {exit_code}: {stderr_snip}"
+                        ));
+                        return fail_explicit_repo_clone(
+                            &state.store,
+                            &state.gateway,
+                            &state.network,
+                            &state.ingestors,
+                            &session_id,
+                            err,
+                        )
+                        .await
+                        .into_response();
+                    } else {
+                        info!(
+                            %session_id,
+                            output = %stdout.trim(),
+                            "repository cloned successfully (lite)"
+                        );
+                    }
+                }
+                Ok(GuestResponse::Error { message }) => {
+                    let err = SandboxError::Internal(format!(
+                        "git clone of {repo_url} failed: guest agent error: {message}"
+                    ));
+                    return fail_explicit_repo_clone(
+                        &state.store,
+                        &state.gateway,
+                        &state.network,
+                        &state.ingestors,
+                        &session_id,
+                        err,
+                    )
+                    .await
+                    .into_response();
+                }
+                Ok(other) => {
+                    let err = SandboxError::Internal(format!(
+                        "git clone of {repo_url} failed: unexpected guest response: {other:?}"
+                    ));
+                    return fail_explicit_repo_clone(
+                        &state.store,
+                        &state.gateway,
+                        &state.network,
+                        &state.ingestors,
+                        &session_id,
+                        err,
+                    )
+                    .await
+                    .into_response();
+                }
+                Err(e) => {
+                    let err = SandboxError::Internal(format!(
+                        "git clone of {repo_url} failed: transport error: {e}"
+                    ));
+                    return fail_explicit_repo_clone(
+                        &state.store,
+                        &state.gateway,
+                        &state.network,
+                        &state.ingestors,
+                        &session_id,
+                        err,
+                    )
+                    .await
+                    .into_response();
                 }
             }
         }

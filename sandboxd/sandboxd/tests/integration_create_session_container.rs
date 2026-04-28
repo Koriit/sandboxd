@@ -475,53 +475,58 @@ fn integration_create_session_container_rejects_hardened() {
     assert_eq!(lima_session.state, SessionState::Creating);
 }
 
-/// M11-S5 Phase 5A contract — `workspace_mode: { kind: shared, host_path }`
-/// on the container backend is now an *accepted* request shape. The
-/// capability matrix advertises `workspace_modes: { Shared }`, the
-/// daemon threads the operator-supplied host path through
-/// `ContainerNetwork::workspace_host_path`, and `ContainerRuntime`
-/// turns it into a `docker create --mount type=bind,...` flag.
+/// M11-S7 contract — both workspace modes are *accepted* request shapes
+/// on the container backend. The capability matrix advertises
+/// `workspace_modes: { Shared, Clone }`. `Shared` threads the
+/// operator-supplied host path through `ContainerNetwork::workspace_host_path`
+/// and `ContainerRuntime` turns it into a `docker create --mount type=bind,...`
+/// flag with the unified bind target `/home/agent/workspace/`. `Clone`
+/// is dispatched in-guest after the lite container's entrypoint
+/// (`sandbox-guest`) is up: the daemon issues `git clone <url>
+/// /home/agent/workspace/` through the backend-agnostic `GuestConnector`,
+/// mirroring the Lima `--repo` path.
 ///
 /// This test pins three pieces of the public contract:
-///   1. The capability matrix advertises exactly `{ Shared }` — neither
-///      empty (the pre-Phase-5A guard shape) nor inclusive of `Clone`,
-///      which the container backend has no plumbing for and which spec
-///      validation must keep rejecting.
+///   1. The capability matrix advertises exactly `{ Shared, Clone }` —
+///      both modes after M11-S7, neither empty (the pre-Phase-5A guard
+///      shape) nor `Shared`-only (the M11-S5 → M11-S7 transitional
+///      shape).
 ///   2. `SessionSpec::validate(caps)` *accepts* a `Shared` request so
 ///      the daemon's `POST /sessions` handler proceeds to the bind-
 ///      mount path rather than failing the request up front.
-///   3. `Clone` is still rejected as
-///      `UnsupportedFeature::WorkspaceMode(Clone, Container)`, holding
-///      the negative coverage that prevents an unimplemented variant
-///      from silently slipping through.
+///   3. `SessionSpec::validate(caps)` *accepts* a `Clone` request so
+///      the daemon's `POST /sessions` handler proceeds to the in-guest
+///      clone dispatch rather than failing the request up front.
 ///
 /// Hermetic — exercises the same `spec.validate(runtime.capabilities())`
 /// branch the daemon's `POST /sessions` handler runs after parsing the
-/// request. Predecessor of this test (pre-Phase-5A) asserted the
-/// inverse — that `Shared` was rejected because the bind-mount plumbing
-/// was deferred. Phase 5A delivered the plumbing; the assertion has
-/// been inverted but the capability-shape coverage is preserved.
+/// request. Predecessor of this test (M11-S5 Phase 5A) asserted Clone
+/// was *rejected* because the in-guest clone plumbing was deferred;
+/// M11-S7 delivered the plumbing — the rejection assertion has been
+/// inverted to a successful-validate, and the capability-shape coverage
+/// is preserved.
 #[test]
-fn integration_create_session_container_advertises_shared_workspace_capability() {
+fn integration_create_session_container_advertises_workspace_capabilities() {
     let runtime = ContainerRuntime::new(
-        "phase5a-shared-workspace-capability-test:none",
+        "m11-s7-workspace-capability-test:none",
         256,
         1.0,
         1000,
         1000,
     );
 
-    // (1) Capability shape — exactly `{ Shared }`, no more, no less.
+    // (1) Capability shape — exactly `{ Shared, Clone }`, no more, no less.
     let modes = runtime.capabilities().workspace_modes;
     assert!(
         modes.contains(WorkspaceModeKind::Shared),
         "container capabilities must advertise WorkspaceModeKind::Shared \
-         after M11-S5 Phase 5A; got {modes:?}"
+         (M11-S5 Phase 5A); got {modes:?}"
     );
     assert!(
-        !modes.contains(WorkspaceModeKind::Clone),
-        "container capabilities must NOT advertise Clone — the container \
-         backend has no plumbing for it; got {modes:?}"
+        modes.contains(WorkspaceModeKind::Clone),
+        "container capabilities must advertise WorkspaceModeKind::Clone \
+         (M11-S7 — in-guest `git clone` dispatched via GuestConnector); \
+         got {modes:?}"
     );
 
     // (2) `Shared` request is accepted by `validate`.
@@ -542,9 +547,9 @@ fn integration_create_session_container_advertises_shared_workspace_capability()
         .validate(runtime.capabilities())
         .expect("Shared workspace must validate against the post-Phase-5A capability matrix");
 
-    // (3) `Clone` request is still rejected with the spec-shaped
-    //     `UnsupportedFeature::WorkspaceMode(Clone, Container)` — the
-    //     negative coverage the predecessor test was originally after.
+    // (3) `Clone` request is accepted by `validate` after M11-S7 — the
+    //     in-guest clone plumbing landed and the capability matrix now
+    //     advertises Clone alongside Shared.
     let clone_spec = SessionSpec {
         backend_specific: BackendSpecific::Container {
             memory_mb: 256,
@@ -558,13 +563,7 @@ fn integration_create_session_container_advertises_shared_workspace_capability()
         template: None,
         disk_gb: None,
     };
-    let err = clone_spec.validate(runtime.capabilities()).expect_err(
-        "Clone workspace must be rejected — the container backend has no plumbing for it",
-    );
-    assert_eq!(
-        err,
-        UnsupportedFeature::WorkspaceMode(WorkspaceModeKind::Clone, BackendKind::Container),
-        "rejection must carry (Clone, Container) so the daemon's error \
-         response names the unsupported variant the operator asked for"
-    );
+    clone_spec
+        .validate(runtime.capabilities())
+        .expect("Clone workspace must validate against the post-M11-S7 capability matrix");
 }

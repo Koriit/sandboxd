@@ -509,14 +509,16 @@ def test_lite_gateway_parity(lite_harness, sandbox_cli):
 @pytest.mark.timeout(300)
 def test_lite_workspace_uid_alignment(lite_harness, tmp_path):
     """Spec § "Workspace bind": mounting a host directory as
-    ``--workspace shared:<path>`` makes it available at ``/workspace``
-    inside the lite container, and files written from inside the
-    session land on the host with the *host* user's uid (not a stale
-    container uid). M11-S5 gap #68 wired this through:
-    ``ContainerNetwork.workspace_host_path`` is now ``Some(<path>)``
-    when the request supplies ``WorkspaceMode::Shared``, and the
-    container runtime renders it as ``--mount
-    type=bind,src=<path>,dst=/workspace``.
+    ``--workspace shared:<path>`` makes it available at
+    ``/home/agent/workspace/`` inside the lite container, and files
+    written from inside the session land on the host with the *host*
+    user's uid (not a stale container uid). M11-S5 gap #68 wired this
+    through: ``ContainerNetwork.workspace_host_path`` is now
+    ``Some(<path>)`` when the request supplies ``WorkspaceMode::Shared``,
+    and the container runtime renders it as ``--mount
+    type=bind,src=<path>,dst=/home/agent/workspace/`` (M11-S7 unified
+    the bind target with Lima's workspace mount; pre-M11-S7 the target
+    was ``/workspace``).
 
     UID alignment is enforced by ``map_container_uid_gid`` (the
     container runs as the daemon's host uid:gid), so any file
@@ -542,9 +544,9 @@ def test_lite_workspace_uid_alignment(lite_harness, tmp_path):
     # 1. host -> container: write a file on the host, read it from inside.
     host_fixture = host_dir / "from-host.txt"
     host_fixture.write_text("hello from host\n")
-    cat_result = lite_harness.ssh(sid, "cat", "/workspace/from-host.txt")
+    cat_result = lite_harness.ssh(sid, "cat", "/home/agent/workspace/from-host.txt")
     assert cat_result.returncode == 0, (
-        f"cat /workspace/from-host.txt failed inside lite session.\n"
+        f"cat /home/agent/workspace/from-host.txt failed inside lite session.\n"
         f"stdout: {cat_result.stdout}\nstderr: {cat_result.stderr}"
     )
     assert "hello from host" in cat_result.stdout, (
@@ -554,10 +556,10 @@ def test_lite_workspace_uid_alignment(lite_harness, tmp_path):
 
     # 2. container -> host: touch a file from inside, verify host uid.
     touch_result = lite_harness.ssh(
-        sid, "sh", "-c", "echo from-container > /workspace/from-container.txt",
+        sid, "sh", "-c", "echo from-container > /home/agent/workspace/from-container.txt",
     )
     assert touch_result.returncode == 0, (
-        f"writing /workspace/from-container.txt failed inside lite session.\n"
+        f"writing /home/agent/workspace/from-container.txt failed inside lite session.\n"
         f"stdout: {touch_result.stdout}\nstderr: {touch_result.stderr}"
     )
 

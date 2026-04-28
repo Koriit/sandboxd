@@ -39,16 +39,11 @@ from conftest import (
 def test_clone_repo(sandbox_cli, backend):
     """Create a session with --repo pointing to a small public repo.
     Verify the repository is cloned into /home/agent/workspace/.
+
+    Backend-agnostic since M11-S7: both backends advertise
+    `WorkspaceModeKind::Clone` and the daemon dispatches `git clone`
+    in-guest via `GuestConnector` after the runtime starts.
     """
-    if backend == "container":
-        pytest.skip(
-            "Clone workspace mode not supported on container backend. "
-            "Per spec § Capabilities, container backend advertises only "
-            "WorkspaceMode::Bind (Lima advertises Bind+Clone). The "
-            "container session-create path rejects --repo at the API "
-            "boundary with 'workspace mode Clone is not supported by "
-            "the container backend'."
-        )
     session_id = None
     policy_path = None
     try:
@@ -253,18 +248,11 @@ def test_cp_vm_to_host(sandbox_cli, backend):
 def test_shared_mount(sandbox_cli, backend):
     """Create a session with --workspace shared:<tmpdir>.
     Verify bidirectional file visibility between host and VM.
+
+    Backend-agnostic since M11-S7: the container backend's bind target
+    is unified with Lima's at `/home/agent/workspace/`, so the path
+    assertions below work on both backends.
     """
-    if backend == "container":
-        pytest.skip(
-            "Lima-only path assertions: this test reads/writes at "
-            "/home/agent/workspace/<file>, which is the Lima bind "
-            "target. Per spec § Workspace, the container backend "
-            "binds the host path to /workspace (line 569: 'Bind mount "
-            "/host/path -> /workspace'). The container-side bind-mount "
-            "lifecycle is covered end-to-end by "
-            "test_lite.py::test_lite_workspace_uid_alignment, so the "
-            "container-backend bind contract is already gated."
-        )
     session_id = None
     host_dir = None
     try:

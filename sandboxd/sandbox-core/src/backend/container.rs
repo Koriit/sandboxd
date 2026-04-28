@@ -88,7 +88,7 @@ use crate::error::SandboxError;
 use crate::guest::GUEST_AGENT_PORT;
 use crate::lima::guest_agent_path;
 use crate::process::run_with_timeout;
-use crate::session::{SessionId, WorkspaceMode, WorkspaceModeKind};
+use crate::session::SessionId;
 use enumset::EnumSet;
 
 // ---------------------------------------------------------------------------
@@ -183,9 +183,12 @@ pub struct ContainerNetwork {
     /// Gateway container IP, the `.2` of the per-session /28. Used for
     /// `--dns` and (Phase 3A) handed to the route helper at start time.
     pub gateway_ip: IpAddr,
-    /// Optional host path bound into `/workspace` inside the
-    /// container. `None` means no workspace bind. Aligned with the
-    /// spec's [`WorkspaceMode::Shared`] semantics.
+    /// Optional host path bound into `/home/agent/workspace/` inside
+    /// the container. `None` means no workspace bind. Aligned with the
+    /// spec's [`WorkspaceMode::Shared`] semantics — the bind target is
+    /// unified with Lima's workspace mount across both backends
+    /// (M11-S7), so an operator's `--workspace shared:<path>` lands at
+    /// the same in-guest path regardless of the backend they chose.
     pub workspace_host_path: Option<PathBuf>,
     /// Path to the `sandbox-route-helper` binary. When `None`, the
     /// runtime skips the route-installation step at `start` — useful
@@ -380,13 +383,16 @@ fn capabilities_for_container() -> Capabilities {
         // Spec §"CLI & UX / `sandbox create --no-cache`" — no
         // per-session slow path; rebuild-image is the operator surface.
         per_session_no_cache: false,
-        // Spec §"Workspace" — `Shared` advertises a Docker bind-mount;
-        // the daemon threads `workspace_host_path` from the request
-        // through `ContainerNetwork`, and `docker create --mount` lights
-        // up at create time. `Clone` remains unimplemented for the
-        // container backend (todo #67-style follow-up); validation
-        // continues to reject it as `UnsupportedFeature::WorkspaceMode`.
-        workspace_modes: EnumSet::only(WorkspaceModeKind::Shared),
+        // Spec §"Workspace" — both workspace modes are supported on the
+        // container backend (M11-S7): `Shared` advertises a Docker
+        // bind-mount (the daemon threads `workspace_host_path` from the
+        // request through `ContainerNetwork`, and `docker create --mount`
+        // lights up at create time); `Clone` advertises the same in-guest
+        // `git clone <url> /home/agent/workspace/` flow Lima uses — the
+        // daemon dispatches it via the backend-agnostic `GuestConnector`
+        // after the lite container's entrypoint (`sandbox-guest`) is up,
+        // mirroring the Lima `--repo` path.
+        workspace_modes: EnumSet::all(),
     }
 }
 
@@ -428,20 +434,25 @@ impl SessionRuntime for ContainerRuntime {
         let label_arg = format!("sandbox.session_id={session_id}");
         let home_mount = format!("type=volume,src={home_volume},dst=/home/agent");
         let workspace_mount = network.workspace_host_path.as_ref().map(|p| {
+            // Spec § "Workspace" — bind target unified with Lima at
+            // `/home/agent/workspace/` (M11-S7). The home volume mounts
+            // at `/home/agent`; this bind shadows the volume's content
+            // at the workspace subdirectory, which is the intended
+            // semantics (operator-supplied workspace files take
+            // precedence over the volume's empty `workspace/`).
             format!(
-                "type=bind,src={},dst=/workspace",
+                "type=bind,src={},dst=/home/agent/workspace/",
                 p.to_string_lossy().into_owned()
             )
         });
         let ca_args = build_ca_mount_args(&network);
-        let workspace_kind = spec.workspace_mode.as_ref().map(WorkspaceMode::kind);
-        if let Some(WorkspaceModeKind::Clone) = workspace_kind {
-            return Err(SandboxError::InvalidArgument(
-                "ContainerRuntime: WorkspaceMode::Clone is not implemented in M11-S3 Phase 3A; \
-                 caller must validate against capabilities first"
-                    .to_string(),
-            ));
-        }
+        // M11-S7 — `WorkspaceMode::Clone` is now part of the container
+        // backend's capability matrix; the daemon dispatches the in-guest
+        // `git clone` step after `runtime.start` completes, exactly like
+        // the Lima `--repo` path. `runtime.create` only owns the
+        // `docker create` arguments, which are identical for `Empty`,
+        // `Clone`, and `Shared` (the bind mount is the only knob, and
+        // `Clone` does not bind a host path).
 
         let mut args: Vec<String> = vec![
             "create".to_string(),
@@ -1364,11 +1375,14 @@ mod tests {
         );
         assert_eq!(
             caps.workspace_modes,
-            EnumSet::only(WorkspaceModeKind::Shared),
-            "M11-S5 advertises Shared so the daemon can thread \
-             workspace_host_path into ContainerNetwork; Clone remains \
-             unimplemented for the container backend",
+            EnumSet::all(),
+            "M11-S7 advertises both workspace modes — `Shared` (Docker \
+             bind-mount via ContainerNetwork.workspace_host_path) and \
+             `Clone` (in-guest `git clone` dispatched through GuestConnector \
+             after the lite container's entrypoint comes up)",
         );
+        assert!(caps.workspace_modes.contains(WorkspaceModeKind::Shared));
+        assert!(caps.workspace_modes.contains(WorkspaceModeKind::Clone));
     }
 
     /// Round-trip the `register_session` / `lookup_session` /
@@ -1712,10 +1726,7 @@ mod tests {
         assert!(!caps.raw_network);
         assert!(!caps.hardening_flag);
         assert!(!caps.per_session_no_cache);
-        assert_eq!(
-            caps.workspace_modes,
-            EnumSet::only(WorkspaceModeKind::Shared),
-        );
+        assert_eq!(caps.workspace_modes, EnumSet::all());
     }
 
     /// Smoke test for [`compute_default_resource_limits`]: the function
