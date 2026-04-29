@@ -6397,9 +6397,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // every list_* call would error and clog the log. The cheapest
     // probe is the reaper itself — any error path inside `reap_orphans`
     // already logs at `warn!` and continues.
+    //
+    // M11-S10: the reaper additionally gates `sandbox-net-*` networks
+    // against the daemon's allocator pool — only networks whose
+    // IPAM-reported IPv4 subnets fall fully inside `allocation_pool`
+    // are reaped, and out-of-pool networks' container/volume siblings
+    // inherit the same exemption. See the `orphan_reaper.rs`
+    // module docs for the dual-anchor model.
     {
         let docker_ops = CliDockerOps;
-        let _ = reap_orphans(&docker_ops, &live_session_ids).await;
+        let _ = reap_orphans(&docker_ops, &live_session_ids, &allocation_pool).await;
     }
 
     // Hydrate the in-memory policy map from SQLite **before**

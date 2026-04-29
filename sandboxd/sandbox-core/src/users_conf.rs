@@ -171,7 +171,11 @@ impl Cidr4 {
     /// Parse a CIDR string of the form `"a.b.c.d/n"`. The error type
     /// uses static reasons so it can be embedded in
     /// [`UsersConfigError::InvalidCidr`] without per-call allocation.
-    fn parse(value: &str) -> Result<Self, &'static str> {
+    ///
+    /// `pub` so the orphan-reaper module (and its integration tests)
+    /// can build `Cidr4` values for the dual-anchor CIDR pool gate
+    /// without crossing back through serde or the users.conf loader.
+    pub fn parse(value: &str) -> Result<Self, &'static str> {
         let (addr_str, prefix_str) = value
             .split_once('/')
             .ok_or("missing prefix; expected the form `a.b.c.d/n` (e.g. 10.209.0.0/20)")?;
