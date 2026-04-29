@@ -23,6 +23,7 @@ use std::collections::HashSet;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use sandbox_core::Cidr4;
 use sandbox_core::backend::{CliDockerOps, reap_orphans};
 use sandbox_core::session::SessionId;
 
@@ -244,7 +245,16 @@ async fn integration_orphan_reaper_removes_orphans_and_preserves_live_resources(
     // *our* orphan id); this test stays single-threaded by virtue of
     // being the only `integration_orphan_reaper_*` test in the suite.
     let live: HashSet<SessionId> = [live_sid].into_iter().collect();
-    let report = reap_orphans(&CliDockerOps, &live).await;
+    // The fixture's networks live in `10.99.0.0/16` (see
+    // `create_network` above), which spans every /28 the test pulls
+    // out of that range. The M11-S10 dual-anchor IPAM gate is
+    // exercised explicitly in `integration_orphan_reaper_cidr.rs`;
+    // here we want the existing reap-and-preserve contract under a
+    // CIDR pool that fully contains the fixture's networks, so the
+    // gate is permissive and the assertions below keep their pre-S10
+    // shape.
+    let pool = Cidr4::parse("10.99.0.0/16").expect("test pool parses");
+    let report = reap_orphans(&CliDockerOps, &live, &pool).await;
 
     // Counters: at least one of each (other orphans on the host from
     // unrelated parallel tests can push this higher; we assert the

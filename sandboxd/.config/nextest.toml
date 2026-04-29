@@ -41,7 +41,16 @@ test-group = 'lima'
 #   - `integration_default_hardened_docker_proceeds` does the same
 #     positive-create exercise as #2 against the default-hardened
 #     stub.
-filter = 'test(/^integration_orphan_reaper/) | test(/^integration_container_runtime/) | test(/^integration_rootless_docker/) | test(/^integration_default_hardened_docker/)'
+#
+# M11-S10 added a second reaper test file
+# (`integration_orphan_reaper_cidr.rs`) whose tests are named
+# `integration_reaper_*` rather than `integration_orphan_reaper_*`
+# (per the M11-S10 spec). Both prefixes belong in the same
+# `docker-sandbox-namespace` group — they create real
+# `sandbox-net-*` networks under the same IPAM space and would race
+# with each other and with the existing reaper / container-runtime
+# tests on parallel runs.
+filter = 'test(/^integration_orphan_reaper/) | test(/^integration_reaper_/) | test(/^integration_container_runtime/) | test(/^integration_rootless_docker/) | test(/^integration_default_hardened_docker/)'
 test-group = 'docker-sandbox-namespace'
 
 [test-groups]
