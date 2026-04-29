@@ -157,8 +157,25 @@ async fn run(args: Args) -> std::io::Result<()> {
         chrono::Utc::now(),
     ));
 
-    let tcp_listener = tcp::bind(args.bind_ip, args.tcp_port).await?;
-    tracing::info!(port = args.tcp_port, "tcp listener bound");
+    // Pin the kernel accept-queue backlog to a multiple of `conn_cap`
+    // so over-cap connections always reach our `accept()` loop (where
+    // they are then RST-closed by the over-cap path) instead of being
+    // kernel-dropped at the SYN with ECONNREFUSED. The factor is
+    // conservative — typical SOMAXCONN is 4096, our default `conn_cap`
+    // is 256, so `4 * conn_cap = 1024` keeps us comfortably below the
+    // kernel ceiling while leaving headroom for short bursts. The
+    // i32 cast cannot overflow at any plausible conn_cap (clap caps
+    // u32 input via the type system).
+    let tcp_backlog: i32 = (args.conn_cap.saturating_mul(4))
+        .min(i32::MAX as u32)
+        .try_into()
+        .expect("backlog fits in i32 after .min(i32::MAX as u32)");
+    let tcp_listener = tcp::bind(args.bind_ip, args.tcp_port, tcp_backlog).await?;
+    tracing::info!(
+        port = args.tcp_port,
+        backlog = tcp_backlog,
+        "tcp listener bound"
+    );
 
     let udp_socket = udp::bind(args.bind_ip, args.udp_port).await?;
     tracing::info!(port = args.udp_port, "udp listener bound");

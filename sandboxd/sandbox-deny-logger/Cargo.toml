@@ -20,6 +20,13 @@ chrono.workspace = true
 # minimal.
 clap = { workspace = true, features = ["env"] }
 nix = { version = "0.29", features = ["net", "socket", "uio"] }
+# Direct socket2 use lets us set an explicit `listen()` backlog (the
+# tokio TcpListener API uses libc's SOMAXCONN and gives no knob).
+# Picking the backlog at the call site lets the deterministic
+# `tcp_respects_concurrency_cap` test ensure the kernel's accept
+# queue is large enough for its burst, eliminating the
+# retry-on-ECONNREFUSED dance the M11-S5 test had to do.
+socket2 = "0.6"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

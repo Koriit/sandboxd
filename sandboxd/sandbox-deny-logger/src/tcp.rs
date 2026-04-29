@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use nix::libc;
 use nix::sys::socket::{setsockopt, sockopt};
+use socket2::{Domain, Protocol as SockProtocol, Socket, Type};
 use tokio::net::{TcpListener, TcpStream};
 
 use chrono::Utc;
@@ -26,14 +27,45 @@ use chrono::Utc;
 use crate::event::{DenyRecord, EventEmitter, Protocol};
 use crate::limits::{Admit, RateCap};
 
-/// Bind a TCP listener on `(bind_ip, port)`.
+/// Bind a TCP listener on `(bind_ip, port)` with an explicit `listen(2)`
+/// backlog.
 ///
 /// The listener is handed to the caller so the runtime's task-spawn
 /// choices (per-accept spawn, blocking accept loop, etc.) live at the
 /// call site.
-pub async fn bind(bind_ip: Ipv4Addr, port: u16) -> io::Result<TcpListener> {
-    let addr = SocketAddr::V4(SocketAddrV4::new(bind_ip, port));
-    TcpListener::bind(addr).await
+///
+/// # Why an explicit backlog
+///
+/// Tokio's `TcpListener::bind` calls `listen(2)` with libc's `SOMAXCONN`
+/// (typically 4096 on stock Linux but historically as low as 128 and
+/// sometimes overridden by `/proc/sys/net/core/somaxconn`). For
+/// production traffic that is fine — the deny-logger's concurrency cap
+/// gates handler admission, not the kernel's accept queue. For the
+/// deterministic `tcp_respects_concurrency_cap` test, however, we want
+/// to guarantee the kernel can hold every connection in its burst on
+/// the accept queue regardless of host tuning, so the conservation
+/// invariant `deny + dropped_total == BURST` does not depend on a
+/// retry loop hiding `ECONNREFUSED` from a backlog overflow. Passing
+/// the backlog explicitly here gives the test that knob; production
+/// callers pass a value at least as large as `conn_cap` so over-cap
+/// connections always reach `accept()` (and are then RST-closed by
+/// the over-cap path) instead of being kernel-dropped at the SYN.
+pub async fn bind(bind_ip: Ipv4Addr, port: u16, backlog: i32) -> io::Result<TcpListener> {
+    // Build a non-blocking IPv4 stream socket via socket2, then
+    // `listen(backlog)` with the explicit backlog so the kernel
+    // pre-allocates the accept queue we need. The standard upgrade
+    // path is `socket2::Socket` -> `std::net::TcpListener` ->
+    // `tokio::net::TcpListener`; tokio takes ownership of the fd via
+    // `from_std`. SO_REUSEADDR is left at the OS default — we are not
+    // recreating a listener on a port we've just closed, so `TIME_WAIT`
+    // reuse is irrelevant here.
+    let sock = Socket::new(Domain::IPV4, Type::STREAM, Some(SockProtocol::TCP))?;
+    sock.set_nonblocking(true)?;
+    let addr: SocketAddr = SocketAddr::V4(SocketAddrV4::new(bind_ip, port));
+    sock.bind(&addr.into())?;
+    sock.listen(backlog)?;
+    let std_listener: std::net::TcpListener = sock.into();
+    TcpListener::from_std(std_listener)
 }
 
 /// RAII guard holding one concurrency-cap permit. Decrements the
@@ -254,7 +286,10 @@ mod tests {
         let path = dir.path().join("deny.jsonl");
         let emitter = Arc::new(EventEmitter::open(&path).unwrap());
         let rate_cap = Arc::new(RateCap::new(1_000, Arc::clone(&emitter), Utc::now()));
-        let listener = bind(Ipv4Addr::LOCALHOST, 0).await.unwrap();
+        // Backlog 128 is plenty for a single-client emit-and-RST test;
+        // production callers compute backlog from `conn_cap` (see
+        // `main.rs`).
+        let listener = bind(Ipv4Addr::LOCALHOST, 0, 128).await.unwrap();
         let local = listener.local_addr().unwrap();
         let emit_for_task = Arc::clone(&emitter);
         let rate_cap_for_task = Arc::clone(&rate_cap);
@@ -343,15 +378,38 @@ mod tests {
         assert_eq!(counter.load(Ordering::Acquire), 0, "all slots released");
     }
 
-    /// End-to-end concurrency cap: open `cap + N` connections against
-    /// a loopback listener and confirm the *conservation* invariant —
-    /// every connection is accounted for as either a deny event or a
-    /// rate-limited drop, and at least `BURST - CAP` connections are
-    /// counted as drops in the worst case where all handlers finish
-    /// instantly between accepts. (On fast hardware the handler is
-    /// so quick that in-flight concurrency never actually reaches
-    /// `cap`; what matters for security is that overshoot is counted,
-    /// which the conservation check proves.)
+    /// End-to-end concurrency cap: open `BURST` connections against a
+    /// loopback listener and confirm the conservation invariant —
+    /// every connection is either admitted (counted as a `deny`
+    /// event) or server-rejected (counted into the periodic
+    /// `rate_limited` summary).
+    ///
+    /// # Determinism (M11-S9)
+    ///
+    /// The previous shape of this test wrapped each `connect()` in a
+    /// 50-attempt retry loop that tolerated both `ECONNREFUSED` and
+    /// `ECONNRESET`, on the theory that under nextest's parallel test
+    /// execution the kernel's accept queue could overflow and surface
+    /// `ECONNREFUSED` to the client before our accept loop drained it.
+    /// That introduced two hazards: (1) flakes when the retry budget
+    /// happened to be insufficient under load, and (2) a real risk
+    /// that `ECONNRESET` (which is the server's over-cap rejection
+    /// signal — the conservation invariant DEPENDS on counting it)
+    /// was being treated as "retry" rather than "drop", double-
+    /// counting connections and silently corrupting the assertion.
+    ///
+    /// The M11-S9 shape eliminates both hazards:
+    ///
+    /// 1. The listener is bound with `backlog = BURST * 4`. The
+    ///    kernel's accept queue can hold every burst connection, so
+    ///    `connect()` cannot fail with `ECONNREFUSED` due to backlog
+    ///    overflow — the only failure path left is the server's
+    ///    over-cap RST, which surfaces as `ECONNRESET`.
+    /// 2. Each thread does exactly ONE `connect()`. `Ok(stream)` is
+    ///    "admitted, will see one deny event"; `Err(ECONNRESET)` is
+    ///    "server-rejected, counted into rate_limited summary";
+    ///    everything else panics. No retries, no error-kind heuristics
+    ///    around what counts as transient.
     ///
     /// Plan Phase 3 / `tcp_respects_concurrency_cap`. Spec Part 3 /
     /// "Hardening rules" § 6.
@@ -362,72 +420,51 @@ mod tests {
         let emitter = Arc::new(EventEmitter::open(&path).unwrap());
         // Rate cap high enough to not interfere with this test.
         let rate_cap = Arc::new(RateCap::new(10_000, Arc::clone(&emitter), Utc::now()));
-        let listener = bind(Ipv4Addr::LOCALHOST, 0).await.unwrap();
-        let local = listener.local_addr().unwrap();
 
-        // Concurrency cap of 2 — open many connections to exercise
-        // the cap path. On a fast handler the cap may or may not
-        // actually fire; we assert the conservation invariant only.
         const CAP: u32 = 2;
         const BURST: usize = 20;
+        // 4× headroom: the kernel's accept queue holds the entire
+        // burst comfortably even in the worst case where every
+        // connection arrives before the server's accept loop runs.
+        const BACKLOG: i32 = (BURST * 4) as i32;
+
+        let listener = bind(Ipv4Addr::LOCALHOST, 0, BACKLOG).await.unwrap();
+        let local = listener.local_addr().unwrap();
         let emit_for_task = Arc::clone(&emitter);
         let rate_cap_for_task = Arc::clone(&rate_cap);
         let server = tokio::spawn(async move {
             let _ = run(listener, emit_for_task, rate_cap_for_task, CAP).await;
         });
 
-        // Fire all connections in parallel so the accept loop sees
-        // the bursts rather than a serial stream. Each connect is
-        // wrapped in a short retry loop because Linux loopback under
-        // nextest's workspace-parallel execution can transiently
-        // surface ECONNREFUSED when the listen backlog is full —
-        // the kernel returns RST on the SYN before our accept loop
-        // drains the queue, and the client's `connect(2)` syscall
-        // translates that into ECONNREFUSED rather than retrying.
-        // Retrying with a 5ms backoff keeps the test's semantics
-        // (all BURST connections reach the server) without masking
-        // real bugs: any failure mode that isn't transient backlog
-        // pressure (e.g. wrong port, server not listening) will
-        // exhaust the retry budget and still panic.
-        let clients: Vec<_> = tokio::task::spawn_blocking(move || {
+        // One `connect()` per thread; no retries, no transient-kind
+        // tolerance. `Some(stream)` means admitted, `None` means
+        // server-RST'd (over-cap rejection). The conservation
+        // assertion below pairs admitted-vs-rejected against
+        // deny-vs-dropped without any tolerance window.
+        let outcomes: Vec<Option<StdTcpStream>> = tokio::task::spawn_blocking(move || {
             (0..BURST)
-                .map(|_| {
-                    let mut last_err = None;
-                    for _ in 0..50 {
-                        match StdTcpStream::connect(local) {
-                            Ok(s) => {
-                                s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-                                return s;
-                            }
-                            // The server's over-cap rejection path applies
-                            // SO_LINGER{0} + drop, so the kernel may surface
-                            // either ECONNREFUSED (listen backlog overflow)
-                            // or ECONNRESET (in-flight handshake RST by the
-                            // server) depending on timing. Both are transient
-                            // "over-cap, retry" signals.
-                            Err(e)
-                                if matches!(
-                                    e.kind(),
-                                    io::ErrorKind::ConnectionRefused
-                                        | io::ErrorKind::ConnectionReset
-                                ) =>
-                            {
-                                last_err = Some(e);
-                                std::thread::sleep(Duration::from_millis(5));
-                            }
-                            Err(e) => panic!("connect: {e}"),
-                        }
+                .map(|_| match StdTcpStream::connect(local) {
+                    Ok(s) => {
+                        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                        Some(s)
                     }
-                    panic!("connect exhausted retries: {last_err:?}");
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionReset => None,
+                    Err(e) => panic!(
+                        "unexpected connect error: {e:?}. With explicit backlog \
+                         large enough for the burst, the only legal failure is \
+                         the server's over-cap RST (ECONNRESET); ECONNREFUSED \
+                         would indicate a real backlog overflow / kernel-side \
+                         bug, not a transient race."
+                    ),
                 })
-                .collect::<Vec<_>>()
+                .collect()
         })
         .await
         .unwrap();
 
         // Give the server time to accept and emit / record drops.
         tokio::time::sleep(Duration::from_millis(300)).await;
-        drop(clients);
+        drop(outcomes);
 
         // Cross the 1s rate-cap window so the summary flushes — the
         // rollover is what turns the internal drop counter into an
@@ -438,7 +475,7 @@ mod tests {
         let body = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = body.lines().collect();
 
-        let mut deny = 0;
+        let mut deny = 0usize;
         let mut dropped_total = 0u64;
         for line in &lines {
             let json: serde_json::Value = serde_json::from_str(line).unwrap();
@@ -452,7 +489,9 @@ mod tests {
         }
 
         // Conservation: every connection either emits a deny or is
-        // counted into the summary — nothing silently lost.
+        // counted into the summary — nothing silently lost. With the
+        // explicit-backlog + single-connect-per-thread shape, this
+        // assertion is deterministic.
         assert_eq!(
             deny + dropped_total as usize,
             BURST,
