@@ -1,4 +1,5 @@
-.PHONY: build fmt fmt-check test test-integration test-e2e test-e2e-container test-e2e-matrix gateway-image lite-image docs-dev docs-build clean
+.PHONY: build fmt fmt-check test test-integration test-e2e test-e2e-container test-e2e-matrix gateway-image lite-image docs-dev docs-build clean \
+	setup-dev-env install-route-helper-prod-cap install-route-helper-test-cap setup-bridge-conf setup-users-conf setup-bridge-helper-setuid
 
 build: fmt-check
 	cd sandboxd && cargo build --workspace
@@ -27,8 +28,8 @@ test:
 # For finer selection while iterating, layer an `-E` filter on top of
 # the profile, e.g. `cargo nextest run --profile integration -E \
 # 'test(integration_gateway_lifecycle)'`.
-test-integration: gateway-image
-	cd sandboxd && cargo nextest run --workspace --profile integration
+test-integration: gateway-image install-route-helper-test-cap
+	cd sandboxd && cargo nextest run --workspace --profile integration --features sandbox-route-helper/test-env-override
 
 # The stamp filename embeds the host's Python minor version (e.g.
 # `.installed.python3.12`) so a host interpreter upgrade — say
@@ -78,7 +79,7 @@ TEST ?=
 # not carry a backend-param suffix). Lima parametrizations and
 # Lima-only tests are filtered out, so this target does not require
 # KVM and runs in ~5-10 min on a warm runner.
-test-e2e-container: $(VENV_STAMP) gateway-image lite-image
+test-e2e-container: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod-cap
 	cd tests/e2e && . .venv/bin/activate && \
 	  python -m pytest -v -rs --timeout=600 \
 	  -k "container or test_lite" $(TEST)
@@ -88,7 +89,7 @@ test-e2e-container: $(VENV_STAMP) gateway-image lite-image
 # The Lima parametrizations require KVM/nested virt; on stock GitHub-
 # hosted runners this target will skip the Lima half via the
 # conftest preflight check (no `/dev/kvm`).
-test-e2e-matrix: $(VENV_STAMP) gateway-image lite-image
+test-e2e-matrix: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod-cap
 	cd tests/e2e && . .venv/bin/activate && \
 	  python -m pytest -v -rs --timeout=600 $(TEST)
 
@@ -140,3 +141,216 @@ clean:
 	cd sandboxd && cargo clean
 	rm -rf tests/e2e/.venv/
 	rm -rf site/node_modules site/dist
+
+# ---------------------------------------------------------------------------
+# Dev-environment setup (M11-S9)
+# ---------------------------------------------------------------------------
+#
+# `make setup-dev-env` is the one-shot operator entry point: it runs
+# every per-host install/configure step the project needs in order for
+# `make test-integration` and `make test-e2e` to pass on a freshly
+# checked-out workspace. Each sub-target is independently runnable
+# and idempotent — re-running `make setup-dev-env` should print a row
+# of `✓ already configured` lines and invoke no `sudo` on the second
+# pass (the principle is "if a step is a no-op, do not even prompt
+# for a password").
+#
+# Each step that mutates host state prints `[sudo] <exact change>`
+# BEFORE invoking sudo, so the operator sees the file path / mode /
+# content that is about to change before authenticating. Operators
+# who want to dry-run can read the line and bail.
+#
+# Stamp directory under `sandboxd/target/.dev-env-stamps/` keeps the
+# stamp files out of the workspace tree but tied to the cargo build
+# output's lifetime — `make clean` wipes them, forcing the next setup
+# to re-verify.
+
+ROUTE_HELPER_PROD_PATH      := /usr/local/libexec/sandboxd/sandbox-route-helper
+ROUTE_HELPER_TEST_PATH      := /usr/local/libexec/sandboxd-test/sandbox-route-helper
+USERS_CONF_PATH             := /etc/sandboxd/users.conf
+BRIDGE_CONF_PATH            := /etc/qemu/bridge.conf
+QEMU_BRIDGE_HELPER_PATH     := /usr/lib/qemu/qemu-bridge-helper
+
+setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap setup-bridge-conf setup-users-conf setup-bridge-helper-setuid
+	@echo "✓ make setup-dev-env complete"
+
+# install-route-helper-prod-cap — production cap'd install at the
+# canonical FHS-libexec path. Default-feature build (no
+# `test-env-override`), so the cap'd binary at this path REFUSES to
+# honor `SANDBOX_USERS_CONF` (the privilege-boundary contract).
+#
+# Stamp-driven on the cargo binary's mtime: if the workspace hasn't
+# rebuilt the route helper, this is a no-op. We deliberately do NOT
+# stamp on the installed path's mtime alone — a freshly-built but
+# already-installed identical binary is detected by the size+mtime
+# pair on the stamp file written after a successful install.
+install-route-helper-prod-cap: sandboxd/target/.dev-env-stamps/route-helper-prod.stamp
+	@true
+
+sandboxd/target/.dev-env-stamps/route-helper-prod.stamp: sandboxd/target/release/sandbox-route-helper
+	@mkdir -p $(dir $@)
+	@if [ -f "$(ROUTE_HELPER_PROD_PATH)" ] && \
+	    cmp -s "sandboxd/target/release/sandbox-route-helper" "$(ROUTE_HELPER_PROD_PATH)" && \
+	    getcap "$(ROUTE_HELPER_PROD_PATH)" 2>/dev/null | grep -q cap_sys_admin; then \
+	  echo "✓ already configured: $(ROUTE_HELPER_PROD_PATH) (cap_sys_admin+ep, content matches build)"; \
+	else \
+	  echo "[sudo] install -m 0755 sandboxd/target/release/sandbox-route-helper $(ROUTE_HELPER_PROD_PATH)"; \
+	  echo "[sudo] setcap cap_sys_admin+ep $(ROUTE_HELPER_PROD_PATH)"; \
+	  sudo install -D -m 0755 \
+	    sandboxd/target/release/sandbox-route-helper \
+	    "$(ROUTE_HELPER_PROD_PATH)"; \
+	  sudo setcap cap_sys_admin+ep "$(ROUTE_HELPER_PROD_PATH)"; \
+	fi
+	@touch $@
+
+# Mark `.PHONY`-equivalent (always-rebuild) so cargo's own up-to-date
+# check runs on every invocation rather than make's mtime check
+# against the binary file. cargo skips the rebuild on a no-op
+# invocation, so this is cheap on the warm-cache path; without
+# `.PHONY` here, an edit to `sandbox-route-helper`'s sources that
+# preserves the binary's mtime (rare but possible — `git checkout`
+# preserves mtimes, for instance) would leave make convinced the
+# target is up-to-date and the install step would silently ship a
+# stale binary. Mirror the test variant below.
+.PHONY: sandboxd/target/release/sandbox-route-helper
+sandboxd/target/release/sandbox-route-helper:
+	cd sandboxd && cargo build --release -p sandbox-route-helper
+
+# install-route-helper-test-cap — test cap'd install. Built with
+# `--features test-env-override` so the integration tests can pass
+# `SANDBOX_USERS_CONF` to point at a tempfile. The two binaries
+# (prod-feature release / test-feature debug) live in separate profile
+# directories under `sandboxd/target/` (`release/` vs `debug/`) so
+# they cannot clobber each other.
+#
+# Built in **debug** profile so the on-disk binary matches what
+# `cargo nextest run --profile integration --features
+# sandbox-route-helper/test-env-override` produces for
+# `CARGO_BIN_EXE_sandbox-route-helper` (nextest defaults to dev). The
+# integration tests then checksum the installed binary against
+# `CARGO_BIN_EXE_sandbox-route-helper` and panic on mismatch — using a
+# release install here would produce a permanent stale-checksum
+# failure regardless of how recently the operator installed. Using
+# the workspace default target-dir (`sandboxd/target/`) means cargo
+# can re-use the same incremental build artifacts that nextest uses,
+# which is what makes the install-time and test-time binaries
+# bit-identical.
+install-route-helper-test-cap: sandboxd/target/.dev-env-stamps/route-helper-test.stamp
+	@true
+
+sandboxd/target/.dev-env-stamps/route-helper-test.stamp: sandboxd/target/debug/sandbox-route-helper
+	@mkdir -p $(dir $@)
+	@if [ -f "$(ROUTE_HELPER_TEST_PATH)" ] && \
+	    cmp -s "sandboxd/target/debug/sandbox-route-helper" "$(ROUTE_HELPER_TEST_PATH)" && \
+	    getcap "$(ROUTE_HELPER_TEST_PATH)" 2>/dev/null | grep -q cap_sys_admin; then \
+	  echo "✓ already configured: $(ROUTE_HELPER_TEST_PATH) (cap_sys_admin+ep, content matches test build)"; \
+	else \
+	  echo "[sudo] install -m 0755 sandboxd/target/debug/sandbox-route-helper $(ROUTE_HELPER_TEST_PATH)"; \
+	  echo "[sudo] setcap cap_sys_admin+ep $(ROUTE_HELPER_TEST_PATH)"; \
+	  sudo install -D -m 0755 \
+	    sandboxd/target/debug/sandbox-route-helper \
+	    "$(ROUTE_HELPER_TEST_PATH)"; \
+	  sudo setcap cap_sys_admin+ep "$(ROUTE_HELPER_TEST_PATH)"; \
+	fi
+	@touch $@
+
+# Build the test-feature debug binary into the workspace's default
+# `sandboxd/target/debug/`. The cargo invocation below mirrors the
+# one `cargo nextest run --workspace --profile integration --features
+# sandbox-route-helper/test-env-override` uses, with `--tests` added
+# so dev-dependency edges (e.g. `ring`, `tempfile`) are unified into
+# the same feature graph nextest sees. A workspace build *without*
+# `--tests` produces a structurally different `sandbox-route-helper`
+# binary (different shared-dep feature flags from dev-dependency
+# edges), so the integration test's checksum check would then fail
+# with "installed route helper is stale" even right after a fresh
+# install. The `--tests` flag also compiles the test harnesses, but
+# that is a fast no-op on the warm-cache path that nextest will hit
+# anyway when it spawns the run.
+#
+# We mark this as `.PHONY`-equivalent (always-rebuild) by routing
+# through cargo's own up-to-date check — cargo skips the rebuild on
+# a no-op invocation, so this is cheap on the warm-cache path.
+.PHONY: sandboxd/target/debug/sandbox-route-helper
+sandboxd/target/debug/sandbox-route-helper:
+	cd sandboxd && cargo build --workspace --tests \
+	  --features sandbox-route-helper/test-env-override
+
+# setup-bridge-conf — `/etc/qemu/bridge.conf`. The QEMU bridge helper
+# (qemu-bridge-helper) reads this file to decide which bridges
+# unprivileged callers may attach to. sandboxd creates per-session
+# bridges named `sb-<id>`; we want either `allow sb-*` or `allow all`.
+#
+# Idempotent + fail-loud:
+#   - If the file already contains exactly `allow all` or
+#     exactly `allow sb-*`, print `✓ already configured` and exit.
+#     A narrower whitelist (e.g. `allow sb-foo` for one specific
+#     bridge) intentionally does NOT match — sandboxd creates a fresh
+#     `sb-<id>` bridge per session, so a single-bridge whitelist is
+#     not sufficient and the operator must broaden it before the
+#     suite passes.
+#   - If the file is missing, create it with `allow all` (the
+#     simplest safe rule for a dev box) — print the `[sudo]` line
+#     ahead of the actual sudo so the operator sees the change.
+#   - If the file exists but does NOT contain a matching rule, refuse
+#     to silently overwrite. Print the current contents and instruct
+#     the operator to fix it manually. We never delete or rewrite an
+#     existing file.
+setup-bridge-conf:
+	@if [ -f "$(BRIDGE_CONF_PATH)" ]; then \
+	  if grep -qE '^allow (all|sb-\*)$$' "$(BRIDGE_CONF_PATH)" 2>/dev/null; then \
+	    echo "✓ already configured: $(BRIDGE_CONF_PATH) authorizes sandbox bridges"; \
+	  else \
+	    echo "ERROR: $(BRIDGE_CONF_PATH) exists but does not authorize sandbox bridges (sb-*)."; \
+	    echo "Current contents:"; \
+	    sed 's/^/    /' "$(BRIDGE_CONF_PATH)"; \
+	    echo "Refusing to mutate an existing file. Add a line such as 'allow sb-*'"; \
+	    echo "(or 'allow all' for a dev host) and re-run \`make setup-dev-env\`."; \
+	    exit 1; \
+	  fi; \
+	else \
+	  echo "[sudo] mkdir -p /etc/qemu  (creating bridge-helper config directory)"; \
+	  echo "[sudo] write to $(BRIDGE_CONF_PATH): 'allow all' (qemu bridge auth for sb-* bridges)"; \
+	  echo "[sudo] chmod 0644 $(BRIDGE_CONF_PATH)"; \
+	  sudo mkdir -p /etc/qemu; \
+	  echo "allow all" | sudo tee "$(BRIDGE_CONF_PATH)" > /dev/null; \
+	  sudo chmod 0644 "$(BRIDGE_CONF_PATH)"; \
+	fi
+
+# setup-users-conf — `/etc/sandboxd/users.conf`. Substitutes `$USER`
+# into `contrib/users.conf.example` and installs it at the canonical
+# path. Idempotent: if the file already exists, leaves it alone (the
+# operator may have customized it; never overwrite admin-curated
+# config).
+setup-users-conf:
+	@if [ -f "$(USERS_CONF_PATH)" ]; then \
+	  echo "✓ already configured: $(USERS_CONF_PATH) (existing file left in place)"; \
+	else \
+	  rendered=$$(sed 's/$$USER/'"$$USER"'/g' contrib/users.conf.example); \
+	  echo "[sudo] mkdir -p /etc/sandboxd  (creating sandboxd config directory)"; \
+	  echo "[sudo] write to $(USERS_CONF_PATH):"; \
+	  echo "$$rendered" | sed 's/^/    /'; \
+	  echo "[sudo] chown root:root $(USERS_CONF_PATH); chmod 0644 $(USERS_CONF_PATH)"; \
+	  sudo mkdir -p /etc/sandboxd; \
+	  printf '%s\n' "$$rendered" | sudo tee "$(USERS_CONF_PATH)" > /dev/null; \
+	  sudo chown root:root "$(USERS_CONF_PATH)"; \
+	  sudo chmod 0644 "$(USERS_CONF_PATH)"; \
+	fi
+
+# setup-bridge-helper-setuid — `qemu-bridge-helper` must be setuid
+# root to create TAP devices on a bridge as a non-privileged caller.
+# Linux distros ship it 0755 by default; we re-apply u+s only if
+# missing.
+setup-bridge-helper-setuid:
+	@if [ ! -e "$(QEMU_BRIDGE_HELPER_PATH)" ]; then \
+	  echo "ERROR: $(QEMU_BRIDGE_HELPER_PATH) does not exist."; \
+	  echo "Install QEMU first: see docs/start/installation.md § 'Install QEMU and KVM'."; \
+	  exit 1; \
+	fi
+	@if [ -u "$(QEMU_BRIDGE_HELPER_PATH)" ]; then \
+	  mode=$$(stat -c '%a' "$(QEMU_BRIDGE_HELPER_PATH)"); \
+	  echo "✓ already configured: $(QEMU_BRIDGE_HELPER_PATH) is setuid (mode $$mode)"; \
+	else \
+	  echo "[sudo] chmod u+s $(QEMU_BRIDGE_HELPER_PATH)  (qemu-bridge-helper must be setuid for unprivileged TAP creation)"; \
+	  sudo chmod u+s "$(QEMU_BRIDGE_HELPER_PATH)"; \
+	fi

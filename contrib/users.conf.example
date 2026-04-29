@@ -1,0 +1,5 @@
+{
+  "subnets": [
+    { "cidr": "10.209.0.0/20", "allow_users": ["$USER"] }
+  ]
+}
