@@ -45,7 +45,8 @@ Path conventions (all absolute to repo root unless qualified):
 | LM11 — Rollout                                                |      16 |          16 |                0 |                0 |        0 |
 | LM12 — Non-goals (out-of-scope conformance)                   |      16 |           7 |               10 |                0 |        0 |
 | LM13 — Route-helper auth hardening, dev-env, test stability   |       6 |           6 |                0 |                0 |        0 |
-| **Grand total**                                               | **258** |     **244** |           **15** |            **1** |    **0** |
+| LM14 — CIDR-scoped orphan reaper (dual-anchor amendment)      |       6 |           6 |                0 |                0 |        0 |
+| **Grand total**                                               | **264** |     **250** |           **15** |            **1** |    **0** |
 
 Note: two rows are dual-counted in the table. LM10.24 carries both
 `(a)` (PR/merge-to-main split shipped) and `(c)` (nightly perf
@@ -53,8 +54,8 @@ benchmarks deferred — todos #73/#74). LM12.2 carries both `(b)`
 (rootless Docker / gVisor / Kata still excluded as a non-goal) and
 `(a)` (the rootless-Docker non-goal is now daemon-enforced — see
 cluster LM12.11–LM12.16 added in M11-S8). Subtract 2 from the
-status sums for the unique-claim count (242 unique (a), 14 unique
-(b) post-S9).
+status sums for the unique-claim count (248 unique (a), 14 unique
+(b) post-S10).
 
 Post-M11-S8: **0 proposed new todos**. All previously-tracked items
 that were in M11-S7 scope (#61, #62, #63, #64, #66, #67, #69, #71,
@@ -78,6 +79,20 @@ path move to FHS § 4.7 libexec, the new `make setup-dev-env`
 operator entry point, and todo #83 (rootless-probe failure
 integration test, folded in from M11-S8 review). The new claim
 cluster lives at LM13.1–LM13.6.
+
+Post-M11-S10: **0 proposed new todos**. M11-S10 closes the
+multi-daemon mass-delete vector by promoting the
+`NetworkManager` allocator pool from a documented constraint to
+an enforced second anchor on the orphan reaper. The reaper now
+filters every `sandbox-net-{12hex}` candidate against the daemon's
+configured pool via a new `DockerOps::inspect_network_ipam` probe;
+out-of-pool networks (and their container/volume siblings, by
+session id) are skipped fail-closed. Companion docs in
+`docs/concepts/networking.md` § "The naming scheme" promote the
+CIDR side from "documented" to "enforced" and add a short
+threat-model note. The new claim cluster lives at LM14.1–LM14.6
+and amends the existing reaper claim cluster (LM9.8–LM9.11)
+in-place.
 
 ---
 
@@ -571,6 +586,13 @@ These are spec self-exclusions covered in LM12. Repeated here as ID pointers:
 
 ### Orphan cleanup on daemon start (LM9.8 – LM9.11)
 
+> **M11-S10 amendment.** The single-anchor name-prefix model below was
+> extended in M11-S10 with a CIDR-pool second anchor. See cluster
+> LM14.1–LM14.6 for the new probe, filter point, transitive ownership
+> rule, and integration tests. The rows below remain accurate as the
+> single-daemon contract; LM14 layers the multi-daemon-safe behavior on
+> top without changing the shipped enumeration / removal primitives.
+
 | #      | Claim                                                                                                                                    | Status | Code                                                                                                                                                    | Test                                                                                                              |
 | ------ | ---------------------------------------------------------------------------------------------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
 | LM9.8  | `docker ps -a --filter name=sandbox-*` enumerates all containers in sandbox namespace                                                    | (a)    | `sandboxd/sandbox-core/src/backend/orphan_reaper.rs::CliDockerOps::list_containers` (filter applied)                                                    | `sandboxd/sandbox-core/src/backend/orphan_reaper.rs:677, 716, 733` `FakeDocker` unit tests covering enumeration   |
@@ -782,6 +804,32 @@ This cluster maps each landed change to its code+test locators.
 
 ---
 
+## LM14 — CIDR-scoped orphan reaper (LM14.1 – LM14.6)
+
+M11-S10 promotes the daemon's `NetworkManager` allocator pool from
+"documented constraint" to "enforced constraint" on the orphan
+reaper. The reaper now identifies `sandbox-net-{12hex}` networks as
+this-sandbox's by **two** anchors instead of one: the existing
+name-prefix check ("name says sandboxd's") plus a new IPAM-pool
+check ("CIDR says **this** sandboxd's"). Out-of-pool networks and
+their session-id-sibling containers / home volumes are skipped
+fail-closed, closing the multi-daemon mass-delete vector
+(`prod` + `dev test`, two parallel test runs, etc.). This cluster
+amends — not replaces — LM9.8–LM9.11; the single-daemon contract
+documented there still holds, with the dual-anchor gate layered
+on top.
+
+| #      | Claim                                                                                                                                                                                                                                                                                          | Status | Code                                                                                                                                                                                                                                                                                                                                                                | Test                                                                                                                                                                                                                                                                                                                                                                                          |
+| ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| LM14.1 | `DockerOps::inspect_network_ipam(name) -> Result<Vec<Cidr4>>` IPAM probe added; `CliDockerOps` shells out to `docker network inspect <name> --format '{{json .IPAM}}'`; `parse_ipam_subnets` extracts IPv4 subnets, drops IPv6 entries, and returns `Vec::new()` for missing-`Config` payloads | (a)    | `sandboxd/sandbox-core/src/backend/orphan_reaper.rs::DockerOps::inspect_network_ipam` (trait method); `CliDockerOps::inspect_network_ipam` (production shell-out, wrapped in `tokio::task::spawn_blocking` via `run_docker_raw`); `parse_ipam_subnets` (pure helper) | `sandboxd/sandbox-core/src/backend/orphan_reaper.rs::tests::parse_ipam_subnets_extracts_ipv4_subnets`, `:parse_ipam_subnets_drops_ipv6_entries`, `:parse_ipam_subnets_empty_config_returns_empty_vec`, `:parse_ipam_subnets_empty_input_returns_empty_vec`, `:parse_ipam_subnets_malformed_json_errors`                                                                                                  |
+| LM14.2 | Filter point in `reap_orphans` network pass: after the name-prefix match, IPAM is fetched and the network is skipped unless every IPv4 subnet's base **and** broadcast both fall inside the daemon's allocator pool. Partial-overlap and empty-IPAM cases are fail-closed                     | (a)    | `sandboxd/sandbox-core/src/backend/orphan_reaper.rs::reap_orphans` ("---- Networks ----" branch — IPAM probe + `ipam_subnets_in_pool` check before `remove_network`); `ipam_subnets_in_pool` helper                                                                                                                                                                | `sandboxd/sandbox-core/src/backend/orphan_reaper.rs::tests::ipam_subnets_in_pool_empty_subnets_is_fail_closed`, `:ipam_subnets_in_pool_single_subnet_inside_pool`, `:ipam_subnets_in_pool_single_subnet_outside_pool`, `:ipam_subnets_in_pool_partial_overlap_is_fail_closed`, `:ipam_subnets_in_pool_all_or_nothing_across_multi_subnet_network`                                                                |
+| LM14.3 | Transitive ownership: when a network is filtered out (out-of-pool, missing IPAM, malformed inspect), every container `sandbox-{id}` and home volume `sandbox-home-{id}` sharing the network's session id is also skipped — the reaper rebuilds the live-by-network skip set in the network pass and consults it in the container and volume passes | (a)    | `sandboxd/sandbox-core/src/backend/orphan_reaper.rs::reap_orphans` populates `out_of_pool_sids: HashSet<SessionId>` during the network pass; the container and volume passes consult it before partitioning                                                                                                                                                          | `sandboxd/sandbox-core/src/backend/orphan_reaper.rs::tests::reap_orphans_skips_network_with_out_of_pool_ipam`, `:reap_orphans_skips_network_when_inspect_errors`, `:reap_orphans_skips_network_with_empty_ipam_data`; integration tests in `sandboxd/sandbox-core/tests/integration_orphan_reaper_cidr.rs::integration_reaper_skips_out_of_pool_network` and `:integration_reaper_skips_network_with_missing_ipam` confirm transitive container+volume preservation against real Docker |
+| LM14.4 | `reap_orphans` constructor takes the daemon's allocator pool CIDR as `pool: &Cidr4`; the daemon-startup wiring at `sandboxd/sandboxd/src/main.rs` passes the resolved `allocation_pool` (computed by `resolve_allocation_pool` from `users.conf` at startup) so the reaper sees the same pool `NetworkManager` allocates from | (a)    | `sandboxd/sandbox-core/src/backend/orphan_reaper.rs::reap_orphans` signature `(docker, live, pool: &Cidr4)`; `sandboxd/sandboxd/src/main.rs` startup block calls `reap_orphans(&docker_ops, &live_session_ids, &allocation_pool)` after `resolve_allocation_pool` returns                                                                                          | `sandboxd/sandbox-core/src/backend/orphan_reaper.rs::tests::reap_orphans_reaps_network_with_in_pool_ipam` (positive path) and `:reap_orphans_skips_network_with_out_of_pool_ipam` (negative path); integration coverage in `sandboxd/sandbox-core/tests/integration_orphan_reaper_cidr.rs::integration_reaper_reaps_in_pool_network` and `:integration_reaper_skips_out_of_pool_network`                                  |
+| LM14.5 | Module docstring at `orphan_reaper.rs:11+` extended with a § "Dual-anchor ownership model (M11-S10)" block describing the two-anchor model, the fail-closed contract, and the transitive container/volume rule; mirrors the prose addition to `docs/concepts/networking.md` § "Dual-anchor enforcement (CIDR pool)" | (a)    | `sandboxd/sandbox-core/src/backend/orphan_reaper.rs:11-56` module docstring (new "Dual-anchor ownership model" section); `docs/concepts/networking.md` § "The naming scheme" extended with "Dual-anchor enforcement (CIDR pool)" and "Threat model — multi-daemon co-existence" subsections; cross-reference link added to the existing "Cross-references" subsection | docs/code-docstring symmetry pinned by review; `make docs-build` green and `starlight-links-validator` clean                                                                                                                                                                                                                                                                              |
+| LM14.6 | Three integration tests in `sandboxd/sandbox-core/tests/integration_orphan_reaper_cidr.rs` pin the CIDR-anchor contract against real Docker: out-of-pool network preserved (and its container+volume siblings), in-pool orphan network reaped (with siblings), IPv4-IPAM-empty network preserved (fail-closed). Both reaper test files share the `docker-sandbox-namespace` nextest test-group so they serialize on the host's `sandbox-net-*` namespace | (a)    | `sandboxd/sandbox-core/tests/integration_orphan_reaper_cidr.rs` (file); `sandboxd/.config/nextest.toml` `docker-sandbox-namespace` group filter widened to include `test(/^integration_reaper_/)` so the new file's tests serialize alongside `integration_orphan_reaper_*`                                                                                          | `sandboxd/sandbox-core/tests/integration_orphan_reaper_cidr.rs::integration_reaper_skips_out_of_pool_network`, `:integration_reaper_reaps_in_pool_network`, `:integration_reaper_skips_network_with_missing_ipam`                                                                                                                                                                          |
+
+---
+
 Additional self-exclusions called out as "What's deliberately not done"
 (rolled into LM7 / LM8 sections above; restated here for completeness):
 
@@ -789,6 +837,7 @@ Additional self-exclusions called out as "What's deliberately not done"
 - CLI § (LM8.28): `sandbox admin`; `prune-images`; `--lite` gating env var; auto-fallback; separate `sandbox-lite` binary. **Verification:** as in LM12.8/9/10.
 - Image building § (LM3.17/LM3.18): registry pull; BYO Dockerfile; multi-stage layer caching across daemon versions. **Verification:** as in LM12.1/5.
 - Testing § "What we are not testing": kernel exploits / container escape; extreme resource exhaustion beyond limits; cross-backend migration. **Verification:** test surface restricted to documented assertions; no escape-test infrastructure (`grep -r "escape\|exploit" tests/e2e/test_lite.py` returns 0 hits).
+- LM14 § (M11-S10 explicit deferrals): kernel-level packet-path isolation between two sandboxds; multi-daemon deployment runbook in `docs/operator/`; IPv6 IPAM filtering; allocator-pool collision detection at daemon startup. **Verification:** the CIDR anchor is metadata-only by design (M11.md S10 § "Explicitly deferred"); IPv6 IPAM entries are silently dropped by `parse_ipam_subnets` rather than gated; no operator runbook exists under `docs/operator/` (directory unused as of S10); daemon startup does not probe the host for a competing sandboxd's pool.
 
 ---
 

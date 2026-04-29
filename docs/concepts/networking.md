@@ -90,6 +90,18 @@ These prefixes are *not* IFNAMSIZ-bound — they're Docker resource names, not k
 
 The current contract is that `sandbox-` is the namespace root, the second segment selects the resource kind (no second segment = VM/container, `gw-` = gateway, `net-` = network, `home-` = volume), and the suffix is always a 12-hex session id. Stay inside that shape.
 
+#### Dual-anchor enforcement (CIDR pool)
+
+The name-prefix anchor above is the first ownership check the reaper runs: "name says sandboxd's." On a host running a single sandboxd that is sufficient. On a host running two sandboxds — prod plus a dev test, two parallel test runs, a dev build coexisting with a stale prod prefix — it is not, because every sandboxd uses the same `sandbox-`, `sandbox-home-`, and `sandbox-net-` prefixes. Without a second anchor each daemon's reaper would mass-delete the other's resources on next boot.
+
+The second anchor is the daemon's `NetworkManager` allocator pool. The pool is resolved from `users.conf` at startup (`sandboxd/sandboxd/src/main.rs::resolve_allocation_pool`) and pinned for the lifetime of the daemon. Networks whose IPAM-reported IPv4 subnets do not lie fully inside the pool are skipped — "name says sandboxd's, *and* CIDR says **this** sandboxd's." Containers and home volumes inherit the gate transitively: if a network for a given session id is not reapable under the CIDR check, the matching `sandbox-{id}` and `sandbox-home-{id}` resources are also left alone.
+
+The CIDR check is fail-closed. Networks with no IPv4 IPAM data, malformed `docker network inspect` output, partial in-pool overlap (e.g. one /28 in-pool, one /28 out-of-pool), or any IPv4 subnet outside the pool are all skipped — the reaper removes only what it can prove is `this sandboxd's`. The inverse rule (reaping on partial in-pool overlap or trusting an empty IPAM block as in-pool) would let a transient `docker network inspect` hiccup mass-delete a neighboring sandboxd's resources, which is the exact failure mode this anchor exists to prevent.
+
+#### Threat model — multi-daemon co-existence
+
+A misconfigured second sandboxd on the same host cannot mass-delete this sandboxd's resources. The CIDR anchor scopes the reaper's reach to the daemon's own allocator pool; any operator who runs two daemons must give each its own pool (operationally, a separate `users.conf` subnet). Two daemons sharing the same pool will still collide at allocation time — that is an operator configuration gap (`docs/operator/`, future), not a kernel-level isolation property. Kernel-level packet-path isolation between two sandboxds on the same host is out of scope for the reaper anchor; this is metadata-only.
+
 #### Cross-references
 
 - Producer: `sandbox-core/src/lima.rs::vm_name` and `VM_NAME_PREFIX` (also reused for the lite container's name).
@@ -99,6 +111,7 @@ The current contract is that `sandbox-` is the namespace root, the second segmen
 - Authoritative parser: `sandbox-core/src/lima.rs::parse_session_id_from_name`.
 - Reaper consumers: `sandbox-core/src/backend/orphan_reaper.rs::parse_container_session_id` (delegates to the lima parser), `parse_home_volume_session_id`, `parse_network_session_id`, plus the `HOME_VOLUME_PREFIX` and `NETWORK_PREFIX` constants.
 - Length guards: `network.rs:805-813` (bridge IFNAMSIZ), `qmp.rs:451-459` (TAP IFNAMSIZ).
+- Dual-anchor enforcement: `sandbox-core/src/backend/orphan_reaper.rs::DockerOps::inspect_network_ipam` and `ipam_subnets_in_pool` are the IPAM probe and CIDR-pool gate; the daemon-startup wiring lives at `sandboxd/sandboxd/src/main.rs` (the `reap_orphans` call alongside the resolved `allocation_pool`).
 
 ## The gateway
 
