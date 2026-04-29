@@ -187,6 +187,29 @@ impl Daemon {
             .env("XDG_DATA_HOME", tmp.path())
             .env("XDG_RUNTIME_DIR", tmp.path())
             .env("SANDBOX_USERS_CONF", &users_conf)
+            // M11-S9 — the production-feature route helper at
+            // `/usr/local/libexec/sandboxd/sandbox-route-helper` ignores
+            // `SANDBOX_USERS_CONF` (privilege boundary: a cap'd helper
+            // must not be redirectable to an attacker-controlled config
+            // file via a process-environment variable). Tests #2, #4
+            // run a real lite session and need the helper's
+            // authorization flow to read the SAME tempfile users.conf
+            // the daemon uses, otherwise the helper denies the route
+            // install with "gateway ip <test-subnet> not in any
+            // subnet". Pointing the daemon at the test-cap'd helper
+            // (which is built with the `test-env-override` feature and
+            // therefore consults `SANDBOX_USERS_CONF`) keeps the
+            // daemon's allocator pool and the helper's auth check on
+            // the same tempfile config without weakening the
+            // production privilege boundary. The test-cap'd helper
+            // lives at the canonical test install path that
+            // `make install-route-helper-test-cap` populates; see
+            // `sandbox-route-helper/tests/integration_route_helper.rs`
+            // for the same path constant.
+            .env(
+                "SANDBOX_ROUTE_HELPER_PATH",
+                "/usr/local/libexec/sandboxd-test/sandbox-route-helper",
+            )
             // Keep the log volume modest — `info` is enough to debug a
             // stuck startup, `debug` would flood the file with per-poll
             // chatter.
@@ -691,6 +714,95 @@ fn integration_default_hardened_docker_proceeds() {
     );
     rm.assert_success("sandbox rm -y after default-hardened create");
     cleanup.disarm();
+}
+
+/// Test 5 — probe failure surfaces as a daemon-side gateway error
+/// (todo #83 from M11-S8 / kio-reviewer NIT 3, folded into M11-S9).
+///
+/// When the docker-info PATH stub is configured to `Fail`, the
+/// rootless-Docker probe at session-create time bubbles up its
+/// underlying error rather than silently defaulting to "rootless" or
+/// "default-hardened". The daemon must surface this as a typed
+/// `SandboxError::Gateway` (HTTP 500), not absorb it into a permissive
+/// classification.
+///
+/// This pins three distinct contracts:
+///
+/// 1. The probe's failure path is wired through to the
+///    session-create gate (not a no-op).
+/// 2. The daemon maps probe failures to HTTP 500 (Gateway, not 400 —
+///    the request is fine; the host is broken).
+/// 3. The CLI surfaces enough of the underlying error for an
+///    operator to diagnose ("rootless-docker probe stub: configured
+///    to fail" is the stub's stderr; we look for the
+///    machine-readable "gateway error" prefix the daemon's
+///    `SandboxError::Gateway` produces via Display).
+///
+/// As with test #1, no docker artifacts (sandbox-* containers,
+/// networks, volumes) must be created — the probe gate runs before
+/// any allocation.
+#[test]
+fn integration_rootless_docker_probe_failure_surfaces_as_gateway_error() {
+    let _stub = DockerPathStub::new(DockerInfoBehavior::Fail);
+    let daemon = Daemon::spawn(|_cmd| {});
+
+    // Snapshot the docker artifact namespace so we can prove no new
+    // sandbox-* artifacts appear after the rejected create.
+    let artifacts_before = list_sandbox_artifacts();
+
+    let out = run_cli(
+        &daemon,
+        &["create", "--lite", "--name", "probe-fail"],
+        Duration::from_secs(60),
+    );
+
+    assert!(
+        !out.status.success(),
+        "sandbox create --lite must fail when the rootless probe itself errors out;\n\
+         exit code: {:?}\nstdout: {}\nstderr: {}",
+        out.status.code(),
+        out.stdout,
+        out.stderr,
+    );
+
+    // The daemon must surface the probe failure as `Gateway`, not
+    // silently treat it as default-hardened (which would proceed) or
+    // as rootless-refused (which would be the `RootlessDockerRefused`
+    // path with a different message). The CLI relays the daemon's
+    // Display string verbatim; "gateway error" is the prefix from
+    // `SandboxError::Gateway`'s `#[error("gateway error: {0}")]`.
+    let combined = format!("{}\n{}", out.stdout, out.stderr);
+    assert!(
+        combined.contains("gateway error") || combined.contains("rootless-docker probe"),
+        "expected probe-failure relay token in CLI output;\n--- stdout ---\n{}\n\
+         --- stderr ---\n{}",
+        out.stdout,
+        out.stderr,
+    );
+
+    // Critically: the rejection MUST NOT mention `--force-rootless-docker`.
+    // That hint belongs to the `RootlessDockerRefused` path (test #1) and
+    // would mislead an operator whose host's docker-info command is broken
+    // — passing the flag would not fix anything.
+    assert!(
+        !combined.contains("--force-rootless-docker"),
+        "probe-failure error must not point at --force-rootless-docker (that's the \
+         rootless-refused path's hint, distinct from a probe failure);\n\
+         --- stdout ---\n{}\n--- stderr ---\n{}",
+        out.stdout,
+        out.stderr,
+    );
+
+    // No artifacts allocated. Mirrors test #1's contract — the probe
+    // gate runs before per-session network/image/container allocation
+    // regardless of which probe outcome (rootless / default / fail)
+    // is returned.
+    let artifacts_after = list_sandbox_artifacts();
+    let leaked: Vec<&String> = artifacts_after.difference(&artifacts_before).collect();
+    assert!(
+        leaked.is_empty(),
+        "probe-failure rejection must not allocate any sandbox-* docker artifacts; leaked: {leaked:?}",
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -247,57 +247,55 @@ fn init_tracing(log_file: Option<&std::path::Path>) -> std::io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Route-helper path resolution (M11-S5 Phase 5A fixup)
+// Route-helper path resolution
 // ---------------------------------------------------------------------------
 //
-// `sandbox-route-helper` is a sibling binary the daemon spawns when a lite
-// session starts (see `ContainerRuntime::start` → `invoke_route_helper`).
-// The original Phase 5A wiring passed the bare name `"sandbox-route-helper"`
-// and relied on `Command::new()`'s `$PATH` lookup, but neither the e2e
-// fixture nor the cargo workspace layout puts `target/debug/` on the
-// daemon's `PATH`. The result was that every lite session create failed at
-// container start with `os error 2`.
+// `sandbox-route-helper` is the privileged setcap binary the daemon
+// spawns when a lite session starts (see `ContainerRuntime::start` →
+// `invoke_route_helper`). M11-S9 collapsed the resolver from four
+// candidate sources to two; the previous design (sibling-of-daemon +
+// canonical install + `$PATH`-walk + cap check) shipped silent fallback
+// modes that were either invisible (`$PATH` outside the operator's
+// awareness) or mis-targeted (sibling-of-daemon picks an un-cap'd
+// `target/debug/` build under 9p / virtio-fs / bind-mount layouts that
+// `setcap` cannot annotate).
 //
-// `resolve_route_helper_path` looks up the helper at deploy-friendly
-// locations and surfaces a single, operator-actionable error if no
-// *usable* candidate is found. "Usable" means: the file exists *and* it
-// carries the `CAP_SYS_ADMIN` file capability (effective). The cap check
-// matters because in dev workspaces the cargo build directory often
-// lives on a host-share / bind-mount filesystem that does not honor
-// `security.capability` xattrs (`setcap` returns "Operation not
-// supported"); the same constraint the route-helper's own integration
-// tests work around by copying the binary to a tempdir before applying
-// caps. Without the cap check, the resolver would happily pick the
-// un-cap'd sibling and the failure surface would move from "spawn os
-// error 2" to "setns EPERM" at session start — equally late and equally
-// confusing. With the cap check, the resolver fails fast at the
-// daemon-error layer with a message naming every location tried.
+// Lookup order (M11-S9):
 //
-// Lookup order:
+//   0. `$SANDBOX_ROUTE_HELPER_PATH` — explicit operator override. If
+//      set, the resolver uses ONLY this path. Fail-closed: if the path
+//      is missing or lacks the cap xattr, the daemon errors out with
+//      a message naming the env var. This is for tests and unusual
+//      deployments; production operators should not set it.
+//   1. `/usr/local/libexec/sandboxd/sandbox-route-helper` — canonical
+//      production install path (FHS § 4.7: libexec is for non-user-
+//      facing helper executables). Installed by
+//      `make install-route-helper-prod-cap`.
 //
-//   1. Sibling of the running daemon binary (`current_exe()`'s directory).
-//      Covers cargo workspace runs (`target/debug/` co-located with
-//      `sandboxd`) and most installed layouts where both binaries ship in
-//      the same `bin/` directory.
-//   2. The well-known install path `/usr/local/bin/sandbox-route-helper`,
-//      matching the install-docs runbook
-//      (`docs/start/installation.md` § "sandbox-route-helper").
-//   3. `$PATH` lookup as a last resort (preserves the original behavior
-//      for operators who deliberately drop the helper into a directory
-//      other than `/usr/local/bin`).
+// Cap-xattr check stays. "Usable" means the file exists AND carries
+// the `CAP_SYS_ADMIN` file capability with the effective bit set. A
+// missing or un-cap'd binary at the canonical path triggers an error
+// pointing at the make target and the install docs.
 //
 // The function returns a `SandboxError::Internal` rather than a custom
-// error type so call sites can propagate it through the existing daemon
-// error pipeline. The error message lists every location tried, plus
-// the cap requirement, so an operator can immediately see why the
-// daemon refused to use any of them.
+// error type so call sites can propagate it through the existing
+// daemon error pipeline. The error message names both candidates (the
+// env-var path if it was set, and the canonical install path always),
+// the cap requirement, and the `make` target an operator can run to
+// fix it.
 
-/// Default install path for the route helper, referenced both by the
-/// resolver and by the operator-facing error message it produces.
-const ROUTE_HELPER_INSTALL_PATH: &str = "/usr/local/bin/sandbox-route-helper";
+/// Canonical install path (FHS § 4.7). Used as the only on-disk
+/// candidate when `SANDBOX_ROUTE_HELPER_PATH` is not set, and named in
+/// the error message in either case.
+const ROUTE_HELPER_INSTALL_PATH: &str = "/usr/local/libexec/sandboxd/sandbox-route-helper";
 
-/// Bare-name of the helper binary, used for both filesystem candidates
-/// and `$PATH` walks.
+/// Environment variable for explicit operator override of the
+/// route-helper path. When set, the resolver uses this path and only
+/// this path (fail-closed if missing or un-cap'd). Intended for tests
+/// and unusual deployments; production operators should not set it.
+const ROUTE_HELPER_PATH_ENV: &str = "SANDBOX_ROUTE_HELPER_PATH";
+
+/// Bare-name of the helper binary, used in error-message context.
 const ROUTE_HELPER_BINARY_NAME: &str = "sandbox-route-helper";
 
 /// Linux capability bit number for `CAP_SYS_ADMIN`, the only capability
@@ -328,97 +326,68 @@ const VFS_CAP_DATA_V3_SIZE: usize = 24;
 ///
 /// See the module-level comment above for the lookup order, the cap-
 /// requirement check, and the rationale. The function is fail-closed:
-/// if no candidate carries `CAP_SYS_ADMIN+ep`, it returns a
-/// `SandboxError::Internal` whose message names every location it
-/// inspected and the cap requirement.
+/// if the env-var override is set but its target is missing or
+/// un-cap'd, the resolver errors out *without* falling through to the
+/// canonical path — explicit operator intent must not be silently
+/// overruled. If the env var is unset, the resolver consults the
+/// canonical install path and errors out if the file is missing or
+/// un-cap'd, naming the make target operators can run to install it.
 fn resolve_route_helper_path() -> Result<PathBuf, SandboxError> {
-    let current_exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    let env_override = std::env::var_os(ROUTE_HELPER_PATH_ENV).map(PathBuf::from);
     let install_path = PathBuf::from(ROUTE_HELPER_INSTALL_PATH);
-    let path_var = std::env::var_os("PATH");
-    let candidates = default_route_helper_candidates(
-        current_exe_dir.as_deref(),
-        &install_path,
-        path_var.as_deref(),
-    );
-    let exe_dir_display = current_exe_dir
-        .as_ref()
-        .map(|d| d.display().to_string())
-        .unwrap_or_else(|| "<unavailable: current_exe() failed>".to_string());
-    resolve_route_helper_path_from(
-        candidates,
-        has_required_caps,
-        &exe_dir_display,
-        &install_path,
-    )
-}
-
-/// Build the ordered candidate list the resolver consults. Split out so
-/// the unit tests can substitute a synthetic candidate iterator without
-/// having to fake `current_exe()` or mutate `$PATH`.
-fn default_route_helper_candidates(
-    current_exe_dir: Option<&std::path::Path>,
-    install_path: &std::path::Path,
-    path_var: Option<&std::ffi::OsStr>,
-) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    // 1. Sibling of the daemon binary.
-    if let Some(dir) = current_exe_dir {
-        out.push(dir.join(ROUTE_HELPER_BINARY_NAME));
-    }
-    // 2. Well-known install path.
-    out.push(install_path.to_path_buf());
-    // 3. `$PATH` walk. Mirrors `Command::new()`'s lookup so operators
-    //    can drop the helper into any PATH-listed directory.
-    if let Some(path_var) = path_var {
-        for dir in std::env::split_paths(path_var) {
-            // `split_paths` yields empty entries for trailing/duplicate
-            // colons (`PATH=/usr/local/bin::/usr/bin`); skip them so we
-            // don't accidentally probe `./sandbox-route-helper`.
-            if dir.as_os_str().is_empty() {
-                continue;
-            }
-            out.push(dir.join(ROUTE_HELPER_BINARY_NAME));
-        }
-    }
-    out
+    resolve_route_helper_path_from(env_override.as_deref(), &install_path, has_required_caps)
 }
 
 /// Pure inner of [`resolve_route_helper_path`].
 ///
-/// Walks the supplied `candidates` in order and returns the first one
-/// that satisfies `is_usable`. Returns a `SandboxError::Internal`
-/// naming every location it tried (plus the cap requirement) when no
-/// candidate is usable.
+/// Two-step resolver:
 ///
-/// Split out — and parameterized over `is_usable` — so the unit tests
-/// can drive the priority logic with a stub predicate. Setting real
-/// file capabilities from a unit test requires `CAP_SETFCAP` and is
-/// not portable, so cap-check coverage lives in [`has_required_caps`]
-/// itself; the priority logic is exercised here without touching
-/// xattrs.
-fn resolve_route_helper_path_from<I, F>(
-    candidates: I,
-    is_usable: F,
-    exe_dir_display: &str,
+///   - If `env_override` is `Some(path)`, that is the ONLY candidate.
+///     Fail-closed if `is_usable(path)` is false — explicit operator
+///     intent is not silently overruled.
+///   - Otherwise, the canonical `install_path` is the only candidate.
+///     Same `is_usable` requirement; an un-cap'd file at the canonical
+///     path is a misconfiguration, not a "fall back to something else"
+///     situation.
+///
+/// Parameterized over `is_usable` so the unit tests can drive the
+/// resolver without `setcap`-ing real binaries. Setting file caps
+/// requires `CAP_SETFCAP` and is not portable in a unit test
+/// environment.
+fn resolve_route_helper_path_from<F>(
+    env_override: Option<&std::path::Path>,
     install_path: &std::path::Path,
+    is_usable: F,
 ) -> Result<PathBuf, SandboxError>
 where
-    I: IntoIterator<Item = PathBuf>,
     F: Fn(&std::path::Path) -> bool,
 {
-    for candidate in candidates {
-        if is_usable(&candidate) {
-            return Ok(candidate);
+    if let Some(env_path) = env_override {
+        if is_usable(env_path) {
+            return Ok(env_path.to_path_buf());
         }
+        return Err(SandboxError::Internal(format!(
+            "sandbox-route-helper not usable at {env_path} (set via \
+             ${ROUTE_HELPER_PATH_ENV}); the file must exist as a regular \
+             file AND carry the CAP_SYS_ADMIN file capability (effective): \
+             `sudo setcap cap_sys_admin+ep {env_path}`. To use the canonical \
+             install instead, unset {env}; the resolver then looks up \
+             {install} (installed by `make install-route-helper-prod-cap`). \
+             See docs/start/installation.md § \"sandbox-route-helper\".",
+            env_path = env_path.display(),
+            env = ROUTE_HELPER_PATH_ENV,
+            install = install_path.display(),
+        )));
+    }
+    if is_usable(install_path) {
+        return Ok(install_path.to_path_buf());
     }
     Err(SandboxError::Internal(format!(
-        "no usable sandbox-route-helper found; checked (1) sibling of daemon binary \
-         at {exe_dir_display}/{ROUTE_HELPER_BINARY_NAME}, (2) install path \
-         {install} and (3) $PATH lookup. Each candidate must exist as a regular \
-         file AND carry the CAP_SYS_ADMIN file capability (effective): \
-         `sudo setcap cap_sys_admin+ep <path>`. See \
+        "no usable {ROUTE_HELPER_BINARY_NAME} found at the canonical install \
+         path {install}. The file must exist as a regular file AND carry the \
+         CAP_SYS_ADMIN file capability (effective). Install it with: \
+         `make install-route-helper-prod-cap` (production) or set \
+         ${ROUTE_HELPER_PATH_ENV} to a custom path. See \
          docs/start/installation.md § \"sandbox-route-helper\".",
         install = install_path.display(),
     )))
@@ -430,12 +399,13 @@ where
 ///
 /// Implemented as a thin wrapper around [`read_cap_xattr`] so the
 /// resolver's call site stays a single named predicate. We deliberately
-/// treat *every* failure mode as "not usable, move on": a missing file
-/// (ENOENT), a missing or empty `security.capability` xattr (ENODATA),
-/// an unreadable file (EACCES), a malformed xattr blob, or anything
-/// else, all reduce to `false`. The resolver's "no usable candidate"
-/// error message names every location tried so operators can debug
-/// from the negative result without a per-candidate reason code.
+/// treat *every* failure mode as "not usable, fail closed": a missing
+/// file (ENOENT), a missing or empty `security.capability` xattr
+/// (ENODATA), an unreadable file (EACCES), a malformed xattr blob, or
+/// anything else, all reduce to `false`. The resolver's error message
+/// names whichever path it consulted (env override or canonical) plus
+/// the cap requirement and the make target an operator can run, so the
+/// negative result is debuggable without a per-candidate reason code.
 fn has_required_caps(path: &std::path::Path) -> bool {
     if !path.is_file() {
         return false;
@@ -1235,10 +1205,12 @@ async fn create_session(
         // the setcap helper at start time to install the default
         // route via the gateway IP inside the container's netns
         // (spec § "Routing"). [`resolve_route_helper_path`] resolves
-        // the absolute path of the helper at the call site, preferring
-        // the sibling-of-`current_exe()` location (covers cargo
-        // workspace + most installed layouts) and falling back to
-        // `/usr/local/bin/sandbox-route-helper` and then to `$PATH`.
+        // the absolute path of the helper at the call site via a
+        // two-step lookup: (0) the `$SANDBOX_ROUTE_HELPER_PATH` env
+        // var (fail-closed if set but missing/un-cap'd), (1) the
+        // canonical install path
+        // `/usr/local/libexec/sandboxd/sandbox-route-helper` per FHS
+        // § 4.7. Each candidate must carry `CAP_SYS_ADMIN+ep`.
         // Surfacing the lookup error here means lite-mode session
         // creation fails fast with an operator-actionable message
         // rather than at `docker start` time with `os error 2`.
@@ -7019,146 +6991,115 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // M11-S5 Phase 5A fixup — route-helper path resolution.
+    // M11-S9 — route-helper path resolution (two-step resolver).
     //
-    // Three layers of coverage:
+    // The resolver collapsed in M11-S9 from four candidate sources to
+    // two: `$SANDBOX_ROUTE_HELPER_PATH` (env-var override, fail-closed
+    // if set but unusable) and the canonical install path
+    // `/usr/local/libexec/sandboxd/sandbox-route-helper`. The four
+    // permutations the unit tests cover line up with the four corners
+    // of (env-var-set | env-var-unset) × (path-usable | path-unusable):
     //
-    //   1. `default_route_helper_candidates` — assembling the priority-
-    //      ordered candidate list from `current_exe()`-dir + install-path
-    //      + `$PATH`. Pure list-builder; no I/O.
-    //   2. `resolve_route_helper_path_from` — walking the candidate list
-    //      against a stub `is_usable` predicate. We deliberately stub
-    //      `is_usable` rather than literally `setcap`-ing fixture files
-    //      because real file capabilities require `CAP_SETFCAP` (so a
-    //      hermetic unit test cannot apply them) and the cargo
-    //      workspace lives on filesystems where `setcap` returns
-    //      "Operation not supported" anyway.
-    //   3. `xattr_has_cap_sys_admin_effective` — decoding a raw
-    //      `vfs_cap_data` blob into a boolean cap presence answer.
-    //      Coverage of revision 2 / revision 3 layouts plus the deny
-    //      branches (no effective bit, wrong revision, missing
-    //      CAP_SYS_ADMIN, malformed length).
+    //   1. env-set, env-path usable → resolver returns env path
+    //   2. env-set, env-path unusable → resolver errors, names env var
+    //   3. env-unset, canonical usable → resolver returns canonical
+    //   4. env-unset, canonical unusable → resolver errors, names make target
     //
-    // (1) and (2) together verify the resolver's priority-and-fallthrough
-    // contract. (3) verifies the cap decoder. Wiring of `has_required_caps`
-    // → `read_cap_xattr` → `xattr_has_cap_sys_admin_effective` is
-    // non-recursive plumbing, so the integration story is "if the decoder
-    // is correct and the resolver respects its predicate, the production
-    // path is correct" — no extra integration test required at the unit
-    // layer.
+    // We deliberately stub `is_usable` rather than `setcap`-ing fixture
+    // files because real file capabilities require `CAP_SETFCAP` (so a
+    // hermetic unit test cannot apply them) and the cargo workspace
+    // commonly lives on filesystems where `setcap` returns "Operation
+    // not supported" anyway. The cap-decoder logic is unit-tested
+    // separately through `xattr_has_cap_sys_admin_effective`.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn default_route_helper_candidates_includes_sibling_install_and_path_walk() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let exe_dir = tmp.path();
-        let install_path = std::path::PathBuf::from("/usr/local/bin/sandbox-route-helper");
-        // Two PATH entries plus an empty entry the builder must skip
-        // (mirrors `PATH=/foo::/bar` shapes in shells that allow them).
-        let path_var = std::ffi::OsString::from("/dir-a::/dir-b");
-
-        let candidates =
-            default_route_helper_candidates(Some(exe_dir), &install_path, Some(&path_var));
-
-        assert_eq!(
-            candidates.len(),
-            4,
-            "expected sibling + install + 2 PATH dirs (the empty PATH \
-             segment must be skipped); got {candidates:?}"
-        );
-        assert_eq!(candidates[0], exe_dir.join("sandbox-route-helper"));
-        assert_eq!(candidates[1], install_path);
-        assert_eq!(
-            candidates[2],
-            std::path::PathBuf::from("/dir-a/sandbox-route-helper")
-        );
-        assert_eq!(
-            candidates[3],
-            std::path::PathBuf::from("/dir-b/sandbox-route-helper")
-        );
-    }
-
-    #[test]
-    fn default_route_helper_candidates_omits_sibling_when_current_exe_unavailable() {
-        let install_path = std::path::PathBuf::from("/usr/local/bin/sandbox-route-helper");
-        let candidates = default_route_helper_candidates(None, &install_path, None);
-        assert_eq!(
-            candidates,
-            vec![install_path],
-            "with no exe-dir and no PATH, only the install path is offered"
-        );
-    }
-
-    #[test]
-    fn resolve_route_helper_path_from_returns_first_usable_candidate() {
-        let candidates = vec![
-            std::path::PathBuf::from("/sibling/sandbox-route-helper"),
-            std::path::PathBuf::from("/usr/local/bin/sandbox-route-helper"),
-            std::path::PathBuf::from("/path-dir/sandbox-route-helper"),
-        ];
-        // The sibling is "usable", so it wins.
+    fn resolve_route_helper_path_from_uses_env_override_when_set_and_usable() {
+        let env_path = std::path::PathBuf::from("/tmp/explicit-route-helper");
+        let install_path = std::path::Path::new("/usr/local/libexec/sandboxd/sandbox-route-helper");
         let resolved = resolve_route_helper_path_from(
-            candidates.clone(),
-            |p| p.starts_with("/sibling"),
-            "/sibling",
-            std::path::Path::new("/usr/local/bin/sandbox-route-helper"),
+            Some(env_path.as_path()),
+            install_path,
+            // Predicate: only the env-override path is "usable". The
+            // canonical install path is intentionally also marked
+            // usable to prove the env override TAKES PRECEDENCE — a
+            // resolver that walks the canonical path on env-set would
+            // fail this test by returning the canonical path.
+            |p| p == env_path.as_path() || p == install_path,
         )
-        .expect("sibling is usable");
-        assert_eq!(resolved, candidates[0]);
+        .expect("env override path is usable; resolver must use it");
+        assert_eq!(resolved, env_path);
     }
 
     #[test]
-    fn resolve_route_helper_path_from_falls_through_when_earlier_candidate_lacks_caps() {
-        let candidates = vec![
-            std::path::PathBuf::from("/sibling/sandbox-route-helper"),
-            std::path::PathBuf::from("/usr/local/bin/sandbox-route-helper"),
-            std::path::PathBuf::from("/path-dir/sandbox-route-helper"),
-        ];
-        // Sibling exists-but-no-caps (predicate returns false for the
-        // sibling); the install path is usable, so it wins.
-        let resolved = resolve_route_helper_path_from(
-            candidates.clone(),
-            |p| p.starts_with("/usr/local/bin"),
-            "/sibling",
-            std::path::Path::new("/usr/local/bin/sandbox-route-helper"),
+    fn resolve_route_helper_path_from_errors_when_env_override_set_but_unusable() {
+        // env-set, env-path NOT usable, canonical IS usable. The
+        // resolver MUST fail closed — explicit operator intent
+        // (setting the env var) is not silently overruled by falling
+        // through to the canonical path. The error must name the env
+        // var so the operator knows what to fix.
+        let env_path = std::path::PathBuf::from("/tmp/missing-route-helper");
+        let install_path = std::path::Path::new("/usr/local/libexec/sandboxd/sandbox-route-helper");
+        let err = resolve_route_helper_path_from(
+            Some(env_path.as_path()),
+            install_path,
+            |p| p == install_path, // only canonical is usable; env-path is not
         )
-        .expect("install path is usable; resolver must skip the un-cap'd sibling");
-        assert_eq!(resolved, candidates[1]);
-    }
-
-    #[test]
-    fn resolve_route_helper_path_from_errors_when_no_candidate_is_usable() {
-        let candidates = vec![
-            std::path::PathBuf::from("/sibling/sandbox-route-helper"),
-            std::path::PathBuf::from("/usr/local/bin/sandbox-route-helper"),
-        ];
-        let exe_dir_display = "/sibling";
-        let install_path = std::path::Path::new("/usr/local/bin/sandbox-route-helper");
-        let err =
-            resolve_route_helper_path_from(candidates, |_| false, exe_dir_display, install_path)
-                .expect_err("no candidate is usable; resolver must surface an error");
+        .expect_err("env-override unusable; resolver must NOT fall through");
         match err {
             SandboxError::Internal(msg) => {
                 assert!(
-                    msg.contains("no usable sandbox-route-helper found"),
-                    "error must use the grep-stable prefix, got: {msg}"
+                    msg.contains("/tmp/missing-route-helper"),
+                    "error must name the env-override path that failed, got: {msg}"
                 );
                 assert!(
-                    msg.contains(exe_dir_display),
-                    "error must name the exe directory we checked, got: {msg}"
-                );
-                assert!(
-                    msg.contains(&install_path.display().to_string()),
-                    "error must name the install path we checked, got: {msg}"
-                );
-                assert!(
-                    msg.contains("$PATH"),
-                    "error must mention the $PATH lookup, got: {msg}"
+                    msg.contains("SANDBOX_ROUTE_HELPER_PATH"),
+                    "error must name the env var so operators can unset it, got: {msg}"
                 );
                 assert!(
                     msg.contains("CAP_SYS_ADMIN"),
-                    "error must mention the cap requirement so operators \
-                     know setcap is needed; got: {msg}"
+                    "error must mention the cap requirement, got: {msg}"
+                );
+            }
+            other => panic!("expected SandboxError::Internal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_route_helper_path_from_uses_canonical_when_env_unset_and_usable() {
+        let install_path = std::path::Path::new("/usr/local/libexec/sandboxd/sandbox-route-helper");
+        let resolved = resolve_route_helper_path_from(None, install_path, |p| p == install_path)
+            .expect("canonical install is usable");
+        assert_eq!(resolved, install_path);
+    }
+
+    #[test]
+    fn resolve_route_helper_path_from_errors_when_env_unset_and_canonical_unusable() {
+        let install_path = std::path::Path::new("/usr/local/libexec/sandboxd/sandbox-route-helper");
+        let err = resolve_route_helper_path_from(None, install_path, |_| false)
+            .expect_err("no usable candidate; resolver must surface error");
+        match err {
+            SandboxError::Internal(msg) => {
+                assert!(
+                    msg.contains("sandbox-route-helper"),
+                    "error must mention the binary name, got: {msg}"
+                );
+                assert!(
+                    msg.contains(&install_path.display().to_string()),
+                    "error must name the canonical install path, got: {msg}"
+                );
+                assert!(
+                    msg.contains("CAP_SYS_ADMIN"),
+                    "error must mention the cap requirement, got: {msg}"
+                );
+                assert!(
+                    msg.contains("install-route-helper-prod-cap"),
+                    "error must point at the make target operators can run \
+                     to fix the install, got: {msg}"
+                );
+                assert!(
+                    msg.contains("SANDBOX_ROUTE_HELPER_PATH"),
+                    "expected error to mention env-var alternative, got: {msg}"
                 );
             }
             other => panic!("expected SandboxError::Internal, got {other:?}"),
