@@ -30,3 +30,19 @@ uuid.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
+
+# Optional features.
+#
+# `test-env-override` — opts route-helper-side users.conf path resolution
+# into honoring the `SANDBOX_USERS_CONF` environment variable. Default
+# builds of the route-helper crate ignore the env var (production
+# privilege boundary: a uid 0 file capability'd binary must not be
+# redirectable to an attacker-controlled config file via a process-
+# environment variable). The route-helper integration tests opt into the
+# feature so they can drive the helper's authorization flow with a
+# tempfile users.conf they own. The daemon-side load path
+# (`users_conf_path()` / `load_users_config()`) is unaffected by this
+# feature — the daemon is not the privilege boundary, only the cap'd
+# helper is.
+[features]
+test-env-override = []

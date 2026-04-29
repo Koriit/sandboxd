@@ -9,6 +9,19 @@ rust-version.workspace = true
 name = "sandbox-route-helper"
 path = "src/main.rs"
 
+[features]
+# `test-env-override` — opts the helper-side users.conf path resolution
+# (`sandbox_core::users_conf::route_helper_users_conf_path`) into
+# honoring the `SANDBOX_USERS_CONF` environment variable. Default
+# builds ignore the env var; the cap'd helper binary must not be
+# redirectable to an attacker-controlled config file via a process-
+# environment variable.
+#
+# The `route-helper` integration-test target enables this feature
+# explicitly so the tests can install their tempfile config via the
+# env var. See `Makefile`'s `install-route-helper-test-cap` target.
+test-env-override = ["sandbox-core/test-env-override"]
+
 [dependencies]
 sandbox-core.workspace = true
 # Feature set:
@@ -24,4 +37,9 @@ nix = { version = "0.29", features = ["user", "sched", "net"] }
 libc = "0.2"
 
 [dev-dependencies]
+# Used by the integration tests to checksum the installed cap'd
+# binary against the cargo-built one — a mismatch means the
+# operator rebuilt without re-installing, so the tests would be
+# exercising a stale binary.
+ring.workspace = true
 tempfile.workspace = true

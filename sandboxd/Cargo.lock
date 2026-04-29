@@ -1545,6 +1545,7 @@ dependencies = [
  "nix",
  "serde",
  "serde_json",
+ "socket2",
  "tempfile",
  "thiserror",
  "tokio",
@@ -1571,6 +1572,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "nix",
+ "ring",
  "sandbox-core",
  "tempfile",
 ]

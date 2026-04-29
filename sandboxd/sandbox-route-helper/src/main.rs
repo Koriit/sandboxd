@@ -9,9 +9,14 @@
 //! ```
 //!
 //! Exactly two positional arguments. No flags, no stdin, no env-var
-//! configuration in production. The `SANDBOX_USERS_CONF` env var is
-//! consumed by the [`sandbox_core::users_conf`] loader as a test seam
-//! and is not part of the operator-facing contract.
+//! configuration in production. The `SANDBOX_USERS_CONF` env var seam
+//! exists in `sandbox-core::users_conf` for daemon-side and helper-side
+//! integration tests, but the helper consults it ONLY when this crate
+//! is built with the `test-env-override` Cargo feature. Default
+//! production builds (used by the `install-route-helper-prod-cap` make
+//! target) ignore the env var entirely. See
+//! [`sandbox_core::users_conf::route_helper_users_conf_path`] for the
+//! gating logic.
 //!
 //! # Authorization flow
 //!
@@ -44,8 +49,11 @@
 //! foreign netns. Operators install it with:
 //!
 //! ```text
-//! sudo setcap cap_sys_admin+ep /usr/local/bin/sandbox-route-helper
+//! sudo setcap cap_sys_admin+ep /usr/local/libexec/sandboxd/sandbox-route-helper
 //! ```
+//!
+//! The production install path is `/usr/local/libexec/sandboxd/` per
+//! FHS § 4.7 (libexec is for non-user-facing helper binaries).
 //!
 //! Under setcap, the helper retains the capability across `exec`
 //! without running as root, so the only privileged operation in the
@@ -66,7 +74,7 @@ use std::process::{Command, ExitCode};
 use nix::ifaddrs::getifaddrs;
 use nix::sched::{CloneFlags, setns};
 use nix::unistd::{Uid, User};
-use sandbox_core::users_conf::{SubnetEntry, load_users_config};
+use sandbox_core::users_conf::{SubnetEntry, load_users_config_route_helper};
 
 /// Single deny exit code per the spec — the stderr reason carries the
 /// "what went wrong" payload, distinct codes per step would only
@@ -99,7 +107,11 @@ fn run() -> Result<(), String> {
     let caller_user = User::from_uid(caller_uid).ok().flatten();
 
     // Step 3 — load users.conf and locate the gateway-IP's subnet.
-    let config = load_users_config().map_err(|e| e.to_string())?;
+    // `load_users_config_route_helper` ignores `SANDBOX_USERS_CONF` in
+    // default builds and reads `/etc/sandboxd/users.conf`
+    // unconditionally; only `test-env-override` builds honor the env
+    // var. See the crate-level docstring + `route_helper_users_conf_path`.
+    let config = load_users_config_route_helper().map_err(|e| e.to_string())?;
     let subnet = config
         .find_subnet_by_gateway_ip(gateway_ip)
         .ok_or_else(|| format!("gateway ip {gateway_ip} not in any subnet"))?;
@@ -304,4 +316,94 @@ fn install_default_route(gateway_ip: Ipv4Addr) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! M11-S9 — the route helper's `test-env-override` Cargo feature
+    //! gates whether the helper-side `users.conf` path resolver
+    //! consults `SANDBOX_USERS_CONF`. The feature lives on this crate
+    //! and forwards to the same-named feature on `sandbox-core`; the
+    //! resolver itself
+    //! ([`sandbox_core::users_conf::route_helper_users_conf_path`]) is
+    //! the unit under test, but the `cfg(feature = ...)` evaluation
+    //! point that matters for the privilege story is *this crate*: a
+    //! production build of `sandbox-route-helper` (no feature flag) is
+    //! what gets `cap_sys_admin+ep` applied at install time, and that
+    //! build must not honor the env var even if some upstream code
+    //! sets it.
+    //!
+    //! Two compile-time-mutually-exclusive tests pin the contract from
+    //! both directions: one fires under `cfg(feature = "test-env-override")`,
+    //! the other under `cfg(not(...))`. The integration-test target
+    //! enables the feature; the default workspace `cargo nextest run`
+    //! picks the negative arm.
+
+    use sandbox_core::users_conf::{USERS_CONF_PATH_ENV, route_helper_users_conf_path};
+    // `DEFAULT_USERS_CONF_PATH` is only referenced from the
+    // `cfg(not(feature = "test-env-override"))` test below, so a
+    // `cfg`-mirrored use keeps the `test-env-override` build clean of
+    // unused-import warnings.
+    #[cfg(not(feature = "test-env-override"))]
+    use sandbox_core::users_conf::DEFAULT_USERS_CONF_PATH;
+    use std::path::PathBuf;
+
+    /// Helper that snapshots / restores the env var around a callback
+    /// so the test does not leak state into other tests in the same
+    /// binary. Env-var mutation is `unsafe` in Rust 2024 (cross-thread
+    /// races on libc env block); the route-helper tests serialize via
+    /// being the only consumers of this var inside this binary.
+    fn with_env<F: FnOnce()>(value: Option<&str>, body: F) {
+        let prev = std::env::var(USERS_CONF_PATH_ENV).ok();
+        // SAFETY: see above.
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(USERS_CONF_PATH_ENV, v),
+                None => std::env::remove_var(USERS_CONF_PATH_ENV),
+            }
+        }
+        body();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(USERS_CONF_PATH_ENV, v),
+                None => std::env::remove_var(USERS_CONF_PATH_ENV),
+            }
+        }
+    }
+
+    /// Default builds of `sandbox-route-helper` (production cap'd
+    /// binary) MUST NOT honor `SANDBOX_USERS_CONF`. The privilege story
+    /// rests on this: any user who can exec the cap'd helper would
+    /// otherwise be able to redirect its auth-config read to a file
+    /// they own, granting themselves arbitrary `allow_users` entries.
+    #[cfg(not(feature = "test-env-override"))]
+    #[test]
+    fn route_helper_path_resolution_ignores_env_in_default_build() {
+        with_env(Some("/tmp/route-helper-test-attacker.conf"), || {
+            let p = route_helper_users_conf_path();
+            assert_eq!(
+                p,
+                PathBuf::from(DEFAULT_USERS_CONF_PATH),
+                "production build of sandbox-route-helper MUST ignore SANDBOX_USERS_CONF"
+            );
+        });
+    }
+
+    /// `test-env-override` builds (used by `make install-route-helper-test-cap`
+    /// for the route-helper integration tests) honor the env var so
+    /// tests can drive a tempfile users.conf they own. This arm
+    /// proves the feature flag actually opens the gate.
+    #[cfg(feature = "test-env-override")]
+    #[test]
+    fn route_helper_path_resolution_honors_env_with_test_env_override_feature() {
+        with_env(Some("/tmp/route-helper-test-tempfile.conf"), || {
+            let p = route_helper_users_conf_path();
+            assert_eq!(
+                p,
+                PathBuf::from("/tmp/route-helper-test-tempfile.conf"),
+                "test-env-override build of sandbox-route-helper must honor \
+                 SANDBOX_USERS_CONF for integration-test seam"
+            );
+        });
+    }
 }

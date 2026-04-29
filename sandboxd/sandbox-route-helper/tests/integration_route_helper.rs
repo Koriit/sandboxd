@@ -2,19 +2,22 @@
 //!
 //! All three tests follow the same outer shape:
 //!
-//! 1. Locate the freshly-built helper binary via the
-//!    `CARGO_BIN_EXE_sandbox-route-helper` env var that cargo sets for
-//!    every integration test in this crate.
-//! 2. Copy the helper binary to a per-test path under `/tmp` (an ext4
-//!    filesystem that backs `security.capability` xattrs — the cargo
-//!    `target/` directory may live on a 9p / virtio-fs mount that
-//!    does not, in which case `setcap` returns `Operation not
-//!    supported`). `sudo setcap cap_sys_admin+ep <copy>` applies the
-//!    capability the helper relies on at runtime. RAII removes the
-//!    copy on test teardown — see [`CappedHelper`].
+//! 1. Locate the installed helper binary at the canonical test
+//!    install path `/usr/local/libexec/sandboxd-test/sandbox-route-helper`
+//!    (FHS § 4.7-aligned; `sandboxd-test` is a sibling of the
+//!    production `sandboxd/` libexec directory so test installs do
+//!    not clobber a real production binary).
+//! 2. Verify that the installed binary (a) exists, (b) carries
+//!    `cap_sys_admin+ep`, and (c) has a SHA-256 checksum equal to the
+//!    cargo-built binary at `CARGO_BIN_EXE_sandbox-route-helper`. A
+//!    checksum mismatch panics with a pointer at the make target so
+//!    the operator knows how to refresh the install.
 //! 3. Drop a tempfile users.conf into place; point the helper at it
-//!    via the `SANDBOX_USERS_CONF` env var (test-only seam exposed by
-//!    the loader in `sandbox-core`).
+//!    via the `SANDBOX_USERS_CONF` env var. The installed test
+//!    binary is built with the `test-env-override` Cargo feature
+//!    (see `make install-route-helper-test-cap`), which is the only
+//!    build of the route helper that consults the env var — default
+//!    production builds ignore it (privilege boundary).
 //! 4. Run the helper, capture exit status + stderr, assert on the
 //!    expected substring.
 //!
@@ -24,6 +27,25 @@
 //! are *outside* the caller's `users.conf` subnet. Cleanup is RAII
 //! per the `TestContainer` pattern in `sandbox-core/tests/validators.rs`.
 //!
+//! ## Why no per-test setcap
+//!
+//! Pre-S9 each test copied the cargo-built binary to `/tmp` and
+//! `sudo setcap`'d the copy. That worked but:
+//!
+//!  - Required `sudo` per test (slow; flaky on systems with NOPASSWD
+//!    timing).
+//!  - Race-prone: parallel test execution under nextest could blow
+//!    away another test's tempfile path.
+//!  - Hid the install path / cap requirements from the operator —
+//!    the tests carried their own `setcap` invocation that did not
+//!    match the production install runbook.
+//!
+//! M11-S9 moved cap installation to a make target
+//! (`install-route-helper-test-cap`) that is run once before
+//! `make test-integration`. The tests verify the install is fresh
+//! (checksum match) and bail with an actionable error if it is
+//! stale, but do not invoke `sudo` themselves.
+//!
 //! ## Profile selection
 //!
 //! Each test name is prefixed `integration_route_helper_` so the
@@ -32,7 +54,7 @@
 //! default profile filters them out. No `#[ignore]`, no env gate —
 //! membership is self-describing at the call site.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -45,69 +67,111 @@ use tempfile::NamedTempFile;
 
 /// Path to the freshly-built helper binary. Cargo populates this env
 /// var for every integration test in this crate; the binary is
-/// (re)built before the test runs.
-fn helper_binary() -> &'static str {
-    env!("CARGO_BIN_EXE_sandbox-route-helper")
+/// (re)built before the test runs. We use it for the checksum side of
+/// the freshness check below — the cargo binary is NEVER executed
+/// directly by the integration tests (it is uncap'd, would fail at
+/// `setns(2)` with EPERM), only checksummed.
+fn cargo_bin_helper_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_sandbox-route-helper"))
 }
 
-/// A copy of the helper binary on a filesystem that supports file
-/// capabilities, with `cap_sys_admin+ep` applied. RAII removes the
-/// copy on drop.
+/// Canonical test install path (`make install-route-helper-test-cap`
+/// installs here). `sandboxd-test` is deliberately a separate libexec
+/// directory from production `sandboxd/` so a `make
+/// install-route-helper-prod-cap` run does not silently overwrite the
+/// test binary (which carries the `test-env-override` feature) with
+/// a production build (which does not).
+const INSTALLED_TEST_HELPER_PATH: &str = "/usr/local/libexec/sandboxd-test/sandbox-route-helper";
+
+/// Compute SHA-256 of a file. Used to verify the installed binary is
+/// in sync with the cargo-built one — a mismatch means the operator
+/// rebuilt the workspace but forgot to re-run
+/// `make install-route-helper-test-cap`, and we'd otherwise be
+/// running an outdated cap'd binary.
+fn sha256_file(path: &Path) -> [u8; 32] {
+    use ring::digest::{Context, SHA256};
+    let mut f = std::fs::File::open(path)
+        .unwrap_or_else(|e| panic!("open {} for checksum: {e}", path.display()));
+    let mut ctx = Context::new(&SHA256);
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f
+            .read(&mut buf)
+            .unwrap_or_else(|e| panic!("read {} for checksum: {e}", path.display()));
+        if n == 0 {
+            break;
+        }
+        ctx.update(&buf[..n]);
+    }
+    let digest = ctx.finish();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(digest.as_ref());
+    out
+}
+
+/// Verify the installed test helper exists, has caps, and matches the
+/// cargo build. Returns the verified path on success; panics with an
+/// actionable message otherwise. Called once at the top of each test.
 ///
-/// Why a copy and not the cargo-built binary directly:
-/// `target/debug/sandbox-route-helper` may live on a 9p / virtio-fs /
-/// other mount that does not back `security.capability` xattrs (Lima's
-/// host-share mount being the canonical example). `setcap` on such a
-/// mount fails with `Operation not supported`. Copying to a host-side
-/// path that supports xattrs (`/tmp` on the standard ext4 root) and
-/// setcap'ing the copy sidesteps this.
-struct CappedHelper {
-    path: PathBuf,
-}
-
-impl CappedHelper {
-    fn new() -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        // Use /tmp explicitly rather than std::env::temp_dir() — the
-        // latter honours $TMPDIR which a caller might point at the
-        // 9p-mounted source tree, defeating the workaround.
-        let path = PathBuf::from(format!("/tmp/sb-route-helper-test-{nanos}"));
-        std::fs::copy(helper_binary(), &path)
-            .unwrap_or_else(|e| panic!("copying helper binary to {} failed: {e}", path.display()));
-        // setcap the copy. Idempotent in the sense that re-applying
-        // the same capability set is a no-op; we run it once per test
-        // because each test gets its own copy.
-        let output = Command::new("sudo")
-            .args([
-                "-n",
-                "setcap",
-                "cap_sys_admin+ep",
-                path.to_str().expect("tempfile path is utf-8"),
-            ])
-            .output()
-            .expect("invoking sudo setcap should succeed");
-        assert!(
-            output.status.success(),
-            "sudo setcap failed on {}: stderr={}",
-            path.display(),
-            String::from_utf8_lossy(&output.stderr)
+/// The three checks lined up:
+///  - Existence: `/usr/local/libexec/sandboxd-test/sandbox-route-helper`
+///    must be a regular file. Missing → `make install-route-helper-test-cap`.
+///  - Capability: `getcap` output must contain `cap_sys_admin=ep`.
+///    Present-but-no-cap → setcap was not run after install.
+///  - Checksum: SHA-256 must equal the cargo-built binary's SHA-256.
+///    Mismatch → operator rebuilt without re-installing.
+fn verify_installed_test_helper() -> PathBuf {
+    let installed = PathBuf::from(INSTALLED_TEST_HELPER_PATH);
+    if !installed.is_file() {
+        panic!(
+            "installed test route helper not found at {}\n\
+             run: make install-route-helper-test-cap",
+            installed.display()
         );
-        Self { path }
     }
 
-    fn path(&self) -> &Path {
-        &self.path
+    // Cap check via `getcap`. We could read security.capability via
+    // libc::getxattr ourselves (the daemon's resolver does that for
+    // production), but `getcap` is universally present on Linux test
+    // hosts and produces a self-explanatory line that we can show in
+    // the panic message verbatim.
+    let getcap = Command::new("getcap")
+        .arg(&installed)
+        .output()
+        .unwrap_or_else(|e| panic!("invoking getcap on {}: {e}", installed.display()));
+    let cap_output = String::from_utf8_lossy(&getcap.stdout);
+    if !cap_output.contains("cap_sys_admin") {
+        panic!(
+            "installed test route helper at {} lacks cap_sys_admin (getcap stdout: {:?})\n\
+             run: make install-route-helper-test-cap",
+            installed.display(),
+            cap_output,
+        );
     }
+
+    let installed_hash = sha256_file(&installed);
+    let cargo_hash = sha256_file(&cargo_bin_helper_path());
+    if installed_hash != cargo_hash {
+        panic!(
+            "installed route helper is stale; run: make install-route-helper-test-cap\n\
+             installed: {} (sha256={})\n\
+             cargo:     {} (sha256={})",
+            installed.display(),
+            hex(&installed_hash),
+            cargo_bin_helper_path().display(),
+            hex(&cargo_hash),
+        );
+    }
+
+    installed
 }
 
-impl Drop for CappedHelper {
-    fn drop(&mut self) {
-        // Best-effort cleanup. Drop must not panic.
-        let _ = std::fs::remove_file(&self.path);
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
     }
+    s
 }
 
 /// Resolve the test runner's username. Used to populate `allow_users`
@@ -134,11 +198,12 @@ fn write_users_conf(contents: &str) -> NamedTempFile {
     f
 }
 
-/// Run the cap'd helper copy with the given argv, pointing at the
-/// given users.conf tempfile via `SANDBOX_USERS_CONF`. Captures
-/// stdout + stderr.
-fn run_helper(helper: &CappedHelper, users_conf: &NamedTempFile, args: &[&str]) -> Output {
-    Command::new(helper.path())
+/// Run the cap'd installed helper with the given argv, pointing at
+/// the given users.conf tempfile via `SANDBOX_USERS_CONF`. The
+/// helper is the test-feature build (made by
+/// `install-route-helper-test-cap`), so it consults the env var.
+fn run_helper(helper: &Path, users_conf: &NamedTempFile, args: &[&str]) -> Output {
+    Command::new(helper)
         .args(args)
         .env("SANDBOX_USERS_CONF", users_conf.path())
         .output()
@@ -155,7 +220,7 @@ fn run_helper(helper: &CappedHelper, users_conf: &NamedTempFile, args: &[&str]) 
 /// helper exits before reaching `pidfd_open`.
 #[test]
 fn integration_route_helper_denies_when_gateway_ip_outside_all_subnets() {
-    let helper = CappedHelper::new();
+    let helper = verify_installed_test_helper();
     let user = runner_username();
 
     let users_conf = write_users_conf(&format!(
@@ -166,10 +231,11 @@ fn integration_route_helper_denies_when_gateway_ip_outside_all_subnets() {
         }}"#
     ));
 
-    // Gateway IP 10.250.0.5 is outside the only configured subnet
-    // (10.209.0.0/20). Pid 1 (init) — irrelevant; helper denies at
-    // step 3 before pidfd_open runs.
-    let output = run_helper(&helper, &users_conf, &["1", "10.250.0.5"]);
+    // Gateway IP 198.18.0.5 is outside the only configured subnet
+    // (10.209.0.0/20). RFC 2544 benchmark-reserved range chosen so
+    // it cannot collide with any real subnet on the host. Pid 1 (init)
+    // — irrelevant; helper denies at step 3 before pidfd_open runs.
+    let output = run_helper(&helper, &users_conf, &["1", "198.18.0.5"]);
 
     assert!(
         !output.status.success(),
@@ -194,7 +260,7 @@ fn integration_route_helper_denies_when_gateway_ip_outside_all_subnets() {
 /// any netns operation.
 #[test]
 fn integration_route_helper_denies_when_caller_not_in_allow_users() {
-    let helper = CappedHelper::new();
+    let helper = verify_installed_test_helper();
 
     // allow_users intentionally lists a username that does not exist
     // on the host (the same sentinel name the loader's unit tests use,
@@ -251,7 +317,7 @@ struct TestNetnsContainer {
 }
 
 impl TestNetnsContainer {
-    /// Spin up a bridge network with `subnet` (e.g. `"10.250.0.0/24"`)
+    /// Spin up a bridge network with `subnet` (e.g. `"198.18.0.0/24"`)
     /// and a container attached to it running `sleep 60`. Panics on
     /// any setup failure — Drop will still tear down whatever was
     /// successfully created.
@@ -382,17 +448,29 @@ impl Drop for TestNetnsContainer {
 /// subnet, so the helper denies before installing the route.
 ///
 /// Also verifies that the container's default route was NOT modified
-/// — the docker-managed default (`via 10.250.0.1`) must still be in
+/// — the docker-managed default (`via 198.18.0.1`) must still be in
 /// place.
+///
+/// # Why 198.18.0.0/24
+///
+/// RFC 2544 reserves `198.18.0.0/15` for inter-network device
+/// benchmarking. It is structurally guaranteed not to be used as a
+/// production subnet (the IETF carved it out specifically to be
+/// uninteresting for routing), so it cannot collide with the
+/// daemon's allocator pool (default `10.209.0.0/24`) or with any
+/// other test's subnet, even if they run in parallel on the same
+/// host. The previous shape used `10.250.0.0/24`, which is private
+/// space but only conventionally — an operator who happens to use
+/// `10.250.0.0/16` for a real network would see this test interfere.
 #[test]
 fn integration_route_helper_denies_when_netns_ip_outside_caller_subnet() {
-    let helper = CappedHelper::new();
+    let helper = verify_installed_test_helper();
     let user = runner_username();
 
-    // Container lives on 10.250.0.0/24. users.conf authorizes the
+    // Container lives on 198.18.0.0/24. users.conf authorizes the
     // caller for 10.209.0.0/20 — well outside the container's bridge
-    // — so step 6 will see `eth0` carrying 10.250.0.2 and deny.
-    let fixture = TestNetnsContainer::spawn("10.250.0.0/24");
+    // — so step 6 will see `eth0` carrying 198.18.0.2 and deny.
+    let fixture = TestNetnsContainer::spawn("198.18.0.0/24");
 
     let users_conf = write_users_conf(&format!(
         r#"{{
@@ -420,7 +498,7 @@ fn integration_route_helper_denies_when_netns_ip_outside_caller_subnet() {
     );
 
     // Verify the container's default route was NOT modified — the
-    // docker-installed default via 10.250.0.1 must still be the
+    // docker-installed default via 198.18.0.1 must still be the
     // active default route. If the helper had erroneously installed
     // `default via 10.209.0.2`, that string would appear in the
     // route table.
@@ -447,8 +525,8 @@ fn integration_route_helper_denies_when_netns_ip_outside_caller_subnet() {
          expected no '10.209.0.2', got: {route_text}"
     );
     assert!(
-        route_text.contains("10.250.0.1"),
+        route_text.contains("198.18.0.1"),
         "container should still have the docker-installed default \
-         via 10.250.0.1; got: {route_text}"
+         via 198.18.0.1; got: {route_text}"
     );
 }

@@ -11,12 +11,41 @@
 //!
 //! # Path resolution
 //!
-//! Production callers use [`load_users_config`], which reads the path
-//! returned by [`users_conf_path`]. The default path is
-//! `/etc/sandboxd/users.conf`. The `SANDBOX_USERS_CONF` environment
-//! variable overrides the default — this is a **test-only** seam used by
-//! unit tests and route-helper integration tests; operators must never
-//! set it in production.
+//! Two entry points exist; they differ on whether they consult the
+//! `SANDBOX_USERS_CONF` environment variable:
+//!
+//! - [`load_users_config`] / [`users_conf_path`] — daemon-facing.
+//!   Always honors `SANDBOX_USERS_CONF`. The daemon is not a privilege
+//!   boundary (it runs as the operator), so the env-var seam stays
+//!   unconditional and is consumed by the daemon-startup integration
+//!   tests.
+//! - [`load_users_config_route_helper`] / [`route_helper_users_conf_path`]
+//!   — `sandbox-route-helper`-facing. Default builds **ignore**
+//!   `SANDBOX_USERS_CONF` and read `/etc/sandboxd/users.conf`
+//!   unconditionally. Test builds (any consumer enabling the
+//!   `test-env-override` Cargo feature on `sandbox-core` — typically
+//!   forwarded by `sandbox-route-helper/test-env-override`) honor the
+//!   env var so route-helper integration tests can drive the
+//!   authorization flow against a tempfile users.conf they own.
+//!
+//! The split exists because the route helper runs with
+//! `cap_sys_admin+ep` (file capabilities) — granting any user who can
+//! exec it the equivalent of root for namespace operations. Honoring an
+//! attacker-controlled env var to redirect the auth-config read inside
+//! a `cap_sys_admin+ep` binary is a local privilege escalation. Default
+//! builds of the route helper therefore cannot consult the env var; the
+//! feature gate makes the test seam explicit and impossible to ship by
+//! accident.
+//!
+//! Both entry points additionally enforce a defensive ownership/mode
+//! check on the canonical `/etc/sandboxd/users.conf` path: the file
+//! must be owned by uid 0 and must carry no group- or world-write bits
+//! (see [`validate_canonical_users_conf_security`]). Tempfile paths
+//! used by tests are skipped — only the well-known canonical path is
+//! checked, so test-tempfile callers (owned by the test runner's uid)
+//! pass through unchanged. The check refuses to read a tampered config
+//! file even if the daemon or helper somehow ends up reading one
+//! outside of the install runbook's `chmod 0644` step.
 //!
 //! # Lookup helpers
 //!
@@ -107,6 +136,16 @@ pub enum UsersConfigError {
         value: String,
         reason: &'static str,
     },
+
+    /// Defensive ownership / mode check on the canonical
+    /// `/etc/sandboxd/users.conf` path failed. The route helper runs
+    /// with `cap_sys_admin+ep`; reading an authorization-config file
+    /// that is not root-owned-and-not-group-or-world-writable would let
+    /// any local user re-write the auth list. We surface the specific
+    /// failure mode (non-root-owned, group-writable, world-writable) so
+    /// operators can re-run the install step that produced the file.
+    #[error("users.conf at {path} fails security check: {reason}")]
+    InsecureFile { path: PathBuf, reason: &'static str },
 }
 
 // ---------------------------------------------------------------------------
@@ -320,10 +359,17 @@ impl SubnetEntry {
 // Path resolution and loading
 // ---------------------------------------------------------------------------
 
-/// Resolve the on-disk path of `users.conf`.
+/// Resolve the on-disk path of `users.conf` for daemon callers.
 ///
-/// Honors `SANDBOX_USERS_CONF` as a **test-only** override; in
-/// production this returns [`DEFAULT_USERS_CONF_PATH`].
+/// Honors `SANDBOX_USERS_CONF` unconditionally — the daemon runs as the
+/// operator, so the env-var seam consumed by the daemon-startup
+/// integration tests is not a privilege boundary. Production daemons
+/// rely on the default path; tests set the env var to a tempfile they
+/// own.
+///
+/// **The route helper must NOT use this function.** See
+/// [`route_helper_users_conf_path`] for the helper-side equivalent
+/// whose env-var consultation is feature-gated behind `test-env-override`.
 pub fn users_conf_path() -> PathBuf {
     if let Ok(p) = std::env::var(USERS_CONF_PATH_ENV) {
         return PathBuf::from(p);
@@ -331,16 +377,56 @@ pub fn users_conf_path() -> PathBuf {
     PathBuf::from(DEFAULT_USERS_CONF_PATH)
 }
 
-/// Load and validate the users config from the resolved path
+/// Resolve the on-disk path of `users.conf` for the
+/// `sandbox-route-helper` binary.
+///
+/// Default builds (production) ignore `SANDBOX_USERS_CONF` and always
+/// return [`DEFAULT_USERS_CONF_PATH`]. The route helper runs with
+/// `cap_sys_admin+ep` (file capabilities); honoring an
+/// attacker-controlled env var would redirect the authorization-config
+/// read inside a privileged binary, which is a local privilege
+/// escalation. Default builds therefore cannot consult the env var.
+///
+/// Test builds enable the `test-env-override` feature on `sandbox-core`
+/// (typically forwarded via `sandbox-route-helper/test-env-override`)
+/// and consult the env var so the route-helper integration tests can
+/// drive the authorization flow against a tempfile users.conf they
+/// own.
+pub fn route_helper_users_conf_path() -> PathBuf {
+    #[cfg(feature = "test-env-override")]
+    if let Ok(p) = std::env::var(USERS_CONF_PATH_ENV) {
+        return PathBuf::from(p);
+    }
+    PathBuf::from(DEFAULT_USERS_CONF_PATH)
+}
+
+/// Load and validate the users config from the daemon-resolved path
 /// ([`users_conf_path`]).
 pub fn load_users_config() -> Result<UsersConfig, UsersConfigError> {
     load_users_config_from(&users_conf_path())
 }
 
+/// Load and validate the users config from the route-helper-resolved
+/// path ([`route_helper_users_conf_path`]).
+///
+/// The privilege-aware entry point used by `sandbox-route-helper`'s
+/// `main.rs`. Default builds always read [`DEFAULT_USERS_CONF_PATH`];
+/// `test-env-override` builds honor `SANDBOX_USERS_CONF` for tests.
+pub fn load_users_config_route_helper() -> Result<UsersConfig, UsersConfigError> {
+    load_users_config_from(&route_helper_users_conf_path())
+}
+
 /// Load and validate the users config from `path`.
 ///
-/// Test seam — production callers should use [`load_users_config`].
+/// Both [`load_users_config`] and [`load_users_config_route_helper`]
+/// route through here so the defensive ownership/mode check on the
+/// canonical `/etc/sandboxd/users.conf` path is shared between daemon
+/// and helper. Tempfile paths used by tests pass through unchanged
+/// (only the canonical path triggers the check); see
+/// [`validate_canonical_users_conf_security`].
 pub fn load_users_config_from(path: &Path) -> Result<UsersConfig, UsersConfigError> {
+    validate_canonical_users_conf_security(path)?;
+
     let raw = match fs::read_to_string(path) {
         Ok(s) => s,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
@@ -355,6 +441,88 @@ pub fn load_users_config_from(path: &Path) -> Result<UsersConfig, UsersConfigErr
     };
 
     parse_users_config(&raw, path)
+}
+
+/// Defensive ownership/mode check applied at config-load time when the
+/// path resolves to the canonical [`DEFAULT_USERS_CONF_PATH`].
+///
+/// We refuse to read the file if it is not owned by uid 0, or if it
+/// carries any group- or world-write bits. The route helper runs with
+/// `cap_sys_admin+ep`; if the auth file were group/world-writable, any
+/// local user could rewrite their own `allow_users` entry and grant
+/// themselves access to a foreign subnet. Linux guarantees that uid 0
+/// is `root`, so an explicit numeric check is sufficient and avoids
+/// pulling in a name-resolver crate.
+///
+/// We deliberately scope this to the canonical path only:
+///
+/// - Tempfile-based tests (anywhere outside `/etc/sandboxd/`) bypass the
+///   check naturally, so unit tests and the route-helper integration
+///   tests using `SANDBOX_USERS_CONF`-pointed tempfiles pass through.
+/// - Operators who genuinely run with a non-root-owned config at the
+///   canonical path are misconfigured and want the loud failure.
+/// - A missing file is signalled later by `FileNotFound` from
+///   `read_to_string`, not here, so the existing error path stays
+///   intact.
+fn validate_canonical_users_conf_security(path: &Path) -> Result<(), UsersConfigError> {
+    validate_users_conf_security_against(path, Path::new(DEFAULT_USERS_CONF_PATH))
+}
+
+/// Inner of [`validate_canonical_users_conf_security`], parameterized
+/// over the canonical path so unit tests can pin the check against a
+/// temp directory they own (and can chmod / chown-via-current-state).
+/// Production callers always pass [`DEFAULT_USERS_CONF_PATH`].
+fn validate_users_conf_security_against(
+    path: &Path,
+    canonical: &Path,
+) -> Result<(), UsersConfigError> {
+    if path != canonical {
+        return Ok(());
+    }
+    let meta = match fs::metadata(path) {
+        Ok(m) => m,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            // Defer NotFound to `load_users_config_from`'s `read_to_string`
+            // arm so the existing `FileNotFound` error variant (with its
+            // operator-friendly install-docs hint) is what surfaces.
+            return Ok(());
+        }
+        Err(err) => {
+            return Err(UsersConfigError::ReadFailed {
+                path: path.to_path_buf(),
+                source: err,
+            });
+        }
+    };
+    use std::os::unix::fs::MetadataExt;
+    if meta.uid() != 0 {
+        return Err(UsersConfigError::InsecureFile {
+            path: path.to_path_buf(),
+            reason: "file must be owned by root (uid 0); re-run the install step in \
+                     docs/start/installation.md to repair",
+        });
+    }
+    let mode = meta.mode() & 0o7777;
+    if !is_secure_mode(mode) {
+        return Err(UsersConfigError::InsecureFile {
+            path: path.to_path_buf(),
+            reason: "file must not be group- or world-writable (no `g+w` or `o+w` bits); \
+                     re-run the install step in docs/start/installation.md to repair",
+        });
+    }
+    Ok(())
+}
+
+/// Pure mode-bits predicate: true iff `mode` carries neither group-write
+/// (`S_IWGRP` = `0o020`) nor world-write (`S_IWOTH` = `0o002`).
+///
+/// Even a root-owned but mode `0o646` file means a non-root user can
+/// rewrite the auth list — the wrapper [`validate_users_conf_security_against`]
+/// rejects on either arm. Extracted to a pure helper so the matrix of
+/// (group-write, world-write) combinations can be exercised by unit
+/// tests that cannot chown a tempfile to root.
+fn is_secure_mode(mode: u32) -> bool {
+    mode & 0o022 == 0
 }
 
 /// Parse `raw` (the file contents) into a [`UsersConfig`], attaching
@@ -803,5 +971,185 @@ mod tests {
                 None => std::env::remove_var(USERS_CONF_PATH_ENV),
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // route_helper_users_conf_path — env-var consultation gated by the
+    // `test-env-override` feature.
+    //
+    // `cfg(feature = ...)` here is a compile-time check, so the two
+    // tests below split on whether the crate is currently being
+    // compiled with the feature enabled (route-helper integration
+    // tests do this via the `test-env-override` feature on
+    // `sandbox-route-helper`; default `cargo nextest run` builds do
+    // not).
+    // -----------------------------------------------------------------
+
+    #[cfg(not(feature = "test-env-override"))]
+    #[test]
+    fn route_helper_users_conf_path_ignores_env_in_default_build() {
+        let prev = std::env::var(USERS_CONF_PATH_ENV).ok();
+        // SAFETY: see the rationale on `users_conf_path_honors_env_override`.
+        unsafe {
+            std::env::set_var(USERS_CONF_PATH_ENV, "/tmp/should-not-be-honored.conf");
+        }
+        let p = route_helper_users_conf_path();
+        assert_eq!(
+            p,
+            PathBuf::from(DEFAULT_USERS_CONF_PATH),
+            "default builds must ignore SANDBOX_USERS_CONF in route-helper-side resolution; \
+             honoring it would let any local exec of the cap'd helper redirect its auth read"
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(USERS_CONF_PATH_ENV, v),
+                None => std::env::remove_var(USERS_CONF_PATH_ENV),
+            }
+        }
+    }
+
+    #[cfg(feature = "test-env-override")]
+    #[test]
+    fn route_helper_users_conf_path_honors_env_with_test_env_override_feature() {
+        let prev = std::env::var(USERS_CONF_PATH_ENV).ok();
+        // SAFETY: see the rationale on `users_conf_path_honors_env_override`.
+        unsafe {
+            std::env::set_var(USERS_CONF_PATH_ENV, "/tmp/test-users.conf");
+        }
+        let p = route_helper_users_conf_path();
+        assert_eq!(
+            p,
+            PathBuf::from("/tmp/test-users.conf"),
+            "with `test-env-override` enabled, SANDBOX_USERS_CONF must be honored so \
+             route-helper integration tests can drive a tempfile config"
+        );
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(USERS_CONF_PATH_ENV, v),
+                None => std::env::remove_var(USERS_CONF_PATH_ENV),
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Defensive ownership/mode check — `validate_users_conf_security_against`.
+    //
+    // We can't chown a tempfile to root from a non-root unit test, so
+    // the uid-0 arm of `validate_users_conf_security_against` is
+    // covered by the two `defensive_check_refuses_*` tests below: any
+    // tempfile-owned-by-the-runner at the canonical path triggers
+    // `InsecureFile` via the uid-0 check (which fires first).
+    //
+    // The mode-bits arm is exercised independently by
+    // `is_secure_mode_matrix` against the extracted `is_secure_mode`
+    // helper — that's a pure function, so we can sweep every relevant
+    // (group-write, world-write) combination without needing a real
+    // file we can chown to root.
+    //
+    // The positive arm of the wrapper (root-owned, 0644) is exercised
+    // by the daemon at runtime *and* via the path-comparison bypass:
+    // a tempfile path that is NOT the configured canonical path
+    // passes through unchanged regardless of ownership/mode, so the
+    // existing happy-path tests (`parses_spec_example_two_subnets`
+    // etc.) prove the bypass works.
+    // -----------------------------------------------------------------
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn defensive_check_refuses_non_root_owned_canonical_file() {
+        // The test's tempfile is owned by the test runner's uid (≠ 0
+        // in any normal CI environment), so passing the same tempfile
+        // path as both `path` and `canonical` triggers the uid-0 arm.
+        let f = write_tempfile(r#"{ "subnets": [] }"#);
+        let err = validate_users_conf_security_against(f.path(), f.path())
+            .expect_err("non-root-owned canonical file must be refused");
+        match err {
+            UsersConfigError::InsecureFile { path, reason } => {
+                assert_eq!(path, f.path());
+                assert!(
+                    reason.contains("uid 0") || reason.contains("root"),
+                    "reason should mention root/uid 0; got: {reason}"
+                );
+            }
+            other => panic!("expected InsecureFile, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn defensive_check_refuses_canonical_file_owned_by_non_root_even_when_world_writable() {
+        // The test's tempfile is owned by the test runner's uid (≠ 0
+        // in any normal CI environment). Setting mode `0o666` is
+        // belt-and-suspenders — the uid-0 arm fires first regardless,
+        // but exercising the canonical-path branch with a non-default
+        // mode keeps redundant coverage of the uid-0 refusal.
+        // The mode-bits arm is exercised separately by
+        // `is_secure_mode_matrix` below, which does not need a real
+        // file to chmod.
+        use std::os::unix::fs::PermissionsExt;
+        let f = write_tempfile(r#"{ "subnets": [] }"#);
+        let mut perms = std::fs::metadata(f.path()).expect("stat").permissions();
+        perms.set_mode(0o666);
+        std::fs::set_permissions(f.path(), perms).expect("chmod");
+        let err = validate_users_conf_security_against(f.path(), f.path())
+            .expect_err("non-root-owned canonical file must be refused");
+        assert!(
+            matches!(err, UsersConfigError::InsecureFile { .. }),
+            "expected InsecureFile, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn is_secure_mode_matrix() {
+        // The canonical secure modes the install runbook produces
+        // (0o600 / 0o644) plus the partially-permissive shapes that
+        // must still be accepted (0o640 grants read-only group). Every
+        // mode that carries S_IWGRP (0o020) or S_IWOTH (0o002) — alone
+        // or in combination — must be refused, regardless of owner-
+        // permission bits, because the auth file's integrity rests on
+        // it being writable only by root.
+        let cases: &[(u32, bool)] = &[
+            (0o600, true),
+            (0o644, true),
+            (0o640, true),
+            (0o620, false), // S_IWGRP
+            (0o602, false), // S_IWOTH
+            (0o666, false), // S_IWGRP | S_IWOTH | owner-rw
+            (0o066, false), // S_IWGRP | S_IWOTH, no owner perms
+            (0o022, false), // S_IWGRP | S_IWOTH alone (no read bits)
+        ];
+        for (mode, expected) in cases.iter().copied() {
+            assert_eq!(
+                is_secure_mode(mode),
+                expected,
+                "is_secure_mode(0o{mode:o}) should be {expected}",
+            );
+        }
+    }
+
+    #[test]
+    fn defensive_check_skips_when_path_is_not_canonical() {
+        // The whole point of the path-equality bypass: a tempfile
+        // whose path is NOT the configured canonical path passes
+        // unchanged regardless of ownership / mode. This is what
+        // keeps every existing tempfile-based test in this file
+        // (and the route-helper integration tests) green without
+        // a per-test feature flag.
+        let f = write_tempfile(r#"{ "subnets": [] }"#);
+        let canonical = std::path::Path::new("/etc/sandboxd/users.conf");
+        // f.path() is in /tmp/<random>, never == /etc/sandboxd/users.conf
+        validate_users_conf_security_against(f.path(), canonical)
+            .expect("non-canonical path must bypass the security check");
+    }
+
+    #[test]
+    fn defensive_check_skips_when_canonical_file_does_not_exist() {
+        // ENOENT on the canonical path defers to the regular
+        // FileNotFound error variant downstream — the security check
+        // must not pre-empt it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nonexistent = dir.path().join("does-not-exist.conf");
+        validate_users_conf_security_against(&nonexistent, &nonexistent)
+            .expect("missing canonical file must defer to FileNotFound downstream");
     }
 }
