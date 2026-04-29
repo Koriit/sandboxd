@@ -46,14 +46,59 @@ Because each session has its own bridge — a separate L2 segment — sessions c
 
 ### The naming scheme
 
-Session IDs are 12 lowercase hex characters, chosen so the derived network-resource names fit Linux's 15-character interface name limit exactly:
+Session IDs are 12 lowercase hex characters. Every per-session resource has a fixed name shape derived from the session id:
 
-| Resource | Name |
-|---|---|
-| Docker network | `sandbox-net-{session_id}` |
-| Bridge interface | `sb-{session_id}` (3 + 12 = 15) |
-| Gateway container | `sandbox-gw-{session_id}` |
-| TAP device | `tb-{session_id}` (3 + 12 = 15) |
+| Resource | Name | Anchor |
+|---|---|---|
+| Docker network | `sandbox-net-{session_id}` | reaper/parser symmetry |
+| Bridge interface | `sb-{session_id}` (3 + 12 = 15) | IFNAMSIZ |
+| Gateway container | `sandbox-gw-{session_id}` | reaper/parser symmetry |
+| TAP device | `tb-{session_id}` (3 + 12 = 15) | IFNAMSIZ |
+| Lima VM / lite container | `sandbox-{session_id}` | reaper/parser symmetry |
+| Per-session home volume | `sandbox-home-{session_id}` | reaper/parser symmetry |
+
+Two distinct constraint chains pin these names. Refactors that touch a prefix or the session-id width must understand which chain they're crossing — the failure modes are different, and both are silent.
+
+#### IFNAMSIZ anchor — `sb-{12hex}` and `tb-{12hex}`
+
+Linux caps kernel network-interface names at **15 bytes** (`IFNAMSIZ - 1` = 15 bytes for the C string + NUL). The bridge and TAP names sit exactly at that limit: `sb-` (3) + 12 hex (12) = 15, and the same for `tb-`. The bridge name is *not* Docker's auto-derived `br-<network-id>` name — sandboxd passes `com.docker.network.bridge.name=sb-{session_id}` on `docker network create` to force the kernel-visible name.
+
+This anchor pins three things together:
+
+- The session-id width at exactly 12 hex characters. Shorter risks identity collisions; longer overflows IFNAMSIZ.
+- The `sb-` and `tb-` prefixes at exactly 3 characters. Any longer prefix overflows IFNAMSIZ.
+- The total length at exactly 15. Length tests (`network.rs:805-813` for the bridge, `qmp.rs:451-459` for the TAP) catch the math at compile-and-test time, not at `docker network create` time.
+
+**Refactor warning.** Lengthening the `sb-` or `tb-` prefix, or widening the session id past 12 hex, will overflow IFNAMSIZ and silently break `docker network create` (Docker rejects the label) or NIC hot-add. The failure manifests at session-creation time in production; the unit tests above will catch it earlier.
+
+#### Reaper/parser symmetry anchor — `sandbox-{12hex}`, `sandbox-net-{12hex}`, `sandbox-home-{12hex}`
+
+The lite container, the Lima VM, the per-session Docker network, and the home volume all live in the `sandbox-` namespace, but they're distinguished by their second-segment prefix. The orphan reaper (`sandbox-core/src/backend/orphan_reaper.rs`) lists every Docker resource matching `name=sandbox-` and reaps the ones whose name decodes to a valid 12-hex session id absent from `sessions.db`. It uses three hardcoded prefix constants:
+
+- `parse_container_session_id` (delegates to `lima.rs::parse_session_id_from_name`, reused so the VM, the lite container, and the canonical `RuntimeHandle` all share the exact same naming check) — strips `sandbox-` and parses the remaining 12 hex chars. Names that don't decode (e.g. `sandbox-gw-{id}`, `sandbox-home-{id}`, `sandbox-net-{id}`) are intentionally rejected so the reaper doesn't touch them.
+- `HOME_VOLUME_PREFIX = "sandbox-home-"` (`orphan_reaper.rs:61`) — strip-and-parse for home volumes.
+- `NETWORK_PREFIX = "sandbox-net-"` (`orphan_reaper.rs:65`) — strip-and-parse for networks.
+
+These prefixes are *not* IFNAMSIZ-bound — they're Docker resource names, not kernel interface names, so they can be arbitrary length without breaking network creation. What pins them is producer/consumer agreement: every producer (`container.rs::container_name`, `container.rs::home_volume_name`, `network.rs::create_network`, `lima.rs::vm_name`) must format names with the exact same prefix the reaper strips. The gateway container is the explicit exception — its `sandbox-gw-` prefix decodes to nothing under the lite-container parser, which is the contract that keeps the reaper from clobbering live gateway containers.
+
+**Refactor warning.** Changing any of these prefixes on the producer side without updating the reaper desynchronizes the two. The failure mode depends on direction:
+
+- *Producer prefix narrows or shifts* (e.g. `sandbox-` → `sb-`) — the reaper's `--filter name=sandbox-` no longer lists the producer's resources, so orphans accumulate forever and the reap pass silently does nothing. The daemon doesn't know it's leaking.
+- *Reaper prefix narrows or shifts* without the producer following — the reaper's parser stops decoding live names; same outcome (silent leak).
+- *Producer/reaper agree on a wider namespace* (e.g. both move from `sandbox-` to `sb-`) — works, but only if every parser, filter, and test is updated atomically. The fact that `parse_session_id_from_name` is shared between the Lima VM, the lite container, and the reaper makes this a single edit point — that sharing is load-bearing.
+- *Reaper prefix widens to a superset that the producer doesn't own* — the reaper would try to reap operator-created resources it shouldn't touch.
+
+The current contract is that `sandbox-` is the namespace root, the second segment selects the resource kind (no second segment = VM/container, `gw-` = gateway, `net-` = network, `home-` = volume), and the suffix is always a 12-hex session id. Stay inside that shape.
+
+#### Cross-references
+
+- Producer: `sandbox-core/src/lima.rs::vm_name` and `VM_NAME_PREFIX` (also reused for the lite container's name).
+- Producer: `sandbox-core/src/backend/container.rs::home_volume_name` and the `format!("sandbox-{session_id}")` literal at `container.rs:438`.
+- Producer: `sandbox-core/src/network.rs::create_network` (sets `bridge_name = "sb-{session_id}"`, `docker_network_name = "sandbox-net-{session_id}"`, and the `com.docker.network.bridge.name` label).
+- Producer: `sandbox-core/src/qmp.rs::tap_name_for_session`.
+- Authoritative parser: `sandbox-core/src/lima.rs::parse_session_id_from_name`.
+- Reaper consumers: `sandbox-core/src/backend/orphan_reaper.rs::parse_container_session_id` (delegates to the lima parser), `parse_home_volume_session_id`, `parse_network_session_id`, plus the `HOME_VOLUME_PREFIX` and `NETWORK_PREFIX` constants.
+- Length guards: `network.rs:805-813` (bridge IFNAMSIZ), `qmp.rs:451-459` (TAP IFNAMSIZ).
 
 ## The gateway
 
