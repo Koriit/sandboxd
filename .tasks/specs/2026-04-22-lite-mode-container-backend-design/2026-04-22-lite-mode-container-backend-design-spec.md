@@ -66,10 +66,17 @@ contract, not deployment convention — the daemon refuses to serve
 lite-backed sessions without them in place.
 
 - **`setcap cap_sys_admin+ep` on `sandbox-route-helper`.** Applied to
-  the installed binary. Mirrors the existing requirement for
-  `qemu-bridge-helper` (setuid-root); packaging guidance points to the
-  same install step. No setuid bit is applied — file capabilities
-  only.
+  the installed binary. Production install path is
+  `/usr/local/libexec/sandboxd/sandbox-route-helper` per FHS § 4.7
+  (libexec is for non-user-facing helper executables that other
+  binaries — here, sandboxd itself — invoke directly). Mirrors the
+  existing requirement for `qemu-bridge-helper` (setuid-root);
+  packaging guidance points to the same install step. No setuid bit
+  is applied — file capabilities only. The `make
+  install-route-helper-prod-cap` target installs the cap'd binary at
+  the canonical path; `make setup-dev-env` is the one-shot operator
+  entry point that runs it alongside the other per-host configure
+  steps.
 - **`/etc/sandboxd/users.conf` populated with at least the sandboxd
   user's subnet entry.** Root-owned, mode `0644`, JSON. The daemon
   fails to start without a matching entry and emits an error pointing
@@ -410,6 +417,33 @@ a deny: non-zero exit, no action taken on the container's netns.
 Usernames appear in the config for admin readability; the helper
 compares numeric uids internally, so admin renames (e.g. `usermod`)
 take effect immediately — there is no silent caching layer.
+
+**Privilege boundary on `users.conf` path resolution.** The route helper
+runs with `cap_sys_admin+ep` on file. Honoring an attacker-controlled
+environment variable to redirect its authorization-config read inside
+that privileged binary would be a local privilege escalation — any
+user who can exec the helper could point it at a `users.conf` they
+own, granting themselves arbitrary `allow_users` entries. The helper
+therefore consults a feature-gated path resolver
+(`sandbox_core::users_conf::route_helper_users_conf_path`): default
+production builds (no Cargo features) ignore `SANDBOX_USERS_CONF`
+entirely and read `/etc/sandboxd/users.conf` unconditionally;
+test-feature builds (`--features test-env-override`, installed at
+`/usr/local/libexec/sandboxd-test/` and never invoked by the daemon)
+honor the env var so route-helper integration tests can drive a
+tempfile config they own. The daemon-side loader continues to honor
+the env var unconditionally because the daemon is not the privilege
+boundary; only the cap'd helper is.
+
+**Defensive ownership/mode check.** Both the daemon-side loader and
+the helper-side loader refuse to read `/etc/sandboxd/users.conf` if
+it is not owned by uid 0 or if it carries any group- or world-write
+bits. The check applies only to the canonical path (tempfile-based
+test paths bypass it naturally), so a misconfigured
+`chmod 666 /etc/sandboxd/users.conf` produces a loud refusal at
+config-load time rather than silently allowing any local user to
+rewrite the auth list. The error message points at the install
+runbook so operators know how to repair the file.
 
 **PID TOCTOU closure.** Between the daemon's `docker inspect` and the
 helper's netns entry, the container could in principle exit and the

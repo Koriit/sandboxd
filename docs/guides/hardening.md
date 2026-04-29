@@ -84,6 +84,15 @@ The gateway container ships with a tight capability set and a read-only root.
 - **`--read-only` root:** container filesystem is immutable. Writable paths (logs, PID files) come from tmpfs mounts. CA certificate files are bind-mounted read-only from the host.
 - **No sudo on the host:** the entire daemon runs as a regular user. The only host privileges required are membership in the `docker` and `kvm` groups.
 
+### Privileged helpers and the `SANDBOX_USERS_CONF` boundary
+
+Two privileged helpers exist in the install footprint: `qemu-bridge-helper` (setuid root, ships with QEMU) and `sandbox-route-helper` (cap'd `cap_sys_admin+ep`, lives at `/usr/local/libexec/sandboxd/sandbox-route-helper`). Both are invoked by the daemon, not by operators directly. Both cross-check the caller's uid against `/etc/sandboxd/users.conf` before performing any namespace mutation.
+
+The `sandbox-route-helper` binary's authorization model rests on the integrity of `/etc/sandboxd/users.conf`. Two concrete defences keep the file trustworthy:
+
+1. **Defensive ownership/mode check at config-load time.** The loader refuses to read the canonical path if the file is not owned by uid 0, or if it carries any group/world-write bits. A misconfigured `chmod 666 /etc/sandboxd/users.conf` cannot grant any user write access to the auth list — the loader bails before parsing, with an error pointing at the install runbook.
+2. **`SANDBOX_USERS_CONF` env-var override is feature-gated in the helper.** The daemon honors the env var unconditionally (the daemon is not the privilege boundary; it runs as the operator). The route helper, however, runs with `cap_sys_admin+ep` — granting any user who can exec it kernel-level namespace authority. Honoring an attacker-controlled env var inside the cap'd binary would let any local user point the helper at a `users.conf` they own, granting themselves arbitrary `allow_users` entries. Production builds of the route helper therefore **ignore** `SANDBOX_USERS_CONF` entirely; only test builds (`cargo build --features test-env-override`, installed at `/usr/local/libexec/sandboxd-test/` and never used by the daemon) consult it. The split makes the privilege boundary auditable: the file capability and the env-var seam cannot co-exist in the same binary.
+
 ## Layer 3 — Network isolation
 
 Network hardening cannot be turned off per session. For the full model see [networking](/concepts/networking/). The security-relevant guarantees:

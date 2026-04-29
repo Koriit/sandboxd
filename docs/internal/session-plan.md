@@ -53,8 +53,8 @@ Sandbox daemon providing isolated Linux VMs (Lima/QEMU) for coding agents. Per-m
 **Status.** completed · **Sessions.** 10 · **Details.** [milestones/M10.md](milestones/M10.md)
 
 ## M11 — Lite mode: container backend
-**Goal.** Second `sandboxd` session backend (Docker container via `--lite`) behind a new backend abstraction; full UX parity with VM sessions, container-level isolation traded for fast session creation. M11-S7 added post-verification for residual quality items; M11-S8 added to enforce the rootless-Docker out-of-scope contract in code rather than relying on test-side skipifs that silently masked it.
-**Status.** in_progress (S7 in flight: polish; S8 next: rootless-Docker enforcement) · **Sessions.** 8 · **Details.** [milestones/M11.md](milestones/M11.md)
+**Goal.** Second `sandboxd` session backend (Docker container via `--lite`) behind a new backend abstraction; full UX parity with VM sessions, container-level isolation traded for fast session creation. M11-S7 added post-verification for residual quality items; M11-S8 added to enforce the rootless-Docker out-of-scope contract in code rather than relying on test-side skipifs that silently masked it; M11-S9 added to harden the route helper's authorization config against env-var override, simplify the daemon-side resolver, and bundle the dev-environment make-target setup that the prior sessions implicitly assumed; M11-S10 added to promote the orphan reaper's CIDR-anchor (currently doc-only) to enforced filtering, closing the cross-daemon mass-delete gap.
+**Status.** in_progress (S8 done, S9 in flight, S10 next: CIDR-scoped orphan reaper) · **Sessions.** 10 · **Details.** [milestones/M11.md](milestones/M11.md)
 
 ---
 

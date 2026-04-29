@@ -33,7 +33,7 @@ This matters for the threat model: the policy layer (DNS filtering, nftables, En
 
 ### One bridge per session
 
-When you create a session, sandboxd allocates a `/28` subnet from a configurable base (default `10.209.0.0/24`). A `/24` holds 16 concurrent sessions.
+When you create a session, sandboxd allocates a `/28` subnet from a configurable base (default `10.209.0.0/24`). A `/24` holds 16 concurrent sessions. The dev-install template at `contrib/users.conf.example` overrides this to `10.209.0.0/20` (256 concurrent sessions) for additional headroom; either works because `users.conf` overrides the in-code default.
 
 | Address in the `/28` | Role |
 |---|---|

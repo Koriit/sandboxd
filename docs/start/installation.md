@@ -258,24 +258,47 @@ All privilege escalation is handled by the underlying tools (Docker, `qemu-bridg
 
 ### Run tests
 
-Before running `make test-e2e`, complete [sandboxd configuration](#sandboxd-configuration) below — the end-to-end suite boots a real daemon, which refuses to start without `/etc/sandboxd/users.conf` and a `setcap`-installed `sandbox-route-helper`. `make test` (unit + integration) does not need those steps.
+Before running `make test-e2e`, complete [sandboxd configuration](#sandboxd-configuration) below — the end-to-end suite boots a real daemon, which refuses to start without `/etc/sandboxd/users.conf` and a `setcap`-installed `sandbox-route-helper`. `make test` (unit-only) does not need those steps; `make test-integration` depends on `make install-route-helper-test-cap` automatically.
 
 ```bash
-make test          # Unit and integration tests (cargo nextest run)
-make test-e2e      # End-to-end tests (pytest, requires running daemon)
+make test               # Hermetic unit tests; no Docker / Lima / nft (fast)
+make test-integration   # Adds out-of-process integration tests (Docker required)
+make test-e2e           # End-to-end tests (pytest, requires running daemon)
 ```
 
 `make test-e2e` automatically creates a Python virtualenv in `tests/e2e/.venv/` on first run and reinstalls dependencies when `tests/e2e/pyproject.toml` changes. No manual venv setup is needed.
 
 ## sandboxd configuration
 
-Two one-time steps are required before the daemon starts: a system-wide config file at `/etc/sandboxd/users.conf`, and a privileged helper binary on `$PATH`. Both stay in place across upgrades.
+Two one-time steps are required before the daemon starts: a system-wide config file at `/etc/sandboxd/users.conf`, and a privileged helper binary at `/usr/local/libexec/sandboxd/sandbox-route-helper`. Both stay in place across upgrades.
+
+### One-shot setup: `make setup-dev-env`
+
+The repository ships a make target that runs every per-host install/configure step the project needs. It prints `[sudo] <exact change>` before each privileged operation so you see what is about to be modified before authenticating, and is fully idempotent — re-running on an already-configured host prints `✓ already configured` for every step and invokes no `sudo`.
+
+```bash
+make setup-dev-env
+```
+
+This composes the five sub-targets below. Each is independently runnable if you only need to (re)apply one step:
+
+| Sub-target | What it does |
+|---|---|
+| `make install-route-helper-prod-cap` | Installs the cap'd production helper at `/usr/local/libexec/sandboxd/sandbox-route-helper` |
+| `make install-route-helper-test-cap` | Installs the cap'd `test-env-override`-feature helper at `/usr/local/libexec/sandboxd-test/sandbox-route-helper` (used by `make test-integration`) |
+| `make setup-bridge-conf` | Ensures `/etc/qemu/bridge.conf` authorizes sandbox bridges (`sb-*`); refuses to silently mutate an existing file with conflicting content |
+| `make setup-users-conf` | Installs `/etc/sandboxd/users.conf` from `contrib/users.conf.example` with `$USER` substituted; leaves an existing file alone |
+| `make setup-bridge-helper-setuid` | `chmod u+s /usr/lib/qemu/qemu-bridge-helper` if not already setuid |
+
+The sections below explain what each prerequisite does and document the manual install path if you cannot or do not want to use the make target.
 
 ### users.conf
 
 `/etc/sandboxd/users.conf` declares which Unix users may run the daemon and which CIDR pool each one allocates from. The daemon reads this file at startup, looks up its own uid in the `allow_users` lists, and uses the matching subnet's CIDR as its session-network allocation pool. If the file is missing, malformed, or contains no subnet matching the daemon's uid, sandboxd refuses to start; error messages name the offending file path.
 
-The file is JSON, owned by root, mode `0644`. Schema:
+The file is JSON, **owned by root, mode `0644`**. The daemon and the route helper additionally enforce a defensive ownership/mode check at config-load time: if the canonical path `/etc/sandboxd/users.conf` is not owned by uid 0 or carries any group/world-write bits, the loader refuses to use it. The route helper's authorization model rests on this file being immutable to non-root callers — a group-writable copy could let a local user grant themselves arbitrary `allow_users` entries.
+
+Schema:
 
 ```json
 {
@@ -287,38 +310,49 @@ The file is JSON, owned by root, mode `0644`. Schema:
 
 Multiple subnet entries are allowed; each binds one CIDR pool to a list of allowed Unix usernames. The daemon resolves `allow_users` entries to numeric uids via `getpwnam_r` at startup, so renaming a user with `usermod` takes effect on the next daemon start without editing this file.
 
-For a single-user dev install (one daemon user, one default pool):
+For a single-user dev install (one daemon user, one default pool), `make setup-users-conf` renders `contrib/users.conf.example` with `$USER` substituted in. The manual equivalent:
 
 ```bash
 sudo mkdir -p /etc/sandboxd
-echo '{"subnets":[{"cidr":"10.209.0.0/24","allow_users":["'"$USER"'"]}]}' \
+echo '{"subnets":[{"cidr":"10.209.0.0/20","allow_users":["'"$USER"'"]}]}' \
     | sudo tee /etc/sandboxd/users.conf > /dev/null
+sudo chown root:root /etc/sandboxd/users.conf
 sudo chmod 0644 /etc/sandboxd/users.conf
 ```
 
 The shell-redirect through `sudo tee` is intentional — `sudo echo ... > file` does not work because the shell opens the file before `sudo` is involved.
 
+#### `SANDBOX_USERS_CONF` env-var override
+
+The daemon honors a `SANDBOX_USERS_CONF` environment variable that overrides the canonical path. This is a test-only seam consumed by the daemon-startup integration tests; production operators must not set it. The route helper additionally **does not honor this env var** in production builds — see [sandbox-route-helper](#sandbox-route-helper) below for the privilege rationale.
+
 ### sandbox-route-helper
 
-`sandbox-route-helper` is a small privileged binary, built alongside the daemon, that installs the per-session default route inside container netns'es on the daemon's behalf. It must be on `$PATH` and given the `cap_sys_admin` Linux capability:
+`sandbox-route-helper` is a small privileged binary, built alongside the daemon, that installs the per-session default route inside container netns'es on the daemon's behalf. The production install path is `/usr/local/libexec/sandboxd/sandbox-route-helper` (per FHS § 4.7: libexec is for non-user-facing helper binaries that other binaries invoke directly). The binary must carry the `cap_sys_admin` Linux capability:
 
 ```bash
-sudo install -m 0755 \
+sudo install -D -m 0755 \
     sandboxd/target/release/sandbox-route-helper \
-    /usr/local/bin/sandbox-route-helper
-sudo setcap cap_sys_admin+ep /usr/local/bin/sandbox-route-helper
+    /usr/local/libexec/sandboxd/sandbox-route-helper
+sudo setcap cap_sys_admin+ep /usr/local/libexec/sandboxd/sandbox-route-helper
 ```
 
-If you only built in debug mode, swap `release` for `debug` in the source path. The capability must be re-applied after every reinstall — `setcap` attributes do not survive a binary copy.
+If you only built in debug mode, swap `release` for `debug` in the source path. The capability must be re-applied after every reinstall — `setcap` attributes do not survive a binary copy. The make target `make install-route-helper-prod-cap` automates both steps and is stamp-driven on the source's mtime so a re-run after an unchanged build is a no-op.
 
 Verify the capability is set:
 
 ```bash
-getcap /usr/local/bin/sandbox-route-helper
-# Expected: /usr/local/bin/sandbox-route-helper cap_sys_admin=ep
+getcap /usr/local/libexec/sandboxd/sandbox-route-helper
+# Expected: /usr/local/libexec/sandboxd/sandbox-route-helper cap_sys_admin=ep
 ```
 
 Do **not** make this binary setuid root. The capability approach is intentional: the daemon stays unprivileged, and the helper acquires only the kernel permission it needs (joining a container's network namespace via `pidfd_open(2)` + `setns(2)`). The helper is invoked by sandboxd, not by operators directly, and it cross-checks the caller's uid against the same `users.conf` `allow_users` list — operators with no `allow_users` entry cannot use it even if they can execute the binary.
+
+#### Privilege boundary: `SANDBOX_USERS_CONF` is feature-gated
+
+The route helper runs with `cap_sys_admin+ep`. Honoring an attacker-controlled environment variable to redirect its authorization-config read inside that privileged binary would be a local privilege escalation: any user who can exec the helper could point it at a `users.conf` they own, granting themselves arbitrary `allow_users` entries. The production build (no Cargo features) therefore **cannot consult `SANDBOX_USERS_CONF`** — it always reads `/etc/sandboxd/users.conf`. The route-helper integration tests use a separate test-feature build (`cargo build --features test-env-override`) installed at `/usr/local/libexec/sandboxd-test/`, which the daemon never invokes; this build does honor the env var so tests can drive a tempfile config they own.
+
+The daemon itself continues to honor `SANDBOX_USERS_CONF` unconditionally because the daemon is not the privilege boundary — only the cap'd helper is.
 
 ## First run
 
