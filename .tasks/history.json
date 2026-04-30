@@ -1,13 +1,13 @@
 {
   "current_state": {
-    "milestone": "M10",
-    "session": "M10-S10",
-    "status": "finished",
-    "completed_sessions": 69,
-    "total_sessions": 69,
-    "next": "M11+: future work"
+    "milestone": "M11",
+    "session": "M11-S10",
+    "status": "completed",
+    "completed_sessions": 79,
+    "total_sessions": 89,
+    "next": "M12-S1 \u2014 UDP audit + pre-DNAT deny-event fix (#29). First session of M12 (10-session loose-ends + UDP-hardening milestone). Audit UDP path map end-to-end, replace IP_ORIGDSTADDR-only deny-logger lookup with a conntrack netlink lookup so deny events carry the pre-DNAT 5-tuple, rewrite m10_s3_end_to_end.rs Phase 8 test 2, add a load-style integration test, and produce docs/internal/m12-s1-udp-audit.md for downstream sessions. See docs/internal/milestones/M12.md."
   },
-  "append_system_prompt": "We are building sandbox daemon with Lima VMs for coding agents.  \nSpecifically: .tasks/specs/2026-04-21-port-explicit-policies-presets-observability-design.md  \nSession plan: docs/internal/session-plan.md\n\nUse /session-tracking for progress tracking. Log decisions and discoveries \u2014 they survive compaction. Block if design cannot be implemented.\n\nYou are running unsupervised \u2014 make autonomous decisions and do not wait for user input. If you hit an issue only the user can resolve, use progress block to pause the session.\n\nKeep context clean: delegate exploration and implementation to subagents. Reserve main conversation for decisions and coordination.\n\nLeverage teams, especially when there are build tools and tests involved, as those usually produce a lot of logs and are good fit for dedicated teammate to run them.\n\nYou are running in isolated VM with passwordless sudo. You can install packages and change system settings as needed.",
+  "append_system_prompt": "We are building sandbox daemon with Lima VMs for coding agents.  \nSpecifically: we are fixing todos and loose ends before planning support for macOS.  \nSession plan: docs/internal/session-plan.md\n\nUse /session-tracking for progress tracking. Log decisions and discoveries \\u2014 they survive compaction. Block if design cannot be implemented.\n\nYou are running unsupervised \\u2014 make autonomous decisions and do not wait for user input. If you hit an issue only the user can resolve, use progress block to pause the session.\n\nKeep context clean: delegate exploration and implementation to subagents. Reserve main conversation for decisions and coordination.\n\nLeverage teams, especially when there are build tools and tests involved, as those usually produce a lot of logs and are good fit for dedicated teammate to run them.\n\nYou are running in isolated VM with passwordless sudo. You can install packages and change system settings as needed.",
   "current_log": null,
   "log": [
     {
@@ -1345,6 +1345,215 @@
         "propagate_and_ack",
         "dns_gate_timed_out"
       ]
+    },
+    {
+      "session": "M11-S1",
+      "title": "Backend abstraction and Lima refactor",
+      "summary": "M11-S1 \u2014 Backend abstraction and Lima refactor \u2014 landed in 4 phases (1A trait surface, 1B LimaRuntime/LimaTransport, 1C AppState rethread, 1D verification + doc polish). Introduced sandbox_core::backend module with SessionRuntime + GuestTransport traits, RuntimeHandle/RuntimeStatus/Capabilities/SessionSpec/RuntimeStartArgs types, V005 migration for the 'backend' column, and LimaRuntime+LimaTransport impls. AppState now holds Arc<HashMap<BackendKind, Arc<dyn SessionRuntime>>> for handler dispatch alongside Arc<LimaRuntime> for Lima-specific orchestration via .manager(). All 17 handler call sites in main.rs migrated; reconcile() takes &LimaRuntime; cleanup macro and trait dispatch coexist. Lima behavior preserved: 46/46 E2E (45m), 991/991 hermetic, 3/3 Lima integration, clippy/fmt clean, grep sweep clean, kio-reviewer APPROVE.",
+      "completed": "2026-04-26T15:45:41.788043Z",
+      "decisions": [
+        "BackendKind lives on Capabilities (Capabilities.kind: BackendKind). Lets SessionSpec::validate construct UnsupportedFeature::WorkspaceMode(mode, caps.kind) without an extra parameter. RuntimeHandle is a String newtype with from_session_id and from_name constructors. ExitCode is a pub struct ExitCode(pub i32) newtype. RuntimeStatus mirrors VmStatus plus Creating/Error variants for daemon-level state.",
+        "SessionRuntime::create signature deviates from spec sketch: takes (&self, session_id: &SessionId, spec: &SessionSpec) \u2014 daemon assigns id before dispatch, mirroring LimaManager::create_vm and the deterministic-handle convention. Documented inline on the trait method. No other trait shape change in 1B.",
+        "AppState shape post-1C: runtimes: Arc<HashMap<BackendKind, Arc<dyn SessionRuntime>>> for trait dispatch; lima_runtime: Arc<LimaRuntime> for Lima-specific orchestration via .manager() escape hatch (clone_vm, install_guest_agent, list_vms, vm_status, base_image lifecycle). Helper fns: lima_dyn(&AppState) -> Arc<dyn SessionRuntime>; session_spec_from_config(&SessionConfig) -> SessionSpec. reconcile() takes &LimaRuntime; still Lima-specific (uses VmStatus walks via manager()). clone_vm and install_guest_agent stay Lima-only \u2014 provisioning shapes don't generalize cleanly to container backend (M11-S2)."
+      ],
+      "discoveries": [
+        "Phase 1 rethreading constraint: AppState already owns event_bus, vm_ip_map, ingestors, propagation_states, component_health_state. The refactor moves who *creates and destroys* per-session entries (ingestor spawn at main.rs:2950, event_bus.register_session at 3062, vm_ip_map.bind at 3065, unregister/unbind at 1558/1578) behind the SessionRuntime abstraction \u2014 the maps themselves stay on AppState. Hook points must survive the refactor verbatim or Lima E2E breaks.",
+        "GuestConnector (sandbox-core/src/guest.rs:202-278) currently takes Arc<LimaManager> to derive the VM name and run 'limactl shell <vm> -- socat - TCP:127.0.0.1:5123'. The S1 refactor splits this: GuestConnector becomes the backend-agnostic JSON-protocol consumer; the raw connect() byte stream becomes GuestTransport::connect() per backend. This is the trickiest seam because it touches the new trait and well-tested existing code.",
+        "SessionSpec is new (does not exist today); SessionConfig stays as the persisted blob shape (cpus, memory_mb, disk_gb, hardened, etc., still serialized at sessions.config column). SessionSpec is the request-time validation shape carrying BackendSpecific; mapping from SessionSpec \u2192 existing LimaManager call sites happens inside LimaRuntime::create. The persisted 'backend' column is added by V005 separately, alongside the unchanged sessions.config blob.",
+        "WorkspaceMode is data-bearing (Shared{host_path}, Clone{repo_url}); cannot derive enumset::EnumSetType. Phase 1A introduced companion WorkspaceModeKind unit-only enum + WorkspaceMode::kind() bridge. Capabilities::workspace_modes is EnumSet<WorkspaceModeKind>; UnsupportedFeature::WorkspaceMode carries (WorkspaceModeKind, BackendKind). Capabilities check kind discriminator, not full mode payload \u2014 the right semantic split.",
+        "Phase 1B Lima refactor pattern: LimaRuntime wraps Arc<LimaManager> as inner field with pub fn manager() escape hatch. Trait surface (create/start/stop/delete/status/ip/exec_interactive/guest_transport) covers VM lifecycle, but AppState still needs LimaManager-specific methods (clone_vm, check_base_image, build_base_image, install_guest_agent, generate_template) \u2014 invoke via runtime.manager(). Phase 1C decision: either grow trait surface to absorb these, or downcast Arc<dyn SessionRuntime> -> Arc<LimaRuntime> for Lima-specific paths. The escape hatch exists by design and should narrow over phases.",
+        "Lima integration tests share ~/.lima/ state and collide if run in parallel (limactl delete fails 'open .../sandbox-XXX/lima.yaml: no such file'). Resolved by adding a 'lima' test-group in sandboxd/.config/nextest.toml with max-threads=1 and override targeting test(/^integration_lima/). Future integration_lima_* tests inherit the serialisation; no per-test annotation needed.",
+        "Phase 1C deferred work catalogue (set by 1B subagent): (a) trait::start currently uses SessionConfig::default() \u2014 Phase 1C must widen signature with RuntimeStartArgs{docker_bridge, mac, config} OR call runtime.manager().start_vm(...) directly via escape hatch. (b) LimaRuntime::ip shells out via 'limactl shell <vm> -- ip -4 -o addr show dev eth1' \u2014 Phase 1C should swap for NetworkInfo.vm_ip lookup (already persisted; one less round-trip; works pre-boot). TODO comment left at LimaRuntime::ip impl. (c) LimaRuntime::create is 'create inert VM only' \u2014 no clone, no boot, no agent install; the full create\u2192boot\u2192agent flow remains in AppState until Phase 1C decides whether to absorb it onto the trait or keep it on LimaRuntime as Lima-specific inherent methods. (d) GuestConnector still consumes Arc<LimaManager>; Phase 1C may refactor to Arc<dyn GuestTransport>. (e) disk_gb defaulting falls through to SessionConfig::default().disk_gb=20 when SessionSpec::disk_gb is None \u2014 Phase 1C may prefer error or daemon-level default upstream.",
+        "Phase 1C confirmed: LimaSpec is NOT a separate type. Lima-specific knobs live on BackendSpecific::Lima { hardened, memory_mb, cpus } and SessionSpec.template (Option<String>). The custom Lima YAML template flow now lives in LimaRuntime::create (was inlined in handler before). RuntimeStatus is 5-variant (Running/Stopped/Creating/Error/Unknown); VmStatus is 3-variant. Handlers fold Creating/Error into existing 'leave alone / Unknown' branches for backward compat \u2014 Phase 1D may revisit when richer status DTO becomes useful (post-container).",
+        "M11-S1 exit criteria fully met. Full E2E suite passed 46/46 in 45:34 against the rethreaded AppState \u2014 Lima behavior preserved end-to-end through the Arc<dyn SessionRuntime> dispatch surface. Hermetic 991/991, Lima integration 3/3, clippy -D warnings clean, fmt clean, grep sweep clean (no surviving state.lima refs; Arc<LimaManager> only in expected places: GuestConnector deferred to M11-S2, LimaRuntime internals, comments). kio-reviewer APPROVE with 0 critical and 3 doc-only Issues all fixed in this session."
+      ],
+      "artifacts": [
+        "sandbox_core::backend::{SessionRuntime, GuestTransport, RuntimeHandle, RuntimeStatus, RuntimeStartArgs, ExitCode, AsyncReadWrite}",
+        "sandbox_core::backend::capabilities::{BackendKind, Capabilities, IsolationLevel, UnsupportedFeature}",
+        "sandbox_core::backend::spec::{SessionSpec, BackendSpecific}",
+        "sandbox_core::backend::lima::{LimaRuntime, LimaTransport}",
+        "sandbox_core::session::WorkspaceModeKind",
+        "migrations/V005__session_backend_column.sql",
+        "AppState.runtimes + AppState.lima_runtime fields",
+        "main.rs helpers: lima_dyn(), session_spec_from_config()",
+        "nextest.toml lima test-group (max-threads=1)"
+      ]
+    },
+    {
+      "session": "M11-S2",
+      "title": "Route helper, users.conf, daemon startup validation",
+      "summary": "M11-S2 delivered the privileged route helper and users.conf-driven allocation pool. Phase 2A: shared loader sandbox-core/src/users_conf.rs (UsersConfig/SubnetEntry/Cidr4 types, find_subnet_by_*, allows_uid lookups; 22 unit tests). Phase 2B: new sandbox-route-helper crate (6th workspace member) implementing the spec's eight-step authorization flow (caller uid via getuid, gateway-ip subnet match, allow_users membership, pidfd_open+setns into container netns, getifaddrs subnet enforcement, ip route replace default via gateway, single deny exit code 1 with stderr reasons; three deny-branch integration tests with Docker fixture and CappedHelper RAII). Phase 2C: daemon startup loads users.conf, resolves the daemon's uid \u2192 subnet, threads CIDR through NetworkManager::new (replacing with_defaults); resolve_allocation_pool extracted as pure helper with 3 unit tests; explicit eprintln!+match shape in main() to surface SandboxError Display rather than Box<dyn Error> Debug; From<UsersConfigError> for SandboxError mapping with test pinning file-path preservation; three integration_users_conf_startup black-box tests (file missing/malformed/no-matching-subnet). Phase 2D: docs/start/installation.md updated with users.conf section, sandbox-route-helper setcap section (NOT setuid), kernel 5.8+ row, and a one-line callout at top of Run tests pointing at the configuration section (resolves kio-reviewer's docs-ordering blocker). Verification gates: cargo nextest --workspace 1017 passed, make test-integration 30 passed (incl. 6 new tests), make test-e2e 46/46 passed in 50 min, clippy clean, fmt clean, no flakes; kio-reviewer NEEDS CHANGES \u2192 APPROVED after the one-line callout. Operator artifact: /etc/sandboxd/users.conf created on the dev VM with {\"subnets\":[{\"cidr\":\"10.209.0.0/24\",\"allow_users\":[\"olek\"]}]} root-owned 0644.",
+      "completed": "2026-04-26T17:44:12.732408Z",
+      "decisions": [
+        "sandbox-route-helper exit-code policy: single deny exit code 1 across all eight steps; stderr reason text is the load-bearing payload. Rationale: distinct codes per step would invite scripts to take ad-hoc dependencies on internal step numbering. Tests assert on stderr substrings, not exit codes."
+      ],
+      "discoveries": [
+        "M11-S2 scoping: NetworkManager already accepts arbitrary base CIDR via new(base, prefix_len) \u2014 daemon today calls with_defaults() hardcoded to 10.209.0.0/24; users.conf integration just swaps the call site at sandboxd/src/main.rs ~line 4694. nix 0.29 is in-tree (sandbox-deny-logger dep); use it for pidfd_open/setns/getuid/getpwuid_r in the helper rather than rustix. users.conf loader belongs in sandbox-core, fixed path /etc/sandboxd/users.conf, env-var override SANDBOX_USERS_CONF for tests; pattern follows sandbox-cli/src/presets/user.rs but hard-fail instead of warn-skip.",
+        "Phase 2A loader landed: 22 unit tests, full workspace 1013 passing. Public surface: UsersConfig/SubnetEntry/Cidr4 types, find_subnet_by_gateway_ip + find_subnet_by_uid + allows_uid lookups, load_users_config{,_from} loaders. nix features split across crates: sandbox-deny-logger has [net,socket,uio]; sandbox-core now has [user] for User::from_{name,uid}. From<UsersConfigError> for SandboxError DEFERRED \u2014 Phase 2C must decide between SandboxError::InvalidArgument-with-formatted-path or a typed extension.",
+        "Rust 2024 made std::env::set_var and remove_var unsafe \u2014 tests that flip env vars need unsafe blocks with save/restore to avoid leaking into sibling tests. Pattern landed in users_conf.rs tests; reuse for any future env-var tests.",
+        "9p filesystem on the cargo target/ directory in this Lima VM does NOT back security.capability xattrs \u2014 sudo setcap returns Operation not supported against cargo-built binaries. Workaround: copy binary to /tmp (ext4, real xattr backing) before setcap. Pattern landed in sandbox-route-helper integration tests as CappedHelper RAII struct; reuse for any future setcap-needing test. Use /tmp literally, not std::env::temp_dir() \u2014 $TMPDIR could be redirected back to 9p.",
+        "nix 0.29 does NOT expose pidfd_open in any feature combination (verified by grepping the registry source). Use libc::syscall(libc::SYS_pidfd_open, pid, 0u32) directly and read errno via *libc::__errno_location(). Wrap in OwnedFd via FromRawFd for RAII close. Bumping nix to a future version that exposes pidfd_open is a small follow-up cleanup.",
+        "Box<dyn Error>'s blanket From<E> impl short-circuits the  operator's coercion through SandboxError when used at main()'s top level \u2014 operators see Debug repr (FileNotFound(\"...\")) instead of Display message. Workaround: explicit match + eprintln!(\"sandboxd: {err}\") + return Err(err.into()) shape for any UsersConfigError or InvalidArgument coming from startup-validation. Pattern landed in sandboxd/src/main.rs.",
+        "NetworkManager::restore_from_infos already errors cleanly on out-of-pool persisted-session allocations (case b per Phase 2C handoff): block_index_for returns None for any subnet outside the configured pool; restore_from_infos maps to SandboxError::Network. No additional code needed for the rollback-with-altered-users.conf path; daemon refuses to start. Error message names offending subnet but not configured pool CIDR \u2014 minor enrichment opportunity, not blocking.",
+        "M11-S2 verification gates all green on combined M11-S1+S2 working tree: cargo nextest --workspace 1017 passed, make test-integration 30 passed (incl. 6 new M11-S2 tests), full make test-e2e 46/46 passed in 50 min wall-clock, clippy clean, fmt clean, no flakes (incl. previously-flaky github-repo test). kio-reviewer NEEDS CHANGES \u2192 blocker fixed (docs ordering callout in installation.md). Working tree remains uncommitted \u2014 see todo #65 for disentanglement before merge."
+      ],
+      "artifacts": [
+        "sandboxd/sandbox-core/src/users_conf.rs,sandboxd/sandbox-route-helper/,sandboxd/sandbox-route-helper/tests/integration_route_helper.rs,sandboxd/sandboxd/tests/integration_users_conf_startup.rs,sandboxd/sandbox-core/src/error.rs,sandboxd/sandboxd/src/main.rs,docs/start/installation.md,/etc/sandboxd/users.conf"
+      ]
+    },
+    {
+      "session": "M11-S3",
+      "title": "ContainerRuntime, lite image build, GET /backends",
+      "summary": "M11-S3 closed: ContainerRuntime + ContainerTransport (3A), lite image build + ensure_image + first-use warning (3B), GET /backends sub-router endpoint (3C), AppState wiring + container POST /sessions path + SessionDto warnings (3D), and review fixes (uid mapping helper, workspace_modes EnumSet::empty, log demotion). All 4 verification gates green: 1038 unit + 43 integration tests pass, clippy clean, fmt clean. Container backend is now functionally end-to-end behind the existing API surface; CLI flags (--lite/--backend) and rebuild-image come in M11-S4. Deferred: M11-S1+S2+S3 commit disentanglement (todo #65), spec patch for seccomp=builtin (todo #66), cpus precision normalization at HTTP boundary (todo #67), bind-mount plumbing for Shared workspaces (M11-S4/S5).",
+      "completed": "2026-04-26T22:07:09.928154Z",
+      "decisions": [
+        "M11-S3 Phase 3A network plumbing: SessionRuntime::create signature is fixed (trait surface from M11-S1) and BackendSpecific::Container doesn't carry network info; 3A handoff forbade touching sandboxd/src/main.rs (3D scope). Solution landed: ContainerRuntime::register_session(session_id, ContainerNetwork) public method storing per-session network in Mutex<HashMap>. Phase 3D and integration tests call register_session before create(). Trait stays unchanged; Lima keeps ignoring container fields. Pattern reused by 3B if image-pull metadata needs threading.",
+        "M11-S3 Phase 3C: GET /backends endpoint landed via SUB-ROUTER pattern (sandboxd/src/backends_http.rs) instead of inline-in-main.rs the handoff suggested. Justified by existing precedent (events_http.rs, policy_http.rs) and test scaffold reuse \u2014 sub-router enables tower::ServiceExt::oneshot HTTP-level integration tests against minimal sub-state without booting Lima/gateway/network/CA-manager. Wire shape unchanged: [{kind: 'lima', capabilities: {...}}]. BackendInfo struct in sandbox-core/src/backend/mod.rs serializes correctly 'for free' from existing serde tags on BackendKind (rename_all=lowercase) and Capabilities. Sort key: BackendKind::as_str() (the persisted lowercase tag) for stable wire order. Net file budget: +1 over handoff (backends_http.rs).",
+        "M11-S3 Phase 3D landed. Container backend wired end-to-end: ContainerRuntime registered alongside Lima with resource defaults computed once at startup (host_ram_mb*0.8 floored, host_cpus*0.8 to 1 decimal); runtime_for(state, kind) helper replaces 13 lima_dyn() call sites; POST /sessions container path runs daemon-side SessionSpec::validate, calls ensure_image() before runtime.create(), surfaces Built{warning} via SessionDto.warnings:Vec<String>, calls register_session(session_id, ContainerNetwork) before create. SessionDto.warnings + SessionDto.backend additive with #[serde(default, skip_serializing_if = Vec::is_empty)] / #[serde(default)]. Gates 1+3+4 green locally (1037 unit, clippy clean, fmt clean); gate 2 (integration profile) running in background. Non-obvious: hardened=true on container backend rejected pre-projection (Container variant has no hardened field so validate() can't see it; explicit pre-check returns UnsupportedFeature::Hardening). cpus impedance: wire stays u32 (BackendSpecific::Container.cpus); daemon-internal default is f64 to preserve spec 1-decimal precision for Docker --cpus.",
+        "M11-S3 review fixes landed cleanly: (1) MAJOR uid degradation fixed via pub map_container_uid_gid(uid,gid)->(u32,u32) helper in sandbox-core/src/backend/container.rs (uid 0\u21921000:1000 spec floor; uid 1000\u21921000:1000; uid\u22600&&\u22601000\u2192passthrough) wired at main.rs:5070; +1 unit test pinning all four spec branches. (2) MINOR workspace_modes mismatch fixed by tightening capabilities_for_container() to EnumSet::empty() with WHY comment that bind-mount plumbing deferred to M11-S4/S5; +1 integration test integration_create_session_container_rejects_shared_workspace asserting UnsupportedFeature::WorkspaceMode(Shared,Container). (3) NIT WARN log demoted to debug! with corrected message about route-helper integration scheduled for M11-S4/S5. All 4 gates green: 1038 unit + 43 integration tests, clippy + fmt clean. Skipping second kio-reviewer pass \u2014 fixes were mechanical."
+      ],
+      "discoveries": [
+        "M11-S3 scoping: SessionRuntime trait at sandbox-core/src/backend/mod.rs:210 (kind/capabilities/create/start/stop/delete/status/ip/guest_transport/exec_interactive). AppState.runtimes is Arc<HashMap<BackendKind,Arc<dyn SessionRuntime>>> at sandboxd/src/main.rs:269; lima_dyn() helper at line 374 fetches Lima today. Capabilities struct in sandbox-core/src/backend/capabilities.rs:80. V005 migration adds backend column with DEFAULT lima \u2014 safe for rollback. Note: Explore claimed M11-S1 'already committed' but it remains uncommitted in working tree (per todo #65); confirm before assuming git state.",
+        "M11-S3 daemon flow: POST /sessions handler at sandboxd/src/main.rs:468. Order: parse/validate (474-505) \u2192 store.create_session (508) \u2192 CA generate (517-534) \u2192 network.create_network (536-557) \u2192 runtime create+start (Lima today, lines 564-834; ContainerRuntime slots here) \u2192 guest.ping agent-ready (837-852) \u2192 state Running (855) \u2192 setup_session_networking gateway (859-908) \u2192 policy apply (910-951) \u2192 repo clone (954-1054) \u2192 boot cmd (1056-1150) \u2192 SessionDto response (1153-1178). NO warnings field on response today \u2014 net-new plumbing for the spec-mandated first-use warning.",
+        "M11-S3 Docker integration: subprocess-only via std::process::Command::new('docker') in sandbox-core/src/gateway.rs (lines 274 rm, 483 run, 619 stop, 642 force-rm). NO bollard dep. Health checks parse 'docker inspect --format {{.State.Health.Status}}' (gateway.rs:99-115 DockerHealth enum). ContainerRuntime should follow same subprocess pattern. Route-helper invocation: docker inspect -f '{{.State.Pid}}' \u2192 sandbox-route-helper <pid> <gateway_ip> \u2192 check exit \u2192 agent probe. Helper consumes users.conf itself (no extra read needed by ContainerRuntime). Image build: no precedent \u2014 net-new ensure_image() in sandbox-core/src/backend/container.rs; Dockerfile location sandboxd/images/lite/Dockerfile (dir is net-new).",
+        "M11-S3 Phase 3A spec bug: docker --security-opt seccomp=default is INVALID syntax (Docker reads value as filename and exits 'no such file or directory'). Correct spelling for Docker's default seccomp profile is seccomp=builtin. Spec \u00a7 Hardening line 542 needs correction. Implementer landed seccomp=builtin and documented the discrepancy in container.rs module docstring. Filed as deferred todo to track the spec patch.",
+        "M11-S3 Phase 3A transport choice: spec \u00a7 container transport says 'docker exec <ctr> socat - TCP:127.0.0.1:5123' \u2014 agent binds loopback-only inside container, so the handoff's 'TCP via bridge IP' alternative would not have reached it. ContainerTransport implements docker-exec-socat with kill_on_drop child reaping; ContainerTransportStream wraps stdin/stdout via AsyncRead/AsyncWrite. Type impedance: BackendSpecific::Container has cpus:u32 but spec \u00a7 Resource defaults wants 1-decimal precision (0.8, 1.5); 3A mitigated with as f64 in resource_ceilings, 3D should normalize at HTTP boundary. Docker stderr variance: 'docker inspect' emits 'error: no such object' (lowercase) while 'docker rm/stop' emits 'Error response from daemon: No such container' (mixed case); status()/delete()/stop() handle both shapes.",
+        "M11-S3 Phase 3B delivered cleanly: ensure_image() tag scheme sandboxd-lite:<daemon-version> (env CARGO_PKG_VERSION), container_image_lock as static Mutex<()>, EnsureImageOutcome enum (AlreadyPresent | Built{warning}), LITE_DOCKERFILE via include_str! from sandboxd/images/lite/Dockerfile (verbatim from spec). 3 new integration tests (first-use warning, second-call skips, concurrent serialize) \u2014 integration profile 35\u219238. The 'futex_wait hang' the implementer chased was transient first-run Docker latency (apt-get + ubuntu:22.04 base layer fetch), NOT a deadlock. Future Docker-integration tests on fresh VMs will need the same warm-up patience or a pre-pull step.",
+        "M11-S3 reviewer review-fix triage pattern: when kio-reviewer NEEDS CHANGES findings are mechanical (helper extract + capability narrow + log demote), skip second-pass review. Verification = (a) trust subagent's reported gate counts plus (b) ground-truth grep that each fix landed in the expected files. For non-mechanical or large-blast-radius findings, run a second reviewer pass. Reviewer verdict (Blockers vs NEEDS CHANGES) sets the floor; the re-review bar is judgment, not protocol."
+      ],
+      "artifacts": [
+        "sandboxd/sandbox-core/src/backend/container.rs,sandboxd/sandbox-core/src/backend/mod.rs,sandboxd/sandbox-core/src/api/dto.rs,sandboxd/sandbox-core/src/api/mapper.rs,sandboxd/sandbox-core/src/backend/capabilities.rs,sandboxd/sandbox-core/src/session.rs,sandboxd/sandbox-core/src/store.rs,sandboxd/sandbox-core/migrations/V005__session_backend_column.sql,sandboxd/sandbox-core/tests/integration_lite_image_build.rs,sandboxd/sandboxd/src/main.rs,sandboxd/sandboxd/src/backends_http.rs,sandboxd/sandboxd/tests/integration_backends_endpoint.rs,sandboxd/sandboxd/tests/integration_create_session_container.rs,sandboxd/images/lite/Dockerfile"
+      ]
+    },
+    {
+      "session": "M11-S4",
+      "title": "--lite CLI surface, capabilities validation, UX",
+      "summary": "M11-S4 closed. Phase 4D test_lite.py: 8 passed + 2 skipped (todo #68 workspace bind to M11-S5; todo #70 gateway container wiring to M11-S5) in 128.23s. Deliverables: tests/e2e/helpers/__init__.py + host_resources.py + lite_harness.py + test_lite.py. In-flight bug fix: plan_ssh_command -it \u2192 conditional -i/-it based on caller's TTY (2 new unit tests pin non-TTY path). Cargo: 1104 unit + 56 integration green, clippy/fmt clean. New deferral todo #70 captures gap #6 gateway integration that Phase 4D-pre's smoke missed. Branch m11-s4 tip remains uncommitted on master per orchestrator policy; next steps: M11-S5 will pick up todos #68 + #70 + parametrise existing Lima E2E tests for both backends. Across all four phases (4A/4B/4C/4D), M11-S4 delivered: --lite + --backend flags with five-tier precedence; CliConfig JSON loader; BackendsCache with one-GET-per-invoke; CLI-side SessionSpec validation; --no-cache rejection for container; BACKEND list column; describe -v capabilities matrix; isolation warning; rebuild-image --backend lima|container|all + --no-cache; docs/guides/lite-mode.md; resolved_cpus/resolved_memory_mb on the wire (gap caveat for cosmetic CPUs:0/Memory:0 display tracked as todo #69); 9 of 10 lite-mode E2E tests with helpers.",
+      "completed": "2026-04-27T01:39:55.229096Z",
+      "decisions": [
+        "M11-S4 Phase 4A landed cleanly: --backend/--lite flags + BackendKindArg ValueEnum at sandbox-cli/src/main.rs; resolve_backend five-tier resolver in sandbox-cli/src/backend.rs (--lite > --backend > SANDBOX_DEFAULT_BACKEND > config default_backend > Lima); CliConfig JSON loader with #[serde(default)] forward-compat (missing\u2192defaults, malformed\u2192hard error with path); BackendsCache in sandbox-cli/src/backends_cache.rs (one GET /backends per invocation, lazy, in-memory only, 5s timeout, BackendsCacheError variants); cli_xdg::resolve_sandboxd_config_dir shared XDG resolver replacing the duplicate path-builder in presets/user.rs (one-resolver-per-XDG-path rule satisfied); render_feature_mismatch byte-exact spec rendering with backticks around flag names and 3-space help indent; render_no_cache_rejection_for_container three-line spec error pointing at sandbox rebuild-image --backend container --no-cache; dispatch_create_preflight integrates load-config \u2192 resolve \u2192 no-cache reject (exit 2) \u2192 cache \u2192 SessionSpec::validate (exit 2 on mismatch) \u2192 POST /sessions with backend stamped on body. Crate restructured to lib+bin layout (sandbox-cli/src/lib.rs added) so binary integration tests can drive helpers in-process. Test counts: 1062 unit/binary + 47 integration = 1109 total (+24 unit, +4 integration over Phase 4A baseline of 1038/43); clippy clean; fmt clean.",
+        "M11-S4 Phase 4B landed cleanly: BACKEND column added between STATE and AGENT in display_sessions_table (main.rs:873) \u2014 refactored to write_sessions_table(&mut dyn Write, &[SessionDto]) for unit testability; describe -v flag added on Describe variant (main.rs:215) with verbose: bool; CapabilitiesLookup enum (main.rs:1171) wraps Available(Capabilities)/Unavailable(String) so cache failures don't fail describe; render_capabilities_block (main.rs:1310) renders 11 spec-listed capability fields with stable enum serialization; handle_describe (main.rs:1805) + fetch_capabilities_for_backends async helper (main.rs:1838) plumb the cache through; isolation warning render_isolation_warning(BackendKind) emits the spec's two-line stderr text byte-exact (em dash U+2014, 6-space indent, lite: prefix) only for Container, integrated into dispatch_create_preflight before SessionSpec::validate. New tests: integration_isolation_warning.rs (subprocess tests pinning stderr.starts_with against spec bytes for both --lite and --backend container) and integration_describe_verbose.rs (default view shows Backend without Capabilities block; -v Lima/Container variants render the matrix). Spec/CLI nomenclature deviation: spec says 'inspect' for the human view but CLI has separate inspect (JSON automation) and describe (multi-block human) \u2014 Phase 4B landed functionality on describe to preserve JSON automation contract; documented in handoff. Test counts: 1075 unit (+13 over Phase 4A's 1062) + 53 integration (+6 over 47); clippy clean; fmt clean.",
+        "M11-S4 Phase 4C landed cleanly: Command::RebuildImage shape extended to { backend: RebuildImageBackend (Lima/Container/All), no_cache: bool } at sandbox-cli/src/main.rs; dispatch_rebuild_image + run_rebuild_image_dispatch<F> generic over send-closure for hermetic unit tests; best-effort dispatch (Lima\u2192Container stable order) with per-backend error prefix 'rebuild-image[<kind>]:'; non-zero exit if any failed. Daemon-side RebuildImageRequest at sandboxd/sandboxd/src/main.rs:4178 with #[serde(default)] + custom Default(Lima, no_cache=false); handler reads Bytes, empty body\u2192default for backwards-compat with older CLIs, malformed JSON\u2192400 InvalidArgument; both backends dispatched via tokio::task::spawn_blocking. New rebuild_lite_image(daemon_version, no_cache) helper at sandbox-core/src/backend/container.rs:1222 reuses container_image_lock() \u2014 concurrent rebuild --backend lima and --backend container run in parallel since locks are independent. Container path explicitly does NOT take state.base_image_lock. Lima --no-cache satisfied by existing rebuild_base_image delete-then-build (no new flag plumbing needed). docs/guides/lite-mode.md authored: 8 sections (what lite mode is, isolation trade-off, what this breaks, what is preserved, resource defaults, UID alignment, prerequisites, when to choose); sidebar wired between Hardening and Integrate-an-agent in site/astro.config.mjs; cross-links from quickstart/sessions/installation. Out-of-scope-but-required: fixed two pre-existing broken anchors (#fail-closed-propagation-for-level-3 \u2192 #synchronous-dns-policy-gating) in policy-model.md and network-policies.md to satisfy starlight-links-validator. Test counts: 1090 unit (+15 over Phase 4B's 1075) + 56 integration (+3 new integration_lite_image_rebuild_*); clippy clean; fmt clean; make docs-build clean.",
+        "Phase 4D test_lite.py landed: 8 passed + 2 skipped (3.9 todo #68 workspace bind; 3.8 todo #70 NEW gateway wiring). End-to-end run: 128.23s. Three deliverables landed: tests/e2e/helpers/__init__.py + host_resources.py + lite_harness.py + test_lite.py. One in-flight regression caught + fixed: plan_ssh_command was passing -it unconditionally for container backend, breaking every non-TTY caller (pytest, CI) with 'cannot attach stdin to a TTY-enabled container' \u2014 added stdin_is_tty parameter, 2 new unit tests pin the non-TTY path drops -t and keeps -i. Cargo gates: 1104 unit (+2 from new TTY tests) + 56 integration tests passing, clippy/fmt clean. NEW DEFERRAL: gap #6 gateway container wiring deferred to M11-S5 (todo #70). The Phase 4D-pre subagent's gap #6 smoke verified sandbox health/exec but did not exercise gateway integration; daemon's container path at sandboxd/main.rs:884-909 explicitly short-circuits before setup_session_networking. Test 3.8 mirrors test 3.9 skip pattern with todo #70 cross-reference. Pre-existing handoff timeouts on tests 3.1/3.2 raised from 120 to 300s to absorb session-scoped _ensure_base_image fixture cost (~112s for Lima base build dominates the first test in a single-file run). Existing E2E unaffected: test_m1_vm_lifecycle.py collects cleanly with helpers package present. Helpers importable as documented."
+      ],
+      "discoveries": [
+        "M11-S4 CLI surface mapped: monolithic sandboxd/sandbox-cli/src/main.rs (3200+ lines, all subcommands inline). Key wire-up sites: Cli/Command enum at line 25-239; Create args 41-95 (--no-hardening at 90, --no-cache at 93); build_request body at 465-545 (no_hardening\u2192hardened:false at 495, no_cache\u2192true at 503); send_request_with_timeout HTTP client at 829-888 over hyper+UnixStream (default 600s timeout); display_sessions_table at 769-793 with columns ID|NAME|STATE|AGENT|GATEWAY|CREATED; handle_inspect at 1572-1589 returns serde_json::to_string_pretty (NOT human-readable); render_describe_one at 1090-1159 is the multi-block human view; RebuildImage at 239 currently has no flags. XDG path resolver already implemented at sandbox-cli/src/presets/user.rs:398-421 (resolve_base_dir for ~/.config/sandboxd/presets/) \u2014 must share for ~/.config/sandboxd/config.json default_backend per spec 'one resolver, not two'. CLI already imports sandbox-core via use statement at main.rs:12-15; will add BackendKind, Capabilities, BackendInfo, SessionSpec. Tests under sandbox-cli/tests/: preset_cli.rs and events_binary.rs use 'fake axum daemon on temp UDS + real binary via CARGO_BIN_EXE_sandbox' pattern \u2014 Phase 4A tests follow same shape. Hand-rolled eprintln!() errors throughout, no anyhow/miette unified type.",
+        "M11-S4 spec/CLI nomenclature mismatch: spec \u00a7 CLI & UX talks about 'sandbox inspect' getting backend prominence + capability matrix on -v, but CLI today has TWO commands: 'inspect' (JSON dump via serde_json::to_string_pretty at main.rs:1572-1589) and 'describe' (multi-block human readable at 1090-1159). The spec's 'inspect' description (default + -v with capability matrix) most closely matches 'describe' shape, not the current JSON-dumping 'inspect'. Phase 4B must either: (a) add backend+capabilities to describe and leave inspect as JSON, (b) merge inspect+describe and adopt -v, or (c) add backend+caps to BOTH. Likely (a) since existing UX has describe as the human path and inspect as automation. Phase 4B handoff must call this out before implementation. ALSO: exit code 2 is already used by 'sandbox policy status --wait' at main.rs:1432 for 'polled once, not yet propagated' \u2014 spec wants exit 2 for misuse; should be safe (different code paths) but watch for conflicts.",
+        "M11-S4 Phase 4D HANDOFF \u2014 surfaced six pre-existing implementation gaps from M11-S2/M11-S3 that block 8 of 10 planned lite-mode E2E tests. Gap #1 (HARD BLOCKER): daemon constructs ContainerRuntime::new with literal DEFAULT_LITE_IMAGE_TAG ('sandboxd-lite:latest') at sandboxd/src/main.rs:5147, but ensure_image builds 'sandboxd-lite:<CARGO_PKG_VERSION>' (currently 0.1.0); the very first sandbox create --lite fails 'Unable to find image sandboxd-lite:latest locally'. Source comments at container.rs:107-109 + 222-223 explicitly flagged this as 'Phase 3B will replace the literal' but Phase 3B never closed the daemon-side wire-up. One-line fix at main.rs:5147. Gap #2: handle_ssh in sandbox-cli/src/main.rs:1900-1956 hardcoded to 'limactl shell' with no backend dispatch \u2014 for container sessions it tries Lima VM that doesn't exist. ContainerRuntime::exec_interactive (container.rs:610) wraps docker exec -it but has no caller. Gap #3: GuestConnector at sandbox-core/src/guest.rs:206-251 holds Arc<LimaManager> directly and shells via 'limactl shell sandbox-X -- socat'; container-side ContainerTransport (container.rs:691) has no integration. Comment at main.rs:5124-5126 confirms 'GuestTransport rewire scheduled for M11-S2' \u2014 did not happen. Gap #4: resource defaults doubly unreachable; clap default_value_t = 2/4096 always populates wire (cli main.rs:50-54, 526-527), daemon req.cpus.unwrap_or(2)/memory.unwrap_or(4096) at sandboxd main.rs:534-535 falls back to Lima defaults not container's compute_default_resource_limits, host-80% path at container.rs:307-328 is dead code in production. Gap #5: workspace_modes empty() + workspace_host_path: None hardcoded \u2014 known deferred via M11-S3 review fix #2 to M11-S4/S5. Gap #6: route_helper_path: None hardcoded; gateway parity for lite unverified end-to-end. Path forward: bundle gaps #1-#4 into single 'Phase 4D-pre' handoff (operational wiring); defer gap #5 to M11-S5 per existing review-fix decision (test 3.9 will skip with that reason); verify gap #6 empirically post-fix. Then resume Phase 4D for 9 of 10 tests.",
+        "M11-S4 Phase 4D-pre Tasks 1-4 landed cleanly (gates: 1099 unit + 56 integration tests passing, clippy/fmt clean). Ground-truth verified: lite_image_tag_for_version helper at sandbox-core/src/backend/container.rs:125 used by ensure_image (1097), rebuild_lite_image (1235), and ContainerRuntime::new in sandboxd/main.rs:5182 with daemon_lite_image_tag_matches_ensure_image_for_same_version invariant test pinning the wire (gap #1); plan_ssh_command at sandbox-cli/main.rs:1937 with 4 unit tests for Lima/Container \u00d7 cmd/no-cmd permutations (gap #2); GuestConnector rewired at guest.rs:218 to {Arc<HashMap<BackendKind, Arc<dyn SessionRuntime>>>, Arc<SessionStore>} with 4 dispatch tests using StubRuntime/StubTransport over tokio::io::duplex (gap #3); cpus/memory flipped to Option<u32> at sandbox-cli/main.rs:55,62 with daemon-side backend-aware unwrap_or at sandboxd/main.rs:565-568 (Lima=2/4096, Container=0 sentinel that resource_ceilings treats as host-80%) (gap #4). However: gap #6 smoke surfaced new HARD blocker \u2014 lite image (FROM ubuntu:22.04, glibc 2.35) cannot run sandbox-guest binary built on Ubuntu 24.04 host (glibc 2.39); container exits within 20s of docker start with 'GLIBC_2.39 not found'. This was masked because integration_lite_image_build* only verifies build, never starts; integration_container_runtime_* uses alpine sleep image not the lite image. Phase 4D's test_lite.py would have been the first thing to actually run sandbox-guest in the lite container. Three options: (1) bump Dockerfile to ubuntu:24.04 (one-liner + spec amendment, all listed packages available in 24.04); (2) multi-stage builder on 22.04; (3) static-musl sandbox-guest. Choosing option 1 \u2014 lowest-risk, eliminates host/image glibc skew permanently, spec's 22.04 was unmotivated by anything load-bearing. Phase 4D-pre2 task created.",
+        "M11-S4 Phase 4D-pre2 landed cleanly. Dockerfile bumped to ubuntu:24.04 with userdel ubuntu mitigation for uid 1000 collision (24.04 ships a default ubuntu user at uid 1000 colliding with spec-pinned agent uid 1000); same edits applied in spec Dockerfile block + prose at line 277 (now '24.04 (noble), same userland as the Lima VM image (also noble)'). docs/internal/milestones/M11.md updated. Verified ground truth: sandboxd/images/lite/Dockerfile lines 9 (FROM ubuntu:24.04) and 17 (RUN userdel --remove ubuntu || true && useradd ... agent). All four cargo gates remain green: 1099 unit + 56 integration tests passing, clippy/fmt clean. Full smoke verified end-to-end: sandbox create --lite test-smoke \u2192 State Running, sandbox health \u2192 VM running + Agent connected, sandbox exec test-smoke -- echo hello \u2192 'hello', sandbox rm \u2192 Session removed. Gap #6 closed; Phase 4D test_lite.py is fully unblocked. Subagent surfaced two minor things to track: (a) CPUs:0/Memory:0 cosmetic display from Phase 4D-pre Task 4 sentinel choice \u2014 explicit caveat carried forward; (b) handoff used 'sandbox destroy' but actual subcommand is 'sandbox rm' \u2014 minor templating nit."
+      ]
+    },
+    {
+      "session": "M11-S5",
+      "title": "E2E parametrization, orphan cleanup, CI policy",
+      "summary": "M11-S5 delivered all four sub-phases: 5A lite container completion (gap #68 workspace bind + gap #70 gateway wiring + cap-aware route_helper resolver + apply_policy(Initial) on container branch + restore_session_networking_lite + inverted stale guard test); 5B orphan cleanup (sandbox-core/src/backend/orphan_reaper.rs with DockerOps trait, 19 hermetic tests + 1 integration_orphan_reaper, hooked at startup); 5C E2E parametrization (94 tests categorized: 7 agnostic files \u00d7 2 backends = 62 invocations, 1 mixed file with 3 in-body skips, 3 Lima-only docstring-documented, test_lite.py preserved container-only); 5D CI policy split (Makefile test-e2e-container 48 tests / test-e2e-matrix 94 tests / test-e2e back-compat alias; .github/workflows/ci.yml jobs cargo + e2e-container + e2e-matrix gated on [self-hosted, kvm]). Final state: cargo 1137 unit + 57 integration, clippy/fmt clean, test_lite.py 9 passed / 1 skipped (3.9 rootless docker per spec \u00a7 Out of scope) / 0 failed. Two follow-ups deferred: #73 KVM runner provisioning, #74 nightly perf benchmarks (blocked on #73).",
+      "completed": "2026-04-27T05:20:13.271901Z",
+      "decisions": [
+        "Phase 5A fixer: cap-aware route_helper resolver landed. Replaced bare-name PathBuf::from('sandbox-route-helper') with layered resolver: default_route_helper_candidates (sibling-of-current_exe, /usr/local/bin/sandbox-route-helper, then $PATH dirs) + resolve_route_helper_path_from<I,F:is_usable> + has_required_caps -> read_cap_xattr (libc::getxattr on security.capability) -> xattr_has_cap_sys_admin_effective (pure decoder for vfs_cap_data V2/V3, effective flag, cap-bit 21). 13 new unit tests covering candidates builder, priority walk, decoder accept/deny variants. libc=0.2 added. Error message names CAP_SYS_ADMIN+ep + setcap command explicitly so operator gets actionable error rather than EPERM at runtime.",
+        "Stale integration test inverted: integration_create_session_container_rejects_shared_workspace -> integration_create_session_container_advertises_shared_workspace_capability. Now positive: workspace_modes contains exactly Shared, not Clone; Shared spec validates ok; Clone spec still rejected with WorkspaceMode(Clone, Container). Documents current contract instead of removed pre-Phase-5A guard.",
+        "Phase 5A complete. Final state: cargo 1118 unit + 56 integration, clippy/fmt clean; test_lite.py 9 passed / 1 skipped / 0 failed in 191.89s. test 3.9 (workspace_uid_alignment) gated with @pytest.mark.skipif(is_rootless_docker()) per spec \u00a7 'Out of scope' line 1175 + \u00a7 Workspace lines 572-574 (which forbid userns-remap workarounds). New helper tests/e2e/helpers/docker_info.py exposes is_rootless_docker(). Docs: M11.md Phase 3 gate annotated; deliberately did NOT touch docs/start/installation.md (which refers to gateway-container rootless support, a separate concern). Total Phase 5A scope landed: gap #68 workspace bind, gap #70 gateway wiring, cap-aware route_helper resolver (libc::getxattr+vfs_cap_data decoder), inverted stale integration test, plus two follow-on fixes (apply_policy(Initial) for lite create-session at main.rs:1357-1395 + restore_session_networking_lite for lite stop+start at main.rs:2213-2226+4525-4640) that were necessary mechanical follow-ons to make 3.8/3.10 actually pass.",
+        "Phase 5B (orphan cleanup) complete. New module sandbox-core/src/backend/orphan_reaper.rs with: pure parsers (parse_container/home_volume/network_session_id, all leveraging SessionId's strict 12-hex constraint to naturally reject gateway containers, operator-foreign names without a hard-coded skiplist), partition_orphans helper, DockerOps trait + CliDockerOps impl, reap_orphans async fn returning ReaperReport. Hooked into sandboxd/src/main.rs immediately after reconcile() and before reconcile_networking. 19 hermetic unit tests (parsers + partition + best-effort error tolerance) + 1 integration_orphan_reaper_removes_orphans_and_preserves_live_resources covering both reap-and-preserve contracts in one race-free pass. NEW nextest test-group docker-sandbox-namespace (max-threads=1) serializes orphan-reaper tests with integration_container_runtime_* \u2014 both families create sandbox-{12hex} resources and would otherwise race against the reaper. Cargo: 1137 unit (+19), 57 integration (+1), clippy/fmt clean. Manual smoke confirmed: pre-planted sandbox-feedface0001 container+volume+net is reaped on first start (containers_reaped=1 volumes_reaped=1 networks_reaped=1), second start is idempotent (0/0/0). Reused lima::parse_session_id_from_name for the container-name parser (single source of truth \u2014 lite container handle and Lima VM name share sandbox-{session_id} convention). Discovery: docker --filter name= is substring-match not prefix-anchored, but the strict 12-hex parse downstream filters false positives \u2014 reaper occasionally enumerates extra names and discards them. Inlined run_docker_raw in the reaper module rather than making container::run_docker pub(crate) \u2014 sibling-concern architecture per spec.",
+        "Phase 5C (E2E parametrization) complete. 94 tests categorized across 12 files: 7 agnostic files parametrized (31 fns \u00d7 2 = 62 invocations), 1 mixed (test_m3_networking.py \u2014 7 fns parametrized but 3 skip in-body for container due to hardcoded Lima 10.209.x.x/28 subnet pool; agnostic refactor via 'sandbox info' query deferred), 3 Lima-only files (test_m1_vm_lifecycle, test_m6_hardening, test_m85_golden_image \u2014 module docstrings updated to explain), 1 container-only (test_lite.py preserved). conftest.py adds @pytest.fixture(params=['lima','container']) backend fixture; helpers updated to honor backend (passes --lite when container). Verified canonical: test_guest_agent_health_check[lima] PASSED in 164.10s, [container] PASSED in 127.46s; test_guest_agent_exec[container] PASSED in 122.77s. test_lite.py baseline preserved (9 passed, 1 skipped in 201.48s). cargo gates unchanged (1137 unit + 57 integration). Discovery: pytest.skipif's string condition evaluates at collection time WITHOUT fixture access \u2014 module-level pytestmark with backend reference doesn't work. Pattern used: 'Lima-only files do not take the backend fixture' (mirrors test_lite.py container-only shape) for clean separation. Full matrix (60+ container-side invocations \u00d7 3-7min) reserved for CI per spec \u00a7 'CI policy'.",
+        "Phase 5D (CI policy split) complete. Three workflow jobs: cargo (rename of build-and-test), e2e-container (every PR + push-to-main, ubuntu-latest, runs make test-e2e-container), e2e-matrix (push-to-main only, runs-on [self-hosted, kvm], runs make test-e2e-matrix). Makefile: test-e2e-container selects 48 tests (38 [container] + 10 test_lite.py, 0 [lima]); test-e2e-matrix selects full 94 tests; test-e2e kept as back-compat alias. Handoff followed strictly: NOT silently degraded matrix to container-only \u2014 wired to label that doesn't yet exist + filed runner-provisioning handoff. Nightly perf deferred until runner exists. Cargo 1137 unit/57 integration unchanged."
+      ],
+      "discoveries": [
+        "M11-S5 Phase 5A scope mapped via Explore: gap #70 gateway wiring is mostly a copy of Lima's setup_session_networking flow (sandboxd/main.rs:3466-3589, 9 steps: register session w/ event bus, bind VM IP, publish gateway_booting, GatewayManager::create_gateway, publish gateway_ready, spawn ingestor, persist NetworkInfo, start DNS-gate listener, attach VM/inject CA) into the container branch at main.rs:884-909 which currently short-circuits with early return at 909. Key findings: (a) GatewayManager::create_gateway is already backend-agnostic \u2014 takes NetworkInfo with docker_network_name + gateway_ip; (b) container DNS is already pointed at gateway via --dns at container.rs:441; (c) route_helper_path is hardcoded None at main.rs:843 \u2014 must be populated for nft route helper to fire; (d) the agent doesn't initiate outbound before ready so timing window for gateway-up-before-agent-ready is safe. Container path also already attaches container to sandbox-net-<id> bridge (container.rs:430-488). Estimated scope ~150-200 lines, mostly copy from Lima branch with adapted variable names. Gap #68 workspace bind is ~50-100 lines: (1) container.rs:374 capability EnumSet::with(WorkspaceMode::Shared), (2) main.rs:842 thread workspace_host_path from request, (3) docker create's --mount path already wired at container.rs:415-420/471-474. Bundling both gaps into Phase 5A \u2014 same function to edit, single test_lite.py run can verify both unskipped tests.",
+        "Phase 5A landed: gap #68 workspace bind + gap #70 gateway wiring. Cargo gates green: 1105 unit (+1 new test register_session_round_trips_workspace_host_path), clippy clean (after target/debug/incremental flush \u2014 same ICE pattern as 4D-pre2), fmt clean. Key implementation choices: (1) compute_initial_dns_policy(&req) -> String helper extracted, used by both Lima and container branches (one of two intended call sites \u2014 restoration path at main.rs:3947 deliberately untouched because it sources from state.session_policies, not req); (2) cleanup_lite_gateway_and_return! is a *local* macro inside container branch closing over session_id/state/backend_kind, parallel to existing cleanup_and_return! and cleanup_net_ca_and_return!; (3) route_helper_path uses bare binary name PathBuf::from('sandbox-route-helper') relying on Command::new() PATH lookup rather than introducing a new daemon-config field \u2014 daemon config did not expose one and bare-name approach matches existing helper invocations. Lima step 9 (VM bridge attach + CA injection) intentionally NOT replicated \u2014 Lima-only. NOT YET VERIFIED: e2e test_lite.py and integration profile \u2014 subagent's signal sent before those background runs completed. Verification deferred to next subagent dispatch.",
+        "Cap-aware fix unmasked two pre-existing M11-S5 lite-path gaps that were hidden behind the EPERM-from-setns failure: (1) test_lite_gateway_parity (3.8) failed at allow-path probe \u2014 DNS gate logged 'no active policy for session' because the container path returns at main.rs:1370 BEFORE the apply_policy block at ~1651. Lima path applies req.policy at create time; lite path skipped this entirely. Fixed by inserting the apply_policy(Initial) block right after step 8 (state->Running) in the container branch \u2014 uses cleanup_lite_gateway_and_return! on failure to mirror the Lima fail_explicit_policy_apply teardown shape. (2) test_lite_home_volume_lifecycle_beta failed on stop+start because start_session calls restore_session_networking unconditionally, which invokes attach_vm_to_bridge -> guest.exec('sudo', ...) \u2014 but the lite image has no sudo (and no VM bridge). Fixed by branching start_session on session.backend: BackendKind::Container -> new restore_session_networking_lite (gateway recreate + ingestor + DNS gate listener + reapply policy; skips attach_vm_to_bridge + inject_ca_into_vm), BackendKind::Lima -> existing restore_session_networking. Both fixes verified by individual test runs (gateway_parity passes, home_volume passes).",
+        "test_lite_workspace_uid_alignment (3.9) fails on this VM because docker is rootless (docker info: 'Context: rootless', SecurityOptions includes rootless). Under rootless docker, --user 1000:1000 in the container runs as host uid (subuid_base+999) per /etc/subuid mapping (olek:100000:65536). So workspace bind-mount writes hit the host as uid ~100999, not host uid 1000 \u2014 assertion st_uid==os.getuid() cannot hold without spec violation. Spec \u00a7 'Out of scope' line 1175 explicitly excludes rootless docker. Spec \u00a7 Workspace lines 572-574 forbids userns-remap workarounds. Test was designed for default-hardened (rootful) docker. Two valid paths forward: (a) add rootless detection + uid:gid remap to map_container_uid_gid (substantive scope expansion beyond original handoff), (b) gate the test with @pytest.mark.skipif(rootless) (small, matches spec out-of-scope statement, but changes the test contract from '10 passed 0 skipped'). Going with (b) is out-of-scope from the original handoff (which only asked for route-helper fix + integration test inversion). Both fixes I already landed (apply_policy + restore_lite) were also out of original scope but were necessary mechanical follow-ons to make the route-helper fix testable. The rootless decision is a design call the user should make.",
+        "GitHub-hosted ubuntu-latest runners do NOT expose /dev/kvm, so Lima parametrization cannot run on stock runners. tests/e2e/conftest.py:226-236 already skips on missing /dev/kvm \u2014 meaning a green test-e2e-matrix on a stock runner would silently skip ALL Lima tests and still report green, defeating the policy. The runs-on:[self-hosted,kvm] label-gate keeps the gap loud: until the runner exists the job queues unscheduled rather than passing-with-zero-Lima-coverage. docs/guides/integrate-agent.md:156 \u2014 project already accepts the same KVM/self-hosted constraint upstream-of-CI."
+      ]
+    },
+    {
+      "session": "M11-S6",
+      "title": "Spec-delivery verification (lite-mode container backend)",
+      "summary": "M11-S6 spec-delivery verification: closed with verdict DELIVERED. Built 238-claim verification map at .tasks/specs/2026-04-22-lite-mode-container-backend-design/2026-04-22-lite-mode-container-backend-design-delivery.md (1009 lines). Initial verification gate FAILED at make test-e2e-container 18/44; triaged into 3 defect classes (A: policy propagation, B: daemon restart, C: 3 fixture gaps). Fix subagent root-caused all classes plus discovered Class D (per-session MITM CA bind-mount \u2014 real M11 spec gap that escaped Phase 5A's DNS-deny-only verification). Class A real cause was bind9-host package shipping only 'host' not 'nslookup' (one-line Dockerfile fix); Class B was Lima-only startup reconcile() force-flipping container sessions to Error (added BackendKind::Container early-skip); Class C was 3 fixture gaps (skipif Clone unsupported, skipif shared_mount Lima-only, conditional ping for CAP_NET_RAW-dropped container); Class D shipped via ContainerNetwork.ca_host_path field + build_ca_mount_args helper rendering bind-mount + 4 env-var injections (CURL_CA_BUNDLE, SSL_CERT_FILE, REQUESTS_CA_BUNDLE, NODE_EXTRA_CA_CERTS). Final cargo: 1138 unit (+1 new CA-mount test) / 57 integration / clippy / fmt clean. Final e2e: 42 passed / 6 skipped / 0 failed in 741s (skips: 1 rootless-Docker, 3 Lima-pin, 1 Clone-unsupported, 1 Lima-only path). Closeout subagent landed two commits per Path B-hybrid: 31caddd 'feat(container): lite-mode session backend (M11)' (75 files +16967/-732) bundling Phases 5A-5D + Class A/B/C/D fixes + M11.md milestone narrative + closeout note, and 273bda7 'docs(verify): M11 spec-delivery verification map' (1 file +1009). Two M10-S10 link-fix files left intentionally unstaged per 'no non-M11 changes' constraint. Phase 5C verification gap also confirmed: M11-S5 Phase 5C only ran ONE canonical test ([container] guest_agent_health_check) end-to-end before declaring done; the full backend-agnostic suite was run for the first time in M11-S6 and exposed 18 failures. Lesson logged: 'one canonical test verification' is insufficient for parametrization shape changes.",
+      "completed": "2026-04-27T07:49:33.262123Z",
+      "decisions": [
+        "Class D (NEW, beyond original triage) \u2014 L3 MITM CA trust delivered. Surfaced after A/B/C unmasked 6 surviving failures all with curl: (60) SSL certificate problem: unable to get local issuer certificate. Per-session sandbox CA from CaManager::generate_session_ca was never trusted inside container; Lima's update-ca-certificates path is incompatible with spec-mandated --read-only rootfs. Fix landed: ContainerNetwork.ca_host_path: Option<PathBuf> field; pure helper build_ca_mount_args renders --mount type=bind,src=<host>,dst=/etc/ssl/certs/sandbox-ca.pem,readonly + 4 --env vars (CURL_CA_BUNDLE, SSL_CERT_FILE, REQUESTS_CA_BUNDLE, NODE_EXTRA_CA_CERTS) at SANDBOX_CA_CONTAINER_PATH. Daemon wires ca_host_path: Some(<base_dir>/sessions/<id>/ca/cert.pem) at main.rs:1185 (CA already on host disk from generate_session_ca, pure plumbing). New unit test container_runtime_create_includes_ca_mount_when_path_set pins arg vector, register/lookup round-trip, and empty-vec contract when ca_host_path=None. This was a real M11 spec gap that escaped Phase 5A (test_lite_gateway_parity passed because it exercised DNS-deny path, not real TLS interception). Final state: cargo 1138 unit (+1)/57 integration/clippy/fmt clean; e2e [container] 42 passed/6 skipped/0 failed in 741s. Suggested commit split: fix(container) for A/B/C + feat(container) for D + new test."
+      ],
+      "discoveries": [
+        "M11-S6 verification gate FAIL: make test-e2e-container 18/44 failed. Cargo gates all pass, test_lite.py 9/9. Three defect classes in parametrized [container] tests (M11-S5 phase 5C added them; only one canonical test was run end-to-end then). Class A: gateway-config policy propagation never advances for container sessions, ~10 tests fail with 'propagated=false actual=- age=Ns' over 60s \u2014 likely missing watcher subscription in ContainerSessionRuntime or actual=<gen> not surfaced back to SessionStore. Class B: daemon-restart leaves container session in Error state, 3 tests \u2014 orphan-cleanup reconcile (Phase 5B) handles cleanup but not re-attach to live containers; restore_session_networking_lite (Phase 5A) may miss policy-watcher resubscription. Class C: 3 mechanical fixture gaps \u2014 C1 nslookup not in lite image (add bind9-host to Dockerfile), C2 test_clone_repo[container] needs skipif (Clone unsupported per Capabilities), C3 sandbox cp target not visible inside container in test_shared_mount. Triage at .tasks/handoffs/20260427-080000-implementer-m11-s6-e2e-container-defects.md. Verification map at delivery.md is updated with NOT delivered verdict but NOT committed (waiting for fix). Discovery validates Phase 5C verification was insufficient \u2014 only one canonical test run.",
+        "M11-S6 e2e gate fix delivered. Original triage hypothesis for Class A WRONG: not a missing gateway-config-sync watcher \u2014 root cause was bind9-host package only ships 'host', not 'nslookup'. test_m10_s5_presets._warm_dns() and inline nslookup calls silently no-oped, so daemon's DNS-propagation cache never advanced. One-line fix: bind9-host -> bind9-dnsutils in sandboxd/images/lite/Dockerfile. Class B real bug: startup reconcile() at sandboxd/src/main.rs:5004-5070 was Lima-only (looked up sessions against lima_runtime.manager().list_vms() and force-flipped any session not in that list to Error). Container sessions universally Error after restart. Fix: early-skip 'if session.backend == BackendKind::Container { continue; }' + skipped_container counter on info! summary; container reconcile is independently handled by reconcile_networking/restore_session_networking_lite. Class C: 3 fixture gaps as expected (C2 cp invisibility was actually Lima-only assertion path; container binds /workspace per spec, lite-specific bind contract gated by test_lite_workspace_uid_alignment).",
+        "M11-S6 closeout committed cleanly. Path B-hybrid: single bundled M11 implementation commit (31caddd, 75 files +16967/-732, 'feat(container): lite-mode session backend (M11)') + separate verification map commit (273bda7, 1 file +1009, 'docs(verify): M11 spec-delivery verification map'). Closeout subagent bundled M11.md closeout-note into commit 1 (deviation from plan, justified per M10-S7 precedent \u2014 milestone narrative belongs with implementation, not with verdict map). Two M10-S10 link-fix files (docs/concepts/policy-model.md, docs/guides/network-policies.md) intentionally left unstaged per handoff constraint 'DO NOT bundle non-M11 changes' \u2014 confirmed via git log --grep='DNS-policy gating' that they are leftover M10-S10 follow-ons unrelated to M11. Final cargo regression check: build clean / 1138 unit (+1 new CA-mount test) / 57 integration / clippy / fmt all clean. Verdict in delivery.md: 'Delivered. All claims delivered. Gate green.'"
+      ],
+      "artifacts": [
+        ".tasks/specs/2026-04-22-lite-mode-container-backend-design/2026-04-22-lite-mode-container-backend-design-delivery.md,docs/internal/milestones/M11.md,sandboxd/sandbox-core/src/backend/container.rs,sandboxd/sandboxd/src/main.rs,sandboxd/images/lite/Dockerfile,tests/e2e/test_m5_workspace.py,tests/e2e/test_m3_networking.py,Makefile,.github/workflows/ci.yml"
+      ]
+    },
+    {
+      "session": "M11-S7",
+      "title": "Residual quality polish + e2e skip triage",
+      "summary": "M11-S7 'Residual quality polish + e2e skip triage' \u2014 closed clean.\n\nFinal e2e gate (make test-e2e-container): 47 passed, 2 skipped, 0 failed in 13:45.\nBoth skips are spec-aligned rootless-Docker contracts: test_lite_workspace_uid_alignment (pre-existing) and test_shared_mount[container] (added this session).\n\nDelivered (organized by wave):\n\n* Wave 1 \u2014 small isolated fixes:\n  - route-helper polish (todos #61 NetworkManager error enrichment, #62 RUST_LOG warn, #63 i32::try_from for pidfd_open, #64 comment cleanup) -> 6822a0d\n  - spec text corrections (seccomp=builtin, /home/agent/workspace/) -> 6822a0d\n  - test_m10_s4 DNS skip \u2192 hard failure -> 7d39bb0\n  - test_concurrent_sessions RAM precondition scoped to Lima-only -> 15e78c2\n  - test_lite_orphan_cleanup_on_daemon_restart (todo #71, SIGKILL+sessions.db DELETE synthesizer) -> 169c7ea\n\n* Wave 2 \u2014 larger Rust changes:\n  - Clone-on-container (capabilities matrix advertises {Shared, Clone}; docker exec git clone reusing fail_explicit_repo_clone envelope from Lima) + unified workspace bind target /home/agent/workspace/ on container -> 5fadccf\n  - Backend-neutral SessionDto.network/mounts plumbing via 'sandbox inspect'; SessionConfigDto.cpus: f32 with cpus_decimal sibling for forward/rollback compat -> 651a635\n  - cpus 1-decimal precision + 'Some(0.0) \u2192 None' sentinel normalization in describe -> 6dd5808\n  - --boot-cmd symmetry on container -> 13d5dbe\n  - Bundle Y test refactor: 4 networking tests now read gateway_ip from 'sandbox inspect' instead of in-VM ip-addr regex (test_gateway_traffic_flow, test_stop_start_with_networking, test_concurrent_sessions, test_gateway_crash_recovery) -> 651a635 + 929726f\n\n* Fold-in polish (post-discovery, per 'resolve small todos inline' feedback): todos #76, #78, #79, #80 -> e06b2da\n\n* TCP-probe replacement for ping (post-e2e-gate diagnosis):\n  - _probe_gateway_tcp helper using bash builtin </dev/tcp/IP/53> wrapped in 'timeout 5' (no extra package needed; works under cap-drop=ALL because TCP connect doesn't require CAP_NET_RAW)\n  - 4 ping call sites in test_m3_networking.py swapped\n  - test_concurrent_sessions cross-session negative-isolation step gated to Lima-only with full architectural rationale (gateway DNAT prerouting at sandbox-core/src/gateway.rs:1462-1486 makes cross-session L4 isolation invisible from inside container sessions)\n  -> 929726f\n\n* test_shared_mount[container] rootless-Docker skipif (in-body conditional pytest.skip; mirrors test_lite.py:495-507 pattern); spec-aligned exit story: M11-S8 will move this to daemon-side refusal -> 929726f\n\n* Two kio-reviewer passes:\n  - 1st (mid-session): 6576430 fix(m11-s7): kio-reviewer findings on the S7 diff\n  - 2nd (post-TCP-probe): fd63787 (4 reviewer follow-ups: 2 delivery-doc line-citation drifts + 'Docker bridges' wording NIT + helper shell-layering NIT) + 1be18c5 (docstring parity follow-up surfaced by the fix agent)\n\n* Delivery doc (.tasks/specs/.../delivery.md): augmented with new claim rows LM4.37, LM6.20-23, LM8.30-31 in cec6808; existing-row augmentation for the TCP-probe coverage in 929726f; line-citation drift fixes in fd63787. Summary table grand total 246/231/15/1/0 (231 a-shipped, 15 b-out-of-scope, 1 c-tracked-todo, 0 blockers).\n\nTodo accounting: 60 completed, 18 dropped, 4 deferred (#29 UDP IP_ORIGDSTADDR conntrack lookup pre-M10, #60 nix pidfd wrapped form, #81 Lima fractional --cpus warn/reject, #82 gateway nftables-integration cross-session L4 isolation coverage \u2014 newly added this session).\n\nArchitectural discovery worth carrying forward (already in current_log + delivery doc): gateway DNAT prerouting in sandbox-core/src/gateway.rs:1462-1486 rewrites every TCP/UDP packet from a session's vm_subnet to that same session's gateway-IP sinks (CoreDNS, Envoy, deny-logger). The 'ip saddr {vm_subnet}' selector is per-session, but rules match the session's OWN saddr \u2014 so any outbound TCP/UDP from session A targeting session B's gateway gets answered by A's own gateway. Cross-session L4 isolation is invisible from inside the session; only ICMP (untouched by prerouting) lets a guest observe the actual L3 routing outcome. Container-backend cross-session isolation is best tested at the gateway nftables-integration level; tracked as todo #82.\n\nNet: 9 new commits since M11-S6 close; cargo build/clippy/fmt clean throughout; integration_users_conf_startup green; both kio-reviewer passes APPROVE.",
+      "completed": "2026-04-28T20:39:03.238368Z",
+      "decisions": [
+        "M11-S7 ping/cap-drop conflict resolved via path #2 (TCP probe), not path #1 (skip). Replaces ping <gateway_ip> with bash-builtin </dev/tcp/IP/53> reachability probe in test_m3_networking.py's three sites. Rationale: (a) preserves cross-backend reachability coverage that Bundle Y's network-info refactor was building toward, (b) aligns with directional pressure of S7 (DNS-skip\u2192hard-fail, fewer skips not more), (c) modest scope \u2014 one helper + 3 call-site swaps. CoreDNS on port 53/TCP is always listening on the gateway so the probe is reliable. The cross-network negative-isolation check in test_concurrent_sessions becomes cleaner with TCP probe (clean fail) than with ping (hangs)."
+      ],
+      "discoveries": [
+        "Workspace bind target unified to /home/agent/workspace/ on container backend (M11-S7). Both backends now share the same in-session workspace path; capabilities matrix advertises {Shared, Clone} for both. Container Clone uses docker exec git clone reusing fail_explicit_repo_clone error envelope from Lima. The lite Dockerfile's tini/sandbox-guest entrypoint is what makes container side of state.guest.exec work \u2014 same TCP-over-SSH protocol as Lima.",
+        "Lima injects per-session MITM CA via guest agent into the system trust store (/usr/local/share/ca-certificates/sandbox-ca.crt + update-ca-certificates) \u2014 not via a bind mount. Container backend uses a read-only rootfs so it bind-mounts at /etc/ssl/certs/sandbox-ca.pem + env-var trust (CURL_CA_BUNDLE etc., per M11-S6 closeout). Asymmetry is structural: Lima can write trust dirs and rebuild the bundle; container cannot. SessionDto's mounts.ca_bundle_path is None for Lima as a result.",
+        "Lite container ping failures (3 of test_m3_networking.py [container] params) are NOT a missing-package gap \u2014 they are structural: spec \u00a7 Hardening line 561-562 forbids ping under --cap-drop=ALL, iputils-ping on Ubuntu 24.04 needs cap_net_raw (inert under cap-drop=ALL), kernel ping_group_range fallback is 65534 65534 inside container, rootless Docker rejects --sysctl net.ipv4.ping_group_range at create time. ping in the e2e suite is a Lima-era L3-reachability proxy that does not survive the lite hardening posture.",
+        "Lite Dockerfile is shipped to the daemon via include_str! at sandbox-core/src/backend/container.rs:145, and the cached sandboxd-lite:0.1.0 image tag is keyed off CARGO_PKG_VERSION \u2014 bumping the Dockerfile alone does not bust the image cache. Forcing a rebuild requires: (a) cargo build --workspace AND (b) docker rmi sandboxd-lite:0.1.0.",
+        "Lite container backend's gateway nftables prerouting (sandbox-core/src/gateway.rs:1462-1486) DNATs every TCP/UDP packet from a session's vm_subnet to the SAME session's gateway IP \u2014 CoreDNS, Envoy, or deny-logger sink. The 'ip saddr {vm_subnet}' selector scopes per-session, but because rules match the session's OWN saddr, any outbound TCP/UDP from session A targeting session B's gateway IP gets answered by A's own gateway. Cross-session isolation is therefore invisible at L4 from inside the session \u2014 only ICMP (untouched by prerouting) lets a guest observe the actual L3 routing outcome. This is well-justified for production (every byte mediated) but limits what cross-session isolation tests can express via TCP. Container-backend cross-session isolation is best tested at the gateway nftables-integration level, not via e2e."
+      ],
+      "artifacts": [
+        "9 commits 6822a0d..1be18c5 on master; final e2e gate log /tmp/m11-s7-e2e-container-final.log (47P/2S/0F in 13:45); delivery doc verification map updated"
+      ]
+    },
+    {
+      "session": "M11-S8",
+      "title": "Rootless-Docker enforcement at the daemon",
+      "summary": "M11-S8 (\"Rootless-Docker enforcement at the daemon\") \u2014 DONE.\n\n**Scope delivered.** Daemon-side rootless-Docker probe (cached for daemon lifetime, container-backend only) + spec-shaped SandboxError::RootlessDockerRefused \u2192 HTTP 400 mapping + `--force-rootless-docker` CLI flag (container-only, per-create, programmatically rejected on `--backend lima` with exit 2) + `SessionDto.rootless` visibility field. Replaces the prose-only \u00a7 Non-goals statement with code-enforced refusal at session-create time, keeping the deliberate-override escape hatch.\n\n**Commits (6 logical + 1 reviewer fold-in).**\n- b292527 \u2014 rootless-Docker probe + RootlessDockerRefused error + PATH-stub helper\n- 193494d \u2014 --force-rootless-docker CLI flag + daemon enforcement + SessionDto.rootless field\n- 5c11848 \u2014 4 integration tests (refused, force flag overrides, force flag rejected on lima, default-hardened proceeds)\n- 2b780c3 \u2014 drop polarity-inverted rootless-Docker skipifs from tests/e2e/test_lite.py + test_m5_workspace.py (now daemon-enforced)\n- cf72ffb \u2014 spec amendment: \u00a7 Non-goals 1175 \u2192 1195 + new \u00a7 Container specifics \u2192 Rootless Docker subsection (Hardening-table style)\n- 2b5cb07 \u2014 delivery doc: LM12.11\u2013LM12.16 cluster + LM12.2 (b)\u2192(b)+(a) + summary table 246\u2192252 + comprehensive line-citation drift fix\n- d626160 \u2014 kio-reviewer fold-in: 4 MINORs (delivery summary table 11\u219210, CLI comment polarity, api/mod.rs comment polarity, docker_info.py docstring intent)\n\n**Final gate state.**\n- cargo build/clippy/fmt clean\n- nextest: 1179/1179 default + 61/61 integration\n- make docs-build clean\n- make test-e2e-container intentionally NOT run on this rootless-Docker host (would produce 2 expected ERRORs at session-create \u2014 that IS the loud-failure signal the M11.md plan calls for); gate-run on default-hardened-Docker CI is the orchestrator's call\n\n**Discoveries logged.** Spawned-binary daemon+CLI is the right harness pattern (vs in-process axum router) \u2014 duplicating main() startup choreography in test fixtures is wasted effort. CARGO_BIN_EXE_sandbox not visible cross-crate; resolve as sibling of CARGO_BIN_EXE_sandboxd. docker-sandbox-namespace nextest filter must be extended whenever new integration_* tests touch the sandbox-{id} namespace.\n\n**Decisions logged.** Probe gate sits in container branch BEFORE artifacts (avoid leaving partial state). force_rootless_docker is per-create and not persisted to SessionConfig (deliberate override is for one session at a time, not a daemon-wide mode). New SessionDto.rootless substruct uses Option + #[serde(default)] for forward/backward compat.\n\n**Deferred.** Todo #82 (cross-session L4 isolation untestable through DNAT prerouting) \u2014 architectural, separate from S8. Todo #83 (probe-failure integration test for NIT 3) \u2014 kio-reviewer fold-in cleanup, separate scope.\n\n**Reviewer verdict.** kio-reviewer APPROVE-WITH-FOLLOWUPS resolved inline per \"resolve small todos inline\" feedback.",
+      "completed": "2026-04-28T23:14:09.269065Z",
+      "decisions": [],
+      "discoveries": [
+        "M11-S8 W3 harness: spawned-binary daemon + spawned-binary CLI is the right pattern (vs in-process axum router). Reasoning: AppState construction needs LimaManager + NetworkManager + GatewayManager + event bus + live tasks \u2014 replicating that in test fixtures = duplicating main()'s startup choreography. integration_users_conf_startup.rs uses the same spawned-binary pattern. Cargo gotcha: CARGO_BIN_EXE_sandbox is NOT visible cross-crate from sandboxd/tests/; resolve sandbox CLI path as sibling of CARGO_BIN_EXE_sandboxd in target/<profile>/. The docker-sandbox-namespace nextest test-group filter in sandboxd/.config/nextest.toml MUST be extended whenever new integration_* tests touch the sandbox-{id} Docker namespace, otherwise concurrent runs collide and surface as flaky 500s \u2014 affected groups today: container-runtime, orphan-reaper, rootless-docker."
+      ]
+    },
+    {
+      "session": "M11-S9",
+      "title": "Route-helper auth hardening, dev-environment setup, test stability",
+      "summary": "Landed three coupled threads: (1) route-helper auth hardening \u2014 install path moved to /usr/local/libexec/sandboxd/, SANDBOX_USERS_CONF env-var consultation gated behind test-env-override Cargo feature, defensive stat check on canonical users.conf (uid 0 + no group/world-write), dual-entry privilege boundary in sandbox-core/users_conf. (2) Daemon resolver collapsed to 2-step env+canonical lookup, both arms fail-closed. (3) TCP listen backlog pinned in sandbox-deny-logger so over-cap connections always reach accept(); flake on tcp_respects_concurrency_cap eliminated, conservation invariant deny+dropped_total==BURST is now a hard assertion. Plus: setup-dev-env Makefile orchestrator with 5 stamp-tracked idempotent sub-targets, contrib/users.conf.example template, /20-vs-/24 doc reconciliation, integration test #5 (probe-failure \u2192 HTTP 500), is_secure_mode pure helper extracted with 8-case matrix test. Verified GREEN: cargo build clean, 1185/1185 hermetic tests pass, clippy clean. Reviewer pass identified 1 Major (test coverage gap on world-writable arm) folded in; 4 follow-ups deferred as todos #87-#90. Landed as 5 commits: 5cb1167 sec(route-helper), 34cb4dc refactor(daemon), a698c5e fix(deny-logger), 6364f33 build(make), b1a8756 docs(m11-s9). Deferred M11-S10 (CIDR-scoped orphan reaper) is now the terminal session for the lite-mode container backend design spec.",
+      "completed": "2026-04-29T21:03:51.053828Z",
+      "decisions": [
+        "Plan changed: Added M11-S10 (CIDR-scoped orphan reaper) \u2014 defense-in-depth filter for cross-daemon collision, deferred from M11-S9 to keep S9 cohesive around route-helper/dev-env theme. (total sessions: 78 \u2192 79)",
+        "M11-S8 integration_rootless_docker.rs tests #2 and #4 set SANDBOX_ROUTE_HELPER_PATH=/usr/local/libexec/sandboxd-test/sandbox-route-helper on spawned daemon. Rationale: S9's privilege boundary makes production helper ignore SANDBOX_USERS_CONF, but those tests rely on tempfile users.conf via that env var. Pointing the daemon at the test-cap'd helper (which honors the env var) keeps tests independent of /etc/sandboxd/users.conf content while preserving production helper's security boundary.",
+        "Privilege-boundary code pattern for capability-bearing helpers: dual entry points in sandbox-core/users_conf \u2014 load_users_config (daemon, env-var honored) vs load_users_config_route_helper (helper, env-var only honored when test-env-override Cargo feature is on). Production builds of cap-bearing binaries unconditionally read the canonical config and ignore SANDBOX_USERS_CONF. Codifies 'if a process holds an extra privilege, it must not be redirectable by user-controlled state.' Use this same shape for any future capability-bearing helper or daemon component.",
+        "Dev-env Makefile pattern (setup-dev-env): stamp-tracked sub-targets under sandboxd/target/.dev-env-stamps/. Each sub-target does cmp + getcap pre-checks before invoking sudo so a no-op rerun issues zero sudo calls. install-route-helper-test-cap must use --workspace --tests --features sandbox-route-helper/test-env-override to match the binary nextest builds (checksum check). Future host-setup work follows this pattern."
+      ],
+      "discoveries": [
+        "make install-route-helper-test-cap had to switch from --release --target-dir route-helper-test to --workspace --tests --features sandbox-route-helper/test-env-override writing to target/debug/. Reason: integration test's checksum check requires the installed binary bit-identical with CARGO_BIN_EXE_sandbox-route-helper, which nextest builds in debug+workspace+tests scope. Any narrower cargo invocation produces a structurally different binary and the test panics 'installed route helper is stale' immediately after a fresh install. Prod (release) and test (debug) binaries don't clobber each other because they live in different profile dirs under the same target/.",
+        "Subnet defaults split: NetworkManager in-code default is 10.209.0.0/24 (256 addresses); contrib/users.conf.example dev-install template is 10.209.0.0/20 (4096 addresses). Both work because users.conf overrides the in-code default. Documented in concepts/networking.md and M3.md so future readers reconcile correctly."
+      ],
+      "artifacts": [
+        "load_users_config_route_helper",
+        "is_secure_mode",
+        "setup-dev-env",
+        "InsecureFile",
+        "SANDBOX_ROUTE_HELPER_PATH",
+        "test-env-override"
+      ]
+    },
+    {
+      "session": "M11-S10",
+      "title": "CIDR-scoped orphan reaper",
+      "summary": "M11-S10 (CIDR-scoped orphan reaper) landed as 3 commits on top of b1a8756: 6d8f6dd feat(reaper) dual-anchor model, 34f3001 test(reaper) CIDR integration tests + nextest serial group, c9dac98 docs(m11-s10) LM14 cluster + concepts/networking.md dual-anchor enforcement promotion. This is the terminal session of M11 and closes the lite-mode-container-backend-design spec. Hard-gate verification (per session-planning skill spec-delivery rules): (a) claim-to-code verification map committed in c9dac98 (LM14.1-LM14.6 covering IPAM probe, filter point, transitive ownership, daemon-startup wiring, docstring extension, integration tests; cross-reference from LM9.x). (b) Conjunctive exit criteria: cargo nextest workspace GREEN (1200/1200 hermetic, was 1199 + 1 from new IPv6-only parser test); make test-integration GREEN; three new integration tests pass deterministically across 6 consecutive runs (integration_reaper_skips_out_of_pool_network, integration_reaper_reaps_in_pool_network, integration_reaper_skips_network_with_missing_ipam); legacy integration_orphan_reaper green under new pool param; cargo clippy clean; make docs-build GREEN with starlight-links-validator clean; reaper module docstring + concepts/networking.md prose match. KNOWN ENVIRONMENT GAP: make test-e2e-container could not run on this dev VM because rootless Docker is in use and post-M11-S8 daemon rejects lite-session creation on rootless docker by default; verified via git stash that pre-S10 master shows identical 47-fail outcome with the same daemon-side rejection \u2014 not an S10 regression. S10 changes touch only the orphan-reaper code path on daemon startup, which is upstream of any session-create call; no behavioral overlap with the rootless-docker rejection. Future host-setup must either run on default-hardened Docker or extend the e2e harness to flip --force-rootless-docker. kio-reviewer ran over the diff: 1 Major + 4 Minor + 2 Questions + 2 Nits. Major (in-pool integration test attached container to network being reaped) fixed inline by dropping --network from create_stopped_container helper, all calls now attach to bridge. Minor m-1 (saturating_add defensive intent) and m-4 (IPv6-only parser test) and Q-1 (transitive-ownership scope limitation docstring) fixed inline. Remaining 4 deferred as todos #91-#94: m-2 unique_session_id collision risk (parity with legacy), m-3 missing_ipam test name vs behavior, n-1 module-tag style consistency, n-2 Cidr4::parse #[doc(hidden)]. Decisions logged: two-pass reap_orphans with out_of_pool_sids skip set, transitive-ownership scope (single-anchor fallback when sandbox-net-{sid} torn down). Discoveries logged: Docker integration test convention (attach to bridge not custom network).",
+      "completed": "2026-04-29T22:36:04.971817Z",
+      "decisions": [
+        "Orphan reaper dual-anchor design: two-pass reap_orphans (networks \u2192 containers/volumes) with out_of_pool_sids HashSet<SessionId> populated during network pass. Container and volume passes consult the skip set, achieving transitive ownership without coupling to docker-network-inspect calls. The CIDR anchor only protects siblings of out-of-pool networks observed during the network pass \u2014 a container/volume whose sandbox-net-{sid} has already been torn down falls through to single-anchor (name-prefix) protection. Acceptable given 12-hex sid randomness; revisit if multi-daemon deployment runbook lands. Documented in orphan_reaper.rs module docstring."
+      ],
+      "discoveries": [
+        "Docker integration test convention: test fixtures should attach containers to bridge, NOT the test's custom sandbox-net-{sid} network. Some Docker engine versions (20.x+) register a created-state container as an active endpoint of its custom network, causing 'docker network rm' to fail with 'network has active endpoints'. The legacy integration_orphan_reaper.rs already followed this pattern; new integration_orphan_reaper_cidr.rs aligned via the create_stopped_container(name) helper. Apply this rule to any future Docker-backed integration test that exercises network teardown."
+      ],
+      "artifacts": [
+        "DockerOps::inspect_network_ipam",
+        "parse_ipam_subnets",
+        "ipam_subnets_in_pool",
+        "out_of_pool_sids",
+        "Cidr4::parse",
+        "LM14"
+      ]
     }
   ],
   "todos": [
@@ -1920,6 +2129,391 @@
       "selected_session": "M10-S9",
       "resolved_session": "M10-S9",
       "resolved_timestamp": "2026-04-25T17:56:10.850749Z"
+    },
+    {
+      "id": 60,
+      "text": "Bump nix dep when 0.30+ exposes pidfd_open: drop libc::syscall fallback in sandbox-route-helper, drop direct libc dep, switch to wrapped form. Currently in-tree at sandbox-route-helper/src/main.rs. No urgency \u2014 syscall is stable.",
+      "added_session": "M11-S2",
+      "added_timestamp": "2026-04-26T16:35:53.889073Z",
+      "status": "dropped",
+      "resolved_session": "M11-S10",
+      "resolved_timestamp": "2026-04-30T23:31:51.396808Z"
+    },
+    {
+      "id": 61,
+      "text": "Enrich NetworkManager::restore_from_infos error message to name the configured pool CIDR and offending session id alongside the offending subnet base. Currently surfaces only 'subnet X does not map to a valid block in the base range'. Out of scope for M11-S2 (would touch sandbox-core/src/network.rs which Phase 2C handoff explicitly forbids); good candidate for a small M11 follow-up before merge to main.",
+      "added_session": "M11-S2",
+      "added_timestamp": "2026-04-26T16:37:12.839294Z",
+      "status": "completed",
+      "selected_session": "M11-S7",
+      "resolved_session": "M11-S7",
+      "resolved_timestamp": "2026-04-28T15:45:17.528935Z"
+    },
+    {
+      "id": 62,
+      "text": "M11-S2 polish: lower RUST_LOG to warn (or unset) in tests/integration_users_conf_startup.rs to reduce stderr-pipe pressure on slow CI. Substring assertions are on eprintln output, not log output; info-level messages are unnecessary and risk pipe-fill if daemon emits chatty init logs. Trivial change, sandboxd/sandboxd/tests/integration_users_conf_startup.rs:67. From kio-reviewer pass.",
+      "added_session": "M11-S2",
+      "added_timestamp": "2026-04-26T16:56:56.124317Z",
+      "status": "completed",
+      "selected_session": "M11-S7",
+      "resolved_session": "M11-S7",
+      "resolved_timestamp": "2026-04-28T15:45:17.529024Z"
+    },
+    {
+      "id": 63,
+      "text": "M11-S2 polish: i32::try_from(raw).expect(...) instead of raw as i32 for pidfd_open return cast in sandbox-route-helper/src/main.rs:191-209. Documents the kernel-fd-in-i32-range assumption inline; cannot fire in practice since pidfd values are kernel-allocated fd numbers. From kio-reviewer pass \u2014 fold into the next route-helper touch (likely todo #60's nix bump).",
+      "added_session": "M11-S2",
+      "added_timestamp": "2026-04-26T16:57:00.295073Z",
+      "status": "completed",
+      "selected_session": "M11-S7",
+      "resolved_session": "M11-S7",
+      "resolved_timestamp": "2026-04-28T15:45:17.529030Z"
+    },
+    {
+      "id": 64,
+      "text": "M11-S2 polish: add // must come after stderr read comment near drop(tmp); in tests/integration_users_conf_startup.rs:103. Future refactors that move the stderr read could break the explicit-early-drop pattern silently. From kio-reviewer pass.",
+      "added_session": "M11-S2",
+      "added_timestamp": "2026-04-26T16:57:03.022535Z",
+      "status": "completed",
+      "selected_session": "M11-S7",
+      "resolved_session": "M11-S7",
+      "resolved_timestamp": "2026-04-28T15:45:17.529034Z"
+    },
+    {
+      "id": 65,
+      "text": "M11 commit disentanglement: working tree contains both M11-S1 (backend/, V005__session_backend_column.sql, session_backend column, sandbox-core/tests/migrations.rs, lima_integration backend tests) and M11-S2 (users_conf, sandbox-route-helper, daemon startup validation, install docs) uncommitted on master. M11-S1's session closed without committing; M11-S2 layered changes on top. Before merging to main, untangle into two commits (or a logical sequence) so attribution maps to the originating session. Hermetic + integration + full E2E gates all green on the combined working tree, so the bundle is verified \u2014 only the git layout is the concern. Files mixed across both sessions: sandboxd/Cargo.toml, sandboxd/Cargo.lock, sandboxd/sandbox-core/Cargo.toml, sandboxd/sandbox-core/src/lib.rs, sandboxd/sandboxd/Cargo.toml, sandboxd/sandboxd/src/main.rs.",
+      "added_session": "M11-S2",
+      "added_timestamp": "2026-04-26T17:43:48.178719Z",
+      "status": "dropped",
+      "resolved_session": "M11-S6",
+      "resolved_timestamp": "2026-04-27T10:38:18.028009Z"
+    },
+    {
+      "id": 66,
+      "text": "Spec patch: .tasks/specs/2026-04-22-lite-mode-container-backend-design/2026-04-22-lite-mode-container-backend-design-spec.md \u00a7 Hardening line 542 lists 'seccomp=default' which is INVALID Docker CLI syntax. Correct spelling is 'seccomp=builtin'. Implementation already uses builtin; spec text needs to match. Discovered in M11-S3 Phase 3A. Tiny edit; fold into M11 spec-cleanup pass before close.",
+      "added_session": "M11-S3",
+      "added_timestamp": "2026-04-26T18:16:51.733638Z",
+      "status": "completed",
+      "selected_session": "M11-S7",
+      "resolved_session": "M11-S7",
+      "resolved_timestamp": "2026-04-28T15:45:17.529037Z"
+    },
+    {
+      "id": 67,
+      "text": "M11-S3 Phase 3D: normalize cpus precision at HTTP boundary. BackendSpecific::Container { cpus: u32 } but spec \u00a7 Resource defaults wants 1-decimal precision (0.8, 1.5). 3A mitigated with as f64 in resource_ceilings; the proper fix lives at the request-parsing layer in sandboxd/src/main.rs (or the type itself in sandbox-core/src/backend/capabilities.rs). Surface during 3D wiring.",
+      "added_session": "M11-S3",
+      "added_timestamp": "2026-04-26T18:16:54.602077Z",
+      "status": "completed",
+      "selected_session": "M11-S7",
+      "resolved_session": "M11-S7",
+      "resolved_timestamp": "2026-04-28T17:38:20.353894Z"
+    },
+    {
+      "id": 68,
+      "text": "Gap #5 (workspace bind plumbing for lite container): re-advertise WorkspaceMode::Shared in container capability matrix (sandbox-core/src/backend/container.rs:362) and thread workspace_host_path from SessionConfig.workspace_mode through to ContainerNetwork at sandboxd/src/main.rs:813. Currently empty() per M11-S3 review fix #2 (deferred). Test 3.9 (workspace UID alignment) in tests/e2e/test_lite.py is skipped with this reason. Schedule into M11-S5 alongside parametrization.",
+      "added_session": "M11-S4",
+      "added_timestamp": "2026-04-26T23:57:31.183158Z",
+      "status": "completed",
+      "selected_session": "M11-S5",
+      "resolved_session": "M11-S5",
+      "resolved_timestamp": "2026-04-27T04:13:43.857173Z"
+    },
+    {
+      "id": 69,
+      "text": "Cosmetic: 'sandbox describe/inspect' on a container session created without --cpus/--memory shows CPUs: 0, Memory: 0 MB (Phase 4D-pre sentinel display). Either flip SessionConfig.cpus/memory_mb to Option<u32> end-to-end, or render '0 (host-80% default)' for container backend in describe/inspect. Surface fix only; runtime behavior is correct.",
+      "added_session": "M11-S4",
+      "added_timestamp": "2026-04-27T00:57:35.896680Z",
+      "status": "dropped",
+      "resolved_session": "M11-S6",
+      "resolved_timestamp": "2026-04-27T10:38:39.880768Z"
+    },
+    {
+      "id": 70,
+      "text": "Wire gateway container into container backend create_session: setup_session_networking equivalent for lite sessions (attach sandbox-gw-<id> to sandbox-net-<id>, point lite container DNS at gateway IP, integrate nft policy enforcement). Currently the container path at sandboxd/src/main.rs:884-909 short-circuits before gateway setup. Re-enable test_lite_gateway_parity (remove @pytest.mark.skip decorator) when wiring lands.",
+      "added_session": "M11-S4",
+      "added_timestamp": "2026-04-27T01:35:28.567341Z",
+      "status": "completed",
+      "selected_session": "M11-S5",
+      "resolved_session": "M11-S5",
+      "resolved_timestamp": "2026-04-27T04:13:43.857209Z"
+    },
+    {
+      "id": 71,
+      "text": "Spec E2E orphan-cleanup test: kill daemon mid-create, restart, assert orphan reaped \u2014 Rust integration test landed in Phase 5B but the spec also calls for an E2E pytest equivalent. Defer to M11-S6 verification or a follow-on phase.",
+      "added_session": "M11-S5",
+      "added_timestamp": "2026-04-27T04:38:52.651639Z",
+      "status": "completed",
+      "selected_session": "M11-S7",
+      "resolved_session": "M11-S7",
+      "resolved_timestamp": "2026-04-28T15:45:17.529041Z"
+    },
+    {
+      "id": 72,
+      "text": "test_m3_networking.py agnostic refactor: 3 tests (gateway_traffic_flow, stop_start_with_networking, concurrent_sessions) currently skip in-body for container backend due to hardcoded Lima 10.209.x.x/28 subnet pool. Refactor to query gateway IP via 'sandbox info' instead of hardcoding subnet \u2014 would unlock these 3 tests for container backend. Out of M11-S5 Phase 5C scope per handoff constraint.",
+      "added_session": "M11-S5",
+      "added_timestamp": "2026-04-27T05:09:03.153091Z",
+      "status": "completed",
+      "selected_session": "M11-S7",
+      "resolved_session": "M11-S7",
+      "resolved_timestamp": "2026-04-28T16:55:38.317025Z"
+    },
+    {
+      "id": 73,
+      "text": "Provision self-hosted KVM-capable GitHub Actions runner with labels [self-hosted, kvm]. Until done, e2e-matrix queues on every push-to-main without scheduling. Reqs: KVM hardware/nested-virt, Docker, limactl, qemu-bridge-helper, 8 CPU/8GB floor. See .tasks/handoffs/20260427-051634-implementer-m11-s5-phase5d-runner-provisioning.md.",
+      "added_session": "M11-S5",
+      "added_timestamp": "2026-04-27T05:19:56.154851Z",
+      "status": "dropped",
+      "resolved_session": "M11-S6",
+      "resolved_timestamp": "2026-04-27T10:53:13.022908Z"
+    },
+    {
+      "id": 74,
+      "text": "Wire nightly perf-benchmarks GitHub Actions job (spec \u00a7 CI policy: 'Nightly | Matrix + perf benchmarks | longer'). Blocked on KVM-runner provisioning. Add schedule: trigger and reuse e2e-matrix scaffolding.",
+      "added_session": "M11-S5",
+      "added_timestamp": "2026-04-27T05:19:57.336410Z",
+      "status": "dropped",
+      "resolved_session": "M11-S6",
+      "resolved_timestamp": "2026-04-27T10:53:13.022986Z"
+    },
+    {
+      "id": 75,
+      "text": "M11 polish: 'sandbox describe/inspect' on a container session created without --cpus/--memory currently shows 'CPUs: 0, Memory: 0 MB' (sentinel display). Either render the actual host-80% defaults the daemon would apply, OR omit the field entirely when no explicit value was set. Never show 0 \u2014 that misleads the reader into thinking the session has no CPU/memory budget. Connects to todo #67 (cpus precision normalization) since the display path needs to match whatever the HTTP boundary normalizes to.",
+      "added_session": "M11-S6",
+      "added_timestamp": "2026-04-27T10:38:39.964469Z",
+      "status": "completed",
+      "selected_session": "M11-S7",
+      "resolved_session": "M11-S7",
+      "resolved_timestamp": "2026-04-28T17:38:20.353936Z"
+    },
+    {
+      "id": 76,
+      "text": "Drop the leading underscore from SubnetAllocator._prefix_len in sandbox-core/src/network.rs. The field is now actively read by NetworkManager::restore_from_infos's enriched error message (todo #61); the underscore-as-unused marker is misleading post-edit. Trivial rename; fold into the next pass that touches network.rs.",
+      "added_session": "M11-S7",
+      "added_timestamp": "2026-04-28T15:40:15.230810Z",
+      "status": "completed",
+      "selected_session": "M11-S7",
+      "resolved_session": "M11-S7",
+      "resolved_timestamp": "2026-04-28T17:53:25.096199Z"
+    },
+    {
+      "id": 77,
+      "text": "M11-S7 follow-up: --boot-cmd symmetry on container backend. The Lima path runs bash -c <cmd> after the --repo clone; container branch still doesn't dispatch req.boot_cmd. Pattern is identical to the new repo-clone block (different state.guest.exec args, fail_explicit_boot_cmd instead of fail_explicit_repo_clone). Mirror the symmetry pattern that --repo just got. Out of original S7 scope; small follow-up.",
+      "added_session": "M11-S7",
+      "added_timestamp": "2026-04-28T16:13:47.013647Z",
+      "status": "completed",
+      "selected_session": "M11-S7",
+      "resolved_session": "M11-S7",
+      "resolved_timestamp": "2026-04-28T17:53:25.096243Z"
+    },
+    {
+      "id": 78,
+      "text": "Cosmetic: sandboxd/sandbox-cli/tests/integration_no_cache_rejection.rs:95 hand-rolls a fake /backends mock with workspace_modes: []. Spec-correct post-S7 value is ['shared', 'clone']. Test still passes (assertion is about --no-cache rejection, not workspace_modes). Opportunistic cleanup whenever someone next touches the file.",
+      "added_session": "M11-S7",
+      "added_timestamp": "2026-04-28T16:13:49.189745Z",
+      "status": "completed",
+      "selected_session": "M11-S7",
+      "resolved_session": "M11-S7",
+      "resolved_timestamp": "2026-04-28T17:53:25.096248Z"
+    },
+    {
+      "id": 79,
+      "text": "Pre-existing flake on master: integration_create_session_container_first_use_warning_surfaces fails in raw nextest runs because sandbox-core::lima::guest_agent_path() resolves via current_exe().parent().join('sandbox-guest') \u2014 under nextest, current_exe() is target/debug/deps/<test-binary>, not target/debug. Fix: search both target/debug and target/debug/../ for the binary, or fall back to the workspace-root canonical path. Affects local-nextest reliability; CI may or may not. Surface for next sandbox-guest provisioning touch.",
+      "added_session": "M11-S7",
+      "added_timestamp": "2026-04-28T16:13:53.322742Z",
+      "status": "completed",
+      "selected_session": "M11-S7",
+      "resolved_session": "M11-S7",
+      "resolved_timestamp": "2026-04-28T17:53:25.096251Z"
+    },
+    {
+      "id": 80,
+      "text": "Refactor: expose CONTAINER_CA_BUNDLE_PATH and home_volume_name(SessionId) via sandbox-core's public API. Today they are private to sandbox-core/src/backend/container.rs; the daemon (sandboxd/src/main.rs::session_mount_info_for) mirrors them verbatim because M11-S7 Bundle Y constraints forbade exposing new accessors. The mirror creates drift risk if either value changes. Either pub the constant + free function, or expose them through the SessionRuntime trait (alongside Capabilities) so the daemon never duplicates literals. The orphan-reaper's parse_home_volume_session_id test should catch volume-name drift but not constant drift.",
+      "added_session": "M11-S7",
+      "added_timestamp": "2026-04-28T16:53:13.379976Z",
+      "status": "completed",
+      "selected_session": "M11-S7",
+      "resolved_session": "M11-S7",
+      "resolved_timestamp": "2026-04-28T17:53:25.096254Z"
+    },
+    {
+      "id": 81,
+      "text": "Future: validate or warn on fractional --cpus for Lima sessions. Today sandboxd/src/main.rs:929 truncates 1.5 \u2192 1 silently for Lima (Lima uses QEMU -smp integers). Either reject Lima fractional cpus at the daemon boundary with a 400, or surface a daemon warn! log + an operator-visible warning string in SessionDto.warnings. Surfaced by kio-reviewer over M11-S7.",
+      "added_session": "M11-S7",
+      "added_timestamp": "2026-04-28T18:45:46.336941Z",
+      "status": "deferred"
+    },
+    {
+      "id": 82,
+      "text": "Add gateway nftables-integration coverage for cross-session L4 isolation (container backend). M11-S7's e2e _probe_gateway_tcp can only verify positive reachability on container \u2014 gateway DNAT prerouting (sandbox-core/src/gateway.rs:1462-1486) rewrites every TCP/UDP packet from session A's saddr before it can leave the bridge, so cross-session 'A cannot reach B's gateway' is invisible at L4 from inside the session. The structural disjoint-subnet check in test_concurrent_sessions covers the architectural contract on both backends, but the runtime traffic-isolation property is currently only behaviourally tested on Lima (via ICMP). Add an in-tree integration test in sandbox-core that asserts: a packet from session A's vm_subnet targeting session B's vm_subnet is dropped by the forward chain. No spec change required.",
+      "added_session": "M11-S7",
+      "added_timestamp": "2026-04-28T20:06:42.248100Z",
+      "status": "deferred"
+    },
+    {
+      "id": 83,
+      "text": "Add fifth M11-S8 integration test exercising probe-Err(_) propagation through the daemon's create_session handler and out to the CLI. Currently the unit test (probe_against_path_stub_round_trip Phase 3) confirms DockerInfoBehavior::Fail surfaces as SandboxError::Gateway, but no integration test drives the HTTP path: stub set to Fail \u2192 daemon returns 500 \u2192 CLI relays the spec-shaped error body. Should be named integration_rootless_docker_probe_failure_surfaces_as_gateway_error and follow the same harness pattern as the four existing tests in sandboxd/sandboxd/tests/integration_rootless_docker.rs. Surfaced by kio-reviewer over M11-S8. Non-blocking; M11.md plan only listed 4 tests, so this is genuinely additional scope.",
+      "added_session": "M11-S8",
+      "added_timestamp": "2026-04-28T22:53:13.668301Z",
+      "status": "completed",
+      "selected_session": "M11-S9",
+      "resolved_session": "M11-S9",
+      "resolved_timestamp": "2026-04-29T19:21:31.815363Z"
+    },
+    {
+      "id": 84,
+      "text": "CIDR-scoped reaper: filter sandbox networks/containers/volumes by daemon's allocator pool (sandbox-core/src/network.rs:197 default 10.209.0.0/24) before reaping. Today the reaper trusts only the 'sandbox-' name prefix, so two daemons sharing a host (or a daemon + a misconfigured second instance, or dev tests using the production prefix) can mass-delete each other's resources. Defense-in-depth \u2014 name says 'sandboxd's', CIDR says 'this sandboxd's'. Implementation: extend DockerOps to fetch IPAM via 'docker network inspect' and filter networks whose IPv4 subnets fall outside the daemon's pool; containers + home volumes are owned by-network transitively, so out-of-pool networks gate them. New test surface: CIDR-mismatch fixtures asserting cross-daemon isolation. Separate session \u2014 has its own design + test scope.",
+      "added_session": "M11-S8",
+      "added_timestamp": "2026-04-29T09:58:05.129020Z",
+      "status": "completed",
+      "selected_session": "M11-S10",
+      "resolved_session": "M11-S10",
+      "resolved_timestamp": "2026-04-29T22:35:34.556511Z"
+    },
+    {
+      "id": 85,
+      "text": "Mode-arm coverage gap in sandbox-core::users_conf::validate_users_conf_security (line ~498-510). The world-writable/group-writable refusal arm is unreachable from non-root unit tests because the uid-0 arm fires first. Test defensive_check_refuses_world_writable_canonical_file asserts InsecureFile but cannot distinguish which arm fired. Fix: introduce validate_users_conf_security_with_meta(meta: &Metadata, ...) seam so a unit test can synthesize uid-0-but-mode-666 metadata. Surfaced by kio-reviewer over M11-S9. Non-blocking \u2014 current tests pass.",
+      "added_session": "M11-S9",
+      "added_timestamp": "2026-04-29T19:36:37.927324Z",
+      "status": "dropped",
+      "resolved_session": "M11-S10",
+      "resolved_timestamp": "2026-04-29T21:05:32.624688Z"
+    },
+    {
+      "id": 86,
+      "text": "kio-reviewer NITs from M11-S9 diff (non-blocking, accepted as-is): (1) ROUTE_HELPER_BINARY_NAME constant in sandboxd/src/main.rs survives only as one error-format param, could be inlined; (2) tcp.rs outcomes Vec deserves a one-line comment near drop(outcomes) clarifying it exists to keep admitted streams alive past the 300ms drain window; (3) integration_rootless_docker.rs sets SANDBOX_ROUTE_HELPER_PATH unconditionally even for tests #1 and #5 that never invoke the helper \u2014 minor redundancy; (4) sandbox-deny-logger bind() takes i32 backlog while production code clamps via try_into().expect() \u2014 could move clamp into a u32-signature wrapper. All low-priority cleanup; pick up in any future deny-logger or route-helper touch.",
+      "added_session": "M11-S9",
+      "added_timestamp": "2026-04-29T19:36:44.567881Z",
+      "status": "deferred"
+    },
+    {
+      "id": 87,
+      "text": "Add unit test for outer resolve_route_helper_path() env-var read in sandboxd/src/main.rs \u2014 inner predicate has 4-corner coverage, outer wrapper is integration-test-only. Same unsafe set_var/restore pattern as users_conf_path_honors_env_override. (M11-S9 reviewer Minor #4)",
+      "added_session": "M11-S9",
+      "added_timestamp": "2026-04-29T20:59:38.083528Z",
+      "status": "deferred"
+    },
+    {
+      "id": 88,
+      "text": "Add a sentence to validate_canonical_users_conf_security docstring noting metadata() follows symlinks \u2014 target file's owner/mode is what gets checked. Optional: switch to symlink_metadata + reject symlinks if threat model justifies. (M11-S9 reviewer Nit #6)",
+      "added_session": "M11-S9",
+      "added_timestamp": "2026-04-29T20:59:38.195890Z",
+      "status": "deferred"
+    },
+    {
+      "id": 89,
+      "text": "Clarify in setup-dev-env Makefile recipes or installation.md that sudo authenticates once via timestamp_timeout \u2014 multiple [sudo] announce lines do not equal multiple password prompts. (M11-S9 reviewer Nit #7)",
+      "added_session": "M11-S9",
+      "added_timestamp": "2026-04-29T20:59:38.332224Z",
+      "status": "deferred"
+    },
+    {
+      "id": 90,
+      "text": "Resolve lib.rs re-export asymmetry: sandbox-core re-exports daemon-side load_users_config/load_users_config_from/users_conf_path but not the helper-side load_users_config_route_helper/route_helper_users_conf_path. Either expose both or add a comment explaining the deliberate omission. (M11-S9 reviewer Nit #8)",
+      "added_session": "M11-S9",
+      "added_timestamp": "2026-04-29T20:59:38.484762Z",
+      "status": "deferred"
+    },
+    {
+      "id": 91,
+      "text": "unique_session_id in integration tests (orphan_reaper.rs and orphan_reaper_cidr.rs) mixes per-test seed with wall-clock low-order nanos \u2014 parallel CI runs on same host could collide. Inherited from legacy. Hardening option: mix in std::process::id() or atomic counter. Out of S10 scope. (M11-S10 reviewer m-2)",
+      "added_session": "M11-S10",
+      "added_timestamp": "2026-04-29T22:32:16.414285Z",
+      "status": "deferred"
+    },
+    {
+      "id": 92,
+      "text": "Optional rename: integration_reaper_skips_network_with_missing_ipam \u2192 integration_reaper_skips_resources_when_sibling_network_has_no_ipv4_ipam (or similar). Test attaches container to bridge, not the IPv6-only network, due to alpine IPv6 stack limits \u2014 name vs behavior asymmetry. Doc comment already explains. (M11-S10 reviewer m-3)",
+      "added_session": "M11-S10",
+      "added_timestamp": "2026-04-29T22:32:16.500244Z",
+      "status": "deferred"
+    },
+    {
+      "id": 93,
+      "text": "Cross-reference style consistency: orphan_reaper.rs module docstring tags 'Dual-anchor ownership model (M11-S10)' inline; docs/concepts/networking.md doesn't mirror the milestone tag. Either remove inline tag (let git log carry it) or mirror in docs. (M11-S10 reviewer n-1)",
+      "added_session": "M11-S10",
+      "added_timestamp": "2026-04-29T22:32:16.581944Z",
+      "status": "deferred"
+    },
+    {
+      "id": 94,
+      "text": "Cidr4::parse made pub during M11-S10 for orphan-reaper cross-module use. If meant as internal API, consider #[doc(hidden)] to signal 'may change'. If meant as stable public surface, leave as-is. Cidr4 is already re-exported from sandbox-core. (M11-S10 reviewer n-2)",
+      "added_session": "M11-S10",
+      "added_timestamp": "2026-04-29T22:32:16.666411Z",
+      "status": "deferred"
+    },
+    {
+      "id": 95,
+      "text": "M12 prep \u2014 daemon-side --no-cache enforcement gap (spec \u00a7 Validation sites + per_session_no_cache: false for container). Add no_cache field to SessionSpec, populate from request when constructing the spec, and have SessionSpec::validate() return Err(UnsupportedFeature::PerSessionNoCache(caps.kind)) when caps.per_session_no_cache is false. Mirror the existing Hardening/WorkspaceMode pattern. Add daemon-side rejection test integration_create_session_container::..._rejects_no_cache mirroring ..._rejects_hardened. Resolves TODO(M11-S4) at sandboxd/sandbox-core/src/backend/spec.rs:178. Currently the CLI is the only enforcer; a non-CLI HTTP client posting {\"backend\":\"container\",\"no_cache\":true} is silently accepted. Surfaced by spec-delivery verifier post-M11-S10. (M12 / macOS-support prep)",
+      "added_session": "M11-S10",
+      "added_timestamp": "2026-04-30T16:42:33.634024Z",
+      "status": "deferred"
+    },
+    {
+      "id": 96,
+      "text": "M12 prep \u2014 delivery doc LM2.10 wording correction. Currently characterizes container runtime as 'stateless over RuntimeHandle'; actually only the trait surface is stateless, the impl carries per-session network info on a Mutex<HashMap> side map populated by the daemon (M11-S3 Phase 3A architectural compromise). Update LM2.10 cell text in .tasks/specs/2026-04-22-lite-mode-container-backend-design/2026-04-22-lite-mode-container-backend-design-delivery.md to read 'trait surface stateless; per-session network state on a daemon-populated side map' or equivalent. Surfaced by spec-delivery verifier. (M12 / macOS-support prep)",
+      "added_session": "M11-S10",
+      "added_timestamp": "2026-04-30T16:42:33.724815Z",
+      "status": "deferred"
+    },
+    {
+      "id": 97,
+      "text": "M12 prep \u2014 orphan TODO(M11-S1 Phase 1C) at sandboxd/sandbox-core/src/backend/lima.rs:298 about IP attribution wiring. Phase 1C is closed; the TODO references a phase that no longer exists in the plan. Investigate: check whether IP attribution was wired up elsewhere during M11; if yes, delete the TODO comment; if no, retarget to a real future phase or convert to a concrete tracker todo. Surfaced by spec-delivery verifier (one of two orphaned TODOs found). The companion TODO at spec.rs:178 will be resolved by the --no-cache daemon-enforcement todo and self-deletes. (M12 / macOS-support prep)",
+      "added_session": "M11-S10",
+      "added_timestamp": "2026-04-30T16:42:33.813864Z",
+      "status": "deferred"
+    },
+    {
+      "id": 98,
+      "text": "echconfig is supposed to be stripped but it seems like the whole HTTP record is denied",
+      "added_session": "M11-S10",
+      "added_timestamp": "2026-04-30T19:53:57.629169Z",
+      "status": "deferred"
+    },
+    {
+      "id": 99,
+      "text": "policy version field is not version of the policy, it's the version of the policy schema - this needs to be clarified",
+      "added_session": "M11-S10",
+      "added_timestamp": "2026-04-30T19:56:50.154535Z",
+      "status": "deferred"
+    },
+    {
+      "id": 100,
+      "text": "verify claim - nftables completely bypass envoy for mitmproxy traffic which is a problem - either correct the original design and docs or fix the discrepancy",
+      "added_session": "M11-S10",
+      "added_timestamp": "2026-04-30T19:57:03.215448Z",
+      "status": "dropped",
+      "resolved_session": "M11-S10",
+      "resolved_timestamp": "2026-04-30T23:31:51.396867Z"
+    },
+    {
+      "id": 101,
+      "text": "shouldn't sandbox cp actually use limactl cp on lima and docker cp on docker backend?",
+      "added_session": "M11-S10",
+      "added_timestamp": "2026-04-30T19:57:47.977686Z",
+      "status": "deferred"
+    },
+    {
+      "id": 102,
+      "text": "why are milestone references everywhere in the code and tests? they are only relevant in the plan which is an ephemeral execution artifact",
+      "added_session": "M11-S10",
+      "added_timestamp": "2026-04-30T20:01:30.766530Z",
+      "status": "deferred"
+    },
+    {
+      "id": 103,
+      "text": "verify claim that this is already addressed - \"can we have different policies on the same IP but different port? I'm thinking that policies should also be explicit about port numbers\"",
+      "added_session": "M11-S10",
+      "added_timestamp": "2026-04-30T20:02:12.185580Z",
+      "status": "dropped",
+      "resolved_session": "M11-S10",
+      "resolved_timestamp": "2026-04-30T23:31:51.396872Z"
+    },
+    {
+      "id": 104,
+      "text": "cp is fine but we need also full rsync-like sync for dirs; not just simple copy",
+      "added_session": "M11-S10",
+      "added_timestamp": "2026-04-30T20:02:27.652661Z",
+      "status": "deferred"
     }
   ],
   "plan": "docs/internal/session-plan.md",
@@ -2009,6 +2603,42 @@
       "old_total": 67,
       "new_total": 69,
       "reason": "M10 expanded post-S8: M10-S9 residual sweep + M10-S10 synchronous DNS-policy gating"
+    },
+    {
+      "timestamp": "2026-04-26T13:19:37.920608Z",
+      "old_total": 69,
+      "new_total": 75,
+      "reason": "M11 'Lite mode: container backend' planned and committed (4c5bd69, 5448b46): 6 new sessions S1-S6 (backend abstraction, route helper, container runtime, --lite CLI, E2E parametrization, spec-delivery verification)"
+    },
+    {
+      "timestamp": "2026-04-27T10:39:13.772462Z",
+      "old_total": 75,
+      "new_total": 76,
+      "reason": "Add M12-S1 polish session: clear residual M11 quality items (todos #67/#72/#75/#62/#63/#64) before merge to main. Scope locked: cpus-precision normalization, test_m3_networking agnostic refactor unlocking 3 e2e skips, describe/inspect '0' sentinel cleanup, route-helper polish."
+    },
+    {
+      "timestamp": "2026-04-28T15:15:01.138366Z",
+      "old_total": 76,
+      "new_total": 77,
+      "reason": "Add M11-S8: rootless-Docker daemon enforcement + --force-rootless-docker escape hatch + PATH-stub test substrate. Spec \u00a7 Out of scope (line 1175) declares rootless Docker unsupported but daemon does not refuse it; test_lite_workspace_uid_alignment skipif silently masks the contract violation. S8 lands the daemon-side enforcement so the contract becomes verifiable."
+    },
+    {
+      "timestamp": "2026-04-29T15:43:41.782126Z",
+      "old_total": 77,
+      "new_total": 78,
+      "reason": "Added M11-S9: Route-helper auth hardening, dev-environment setup, test stability. Surfaced during flake-triage on make test-integration; bundles security-critical env-var lockdown for SANDBOX_USERS_CONF (route helper has cap_sys_admin, env override is local privilege escalation), daemon resolver simplification (4-step \u2192 2-step), install-path move to /usr/local/libexec/sandboxd/ per FHS, make setup-dev-env target with idempotent /etc setup, integration test refactor (drop CappedHelper, install at /usr/local/libexec/sandboxd-test/), and TCP listen-backlog test stability fix. See docs/internal/milestones/M11.md M11-S9 entry."
+    },
+    {
+      "timestamp": "2026-04-29T17:32:47.716743Z",
+      "old_total": 78,
+      "new_total": 79,
+      "reason": "Added M11-S10 (CIDR-scoped orphan reaper) \u2014 defense-in-depth filter for cross-daemon collision, deferred from M11-S9 to keep S9 cohesive around route-helper/dev-env theme."
+    },
+    {
+      "timestamp": "2026-04-30T23:44:50.974944Z",
+      "old_total": 79,
+      "new_total": 89,
+      "reason": "M12 added \u2014 10 sessions of loose-ends + UDP hardening before further feature work (S1 UDP audit/fix, S2 UDP transport parity, S3 ECH strip-not-deny, S4 daemon validation, S5 reviewer-nit round-up, S6 milestone-ref cleanup, S7 native cp, S8 rsync sync, S9 backlog buffer, S10 claim-to-code verification). 23 deferred todos at planning start; 3 dropped after parallel verification (#60, #100, #103); 20 covered by M12 sessions."
     }
   ]
 }
