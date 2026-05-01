@@ -26,7 +26,7 @@
 //! reconciler (which owns `sandbox-gw-*`) and any operator-created
 //! resources outside the sandbox namespace untouched.
 //!
-//! # Dual-anchor ownership model (M11-S10)
+//! # Dual-anchor ownership model
 //!
 //! The name-prefix check above is the **first** ownership anchor:
 //! "name says sandboxd's." On a host running a single sandboxd that is
