@@ -172,9 +172,23 @@ impl Cidr4 {
     /// uses static reasons so it can be embedded in
     /// [`UsersConfigError::InvalidCidr`] without per-call allocation.
     ///
-    /// `pub` so the orphan-reaper module (and its integration tests)
-    /// can build `Cidr4` values for the dual-anchor CIDR pool gate
-    /// without crossing back through serde or the users.conf loader.
+    /// `pub` so the orphan-reaper module (and its integration tests
+    /// under `sandbox-core/tests/`) can build `Cidr4` values for the
+    /// dual-anchor CIDR pool gate without crossing back through serde
+    /// or the users.conf loader.
+    ///
+    /// Internal API — `#[doc(hidden)]` so it does not appear in the
+    /// rendered crate docs and so downstream crates do not treat it as
+    /// stable surface. Verified at M11-S10 review (reviewer nit n-2)
+    /// and re-checked at M12-S5: the only callers are
+    /// `sandbox-core::users_conf` (Deserialize / `first_invalid_cidr`),
+    /// `sandbox-core::backend::orphan_reaper`, and the
+    /// `sandbox-core/tests/integration_orphan_reaper*` integration
+    /// tests. No external crate (`sandboxd`, `sandbox-cli`,
+    /// `sandbox-route-helper`, the nft loggers, `sandbox-event-emitter`,
+    /// `sandbox-guest`) calls `parse` — `sandboxd` consumes `Cidr4`
+    /// only as a value type. Signature may change without notice.
+    #[doc(hidden)]
     pub fn parse(value: &str) -> Result<Self, &'static str> {
         let (addr_str, prefix_str) = value
             .split_once('/')
