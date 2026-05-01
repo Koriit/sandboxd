@@ -1562,7 +1562,6 @@ dependencies = [
 name = "sandbox-guest"
 version = "0.1.0"
 dependencies = [
- "base64",
  "sandbox-core",
  "serde",
  "serde_json",

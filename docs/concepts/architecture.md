@@ -199,8 +199,6 @@ sandbox prints stdout, exits with code 0
 | POST | `/sessions/{id}/start` | `start_session` | Start a stopped session |
 | POST | `/sessions/{id}/stop` | `stop_session` | Stop a running session |
 | POST | `/sessions/{id}/exec` | `exec_in_session` | Execute a command |
-| POST | `/sessions/{id}/upload` | `upload_to_session` | Upload a file |
-| POST | `/sessions/{id}/download` | `download_from_session` | Download a file |
 | POST | `/sessions/{id}/policy` | `update_policy` | Update network policy |
 | GET | `/sessions/{id}/events` | `get_events` | Replay or stream the session's event stream (traffic + lifecycle) |
 | GET | `/sessions/{id}/health` | `session_health` | Per-session health |

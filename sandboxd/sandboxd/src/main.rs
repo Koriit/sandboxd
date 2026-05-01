@@ -25,9 +25,8 @@ use sandbox_core::{
     ApiError, AssuranceLevel, BaseImageStatus, CaManager, Cidr4, CoreDnsConfig,
     CreateSessionRequest, DEFAULT_DEADLINE_MS as DNS_GATE_DEFAULT_DEADLINE_MS, Destination,
     DnsCache, DockerExecLdsProbe, DockerHealth, EventBus, EventBusConfig, ExecRequest,
-    ExecResponse, FileDownloadRequest, FileDownloadResponse, FileUploadRequest, GateRequest,
-    GateService, GateServiceOutcome, GateStatus, GatewayHealth, GatewayManager,
-    GatewayShutdownReason, GatewayStatus, GuestConnector, GuestRequest, GuestResponse,
+    ExecResponse, GateRequest, GateService, GateServiceOutcome, GateStatus, GatewayHealth,
+    GatewayManager, GatewayShutdownReason, GatewayStatus, GuestConnector, GuestResponse,
     HealthComponent, LdsAckOutcome, LdsStatsProbe, LimaManager, NetworkHealth, NetworkInfo,
     NetworkManager, PersistConfig, PersistentSink, Policy, PolicyApplyStatus, PolicyCompiler,
     PolicyDistributor, SandboxError, Session, SessionConfig, SessionDto, SessionHealth, SessionId,
@@ -775,8 +774,6 @@ fn app(state: Arc<AppState>) -> Router {
         .route("/sessions/{id}/start", post(start_session))
         .route("/sessions/{id}/stop", post(stop_session))
         .route("/sessions/{id}/exec", post(exec_in_session))
-        .route("/sessions/{id}/upload", post(upload_to_session))
-        .route("/sessions/{id}/download", post(download_from_session))
         .route(
             "/sessions/{id}/policy",
             post(update_policy).delete(clear_policy),
@@ -3044,138 +3041,6 @@ async fn exec_in_session(
         }
         Err(e) => {
             error!(session_id = %session.id, error = %e, "guest agent exec failed");
-            error_response(e).into_response()
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// File transfer handlers
-// ---------------------------------------------------------------------------
-
-/// `POST /sessions/{id}/upload` -- upload a file to the VM.
-async fn upload_to_session(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(req): Json<FileUploadRequest>,
-) -> impl IntoResponse {
-    let session = match state.store.get_session_by_name_or_id(&id) {
-        Ok(Some(s)) => s,
-        Ok(None) => return error_response(SandboxError::SessionNotFound(id)).into_response(),
-        Err(e) => return error_response(e).into_response(),
-    };
-
-    if session.state != SessionState::Running {
-        return error_response(SandboxError::InvalidState(format!(
-            "cannot upload to session with state {} (must be running)",
-            session.state
-        )))
-        .into_response();
-    }
-
-    match state
-        .guest
-        .send_request(
-            &session.id,
-            GuestRequest::FileUpload {
-                path: req.path.clone(),
-                data: req.data,
-                mode: req.mode,
-            },
-        )
-        .await
-    {
-        Ok(GuestResponse::FileUploadResult { success, error }) => {
-            if success {
-                let body = serde_json::json!({
-                    "status": "ok",
-                    "message": format!("file uploaded to {}", req.path),
-                });
-                (StatusCode::OK, Json(body)).into_response()
-            } else {
-                let msg = error.unwrap_or_else(|| "unknown error".into());
-                error_response(SandboxError::Internal(format!("file upload failed: {msg}")))
-                    .into_response()
-            }
-        }
-        Ok(GuestResponse::Error { message }) => {
-            error!(session_id = %session.id, %message, "guest agent upload error");
-            error_response(SandboxError::Internal(format!(
-                "guest agent error: {message}"
-            )))
-            .into_response()
-        }
-        Ok(other) => {
-            error!(session_id = %session.id, ?other, "unexpected guest response to upload");
-            error_response(SandboxError::Internal(
-                "unexpected response from guest agent".into(),
-            ))
-            .into_response()
-        }
-        Err(e) => {
-            error!(session_id = %session.id, error = %e, "guest agent upload failed");
-            error_response(e).into_response()
-        }
-    }
-}
-
-/// `POST /sessions/{id}/download` -- download a file from the VM.
-async fn download_from_session(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(req): Json<FileDownloadRequest>,
-) -> impl IntoResponse {
-    let session = match state.store.get_session_by_name_or_id(&id) {
-        Ok(Some(s)) => s,
-        Ok(None) => return error_response(SandboxError::SessionNotFound(id)).into_response(),
-        Err(e) => return error_response(e).into_response(),
-    };
-
-    if session.state != SessionState::Running {
-        return error_response(SandboxError::InvalidState(format!(
-            "cannot download from session with state {} (must be running)",
-            session.state
-        )))
-        .into_response();
-    }
-
-    match state
-        .guest
-        .send_request(
-            &session.id,
-            GuestRequest::FileDownload {
-                path: req.path.clone(),
-            },
-        )
-        .await
-    {
-        Ok(GuestResponse::FileDownloadResult { data, error }) => {
-            if let Some(err_msg) = error {
-                error_response(SandboxError::Internal(format!(
-                    "file download failed: {err_msg}"
-                )))
-                .into_response()
-            } else {
-                let body = FileDownloadResponse { data };
-                (StatusCode::OK, Json(body)).into_response()
-            }
-        }
-        Ok(GuestResponse::Error { message }) => {
-            error!(session_id = %session.id, %message, "guest agent download error");
-            error_response(SandboxError::Internal(format!(
-                "guest agent error: {message}"
-            )))
-            .into_response()
-        }
-        Ok(other) => {
-            error!(session_id = %session.id, ?other, "unexpected guest response to download");
-            error_response(SandboxError::Internal(
-                "unexpected response from guest agent".into(),
-            ))
-            .into_response()
-        }
-        Err(e) => {
-            error!(session_id = %session.id, error = %e, "guest agent download failed");
             error_response(e).into_response()
         }
     }

@@ -194,31 +194,6 @@ pub struct CreateSessionRequest {
     pub force_rootless_docker: bool,
 }
 
-/// Request body for `POST /sessions/{id}/upload`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct FileUploadRequest {
-    /// Path inside the VM to write the file to.
-    pub path: String,
-    /// Base64-encoded file data.
-    pub data: String,
-    /// Optional Unix file mode (e.g. 0o644).
-    pub mode: Option<u32>,
-}
-
-/// Request body for `POST /sessions/{id}/download`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct FileDownloadRequest {
-    /// Path inside the VM to read.
-    pub path: String,
-}
-
-/// Response body for `POST /sessions/{id}/download`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileDownloadResponse {
-    /// Base64-encoded file data.
-    pub data: String,
-}
-
 /// Request body for `POST /sessions/{id}/policy`.
 ///
 /// Contains the full policy document to compile and distribute to the
@@ -686,39 +661,5 @@ mod tests {
         let req: UpdatePolicyRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.policy.version, "2.0.0");
         assert_eq!(req.source_presets, vec!["npm".to_string()]);
-    }
-
-    #[test]
-    fn deserialize_file_upload_request() {
-        let json = r#"{"path": "/root/test.txt", "data": "aGVsbG8=", "mode": 420}"#;
-        let req: FileUploadRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.path, "/root/test.txt");
-        assert_eq!(req.data, "aGVsbG8=");
-        assert_eq!(req.mode, Some(420));
-    }
-
-    #[test]
-    fn deserialize_file_upload_request_no_mode() {
-        let json = r#"{"path": "/root/test.txt", "data": "aGVsbG8="}"#;
-        let req: FileUploadRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.path, "/root/test.txt");
-        assert!(req.mode.is_none());
-    }
-
-    #[test]
-    fn deserialize_file_download_request() {
-        let json = r#"{"path": "/root/test.txt"}"#;
-        let req: FileDownloadRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.path, "/root/test.txt");
-    }
-
-    #[test]
-    fn file_download_response_serialization() {
-        let resp = FileDownloadResponse {
-            data: "aGVsbG8=".into(),
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        let deser: FileDownloadResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(deser.data, "aGVsbG8=");
     }
 }

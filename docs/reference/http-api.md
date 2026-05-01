@@ -123,33 +123,13 @@ Success: `200 OK` with:
 }
 ```
 
-### `POST /sessions/{id}/upload` — upload a file into the session
+### File transfer
 
-Request body:
-
-```json
-{
-  "path": "/home/agent/note.txt",
-  "data": "aGVsbG8K",
-  "mode": 420
-}
-```
-
-`data` is base64-encoded file contents. `mode` is an optional Unix permission bitset (e.g. `420` = `0o644`). Session must be `running`.
-
-Success: `200 OK` with `{ "status": "ok", "message": "file uploaded to <path>" }`.
-
-### `POST /sessions/{id}/download` — download a file out of the session
-
-Request body:
-
-```json
-{ "path": "/home/agent/note.txt" }
-```
-
-Session must be `running`.
-
-Success: `200 OK` with `{ "data": "<base64>" }`.
+The daemon does not expose HTTP endpoints for file transfer. The CLI's
+`sandbox cp` and `sandbox sync` commands dispatch directly to the
+backend's native copy tool (`limactl cp` / `docker cp`) or to host
+`rsync` over the backend's native shell — see the [CLI
+reference](/reference/cli/#sandbox-cp).
 
 ### `GET /sessions/{id}/health` — detailed health
 
