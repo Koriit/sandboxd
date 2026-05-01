@@ -86,6 +86,28 @@ fn sandboxd_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_sandboxd"))
 }
 
+/// Canonical install path of the test-cap'd route helper, populated by
+/// `make install-route-helper-test-cap`. Tests #2 and #4 (`force_flag_overrides`
+/// and `default_hardened_docker_proceeds`) point the daemon here via
+/// `SANDBOX_ROUTE_HELPER_PATH` so the helper's `users.conf` authorization
+/// flow reads the SAME tempfile config the daemon uses — otherwise the
+/// helper denies the route install with "gateway ip <test-subnet> not in
+/// any subnet". The production-feature helper at
+/// `/usr/local/libexec/sandboxd/sandbox-route-helper` ignores
+/// `SANDBOX_USERS_CONF` (privilege boundary: a cap'd helper must not be
+/// redirectable to an attacker-controlled config file via a process-
+/// environment variable); the test-cap'd helper here is built with the
+/// `test-env-override` feature and therefore consults `SANDBOX_USERS_CONF`,
+/// which keeps the daemon's allocator pool and the helper's auth check on
+/// the same tempfile config without weakening the production privilege
+/// boundary. Tests #1 and #5 (`session_create_refused` and
+/// `probe_failure_surfaces_as_gateway_error`) reject before
+/// `setup_session_networking` runs and never invoke the route helper, so
+/// they leave the env var unset. See
+/// `sandbox-route-helper/tests/integration_route_helper.rs` for the same
+/// path constant on the helper side.
+const TEST_ROUTE_HELPER_PATH: &str = "/usr/local/libexec/sandboxd-test/sandbox-route-helper";
+
 /// Path to the `sandbox` CLI binary. The CLI lives in a sibling
 /// package (`sandbox-cli`) so `CARGO_BIN_EXE_sandbox` is **not**
 /// available for this test crate. Cargo always emits both binaries
@@ -187,29 +209,6 @@ impl Daemon {
             .env("XDG_DATA_HOME", tmp.path())
             .env("XDG_RUNTIME_DIR", tmp.path())
             .env("SANDBOX_USERS_CONF", &users_conf)
-            // M11-S9 — the production-feature route helper at
-            // `/usr/local/libexec/sandboxd/sandbox-route-helper` ignores
-            // `SANDBOX_USERS_CONF` (privilege boundary: a cap'd helper
-            // must not be redirectable to an attacker-controlled config
-            // file via a process-environment variable). Tests #2, #4
-            // run a real lite session and need the helper's
-            // authorization flow to read the SAME tempfile users.conf
-            // the daemon uses, otherwise the helper denies the route
-            // install with "gateway ip <test-subnet> not in any
-            // subnet". Pointing the daemon at the test-cap'd helper
-            // (which is built with the `test-env-override` feature and
-            // therefore consults `SANDBOX_USERS_CONF`) keeps the
-            // daemon's allocator pool and the helper's auth check on
-            // the same tempfile config without weakening the
-            // production privilege boundary. The test-cap'd helper
-            // lives at the canonical test install path that
-            // `make install-route-helper-test-cap` populates; see
-            // `sandbox-route-helper/tests/integration_route_helper.rs`
-            // for the same path constant.
-            .env(
-                "SANDBOX_ROUTE_HELPER_PATH",
-                "/usr/local/libexec/sandboxd-test/sandbox-route-helper",
-            )
             // Keep the log volume modest — `info` is enough to debug a
             // stuck startup, `debug` would flood the file with per-poll
             // chatter.
@@ -526,7 +525,12 @@ fn integration_rootless_docker_session_create_refused() {
 #[test]
 fn integration_rootless_docker_force_flag_overrides() {
     let _stub = DockerPathStub::new(DockerInfoBehavior::ReportRootless);
-    let daemon = Daemon::spawn(|_cmd| {});
+    // Test runs a real lite session that invokes the route helper, so
+    // point the daemon at the test-cap'd helper; see the doc comment on
+    // `TEST_ROUTE_HELPER_PATH` for the privilege-boundary rationale.
+    let daemon = Daemon::spawn(|cmd| {
+        cmd.env("SANDBOX_ROUTE_HELPER_PATH", TEST_ROUTE_HELPER_PATH);
+    });
 
     let session_name = "rootless-forced";
     let cleanup = SessionCleanupGuard::new(&daemon, session_name);
@@ -663,7 +667,12 @@ fn integration_rootless_docker_force_flag_rejected_on_lima() {
 #[test]
 fn integration_default_hardened_docker_proceeds() {
     let _stub = DockerPathStub::new(DockerInfoBehavior::ReportDefault);
-    let daemon = Daemon::spawn(|_cmd| {});
+    // Test runs a real lite session that invokes the route helper, so
+    // point the daemon at the test-cap'd helper; see the doc comment on
+    // `TEST_ROUTE_HELPER_PATH` for the privilege-boundary rationale.
+    let daemon = Daemon::spawn(|cmd| {
+        cmd.env("SANDBOX_ROUTE_HELPER_PATH", TEST_ROUTE_HELPER_PATH);
+    });
 
     let session_name = "default-hardened";
     let cleanup = SessionCleanupGuard::new(&daemon, session_name);

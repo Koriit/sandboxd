@@ -295,9 +295,6 @@ const ROUTE_HELPER_INSTALL_PATH: &str = "/usr/local/libexec/sandboxd/sandbox-rou
 /// and unusual deployments; production operators should not set it.
 const ROUTE_HELPER_PATH_ENV: &str = "SANDBOX_ROUTE_HELPER_PATH";
 
-/// Bare-name of the helper binary, used in error-message context.
-const ROUTE_HELPER_BINARY_NAME: &str = "sandbox-route-helper";
-
 /// Linux capability bit number for `CAP_SYS_ADMIN`, the only capability
 /// the route helper requires. Hard-coded rather than pulled from a
 /// crate constant because no workspace dep exposes the kernel
@@ -383,7 +380,7 @@ where
         return Ok(install_path.to_path_buf());
     }
     Err(SandboxError::Internal(format!(
-        "no usable {ROUTE_HELPER_BINARY_NAME} found at the canonical install \
+        "no usable sandbox-route-helper found at the canonical install \
          path {install}. The file must exist as a regular file AND carry the \
          CAP_SYS_ADMIN file capability (effective). Install it with: \
          `make install-route-helper-prod-cap` (production) or set \
@@ -7144,6 +7141,122 @@ mod tests {
                 );
             }
             other => panic!("expected SandboxError::Internal, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Outer wrapper: `resolve_route_helper_path()`.
+    //
+    // The four-corner tests above drive the inner `_from` resolver with
+    // a stub predicate; this test pins the outer wrapper that reads
+    // `$SANDBOX_ROUTE_HELPER_PATH` and feeds it (along with the real
+    // `has_required_caps` predicate) into the inner. We mirror the
+    // `unsafe set_var/restore` pattern used by
+    // `users_conf_path_honors_env_override` in
+    // `sandbox-core/src/users_conf.rs`. Setting/unsetting env vars in
+    // Rust 2024 is unsafe due to cross-thread races; we accept the risk
+    // in a unit test that does not spawn other env-reading threads.
+    //
+    // We assert via error-message content because a hermetic unit test
+    // cannot `setcap` a fixture file (`CAP_SETFCAP` is unavailable in
+    // typical runners and the workspace often lives on a filesystem
+    // where `setcap` returns "Operation not supported"). Pointing the
+    // env var at a path that definitely does not exist makes
+    // `has_required_caps` return false deterministically, so the outer
+    // takes the env-set fail-closed branch and surfaces the env-named
+    // error — proving the env read happened and that the inner saw the
+    // env override.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_route_helper_path_reads_env_var_when_set() {
+        // SAFETY: see the rationale on `users_conf_path_honors_env_override`
+        // in `sandbox-core/src/users_conf.rs`.
+        let prev = std::env::var(ROUTE_HELPER_PATH_ENV).ok();
+        let env_path = "/tmp/sandbox-route-helper-outer-env-read-test-DOES-NOT-EXIST";
+        unsafe {
+            std::env::set_var(ROUTE_HELPER_PATH_ENV, env_path);
+        }
+
+        let result = resolve_route_helper_path();
+
+        // Restore env state before any assertion can panic — otherwise a
+        // failing assertion leaks the env mutation into other tests in
+        // the same process.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(ROUTE_HELPER_PATH_ENV, v),
+                None => std::env::remove_var(ROUTE_HELPER_PATH_ENV),
+            }
+        }
+
+        match result {
+            Err(SandboxError::Internal(msg)) => {
+                assert!(
+                    msg.contains(env_path),
+                    "outer must consult $SANDBOX_ROUTE_HELPER_PATH and surface the \
+                     env-set path on fail-closed; got: {msg}"
+                );
+                assert!(
+                    msg.contains(ROUTE_HELPER_PATH_ENV),
+                    "outer must name the env var so the operator knows what to fix; got: {msg}"
+                );
+            }
+            Ok(path) => panic!(
+                "env-set path is non-existent so the resolver must NOT return Ok; got: {}",
+                path.display()
+            ),
+            Err(other) => panic!("expected SandboxError::Internal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_route_helper_path_falls_back_to_canonical_when_env_unset() {
+        // SAFETY: see the rationale on `users_conf_path_honors_env_override`
+        // in `sandbox-core/src/users_conf.rs`.
+        let prev = std::env::var(ROUTE_HELPER_PATH_ENV).ok();
+        let unique_marker = "/tmp/sandbox-route-helper-outer-fallback-test-MARKER-NOT-IN-CANONICAL";
+        unsafe {
+            std::env::remove_var(ROUTE_HELPER_PATH_ENV);
+        }
+
+        let result = resolve_route_helper_path();
+
+        // Restore env state before any assertion can panic.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(ROUTE_HELPER_PATH_ENV, v),
+                None => std::env::remove_var(ROUTE_HELPER_PATH_ENV),
+            }
+        }
+
+        // Two acceptable outcomes depending on host state:
+        //   * canonical install present and cap'd → Ok(canonical_path)
+        //   * canonical install absent or un-cap'd → Err(message naming canonical)
+        // In neither case may the result reference the env-set marker
+        // path (we removed the env var, so the env-set branch must not
+        // fire). That is the seam under test.
+        match result {
+            Ok(path) => {
+                assert_eq!(
+                    path,
+                    PathBuf::from(ROUTE_HELPER_INSTALL_PATH),
+                    "env unset and canonical usable ⇒ resolver must return the canonical \
+                     install path verbatim; got: {}",
+                    path.display(),
+                );
+            }
+            Err(SandboxError::Internal(msg)) => {
+                assert!(
+                    msg.contains(ROUTE_HELPER_INSTALL_PATH),
+                    "env-unset error must name the canonical install path; got: {msg}"
+                );
+                assert!(
+                    !msg.contains(unique_marker),
+                    "env-unset branch must not surface any env-derived path; got: {msg}"
+                );
+            }
+            Err(other) => panic!("expected SandboxError::Internal, got {other:?}"),
         }
     }
 
