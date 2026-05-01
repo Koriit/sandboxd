@@ -318,7 +318,7 @@ Preset expansion happens entirely client-side — the daemon receives the fully-
 
 ### Built-in catalog
 
-Ten built-ins ship with every CLI release. Run `sandbox policy preset list` to see them, and `sandbox policy preset show <name>` for per-preset metadata.
+Eleven built-ins ship with every CLI release. Run `sandbox policy preset list` to see them, and `sandbox policy preset show <name>` for per-preset metadata.
 
 Unparameterized ecosystem presets:
 
@@ -341,6 +341,20 @@ GitHub family:
 | `github:` | Broad GitHub access: `github.com` and `api.github.com` with `ANY /**`, plus read-only access to the asset CDN hosts (`codeload.github.com`, `raw.githubusercontent.com`, `objects.githubusercontent.com`, `release-assets.githubusercontent.com`). |
 | `github-repo:repo=OWNER/REPO` | One-repo scope. Required repeatable `repo=owner/name` param — each value contributes its path filters. Covers git-pack URLs, the repo's REST API subtree, archive downloads, and raw-content reads. |
 | `github-pr:repo=OWNER/REPO,pr=N` | One-PR scope. Paired repeatable `repo=` / `pr=` params — both required, counts must match. Grants access to a single PR's metadata, comments, and files, nothing more (no git clone/fetch/push, no archive download). |
+
+OS / distro presets:
+
+| Preset | Purpose |
+|---|---|
+| `ubuntu:` | Default-allow rules an Ubuntu sandbox needs to function. Two NTP rules (UDP/123 to `ntp.ubuntu.com` and `time.ubuntu.com`) so `systemd-timesyncd` / `chrony` can sync the clock, plus two apt-mirror rules (HTTPS/443 to `archive.ubuntu.com` and `security.ubuntu.com`) so a stock 22.04+ `/etc/apt/sources.list` can run `apt update` and `apt install`. |
+
+Use `ubuntu:` whenever you boot a session against an Ubuntu image and need the host distro's own housekeeping (clock sync + mirror reads) to keep working — for example, when an agent's first action is `apt install build-essential`. The preset is intentionally minimal: it does not allow snap (`api.snapcraft.io`), livepatch (`livepatch.canonical.com`), or changelog fetches (`changelogs.ubuntu.com`); add explicit rules for those if your workload needs them. The preset is unparameterized like `npm:` / `pypi:` — there is no `ubuntu:release=...` or `ubuntu:mirror=...` knob in v1.
+
+```bash
+sandbox create --image ubuntu --preset 'ubuntu:'
+```
+
+Stack `ubuntu:` alongside any number of ecosystem or GitHub presets — for example `--preset 'ubuntu:' --preset 'npm:' --preset 'github-repo:repo=acme/widget'` to give an agent a working clock + apt + npm registry + one repo's git-pack URLs.
 
 The authoritative host and filter lists live in the CLI source at `sandboxd/sandbox-cli/src/presets/builtin.rs`; the exact shape of each expansion is also visible on demand via `sandbox policy preset expand '<invocation>'`.
 

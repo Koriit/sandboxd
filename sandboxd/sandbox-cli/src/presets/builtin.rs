@@ -11,12 +11,14 @@
 //!
 //! # Relationship to the spec
 //!
-//! The 10 entries mirror Part 2 of the spec at
+//! The first 10 entries mirror Part 2 of the spec at
 //! `.tasks/specs/2026-04-21-port-explicit-policies-presets-observability-design.md`
 //! lines 428-568. The plain `github` preset unifies the two rows in
 //! the spec's table (interactive hosts + asset CDN) under a single
 //! preset name; operators who need narrower scope than `github:`
-//! use `github-repo` / `github-pr` instead.
+//! use `github-repo` / `github-pr` instead. The 11th entry, `ubuntu`,
+//! was added in M12-S4 (`docs/internal/milestones/M12.md` § M12-S4)
+//! as the first distro-level default-allow preset.
 //!
 //! # Determinism
 //!
@@ -116,6 +118,12 @@ pub const BUILTINS: &[BuiltinPreset] = &[
         name: "github-pr",
         description: "Allow GitHub access scoped to specific pull requests (params: repo=owner/name, pr=N).",
         expand: expand_github_pr,
+    },
+    // ----- OS / distro presets (M12-S4) ------------------------------
+    BuiltinPreset {
+        name: "ubuntu",
+        description: "Allow default-allow rules an Ubuntu sandbox needs to function (NTP + apt mirrors).",
+        expand: expand_ubuntu,
     },
 ];
 
@@ -630,6 +638,91 @@ fn is_positive_integer(s: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// ubuntu (unparameterized; M12-S4)
+// ---------------------------------------------------------------------------
+//
+// Default-allow rules an Ubuntu sandbox needs to function. Two
+// concerns are covered:
+//
+//   * NTP — UDP/123 to the canonical Ubuntu pool / vendor hosts.
+//     Sequencing note: the UDP allow-path datapath shipped in M12-S2
+//     (allowed UDP exits direct to upstream via `policy_allow_udp`,
+//     no Envoy hop). Without S2's datapath this rule would fail
+//     closed at the gateway; with it, the rule allows actual NTP
+//     traffic.
+//
+//   * apt — HTTPS/443 to the canonical Ubuntu mirrors used by stock
+//     `/etc/apt/sources.list` on Ubuntu 22.04+. `tls`-level (not
+//     `http`-level) because apt's debian-installer / signed-package
+//     fetches are opaque blobs that don't benefit from
+//     method/path-level inspection, and apt's transport already
+//     verifies repo signatures end-to-end.
+//
+// Implementation-phase decisions (M12-S4 plan lines 132-133):
+//
+//   * **HTTP/80 for first-boot apt: omitted.** Modern Ubuntu's stock
+//     sources.list uses `https://` mirrors on 22.04+ (the test base
+//     image is 24.04 per `lima.rs`), and apt's transport defaults
+//     fetch over HTTPS first. Without an easy way to verify the
+//     negative path on a fresh base image, the spec prescribes
+//     defaulting to omit.
+//
+//   * **snap / livepatch / changelogs: omitted.** The spec says
+//     scope by what an unmodified Ubuntu base image actually opens
+//     during the first 60 s of boot + a sample `apt update` cycle;
+//     without an easy way to measure that here, default to omit.
+//     Real workloads that hit `api.snapcraft.io` etc. add a project
+//     policy rule explicitly; the preset can grow later if those
+//     hosts turn out to be load-bearing for the typical Ubuntu agent
+//     workflow.
+//
+// The preset is unparameterized like `npm` / `pypi`. A future
+// parameterized variant (`ubuntu:release=24.04` / `ubuntu:mirror=...`)
+// is explicitly out of scope for v1.
+
+/// NTP hosts for the `ubuntu` preset. UDP/123. The two canonical
+/// vendor hosts published in `/etc/systemd/timesyncd.conf.d/` on a
+/// fresh Ubuntu install.
+const UBUNTU_NTP_HOSTS: &[&str] = &["ntp.ubuntu.com", "time.ubuntu.com"];
+
+/// apt mirror hosts for the `ubuntu` preset. HTTPS/443. The two
+/// canonical hosts referenced from a stock 22.04+ sources.list:
+/// `archive.ubuntu.com` for the main / universe / multiverse
+/// repositories and `security.ubuntu.com` for the
+/// `*-security` repository.
+const UBUNTU_APT_HOSTS: &[&str] = &["archive.ubuntu.com", "security.ubuntu.com"];
+
+/// Build a UDP/transport rule for `(host, port)`. Mirrors the shape
+/// `http_rule` / `tls_rule` use for TCP rules — kept as a tiny named
+/// helper so the rule defaults (`reason: None`, transport-level)
+/// stay in one place if the preset grows other UDP hosts later.
+fn udp_transport_rule(host: &str, port: u16) -> PolicyRule {
+    PolicyRule {
+        host: Destination::Domain(host.to_string()),
+        port,
+        protocol: Protocol::Udp,
+        reason: None,
+        level: AssuranceLevel::Transport,
+    }
+}
+
+fn expand_ubuntu(_inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetError> {
+    let mut rules = Vec::with_capacity(UBUNTU_NTP_HOSTS.len() + UBUNTU_APT_HOSTS.len());
+    // NTP — UDP/123, transport-level (no L7 to inspect).
+    for host in UBUNTU_NTP_HOSTS {
+        rules.push(udp_transport_rule(host, 123));
+    }
+    // apt mirrors — HTTPS/443. tls-level: apt fetches signed indexes
+    // and packages whose URLs are deterministic but whose payloads
+    // don't benefit from method/path-level inspection (apt verifies
+    // signatures end-to-end above the transport).
+    for host in UBUNTU_APT_HOSTS {
+        rules.push(tls_rule(host));
+    }
+    Ok(rules)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -692,8 +785,9 @@ mod tests {
     // ----- unparameterized presets -----------------------------------
 
     #[test]
-    fn builtins_has_ten_entries() {
-        assert_eq!(BUILTINS.len(), 10);
+    fn builtins_has_eleven_entries() {
+        // 10 from the M10-S5 baseline + 1 for the M12-S4 `ubuntu` preset.
+        assert_eq!(BUILTINS.len(), 11);
     }
 
     #[test]
@@ -938,6 +1032,99 @@ mod tests {
             ],
         );
         assert_rules_round_trip(rules);
+    }
+
+    // ----- ubuntu (unparameterized; M12-S4) ---------------------------
+
+    /// The `ubuntu` preset is structurally distinct from every other
+    /// unparameterized built-in: it mixes UDP/transport rules (NTP) with
+    /// TCP/tls rules (apt mirrors), so it does not fit the
+    /// `assert_consume_posture` shape used by `npm`/`pypi`/etc. The
+    /// test asserts the expected rules explicitly — host, port,
+    /// protocol, and assurance level — so a typo or shape drift fails
+    /// loudly.
+    #[test]
+    fn expand_ubuntu_matches_spec() {
+        let rules = expand_builtin("ubuntu", "ubuntu:");
+
+        // Two NTP rules + two apt rules, in source-order. The preset
+        // emits in a fixed sequence (UBUNTU_NTP_HOSTS then
+        // UBUNTU_APT_HOSTS) so the test pins the order.
+        assert_eq!(
+            rules.len(),
+            4,
+            "ubuntu must emit four host rules (2 NTP + 2 apt mirrors); got {} rules: {rules:?}",
+            rules.len()
+        );
+
+        // Rule 0: NTP — ntp.ubuntu.com:123/udp transport.
+        let ntp_a = &rules[0];
+        match &ntp_a.host {
+            Destination::Domain(d) => assert_eq!(d, "ntp.ubuntu.com"),
+            other => panic!("expected Domain(ntp.ubuntu.com), got {other:?}"),
+        }
+        assert_eq!(ntp_a.port, 123);
+        assert_eq!(ntp_a.protocol, Protocol::Udp);
+        assert_eq!(ntp_a.level, AssuranceLevel::Transport);
+
+        // Rule 1: NTP — time.ubuntu.com:123/udp transport.
+        let ntp_b = &rules[1];
+        match &ntp_b.host {
+            Destination::Domain(d) => assert_eq!(d, "time.ubuntu.com"),
+            other => panic!("expected Domain(time.ubuntu.com), got {other:?}"),
+        }
+        assert_eq!(ntp_b.port, 123);
+        assert_eq!(ntp_b.protocol, Protocol::Udp);
+        assert_eq!(ntp_b.level, AssuranceLevel::Transport);
+
+        // Rule 2: apt — archive.ubuntu.com:443/tcp tls.
+        let apt_a = &rules[2];
+        match &apt_a.host {
+            Destination::Domain(d) => assert_eq!(d, "archive.ubuntu.com"),
+            other => panic!("expected Domain(archive.ubuntu.com), got {other:?}"),
+        }
+        assert_eq!(apt_a.port, 443);
+        assert_eq!(apt_a.protocol, Protocol::Tcp);
+        assert_eq!(apt_a.level, AssuranceLevel::Tls);
+
+        // Rule 3: apt — security.ubuntu.com:443/tcp tls.
+        let apt_b = &rules[3];
+        match &apt_b.host {
+            Destination::Domain(d) => assert_eq!(d, "security.ubuntu.com"),
+            other => panic!("expected Domain(security.ubuntu.com), got {other:?}"),
+        }
+        assert_eq!(apt_b.port, 443);
+        assert_eq!(apt_b.protocol, Protocol::Tcp);
+        assert_eq!(apt_b.level, AssuranceLevel::Tls);
+
+        // The expansion must also be a structurally valid v2 policy on
+        // its own — same round-trip check the other unparameterized
+        // presets run.
+        assert_rules_round_trip(rules);
+    }
+
+    /// The `ubuntu` preset must not surprise-overlap the default-deny
+    /// baseline: every emitted rule's `(host, port)` identity is
+    /// unique within the preset's expansion. This is the equivalent of
+    /// the `(host, port)` uniqueness invariant `PolicyCompiler::validate`
+    /// enforces across the merged effective policy — pinned here at
+    /// the preset level so a future edit that accidentally duplicates
+    /// `archive.ubuntu.com:443` (e.g. by adding both an `:80` and
+    /// `:443` rule and getting one of them wrong) fails loudly in unit
+    /// tests rather than only at preset-merge time when the operator
+    /// runs `sandbox create`.
+    #[test]
+    fn ubuntu_preset_rules_are_unique_by_host_port() {
+        use std::collections::HashSet;
+        let rules = expand_builtin("ubuntu", "ubuntu:");
+        let mut seen: HashSet<(String, u16)> = HashSet::new();
+        for r in &rules {
+            let key = (r.host.to_string(), r.port);
+            assert!(
+                seen.insert(key.clone()),
+                "ubuntu preset emitted a duplicate (host, port) pair {key:?}: {rules:?}"
+            );
+        }
     }
 
     #[test]

@@ -1206,6 +1206,179 @@ def test_udp_allowed_ip_cidr_edge(sandbox_cli, backend):
             cleanup_policy_file(policy_path)
 
 
+# ---------------------------------------------------------------------------
+# `ubuntu:` preset smoke (M12-S4)
+# ---------------------------------------------------------------------------
+#
+# The `ubuntu:` preset adds the default-allow rules an Ubuntu sandbox
+# needs to function: NTP (UDP/123 to ntp.ubuntu.com / time.ubuntu.com)
+# and apt mirrors (HTTPS/443 to archive.ubuntu.com /
+# security.ubuntu.com). The preset was added in M12-S4 as the first
+# distro-level preset on top of the M10-S5 ten-preset baseline. See
+# `sandboxd/sandbox-cli/src/presets/builtin.rs::expand_ubuntu` for the
+# authoritative rule set and `docs/guides/network-policies.md` for
+# the user-facing description.
+#
+# This single end-to-end test exercises both halves of the preset:
+#
+#   1. apt update against the preset-allowed mirrors succeeds (TLS
+#      leg of the preset).
+#   2. A UDP/123 packet to one of the preset-allowed NTP hosts
+#      surfaces an allow event on the per-session bus (UDP allow-path
+#      leg of the preset, depends on M12-S2's nft-allow-logger
+#      landing).
+#
+# Backend coverage: Lima only — the apt-update half needs a real
+# Ubuntu base image, which the lite container backend does not boot
+# (it runs a different image stack). The UDP allow-path leg works on
+# both backends, but we keep the test single-backend so the apt half
+# stays meaningful; a future container-backend smoke for the
+# `dockerhub:` / `ubuntu:` overlap would be a separate test.
+
+
+@pytest.mark.timeout(600)
+def test_ubuntu_preset_smoke(sandbox_cli, backend):
+    """``sandbox create --preset 'ubuntu:'`` allows ``apt update`` against
+    the canonical Ubuntu mirrors and surfaces an allow event for a
+    UDP/123 packet to ``time.ubuntu.com``.
+
+    M12-S4 § "ubuntu policy preset" exit criteria: a sandboxed Ubuntu
+    VM with ``--preset 'ubuntu:'`` runs ``sudo apt update`` and an
+    NTP sync check, and both succeed. We assert the apt half via
+    ``apt-get update`` exit code (apt's HTTPS fetches the indexes
+    from the preset-allowed mirrors) and the NTP half via the
+    per-session event bus (the M12-S2 nft-allow-logger emits an
+    allow event for new conntrack flows; same shape
+    ``test_udp_allow_ntp`` pins).
+    """
+    # Lima only: the apt half needs a real Ubuntu base image. See the
+    # block comment above for the backend split rationale.
+    if backend != "lima":
+        pytest.skip(
+            "ubuntu: preset smoke is Lima-only — apt update needs the real "
+            "Ubuntu base image; container backend boots a different stack"
+        )
+
+    session_id = None
+    session_name = "ubuntu-preset-smoke"
+    try:
+        create_result = sandbox_cli(
+            "create",
+            *make_create_args(backend, session_name, "--preset", "ubuntu:"),
+            timeout=600,
+        )
+        assert create_result.returncode == 0, (
+            f"sandbox create --preset 'ubuntu:' failed (rc={create_result.returncode}).\n"
+            f"stdout: {create_result.stdout}\nstderr: {create_result.stderr}"
+        )
+        session_id = parse_session_id(create_result.stdout)
+        wait_for_state(sandbox_cli, session_name, "Running", timeout=30)
+
+        # Warm DNS for every preset-allowed host so the daemon's
+        # propagation loop materialises both nftables concat-set
+        # entries (UDP for NTP, TCP for apt mirrors) and the per-rule
+        # Envoy chains for the TLS-level apt rules. Without this
+        # warmup the first request can race the propagation poll.
+        # Mirrors the warmup pattern already used by
+        # ``test_udp_allow_ntp`` and the M10-S5 preset tests.
+        for host in (
+            "ntp.ubuntu.com",
+            "time.ubuntu.com",
+            "archive.ubuntu.com",
+            "security.ubuntu.com",
+        ):
+            nslookup = sandbox_cli(
+                "ssh", session_name, "--", "nslookup", host,
+                timeout=120,
+            )
+            assert nslookup.returncode == 0, (
+                f"nslookup for {host} failed inside VM under ubuntu preset.\n"
+                f"stdout: {nslookup.stdout}\nstderr: {nslookup.stderr}\n"
+                f"{capture_lima_logs(session_id)}"
+            )
+        time.sleep(5)
+
+        # apt half — `apt-get update` against the mirrors enabled by
+        # the preset. The base image's stock /etc/apt/sources.list is
+        # pinned at archive.ubuntu.com / security.ubuntu.com on
+        # 22.04+, both of which the preset allows; everything else
+        # (PPAs, snap, livepatch) is intentionally not part of the
+        # preset, so this command should succeed unmodified on a
+        # fresh image.
+        apt_update = sandbox_cli(
+            "ssh", session_name, "--",
+            "sudo", "apt-get", "update", "-q",
+            timeout=300,
+        )
+        assert apt_update.returncode == 0, (
+            f"sudo apt-get update failed under ubuntu preset (rc={apt_update.returncode}); "
+            f"this means the preset's apt-mirror rules did not cover what the base image's "
+            f"/etc/apt/sources.list actually fetches.\n"
+            f"stdout: {apt_update.stdout}\nstderr: {apt_update.stderr}\n"
+            f"{capture_lima_logs(session_id)}"
+        )
+
+        # NTP half — send one UDP/123 packet to time.ubuntu.com and
+        # assert an allow event lands on the bus. We resolve the host
+        # in the VM (matches the IP that gets placed in
+        # `policy_allow_udp` by the daemon's propagation loop) and
+        # then send a single packet, mirroring `test_udp_allow_ntp`.
+        nslookup = sandbox_cli(
+            "ssh", session_name, "--", "nslookup", "time.ubuntu.com",
+            timeout=120,
+        )
+        assert nslookup.returncode == 0
+        vm_resolved: list[str] = []
+        seen_name = False
+        for line in nslookup.stdout.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Name:"):
+                seen_name = True
+                continue
+            if seen_name:
+                m = re.match(
+                    r"Address(?:es)?(?:\s*\d+)?:\s*(\d{1,3}(?:\.\d{1,3}){3})$",
+                    stripped,
+                )
+                if m:
+                    vm_resolved.append(m.group(1))
+        assert vm_resolved, (
+            f"VM-side nslookup for time.ubuntu.com returned no A records.\n"
+            f"stdout: {nslookup.stdout}"
+        )
+        target_ip = vm_resolved[0]
+
+        send = _send_udp_packet(sandbox_cli, session_name, target_ip, 123)
+        assert send.returncode == 0, (
+            f"`sandbox ssh` wrapper failed when sending NTP packet.\n"
+            f"stdout: {send.stdout}\nstderr: {send.stderr}"
+        )
+
+        time.sleep(_UDP_EVENT_PROPAGATION_S)
+
+        allow_events = _read_session_events(
+            sandbox_cli, session_name, decision="allow",
+        )
+        ntp_allows = [
+            ev for ev in allow_events
+            if _is_nft_allow_for(ev, target_ip, 123, protocol="udp")
+        ]
+        assert ntp_allows, (
+            f"Expected at least one nft-allow-logger allow event for "
+            f"({target_ip}:123/udp) under ubuntu preset, but found none. "
+            f"Captured {len(allow_events)} allow events total; first 10:\n"
+            + "\n".join(json.dumps(ev) for ev in allow_events[:10])
+            + f"\n{capture_lima_logs(session_id)}"
+        )
+
+        sandbox_cli("rm", session_name, timeout=120)
+        session_id = None
+
+    finally:
+        if session_id is not None:
+            sandbox_cli("rm", session_name, timeout=120)
+
+
 @pytest.mark.timeout(600)
 def test_level2_tls_verified(sandbox_cli, backend):
     """Policy allows example.com at level 'tls'. HTTPS should succeed and the

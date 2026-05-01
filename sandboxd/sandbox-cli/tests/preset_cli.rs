@@ -231,7 +231,8 @@ async fn policy_preset_list_emits_every_builtin() {
     let (status, stdout, stderr) = run_sandbox(&["policy", "preset", "list"], None).await;
     assert!(status.success(), "exit: {status:?}\nstderr: {stderr}");
 
-    // The 10 built-ins shipped in M10-S5 Phase 3.
+    // The 10 built-ins shipped in M10-S5 Phase 3, plus the `ubuntu`
+    // distro preset added in M12-S4.
     let builtins = [
         "npm",
         "pypi",
@@ -243,6 +244,7 @@ async fn policy_preset_list_emits_every_builtin() {
         "github",
         "github-repo",
         "github-pr",
+        "ubuntu",
     ];
     for name in builtins {
         assert!(
