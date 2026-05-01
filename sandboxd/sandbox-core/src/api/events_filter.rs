@@ -1,7 +1,7 @@
 //! Domain predicate for the event stream filter.
 //!
 //! Callers build an [`EventsFilter`] from an
-//! [`EventsQueryDto`][super::events_query_dto::EventsQueryDto] via
+//! [`EventsQueryDto`] via
 //! [`EventsFilter::from_query`], which is the single conversion point
 //! where unknown layer / decision / event strings fail loud as
 //! [`crate::error::SandboxError::InvalidArgument`]. Downstream code

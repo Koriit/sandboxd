@@ -167,7 +167,7 @@ fn run() -> Result<(), String> {
 // Argv parsing
 // ---------------------------------------------------------------------------
 
-/// Parse the two positional arguments. argv[0] is the program name.
+/// Parse the two positional arguments. `argv[0]` is the program name.
 fn parse_argv(args: &[OsString]) -> Result<(i32, Ipv4Addr), String> {
     if args.len() != 3 {
         return Err("usage: sandbox-route-helper <container_pid> <gateway_ip>".to_string());

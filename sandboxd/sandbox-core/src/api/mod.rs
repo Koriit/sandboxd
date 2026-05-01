@@ -56,7 +56,7 @@ pub struct NetworkHealth {
 /// Wire-level response shape for
 /// `GET /sessions/{id}/policy/propagation-status`.
 ///
-/// Produced by the daemon ([`sandboxd::policy_http`]) and consumed by
+/// Produced by the daemon (`sandboxd::policy_http`) and consumed by
 /// the `sandbox policy status [--wait]` CLI subcommand and the E2E
 /// suite. Both sides share this type so a field rename at the HTTP
 /// layer cannot silently drift from the CLI's wait loop.

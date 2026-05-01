@@ -10,7 +10,7 @@
 //! # Semantics
 //!
 //! - **Per-session sink.** Each registered session owns a
-//!   [`SessionEventSink`] containing a bounded [`VecDeque`] ring buffer of
+//!   `SessionEventSink` containing a bounded [`VecDeque`] ring buffer of
 //!   recent events and a [`tokio::sync::broadcast::Sender`] that fans
 //!   events out to live subscribers.
 //! - **Atomic snapshot + subscribe.** [`EventBus::subscribe`] returns the
@@ -34,7 +34,7 @@
 //!   to a daemon-wide log).
 //! - **Publishing to an unregistered session drops silently.** This is
 //!   the correct shape for racy teardown: if the session was unregistered
-//!   between an ingester tailing a JSONL line and [`publish`] being called,
+//!   between an ingester tailing a JSONL line and [`EventBus::publish`] being called,
 //!   the event is simply discarded. No error surface is returned because
 //!   producers have nothing actionable to do.
 //!

@@ -31,9 +31,9 @@
 //! in-memory bus; a burst that outruns the disk is observable via the
 //! counter and the warn stream rather than backpressuring producers.
 //!
-//! The **sink** task owns the [`RotatingWriterMap`] and is the sole
+//! The **sink** task owns the `RotatingWriterMap` and is the sole
 //! writer — no interior locking is required. For each event it
-//! classifies the [`LayerKind`], renders the JSONL line via
+//! classifies the [`crate::api::LayerKind`], renders the JSONL line via
 //! [`event_to_jsonl_line`], and calls `write` on the rotating map.
 //! I/O errors are logged and swallowed; a one-off disk failure does
 //! not bring down the sink.

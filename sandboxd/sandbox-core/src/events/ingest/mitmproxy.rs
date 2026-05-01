@@ -1,7 +1,7 @@
 //! mitmproxy addon JSONL line parser.
 //!
 //! Parses one JSON object (one line of `mitmproxy.jsonl`) produced by
-//! the mitmproxy [`EventEmitter`] into a domain
+//! the mitmproxy `EventEmitter` into a domain
 //! [`crate::events::MitmproxyEvent`] wrapped in a
 //! [`TrafficEvent::Mitmproxy`], plus the `client_ip` used by the
 //! ingestor for session attribution.

@@ -16,7 +16,7 @@
 //!    [`JsonlTailer::new_at_eof`]).
 //! 3. Run a `tokio::select!` loop that:
 //!    a. Handles inotify events delivered through an mpsc channel.
-//!    On the first [`Create`] / [`Modify`] event for a known file
+//!    On the first `Create` / `Modify` event for a known file
 //!    name we have not already seen, spawn a
 //!    [`JsonlTailer::new_at_start`] for it. On any subsequent
 //!    event that touches a file we are already tailing, wake the

@@ -1359,7 +1359,7 @@ pub const KNOWN_COMPONENTS: &[(&str, &str)] = &[
 /// or `None` if `component` is not a recognised subcomponent name.
 ///
 /// Used by both [`GatewayManager::component_health`] (steady-state
-/// liveness polling) and [`GatewayManager::wait_for_components`]
+/// liveness polling) and `GatewayManager::wait_for_components`
 /// (startup readiness wait) — keeping both paths on the identical
 /// probe command per component.
 ///

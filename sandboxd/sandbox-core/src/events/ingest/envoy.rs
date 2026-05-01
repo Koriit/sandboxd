@@ -8,7 +8,7 @@
 //! # Source of truth
 //!
 //! The field map on the wire is authored in
-//! [`crate::policy::PolicyCompiler::l1_tcp_proxy_access_log_yaml`],
+//! `crate::policy::PolicyCompiler::l1_tcp_proxy_access_log_yaml`,
 //! `l2_…`, and `l3_…`. L3 adds `connect_authority`; the rest of the
 //! fields are identical across all three.
 //!

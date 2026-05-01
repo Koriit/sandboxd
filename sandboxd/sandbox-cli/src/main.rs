@@ -483,7 +483,7 @@ fn default_socket_path() -> String {
 /// 4. Call `presets::merge_effective` to combine the policy file + all
 ///    expansions into a single validated [`Policy`].
 ///
-/// Any [`PresetError`] along the way prints its `Display` impl to
+/// Any [`presets::PresetError`] along the way prints its `Display` impl to
 /// stderr and calls `process::exit(1)` **before** returning. The
 /// error wording is spec-mandated (Part 1 lines 140-150, Part 2
 /// "Error shapes"), so we defer to `PresetError`'s `Display` impl
@@ -1033,7 +1033,7 @@ fn display_session(session: &SessionDto) {
     );
 }
 
-/// Render a [`SessionConfigDto`]'s `cpus` field for human-readable
+/// Render a [`sandbox_core::SessionConfigDto`]'s `cpus` field for human-readable
 /// `sandbox describe` / inspect output.
 ///
 /// The container backend uses `0`/`0.0` as the "operator did not pass
@@ -1074,7 +1074,7 @@ fn format_cpus_field(config: &sandbox_core::SessionConfigDto) -> String {
     }
 }
 
-/// Render a [`SessionConfigDto`]'s `memory_mb` field with the same
+/// Render a [`sandbox_core::SessionConfigDto`]'s `memory_mb` field with the same
 /// "stored 0 → daemon default" rule as [`format_cpus_field`].
 fn format_memory_field(config: &sandbox_core::SessionConfigDto) -> String {
     if config.memory_mb == 0 {
@@ -3638,7 +3638,7 @@ async fn handle_sync(socket_path: &str, src: &str, dst: &str) {
 }
 
 /// Check whether this binary was invoked as `git-remote-sandbox` (i.e. as a
-/// git remote helper).  Returns `true` if argv[0] ends with
+/// git remote helper).  Returns `true` if `argv[0]` ends with
 /// `git-remote-sandbox`, in which case the caller should enter remote-helper
 /// mode instead of normal CLI parsing.
 fn invoked_as_remote_helper() -> bool {
@@ -3924,7 +3924,7 @@ struct RebuildDispatchOutcome {
     /// `true` iff every selected backend's HTTP call succeeded.
     all_ok: bool,
     /// One stderr line per backend, in dispatch order. Pre-formatted
-    /// per spec ("rebuild-image[<kind>]: ..." for failures, plain
+    /// per spec (`rebuild-image[<kind>]: ...` for failures, plain
     /// status for successes).
     lines: Vec<String>,
 }
@@ -3933,7 +3933,7 @@ struct RebuildDispatchOutcome {
 /// the unit tests can substitute the HTTP call.
 ///
 /// `send` is the per-backend transport: it receives the
-/// [`BackendKind`] and the JSON body string the daemon expects,
+/// [`sandbox_core::BackendKind`] and the JSON body string the daemon expects,
 /// returns either the daemon's success body (which is currently a
 /// short status string) or an error message ready to splice into the
 /// `rebuild-image[<kind>]:` prefix.
@@ -4024,7 +4024,7 @@ async fn send_rebuild_image_request(
 ///    reaches the daemon.
 /// 3. Lazily fetch `/backends` once via [`BackendsCache`] and project
 ///    the operator's flags into a [`sandbox_core::SessionSpec`].
-/// 4. Run [`SessionSpec::validate`] against the cached capabilities;
+/// 4. Run [`sandbox_core::SessionSpec::validate`] against the cached capabilities;
 ///    on `Err`, render the spec's `error:`+`help:` shape and exit 2.
 ///
 /// Returns `Ok(())` when every gate passes; the caller proceeds to

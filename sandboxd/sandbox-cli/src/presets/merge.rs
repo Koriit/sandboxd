@@ -1,6 +1,6 @@
 //! Effective-policy merger and `(host, port)` uniqueness gate.
 //!
-//! The [`expand`] module per invocation is intentionally permissive —
+//! The [`mod@super::expand`] module per invocation is intentionally permissive —
 //! two presets may legitimately emit
 //! overlapping `(host, port)` rows (e.g. `github:` and
 //! `github-repo:repo=foo/bar` both declare `api.github.com:443`), and
@@ -79,7 +79,7 @@ use super::{Catalog, DuplicateDestination, ParsedInvocation, Preset, PresetError
 ///   [`RuleSource`] attached to each expanded rule distinguishes
 ///   built-in from user-preset origin.
 /// - `expansions` — a slice of `(invocation, rules)` pairs.  Caller is
-///   expected to pre-compute the expansions via [`super::expand`]
+///   expected to pre-compute the expansions via [`super::expand()`]
 ///   — we do not re-expand here because the caller may want to run
 ///   each expansion through `sandbox policy preset expand`-style
 ///   diagnostics before committing to the merge.  Order is preserved:

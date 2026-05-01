@@ -1,7 +1,7 @@
 //! CoreDNS policy-plugin JSONL line parser.
 //!
 //! Parses one JSON object (one line of `coredns.jsonl`) produced by the
-//! CoreDNS `sandboxpolicy` plugin's [`EventWriter`] into a domain
+//! CoreDNS `sandboxpolicy` plugin's `EventWriter` into a domain
 //! [`crate::events::DnsEvent`] wrapped in a [`TrafficEvent::Dns`], plus
 //! the `client_ip` used by the ingestor for session attribution.
 //!

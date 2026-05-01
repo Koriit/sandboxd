@@ -245,7 +245,7 @@ impl SessionStore {
     ///
     /// If the generated 12-hex ID collides with an existing session (rare but
     /// possible with 48 bits of entropy), the session is regenerated and
-    /// re-inserted up to [`INSERT_COLLISION_RETRIES`] times before failing.
+    /// re-inserted up to `INSERT_COLLISION_RETRIES` times before failing.
     pub fn create_session(
         &self,
         config: SessionConfig,
@@ -258,7 +258,7 @@ impl SessionStore {
         self.create_session_with_backend(config, name, crate::backend::BackendKind::Lima)
     }
 
-    /// Like [`create_session`], but lets the caller pin which backend
+    /// Like [`Self::create_session`], but lets the caller pin which backend
     /// owns the session. Threaded through by the `POST /sessions`
     /// handler so the container path persists `backend = 'container'`
     /// rather than relying on the SQL `DEFAULT 'lima'`.
@@ -384,7 +384,7 @@ impl SessionStore {
     /// `SandboxError::InvalidState` if the transition is not valid.
     ///
     /// For reconciliation or crash-recovery code that must force a state
-    /// regardless of the current value, use [`update_state_forced`] instead.
+    /// regardless of the current value, use [`Self::update_state_forced`] instead.
     pub fn update_state(
         &self,
         id: &SessionId,
@@ -428,7 +428,7 @@ impl SessionStore {
     /// This is intended **only** for reconciliation and crash-recovery code
     /// that must align the DB with external reality (e.g. a VM that was
     /// found running when the DB says Stopped).  Normal handler code should
-    /// use [`update_state`] which enforces the state machine.
+    /// use [`Self::update_state`] which enforces the state machine.
     pub fn update_state_forced(
         &self,
         id: &SessionId,
@@ -459,7 +459,7 @@ impl SessionStore {
     /// 1. If `query` is a full 12-char session ID, try exact ID lookup.
     /// 2. Otherwise, try exact name lookup.
     /// 3. If still not found and `query` looks like a hex prefix (1..=12
-    ///    lowercase hex chars), try [`resolve_id_prefix`]. Returns the matching
+    ///    lowercase hex chars), try [`Self::resolve_id_prefix`]. Returns the matching
     ///    session if exactly one ID has this prefix.
     ///
     /// Returns `None` if no session matches. Returns

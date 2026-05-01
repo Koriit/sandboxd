@@ -18,8 +18,8 @@
 //! # Writer invariant
 //!
 //! Between any two listener generations, **only the region between
-//! [`policy::FILTER_CHAINS_BEGIN_MARKER`] and
-//! [`policy::FILTER_CHAINS_END_MARKER`] may differ.** Changes outside
+//! [`crate::policy::FILTER_CHAINS_BEGIN_MARKER`] and
+//! [`crate::policy::FILTER_CHAINS_END_MARKER`] may differ.** Changes outside
 //! that region (bind address, `listener_filters`, `metadata`,
 //! `socket_options`, `traffic_direction`,
 //! `per_connection_buffer_limit_bytes`, etc.) cause Envoy to treat the
@@ -41,7 +41,7 @@
 //! placement — not in-flight-connection preservation. The DNS-rotation
 //! propagation redesign treats connection survival across rewrites as
 //! a quality-of-implementation concern. See the rustdoc on
-//! [`policy::PolicyCompiler::compile_envoy_listener`] for the empirical
+//! [`crate::policy::PolicyCompiler::compile_envoy_listener`] for the empirical
 //! evidence captured in
 //! `integration_gateway_lds_listener_and_atomic_rewrite`.
 //!

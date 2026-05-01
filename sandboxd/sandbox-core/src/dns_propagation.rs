@@ -321,9 +321,9 @@ pub fn read_resolved_json(session_id: &SessionId) -> Result<ResolvedReport, Sand
 /// This produces the full two-table ruleset (`sandbox_dnat` +
 /// `sandbox_policy`) that admits traffic to the resolved IPs for
 /// domains in the policy, joined with the rule's explicit port
-/// (v2 schema). The shape matches [`PolicyCompiler::compile_nftables`]
+/// (v2 schema). The shape matches `PolicyCompiler::compile_nftables`
 /// byte-for-byte — both entry points delegate to the shared
-/// [`render_two_table_ruleset`] helper so the chains stay in lockstep.
+/// `render_two_table_ruleset` helper so the chains stay in lockstep.
 ///
 /// **Shape.** Per-destination allowance lives in two nftables concat
 /// sets keyed on `ipv4_addr . inet_service`, one per L4 protocol

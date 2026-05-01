@@ -19,7 +19,7 @@
 //!
 //! # Placement and reachability
 //!
-//! This module is a sibling of [`super::container`] and is **only**
+//! This module is a sibling of [`crate::backend::container`] and is **only**
 //! consumed by the container backend's session-create path. It is
 //! **not** re-exported via [`super`] and Lima code paths never reach
 //! it — the structural decision keeps the probe container-only by
@@ -27,7 +27,7 @@
 //!
 //! # Public API (consumed by the session-create handler)
 //!
-//! - [`is_rootless_docker`] — async, returns `Ok(true)` on rootless
+//! - [`crate::backend::container_rootless_probe::is_rootless_docker`] — async, returns `Ok(true)` on rootless
 //!   hosts, `Ok(false)` on default-hardened hosts, and a typed
 //!   [`SandboxError::Gateway`] if `docker info` itself fails. Probe
 //!   failure is **never** treated as "not rootless" — the caller
@@ -35,7 +35,7 @@
 //!   unreachable" diagnostic rather than a silent default that could
 //!   later create a session against an unsupported environment.
 //!
-//! - [`reset_cache_for_tests`] (test-only) — clears the cache so a
+//! - [`crate::backend::container_rootless_probe::reset_cache_for_tests`] (test-only) — clears the cache so a
 //!   single test process can run multiple probes against different
 //!   PATH-stub configurations.
 //!
@@ -53,7 +53,7 @@
 //!   `SandboxError` is intentionally not [`Clone`].
 //!
 //! `Mutex<Option<...>>` is preferred over `OnceLock<Result<...>>`
-//! because the test-only [`reset_cache_for_tests`] path needs a sound
+//! because the test-only [`crate::backend::container_rootless_probe::reset_cache_for_tests`] path needs a sound
 //! way to invalidate the cache without `unsafe` reference-casting; an
 //! explicit interior-mutability primitive is the idiomatic answer.
 //! The mutex contention is benign: the critical section is a single

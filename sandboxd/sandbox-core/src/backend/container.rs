@@ -184,7 +184,7 @@ pub struct ContainerNetwork {
     pub gateway_ip: IpAddr,
     /// Optional host path bound into `/home/agent/workspace/` inside
     /// the container. `None` means no workspace bind. Aligned with the
-    /// spec's [`WorkspaceMode::Shared`] semantics — the bind target is
+    /// spec's [`crate::session::WorkspaceMode::Shared`] semantics — the bind target is
     /// unified with Lima's workspace mount across both backends, so
     /// an operator's `--workspace shared:<path>` lands at the same
     /// in-guest path regardless of the backend they chose.
@@ -1038,13 +1038,13 @@ async fn invoke_route_helper(
 ///
 /// Internal type for the cpu default is `f64` so the spec's one-decimal
 /// precision survives all the way to docker's `--cpus <n>` flag (see
-/// [`format_cpus`]). The wire-level [`BackendSpecific::Container`]
+/// `format_cpus`). The wire-level [`BackendSpecific::Container`]
 /// field is `f32` (widened from a historical `u32`), so an explicit
 /// operator-supplied fractional value (e.g. `--cpus 1.5`) reaches
 /// `format_cpus` without truncation. The implicit-default path
 /// (operator omits `--cpus`, request boundary stamps `0.0`) still
 /// resolves to this function's return value via
-/// [`ContainerRuntime::resource_ceilings`]'s `0.0 → default_cpus` arm.
+/// `ContainerRuntime::resource_ceilings`'s `0.0 → default_cpus` arm.
 ///
 /// Best-effort fallbacks keep the daemon bootable even on hosts where
 /// /proc/meminfo or `available_parallelism` is unavailable: a 4096 MB
@@ -1196,7 +1196,7 @@ fn container_image_lock() -> &'static Mutex<()> {
 ///   sequence; concurrent calls with the same tag observe exactly one
 ///   `Built` outcome and `AlreadyPresent` for the rest.
 /// - Build context: a fresh `tempfile::TempDir` populated with the
-///   embedded [`LITE_DOCKERFILE`] and the `sandbox-guest` binary
+///   embedded `LITE_DOCKERFILE` and the `sandbox-guest` binary
 ///   located via [`guest_agent_path`]. The spec mentions
 ///   `{runtime_dir}/images/lite/` — using a tempdir is functionally
 ///   equivalent (the staging surface has no purpose beyond the

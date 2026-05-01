@@ -113,7 +113,7 @@ pub fn events_router(state: Arc<EventsApiState>) -> Router {
 /// - Builds the domain [`EventsFilter`] via `EventsFilter::from_query`;
 ///   unknown layer / decision / event values yield 400.
 /// - `follow=true`: streams a chunked JSONL body built from the
-///   broadcast receiver (see [`follow_response`]).
+///   broadcast receiver (see `follow_response`).
 /// - `follow=false`: replays the session's ring buffer, applies the
 ///   filter, renders each surviving event to JSONL, concatenates into
 ///   a single body, and returns 200 with `Content-Type: application/jsonl`.

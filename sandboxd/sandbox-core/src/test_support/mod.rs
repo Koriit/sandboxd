@@ -15,7 +15,7 @@
 //! each helper make that contract explicit.
 //!
 //! See:
-//! - [`docker_path_stub`] — RAII guard that prepends a temp directory
+//! - [`crate::test_support::docker_path_stub`] — RAII guard that prepends a temp directory
 //!   containing a `docker` shim to `PATH`, with configurable
 //!   `docker info --format '{{.SecurityOptions}}'` responses for
 //!   testing the rootless-Docker probe.

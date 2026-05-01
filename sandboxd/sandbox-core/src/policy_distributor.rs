@@ -37,7 +37,7 @@ struct DistributionState {
 /// (`listeners/listener.yaml`, served via filesystem LDS). The bootstrap
 /// is written via `docker exec`; the listener file is written on the host
 /// into a bind-mounted directory via
-/// [`AtomicListenerWriter`](crate::AtomicListenerWriter), producing a
+/// [`AtomicListenerWriter`], producing a
 /// `MovedTo` inotify event that triggers Envoy's LDS reload without a
 /// listener drain. See
 /// `.tasks/specs/2026-04-19-l3-envoy-mitmproxy-flow-design.md` and
