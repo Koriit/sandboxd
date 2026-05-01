@@ -1,17 +1,29 @@
 #!/usr/bin/env bash
 #
 # Gateway container entrypoint
-# Starts mitmproxy, Envoy, deny-logger, and CoreDNS in the design-specified
-# order, waits for readiness, then monitors all processes.
+# Starts mitmproxy, Envoy, the two nft-loggers (deny + allow), and
+# CoreDNS in the design-specified order, waits for readiness, then
+# monitors all processes.
 #
 # Startup order (per networking-design.md § Component lifecycle + spec
-# 2026-04-21 Part 3 / "Deny-logger component"):
-#   1. mitmproxy    (must be ready before Envoy, which forwards to it)
-#   2. Envoy        (must be ready before DNS, which triggers resolution)
-#   3. deny-logger  (must be ready before VM traffic starts — nftables
-#                    DNAT sends denied packets to :10001/:10002 and the
-#                    container's HEALTHCHECK probes :10003)
-#   4. CoreDNS      (last — completing the pipeline)
+# 2026-04-21 Part 3 / "Deny-logger component" + 2026-05-01 UDP nft-
+# loggers spec):
+#   1. mitmproxy        (must be ready before Envoy, which forwards to it)
+#   2. Envoy            (must be ready before DNS, which triggers resolution)
+#   3. nft-deny-logger  (must be ready before VM traffic starts —
+#                        nftables DNAT sends denied TCP packets to
+#                        :10001 and the kernel mirrors denied UDP via
+#                        NFLOG group 1; HEALTHCHECK probes :10003)
+#   3'. nft-allow-logger (started in parallel with the deny-logger; the
+#                        two are independent failure domains per
+#                        spec 2026-05-01 Decision 4. Owns the NFCT
+#                        subscription on `NFNLGRP_CONNTRACK_NEW`,
+#                        emitting one JSONL `allow` record per new
+#                        UDP flow; HEALTHCHECK probes :10004. Both
+#                        loggers must be ready before the entrypoint
+#                        completes; either failing renders the
+#                        container unhealthy.)
+#   4. CoreDNS          (last — completing the pipeline)
 #
 # nftables rules are managed externally by sandboxd, not by this script.
 #
@@ -55,6 +67,7 @@ MITM_PID=""
 ENVOY_PID=""
 COREDNS_PID=""
 DENY_LOGGER_PID=""
+ALLOW_LOGGER_PID=""
 
 log() {
     echo "[gateway] $(date -u '+%Y-%m-%dT%H:%M:%SZ') $*"
@@ -64,12 +77,15 @@ log() {
 
 shutdown_all() {
     log "Shutting down components..."
-    # Shutdown order (reverse of startup): CoreDNS, deny-logger, Envoy,
-    # mitmproxy. deny-logger handles SIGTERM cleanly — it flushes any
-    # pending rate_limited summary to the JSONL before exiting (see
-    # sandbox-deny-logger spec Part 3 / "Liveness posture"), so SIGKILL
+    # Shutdown order (reverse of startup): CoreDNS, both nft-loggers,
+    # Envoy, mitmproxy. The deny-logger and the allow-logger are
+    # independent failure domains (M12-S2 Decision 4) and have no
+    # ordering relationship between them — both get SIGTERM
+    # simultaneously. Both handle SIGTERM cleanly: each flushes any
+    # pending `rate_limited` summary to its JSONL before exiting (see
+    # sandbox-event-emitter `RateCap::flush_now`), so the SIGKILL
     # fallback below is for the hang-protection deadline only.
-    for pid_var in COREDNS_PID DENY_LOGGER_PID ENVOY_PID MITM_PID; do
+    for pid_var in COREDNS_PID DENY_LOGGER_PID ALLOW_LOGGER_PID ENVOY_PID MITM_PID; do
         local pid="${!pid_var}"
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
             log "Sending SIGTERM to ${pid_var}=${pid}"
@@ -79,7 +95,7 @@ shutdown_all() {
 
     # Wait for all to exit (up to 10 seconds total)
     local deadline=$((SECONDS + 10))
-    for pid_var in COREDNS_PID DENY_LOGGER_PID ENVOY_PID MITM_PID; do
+    for pid_var in COREDNS_PID DENY_LOGGER_PID ALLOW_LOGGER_PID ENVOY_PID MITM_PID; do
         local pid="${!pid_var}"
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
             local remaining=$((deadline - SECONDS))
@@ -187,14 +203,33 @@ log "Envoy started (PID=${ENVOY_PID})"
 
 wait_for_ready "Envoy" "curl -sf http://127.0.0.1:9901/ready"
 
-# ── Start sandbox-deny-logger ───────────────────────────────────────
+# ── Start nft-loggers (deny + allow) ────────────────────────────────
 #
-# The deny-logger binds its TCP (:10001), UDP (:10002), and health
-# (:10003) listeners on the gateway container's bridge IP — NOT
-# 127.0.0.1. PREROUTING DNAT to loopback is dropped by the kernel as a
-# martian destination unless `route_localnet=1` is enabled on the
-# ingress interface, which the gateway container does not enable (see
-# spec 2026-04-21 Part 3 / "Deny-logger component / Listener design").
+# Both nft-loggers bind their listeners on the gateway container's
+# bridge IP — NOT 127.0.0.1. For the deny-logger this is load-bearing:
+# PREROUTING DNAT to loopback is dropped by the kernel as a martian
+# destination unless `route_localnet=1` is enabled on the ingress
+# interface, which the gateway container does not enable (see spec
+# 2026-04-21 Part 3 / "Deny-logger component / Listener design"). The
+# allow-logger doesn't have a DNAT'd listener (its only socket is
+# `/health`), but it binds the same way for symmetry with the
+# HEALTHCHECK probe (which discovers the bridge IP via `hostname -i`).
+#
+# UDP datapath honesty (M12-S2 spec):
+#   - Denied UDP: kernel `nft drop`s and emits NFLOG group 1 messages;
+#     the deny-logger's NFLOG subscriber parses them in-process. No
+#     userland datagram listener.
+#   - Allowed UDP: kernel `accept`s, MASQUERADEs to upstream, and emits
+#     a `NFCT_T_NEW` event on `NFNLGRP_CONNTRACK_NEW`; the allow-logger
+#     parses the original-direction tuple and emits a JSONL `allow`
+#     record. No userland datagram listener.
+#
+# The two binaries are independent failure domains (Decision 4): each
+# owns its own netlink socket, JSONL file, `/health` endpoint, and
+# tokio runtime. The launches below run in parallel — order between
+# them does not matter — but BOTH must be ready before the entrypoint
+# advances to CoreDNS, so the readiness probes are sequential.
+#
 # Discover the bridge IP at runtime via `hostname -i`; take the first
 # address in case a future setup adds more interfaces.
 GATEWAY_IP="${GATEWAY_IP:-$(hostname -i | awk '{print $1}')}"
@@ -204,23 +239,44 @@ if [[ -z "${GATEWAY_IP}" ]]; then
 fi
 log "Discovered gateway bridge IP: ${GATEWAY_IP}"
 
-# Per-session JSONL target. Lives under the per-session events bind
-# mount (/var/log/gateway/events/<session-id>/) so sandboxd's ingest
-# watcher picks it up from the host side without an extra file
-# descriptor dance.
-SANDBOX_DENY_LOGGER_EVENTS="${SANDBOX_DENY_LOGGER_EVENTS:-/var/log/gateway/events/deny-logger.jsonl}"
+# Per-session JSONL targets. Both files live under the per-session
+# events bind mount (/var/log/gateway/events/<session-id>/) so
+# sandboxd's directory-scoped ingest watcher picks them both up
+# without per-file configuration.
+#
+# Filename note (M12-S2 Resolution 6): both producers now write under
+# their spec-mandated names — `nft-deny.jsonl` and `nft-allow.jsonl`.
+# The daemon-side ingest watcher's known-producer list at
+# `sandbox-core/src/events/ingest/watcher.rs` keys on these literal
+# filenames; both binaries' `--event-path` clap defaults match.
+SANDBOX_DENY_LOGGER_EVENTS="${SANDBOX_DENY_LOGGER_EVENTS:-/var/log/gateway/events/nft-deny.jsonl}"
+SANDBOX_ALLOW_LOGGER_EVENTS="${SANDBOX_ALLOW_LOGGER_EVENTS:-/var/log/gateway/events/nft-allow.jsonl}"
 
-log "Starting sandbox-deny-logger on ${GATEWAY_IP}:10001/10002/10003..."
-/usr/local/bin/sandbox-deny-logger \
+log "Starting sandbox-nft-deny-logger on ${GATEWAY_IP}:10001 tcp / :10003 health (UDP via NFLOG group 1)..."
+/usr/local/bin/sandbox-nft-deny-logger \
     --bind-ip "${GATEWAY_IP}" \
     --event-path "${SANDBOX_DENY_LOGGER_EVENTS}" \
-    >>"${LOG_DIR}/deny-logger.log" 2>&1 &
+    >>"${LOG_DIR}/nft-deny-logger.log" 2>&1 &
 DENY_LOGGER_PID=$!
-log "sandbox-deny-logger started (PID=${DENY_LOGGER_PID})"
+log "sandbox-nft-deny-logger started (PID=${DENY_LOGGER_PID}, /health at http://${GATEWAY_IP}:10003/health)"
 
-# The health endpoint on :10003 is the definitive readiness signal; it
-# only reports 200 once the TCP and UDP listener tasks are alive.
-wait_for_ready "deny-logger" "curl -sf http://${GATEWAY_IP}:10003/health"
+log "Starting sandbox-nft-allow-logger on ${GATEWAY_IP}:10004 health (UDP allow audit via NFCT NFNLGRP_CONNTRACK_NEW)..."
+/usr/local/bin/sandbox-nft-allow-logger \
+    --bind-ip "${GATEWAY_IP}" \
+    --event-path "${SANDBOX_ALLOW_LOGGER_EVENTS}" \
+    >>"${LOG_DIR}/nft-allow-logger.log" 2>&1 &
+ALLOW_LOGGER_PID=$!
+log "sandbox-nft-allow-logger started (PID=${ALLOW_LOGGER_PID}, /health at http://${GATEWAY_IP}:10004/health)"
+
+# Both `/health` endpoints are the definitive readiness signal for
+# their respective binaries. Each only reports 200 once its data-plane
+# task(s) are alive — the deny-logger's TCP listener + NFLOG
+# subscriber, and the allow-logger's NFCT subscriber. We probe them
+# sequentially so a clear log line names the binary that succeeded
+# (or timed out). Ordering between them does not matter; either order
+# would surface a stuck binary in `READY_TIMEOUT` seconds.
+wait_for_ready "nft-deny-logger"  "curl -sf http://${GATEWAY_IP}:10003/health"
+wait_for_ready "nft-allow-logger" "curl -sf http://${GATEWAY_IP}:10004/health"
 
 # ── Start CoreDNS ───────────────────────────────────────────────────
 
@@ -246,17 +302,24 @@ wait_for_ready "CoreDNS" "curl -sf http://127.0.0.1:8180/health"
 # ── All components running ──────────────────────────────────────────
 
 log "All components are running and healthy."
-log "  mitmproxy    PID=${MITM_PID}        (127.0.0.1:18080 regular mode; reached via Envoy CONNECT)"
-log "  Envoy        PID=${ENVOY_PID}        (0.0.0.0:10000, admin 127.0.0.1:9901)"
-log "  deny-logger  PID=${DENY_LOGGER_PID}  (${GATEWAY_IP}:10001 tcp, :10002 udp, :10003 health)"
-log "  CoreDNS      PID=${COREDNS_PID}      (DNS :53, health :8180)"
+log "  mitmproxy         PID=${MITM_PID}         (127.0.0.1:18080 regular mode; reached via Envoy CONNECT)"
+log "  Envoy             PID=${ENVOY_PID}         (0.0.0.0:10000, admin 127.0.0.1:9901)"
+log "  nft-deny-logger   PID=${DENY_LOGGER_PID}   (${GATEWAY_IP}:10001 tcp, NFLOG group 1, :10003 health)"
+log "  nft-allow-logger  PID=${ALLOW_LOGGER_PID}  (NFCT NFNLGRP_CONNTRACK_NEW, ${GATEWAY_IP}:10004 health)"
+log "  CoreDNS           PID=${COREDNS_PID}       (DNS :53, health :8180)"
 
 # ── Monitor processes ───────────────────────────────────────────────
-# Wait for any child to exit. If any managed process dies, log and exit
-# so Docker's restart policy can handle recovery.
+# Wait for any child to exit. If any managed process dies, log and
+# exit so Docker's restart policy can handle recovery.
+#
+# The two nft-loggers are independent failure domains (M12-S2
+# Decision 4): we deliberately do NOT keep one alive while the other
+# dies. If either exits, the container goes unhealthy and Docker
+# restarts the whole thing — this is the simplest correct shape and
+# matches the existing Envoy / mitmproxy / CoreDNS contract.
 
 while true; do
-    for pid_var in MITM_PID ENVOY_PID DENY_LOGGER_PID COREDNS_PID; do
+    for pid_var in MITM_PID ENVOY_PID DENY_LOGGER_PID ALLOW_LOGGER_PID COREDNS_PID; do
         local_pid="${!pid_var}"
         if [[ -n "$local_pid" ]] && ! kill -0 "$local_pid" 2>/dev/null; then
             # Process is gone. Retrieve exit code.
