@@ -36,6 +36,16 @@ use sandbox_core::session::SessionId;
 /// "orphan" pair and a "live" pair in the same test get distinct ids
 /// even when the wall clock has moved fewer than a few hundred
 /// nanoseconds between calls.
+///
+/// PID is mixed into the trailing slot because two `cargo nextest`
+/// processes running on the same host (parallel CI, dev-host plus
+/// CI agent, etc.) would otherwise share both the per-call seed and
+/// the low-order wall-clock nanos and could land on the same 12-hex
+/// id. `std::process::id()` differs per OS process, so its low byte
+/// breaks that cross-process tie. Chose `process::id()` over an
+/// atomic counter because the counter is per-process — it cannot
+/// disambiguate two test processes that each happen to start their
+/// counter at 0.
 fn unique_session_id(seed: &str) -> SessionId {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -43,10 +53,12 @@ fn unique_session_id(seed: &str) -> SessionId {
         .unwrap_or(0);
     let raw = format!("{nanos:032x}");
     let seed_byte = seed.as_bytes().iter().fold(0u8, |a, b| a.wrapping_add(*b));
-    // Two leading hex chars from the seed, ten trailing hex chars from
-    // the wall-clock — 12 total. SessionId::parse demands exactly 12.
-    let tail = &raw[2..12];
-    let mixed = format!("{seed_byte:02x}{tail}");
+    let pid_byte = (std::process::id() & 0xff) as u8;
+    // Two leading hex chars from the seed, eight trailing hex chars
+    // from the wall-clock, two trailing hex chars from the pid — 12
+    // total. SessionId::parse demands exactly 12.
+    let tail = &raw[2..10];
+    let mixed = format!("{seed_byte:02x}{tail}{pid_byte:02x}");
     SessionId::parse(&mixed).expect("12-hex session id")
 }
 

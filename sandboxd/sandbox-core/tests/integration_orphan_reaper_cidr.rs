@@ -37,6 +37,16 @@ use sandbox_core::session::SessionId;
 /// per-test seed — see [`unique_session_id`] — so two tests running
 /// back-to-back never collide on the same `sandbox-{id}` name even
 /// when the wall-clock nanosecond resolution is coarse.
+///
+/// PID is mixed into the trailing slot because two `cargo nextest`
+/// processes running on the same host (parallel CI, dev-host plus
+/// CI agent, etc.) would otherwise share both the per-call seed and
+/// the low-order wall-clock nanos and could land on the same 12-hex
+/// id. `std::process::id()` differs per OS process, so its low byte
+/// breaks that cross-process tie. Chose `process::id()` over an
+/// atomic counter because the counter is per-process — it cannot
+/// disambiguate two test processes that each happen to start their
+/// counter at 0.
 fn unique_session_id(seed: &str) -> SessionId {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -44,8 +54,9 @@ fn unique_session_id(seed: &str) -> SessionId {
         .unwrap_or(0);
     let raw = format!("{nanos:032x}");
     let seed_byte = seed.as_bytes().iter().fold(0u8, |a, b| a.wrapping_add(*b));
-    let tail = &raw[2..12];
-    let mixed = format!("{seed_byte:02x}{tail}");
+    let pid_byte = (std::process::id() & 0xff) as u8;
+    let tail = &raw[2..10];
+    let mixed = format!("{seed_byte:02x}{tail}{pid_byte:02x}");
     SessionId::parse(&mixed).expect("12-hex session id")
 }
 
@@ -312,17 +323,24 @@ fn create_ipv6_only_network(name: &str, subnet: &str) {
     );
 }
 
-/// Fail-closed test: a `sandbox-net-{12hex}` network whose IPAM block
-/// has no IPv4 entries (here, IPv6-only by `--ipv4=false`) must be
-/// skipped. This is the integration-side equivalent of the unit test
+/// Fail-closed test: when a `sandbox-net-{12hex}` network has no
+/// IPv4 IPAM entries (here, IPv6-only via `--ipv4=false`), the reaper
+/// must preserve **all three** session-id-siblings — the network
+/// itself, the home volume, and the container — even though the
+/// container is attached to Docker's default `bridge` rather than the
+/// IPv6-only network. The transitive-ownership rule is what's under
+/// test: the IPv4-IPAM-empty network puts its session id in the
+/// out-of-pool skip set, and the container/volume passes consult
+/// that skip set before partitioning. This is the integration-side
+/// equivalent of the unit test
 /// `reap_orphans_skips_network_with_empty_ipam_data` in
 /// `orphan_reaper.rs::tests` — the unit suite covers the parser and
 /// in-pool helper exhaustively (malformed JSON, empty `Config` array,
 /// partial overlap); this integration test pins the same fail-closed
 /// outcome through a real `docker network inspect` call.
 #[tokio::test]
-async fn integration_reaper_skips_network_with_missing_ipam() {
-    let orphan_sid = unique_session_id("cidr-missing-ipam");
+async fn integration_reaper_skips_resources_when_sibling_network_has_no_ipv4_ipam() {
+    let orphan_sid = unique_session_id("cidr-no-ipv4-ipam");
     let container = format!("sandbox-{orphan_sid}");
     let volume = format!("sandbox-home-{orphan_sid}");
     let network = format!("sandbox-net-{orphan_sid}");
