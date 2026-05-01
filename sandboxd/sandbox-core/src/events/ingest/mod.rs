@@ -59,10 +59,10 @@ use crate::events::{EventBus, VmIpSessionMap};
 use crate::session::SessionId;
 
 pub mod coredns;
-pub mod deny_logger;
 pub mod envoy;
 pub mod jsonl_reader;
 pub mod mitmproxy;
+pub mod nft_logger;
 pub mod watcher;
 
 /// Handle to a spawned per-session ingest task.

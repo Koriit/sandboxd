@@ -1,0 +1,87 @@
+[package]
+name = "sandbox-nft-deny-logger"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# The nft-deny-logger ships as a single static binary that runs alongside
+# Envoy / CoreDNS / mitmproxy / nft-allow-logger inside the gateway
+# container. It owns two data-plane code paths:
+#   - TCP listener on :10001 — accept(2) → SO_ORIGINAL_DST → SO_LINGER 0
+#     RST close, unchanged from the M10-S3 deny-logger contract.
+#   - NFLOG receive loop subscribed to NFNLGRP_NFLOG group 1 — kernel
+#     emits one netlink message per nft-dropped UDP datagram with the
+#     full IPv4+UDP headers in NFULA_PAYLOAD; the receiver parses the
+#     pre-DNAT 5-tuple from the headers and emits a JSONL deny event.
+# Cross-cutting infrastructure (JSONL emitter, RateCap, /health) lives
+# in `sandbox-event-emitter` (M12-S2 Decision 5).
+[[bin]]
+name = "sandbox-nft-deny-logger"
+path = "src/main.rs"
+
+[dependencies]
+# Cross-cutting infrastructure (JSONL emitter, RateCap, /health server)
+# extracted in M12-S2 Phase 1 (Decision 5). Both the renamed deny-logger
+# and the upcoming `sandbox-nft-allow-logger` depend on this lib; the
+# binary owns only the data-plane code (TCP listener, NFLOG receiver,
+# main wiring).
+sandbox-event-emitter = { path = "../sandbox-event-emitter" }
+
+chrono.workspace = true
+# The workspace clap has only `derive`; we need `env` here for the
+# `SANDBOX_DENY_LOGGER_RATE_CAP` / `..._CONN_CAP` fallbacks. Opting into
+# the extra feature on this single consumer keeps the workspace default
+# minimal.
+clap = { workspace = true, features = ["env"] }
+nix = { version = "0.29", features = ["net", "socket", "uio"] }
+# Direct socket2 use lets us set an explicit `listen()` backlog (the
+# tokio TcpListener API uses libc's SOMAXCONN and gives no knob).
+# Picking the backlog at the call site lets the deterministic
+# `tcp_respects_concurrency_cap` test ensure the kernel's accept
+# queue is large enough for its burst, eliminating the
+# retry-on-ECONNREFUSED dance the M11-S5 test had to do.
+socket2 = "0.6"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# NFLOG receiver for the UDP deny path (M12-S2 Decision 2).
+#
+# The kernel drops denied UDP at nft (`log group 1 ; drop`) and emits one
+# netlink message per drop on the NFNL_SUBSYS_ULOG / NFNLGRP_NFLOG
+# multicast group. The receiver parses NFULA_PAYLOAD (IPv4 + UDP
+# headers) directly into a `DenyRecord` carrying the original 5-tuple
+# the VM dialled — no userland datapath, no DNAT, no conntrack lookup.
+#
+# Crate choice rationale (M12-S2 Phase 2):
+#   1. `netlink-packet-netfilter` v0.2.0 (rust-netlink, pure Rust):
+#      *does* cover NFLOG/ULOG. Considered. Rejected for now to keep
+#      symmetry with the rest of the gateway-container netlink code:
+#      sandbox-nft-allow-logger (M12-S2 Phase 3) will subscribe to
+#      `NFNLGRP_CONNTRACK_NEW`, which v0.2.0 does NOT cover (conntrack
+#      support is on `main` only, unreleased), so that crate would
+#      have to hand-roll its own netlink emit/parse anyway. Splitting
+#      the two binaries across two netlink stacks is a maintenance
+#      tax for no win; sharing one stack (netlink-sys + hand-rolled
+#      TLV parse) keeps the code surface uniform and the dep tree
+#      smaller. The deleted M12-S1 conntrack module set the precedent
+#      (~200 LOC of hand-rolled netfilter TLV); NFLOG is simpler.
+#   2. `nfct` / libnetfilter_log (C FFI): rejected. Would require
+#      pulling libnfnetlink + libnetfilter_log into the gateway
+#      `debian:bookworm-slim` runtime image, bloating it and adding a
+#      glibc-version coupling.
+#   3. `netlink-sys` + hand-rolled NFNL_SUBSYS_ULOG TLV parse
+#      (chosen). The wire format is stable kernel ABI documented in
+#      `linux/netfilter/nfnetlink_log.h`; ~150 LOC of bind/parse with
+#      hermetic test coverage. `netlink-sys` provides only the
+#      NETLINK_NETFILTER socket; the on-the-wire encoding is in
+#      src/nflog.rs.
+netlink-sys = "0.8"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true

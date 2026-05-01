@@ -119,8 +119,12 @@ pub enum EventName {
     // -------- mitmproxy --------
     RequestAllowed,
     RequestDenied,
-    // -------- deny-logger --------
+    // -------- deny-logger / allow-logger --------
     Deny,
+    /// M12-S2 Phase 3: nft-allow-logger's `allow` event. Same on-bus
+    /// layer (`deny-logger`) as `Deny` — the two are sibling variants
+    /// of the nft-logger family per Decision 5.
+    Allow,
     RateLimited,
     // -------- lifecycle --------
     GatewayBooting,
@@ -150,6 +154,7 @@ impl EventName {
             "request_allowed" => Ok(Self::RequestAllowed),
             "request_denied" => Ok(Self::RequestDenied),
             "deny" => Ok(Self::Deny),
+            "allow" => Ok(Self::Allow),
             "rate_limited" => Ok(Self::RateLimited),
             "gateway_booting" => Ok(Self::GatewayBooting),
             "gateway_ready" => Ok(Self::GatewayReady),
@@ -176,6 +181,7 @@ impl EventName {
             Self::RequestAllowed => "request_allowed",
             Self::RequestDenied => "request_denied",
             Self::Deny => "deny",
+            Self::Allow => "allow",
             Self::RateLimited => "rate_limited",
             Self::GatewayBooting => "gateway_booting",
             Self::GatewayReady => "gateway_ready",
@@ -323,6 +329,10 @@ fn decision_of(event: &Event) -> Option<DecisionKind> {
             }),
             TrafficEvent::DenyLogger(e) => match e {
                 DenyLoggerEvent::Deny(_) => Some(DecisionKind::Deny),
+                // M12-S2 Phase 3: allow-flow audit record carries an
+                // explicit allow decision (the nft-allow-logger only
+                // sees flows that nftables already classified `accept`).
+                DenyLoggerEvent::Allow(_) => Some(DecisionKind::Allow),
                 // `rate_limited` is a summary, not a per-attempt decision.
                 DenyLoggerEvent::RateLimited { .. } => None,
             },
@@ -346,6 +356,7 @@ fn event_name_of(event: &Event) -> EventName {
                 EventName::RequestDenied
             }
             TrafficEvent::DenyLogger(DenyLoggerEvent::Deny(_)) => EventName::Deny,
+            TrafficEvent::DenyLogger(DenyLoggerEvent::Allow(_)) => EventName::Allow,
             TrafficEvent::DenyLogger(DenyLoggerEvent::RateLimited { .. }) => EventName::RateLimited,
         },
         Event::Lifecycle { event, .. } => match event {
@@ -702,6 +713,7 @@ mod tests {
             EventName::RequestAllowed,
             EventName::RequestDenied,
             EventName::Deny,
+            EventName::Allow,
             EventName::RateLimited,
             EventName::GatewayBooting,
             EventName::GatewayReady,

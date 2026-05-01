@@ -13,10 +13,11 @@
 //!      protocol, and envelope stamped with the session id.
 //!   2. `udp_send_to_non_allowlisted_destination_emits_deny_event` —
 //!      same fixture, but `nc -u -w1 203.0.113.1 9999` sends a single
-//!      datagram. The deny-logger sees the datagram and emits a `deny`
-//!      with `udp` protocol carrying the **pre-DNAT** 5-tuple
-//!      (M12-S1 conntrack netlink recovery); the ingestor stamps the
-//!      envelope.
+//!      datagram. The kernel drops the datagram via `nft drop` and
+//!      mirrors it to NFLOG group 1 (M12-S2 Decision 2); the
+//!      nft-deny-logger's NFLOG receiver parses the IPv4+UDP headers
+//!      and emits a `deny` event with the original 5-tuple straight
+//!      from the wire. The ingestor stamps the envelope.
 //!   3. `session_start_produces_exactly_sandbox_sandbox_dnat_sandbox_policy_tables`
 //!      — after `create_gateway` + policy distribute, the nftables
 //!      tables inside the gateway container are exactly
@@ -24,7 +25,7 @@
 //!      `sandbox_policy` table carries only `chain output` (no VM-
 //!      egress filter chain like `forward` / `prerouting`).
 //!   4. `killing_deny_logger_emits_health_degraded_then_restored` —
-//!      killing the `sandbox-deny-logger` process inside the gateway
+//!      killing the `sandbox-nft-deny-logger` process inside the gateway
 //!      flips the container to unhealthy (Docker HEALTHCHECK × 3 retries
 //!      = ~30s); sandboxd's monitor loop emits a `health_degraded`
 //!      lifecycle event within the 120s budget, calls `restart_gateway`,
@@ -48,7 +49,8 @@
 //!
 //! - Docker daemon reachable via the local socket.
 //! - `sandbox-gateway` image built (`make gateway-image`). The image
-//!   has the deny-logger binary baked in (M10-S3 Phase 2).
+//!   has the `sandbox-nft-deny-logger` binary baked in (M12-S2 Phase 2
+//!   rename of the original M10-S3 `sandbox-deny-logger`).
 //! - Kernel permits `CAP_NET_ADMIN` containers (the gateway image
 //!   needs it for nftables injection).
 //! - The `alpine` public image must be pullable (used as the side
@@ -603,12 +605,14 @@ async fn integration_tcp_connect_to_non_allowlisted_destination_emits_deny_event
 /// `orig_dst_ip`, `orig_dst_port`, `src_ip`, `src_port`, `layer` as above."
 ///
 /// UDP has no three-way handshake, so the gateway's deny path is
-/// different from TCP — the datagram is DNATted by
-/// `sandbox_dnat.prerouting`'s UDP fallback to the deny-logger's
-/// `:10002` UDP listener. The deny-logger recovers the pre-DNAT
-/// 5-tuple via a conntrack netlink lookup (M12-S1;
-/// `sandbox-deny-logger/src/conntrack.rs`). The test pins that path:
-/// nft DNAT → UDP listener → conntrack lookup → JSONL `deny` record.
+/// different from TCP. M12-S2 (Decision 2): unmatched UDP is mirrored
+/// to NFLOG group 1 and dropped at PREROUTING — no DNAT, no userland
+/// listener. The kernel emits one netlink message per dropped packet
+/// with the pre-rewrite IPv4+UDP headers in `NFULA_PAYLOAD`; the
+/// `sandbox-nft-deny-logger`'s NFLOG receiver parses those headers
+/// directly into a `DenyRecord`. The test pins that path:
+/// nft `log group 1; drop` → NFLOG netlink message →
+/// `sandbox-nft-deny-logger` parse → JSONL `deny` record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn integration_udp_send_to_non_allowlisted_destination_emits_deny_event() {
     let gw = GatewaySession::create(Ipv4Addr::new(10, 211, 0, 0));
@@ -647,8 +651,9 @@ async fn integration_udp_send_to_non_allowlisted_destination_emits_deny_event() 
     // `busybox-extras nc` explicitly to avoid ambiguity.
     //
     // Sending `hello` as the datagram payload is arbitrary — the
-    // deny-logger records the 5-tuple, not the payload. Port 9999 is
-    // outside the :443 allow list; 203.0.113.1 is outside 10.0.0.0/8.
+    // nft-deny-logger records the 5-tuple from the IPv4+UDP headers
+    // NFLOG copies to userspace, not the payload. Port 9999 is outside
+    // the :443 allow list; 203.0.113.1 is outside 10.0.0.0/8.
     let nc_out = Command::new("docker")
         .args([
             "exec",
@@ -671,19 +676,17 @@ async fn integration_udp_send_to_non_allowlisted_destination_emits_deny_event() 
     );
 
     // Spec (`.tasks/specs/2026-04-21-port-explicit-policies-presets-
-    // observability-design.md` lines 810-817): the UDP deny-logger
-    // emits the **pre-DNAT** destination — `203.0.113.1:9999` here.
+    // observability-design.md` lines 810-817): the UDP deny event
+    // carries the **pre-DNAT** destination — `203.0.113.1:9999` here.
     //
-    // The deny-logger recovers the pre-DNAT 4-tuple via a conntrack
-    // netlink lookup (M12-S1; `sandbox-deny-logger/src/conntrack.rs`)
-    // because the kernel does not surface the pre-DNAT dst via
-    // `IP_ORIGDSTADDR` for conntrack-DNAT'd UDP (TCP works by virtue
-    // of `SO_ORIGINAL_DST` reading the conntrack entry the kernel
-    // threaded through the accepted-socket fd; UDP has no per-flow
-    // fd). The lookup hits `IPCTNL_MSG_CT_GET` keyed on the post-DNAT
-    // REPLY tuple `(gateway_ip:10002 → vm_ip:vm_port)`, parses
-    // `CTA_TUPLE_ORIG.dst` from the kernel's reply, and populates
-    // the deny event with that pre-DNAT destination.
+    // M12-S2 Decision 2: unmatched UDP is mirrored to NFLOG group 1 at
+    // PREROUTING and then dropped — no DNAT, no userland listener, no
+    // conntrack lookup. NFLOG copies the original IPv4+UDP headers to
+    // userspace via `NFULA_PAYLOAD`, so the
+    // `sandbox-nft-deny-logger` receiver reads the pre-rewrite
+    // 5-tuple straight from the wire and stamps it onto the JSONL
+    // deny event. The kernel never had to mutate the destination, so
+    // there is no pre-/post-DNAT asymmetry to recover from.
     let want_src_ip = vm_ip;
     let sid = gw.session_id;
     let pre_dnat_dst_ip = Ipv4Addr::new(203, 0, 113, 1);
@@ -721,7 +724,9 @@ async fn integration_udp_send_to_non_allowlisted_destination_emits_deny_event() 
             );
             assert_ne!(
                 d.orig_dst_port, 10002,
-                "post-DNAT regression: deny event must not carry deny-logger port as orig_dst_port",
+                "M12-S2 regression: deny event must not carry the legacy \
+                 deny-logger UDP listener port :10002 as orig_dst_port \
+                 (the listener no longer exists)",
             );
             assert_eq!(d.src_ip, vm_ip);
             assert!(d.src_port > 0, "src_port must be nonzero on UDP deny");
@@ -841,7 +846,7 @@ fn integration_session_start_produces_exactly_sandbox_sandbox_dnat_sandbox_polic
 /// Phase 8 exit criterion 4: "Start a session through the full
 /// sandboxd lifecycle. Subscribe to `EventBus` for
 /// `lifecycle::HealthDegraded` + `lifecycle::HealthRestored`.
-/// `docker exec ... pkill sandbox-deny-logger`. Assert
+/// `docker exec ... pkill sandbox-nft-deny-logger`. Assert
 /// `health_degraded` event appears within 120s. Assert sandboxd
 /// automatically triggers `restart_gateway`; after restart, assert
 /// `health_restored` event appears. Post-restart smoke test: from
@@ -1128,10 +1133,11 @@ async fn integration_killing_deny_logger_emits_health_degraded_then_restored() {
     // Kill the deny-logger inside the container. `-KILL` guarantees
     // the process cannot clean up before the HEALTHCHECK retries
     // catch it. The `-f` flag is load-bearing: the Linux `comm` field
-    // is truncated to 15 chars, and `sandbox-deny-logger` is 19
-    // chars, so a bare `pkill sandbox-deny-logger` silently matches
-    // nothing (procps-ng emits a warning and returns 1). `-f` matches
-    // against the full command line where the binary path is intact.
+    // is truncated to 15 chars, and `sandbox-nft-deny-logger` is 23
+    // chars, so a bare `pkill sandbox-nft-deny-logger` silently
+    // matches nothing (procps-ng emits a warning and returns 1). `-f`
+    // matches against the full command line where the binary path is
+    // intact.
     //
     // We intentionally do NOT assert on `docker exec`'s exit status:
     // the gateway's `entrypoint.sh` watchdog (lines 258-275) polls
@@ -1147,7 +1153,7 @@ async fn integration_killing_deny_logger_emits_health_degraded_then_restored() {
             &gw_container,
             "sh",
             "-c",
-            "pkill -KILL -f sandbox-deny-logger || true",
+            "pkill -KILL -f sandbox-nft-deny-logger || true",
         ])
         .output()
         .expect("docker exec pkill should be invokable");
@@ -1227,36 +1233,38 @@ async fn integration_killing_deny_logger_emits_health_degraded_then_restored() {
 // Test 5 (M12-S1): UDP pre-DNAT attribution under load
 // ---------------------------------------------------------------------------
 
-/// M12-S1 deliverable: prove the conntrack-netlink lookup in the UDP
-/// deny-logger handler keeps pre-DNAT attribution tight under
-/// concurrent flows. Single-flow correctness is covered by Test 2; this
-/// test exercises the path under multi-flow contention to expose any
-/// race between conntrack lookup and the receive loop.
+/// M12-S1 deliverable, retargeted in M12-S2 Phase 2 onto the NFLOG
+/// data path: prove that pre-DNAT attribution stays tight under
+/// concurrent flows. Single-flow correctness is covered by Test 2;
+/// this test exercises the path under multi-flow contention to expose
+/// any race between the kernel's NFLOG emission and the receiver's
+/// per-message parse.
 ///
 /// **Shape.** From a single side container, fire N concurrent UDP
 /// datagrams to N distinct denied destinations
 /// `(203.0.113.{1..=N}, 9000+i)`. Each flow takes a different
-/// `(dst_ip, dst_port)` so the post-DNAT REPLY tuple uniquely
-/// identifies it (the kernel installs a separate conntrack entry per
-/// flow). Wait for N matching deny events on the bus and assert each
-/// one carries the originally-targeted pre-DNAT 5-tuple — not the
-/// post-DNAT `(gateway_ip, 10002)` regression shape.
+/// `(dst_ip, dst_port)`. The kernel `nft drop`-s every datagram at
+/// PREROUTING and emits one netlink message per drop on NFLOG group
+/// 1; the receiver parses the IPv4+UDP headers and emits a JSONL
+/// deny event with the original 5-tuple straight from the wire.
+/// Wait for N matching deny events on the bus and assert each one
+/// carries the originally-targeted 5-tuple — there is no pre-/post-
+/// DNAT asymmetry under M12-S2 (no DNAT for the deny path), so the
+/// "post-DNAT (gateway_ip, 10002)" regression shape from M12-S1 is
+/// now structurally impossible; we keep an assertion against it as a
+/// defense-in-depth pin.
 ///
-/// **Why N=12.** The deny-logger's per-process rate cap defaults to
-/// 1000/s (see `sandbox-deny-logger` `--rate-cap`); 12 datagrams
-/// spread across ~1s of wall time stay well under it while still
-/// generating enough overlap to expose a single-flow conntrack race.
-/// Bumping to ~50 would require either raising the rate cap or
-/// pacing — out of scope; 12 is empirically sufficient to expose the
-/// regression on a fast-conntrack-GC kernel.
+/// **Why N=12.** The nft-deny-logger's per-process rate cap defaults
+/// to 1000/s (`--rate-cap`); 12 datagrams spread across ~1s of wall
+/// time stay well under it while still generating enough overlap to
+/// expose receive-loop contention.
 ///
 /// **Why the side container, not multiple side containers.** Multiple
-/// side containers would also stress the gateway's conntrack table,
-/// but they would each have a distinct `src_ip`, simplifying the
-/// kernel's flow-key disambiguation. We deliberately keep `src_ip`
-/// constant across all flows so disambiguation is purely on
-/// `(src_port, dst_ip, dst_port)` — the same shape a real high-rate
-/// VM would produce.
+/// side containers would each have a distinct `src_ip`, simplifying
+/// the kernel's flow-key disambiguation. We deliberately keep
+/// `src_ip` constant so disambiguation is purely on `(src_port,
+/// dst_ip, dst_port)` — the same shape a real high-rate VM would
+/// produce.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn integration_udp_load_pre_dnat_attribution_holds_under_concurrent_flows() {
     /// Number of concurrent UDP flows the test fires. Tuned per the
@@ -1351,8 +1359,10 @@ async fn integration_udp_load_pre_dnat_attribution_holds_under_concurrent_flows(
             if d.protocol != DenyProtocol::Udp {
                 return false;
             }
-            // Pre-DNAT regression guard: any post-DNAT
-            // `(gateway_ip, 10002)` slip-through trips this.
+            // M12-S2 defense-in-depth: there is no `(gateway_ip,
+            // 10002)` regression shape to worry about under NFLOG
+            // (the deny path no longer DNATs), but a regression that
+            // re-introduced the listener would surface here.
             if d.orig_dst_ip == gateway_ip && d.orig_dst_port == 10002 {
                 // Match it so the test surfaces the exact bad event in
                 // the per-event assertion below.
@@ -1375,14 +1385,16 @@ async fn integration_udp_load_pre_dnat_attribution_holds_under_concurrent_flows(
                 assert_ne!(
                     (d.orig_dst_ip, d.orig_dst_port),
                     (gateway_ip, 10002u16),
-                    "post-DNAT regression: deny event carried the deny-logger's own \
-                     bind address (gateway_ip:10002) instead of the pre-DNAT target"
+                    "M12-S2 regression: deny event carried the legacy \
+                     deny-logger UDP listener address (gateway_ip:10002); \
+                     the userland listener no longer exists and NFLOG \
+                     carries the original 5-tuple by construction"
                 );
                 let key = (d.orig_dst_ip, d.orig_dst_port);
                 assert!(
                     target_set.contains(&key),
-                    "pre-DNAT tuple {key:?} not in target set {target_set:?} — \
-                     conntrack lookup returned a stale or wrong entry"
+                    "5-tuple {key:?} not in target set {target_set:?} — \
+                     NFLOG header parse produced a wrong tuple"
                 );
                 let inserted = matched.insert(key);
                 assert!(

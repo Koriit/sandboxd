@@ -751,13 +751,18 @@ table inet sandbox_dnat {{
         ip saddr {subnet} udp dport {dns_port} dnat to {gateway_ip}:{dns_port}
         ip saddr {subnet} tcp dport {dns_port} dnat to {gateway_ip}:{dns_port}
 
-        # Policy-allowed destinations -> Envoy
+        # Policy-allowed TCP -> Envoy
         ip saddr {subnet} meta l4proto tcp ip daddr . tcp dport @{tcp_set} dnat to {gateway_ip}:{envoy_port}
-        ip saddr {subnet} meta l4proto udp ip daddr . udp dport @{udp_set} dnat to {gateway_ip}:{envoy_port}
 
-        # Everything else -> deny-logger
+        # Policy-allowed UDP -> direct to upstream (M12-S2 Decision 1).
+        ip saddr {subnet} meta l4proto udp ip daddr . udp dport @{udp_set} accept
+
+        # Unmatched TCP -> deny-logger
         ip saddr {subnet} meta l4proto tcp dnat to {gateway_ip}:{deny_tcp_port}
-        ip saddr {subnet} meta l4proto udp dnat to {gateway_ip}:{deny_udp_port}
+
+        # Unmatched UDP -> NFLOG group then drop (M12-S2 Decision 2).
+        ip saddr {subnet} meta l4proto udp log group {nflog_group}
+        ip saddr {subnet} meta l4proto udp drop
 
         # Block cloud metadata
         ip daddr 169.254.169.254 drop
@@ -815,7 +820,7 @@ table inet sandbox_policy {{
         dns_port = crate::gateway::GATEWAY_DNS_PORT,
         envoy_port = crate::gateway::GATEWAY_ENVOY_PORT,
         deny_tcp_port = crate::gateway::GATEWAY_DENY_LOGGER_TCP_PORT,
-        deny_udp_port = crate::gateway::GATEWAY_DENY_LOGGER_UDP_PORT,
+        nflog_group = crate::gateway::NFT_NFLOG_DENY_GROUP,
         tcp_set = NFT_POLICY_ALLOW_TCP_SET,
         udp_set = NFT_POLICY_ALLOW_UDP_SET,
     )
@@ -3033,7 +3038,8 @@ mod tests {
              the CIDR rule; got:\n{nft}"
         );
         // sandbox_dnat.prerouting conditionally DNATs policy-allowed
-        // destinations to Envoy.
+        // TCP to Envoy. UDP is `accept`-ed without DNAT (M12-S2
+        // Decision 1).
         assert!(
             nft.contains(
                 "meta l4proto tcp ip daddr . tcp dport @policy_allow_tcp dnat to 10.209.0.2:10000"
@@ -3042,11 +3048,9 @@ mod tests {
              Envoy via conditional DNAT; got:\n{nft}"
         );
         assert!(
-            nft.contains(
-                "meta l4proto udp ip daddr . udp dport @policy_allow_udp dnat to 10.209.0.2:10000"
-            ),
-            "sandbox_dnat.prerouting must route policy-allowed UDP to \
-             Envoy via conditional DNAT; got:\n{nft}"
+            nft.contains("meta l4proto udp ip daddr . udp dport @policy_allow_udp accept"),
+            "sandbox_dnat.prerouting must `accept` policy-allowed UDP \
+             without DNAT (M12-S2 Decision 1); got:\n{nft}"
         );
         // sandbox_policy.output admits the gateway's own upstream
         // connections to the same policy-allowed destinations.
@@ -3101,10 +3105,10 @@ mod tests {
     }
 
     #[test]
-    fn compile_nftables_dnat_prerouting_routes_allow_to_envoy_deny_to_deny_logger() {
-        // Pin the four prerouting DNAT rules that encode the VM-egress
-        // filter decision: DNS → CoreDNS :53, allow → Envoy :10000, TCP
-        // deny → deny-logger :10001, UDP deny → deny-logger :10002.
+    fn compile_nftables_dnat_prerouting_routes_allow_and_deny_per_protocol() {
+        // M12-S2 prerouting shape: DNS → CoreDNS :53, TCP allow → Envoy
+        // :10000, UDP allow → direct accept (no DNAT), TCP deny →
+        // deny-logger :10001, UDP deny → NFLOG group 1 + drop.
         let policy = transport_policy();
         let net = test_network_info();
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
@@ -3120,7 +3124,7 @@ mod tests {
             "VM-egress TCP :53 must DNAT to CoreDNS; got:\n{nft}"
         );
 
-        // Policy-allowed destinations to Envoy :10000.
+        // Policy-allowed TCP DNATs to Envoy :10000 (unchanged).
         assert!(
             nft.contains(
                 "ip saddr 10.209.0.0/28 meta l4proto tcp ip daddr . tcp dport \
@@ -3128,36 +3132,64 @@ mod tests {
             ),
             "policy-allowed TCP must DNAT to Envoy :10000; got:\n{nft}"
         );
+        // Policy-allowed UDP `accept`s without DNAT (M12-S2 Decision 1).
         assert!(
             nft.contains(
                 "ip saddr 10.209.0.0/28 meta l4proto udp ip daddr . udp dport \
-                 @policy_allow_udp dnat to 10.209.0.2:10000"
+                 @policy_allow_udp accept"
             ),
-            "policy-allowed UDP must DNAT to Envoy :10000; got:\n{nft}"
+            "policy-allowed UDP must `accept` (no DNAT to Envoy under \
+             M12-S2 Decision 1); got:\n{nft}"
+        );
+        assert!(
+            !nft.contains("@policy_allow_udp dnat to"),
+            "M12-S2 Decision 1: policy-allowed UDP MUST NOT DNAT \
+             anywhere; got:\n{nft}"
         );
 
-        // Fall-through to deny-logger (separate TCP and UDP ports).
+        // Fall-through: TCP DNATs to deny-logger; UDP NFLOG-then-drops.
         assert!(
             nft.contains("ip saddr 10.209.0.0/28 meta l4proto tcp dnat to 10.209.0.2:10001"),
             "unmatched TCP must fall through to deny-logger :10001; got:\n{nft}"
         );
         assert!(
-            nft.contains("ip saddr 10.209.0.0/28 meta l4proto udp dnat to 10.209.0.2:10002"),
-            "unmatched UDP must fall through to deny-logger :10002; got:\n{nft}"
+            nft.contains("ip saddr 10.209.0.0/28 meta l4proto udp log group 1"),
+            "unmatched UDP must mirror to NFLOG group 1 (M12-S2 \
+             Decision 2 / Resolution 1); got:\n{nft}"
+        );
+        assert!(
+            nft.contains("ip saddr 10.209.0.0/28 meta l4proto udp drop"),
+            "unmatched UDP must drop after the NFLOG mirror; got:\n{nft}"
+        );
+        assert!(
+            !nft.contains("dnat to 10.209.0.2:10002"),
+            "M12-S2 Decision 2: there is no DNAT-to-:10002 rule \
+             anymore; got:\n{nft}"
         );
 
-        // Ordering: allow rules must appear before the deny-logger
-        // fall-through so nftables evaluates them first.
+        // Ordering: allow rules must appear before fall-through so
+        // nftables evaluates them first.
         let allow_tcp_idx = nft
             .find("dport @policy_allow_tcp dnat to 10.209.0.2:10000")
             .expect("allow-to-envoy TCP rule missing");
         let deny_tcp_idx = nft
             .find("meta l4proto tcp dnat to 10.209.0.2:10001")
             .expect("deny-logger TCP rule missing");
+        let allow_udp_idx = nft
+            .find("@policy_allow_udp accept")
+            .expect("allow-accept UDP rule missing");
+        let deny_udp_idx = nft
+            .find("meta l4proto udp log group 1")
+            .expect("UDP NFLOG mirror missing");
         assert!(
             allow_tcp_idx < deny_tcp_idx,
             "allow-to-envoy TCP must precede deny-logger fall-through; got \
              allow@{allow_tcp_idx} deny@{deny_tcp_idx} in:\n{nft}"
+        );
+        assert!(
+            allow_udp_idx < deny_udp_idx,
+            "allow-accept UDP must precede UDP NFLOG fall-through; got \
+             allow@{allow_udp_idx} deny@{deny_udp_idx} in:\n{nft}"
         );
     }
 
@@ -3852,13 +3884,18 @@ mod tests {
             "sandbox_policy.output must admit gateway-originated UDP to \
              policy-allowed destinations; got:\n{nft}"
         );
-        // sandbox_dnat.prerouting DNATs policy-allowed UDP to Envoy.
+        // sandbox_dnat.prerouting `accept`s policy-allowed UDP without
+        // DNAT (M12-S2 Decision 1: UDP allow path skips Envoy entirely).
         assert!(
-            nft.contains(
-                "meta l4proto udp ip daddr . udp dport @policy_allow_udp dnat to 10.209.0.2:10000"
-            ),
-            "sandbox_dnat.prerouting must route policy-allowed UDP to \
-             Envoy via conditional DNAT; got:\n{nft}"
+            nft.contains("meta l4proto udp ip daddr . udp dport @policy_allow_udp accept"),
+            "sandbox_dnat.prerouting must `accept` policy-allowed UDP \
+             without DNAT (M12-S2 Decision 1); got:\n{nft}"
+        );
+        // The unmatched-UDP arm fires NFLOG instead of DNAT-to-listener.
+        assert!(
+            nft.contains("meta l4proto udp log group 1"),
+            "sandbox_dnat.prerouting must mirror unmatched UDP to \
+             NFLOG group 1 (M12-S2 Decision 2 / Resolution 1); got:\n{nft}"
         );
     }
 

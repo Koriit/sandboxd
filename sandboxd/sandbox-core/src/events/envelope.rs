@@ -196,28 +196,48 @@ pub enum MitmproxyEvent {
     },
 }
 
-/// Deny-logger `deny` / `rate_limited`.
+/// Deny-logger / allow-logger `deny` / `allow` / `rate_limited`.
 ///
-/// The deny-logger component (spec Part 3 / "Deny-logger component")
-/// emits a structured record for every VM-egress connection attempt that
-/// lands in the deny-path of `sandbox_dnat` prerouting — i.e. that
-/// matches no policy allow rule. The `Deny` variant carries the
-/// pre-DNAT 5-tuple per spec Part 3 / "Traffic events" table row for
-/// layer `deny-logger`:
-/// `orig_dst_ip`, `orig_dst_port`, `protocol` (`tcp` / `udp`), `src_ip`,
-/// `src_port`.
+/// Despite the historical "DenyLogger" name on the domain enum, the
+/// `nft-` family of gateway-container loggers (M12-S2 Decision 4)
+/// produces three event kinds that share a common envelope and
+/// flow through the same daemon-side ingest pipeline (Decision 5):
 ///
-/// The `RateLimited` variant is a periodic summary event emitted when
-/// the component's per-session event rate cap is exceeded — individual
-/// denied attempts are dropped from the stream once the cap is hit and
-/// are reported in aggregate via this variant. Carries
-/// `rate_limited_count` per spec Part 3 / "Hardening rules" § 5.
+/// - **`Deny`** — emitted by `sandbox-nft-deny-logger`. The original
+///   M10-S3 contract: spec Part 3 / "Deny-logger component" + "Traffic
+///   events" row for layer `deny-logger`. Pre-DNAT 5-tuple recovered
+///   via `SO_ORIGINAL_DST` (TCP) or NFLOG payload parse (UDP, M12-S2
+///   Decision 2). Same wire shape as `Allow`.
+/// - **`Allow`** — emitted by `sandbox-nft-allow-logger`. M12-S2
+///   Decision 3: one record per new tracked UDP flow observed via
+///   `nfnetlink_conntrack`'s `NFNLGRP_CONNTRACK_NEW` multicast group.
+///   The wire shape mirrors `Deny` field-for-field on purpose so the
+///   round-trip pipeline is one mapper code path with two
+///   discriminator branches; the audit record answers "client X
+///   started a flow to Y on port Z" without a corresponding flow-end
+///   signal (NEW-only, Resolution 7).
+/// - **`RateLimited`** — emitted by either binary's per-process
+///   `RateCap` flush ticker. Periodic summary of events dropped
+///   because the per-second cap was hit. Carries `rate_limited_count`
+///   per spec Part 3 / "Hardening rules" § 5; no 5-tuple to attribute,
+///   so the watcher falls back to its owning session.
+///
+/// The enum kept its original name to avoid churning every
+/// downstream consumer of `TrafficEvent::DenyLogger(...)`. The daemon-
+/// side classification is "nft-layer logger event" regardless of the
+/// verdict; `event_mapper` carries the `Deny` / `Allow` discriminator
+/// onto the wire DTO unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DenyLoggerEvent {
-    /// Single denied connection attempt.
+    /// Single denied connection attempt (deny-logger source).
     Deny(DenyLoggerDeny),
-    /// Periodic cap-breach summary: how many deny events were dropped
-    /// since the last summary tick.
+    /// Single allowed UDP flow (allow-logger source, M12-S2 Decision 3).
+    Allow(DenyLoggerAllow),
+    /// Periodic cap-breach summary: how many events were dropped
+    /// since the last summary tick. Either binary can produce these;
+    /// the daemon does not distinguish the source on this variant
+    /// (the wire shape is identical and the operator-visible signal
+    /// is the same — "the stream is hot enough to hit the rate cap").
     RateLimited {
         rate_limited_count: u32,
         since_ts: DateTime<Utc>,
@@ -231,23 +251,61 @@ pub enum DenyLoggerEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DenyLoggerDeny {
     /// Pre-DNAT original destination IPv4 address (from `SO_ORIGINAL_DST`
-    /// / `IP_ORIGDSTADDR` cmsg).
+    /// / `IP_ORIGDSTADDR` cmsg or NFLOG payload parse).
     pub orig_dst_ip: Ipv4Addr,
     /// Pre-DNAT original destination port.
     pub orig_dst_port: u16,
     /// L4 protocol of the denied attempt.
     pub protocol: DenyProtocol,
-    /// Source IPv4 address (VM bridge IP), from `getpeername` on TCP or
-    /// the datagram's peer address on UDP.
+    /// Source IPv4 address (VM bridge IP), from `getpeername` on TCP
+    /// or the L3 header's source on NFLOG-driven UDP.
     pub src_ip: Ipv4Addr,
     /// Source port.
     pub src_port: u16,
 }
 
-/// L4 protocol on a deny-logger `deny` event.
+/// Payload of [`DenyLoggerEvent::Allow`].
+///
+/// Mirror of [`DenyLoggerDeny`] field-for-field — same names, same
+/// types, same on-wire shape. The only structural difference between
+/// allow and deny is the `event` discriminator on the DTO; the
+/// 5-tuple parsing and ingest path is shared (M12-S2 Decision 5
+/// "additive change, not a new pipeline").
+///
+/// Field rationale:
+///
+/// - `orig_dst_ip` / `orig_dst_port`: destination as observed on the
+///   conntrack ORIGINAL tuple. Under M12-S2 Decision 1, the UDP allow
+///   path does *not* DNAT, so the kernel-emitted ORIGINAL tuple's
+///   destination is the literal address the VM dialled — `orig_dst_*`
+///   reads honestly even though there is no NAT to "originate" past.
+/// - `protocol`: always [`DenyProtocol::Udp`] in practice. Allow-logger
+///   filters the NFCT stream for UDP at parse time (Decision 3
+///   rationale) — TCP allow-path audit is Envoy's job. The field
+///   exists on both `Allow` and `Deny` so the DTO stays uniform.
+/// - `src_ip` / `src_port`: VM-side endpoint, ORIGINAL tuple source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DenyLoggerAllow {
+    /// Original destination IPv4 (conntrack ORIGINAL tuple).
+    pub orig_dst_ip: Ipv4Addr,
+    /// Original destination port.
+    pub orig_dst_port: u16,
+    /// L4 protocol — `Udp` in v1 (allow-logger filters non-UDP at
+    /// parse time, but the field is wire-uniform with `Deny`).
+    pub protocol: DenyProtocol,
+    /// Source IPv4 (VM bridge IP).
+    pub src_ip: Ipv4Addr,
+    /// Source port.
+    pub src_port: u16,
+}
+
+/// L4 protocol on a deny-logger / allow-logger 5-tuple event.
 ///
 /// Serialized on the wire as `"tcp"` / `"udp"` per spec Part 3 /
-/// "Traffic events" row for layer `deny-logger`.
+/// "Traffic events" row for layer `deny-logger`. Reused on `allow`
+/// events (M12-S2 Decision 5) so the wire shape is uniform — the
+/// allow-logger filters non-UDP at parse time, so in practice
+/// `DenyProtocol::Udp` is the only value an `Allow` payload carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DenyProtocol {
     Tcp,
@@ -700,6 +758,55 @@ mod tests {
         let json = round_trip_traffic(event, "deny-logger", "deny");
         assert_eq!(json["protocol"], "udp");
         assert_eq!(json["orig_dst_port"], 53);
+    }
+
+    /// M12-S2 Decision 3 / 5: round-trip an `allow` event the same
+    /// way the existing `deny` round-trip tests do. The deny tests
+    /// stay green untouched (regression guard); this test adds the
+    /// new variant. The 5-tuple shape is identical to deny —
+    /// `orig_dst_ip`, `orig_dst_port`, `protocol`, `src_ip`,
+    /// `src_port` — only the `event` discriminator differs.
+    #[test]
+    fn env_round_trip_traffic_deny_logger_allow_udp() {
+        let event = Event::Traffic {
+            envelope: fixture_envelope(),
+            event: TrafficEvent::DenyLogger(DenyLoggerEvent::Allow(DenyLoggerAllow {
+                orig_dst_ip: "198.51.100.7".parse().unwrap(),
+                orig_dst_port: 123,
+                protocol: DenyProtocol::Udp,
+                src_ip: "10.0.0.42".parse().unwrap(),
+                src_port: 51234,
+            })),
+        };
+        let json = round_trip_traffic(event, "deny-logger", "allow");
+        for field in [
+            "timestamp",
+            "session",
+            "layer",
+            "event",
+            "orig_dst_ip",
+            "orig_dst_port",
+            "protocol",
+            "src_ip",
+            "src_port",
+        ] {
+            assert!(
+                json.get(field).is_some(),
+                "deny-logger allow missing `{field}`; json = {json}"
+            );
+        }
+        assert_eq!(json["protocol"], "udp");
+        assert_eq!(json["orig_dst_ip"], "198.51.100.7");
+        assert_eq!(json["orig_dst_port"], 123);
+        // `rate_limited_count` / `since_ts` must not leak into an `allow`.
+        assert!(
+            json.get("rate_limited_count").is_none(),
+            "rate_limited_count must not appear on allow; json = {json}"
+        );
+        assert!(
+            json.get("since_ts").is_none(),
+            "since_ts must not appear on allow; json = {json}"
+        );
     }
 
     #[test]

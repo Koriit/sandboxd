@@ -22,9 +22,9 @@
 use chrono::{DateTime, SecondsFormat, Utc};
 
 use crate::events::{
-    DenyLoggerDeny, DenyLoggerEvent, DenyProtocol, DnsEvent, EnvoyConnection, EnvoyEvent, Event,
-    EventEnvelope, GatewayShutdownReason, HealthComponent, LifecycleEvent, MitmproxyEvent,
-    PolicyApplyStatus, TrafficEvent,
+    DenyLoggerAllow, DenyLoggerDeny, DenyLoggerEvent, DenyProtocol, DnsEvent, EnvoyConnection,
+    EnvoyEvent, Event, EventEnvelope, GatewayShutdownReason, HealthComponent, LifecycleEvent,
+    MitmproxyEvent, PolicyApplyStatus, TrafficEvent,
 };
 use crate::session::SessionId;
 
@@ -207,6 +207,7 @@ fn deny_logger_event_dto(envelope: &EventEnvelope, event: &DenyLoggerEvent) -> D
 fn deny_logger_body_dto(event: &DenyLoggerEvent) -> DenyLoggerEventBodyDto {
     match event {
         DenyLoggerEvent::Deny(d) => deny_body_dto(d),
+        DenyLoggerEvent::Allow(a) => allow_body_dto(a),
         DenyLoggerEvent::RateLimited {
             rate_limited_count,
             since_ts,
@@ -224,6 +225,16 @@ fn deny_body_dto(d: &DenyLoggerDeny) -> DenyLoggerEventBodyDto {
         protocol: d.protocol.into(),
         src_ip: d.src_ip.to_string(),
         src_port: d.src_port,
+    }
+}
+
+fn allow_body_dto(a: &DenyLoggerAllow) -> DenyLoggerEventBodyDto {
+    DenyLoggerEventBodyDto::Allow {
+        orig_dst_ip: a.orig_dst_ip.to_string(),
+        orig_dst_port: a.orig_dst_port,
+        protocol: a.protocol.into(),
+        src_ip: a.src_ip.to_string(),
+        src_port: a.src_port,
     }
 }
 
@@ -379,8 +390,8 @@ mod tests {
     use serde_json::Value;
 
     use crate::events::{
-        DenyLoggerDeny, DenyLoggerEvent, DenyProtocol, DnsEvent, EnvoyConnection, EnvoyEvent,
-        Event, EventEnvelope, GatewayShutdownReason, HealthComponent, LifecycleEvent,
+        DenyLoggerAllow, DenyLoggerDeny, DenyLoggerEvent, DenyProtocol, DnsEvent, EnvoyConnection,
+        EnvoyEvent, Event, EventEnvelope, GatewayShutdownReason, HealthComponent, LifecycleEvent,
         MitmproxyEvent, PolicyApplyStatus, TrafficEvent,
     };
     use crate::policy::{
@@ -657,6 +668,19 @@ mod tests {
             (
                 Event::Traffic {
                     envelope: envelope.clone(),
+                    event: TrafficEvent::DenyLogger(DenyLoggerEvent::Allow(DenyLoggerAllow {
+                        orig_dst_ip: Ipv4Addr::new(198, 51, 100, 7),
+                        orig_dst_port: 123,
+                        protocol: DenyProtocol::Udp,
+                        src_ip: Ipv4Addr::new(10, 0, 0, 42),
+                        src_port: 51234,
+                    })),
+                },
+                "allow",
+            ),
+            (
+                Event::Traffic {
+                    envelope: envelope.clone(),
                     event: TrafficEvent::DenyLogger(DenyLoggerEvent::RateLimited {
                         rate_limited_count: 7,
                         since_ts: envelope.timestamp,
@@ -832,6 +856,58 @@ mod tests {
     }
 
     #[test]
+    fn dto_deny_logger_allow_udp_wire_shape() {
+        // M12-S2 Decision 3 / 5: allow events share the deny event's
+        // 5-tuple wire shape (`orig_dst_ip`, `orig_dst_port`,
+        // `protocol`, `src_ip`, `src_port`), distinguished only by
+        // the `event` discriminator (`"allow"` vs `"deny"`). This
+        // test pins the allow shape and the round-trip equality
+        // alongside the existing deny tests; the deny round-trip
+        // tests stay green untouched.
+        let event = Event::Traffic {
+            envelope: EventEnvelope {
+                timestamp: Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap()
+                    + chrono::Duration::milliseconds(789),
+                session: Some(sid()),
+            },
+            event: TrafficEvent::DenyLogger(DenyLoggerEvent::Allow(DenyLoggerAllow {
+                orig_dst_ip: Ipv4Addr::new(198, 51, 100, 7),
+                orig_dst_port: 123,
+                protocol: DenyProtocol::Udp,
+                src_ip: Ipv4Addr::new(10, 0, 0, 42),
+                src_port: 51234,
+            })),
+        };
+        let json = to_json(event);
+        // The on-bus DTO `layer` stays "deny-logger" — the layer is
+        // the daemon's classification of "nft-layer logger event"
+        // (Decision 5: same code path), not the literal name of the
+        // emitting binary. The on-disk JSONL `layer:"allow-logger"`
+        // is mapped at ingest into this same domain bucket.
+        assert_eq!(json["layer"], "deny-logger");
+        assert_eq!(json["event"], "allow");
+        assert_eq!(json["timestamp"], "2026-05-01T12:00:00.789Z");
+        assert_eq!(json["session"], "0123456789ab");
+        assert_eq!(json["orig_dst_ip"], "198.51.100.7");
+        assert_eq!(json["orig_dst_port"], 123);
+        assert_eq!(json["protocol"], "udp");
+        assert_eq!(json["src_ip"], "10.0.0.42");
+        assert_eq!(json["src_port"], 51234);
+        // `rate_limited_count` / `since_ts` must not leak into
+        // an `allow` event.
+        for absent in ["rate_limited_count", "since_ts"] {
+            assert!(
+                json.get(absent).is_none(),
+                "`{absent}` must not appear on allow; json = {json}"
+            );
+        }
+        // Round-trip: parsing back and re-serializing must preserve shape.
+        let dto: EventDto = serde_json::from_value(json.clone()).expect("parse back");
+        let reserialized = serde_json::to_value(&dto).expect("re-serialize");
+        assert_eq!(json, reserialized, "round-trip must preserve JSON shape");
+    }
+
+    #[test]
     fn dto_deny_logger_rate_limited_wire_shape() {
         // `rate_limited` summary event — `rate_limited_count` is the
         // spec-authoritative field name (spec § "Hardening rules" #5).
@@ -970,6 +1046,16 @@ mod tests {
                     protocol: DenyProtocol::Tcp,
                     src_ip: Ipv4Addr::new(10, 0, 0, 42),
                     src_port: 55123,
+                })),
+            },
+            Event::Traffic {
+                envelope: jsonl_envelope(),
+                event: TrafficEvent::DenyLogger(DenyLoggerEvent::Allow(DenyLoggerAllow {
+                    orig_dst_ip: Ipv4Addr::new(198, 51, 100, 7),
+                    orig_dst_port: 123,
+                    protocol: DenyProtocol::Udp,
+                    src_ip: Ipv4Addr::new(10, 0, 0, 42),
+                    src_port: 51234,
                 })),
             },
             Event::Traffic {

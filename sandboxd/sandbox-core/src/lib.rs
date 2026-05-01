@@ -63,16 +63,17 @@ pub use dns_propagation::{
 };
 pub use error::{ApiError, SandboxError};
 pub use events::{
-    DEFAULT_BROADCAST_CAPACITY, DEFAULT_RING_BUFFER_SIZE, DenyLoggerDeny, DenyLoggerEvent,
-    DenyProtocol, DnsEvent, EVENTS_DIR_IN_CONTAINER, EnvoyConnection, EnvoyEvent, Event, EventBus,
-    EventBusConfig, EventEnvelope, EventSubscription, GatewayShutdownReason, HealthComponent,
-    LifecycleEvent, MitmproxyEvent, PersistConfig, PersistentSink, PolicyApplyStatus, TrafficEvent,
-    VmIpSessionMap, events_host_root, ingest::SessionIngestor, session_events_host_dir,
+    DEFAULT_BROADCAST_CAPACITY, DEFAULT_RING_BUFFER_SIZE, DenyLoggerAllow, DenyLoggerDeny,
+    DenyLoggerEvent, DenyProtocol, DnsEvent, EVENTS_DIR_IN_CONTAINER, EnvoyConnection, EnvoyEvent,
+    Event, EventBus, EventBusConfig, EventEnvelope, EventSubscription, GatewayShutdownReason,
+    HealthComponent, LifecycleEvent, MitmproxyEvent, PersistConfig, PersistentSink,
+    PolicyApplyStatus, TrafficEvent, VmIpSessionMap, events_host_root, ingest::SessionIngestor,
+    session_events_host_dir,
 };
 pub use gateway::{
-    DockerHealth, GATEWAY_DENY_LOGGER_HEALTH_PORT, GATEWAY_DENY_LOGGER_TCP_PORT,
-    GATEWAY_DENY_LOGGER_UDP_PORT, GATEWAY_DNS_PORT, GATEWAY_ENVOY_PORT, GatewayManager,
-    GatewayStatus, NFT_POLICY_ALLOW_TCP_SET, NFT_POLICY_ALLOW_UDP_SET,
+    DockerHealth, GATEWAY_DENY_LOGGER_HEALTH_PORT, GATEWAY_DENY_LOGGER_TCP_PORT, GATEWAY_DNS_PORT,
+    GATEWAY_ENVOY_PORT, GatewayManager, GatewayStatus, NFT_NFLOG_DENY_GROUP,
+    NFT_POLICY_ALLOW_TCP_SET, NFT_POLICY_ALLOW_UDP_SET,
 };
 pub use guest::{
     GUEST_AGENT_PORT, GuestConnector, GuestRequest, GuestResponse, MAX_MESSAGE_SIZE, read_message,

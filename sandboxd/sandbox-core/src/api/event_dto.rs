@@ -166,7 +166,7 @@ pub enum MitmproxyEventBodyDto {
 }
 
 // ---------------------------------------------------------------------------
-// Deny-logger
+// Deny-logger / allow-logger (the M12-S2 nft-logger family)
 // ---------------------------------------------------------------------------
 //
 // Wire shape per spec Part 3 / "Traffic events" row for layer
@@ -178,6 +178,18 @@ pub enum MitmproxyEventBodyDto {
 // The `rate_limited` summary event carries `rate_limited_count` plus
 // `since_ts` marking the start of the summarised window, per spec
 // Part 3 / "Hardening rules" § 5.
+//
+// M12-S2 Decision 3 / 5 adds an `allow` variant with the same 5-tuple
+// shape as `deny`; the only structural difference is the `event`
+// discriminator. Per Decision 5 ("additive change, not a new
+// pipeline") the variant is added inside the existing
+// `DenyLoggerEventBodyDto` enum so daemon ingest stays one mapper
+// code path. Forward-compat: any future `allow_end` / equivalent
+// can be added additively here without breaking the existing
+// `deny` / `allow` / `rate_limited` shapes — `serde` round-tripping
+// is unknown-field-tolerant by default for tagged enums (unknown
+// `event` values yield deserialise errors that the ingest parser
+// surfaces as drops, mirroring the `deny_logger` path).
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DenyLoggerEventDto {
@@ -192,6 +204,15 @@ pub struct DenyLoggerEventDto {
 pub enum DenyLoggerEventBodyDto {
     Deny {
         /// IPv4 rendered as `Ipv4Addr::to_string()` (e.g. `"203.0.113.1"`).
+        orig_dst_ip: String,
+        orig_dst_port: u16,
+        protocol: DenyProtocolDto,
+        src_ip: String,
+        src_port: u16,
+    },
+    /// M12-S2 Decision 3 / 5: allow-flow audit record. Same 5-tuple
+    /// shape as `Deny`; the `event` tag is `"allow"`.
+    Allow {
         orig_dst_ip: String,
         orig_dst_port: u16,
         protocol: DenyProtocolDto,

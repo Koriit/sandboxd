@@ -30,9 +30,9 @@ pub use bus::{
     EventSubscription,
 };
 pub use envelope::{
-    DenyLoggerDeny, DenyLoggerEvent, DenyProtocol, DnsEvent, EnvoyConnection, EnvoyEvent, Event,
-    EventEnvelope, GatewayShutdownReason, HealthComponent, LifecycleEvent, MitmproxyEvent,
-    PolicyApplyStatus, TrafficEvent,
+    DenyLoggerAllow, DenyLoggerDeny, DenyLoggerEvent, DenyProtocol, DnsEvent, EnvoyConnection,
+    EnvoyEvent, Event, EventEnvelope, GatewayShutdownReason, HealthComponent, LifecycleEvent,
+    MitmproxyEvent, PolicyApplyStatus, TrafficEvent,
 };
 pub use health_transition::{HEALTHY, HealthTransition, detect_health_transition};
 pub use persist::{PersistConfig, PersistentSink};

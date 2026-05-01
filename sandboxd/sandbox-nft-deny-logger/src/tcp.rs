@@ -24,8 +24,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use chrono::Utc;
 
-use crate::event::{DenyRecord, EventEmitter, Protocol};
-use crate::limits::{Admit, RateCap};
+use sandbox_event_emitter::{Admit, DenyRecord, EventEmitter, Protocol, RateCap};
 
 /// Bind a TCP listener on `(bind_ip, port)` with an explicit `listen(2)`
 /// backlog.
@@ -272,9 +271,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use crate::event::EventEmitter;
-    use crate::limits::RateCap;
     use chrono::Utc;
+    use sandbox_event_emitter::{EventEmitter, RateCap};
 
     /// TCP accept without any PREROUTING DNAT in play: `SO_ORIGINAL_DST`
     /// returns the loopback-listener address itself. We assert that an
@@ -284,7 +282,7 @@ mod tests {
     async fn tcp_emits_one_deny_event_and_rst_closes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("deny.jsonl");
-        let emitter = Arc::new(EventEmitter::open(&path).unwrap());
+        let emitter = Arc::new(EventEmitter::open(&path, "deny-logger").unwrap());
         let rate_cap = Arc::new(RateCap::new(1_000, Arc::clone(&emitter), Utc::now()));
         // Backlog 128 is plenty for a single-client emit-and-RST test;
         // production callers compute backlog from `conn_cap` (see
@@ -417,7 +415,7 @@ mod tests {
     async fn tcp_respects_concurrency_cap() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("deny.jsonl");
-        let emitter = Arc::new(EventEmitter::open(&path).unwrap());
+        let emitter = Arc::new(EventEmitter::open(&path, "deny-logger").unwrap());
         // Rate cap high enough to not interfere with this test.
         let rate_cap = Arc::new(RateCap::new(10_000, Arc::clone(&emitter), Utc::now()));
 

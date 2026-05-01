@@ -2843,6 +2843,29 @@ fn extract_table_fields(
                     true,
                 )
             }
+            DenyLoggerEventBodyDto::Allow {
+                orig_dst_ip,
+                orig_dst_port,
+                protocol,
+                src_ip,
+                src_port,
+            } => {
+                let host_port = format!("{orig_dst_ip}:{orig_dst_port}");
+                let proto = match protocol {
+                    DenyProtocolDto::Tcp => "tcp",
+                    DenyProtocolDto::Udp => "udp",
+                };
+                let detail = format!("proto={proto} src={src_ip}:{src_port} decision=allow");
+                (
+                    dl.timestamp.clone(),
+                    dl.session.clone(),
+                    "deny-logger",
+                    "allow",
+                    host_port,
+                    detail,
+                    false,
+                )
+            }
             DenyLoggerEventBodyDto::RateLimited {
                 rate_limited_count,
                 since_ts,

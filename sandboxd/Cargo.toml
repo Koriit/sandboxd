@@ -3,7 +3,9 @@ members = [
     "sandboxd",
     "sandbox-cli",
     "sandbox-core",
-    "sandbox-deny-logger",
+    "sandbox-event-emitter",
+    "sandbox-nft-allow-logger",
+    "sandbox-nft-deny-logger",
     "sandbox-guest",
     "sandbox-route-helper",
 ]

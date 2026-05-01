@@ -1548,22 +1548,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "sandbox-deny-logger"
+name = "sandbox-event-emitter"
 version = "0.1.0"
 dependencies = [
  "chrono",
- "clap",
- "libc",
- "netlink-sys",
- "nix",
  "serde",
  "serde_json",
- "socket2",
  "tempfile",
- "thiserror",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1574,6 +1567,44 @@ dependencies = [
  "sandbox-core",
  "serde",
  "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "sandbox-nft-allow-logger"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "libc",
+ "netlink-sys",
+ "sandbox-event-emitter",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "sandbox-nft-deny-logger"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "libc",
+ "netlink-sys",
+ "nix",
+ "sandbox-event-emitter",
+ "serde",
+ "serde_json",
+ "socket2",
+ "tempfile",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",

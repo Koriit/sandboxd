@@ -1,12 +1,14 @@
 //! Per-second event rate cap + periodic `rate_limited` summary.
 //!
-//! Spec reference: Part 3 / "Hardening rules" § 5 (lines 844-847).
+//! Spec reference: `2026-04-21-port-explicit-policies-presets-observability-design.md`
+//! Part 3 / "Hardening rules" § 5.
 //!
-//! The deny-logger must not spam its JSONL file — a misbehaving VM
-//! could open thousands of denied connections per second and drown the
-//! ingest pipeline. We cap admitted events at `rate_cap` per rolling
-//! 1-second window. Excess attempts are *not* emitted; they are counted
-//! and surfaced on a periodic `rate_limited` summary event that carries
+//! The deny-logger (and, in M12-S2, the allow-logger sharing this same
+//! crate) must not spam its JSONL file — a misbehaving VM could open
+//! thousands of denied connections per second and drown the ingest
+//! pipeline. We cap admitted events at `rate_cap` per rolling 1-second
+//! window. Excess attempts are *not* emitted; they are counted and
+//! surfaced on a periodic `rate_limited` summary event that carries
 //! the drop count and the window start timestamp.
 //!
 //! ## Design
@@ -102,9 +104,6 @@ impl RateCap {
     /// concurrency-cap path, where the refusal happens at accept and
     /// no deny event is ever eligible — the drop still feeds the
     /// periodic summary per spec § 6 / plan Phase 3.
-    // Wired into `tcp::run` by the concurrency-cap commit later in
-    // this phase; exercised by `record_drop_feeds_summary_counter`.
-    #[allow(dead_code)]
     pub fn record_drop(&self, now: DateTime<Utc>) {
         self.maybe_rollover(now);
         self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -228,7 +227,7 @@ mod tests {
     fn rate_cap_produces_summary_event() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("deny.jsonl");
-        let emitter = Arc::new(EventEmitter::open(&path).unwrap());
+        let emitter = Arc::new(EventEmitter::open(&path, "deny-logger").unwrap());
         let t0 = Utc
             .timestamp_millis_opt(1_700_000_000_000)
             .single()
@@ -281,7 +280,7 @@ mod tests {
     fn record_drop_feeds_summary_counter() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("deny.jsonl");
-        let emitter = Arc::new(EventEmitter::open(&path).unwrap());
+        let emitter = Arc::new(EventEmitter::open(&path, "deny-logger").unwrap());
         let t0 = Utc
             .timestamp_millis_opt(1_700_000_000_000)
             .single()
@@ -308,7 +307,7 @@ mod tests {
     fn flush_now_emits_pending_summary() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("deny.jsonl");
-        let emitter = Arc::new(EventEmitter::open(&path).unwrap());
+        let emitter = Arc::new(EventEmitter::open(&path, "deny-logger").unwrap());
         let t0 = Utc
             .timestamp_millis_opt(1_700_000_000_000)
             .single()
@@ -334,7 +333,7 @@ mod tests {
     fn empty_window_emits_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("deny.jsonl");
-        let emitter = Arc::new(EventEmitter::open(&path).unwrap());
+        let emitter = Arc::new(EventEmitter::open(&path, "deny-logger").unwrap());
         let t0 = Utc
             .timestamp_millis_opt(1_700_000_000_000)
             .single()

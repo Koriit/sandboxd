@@ -29,8 +29,9 @@ chrono.workspace = true
 # `--events-persist-retention-days` to fall back to
 # `SANDBOX_EVENTS_PERSIST_RETENTION_DAYS`. The workspace clap dep only
 # carries `derive`; without re-stating `env` here the crate compiles only
-# under workspace feature unification (via `sandbox-deny-logger` which
-# also opts into `env`), so isolated `cargo check -p sandboxd` fails.
+# under workspace feature unification (via `sandbox-nft-deny-logger`
+# which also opts into `env`), so isolated `cargo check -p sandboxd`
+# fails.
 clap = { workspace = true, features = ["env"] }
 # M11-S5 Phase 5A fixup: the cap-aware `resolve_route_helper_path` reads
 # the `security.capability` xattr via `libc::getxattr` to verify each

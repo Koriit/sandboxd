@@ -341,7 +341,7 @@ async fn mitmproxy_event_attributes_via_watcher_session_even_with_unbound_client
     ingestor.abort();
 }
 
-/// End-to-end: `deny-logger.jsonl` records are parsed and surface on the
+/// End-to-end: `nft-deny.jsonl` records are parsed and surface on the
 /// session bus. Covers both event shapes prescribed by spec Part 3:
 ///
 /// 1. A TCP `deny` record — the 5-tuple drives a `vm_ip_map.lookup` on
@@ -369,13 +369,13 @@ async fn deny_logger_jsonl_appears_on_bus() {
     // component per spec Part 3 / "Traffic events" row for `deny-logger`:
     // `orig_dst_ip`, `orig_dst_port`, `protocol`, `src_ip`, `src_port`.
     let deny_line = r#"{"timestamp":"2026-04-22T09:45:10.000Z","layer":"deny-logger","event":"deny","orig_dst_ip":"203.0.113.1","orig_dst_port":8443,"protocol":"tcp","src_ip":"10.0.0.42","src_port":51234}"#;
-    append_jsonl_line(&events_dir.join("deny-logger.jsonl"), deny_line).await;
+    append_jsonl_line(&events_dir.join("nft-deny.jsonl"), deny_line).await;
 
     // --- Rate-limited summary — no 5-tuple; `rate_limited_count` +
     // `since_ts` per spec Part 3 / "Hardening rules" § 5. Attribution
     // must fall back to the ingestor's own session.
     let rate_limited_line = r#"{"timestamp":"2026-04-22T09:45:11.000Z","layer":"deny-logger","event":"rate_limited","rate_limited_count":17,"since_ts":"2026-04-22T09:45:10.000Z"}"#;
-    append_jsonl_line(&events_dir.join("deny-logger.jsonl"), rate_limited_line).await;
+    append_jsonl_line(&events_dir.join("nft-deny.jsonl"), rate_limited_line).await;
 
     let mut saw_deny = false;
     let mut saw_rate_limited = false;

@@ -47,26 +47,32 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::events::ingest::coredns::{ParsedDnsEvent, parse_coredns_line};
-use crate::events::ingest::deny_logger::{ParsedDenyLoggerEvent, parse_deny_logger_line};
 use crate::events::ingest::envoy::{ParsedEnvoyEvent, parse_envoy_line};
 use crate::events::ingest::jsonl_reader::JsonlTailer;
 use crate::events::ingest::mitmproxy::{ParsedMitmEvent, parse_mitmproxy_line};
+use crate::events::ingest::nft_logger::{ParsedNftLoggerEvent, parse_nft_logger_line};
 use crate::events::{Event, EventBus, EventEnvelope, TrafficEvent, VmIpSessionMap};
 use crate::session::SessionId;
 
-/// File names of the four producers. Kept private to this module —
+/// File names of the five producers. Kept private to this module —
 /// the producer side (gateway-container Docker image) is the source of
 /// truth. If a new layer ships, add it here and a matching parser.
+///
+/// `nft-allow.jsonl` (M12-S2 Phase 3) shares the `nft_logger` parser
+/// with `nft-deny.jsonl`; the per-file `Layer` discriminator is what
+/// routes the dispatch arm.
 const ENVOY_JSONL: &str = "envoy.jsonl";
 const COREDNS_JSONL: &str = "coredns.jsonl";
 const MITMPROXY_JSONL: &str = "mitmproxy.jsonl";
-const DENY_LOGGER_JSONL: &str = "deny-logger.jsonl";
+const DENY_LOGGER_JSONL: &str = "nft-deny.jsonl";
+const ALLOW_LOGGER_JSONL: &str = "nft-allow.jsonl";
 
 const KNOWN_FILES: &[&str] = &[
     ENVOY_JSONL,
     COREDNS_JSONL,
     MITMPROXY_JSONL,
     DENY_LOGGER_JSONL,
+    ALLOW_LOGGER_JSONL,
 ];
 
 /// Fallback-poll interval. Matches the plan's "2-second poll even in
@@ -75,12 +81,18 @@ const KNOWN_FILES: &[&str] = &[
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Which layer a particular tailer serves. Drives the parse dispatch.
+///
+/// `DenyLogger` and `AllowLogger` are sibling members of the nft-logger
+/// family (M12-S2 Decision 5): both flow through
+/// [`crate::events::ingest::nft_logger::parse_nft_logger_line`] and end
+/// up as [`crate::events::DenyLoggerEvent`] variants on the bus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Layer {
     Envoy,
     Coredns,
     Mitmproxy,
     DenyLogger,
+    AllowLogger,
 }
 
 impl Layer {
@@ -90,6 +102,7 @@ impl Layer {
             COREDNS_JSONL => Some(Layer::Coredns),
             MITMPROXY_JSONL => Some(Layer::Mitmproxy),
             DENY_LOGGER_JSONL => Some(Layer::DenyLogger),
+            ALLOW_LOGGER_JSONL => Some(Layer::AllowLogger),
             _ => None,
         }
     }
@@ -101,6 +114,7 @@ impl Layer {
             Layer::Coredns => COREDNS_JSONL,
             Layer::Mitmproxy => MITMPROXY_JSONL,
             Layer::DenyLogger => DENY_LOGGER_JSONL,
+            Layer::AllowLogger => ALLOW_LOGGER_JSONL,
         }
     }
 }
@@ -400,8 +414,8 @@ fn dispatch_line(
             // attribute via watcher_session — same treatment as deny-logger's
             // rate_limited summary.
             .map(|p: ParsedMitmEvent| (p.timestamp, None, p.traffic)),
-        Layer::DenyLogger => parse_deny_logger_line(line)
-            .map(|p: ParsedDenyLoggerEvent| (p.timestamp, p.src_ip, p.traffic)),
+        Layer::DenyLogger | Layer::AllowLogger => parse_nft_logger_line(line)
+            .map(|p: ParsedNftLoggerEvent| (p.timestamp, p.src_ip, p.traffic)),
     };
     let (timestamp, maybe_client_ip, traffic) = match parsed {
         Ok(v) => v,
@@ -483,8 +497,12 @@ mod tests {
             Some(Layer::Mitmproxy)
         );
         assert_eq!(
-            Layer::from_file_name("deny-logger.jsonl"),
+            Layer::from_file_name("nft-deny.jsonl"),
             Some(Layer::DenyLogger)
+        );
+        assert_eq!(
+            Layer::from_file_name("nft-allow.jsonl"),
+            Some(Layer::AllowLogger)
         );
     }
 
@@ -495,7 +513,10 @@ mod tests {
         assert_eq!(Layer::from_file_name(""), None);
         // Underscore vs. hyphen variant — easy-to-make typo, must not
         // match.
-        assert_eq!(Layer::from_file_name("deny_logger.jsonl"), None);
+        assert_eq!(Layer::from_file_name("nft_deny.jsonl"), None);
+        // Pre-rename legacy filename — must no longer match after the
+        // M12-S2 Resolution 6 rename to `nft-deny.jsonl`.
+        assert_eq!(Layer::from_file_name("deny-logger.jsonl"), None);
     }
 
     #[test]
@@ -505,6 +526,7 @@ mod tests {
             Layer::Coredns,
             Layer::Mitmproxy,
             Layer::DenyLogger,
+            Layer::AllowLogger,
         ] {
             assert_eq!(Layer::from_file_name(l.file_name()), Some(l));
         }
