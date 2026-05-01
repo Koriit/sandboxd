@@ -108,19 +108,6 @@ func filterECHParams(params []dns.SVCBKeyValue) ([]dns.SVCBKeyValue, bool) {
 	return kept, true
 }
 
-// hasECHParam returns true if the RR is a SVCB or HTTPS record containing
-// an ECH SvcParam (key 5).
-func hasECHParam(rr dns.RR) bool {
-	switch r := rr.(type) {
-	case *dns.SVCB:
-		return containsECHKey(r.Value)
-	case *dns.HTTPS:
-		return containsECHKey(r.Value)
-	default:
-		return false
-	}
-}
-
 // containsECHKey checks a slice of SVCB key-value pairs for the ECH key.
 func containsECHKey(params []dns.SVCBKeyValue) bool {
 	for _, kv := range params {
