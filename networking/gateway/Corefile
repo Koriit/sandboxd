@@ -4,7 +4,9 @@
 #   - Only domains listed in the policy file are resolved
 #   - All other domains receive NXDOMAIN
 #   - AAAA records are stripped (IPv4-only networking)
-#   - SVCB/HTTPS records with ECH are stripped (prevents TLS ECH bypass)
+#   - ECH SvcParams are stripped from SVCB/HTTPS records (prevents TLS
+#     ECH bypass); records themselves and their non-ECH SvcParams reach
+#     the VM unchanged
 #   - Resolved domain→IP mappings are reported to a JSON file
 #   - Every allow/deny decision is also written as a JSONL line to
 #     `events_file`; sandboxd tails the file and ingests the stream into the

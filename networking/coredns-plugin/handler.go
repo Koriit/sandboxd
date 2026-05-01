@@ -43,8 +43,11 @@ type SandboxPolicy struct {
 func (sp *SandboxPolicy) Name() string { return pluginName }
 
 // ServeDNS implements the plugin.Handler interface. It checks the queried
-// domain against the policy, blocks denied domains with NXDOMAIN, and strips
-// AAAA/ECH records from allowed responses.
+// domain against the policy, blocks denied domains with NXDOMAIN, denies
+// AAAA queries with an empty answer (IPv4-only networking), and strips
+// the ECH SvcParam from any SVCB/HTTPS records returned by the upstream
+// resolver. SVCB/HTTPS records themselves and their non-ECH SvcParams
+// pass through to the VM unchanged.
 func (sp *SandboxPolicy) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
 	state := request.Request{W: w, Req: r}
 	qname := state.Name() // lowercase, trailing dot
@@ -67,16 +70,10 @@ func (sp *SandboxPolicy) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *
 		return dns.RcodeSuccess, nil
 	}
 
-	// For SVCB/HTTPS queries, respond with empty answer to prevent ECH negotiation.
-	if qtype == dnsTypeSVCB || qtype == dnsTypeHTTPS {
-		log.Infof("query %s %s -> denied (SVCB/HTTPS stripped)", displayName, qtypeStr)
-		sp.emitDenied(displayName, qtypeStr, "SVCB/HTTPS stripped", clientIP)
-		m := new(dns.Msg).SetReply(r)
-		m.Authoritative = false
-		m.RecursionAvailable = true
-		w.WriteMsg(m)
-		return dns.RcodeSuccess, nil
-	}
+	// SVCB/HTTPS queries are forwarded upstream so that non-ECH SvcParams
+	// (ALPN, port, IPv4 hints, etc.) reach the VM. The response interceptor
+	// removes only the ECH SvcParam from each SVCB/HTTPS RR; records without
+	// ECH are passed through unchanged. See `stripECH` in `strip.go`.
 
 	// Check policy.
 	if !sp.policy.IsAllowed(qname) {
@@ -139,8 +136,9 @@ type responseInterceptor struct {
 	resolvedIPs []string
 }
 
-// WriteMsg intercepts the response to strip AAAA and ECH records, then records
-// domain→IP mappings for the report.
+// WriteMsg intercepts the response to strip AAAA records and the ECH
+// SvcParam from SVCB/HTTPS records, then records domain→IP mappings for
+// the report.
 //
 // M10-S10 Phase 2: when the gate client is configured, this method
 // emits a `propagate_and_ack` request to sandboxd with the resolved
@@ -159,7 +157,9 @@ func (ri *responseInterceptor) WriteMsg(msg *dns.Msg) error {
 	// the additional/authority sections might contain AAAA).
 	stripAAAA(msg)
 
-	// Strip SVCB/HTTPS records carrying ECH parameters.
+	// Strip the ECH SvcParam from SVCB/HTTPS records. Only the ECH key is
+	// removed — other SvcParams (ALPN, port, IPv4 hints, …) and the records
+	// themselves stay intact, so the VM still sees the SVCB/HTTPS payload.
 	stripECH(msg)
 
 	// Collect resolved IPs for logging and reporting.

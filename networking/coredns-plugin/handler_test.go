@@ -204,8 +204,22 @@ func TestHandler_AAAAQuery_Blocked(t *testing.T) {
 	}
 }
 
-func TestHandler_SVCBQuery_Blocked(t *testing.T) {
-	sp, _ := newTestPlugin(t, "example.com\n", nil)
+// TestHandler_SVCBQuery_StripsECHParam asserts that an SVCB query for
+// an allowed domain is forwarded upstream and the response keeps the
+// SVCB record while only the ECH SvcParam is stripped. Reverts the
+// M10-S10-era blanket-deny posture (`TestHandler_SVCBQuery_Blocked`)
+// per M12-S3.
+func TestHandler_SVCBQuery_StripsECHParam(t *testing.T) {
+	sp := &SandboxPolicy{
+		Next: &mockSVCBHTTPSNextHandler{
+			svcb: []dns.SVCBKeyValue{
+				&dns.SVCBAlpn{Alpn: []string{"h2"}},
+				&dns.SVCBECHConfig{ECH: []byte{0xAB, 0xCD}},
+			},
+		},
+		policy:   mustLoadPolicy(t, "example.com\n"),
+		reporter: NewReporter(""),
+	}
 
 	w := newTestResponseWriter()
 	r := new(dns.Msg).SetQuestion("example.com.", dnsTypeSVCB)
@@ -220,13 +234,37 @@ func TestHandler_SVCBQuery_Blocked(t *testing.T) {
 	if w.msg == nil {
 		t.Fatal("no response written")
 	}
-	if len(w.msg.Answer) != 0 {
-		t.Errorf("answer count = %d, want 0", len(w.msg.Answer))
+	if len(w.msg.Answer) != 1 {
+		t.Fatalf("answer count = %d, want 1 (SVCB record must be preserved)", len(w.msg.Answer))
+	}
+	svcb, ok := w.msg.Answer[0].(*dns.SVCB)
+	if !ok {
+		t.Fatalf("answer is not SVCB: %T", w.msg.Answer[0])
+	}
+	if len(svcb.Value) != 1 || svcb.Value[0].Key() != dns.SVCB_ALPN {
+		t.Errorf("remaining SvcParams = %v, want only ALPN", svcb.Value)
+	}
+	for _, kv := range svcb.Value {
+		if kv.Key() == dns.SVCBKey(svcParamKeyECH) {
+			t.Errorf("ECH SvcParam still present in response: %v", kv)
+		}
 	}
 }
 
-func TestHandler_HTTPSQuery_Blocked(t *testing.T) {
-	sp, _ := newTestPlugin(t, "example.com\n", nil)
+// TestHandler_HTTPSQuery_StripsECHParam mirrors the SVCB test for the
+// HTTPS qtype.
+func TestHandler_HTTPSQuery_StripsECHParam(t *testing.T) {
+	sp := &SandboxPolicy{
+		Next: &mockSVCBHTTPSNextHandler{
+			https: []dns.SVCBKeyValue{
+				&dns.SVCBAlpn{Alpn: []string{"h3"}},
+				&dns.SVCBECHConfig{ECH: []byte{0x01, 0x02, 0x03}},
+				&dns.SVCBPort{Port: 8443},
+			},
+		},
+		policy:   mustLoadPolicy(t, "example.com\n"),
+		reporter: NewReporter(""),
+	}
 
 	w := newTestResponseWriter()
 	r := new(dns.Msg).SetQuestion("example.com.", dnsTypeHTTPS)
@@ -241,8 +279,78 @@ func TestHandler_HTTPSQuery_Blocked(t *testing.T) {
 	if w.msg == nil {
 		t.Fatal("no response written")
 	}
-	if len(w.msg.Answer) != 0 {
-		t.Errorf("answer count = %d, want 0", len(w.msg.Answer))
+	if len(w.msg.Answer) != 1 {
+		t.Fatalf("answer count = %d, want 1 (HTTPS record must be preserved)", len(w.msg.Answer))
+	}
+	https, ok := w.msg.Answer[0].(*dns.HTTPS)
+	if !ok {
+		t.Fatalf("answer is not HTTPS: %T", w.msg.Answer[0])
+	}
+	if len(https.Value) != 2 {
+		t.Fatalf("remaining SvcParams = %d, want 2 (ALPN + Port preserved, ECH stripped)", len(https.Value))
+	}
+	for _, kv := range https.Value {
+		if kv.Key() == dns.SVCBKey(svcParamKeyECH) {
+			t.Errorf("ECH SvcParam still present in response: %v", kv)
+		}
+	}
+}
+
+// TestHandler_SVCBQuery_NonECHPassesThrough asserts the positive case
+// the plan calls out: a SVCB record with no ECH SvcParam is delivered to
+// the VM completely unchanged. Locks in the strip-only semantics so a
+// future regression to blanket-deny would fail this test.
+func TestHandler_SVCBQuery_NonECHPassesThrough(t *testing.T) {
+	sp := &SandboxPolicy{
+		Next: &mockSVCBHTTPSNextHandler{
+			svcb: []dns.SVCBKeyValue{
+				&dns.SVCBAlpn{Alpn: []string{"h2"}},
+				&dns.SVCBPort{Port: 8443},
+			},
+		},
+		policy:   mustLoadPolicy(t, "example.com\n"),
+		reporter: NewReporter(""),
+	}
+
+	w := newTestResponseWriter()
+	r := new(dns.Msg).SetQuestion("example.com.", dnsTypeSVCB)
+
+	if _, err := sp.ServeDNS(context.Background(), w, r); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if w.msg == nil {
+		t.Fatal("no response written")
+	}
+	if len(w.msg.Answer) != 1 {
+		t.Fatalf("answer count = %d, want 1", len(w.msg.Answer))
+	}
+	svcb, ok := w.msg.Answer[0].(*dns.SVCB)
+	if !ok {
+		t.Fatalf("answer is not SVCB: %T", w.msg.Answer[0])
+	}
+	if len(svcb.Value) != 2 {
+		t.Errorf("SvcParams = %d, want 2 (record must pass through unchanged)", len(svcb.Value))
+	}
+}
+
+// TestHandler_SVCBQuery_DeniedDomain asserts that the SVCB pathway still
+// honors policy: a query for a non-allowed domain returns NXDOMAIN, not
+// an empty NOERROR. This guards against accidentally turning the
+// strip-only path into an unconditional allow.
+func TestHandler_SVCBQuery_DeniedDomain(t *testing.T) {
+	sp, _ := newTestPlugin(t, "example.com\n", nil)
+
+	w := newTestResponseWriter()
+	r := new(dns.Msg).SetQuestion("evil.com.", dnsTypeSVCB)
+
+	if _, err := sp.ServeDNS(context.Background(), w, r); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if w.msg == nil {
+		t.Fatal("no response written")
+	}
+	if w.msg.Rcode != dns.RcodeNameError {
+		t.Errorf("rcode = %d, want NXDOMAIN", w.msg.Rcode)
 	}
 }
 
@@ -393,6 +501,45 @@ func TestHandler_CaseInsensitiveQuery(t *testing.T) {
 	if w.msg.Rcode == dns.RcodeNameError {
 		t.Error("expected query to be allowed (not NXDOMAIN) — case-insensitive matching should work")
 	}
+}
+
+// mockSVCBHTTPSNextHandler responds to SVCB / HTTPS queries with a single
+// record of the matching type, populated with the configured SvcParam set.
+// Used to exercise the response-side ECH stripper end-to-end through
+// ServeDNS without spinning up a real upstream resolver.
+type mockSVCBHTTPSNextHandler struct {
+	svcb  []dns.SVCBKeyValue // returned for SVCB qtype queries
+	https []dns.SVCBKeyValue // returned for HTTPS qtype queries
+}
+
+func (h *mockSVCBHTTPSNextHandler) Name() string { return "mock-svcb-https" }
+
+func (h *mockSVCBHTTPSNextHandler) ServeDNS(_ context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+	m := new(dns.Msg).SetReply(r)
+	qname := r.Question[0].Name
+	qtype := r.Question[0].Qtype
+
+	switch qtype {
+	case dnsTypeSVCB:
+		m.Answer = append(m.Answer, &dns.SVCB{
+			Hdr:      dns.RR_Header{Name: qname, Rrtype: dnsTypeSVCB, Class: dns.ClassINET, Ttl: 300},
+			Priority: 1,
+			Target:   ".",
+			Value:    h.svcb,
+		})
+	case dnsTypeHTTPS:
+		m.Answer = append(m.Answer, &dns.HTTPS{
+			SVCB: dns.SVCB{
+				Hdr:      dns.RR_Header{Name: qname, Rrtype: dnsTypeHTTPS, Class: dns.ClassINET, Ttl: 300},
+				Priority: 1,
+				Target:   ".",
+				Value:    h.https,
+			},
+		})
+	}
+
+	w.WriteMsg(m)
+	return dns.RcodeSuccess, nil
 }
 
 // mockNextHandlerWithAAAA responds with both A and AAAA records.

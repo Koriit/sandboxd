@@ -42,7 +42,9 @@ type dnsAllowedEvent struct {
 }
 
 // dnsDeniedEvent is emitted when a query is denied by policy or type-based
-// stripping (AAAA / SVCB / HTTPS).
+// stripping (currently AAAA, which is denied at query time). SVCB/HTTPS
+// queries are forwarded upstream and have only the ECH SvcParam stripped
+// from the response — they do not produce deny events.
 type dnsDeniedEvent struct {
 	dnsEventCommon
 	Reason string `json:"reason"`
@@ -83,7 +85,7 @@ func (w *EventWriter) EmitQueryAllowed(query, qtype string, resolvedIPs []string
 }
 
 // EmitQueryDenied writes a `query_denied` JSONL line with a short free-text
-// reason (e.g. "policy", "AAAA stripped", "SVCB/HTTPS stripped").
+// reason (e.g. "policy", "AAAA stripped").
 func (w *EventWriter) EmitQueryDenied(query, qtype, reason, clientIP string) error {
 	evt := dnsDeniedEvent{
 		dnsEventCommon: dnsEventCommon{

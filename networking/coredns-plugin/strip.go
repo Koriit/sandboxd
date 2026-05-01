@@ -25,18 +25,21 @@ func stripAAAA(msg *dns.Msg) int {
 	return removed
 }
 
-// stripECH removes SVCB (type 64) and HTTPS (type 65) records that carry
-// ECHConfig parameters from all sections of a DNS response. This prevents
-// Encrypted Client Hello, which would bypass SNI extraction at the gateway.
-// Returns the count of removed records.
+// stripECH removes the ECH (Encrypted Client Hello) SvcParam from every
+// SVCB (type 64) and HTTPS (type 65) record in a DNS response — across
+// the answer, authority, and extra sections — while leaving the records
+// themselves and any other SvcParams (ALPN, port, IPv4 hints, …) intact.
+// Records of unrelated types are untouched.
+//
+// This prevents Encrypted Client Hello (which would defeat SNI extraction
+// at the gateway and break HTTP inspection) without dropping the rest of
+// the SVCB/HTTPS information clients rely on. Returns the count of records
+// from which an ECH SvcParam was removed.
 func stripECH(msg *dns.Msg) int {
 	removed := 0
-	msg.Answer, removed = filterECHRecords(msg.Answer)
-	n := 0
-	msg.Ns, n = filterECHRecords(msg.Ns)
-	removed += n
-	msg.Extra, n = filterECHRecords(msg.Extra)
-	removed += n
+	removed += stripECHFromSection(msg.Answer)
+	removed += stripECHFromSection(msg.Ns)
+	removed += stripECHFromSection(msg.Extra)
 	return removed
 }
 
@@ -55,19 +58,54 @@ func filterRRs(rrs []dns.RR, rrtype uint16) ([]dns.RR, int) {
 	return kept, removed
 }
 
-// filterECHRecords removes SVCB/HTTPS records that contain an ECH SvcParam.
-// Records of type SVCB or HTTPS that do NOT carry ECH are preserved.
-func filterECHRecords(rrs []dns.RR) ([]dns.RR, int) {
-	kept := rrs[:0]
-	removed := 0
+// stripECHFromSection walks one DNS message section and removes the ECH
+// SvcParam from each SVCB / HTTPS record that carries it. The records
+// themselves remain in place — only the ECH SvcParam is dropped. Returns
+// the count of records from which an ECH SvcParam was removed.
+func stripECHFromSection(rrs []dns.RR) int {
+	stripped := 0
 	for _, rr := range rrs {
-		if hasECHParam(rr) {
-			removed++
-		} else {
-			kept = append(kept, rr)
+		if stripECHFromRR(rr) {
+			stripped++
 		}
 	}
-	return kept, removed
+	return stripped
+}
+
+// stripECHFromRR removes the ECH SvcParam from a single SVCB or HTTPS
+// record's `Value` slice if present. Returns true if a param was removed.
+// All other RR types and any SVCB/HTTPS without ECH are left untouched.
+func stripECHFromRR(rr dns.RR) bool {
+	switch r := rr.(type) {
+	case *dns.SVCB:
+		if filtered, removed := filterECHParams(r.Value); removed {
+			r.Value = filtered
+			return true
+		}
+	case *dns.HTTPS:
+		if filtered, removed := filterECHParams(r.Value); removed {
+			r.Value = filtered
+			return true
+		}
+	}
+	return false
+}
+
+// filterECHParams returns a copy of the SvcParam slice with any ECH entries
+// removed, plus a flag indicating whether at least one ECH entry was
+// removed. The original slice is not mutated.
+func filterECHParams(params []dns.SVCBKeyValue) ([]dns.SVCBKeyValue, bool) {
+	if !containsECHKey(params) {
+		return params, false
+	}
+	kept := make([]dns.SVCBKeyValue, 0, len(params))
+	for _, kv := range params {
+		if kv.Key() == dns.SVCBKey(svcParamKeyECH) {
+			continue
+		}
+		kept = append(kept, kv)
+	}
+	return kept, true
 }
 
 // hasECHParam returns true if the RR is a SVCB or HTTPS record containing

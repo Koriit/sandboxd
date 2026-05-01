@@ -490,7 +490,7 @@ A CoreDNS instance with a custom policy plugin runs inside the gateway container
 
 The resolver is the bridge between domain-based policy and IP-based enforcement. When policy permits a domain, the resolver both answers the query and makes the resolved IP available to the sandbox daemon for propagation to all enforcement components that operate on IP addresses.
 
-**ECH stripping:** The local DNS resolver strips HTTPS/SVCB records that carry ECHConfig from DNS responses by default. This prevents clients from learning the server's Encrypted Client Hello public key, forcing a fallback to standard TLS with plaintext SNI. This is necessary because ECH encrypts the entire inner ClientHello — including SNI — using the server's public key, which defeats both SNI-based routing at Envoy and TLS interception at mitmproxy. ECH stripping applies to level 2 (TLS-verified) and level 3 (HTTP inspected) destinations. Level 2 requires SNI extraction and validation, which ECH also defeats. Level 1 (transport-only) destinations are not affected — they do not depend on TLS or SNI. ECH stripping is enabled by default because without it, increasing ECH adoption would silently break HTTP inspection for destinations that previously worked, producing confusing TLS handshake errors with no clear cause.
+**ECH stripping:** The local DNS resolver strips the ECH SvcParam from any HTTPS/SVCB records returned for an allowed domain by default. The records themselves — and any other SvcParams (ALPN, port, IPv4 hints, …) — pass through to the VM unchanged; only the ECH key is removed. This prevents clients from learning the server's Encrypted Client Hello public key, forcing a fallback to standard TLS with plaintext SNI. This is necessary because ECH encrypts the entire inner ClientHello — including SNI — using the server's public key, which defeats both SNI-based routing at Envoy and TLS interception at mitmproxy. ECH stripping applies to level 2 (TLS-verified) and level 3 (HTTP inspected) destinations. Level 2 requires SNI extraction and validation, which ECH also defeats. Level 1 (transport-only) destinations are not affected — they do not depend on TLS or SNI. ECH stripping is enabled by default because without it, increasing ECH adoption would silently break HTTP inspection for destinations that previously worked, producing confusing TLS handshake errors with no clear cause.
 
 ##### Envoy
 
@@ -797,7 +797,7 @@ Response:
 
 Response:
 
-* ECH configs are stripped from DNS responses by default for level 2 and level 3 destinations, forcing client fallback to standard TLS
+* the ECH SvcParam is stripped from any SVCB/HTTPS DNS responses by default for level 2 and level 3 destinations (records and other SvcParams pass through unchanged), forcing client fallback to standard TLS
 * if the upstream server mandates ECH and rejects non-ECH connections, the destination requires an explicit level 1 (transport-only) bypass — HTTP inspection is not possible
 * ECH stripping is enabled by default to prevent silent inspection breakage as ECH adoption grows
 

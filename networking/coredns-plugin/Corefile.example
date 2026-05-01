@@ -4,7 +4,9 @@
 #   - Only domains listed in the policy file are resolved
 #   - All other domains receive NXDOMAIN
 #   - AAAA records are stripped (IPv4-only networking)
-#   - SVCB/HTTPS records with ECH are stripped (prevents TLS ECH bypass)
+#   - ECH SvcParams are stripped from SVCB/HTTPS records (prevents TLS
+#     ECH bypass); records themselves and their non-ECH SvcParams reach
+#     the VM unchanged
 #   - Resolved domain→IP mappings are written to a JSON report file
 #
 # The policy file is polled for changes and reloaded without restart.

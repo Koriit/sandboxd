@@ -202,7 +202,7 @@ Two things are worth highlighting:
 
 CoreDNS is the only resolver the VM reaches.
 
-- **With a policy applied**, CoreDNS answers only the domains the policy lists; everything else returns `NXDOMAIN`. ECH/HTTPS SVCB records are stripped from answers so Encrypted Client Hello cannot hide the hostname from downstream inspection.
+- **With a policy applied**, CoreDNS answers only the domains the policy lists; everything else returns `NXDOMAIN`. The ECH SvcParam is stripped from any SVCB/HTTPS records in the response — the records themselves and their other SvcParams reach the VM unchanged — so Encrypted Client Hello cannot hide the hostname from downstream inspection.
 - **Without a policy**, DNS resolution returns `NXDOMAIN` for everything — the default is deny.
 - **IPs learned from CoreDNS** are reported back to sandboxd, which writes them into the `sandbox_policy` table so the firewall matches the live IPs for each allowed domain.
 

@@ -1,7 +1,9 @@
 // Package sandboxpolicy implements a CoreDNS plugin that enforces DNS-level
-// policy for the claude-sandbox gateway. It loads an allowed-domain list from a
-// file, returns NXDOMAIN for unlisted domains, strips AAAA/SVCB/HTTPS records,
-// and reports resolved domain→IP mappings to a JSON file.
+// policy for the claude-sandbox gateway. It loads an allowed-domain list
+// from a file, returns NXDOMAIN for unlisted domains, denies AAAA queries
+// with an empty answer (IPv4-only networking), strips the ECH SvcParam
+// from any SVCB/HTTPS records (other SvcParams and the records themselves
+// pass through), and reports resolved domain→IP mappings to a JSON file.
 package sandboxpolicy
 
 import (
