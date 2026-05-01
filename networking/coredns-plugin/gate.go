@@ -1,4 +1,4 @@
-// Package sandboxpolicy: synchronous DNS-policy gate client (M10-S10 Phase 2).
+// Package sandboxpolicy: synchronous DNS-policy gate client.
 //
 // The gate provides happens-before ordering between CoreDNS's answer
 // emission and sandboxd's nft / Envoy LDS propagation: the plugin

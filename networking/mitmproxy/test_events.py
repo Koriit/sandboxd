@@ -1,4 +1,4 @@
-"""Unit tests for the mitmproxy JSONL EventEmitter (M10-S2 Phase 6b)."""
+"""Unit tests for the mitmproxy JSONL EventEmitter."""
 
 from __future__ import annotations
 

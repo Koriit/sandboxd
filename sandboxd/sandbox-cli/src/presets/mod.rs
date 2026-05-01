@@ -8,12 +8,11 @@
 //! audit field.
 //!
 //! See `.tasks/specs/2026-04-21-port-explicit-policies-presets-observability-design.md`
-//! Part 2 for the design, and `docs/internal/milestones/M10.md` § M10-S5
-//! for the implementation milestone.
+//! Part 2 for the design.
 //!
 //! # Current scope
 //!
-//! M10-S5 Phases 1–2 are live:
+//! The preset infrastructure is live:
 //!
 //! - The [`Preset`] enum distinguishes [`BuiltinPreset`]s (compiled-in)
 //!   from [`UserPreset`]s (loaded from `$XDG_CONFIG_HOME/sandboxd/presets/`).
@@ -369,7 +368,7 @@ pub enum PresetError {
     /// same `name`. This is a hard error (not warn-and-skip) — silent
     /// skipping would let whichever file won the directory-iteration
     /// race determine the preset bodies, which is exactly the class of
-    /// "explicit everything" bug the M10-S5 design exists to prevent.
+    /// "explicit everything" bug the preset design exists to prevent.
     DuplicateUserPresetName {
         name: String,
         path_a: PathBuf,
@@ -589,9 +588,9 @@ mod tests {
         let xdg = empty_xdg_override();
         let catalog = Catalog::load(Some(xdg.path())).expect("empty dir loads clean");
         let summaries = catalog.list();
-        // M10-S5 shipped 10 built-ins; M12-S4 added the `ubuntu`
-        // distro preset, bringing the total to 11. No user presets in
-        // the empty override dir.
+        // The catalog ships 11 built-ins (10 ecosystem presets plus
+        // the `ubuntu` distro preset). No user presets in the empty
+        // override dir.
         assert_eq!(summaries.len(), 11);
         // Alphabetical sort.
         let names: Vec<&str> = summaries.iter().map(|s| s.name.as_str()).collect();

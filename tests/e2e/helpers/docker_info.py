@@ -15,7 +15,7 @@ per-invocation escape hatch for users who accept they are operating
 outside the supported envelope. Alternative runtimes are a separate
 design."*).
 
-Since M11-S8 the daemon enforces the non-goal at session-create time
+The daemon enforces the non-goal at session-create time
 (``RootlessDockerRefused`` returned as HTTP 400), so e2e tests no
 longer skip on rootless hosts — the daemon's refusal is the
 loud-failure signal that the host is operating outside the supported

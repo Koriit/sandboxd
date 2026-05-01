@@ -40,7 +40,7 @@
 //!    the tests carried their own `setcap` invocation that did not
 //!    match the production install runbook.
 //!
-//! M11-S9 moved cap installation to a make target
+//! Cap installation lives in a make target
 //! (`install-route-helper-test-cap`) that is run once before
 //! `make test-integration`. The tests verify the install is fresh
 //! (checksum match) and bail with an actionable error if it is

@@ -1,4 +1,4 @@
-//! Black-box integration tests for M11-S2 Phase 2C: the daemon refuses
+//! Black-box integration tests verifying that the daemon refuses
 //! to start unless `users.conf` exists, parses, and contains a subnet
 //! entry whose `allow_users` resolves to the daemon's own uid.
 //!

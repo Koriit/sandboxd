@@ -6,14 +6,14 @@ license.workspace = true
 rust-version.workspace = true
 
 # Cross-cutting infrastructure shared by `sandbox-nft-deny-logger` and
-# `sandbox-nft-allow-logger` (M12-S2 spec, Decision 5):
+# `sandbox-nft-allow-logger`:
 #   - `EventEmitter` — JSONL writer with byte-for-byte stable wire shape
 #     (`DenyRecord`, `AllowRecord`, `rate_limited` summary envelope).
 #   - `RateCap` + `spawn_flush_ticker` — per-process rolling rate cap and
 #     periodic summary flusher.
 #   - `health::{bind, run}` — minimal HTTP/1.1 `/health` endpoint shared
-#     by both binaries; the response field names are preserved across
-#     the binary rename (Resolution 5).
+#     by both binaries; the response field names are stable across the
+#     binary rename.
 #
 # Lib only — no `[[bin]]`. Both binaries pull this in via path dep.
 

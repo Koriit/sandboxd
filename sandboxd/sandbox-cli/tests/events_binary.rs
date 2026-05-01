@@ -1,10 +1,9 @@
 //! Binary-level regression test for `sandbox events` (non-follow).
 //!
-//! Pins the end-to-end process exit behavior that M10-S4 Phase 6b
-//! restored: after the daemon finishes streaming the bounded JSONL
-//! body, the CLI must drop its request machinery, let hyper's
-//! connection driver return, and exit — *without* waiting on a
-//! keep-alive idle timeout.
+//! Pins the end-to-end process exit behavior of the non-follow path:
+//! after the daemon finishes streaming the bounded JSONL body, the CLI
+//! must drop its request machinery, let hyper's connection driver
+//! return, and exit — *without* waiting on a keep-alive idle timeout.
 //!
 //! ## What this test covers
 //!

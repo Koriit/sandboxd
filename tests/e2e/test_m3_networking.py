@@ -18,8 +18,8 @@ M11 gap-#70 closure. The three tests previously pinned to Lima via an
 in-body ``pytest.skip()`` for the ``10.209.x.x/28`` regex —
 ``test_gateway_traffic_flow``, ``test_stop_start_with_networking``,
 ``test_concurrent_sessions`` — now read the gateway / session IP /
-subnet CIDR from ``sandbox inspect <name>`` (M11-S7 Bundle Y / todo
-#72) and run on both backends. The Lima-only RAM precondition in
+subnet CIDR from ``sandbox inspect <name>`` and run on both backends.
+The Lima-only RAM precondition in
 ``test_concurrent_sessions`` (two 2 GB Lima VMs require ≥6 GB host
 RAM; container sessions are tens of MB) remains scoped to
 ``backend == "lima"``.
@@ -51,7 +51,7 @@ def _networking_smoke_policy_file() -> str:
     """Write a minimal v2 policy covering the hosts these M3 networking
     tests nslookup / curl from inside the VM, and return the file path.
 
-    M10-S1 removed the ``--unrestricted`` discovery escape hatch; tests
+    The ``--unrestricted`` discovery escape hatch has been removed; tests
     that previously used it to get "any working session" must now carry
     an explicit allow-list. These tests do not assert on policy
     enforcement — they exercise the gateway container, second NIC, DNS
@@ -244,8 +244,8 @@ def test_gateway_traffic_flow(sandbox_cli, backend):
     session_id = None
     policy_path = None
     try:
-        # 1. Create a session with a minimal v2 policy (post-M10-S1
-        #    replacement for the legacy --unrestricted flag).
+        # 1. Create a session with a minimal v2 policy
+        #    (replacement for the legacy --unrestricted flag).
         policy_path = _networking_smoke_policy_file()
         result = sandbox_cli(
             "create",
@@ -389,7 +389,7 @@ def test_denied_traffic(sandbox_cli, backend):
         )
 
         # Verify non-DNS TCP catch-all DNAT to the deny-logger TCP sink
-        # (port 10001). Post-M9-S10 + M10-S3 the ruleset uses an
+        # (port 10001). The ruleset uses an
         # l4proto catch-all (`meta l4proto 6` = TCP) rather than the
         # older `tcp dport != 53` shape, landing non-policy-allowed TCP
         # on the deny-logger for visibility before being rejected.
@@ -398,10 +398,10 @@ def test_denied_traffic(sandbox_cli, backend):
             f"gateway nftables.\nnftables output:\n{nft_rules}"
         )
 
-        # Verify non-DNS UDP catch-all is `log group N ; drop` (M12-S2
-        # Decision 2). Pre-M12-S2 this was a DNAT to the userland
-        # deny-logger UDP sink at :10002; the spec replaced that
-        # listener with kernel NFLOG + drop because the listener
+        # Verify non-DNS UDP catch-all is `log group N ; drop`.
+        # Previously this was a DNAT to the userland
+        # deny-logger UDP sink at :10002; that listener was replaced
+        # with kernel NFLOG + drop because the listener
         # existed only to launder bookkeeping the kernel already had.
         # The kernel mirrors each dropped packet to NFNLGRP_NFLOG with
         # the pre-rewrite IPv4+UDP headers so the
@@ -415,12 +415,12 @@ def test_denied_traffic(sandbox_cli, backend):
             f"Missing non-DNS UDP drop after NFLOG mirror (meta "
             f"l4proto 17 drop) in gateway nftables.\nnftables output:\n{nft_rules}"
         )
-        # Defense-in-depth: the pre-M12-S2 DNAT-to-:10002 rule must be
+        # Defense-in-depth: the legacy DNAT-to-:10002 rule must be
         # gone. A leak here means a regression that re-introduced the
         # userland listener path.
         assert "10002" not in nft_rules, (
-            f"Found references to :10002 in nftables — the pre-M12-S2 "
-            f"UDP-to-listener DNAT must be removed (M12-S2 Decision 2). "
+            f"Found references to :10002 in nftables — the legacy "
+            f"UDP-to-listener DNAT must be removed. "
             f"\nnftables output:\n{nft_rules}"
         )
 
@@ -430,7 +430,7 @@ def test_denied_traffic(sandbox_cli, backend):
             f"nftables output:\n{nft_rules}"
         )
 
-        # Verify the forward chain shape. M12-S2 Decision 2 changed the
+        # Verify the forward chain shape. The
         # invariant: TCP enters via DNAT-rewritten dst=gateway_ip
         # (caught by `ip saddr <vm_subnet> ip daddr <gateway_ip>
         # accept`), denied UDP is dropped at PREROUTING via the
@@ -454,9 +454,9 @@ def test_denied_traffic(sandbox_cli, backend):
         accept_lines = [l for l in forward_lines if "accept" in l and "saddr" in l]
         for line in accept_lines:
             # `nft list ruleset` prints the L4 protocol numerically:
-            # `meta l4proto 17` for UDP (and 6 for TCP). The pre-M12-S2
+            # `meta l4proto 17` for UDP (and 6 for TCP). The legacy
             # check assumed every saddr-accept also carried daddr; the
-            # M12-S2 datapath admits all VM-subnet UDP wholesale at
+            # current datapath admits all VM-subnet UDP wholesale at
             # FORWARD (defence-in-depth lives at PREROUTING via NFLOG +
             # drop). Skip the UDP wholesale-accept; assert daddr on
             # every other saddr-accept.
@@ -468,12 +468,12 @@ def test_denied_traffic(sandbox_cli, backend):
                 f"escape the sandbox unproxied.\nnftables output:\n{nft_rules}"
             )
 
-        # Behavioural check (M12-S2 § Test plan): with NFLOG live,
+        # Behavioural check: with NFLOG live,
         # send UDP from the VM to a not-allowed destination and assert
         # the corresponding deny event surfaces on the per-session
-        # event bus. Pre-M12-S2 this was skipped because UDP deny
-        # attribution was structurally broken; post-M12-S2 the kernel
-        # mirrors the dropped packet to NFNLGRP_NFLOG and the
+        # event bus. Previously UDP deny attribution was structurally
+        # broken; the kernel now mirrors the dropped packet to
+        # NFNLGRP_NFLOG and the
         # `sandbox-nft-deny-logger` republishes it as a JSONL deny
         # event ingested by the daemon and surfaced via
         # ``sandbox events``.
@@ -489,8 +489,7 @@ def test_denied_traffic(sandbox_cli, backend):
         # bash redirect into /dev/udp opens a SOCK_DGRAM, sendto's,
         # and exits. The packet is dropped at the gateway's PREROUTING
         # (post-NFLOG mirror) and never produces an ICMP unreachable
-        # back to the VM under the M12-S2 silent-drop default
-        # (Decision 6 / Open Question #2 resolution).
+        # back to the VM under the silent-drop default.
         send_cmd = (
             f"head -c 16 /dev/zero > /dev/udp/{target_ip}/{target_port} "
             f"2>&1; echo EXIT:$?"
@@ -565,8 +564,8 @@ def test_dns_interception(sandbox_cli, backend):
     session_id = None
     policy_path = None
     try:
-        # 1. Create a session with a minimal v2 policy (post-M10-S1
-        #    replacement for the legacy --unrestricted flag).
+        # 1. Create a session with a minimal v2 policy
+        #    (replacement for the legacy --unrestricted flag).
         policy_path = _networking_smoke_policy_file()
         result = sandbox_cli(
             "create",
@@ -640,15 +639,15 @@ def test_stop_start_with_networking(sandbox_cli, backend):
     """Create a session, verify networking, stop, verify gateway gone,
     start, verify persistence and networking restoration.
 
-    Backend-neutral: gateway IP is read from ``sandbox inspect`` (M11-S7
-    Bundle Y / todo #72) so the same assertion shape works for both
+    Backend-neutral: gateway IP is read from ``sandbox inspect``
+    so the same assertion shape works for both
     Lima and container sessions.
     """
     session_id = None
     policy_path = None
     try:
-        # 1. Create a session with a minimal v2 policy (post-M10-S1
-        #    replacement for the legacy --unrestricted flag).
+        # 1. Create a session with a minimal v2 policy
+        #    (replacement for the legacy --unrestricted flag).
         policy_path = _networking_smoke_policy_file()
         result = sandbox_cli(
             "create",
@@ -776,7 +775,7 @@ def test_stop_start_with_networking(sandbox_cli, backend):
 def test_concurrent_sessions(sandbox_cli, backend):
     """Create two sessions and verify network isolation.
 
-    Backend-neutral isolation property (M11-S7 Bundle Y / todo #72):
+    Backend-neutral isolation property:
 
     * Session A's session/gateway IPs are NOT inside session B's
       subnet (and vice versa) — each session lives in a distinct /28
@@ -1105,8 +1104,8 @@ def test_gateway_crash_recovery(sandbox_cli, backend):
     session_id = None
     policy_path = None
     try:
-        # 1. Create a session with a minimal v2 policy (post-M10-S1
-        #    replacement for the legacy --unrestricted flag).
+        # 1. Create a session with a minimal v2 policy
+        #    (replacement for the legacy --unrestricted flag).
         policy_path = _networking_smoke_policy_file()
         result = sandbox_cli(
             "create",
@@ -1178,14 +1177,14 @@ def test_gateway_crash_recovery(sandbox_cli, backend):
         #    Give the gateway a moment to finish nftables injection.
         time.sleep(5)
 
-        # Pull the gateway IP from `sandbox inspect` (M11-S7 Bundle Y /
-        # todo #72) — the daemon-side `network` block populated from the
+        # Pull the gateway IP from `sandbox inspect` — the daemon-side
+        # `network` block populated from the
         # persisted `NetworkInfo` row works for both backends, replacing
         # the legacy in-VM `ip -4 addr show` regex against
         # `10.209.x.x/28` plus octet arithmetic that this test used to
-        # carry. Brings this test in line with its three Bundle Y
-        # siblings (`test_gateway_traffic_flow`,
-        # `test_stop_start_with_networking`, `test_concurrent_sessions`).
+        # carry. Matches the shape used by
+        # `test_gateway_traffic_flow`,
+        # `test_stop_start_with_networking`, `test_concurrent_sessions`.
         net = inspect_session_network(sandbox_cli, "net-gwcrash-test")
         gateway_ip = net["gateway_ip"]
 

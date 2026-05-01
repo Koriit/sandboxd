@@ -179,8 +179,7 @@ impl Cidr4 {
     ///
     /// Internal API — `#[doc(hidden)]` so it does not appear in the
     /// rendered crate docs and so downstream crates do not treat it as
-    /// stable surface. Verified at M11-S10 review (reviewer nit n-2)
-    /// and re-checked at M12-S5: the only callers are
+    /// stable surface. The only callers are
     /// `sandbox-core::users_conf` (Deserialize / `first_invalid_cidr`),
     /// `sandbox-core::backend::orphan_reaper`, and the
     /// `sandbox-core/tests/integration_orphan_reaper*` integration

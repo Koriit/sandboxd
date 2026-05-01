@@ -1,9 +1,7 @@
-//! Milestone-exit integration test for M10-S2 Phase 8.
+//! End-to-end integration test for the event-ingestion pipeline.
+//! (Filename preserved for external references.)
 //!
-//! Pins the three contracts the plan requires before the milestone can
-//! close (`.tasks/plans/2026-04-21-port-explicit-policies-presets-
-//! observability-design/M10/session-2-event-ingestion-pipeline.md`,
-//! Phase 8 / exit criteria 4-5):
+//! Pins the three contracts the pipeline must uphold:
 //!
 //!   1. `ingest_traffic_events_stamp_session_and_reach_bus` — apply
 //!      policy + trigger one flow per layer ⇒ three domain events appear
@@ -322,9 +320,9 @@ fn sample_http_policy() -> Policy {
 /// Design decisions pinned by this test (do NOT change the assertions
 /// without updating the matching emission-site code in main.rs):
 /// - `ApplyKind::Restoration` is deliberately NOT exercised here — the
-///   M10-S2 Phase 5 design omits `policy_applied` on restoration so a
-///   daemon restart does not re-emit policy events for sessions whose
-///   policy was already announced at initial apply.
+///   design omits `policy_applied` on restoration so a daemon restart
+///   does not re-emit policy events for sessions whose policy was
+///   already announced at initial apply.
 /// - SIGTERM / daemon teardown does NOT emit `gateway_shutdown`; only
 ///   an explicit session stop does (reason = `SessionStopped`).  We
 ///   trigger the explicit path here by publishing the shutdown event
@@ -421,7 +419,7 @@ async fn lifecycle_sequence_across_create_apply_stop() {
                 "policy rule count preserved"
             );
             // Spot-check the rule — this pins the port-explicit shape
-            // that M10-S2's V004 migration enforces post-upgrade.
+            // that the V004 migration enforces post-upgrade.
             let rule = &p.rules[0];
             assert_eq!(rule.port, 443);
             assert_eq!(rule.protocol, Protocol::Tcp);

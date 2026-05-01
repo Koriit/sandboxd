@@ -29,7 +29,7 @@ type SandboxPolicy struct {
 	// gateSocketPath is the path to the per-session synchronous DNS
 	// gate UDS bound by sandboxd. Empty means the gate is disabled
 	// (legacy / fail-open path used by daemons that haven't enabled
-	// M10-S10 Phase 2 yet).
+	// the synchronous gate yet).
 	gateSocketPath string
 	// gateDeadline overrides the wall-clock deadline applied to each
 	// gate round-trip. Zero means use the package default
@@ -140,7 +140,7 @@ type responseInterceptor struct {
 // SvcParam from SVCB/HTTPS records, then records domain→IP mappings for
 // the report.
 //
-// M10-S10 Phase 2: when the gate client is configured, this method
+// When the gate client is configured, this method
 // emits a `propagate_and_ack` request to sandboxd with the resolved
 // IPs and blocks on the daemon's ack until success or deadline. On
 // success / noop the answer is released to the client; on rejection
@@ -172,7 +172,7 @@ func (ri *responseInterceptor) WriteMsg(msg *dns.Msg) error {
 	// Record the resolution for the IP report file.
 	ri.plugin.reporter.RecordResponse(ri.domain, msg)
 
-	// Synchronous gate (M10-S10 Phase 2). Only A-record responses
+	// Synchronous gate. Only A-record responses
 	// with at least one resolved IP need gating: AAAA responses are
 	// stripped above (no IPs to admit), and an empty-answer A
 	// response carries nothing for sandboxd to propagate.

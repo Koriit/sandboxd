@@ -40,7 +40,7 @@ def test_clone_repo(sandbox_cli, backend):
     """Create a session with --repo pointing to a small public repo.
     Verify the repository is cloned into /home/agent/workspace/.
 
-    Backend-agnostic since M11-S7: both backends advertise
+    Backend-agnostic: both backends advertise
     `WorkspaceModeKind::Clone` and the daemon dispatches `git clone`
     in-guest via `GuestConnector` after the runtime starts.
     """
@@ -48,7 +48,7 @@ def test_clone_repo(sandbox_cli, backend):
     policy_path = None
     try:
         # We need a policy that allows github.com for the git clone to work.
-        # M10-S1 v2 schema: rule identity is (host, port); protocol is L4.
+        # Policy v2 schema: rule identity is (host, port); protocol is L4.
         # `git clone https://…` over HTTPS → (github.com, 443, tcp).
         policy = {
             "version": "2.0.0",
@@ -249,11 +249,11 @@ def test_shared_mount(sandbox_cli, backend):
     """Create a session with --workspace shared:<tmpdir>.
     Verify bidirectional file visibility between host and VM.
 
-    Backend-agnostic since M11-S7: the container backend's bind target
+    Backend-agnostic: the container backend's bind target
     is unified with Lima's at `/home/agent/workspace/`, so the path
     assertions below work on both backends.
 
-    Rootless-Docker handling moved daemon-side in M11-S8: the daemon
+    Rootless-Docker handling lives daemon-side: the daemon
     refuses container session-create on rootless hosts by default
     (spec § Non-goals line 1195 + `RootlessDockerRefused` mapped to
     HTTP 400). The previous in-body `is_rootless_docker()` skip is no

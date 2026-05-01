@@ -102,8 +102,8 @@ func (w *EventWriter) EmitQueryDenied(query, qtype, reason, clientIP string) err
 }
 
 // dnsGateEvent records the outcome of one synchronous DNS-policy
-// gate round-trip (M10-S10 Phase 2). Outcome is one of `ok`,
-// `rejected`, `timed_out`, `protocol_error`, `unknown`.
+// gate round-trip. Outcome is one of `ok`, `rejected`, `timed_out`,
+// `protocol_error`, `unknown`.
 type dnsGateEvent struct {
 	Timestamp     string `json:"timestamp"`
 	Layer         string `json:"layer"`

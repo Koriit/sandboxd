@@ -1,12 +1,12 @@
 //! User-configured presets loaded from `$XDG_CONFIG_HOME/sandboxd/presets/`.
 //!
-//! This module implements the XDG loader for M10-S5 Phase 2. It reads
-//! `*.json` files from the user's preset directory, validates the
-//! structural and semantic constraints the spec calls out (see
+//! This module implements the XDG loader. It reads `*.json` files
+//! from the user's preset directory, validates the structural and
+//! semantic constraints the spec calls out (see
 //! `.tasks/specs/2026-04-21-port-explicit-policies-presets-observability-design.md`
 //! Part 2 § "User-configured presets"), and returns a list of
 //! [`UserPreset`] values whose `${param}` references are preserved
-//! verbatim for expansion in Phase 3.
+//! verbatim for expansion at apply time.
 //!
 //! # Error handling contract
 //!
@@ -74,7 +74,7 @@ pub struct UserParamSpec {
     /// Parameter name as it appears in both the invocation
     /// (`--preset 'p:name=val'`) and in `${name}` template references.
     pub name: String,
-    /// Parameter value type. For M10-S5 only [`ParamType::String`] is
+    /// Parameter value type. Currently only [`ParamType::String`] is
     /// supported; the spec does not reserve any other types yet.
     #[serde(rename = "type")]
     pub r#type: ParamType,

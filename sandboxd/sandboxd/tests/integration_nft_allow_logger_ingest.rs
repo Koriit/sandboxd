@@ -1,8 +1,7 @@
-//! M12-S2 Phase 3 — daemon-side ingest test for `nft-allow.jsonl`.
+//! Daemon-side ingest test for `nft-allow.jsonl`.
 //!
 //! Pins the new producer file path through the watcher, parser, and bus
-//! without depending on the gateway image (Phase 4 wires the binary into
-//! the gateway, which is out of scope for Phase 3). Pattern mirrors
+//! without depending on the gateway image. Pattern mirrors
 //! `sandbox-core/tests/events_ingest_integration.rs`'s
 //! `deny_logger_jsonl_appears_on_bus` test:
 //!
@@ -100,8 +99,7 @@ async fn integration_nft_allow_jsonl_appears_on_bus() {
     // --- Allow (UDP) — the 5-tuple shape authored by the nft-allow-
     // logger component. Wire fields are byte-for-byte identical to
     // `deny-logger`'s `deny` row except for the `event` discriminator
-    // and the `layer` tag (M12-S2 Decision 5: additive, not a new
-    // pipeline).
+    // and the `layer` tag (additive, not a new pipeline).
     let allow_line = r#"{"timestamp":"2026-04-22T09:45:10.000Z","layer":"allow-logger","event":"allow","orig_dst_ip":"1.1.1.1","orig_dst_port":53,"protocol":"udp","src_ip":"10.0.0.42","src_port":40123}"#;
     append_jsonl_line(&events_dir.join("nft-allow.jsonl"), allow_line).await;
 

@@ -1,7 +1,7 @@
 """
 Structured JSONL event emission for mitmproxy addons.
 
-Part of the M10-S2 observability pipeline: the gateway's CoreDNS plugin,
+Part of the observability pipeline: the gateway's CoreDNS plugin,
 Envoy access logs, and mitmproxy addons each emit one JSON-encoded event
 per decision into ``/var/log/gateway/events/<layer>.jsonl``.  sandboxd's
 per-session ingester tails these files, stamps the session ID based on

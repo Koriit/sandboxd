@@ -7,19 +7,19 @@ rust-version.workspace = true
 
 [dependencies]
 axum.workspace = true
-# M10-S4 Phase 2: `axum-extra::extract::Query` supports repeatable
-# query-string parameters (`?layer=a&layer=b` → `Vec<_>`).  The axum 0.8
-# built-in `Query` extractor delegates to `serde_urlencoded`, which fails
-# outright on repeated keys for `Vec<String>` fields; the `query` feature
-# here pulls in `serde_html_form` which does the right thing.  Version
-# tracks the axum 0.8 family (axum-extra 0.10.x).
+# `axum-extra::extract::Query` supports repeatable query-string
+# parameters (`?layer=a&layer=b` → `Vec<_>`). The axum 0.8 built-in
+# `Query` extractor delegates to `serde_urlencoded`, which fails
+# outright on repeated keys for `Vec<String>` fields; the `query`
+# feature here pulls in `serde_html_form` which does the right thing.
+# Version tracks the axum 0.8 family (axum-extra 0.10.x).
 axum-extra = { version = "0.10", features = ["query"] }
-# M10-S4 Phase 3: `async_stream::stream!` lets the HTTP handler express
+# `async_stream::stream!` lets the events HTTP handler express
 # "emit replay lines, then loop on broadcast::Receiver::recv" as straight-
 # line async code.  Alternative is hand-rolling `futures::stream::unfold`,
 # which costs ~20 extra lines and obscures the ordering contract.
 async-stream = "0.3"
-# M10-S4 Phase 3: the follow streaming path stamps synthetic
+# The follow streaming path stamps synthetic
 # `lifecycle.ring_buffer_lag` JSONL lines with an RFC-3339 UTC
 # timestamp.  chrono was already a dev-dep; promoted to a direct dep
 # so the handler can produce the timestamp without threading through
@@ -33,7 +33,7 @@ chrono.workspace = true
 # which also opts into `env`), so isolated `cargo check -p sandboxd`
 # fails.
 clap = { workspace = true, features = ["env"] }
-# M11-S5 Phase 5A fixup: the cap-aware `resolve_route_helper_path` reads
+# The cap-aware `resolve_route_helper_path` reads
 # the `security.capability` xattr via `libc::getxattr` to verify each
 # candidate route-helper binary actually carries `CAP_SYS_ADMIN+ep`
 # before accepting it. `nix` 0.29 does not expose xattr wrappers, so we
@@ -41,7 +41,7 @@ clap = { workspace = true, features = ["env"] }
 # `pidfd_open`). Pinning to the same `0.2` line that crate already uses
 # keeps the workspace on a single libc version.
 libc = "0.2"
-# M11-S2 Phase 2C: daemon-startup users.conf validation needs the
+# Daemon-startup users.conf validation needs the
 # daemon's own uid (`Uid::current`) plus uid → username resolution
 # (`User::from_uid`) for the "no matching subnet" error message. The
 # `user` feature is the same one `sandbox-core` already opts into for

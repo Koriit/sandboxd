@@ -232,8 +232,8 @@ func TestGateClientReleasesResponseOnTimeout(t *testing.T) {
 
 // TestGateClientDisabledShortCircuitsToOK: when no socket path is
 // configured the client never dials and returns ok unconditionally.
-// This is the fail-safe for daemons that haven't enabled M10-S10
-// Phase 2 yet.
+// This is the fail-safe for daemons that haven't enabled the
+// synchronous DNS-policy gate.
 func TestGateClientDisabledShortCircuitsToOK(t *testing.T) {
 	client := newGateClient("", 0)
 	if !client.disabled() {

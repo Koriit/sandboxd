@@ -126,7 +126,7 @@ fn default_base_dir() -> String {
 // users.conf startup validation
 // ---------------------------------------------------------------------------
 //
-// M11-S2 Phase 2C: the daemon refuses to start unless `/etc/sandboxd/users.conf`
+// The daemon refuses to start unless `/etc/sandboxd/users.conf`
 // (or its `SANDBOX_USERS_CONF` test-only override) contains a subnet entry whose
 // `allow_users` resolves to the daemon's own uid. The matched subnet's CIDR
 // scopes `NetworkManager`'s per-session /28 allocation pool.
@@ -252,15 +252,15 @@ fn init_tracing(log_file: Option<&std::path::Path>) -> std::io::Result<()> {
 //
 // `sandbox-route-helper` is the privileged setcap binary the daemon
 // spawns when a lite session starts (see `ContainerRuntime::start` →
-// `invoke_route_helper`). M11-S9 collapsed the resolver from four
-// candidate sources to two; the previous design (sibling-of-daemon +
+// `invoke_route_helper`). The resolver considers two
+// candidate sources; the previous design (sibling-of-daemon +
 // canonical install + `$PATH`-walk + cap check) shipped silent fallback
 // modes that were either invisible (`$PATH` outside the operator's
 // awareness) or mis-targeted (sibling-of-daemon picks an un-cap'd
 // `target/debug/` build under 9p / virtio-fs / bind-mount layouts that
 // `setcap` cannot annotate).
 //
-// Lookup order (M11-S9):
+// Lookup order:
 //
 //   0. `$SANDBOX_ROUTE_HELPER_PATH` — explicit operator override. If
 //      set, the resolver uses ONLY this path. Fail-closed: if the path
@@ -500,7 +500,7 @@ fn xattr_has_cap_sys_admin_effective(buf: &[u8]) -> bool {
 
 struct AppState {
     base_dir: PathBuf,
-    // M10-S4 Phase 2: wrapped in `Arc` so the events sub-router (built
+    // Wrapped in `Arc` so the events sub-router (built
     // in [`app`]) can hold its own `Arc<SessionStore>` handle inside an
     // `Arc<events_http::EventsApiState>` without the two routers having
     // to share state via axum's `FromRef`. `SessionStore` is internally
@@ -509,8 +509,7 @@ struct AppState {
     store: Arc<SessionStore>,
     /// Backend dispatch table keyed by [`BackendKind`].
     ///
-    /// M11-S1 Phase 1C introduced this map alongside `lima_runtime` so
-    /// that handler call sites talking to the *generic* lifecycle
+    /// Handler call sites talking to the *generic* lifecycle
     /// (create / start / stop / delete / status / ip / exec_interactive
     /// / guest_transport) go through the trait, while Lima-specific
     /// orchestration (clone, base image, agent install, list_vms)
@@ -518,7 +517,8 @@ struct AppState {
     /// [`LimaRuntime::manager`]. The same `Arc<LimaRuntime>` is
     /// registered here under [`BackendKind::Lima`] and held by
     /// `lima_runtime` — there is one Lima runtime instance reachable
-    /// both ways. M11-S2 will register the container backend alongside.
+    /// both ways. The container backend is registered alongside
+    /// under [`BackendKind::Container`].
     runtimes: Arc<HashMap<BackendKind, Arc<dyn SessionRuntime>>>,
     /// Typed handle to the Lima/QEMU runtime, retained so the daemon
     /// can still call Lima-specific orchestration that does not (yet)
@@ -541,8 +541,8 @@ struct AppState {
     /// Handles for DNS propagation background tasks, keyed by session ID.
     /// Used to cancel the loop when a session is stopped or deleted.
     dns_loop_handles: Mutex<HashMap<SessionId, tokio::task::JoinHandle<()>>>,
-    /// Handles for the per-session synchronous DNS-gate listener tasks
-    /// (M10-S10 Phase 2). Each handle drives the UDS server bound at
+    /// Handles for the per-session synchronous DNS-gate listener tasks.
+    /// Each handle drives the UDS server bound at
     /// `{events_host_root}/<session-id>/dns-gate.sock`, which the
     /// gateway's CoreDNS plugin calls into to block answer delivery on
     /// nft + Envoy LDS propagation. Aborted on stop / remove / teardown.
@@ -575,8 +575,8 @@ struct AppState {
     /// Per-session unified event bus.
     ///
     /// Sessions are registered when their networking is set up and
-    /// unregistered on teardown / deletion.  Ingest tasks (M10-S2 Phase 7)
-    /// publish into the bus; SSE handlers (later milestone) subscribe.
+    /// unregistered on teardown / deletion.  Ingest tasks
+    /// publish into the bus; SSE handlers subscribe.
     /// See [`EventBus`] for the fan-out + ring-buffer replay semantics.
     event_bus: EventBus,
     /// VM-IP → session-ID lookup used by the ingest layer to stamp the
@@ -593,7 +593,7 @@ struct AppState {
     /// components are recorded as `false` so the first healthy poll
     /// publishes `health_restored`.
     component_health_state: Mutex<HashMap<SessionId, HashMap<HealthComponent, bool>>>,
-    /// Per-session JSONL ingest tasks (M10-S2 Phase 7).
+    /// Per-session JSONL ingest tasks.
     ///
     /// Each [`SessionIngestor`] tails `envoy.jsonl` / `coredns.jsonl` /
     /// `mitmproxy.jsonl` under [`session_events_host_dir`] and publishes
@@ -604,7 +604,7 @@ struct AppState {
     /// gateway teardown. Keyed by session ID so a gateway bounce can
     /// abort-and-respawn without leaking the previous ingestor.
     ingestors: Mutex<HashMap<SessionId, SessionIngestor>>,
-    /// Per-session policy-propagation tracker (M10-S6 todo #37).
+    /// Per-session policy-propagation tracker.
     ///
     /// Records, for each session, the hash of the most recently
     /// applied policy and the hash of the most recently fully
@@ -622,10 +622,9 @@ struct AppState {
 ///
 /// Used by handlers that already know the backend kind for the
 /// session they are operating on — typically because they read it
-/// off the persisted `Session::backend` field. M11-S3 Phase 3D
-/// supersedes the Phase 1C `lima_dyn` helper with this version so
-/// the same call site works for both `BackendKind::Lima` and
-/// `BackendKind::Container` rows without any per-handler branching.
+/// off the persisted `Session::backend` field. The same call site
+/// works for both `BackendKind::Lima` and `BackendKind::Container`
+/// rows without any per-handler branching.
 ///
 /// Panics if the requested runtime is missing from the dispatch
 /// table; that is unreachable by construction (registration happens
@@ -662,9 +661,9 @@ fn runtime_for(state: &AppState, kind: BackendKind) -> Arc<dyn SessionRuntime> {
 /// regardless of backend.
 ///
 /// Container `cpus` is projected from the precise
-/// [`SessionConfig::cpus_decimal`] when present (M11-S7 todo #67 — the
-/// 1-decimal value the operator supplied), falling back to the
-/// integer [`SessionConfig::cpus`] otherwise. The Lima variant always
+/// [`SessionConfig::cpus_decimal`] when present (the 1-decimal value
+/// the operator supplied), falling back to the integer
+/// [`SessionConfig::cpus`] otherwise. The Lima variant always
 /// projects the integer field — Lima/QEMU pin whole cores.
 ///
 /// `no_cache` is taken from the request rather than the persisted
@@ -673,7 +672,7 @@ fn runtime_for(state: &AppState, kind: BackendKind) -> Arc<dyn SessionRuntime> {
 /// carry it, the daemon consumes it once at create time. Threading
 /// it through the projection lets `SessionSpec::validate` reject
 /// `--no-cache` on backends whose `per_session_no_cache` capability
-/// is `false` (M12-S4 todo #95).
+/// is `false`.
 fn session_spec_from_config(
     config: &SessionConfig,
     kind: BackendKind,
@@ -707,11 +706,10 @@ fn session_spec_from_config(
 ///
 /// Mirrors the rounding [`compute_default_resource_limits`] applies to
 /// the daemon-side host-80% default so both code paths produce values
-/// on the same grid. M11-S7 todo #67 added this normalisation step
-/// alongside the wire boundary type widening — without it, an
-/// operator typing `--cpus 0.81` would reach `format_cpus` as
-/// `0.81` and render `--cpus 0.8` (truncating the trailing `1`)
-/// rather than the intended round-to-grid behaviour.
+/// on the same grid. Without this normalisation step, an operator
+/// typing `--cpus 0.81` would reach `format_cpus` as `0.81` and
+/// render `--cpus 0.8` (truncating the trailing `1`) rather than
+/// the intended round-to-grid behaviour.
 ///
 /// Math is in `f64` to keep the rounding precise for f32 inputs;
 /// the result is narrowed back to `f32` because the caller stores
@@ -737,7 +735,7 @@ use sandboxd::propagation::{PropagatedEdge, PropagationStates};
 // ---------------------------------------------------------------------------
 
 fn app(state: Arc<AppState>) -> Router {
-    // M10-S4 Phase 2: build the events sub-router with its own minimal
+    // Build the events sub-router with its own minimal
     // state (an `Arc` over the same `SessionStore` and the same
     // `EventBus` clone the main state owns).  Merging rather than
     // extending lets the sub-router keep its own typed state without
@@ -748,9 +746,9 @@ fn app(state: Arc<AppState>) -> Router {
     ));
     let events_router = sandboxd::events_http::events_router(events_state);
 
-    // M10-S6 todo #37: build the policy status sub-router with its own
-    // minimal state (shared `SessionStore` + shared `PropagationStates`).
-    // Same merging rationale as `events_router` above — the read-only
+    // Build the policy status sub-router with its own minimal state
+    // (shared `SessionStore` + shared `PropagationStates`). Same
+    // merging rationale as `events_router` above — the read-only
     // endpoint does not need the full `AppState` surface.
     let policy_state = Arc::new(sandboxd::policy_http::PolicyApiState::new(
         Arc::clone(&state.store),
@@ -758,12 +756,12 @@ fn app(state: Arc<AppState>) -> Router {
     ));
     let policy_router = sandboxd::policy_http::policy_router(policy_state);
 
-    // M11-S3 Phase 3C: build the backends-listing sub-router. Holds an
-    // `Arc` over the same backend dispatch map the main `AppState`
-    // owns; the CLI hits `GET /backends` once per invocation to learn
-    // capabilities, so a read-only sub-router keeps the surface narrow
-    // and lets `tests/integration_backends_endpoint.rs` drive the
-    // route via `oneshot` without booting Lima/gateway/network.
+    // Build the backends-listing sub-router. Holds an `Arc` over the
+    // same backend dispatch map the main `AppState` owns; the CLI hits
+    // `GET /backends` once per invocation to learn capabilities, so a
+    // read-only sub-router keeps the surface narrow and lets
+    // `tests/integration_backends_endpoint.rs` drive the route via
+    // `oneshot` without booting Lima/gateway/network.
     let backends_state = Arc::new(sandboxd::backends_http::BackendsApiState::new(Arc::clone(
         &state.runtimes,
     )));
@@ -851,21 +849,21 @@ async fn create_session(
             })
     };
 
-    // M11-S3 Phase 3D: which backend hosts this session. Default to
-    // Lima for back-compat with older CLIs that omit the field. The
-    // chosen kind is then validated against the runtime's capability
-    // matrix *before* any state is mutated, so a request that asks
-    // for `--hardened` on the container backend is rejected with 400
-    // and never spends a session id, network allocation, or CA dir.
+    // Which backend hosts this session. Default to Lima for back-compat
+    // with older CLIs that omit the field. The chosen kind is then
+    // validated against the runtime's capability matrix *before* any
+    // state is mutated, so a request that asks for `--hardened` on the
+    // container backend is rejected with 400 and never spends a session
+    // id, network allocation, or CA dir.
     //
     // Resolved up front (before `config` is built) because the
-    // resource defaults below are backend-aware (gap #4).
+    // resource defaults below are backend-aware.
     let backend_kind = req.backend.unwrap_or(BackendKind::Lima);
 
-    // M11-S4 Phase 4D-pre gap #4: resource defaults are backend-aware.
+    // Resource defaults are backend-aware.
     //
     // - For Lima we keep the historical 2-CPU / 4096-MB defaults that
-    //   the pre-M11 wire shape baked in. These match what
+    //   the original wire shape baked in. These match what
     //   `LimaRuntime::start_vm` consumes and what every long-standing
     //   E2E test expects.
     // - For Container we feed `0` sentinels through, which
@@ -879,38 +877,37 @@ async fn create_session(
     // The `0` sentinel is the lowest-touch shape — it threads through
     // `SessionConfig` (Lima-shaped) into `BackendSpecific::Container`
     // unchanged, and `resource_ceilings` already encoded the
-    // "0 means unset" contract back in 3A. Persisting `0` is safe:
+    // "0 means unset" contract. Persisting `0` is safe:
     // `SessionConfig` carries the user-requested ceiling, and a
     // container session that took the host-80% default has `0` in
     // both columns by construction.
     //
-    // M11-S7 todo #67: `req.cpus` is `Option<f32>` so the spec §
-    // "Resource defaults — container only" 1-decimal grammar
-    // (`0.8`, `1.5`, …) reaches the runtime without truncation.
-    // Lima sessions still see whole-number cores (QEMU's `-smp`
-    // grammar pins integers), so we floor any fractional value on
-    // the Lima path. The container path normalises to one decimal
-    // place via `round_cpus_one_decimal` so `0.81` lands on the
-    // grid as `0.8` regardless of whether an operator typo'd extra
-    // precision.
+    // `req.cpus` is `Option<f32>` so the spec § "Resource defaults —
+    // container only" 1-decimal grammar (`0.8`, `1.5`, …) reaches the
+    // runtime without truncation. Lima sessions still see whole-number
+    // cores (QEMU's `-smp` grammar pins integers), so we floor any
+    // fractional value on the Lima path. The container path normalises
+    // to one decimal place via `round_cpus_one_decimal` so `0.81`
+    // lands on the grid as `0.8` regardless of whether an operator
+    // typo'd extra precision.
     let memory_mb = match backend_kind {
         BackendKind::Lima => req.memory_mb.unwrap_or(4096),
         BackendKind::Container => req.memory_mb.unwrap_or(0),
     };
     let cpus_decimal_request = req.cpus;
-    // M12-S4 todo #81: reject fractional `--cpus` for Lima sessions at
-    // the daemon boundary. QEMU's `-smp` flag (and the Lima YAML it
-    // generates) only accepts whole-number cores; the prior `as u32`
-    // truncation silently downsized a `1.5` request to `1`, which is
-    // invisible to non-CLI HTTP clients. The CLI never sends a
-    // fractional value on the Lima path (clap parses `--cpus` as
-    // `f32` but the resolver enforces integer-shape semantics
-    // upstream), so this gate fires only on hand-rolled HTTP clients
-    // that bypass the CLI. `SessionDto.warnings` is reserved for
-    // post-success operator notices (e.g. lite-image first-use),
-    // not for masking malformed sizing requests — so we hard-reject
-    // with HTTP 400 to mirror the spec § "Validation sites" pattern
-    // already used by `--hardened` on the container backend.
+    // Reject fractional `--cpus` for Lima sessions at the daemon
+    // boundary. QEMU's `-smp` flag (and the Lima YAML it generates)
+    // only accepts whole-number cores; an `as u32` truncation would
+    // silently downsize a `1.5` request to `1`, which is invisible to
+    // non-CLI HTTP clients. The CLI never sends a fractional value on
+    // the Lima path (clap parses `--cpus` as `f32` but the resolver
+    // enforces integer-shape semantics upstream), so this gate fires
+    // only on hand-rolled HTTP clients that bypass the CLI.
+    // `SessionDto.warnings` is reserved for post-success operator
+    // notices (e.g. lite-image first-use), not for masking malformed
+    // sizing requests — so we hard-reject with HTTP 400 to mirror the
+    // spec § "Validation sites" pattern already used by `--hardened`
+    // on the container backend.
     if backend_kind == BackendKind::Lima && cpus_decimal_request.is_some_and(|c| c.fract() != 0.0) {
         return error_response(SandboxError::InvalidArgument(
             "Lima sessions require integer --cpus values (QEMU's -smp flag pins whole cores); \
@@ -949,8 +946,8 @@ async fn create_session(
         },
     };
 
-    // M11-S8 Wave 2: `rootless_docker` is stamped post-probe (after
-    // the rootless-Docker gate runs below) so the persisted config
+    // `rootless_docker` is stamped post-probe (after the
+    // rootless-Docker gate runs below) so the persisted config
     // carries the probe outcome the same daemon used to make the
     // refuse/accept decision. Initialised to `None` here and patched
     // before the session row is written to the store.
@@ -963,7 +960,7 @@ async fn create_session(
         // Record the creation inputs so `sandbox inspect`/`describe` can
         // surface them later.  These are persisted in `config_json` and
         // forward-compatible via `#[serde(default)]`; records written by
-        // pre-M9-S11 daemons keep `None` on these three fields.
+        // older daemons keep `None` on these three fields.
         repo: req.repo.clone(),
         boot_cmd: req.boot_cmd.clone(),
         template: req.template.clone(),
@@ -994,8 +991,8 @@ async fn create_session(
     // Daemon-side authoritative validation: spec § "Validation sites"
     // requires the daemon to repeat the capability check the CLI did.
     // The runtime is the single source of truth for its capability
-    // matrix. M12-S4 todo #95 threads `req.no_cache` through the spec
-    // projection so a non-CLI HTTP client posting
+    // matrix. Threading `req.no_cache` through the spec projection
+    // ensures a non-CLI HTTP client posting
     // `{"backend":"container","no_cache":true}` is refused by
     // `SessionSpec::validate` rather than silently honoured.
     let spec = session_spec_from_config(&config, backend_kind, req.no_cache);
@@ -1009,8 +1006,8 @@ async fn create_session(
             .into_response();
     }
 
-    // M11-S8 Wave 2: rootless-Docker enforcement (spec § Non-goals
-    // line 1195). Run BEFORE any container artifacts are touched —
+    // Rootless-Docker enforcement (spec § Non-goals).
+    // Run BEFORE any container artifacts are touched —
     // including the lite-image build below and every subsequent
     // session-create step (CA, network, runtime). On rootless hosts
     // without `--force-rootless-docker` the daemon refuses with
@@ -1151,15 +1148,15 @@ async fn create_session(
     // Helper closure: cleanup VM + network + CA on failure, set state to Error.
     // This macro avoids repeating the cleanup pattern in every error branch.
     //
-    // M11-S1 Phase 1C: VM cleanup goes through the generic trait
-    // dispatch (`runtime.delete(&handle).await`); the synchronous
-    // network + CA cleanup stays inside a single `spawn_blocking` so we
-    // do not pay an extra task spawn per cleanup. The macro is invoked
-    // from inside `create_session`'s async body, so the `.await` on
+    // VM cleanup goes through the generic trait dispatch
+    // (`runtime.delete(&handle).await`); the synchronous network + CA
+    // cleanup stays inside a single `spawn_blocking` so we do not pay
+    // an extra task spawn per cleanup. The macro is invoked from
+    // inside `create_session`'s async body, so the `.await` on
     // `delete` is safe.
     //
-    // M11-S3 Phase 3D: pass the request's `backend_kind` so the
-    // cleanup dispatches to the runtime that actually owns the
+    // The request's `backend_kind` is passed in so the cleanup
+    // dispatches to the runtime that actually owns the
     // partially-created resources — Lima for VM rows, Container for
     // docker rows.
     macro_rules! cleanup_and_return {
@@ -1203,7 +1200,7 @@ async fn create_session(
         // there is no golden image to clone (the lite image was
         // already ensured above), no QEMU template to render, and
         // no separate guest-agent install step (the agent is built
-        // into the lite image per M11-S2). The runtime drives
+        // into the lite image). The runtime drives
         // `docker create` + `docker start`, and the rest of the
         // post-create work (per-session gateway, event ingest, DNS
         // gate listener) is performed inline below — copying the
@@ -1513,15 +1510,15 @@ async fn create_session(
         // which the CLI compiles into `req.policy` server-side) now that
         // the session is Running and the gateway is live. Mirrors the
         // Lima branch's apply_policy block at lines ~1651-1679: an
-        // explicit policy that fails to compile/distribute is fatal
-        // (M10-S8 #16) — silently returning a Running session with no
-        // policy in place lies to the operator. The implicit "no
-        // policy" path never reaches this branch (the CoreDNS
-        // fail-closed default was already written by `create_gateway`
-        // above via `initial_dns_policy`).
+        // explicit policy that fails to compile/distribute is fatal —
+        // silently returning a Running session with no policy in place
+        // lies to the operator. The implicit "no policy" path never
+        // reaches this branch (the CoreDNS fail-closed default was
+        // already written by `create_gateway` above via
+        // `initial_dns_policy`).
         //
         // `req.policy` is consumed here (moved out of `req`); the
-        // `req.repo` clone block immediately below is the M11-S7 backend
+        // `req.repo` clone block immediately below is the backend
         // symmetry for `--repo` (the lite image's entrypoint is the
         // `sandbox-guest` agent, so the `state.guest.exec` dispatch the
         // Lima path uses works unchanged once the agent's TCP listener
@@ -1553,7 +1550,7 @@ async fn create_session(
             }
         }
 
-        // M11-S7 — `--repo` symmetry on the container backend.
+        // `--repo` symmetry on the container backend.
         //
         // Mirrors the Lima `--repo` path at the bottom of this handler:
         // pre-warm DNS for the repo host through the guest, then
@@ -1668,7 +1665,7 @@ async fn create_session(
             }
         }
 
-        // M11-S7 — `--boot-cmd` symmetry on the container backend.
+        // `--boot-cmd` symmetry on the container backend.
         //
         // Mirrors the Lima `--boot-cmd` path further down this handler:
         // an explicit `--boot-cmd <cmd>` violates the caller's stated
@@ -1776,11 +1773,11 @@ async fn create_session(
                 cleanup_lite_gateway_and_return!(error_response(e).into_response());
             }
         };
-        // M11-S8 Wave 2: surface the rootless-Docker probe outcome
-        // on the container create response so operators can confirm
-        // whether the daemon detected rootless and whether the
-        // `--force-rootless-docker` opt-in was actually applied,
-        // without an extra `GET /sessions/{id}` round-trip.
+        // Surface the rootless-Docker probe outcome on the container
+        // create response so operators can confirm whether the daemon
+        // detected rootless and whether the `--force-rootless-docker`
+        // opt-in was actually applied, without an extra
+        // `GET /sessions/{id}` round-trip.
         let rootless_dto = created
             .config
             .rootless_docker
@@ -1910,12 +1907,12 @@ async fn create_session(
 
         // 2a. Create the Lima VM (with optional custom template).
         //
-        // M11-S1 Phase 1C: dispatch through the trait. The
-        // custom-template branch lives inside `LimaRuntime::create`
-        // (it inspects `SessionSpec::template`) — handlers no longer
-        // pick between `create_vm` and `create_vm_with_custom_template`
-        // directly. The wire shape (`CreateSessionRequest.template`)
-        // is unchanged; we project the request into a `SessionSpec`
+        // Dispatch through the trait. The custom-template branch lives
+        // inside `LimaRuntime::create` (it inspects
+        // `SessionSpec::template`) — handlers no longer pick between
+        // `create_vm` and `create_vm_with_custom_template` directly.
+        // The wire shape (`CreateSessionRequest.template`) is
+        // unchanged; we project the request into a `SessionSpec`
         // and hand it to the runtime.
         {
             let runtime = runtime_for(&state, BackendKind::Lima);
@@ -1976,11 +1973,11 @@ async fn create_session(
         };
 
         {
-            // M11-S1 Phase 1C: `install_guest_agent` is Lima-specific
-            // (it shells out to `limactl shell` to inject the binary)
-            // and stays behind the `LimaRuntime::manager()` escape
-            // hatch until the trait surface grows to cover agent
-            // bootstrapping in a backend-agnostic way.
+            // `install_guest_agent` is Lima-specific (it shells out to
+            // `limactl shell` to inject the binary) and stays behind
+            // the `LimaRuntime::manager()` escape hatch until the
+            // trait surface grows to cover agent bootstrapping in a
+            // backend-agnostic way.
             let lima = Arc::clone(state.lima_runtime.manager());
             let sid = session_id;
             let guest_bin = guest_binary_path.clone();
@@ -2063,13 +2060,13 @@ async fn create_session(
     // Reaching this block means the caller provided `policy` explicitly
     // (via `--policy <file>` and/or `--preset <invocation>` on the CLI —
     // both paths populate the field on the wire). Compile/distribute
-    // failure on an *explicit* policy is fatal for the create call
-    // (M10-S8 #16): the alternative is silently returning a Running
-    // session with `Policy: none`, which violates the caller's stated
-    // intent. The implicit "no policy" default path never reaches this
-    // branch at all — for that path we've already written the
-    // fail-closed empty CoreDNS config during `setup_session_networking`
-    // above and there is nothing to do here.
+    // failure on an *explicit* policy is fatal for the create call:
+    // the alternative is silently returning a Running session with
+    // `Policy: none`, which violates the caller's stated intent. The
+    // implicit "no policy" default path never reaches this branch at
+    // all — for that path we've already written the fail-closed empty
+    // CoreDNS config during `setup_session_networking` above and there
+    // is nothing to do here.
     if let Some(policy) = req.policy {
         let initial_presets = req.source_presets.clone();
         match apply_policy(
@@ -2207,15 +2204,14 @@ async fn create_session(
     // Reaching this block means the caller passed `--boot-cmd <cmd>`
     // explicitly (the wire field is `Option<String>` with no implicit
     // default — the CLI only populates it when `--boot-cmd` is given).
-    // Any failure here therefore violates the caller's stated intent
-    // the same way #16 (`--policy`) and #34 (`--repo`) did pre-fix:
-    // returning a `Running` session with the boot command's side
-    // effects unrealised silently lies to the operator. Mirror the
-    // fatal-create pattern (M10-S9 #53): tag the session `Error`,
-    // tear down partial gateway/network state, and surface the
-    // failure in the HTTP response so the CLI user can see *why* the
-    // boot command did not succeed (exit code, stderr snippet,
-    // transport error, etc.).
+    // Any failure here violates the caller's stated intent the same
+    // way `--policy` and `--repo` failures would: returning a `Running`
+    // session with the boot command's side effects unrealised silently
+    // lies to the operator. Mirror the fatal-create pattern: tag the
+    // session `Error`, tear down partial gateway/network state, and
+    // surface the failure in the HTTP response so the CLI user can
+    // see *why* the boot command did not succeed (exit code, stderr
+    // snippet, transport error, etc.).
     if let Some(boot_cmd) = &req.boot_cmd {
         info!(%session_id, cmd = %boot_cmd, "executing boot command in VM");
         match state
@@ -2320,12 +2316,12 @@ async fn create_session(
         policies.get(&session_id).cloned()
     };
 
-    // M11-S8 Wave 2: rootless-Docker state is container-only; for
-    // Lima sessions `created.config.rootless_docker` stays `None` and
-    // the wire field is omitted entirely (`skip_serializing_if`).
-    // Mirroring the container response for shape symmetry — operators
-    // who pipe `POST /sessions` through `jq` see the same key set
-    // regardless of which branch served them.
+    // Rootless-Docker state is container-only; for Lima sessions
+    // `created.config.rootless_docker` stays `None` and the wire field
+    // is omitted entirely (`skip_serializing_if`). Mirroring the
+    // container response for shape symmetry — operators who pipe
+    // `POST /sessions` through `jq` see the same key set regardless
+    // of which branch served them.
     let rootless_dto = created
         .config
         .rootless_docker
@@ -2385,11 +2381,11 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse 
 
     // Enrich with VM status (best-effort).
     //
-    // M11-S1 Phase 1C: `list_vms()` is Lima-specific — it returns a
-    // `Vec<VmInfo>` shaped by `limactl list --json` and the
-    // reconciliation block below matches on `VmStatus`. Multi-backend
-    // listing (fan-out across every registered runtime) is deferred
-    // to M11-S2 when the second backend lands.
+    // `list_vms()` is Lima-specific — it returns a `Vec<VmInfo>` shaped
+    // by `limactl list --json` and the reconciliation block below
+    // matches on `VmStatus`. Multi-backend listing (fan-out across
+    // every registered runtime) is a future extension once additional
+    // backends ship a comparable inventory surface.
     let lima = Arc::clone(state.lima_runtime.manager());
     let vm_list = tokio::task::spawn_blocking(move || lima.list_vms().unwrap_or_default())
         .await
@@ -2448,12 +2444,12 @@ async fn get_session(
 
     // Enrich with VM status (best-effort).
     //
-    // M11-S1 Phase 1C: dispatch through the trait. `RuntimeStatus`
-    // mirrors `VmStatus` for the Running/Stopped cases the
-    // reconciliation cares about; the new `Creating`/`Error` variants
-    // (set by the container backend) are treated as "no-op" here —
-    // the daemon's authoritative state is in the store and we don't
-    // overwrite it on a non-matching runtime status.
+    // Dispatch through the trait. `RuntimeStatus` mirrors `VmStatus`
+    // for the Running/Stopped cases the reconciliation cares about;
+    // the `Creating`/`Error` variants (set by the container backend)
+    // are treated as "no-op" here — the daemon's authoritative state
+    // is in the store and we don't overwrite it on a non-matching
+    // runtime status.
     let mut session = session;
     {
         let runtime = runtime_for(&state, session.backend);
@@ -2481,17 +2477,17 @@ async fn get_session(
     let agent_status = probe_agent_status(&state, &session).await;
     let gateway_status = probe_gateway_status(&state, &session).await;
 
-    // Look up the currently applied policy in the in-memory map.
-    // Persistence of the policy across daemon restarts is M9-S12's
-    // responsibility; until then, this map is the source of truth.
+    // Look up the currently applied policy in the in-memory map. The
+    // map is the source of truth at runtime; on-disk persistence
+    // (which `SessionStore` handles) is what survives daemon restarts.
     let policy_opt = {
         let policies = state.session_policies.lock().await;
         policies.get(&session.id).cloned()
     };
 
-    // Backend-neutral network/mount surfaces (M11-S7 Bundle Y / todo
-    // #72). Both pull from already-canonical sources: `network` from
-    // the persisted `NetworkInfo`, `mounts` from the session's own
+    // Backend-neutral network/mount surfaces. Both pull from
+    // already-canonical sources: `network` from the persisted
+    // `NetworkInfo`, `mounts` from the session's own
     // `config.workspace_mode` plus a small per-backend constant set
     // (workspace path, CA bind path, home-volume name). Surfacing
     // them here lets `sandbox inspect` consumers and the e2e suite
@@ -2500,10 +2496,10 @@ async fn get_session(
     let network = session_network_info_for(&state, &session.id);
     let mounts = Some(session_mount_info_for(&session));
 
-    // M11-S8 Wave 2: project the persisted rootless-Docker probe
-    // outcome onto the wire — `None` for Lima sessions and for
-    // pre-Wave-2 container records, `Some({detected, forced})` for
-    // any container session created post Wave 2.
+    // Project the persisted rootless-Docker probe outcome onto the
+    // wire — `None` for Lima sessions and for older container
+    // records that pre-date the probe, `Some({detected, forced})` for
+    // any container session whose probe outcome was recorded.
     let rootless_dto = session
         .config
         .rootless_docker
@@ -2550,11 +2546,10 @@ fn session_network_info_for(
     }
 }
 
-/// In-session absolute path of the workspace, unified across backends
-/// post Bundle X (M11-S7). Both Lima and container plant the
-/// workspace at this path; the `WorkspaceMode::Shared` host bind and
-/// the `WorkspaceMode::Clone` `git clone <url> <path>` invocations
-/// already use the same target.
+/// In-session absolute path of the workspace, unified across backends.
+/// Both Lima and container plant the workspace at this path; the
+/// `WorkspaceMode::Shared` host bind and the `WorkspaceMode::Clone`
+/// `git clone <url> <path>` invocations already use the same target.
 const SESSION_WORKSPACE_PATH: &str = "/home/agent/workspace/";
 
 /// Build a backend-neutral [`SessionMountInfo`] for a session.
@@ -2646,12 +2641,10 @@ async fn start_session(
 
     // Start the VM/container via the trait.
     //
-    // M11-S1 Phase 1C: dispatch through the trait. The persisted
-    // `SessionConfig` and the per-session bridge / MAC ride down via
-    // `RuntimeStartArgs`; the runtime's `start` does its own
-    // `spawn_blocking` internally so we just `.await` here.
-    //
-    // M11-S3 Phase 3D: dispatch keyed off the persisted
+    // Dispatch through the trait. The persisted `SessionConfig` and
+    // the per-session bridge / MAC ride down via `RuntimeStartArgs`;
+    // the runtime's `start` does its own `spawn_blocking` internally
+    // so we just `.await` here. Dispatch is keyed off the persisted
     // `session.backend`, so a container session with `backend =
     // "container"` lands on `ContainerRuntime::start` and Lima
     // sessions land on `LimaRuntime::start` from the same handler.
@@ -2770,11 +2763,11 @@ async fn stop_session(
     // Cancel DNS propagation loop before tearing down networking.
     cancel_dns_propagation_loop(&session.id, &state).await;
 
-    // Cancel the synchronous DNS-gate listener (M10-S10 Phase 2)
-    // before the container disappears: the UDS file lives inside the
-    // events host directory `stop_gateway` is about to remove, and we
-    // want the listener task to exit cleanly rather than spin on
-    // `accept` against a vanished socket.
+    // Cancel the synchronous DNS-gate listener before the container
+    // disappears: the UDS file lives inside the events host directory
+    // `stop_gateway` is about to remove, and we want the listener task
+    // to exit cleanly rather than spin on `accept` against a vanished
+    // socket.
     cancel_dns_gate_listener(&session.id, &state).await;
     drop_dns_cache(&state, &session.id).await;
 
@@ -2818,8 +2811,7 @@ async fn stop_session(
     }
 
     {
-        // M11-S1 Phase 1C: dispatch through the trait.
-        // M11-S3 Phase 3D: keyed off persisted backend.
+        // Dispatch through the trait, keyed off the persisted backend.
         let runtime = runtime_for(&state, session.backend);
         let handle = RuntimeHandle::from_session_id(&session.id);
         match runtime.stop(&handle).await {
@@ -2911,13 +2903,13 @@ async fn remove_session(
     // a running VM, so we skip the separate `stop_vm` call to avoid
     // doubling the Lima wait time (~60s each).
     //
-    // M11-S1 Phase 1C: VM cleanup goes through the generic trait
-    // dispatch (`runtime.delete(&handle).await`); the rest of the
-    // teardown (gateway stop, docker network delete, CA remove,
-    // bridge detach) stays inside one shared `spawn_blocking` so we
-    // keep a single host-side task for the remaining sync work.
-    // M11-S3 Phase 3D: dispatch to the runtime that owns this
-    // session's resources (Lima for VM rows, Container for docker rows).
+    // VM cleanup goes through the generic trait dispatch
+    // (`runtime.delete(&handle).await`); the rest of the teardown
+    // (gateway stop, docker network delete, CA remove, bridge detach)
+    // stays inside one shared `spawn_blocking` so we keep a single
+    // host-side task for the remaining sync work. Dispatch goes to
+    // the runtime that owns this session's resources (Lima for VM
+    // rows, Container for docker rows).
     {
         let runtime = runtime_for(&state, session.backend);
         let handle = RuntimeHandle::from_session_id(&session.id);
@@ -2987,7 +2979,7 @@ async fn remove_session(
         .await
         .remove(&session.id);
     // Drop propagation-tracker state for this session so the map
-    // doesn't grow without bound as sessions churn (M10-S6).
+    // doesn't grow without bound as sessions churn.
     state.propagation_states.remove(&session.id).await;
 
     // Delete the session from the store.
@@ -3520,7 +3512,7 @@ async fn apply_policy_inner(
         }
     }
 
-    // Record the applied hash for the propagation tracker (M10-S6).
+    // Record the applied hash for the propagation tracker.
     // Done immediately after the distributor succeeds so the DNS loop's
     // very next reconciliation cycle — or the synchronous empty-policy
     // edge below — observes the current target and can flip the
@@ -3960,7 +3952,7 @@ impl GateService for DaemonGateService {
 /// Periodically reads resolved.json from the gateway container, updates
 /// the DNS cache, and propagates IP changes to nftables.
 ///
-/// # Propagation tracking (M10-S6)
+/// # Propagation tracking
 ///
 /// On each cycle the loop also reconciles the session's
 /// [`PropagationState`]: once every `Destination::Domain` rule in the
@@ -4085,7 +4077,7 @@ async fn dns_propagation_loop(
         // already ticked `update_rejected` once (e.g. the deny-all
         // bootstrap fails LDS validation on first parse).
         // Wait deadline 5s with 100ms polls — typical Envoy reload
-        // observed at <250ms in the M9-S18 integration test. Empty
+        // observed at <250ms in the integration test. Empty
         // (stable_cache) cycles skip both rewrite and ack-wait —
         // there is no rewrite to ack.
         let probe = DockerExecLdsProbe::new(&session_id);
@@ -4536,7 +4528,7 @@ async fn setup_session_networking(
     // up.
     state.store.set_network_info(session_id, network_info)?;
 
-    // Start the synchronous DNS-gate UDS listener (M10-S10 Phase 2).
+    // Start the synchronous DNS-gate UDS listener.
     // The events host directory was created by `create_gateway` and is
     // bind-mounted into the container at `/var/log/gateway/events/`,
     // so the socket file appears at the canonical container path
@@ -4572,15 +4564,14 @@ async fn setup_session_networking(
 /// Fail a `POST /sessions` request after an explicit initial policy
 /// fails to apply.
 ///
-/// Centralises the teardown contract for M10-S8 #16: when
-/// `create_session` reaches its `apply_policy` call, the caller has
-/// already supplied a non-`None` `req.policy` (either directly via
-/// `--policy <file>` or indirectly via `--preset` — both paths
-/// populate the wire field at the CLI layer). A failure here means
-/// the session would otherwise come up `Running` with `Policy: none`,
-/// silently violating the caller's stated intent. The only correct
-/// response is to fail the create call and surface the error through
-/// the HTTP response.
+/// Centralises the teardown contract: when `create_session` reaches
+/// its `apply_policy` call, the caller has already supplied a
+/// non-`None` `req.policy` (either directly via `--policy <file>` or
+/// indirectly via `--preset` — both paths populate the wire field at
+/// the CLI layer). A failure here means the session would otherwise
+/// come up `Running` with `Policy: none`, silently violating the
+/// caller's stated intent. The only correct response is to fail the
+/// create call and surface the error through the HTTP response.
 ///
 /// The teardown performed here mirrors the failure path already used
 /// by `setup_session_networking` earlier in `create_session`: mark
@@ -4619,20 +4610,19 @@ async fn fail_explicit_policy_apply(
 }
 
 /// Fail the create call when an explicit `--repo <url>` clone fails
-/// in-guest (M10-S8 #34).
+/// in-guest.
 ///
 /// Mirrors the shape of [`fail_explicit_policy_apply`]: when the
 /// caller passes `--repo <url>`, the session is supposed to come up
-/// with `/home/agent/workspace/` populated. Pre-fix, the four
-/// failure branches (non-zero exit, `GuestResponse::Error`,
-/// unexpected guest response, transport error) all `warn!`-swallowed
-/// the failure and the handler returned 201 CREATED with a `Running`
-/// session and an empty workspace — silently violating the caller's
-/// stated intent. The only correct response is to fail the create
-/// call and surface the failure through the HTTP response so the
-/// CLI user can see *why* the clone did not succeed (exit code,
-/// stderr snippet, transport error, etc., carried through in the
-/// caller-supplied `e`).
+/// with `/home/agent/workspace/` populated. The four failure branches
+/// (non-zero exit, `GuestResponse::Error`, unexpected guest response,
+/// transport error) must not be `warn!`-swallowed — returning 201
+/// CREATED with a `Running` session and an empty workspace would
+/// silently violate the caller's stated intent. The only correct
+/// response is to fail the create call and surface the failure
+/// through the HTTP response so the CLI user can see *why* the clone
+/// did not succeed (exit code, stderr snippet, transport error,
+/// etc., carried through in the caller-supplied `e`).
 ///
 /// Teardown shape matches [`fail_explicit_policy_apply`]:
 ///   - mark session `Error` (so `sandbox ps` / `inspect` surface the
@@ -4664,13 +4654,12 @@ async fn fail_explicit_repo_clone(
 
 /// Fail the create call when an explicit `--boot-cmd <cmd>` returns a
 /// non-zero exit code, a guest-agent error, an unexpected guest
-/// response, or a transport error (M10-S9 #53).
+/// response, or a transport error.
 ///
 /// Symmetric completion of the fail-explicit triad with
-/// [`fail_explicit_policy_apply`] (#16) and
-/// [`fail_explicit_repo_clone`] (#34): the boot-cmd block had the
-/// same warn-and-continue shape as the pre-fix repo-clone block, and
-/// the same hazard — when `--boot-cmd` is provided the caller is
+/// [`fail_explicit_policy_apply`] and [`fail_explicit_repo_clone`]:
+/// the boot-cmd block must reject `warn!`-and-continue handling for
+/// the same reason — when `--boot-cmd` is provided the caller is
 /// stating "the session is not usable until this command has run
 /// successfully", and a `Running` session whose boot command exit-ed
 /// 1 (or never dispatched) silently lies to that contract.
@@ -4728,8 +4717,8 @@ fn truncate_for_diagnostic(s: &str, max_chars: usize) -> String {
 /// Inner body of [`teardown_session_networking`], parameterised on the
 /// exact fields it reads rather than the full [`AppState`]. This keeps
 /// the async teardown logic shared between the `setup_session_networking`
-/// failure path, the `apply_policy` failure path (M10-S8 #16), and the
-/// regular stop path, while letting the #16 unit test drive it without
+/// failure path, the `apply_policy` failure path, and the
+/// regular stop path, while letting the unit test drive it without
 /// constructing every `AppState` field just to call it.
 async fn teardown_session_networking_parts(
     session_id: &SessionId,
@@ -4788,7 +4777,7 @@ async fn teardown_session_networking_parts(
 /// underlying `_parts` helper so it can be exercised without
 /// constructing a full [`AppState`].
 async fn teardown_session_networking(session_id: &SessionId, state: &AppState) {
-    // Cancel the synchronous DNS-gate listener (M10-S10 Phase 2) and
+    // Cancel the synchronous DNS-gate listener and
     // drop the per-session DnsCache before the events host directory
     // disappears with the gateway container. Cheap no-ops when no
     // listener was ever spawned (e.g., the session never reached
@@ -5167,12 +5156,12 @@ async fn session_health(
 
     // VM status.
     //
-    // M11-S1 Phase 1C: dispatch through the trait. `RuntimeStatus`
-    // adds `Creating` and `Error` variants over `VmStatus` for the
-    // forthcoming container backend; both are surfaced as their lower-
-    // case names so the existing health-payload consumers (CLI,
-    // `tests/e2e`) stay backwards compatible — they already accept
-    // arbitrary lower-case status strings.
+    // Dispatch through the trait. `RuntimeStatus` adds `Creating` and
+    // `Error` variants over `VmStatus` for the container backend;
+    // both are surfaced as their lower-case names so the existing
+    // health-payload consumers (CLI, `tests/e2e`) stay backwards
+    // compatible — they already accept arbitrary lower-case status
+    // strings.
     let vm_status = {
         let runtime = runtime_for(&state, session.backend);
         let handle = RuntimeHandle::from_session_id(&session.id);
@@ -5296,10 +5285,10 @@ async fn session_health(
     (StatusCode::OK, Json(health)).into_response()
 }
 
-/// JSON body for `POST /rebuild-image` (M11-S4 Phase 4C).
+/// JSON body for `POST /rebuild-image`.
 ///
-/// Both fields default so an empty / missing body decodes as the pre-
-/// Phase-4C behavior (rebuild Lima, no cache-bust flag plumbing).
+/// Both fields default so an empty / missing body decodes as the
+/// historical behavior (rebuild Lima, no cache-bust flag plumbing).
 /// `#[serde(default)]` per CLAUDE.md "On-disk compatibility" /
 /// forward-compat: older CLIs that POST an empty body must keep
 /// working.
@@ -5312,8 +5301,8 @@ struct RebuildImageRequest {
 
 impl Default for RebuildImageRequest {
     fn default() -> Self {
-        // Backwards-compat default: an empty body matches the pre-
-        // Phase-4C handler — Lima, no cache-bust signal.
+        // Backwards-compat default: an empty body matches the historical
+        // handler — Lima, no cache-bust signal.
         Self {
             backend: BackendKind::Lima,
             no_cache: false,
@@ -5323,7 +5312,7 @@ impl Default for RebuildImageRequest {
 
 /// `POST /rebuild-image` -- rebuild a backend's image.
 ///
-/// JSON body shape (M11-S4 Phase 4C):
+/// JSON body shape:
 ///
 /// ```json
 /// { "backend": "lima" | "container", "no_cache": true | false }
@@ -5353,10 +5342,10 @@ async fn rebuild_image(State(state): State<Arc<AppState>>, body: Bytes) -> impl 
 
     match req.backend {
         BackendKind::Lima => {
-            // Per spec Phase 4C: `rebuild_base_image` already deletes
-            // the golden VM and rebuilds it from scratch — that is the
-            // cache-bust. The `no_cache` flag is therefore a no-op on
-            // the Lima path; no new flag plumbing is required.
+            // `rebuild_base_image` already deletes the golden VM and
+            // rebuilds it from scratch — that is the cache-bust. The
+            // `no_cache` flag is therefore a no-op on the Lima path;
+            // no new flag plumbing is required.
             let _base_guard = state.base_image_lock.lock().await;
             let lima = Arc::clone(state.lima_runtime.manager());
             match tokio::task::spawn_blocking(move || lima.rebuild_base_image()).await {
@@ -5367,10 +5356,10 @@ async fn rebuild_image(State(state): State<Arc<AppState>>, body: Bytes) -> impl 
             }
         }
         BackendKind::Container => {
-            // Per spec § "rebuild-image" + Phase 4C: the container
-            // rebuild lock is owned inside `rebuild_lite_image` (the
-            // same image-namespace lock that `ensure_image` uses), so
-            // we deliberately do NOT acquire `state.base_image_lock`
+            // Per spec § "rebuild-image": the container rebuild lock
+            // is owned inside `rebuild_lite_image` (the same
+            // image-namespace lock that `ensure_image` uses), so we
+            // deliberately do NOT acquire `state.base_image_lock`
             // here — that lock is Lima-scoped and would needlessly
             // serialise concurrent `rebuild --backend lima` and
             // `rebuild --backend container` calls.
@@ -5390,9 +5379,9 @@ async fn rebuild_image(State(state): State<Arc<AppState>>, body: Bytes) -> impl 
 
 /// `GET /base-image-status` -- check the status of the golden base image.
 async fn base_image_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    // M11-S1 Phase 1C: base-image status is Lima-specific (the
-    // hash-and-age check operates on the golden VM); kept on the
-    // typed runtime's escape hatch.
+    // Base-image status is Lima-specific (the hash-and-age check
+    // operates on the golden VM); kept on the typed runtime's escape
+    // hatch.
     let lima = Arc::clone(state.lima_runtime.manager());
     match tokio::task::spawn_blocking(move || lima.check_base_image()).await {
         Ok(Ok(status)) => {
@@ -5459,12 +5448,13 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 /// - If the VM exists and states match -> no action
 /// - If the VM exists but states disagree -> update store to match Lima
 ///
-/// M11-S1 Phase 1C: takes the wrapping [`LimaRuntime`] rather than the
+/// Takes the wrapping [`LimaRuntime`] rather than the
 /// raw [`LimaManager`], reaching for `list_vms()` through
 /// [`LimaRuntime::manager`]. The body still pattern-matches on the
 /// Lima-native [`VmStatus`] because the reconciliation contract is
-/// today single-backend; per-backend reconciliation fan-out lands when
-/// the container backend joins (M11-S2).
+/// single-backend; per-backend reconciliation fan-out is a future
+/// extension once additional backends ship a comparable inventory
+/// surface.
 fn reconcile(store: &SessionStore, lima_runtime: &LimaRuntime) {
     let sessions = match store.list_sessions() {
         Ok(s) => s,
@@ -5492,8 +5482,8 @@ fn reconcile(store: &SessionStore, lima_runtime: &LimaRuntime) {
     let mut skipped_count = 0u32;
 
     for session in &sessions {
-        // M11-S6 fix: skip container-backed sessions. The Lima-VM list does
-        // not include them, so the (None, Running) arm below would falsely
+        // Skip container-backed sessions. The Lima-VM list does not
+        // include them, so the (None, Running) arm below would falsely
         // mark every container session as Error on every daemon restart.
         // Container sessions are reconciled via the Docker daemon directly:
         // the session container persists across daemon restarts (Docker is
@@ -5804,9 +5794,9 @@ async fn reconcile_networking(state: &AppState) {
 /// `health_degraded`/`health_restored` events.
 ///
 /// `deny-logger` polls the `:10003/health` endpoint on the gateway
-/// bridge IP (M10-S3 Phase 6) — its data-path listeners on :10001/:10002
-/// are bound on the bridge IP as well (not 127.0.0.1), because DNAT to
-/// loopback would be dropped as a martian destination. The in-container
+/// bridge IP — its data-path listeners on :10001/:10002 are bound on
+/// the bridge IP as well (not 127.0.0.1), because DNAT to loopback
+/// would be dropped as a martian destination. The in-container
 /// probe discovers the bridge IP via `hostname -i` (see
 /// `gateway::component_probe` and the container's `healthcheck.sh`).
 const MONITORED_COMPONENTS: &[(&str, HealthComponent)] = &[
@@ -5917,8 +5907,8 @@ async fn gateway_monitor(state: Arc<AppState>) {
                 continue;
             }
 
-            // Poll per-component health and emit transitions
-            // (M10-S2 Phase 5).  Only components that *flipped* since
+            // Poll per-component health and emit transitions.
+            // Only components that *flipped* since
             // the last tick produce events, so the bus stays sparse
             // under sustained outages.  Runs on every tick independent
             // of the container-level health verdict so we can still
@@ -5939,7 +5929,7 @@ async fn gateway_monitor(state: Arc<AppState>) {
             // honours Docker's retry/debounce window, so we do not
             // flap-restart on a single transient failure.
             //
-            // See M10-S3 spec: "Docker marks the container unhealthy.
+            // The contract: "Docker marks the container unhealthy.
             // sandboxd's existing gateway health polling observes this
             // and restarts the gateway container."
             let gw = Arc::clone(&state.gateway);
@@ -6205,7 +6195,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    // M11-S2 Phase 2C: validate `users.conf` before any expensive
+    // Validate `users.conf` before any expensive
     // initialization (SQLite migrations, Lima manager construction).
     // The daemon refuses to start unless the config contains a subnet
     // entry whose `allow_users` resolves to the daemon's own uid; the
@@ -6253,20 +6243,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // was reset by the V004 migration; the replay of
     // `policy_reset_on_upgrade` lifecycle events on the bus happens in
     // the startup block below, once the `EventBus` is up.
-    // M10-S4 Phase 2: wrap the store in an `Arc` immediately so the
-    // events sub-router (built in `app()`) can hold its own handle
-    // without an additional `FromRef` binding on `AppState`.  All
-    // existing `store.*` call sites below keep working unchanged via
-    // `Arc`'s `Deref<Target = SessionStore>`.
+    // Wrap the store in an `Arc` immediately so the events sub-router
+    // (built in `app()`) can hold its own handle without an additional
+    // `FromRef` binding on `AppState`. All existing `store.*` call
+    // sites below keep working unchanged via `Arc`'s
+    // `Deref<Target = SessionStore>`.
     let (store, reset_orphans) = SessionStore::new(base_dir.clone())?;
     let store = Arc::new(store);
     let lima = Arc::new(LimaManager::new(base_dir.clone())?);
 
-    // M11-S1 Phase 1C: wrap the existing `LimaManager` in a
-    // [`LimaRuntime`] and register it in the backend dispatch table.
-    // The same `Arc<LimaRuntime>` is held both as a typed handle (for
-    // Lima-only orchestration via `LimaRuntime::manager()`) and inside
-    // `runtimes` (for handler-side trait dispatch).
+    // Wrap the existing `LimaManager` in a [`LimaRuntime`] and register
+    // it in the backend dispatch table. The same `Arc<LimaRuntime>` is
+    // held both as a typed handle (for Lima-only orchestration via
+    // `LimaRuntime::manager()`) and inside `runtimes` (for handler-side
+    // trait dispatch).
     let lima_runtime = LimaRuntime::new(Arc::clone(&lima));
     let mut runtimes: HashMap<BackendKind, Arc<dyn SessionRuntime>> = HashMap::new();
     runtimes.insert(
@@ -6274,10 +6264,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&lima_runtime) as Arc<dyn SessionRuntime>,
     );
 
-    // M11-S3 Phase 3D: register the lite-mode container runtime in the
-    // dispatch table next to Lima. Resource defaults are derived from
-    // host capacity (host_ram*0.8, host_cpus*0.8) so the container
-    // backend honors the same headroom policy Lima applies. The same
+    // Register the lite-mode container runtime in the dispatch table
+    // next to Lima. Resource defaults are derived from host capacity
+    // (host_ram*0.8, host_cpus*0.8) so the container backend honors
+    // the same headroom policy Lima applies. The same
     // `Arc<ContainerRuntime>` is also held as a typed handle on
     // `AppState` so the create-session handler can reach the
     // image-tag/`ensure_image` plumbing without going through the
@@ -6287,14 +6277,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Spec § Hardening — root degrades to the 1000:1000 floor; non-1000
     // host uids pass through for workspace bind-mount alignment.
     let (container_uid, container_gid) = map_container_uid_gid(daemon_uid, daemon_gid);
-    // M11-S4 Phase 4D-pre: the runtime's image tag must match the one
-    // `ensure_image` actually builds (`sandboxd-lite:<CARGO_PKG_VERSION>`),
-    // not the literal `:latest` placeholder shipped in M11-S2/3A. Using
-    // the placeholder broke the very first `--lite` create because
-    // `docker create` then references an image tag that no build step
-    // ever produced. Pinning it to the same `lite_image_tag_for_version`
-    // helper that `ensure_image` and `rebuild_lite_image` use closes the
-    // drift at one source.
+    // The runtime's image tag must match the one `ensure_image`
+    // actually builds (`sandboxd-lite:<CARGO_PKG_VERSION>`), not a
+    // literal `:latest` placeholder. Using a placeholder would break
+    // the very first `--lite` create because `docker create` would
+    // reference an image tag that no build step ever produced. Pinning
+    // it to the same `lite_image_tag_for_version` helper that
+    // `ensure_image` and `rebuild_lite_image` use closes the drift at
+    // one source.
     let container_runtime = ContainerRuntime::new(
         lite_image_tag_for_version(env!("CARGO_PKG_VERSION")),
         default_memory_mb,
@@ -6309,12 +6299,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let runtimes = Arc::new(runtimes);
 
-    // M11-S4 Phase 4D-pre (Gap #3): `GuestConnector` now dispatches per
-    // session backend through the runtime registry. It looks up the
-    // session's `BackendKind` in the store at request time and asks the
-    // matching `SessionRuntime` for a `GuestTransport` — no more
-    // hard-wired `limactl shell` invocation. Lima sessions still go
-    // through `limactl shell ... socat`; container sessions go through
+    // `GuestConnector` dispatches per session backend through the
+    // runtime registry. It looks up the session's `BackendKind` in
+    // the store at request time and asks the matching `SessionRuntime`
+    // for a `GuestTransport` — no hard-wired `limactl shell`
+    // invocation. Lima sessions still go through
+    // `limactl shell ... socat`; container sessions go through
     // `docker exec ... socat` via `ContainerTransport`.
     let guest = GuestConnector::new(Arc::clone(&runtimes), Arc::clone(&store));
 
@@ -6406,13 +6396,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Run startup reconciliation (VM state).
     reconcile(&store, &lima_runtime);
 
-    // M11-S5 Phase 5B: lite container backend orphan cleanup. Spec §
-    // "Orphan cleanup on daemon start" extends the gateway-container
-    // reconcile pattern with a Docker-side sweep: any `sandbox-{id}`
-    // container, `sandbox-home-{id}` volume, or `sandbox-net-{id}`
-    // network whose derived session id is not in `sessions.db` is
-    // removed. Best-effort and idempotent — a Docker hiccup logs and
-    // continues rather than aborting startup.
+    // Lite container backend orphan cleanup. Spec § "Orphan cleanup
+    // on daemon start" extends the gateway-container reconcile pattern
+    // with a Docker-side sweep: any `sandbox-{id}` container,
+    // `sandbox-home-{id}` volume, or `sandbox-net-{id}` network whose
+    // derived session id is not in `sessions.db` is removed.
+    // Best-effort and idempotent — a Docker hiccup logs and continues
+    // rather than aborting startup.
     let live_session_ids: HashSet<SessionId> = match store.list_sessions() {
         Ok(sessions) => sessions.into_iter().map(|s| s.id).collect(),
         Err(e) => {
@@ -6429,12 +6419,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // probe is the reaper itself — any error path inside `reap_orphans`
     // already logs at `warn!` and continues.
     //
-    // M11-S10: the reaper additionally gates `sandbox-net-*` networks
-    // against the daemon's allocator pool — only networks whose
-    // IPAM-reported IPv4 subnets fall fully inside `allocation_pool`
-    // are reaped, and out-of-pool networks' container/volume siblings
-    // inherit the same exemption. See the `orphan_reaper.rs`
-    // module docs for the dual-anchor model.
+    // The reaper additionally gates `sandbox-net-*` networks against
+    // the daemon's allocator pool — only networks whose IPAM-reported
+    // IPv4 subnets fall fully inside `allocation_pool` are reaped, and
+    // out-of-pool networks' container/volume siblings inherit the same
+    // exemption. See the `orphan_reaper.rs` module docs for the
+    // dual-anchor model.
     {
         let docker_ops = CliDockerOps;
         let _ = reap_orphans(&docker_ops, &live_session_ids, &allocation_pool).await;
@@ -6445,9 +6435,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // reconciliation loop calls `reapply_session_policy`, which looks
     // up `state.session_policies`.  Without this hydration step the map
     // is empty on restart and the restored gateway would fall back to
-    // the fail-closed empty DNS policy (post-M9-S15), locking out the
-    // session until its stored policy is reapplied — which is less bad
-    // than the pre-M9-S15 allow-all fallback but still wrong.
+    // the fail-closed empty DNS policy, locking out the session until
+    // its stored policy is reapplied — which is less bad than an
+    // allow-all fallback but still wrong.
     let hydrated_policies: HashMap<SessionId, Policy> = match store.load_all_policies() {
         Ok(entries) => {
             if !entries.is_empty() {
@@ -6503,8 +6493,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Replay one `policy_reset_on_upgrade` lifecycle event per
-    // session whose v1 policy was dropped by migration V004 (M10-S2
-    // Phase 5).  The store's `SessionStore::new` captured the
+    // session whose v1 policy was dropped by migration V004.
+    // The store's `SessionStore::new` captured the
     // affected session IDs and their pre-V004 rule counts; now that
     // the `EventBus` is up and the per-session sinks are registered,
     // publish them.  Subscribers connected late still observe these
@@ -6614,7 +6604,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // round_cpus_one_decimal — M11-S7 todo #67 boundary normalisation.
+    // round_cpus_one_decimal — boundary normalisation.
     // Pins the request-parse-time grid: 0.81 → 0.8, 1.55 → 1.5, etc.
     // -----------------------------------------------------------------------
 
@@ -6640,9 +6630,9 @@ mod tests {
 
     /// Round-trip the spec § "Resource defaults — container only"
     /// 1-decimal grid through the request-parse-time normalisation
-    /// without precision drift. Pins the contract todo #67 enforces:
-    /// `0.8`, `1.5`, `2.0` survive the parse → store → serialize
-    /// round-trip with bit-equality on the boundary helper.
+    /// without precision drift. `0.8`, `1.5`, `2.0` survive the
+    /// parse → store → serialize round-trip with bit-equality on the
+    /// boundary helper.
     #[test]
     fn round_cpus_one_decimal_grid_values_survive_unchanged() {
         for cpus in [0.8_f32, 1.5_f32, 2.0_f32] {
@@ -6656,7 +6646,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // resolve_allocation_pool — M11-S2 Phase 2C startup-validation logic.
+    // resolve_allocation_pool — startup-validation logic.
     //
     // Pure function; we drive it with `UsersConfig` values parsed from
     // inline JSON via `load_users_config_from` against a tempfile (the
@@ -6669,7 +6659,7 @@ mod tests {
     //   3. Empty `subnets: []` — same `InvalidArgument` shape as case 2.
     //
     // Loader-level errors (missing file, malformed JSON, invalid CIDR)
-    // are NOT re-tested here — Phase 2A's `users_conf` tests cover them.
+    // are NOT re-tested here — the `users_conf` unit tests cover them.
     // -----------------------------------------------------------------------
 
     fn parse_users_config(raw: &str) -> UsersConfig {
@@ -7029,10 +7019,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // M11-S9 — route-helper path resolution (two-step resolver).
+    // Route-helper path resolution (two-step resolver).
     //
-    // The resolver collapsed in M11-S9 from four candidate sources to
-    // two: `$SANDBOX_ROUTE_HELPER_PATH` (env-var override, fail-closed
+    // The resolver considers two candidate sources:
+    // `$SANDBOX_ROUTE_HELPER_PATH` (env-var override, fail-closed
     // if set but unusable) and the canonical install path
     // `/usr/local/libexec/sandboxd/sandbox-route-helper`. The four
     // permutations the unit tests cover line up with the four corners
@@ -7462,17 +7452,17 @@ mod tests {
 
     #[test]
     fn monitored_components_includes_deny_logger() {
-        // Regression guard for M10-S3 Phase 6: deny-logger is a
-        // first-class monitored subcomponent (it has a real TCP/UDP
-        // data path and a /health endpoint), so its liveness MUST
-        // participate in `health_degraded` / `health_restored` events.
+        // Regression guard: deny-logger is a first-class monitored
+        // subcomponent (it has a real TCP/UDP data path and a /health
+        // endpoint), so its liveness MUST participate in
+        // `health_degraded` / `health_restored` events.
         assert!(
             MONITORED_COMPONENTS
                 .iter()
                 .any(|(label, component)| *label == "deny-logger"
                     && *component == HealthComponent::DenyLogger),
             "MONITORED_COMPONENTS must contain (\"deny-logger\", \
-             HealthComponent::DenyLogger) — see M10-S3 Phase 6"
+             HealthComponent::DenyLogger)"
         );
     }
 
@@ -7499,12 +7489,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // fail_explicit_policy_apply: M10-S8 #16 regression guard
+    // fail_explicit_policy_apply regression guard
     //
-    // Pre-M10-S8, `create_session` `warn!`-swallowed an `apply_policy`
-    // error and returned a `Running` session with `Policy: none`,
-    // silently violating the caller's `--policy` / `--preset` intent.
-    // The helper extracted by M10-S8 flips this to a fatal failure:
+    // Earlier behaviour: `create_session` `warn!`-swallowed an
+    // `apply_policy` error and returned a `Running` session with
+    // `Policy: none`, silently violating the caller's `--policy` /
+    // `--preset` intent. The helper flips this to a fatal failure:
     //   - session state transitions Running → Error
     //   - the HTTP response carries `error_response(e)` (5xx for the
     //     `SandboxError` variants `apply_policy` can produce)
@@ -7601,15 +7591,15 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // fail_explicit_repo_clone: M10-S8 #34 regression guard
+    // fail_explicit_repo_clone regression guard
     //
-    // Pre-M10-S8, the four `git clone` failure branches in
+    // Earlier behaviour: the four `git clone` failure branches in
     // `create_session` `warn!`-swallowed the error and returned 201
     // CREATED with a `Running` session and an empty
     // `/home/agent/workspace/`. The CLI user observed success but
     // had no usable repo — silently violating the caller's
-    // `--repo <url>` intent. The helper extracted by M10-S8 flips
-    // this to a fatal failure with the same shape as #16:
+    // `--repo <url>` intent. The helper flips this to a fatal failure
+    // with the same shape as the policy-apply guard above:
     //   - session state transitions Running → Error
     //   - the HTTP response carries `error_response(e)` with the
     //     diagnostic message (exit code, stderr snippet, transport
@@ -7617,9 +7607,9 @@ mod tests {
     //   - teardown is issued for any partial networking state
     //
     // The test drives the helper directly (rather than the end-to-end
-    // `create_session` handler) for the same reason as #16: the
-    // latter requires Docker + Lima, which are banned from
-    // `make test` (see CLAUDE.md "Integration-test convention").
+    // `create_session` handler) because the latter requires Docker +
+    // Lima, which are banned from `make test` (see CLAUDE.md
+    // "Integration-test convention").
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -7627,8 +7617,8 @@ mod tests {
         use std::collections::HashMap;
         use std::net::Ipv4Addr;
 
-        // Fresh store in a tempdir — same hermetic shape as the #16
-        // test above.
+        // Fresh store in a tempdir — same hermetic shape as the
+        // policy-apply test above.
         let tmp = tempfile::tempdir().expect("tempdir");
         let (store, _orphans) =
             SessionStore::new(tmp.path().to_path_buf()).expect("open session store");
@@ -7745,20 +7735,20 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // fail_explicit_boot_cmd: M10-S9 #53 regression guard
+    // fail_explicit_boot_cmd regression guard
     //
-    // Pre-M10-S9, the four boot-command failure branches in
+    // Earlier behaviour: the four boot-command failure branches in
     // `create_session` (non-zero exit, `GuestResponse::Error`,
     // unexpected guest response, transport error) all
     // `warn!`-swallowed the failure and the handler returned 201
     // CREATED with a `Running` session whose boot command's side
-    // effects were unrealised — the same shape that #16
-    // (`--policy`) and #34 (`--repo`) had pre-fix. The helper
-    // extracted by M10-S9 mirrors its two siblings: when the
-    // caller supplies `--boot-cmd <cmd>` and the command does not
-    // succeed in-guest, the create call must fail.
+    // effects were unrealised — the same shape that the `--policy`
+    // and `--repo` paths had before their fixes. The helper mirrors
+    // its two siblings: when the caller supplies `--boot-cmd <cmd>`
+    // and the command does not succeed in-guest, the create call
+    // must fail.
     //
-    // Contracts pinned here mirror the #34 test verbatim:
+    // Contracts pinned here mirror the repo-clone test verbatim:
     //   - 5xx response (not a 2xx that hides the failure),
     //   - the diagnostic context built at the failure site
     //     (operation, exit code, stderr snippet) reaches the wire
@@ -7766,10 +7756,11 @@ mod tests {
     //     command did not succeed,
     //   - the session row transitions to `Error`.
     //
-    // Like #16 and #34, the test drives the helper directly because
-    // the end-to-end `create_session` handler requires Docker + Lima,
-    // which are banned from `make test` (see CLAUDE.md
-    // "Integration-test convention").
+    // Like the policy-apply and repo-clone tests, the boot-cmd test
+    // drives the helper directly because the end-to-end
+    // `create_session` handler requires Docker + Lima, which are
+    // banned from `make test` (see CLAUDE.md "Integration-test
+    // convention").
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -7865,12 +7856,12 @@ mod tests {
         );
     }
 
-    // -- RebuildImageRequest body deserialization (M11-S4 Phase 4C) --------
+    // -- RebuildImageRequest body deserialization -------------------------
 
-    /// Spec § "rebuild-image" + Phase 4C: an empty body must decode as
+    /// Spec § "rebuild-image": an empty body must decode as
     /// `{ "backend": "lima", "no_cache": false }` so older CLIs that
     /// POST `/rebuild-image` with no body keep working (backwards-
-    /// compat at the wire — handoff Constraints).
+    /// compat at the wire).
     #[test]
     fn rebuild_image_request_default_is_lima_no_cache_false() {
         let req = RebuildImageRequest::default();
@@ -7942,13 +7933,12 @@ mod tests {
         );
     }
 
-    /// M11-S4 Phase 4D-pre gap #1 regression guard: the daemon must
-    /// construct `ContainerRuntime` with the *same* image tag that
-    /// `ensure_image` builds. Previously `main()` passed
-    /// `DEFAULT_LITE_IMAGE_TAG` (`"sandboxd-lite:latest"`) while
+    /// Regression guard: the daemon must construct `ContainerRuntime`
+    /// with the *same* image tag that `ensure_image` builds.
+    /// Previously `main()` could pass `"sandboxd-lite:latest"` while
     /// `ensure_image` builds `sandboxd-lite:<CARGO_PKG_VERSION>`,
-    /// so `docker create` saw an image tag that no build step ever
-    /// produced. Routing both through `lite_image_tag_for_version`
+    /// so `docker create` would see an image tag that no build step
+    /// ever produced. Routing both through `lite_image_tag_for_version`
     /// closes the drift; this test fails-loud if either side ever
     /// computes the tag from a different formula again.
     #[test]

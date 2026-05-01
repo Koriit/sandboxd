@@ -53,9 +53,9 @@ enum Command {
         /// Omit to take the backend default; pass an explicit value
         /// to override.
         ///
-        /// `f32` (M11-S7 todo #67) so the spec § "Resource defaults —
-        /// container only" 1-decimal grammar (`0.8`, `1.5`, `2.0`, …)
-        /// reaches the daemon without truncation. The daemon rounds
+        /// `f32` so the spec § "Resource defaults — container only"
+        /// 1-decimal grammar (`0.8`, `1.5`, `2.0`, …) reaches the
+        /// daemon without truncation. The daemon rounds
         /// to one decimal at request-parse time so `0.81` lands on
         /// the grid as `0.8`. Lima sessions truncate the fractional
         /// part on the daemon side — QEMU's `-smp` flag pins integer
@@ -132,10 +132,10 @@ enum Command {
         /// spec § Non-goals 1195 — explicitly outside the supported
         /// envelope).
         ///
-        /// M11-S8 Wave 2: by default the daemon probes `docker info`
-        /// and refuses container-backend session-create when the host
-        /// is in rootless mode. Pass this flag to override that
-        /// refusal for the current invocation only — the flag is
+        /// By default the daemon probes `docker info` and refuses
+        /// container-backend session-create when the host is in
+        /// rootless mode. Pass this flag to override that refusal
+        /// for the current invocation only — the flag is
         /// never persisted to any config file or preset, so accidental
         /// opt-in across multiple invocations is not possible.
         ///
@@ -564,14 +564,14 @@ fn build_create_request_body(
     if let Some(n) = name {
         body.insert("name".into(), serde_json::Value::String(n.clone()));
     }
-    // M11-S4 Phase 4D-pre gap #4: only stamp `cpus`/`memory_mb` on the
-    // wire when the operator passed an explicit value. Older daemons
-    // that ignore the absence treat it as "Lima-leaning 2/4096"; newer
-    // daemons fold absence into the container backend's host-80%
-    // default. Always sending a concrete number (the pre-fix
-    // `default_value_t` shape) made the host-80% ceiling unreachable
-    // through the public CLI. Forward-compatible with old daemons via
-    // their existing `unwrap_or` Lima fallback path.
+    // Only stamp `cpus`/`memory_mb` on the wire when the operator
+    // passed an explicit value. Older daemons that ignore the absence
+    // treat it as "Lima-leaning 2/4096"; newer daemons fold absence
+    // into the container backend's host-80% default. Always sending a
+    // concrete number (the pre-fix `default_value_t` shape) made the
+    // host-80% ceiling unreachable through the public CLI.
+    // Forward-compatible with old daemons via their existing
+    // `unwrap_or` Lima fallback path.
     if let Some(v) = cpus {
         body.insert("cpus".into(), serde_json::json!(*v));
     }
@@ -588,7 +588,7 @@ fn build_create_request_body(
     // - If neither is present, omit `policy` from the body
     //   (legacy "no policy" shape — server defaults to fail-closed).
     // - If only `--policy` is present, parse it and pass it through
-    //   (matches the pre-M10-S5 wire shape).
+    //   (matches the legacy file-only wire shape).
     // - If `--preset` is present (with or without `--policy`),
     //   expand presets client-side, merge them with the file, and
     //   send the effective `Policy` JSON plus `source_presets` as a
@@ -672,28 +672,27 @@ fn build_create_request_body(
     if *no_cache {
         body.insert("no_cache".into(), serde_json::json!(true));
     }
-    // M11-S8 Wave 2: only stamp `force_rootless_docker` when the
-    // operator explicitly passed `--force-rootless-docker`. The
-    // conditional insert below keeps the body bit-equal to the
-    // pre-Wave-2 default-hardened path when the flag is absent, so
-    // older daemons that ignore the field see exactly the request
-    // they used to receive. (`CreateSessionRequest` derives
-    // `Deserialize` only, so there is no serialize-side
-    // `skip_serializing_if` attribute on the wire struct — the
-    // bit-equality is enforced here at the body-builder seam.)
+    // Only stamp `force_rootless_docker` when the operator explicitly
+    // passed `--force-rootless-docker`. The conditional insert below
+    // keeps the body bit-equal to the default-hardened path when the
+    // flag is absent, so older daemons that ignore the field see
+    // exactly the request they used to receive.
+    // (`CreateSessionRequest` derives `Deserialize` only, so there is
+    // no serialize-side `skip_serializing_if` attribute on the wire
+    // struct — the bit-equality is enforced here at the body-builder
+    // seam.)
     // Container-only by construction — `dispatch_create_preflight`
     // already rejected the `--force-rootless-docker --backend lima`
     // combination with exit 2 before this function runs.
     if *force_rootless_docker {
         body.insert("force_rootless_docker".into(), serde_json::json!(true));
     }
-    // M11-S4 Phase 4A: stamp the resolved backend onto the request
-    // body. The daemon's `CreateSessionRequest` carries this as
-    // `Option<BackendKind>` (added in M11-S3 Phase 3D); older daemons
-    // that ignore the field default to Lima, which is consistent with
-    // the resolver's tier-5 fallback. Always send the field (even for
-    // Lima) so the daemon-side audit / persistence sees an explicit
-    // choice rather than relying on the default.
+    // Stamp the resolved backend onto the request body. The daemon's
+    // `CreateSessionRequest` carries this as `Option<BackendKind>`;
+    // older daemons that ignore the field default to Lima, which is
+    // consistent with the resolver's tier-5 fallback. Always send the
+    // field (even for Lima) so the daemon-side audit / persistence
+    // sees an explicit choice rather than relying on the default.
     body.insert(
         "backend".into(),
         serde_json::json!(resolved_backend.as_str()),
@@ -713,7 +712,7 @@ fn build_create_request_body(
 fn build_request(command: &Command) -> Option<Request<String>> {
     let req = match command {
         Command::Create { .. } => {
-            // M11-S4 Phase 4A: the `Create` branch is owned by
+            // The `Create` branch is owned by
             // [`build_create_request_body`] because the resolved
             // backend (computed in the async preflight that runs
             // before this function) must be threaded into the
@@ -802,8 +801,9 @@ fn build_request(command: &Command) -> Option<Request<String>> {
                     // `source_presets` as a sibling, so the wire shape
                     // is `{"version":"2.0.0","rules":[...],"source_presets":[...]}`
                     // when presets are present and bitwise-identical to
-                    // the pre-M10-S5 shape when they are not (thanks to
-                    // `skip_serializing_if = "Vec::is_empty"` on the DTO).
+                    // the legacy preset-free shape when they are not
+                    // (thanks to `skip_serializing_if = "Vec::is_empty"`
+                    // on the DTO).
                     let (file_policy, file_path): (Option<Policy>, Option<std::path::PathBuf>) =
                         if let Some(path) = policy {
                             let raw = match std::fs::read_to_string(path) {
@@ -880,9 +880,9 @@ fn build_request(command: &Command) -> Option<Request<String>> {
             .body(String::new())
             .expect("failed to build request"),
         Command::RebuildImage { .. } => {
-            // M11-S4 Phase 4C: rebuild-image fans out one HTTP call per
-            // selected backend (spec § "rebuild-image"). The single-
-            // request shape `build_request` returns cannot express that;
+            // rebuild-image fans out one HTTP call per selected
+            // backend (spec § "rebuild-image"). The single-request
+            // shape `build_request` returns cannot express that;
             // `main` short-circuits this command into
             // [`dispatch_rebuild_image`] before reaching this match,
             // mirroring how `Create` is hosted by
@@ -1010,7 +1010,7 @@ fn display_session(session: &SessionDto) {
 }
 
 /// Render a [`SessionConfigDto`]'s `cpus` field for human-readable
-/// `sandbox describe` / inspect output (M11-S7 todo #75).
+/// `sandbox describe` / inspect output.
 ///
 /// The container backend uses `0`/`0.0` as the "operator did not pass
 /// `--cpus`" sentinel, with the daemon substituting its host-80%
@@ -1332,14 +1332,14 @@ enum CapabilitiesLookup {
 /// Render a slice of `SessionDto` as the human-readable `sandbox describe`
 /// output. Separator between sessions is a single blank line.
 ///
-/// Layout follows the spec §2 plus M11-S4 Phase 4B additions:
+/// Layout follows the spec §2:
 /// - header block (Session, Name, State, **Backend**, Created, Updated)
 /// - `Config:` block
 /// - `Runtime:` block
 /// - `Network:` block — backend-neutral gateway IP, session IP, and
-///   per-session /28 CIDR (M11-S7 Bundle Y / todo #72).
+///   per-session /28 CIDR.
 /// - `Mounts:` block — backend-neutral workspace path, host bind
-///   source, CA bundle path, and home volume (M11-S7 Bundle Y).
+///   source, CA bundle path, and home volume.
 /// - `Policy:` block — either `Policy: none` or a version/count header
 ///   followed by one indented rule entry per rule.
 /// - `Capabilities:` block (only when `verbose_caps` is `Some`) showing
@@ -1407,11 +1407,11 @@ fn render_describe_one(
     out.push('\n');
 
     let _ = writeln!(out, "Config:");
-    // M11-S7 todo #75: when the operator omitted `--cpus`/`--memory`
-    // on a container session, the persisted column is `0` and the
-    // daemon substitutes its host-80% default at runtime. Rendering
-    // the raw `0` previously mislead operators; surface the resolved
-    // applied value with a `(default)` hint instead.
+    // When the operator omitted `--cpus`/`--memory` on a container
+    // session, the persisted column is `0` and the daemon substitutes
+    // its host-80% default at runtime. Rendering the raw `0`
+    // previously mislead operators; surface the resolved applied
+    // value with a `(default)` hint instead.
     let _ = writeln!(out, "  CPUs:        {}", format_cpus_field(&session.config));
     let _ = writeln!(
         out,
@@ -1536,10 +1536,10 @@ fn render_workspace_modes(caps: &sandbox_core::Capabilities) -> String {
     parts.join(", ")
 }
 
-/// Render the backend-neutral session networking block (M11-S7
-/// Bundle Y / todo #72). Always emitted so operators see a stable
-/// `Network:` heading per session block; missing data renders as
-/// `none` (matching the `Policy: none` shape) rather than absent.
+/// Render the backend-neutral session networking block. Always
+/// emitted so operators see a stable `Network:` heading per session
+/// block; missing data renders as `none` (matching the `Policy: none`
+/// shape) rather than absent.
 ///
 /// Field labels mirror the spec's "operator-readable" naming so a
 /// human reader and the e2e suite parse the same surface — the e2e
@@ -1562,10 +1562,9 @@ fn render_network_block(network: Option<&SessionNetworkInfo>, out: &mut String) 
     out.push('\n');
 }
 
-/// Render the backend-neutral session mount-surface block (M11-S7
-/// Bundle Y). Same emission contract as [`render_network_block`]:
-/// always emitted, with `none` fallback when the daemon has no
-/// mount info to surface.
+/// Render the backend-neutral session mount-surface block. Same
+/// emission contract as [`render_network_block`]: always emitted,
+/// with `none` fallback when the daemon has no mount info to surface.
 ///
 /// `workspace_host_path`, `ca_bundle_path`, and `home_volume` are
 /// `Option<String>` on the wire and render as `-` when absent so
@@ -1600,7 +1599,7 @@ fn render_mounts_block(mounts: Option<&SessionMountInfo>, out: &mut String) {
     out.push('\n');
 }
 
-/// Render the M11-S8 Wave 2 rootless-Docker probe outcome.
+/// Render the rootless-Docker probe outcome.
 ///
 /// Spec § Non-goals line 1195 makes rootless Docker out-of-scope for
 /// the lite container backend; the daemon stamps the probe outcome
@@ -2230,8 +2229,8 @@ async fn handle_ssh(socket_path: &str, session: &str, command: &[String]) {
         }
     };
 
-    // M11-S4 Phase 4D-pre gap #2: dispatch on the persisted backend so
-    // container sessions reach `docker exec` instead of failing with
+    // Dispatch on the persisted backend so container sessions reach
+    // `docker exec` instead of failing with
     // `limactl shell sandbox-<id>: no such instance`.
     //
     // `stdin_is_tty` controls whether `docker exec` gets `-t`: passing
@@ -2347,7 +2346,7 @@ async fn handle_logs(
 }
 
 // ---------------------------------------------------------------------------
-// `sandbox events` — M10-S4 Phase 4
+// `sandbox events`
 // ---------------------------------------------------------------------------
 //
 // `Command::Events` cannot reuse `send_request`: that helper buffers the
@@ -2995,7 +2994,7 @@ async fn stream_events_to_stdout(socket_path: &str, args: &EventsArgs) -> Result
     // this function), it guarantees that non-follow `sandbox events`
     // exits promptly once the daemon finishes streaming. Without it,
     // the default HTTP/1.1 keep-alive leaves the driver idling for a
-    // next request that never arrives. See the Phase 6b fix for M10-S4.
+    // next request that never arrives.
     let req = Request::builder()
         .method("GET")
         .uri(&uri)
@@ -3706,7 +3705,7 @@ async fn check_base_image_staleness(socket_path: &str) {
     }
 }
 
-/// M11-S4 Phase 4C: per-backend dispatcher for `sandbox rebuild-image`.
+/// Per-backend dispatcher for `sandbox rebuild-image`.
 ///
 /// Spec § "`rebuild-image`: extend the existing flat command" requires
 /// fanning out one HTTP call per selected backend, prefixing per-
@@ -3831,7 +3830,7 @@ async fn send_rebuild_image_request(
     Err(format!("{status}: {body}"))
 }
 
-/// M11-S4 Phase 4A: pre-flight gate for `sandbox create`.
+/// Pre-flight gate for `sandbox create`.
 ///
 /// Runs the work that must happen before the daemon is contacted, in
 /// the order the spec mandates:
@@ -3920,12 +3919,12 @@ async fn dispatch_create_preflight(
         process::exit(2);
     }
 
-    // M11-S8 Wave 2: `--force-rootless-docker` is the operator's
-    // per-invocation opt-in to allow session-create on a rootless
-    // Docker host (spec § Non-goals 1195); it is only meaningful for
-    // the container backend. Combining it with a resolved Lima
-    // backend is operator confusion the CLI rejects up-front so the
-    // daemon never sees a malformed request. Same shape as the
+    // `--force-rootless-docker` is the operator's per-invocation
+    // opt-in to allow session-create on a rootless Docker host
+    // (spec § Non-goals 1195); it is only meaningful for the
+    // container backend. Combining it with a resolved Lima backend
+    // is operator confusion the CLI rejects up-front so the daemon
+    // never sees a malformed request. Same shape as the
     // `--no-cache` rejection above (programmatic, exit 2, runs before
     // daemon contact). `clap`'s `conflicts_with` cannot express this
     // — the offending state is "resolved backend is Lima", which is
@@ -3998,7 +3997,7 @@ async fn dispatch_create_preflight(
         // `SessionSpec::validate` call, so threading the value through
         // here would only duplicate that gate. Leave the spec field as
         // `None` — the daemon-side validate does the authoritative
-        // check via the request's `no_cache` field (M12-S4 todo #95).
+        // check via the request's `no_cache` field.
         no_cache: None,
     };
 
@@ -4132,8 +4131,8 @@ async fn main() {
         }
     }
 
-    // M11-S4 Phase 4C: rebuild-image fans out one HTTP call per
-    // selected backend (spec § "rebuild-image"). The single-call
+    // rebuild-image fans out one HTTP call per selected backend
+    // (spec § "rebuild-image"). The single-call
     // build_request / send_request flow does not fit a multi-call
     // command, so the dispatcher owns the full request loop, error
     // formatting (`rebuild-image[<kind>]: <msg>` per spec), and
@@ -4144,8 +4143,8 @@ async fn main() {
         return;
     }
 
-    // M11-S4 Phase 4A: Create has a dedicated dispatch path because
-    // the request body depends on a backend choice that is the output
+    // Create has a dedicated dispatch path because the request body
+    // depends on a backend choice that is the output
     // of an async preflight (config load → resolver → /backends fetch
     // → SessionSpec validation). Running it here keeps `build_request`
     // sync for every other command and confines the new logic to one
@@ -4205,9 +4204,9 @@ mod tests {
     fn parse_create_no_name() {
         let cli = Cli::parse_from(["sandbox", "create"]);
         // Exhaustive match guarantees every field has its documented
-        // default. `preset` was added in M10-S5 Phase 5a; an empty
-        // vec is the "no presets requested" shape the `--preset`
-        // flag would populate.
+        // default. `preset` is the repeatable preset invocation list;
+        // an empty vec is the "no presets requested" shape the
+        // `--preset` flag would populate.
         match &cli.command {
             Command::Create {
                 name: None,
@@ -4265,7 +4264,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(name.as_deref(), Some("full"));
-                // M11-S7 todo #67: `--cpus 4` parses as `4.0_f32`.
+                // `--cpus 4` parses as `4.0_f32`.
                 assert_eq!(*cpus, Some(4.0_f32));
                 assert_eq!(*memory, Some(8192));
                 assert_eq!(*disk, 50);
@@ -4431,9 +4430,9 @@ mod tests {
         assert_eq!(req.uri(), "/sessions");
         let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
         assert_eq!(body["name"], "test");
-        // M11-S7 todo #67: cpus is `f32` on the wire; serde_json
-        // renders `2.0_f32` as JSON `2.0` (a `Number::Float`), so
-        // compare via `as_f64` rather than against an integer literal.
+        // cpus is `f32` on the wire; serde_json renders `2.0_f32`
+        // as JSON `2.0` (a `Number::Float`), so compare via `as_f64`
+        // rather than against an integer literal.
         assert_eq!(body["cpus"].as_f64(), Some(2.0));
         assert_eq!(body["memory_mb"], 4096);
         assert_eq!(body["disk_gb"], 20);
@@ -5719,8 +5718,8 @@ mod tests {
     // -- BACKEND column / describe backend prominence / capabilities ---------
 
     /// `display_sessions_table` rendered into a buffer must include the
-    /// `BACKEND` column header between `STATE` and `AGENT`. M11-S4
-    /// Phase 4B contract pin.
+    /// `BACKEND` column header between `STATE` and `AGENT`. Contract
+    /// pin so the column does not silently drift.
     #[test]
     fn write_sessions_table_header_includes_backend_between_state_and_agent() {
         let dto = make_session_dto("0123456789ab", Some("alpha"), None, chrono::Utc::now());
@@ -5780,11 +5779,11 @@ mod tests {
         assert_eq!(rendered, "No sessions found.\n");
     }
 
-    // -- M11-S7 Bundle Z (todo #75): describe/inspect rendering of
-    //    cpus / memory must surface the daemon's host-80% default for
-    //    container sessions whose persisted column is `0` (operator
-    //    omitted `--cpus`/`--memory`). The pre-Bundle-Z render shape
-    //    rendered "CPUs: 0, Memory: 0 MB" which mislead operators.
+    // -- describe/inspect rendering of cpus / memory must surface the
+    //    daemon's host-80% default for container sessions whose
+    //    persisted column is `0` (operator omitted `--cpus`/`--memory`).
+    //    An earlier render shape rendered "CPUs: 0, Memory: 0 MB"
+    //    which mislead operators.
 
     /// Container session created without `--cpus` (`config.cpus == 0`).
     /// `format_cpus_field` must surface the daemon's resolved host-80%
@@ -6121,11 +6120,11 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&pretty).expect("valid json");
         let arr = parsed.as_array().expect("top-level array");
         assert_eq!(arr.len(), 2);
-        // M11-S4 Phase 4B: the JSON `inspect` automation contract picks
-        // up `backend` "for free" via SessionDto's additive field. Pin
-        // the wire key here so an accidental rename or removal in
-        // `SessionDto` lights up the inspect contract test, not just
-        // the deeper serde unit tests.
+        // The JSON `inspect` automation contract picks up `backend`
+        // "for free" via SessionDto's additive field. Pin the wire
+        // key here so an accidental rename or removal in `SessionDto`
+        // lights up the inspect contract test, not just the deeper
+        // serde unit tests.
         assert_eq!(
             arr[0]
                 .get("backend")
@@ -6206,7 +6205,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // `sandbox events` subcommand — Phase 4 of M10-S4.
+    // `sandbox events` subcommand.
     //
     // Coverage matrix (aligned with the implementation plan):
     //
@@ -6628,7 +6627,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // `policy status` subcommand (M10-S6 todo #37)
+    // `policy status` subcommand
     // ---------------------------------------------------------------
 
     #[test]
@@ -6740,7 +6739,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // plan_ssh_command — M11-S4 Phase 4D-pre gap #2 dispatch logic.
+    // plan_ssh_command — backend-specific dispatch logic.
     //
     // Pure helper: returns `(program, args)` based on the session's
     // backend kind. The handler then forwards them to
@@ -6878,9 +6877,10 @@ mod tests {
         );
     }
 
-    // -- M11-S8 Wave 2: render_rootless_block ----------------------------------
+    // -- render_rootless_block -------------------------------------------------
 
-    /// `None` — Lima sessions and pre-Wave-2 records emit nothing.
+    /// `None` — Lima sessions and records from before the rootless
+    /// block landed emit nothing.
     /// Mirrors how `render_network_block`/`render_mounts_block` behave
     /// for absent data, but without a `none` placeholder line: the
     /// rootless-Docker block is container-only, and printing

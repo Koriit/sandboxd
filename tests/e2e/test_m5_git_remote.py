@@ -1,4 +1,4 @@
-"""E2E tests for M5-S2 git remote transport: verifying host-to-VM git
+"""E2E tests for the git remote transport: verifying host-to-VM git
 push/fetch via the ``git-remote-sandbox`` remote helper.
 
 Git invokes the ``git-remote-sandbox`` symlink (pointing at the ``sandbox``

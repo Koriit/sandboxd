@@ -1,7 +1,7 @@
 //! HTTP endpoint `GET /sessions/{id}/events`.
 //!
-//! This module owns the non-follow replay handler landed in M10-S4 Phase 2
-//! and the follow-streaming handler landed in Phase 3.
+//! This module owns both the non-follow replay handler and the
+//! follow-streaming handler.
 //!
 //! # Contract
 //!
@@ -11,9 +11,8 @@
 //! - Query: [`EventsQueryDto`] via [`axum_extra::extract::Query`]. We
 //!   use axum-extra's extractor (not the built-in `axum::extract::Query`)
 //!   because axum 0.8's built-in `Query` delegates to `serde_urlencoded`,
-//!   which rejects repeated keys when the target field is `Vec<_>`
-//!   (R1 entry check for Phase 2 — see the M10-S4 plan). axum-extra's
-//!   `Query` swaps in `serde_html_form` which accepts them.
+//!   which rejects repeated keys when the target field is `Vec<_>`.
+//!   axum-extra's `Query` swaps in `serde_html_form` which accepts them.
 //! - `follow=false` (default): bounded replay of the session's ring
 //!   buffer, rendered as concatenated JSONL (one object per line,
 //!   `\n`-terminated) with `Content-Type: application/jsonl`.
@@ -290,8 +289,7 @@ fn follow_response(
 /// published on the bus, never persisted, and does not flow through
 /// the domain → DTO mapper.  It exists only to signal, inline, that
 /// the streaming consumer fell behind the broadcast channel and
-/// `n` live events were skipped.  The shape is pinned by the
-/// M10-S4 Phase 3 handoff (Q5 answer):
+/// `n` live events were skipped.  The shape is:
 ///
 /// ```json
 /// {"layer":"lifecycle","event":"ring_buffer_lag","skipped":<n>,"timestamp":"<RFC3339 now UTC>"}

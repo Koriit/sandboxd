@@ -1,7 +1,7 @@
 //! Effective-policy merger and `(host, port)` uniqueness gate.
 //!
-//! Phase 4 of M10-S5 lives here.  The [`expand`] module per invocation
-//! is intentionally permissive — two presets may legitimately emit
+//! The [`expand`] module per invocation is intentionally permissive —
+//! two presets may legitimately emit
 //! overlapping `(host, port)` rows (e.g. `github:` and
 //! `github-repo:repo=foo/bar` both declare `api.github.com:443`), and
 //! user-preset repeatable fan-out can produce intra-preset duplicates

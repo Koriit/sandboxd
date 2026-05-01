@@ -1,4 +1,4 @@
-//! Integration test for the M11-S5 Phase 5B lite-mode orphan reaper.
+//! Integration test for the lite-mode orphan reaper.
 //!
 //! Spec § "Orphan cleanup on daemon start" — the reaper enumerates the
 //! `sandbox-` Docker namespace at boot and removes any container,
@@ -259,11 +259,11 @@ async fn integration_orphan_reaper_removes_orphans_and_preserves_live_resources(
     let live: HashSet<SessionId> = [live_sid].into_iter().collect();
     // The fixture's networks live in `10.99.0.0/16` (see
     // `create_network` above), which spans every /28 the test pulls
-    // out of that range. The M11-S10 dual-anchor IPAM gate is
-    // exercised explicitly in `integration_orphan_reaper_cidr.rs`;
-    // here we want the existing reap-and-preserve contract under a
-    // CIDR pool that fully contains the fixture's networks, so the
-    // gate is permissive and the assertions below keep their pre-S10
+    // out of that range. The dual-anchor IPAM gate is exercised
+    // explicitly in `integration_orphan_reaper_cidr.rs`; here we
+    // want the existing reap-and-preserve contract under a CIDR
+    // pool that fully contains the fixture's networks, so the gate
+    // is permissive and the assertions below keep their original
     // shape.
     let pool = Cidr4::parse("10.99.0.0/16").expect("test pool parses");
     let report = reap_orphans(&CliDockerOps, &live, &pool).await;

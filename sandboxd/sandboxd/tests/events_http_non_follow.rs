@@ -1,6 +1,6 @@
 //! Integration tests for `GET /sessions/{id}/events` — non-follow
-//! (`follow=false`) path only.  Follow-streaming is Phase 3 of M10-S4
-//! and is covered separately once it lands.
+//! (`follow=false`) path only.  Follow-streaming is covered separately
+//! in `events_http_follow.rs`.
 //!
 //! # Architecture
 //!
@@ -12,7 +12,7 @@
 //! through `tower::ServiceExt::oneshot`.  This exercises the real
 //! axum 0.8 extractor stack (including the axum-extra `Query`
 //! extractor that replaces the built-in one for repeatable query
-//! parameters — see R1 in the M10-S4 plan), the real handler, and the
+//! parameters), the real handler, and the
 //! real `SessionStore` name-or-id resolver, without ever booting the
 //! full daemon or going anywhere near Unix sockets.
 //!
@@ -217,8 +217,8 @@ fn parse_jsonl(body: &[u8]) -> Vec<serde_json::Value> {
 
 /// Empty filter replays every buffered event.  The 6-event fixture
 /// (2 × dns, 2 × envoy, 1 × mitmproxy, 1 × deny-logger) is the
-/// reference shape the M10-S4 plan's Phase 2 exit test names verbatim,
-/// so the assertion count is load-bearing.
+/// reference shape the exit test names verbatim, so the assertion
+/// count is load-bearing.
 #[tokio::test]
 async fn get_events_empty_filter_returns_all_replay() {
     let (store, _tmp) = fresh_store();

@@ -1,4 +1,4 @@
-//! Integration test for M11-S3 Phase 3C: `GET /backends`.
+//! Integration test for `GET /backends`.
 //!
 //! Drives `sandboxd::backends_http::backends_router` via
 //! `tower::ServiceExt::oneshot` against a `BackendsApiState` populated

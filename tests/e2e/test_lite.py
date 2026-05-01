@@ -6,7 +6,7 @@ git-remote-sandbox parity, and the β home-volume lifecycle. These
 assertions exercise the *container* backend end-to-end through the
 public CLI surface (``sandbox create --lite ...``); the matching
 backend-agnostic parametrisation of the existing test files is
-deferred to M11-S5.
+deferred to a follow-up.
 
 These tests boot real Docker containers (no QEMU/Lima); each create +
 stop/start cycle takes ~5-10s plus assertion overhead, so individual
@@ -409,11 +409,10 @@ def test_lite_gateway_parity(lite_harness, sandbox_cli):
 
     The shape matches ``test_m4_policy.py::test_level1_transport_tcp``
     plus a deny probe — kept narrow because the full M4 matrix is
-    parametrised in M11-S5; this test is the lite-specific smoke gate.
-    M11-S5 wired the gateway into the container backend (gap #70):
-    ``create_session`` now performs the same 8-step gateway sequence
-    as ``setup_session_networking`` for lite sessions, so this test is
-    re-enabled.
+    parametrised separately; this test is the lite-specific smoke gate.
+    The gateway is wired into the container backend so
+    ``create_session`` performs the same 8-step gateway sequence
+    as ``setup_session_networking`` for lite sessions.
     """
     policy_path = None
     try:
@@ -488,7 +487,7 @@ def test_lite_gateway_parity(lite_harness, sandbox_cli):
 
 
 # ---------------------------------------------------------------------------
-# 3.9 — workspace UID alignment (deferred to M11-S5)
+# 3.9 — workspace UID alignment
 # ---------------------------------------------------------------------------
 
 
@@ -498,13 +497,13 @@ def test_lite_workspace_uid_alignment(lite_harness, tmp_path):
     ``--workspace shared:<path>`` makes it available at
     ``/home/agent/workspace/`` inside the lite container, and files
     written from inside the session land on the host with the *host*
-    user's uid (not a stale container uid). M11-S5 gap #68 wired this
-    through: ``ContainerNetwork.workspace_host_path`` is now
+    user's uid (not a stale container uid).
+    ``ContainerNetwork.workspace_host_path`` is set to
     ``Some(<path>)`` when the request supplies ``WorkspaceMode::Shared``,
     and the container runtime renders it as ``--mount
-    type=bind,src=<path>,dst=/home/agent/workspace/`` (M11-S7 unified
-    the bind target with Lima's workspace mount; pre-M11-S7 the target
-    was ``/workspace``).
+    type=bind,src=<path>,dst=/home/agent/workspace/`` (the bind target
+    matches Lima's workspace mount; the legacy target ``/workspace``
+    has been retired).
 
     UID alignment is enforced by ``map_container_uid_gid`` (the
     container runs as the daemon's host uid:gid), so any file

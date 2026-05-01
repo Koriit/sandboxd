@@ -532,7 +532,7 @@ pub fn render_no_cache_rejection_for_container(lite_flag_used: bool) -> String {
     )
 }
 
-/// Render the M11-S8 Wave 2 misuse error for `--force-rootless-docker`
+/// Render the misuse error for `--force-rootless-docker`
 /// against a resolved Lima backend.
 ///
 /// `--force-rootless-docker` is the operator's per-invocation opt-in
@@ -864,11 +864,10 @@ error: `--no-cache` is not supported with `--backend container` / container back
         assert_eq!(rendered, expected);
     }
 
-    /// M11-S8 Wave 2: `--force-rootless-docker` with a resolved Lima
-    /// backend renders a three-line misuse error. Pin every byte so
-    /// downstream tests (Wave 3's
-    /// `integration_rootless_docker_force_flag_rejected_on_lima`) and
-    /// the spec text stay aligned.
+    /// `--force-rootless-docker` with a resolved Lima backend renders
+    /// a three-line misuse error. Pin every byte so the integration
+    /// test `integration_rootless_docker_force_flag_rejected_on_lima`
+    /// and the spec text stay aligned.
     #[test]
     fn render_force_rootless_docker_lima_rejection_matches_spec() {
         let rendered = render_force_rootless_docker_lima_rejection();

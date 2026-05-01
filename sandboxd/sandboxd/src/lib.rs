@@ -2,12 +2,12 @@
 //!
 //! Items that escape the binary:
 //!
-//! * [`backends_http`] — `GET /backends` (M11-S3 Phase 3C). Read-only
-//!   endpoint the CLI hits once per invocation to learn the daemon's
-//!   registered backends and their capability matrices.
-//! * [`events_http`] — `GET /sessions/{id}/events` (M10-S4 Phase 2/3).
-//! * [`policy_http`] — `GET /sessions/{id}/policy/propagation-status`
-//!   (M10-S6 todo #37). The read-only status endpoint that the
+//! * [`backends_http`] — `GET /backends`. Read-only endpoint the CLI
+//!   hits once per invocation to learn the daemon's registered
+//!   backends and their capability matrices.
+//! * [`events_http`] — `GET /sessions/{id}/events`.
+//! * [`policy_http`] — `GET /sessions/{id}/policy/propagation-status`.
+//!   The read-only status endpoint that the
 //!   `sandbox policy status [--wait]` CLI and the E2E suite poll to
 //!   decide when a just-applied policy has reached steady state.
 //! * [`propagation`] — the per-session propagation-state registry that

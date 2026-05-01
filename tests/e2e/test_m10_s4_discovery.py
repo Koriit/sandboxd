@@ -1,12 +1,12 @@
-"""E2E test for the M10-S4 discovery workflow.
+"""E2E test for the discovery workflow.
 
-Exercises the capstone scenario from the M10-S4 plan (Phase 6): an
+Exercises the capstone scenario: an
 empty-policy session first surfaces deny events via
 ``sandbox events <id> --decision=deny --follow``, then a policy update
 that allow-lists the target hosts causes a subsequent workload run to
 emit no *new* deny events for those hosts.
 
-Rationale: the M10 "discovery workflow" pitch is that operators and
+Rationale: the discovery workflow pitch is that operators and
 agents can spot their own unintended denials by tailing the event
 stream, refine the policy, and re-run — without reading gateway logs or
 rebuilding the session. This test is the end-to-end guard for that
@@ -34,8 +34,8 @@ Notes:
 - The background ``sandbox events`` subprocess is terminated via
   ``SIGINT`` to hit its documented exit path (the CLI installs a
   ``tokio::signal::ctrl_c`` handler and exits 130). We accept 130,
-  -2, and 0 as valid exit codes per the M10-S4 plan's "exit code
-  reflects SIGINT" note.
+  -2, and 0 as valid exit codes per the "exit code reflects SIGINT"
+  contract.
 
 Runs with generous timeouts; a single iteration boots a VM so budget
 3-10 minutes.

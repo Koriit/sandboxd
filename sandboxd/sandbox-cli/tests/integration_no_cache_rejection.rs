@@ -65,9 +65,9 @@ async fn spawn_dual_backend_daemon() -> (TempDir, String, SessionsCounter) {
                 // sandbox-core/backend/container.rs: no nested-virt,
                 // no privileged ops, no raw network, no hardening
                 // flag, no per-session no-cache. Workspace modes
-                // ship `["shared", "clone"]` post M11-S7 once the
-                // bind-mount + clone-on-container plumbing landed
-                // (Bundle X). The `--no-cache` rejection asserted
+                // ship `["shared", "clone"]` once the bind-mount +
+                // clone-on-container plumbing has landed. The
+                // `--no-cache` rejection asserted
                 // by these tests is independent of workspace modes;
                 // the mock is kept spec-accurate so the preflight
                 // does not skip on a malformed capability matrix.

@@ -1,6 +1,6 @@
-//! Integration test for M9-S12 policy persistence.
+//! Integration test for policy persistence.
 //!
-//! Exercises the daemon-side contract that was added this session:
+//! Exercises the daemon-side contract:
 //!
 //!   1. A `Policy` written via `SessionStore::set_policy` survives a
 //!      drop-and-reopen of the store on the same `base_dir` — this is

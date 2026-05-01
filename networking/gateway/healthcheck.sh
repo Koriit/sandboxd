@@ -43,8 +43,8 @@ fi
 # unhealthy, and sandboxd's gateway poller restarts the container
 # (spec Part 3 / "Liveness posture" — observability of denials and
 # allow-flow audit are hard invariants, no degraded mode). The two
-# loggers are independent failure domains (M12-S2 Decision 4): if
-# either fails the container is unhealthy.
+# loggers are independent failure domains: if either fails the
+# container is unhealthy.
 GATEWAY_IP_FOR_HEALTH="$(hostname -i | awk '{print $1}')"
 if [[ -z "${GATEWAY_IP_FOR_HEALTH}" ]]; then
     echo "UNHEALTHY: could not discover gateway bridge IP via 'hostname -i'"

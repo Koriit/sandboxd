@@ -1,11 +1,11 @@
-"""E2E tests for the M10-S5 preset system.
+"""E2E tests for the preset system.
 
 Each test exercises one preset class end-to-end by creating a session with
 ``sandbox create --preset '<name>[:<args>]'`` and asserting that the
 preset-allowed traffic succeeds while off-preset traffic is denied. The
 assertions rely on the unified event stream (``sandbox events <sid>``)
 which exposes DNS, Envoy, mitmproxy, deny-logger, and lifecycle layers —
-so the tests also act as a cross-layer smoke test for M10-S4 events plumbing.
+so the tests also act as a cross-layer smoke test for events plumbing.
 
 Deviation from the plan (Phase 7 of
 ``.tasks/handoffs/20260423-m10-s5-implementation-plan.md``)
@@ -67,7 +67,7 @@ from conftest import (
 
 # Seconds to wait after a workload so the gateway logger-tail / ring ingest
 # tasks have time to publish the domain event to the per-session ring
-# buffer. M10-S4's discovery test uses 3s; we use 5s because the mitmproxy
+# buffer. The discovery test uses 3s; we use 5s because the mitmproxy
 # JSONL tail (unlike Envoy's access log) is buffered inside the Python
 # addon via ``open(…, "a")`` without explicit ``flush()`` on every write,
 # and the daemon's file watcher reacts to size-change events from inotify,
@@ -171,9 +171,9 @@ def _wait_policy_propagated(
 ) -> None:
     """Block until the session's latest policy-apply has fully propagated.
 
-    Replaces the M10-S5 pattern of ``time.sleep(POLICY_PROPAGATION_S)``
+    Replaces the legacy pattern of ``time.sleep(POLICY_PROPAGATION_S)``
     wall-clock waits with a deterministic poll against
-    ``GET /sessions/{id}/policy/propagation-status`` (M10-S6 todo #37).
+    ``GET /sessions/{id}/policy/propagation-status``.
     The CLI exits 0 the moment the propagation tracker reports
     ``propagated=true`` — which in turn requires every enforcement
     layer to have reconciled the policy *and* the DNS loop to have
@@ -194,7 +194,7 @@ def _wait_policy_propagated(
     # Multi-host presets: --wait returns when daemon's DNS-propagation loop
     # flips propagated=true, but multi-host cases still race against Envoy
     # cluster DNS resolution / nftables enforcement settling (~sub-second
-    # window). 8s settle matches pre-M10-S6 timing baseline (sleep(5) +
+    # window). 8s settle matches the legacy timing baseline (sleep(5) +
     # warm_dns + sleep(5) that passed 5/5 on e18baa2) until todo #40 lands.
     time.sleep(8)
 
@@ -437,7 +437,7 @@ def test_cargo_preset_allows_cargo_fetch(sandbox_cli, backend):
     ``cargo fetch`` issues against the three crates.io hosts.
 
     The ``cargo:`` preset expansion (``sandboxd/sandbox-cli/src/presets/
-    builtin.rs``, verified empirically by M10-S5 Phase 5a' against a live
+    builtin.rs``, verified empirically against a live
     cargo fetch trace stored at ``sandbox-cli/tests/fixtures/
     cargo_fetch_trace.json``) includes:
 
@@ -554,7 +554,7 @@ def test_github_repo_preset_scopes_to_one_repo(sandbox_cli, backend):
 
     The ``rustlings`` repo was chosen over smaller public repos (e.g.
     ``octocat/Hello-World``) because it is still actively maintained,
-    under ~20 MiB shallow, and the M10-S5 plan names it explicitly.
+    under ~20 MiB shallow, and the preset plan names it explicitly.
     """
     session_name = "m10-s5-ghrepo"
     session_id: str | None = None

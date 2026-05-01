@@ -23,7 +23,7 @@ filter = 'test(/^integration_lima/)'
 test-group = 'lima'
 
 [[profile.integration.overrides]]
-# The orphan reaper (M11-S5 Phase 5B) sweeps every `sandbox-{12hex}`
+# The orphan reaper sweeps every `sandbox-{12hex}`
 # container/volume/network on the host whose session id isn't in the
 # live set passed in. If it runs in parallel with the container
 # runtime tests (which create `sandbox-{12hex}` containers with their
@@ -32,24 +32,21 @@ test-group = 'lima'
 # anything that touches the lite-mode `sandbox-{id}` Docker namespace
 # via the shared `docker-sandbox-namespace` test group below.
 #
-# M11-S8 Wave 3 added two more touch points:
-#   - `integration_rootless_docker_*` spawn full lite sessions (#2
-#     forced override, #4 default-hardened) and snapshot the
-#     `sandbox-*` namespace pre/post (#1 rejection); a parallel
-#     orphan-reaper or container-runtime test would either reap their
-#     in-flight containers or pollute the snapshot.
+# Additional touch points in the same namespace:
+#   - `integration_rootless_docker_*` spawn full lite sessions (forced
+#     override and default-hardened) and snapshot the `sandbox-*`
+#     namespace pre/post; a parallel orphan-reaper or container-runtime
+#     test would either reap their in-flight containers or pollute the
+#     snapshot.
 #   - `integration_default_hardened_docker_proceeds` does the same
-#     positive-create exercise as #2 against the default-hardened
-#     stub.
-#
-# M11-S10 added a second reaper test file
-# (`integration_orphan_reaper_cidr.rs`) whose tests are named
-# `integration_reaper_*` rather than `integration_orphan_reaper_*`
-# (per the M11-S10 spec). Both prefixes belong in the same
-# `docker-sandbox-namespace` group — they create real
-# `sandbox-net-*` networks under the same IPAM space and would race
-# with each other and with the existing reaper / container-runtime
-# tests on parallel runs.
+#     positive-create exercise against the default-hardened stub.
+#   - `integration_orphan_reaper_cidr.rs` exposes a second reaper
+#     test file whose tests are named `integration_reaper_*` rather
+#     than `integration_orphan_reaper_*`. Both prefixes belong in the
+#     same `docker-sandbox-namespace` group — they create real
+#     `sandbox-net-*` networks under the same IPAM space and would
+#     race with each other and with the existing reaper /
+#     container-runtime tests on parallel runs.
 filter = 'test(/^integration_orphan_reaper/) | test(/^integration_reaper_/) | test(/^integration_container_runtime/) | test(/^integration_rootless_docker/) | test(/^integration_default_hardened_docker/)'
 test-group = 'docker-sandbox-namespace'
 

@@ -1,11 +1,10 @@
 //! Parser for preset invocation strings of the form
 //! `'<name>:<key>=<val>,<key>=<val>,...'`.
 //!
-//! The parser is fail-loud on raw `,`, `:`, and `=` inside values (per
-//! M10-S5 Phase 0 decision D-2): there is no escape mechanism, and a
-//! value containing any of those three characters produces a
-//! [`PresetError::ForbiddenChar`] rather than being silently
-//! interpreted.
+//! The parser is fail-loud on raw `,`, `:`, and `=` inside values:
+//! there is no escape mechanism, and a value containing any of those
+//! three characters produces a [`PresetError::ForbiddenChar`] rather
+//! than being silently interpreted.
 //!
 //! Grammar:
 //!

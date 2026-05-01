@@ -27,7 +27,7 @@
 #
 # nftables rules are managed externally by sandboxd, not by this script.
 #
-# **M9-S18**: Envoy config is split into a **static bootstrap**
+# Envoy config is split into a **static bootstrap**
 # (`/etc/envoy/envoy-bootstrap.yaml`) and a **dynamic listener file** served
 # via filesystem LDS from `/etc/envoy/listeners/listener.yaml`. The bootstrap
 # is written into the tmpfs by sandboxd via `docker exec` right after the
@@ -35,8 +35,8 @@
 # sandboxd can atomically rewrite the listener file via host-side rename
 # (Envoy's filesystem LDS watcher only fires on `MovedTo` inotify events —
 # upstream issue `#20474`). Changes to the listener are picked up via xDS
-# without process restart, so the SIGHUP restart handler used before M9-S18
-# has been removed.
+# without process restart, so the legacy SIGHUP restart handler has been
+# removed.
 #
 # If any process exits, this script logs the failure and exits non-zero
 # so Docker can restart the container.
@@ -49,7 +49,7 @@ ENVOY_BOOTSTRAP_FILE="${ENVOY_BOOTSTRAP_FILE:-/etc/envoy/envoy-bootstrap.yaml}"
 ENVOY_LISTENER_FILE="${ENVOY_LISTENER_FILE:-/etc/envoy/listeners/listener.yaml}"
 ENVOY_CONFIG_WAIT_TIMEOUT="${ENVOY_CONFIG_WAIT_TIMEOUT:-30}"
 
-# M10-S2 Phase 6b: default path for the mitmproxy JSONL event stream.
+# Default path for the mitmproxy JSONL event stream.
 # `/var/log/gateway/events/` is the per-session bind-mount target
 # (host-side: `{events_host_root}/<session>/`), so writes here land on
 # the host filesystem where sandboxd's ingester tails them.  Export so
@@ -79,7 +79,7 @@ shutdown_all() {
     log "Shutting down components..."
     # Shutdown order (reverse of startup): CoreDNS, both nft-loggers,
     # Envoy, mitmproxy. The deny-logger and the allow-logger are
-    # independent failure domains (M12-S2 Decision 4) and have no
+    # independent failure domains and have no
     # ordering relationship between them — both get SIGTERM
     # simultaneously. Both handle SIGTERM cleanly: each flushes any
     # pending `rate_limited` summary to its JSONL before exiting (see
@@ -119,7 +119,7 @@ on_signal() {
 
 trap on_signal SIGTERM SIGINT SIGQUIT
 
-# M9-S18: Envoy configuration now updates via xDS (filesystem LDS for
+# Envoy configuration now updates via xDS (filesystem LDS for
 # listener, in-process cluster definitions for clusters). A SIGHUP-driven
 # process restart would drain the listener and reset in-flight
 # connections, defeating the whole point of the xDS path. The previous
@@ -176,7 +176,7 @@ wait_for_ready "mitmproxy" \
 
 # ── Start Envoy ─────────────────────────────────────────────────────
 
-# M9-S18: the bootstrap config is written into the tmpfs at
+# The bootstrap config is written into the tmpfs at
 # ${ENVOY_BOOTSTRAP_FILE} by sandboxd right after `docker run` (via
 # `docker exec`). The listener file at ${ENVOY_LISTENER_FILE} lives in a
 # bind-mounted host directory and is seeded by sandboxd before the
@@ -215,7 +215,7 @@ wait_for_ready "Envoy" "curl -sf http://127.0.0.1:9901/ready"
 # `/health`), but it binds the same way for symmetry with the
 # HEALTHCHECK probe (which discovers the bridge IP via `hostname -i`).
 #
-# UDP datapath honesty (M12-S2 spec):
+# UDP datapath honesty:
 #   - Denied UDP: kernel `nft drop`s and emits NFLOG group 1 messages;
 #     the deny-logger's NFLOG subscriber parses them in-process. No
 #     userland datagram listener.
@@ -244,7 +244,7 @@ log "Discovered gateway bridge IP: ${GATEWAY_IP}"
 # sandboxd's directory-scoped ingest watcher picks them both up
 # without per-file configuration.
 #
-# Filename note (M12-S2 Resolution 6): both producers now write under
+# Filename note: both producers write under
 # their spec-mandated names — `nft-deny.jsonl` and `nft-allow.jsonl`.
 # The daemon-side ingest watcher's known-producer list at
 # `sandbox-core/src/events/ingest/watcher.rs` keys on these literal
@@ -312,11 +312,11 @@ log "  CoreDNS           PID=${COREDNS_PID}       (DNS :53, health :8180)"
 # Wait for any child to exit. If any managed process dies, log and
 # exit so Docker's restart policy can handle recovery.
 #
-# The two nft-loggers are independent failure domains (M12-S2
-# Decision 4): we deliberately do NOT keep one alive while the other
-# dies. If either exits, the container goes unhealthy and Docker
-# restarts the whole thing — this is the simplest correct shape and
-# matches the existing Envoy / mitmproxy / CoreDNS contract.
+# The two nft-loggers are independent failure domains: we deliberately
+# do NOT keep one alive while the other dies. If either exits, the
+# container goes unhealthy and Docker restarts the whole thing — this
+# is the simplest correct shape and matches the existing Envoy /
+# mitmproxy / CoreDNS contract.
 
 while true; do
     for pid_var in MITM_PID ENVOY_PID DENY_LOGGER_PID ALLOW_LOGGER_PID COREDNS_PID; do

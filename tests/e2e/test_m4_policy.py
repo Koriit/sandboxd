@@ -41,7 +41,7 @@ from conftest import (
 )
 
 # ---------------------------------------------------------------------------
-# Gateway introspection helpers (M9-S20)
+# Gateway introspection helpers
 # ---------------------------------------------------------------------------
 
 
@@ -153,7 +153,7 @@ def _read_envoy_access_log(session_id: str) -> tuple[str, list[dict]]:
     retry would resolve, not a production bug.
 
     The events path (``/var/log/gateway/events/``) is a per-session
-    bind mount established by ``spawn_gateway`` (M10-S2 Phase 3) so
+    bind mount established by ``spawn_gateway`` so
     the host-side ingest pipeline can tail the file via inotify. The
     previous text-format log at ``/var/log/gateway/envoy_access.log``
     lived on the container's tmpfs and is no longer emitted.
@@ -330,7 +330,7 @@ def test_level1_transport_udp(sandbox_cli, backend):
     session_id = None
     policy_path = None
     try:
-        # M10-S1 v2: DNS uses UDP/53. example.com needs its own rule so
+        # DNS uses UDP/53. example.com needs its own rule so
         # CoreDNS resolves it (DNS allow-list is keyed on rule.host).
         # All :53 traffic is DNAT'd to CoreDNS regardless of target IP,
         # but the policy must still carry an (ip, 53, udp) allow for
@@ -395,10 +395,10 @@ def test_level1_transport_udp(sandbox_cli, backend):
 
 
 # ---------------------------------------------------------------------------
-# UDP allow-path / deny-path event-bus helpers (M12-S2)
+# UDP allow-path / deny-path event-bus helpers
 # ---------------------------------------------------------------------------
 #
-# The four ``test_udp_*`` cases below exercise the post-M12-S2 datapath:
+# The four ``test_udp_*`` cases below exercise the UDP datapath:
 #
 #   * Allowed UDP -> ``policy_allow_udp accept`` -> direct upstream
 #     (no Envoy hop). The ``sandbox-nft-allow-logger`` subscribes to
@@ -435,7 +435,7 @@ def _read_session_events(
     Returns the parsed JSONL entries; blank or unparseable lines are
     skipped so a truncated tail does not invalidate the assertion.
     Mirrors the helper at ``test_m10_s5_presets._read_events`` — kept
-    inline rather than promoted to ``conftest.py`` so the M12-S2 test
+    inline rather than promoted to ``conftest.py`` so the UDP test
     block stays self-contained for future readers.
     """
     args = ["events", session_name]
@@ -565,13 +565,13 @@ def test_udp_allow_ntp(sandbox_cli, backend):
     """Allow UDP/123 to an NTP host; from the VM, send an NTP packet and
     assert an allow event lands on the bus with the correct 5-tuple.
 
-    M12-S2 Decision 1 + 3: allowed UDP exits direct to upstream (no
+    Allowed UDP exits direct to upstream (no
     Envoy / mitmproxy hop), and the ``sandbox-nft-allow-logger``
     emits one JSONL allow event per new conntrack flow. The daemon
     ingest republishes it on the bus with ``layer="deny-logger"`` and
     ``event="allow"`` per ``event_mapper.rs``.
 
-    NTP is the spec-suggested non-DNS UDP example (audit § 3.c1) —
+    NTP is the canonical non-DNS UDP example —
     it exercises the ``policy_allow_udp`` path proper rather than the
     DNS DNAT hairpin that ``test_level1_transport_udp`` covers.
     """
@@ -718,7 +718,7 @@ def test_udp_bidirectional_echo(sandbox_cli, backend):
     and assert exactly one allow event fires for the *outbound* (NEW)
     flow — no allow event for the return packet.
 
-    M12-S2 Decision 3 / Resolution 7: the allow logger subscribes to
+    The allow logger subscribes to
     ``NFNLGRP_CONNTRACK_NEW`` only — not ``DESTROY`` or any other
     conntrack lifecycle event. A single UDP request/reply is one
     flow, one NFCT_T_NEW event, one allow event on the bus.
@@ -728,7 +728,7 @@ def test_udp_bidirectional_echo(sandbox_cli, backend):
     response carrying the timestamps. We don't validate the NTP
     timestamps here — the round trip itself is sufficient evidence
     that the allow datapath delivered the packet end-to-end (no
-    Envoy hop, direct upstream per Decision 1).
+    Envoy hop, direct upstream).
     """
     session_id = None
     policy_path = None
@@ -891,7 +891,7 @@ def test_udp_bidirectional_echo(sandbox_cli, backend):
         assert not return_flow_hits, (
             f"Found an allow event whose src side is the upstream NTP "
             f"server — the allow logger should subscribe to "
-            f"NFCT_T_NEW only (M12-S2 Resolution 7) and emit one event "
+            f"NFCT_T_NEW only and emit one event "
             f"per *outbound* flow. Offending events:\n"
             + "\n".join(json.dumps(ev) for ev in return_flow_hits[:5])
         )
@@ -913,7 +913,7 @@ def test_udp_multi_port_same_host(sandbox_cli, backend):
     silently and emits a deny event. Both events carry the correct
     5-tuple discriminated only by ``event="allow"`` vs ``"deny"``.
 
-    Spec: M12-S2 § Test plan, multi-port-same-host case. Exercises
+    Multi-port-same-host case. Exercises
     the per-port granularity of ``policy_allow_udp`` (which is keyed
     on ``(ip, port)`` concat-set entries — see
     ``policy.rs::generate_policy_allow_table``) and the deny-NFLOG
@@ -1072,9 +1072,9 @@ def test_udp_allowed_ip_cidr_edge(sandbox_cli, backend):
     DNS), and assert an allow event lands with the full 5-tuple
     including the resolved destination IP.
 
-    M12-S2 § Test plan: "the allowed-IP edge case (direct-IP
-    destination skipping DNS, exercising the CIDR side of
-    ``policy_allow_udp``)". Pairs with the M11 dual-anchor model
+    Allowed-IP edge case: direct-IP destination skipping DNS,
+    exercising the CIDR side of
+    ``policy_allow_udp``. Pairs with the dual-anchor model
     on the TCP side: CIDR-anchored allows skip the DNS propagation
     loop entirely and land in nftables at policy-apply time. This
     test proves the same shape works for UDP.
@@ -1207,14 +1207,14 @@ def test_udp_allowed_ip_cidr_edge(sandbox_cli, backend):
 
 
 # ---------------------------------------------------------------------------
-# `ubuntu:` preset smoke (M12-S4)
+# `ubuntu:` preset smoke
 # ---------------------------------------------------------------------------
 #
 # The `ubuntu:` preset adds the default-allow rules an Ubuntu sandbox
 # needs to function: NTP (UDP/123 to ntp.ubuntu.com / time.ubuntu.com)
 # and apt mirrors (HTTPS/443 to archive.ubuntu.com /
-# security.ubuntu.com). The preset was added in M12-S4 as the first
-# distro-level preset on top of the M10-S5 ten-preset baseline. See
+# security.ubuntu.com). It is the first distro-level preset on top
+# of the ten-preset baseline. See
 # `sandboxd/sandbox-cli/src/presets/builtin.rs::expand_ubuntu` for the
 # authoritative rule set and `docs/guides/network-policies.md` for
 # the user-facing description.
@@ -1225,8 +1225,7 @@ def test_udp_allowed_ip_cidr_edge(sandbox_cli, backend):
 #      leg of the preset).
 #   2. A UDP/123 packet to one of the preset-allowed NTP hosts
 #      surfaces an allow event on the per-session bus (UDP allow-path
-#      leg of the preset, depends on M12-S2's nft-allow-logger
-#      landing).
+#      leg of the preset, depends on the nft-allow-logger landing).
 #
 # Backend coverage: Lima only — the apt-update half needs a real
 # Ubuntu base image, which the lite container backend does not boot
@@ -1242,12 +1241,12 @@ def test_ubuntu_preset_smoke(sandbox_cli, backend):
     the canonical Ubuntu mirrors and surfaces an allow event for a
     UDP/123 packet to ``time.ubuntu.com``.
 
-    M12-S4 § "ubuntu policy preset" exit criteria: a sandboxed Ubuntu
+    A sandboxed Ubuntu
     VM with ``--preset 'ubuntu:'`` runs ``sudo apt update`` and an
     NTP sync check, and both succeed. We assert the apt half via
     ``apt-get update`` exit code (apt's HTTPS fetches the indexes
     from the preset-allowed mirrors) and the NTP half via the
-    per-session event bus (the M12-S2 nft-allow-logger emits an
+    per-session event bus (the nft-allow-logger emits an
     allow event for new conntrack flows; same shape
     ``test_udp_allow_ntp`` pins).
     """
@@ -1280,7 +1279,7 @@ def test_ubuntu_preset_smoke(sandbox_cli, backend):
         # Envoy chains for the TLS-level apt rules. Without this
         # warmup the first request can race the propagation poll.
         # Mirrors the warmup pattern already used by
-        # ``test_udp_allow_ntp`` and the M10-S5 preset tests.
+        # ``test_udp_allow_ntp`` and the preset tests.
         for host in (
             "ntp.ubuntu.com",
             "time.ubuntu.com",
@@ -1521,7 +1520,7 @@ def test_level3_http_inspected(sandbox_cli, backend):
         session_id = parse_session_id(result.stdout)
         wait_for_state(sandbox_cli, "pol-l3-inspect", "Running", timeout=10)
 
-        # M9-S20 gap 1: mitmproxy must be bound to 127.0.0.1:18080 only.
+        # mitmproxy must be bound to 127.0.0.1:18080 only.
         # A regression rebinding to 0.0.0.0:18080 would expose the forward
         # proxy to the VM and bypass Envoy's filter chains.
         _assert_mitmproxy_loopback_only(session_id)
@@ -1559,7 +1558,7 @@ def test_level3_http_inspected(sandbox_cli, backend):
         # LDS watcher observes the MovedTo inotify event and reconfigures.
         time.sleep(5)
 
-        # M9-S20 gap 5: post-M9-S19 the gateway nftables steady state
+        # The gateway nftables steady state
         # after the DNS propagation loop has injected the resolved-IP
         # allow rules is exactly three tables: `sandbox` (deny-all
         # baseline), `sandbox_dnat` (DNS + catch-all → Envoy), and
@@ -1612,7 +1611,7 @@ def test_level3_http_inspected(sandbox_cli, backend):
         time.sleep(2)
         mitm_log = _read_gateway_log(session_id, "mitmproxy.log")
 
-        # M9-S20 gap 2: observe the CONNECT tunnel in mitmproxy's log.
+        # Observe the CONNECT tunnel in mitmproxy's log.
         # Envoy emits HTTP/1.1 CONNECT requests to mitmproxy's forward-
         # proxy listener. mitmproxy's default flow log in regular mode
         # records each tunneled flow as `client connect` (downstream side)
@@ -1640,7 +1639,7 @@ def test_level3_http_inspected(sandbox_cli, backend):
             f"mitmproxy.log tail:\n{mitm_log[-4000:]}"
         )
 
-        # M9-S20 gap 3: authority preservation. Envoy's L3 tcp_proxy
+        # Authority preservation. Envoy's L3 tcp_proxy
         # emits CONNECT with hostname=%DOWNSTREAM_LOCAL_ADDRESS%, i.e.
         # the original destination IP:port the VM tried to reach. If
         # interpolation fell back (e.g. to mitmproxy's own loopback),
@@ -1668,7 +1667,7 @@ def test_level3_http_inspected(sandbox_cli, backend):
             f"mitmproxy.log tail:\n{mitm_log[-4000:]}"
         )
 
-        # M9-S20 gap 4 + M10-S2 Phase 4: observe the CONNECT-tunnel
+        # Observe the CONNECT-tunnel
         # invariant from **Envoy's own access log**, independent of
         # mitmproxy's flow log. The L3 `tcp_proxy` filter writes one
         # JSON object per tunneled connection to
@@ -2588,7 +2587,7 @@ def test_policy_clear_reverts_to_deny_all(sandbox_cli, backend):
     policy_path = None
     try:
         # Start with an HTTP-level policy allowing example.com:80 GET /*.
-        # M10-S1 v2: port and L4 protocol are mandatory per rule.
+        # Port and L4 protocol are mandatory per rule.
         policy = {
             "version": "2.0.0",
             "rules": [

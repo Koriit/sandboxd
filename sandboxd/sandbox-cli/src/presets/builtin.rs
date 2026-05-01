@@ -17,8 +17,7 @@
 //! the spec's table (interactive hosts + asset CDN) under a single
 //! preset name; operators who need narrower scope than `github:`
 //! use `github-repo` / `github-pr` instead. The 11th entry, `ubuntu`,
-//! was added in M12-S4 (`docs/internal/milestones/M12.md` § M12-S4)
-//! as the first distro-level default-allow preset.
+//! is the first distro-level default-allow preset.
 //!
 //! # Determinism
 //!
@@ -119,7 +118,7 @@ pub const BUILTINS: &[BuiltinPreset] = &[
         description: "Allow GitHub access scoped to specific pull requests (params: repo=owner/name, pr=N).",
         expand: expand_github_pr,
     },
-    // ----- OS / distro presets (M12-S4) ------------------------------
+    // ----- OS / distro presets ----------------------------------------
     BuiltinPreset {
         name: "ubuntu",
         description: "Allow default-allow rules an Ubuntu sandbox needs to function (NTP + apt mirrors).",
@@ -638,18 +637,17 @@ fn is_positive_integer(s: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// ubuntu (unparameterized; M12-S4)
+// ubuntu (unparameterized)
 // ---------------------------------------------------------------------------
 //
 // Default-allow rules an Ubuntu sandbox needs to function. Two
 // concerns are covered:
 //
 //   * NTP — UDP/123 to the canonical Ubuntu pool / vendor hosts.
-//     Sequencing note: the UDP allow-path datapath shipped in M12-S2
-//     (allowed UDP exits direct to upstream via `policy_allow_udp`,
-//     no Envoy hop). Without S2's datapath this rule would fail
-//     closed at the gateway; with it, the rule allows actual NTP
-//     traffic.
+//     Sequencing note: the UDP allow-path datapath routes allowed
+//     UDP direct to upstream via `policy_allow_udp`, with no Envoy
+//     hop. Without that datapath this rule would fail closed at the
+//     gateway; with it, the rule allows actual NTP traffic.
 //
 //   * apt — HTTPS/443 to the canonical Ubuntu mirrors used by stock
 //     `/etc/apt/sources.list` on Ubuntu 22.04+. `tls`-level (not
@@ -658,7 +656,7 @@ fn is_positive_integer(s: &str) -> bool {
 //     method/path-level inspection, and apt's transport already
 //     verifies repo signatures end-to-end.
 //
-// Implementation-phase decisions (M12-S4 plan lines 132-133):
+// Implementation-phase decisions:
 //
 //   * **HTTP/80 for first-boot apt: omitted.** Modern Ubuntu's stock
 //     sources.list uses `https://` mirrors on 22.04+ (the test base
@@ -786,7 +784,7 @@ mod tests {
 
     #[test]
     fn builtins_has_eleven_entries() {
-        // 10 from the M10-S5 baseline + 1 for the M12-S4 `ubuntu` preset.
+        // 10 ecosystem presets + 1 `ubuntu` distro preset.
         assert_eq!(BUILTINS.len(), 11);
     }
 
@@ -1034,7 +1032,7 @@ mod tests {
         assert_rules_round_trip(rules);
     }
 
-    // ----- ubuntu (unparameterized; M12-S4) ---------------------------
+    // ----- ubuntu (unparameterized) -----------------------------------
 
     /// The `ubuntu` preset is structurally distinct from every other
     /// unparameterized built-in: it mixes UDP/transport rules (NTP) with

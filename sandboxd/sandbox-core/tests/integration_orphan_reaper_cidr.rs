@@ -1,4 +1,4 @@
-//! M11-S10 dual-anchor (CIDR-pool) orphan-reaper integration tests.
+//! Dual-anchor (CIDR-pool) orphan-reaper integration tests.
 //!
 //! These tests stand up real Docker fixtures and exercise the
 //! second of the two ownership anchors documented at
@@ -298,7 +298,7 @@ async fn integration_reaper_reaps_in_pool_network() {
 
 /// Create an IPv6-only Docker bridge network. The IPv4 IPAM `Config`
 /// array is empty; the IPAM probe in the reaper drops IPv6 entries
-/// (the M11-S10 gate is IPv4-only), so [`crate::ipam_subnets_in_pool`]
+/// (the dual-anchor gate is IPv4-only), so [`crate::ipam_subnets_in_pool`]
 /// receives an empty slice and returns `false` per the fail-closed
 /// contract. Docker requires `--ipv4=false` when an IPv6 subnet is
 /// the only one configured; without it Docker auto-attaches a

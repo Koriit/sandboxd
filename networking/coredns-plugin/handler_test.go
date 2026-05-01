@@ -206,9 +206,8 @@ func TestHandler_AAAAQuery_Blocked(t *testing.T) {
 
 // TestHandler_SVCBQuery_StripsECHParam asserts that an SVCB query for
 // an allowed domain is forwarded upstream and the response keeps the
-// SVCB record while only the ECH SvcParam is stripped. Reverts the
-// M10-S10-era blanket-deny posture (`TestHandler_SVCBQuery_Blocked`)
-// per M12-S3.
+// SVCB record while only the ECH SvcParam is stripped. Replaces the
+// legacy blanket-deny posture (`TestHandler_SVCBQuery_Blocked`).
 func TestHandler_SVCBQuery_StripsECHParam(t *testing.T) {
 	sp := &SandboxPolicy{
 		Next: &mockSVCBHTTPSNextHandler{

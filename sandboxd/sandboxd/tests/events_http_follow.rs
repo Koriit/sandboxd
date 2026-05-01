@@ -1,5 +1,5 @@
 //! Integration tests for `GET /sessions/{id}/events` — follow
-//! (`follow=true`) streaming path, landed in M10-S4 Phase 3.
+//! (`follow=true`) streaming path.
 //!
 //! # Architecture
 //!

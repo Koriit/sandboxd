@@ -1,5 +1,4 @@
-//! Milestone-exit integration tests for M10-S4 Phase 5 (persistent
-//! event sink).
+//! Integration tests for the persistent event sink.
 //!
 //! Two contracts, both named `integration_*` so the `integration`
 //! nextest profile picks them up and the default profile filters

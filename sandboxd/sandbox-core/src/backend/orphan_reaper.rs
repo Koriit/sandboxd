@@ -198,7 +198,7 @@ pub trait DockerOps: Send + Sync {
     /// [`Self::remove_container`].
     async fn remove_network(&self, name: &str) -> Result<(), SandboxError>;
 
-    /// IPAM probe for the dual-anchor CIDR gate (M11-S10). Returns
+    /// IPAM probe for the dual-anchor CIDR gate. Returns
     /// every IPv4 subnet (`a.b.c.d/n`) Docker reports for the named
     /// network's IPAM configuration. Implementations shell out to
     /// `docker network inspect <name> --format '{{json .IPAM}}'` and
@@ -330,8 +330,8 @@ impl DockerOps for CliDockerOps {
         // (the IPAM block) per network, e.g.
         //   {"Driver":"default","Options":{},"Config":[{"Subnet":"10.209.0.16/28"}]}
         // We extract every IPv4 `Subnet` from `Config[]` and skip
-        // entries whose subnet is IPv6 (`fd00::/64` etc.) — the M11-S10
-        // gate is IPv4-only by design (see module docs).
+        // entries whose subnet is IPv6 (`fd00::/64` etc.) — the
+        // dual-anchor gate is IPv4-only by design (see module docs).
         let stdout = run_docker_raw(
             &["network", "inspect", name, "--format", "{{json .IPAM}}"],
             "docker network inspect (orphan reaper IPAM probe)",
@@ -530,7 +530,7 @@ pub async fn reap_orphans<D: DockerOps + ?Sized>(
             }
             let (_keep, reap) = partition_orphans(classified, live);
             for (name, sid) in reap {
-                // Dual-anchor (M11-S10): the name says sandboxd's;
+                // Dual-anchor: the name says sandboxd's;
                 // before reaping, confirm the IPAM-reported subnets
                 // also say *this* sandboxd's (i.e. fully inside the
                 // allocator pool). Anything else — out-of-pool, no
@@ -719,9 +719,9 @@ mod tests {
         SessionId::parse(hex).expect("valid 12-hex session id")
     }
 
-    /// Permissive pool used by tests that pre-date the M11-S10
-    /// dual-anchor gate. `0.0.0.0/0` matches every IPv4 subnet, so the
-    /// pre-S10 reaper-end-to-end tests below see the same behavior they
+    /// Permissive pool used by tests that pre-date the dual-anchor
+    /// gate. `0.0.0.0/0` matches every IPv4 subnet, so the older
+    /// reaper-end-to-end tests below see the same behavior they
     /// did before the second anchor landed.
     fn permissive_pool() -> Cidr4 {
         Cidr4::parse("0.0.0.0/0").expect("0.0.0.0/0 parses")
@@ -729,7 +729,7 @@ mod tests {
 
     /// Default in-pool subnet for `FakeDocker` networks: a /28 inside
     /// the permissive pool. Tests that care about CIDR specifics (the
-    /// new M11-S10 unit tests below) override per network via
+    /// dual-anchor unit tests below) override per network via
     /// `FakeDocker::network_ipam`.
     fn default_in_pool_subnet() -> Cidr4 {
         Cidr4::parse("10.209.0.0/28").expect("10.209.0.0/28 parses")
@@ -882,9 +882,9 @@ mod tests {
         // exercise the best-effort path.
         fail_remove_container: Option<String>,
         fail_list_volumes: bool,
-        // M11-S10 dual-anchor: per-network IPAM probe outcome. Networks
-        // not in the map default to a single `default_in_pool_subnet()`
-        // /28 so pre-S10 tests keep their existing semantics under the
+        // Dual-anchor: per-network IPAM probe outcome. Networks not
+        // in the map default to a single `default_in_pool_subnet()`
+        // /28 so older tests keep their existing semantics under the
         // permissive pool.
         network_ipam: HashMap<String, FakeIpam>,
     }
@@ -1094,7 +1094,7 @@ mod tests {
         assert!(parse_one_per_line("\n\n   \n").is_empty());
     }
 
-    // -- M11-S10 dual-anchor IPAM helpers ----------------------------------
+    // -- Dual-anchor IPAM helpers ------------------------------------------
 
     #[test]
     fn parse_ipam_subnets_extracts_ipv4_subnets() {
@@ -1195,7 +1195,7 @@ mod tests {
         assert!(!ipam_subnets_in_pool(&[in_pool_a, out_of_pool], &pool));
     }
 
-    // -- M11-S10 dual-anchor reaper-end-to-end ----------------------------
+    // -- Dual-anchor reaper-end-to-end -------------------------------------
 
     #[tokio::test]
     async fn reap_orphans_skips_network_with_out_of_pool_ipam() {

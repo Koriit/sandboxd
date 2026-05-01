@@ -224,7 +224,7 @@ func TestStripECH_RemovesECHParamFromHTTPSRecord(t *testing.T) {
 // an HTTPS RR whose only SvcParam was ECH: the ECH key is removed and
 // the record stays with an empty SvcParam slice. This is intentional —
 // dropping the record would be a behavior change (record-level removal,
-// the M10-S10 stance the M12-S3 fix reverted).
+// the prior stance that the strip-the-param fix reverted).
 func TestStripECH_HTTPSOnlyECHEndsWithEmptyParams(t *testing.T) {
 	msg := new(dns.Msg)
 	msg.Answer = []dns.RR{

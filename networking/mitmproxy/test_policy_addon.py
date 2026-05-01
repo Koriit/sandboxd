@@ -40,7 +40,7 @@ class _FakeRequest:
         self.host = host
         self.path = path
         # `port` mirrors mitmproxy's `request.port` — the destination
-        # L4 port.  M10-S1 rules match on `(host, port)`, so every test
+        # L4 port.  Rules match on `(host, port)`, so every test
         # flow must carry one.  443 is the default for the HTTPS path
         # we're actually MITM-ing in production.
         self.port = port
@@ -381,12 +381,12 @@ class TestLegacyPreM9S10ShapeIsRejected:
 
     Two historical hazards are pinned here:
 
-    1. **Pre-M9-S10 shape** — the addon accepted top-level ``methods``
-       / ``paths`` arrays on each rule and treated both being
-       absent/null as "allow every request on this host".  Post-M9-S10,
-       the contract is strict ``filters = [{method, path}, ...]`` pair
-       matching.  A stale addon paired with a new-shape config file
-       (exactly what happened in CI when the gateway image wasn't
+    1. **Legacy methods/paths shape** — the addon accepted top-level
+       ``methods`` / ``paths`` arrays on each rule and treated both
+       being absent/null as "allow every request on this host".  The
+       current contract is strict ``filters = [{method, path}, ...]``
+       pair matching.  A stale addon paired with a new-shape config
+       file (exactly what happened in CI when the gateway image wasn't
        rebuilt after the addon rewrite) silently allowed every request
        to a matched host, defeating all level-3 HTTP filtering.  The
        failing E2E tests (``test_level3_method_restriction``,
@@ -394,7 +394,7 @@ class TestLegacyPreM9S10ShapeIsRejected:
        observing supposedly-blocked requests reaching upstream as 404
        rather than the expected 599.
 
-    2. **Missing-port (pre-M10-S1)** — v1 rules had no ``port`` field;
+    2. **Missing-port (legacy v1)** — v1 rules had no ``port`` field;
        v2 treats the field as mandatory.  A v1-shape rule paired with
        a v2 addon must deny, not silently allow — a rule without an
        integer ``port`` is skipped by ``_check_request``.
@@ -435,7 +435,7 @@ class TestLegacyPreM9S10ShapeIsRejected:
     def test_v1_rule_without_port_denies(self) -> None:
         """v1-shape rule (no ``port`` field) must deny every request.
 
-        This is the M10-S1 analogue of the M9-S10 legacy-shape guard:
+        Analogue of the legacy methods/paths-shape guard:
         if a v2 addon is fed a v1 config file, the port check short-
         circuits the rule-walk and every request falls through to
         "host not in policy".
@@ -527,7 +527,7 @@ class TestLegacyPreM9S10ShapeIsRejected:
 class TestPortMatching:
     """Rule identity is ``(host, port)``: a port mismatch denies.
 
-    Introduced in M10-S1.  The addon reads ``flow.request.port`` and
+    The addon reads ``flow.request.port`` and
     compares against the rule's ``port`` field before walking its
     ``filters``.  A request whose destination port differs from every
     matching-host rule is denied — the deny reason distinguishes the
@@ -541,7 +541,7 @@ class TestPortMatching:
         `httpbin.org:8443`, even with a filter that permits the
         `(method, path)` pair.  The deny reason must call out the
         port mismatch rather than pretending the host is unknown —
-        this is the M10-S2 deny-event discovery signal."""
+        this is the deny-event discovery signal."""
         addon = _make_addon([
             {"host": "httpbin.org", "port": 443, "filters": [ANY_FILTER]},
         ])
@@ -597,9 +597,9 @@ class TestPortMatching:
 class TestPairMatching:
     """(method, path) pairs must match together — not cartesian product.
 
-    Under the pre-M9-S10 shape, two independent lists `methods=[GET, POST]`
+    Under the legacy shape, two independent lists `methods=[GET, POST]`
     and `paths=[/a, /b]` would permit the cartesian product {GET /a, GET /b,
-    POST /a, POST /b}.  The new shape expresses the mixed pairs directly:
+    POST /a, POST /b}.  The current shape expresses the mixed pairs directly:
     `filters=[{GET /a}, {POST /b}]` means *exactly* those two pairs.
     """
 
@@ -639,7 +639,7 @@ class TestPairMatching:
 
 
 class TestPerSegmentGlob:
-    """Filter paths use a per-segment glob (M10-S1 v2 semantics).
+    """Filter paths use a per-segment glob (v2 semantics).
 
     - ``?``  matches exactly one non-``/`` character.
     - ``*``  matches zero or more non-``/`` characters — within a
@@ -1181,7 +1181,7 @@ class TestConfigFileWatcher:
         assert flow.response is None
 
 
-# ── JSONL event emission wiring (M10-S2 Phase 6b) ──────────────────
+# ── JSONL event emission wiring ────────────────────────────────────
 #
 # The addon must call ``EventEmitter.emit_request_allowed`` /
 # ``emit_request_denied`` at every point it would emit a ``logger.info``

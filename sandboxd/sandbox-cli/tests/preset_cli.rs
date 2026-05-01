@@ -1,4 +1,4 @@
-//! CLI surface tests for the M10-S5 preset system.
+//! CLI surface tests for the preset system.
 //!
 //! These tests spawn the compiled `sandbox` binary via
 //! `CARGO_BIN_EXE_sandbox` and exercise every public preset touch-point:
@@ -78,12 +78,12 @@ async fn spawn_fake_daemon_for_create() -> (TempDir, String, CapturedBody) {
                 },
             ),
         )
-        // M11-S4 Phase 4A: the CLI hits `GET /backends` once per
-        // invocation before sending `POST /sessions` (capability-driven
-        // client-side validation). Without this route the create
-        // would fail in the preflight with HTTP 404 before our
-        // `POST /sessions` capture runs. Serve a minimal Lima-only
-        // matrix so the preflight succeeds for these preset tests.
+        // The CLI hits `GET /backends` once per invocation before
+        // sending `POST /sessions` (capability-driven client-side
+        // validation). Without this route the create would fail in
+        // the preflight with HTTP 404 before our `POST /sessions`
+        // capture runs. Serve a minimal Lima-only matrix so the
+        // preflight succeeds for these preset tests.
         .route("/backends", get(fake_backends_lima_only))
         .with_state(captured_clone);
 
@@ -231,8 +231,7 @@ async fn policy_preset_list_emits_every_builtin() {
     let (status, stdout, stderr) = run_sandbox(&["policy", "preset", "list"], None).await;
     assert!(status.success(), "exit: {status:?}\nstderr: {stderr}");
 
-    // The 10 built-ins shipped in M10-S5 Phase 3, plus the `ubuntu`
-    // distro preset added in M12-S4.
+    // The 10 ecosystem built-ins, plus the `ubuntu` distro preset.
     let builtins = [
         "npm",
         "pypi",
@@ -531,8 +530,8 @@ async fn policy_update_with_no_flags_errors_with_three_option_guidance() {
 /// body that carries `source_presets: ["npm:"]` AND a policy whose
 /// rules include the npm registry host.
 ///
-/// This is the "daemon sees the wire shape M10-S5 specifies" test. It
-/// complements the unit tests that verify CLI-internal types.
+/// This is the "daemon sees the wire shape the spec specifies" test.
+/// It complements the unit tests that verify CLI-internal types.
 #[tokio::test]
 async fn create_with_npm_preset_ships_source_presets() {
     let (_dtmp, sock, captured) = spawn_fake_daemon_for_create().await;

@@ -321,7 +321,7 @@ fn install_default_route(gateway_ip: Ipv4Addr) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    //! M11-S9 — the route helper's `test-env-override` Cargo feature
+    //! The route helper's `test-env-override` Cargo feature
     //! gates whether the helper-side `users.conf` path resolver
     //! consults `SANDBOX_USERS_CONF`. The feature lives on this crate
     //! and forwards to the same-named feature on `sandbox-core`; the

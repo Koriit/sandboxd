@@ -1,12 +1,12 @@
-"""E2E test for M9-S12 policy persistence — restart-survival regression.
+"""E2E test for policy persistence — restart-survival regression.
 
-Before M9-S12, applied policies lived only in the daemon's in-memory
+Previously, applied policies lived only in the daemon's in-memory
 ``HashMap``. When the daemon restarted, the map was empty, so
 ``reconcile_networking`` rebuilt the gateway with the default allow-all
-DNS policy — a silent security regression. M9-S12 added normalized SQL
-persistence with ``SessionStore::{set_policy,get_policy,load_all_policies}``
+DNS policy — a silent security regression. Normalized SQL
+persistence via ``SessionStore::{set_policy,get_policy,load_all_policies}``
 plus startup hydration in ``sandboxd::main`` before
-``reconcile_networking`` runs.
+``reconcile_networking`` runs closes this gap.
 
 This test covers spec § 6 "E2E test" end-to-end:
 
@@ -147,7 +147,7 @@ def test_policy_survives_daemon_restart(
         # 1. Build a restrictive policy: allow example.com only.
         #    Everything else is denied by the implicit default-deny that
         #    CoreDNS enforces (NXDOMAIN for any domain not in the policy).
-        #    M10-S1 v2 schema: (host, port) identity with explicit L4
+        #    Policy v2 schema: (host, port) identity with explicit L4
         #    protocol. The restart-recovery assertions curl
         #    `http://example.com` (port 80), so the rule pins :80/tcp.
         policy = {
@@ -293,7 +293,7 @@ def test_policy_survives_daemon_restart(
         # 8. THE INVARIANT: re-run both curls WITHOUT re-posting the
         #    policy. If hydration is broken, the gateway falls back to
         #    allow-all DNS and the denied destination would start to
-        #    resolve — that is exactly the silent regression M9-S12 closes.
+        #    resolve — that is exactly the silent regression policy persistence closes.
         _assert_allowed_succeeds(
             _curl_allowed(sandbox_cli, session_name),
             context="post-restart allowed",

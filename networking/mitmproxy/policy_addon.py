@@ -8,7 +8,7 @@ reason for denial.
 When no config file is present, operates in pass-through mode (allow all)
 for backwards compatibility.
 
-Config format (from sandboxd MitmproxyConfig, M10-S1 v2 schema):
+Config format (from sandboxd MitmproxyConfig, v2 schema):
 
     {
       "rules": [
@@ -39,14 +39,13 @@ Config format (from sandboxd MitmproxyConfig, M10-S1 v2 schema):
   when no rule matched the host at all.  This lets policies express
   "HTTP to api.example.com:443 only, nothing on :8443" without a
   separate deny rule, and lets operators reading deny events tell a
-  missing-port entry apart from a missing-host entry.  Added in M10-S1
-  — prior versions omitted the field.
+  missing-port entry apart from a missing-host entry.
 - Each `filters[i]` is a `(method, path)` pair — both must match
-  together.  This differs from the pre-M9-S10 shape (independent
+  together.  This differs from the legacy shape (independent
   `methods` / `paths` lists with cartesian-product semantics).
 - `method` is an uppercase HTTP method name (`GET`, `POST`, ...) or the
   special marker `ANY` meaning "match any method".
-- `path` is a per-segment glob (M10-S1):
+- `path` is a per-segment glob:
     * `?` matches exactly one non-`/` character.
     * `*` matches zero or more non-`/` characters — within a single
       path segment, never crossing `/`.
@@ -62,7 +61,7 @@ Config format (from sandboxd MitmproxyConfig, M10-S1 v2 schema):
   never receives them in practice.  If it does (hand-edited config),
   all requests to that host are denied with `"no filter matched"`.
 
-M10-S2 Phase 6b: in addition to the human-readable ``logger.info`` /
+In addition to the human-readable ``logger.info`` /
 ``logger.warning`` lines, each decision is also emitted as a
 structured JSONL event via :class:`events.EventEmitter` when
 ``SANDBOX_MITMPROXY_EVENTS`` is set in the environment.  The JSONL
@@ -247,8 +246,8 @@ class PolicyAddon:
         # logging and structured events so operators see exactly what
         # the client requested.
         match_path = path.split("?", 1)[0]
-        # `flow.request.port` is the destination L4 port.  In M10-S1 the
-        # addon matches on `(host, port)`, so a missing attribute on a
+        # `flow.request.port` is the destination L4 port. The addon
+        # matches on `(host, port)`, so a missing attribute on a
         # fake/test request defaults to 0 — which will never match a
         # real rule (rule ports are `1..=65535`).
         port = int(getattr(flow.request, "port", 0) or 0)
@@ -364,7 +363,7 @@ class PolicyAddon:
         Returns (allowed, reason).  *reason* is meaningful only when
         *allowed* is False.
 
-        Semantics (M10-S1 v2): rule identity is `(host, port)`.  A rule
+        Semantics (v2): rule identity is `(host, port)`.  A rule
         only matches when its host pattern matches the request host
         **and** its `port` field equals the request's destination port.
         Rules with a host match but port mismatch are skipped — if no
@@ -378,7 +377,7 @@ class PolicyAddon:
           port.  This is the discovery signal operators need to tell a
           missing-port entry apart from a missing-host entry; the
           string is part of the deny-event schema consumed by
-          `sandbox events --decision=deny` (M10-S2+).
+          `sandbox events --decision=deny`.
 
         When at least one rule matches on both host and port, their
         `filters` lists contribute as a union: the request is permitted

@@ -77,6 +77,7 @@ Test runner: cargo-nextest (config at `sandboxd/.config/nextest.toml`).
 - Socket path default: `$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock` (falls back to `~/.local/share/sandboxd/sandboxd.sock`). Both the daemon and CLI honor the `SANDBOX_SOCKET` env var as an override; an explicit `--socket` flag takes precedence over the env var.
 - Git remote helper: `git-remote-sandbox` symlink to `sandbox` binary, uses `sandbox::session/repo-path` URLs
 - Config files: all config files (daemon, CLI, per-session metadata) use JSON — not TOML, not YAML
+- **No milestone tags in code or tests.** Comments like `// M11-S10 added X` or `// M12-S2 Decision N` belong in git log + planning docs, not in source. The plan (`docs/internal/session-plan.md`), git history, and PR descriptions are the right home for "when/why this changed". Code should explain itself in its own terms. Test FILE names (`test_m4_policy.py`, `m10_s3_end_to_end.rs`) and symbol names that have already become external references are exempt — keep them.
 
 ## On-disk compatibility
 
