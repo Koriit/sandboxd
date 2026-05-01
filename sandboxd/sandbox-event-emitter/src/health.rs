@@ -30,14 +30,18 @@
 //!
 //! `sandbox-nft-allow-logger` is a sibling binary; it shares this lib
 //! but exposes a different `/health` payload
-//! (`allow_events_emitted_60s`, `rate_limited_count`,
-//! `nfct_socket: "ok"` in place of the deny-logger's `tcp_listener` /
-//! `nflog_socket` / `events_emitted_60s`). Rather than fork the
-//! handler, we let the calling binary pass a [`HealthShape`] closure
-//! that takes the current emitter gauge value and returns the JSON
-//! body to send. The lib stays the single source of truth for the
-//! HTTP framing, the rolling-gauge reset cadence, the request parser,
-//! and the strict path-match — only the body bytes are caller-shaped.
+//! (`allow_events_emitted_60s`, `nfct_socket: "ok"` in place of the
+//! deny-logger's `tcp_listener` / `nflog_socket` /
+//! `events_emitted_60s`, plus per-binary parser counters — see
+//! "Parser audit counters" below). Rather than fork the handler, we
+//! let the calling binary pass a [`HealthShape`] closure that takes
+//! the [`EventEmitter`] reference and returns the JSON body to send.
+//! Receiving the emitter (rather than just the gauge integer) lets
+//! the binary-local body builders read the rolling gauge *and* close
+//! over their crate-local parser counters in one place; the lib stays
+//! the single source of truth for the HTTP framing, the
+//! rolling-gauge reset cadence, the request parser, and the strict
+//! path-match — only the body bytes are caller-shaped.
 //!
 //! The `events_emitted_60s` (deny-logger) and
 //! `allow_events_emitted_60s` (allow-logger) values are pulled from a
@@ -45,6 +49,36 @@
 //! background ticker resets it every 60 seconds so the value
 //! approximates "events in the last minute" without the cost of a
 //! sliding-window histogram.
+//!
+//! ## Parser audit counters
+//!
+//! The two stock body builders ([`deny_logger_body`] /
+//! [`allow_logger_body`]) accept per-binary parser-level counters as
+//! arguments so operators get a numeric audit signal without scraping
+//! logs. These cover the "is the kernel→userspace pipeline dropping
+//! work?" question that `/health`'s liveness check alone cannot
+//! answer:
+//!
+//! - `nflog_emitted` / `nflog_parse_errors` (deny-logger): NFLOG
+//!   messages successfully parsed and emitted as `deny` events vs
+//!   messages rejected by the parser (truncated, non-IPv4, non-UDP,
+//!   missing payload). A rising `nflog_parse_errors` with stable
+//!   `nflog_emitted` indicates a kernel-side configuration drift.
+//! - `nfct_emitted` / `nfct_skipped` / `nfct_parse_errors`
+//!   (allow-logger): NFCT messages parsed and emitted vs silently
+//!   skipped (non-UDP flow, unknown CT message kind) vs rejected as
+//!   wire-shape violations. `nfct_skipped` is a normal high-volume
+//!   counter — TCP CT-NEW arrives on the same multicast socket and is
+//!   filtered out at parse time — so a non-zero `nfct_parse_errors`
+//!   is the operator-actionable signal, not the skip count itself.
+//!
+//! These counters are process-cumulative and *not* reset by the
+//! rolling-gauge ticker — they are intended for "is anything dropping
+//! work?" delta monitoring across health probes, not minute-by-minute
+//! observability. Operator tooling diffing two snapshots is the
+//! intended consumer; the binaries' static `AtomicU64` counters back
+//! them up so the values survive even if the rate-cap ticker is
+//! delayed.
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -61,16 +95,18 @@ const GAUGE_WINDOW: Duration = Duration::from_secs(60);
 
 /// Caller-supplied response-body builder.
 ///
-/// Receives the current `events_emitted_60s` counter snapshot and must
-/// return the bytes of the JSON object to ship as the `/health`
-/// response body (no surrounding HTTP framing — the lib adds that).
+/// Receives the [`EventEmitter`] reference (so the closure can call
+/// `events_emitted_60s` and close over any other crate-local counters
+/// — see the "Parser audit counters" module-doc section) and returns
+/// the bytes of the JSON object to ship as the `/health` response
+/// body (no surrounding HTTP framing — the lib adds that).
 ///
-/// Trait alias around `Fn(u64) -> String + Send + Sync + 'static` so
-/// closures, function pointers, and explicit struct impls all
-/// compose; bound at construction (`run`) so the spawned per-request
+/// Trait alias around `Fn(&EventEmitter) -> String + Send + Sync + 'static`
+/// so closures, function pointers, and explicit struct impls all
+/// compose; bound at construction ([`run`]) so the spawned per-request
 /// tasks can clone an `Arc<HealthShape>` without further bound noise.
-pub trait HealthShape: Fn(u64) -> String + Send + Sync + 'static {}
-impl<F> HealthShape for F where F: Fn(u64) -> String + Send + Sync + 'static {}
+pub trait HealthShape: Fn(&EventEmitter) -> String + Send + Sync + 'static {}
+impl<F> HealthShape for F where F: Fn(&EventEmitter) -> String + Send + Sync + 'static {}
 
 /// Bind the HTTP health listener on `(bind_ip, port)`.
 pub async fn bind(bind_ip: Ipv4Addr, port: u16) -> io::Result<TcpListener> {
@@ -168,15 +204,15 @@ where
         return write_status(&mut socket, 404, b"").await;
     }
 
-    let body = body_builder(emitter.events_emitted_60s());
+    let body = body_builder(emitter);
     write_response(&mut socket, 200, "OK", body.as_bytes()).await
 }
 
 /// Stock body builder for `sandbox-nft-deny-logger`'s `/health`.
 ///
-/// Exposes the deny-logger's three legacy field names (preserved
-/// across the binary rename per
-/// `2026-05-01-udp-nft-loggers-design.md` Resolution 5):
+/// Exposes the deny-logger's legacy field names (preserved across the
+/// binary rename per `2026-05-01-udp-nft-loggers-design.md`
+/// Resolution 5) plus the parser audit counters (see module docs).
 ///
 /// - `tcp_listener: "ok"` — the listener on `:10001` is up.
 /// - `nflog_socket: "ok"` — the NFLOG receive task is bound (replaces
@@ -185,9 +221,24 @@ where
 ///   userland UDP listener).
 /// - `events_emitted_60s: <gauge>` — rolling deny-event count over
 ///   the last 60 seconds.
-pub fn deny_logger_body(events_emitted_60s: u64) -> String {
+/// - `nflog_emitted: <u64>` — process-cumulative count of NFLOG
+///   messages successfully parsed and emitted as `deny` events.
+/// - `nflog_parse_errors: <u64>` — process-cumulative count of NFLOG
+///   messages rejected by the parser (truncated, non-IPv4, non-UDP,
+///   missing payload).
+pub fn deny_logger_body(
+    events_emitted_60s: u64,
+    nflog_emitted: u64,
+    nflog_parse_errors: u64,
+) -> String {
     format!(
-        "{{\"tcp_listener\":\"ok\",\"nflog_socket\":\"ok\",\"events_emitted_60s\":{events_emitted_60s}}}",
+        "{{\
+            \"tcp_listener\":\"ok\",\
+            \"nflog_socket\":\"ok\",\
+            \"events_emitted_60s\":{events_emitted_60s},\
+            \"nflog_emitted\":{nflog_emitted},\
+            \"nflog_parse_errors\":{nflog_parse_errors}\
+        }}",
     )
 }
 
@@ -199,6 +250,15 @@ pub fn deny_logger_body(events_emitted_60s: u64) -> String {
 /// - `nfct_socket: "ok"` — the NFCT (`nfnetlink_conntrack`)
 ///   subscription is bound and receiving multicast events.
 /// - `allow_events_emitted_60s: <gauge>` — rolling allow-event count.
+/// - `nfct_emitted: <u64>` — process-cumulative count of NFCT
+///   messages successfully parsed and emitted as `allow` events.
+/// - `nfct_skipped: <u64>` — process-cumulative count of NFCT
+///   messages silently skipped (non-UDP flow, unknown CT message
+///   kind). `nfct_skipped` is a normal high-volume counter on the
+///   multicast socket; the operator-actionable signal is
+///   `nfct_parse_errors`.
+/// - `nfct_parse_errors: <u64>` — process-cumulative count of NFCT
+///   messages rejected by the parser as wire-shape violations.
 ///
 /// `rate_limited_count` is intentionally *not* exposed at `/health`
 /// time: the per-process `RateCap` flushes a `rate_limited` summary
@@ -206,8 +266,21 @@ pub fn deny_logger_body(events_emitted_60s: u64) -> String {
 /// authoritative count. Putting a parallel counter into `/health`
 /// would create a second source of truth that operators would have to
 /// reconcile against the JSONL stream.
-pub fn allow_logger_body(allow_events_emitted_60s: u64) -> String {
-    format!("{{\"nfct_socket\":\"ok\",\"allow_events_emitted_60s\":{allow_events_emitted_60s}}}",)
+pub fn allow_logger_body(
+    allow_events_emitted_60s: u64,
+    nfct_emitted: u64,
+    nfct_skipped: u64,
+    nfct_parse_errors: u64,
+) -> String {
+    format!(
+        "{{\
+            \"nfct_socket\":\"ok\",\
+            \"allow_events_emitted_60s\":{allow_events_emitted_60s},\
+            \"nfct_emitted\":{nfct_emitted},\
+            \"nfct_skipped\":{nfct_skipped},\
+            \"nfct_parse_errors\":{nfct_parse_errors}\
+        }}",
+    )
 }
 
 async fn write_status(socket: &mut TcpStream, code: u16, body: &[u8]) -> io::Result<()> {
@@ -269,9 +342,11 @@ mod tests {
     }
 
     /// Probe `GET /health` end-to-end against the deny-logger body
-    /// builder: assert `200 OK`, JSON body, and the three spec-named
-    /// keys. Covers the happy path that Docker `HEALTHCHECK` and
-    /// sandboxd's component-health probe hit on the deny-logger.
+    /// builder: assert `200 OK`, JSON body, the three legacy
+    /// spec-named keys, and the parser audit counters
+    /// (`nflog_emitted`, `nflog_parse_errors`). Covers the happy path
+    /// that Docker `HEALTHCHECK` and sandboxd's component-health
+    /// probe hit on the deny-logger.
     #[tokio::test]
     async fn health_responds_200_ok_json_for_deny_logger() {
         let dir = tempfile::tempdir().unwrap();
@@ -282,7 +357,15 @@ mod tests {
 
         let server_emitter = Arc::clone(&emitter);
         let server = tokio::spawn(async move {
-            let _ = run(listener, server_emitter, deny_logger_body).await;
+            // Emulate the binary-side closure: the lib's stock builder
+            // takes the parser counters as parameters; the binary
+            // closes over its module-local statics. Here we hard-code
+            // the fixture values 0 / 0 so the test pins the JSON
+            // shape without standing up a fake `nflog` module.
+            let _ = run(listener, server_emitter, |emitter| {
+                deny_logger_body(emitter.events_emitted_60s(), 0, 0)
+            })
+            .await;
         });
 
         let json = read_health_body(local).await;
@@ -298,15 +381,27 @@ mod tests {
         );
         // Fresh emitter — no deny events emitted yet.
         assert_eq!(json["events_emitted_60s"], 0);
+        // Parser audit counters present and zero-initialised.
+        assert_eq!(
+            json["nflog_emitted"], 0,
+            "nflog_emitted must be exposed as a numeric field on /health"
+        );
+        assert_eq!(
+            json["nflog_parse_errors"], 0,
+            "nflog_parse_errors must be exposed as a numeric field on /health"
+        );
 
         server.abort();
     }
 
     /// `/health` for the allow-logger exposes a different field set
     /// (`2026-05-01-udp-nft-loggers-design.md` Resolution 5):
-    /// `nfct_socket: "ok"` plus `allow_events_emitted_60s`. Pin the
-    /// shape so the deny-side keys (`tcp_listener`, `nflog_socket`)
-    /// do not leak into the allow-logger response.
+    /// `nfct_socket: "ok"`, `allow_events_emitted_60s`, plus the
+    /// parser audit counters (`nfct_emitted`, `nfct_skipped`,
+    /// `nfct_parse_errors`). Pin the shape so the deny-side keys
+    /// (`tcp_listener`, `nflog_socket`, `nflog_emitted`,
+    /// `nflog_parse_errors`) do not leak into the allow-logger
+    /// response.
     #[tokio::test]
     async fn health_responds_200_ok_json_for_allow_logger() {
         let dir = tempfile::tempdir().unwrap();
@@ -317,18 +412,36 @@ mod tests {
 
         let server_emitter = Arc::clone(&emitter);
         let server = tokio::spawn(async move {
-            let _ = run(listener, server_emitter, allow_logger_body).await;
+            let _ = run(listener, server_emitter, |emitter| {
+                allow_logger_body(emitter.events_emitted_60s(), 0, 0, 0)
+            })
+            .await;
         });
 
         let json = read_health_body(local).await;
         assert_eq!(json["nfct_socket"], "ok");
         assert_eq!(json["allow_events_emitted_60s"], 0);
+        // Allow-side parser audit counters are present and zero-init.
+        assert_eq!(
+            json["nfct_emitted"], 0,
+            "nfct_emitted must be exposed as a numeric field on /health"
+        );
+        assert_eq!(
+            json["nfct_skipped"], 0,
+            "nfct_skipped must be exposed as a numeric field on /health"
+        );
+        assert_eq!(
+            json["nfct_parse_errors"], 0,
+            "nfct_parse_errors must be exposed as a numeric field on /health"
+        );
         // Deny-logger keys must not appear on the allow-logger.
         for legacy in [
             "tcp_listener",
             "nflog_socket",
             "events_emitted_60s",
             "udp_listener",
+            "nflog_emitted",
+            "nflog_parse_errors",
         ] {
             assert!(
                 json.get(legacy).is_none(),
@@ -336,5 +449,39 @@ mod tests {
             );
         }
         server.abort();
+    }
+
+    /// Pin the wire shape of the deny-logger body builder under
+    /// non-zero parser counter values. Ensures field names are
+    /// snake_case, integers are emitted as JSON numbers (not strings),
+    /// and the body remains valid JSON when counters are populated.
+    #[test]
+    fn deny_logger_body_renders_parser_counters_as_numbers() {
+        let body = deny_logger_body(7, 1234, 5);
+        let json: serde_json::Value =
+            serde_json::from_str(&body).expect("deny_logger_body must emit valid JSON");
+        assert_eq!(json["events_emitted_60s"], 7);
+        assert_eq!(json["nflog_emitted"], 1234);
+        assert_eq!(json["nflog_parse_errors"], 5);
+        // Defensive: counters are integers, not stringified.
+        assert!(json["nflog_emitted"].is_number());
+        assert!(json["nflog_parse_errors"].is_number());
+    }
+
+    /// Same wire-shape pin for the allow-logger body builder under
+    /// non-zero parser counter values. Three counters cover the
+    /// emit/skip/parse-error trichotomy.
+    #[test]
+    fn allow_logger_body_renders_parser_counters_as_numbers() {
+        let body = allow_logger_body(11, 999, 88_888, 2);
+        let json: serde_json::Value =
+            serde_json::from_str(&body).expect("allow_logger_body must emit valid JSON");
+        assert_eq!(json["allow_events_emitted_60s"], 11);
+        assert_eq!(json["nfct_emitted"], 999);
+        assert_eq!(json["nfct_skipped"], 88_888);
+        assert_eq!(json["nfct_parse_errors"], 2);
+        assert!(json["nfct_emitted"].is_number());
+        assert!(json["nfct_skipped"].is_number());
+        assert!(json["nfct_parse_errors"].is_number());
     }
 }

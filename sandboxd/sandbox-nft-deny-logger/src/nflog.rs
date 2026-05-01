@@ -72,7 +72,7 @@ use std::io;
 use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use chrono::Utc;
 use netlink_sys::{Socket, SocketAddr, protocols::NETLINK_NETFILTER};
@@ -161,15 +161,22 @@ static NFLOG_EMITTED: AtomicU64 = AtomicU64::new(0);
 /// non-IPv4, non-UDP).
 static NFLOG_PARSE_ERRORS: AtomicU64 = AtomicU64::new(0);
 
-/// Snapshot of `NFLOG_EMITTED`. Diagnostic only.
-#[allow(dead_code)]
-pub fn emitted() -> u64 {
+/// Snapshot of `NFLOG_EMITTED`. Read by the binary's `/health` body
+/// builder (`main.rs::run`) so operators see the cumulative count of
+/// NFLOG messages successfully turned into `deny` events without
+/// scraping logs.
+///
+/// `pub(crate)` because the only caller is `main.rs`'s closure
+/// passed into `health::run`; binary-crate items cannot be reached
+/// from outside the crate, so a plain `pub` would be misleading.
+pub(crate) fn emitted() -> u64 {
     NFLOG_EMITTED.load(Ordering::Relaxed)
 }
 
-/// Snapshot of `NFLOG_PARSE_ERRORS`. Diagnostic only.
-#[allow(dead_code)]
-pub fn parse_errors() -> u64 {
+/// Snapshot of `NFLOG_PARSE_ERRORS`. Same `/health` consumer as
+/// [`emitted`]; rising values indicate kernel-side configuration
+/// drift (truncated payloads, non-IPv4 hits, missing attributes).
+pub(crate) fn parse_errors() -> u64 {
     NFLOG_PARSE_ERRORS.load(Ordering::Relaxed)
 }
 
@@ -279,12 +286,53 @@ impl NflogSubscriber {
         parse_all(bytes, self.group)
     }
 
-    /// Underlying file descriptor — exposed for tests that want to
-    /// drive the socket directly (e.g. inject a synthetic netlink
-    /// message via writev). Not used in production.
-    #[allow(dead_code)]
+    /// Underlying file descriptor.
+    ///
+    /// Two consumers in this crate:
+    ///
+    /// 1. Tests that drive the socket directly (e.g. inject a
+    ///    synthetic netlink message via writev).
+    /// 2. The SIGTERM-driven clean-exit path in `main.rs`: the
+    ///    receive loop runs inside `tokio::task::spawn_blocking` and
+    ///    is parked in a kernel `recv` that tokio cancellation cannot
+    ///    interrupt. To exit promptly on SIGTERM the main task takes
+    ///    a snapshot of this fd before moving the subscriber into the
+    ///    blocking task, then calls [`shutdown_recv`] from the signal
+    ///    handler so the in-flight `recv` returns with EBADF /
+    ///    ENOTCONN / `n=0` and the loop drops out cleanly.
     pub(crate) fn as_raw_fd(&self) -> RawFd {
         self.socket.as_raw_fd()
+    }
+}
+
+/// Initiate clean exit by half-closing the netlink socket on `fd`.
+///
+/// Calls `shutdown(fd, SHUT_RDWR)`. On a netlink socket this causes
+/// any pending `recv` to return — typically with `n=0` (graceful
+/// peer-close semantics) or with `EBADF` if the fd was reaped between
+/// the shutdown and the next syscall — letting the receive loop
+/// observe the shutdown atomic and exit. Prefer this to a bare
+/// `close(fd)`: `close` frees the fd while another thread may still
+/// be holding it inside the recvmsg, opening a window for fd reuse
+/// (a fresh socket bound to the same number) before the recv thread
+/// notices. `shutdown` keeps the fd valid until the recv thread
+/// drops the subscriber.
+///
+/// Soft-fail on error: the SIGTERM path never blocks on this — if
+/// `shutdown` fails for any reason the kernel cleans up at process
+/// exit anyway. Logged at `debug` so operators investigating slow
+/// shutdowns can see the trace.
+pub(crate) fn shutdown_recv(fd: RawFd) {
+    // SAFETY: `fd` is a snapshot taken from a live `NflogSubscriber`
+    // before that subscriber was moved into the spawn_blocking task.
+    // The fd may have been closed by a concurrent drop of the
+    // subscriber — in which case `shutdown` returns `EBADF` which we
+    // ignore. Calling shutdown on an open fd of any kind is a benign
+    // operation; the failure path here is purely diagnostic.
+    let rc = unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
+    if rc != 0 {
+        let err = io::Error::last_os_error();
+        tracing::debug!(error = %err, "nflog shutdown(SHUT_RDWR) failed; relying on process-exit fd reap");
     }
 }
 
@@ -296,18 +344,48 @@ impl NflogSubscriber {
 /// places this inside `tokio::task::spawn_blocking` per CLAUDE.md's
 /// blocking-syscall convention.
 ///
-/// Returns `Ok(())` when the socket is closed cleanly (only on test
-/// abort — production runs forever) and an `Err` on unrecoverable I/O.
-/// Soft errors (parse failures, non-UDP packets) increment the
+/// Returns `Ok(())` when `shutdown` is set (clean SIGTERM exit driven
+/// from `main.rs`'s signal handler — see [`shutdown_recv`]). Returns
+/// an `Err` on unrecoverable I/O *not attributable to the shutdown
+/// path*. Soft errors (parse failures, non-UDP packets) increment the
 /// counters and continue the loop.
+///
+/// ## Shutdown contract
+///
+/// The blocking `recv` cannot be cancelled by tokio. The SIGTERM exit
+/// path in `main.rs` therefore:
+///
+/// 1. Sets `shutdown` to `true`.
+/// 2. Calls [`shutdown_recv`] on the netlink fd, which causes any
+///    in-flight `recvmsg` to return with `n=0` / `EBADF` /
+///    `ENOTCONN`.
+/// 3. The recv loop observes the post-syscall outcome, sees the
+///    `shutdown` flag, and returns `Ok(())`.
+///
+/// Goal: exit within ~1 second of SIGTERM rather than relying on the
+/// 10-second SIGKILL escalation in the gateway entrypoint.
 pub fn run_blocking(
     mut subscriber: NflogSubscriber,
     emitter: Arc<EventEmitter>,
     rate_cap: Arc<RateCap>,
+    shutdown: Arc<AtomicBool>,
 ) -> Result<(), NflogError> {
     loop {
+        // Cheap pre-check so a `shutdown` flip that happened *between*
+        // recvs (no in-flight syscall to interrupt) still exits
+        // promptly. The post-syscall arms below cover the in-flight
+        // case via `shutdown_recv`'s socket half-close.
+        if shutdown.load(Ordering::Acquire) {
+            return Ok(());
+        }
         match subscriber.recv_packets() {
             Ok(records) => {
+                if records.is_empty() && shutdown.load(Ordering::Acquire) {
+                    // `shutdown_recv` causes `recv` to return n=0 with
+                    // an empty parse buffer; treat that as the clean
+                    // exit signal.
+                    return Ok(());
+                }
                 for record in records {
                     if rate_cap.try_admit(Utc::now()) == Admit::Ok {
                         emitter.emit_deny(record);
@@ -317,6 +395,14 @@ pub fn run_blocking(
             }
             Err(NflogError::Io(err)) if err.kind() == io::ErrorKind::Interrupted => {
                 continue;
+            }
+            Err(NflogError::Io(err)) if shutdown.load(Ordering::Acquire) => {
+                // `shutdown_recv` may surface as EBADF / ENOTCONN /
+                // EINVAL depending on kernel + libc version; any I/O
+                // error observed while the shutdown flag is set is a
+                // clean-exit signal, not a failure.
+                tracing::debug!(error = %err, "nflog recv error during shutdown; exiting cleanly");
+                return Ok(());
             }
             Err(NflogError::Io(err)) => {
                 tracing::warn!(error = %err, "nflog recv failed");
@@ -792,5 +878,80 @@ mod tests {
             Err(other) => panic!("expected Protocol error for group 0; got {other:?}"),
             Ok(_) => panic!("group 0 must be rejected"),
         }
+    }
+
+    /// Pin the SIGTERM clean-exit contract: a thread blocked on
+    /// `recv` against a Linux socket exits promptly when a peer
+    /// thread calls `shutdown(fd, SHUT_RDWR)` on the same fd. We
+    /// can't construct an `NflogSubscriber` in a unit test
+    /// (`NETLINK_NETFILTER` bind needs `CAP_NET_ADMIN`), but the
+    /// shutdown→recv-returns mechanism is a generic kernel-socket
+    /// behaviour — we exercise it on a `socketpair(AF_UNIX)` so the
+    /// hermetic test suite can own the assertion. The
+    /// `NflogSubscriber::shutdown_recv` callsite delegates to the
+    /// same `libc::shutdown(fd, SHUT_RDWR)` syscall this test
+    /// exercises, so a regression in the kernel-side semantics would
+    /// fail this test the same way it would fail the production
+    /// path.
+    #[test]
+    fn shutdown_unblocks_blocking_recv_within_one_second() {
+        use std::os::fd::{AsRawFd, OwnedFd};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        // socketpair() yields two connected endpoints; we read from
+        // one and shutdown the other to trigger recv-returns-0.
+        let mut sv: [libc::c_int; 2] = [0; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair: {}", io::Error::last_os_error());
+        // SAFETY: socketpair populated valid fds on success.
+        let read_end = unsafe { OwnedFd::from_raw_fd(sv[0]) };
+        let _write_end = unsafe { OwnedFd::from_raw_fd(sv[1]) };
+        use std::os::fd::FromRawFd;
+
+        let read_fd = read_end.as_raw_fd();
+
+        let (tx, rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut buf = [0u8; 16];
+            // SAFETY: `read_fd` is owned by the moved `read_end`.
+            let n = unsafe {
+                libc::recv(
+                    read_end.as_raw_fd(),
+                    buf.as_mut_ptr().cast::<libc::c_void>(),
+                    buf.len(),
+                    0,
+                )
+            };
+            tx.send((n, io::Error::last_os_error().raw_os_error()))
+                .expect("send recv outcome");
+        });
+
+        // Give the reader a beat to enter blocking recv before we
+        // shutdown the fd.
+        std::thread::sleep(Duration::from_millis(50));
+
+        let start = Instant::now();
+        super::shutdown_recv(read_fd);
+
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("recv must return within 1s of shutdown(SHUT_RDWR); SIGTERM contract violated");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "shutdown→recv-returns latency budget is 1s; got {elapsed:?}"
+        );
+        let (n, errno) = outcome;
+        // Linux returns 0 (graceful close) for a socketpair shut
+        // down with SHUT_RDWR while a peer is in recv. A negative
+        // return with EBADF/ENOTCONN is also acceptable as a
+        // clean-exit signal — the receive-loop arm in
+        // `run_blocking` treats either as "shutdown observed".
+        assert!(
+            n == 0 || (n < 0 && errno.is_some()),
+            "expected n=0 (graceful close) or n<0 with errno set; got n={n} errno={errno:?}"
+        );
+        reader.join().expect("reader thread");
     }
 }

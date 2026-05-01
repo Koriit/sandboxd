@@ -40,6 +40,8 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use clap::Parser;
 use sandbox_event_emitter::{EventEmitter, RateCap, health, spawn_flush_ticker};
@@ -185,6 +187,14 @@ async fn run(args: Args) -> std::io::Result<()> {
         group = args.nflog_group,
         "nflog subscriber bound (NETLINK_NETFILTER, NFNLGRP_NFLOG, CAP_NET_ADMIN)"
     );
+    // Snapshot the netlink fd before moving the subscriber into
+    // `spawn_blocking`. The SIGTERM handler below uses this fd to
+    // call `nflog::shutdown_recv`, which causes the in-flight
+    // `recv` to return cleanly. `RawFd` is `Copy` so this is a
+    // value snapshot, not a borrow against `nflog_subscriber`'s
+    // lifetime.
+    let nflog_fd = nflog_subscriber.as_raw_fd();
+    let shutdown = Arc::new(AtomicBool::new(false));
 
     let health_listener = health::bind(args.bind_ip, args.health_port).await?;
     tracing::info!(port = args.health_port, "health listener bound");
@@ -206,24 +216,46 @@ async fn run(args: Args) -> std::io::Result<()> {
     // posture as the listener tasks). The kernel is the bursting
     // sender, the consumer is one task; blocking is the simplest
     // correct shape.
+    //
+    // SIGTERM clean-exit contract: the shutdown atomic is shared
+    // between this loop and the signal handler. When SIGTERM fires
+    // the handler sets the flag and `shutdown_recv`s the fd; the
+    // loop observes either path and returns `Ok(())` within ~1
+    // second instead of relying on the gateway entrypoint's 10-second
+    // SIGKILL escalation.
     let nflog_emitter = Arc::clone(&emitter);
     let nflog_rate_cap = Arc::clone(&rate_cap);
-    let nflog_task = tokio::task::spawn_blocking(move || {
-        if let Err(err) = nflog::run_blocking(nflog_subscriber, nflog_emitter, nflog_rate_cap) {
+    let nflog_shutdown = Arc::clone(&shutdown);
+    let mut nflog_task = tokio::task::spawn_blocking(move || {
+        if let Err(err) = nflog::run_blocking(
+            nflog_subscriber,
+            nflog_emitter,
+            nflog_rate_cap,
+            nflog_shutdown,
+        ) {
             tracing::error!(error = %err, "nflog receiver exited with error");
         }
     });
 
     let health_emitter = Arc::clone(&emitter);
     let health_task = tokio::spawn(async move {
-        // The deny-logger's `/health` body shape is preserved across the
-        // binary rename per `2026-05-01-udp-nft-loggers-design.md`
-        // Resolution 5 (`tcp_listener`, `nflog_socket`,
-        // `events_emitted_60s`); the lib's `deny_logger_body` builder
-        // emits exactly that JSON.
-        if let Err(err) =
-            health::run(health_listener, health_emitter, health::deny_logger_body).await
-        {
+        // The deny-logger's `/health` body shape preserves the legacy
+        // field names (`tcp_listener`, `nflog_socket`,
+        // `events_emitted_60s`) across the binary rename per
+        // `2026-05-01-udp-nft-loggers-design.md` Resolution 5, and
+        // adds the parser audit counters (`nflog_emitted`,
+        // `nflog_parse_errors`) so operators get a numeric audit
+        // signal without scraping logs. The closure threads the
+        // crate-local `nflog::emitted` / `nflog::parse_errors`
+        // statics into the lib's stock body builder.
+        let body_builder = |emitter: &EventEmitter| -> String {
+            health::deny_logger_body(
+                emitter.events_emitted_60s(),
+                nflog::emitted(),
+                nflog::parse_errors(),
+            )
+        };
+        if let Err(err) = health::run(health_listener, health_emitter, body_builder).await {
             tracing::error!(error = %err, "health listener exited with error");
         }
     });
@@ -237,7 +269,7 @@ async fn run(args: Args) -> std::io::Result<()> {
 
     let outcome = tokio::select! {
         res = tcp_task => res.map_err(|e| std::io::Error::other(e.to_string())),
-        res = nflog_task => res.map_err(|e| std::io::Error::other(e.to_string())),
+        res = &mut nflog_task => res.map_err(|e| std::io::Error::other(e.to_string())),
         res = health_task => res.map_err(|e| std::io::Error::other(e.to_string())),
         res = &mut flush_ticker => {
             let err_msg = match res {
@@ -261,6 +293,31 @@ async fn run(args: Args) -> std::io::Result<()> {
             Ok(())
         }
     };
+
+    // Signal the NFLOG blocking loop to exit cleanly. Setting the
+    // flag covers the "between-recvs" race; the `shutdown_recv`
+    // syscall handles the "in-flight recv" race. With both, the
+    // loop observes the shutdown within one syscall round-trip and
+    // returns `Ok(())` so tokio's blocking-pool thread is freed
+    // before the runtime drop. We then wait briefly on the join
+    // handle to confirm clean exit; on timeout we fall through to
+    // the runtime drop, which detaches the blocking thread (the
+    // kernel reaps the fd at process exit).
+    shutdown.store(true, Ordering::Release);
+    nflog::shutdown_recv(nflog_fd);
+    if !nflog_task.is_finished() {
+        // 1s budget — well below the gateway entrypoint's 10s
+        // SIGKILL escalation. If the recv loop hasn't observed the
+        // shutdown by then, something is wrong with the kernel-side
+        // socket state; drop through and let the runtime detach.
+        let join_outcome = tokio::time::timeout(Duration::from_secs(1), nflog_task).await;
+        if let Err(_elapsed) = join_outcome {
+            tracing::warn!(
+                "nflog receiver did not exit within 1s of SIGTERM; \
+                 falling through to runtime drop (process exit will reap)"
+            );
+        }
+    }
 
     flush_ticker.abort();
     rate_cap.flush_now(chrono::Utc::now());

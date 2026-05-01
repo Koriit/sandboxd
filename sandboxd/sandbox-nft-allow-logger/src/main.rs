@@ -63,6 +63,8 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use clap::Parser;
 use sandbox_event_emitter::{EventEmitter, RateCap, health, spawn_flush_ticker};
@@ -185,6 +187,12 @@ async fn run(args: Args) -> std::io::Result<()> {
     let nfct_subscriber = nfct::NfctSubscriber::bind()
         .map_err(|e| std::io::Error::other(format!("nfct bind: {e}")))?;
     tracing::info!("nfct subscriber bound (NETLINK_NETFILTER, NFNLGRP_CONNTRACK_NEW)");
+    // Snapshot the netlink fd before moving the subscriber into
+    // `spawn_blocking` (mirrors the deny-logger). The SIGTERM
+    // handler below uses this fd to call `nfct::shutdown_recv`,
+    // which causes the in-flight `recv` to return cleanly.
+    let nfct_fd = nfct_subscriber.as_raw_fd();
+    let shutdown = Arc::new(AtomicBool::new(false));
 
     let health_listener = health::bind(args.bind_ip, args.health_port).await?;
     tracing::info!(port = args.health_port, "health listener bound");
@@ -193,11 +201,18 @@ async fn run(args: Args) -> std::io::Result<()> {
     // CLAUDE.md's blocking-syscall convention: place it on a
     // dedicated `spawn_blocking` thread so the netlink syscall does
     // not park a tokio worker under sustained traffic. Mirrors the
-    // deny-logger's NFLOG receive loop.
+    // deny-logger's NFLOG receive loop, including the SIGTERM
+    // clean-exit contract: shutdown atomic + half-close of the
+    // netlink fd so the loop exits within ~1s of SIGTERM rather
+    // than relying on the gateway entrypoint's 10-second SIGKILL
+    // escalation.
     let nfct_emitter = Arc::clone(&emitter);
     let nfct_rate_cap = Arc::clone(&rate_cap);
-    let nfct_task = tokio::task::spawn_blocking(move || {
-        if let Err(err) = nfct::run_blocking(nfct_subscriber, nfct_emitter, nfct_rate_cap) {
+    let nfct_shutdown = Arc::clone(&shutdown);
+    let mut nfct_task = tokio::task::spawn_blocking(move || {
+        if let Err(err) =
+            nfct::run_blocking(nfct_subscriber, nfct_emitter, nfct_rate_cap, nfct_shutdown)
+        {
             tracing::error!(error = %err, "nfct receiver exited with error");
         }
     });
@@ -205,12 +220,21 @@ async fn run(args: Args) -> std::io::Result<()> {
     let health_emitter = Arc::clone(&emitter);
     let health_task = tokio::spawn(async move {
         // Allow-logger `/health` shape: `nfct_socket` + the rolling
-        // `allow_events_emitted_60s` gauge. Per-binary builder
-        // (Resolution 5) — the lib's HTTP framing is shared with the
-        // deny-logger, only the JSON body differs.
-        if let Err(err) =
-            health::run(health_listener, health_emitter, health::allow_logger_body).await
-        {
+        // `allow_events_emitted_60s` gauge plus parser audit
+        // counters (`nfct_emitted`, `nfct_skipped`,
+        // `nfct_parse_errors`) so operators get a numeric audit
+        // signal without scraping logs. Per-binary builder
+        // (Resolution 5) — the lib's HTTP framing is shared with
+        // the deny-logger, only the JSON body differs.
+        let body_builder = |emitter: &EventEmitter| -> String {
+            health::allow_logger_body(
+                emitter.events_emitted_60s(),
+                nfct::emitted(),
+                nfct::skipped(),
+                nfct::parse_errors(),
+            )
+        };
+        if let Err(err) = health::run(health_listener, health_emitter, body_builder).await {
             tracing::error!(error = %err, "health listener exited with error");
         }
     });
@@ -223,7 +247,7 @@ async fn run(args: Args) -> std::io::Result<()> {
         .map_err(|e| std::io::Error::other(format!("install SIGINT handler: {e}")))?;
 
     let outcome = tokio::select! {
-        res = nfct_task => res.map_err(|e| std::io::Error::other(e.to_string())),
+        res = &mut nfct_task => res.map_err(|e| std::io::Error::other(e.to_string())),
         res = health_task => res.map_err(|e| std::io::Error::other(e.to_string())),
         res = &mut flush_ticker => {
             let err_msg = match res {
@@ -247,6 +271,21 @@ async fn run(args: Args) -> std::io::Result<()> {
             Ok(())
         }
     };
+
+    // Signal the NFCT blocking loop to exit cleanly. See the
+    // deny-logger's main.rs for the full rationale; the shape is
+    // identical here.
+    shutdown.store(true, Ordering::Release);
+    nfct::shutdown_recv(nfct_fd);
+    if !nfct_task.is_finished() {
+        let join_outcome = tokio::time::timeout(Duration::from_secs(1), nfct_task).await;
+        if let Err(_elapsed) = join_outcome {
+            tracing::warn!(
+                "nfct receiver did not exit within 1s of SIGTERM; \
+                 falling through to runtime drop (process exit will reap)"
+            );
+        }
+    }
 
     flush_ticker.abort();
     rate_cap.flush_now(chrono::Utc::now());
