@@ -398,13 +398,30 @@ def test_denied_traffic(sandbox_cli, backend):
             f"gateway nftables.\nnftables output:\n{nft_rules}"
         )
 
-        # Verify non-DNS UDP catch-all DNAT to the deny-logger UDP sink
-        # (port 10002). Same l4proto shape as TCP — the catch-all exists
-        # specifically so denied UDP is observed by the deny-logger
-        # rather than silently dropped.
-        assert re.search(r"meta l4proto 17 dnat", nft_rules), (
-            f"Missing non-DNS UDP catch-all DNAT (meta l4proto 17) in "
-            f"gateway nftables.\nnftables output:\n{nft_rules}"
+        # Verify non-DNS UDP catch-all is `log group N ; drop` (M12-S2
+        # Decision 2). Pre-M12-S2 this was a DNAT to the userland
+        # deny-logger UDP sink at :10002; the spec replaced that
+        # listener with kernel NFLOG + drop because the listener
+        # existed only to launder bookkeeping the kernel already had.
+        # The kernel mirrors each dropped packet to NFNLGRP_NFLOG with
+        # the pre-rewrite IPv4+UDP headers so the
+        # `sandbox-nft-deny-logger` can emit a deny event with the
+        # original 5-tuple.
+        assert re.search(r"meta l4proto 17 log group 1", nft_rules), (
+            f"Missing non-DNS UDP NFLOG mirror (meta l4proto 17 log "
+            f"group 1) in gateway nftables.\nnftables output:\n{nft_rules}"
+        )
+        assert re.search(r"meta l4proto 17 drop", nft_rules), (
+            f"Missing non-DNS UDP drop after NFLOG mirror (meta "
+            f"l4proto 17 drop) in gateway nftables.\nnftables output:\n{nft_rules}"
+        )
+        # Defense-in-depth: the pre-M12-S2 DNAT-to-:10002 rule must be
+        # gone. A leak here means a regression that re-introduced the
+        # userland listener path.
+        assert "10002" not in nft_rules, (
+            f"Found references to :10002 in nftables — the pre-M12-S2 "
+            f"UDP-to-listener DNAT must be removed (M12-S2 Decision 2). "
+            f"\nnftables output:\n{nft_rules}"
         )
 
         # Verify cloud metadata (169.254.169.254) is blocked in the rules.
@@ -413,11 +430,17 @@ def test_denied_traffic(sandbox_cli, backend):
             f"nftables output:\n{nft_rules}"
         )
 
-        # Verify the forward chain restricts traffic to the gateway IP
-        # (not a blanket accept from VM subnet).  After DNAT, legitimate
-        # traffic has its destination rewritten to the gateway.  The forward
-        # chain should require "ip daddr <gateway_ip>" so non-DNS UDP
-        # (which was NOT DNAT'd) gets rejected.
+        # Verify the forward chain shape. M12-S2 Decision 2 changed the
+        # invariant: TCP enters via DNAT-rewritten dst=gateway_ip
+        # (caught by `ip saddr <vm_subnet> ip daddr <gateway_ip>
+        # accept`), denied UDP is dropped at PREROUTING via the
+        # NFLOG+drop pair, and allowed UDP is admitted in FORWARD by
+        # `ip saddr <vm_subnet> meta l4proto udp accept` (no daddr
+        # restriction — defence-in-depth lives at PREROUTING). So the
+        # forward chain should contain *both* shapes: a TCP-class
+        # accept that includes daddr, and a UDP wholesale-accept that
+        # legitimately omits daddr. Anything else (e.g. a TCP accept
+        # without daddr) would be a regression.
         forward_lines = []
         in_forward = False
         for line in nft_rules.splitlines():
@@ -428,20 +451,100 @@ def test_denied_traffic(sandbox_cli, backend):
             elif in_forward:
                 forward_lines.append(line.strip())
 
-        # The forward chain should have "ip daddr" restriction — no blanket accept.
         accept_lines = [l for l in forward_lines if "accept" in l and "saddr" in l]
         for line in accept_lines:
+            # `nft list ruleset` prints the L4 protocol numerically:
+            # `meta l4proto 17` for UDP (and 6 for TCP). The pre-M12-S2
+            # check assumed every saddr-accept also carried daddr; the
+            # M12-S2 datapath admits all VM-subnet UDP wholesale at
+            # FORWARD (defence-in-depth lives at PREROUTING via NFLOG +
+            # drop). Skip the UDP wholesale-accept; assert daddr on
+            # every other saddr-accept.
+            if re.search(r"meta l4proto (?:17|udp)", line):
+                continue
             assert "daddr" in line, (
-                f"Forward chain has blanket accept without daddr restriction: {line!r}\n"
-                f"Non-DNS UDP would escape the sandbox unproxied.\n"
-                f"nftables output:\n{nft_rules}"
+                f"Forward chain has a non-UDP saddr-accept without "
+                f"daddr restriction: {line!r}\nNon-DNAT TCP would "
+                f"escape the sandbox unproxied.\nnftables output:\n{nft_rules}"
             )
 
-        # Note: we do NOT behaviorally test UDP blocking here. UDP is
-        # connectionless — nc -u sendto() succeeds immediately before the
-        # kernel's ICMP reject arrives, making behavioral assertions unreliable.
-        # The structural check above (forward chain requires daddr match)
-        # verifies the rules are correct; the kernel enforces them.
+        # Behavioural check (M12-S2 § Test plan): with NFLOG live,
+        # send UDP from the VM to a not-allowed destination and assert
+        # the corresponding deny event surfaces on the per-session
+        # event bus. Pre-M12-S2 this was skipped because UDP deny
+        # attribution was structurally broken; post-M12-S2 the kernel
+        # mirrors the dropped packet to NFNLGRP_NFLOG and the
+        # `sandbox-nft-deny-logger` republishes it as a JSONL deny
+        # event ingested by the daemon and surfaced via
+        # ``sandbox events``.
+        #
+        # We use a documentation-reserved IP (203.0.113.1, RFC 5737
+        # TEST-NET-3) on a deliberately weird port (54321) so we can
+        # assert a precise (orig_dst_ip, orig_dst_port) pair without
+        # racing against legitimate traffic the VM might generate.
+        # The session was created without an explicit policy above,
+        # so all UDP-to-arbitrary-dst is in the deny path.
+        target_ip = "203.0.113.1"
+        target_port = 54321
+        # bash redirect into /dev/udp opens a SOCK_DGRAM, sendto's,
+        # and exits. The packet is dropped at the gateway's PREROUTING
+        # (post-NFLOG mirror) and never produces an ICMP unreachable
+        # back to the VM under the M12-S2 silent-drop default
+        # (Decision 6 / Open Question #2 resolution).
+        send_cmd = (
+            f"head -c 16 /dev/zero > /dev/udp/{target_ip}/{target_port} "
+            f"2>&1; echo EXIT:$?"
+        )
+        send_result = sandbox_cli(
+            "ssh", "net-deny-test", "--",
+            "timeout", "5", "bash", "-c", send_cmd,
+            timeout=60,
+        )
+        assert send_result.returncode == 0, (
+            f"sandbox ssh wrapper failed for UDP-to-deny send.\n"
+            f"stdout: {send_result.stdout}\nstderr: {send_result.stderr}"
+        )
+
+        # Allow the watcher's parse + publish path to flush the deny
+        # event onto the bus.
+        time.sleep(4)
+
+        # Snapshot the per-session deny stream and look for our exact
+        # pre-DNAT 5-tuple slice.
+        events_result = sandbox_cli(
+            "events", "net-deny-test", "--decision=deny",
+            timeout=60,
+        )
+        assert events_result.returncode == 0, (
+            f"`sandbox events --decision=deny` failed "
+            f"(rc={events_result.returncode}).\n"
+            f"stdout: {events_result.stdout}\nstderr: {events_result.stderr}"
+        )
+        deny_events: list[dict] = []
+        for line in events_result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                deny_events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        nft_deny_match = [
+            ev for ev in deny_events
+            if ev.get("layer") == "deny-logger"
+            and ev.get("event") == "deny"
+            and ev.get("protocol") == "udp"
+            and ev.get("orig_dst_ip") == target_ip
+            and ev.get("orig_dst_port") == target_port
+        ]
+        assert nft_deny_match, (
+            f"Expected at least one nft-deny-logger deny event for "
+            f"({target_ip}:{target_port}/udp) on the per-session event "
+            f"bus after sending UDP to a not-allowed destination. "
+            f"Captured {len(deny_events)} deny events; first 10:\n"
+            + "\n".join(json.dumps(ev) for ev in deny_events[:10])
+            + f"\n{capture_lima_logs(session_id)}"
+        )
 
         # 4. Clean up.
         sandbox_cli("rm", "net-deny-test", timeout=120)

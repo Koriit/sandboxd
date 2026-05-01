@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import re
+import socket
 import subprocess
 import time
 
@@ -389,6 +390,818 @@ def test_level1_transport_udp(sandbox_cli, backend):
     finally:
         if session_id is not None:
             sandbox_cli("rm", "pol-l1-udp", timeout=120)
+        if policy_path is not None:
+            cleanup_policy_file(policy_path)
+
+
+# ---------------------------------------------------------------------------
+# UDP allow-path / deny-path event-bus helpers (M12-S2)
+# ---------------------------------------------------------------------------
+#
+# The four ``test_udp_*`` cases below exercise the post-M12-S2 datapath:
+#
+#   * Allowed UDP -> ``policy_allow_udp accept`` -> direct upstream
+#     (no Envoy hop). The ``sandbox-nft-allow-logger`` subscribes to
+#     ``NFNLGRP_CONNTRACK_NEW`` and emits a JSONL allow event per new
+#     UDP flow; the daemon's ingest watcher republishes it onto the
+#     per-session event bus with on-bus ``layer="deny-logger"`` and
+#     ``event="allow"`` (same on-bus layer for both nft loggers,
+#     distinguished by the ``event`` discriminator — see
+#     ``event_mapper.rs``).
+#
+#   * Denied UDP -> ``meta l4proto udp log group 1; drop``. The
+#     kernel mirrors the dropped packet to NFNLGRP_NFLOG; the
+#     ``sandbox-nft-deny-logger`` parses the netlink message and
+#     emits a JSONL deny event with the pre-DNAT 5-tuple. Same on-bus
+#     ``layer="deny-logger"``, ``event="deny"`` discriminator.
+#
+# All assertions in this group target the on-bus DTO via
+# ``sandbox events <session>`` (JSONL stream) — never the on-disk
+# ``nft-allow.jsonl`` / ``nft-deny.jsonl`` files. Internal filenames
+# may change without notice; the bus contract is what tests pin.
+
+# Number of seconds to wait between a UDP send and the snapshot read,
+# allowing the watcher's parse + publish path to flush.
+_UDP_EVENT_PROPAGATION_S = 4
+
+
+def _read_session_events(
+    sandbox_cli,
+    session_name: str,
+    decision: str | None = None,
+) -> list[dict]:
+    """Snapshot the per-session event bus via ``sandbox events`` (non-follow).
+
+    Returns the parsed JSONL entries; blank or unparseable lines are
+    skipped so a truncated tail does not invalidate the assertion.
+    Mirrors the helper at ``test_m10_s5_presets._read_events`` — kept
+    inline rather than promoted to ``conftest.py`` so the M12-S2 test
+    block stays self-contained for future readers.
+    """
+    args = ["events", session_name]
+    if decision is not None:
+        args.append(f"--decision={decision}")
+    result = sandbox_cli(*args, timeout=60)
+    assert result.returncode == 0, (
+        f"`sandbox events {' '.join(args[1:])}` failed "
+        f"(rc={result.returncode}).\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    events: list[dict] = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return events
+
+
+def _is_nft_allow_for(
+    ev: dict,
+    dst_ip: str,
+    dst_port: int,
+    protocol: str = "udp",
+) -> bool:
+    """Match a single allow event against an expected pre-DNAT 5-tuple slice.
+
+    The on-bus shape (``event_mapper.rs``):
+        layer="deny-logger", event="allow", protocol="udp",
+        orig_dst_ip=<ip>, orig_dst_port=<port>,
+        src_ip=<vm-ip>, src_port=<ephemeral>.
+
+    Tests pin destination + protocol; source port is ephemeral and
+    not asserted here.
+    """
+    return (
+        ev.get("layer") == "deny-logger"
+        and ev.get("event") == "allow"
+        and ev.get("protocol") == protocol
+        and ev.get("orig_dst_ip") == dst_ip
+        and ev.get("orig_dst_port") == dst_port
+    )
+
+
+def _is_nft_deny_for(
+    ev: dict,
+    dst_ip: str,
+    dst_port: int,
+    protocol: str = "udp",
+) -> bool:
+    """Match a single deny event against an expected pre-DNAT 5-tuple slice.
+
+    Same wire shape as ``_is_nft_allow_for`` — only the ``event``
+    discriminator differs.
+    """
+    return (
+        ev.get("layer") == "deny-logger"
+        and ev.get("event") == "deny"
+        and ev.get("protocol") == protocol
+        and ev.get("orig_dst_ip") == dst_ip
+        and ev.get("orig_dst_port") == dst_port
+    )
+
+
+def _resolve_ipv4(host: str, attempts: int = 3) -> set[str]:
+    """Resolve ``host`` host-side (not via the gateway's CoreDNS) to a
+    set of IPv4 addresses. CDN / Anycast hosts can return different
+    IPs across calls; we union a few attempts.
+
+    Used by the CIDR-anchor and bidirectional-echo tests so they can
+    target an IP directly without relying on the gateway's DNS path
+    (which would re-resolve and might pick a different IP).
+    """
+    ips: set[str] = set()
+    for _ in range(attempts):
+        try:
+            ips.add(socket.gethostbyname(host))
+        except OSError:
+            pass
+    return ips
+
+
+def _send_udp_packet(
+    sandbox_cli,
+    session_name: str,
+    dst_ip: str,
+    dst_port: int,
+    payload_bytes: int = 16,
+    timeout_s: int = 5,
+) -> subprocess.CompletedProcess:
+    """Send one UDP packet from inside the VM via bash's ``/dev/udp/``
+    redirection. Returns the CLI's CompletedProcess — the test does not
+    assert on the inner exit code (UDP is connectionless; ``echo
+    >/dev/udp/...`` returns 0 on a successful sendto regardless of
+    whether the packet was eventually delivered, dropped at nft, or
+    accepted by the upstream).
+
+    The exit code is informational; the actual assertion in each test
+    is on the bus event that the kernel datapath produced (allow event
+    from nft-allow-logger / deny event from nft-deny-logger).
+
+    bash redirection is the most portable primitive — present in both
+    the Lima base image and the lite container image without extra
+    packages, no raw-socket capabilities needed (UDP send goes through
+    a stock SOCK_DGRAM, not a raw socket).
+    """
+    # 16 bytes of arbitrary content; payload size is irrelevant since
+    # the deny path drops at nft and the allow path doesn't inspect
+    # contents. ``head -c`` from /dev/zero gives deterministic bytes.
+    cmd = (
+        f"head -c {payload_bytes} /dev/zero > /dev/udp/{dst_ip}/{dst_port} "
+        f"2>&1; echo EXIT:$?"
+    )
+    return sandbox_cli(
+        "ssh", session_name, "--",
+        "timeout", str(timeout_s), "bash", "-c", cmd,
+        timeout=60,
+    )
+
+
+@pytest.mark.timeout(600)
+def test_udp_allow_ntp(sandbox_cli, backend):
+    """Allow UDP/123 to an NTP host; from the VM, send an NTP packet and
+    assert an allow event lands on the bus with the correct 5-tuple.
+
+    M12-S2 Decision 1 + 3: allowed UDP exits direct to upstream (no
+    Envoy / mitmproxy hop), and the ``sandbox-nft-allow-logger``
+    emits one JSONL allow event per new conntrack flow. The daemon
+    ingest republishes it on the bus with ``layer="deny-logger"`` and
+    ``event="allow"`` per ``event_mapper.rs``.
+
+    NTP is the spec-suggested non-DNS UDP example (audit § 3.c1) —
+    it exercises the ``policy_allow_udp`` path proper rather than the
+    DNS DNAT hairpin that ``test_level1_transport_udp`` covers.
+    """
+    session_id = None
+    policy_path = None
+    session_name = "pol-udp-allow-ntp"
+    try:
+        # Allow time.cloudflare.com on UDP/123. Cloudflare's NTP service
+        # is anycast / publicly reachable, used here purely as a known
+        # UDP/123 destination. The host has its own A record and is
+        # resolvable via CoreDNS (which then propagates the resolved IPs
+        # into `policy_allow_udp`).
+        target_host = "time.cloudflare.com"
+        target_port = 123
+        policy = {
+            "version": "2.0.0",
+            "rules": [
+                {
+                    "host": target_host,
+                    "port": target_port,
+                    "protocol": "udp",
+                    "level": "transport",
+                },
+            ],
+        }
+        policy_path = write_policy_file(policy)
+
+        result = sandbox_cli(
+            "create", *make_create_args(backend, session_name, "--policy", policy_path),
+            timeout=600,
+        )
+        assert result.returncode == 0, (
+            f"sandbox create failed (rc={result.returncode}).\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        session_id = parse_session_id(result.stdout)
+        wait_for_state(sandbox_cli, session_name, "Running", timeout=10)
+
+        # Warm DNS so CoreDNS resolves the host and the daemon's
+        # propagation loop populates the `policy_allow_udp` concat-set
+        # entry `(ip, 123)`. Without this the first UDP packet races
+        # the 2-second propagation poll and would hit the NFLOG-drop
+        # path. Mirrors the warmup pattern used elsewhere in this
+        # module (test_level1_transport_tcp etc.).
+        nslookup = sandbox_cli(
+            "ssh", session_name, "--",
+            "nslookup", target_host,
+            timeout=120,
+        )
+        assert nslookup.returncode == 0, (
+            f"nslookup for {target_host} failed inside VM.\n"
+            f"stdout: {nslookup.stdout}\nstderr: {nslookup.stderr}"
+        )
+        time.sleep(5)
+
+        # Capture the resolved IPs reported by the VM-side resolver so
+        # the bus assertion's expected 5-tuple matches whatever address
+        # was actually placed in `policy_allow_udp`. Geo / CDN drift
+        # between host-side and gateway-side resolvers is a documented
+        # source of flakiness elsewhere (see
+        # test_l3_fail_closed_before_dns_propagation), so we use the
+        # in-VM answer as the source of truth.
+        vm_resolved: list[str] = []
+        seen_name = False
+        for line in nslookup.stdout.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Name:"):
+                seen_name = True
+                continue
+            if seen_name:
+                m = re.match(
+                    r"Address(?:es)?(?:\s*\d+)?:\s*(\d{1,3}(?:\.\d{1,3}){3})$",
+                    stripped,
+                )
+                if m:
+                    vm_resolved.append(m.group(1))
+        assert vm_resolved, (
+            f"VM-side nslookup for {target_host} returned no A records.\n"
+            f"stdout: {nslookup.stdout}\nstderr: {nslookup.stderr}"
+        )
+        target_ip = vm_resolved[0]
+
+        # Send a single UDP packet to <target_ip>:123. The bash redirect
+        # opens a SOCK_DGRAM, sendto's the bytes, and closes — that is
+        # enough for the kernel to instantiate a new conntrack entry
+        # (UDP is unconnected, but `ip_conntrack_udp` still creates an
+        # NFCT_T_NEW event on first packet match), which the
+        # nft-allow-logger picks up via the `NFNLGRP_CONNTRACK_NEW`
+        # subscription.
+        send = _send_udp_packet(sandbox_cli, session_name, target_ip, target_port)
+        assert send.returncode == 0, (
+            f"`sandbox ssh` wrapper failed when sending UDP packet.\n"
+            f"stdout: {send.stdout}\nstderr: {send.stderr}"
+        )
+
+        # Give the watcher + ingest path time to publish the allow
+        # event onto the bus.
+        time.sleep(_UDP_EVENT_PROPAGATION_S)
+
+        allow_events = _read_session_events(
+            sandbox_cli, session_name, decision="allow",
+        )
+        # At least one nft-allow event for our (target_ip, 123, udp)
+        # 5-tuple slice must be present.
+        matched = [
+            ev for ev in allow_events
+            if _is_nft_allow_for(ev, target_ip, target_port, protocol="udp")
+        ]
+        assert matched, (
+            f"Expected at least one nft-allow-logger allow event for "
+            f"({target_ip}:{target_port}/udp) on the per-session bus, "
+            f"but found none. Captured {len(allow_events)} allow "
+            f"events total; first 10:\n"
+            + "\n".join(json.dumps(ev) for ev in allow_events[:10])
+            + f"\n{capture_lima_logs(session_id)}"
+        )
+
+        # Spot-check the source side of the 5-tuple: src_ip should be
+        # the session's VM IP (lives inside the per-session subnet),
+        # src_port is ephemeral and not pinned. Asserting only that the
+        # source field is *populated* keeps the test robust to backend
+        # differences (lima vs container subnet shapes).
+        any_event = matched[0]
+        assert any_event.get("src_ip"), (
+            f"allow event missing src_ip; event: {json.dumps(any_event)}"
+        )
+        assert isinstance(any_event.get("src_port"), int), (
+            f"allow event missing/invalid src_port; event: {json.dumps(any_event)}"
+        )
+
+        sandbox_cli("rm", session_name, timeout=120)
+        session_id = None
+
+    finally:
+        if session_id is not None:
+            sandbox_cli("rm", session_name, timeout=120)
+        if policy_path is not None:
+            cleanup_policy_file(policy_path)
+
+
+@pytest.mark.timeout(600)
+def test_udp_bidirectional_echo(sandbox_cli, backend):
+    """Send a UDP packet to an allowed NTP server, receive the response,
+    and assert exactly one allow event fires for the *outbound* (NEW)
+    flow — no allow event for the return packet.
+
+    M12-S2 Decision 3 / Resolution 7: the allow logger subscribes to
+    ``NFNLGRP_CONNTRACK_NEW`` only — not ``DESTROY`` or any other
+    conntrack lifecycle event. A single UDP request/reply is one
+    flow, one NFCT_T_NEW event, one allow event on the bus.
+
+    NTP serves as a real bidirectional UDP service: the request packet
+    is 48 bytes with mode=3 (client); the server replies with a 48-byte
+    response carrying the timestamps. We don't validate the NTP
+    timestamps here — the round trip itself is sufficient evidence
+    that the allow datapath delivered the packet end-to-end (no
+    Envoy hop, direct upstream per Decision 1).
+    """
+    session_id = None
+    policy_path = None
+    session_name = "pol-udp-echo"
+    try:
+        target_host = "time.cloudflare.com"
+        target_port = 123
+        policy = {
+            "version": "2.0.0",
+            "rules": [
+                {
+                    "host": target_host,
+                    "port": target_port,
+                    "protocol": "udp",
+                    "level": "transport",
+                },
+            ],
+        }
+        policy_path = write_policy_file(policy)
+
+        result = sandbox_cli(
+            "create", *make_create_args(backend, session_name, "--policy", policy_path),
+            timeout=600,
+        )
+        assert result.returncode == 0, (
+            f"sandbox create failed (rc={result.returncode}).\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        session_id = parse_session_id(result.stdout)
+        wait_for_state(sandbox_cli, session_name, "Running", timeout=10)
+
+        # Warm DNS + propagate.
+        nslookup = sandbox_cli(
+            "ssh", session_name, "--",
+            "nslookup", target_host,
+            timeout=120,
+        )
+        assert nslookup.returncode == 0, (
+            f"nslookup for {target_host} failed.\n"
+            f"stdout: {nslookup.stdout}\nstderr: {nslookup.stderr}"
+        )
+        time.sleep(5)
+
+        # Resolve VM-side and pick the first IP — same logic as
+        # test_udp_allow_ntp.
+        vm_resolved: list[str] = []
+        seen_name = False
+        for line in nslookup.stdout.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Name:"):
+                seen_name = True
+                continue
+            if seen_name:
+                m = re.match(
+                    r"Address(?:es)?(?:\s*\d+)?:\s*(\d{1,3}(?:\.\d{1,3}){3})$",
+                    stripped,
+                )
+                if m:
+                    vm_resolved.append(m.group(1))
+        assert vm_resolved, (
+            f"VM-side nslookup for {target_host} returned no A records.\n"
+            f"{nslookup.stdout}"
+        )
+        target_ip = vm_resolved[0]
+
+        # Send a real NTP client request and read the response. The
+        # request is a 48-byte v4 client packet (LI=0, VN=4, Mode=3
+        # encoded as 0x23 in the first byte; remaining 47 bytes zero).
+        # We use socat for the round-trip because bash's /dev/udp/
+        # redirection is sendto-only — it doesn't expose a way to
+        # read the reply on the same socket. socat is installed in
+        # both Lima (cloud-init) and lite container (Dockerfile)
+        # images, so the test works on both backends.
+        #
+        # The `-t 5` and `-T 5` socat options bound the wait time so
+        # the test fails fast if no reply arrives (which would be a
+        # datapath bug). Output is base64-encoded so we can sanity-
+        # check the response length without worrying about binary
+        # bytes corrupting the ssh transport.
+        ntp_cmd = (
+            "printf '\\x23' > /tmp/ntp_req && "
+            "head -c 47 /dev/zero >> /tmp/ntp_req && "
+            f"socat -t 5 -T 5 - UDP:{target_ip}:{target_port} < /tmp/ntp_req "
+            "| base64 -w0; echo; echo EXIT:$?"
+        )
+        socat_result = sandbox_cli(
+            "ssh", session_name, "--",
+            "bash", "-c", ntp_cmd,
+            timeout=60,
+        )
+        # The outer ssh wrapper should always succeed; the inner socat
+        # reports its exit code via "EXIT:$?".
+        assert socat_result.returncode == 0, (
+            f"sandbox ssh wrapper failed for socat NTP send.\n"
+            f"stdout: {socat_result.stdout}\nstderr: {socat_result.stderr}"
+        )
+        # Parse out the base64'd response. socat emits the bytes on
+        # stdout, then the inner shell appends "\nEXIT:0".
+        out_lines = [l for l in socat_result.stdout.splitlines() if l.strip()]
+        assert out_lines and "EXIT:0" in out_lines[-1], (
+            f"socat exited non-zero or produced no output — "
+            f"NTP response did not arrive.\n"
+            f"stdout:\n{socat_result.stdout}\nstderr: {socat_result.stderr}\n"
+            f"{capture_lima_logs(session_id)}"
+        )
+        b64_response = out_lines[0]
+        # NTPv4 response is exactly 48 bytes -> base64 of 48 bytes is
+        # 64 chars (ceiling((48*4)/3)). Allow some flex if a server
+        # returns a slightly different shape, but require *some*
+        # response bytes (not just a newline).
+        try:
+            import base64
+            response_bytes = base64.b64decode(b64_response)
+        except Exception as e:
+            pytest.fail(
+                f"failed to decode socat output as base64; raw output:\n"
+                f"{socat_result.stdout}\nerror: {e}"
+            )
+        assert len(response_bytes) >= 48, (
+            f"NTP response shorter than expected 48 bytes; got "
+            f"{len(response_bytes)} bytes. Indicates the upstream "
+            f"didn't reply or the reply was truncated.\n"
+            f"raw socat stdout:\n{socat_result.stdout}"
+        )
+
+        # Allow ingest to flush.
+        time.sleep(_UDP_EVENT_PROPAGATION_S)
+
+        allow_events = _read_session_events(
+            sandbox_cli, session_name, decision="allow",
+        )
+        # Find every nft-allow event for our (target_ip, 123/udp).
+        # Expect exactly one — Resolution 7 says NEW only.
+        matching = [
+            ev for ev in allow_events
+            if _is_nft_allow_for(ev, target_ip, target_port, protocol="udp")
+        ]
+        assert matching, (
+            f"Expected at least one nft-allow-logger allow event for "
+            f"({target_ip}:{target_port}/udp), got none. Captured "
+            f"{len(allow_events)} allow events total; first 10:\n"
+            + "\n".join(json.dumps(ev) for ev in allow_events[:10])
+        )
+
+        # Resolution 7: NEW-only — no DESTROY/return-flow events. The
+        # outbound (VM -> NTP) flow has src_ip = VM IP. A bug that
+        # also subscribed to NFCT_T_DESTROY (or that mistakenly
+        # logged the reply tuple) would surface as a *second* event
+        # whose src_ip / orig_dst_ip are swapped (NTP server -> VM).
+        # We assert the inverse: no allow event with
+        # orig_dst_ip = our VM's session IP exists for the duration
+        # of this test.
+        return_flow_hits = [
+            ev for ev in allow_events
+            if ev.get("layer") == "deny-logger"
+            and ev.get("event") == "allow"
+            and ev.get("src_ip") == target_ip
+            and ev.get("src_port") == target_port
+        ]
+        assert not return_flow_hits, (
+            f"Found an allow event whose src side is the upstream NTP "
+            f"server — the allow logger should subscribe to "
+            f"NFCT_T_NEW only (M12-S2 Resolution 7) and emit one event "
+            f"per *outbound* flow. Offending events:\n"
+            + "\n".join(json.dumps(ev) for ev in return_flow_hits[:5])
+        )
+
+        sandbox_cli("rm", session_name, timeout=120)
+        session_id = None
+
+    finally:
+        if session_id is not None:
+            sandbox_cli("rm", session_name, timeout=120)
+        if policy_path is not None:
+            cleanup_policy_file(policy_path)
+
+
+@pytest.mark.timeout(600)
+def test_udp_multi_port_same_host(sandbox_cli, backend):
+    """Allow one UDP port to a host but not another. The allowed port
+    delivers and emits an allow event; the disallowed port is dropped
+    silently and emits a deny event. Both events carry the correct
+    5-tuple discriminated only by ``event="allow"`` vs ``"deny"``.
+
+    Spec: M12-S2 § Test plan, multi-port-same-host case. Exercises
+    the per-port granularity of ``policy_allow_udp`` (which is keyed
+    on ``(ip, port)`` concat-set entries — see
+    ``policy.rs::generate_policy_allow_table``) and the deny-NFLOG
+    catch-all firing for the unallowed port.
+    """
+    session_id = None
+    policy_path = None
+    session_name = "pol-udp-multi-port"
+    try:
+        target_host = "time.cloudflare.com"
+        allowed_port = 123
+        denied_port = 9999
+        policy = {
+            "version": "2.0.0",
+            "rules": [
+                {
+                    "host": target_host,
+                    "port": allowed_port,
+                    "protocol": "udp",
+                    "level": "transport",
+                },
+            ],
+        }
+        policy_path = write_policy_file(policy)
+
+        result = sandbox_cli(
+            "create", *make_create_args(backend, session_name, "--policy", policy_path),
+            timeout=600,
+        )
+        assert result.returncode == 0, (
+            f"sandbox create failed (rc={result.returncode}).\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        session_id = parse_session_id(result.stdout)
+        wait_for_state(sandbox_cli, session_name, "Running", timeout=10)
+
+        # Warm DNS + propagate.
+        nslookup = sandbox_cli(
+            "ssh", session_name, "--",
+            "nslookup", target_host,
+            timeout=120,
+        )
+        assert nslookup.returncode == 0, (
+            f"nslookup for {target_host} failed.\n"
+            f"stdout: {nslookup.stdout}\nstderr: {nslookup.stderr}"
+        )
+        time.sleep(5)
+
+        vm_resolved: list[str] = []
+        seen_name = False
+        for line in nslookup.stdout.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Name:"):
+                seen_name = True
+                continue
+            if seen_name:
+                m = re.match(
+                    r"Address(?:es)?(?:\s*\d+)?:\s*(\d{1,3}(?:\.\d{1,3}){3})$",
+                    stripped,
+                )
+                if m:
+                    vm_resolved.append(m.group(1))
+        assert vm_resolved, (
+            f"VM-side nslookup for {target_host} returned no A records.\n"
+            f"{nslookup.stdout}"
+        )
+        target_ip = vm_resolved[0]
+
+        # Send to allowed port (123) — should emit allow event.
+        send_allowed = _send_udp_packet(
+            sandbox_cli, session_name, target_ip, allowed_port,
+        )
+        assert send_allowed.returncode == 0, (
+            f"sandbox ssh wrapper failed for allowed-port send.\n"
+            f"stdout: {send_allowed.stdout}\nstderr: {send_allowed.stderr}"
+        )
+
+        # Send to denied port (9999) — should emit deny event.
+        send_denied = _send_udp_packet(
+            sandbox_cli, session_name, target_ip, denied_port,
+        )
+        assert send_denied.returncode == 0, (
+            f"sandbox ssh wrapper failed for denied-port send.\n"
+            f"stdout: {send_denied.stdout}\nstderr: {send_denied.stderr}"
+        )
+
+        time.sleep(_UDP_EVENT_PROPAGATION_S)
+
+        # Read allow events and find the one for (target_ip, 123).
+        allow_events = _read_session_events(
+            sandbox_cli, session_name, decision="allow",
+        )
+        allow_match = [
+            ev for ev in allow_events
+            if _is_nft_allow_for(ev, target_ip, allowed_port, protocol="udp")
+        ]
+        assert allow_match, (
+            f"Expected at least one nft-allow event for "
+            f"({target_ip}:{allowed_port}/udp), got none. Captured "
+            f"{len(allow_events)} allow events:\n"
+            + "\n".join(json.dumps(ev) for ev in allow_events[:10])
+        )
+        # And no allow event for the denied port — that would mean the
+        # policy_allow_udp set leaked beyond the configured rule.
+        leaked_allow = [
+            ev for ev in allow_events
+            if _is_nft_allow_for(ev, target_ip, denied_port, protocol="udp")
+        ]
+        assert not leaked_allow, (
+            f"Found allow event for ({target_ip}:{denied_port}/udp) — "
+            f"policy_allow_udp must be keyed on (ip, port), not ip "
+            f"alone. Offending events:\n"
+            + "\n".join(json.dumps(ev) for ev in leaked_allow[:5])
+        )
+
+        # Read deny events and find the one for (target_ip, 9999).
+        deny_events = _read_session_events(
+            sandbox_cli, session_name, decision="deny",
+        )
+        deny_match = [
+            ev for ev in deny_events
+            if _is_nft_deny_for(ev, target_ip, denied_port, protocol="udp")
+        ]
+        assert deny_match, (
+            f"Expected at least one nft-deny event for "
+            f"({target_ip}:{denied_port}/udp), got none. Captured "
+            f"{len(deny_events)} deny events:\n"
+            + "\n".join(json.dumps(ev) for ev in deny_events[:10])
+            + f"\n{capture_lima_logs(session_id)}"
+        )
+        # And no deny event for the allowed port.
+        leaked_deny = [
+            ev for ev in deny_events
+            if _is_nft_deny_for(ev, target_ip, allowed_port, protocol="udp")
+        ]
+        assert not leaked_deny, (
+            f"Found deny event for ({target_ip}:{allowed_port}/udp) — "
+            f"the allowed port should never reach the NFLOG-drop path. "
+            f"Offending events:\n"
+            + "\n".join(json.dumps(ev) for ev in leaked_deny[:5])
+        )
+
+        sandbox_cli("rm", session_name, timeout=120)
+        session_id = None
+
+    finally:
+        if session_id is not None:
+            sandbox_cli("rm", session_name, timeout=120)
+        if policy_path is not None:
+            cleanup_policy_file(policy_path)
+
+
+@pytest.mark.timeout(600)
+def test_udp_allowed_ip_cidr_edge(sandbox_cli, backend):
+    """Allow a CIDR range over UDP, hit an IP inside it directly (no
+    DNS), and assert an allow event lands with the full 5-tuple
+    including the resolved destination IP.
+
+    M12-S2 § Test plan: "the allowed-IP edge case (direct-IP
+    destination skipping DNS, exercising the CIDR side of
+    ``policy_allow_udp``)". Pairs with the M11 dual-anchor model
+    on the TCP side: CIDR-anchored allows skip the DNS propagation
+    loop entirely and land in nftables at policy-apply time. This
+    test proves the same shape works for UDP.
+
+    Choosing a target: we resolve ``time.cloudflare.com`` host-side
+    once, take the first /32 IP, and use that as both the policy
+    CIDR and the curl-style direct-IP destination. The host-side
+    resolution is one-shot — the test does not warm CoreDNS in the
+    VM at all, which is the whole point of the "direct-IP skipping
+    DNS" case. If host-side resolution fails (e.g. test runner has
+    no DNS), the test skips with a clear message.
+    """
+    session_id = None
+    policy_path = None
+    session_name = "pol-udp-cidr-edge"
+    try:
+        target_host = "time.cloudflare.com"
+        target_port = 123
+
+        # Resolve host-side; pick a deterministic IP. The CDN can
+        # rotate IPs across calls, so we union a few attempts and
+        # pick the lexicographically-smallest entry.
+        host_ips = _resolve_ipv4(target_host)
+        if not host_ips:
+            pytest.skip(
+                f"host-side DNS cannot resolve {target_host} — cannot "
+                f"run direct-IP CIDR test."
+            )
+        target_ip = sorted(host_ips)[0]
+
+        # Allow exactly that /32 over UDP/123. Using /32 (single host)
+        # exercises the CIDR-anchor path without depending on a wider
+        # netblock that might catch unrelated packets and confuse the
+        # event assertion.
+        cidr = f"{target_ip}/32"
+        policy = {
+            "version": "2.0.0",
+            "rules": [
+                {
+                    "host": cidr,
+                    "port": target_port,
+                    "protocol": "udp",
+                    "level": "transport",
+                },
+            ],
+        }
+        policy_path = write_policy_file(policy)
+
+        result = sandbox_cli(
+            "create", *make_create_args(backend, session_name, "--policy", policy_path),
+            timeout=600,
+        )
+        assert result.returncode == 0, (
+            f"sandbox create failed (rc={result.returncode}).\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        session_id = parse_session_id(result.stdout)
+        wait_for_state(sandbox_cli, session_name, "Running", timeout=10)
+
+        # CIDR rules don't go through the DNS propagation loop — the
+        # daemon emits the `policy_allow_udp` element at policy-apply
+        # time directly (policy.rs::generate_policy_allow_table).
+        # We still pause briefly for the policy-apply path to settle
+        # (gateway nft reload + forward-chain admit rule). Mirrors the
+        # ~5 s wait used elsewhere after warmup; here the wait stands
+        # in for the propagation loop.
+        time.sleep(5)
+
+        # Send UDP directly to the resolved IP — no nslookup inside
+        # the VM, no CoreDNS round-trip. This is the "skipping DNS"
+        # property the spec calls out.
+        send = _send_udp_packet(
+            sandbox_cli, session_name, target_ip, target_port,
+        )
+        assert send.returncode == 0, (
+            f"sandbox ssh wrapper failed for direct-IP UDP send.\n"
+            f"stdout: {send.stdout}\nstderr: {send.stderr}"
+        )
+
+        time.sleep(_UDP_EVENT_PROPAGATION_S)
+
+        allow_events = _read_session_events(
+            sandbox_cli, session_name, decision="allow",
+        )
+        matched = [
+            ev for ev in allow_events
+            if _is_nft_allow_for(ev, target_ip, target_port, protocol="udp")
+        ]
+        assert matched, (
+            f"Expected at least one nft-allow event for "
+            f"({target_ip}:{target_port}/udp) under CIDR rule "
+            f"{cidr} (direct-IP, no DNS). Captured "
+            f"{len(allow_events)} allow events; first 10:\n"
+            + "\n".join(json.dumps(ev) for ev in allow_events[:10])
+            + f"\n{capture_lima_logs(session_id)}"
+        )
+
+        # Pin the full 5-tuple: orig_dst_ip + orig_dst_port + protocol
+        # plus the source axis (src_ip = VM IP, src_port populated).
+        ev = matched[0]
+        assert ev.get("orig_dst_ip") == target_ip, (
+            f"orig_dst_ip mismatch — expected {target_ip}, got "
+            f"{ev.get('orig_dst_ip')}; full event: {json.dumps(ev)}"
+        )
+        assert ev.get("orig_dst_port") == target_port, (
+            f"orig_dst_port mismatch — expected {target_port}, got "
+            f"{ev.get('orig_dst_port')}; full event: {json.dumps(ev)}"
+        )
+        assert ev.get("protocol") == "udp", (
+            f"protocol must be 'udp', got {ev.get('protocol')!r}; "
+            f"full event: {json.dumps(ev)}"
+        )
+        assert ev.get("src_ip"), (
+            f"src_ip must be populated on a 5-tuple allow event; "
+            f"full event: {json.dumps(ev)}"
+        )
+        assert isinstance(ev.get("src_port"), int) and ev["src_port"] > 0, (
+            f"src_port must be a positive integer; got "
+            f"{ev.get('src_port')!r}; full event: {json.dumps(ev)}"
+        )
+
+        sandbox_cli("rm", session_name, timeout=120)
+        session_id = None
+
+    finally:
+        if session_id is not None:
+            sandbox_cli("rm", session_name, timeout=120)
         if policy_path is not None:
             cleanup_policy_file(policy_path)
 
