@@ -49,7 +49,25 @@ use sandbox_event_emitter::{Admit, DenyRecord, EventEmitter, Protocol, RateCap};
 /// callers pass a value at least as large as `conn_cap` so over-cap
 /// connections always reach `accept()` (and are then RST-closed by
 /// the over-cap path) instead of being kernel-dropped at the SYN.
-pub async fn bind(bind_ip: Ipv4Addr, port: u16, backlog: i32) -> io::Result<TcpListener> {
+///
+/// # Why the `u32` signature (and the clamp)
+///
+/// The underlying `socket2::Socket::listen` takes `c_int` (i.e. `i32`),
+/// matching libc's `listen(2)` prototype. Backlogs are conceptually
+/// non-negative, so the wrapper exposes `u32` to keep the conversion
+/// next to the syscall and prevent each caller from re-deriving the
+/// clamp. Values above `i32::MAX` saturate to `i32::MAX`; in practice
+/// production callers pass `conn_cap * 4` (a few thousand at most) so
+/// the saturation branch is unreachable, but encoding it here means
+/// callers never need a `try_into().expect(...)` next to a `bind` call.
+pub async fn bind(bind_ip: Ipv4Addr, port: u16, backlog: u32) -> io::Result<TcpListener> {
+    // `socket2::Socket::listen` takes `c_int` (`i32`), so saturate the
+    // `u32` argument here. `i32::MAX` is far above any realistic
+    // `SOMAXCONN`, so the clamp is a type-system formality rather than
+    // a real ceiling; capturing it here keeps every caller free of a
+    // hand-rolled `try_into().expect(...)`.
+    let backlog_i32: i32 = backlog.min(i32::MAX as u32) as i32;
+
     // Build a non-blocking IPv4 stream socket via socket2, then
     // `listen(backlog)` with the explicit backlog so the kernel
     // pre-allocates the accept queue we need. The standard upgrade
@@ -62,7 +80,7 @@ pub async fn bind(bind_ip: Ipv4Addr, port: u16, backlog: i32) -> io::Result<TcpL
     sock.set_nonblocking(true)?;
     let addr: SocketAddr = SocketAddr::V4(SocketAddrV4::new(bind_ip, port));
     sock.bind(&addr.into())?;
-    sock.listen(backlog)?;
+    sock.listen(backlog_i32)?;
     let std_listener: std::net::TcpListener = sock.into();
     TcpListener::from_std(std_listener)
 }
@@ -287,7 +305,7 @@ mod tests {
         // Backlog 128 is plenty for a single-client emit-and-RST test;
         // production callers compute backlog from `conn_cap` (see
         // `main.rs`).
-        let listener = bind(Ipv4Addr::LOCALHOST, 0, 128).await.unwrap();
+        let listener = bind(Ipv4Addr::LOCALHOST, 0, 128u32).await.unwrap();
         let local = listener.local_addr().unwrap();
         let emit_for_task = Arc::clone(&emitter);
         let rate_cap_for_task = Arc::clone(&rate_cap);
@@ -424,7 +442,7 @@ mod tests {
         // 4× headroom: the kernel's accept queue holds the entire
         // burst comfortably even in the worst case where every
         // connection arrives before the server's accept loop runs.
-        const BACKLOG: i32 = (BURST * 4) as i32;
+        const BACKLOG: u32 = (BURST * 4) as u32;
 
         let listener = bind(Ipv4Addr::LOCALHOST, 0, BACKLOG).await.unwrap();
         let local = listener.local_addr().unwrap();
@@ -462,6 +480,9 @@ mod tests {
 
         // Give the server time to accept and emit / record drops.
         tokio::time::sleep(Duration::from_millis(300)).await;
+        // `outcomes` is held until here so admitted streams survive the
+        // 300ms drain window above; dropping earlier truncates in-flight
+        // server responses and would invalidate the conservation count.
         drop(outcomes);
 
         // Cross the 1s rate-cap window so the summary flushes — the

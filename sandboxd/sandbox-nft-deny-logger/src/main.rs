@@ -162,10 +162,9 @@ async fn run(args: Args) -> std::io::Result<()> {
     ));
 
     // Pin the kernel accept-queue backlog to a multiple of `conn_cap`.
-    let tcp_backlog: i32 = (args.conn_cap.saturating_mul(4))
-        .min(i32::MAX as u32)
-        .try_into()
-        .expect("backlog fits in i32 after .min(i32::MAX as u32)");
+    // `tcp::bind` takes `u32` and clamps to `i32::MAX` internally, so
+    // `saturating_mul` is the only conversion the caller has to do.
+    let tcp_backlog: u32 = args.conn_cap.saturating_mul(4);
     let tcp_listener = tcp::bind(args.bind_ip, args.tcp_port, tcp_backlog).await?;
     tracing::info!(
         port = args.tcp_port,
