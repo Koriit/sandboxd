@@ -1683,6 +1683,7 @@ mod tests {
             boot_cmd: None,
             template: None,
             disk_gb: None,
+            no_cache: None,
         };
 
         let err = rt
@@ -1717,6 +1718,7 @@ mod tests {
             boot_cmd: None,
             template: None,
             disk_gb: None,
+            no_cache: None,
         };
         let (mem, cpus) = rt.resource_ceilings(&spec_zero).unwrap();
         assert_eq!(mem, 2048, "0 → default_memory_mb");
@@ -1732,6 +1734,7 @@ mod tests {
             boot_cmd: None,
             template: None,
             disk_gb: None,
+            no_cache: None,
         };
         let (mem, cpus) = rt.resource_ceilings(&spec_explicit).unwrap();
         assert_eq!(mem, 4096);
@@ -1751,6 +1754,7 @@ mod tests {
             boot_cmd: None,
             template: None,
             disk_gb: None,
+            no_cache: None,
         };
         let (_mem, cpus) = rt.resource_ceilings(&spec_fractional).unwrap();
         assert!(

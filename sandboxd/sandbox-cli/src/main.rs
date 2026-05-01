@@ -3993,6 +3993,13 @@ async fn dispatch_create_preflight(
         boot_cmd: None,
         template: None,
         disk_gb: None,
+        // The CLI runs its own dedicated `--no-cache`/Container reject
+        // (`render_no_cache_rejection_for_container`) before this
+        // `SessionSpec::validate` call, so threading the value through
+        // here would only duplicate that gate. Leave the spec field as
+        // `None` — the daemon-side validate does the authoritative
+        // check via the request's `no_cache` field (M12-S4 todo #95).
+        no_cache: None,
     };
 
     if let Err(unsupported) = spec.validate(&caps) {

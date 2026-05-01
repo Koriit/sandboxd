@@ -669,9 +669,18 @@ fn runtime_for(state: &AppState, kind: BackendKind) -> Arc<dyn SessionRuntime> {
 /// 1-decimal value the operator supplied), falling back to the
 /// integer [`SessionConfig::cpus`] otherwise. The Lima variant always
 /// projects the integer field — Lima/QEMU pin whole cores.
+///
+/// `no_cache` is taken from the request rather than the persisted
+/// config because it is a per-invocation flag (skip the cached fast
+/// path) rather than a session-shape field — `SessionConfig` does not
+/// carry it, the daemon consumes it once at create time. Threading
+/// it through the projection lets `SessionSpec::validate` reject
+/// `--no-cache` on backends whose `per_session_no_cache` capability
+/// is `false` (M12-S4 todo #95).
 fn session_spec_from_config(
     config: &SessionConfig,
     kind: BackendKind,
+    no_cache: Option<bool>,
 ) -> sandbox_core::SessionSpec {
     let backend_specific = match kind {
         BackendKind::Lima => sandbox_core::BackendSpecific::Lima {
@@ -691,6 +700,7 @@ fn session_spec_from_config(
         boot_cmd: config.boot_cmd.clone(),
         template: config.template.clone(),
         disk_gb: Some(config.disk_gb),
+        no_cache,
     }
 }
 
@@ -891,11 +901,32 @@ async fn create_session(
         BackendKind::Container => req.memory_mb.unwrap_or(0),
     };
     let cpus_decimal_request = req.cpus;
+    // M12-S4 todo #81: reject fractional `--cpus` for Lima sessions at
+    // the daemon boundary. QEMU's `-smp` flag (and the Lima YAML it
+    // generates) only accepts whole-number cores; the prior `as u32`
+    // truncation silently downsized a `1.5` request to `1`, which is
+    // invisible to non-CLI HTTP clients. The CLI never sends a
+    // fractional value on the Lima path (clap parses `--cpus` as
+    // `f32` but the resolver enforces integer-shape semantics
+    // upstream), so this gate fires only on hand-rolled HTTP clients
+    // that bypass the CLI. `SessionDto.warnings` is reserved for
+    // post-success operator notices (e.g. lite-image first-use),
+    // not for masking malformed sizing requests — so we hard-reject
+    // with HTTP 400 to mirror the spec § "Validation sites" pattern
+    // already used by `--hardened` on the container backend.
+    if backend_kind == BackendKind::Lima && cpus_decimal_request.is_some_and(|c| c.fract() != 0.0) {
+        return error_response(SandboxError::InvalidArgument(
+            "Lima sessions require integer --cpus values (QEMU's -smp flag pins whole cores); \
+             use the container backend for fractional CPU sizing"
+                .into(),
+        ))
+        .into_response();
+    }
     let (cpus_persisted, cpus_decimal) = match backend_kind {
         BackendKind::Lima => {
-            // QEMU pins integer cores; ignore any sub-integer portion
-            // the operator passed and persist the integer ceiling
-            // unchanged.
+            // QEMU pins integer cores; the fractional-rejection gate
+            // above guarantees the value is integer-shaped here, so
+            // the `as u32` cast is precision-preserving.
             let cpus = cpus_decimal_request.map(|c| c as u32).unwrap_or(2);
             (cpus, None)
         }
@@ -966,8 +997,11 @@ async fn create_session(
     // Daemon-side authoritative validation: spec § "Validation sites"
     // requires the daemon to repeat the capability check the CLI did.
     // The runtime is the single source of truth for its capability
-    // matrix.
-    let spec = session_spec_from_config(&config, backend_kind);
+    // matrix. M12-S4 todo #95 threads `req.no_cache` through the spec
+    // projection so a non-CLI HTTP client posting
+    // `{"backend":"container","no_cache":true}` is refused by
+    // `SessionSpec::validate` rather than silently honoured.
+    let spec = session_spec_from_config(&config, backend_kind, req.no_cache);
     let runtime_for_validation = runtime_for(&state, backend_kind);
     if let Err(unsupported) = spec.validate(runtime_for_validation.capabilities()) {
         // `UnsupportedFeature: Display` produces the operator-facing

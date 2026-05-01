@@ -698,6 +698,7 @@ mod tests {
             boot_cmd: None,
             template: None,
             disk_gb: None,
+            no_cache: None,
         };
 
         let err = rt

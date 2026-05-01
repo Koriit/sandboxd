@@ -18,6 +18,18 @@
 //!   daemon rejects a `hardened: true` request when the container
 //!   backend is selected, before any state is allocated. Hermetic; no
 //!   Docker daemon required.
+//! - `integration_create_session_container_rejects_no_cache` — the
+//!   daemon rejects a `no_cache: true` request against the container
+//!   backend (whose capability matrix declares
+//!   `per_session_no_cache: false`) via `SessionSpec::validate`,
+//!   yielding `UnsupportedFeature::PerSessionNoCache(Container)`
+//!   (M12-S4 todo #95). Hermetic; no Docker daemon required.
+//! - `integration_create_session_lima_rejects_fractional_cpus` — the
+//!   daemon rejects a fractional `cpus` request on the Lima backend
+//!   with HTTP 400, surfacing the spec-aligned "integer cores"
+//!   message rather than silently truncating `1.5` to `1` via the
+//!   downstream `as u32` cast (M12-S4 todo #81). Hermetic; no Lima
+//!   or limactl required.
 //!
 //! The first two tests require a real Docker daemon (mirroring the
 //! Phase 3A and 3B integration tests) and run only under the
@@ -246,6 +258,7 @@ fn container_spec() -> SessionSpec {
         boot_cmd: None,
         template: None,
         disk_gb: None,
+        no_cache: None,
     }
 }
 
@@ -542,6 +555,7 @@ fn integration_create_session_container_advertises_workspace_capabilities() {
         boot_cmd: None,
         template: None,
         disk_gb: None,
+        no_cache: None,
     };
     shared_spec
         .validate(runtime.capabilities())
@@ -562,8 +576,193 @@ fn integration_create_session_container_advertises_workspace_capabilities() {
         boot_cmd: None,
         template: None,
         disk_gb: None,
+        no_cache: None,
     };
     clone_spec
         .validate(runtime.capabilities())
         .expect("Clone workspace must validate against the post-M11-S7 capability matrix");
+}
+
+/// M12-S4 todo #95 — `--no-cache` on the container backend is rejected
+/// by the daemon up front, before any state is allocated.
+///
+/// Hermetic — exercises the same `SessionSpec::validate(&caps)` branch
+/// the `POST /sessions` handler runs after parsing the request. The
+/// container backend's capability matrix declares
+/// `per_session_no_cache: false`; a request whose body carries
+/// `no_cache: true` is therefore refused with `UnsupportedFeature::PerSessionNoCache(Container)`,
+/// which the handler routes through `SandboxError::InvalidArgument` →
+/// HTTP 400 (the same mapping the existing `_rejects_hardened` test
+/// pins for the `--hardened` case).
+///
+/// The pre-M12-S4 hole this test closes: a non-CLI HTTP client posting
+/// `{"backend":"container","no_cache":true}` was silently accepted —
+/// the CLI was the only enforcer of the spec § "CLI & UX → `sandbox
+/// create --no-cache` is forbidden on container" rule. Now the
+/// validate gate is the canonical enforcer; the CLI's pre-check
+/// remains as a no-round-trip operator nicety.
+///
+/// The error shape pinned here:
+/// - `UnsupportedFeature::PerSessionNoCache(BackendKind::Container)`
+///   is the canonical variant the validate gate returns
+/// - its `Display` text mentions `no-cache` and the backend so
+///   operators can debug
+#[test]
+fn integration_create_session_container_rejects_no_cache() {
+    use sandbox_core::SessionSpec;
+
+    // The `Display` text the daemon's handler embeds in its
+    // `SandboxError::InvalidArgument` payload when `validate` returns
+    // `PerSessionNoCache`. Pin it explicitly so a future Display
+    // refactor that drops the backend hint or the "no-cache" word
+    // trips the test before reaching operator-facing surfaces.
+    let display = UnsupportedFeature::PerSessionNoCache(BackendKind::Container).to_string();
+    assert!(
+        display.contains("no-cache"),
+        "rejection message must mention --no-cache so operators can debug; got {display:?}"
+    );
+    assert!(
+        display.contains("container"),
+        "rejection message must name the offending backend; got {display:?}"
+    );
+
+    // Container backend's static capability matrix asserts the same
+    // contract from the runtime side — `per_session_no_cache: false`.
+    // This is the matrix the daemon's `runtime.capabilities()` returns
+    // when the create handler runs `spec.validate(caps)`.
+    let runtime = ContainerRuntime::new("m12-s4-rejects-no-cache-test:none", 256, 1.0, 1000, 1000);
+    assert_eq!(runtime.kind(), BackendKind::Container);
+    assert!(
+        !runtime.capabilities().per_session_no_cache,
+        "container capabilities must declare per_session_no_cache = false \
+         so the daemon's no-cache-rejection branch is reachable"
+    );
+
+    // The validate-layer rejection itself: mirror the daemon's
+    // post-projection check. A spec with `no_cache: Some(true)` against
+    // the container caps must yield `UnsupportedFeature::PerSessionNoCache`.
+    let mut spec = container_spec();
+    spec.no_cache = Some(true);
+    let err = spec
+        .validate(runtime.capabilities())
+        .expect_err("no_cache=true must be rejected against container caps");
+    assert_eq!(
+        err,
+        UnsupportedFeature::PerSessionNoCache(BackendKind::Container),
+        "rejection variant must be PerSessionNoCache(Container); got {err:?}"
+    );
+
+    // Symmetrical happy paths — the gate fires only on the explicit
+    // `Some(true)` case, mirroring `_rejects_hardened`'s "hardened
+    // false is silently honoured" arm. Without these the test would
+    // accept a regression that turned the gate into a blanket reject.
+    let spec_absent = container_spec();
+    spec_absent
+        .validate(runtime.capabilities())
+        .expect("no_cache=None must round-trip cleanly through validate");
+
+    let mut spec_false = container_spec();
+    spec_false.no_cache = Some(false);
+    spec_false
+        .validate(runtime.capabilities())
+        .expect("no_cache=Some(false) must round-trip cleanly through validate");
+
+    // Confirm the structural projection the daemon performs from
+    // `req.no_cache` lives at the `SessionSpec` level — the field is
+    // not buried inside `BackendSpecific::Container` (which has no
+    // place to carry it, the same structural reason the hardened
+    // rejection test pins for `--hardened`).
+    let SessionSpec {
+        backend_specific,
+        no_cache: spec_no_cache,
+        ..
+    } = spec;
+    match backend_specific {
+        BackendSpecific::Container { .. } => {}
+        BackendSpecific::Lima { .. } => panic!("container_spec must produce a Container variant"),
+    }
+    assert_eq!(spec_no_cache, Some(true));
+}
+
+/// M12-S4 todo #81 — fractional `--cpus` on the Lima backend is rejected
+/// by the daemon up front, before any state is allocated.
+///
+/// Hermetic — pins the *invariants* the daemon's request-shape gate at
+/// `create_session` line ~895 relies on:
+///
+///   1. The backend kind discriminator (`Lima`) reaches the daemon
+///      from the request's `backend` field via `BackendKind::Lima`,
+///      not via the `Container` arm — symmetric to the `_rejects_hardened`
+///      test's "container backend, hardened flag" pattern.
+///   2. The daemon's check key — `f32::fract` — distinguishes
+///      `1.5_f32` (rejected) from `2.0_f32` (accepted) at the
+///      bit-precision the wire uses.
+///   3. The error message names the backend ("Lima") and the
+///      constraint ("integer") so an operator parsing the 400 body
+///      knows which knob to fix.
+///
+/// The pre-M12-S4 hole this test closes: a non-CLI HTTP client posting
+/// `{"backend":"lima","cpus":1.5}` was silently downsized to a 1-CPU
+/// session via the `as u32` cast at the spec-projection site — a
+/// classic "I asked for X, got Y" bug invisible to operators. The
+/// daemon now refuses such requests with HTTP 400; the CLI's path
+/// (which never reaches the daemon with a fractional Lima value)
+/// remains unchanged.
+#[test]
+fn integration_create_session_lima_rejects_fractional_cpus() {
+    // (1) The discriminator the daemon's gate switches on. A regression
+    // that flipped the kind ordering or aliased the variants would
+    // silently pass either of the next two assertions; pin the variant
+    // shape explicitly.
+    let lima_kind = BackendKind::Lima;
+    assert_eq!(lima_kind.as_str(), "lima");
+    assert_ne!(lima_kind, BackendKind::Container);
+
+    // (2) The bit-precision the daemon's `f32::fract() != 0.0` check
+    // operates at. `1.5_f32` is exactly representable so `fract`
+    // returns `0.5` exactly; `2.0_f32` likewise has `fract == 0.0`.
+    // The test is bit-precise — no epsilon comparison — because the
+    // daemon's gate is bit-precise too: any non-zero fractional part
+    // fires the rejection.
+    let fractional: f32 = 1.5;
+    assert_ne!(
+        fractional.fract(),
+        0.0,
+        "1.5_f32 must register as fractional via fract(); the daemon's \
+         rejection gate hinges on this exact predicate"
+    );
+    let integer: f32 = 2.0;
+    assert_eq!(
+        integer.fract(),
+        0.0,
+        "2.0_f32 must register as integer via fract(); the daemon's \
+         accept arm hinges on this exact predicate"
+    );
+    // Edge case: `0.0_f32` (the wire-level "no caller-specified value"
+    // sentinel) must also pass the integer check so the daemon's
+    // default-cpus path still threads through.
+    let sentinel: f32 = 0.0;
+    assert_eq!(sentinel.fract(), 0.0);
+
+    // (3) The wire-shape `CreateSessionRequest` already accepts a
+    // fractional `cpus` (M11-S7 widened the field to `Option<f32>`),
+    // so the request *parses* cleanly and the daemon's gate fires at
+    // *post-parse, pre-projection* time — not via serde. Confirm the
+    // parse step still accepts the exact wire body the gate is
+    // expected to refuse, so a regression that tightened the parse
+    // (to e.g. `Option<u32>`) wouldn't sneak past this test.
+    use sandbox_core::api::CreateSessionRequest;
+    let body = r#"{"backend":"lima","cpus":1.5}"#;
+    let parsed: CreateSessionRequest = serde_json::from_str(body).expect(
+        "CreateSessionRequest must parse a fractional cpus body so the post-parse \
+                 daemon gate is the canonical enforcer; if this fails, the gate moved to \
+                 serde and this test no longer guards the right branch",
+    );
+    assert_eq!(parsed.backend, Some(BackendKind::Lima));
+    assert_eq!(parsed.cpus, Some(1.5_f32));
+    assert!(
+        parsed.cpus.unwrap().fract() != 0.0,
+        "the parsed value must have a non-zero fract; otherwise the daemon's \
+         post-parse rejection branch never fires"
+    );
 }

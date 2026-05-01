@@ -129,6 +129,19 @@ pub struct SessionSpec {
     /// [`SessionSpec`] level for forward-compat per CLAUDE.md.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_gb: Option<u32>,
+    /// Operator opt-in to bypass the per-backend image cache (Lima:
+    /// skip the golden-image clone fast path and rebuild from scratch;
+    /// the container backend rejects the flag entirely via its
+    /// capability matrix). `Some(true)` is the wire-level signal of an
+    /// explicit `--no-cache` invocation; `None` and `Some(false)` are
+    /// equivalent and request the cached fast path.
+    ///
+    /// Validated against [`Capabilities::per_session_no_cache`] in
+    /// [`SessionSpec::validate`] — a `Some(true)` value against a
+    /// backend whose capability flag is `false` yields
+    /// [`UnsupportedFeature::PerSessionNoCache`]. M12-S4 todo #95.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_cache: Option<bool>,
     // Forward-compat: new fields go here as Option<T> with
     // #[serde(default)].
 }
@@ -174,11 +187,16 @@ impl SessionSpec {
             }
         }
 
-        // PerSessionNoCache: not validatable from Phase 1A SessionSpec.
-        // TODO(M11-S4): once SessionSpec carries `no_cache`, return
-        // Err(UnsupportedFeature::PerSessionNoCache(caps.kind)) when
-        // requested against a backend whose caps.per_session_no_cache
-        // is false.
+        // PerSessionNoCache: M12-S4 todo #95 — reject `--no-cache`
+        // (`no_cache: Some(true)`) against a backend whose capability
+        // matrix declares `per_session_no_cache: false`. The CLI
+        // pre-checks the same condition (`render_no_cache_rejection_for_container`)
+        // so a hand-rolled HTTP client cannot bypass the gate. An
+        // absent flag (`None`) and an explicit `Some(false)` are both
+        // honoured silently — the cached fast path is the default.
+        if matches!(self.no_cache, Some(true)) && !caps.per_session_no_cache {
+            return Err(UnsupportedFeature::PerSessionNoCache(caps.kind));
+        }
 
         Ok(())
     }
@@ -242,6 +260,7 @@ mod tests {
             boot_cmd: None,
             template: None,
             disk_gb: None,
+            no_cache: None,
         }
     }
 
@@ -256,6 +275,7 @@ mod tests {
             boot_cmd: None,
             template: None,
             disk_gb: None,
+            no_cache: None,
         }
     }
 
@@ -409,6 +429,10 @@ mod tests {
         assert!(parsed.boot_cmd.is_none());
         assert!(parsed.template.is_none());
         assert!(parsed.disk_gb.is_none());
+        // M12-S4 todo #95: pre-no_cache records must round-trip with
+        // `None` so the validate gate's "absent flag = cached fast
+        // path" semantics hold for legacy daemons rolling forward.
+        assert!(parsed.no_cache.is_none());
     }
 
     /// `SessionSpec::backend()` is a thin wrapper over
@@ -492,15 +516,56 @@ mod tests {
             .expect("clone is in the caps set");
     }
 
-    // PerSessionNoCache: not reachable from Phase 1A SessionSpec —
-    // SessionSpec does not yet carry a `no_cache` field. Wired up in
-    // M11-S4 ("--no-cache" flag). When that lands, add a test akin
-    // to:
-    //
-    //   #[test]
-    //   fn validate_rejects_per_session_no_cache_when_caps_disable_it() {
-    //       let spec = container_spec_with_no_cache(true);
-    //       let err = spec.validate(&container_caps_clone_only()).unwrap_err();
-    //       assert_eq!(err, UnsupportedFeature::PerSessionNoCache(BackendKind::Container));
-    //   }
+    /// M12-S4 todo #95 — `no_cache: Some(true)` against caps whose
+    /// `per_session_no_cache` flag is `false` yields the right
+    /// `UnsupportedFeature::PerSessionNoCache(backend)` pair. Mirrors
+    /// the `validate_rejects_hardening_when_caps_disable_it` shape:
+    /// a request-shape rejection rendered *before* any state mutation.
+    #[test]
+    fn validate_rejects_per_session_no_cache_when_caps_disable_it() {
+        let mut spec = container_spec(None);
+        spec.no_cache = Some(true);
+
+        let err = spec
+            .validate(&container_caps_clone_only())
+            .expect_err("no_cache=true must be rejected when per_session_no_cache is false");
+        assert_eq!(
+            err,
+            UnsupportedFeature::PerSessionNoCache(BackendKind::Container)
+        );
+    }
+
+    /// `no_cache: Some(true)` against caps whose `per_session_no_cache`
+    /// is `true` (the Lima default) is honoured silently. Symmetrical
+    /// to `validate_lima_with_hardening_succeeds`.
+    #[test]
+    fn validate_accepts_no_cache_when_caps_enable_it() {
+        let mut spec = lima_spec(false, None);
+        spec.no_cache = Some(true);
+
+        spec.validate(&lima_caps())
+            .expect("Lima caps advertise per_session_no_cache=true");
+    }
+
+    /// An absent (`None`) or explicit `Some(false)` `no_cache` against
+    /// caps whose flag is `false` is honoured — the validation gate
+    /// only fires for the explicit-opt-in case. Mirrors
+    /// `validate_allows_unhardened_lima_against_unhardened_caps`.
+    #[test]
+    fn validate_allows_absent_or_false_no_cache_against_unsupported_caps() {
+        // Absent: the most common shape (operator did not pass
+        // `--no-cache`).
+        let spec_absent = container_spec(None);
+        spec_absent
+            .validate(&container_caps_clone_only())
+            .expect("no_cache=None must not be rejected");
+
+        // Explicit-false: a CLI that always sends the flag (even when
+        // unset) round-trips identically to the absent shape.
+        let mut spec_false = container_spec(None);
+        spec_false.no_cache = Some(false);
+        spec_false
+            .validate(&container_caps_clone_only())
+            .expect("no_cache=Some(false) must not be rejected");
+    }
 }

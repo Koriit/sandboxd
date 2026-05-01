@@ -91,6 +91,7 @@ async fn integration_lima_runtime_lifecycle() {
         boot_cmd: None,
         template: None,
         disk_gb: Some(10),
+        no_cache: None,
     };
 
     // create() returns the canonical sandbox-{session_id} handle and
@@ -181,6 +182,7 @@ async fn integration_lima_transport_socat_smoke() {
         boot_cmd: None,
         template: None,
         disk_gb: Some(10),
+        no_cache: None,
     };
 
     runtime

@@ -199,6 +199,7 @@ fn container_spec() -> SessionSpec {
         boot_cmd: None,
         template: None,
         disk_gb: None,
+        no_cache: None,
     }
 }
 
