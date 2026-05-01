@@ -376,12 +376,8 @@ async fn integration_sync_rejects_both_sides_remote() {
     let shim_dir = tempfile::tempdir().expect("shim dir");
     // No shim binaries needed — we should never reach a subprocess.
 
-    let (status, _stdout, stderr) = run_sandbox_sync(
-        &["a:foo", "b:bar"],
-        &sock,
-        shim_dir.path(),
-    )
-    .await;
+    let (status, _stdout, stderr) =
+        run_sandbox_sync(&["a:foo", "b:bar"], &sock, shim_dir.path()).await;
 
     assert_eq!(
         status.code(),
@@ -395,6 +391,56 @@ async fn integration_sync_rejects_both_sides_remote() {
     );
 }
 
+/// Trailing rsync flags (everything after `--`) are spliced between
+/// the baseline `-a --delete -e <shell>` and the source/destination
+/// operands, matching rsync's `[OPTION...] SRC... [DEST]` synopsis.
+/// Pins both the layout and the literal preservation of multi-token
+/// flag values like `--exclude '*.log'`.
+#[tokio::test]
+async fn integration_sync_lima_passes_through_trailing_rsync_flags() {
+    let (_tmp_daemon, sock) = spawn_fake_daemon("lima").await;
+    let shim_dir = tempfile::tempdir().expect("shim dir");
+    let record_file = shim_dir.path().join("argv.log");
+    install_shim(shim_dir.path(), "rsync", &record_file, 0, None);
+
+    let (status, _stdout, stderr) = run_sandbox_sync(
+        &[
+            "./local/dir",
+            "sync-dispatch-test:/home/agent/workspace/dir",
+            "--",
+            "--exclude",
+            "*.log",
+            "--info=progress2",
+        ],
+        &sock,
+        shim_dir.path(),
+    )
+    .await;
+
+    assert!(
+        status.success(),
+        "sandbox sync with trailing flags should succeed; status={:?}, stderr=\n{stderr}",
+        status.code()
+    );
+
+    let argv = read_recorded_argv(&record_file);
+    assert_eq!(
+        argv,
+        vec![
+            "-a".to_string(),
+            "--delete".to_string(),
+            "-e".to_string(),
+            "limactl shell".to_string(),
+            "--exclude".to_string(),
+            "*.log".to_string(),
+            "--info=progress2".to_string(),
+            "./local/dir".to_string(),
+            format!("sandbox-{TEST_SESSION_ID}:/home/agent/workspace/dir"),
+        ],
+        "trailing rsync flags must splice between baseline and operands"
+    );
+}
+
 /// Neither side prefixed with `session:` is also a misuse; the CLI
 /// emits the documented sync-shaped usage hint (referring to dirs,
 /// not files like cp does).
@@ -403,12 +449,8 @@ async fn integration_sync_rejects_no_remote_side() {
     let (_tmp_daemon, sock) = spawn_fake_daemon("lima").await;
     let shim_dir = tempfile::tempdir().expect("shim dir");
 
-    let (status, _stdout, stderr) = run_sandbox_sync(
-        &["./local/a", "./local/b"],
-        &sock,
-        shim_dir.path(),
-    )
-    .await;
+    let (status, _stdout, stderr) =
+        run_sandbox_sync(&["./local/a", "./local/b"], &sock, shim_dir.path()).await;
 
     assert_eq!(
         status.code(),

@@ -193,6 +193,13 @@ enum Command {
     ///   sandbox sync local/dir session:remote/dir   (upload)
     ///   sandbox sync session:remote/dir local/dir   (download)
     ///
+    /// Extra rsync flags can be passed after `--`, in which case they
+    /// are spliced after the baseline `-a --delete -e <shell>` and
+    /// before the source/destination operands. Examples: `--exclude
+    /// '*.log'`, `--bwlimit=1m`, `--partial`, `--info=progress2`. See
+    /// the [CLI reference](docs/reference/cli.md#sandbox-sync) for the
+    /// argv shape.
+    ///
     /// Requires `rsync` on both the host and inside the session image.
     /// The sandboxd-provisioned base images ship rsync; if you supply a
     /// custom image, install rsync yourself.
@@ -201,6 +208,13 @@ enum Command {
         src: String,
         /// Destination path (prefix with session: for VM paths).
         dst: String,
+        /// Extra rsync flags (everything after `--`). Spliced between
+        /// the baseline `-a --delete -e <shell>` and the source /
+        /// destination operands so users can layer pass-through flags
+        /// (`--exclude`, `--bwlimit`, `--partial`, `--info=progress2`,
+        /// etc.) without losing the safety baseline.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        rsync_args: Vec<String>,
     },
     /// Open an interactive SSH session (or run a command) in a sandbox.
     Ssh {
@@ -3264,8 +3278,8 @@ enum TransferDirection {
 /// session-targeting CLI commands share the same dispatch shape.
 ///
 /// **Why this exists.** Before M12-S7 `sandbox cp` chunked the file
-/// into base64 frames and pushed them through the daemon's
-/// `/upload` / `/download` HTTP endpoints, which in turn hit the
+/// into base64 frames and pushed them through daemon `/upload` /
+/// `/download` HTTP endpoints (since removed), which in turn hit the
 /// guest agent over TCP-over-SSH. That worked but glossed over
 /// edge cases the backend-native tools already handle: large files,
 /// sparse files, attribute preservation, directory recursion, and
@@ -3316,12 +3330,7 @@ fn plan_cp_command(
             // copies work transparently from the user's point of view;
             // for plain files `-r` is a no-op (scp recursion only
             // engages on directories).
-            let args = vec![
-                "cp".to_string(),
-                "-r".to_string(),
-                src_arg,
-                dst_arg,
-            ];
+            let args = vec!["cp".to_string(), "-r".to_string(), src_arg, dst_arg];
             ("limactl", args)
         }
         sandbox_core::backend::BackendKind::Container => {
@@ -3512,6 +3521,7 @@ fn plan_sync_command(
     direction: TransferDirection,
     host_path: &str,
     remote_path: &str,
+    extra_args: &[String],
 ) -> (&'static str, Vec<String>) {
     let target_name = format!("sandbox-{session_id}");
     let remote_arg = format!("{target_name}:{remote_path}");
@@ -3528,14 +3538,20 @@ fn plan_sync_command(
         sandbox_core::backend::BackendKind::Container => "docker exec -i",
     };
 
-    let args = vec![
+    // Argv layout: `[baseline flags] [pass-through flags] <src> <dst>`.
+    // rsync expects every flag to precede the file operands; splicing
+    // pass-through args between the baseline and operands keeps the
+    // operator-supplied flags in a position rsync accepts (man rsync(1)
+    // describes the synopsis as `rsync [OPTION...] SRC... [DEST]`).
+    let mut args = vec![
         "-a".to_string(),
         "--delete".to_string(),
         "-e".to_string(),
         rsh.to_string(),
-        src_arg,
-        dst_arg,
     ];
+    args.extend(extra_args.iter().cloned());
+    args.push(src_arg);
+    args.push(dst_arg);
     ("rsync", args)
 }
 
@@ -3544,7 +3560,7 @@ fn plan_sync_command(
 /// backend's native shell as the remote-shell (`-e`) transport. Mirrors
 /// the structure of `handle_cp` so the two commands have a single
 /// dispatch shape.
-async fn handle_sync(socket_path: &str, src: &str, dst: &str) {
+async fn handle_sync(socket_path: &str, src: &str, dst: &str, rsync_args: &[String]) {
     // Determine transfer direction by which side carries `session:`.
     let src_remote = parse_remote_spec(src);
     let dst_remote = parse_remote_spec(dst);
@@ -3614,6 +3630,7 @@ async fn handle_sync(socket_path: &str, src: &str, dst: &str) {
         direction,
         host_path,
         remote_path,
+        rsync_args,
     );
 
     // Inherit stdin/stdout/stderr so rsync's progress and error
@@ -4226,8 +4243,13 @@ async fn main() {
     // Handle sync specially — same dispatch shape as cp, but the
     // subprocess is `rsync` with the backend's native shell as the
     // remote-shell transport (`-e` slot).
-    if let Command::Sync { src, dst } = &cli.command {
-        handle_sync(&cli.socket, src, dst).await;
+    if let Command::Sync {
+        src,
+        dst,
+        rsync_args,
+    } = &cli.command
+    {
+        handle_sync(&cli.socket, src, dst, rsync_args).await;
         return;
     }
 
@@ -7233,13 +7255,8 @@ mod tests {
             sandbox_core::backend::BackendKind::Lima,
             sandbox_core::backend::BackendKind::Container,
         ] {
-            let (_, args) = plan_cp_command(
-                backend,
-                &sid,
-                TransferDirection::Upload,
-                "/tmp/x",
-                "/tmp/x",
-            );
+            let (_, args) =
+                plan_cp_command(backend, &sid, TransferDirection::Upload, "/tmp/x", "/tmp/x");
             // Find the argument that contains the colon — that's the
             // remote-side spec.
             let remote_arg = args
@@ -7271,6 +7288,7 @@ mod tests {
             TransferDirection::Upload,
             "./local/dir",
             "/home/agent/workspace/dir",
+            &[],
         );
         assert_eq!(program, "rsync");
         // `-a --delete` is the baseline. `-e 'limactl shell'` slots
@@ -7299,6 +7317,7 @@ mod tests {
             TransferDirection::Download,
             "./local/dir",
             "/home/agent/workspace/dir",
+            &[],
         );
         assert_eq!(program, "rsync");
         assert_eq!(
@@ -7323,6 +7342,7 @@ mod tests {
             TransferDirection::Upload,
             "./local/dir",
             "/home/agent/workspace/dir",
+            &[],
         );
         assert_eq!(program, "rsync");
         // `docker exec -i` (no `-t`): `-i` keeps stdin a binary-clean
@@ -7350,6 +7370,7 @@ mod tests {
             TransferDirection::Download,
             "./local/dir",
             "/home/agent/workspace/dir",
+            &[],
         );
         assert_eq!(program, "rsync");
         assert_eq!(
@@ -7381,6 +7402,7 @@ mod tests {
                 TransferDirection::Upload,
                 "/tmp/x",
                 "/tmp/x",
+                &[],
             );
             let remote_arg = args
                 .iter()
@@ -7412,6 +7434,7 @@ mod tests {
                 TransferDirection::Upload,
                 "/tmp/src",
                 "/tmp/dst",
+                &[],
             );
             assert!(
                 args.iter().any(|a| a == "-a"),
@@ -7422,6 +7445,103 @@ mod tests {
                 "backend {backend:?} args missing `--delete`: {args:?}"
             );
         }
+    }
+
+    #[test]
+    fn plan_sync_pass_through_args_splice_between_baseline_and_operands() {
+        // Operators can pass extra rsync flags after `--`; the planner
+        // must splice them between the baseline `-a --delete -e <rsh>`
+        // and the source/destination operands. rsync's synopsis is
+        // `rsync [OPTION...] SRC... [DEST]`, so flags placed after the
+        // operands would be treated as additional sources by rsync's
+        // argv parser. Pin the splice ordering so a refactor cannot
+        // accidentally append the extras after the operands.
+        let sid = cp_session_id();
+        let (program, args) = plan_sync_command(
+            sandbox_core::backend::BackendKind::Lima,
+            &sid,
+            TransferDirection::Upload,
+            "src/",
+            "dst/",
+            &["--exclude".to_string(), "*.log".to_string()],
+        );
+        assert_eq!(program, "rsync");
+        assert_eq!(
+            args,
+            vec![
+                "-a".to_string(),
+                "--delete".to_string(),
+                "-e".to_string(),
+                "limactl shell".to_string(),
+                "--exclude".to_string(),
+                "*.log".to_string(),
+                "src/".to_string(),
+                "sandbox-0123456789ab:dst/".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_sync_pass_through_args_apply_on_container_backend_too() {
+        // The splice rule is backend-agnostic: pass-through flags land
+        // in the same slot regardless of which native shell drives
+        // rsync's `-e` transport. Asserting both backends ensures a
+        // future divergence (e.g. someone special-casing one backend's
+        // arg layout) trips this test instead of silently shipping.
+        let sid = cp_session_id();
+        let (program, args) = plan_sync_command(
+            sandbox_core::backend::BackendKind::Container,
+            &sid,
+            TransferDirection::Download,
+            "out/",
+            "/home/agent/build/",
+            &[
+                "--bwlimit=1m".to_string(),
+                "--info=progress2".to_string(),
+                "--partial".to_string(),
+            ],
+        );
+        assert_eq!(program, "rsync");
+        assert_eq!(
+            args,
+            vec![
+                "-a".to_string(),
+                "--delete".to_string(),
+                "-e".to_string(),
+                "docker exec -i".to_string(),
+                "--bwlimit=1m".to_string(),
+                "--info=progress2".to_string(),
+                "--partial".to_string(),
+                "sandbox-0123456789ab:/home/agent/build/".to_string(),
+                "out/".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_sync_empty_pass_through_args_match_pre_passthrough_shape() {
+        // Empty extra-args must produce the historical no-passthrough
+        // argv exactly. Guards against a refactor that introduces a
+        // sentinel placeholder or a stray empty string.
+        let sid = cp_session_id();
+        let (_, with_extras) = plan_sync_command(
+            sandbox_core::backend::BackendKind::Lima,
+            &sid,
+            TransferDirection::Upload,
+            "src/",
+            "dst/",
+            &[],
+        );
+        // Original baseline, written out for clarity:
+        let baseline = vec![
+            "-a".to_string(),
+            "--delete".to_string(),
+            "-e".to_string(),
+            "limactl shell".to_string(),
+            "src/".to_string(),
+            "sandbox-0123456789ab:dst/".to_string(),
+        ];
+        assert_eq!(with_extras, baseline);
     }
 
     // -- render_rootless_block -------------------------------------------------

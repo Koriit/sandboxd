@@ -397,7 +397,7 @@ Mirror a directory between the host and a sandbox session via `rsync`. Use this 
 ### Synopsis
 
 ```
-sandbox sync <src> <dst>
+sandbox sync <src> <dst> [-- <rsync-args>...]
 ```
 
 One of `<src>` or `<dst>` must use the `session:path` format to identify the remote side.
@@ -408,11 +408,13 @@ One of `<src>` or `<dst>` must use the `session:path` format to identify the rem
 |----------|-------------|
 | `<src>` | Source path. Prefix with `session:` for session-side paths. |
 | `<dst>` | Destination path. Prefix with `session:` for session-side paths. |
+| `-- <rsync-args>...` | Optional extra rsync flags (everything after `--`). Spliced between the baseline `-a --delete -e <shell>` and the source / destination operands so rsync's argv parser receives them as flags, not as additional sources. |
 
 ### Details
 
 - Dispatches to the host's `rsync` binary with the backend's native shell as rsync's remote-shell transport: `rsync -a --delete -e 'limactl shell' …` for Lima, `rsync -a --delete -e 'docker exec -i' …` for container.
-- Baseline flag set is `-a --delete`: archive mode (preserves perms, ownership, mtimes, symlinks, recursion) plus mirror semantics (delete destination entries that no longer exist on the source). Operators wanting filter rules, partial transfers, or bandwidth limits should run `rsync` directly against the same `-e` shell-transport pattern this command uses.
+- Baseline flag set is `-a --delete`: archive mode (preserves perms, ownership, mtimes, symlinks, recursion) plus mirror semantics (delete destination entries that no longer exist on the source).
+- Pass-through flags after `--` are layered on top of the baseline. Use them for `--exclude`, `--bwlimit`, `--partial`, `--info=progress2`, etc. The CLI does not interpret them — it splices them straight into rsync's argv between the baseline flags and the operands, which is the position rsync's synopsis (`rsync [OPTION...] SRC... [DEST]`) requires.
 - **Requires `rsync` on both the host and inside the session image.** sandboxd-provisioned base images (Lima golden image, Lite container image) include rsync by default. If you supply a custom image, install rsync yourself or `sandbox sync` will fail with `rsync: command not found` from whichever side is missing it.
 - Errors (missing source, permission denied, unreachable session) come from `rsync` verbatim. The exit code is propagated unchanged so callers can branch on rsync's documented exit-code table (`man rsync(1)`).
 - Both source and destination cannot be remote.
@@ -435,6 +437,15 @@ sandbox sync ./src my-sandbox:/home/agent/workspace/src
 rm ./src/obsolete.go
 sandbox sync ./src my-sandbox:/home/agent/workspace/src
 # /home/agent/workspace/src/obsolete.go is now gone in the session too
+
+# Pass-through extra rsync flags after `--`. The CLI splices them
+# between the baseline `-a --delete -e <shell>` and the operands.
+sandbox sync ./src my-sandbox:/home/agent/workspace/src \
+    -- --exclude '*.log' --exclude 'target/' --info=progress2
+
+# Throttle bandwidth and keep partials across resumed runs.
+sandbox sync ci-run:/home/agent/workspace/artifacts ./out \
+    -- --bwlimit=1m --partial
 ```
 
 ---
