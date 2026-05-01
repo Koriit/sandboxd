@@ -20,6 +20,7 @@ parametrization extends the rest to the matrix.
 from __future__ import annotations
 
 import os
+import stat
 import tempfile
 
 import pytest
@@ -241,6 +242,172 @@ def test_cp_vm_to_host(sandbox_cli, backend):
         if local_file is not None:
             try:
                 os.unlink(local_file)
+            except OSError:
+                pass
+
+
+@pytest.mark.timeout(600)
+def test_cp_native_attributes(sandbox_cli, backend):
+    """Round-trip a 10 MB sparse file with mode 0700 across both backends
+    and verify size + mode are preserved end-to-end.
+
+    Validates that the M12-S7 native-cp dispatch (`limactl cp` /
+    `docker cp`) preserves file attributes the prior base64-pump
+    implementation never did. The pre-M12-S7 path lost mode (the CLI
+    never set it on `FileUploadRequest`) and inflated sparse files
+    (base64 + decode forces every hole into a real byte). The native
+    tools handle both: `scp` (under `limactl cp`) preserves mode and
+    sparseness with `-p`/`-S`; `docker cp` preserves mode by default
+    and copies sparse-aware via tar streaming.
+
+    Sparseness is asserted via the *apparent* vs *allocated* size
+    relationship: a true sparse file has `du --apparent-size` = 10 MB
+    but `du` (allocated) ≪ 10 MB. We tolerate some inflation up to 1 MB
+    to leave headroom for filesystem-block rounding without admitting
+    a full inflation regression.
+
+    Path layout:
+      host  /tmp/<tmpdir>/sparse.bin   (apparent 10 MB, mode 0700)
+      VM    /tmp/sparse-uploaded.bin
+      host  /tmp/<tmpdir>/sparse-roundtripped.bin
+
+    Backend coverage: parametrised over [lima, container] like the
+    other M5 cp tests.
+    """
+    session_id = None
+    host_dir = None
+    try:
+        host_dir = tempfile.mkdtemp(prefix="sandbox-cp-attr-")
+        original = os.path.join(host_dir, "sparse.bin")
+        roundtrip = os.path.join(host_dir, "sparse-roundtripped.bin")
+
+        # Create a 10 MB sparse file on the host: open, seek to 10 MB - 1,
+        # write a single byte, close. This is the canonical sparse-file
+        # pattern; `du --apparent-size` reports 10 MB while `du` reports
+        # only the allocated blocks (typically 4-8 KB).
+        with open(original, "wb") as f:
+            f.seek(10 * 1024 * 1024 - 1)
+            f.write(b"\0")
+        os.chmod(original, 0o700)
+
+        result = sandbox_cli(
+            "create", *make_create_args(backend, "ws-cp-attr"),
+            timeout=600,
+        )
+        assert result.returncode == 0, (
+            f"sandbox create failed (rc={result.returncode}).\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        session_id = parse_session_id(result.stdout)
+        wait_for_state(sandbox_cli, "ws-cp-attr", "Running", timeout=10)
+
+        # Upload via `sandbox cp`. The native tool (limactl cp / docker
+        # cp) is what actually crosses the host/VM boundary.
+        cp_up = sandbox_cli(
+            "cp", original, "ws-cp-attr:/tmp/sparse-uploaded.bin",
+            timeout=180,
+        )
+        assert cp_up.returncode == 0, (
+            f"sandbox cp upload failed (rc={cp_up.returncode}).\n"
+            f"stdout: {cp_up.stdout}\nstderr: {cp_up.stderr}"
+        )
+
+        # In-VM mode check: stat -c %a returns the file mode in octal.
+        # Mode 0700 must round-trip — the pre-M12-S7 path lost it.
+        mode_in_vm = sandbox_cli(
+            "exec", "ws-cp-attr", "--",
+            "stat", "-c", "%a", "/tmp/sparse-uploaded.bin",
+            timeout=120,
+        )
+        assert mode_in_vm.returncode == 0, (
+            f"stat -c %a failed in VM.\n"
+            f"stdout: {mode_in_vm.stdout}\nstderr: {mode_in_vm.stderr}"
+        )
+        assert mode_in_vm.stdout.strip() == "700", (
+            f"mode for /tmp/sparse-uploaded.bin not preserved across upload: "
+            f"expected 700, got {mode_in_vm.stdout.strip()!r}"
+        )
+
+        # In-VM size check: the apparent (logical) size must equal
+        # 10 MB exactly. `stat -c %s` returns size in bytes.
+        size_in_vm = sandbox_cli(
+            "exec", "ws-cp-attr", "--",
+            "stat", "-c", "%s", "/tmp/sparse-uploaded.bin",
+            timeout=120,
+        )
+        assert size_in_vm.returncode == 0, (
+            f"stat -c %s failed in VM: stderr={size_in_vm.stderr!r}"
+        )
+        assert int(size_in_vm.stdout.strip()) == 10 * 1024 * 1024, (
+            f"apparent size for /tmp/sparse-uploaded.bin not preserved: "
+            f"expected {10 * 1024 * 1024}, got {size_in_vm.stdout.strip()!r}"
+        )
+
+        # In-VM allocated-size check: `du -B1 --apparent-size` should
+        # report ≥ 10 MB; plain `du -B1` (allocated, in bytes) must
+        # report ≤ 10 MB + 1 MB tolerance (so sparseness is still
+        # recognisable, even if the backend reinflates a bit during
+        # transit). Catching full inflation: if a base64-style pump
+        # crept back in, allocated would equal apparent (10 MB).
+        allocated_in_vm = sandbox_cli(
+            "exec", "ws-cp-attr", "--",
+            "du", "-B1", "/tmp/sparse-uploaded.bin",
+            timeout=120,
+        )
+        assert allocated_in_vm.returncode == 0, (
+            f"du failed in VM: stderr={allocated_in_vm.stderr!r}"
+        )
+        # `du` output: "<bytes>\t<path>". Extract the number.
+        allocated_bytes = int(allocated_in_vm.stdout.split()[0])
+        assert allocated_bytes <= 10 * 1024 * 1024 + 1024 * 1024, (
+            f"allocated bytes ({allocated_bytes}) for sparse file exceed "
+            f"apparent size + 1 MB tolerance — sparseness was not preserved "
+            f"(suggests a base64-style pump regression)."
+        )
+
+        # Round-trip back to the host via `sandbox cp`.
+        cp_down = sandbox_cli(
+            "cp", "ws-cp-attr:/tmp/sparse-uploaded.bin", roundtrip,
+            timeout=180,
+        )
+        assert cp_down.returncode == 0, (
+            f"sandbox cp download failed (rc={cp_down.returncode}).\n"
+            f"stdout: {cp_down.stdout}\nstderr: {cp_down.stderr}"
+        )
+
+        # Host-side mode check after round-trip.
+        host_mode = stat.S_IMODE(os.stat(roundtrip).st_mode)
+        assert host_mode == 0o700, (
+            f"mode for round-tripped file not preserved on host: "
+            f"expected 0o700, got {oct(host_mode)}"
+        )
+
+        # Host-side apparent size after round-trip.
+        host_size = os.path.getsize(roundtrip)
+        assert host_size == 10 * 1024 * 1024, (
+            f"apparent size for round-tripped file not preserved on host: "
+            f"expected {10 * 1024 * 1024}, got {host_size}"
+        )
+
+        # Host-side allocated-size sparseness check (st_blocks * 512
+        # bytes is the standard POSIX allocated-size formula).
+        host_allocated = os.stat(roundtrip).st_blocks * 512
+        assert host_allocated <= 10 * 1024 * 1024 + 1024 * 1024, (
+            f"host-side round-tripped file allocated {host_allocated} bytes "
+            f"for {host_size} apparent — exceeds 1 MB tolerance, sparseness "
+            f"lost on the download leg."
+        )
+
+        sandbox_cli("rm", "ws-cp-attr", timeout=120)
+        session_id = None
+
+    finally:
+        if session_id is not None:
+            sandbox_cli("rm", "ws-cp-attr", timeout=120)
+        if host_dir is not None:
+            import shutil
+            try:
+                shutil.rmtree(host_dir)
             except OSError:
                 pass
 

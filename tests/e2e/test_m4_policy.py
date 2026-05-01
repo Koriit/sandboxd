@@ -2687,3 +2687,225 @@ def test_policy_clear_reverts_to_deny_all(sandbox_cli, backend):
             sandbox_cli("rm", "pol-clear", timeout=120)
         if policy_path is not None:
             cleanup_policy_file(policy_path)
+
+
+@pytest.mark.timeout(600)
+def test_svcb_record_without_ech_reaches_vm(sandbox_cli, backend):
+    """An SVCB record whose answer carries no ECH SvcParam must reach
+    the VM intact — the M12-S3 strip-not-deny semantics rewrite removes
+    only the `ech` SvcParam value, never the record itself.
+
+    Pre-M12-S3 the CoreDNS plugin blanket-denied every SVCB / HTTPS
+    query (legacy `TestHandler_SVCBQuery_Blocked` posture). The current
+    behaviour returns the original RR with `ech` stripped if present,
+    or unchanged if absent. This test pins the absent-ECH path
+    end-to-end through the gateway: a real SVCB query for an
+    allowed name should resolve and return at least one SVCB answer to
+    the VM, not NOERROR-with-zero-answers and not NXDOMAIN.
+
+    Cloudflare's `cloudflare.com` advertises an SVCB record at root
+    that omits ECH (only `alpn` + `ipv4hint`); we use it as the test
+    target. Lima/container DNS is intercepted and forwarded through
+    CoreDNS, so this exercises the real strip path against a real
+    answer rather than synthetic test fixtures.
+    """
+    session_id = None
+    policy_path = None
+    try:
+        # Allow cloudflare.com:443 over HTTPS — enough for the resolver
+        # to consider the name in scope; the SVCB query itself is
+        # protocol-independent at the resolver layer (CoreDNS gates the
+        # name, not the rrtype).
+        policy = {
+            "version": "2.0.0",
+            "rules": [
+                {
+                    "host": "cloudflare.com",
+                    "port": 443,
+                    "protocol": "tcp",
+                    "level": "transport",
+                },
+            ],
+        }
+        policy_path = write_policy_file(policy)
+
+        result = sandbox_cli(
+            "create", *make_create_args(backend, "pol-svcb-noech",
+                                        "--policy", policy_path),
+            timeout=600,
+        )
+        assert result.returncode == 0, (
+            f"sandbox create failed (rc={result.returncode}).\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        session_id = parse_session_id(result.stdout)
+        wait_for_state(sandbox_cli, "pol-svcb-noech", "Running", timeout=10)
+
+        # Warm A first so DNS-driven IP propagation can race in;
+        # mirrors `test_dns_ip_propagation` and similar M4 tests.
+        sandbox_cli(
+            "ssh", "pol-svcb-noech", "--",
+            "nslookup", "cloudflare.com",
+            timeout=120,
+        )
+        time.sleep(2)
+
+        # Issue the SVCB query (TYPE64) via dig. We deliberately use a
+        # raw type number to avoid relying on dig's `+svcb` shorthand
+        # being present in every base image. The expected answer for
+        # cloudflare.com today carries no `ech` SvcParam — this is the
+        # specific shape M12-S3 changed from "blocked" to
+        # "stripped-or-passthrough".
+        svcb_result = sandbox_cli(
+            "ssh", "pol-svcb-noech", "--",
+            "dig", "+short", "cloudflare.com", "TYPE64",
+            timeout=120,
+        )
+        assert svcb_result.returncode == 0, (
+            f"dig TYPE64 cloudflare.com failed inside VM.\n"
+            f"stdout: {svcb_result.stdout}\nstderr: {svcb_result.stderr}"
+        )
+        # `dig +short` of an SVCB record renders the RDATA on a single
+        # line per RR (priority + target + key=value pairs). The VM
+        # must see at least one such line — anything else means the
+        # record was suppressed somewhere in the chain.
+        non_empty_lines = [
+            line for line in svcb_result.stdout.splitlines() if line.strip()
+        ]
+        assert non_empty_lines, (
+            f"SVCB record for cloudflare.com was not delivered to the VM.\n"
+            f"This regresses M12-S3 strip-not-deny: the absent-ECH path "
+            f"should pass the record through unchanged.\n"
+            f"dig stdout: {svcb_result.stdout!r}\n"
+            f"dig stderr: {svcb_result.stderr!r}"
+        )
+        # And the answer must not contain an `ech=` token. The
+        # upstream answer for cloudflare.com today does not carry ECH;
+        # if a future upstream change adds one, the strip path should
+        # still remove it before the answer reaches the VM.
+        joined = " ".join(non_empty_lines).lower()
+        assert "ech=" not in joined, (
+            f"SVCB record reached the VM with an `ech=` SvcParam intact.\n"
+            f"M12-S3 requires the strip path to remove it before delivery.\n"
+            f"dig stdout: {svcb_result.stdout!r}"
+        )
+
+        sandbox_cli("rm", "pol-svcb-noech", timeout=120)
+        session_id = None
+
+    finally:
+        if session_id is not None:
+            sandbox_cli("rm", "pol-svcb-noech", timeout=120)
+        if policy_path is not None:
+            cleanup_policy_file(policy_path)
+
+
+@pytest.mark.timeout(600)
+def test_policy_rejects_http_level_with_udp_protocol(sandbox_cli, backend):
+    """`level: http` + `protocol: udp` is invalid by construction —
+    HTTP inspection requires TCP. The unit-level invariant is pinned in
+    `policy.rs::validate_rejects_http_level_with_udp`; this test
+    drives the same assertion through the daemon's HTTP layer to
+    verify the boundary stays consistent end-to-end.
+
+    Posts a single rule with `level: http` and `protocol: udp` via
+    `sandbox policy update --policy <file>`. The daemon must reject
+    the request with a non-success exit code and an error message
+    containing the spec-mandated phrase ``assurance level 'http'
+    requires protocol 'tcp'`` (per `PolicyCompiler::validate`). The
+    session must remain alive afterwards — the failed apply must not
+    knock it out of the running state.
+    """
+    session_id = None
+    base_path = None
+    bad_path = None
+    try:
+        # Bring up a session with a benign baseline policy so we can
+        # then attempt the invalid update against a running daemon.
+        baseline = {
+            "version": "2.0.0",
+            "rules": [
+                {
+                    "host": "example.com",
+                    "port": 80,
+                    "protocol": "tcp",
+                    "level": "transport",
+                },
+            ],
+        }
+        base_path = write_policy_file(baseline)
+
+        result = sandbox_cli(
+            "create", *make_create_args(backend, "pol-http-udp", "--policy", base_path),
+            timeout=600,
+        )
+        assert result.returncode == 0, (
+            f"sandbox create failed (rc={result.returncode}).\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        session_id = parse_session_id(result.stdout)
+        wait_for_state(sandbox_cli, "pol-http-udp", "Running", timeout=10)
+
+        # Build the invalid update body: http+udp on the same rule.
+        bad_policy = {
+            "version": "2.0.0",
+            "rules": [
+                {
+                    "host": "example.com",
+                    "port": 53,
+                    "protocol": "udp",
+                    "level": "http",
+                    "http_filters": [
+                        {"method": "GET", "path": "/*"},
+                    ],
+                },
+            ],
+        }
+        bad_path = write_policy_file(bad_policy)
+
+        update = sandbox_cli(
+            "policy", "update", "pol-http-udp", "--policy", bad_path,
+            timeout=120,
+        )
+        assert update.returncode != 0, (
+            "Policy with http level + udp protocol must be rejected by the "
+            f"daemon, got rc=0.\nstdout: {update.stdout}\nstderr: {update.stderr}"
+        )
+        # The exact error string is owned by `PolicyCompiler::validate`
+        # — we pin its grep-stable prefix here so a future error-text
+        # rewording trips this assertion in CI before silently breaking
+        # operator-facing diagnostics. The stderr must surface the
+        # daemon's response, not a generic "request failed" wrapper.
+        combined = (update.stdout + update.stderr)
+        assert "assurance level 'http' requires protocol" in combined, (
+            f"Daemon-side validation error not surfaced to operator.\n"
+            f"Expected substring: \"assurance level 'http' requires protocol\"\n"
+            f"stdout: {update.stdout!r}\nstderr: {update.stderr!r}"
+        )
+
+        # Session must stay running — a rejected apply must not knock
+        # it into Error state. (`apply_policy` emits a `policy_updated`
+        # event with status=error but does not transition the session.)
+        ps = sandbox_cli("ps", timeout=60)
+        assert ps.returncode == 0, (
+            f"sandbox ps failed: stderr={ps.stderr!r}"
+        )
+        # A "Running" line for our session must still be present.
+        assert any(
+            "pol-http-udp" in line and "Running" in line
+            for line in ps.stdout.splitlines()
+        ), (
+            f"Session pol-http-udp must remain Running after rejected "
+            f"policy update.\nps output:\n{ps.stdout}"
+        )
+
+        sandbox_cli("rm", "pol-http-udp", timeout=120)
+        session_id = None
+
+    finally:
+        if session_id is not None:
+            sandbox_cli("rm", "pol-http-udp", timeout=120)
+        if base_path is not None:
+            cleanup_policy_file(base_path)
+        if bad_path is not None:
+            cleanup_policy_file(bad_path)
