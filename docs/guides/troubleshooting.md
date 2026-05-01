@@ -417,6 +417,14 @@ Fix: `sandbox start <session>` first. The container-backend behavior of copying 
 
 Fix: install the missing dependency. The CLI no longer relays file content through the daemon, so the host running `sandbox cp` needs the same binary the daemon would use to manage the session.
 
+### `sandbox sync` against a stopped session
+
+**Symptom (Lima):** rsync's remote-shell exits before the protocol handshake; you'll see something like `instance "sandbox-<id>" is stopped, run \`limactl start ...\` to start it` from `limactl shell` followed by rsync's own `rsync error: unexplained error (code 255) at ...`. **Symptom (container):** `docker exec` exits with `Error response from daemon: Container <hash> is not running` and rsync wraps it in the same `unexplained error (code 255)` line.
+
+`sandbox sync` uses `rsync -e "limactl shell"` (Lima) or `rsync -e "docker exec -i"` (container) as its remote-shell transport, and unlike `docker cp`, neither shell can attach to a stopped session — the directory protocol needs a live process on both sides.
+
+Fix: `sandbox start <session>` first.
+
 ## Performance issues
 
 ### Cgroup limits
