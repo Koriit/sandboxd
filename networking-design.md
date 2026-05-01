@@ -1399,7 +1399,7 @@ This subsystem defines the networking architecture for the sandbox in which:
 * all traffic is denied by default — only TCP and UDP are supported; ICMP and tunneling protocols are explicitly denied
 * nftables PREROUTING DNAT transparently intercepts forwarded traffic from the VM, with Envoy recovering original destinations via `original_dst`
 * a local DNS resolver enforces policy at the DNS layer and provides query logging for audit trails
-* UDP policy is enforced purely by nftables (IP/port allow/deny) with no userland proxy
+* UDP policy enforcement is kernel-resident: nftables matches `(daddr, dport)` against `policy_allow_udp`, accepting allowed flows directly to MASQUERADE and `log group 1; drop`-ing the rest — no userland proxy sits in the datapath. Two userland nft-loggers (`sandbox-nft-deny-logger`, `sandbox-nft-allow-logger`) observe the kernel via NFLOG group 1 and `NFNLGRP_CONNTRACK_NEW` respectively, emitting structured deny / allow events without ever touching the packets themselves
 * the only normal allowed mode is inspected HTTP(S)
 * every non-HTTP or non-inspected flow is an explicit bypass
 * bypasses are classified by assurance level
