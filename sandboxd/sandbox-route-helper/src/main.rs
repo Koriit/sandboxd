@@ -206,6 +206,7 @@ fn pidfd_open(pid: i32) -> Result<OwnedFd, i32> {
     // immediately wrap in `OwnedFd` to take ownership. The flags
     // argument is 0 — the only currently-defined flag is
     // `PIDFD_NONBLOCK` (Linux 5.10+) which we don't need here.
+    // nix-rust/nix#2748: pidfd_open wrapper not yet provided; using libc::syscall as a deliberate gap.
     let raw: libc::c_long =
         unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0u32) };
     if raw < 0 {
