@@ -40,7 +40,7 @@
 //! Both entry points additionally enforce a defensive ownership/mode
 //! check on the canonical `/etc/sandboxd/users.conf` path: the file
 //! must be owned by uid 0 and must carry no group- or world-write bits
-//! (see [`validate_canonical_users_conf_security`]). Tempfile paths
+//! (see `validate_canonical_users_conf_security`). Tempfile paths
 //! used by tests are skipped — only the well-known canonical path is
 //! checked, so test-tempfile callers (owned by the test runner's uid)
 //! pass through unchanged. The check refuses to read a tampered config
@@ -440,7 +440,7 @@ pub fn load_users_config_route_helper() -> Result<UsersConfig, UsersConfigError>
 /// canonical `/etc/sandboxd/users.conf` path is shared between daemon
 /// and helper. Tempfile paths used by tests pass through unchanged
 /// (only the canonical path triggers the check); see
-/// [`validate_canonical_users_conf_security`].
+/// `validate_canonical_users_conf_security`.
 pub fn load_users_config_from(path: &Path) -> Result<UsersConfig, UsersConfigError> {
     validate_canonical_users_conf_security(path)?;
 
@@ -463,24 +463,24 @@ pub fn load_users_config_from(path: &Path) -> Result<UsersConfig, UsersConfigErr
 /// Defensive ownership/mode check applied at config-load time when the
 /// path resolves to the canonical [`DEFAULT_USERS_CONF_PATH`].
 ///
-/// We refuse to read the file if it is not owned by uid 0, or if it
-/// carries any group- or world-write bits. The route helper runs with
-/// `cap_sys_admin+ep`; if the auth file were group/world-writable, any
-/// local user could rewrite their own `allow_users` entry and grant
-/// themselves access to a foreign subnet. Linux guarantees that uid 0
-/// is `root`, so an explicit numeric check is sufficient and avoids
-/// pulling in a name-resolver crate.
+/// We refuse to read the file if it is not owned by uid 0, if it
+/// carries any group- or world-write bits, or if it is a symlink. The
+/// route helper runs with `cap_sys_admin+ep`; if the auth file were
+/// group/world-writable, any local user could rewrite their own
+/// `allow_users` entry and grant themselves access to a foreign subnet.
+/// Linux guarantees that uid 0 is `root`, so an explicit numeric check
+/// is sufficient and avoids pulling in a name-resolver crate.
 ///
-/// **Symlink behavior.** This check uses [`fs::metadata`], which
-/// follows symlinks — so when `/etc/sandboxd/users.conf` is a symlink,
-/// the validation runs against the *target* file's owner and mode bits,
-/// not the symlink itself. The install runbook places a regular file at
-/// the canonical path, so this is the documented configuration; an
-/// operator who deliberately points the canonical path at a symlinked
-/// target is responsible for ensuring the target is also root-owned and
-/// not group- or world-writable. Hardening this further (rejecting any
-/// symlink at the canonical path via [`fs::symlink_metadata`]) is
-/// tracked separately.
+/// **Symlink behavior.** This check uses [`fs::symlink_metadata`], which
+/// does **not** follow symlinks. If `/etc/sandboxd/users.conf` is a
+/// symlink we refuse to read it — even if the target happens to be
+/// root-owned and 0644 — because a writable directory anywhere in the
+/// link's parent chain (or write-access to the link itself) lets a
+/// non-root user re-point the auth file at a config they control. The
+/// install runbook places a regular file at the canonical path, so the
+/// documented configuration trips no extra check; operators who
+/// previously placed a symlink there must replace it with a regular
+/// file (or, equivalently, copy the target's contents in place).
 ///
 /// We deliberately scope this to the canonical path only:
 ///
@@ -507,7 +507,13 @@ fn validate_users_conf_security_against(
     if path != canonical {
         return Ok(());
     }
-    let meta = match fs::metadata(path) {
+    // Use `symlink_metadata` rather than `metadata` so a symlink at the
+    // canonical path is examined directly (as a symlink), not transparently
+    // followed to its target. Otherwise an attacker who can write into any
+    // directory along the link's parent chain can re-point the canonical
+    // path at a config they own and pass the ownership/mode check via the
+    // target's attributes.
+    let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             // Defer NotFound to `load_users_config_from`'s `read_to_string`
@@ -522,6 +528,13 @@ fn validate_users_conf_security_against(
             });
         }
     };
+    if meta.file_type().is_symlink() {
+        return Err(UsersConfigError::InsecureFile {
+            path: path.to_path_buf(),
+            reason: "file must not be a symlink; replace it with a regular file per the \
+                     install step in docs/start/installation.md",
+        });
+    }
     use std::os::unix::fs::MetadataExt;
     if meta.uid() != 0 {
         return Err(UsersConfigError::InsecureFile {
@@ -1066,13 +1079,20 @@ mod tests {
     // the uid-0 arm of `validate_users_conf_security_against` is
     // covered by the two `defensive_check_refuses_*` tests below: any
     // tempfile-owned-by-the-runner at the canonical path triggers
-    // `InsecureFile` via the uid-0 check (which fires first).
+    // `InsecureFile` via the uid-0 check (which fires first, after the
+    // symlink arm).
     //
     // The mode-bits arm is exercised independently by
     // `is_secure_mode_matrix` against the extracted `is_secure_mode`
     // helper — that's a pure function, so we can sweep every relevant
     // (group-write, world-write) combination without needing a real
     // file we can chown to root.
+    //
+    // The symlink arm is exercised by
+    // `defensive_check_refuses_canonical_path_that_is_a_symlink`: it
+    // points the "canonical" path at a tempfile via a symlink and
+    // asserts the validator rejects on symlink grounds before the
+    // uid-0 / mode-bits arms have a chance to fire.
     //
     // The positive arm of the wrapper (root-owned, 0644) is exercised
     // by the daemon at runtime *and* via the path-comparison bypass:
@@ -1152,6 +1172,41 @@ mod tests {
                 expected,
                 "is_secure_mode(0o{mode:o}) should be {expected}",
             );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn defensive_check_refuses_canonical_path_that_is_a_symlink() {
+        // A symlink at the canonical path is rejected even when its
+        // target satisfies the ownership/mode check, because writability
+        // anywhere in the link's parent chain (or write-access to the
+        // link itself) lets a non-root user re-point the auth file at
+        // a config they control. We exercise this by pointing the
+        // "canonical" path at a regular tempfile via a symlink and
+        // asserting the validator refuses on symlink grounds — this
+        // arm fires before the uid-0 / mode-bits arms, so the test
+        // does not need a root-owned target.
+        let target = write_tempfile(r#"{ "subnets": [] }"#);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let link = dir.path().join("users.conf");
+        std::os::unix::fs::symlink(target.path(), &link).expect("symlink");
+
+        let err = validate_users_conf_security_against(&link, &link)
+            .expect_err("symlink at the canonical path must be refused");
+        match err {
+            UsersConfigError::InsecureFile { path, reason } => {
+                assert_eq!(path, link);
+                assert!(
+                    reason.contains("symlink"),
+                    "reason should mention symlink; got: {reason}"
+                );
+                assert!(
+                    reason.contains("docs/start/installation.md"),
+                    "reason should point at install runbook; got: {reason}"
+                );
+            }
+            other => panic!("expected InsecureFile, got {other:?}"),
         }
     }
 
