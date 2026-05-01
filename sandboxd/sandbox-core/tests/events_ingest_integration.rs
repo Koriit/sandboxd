@@ -1,5 +1,5 @@
 //! End-to-end integration test for the per-session JSONL ingest
-//! pipeline (M10-S2 Phase 7).
+//! pipeline.
 //!
 //! Covers the full read-parse-stamp-publish path without a real
 //! gateway container: a test-owned tempdir stands in for the
@@ -198,8 +198,8 @@ async fn ingestor_drops_events_with_unknown_source_ip() {
     // be published to any session's sink. Envoy is used here (rather
     // than mitmproxy as in older versions of this test) because
     // mitmproxy attribution was intentionally moved off the vm_ip_map
-    // lookup path in M10-S5 Phase 7 — see the function-level doc on
-    // `dispatch_line` and the dedicated
+    // lookup path — see the function-level doc on `dispatch_line` and
+    // the dedicated
     // `mitmproxy_event_attributes_via_watcher_session_even_with_unbound_client_ip`
     // test below. The drop-on-miss invariant continues to apply to the
     // producers that do use vm_ip_map (envoy + coredns).
@@ -278,7 +278,7 @@ async fn ingestor_abort_stops_further_publishes() {
     }
 }
 
-/// Regression test for the mitmproxy attribution bug (M10-S5 Phase 7).
+/// Regression test for the mitmproxy attribution bug.
 ///
 /// In production, mitmproxy runs on `127.0.0.1:18080` inside the gateway
 /// container and is reached by Envoy via a `tcp_proxy` filter. The
@@ -348,8 +348,8 @@ async fn mitmproxy_event_attributes_via_watcher_session_even_with_unbound_client
 ///    the VM's bridge IP, stamping the same session as the other
 ///    producers.
 /// 2. A `rate_limited` summary record — no 5-tuple, so attribution
-///    falls back to the ingestor's owning session (M10-S3 Phase 5
-///    watcher rule).
+///    falls back to the ingestor's owning session (the watcher's
+///    fallback rule).
 #[tokio::test]
 async fn deny_logger_jsonl_appears_on_bus() {
     let tmp = TempDir::new().expect("create tempdir");

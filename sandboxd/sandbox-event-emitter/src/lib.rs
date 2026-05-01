@@ -20,8 +20,8 @@
 //!   and the 1-second ticker that flushes a `rate_limited` summary on
 //!   window rollover.
 //! - [`health::bind`] / [`health::run`] — the `/health` HTTP endpoint
-//!   (response shape preserved across the M12-S2 binary rename per
-//!   Resolution 5).
+//!   (response shape preserved across the binary rename per
+//!   `2026-05-01-udp-nft-loggers-design.md` Resolution 5).
 //!
 //! Binary crates compose these primitives; this lib does not contain
 //! data-plane code (UDP / TCP listeners, NFLOG / NFCT subscribers).

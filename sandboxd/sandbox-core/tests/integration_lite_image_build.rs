@@ -1,5 +1,5 @@
 //! Integration tests for [`sandbox_core::backend::ensure_image`] —
-//! Phase 3B of the M11-S3 lite-mode container backend.
+//! the missing-image build path of the lite-mode container backend.
 //!
 //! These tests exercise the real `docker` daemon: each one runs a real
 //! `docker build` against a unique daemon-version-shaped tag and asserts

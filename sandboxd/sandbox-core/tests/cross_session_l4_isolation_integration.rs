@@ -1,4 +1,4 @@
-//! Cross-session L4 isolation (M12-S4 todo #82).
+//! Cross-session L4 isolation.
 //!
 //! These tests pair with the e2e structural disjoint-subnet check in
 //! `tests/e2e/test_m3_networking.py::test_concurrent_sessions`. The e2e
@@ -108,9 +108,9 @@ fn forward_chain_drops_cross_session_tcp_via_absence_of_accept() {
 
     // Walk every accept rule and assert each TCP-or-untyped accept
     // either (a) admits only return traffic via conntrack, (b) admits
-    // wholesale UDP (the documented allow-path datapath per M12-S2
-    // Decision 1, safe because PREROUTING already filtered denied UDP
-    // against the policy allow-set), or (c) pins `ip daddr` to
+    // wholesale UDP (the documented allow-path datapath, safe because
+    // PREROUTING already filtered denied UDP against the policy
+    // allow-set), or (c) pins `ip daddr` to
     // session A's own gateway IP. Because session B's subnet is
     // disjoint from A's by construction (NetworkManager allocates
     // distinct /28s out of the 10.209.0.0/24 pool), no accept rule of
@@ -129,7 +129,7 @@ fn forward_chain_drops_cross_session_tcp_via_absence_of_accept() {
         if line.contains("ct state") {
             continue;
         }
-        // (b) Wholesale UDP allow — safe per M12-S2 Decision 1.
+        // (b) Wholesale UDP allow — safe per the allow-path datapath.
         if line.contains("meta l4proto udp") {
             continue;
         }

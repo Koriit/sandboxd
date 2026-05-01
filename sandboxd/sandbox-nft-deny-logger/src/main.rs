@@ -4,19 +4,19 @@
 //! Spec references:
 //!   - `2026-04-21-port-explicit-policies-presets-observability-design.md`
 //!     Part 3 / "Deny-logger component" — original deny-logger contract.
-//!   - `2026-05-01-udp-nft-loggers-design.md` (M12-S2) Decisions 2, 4, 5
-//!     — the rename and the UDP datapath restructure (DNAT-to-listener →
-//!     NFLOG receive).
+//!   - `2026-05-01-udp-nft-loggers-design.md` Decisions 2, 4, 5 — the
+//!     rename and the UDP datapath restructure (DNAT-to-listener → NFLOG
+//!     receive).
 //!
 //! Packet flow:
 //!
-//!   - **TCP deny** (unchanged from M10-S3): nftables' `sandbox_dnat`
-//!     prerouting chain DNATs denied TCP to `gateway_ip:10001`. This
-//!     binary `accept(2)`s the connection, reads `SO_ORIGINAL_DST` to
-//!     recover the pre-DNAT destination, emits a `deny` JSONL event,
-//!     and closes the socket with RST (SO_LINGER 0).
-//!   - **UDP deny** (M12-S2): nft no longer DNATs denied UDP. Instead,
-//!     the `sandbox_dnat.prerouting` chain matches unmatched UDP with
+//!   - **TCP deny**: nftables' `sandbox_dnat` prerouting chain DNATs
+//!     denied TCP to `gateway_ip:10001`. This binary `accept(2)`s the
+//!     connection, reads `SO_ORIGINAL_DST` to recover the pre-DNAT
+//!     destination, emits a `deny` JSONL event, and closes the socket
+//!     with RST (SO_LINGER 0).
+//!   - **UDP deny**: nft no longer DNATs denied UDP. Instead, the
+//!     `sandbox_dnat.prerouting` chain matches unmatched UDP with
 //!     `meta l4proto udp log group 1; meta l4proto udp drop`. The
 //!     kernel emits one netlink message per drop on NFNLGRP_NFLOG group
 //!     1; this binary subscribes to that group, parses the IPv4 + UDP
@@ -76,9 +76,10 @@ struct Args {
     /// `/var/log/gateway/events/<session-id>/` is covered by one ingest
     /// watcher.
     ///
-    /// The default file name is `nft-deny.jsonl` per M12-S2 Resolution
-    /// 6 — coordinated with the daemon-side ingest watcher's known-file
-    /// glob (`sandbox-core/src/events/ingest/watcher.rs`). The on-disk
+    /// The default file name is `nft-deny.jsonl` per
+    /// `2026-05-01-udp-nft-loggers-design.md` Resolution 6 —
+    /// coordinated with the daemon-side ingest watcher's known-file glob
+    /// (`sandbox-core/src/events/ingest/watcher.rs`). The on-disk
     /// filename is independent of the wire `layer: "deny-logger"`
     /// discriminator, which is what the parser keys on per JSONL line.
     #[arg(long, default_value = "/var/log/gateway/events/nft-deny.jsonl")]
@@ -95,7 +96,8 @@ struct Args {
 
     /// NFLOG group the kernel emits dropped-UDP packets on. Must match
     /// the `nft log group N` value in `gateway.rs`'s prerouting deny
-    /// rule. M12-S2 Resolution 1 pins this to `1`.
+    /// rule. Pinned to `1` per
+    /// `2026-05-01-udp-nft-loggers-design.md` Resolution 1.
     #[arg(long, default_value_t = 1)]
     nflog_group: u16,
 
@@ -152,8 +154,9 @@ fn main() -> ExitCode {
 async fn run(args: Args) -> std::io::Result<()> {
     // `"deny-logger"` is the on-disk layer tag the daemon-side ingest
     // parser keys on (`sandbox-core/src/events/ingest/nft_logger.rs`);
-    // preserved byte-for-byte across the M12-S2 binary rename so daemon
-    // ingest is unaffected (Resolution 5).
+    // preserved byte-for-byte across the binary rename so daemon ingest
+    // is unaffected (`2026-05-01-udp-nft-loggers-design.md`
+    // Resolution 5).
     let emitter = Arc::new(EventEmitter::open(&args.event_path, "deny-logger")?);
     let rate_cap = Arc::new(RateCap::new(
         args.rate_cap,
@@ -200,8 +203,7 @@ async fn run(args: Args) -> std::io::Result<()> {
     // `spawn_blocking` thread so it cannot starve a tokio worker. It
     // runs forever; we surface its `JoinHandle` to tokio's `select!`
     // below so a panic / unexpected exit takes the process down (same
-    // posture as the listener tasks). This pattern matches the prior
-    // M12-S1 conntrack-module rationale: the kernel is the bursting
+    // posture as the listener tasks). The kernel is the bursting
     // sender, the consumer is one task; blocking is the simplest
     // correct shape.
     let nflog_emitter = Arc::clone(&emitter);
@@ -215,7 +217,8 @@ async fn run(args: Args) -> std::io::Result<()> {
     let health_emitter = Arc::clone(&emitter);
     let health_task = tokio::spawn(async move {
         // The deny-logger's `/health` body shape is preserved across the
-        // M12-S2 rename per Resolution 5 (`tcp_listener`, `nflog_socket`,
+        // binary rename per `2026-05-01-udp-nft-loggers-design.md`
+        // Resolution 5 (`tcp_listener`, `nflog_socket`,
         // `events_emitted_60s`); the lib's `deny_logger_body` builder
         // emits exactly that JSON.
         if let Err(err) =

@@ -58,8 +58,8 @@ use crate::session::SessionId;
 /// the producer side (gateway-container Docker image) is the source of
 /// truth. If a new layer ships, add it here and a matching parser.
 ///
-/// `nft-allow.jsonl` (M12-S2 Phase 3) shares the `nft_logger` parser
-/// with `nft-deny.jsonl`; the per-file `Layer` discriminator is what
+/// `nft-allow.jsonl` shares the `nft_logger` parser with
+/// `nft-deny.jsonl`; the per-file `Layer` discriminator is what
 /// routes the dispatch arm.
 const ENVOY_JSONL: &str = "envoy.jsonl";
 const COREDNS_JSONL: &str = "coredns.jsonl";
@@ -83,7 +83,7 @@ const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 /// Which layer a particular tailer serves. Drives the parse dispatch.
 ///
 /// `DenyLogger` and `AllowLogger` are sibling members of the nft-logger
-/// family (M12-S2 Decision 5): both flow through
+/// family: both flow through
 /// [`crate::events::ingest::nft_logger::parse_nft_logger_line`] and end
 /// up as [`crate::events::DenyLoggerEvent`] variants on the bus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -514,8 +514,8 @@ mod tests {
         // Underscore vs. hyphen variant — easy-to-make typo, must not
         // match.
         assert_eq!(Layer::from_file_name("nft_deny.jsonl"), None);
-        // Pre-rename legacy filename — must no longer match after the
-        // M12-S2 Resolution 6 rename to `nft-deny.jsonl`.
+        // Pre-rename legacy filename — must no longer match after
+        // the rename to `nft-deny.jsonl`.
         assert_eq!(Layer::from_file_name("deny-logger.jsonl"), None);
     }
 
@@ -545,7 +545,7 @@ mod tests {
     use crate::events::{EventBusConfig, MitmproxyEvent};
     use std::net::Ipv4Addr;
 
-    /// Regression test for the mitmproxy attribution bug (M10-S5 Phase 7).
+    /// Regression test for the mitmproxy attribution bug.
     ///
     /// Mitmproxy's `client_ip` is the kernel-chosen source of Envoy's
     /// loopback connect — not the VM — so attempting to resolve it via

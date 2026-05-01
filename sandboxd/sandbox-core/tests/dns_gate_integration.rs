@@ -1,5 +1,4 @@
-//! Integration tests for the synchronous DNS-policy gating IPC
-//! (M10-S10 Phase 2).
+//! Integration tests for the synchronous DNS-policy gating IPC.
 //!
 //! These tests drive the daemon-side gate listener over a real Unix
 //! domain socket, against a real gateway container, exercising the

@@ -68,9 +68,10 @@ pub struct SessionDto {
     /// Backend that owns this session's runtime resources. Surfaced
     /// on the wire so HTTP-level integration tests and CLI consumers
     /// can confirm `--backend container` actually routed to the
-    /// container runtime. Additive: pre-M11-S3 records and clients
-    /// that ignore the field still round-trip via `#[serde(default)]`
-    /// (defaults to Lima, matching the implicit pre-M11 contract).
+    /// container runtime. Additive: records and clients predating
+    /// the container backend (and any that ignore the field) still
+    /// round-trip via `#[serde(default)]` (defaults to Lima, matching
+    /// the historical implicit Lima-only contract).
     #[serde(default)]
     pub backend: BackendKind,
     /// Backend-neutral session networking summary. Populated by
@@ -88,7 +89,7 @@ pub struct SessionDto {
     /// non-`Option` because they are populated together from the
     /// same `NetworkInfo` row — splitting their availability would
     /// only model an impossible state. Additive on the wire:
-    /// pre-Wave-2 records that lack the field round-trip via
+    /// records that lack the field round-trip via
     /// `#[serde(default)]`; older clients reading a newer response
     /// silently ignore the unknown key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -104,16 +105,15 @@ pub struct SessionDto {
     /// stay `None` rather than carrying a placeholder string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mounts: Option<SessionMountInfo>,
-    /// Rootless-Docker probe outcome captured at session-create time
-    /// (M11-S8 Wave 2). `Some(_)` only for container sessions where
-    /// the daemon ran the probe; `None` for every Lima session and
-    /// for legacy container records written by pre-Wave-2 daemons
+    /// Rootless-Docker probe outcome captured at session-create time.
+    /// `Some(_)` only for container sessions where the daemon ran
+    /// the probe; `None` for every Lima session and for legacy
+    /// container records written before the probe was introduced
     /// (forward-compatible via `#[serde(default)]` per CLAUDE.md
     /// "On-disk compatibility").
     ///
-    /// Wave 4 docs and Wave 3 integration tests both consume this
-    /// shape — `detected` mirrors the host's `docker info` output at
-    /// create time, and `forced` records whether the operator passed
+    /// `detected` mirrors the host's `docker info` output at create
+    /// time, and `forced` records whether the operator passed
     /// `--force-rootless-docker` AND the probe actually returned
     /// rootless (i.e. the override applied). Default-hardened hosts
     /// stamp `{detected: false, forced: false}` and Lima sessions
@@ -123,7 +123,7 @@ pub struct SessionDto {
 }
 
 /// Wire representation of the rootless-Docker probe outcome stamped
-/// onto a container session at create time (M11-S8 Wave 2).
+/// onto a container session at create time.
 ///
 /// Spec § Non-goals line 1195 declares rootless Docker out of scope
 /// for the lite container backend; the daemon enforces this at
@@ -194,7 +194,7 @@ pub struct SessionNetworkInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionMountInfo {
     /// In-session absolute path of the workspace. Unified across
-    /// backends post Bundle X (M11-S7) — both Lima and container use
+    /// backends — both Lima and container use
     /// `/home/agent/workspace/`.
     pub workspace_path: String,
     /// Absolute host path bound into the session at `workspace_path`.
@@ -233,9 +233,10 @@ pub struct SessionMountInfo {
 ///    enum object, which is what CLI consumers actually want to print.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfigDto {
-    /// User-requested CPU ceiling. M11-S7 todo #67 widened this from
-    /// `u32` to `f32` so the spec § "Resource defaults — container
-    /// only" 1-decimal precision survives the persisted round-trip.
+    /// User-requested CPU ceiling. The wire type is `f32` (widened
+    /// from a historical `u32`) so the spec § "Resource defaults —
+    /// container only" 1-decimal precision survives the persisted
+    /// round-trip.
     /// Lima sessions still see whole-number values; container
     /// sessions see whatever the operator passed (e.g. `1.5`) or
     /// `0.0` when the operator omitted the flag and the daemon will
@@ -253,9 +254,10 @@ pub struct SessionConfigDto {
     /// resolved fraction (rounded to one decimal place to match
     /// Docker's `--cpus` grammar) lands here so callers can verify
     /// the actually-applied ceiling without inspecting cgroup files.
-    /// Additive: pre-M11-S4 records without this field deserialize to
-    /// `0.0` via `#[serde(default)]`; older clients reading a newer
-    /// response simply ignore the unknown field.
+    /// Additive: records predating the resolved-ceilings projection
+    /// have no field and deserialize to `0.0` via `#[serde(default)]`;
+    /// older clients reading a newer response simply ignore the
+    /// unknown field.
     #[serde(default)]
     pub resolved_cpus: f64,
     /// Effective memory ceiling actually applied at runtime, in
@@ -263,8 +265,8 @@ pub struct SessionConfigDto {
     ///
     /// Same shape and motivation as `resolved_cpus`: a stored `0`
     /// sentinel on a container session is replaced by the daemon's
-    /// host-80% default. Pre-M11-S4 records default to `0` via
-    /// `#[serde(default)]`.
+    /// host-80% default. Records predating the resolved-ceilings
+    /// projection default to `0` via `#[serde(default)]`.
     #[serde(default)]
     pub resolved_memory_mb: u32,
     /// Rendered workspace-mode summary, if any.  Format:

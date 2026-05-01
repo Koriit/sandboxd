@@ -1,18 +1,12 @@
 //! Backend abstraction for sandbox session runtimes.
 //!
 //! Two traits — [`SessionRuntime`] and [`GuestTransport`] — describe the
-//! contract every backend (Lima today, container in M11) must satisfy.
-//! The daemon dispatches by the persisted `sessions.backend` column
+//! contract every backend (Lima and container) must satisfy. The
+//! daemon dispatches by the persisted `sessions.backend` column
 //! (see V005 migration) into a `HashMap<BackendKind, Arc<dyn SessionRuntime>>`
 //! held on `AppState`.
 //!
-//! See spec § "Architecture / Two traits" for the full rationale and
-//! `docs/internal/milestones/M11.md` for the rollout plan.
-//!
-//! M11-S1 lands the trait surface, the request-time types
-//! (`SessionSpec`, `BackendSpecific`), the V005 migration, the
-//! `LimaRuntime` / `LimaTransport` impl, and the [`RuntimeStartArgs`]
-//! boot-arg surface. The container backend lands in M11-S2.
+//! See spec § "Architecture / Two traits" for the full rationale.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -27,10 +21,10 @@ use crate::session::{SessionConfig, SessionId};
 pub mod capabilities;
 pub mod container;
 /// Rootless-Docker probe used by the container backend's
-/// session-create path. Public so the daemon's create handler (M11-S8
-/// Wave 2) can call it; structurally placed alongside [`container`]
-/// so Lima code paths cannot reach it. See the module docs for the
-/// caching and error-handling contract.
+/// session-create path. Public so the daemon's create handler can
+/// call it; structurally placed alongside [`container`] so Lima code
+/// paths cannot reach it. See the module docs for the caching and
+/// error-handling contract.
 pub mod container_rootless_probe;
 pub mod lima;
 pub mod orphan_reaper;
@@ -66,19 +60,19 @@ pub use spec::{BackendSpecific, SessionSpec};
 
 /// Backend-specific arguments to [`SessionRuntime::start`].
 ///
-/// Phase 1B's `start(handle)` boot signature was deliberately minimal —
-/// the daemon-side networking bringup (docker bridge name, deterministic
-/// VM MAC) and the persisted [`SessionConfig`] all stayed in
-/// `AppState`, with the trait implementation falling back to
-/// [`SessionConfig::default()`]. Phase 1C (M11-S1) widens that surface
+/// The original `start(handle)` boot signature was deliberately
+/// minimal — the daemon-side networking bringup (docker bridge name,
+/// deterministic VM MAC) and the persisted [`SessionConfig`] all
+/// stayed in `AppState`, with the trait implementation falling back
+/// to [`SessionConfig::default()`]. The current surface widens that
 /// so the daemon can plumb the real per-session values down to the
 /// runtime without leaking Lima-specific call sites into handlers.
 ///
-/// Today the struct carries only Lima-shaped fields; the M11-S2
-/// container backend will land its own `container_*` siblings here,
-/// keyed by which backend the [`SessionRuntime`] dispatched to. New
-/// fields land as `Option<T>` (and via `#[serde(default)]` if the type
-/// ever becomes serialisable) so the wire shape and forward-compat
+/// Today the struct carries only Lima-shaped fields; the container
+/// backend will land its own `container_*` siblings here, keyed by
+/// which backend the [`SessionRuntime`] dispatched to. New fields
+/// land as `Option<T>` (and via `#[serde(default)]` if the type ever
+/// becomes serialisable) so the wire shape and forward-compat
 /// guarantees of CLAUDE.md "On-disk compatibility" stay applicable
 /// when persistence comes for these values.
 #[derive(Debug, Clone, Default)]
@@ -214,10 +208,10 @@ impl<T: AsyncRead + AsyncWrite + ?Sized> AsyncReadWrite for T {}
 ///
 /// The agent listens on TCP `127.0.0.1:5123` inside every session,
 /// regardless of backend. Lima's transport wraps `limactl shell <vm>
-/// -- socat - TCP:127.0.0.1:5123`; the container backend will wrap
-/// `docker exec <ctr> socat - TCP:127.0.0.1:5123` (M11-S2). The
-/// payload is sandboxd's structured JSON guest protocol (`ping`,
-/// `exec`, `file upload`, `status`).
+/// -- socat - TCP:127.0.0.1:5123`; the container backend wraps
+/// `docker exec <ctr> socat - TCP:127.0.0.1:5123`. The payload is
+/// sandboxd's structured JSON guest protocol (`ping`, `exec`,
+/// `file upload`, `status`).
 ///
 /// See spec § "Architecture / Two traits" for why this is split from
 /// [`SessionRuntime::exec_interactive`].
@@ -256,11 +250,11 @@ pub trait SessionRuntime: Send + Sync {
     /// Networking, gateway, and policy work happen outside the
     /// runtime.
     ///
-    /// Phase 1B note (M11-S1): the spec sketch (line 113) omits the
-    /// session id; the daemon assigns it before dispatch and passes it
-    /// explicitly here, mirroring `LimaManager::create_vm` and the
-    /// deterministic-handle convention in spec § "Persistence / Handle
-    /// persistence: none, by convention".
+    /// The spec sketch (line 113) omits the session id; the daemon
+    /// assigns it before dispatch and passes it explicitly here,
+    /// mirroring `LimaManager::create_vm` and the deterministic-handle
+    /// convention in spec § "Persistence / Handle persistence: none,
+    /// by convention".
     async fn create(
         &self,
         session_id: &SessionId,

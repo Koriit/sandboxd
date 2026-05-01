@@ -3,15 +3,16 @@
 //!
 //! ## Why this exists
 //!
-//! The M10-S3 / M12-S1 datapath DNAT'd unmatched UDP to a userland
-//! listener on `gateway_ip:10002`; the listener `recv()`'d the datagram
-//! purely so the kernel had a `(src,dst)` pair to feed into a conntrack
-//! lookup that recovered the pre-DNAT destination (the kernel had
-//! already mutated the destination during DNAT). M12-S2 Decision 2
-//! removes the DNAT and the userland listener entirely: the kernel
-//! drops denied UDP via `nft drop` and copies the packet to NFLOG
-//! group 1. NFLOG carries the *pre-rewrite* IPv4 + UDP headers, so the
-//! pre-DNAT 5-tuple is the receiver's straight-from-the-headers parse.
+//! The previous datapath DNAT'd unmatched UDP to a userland listener on
+//! `gateway_ip:10002`; the listener `recv()`'d the datagram purely so
+//! the kernel had a `(src,dst)` pair to feed into a conntrack lookup
+//! that recovered the pre-DNAT destination (the kernel had already
+//! mutated the destination during DNAT).
+//! `2026-05-01-udp-nft-loggers-design.md` Decision 2 removes the DNAT
+//! and the userland listener entirely: the kernel drops denied UDP via
+//! `nft drop` and copies the packet to NFLOG group 1. NFLOG carries the
+//! *pre-rewrite* IPv4 + UDP headers, so the pre-DNAT 5-tuple is the
+//! receiver's straight-from-the-headers parse.
 //!
 //! ## Wire shape
 //!
@@ -127,7 +128,7 @@ const NFULA_PAYLOAD: u16 = 9;
 /// `NLA_F_NESTED` bit on attribute types. Mask out before comparing.
 const NLA_F_NESTED: u16 = 0x8000;
 /// `NLA_F_NET_BYTEORDER` bit on attribute types. Mask out before
-/// comparing — see the M12-S1 conntrack module's rationale.
+/// comparing.
 const NLA_F_NET_BYTEORDER: u16 = 0x4000;
 const NLA_TYPE_MASK: u16 = !(NLA_F_NESTED | NLA_F_NET_BYTEORDER);
 
@@ -222,10 +223,10 @@ impl NflogSubscriber {
         // Bump the receive buffer so a UDP-deny burst doesn't drop
         // packets on the kernel side before we can drain. The kernel
         // default (`net.core.rmem_default`, ~200 KiB) is enough for
-        // single-flow workloads but a 12-flow simultaneous burst (the
-        // M10-S3 load test) overflowed it on the prior 8 KiB userspace
-        // buffer, leaving only 1 of 12 packets visible. 4 MiB is the
-        // value `libnetfilter_log` uses by default and is well within
+        // single-flow workloads but a 12-flow simultaneous burst
+        // overflowed it on the prior 8 KiB userspace buffer, leaving
+        // only 1 of 12 packets visible. 4 MiB is the value
+        // `libnetfilter_log` uses by default and is well within
         // `net.core.rmem_max` on stock kernels (`8388608` on Linux 6).
         socket.set_rx_buf_sz(4 * 1024 * 1024)?;
         // pid=0 → kernel auto-assigns; nl_groups=0 because per-group

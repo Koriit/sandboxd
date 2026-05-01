@@ -9,9 +9,9 @@
 //! and one `publish(lifecycle::…)` line is all it takes to signal a
 //! lifecycle transition.
 //!
-//! Phase 5 of M10-S2 (plan line 115-132). Phase 2 shipped the
-//! [`crate::events::EventBus`] and its `publish(Event)` entrypoint; this
-//! module is the sandboxd-side producer surface feeding it.
+//! [`crate::events::EventBus`] is the bus side of this pipeline (its
+//! `publish(Event)` entrypoint accepts the envelopes built here);
+//! this module is the sandboxd-side producer surface feeding it.
 //!
 //! Spec reference: `.tasks/specs/2026-04-21-port-explicit-policies-presets-
 //! observability-design.md`, Part 3 "Lifecycle events". Each builder

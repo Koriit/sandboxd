@@ -103,9 +103,9 @@ impl fmt::Display for LayerKind {
 /// plus the spec's Part 3 "Event categories" tables.
 ///
 /// A mid-stream additive event (e.g., a future synthetic
-/// `ring_buffer_lag` lifecycle event — M10-S4 Phase 3 open question
-/// Q5) requires a new variant here before it can be named in a
-/// filter. That's the right direction of dependency: filters are a
+/// `ring_buffer_lag` lifecycle event) requires a new variant here
+/// before it can be named in a filter. That's the right direction
+/// of dependency: filters are a
 /// user-facing contract, so adding a private event without deciding
 /// how it's filterable is a design bug, not a convenience.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -121,9 +121,9 @@ pub enum EventName {
     RequestDenied,
     // -------- deny-logger / allow-logger --------
     Deny,
-    /// M12-S2 Phase 3: nft-allow-logger's `allow` event. Same on-bus
-    /// layer (`deny-logger`) as `Deny` — the two are sibling variants
-    /// of the nft-logger family per Decision 5.
+    /// nft-allow-logger's `allow` event. Same on-bus layer
+    /// (`deny-logger`) as `Deny` — the two are sibling variants of
+    /// the nft-logger family.
     Allow,
     RateLimited,
     // -------- lifecycle --------
@@ -329,9 +329,9 @@ fn decision_of(event: &Event) -> Option<DecisionKind> {
             }),
             TrafficEvent::DenyLogger(e) => match e {
                 DenyLoggerEvent::Deny(_) => Some(DecisionKind::Deny),
-                // M12-S2 Phase 3: allow-flow audit record carries an
-                // explicit allow decision (the nft-allow-logger only
-                // sees flows that nftables already classified `accept`).
+                // Allow-flow audit record carries an explicit allow
+                // decision (the nft-allow-logger only sees flows that
+                // nftables already classified `accept`).
                 DenyLoggerEvent::Allow(_) => Some(DecisionKind::Allow),
                 // `rate_limited` is a summary, not a per-attempt decision.
                 DenyLoggerEvent::RateLimited { .. } => None,

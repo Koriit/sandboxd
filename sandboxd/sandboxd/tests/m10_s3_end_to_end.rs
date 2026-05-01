@@ -1,9 +1,11 @@
-//! Milestone-exit integration tests for M10-S3 Phase 8.
+//! End-to-end integration tests for the deny-logger + nftables DNAT
+//! restructure work.
 //!
-//! Pins the four contracts the M10-S3 plan requires before the
-//! deny-logger + nftables DNAT restructure milestone can close
-//! (`.tasks/handoffs/20260422-133850-Plan-m10-s3-implementation-plan.md`,
-//! Phase 8 / lines 687-757):
+//! File name preserved as `m10_s3_end_to_end` for external references
+//! (commits, PRs, issues citing the test path); content is otherwise
+//! milestone-tag-free.
+//!
+//! Pins four contracts:
 //!
 //!   1. `tcp_connect_to_non_allowlisted_destination_emits_deny_event` —
 //!      policy allows only `10.0.0.0/8:443`; a side container on the
@@ -14,7 +16,8 @@
 //!   2. `udp_send_to_non_allowlisted_destination_emits_deny_event` —
 //!      same fixture, but `nc -u -w1 203.0.113.1 9999` sends a single
 //!      datagram. The kernel drops the datagram via `nft drop` and
-//!      mirrors it to NFLOG group 1 (M12-S2 Decision 2); the
+//!      mirrors it to NFLOG group 1
+//!      (`2026-05-01-udp-nft-loggers-design.md` Decision 2); the
 //!      nft-deny-logger's NFLOG receiver parses the IPv4+UDP headers
 //!      and emits a `deny` event with the original 5-tuple straight
 //!      from the wire. The ingestor stamps the envelope.
@@ -49,8 +52,8 @@
 //!
 //! - Docker daemon reachable via the local socket.
 //! - `sandbox-gateway` image built (`make gateway-image`). The image
-//!   has the `sandbox-nft-deny-logger` binary baked in (M12-S2 Phase 2
-//!   rename of the original M10-S3 `sandbox-deny-logger`).
+//!   has the `sandbox-nft-deny-logger` binary baked in (renamed from
+//!   the original `sandbox-deny-logger`).
 //! - Kernel permits `CAP_NET_ADMIN` containers (the gateway image
 //!   needs it for nftables injection).
 //! - The `alpine` public image must be pullable (used as the side
@@ -459,8 +462,8 @@ fn allow_10_over_8_443() -> Policy {
 /// curl sees RST; assert a `deny` event lands with the correct
 /// 5-tuple and `protocol: tcp`."
 ///
-/// This pins the M10-S3 Phase 3 deny-logger TCP path end-to-end:
-/// nft `sandbox_policy` chain → `sandbox_dnat` fallback DNAT to
+/// This pins the deny-logger TCP path end-to-end: nft
+/// `sandbox_policy` chain → `sandbox_dnat` fallback DNAT to
 /// deny-logger :10001 → deny-logger emits JSONL record → sandboxd's
 /// ingestor tails the file → stamped envelope lands on `EventBus`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -537,7 +540,7 @@ async fn integration_tcp_connect_to_non_allowlisted_destination_emits_deny_event
     // SYN is dropped silently, so curl exits with code 28 and stderr
     // "connection timed out". This assertion matches the e2e practice
     // in `tests/e2e/test_m4_policy.py` (accepts timeout / refused /
-    // no route as valid deny signatures). The *load-bearing* M10-S3
+    // no route as valid deny signatures). The *load-bearing*
     // deny-logger contract is the `deny` event with correct 5-tuple
     // on the EventBus (asserted below) — the stderr signature is
     // only a liveness check that the attempt actually failed.
@@ -605,8 +608,10 @@ async fn integration_tcp_connect_to_non_allowlisted_destination_emits_deny_event
 /// `orig_dst_ip`, `orig_dst_port`, `src_ip`, `src_port`, `layer` as above."
 ///
 /// UDP has no three-way handshake, so the gateway's deny path is
-/// different from TCP. M12-S2 (Decision 2): unmatched UDP is mirrored
-/// to NFLOG group 1 and dropped at PREROUTING — no DNAT, no userland
+/// different from TCP. Per
+/// `2026-05-01-udp-nft-loggers-design.md` Decision 2, unmatched UDP
+/// is mirrored to NFLOG group 1 and dropped at PREROUTING — no
+/// DNAT, no userland
 /// listener. The kernel emits one netlink message per dropped packet
 /// with the pre-rewrite IPv4+UDP headers in `NFULA_PAYLOAD`; the
 /// `sandbox-nft-deny-logger`'s NFLOG receiver parses those headers
@@ -679,9 +684,10 @@ async fn integration_udp_send_to_non_allowlisted_destination_emits_deny_event() 
     // observability-design.md` lines 810-817): the UDP deny event
     // carries the **pre-DNAT** destination — `203.0.113.1:9999` here.
     //
-    // M12-S2 Decision 2: unmatched UDP is mirrored to NFLOG group 1 at
-    // PREROUTING and then dropped — no DNAT, no userland listener, no
-    // conntrack lookup. NFLOG copies the original IPv4+UDP headers to
+    // Per `2026-05-01-udp-nft-loggers-design.md` Decision 2,
+    // unmatched UDP is mirrored to NFLOG group 1 at PREROUTING and
+    // then dropped — no DNAT, no userland listener, no conntrack
+    // lookup. NFLOG copies the original IPv4+UDP headers to
     // userspace via `NFULA_PAYLOAD`, so the
     // `sandbox-nft-deny-logger` receiver reads the pre-rewrite
     // 5-tuple straight from the wire and stamps it onto the JSONL
@@ -724,7 +730,7 @@ async fn integration_udp_send_to_non_allowlisted_destination_emits_deny_event() 
             );
             assert_ne!(
                 d.orig_dst_port, 10002,
-                "M12-S2 regression: deny event must not carry the legacy \
+                "regression: deny event must not carry the legacy \
                  deny-logger UDP listener port :10002 as orig_dst_port \
                  (the listener no longer exists)",
             );
@@ -773,9 +779,10 @@ fn nft_tables(gw_container: &str) -> std::collections::BTreeSet<String> {
 /// Also asserts `sandbox_policy` contains only `chain output` — no
 /// VM-egress filter chain (`forward`, `prerouting`, etc.). This is
 /// the "no VM-egress reject rules in sandbox_policy" exit criterion:
-/// the M10-S3 restructure moved all reject logic into `sandbox_dnat`'s
-/// conditional DNAT fallback, leaving `sandbox_policy` to hold only
-/// the Envoy-egress allow list on the `output` chain.
+/// the deny-path restructure moved all reject logic into
+/// `sandbox_dnat`'s conditional DNAT fallback, leaving
+/// `sandbox_policy` to hold only the Envoy-egress allow list on the
+/// `output` chain.
 #[test]
 fn integration_session_start_produces_exactly_sandbox_sandbox_dnat_sandbox_policy_tables() {
     let gw = GatewaySession::create(Ipv4Addr::new(10, 212, 0, 0));
@@ -796,8 +803,7 @@ fn integration_session_start_produces_exactly_sandbox_sandbox_dnat_sandbox_polic
     assert_eq!(
         tables, expected,
         "post-apply gateway nftables tables must be exactly \
-         {{sandbox, sandbox_dnat, sandbox_policy}} (M10-S3 Phase 2 \
-         restructure); got {tables:?}"
+         {{sandbox, sandbox_dnat, sandbox_policy}}; got {tables:?}"
     );
 
     // Assert `sandbox_policy` holds only `chain output` and no
@@ -1230,15 +1236,14 @@ async fn integration_killing_deny_logger_emits_health_degraded_then_restored() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 5 (M12-S1): UDP pre-DNAT attribution under load
+// Test 5: UDP pre-DNAT attribution under load
 // ---------------------------------------------------------------------------
 
-/// M12-S1 deliverable, retargeted in M12-S2 Phase 2 onto the NFLOG
-/// data path: prove that pre-DNAT attribution stays tight under
-/// concurrent flows. Single-flow correctness is covered by Test 2;
-/// this test exercises the path under multi-flow contention to expose
-/// any race between the kernel's NFLOG emission and the receiver's
-/// per-message parse.
+/// Prove that pre-DNAT attribution stays tight under concurrent flows
+/// on the NFLOG data path. Single-flow correctness is covered by
+/// Test 2; this test exercises the path under multi-flow contention
+/// to expose any race between the kernel's NFLOG emission and the
+/// receiver's per-message parse.
 ///
 /// **Shape.** From a single side container, fire N concurrent UDP
 /// datagrams to N distinct denied destinations
@@ -1249,8 +1254,8 @@ async fn integration_killing_deny_logger_emits_health_degraded_then_restored() {
 /// deny event with the original 5-tuple straight from the wire.
 /// Wait for N matching deny events on the bus and assert each one
 /// carries the originally-targeted 5-tuple — there is no pre-/post-
-/// DNAT asymmetry under M12-S2 (no DNAT for the deny path), so the
-/// "post-DNAT (gateway_ip, 10002)" regression shape from M12-S1 is
+/// DNAT asymmetry on the current deny path (no DNAT for UDP), so the
+/// historical "post-DNAT (gateway_ip, 10002)" regression shape is
 /// now structurally impossible; we keep an assertion against it as a
 /// defense-in-depth pin.
 ///
@@ -1359,9 +1364,9 @@ async fn integration_udp_load_pre_dnat_attribution_holds_under_concurrent_flows(
             if d.protocol != DenyProtocol::Udp {
                 return false;
             }
-            // M12-S2 defense-in-depth: there is no `(gateway_ip,
-            // 10002)` regression shape to worry about under NFLOG
-            // (the deny path no longer DNATs), but a regression that
+            // Defense-in-depth: there is no `(gateway_ip, 10002)`
+            // regression shape to worry about under NFLOG (the deny
+            // path no longer DNATs), but a regression that
             // re-introduced the listener would surface here.
             if d.orig_dst_ip == gateway_ip && d.orig_dst_port == 10002 {
                 // Match it so the test surfaces the exact bad event in
@@ -1385,7 +1390,7 @@ async fn integration_udp_load_pre_dnat_attribution_holds_under_concurrent_flows(
                 assert_ne!(
                     (d.orig_dst_ip, d.orig_dst_port),
                     (gateway_ip, 10002u16),
-                    "M12-S2 regression: deny event carried the legacy \
+                    "regression: deny event carried the legacy \
                      deny-logger UDP listener address (gateway_ip:10002); \
                      the userland listener no longer exists and NFLOG \
                      carries the original 5-tuple by construction"

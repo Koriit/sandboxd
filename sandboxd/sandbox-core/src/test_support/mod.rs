@@ -6,10 +6,8 @@
 //! module under `sandbox-core` is unreachable from `sandboxd/tests/`.
 //! Putting the helper in `src/` (instead of `tests/helpers/`) is the
 //! idiomatic Cargo pattern for shared cross-crate test scaffolding;
-//! see the M11-S8 plan section ("Single-test file ... plus a helper
-//! ... or similar") which permits the placement deviation when the
-//! literal `tests/helpers/` path conflicts with cross-crate
-//! consumption.
+//! the literal `tests/helpers/` path conflicts with cross-crate
+//! consumption, so the deviation is intentional.
 //!
 //! Each helper is **public-API**, **runtime-stable**, and exercised
 //! only by integration tests. Production code paths must never reach

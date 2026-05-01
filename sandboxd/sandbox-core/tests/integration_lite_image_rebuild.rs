@@ -1,5 +1,6 @@
-//! Integration tests for [`sandbox_core::backend::rebuild_lite_image`] —
-//! Phase 4C of the M11-S4 lite-mode container backend.
+//! Integration tests for [`sandbox_core::backend::rebuild_lite_image`]
+//! — the operator-driven rebuild path of the lite-mode container
+//! backend.
 //!
 //! `rebuild_lite_image` is the operator-driven counterpart to
 //! `ensure_image`: where `ensure_image` short-circuits when the image is

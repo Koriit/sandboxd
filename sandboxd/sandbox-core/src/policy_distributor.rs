@@ -32,7 +32,7 @@ struct DistributionState {
 /// Distribution is atomic: if any step fails, all previously completed
 /// steps are rolled back to the previous configuration.
 ///
-/// **M9-S18**: Envoy config is split into a **static bootstrap**
+/// Envoy config is split into a **static bootstrap**
 /// (`envoy-bootstrap.yaml`) and a **dynamic listener file**
 /// (`listeners/listener.yaml`, served via filesystem LDS). The bootstrap
 /// is written via `docker exec`; the listener file is written on the host
@@ -427,9 +427,9 @@ fn read_file_from_container(container: &str, path: &str) -> Result<String, Sandb
 /// exec`. The snapshot is used by rollback to restore the pre-apply
 /// ruleset.
 ///
-/// **M10-S3 shape.** Both tables are managed as a pair — `sandbox_dnat`
-/// carries the VM-egress conditional-DNAT decision and both concat
-/// sets; `sandbox_policy` carries the gateway-egress allow `output`
+/// Both tables are managed as a pair — `sandbox_dnat` carries the
+/// VM-egress conditional-DNAT decision and both concat sets;
+/// `sandbox_policy` carries the gateway-egress allow `output`
 /// chain keyed on the same sets. A rollback that restored only one
 /// would leave the gateway in a half-configured state, so the snapshot
 /// covers both. Each table is listed separately; either may be absent

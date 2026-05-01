@@ -6,12 +6,12 @@
 //! The wire (JSON) shape and the domain → wire mapper live in
 //! [`crate::api::event_dto`] and [`crate::api::event_mapper`] respectively.
 //!
-//! Subsequent phases of M10-S2 add:
+//! Submodules:
 //!
-//! - `bus.rs` — per-session ring buffer (Phase 2).
-//! - `vm_ip_map.rs` — vm-ip → session-id lookup (Phase 2).
-//! - `lifecycle.rs` — sandboxd-side emitters (Phase 5).
-//! - `ingest/` — JSONL-tail producers into the bus (Phase 7).
+//! - `bus.rs` — per-session ring buffer.
+//! - `vm_ip_map.rs` — vm-ip → session-id lookup.
+//! - `lifecycle.rs` — sandboxd-side emitters.
+//! - `ingest/` — JSONL-tail producers into the bus.
 
 use std::path::PathBuf;
 
@@ -141,7 +141,7 @@ mod tests {
     // restores the relevant vars within its own body to be robust against
     // future runner changes that might serialise tests within a process.
     // Mirrors the test pattern in `atomic_listener_writer` for
-    // `listener_host_root` (M10-S8 #20).
+    // `listener_host_root`.
     // -----------------------------------------------------------------------
 
     /// Snapshot the trio of env vars `events_host_root` reads, clear

@@ -120,7 +120,7 @@ pub enum TrafficEvent {
     /// mitmproxy addon per-request decision.
     Mitmproxy(MitmproxyEvent),
     /// Deny-logger per-attempt decision on a VM-egress connection that
-    /// matches no allow rule (see M10-S3).
+    /// matches no allow rule.
     DenyLogger(DenyLoggerEvent),
 }
 
@@ -199,18 +199,17 @@ pub enum MitmproxyEvent {
 /// Deny-logger / allow-logger `deny` / `allow` / `rate_limited`.
 ///
 /// Despite the historical "DenyLogger" name on the domain enum, the
-/// `nft-` family of gateway-container loggers (M12-S2 Decision 4)
-/// produces three event kinds that share a common envelope and
-/// flow through the same daemon-side ingest pipeline (Decision 5):
+/// `nft-` family of gateway-container loggers produces three event
+/// kinds that share a common envelope and flow through the same
+/// daemon-side ingest pipeline:
 ///
-/// - **`Deny`** — emitted by `sandbox-nft-deny-logger`. The original
-///   M10-S3 contract: spec Part 3 / "Deny-logger component" + "Traffic
-///   events" row for layer `deny-logger`. Pre-DNAT 5-tuple recovered
-///   via `SO_ORIGINAL_DST` (TCP) or NFLOG payload parse (UDP, M12-S2
-///   Decision 2). Same wire shape as `Allow`.
-/// - **`Allow`** — emitted by `sandbox-nft-allow-logger`. M12-S2
-///   Decision 3: one record per new tracked UDP flow observed via
-///   `nfnetlink_conntrack`'s `NFNLGRP_CONNTRACK_NEW` multicast group.
+/// - **`Deny`** — emitted by `sandbox-nft-deny-logger`. Spec Part 3
+///   / "Deny-logger component" + "Traffic events" row for layer
+///   `deny-logger`. Pre-DNAT 5-tuple recovered via `SO_ORIGINAL_DST`
+///   (TCP) or NFLOG payload parse (UDP). Same wire shape as `Allow`.
+/// - **`Allow`** — emitted by `sandbox-nft-allow-logger`: one record
+///   per new tracked UDP flow observed via `nfnetlink_conntrack`'s
+///   `NFNLGRP_CONNTRACK_NEW` multicast group.
 ///   The wire shape mirrors `Deny` field-for-field on purpose so the
 ///   round-trip pipeline is one mapper code path with two
 ///   discriminator branches; the audit record answers "client X
@@ -231,7 +230,7 @@ pub enum MitmproxyEvent {
 pub enum DenyLoggerEvent {
     /// Single denied connection attempt (deny-logger source).
     Deny(DenyLoggerDeny),
-    /// Single allowed UDP flow (allow-logger source, M12-S2 Decision 3).
+    /// Single allowed UDP flow (allow-logger source).
     Allow(DenyLoggerAllow),
     /// Periodic cap-breach summary: how many events were dropped
     /// since the last summary tick. Either binary can produce these;
@@ -269,20 +268,20 @@ pub struct DenyLoggerDeny {
 /// Mirror of [`DenyLoggerDeny`] field-for-field — same names, same
 /// types, same on-wire shape. The only structural difference between
 /// allow and deny is the `event` discriminator on the DTO; the
-/// 5-tuple parsing and ingest path is shared (M12-S2 Decision 5
-/// "additive change, not a new pipeline").
+/// 5-tuple parsing and ingest path is shared ("additive change, not
+/// a new pipeline").
 ///
 /// Field rationale:
 ///
 /// - `orig_dst_ip` / `orig_dst_port`: destination as observed on the
-///   conntrack ORIGINAL tuple. Under M12-S2 Decision 1, the UDP allow
-///   path does *not* DNAT, so the kernel-emitted ORIGINAL tuple's
-///   destination is the literal address the VM dialled — `orig_dst_*`
-///   reads honestly even though there is no NAT to "originate" past.
+///   conntrack ORIGINAL tuple. The UDP allow path does *not* DNAT,
+///   so the kernel-emitted ORIGINAL tuple's destination is the
+///   literal address the VM dialled — `orig_dst_*` reads honestly
+///   even though there is no NAT to "originate" past.
 /// - `protocol`: always [`DenyProtocol::Udp`] in practice. Allow-logger
-///   filters the NFCT stream for UDP at parse time (Decision 3
-///   rationale) — TCP allow-path audit is Envoy's job. The field
-///   exists on both `Allow` and `Deny` so the DTO stays uniform.
+///   filters the NFCT stream for UDP at parse time — TCP allow-path
+///   audit is Envoy's job. The field exists on both `Allow` and
+///   `Deny` so the DTO stays uniform.
 /// - `src_ip` / `src_port`: VM-side endpoint, ORIGINAL tuple source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DenyLoggerAllow {
@@ -303,9 +302,9 @@ pub struct DenyLoggerAllow {
 ///
 /// Serialized on the wire as `"tcp"` / `"udp"` per spec Part 3 /
 /// "Traffic events" row for layer `deny-logger`. Reused on `allow`
-/// events (M12-S2 Decision 5) so the wire shape is uniform — the
-/// allow-logger filters non-UDP at parse time, so in practice
-/// `DenyProtocol::Udp` is the only value an `Allow` payload carries.
+/// events so the wire shape is uniform — the allow-logger filters
+/// non-UDP at parse time, so in practice `DenyProtocol::Udp` is the
+/// only value an `Allow` payload carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DenyProtocol {
     Tcp,
@@ -760,12 +759,12 @@ mod tests {
         assert_eq!(json["orig_dst_port"], 53);
     }
 
-    /// M12-S2 Decision 3 / 5: round-trip an `allow` event the same
-    /// way the existing `deny` round-trip tests do. The deny tests
-    /// stay green untouched (regression guard); this test adds the
-    /// new variant. The 5-tuple shape is identical to deny —
-    /// `orig_dst_ip`, `orig_dst_port`, `protocol`, `src_ip`,
-    /// `src_port` — only the `event` discriminator differs.
+    /// Round-trip an `allow` event the same way the existing `deny`
+    /// round-trip tests do. The deny tests stay green untouched
+    /// (regression guard); this test adds the new variant. The
+    /// 5-tuple shape is identical to deny — `orig_dst_ip`,
+    /// `orig_dst_port`, `protocol`, `src_ip`, `src_port` — only the
+    /// `event` discriminator differs.
     #[test]
     fn env_round_trip_traffic_deny_logger_allow_udp() {
         let event = Event::Traffic {

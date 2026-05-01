@@ -1,8 +1,8 @@
 //! Rootless-Docker probe for the container backend.
 //!
 //! Spec § Non-goals line 1195 declares rootless Docker out of scope:
-//! Lite's target is **default-hardened Docker**. The previous milestone
-//! (M11-S7) caught the gap between this prose contract and the daemon's
+//! Lite's target is **default-hardened Docker**. An earlier audit
+//! caught the gap between this prose contract and the daemon's
 //! actual behavior — a polarity-inverted `is_rootless_docker()` skipif
 //! on `tests/e2e/test_lite.py:493` was silently masking the fact that
 //! the daemon happily created container sessions on rootless hosts,
@@ -20,17 +20,17 @@
 //! # Placement and reachability
 //!
 //! This module is a sibling of [`super::container`] and is **only**
-//! consumed by the container backend's session-create path (wired in
-//! M11-S8 Wave 2). It is **not** re-exported via [`super`] and Lima
-//! code paths never reach it — the structural decision keeps the probe
-//! container-only by construction, not by convention.
+//! consumed by the container backend's session-create path. It is
+//! **not** re-exported via [`super`] and Lima code paths never reach
+//! it — the structural decision keeps the probe container-only by
+//! construction, not by convention.
 //!
-//! # Public API (consumed by Wave 2's session-create handler)
+//! # Public API (consumed by the session-create handler)
 //!
 //! - [`is_rootless_docker`] — async, returns `Ok(true)` on rootless
 //!   hosts, `Ok(false)` on default-hardened hosts, and a typed
 //!   [`SandboxError::Gateway`] if `docker info` itself fails. Probe
-//!   failure is **never** treated as "not rootless" — Wave 2's caller
+//!   failure is **never** treated as "not rootless" — the caller
 //!   propagates the error so the operator sees a clear "Docker daemon
 //!   unreachable" diagnostic rather than a silent default that could
 //!   later create a session against an unsupported environment.
@@ -221,9 +221,9 @@ fn parse_security_options(output: &str) -> bool {
 /// configurations (e.g. one test asserts "rootless ⇒ refused", a
 /// neighbour asserts "default-hardened ⇒ proceeds"). Exposed as
 /// `pub` (not `pub(crate)`) so cross-crate integration tests in the
-/// daemon (M11-S8 Wave 3, located in `sandboxd/sandboxd/tests/`) can
-/// invalidate the cache between PATH-stub reconfigurations within
-/// the same test binary.
+/// daemon (located in `sandboxd/sandboxd/tests/`) can invalidate the
+/// cache between PATH-stub reconfigurations within the same test
+/// binary.
 ///
 /// Production code MUST NOT call this — caching is a correctness
 /// property of the probe (a daemon's Docker mode does not change

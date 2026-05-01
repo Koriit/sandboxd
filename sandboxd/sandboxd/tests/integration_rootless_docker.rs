@@ -1,7 +1,6 @@
-//! M11-S8 Wave 3 — rootless-Docker enforcement at the daemon (integration
-//! tests).
+//! Rootless-Docker enforcement at the daemon (integration tests).
 //!
-//! Pins four contracts laid out in M11.md § M11-S8 (lines 314-326):
+//! Pins four contracts:
 //!
 //! 1. `integration_rootless_docker_session_create_refused` — the daemon
 //!    returns HTTP 400 with the spec-shaped rejection body when the
@@ -136,7 +135,7 @@ fn sandbox_cli_bin() -> PathBuf {
 
 /// Materialise a `users.conf` whose single subnet's `allow_users`
 /// resolves to the test process's own uid. The daemon's startup
-/// validator (M11-S2 Phase 2C) requires this to come up.
+/// validator requires this to come up.
 ///
 /// Returns the file path; the caller passes it to the daemon via
 /// `SANDBOX_USERS_CONF`. The caller owns the surrounding tempdir.
@@ -725,8 +724,7 @@ fn integration_default_hardened_docker_proceeds() {
     cleanup.disarm();
 }
 
-/// Test 5 — probe failure surfaces as a daemon-side gateway error
-/// (todo #83 from M11-S8 / kio-reviewer NIT 3, folded into M11-S9).
+/// Test 5 — probe failure surfaces as a daemon-side gateway error.
 ///
 /// When the docker-info PATH stub is configured to `Fail`, the
 /// rootless-Docker probe at session-create time bubbles up its

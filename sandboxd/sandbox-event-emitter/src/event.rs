@@ -12,7 +12,7 @@
 //! Part 3 / "Traffic events" table row for layer `deny-logger` (the
 //! `deny` / `rate_limited` shape) and
 //! `2026-05-01-udp-nft-loggers-design.md` Decision 3 / Decision 5
-//! (the `allow` shape, M12-S2).
+//! (the `allow` shape).
 //!
 //! **Session awareness:** intentionally absent. sandboxd stamps
 //! `session` at ingest via its `vm_ip → session-id` map — matches the
@@ -38,13 +38,13 @@ pub enum Protocol {
 }
 
 /// A single denied connection attempt — one record per accepted TCP
-/// connection, one record per received UDP datagram (M10-S3 path) or
-/// per NFLOG-observed dropped UDP datagram (M12-S2 path; same wire
-/// shape, different data source).
+/// connection or per NFLOG-observed dropped UDP datagram (same wire
+/// shape across the historical UDP-listener and current NFLOG data
+/// sources, per `2026-05-01-udp-nft-loggers-design.md`).
 ///
 /// Field names are spec-canonical; **do not rename** without updating
-/// the ingest parser in sandbox-core and coordinating with the M10-S3
-/// Phase 5 handoff.
+/// the ingest parser in sandbox-core. The wire shape is part of the
+/// daemon-side ingest contract.
 #[derive(Debug, Clone, Serialize)]
 pub struct DenyRecord {
     pub orig_dst_ip: Ipv4Addr,
@@ -55,7 +55,8 @@ pub struct DenyRecord {
 }
 
 /// A single allowed UDP flow as observed via `NFCT_T_NEW` on the
-/// `nfnetlink_conntrack` multicast group (spec Decision 3, M12-S2).
+/// `nfnetlink_conntrack` multicast group
+/// (`2026-05-01-udp-nft-loggers-design.md` Decision 3).
 ///
 /// ## Field rationale
 ///
@@ -112,8 +113,8 @@ pub struct AllowRecord {
 /// Wire-shape envelope for a single JSONL line.
 ///
 /// `layer` is the emitting binary's layer tag (`"deny-logger"` for the
-/// nft-deny-logger; the new nft-allow-logger will pass its own tag at
-/// the `emit_*` call site once that binary lands in M12-S2 Phase 3).
+/// nft-deny-logger; `"allow-logger"` for the nft-allow-logger — each
+/// binary passes its own tag at the `emit_*` call site).
 /// `event` discriminates between `"deny"`, `"allow"`, and
 /// `"rate_limited"`. Flattened payload keeps the on-the-wire structure
 /// flat so the ingest parser can `serde_json::from_str` a single struct
@@ -196,8 +197,10 @@ impl EventEmitter {
     /// Emit an `allow` line.
     ///
     /// Used by `sandbox-nft-allow-logger` when it observes a new UDP
-    /// flow on `NFNLGRP_CONNTRACK_NEW` (M12-S2 Decision 3). Same on-disk
-    /// envelope as `deny`, distinguished by the `event` discriminator.
+    /// flow on `NFNLGRP_CONNTRACK_NEW`
+    /// (`2026-05-01-udp-nft-loggers-design.md` Decision 3). Same
+    /// on-disk envelope as `deny`, distinguished by the `event`
+    /// discriminator.
     pub fn emit_allow(&self, record: AllowRecord) {
         let line = Line::Allow {
             timestamp: Utc::now(),
@@ -303,9 +306,9 @@ mod tests {
 
     /// Round-trip test for `AllowRecord` mirroring the deny equivalent.
     /// Pins the wire-shape contract: same flat envelope, same
-    /// snake_case field names, distinct `event` discriminator. Phase 3
-    /// of M12-S2 will add an integration test against the real NFCT
-    /// data source; this hermetic test pins the on-disk shape so the
+    /// snake_case field names, distinct `event` discriminator. The
+    /// allow-logger's integration tests cover the real NFCT data
+    /// source; this hermetic test pins the on-disk shape so the
     /// daemon-side parser can be written against a stable contract.
     #[test]
     fn allow_line_has_required_fields_and_snake_case() {

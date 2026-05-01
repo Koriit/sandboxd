@@ -5,8 +5,8 @@
 //! records) because none of them know the session ID. sandboxd owns the
 //! mapping: when a session's `NetworkInfo` is ready, its `vm_ip` is bound
 //! here; when the session's networking is torn down, the entry is removed.
-//! The ingest layer (M10-S2 Phase 7) calls [`VmIpSessionMap::lookup`] to
-//! stamp the `session` field on each [`crate::events::EventEnvelope`]
+//! The ingest layer calls [`VmIpSessionMap::lookup`] to stamp the
+//! `session` field on each [`crate::events::EventEnvelope`]
 //! before publishing it to the [`crate::events::EventBus`] — this is the
 //! "session-ID attribution is sandboxd's job" concern from spec Part 3.
 //!

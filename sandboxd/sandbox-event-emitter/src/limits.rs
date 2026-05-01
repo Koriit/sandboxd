@@ -3,8 +3,8 @@
 //! Spec reference: `2026-04-21-port-explicit-policies-presets-observability-design.md`
 //! Part 3 / "Hardening rules" § 5.
 //!
-//! The deny-logger (and, in M12-S2, the allow-logger sharing this same
-//! crate) must not spam its JSONL file — a misbehaving VM could open
+//! The deny-logger (and the allow-logger that shares this crate)
+//! must not spam its JSONL file — a misbehaving VM could open
 //! thousands of denied connections per second and drown the ingest
 //! pipeline. We cap admitted events at `rate_cap` per rolling 1-second
 //! window. Excess attempts are *not* emitted; they are counted and

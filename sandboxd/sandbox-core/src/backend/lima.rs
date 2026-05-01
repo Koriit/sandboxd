@@ -51,8 +51,8 @@ impl From<VmStatus> for RuntimeStatus {
     /// reports as `Unknown(s)` is forwarded with the original status
     /// string preserved for diagnostic display. Lima today does not
     /// surface explicit `Creating` / `Error` states — those variants
-    /// exist on `RuntimeStatus` for the container backend (M11-S2) and
-    /// are populated by it directly.
+    /// exist on `RuntimeStatus` for the container backend and are
+    /// populated by it directly.
     fn from(status: VmStatus) -> Self {
         match status {
             VmStatus::Running => RuntimeStatus::Running,
@@ -72,9 +72,9 @@ impl From<VmStatus> for RuntimeStatus {
 /// is stateless over [`RuntimeHandle`] (see the trait doc on
 /// [`SessionRuntime`]). Wraps [`crate::lima::LimaManager`] as a private
 /// inner field; folding the manager content into this module and
-/// narrowing the [`Self::manager`] accessor is deferred until M11-S2,
-/// when the trait surface widens enough to cover daemon-startup
-/// orchestration without an escape hatch.
+/// narrowing the [`Self::manager`] accessor is deferred until the
+/// trait surface widens enough to cover daemon-startup orchestration
+/// without an escape hatch.
 pub struct LimaRuntime {
     manager: Arc<LimaManager>,
     capabilities: Capabilities,
@@ -96,8 +96,8 @@ impl LimaRuntime {
     /// Access the inner [`LimaManager`] for Lima-specific operations
     /// not on the trait surface — base-image build, template
     /// generation, base-image hash check, etc. Future polish: deferred
-    /// until M11-S2 grows the trait enough to cover the daemon-startup
-    /// flow without escape hatches.
+    /// until the trait grows enough to cover the daemon-startup flow
+    /// without escape hatches.
     pub fn manager(&self) -> &Arc<LimaManager> {
         &self.manager
     }
@@ -132,13 +132,13 @@ impl LimaRuntime {
                 // Lima's `BackendSpecific::Lima` carries integer `cpus`
                 // by spec — the precise `cpus_decimal` only applies to
                 // container sessions. None here keeps the persisted
-                // shape consistent with the pre-todo-#67 Lima record.
+                // shape consistent with the historical Lima record.
                 cpus_decimal: None,
-                // M11-S8 Wave 2: rootless-Docker probe is gated to
-                // the container backend per spec § Non-goals 1195.
-                // Lima sessions never construct this state — the
-                // `None` keeps the persisted shape consistent with
-                // pre-Wave-2 Lima records.
+                // Rootless-Docker probe is gated to the container
+                // backend per spec § Non-goals 1195. Lima sessions
+                // never construct this state — the `None` keeps the
+                // persisted shape consistent with Lima records that
+                // predate the probe.
                 rootless_docker: None,
             }),
             BackendSpecific::Container { .. } => Err(SandboxError::InvalidArgument(format!(
@@ -181,7 +181,7 @@ impl SessionRuntime for LimaRuntime {
     /// The VM is **not** booted, **not** cloned from the golden image,
     /// and the guest agent is **not** installed — those orchestration
     /// steps remain in `AppState` (clone path lives behind
-    /// [`Self::manager`] until M11-S2 generalises them).
+    /// [`Self::manager`] until the trait generalises them).
     ///
     /// When [`SessionSpec::template`] is `Some`, the runtime delegates to
     /// [`LimaManager::create_vm_with_custom_template`]; otherwise it

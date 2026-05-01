@@ -400,7 +400,7 @@ mod tests {
     /// event) or server-rejected (counted into the periodic
     /// `rate_limited` summary).
     ///
-    /// # Determinism (M11-S9)
+    /// # Determinism
     ///
     /// The previous shape of this test wrapped each `connect()` in a
     /// 50-attempt retry loop that tolerated both `ECONNREFUSED` and
@@ -414,7 +414,7 @@ mod tests {
     /// was being treated as "retry" rather than "drop", double-
     /// counting connections and silently corrupting the assertion.
     ///
-    /// The M11-S9 shape eliminates both hazards:
+    /// The current shape eliminates both hazards:
     ///
     /// 1. The listener is bound with `backlog = BURST * 4`. The
     ///    kernel's accept queue can hold every burst connection, so

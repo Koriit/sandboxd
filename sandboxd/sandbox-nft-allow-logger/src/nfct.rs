@@ -3,15 +3,15 @@
 //!
 //! ## Why this exists
 //!
-//! M12-S2 Decision 3 (`2026-05-01-udp-nft-loggers-design.md`) closes
-//! the UDP allow-flow audit gap. Allowed UDP traverses no userland
-//! datapath under Decision 1 — the kernel `accept`s the packet at
-//! prerouting, MASQUERADE rewrites the source on egress, and the
-//! datagram leaves directly. The audit signal is the conntrack
-//! NEW-flow event the kernel already emits on every new tracked
-//! flow: this binary subscribes to that multicast stream, filters
-//! for UDP at parse time, extracts the original-direction tuple, and
-//! writes one JSONL `allow` record per flow.
+//! `2026-05-01-udp-nft-loggers-design.md` Decision 3 closes the UDP
+//! allow-flow audit gap. Allowed UDP traverses no userland datapath
+//! under Decision 1 — the kernel `accept`s the packet at prerouting,
+//! MASQUERADE rewrites the source on egress, and the datagram leaves
+//! directly. The audit signal is the conntrack NEW-flow event the
+//! kernel already emits on every new tracked flow: this binary
+//! subscribes to that multicast stream, filters for UDP at parse
+//! time, extracts the original-direction tuple, and writes one JSONL
+//! `allow` record per flow.
 //!
 //! ## NFCT vs NFLOG: subscription model
 //!
@@ -72,8 +72,8 @@
 //!     `CTA_IP_V4_SRC`, `CTA_IP_V4_DST`. Mask before comparing.
 //!
 //! `NLA_TYPE_MASK = ~(NLA_F_NESTED | NLA_F_NET_BYTEORDER)` is the
-//! defensive idiom (same one M12-S1's deleted conntrack module
-//! used; the deny-logger's NFLOG parser uses the identical mask).
+//! defensive idiom (the deny-logger's NFLOG parser uses the
+//! identical mask).
 //!
 //! ## NEW-only filtering
 //!
@@ -241,9 +241,9 @@ impl NfctSubscriber {
     /// once with `nl_groups = 0x1` and immediately start receiving.
     ///
     /// Requires `CAP_NET_ADMIN` — present in the gateway container by
-    /// virtue of `--cap-add NET_ADMIN` (audit §2.4). Conntrack
-    /// subsystem itself is loaded as part of M12-S1's conntrack
-    /// netlink work.
+    /// virtue of `--cap-add NET_ADMIN` (audit §2.4). The conntrack
+    /// subsystem is loaded by the existing gateway-container netlink
+    /// setup.
     pub fn bind() -> Result<Self, NfctError> {
         let mut socket = Socket::new(NETLINK_NETFILTER)?;
         // Bump the receive buffer for the same reason the deny-logger

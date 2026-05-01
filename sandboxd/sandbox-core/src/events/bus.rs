@@ -156,8 +156,8 @@ impl SessionEventSink {
     /// any event published between snapshot and subscribe shows up at
     /// least once: either it's already in the ring when we snapshot, or
     /// it arrives on the freshly-subscribed receiver. The trade-off is
-    /// that boundary events can be seen twice; the SSE handler (M10-S2
-    /// Phase 8) deduplicates by (timestamp, layer, event) when needed.
+    /// that boundary events can be seen twice; the SSE handler
+    /// deduplicates by (timestamp, layer, event) when needed.
     fn snapshot_and_subscribe(&self) -> EventSubscription {
         let rx = self.tx.subscribe();
         let ring = self.ring.lock().expect("event ring mutex poisoned");

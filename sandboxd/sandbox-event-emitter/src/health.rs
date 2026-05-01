@@ -2,8 +2,8 @@
 //!
 //! Spec reference: `2026-04-21-port-explicit-policies-presets-observability-design.md`
 //! Part 3 / "Listener design / Healthcheck listener" and "Liveness
-//! posture", with M12-S2 Resolution 5 pinning the response field
-//! names across the binary rename.
+//! posture", with `2026-05-01-udp-nft-loggers-design.md` Resolution 5
+//! pinning the response field names across the binary rename.
 //!
 //! `GET /health` returns `200 OK` with a JSON body whose field set is
 //! supplied by the caller via the [`HealthShape`] callback. Any other
@@ -14,23 +14,23 @@
 //! semantics — keep-alive, chunked encoding, and header tolerance are
 //! out of scope.
 //!
-//! ## Field-name evolution across the M12-S2 rename
+//! ## Field-name evolution across the binary rename
 //!
-//! Resolution 5 of the M12-S2 design spec preserves the bulk of the
-//! `/health` JSON shape across the binary rename, but renames the one
-//! field whose name pinned the old (now-removed) implementation: the
-//! `udp_listener` key has become `nflog_socket` because the UDP deny
-//! path no longer runs a userland datagram listener — the kernel
-//! emits NFLOG netlink messages and the binary's NFLOG subscriber
-//! parses them. Operator-tooling that pinned the literal key name
-//! needs an update; tooling that probes for top-level field
-//! *presence* keeps working.
+//! Resolution 5 of `2026-05-01-udp-nft-loggers-design.md` preserves
+//! the bulk of the `/health` JSON shape across the binary rename, but
+//! renames the one field whose name pinned the old (now-removed)
+//! implementation: the `udp_listener` key has become `nflog_socket`
+//! because the UDP deny path no longer runs a userland datagram
+//! listener — the kernel emits NFLOG netlink messages and the
+//! binary's NFLOG subscriber parses them. Operator-tooling that
+//! pinned the literal key name needs an update; tooling that probes
+//! for top-level field *presence* keeps working.
 //!
 //! ## Per-binary response shape
 //!
-//! M12-S2 Phase 3 introduces `sandbox-nft-allow-logger` as a sibling
-//! binary; it shares this lib but exposes a different `/health`
-//! payload (`allow_events_emitted_60s`, `rate_limited_count`,
+//! `sandbox-nft-allow-logger` is a sibling binary; it shares this lib
+//! but exposes a different `/health` payload
+//! (`allow_events_emitted_60s`, `rate_limited_count`,
 //! `nfct_socket: "ok"` in place of the deny-logger's `tcp_listener` /
 //! `nflog_socket` / `events_emitted_60s`). Rather than fork the
 //! handler, we let the calling binary pass a [`HealthShape`] closure
@@ -175,11 +175,13 @@ where
 /// Stock body builder for `sandbox-nft-deny-logger`'s `/health`.
 ///
 /// Exposes the deny-logger's three legacy field names (preserved
-/// across the M12-S2 binary rename per Resolution 5):
+/// across the binary rename per
+/// `2026-05-01-udp-nft-loggers-design.md` Resolution 5):
 ///
 /// - `tcp_listener: "ok"` — the listener on `:10001` is up.
 /// - `nflog_socket: "ok"` — the NFLOG receive task is bound (replaces
-///   the legacy `udp_listener` field; M12-S2 Decision 2 removed the
+///   the legacy `udp_listener` field;
+///   `2026-05-01-udp-nft-loggers-design.md` Decision 2 removed the
 ///   userland UDP listener).
 /// - `events_emitted_60s: <gauge>` — rolling deny-event count over
 ///   the last 60 seconds.
@@ -192,7 +194,7 @@ pub fn deny_logger_body(events_emitted_60s: u64) -> String {
 /// Stock body builder for `sandbox-nft-allow-logger`'s `/health`.
 ///
 /// Field set parallels `deny_logger_body` but for the allow side
-/// (M12-S2 Phase 3 / Resolution 5):
+/// (`2026-05-01-udp-nft-loggers-design.md` Resolution 5):
 ///
 /// - `nfct_socket: "ok"` — the NFCT (`nfnetlink_conntrack`)
 ///   subscription is bound and receiving multicast events.
@@ -287,13 +289,12 @@ mod tests {
         assert_eq!(json["tcp_listener"], "ok");
         assert_eq!(
             json["nflog_socket"], "ok",
-            "M12-S2 Phase 2 renamed udp_listener → nflog_socket: the UDP \
+            "udp_listener was renamed to nflog_socket: the UDP \
              deny path is now NFLOG-driven, no userland datagram listener"
         );
         assert!(
             json.get("udp_listener").is_none(),
-            "the legacy udp_listener field must not survive the M12-S2 \
-             rename"
+            "the legacy udp_listener field must not survive the rename"
         );
         // Fresh emitter — no deny events emitted yet.
         assert_eq!(json["events_emitted_60s"], 0);
@@ -302,10 +303,10 @@ mod tests {
     }
 
     /// `/health` for the allow-logger exposes a different field set
-    /// (M12-S2 Phase 3 / Resolution 5): `nfct_socket: "ok"` plus
-    /// `allow_events_emitted_60s`. Pin the shape so the deny-side
-    /// keys (`tcp_listener`, `nflog_socket`) do not leak into the
-    /// allow-logger response.
+    /// (`2026-05-01-udp-nft-loggers-design.md` Resolution 5):
+    /// `nfct_socket: "ok"` plus `allow_events_emitted_60s`. Pin the
+    /// shape so the deny-side keys (`tcp_listener`, `nflog_socket`)
+    /// do not leak into the allow-logger response.
     #[tokio::test]
     async fn health_responds_200_ok_json_for_allow_logger() {
         let dir = tempfile::tempdir().unwrap();

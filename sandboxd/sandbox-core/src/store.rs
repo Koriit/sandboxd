@@ -30,7 +30,7 @@ pub enum ResolveOutcome {
 }
 
 /// Information about a session whose v1 policy was purged by the
-/// M10-S2 V004 migration and swept from `session_policies`.
+/// V004 migration and swept from `session_policies`.
 ///
 /// Returned by [`SessionStore::new`] so the caller (sandboxd `main`)
 /// can emit one `policy_reset_on_upgrade` lifecycle event per affected
@@ -186,7 +186,7 @@ impl SessionStore {
     /// Operators subscribed to the `policy_reset_on_upgrade` event know
     /// exactly which sessions need a v2 policy re-applied.  The tracing
     /// event is kept for backwards compatibility with existing
-    /// subscribers and tests; M10-S2 additionally returns the orphan
+    /// subscribers and tests; the function also returns the orphan
     /// list so the caller can publish a structured lifecycle event on
     /// the in-memory bus.
     fn purge_orphaned_policies_and_emit_reset_events(
@@ -259,10 +259,9 @@ impl SessionStore {
     }
 
     /// Like [`create_session`], but lets the caller pin which backend
-    /// owns the session. Threaded through by the M11-S3 Phase 3D
-    /// `POST /sessions` handler so the container path persists
-    /// `backend = 'container'` rather than relying on the SQL
-    /// `DEFAULT 'lima'`.
+    /// owns the session. Threaded through by the `POST /sessions`
+    /// handler so the container path persists `backend = 'container'`
+    /// rather than relying on the SQL `DEFAULT 'lima'`.
     pub fn create_session_with_backend(
         &self,
         config: SessionConfig,
@@ -2365,8 +2364,8 @@ mod tests {
     ///
     /// The tracing event assertion goes through a custom
     /// `tracing-subscriber` layer that records every `INFO` event with
-    /// its `event` field value — this is the same contract M10-S2 will
-    /// consume off the ring buffer.
+    /// its `event` field value — this is the same contract the bus
+    /// consumer reads off the ring buffer.
     #[test]
     fn test_v004_migration_from_v1_seed_db() {
         use std::sync::{Arc, Mutex as StdMutex};
@@ -2764,11 +2763,9 @@ mod tests {
     /// Hermetic: no Docker, no Lima — just rusqlite + the embedded
     /// migrations. Lives next to `test_v004_migration_from_v1_seed_db`
     /// to follow the existing project convention for migration
-    /// coverage (V001..V004 tests live inline in this module). See
-    /// M11-S1 Phase 1A handoff for the spec mapping; the
+    /// coverage (V001..V004 tests live inline in this module). The
     /// `integration_*`-prefixed shim in `tests/migrations.rs` is a
-    /// thin wrapper that satisfies the handoff's verbatim verification
-    /// command.
+    /// thin wrapper that satisfies the verbatim verification command.
     #[test]
     fn test_v005_backend_column_migration() {
         let dir = TempDir::new().expect("tempdir");

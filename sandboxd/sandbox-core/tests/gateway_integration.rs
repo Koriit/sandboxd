@@ -68,10 +68,10 @@ fn integration_gateway_lifecycle() {
 
     let nft_output = String::from_utf8_lossy(&output.stdout);
 
-    // M9-S19: the gateway post-cutover exposes exactly two nftables
-    // tables after `create_gateway` (before any policy is applied):
-    // `sandbox` (deny-all forward/input baseline) and `sandbox_dnat`
-    // (DNS → CoreDNS, all other TCP → Envoy:10000). Once a policy is
+    // The gateway exposes exactly two nftables tables after
+    // `create_gateway` (before any policy is applied): `sandbox`
+    // (deny-all forward/input baseline) and `sandbox_dnat` (DNS →
+    // CoreDNS, all other TCP → Envoy:10000). Once a policy is
     // applied, `sandbox_policy` joins the set — giving the spec's
     // three-table steady state. The legacy `sandbox_l3` transparent-
     // DNAT table is gone: L3 traffic reaches mitmproxy via Envoy
@@ -101,14 +101,14 @@ fn integration_gateway_lifecycle() {
          Full ruleset:\n{nft_output}"
     );
 
-    // M9-S19: mitmproxy now runs in regular (forward-proxy) mode on
-    // loopback — it must NOT listen on 0.0.0.0:8080 anymore, the
-    // loopback 18080 port must be open inside the container, and
-    // crucially nothing must be listening on 18080 on the VM-facing
-    // IP (spec requirement: "nothing is listening on 18080 on the
-    // VM-facing IP"). A regression that bound mitmproxy to 0.0.0.0:18080
-    // instead of 127.0.0.1:18080 would expose the forward proxy to the
-    // sandboxed VM and short-circuit the Envoy filter chains.
+    // mitmproxy runs in regular (forward-proxy) mode on loopback —
+    // it must NOT listen on 0.0.0.0:8080, the loopback 18080 port
+    // must be open inside the container, and crucially nothing must
+    // be listening on 18080 on the VM-facing IP (spec requirement:
+    // "nothing is listening on 18080 on the VM-facing IP"). A
+    // regression that bound mitmproxy to 0.0.0.0:18080 instead of
+    // 127.0.0.1:18080 would expose the forward proxy to the sandboxed
+    // VM and short-circuit the Envoy filter chains.
     //
     // The gateway image is minimal (no `ss` / `netstat` binaries), so we
     // parse `/proc/net/tcp` directly. Each listening socket has state
@@ -132,7 +132,7 @@ fn integration_gateway_lifecycle() {
     }
     assert!(
         listen_addrs.contains(&"0100007F:46A0"),
-        "mitmproxy must listen on 127.0.0.1:18080 post-M9-S19; listening sockets: {listen_addrs:?}\n{listeners}"
+        "mitmproxy must listen on 127.0.0.1:18080; listening sockets: {listen_addrs:?}\n{listeners}"
     );
     assert!(
         !listen_addrs.contains(&"00000000:1F90"),
@@ -275,7 +275,7 @@ fn integration_gateway_nftables_injection_standalone() {
     let _ = net_mgr.delete_network(&session_id);
 }
 
-/// M9-S18: Envoy xDS listener plumbing — verify the split bootstrap +
+/// Envoy xDS listener plumbing — verify the split bootstrap +
 /// dynamic LDS listener design with atomic host-side rewrites.
 ///
 /// Exercises:
@@ -290,8 +290,8 @@ fn integration_gateway_nftables_injection_standalone() {
 ///     the new generation (i.e. the `MovedTo` inotify event reached
 ///     Envoy's LDS watcher).
 ///   - The `mitmproxy` cluster is present under `static_clusters` in the
-///     bootstrap. (M9-S19 completes the cutover by routing every L3
-///     filter chain to this cluster via `tcp_proxy.tunneling_config`.)
+///     bootstrap. The L3 cutover routes every L3 filter chain to this
+///     cluster via `tcp_proxy.tunneling_config`.
 #[test]
 fn integration_gateway_lds_listener_and_atomic_rewrite() {
     // Use 10.209.5.0/24 to avoid collisions with other tests.
@@ -357,7 +357,7 @@ fn integration_gateway_lds_listener_and_atomic_rewrite() {
     // ---------- 2. Verify listener appears as a DYNAMIC listener ----------
     // Envoy's /config_dump returns the listener under `dynamic_listeners`
     // (with `active_state`) when served via LDS, versus `static_listeners`
-    // when inlined in the bootstrap. This is the key M9-S18 invariant.
+    // when inlined in the bootstrap. This is the key xDS-split invariant.
     let output = Command::new("docker")
         .args([
             "exec",
@@ -413,7 +413,7 @@ fn integration_gateway_lds_listener_and_atomic_rewrite() {
     assert!(
         static_clusters.contains("\"name\": \"mitmproxy\"")
             || static_clusters.contains("\"name\":\"mitmproxy\""),
-        "static_clusters must include mitmproxy cluster (M9-S19 cutover target):\n{static_clusters}"
+        "static_clusters must include mitmproxy cluster (L3 cutover target):\n{static_clusters}"
     );
     assert!(
         static_clusters.contains("\"name\": \"original_dst\"")
@@ -812,8 +812,8 @@ fn integration_gateway_lds_listener_and_atomic_rewrite() {
 ///   1. The pre-rewrite snapshot of `lds.update_attempt` returns
 ///      from the `DockerExecLdsProbe` against a live admin port.
 ///   2. `wait_for_lds_ack` returns `Accepted` after a benign
-///      filter-chain rewrite (the same one the M9-S18 listener
-///      test uses), within the deadline.
+///      filter-chain rewrite (the same one the LDS listener
+///      integration test uses), within the deadline.
 ///   3. By the time the helper returns `Accepted`, Envoy reports
 ///      `update_success` strictly greater than the pre-rewrite
 ///      snapshot — i.e. the `Accepted` outcome is not a false
@@ -890,7 +890,7 @@ fn integration_wait_for_lds_ack_observes_real_envoy_ack() {
         .expect("DockerExecLdsProbe must reach Envoy admin in a healthy gateway");
     let initial_success = lds_update_success(&gw_container);
 
-    // 2. Atomic listener rewrite — same shape as the M9-S18
+    // 2. Atomic listener rewrite — same shape as the LDS listener
     //    integration test: switch the deny-all bootstrap body
     //    (`filter_chains: []`) to a single L1 passthrough chain
     //    routing to the pre-defined `original_dst` cluster. Envoy
@@ -962,11 +962,10 @@ fn integration_wait_for_lds_ack_observes_real_envoy_ack() {
     net_mgr.delete_network(&session_id).unwrap();
 }
 
-/// M10-S2 Phase 3: the gateway container must expose a per-session
-/// events bind mount into which the three JSONL producers (Envoy
-/// access log, CoreDNS plugin, mitmproxy addon — all landing in later
-/// phases) append structured event lines that sandboxd tails via
-/// `inotify`.
+/// The gateway container must expose a per-session events bind mount
+/// into which the three JSONL producers (Envoy access log, CoreDNS
+/// plugin, mitmproxy addon) append structured event lines that
+/// sandboxd tails via `inotify`.
 ///
 /// This test asserts three lifecycle properties of that bind:
 ///   1. `create_gateway` creates the host-side events dir.
@@ -1457,7 +1456,7 @@ fn integration_apply_policy_through_real_gateway() {
     net_mgr.delete_network(&session_id).unwrap();
 }
 
-/// Pins the fatal-create contract (M10-S8 #16, M10-S9 #46) end-to-end.
+/// Pins the fatal-create contract (todo #16, todo #46) end-to-end.
 ///
 /// `fail_explicit_policy_apply_marks_session_error_and_returns_5xx`
 /// (in `sandboxd/src/main.rs` tests) is the hermetic unit test for the
@@ -1597,7 +1596,7 @@ fn integration_distribute_returns_err_when_gateway_rejects_policy() {
     let err = result.expect_err(
         "PolicyDistributor::distribute must return Err when nft rejects the ruleset \
          (overlapping CIDR intervals); production code's apply_policy depends on this Err \
-         to trigger fail_explicit_policy_apply (M10-S8 #16)",
+         to trigger fail_explicit_policy_apply (todo #16)",
     );
 
     // Contract 2: variant is `SandboxError::Gateway`. We pin on the
@@ -1611,7 +1610,7 @@ fn integration_distribute_returns_err_when_gateway_rejects_policy() {
     assert!(
         matches!(err, sandbox_core::SandboxError::Gateway(_)),
         "distribute must surface nft rejection as SandboxError::Gateway so error_response \
-         maps it to 500 (the variant the M10-S8 #16 unit test pins); got: {err:?}"
+         maps it to 500 (the variant the todo #16 unit test pins); got: {err:?}"
     );
 }
 

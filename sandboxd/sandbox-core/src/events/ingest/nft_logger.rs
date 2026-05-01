@@ -3,27 +3,26 @@
 //! Single ingest module covering both producer files written under the
 //! gateway container's `/var/log/gateway/events/` mount:
 //!
-//! - `nft-deny.jsonl`   — produced by `sandbox-nft-deny-logger`
-//!   (Phase 2). Records carry `layer == "deny-logger"` and `event` ∈
+//! - `nft-deny.jsonl`   — produced by `sandbox-nft-deny-logger`.
+//!   Records carry `layer == "deny-logger"` and `event` ∈
 //!   `{"deny", "rate_limited"}`.
-//! - `nft-allow.jsonl`   — produced by `sandbox-nft-allow-logger`
-//!   (Phase 3). Records carry `layer == "allow-logger"` and `event` ∈
+//! - `nft-allow.jsonl`   — produced by `sandbox-nft-allow-logger`.
+//!   Records carry `layer == "allow-logger"` and `event` ∈
 //!   `{"allow", "rate_limited"}`.
 //!
 //! Both producers share the same on-disk JSONL shape (RFC 3339 timestamp,
 //! 5-tuple payload, common rate-limited summary), so they share one
-//! parser and one ingestor dispatch arm. Per M12-S2 Decision 5 ("additive
-//! change, not a new pipeline") the deny / allow distinction is captured
-//! by the `event` discriminator on the bus rather than a separate domain
-//! pipeline.
+//! parser and one ingestor dispatch arm. The deny / allow distinction
+//! is captured by the `event` discriminator on the bus rather than a
+//! separate domain pipeline ("additive change, not a new pipeline").
 //!
 //! Source of truth for the on-disk shape: spec Part 3 / "Deny-logger
 //! component" (`.tasks/specs/2026-04-21-port-explicit-policies-presets-
-//! observability-design.md`) plus M12-S2 Phase 2 / 3 plan entries:
+//! observability-design.md`):
 //!
 //! - Common envelope fields `timestamp`, `layer`, `event`.
 //! - `deny` / `allow` payload (spec "Traffic events" row for `deny-logger`,
-//!   identical for the M12-S2 allow variant): `orig_dst_ip`, `orig_dst_port`,
+//!   identical for the allow variant): `orig_dst_ip`, `orig_dst_port`,
 //!   `protocol` (`"tcp"` / `"udp"`), `src_ip`, `src_port`.
 //! - `rate_limited` summary payload (spec "Hardening rules" § 5):
 //!   `rate_limited_count`, `since_ts`.
@@ -294,7 +293,7 @@ mod tests {
 
     #[test]
     fn parse_nft_logger_line_accepts_udp_allow() {
-        // M12-S2 Phase 3: `nft-allow.jsonl` shape.
+        // `nft-allow.jsonl` shape.
         let line = r#"{"timestamp":"2026-04-22T09:45:02.500Z","layer":"allow-logger","event":"allow","orig_dst_ip":"1.1.1.1","orig_dst_port":53,"protocol":"udp","src_ip":"10.0.0.42","src_port":40123}"#;
         let parsed = parse_nft_logger_line(line).expect("udp allow must parse");
         assert_eq!(

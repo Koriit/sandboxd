@@ -1,5 +1,5 @@
 //! End-to-end sequencing test for the sandboxd-emitted lifecycle
-//! events (M10-S2 Phase 5).
+//! events.
 //!
 //! This test exercises the wiring between the lifecycle builder
 //! surface (`events::lifecycle::*`) and the `EventBus` fan-out — the

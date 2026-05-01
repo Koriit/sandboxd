@@ -38,21 +38,21 @@
 //! `listener_in_place_updated` stays at 0). What this writer guarantees
 //! is *listener-identity preservation* across the rewrite — the
 //! `policy_listener` resource keeps the same name, bind, and dynamic
-//! placement — not in-flight-connection preservation. M10-S10 redesigns
-//! DNS-rotation propagation, so connection survival across rewrites is
-//! treated as a quality-of-implementation concern. See the rustdoc on
+//! placement — not in-flight-connection preservation. The DNS-rotation
+//! propagation redesign treats connection survival across rewrites as
+//! a quality-of-implementation concern. See the rustdoc on
 //! [`policy::PolicyCompiler::compile_envoy_listener`] for the empirical
 //! evidence captured in
 //! `integration_gateway_lds_listener_and_atomic_rewrite`.
 //!
 //! # Ownership and call sites
 //!
-//! M9-S18 introduces the writer and exercises it from unit tests. The
-//! initial listener file is written as part of policy distribution so
-//! Envoy has something to consume on first boot. Wiring the writer up for
-//! DNS-propagation events is M9-S19's responsibility — this module is
-//! deliberately kept independent of the DNS-propagation path so both
-//! call sites share a single enforcement point for the invariant.
+//! Unit tests exercise the writer directly. The initial listener file
+//! is written as part of policy distribution so Envoy has something
+//! to consume on first boot. The DNS-propagation path also drives the
+//! writer; this module is deliberately kept independent of either
+//! call site so both share a single enforcement point for the
+//! invariant.
 
 use std::fs;
 use std::io::Write;

@@ -7,15 +7,14 @@
 //! (`test_v004_migration_from_v1_seed_db`,
 //! `test_v005_backend_column_migration`); the tests here are thin
 //! wrappers that exercise the same migrations from outside the crate
-//! to satisfy explicit verification commands in milestone handoffs
-//! (e.g. M11-S1 Phase 1A) and to give the integration profile a
-//! schema-evolution smoke that runs alongside the Docker-backed
-//! gateway validators.
+//! to satisfy explicit verification commands and give the
+//! integration profile a schema-evolution smoke that runs alongside
+//! the Docker-backed gateway validators.
 //!
 //! The tests are still hermetic — embedded migrations + rusqlite, no
 //! Docker required. The `integration_*` prefix here is therefore
-//! about the test profile (matching the verification command in
-//! M11-S1 Phase 1A) rather than about needing out-of-process state.
+//! about the test profile (matching the verification commands)
+//! rather than about needing out-of-process state.
 
 use rusqlite::{Connection, params};
 use sandbox_core::SessionStore;

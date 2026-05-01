@@ -121,8 +121,8 @@ pub const LITE_IMAGE_REPOSITORY: &str = "sandboxd-lite";
 /// daemon version string. Pinned to this single helper so the daemon's
 /// `ContainerRuntime` construction site, [`ensure_image`], and
 /// [`rebuild_lite_image`] all agree on the same tag without duplicating
-/// the format string. Drift here was the M11-S4 Phase 4D-pre gap #1
-/// regression that broke `sandbox create --lite` end-to-end.
+/// the format string. Drift here was a pre-release regression that
+/// broke `sandbox create --lite` end-to-end.
 pub fn lite_image_tag_for_version(daemon_version: &str) -> String {
     format!("{LITE_IMAGE_REPOSITORY}:{daemon_version}")
 }
@@ -131,8 +131,7 @@ pub fn lite_image_tag_for_version(daemon_version: &str) -> String {
 ///
 /// Spec § "Image building / First-use warning" pins this exact byte
 /// sequence (note the en-dash `—` between "version" and "building"); the
-/// CLI surface (M11-S4) and integration tests both rely on string
-/// equality.
+/// CLI surface and integration tests both rely on string equality.
 pub const LITE_FIRST_USE_WARNING: &str =
     "lite: first use on this daemon version — building lite image";
 
@@ -186,9 +185,9 @@ pub struct ContainerNetwork {
     /// Optional host path bound into `/home/agent/workspace/` inside
     /// the container. `None` means no workspace bind. Aligned with the
     /// spec's [`WorkspaceMode::Shared`] semantics — the bind target is
-    /// unified with Lima's workspace mount across both backends
-    /// (M11-S7), so an operator's `--workspace shared:<path>` lands at
-    /// the same in-guest path regardless of the backend they chose.
+    /// unified with Lima's workspace mount across both backends, so
+    /// an operator's `--workspace shared:<path>` lands at the same
+    /// in-guest path regardless of the backend they chose.
     pub workspace_host_path: Option<PathBuf>,
     /// Path to the `sandbox-route-helper` binary. When `None`, the
     /// runtime skips the route-installation step at `start` — useful
@@ -396,8 +395,8 @@ fn capabilities_for_container() -> Capabilities {
         // per-session slow path; rebuild-image is the operator surface.
         per_session_no_cache: false,
         // Spec §"Workspace" — both workspace modes are supported on the
-        // container backend (M11-S7): `Shared` advertises a Docker
-        // bind-mount (the daemon threads `workspace_host_path` from the
+        // container backend: `Shared` advertises a Docker bind-mount
+        // (the daemon threads `workspace_host_path` from the
         // request through `ContainerNetwork`, and `docker create --mount`
         // lights up at create time); `Clone` advertises the same in-guest
         // `git clone <url> /home/agent/workspace/` flow Lima uses — the
@@ -447,8 +446,8 @@ impl SessionRuntime for ContainerRuntime {
         let home_mount = format!("type=volume,src={home_volume},dst=/home/agent");
         let workspace_mount = network.workspace_host_path.as_ref().map(|p| {
             // Spec § "Workspace" — bind target unified with Lima at
-            // `/home/agent/workspace/` (M11-S7). The home volume mounts
-            // at `/home/agent`; this bind shadows the volume's content
+            // `/home/agent/workspace/`. The home volume mounts at
+            // `/home/agent`; this bind shadows the volume's content
             // at the workspace subdirectory, which is the intended
             // semantics (operator-supplied workspace files take
             // precedence over the volume's empty `workspace/`).
@@ -458,13 +457,13 @@ impl SessionRuntime for ContainerRuntime {
             )
         });
         let ca_args = build_ca_mount_args(&network);
-        // M11-S7 — `WorkspaceMode::Clone` is now part of the container
-        // backend's capability matrix; the daemon dispatches the in-guest
-        // `git clone` step after `runtime.start` completes, exactly like
-        // the Lima `--repo` path. `runtime.create` only owns the
-        // `docker create` arguments, which are identical for `Empty`,
-        // `Clone`, and `Shared` (the bind mount is the only knob, and
-        // `Clone` does not bind a host path).
+        // `WorkspaceMode::Clone` is part of the container backend's
+        // capability matrix; the daemon dispatches the in-guest
+        // `git clone` step after `runtime.start` completes, exactly
+        // like the Lima `--repo` path. `runtime.create` only owns
+        // the `docker create` arguments, which are identical for
+        // `Empty`, `Clone`, and `Shared` (the bind mount is the only
+        // knob, and `Clone` does not bind a host path).
 
         let mut args: Vec<String> = vec![
             "create".to_string(),
@@ -558,8 +557,8 @@ impl SessionRuntime for ContainerRuntime {
                 session_id = %session_id,
                 container = %container_name,
                 "ContainerRuntime::start: no route_helper_path registered; \
-                 container will route to the bridge; route-helper integration \
-                 scheduled for M11-S4/S5."
+                 container will route to the bridge without per-session \
+                 route installation (test or unregistered configuration)."
             );
         }
 
@@ -1039,10 +1038,10 @@ async fn invoke_route_helper(
 ///
 /// Internal type for the cpu default is `f64` so the spec's one-decimal
 /// precision survives all the way to docker's `--cpus <n>` flag (see
-/// [`format_cpus`]). M11-S7 todo #67 widened the wire-level
-/// [`BackendSpecific::Container`] field from `u32` to `f32`, so an
-/// explicit operator-supplied fractional value (e.g. `--cpus 1.5`) now
-/// reaches `format_cpus` without truncation. The implicit-default path
+/// [`format_cpus`]). The wire-level [`BackendSpecific::Container`]
+/// field is `f32` (widened from a historical `u32`), so an explicit
+/// operator-supplied fractional value (e.g. `--cpus 1.5`) reaches
+/// `format_cpus` without truncation. The implicit-default path
 /// (operator omits `--cpus`, request boundary stamps `0.0`) still
 /// resolves to this function's return value via
 /// [`ContainerRuntime::resource_ceilings`]'s `0.0 → default_cpus` arm.
@@ -1261,9 +1260,9 @@ fn image_present(tag: &str) -> Result<bool, SandboxError> {
 /// fresh tempdir and run `docker build -t <tag> <ctx>`.
 ///
 /// `no_cache` is wired through to `docker build --no-cache` for the
-/// rebuild path (M11-S4 Phase 4C). `false` keeps the historical fast
-/// path (incremental cache enabled) for the missing-image build flow
-/// `ensure_image` uses.
+/// rebuild path. `false` keeps the historical fast path (incremental
+/// cache enabled) for the missing-image build flow `ensure_image`
+/// uses.
 fn build_lite_image(tag: &str, no_cache: bool) -> Result<(), SandboxError> {
     let agent_src = guest_agent_path()?;
     if !agent_src.exists() {
@@ -1400,10 +1399,10 @@ mod tests {
         assert_eq!(
             caps.workspace_modes,
             EnumSet::all(),
-            "M11-S7 advertises both workspace modes — `Shared` (Docker \
-             bind-mount via ContainerNetwork.workspace_host_path) and \
-             `Clone` (in-guest `git clone` dispatched through GuestConnector \
-             after the lite container's entrypoint comes up)",
+            "container backend advertises both workspace modes — `Shared` \
+             (Docker bind-mount via ContainerNetwork.workspace_host_path) \
+             and `Clone` (in-guest `git clone` dispatched through \
+             GuestConnector after the lite container's entrypoint comes up)",
         );
         assert!(caps.workspace_modes.contains(WorkspaceModeKind::Shared));
         assert!(caps.workspace_modes.contains(WorkspaceModeKind::Clone));
@@ -1432,7 +1431,7 @@ mod tests {
         assert!(rt.lookup_session(&sid).is_err());
     }
 
-    /// M11-S5 gap #68 contract: the daemon resolves
+    /// Shared-workspace contract: the daemon resolves
     /// `WorkspaceMode::Shared { host_path }` into a
     /// `ContainerNetwork.workspace_host_path = Some(<path>)`, and that
     /// value round-trips through `register_session` /
@@ -1489,8 +1488,8 @@ mod tests {
         }
     }
 
-    /// M11-S6 follow-up — the per-session sandbox CA is bind-mounted
-    /// read-only at `/etc/ssl/certs/sandbox-ca.pem` and surfaced through
+    /// The per-session sandbox CA is bind-mounted read-only at
+    /// `/etc/ssl/certs/sandbox-ca.pem` and surfaced through
     /// the four standard HTTPS-client trust env vars when
     /// `ContainerNetwork.ca_host_path = Some(<host_path>)`.
     ///
@@ -1700,9 +1699,9 @@ mod tests {
 
     /// `resource_ceilings` falls back to the runtime's defaults when
     /// the spec carries `0`/`0.0`; passes through non-zero values
-    /// unchanged with f32→f64 lossless widening (M11-S7 todo #67).
+    /// unchanged with f32→f64 lossless widening.
     ///
-    /// The pre-todo-#67 shape was `cpus: u32` with `as f64` widening
+    /// The historical shape was `cpus: u32` with `as f64` widening
     /// inside the function, which silently truncated `1.5` to `1`.
     /// The fractional case is now pinned below.
     #[test]

@@ -6,9 +6,7 @@
 //! the `GET /backends` HTTP endpoint.
 //!
 //! The types here are the request-time validation surface. Runtime
-//! implementations live in `lima.rs` / `container.rs` and are added in
-//! later phases of the M11-S1 milestone (see
-//! `docs/internal/milestones/M11.md`).
+//! implementations live in `lima.rs` / `container.rs`.
 
 use enumset::EnumSet;
 use serde::{Deserialize, Serialize};
@@ -196,9 +194,6 @@ pub enum UnsupportedFeature {
     WorkspaceMode(WorkspaceModeKind, BackendKind),
     /// The spec asked for `--no-cache` against a backend that does not
     /// support per-session cache invalidation.
-    ///
-    /// Not reachable from Phase 1A's [`super::SessionSpec`] (which
-    /// does not yet carry a `no_cache` field) — wired up in M11-S4.
     PerSessionNoCache(BackendKind),
 }
 

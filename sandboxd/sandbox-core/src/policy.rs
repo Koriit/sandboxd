@@ -207,7 +207,7 @@ impl fmt::Display for AssuranceLevel {
 }
 
 // Custom `Deserialize` impl for `AssuranceLevel` that emits a clear,
-// targeted error when callers pass the old (pre-M9-S10) rule shape:
+// targeted error when callers pass the legacy rule shape:
 //
 //   { "level": "full", "constraints": { "methods": [...], "paths": [...] } }
 //
@@ -237,7 +237,7 @@ impl<'de> Deserialize<'de> for AssuranceLevel {
 
         let level_tag = obj.get("level").and_then(|v| v.as_str());
 
-        // Legacy sentinel: `"full"` was renamed to `"http"` in M9-S10 and
+        // Legacy sentinel: `"full"` was renamed to `"http"` and
         // the `constraints: {methods, paths}` wrapper was replaced by a
         // flat `http_filters: [{method, path}, ...]` array.
         if level_tag == Some("full") {
@@ -284,8 +284,9 @@ impl<'de> Deserialize<'de> for AssuranceLevel {
 ///
 /// Matching is evaluated as a pair: both `method` and `path` must match
 /// for the filter to permit the request.  This is different from the
-/// pre-M9-S10 shape that held two independent vectors and allowed any
-/// combination — the new shape can express "GET /foo but POST /bar".
+/// legacy shape that held two independent vectors and allowed any
+/// method × any path combination — the new shape can express
+/// "GET /foo but POST /bar".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct HttpFilter {
     /// Allowed HTTP method.
@@ -391,9 +392,9 @@ pub enum Protocol {
     Udp,
 }
 
-// NOTE: the old `HttpConstraints { methods, paths }` wrapper struct was
-// removed in M9-S10.  Its cartesian-product semantics (any method × any
-// path) could not express "GET /foo but POST /bar" rules.  Use
+// NOTE: the legacy `HttpConstraints { methods, paths }` wrapper struct has
+// been removed.  Its cartesian-product semantics (any method × any path)
+// could not express "GET /foo but POST /bar" rules.  Use
 // [`AssuranceLevel::Http { http_filters }`] with explicit `(method, path)`
 // pairs instead.
 
@@ -600,7 +601,7 @@ pub const FILTER_CHAINS_END_MARKER: &str = "# <<< FILTER_CHAINS_END";
 /// [`crate::events::EVENTS_DIR_IN_CONTAINER`] and
 /// `gateway.rs::create_gateway`). Because the bind mount is narrower
 /// than the surrounding `/var/log` tmpfs, the file is visible on the
-/// host, where the M10-S2 ingest layer tails it via `inotify` and
+/// host, where sandboxd's ingest layer tails it via `inotify` and
 /// publishes each record to the per-session event ring buffer.
 ///
 /// The filename (`envoy.jsonl`) is also the producer-side half of the
@@ -698,7 +699,7 @@ pub(crate) fn format_nft_set_elements(elements: &[String]) -> String {
     format!("\n        elements = {{ {} }}", elements.join(", "))
 }
 
-/// Render the M10-S3 two-table ruleset — `sandbox_dnat` (conditional
+/// Render the two-table ruleset — `sandbox_dnat` (conditional
 /// DNAT keyed on `policy_allow_{tcp,udp}`) and `sandbox_policy`
 /// (Envoy-egress allow output chain).
 ///
@@ -714,9 +715,9 @@ pub(crate) fn format_nft_set_elements(elements: &[String]) -> String {
 /// gateway-image version) rejects the `@<table>::<setname>`
 /// cross-table reference syntax. Duplicating into both tables and
 /// populating them identically within the same transaction is the
-/// portable fallback. See `gateway::generate_dnat_ruleset` and the
-/// M10-S3 implementation plan risk §1 for the empirical `nft -c`
-/// verification.
+/// portable fallback. See `gateway::generate_dnat_ruleset` for the
+/// empirical `nft -c` verification done before this fallback was
+/// committed.
 ///
 /// The `sandbox_dnat` chain shape emitted here mirrors
 /// `gateway::generate_dnat_ruleset` byte-for-byte; at apply-policy
@@ -754,13 +755,13 @@ table inet sandbox_dnat {{
         # Policy-allowed TCP -> Envoy
         ip saddr {subnet} meta l4proto tcp ip daddr . tcp dport @{tcp_set} dnat to {gateway_ip}:{envoy_port}
 
-        # Policy-allowed UDP -> direct to upstream (M12-S2 Decision 1).
+        # Policy-allowed UDP -> direct to upstream (UDP allow path skips Envoy).
         ip saddr {subnet} meta l4proto udp ip daddr . udp dport @{udp_set} accept
 
         # Unmatched TCP -> deny-logger
         ip saddr {subnet} meta l4proto tcp dnat to {gateway_ip}:{deny_tcp_port}
 
-        # Unmatched UDP -> NFLOG group then drop (M12-S2 Decision 2).
+        # Unmatched UDP -> NFLOG group then drop (kernel-side; no userland listener).
         ip saddr {subnet} meta l4proto udp log group {nflog_group}
         ip saddr {subnet} meta l4proto udp drop
 
@@ -969,16 +970,15 @@ impl PolicyCompiler {
     /// `nft -f` transaction inside
     /// [`crate::policy_distributor::PolicyDistributor`].
     ///
-    /// **M10-S3 shape (post deny-logger).** The filtering decision moved
-    /// from `sandbox_policy.forward` into `sandbox_dnat.prerouting`'s
-    /// conditional DNAT — see
-    /// [`crate::gateway::generate_dnat_ruleset`]. `sandbox_policy` now
+    /// **Two-table shape (post deny-logger).** The filtering decision
+    /// lives in `sandbox_dnat.prerouting`'s conditional DNAT — see
+    /// [`crate::gateway::generate_dnat_ruleset`]. `sandbox_policy`
     /// holds only an `output` chain that admits gateway-initiated egress
     /// to policy-allowed destinations (Envoy opening upstream connections
     /// for L1/L2 passthrough, mitmproxy opening upstream for L3 MITM),
     /// keyed on the same `(ipv4_addr . inet_service)` concat sets.
     ///
-    /// **v2 concat-set shape (M10-S1 / Phase 3B, unchanged here).** Each
+    /// **v2 concat-set shape.** Each
     /// allow element is `<ip_or_cidr> . <port>`. Each protocol gets its
     /// own set (`policy_allow_tcp`, `policy_allow_udp`) keyed on
     /// `ipv4_addr . inet_service`. The hardcoded `dport { 80, 443 }`
@@ -1120,7 +1120,7 @@ impl PolicyCompiler {
           tcp_health_check: {}"#;
 
         format!(
-            r#"# Envoy static bootstrap (generated by sandbox policy engine, M9-S18)
+            r#"# Envoy static bootstrap (generated by sandbox policy engine)
 #
 # The listener is served via LDS from a filesystem `path_config_source`;
 # sandboxd writes the listener file via an atomic rename so Envoy's
@@ -1181,11 +1181,11 @@ admin:
     /// (still `policy_listener`, still under `dynamic_listeners`,
     /// `lds.update_success` ticks while `lds.update_rejected` does not).
     /// In-flight connections to the old generation are subject to Envoy's
-    /// drain timer rather than carried over untouched. M10-S10 redesigns
-    /// DNS-rotation propagation, so this is treated as a quality-of-
-    /// implementation concern rather than a correctness one — the design
-    /// here ensures the rename is *accepted*, not that connections survive
-    /// the rewrite untouched.
+    /// drain timer rather than carried over untouched. A planned
+    /// follow-up redesigns DNS-rotation propagation, so this is
+    /// treated as a quality-of-implementation concern rather than a
+    /// correctness one — the design here ensures the rename is
+    /// *accepted*, not that connections survive the rewrite untouched.
     ///
     /// Supports all assurance levels, and every generated filter chain
     /// carries a `destination_port` predicate on its `FilterChainMatch`
@@ -1598,7 +1598,7 @@ admin:
     /// **Format: JSON, harmonized across all three layers.** One
     /// object per line, parseable by `serde_json::from_str`. Field keys
     /// and value substitutions are the contract with the ingest layer
-    /// (`sandbox-core/src/events/ingest/envoy.rs`, M10-S2 Phase 7) —
+    /// (`sandbox-core/src/events/ingest/envoy.rs`) —
     /// renaming a key or dropping a field requires a coordinated change
     /// there. Field order is fixed (and identical across L1 / L2 / L3
     /// modulo the L3-only `connect_authority` key) so `grep` / `diff`
@@ -1972,12 +1972,12 @@ resources:
     /// applied. It is published as its own method so call sites document
     /// the intent (first write vs. post-rollback recovery).
     ///
-    /// # Behaviour change vs. pre-M9-S18
+    /// # Behaviour change vs. the legacy baked-in bootstrap
     ///
-    /// Before M9-S18 the gateway shipped with `envoy-base.yaml` baked into
-    /// the container, which installed an **L1 pass-through** listener on
-    /// first boot. From M9-S18 onwards the bootstrap is policy-agnostic
-    /// and the day-one listener is served via LDS — and Envoy refuses to
+    /// The gateway used to ship with `envoy-base.yaml` baked into the
+    /// container, which installed an **L1 pass-through** listener on
+    /// first boot. The bootstrap is now policy-agnostic and the
+    /// day-one listener is served via LDS — and Envoy refuses to
     /// promote a static listener to LDS mid-session, so the very first
     /// listener published on the filesystem must itself be deliverable
     /// via LDS. The simplest fail-closed default that satisfies this
@@ -1987,9 +1987,9 @@ resources:
     /// startup) this means the Envoy listener is deny-all instead of
     /// L1 pass-through. Net user-visible behaviour is unchanged because
     /// the nftables `sandbox_policy` layer gates traffic first and is
-    /// also empty on a no-policy session, and DNS is deny-by-default
-    /// since M9-S15. This is consistent with the fail-closed design
-    /// principle — no-policy sessions must not leak.
+    /// also empty on a no-policy session, and DNS is deny-by-default.
+    /// This is consistent with the fail-closed design principle —
+    /// no-policy sessions must not leak.
     ///
     /// Policy-driven L3 filter chains are emitted by
     /// [`Self::compile_envoy_listener`]; those chains appear on disk
@@ -2189,7 +2189,7 @@ mod tests {
 
     #[test]
     fn parse_rejects_legacy_full_level_with_clear_error() {
-        // The pre-M9-S10 shape: `level: "full"` + `constraints: {methods,
+        // The legacy shape: `level: "full"` + `constraints: {methods,
         // paths}`.  No auto-conversion — the error must name the new shape.
         let json = r#"{
             "version": "2.0.0",
@@ -2332,7 +2332,7 @@ mod tests {
         );
         assert!(
             schema_str.contains("\"http\""),
-            "schema must include 'http' level (renamed from 'full' in M9-S10)"
+            "schema must include 'http' level (renamed from legacy 'full')"
         );
         assert!(
             !schema_str.contains("\"full\""),
@@ -2865,11 +2865,10 @@ mod tests {
         // 0, so this is a validator-level check — parser lets it
         // through but validate() rejects it.
         //
-        // TODO(M10-S1 Commit 5): once V004 is in place and `port` has
-        // a CHECK constraint, a numeric validator on the Rust side
-        // should mirror it. For now, the store's CHECK is the source
-        // of truth; the parser-level test just pins the upper bound
-        // behavior.
+        // TODO: once V004 is in place and `port` has a CHECK constraint,
+        // a numeric validator on the Rust side should mirror it. For
+        // now, the store's CHECK is the source of truth; the
+        // parser-level test just pins the upper bound behavior.
         let json = r#"{
             "version": "2.0.0",
             "rules": [
@@ -3003,7 +3002,7 @@ mod tests {
 
         let nft = &compiled.nftables_rules;
 
-        // v2/M10-S3 shape: the CIDR destination appears as a concat-set
+        // v2 two-table shape: the CIDR destination appears as a concat-set
         // element `<cidr> . <port>` inside `policy_allow_tcp`. Two tables
         // carry identical copies of the sets — `sandbox_dnat` uses them to
         // route VM-egress to Envoy via conditional DNAT, `sandbox_policy`
@@ -3038,8 +3037,8 @@ mod tests {
              the CIDR rule; got:\n{nft}"
         );
         // sandbox_dnat.prerouting conditionally DNATs policy-allowed
-        // TCP to Envoy. UDP is `accept`-ed without DNAT (M12-S2
-        // Decision 1).
+        // TCP to Envoy. UDP is `accept`-ed without DNAT (UDP allow
+        // path skips Envoy entirely).
         assert!(
             nft.contains(
                 "meta l4proto tcp ip daddr . tcp dport @policy_allow_tcp dnat to 10.209.0.2:10000"
@@ -3050,7 +3049,7 @@ mod tests {
         assert!(
             nft.contains("meta l4proto udp ip daddr . udp dport @policy_allow_udp accept"),
             "sandbox_dnat.prerouting must `accept` policy-allowed UDP \
-             without DNAT (M12-S2 Decision 1); got:\n{nft}"
+             without DNAT (UDP allow path skips Envoy); got:\n{nft}"
         );
         // sandbox_policy.output admits the gateway's own upstream
         // connections to the same policy-allowed destinations.
@@ -3068,7 +3067,7 @@ mod tests {
 
     #[test]
     fn compile_nftables_emits_two_tables() {
-        // M10-S3 shape: compile emits BOTH `sandbox_dnat` (VM-egress
+        // Two-table shape: compile emits BOTH `sandbox_dnat` (VM-egress
         // filter + DNAT) and `sandbox_policy` (Envoy-egress allow), with
         // `sandbox_dnat` declared first so the single `nft -f`
         // transaction lays down the filter table before the egress table.
@@ -3106,7 +3105,7 @@ mod tests {
 
     #[test]
     fn compile_nftables_dnat_prerouting_routes_allow_and_deny_per_protocol() {
-        // M12-S2 prerouting shape: DNS → CoreDNS :53, TCP allow → Envoy
+        // Prerouting shape: DNS → CoreDNS :53, TCP allow → Envoy
         // :10000, UDP allow → direct accept (no DNAT), TCP deny →
         // deny-logger :10001, UDP deny → NFLOG group 1 + drop.
         let policy = transport_policy();
@@ -3132,19 +3131,20 @@ mod tests {
             ),
             "policy-allowed TCP must DNAT to Envoy :10000; got:\n{nft}"
         );
-        // Policy-allowed UDP `accept`s without DNAT (M12-S2 Decision 1).
+        // Policy-allowed UDP `accept`s without DNAT (UDP allow path
+        // skips Envoy entirely).
         assert!(
             nft.contains(
                 "ip saddr 10.209.0.0/28 meta l4proto udp ip daddr . udp dport \
                  @policy_allow_udp accept"
             ),
-            "policy-allowed UDP must `accept` (no DNAT to Envoy under \
-             M12-S2 Decision 1); got:\n{nft}"
+            "policy-allowed UDP must `accept` (no DNAT to Envoy — UDP \
+             allow path is direct); got:\n{nft}"
         );
         assert!(
             !nft.contains("@policy_allow_udp dnat to"),
-            "M12-S2 Decision 1: policy-allowed UDP MUST NOT DNAT \
-             anywhere; got:\n{nft}"
+            "policy-allowed UDP MUST NOT DNAT anywhere (UDP allow path \
+             is direct, not via Envoy); got:\n{nft}"
         );
 
         // Fall-through: TCP DNATs to deny-logger; UDP NFLOG-then-drops.
@@ -3154,8 +3154,8 @@ mod tests {
         );
         assert!(
             nft.contains("ip saddr 10.209.0.0/28 meta l4proto udp log group 1"),
-            "unmatched UDP must mirror to NFLOG group 1 (M12-S2 \
-             Decision 2 / Resolution 1); got:\n{nft}"
+            "unmatched UDP must mirror to NFLOG group 1 (kernel-side \
+             deny path; no userland UDP listener); got:\n{nft}"
         );
         assert!(
             nft.contains("ip saddr 10.209.0.0/28 meta l4proto udp drop"),
@@ -3163,8 +3163,8 @@ mod tests {
         );
         assert!(
             !nft.contains("dnat to 10.209.0.2:10002"),
-            "M12-S2 Decision 2: there is no DNAT-to-:10002 rule \
-             anymore; got:\n{nft}"
+            "no DNAT-to-:10002 rule should remain — UDP deny is now \
+             NFLOG-driven, not via a userland listener; got:\n{nft}"
         );
 
         // Ordering: allow rules must appear before fall-through so
@@ -3885,17 +3885,17 @@ mod tests {
              policy-allowed destinations; got:\n{nft}"
         );
         // sandbox_dnat.prerouting `accept`s policy-allowed UDP without
-        // DNAT (M12-S2 Decision 1: UDP allow path skips Envoy entirely).
+        // DNAT (UDP allow path skips Envoy entirely).
         assert!(
             nft.contains("meta l4proto udp ip daddr . udp dport @policy_allow_udp accept"),
             "sandbox_dnat.prerouting must `accept` policy-allowed UDP \
-             without DNAT (M12-S2 Decision 1); got:\n{nft}"
+             without DNAT (UDP allow path is direct); got:\n{nft}"
         );
         // The unmatched-UDP arm fires NFLOG instead of DNAT-to-listener.
         assert!(
             nft.contains("meta l4proto udp log group 1"),
             "sandbox_dnat.prerouting must mirror unmatched UDP to \
-             NFLOG group 1 (M12-S2 Decision 2 / Resolution 1); got:\n{nft}"
+             NFLOG group 1 (kernel-side deny path); got:\n{nft}"
         );
     }
 
@@ -3995,8 +3995,8 @@ mod tests {
     }
 
     /// Http-level policy with a single `(ANY, /*)` wildcard filter —
-    /// semantically equivalent to pre-M9-S10 "level: full, no constraints"
-    /// (permit any HTTP request to the host).
+    /// semantically equivalent to the legacy "level: full, no constraints"
+    /// shape (permit any HTTP request to the host).
     fn full_policy() -> Policy {
         Policy {
             version: SCHEMA_VERSION.to_string(),
@@ -4152,12 +4152,12 @@ mod tests {
         let net = test_network_info();
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
-        // As of M9-S18 the mitmproxy cluster is **always present in the
-        // bootstrap** — it is scaffolded now so that M9-S19's L3 cutover
-        // to HTTP/1.1 CONNECT tunnelling is a pure listener change. The
-        // behavioural guarantee for L2 is that no listener filter chain
-        // routes traffic to the mitmproxy cluster; L2 traffic must still
-        // flow through `original_dst`.
+        // The mitmproxy cluster is **always present in the bootstrap**
+        // — it is scaffolded so that the L3 cutover to HTTP/1.1 CONNECT
+        // tunnelling is a pure listener change. The behavioural
+        // guarantee for L2 is that no listener filter chain routes
+        // traffic to the mitmproxy cluster; L2 traffic must still flow
+        // through `original_dst`.
         assert!(
             !compiled
                 .envoy_listener_config
@@ -4239,7 +4239,7 @@ mod tests {
 
     #[test]
     fn compile_level3_domain_with_empty_dns_cache_emits_no_chain() {
-        // M9-S19: L3 domain chains now require resolved IPs because
+        // L3 domain chains require resolved IPs because
         // filter_chain_match uses `prefix_ranges` (by-IP) rather than
         // `server_names` (by-SNI). `PolicyCompiler::compile` runs at
         // apply-policy time with an empty DnsCache — so a domain-only
@@ -4297,14 +4297,14 @@ mod tests {
         );
         assert!(
             !listener.contains("server_names: [\"inspected.example.com\"]"),
-            "L3 domain chain must NOT use SNI matching (pre-M9-S19 shape):\n{listener}"
+            "L3 domain chain must NOT use SNI matching (legacy shape):\n{listener}"
         );
         assert!(
             listener.contains("cluster: mitmproxy"),
             "L3 domain chain must route to mitmproxy cluster:\n{listener}"
         );
-        // Per-port aggregation (M10-S8 / todo #40): two domain rules
-        // sharing IPs at the same port collapse into one chain named
+        // Per-port aggregation (todo #40): two domain rules sharing
+        // IPs at the same port collapse into one chain named
         // `level3_p{port}` to satisfy Envoy's
         // unique-`(prefix_ranges, destination_port)` invariant.
         // The chain still carries the `level3_` prefix that downstream
@@ -4324,8 +4324,8 @@ mod tests {
 
     #[test]
     fn compile_l3_tunneling_config_hostname_is_downstream_local_address() {
-        // The entire point of M9-S19: every L3 filter chain (domain-
-        // backed, CIDR-backed, and wildcard) must carry a
+        // L3 cutover invariant: every L3 filter chain (domain-backed,
+        // CIDR-backed, and wildcard) must carry a
         // `tunneling_config.hostname` formatted as
         // `%DOWNSTREAM_LOCAL_ADDRESS%`. Envoy formats this per-
         // connection using the address recovered by the `original_dst`
@@ -4396,7 +4396,7 @@ mod tests {
         // FileAccessLog wiring.
         r#""@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog"#,
         "name: envoy.access_loggers.file",
-        // JSON format selector (the M10-S2 contract with ingest).
+        // JSON format selector (the contract with ingest).
         "log_format:",
         "json_format:",
         // Literal fields stamped by Envoy irrespective of traffic.
@@ -4421,17 +4421,16 @@ mod tests {
 
     #[test]
     fn compile_envoy_access_log_path_is_events_jsonl() {
-        // The path is the producer-side half of the M10-S2 ingest
-        // contract: sandboxd tails `<events_host_dir>/envoy.jsonl`
-        // via `inotify`, filtering `Create` / `Modify` events on the
-        // exact file name. Drifting the path (or the filename) here
-        // without a matching change in
-        // `sandbox-core/src/events/ingest/` silently breaks the
-        // ingest path — the file lands on the tmpfs, never reaches
+        // The path is the producer-side half of the ingest contract:
+        // sandboxd tails `<events_host_dir>/envoy.jsonl` via `inotify`,
+        // filtering `Create` / `Modify` events on the exact file name.
+        // Drifting the path (or the filename) here without a matching
+        // change in `sandbox-core/src/events/ingest/` silently breaks
+        // the ingest path — the file lands on the tmpfs, never reaches
         // the host, and no Envoy event surfaces in the ring buffer.
         assert_eq!(
             ENVOY_ACCESS_LOG_IN_CONTAINER, "/var/log/gateway/events/envoy.jsonl",
-            "Envoy access_log path must match the M10-S2 ingest contract"
+            "Envoy access_log path must match the ingest contract"
         );
 
         // And the rendered listener must echo that path under every
@@ -4457,7 +4456,7 @@ mod tests {
     #[test]
     fn compile_l3_tcp_proxy_carries_envoy_access_log() {
         // Every L3 `tcp_proxy` filter must attach a `FileAccessLog` in
-        // the harmonized JSON format so the M10-S2 ingest path can
+        // the harmonized JSON format so the ingest path can
         // parse one record per line into a `TrafficEvent` of
         // `layer=envoy, event=connection_allowed|connection_denied`.
         // If we drop the access_log here or change the field map,
@@ -4713,7 +4712,7 @@ mod tests {
         // (pinned.example.com), and L3 (monitored.example.com). Pin
         // each chain name verbatim so drift breaks the test loudly.
         //
-        // Post-#40 (M10-S8): L1 and L3 domain rules aggregate into one
+        // Post-#40: L1 and L3 domain rules aggregate into one
         // chain per port (`level{1,3}_p<port>`) so distinct domains
         // resolving to overlapping IPs do not produce
         // duplicate-`(prefix_ranges, destination_port)` predicates
@@ -4876,7 +4875,7 @@ mod tests {
         );
         assert!(
             !listener.contains("server_names: [\"monitored.example.com\"]"),
-            "mixed policy L3 chain must NOT use SNI (pre-M9-S19 shape):\n{listener}"
+            "mixed policy L3 chain must NOT use SNI (legacy shape):\n{listener}"
         );
     }
 
@@ -5011,10 +5010,10 @@ mod tests {
         let net = test_network_info();
         let compiled = PolicyCompiler::compile(&policy, &net).unwrap();
 
-        // As of M9-S18 the bootstrap defines **both** clusters
-        // (`original_dst` and `mitmproxy`) on every session regardless
-        // of policy content. The `mitmproxy` cluster is scaffolded so
-        // M9-S19's cutover is an isolated listener change.
+        // The bootstrap defines **both** clusters (`original_dst` and
+        // `mitmproxy`) on every session regardless of policy content.
+        // The `mitmproxy` cluster is scaffolded so the L3 cutover is
+        // an isolated listener change.
         assert!(
             compiled
                 .envoy_bootstrap_config
@@ -5023,15 +5022,17 @@ mod tests {
         );
         assert!(
             compiled.envoy_bootstrap_config.contains("name: mitmproxy"),
-            "bootstrap must define the mitmproxy cluster (M9-S18+)"
+            "bootstrap must define the mitmproxy cluster"
         );
-        // The behavioural guarantee survives the split: the listener
-        // must not yet route traffic to mitmproxy (that's M9-S19).
+        // At apply-policy time (empty DnsCache) the L3 domain chain
+        // has no resolved IPs and therefore emits no chain — so the
+        // listener must not yet route traffic to mitmproxy.
         assert!(
             !compiled
                 .envoy_listener_config
                 .contains("cluster: mitmproxy"),
-            "listener must not route to mitmproxy yet"
+            "listener must not route to mitmproxy at apply-policy time \
+             (L3 domain chain is fail-closed until DNS resolves)"
         );
     }
 
@@ -5447,7 +5448,7 @@ mod tests {
         );
     }
 
-    // -- M9-S18 invariant: listener framing is identical across policies ----
+    // -- Invariant: listener framing is identical across policies ----------
     //
     // Every listener generation (deny-all, L1-only, L2, L3, mixed) must
     // share the same `listener_filters` block so the atomic listener
@@ -5455,7 +5456,7 @@ mod tests {
     // mutation that preserves the `policy_listener` identity (see
     // `compile_envoy_listener` rustdoc — Envoy services the rewrite via
     // warm-restart-with-drain, but the listener's name and dynamic-listener
-    // placement survive). As a consequence `tls_inspector` is now present
+    // placement survive). As a consequence `tls_inspector` is present
     // in every listener — it is a no-op for non-TLS traffic and is
     // necessary for L2/L3 SNI-based filter_chain_match routing.
 
@@ -5467,7 +5468,7 @@ mod tests {
 
         assert!(
             compiled.envoy_config_combined().contains("tls_inspector"),
-            "M9-S18: L1-only listener must include tls_inspector so the \
+            "L1-only listener must include tls_inspector so the \
              listener-filters block stays identical across LDS generations \
              (required by the atomic listener writer's invariant)"
         );
@@ -5499,9 +5500,9 @@ mod tests {
         );
     }
 
-    // -- M9-S18: Bootstrap / listener split -----------------------------------
+    // -- Bootstrap / listener split -------------------------------------------
     //
-    // These tests verify the xDS-based split introduced in M9-S18. The
+    // These tests verify the xDS-based bootstrap/listener split. The
     // invariants under test are:
     //   * The bootstrap is policy-agnostic and contains the LDS config,
     //     both clusters (`original_dst` + `mitmproxy`), and the admin
@@ -5511,9 +5512,8 @@ mod tests {
     //     and a TCP health check.
     //   * The listener file is framed by the filter-chains marker
     //     comments and is written through the filesystem LDS path.
-    //   * The listener file emitted today still routes every filter
-    //     chain to `original_dst` (M9-S19 performs the L3 → mitmproxy
-    //     cutover).
+    //   * L2 chains route to `original_dst`; the L3 → mitmproxy cutover
+    //     is exercised by tests below.
 
     #[test]
     fn bootstrap_is_policy_agnostic() {
@@ -5647,9 +5647,9 @@ mod tests {
         let bootstrap = &compiled.envoy_bootstrap_config;
 
         // The design spec explicitly forbids wrapping the upstream
-        // transport socket in PROXY protocol. The CONNECT preface for
-        // M9-S19 is emitted via per-chain `tcp_proxy.tunneling_config`,
-        // not via a transport-socket header.
+        // transport socket in PROXY protocol. The CONNECT preface is
+        // emitted via per-chain `tcp_proxy.tunneling_config`, not via
+        // a transport-socket header.
         assert!(
             !bootstrap.contains("upstream_proxy_protocol"),
             "mitmproxy cluster must NOT wrap its transport in upstream_proxy_protocol:\n{bootstrap}"
@@ -5718,9 +5718,9 @@ mod tests {
 
     #[test]
     fn listener_routes_l2_to_original_dst_and_l3_to_mitmproxy() {
-        // M9-S19 cutover: L2 TLS chains continue to target
+        // L3 cutover: L2 TLS chains continue to target
         // `original_dst` (no inspection beyond SNI), but every L3
-        // chain now routes to the `mitmproxy` cluster via
+        // chain routes to the `mitmproxy` cluster via
         // `tcp_proxy.tunneling_config.hostname =
         // "%DOWNSTREAM_LOCAL_ADDRESS%"`. Exercise the mixed fixture
         // so both clusters appear in the same listener.
@@ -5766,7 +5766,7 @@ mod tests {
         )
     }
 
-    /// CRITICAL M9-S18 INVARIANT: the listener file's head and tail regions
+    /// CRITICAL INVARIANT: the listener file's head and tail regions
     /// (everything outside the filter-chains markers) must be IDENTICAL
     /// across every policy shape, otherwise
     /// [`AtomicListenerWriter`](crate::atomic_listener_writer::AtomicListenerWriter)

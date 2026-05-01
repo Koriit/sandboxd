@@ -2,15 +2,15 @@
 //! closes the UDP allow-flow audit gap.
 //!
 //! Spec references:
-//!   - `2026-05-01-udp-nft-loggers-design.md` (M12-S2) Decisions 3,
-//!     4, 5 — the new NFCT-driven allow-flow audit log, the
-//!     binary-rename family, and the shared lib crate.
+//!   - `2026-05-01-udp-nft-loggers-design.md` Decisions 3, 4, 5 — the
+//!     new NFCT-driven allow-flow audit log, the binary-rename family,
+//!     and the shared lib crate.
 //!
 //! Packet flow:
 //!
-//!   - **UDP allow** (M12-S2 Decision 1): nft's `sandbox_dnat`
-//!     prerouting chain matches `policy_allow_udp` and `accept`s — no
-//!     DNAT, no userland datapath. The packet exits via MASQUERADE on
+//!   - **UDP allow** (Decision 1): nft's `sandbox_dnat` prerouting
+//!     chain matches `policy_allow_udp` and `accept`s — no DNAT, no
+//!     userland datapath. The packet exits via MASQUERADE on
 //!     POSTROUTING and reaches the upstream directly.
 //!   - **Audit signal** (this binary, Decision 3): the kernel's
 //!     conntrack subsystem creates a tracked flow for the allowed UDP
@@ -97,24 +97,26 @@ struct Args {
     /// logger JSONL files so the per-session bind mount at
     /// `/var/log/gateway/events/<session-id>/` is covered by one
     /// ingest watcher. The file name is `nft-allow.jsonl` per
-    /// M12-S2 Resolution 6 (the shorter `nft-allow` form is preferred
-    /// over `nft-allow-logger` because the file already lives in a
-    /// logger-emitted-events directory — the `-logger` suffix is
-    /// implicit context).
+    /// `2026-05-01-udp-nft-loggers-design.md` Resolution 6 (the shorter
+    /// `nft-allow` form is preferred over `nft-allow-logger` because
+    /// the file already lives in a logger-emitted-events directory —
+    /// the `-logger` suffix is implicit context).
     #[arg(long, default_value = "/var/log/gateway/events/nft-allow.jsonl")]
     event_path: PathBuf,
 
     /// Health probe port. Not in the nftables DNAT set; reached from
     /// inside the container by `HEALTHCHECK` / sandboxd `docker exec`.
-    /// `:10004` adjacent to the deny-logger's `:10003` (M12-S2
-    /// Decision 4); not load-bearing — the gateway container's port
-    /// table has nothing else listening in this range.
+    /// `:10004` adjacent to the deny-logger's `:10003`
+    /// (`2026-05-01-udp-nft-loggers-design.md` Decision 4); not
+    /// load-bearing — the gateway container's port table has nothing
+    /// else listening in this range.
     #[arg(long, default_value_t = 10004)]
     health_port: u16,
 
     /// Per-process event-rate cap, events per second. Inherited from
-    /// the deny-logger pattern (Resolution 3 defers per-source rate
-    /// caps to M12-S9; the per-process cap suffices for the v1
+    /// the deny-logger pattern (Resolution 3 of
+    /// `2026-05-01-udp-nft-loggers-design.md` defers per-source rate
+    /// caps to a follow-up; the per-process cap suffices for the v1
     /// allow-logger).
     #[arg(long, env = "SANDBOX_ALLOW_LOGGER_RATE_CAP", default_value_t = 1000)]
     rate_cap: u32,
@@ -160,12 +162,12 @@ fn main() -> ExitCode {
 
 async fn run(args: Args) -> std::io::Result<()> {
     // `"allow-logger"` is the on-disk layer tag the daemon-side
-    // ingest parser dispatches on; preserved across phases of M12-S2
-    // so daemon ingest is a small additive change rather than a new
-    // pipeline (Decision 5). The same tag drives the EventEmitter's
-    // `layer:` line field and is the value the daemon-side
-    // `nft_logger.rs` parser keys on alongside the existing
-    // `deny-logger` tag.
+    // ingest parser dispatches on; the daemon-side ingest is an
+    // additive change rather than a new pipeline
+    // (`2026-05-01-udp-nft-loggers-design.md` Decision 5). The same
+    // tag drives the EventEmitter's `layer:` line field and is the
+    // value the daemon-side `nft_logger.rs` parser keys on alongside
+    // the existing `deny-logger` tag.
     let emitter = Arc::new(EventEmitter::open(&args.event_path, "allow-logger")?);
     let rate_cap = Arc::new(RateCap::new(
         args.rate_cap,
@@ -178,8 +180,8 @@ async fn run(args: Args) -> std::io::Result<()> {
     // would silently miss every UDP allow event, which is strictly
     // worse than going unhealthy and being restarted by Docker's
     // HEALTHCHECK. The conntrack subsystem is loaded inside the
-    // gateway container as part of the existing M12-S1 work (audit
-    // §2.4); `CAP_NET_ADMIN` is in the run flags.
+    // gateway container by the existing audit-§2.4 setup;
+    // `CAP_NET_ADMIN` is in the run flags.
     let nfct_subscriber = nfct::NfctSubscriber::bind()
         .map_err(|e| std::io::Error::other(format!("nfct bind: {e}")))?;
     tracing::info!("nfct subscriber bound (NETLINK_NETFILTER, NFNLGRP_CONNTRACK_NEW)");
@@ -191,7 +193,7 @@ async fn run(args: Args) -> std::io::Result<()> {
     // CLAUDE.md's blocking-syscall convention: place it on a
     // dedicated `spawn_blocking` thread so the netlink syscall does
     // not park a tokio worker under sustained traffic. Mirrors the
-    // deny-logger's NFLOG receive loop (Phase 2).
+    // deny-logger's NFLOG receive loop.
     let nfct_emitter = Arc::clone(&emitter);
     let nfct_rate_cap = Arc::clone(&rate_cap);
     let nfct_task = tokio::task::spawn_blocking(move || {

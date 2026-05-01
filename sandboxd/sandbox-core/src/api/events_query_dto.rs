@@ -223,7 +223,7 @@ mod tests {
     // These tests pin the serde-level contract: every field must be
     // `#[serde(default)]` so an empty/partial object deserializes
     // cleanly. Axum's query-string extraction is verified in the
-    // HTTP-layer tests added in Phase 2 of M10-S4.
+    // HTTP-layer tests.
 
     #[test]
     fn deserialize_empty_object_uses_defaults() {

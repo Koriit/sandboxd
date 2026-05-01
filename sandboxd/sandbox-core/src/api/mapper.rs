@@ -41,7 +41,7 @@ impl From<&Session> for SessionDto {
         // Container backend: substitute the daemon's host-80% defaults
         // for any `0`-sentinel persisted value. The "stored" cpus
         // value is `config.cpus_decimal` when set (the precise float
-        // M11-S7 todo #67 plumbed in) or the integer `config.cpus`
+        // the wire boundary preserves) or the integer `config.cpus`
         // cast to f64 otherwise. Lima passes through verbatim — the
         // sentinel only applies to container sessions.
         let stored_cpus_f64 = session
@@ -120,8 +120,8 @@ impl SessionDto {
     /// Attach operator-facing warnings to the DTO.
     ///
     /// Currently exercised only by `POST /sessions` for the container
-    /// backend's first-use lite-image build notice (M11-S3 Phase 3D);
-    /// kept generic so future warnings (e.g. resource ceiling
+    /// backend's first-use lite-image build notice; kept generic so
+    /// future warnings (e.g. resource ceiling
     /// substitutions) can plumb through the same path. An empty
     /// `Vec` is a no-op and round-trips as the wire field being
     /// omitted entirely (`#[serde(skip_serializing_if = "Vec::is_empty")]`
@@ -153,7 +153,7 @@ impl SessionDto {
     }
 
     /// Attach the rootless-Docker probe outcome captured at session-
-    /// create time (M11-S8 Wave 2).
+    /// create time.
     ///
     /// Same lean-list rationale as [`SessionDto::with_network`] and
     /// [`SessionDto::with_mounts`]: the list endpoint deliberately
@@ -161,14 +161,14 @@ impl SessionDto {
     /// `GET /sessions/{id}` and `POST /sessions` populate it from
     /// the persisted [`crate::session::SessionConfig::rootless_docker`].
     /// The mapper does not probe — it only projects state that the
-    /// daemon already stamped onto the session at create time
-    /// (deliverable 3 of the M11-S8 Wave 2 plumbing).
+    /// daemon already stamped onto the session at create time.
     ///
     /// `None` keeps the wire-key absent (`#[serde(skip_serializing_if]
     /// = "Option::is_none"]`), matching the per-backend semantics on
     /// the parent: Lima sessions never carry it, container sessions
-    /// always do. Pre-Wave-2 container records that lack the
-    /// persisted state also surface as `None` here.
+    /// always do. Container records written before the probe was
+    /// introduced lack the persisted state and also surface as
+    /// `None` here.
     pub fn with_rootless(mut self, rootless: Option<SessionRootlessDockerDto>) -> Self {
         self.rootless = rootless;
         self
@@ -197,9 +197,9 @@ impl From<&SessionConfig> for SessionConfigDto {
     /// that explicitly set non-zero `cpus`/`memory_mb`.
     ///
     /// `cpus` is sourced from [`SessionConfig::cpus_decimal`] when
-    /// `Some` (M11-S7 todo #67 — the precise 1-decimal value the
-    /// operator supplied for a container session); otherwise it
-    /// falls back to the integer [`SessionConfig::cpus`] cast to
+    /// `Some` (the precise 1-decimal value the operator supplied for
+    /// a container session); otherwise it falls back to the integer
+    /// [`SessionConfig::cpus`] cast to
     /// `f32`, which is exact for every value the persisted column
     /// can hold (`u32` → `f32` is exact for inputs ≤ 2^24).
     fn from(config: &SessionConfig) -> Self {
@@ -581,12 +581,11 @@ mod tests {
         assert_eq!(dto.config.memory_mb, dto.config.resolved_memory_mb);
     }
 
-    /// M11-S7 todo #67: a container session whose persisted
-    /// `cpus_decimal` carries a fractional value (`1.5`) surfaces
-    /// that exact value on the wire `cpus` field — not the rounded-
-    /// down integer `cpus` column the older daemon's view would have
-    /// returned. Pins the round-trip the daemon's create handler
-    /// stamps when it parses `--cpus 1.5`.
+    /// A container session whose persisted `cpus_decimal` carries a
+    /// fractional value (`1.5`) surfaces that exact value on the wire
+    /// `cpus` field — not the rounded-down integer `cpus` column the
+    /// older daemon's view would have returned. Pins the round-trip
+    /// the daemon's create handler stamps when it parses `--cpus 1.5`.
     #[test]
     fn session_dto_surfaces_fractional_cpus_decimal_on_wire() {
         let config = SessionConfig {
@@ -615,7 +614,7 @@ mod tests {
         );
     }
 
-    // -- M11-S7 Bundle Y: SessionNetworkInfo / SessionMountInfo wire shape ---
+    // -- SessionNetworkInfo / SessionMountInfo wire shape -------------------
 
     #[test]
     fn session_dto_omits_network_and_mounts_when_none() {
@@ -748,7 +747,7 @@ mod tests {
         assert_eq!(deser.mounts.as_ref(), Some(&mounts));
     }
 
-    // -- M11-S8 Wave 2: SessionRootlessDocker wire shape ---------------------
+    // -- SessionRootlessDocker wire shape ------------------------------------
 
     #[test]
     fn session_dto_omits_rootless_when_none() {

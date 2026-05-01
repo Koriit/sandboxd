@@ -857,13 +857,13 @@ mod tests {
 
     #[test]
     fn dto_deny_logger_allow_udp_wire_shape() {
-        // M12-S2 Decision 3 / 5: allow events share the deny event's
-        // 5-tuple wire shape (`orig_dst_ip`, `orig_dst_port`,
-        // `protocol`, `src_ip`, `src_port`), distinguished only by
-        // the `event` discriminator (`"allow"` vs `"deny"`). This
-        // test pins the allow shape and the round-trip equality
-        // alongside the existing deny tests; the deny round-trip
-        // tests stay green untouched.
+        // Allow events share the deny event's 5-tuple wire shape
+        // (`orig_dst_ip`, `orig_dst_port`, `protocol`, `src_ip`,
+        // `src_port`), distinguished only by the `event`
+        // discriminator (`"allow"` vs `"deny"`). This test pins the
+        // allow shape and the round-trip equality alongside the
+        // existing deny tests; the deny round-trip tests stay green
+        // untouched.
         let event = Event::Traffic {
             envelope: EventEnvelope {
                 timestamp: Utc.with_ymd_and_hms(2026, 5, 1, 12, 0, 0).unwrap()

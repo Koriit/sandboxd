@@ -7,18 +7,20 @@ rust-version.workspace = true
 
 # The nft-allow-logger ships as a single static binary that runs
 # alongside Envoy / CoreDNS / mitmproxy / nft-deny-logger inside the
-# gateway container. M12-S2 Decision 3: it owns one data-plane code
-# path — an `nfnetlink_conntrack` (NFCT) multicast subscription on
-# `NFNLGRP_CONNTRACK_NEW`, filtered for UDP at parse time, that emits
-# one JSONL `event: "allow"` record per new tracked UDP flow. The
-# kernel does the filtering + flow-construction; this binary's only
-# datapath responsibility is to parse the original-direction tuple
-# out of each kernel-emitted message and emit it as a structured
-# audit record.
+# gateway container. Per
+# `2026-05-01-udp-nft-loggers-design.md` Decision 3, it owns one
+# data-plane code path — an `nfnetlink_conntrack` (NFCT) multicast
+# subscription on `NFNLGRP_CONNTRACK_NEW`, filtered for UDP at parse
+# time, that emits one JSONL `event: "allow"` record per new tracked
+# UDP flow. The kernel does the filtering + flow-construction; this
+# binary's only datapath responsibility is to parse the
+# original-direction tuple out of each kernel-emitted message and
+# emit it as a structured audit record.
 #
 # Cross-cutting infrastructure (JSONL emitter, RateCap, /health) lives
-# in `sandbox-event-emitter` (M12-S2 Decision 5) and is shared with
-# `sandbox-nft-deny-logger`. Keeping the netlink stack uniform
+# in `sandbox-event-emitter`
+# (`2026-05-01-udp-nft-loggers-design.md` Decision 5) and is shared
+# with `sandbox-nft-deny-logger`. Keeping the netlink stack uniform
 # (`netlink-sys` + hand-rolled NFCT TLV parse, mirroring the
 # deny-logger's NFLOG handling) avoids splitting the two binaries
 # across two netlink crate stacks for no win.
@@ -27,10 +29,10 @@ name = "sandbox-nft-allow-logger"
 path = "src/main.rs"
 
 [dependencies]
-# Cross-cutting infrastructure (JSONL emitter, RateCap, /health server)
-# extracted in M12-S2 Phase 1 (Decision 5). Both the renamed deny-logger
-# and this allow-logger depend on this lib; the binary owns only the
-# data-plane code (NFCT subscriber, main wiring).
+# Cross-cutting infrastructure (JSONL emitter, RateCap, /health server).
+# Both the sibling deny-logger and this allow-logger depend on this
+# lib; the binary owns only the data-plane code (NFCT subscriber,
+# main wiring).
 sandbox-event-emitter = { path = "../sandbox-event-emitter" }
 
 chrono.workspace = true
@@ -45,7 +47,7 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-# NFCT subscriber for the UDP allow path (M12-S2 Decision 3).
+# NFCT subscriber for the UDP allow path.
 #
 # The kernel emits one netlink message per new tracked flow on the
 # `NFNL_SUBSYS_CTNETLINK` subsystem's `NFNLGRP_CONNTRACK_NEW`
@@ -55,7 +57,7 @@ tracing-subscriber.workspace = true
 # / CTA_PROTO_NUM / CTA_PROTO_SRC_PORT / CTA_PROTO_DST_PORT), filters
 # for UDP, and emits one `AllowRecord` per matching event.
 #
-# Crate choice rationale (M12-S2 Phase 3):
+# Crate choice rationale:
 #   1. `netlink-packet-netfilter` v0.2.0 (rust-netlink, pure Rust):
 #      conntrack-subscription support is on the unreleased `main`
 #      branch only — v0.2.0 covers NFLOG/ULOG and nftables but NOT

@@ -66,9 +66,9 @@ pub enum GatewayStatus {
 /// `gateway_monitor` uses this enum as a first-pass signal — an
 /// `Unhealthy` verdict here means Docker has already observed `retries`
 /// consecutive failures and is the canonical "container unhealthy"
-/// signal the spec calls for (see the M10-S3 spec:
-/// *"Docker marks the container unhealthy. sandboxd's existing gateway
-/// health polling observes this and restarts the gateway container."*).
+/// signal the spec calls for: Docker marks the container unhealthy,
+/// sandboxd's gateway health polling observes this, and the gateway
+/// container is restarted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DockerHealth {
     /// Within the HEALTHCHECK `start-period` — Docker has not yet
@@ -123,7 +123,7 @@ impl DockerHealth {
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Docker image name for the gateway container (built in M3-S1).
+/// Docker image name for the gateway container.
 pub const GATEWAY_IMAGE: &str = "sandbox-gateway";
 
 /// Maximum time to wait for individual component readiness.
@@ -178,9 +178,9 @@ pub const GATEWAY_ENVOY_PORT: u16 = 10000;
 /// Part 3 § "Listener design".
 pub const GATEWAY_DENY_LOGGER_TCP_PORT: u16 = 10001;
 
-/// NFLOG group the kernel emits dropped-UDP packets on. M12-S2
-/// Decision 2 / Resolution 1: denied UDP no longer DNATs to a userland
-/// listener; the prerouting chain matches unmatched UDP with
+/// NFLOG group the kernel emits dropped-UDP packets on. Denied UDP
+/// no longer DNATs to a userland listener; the prerouting chain
+/// matches unmatched UDP with
 /// `meta l4proto udp log group {NFT_NFLOG_DENY_GROUP}; meta l4proto udp drop`,
 /// and the kernel mirrors each dropped packet to NFNLGRP_NFLOG with the
 /// pre-rewrite IPv4+UDP headers in `NFULA_PAYLOAD`. The
@@ -315,20 +315,20 @@ impl GatewayManager {
         // first boot. PolicyDistributor rewrites it later when the
         // session policy is applied.
         //
-        // Pre-M9-S18 the gateway container shipped with `envoy-base.yaml`
-        // baked in, which installed an L1 pass-through listener on first
-        // boot. From M9-S18 onwards the bootstrap is policy-agnostic and
-        // the day-one listener is served via LDS — so the initial
+        // The gateway container used to ship with `envoy-base.yaml`
+        // baked in, which installed an L1 pass-through listener on
+        // first boot. The bootstrap is now policy-agnostic and the
+        // day-one listener is served via LDS — so the initial
         // listener must itself be deliverable via LDS, and the simplest
         // fail-closed default is deny-all. For sessions started without
         // a policy, this means the Envoy listener is deny-all rather
         // than L1 pass-through; net user-visible behaviour is unchanged
         // because the nftables layer (`sandbox_policy`) gates traffic
         // first and is also empty on a no-policy session, and DNS is
-        // deny-by-default since M9-S15. As of M9-S19, the policy-driven
-        // L3 filter chains replace this default once a policy is
-        // applied. See `PolicyCompiler::compile_initial_envoy_listener`
-        // for the full rationale.
+        // deny-by-default. Policy-driven L3 filter chains replace this
+        // default once a policy is applied. See
+        // `PolicyCompiler::compile_initial_envoy_listener` for the
+        // full rationale.
         let listener_host_dir = session_listener_host_dir(session_id);
         // Best-effort cleanup of any leftover dir from a crashed previous
         // session with the same ID (extremely unlikely given UUIDs, but
@@ -363,7 +363,7 @@ impl GatewayManager {
         // inside the container (Envoy access log, CoreDNS plugin,
         // mitmproxy addon) append to envoy.jsonl / coredns.jsonl /
         // mitmproxy.jsonl inside this directory, which sandboxd tails
-        // via `inotify` in the ingest layer (Phase 7 of M10-S2).
+        // via `inotify` in the ingest layer.
         //
         // Mirrors the listener host-dir handling above: best-effort
         // cleanup of any leftover dir from a crashed previous session
@@ -1070,8 +1070,8 @@ impl GatewayManager {
     /// Remove the DNAT + policy nftables tables from the gateway container's
     /// network namespace. Called before shutdown to stop routing new traffic.
     ///
-    /// **M10-S3:** `sandbox_dnat` and `sandbox_policy` are both managed as
-    /// a pair — `sandbox_dnat` holds the conditional-DNAT + set declarations,
+    /// `sandbox_dnat` and `sandbox_policy` are both managed as a pair —
+    /// `sandbox_dnat` holds the conditional-DNAT + set declarations,
     /// `sandbox_policy` holds the Envoy-egress output-chain allow rules.
     /// Tear both down atomically in a single `nft -f` input so the gateway
     /// doesn't briefly run with only half the pair present (which could
@@ -1429,8 +1429,8 @@ pub fn generate_deny_all_ruleset() -> String {
 
 /// Generate the DNAT ruleset that routes VM traffic through the gateway.
 ///
-/// **M10-S3 shape (two-table conditional DNAT).** The `sandbox_dnat` table
-/// now makes the allow/deny decision for VM egress via conditional DNAT
+/// **Two-table conditional DNAT shape.** The `sandbox_dnat` table
+/// makes the allow/deny decision for VM egress via conditional DNAT
 /// keyed on the `policy_allow_{tcp,udp}` concat sets:
 ///
 /// - DNS (port 53) → CoreDNS (unchanged)
@@ -1457,7 +1457,7 @@ pub fn generate_deny_all_ruleset() -> String {
 /// declarations are duplicated in both `sandbox_dnat` and `sandbox_policy`
 /// and populated identically by the compile / DNS-propagation paths.
 /// Verified empirically via `nft -c -f -` on the gateway image before the
-/// landing commit. See the M10-S3 plan risk §1.
+/// landing commit.
 pub fn generate_dnat_ruleset(vm_subnet: &str, gateway_ip: &str) -> String {
     format!(
         r#"table inet sandbox_dnat {{
@@ -1483,11 +1483,11 @@ pub fn generate_dnat_ruleset(vm_subnet: &str, gateway_ip: &str) -> String {
         # and DNS propagation loop).
         ip saddr {vm_subnet} meta l4proto tcp ip daddr . tcp dport @{NFT_POLICY_ALLOW_TCP_SET} dnat to {gateway_ip}:{GATEWAY_ENVOY_PORT}
 
-        # Policy-allowed UDP -> direct to upstream. M12-S2 Decision 1:
-        # UDP allow path skips Envoy entirely (UDP cannot be MITM'd / has
-        # no L7 inspection surface). The packet falls through prerouting
-        # un-DNAT'd; the `forward` chain admits VM-subnet UDP destined to
-        # an allowed (ip, port) and POSTROUTING masquerades it out.
+        # Policy-allowed UDP -> direct to upstream. The UDP allow path
+        # skips Envoy entirely (UDP cannot be MITM'd / has no L7
+        # inspection surface). The packet falls through prerouting
+        # un-DNAT'd; the `forward` chain admits VM-subnet UDP destined
+        # to an allowed (ip, port) and POSTROUTING masquerades it out.
         ip saddr {vm_subnet} meta l4proto udp ip daddr . udp dport @{NFT_POLICY_ALLOW_UDP_SET} accept
 
         # Unmatched TCP -> deny-logger (DNAT to userland listener).
@@ -1495,12 +1495,12 @@ pub fn generate_dnat_ruleset(vm_subnet: &str, gateway_ip: &str) -> String {
         # surfaced as a structured `deny` event instead of a silent RST.
         ip saddr {vm_subnet} meta l4proto tcp dnat to {gateway_ip}:{GATEWAY_DENY_LOGGER_TCP_PORT}
 
-        # Unmatched UDP -> NFLOG group then drop. M12-S2 Decision 2: no
-        # DNAT, no userland listener. The kernel mirrors the dropped
-        # packet to NFNLGRP_NFLOG with the pre-rewrite IPv4+UDP headers;
+        # Unmatched UDP -> NFLOG group then drop. No DNAT, no userland
+        # listener. The kernel mirrors the dropped packet to
+        # NFNLGRP_NFLOG with the pre-rewrite IPv4+UDP headers;
         # `sandbox-nft-deny-logger` subscribes to the group and emits
-        # the JSONL deny event with the original 5-tuple. Silent drop on
-        # the wire (Resolution 2 — no ICMP unreachable).
+        # the JSONL deny event with the original 5-tuple. Silent drop
+        # on the wire (no ICMP unreachable).
         ip saddr {vm_subnet} meta l4proto udp log group {NFT_NFLOG_DENY_GROUP}
         ip saddr {vm_subnet} meta l4proto udp drop
 
@@ -1526,14 +1526,15 @@ pub fn generate_dnat_ruleset(vm_subnet: &str, gateway_ip: &str) -> String {
 ///
 /// The initial deny-all ruleset blocks all inbound traffic. After DNAT
 /// is configured, traffic from the VM subnet is rewritten to the
-/// gateway's own IP on one of three destination ports (M12-S2: down
-/// from four — the deny-logger UDP listener at :10002 is gone):
+/// gateway's own IP on one of three destination ports (down from
+/// four — the legacy deny-logger UDP listener at :10002 is gone,
+/// replaced by an NFLOG-driven UDP deny path):
 ///
 /// - `:53` — DNS (CoreDNS)
 /// - `:10000` — Envoy's `original_dst` listener (policy-allowed TCP only;
 ///   Envoy terminates TCP and — for L3 destinations — opens a CONNECT
-///   tunnel to mitmproxy on loopback `127.0.0.1:18080`. UDP no longer
-///   DNATs here per M12-S2 Decision 1.)
+///   tunnel to mitmproxy on loopback `127.0.0.1:18080`. UDP does not
+///   DNAT here — the UDP allow path is direct.)
 /// - `:10001` — deny-logger TCP listener (VM TCP that *didn't* match any
 ///   policy allow tuple)
 ///
@@ -1590,13 +1591,13 @@ table inet sandbox {{
 ///      Envoy:10000, deny-logger:10001, CoreDNS:53). The DNAT rewrites
 ///      the destination to `gateway_ip` so the gateway-IP match captures
 ///      it.
-///   2. VM-subnet UDP destined off-gateway. M12-S2 Decision 1: allowed
-///      UDP `accept`s at PREROUTING without DNAT, so its destination
-///      remains the upstream IP. Denied UDP is `drop`-ed at
-///      PREROUTING via the `log group N; drop` pair earlier on the
-///      chain, so by the time UDP reaches FORWARD, it's already been
-///      filtered against the policy allow-set; admitting all VM-subnet
-///      UDP at FORWARD is therefore safe.
+///   2. VM-subnet UDP destined off-gateway. Allowed UDP `accept`s at
+///      PREROUTING without DNAT, so its destination remains the
+///      upstream IP. Denied UDP is `drop`-ed at PREROUTING via the
+///      `log group N; drop` pair earlier on the chain, so by the time
+///      UDP reaches FORWARD, it has already been filtered against the
+///      policy allow-set; admitting all VM-subnet UDP at FORWARD is
+///      therefore safe.
 ///   3. Established / related return traffic (kernel conntrack).
 pub fn generate_forward_allow_ruleset(vm_subnet: &str, gateway_ip: &str) -> String {
     format!(
@@ -1606,12 +1607,12 @@ table inet sandbox {{
         # Allow DNAT'd traffic (destination rewritten to gateway by prerouting)
         ip saddr {vm_subnet} ip daddr {gateway_ip} accept
 
-        # Allow policy-allowed UDP (M12-S2 Decision 1). The prerouting
-        # chain's `log group N; drop` rule has already filtered denied
-        # UDP, so anything that reaches this chain is either explicitly
-        # allowed or DNS (DNS-DNAT'd to gateway_ip and caught by the
-        # rule above). Admitting VM-subnet UDP wholesale is the
-        # simplest correct shape; defence-in-depth lives at PREROUTING.
+        # Allow policy-allowed UDP. The prerouting chain's
+        # `log group N; drop` rule has already filtered denied UDP, so
+        # anything that reaches this chain is either explicitly allowed
+        # or DNS (DNS-DNAT'd to gateway_ip and caught by the rule
+        # above). Admitting VM-subnet UDP wholesale is the simplest
+        # correct shape; defence-in-depth lives at PREROUTING.
         ip saddr {vm_subnet} meta l4proto udp accept
 
         # Allow established return traffic
@@ -1787,8 +1788,8 @@ mod tests {
             "must define 'table inet sandbox_dnat'"
         );
 
-        // Must declare both concat sets (M10-S3: filtering moved from
-        // sandbox_policy.forward to sandbox_dnat.prerouting).
+        // Must declare both concat sets (filtering lives in
+        // sandbox_dnat.prerouting, not sandbox_policy.forward).
         assert!(
             ruleset.contains("set policy_allow_tcp"),
             "must declare policy_allow_tcp concat set"
@@ -1819,7 +1820,8 @@ mod tests {
         );
 
         // Conditional DNAT to Envoy for policy-allowed TCP. Policy-
-        // allowed UDP is `accept`-ed without DNAT (M12-S2 Decision 1).
+        // allowed UDP is `accept`-ed without DNAT (UDP allow path
+        // skips Envoy).
         assert!(
             ruleset.contains(
                 "ip saddr 10.209.0.0/28 meta l4proto tcp ip daddr . tcp dport \
@@ -1834,35 +1836,34 @@ mod tests {
                  @policy_allow_udp accept"
             ),
             "must `accept` policy-allowed UDP without DNAT so MASQUERADE \
-             routes it directly to upstream (M12-S2 Decision 1):\n{ruleset}"
+             routes it directly to upstream (UDP allow path is direct):\n{ruleset}"
         );
         assert!(
             !ruleset.contains("@policy_allow_udp dnat to"),
-            "M12-S2 Decision 1 forbids DNAT-to-Envoy for policy-allowed UDP \
+            "DNAT-to-Envoy is forbidden for policy-allowed UDP \
              (Envoy is TCP-only and the allow path is direct):\n{ruleset}"
         );
 
-        // Deny-logger fall-through DNAT rule for TCP. UDP no longer
-        // DNATs to a userland listener; it `log group {N}; drop`s
-        // (M12-S2 Decision 2).
+        // Deny-logger fall-through DNAT rule for TCP. UDP does not
+        // DNAT to a userland listener; it `log group {N}; drop`s.
         assert!(
             ruleset.contains("ip saddr 10.209.0.0/28 meta l4proto tcp dnat to 10.209.0.2:10001"),
             "must DNAT non-allowed VM TCP to deny-logger :10001:\n{ruleset}"
         );
         assert!(
             ruleset.contains("ip saddr 10.209.0.0/28 meta l4proto udp log group 1"),
-            "must mirror unmatched VM UDP to NFLOG group 1 (M12-S2 \
-             Decision 2 / Resolution 1):\n{ruleset}"
+            "must mirror unmatched VM UDP to NFLOG group 1 (kernel-side \
+             deny path):\n{ruleset}"
         );
         assert!(
             ruleset.contains("ip saddr 10.209.0.0/28 meta l4proto udp drop"),
-            "must drop unmatched VM UDP after the NFLOG mirror (M12-S2 \
-             Decision 2):\n{ruleset}"
+            "must drop unmatched VM UDP after the NFLOG mirror:\n{ruleset}"
         );
         assert!(
             !ruleset.contains("dnat to 10.209.0.2:10002"),
-            "M12-S2 Decision 2 removes the UDP-to-:10002 DNAT — there is \
-             no userland UDP listener anymore:\n{ruleset}"
+            "no UDP-to-:10002 DNAT should remain — the legacy userland \
+             UDP listener has been replaced by the NFLOG-driven deny \
+             path:\n{ruleset}"
         );
 
         // The old unconditional "tcp dport != 53 dnat to Envoy" rule is
@@ -1917,19 +1918,19 @@ mod tests {
             ruleset.contains("dnat to 10.209.0.18:10001"),
             "must use the provided gateway IP for deny-logger TCP"
         );
-        // M12-S2 Decision 2: no UDP DNAT-to-listener; the UDP deny path
-        // is `log group N; drop`. There must therefore be no
+        // No UDP DNAT-to-listener: the UDP deny path is
+        // `log group N; drop`. There must therefore be no
         // gateway-IP-prefixed :10002 DNAT in the ruleset.
         assert!(
             !ruleset.contains("dnat to 10.209.0.18:10002"),
-            "post-M12-S2 there is no UDP-to-:10002 DNAT (NFLOG-driven \
-             deny path):\n{ruleset}"
+            "no UDP-to-:10002 DNAT should remain (UDP deny is \
+             NFLOG-driven, not via a userland listener):\n{ruleset}"
         );
     }
 
     #[test]
     fn generate_dnat_ruleset_routes_unmatched_tcp_to_listener_unmatched_udp_to_nflog() {
-        // M12-S2 explicit pin: non-allowed TCP DNATs to :10001
+        // Explicit pin: non-allowed TCP DNATs to :10001
         // (deny-logger listener), non-allowed UDP is mirrored to NFLOG
         // group 1 and dropped (no userland listener). Any future
         // reshuffle that silently drops either arm would reintroduce
@@ -1965,13 +1966,13 @@ mod tests {
             .expect("allow-to-Envoy rule must be present");
         let allow_udp_pos = ruleset
             .find("@policy_allow_udp accept")
-            .expect("UDP allow-accept rule must be present (M12-S2 Decision 1)");
+            .expect("UDP allow-accept rule must be present");
         let deny_tcp_pos = ruleset
             .find("dnat to 10.10.10.2:10001")
             .expect("deny-logger TCP fall-through must be present");
         let deny_udp_pos = ruleset
             .find("meta l4proto udp log group")
-            .expect("UDP NFLOG mirror must be present (M12-S2 Decision 2)");
+            .expect("UDP NFLOG mirror must be present");
 
         assert!(
             envoy_pos < deny_tcp_pos,
@@ -2035,18 +2036,18 @@ mod tests {
             "must allow forwarding from VM subnet only to gateway IP\nruleset:\n{ruleset}"
         );
 
-        // M12-S2 Decision 1: VM-subnet UDP that didn't get DNAT'd at
-        // PREROUTING (it was either allowed via the allow-set accept,
-        // or DNS-DNAT'd to gateway_ip and caught by the rule above)
-        // must still pass forward. The allowed-UDP path no longer
-        // routes through Envoy, so a strict gateway-IP-only rule would
-        // drop allowed UDP destined to upstream IPs. Denied UDP is
-        // already filtered by `nft drop` at PREROUTING, so admitting
-        // VM-subnet UDP wholesale here is safe.
+        // VM-subnet UDP that didn't get DNAT'd at PREROUTING (it was
+        // either allowed via the allow-set accept, or DNS-DNAT'd to
+        // gateway_ip and caught by the rule above) must still pass
+        // forward. The allowed-UDP path does not route through Envoy,
+        // so a strict gateway-IP-only rule would drop allowed UDP
+        // destined to upstream IPs. Denied UDP is already filtered by
+        // `nft drop` at PREROUTING, so admitting VM-subnet UDP
+        // wholesale here is safe.
         assert!(
             ruleset.contains("ip saddr 10.209.0.0/28 meta l4proto udp accept"),
-            "M12-S2 Decision 1: forward chain must admit VM-subnet UDP \
-             so the allow-path datapath works (denied UDP is filtered \
+            "forward chain must admit VM-subnet UDP so the allow-path \
+             datapath works (denied UDP is filtered \
              at PREROUTING):\n{ruleset}"
         );
 
@@ -2081,18 +2082,19 @@ mod tests {
 
     #[test]
     fn generate_input_allow_ruleset_has_no_tcp_8080_accept() {
-        // M9-S19: mitmproxy moved from transparent mode on 0.0.0.0:8080
-        // to regular mode on 127.0.0.1:18080. Nothing in the VM subnet
-        // should reach mitmproxy directly over TCP/8080 anymore — Envoy
-        // terminates the connection and opens a CONNECT tunnel to
-        // mitmproxy over loopback. The input-allow chain must drop the
-        // stale accept so the gateway surface remains tight.
+        // mitmproxy runs in regular mode on 127.0.0.1:18080 — it is
+        // no longer bound to 0.0.0.0:8080 in transparent mode. Nothing
+        // in the VM subnet should reach mitmproxy directly over
+        // TCP/8080 — Envoy terminates the connection and opens a
+        // CONNECT tunnel to mitmproxy over loopback. The input-allow
+        // chain must drop the stale accept so the gateway surface
+        // remains tight.
         let ruleset = generate_input_allow_ruleset("10.209.0.0/28");
 
         assert!(
             !ruleset.contains("tcp dport 8080"),
             "sandbox input chain must no longer accept tcp dport 8080 \
-             (mitmproxy runs on 127.0.0.1:18080 post-M9-S19):\n{ruleset}"
+             (mitmproxy runs on 127.0.0.1:18080):\n{ruleset}"
         );
         assert!(
             !ruleset.contains("tcp dport 18080"),
@@ -2117,11 +2119,11 @@ mod tests {
 
     #[test]
     fn generate_input_allow_ruleset_admits_10001_and_10003_but_not_10002() {
-        // Post-M12-S2 the deny-logger listens on TWO ports inside the
-        // gateway container — TCP :10001 (denied VM TCP DNATted here)
-        // and :10003 (the `/health` endpoint). The previous UDP
-        // listener on :10002 is gone; UDP deny is NFLOG-driven and has
-        // no userland listener. The input chain must admit :10001 and
+        // The deny-logger listens on TWO ports inside the gateway
+        // container — TCP :10001 (denied VM TCP DNATted here) and
+        // :10003 (the `/health` endpoint). The previous UDP listener
+        // on :10002 is gone; UDP deny is NFLOG-driven and has no
+        // userland listener. The input chain must admit :10001 and
         // :10003 but MUST NOT admit `:10002` — opening the port back
         // up would only paper over a regression that re-introduced the
         // listener.
@@ -2134,8 +2136,8 @@ mod tests {
         );
         assert!(
             !ruleset.contains("dport 10002"),
-            "M12-S2 Decision 2 removes the UDP listener — :10002 must \
-             not be admitted on the input chain anymore:\n{ruleset}"
+            "the legacy UDP listener at :10002 has been removed — \
+             :10002 must not be admitted on the input chain anymore:\n{ruleset}"
         );
         assert!(
             ruleset.contains("tcp dport 10003"),

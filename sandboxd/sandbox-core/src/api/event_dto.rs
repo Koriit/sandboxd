@@ -166,7 +166,7 @@ pub enum MitmproxyEventBodyDto {
 }
 
 // ---------------------------------------------------------------------------
-// Deny-logger / allow-logger (the M12-S2 nft-logger family)
+// Deny-logger / allow-logger (the nft-logger family)
 // ---------------------------------------------------------------------------
 //
 // Wire shape per spec Part 3 / "Traffic events" row for layer
@@ -179,12 +179,12 @@ pub enum MitmproxyEventBodyDto {
 // `since_ts` marking the start of the summarised window, per spec
 // Part 3 / "Hardening rules" § 5.
 //
-// M12-S2 Decision 3 / 5 adds an `allow` variant with the same 5-tuple
+// The enum also carries an `allow` variant with the same 5-tuple
 // shape as `deny`; the only structural difference is the `event`
-// discriminator. Per Decision 5 ("additive change, not a new
-// pipeline") the variant is added inside the existing
-// `DenyLoggerEventBodyDto` enum so daemon ingest stays one mapper
-// code path. Forward-compat: any future `allow_end` / equivalent
+// discriminator. The variant lives inside the existing
+// `DenyLoggerEventBodyDto` enum (additive change, not a new
+// pipeline) so daemon ingest stays one mapper code path.
+// Forward-compat: any future `allow_end` / equivalent
 // can be added additively here without breaking the existing
 // `deny` / `allow` / `rate_limited` shapes — `serde` round-tripping
 // is unknown-field-tolerant by default for tagged enums (unknown
@@ -210,8 +210,8 @@ pub enum DenyLoggerEventBodyDto {
         src_ip: String,
         src_port: u16,
     },
-    /// M12-S2 Decision 3 / 5: allow-flow audit record. Same 5-tuple
-    /// shape as `Deny`; the `event` tag is `"allow"`.
+    /// Allow-flow audit record. Same 5-tuple shape as `Deny`; the
+    /// `event` tag is `"allow"`.
     Allow {
         orig_dst_ip: String,
         orig_dst_port: u16,

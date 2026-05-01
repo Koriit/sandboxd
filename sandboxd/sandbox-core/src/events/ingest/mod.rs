@@ -6,7 +6,7 @@
 //! observability-design.md`, Part 3 "Envoy access log", "CoreDNS structured
 //! emission", "mitmproxy structured emission", and the session-ID stamping
 //! paragraph in "Event shape" ("session-ID attribution is sandboxd's job,
-//! not each component's"). Phase 7 of the M10-S2 plan.
+//! not each component's").
 //!
 //! # Shape
 //!

@@ -41,10 +41,10 @@ use super::capabilities::{BackendKind, Capabilities, UnsupportedFeature};
 /// both take whole CPUs), while Docker accepts a 1-decimal fraction
 /// (`--cpus 1.5`) as the cgroup CPU-quota knob. Container's `cpus`
 /// is therefore `f32` — preserving the spec § "Resource defaults —
-/// container only" 1-decimal precision end-to-end (M11-S7 todo #67).
-/// Pre-todo-#67 the container variant was `cpus: u32` with an
-/// implicit `as f64` widening in `ContainerRuntime::resource_ceilings`,
-/// which silently truncated `1.5` to `1`.
+/// container only" 1-decimal precision end-to-end. Historically the
+/// container variant was `cpus: u32` with an implicit `as f64`
+/// widening in `ContainerRuntime::resource_ceilings`, which silently
+/// truncated `1.5` to `1`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "backend", rename_all = "lowercase")]
 pub enum BackendSpecific {
@@ -103,9 +103,9 @@ impl BackendSpecific {
 /// See spec §"Capabilities model" — `BackendSpecific` / `SessionSpec`.
 ///
 /// `Eq` is intentionally not derived because `BackendSpecific::Container`
-/// carries `cpus: f32` (M11-S7 todo #67); float types only implement
-/// `PartialEq`. Tests that previously asserted `Eq`-style equality
-/// continue to work via `PartialEq` (`assert_eq!`).
+/// carries `cpus: f32`; float types only implement `PartialEq`. Tests
+/// that previously asserted `Eq`-style equality continue to work via
+/// `PartialEq` (`assert_eq!`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionSpec {
     /// Backend selector + sizing.
@@ -139,7 +139,7 @@ pub struct SessionSpec {
     /// Validated against [`Capabilities::per_session_no_cache`] in
     /// [`SessionSpec::validate`] — a `Some(true)` value against a
     /// backend whose capability flag is `false` yields
-    /// [`UnsupportedFeature::PerSessionNoCache`]. M12-S4 todo #95.
+    /// [`UnsupportedFeature::PerSessionNoCache`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_cache: Option<bool>,
     // Forward-compat: new fields go here as Option<T> with
@@ -187,9 +187,9 @@ impl SessionSpec {
             }
         }
 
-        // PerSessionNoCache: M12-S4 todo #95 — reject `--no-cache`
-        // (`no_cache: Some(true)`) against a backend whose capability
-        // matrix declares `per_session_no_cache: false`. The CLI
+        // PerSessionNoCache: reject `--no-cache` (`no_cache: Some(true)`)
+        // against a backend whose capability matrix declares
+        // `per_session_no_cache: false`. The CLI
         // pre-checks the same condition (`render_no_cache_rejection_for_container`)
         // so a hand-rolled HTTP client cannot bypass the gate. An
         // absent flag (`None`) and an explicit `Some(false)` are both
@@ -301,8 +301,8 @@ mod tests {
     /// Serde shape for `BackendSpecific::Container` matches the spec
     /// (`{ "backend": "container", ... }`, no `hardened` field).
     ///
-    /// `cpus` is `f32` (M11-S7 todo #67) so the serde-rendered value is
-    /// a JSON number whose textual form preserves the 1-decimal grid.
+    /// `cpus` is `f32` so the serde-rendered value is a JSON number
+    /// whose textual form preserves the 1-decimal grid.
     #[test]
     fn backend_specific_container_serde_shape() {
         let value = BackendSpecific::Container {
@@ -313,7 +313,7 @@ mod tests {
         assert_eq!(v["backend"], "container");
         assert_eq!(v["memory_mb"], 2048);
         // `1.5` round-trips as a float on the wire — not as the truncated
-        // integer the pre-todo-#67 `u32` shape would have produced.
+        // integer the historical `u32` shape would have produced.
         assert_eq!(v["cpus"].as_f64().expect("cpus is a number"), 1.5);
         assert!(
             v.get("hardened").is_none(),
@@ -429,9 +429,9 @@ mod tests {
         assert!(parsed.boot_cmd.is_none());
         assert!(parsed.template.is_none());
         assert!(parsed.disk_gb.is_none());
-        // M12-S4 todo #95: pre-no_cache records must round-trip with
-        // `None` so the validate gate's "absent flag = cached fast
-        // path" semantics hold for legacy daemons rolling forward.
+        // Records predating the `no_cache` field must round-trip
+        // with `None` so the validate gate's "absent flag = cached
+        // fast path" semantics hold for legacy daemons rolling forward.
         assert!(parsed.no_cache.is_none());
     }
 
@@ -516,7 +516,7 @@ mod tests {
             .expect("clone is in the caps set");
     }
 
-    /// M12-S4 todo #95 — `no_cache: Some(true)` against caps whose
+    /// `no_cache: Some(true)` against caps whose
     /// `per_session_no_cache` flag is `false` yields the right
     /// `UnsupportedFeature::PerSessionNoCache(backend)` pair. Mirrors
     /// the `validate_rejects_hardening_when_caps_disable_it` shape:

@@ -1,9 +1,8 @@
-//! Integration tests for M11-S3 Phase 3D — daemon-side container
-//! backend wiring.
+//! Integration tests for daemon-side container backend wiring.
 //!
-//! Phase 3D ties the container runtime (Phase 3A), the lite image
-//! builder (Phase 3B), and the `GET /backends` endpoint (Phase 3C) into
-//! `POST /sessions`. The three contracts these tests pin:
+//! These tests cover the wiring that ties the container runtime, the
+//! lite image builder, and the `GET /backends` endpoint into
+//! `POST /sessions`. The contracts these tests pin:
 //!
 //! - `integration_create_session_container_backend_round_trip` —
 //!   end-to-end: build the lite image, create a session row tagged
@@ -22,17 +21,16 @@
 //!   daemon rejects a `no_cache: true` request against the container
 //!   backend (whose capability matrix declares
 //!   `per_session_no_cache: false`) via `SessionSpec::validate`,
-//!   yielding `UnsupportedFeature::PerSessionNoCache(Container)`
-//!   (M12-S4 todo #95). Hermetic; no Docker daemon required.
+//!   yielding `UnsupportedFeature::PerSessionNoCache(Container)`.
+//!   Hermetic; no Docker daemon required.
 //! - `integration_create_session_lima_rejects_fractional_cpus` — the
 //!   daemon rejects a fractional `cpus` request on the Lima backend
 //!   with HTTP 400, surfacing the spec-aligned "integer cores"
 //!   message rather than silently truncating `1.5` to `1` via the
-//!   downstream `as u32` cast (M12-S4 todo #81). Hermetic; no Lima
-//!   or limactl required.
+//!   downstream `as u32` cast. Hermetic; no Lima or limactl required.
 //!
 //! The first two tests require a real Docker daemon (mirroring the
-//! Phase 3A and 3B integration tests) and run only under the
+//! container-runtime integration tests) and run only under the
 //! `integration` nextest profile (selected by the `integration_*` name
 //! prefix — see `sandboxd/.config/nextest.toml`). The third is
 //! hermetic.
@@ -40,15 +38,14 @@
 //! These tests intentionally bypass the full HTTP router because
 //! constructing a real `AppState` would require booting Lima, the
 //! gateway container, the network manager, and the event bus — most
-//! of which the container backend never touches in this milestone.
-//! Each test exercises the precise piece of Phase 3D's wiring that
-//! its name names: backend dispatch + DTO mapping (round_trip),
-//! `ensure_image` first-use semantics (first_use_warning), and the
-//! daemon-side hardened-flag rejection branch (rejects_hardened).
+//! of which the container backend never touches at this layer.
+//! Each test exercises the precise piece of wiring that its name
+//! names: backend dispatch + DTO mapping (round_trip), `ensure_image`
+//! first-use semantics (first_use_warning), and the daemon-side
+//! hardened-flag rejection branch (rejects_hardened).
 //!
-//! When M11-S5 lands the e2e suite, the same three contracts are
-//! re-verified end-to-end through the CLI; these tests stay as the
-//! daemon-level regression net.
+//! The e2e suite re-verifies the same contracts end-to-end through
+//! the CLI; these tests stay as the daemon-level regression net.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -273,8 +270,8 @@ fn container_spec() -> SessionSpec {
 /// of per-session `ContainerNetwork`, `runtime.create()`,
 /// `runtime.start()`, `SessionStore::create_session_with_backend`
 /// persistence, and `SessionDto::from(&session)` wire mapping. The
-/// asserted invariants are the ones the M11-S4 CLI and the M11-S5 e2e
-/// suite will rely on:
+/// asserted invariants are the ones the CLI and the e2e suite rely
+/// on:
 ///
 /// - `BackendKind` survives the SQLite round trip: a
 ///   `create_session_with_backend(_, _, Container)` row reads back as
@@ -488,9 +485,9 @@ fn integration_create_session_container_rejects_hardened() {
     assert_eq!(lima_session.state, SessionState::Creating);
 }
 
-/// M11-S7 contract — both workspace modes are *accepted* request shapes
-/// on the container backend. The capability matrix advertises
-/// `workspace_modes: { Shared, Clone }`. `Shared` threads the
+/// Workspace-mode contract — both workspace modes are *accepted*
+/// request shapes on the container backend. The capability matrix
+/// advertises `workspace_modes: { Shared, Clone }`. `Shared` threads the
 /// operator-supplied host path through `ContainerNetwork::workspace_host_path`
 /// and `ContainerRuntime` turns it into a `docker create --mount type=bind,...`
 /// flag with the unified bind target `/home/agent/workspace/`. `Clone`
@@ -501,9 +498,8 @@ fn integration_create_session_container_rejects_hardened() {
 ///
 /// This test pins three pieces of the public contract:
 ///   1. The capability matrix advertises exactly `{ Shared, Clone }` —
-///      both modes after M11-S7, neither empty (the pre-Phase-5A guard
-///      shape) nor `Shared`-only (the M11-S5 → M11-S7 transitional
-///      shape).
+///      both modes, neither empty (the pre-Clone guard shape) nor
+///      `Shared`-only (an earlier transitional shape).
 ///   2. `SessionSpec::validate(caps)` *accepts* a `Shared` request so
 ///      the daemon's `POST /sessions` handler proceeds to the bind-
 ///      mount path rather than failing the request up front.
@@ -513,11 +509,10 @@ fn integration_create_session_container_rejects_hardened() {
 ///
 /// Hermetic — exercises the same `spec.validate(runtime.capabilities())`
 /// branch the daemon's `POST /sessions` handler runs after parsing the
-/// request. Predecessor of this test (M11-S5 Phase 5A) asserted Clone
-/// was *rejected* because the in-guest clone plumbing was deferred;
-/// M11-S7 delivered the plumbing — the rejection assertion has been
-/// inverted to a successful-validate, and the capability-shape coverage
-/// is preserved.
+/// request. An earlier predecessor of this test asserted Clone was
+/// *rejected* because the in-guest clone plumbing was deferred; once
+/// the plumbing landed, the rejection assertion was inverted to a
+/// successful-validate and the capability-shape coverage was preserved.
 #[test]
 fn integration_create_session_container_advertises_workspace_capabilities() {
     let runtime = ContainerRuntime::new(
@@ -532,14 +527,13 @@ fn integration_create_session_container_advertises_workspace_capabilities() {
     let modes = runtime.capabilities().workspace_modes;
     assert!(
         modes.contains(WorkspaceModeKind::Shared),
-        "container capabilities must advertise WorkspaceModeKind::Shared \
-         (M11-S5 Phase 5A); got {modes:?}"
+        "container capabilities must advertise WorkspaceModeKind::Shared; \
+         got {modes:?}"
     );
     assert!(
         modes.contains(WorkspaceModeKind::Clone),
         "container capabilities must advertise WorkspaceModeKind::Clone \
-         (M11-S7 — in-guest `git clone` dispatched via GuestConnector); \
-         got {modes:?}"
+         (in-guest `git clone` dispatched via GuestConnector); got {modes:?}"
     );
 
     // (2) `Shared` request is accepted by `validate`.
@@ -559,10 +553,10 @@ fn integration_create_session_container_advertises_workspace_capabilities() {
     };
     shared_spec
         .validate(runtime.capabilities())
-        .expect("Shared workspace must validate against the post-Phase-5A capability matrix");
+        .expect("Shared workspace must validate against the container capability matrix");
 
-    // (3) `Clone` request is accepted by `validate` after M11-S7 — the
-    //     in-guest clone plumbing landed and the capability matrix now
+    // (3) `Clone` request is accepted by `validate` — the in-guest
+    //     clone plumbing has landed and the capability matrix
     //     advertises Clone alongside Shared.
     let clone_spec = SessionSpec {
         backend_specific: BackendSpecific::Container {
@@ -580,11 +574,11 @@ fn integration_create_session_container_advertises_workspace_capabilities() {
     };
     clone_spec
         .validate(runtime.capabilities())
-        .expect("Clone workspace must validate against the post-M11-S7 capability matrix");
+        .expect("Clone workspace must validate against the container capability matrix");
 }
 
-/// M12-S4 todo #95 — `--no-cache` on the container backend is rejected
-/// by the daemon up front, before any state is allocated.
+/// `--no-cache` on the container backend is rejected by the daemon
+/// up front, before any state is allocated.
 ///
 /// Hermetic — exercises the same `SessionSpec::validate(&caps)` branch
 /// the `POST /sessions` handler runs after parsing the request. The
@@ -595,7 +589,7 @@ fn integration_create_session_container_advertises_workspace_capabilities() {
 /// HTTP 400 (the same mapping the existing `_rejects_hardened` test
 /// pins for the `--hardened` case).
 ///
-/// The pre-M12-S4 hole this test closes: a non-CLI HTTP client posting
+/// The hole this test closes: a non-CLI HTTP client posting
 /// `{"backend":"container","no_cache":true}` was silently accepted —
 /// the CLI was the only enforcer of the spec § "CLI & UX → `sandbox
 /// create --no-cache` is forbidden on container" rule. Now the
@@ -630,7 +624,7 @@ fn integration_create_session_container_rejects_no_cache() {
     // contract from the runtime side — `per_session_no_cache: false`.
     // This is the matrix the daemon's `runtime.capabilities()` returns
     // when the create handler runs `spec.validate(caps)`.
-    let runtime = ContainerRuntime::new("m12-s4-rejects-no-cache-test:none", 256, 1.0, 1000, 1000);
+    let runtime = ContainerRuntime::new("rejects-no-cache-test:none", 256, 1.0, 1000, 1000);
     assert_eq!(runtime.kind(), BackendKind::Container);
     assert!(
         !runtime.capabilities().per_session_no_cache,
@@ -684,8 +678,8 @@ fn integration_create_session_container_rejects_no_cache() {
     assert_eq!(spec_no_cache, Some(true));
 }
 
-/// M12-S4 todo #81 — fractional `--cpus` on the Lima backend is rejected
-/// by the daemon up front, before any state is allocated.
+/// Fractional `--cpus` on the Lima backend is rejected by the daemon
+/// up front, before any state is allocated.
 ///
 /// Hermetic — pins the *invariants* the daemon's request-shape gate at
 /// `create_session` line ~895 relies on:
@@ -701,7 +695,7 @@ fn integration_create_session_container_rejects_no_cache() {
 ///      constraint ("integer") so an operator parsing the 400 body
 ///      knows which knob to fix.
 ///
-/// The pre-M12-S4 hole this test closes: a non-CLI HTTP client posting
+/// The hole this test closes: a non-CLI HTTP client posting
 /// `{"backend":"lima","cpus":1.5}` was silently downsized to a 1-CPU
 /// session via the `as u32` cast at the spec-projection site — a
 /// classic "I asked for X, got Y" bug invisible to operators. The
@@ -745,8 +739,8 @@ fn integration_create_session_lima_rejects_fractional_cpus() {
     assert_eq!(sentinel.fract(), 0.0);
 
     // (3) The wire-shape `CreateSessionRequest` already accepts a
-    // fractional `cpus` (M11-S7 widened the field to `Option<f32>`),
-    // so the request *parses* cleanly and the daemon's gate fires at
+    // fractional `cpus` (the field is `Option<f32>`), so the request
+    // *parses* cleanly and the daemon's gate fires at
     // *post-parse, pre-projection* time — not via serde. Confirm the
     // parse step still accepts the exact wire body the gate is
     // expected to refuse, so a regression that tightened the parse

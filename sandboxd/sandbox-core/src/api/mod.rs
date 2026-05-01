@@ -96,9 +96,9 @@ pub struct CreateSessionRequest {
     /// Number of CPU cores (default: 2 for Lima, daemon host-80% for
     /// Container).
     ///
-    /// `f32` (M11-S7 todo #67) so the spec § "Resource defaults —
-    /// container only" 1-decimal grammar (`0.8`, `1.5`, `2.0`, …)
-    /// reaches the runtime without truncation. Older CLIs that send
+    /// `f32` so the spec § "Resource defaults — container only"
+    /// 1-decimal grammar (`0.8`, `1.5`, `2.0`, …) reaches the runtime
+    /// without truncation. Older CLIs that send
     /// integers (`"cpus": 2`) round-trip cleanly through serde — JSON
     /// integers parse as `2.0_f32`. The daemon rounds to one decimal
     /// at request-parse time so `0.81` lands on the grid as `0.8`.
@@ -139,8 +139,8 @@ pub struct CreateSessionRequest {
     pub no_cache: Option<bool>,
     /// Original `--preset` invocation strings forwarded by the CLI.
     ///
-    /// Populated by the CLI (M10-S5) when presets expanded into the
-    /// policy document above, so the daemon can surface them on the
+    /// Populated by the CLI when presets expanded into the policy
+    /// document above, so the daemon can surface them on the
     /// `policy_applied` lifecycle event for operator debugging and
     /// audit. Optional and additive on the wire: older CLIs that do
     /// not send the field deserialize to an empty vector; newer
@@ -154,19 +154,19 @@ pub struct CreateSessionRequest {
     pub source_presets: Vec<String>,
     /// Which backend should host the session.
     ///
-    /// Optional on the wire (M11-S3 Phase 3D): older CLIs that omit
-    /// the field decode to `None`, which the daemon treats as the
-    /// historical default of `BackendKind::Lima`. Setting this to
-    /// `Container` enables the lite-mode container backend (M11);
-    /// the daemon validates the request against the chosen backend's
+    /// Optional on the wire: older CLIs that omit the field decode
+    /// to `None`, which the daemon treats as the historical default
+    /// of `BackendKind::Lima`. Setting this to `Container` enables
+    /// the lite-mode container backend; the daemon validates the
+    /// request against the chosen backend's
     /// capability matrix (e.g. rejects `--hardened` for Container)
     /// and persists the choice in the `sessions.backend` SQLite
     /// column so subsequent dispatch routes to the right runtime.
     #[serde(default)]
     pub backend: Option<crate::backend::BackendKind>,
-    /// Operator opt-in to allow session-create on a rootless-Docker host
-    /// (M11-S8 Wave 2). Spec § Non-goals line 1195 declares rootless
-    /// Docker out of scope for the lite container backend; the daemon's
+    /// Operator opt-in to allow session-create on a rootless-Docker
+    /// host. Spec § Non-goals line 1195 declares rootless Docker out
+    /// of scope for the lite container backend; the daemon's
     /// create handler probes the host with `docker info` and refuses
     /// the request when the probe reports rootless mode unless this
     /// field is `true`.
@@ -178,18 +178,17 @@ pub struct CreateSessionRequest {
     /// Per-invocation, never persisted to any config file or preset:
     /// surfacing it on the wire as a request field guarantees a fresh
     /// opt-in is required for every `sandbox create` call. Additive
-    /// on the wire — pre-Wave-2 daemons predate the probe and accept
-    /// rootless hosts silently (the gap this milestone closes);
-    /// Wave-2-or-newer daemons that see an absent field still run the
-    /// probe unconditionally and refuse rootless hosts unless this
-    /// flag is `true`.
+    /// on the wire — daemons predating the rootless-Docker probe
+    /// accept rootless hosts silently; daemons running the probe
+    /// that see an absent field still run it unconditionally and
+    /// refuse rootless hosts unless this flag is `true`.
     ///
     /// `CreateSessionRequest` derives `Deserialize` only (not
     /// `Serialize`); the CLI assembles the wire body via the
     /// `serde_json::Map` helper in `build_create_request_body`, which
     /// only inserts `"force_rootless_docker": true` when the operator
     /// passed the flag. The default-hardened path therefore sends a
-    /// body bit-equal to the pre-Wave-2 shape without any
+    /// body bit-equal to the historical (pre-probe) shape without any
     /// `skip_serializing_if` attribute on this field.
     #[serde(default)]
     pub force_rootless_docker: bool,
@@ -242,8 +241,8 @@ pub struct UpdatePolicyRequest {
     /// Serialized when the field is non-empty; skipped when empty so
     /// older daemons that still parse v1 policy JSON as a raw `Policy`
     /// (via `#[serde(flatten)]`) see a bitwise-identical body when no
-    /// presets contributed to the update. M10-S5 CLI wiring populates
-    /// this from `--preset` invocations; callers without presets leave
+    /// presets contributed to the update. The CLI populates this
+    /// from `--preset` invocations; callers without presets leave
     /// it empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_presets: Vec<String>,
@@ -344,8 +343,8 @@ mod tests {
         }"#;
         let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.name.as_deref(), Some("test"));
-        // M11-S7 todo #67: `cpus` is `f32`; integer JSON literal `4`
-        // parses as `4.0_f32` so older clients still round-trip.
+        // `cpus` is `f32`; integer JSON literal `4` parses as
+        // `4.0_f32` so older clients still round-trip.
         assert_eq!(req.cpus, Some(4.0_f32));
         assert_eq!(req.memory_mb, Some(8192));
         assert_eq!(req.disk_gb, Some(50));
@@ -363,10 +362,10 @@ mod tests {
         assert!(req.template.is_none());
     }
 
-    /// M11-S7 todo #67: a fractional `cpus` value (`1.5`) on the wire
-    /// must deserialise as the precise `f32` rather than truncating
-    /// to `1` (the pre-todo-#67 `Option<u32>` behaviour). This is the
-    /// regression net for the lite-mode `--cpus 1.5` operator path.
+    /// A fractional `cpus` value (`1.5`) on the wire must deserialise
+    /// as the precise `f32` rather than truncating to `1` (the
+    /// historical `Option<u32>` behaviour). This is the regression
+    /// net for the lite-mode `--cpus 1.5` operator path.
     #[test]
     fn deserialize_fractional_cpus_request() {
         let json = r#"{"name": "lite-fractional", "cpus": 1.5}"#;
@@ -623,8 +622,9 @@ mod tests {
 
     #[test]
     fn deserialize_create_request_without_source_presets_is_empty_vec() {
-        // Backward-compat: pre-M10-S5 CLIs never send source_presets.
-        // The default decode must be an empty vector, not an error.
+        // Backward-compat: older CLIs predating preset-attribution
+        // never send source_presets. The default decode must be an
+        // empty vector, not an error.
         let json = r#"{"name": "legacy-cli"}"#;
         let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
         assert!(

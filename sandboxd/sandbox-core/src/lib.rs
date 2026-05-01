@@ -22,7 +22,7 @@ pub mod store;
 /// must never reference items in this module — the module name and
 /// per-item docs make that contract explicit. See
 /// [`test_support::docker_path_stub`] for the rootless-Docker probe
-/// substrate consumed by M11-S8 Wave 3's integration tests.
+/// substrate consumed by the daemon's integration tests.
 pub mod test_support;
 pub mod users_conf;
 pub mod vm_network;

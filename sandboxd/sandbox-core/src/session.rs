@@ -305,28 +305,28 @@ pub struct SessionConfig {
     ///
     /// Captured so `sandbox inspect`/`sandbox describe` can surface the
     /// original creation input.  `None` on records written by daemons
-    /// predating M9-S11 (forward-compatible via `#[serde(default)]`).
+    /// predating this field (forward-compatible via `#[serde(default)]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
     /// Command executed inside the VM once setup completes.
     ///
     /// Captured so `sandbox inspect`/`sandbox describe` can surface the
     /// original creation input.  `None` on records written by daemons
-    /// predating M9-S11 (forward-compatible via `#[serde(default)]`).
+    /// predating this field (forward-compatible via `#[serde(default)]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot_cmd: Option<String>,
     /// Path to a custom Lima template used for creation, if any.
     ///
     /// Captured so `sandbox inspect`/`sandbox describe` can surface the
     /// original creation input.  `None` on records written by daemons
-    /// predating M9-S11 (forward-compatible via `#[serde(default)]`).
+    /// predating this field (forward-compatible via `#[serde(default)]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template: Option<String>,
     /// 1-decimal CPU value for the container backend (`0.8`, `1.5`,
-    /// `2.0`, …). M11-S7 todo #67 widened the wire boundary to `f32`
-    /// so the spec § "Resource defaults — container only" precision
-    /// survives end-to-end (the prior `u32` shape silently truncated
-    /// `1.5` to `1` in `ContainerRuntime::resource_ceilings`).
+    /// `2.0`, …). The wire boundary is `f32` so the spec § "Resource
+    /// defaults — container only" precision survives end-to-end (the
+    /// historical `u32` shape silently truncated `1.5` to `1` in
+    /// `ContainerRuntime::resource_ceilings`).
     ///
     /// Persisted alongside the integer [`Self::cpus`] field rather
     /// than replacing it: an older daemon rolling back must still
@@ -334,16 +334,16 @@ pub struct SessionConfig {
     /// `Some`, it is the authoritative precise value (used by the
     /// runtime and the HTTP DTO render); `cpus` then carries the
     /// floored representation as a fallback for older readers.
-    /// `None` on records written by pre-todo-#67 daemons (and on
-    /// every Lima session, where integer cpus is the spec).
+    /// `None` on records written by daemons predating fractional cpus
+    /// (and on every Lima session, where integer cpus is the spec).
     /// Forward-compatible via `#[serde(default)]` per CLAUDE.md
     /// "On-disk compatibility".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpus_decimal: Option<f32>,
-    /// Rootless-Docker probe outcome captured at session-create time
-    /// (M11-S8 Wave 2). `Some(_)` only for container sessions where
-    /// the daemon ran the probe; `None` for every Lima session and
-    /// for legacy container records written by pre-Wave-2 daemons.
+    /// Rootless-Docker probe outcome captured at session-create time.
+    /// `Some(_)` only for container sessions where the daemon ran
+    /// the probe; `None` for every Lima session and for legacy
+    /// container records written before the probe was introduced.
     ///
     /// Surfaced on the wire by the [`crate::api::SessionDto::rootless`]
     /// field so `sandbox inspect` and `sandbox describe` can render
@@ -357,8 +357,7 @@ pub struct SessionConfig {
     pub rootless_docker: Option<SessionRootlessDocker>,
 }
 
-/// Persisted rootless-Docker probe outcome for a container session
-/// (M11-S8 Wave 2).
+/// Persisted rootless-Docker probe outcome for a container session.
 ///
 /// Captured at `POST /sessions` time and stamped into
 /// [`SessionConfig::rootless_docker`] so `GET /sessions/{id}` can
@@ -428,11 +427,11 @@ pub struct Session {
     /// Persisted as the `sessions.backend` SQLite column (V005
     /// migration); legacy rows written before V005 default to
     /// `BackendKind::Lima` via the column's SQL `DEFAULT 'lima'`,
-    /// so any session that exists today is unambiguously a Lima
-    /// session. M11-S3 Phase 3D introduces the container backend
-    /// and threads this kind through `runtime_for(...)` so handlers
-    /// dispatch to the right `SessionRuntime` for each persisted
-    /// row, without re-deriving the kind from per-handler heuristics.
+    /// so any session that pre-dates the column is unambiguously a
+    /// Lima session. The container backend threads this kind through
+    /// `runtime_for(...)` so handlers dispatch to the right
+    /// `SessionRuntime` for each persisted row, without re-deriving
+    /// the kind from per-handler heuristics.
     ///
     /// `#[serde(default)]` so JSON snapshots written by older code
     /// paths still deserialize cleanly (defaulting to Lima); the
@@ -712,8 +711,8 @@ mod tests {
 
     #[test]
     fn legacy_config_json_deserializes_with_none_for_new_fields() {
-        // A record written by a pre-M9-S11 daemon has no `repo`,
-        // `boot_cmd`, or `template` keys at all.  The new fields must
+        // A record written by an older daemon has no `repo`,
+        // `boot_cmd`, or `template` keys at all.  These fields must
         // deserialize to `None` via `#[serde(default)]` so that rolling
         // upgrades (and mid-conversation rollbacks) do not fail to load.
         let json = r#"{"cpus": 2, "memory_mb": 4096, "disk_gb": 20, "hardened": true}"#;
@@ -737,13 +736,13 @@ mod tests {
         );
         assert!(
             config.cpus_decimal.is_none(),
-            "cpus_decimal must default to None on legacy records (M11-S7 todo #67)"
+            "cpus_decimal must default to None on legacy records"
         );
     }
 
-    /// Forward-compat round-trip for [`SessionConfig::cpus_decimal`]
-    /// (M11-S7 todo #67). A daemon that persists a fractional cpus
-    /// value sets both `cpus` (floored) and `cpus_decimal`; on
+    /// Forward-compat round-trip for [`SessionConfig::cpus_decimal`].
+    /// A daemon that persists a fractional cpus value sets both
+    /// `cpus` (floored) and `cpus_decimal`; on
     /// rollback an older daemon ignores the unknown field and reads
     /// the integer one. On forward read the new daemon picks up the
     /// precise float value.

@@ -10,9 +10,9 @@
 //!   shape regressions the Rust string assertions would miss.
 //! - `envoy --mode validate` loads the compiler's bootstrap + listener
 //!   YAML and exits 0 only if the static config (including the
-//!   `destination_port` `FilterChainMatch` predicates added in M10-S1
-//!   Phase 3A) passes Envoy's own schema validation against the
-//!   version pinned in the gateway image.
+//!   `destination_port` `FilterChainMatch` predicates) passes Envoy's
+//!   own schema validation against the version pinned in the gateway
+//!   image.
 //!
 //! ## Gate
 //!
@@ -271,14 +271,14 @@ fn write_file_in_container(container: &str, path: &str, content: &str) {
 /// (`ipv4_addr . inet_service`) and the flush+define pattern used by
 /// both emitters.
 ///
-/// **M10-S3 shape.** Both emitters now produce the full two-table
-/// ruleset (`sandbox_dnat` + `sandbox_policy`) via the shared
+/// Both emitters produce the full two-table ruleset
+/// (`sandbox_dnat` + `sandbox_policy`) via the shared
 /// `render_two_table_ruleset` helper. Concatenation is therefore two
 /// full applies in sequence: the first lays down both tables with
 /// whatever CIDR elements the policy has; the second flushes and
 /// redefines both tables with the DNS-join elements (policy CIDRs +
-/// resolved domain IPs). `nft -c` validates both as one input stream
-/// — mirroring how `policy_distributor` and the DNS propagation loop
+/// resolved domain IPs). `nft -c` validates both as one input stream,
+/// mirroring how `policy_distributor` and the DNS propagation loop
 /// pipe them to the kernel at different moments in production.
 ///
 /// This also concretely exercises the decision documented in
@@ -305,7 +305,7 @@ fn integration_validator_nft_check() {
 
     // Sanity: the combined ruleset should carry both tables. This
     // catches regressions where an emitter silently reverts to the
-    // pre-M10-S3 single-table shape and the nft validator would
+    // historical single-table shape and the nft validator would
     // therefore only cover half the ruleset.
     assert!(
         combined.contains("table inet sandbox_dnat"),

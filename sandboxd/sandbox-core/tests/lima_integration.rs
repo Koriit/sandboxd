@@ -59,15 +59,14 @@ fn integration_lima_create_and_delete() {
     );
 }
 
-/// Phase 1B (M11-S1) — exercise the [`LimaRuntime`] / [`SessionRuntime`]
-/// trait surface end-to-end against a real Lima/QEMU instance and
-/// assert it stays equivalent to the existing `LimaManager`-driven
-/// flow.
+/// Exercise the [`LimaRuntime`] / [`SessionRuntime`] trait surface
+/// end-to-end against a real Lima/QEMU instance and assert it stays
+/// equivalent to the existing `LimaManager`-driven flow.
 ///
 /// Boundary: this test does **not** boot the VM (no `start`, no
 /// `install_guest_agent`). Booting requires the daemon's
 /// `NetworkManager` for docker-bridge / mac plumbing — that wiring
-/// stays in `AppState` until M11-S1 Phase 1C. The lifecycle here is:
+/// stays in `AppState`. The lifecycle here is:
 /// `create -> status -> delete`, mirroring the inert-VM coverage of
 /// `integration_lima_create_and_delete` above.
 #[tokio::test]
@@ -141,9 +140,9 @@ async fn integration_lima_runtime_lifecycle() {
     );
 }
 
-/// Phase 1B (M11-S1) — smoke-test [`LimaTransport::connect`] against
-/// a real Lima VM: assert the spawn-args wiring works end-to-end (the
-/// child process starts and we get a duplex stream back).
+/// Smoke-test [`LimaTransport::connect`] against a real Lima VM:
+/// assert the spawn-args wiring works end-to-end (the child process
+/// starts and we get a duplex stream back).
 ///
 /// Per the Phase 1B handoff (Task 6, integration test 7), this is
 /// the *weaker* of the two suggested checks — we do **not** drive a

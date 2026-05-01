@@ -325,15 +325,13 @@ pub fn read_resolved_json(session_id: &SessionId) -> Result<ResolvedReport, Sand
 /// byte-for-byte — both entry points delegate to the shared
 /// [`render_two_table_ruleset`] helper so the chains stay in lockstep.
 ///
-/// **v2 shape (M10-S1 / Phase 3B):** per-destination allowance lives in
-/// two nftables concat sets keyed on `ipv4_addr . inet_service`, one per
-/// L4 protocol (`policy_allow_tcp`, `policy_allow_udp`). Set elements
-/// are `<ip_or_cidr> . <port>` pairs.
-///
-/// **M10-S3 shape (post deny-logger):** the filtering decision lives in
+/// **Shape.** Per-destination allowance lives in two nftables concat
+/// sets keyed on `ipv4_addr . inet_service`, one per L4 protocol
+/// (`policy_allow_tcp`, `policy_allow_udp`). Set elements are
+/// `<ip_or_cidr> . <port>` pairs. The filtering decision lives in
 /// `sandbox_dnat.prerouting` as conditional DNAT — policy-allowed
-/// destinations route to Envoy :10000; everything else falls through to
-/// the deny-logger :10001 / :10002. `sandbox_policy` holds only an
+/// destinations route to Envoy :10000; everything else falls through
+/// to the deny-logger :10001 / :10002. `sandbox_policy` holds only an
 /// `output` chain admitting gateway-originated egress to policy-allowed
 /// destinations. Both tables carry identical copies of the concat sets
 /// (cross-table set references are unsupported on the pinned nft 1.0.6
@@ -1038,8 +1036,8 @@ mod tests {
         let net = test_network_info();
         let rules = generate_domain_ip_rules(&policy, &cache, &net);
 
-        // M10-S3 shape: the resolved `(ip, port)` pair is a concat-set
-        // element inside `policy_allow_tcp`, duplicated across both
+        // The resolved `(ip, port)` pair is a concat-set element
+        // inside `policy_allow_tcp`, duplicated across both
         // tables. The domain name itself does not appear in the
         // generated ruleset — the DNS-to-IP binding happens upstream in
         // the cache; what lands in nftables is the post-join `(ip, port)`
