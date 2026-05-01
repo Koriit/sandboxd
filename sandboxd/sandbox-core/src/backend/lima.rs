@@ -287,19 +287,21 @@ impl SessionRuntime for LimaRuntime {
         Ok(vm_status.into())
     }
 
-    /// Phase 1B approximation of `ip(handle)` (per the handoff Issue
-    /// 2): shells out via `limactl shell <vm> -- ip -4 addr show eth1`
-    /// and parses the resulting `inet 10.x.y.z/...` line. The IP
-    /// authoritatively lives on the daemon's `NetworkInfo.vm_ip`
-    /// blob; this shell-out is a stop-gap until Phase 1C plumbs the
-    /// daemon's per-session map into the runtime so we can return it
-    /// without an extra round trip to the VM.
+    /// Stop-gap implementation of `ip(handle)`: shells out via
+    /// `limactl shell <vm> -- ip -4 addr show eth1` and parses the
+    /// resulting `inet 10.x.y.z/...` line. The IP authoritatively
+    /// lives on the daemon's `NetworkInfo.vm_ip` blob; this shell-out
+    /// re-derives it from the VM only because `LimaRuntime` does not
+    /// (yet) carry a per-session network side map the way
+    /// `ContainerRuntime` does.
     ///
-    // TODO(M11-S1 Phase 1C): wire IP attribution properly via the
-    // daemon's persisted `NetworkInfo.vm_ip` rather than an in-VM
-    // shell-out. The current implementation requires the VM to be
-    // running and `eth1` to exist — neither holds during create /
-    // post-stop windows.
+    // TODO: future — adopt the same per-session side-map pattern as
+    // `ContainerRuntime` (`Mutex<HashMap<SessionId, ContainerNetwork>>`
+    // populated via `register_session` before `create`, see
+    // `backend/container.rs`). That removes a `limactl shell` round
+    // trip per `ip()` call and — more importantly — makes `ip()`
+    // answer correctly during create / post-stop windows when the VM
+    // isn't running or `eth1` doesn't exist.
     async fn ip(&self, handle: &RuntimeHandle) -> Result<IpAddr, SandboxError> {
         let manager = Arc::clone(&self.manager);
         let vm_name = handle.as_str().to_string();
