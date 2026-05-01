@@ -1,6 +1,6 @@
 ---
 title: Use workspaces
-description: Provision source code into a session using clone, shared mount, sandbox cp, or git remote transport.
+description: Provision source code into a session using clone, shared mount, sandbox cp / sync, or git remote transport.
 ---
 
 This guide shows you how to use each workspace mode with copy-pasteable commands. For background on the four modes and their trade-offs, see [workspaces concepts](/concepts/workspaces/).
@@ -103,6 +103,48 @@ sandbox cp ./dist dev:/home/agent/workspace/dist
 Under the hood `sandbox cp` dispatches to the backend's native copy tool — `limactl cp` for Lima sessions and `docker cp` for container sessions — so file modes, sparse files, and directory trees are preserved by the same code path your operating system already trusts. Errors (missing source, permission denied, unreachable session) come from those tools verbatim, so they match the diagnostics you would see invoking them directly.
 
 `sandbox cp` works regardless of which workspace mode you chose at creation time.
+
+## Mirror a directory with `sandbox sync`
+
+`sandbox sync` is the rsync-shaped sibling of `sandbox cp`. Reach for it when `cp`'s "retransfer everything" semantics are wrong for the workflow — typically tight edit-build-test loops where you want only the changed files to traverse the boundary, or CI-style runs where the destination must be a faithful mirror of the source on each invocation (no left-over files from a previous run).
+
+The CLI shape mirrors `cp`: `session:path` for the session side, plain paths for host-side.
+
+Upload a directory tree to the session:
+
+```bash
+sandbox sync ./src dev:/home/agent/workspace/src
+```
+
+Re-run the same command after editing a few files. Rsync only retransfers the changed files; an untouched tree finishes in milliseconds.
+
+Pull a build directory back to the host:
+
+```bash
+sandbox sync dev:/home/agent/workspace/dist ./dist
+```
+
+Demonstrate the `--delete` mirror semantics — files removed on the source are removed on the destination on the next sync:
+
+```bash
+rm ./src/obsolete.go
+sandbox sync ./src dev:/home/agent/workspace/src
+# /home/agent/workspace/src/obsolete.go is now gone in the session too
+```
+
+Under the hood `sandbox sync` dispatches the host's `rsync` with the backend's native shell as rsync's remote-shell (`-e`) transport — `limactl shell` for Lima, `docker exec -i` for container. The baseline flag set is `-a --delete`: archive mode (perms, ownership, mtimes, symlinks, recursion) plus mirror semantics. Errors and progress reach you in rsync's native form. Out-of-scope: filter rules, partial transfers, bandwidth limits — operators wanting those can run `rsync` directly with the same `-e <rsh>` pattern this command uses.
+
+`sandbox sync` requires `rsync` on **both** sides. sandboxd-provisioned base images (Lima golden image, Lite container image) ship rsync by default. If you supply a custom image, install rsync yourself.
+
+`cp` vs. `sync` — pick by semantic, not by tree size:
+
+| | `sandbox cp` | `sandbox sync` |
+|---|---|---|
+| One-shot copy of a file or tree | Yes | Yes |
+| Retransfers full source on re-run | Yes | No (only deltas) |
+| Preserves attributes (mode, ownership, mtimes) | Yes (via `cp`/`scp`) | Yes (`-a`) |
+| Deletes destination entries no longer on source | No | Yes (`--delete`) |
+| Backend tool dependency | `limactl` / `docker` | `rsync` (host + session) |
 
 ## Sync via `git push` and `git pull`
 

@@ -348,7 +348,7 @@ sandbox exec my-sandbox -- df -h
 
 ## sandbox cp
 
-Copy files between the host and a sandbox VM. Uses the `session:path` syntax to specify the remote side.
+Copy files or directories between the host and a sandbox session. Uses the `session:path` syntax to specify the remote side.
 
 ### Synopsis
 
@@ -362,26 +362,79 @@ One of `<src>` or `<dst>` must use the `session:path` format to identify the rem
 
 | Argument | Description |
 |----------|-------------|
-| `<src>` | Source path. Prefix with `session:` for VM paths. |
-| `<dst>` | Destination path. Prefix with `session:` for VM paths. |
+| `<src>` | Source path. Prefix with `session:` for session-side paths. |
+| `<dst>` | Destination path. Prefix with `session:` for session-side paths. |
 
 ### Details
 
-- Files are transferred via the guest agent using base64-encoded payloads.
-- Large files are automatically chunked (700 KB per chunk).
+- Dispatches to the backend's native copy tool: `limactl cp -r` for Lima sessions, `docker cp` for container sessions. Both recurse into directories transparently.
+- Errors (missing source, permission denied, unreachable session) come from the underlying tool verbatim.
+- Both source and destination cannot be remote.
+- For incremental directory mirroring (skip-unchanged, attribute preservation, deletion mirroring), use [`sandbox sync`](#sandbox-sync) instead — `cp` retransfers the full source on every invocation.
+
+### Examples
+
+```bash
+# Upload a file to the session
+sandbox cp local/config.toml my-sandbox:/root/config.toml
+
+# Download a file from the session
+sandbox cp my-sandbox:/root/output.log ./output.log
+
+# Upload a build artifact
+sandbox cp ./dist/app.tar.gz ci-run:/home/agent/workspace/app.tar.gz
+
+# Upload a directory (recurses transparently on both backends)
+sandbox cp ./dist my-sandbox:/home/agent/workspace/dist
+```
+
+---
+
+## sandbox sync
+
+Mirror a directory between the host and a sandbox session via `rsync`. Use this when you need incremental updates, attribute preservation across re-runs, and the deletion of source-removed files on the destination — properties `cp` does not provide.
+
+### Synopsis
+
+```
+sandbox sync <src> <dst>
+```
+
+One of `<src>` or `<dst>` must use the `session:path` format to identify the remote side.
+
+### Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `<src>` | Source path. Prefix with `session:` for session-side paths. |
+| `<dst>` | Destination path. Prefix with `session:` for session-side paths. |
+
+### Details
+
+- Dispatches to the host's `rsync` binary with the backend's native shell as rsync's remote-shell transport: `rsync -a --delete -e 'limactl shell' …` for Lima, `rsync -a --delete -e 'docker exec -i' …` for container.
+- Baseline flag set is `-a --delete`: archive mode (preserves perms, ownership, mtimes, symlinks, recursion) plus mirror semantics (delete destination entries that no longer exist on the source). Operators wanting filter rules, partial transfers, or bandwidth limits should run `rsync` directly against the same `-e` shell-transport pattern this command uses.
+- **Requires `rsync` on both the host and inside the session image.** sandboxd-provisioned base images (Lima golden image, Lite container image) include rsync by default. If you supply a custom image, install rsync yourself or `sandbox sync` will fail with `rsync: command not found` from whichever side is missing it.
+- Errors (missing source, permission denied, unreachable session) come from `rsync` verbatim. The exit code is propagated unchanged so callers can branch on rsync's documented exit-code table (`man rsync(1)`).
 - Both source and destination cannot be remote.
 
 ### Examples
 
 ```bash
-# Upload a file to the VM
-sandbox cp local/config.toml my-sandbox:/root/config.toml
+# Upload a directory tree to the session, preserving attributes
+sandbox sync ./src my-sandbox:/home/agent/workspace/src
 
-# Download a file from the VM
-sandbox cp my-sandbox:/root/output.log ./output.log
+# Pull build artifacts back to the host, deleting host-side files
+# that no longer exist in the session (mirror semantics)
+sandbox sync ci-run:/home/agent/workspace/dist ./dist
 
-# Upload a build artifact
-sandbox cp ./dist/app.tar.gz ci-run:/home/agent/workspace/app.tar.gz
+# Re-run after editing a few files: rsync only retransfers the deltas
+sandbox sync ./src my-sandbox:/home/agent/workspace/src
+
+# Demonstrate `--delete`: a file removed locally is removed in the
+# session on the next sync
+rm ./src/obsolete.go
+sandbox sync ./src my-sandbox:/home/agent/workspace/src
+# /home/agent/workspace/src/obsolete.go is now gone in the session too
 ```
 
 ---

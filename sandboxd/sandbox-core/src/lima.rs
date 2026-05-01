@@ -1118,20 +1118,31 @@ provision:
     #!/bin/bash
     set -eux -o pipefail
     export DEBIAN_FRONTEND=noninteractive
-    echo "[sandbox-provision] step=apt-socat-git start=$(date -u +%Y-%m-%dT%H:%M:%S)"
-    # Install socat (needed for host-guest communication bridge) and git
-    if ! command -v socat &>/dev/null || ! command -v git &>/dev/null; then
+    echo "[sandbox-provision] step=apt-baseline start=$(date -u +%Y-%m-%dT%H:%M:%S)"
+    # Baseline packages required by sandboxd's session contract:
+    #   - socat: host-guest communication bridge for the guest agent
+    #   - git: required by `--repo`, the git remote helper, and
+    #     in-session source workflows
+    #   - rsync: required by `sandbox sync`, which dispatches
+    #     `rsync -e 'limactl shell' …`. The remote side has to
+    #     find an rsync binary on PATH or the operator gets a
+    #     "command not found" from the remote shell. The host-side
+    #     rsync must be present too, but that is the operator's
+    #     concern.
+    if ! command -v socat &>/dev/null \
+        || ! command -v git &>/dev/null \
+        || ! command -v rsync &>/dev/null; then
       echo "[sandbox-provision] apt-get update start=$(date -u +%Y-%m-%dT%H:%M:%S)"
       apt-get update -qq
       echo "[sandbox-provision] apt-get update done=$(date -u +%Y-%m-%dT%H:%M:%S)"
-      echo "[sandbox-provision] apt-get install socat git start=$(date -u +%Y-%m-%dT%H:%M:%S)"
-      apt-get install -y socat git
-      echo "[sandbox-provision] apt-get install socat git done=$(date -u +%Y-%m-%dT%H:%M:%S)"
+      echo "[sandbox-provision] apt-get install socat git rsync start=$(date -u +%Y-%m-%dT%H:%M:%S)"
+      apt-get install -y socat git rsync
+      echo "[sandbox-provision] apt-get install socat git rsync done=$(date -u +%Y-%m-%dT%H:%M:%S)"
     fi
     # Ensure the workspace directory exists for repo cloning (owned by agent, not root)
     mkdir -p /home/agent/workspace
     chown agent:agent /home/agent/workspace
-    echo "[sandbox-provision] step=apt-socat-git done=$(date -u +%Y-%m-%dT%H:%M:%S)"
+    echo "[sandbox-provision] step=apt-baseline done=$(date -u +%Y-%m-%dT%H:%M:%S)"
 - mode: system
   script: |
     #!/bin/bash
@@ -1278,20 +1289,28 @@ provision:
     #!/bin/bash
     set -eux -o pipefail
     export DEBIAN_FRONTEND=noninteractive
-    echo "[sandbox-provision] step=apt-socat-git start=$(date -u +%Y-%m-%dT%H:%M:%S)"
-    # Install socat (needed for host-guest communication bridge) and git
-    if ! command -v socat &>/dev/null || ! command -v git &>/dev/null; then
+    echo "[sandbox-provision] step=apt-baseline start=$(date -u +%Y-%m-%dT%H:%M:%S)"
+    # Baseline packages required by sandboxd's session contract:
+    # socat (guest-agent bridge), git (`--repo` + remote helper),
+    # rsync (`sandbox sync`). The base image already installs
+    # these — this block is a defence-in-depth no-op when the VM
+    # was cloned from an up-to-date base, and a recovery path when
+    # it wasn't (e.g. the image was rebuilt without rsync before
+    # the base-image tooling caught up).
+    if ! command -v socat &>/dev/null \
+        || ! command -v git &>/dev/null \
+        || ! command -v rsync &>/dev/null; then
       echo "[sandbox-provision] apt-get update start=$(date -u +%Y-%m-%dT%H:%M:%S)"
       apt-get update -qq
       echo "[sandbox-provision] apt-get update done=$(date -u +%Y-%m-%dT%H:%M:%S)"
-      echo "[sandbox-provision] apt-get install socat git start=$(date -u +%Y-%m-%dT%H:%M:%S)"
-      apt-get install -y socat git
-      echo "[sandbox-provision] apt-get install socat git done=$(date -u +%Y-%m-%dT%H:%M:%S)"
+      echo "[sandbox-provision] apt-get install socat git rsync start=$(date -u +%Y-%m-%dT%H:%M:%S)"
+      apt-get install -y socat git rsync
+      echo "[sandbox-provision] apt-get install socat git rsync done=$(date -u +%Y-%m-%dT%H:%M:%S)"
     fi
     # Ensure the workspace directory exists for repo cloning (owned by agent, not root)
     mkdir -p /home/agent/workspace
     chown agent:agent /home/agent/workspace
-    echo "[sandbox-provision] step=apt-socat-git done=$(date -u +%Y-%m-%dT%H:%M:%S)"
+    echo "[sandbox-provision] step=apt-baseline done=$(date -u +%Y-%m-%dT%H:%M:%S)"
 - mode: system
   script: |
     #!/bin/bash
@@ -1869,8 +1888,8 @@ mod tests {
             "template should grant passwordless sudo"
         );
         assert!(
-            template.contains("apt-get") && template.contains("install -y socat git"),
-            "template should install socat and git"
+            template.contains("apt-get") && template.contains("install -y socat git rsync"),
+            "template should install the socat / git / rsync baseline"
         );
         assert!(
             template.contains("get.docker.com"),
@@ -2569,8 +2588,8 @@ mod tests {
             "base template should grant passwordless sudo"
         );
         assert!(
-            template.contains("apt-get") && template.contains("install -y socat git"),
-            "base template should install socat and git"
+            template.contains("apt-get") && template.contains("install -y socat git rsync"),
+            "base template should install the socat / git / rsync baseline"
         );
         assert!(
             template.contains("get.docker.com"),

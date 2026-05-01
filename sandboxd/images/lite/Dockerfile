@@ -10,8 +10,12 @@ FROM ubuntu:24.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       bash coreutils git socat ca-certificates iproute2 curl tini \
-      bind9-dnsutils \
+      bind9-dnsutils rsync \
     && rm -rf /var/lib/apt/lists/*
+# `rsync` is required by `sandbox sync` (the `docker exec -i <ctr>
+# rsync --server …` remote side). Keeping it in the image avoids a
+# runtime "command not found" the first time an operator reaches for
+# directory mirroring.
 
 # Ubuntu 24.04 ships a default `ubuntu` user at uid 1000; the spec pins the
 # agent user at uid 1000 / gid 1000, so remove the default first.

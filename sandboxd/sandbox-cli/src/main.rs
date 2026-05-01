@@ -180,6 +180,28 @@ enum Command {
         /// Destination path (prefix with session: for VM paths).
         dst: String,
     },
+    /// Mirror a directory between host and sandbox session via rsync.
+    ///
+    /// Like `sandbox cp`, but dispatches to `rsync -a --delete` over the
+    /// backend's native shell transport (`limactl shell` for Lima,
+    /// `docker exec -i` for container). Use this for incremental
+    /// directory mirroring where attribute preservation, deletion of
+    /// removed files, and skip-unchanged behaviour matter — `cp`
+    /// retransfers the full tree on every invocation.
+    ///
+    /// Use session:path syntax to specify the remote side:
+    ///   sandbox sync local/dir session:remote/dir   (upload)
+    ///   sandbox sync session:remote/dir local/dir   (download)
+    ///
+    /// Requires `rsync` on both the host and inside the session image.
+    /// The sandboxd-provisioned base images ship rsync; if you supply a
+    /// custom image, install rsync yourself.
+    Sync {
+        /// Source path (prefix with session: for VM paths).
+        src: String,
+        /// Destination path (prefix with session: for VM paths).
+        dst: String,
+    },
     /// Open an interactive SSH session (or run a command) in a sandbox.
     Ssh {
         /// Session name or ID.
@@ -890,14 +912,18 @@ fn build_request(command: &Command) -> Option<Request<String>> {
             // use, instead of silently sending the wrong request shape.
             return None;
         }
-        // Ssh, Logs, Cp, Inspect, Describe, and Events are handled
-        // specially -- not via a single buffered request/response pair.
-        // Inspect and Describe issue one GET /sessions/{id} per argument
-        // and render client-side. Events streams chunked JSONL and
-        // cannot go through `send_request` (which buffers the body).
+        // Ssh, Logs, Cp, Sync, Inspect, Describe, and Events are
+        // handled specially -- not via a single buffered request/
+        // response pair. Inspect and Describe issue one GET
+        // /sessions/{id} per argument and render client-side. Events
+        // streams chunked JSONL and cannot go through `send_request`
+        // (which buffers the body). Cp and Sync resolve the session
+        // via `GET /sessions/{id}` and then exec the backend's
+        // native copy / rsync tool with stdio inherited.
         Command::Ssh { .. }
         | Command::Logs { .. }
         | Command::Cp { .. }
+        | Command::Sync { .. }
         | Command::Inspect { .. }
         | Command::Describe { .. }
         | Command::Events { .. } => return None,
@@ -1232,13 +1258,14 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
         Command::Ssh { .. }
         | Command::Logs { .. }
         | Command::Cp { .. }
+        | Command::Sync { .. }
         | Command::Inspect { .. }
         | Command::Describe { .. }
         | Command::Events { .. } => {
             // These commands are handled separately and never call
             // handle_response. Reaching here indicates a dispatch bug.
             unreachable!(
-                "ssh/logs/cp/inspect/describe/events commands should be handled before send_request"
+                "ssh/logs/cp/sync/inspect/describe/events commands should be handled before send_request"
             );
         }
     }
@@ -3214,17 +3241,15 @@ async fn handle_events(
     }
 }
 
-/// Direction of a `sandbox cp` transfer, derived by `handle_cp` from
-/// which side of the `src`/`dst` pair carried the `session:` prefix.
+/// Direction of a host <-> session transfer, derived by `handle_cp` /
+/// `handle_sync` from which side of the `src`/`dst` pair carried the
+/// `session:` prefix.
 ///
-/// Carried into [`plan_cp_command`] so the planner can emit the
-/// correct argument ordering for whichever native tool handles the
-/// dispatch (`limactl cp <local> <vm>:<remote>` for upload,
-/// `<vm>:<remote> <local>` for download). A small enum here — rather
-/// than two sibling functions — keeps the dispatch surface a single
-/// pure helper, so the upcoming rsync-style sync command (M12-S8) can
-/// reuse the same shape with a parallel `plan_sync_command` that
-/// dispatches by backend in identical fashion.
+/// Carried into [`plan_cp_command`] and [`plan_sync_command`] so each
+/// planner can emit the correct argument ordering for whichever native
+/// tool handles the dispatch. A single shared enum (rather than two
+/// sibling functions per planner) keeps the dispatch surface a single
+/// pure helper across both `sandbox cp` and `sandbox sync`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TransferDirection {
     /// Host filesystem -> session: source is local, destination is remote.
@@ -3263,17 +3288,14 @@ enum TransferDirection {
 ///   containers via the storage driver — a small UX upgrade over
 ///   the old path which required `state == Running`.
 ///
-/// **Extension story for M12-S8 (rsync-style sync).** The trait/helper
-/// shape this session establishes is *plan a (program, args) tuple
-/// from a (backend, session, paths) input*. S8 will land
-/// `plan_sync_command` next to this function, returning the rsync
-/// shape that fits each backend (`rsync -e 'limactl shell' …` for
-/// Lima, `docker exec sandbox-<id> rsync …` or a bind-mount path for
-/// container). The [`TransferDirection`] enum is the right domain
-/// shape to share between the two; S8 either reuses it directly or
-/// extends it with a `Sync` variant. Either way the per-command
-/// dispatch (CLI fetches `SessionDto`, calls planner, spawns
-/// subprocess) stays uniform across `cp` and `sync`.
+/// **Sibling planner.** [`plan_sync_command`] follows the same shape
+/// for `sandbox sync` (rsync-based directory mirroring), sharing the
+/// [`TransferDirection`] enum and the `sandbox-<id>` runtime-handle
+/// convention. The two planners are deliberately parallel free
+/// functions rather than methods on a backend trait — the codebase
+/// does not use trait-object dispatch for backend kinds elsewhere,
+/// and adding one purely for these two helpers would not buy
+/// polymorphism we use.
 fn plan_cp_command(
     backend: sandbox_core::backend::BackendKind,
     session_id: &sandbox_core::SessionId,
@@ -3419,6 +3441,196 @@ async fn handle_cp(socket_path: &str, src: &str, dst: &str) {
             // `limactl` or `docker` not on PATH (or any other spawn
             // failure). Surface the program name explicitly so the
             // operator immediately knows which dependency is missing.
+            eprintln!("Error: failed to execute {program}: {e}");
+            process::exit(1);
+        }
+    }
+}
+
+/// Pure planner that maps a backend-kind + direction + paths into the
+/// `(program, args)` tuple `handle_sync` will hand to
+/// `std::process::Command`. Sibling of [`plan_cp_command`] — same
+/// (backend, session, direction, host_path, remote_path) input shape,
+/// same `sandbox-<id>` runtime-handle convention, but emits an `rsync`
+/// invocation that uses the backend's native shell as the remote
+/// transport (rsync's `-e` slot).
+///
+/// **Why a separate command and not a `--rsync` flag on `cp`.** `cp`
+/// and `sync` carry different semantics: `cp` retransfers the full
+/// source on every invocation, mirroring `scp`/`docker cp`; `sync`
+/// preserves attributes, skips unchanged files, and (with the baseline
+/// flag set below) deletes destination entries that no longer exist
+/// on the source side. Folding both into `cp` would mean a single
+/// command with two distinct mental models — a `--delete` switch is
+/// not "deletion *in* a copy", it's "this is a mirror, not a copy".
+/// Splitting the surface keeps each command's contract obvious from
+/// its name alone.
+///
+/// **Baseline rsync flags.**
+///
+/// - `-a` (`--archive`) — recurse, preserve symlinks, perms, times,
+///   group, owner, devices, special files. The default for any
+///   directory-mirror workflow; without it, `sync` would behave like
+///   a slower `cp -r`.
+/// - `--delete` — remove files on the destination that are absent on
+///   the source, so the destination ends as a faithful mirror of the
+///   source. Out-of-scope: filter rules, partial transfers, bandwidth
+///   limits — operators wanting those should run `rsync` directly
+///   against the same `-e` shell-transport pattern this planner uses.
+///
+/// **Backend shapes.**
+///
+/// - **Lima** — `rsync -a --delete -e 'limactl shell' <src> <dst>`
+///   where the remote side has the form `sandbox-<id>:<path>`. rsync
+///   spawns `limactl shell sandbox-<id> rsync --server …` for the
+///   far side; `limactl shell INSTANCE [COMMAND...]` accepts that
+///   shape verbatim, and the underlying SSH transport is the same one
+///   that powers `limactl cp` on the cp path. We *don't* use
+///   `rsync -e 'ssh -F ~/.lima/<vm>/ssh.config'` even though it would
+///   also work — `limactl shell` is the supported public entrypoint;
+///   the per-VM ssh.config is an internal artefact whose path and
+///   contents Lima reserves the right to rearrange.
+/// - **Container** — `rsync -a --delete -e 'docker exec -i' <src>
+///   <dst>` where the remote side has the form `sandbox-<id>:<path>`.
+///   `docker exec -i <container> rsync --server …` is the
+///   shell-equivalent transport for a container; `-i` keeps stdin
+///   forwarded (rsync needs a binary-clean duplex pipe). No `-t` —
+///   allocating a TTY would corrupt rsync's wire protocol.
+///
+/// **rsync availability.** Both backends provision `rsync` into the
+/// session image (Lima base + per-session cloud-init, container Lite
+/// Dockerfile). If `rsync` is missing on either side, the operator
+/// sees the native error verbatim — `rsync: command not found` from
+/// the remote shell, or "No such file or directory (os error 2)"
+/// when the host-side `rsync` binary is missing. We deliberately do
+/// not pre-flight check for rsync: a probe round-trip would slow the
+/// happy path, and the native error already names the missing
+/// dependency.
+fn plan_sync_command(
+    backend: sandbox_core::backend::BackendKind,
+    session_id: &sandbox_core::SessionId,
+    direction: TransferDirection,
+    host_path: &str,
+    remote_path: &str,
+) -> (&'static str, Vec<String>) {
+    let target_name = format!("sandbox-{session_id}");
+    let remote_arg = format!("{target_name}:{remote_path}");
+    let (src_arg, dst_arg) = match direction {
+        TransferDirection::Upload => (host_path.to_string(), remote_arg),
+        TransferDirection::Download => (remote_arg, host_path.to_string()),
+    };
+
+    let rsh = match backend {
+        sandbox_core::backend::BackendKind::Lima => "limactl shell",
+        // `-i` forwards stdin into the container so rsync can speak
+        // its binary protocol both ways. No `-t` — a TTY would line-
+        // buffer and corrupt the wire format.
+        sandbox_core::backend::BackendKind::Container => "docker exec -i",
+    };
+
+    let args = vec![
+        "-a".to_string(),
+        "--delete".to_string(),
+        "-e".to_string(),
+        rsh.to_string(),
+        src_arg,
+        dst_arg,
+    ];
+    ("rsync", args)
+}
+
+/// Handle the `sync` subcommand: rsync-mirror a directory between host
+/// and session by dispatching to the host's `rsync` binary with the
+/// backend's native shell as the remote-shell (`-e`) transport. Mirrors
+/// the structure of `handle_cp` so the two commands have a single
+/// dispatch shape.
+async fn handle_sync(socket_path: &str, src: &str, dst: &str) {
+    // Determine transfer direction by which side carries `session:`.
+    let src_remote = parse_remote_spec(src);
+    let dst_remote = parse_remote_spec(dst);
+
+    let (session_arg, host_path, remote_path, direction) = match (src_remote, dst_remote) {
+        (None, Some((session, remote_path))) => {
+            // Upload: local -> session.
+            (session, src, remote_path, TransferDirection::Upload)
+        }
+        (Some((session, remote_path)), None) => {
+            // Download: session -> local.
+            (session, dst, remote_path, TransferDirection::Download)
+        }
+        (Some(_), Some(_)) => {
+            eprintln!("Error: both source and destination cannot be remote");
+            process::exit(1);
+        }
+        (None, None) => {
+            eprintln!(
+                "Error: one of source or destination must be a remote path (session:path)\n\
+                 Usage:\n  \
+                 sandbox sync local/dir session:remote/dir   (upload)\n  \
+                 sandbox sync session:remote/dir local/dir   (download)"
+            );
+            process::exit(1);
+        }
+    };
+
+    // Resolve the session to a SessionDto so we know the persisted
+    // backend kind and the canonical session id used to derive the
+    // `sandbox-<id>` runtime handle. Mirrors the lookup in
+    // `handle_cp` / `handle_ssh` for parity across dispatch commands.
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/sessions/{session_arg}"))
+        .body(String::new())
+        .expect("failed to build request");
+
+    let (status, body) = match send_request(socket_path, req).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{e}");
+            process::exit(1);
+        }
+    };
+
+    if !status.is_success() {
+        if let Ok(api_err) = serde_json::from_str::<ApiError>(&body) {
+            eprintln!("Error: {}", api_err.error);
+        } else {
+            eprintln!("Error ({status}): {body}");
+        }
+        process::exit(1);
+    }
+
+    let session_resp: SessionDto = match serde_json::from_str(&body) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to parse session response: {e}");
+            process::exit(1);
+        }
+    };
+
+    let (program, args) = plan_sync_command(
+        session_resp.backend,
+        &session_resp.id,
+        direction,
+        host_path,
+        remote_path,
+    );
+
+    // Inherit stdin/stdout/stderr so rsync's progress and error
+    // messages reach the operator verbatim. Propagate the subprocess
+    // exit code unchanged so callers/scripts can branch on rsync's
+    // documented exit codes (man rsync(1) lists the full table).
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(&args);
+
+    match cmd.status() {
+        Ok(exit_status) => {
+            process::exit(exit_status.code().unwrap_or(1));
+        }
+        Err(e) => {
+            // `rsync` not on PATH (or any other spawn failure).
+            // Surface the program name explicitly so the operator
+            // immediately knows which dependency is missing.
             eprintln!("Error: failed to execute {program}: {e}");
             process::exit(1);
         }
@@ -4004,9 +4216,18 @@ async fn main() {
         return;
     }
 
-    // Handle cp specially — it uses upload/download endpoints.
+    // Handle cp specially — it dispatches to the backend's native
+    // copy tool (`limactl cp` / `docker cp`) with stdio inherited.
     if let Command::Cp { src, dst } = &cli.command {
         handle_cp(&cli.socket, src, dst).await;
+        return;
+    }
+
+    // Handle sync specially — same dispatch shape as cp, but the
+    // subprocess is `rsync` with the backend's native shell as the
+    // remote-shell transport (`-e` slot).
+    if let Command::Sync { src, dst } = &cli.command {
+        handle_sync(&cli.socket, src, dst).await;
         return;
     }
 
@@ -7028,6 +7249,177 @@ mod tests {
             assert!(
                 remote_arg.starts_with("sandbox-0123456789ab:"),
                 "backend {backend:?} produced unexpected remote arg: {remote_arg}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // plan_sync_command — backend-specific dispatch for `sandbox sync`.
+    //
+    // Sibling of the cp planner. Pins the rsync invocation shape so a
+    // future refactor cannot accidentally rearrange the `-a --delete -e
+    // <rsh>` ordering or break the per-backend `<rsh>` choice (Lima
+    // `limactl shell`, container `docker exec -i`).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn plan_sync_lima_upload_emits_rsync_with_limactl_shell_remote_shell() {
+        let sid = cp_session_id();
+        let (program, args) = plan_sync_command(
+            sandbox_core::backend::BackendKind::Lima,
+            &sid,
+            TransferDirection::Upload,
+            "./local/dir",
+            "/home/agent/workspace/dir",
+        );
+        assert_eq!(program, "rsync");
+        // `-a --delete` is the baseline. `-e 'limactl shell'` slots
+        // `limactl shell <vm> rsync --server …` in as rsync's remote
+        // shell — `<vm>` is taken from the host portion of the
+        // `sandbox-<id>:<path>` argument by rsync's own parser.
+        assert_eq!(
+            args,
+            vec![
+                "-a".to_string(),
+                "--delete".to_string(),
+                "-e".to_string(),
+                "limactl shell".to_string(),
+                "./local/dir".to_string(),
+                "sandbox-0123456789ab:/home/agent/workspace/dir".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_sync_lima_download_swaps_src_and_dst_args() {
+        let sid = cp_session_id();
+        let (program, args) = plan_sync_command(
+            sandbox_core::backend::BackendKind::Lima,
+            &sid,
+            TransferDirection::Download,
+            "./local/dir",
+            "/home/agent/workspace/dir",
+        );
+        assert_eq!(program, "rsync");
+        assert_eq!(
+            args,
+            vec![
+                "-a".to_string(),
+                "--delete".to_string(),
+                "-e".to_string(),
+                "limactl shell".to_string(),
+                "sandbox-0123456789ab:/home/agent/workspace/dir".to_string(),
+                "./local/dir".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_sync_container_upload_emits_rsync_with_docker_exec_i_remote_shell() {
+        let sid = cp_session_id();
+        let (program, args) = plan_sync_command(
+            sandbox_core::backend::BackendKind::Container,
+            &sid,
+            TransferDirection::Upload,
+            "./local/dir",
+            "/home/agent/workspace/dir",
+        );
+        assert_eq!(program, "rsync");
+        // `docker exec -i` (no `-t`): `-i` keeps stdin a binary-clean
+        // pipe so rsync can speak its wire protocol; allocating a TTY
+        // (`-t`) would line-buffer and corrupt it.
+        assert_eq!(
+            args,
+            vec![
+                "-a".to_string(),
+                "--delete".to_string(),
+                "-e".to_string(),
+                "docker exec -i".to_string(),
+                "./local/dir".to_string(),
+                "sandbox-0123456789ab:/home/agent/workspace/dir".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_sync_container_download_swaps_src_and_dst_args() {
+        let sid = cp_session_id();
+        let (program, args) = plan_sync_command(
+            sandbox_core::backend::BackendKind::Container,
+            &sid,
+            TransferDirection::Download,
+            "./local/dir",
+            "/home/agent/workspace/dir",
+        );
+        assert_eq!(program, "rsync");
+        assert_eq!(
+            args,
+            vec![
+                "-a".to_string(),
+                "--delete".to_string(),
+                "-e".to_string(),
+                "docker exec -i".to_string(),
+                "sandbox-0123456789ab:/home/agent/workspace/dir".to_string(),
+                "./local/dir".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_sync_target_name_matches_runtime_handle_convention() {
+        // Both backends name their runtime resource `sandbox-<id>` —
+        // identical convention to plan_cp_command. Pin this so a
+        // future rename cannot silently break only one backend.
+        let sid = cp_session_id();
+        for backend in [
+            sandbox_core::backend::BackendKind::Lima,
+            sandbox_core::backend::BackendKind::Container,
+        ] {
+            let (_, args) = plan_sync_command(
+                backend,
+                &sid,
+                TransferDirection::Upload,
+                "/tmp/x",
+                "/tmp/x",
+            );
+            let remote_arg = args
+                .iter()
+                .find(|a| a.contains(':') && !a.starts_with('-'))
+                .expect("planner must emit a remote-side <name>:<path> arg");
+            assert!(
+                remote_arg.starts_with("sandbox-0123456789ab:"),
+                "backend {backend:?} produced unexpected remote arg: {remote_arg}"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_sync_baseline_flags_are_archive_and_delete() {
+        // Pin the baseline flag set explicitly: `-a` for attribute
+        // preservation + recursion, `--delete` for mirror semantics
+        // (the property that distinguishes `sync` from `cp` in the
+        // operator's mental model). A future change that drops
+        // either flag should fail this test rather than silently
+        // weaken the guarantee.
+        let sid = cp_session_id();
+        for backend in [
+            sandbox_core::backend::BackendKind::Lima,
+            sandbox_core::backend::BackendKind::Container,
+        ] {
+            let (_, args) = plan_sync_command(
+                backend,
+                &sid,
+                TransferDirection::Upload,
+                "/tmp/src",
+                "/tmp/dst",
+            );
+            assert!(
+                args.iter().any(|a| a == "-a"),
+                "backend {backend:?} args missing `-a`: {args:?}"
+            );
+            assert!(
+                args.iter().any(|a| a == "--delete"),
+                "backend {backend:?} args missing `--delete`: {args:?}"
             );
         }
     }
