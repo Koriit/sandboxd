@@ -51,6 +51,8 @@ A policy is a JSON document with a `version` and an ordered `rules` array. Every
 }
 ```
 
+The `version` field is the **schema version** of the document format — it tells the daemon which policy DTO shape the file conforms to. The current schema is `2.0.0`; minor bumps (`2.x.x`) are accepted as backward-compatible, and the major must match exactly. It is *not* a per-policy revision counter — editing a policy does not require bumping `version`. Per-policy identity is tracked separately by the daemon as `policy_hash`, the SHA-256 digest of the canonical JSON form, surfaced on the `policy_propagated` and `policy_updated` lifecycle events and as `expected_hash` / `propagated_hash` on `GET /sessions/{id}/policy/propagation-status` (see [networking → Synchronous DNS-policy gating](/concepts/networking/#synchronous-dns-policy-gating)).
+
 ### Fields
 
 | Field | Required | Meaning |

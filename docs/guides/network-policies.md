@@ -44,6 +44,8 @@ A policy is a JSON file with a `version` and a `rules` array. Every rule names a
 }
 ```
 
+The `version` at the top is the **schema version** of the document format — it identifies which policy DTO shape this file conforms to (the current schema is `2.0.0`; minor `2.x.x` bumps are accepted as backward-compatible). It is *not* a revision counter for the policy itself: edits and re-applies do not require bumping it. To track which specific policy is currently loaded on a session, the daemon computes `policy_hash` (a SHA-256 over the canonical JSON of the policy body) and surfaces it on the `policy_propagated` and `policy_updated` lifecycle events as well as on `GET /sessions/{id}/policy/propagation-status` (`expected_hash` / `propagated_hash`) — that is the field to watch when scripting against policy changes.
+
 Points to note:
 
 - **Every rule must declare an explicit `port`** (1–65535) and `protocol` (`tcp` or `udp`). There are no defaults — the compiler rejects a rule that omits either field.
