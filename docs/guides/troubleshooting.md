@@ -397,21 +397,25 @@ Fix: filter by `layer=mitmproxy` and the session ID, not by a VM bridge IP. The 
 
 ## File transfer failures
 
-### Path validation
+`sandbox cp` dispatches to the backend's native copy tool (`limactl cp` for Lima, `docker cp` for container sessions), so the symptoms you see come from those tools verbatim. The most common failure modes:
 
-**Symptom:** `path must be within one of: /home/agent/, /root/, /tmp/`
+### Source file does not exist
 
-The guest agent only allows file transfers to `/home/agent/`, `/root/`, and `/tmp/`. Paths with `..` traversal are rejected. Paths under `/proc`, `/sys`, `/dev`, `/etc` are always denied.
+**Symptom (Lima):** `lost connection` or `scp: <path>: No such file or directory`. **Symptom (container):** `Error response from daemon: Could not find the file <path> in container ...`.
 
-Fix: use an allowed path (`sandbox cp file.txt <session>:/home/agent/workspace/file.txt`). For system directories, use `sandbox exec` instead.
+Fix: double-check the path on the side reporting the error. Remember the syntax: `session:path` is the session side, plain paths are the host side.
 
-### Message size limit
+### Session not running / not found
 
-**Symptom:** `message size exceeds maximum`
+**Symptom (Lima):** `instance "sandbox-<id>" does not exist` or `instance "sandbox-<id>" is stopped, run `limactl start ...` to start it`. **Symptom (container):** `Error response from daemon: No such container: sandbox-<id>` (when the session was deleted) or — uniquely on the container backend — copy *succeeds* against a stopped container because `docker cp` reads/writes the storage layer directly.
 
-The protocol has a 1 MB limit. Files larger than about 750 KB (after base64 overhead) will fail.
+Fix: `sandbox start <session>` first. The container-backend behavior of copying against a stopped container is intentional and matches `docker cp`'s native semantics.
 
-Fix: use Lima's copy (`limactl copy file.tar.gz sandbox-<session_id>:/tmp/`) or shared workspace mode.
+### `limactl` or `docker` not on PATH
+
+**Symptom:** `Error: failed to execute limactl: ...` or `Error: failed to execute docker: ...`.
+
+Fix: install the missing dependency. The CLI no longer relays file content through the daemon, so the host running `sandbox cp` needs the same binary the daemon would use to manage the session.
 
 ## Performance issues
 

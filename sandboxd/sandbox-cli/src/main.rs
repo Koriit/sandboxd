@@ -2,8 +2,6 @@ use std::path::Path;
 use std::process;
 use std::time::Duration;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, SecondsFormat, Utc};
 use clap::{ArgAction, ArgGroup, Parser, Subcommand, ValueEnum};
 use http_body_util::BodyExt;
@@ -3216,11 +3214,105 @@ async fn handle_events(
     }
 }
 
-/// Maximum raw file size for a single-chunk transfer.
+/// Direction of a `sandbox cp` transfer, derived by `handle_cp` from
+/// which side of the `src`/`dst` pair carried the `session:` prefix.
 ///
-/// Base64 expands data by ~33%, so 700 KB raw stays well within the 1 MB
-/// framed message limit after encoding + JSON overhead.
-const CP_CHUNK_SIZE: usize = 700 * 1024;
+/// Carried into [`plan_cp_command`] so the planner can emit the
+/// correct argument ordering for whichever native tool handles the
+/// dispatch (`limactl cp <local> <vm>:<remote>` for upload,
+/// `<vm>:<remote> <local>` for download). A small enum here — rather
+/// than two sibling functions — keeps the dispatch surface a single
+/// pure helper, so the upcoming rsync-style sync command (M12-S8) can
+/// reuse the same shape with a parallel `plan_sync_command` that
+/// dispatches by backend in identical fashion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransferDirection {
+    /// Host filesystem -> session: source is local, destination is remote.
+    Upload,
+    /// Session -> host filesystem: source is remote, destination is local.
+    Download,
+}
+
+/// Pure planner that maps a backend-kind + direction + paths into the
+/// `(program, args)` tuple the caller will hand to
+/// `std::process::Command`. Mirrors [`plan_ssh_command`] so all
+/// session-targeting CLI commands share the same dispatch shape.
+///
+/// **Why this exists.** Before M12-S7 `sandbox cp` chunked the file
+/// into base64 frames and pushed them through the daemon's
+/// `/upload` / `/download` HTTP endpoints, which in turn hit the
+/// guest agent over TCP-over-SSH. That worked but glossed over
+/// edge cases the backend-native tools already handle: large files,
+/// sparse files, attribute preservation, directory recursion, and
+/// error message clarity. This planner replaces that pump with a
+/// dispatch to the runtime's own copy command.
+///
+/// **Backend shapes.**
+///
+/// - **Lima** — `limactl cp -r <src> <dst>` where the remote side has
+///   the form `sandbox-<id>:<path>`. `limactl cp` is a thin wrapper
+///   around `scp`; passing `-r` unconditionally is harmless for
+///   regular files (scp ignores it for non-directories) and lets a
+///   single CLI invocation handle directories without a separate
+///   flag at the user-facing surface — matching `docker cp`'s
+///   default-recursive semantics on the container backend.
+/// - **Container** — `docker cp <src> <dst>` where the remote side
+///   has the form `sandbox-<id>:<path>`. `docker cp` already
+///   recurses into directories by default, no `-r` analogue is
+///   needed (and none exists). Works on running *and* stopped
+///   containers via the storage driver — a small UX upgrade over
+///   the old path which required `state == Running`.
+///
+/// **Extension story for M12-S8 (rsync-style sync).** The trait/helper
+/// shape this session establishes is *plan a (program, args) tuple
+/// from a (backend, session, paths) input*. S8 will land
+/// `plan_sync_command` next to this function, returning the rsync
+/// shape that fits each backend (`rsync -e 'limactl shell' …` for
+/// Lima, `docker exec sandbox-<id> rsync …` or a bind-mount path for
+/// container). The [`TransferDirection`] enum is the right domain
+/// shape to share between the two; S8 either reuses it directly or
+/// extends it with a `Sync` variant. Either way the per-command
+/// dispatch (CLI fetches `SessionDto`, calls planner, spawns
+/// subprocess) stays uniform across `cp` and `sync`.
+fn plan_cp_command(
+    backend: sandbox_core::backend::BackendKind,
+    session_id: &sandbox_core::SessionId,
+    direction: TransferDirection,
+    host_path: &str,
+    remote_path: &str,
+) -> (&'static str, Vec<String>) {
+    let target_name = format!("sandbox-{session_id}");
+    let remote_arg = format!("{target_name}:{remote_path}");
+    let (src_arg, dst_arg) = match direction {
+        TransferDirection::Upload => (host_path.to_string(), remote_arg),
+        TransferDirection::Download => (remote_arg, host_path.to_string()),
+    };
+
+    match backend {
+        sandbox_core::backend::BackendKind::Lima => {
+            // `limactl cp` mirrors `scp`. Always pass `-r` so directory
+            // copies work transparently from the user's point of view;
+            // for plain files `-r` is a no-op (scp recursion only
+            // engages on directories).
+            let args = vec![
+                "cp".to_string(),
+                "-r".to_string(),
+                src_arg,
+                dst_arg,
+            ];
+            ("limactl", args)
+        }
+        sandbox_core::backend::BackendKind::Container => {
+            // `docker cp` already recurses into directories by default
+            // and has no `-r` flag. The argument shape matches Lima's
+            // exactly, only the program changes — keeping the user's
+            // mental model "remote side carries `session:path`" intact
+            // across both backends.
+            let args = vec!["cp".to_string(), src_arg, dst_arg];
+            ("docker", args)
+        }
+    }
+}
 
 /// Parse a `session:path` spec, returning `(session, path)` if the spec
 /// contains a colon, or `None` if it's a local path.
@@ -3229,20 +3321,27 @@ fn parse_remote_spec(spec: &str) -> Option<(&str, &str)> {
     spec.split_once(':')
 }
 
-/// Handle the `cp` subcommand: copy files between host and sandbox VM.
+/// Handle the `cp` subcommand: copy files between host and sandbox VM
+/// by dispatching to the backend's native copy tool (`limactl cp` for
+/// Lima sessions, `docker cp` for container sessions).
+///
+/// The CLI resolves the session via `GET /sessions/{id}` to discover
+/// the persisted backend kind and canonical session id, then hands the
+/// transfer to the native tool with stdio inherited so its native
+/// error messages reach the operator unchanged.
 async fn handle_cp(socket_path: &str, src: &str, dst: &str) {
-    // Determine transfer direction.
+    // Determine transfer direction by which side carries `session:`.
     let src_remote = parse_remote_spec(src);
     let dst_remote = parse_remote_spec(dst);
 
-    match (src_remote, dst_remote) {
+    let (session_arg, host_path, remote_path, direction) = match (src_remote, dst_remote) {
         (None, Some((session, remote_path))) => {
-            // Upload: local -> VM
-            handle_cp_upload(socket_path, src, session, remote_path).await;
+            // Upload: local -> session.
+            (session, src, remote_path, TransferDirection::Upload)
         }
         (Some((session, remote_path)), None) => {
-            // Download: VM -> local
-            handle_cp_download(socket_path, session, remote_path, dst).await;
+            // Download: session -> local.
+            (session, dst, remote_path, TransferDirection::Download)
         }
         (Some(_), Some(_)) => {
             eprintln!("Error: both source and destination cannot be remote");
@@ -3257,152 +3356,20 @@ async fn handle_cp(socket_path: &str, src: &str, dst: &str) {
             );
             process::exit(1);
         }
-    }
-}
-
-/// Upload a local file to a sandbox VM.
-async fn handle_cp_upload(socket_path: &str, local_path: &str, session: &str, remote_path: &str) {
-    // Read the local file.
-    let data = match std::fs::read(local_path) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Error: cannot read local file '{local_path}': {e}");
-            process::exit(1);
-        }
     };
 
-    if data.len() <= CP_CHUNK_SIZE {
-        // Single-chunk upload.
-        let encoded = BASE64.encode(&data);
-        let body = serde_json::json!({
-            "path": remote_path,
-            "data": encoded,
-        });
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/sessions/{session}/upload"))
-            .header("content-type", "application/json")
-            .body(body.to_string())
-            .expect("failed to build request");
-
-        let (status, resp_body) = match send_request(socket_path, req).await {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("{e}");
-                process::exit(1);
-            }
-        };
-
-        if !status.is_success() {
-            if let Ok(api_err) = serde_json::from_str::<ApiError>(&resp_body) {
-                eprintln!("Error: {}", api_err.error);
-            } else {
-                eprintln!("Error ({status}): {resp_body}");
-            }
-            process::exit(1);
-        }
-    } else {
-        // Chunked upload: split into chunks, upload each to a temp file,
-        // then concatenate on the VM side.
-        let chunk_count = data.len().div_ceil(CP_CHUNK_SIZE);
-        let mut chunk_paths: Vec<String> = Vec::with_capacity(chunk_count);
-
-        for (i, chunk) in data.chunks(CP_CHUNK_SIZE).enumerate() {
-            let chunk_remote = format!("{remote_path}.chunk.{i}");
-            let encoded = BASE64.encode(chunk);
-            let body = serde_json::json!({
-                "path": chunk_remote,
-                "data": encoded,
-            });
-            let req = Request::builder()
-                .method("POST")
-                .uri(format!("/sessions/{session}/upload"))
-                .header("content-type", "application/json")
-                .body(body.to_string())
-                .expect("failed to build request");
-
-            let (status, resp_body) = match send_request(socket_path, req).await {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("{e}");
-                    process::exit(1);
-                }
-            };
-
-            if !status.is_success() {
-                if let Ok(api_err) = serde_json::from_str::<ApiError>(&resp_body) {
-                    eprintln!("Error uploading chunk {i}: {}", api_err.error);
-                } else {
-                    eprintln!("Error uploading chunk {i} ({status}): {resp_body}");
-                }
-                process::exit(1);
-            }
-
-            chunk_paths.push(chunk_remote);
-        }
-
-        // Concatenate chunks on the VM side via exec.
-        let cat_args: Vec<String> = chunk_paths.iter().map(|p| p.to_string()).collect();
-        let cat_cmd = format!(
-            "cat {} > {} && rm -f {}",
-            cat_args.join(" "),
-            remote_path,
-            cat_args.join(" "),
-        );
-        let exec_body = serde_json::json!({
-            "command": "bash",
-            "args": ["-c", cat_cmd],
-        });
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/sessions/{session}/exec"))
-            .header("content-type", "application/json")
-            .body(exec_body.to_string())
-            .expect("failed to build request");
-
-        let (status, resp_body) = match send_request(socket_path, req).await {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("{e}");
-                process::exit(1);
-            }
-        };
-
-        if !status.is_success() {
-            if let Ok(api_err) = serde_json::from_str::<ApiError>(&resp_body) {
-                eprintln!("Error concatenating chunks: {}", api_err.error);
-            } else {
-                eprintln!("Error concatenating chunks ({status}): {resp_body}");
-            }
-            process::exit(1);
-        }
-
-        // Check the exec result.
-        if let Ok(exec_resp) = serde_json::from_str::<ExecResponse>(&resp_body) {
-            if exec_resp.exit_code != 0 {
-                eprintln!(
-                    "Error: chunk concatenation failed (exit {}): {}",
-                    exec_resp.exit_code, exec_resp.stderr
-                );
-                process::exit(1);
-            }
-        }
-    }
-}
-
-/// Download a file from a sandbox VM to the local filesystem.
-async fn handle_cp_download(socket_path: &str, session: &str, remote_path: &str, local_path: &str) {
-    let body = serde_json::json!({
-        "path": remote_path,
-    });
+    // Resolve the session name/id to a SessionDto so we know the
+    // backend kind and the canonical session id used to derive the
+    // `sandbox-<id>` runtime handle. Mirrors the lookup in
+    // `handle_ssh` / `handle_logs` for parity across dispatch
+    // commands.
     let req = Request::builder()
-        .method("POST")
-        .uri(format!("/sessions/{session}/download"))
-        .header("content-type", "application/json")
-        .body(body.to_string())
+        .method("GET")
+        .uri(format!("/sessions/{session_arg}"))
+        .body(String::new())
         .expect("failed to build request");
 
-    let (status, resp_body) = match send_request(socket_path, req).await {
+    let (status, body) = match send_request(socket_path, req).await {
         Ok(r) => r,
         Err(e) => {
             eprintln!("{e}");
@@ -3411,47 +3378,50 @@ async fn handle_cp_download(socket_path: &str, session: &str, remote_path: &str,
     };
 
     if !status.is_success() {
-        if let Ok(api_err) = serde_json::from_str::<ApiError>(&resp_body) {
+        if let Ok(api_err) = serde_json::from_str::<ApiError>(&body) {
             eprintln!("Error: {}", api_err.error);
         } else {
-            eprintln!("Error ({status}): {resp_body}");
+            eprintln!("Error ({status}): {body}");
         }
         process::exit(1);
     }
 
-    // Parse the response.
-    let download_resp: serde_json::Value = match serde_json::from_str(&resp_body) {
-        Ok(v) => v,
+    let session_resp: SessionDto = match serde_json::from_str(&body) {
+        Ok(s) => s,
         Err(e) => {
-            eprintln!("Error: failed to parse download response: {e}");
+            eprintln!("Failed to parse session response: {e}");
             process::exit(1);
         }
     };
 
-    let data_b64 = match download_resp.get("data").and_then(|d| d.as_str()) {
-        Some(d) => d,
-        None => {
-            // Check if there's an error field.
-            if let Some(err) = download_resp.get("error").and_then(|e| e.as_str()) {
-                eprintln!("Error: {err}");
-            } else {
-                eprintln!("Error: no data in download response");
-            }
-            process::exit(1);
-        }
-    };
+    let (program, args) = plan_cp_command(
+        session_resp.backend,
+        &session_resp.id,
+        direction,
+        host_path,
+        remote_path,
+    );
 
-    let decoded = match BASE64.decode(data_b64) {
-        Ok(d) => d,
+    // Inherit stdin/stdout/stderr so the native tool's progress and
+    // error messages reach the operator verbatim — that's the whole
+    // point of the refactor. We propagate the subprocess exit code
+    // unchanged so callers/scripts can branch on the same set of
+    // status codes the native tool already documents (scp's exit
+    // codes via `limactl cp`; docker's via `docker cp`).
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(&args);
+
+    match cmd.status() {
+        Ok(exit_status) => {
+            process::exit(exit_status.code().unwrap_or(1));
+        }
         Err(e) => {
-            eprintln!("Error: failed to decode base64 data: {e}");
+            // `limactl` or `docker` not on PATH (or any other spawn
+            // failure). Surface the program name explicitly so the
+            // operator immediately knows which dependency is missing.
+            eprintln!("Error: failed to execute {program}: {e}");
             process::exit(1);
         }
-    };
-
-    if let Err(e) = std::fs::write(local_path, &decoded) {
-        eprintln!("Error: failed to write local file '{local_path}': {e}");
-        process::exit(1);
     }
 }
 
@@ -6875,6 +6845,191 @@ mod tests {
                 "hello".to_string(),
             ]
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // plan_cp_command — backend-specific dispatch for `sandbox cp`.
+    //
+    // Pure planner: returns `(program, args)` from a (backend, session,
+    // direction, host_path, remote_path) input. The handler then hands
+    // them to `std::process::Command` with stdio inherited; these tests
+    // pin the dispatch shape so a future refactor cannot regress the
+    // argument ordering or the `-r` / no-`-r` choice between Lima's
+    // `limactl cp` (scp under the hood) and Docker's `docker cp`
+    // (recurses by default).
+    // -----------------------------------------------------------------------
+
+    fn cp_session_id() -> sandbox_core::SessionId {
+        sandbox_core::SessionId::parse("0123456789ab").expect("test fixture session id must parse")
+    }
+
+    #[test]
+    fn plan_cp_lima_upload_emits_limactl_cp_with_recurse_flag() {
+        let sid = cp_session_id();
+        let (program, args) = plan_cp_command(
+            sandbox_core::backend::BackendKind::Lima,
+            &sid,
+            TransferDirection::Upload,
+            "./local/file.txt",
+            "/home/agent/workspace/file.txt",
+        );
+        assert_eq!(program, "limactl");
+        // `-r` is unconditional on Lima — it makes directory copies
+        // work transparently and is a no-op on plain files.
+        assert_eq!(
+            args,
+            vec![
+                "cp".to_string(),
+                "-r".to_string(),
+                "./local/file.txt".to_string(),
+                "sandbox-0123456789ab:/home/agent/workspace/file.txt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_cp_lima_download_swaps_src_and_dst_args() {
+        let sid = cp_session_id();
+        let (program, args) = plan_cp_command(
+            sandbox_core::backend::BackendKind::Lima,
+            &sid,
+            TransferDirection::Download,
+            "./local/output.log",
+            "/home/agent/workspace/output.log",
+        );
+        assert_eq!(program, "limactl");
+        // Download: remote is the source, local is the destination.
+        assert_eq!(
+            args,
+            vec![
+                "cp".to_string(),
+                "-r".to_string(),
+                "sandbox-0123456789ab:/home/agent/workspace/output.log".to_string(),
+                "./local/output.log".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_cp_container_upload_emits_docker_cp_without_recurse_flag() {
+        let sid = cp_session_id();
+        let (program, args) = plan_cp_command(
+            sandbox_core::backend::BackendKind::Container,
+            &sid,
+            TransferDirection::Upload,
+            "./local/file.txt",
+            "/home/agent/workspace/file.txt",
+        );
+        assert_eq!(program, "docker");
+        // No `-r`: `docker cp` recurses into directories by default
+        // and rejects unknown flags.
+        assert_eq!(
+            args,
+            vec![
+                "cp".to_string(),
+                "./local/file.txt".to_string(),
+                "sandbox-0123456789ab:/home/agent/workspace/file.txt".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_cp_container_download_swaps_src_and_dst_args() {
+        let sid = cp_session_id();
+        let (program, args) = plan_cp_command(
+            sandbox_core::backend::BackendKind::Container,
+            &sid,
+            TransferDirection::Download,
+            "./local/output.log",
+            "/home/agent/workspace/output.log",
+        );
+        assert_eq!(program, "docker");
+        assert_eq!(
+            args,
+            vec![
+                "cp".to_string(),
+                "sandbox-0123456789ab:/home/agent/workspace/output.log".to_string(),
+                "./local/output.log".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_cp_directory_upload_uses_same_shape_as_file_upload() {
+        // Pin that directory copy goes through the same planner: the
+        // user-facing CLI surface is identical for files and
+        // directories — the backend tools handle the recursion under
+        // the hood. This is a meaningful behavior improvement over the
+        // previous in-tree path, which read the local file via
+        // `std::fs::read` and would fail on a directory.
+        let sid = cp_session_id();
+        let (lima_program, lima_args) = plan_cp_command(
+            sandbox_core::backend::BackendKind::Lima,
+            &sid,
+            TransferDirection::Upload,
+            "./dist",
+            "/home/agent/workspace/dist",
+        );
+        assert_eq!(lima_program, "limactl");
+        assert_eq!(
+            lima_args,
+            vec![
+                "cp".to_string(),
+                "-r".to_string(),
+                "./dist".to_string(),
+                "sandbox-0123456789ab:/home/agent/workspace/dist".to_string(),
+            ]
+        );
+
+        let (docker_program, docker_args) = plan_cp_command(
+            sandbox_core::backend::BackendKind::Container,
+            &sid,
+            TransferDirection::Upload,
+            "./dist",
+            "/home/agent/workspace/dist",
+        );
+        assert_eq!(docker_program, "docker");
+        assert_eq!(
+            docker_args,
+            vec![
+                "cp".to_string(),
+                "./dist".to_string(),
+                "sandbox-0123456789ab:/home/agent/workspace/dist".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_cp_target_name_matches_runtime_handle_convention() {
+        // Both backends name their runtime resource `sandbox-<id>`
+        // (see `sandbox-core::backend::RuntimeHandle::from_session_id`
+        // and `sandbox-core::lima::vm_name`). Pin that the planner
+        // builds the same name on both branches so a future rename
+        // would fail at this test rather than silently breaking
+        // dispatch on one of the two backends.
+        let sid = cp_session_id();
+        for backend in [
+            sandbox_core::backend::BackendKind::Lima,
+            sandbox_core::backend::BackendKind::Container,
+        ] {
+            let (_, args) = plan_cp_command(
+                backend,
+                &sid,
+                TransferDirection::Upload,
+                "/tmp/x",
+                "/tmp/x",
+            );
+            // Find the argument that contains the colon — that's the
+            // remote-side spec.
+            let remote_arg = args
+                .iter()
+                .find(|a| a.contains(':'))
+                .expect("planner must emit a remote-side <name>:<path> arg");
+            assert!(
+                remote_arg.starts_with("sandbox-0123456789ab:"),
+                "backend {backend:?} produced unexpected remote arg: {remote_arg}"
+            );
+        }
     }
 
     // -- render_rootless_block -------------------------------------------------

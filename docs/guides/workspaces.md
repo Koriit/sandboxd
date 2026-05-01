@@ -80,25 +80,27 @@ Shared mount reduces VM isolation. If your workload does not need live bidirecti
 
 ## Copy individual files with `sandbox cp`
 
-`sandbox cp` moves single files or directories between the host and a running session. The syntax mirrors `scp`: `session:path` for VM-side paths, plain paths for host-side.
+`sandbox cp` moves single files or directories between the host and a session. The syntax mirrors `scp`: `session:path` for the session-side path, plain paths for host-side.
 
-Upload to the VM:
+Upload to the session:
 
 ```bash
 sandbox cp ./config.toml dev:/home/agent/workspace/config.toml
 ```
 
-Download from the VM:
+Download from the session:
 
 ```bash
 sandbox cp dev:/home/agent/workspace/output.log ./output.log
 ```
 
-Copy a directory (transferred as chunked base64 through the daemon):
+Copy a directory (recursive by default):
 
 ```bash
 sandbox cp ./dist dev:/home/agent/workspace/dist
 ```
+
+Under the hood `sandbox cp` dispatches to the backend's native copy tool — `limactl cp` for Lima sessions and `docker cp` for container sessions — so file modes, sparse files, and directory trees are preserved by the same code path your operating system already trusts. Errors (missing source, permission denied, unreachable session) come from those tools verbatim, so they match the diagnostics you would see invoking them directly.
 
 `sandbox cp` works regardless of which workspace mode you chose at creation time.
 
