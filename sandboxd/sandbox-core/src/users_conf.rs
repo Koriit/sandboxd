@@ -458,6 +458,17 @@ pub fn load_users_config_from(path: &Path) -> Result<UsersConfig, UsersConfigErr
 /// is `root`, so an explicit numeric check is sufficient and avoids
 /// pulling in a name-resolver crate.
 ///
+/// **Symlink behavior.** This check uses [`fs::metadata`], which
+/// follows symlinks — so when `/etc/sandboxd/users.conf` is a symlink,
+/// the validation runs against the *target* file's owner and mode bits,
+/// not the symlink itself. The install runbook places a regular file at
+/// the canonical path, so this is the documented configuration; an
+/// operator who deliberately points the canonical path at a symlinked
+/// target is responsible for ensuring the target is also root-owned and
+/// not group- or world-writable. Hardening this further (rejecting any
+/// symlink at the canonical path via [`fs::symlink_metadata`]) is
+/// tracked separately.
+///
 /// We deliberately scope this to the canonical path only:
 ///
 /// - Tempfile-based tests (anywhere outside `/etc/sandboxd/`) bypass the

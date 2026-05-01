@@ -100,6 +100,14 @@ pub use session::{
     WorkspaceModeKind,
 };
 pub use store::{OrphanInfo, ResolveOutcome, SessionStore};
+// Only the daemon-side users-conf surface is re-exported at the crate
+// root: `sandboxd` consumes it via `sandbox_core::*`. The helper-side
+// surface (`load_users_config_route_helper`, `route_helper_users_conf_path`)
+// is intentionally NOT re-exported — it is consumed only by
+// `sandbox-route-helper`, which imports through the explicit
+// `sandbox_core::users_conf::...` path. Keeping the asymmetry signals
+// at the API surface that the privilege-aware helper entry points are
+// not for general daemon-side use.
 pub use users_conf::{
     Cidr4, DEFAULT_USERS_CONF_PATH, SubnetEntry, USERS_CONF_PATH_ENV, UsersConfig,
     UsersConfigError, load_users_config, load_users_config_from, users_conf_path,
