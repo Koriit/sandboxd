@@ -23,7 +23,7 @@
 //! emitted JSONL has no `session` field. sandboxd stamps the session at
 //! ingest time via its `vm_ip → session-id` map.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -31,12 +31,14 @@ use std::sync::Arc;
 use clap::Parser;
 use tokio::signal::unix::{SignalKind, signal};
 
+mod conntrack;
 mod event;
 mod health;
 mod limits;
 mod tcp;
 mod udp;
 
+use conntrack::ConntrackLookup;
 use event::EventEmitter;
 use limits::RateCap;
 
@@ -178,7 +180,16 @@ async fn run(args: Args) -> std::io::Result<()> {
     );
 
     let udp_socket = udp::bind(args.bind_ip, args.udp_port).await?;
+    let udp_bind_addr = SocketAddrV4::new(args.bind_ip, args.udp_port);
     tracing::info!(port = args.udp_port, "udp listener bound");
+
+    // Conntrack lookup handle for UDP pre-DNAT recovery (M12-S1).
+    // Hard fail if the netlink socket can't be opened: without it the
+    // UDP path silently regresses to the post-DNAT bug, which is
+    // strictly worse than going unhealthy and being restarted.
+    let udp_conntrack = ConntrackLookup::new()
+        .map_err(|e| std::io::Error::other(format!("conntrack lookup init: {e}")))?;
+    tracing::info!("conntrack netlink socket bound (NETLINK_NETFILTER, CAP_NET_ADMIN)");
 
     let health_listener = health::bind(args.bind_ip, args.health_port).await?;
     tracing::info!(port = args.health_port, "health listener bound");
@@ -195,7 +206,15 @@ async fn run(args: Args) -> std::io::Result<()> {
     let udp_emitter = Arc::clone(&emitter);
     let udp_rate_cap = Arc::clone(&rate_cap);
     let udp_task = tokio::spawn(async move {
-        if let Err(err) = udp::run(udp_socket, udp_emitter, udp_rate_cap).await {
+        if let Err(err) = udp::run(
+            udp_socket,
+            udp_bind_addr,
+            Some(udp_conntrack),
+            udp_emitter,
+            udp_rate_cap,
+        )
+        .await
+        {
             tracing::error!(error = %err, "udp listener exited with error");
         }
     });

@@ -34,5 +34,34 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+# Conntrack pre-DNAT recovery for the UDP deny-logger (M12-S1, todo
+# #29). The deny-logger sends an IPCTNL_MSG_CT_GET keyed on the
+# post-DNAT REPLY tuple to recover CTA_TUPLE_ORIG.dst (the pre-DNAT
+# destination the VM dialled).
+#
+# Crate choice rationale:
+#   1. `nfct` / libnetfilter_conntrack (C FFI): rejected. The gateway
+#      runtime image is `debian:bookworm-slim` with no libmnl /
+#      libnetfilter_conntrack installed; pulling those C libs would
+#      bloat the image and add a glibc-version coupling.
+#   2. `conntrack` crate (rusty-bolt/conntrack-rs): rejected. Only
+#      exposes `dump()` (full-table walk), unacceptable per-datagram
+#      cost under a deny storm.
+#   3. `netlink-packet-netfilter` (rust-netlink, pure Rust): rejected
+#      *for the published version*. v0.2.0 on crates.io has only nflog
+#      support; conntrack landed only on `main` (unreleased). Pinning
+#      to a git rev for a security-sensitive crate adds supply-chain
+#      risk we'd rather avoid.
+#   4. Hand-rolled NFNL_SUBSYS_CTNETLINK encoding via `netlink-sys`
+#      (chosen). The wire format is stable kernel ABI documented in
+#      `linux/netfilter/nfnetlink_conntrack.h`; ~200 LOC of emit/parse
+#      with full hermetic test coverage. `netlink-sys` provides only
+#      the NETLINK_NETFILTER socket. Revisit once
+#      netlink-packet-netfilter ships conntrack to crates.io — at
+#      which point the encode/decode in `src/conntrack.rs` is a thin
+#      adaptor on top of typed messages.
+netlink-sys = "0.8"
+libc = "0.2"
+
 [dev-dependencies]
 tempfile.workspace = true

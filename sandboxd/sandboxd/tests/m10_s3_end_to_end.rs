@@ -14,7 +14,9 @@
 //!   2. `udp_send_to_non_allowlisted_destination_emits_deny_event` —
 //!      same fixture, but `nc -u -w1 203.0.113.1 9999` sends a single
 //!      datagram. The deny-logger sees the datagram and emits a `deny`
-//!      with `udp` protocol; the ingestor stamps the envelope.
+//!      with `udp` protocol carrying the **pre-DNAT** 5-tuple
+//!      (M12-S1 conntrack netlink recovery); the ingestor stamps the
+//!      envelope.
 //!   3. `session_start_produces_exactly_sandbox_sandbox_dnat_sandbox_policy_tables`
 //!      — after `create_gateway` + policy distribute, the nftables
 //!      tables inside the gateway container are exactly
@@ -56,10 +58,10 @@
 //! # Parallel safety
 //!
 //! Each test uses its own `/24` base subnet (test 1: `10.210.*`,
-//! test 2: `10.211.*`, test 3: `10.212.*`, test 4: `10.213.*`) plus
-//! a freshly-generated `SessionId`, so concurrent runs on the same
-//! host cannot collide on network name, container name, or host
-//! events directory.
+//! test 2: `10.211.*`, test 3: `10.212.*`, test 4: `10.213.*`,
+//! test 5 (UDP load): `10.214.*`) plus a freshly-generated
+//! `SessionId`, so concurrent runs on the same host cannot collide on
+//! network name, container name, or host events directory.
 //!
 //! # Cleanup
 //!
@@ -603,9 +605,10 @@ async fn integration_tcp_connect_to_non_allowlisted_destination_emits_deny_event
 /// UDP has no three-way handshake, so the gateway's deny path is
 /// different from TCP — the datagram is DNATted by
 /// `sandbox_dnat.prerouting`'s UDP fallback to the deny-logger's
-/// `:10002` UDP listener (M10-S3 Phase 3 wired `IP_RECVORIGDSTADDR` on
-/// that socket so the logger can recover the original 5-tuple). The
-/// test pins that path: nft DNAT → UDP listener → JSONL `deny` record.
+/// `:10002` UDP listener. The deny-logger recovers the pre-DNAT
+/// 5-tuple via a conntrack netlink lookup (M12-S1;
+/// `sandbox-deny-logger/src/conntrack.rs`). The test pins that path:
+/// nft DNAT → UDP listener → conntrack lookup → JSONL `deny` record.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn integration_udp_send_to_non_allowlisted_destination_emits_deny_event() {
     let gw = GatewaySession::create(Ipv4Addr::new(10, 211, 0, 0));
@@ -668,36 +671,23 @@ async fn integration_udp_send_to_non_allowlisted_destination_emits_deny_event() 
     );
 
     // Spec (`.tasks/specs/2026-04-21-port-explicit-policies-presets-
-    // observability-design.md` lines 810-817) states the UDP deny-logger
-    // should read `IP_ORIGDSTADDR` from the `recvmsg` cmsg and emit the
-    // **pre-DNAT** destination (expected: `203.0.113.1:9999`).
+    // observability-design.md` lines 810-817): the UDP deny-logger
+    // emits the **pre-DNAT** destination — `203.0.113.1:9999` here.
     //
-    // Observed behavior on the current gateway image: the Linux kernel
-    // does not expose the pre-DNAT destination via `IP_ORIGDSTADDR` for
-    // conntrack-DNAT'd UDP the same way it does for TCP's
-    // `SO_ORIGINAL_DST` (TCP queries conntrack via
-    // `nf_conntrack_l4proto_tcp`; UDP's cmsg only surfaces the packet's
-    // destination as delivered to the socket, which after DNAT equals
-    // the listener's own bind address — `gateway_ip:10002`).
-    //
-    // The deny-logger emits `orig_dst_ip=<gateway_ip>,
-    // orig_dst_port=10002` for every UDP deny. Capturing the pre-DNAT
-    // tuple would require a conntrack netlink lookup in the deny-logger
-    // or a different nftables marking strategy — both out of scope for
-    // M10-S3 (handoff prohibits touching the deny-logger wire shape).
-    //
-    // Like Test 1's stderr-signature relaxation, we pin the primary
-    // contract (a `deny` event **is** emitted for a blocked UDP
-    // datagram, with the correct src_ip and protocol) and accept the
-    // DNAT-target orig_dst rather than the spec-prescribed pre-DNAT
-    // destination. The 5-tuple's pre-DNAT accuracy is tracked upstream
-    // as a deny-logger UDP follow-up.
+    // The deny-logger recovers the pre-DNAT 4-tuple via a conntrack
+    // netlink lookup (M12-S1; `sandbox-deny-logger/src/conntrack.rs`)
+    // because the kernel does not surface the pre-DNAT dst via
+    // `IP_ORIGDSTADDR` for conntrack-DNAT'd UDP (TCP works by virtue
+    // of `SO_ORIGINAL_DST` reading the conntrack entry the kernel
+    // threaded through the accepted-socket fd; UDP has no per-flow
+    // fd). The lookup hits `IPCTNL_MSG_CT_GET` keyed on the post-DNAT
+    // REPLY tuple `(gateway_ip:10002 → vm_ip:vm_port)`, parses
+    // `CTA_TUPLE_ORIG.dst` from the kernel's reply, and populates
+    // the deny event with that pre-DNAT destination.
     let want_src_ip = vm_ip;
-    // NOTE: if this assertion ever fails with orig_dst = 203.0.113.1:9999,
-    // the UDP pre-DNAT conntrack fix (deferred todo #29) has landed —
-    // update this test to the spec-prescribed pre-DNAT tuple instead of
-    // reverting.
     let sid = gw.session_id;
+    let pre_dnat_dst_ip = Ipv4Addr::new(203, 0, 113, 1);
+    let pre_dnat_dst_port: u16 = 9999;
     let matched = wait_for_deny(&mut replay, &mut rx, move |ev| {
         let Event::Traffic { envelope, event } = ev else {
             return false;
@@ -709,8 +699,8 @@ async fn integration_udp_send_to_non_allowlisted_destination_emits_deny_event() 
             return false;
         };
         d.protocol == DenyProtocol::Udp
-            && d.orig_dst_ip == gateway_ip
-            && d.orig_dst_port == 10002
+            && d.orig_dst_ip == pre_dnat_dst_ip
+            && d.orig_dst_port == pre_dnat_dst_port
             && d.src_ip == want_src_ip
             && d.src_port > 0
     })
@@ -723,8 +713,16 @@ async fn integration_udp_send_to_non_allowlisted_destination_emits_deny_event() 
         } => {
             assert_eq!(envelope.session, Some(gw.session_id));
             assert_eq!(d.protocol, DenyProtocol::Udp);
-            assert_eq!(d.orig_dst_ip, gateway_ip);
-            assert_eq!(d.orig_dst_port, 10002);
+            assert_eq!(d.orig_dst_ip, pre_dnat_dst_ip);
+            assert_eq!(d.orig_dst_port, pre_dnat_dst_port);
+            assert_ne!(
+                d.orig_dst_ip, gateway_ip,
+                "post-DNAT regression: deny event must not carry gateway_ip as orig_dst",
+            );
+            assert_ne!(
+                d.orig_dst_port, 10002,
+                "post-DNAT regression: deny event must not carry deny-logger port as orig_dst_port",
+            );
             assert_eq!(d.src_ip, vm_ip);
             assert!(d.src_port > 0, "src_port must be nonzero on UDP deny");
         }
@@ -1223,4 +1221,184 @@ async fn integration_killing_deny_logger_emits_health_degraded_then_restored() {
     drop(side);
 
     monitor_handle.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Test 5 (M12-S1): UDP pre-DNAT attribution under load
+// ---------------------------------------------------------------------------
+
+/// M12-S1 deliverable: prove the conntrack-netlink lookup in the UDP
+/// deny-logger handler keeps pre-DNAT attribution tight under
+/// concurrent flows. Single-flow correctness is covered by Test 2; this
+/// test exercises the path under multi-flow contention to expose any
+/// race between conntrack lookup and the receive loop.
+///
+/// **Shape.** From a single side container, fire N concurrent UDP
+/// datagrams to N distinct denied destinations
+/// `(203.0.113.{1..=N}, 9000+i)`. Each flow takes a different
+/// `(dst_ip, dst_port)` so the post-DNAT REPLY tuple uniquely
+/// identifies it (the kernel installs a separate conntrack entry per
+/// flow). Wait for N matching deny events on the bus and assert each
+/// one carries the originally-targeted pre-DNAT 5-tuple — not the
+/// post-DNAT `(gateway_ip, 10002)` regression shape.
+///
+/// **Why N=12.** The deny-logger's per-process rate cap defaults to
+/// 1000/s (see `sandbox-deny-logger` `--rate-cap`); 12 datagrams
+/// spread across ~1s of wall time stay well under it while still
+/// generating enough overlap to expose a single-flow conntrack race.
+/// Bumping to ~50 would require either raising the rate cap or
+/// pacing — out of scope; 12 is empirically sufficient to expose the
+/// regression on a fast-conntrack-GC kernel.
+///
+/// **Why the side container, not multiple side containers.** Multiple
+/// side containers would also stress the gateway's conntrack table,
+/// but they would each have a distinct `src_ip`, simplifying the
+/// kernel's flow-key disambiguation. We deliberately keep `src_ip`
+/// constant across all flows so disambiguation is purely on
+/// `(src_port, dst_ip, dst_port)` — the same shape a real high-rate
+/// VM would produce.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn integration_udp_load_pre_dnat_attribution_holds_under_concurrent_flows() {
+    /// Number of concurrent UDP flows the test fires. Tuned per the
+    /// rate-cap reasoning in the doc comment above.
+    const FLOW_COUNT: usize = 12;
+
+    let gw = GatewaySession::create(Ipv4Addr::new(10, 214, 0, 0));
+    gw.apply_policy(&allow_10_over_8_443());
+
+    let vm_ip: Ipv4Addr = gw.network_info.vm_ip.parse().expect("vm_ip parses");
+    let gateway_ip: Ipv4Addr = gw
+        .network_info
+        .gateway_ip
+        .parse()
+        .expect("gateway_ip parses");
+    let side = SideContainer::spawn(
+        "udp-load",
+        &gw.network_info.docker_network_name,
+        vm_ip,
+        gateway_ip,
+    );
+
+    let bus = EventBus::new(EventBusConfig::default());
+    bus.register_session(gw.session_id);
+    let vm_ip_map = VmIpSessionMap::new();
+    vm_ip_map.bind(vm_ip, gw.session_id);
+
+    let (mut replay, mut rx) = bus.subscribe(&gw.session_id).expect("session registered");
+
+    let events_dir: PathBuf = session_events_host_dir(&gw.session_id);
+    let ingestor = SessionIngestor::spawn(gw.session_id, events_dir, bus.clone(), vm_ip_map);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Generate the (dst_ip, dst_port) matrix. 203.0.113.0/24 is
+    // TEST-NET-3; ports 9000..9000+FLOW_COUNT are arbitrary deny
+    // ports outside any allow list.
+    let targets: Vec<(Ipv4Addr, u16)> = (1..=FLOW_COUNT as u8)
+        .map(|i| (Ipv4Addr::new(203, 0, 113, i), 9000 + (i as u16)))
+        .collect();
+
+    // Build a single shell command that backgrounds all N nc -u
+    // invocations from inside the side container, then waits for
+    // them. Backgrounding ensures the kernel sees them
+    // near-simultaneously rather than serialised by the shell — the
+    // racy shape we want to exercise.
+    let mut script = String::from("set -e\n");
+    for (ip, port) in &targets {
+        // `nc -u -w1` exits 1s after writing stdin EOF. We pipe
+        // `echo hello` so it sends one datagram before EOF; the
+        // backgrounded `&` lets all 12 invocations be in-flight at
+        // the same time. Stdout/stderr are silenced because we don't
+        // care about their per-process output (the assertion is on
+        // the deny-logger JSONL).
+        script.push_str(&format!(
+            "(echo hello | nc -u -w1 {ip} {port}) >/dev/null 2>&1 &\n"
+        ));
+    }
+    script.push_str("wait\n");
+
+    let nc_out = Command::new("docker")
+        .args(["exec", &side.name, "sh", "-c", &script])
+        .output()
+        .expect("docker exec nc -u burst should be invokable");
+    assert!(
+        nc_out.status.success(),
+        "nc -u burst must exit cleanly; stderr={}",
+        String::from_utf8_lossy(&nc_out.stderr)
+    );
+
+    // Collect FLOW_COUNT distinct deny events. Track which targets
+    // we've matched; assert at the end that the set is exactly the
+    // targets we sent.
+    let mut matched: std::collections::BTreeSet<(Ipv4Addr, u16)> =
+        std::collections::BTreeSet::new();
+    let target_set: std::collections::BTreeSet<(Ipv4Addr, u16)> = targets.iter().copied().collect();
+
+    let sid = gw.session_id;
+    while matched.len() < FLOW_COUNT {
+        let captured = matched.clone();
+        let target_set_inner = target_set.clone();
+        let ev = wait_for_deny(&mut replay, &mut rx, move |ev| {
+            let Event::Traffic { envelope, event } = ev else {
+                return false;
+            };
+            if envelope.session != Some(sid) {
+                return false;
+            }
+            let TrafficEvent::DenyLogger(DenyLoggerEvent::Deny(d)) = event else {
+                return false;
+            };
+            if d.protocol != DenyProtocol::Udp {
+                return false;
+            }
+            // Pre-DNAT regression guard: any post-DNAT
+            // `(gateway_ip, 10002)` slip-through trips this.
+            if d.orig_dst_ip == gateway_ip && d.orig_dst_port == 10002 {
+                // Match it so the test surfaces the exact bad event in
+                // the per-event assertion below.
+                return true;
+            }
+            let key = (d.orig_dst_ip, d.orig_dst_port);
+            target_set_inner.contains(&key) && !captured.contains(&key)
+        })
+        .await;
+
+        match &*ev {
+            Event::Traffic {
+                envelope,
+                event: TrafficEvent::DenyLogger(DenyLoggerEvent::Deny(d)),
+            } => {
+                assert_eq!(envelope.session, Some(sid));
+                assert_eq!(d.protocol, DenyProtocol::Udp);
+                assert_eq!(d.src_ip, vm_ip, "src_ip must be the side-container IP");
+                assert!(d.src_port > 0, "src_port must be nonzero");
+                assert_ne!(
+                    (d.orig_dst_ip, d.orig_dst_port),
+                    (gateway_ip, 10002u16),
+                    "post-DNAT regression: deny event carried the deny-logger's own \
+                     bind address (gateway_ip:10002) instead of the pre-DNAT target"
+                );
+                let key = (d.orig_dst_ip, d.orig_dst_port);
+                assert!(
+                    target_set.contains(&key),
+                    "pre-DNAT tuple {key:?} not in target set {target_set:?} — \
+                     conntrack lookup returned a stale or wrong entry"
+                );
+                let inserted = matched.insert(key);
+                assert!(
+                    inserted,
+                    "duplicate match for {key:?} — wait_for_deny predicate is leaky"
+                );
+            }
+            other => panic!("unexpected matched event shape: {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        matched, target_set,
+        "every fired flow must produce exactly one matching deny event with its \
+         pre-DNAT 5-tuple intact",
+    );
+
+    ingestor.abort();
 }
