@@ -276,6 +276,8 @@ Two one-time steps are required before the daemon starts: a system-wide config f
 
 The repository ships a make target that runs every per-host install/configure step the project needs. It prints `[sudo] <exact change>` before each privileged operation so you see what is about to be modified before authenticating, and is fully idempotent — re-running on an already-configured host prints `✓ already configured` for every step and invokes no `sudo`.
 
+Multiple `[sudo]` announce lines do not mean multiple password prompts: `sudo` caches your authentication for a few minutes (the `timestamp_timeout` setting, typically 5–15 minutes on most distros), so you usually authenticate once at the first privileged step and the rest run silently. If enough time has elapsed between steps, `sudo` will re-prompt — that is normal.
+
 ```bash
 make setup-dev-env
 ```
