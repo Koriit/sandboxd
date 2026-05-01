@@ -369,12 +369,8 @@ async fn integration_cp_rejects_both_sides_remote() {
     let shim_dir = tempfile::tempdir().expect("shim dir");
     // No shim binaries needed — we should never reach a subprocess.
 
-    let (status, _stdout, stderr) = run_sandbox_cp(
-        &["a:foo", "b:bar"],
-        &sock,
-        shim_dir.path(),
-    )
-    .await;
+    let (status, _stdout, stderr) =
+        run_sandbox_cp(&["a:foo", "b:bar"], &sock, shim_dir.path()).await;
 
     assert_eq!(
         status.code(),
@@ -395,12 +391,8 @@ async fn integration_cp_rejects_no_remote_side() {
     let (_tmp_daemon, sock) = spawn_fake_daemon("lima").await;
     let shim_dir = tempfile::tempdir().expect("shim dir");
 
-    let (status, _stdout, stderr) = run_sandbox_cp(
-        &["./local/a", "./local/b"],
-        &sock,
-        shim_dir.path(),
-    )
-    .await;
+    let (status, _stdout, stderr) =
+        run_sandbox_cp(&["./local/a", "./local/b"], &sock, shim_dir.path()).await;
 
     assert_eq!(
         status.code(),
