@@ -64,6 +64,16 @@ A policy is a JSON document with a `version` and an ordered `rules` array. Every
 
 Rule identity is the `(host, port)` pair: at most one rule per pair in any effective policy.
 
+#### UDP-specific caveats
+
+The `protocol` enum accepts `tcp` or `udp` symmetrically, but the two protocols carry different operational properties:
+
+- **No L7 inspection for UDP.** mitmproxy does not handle UDP and there is no equivalent of HTTP CONNECT — the only meaningful level for `protocol: "udp"` is `transport`. The policy compiler rejects level `http` paired with `protocol: "udp"` (and `tls` with UDP is similarly not viable). Allowed UDP exits the gateway directly through nftables MASQUERADE, with no userland proxy on the data path.
+- **Allow audit is per-flow, not per-packet.** Every accepted UDP flow produces one `event: "allow"` JSONL record at flow start, sourced from the kernel's conntrack `NFCT_T_NEW` event. A long-lived UDP exchange does not produce one record per datagram. Conntrack ages the flow out after 30 s of silence (`net.netfilter.nf_conntrack_udp_timeout`); the next packet on the same 5-tuple opens a new flow with a new allow record. TCP allow audit, by contrast, is per-connection via Envoy's access log.
+- **Deny is silent at the network level.** A blocked UDP datagram is dropped at nft with no ICMP unreachable on the wire — the VM-side socket sees only timeouts. Audit attribution lives in the JSONL stream: a `event: "deny"` record carrying the original 5-tuple is written by `sandbox-nft-deny-logger` from the kernel's NFLOG group 1 stream. TCP deny, by contrast, is a RST close on a redirected listener socket.
+
+These properties are also reflected in the [network policies guide](/guides/network-policies/#udp-destinations) (with a worked NTP example) and the [troubleshooting guide's UDP section](/guides/troubleshooting/#udp-traffic) (for diagnosis flow).
+
 ### Hosts
 
 - **Exact domain:** `"github.com"` — just that host.
@@ -134,7 +144,7 @@ flowchart TB
 ```
 
 - **CoreDNS** receives the allow-list of domains. Allowed names resolve normally; everything else returns `NXDOMAIN`. Resolved IPs are fed back to sandboxd to keep nftables current.
-- **nftables** blocks traffic to any `(destination-IP, destination-port)` pair not covered by the policy — populated from CIDR literals (expanded to `/32` entries for resolved IPs of a domain, or the CIDR itself for literal rules) crossed with the rule's explicit port. Anything else is redirected to the deny-logger, which RST-closes the flow and emits a structured `deny` event.
+- **nftables** blocks traffic to any `(destination-IP, destination-port)` pair not covered by the policy — populated from CIDR literals (expanded to `/32` entries for resolved IPs of a domain, or the CIDR itself for literal rules) crossed with the rule's explicit port. TCP that doesn't match is DNAT-redirected to the nft-deny-logger's listener, which RST-closes the flow and emits a structured `deny` event. UDP that doesn't match is dropped at nft (silent — no ICMP unreachable) with a NFLOG group 1 audit copy that the nft-deny-logger consumes from the kernel and emits as the same `deny` event shape.
 - **Envoy** receives all TCP that survives the firewall and picks a filter chain whose `filter_chain_match` combines `prefix_ranges` (destination IPs) with an explicit `destination_port`. The chain then routes per level: passthrough for `transport`, SNI-verified passthrough for `tls`, loopback CONNECT to mitmproxy for `http`.
 - **mitmproxy** handles only `http` traffic. It terminates TLS with the per-session CA, strips the query string from the request path, matches against the rule's `http_filters`, and either forwards or rejects with a 599 response carrying the denial reason.
 
@@ -156,7 +166,9 @@ Expansion is entirely client-side — the daemon receives the fully materialized
 
 ## Observability
 
-Every policy-enforcing component (CoreDNS, Envoy, mitmproxy, deny-logger) emits a structured event per decision, and sandboxd itself emits lifecycle events — including `policy_applied`, `policy_updated`, `policy_propagated`, `gateway_ready`, and `gateway_shutdown`. All of them land in a unified per-session stream you can replay or follow with `sandbox events <session>`. The `policy_propagated` event in particular closes the DNS-propagation window: it fires once the applied policy's hash has reconciled across CoreDNS, the nftables `policy_allow_{tcp,udp}` sets, and Envoy's L3 filter chains. See [`sandbox events`](/reference/cli/#sandbox-events) for the full CLI surface and [networking → Synchronous DNS-policy gating](/concepts/networking/#synchronous-dns-policy-gating) for why the propagation is observable at all.
+Every policy-enforcing component (CoreDNS, Envoy, mitmproxy, nft-deny-logger, nft-allow-logger) emits a structured event per decision, and sandboxd itself emits lifecycle events — including `policy_applied`, `policy_updated`, `policy_propagated`, `gateway_ready`, and `gateway_shutdown`. All of them land in a unified per-session stream you can replay or follow with `sandbox events <session>`. The `policy_propagated` event in particular closes the DNS-propagation window: it fires once the applied policy's hash has reconciled across CoreDNS, the nftables `policy_allow_{tcp,udp}` sets, and Envoy's L3 filter chains. See [`sandbox events`](/reference/cli/#sandbox-events) for the full CLI surface and [networking → Synchronous DNS-policy gating](/concepts/networking/#synchronous-dns-policy-gating) for why the propagation is observable at all.
+
+Note the asymmetry between TCP and UDP audit granularity: TCP allow events come from Envoy's access log (per connection), TCP deny events come from `nft-deny-logger`'s redirected listener (per accepted-then-RST-closed connection), UDP allow events come from `nft-allow-logger`'s NFCT subscription (per new conntrack flow, with 30 s rollover after silence), and UDP deny events come from `nft-deny-logger`'s NFLOG subscription (per dropped datagram, no ICMP attribution on the wire). Per-protocol caveats are spelled out alongside the [`protocol` field](#udp-specific-caveats) above.
 
 ## Related reading
 

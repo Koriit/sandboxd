@@ -9,7 +9,7 @@ If you are just getting started, check [Installation](/start/installation/) for 
 
 ## Which layer denied my request?
 
-Before diving into component-specific symptoms below, check the unified event stream — every policy-enforcing layer (CoreDNS, nftables-via-deny-logger, Envoy, mitmproxy) writes a per-decision event there, and sandboxd exposes the whole stream through `sandbox events`.
+Before diving into component-specific symptoms below, check the unified event stream — every policy-enforcing layer (CoreDNS, nft-deny-logger and nft-allow-logger, Envoy, mitmproxy) writes a per-decision event there, and sandboxd exposes the whole stream through `sandbox events`.
 
 ```bash
 # Live deny-only stream, auto-tabular in a TTY:
@@ -17,12 +17,16 @@ sandbox events <session> --decision=deny --follow
 
 # Only the deny-logger (i.e. packets that matched no allow rule at all):
 sandbox events <session> --layer=deny-logger --follow
+
+# Only the allow-logger (per-flow audit for allowed UDP).
+sandbox events <session> --layer=allow-logger --follow
 ```
 
 How to read the result:
 
 - **`layer: dns`, decision `deny`** — CoreDNS refused the name (`NXDOMAIN`). The domain is not covered by the policy, or the wildcard does not match the apex. See [DNS resolution issues](#dns-resolution-issues).
-- **`layer: deny-logger`** — a packet reached the firewall but matched no `policy_allow_{tcp,udp}` entry. Either the destination is truly unauthorized, or DNS hadn't propagated for it yet. See [L3 destination fails on first request](#l3-destination-fails-on-first-request-after-policy-change) for the race and [Non-HTTP traffic to a level `http` destination](#non-http-traffic-to-a-level-http-destination) for non-TCP-over-port-443 misses.
+- **`layer: deny-logger`** — a packet reached the firewall but matched no `policy_allow_{tcp,udp}` entry. Either the destination is truly unauthorized, or DNS hadn't propagated for it yet. See [L3 destination fails on first request](#l3-destination-fails-on-first-request-after-policy-change) for the race and [Non-HTTP traffic to a level `http` destination](#non-http-traffic-to-a-level-http-destination) for non-TCP-over-port-443 misses. For UDP-specific deny diagnosis (silent drop, no ICMP unreachable), see [UDP traffic](#udp-traffic).
+- **`layer: allow-logger`** — a UDP flow was admitted (per-flow audit, not per-packet). Useful for confirming an allowed UDP exchange actually started; see [How do I read the allow event](#how-do-i-read-the-allow-event) and [the 30 s NFCT-rollover behaviour](#i-see-the-same-allow-event-twice-for-one-apparent-session). TCP allow-flow audit is provided by Envoy's access log instead.
 - **`layer: envoy`, decision `deny`** — Envoy's listener / chain match rejected the connection (wrong SNI for a `tls` rule, no filter chain for the `(ip, port)` pair, etc.).
 - **`layer: mitmproxy`, decision `deny`** — the request reached mitmproxy but no `http_filters` entry matched. The event's `reason` names the specific check that failed (host, port, method/path). Mitmproxy strips the query string from the path before matching, so a filter like `GET /api/v1/**` matches regardless of whatever the caller appended after `?`.
 
@@ -195,6 +199,92 @@ Look for `table inet sandbox` (deny-all base) and `table inet sandbox_dnat` (DNA
 sandbox stop <session> && sandbox start <session>
 ```
 
+## UDP traffic
+
+UDP behaves differently from TCP in the gateway: there is no userland proxy on the data path, the deny path is silent at the network level (no ICMP unreachable), and audit events arrive per-flow rather than per-packet. The entries below cover the most common UDP-specific symptoms.
+
+### UDP traffic isn't working
+
+**Symptom:** A UDP-using application inside the VM (NTP client, DNS-over-UDP for non-system resolvers, custom UDP service) doesn't receive responses, and `sandbox health` reports the gateway as healthy.
+
+Check the unified event stream first — the answer is almost always there:
+
+```bash
+# UDP allow events for the session, live.
+sandbox events <session> --layer=allow-logger --follow
+
+# UDP (and TCP) deny events for the session.
+sandbox events <session> --layer=deny-logger --decision=deny --follow
+```
+
+Walk the checklist:
+
+1. **Does any rule cover the destination?** A UDP rule must declare `protocol: "udp"` explicitly; a TCP rule does not implicitly cover UDP. Confirm with `sandbox describe <session>`. If the destination isn't named, add a `transport`-level UDP rule (see [the UDP destinations section](/guides/network-policies/#udp-destinations)) and `sandbox policy update`.
+2. **Did DNS propagate the IP into `policy_allow_udp`?** For domain-based UDP rules (e.g. `time.ubuntu.com:123`), the rule's IPs land in nft only after CoreDNS resolves them and sandboxd injects them. A bare-IP UDP rule (CIDR literal) is in the set immediately. Check the live state:
+   ```bash
+   docker exec sandbox-gw-<session_id> nft list set inet sandbox_dnat policy_allow_udp
+   ```
+3. **Did NFLOG record a deny?** If the policy doesn't cover the destination, you'll see a JSONL `event: "deny"` record in the events stream with `protocol: "udp"` and the original 5-tuple. The VM-side socket sees only timeouts (no ICMP unreachable — see [Why don't I get ICMP unreachable](#why-dont-i-get-icmp-unreachable-on-a-denied-udp-send) below for the rationale).
+
+If a rule covers the destination, the IP is in `policy_allow_udp`, and there is no deny event — but the VM still doesn't get a response — the upstream is not responding. UDP is connectionless; the gateway can confirm the request left, but it cannot tell you why a reply never arrived. Tcpdump on the bridge interface from the host side is the next step.
+
+### How do I read the allow event?
+
+`sandbox-nft-allow-logger` writes one JSONL line per new allowed UDP flow into the gateway's events directory. The file name is `nft-allow.jsonl` (mounted from the per-session events directory at `/var/log/gateway/events/<session-id>/nft-allow.jsonl`). Each line carries:
+
+- `timestamp` — ISO 8601, when the logger observed the `NFCT_T_NEW` event (within milliseconds of the kernel creating the conntrack entry).
+- `event` — always `"allow"`.
+- `layer` — emitter tag (`"allow-logger"` for `sandbox-nft-allow-logger`).
+- `protocol` — always `udp` for this file (the logger filters NFCT events for UDP at parse time).
+- `src_ip`, `src_port` — the VM-side endpoint, original-direction tuple source.
+- `orig_dst_ip`, `orig_dst_port` — the upstream destination the VM dialed (no DNAT on the UDP allow path, so this is the literal destination address).
+
+You normally read these via the unified event stream rather than the file directly:
+
+```bash
+# Live stream of allow events (allow-logger only).
+sandbox events <session> --layer=allow-logger --follow
+
+# All events for the session, including allow + deny + DNS + Envoy + mitmproxy.
+sandbox events <session> --follow
+```
+
+The granularity matters: this is **per conntrack flow, not per packet**. A long-lived UDP exchange (e.g. an NTP client sampling a server every 64 seconds) produces one allow record at the start of each flow, not one per datagram. See the next entry for what makes a "new flow."
+
+### I see the same allow event twice for one apparent session
+
+**Symptom:** A long-running UDP exchange to the same upstream `(IP, port)` produces two (or more) allow events spaced apart in time, even though from the application's point of view it's the same conversation.
+
+This is the kernel's UDP conntrack rollover, not a bug. UDP is connectionless — there is no protocol-level way to tell when a "session" ends. The kernel approximates session lifetime with a timeout: if a tracked UDP flow sees no traffic for a configurable interval (`net.netfilter.nf_conntrack_udp_timeout`, default **30 seconds**), conntrack ages the entry out. The next packet on the same 5-tuple opens a new conntrack flow and fires a new `NFCT_T_NEW` event — `sandbox-nft-allow-logger` writes a new allow record.
+
+So an NTP client polling every 64 seconds will produce one allow record per poll, an active 1-second-interval audio stream will produce a single record at the start (or roughly one per outage), and a chatty short-lived exchange may produce many records depending on idle gaps.
+
+To inspect the kernel's view directly:
+
+```bash
+docker exec sandbox-gw-<session_id> sysctl net.netfilter.nf_conntrack_udp_timeout
+docker exec sandbox-gw-<session_id> conntrack -L -p udp 2>/dev/null
+```
+
+The expected per-flow audit shape is documented in [policy model → UDP-specific caveats](/concepts/policy-model/#udp-specific-caveats) and the design rationale in the [UDP subsection of the networking design](/concepts/networking/#nftables).
+
+### Why don't I get ICMP unreachable on a denied UDP send?
+
+**Symptom:** A UDP datagram to a non-allowed destination doesn't trigger the application's "destination unreachable" error path. The application sees only a recv timeout.
+
+This is intentional. Denied UDP is **silent dropped** at nft — there is no `nft reject with icmp port-unreachable` rule. Two reasons:
+
+1. **Defence-in-depth against probing.** ICMP unreachables would let a sandboxed application enumerate the gateway's policy structure (which IPs are not in `policy_allow_udp`, which ports are unbound on which upstream hosts) by sending probe datagrams and observing the error responses. Silent drop closes that side channel.
+2. **The audit log already attributes the deny.** The kernel emits an NFLOG group 1 message before the drop completes, and `sandbox-nft-deny-logger` writes a JSONL `event: "deny"` record carrying the original 5-tuple. Operator-side observability is preserved; only the in-VM probing surface is narrowed.
+
+If you need to confirm a specific datagram was denied (rather than lost in transit or upstream-dropped), tail the deny stream:
+
+```bash
+sandbox events <session> --layer=deny-logger --decision=deny --follow
+```
+
+A matching `event: "deny"` record with `protocol: "udp"` and the 5-tuple your application sent confirms the gateway dropped it. No matching record means the datagram either wasn't dropped (so the upstream is the silent party) or was dropped further upstream than the gateway.
+
 ## Policy not taking effect
 
 **Symptom:** Policy update was applied but behavior has not changed.
@@ -299,11 +389,11 @@ By the time a request reaches mitmproxy, the connection's peer is Envoy's loopba
 
 Fix: filter by `layer=mitmproxy` and the session ID, not by a VM bridge IP. The envelope's `session` field is authoritative for attribution.
 
-### Deny-logger reports pre-DNAT 5-tuple
+### nft-deny-logger reports pre-DNAT 5-tuple
 
 **Symptom:** A deny event on the deny-logger layer shows a destination IP that does not match what the application dialed.
 
-Deny-logger records the original 5-tuple as recovered via `SO_ORIGINAL_DST` / `IP_ORIGDSTADDR` from the redirected socket — i.e. the destination *before* the nftables DNAT would have fired if the destination had been allowed. That is deliberate: the interesting field for an operator is what the VM was trying to reach, not `127.0.0.1:10001` on the gateway's loopback. See the spec's "Deny-logger component" section for the full field list.
+`sandbox-nft-deny-logger` records the original 5-tuple from the kernel, before any DNAT could mutate it. The exact source depends on protocol: TCP-deny reads the pre-DNAT destination via `SO_ORIGINAL_DST` on the accepted (DNAT-redirected) socket; UDP-deny pulls the 5-tuple from the kernel-emitted NFLOG group 1 message (and there is no DNAT on the UDP-deny path, so the destination in the NFLOG payload is literally what the VM dialed). Either way the event names what the VM was trying to reach, not the gateway's listener address. See the [networking concept guide](/concepts/networking/) for the full datapath.
 
 ## File transfer failures
 

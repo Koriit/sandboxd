@@ -476,9 +476,9 @@ Provides hard enforcement and transparent interception of forwarded traffic from
 
 * DNS traffic (TCP/UDP port 53) is redirected to the local resolver. This serves as a safety net — even applications in the VM that ignore resolv.conf or use hardcoded resolver addresses are forced through the local resolver. Well-behaved applications reach the resolver directly via resolv.conf configuration; nftables redirect catches everything else
 * TCP traffic is redirected to Envoy's listener, which uses the `original_dst` listener filter to recover the real destination from the DNAT-redirected socket
-* UDP traffic is handled purely by nftables rules (IP/port allow/deny) — no userland proxy is involved. The local DNS resolver is not an exception: it is an actual destination (resolv.conf points applications to it directly), not a proxy in the UDP path. nftables enforces that port 53 traffic can only reach the local resolver; all other port 53 traffic is denied
+* UDP traffic is handled purely by nftables rules (IP/port allow/deny) — no userland proxy is involved. Allowed UDP `accepts` at PREROUTING and falls through to MASQUERADE for direct egress to upstream; denied UDP is silently dropped at nft (with NFLOG group 1 audit copy that is observe-only — the audit logger receives a netlink message carrying the original 5-tuple, but the packet itself never enters userland). The local DNS resolver is not an exception to "no userland proxy": it is an actual destination (resolv.conf points applications to it directly), not a proxy in the UDP path. nftables enforces that port 53 traffic can only reach the local resolver; all other port 53 traffic is denied
 
-This eliminates the need for userland transparent interception proxies. The kernel handles the redirect, and Envoy recovers the original destination natively.
+This eliminates the need for userland transparent interception proxies on the data plane. The kernel handles the redirect, Envoy recovers the original destination natively for TCP, and UDP never crosses into userland on either the allow or the deny path. The two nft-loggers (`sandbox-nft-deny-logger`, `sandbox-nft-allow-logger`) are observe-only audit consumers of kernel-emitted netlink streams (NFLOG for the deny path, `NFNLGRP_CONNTRACK_NEW` for the allow path); they sit beside the datapath, not in it.
 
 ##### Local DNS resolver (CoreDNS)
 
@@ -1114,11 +1114,18 @@ Allowed only by explicit bypass:
 
 #### UDP
 
-Allowed only by explicit bypass:
+Allowed only by explicit bypass, and the bypass is enforced entirely in the kernel: there is no userland proxy on either the allow or the deny path. UDP enforcement is **allow-by-set, observe-by-NFLOG-and-NFCT**.
 
-* narrow and intentional
-* strongest review burden
-* generally weakest service identity guarantees
+The allow path is a concat-set lookup. nftables maintains `policy_allow_udp` keyed on `(destination-IP, destination-port)`, populated at compile time from CIDR rules and at runtime from the DNS-propagation loop as policy-allowed names resolve. PREROUTING packets matching the set `accept` and fall through to MASQUERADE, exiting the gateway directly to upstream. Envoy is not in the path. Per-flow audit is closed by a separate netlink subscription: `sandbox-nft-allow-logger` listens on `NFNLGRP_CONNTRACK_NEW`, filters for UDP, and emits one `event: "allow"` JSONL record per new conntrack flow. The granularity is per-flow, not per-packet — a long-lived UDP exchange produces one allow record per new conntrack entry. Conntrack's plain-UDP timeout (`net.netfilter.nf_conntrack_udp_timeout`, default 30 s) shapes flow lifetime: a UDP exchange that goes silent for ≥ 30 s is aged out and the next packet on the same 5-tuple opens a new flow with a new allow record. This rollover is documented behaviour, not a bug.
+
+The deny path is a kernel drop with audit. PREROUTING packets that do not match `policy_allow_udp` (and are not the DNS-special-case to CoreDNS) hit an `nft log group 1 ; drop` rule. The kernel emits a netlink message on NFLOG group 1 carrying the full IPv4 + UDP headers — the original 5-tuple before any DNAT could mutate it, with no DNAT in the deny path anyway — and silently drops the packet. `sandbox-nft-deny-logger` subscribes to the NFLOG stream, parses the headers, and emits `event: "deny"` JSONL records. The packet itself never enters userland. There is no ICMP unreachable on the wire (silent drop is the design — see § Error propagation); audit attribution is the JSONL stream.
+
+Properties:
+
+* narrow and intentional — every allow rule is an explicit `(host, port)` declaration
+* strongest review burden — there is no L7 inspection, no MITM, no header validation; the gating signal is `(IP, port, protocol)`
+* generally weakest service identity guarantees — the kernel can attribute by 5-tuple, but cannot verify what the protocol payload claims to be
+* no userland datapath in either direction — the `nft-` loggers are kernel-event consumers, not proxies
 
 ## Operations
 
@@ -1218,9 +1225,9 @@ When the pipeline denies a connection, the application in the VM should receive 
 
 **Kernel firewall (nftables):**
 
-* use REJECT (TCP RST for TCP, ICMP unreachable for UDP) rather than DROP where possible
-* REJECT gives the application immediate feedback; DROP causes timeouts
-* exception: DROP may be appropriate for security-sensitive cases where revealing policy structure is undesirable
+* TCP: send RST (the deny-side path DNATs unmatched TCP into `sandbox-nft-deny-logger`'s listener, which closes via `SO_LINGER{1,0}` so the VM's connect attempt fails immediately rather than hanging on a half-open handshake). RST gives the application immediate feedback.
+* UDP: silent `nft drop` — **no** ICMP port-unreachable. This is a deliberate defence-in-depth posture: a sandboxed application should not be able to probe the gateway's policy structure or the existence of upstream hosts via ICMP responses. The audit log already attributes the deny (the kernel emits an NFLOG message and `sandbox-nft-deny-logger` writes a JSONL `event: "deny"` record before the drop completes), so the absence of an on-wire signal does not reduce operator visibility — it only reduces the in-VM probing surface. The application observes a socket-layer timeout; the operator observes a deny event.
+* DROP without audit may be appropriate for security-sensitive cases where revealing policy structure is undesirable; the UDP deny path described above is exactly that posture, with NFLOG providing the operator-side audit channel that DROP otherwise loses.
 
 **Local DNS resolver:**
 

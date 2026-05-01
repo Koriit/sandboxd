@@ -171,10 +171,47 @@ sandbox events <session> --event policy_propagated --follow
 
 Level `http` (HTTPS inspection) has a few constraints worth calling out:
 
-- **TCP only.** mitmproxy's forward-proxy mode inspects HTTP/HTTPS over TCP. Non-TCP protocols (QUIC/HTTP/3, raw UDP) cannot be inspected at this level. QUIC is blocked by the deny-all firewall since no rule opens UDP/443.
+- **TCP only.** mitmproxy's forward-proxy mode inspects HTTP/HTTPS over TCP. Non-TCP protocols (QUIC/HTTP/3, raw UDP) cannot be inspected at this level — UDP has no MITM analogue and no equivalent of HTTP CONNECT. To allow a UDP destination at all, declare a `transport`-level rule with `protocol: "udp"` (see [UDP destinations](#udp-destinations) below); a level-`http` rule with `protocol: "udp"` is rejected at policy-validation time. QUIC over UDP/443 is the same case: it can be allowed as `transport` UDP/443 but the bytes are opaque to the sandbox.
 - **Destinations must resolve via the intercepted DNS path.** L3 filter chains are keyed on IPs learned from CoreDNS (or explicit CIDR literals in the policy). A destination that is never resolved through CoreDNS will have no L3 chain and will fail closed. Pre-populating CIDRs in the policy works around this for known IP ranges.
 - **Inspection is done with the per-session CA.** The client inside the VM sees the mitmproxy-issued certificate, not the real server's. Applications that pin the real certificate cannot use level `http`; drop them to `tls` or `transport`. See [TLS certificate errors](#tls-certificate-errors) below.
 - **No `CONNECT` from the guest.** The mitmproxy forward proxy is bound to loopback inside the gateway container and is not reachable from the VM. The only way to reach it is through the Envoy L3 filter chain's internal CONNECT tunnel. This is deliberate — it keeps the inspection path off the VM's attack surface.
+
+## UDP destinations
+
+UDP destinations behave differently from TCP. Worth knowing before you add UDP rules to a policy:
+
+- **Only `transport` is meaningful for UDP.** There is no L7 inspection (mitmproxy does not handle UDP), no SNI for `tls`, and no equivalent of HTTP CONNECT. The policy compiler rejects level `http` with `protocol: "udp"`; `tls` with `protocol: "udp"` is also not a viable shape. Use `transport` for any UDP rule.
+- **No userland proxy on the data path.** Allowed UDP exits the gateway directly to upstream via nftables MASQUERADE; Envoy and mitmproxy are not in the path. This is the intended design — UDP cannot be inspected, so there is no reason to route it through the inspection pipeline.
+- **Audit is per-flow, not per-packet.** A nft-allow-logger in the gateway subscribes to the kernel's conntrack `NFCT_T_NEW` event stream and writes one `event: "allow"` JSONL line per new tracked UDP flow. A long-lived UDP exchange produces one allow record at the start of the flow, not one per datagram. This is a meaningful difference from TCP: an Envoy access log records per-connection, but a UDP allow record records per *conntrack flow*, which the kernel ages out after 30 seconds of silence (see the [troubleshooting guide's UDP entries](/guides/troubleshooting/#udp-traffic) for the rollover behaviour).
+- **Denied UDP is silent at the network level.** There is no ICMP port-unreachable on the wire — the kernel drops the datagram and the VM-side socket sees only timeouts. The deny is recorded in the audit log: a nft-deny-logger subscribes to NFLOG group 1 and writes a `event: "deny"` JSONL record carrying the original 5-tuple. So "no ICMP" does not mean "no observability"; it means observability lives in the JSONL stream, not in the in-VM error path.
+
+A worked example — allow NTP synchronisation against the Ubuntu time pool:
+
+```json
+{
+  "version": "2.0.0",
+  "rules": [
+    {
+      "host": "time.ubuntu.com",
+      "port": 123,
+      "protocol": "udp",
+      "level": "transport",
+      "reason": "NTP time sync"
+    },
+    {
+      "host": "ntp.ubuntu.com",
+      "port": 123,
+      "protocol": "udp",
+      "level": "transport",
+      "reason": "NTP time sync (secondary pool)"
+    }
+  ]
+}
+```
+
+After applying the rule, the VM's NTP client reaches the upstream pool through nftables MASQUERADE; the nft-allow-logger emits one allow event per resolved upstream IP the client opens a flow to. If you want to confirm a specific exchange went through, tail the unified events stream with `sandbox events <session> --layer=allow-logger --follow` and watch for matching 5-tuples.
+
+If you instead try to send UDP/123 to a host that is *not* in the policy, the gateway drops the datagram and emits a `event: "deny"` JSONL record naming the source and pre-DNAT destination — but `chronyc tracking` (or whatever the VM-side client is) will only see request timeouts, since there is no ICMP unreachable to attribute the failure to.
 
 ## Verify what is active
 

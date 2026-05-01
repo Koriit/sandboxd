@@ -11,7 +11,7 @@ Each session is a closed loop:
 
 - A **per-session Docker bridge** (a `/28` subnet) — the only L2 segment the VM touches.
 - A **gateway container** attached to that bridge — the only L3 next hop the VM can reach.
-- Inside the gateway: **nftables** for default-deny firewalling and conditional DNAT, **CoreDNS** for policy-filtered DNS, **Envoy** for connection routing, **mitmproxy** for TLS inspection, and a **deny-logger** that catches traffic no allow rule matched.
+- Inside the gateway: **nftables** for default-deny firewalling and conditional DNAT, **CoreDNS** for policy-filtered DNS, **Envoy** for connection routing, **mitmproxy** for TLS inspection, an **nft-deny-logger** that catches traffic no allow rule matched, and an **nft-allow-logger** that records every new allowed UDP flow.
 - A **per-session CA** trusted inside the VM, with the private key living only inside the gateway.
 
 There is no alternate path out for application traffic. The VM's data NIC routes through the gateway, and the gateway denies everything by default.
@@ -115,7 +115,7 @@ A misconfigured second sandboxd on the same host cannot mass-delete this sandbox
 
 ## The gateway
 
-The gateway container is the session's single exit. It runs four cooperating processes plus an nftables ruleset in its own network namespace.
+The gateway container is the session's single exit. It runs five cooperating processes plus an nftables ruleset in its own network namespace.
 
 ### nftables
 
@@ -124,23 +124,31 @@ The gateway holds three nftables tables, each with a distinct role:
 | Table | Purpose |
 |---|---|
 | `sandbox` | Deny-all baseline — forward chain drops everything |
-| `sandbox_dnat` | PREROUTING DNAT — DNS to CoreDNS; policy-allowed TCP/UDP conditionally to Envoy, everything else to the deny-logger |
+| `sandbox_dnat` | PREROUTING — DNS to CoreDNS; policy-allowed TCP DNATs to Envoy; policy-allowed UDP exits direct to upstream; non-allowed TCP DNATs to the nft-deny-logger; non-allowed UDP is dropped at nft (with NFLOG copy for audit) |
 | `sandbox_policy` | Envoy-egress allow list — IPs learned from DNS responses plus policy CIDRs |
 
-`sandbox_dnat` carries two concat sets, `policy_allow_tcp` and `policy_allow_udp`, keyed on `(destination-IP, destination-port)`. PREROUTING packets whose `(daddr, dport)` is in the set are DNAT-redirected to Envoy's intercepting listener on `127.0.0.1:10000`; packets outside the set (TCP **or** UDP) are redirected to the deny-logger on `127.0.0.1:10001` (TCP) / `127.0.0.1:10002` (UDP). The deny-logger records the pre-DNAT 5-tuple (see the `deny` event under [`sandbox events`](/reference/cli/#sandbox-events)) and closes TCP with `SO_LINGER{1,0}` so the VM sees a RST immediately instead of a silent hang.
+`sandbox_dnat` carries two concat sets, `policy_allow_tcp` and `policy_allow_udp`, keyed on `(destination-IP, destination-port)`. The two protocols take different paths after the set match:
+
+- **TCP.** PREROUTING packets whose `(daddr, dport)` is in `policy_allow_tcp` are DNAT-redirected to Envoy's intercepting listener on `127.0.0.1:10000`; everything else is redirected to the nft-deny-logger on `127.0.0.1:10001`. The nft-deny-logger recovers the pre-DNAT destination via `SO_ORIGINAL_DST` on the accepted socket and closes the connection with `SO_LINGER{1,0}` so the VM sees a RST immediately instead of a silent hang.
+- **UDP.** PREROUTING packets whose `(daddr, dport)` is in `policy_allow_udp` `accept` and fall through to MASQUERADE — they exit the gateway directly to upstream, with no userland hop. Anything else hits an `nft log group 1 ; drop` rule: the kernel emits a netlink message carrying the original 5-tuple (before any DNAT could mutate it) and silently drops the packet. The nft-deny-logger subscribes to NFLOG group 1 and emits a JSONL `event: "deny"` record for the dropped datagram. There is no ICMP unreachable — the deny is silent at the network layer; the audit log is the attribution.
+
+UDP allow-flow audit is closed by a second netlink subscription. The nft-allow-logger subscribes to `nfnetlink_conntrack`'s `NFNLGRP_CONNTRACK_NEW` multicast group, filters for UDP, and emits a JSONL `event: "allow"` record per new tracked flow. The granularity is per-flow, not per-packet: a long-lived UDP "session" produces one allow record per new conntrack entry, not one per datagram. See [`sandbox events`](/reference/cli/#sandbox-events) for the event surface and the troubleshooting guide for the 30-second NFCT-rollover behaviour that shapes how flows reappear in the audit log.
 
 The deny-all baseline in the `sandbox` table is the safety net: even if `sandbox_dnat` disappeared, no forwarded packet would leave the namespace. Level-3 (HTTPS inspection) traffic is not routed through nftables DNAT a second time; Envoy itself opens a loopback CONNECT tunnel to mitmproxy on `127.0.0.1:18080` (see [Request flow](#request-flow) below).
 
-### Four processes
+### Five processes
 
 | Component | What it does |
 |---|---|
 | **CoreDNS** | Answers all DNS queries; returns `NXDOMAIN` for anything the policy does not list |
 | **Envoy** | Receives redirected TCP; routes connections per the policy's assurance level |
 | **mitmproxy** | Terminates TLS with the per-session CA for HTTP-level inspection |
-| **deny-logger** | TCP `:10001`, UDP `:10002`, healthcheck `:10003`; recovers the pre-DNAT destination via `SO_ORIGINAL_DST` / `IP_ORIGDSTADDR` and emits a structured `deny` event per attempt |
+| **nft-deny-logger** | Emits a structured `deny` event per blocked attempt. TCP-deny is a DNAT-redirect to `:10001`, where the listener recovers the pre-DNAT destination via `SO_ORIGINAL_DST` on the accepted socket and RST-closes. UDP-deny is observed-only via NFLOG group 1: the kernel drops the datagram and emits a netlink message carrying the original 5-tuple, which the logger parses without ever receiving the packet itself. Healthcheck on `:10003` |
+| **nft-allow-logger** | Emits a structured `allow` event per new allowed UDP flow. Subscribes to `nfnetlink_conntrack`'s `NFNLGRP_CONNTRACK_NEW` multicast group, filters for UDP, and writes one JSONL line per `NFCT_T_NEW` event. Per-flow granularity, not per-packet. Healthcheck on `:10004` |
 
-Startup is ordered to avoid a window where traffic could leak: deny-logger and mitmproxy come up first, then Envoy, then CoreDNS. The DNAT rules in `sandbox_dnat` are installed only after all four pass their readiness checks.
+Both `nft-` loggers source their data from the kernel/nft layer rather than userland L7 streams; the prefix in their names is deliberate. They observe protocol-level facts (5-tuple, verdict, timestamp), not payload content.
+
+Startup is ordered to avoid a window where traffic could leak: the loggers and mitmproxy come up first, then Envoy, then CoreDNS. The DNAT rules in `sandbox_dnat` are installed only after every component passes its readiness check.
 
 ### Why a container, not the host
 
@@ -188,7 +196,7 @@ When mitmproxy matches the request against a rule's `http_filters`, the path is 
 Two things are worth highlighting:
 
 - **DNS is intercepted twice.** The VM's `resolv.conf` points at the gateway, *and* nftables DNATs port 53 regardless of destination. An application that ignores `resolv.conf` and hardcodes `8.8.8.8` still ends up at CoreDNS.
-- **Direct-IP access is not a loophole.** Even if an application skips DNS and dials an IP directly, its `(daddr, dport)` must be in `policy_allow_{tcp,udp}` (populated from policy CIDRs plus CoreDNS-learned IPs for the matching rule's port) for the DNAT to Envoy to fire. Anything else is redirected to the deny-logger, which records the attempt and RST-closes the flow.
+- **Direct-IP access is not a loophole.** Even if an application skips DNS and dials an IP directly, its `(daddr, dport)` must be in `policy_allow_{tcp,udp}` (populated from policy CIDRs plus CoreDNS-learned IPs for the matching rule's port) to be admitted. TCP that does not match is DNAT-redirected to the nft-deny-logger, which records the attempt and RST-closes the flow. UDP that does not match is dropped at nft with a NFLOG copy: the kernel-emitted netlink message reaches the nft-deny-logger as an observe-only audit event, the datagram itself never enters userland, and the VM-side socket sees only timeouts (no ICMP unreachable).
 
 ## DNS
 
@@ -215,7 +223,7 @@ The propagation loop publishes a `policy_propagated` lifecycle event once all th
 
 ### Event attribution
 
-Every policy-enforcing component emits structured events that sandboxd ingests and publishes on a per-session ring buffer. Most layers carry the VM's bridge IP on the record, and sandboxd stamps the envelope `session` by looking up `(vm_ip → session_id)` at ingest time. mitmproxy is the exception: by the time a request reaches the addon, the TCP peer is Envoy's loopback-connect source, not the VM. So the mitmproxy ingestor attributes its events to the **per-session watcher** that produced the line — one watcher per session, reading that session's mitmproxy JSONL log — rather than via the VM-IP map. Deny-logger events use the pre-DNAT `src_ip` from `SO_ORIGINAL_DST` / `IP_ORIGDSTADDR`, which is the VM's bridge IP, and go back through the VM-IP map. See [`sandbox events`](/reference/cli/#sandbox-events) for the replay/stream surface.
+Every policy-enforcing component emits structured events that sandboxd ingests and publishes on a per-session ring buffer. Most layers carry the VM's bridge IP on the record, and sandboxd stamps the envelope `session` by looking up `(vm_ip → session_id)` at ingest time. mitmproxy is the exception: by the time a request reaches the addon, the TCP peer is Envoy's loopback-connect source, not the VM. So the mitmproxy ingestor attributes its events to the **per-session watcher** that produced the line — one watcher per session, reading that session's mitmproxy JSONL log — rather than via the VM-IP map. The nft-loggers attribute by `src_ip` per the same VM-IP map; the source of that IP differs by protocol — TCP-deny reads it from the accepted socket via `SO_ORIGINAL_DST` (with the pre-DNAT destination on the same call), UDP-deny pulls it straight out of the kernel-emitted NFLOG message (where the original 5-tuple appears before any DNAT could mutate it, and there is no DNAT for UDP-deny anyway), and UDP-allow pulls it from the NFCT `NFCT_T_NEW` event's ORIGINAL tuple. All three resolve to the VM's bridge IP and go back through the VM-IP map. See [`sandbox events`](/reference/cli/#sandbox-events) for the replay/stream surface.
 
 ## TLS interception
 
