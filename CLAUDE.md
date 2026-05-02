@@ -1,6 +1,6 @@
 # Sandbox Daemon (sandboxd)
 
-Sandbox daemon providing isolated Linux environments for coding agents — Lima/QEMU VMs (full backend) and rootless Docker containers (lite-mode backend), with a shared per-session network gateway that enforces egress policy.
+Sandbox daemon providing isolated Linux environments for coding agents — Lima/QEMU VMs (full backend) and default-hardened Docker containers (lite-mode backend), with a shared per-session network gateway that enforces egress policy.
 
 ## Project structure
 

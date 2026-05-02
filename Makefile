@@ -117,10 +117,18 @@ gateway-image:
 # uses at run-time. Useful for local iteration and for warming the daemon
 # version's image before the first `--lite` create.
 #
-# The Dockerfile sources `sandbox-guest` from `sandboxd/target/release/`;
-# the workspace must be built first so the binary exists. The image is
-# tagged with the `sandbox-core` package version because the daemon's
-# `CARGO_PKG_VERSION` (used at run-time) is sourced from the same package.
+# This target intentionally mirrors the daemon's runtime build path: a
+# host `cargo build`, then `docker build` from a small staging dir
+# containing the Dockerfile and the prebuilt `sandbox-guest` binary.
+# The daemon does the same at runtime on user machines that do not
+# have the Rust workspace source — see the comment at the top of
+# `sandboxd/images/lite/Dockerfile`. Aligning `make lite-image` with
+# the runtime build keeps the dev image and the user-built image
+# byte-identical (modulo the sandbox-guest binary itself), so dev
+# testing reflects what users actually run. The image is tagged with
+# the `sandbox-core` package version because the daemon's
+# `CARGO_PKG_VERSION` (used at run-time) is sourced from the same
+# package.
 LITE_VERSION := $(shell awk -F'"' '/^version/ { print $$2; exit }' sandboxd/sandbox-core/Cargo.toml)
 
 lite-image:
@@ -191,15 +199,16 @@ sandboxd/target/.dev-env-stamps/route-helper-prod.stamp: sandboxd/target/release
 	@mkdir -p $(dir $@)
 	@if [ -f "$(ROUTE_HELPER_PROD_PATH)" ] && \
 	    cmp -s "sandboxd/target/release/sandbox-route-helper" "$(ROUTE_HELPER_PROD_PATH)" && \
+	    getcap "$(ROUTE_HELPER_PROD_PATH)" 2>/dev/null | grep -q cap_net_admin && \
 	    getcap "$(ROUTE_HELPER_PROD_PATH)" 2>/dev/null | grep -q cap_sys_admin; then \
-	  echo "✓ already configured: $(ROUTE_HELPER_PROD_PATH) (cap_sys_admin+ep, content matches build)"; \
+	  echo "✓ already configured: $(ROUTE_HELPER_PROD_PATH) (cap_net_admin,cap_sys_admin=eip, content matches build)"; \
 	else \
 	  echo "[sudo] install -m 0755 sandboxd/target/release/sandbox-route-helper $(ROUTE_HELPER_PROD_PATH)"; \
-	  echo "[sudo] setcap cap_sys_admin+ep $(ROUTE_HELPER_PROD_PATH)"; \
+	  echo "[sudo] setcap cap_net_admin,cap_sys_admin=eip $(ROUTE_HELPER_PROD_PATH)"; \
 	  sudo install -D -m 0755 \
 	    sandboxd/target/release/sandbox-route-helper \
 	    "$(ROUTE_HELPER_PROD_PATH)"; \
-	  sudo setcap cap_sys_admin+ep "$(ROUTE_HELPER_PROD_PATH)"; \
+	  sudo setcap 'cap_net_admin,cap_sys_admin=eip' "$(ROUTE_HELPER_PROD_PATH)"; \
 	fi
 	@touch $@
 
@@ -242,15 +251,16 @@ sandboxd/target/.dev-env-stamps/route-helper-test.stamp: sandboxd/target/debug/s
 	@mkdir -p $(dir $@)
 	@if [ -f "$(ROUTE_HELPER_TEST_PATH)" ] && \
 	    cmp -s "sandboxd/target/debug/sandbox-route-helper" "$(ROUTE_HELPER_TEST_PATH)" && \
+	    getcap "$(ROUTE_HELPER_TEST_PATH)" 2>/dev/null | grep -q cap_net_admin && \
 	    getcap "$(ROUTE_HELPER_TEST_PATH)" 2>/dev/null | grep -q cap_sys_admin; then \
-	  echo "✓ already configured: $(ROUTE_HELPER_TEST_PATH) (cap_sys_admin+ep, content matches test build)"; \
+	  echo "✓ already configured: $(ROUTE_HELPER_TEST_PATH) (cap_net_admin,cap_sys_admin=eip, content matches test build)"; \
 	else \
 	  echo "[sudo] install -m 0755 sandboxd/target/debug/sandbox-route-helper $(ROUTE_HELPER_TEST_PATH)"; \
-	  echo "[sudo] setcap cap_sys_admin+ep $(ROUTE_HELPER_TEST_PATH)"; \
+	  echo "[sudo] setcap cap_net_admin,cap_sys_admin=eip $(ROUTE_HELPER_TEST_PATH)"; \
 	  sudo install -D -m 0755 \
 	    sandboxd/target/debug/sandbox-route-helper \
 	    "$(ROUTE_HELPER_TEST_PATH)"; \
-	  sudo setcap cap_sys_admin+ep "$(ROUTE_HELPER_TEST_PATH)"; \
+	  sudo setcap 'cap_net_admin,cap_sys_admin=eip' "$(ROUTE_HELPER_TEST_PATH)"; \
 	fi
 	@touch $@
 

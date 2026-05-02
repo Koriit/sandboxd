@@ -140,9 +140,10 @@ fn verify_installed_test_helper() -> PathBuf {
         .output()
         .unwrap_or_else(|e| panic!("invoking getcap on {}: {e}", installed.display()));
     let cap_output = String::from_utf8_lossy(&getcap.stdout);
-    if !cap_output.contains("cap_sys_admin") {
+    if !cap_output.contains("cap_sys_admin") || !cap_output.contains("cap_net_admin") {
         panic!(
-            "installed test route helper at {} lacks cap_sys_admin (getcap stdout: {:?})\n\
+            "installed test route helper at {} lacks cap_sys_admin and/or cap_net_admin \
+             (getcap stdout: {:?})\n\
              run: make install-route-helper-test-cap",
             installed.display(),
             cap_output,
@@ -365,6 +366,22 @@ impl TestNetnsContainer {
 
         // Construct the container; --rm so it self-deletes on stop.
         // sleep 60 gives the test plenty of time even on a slow box.
+        //
+        // `--user <uid>:<gid>` makes the container's task credentials
+        // match the test runner's. Under rootful Docker, the helper's
+        // `setns(pidfd, CLONE_NEWNET)` is gated by
+        // `ptrace_may_access(task, PTRACE_MODE_READ_REALCREDS)`,
+        // which checks both real uid AND real gid: a uid match alone
+        // is not enough — gid must also match (or the caller must
+        // hold `CAP_SYS_PTRACE`, which we deliberately do not grant).
+        // Passing only `--user <uid>` leaves gid at the busybox
+        // image default (root, 0), so the gid check fails and setns
+        // returns EPERM. Production containers spawned by sandboxd
+        // already pass `--user 1000:1000` (matching the daemon's
+        // uid:gid), which is why the production path works.
+        let uid = nix::unistd::Uid::current().as_raw();
+        let gid = nix::unistd::Gid::current().as_raw();
+        let user_arg = format!("{uid}:{gid}");
         let run = Command::new("docker")
             .args([
                 "run",
@@ -374,6 +391,8 @@ impl TestNetnsContainer {
                 &container_name,
                 "--network",
                 &network_name,
+                "--user",
+                &user_arg,
                 "busybox:latest",
                 "sleep",
                 "60",

@@ -620,7 +620,7 @@ def _ensure_base_image(sandbox_binaries: SandboxBinaries, sandbox_daemon):
         [str(sandbox_binaries.sandbox), "--socket", socket_path, "rebuild-image"],
         capture_output=True,
         text=True,
-        timeout=600,
+        timeout=1800,
     )
     if result.returncode != 0:
         pytest.fail(

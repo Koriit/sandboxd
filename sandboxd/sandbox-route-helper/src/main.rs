@@ -45,20 +45,38 @@
 //!
 //! # Privilege model
 //!
-//! The helper requires `cap_sys_admin+ep` to call `setns(2)` on a
-//! foreign netns. Operators install it with:
+//! The helper requires `CAP_SYS_ADMIN` to call `setns(2)` on a foreign
+//! netns and `CAP_NET_ADMIN` to issue `RTM_NEWROUTE` (which the spawned
+//! `ip(8)` needs to inherit via the ambient set — see step 7 below).
+//! Operators install it with:
 //!
 //! ```text
-//! sudo setcap cap_sys_admin+ep /usr/local/libexec/sandboxd/sandbox-route-helper
+//! sudo setcap 'cap_net_admin,cap_sys_admin=eip' /usr/local/libexec/sandboxd/sandbox-route-helper
 //! ```
+//!
+//! The `=eip` flags put both caps in the file's Permitted, Inheritable,
+//! and Effective sets. On exec by an unprivileged caller, the thread's
+//! Permitted gets the file Permitted (gated by bset); Effective tracks
+//! Permitted because the file Effective bit is set; but Inheritable is
+//! taken from the *parent's* Inheritable, which is empty. The helper
+//! itself must therefore promote `CAP_NET_ADMIN` from its Permitted into
+//! its Inheritable set before raising ambient — see `install_default_route`.
+//!
+//! Under rootless Docker the container netns lives in a child userns
+//! and `CAP_SYS_ADMIN` in the parent userns implicitly promotes to all
+//! caps inside it, so the previous `cap_sys_admin+ep`-only install
+//! happened to also let `ip(8)` `RTM_NEWROUTE` succeed; under rootful
+//! Docker the netns is in init userns directly and there is no such
+//! promotion, so we must hand the child its own `CAP_NET_ADMIN`
+//! explicitly via the ambient set.
 //!
 //! The production install path is `/usr/local/libexec/sandboxd/` per
 //! FHS § 4.7 (libexec is for non-user-facing helper binaries).
 //!
-//! Under setcap, the helper retains the capability across `exec`
-//! without running as root, so the only privileged operation in the
-//! sandbox stack is namespace-entry — everything else (config read,
-//! authorization, route install via `ip(8)`) runs as the invoking user.
+//! Under setcap, the helper retains the capabilities across `exec`
+//! without running as root, so the only privileged operations in the
+//! sandbox stack are namespace-entry and route install — everything
+//! else (config read, authorization) runs as the invoking user.
 //!
 //! # Stderr / exit-code contract
 //!
@@ -299,7 +317,26 @@ fn enforce_netns_addresses_in_subnet(subnet: &SubnetEntry) -> Result<(), String>
 /// `ip route replace default via <gateway_ip>` inside the (already-
 /// entered) netns. We let `ip(8)`'s own stderr surface to the user on
 /// failure rather than re-formatting it.
+///
+/// Before exec we raise `CAP_NET_ADMIN` to the ambient set so the
+/// `ip(8)` child inherits permitted+effective `CAP_NET_ADMIN` and can
+/// issue `RTM_NEWROUTE`. The file caps `cap_net_admin,cap_sys_admin=eip`
+/// place `CAP_NET_ADMIN` in the file's permitted+inheritable+effective
+/// sets, but on exec a process's *thread* inheritable set is taken from
+/// the parent — which is the unprivileged caller, so inheritable is
+/// empty after exec. `PR_CAP_AMBIENT_RAISE` requires the cap in both
+/// permitted AND inheritable, so we first promote permitted →
+/// inheritable, then inheritable → ambient.
 fn install_default_route(gateway_ip: Ipv4Addr) -> Result<(), String> {
+    caps::raise(
+        None,
+        caps::CapSet::Inheritable,
+        caps::Capability::CAP_NET_ADMIN,
+    )
+    .map_err(|err| format!("raise CAP_NET_ADMIN to inheritable: {err}"))?;
+    caps::raise(None, caps::CapSet::Ambient, caps::Capability::CAP_NET_ADMIN)
+        .map_err(|err| format!("raise CAP_NET_ADMIN to ambient: {err}"))?;
+
     let status = Command::new("ip")
         .args([
             "route",

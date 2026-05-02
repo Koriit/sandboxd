@@ -144,7 +144,7 @@ def test_cp_host_to_vm(sandbox_cli, backend):
 
         # Upload the file into the VM.
         cp_result = sandbox_cli(
-            "cp", local_file, "ws-cp-up:/tmp/uploaded.txt",
+            "cp", local_file, "ws-cp-up:/home/agent/uploaded.txt",
             timeout=120,
         )
         assert cp_result.returncode == 0, (
@@ -154,7 +154,7 @@ def test_cp_host_to_vm(sandbox_cli, backend):
 
         # Verify the file contents in the VM.
         cat_result = sandbox_cli(
-            "exec", "ws-cp-up", "--", "cat", "/tmp/uploaded.txt",
+            "exec", "ws-cp-up", "--", "cat", "/home/agent/uploaded.txt",
             timeout=120,
         )
         assert cat_result.returncode == 0, (
@@ -203,7 +203,7 @@ def test_cp_vm_to_host(sandbox_cli, backend):
         test_content = "content created inside VM for download test"
         exec_result = sandbox_cli(
             "exec", "ws-cp-down", "--",
-            "bash", "-c", f"echo -n '{test_content}' > /tmp/vm-file.txt",
+            "bash", "-c", f"echo -n '{test_content}' > /home/agent/vm-file.txt",
             timeout=120,
         )
         assert exec_result.returncode == 0, (
@@ -216,7 +216,7 @@ def test_cp_vm_to_host(sandbox_cli, backend):
         os.close(fd)
 
         cp_result = sandbox_cli(
-            "cp", "ws-cp-down:/tmp/vm-file.txt", local_file,
+            "cp", "ws-cp-down:/home/agent/vm-file.txt", local_file,
             timeout=120,
         )
         assert cp_result.returncode == 0, (
@@ -268,7 +268,7 @@ def test_cp_native_attributes(sandbox_cli, backend):
 
     Path layout:
       host  /tmp/<tmpdir>/sparse.bin   (apparent 10 MB, mode 0700)
-      VM    /tmp/sparse-uploaded.bin
+      VM    /home/agent/sparse-uploaded.bin
       host  /tmp/<tmpdir>/sparse-roundtripped.bin
 
     Backend coverage: parametrised over [lima, container] like the
@@ -304,7 +304,7 @@ def test_cp_native_attributes(sandbox_cli, backend):
         # Upload via `sandbox cp`. The native tool (limactl cp / docker
         # cp) is what actually crosses the host/VM boundary.
         cp_up = sandbox_cli(
-            "cp", original, "ws-cp-attr:/tmp/sparse-uploaded.bin",
+            "cp", original, "ws-cp-attr:/home/agent/sparse-uploaded.bin",
             timeout=180,
         )
         assert cp_up.returncode == 0, (
@@ -316,7 +316,7 @@ def test_cp_native_attributes(sandbox_cli, backend):
         # Mode 0700 must round-trip — the pre-M12-S7 path lost it.
         mode_in_vm = sandbox_cli(
             "exec", "ws-cp-attr", "--",
-            "stat", "-c", "%a", "/tmp/sparse-uploaded.bin",
+            "stat", "-c", "%a", "/home/agent/sparse-uploaded.bin",
             timeout=120,
         )
         assert mode_in_vm.returncode == 0, (
@@ -324,7 +324,7 @@ def test_cp_native_attributes(sandbox_cli, backend):
             f"stdout: {mode_in_vm.stdout}\nstderr: {mode_in_vm.stderr}"
         )
         assert mode_in_vm.stdout.strip() == "700", (
-            f"mode for /tmp/sparse-uploaded.bin not preserved across upload: "
+            f"mode for /home/agent/sparse-uploaded.bin not preserved across upload: "
             f"expected 700, got {mode_in_vm.stdout.strip()!r}"
         )
 
@@ -332,14 +332,14 @@ def test_cp_native_attributes(sandbox_cli, backend):
         # 10 MB exactly. `stat -c %s` returns size in bytes.
         size_in_vm = sandbox_cli(
             "exec", "ws-cp-attr", "--",
-            "stat", "-c", "%s", "/tmp/sparse-uploaded.bin",
+            "stat", "-c", "%s", "/home/agent/sparse-uploaded.bin",
             timeout=120,
         )
         assert size_in_vm.returncode == 0, (
             f"stat -c %s failed in VM: stderr={size_in_vm.stderr!r}"
         )
         assert int(size_in_vm.stdout.strip()) == 10 * 1024 * 1024, (
-            f"apparent size for /tmp/sparse-uploaded.bin not preserved: "
+            f"apparent size for /home/agent/sparse-uploaded.bin not preserved: "
             f"expected {10 * 1024 * 1024}, got {size_in_vm.stdout.strip()!r}"
         )
 
@@ -351,7 +351,7 @@ def test_cp_native_attributes(sandbox_cli, backend):
         # crept back in, allocated would equal apparent (10 MB).
         allocated_in_vm = sandbox_cli(
             "exec", "ws-cp-attr", "--",
-            "du", "-B1", "/tmp/sparse-uploaded.bin",
+            "du", "-B1", "/home/agent/sparse-uploaded.bin",
             timeout=120,
         )
         assert allocated_in_vm.returncode == 0, (
@@ -367,7 +367,7 @@ def test_cp_native_attributes(sandbox_cli, backend):
 
         # Round-trip back to the host via `sandbox cp`.
         cp_down = sandbox_cli(
-            "cp", "ws-cp-attr:/tmp/sparse-uploaded.bin", roundtrip,
+            "cp", "ws-cp-attr:/home/agent/sparse-uploaded.bin", roundtrip,
             timeout=180,
         )
         assert cp_down.returncode == 0, (

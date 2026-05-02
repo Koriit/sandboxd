@@ -35,6 +35,11 @@ nix = { version = "0.29", features = ["user", "sched", "net"] }
 # Required only for the direct `pidfd_open` syscall and the matching
 # errno read. The rest of the crate uses nix wrappers.
 libc = "0.2"
+# Manipulate the helper's own capability sets so `CAP_NET_ADMIN` survives
+# the `ip(8)` exec via the ambient set — required under rootful Docker
+# where the container netns is in init userns and there's no userns
+# implicit-cap promotion to cover the post-exec child.
+caps = "0.5"
 
 [dev-dependencies]
 # Used by the integration tests to checksum the installed cap'd

@@ -179,10 +179,7 @@ async fn integration_cp_lima_upload_file_source_omits_recurse_flag() {
     let src_path = src_file.to_string_lossy().into_owned();
 
     let (status, _stdout, stderr) = run_sandbox_cp(
-        &[
-            &src_path,
-            "cp-dispatch-test:/home/agent/workspace/file.txt",
-        ],
+        &[&src_path, "cp-dispatch-test:/home/agent/workspace/file.txt"],
         &sock,
         shim_dir.path(),
     )
