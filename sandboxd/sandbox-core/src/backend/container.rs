@@ -642,17 +642,6 @@ impl SessionRuntime for ContainerRuntime {
         }
     }
 
-    /// Return the container's bridge IP. Returns the IP recorded at
-    /// `register_session` time rather than `docker inspect`-ing — the
-    /// daemon is the authoritative source (network manager allocated
-    /// it), and the inspect path costs a subprocess for no new
-    /// information.
-    async fn ip(&self, handle: &RuntimeHandle) -> Result<IpAddr, SandboxError> {
-        let session_id = Self::session_id_from_handle(handle)?;
-        let network = self.lookup_session(&session_id)?;
-        Ok(network.container_ip)
-    }
-
     fn guest_transport(&self, handle: &RuntimeHandle) -> Arc<dyn GuestTransport> {
         Arc::new(ContainerTransport {
             container_name: handle.as_str().to_string(),

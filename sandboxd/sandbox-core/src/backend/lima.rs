@@ -19,7 +19,6 @@
 //!   the IP from the daemon's per-session `NetworkInfo.vm_ip` map
 //!   (one less round-trip; works pre-boot).
 
-use std::net::IpAddr;
 use std::process::Stdio;
 use std::sync::Arc;
 
@@ -287,51 +286,6 @@ impl SessionRuntime for LimaRuntime {
         Ok(vm_status.into())
     }
 
-    /// Stop-gap implementation of `ip(handle)`: shells out via
-    /// `limactl shell <vm> -- ip -4 addr show eth1` and parses the
-    /// resulting `inet 10.x.y.z/...` line. The IP authoritatively
-    /// lives on the daemon's `NetworkInfo.vm_ip` blob; this shell-out
-    /// re-derives it from the VM only because `LimaRuntime` does not
-    /// (yet) carry a per-session network side map the way
-    /// `ContainerRuntime` does.
-    ///
-    // TODO: future — adopt the same per-session side-map pattern as
-    // `ContainerRuntime` (`Mutex<HashMap<SessionId, ContainerNetwork>>`
-    // populated via `register_session` before `create`, see
-    // `backend/container.rs`). That removes a `limactl shell` round
-    // trip per `ip()` call and — more importantly — makes `ip()`
-    // answer correctly during create / post-stop windows when the VM
-    // isn't running or `eth1` doesn't exist.
-    async fn ip(&self, handle: &RuntimeHandle) -> Result<IpAddr, SandboxError> {
-        let manager = Arc::clone(&self.manager);
-        let vm_name = handle.as_str().to_string();
-
-        let output = tokio::task::spawn_blocking(move || {
-            std::process::Command::new(manager.limactl_path())
-                .args([
-                    "shell", &vm_name, "--", "ip", "-4", "-o", "addr", "show", "dev", "eth1",
-                ])
-                .output()
-                .map_err(|e| {
-                    SandboxError::Lima(format!("failed to spawn limactl shell ... ip: {e}"))
-                })
-        })
-        .await
-        .map_err(|e| SandboxError::Internal(format!("spawn_blocking join failed: {e}")))??;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(SandboxError::Lima(format!(
-                "limactl shell ... ip -4 addr show eth1 failed: {stderr}"
-            )));
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        parse_eth1_ipv4(&stdout).ok_or_else(|| {
-            SandboxError::Lima(format!("could not parse eth1 IPv4 address from: {stdout}"))
-        })
-    }
-
     fn guest_transport(&self, handle: &RuntimeHandle) -> Arc<dyn GuestTransport> {
         // Resolving the session id can fail for malformed handles, but
         // `guest_transport` is non-fallible by trait contract. We
@@ -523,32 +477,6 @@ impl AsyncWrite for LimaTransportStream {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Parse the dotted-quad IPv4 address out of `ip -4 -o addr show dev
-/// eth1` output. Lima's `ip(8)` formatting (`-o`) puts the `inet
-/// <addr>/<prefix>` token on a single line; we split on whitespace,
-/// find `inet`, and return the address minus its prefix.
-fn parse_eth1_ipv4(stdout: &str) -> Option<IpAddr> {
-    for line in stdout.lines() {
-        let mut tokens = line.split_whitespace();
-        // Tokens: "<idx>:" "<iface>" "inet" "<addr>/<prefix>" ...
-        while let Some(token) = tokens.next() {
-            if token == "inet" {
-                if let Some(cidr) = tokens.next() {
-                    let addr = cidr.split('/').next().unwrap_or(cidr);
-                    if let Ok(ip) = addr.parse::<IpAddr>() {
-                        return Some(ip);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -659,26 +587,6 @@ mod tests {
             RuntimeStatus::from(VmStatus::Unknown(String::new())),
             RuntimeStatus::Unknown(String::new()),
         );
-    }
-
-    /// `parse_eth1_ipv4` extracts the dotted-quad IPv4 address from
-    /// `ip -4 -o addr show dev eth1`-shaped output. Tightly scoped
-    /// helper test — the real `ip(handle)` round-trip is exercised
-    /// in `integration_lima_runtime_lifecycle`.
-    #[test]
-    fn parse_eth1_ipv4_extracts_dotted_quad() {
-        let output = "3: eth1    inet 10.209.0.3/28 brd 10.209.0.15 scope global eth1\\       valid_lft forever preferred_lft forever\n";
-        let ip = parse_eth1_ipv4(output).expect("parse succeeded");
-        assert_eq!(ip.to_string(), "10.209.0.3");
-    }
-
-    /// `parse_eth1_ipv4` returns `None` on output without an `inet`
-    /// token (e.g. when `ip` reports only `inet6` because the link is
-    /// down).
-    #[test]
-    fn parse_eth1_ipv4_returns_none_when_absent() {
-        assert!(parse_eth1_ipv4("").is_none());
-        assert!(parse_eth1_ipv4("3: eth1    inet6 fe80::1/64 scope link").is_none());
     }
 
     /// Defensive: `LimaRuntime::create` rejects a container-shaped

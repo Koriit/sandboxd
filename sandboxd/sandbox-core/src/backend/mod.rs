@@ -8,7 +8,6 @@
 //!
 //! See spec § "Architecture / Two traits" for the full rationale.
 
-use std::net::IpAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -282,11 +281,6 @@ pub trait SessionRuntime: Send + Sync {
 
     /// Query the current state of a session.
     async fn status(&self, handle: &RuntimeHandle) -> Result<RuntimeStatus, SandboxError>;
-
-    /// Return the IP address the session is reachable on (the bridge
-    /// IP for Lima, the container's bridge IP for the container
-    /// backend).
-    async fn ip(&self, handle: &RuntimeHandle) -> Result<IpAddr, SandboxError>;
 
     /// Return a guest-agent transport bound to this session's
     /// handle. The returned transport is cheap to clone and is

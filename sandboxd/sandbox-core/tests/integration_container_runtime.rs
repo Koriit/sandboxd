@@ -452,32 +452,10 @@ async fn integration_container_runtime_status_reflects_docker_state() {
         "out-of-band docker stop must surface as RuntimeStatus::Stopped"
     );
 
-    // Sanity: ip() returns the registered container IP, not from
-    // docker inspect — pinned because the trait method name might
-    // misleadingly suggest a docker round-trip.
-    let observed_ip = runtime
-        .ip(&handle)
-        .await
-        .expect("ip() must return the registered container IP before delete");
-    assert_eq!(
-        observed_ip,
-        net.container_ip.parse::<std::net::IpAddr>().unwrap()
-    );
-
     runtime
         .delete(&handle)
         .await
         .expect("ContainerRuntime::delete");
-
-    // After delete(), the session entry is forgotten — a subsequent
-    // ip() call must error rather than return stale registered state.
-    assert!(
-        runtime
-            .ip(&RuntimeHandle::from_session_id(&session_id))
-            .await
-            .is_err(),
-        "delete() must forget the session info so ip() errors cleanly"
-    );
 
     drop(net);
 }

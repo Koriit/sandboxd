@@ -710,7 +710,6 @@ mod tests {
 
     // -- GuestConnector dispatch tests --------------------------------------
 
-    use std::net::IpAddr;
     use std::sync::Mutex as StdMutex;
 
     use async_trait::async_trait;
@@ -803,10 +802,6 @@ mod tests {
 
         async fn status(&self, _handle: &RuntimeHandle) -> Result<RuntimeStatus, SandboxError> {
             unimplemented!("StubRuntime::status — not exercised by guest dispatch tests")
-        }
-
-        async fn ip(&self, _handle: &RuntimeHandle) -> Result<IpAddr, SandboxError> {
-            unimplemented!("StubRuntime::ip — not exercised by guest dispatch tests")
         }
 
         fn guest_transport(&self, _handle: &RuntimeHandle) -> Arc<dyn GuestTransport> {
