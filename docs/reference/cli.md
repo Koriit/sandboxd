@@ -600,7 +600,7 @@ The events stream is intended as the operator-facing feedback loop for tightenin
 
 6. **Re-run the workload.** Run `sandbox events dev --decision=deny` once more — no new denies means the policy is tight enough.
 
-The `tests/e2e/test_m10_s4_discovery.py` suite encodes this exact flow end-to-end. See [Network policies](/guides/network-policies/) for how to structure the policy JSON once you know which targets to allow.
+The `tests/e2e/test_discovery.py` suite encodes this exact flow end-to-end. See [Network policies](/guides/network-policies/) for how to structure the policy JSON once you know which targets to allow.
 
 ---
 

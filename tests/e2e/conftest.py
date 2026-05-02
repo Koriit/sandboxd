@@ -666,8 +666,8 @@ def sandbox_cli(sandbox_binaries: SandboxBinaries, sandbox_daemon, _ensure_base_
 # to build their ``sandbox create`` argv. pytest then runs each test twice
 # — once for ``backend == "lima"`` and once for ``backend == "container"``.
 #
-# Lima-only tests (``test_m1_vm_lifecycle.py``, ``test_m6_hardening.py``,
-# ``test_m85_golden_image.py``, ``test_m3_networking.py::
+# Lima-only tests (``test_vm_lifecycle.py``, ``test_hardening.py``,
+# ``test_golden_image.py``, ``test_networking.py::
 # test_concurrent_sessions``) carry an ``@pytest.mark.skipif(backend ==
 # "container", reason=...)`` to declare why the backend pair is not
 # applicable. Tests in ``test_lite.py`` are container-only and don't take

@@ -1,7 +1,7 @@
 //! Cross-session L4 isolation.
 //!
 //! These tests pair with the e2e structural disjoint-subnet check in
-//! `tests/e2e/test_m3_networking.py::test_concurrent_sessions`. The e2e
+//! `tests/e2e/test_networking.py::test_concurrent_sessions`. The e2e
 //! test already asserts the daemon hands two concurrent sessions
 //! disjoint `vm_subnet`s — the architectural contract on both Lima and
 //! container backends. What that test cannot assert behaviourally on

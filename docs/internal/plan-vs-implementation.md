@@ -48,7 +48,7 @@
 | Error handling for limactl | Delivered | Raw stderr preserved (simplified from plan's parse approach) |
 | **M1-S4:** Wire CLI to daemon, session lifecycle | Delivered | |
 | Daemon startup reconciliation | Delivered | VM state + network/gateway reconciliation |
-| E2E: test_create_and_destroy, test_stop_and_start | Delivered | 2 tests in test_m1_vm_lifecycle.py |
+| E2E: test_create_and_destroy, test_stop_and_start | Delivered | 2 tests in test_vm_lifecycle.py |
 
 **Gaps:** None.
 
@@ -65,7 +65,7 @@
 | Cloud-init installs guest agent as systemd service | Delivered | Installed via `limactl shell` after VM boot |
 | **M2-S3:** `sandbox ssh` command | Delivered | Via `limactl shell` (not vsock proxy) |
 | `sandbox exec` endpoint | Delivered | POST /sessions/{id}/exec |
-| E2E tests for guest agent | Delivered | 4 tests in test_m2_guest_agent.py |
+| E2E tests for guest agent | Delivered | 4 tests in test_guest_agent.py |
 
 **Key deviation:** Plan specified kernel AF_VSOCK sockets; implementation uses TCP-over-SSH via `limactl shell` + `socat`. Reason: Lima does not expose AF_VSOCK. The protocol layer is transport-agnostic -- the framed JSON protocol works identically over either transport.
 
@@ -92,7 +92,7 @@
 | `sandbox logs` command | Delivered | With --component and --follow flags |
 | Health monitoring background loop | Delivered | Polls gateway components periodically |
 | Gateway crash recovery | Delivered | Automatic restart with nftables re-injection |
-| E2E tests (7 planned tests) | Delivered | 7 tests in test_m3_networking.py |
+| E2E tests (7 planned tests) | Delivered | 7 tests in test_networking.py |
 
 **Key deviations:**
 - Subnet sizing widened from /30 to /28 (Docker claims .1, gateway gets .2, VM gets .3)
@@ -121,7 +121,7 @@
 | **M4-S5:** DNS-to-IP propagation | Delivered | TTL-aware cache, nftables IP updates on resolution changes |
 | `sandbox policy update` command | Delivered | Atomic distribution with rollback |
 | Policy loading at session create (`--policy` flag) | Delivered | |
-| **M4-S6:** E2E tests (11 planned tests) | Delivered | 11 tests in test_m4_policy.py |
+| **M4-S6:** E2E tests (11 planned tests) | Delivered | 11 tests in test_policy.py |
 
 **Gaps:** None. All 4 assurance levels fully implemented and tested.
 
@@ -135,10 +135,10 @@
 | `--boot-cmd` flag | Delivered | Executes command inside VM after boot |
 | `sandbox cp` (host-to-VM and VM-to-host) | Delivered | Via guest agent FileUpload/FileDownload protocol |
 | File transfer protocol (FileUpload, FileDownload) | Delivered | Base64-encoded data over framed JSON |
-| E2E tests (3 planned) | Delivered | 4 tests in test_m5_workspace.py (test_clone_repo, test_cp_host_to_vm, test_cp_vm_to_host, test_shared_mount) |
+| E2E tests (3 planned) | Delivered | 4 tests in test_workspace.py (test_clone_repo, test_cp_host_to_vm, test_cp_vm_to_host, test_shared_mount) |
 | **M5-S2:** Git remote over vsock | Delivered | git-remote-sandbox symlink, `sandbox::session/repo-path` URLs |
 | GitUploadPack/GitReceivePack protocol messages | Delivered | Stream-based via base64-encoded data |
-| E2E tests (2 planned) | Delivered | 2 tests in test_m5_git_remote.py (test_git_push_to_vm, test_git_fetch_from_vm) |
+| E2E tests (2 planned) | Delivered | 2 tests in test_git_remote.py (test_git_push_to_vm, test_git_fetch_from_vm) |
 | **M5-S3:** Shared mount mode (`--workspace shared:<path>`) | Delivered | Via 9p (not virtio-fs) |
 | Mutually exclusive with --repo | Delivered | clap `conflicts_with` enforced |
 | `docs/workspaces.md` | Delivered | |
@@ -153,7 +153,7 @@
 |---|---|---|
 | **M6-S1:** QEMU sandboxing (unprivileged user, seccomp, namespaces, cgroups) | Partially delivered | Cgroup limits delivered; seccomp removed |
 | **M6-S2:** Device model lockdown (minimal virtio devices) | Delivered | video: none, audio: none via Lima config |
-| **M6-S3:** Hardening E2E and verification | Delivered | 3 tests in test_m6_hardening.py |
+| **M6-S3:** Hardening E2E and verification | Delivered | 3 tests in test_hardening.py |
 | `--no-hardening` flag for debugging | Delivered | Beyond original plan |
 
 **Key deviation:** QEMU seccomp sandbox (`-sandbox on,obsolete=deny,...`) was removed during M8.5. It is incompatible with `qemu-bridge-helper` which requires the QEMU process to spawn a setuid helper. Cgroup limits (CPU, memory, PIDs) remain. Device lockdown remains.

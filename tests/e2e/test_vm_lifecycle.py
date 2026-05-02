@@ -5,7 +5,7 @@ Run with generous timeouts:
 
     cd tests/e2e
     source .venv/bin/activate
-    python -m pytest test_m1_vm_lifecycle.py -v --timeout=600
+    python -m pytest test_vm_lifecycle.py -v --timeout=600
 
 Backend coverage: **Lima only**. The assertions reach through
 ``limactl shell`` and ``limactl list --json`` to verify VM-level state
@@ -13,7 +13,7 @@ that has no analogue in the lite container backend. The equivalent
 container-backend lifecycle / persistence contract is covered by
 ``test_lite.py`` (which runs unparametrised against ``--lite``);
 backend-agnostic exec/lifecycle behaviour is covered by the
-parametrized tests in ``test_m2_guest_agent.py``.
+parametrized tests in ``test_guest_agent.py``.
 """
 
 from __future__ import annotations

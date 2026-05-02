@@ -32,7 +32,7 @@ Run with:
 
     cd tests/e2e
     source .venv/bin/activate
-    python -m pytest test_m85_golden_image.py -v --timeout=600
+    python -m pytest test_golden_image.py -v --timeout=600
 """
 
 from __future__ import annotations

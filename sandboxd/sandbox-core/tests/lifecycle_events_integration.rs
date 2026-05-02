@@ -5,7 +5,8 @@
 //! surface (`events::lifecycle::*`) and the `EventBus` fan-out — the
 //! same path `sandboxd::main` uses at every emission site. A real
 //! gateway and daemon are out of scope here (covered by
-//! `tests/e2e/test_m10_*` at the Python suite level); instead this
+//! `tests/e2e/test_discovery.py` and `tests/e2e/test_presets.py` at
+//! the Python suite level); instead this
 //! test publishes the expected event *sequence* for a session and
 //! asserts the subscriber sees the exact sequence via
 //! `EventBus::subscribe`.

@@ -294,7 +294,7 @@ def test_lite_git_remote_sandbox(
     """``git-remote-sandbox`` (the symlink to the ``sandbox`` binary
     that powers ``sandbox::`` URLs) must work against a lite session
     the same way it does against a Lima VM. Mirrors
-    ``test_m5_git_remote.py::test_git_push_to_vm`` but uses
+    ``test_git_remote.py::test_git_push_to_vm`` but uses
     ``--lite``.
     """
     socket_path = sandbox_daemon["socket"]
@@ -407,7 +407,7 @@ def test_lite_gateway_parity(lite_harness, sandbox_cli):
     only ``example.com`` and verify the allow path succeeds while a
     denied destination is blocked.
 
-    The shape matches ``test_m4_policy.py::test_level1_transport_tcp``
+    The shape matches ``test_policy.py::test_level1_transport_tcp``
     plus a deny probe — kept narrow because the full M4 matrix is
     parametrised separately; this test is the lite-specific smoke gate.
     The gateway is wired into the container backend so
@@ -445,7 +445,7 @@ def test_lite_gateway_parity(lite_harness, sandbox_cli):
         # per-rule Envoy filter chain (prefix_ranges = resolved IPs)
         # and the sandbox_policy nftables concat-set entry. Mirrors
         # the warmup pattern used by every L1+ policy test in
-        # test_m4_policy.py — without it, the first request races the
+        # test_policy.py — without it, the first request races the
         # 2-second poll and fails closed at the empty-cache state.
         lite_harness.ssh(sid, "nslookup", "example.com", timeout=120)
         time.sleep(5)
@@ -658,7 +658,7 @@ def test_lite_orphan_cleanup_on_daemon_restart(
     and assert both Docker artifacts are gone.
 
     Restart mechanics mirror
-    ``test_m3_networking::test_daemon_restart_recovery``: SIGKILL the
+    ``test_networking::test_daemon_restart_recovery``: SIGKILL the
     process, append to the existing log files so the session-scoped
     fixture can adopt the restarted daemon, and hand the new ``Popen``
     back via ``sandbox_daemon["process"]`` so subsequent tests (and
@@ -740,7 +740,7 @@ def test_lite_orphan_cleanup_on_daemon_restart(
 
         # 3. Restart the daemon with the same socket and base-dir.
         #    Append to the existing log files (mirrors
-        #    test_m3_networking::test_daemon_restart_recovery) so the
+        #    test_networking::test_daemon_restart_recovery) so the
         #    fixture can adopt the restarted process without leaving a
         #    dangling pipe behind.
         stdout_log = sandbox_daemon["_stdout_log"]
@@ -832,7 +832,7 @@ def test_lite_orphan_cleanup_on_daemon_restart(
         # gone), and the harness tolerates that branch — see
         # `LiteBackendHarness.rm`.
 
-        # Recovery path mirrors test_m3_networking::test_daemon_restart_recovery:
+        # Recovery path mirrors test_networking::test_daemon_restart_recovery:
         # ensure the session-scoped fixture ends the test with a live
         # daemon process. If our restart never made it that far (e.g. an
         # assertion fired between SIGKILL and the handoff), spin up a

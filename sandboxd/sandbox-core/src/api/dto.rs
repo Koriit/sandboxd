@@ -168,7 +168,7 @@ pub struct SessionRootlessDocker {
 /// container's IP on `sandbox-net-<id>` in the same field. Operators
 /// (and tests) read `session_ip` regardless of backend, which is the
 /// whole point of surfacing this — todo #72 was filed because
-/// `test_m3_networking` hard-coded the Lima `10.209.x.x/28` shape
+/// `test_networking` hard-coded the Lima `10.209.x.x/28` shape
 /// and skipped the container parameterization in-body.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionNetworkInfo {

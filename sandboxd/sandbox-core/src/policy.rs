@@ -4460,7 +4460,7 @@ mod tests {
         // parse one record per line into a `TrafficEvent` of
         // `layer=envoy, event=connection_allowed|connection_denied`.
         // If we drop the access_log here or change the field map,
-        // the E2E assertion in `tests/e2e/test_m4_policy.py` goes
+        // the E2E assertion in `tests/e2e/test_policy.py` goes
         // mute rather than failing, so pin the key shape at the unit
         // level.
         //

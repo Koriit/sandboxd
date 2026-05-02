@@ -6,7 +6,7 @@ Run with generous timeouts:
 
     cd tests/e2e
     source .venv/bin/activate
-    python -m pytest test_m6_hardening.py -v --timeout=600
+    python -m pytest test_hardening.py -v --timeout=600
 
 Backend coverage: **Lima only**. The lite container backend has no QEMU
 process, no ``--hardened`` flag (the spec rejects it on lite —

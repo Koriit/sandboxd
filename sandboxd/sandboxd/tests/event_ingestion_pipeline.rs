@@ -1,5 +1,4 @@
 //! End-to-end integration test for the event-ingestion pipeline.
-//! (Filename preserved for external references.)
 //!
 //! Pins the three contracts the pipeline must uphold:
 //!
@@ -26,9 +25,9 @@
 //! tempdir stand-in for the per-session bind mount; it does *not* spin
 //! up a gateway container, Lima VM, or sandboxd::AppState.  That
 //! intentionally matches Phase 8's "test-only" scope — the full-stack
-//! coverage over real containers lives in `tests/e2e/test_m4_policy.py`
-//! and `test_m10_*.py` and is invoked by the exit-gate checklist, not
-//! this file.
+//! coverage over real containers lives in `tests/e2e/test_policy.py`,
+//! `test_discovery.py`, and `test_presets.py`, and is invoked by the
+//! exit-gate checklist, not this file.
 
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};

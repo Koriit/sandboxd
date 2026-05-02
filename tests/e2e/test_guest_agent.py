@@ -5,7 +5,7 @@ Run with generous timeouts:
 
     cd tests/e2e
     source .venv/bin/activate
-    python -m pytest test_m2_guest_agent.py -v --timeout=600
+    python -m pytest test_guest_agent.py -v --timeout=600
 
 Backend coverage: **agnostic** — parametrized over ``[lima, container]``
 via the ``backend`` fixture from ``conftest.py``. The exec / ssh / ps

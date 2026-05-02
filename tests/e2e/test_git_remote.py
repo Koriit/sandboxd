@@ -11,7 +11,7 @@ Run with generous timeouts:
 
     cd tests/e2e
     source .venv/bin/activate
-    python -m pytest test_m5_git_remote.py -v --timeout=600
+    python -m pytest test_git_remote.py -v --timeout=600
 
 Backend coverage: **agnostic** — parametrized over ``[lima, container]``
 via the ``backend`` fixture. ``sandbox ssh`` (the transport the remote

@@ -36,7 +36,7 @@ seconds.
 
     cd tests/e2e
     source .venv/bin/activate
-    python -m pytest test_m10_s5_presets.py -v --timeout=600
+    python -m pytest test_presets.py -v --timeout=600
 
 Backend coverage: **agnostic** — parametrized over ``[lima, container]``
 via the ``backend`` fixture. Preset expansion is host-side; policy
@@ -152,8 +152,8 @@ def _warm_dns(sandbox_cli, session_name: str, hosts: list[str]) -> None:
     """Pre-resolve ``hosts`` inside the VM so the gateway's DNS-driven
     propagation loop materialises the per-rule Envoy filter chain and
     the nftables concat-set entry (ip, port) for each preset-allowed
-    host. Mirrors the pattern used in ``test_m4_policy`` /
-    ``test_m10_s4_discovery``: without the warmup, the first curl can
+    host. Mirrors the pattern used in ``test_policy`` /
+    ``test_discovery``: without the warmup, the first curl can
     race the 2-second poll and lose.
     """
     for host in hosts:

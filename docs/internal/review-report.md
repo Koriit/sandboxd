@@ -96,8 +96,8 @@ Comprehensive 6-track audit with cargo-llvm-cov code coverage analysis.
 2. **8 new unit tests added** — 6 for YAML path sanitization in lima.rs, 2 for symlink traversal protection in guest agent.
 
 ### E2E test quality (6 fixes)
-1. **Created `test_m6_hardening.py`** — 3 new E2E tests for QEMU hardening verification (device lockdown, cgroup limits, `--no-hardening` flag).
-2. **Strengthened 4 "example" substring assertions** in test_m4_policy.py — now check for `"Example Domain"` instead of `"example"`.
+1. **Created `test_hardening.py`** — 3 new E2E tests for QEMU hardening verification (device lockdown, cgroup limits, `--no-hardening` flag).
+2. **Strengthened 4 "example" substring assertions** in test_policy.py — now check for `"Example Domain"` instead of `"example"`.
 3. **Strengthened TLS certificate verification** — now checks for Organization field in issuer, not just string presence.
 
 ### Security (2 fixes)

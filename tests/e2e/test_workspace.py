@@ -7,7 +7,7 @@ Run with generous timeouts:
 
     cd tests/e2e
     source .venv/bin/activate
-    python -m pytest test_m5_workspace.py -v --timeout=600
+    python -m pytest test_workspace.py -v --timeout=600
 
 Backend coverage: **agnostic** — parametrized over ``[lima, container]``
 via the ``backend`` fixture. ``--repo``, ``sandbox cp``, and

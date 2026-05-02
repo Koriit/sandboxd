@@ -21,7 +21,7 @@ This test covers spec § 6 "E2E test" end-to-end:
    fails — this is the invariant that would have regressed silently
    before this session.
 
-Pattern follows ``test_m3_networking.py::test_daemon_restart_recovery``
+Pattern follows ``test_networking.py::test_daemon_restart_recovery``
 for the restart mechanics (reuses the same stdout/stderr log files so the
 fixture can adopt the restarted process). Uses SIGTERM (not SIGKILL) per
 spec § 6 step 4: "Stop the daemon process (SIGTERM; await exit) and
@@ -31,7 +31,7 @@ These tests boot real Lima/QEMU VMs and are SLOW. Run with:
 
     cd tests/e2e
     source .venv/bin/activate
-    python -m pytest test_m9_policy_persistence.py -v --timeout=600
+    python -m pytest test_policy_persistence.py -v --timeout=600
 
 Backend coverage: **agnostic** — parametrized over ``[lima, container]``
 via the ``backend`` fixture. The persistence path lives in
@@ -231,7 +231,7 @@ def test_policy_survives_daemon_restart(
         #    will wrongly observe the denied destination as reachable.
         #
         #    Append to the existing log files (same pattern as
-        #    test_m3_networking::test_daemon_restart_recovery) so the
+        #    test_networking::test_daemon_restart_recovery) so the
         #    session-scoped fixture can adopt the restarted process
         #    without ending up with a dangling pipe.
         stdout_log = sandbox_daemon["_stdout_log"]
@@ -322,7 +322,7 @@ def test_policy_survives_daemon_restart(
         if policy_path is not None:
             cleanup_policy_file(policy_path)
 
-        # Recovery path mirrors test_m3_networking::test_daemon_restart_recovery:
+        # Recovery path mirrors test_networking::test_daemon_restart_recovery:
         # the session-scoped sandbox_daemon fixture MUST end the test with
         # a live daemon process, otherwise every subsequent test in the
         # module will cascade-fail.

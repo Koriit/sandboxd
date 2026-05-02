@@ -1,10 +1,6 @@
 //! End-to-end integration tests for the deny-logger + nftables DNAT
 //! restructure work.
 //!
-//! File name preserved as `m10_s3_end_to_end` for external references
-//! (commits, PRs, issues citing the test path); content is otherwise
-//! milestone-tag-free.
-//!
 //! Pins four contracts:
 //!
 //!   1. `tcp_connect_to_non_allowlisted_destination_emits_deny_event` —
@@ -539,7 +535,7 @@ async fn integration_tcp_connect_to_non_allowlisted_destination_emits_deny_event
     // from server". Empirically against the current gateway image the
     // SYN is dropped silently, so curl exits with code 28 and stderr
     // "connection timed out". This assertion matches the e2e practice
-    // in `tests/e2e/test_m4_policy.py` (accepts timeout / refused /
+    // in `tests/e2e/test_policy.py` (accepts timeout / refused /
     // no route as valid deny signatures). The *load-bearing*
     // deny-logger contract is the `deny` event with correct 5-tuple
     // on the EventBus (asserted below) — the stderr signature is

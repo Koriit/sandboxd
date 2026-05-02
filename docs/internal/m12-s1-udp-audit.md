@@ -84,7 +84,7 @@ egress (`gateway.rs:1488-1493`). Forward chain
 `sandboxd/sandbox-core/src/gateway.rs:1565`) requires
 `ip daddr {gateway_ip}` so any non-DNATted UDP is rejected at FORWARD
 (`gateway.rs:1580`). This is the safety net referenced at
-`tests/e2e/test_m3_networking.py:401-444`.
+`tests/e2e/test_networking.py:401-444`.
 
 The two `policy_allow_udp` concat-set declarations live in *both*
 `sandbox_dnat` and `sandbox_policy` because nftables 1.0.6 (pinned in the
@@ -264,7 +264,7 @@ contents are post-DNAT, not pre-DNAT.
 
 ### 2.2 The Phase 8 test that documents the workaround
 
-`sandboxd/sandboxd/tests/m10_s3_end_to_end.rs:609-732`. The relevant
+`sandboxd/sandboxd/tests/gateway_deny_pipeline.rs:609-732`. The relevant
 asserted tuple is at lines `711-715` and `724-729`:
 
 ```
@@ -303,7 +303,7 @@ The verbatim explanatory comment, lines `670-694`:
 > destination. The 5-tuple's pre-DNAT accuracy is tracked upstream
 > as a deny-logger UDP follow-up.
 
-There is also a guard comment at `m10_s3_end_to_end.rs:696-699`:
+There is also a guard comment at `gateway_deny_pipeline.rs:696-699`:
 
 > NOTE: if this assertion ever fails with orig_dst = 203.0.113.1:9999,
 > the UDP pre-DNAT conntrack fix (deferred todo #29) has landed —
@@ -385,7 +385,7 @@ conntrack lookup keyed on `(src_ip:src_port, gateway_ip:10002, UDP)`.
 Document the netlink crate choice and the failure-mode policy in the
 listener docstring at `udp.rs:1-13`.
 
-**a2. Phase 8 test 2 rewrite.** `sandboxd/sandboxd/tests/m10_s3_end_to_end.rs:610-735`.
+**a2. Phase 8 test 2 rewrite.** `sandboxd/sandboxd/tests/gateway_deny_pipeline.rs:610-735`.
 After (a1) lands, rewrite the assertion (lines 711-715, 724-729) to
 expect the pre-DNAT tuple `203.0.113.1:9999` and remove the
 explanatory comment block at lines 670-699. This is M12-S1's named
@@ -445,19 +445,19 @@ conntrack-netlink lookup (UDP)". S2 reconciliation.
 true for UDP after M12-S1 lands. Until then, the sentence overclaims
 for UDP. S2 reconciliation.
 
-**b5. `tests/e2e/test_m4_policy.py:321` (`test_level1_transport_udp`)
+**b5. `tests/e2e/test_policy.py:321` (`test_level1_transport_udp`)
 does not test deny path.** The only e2e UDP test today is an
 allow-path DNS lookup via `nslookup example.com 8.8.8.8`. There is
 no e2e assertion that a denied UDP datagram emits a deny event with
 correct attribution. M12-S2 e2e parity scope.
 
-**b6. `tests/e2e/test_m3_networking.py:440-444` explicitly skips
+**b6. `tests/e2e/test_networking.py:440-444` explicitly skips
 behavioural UDP blocking assertion.** Quoted comment: "we do NOT
 behaviorally test UDP blocking here. UDP is connectionless …". With
 M12-S1's correct attribution, an event-bus assertion (rather than a
 behavioural ICMP-reject assertion) becomes feasible. M12-S2 scope.
 
-**b7. `tests/e2e/test_m10_s4_discovery.py:17-20` workaround.** Comment:
+**b7. `tests/e2e/test_discovery.py:17-20` workaround.** Comment:
 "UDP would be a cleaner match for the deny-logger's bare-IP path,
 but todo #29 tracks a post-DNAT destination bug on UDP that makes UDP
 assertions flaky. Do NOT flip this to UDP." After M12-S1, this guard
@@ -675,18 +675,18 @@ shapes.
   conntrack-DNAT involvement; it does **not** exercise the broken
   path. **M12-S1 must add a load-style integration test that
   exercises the DNATted path** (this is the named M12-S1 deliverable).
-- `sandboxd/sandboxd/tests/m10_s3_end_to_end.rs:609 (also at :610) —
+- `sandboxd/sandboxd/tests/gateway_deny_pipeline.rs:609 (also at :610) —
   integration_udp_send_to_non_allowlisted_destination_emits_deny_event` —
   the integration test that knowingly asserts the wrong tuple (see
   §2.2). This is the test that gets rewritten in M12-S1.
-- `tests/e2e/test_m4_policy.py:321 — test_level1_transport_udp` —
+- `tests/e2e/test_policy.py:321 — test_level1_transport_udp` —
   e2e UDP allow-path via DNS. **Does not exercise the deny path.**
   M12-S2 will add deny-path coverage.
-- `tests/e2e/test_m3_networking.py:330 — test_denied_traffic` —
+- `tests/e2e/test_networking.py:330 — test_denied_traffic` —
   asserts the catch-all UDP DNAT rule exists structurally
   (`meta l4proto 17 dnat`), but explicitly skips behavioural UDP
   blocking (line 440-444). M12-S2 may upgrade to behavioural.
-- `tests/e2e/test_m10_s4_discovery.py:222 —
+- `tests/e2e/test_discovery.py:222 —
   test_discovery_workflow_surfaces_denials_then_policy_update_closes_them` —
   TCP-only on purpose, with the explanatory comment at lines 17-20
   citing #29.
@@ -704,7 +704,7 @@ shapes.
 - **Wire-shape coverage: complete.** Five tests pin the JSONL line,
   DTO, envelope, and ingest parser for UDP.
 - **Deny-attribution coverage: broken.** The single integration test
-  that exercises the DNATted UDP path (`m10_s3_end_to_end.rs:610`)
+  that exercises the DNATted UDP path (`gateway_deny_pipeline.rs:610`)
   asserts the wrong tuple by design. The unit test in `udp.rs` doesn't
   involve DNAT. M12-S1 needs at least one new integration test that
   proves the conntrack-lookup path produces the right pre-DNAT tuple
@@ -727,11 +727,11 @@ fan-out.
 - `sandboxd/sandbox-deny-logger/src/main.rs` — possibly small (logging
   field for "conntrack lookup failed" counter, depending on a3
   decision).
-- `sandboxd/sandboxd/tests/m10_s3_end_to_end.rs` — rewrite Phase 8
+- `sandboxd/sandboxd/tests/gateway_deny_pipeline.rs` — rewrite Phase 8
   test 2 (lines 595-735), drop the explanatory comment (670-699 +
   696-699 guard).
 - One new integration test (likely a new file under
-  `sandboxd/sandboxd/tests/` or appended to `m10_s3_end_to_end.rs`)
+  `sandboxd/sandboxd/tests/` or appended to `gateway_deny_pipeline.rs`)
   exercising the conntrack-lookup path under load / multiple flows.
 - `sandboxd/Cargo.lock` — auto-generated bump for the new dep.
 
@@ -743,5 +743,5 @@ Files **not** touched in M12-S1 (deferred to M12-S2 or later):
 - `docs/concepts/networking.md`, `docs/guides/network-policies.md`,
   `docs/concepts/policy-model.md`, `docs/guides/troubleshooting.md`,
   `networking-design.md` — all S2 reconciliation.
-- `tests/e2e/test_m4_policy.py`, `test_m3_networking.py`,
-  `test_m10_s4_discovery.py` — S2 e2e parity.
+- `tests/e2e/test_policy.py`, `test_networking.py`,
+  `test_discovery.py` — S2 e2e parity.

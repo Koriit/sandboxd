@@ -15,7 +15,7 @@
 //!
 //! ## Why a separate module
 //!
-//! Before this module existed, `m10_s3_end_to_end.rs::
+//! Before this module existed, `gateway_deny_pipeline.rs::
 //! integration_killing_deny_logger_emits_health_degraded_then_restored`
 //! re-implemented ~150 lines of monitor-loop transition-detection inline
 //! to assert against an accelerated 500ms cadence. Two parallel

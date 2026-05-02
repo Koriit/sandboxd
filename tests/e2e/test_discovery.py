@@ -42,7 +42,7 @@ Runs with generous timeouts; a single iteration boots a VM so budget
 
     cd tests/e2e
     source .venv/bin/activate
-    python -m pytest test_m10_s4_discovery.py -v --timeout=600
+    python -m pytest test_discovery.py -v --timeout=600
 
 Backend coverage: **agnostic** — parametrized over ``[lima, container]``
 via the ``backend`` fixture. The deny-logger / events ring / Envoy
@@ -389,7 +389,7 @@ def test_discovery_workflow_surfaces_denials_then_policy_update_closes_them(
         #     v2 L1 transport is fail-closed at empty cache — without this
         #     warmup the curl --resolve workload would race against the
         #     2-second DNS-driven propagation loop and lose. See
-        #     test_m4_policy.test_level1_transport_tcp for the same pattern.
+        #     test_policy.test_level1_transport_tcp for the same pattern.
         #
         #     Note: these nslookup calls themselves may produce dns.query_denied
         #     events if the policy update is still propagating. That's why

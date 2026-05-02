@@ -8,7 +8,7 @@ Run with generous timeouts:
 
     cd tests/e2e
     source .venv/bin/activate
-    python -m pytest test_m3_networking.py -v --timeout=600
+    python -m pytest test_networking.py -v --timeout=600
 
 Backend coverage: every test in this file is parametrized over
 ``[lima, container]`` via the ``backend`` fixture. The gateway

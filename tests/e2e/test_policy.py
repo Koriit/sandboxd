@@ -7,7 +7,7 @@ and are SLOW (3-10 minutes per test).  Run with generous timeouts:
 
     cd tests/e2e
     source .venv/bin/activate
-    python -m pytest test_m4_policy.py -v --timeout=600
+    python -m pytest test_policy.py -v --timeout=600
 
 Backend coverage: **agnostic** — every test in this file is parametrized
 over ``[lima, container]`` via the ``backend`` fixture. Policy
@@ -434,7 +434,7 @@ def _read_session_events(
 
     Returns the parsed JSONL entries; blank or unparseable lines are
     skipped so a truncated tail does not invalidate the assertion.
-    Mirrors the helper at ``test_m10_s5_presets._read_events`` — kept
+    Mirrors the helper at ``test_presets._read_events`` — kept
     inline rather than promoted to ``conftest.py`` so the UDP test
     block stays self-contained for future readers.
     """
