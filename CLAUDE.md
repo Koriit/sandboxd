@@ -1,22 +1,34 @@
 # Sandbox Daemon (sandboxd)
 
-Sandbox daemon providing isolated Linux VMs (Lima/QEMU) for coding agents.
+Sandbox daemon providing isolated Linux environments for coding agents — Lima/QEMU VMs (full backend) and rootless Docker containers (lite-mode backend), with a shared per-session network gateway that enforces egress policy.
 
 ## Project structure
 
-- `sandboxd/` — Rust workspace (4 crates: sandbox-core, sandbox-cli, sandboxd, sandbox-guest)
-- `networking/` — Gateway container (Envoy, mitmproxy, CoreDNS)
+- `sandboxd/` — Rust workspace, 8 crates:
+  - `sandbox-core` — shared library (backends, store, policy, events, guest protocol)
+  - `sandboxd` — daemon binary (HTTP API over unix socket)
+  - `sandbox-cli` — `sandbox` CLI binary (also installed as `git-remote-sandbox`)
+  - `sandbox-guest` — guest-agent binary that runs inside each VM/container
+  - `sandbox-route-helper` — privileged setcap binary that installs the default route inside a container netns on behalf of an authorized caller
+  - `sandbox-event-emitter` — shared lib used by both nft-loggers (JSONL writer + record types)
+  - `sandbox-nft-deny-logger` — gateway-container binary that emits `deny` records (TCP DNAT + UDP NFLOG)
+  - `sandbox-nft-allow-logger` — gateway-container binary that audits allowed UDP flows via NFCT
+- `networking/` — Gateway container (five-process pipeline: Envoy, mitmproxy, CoreDNS, nft-deny-logger, nft-allow-logger) plus the in-tree CoreDNS plugin
 - `tests/e2e/` — Python E2E test suite (pytest)
 - `docs/` — Project documentation
 
 ## Build and test
 
 ```bash
-make build                  # cargo build --workspace
+make build                  # cargo build --workspace (preceded by fmt-check)
 make test                   # hermetic unit tests only — fast, no Docker/Lima/nft
-make test-integration       # test + every #[ignore]d integration test (Docker required)
-make test-e2e               # full E2E suite (boots real VMs, ~30-45 min)
-make gateway-image          # docker build for gateway container
+make test-integration       # every `integration_*`-prefixed test in the workspace (Docker required)
+make test-e2e-container     # PR-time E2E: container backend only (~5-10 min)
+make test-e2e-matrix        # full E2E matrix: Lima + container (~30-45 min, needs /dev/kvm for the Lima half)
+make test-e2e               # back-compat alias for test-e2e-matrix
+make gateway-image          # docker build for the gateway container
+make lite-image             # docker build for the lite-mode container image
+make setup-dev-env          # one-shot per-host install/configure (route-helper cap'd install, qemu bridge.conf, users.conf, qemu-bridge-helper setuid)
 ```
 
 ### Integration-test convention
@@ -71,7 +83,7 @@ Test runner: cargo-nextest (config at `sandboxd/.config/nextest.toml`).
 ## Key conventions
 
 - All `std::process::Command` calls in async handlers are wrapped in `tokio::task::spawn_blocking`
-- Guest agent communication (TCP-over-SSH) is already async — do not wrap in spawn_blocking
+- Guest agent communication is already async — do not wrap in spawn_blocking. Transport is a per-backend `socat`-bridged pipe (`limactl shell <vm> -- socat - TCP:127.0.0.1:5123` for Lima, `docker exec <ctr> socat - TCP:127.0.0.1:5123` for container) selected via the `SessionRuntime::guest_transport` seam in `sandbox-core::backend`
 - Error responses use `error_response()` helper that maps `SandboxError` variants to HTTP status codes
 - Handler return type is `impl IntoResponse` — use `match` on spawn_blocking results, not `?` operator
 - Socket path default: `$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock` (falls back to `~/.local/share/sandboxd/sandboxd.sock`). Both the daemon and CLI honor the `SANDBOX_SOCKET` env var as an override; an explicit `--socket` flag takes precedence over the env var.
@@ -81,8 +93,8 @@ Test runner: cargo-nextest (config at `sandboxd/.config/nextest.toml`).
 
 ## On-disk compatibility
 
-Session state persists across daemon restarts in `{base_dir}/sessions.db` (SQLite). Schema evolution rules:
+Session state persists across daemon restarts in `{base_dir}/sessions.db` (SQLite). `SessionStore::new` (in `sandbox-core/src/store.rs`) opens the DB and runs every pending migration via `refinery` against `sandbox-core/migrations/`. Schema evolution rules:
 
-- **SQLite columns** (`sessions`, `network_info`, etc.) — adding or changing a column requires an explicit migration step in `SessionStore::open`. Never drop a column without verifying no older daemon needs it.
+- **SQLite columns** (`sessions`, `network_info`, etc.) — adding or changing a column requires a new `V<NNN>__<name>.sql` file in `sandbox-core/migrations/`. Never drop a column without verifying no older daemon needs it; refinery enforces forward-only application of the migration set.
 - **JSON blob fields** (columns like `config_json`, `network_info` JSON payloads) — when adding a field to a persisted struct (`SessionConfig`, `NetworkInfo`, etc.), make it `Option<T>` with `#[serde(default)]` so records written by older versions still deserialize. Never remove or rename a persisted blob field without a migration.
 - **Forward-compat on rollback** — records written by a newer daemon may be read by an older one during rollback. Use `#[serde(default)]` + unknown-field tolerance to keep this safe.
