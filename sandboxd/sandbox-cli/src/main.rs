@@ -3288,13 +3288,17 @@ enum TransferDirection {
 ///
 /// **Backend shapes.**
 ///
-/// - **Lima** — `limactl cp -r <src> <dst>` where the remote side has
-///   the form `sandbox-<id>:<path>`. `limactl cp` is a thin wrapper
-///   around `scp`; passing `-r` unconditionally is harmless for
-///   regular files (scp ignores it for non-directories) and lets a
-///   single CLI invocation handle directories without a separate
-///   flag at the user-facing surface — matching `docker cp`'s
-///   default-recursive semantics on the container backend.
+/// - **Lima** — `limactl cp [-r] <src> <dst>` where the remote side
+///   has the form `sandbox-<id>:<path>`. In Lima 2.x `limactl cp` is
+///   implemented on top of `rsync` (older Lima versions wrapped
+///   `scp`). Unlike `scp`, rsync does **not** treat `-r` as a no-op
+///   when the source is a regular file: it tries to `chdir` into the
+///   source path, hits ENOTDIR, and aborts with rsync exit code 23.
+///   So `-r` is conditional on the caller-supplied `source_is_dir`
+///   flag — the caller must `stat` the source before invoking the
+///   planner. `docker cp` (the container backend) recurses by
+///   default and needs no analogous flag, which is why this
+///   conditional only lives on the Lima branch.
 /// - **Container** — `docker cp <src> <dst>` where the remote side
 ///   has the form `sandbox-<id>:<path>`. `docker cp` already
 ///   recurses into directories by default, no `-r` analogue is
@@ -3316,6 +3320,7 @@ fn plan_cp_command(
     direction: TransferDirection,
     host_path: &str,
     remote_path: &str,
+    source_is_dir: bool,
 ) -> (&'static str, Vec<String>) {
     let target_name = format!("sandbox-{session_id}");
     let remote_arg = format!("{target_name}:{remote_path}");
@@ -3326,11 +3331,18 @@ fn plan_cp_command(
 
     match backend {
         sandbox_core::backend::BackendKind::Lima => {
-            // `limactl cp` mirrors `scp`. Always pass `-r` so directory
-            // copies work transparently from the user's point of view;
-            // for plain files `-r` is a no-op (scp recursion only
-            // engages on directories).
-            let args = vec!["cp".to_string(), "-r".to_string(), src_arg, dst_arg];
+            // `limactl cp` in Lima 2.x is rsync-backed (not scp). rsync
+            // refuses to `chdir` into a non-directory source when `-r`
+            // is set, so we only pass `-r` when the caller has
+            // verified the source is a directory. The caller is
+            // responsible for stat'ing the source — we cannot stat
+            // here in a pure planner without losing testability.
+            let mut args = vec!["cp".to_string()];
+            if source_is_dir {
+                args.push("-r".to_string());
+            }
+            args.push(src_arg);
+            args.push(dst_arg);
             ("limactl", args)
         }
         sandbox_core::backend::BackendKind::Container => {
@@ -3338,7 +3350,9 @@ fn plan_cp_command(
             // and has no `-r` flag. The argument shape matches Lima's
             // exactly, only the program changes — keeping the user's
             // mental model "remote side carries `session:path`" intact
-            // across both backends.
+            // across both backends. `source_is_dir` is unused on this
+            // branch by design.
+            let _ = source_is_dir;
             let args = vec!["cp".to_string(), src_arg, dst_arg];
             ("docker", args)
         }
@@ -3425,12 +3439,32 @@ async fn handle_cp(socket_path: &str, src: &str, dst: &str) {
         }
     };
 
+    // Stat the host-side source so the planner can decide whether to
+    // pass `-r` to `limactl cp` (Lima 2.x's rsync-backed copy aborts
+    // with ENOTDIR when `-r` is set against a regular file). On
+    // Download the source lives on the VM side; remote-stat'ing from
+    // the host would require a daemon round-trip we deliberately
+    // avoid here, so we always pass `source_is_dir: false` for
+    // downloads — `limactl cp` (no `-r`) handles file-to-file and
+    // file-to-dir destinations fine, and an operator wanting a
+    // directory download invokes the explicit `sandbox cp -r` shape
+    // (the `-r` switch is currently unconditional on Lima but is
+    // about to become conditional; users wanting directory download
+    // can opt in via `sandbox sync` instead).
+    let source_is_dir = match direction {
+        TransferDirection::Upload => std::fs::metadata(host_path)
+            .map(|m| m.is_dir())
+            .unwrap_or(false),
+        TransferDirection::Download => false,
+    };
+
     let (program, args) = plan_cp_command(
         session_resp.backend,
         &session_resp.id,
         direction,
         host_path,
         remote_path,
+        source_is_dir,
     );
 
     // Inherit stdin/stdout/stderr so the native tool's progress and
@@ -3515,6 +3549,25 @@ async fn handle_cp(socket_path: &str, src: &str, dst: &str) {
 /// not pre-flight check for rsync: a probe round-trip would slow the
 /// happy path, and the native error already names the missing
 /// dependency.
+///
+/// **Trailing-slash auto-append on directory uploads.** rsync's
+/// long-standing convention is that a source path *with* a trailing
+/// slash means "copy the contents of this directory into the
+/// destination", while a path *without* one means "copy this
+/// directory itself into the destination" (which produces
+/// `<dst>/<basename(src)>/...`). Most users — and the E2E tests —
+/// expect contents-mirroring when they write `sandbox sync ./src
+/// remote:./dst`, so when the caller signals via `source_is_dir` that
+/// the local source is a directory and the path does not already end
+/// with `/`, the planner appends one before constructing `src_arg`
+/// for the upload case. We do **not** mutate the path on download —
+/// the source there lives on the VM side and the host has no easy
+/// way to remote-stat without a round-trip; users who want
+/// contents-mirroring on download supply the trailing slash
+/// explicitly. The decision to stat lives at the call site (in
+/// `handle_sync`) so the planner stays a pure function — testable
+/// without the filesystem and parametrizable from tests with both
+/// `true` and `false` source_is_dir.
 fn plan_sync_command(
     backend: sandbox_core::backend::BackendKind,
     session_id: &sandbox_core::SessionId,
@@ -3522,12 +3575,27 @@ fn plan_sync_command(
     host_path: &str,
     remote_path: &str,
     extra_args: &[String],
+    source_is_dir: bool,
 ) -> (&'static str, Vec<String>) {
     let target_name = format!("sandbox-{session_id}");
     let remote_arg = format!("{target_name}:{remote_path}");
+
+    // Auto-append a trailing slash on the host-side source path when
+    // (a) the caller has stat'd it and confirmed it's a directory and
+    // (b) the path doesn't already end in `/`. Only applied on
+    // Upload — see the docstring for the asymmetry rationale.
+    let host_arg = if matches!(direction, TransferDirection::Upload)
+        && source_is_dir
+        && !host_path.ends_with('/')
+    {
+        format!("{host_path}/")
+    } else {
+        host_path.to_string()
+    };
+
     let (src_arg, dst_arg) = match direction {
-        TransferDirection::Upload => (host_path.to_string(), remote_arg),
-        TransferDirection::Download => (remote_arg, host_path.to_string()),
+        TransferDirection::Upload => (host_arg, remote_arg),
+        TransferDirection::Download => (remote_arg, host_arg),
     };
 
     let rsh = match backend {
@@ -3624,6 +3692,22 @@ async fn handle_sync(socket_path: &str, src: &str, dst: &str, rsync_args: &[Stri
         }
     };
 
+    // Stat the host-side source so the planner can auto-append a
+    // trailing slash on directory uploads (rsync's "copy contents,
+    // not the directory itself" idiom). On Download the source lives
+    // on the VM side; we deliberately do not remote-stat — users who
+    // want contents-mirroring on download write the trailing slash
+    // explicitly in the remote path. Pass `source_is_dir: false` for
+    // every download; the planner short-circuits the trailing-slash
+    // logic when it's not an upload anyway, but keeping the call
+    // site explicit documents the intent.
+    let source_is_dir = match direction {
+        TransferDirection::Upload => std::fs::metadata(host_path)
+            .map(|m| m.is_dir())
+            .unwrap_or(false),
+        TransferDirection::Download => false,
+    };
+
     let (program, args) = plan_sync_command(
         session_resp.backend,
         &session_resp.id,
@@ -3631,6 +3715,7 @@ async fn handle_sync(socket_path: &str, src: &str, dst: &str, rsync_args: &[Stri
         host_path,
         remote_path,
         rsync_args,
+        source_is_dir,
     );
 
     // Inherit stdin/stdout/stderr so rsync's progress and error
@@ -7107,46 +7192,103 @@ mod tests {
     }
 
     #[test]
-    fn plan_cp_lima_upload_emits_limactl_cp_with_recurse_flag() {
+    fn plan_cp_lima_upload_directory_emits_limactl_cp_with_recurse_flag() {
         let sid = cp_session_id();
         let (program, args) = plan_cp_command(
             sandbox_core::backend::BackendKind::Lima,
             &sid,
             TransferDirection::Upload,
-            "./local/file.txt",
-            "/home/agent/workspace/file.txt",
+            "./local/dist",
+            "/home/agent/workspace/dist",
+            true,
         );
         assert_eq!(program, "limactl");
-        // `-r` is unconditional on Lima — it makes directory copies
-        // work transparently and is a no-op on plain files.
+        // `-r` is conditional on Lima — passed only when the caller
+        // has stat'd the source and confirmed it's a directory. Lima
+        // 2.x's rsync-backed `limactl cp` aborts with ENOTDIR on a
+        // file-source + `-r` combination, so the planner must not
+        // emit `-r` unconditionally.
         assert_eq!(
             args,
             vec![
                 "cp".to_string(),
                 "-r".to_string(),
-                "./local/file.txt".to_string(),
+                "./local/dist".to_string(),
+                "sandbox-0123456789ab:/home/agent/workspace/dist".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_cp_lima_omits_r_for_file_source() {
+        // Regression guard for the bug where `limactl cp -r <file>
+        // <remote>` aborts under Lima 2.x's internal rsync with
+        // `change_dir … failed: Not a directory (20)`. With
+        // `source_is_dir: false` the planner must emit a `cp`
+        // invocation that omits `-r` entirely.
+        let sid = cp_session_id();
+        let (program, args) = plan_cp_command(
+            sandbox_core::backend::BackendKind::Lima,
+            &sid,
+            TransferDirection::Upload,
+            "/tmp/sandbox-cp-test.txt",
+            "/home/agent/workspace/file.txt",
+            false,
+        );
+        assert_eq!(program, "limactl");
+        assert!(
+            !args.iter().any(|a| a == "-r"),
+            "lima cp on a file source must not emit `-r`; got args: {args:?}"
+        );
+        assert_eq!(
+            args,
+            vec![
+                "cp".to_string(),
+                "/tmp/sandbox-cp-test.txt".to_string(),
                 "sandbox-0123456789ab:/home/agent/workspace/file.txt".to_string(),
             ]
         );
     }
 
     #[test]
+    fn plan_cp_lima_keeps_r_for_directory_source() {
+        // Symmetric companion to the file-source omits-`-r` test: when
+        // the caller has confirmed the source is a directory, the
+        // planner must emit `-r` so `limactl cp` recurses correctly.
+        let sid = cp_session_id();
+        let (_, args) = plan_cp_command(
+            sandbox_core::backend::BackendKind::Lima,
+            &sid,
+            TransferDirection::Upload,
+            "/tmp/sandbox-cp-dir",
+            "/home/agent/workspace/dir",
+            true,
+        );
+        assert!(
+            args.iter().any(|a| a == "-r"),
+            "lima cp on a directory source must emit `-r`; got args: {args:?}"
+        );
+    }
+
+    #[test]
     fn plan_cp_lima_download_swaps_src_and_dst_args() {
         let sid = cp_session_id();
+        // Downloads always pass `source_is_dir: false` from the call
+        // site (the host cannot easily remote-stat the VM-side
+        // source), so the planner must omit `-r` on this branch.
         let (program, args) = plan_cp_command(
             sandbox_core::backend::BackendKind::Lima,
             &sid,
             TransferDirection::Download,
             "./local/output.log",
             "/home/agent/workspace/output.log",
+            false,
         );
         assert_eq!(program, "limactl");
-        // Download: remote is the source, local is the destination.
         assert_eq!(
             args,
             vec![
                 "cp".to_string(),
-                "-r".to_string(),
                 "sandbox-0123456789ab:/home/agent/workspace/output.log".to_string(),
                 "./local/output.log".to_string(),
             ]
@@ -7162,10 +7304,13 @@ mod tests {
             TransferDirection::Upload,
             "./local/file.txt",
             "/home/agent/workspace/file.txt",
+            false,
         );
         assert_eq!(program, "docker");
         // No `-r`: `docker cp` recurses into directories by default
-        // and rejects unknown flags.
+        // and rejects unknown flags. `source_is_dir` is unused on the
+        // container branch — pin that pinning the file shape stays
+        // backend-symmetric.
         assert_eq!(
             args,
             vec![
@@ -7185,6 +7330,7 @@ mod tests {
             TransferDirection::Download,
             "./local/output.log",
             "/home/agent/workspace/output.log",
+            false,
         );
         assert_eq!(program, "docker");
         assert_eq!(
@@ -7212,6 +7358,7 @@ mod tests {
             TransferDirection::Upload,
             "./dist",
             "/home/agent/workspace/dist",
+            true,
         );
         assert_eq!(lima_program, "limactl");
         assert_eq!(
@@ -7230,6 +7377,7 @@ mod tests {
             TransferDirection::Upload,
             "./dist",
             "/home/agent/workspace/dist",
+            true,
         );
         assert_eq!(docker_program, "docker");
         assert_eq!(
@@ -7255,8 +7403,14 @@ mod tests {
             sandbox_core::backend::BackendKind::Lima,
             sandbox_core::backend::BackendKind::Container,
         ] {
-            let (_, args) =
-                plan_cp_command(backend, &sid, TransferDirection::Upload, "/tmp/x", "/tmp/x");
+            let (_, args) = plan_cp_command(
+                backend,
+                &sid,
+                TransferDirection::Upload,
+                "/tmp/x",
+                "/tmp/x",
+                true,
+            );
             // Find the argument that contains the colon — that's the
             // remote-side spec.
             let remote_arg = args
@@ -7282,6 +7436,11 @@ mod tests {
     #[test]
     fn plan_sync_lima_upload_emits_rsync_with_limactl_shell_remote_shell() {
         let sid = cp_session_id();
+        // Pass `source_is_dir: false` here so the planner does not
+        // auto-append a trailing slash to "./local/dir"; this test
+        // pins the `-a --delete -e <rsh>` baseline shape, separate
+        // from the trailing-slash auto-append behaviour which has its
+        // own dedicated tests below.
         let (program, args) = plan_sync_command(
             sandbox_core::backend::BackendKind::Lima,
             &sid,
@@ -7289,6 +7448,7 @@ mod tests {
             "./local/dir",
             "/home/agent/workspace/dir",
             &[],
+            false,
         );
         assert_eq!(program, "rsync");
         // `-a --delete` is the baseline. `-e 'limactl shell'` slots
@@ -7311,6 +7471,10 @@ mod tests {
     #[test]
     fn plan_sync_lima_download_swaps_src_and_dst_args() {
         let sid = cp_session_id();
+        // Downloads always pass `source_is_dir: false` from the call
+        // site — the host has no easy way to remote-stat the VM-side
+        // source. The planner must not mutate either path on this
+        // branch.
         let (program, args) = plan_sync_command(
             sandbox_core::backend::BackendKind::Lima,
             &sid,
@@ -7318,6 +7482,7 @@ mod tests {
             "./local/dir",
             "/home/agent/workspace/dir",
             &[],
+            false,
         );
         assert_eq!(program, "rsync");
         assert_eq!(
@@ -7343,6 +7508,7 @@ mod tests {
             "./local/dir",
             "/home/agent/workspace/dir",
             &[],
+            false,
         );
         assert_eq!(program, "rsync");
         // `docker exec -i` (no `-t`): `-i` keeps stdin a binary-clean
@@ -7371,6 +7537,7 @@ mod tests {
             "./local/dir",
             "/home/agent/workspace/dir",
             &[],
+            false,
         );
         assert_eq!(program, "rsync");
         assert_eq!(
@@ -7403,6 +7570,7 @@ mod tests {
                 "/tmp/x",
                 "/tmp/x",
                 &[],
+                false,
             );
             let remote_arg = args
                 .iter()
@@ -7435,6 +7603,7 @@ mod tests {
                 "/tmp/src",
                 "/tmp/dst",
                 &[],
+                false,
             );
             assert!(
                 args.iter().any(|a| a == "-a"),
@@ -7464,6 +7633,7 @@ mod tests {
             "src/",
             "dst/",
             &["--exclude".to_string(), "*.log".to_string()],
+            true,
         );
         assert_eq!(program, "rsync");
         assert_eq!(
@@ -7500,6 +7670,7 @@ mod tests {
                 "--info=progress2".to_string(),
                 "--partial".to_string(),
             ],
+            false,
         );
         assert_eq!(program, "rsync");
         assert_eq!(
@@ -7531,6 +7702,7 @@ mod tests {
             "src/",
             "dst/",
             &[],
+            true,
         );
         // Original baseline, written out for clarity:
         let baseline = vec![
@@ -7542,6 +7714,134 @@ mod tests {
             "sandbox-0123456789ab:dst/".to_string(),
         ];
         assert_eq!(with_extras, baseline);
+    }
+
+    // -----------------------------------------------------------------------
+    // plan_sync_command — trailing-slash auto-append on directory uploads.
+    //
+    // rsync's "copy contents into dest" idiom requires a trailing
+    // slash on the source path. The planner takes a `source_is_dir`
+    // hint from the call site (which has stat'd the host path) and
+    // auto-appends `/` so users can write the natural form
+    // `sandbox sync ./src remote:./dst` and get contents-mirroring,
+    // matching what e2e tests and most operators expect. The asymmetry
+    // — only on Upload, never on Download — is pinned here so a future
+    // refactor cannot accidentally remote-stat (a daemon round-trip
+    // we deliberately avoid).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn plan_sync_command_appends_trailing_slash_when_source_is_directory_without_one() {
+        let sid = cp_session_id();
+        let (_, args) = plan_sync_command(
+            sandbox_core::backend::BackendKind::Lima,
+            &sid,
+            TransferDirection::Upload,
+            "/tmp/foo",
+            "/home/agent/dst",
+            &[],
+            true,
+        );
+        // The host-side source operand is the only argument that's
+        // neither a flag, the `-e` rsh string, nor the remote-side
+        // arg. Find it positionally — rsync's argv shape is
+        // `[OPTION...] SRC DEST`, so the second-to-last position is
+        // the source.
+        let src_arg = &args[args.len() - 2];
+        assert_eq!(
+            src_arg, "/tmp/foo/",
+            "directory upload without trailing slash must auto-trail to mirror contents; got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn plan_sync_command_keeps_existing_trailing_slash_idempotent() {
+        // If the operator already wrote the trailing slash, the
+        // planner must not double it — `/tmp/foo//` would still work
+        // for rsync but is sloppy and would surface as a confusing
+        // path in error messages.
+        let sid = cp_session_id();
+        let (_, args) = plan_sync_command(
+            sandbox_core::backend::BackendKind::Lima,
+            &sid,
+            TransferDirection::Upload,
+            "/tmp/foo/",
+            "/home/agent/dst",
+            &[],
+            true,
+        );
+        let src_arg = &args[args.len() - 2];
+        assert_eq!(
+            src_arg, "/tmp/foo/",
+            "trailing slash auto-append must be idempotent; got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn plan_sync_command_does_not_trail_slash_when_source_is_file() {
+        // File-source uploads must not get a trailing slash —
+        // `/tmp/file.txt/` would make rsync interpret the source as a
+        // (non-existent) directory and abort.
+        let sid = cp_session_id();
+        let (_, args) = plan_sync_command(
+            sandbox_core::backend::BackendKind::Lima,
+            &sid,
+            TransferDirection::Upload,
+            "/tmp/file.txt",
+            "/home/agent/file.txt",
+            &[],
+            false,
+        );
+        let src_arg = &args[args.len() - 2];
+        assert_eq!(
+            src_arg, "/tmp/file.txt",
+            "file-source upload must not gain a trailing slash; got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn plan_sync_command_does_not_trail_slash_on_download() {
+        // Downloads always pass `source_is_dir: false` from the call
+        // site (the host cannot easily remote-stat the VM-side
+        // source). Pin that the planner makes no path mutation on
+        // the Download branch even if a future caller passed
+        // `source_is_dir: true` by mistake — the trailing-slash
+        // semantics only apply on Upload, where the host path *is*
+        // the source.
+        let sid = cp_session_id();
+        let (_, args) = plan_sync_command(
+            sandbox_core::backend::BackendKind::Lima,
+            &sid,
+            TransferDirection::Download,
+            "/tmp/local-out",
+            "/home/agent/remote-src",
+            &[],
+            false,
+        );
+        // On Download the host arg is the destination — last
+        // position. Pin that it stays unchanged.
+        let dst_arg = &args[args.len() - 1];
+        assert_eq!(
+            dst_arg, "/tmp/local-out",
+            "download must not mutate the host-side path; got: {args:?}"
+        );
+
+        // Belt-and-braces: even with `source_is_dir: true`, the
+        // planner must not mutate paths on Download.
+        let (_, args_with_true) = plan_sync_command(
+            sandbox_core::backend::BackendKind::Lima,
+            &sid,
+            TransferDirection::Download,
+            "/tmp/local-out",
+            "/home/agent/remote-src",
+            &[],
+            true,
+        );
+        let dst_arg_true = &args_with_true[args_with_true.len() - 1];
+        assert_eq!(
+            dst_arg_true, "/tmp/local-out",
+            "download must never trail-slash the host path regardless of source_is_dir; got: {args_with_true:?}"
+        );
     }
 
     // -- render_rootless_block -------------------------------------------------

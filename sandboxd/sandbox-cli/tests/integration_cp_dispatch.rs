@@ -154,19 +154,33 @@ fn read_recorded_argv(record_file: &Path) -> Vec<String> {
 // Lima dispatch
 // ---------------------------------------------------------------------------
 
-/// `sandbox cp ./local <session>:/remote` against a Lima session
-/// invokes `limactl cp -r ./local sandbox-<id>:/remote` and propagates
-/// the shim's exit status.
+/// `sandbox cp ./local-file <session>:/remote-file` (file-source
+/// upload) against a Lima session invokes `limactl cp <src> <dst>` —
+/// **without** `-r`. Lima 2.x's `limactl cp` is rsync-backed: passing
+/// `-r` against a regular-file source aborts with rsync exit code 23
+/// (rsync tries to `chdir` into the source, hits ENOTDIR). The CLI
+/// stats the host-side source and only emits `-r` when it's a
+/// directory.
 #[tokio::test]
-async fn integration_cp_lima_upload_invokes_limactl_cp_with_recurse_flag() {
+async fn integration_cp_lima_upload_file_source_omits_recurse_flag() {
     let (_tmp_daemon, sock) = spawn_fake_daemon("lima").await;
     let shim_dir = tempfile::tempdir().expect("shim dir");
     let record_file = shim_dir.path().join("argv.log");
     install_shim(shim_dir.path(), "limactl", &record_file, 0, None);
 
+    // Stage a real file on disk so the CLI's `std::fs::metadata` call
+    // resolves (`is_dir() == false`), confirming the file-source code
+    // path is exercised rather than the "stat failed → fall back"
+    // path. Either path produces no `-r`, but pinning the live-stat
+    // case keeps this test honest about what it covers.
+    let src_dir = tempfile::tempdir().expect("src dir");
+    let src_file = src_dir.path().join("file.txt");
+    std::fs::write(&src_file, b"contents").expect("write src file");
+    let src_path = src_file.to_string_lossy().into_owned();
+
     let (status, _stdout, stderr) = run_sandbox_cp(
         &[
-            "./local/file.txt",
+            &src_path,
             "cp-dispatch-test:/home/agent/workspace/file.txt",
         ],
         &sock,
@@ -185,17 +199,59 @@ async fn integration_cp_lima_upload_invokes_limactl_cp_with_recurse_flag() {
         argv,
         vec![
             "cp".to_string(),
-            "-r".to_string(),
-            "./local/file.txt".to_string(),
+            src_path,
             format!("sandbox-{TEST_SESSION_ID}:/home/agent/workspace/file.txt"),
         ],
-        "recorded argv shape regressed"
+        "file-source upload must not pass -r (rsync ENOTDIR regression)"
+    );
+}
+
+/// `sandbox cp ./local-dir <session>:/remote-dir` (directory-source
+/// upload) against a Lima session invokes `limactl cp -r <src> <dst>`.
+/// `-r` is conditional on the host-side source being a directory; the
+/// planner stats it at the call site.
+#[tokio::test]
+async fn integration_cp_lima_upload_directory_source_keeps_recurse_flag() {
+    let (_tmp_daemon, sock) = spawn_fake_daemon("lima").await;
+    let shim_dir = tempfile::tempdir().expect("shim dir");
+    let record_file = shim_dir.path().join("argv.log");
+    install_shim(shim_dir.path(), "limactl", &record_file, 0, None);
+
+    let src_dir = tempfile::tempdir().expect("src dir");
+    let src_path = src_dir.path().to_string_lossy().into_owned();
+
+    let (status, _stdout, stderr) = run_sandbox_cp(
+        &[&src_path, "cp-dispatch-test:/home/agent/workspace/dir"],
+        &sock,
+        shim_dir.path(),
+    )
+    .await;
+
+    assert!(
+        status.success(),
+        "sandbox cp directory upload should succeed; status={:?}, stderr=\n{stderr}",
+        status.code()
+    );
+
+    let argv = read_recorded_argv(&record_file);
+    assert_eq!(
+        argv,
+        vec![
+            "cp".to_string(),
+            "-r".to_string(),
+            src_path,
+            format!("sandbox-{TEST_SESSION_ID}:/home/agent/workspace/dir"),
+        ],
+        "directory-source upload must pass -r"
     );
 }
 
 /// Download direction on Lima: `sandbox cp <session>:/remote ./local`
-/// invokes `limactl cp -r sandbox-<id>:/remote ./local` (src/dst
-/// swapped from upload).
+/// invokes `limactl cp <src> <dst>` (src/dst swapped from upload),
+/// **without** `-r`. Downloads always omit `-r` because the source
+/// lives on the VM side and remote-stat'ing from the host would
+/// require a daemon round-trip we deliberately avoid; users wanting a
+/// directory download invoke `sandbox sync` instead.
 #[tokio::test]
 async fn integration_cp_lima_download_swaps_src_and_dst_args() {
     let (_tmp_daemon, sock) = spawn_fake_daemon("lima").await;
@@ -224,7 +280,6 @@ async fn integration_cp_lima_download_swaps_src_and_dst_args() {
         argv,
         vec![
             "cp".to_string(),
-            "-r".to_string(),
             format!("sandbox-{TEST_SESSION_ID}:/home/agent/workspace/output.log"),
             "./local/output.log".to_string(),
         ]

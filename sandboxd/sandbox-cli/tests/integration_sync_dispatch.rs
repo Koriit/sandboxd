@@ -159,9 +159,14 @@ fn read_recorded_argv(record_file: &Path) -> Vec<String> {
 // Lima dispatch
 // ---------------------------------------------------------------------------
 
-/// `sandbox sync ./local <session>:/remote` against a Lima session
-/// invokes `rsync -a --delete -e 'limactl shell' ./local
-/// sandbox-<id>:/remote` and propagates the shim's exit status.
+/// `sandbox sync ./local-dir/ <session>:/remote-dir` (directory-source
+/// upload, with trailing slash) against a Lima session invokes
+/// `rsync -a --delete -e 'limactl shell' <src>/ sandbox-<id>:/remote`
+/// and preserves the operator-supplied trailing slash idempotently —
+/// the planner does not double it. rsync's contents-mirroring idiom
+/// requires the trailing slash, and the CLI also auto-appends one
+/// when the operator forgot it (covered by
+/// `integration_sync_lima_upload_directory_source_appends_trailing_slash`).
 #[tokio::test]
 async fn integration_sync_lima_upload_invokes_rsync_with_limactl_shell_rsh() {
     let (_tmp_daemon, sock) = spawn_fake_daemon("lima").await;
@@ -197,6 +202,57 @@ async fn integration_sync_lima_upload_invokes_rsync_with_limactl_shell_rsh() {
             format!("sandbox-{TEST_SESSION_ID}:/home/agent/workspace/dir"),
         ],
         "recorded argv shape regressed"
+    );
+}
+
+/// `sandbox sync <bare-dir-path-without-slash> <session>:/remote`
+/// auto-appends a trailing slash to the host-side source when it's a
+/// real directory, so rsync mirrors the *contents* of the source into
+/// the destination (rsync's long-standing convention) instead of
+/// landing them at `<dst>/<basename(src)>/...`. The planner stats the
+/// host-side source at the call site in `handle_sync` so the planner
+/// itself stays a pure function.
+#[tokio::test]
+async fn integration_sync_lima_upload_directory_source_appends_trailing_slash() {
+    let (_tmp_daemon, sock) = spawn_fake_daemon("lima").await;
+    let shim_dir = tempfile::tempdir().expect("shim dir");
+    let record_file = shim_dir.path().join("argv.log");
+    install_shim(shim_dir.path(), "rsync", &record_file, 0, None);
+
+    let src_dir = tempfile::tempdir().expect("src dir");
+    let src_path = src_dir.path().to_string_lossy().into_owned();
+    // Sanity: the path we hand to the CLI does *not* already end in `/`.
+    assert!(
+        !src_path.ends_with('/'),
+        "tempdir path unexpectedly ends with '/' — test would not exercise auto-append"
+    );
+
+    let (status, _stdout, stderr) = run_sandbox_sync(
+        &[&src_path, "sync-dispatch-test:/home/agent/workspace/dir"],
+        &sock,
+        shim_dir.path(),
+    )
+    .await;
+
+    assert!(
+        status.success(),
+        "sandbox sync should propagate shim exit 0; status={:?}, stderr=\n{stderr}",
+        status.code()
+    );
+
+    let expected_src = format!("{src_path}/");
+    let argv = read_recorded_argv(&record_file);
+    assert_eq!(
+        argv,
+        vec![
+            "-a".to_string(),
+            "--delete".to_string(),
+            "-e".to_string(),
+            "limactl shell".to_string(),
+            expected_src,
+            format!("sandbox-{TEST_SESSION_ID}:/home/agent/workspace/dir"),
+        ],
+        "directory-source upload must auto-append trailing slash for contents-mirror"
     );
 }
 
