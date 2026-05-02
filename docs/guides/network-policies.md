@@ -194,22 +194,17 @@ A worked example — allow NTP synchronisation against the Ubuntu time pool:
   "version": "2.0.0",
   "rules": [
     {
-      "host": "time.ubuntu.com",
-      "port": 123,
-      "protocol": "udp",
-      "level": "transport",
-      "reason": "NTP time sync"
-    },
-    {
       "host": "ntp.ubuntu.com",
       "port": 123,
       "protocol": "udp",
       "level": "transport",
-      "reason": "NTP time sync (secondary pool)"
+      "reason": "NTP time sync"
     }
   ]
 }
 ```
+
+`ntp.ubuntu.com` resolves to a round-robin pool of A records, which is what `systemd-timesyncd` / `chrony` use on a stock Ubuntu install — one rule covers the whole pool.
 
 After applying the rule, the VM's NTP client reaches the upstream pool through nftables MASQUERADE; the nft-allow-logger emits one allow event per resolved upstream IP the client opens a flow to. Allow events flow on the `deny-logger` layer with `event: "allow"` (the layer name reflects the legacy single-process design; both nft-loggers share that layer). If you want to confirm a specific exchange went through, tail the unified events stream with `sandbox events <session> --event allow --follow` and watch for matching 5-tuples.
 
@@ -346,7 +341,7 @@ OS / distro presets:
 
 | Preset | Purpose |
 |---|---|
-| `ubuntu:` | Default-allow rules an Ubuntu sandbox needs to function. Two NTP rules (UDP/123 to `ntp.ubuntu.com` and `time.ubuntu.com`) so `systemd-timesyncd` / `chrony` can sync the clock, plus two apt-mirror rules (HTTPS/443 to `archive.ubuntu.com` and `security.ubuntu.com`) so a stock 22.04+ `/etc/apt/sources.list` can run `apt update` and `apt install`. |
+| `ubuntu:` | Default-allow rules an Ubuntu sandbox needs to function. One NTP rule (UDP/123 to `ntp.ubuntu.com`, the canonical vendor pool — Canonical removed `time.ubuntu.com` from authoritative DNS) so `systemd-timesyncd` / `chrony` can sync the clock, plus two apt-mirror rules (HTTPS/443 to `archive.ubuntu.com` and `security.ubuntu.com`) so a stock 22.04+ `/etc/apt/sources.list` can run `apt update` and `apt install`. |
 
 Use `ubuntu:` whenever you boot a session against an Ubuntu image and need the host distro's own housekeeping (clock sync + mirror reads) to keep working — for example, when an agent's first action is `apt install build-essential`. The preset is intentionally minimal: it does not allow snap (`api.snapcraft.io`), livepatch (`livepatch.canonical.com`), or changelog fetches (`changelogs.ubuntu.com`); add explicit rules for those if your workload needs them. The preset is unparameterized like `npm:` / `pypi:` — there is no `ubuntu:release=...` or `ubuntu:mirror=...` knob in v1.
 

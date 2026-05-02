@@ -1211,10 +1211,11 @@ def test_udp_allowed_ip_cidr_edge(sandbox_cli, backend):
 # ---------------------------------------------------------------------------
 #
 # The `ubuntu:` preset adds the default-allow rules an Ubuntu sandbox
-# needs to function: NTP (UDP/123 to ntp.ubuntu.com / time.ubuntu.com)
-# and apt mirrors (HTTPS/443 to archive.ubuntu.com /
-# security.ubuntu.com). It is the first distro-level preset on top
-# of the ten-preset baseline. See
+# needs to function: NTP (UDP/123 to ntp.ubuntu.com — the canonical
+# vendor pool; Canonical removed time.ubuntu.com from authoritative
+# DNS so we no longer ship a rule for it) and apt mirrors (HTTPS/443
+# to archive.ubuntu.com / security.ubuntu.com). It is the first
+# distro-level preset on top of the ten-preset baseline. See
 # `sandboxd/sandbox-cli/src/presets/builtin.rs::expand_ubuntu` for the
 # authoritative rule set and `docs/guides/network-policies.md` for
 # the user-facing description.
@@ -1282,7 +1283,6 @@ def test_ubuntu_preset_smoke(sandbox_cli, backend):
         # ``test_udp_allow_ntp`` and the preset tests.
         for host in (
             "ntp.ubuntu.com",
-            "time.ubuntu.com",
             "archive.ubuntu.com",
             "security.ubuntu.com",
         ):
@@ -1317,13 +1317,13 @@ def test_ubuntu_preset_smoke(sandbox_cli, backend):
             f"{capture_lima_logs(session_id)}"
         )
 
-        # NTP half — send one UDP/123 packet to time.ubuntu.com and
+        # NTP half — send one UDP/123 packet to ntp.ubuntu.com and
         # assert an allow event lands on the bus. We resolve the host
         # in the VM (matches the IP that gets placed in
         # `policy_allow_udp` by the daemon's propagation loop) and
         # then send a single packet, mirroring `test_udp_allow_ntp`.
         nslookup = sandbox_cli(
-            "ssh", session_name, "--", "nslookup", "time.ubuntu.com",
+            "ssh", session_name, "--", "nslookup", "ntp.ubuntu.com",
             timeout=120,
         )
         assert nslookup.returncode == 0
@@ -1342,7 +1342,7 @@ def test_ubuntu_preset_smoke(sandbox_cli, backend):
                 if m:
                     vm_resolved.append(m.group(1))
         assert vm_resolved, (
-            f"VM-side nslookup for time.ubuntu.com returned no A records.\n"
+            f"VM-side nslookup for ntp.ubuntu.com returned no A records.\n"
             f"stdout: {nslookup.stdout}"
         )
         target_ip = vm_resolved[0]
@@ -2691,23 +2691,29 @@ def test_policy_clear_reverts_to_deny_all(sandbox_cli, backend):
 
 @pytest.mark.timeout(600)
 def test_svcb_record_without_ech_reaches_vm(sandbox_cli, backend):
-    """An SVCB record whose answer carries no ECH SvcParam must reach
-    the VM intact — the M12-S3 strip-not-deny semantics rewrite removes
-    only the `ech` SvcParam value, never the record itself.
+    """An SVCB-family record (RFC 9460 — SVCB type 64 *or* HTTPS type
+    65) whose answer carries no ECH SvcParam must reach the VM intact —
+    the strip-not-deny semantics removes only the `ech` SvcParam value,
+    never the record itself.
 
-    Pre-M12-S3 the CoreDNS plugin blanket-denied every SVCB / HTTPS
-    query (legacy `TestHandler_SVCBQuery_Blocked` posture). The current
-    behaviour returns the original RR with `ech` stripped if present,
-    or unchanged if absent. This test pins the absent-ECH path
-    end-to-end through the gateway: a real SVCB query for an
-    allowed name should resolve and return at least one SVCB answer to
-    the VM, not NOERROR-with-zero-answers and not NXDOMAIN.
+    The CoreDNS plugin blanket-denied every SVCB / HTTPS query in an
+    earlier posture (legacy `TestHandler_SVCBQuery_Blocked`). The
+    current behaviour returns the original RR with `ech` stripped if
+    present, or unchanged if absent. This test pins the absent-ECH
+    path end-to-end through the gateway: a real query for an allowed
+    name should resolve and return at least one answer to the VM,
+    not NOERROR-with-zero-answers and not NXDOMAIN.
 
-    Cloudflare's `cloudflare.com` advertises an SVCB record at root
-    that omits ECH (only `alpn` + `ipv4hint`); we use it as the test
-    target. Lima/container DNS is intercepted and forwarded through
-    CoreDNS, so this exercises the real strip path against a real
-    answer rather than synthetic test fixtures.
+    We query `cloudflare.com` for type HTTPS (TYPE65). Cloudflare
+    publishes an HTTPS record at the apex (`alpn=h3,h2` +
+    `ipv4hint=...`, no ECH) but no plain SVCB record there — the two
+    types share an on-the-wire format and the strip path
+    (`stripECHFromRR`) treats them identically (`case *dns.SVCB`,
+    `case *dns.HTTPS`), so HTTPS is the type that exercises the
+    code path against a *real* upstream answer. Lima/container DNS is
+    intercepted and forwarded through CoreDNS, so this exercises the
+    real strip path against a real answer rather than synthetic test
+    fixtures.
     """
     session_id = None
     policy_path = None
@@ -2750,22 +2756,22 @@ def test_svcb_record_without_ech_reaches_vm(sandbox_cli, backend):
         )
         time.sleep(2)
 
-        # Issue the SVCB query (TYPE64) via dig. We deliberately use a
-        # raw type number to avoid relying on dig's `+svcb` shorthand
+        # Issue the HTTPS query (TYPE65) via dig. We deliberately use a
+        # raw type number to avoid relying on dig's `+https` shorthand
         # being present in every base image. The expected answer for
         # cloudflare.com today carries no `ech` SvcParam — this is the
-        # specific shape M12-S3 changed from "blocked" to
+        # specific shape the strip path turns from "blocked" into
         # "stripped-or-passthrough".
         svcb_result = sandbox_cli(
             "ssh", "pol-svcb-noech", "--",
-            "dig", "+short", "cloudflare.com", "TYPE64",
+            "dig", "+short", "cloudflare.com", "TYPE65",
             timeout=120,
         )
         assert svcb_result.returncode == 0, (
-            f"dig TYPE64 cloudflare.com failed inside VM.\n"
+            f"dig TYPE65 cloudflare.com failed inside VM.\n"
             f"stdout: {svcb_result.stdout}\nstderr: {svcb_result.stderr}"
         )
-        # `dig +short` of an SVCB record renders the RDATA on a single
+        # `dig +short` of an HTTPS record renders the RDATA on a single
         # line per RR (priority + target + key=value pairs). The VM
         # must see at least one such line — anything else means the
         # record was suppressed somewhere in the chain.
@@ -2773,8 +2779,8 @@ def test_svcb_record_without_ech_reaches_vm(sandbox_cli, backend):
             line for line in svcb_result.stdout.splitlines() if line.strip()
         ]
         assert non_empty_lines, (
-            f"SVCB record for cloudflare.com was not delivered to the VM.\n"
-            f"This regresses M12-S3 strip-not-deny: the absent-ECH path "
+            f"HTTPS record for cloudflare.com was not delivered to the VM.\n"
+            f"This regresses strip-not-deny: the absent-ECH path "
             f"should pass the record through unchanged.\n"
             f"dig stdout: {svcb_result.stdout!r}\n"
             f"dig stderr: {svcb_result.stderr!r}"
@@ -2785,8 +2791,8 @@ def test_svcb_record_without_ech_reaches_vm(sandbox_cli, backend):
         # still remove it before the answer reaches the VM.
         joined = " ".join(non_empty_lines).lower()
         assert "ech=" not in joined, (
-            f"SVCB record reached the VM with an `ech=` SvcParam intact.\n"
-            f"M12-S3 requires the strip path to remove it before delivery.\n"
+            f"HTTPS record reached the VM with an `ech=` SvcParam intact.\n"
+            f"The strip path must remove it before delivery.\n"
             f"dig stdout: {svcb_result.stdout!r}"
         )
 

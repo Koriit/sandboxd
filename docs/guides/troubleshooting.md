@@ -222,7 +222,7 @@ sandbox events <session> --layer=deny-logger --decision=deny --follow
 Walk the checklist:
 
 1. **Does any rule cover the destination?** A UDP rule must declare `protocol: "udp"` explicitly; a TCP rule does not implicitly cover UDP. Confirm with `sandbox describe <session>`. If the destination isn't named, add a `transport`-level UDP rule (see [the UDP destinations section](/guides/network-policies/#udp-destinations)) and `sandbox policy update`.
-2. **Did DNS propagate the IP into `policy_allow_udp`?** For domain-based UDP rules (e.g. `time.ubuntu.com:123`), the rule's IPs land in nft only after CoreDNS resolves them and sandboxd injects them. A bare-IP UDP rule (CIDR literal) is in the set immediately. Check the live state:
+2. **Did DNS propagate the IP into `policy_allow_udp`?** For domain-based UDP rules (e.g. `ntp.ubuntu.com:123`), the rule's IPs land in nft only after CoreDNS resolves them and sandboxd injects them. A bare-IP UDP rule (CIDR literal) is in the set immediately. Check the live state:
    ```bash
    docker exec sandbox-gw-<session_id> nft list set inet sandbox_dnat policy_allow_udp
    ```

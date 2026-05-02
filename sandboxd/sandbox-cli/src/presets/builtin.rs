@@ -678,10 +678,17 @@ fn is_positive_integer(s: &str) -> bool {
 // parameterized variant (`ubuntu:release=24.04` / `ubuntu:mirror=...`)
 // is explicitly out of scope for v1.
 
-/// NTP hosts for the `ubuntu` preset. UDP/123. The two canonical
-/// vendor hosts published in `/etc/systemd/timesyncd.conf.d/` on a
-/// fresh Ubuntu install.
-const UBUNTU_NTP_HOSTS: &[&str] = &["ntp.ubuntu.com", "time.ubuntu.com"];
+/// NTP hosts for the `ubuntu` preset. UDP/123. `ntp.ubuntu.com` is
+/// the canonical vendor host; `time.ubuntu.com` was historically the
+/// secondary entry but Canonical removed it from authoritative DNS
+/// (the apex of `ubuntu.com.` returns SOA-only for the name as of
+/// 2026-05), so we no longer ship a rule for it — a preset rule
+/// pointing at an unresolvable host produces nothing useful and
+/// surprises users who tracerule `apt`/`timesyncd` failures back to
+/// "the preset said this was allowed". `systemd-timesyncd` /
+/// `chrony` resolve `ntp.ubuntu.com` to multiple A records (round-
+/// robin pool), which is sufficient on its own.
+const UBUNTU_NTP_HOSTS: &[&str] = &["ntp.ubuntu.com"];
 
 /// apt mirror hosts for the `ubuntu` preset. HTTPS/443. The two
 /// canonical hosts referenced from a stock 22.04+ sources.list:
@@ -1045,13 +1052,13 @@ mod tests {
     fn expand_ubuntu_matches_spec() {
         let rules = expand_builtin("ubuntu", "ubuntu:");
 
-        // Two NTP rules + two apt rules, in source-order. The preset
+        // One NTP rule + two apt rules, in source-order. The preset
         // emits in a fixed sequence (UBUNTU_NTP_HOSTS then
         // UBUNTU_APT_HOSTS) so the test pins the order.
         assert_eq!(
             rules.len(),
-            4,
-            "ubuntu must emit four host rules (2 NTP + 2 apt mirrors); got {} rules: {rules:?}",
+            3,
+            "ubuntu must emit three host rules (1 NTP + 2 apt mirrors); got {} rules: {rules:?}",
             rules.len()
         );
 
@@ -1065,18 +1072,8 @@ mod tests {
         assert_eq!(ntp_a.protocol, Protocol::Udp);
         assert_eq!(ntp_a.level, AssuranceLevel::Transport);
 
-        // Rule 1: NTP — time.ubuntu.com:123/udp transport.
-        let ntp_b = &rules[1];
-        match &ntp_b.host {
-            Destination::Domain(d) => assert_eq!(d, "time.ubuntu.com"),
-            other => panic!("expected Domain(time.ubuntu.com), got {other:?}"),
-        }
-        assert_eq!(ntp_b.port, 123);
-        assert_eq!(ntp_b.protocol, Protocol::Udp);
-        assert_eq!(ntp_b.level, AssuranceLevel::Transport);
-
-        // Rule 2: apt — archive.ubuntu.com:443/tcp tls.
-        let apt_a = &rules[2];
+        // Rule 1: apt — archive.ubuntu.com:443/tcp tls.
+        let apt_a = &rules[1];
         match &apt_a.host {
             Destination::Domain(d) => assert_eq!(d, "archive.ubuntu.com"),
             other => panic!("expected Domain(archive.ubuntu.com), got {other:?}"),
@@ -1085,8 +1082,8 @@ mod tests {
         assert_eq!(apt_a.protocol, Protocol::Tcp);
         assert_eq!(apt_a.level, AssuranceLevel::Tls);
 
-        // Rule 3: apt — security.ubuntu.com:443/tcp tls.
-        let apt_b = &rules[3];
+        // Rule 2: apt — security.ubuntu.com:443/tcp tls.
+        let apt_b = &rules[2];
         match &apt_b.host {
             Destination::Domain(d) => assert_eq!(d, "security.ubuntu.com"),
             other => panic!("expected Domain(security.ubuntu.com), got {other:?}"),
