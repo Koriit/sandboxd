@@ -1,9 +1,9 @@
 ---
 title: Workspaces
-description: How sandboxd delivers source code into a session — the four provisioning modes and their isolation trade-offs.
+description: How sandboxd delivers source code into a session — the five provisioning modes and their isolation trade-offs.
 ---
 
-A workspace is whatever source code and project files a session can see. sandboxd offers four ways to get those files into — and out of — a VM, and the choice has real isolation consequences. This page explains the model. For hands-on commands, see the [workspaces guide](/guides/workspaces/).
+A workspace is whatever source code and project files a session can see. sandboxd offers five ways to get those files into — and out of — a VM, and the choice has real isolation consequences. This page explains the model. For hands-on commands, see the [workspaces guide](/guides/workspaces/).
 
 ## Why multiple modes
 
@@ -13,15 +13,16 @@ A coding agent needs a place to read source, write changes, and hand results bac
 - **Latency** wants changes to appear immediately on both sides, without a copy step.
 - **Bandwidth** wants to move only what changed, not a full re-sync each time.
 
-No single mechanism wins on all three. sandboxd exposes four modes so you can pick the trade-off that fits the workload.
+No single mechanism wins on all three. sandboxd exposes five modes so you can pick the trade-off that fits the workload.
 
-## The four modes
+## The five modes
 
 | Mode | Direction | Latency | Isolation |
 |---|---|---|---|
 | **Clone** | One-shot pull from a remote git host | Minutes (network-bound) | Full |
 | **Shared mount** | Bidirectional, live | Instant | Reduced — host directory exposed |
 | **`sandbox cp`** | Bidirectional, per-transfer | Per-transfer | Full |
+| **`sandbox sync`** | Bidirectional, rsync-driven directory sync | Per-operation, delta-only | Full |
 | **Git remote transport** | Bidirectional, via `git push`/`git pull` | Per-operation | Full |
 
 ### Clone mode
@@ -38,7 +39,11 @@ Shared mount trades isolation for developer ergonomics. The guest has read-write
 
 ### `sandbox cp`
 
-An explicit, scp-style copy between the host and a running VM. Each invocation transfers a point-in-time snapshot through the guest agent — no persistent mount, no network exposure. Good for moving config files, build artifacts, or logs across the boundary without giving up isolation.
+An explicit, scp-style copy between the host and a running session. The CLI dispatches to the backend's native copy tool — `limactl cp` for Lima sessions, `docker cp` for container sessions — so each invocation is a point-in-time transfer with no persistent mount and no network exposure. Good for moving config files, build artifacts, or logs across the boundary without giving up isolation. Notably, the daemon HTTP API is *not* in the path: the host running `sandbox cp` needs the same backend binary the daemon would use to manage the session.
+
+### `sandbox sync`
+
+A directory-level delta sync built on `rsync`, using the backend's session tool as the remote-shell transport (`rsync -e "limactl shell"` for Lima, `rsync -e "docker exec -i"` for container). Unlike `sandbox cp`, it transfers only what changed between the source and destination trees and supports recursive directory copy with attribute preservation, includes/excludes, and dry-run via the trailing `-- <rsync-args>` slot. Use it when iterating on a host-side tree that needs to land inside a running session repeatedly without the cost of a full re-copy. The session must be running on both ends — the rsync remote-shell needs a live process to hand off to.
 
 ### Git remote transport
 
@@ -60,17 +65,19 @@ flowchart LR
     HostFS -- "9p mount<br/>(bidirectional, live)" --- WS
     Host -- "sandbox cp<br/>(snapshot)" --> WS
     WS -- "sandbox cp<br/>(snapshot)" --> Host
+    Host -- "sandbox sync<br/>(rsync delta)" --- WS
     Host -- "git push/pull<br/>over sandbox::" --- WS
 ```
 
-All four modes land data in the same place: `/home/agent/workspace/` inside the VM. What differs is the channel and whether updates continue to flow after session creation.
+All five modes land data in the same place: `/home/agent/workspace/` inside the VM. What differs is the channel and whether updates continue to flow after session creation.
 
 ## Isolation trade-offs
 
 Only shared mount reduces the VM's isolation from the host; the other three modes preserve full isolation.
 
 - **Clone** pulls bytes through the gateway at creation time, then closes the loop. The only lasting exposure is whatever the policy allows for network.
-- **`sandbox cp`** transfers through the guest agent — the daemon reads or writes the host file and hands the bytes across the already-authenticated host-to-guest channel.
+- **`sandbox cp`** dispatches to `limactl cp` / `docker cp` — both operate over the backend's already-authenticated control channel; no extra network exposure is opened on the host or in the gateway path.
+- **`sandbox sync`** runs `rsync` with the backend's session tool as the remote-shell, so the bytes ride that same control channel. No SSH/rsync daemon is exposed to the network.
 - **Git remote transport** works the same way: the daemon already has a socket into the VM, so git's pack protocol rides it without opening anything new.
 - **Shared mount** is different. QEMU's 9p filesystem exposes a directory live. The guest can write anything, at any time, to anything under that directory. A VM escape paired with 9p access expands the blast radius to those host files. See [hardening](/guides/hardening/#9p-shared-mounts) for the detailed security-model notes.
 
@@ -83,9 +90,10 @@ Regardless of mode, you can run an arbitrary command inside the VM after provisi
 - **Automating a job with a known start and end?** Clone — deterministic and throwaway.
 - **Interactively editing on the host with an IDE, building in the VM?** Shared mount — live bidirectional visibility is worth the isolation cost while you iterate.
 - **Need to shuttle a one-off file across?** `sandbox cp` — no setup, full isolation.
+- **Repeatedly syncing a directory tree, want delta-only transfer?** `sandbox sync` — rsync over the backend's control channel.
 - **Commit-push-test-pull loop?** Git remote transport — the coding-agent native flow.
 
-You can combine modes: clone at creation, then use `sandbox cp` for artifacts, or bootstrap with git remote transport and use `sandbox cp` for logs. The modes are not exclusive — only `--repo` and `--workspace shared:` are mutually exclusive at session-creation time, because they both want to own the initial state of `/home/agent/workspace/`.
+You can combine modes: clone at creation, then use `sandbox cp` or `sandbox sync` for artifacts, or bootstrap with git remote transport and use `sandbox cp` for logs. The modes are not exclusive — only `--repo` and `--workspace shared:` are mutually exclusive at session-creation time, because they both want to own the initial state of `/home/agent/workspace/`.
 
 ## Next steps
 

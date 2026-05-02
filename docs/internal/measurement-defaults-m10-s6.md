@@ -11,8 +11,8 @@ measurement defaults, M10-S6 is the session where these are pinned.
 |---|---|---|---|
 | `events.ring_buffer_size` | 10 000 | `sandboxd/sandbox-core/src/events/bus.rs` (`DEFAULT_RING_BUFFER_SIZE`) | Covers ~10 min of sustained ~15 events/s traffic. Memory cost bounded at ~10 MB/session (1 KB/event upper bound). |
 | `events.persist_retention_days` | 14 | `sandboxd/sandboxd/src/main.rs` (`Args::events_persist_retention_days`) | Two sprint cycles of post-incident review; ~170 MB/session on-disk at the modeled event rate. |
-| deny-logger `rate_cap` (per session) | 1 000 events/s | `sandboxd/sandbox-deny-logger/src/main.rs` (`Args::rate_cap`) | Spec Part 3 / "Hardening rules" § 5 suggested value. Breach path produces summary events, not drops. |
-| deny-logger `conn_cap` (per session TCP) | 256 | `sandboxd/sandbox-deny-logger/src/main.rs` (`Args::conn_cap`) | Spec Part 3 / "Hardening rules" § 6 suggested value. Each concurrent deny costs ~4 KB of socket state; cap fits inside a 10 MB container budget. |
+| nft-deny-logger `rate_cap` (per session) | 1 000 events/s | `sandboxd/sandbox-nft-deny-logger/src/main.rs` (`Args::rate_cap`) | Spec Part 3 / "Hardening rules" § 5 suggested value. Breach path produces summary events, not drops. |
+| nft-deny-logger `conn_cap` (per session TCP) | 256 | `sandboxd/sandbox-nft-deny-logger/src/main.rs` (`Args::conn_cap`) | Spec Part 3 / "Hardening rules" § 6 suggested value. Each concurrent deny costs ~4 KB of socket state; cap fits inside a 10 MB container budget. |
 
 ## Methodology
 
@@ -35,12 +35,13 @@ that:
   reasonable on-disk overhead for the typical development host.
 - **`rate_cap = 1 000 events/s per session`** is the spec's
   suggested ceiling and matches what the pipeline can flush without
-  back-pressuring deny-logger's UDP listener. Breaches produce
-  periodic summary events, not drops.
+  back-pressuring nft-deny-logger's NFLOG / TCP-listener inputs.
+  Breaches produce periodic summary events, not drops.
 - **`conn_cap = 256 per-session TCP`** matches the spec suggestion
-  and is calibrated for deny-logger's non-`recv`ing RST-close
-  pattern (each concurrent deny costs ~4 KB of socket state; 256
-  fits well inside a 10 MB container memory budget).
+  and is calibrated for nft-deny-logger's non-`recv`ing RST-close
+  pattern on the TCP-deny path (each concurrent deny costs ~4 KB of
+  socket state; 256 fits well inside a 10 MB container memory
+  budget).
 
 When a real-world measurement pass is run, the `rate_cap` and
 `conn_cap` are the two most likely to shift (rate depends on

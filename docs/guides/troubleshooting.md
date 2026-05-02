@@ -15,18 +15,19 @@ Before diving into component-specific symptoms below, check the unified event st
 # Live deny-only stream, auto-tabular in a TTY:
 sandbox events <session> --decision=deny --follow
 
-# Only the deny-logger (i.e. packets that matched no allow rule at all):
+# Only the nft-loggers (deny-logger plus allow-logger — both report under
+# the `deny-logger` layer; allow events carry `event: "allow"`):
 sandbox events <session> --layer=deny-logger --follow
 
-# Only the allow-logger (per-flow audit for allowed UDP).
-sandbox events <session> --layer=allow-logger --follow
+# Just the per-flow UDP allow audit (allow-logger writes here):
+sandbox events <session> --event=allow --follow
 ```
 
 How to read the result:
 
 - **`layer: dns`, decision `deny`** — CoreDNS refused the name (`NXDOMAIN`). The domain is not covered by the policy, or the wildcard does not match the apex. See [DNS resolution issues](#dns-resolution-issues).
-- **`layer: deny-logger`** — a packet reached the firewall but matched no `policy_allow_{tcp,udp}` entry. Either the destination is truly unauthorized, or DNS hadn't propagated for it yet. See [L3 destination fails on first request](#l3-destination-fails-on-first-request-after-policy-change) for the race and [Non-HTTP traffic to a level `http` destination](#non-http-traffic-to-a-level-http-destination) for non-TCP-over-port-443 misses. For UDP-specific deny diagnosis (silent drop, no ICMP unreachable), see [UDP traffic](#udp-traffic).
-- **`layer: allow-logger`** — a UDP flow was admitted (per-flow audit, not per-packet). Useful for confirming an allowed UDP exchange actually started; see [How do I read the allow event](#how-do-i-read-the-allow-event) and [the 30 s NFCT-rollover behaviour](#i-see-the-same-allow-event-twice-for-one-apparent-session). TCP allow-flow audit is provided by Envoy's access log instead.
+- **`layer: deny-logger`, `event: "deny"`** — a packet reached the firewall but matched no `policy_allow_{tcp,udp}` entry. Either the destination is truly unauthorized, or DNS hadn't propagated for it yet. See [L3 destination fails on first request](#l3-destination-fails-on-first-request-after-policy-change) for the race and [Non-HTTP traffic to a level `http` destination](#non-http-traffic-to-a-level-http-destination) for non-TCP-over-port-443 misses. For UDP-specific deny diagnosis (silent drop, no ICMP unreachable), see [UDP traffic](#udp-traffic).
+- **`layer: deny-logger`, `event: "allow"`** — a UDP flow was admitted (per-flow audit, not per-packet). The nft-allow-logger emits these by subscribing to the kernel's conntrack `NFCT_T_NEW` event stream; events ride the same `deny-logger` layer envelope as the deny path. Useful for confirming an allowed UDP exchange actually started; see [How do I read the allow event](#how-do-i-read-the-allow-event) and [the 30 s NFCT-rollover behaviour](#i-see-the-same-allow-event-twice-for-one-apparent-session). TCP allow-flow audit is provided by Envoy's access log instead.
 - **`layer: envoy`, decision `deny`** — Envoy's listener / chain match rejected the connection (wrong SNI for a `tls` rule, no filter chain for the `(ip, port)` pair, etc.).
 - **`layer: mitmproxy`, decision `deny`** — the request reached mitmproxy but no `http_filters` entry matched. The event's `reason` names the specific check that failed (host, port, method/path). Mitmproxy strips the query string from the path before matching, so a filter like `GET /api/v1/**` matches regardless of whatever the caller appended after `?`.
 
@@ -210,8 +211,9 @@ UDP behaves differently from TCP in the gateway: there is no userland proxy on t
 Check the unified event stream first — the answer is almost always there:
 
 ```bash
-# UDP allow events for the session, live.
-sandbox events <session> --layer=allow-logger --follow
+# UDP allow events for the session, live (allow-logger flows under
+# the `deny-logger` layer; filter by event name).
+sandbox events <session> --event=allow --follow
 
 # UDP (and TCP) deny events for the session.
 sandbox events <session> --layer=deny-logger --decision=deny --follow
@@ -234,7 +236,7 @@ If a rule covers the destination, the IP is in `policy_allow_udp`, and there is 
 
 - `timestamp` — ISO 8601, when the logger observed the `NFCT_T_NEW` event (within milliseconds of the kernel creating the conntrack entry).
 - `event` — always `"allow"`.
-- `layer` — emitter tag (`"allow-logger"` for `sandbox-nft-allow-logger`).
+- `layer` — emitter tag. Allow-logger records ride the `deny-logger` layer envelope (the layer name reflects the legacy single-process design; both nft-loggers share that layer). Filter by `--event=allow` to isolate them.
 - `protocol` — always `udp` for this file (the logger filters NFCT events for UDP at parse time).
 - `src_ip`, `src_port` — the VM-side endpoint, original-direction tuple source.
 - `orig_dst_ip`, `orig_dst_port` — the upstream destination the VM dialed (no DNAT on the UDP allow path, so this is the literal destination address).
@@ -242,8 +244,8 @@ If a rule covers the destination, the IP is in `policy_allow_udp`, and there is 
 You normally read these via the unified event stream rather than the file directly:
 
 ```bash
-# Live stream of allow events (allow-logger only).
-sandbox events <session> --layer=allow-logger --follow
+# Live stream of allow events only.
+sandbox events <session> --event=allow --follow
 
 # All events for the session, including allow + deny + DNS + Envoy + mitmproxy.
 sandbox events <session> --follow

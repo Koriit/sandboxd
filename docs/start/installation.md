@@ -245,7 +245,7 @@ make gateway-image
 # Equivalent to: docker build -t sandbox-gateway -f networking/gateway/Dockerfile networking/
 ```
 
-The gateway image bundles Envoy, mitmproxy, CoreDNS, and the policy plugin into a single container.
+The gateway image bundles Envoy, mitmproxy, CoreDNS (with the policy plugin), sandbox-nft-deny-logger, and sandbox-nft-allow-logger into a single container.
 
 ### Privilege model
 

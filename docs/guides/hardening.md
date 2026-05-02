@@ -98,7 +98,7 @@ The `sandbox-route-helper` binary's authorization model rests on the integrity o
 Network hardening cannot be turned off per session. For the full model see [networking](/concepts/networking/). The security-relevant guarantees:
 
 - **Per-session bridge.** Each session lives on its own `/28` Docker bridge. Sessions cannot reach each other.
-- **Deny-all baseline.** nftables rules in the gateway drop every forwarded packet by default. DNAT rules that route traffic through the proxy pipeline are installed only after all three gateway components pass readiness.
+- **Deny-all baseline.** nftables rules in the gateway drop every forwarded packet by default. DNAT rules that route traffic through the proxy pipeline are installed only after the gateway's policy-enforcing components (CoreDNS, Envoy, mitmproxy) and audit loggers (sandbox-nft-deny-logger, sandbox-nft-allow-logger) pass readiness.
 - **Gateway-mediated egress.** The VM's single data NIC routes through the gateway. There is no alternate path to the internet.
 - **Metadata endpoint blocked.** `169.254.169.254` is dropped at nftables. IAM tokens and cloud instance metadata are unreachable.
 - **IPv4 only.** IPv6 is dropped at nftables to prevent dual-stack bypass:

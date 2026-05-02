@@ -53,20 +53,26 @@ Request body (all fields optional):
   "disk_gb": 20,
   "template": "/path/to/lima.yaml",
   "policy": { "version": "2.0.0", "rules": [] },
+  "source_presets": ["npm:", "github-repo:repo=foo/bar"],
   "repo": "https://github.com/example/app.git",
   "boot_cmd": "make setup",
   "workspace": "shared:/home/you/project",
   "hardened": true,
-  "no_cache": false
+  "no_cache": false,
+  "backend": "lima",
+  "force_rootless_docker": false
 }
 ```
 
 Semantics:
 
 - `workspace` takes precedence over `repo` if both are set. Only `shared:<absolute-path>` is currently accepted.
-- `policy`, when present, is applied immediately after the session boots.
+- `policy`, when present, is applied immediately after the session boots. The matching `source_presets` array (the original CLI `--preset` invocation strings, in order) is stored as an audit trail on the `policy_applied` lifecycle event; the daemon does not re-expand presets server-side, so `policy` already carries the merged effective rules.
 - `hardened` defaults to `true` (device lockdown + cgroup limits). Set `false` for debugging.
-- `no_cache: true` skips the pre-baked base image and forces the slow create path.
+- `no_cache: true` skips the pre-baked base image and forces the slow create path. Lima only — the daemon rejects `no_cache: true` with `400 Bad Request` on the container backend, which shares its lite image across concurrent sessions; use `POST /rebuild-image` with `backend=container` for operator-driven lite-image rebuilds.
+- `cpus` accepts a fractional value (one-decimal grid; the daemon rounds at parse time so `0.81` lands as `0.8`) on the container backend. Lima sessions reject a fractional value with `400 Bad Request` — QEMU's `-smp` flag pins integer cores.
+- `backend` selects which runtime hosts the session: `"lima"` (Lima/QEMU VM) or `"container"` (Docker container — "lite" mode). Omitted means daemon-resolved default.
+- `force_rootless_docker: true` is the operator opt-in that allows session-create on a rootless Docker host. Container backend only — combining it with a Lima-resolved backend is a misuse error (`400 Bad Request`).
 
 Success: `200 OK` with a `SessionDto` body (see below).
 
@@ -249,6 +255,30 @@ No request body. Idempotent. Compiles an empty policy, pushes it to the gateway 
 
 Success: `200 OK` with `{ "status": "ok", "message": "policy cleared; session is now fail-closed" }`.
 
+### `GET /sessions/{id}/policy/propagation-status` — propagation snapshot
+
+No request body. Reports whether the most recent policy-apply has reconciled across every enforcement layer (CoreDNS, the nftables `policy_allow_{tcp,udp}` sets, and Envoy's L3 filter chains).
+
+Backs the [`sandbox policy status`](/reference/cli/#sandbox-policy-status) command and the E2E suite's `wait_for_policy` helper.
+
+Success: `200 OK` with:
+
+```json
+{
+  "expected_hash": "9f8e7d6c5b4a...",
+  "propagated_hash": "9f8e7d6c5b4a...",
+  "propagated": true,
+  "seconds_since_apply": 0.34
+}
+```
+
+- `expected_hash` is the SHA-256 hex digest of the canonical JSON form of the most recently *applied* policy.
+- `propagated_hash` is the digest of the policy that has *propagated* across all three layers (`null` until the first reconciliation completes).
+- `propagated` is `true` when the two hashes match.
+- `seconds_since_apply` is wall-clock seconds since the last policy-apply on this session.
+
+The "never applied" case (no policy on the session) returns all-`null` hashes with `propagated: false` and `seconds_since_apply: 0`. The CLI's `--wait` loop treats that as "keep polling, an apply may be mid-flight", and shorts to `propagated: true` once the first applied hash propagates.
+
 ## Base image
 
 ### `POST /rebuild-image` — rebuild the pre-baked base image
@@ -287,6 +317,43 @@ Success: `200 OK` with:
 }
 ```
 
+## Backends
+
+### `GET /backends` — backend capability matrix
+
+No request body. Returns the per-backend capability matrix the daemon advertises — the read-only counterpart to `sandbox describe -v`. Backs the CLI's `Capabilities` block.
+
+Success: `200 OK` with:
+
+```json
+{
+  "backends": [
+    {
+      "kind": "lima",
+      "available": true,
+      "capabilities": {
+        "supports_no_cache": true,
+        "supports_workspace_modes": ["shared", "clone"],
+        "fractional_cpus": false,
+        "isolation_grade": "vm"
+      }
+    },
+    {
+      "kind": "container",
+      "available": true,
+      "capabilities": {
+        "supports_no_cache": false,
+        "supports_workspace_modes": ["shared", "clone"],
+        "fractional_cpus": true,
+        "isolation_grade": "container"
+      }
+    }
+  ]
+}
+```
+
+Field names and shapes evolve with the capability schema; consult the `sandbox-core::Capabilities` source for the authoritative DTO.
+
 ## Response shapes
 
 ### `SessionDto`
@@ -310,6 +377,20 @@ Success: `200 OK` with:
   },
   "guest_agent_status": "connected",
   "gateway_status": "running",
+  "backend": "lima",
+  "network": {
+    "session_ip": "10.209.0.3",
+    "gateway_ip": "10.209.0.2",
+    "subnet_cidr": "10.209.0.0/28",
+    "bridge_name": "sb-a1b2c3d4e5f6"
+  },
+  "mounts": {
+    "workspace_in_session": "/home/agent/workspace",
+    "workspace_host_source": "/home/you/project",
+    "ca_bundle_in_session": null,
+    "home_volume": null
+  },
+  "rootless": null,
   "policy": { "version": "2.0.0", "rules": [] }
 }
 ```
@@ -321,6 +402,9 @@ Notes:
 - `guest_agent_status` / `gateway_status` are omitted when the session is not running.
 - `policy` is only populated by `GET /sessions/{id}`; the list endpoint omits it.
 - Optional fields (`name`, `repo`, `boot_cmd`, `template`) are omitted when null.
+- `backend` is `"lima"` or `"container"`. Older records that predate the container backend default to `"lima"` on read.
+- `network`, `mounts`, and `rootless` are populated by the single-session endpoint when applicable; they are omitted from list responses or when the underlying state is absent. `rootless` is populated only on container sessions where the rootless-Docker probe ran (`{detected, forced}` pair); Lima sessions omit it.
+- `warnings` (omitted when empty) carries operator-facing notices, currently the container backend's first-use lite-image build notice.
 
 ## See also
 

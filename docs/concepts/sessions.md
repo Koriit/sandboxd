@@ -14,7 +14,7 @@ When you run `sandbox create`, the daemon provisions a bundle of resources that 
 - A **QEMU/KVM VM** managed by Lima, cloned from a pre-baked base image on the fast path.
 - A **guest agent** (`sandbox-guest`) running inside the VM on TCP port 5123, reached over an SSH-tunneled connection.
 - A **Docker bridge network** allocated from a private subnet range.
-- A **per-session gateway container** running Envoy, mitmproxy, and CoreDNS that filters every outbound packet from the VM.
+- A **per-session gateway container** running five processes — Envoy, mitmproxy, CoreDNS, sandbox-nft-deny-logger, and sandbox-nft-allow-logger — that together filter and audit every outbound packet from the VM.
 - A **per-session CA certificate** generated on the host, injected into the VM's trust store, and used by mitmproxy to MITM TLS.
 - An **applied policy** (optional) that constrains which destinations the VM can reach and at which assurance level.
 

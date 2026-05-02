@@ -211,7 +211,7 @@ A worked example — allow NTP synchronisation against the Ubuntu time pool:
 }
 ```
 
-After applying the rule, the VM's NTP client reaches the upstream pool through nftables MASQUERADE; the nft-allow-logger emits one allow event per resolved upstream IP the client opens a flow to. If you want to confirm a specific exchange went through, tail the unified events stream with `sandbox events <session> --layer=allow-logger --follow` and watch for matching 5-tuples.
+After applying the rule, the VM's NTP client reaches the upstream pool through nftables MASQUERADE; the nft-allow-logger emits one allow event per resolved upstream IP the client opens a flow to. Allow events flow on the `deny-logger` layer with `event: "allow"` (the layer name reflects the legacy single-process design; both nft-loggers share that layer). If you want to confirm a specific exchange went through, tail the unified events stream with `sandbox events <session> --event allow --follow` and watch for matching 5-tuples.
 
 If you instead try to send UDP/123 to a host that is *not* in the policy, the gateway drops the datagram and emits a `event: "deny"` JSONL record naming the source and pre-DNAT destination — but `chronyc tracking` (or whatever the VM-side client is) will only see request timeouts, since there is no ICMP unreachable to attribute the failure to.
 

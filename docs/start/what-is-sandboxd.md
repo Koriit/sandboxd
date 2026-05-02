@@ -9,9 +9,9 @@ sandboxd runs coding agents inside real Linux virtual machines, one per session,
 
 Every session you create gives you:
 
-- A dedicated QEMU/KVM virtual machine managed by Lima, with its own disk and kernel.
+- A dedicated guest runtime — by default a QEMU/KVM virtual machine managed by Lima, optionally a Docker container via `--lite` / `--backend container` for fast ephemeral sessions; either way with its own filesystem and an in-guest agent.
 - A per-session Docker bridge network — no cross-session traffic path, no access to the host network.
-- A gateway container running Envoy, mitmproxy, and CoreDNS that mediates all outbound traffic.
+- A gateway container running five processes — Envoy, mitmproxy, CoreDNS, sandbox-nft-deny-logger, and sandbox-nft-allow-logger — that together mediate all outbound traffic.
 - A per-session CA that mitmproxy uses for TLS interception. The private key never leaves the gateway.
 - A deny-by-default policy. Without an allow rule, DNS returns `NXDOMAIN` and outbound connections fail.
 
@@ -19,7 +19,7 @@ You talk to the daemon with the `sandbox` CLI over a Unix socket. The CLI create
 
 ## Problems it solves
 
-**You want to run an agent against a real codebase without trusting it with your user account.** The VM gives you hardware-level isolation. The policy engine gives you a short, auditable list of domains the agent is allowed to reach.
+**You want to run an agent against a real codebase without trusting it with your user account.** The VM gives you hardware-level isolation (Lima backend); for less-sensitive workloads the lite container backend gives you the same gateway and policy contract with a smaller, faster substrate. The policy engine gives you a short, auditable list of domains the agent is allowed to reach.
 
 **You need to see what the agent actually talks to.** mitmproxy intercepts TLS with the per-session CA, so you can inspect HTTPS traffic that would otherwise be opaque. Policy rules can go as deep as matching HTTP methods and paths.
 

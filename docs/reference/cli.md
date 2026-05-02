@@ -47,8 +47,8 @@ sandbox create [OPTIONS]
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--name <name>` | (optional) | Human-readable name for the session. If omitted, the session is identified solely by its auto-generated 12-character hex session ID. |
-| `--cpus <n>` | `2` | Number of CPU cores |
-| `--memory <mb>` | `4096` | Memory in megabytes |
+| `--cpus <n>` | backend default | Number of CPU cores. Lima sessions fall back to 2 cores; container ("lite") sessions fall back to the daemon's host-80% ceiling. Accepts a fractional value (`0.8`, `1.5`, `2.0`, …); the container backend rounds to one decimal at request-parse time. Lima sessions truncate the fractional part because QEMU's `-smp` flag pins integer cores. Passing a fractional value with an explicit `--backend lima` (or a Lima resolved default) is rejected; use an integer instead. |
+| `--memory <mb>` | backend default | Memory in megabytes. Lima sessions fall back to 4096 MB; container ("lite") sessions fall back to the daemon's host-80% ceiling. |
 | `--disk <gb>` | `20` | Disk size in gigabytes |
 | `--repo <url>` | | Git repository URL to clone into `/home/agent/workspace/` |
 | `--workspace <mode>` | | Workspace mode (e.g., `shared:/path/to/dir`) |
@@ -56,8 +56,11 @@ sandbox create [OPTIONS]
 | `--policy <path>` | | Path to a policy JSON file to apply after creation |
 | `--preset <invocation>` | | Preset invocation to apply on top of `--policy`. Repeatable. See [`--preset` invocations](#preset-invocations) below and the [Presets guide](/guides/network-policies/#presets). |
 | `--template <path>` | | Path to a custom Lima YAML template |
-| `--no-hardening` | | Disable QEMU hardening (device lockdown, cgroup limits) |
-| `--no-cache` | | Skip the pre-baked base image and use the full create path |
+| `--backend <name>` | resolved | Which backend hosts the session: `lima` or `container`. When omitted, the daemon resolves from `SANDBOX_DEFAULT_BACKEND`, the per-user config (`~/.config/sandboxd/config.json`), and finally the hardcoded default `lima`. Mutually exclusive with `--lite`. |
+| `--lite` | | Sugar for `--backend container`. Mutually exclusive with `--backend`. See [Lite mode](/guides/lite-mode/). |
+| `--no-hardening` | | Disable QEMU hardening (device lockdown, cgroup limits). Lima only. |
+| `--no-cache` | | Skip the pre-baked base image and use the full create path. **Lima only** — rejected on the container backend (the lite image is shared across concurrent lite sessions, so a per-session cache-bust would force every other lite session to rebuild). Use [`sandbox rebuild-image --backend container --no-cache`](#sandbox-rebuild-image) for operator-driven lite-image rebuilds. |
+| `--force-rootless-docker` | | Operator opt-in override that allows session-create on a rootless Docker host (container backend only — combining it with a Lima-resolved backend is a misuse error). Off by default; the daemon refuses container-backend session-create on rootless Docker so accidental mode-mismatch can't slip through. The flag is per-invocation and never persisted. |
 
 Notes:
 
@@ -367,7 +370,7 @@ One of `<src>` or `<dst>` must use the `session:path` format to identify the rem
 
 ### Details
 
-- Dispatches to the backend's native copy tool: `limactl cp -r` for Lima sessions, `docker cp` for container sessions. Both recurse into directories transparently.
+- Dispatches to the backend's native copy tool: `limactl cp -r` for Lima sessions, `docker cp` for container sessions. Both recurse into directories transparently. (No daemon HTTP endpoint is involved; the host running `sandbox cp` needs the same backend binary the daemon would use.)
 - Errors (missing source, permission denied, unreachable session) come from the underlying tool verbatim.
 - Both source and destination cannot be remote.
 - For incremental directory mirroring (skip-unchanged, attribute preservation, deletion mirroring), use [`sandbox sync`](#sandbox-sync) instead — `cp` retransfers the full source on every invocation.
@@ -376,10 +379,10 @@ One of `<src>` or `<dst>` must use the `session:path` format to identify the rem
 
 ```bash
 # Upload a file to the session
-sandbox cp local/config.toml my-sandbox:/root/config.toml
+sandbox cp local/config.toml my-sandbox:/home/agent/workspace/config.toml
 
 # Download a file from the session
-sandbox cp my-sandbox:/root/output.log ./output.log
+sandbox cp my-sandbox:/home/agent/workspace/output.log ./output.log
 
 # Upload a build artifact
 sandbox cp ./dist/app.tar.gz ci-run:/home/agent/workspace/app.tar.gz
@@ -500,7 +503,7 @@ sandbox logs my-sandbox -f
 
 ## sandbox events
 
-Replay or stream the session's event stream — every per-request decision made by the gateway's DNS, Envoy, mitmproxy, and deny-logger layers, plus the session's lifecycle events. Thin client over [`GET /sessions/{id}/events`](/reference/http-api/#get-sessionsidevents--replay-or-stream-events).
+Replay or stream the session's event stream — every per-request decision made by the gateway's DNS, Envoy, mitmproxy, and nft-logger layers (deny + allow), plus the session's lifecycle events. Thin client over [`GET /sessions/{id}/events`](/reference/http-api/#get-sessionsidevents--replay-or-stream-events).
 
 ### Synopsis
 
@@ -519,8 +522,8 @@ sandbox events <session> [--follow] [--layer <name>]... [--event <name>]... [--d
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--follow`, `-f` | off | Stream live events as they arrive, until interrupted with Ctrl+C. Without it, the CLI prints the current ring-buffer contents and exits when the response body ends. |
-| `--layer <name>` | | Filter by layer. Valid values: `dns`, `envoy`, `mitmproxy`, `deny-logger`, `lifecycle`. Repeat to include multiple layers; values within the flag combine with OR. |
-| `--event <name>` | | Filter by event name (e.g. `query_denied`, `connection_allowed`, `deny`, `rate_limited`, `policy_applied`). Repeat to include multiple names. |
+| `--layer <name>` | | Filter by layer. Valid values: `dns`, `envoy`, `mitmproxy`, `deny-logger`, `lifecycle`. Repeat to include multiple layers; values within the flag combine with OR. The nft-allow-logger's `allow` events flow on the `deny-logger` layer (sibling members of the nft-logger family on the bus); use `--event=allow` to narrow. |
+| `--event <name>` | | Filter by event name (e.g. `query_denied`, `connection_allowed`, `deny`, `allow`, `rate_limited`, `policy_applied`, `policy_propagated`). Repeat to include multiple names. |
 | `--decision <allow\|deny>` | | Filter by verdict. Single-valued at the CLI: the HTTP endpoint accepts a repeatable parameter, but passing both `allow` and `deny` is equivalent to omitting the filter entirely, so the CLI takes one or neither. |
 | `--since <ts-or-duration>` | | Lower-bound cutoff for event timestamps. Accepts either an RFC 3339 timestamp (`2026-04-22T12:00:00Z`) or a shorthand duration (`30s`, `5m`, `2h`, `7d`) resolved against the CLI's wall clock. The duration shorthand is a CLI convenience — the value sent on the wire is always an RFC 3339 timestamp. |
 | `--json` | on (non-TTY) | Emit raw JSONL, one event per line. Default when stdout is not a TTY so shell redirects (`sandbox events <id> --follow > file.jsonl`) preserve round-trip fidelity. |
@@ -1044,18 +1047,74 @@ git pull origin main
 
 ---
 
-## sandbox rebuild-image
+## sandbox policy status
 
-Rebuild the pre-baked base VM image. The base image is a fully provisioned Lima VM snapshot that accelerates `sandbox create` by skipping the cloud-init provisioning steps. Use this command after updating provisioning scripts or when the base image is stale.
+Report policy-propagation status for a session. Queries `GET /sessions/{id}/policy/propagation-status` and prints the result, optionally polling until the most recent policy-apply has reconciled across every enforcement layer.
 
 ### Synopsis
 
 ```
-sandbox rebuild-image
+sandbox policy status <session> [--wait] [--timeout <duration>]
 ```
+
+### Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `<session>` | Session name or session ID (see [Session identifiers](#session-identifiers)). |
+
+### Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--wait` | off | Poll until the latest policy-apply has reached steady state across nftables, Envoy, and mitmproxy/CoreDNS. Without it, the command reads the status once and exits. |
+| `--timeout <duration>` | `60s` | Deadline for `--wait`. Accepts plain seconds (`60`), `s`, `m`, `h`, or `ms` suffixes (`60s`, `2m`, `1h`, `500ms`). Ignored unless `--wait` is set. |
+
+### Details
+
+- Exits 0 when the latest policy-apply has propagated, or when no policy has ever been applied (nothing to wait for).
+- Exits non-zero on daemon errors. With `--wait`, exits non-zero if the deadline passes before the policy propagates — useful in scripts and the E2E suite to fail fast instead of `time.sleep()`-ing.
+- See [networking → Synchronous DNS-policy gating](/concepts/networking/#synchronous-dns-policy-gating) for the propagation model and the `policy_propagated` lifecycle event this command waits on.
 
 ### Examples
 
 ```bash
+# Read the current propagation snapshot and exit.
+sandbox policy status dev
+
+# Apply a policy, then block until every enforcement layer has reconciled.
+sandbox policy update dev --policy ./policy.json
+sandbox policy status dev --wait --timeout 10s
+```
+
+---
+
+## sandbox rebuild-image
+
+Rebuild the pre-baked backend image(s) the daemon clones from on the fast `sandbox create` path. For Lima, "rebuild" cache-busts the golden VM image; for the container backend, it rebuilds the lite image.
+
+### Synopsis
+
+```
+sandbox rebuild-image [--backend lima|container|all] [--no-cache]
+```
+
+### Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--backend <name>` | `all` | Which backend's image to rebuild. `all` rebuilds every installed backend's image; per-backend failures are printed with a `rebuild-image[<backend>]:` prefix and the command exits non-zero if any selected backend fails. Concurrent `--backend lima` and `--backend container` calls do not block each other. |
+| `--no-cache` | | Cache-bust the rebuild. Container: passes `--no-cache` to `docker build`. Lima: already cache-busts on every rebuild (delete-then-build the golden VM), so this flag is a no-op for Lima but kept for symmetry with the container path. |
+
+### Examples
+
+```bash
+# Rebuild both Lima's golden image and the lite container image.
 sandbox rebuild-image
+
+# Rebuild only the lite image with full cache-bust.
+sandbox rebuild-image --backend container --no-cache
+
+# Rebuild only the Lima golden image.
+sandbox rebuild-image --backend lima
 ```

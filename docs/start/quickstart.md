@@ -26,7 +26,7 @@ make build
 make gateway-image
 ```
 
-`make build` produces `sandboxd`, `sandbox`, and `sandbox-guest` in `sandboxd/target/debug/`. `make gateway-image` builds the Docker image that runs Envoy, mitmproxy, and CoreDNS inside each session's gateway container.
+`make build` produces `sandboxd`, `sandbox`, `sandbox-guest`, `sandbox-nft-deny-logger`, and `sandbox-nft-allow-logger` in `sandboxd/target/debug/`. `make gateway-image` builds the Docker image that runs the five gateway processes — Envoy, mitmproxy, CoreDNS, sandbox-nft-deny-logger, and sandbox-nft-allow-logger — inside each session's gateway container.
 
 Put the CLI on your `PATH` for convenience:
 

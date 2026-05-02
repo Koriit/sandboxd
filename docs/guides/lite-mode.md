@@ -68,9 +68,9 @@ The lite backend computes defaults once at daemon startup based on the host's re
 
 These are **ceilings** (OOM bound and CFS quota), not reservations. Multiple concurrent lite sessions share the same 80%-of-host envelope rather than each getting a private slice. This matches operator intuition: lite is for small, ephemeral runs, not for reserving 80% of the laptop per session.
 
-Lima defaults (currently 2 GB / 2 CPUs) are unchanged — the percentage rule applies only to the lite backend.
+Lima defaults (currently 4 GB / 2 CPUs) are unchanged — the percentage rule applies only to the lite backend.
 
-Pass `--memory-mb` and `--cpus` explicitly to override the defaults, on either backend.
+Pass `--memory` (in MB) and `--cpus` explicitly to override the defaults, on either backend. Fractional values for `--cpus` (e.g. `1.5`) are accepted only on the container backend; the Lima backend rejects them at session-create time because `limactl` requires integer CPU counts.
 
 ## UID alignment
 

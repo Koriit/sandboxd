@@ -16,7 +16,7 @@ flowchart LR
     VM["Session VM"]
     Guest["sandbox-guest<br/>(TCP :5123)"]
     Bridge["Docker bridge<br/>(per session)"]
-    Gateway["Gateway container<br/>Envoy · mitmproxy · CoreDNS · deny-logger"]
+    Gateway["Gateway container<br/>Envoy · mitmproxy · CoreDNS · nft-deny-logger · nft-allow-logger"]
     Internet(["Internet"])
 
     CLI -- "HTTP over<br/>Unix socket" --> Daemon
@@ -46,8 +46,8 @@ Responsibilities:
 - Compile and distribute network policies to gateway components.
 - Relay command execution, file transfer, and git operations to the guest agent.
 - Maintain a SQLite database of sessions and their network info.
-- Run background DNS propagation loops that update nftables `policy_allow_{tcp,udp}` sets and Envoy L3 filter chains as DNS resolutions change, and emit a `policy_propagated` lifecycle event once the applied policy has reconciled across all three enforcement layers.
-- Ingest structured decisions from CoreDNS, Envoy, mitmproxy, and the deny-logger; publish them alongside sandboxd's own lifecycle events on a per-session event bus backed by a bounded ring buffer and a JSONL disk log.
+- Run background DNS propagation loops that update nftables `policy_allow_{tcp,udp}` sets and Envoy L3 filter chains as DNS resolutions change, and emit a `policy_propagated` lifecycle event once the applied policy has reconciled across all three enforcement layers. The CoreDNS plugin can also gate individual responses synchronously through the daemon (see [networking → Synchronous DNS-policy gating](/concepts/networking/#synchronous-dns-policy-gating)).
+- Ingest structured decisions from CoreDNS, Envoy, mitmproxy, and the two nft-loggers (deny + allow); publish them alongside sandboxd's own lifecycle events on a per-session event bus backed by a bounded ring buffer and an optional JSONL disk log.
 
 Key modules (in `sandbox-core`):
 
@@ -59,19 +59,21 @@ Key modules (in `sandbox-core`):
 - `CaManager` — generates and manages per-session CA certificates.
 - `PolicyCompiler` — transforms policy rules into component-specific configurations.
 - `PolicyDistributor` — pushes compiled configurations to gateway components.
-- `EventBus` and per-session ingestors — read the gateway's JSONL access logs (Envoy, mitmproxy, deny-logger) and the CoreDNS policy-plugin log, plus sandboxd's own lifecycle transitions, into a unified event stream with a per-session ring buffer and a disk-backed replay log.
+- `EventBus` and per-session ingestors — read the gateway's JSONL access logs (Envoy, mitmproxy, `sandbox-nft-deny-logger`, `sandbox-nft-allow-logger`) and the CoreDNS policy-plugin log, plus sandboxd's own lifecycle transitions, into a unified event stream with a per-session ring buffer and an optional disk-backed replay log.
 
 ### sandbox (CLI)
 
 A thin client that builds HTTP requests and sends them to the daemon over the Unix socket. Most commands map directly to a single API call.
 
-Commands handled via the HTTP API: `create`, `start`, `stop`, `rm`, `ps`/`ls`, `exec`, `policy update`, `policy preset`, `events`, `health`.
+Commands handled via the HTTP API: `create`, `start`, `stop`, `rm`, `ps`/`ls`, `exec`, `policy update`, `policy status`, `events`, `health`, `inspect`, `describe`, `rebuild-image`.
 
-Commands handled specially:
+Commands handled client-side (no daemon round-trip beyond the initial session lookup):
 
 - `ssh` — resolves the session via the API, then invokes `limactl shell` directly.
 - `logs` — resolves the session via the API, then invokes `docker logs` or `docker exec` to read gateway logs.
-- `cp` — reads/writes local files and transfers via the daemon's upload/download API endpoints.
+- `cp` — resolves the session, then dispatches to the backend's native copy tool (`limactl cp -r` for Lima, `docker cp` for the container backend). No daemon HTTP endpoint is involved on the data path.
+- `sync` — resolves the session, then runs `rsync -a --delete -e <backend-shell>` against it (`limactl shell` for Lima, `docker exec -i` for the container backend). Same no-daemon-data-path property as `cp`.
+- `policy preset` (`list` / `show` / `expand`) — entirely client-local. Loads built-in presets and any JSON files under `$XDG_CONFIG_HOME/sandboxd/presets/`; does not contact the daemon at all.
 
 The same binary is also installed as a `git-remote-sandbox` symlink. When git invokes it under that name for a `sandbox::` URL, it acts as a git remote helper and spawns `sandbox ssh <session>` to tunnel the git pack protocol to `git-upload-pack` / `git-receive-pack` inside the VM.
 
@@ -100,16 +102,19 @@ Contains all shared types, configuration structures, and business logic used by 
 
 ### Gateway container
 
-A Docker container running per session that mediates all outbound traffic from the VM. It bundles four components:
+A Docker container running per session that mediates all outbound traffic from the VM. It bundles five processes:
 
 | Component | Role |
 |-----------|------|
-| **Envoy** | L4/L7 proxy that routes connections based on policy assurance levels |
+| **Envoy** | L4/L7 proxy that routes TCP connections based on policy assurance levels |
 | **mitmproxy** | HTTPS interceptor for full-inspection (level 3) traffic |
-| **CoreDNS** | DNS server with policy filtering (blocks disallowed domains) |
-| **deny-logger** | Sink for VM traffic that matches no allow rule; recovers the pre-DNAT destination via `SO_ORIGINAL_DST` / `IP_ORIGDSTADDR` and emits a structured `deny` event per attempt |
+| **CoreDNS** | DNS server with policy filtering (blocks disallowed domains; strips ECH SvcParams from SVCB/HTTPS responses; can synchronously gate per-name resolutions through the daemon) |
+| **sandbox-nft-deny-logger** | Sink for VM traffic that matches no allow rule. TCP-deny is a DNAT-redirect to its `:10001` listener which recovers the pre-DNAT destination via `SO_ORIGINAL_DST`, `RST`-closes the flow, and emits a structured `deny` event. UDP-deny is observed-only via NFLOG group 1: the kernel drops the datagram and the logger parses the netlink message carrying the original 5-tuple |
+| **sandbox-nft-allow-logger** | Per-flow audit for *allowed* UDP. Subscribes to `nfnetlink_conntrack`'s `NFNLGRP_CONNTRACK_NEW` multicast group, filters for UDP, and writes one `event: "allow"` JSONL line per new tracked flow |
 
-The gateway also runs nftables rules in its network namespace to enforce deny-by-default firewall behavior and route each packet either to Envoy (policy-allowed destinations) or to the deny-logger (everything else). Each component writes structured per-decision records to a per-session JSONL log on a host-side bind mount; sandboxd ingests those logs into the unified event stream and relays them to clients via `sandbox events`.
+The two `nft-`-prefixed loggers share a `sandbox-event-emitter` library crate that owns the JSONL line shape, rate-cap, and emit gauge.
+
+The gateway also runs nftables rules in its network namespace to enforce deny-by-default firewall behavior. The TCP datapath routes each packet either to Envoy (policy-allowed destinations) or to the nft-deny-logger (everything else). The UDP datapath is **userland-free on the allow path** — policy-allowed UDP exits the gateway directly through MASQUERADE, with the allow audit landing as a side-channel via NFCT subscription; non-allowed UDP is dropped at nft and audited via the NFLOG side channel. Each gateway component writes structured per-decision records to a per-session JSONL log on a host-side bind mount; sandboxd ingests those logs into the unified event stream and relays them to clients via `sandbox events`.
 
 ## Session lifecycle
 
@@ -200,9 +205,11 @@ sandbox prints stdout, exits with code 0
 | POST | `/sessions/{id}/stop` | `stop_session` | Stop a running session |
 | POST | `/sessions/{id}/exec` | `exec_in_session` | Execute a command |
 | POST | `/sessions/{id}/policy` | `update_policy` | Update network policy |
+| GET | `/sessions/{id}/policy/propagation-status` | `policy_propagation_status` | Check whether the latest policy hash has propagated to all enforcement layers |
 | GET | `/sessions/{id}/events` | `get_events` | Replay or stream the session's event stream (traffic + lifecycle) |
 | GET | `/sessions/{id}/health` | `session_health` | Per-session health |
 | GET | `/health` | `health_check` | Global health |
+| GET | `/backends` | `list_backends` | Capability matrix for the available session backends (Lima, container) |
 | POST | `/rebuild-image` | `rebuild_image` | Rebuild the pre-baked base VM image |
 | GET | `/base-image-status` | `base_image_status` | Check base image build status |
 

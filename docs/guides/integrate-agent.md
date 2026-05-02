@@ -174,7 +174,7 @@ rm /tmp/token
 sandbox exec my-session -- bash -c 'cat /home/agent/.token | curl -H @- https://api.example.com'
 ```
 
-File permissions inside the VM default to the guest agent's file-upload mode; pass `--mode` through the HTTP API if you need a specific mode (not exposed as a CLI flag today — use the [HTTP API](/reference/http-api/)).
+File permissions inside the session follow the backend tool's behavior: `sandbox cp` dispatches to `limactl cp` (Lima) or `docker cp` (container), which preserve the source file's mode bits the same way `scp` and `docker cp` do natively. There is no in-band `--mode` knob — chmod the file on the host before copying, or run `sandbox exec <session> -- chmod 600 /home/agent/.token` afterwards.
 
 ## Observability
 
