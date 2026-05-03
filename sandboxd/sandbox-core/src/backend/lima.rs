@@ -496,6 +496,7 @@ mod tests {
         let manager = Arc::new(LimaManager::with_limactl_path(
             PathBuf::from("/tmp/sandbox-test"),
             PathBuf::from("limactl"),
+            crate::lima::DEFAULT_BASE_VM_NAME.to_string(),
         ));
         LimaRuntime::new(manager)
     }

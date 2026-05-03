@@ -38,6 +38,7 @@ Run with:
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -56,7 +57,10 @@ from conftest import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-BASE_VM_NAME = "sandbox-base"
+# Read the same env var the daemon uses; conftest defaults this to
+# `sandbox-test-base` for the e2e suite so the test daemon never collides
+# with the operator's production `sandbox-base` Lima instance.
+BASE_VM_NAME = os.environ.get("SANDBOX_BASE_VM_NAME", "sandbox-test-base")
 BASE_META_FILENAME = "base-image-meta.json"
 
 
@@ -169,8 +173,8 @@ def _force_delete_base_vm() -> None:
         ["limactl", "delete", "--force", BASE_VM_NAME],
         capture_output=True, timeout=120,
     )
-    # Remove any orphan ~/.lima/sandbox-base directory (matches conftest's
-    # pre-flight cleanup pattern for partial/broken VMs).
+    # Remove any orphan `~/.lima/<base-vm-name>` directory left behind by
+    # a partial / broken VM (e.g. from a hard crash mid-build).
     orphan = Path.home() / ".lima" / BASE_VM_NAME
     if orphan.exists():
         shutil.rmtree(orphan, ignore_errors=True)

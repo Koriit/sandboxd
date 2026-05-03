@@ -11,14 +11,14 @@
 use std::sync::Arc;
 
 use sandbox_core::backend::{LimaRuntime, RuntimeStatus, SessionRuntime};
-use sandbox_core::lima::{LimaManager, vm_name};
+use sandbox_core::lima::{DEFAULT_BASE_VM_NAME, LimaManager, vm_name};
 use sandbox_core::session::{SessionConfig, SessionId};
 use sandbox_core::{BackendKind, BackendSpecific, RuntimeHandle, SessionSpec};
 
 #[test]
 fn integration_lima_create_and_delete() {
     let dir = tempfile::TempDir::new().expect("create temp dir");
-    let mgr = LimaManager::new(dir.path().to_path_buf())
+    let mgr = LimaManager::new(dir.path().to_path_buf(), DEFAULT_BASE_VM_NAME.to_string())
         .expect("limactl must be on PATH for integration test");
 
     let session_id = SessionId::generate();
@@ -73,7 +73,7 @@ fn integration_lima_create_and_delete() {
 async fn integration_lima_runtime_lifecycle() {
     let dir = tempfile::TempDir::new().expect("create temp dir");
     let manager = Arc::new(
-        LimaManager::new(dir.path().to_path_buf())
+        LimaManager::new(dir.path().to_path_buf(), DEFAULT_BASE_VM_NAME.to_string())
             .expect("limactl must be on PATH for integration test"),
     );
     let runtime = LimaRuntime::new(manager.clone());
@@ -164,7 +164,7 @@ async fn integration_lima_runtime_lifecycle() {
 async fn integration_lima_transport_socat_smoke() {
     let dir = tempfile::TempDir::new().expect("create temp dir");
     let manager = Arc::new(
-        LimaManager::new(dir.path().to_path_buf())
+        LimaManager::new(dir.path().to_path_buf(), DEFAULT_BASE_VM_NAME.to_string())
             .expect("limactl must be on PATH for integration test"),
     );
     let runtime = LimaRuntime::new(manager.clone());

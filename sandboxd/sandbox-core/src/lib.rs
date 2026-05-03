@@ -82,7 +82,10 @@ pub use lds_ack::{
     DockerExecLdsProbe, LdsAckOutcome, LdsCounters, LdsStatsProbe, parse_lds_counters,
     wait_for_lds_ack,
 };
-pub use lima::{BaseImageMeta, BaseImageStatus, LimaManager, VmInfo, VmStatus, guest_agent_path};
+pub use lima::{
+    BaseImageMeta, BaseImageStatus, DEFAULT_BASE_VM_NAME, LimaManager, VmInfo, VmStatus,
+    guest_agent_path,
+};
 pub use network::{NetworkInfo, NetworkManager};
 pub use policy::{
     AssuranceLevel, BOOTSTRAP_FILE_IN_CONTAINER, CompiledPolicy, CoreDnsConfig, Destination,

@@ -179,6 +179,80 @@ fn resolve_allocation_pool(daemon_uid: u32, config: &UsersConfig) -> Result<Cidr
 }
 
 // ---------------------------------------------------------------------------
+// SANDBOX_BASE_VM_NAME validation
+// ---------------------------------------------------------------------------
+//
+// Lima instance names appear as positional arguments in every limactl
+// invocation that touches the singleton golden-image VM. An
+// attacker-controlled `SANDBOX_BASE_VM_NAME` could otherwise inject
+// `--`-prefixed flags into the argv (e.g. `--evil`), so the daemon
+// validates the name at startup against the same character class Lima
+// itself accepts and rejects malformed values with a clear error before
+// it ever shells out.
+
+/// Maximum length of a Lima instance name; matches Lima's own cap.
+const BASE_VM_NAME_MAX_LEN: usize = 63;
+
+/// Environment variable that overrides the default base VM name.
+const BASE_VM_NAME_ENV: &str = "SANDBOX_BASE_VM_NAME";
+
+/// Validate a Lima instance name destined for `limactl create --name <name>`.
+///
+/// Accepts the regex `^[A-Za-z0-9][-A-Za-z0-9]*$` with a length cap of
+/// [`BASE_VM_NAME_MAX_LEN`]. Rejects:
+/// - empty strings
+/// - names starting with `-` (would be parsed as a flag by limactl)
+/// - names containing characters outside `[A-Za-z0-9-]`
+/// - names longer than 63 characters
+///
+/// Pure function — split out from the startup wiring so unit tests can
+/// drive every rejection case without spawning the daemon.
+fn validate_base_vm_name(name: &str) -> Result<(), SandboxError> {
+    if name.is_empty() {
+        return Err(SandboxError::InvalidArgument(format!(
+            "{BASE_VM_NAME_ENV} is empty; expected a Lima instance name \
+             matching ^[A-Za-z0-9][-A-Za-z0-9]*$"
+        )));
+    }
+    if name.len() > BASE_VM_NAME_MAX_LEN {
+        return Err(SandboxError::InvalidArgument(format!(
+            "{BASE_VM_NAME_ENV}={name:?} exceeds the {BASE_VM_NAME_MAX_LEN}-character limit"
+        )));
+    }
+    let mut chars = name.chars();
+    let first = chars.next().expect("non-empty checked above");
+    if !first.is_ascii_alphanumeric() {
+        return Err(SandboxError::InvalidArgument(format!(
+            "{BASE_VM_NAME_ENV}={name:?} must start with an ASCII alphanumeric \
+             character (got {first:?}); names beginning with '-' would be \
+             parsed as a flag by limactl"
+        )));
+    }
+    for c in chars {
+        if !(c.is_ascii_alphanumeric() || c == '-') {
+            return Err(SandboxError::InvalidArgument(format!(
+                "{BASE_VM_NAME_ENV}={name:?} contains the disallowed character \
+                 {c:?}; only ASCII alphanumerics and '-' are permitted"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the base VM name from the `SANDBOX_BASE_VM_NAME` env var,
+/// falling back to [`DEFAULT_BASE_VM_NAME`].
+///
+/// Validation happens here so a single early failure stops the daemon
+/// before any limactl argv is built. Returns the validated name as an
+/// owned `String` ready to hand to [`LimaManager::new`].
+fn resolve_base_vm_name() -> Result<String, SandboxError> {
+    let raw = std::env::var(BASE_VM_NAME_ENV)
+        .unwrap_or_else(|_| sandbox_core::DEFAULT_BASE_VM_NAME.to_string());
+    validate_base_vm_name(&raw)?;
+    Ok(raw)
+}
+
+// ---------------------------------------------------------------------------
 // Logging setup
 // ---------------------------------------------------------------------------
 
@@ -6115,7 +6189,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `Deref<Target = SessionStore>`.
     let (store, reset_orphans) = SessionStore::new(base_dir.clone())?;
     let store = Arc::new(store);
-    let lima = Arc::new(LimaManager::new(base_dir.clone())?);
+    let base_vm_name = match resolve_base_vm_name() {
+        Ok(name) => name,
+        Err(err) => {
+            eprintln!("sandboxd: {err}");
+            return Err(err.into());
+        }
+    };
+    info!(base_vm_name = %base_vm_name, "base VM name resolved");
+    let lima = Arc::new(LimaManager::new(base_dir.clone(), base_vm_name)?);
 
     // Wrap the existing `LimaManager` in a [`LimaRuntime`] and register
     // it in the backend dispatch table. The same `Arc<LimaRuntime>` is
@@ -6613,6 +6695,119 @@ mod tests {
                 );
             }
             other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_base_vm_name — startup-validation for SANDBOX_BASE_VM_NAME.
+    //
+    // Pure function; we drive every accept/reject branch directly so the
+    // argv-injection guard is pinned without spinning up the daemon.
+    // Validation is a must-have: an attacker-controlled env var could
+    // otherwise inject `--`-prefixed flags into `limactl create --name <…>`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_base_vm_name_accepts_default() {
+        validate_base_vm_name(sandbox_core::DEFAULT_BASE_VM_NAME)
+            .expect("default base VM name must validate");
+    }
+
+    #[test]
+    fn validate_base_vm_name_accepts_test_override() {
+        validate_base_vm_name("sandbox-test-base").expect("test override must validate");
+    }
+
+    #[test]
+    fn validate_base_vm_name_accepts_alphanumeric_only() {
+        validate_base_vm_name("base42").expect("alphanumeric-only name must validate");
+        validate_base_vm_name("A").expect("single-letter name must validate");
+        validate_base_vm_name("0").expect("single-digit name must validate");
+    }
+
+    #[test]
+    fn validate_base_vm_name_accepts_max_length() {
+        let name = "a".repeat(BASE_VM_NAME_MAX_LEN);
+        validate_base_vm_name(&name).expect("63-character name must validate");
+    }
+
+    #[test]
+    fn validate_base_vm_name_rejects_empty_string() {
+        let err = validate_base_vm_name("").expect_err("empty string must reject");
+        match err {
+            SandboxError::InvalidArgument(msg) => {
+                assert!(
+                    msg.contains(BASE_VM_NAME_ENV) && msg.contains("empty"),
+                    "message must name the env var and 'empty', got {msg}"
+                );
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_base_vm_name_rejects_leading_hyphen() {
+        // The whole point of the check: `--evil` would be parsed as a flag
+        // by limactl. Names starting with a single `-` are equally unsafe.
+        let err = validate_base_vm_name("--evil").expect_err("leading hyphen must reject");
+        match err {
+            SandboxError::InvalidArgument(msg) => {
+                assert!(
+                    msg.contains("--evil") && msg.contains("alphanumeric"),
+                    "message must echo the input and explain the rule, got {msg}"
+                );
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+
+        validate_base_vm_name("-base").expect_err("single leading hyphen must reject");
+    }
+
+    #[test]
+    fn validate_base_vm_name_rejects_disallowed_characters() {
+        for bad in ["foo!bar", "foo bar", "foo/bar", "foo.bar", "foo_bar", "foo:bar"] {
+            let err = validate_base_vm_name(bad)
+                .unwrap_err_or_panic_with(|| format!("expected reject for {bad:?}"));
+            match err {
+                SandboxError::InvalidArgument(msg) => {
+                    assert!(
+                        msg.contains("disallowed") || msg.contains("only ASCII"),
+                        "message must explain the rule, got {msg}"
+                    );
+                }
+                other => panic!("expected InvalidArgument for {bad:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn validate_base_vm_name_rejects_overly_long_name() {
+        let too_long = "a".repeat(BASE_VM_NAME_MAX_LEN + 1);
+        let err = validate_base_vm_name(&too_long).expect_err("64+ character name must reject");
+        match err {
+            SandboxError::InvalidArgument(msg) => {
+                assert!(
+                    msg.contains("exceeds") && msg.contains(&BASE_VM_NAME_MAX_LEN.to_string()),
+                    "message must surface the limit, got {msg}"
+                );
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    /// Local helper that mirrors `Result::expect_err` but lets the message
+    /// be computed lazily inside a closure; lets the rejection-loop above
+    /// stay terse without paying for a `format!` on the happy path.
+    trait ResultExt<T, E> {
+        fn unwrap_err_or_panic_with<F: FnOnce() -> String>(self, f: F) -> E;
+    }
+
+    impl<T: std::fmt::Debug, E> ResultExt<T, E> for Result<T, E> {
+        fn unwrap_err_or_panic_with<F: FnOnce() -> String>(self, f: F) -> E {
+            match self {
+                Ok(value) => panic!("{}: got Ok({value:?})", f()),
+                Err(e) => e,
+            }
         }
     }
 

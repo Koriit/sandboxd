@@ -58,6 +58,15 @@ QEMU_BRIDGE_HELPER_PATHS = [
 
 BRIDGE_CONF_PATH = Path("/etc/qemu/bridge.conf")
 
+# The test daemon uses a distinct base VM name so it neither sees nor
+# touches the operator's production `sandbox-base` Lima instance. We
+# export this at module-import time (rather than inside `sandbox_daemon`)
+# so test modules that read the name as a module-level constant — e.g.
+# `test_golden_image.BASE_VM_NAME = os.environ.get("SANDBOX_BASE_VM_NAME",
+# ...)` — pick up the same value the spawned daemon sees. Operators can
+# override via the env var before invoking pytest.
+os.environ.setdefault("SANDBOX_BASE_VM_NAME", "sandbox-test-base")
+
 
 # ---------------------------------------------------------------------------
 # Shared test helpers
@@ -284,70 +293,14 @@ def _preflight_checks():
             f'echo "allow all" | sudo tee {BRIDGE_CONF_PATH}'
         )
 
-    # 8. Clean up stale sandbox resources from previous runs to prevent
-    #    Docker subnet pool overlap errors.
-    try:
-        stale_containers = subprocess.run(
-            ["docker", "ps", "-a", "--filter", "name=sandbox-",
-             "--format", "{{.Names}}"],
-            capture_output=True, text=True, timeout=15,
-        )
-        for name in stale_containers.stdout.strip().splitlines():
-            if name:
-                subprocess.run(
-                    ["docker", "rm", "-f", name],
-                    capture_output=True, timeout=30,
-                )
-    except Exception:
-        pass
-
-    try:
-        stale_networks = subprocess.run(
-            ["docker", "network", "ls", "--filter", "name=sandbox-",
-             "--format", "{{.Name}}"],
-            capture_output=True, text=True, timeout=15,
-        )
-        for name in stale_networks.stdout.strip().splitlines():
-            if name:
-                subprocess.run(
-                    ["docker", "network", "rm", name],
-                    capture_output=True, timeout=30,
-                )
-    except Exception:
-        pass
-
-    try:
-        lima_vms = subprocess.run(
-            ["limactl", "list", "--json"],
-            capture_output=True, text=True, timeout=30,
-        )
-        for line in (lima_vms.stdout or "").strip().splitlines():
-            try:
-                entry = json.loads(line)
-                vm_name = entry.get("name", "")
-                if vm_name.startswith("sandbox-"):
-                    subprocess.run(
-                        ["limactl", "delete", "--force", vm_name],
-                        capture_output=True, timeout=60,
-                    )
-            except json.JSONDecodeError:
-                pass
-    except Exception:
-        pass
-
-    # Also remove orphan ~/.lima/sandbox-* directories that are not tracked
-    # by limactl (e.g. from hard crashes or incomplete teardowns).  These
-    # cause "open .../lima.yaml: no such file or directory" on subsequent
-    # runs when limactl tries to reuse the stale instance directory.
-    try:
-        lima_dir = Path.home() / ".lima"
-        if lima_dir.is_dir():
-            for entry in lima_dir.iterdir():
-                if entry.is_dir() and entry.name.startswith("sandbox-"):
-                    import shutil
-                    shutil.rmtree(entry, ignore_errors=True)
-    except Exception:
-        pass
+    # Cleanup of stale sandbox-* resources is intentionally NOT done here.
+    # The test daemon uses a distinct base VM name
+    # (SANDBOX_BASE_VM_NAME = "sandbox-test-base"; see `sandbox_daemon`)
+    # and its own CIDR-scoped startup reaper handles cleanup of stale
+    # test-daemon orphans without touching production resources. Sweeping
+    # every `sandbox-*` resource on the host from here would clobber the
+    # operator's production sandboxd — including the `sandbox-base`
+    # golden image and any live production sessions.
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +379,11 @@ def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path_factory: pytest.T
     stdout_fh = open(stdout_log, "w")
     stderr_fh = open(stderr_log, "w")
 
+    # The daemon inherits SANDBOX_BASE_VM_NAME from the parent test
+    # process, where it is set at conftest-module import time (see the
+    # `os.environ.setdefault` near the top of this file). This keeps
+    # `test_golden_image.BASE_VM_NAME` and the daemon's view of the base
+    # VM in lockstep without having to thread a fixture through it.
     proc = subprocess.Popen(
         [
             str(sandbox_binaries.sandboxd),
