@@ -62,9 +62,11 @@ struct SubnetAllocator {
     /// Prefix length of the base range (e.g. 24). Retained for diagnostics.
     prefix_len: u8,
     /// Set of allocated /28 block indices (0..max_blocks).
-    allocated: HashSet<u8>,
-    /// Maximum number of /28 blocks: 2^(32 - prefix_len) / 16.
-    max_blocks: u8,
+    allocated: HashSet<u16>,
+    /// Maximum number of /28 blocks: 2^(32 - prefix_len) / 16. A `/20`
+    /// (the shipped `users.conf` default) yields exactly 256 blocks,
+    /// which is why this is u16 rather than u8.
+    max_blocks: u16,
 }
 
 impl SubnetAllocator {
@@ -85,10 +87,14 @@ impl SubnetAllocator {
         // Each /28 uses 16 addresses.
         let max_blocks = total_addrs / 16;
 
-        // We store the block index as u8, so cap at 255.
-        if max_blocks > 255 {
+        // Block index is stored as u16 (65535 blocks is well past any
+        // practical pool size — `/12` already gives 65536). Reject
+        // anything bigger so the cast below cannot truncate.
+        if max_blocks > u16::MAX as u32 {
             return Err(SandboxError::Network(format!(
-                "base range /{prefix_len} yields {max_blocks} blocks, which exceeds u8 limit"
+                "base range /{prefix_len} yields {max_blocks} blocks, \
+                 which exceeds the u16 block-index limit ({})",
+                u16::MAX
             )));
         }
 
@@ -96,14 +102,14 @@ impl SubnetAllocator {
             base,
             prefix_len,
             allocated: HashSet::new(),
-            max_blocks: max_blocks as u8,
+            max_blocks: max_blocks as u16,
         })
     }
 
     /// Allocate the next available /28 block.
     ///
     /// Returns `(block_index, subnet_base, gateway_ip, vm_ip)`.
-    fn allocate(&mut self) -> Result<(u8, Ipv4Addr, Ipv4Addr, Ipv4Addr), SandboxError> {
+    fn allocate(&mut self) -> Result<(u16, Ipv4Addr, Ipv4Addr, Ipv4Addr), SandboxError> {
         // Find the lowest free index.
         let block_idx = (0..self.max_blocks)
             .find(|idx| !self.allocated.contains(idx))
@@ -127,12 +133,12 @@ impl SubnetAllocator {
     }
 
     /// Release a /28 block back to the pool.
-    fn release(&mut self, block_idx: u8) {
+    fn release(&mut self, block_idx: u16) {
         self.allocated.remove(&block_idx);
     }
 
     /// Mark a specific block as allocated (used during state rebuild).
-    fn mark_allocated(&mut self, block_idx: u8) -> Result<(), SandboxError> {
+    fn mark_allocated(&mut self, block_idx: u16) -> Result<(), SandboxError> {
         if block_idx >= self.max_blocks {
             return Err(SandboxError::Network(format!(
                 "block index {block_idx} out of range (max {})",
@@ -144,7 +150,7 @@ impl SubnetAllocator {
     }
 
     /// Determine the block index for a given subnet base address.
-    fn block_index_for(&self, subnet_base: Ipv4Addr) -> Option<u8> {
+    fn block_index_for(&self, subnet_base: Ipv4Addr) -> Option<u16> {
         let base_u32 = u32::from(self.base);
         let addr_u32 = u32::from(subnet_base);
 
@@ -162,7 +168,7 @@ impl SubnetAllocator {
             return None;
         }
 
-        Some(idx as u8)
+        Some(idx as u16)
     }
 }
 
@@ -177,7 +183,7 @@ impl SubnetAllocator {
 pub struct NetworkManager {
     subnet_allocator: Mutex<SubnetAllocator>,
     /// Maps session_id -> (block_index, NetworkInfo) for active networks.
-    networks: Mutex<std::collections::HashMap<SessionId, (u8, NetworkInfo)>>,
+    networks: Mutex<std::collections::HashMap<SessionId, (u16, NetworkInfo)>>,
 }
 
 impl NetworkManager {
@@ -725,7 +731,7 @@ mod tests {
         assert_eq!(alloc.max_blocks, 16);
 
         // Allocate all 16 blocks.
-        for i in 0..16u8 {
+        for i in 0..16u16 {
             let (idx, _, _, _) = alloc.allocate().unwrap();
             assert_eq!(idx, i);
         }
@@ -735,6 +741,16 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("exhausted"));
+    }
+
+    #[test]
+    fn test_allocator_accepts_slash_20() {
+        // /20 yields exactly 256 /28 blocks — one past u8::MAX. This
+        // is the prefix shipped in `contrib/users.conf.example`, so
+        // any host that runs `make setup-users-conf` lands here on
+        // first daemon start.
+        let alloc = SubnetAllocator::new(Ipv4Addr::new(10, 209, 0, 0), 20).unwrap();
+        assert_eq!(alloc.max_blocks, 256);
     }
 
     #[test]
