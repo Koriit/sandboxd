@@ -495,6 +495,79 @@ impl LimaManager {
         Ok(())
     }
 
+    /// Best-effort cleanup of a partial Lima instance directory.
+    ///
+    /// `limactl clone` is non-atomic: a failure mid-clone can leave
+    /// behind `disk` and `cidata.iso` without a `lima.yaml`. From that
+    /// point on every subsequent `limactl` invocation host-wide fatals
+    /// while enumerating instances ("open lima.yaml: no such file or
+    /// directory"), poisoning all other Lima operations until the
+    /// orphan dir is removed manually.
+    ///
+    /// We try the clean path first (`limactl delete --force`) and fall
+    /// back to a direct `rm -rf $LIMA_HOME/<vm>` when limactl refuses
+    /// to operate on a corrupted instance. Errors are swallowed — this
+    /// runs from the error path of another operation, and the caller
+    /// already has a primary failure to report.
+    fn cleanup_partial_lima_instance(&self, vm: &str) {
+        let delete_attempt = run_with_timeout(
+            Command::new(&self.limactl)
+                .args(["delete", "--force", vm])
+                .arg("--tty=false"),
+            DELETE_VM_TIMEOUT,
+            "limactl delete (partial-clone cleanup)",
+        );
+        match delete_attempt {
+            Ok(out) if out.status.success() => {
+                debug!(vm, "partial Lima instance removed via limactl delete");
+                return;
+            }
+            Ok(out) => {
+                debug!(
+                    vm,
+                    stderr = %String::from_utf8_lossy(&out.stderr),
+                    "limactl delete on partial clone failed; falling back to fs cleanup"
+                );
+            }
+            Err(e) => {
+                debug!(
+                    vm, error = %e,
+                    "limactl delete on partial clone errored; falling back to fs cleanup"
+                );
+            }
+        }
+
+        // Fallback: rm -rf the dir directly. Lima resolves
+        // `$LIMA_HOME` (default `$HOME/.lima`) to locate instance
+        // dirs; mirror that resolution here so we hit the same path.
+        let lima_home = std::env::var("LIMA_HOME")
+            .map(PathBuf::from)
+            .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".lima")));
+        match lima_home {
+            Ok(dir) => {
+                let target = dir.join(vm);
+                if target.exists()
+                    && let Err(e) = std::fs::remove_dir_all(&target)
+                {
+                    warn!(
+                        vm,
+                        path = %target.display(),
+                        error = %e,
+                        "failed to rm -rf partial Lima instance dir (manual cleanup may be required)"
+                    );
+                } else if target.exists() {
+                    debug!(vm, path = %target.display(), "removed partial Lima instance dir");
+                }
+            }
+            Err(_) => {
+                warn!(
+                    vm,
+                    "could not resolve LIMA_HOME or $HOME for partial-clone cleanup; manual rm -rf may be required"
+                );
+            }
+        }
+    }
+
     /// Copy the sandbox-guest binary into a running VM and start it as a
     /// systemd service.
     ///
@@ -903,6 +976,19 @@ impl LimaManager {
         }
         info!("base VM started");
 
+        // 3a. Validate that cloud-init's per-boot provision scripts
+        // actually finished installing the tools the session contract
+        // depends on. Lima's `cc_scripts_per_boot` reports any
+        // provision-script failure as a non-fatal warning, so
+        // `limactl start` returning success does NOT imply
+        // provisioning succeeded — see e.g. an apt-get hitting a
+        // mirror EAGAIN mid-`apt install docker-ce`. Without this
+        // check the daemon happily declares the base image golden,
+        // every cloned session VM re-runs the same provisioning on
+        // its own first boot, hits the same flakiness, and fails to
+        // come up.
+        self.validate_base_provisioning()?;
+
         // 4. Install the guest agent.
         info!("installing guest agent into base VM");
         let agent_path = guest_agent_path()?;
@@ -944,6 +1030,55 @@ impl LimaManager {
         std::fs::write(&meta_path, &meta_json)?;
         info!(path = %meta_path.display(), "wrote base image metadata");
 
+        Ok(())
+    }
+
+    /// Probe the running base VM to confirm cloud-init's
+    /// `provision.system` scripts actually finished installing the
+    /// tools the session contract relies on.
+    ///
+    /// Required tools, drawn from the base template's provision
+    /// blocks: `socat` (guest-agent transport), `git` (`--repo` and
+    /// the git remote helper), `rsync` (`sandbox sync` and lima cp on
+    /// limactl 2.x), and `docker` (in-VM container workloads).
+    /// Missing any of these means a provision step failed silently —
+    /// most commonly an apt-mirror EAGAIN during Docker install — and
+    /// the base image must not be stamped golden.
+    fn validate_base_provisioning(&self) -> Result<(), SandboxError> {
+        const REQUIRED: &[&str] = &["socat", "git", "rsync", "docker"];
+        const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+        info!("validating base VM provisioning");
+        for tool in REQUIRED {
+            let probe = run_with_timeout(
+                Command::new(&self.limactl).args([
+                    "shell",
+                    "--tty=false",
+                    BASE_VM_NAME,
+                    "command",
+                    "-v",
+                    tool,
+                ]),
+                PROBE_TIMEOUT,
+                "limactl shell (base provisioning probe)",
+            )
+            .map_err(|e| match e {
+                SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                    lima_io_error("limactl shell (probe)", std::io::Error::other(msg))
+                }
+                other => other,
+            })?;
+            if !probe.status.success() {
+                return Err(SandboxError::Internal(format!(
+                    "base image provisioning incomplete: '{tool}' not found in VM. \
+                     Cloud-init's provision scripts likely failed silently \
+                     (often an apt-mirror EAGAIN during Docker install). \
+                     Inspect the base VM's serial.log for `step=...` markers, \
+                     then re-run with `sandbox rebuild-image`."
+                )));
+            }
+            debug!(tool, "base provisioning probe ok");
+        }
+        info!("base VM provisioning validated");
         Ok(())
     }
 
@@ -1019,15 +1154,26 @@ impl LimaManager {
             CLONE_VM_TIMEOUT,
             "limactl clone",
         )
-        .map_err(|e| match e {
-            SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
-                lima_io_error("limactl clone", std::io::Error::other(msg))
+        .map_err(|e| {
+            // The spawn or timeout may itself have left a half-written
+            // instance dir behind — `limactl clone` writes `disk` and
+            // `cidata.iso` before `lima.yaml`, so an interruption here
+            // would orphan a dir that poisons all later limactl calls.
+            self.cleanup_partial_lima_instance(&target);
+            match e {
+                SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                    lima_io_error("limactl clone", std::io::Error::other(msg))
+                }
+                other => other,
             }
-            other => other,
         })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            // Clean up the partial instance dir before surfacing the
+            // error. Without this, a single failed clone can wedge
+            // every subsequent limactl invocation host-wide.
+            self.cleanup_partial_lima_instance(&target);
             return Err(parse_limactl_error("clone", &stderr));
         }
 
@@ -1111,6 +1257,9 @@ provision:
     Acquire::https::Timeout "5";
     Acquire::Retries "5";
     Acquire::ForceIPv4 "true";
+    Acquire::Queue-Mode "access";
+    Acquire::http::Pipeline-Depth "0";
+    Acquire::https::Pipeline-Depth "0";
     APTEOF
     echo "[sandbox-provision] step=apt-config done=$(date -u +%Y-%m-%dT%H:%M:%S)"
 - mode: system
@@ -1129,15 +1278,28 @@ provision:
     #     "command not found" from the remote shell. The host-side
     #     rsync must be present too, but that is the operator's
     #     concern.
+    #
+    # Wrapped in a retry loop because Lima's user-mode networking
+    # (SLIRP) can drop packets under concurrent fetches and apt
+    # surfaces those as "Could not wait for server fd - select
+    # (11: Resource temporarily unavailable)". Without retry, a
+    # single transient flake stamps a baseline-less golden image
+    # (cloud-init's per_boot doesn't abort on script failure).
     if ! command -v socat &>/dev/null \
         || ! command -v git &>/dev/null \
         || ! command -v rsync &>/dev/null; then
-      echo "[sandbox-provision] apt-get update start=$(date -u +%Y-%m-%dT%H:%M:%S)"
-      apt-get update -qq
-      echo "[sandbox-provision] apt-get update done=$(date -u +%Y-%m-%dT%H:%M:%S)"
-      echo "[sandbox-provision] apt-get install socat git rsync start=$(date -u +%Y-%m-%dT%H:%M:%S)"
-      apt-get install -y socat git rsync
-      echo "[sandbox-provision] apt-get install socat git rsync done=$(date -u +%Y-%m-%dT%H:%M:%S)"
+      attempt=1
+      max_attempts=3
+      until apt-get update -qq && apt-get install -y socat git rsync; do
+        if [ "$attempt" -ge "$max_attempts" ]; then
+          echo "[sandbox-provision] apt-baseline failed after $max_attempts attempts" >&2
+          exit 1
+        fi
+        echo "[sandbox-provision] apt-baseline attempt=$attempt failed, retrying" >&2
+        attempt=$((attempt + 1))
+        sleep 10
+      done
+      echo "[sandbox-provision] apt-baseline succeeded after $attempt attempt(s)"
     fi
     # Ensure the workspace directory exists for repo cloning (owned by agent, not root)
     mkdir -p /home/agent/workspace
@@ -1149,9 +1311,24 @@ provision:
     set -eux -o pipefail
     export DEBIAN_FRONTEND=noninteractive
     echo "[sandbox-provision] step=docker start=$(date -u +%Y-%m-%dT%H:%M:%S)"
-    # Install Docker via official convenience script
+    # Install Docker via official convenience script. Retry up to 3
+    # times: the get.docker.com script does its own apt-get update +
+    # install internally, and a single transient apt fetch failure
+    # (e.g. EAGAIN from too many parallel HTTP fetches against
+    # download.docker.com) would otherwise stamp a docker-less base
+    # image as golden.
     if ! command -v docker &>/dev/null; then
-      curl -fsSL https://get.docker.com | sh
+      attempt=1
+      max_attempts=3
+      until curl -fsSL https://get.docker.com | sh; do
+        if [ "$attempt" -ge "$max_attempts" ]; then
+          echo "[sandbox-provision] docker install failed after $max_attempts attempts" >&2
+          exit 1
+        fi
+        echo "[sandbox-provision] docker install attempt=$attempt failed, retrying" >&2
+        attempt=$((attempt + 1))
+        sleep 5
+      done
       usermod -aG docker agent
     fi
     echo "[sandbox-provision] step=docker done=$(date -u +%Y-%m-%dT%H:%M:%S)"
@@ -1282,6 +1459,9 @@ provision:
     Acquire::https::Timeout "5";
     Acquire::Retries "5";
     Acquire::ForceIPv4 "true";
+    Acquire::Queue-Mode "access";
+    Acquire::http::Pipeline-Depth "0";
+    Acquire::https::Pipeline-Depth "0";
     APTEOF
     echo "[sandbox-provision] step=apt-config done=$(date -u +%Y-%m-%dT%H:%M:%S)"
 - mode: system
@@ -1296,16 +1476,23 @@ provision:
     # these — this block is a defence-in-depth no-op when the VM
     # was cloned from an up-to-date base, and a recovery path when
     # it wasn't (e.g. the image was rebuilt without rsync before
-    # the base-image tooling caught up).
+    # the base-image tooling caught up). See base template for
+    # retry rationale.
     if ! command -v socat &>/dev/null \
         || ! command -v git &>/dev/null \
         || ! command -v rsync &>/dev/null; then
-      echo "[sandbox-provision] apt-get update start=$(date -u +%Y-%m-%dT%H:%M:%S)"
-      apt-get update -qq
-      echo "[sandbox-provision] apt-get update done=$(date -u +%Y-%m-%dT%H:%M:%S)"
-      echo "[sandbox-provision] apt-get install socat git rsync start=$(date -u +%Y-%m-%dT%H:%M:%S)"
-      apt-get install -y socat git rsync
-      echo "[sandbox-provision] apt-get install socat git rsync done=$(date -u +%Y-%m-%dT%H:%M:%S)"
+      attempt=1
+      max_attempts=3
+      until apt-get update -qq && apt-get install -y socat git rsync; do
+        if [ "$attempt" -ge "$max_attempts" ]; then
+          echo "[sandbox-provision] apt-baseline failed after $max_attempts attempts" >&2
+          exit 1
+        fi
+        echo "[sandbox-provision] apt-baseline attempt=$attempt failed, retrying" >&2
+        attempt=$((attempt + 1))
+        sleep 10
+      done
+      echo "[sandbox-provision] apt-baseline succeeded after $attempt attempt(s)"
     fi
     # Ensure the workspace directory exists for repo cloning (owned by agent, not root)
     mkdir -p /home/agent/workspace
@@ -1317,9 +1504,20 @@ provision:
     set -eux -o pipefail
     export DEBIAN_FRONTEND=noninteractive
     echo "[sandbox-provision] step=docker start=$(date -u +%Y-%m-%dT%H:%M:%S)"
-    # Install Docker via official convenience script
+    # Install Docker via official convenience script. See base
+    # template above for retry rationale.
     if ! command -v docker &>/dev/null; then
-      curl -fsSL https://get.docker.com | sh
+      attempt=1
+      max_attempts=3
+      until curl -fsSL https://get.docker.com | sh; do
+        if [ "$attempt" -ge "$max_attempts" ]; then
+          echo "[sandbox-provision] docker install failed after $max_attempts attempts" >&2
+          exit 1
+        fi
+        echo "[sandbox-provision] docker install attempt=$attempt failed, retrying" >&2
+        attempt=$((attempt + 1))
+        sleep 5
+      done
       usermod -aG docker agent
     fi
     echo "[sandbox-provision] step=docker done=$(date -u +%Y-%m-%dT%H:%M:%S)"
