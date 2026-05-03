@@ -301,6 +301,13 @@ pub struct SubnetEntry {
     /// don't yet exist (e.g. an admin staging a config before
     /// provisioning the user account).
     pub allow_users: Vec<String>,
+    /// Free-form operator-facing description of what this subnet pool is
+    /// for. Informational only — no code reads it. Optional so older
+    /// `users.conf` files without the field continue to parse; the
+    /// `deny_unknown_fields` guard on the struct is preserved so typos
+    /// on unrelated fields are still rejected.
+    #[serde(default)]
+    pub comment: Option<String>,
 }
 
 impl UsersConfig {
@@ -754,6 +761,75 @@ mod tests {
         assert!(
             matches!(err, UsersConfigError::ParseFailed { .. }),
             "expected ParseFailed for unknown subnet-entry field, got {err:?}"
+        );
+    }
+
+    /// A typo on a known field name (`alow_users` instead of
+    /// `allow_users`) must still trip `deny_unknown_fields`. This guards
+    /// against accidentally regressing the typo-detection when the
+    /// optional `comment` field is added — the guard rests on the
+    /// `deny_unknown_fields` attribute on the struct, and the optional
+    /// `#[serde(default)]` field is allowed to coexist with it.
+    #[test]
+    fn typo_on_allow_users_field_rejected() {
+        let raw = r#"{
+            "subnets": [
+                {
+                    "cidr": "10.209.0.0/20",
+                    "alow_users": ["olek"]
+                }
+            ]
+        }"#;
+        let f = write_tempfile(raw);
+        let err = load_users_config_from(f.path()).expect_err("must fail");
+        assert!(
+            matches!(err, UsersConfigError::ParseFailed { .. }),
+            "expected ParseFailed for typo on `allow_users`, got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Optional `comment` field — parsed when present, defaults to None
+    // when absent. Informational only; no code reads it. The field's
+    // `#[serde(default)]` lets older files without it keep parsing
+    // while `deny_unknown_fields` continues to catch typos on unrelated
+    // field names (covered by `typo_on_allow_users_field_rejected`).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn comment_field_populates_option_when_present() {
+        let raw = r#"{
+            "subnets": [
+                {
+                    "comment": "Production pool — operator's daemon.",
+                    "cidr": "10.209.0.0/20",
+                    "allow_users": ["olek"]
+                }
+            ]
+        }"#;
+        let f = write_tempfile(raw);
+        let cfg = load_users_config_from(f.path()).expect("parse");
+        assert_eq!(cfg.subnets.len(), 1);
+        assert_eq!(
+            cfg.subnets[0].comment.as_deref(),
+            Some("Production pool — operator's daemon."),
+        );
+    }
+
+    #[test]
+    fn comment_field_absent_yields_none() {
+        let raw = r#"{
+            "subnets": [
+                { "cidr": "10.209.0.0/20", "allow_users": ["olek"] }
+            ]
+        }"#;
+        let f = write_tempfile(raw);
+        let cfg = load_users_config_from(f.path()).expect("parse");
+        assert_eq!(cfg.subnets.len(), 1);
+        assert!(
+            cfg.subnets[0].comment.is_none(),
+            "comment must default to None when absent, got {:?}",
+            cfg.subnets[0].comment,
         );
     }
 

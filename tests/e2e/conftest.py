@@ -67,6 +67,67 @@ BRIDGE_CONF_PATH = Path("/etc/qemu/bridge.conf")
 # override via the env var before invoking pytest.
 os.environ.setdefault("SANDBOX_BASE_VM_NAME", "sandbox-test-base")
 
+# CIDR pool of /28 blocks the e2e test daemon allocates session networks
+# from. Disjoint from the production pool (10.209.0.0/20) so the
+# M11-S10 CIDR-scoped reaper has something to filter on: the test
+# daemon's startup cleanup only deletes session resources falling inside
+# this CIDR, leaving any live production sessions in 10.209.0.0/20
+# untouched.
+E2E_TEST_POOL_CIDR = "10.220.0.0/20"
+
+# The test daemon reads its users.conf from a tempfile we own, written
+# at conftest-module import time. The tempfile lists ONLY the test pool
+# (10.220.0.0/20) so the daemon's `find_subnet_by_uid` lookup at startup
+# returns the test pool — not the production pool the canonical
+# `/etc/sandboxd/users.conf` lists first. The daemon honors
+# `SANDBOX_USERS_CONF` unconditionally per M11-S9 (it is not the
+# privilege boundary; only the cap'd route helper is, and the helper
+# default-build refuses the env var). The production route helper
+# continues reading the canonical file — which lists both pools after
+# `make setup-users-conf` — so authorization for the test pool's
+# gateway IP succeeds without weakening the M11-S9 boundary.
+#
+# Tempfile is owned by the test runner's uid (the daemon does not run
+# the route-helper-style ownership check on the env-var path) and is
+# cleaned up at process exit via `atexit`. Like `SANDBOX_BASE_VM_NAME`
+# above, we set it on the harness's own env so children inherit it; an
+# operator-set value (e.g. for ad-hoc debugging) takes precedence via
+# `setdefault`.
+import atexit  # noqa: E402  -- after module-level setup
+import getpass  # noqa: E402
+if "SANDBOX_USERS_CONF" not in os.environ:
+    _users_conf_payload = {
+        "subnets": [
+            {
+                "comment": (
+                    "E2E test daemon pool — see "
+                    "docs/internal/milestones/M12.md S13."
+                ),
+                "cidr": E2E_TEST_POOL_CIDR,
+                "allow_users": [getpass.getuser()],
+            }
+        ]
+    }
+    _users_conf_tf = tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".json",
+        prefix="sandbox-e2e-users-",
+        delete=False,
+    )
+    json.dump(_users_conf_payload, _users_conf_tf)
+    _users_conf_tf.flush()
+    _users_conf_tf.close()
+    os.chmod(_users_conf_tf.name, 0o600)
+    os.environ["SANDBOX_USERS_CONF"] = _users_conf_tf.name
+
+    def _cleanup_users_conf_tempfile(path: str = _users_conf_tf.name) -> None:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    atexit.register(_cleanup_users_conf_tempfile)
+
 
 # ---------------------------------------------------------------------------
 # Shared test helpers

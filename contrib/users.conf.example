@@ -1,5 +1,14 @@
 {
   "subnets": [
-    { "cidr": "10.209.0.0/20", "allow_users": ["$USER"] }
+    {
+      "comment": "Production pool — used by the operator's sandboxd reading the canonical /etc/sandboxd/users.conf.",
+      "cidr": "10.209.0.0/20",
+      "allow_users": ["$USER"]
+    },
+    {
+      "comment": "E2E test pool — used by the e2e test daemon launched with SANDBOX_USERS_CONF pointing at a tempfile that contains only this entry. The production route helper continues reading this canonical file, so authorization for this pool's gateway IP succeeds.",
+      "cidr": "10.220.0.0/20",
+      "allow_users": ["$USER"]
+    }
   ]
 }

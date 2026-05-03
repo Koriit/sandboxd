@@ -314,21 +314,40 @@ Schema:
 
 Multiple subnet entries are allowed; each binds one CIDR pool to a list of allowed Unix usernames. The daemon resolves `allow_users` entries to numeric uids via `getpwnam_r` at startup, so renaming a user with `usermod` takes effect on the next daemon start without editing this file.
 
-For a single-user dev install (one daemon user, one default pool), `make setup-users-conf` renders `contrib/users.conf.example` with `$USER` substituted in. The manual equivalent:
+For a single-user dev install, `make setup-users-conf` renders `contrib/users.conf.example` with `$USER` substituted in. The example ships **two pools**:
+
+| CIDR | Purpose | Read by |
+|------|---------|---------|
+| `10.209.0.0/20` | Production pool | The operator's `sandboxd` reading the canonical `/etc/sandboxd/users.conf`. The daemon's `find_subnet_by_uid` lookup returns this entry first since it appears first in the array. |
+| `10.220.0.0/20` | E2E test pool | The e2e test daemon, which `tests/e2e/conftest.py` launches with `SANDBOX_USERS_CONF` pointing at a tempfile users.conf containing only this entry. The production `sandbox-route-helper` continues reading the canonical file — which lists both pools — so authorization for the test pool's gateway IP succeeds without weakening the [`SANDBOX_USERS_CONF` privilege boundary](#privilege-boundary-sandbox_users_conf-is-feature-gated). |
+
+The two pools are non-overlapping `/20` blocks. Disjoint CIDRs let the M11-S10 CIDR-scoped reaper distinguish test-daemon resources from production-daemon resources at startup, so a `make test-e2e` run never touches a live production session.
+
+The manual equivalent of `make setup-users-conf`:
 
 ```bash
 sudo mkdir -p /etc/sandboxd
-echo '{"subnets":[{"cidr":"10.209.0.0/20","allow_users":["'"$USER"'"]}]}' \
-    | sudo tee /etc/sandboxd/users.conf > /dev/null
+sudo tee /etc/sandboxd/users.conf > /dev/null <<EOF
+{
+  "subnets": [
+    { "cidr": "10.209.0.0/20", "allow_users": ["$USER"] },
+    { "cidr": "10.220.0.0/20", "allow_users": ["$USER"] }
+  ]
+}
+EOF
 sudo chown root:root /etc/sandboxd/users.conf
 sudo chmod 0644 /etc/sandboxd/users.conf
 ```
 
 The shell-redirect through `sudo tee` is intentional — `sudo echo ... > file` does not work because the shell opens the file before `sudo` is involved.
 
+##### Upgrade path for hosts installed before the dual-pool layout
+
+Hosts that ran `make setup-dev-env` before the dual-pool layout landed carry a single-pool canonical file (production pool only). Re-running `make setup-users-conf` on such a host detects the missing test pool and idempotently appends it via a `python3` JSON round-trip; operator-added entries are preserved untouched. A second invocation prints `✓ already configured` and invokes no `sudo`. `contrib/users.conf.example` is the source of truth for the layout — diff against it if you want to confirm what `make setup-users-conf` will install on a fresh host.
+
 #### `SANDBOX_USERS_CONF` env-var override
 
-The daemon honors a `SANDBOX_USERS_CONF` environment variable that overrides the canonical path. This is a test-only seam consumed by the daemon-startup integration tests; production operators must not set it. The route helper additionally **does not honor this env var** in production builds — see [sandbox-route-helper](#sandbox-route-helper) below for the privilege rationale.
+The daemon honors a `SANDBOX_USERS_CONF` environment variable that overrides the canonical path. The e2e test harness uses it to point the test daemon at a tempfile listing only the test pool (`10.220.0.0/20`); production operators must not set it. The route helper additionally **does not honor this env var** in production builds — see [sandbox-route-helper](#sandbox-route-helper) below for the privilege rationale.
 
 ### sandbox-route-helper
 

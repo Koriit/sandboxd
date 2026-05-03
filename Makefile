@@ -333,14 +333,55 @@ setup-bridge-conf:
 	  sudo -k chmod 0644 "$(BRIDGE_CONF_PATH)"; \
 	fi
 
-# setup-users-conf — `/etc/sandboxd/users.conf`. Substitutes `$USER`
-# into `contrib/users.conf.example` and installs it at the canonical
-# path. Idempotent: if the file already exists, leaves it alone (the
-# operator may have customized it; never overwrite admin-curated
-# config).
+# setup-users-conf — `/etc/sandboxd/users.conf`.
+#
+# Two paths:
+#
+# (a) File does not exist — render `contrib/users.conf.example` with
+#     `$USER` substituted in and install it at the canonical path.
+#     Ships both the production pool (10.209.0.0/20) and the e2e test
+#     pool (10.220.0.0/20).
+#
+# (b) File exists — leave operator-curated subnets alone, but ensure
+#     the e2e test pool (10.220.0.0/20) is present. If absent, parse
+#     the canonical JSON, append the test-pool entry to the end of the
+#     `subnets` array, and write the result back via `sudo install`.
+#     If present, print `✓ already configured` and invoke no sudo.
+#
+# The upgrade path in (b) exists because hosts that ran
+# `make setup-dev-env` before the dual-pool change carry a
+# single-pool `users.conf`. The e2e harness sets `SANDBOX_USERS_CONF`
+# to point its test daemon at a tempfile users.conf containing only
+# the test pool, but the production route helper continues reading
+# the canonical file — so the canonical file must list the test pool
+# too, or route-helper authorization for the test pool's gateway IP
+# fails. See `docs/internal/milestones/M12.md` § S13 for the
+# rationale.
+#
+# Mutation rule: only ever *append* the test-pool entry. Never
+# remove, reorder, or rewrite any existing entry the operator has
+# added. The append goes through a Python `json.load`/`json.dump`
+# round-trip rather than regex/sed so we cannot corrupt the file's
+# JSON shape.
 setup-users-conf:
 	@if [ -f "$(USERS_CONF_PATH)" ]; then \
-	  echo "✓ already configured: $(USERS_CONF_PATH) (existing file left in place)"; \
+	  rendered_test_entry=$$(python3 -c 'import json,os,sys; sys.stdout.write(json.dumps({"comment":"E2E test pool — used by the e2e test daemon launched with SANDBOX_USERS_CONF pointing at a tempfile that contains only this entry. The production route helper continues reading this canonical file, so authorization for this pool'"'"'s gateway IP succeeds.","cidr":"10.220.0.0/20","allow_users":[os.environ["USER"]]}, indent=2))'); \
+	  status=$$(python3 -c 'import json,sys; cfg=json.load(open(sys.argv[1])); print("present" if any(s.get("cidr")=="10.220.0.0/20" for s in cfg.get("subnets",[])) else "absent")' "$(USERS_CONF_PATH)" 2>/dev/null) || { \
+	    echo "ERROR: $(USERS_CONF_PATH) exists but is not parseable as JSON."; \
+	    echo "Refusing to mutate. Inspect the file and re-run after fixing."; \
+	    exit 1; \
+	  }; \
+	  if [ "$$status" = "present" ]; then \
+	    echo "✓ already configured: $(USERS_CONF_PATH) (test pool 10.220.0.0/20 present)"; \
+	  else \
+	    tmp=$$(mktemp); \
+	    USER="$$USER" python3 -c 'import json,os,sys; cfg=json.load(open(sys.argv[1])); cfg.setdefault("subnets", []).append({"comment":"E2E test pool — used by the e2e test daemon launched with SANDBOX_USERS_CONF pointing at a tempfile that contains only this entry. The production route helper continues reading this canonical file, so authorization for this pool'"'"'s gateway IP succeeds.","cidr":"10.220.0.0/20","allow_users":[os.environ["USER"]]}); json.dump(cfg, open(sys.argv[2], "w"), indent=2); open(sys.argv[2], "a").write("\n")' "$(USERS_CONF_PATH)" "$$tmp"; \
+	    echo "[sudo] append test pool entry to $(USERS_CONF_PATH):"; \
+	    echo "$$rendered_test_entry" | sed 's/^/    /'; \
+	    echo "[sudo] install -o root -g root -m 0644 <updated> $(USERS_CONF_PATH)"; \
+	    sudo -k install -o root -g root -m 0644 "$$tmp" "$(USERS_CONF_PATH)"; \
+	    rm -f "$$tmp"; \
+	  fi; \
 	else \
 	  rendered=$$(sed 's/$$USER/'"$$USER"'/g' contrib/users.conf.example); \
 	  echo "[sudo] mkdir -p /etc/sandboxd  (creating sandboxd config directory)"; \
