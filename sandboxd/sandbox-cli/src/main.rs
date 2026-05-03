@@ -3277,14 +3277,11 @@ enum TransferDirection {
 /// `std::process::Command`. Mirrors [`plan_ssh_command`] so all
 /// session-targeting CLI commands share the same dispatch shape.
 ///
-/// **Why this exists.** Before M12-S7 `sandbox cp` chunked the file
-/// into base64 frames and pushed them through daemon `/upload` /
-/// `/download` HTTP endpoints (since removed), which in turn hit the
-/// guest agent over TCP-over-SSH. That worked but glossed over
-/// edge cases the backend-native tools already handle: large files,
+/// **Why this exists.** Dispatching to the backend's native copy
+/// command (`limactl cp` / `docker cp`) handles edge cases the
+/// daemon-side base64-over-HTTP pump glossed over: large files,
 /// sparse files, attribute preservation, directory recursion, and
-/// error message clarity. This planner replaces that pump with a
-/// dispatch to the runtime's own copy command.
+/// error message clarity.
 ///
 /// **Backend shapes.**
 ///

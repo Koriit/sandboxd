@@ -11,9 +11,9 @@
 #     to `nfnetlink_conntrack`'s `NFNLGRP_CONNTRACK_NEW` multicast group
 #     (filtered for UDP) and emits one JSONL `allow` record per new
 #     tracked flow. `/health` on `:10004`.
-# The two binaries are independent failure domains (M12-S2 spec
-# Decision 4): each owns its own data source, JSONL file, and `/health`
-# endpoint; they share only the `sandbox-event-emitter` lib crate.
+# The two binaries are independent failure domains: each owns its own
+# data source, JSONL file, and `/health` endpoint; they share only the
+# `sandbox-event-emitter` lib crate.
 #
 # Build context is the repository root (see Makefile `.gateway-image.stamp`
 # target); `.dockerignore` prunes heavyweight directories.
@@ -98,8 +98,8 @@ RUN chmod +x /usr/local/bin/coredns
 # Runtime-only dependency is glibc (≥ the debian:bookworm version the
 # builder stage linked against); no extra packages needed. Both
 # binaries land side-by-side in `/usr/local/bin/`; the entrypoint
-# launches each as its own supervised PID (M12-S2 Decision 4 —
-# independent failure domains).
+# launches each as its own supervised PID (independent failure
+# domains).
 COPY --from=nft-loggers-builder /out/sandbox-nft-deny-logger  /usr/local/bin/sandbox-nft-deny-logger
 COPY --from=nft-loggers-builder /out/sandbox-nft-allow-logger /usr/local/bin/sandbox-nft-allow-logger
 RUN chmod +x /usr/local/bin/sandbox-nft-deny-logger /usr/local/bin/sandbox-nft-allow-logger
@@ -125,18 +125,18 @@ RUN mkdir -p /var/log/gateway/events /var/run/gateway /tmp/gateway \
 # ---------- copy configuration files ----------
 # Build context is the repository root. Paths below are repo-relative.
 #
-# M9-S18: Envoy configuration is now provided at runtime by sandboxd.
+# Envoy configuration is provided at runtime by sandboxd, not baked
+# into the image:
 #  - `/etc/envoy/envoy-bootstrap.yaml` is written via `docker exec` after
 #    `docker run` but before the entrypoint starts Envoy.
 #  - `/etc/envoy/listeners/listener.yaml` lives in a per-session host
 #    directory bind-mounted into the container (see `atomic_listener_writer`
 #    in `sandbox-core`). Docker creates the mountpoint automatically.
-# We therefore no longer ship `envoy-base.yaml` inside the image.
 COPY networking/gateway/Corefile /opt/coredns/Corefile
-# M10-S2 Phase 6b: both addons import the shared EventEmitter from
-# ``events.py``, so it must sit alongside the addon scripts in
-# ``/etc/mitmproxy/`` — mitmdump loads the addon by path, and Python
-# resolves the sibling ``events`` module via the addon's own directory.
+# Both addons import the shared EventEmitter from ``events.py``, so
+# it must sit alongside the addon scripts in ``/etc/mitmproxy/`` —
+# mitmdump loads the addon by path, and Python resolves the sibling
+# ``events`` module via the addon's own directory.
 COPY networking/mitmproxy/events.py /etc/mitmproxy/events.py
 COPY networking/mitmproxy/passthrough_addon.py /etc/mitmproxy/passthrough_addon.py
 COPY networking/mitmproxy/policy_addon.py /etc/mitmproxy/policy_addon.py
@@ -149,7 +149,7 @@ RUN chmod +x /entrypoint.sh /healthcheck.sh
 # 10000 - Envoy listener (TCP pass-through)
 # 10001 - sandbox-nft-deny-logger TCP listener (denied VM TCP, DNAT'd here)
 # 10003 - sandbox-nft-deny-logger health endpoint
-# 10004 - sandbox-nft-allow-logger health endpoint (M12-S2 Phase 3)
+# 10004 - sandbox-nft-allow-logger health endpoint
 # 8080  - mitmproxy listener (HTTP/HTTPS inspection)
 # 53    - CoreDNS (DNS)
 # 9901  - Envoy admin (loopback only in config, but declared for docs)

@@ -28,6 +28,13 @@ test:
 # For finer selection while iterating, layer an `-E` filter on top of
 # the profile, e.g. `cargo nextest run --profile integration -E \
 # 'test(integration_gateway_lifecycle)'`.
+#
+# `--features sandbox-route-helper/test-env-override` lets the tests
+# redirect users.conf via `SANDBOX_USERS_CONF` (default builds ignore
+# it — see the privilege-boundary rationale on
+# `install-route-helper-test-cap`). Flag must match the install step
+# or the test's checksum check rejects the on-disk cap'd binary as
+# stale.
 test-integration: gateway-image install-route-helper-test-cap
 	cd sandboxd && cargo nextest run --workspace --profile integration --features sandbox-route-helper/test-env-override
 
@@ -36,8 +43,7 @@ test-integration: gateway-image install-route-helper-test-cap
 # 3.12 → 3.13 — invalidates the marker and forces a venv rebuild.
 # Without the embedded version, the existing `.venv` becomes
 # ABI-incompatible with the new interpreter while the stamp remains
-# fresh, and `make test-e2e` crashes with `No module named pytest`
-# (this regression bit M10-S8 Group 1).
+# fresh, and `make test-e2e` crashes with `No module named pytest`.
 PY_VERSION := $(shell python3 -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')
 VENV_STAMP := tests/e2e/.venv/.installed.$(PY_VERSION)
 
@@ -151,7 +157,7 @@ clean:
 	rm -rf site/node_modules site/dist
 
 # ---------------------------------------------------------------------------
-# Dev-environment setup (M11-S9)
+# Dev-environment setup
 # ---------------------------------------------------------------------------
 #
 # `make setup-dev-env` is the one-shot operator entry point: it runs

@@ -1,11 +1,11 @@
 //! Integration test: `sandbox cp` dispatches to the backend's native
 //! copy tool (`limactl cp` for Lima, `docker cp` for container).
 //!
-//! Spec § M12-S7 ("Native `cp` via `limactl cp` / `docker cp`"). The
-//! refactor replaces a daemon-relayed base64 byte pump with a direct
-//! call to the runtime's native copy tool. This test pins the
-//! end-to-end CLI surface so a future regression cannot silently
-//! revert to the in-tree path or wire the wrong argument shape.
+//! `sandbox cp` dispatches directly to the backend's native copy
+//! tool rather than relaying bytes through the daemon. This test
+//! pins the end-to-end CLI surface so a regression cannot silently
+//! reintroduce a daemon-relayed pump or wire the wrong argument
+//! shape.
 //!
 //! The test stages a tempdir shim on `PATH` for both `limactl` and
 //! `docker` that records its argv to a sentinel file. A fake
@@ -366,11 +366,8 @@ async fn integration_cp_container_download_swaps_src_and_dst_args() {
 
 /// When the native tool exits non-zero (e.g. source-not-found), the
 /// CLI propagates the exit code unchanged and forwards the native
-/// stderr verbatim. This is the "improved error message clarity"
-/// behavior change M12-S7 calls out: callers see the same diagnostic
-/// they would get from `limactl cp` / `docker cp` directly, instead
-/// of the previous in-tree wrapper's `Error: cannot read local file
-/// '<path>': No such file or directory (os error 2)` message.
+/// stderr verbatim — callers see the same diagnostic they would get
+/// from `limactl cp` / `docker cp` directly.
 #[tokio::test]
 async fn integration_cp_lima_propagates_native_error_and_exit_code() {
     let (_tmp_daemon, sock) = spawn_fake_daemon("lima").await;

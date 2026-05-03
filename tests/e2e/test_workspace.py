@@ -251,14 +251,11 @@ def test_cp_native_attributes(sandbox_cli, backend):
     """Round-trip a 10 MB sparse file with mode 0700 across both backends
     and verify size + mode are preserved end-to-end.
 
-    Validates that the M12-S7 native-cp dispatch (`limactl cp` /
-    `docker cp`) preserves file attributes the prior base64-pump
-    implementation never did. The pre-M12-S7 path lost mode (the CLI
-    never set it on `FileUploadRequest`) and inflated sparse files
-    (base64 + decode forces every hole into a real byte). The native
-    tools handle both: `scp` (under `limactl cp`) preserves mode and
-    sparseness with `-p`/`-S`; `docker cp` preserves mode by default
-    and copies sparse-aware via tar streaming.
+    Validates that the native-cp dispatch (`limactl cp` / `docker
+    cp`) preserves file attributes: `scp` (under `limactl cp`)
+    preserves mode and sparseness with `-p`/`-S`; `docker cp`
+    preserves mode by default and copies sparse-aware via tar
+    streaming.
 
     Sparseness is asserted via the *apparent* vs *allocated* size
     relationship: a true sparse file has `du --apparent-size` = 10 MB
@@ -272,7 +269,7 @@ def test_cp_native_attributes(sandbox_cli, backend):
       host  /tmp/<tmpdir>/sparse-roundtripped.bin
 
     Backend coverage: parametrised over [lima, container] like the
-    other M5 cp tests.
+    other cp tests.
     """
     session_id = None
     host_dir = None
@@ -313,7 +310,6 @@ def test_cp_native_attributes(sandbox_cli, backend):
         )
 
         # In-VM mode check: stat -c %a returns the file mode in octal.
-        # Mode 0700 must round-trip — the pre-M12-S7 path lost it.
         mode_in_vm = sandbox_cli(
             "exec", "ws-cp-attr", "--",
             "stat", "-c", "%a", "/home/agent/sparse-uploaded.bin",

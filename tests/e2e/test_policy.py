@@ -2568,16 +2568,6 @@ def test_empty_policy_denies_dns(sandbox_cli, backend):
             sandbox_cli("rm", "pol-empty-default", timeout=120)
 
 
-# Note: the M9-era `test_unrestricted_allows_and_logs` test was removed in
-# M10-S1. The spec (`.tasks/specs/2026-04-21-port-explicit-policies-
-# presets-observability-design.md`, Part 1) removes `--unrestricted` /
-# `Policy::unrestricted()` as an escape hatch; the discovery workflow it
-# supported is replaced by deny-log-driven iteration delivered in Part 3
-# (`sandbox events --decision=deny --follow`), which lands in later M10
-# sessions. Until that ships there is no functional equivalent to assert
-# here.
-
-
 @pytest.mark.timeout(600)
 def test_policy_clear_reverts_to_deny_all(sandbox_cli, backend):
     """Create a session with an HTTP-level policy, then clear it via
