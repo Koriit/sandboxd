@@ -6765,7 +6765,9 @@ mod tests {
 
     #[test]
     fn validate_base_vm_name_rejects_disallowed_characters() {
-        for bad in ["foo!bar", "foo bar", "foo/bar", "foo.bar", "foo_bar", "foo:bar"] {
+        for bad in [
+            "foo!bar", "foo bar", "foo/bar", "foo.bar", "foo_bar", "foo:bar",
+        ] {
             let err = validate_base_vm_name(bad)
                 .unwrap_err_or_panic_with(|| format!("expected reject for {bad:?}"));
             match err {

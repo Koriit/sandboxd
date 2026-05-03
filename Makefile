@@ -211,10 +211,10 @@ sandboxd/target/.dev-env-stamps/route-helper-prod.stamp: sandboxd/target/release
 	else \
 	  echo "[sudo] install -m 0755 sandboxd/target/release/sandbox-route-helper $(ROUTE_HELPER_PROD_PATH)"; \
 	  echo "[sudo] setcap cap_net_admin,cap_sys_admin=eip $(ROUTE_HELPER_PROD_PATH)"; \
-	  sudo install -D -m 0755 \
+	  sudo -k install -D -m 0755 \
 	    sandboxd/target/release/sandbox-route-helper \
 	    "$(ROUTE_HELPER_PROD_PATH)"; \
-	  sudo setcap 'cap_net_admin,cap_sys_admin=eip' "$(ROUTE_HELPER_PROD_PATH)"; \
+	  sudo -k setcap 'cap_net_admin,cap_sys_admin=eip' "$(ROUTE_HELPER_PROD_PATH)"; \
 	fi
 	@touch $@
 
@@ -263,10 +263,10 @@ sandboxd/target/.dev-env-stamps/route-helper-test.stamp: sandboxd/target/debug/s
 	else \
 	  echo "[sudo] install -m 0755 sandboxd/target/debug/sandbox-route-helper $(ROUTE_HELPER_TEST_PATH)"; \
 	  echo "[sudo] setcap cap_net_admin,cap_sys_admin=eip $(ROUTE_HELPER_TEST_PATH)"; \
-	  sudo install -D -m 0755 \
+	  sudo -k install -D -m 0755 \
 	    sandboxd/target/debug/sandbox-route-helper \
 	    "$(ROUTE_HELPER_TEST_PATH)"; \
-	  sudo setcap 'cap_net_admin,cap_sys_admin=eip' "$(ROUTE_HELPER_TEST_PATH)"; \
+	  sudo -k setcap 'cap_net_admin,cap_sys_admin=eip' "$(ROUTE_HELPER_TEST_PATH)"; \
 	fi
 	@touch $@
 
@@ -328,9 +328,9 @@ setup-bridge-conf:
 	  echo "[sudo] mkdir -p /etc/qemu  (creating bridge-helper config directory)"; \
 	  echo "[sudo] write to $(BRIDGE_CONF_PATH): 'allow all' (qemu bridge auth for sb-* bridges)"; \
 	  echo "[sudo] chmod 0644 $(BRIDGE_CONF_PATH)"; \
-	  sudo mkdir -p /etc/qemu; \
-	  echo "allow all" | sudo tee "$(BRIDGE_CONF_PATH)" > /dev/null; \
-	  sudo chmod 0644 "$(BRIDGE_CONF_PATH)"; \
+	  sudo -k mkdir -p /etc/qemu; \
+	  echo "allow all" | sudo -k tee "$(BRIDGE_CONF_PATH)" > /dev/null; \
+	  sudo -k chmod 0644 "$(BRIDGE_CONF_PATH)"; \
 	fi
 
 # setup-users-conf — `/etc/sandboxd/users.conf`. Substitutes `$USER`
@@ -347,10 +347,10 @@ setup-users-conf:
 	  echo "[sudo] write to $(USERS_CONF_PATH):"; \
 	  echo "$$rendered" | sed 's/^/    /'; \
 	  echo "[sudo] chown root:root $(USERS_CONF_PATH); chmod 0644 $(USERS_CONF_PATH)"; \
-	  sudo mkdir -p /etc/sandboxd; \
-	  printf '%s\n' "$$rendered" | sudo tee "$(USERS_CONF_PATH)" > /dev/null; \
-	  sudo chown root:root "$(USERS_CONF_PATH)"; \
-	  sudo chmod 0644 "$(USERS_CONF_PATH)"; \
+	  sudo -k mkdir -p /etc/sandboxd; \
+	  printf '%s\n' "$$rendered" | sudo -k tee "$(USERS_CONF_PATH)" > /dev/null; \
+	  sudo -k chown root:root "$(USERS_CONF_PATH)"; \
+	  sudo -k chmod 0644 "$(USERS_CONF_PATH)"; \
 	fi
 
 # setup-bridge-helper-setuid — `qemu-bridge-helper` must be setuid
@@ -368,5 +368,5 @@ setup-bridge-helper-setuid:
 	  echo "✓ already configured: $(QEMU_BRIDGE_HELPER_PATH) is setuid (mode $$mode)"; \
 	else \
 	  echo "[sudo] chmod u+s $(QEMU_BRIDGE_HELPER_PATH)  (qemu-bridge-helper must be setuid for unprivileged TAP creation)"; \
-	  sudo chmod u+s "$(QEMU_BRIDGE_HELPER_PATH)"; \
+	  sudo -k chmod u+s "$(QEMU_BRIDGE_HELPER_PATH)"; \
 	fi

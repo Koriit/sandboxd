@@ -285,11 +285,7 @@ impl LimaManager {
     /// PATH resolution.  Useful for tests and environments where the binary
     /// location is already known.
     #[cfg(test)]
-    pub fn with_limactl_path(
-        base_dir: PathBuf,
-        limactl: PathBuf,
-        base_vm_name: String,
-    ) -> Self {
+    pub fn with_limactl_path(base_dir: PathBuf, limactl: PathBuf, base_vm_name: String) -> Self {
         Self {
             base_dir,
             limactl,
@@ -970,11 +966,7 @@ impl LimaManager {
             Err(e) => {
                 warn!(error = %e, "base image build failed, cleaning up partial VM");
                 let _ = run_with_timeout(
-                    Command::new(&self.limactl).args([
-                        "delete",
-                        "--force",
-                        &self.base_vm_name,
-                    ]),
+                    Command::new(&self.limactl).args(["delete", "--force", &self.base_vm_name]),
                     Duration::from_secs(60),
                     "limactl delete (base image cleanup)",
                 );
@@ -2068,12 +2060,11 @@ mod tests {
 
     #[test]
     fn test_generate_template() {
-        let mgr =
-            LimaManager::with_limactl_path(
-                PathBuf::from("/tmp/test"),
-                PathBuf::from("limactl"),
-                DEFAULT_BASE_VM_NAME.to_string(),
-            );
+        let mgr = LimaManager::with_limactl_path(
+            PathBuf::from("/tmp/test"),
+            PathBuf::from("limactl"),
+            DEFAULT_BASE_VM_NAME.to_string(),
+        );
         let id = SessionId::parse("550e8400e29b").unwrap();
         let config = SessionConfig::default(); // 2 CPU, 4096 MB, 20 GB
 
@@ -2147,12 +2138,11 @@ mod tests {
 
     #[test]
     fn test_generate_template_custom_config() {
-        let mgr =
-            LimaManager::with_limactl_path(
-                PathBuf::from("/tmp/test"),
-                PathBuf::from("limactl"),
-                DEFAULT_BASE_VM_NAME.to_string(),
-            );
+        let mgr = LimaManager::with_limactl_path(
+            PathBuf::from("/tmp/test"),
+            PathBuf::from("limactl"),
+            DEFAULT_BASE_VM_NAME.to_string(),
+        );
         let id = SessionId::parse("a1b2c3d4e5f6").unwrap();
         let config = SessionConfig {
             cpus: 8,
@@ -2189,12 +2179,11 @@ mod tests {
 
     #[test]
     fn test_generate_template_fractional_memory() {
-        let mgr =
-            LimaManager::with_limactl_path(
-                PathBuf::from("/tmp/test"),
-                PathBuf::from("limactl"),
-                DEFAULT_BASE_VM_NAME.to_string(),
-            );
+        let mgr = LimaManager::with_limactl_path(
+            PathBuf::from("/tmp/test"),
+            PathBuf::from("limactl"),
+            DEFAULT_BASE_VM_NAME.to_string(),
+        );
         let id = SessionId::generate();
         let config = SessionConfig {
             cpus: 1,
@@ -2218,12 +2207,11 @@ mod tests {
 
     #[test]
     fn test_generate_template_shared_workspace() {
-        let mgr =
-            LimaManager::with_limactl_path(
-                PathBuf::from("/tmp/test"),
-                PathBuf::from("limactl"),
-                DEFAULT_BASE_VM_NAME.to_string(),
-            );
+        let mgr = LimaManager::with_limactl_path(
+            PathBuf::from("/tmp/test"),
+            PathBuf::from("limactl"),
+            DEFAULT_BASE_VM_NAME.to_string(),
+        );
         let id = SessionId::parse("550e8400e29b").unwrap();
         let config = SessionConfig {
             cpus: 2,
@@ -2271,12 +2259,11 @@ mod tests {
 
     #[test]
     fn test_generate_template_clone_workspace_no_mount() {
-        let mgr =
-            LimaManager::with_limactl_path(
-                PathBuf::from("/tmp/test"),
-                PathBuf::from("limactl"),
-                DEFAULT_BASE_VM_NAME.to_string(),
-            );
+        let mgr = LimaManager::with_limactl_path(
+            PathBuf::from("/tmp/test"),
+            PathBuf::from("limactl"),
+            DEFAULT_BASE_VM_NAME.to_string(),
+        );
         let id = SessionId::generate();
         let config = SessionConfig {
             cpus: 1,
@@ -2418,12 +2405,11 @@ mod tests {
 
     #[test]
     fn test_generate_template_hardened_video_audio() {
-        let mgr =
-            LimaManager::with_limactl_path(
-                PathBuf::from("/tmp/test"),
-                PathBuf::from("limactl"),
-                DEFAULT_BASE_VM_NAME.to_string(),
-            );
+        let mgr = LimaManager::with_limactl_path(
+            PathBuf::from("/tmp/test"),
+            PathBuf::from("limactl"),
+            DEFAULT_BASE_VM_NAME.to_string(),
+        );
         let id = SessionId::generate();
         let config = SessionConfig {
             cpus: 2,
@@ -2452,12 +2438,11 @@ mod tests {
 
     #[test]
     fn test_generate_template_not_hardened_no_video_audio() {
-        let mgr =
-            LimaManager::with_limactl_path(
-                PathBuf::from("/tmp/test"),
-                PathBuf::from("limactl"),
-                DEFAULT_BASE_VM_NAME.to_string(),
-            );
+        let mgr = LimaManager::with_limactl_path(
+            PathBuf::from("/tmp/test"),
+            PathBuf::from("limactl"),
+            DEFAULT_BASE_VM_NAME.to_string(),
+        );
         let id = SessionId::generate();
         let config = SessionConfig {
             cpus: 2,
@@ -2487,12 +2472,11 @@ mod tests {
     #[test]
     fn test_ensure_qemu_wrapper_creates_file() {
         let dir = tempfile::TempDir::new().expect("create temp dir");
-        let mgr =
-            LimaManager::with_limactl_path(
-                dir.path().to_path_buf(),
-                PathBuf::from("limactl"),
-                DEFAULT_BASE_VM_NAME.to_string(),
-            );
+        let mgr = LimaManager::with_limactl_path(
+            dir.path().to_path_buf(),
+            PathBuf::from("limactl"),
+            DEFAULT_BASE_VM_NAME.to_string(),
+        );
 
         let wrapper = mgr.ensure_qemu_wrapper().unwrap();
 
@@ -2630,12 +2614,11 @@ mod tests {
     #[test]
     fn test_install_guest_agent_missing_binary() {
         let dir = tempfile::TempDir::new().expect("create temp dir");
-        let mgr =
-            LimaManager::with_limactl_path(
-                dir.path().to_path_buf(),
-                PathBuf::from("limactl"),
-                DEFAULT_BASE_VM_NAME.to_string(),
-            );
+        let mgr = LimaManager::with_limactl_path(
+            dir.path().to_path_buf(),
+            PathBuf::from("limactl"),
+            DEFAULT_BASE_VM_NAME.to_string(),
+        );
         let session_id = SessionId::generate();
 
         let result = mgr.install_guest_agent(
@@ -2774,12 +2757,11 @@ mod tests {
     #[test]
     fn test_qemu_wrapper_written_to_filesystem() {
         let dir = tempfile::TempDir::new().expect("create temp dir");
-        let mgr =
-            LimaManager::with_limactl_path(
-                dir.path().to_path_buf(),
-                PathBuf::from("limactl"),
-                DEFAULT_BASE_VM_NAME.to_string(),
-            );
+        let mgr = LimaManager::with_limactl_path(
+            dir.path().to_path_buf(),
+            PathBuf::from("limactl"),
+            DEFAULT_BASE_VM_NAME.to_string(),
+        );
 
         let wrapper_path = mgr
             .ensure_qemu_wrapper()
@@ -2813,12 +2795,11 @@ mod tests {
 
     #[test]
     fn test_generate_base_template_valid_yaml_fields() {
-        let mgr =
-            LimaManager::with_limactl_path(
-                PathBuf::from("/tmp/test"),
-                PathBuf::from("limactl"),
-                DEFAULT_BASE_VM_NAME.to_string(),
-            );
+        let mgr = LimaManager::with_limactl_path(
+            PathBuf::from("/tmp/test"),
+            PathBuf::from("limactl"),
+            DEFAULT_BASE_VM_NAME.to_string(),
+        );
 
         let template = mgr.generate_base_template();
 
@@ -2854,9 +2835,7 @@ mod tests {
 
         // Uses the base VM name as hostname.
         assert!(
-            template.contains(&format!(
-                "hostnamectl set-hostname {DEFAULT_BASE_VM_NAME}"
-            )),
+            template.contains(&format!("hostnamectl set-hostname {DEFAULT_BASE_VM_NAME}")),
             "base template should set hostname to base VM name"
         );
 
@@ -2911,12 +2890,11 @@ mod tests {
 
     #[test]
     fn test_generate_base_template_deterministic() {
-        let mgr =
-            LimaManager::with_limactl_path(
-                PathBuf::from("/tmp/test"),
-                PathBuf::from("limactl"),
-                DEFAULT_BASE_VM_NAME.to_string(),
-            );
+        let mgr = LimaManager::with_limactl_path(
+            PathBuf::from("/tmp/test"),
+            PathBuf::from("limactl"),
+            DEFAULT_BASE_VM_NAME.to_string(),
+        );
 
         let t1 = mgr.generate_base_template();
         let t2 = mgr.generate_base_template();

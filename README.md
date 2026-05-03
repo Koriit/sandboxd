@@ -29,10 +29,14 @@ CLI (sandbox) --> Unix socket --> Daemon (sandboxd) --> Lima/QEMU VMs
 
 | Crate | Purpose |
 |-------|---------|
-| `sandbox-core` | Shared library: session types, CA management, gateway/network/policy management, Lima VM management, session store |
-| `sandbox-cli` | CLI binary (`sandbox`): create/manage sessions, execute commands, file transfer, policy management |
+| `sandbox-core` | Shared library: backends (Lima/container), session store, policy, events, guest protocol |
 | `sandboxd` | Daemon binary: HTTP API on Unix socket, session lifecycle, networking orchestration |
-| `sandbox-guest` | Guest agent binary (runs inside VM): command execution, file transfer |
+| `sandbox-cli` | CLI binary (`sandbox`, also installed as `git-remote-sandbox`): session management, exec, file transfer, policy |
+| `sandbox-guest` | Guest agent binary (runs inside VM/container): command execution, file transfer |
+| `sandbox-route-helper` | Privileged setcap binary: installs the default route inside a container netns on behalf of an authorized caller |
+| `sandbox-event-emitter` | Shared lib used by both nft-loggers (JSONL writer + record types) |
+| `sandbox-nft-deny-logger` | Gateway-container binary: emits `deny` records (TCP DNAT + UDP NFLOG) |
+| `sandbox-nft-allow-logger` | Gateway-container binary: audits allowed UDP flows via NFCT |
 
 ## Prerequisites
 
@@ -54,15 +58,33 @@ sandbox exec my-sandbox -- echo "hello from sandbox"
 sandbox rm my-sandbox
 ```
 
+## Dev environment setup
+
+Before running `make test-integration` or any of the `make test-e2e*`
+targets on a fresh checkout, run:
+
+```bash
+make setup-dev-env
+```
+
+This is a one-shot, idempotent operator entry point that installs the
+cap'd `sandbox-route-helper` binaries, writes `/etc/sandboxd/users.conf`,
+configures `/etc/qemu/bridge.conf`, and ensures `qemu-bridge-helper` is
+setuid. Re-running on a configured host prints `✓ already configured`
+and invokes no `sudo`. See `docs/start/installation.md` for details.
+
 ## Build and test
 
 ```bash
-make build            # cargo build --workspace
-make test             # unit tests (~5s)
-make test-integration # integration tests (requires Docker + Lima)
-make test-e2e         # full E2E suite (boots real VMs, ~45 min)
-make gateway-image    # build gateway container
-make clean            # cargo clean
+make build                  # cargo build --workspace
+make test                   # hermetic unit tests (~5s, no Docker/Lima/nft)
+make test-integration       # integration tests (requires Docker + cap'd route helper)
+make test-e2e-container     # PR-time E2E: container backend only (~5-10 min)
+make test-e2e-matrix        # full E2E matrix: Lima + container (~30-45 min, needs /dev/kvm)
+make test-e2e               # back-compat alias for test-e2e-matrix
+make gateway-image          # build gateway container
+make lite-image             # build lite-mode container image
+make clean                  # cargo clean
 ```
 
 `make test-integration` rebuilds the `sandbox-gateway` image and runs
@@ -78,8 +100,8 @@ default `make test` path.
 ## Project structure
 
 ```
-sandboxd/           Rust workspace (4 crates)
-networking/          Gateway container (Envoy, mitmproxy, CoreDNS)
+sandboxd/            Rust workspace (8 crates)
+networking/          Gateway container (Envoy, mitmproxy, CoreDNS, nft-loggers)
 tests/e2e/           Python E2E test suite (pytest)
 docs/                Project documentation
 ```
@@ -88,11 +110,13 @@ docs/                Project documentation
 
 See the `docs/` directory for detailed documentation:
 
-- [Architecture](docs/architecture.md)
-- [Installation](docs/installation.md)
-- [CLI reference](docs/cli-reference.md)
-- [Networking](docs/networking.md)
-- [Policy engine](docs/policy.md)
-- [Workspaces](docs/workspaces.md)
-- [Hardening](docs/hardening.md)
-- [Troubleshooting](docs/troubleshooting.md)
+- [Installation](docs/start/installation.md)
+- [Quickstart](docs/start/quickstart.md)
+- [Architecture](docs/concepts/architecture.md)
+- [Networking](docs/concepts/networking.md)
+- [Policy model](docs/concepts/policy-model.md)
+- [Workspaces](docs/concepts/workspaces.md)
+- [CLI reference](docs/reference/cli.md)
+- [HTTP API reference](docs/reference/http-api.md)
+- [Hardening](docs/guides/hardening.md)
+- [Troubleshooting](docs/guides/troubleshooting.md)
