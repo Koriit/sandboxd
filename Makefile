@@ -36,7 +36,9 @@ test:
 # or the test's checksum check rejects the on-disk cap'd binary as
 # stale.
 test-integration: gateway-image install-route-helper-test-cap
-	cd sandboxd && cargo nextest run --workspace --profile integration --features sandbox-route-helper/test-env-override
+	cd sandboxd && \
+	    cargo build --workspace --features sandbox-route-helper/test-env-override && \
+	    cargo nextest run --workspace --profile integration --features sandbox-route-helper/test-env-override
 
 # The stamp filename embeds the host's Python minor version (e.g.
 # `.installed.python3.12`) so a host interpreter upgrade — say

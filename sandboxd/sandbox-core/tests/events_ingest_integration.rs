@@ -86,7 +86,7 @@ async fn next_event(
 }
 
 #[tokio::test]
-async fn ingestor_publishes_one_event_per_layer() {
+async fn integration_ingestor_publishes_one_event_per_layer() {
     let tmp = TempDir::new().expect("create tempdir");
     let events_dir = tmp.path().to_path_buf();
     let sid = SessionId::parse("aaaaaaaaaaaa").expect("valid fixture id");
@@ -178,7 +178,7 @@ async fn ingestor_publishes_one_event_per_layer() {
 }
 
 #[tokio::test]
-async fn ingestor_drops_events_with_unknown_source_ip() {
+async fn integration_ingestor_drops_events_with_unknown_source_ip() {
     let tmp = TempDir::new().expect("create tempdir");
     let events_dir = tmp.path().to_path_buf();
     let sid = SessionId::parse("bbbbbbbbbbbb").expect("valid fixture id");
@@ -200,7 +200,7 @@ async fn ingestor_drops_events_with_unknown_source_ip() {
     // mitmproxy attribution was intentionally moved off the vm_ip_map
     // lookup path — see the function-level doc on `dispatch_line` and
     // the dedicated
-    // `mitmproxy_event_attributes_via_watcher_session_even_with_unbound_client_ip`
+    // `integration_mitmproxy_event_attributes_via_watcher_session_even_with_unbound_client_ip`
     // test below. The drop-on-miss invariant continues to apply to the
     // producers that do use vm_ip_map (envoy + coredns).
     let unknown_line = format!(
@@ -228,7 +228,7 @@ async fn ingestor_drops_events_with_unknown_source_ip() {
 }
 
 #[tokio::test]
-async fn ingestor_abort_stops_further_publishes() {
+async fn integration_ingestor_abort_stops_further_publishes() {
     let tmp = TempDir::new().expect("create tempdir");
     let events_dir = tmp.path().to_path_buf();
     let sid = SessionId::parse("cccccccccccc").expect("valid fixture id");
@@ -295,7 +295,7 @@ async fn ingestor_abort_stops_further_publishes() {
 /// IP is deliberately bound to a *different* address to prove no
 /// lookup-by-client_ip is happening under the hood.
 #[tokio::test]
-async fn mitmproxy_event_attributes_via_watcher_session_even_with_unbound_client_ip() {
+async fn integration_mitmproxy_event_attributes_via_watcher_session_even_with_unbound_client_ip() {
     let tmp = TempDir::new().expect("create tempdir");
     let events_dir = tmp.path().to_path_buf();
     let sid = SessionId::parse("eeeeeeeeeeee").expect("valid fixture id");
