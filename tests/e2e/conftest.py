@@ -280,7 +280,13 @@ def _preflight_checks():
     Each check produces a clear, actionable skip message so the developer
     knows exactly what to install or configure.
     """
-    # 1. Docker accessible
+    # 1. Docker accessible — universal: both backends need Docker (Lima
+    #    pulls the gateway image; the container backend needs Docker
+    #    proper). KVM and Lima checks are deliberately not at session
+    #    scope: KVM is Linux/QEMU-specific (the upcoming macOS VZ Lima
+    #    backend has no /dev/kvm), and limactl is only needed by tests
+    #    carrying the ``lima`` marker — see
+    #    ``_lima_required_for_lima_tests`` below.
     try:
         subprocess.run(
             ["docker", "info"],
@@ -292,32 +298,8 @@ def _preflight_checks():
             "user is in the docker group (then re-login)."
         )
 
-    # 2. KVM available
-    kvm = Path("/dev/kvm")
-    if not kvm.exists():
-        pytest.skip(
-            "/dev/kvm not found. Enable KVM in your kernel / BIOS, or "
-            "load the kvm module: sudo modprobe kvm_intel  (or kvm_amd)."
-        )
-    if not os.access(kvm, os.R_OK):
-        pytest.skip(
-            "/dev/kvm exists but is not readable by the current user. "
-            "Add your user to the kvm group: sudo usermod -aG kvm $USER"
-        )
-
-    # 3. Lima installed
-    try:
-        subprocess.run(
-            ["limactl", "--version"],
-            capture_output=True, timeout=15, check=True,
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
-        pytest.skip(
-            "Lima not installed. Install limactl: "
-            "https://lima-vm.io/docs/installation/"
-        )
-
-    # 4. Gateway image exists
+    # 2. Gateway image exists — both backends require it (the gateway
+    #    container is the egress chokepoint for every session).
     try:
         subprocess.run(
             ["docker", "image", "inspect", "sandbox-gateway"],
@@ -329,31 +311,6 @@ def _preflight_checks():
             "make gateway-image"
         )
 
-    # 5. qemu-bridge-helper installed
-    helper = _find_qemu_bridge_helper()
-    if helper is None:
-        searched = ", ".join(str(p) for p in QEMU_BRIDGE_HELPER_PATHS)
-        pytest.skip(
-            f"qemu-bridge-helper not found (checked: {searched}). "
-            "Install the qemu-system-x86 (or qemu-utils) package."
-        )
-
-    # 6. qemu-bridge-helper has setuid bit
-    helper_stat = helper.stat()
-    if not (helper_stat.st_mode & stat.S_ISUID):
-        pytest.skip(
-            f"qemu-bridge-helper at {helper} is missing the setuid bit. "
-            f"Run: sudo chmod u+s {helper}"
-        )
-
-    # 7. bridge.conf exists
-    if not BRIDGE_CONF_PATH.exists():
-        pytest.skip(
-            f"{BRIDGE_CONF_PATH} not found. Create it with: "
-            f"sudo mkdir -p {BRIDGE_CONF_PATH.parent} && "
-            f'echo "allow all" | sudo tee {BRIDGE_CONF_PATH}'
-        )
-
     # Cleanup of stale sandbox-* resources is intentionally NOT done here.
     # The test daemon uses a distinct base VM name
     # (SANDBOX_BASE_VM_NAME = "sandbox-test-base"; see `sandbox_daemon`)
@@ -362,6 +319,63 @@ def _preflight_checks():
     # every `sandbox-*` resource on the host from here would clobber the
     # operator's production sandboxd — including the `sandbox-base`
     # golden image and any live production sessions.
+
+
+@pytest.fixture(autouse=True)
+def _lima_required_for_lima_tests(request):
+    """Per-test prereq check for tests carrying the ``lima`` marker.
+
+    Tests that need limactl / QEMU bridge helper / bridge.conf carry
+    ``@pytest.mark.lima`` (module-level for whole-file Lima-only files,
+    per-test for mixed files). On hosts without these prerequisites,
+    each Lima-marked test emits an individual, actionable skip; the
+    rest of the suite (cross-backend ``[container]`` parametrizations
+    and container-only ``test_lite.py``) runs unaffected.
+
+    Tests without the ``lima`` marker return immediately and pay no
+    cost. The fixture is declared at session-default scope (function-
+    scoped via autouse=True) so it runs once per test rather than once
+    per session.
+    """
+    if request.node.get_closest_marker("lima") is None:
+        return
+
+    # 1. Lima installed.
+    try:
+        subprocess.run(
+            ["limactl", "--version"],
+            capture_output=True, timeout=15, check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        pytest.skip(
+            "Lima (limactl) not installed; install via `brew install lima` "
+            "(macOS) or your distribution package (Linux), then re-run."
+        )
+
+    # 2. qemu-bridge-helper installed (Lima/QEMU-specific).
+    helper = _find_qemu_bridge_helper()
+    if helper is None:
+        searched = ", ".join(str(p) for p in QEMU_BRIDGE_HELPER_PATHS)
+        pytest.skip(
+            f"qemu-bridge-helper not found (checked: {searched}). "
+            "Install the qemu-system-x86 (or qemu-utils) package."
+        )
+
+    # 3. qemu-bridge-helper has setuid bit.
+    helper_stat = helper.stat()
+    if not (helper_stat.st_mode & stat.S_ISUID):
+        pytest.skip(
+            f"qemu-bridge-helper at {helper} is missing the setuid bit. "
+            f"Run: sudo chmod u+s {helper}"
+        )
+
+    # 4. bridge.conf exists.
+    if not BRIDGE_CONF_PATH.exists():
+        pytest.skip(
+            f"{BRIDGE_CONF_PATH} not found. Create it with: "
+            f"sudo mkdir -p {BRIDGE_CONF_PATH.parent} && "
+            f'echo "allow all" | sudo tee {BRIDGE_CONF_PATH}'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -675,26 +689,39 @@ def sandbox_cli(sandbox_binaries: SandboxBinaries, sandbox_daemon, _ensure_base_
 
 
 # ---------------------------------------------------------------------------
-# Backend parametrization (M11 § "E2E tests" → "Parametrization", spec lines
-# 990-1005)
+# Backend parametrization
 # ---------------------------------------------------------------------------
 #
-# Tests that exercise behavior contracts agnostic of backend (lifecycle,
-# exec, networking policy, git remote, workspace, presets, persistence)
-# request the ``backend`` fixture and use ``make_create_args(backend, ...)``
-# to build their ``sandbox create`` argv. pytest then runs each test twice
-# — once for ``backend == "lima"`` and once for ``backend == "container"``.
+# Three-way fixture-symmetric convention; zero convention-driven skips
+# on a properly-configured host:
 #
-# Lima-only tests (``test_vm_lifecycle.py``, ``test_hardening.py``,
-# ``test_golden_image.py``, ``test_networking.py::
-# test_concurrent_sessions``) carry an ``@pytest.mark.skipif(backend ==
-# "container", reason=...)`` to declare why the backend pair is not
-# applicable. Tests in ``test_lite.py`` are container-only and don't take
-# this fixture.
+# * Cross-backend tests take the ``backend`` fixture, no marker.
+#   pytest runs them twice — once with ``backend == "lima"`` and once
+#   with ``backend == "container"`` — and they pass the value through
+#   ``make_create_args(backend, ...)`` to build their ``sandbox
+#   create`` argv.
 #
-# CI policy (spec lines 1060-1070): PR-time runs ``container`` only;
-# merge-to-main runs the full ``[lima, container]`` matrix; nightly adds
-# performance numbers.
+# * Lima-only tests carry ``@pytest.mark.lima`` (module-level for
+#   whole-file Lima-only files like ``test_vm_lifecycle.py``,
+#   ``test_hardening.py``, and ``test_golden_image.py``; per-test for
+#   mixed files such as ``test_networking.py::
+#   test_concurrent_sessions``). They do not take the ``backend``
+#   fixture and hardcode ``"lima"`` in ``make_create_args`` calls. The
+#   ``lima`` marker also gates the per-test
+#   ``_lima_required_for_lima_tests`` fixture, so on a host without
+#   limactl / qemu-bridge-helper / bridge.conf each Lima-marked test
+#   emits a justified per-test skip rather than collapsing the whole
+#   session.
+#
+# * Container-only tests carry ``@pytest.mark.container`` (module-
+#   level for ``test_lite.py``). They do not take the ``backend``
+#   fixture and hardcode ``"container"`` in ``make_create_args``
+#   calls.
+#
+# CI selection: ``make test-e2e-container`` uses ``-m "not lima" -k
+# "not [lima]"`` (the ``-m`` clause excludes Lima-marked tests; the
+# ``-k`` clause filters out the ``[lima]`` parametrization of cross-
+# backend tests). ``make test-e2e-matrix`` runs everything.
 
 @pytest.fixture(params=["lima", "container"])
 def backend(request) -> str:

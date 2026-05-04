@@ -41,6 +41,11 @@ from conftest import (
 )
 from helpers import HostResources, LiteBackendHarness
 
+# Whole-file container-only: lets `-m container` select this file
+# explicitly and documents the backend coverage at the file's edge
+# rather than implicitly via the absence of the ``backend`` fixture.
+pytestmark = pytest.mark.container
+
 
 # ---------------------------------------------------------------------------
 # File-level skip if Docker is not accessible

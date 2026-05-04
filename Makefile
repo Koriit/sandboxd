@@ -79,22 +79,31 @@ TEST ?=
 # the parametrized `[container]` runs and the `tests/e2e/test_lite.py`
 # suite) is up to date before the suite runs.
 
-# PR-time: container backend only. Selects the parametrized
-# `[container]` invocations of backend-agnostic tests *and* the
-# container-only `tests/e2e/test_lite.py` file (whose test names do
-# not carry a backend-param suffix). Lima parametrizations and
-# Lima-only tests are filtered out, so this target does not require
-# KVM and runs in ~5-10 min on a warm runner.
+# PR-time: container backend only. The selector is fixture-symmetric
+# with the e2e marker convention (see `tests/e2e/conftest.py` →
+# "Backend parametrization"):
+#
+#   * `-m "not lima"` excludes Lima-only tests (whole-file or per-test
+#     `@pytest.mark.lima`).
+#   * `-k "not [lima]"` filters out the `[lima]` parametrization of
+#     cross-backend tests (which take the `backend` fixture).
+#
+# What remains is exactly the `[container]` half of cross-backend
+# tests and the container-only `test_lite.py` (`@pytest.mark.
+# container`). Zero convention-driven skips on a properly-configured
+# host; runs in ~5-10 min on a warm runner.
 test-e2e-container: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod-cap
 	cd tests/e2e && . .venv/bin/activate && \
 	  python -m pytest -v -rs --timeout=600 \
-	  -k "container or test_lite" $(TEST)
+	  -m "not lima" -k "not [lima]" $(TEST)
 
 # Merge-to-main: full matrix -- Lima + container parametrizations plus
 # the Lima-only and container-only test files. Wall clock ~30-45 min.
-# The Lima parametrizations require KVM/nested virt; on stock GitHub-
-# hosted runners this target will skip the Lima half via the
-# conftest preflight check (no `/dev/kvm`).
+# Single-backend tests (`@pytest.mark.lima` / `@pytest.mark.
+# container`) run once on their applicable backend; cross-backend
+# tests run twice. Lima-marked tests on a host without limactl /
+# qemu-bridge-helper / bridge.conf emit per-test skips via the
+# `_lima_required_for_lima_tests` fixture; everything else runs.
 test-e2e-matrix: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod-cap
 	cd tests/e2e && . .venv/bin/activate && \
 	  python -m pytest -v -rs --timeout=600 $(TEST)

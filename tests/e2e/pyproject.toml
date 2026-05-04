@@ -16,3 +16,7 @@ testpaths = ["."]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
 timeout = 600
+markers = [
+    "lima: test runs only on the Lima/QEMU backend",
+    "container: test runs only on the lite container backend",
+]

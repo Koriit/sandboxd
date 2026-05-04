@@ -1237,7 +1237,8 @@ def test_udp_allowed_ip_cidr_edge(sandbox_cli, backend):
 
 
 @pytest.mark.timeout(600)
-def test_ubuntu_preset_smoke(sandbox_cli, backend):
+@pytest.mark.lima
+def test_ubuntu_preset_smoke(sandbox_cli):
     """``sandbox create --preset 'ubuntu:'`` allows ``apt update`` against
     the canonical Ubuntu mirrors and surfaces an allow event for a
     UDP/123 packet to ``time.ubuntu.com``.
@@ -1250,21 +1251,17 @@ def test_ubuntu_preset_smoke(sandbox_cli, backend):
     per-session event bus (the nft-allow-logger emits an
     allow event for new conntrack flows; same shape
     ``test_udp_allow_ntp`` pins).
-    """
-    # Lima only: the apt half needs a real Ubuntu base image. See the
-    # block comment above for the backend split rationale.
-    if backend != "lima":
-        pytest.skip(
-            "ubuntu: preset smoke is Lima-only — apt update needs the real "
-            "Ubuntu base image; container backend boots a different stack"
-        )
 
+    Lima-only: the apt half needs a real Ubuntu base image, which the
+    lite container backend's image stack does not boot. See the block
+    comment above for the full rationale.
+    """
     session_id = None
     session_name = "ubuntu-preset-smoke"
     try:
         create_result = sandbox_cli(
             "create",
-            *make_create_args(backend, session_name, "--preset", "ubuntu:"),
+            *make_create_args("lima", session_name, "--preset", "ubuntu:"),
             timeout=600,
         )
         assert create_result.returncode == 0, (

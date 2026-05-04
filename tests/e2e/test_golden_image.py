@@ -53,6 +53,10 @@ from conftest import (
     wait_for_state,
 )
 
+# Whole-file Lima-only: gates the per-test Lima prereq fixture and lets
+# `-m "not lima"` exclude this file on container-only runs.
+pytestmark = pytest.mark.lima
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

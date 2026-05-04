@@ -10,19 +10,16 @@ Run with generous timeouts:
     source .venv/bin/activate
     python -m pytest test_networking.py -v --timeout=600
 
-Backend coverage: every test in this file is parametrized over
-``[lima, container]`` via the ``backend`` fixture. The gateway
-container, nftables ruleset, CoreDNS interception, and daemon /
-gateway crash-recovery monitors are shared between backends per the
-M11 gap-#70 closure. The three tests previously pinned to Lima via an
-in-body ``pytest.skip()`` for the ``10.209.x.x/28`` regex —
-``test_gateway_traffic_flow``, ``test_stop_start_with_networking``,
-``test_concurrent_sessions`` — now read the gateway / session IP /
-subnet CIDR from ``sandbox inspect <name>`` and run on both backends.
-The Lima-only RAM precondition in
-``test_concurrent_sessions`` (two 2 GB Lima VMs require ≥6 GB host
-RAM; container sessions are tens of MB) remains scoped to
-``backend == "lima"``.
+Backend coverage: most tests in this file take the ``backend`` fixture
+and parametrize over ``[lima, container]``. The gateway container,
+nftables ruleset, CoreDNS interception, and daemon / gateway crash-
+recovery monitors are shared between backends per the M11 gap-#70
+closure. ``test_concurrent_sessions`` is Lima-only
+(``@pytest.mark.lima``): the cross-session L4 isolation observation
+relies on ICMP, which the lite container backend's hardened profile
+does not expose (CAP_NET_RAW dropped); the structural disjoint-subnet
+contract is validated regardless, but the behavioural ping leg is a
+Lima-specific assertion.
 """
 
 from __future__ import annotations
@@ -772,44 +769,41 @@ def test_stop_start_with_networking(sandbox_cli, backend):
 
 
 @pytest.mark.timeout(600)
-def test_concurrent_sessions(sandbox_cli, backend):
+@pytest.mark.lima
+def test_concurrent_sessions(sandbox_cli):
     """Create two sessions and verify network isolation.
+
+    Lima-only: the cross-session L4-isolation leg uses ICMP (ping),
+    which the lite container backend's hardened profile drops via
+    CAP_NET_RAW; the gateway DNAT prerouting on the container backend
+    also rewrites every TCP/UDP packet from the session's own saddr,
+    so cross-session isolation is not observable from inside the
+    session. The structural disjoint-subnet contract is asserted
+    here regardless, but the behavioural ping leg is Lima-specific.
 
     Backend-neutral isolation property:
 
     * Session A's session/gateway IPs are NOT inside session B's
       subnet (and vice versa) — each session lives in a distinct /28
-      block, regardless of whether the underlying carrier is a Lima
-      Docker bridge or a per-session ``sandbox-net-<id>`` container
-      network.
+      block.
     * Both sessions can reach their own gateway.
     * Session A cannot reach session B's gateway — the per-session
       subnets are isolated, so routing between them must not exist.
-      (Behaviourally exercised on Lima only; on the container backend
-      the gateway DNAT prerouting rewrites every TCP/UDP packet from
-      the session's own saddr, so cross-session L4 isolation is
-      invisible from inside the session — see step 7's in-line
-      comment for the full rationale.)
 
     Subnet shape (the old ``10.209.x.x/28`` Lima-pool regex) is no
     longer asserted here; the daemon owns the subnet allocator and
-    `sandbox inspect` surfaces whatever it picked per backend.
+    `sandbox inspect` surfaces whatever it picked.
     """
-    # RAM precondition is Lima-only: the test boots two Lima VMs at 2 GB
-    # each, so a 6 GB host floor is required. Container sessions are tens
-    # of MB and have no such precondition; gating the check on
-    # backend == "lima" keeps the container parameterization runnable on
-    # memory-constrained hosts.
-    if backend == "lima" and (
-        os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") < 6 * 1024**3
-    ):
+    # RAM precondition: the test boots two Lima VMs at 2 GB each, so a
+    # 6 GB host floor is required.
+    if os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") < 6 * 1024**3:
         pytest.skip("Requires >= 6GB RAM for concurrent Lima VMs")
     session_id_a = None
     session_id_b = None
     try:
         # 1. Create first session.
         result_a = sandbox_cli(
-            "create", *make_create_args(backend, "net-multi-a"),
+            "create", *make_create_args("lima", "net-multi-a"),
             timeout=600,
         )
         assert result_a.returncode == 0, (
@@ -821,7 +815,7 @@ def test_concurrent_sessions(sandbox_cli, backend):
 
         # 2. Create second session.
         result_b = sandbox_cli(
-            "create", *make_create_args(backend, "net-multi-b"),
+            "create", *make_create_args("lima", "net-multi-b"),
             timeout=600,
         )
         assert result_b.returncode == 0, (
@@ -896,38 +890,24 @@ def test_concurrent_sessions(sandbox_cli, backend):
 
         # 7. Verify no cross-session traffic: session A cannot reach
         #    session B's gateway. The per-session subnets are isolated,
-        #    so routing between them must not exist.
-        #
-        #    Lima-only: the gateway's prerouting nftables ruleset
-        #    (``sandbox-core/src/gateway.rs:1462-1486``) DNATs every
-        #    TCP/UDP packet originating from the session's VM subnet
-        #    to one of three local sinks (CoreDNS for dport 53, Envoy
-        #    for policy-allowed (ip,port) pairs, deny-logger for
-        #    everything else) on A's *own* gateway IP. So a TCP probe
-        #    from session A to session B's gateway IP gets its
-        #    destination rewritten by A's gateway before the packet
-        #    ever leaves A's bridge — the connect succeeds against A's
-        #    deny-logger / CoreDNS regardless of whether B's bridge is
-        #    actually reachable, making behavioural cross-session
-        #    isolation untestable via TCP. ICMP is not DNAT'd by these
-        #    rules so a Lima ping cleanly observes the
-        #    no-route-to-host outcome, but the lite container backend
-        #    drops ``CAP_NET_RAW`` (spec § Hardening line 561-562) and
-        #    has no working ICMP path. The structural disjoint-subnet
-        #    check at step 5 above is the architecturally-binding
-        #    contract on both backends; behavioural isolation
-        #    coverage is retained via Lima only.
-        if backend == "lima":
-            cross_ping = sandbox_cli(
-                "exec", "net-multi-a", "--",
-                "ping", "-c", "2", "-W", "3", gw_ip_b,
-                timeout=120,
-            )
-            assert cross_ping.returncode != 0, (
-                f"Session A should NOT be able to reach session B's gateway "
-                f"{gw_ip_b}, but ping succeeded.\n"
-                f"stdout: {cross_ping.stdout}\nstderr: {cross_ping.stderr}"
-            )
+        #    so routing between them must not exist. ICMP is not DNAT'd
+        #    by the gateway's prerouting nftables ruleset
+        #    (``sandbox-core/src/gateway.rs:1462-1486``), so a Lima ping
+        #    cleanly observes the no-route-to-host outcome. The
+        #    container backend drops ``CAP_NET_RAW`` (spec § Hardening
+        #    line 561-562) and DNATs every TCP/UDP packet from the
+        #    session's saddr — making this leg untestable there, which
+        #    is why the whole test is Lima-marked at the top.
+        cross_ping = sandbox_cli(
+            "exec", "net-multi-a", "--",
+            "ping", "-c", "2", "-W", "3", gw_ip_b,
+            timeout=120,
+        )
+        assert cross_ping.returncode != 0, (
+            f"Session A should NOT be able to reach session B's gateway "
+            f"{gw_ip_b}, but ping succeeded.\n"
+            f"stdout: {cross_ping.stdout}\nstderr: {cross_ping.stderr}"
+        )
 
         # 8. Clean up both sessions.
         sandbox_cli("rm", "net-multi-a", timeout=120)
