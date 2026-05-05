@@ -1283,6 +1283,34 @@ provision:
   script: |
     #!/bin/bash
     set -eux -o pipefail
+    echo "[sandbox-provision] step=net-tune start=$(date -u +%Y-%m-%dT%H:%M:%S)"
+    # Workaround for libslirp PMTU-propagation gap.
+    # libslirp doesn't relay the host's learned PMTU into the guest's
+    # TCP state. On host paths with PMTU < 1500 (PPPoE, WiFi, VPN,
+    # cellular, NAT64), the guest's full-MTU TCP segments get
+    # blackholed — apt-update against Canonical mirrors hangs forever
+    # and the e2e base-image build times out at BASE_START_TIMEOUT.
+    #
+    # Clip eth0 (the SLIRP NIC) to 1280 bytes — the IPv6 minimum
+    # (RFC 8200 §5). Every IPv6-capable hop must forward this size,
+    # so it's the universal safe floor used by Cloudflare WARP,
+    # Tailscale, etc. Throughput cost is negligible for our workload
+    # (small apt fetches, package downloads). Session runtime egress
+    # uses eth1/the gateway bridge with its own MTU, so agent
+    # workloads inside session VMs are unaffected.
+    install -m 0600 /dev/stdin /etc/netplan/99-sandbox-mtu.yaml <<'NETPLAN_EOF'
+    network:
+      version: 2
+      ethernets:
+        eth0:
+          mtu: 1280
+    NETPLAN_EOF
+    netplan apply
+    echo "[sandbox-provision] step=net-tune done=$(date -u +%Y-%m-%dT%H:%M:%S)"
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
     echo "[sandbox-provision] step=apt-config start=$(date -u +%Y-%m-%dT%H:%M:%S)"
     # Switch apt sources to HTTPS and configure fast timeouts
     sed -i 's|http://|https://|g' /etc/apt/sources.list.d/ubuntu.sources
@@ -1481,6 +1509,34 @@ provision:
     echo 'agent ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/agent
     chmod 0440 /etc/sudoers.d/agent
     echo "[sandbox-provision] step=user done=$(date -u +%Y-%m-%dT%H:%M:%S)"
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    echo "[sandbox-provision] step=net-tune start=$(date -u +%Y-%m-%dT%H:%M:%S)"
+    # Workaround for libslirp PMTU-propagation gap.
+    # libslirp doesn't relay the host's learned PMTU into the guest's
+    # TCP state. On host paths with PMTU < 1500 (PPPoE, WiFi, VPN,
+    # cellular, NAT64), the guest's full-MTU TCP segments get
+    # blackholed — apt-update against Canonical mirrors hangs forever
+    # and the e2e base-image build times out at BASE_START_TIMEOUT.
+    #
+    # Clip eth0 (the SLIRP NIC) to 1280 bytes — the IPv6 minimum
+    # (RFC 8200 §5). Every IPv6-capable hop must forward this size,
+    # so it's the universal safe floor used by Cloudflare WARP,
+    # Tailscale, etc. Throughput cost is negligible for our workload
+    # (small apt fetches, package downloads). Session runtime egress
+    # uses eth1/the gateway bridge with its own MTU, so agent
+    # workloads inside session VMs are unaffected.
+    install -m 0600 /dev/stdin /etc/netplan/99-sandbox-mtu.yaml <<'NETPLAN_EOF'
+    network:
+      version: 2
+      ethernets:
+        eth0:
+          mtu: 1280
+    NETPLAN_EOF
+    netplan apply
+    echo "[sandbox-provision] step=net-tune done=$(date -u +%Y-%m-%dT%H:%M:%S)"
 - mode: system
   script: |
     #!/bin/bash
@@ -2134,6 +2190,14 @@ mod tests {
             template.contains("usermod -aG docker agent"),
             "template should add agent to docker group"
         );
+        assert!(
+            template.contains("step=net-tune"),
+            "template should include the net-tune provision step"
+        );
+        assert!(
+            template.contains("mtu: 1280"),
+            "template should clamp eth0 MTU to 1280 (libslirp PMTU workaround)"
+        );
     }
 
     #[test]
@@ -2175,6 +2239,14 @@ mod tests {
             template.contains("sandbox-a1b2c3d4e5f6"),
             "hostname should include the full 12-hex session id"
         );
+        assert!(
+            template.contains("step=net-tune"),
+            "template should include the net-tune provision step"
+        );
+        assert!(
+            template.contains("mtu: 1280"),
+            "template should clamp eth0 MTU to 1280 (libslirp PMTU workaround)"
+        );
     }
 
     #[test]
@@ -2202,6 +2274,14 @@ mod tests {
         assert!(
             template.contains("memory: \"1.5GiB\""),
             "template should handle fractional GiB"
+        );
+        assert!(
+            template.contains("step=net-tune"),
+            "template should include the net-tune provision step"
+        );
+        assert!(
+            template.contains("mtu: 1280"),
+            "template should clamp eth0 MTU to 1280 (libslirp PMTU workaround)"
         );
     }
 
@@ -2255,6 +2335,14 @@ mod tests {
             template.contains("writable: true"),
             "template should make mount writable"
         );
+        assert!(
+            template.contains("step=net-tune"),
+            "template should include the net-tune provision step"
+        );
+        assert!(
+            template.contains("mtu: 1280"),
+            "template should clamp eth0 MTU to 1280 (libslirp PMTU workaround)"
+        );
     }
 
     #[test]
@@ -2290,6 +2378,14 @@ mod tests {
         assert!(
             !template.contains("9p:"),
             "clone workspace should not reference 9p mount config"
+        );
+        assert!(
+            template.contains("step=net-tune"),
+            "template should include the net-tune provision step"
+        );
+        assert!(
+            template.contains("mtu: 1280"),
+            "template should clamp eth0 MTU to 1280 (libslirp PMTU workaround)"
         );
     }
 
@@ -2434,6 +2530,14 @@ mod tests {
             template.contains("device: \"none\""),
             "hardened template should disable audio device"
         );
+        assert!(
+            template.contains("step=net-tune"),
+            "template should include the net-tune provision step"
+        );
+        assert!(
+            template.contains("mtu: 1280"),
+            "template should clamp eth0 MTU to 1280 (libslirp PMTU workaround)"
+        );
     }
 
     #[test]
@@ -2466,6 +2570,14 @@ mod tests {
         assert!(
             !template.contains("device: \"none\""),
             "non-hardened template should not disable audio device"
+        );
+        assert!(
+            template.contains("step=net-tune"),
+            "template should include the net-tune provision step"
+        );
+        assert!(
+            template.contains("mtu: 1280"),
+            "template should clamp eth0 MTU to 1280 (libslirp PMTU workaround)"
         );
     }
 
@@ -2886,6 +2998,16 @@ mod tests {
             template.contains("vmType: \"qemu\""),
             "base template should specify qemu vmType"
         );
+
+        // libslirp PMTU workaround: eth0 MTU clamped to 1280.
+        assert!(
+            template.contains("step=net-tune"),
+            "base template should include the net-tune provision step"
+        );
+        assert!(
+            template.contains("mtu: 1280"),
+            "base template should clamp eth0 MTU to 1280 (libslirp PMTU workaround)"
+        );
     }
 
     #[test]
@@ -3113,6 +3235,14 @@ mod tests {
         assert!(
             !template.contains("sandbox-base"),
             "base template must not embed the default base VM name when an override is set"
+        );
+        assert!(
+            template.contains("step=net-tune"),
+            "base template should include the net-tune provision step"
+        );
+        assert!(
+            template.contains("mtu: 1280"),
+            "base template should clamp eth0 MTU to 1280 (libslirp PMTU workaround)"
         );
     }
 
