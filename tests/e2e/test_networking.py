@@ -39,6 +39,7 @@ from conftest import (
     gateway_container_name,
     make_create_args,
     parse_session_id,
+    wait_for_daemon_ready,
     wait_for_state,
     write_policy_file,
 )
@@ -975,25 +976,20 @@ def test_daemon_restart_recovery(sandbox_binaries, sandbox_daemon, sandbox_cli, 
             stderr=new_stderr_fh,
         )
 
-        # Wait for the new socket to appear.
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            if os.path.exists(socket_path):
-                break
-            if restarted_proc.poll() is not None:
-                new_stdout_fh.close()
-                new_stderr_fh.close()
-                pytest.fail(
-                    f"Restarted daemon exited early (code {restarted_proc.returncode}).\n"
-                    f"stdout: {stdout_log.read_text()}\n"
-                    f"stderr: {stderr_log.read_text()}"
-                )
-            time.sleep(0.2)
-        else:
-            restarted_proc.kill()
+        # Wait for the restarted daemon to accept connections.
+        try:
+            wait_for_daemon_ready(socket_path, restarted_proc, 15)
+        except BaseException:
+            if restarted_proc.poll() is None:
+                restarted_proc.kill()
             new_stdout_fh.close()
             new_stderr_fh.close()
-            pytest.fail("Restarted daemon socket did not appear within 15s")
+            print(
+                f"Restarted daemon failed to start.\n"
+                f"stdout: {stdout_log.read_text()}\n"
+                f"stderr: {stderr_log.read_text()}"
+            )
+            raise
 
         # Allow time for reconciliation (gateway restart, network restoration).
         time.sleep(5)
@@ -1064,13 +1060,7 @@ def test_daemon_restart_recovery(sandbox_binaries, sandbox_daemon, sandbox_cli, 
                 stdout=fresh_stdout_fh,
                 stderr=fresh_stderr_fh,
             )
-            deadline = time.monotonic() + 15
-            while time.monotonic() < deadline:
-                if os.path.exists(sandbox_daemon["socket"]):
-                    break
-                if fresh_proc.poll() is not None:
-                    break
-                time.sleep(0.2)
+            wait_for_daemon_ready(sandbox_daemon["socket"], fresh_proc, 15)
             sandbox_daemon["process"] = fresh_proc
             sandbox_daemon["_stdout_fh"] = fresh_stdout_fh
             sandbox_daemon["_stderr_fh"] = fresh_stderr_fh

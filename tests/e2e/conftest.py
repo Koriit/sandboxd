@@ -205,6 +205,55 @@ def gateway_container_name(session_id: str) -> str:
     return f"sandbox-gw-{session_id}"
 
 
+def wait_for_daemon_ready(
+    socket_path,
+    proc: subprocess.Popen,
+    timeout: float,
+) -> None:
+    """Block until ``sandboxd`` accepts connections on ``socket_path``.
+
+    Polling ``os.path.exists(socket_path)`` is not enough: the path
+    appears the moment the daemon calls ``bind(2)``, but ``connect(2)``
+    keeps returning ``ECONNREFUSED`` until the daemon also calls
+    ``listen(2)``. A CLI invoked in that window races and intermittently
+    fails with "cannot connect to sandboxd: Connection refused (os error
+    111)". Probe with an actual ``connect()`` so we only return once the
+    listen backlog is up.
+
+    Treats ``FileNotFoundError`` (pre-bind) and ``ConnectionRefusedError``
+    (bound but not listening) as "keep polling". Any other exception
+    (e.g. ``PermissionError`` or an unrelated ``OSError`` errno) is a
+    real misconfiguration and is allowed to propagate so the failure is
+    visible.
+
+    Fails the test via ``pytest.fail`` if the daemon process exits or if
+    the deadline expires before the socket starts accepting connections.
+    The caller is responsible for any process/file-handle cleanup on
+    failure paths.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            pytest.fail(
+                f"sandboxd exited early (code {proc.returncode}) before "
+                f"its socket started accepting connections."
+            )
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(0.5)
+                s.connect(str(socket_path))
+            return
+        except (FileNotFoundError, ConnectionRefusedError):
+            # Path not yet created (pre-bind) or bound but not yet
+            # listening — keep polling.
+            pass
+        time.sleep(0.1)
+    pytest.fail(
+        f"sandboxd did not accept connections on {socket_path} within "
+        f"{timeout}s"
+    )
+
+
 def wait_for_state(
     sandbox_cli,
     name: str,
@@ -484,48 +533,26 @@ def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path_factory: pytest.T
         stderr=stderr_fh,
     )
 
-    # Wait for the daemon to accept connections on its socket.
-    #
-    # Polling `socket_path.exists()` is not enough: the path appears the
-    # moment the daemon calls `bind(2)`, but `connect(2)` keeps returning
-    # ECONNREFUSED until the daemon also calls `listen(2)`.  A CLI invoked
-    # in that window races and intermittently fails with "cannot connect
-    # to sandboxd: Connection refused (os error 111)".  Probe with an
-    # actual connect() so we only return once the listen backlog is up.
-    deadline = time.monotonic() + DAEMON_STARTUP_TIMEOUT
-    ready = False
-    while time.monotonic() < deadline:
-        # Check if the daemon crashed.
-        if proc.poll() is not None:
-            stdout_fh.close()
-            stderr_fh.close()
-            pytest.fail(
-                f"sandboxd exited early (code {proc.returncode}).\n"
-                f"stdout: {stdout_log.read_text()}\n"
-                f"stderr: {stderr_log.read_text()}"
-            )
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-                s.settimeout(0.5)
-                s.connect(str(socket_path))
-            ready = True
-            break
-        except (FileNotFoundError, ConnectionRefusedError):
-            # Path not yet created (pre-bind) or bound but not yet
-            # listening — keep polling.
-            pass
-        # Any other exception (PermissionError, OSError with a
-        # non-ECONNREFUSED errno, etc.) is a real misconfiguration:
-        # let it propagate so the failure is visible.
-        time.sleep(0.1)
-    if not ready:
-        proc.kill()
+    # Wait for the daemon to accept connections on its socket. See
+    # `wait_for_daemon_ready` for why we probe with connect() rather
+    # than polling for the socket file.
+    try:
+        wait_for_daemon_ready(socket_path, proc, DAEMON_STARTUP_TIMEOUT)
+    except BaseException:
+        # Augment the helper's failure with the daemon's log contents
+        # before propagating, then close our handles. The helper raises
+        # `Failed` (via pytest.fail), but we catch BaseException to be
+        # safe against future helper changes.
+        if proc.poll() is None:
+            proc.kill()
         stdout_fh.close()
         stderr_fh.close()
-        pytest.fail(
-            f"sandboxd did not accept connections on its socket within "
-            f"{DAEMON_STARTUP_TIMEOUT}s"
+        print(
+            f"sandboxd startup failed.\n"
+            f"stdout: {stdout_log.read_text()}\n"
+            f"stderr: {stderr_log.read_text()}"
         )
+        raise
 
     info = {
         "socket": str(socket_path),
