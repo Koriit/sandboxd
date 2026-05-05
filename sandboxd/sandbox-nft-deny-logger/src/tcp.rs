@@ -40,15 +40,16 @@ use sandbox_event_emitter::{Admit, DenyRecord, EventEmitter, Protocol, RateCap};
 /// sometimes overridden by `/proc/sys/net/core/somaxconn`). For
 /// production traffic that is fine — the deny-logger's concurrency cap
 /// gates handler admission, not the kernel's accept queue. For the
-/// deterministic `tcp_respects_concurrency_cap` test, however, we want
-/// to guarantee the kernel can hold every connection in its burst on
-/// the accept queue regardless of host tuning, so the conservation
-/// invariant `deny + dropped_total == BURST` does not depend on a
-/// retry loop hiding `ECONNREFUSED` from a backlog overflow. Passing
-/// the backlog explicitly here gives the test that knob; production
-/// callers pass a value at least as large as `conn_cap` so over-cap
-/// connections always reach `accept()` (and are then RST-closed by
-/// the over-cap path) instead of being kernel-dropped at the SYN.
+/// deterministic `integration_tcp_respects_concurrency_cap` test,
+/// however, we want to guarantee the kernel can hold every connection
+/// in its burst on the accept queue regardless of host tuning, so the
+/// conservation invariant `deny + dropped_total == BURST` does not
+/// depend on a retry loop hiding `ECONNREFUSED` from a backlog
+/// overflow. Passing the backlog explicitly here gives the test that
+/// knob; production callers pass a value at least as large as
+/// `conn_cap` so over-cap connections always reach `accept()` (and are
+/// then RST-closed by the over-cap path) instead of being kernel-
+/// dropped at the SYN.
 ///
 /// # Why the `u32` signature (and the clamp)
 ///
@@ -297,7 +298,7 @@ mod tests {
     /// emit happens and the connection is RST-closed (the client sees
     /// `ConnectionReset`, not a graceful EOF).
     #[tokio::test]
-    async fn tcp_emits_one_deny_event_and_rst_closes() {
+    async fn integration_tcp_emits_one_deny_event_and_rst_closes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("deny.jsonl");
         let emitter = Arc::new(EventEmitter::open(&path, "deny-logger").unwrap());
@@ -430,7 +431,7 @@ mod tests {
     /// Plan Phase 3 / `tcp_respects_concurrency_cap`. Spec Part 3 /
     /// "Hardening rules" § 6.
     #[tokio::test]
-    async fn tcp_respects_concurrency_cap() {
+    async fn integration_tcp_respects_concurrency_cap() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("deny.jsonl");
         let emitter = Arc::new(EventEmitter::open(&path, "deny-logger").unwrap());

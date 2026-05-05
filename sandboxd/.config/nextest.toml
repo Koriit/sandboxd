@@ -5,14 +5,22 @@ fail-fast = true
 # the `integration` profile (see `make test-integration`). Filter them
 # out of the default profile so `make test` / `cargo nextest run` stay
 # hermetic with no Docker dependency.
-default-filter = 'not test(/^integration_/)'
+#
+# The `(^|::)` anchor matches the prefix in two places: at the start of
+# bare test names from `tests/`-directory integration binaries (e.g.
+# `integration_validator_nft_check`), and at any module boundary inside
+# `#[cfg(test)] mod` unit tests in `src/` (e.g.
+# `tcp::tests::integration_tcp_respects_concurrency_cap`). A bare `^`
+# anchor would only catch the first form.
+default-filter = 'not test(/(^|::)integration_/)'
 
 [profile.integration]
 # Opt-in profile for tests requiring out-of-process state (real gateway
 # container, `nft -c` / `envoy --mode validate` CLIs, etc.). Selected by
 # the `integration_*` name prefix so the set is self-describing at call
-# sites — no `#[ignore]`, no env gate.
-default-filter = 'test(/^integration_/)'
+# sites — no `#[ignore]`, no env gate. See the default-profile comment
+# above for why the `(^|::)` anchor is needed.
+default-filter = 'test(/(^|::)integration_/)'
 
 [[profile.integration.overrides]]
 # Lima integration tests share the per-user `~/.lima/` state directory
