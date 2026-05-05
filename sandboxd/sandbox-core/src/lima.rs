@@ -41,8 +41,14 @@ const BASE_CREATE_TIMEOUT: Duration = Duration::from_secs(120);
 /// apt, guest agent).
 const BASE_START_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// Timeout for `limactl stop` when stopping the base image.
-const BASE_STOP_TIMEOUT: Duration = Duration::from_secs(120);
+/// Graceful budget for `limactl stop` of the base image. Healthy
+/// guests under normal disk I/O finish well under this; under
+/// contention we fall back to `-f`. See `build_base_image_inner`.
+const BASE_STOP_GRACEFUL_BUDGET: Duration = Duration::from_secs(60);
+
+/// Force-stop (-f) budget for the fallback path. Issues SIGTERM to
+/// QEMU directly; qcow2 flushes via QEMU's own exit handler.
+const BASE_STOP_FORCE_BUDGET: Duration = Duration::from_secs(60);
 
 /// Timeout for `limactl clone`.
 const CLONE_VM_TIMEOUT: Duration = Duration::from_secs(60);
@@ -1028,13 +1034,18 @@ impl LimaManager {
         self.install_guest_agent_by_vm_name(&self.base_vm_name, &agent_path)?;
         info!("guest agent installed in base VM");
 
-        // 5. Stop the VM.
+        // 5. Stop the VM. Try graceful first so a hung in-guest unit
+        // surfaces as a clear shutdown failure; fall back to -f under
+        // contention so heavy host I/O can't wedge the build. The
+        // warn! on fallback is the diagnostic signal — operators
+        // correlating recurring fallbacks with host load vs. guest-side
+        // regressions should grep daemon logs for it.
         info!("stopping base VM");
-        let output = run_with_timeout(
+        let graceful = run_with_timeout(
             Command::new(&self.limactl)
                 .args(["stop", &self.base_vm_name])
                 .arg("--tty=false"),
-            BASE_STOP_TIMEOUT,
+            BASE_STOP_GRACEFUL_BUDGET,
             "limactl stop (base image)",
         )
         .map_err(|e| match e {
@@ -1042,13 +1053,42 @@ impl LimaManager {
                 lima_io_error("limactl stop (base image)", std::io::Error::other(msg))
             }
             other => other,
-        })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(parse_limactl_error("stop (base image)", &stderr));
+        });
+        match graceful {
+            Ok(output) if output.status.success() => {
+                info!("base VM stopped (graceful)");
+            }
+            other => {
+                warn!(
+                    outcome = ?other,
+                    vm = %self.base_vm_name,
+                    "graceful limactl stop did not complete in {}s; \
+                     falling back to -f. Usually indicates host I/O \
+                     contention; investigate ~/.lima/{}/serial.log if \
+                     recurring.",
+                    BASE_STOP_GRACEFUL_BUDGET.as_secs(),
+                    self.base_vm_name,
+                );
+                let force = run_with_timeout(
+                    Command::new(&self.limactl)
+                        .args(["stop", "-f", &self.base_vm_name])
+                        .arg("--tty=false"),
+                    BASE_STOP_FORCE_BUDGET,
+                    "limactl stop -f (base image fallback)",
+                )
+                .map_err(|e| match e {
+                    SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
+                        lima_io_error("limactl stop -f (base image)", std::io::Error::other(msg))
+                    }
+                    other => other,
+                })?;
+                if !force.status.success() {
+                    let stderr = String::from_utf8_lossy(&force.stderr);
+                    return Err(parse_limactl_error("stop -f (base image)", &stderr));
+                }
+                info!("base VM stopped (force, after graceful timeout)");
+            }
         }
-        info!("base VM stopped");
 
         // 6. Write metadata.
         let content_hash = self.compute_base_image_hash()?;
