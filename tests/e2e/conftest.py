@@ -31,12 +31,27 @@ import re
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+
+
+@pytest.hookimpl(tryfirst=True, hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Stash per-phase test outcome on the item.
+
+    Allows fixtures (autouse or otherwise) to inspect whether the test
+    body itself failed (`item.rep_call.failed`) vs. setup/teardown.
+    Standard pytest plugin pattern; see pytest docs for details.
+    """
+    outcome = yield
+    rep = outcome.get_result()
+    setattr(item, "rep_" + rep.when, rep)
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -609,6 +624,40 @@ def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path_factory: pytest.T
                 )
     except Exception:
         pass
+
+
+@pytest.fixture(autouse=True)
+def _dump_daemon_log_on_failure(request, sandbox_daemon):
+    """Print the last 100 lines of sandboxd's stderr+stdout when the
+    enclosing test fails.
+
+    Driven by the per-phase outcome stashed by ``pytest_runtest_makereport``.
+    Only fires when ``rep_call`` (the test body) failed — setup/teardown
+    failures get reported separately and rarely correlate with daemon logs.
+
+    Depends on ``sandbox_daemon`` (session-scoped) so every test that uses
+    a daemon — directly or transitively — gets the dump for free. Tests
+    that don't request the daemon at all still pull this fixture (it's
+    autouse), but ``sandbox_daemon`` will only spin up the actual process
+    on first request from any test, so the cost is just two file reads
+    on failure.
+    """
+    yield
+    rep = getattr(request.node, "rep_call", None)
+    if rep is None or not rep.failed:
+        return
+    for label, key in (("stderr", "_stderr_log"), ("stdout", "_stdout_log")):
+        path = sandbox_daemon[key]
+        try:
+            tail = "\n".join(path.read_text().splitlines()[-100:])
+        except Exception as e:
+            tail = f"(could not read {path}: {e})"
+        print(
+            f"\n=== sandboxd {label} (last 100 lines, from {path}) ===\n"
+            f"{tail}\n"
+            f"=== end sandboxd {label} ===\n",
+            file=sys.stderr,
+        )
 
 
 def _query_base_image_status(socket_path: str, timeout: float = 5.0) -> str | None:
