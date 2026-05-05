@@ -469,11 +469,17 @@ def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path_factory: pytest.T
         stderr=stderr_fh,
     )
 
-    # Wait for the socket to appear.
+    # Wait for the daemon to accept connections on its socket.
+    #
+    # Polling `socket_path.exists()` is not enough: the path appears the
+    # moment the daemon calls `bind(2)`, but `connect(2)` keeps returning
+    # ECONNREFUSED until the daemon also calls `listen(2)`.  A CLI invoked
+    # in that window races and intermittently fails with "cannot connect
+    # to sandboxd: Connection refused (os error 111)".  Probe with an
+    # actual connect() so we only return once the listen backlog is up.
     deadline = time.monotonic() + DAEMON_STARTUP_TIMEOUT
+    ready = False
     while time.monotonic() < deadline:
-        if socket_path.exists():
-            break
         # Check if the daemon crashed.
         if proc.poll() is not None:
             stdout_fh.close()
@@ -483,12 +489,28 @@ def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path_factory: pytest.T
                 f"stdout: {stdout_log.read_text()}\n"
                 f"stderr: {stderr_log.read_text()}"
             )
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(0.5)
+                s.connect(str(socket_path))
+            ready = True
+            break
+        except (FileNotFoundError, ConnectionRefusedError):
+            # Path not yet created (pre-bind) or bound but not yet
+            # listening — keep polling.
+            pass
+        # Any other exception (PermissionError, OSError with a
+        # non-ECONNREFUSED errno, etc.) is a real misconfiguration:
+        # let it propagate so the failure is visible.
         time.sleep(0.1)
-    else:
+    if not ready:
         proc.kill()
         stdout_fh.close()
         stderr_fh.close()
-        pytest.fail(f"sandboxd socket did not appear within {DAEMON_STARTUP_TIMEOUT}s")
+        pytest.fail(
+            f"sandboxd did not accept connections on its socket within "
+            f"{DAEMON_STARTUP_TIMEOUT}s"
+        )
 
     info = {
         "socket": str(socket_path),
