@@ -1,6 +1,17 @@
 .PHONY: build fmt fmt-check test test-integration test-e2e test-e2e-container test-e2e-matrix gateway-image lite-image docs-dev docs-build clean \
 	setup-dev-env install-route-helper-prod-cap install-route-helper-test-cap setup-bridge-conf setup-users-conf setup-bridge-helper-setuid
 
+# Green/reset for ✓ confirmation lines. TTY-aware: empty when stdout
+# is piped/redirected, so non-TTY consumers (CI logs, `less` without
+# -R, file capture) don't see escape garbage.
+ifneq ($(shell test -t 1 && echo tty),)
+GREEN := $(shell tput setaf 2 2>/dev/null)
+RESET := $(shell tput sgr0 2>/dev/null)
+else
+GREEN :=
+RESET :=
+endif
+
 build: fmt-check
 	cd sandboxd && cargo build --workspace
 
@@ -197,7 +208,7 @@ BRIDGE_CONF_PATH            := /etc/qemu/bridge.conf
 QEMU_BRIDGE_HELPER_PATH     := /usr/lib/qemu/qemu-bridge-helper
 
 setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap setup-bridge-conf setup-users-conf setup-bridge-helper-setuid
-	@echo "✓ make setup-dev-env complete"
+	@echo "$(GREEN)✓ make setup-dev-env complete$(RESET)"
 
 # install-route-helper-prod-cap — production cap'd install at the
 # canonical FHS-libexec path. Default-feature build (no
@@ -218,7 +229,7 @@ sandboxd/target/.dev-env-stamps/route-helper-prod.stamp: sandboxd/target/release
 	    cmp -s "sandboxd/target/release/sandbox-route-helper" "$(ROUTE_HELPER_PROD_PATH)" && \
 	    getcap "$(ROUTE_HELPER_PROD_PATH)" 2>/dev/null | grep -q cap_net_admin && \
 	    getcap "$(ROUTE_HELPER_PROD_PATH)" 2>/dev/null | grep -q cap_sys_admin; then \
-	  echo "✓ already configured: $(ROUTE_HELPER_PROD_PATH) (cap_net_admin,cap_sys_admin=eip, content matches build)"; \
+	  echo "$(GREEN)✓ already configured: $(ROUTE_HELPER_PROD_PATH) (cap_net_admin,cap_sys_admin=eip, content matches build)$(RESET)"; \
 	else \
 	  echo "[sudo] install -m 0755 sandboxd/target/release/sandbox-route-helper $(ROUTE_HELPER_PROD_PATH)"; \
 	  echo "[sudo] setcap cap_net_admin,cap_sys_admin=eip $(ROUTE_HELPER_PROD_PATH)"; \
@@ -270,7 +281,7 @@ sandboxd/target/.dev-env-stamps/route-helper-test.stamp: sandboxd/target/debug/s
 	    cmp -s "sandboxd/target/debug/sandbox-route-helper" "$(ROUTE_HELPER_TEST_PATH)" && \
 	    getcap "$(ROUTE_HELPER_TEST_PATH)" 2>/dev/null | grep -q cap_net_admin && \
 	    getcap "$(ROUTE_HELPER_TEST_PATH)" 2>/dev/null | grep -q cap_sys_admin; then \
-	  echo "✓ already configured: $(ROUTE_HELPER_TEST_PATH) (cap_net_admin,cap_sys_admin=eip, content matches test build)"; \
+	  echo "$(GREEN)✓ already configured: $(ROUTE_HELPER_TEST_PATH) (cap_net_admin,cap_sys_admin=eip, content matches test build)$(RESET)"; \
 	else \
 	  echo "[sudo] install -m 0755 sandboxd/target/debug/sandbox-route-helper $(ROUTE_HELPER_TEST_PATH)"; \
 	  echo "[sudo] setcap cap_net_admin,cap_sys_admin=eip $(ROUTE_HELPER_TEST_PATH)"; \
@@ -326,7 +337,7 @@ sandboxd/target/debug/sandbox-route-helper:
 setup-bridge-conf:
 	@if [ -f "$(BRIDGE_CONF_PATH)" ]; then \
 	  if grep -qE '^allow (all|sb-\*)$$' "$(BRIDGE_CONF_PATH)" 2>/dev/null; then \
-	    echo "✓ already configured: $(BRIDGE_CONF_PATH) authorizes sandbox bridges"; \
+	    echo "$(GREEN)✓ already configured: $(BRIDGE_CONF_PATH) authorizes sandbox bridges$(RESET)"; \
 	  else \
 	    echo "ERROR: $(BRIDGE_CONF_PATH) exists but does not authorize sandbox bridges (sb-*)."; \
 	    echo "Current contents:"; \
@@ -383,7 +394,7 @@ setup-users-conf:
 	    exit 1; \
 	  }; \
 	  if [ "$$status" = "present" ]; then \
-	    echo "✓ already configured: $(USERS_CONF_PATH) (test pool 10.220.0.0/20 present)"; \
+	    echo "$(GREEN)✓ already configured: $(USERS_CONF_PATH) (test pool 10.220.0.0/20 present)$(RESET)"; \
 	  else \
 	    tmp=$$(mktemp); \
 	    USER="$$USER" python3 -c 'import json,os,sys; cfg=json.load(open(sys.argv[1])); cfg.setdefault("subnets", []).append({"comment":"E2E test pool — used by the e2e test daemon launched with SANDBOX_USERS_CONF pointing at a tempfile that contains only this entry. The production route helper continues reading this canonical file, so authorization for this pool'"'"'s gateway IP succeeds.","cidr":"10.220.0.0/20","allow_users":[os.environ["USER"]]}); json.dump(cfg, open(sys.argv[2], "w"), indent=2); open(sys.argv[2], "a").write("\n")' "$(USERS_CONF_PATH)" "$$tmp"; \
@@ -417,7 +428,7 @@ setup-bridge-helper-setuid:
 	fi
 	@if [ -u "$(QEMU_BRIDGE_HELPER_PATH)" ]; then \
 	  mode=$$(stat -c '%a' "$(QEMU_BRIDGE_HELPER_PATH)"); \
-	  echo "✓ already configured: $(QEMU_BRIDGE_HELPER_PATH) is setuid (mode $$mode)"; \
+	  echo "$(GREEN)✓ already configured: $(QEMU_BRIDGE_HELPER_PATH) is setuid (mode $$mode)$(RESET)"; \
 	else \
 	  echo "[sudo] chmod u+s $(QEMU_BRIDGE_HELPER_PATH)  (qemu-bridge-helper must be setuid for unprivileged TAP creation)"; \
 	  sudo -k chmod u+s "$(QEMU_BRIDGE_HELPER_PATH)"; \
