@@ -626,35 +626,97 @@ def sandbox_daemon(sandbox_binaries: SandboxBinaries, tmp_path_factory: pytest.T
         pass
 
 
+# Per-test dump-window caps: keep failure output bounded even when a test
+# generates a torrent of daemon logs.
+_DUMP_MAX_LINES = 4000
+_DUMP_MAX_BYTES = 1 << 20  # 1 MiB
+
+
+def _capture_log_offset(path: Path) -> int:
+    """Return current size of ``path``, or 0 if it doesn't exist yet."""
+    try:
+        return os.path.getsize(path)
+    except FileNotFoundError:
+        return 0
+
+
+def _read_log_window(path: Path, start_offset: int) -> tuple[str, int, int]:
+    """Read ``path`` from ``start_offset`` to EOF.
+
+    Returns ``(text, effective_start, end)`` where ``effective_start`` may
+    differ from ``start_offset`` if the file shrunk (rotation/truncation),
+    in which case we read from 0. Caps the returned text at
+    ``_DUMP_MAX_LINES`` lines / ``_DUMP_MAX_BYTES`` bytes from the tail of
+    the window, prefixing a ``(truncated)`` marker when capped.
+    """
+    try:
+        end = os.path.getsize(path)
+    except FileNotFoundError:
+        return ("(log file does not exist)", start_offset, start_offset)
+
+    effective_start = start_offset if end >= start_offset else 0
+    try:
+        with open(path, "rb") as f:
+            f.seek(effective_start)
+            window = f.read(end - effective_start)
+    except OSError as e:
+        return (f"(could not read {path}: {e})", effective_start, end)
+
+    text = window.decode("utf-8", errors="replace")
+    truncated = False
+    if len(window) > _DUMP_MAX_BYTES:
+        text = text[-_DUMP_MAX_BYTES:]
+        truncated = True
+    lines = text.splitlines()
+    if len(lines) > _DUMP_MAX_LINES:
+        lines = lines[-_DUMP_MAX_LINES:]
+        truncated = True
+    if truncated:
+        lines.insert(0, "(truncated)")
+    return ("\n".join(lines), effective_start, end)
+
+
 @pytest.fixture(autouse=True)
 def _dump_daemon_log_on_failure(request, sandbox_daemon):
-    """Print the last 100 lines of sandboxd's stderr+stdout when the
-    enclosing test fails.
+    """Print the per-test window of sandboxd's stderr+stdout on failure.
+
+    Captures ``os.path.getsize`` of each log before the test runs and, on
+    failure, emits exactly the bytes appended during the test body — not
+    the last 100 lines of the whole-session log, which conflate output
+    from earlier tests (and from the restarted daemon spawned by
+    ``test_daemon_restart_recovery``, which deliberately writes to the
+    same log paths).
 
     Driven by the per-phase outcome stashed by ``pytest_runtest_makereport``.
     Only fires when ``rep_call`` (the test body) failed — setup/teardown
     failures get reported separately and rarely correlate with daemon logs.
 
+    The window is capped at ``_DUMP_MAX_LINES`` / ``_DUMP_MAX_BYTES`` from
+    the tail with a ``(truncated)`` marker; if the file shrank during the
+    test (rotation), the dump falls back to reading from offset 0.
+
     Depends on ``sandbox_daemon`` (session-scoped) so every test that uses
     a daemon — directly or transitively — gets the dump for free. Tests
     that don't request the daemon at all still pull this fixture (it's
     autouse), but ``sandbox_daemon`` will only spin up the actual process
-    on first request from any test, so the cost is just two file reads
-    on failure.
+    on first request from any test, so the cost is just two ``stat`` calls
+    plus, on failure, two bounded reads.
     """
+    offsets = {
+        key: _capture_log_offset(sandbox_daemon[key])
+        for _, key in (("stderr", "_stderr_log"), ("stdout", "_stdout_log"))
+    }
     yield
     rep = getattr(request.node, "rep_call", None)
     if rep is None or not rep.failed:
         return
     for label, key in (("stderr", "_stderr_log"), ("stdout", "_stdout_log")):
         path = sandbox_daemon[key]
-        try:
-            tail = "\n".join(path.read_text().splitlines()[-100:])
-        except Exception as e:
-            tail = f"(could not read {path}: {e})"
+        text, eff_start, end = _read_log_window(path, offsets[key])
         print(
-            f"\n=== sandboxd {label} (last 100 lines, from {path}) ===\n"
-            f"{tail}\n"
+            f"\n=== sandboxd {label} "
+            f"(test window bytes [{eff_start}, {end}), from {path}) ===\n"
+            f"{text}\n"
             f"=== end sandboxd {label} ===\n",
             file=sys.stderr,
         )
