@@ -68,6 +68,8 @@ python -m pytest test_vm_lifecycle.py -v --timeout=600  # single file
 python -m pytest -v --timeout=600                           # full suite
 ```
 
+If `python -m pytest` reports `ModuleNotFoundError: No module named 'pytest'` despite `pip list` showing it, the host's `python3` was upgraded under the venv since it was built — `tests/e2e/.venv/bin/python` is now ABI-mismatched with the new interpreter. `make test-e2e` (and friends) auto-rebuild the venv via a version-stamped marker (`.installed.pythonX.Y`); for the manual `source .venv/bin/activate` path above, run `rm -rf tests/e2e/.venv && make test-e2e-container` once to rebuild against the current `python3`, then the activate-and-iterate flow works again.
+
 ## Rust workspace
 
 Working directory for cargo commands: `sandboxd/`
