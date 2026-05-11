@@ -282,6 +282,14 @@ impl<'de> Deserialize<'de> for Cidr4 {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UsersConfig {
+    /// Schema version of the on-disk file, written as the `_schema_version`
+    /// key. `None` means the file predates the migration framework and is
+    /// treated as version `0` by the framework (Spec 5); V001 advances it
+    /// to `Some(1)`. The underscore prefix is the project's convention for
+    /// metadata that sits alongside domain data inside the same JSON
+    /// object — the Rust field name stays idiomatic via `#[serde(rename)]`.
+    #[serde(default, rename = "_schema_version")]
+    pub schema_version: Option<u32>,
     /// One entry per allocation subnet. Order is preserved; the lookup
     /// helpers return the **first** match, so operators control
     /// precedence by ordering when CIDRs overlap (uncommon but legal).
@@ -377,6 +385,75 @@ impl SubnetEntry {
         }
         false
     }
+}
+
+// ---------------------------------------------------------------------------
+// Migration V001 — pure transform
+// ---------------------------------------------------------------------------
+
+/// Apply migration **V001** to a `users.conf` value: stamp
+/// `_schema_version: 1` at the top level and ensure every pool's
+/// `allow_users` array contains `"sandbox"` (prepended if absent).
+///
+/// The transform is **pure** — no I/O, no path resolution, no
+/// `UsersConfig` round-trip. It operates on `serde_json::Value` directly
+/// so it can ingest inputs that pre-date the post-V001 strict schema
+/// (e.g. a file with no `_schema_version` field, which would not yet
+/// satisfy the typed shape if the field were non-optional). The file-IO
+/// wrapper (atomic-rename write, lock file, backup folder) is owned by
+/// the migration framework in Spec 5; this function is the content
+/// contribution from Spec 1.
+///
+/// # Idempotency
+///
+/// Running the transform twice yields a value equal to running it once.
+/// Two distinct paths reach this contract:
+///
+/// - A file already at `_schema_version: 1` is unchanged. (The framework
+///   never invokes this branch under normal operation per Spec 5 § 4.2 —
+///   it returns early when current == target — but the branch remains as
+///   defense-in-depth for ad-hoc test or tool invocations.)
+/// - A pool whose `allow_users` already contains `"sandbox"` is left
+///   untouched, including operator-chosen order (e.g. `["alice",
+///   "sandbox"]` stays in that order rather than being shuffled into the
+///   canonical `["sandbox", "alice"]`).
+///
+/// # Shape preservation
+///
+/// Inputs that are not `Value::Object` (or whose `subnets` field is not
+/// an array, or whose `allow_users` is not an array) are returned
+/// unchanged — the framework will validate the produced value against
+/// `UsersConfig` after the transform runs (Spec 5), so a malformed input
+/// surfaces as a typed parse error downstream rather than a silent
+/// mutation here. We deliberately do not coerce or repair shapes the
+/// strict schema would reject.
+pub fn migrate_v001(value: serde_json::Value) -> serde_json::Value {
+    let serde_json::Value::Object(mut obj) = value else {
+        return value;
+    };
+
+    obj.insert(
+        "_schema_version".to_string(),
+        serde_json::Value::Number(1u32.into()),
+    );
+
+    if let Some(serde_json::Value::Array(subnets)) = obj.get_mut("subnets") {
+        for entry in subnets.iter_mut() {
+            let Some(entry_obj) = entry.as_object_mut() else {
+                continue;
+            };
+            let Some(serde_json::Value::Array(allow_users)) = entry_obj.get_mut("allow_users")
+            else {
+                continue;
+            };
+            let already_has_sandbox = allow_users.iter().any(|n| n.as_str() == Some("sandbox"));
+            if !already_has_sandbox {
+                allow_users.insert(0, serde_json::Value::String("sandbox".to_string()));
+            }
+        }
+    }
+
+    serde_json::Value::Object(obj)
 }
 
 // ---------------------------------------------------------------------------
@@ -1310,5 +1387,292 @@ mod tests {
         let nonexistent = dir.path().join("does-not-exist.conf");
         validate_users_conf_security_against(&nonexistent, &nonexistent)
             .expect("missing canonical file must defer to FileNotFound downstream");
+    }
+
+    // -----------------------------------------------------------------
+    // `_schema_version` schema field.
+    //
+    // The field is `Option<u32>` + `#[serde(default)]`; older files
+    // without it parse as `None`. `deny_unknown_fields` still rejects
+    // typos verbatim — operator-facing error text contains the exact
+    // mistyped key, so `serde_json` is the single source of truth for
+    // the rejection message and we pin that contract here.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn schema_version_absent_yields_none() {
+        let raw = r#"{
+            "subnets": [
+                { "cidr": "10.209.0.0/20", "allow_users": ["olek"] }
+            ]
+        }"#;
+        let f = write_tempfile(raw);
+        let cfg = load_users_config_from(f.path()).expect("parse");
+        assert!(
+            cfg.schema_version.is_none(),
+            "absent _schema_version must default to None, got {:?}",
+            cfg.schema_version,
+        );
+    }
+
+    #[test]
+    fn schema_version_present_populates_option() {
+        let raw = r#"{
+            "_schema_version": 1,
+            "subnets": [
+                { "cidr": "10.209.0.0/20", "allow_users": ["olek"] }
+            ]
+        }"#;
+        let f = write_tempfile(raw);
+        let cfg = load_users_config_from(f.path()).expect("parse");
+        assert_eq!(cfg.schema_version, Some(1));
+
+        // Other u32 values round-trip the same way — the field's typing
+        // is `Option<u32>`, not a "must be 1" constraint (that policy
+        // belongs to the migration framework in Spec 5, not the parser).
+        let raw_v7 = r#"{
+            "_schema_version": 7,
+            "subnets": []
+        }"#;
+        let f7 = write_tempfile(raw_v7);
+        let cfg7 = load_users_config_from(f7.path()).expect("parse");
+        assert_eq!(cfg7.schema_version, Some(7));
+    }
+
+    #[test]
+    fn schema_version_typo_rejected() {
+        // A close-but-wrong variant of `_schema_version` must trip
+        // `deny_unknown_fields`; the parser's job is to reject
+        // unrecognised keys verbatim so the operator sees their typo.
+        let raw = r#"{
+            "_schemaversion": 1,
+            "subnets": [
+                { "cidr": "10.209.0.0/20", "allow_users": ["olek"] }
+            ]
+        }"#;
+        let f = write_tempfile(raw);
+        let err = load_users_config_from(f.path()).expect_err("must fail");
+        assert!(
+            matches!(err, UsersConfigError::ParseFailed { .. }),
+            "expected ParseFailed for typo on `_schema_version`, got {err:?}"
+        );
+    }
+
+    /// Pin the `deny_unknown_fields` verbatim-key contract: a one-character
+    /// typo (missing the `c` in `_schema_version`) is rejected, and the
+    /// error string contains the exact mistyped key so the operator can
+    /// see what they wrote. Future maintenance that swaps the rejection
+    /// surface (custom `Deserialize` impl, hand-rolled validator) must
+    /// keep this property.
+    #[test]
+    fn users_conf_schema_version_typo_rejected_with_clear_error() {
+        let raw = r#"{
+            "_shema_version": 1,
+            "subnets": [
+                { "cidr": "10.209.0.0/20", "allow_users": ["olek"] }
+            ]
+        }"#;
+        let f = write_tempfile(raw);
+        let err = load_users_config_from(f.path()).expect_err("must fail");
+        let msg = err.to_string();
+        assert!(
+            matches!(err, UsersConfigError::ParseFailed { .. }),
+            "expected ParseFailed for `_shema_version` typo, got {err:?}"
+        );
+        assert!(
+            msg.contains("_shema_version"),
+            "error message must name the mistyped key verbatim so the operator \
+             can see exactly what they wrote; got: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Migration V001 — pure transform.
+    //
+    // Inputs and outputs follow Spec 1 § 5.5 verbatim. The transform is
+    // pure (no I/O), so each row is a single `assert_eq!` between
+    // `serde_json::Value` trees. `Value` equality is structural — key
+    // order inside an object is not part of the comparison, so the spec
+    // examples' textual order is incidental to the test contract.
+    // -----------------------------------------------------------------
+
+    /// Parse a JSON literal into a `serde_json::Value`. Tiny helper so the
+    /// table-style tests below stay close to the spec's example shapes.
+    fn json(raw: &str) -> serde_json::Value {
+        serde_json::from_str(raw).expect("json literal must parse")
+    }
+
+    #[test]
+    fn v001_adds_sandbox_to_single_user_pool() {
+        // Spec § 5.5 — Input A → Output A.
+        let input = json(
+            r#"{
+                "subnets": [
+                    { "cidr": "10.209.0.0/24", "allow_users": ["alice"] }
+                ]
+            }"#,
+        );
+        let expected = json(
+            r#"{
+                "_schema_version": 1,
+                "subnets": [
+                    { "cidr": "10.209.0.0/24", "allow_users": ["sandbox", "alice"] }
+                ]
+            }"#,
+        );
+        assert_eq!(migrate_v001(input), expected);
+    }
+
+    #[test]
+    fn v001_adds_sandbox_to_multiple_pools_independently() {
+        // Spec § 5.5 — Input B → Output B. Each pool is migrated
+        // independently; the operator's `comment` field rides through.
+        let input = json(
+            r#"{
+                "subnets": [
+                    { "cidr": "10.209.0.0/24", "allow_users": ["alice"], "comment": "alice prod" },
+                    { "cidr": "10.210.0.0/24", "allow_users": ["bob", "carol"] }
+                ]
+            }"#,
+        );
+        let expected = json(
+            r#"{
+                "_schema_version": 1,
+                "subnets": [
+                    { "cidr": "10.209.0.0/24", "allow_users": ["sandbox", "alice"], "comment": "alice prod" },
+                    { "cidr": "10.210.0.0/24", "allow_users": ["sandbox", "bob", "carol"] }
+                ]
+            }"#,
+        );
+        assert_eq!(migrate_v001(input), expected);
+    }
+
+    #[test]
+    fn v001_noops_pool_already_containing_sandbox() {
+        // Spec § 5.5 — Input C → Output C. Operator hand-added `sandbox`
+        // in a different order; V001 must not shuffle.
+        let input = json(
+            r#"{
+                "subnets": [
+                    { "cidr": "10.209.0.0/24", "allow_users": ["alice", "sandbox"] }
+                ]
+            }"#,
+        );
+        let expected = json(
+            r#"{
+                "_schema_version": 1,
+                "subnets": [
+                    { "cidr": "10.209.0.0/24", "allow_users": ["alice", "sandbox"] }
+                ]
+            }"#,
+        );
+        assert_eq!(migrate_v001(input), expected);
+    }
+
+    #[test]
+    fn v001_noops_when_schema_version_already_one() {
+        // Spec § 5.5 — Input D. Bit-equal output.
+        let input = json(
+            r#"{
+                "_schema_version": 1,
+                "subnets": [
+                    { "cidr": "10.209.0.0/24", "allow_users": ["sandbox", "alice"] }
+                ]
+            }"#,
+        );
+        let expected = input.clone();
+        assert_eq!(migrate_v001(input), expected);
+    }
+
+    #[test]
+    fn v001_preserves_comment_field() {
+        // A subnet with an operator-supplied `comment` must keep it
+        // through the transform — V001 touches `allow_users` and the
+        // top-level `_schema_version` only.
+        let input = json(
+            r#"{
+                "subnets": [
+                    {
+                        "cidr": "10.209.0.0/20",
+                        "allow_users": ["alice"],
+                        "comment": "alice prod — please leave this alone"
+                    }
+                ]
+            }"#,
+        );
+        let output = migrate_v001(input);
+        let comment = output
+            .get("subnets")
+            .and_then(|s| s.get(0))
+            .and_then(|e| e.get("comment"))
+            .and_then(|c| c.as_str());
+        assert_eq!(comment, Some("alice prod — please leave this alone"));
+    }
+
+    #[test]
+    fn v001_idempotent_when_run_twice() {
+        // Pure-function idempotency: f(f(x)) == f(x). Covers both
+        // observable branches (schema-version already at 1; sandbox
+        // already in pool) on the second pass.
+        let input = json(
+            r#"{
+                "subnets": [
+                    { "cidr": "10.209.0.0/24", "allow_users": ["alice"] },
+                    { "cidr": "10.210.0.0/24", "allow_users": ["bob"] }
+                ]
+            }"#,
+        );
+        let once = migrate_v001(input);
+        let twice = migrate_v001(once.clone());
+        assert_eq!(twice, once, "V001 must be idempotent on the second pass");
+    }
+
+    #[test]
+    fn v001_preserves_existing_field_order_when_possible() {
+        // The transform must not drop, rename, or add fields outside the
+        // ones it owns (`_schema_version` at top level; `"sandbox"` inside
+        // each `allow_users`). Operator-supplied keys at the subnet level
+        // ride through; their presence in the output is a structural
+        // contract independent of `serde_json::Value`'s map-ordering
+        // implementation.
+        let input = json(
+            r#"{
+                "subnets": [
+                    {
+                        "cidr": "10.209.0.0/24",
+                        "allow_users": ["alice"],
+                        "comment": "primary"
+                    }
+                ]
+            }"#,
+        );
+        let output = migrate_v001(input);
+
+        // Top level: gained exactly `_schema_version`; `subnets` still
+        // present; nothing else.
+        let top = output.as_object().expect("top is object");
+        let top_keys: std::collections::BTreeSet<&str> = top.keys().map(|k| k.as_str()).collect();
+        assert_eq!(
+            top_keys,
+            ["_schema_version", "subnets"].into_iter().collect(),
+            "top-level keys must be exactly {{_schema_version, subnets}} after V001"
+        );
+        assert_eq!(top.get("_schema_version"), Some(&serde_json::json!(1)));
+
+        // Subnet level: every original key survives; `allow_users` is
+        // extended by the prepended `"sandbox"` entry.
+        let entry = output["subnets"][0].as_object().expect("entry is object");
+        let entry_keys: std::collections::BTreeSet<&str> =
+            entry.keys().map(|k| k.as_str()).collect();
+        assert_eq!(
+            entry_keys,
+            ["cidr", "allow_users", "comment"].into_iter().collect(),
+            "subnet entry keys must be unchanged (no drops, no additions)"
+        );
+        assert_eq!(entry.get("comment"), Some(&serde_json::json!("primary")));
+        assert_eq!(
+            entry.get("allow_users"),
+            Some(&serde_json::json!(["sandbox", "alice"])),
+        );
     }
 }
