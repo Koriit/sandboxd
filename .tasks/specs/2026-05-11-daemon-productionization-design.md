@@ -639,13 +639,15 @@ sandbox doctor — checking deployment
 ~ gateway image present                  SKIPPED (requires daemon)
 ~ lite image present                     SKIPPED (requires daemon)
 ~ users.conf has daemon pool             SKIPPED (requires daemon)
+~ running sessions guest-version drift   SKIPPED (requires daemon)
+~ orphan substrate resources             SKIPPED (requires daemon — session cross-reference unavailable)
 
-3 checks passed, 1 failed, 7 skipped
+3 checks passed, 1 failed, 9 skipped
 ```
 
-The two checks that **do** pass (C4 group membership, C9 route-helper caps,
-C10 state-dir mode) are listed in the summary count but not echoed in
-default mode. `--verbose` would render them.
+The three checks that **do** pass (C4 group membership, C9 route-helper
+caps, C10 state-dir mode) are listed in the summary count but not echoed
+in default mode. `--verbose` would render them.
 
 **Partial-fail output** (version skew):
 
