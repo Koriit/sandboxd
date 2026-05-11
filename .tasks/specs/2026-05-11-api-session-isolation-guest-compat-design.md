@@ -120,13 +120,12 @@ Notes on the SQL shape:
   table and are never observed by any read — every subsequent
   `INSERT INTO sessions` writes real values from `SessionStore::create_session_with_backend`
   (see § 2.4).
-- `CHECK (owner_username <> '')` is **not** added, on purpose. Refinery's
-  one-shot apply ordering applies the migration atomically; the empty-string
-  default is internal to the migration body and never survives outside the
-  transaction in any non-empty state. Adding a CHECK would force a separate
-  migration step on Spec 5's `sandbox update` rollforward path; the
-  daemon-side enforcement (§ 2.4 — `create_session` always passes a non-empty
-  username, never `''`) is sufficient.
+- `CHECK (owner_username <> '')` is intentionally omitted. SQLite's
+  `ALTER TABLE ADD COLUMN` does not support `CHECK` constraints — adding one
+  would require a full table recreate (a separate migration step). The
+  daemon-side enforcement in § 2.4 (`create_session` always passes the
+  `SO_PEERCRED`-resolved username, which is validated non-empty at the accept
+  boundary) is sufficient.
 
 ### 2.1.1 · Substrate-orphan footprint of the destructive migration
 
@@ -1338,17 +1337,20 @@ The test greps the `sandboxd/` workspace (excluding `target/`,
 set of caller locations is **exactly** the allow-list pinned in § 2.4's
 doc-comment:
 
+// Each entry is `<repo-relative-path>:<function-name>`. The test should
+// grep for callers of `update_state_reconcile` and assert each call site
+// appears in this list.
 ```rust
 const ALLOW_LIST: &[&str] = &[
     // Reconciler blocks inside session-read handlers.
-    "sandboxd/sandboxd/src/main.rs::list_sessions",
-    "sandboxd/sandboxd/src/main.rs::get_session",
+    "sandboxd/sandboxd/src/main.rs:list_sessions",
+    "sandboxd/sandboxd/src/main.rs:get_session",
     // Error/cleanup branches in create/start; the happy path uses
     // update_state, not _reconcile.
-    "sandboxd/sandboxd/src/main.rs::create_session::error_cleanup",
-    "sandboxd/sandboxd/src/main.rs::start_session::error_cleanup",
+    "sandboxd/sandboxd/src/main.rs:create_session::error_cleanup",
+    "sandboxd/sandboxd/src/main.rs:start_session::error_cleanup",
     // Startup reconciliation.
-    "sandboxd/sandboxd/src/main.rs::main::startup_reconcile",
+    "sandboxd/sandboxd/src/main.rs:main::startup_reconcile",
 ];
 ```
 
