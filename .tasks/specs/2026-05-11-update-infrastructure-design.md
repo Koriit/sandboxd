@@ -196,12 +196,30 @@ Field semantics:
   (Spec 2 § 3.4) runs lazily at next `start_session` per session.
 
 `--check` exit codes:
-- `0` — current installed and target match (up to date), **or** target
-  is newer (update available).
-- `1` — daemon-side failure (cannot reach daemon, cannot read state
-  file, cosign-verify of the available release failed).
+- `0` — up to date (installed version == available version; no action needed).
+- `1` — error (cannot reach daemon, cannot read state file, network
+  failure, cosign-verify failed). The operator should investigate before
+  deciding whether to update.
 - `2` — argument parse failure / read-only-preflight refusal (e.g.
   `--cosign-bundle` without `--from`).
+- `3` — update available (installed version < available version; action
+  recommended).
+
+Exit 3 is the machine-readable signal that an update is waiting. Scripts
+can use it without parsing stdout:
+
+```sh
+# Check; if an update is available (exit 3), apply it.
+sandbox update --check; rc=$?
+[ $rc -eq 1 ] && { echo "check failed; investigate before updating" >&2; exit 1; }
+[ $rc -eq 3 ] && sudo sandbox update --yes
+```
+
+Or as a one-liner (POSIX-portable):
+
+```sh
+sandbox update --check || { [ $? -eq 3 ] && sudo sandbox update --yes; }
+```
 
 ### 2.3 · What `--dry-run` prints
 
@@ -513,11 +531,27 @@ Refuse with a clear free-space report if any are short. Log:
 
 Identical mechanism to install.sh § 4.4.8. The pinned cosign version is
 the **same constant** install.sh uses (Spec 4 § 7.3 — `cosign v2.4.1` at
-write time); both scripts read it from a shared `scripts/lib.sh` header
-constant or from inlined-and-kept-in-sync constants if the scripts choose
-to remain self-contained. Air-gapped path (`--from` + no cosign binary
-downloaded) probes `/usr/local/bin/cosign` as fallback; refuses with a
-clear stage-cosign-locally message if absent. Log:
+write time). Both consumers source it from `scripts/lib.sh`:
+
+```sh
+# scripts/lib.sh  (sourced by both install.sh and sandbox update's shell path)
+COSIGN_VERSION="v2.4.1"
+COSIGN_SHA256_AMD64="<hex>"
+COSIGN_SHA256_ARM64="<hex>"
+```
+
+`scripts/lib.sh` is a **required** shared library, not optional. Spec 4
+§ 12 listed it as "inline vs factored, author's discretion"; now that
+`sandbox update` is a second consumer of the same pinned constant, inlining
+independently guarantees hash drift between the two code paths over time. A
+single bump to `COSIGN_VERSION` and its sha256 in `lib.sh` updates both
+install.sh and `sandbox update` atomically, in one diff, in one PR.
+
+Any future cosign pin bump touches exactly one file — `scripts/lib.sh`.
+
+Air-gapped path (`--from` + no cosign binary downloaded) probes
+`/usr/local/bin/cosign` as fallback; refuses with a clear
+stage-cosign-locally message if absent. Log:
 `step=cosign_bootstrap version=v2.4.1 source=<download|local> status=ok`.
 
 #### 11. Sigstore verification + tarball extraction
@@ -1546,6 +1580,12 @@ succeeds:
 // sandbox-core/src/users_conf.rs (new helper)
 
 pub const DAEMON_MAX_SUPPORTED_USERS_CONF_SCHEMA: u32 = 1;
+/// At v1, MIN equals MAX (both 1) because only one schema version exists.
+/// The MIN constant exists to establish the pattern: when a future daemon
+/// can accept both v1 and v2 files (e.g. a rolling-upgrade window where
+/// some operators have run `sandbox update` but others haven't yet), MIN
+/// stays at 1 and MAX advances to 2. The validator's `MIN <= v <= MAX`
+/// range check is written once and covers both eras without modification.
 pub const DAEMON_MIN_SUPPORTED_USERS_CONF_SCHEMA: u32 = 1;
 
 pub fn validate_users_conf_schema_version(cfg: &UsersConfig) -> Result<(), UsersConfigError> {
