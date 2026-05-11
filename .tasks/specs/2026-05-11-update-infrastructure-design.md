@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-11
 **Status:** Approved
-**Scope:** `sandbox update` CLI subcommand (fetch + verify + pre-flight + backup + stop + atomic file swap + config migration + image load + start + verify); the config migration framework (`sandbox-cli/src/cfg_migrations/`) that applies Spec 1 V001+ to `/etc/sandboxd/users.conf` and `/etc/qemu/bridge.conf`; backup mechanics at `/var/lib/sandbox/backups/` with a 2-retention policy; the lock file at `/var/lib/sandbox/.update.lock` with sticky `was_running`; idempotency contract; documented manual rollback recipe; and the `sandbox rebuild-image lite` CLI subcommand (with `gateway` explicitly refused). The daemon-side `_schema_version`-mismatch refusal that closes the safety loop also lands here.
+**Scope:** `sandbox update` CLI subcommand (fetch + verify + pre-flight + backup + stop + atomic file swap + config migration + image load + start + verify); the config migration framework (`sandbox-cli/src/cfg_migrations/`) that applies Spec 1 V001+ to `/etc/sandboxd/users.conf` and `/etc/qemu/bridge.conf`; backup mechanics at `/var/lib/sandbox/backups/` with a 2-retention policy; the lock file at `/var/lib/sandbox/.update.lock` (mode `0664 sandbox:sandbox`) with sticky `was_running`; idempotency contract; documented manual rollback recipe; and the `sandbox rebuild-image --backend container|lima|all` CLI surface with `--backend gateway` explicitly refused client-side. The daemon-side `_schema_version`-mismatch refusal that closes the safety loop also lands here.
 
 ---
 
@@ -129,24 +129,33 @@ manifest (or reads MANIFEST from `--from`), and prints a status report. It
 does **not** acquire the lock file, does **not** mutate any state, does
 **not** require sudo.
 
-Sample output (upgrade available):
+Sample output (upgrade available — example uses a hypothetical future
+release where `DAEMON_GUEST_PROTO_VERSION` has bumped from 1 to 2, so
+the "refreshable" classification is observable; on the day-one v1→v1.1
+path the daemon's proto range is still `1..1` and every existing
+session classifies as `compatible`):
 
 ```
 Installed: sandboxd 1.0.0  (installed 2026-05-08T14:23:11Z by alice)
-Available: sandboxd 1.1.0  (released 2026-05-10T09:00:00Z, x86_64-unknown-linux-gnu)
+Available: sandboxd 2.0.0  (released 2026-05-10T09:00:00Z, x86_64-unknown-linux-gnu)
 Status:    update available
 
 Pending migrations:
   config: V002 (add per-pool rate limit metadata)
   db:     V0007__add_rate_limit_columns.sql
 
-Stopped sessions (3):
-  0123456789ab  alice/feat-xyz   guest_proto=1  daemon_supports=1..1  → compatible
-  0234567890bc  alice/bugfix-q3  guest_proto=1  daemon_supports=1..1  → compatible (refreshable)
-  0345678901cd  alice/old-poc    guest_proto=0  daemon_supports=1..1  → recreate (pre-V006)
+Stopped sessions (2):
+  0123456789ab  alice/feat-xyz   guest_proto=2  daemon_supports=2..2  → compatible
+  0234567890bc  alice/bugfix-q3  guest_proto=1  daemon_supports=2..2  → compatible (refreshable)
 
 Run `sudo sandbox update` to apply.
 ```
+
+A third row, classified as `recreate`, would surface only on a path
+where `can_refresh_in_place` returns `false` for the session's proto
+version (Spec 2 § 3.7 — v1's body returns `true` for any non-zero
+proto, so the recreate-on-update classification is reserved for
+future protocol changes the seam catches with a `false` arm).
 
 Up-to-date case:
 
@@ -438,16 +447,11 @@ default mode, continue.
 
 #### 6. Acquire lock
 
-See § 6 for the lock-file contract in full. Briefly:
-
-```sh
-lockfile=/var/lib/sandbox/.update.lock
-sudo -k flock -n -E 200 "$lockfile" -c "echo $$ > $lockfile.pid" || ...
-```
-
-The lock-file payload (JSON) carries `pid`, `started_at`, `target_version`,
-`from_version`, and the sticky `was_running` flag captured at first
-acquisition. § 6.4 documents the sticky lifecycle.
+See § 6 for the full lock-file contract. Briefly: the lock file is
+`0664 sandbox:sandbox`; operators in the `sandbox` group can open it
+directly. Acquisition uses `flock -n -x` on an FD held open by the
+shell process itself (no helper subprocess). The full shell sequence
+is in § 6.2.1.
 
 Log: `step=acquire_lock pid=$$ target_version=<v> from_version=<v> was_running=<0|1> action=<acquire|adopt> status=ok`.
 
@@ -644,14 +648,15 @@ Log: `step=backup_sessions_db path=<dst> sha256=<hex> action=<copy|skip>`.
 #### 16. Backup /etc files
 
 `users.conf` is mode `0644 root:root` (Spec 4 § 4.4.19). `bridge.conf`
-is mode `0640 root:root` (`Makefile:337-356` / Spec 4 § 4.4.18). The
-backup must preserve readable content but lives under the
-`sandbox:sandbox` backup set:
+is mode `0644 root:root` (`Makefile:355` / Spec 4 § 4.4.18 — matches
+QEMU's distro convention, where `bridge.conf` is world-readable in
+every distro's `qemu-system-common` package). The backup must preserve
+readable content but lives under the `sandbox:sandbox` backup set:
 
 ```sh
 for src_dst_mode in \
     "/etc/sandboxd/users.conf $backup_set/users.conf.bak 0644" \
-    "/etc/qemu/bridge.conf    $backup_set/bridge.conf.bak 0640"
+    "/etc/qemu/bridge.conf    $backup_set/bridge.conf.bak 0644"
 do
     src=${src_dst_mode% * *}; dst=$(echo $src_dst_mode | awk '{print $2}'); mode=$(echo $src_dst_mode | awk '{print $3}')
     [ -f "$src" ] || { log_ok "step=backup_etc src=$src action=skip reason=absent"; continue; }
@@ -669,9 +674,9 @@ done
 ```
 
 The `cat | sudo -u sandbox tee` two-step is so the daemon-user can
-write into its own backup set. `bridge.conf` at mode 0640 requires
-root or a member of the file's group to read; `sudo -k cat` reads as
-root, pipes the bytes to the `sandbox`-owned destination. The mode
+write into its own backup set. Both files are mode `0644` (root-only
+write, world-readable) so `sudo -k cat` reads as root and pipes the
+bytes to the `sandbox`-owned destination unchanged. The mode
 restoration via `chmod` after the write ensures `.bak` matches the
 original mode bit-for-bit, which the rollback recipe (§ 7.2) relies on.
 
@@ -756,7 +761,55 @@ EOF
 The `files` map is populated from § 3.2.15–17 outputs. Log:
 `step=backup_manifest status=in-progress`.
 
-#### 20. Install new binaries
+**Ordering note (binding):** the locked-in brainstorm decision is
+**"image load BEFORE binary swap, to avoid leaving the system
+half-updated."** The reasoning: if an upgrade is interrupted between
+binary install and image load, a `systemctl start` would launch the
+**new** daemon binary against the **old** gateway image tag — and the
+new daemon refuses to start (Spec 3 § 8.5 — gateway image is a hard
+requirement). By loading the image first, an interruption mid-flight
+leaves the system at "old binary, old image still present plus new
+image present alongside" — the old daemon still runs cleanly, and a
+re-run picks up where it left off without any half-state. The
+following steps are sequenced accordingly: docker load (step 20),
+then binary swap (step 21), then setcap, unit, migrations.
+
+Idempotency contract under this ordering:
+
+| Re-entry point                                 | Convergence outcome                                                                                  |
+|-----------------------------------------------|-------------------------------------------------------------------------------------------------------|
+| Interrupted before step 20                    | Old binary, old image. Daemon if `was_running` is still healthy. Re-run resumes from step 20.        |
+| Interrupted after step 20, before step 21     | Old binary, **both** images present (idempotent: `docker image inspect` short-circuits on re-run).   |
+| Interrupted after step 21, before § 3.2.26   | New binary on disk, daemon stopped. Re-run resumes from the failing step; old image still present unless operator pruned, but the new image is also present (step 20 ran). The new daemon's start passes Spec 3 § 8.5's check. |
+| Interrupted between §§ 3.2.26 and 3.2.30      | New binary running. Lock file persists until § 3.2.30; re-run adopts and reaches the failing post-start step. |
+
+The post-load image-tag table check (`docker image inspect "$tag"`) at
+step 20's idempotency check is the convergence anchor — once a tag is
+present, the step short-circuits on every subsequent run.
+
+#### 20. `docker load` new gateway image
+
+Image load happens **before** the binary swap, per the binding ordering
+note above. Same shape as install.sh § 4.4.20:
+
+```sh
+tag="sandbox-gateway:${TARGET_VERSION}"
+if docker image inspect "$tag" >/dev/null 2>&1; then
+    log_ok "step=docker_load image=$tag action=skip reason=already-loaded"
+else
+    sudo -k docker load -i "$stage/images/sandbox-gateway-${TARGET_VERSION}.tar"
+    docker image inspect "$tag" >/dev/null || die "docker load did not produce expected tag $tag"
+fi
+```
+
+**Old image not pruned.** Spec 3 § 8.6 forbids auto-pruning the prior
+version's gateway image during upgrade — stopped sessions may still
+reference the prior tag's image-id, and the disk cost is bounded.
+Operators run `docker image prune` manually when they want.
+
+Log: `step=docker_load image=<tag> action=<load|skip> status=ok`.
+
+#### 21. Install new binaries
 
 Mirrors install.sh § 4.4.14 — sha256 compare for idempotency, atomic
 install via `install -D -m <mode> -o root -g root`:
@@ -779,11 +832,11 @@ install_binary "$stage/bin/sandbox-route-helper" /usr/local/libexec/sandboxd/san
 The new daemon binary lands at `0755 root:root`. The route-helper's file
 caps are *not* preserved by `install` — they're stripped on file
 overwrite (Linux removes file caps on any chmod/chown/write that
-touches the inode). The setcap step (§ 3.2.21) restores them.
+touches the inode). The setcap step (§ 3.2.22) restores them.
 
 Log: `step=install_binary path=<dst> sha256=<hex> action=<install|skip> status=ok`.
 
-#### 21. Setcap on route-helper
+#### 22. Setcap on route-helper
 
 Identical to install.sh § 4.4.15:
 
@@ -802,7 +855,7 @@ fi
 
 Log: `step=setcap caps=<v> action=<set|skip> status=ok`.
 
-#### 22. Install systemd unit (idempotent)
+#### 23. Install systemd unit (idempotent)
 
 The new release's `systemd/sandboxd.service` may differ from the
 installed one (Spec 3 § 4.1 fixes the unit shape; future releases may
@@ -826,7 +879,7 @@ walks through the invariant. The check looks at the unit file only; the
 
 Log: `step=install_unit path=<p> sha256=<hex> action=<install|skip> status=ok`.
 
-#### 23. Apply config migrations (per file, atomically)
+#### 24. Apply config migrations (per file, atomically)
 
 The framework runs its apply loop (§ 4.3) for each managed file. For
 each pending migration, in numeric order:
@@ -886,27 +939,6 @@ hop, and on a subsequent run the framework continues from there.
 
 Log: `step=migrate_<file> migration=V<NNN> path=<p> action=<apply|skip>`.
 
-#### 24. `docker load` new gateway image
-
-Same shape as install.sh § 4.4.20:
-
-```sh
-tag="sandbox-gateway:${TARGET_VERSION}"
-if docker image inspect "$tag" >/dev/null 2>&1; then
-    log_ok "step=docker_load image=$tag action=skip reason=already-loaded"
-else
-    sudo -k docker load -i "$stage/images/sandbox-gateway-${TARGET_VERSION}.tar"
-    docker image inspect "$tag" >/dev/null || die "docker load did not produce expected tag $tag"
-fi
-```
-
-**Old image not pruned.** Spec 3 § 8.6 forbids auto-pruning the prior
-version's gateway image during upgrade — stopped sessions may still
-reference the prior tag's image-id, and the disk cost is bounded.
-Operators run `docker image prune` manually when they want.
-
-Log: `step=docker_load image=<tag> action=<load|skip> status=ok`.
-
 #### 25. Prune older backup sets
 
 Only **successful** (`completed_ok: true`) backup sets are pruned. The
@@ -941,7 +973,10 @@ step § 3.2.29 below, so this prune step **runs before** the final
 manifest update — but the filter on `completed_ok: true` already
 excludes the current set (its manifest still says `false` from step
 § 3.2.19), so even if the prune ran twice it wouldn't touch this run's
-state.
+state. The re-ordering of binary swap and docker load (steps 20–21
+above) does not affect this property — the prune step looks only at
+already-completed sibling backup sets' manifests, not at the current
+run's binaries or images.
 
 Log: `step=prune_backups kept=2 pruned=<n>`.
 
@@ -1041,6 +1076,7 @@ Log: `step=finalize_state installed_version=<v> previous_version=<v> status=ok`,
 
 ```sh
 sudo -k rm -f /var/lib/sandbox/.update.lock
+exec {lock_fd}>&-     # close the FD → kernel releases flock
 ```
 
 Log: `step=release_lock status=ok`,
@@ -1055,7 +1091,7 @@ The upgrade explicitly does **not** touch:
 | `/etc/systemd/system/sandboxd.service.d/`                           | Spec 3 § 4.3 promise: operator drop-ins survive base-unit replacement. § 3.2.22 above touches only `sandboxd.service`, never the sibling `.service.d/`. |
 | `/var/lib/sandbox/sessions.db` (after the backup-then-upgrade)      | Backed up before the swap; refinery applies forward-only DB migrations on next daemon start (no CLI-side touch). |
 | Per-session directories under `/var/lib/sandbox/sessions/<id>/`     | Session state is owned by the daemon; the upgrade never reaches into per-session storage. |
-| `/var/lib/sandbox/route-helper-audit.log`                           | Appendable forensic log; the upgrade does not rotate or truncate it. |
+| `/var/lib/sandbox/route-helper-audit.log`                           | Appendable forensic log; the upgrade does not rotate or truncate it. The route-helper's audit-write policy (Spec 1's revision: deny-path write failure escalates with `DENY_EXIT`; allow-path write failure continues) is unaffected by the upgrade — Spec 5 inherits the policy as-is and the upgrade flow does not touch the audit log's file mode, owner, or content. |
 | `/var/log/sandbox-install.log`                                      | Appended to with `sandbox-update` second token (§ 2.6); never rotated or truncated. |
 | The `sandbox` system user, group, and `docker`/`kvm` memberships    | Only install.sh creates them; uninstall.sh removes them under `--purge`. The upgrade leaves them alone. |
 | Operator group memberships (operators in `sandbox` group)           | install.sh records `operators_added_to_group`; the upgrade does not modify the list. |
@@ -1201,6 +1237,31 @@ content transform. The split keeps each new migration a focused unit:
 the test for V001's transform is the unit test in Spec 1 § 8.2 — no
 file-IO mocking required.
 
+**Selection rule (binding):** every migration advances **exactly one
+version**: `to_version() == from_version() + 1`. Multi-version skips
+are composed by chaining migrations (e.g., upgrading a file from
+version 0 to version 3 walks V001 0→1, V002 1→2, V003 2→3 in order).
+This forbids a single migration with `from_version() == 0, to_version()
+== 3` that would collapse three steps; such a transform must be split
+into three single-step migrations.
+
+Two consequences:
+
+1. The apply loop's filter `m.from_version() == current` is exact
+   (§ 4.3 — never picks more than one migration per iteration; walks
+   the chain by re-reading `current` after each apply).
+2. Spec 1's V001 idempotency contract (Spec 1 § 5.3 — "A file with
+   `_schema_version: 1` already at the top level → V001 does
+   nothing") is a **defense-in-depth guarantee unobservable by the
+   framework's selection rule**: the apply loop short-circuits at
+   `current >= target` (§ 4.3) before calling V001's `apply` on a
+   file already at version 1. Spec 1 documents the transform-level
+   idempotency for the case where a test or future contributor calls
+   the pure transform directly; the framework never observes it.
+
+The selection rule is verified by a unit test in § 9.2
+(`registry_migrations_advance_exactly_one_version`).
+
 The registry is a static slice of `&'static dyn ConfigMigration`,
 initialized at compile time:
 
@@ -1298,6 +1359,56 @@ an in-memory copy of each file (read once, transforms threaded
 through, validation invoked) but never writes — the validation step
 catches any broken migration before any sudo elevation occurs.
 
+#### Access gating for `--apply-config-migration` (security)
+
+The hidden flag is clap-`hide(true)` so it doesn't surface in
+`--help`, but `hide` is **not access control** — the flag is callable
+by any local user against `/usr/local/bin/sandbox` (mode `0755 root:root`,
+world-callable per Spec 3 § 5.1). Without explicit gating, an
+unprivileged user could ask the CLI to apply migration V001 against an
+attacker-controlled `--file /tmp/their-fake.json` with `--out
+/var/lib/sandbox/whatever`, which is a parser-confusion hazard at
+minimum and a privesc-shaped bug if a future migration writes
+attacker-controlled bytes to a path with downstream effects.
+
+The `--apply-config-migration` subcommand enforces, in this order:
+
+1. **Caller must be root.** `getuid() != 0` → refuse with
+   `--apply-config-migration is internal to sandbox update and requires
+   root; run via `sudo sandbox update` instead` and exit non-zero.
+   This rules out unprivileged callers entirely; the only legitimate
+   caller is `sudo -k sandbox --apply-config-migration` invoked by
+   `sandbox update`'s own orchestration.
+2. **`--file` is a registry-canonical path.** The argument is parsed
+   into a `TargetFile` (via `TargetFile::from_canonical_path(&Path)`,
+   a new helper that returns `Some(TargetFile::UsersConf)` for
+   exactly `/etc/sandboxd/users.conf` and `Some(TargetFile::BridgeConf)`
+   for exactly `/etc/qemu/bridge.conf`). Anything else → refuse with
+   `--file must be one of the registry's canonical paths
+   (/etc/sandboxd/users.conf, /etc/qemu/bridge.conf); got: <path>`.
+3. **`--out` is a tempfile under a registry-known parent dir.** The
+   argument's parent must be the same parent as `--file`'s canonical
+   path, and the basename must match the pattern
+   `\.<basename>\.tmp\.V[0-9]+$` (e.g., `/etc/sandboxd/.users.conf.tmp.V001`).
+   Anything else → refuse with `--out must be a tempfile under the
+   same directory as --file; got: <out>`.
+4. **`--migration` exists in the registry for the target file.** The
+   migration ID must resolve to a registered `ConfigMigration` whose
+   `target_file()` matches the validated `TargetFile`. Anything else
+   → refuse with `migration V<NNN> not found in registry for <target>`.
+
+Same rules for `--dump-migration-set` (§ 3.1.4), narrower:
+
+1. Caller must be the operator or root (no privilege requirement; the
+   flag is read-only).
+2. No argument validation beyond clap's parsing (it takes no
+   path-like arguments).
+3. Output goes to stdout; no file is written.
+
+The gating logic lives in `sandbox-cli/src/main.rs`'s subcommand
+dispatch (a precondition guard at the top of the handler). Unit tests
+in § 9.2 cover each refusal path.
+
 ### 4.4 · Atomic write semantics
 
 Atomic write requires:
@@ -1324,7 +1435,13 @@ sudo-`mv` because the rename target lives under `/etc/`, owned by root.
 For `users.conf` specifically (Spec 4 § 4.4.19 sets it `0644 root:root`):
 the rename leaves the file at the right mode automatically (assuming the
 temp file is installed at `0644 root:root` before the mv). For
-`bridge.conf` (`0640 root:root`): same pattern, mode 0640.
+`bridge.conf` (`0644 root:root` per `Makefile:355` / Spec 4 § 4.4.18 —
+matches QEMU's distro convention): same pattern, mode 0644. The CLI
+must reference the canonical mode constants rather than re-stating them
+inline (a single shared `MODE_USERS_CONF: u32 = 0o644` and
+`MODE_BRIDGE_CONF: u32 = 0o644` in the framework's `version.rs` or
+`mod.rs`) so future migrations that touch new files declare their mode
+once.
 
 ### 4.5 · Version detection per file
 
@@ -1526,7 +1643,7 @@ one backup set as a subdirectory:
 │   ├── sandbox-route-helper.bak     # mode 0640
 │   ├── sessions.db.bak              # mode 0600
 │   ├── users.conf.bak               # mode 0644 (matches /etc/sandboxd/users.conf)
-│   └── bridge.conf.bak              # mode 0640 (matches /etc/qemu/bridge.conf)
+│   └── bridge.conf.bak              # mode 0644 (matches /etc/qemu/bridge.conf per Spec 4 § 4.4.18)
 ├── 2026-05-09T09:11:42Z-from-0.9.5-to-1.0.0/      ← prior successful upgrade, kept
 └── 2026-05-07T12:00:00Z-from-0.9.4-to-0.9.5/      ← older, eligible for prune
 ```
@@ -1631,20 +1748,26 @@ contract.
 
 ### 6.1 · Path and shape
 
-`/var/lib/sandbox/.update.lock`. Mode `0600 sandbox:sandbox`. Created
+`/var/lib/sandbox/.update.lock`. Mode **`0664 sandbox:sandbox`**. Created
 on first `sandbox update` invocation; deleted at successful completion
 (§ 3.2.30). The path is **persistent** (under `/var/lib/`, not `/run/`)
 because it must survive a system reboot mid-update so re-runs can
 detect and adopt.
 
-Path resolution note: the lock file lives under `/var/lib/sandbox/`,
-which Spec 3 § 4.1 sets as the systemd `StateDirectory=` for the
-daemon. The directory's owner is `sandbox:sandbox` mode `0750`; the
-CLI runs as the operator (not as `sandbox`). The CLI must use `sudo
--k` for both reads and writes against the lock file. This is
-intentional — the lock file gates a privileged operation, and the
-elevation to read it is the same elevation needed to perform the
-update.
+**Mode rationale:** `0664` (`rw-rw-r--`) allows any operator in the
+`sandbox` group (Spec 3 § 3.2 — all operators that can reach the daemon
+socket are in the `sandbox` group) to open the file with
+`O_RDWR|O_CREAT`. This lets the acquisition shell pseudo-code use a
+direct `exec {fd}<>"$lockfile"` without `sudo`, which in turn keeps the
+flock on an FD the running process owns — no long-lived helper child or
+subprocess is required. The file owner is `sandbox:sandbox` so a fresh
+create sets the right owner automatically (file is created in
+`/var/lib/sandbox/` which is `0750 sandbox:sandbox`; only
+`sandbox:sandbox` processes or root can create files there without a
+prior `sudo`; the first write under `sudo -k` sets ownership correctly).
+Operators outside the `sandbox` group cannot run `sandbox update` in a
+meaningful way (the daemon socket is `0660 sandbox:sandbox`), so the
+relaxed mode does not expand the privilege surface.
 
 Lock-file payload (JSON):
 
@@ -1662,118 +1785,190 @@ Lock-file payload (JSON):
 
 ### 6.2 · Acquisition
 
-The acquisition pattern uses `flock(2)` for the mutex semantics and an
-atomic create-or-update for the payload:
+Mode `0664 sandbox:sandbox` means operator-level open succeeds.
+Acquisition uses the `flock(1)` utility (available everywhere on Linux
+via `util-linux`) for the kernel advisory lock, and `sudo -k` only for
+the payload write (which must be done as root since the file was created
+with `O_CREAT` under sudo on fresh acquisition, and the group-write
+permission means the operator can take the lock but the payload write
+targets a directory that requires root to write in).
+
+#### 6.2.1 · Shell pseudo-code
 
 ```sh
 lockfile=/var/lib/sandbox/.update.lock
-lock_fd=
+
+# Step 1: Attempt to open the file with group-write permission (0664).
+#         O_CREAT | O_RDWR: fine, the directory's group permission
+#         plus the file's 0664 mode allows the operator in sandbox group.
+#         If the file doesn't exist yet, it must be created under sudo
+#         first (the directory is 0750 sandbox:sandbox; only root or the
+#         sandbox user can create new files in it).
+if [ ! -f "$lockfile" ]; then
+    sudo -k -u sandbox touch "$lockfile"
+    sudo -k -u sandbox chmod 0664 "$lockfile"
+fi
+
+# Step 2: Try non-blocking exclusive flock. The flock FD stays open
+#         for the lifetime of the shell process (held via exec trick).
 exec {lock_fd}<>"$lockfile"
-if ! sudo -k flock -n -x $lock_fd; then
-    # Lock is held; inspect to see who.
-    if [ -f "$lockfile" ]; then
-        held_pid=$(sudo -k jq -r '.pid // 0' "$lockfile" 2>/dev/null || echo 0)
-        if [ "$held_pid" -gt 0 ] && kill -0 "$held_pid" 2>/dev/null; then
-            die "another update is in progress (pid $held_pid). Wait for it to finish."
-        else
-            # PID is dead — adopt.
-            log_warn "step=acquire_lock adopted_from_pid=$held_pid action=adopt"
-            # was_running is preserved from the existing lock file
-            WAS_RUNNING=$(sudo -k jq -r '.was_running // 0' "$lockfile")
-            # The flock acquisition itself fails because another process
-            # holds it OR because the file's flock entry is stale. We
-            # retry with the dead-PID branch and forcibly write a new
-            # payload + acquire the lock.
+if ! flock -n -x "$lock_fd"; then
+    # EWOULDBLOCK — another process holds the lock. Inspect payload.
+    held_pid=$(jq -r '.pid // 0' "$lockfile" 2>/dev/null || echo 0)
+    if [ "$held_pid" -gt 0 ] && kill -0 "$held_pid" 2>/dev/null; then
+        die "another sandbox update is in progress (pid $held_pid); wait for it to finish."
+    else
+        # PID is dead. The kernel released its flock; our non-blocking
+        # attempt just failed because we lost the race against another
+        # adopting process. Retry once with a short wait. In the common
+        # single-user case there is no race; the retry loop is purely
+        # defensive.
+        sleep 1
+        if ! flock -n -x "$lock_fd"; then
+            die "lock busy after retry; another adoption is in progress."
         fi
+        log_warn "step=acquire_lock adopted_from_dead_pid=$held_pid action=adopt"
+        ADOPT=1
     fi
 fi
-```
 
-`flock(2)`'s lock is per-file-descriptor — it's released automatically
-when the holding process exits (the kernel sweeps file descriptors on
-process death). If the holding `sandbox update` died mid-flight, the
-kernel released its flock; the dead-PID branch above is for the case
-where the on-disk JSON payload still exists but no process holds the
-flock anymore.
+# Step 3: We hold the lock. Decide: fresh acquisition or dead-PID adoption.
+#         Ordering is binding: flock is held BEFORE reading or writing
+#         the payload — no racing reader or writer can observe a
+#         partial/stale payload under the held flock.
+existing=$(cat "$lockfile" 2>/dev/null || echo "")
+prior_was_running=$(echo "$existing" | jq -r '.was_running // null' 2>/dev/null)
+prior_started_at=$(echo  "$existing" | jq -r '.started_at  // ""'   2>/dev/null)
+stale_hours=0
+if [ -n "$prior_started_at" ]; then
+    prior_epoch=$(date -d "$prior_started_at" +%s 2>/dev/null || echo 0)
+    stale_hours=$(( ($(date +%s) - prior_epoch) / 3600 ))
+fi
 
-Lock acquisition outcomes:
+if [ -z "$prior_was_running" ] || [ -z "${ADOPT:-}" ]; then
+    # Fresh acquisition. Sample daemon state NOW — this is the one
+    # point where was_running is determined; every re-run inherits it.
+    WAS_RUNNING=$(systemctl is-active sandboxd >/dev/null 2>&1 && echo true || echo false)
+    ACTION=acquire
+elif [ "$stale_hours" -gt 24 ]; then
+    WAS_RUNNING=${prior_was_running}
+    ACTION="adopt-stale"
+    log_warn "step=acquire_lock stale_hours=$stale_hours action=adopt-stale"
+else
+    # Normal dead-PID adoption. Preserve prior was_running.
+    WAS_RUNNING=${prior_was_running}
+    ACTION=adopt
+fi
 
-| State                                          | Outcome                                                                                     |
-|------------------------------------------------|---------------------------------------------------------------------------------------------|
-| File absent → create + acquire flock          | Fresh acquisition. Write payload with `was_running` from `systemctl is-active`. Continue.   |
-| File present, flock held by live PID          | Refuse with "another update is in progress (pid $X)". Exit code 1.                          |
-| File present, flock released (process dead)   | Adopt: read existing payload (sticky `was_running`), overwrite `pid` and `started_at`, continue. |
-| File present with stale timestamp (> 24h old) | Adopt with warning — same as dead-PID adoption but log additionally.                        |
-
-The first acquisition writes the payload from scratch:
-
-```sh
-WAS_RUNNING=$(systemctl is-active sandboxd >/dev/null 2>&1 && echo 1 || echo 0)
+# Step 4: Write new payload under the held lock.
+#         sudo is needed here because /var/lib/sandbox/ is 0750 and
+#         writing to the existing 0664 file is allowed by group perm,
+#         but using sudo -u sandbox ensures the owner stays correct.
 sudo -k -u sandbox tee "$lockfile" >/dev/null <<EOF
 {
   "pid":            $$,
   "started_at":     "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "target_version": "$TARGET_VERSION",
   "from_version":   "$CURRENT_VERSION",
-  "was_running":    $([ "$WAS_RUNNING" -eq 1 ] && echo true || echo false)
+  "was_running":    $WAS_RUNNING
 }
 EOF
+
+log_ok "step=acquire_lock pid=$$ was_running=$WAS_RUNNING action=$ACTION"
 ```
 
-The dead-PID adoption preserves `was_running`, updates `pid` and
-`started_at`, and keeps `target_version` and `from_version` if the
-new run is targeting the same version; if the new run is targeting a
-different version (operator changed `--version` between attempts),
-adopt warns and overwrites — the operator is now driving a different
-upgrade and the old lock's metadata is stale.
+#### 6.2.2 · Ordering rule: flock before payload read/write
+
+The binding rule: **flock first, then read-and-write the payload**. This
+prevents two simultaneously-racing `sandbox update` processes from both
+reading the prior payload before either holds the lock.
+
+Under the held flock:
+
+- **Read:** the payload reflects the last completed write (either the
+  previous run's final state, or empty on first creation).
+- **Write:** `tee` writes atomically from the shell's perspective (the
+  flock serialises it); any other process attempting to acquire will
+  block until we release.
+
+A racing `sandbox update` that hits `flock -n -x` while we hold it gets
+`EWOULDBLOCK` immediately (step 2 above). It reads the payload **without
+the flock** (since we hold the exclusive lock), which means it may see
+a partial in-progress write. The code tolerates this: `jq` parse failure
+returns `held_pid=0`, and `kill -0 0` always fails, triggering the
+"PID dead" branch which retries via `sleep 1` + second flock attempt.
+At that point our write is complete and the retry sees a full payload
+with the current PID (alive), so it correctly refuses.
+
+#### 6.2.3 · Lock acquisition outcomes
+
+| State                                          | Outcome                                                                                     |
+|------------------------------------------------|---------------------------------------------------------------------------------------------|
+| File absent → create (sudo) + acquire flock   | Fresh acquisition. Sample `systemctl is-active`; write payload. Continue.                   |
+| File present, flock held by live PID           | `EWOULDBLOCK`; read payload; PID alive → refuse with "another update in progress (pid X)".  |
+| File present, flock released (process dead)    | `EWOULDBLOCK` then retry; flock acquired on second attempt; dead PID confirmed → adopt with sticky `was_running`. |
+| File present with `started_at > 24h old`       | Adopt with additional `step=acquire_lock action=adopt-stale` log line.                      |
 
 ### 6.3 · Release
 
-On successful completion of § 3.2.29 (install state + manifest
-update), § 3.2.30 deletes the lock file:
+On successful completion of § 3.2.29, § 3.2.30 removes the lock file
+and closes the FD (which also releases the kernel flock):
 
 ```sh
-sudo -k rm -f /var/lib/sandbox/.update.lock
+# § 3.2.30: Release.
+sudo -k rm -f "$lockfile"
+exec {lock_fd}>&-     # close the FD → kernel releases the flock
 ```
 
-If `sandbox update` exits non-zero before § 3.2.30, the lock file
-remains in place. A re-run will see it, check the PID, find it dead
-(the exited process), and adopt. The sticky `was_running` carries
-through; the idempotent inspections (§§ 3.2.15–28) skip already-done
-work and re-attempt the failing step.
+If `sandbox update` exits non-zero before § 3.2.30, the process ends
+and the shell closes all open FDs — the kernel releases the flock
+automatically when `lock_fd` closes on exit. The JSON payload file
+**remains on disk** (the `rm` at § 3.2.30 didn't run). A re-run will
+`flock -n -x` successfully (the prior process's flock is gone), read
+the stale payload, see the dead PID, and adopt with the sticky
+`was_running`.
+
+This "file remains, flock released" property is the whole point of the
+dead-PID adoption branch: the payload is the durable state across process
+restarts; the flock is the live-process-only mutex.
+
+**Rollback recipe note (§ 7.2 step 8):** after invoking the rollback,
+remove the stale lock file manually:
+
+```sh
+sudo rm -f /var/lib/sandbox/.update.lock
+```
+
+This prevents future `sandbox update` runs from adopting a stale payload
+that reflects the abandoned update's versions.
 
 ### 6.4 · The sticky `was_running` flag
 
-This is the only piece of state that the system itself cannot infer
-between re-runs. After § 3.2.14 (stop daemon), the daemon is stopped;
-`systemctl is-active sandboxd` returns `inactive`. A re-run that calls
-`systemctl is-active` would see `inactive` and conclude
-`was_running=0`, then skip the final start step (§ 3.2.26) — even
-though the original state was "running, should be started again after
-upgrade."
+This is the only piece of state the system cannot infer between re-runs.
+After § 3.2.14 (stop daemon), `systemctl is-active sandboxd` returns
+`inactive`. A fresh re-run that re-evaluates `is-active` would see
+`inactive` and conclude `was_running=false`, then skip § 3.2.26
+(re-start) — even though the operator's intent was "it was running before
+the upgrade, start it back when done."
 
-Solution: the flag is captured **once**, at first lock acquisition
-(`systemctl is-active sandboxd` immediately after creating the lock
-file). On every adopt-the-lock re-acquisition, the existing
-`was_running` is preserved, never re-evaluated. After successful
-release (§ 3.2.30), the lock file is gone and subsequent fresh runs
-re-evaluate.
+Solution: the flag is captured **once**, at the initial lock acquisition
+(§ 6.2.1 step 3). Every subsequent re-run that adopts the lock reads the
+payload's `was_running` and carries it forward unchanged.
 
 Lifecycle:
 
-1. **First acquisition:** evaluate `systemctl is-active sandboxd`; write
-   `was_running` as boolean into the lock file payload.
-2. **Adopt (dead-PID re-run):** read existing `was_running`; preserve.
-3. **Use in § 3.2.14 / § 3.2.26:** condition the stop and start on
-   `was_running`.
-4. **Release at § 3.2.30:** lock file deleted; sticky flag discarded.
-5. **Next fresh run:** if the daemon is now running (because the
-   previous update started it back), `was_running=1` again. If
-   not, `was_running=0` — operator's choice.
+1. **Fresh acquisition:** evaluate `systemctl is-active sandboxd`; write
+   as `was_running` in the JSON payload.
+2. **Dead-PID adoption:** read prior payload's `was_running`; do **not**
+   re-evaluate `is-active`. The sticky flag is the one from step 1.
+3. **Use in §§ 3.2.14 / 3.2.26:** stop daemon only if `was_running`;
+   start daemon only if `was_running`.
+4. **Release at § 3.2.30:** `rm` the file; sticky flag discarded.
+5. **Next fresh run:** evaluates `is-active` again from current state.
 
-The `--check` and `--dry-run` modes do **not** acquire the lock or
-write the `was_running` flag — they're read-only and use a transient
-inspection of `systemctl is-active` for display purposes only.
+The `--check` and `--dry-run` modes do **not** acquire the lock or write
+`was_running` — they are read-only and use a transient `is-active` call
+for display purposes only.
 
 ## 7 · Documented rollback recipe
 
@@ -1790,7 +1985,7 @@ encode, and the documented recipe is enough until demand emerges.
 | Daemon binary (`/usr/local/bin/sandboxd`)      | Direct restore from `sandboxd.bak`.                                                    |
 | CLI binary (`/usr/local/bin/sandbox`)          | Direct restore from `sandbox.bak`.                                                     |
 | Route-helper binary                            | Direct restore from `sandbox-route-helper.bak` + re-setcap.                            |
-| Gateway image                                  | Old image tag survives (Spec 3 § 8.6 — not auto-pruned). No restore needed; the daemon's `lite_image_tag_for_version` and `gateway_image_tag_for_version` (Spec 3 § 8.3) pick the tag matching the daemon's version, so restoring the binary auto-selects the prior image. |
+| Gateway image                                  | Old image tag **may** survive if the operator hasn't run `docker image prune` since the upgrade. The daemon does **not** rebuild the gateway image (Spec 3 § 8.5 — gateway is shipped pre-built per release, not built on demand), and Spec 3 § 8.6 actively encourages operators to prune old tags. If the prior tag (`sandbox-gateway:<previous-version>`) is **absent**, rollback requires re-loading from the prior release tarball (operator's responsibility — keep prior tarballs locally, or re-download from GH Releases). The recipe at § 7.2 includes an explicit `docker image inspect` step that gates whether re-load is required. |
 | `/etc/sandboxd/users.conf`                     | Direct restore from `users.conf.bak`. The config migration framework is forward-only at the framework level, but the file's pre-update bytes are preserved bit-for-bit in the backup. |
 | `/etc/qemu/bridge.conf`                        | Direct restore from `bridge.conf.bak`.                                                  |
 | `sessions.db`                                  | Direct restore from `sessions.db.bak`. Refinery DB migrations are forward-only, so restoring the prior daemon binary and an upgraded sessions.db would refuse to start (Spec 5 inherits Spec 2 § 6.1's "DB ahead of binary" failure mode). Restoring both as a unit is the contract. |
@@ -1819,33 +2014,46 @@ BACKUP_DIR=$(sudo -u sandbox ls -td /var/lib/sandbox/backups/*/ \
 echo "Rolling back from backup: $BACKUP_DIR"
 sudo -u sandbox cat "$BACKUP_DIR/manifest.json"
 
-# 2. Stop the daemon.
+# 2. Verify the prior gateway image is still present. If pruned, re-load it
+#    from the prior release tarball BEFORE starting the rolled-back daemon
+#    (Spec 3 § 8.5 — the daemon refuses to start without its versioned gateway image).
+PREV_VERSION=$(sudo -u sandbox jq -r '.from_version' "$BACKUP_DIR/manifest.json")
+if ! docker image inspect "sandbox-gateway:${PREV_VERSION}" >/dev/null 2>&1; then
+    echo "Prior gateway image sandbox-gateway:${PREV_VERSION} is missing (likely pruned)."
+    echo "Re-load it from the prior release tarball, e.g.:"
+    echo "    sudo docker load -i sandboxd-${PREV_VERSION}-$(uname -m)-unknown-linux-gnu/images/sandbox-gateway-${PREV_VERSION}.tar"
+    echo "Re-fetch the tarball from https://github.com/Koriit/sandboxd/releases/tag/v${PREV_VERSION}"
+    echo "Then re-run this rollback script from step 3."
+    exit 1
+fi
+
+# 3. Stop the daemon.
 sudo systemctl stop sandboxd
 
-# 3. Restore binaries — install with proper mode/owner.
+# 4. Restore binaries — install with proper mode/owner.
 sudo install -m 0755 -o root -g root "$BACKUP_DIR/sandboxd.bak"             /usr/local/bin/sandboxd
 sudo install -m 0755 -o root -g root "$BACKUP_DIR/sandbox.bak"              /usr/local/bin/sandbox
 sudo install -m 0755 -o root -g root "$BACKUP_DIR/sandbox-route-helper.bak" /usr/local/libexec/sandboxd/sandbox-route-helper
 
-# 4. Re-apply route-helper file caps.
+# 5. Re-apply route-helper file caps.
 sudo setcap cap_net_admin,cap_sys_admin=eip /usr/local/libexec/sandboxd/sandbox-route-helper
 
-# 5. Restore /etc files.
+# 6. Restore /etc files. bridge.conf is mode 0644 per Spec 4 § 4.4.18 / Makefile:355.
 sudo install -m 0644 -o root -g root "$BACKUP_DIR/users.conf.bak"  /etc/sandboxd/users.conf
-sudo install -m 0640 -o root -g root "$BACKUP_DIR/bridge.conf.bak" /etc/qemu/bridge.conf
+sudo install -m 0644 -o root -g root "$BACKUP_DIR/bridge.conf.bak" /etc/qemu/bridge.conf
 
-# 6. Restore sessions.db. The backup is owned sandbox:sandbox at mode 0600 — `install` preserves nothing of the dest;
+# 7. Restore sessions.db. The backup is owned sandbox:sandbox at mode 0600 — `install` preserves nothing of the dest;
 #    the explicit -o sandbox -g sandbox restores ownership.
 sudo install -m 0600 -o sandbox -g sandbox "$BACKUP_DIR/sessions.db.bak" /var/lib/sandbox/sessions.db
 
-# 7. Remove the stale lock file (if present from a failed update). The lock survives
+# 8. Remove the stale lock file (if present from a failed update). The lock survives
 #    until § 3.2.30; if the upgrade exited before then, the lock remains.
 sudo rm -f /var/lib/sandbox/.update.lock
 
-# 8. Start the daemon.
+# 9. Start the daemon.
 sudo systemctl start sandboxd
 
-# 9. Verify.
+# 10. Verify.
 sandbox doctor
 ```
 
@@ -1880,8 +2088,17 @@ restored DB are visible).
 
 - **Lock file cleanup is the operator's job.** After rollback the
   operator must `rm /var/lib/sandbox/.update.lock` so future
-  `sandbox update` runs can acquire it. The recipe (§ 7.2 step 7)
+  `sandbox update` runs can acquire it. The recipe (§ 7.2 step 8)
   includes this.
+
+- **Gateway image absence requires manual reload.** § 7.2 step 2 gates
+  the rest of the recipe on `docker image inspect
+  sandbox-gateway:<prev>` succeeding. If the operator has run
+  `docker image prune` since the upgrade (Spec 3 § 8.6 encourages
+  this) and no longer has the prior release tarball locally, they
+  must re-fetch it from GH Releases before continuing. The recipe
+  short-circuits with a clear `docker load` hint pointing at the GH
+  Releases tag URL.
 
 - **Operator group memberships unaffected.** Rollback does not revoke
   group memberships granted during install (or during prior upgrades —
@@ -1924,101 +2141,81 @@ Manual entry point for the deferred auto-rebuild feature
 ### 8.1 · Surface
 
 ```
-sandbox rebuild-image lite         # rebuild the lite image
-sandbox rebuild-image gateway      # refuse — gateway is pre-built per release
+sandbox rebuild-image --backend container   # rebuild the lite (container) image
+sandbox rebuild-image --backend lima        # rebuild the Lima golden VM image
+sandbox rebuild-image --backend all         # rebuild both (default when no flag given)
+sandbox rebuild-image --backend gateway     # refused — gateway is pre-built per release
+sandbox rebuild-image --no-cache --backend container  # force a cache-busting rebuild
 ```
 
-The handoff's surface — positional `lite` / `gateway` — diverges from
-the existing `sandbox rebuild-image --backend <kind>` at
-`sandbox-cli/src/main.rs:349`. Spec 5 **introduces a positional
-variant alongside the existing `--backend` flag**, not replacing it:
+Spec 5 **does not introduce a positional variant**. The existing
+`--backend container|lima|all` flag (already at `sandbox-cli/src/main.rs:349`
+via `RebuildImageBackend`) is the complete CLI surface for valid backends.
+A positional `lite|gateway` was considered and rejected:
 
-- The existing `--backend lima|container|all` continues to work
-  (Spec 3 § 8.4 explicitly relies on it for dev mode and for the
-  current daemon-internal call sites). Removing it would be a CLI
-  break.
-- The new positional `lite | gateway` is a thin alias for operator
-  ergonomics: `lite` maps to `--backend container`, `gateway` maps to
-  the refusal.
+- `lite` vs `container` is an unnecessary alias for users who already
+  learned `--backend container`; adding it creates two spellings for the
+  same thing.
+- `gateway` as a positional would introduce a clap variant that exists
+  only to error, which is confusing in `--help` output.
+- Adding a `lima` positional on top risks the variant token colliding
+  with `--backend lima` on older `clap` behaviour.
 
-A clap subcommand pattern handles this. Pseudocode:
+Instead, Spec 5 adds a single refused dispatch arm for the (currently
+non-existent) `--backend gateway` flag to the existing `RebuildImageBackend`
+enum, and documents `gateway` as a client-side refused option so operators
+who try it get a clear error message pointing at `sandbox update`.
+
+Extended `RebuildImageBackend` (adds `Gateway` variant):
 
 ```rust
-// sandbox-cli/src/main.rs
+// sandbox-cli/src/backend.rs — adds one variant to the existing enum.
 
-#[derive(Subcommand, Debug, Clone)]
-enum Command {
-    // ... existing variants ...
-
-    /// Rebuild a backend image.
-    RebuildImage {
-        /// Positional image to rebuild. `lite` triggers the container
-        /// rebuild; `gateway` is refused (use `sandbox update` for the
-        /// gateway image — it's shipped pre-built per release).
-        ///
-        /// Mutually exclusive with --backend.
-        #[arg(value_enum, conflicts_with = "backend")]
-        image: Option<RebuildImageImage>,
-
-        /// Which backend's image to rebuild (legacy form).
-        #[arg(long, value_enum)]
-        backend: Option<RebuildImageBackend>,
-
-        /// Cache-bust the rebuild.
-        #[arg(long)]
-        no_cache: bool,
-    },
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[clap(rename_all = "lowercase")]
-enum RebuildImageImage {
-    Lite,
+pub enum RebuildImageBackend {
+    Lima,
+    Container,
+    All,
+    /// Gateway image: refused. The gateway image is shipped pre-built
+    /// per release and loaded by `sandbox update`. Building it locally
+    /// requires the full source tree + Docker + network access to
+    /// upstream registries.
     Gateway,
 }
 ```
 
-Dispatch (in the existing `dispatch_rebuild_image` at
-`sandbox-cli/src/main.rs:4003`):
+Dispatch arm added to `dispatch_rebuild_image`
+(`sandbox-cli/src/main.rs:4003`):
 
 ```rust
-match (image, backend) {
-    (Some(RebuildImageImage::Gateway), _) => {
+match backend {
+    RebuildImageBackend::Gateway => {
         eprintln!(
-            "sandbox: gateway image is shipped pre-built per release.\n  \
-             To refresh the gateway image, run: sudo sandbox update\n  \
-             (the update flow loads the new gateway image from the release tarball)."
+            "sandbox: --backend gateway is not supported for rebuild-image.\n  \
+             The gateway image is shipped pre-built per release and loaded by \
+             `sandbox update`.\n  To refresh the gateway image, run: sudo sandbox update"
         );
         process::exit(2);
     }
-    (Some(RebuildImageImage::Lite), _) => {
-        dispatch_rebuild_image(socket_path, RebuildImageBackend::Container, no_cache).await;
-    }
-    (None, Some(b)) => {
-        dispatch_rebuild_image(socket_path, b, no_cache).await;
-    }
-    (None, None) => {
-        // Backwards-compat default: --backend all.
-        dispatch_rebuild_image(socket_path, RebuildImageBackend::All, no_cache).await;
-    }
+    // ... existing Lima / Container / All arms unchanged ...
 }
 ```
 
 ### 8.2 · Implementation
 
-The lite-rebuild path is a thin CLI wrapper around the daemon's
-existing `POST /rebuild-image` endpoint at
+The `--backend container` and `--backend lima` paths are thin CLI wrappers
+around the daemon's existing `POST /rebuild-image` endpoint at
 `sandboxd/sandboxd/src/main.rs:5265-5317`. The endpoint's request body
-shape is `{"backend": "lima"|"container", "no_cache": bool}` —
-`sandbox rebuild-image lite` translates to `{"backend": "container",
-"no_cache": <flag>}`. **No daemon-side change is required** for the
-lite path: the existing endpoint is exactly the surface the new
-positional needs.
+shape is `{"backend": "lima"|"container", "no_cache": bool}` — the CLI
+translates the `RebuildImageBackend` flag directly into that body.
+**No daemon-side change is required** for `container` or `lima`: the
+existing endpoint already handles them.
 
-The gateway refusal happens **client-side** in the CLI — the daemon
-never receives a "rebuild gateway" request because `sandbox
-rebuild-image gateway` exits non-zero before any HTTP call. This keeps
-the daemon's surface unchanged.
+The `--backend gateway` refusal happens **client-side** in the CLI — the
+daemon never receives a "rebuild gateway" request because the dispatch arm
+for `RebuildImageBackend::Gateway` (§ 8.1) exits non-zero before any HTTP
+call. This keeps the daemon's surface unchanged.
 
 ### 8.3 · Operator scheduling (informational)
 
@@ -2048,7 +2245,7 @@ Requires=sandboxd.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/sandbox rebuild-image lite
+ExecStart=/usr/local/bin/sandbox rebuild-image --backend container
 User=<operator>
 Environment=SANDBOX_SOCKET=/run/sandbox/sandboxd.sock
 ```
@@ -2104,15 +2301,24 @@ Live under `sandbox-cli/src/cfg_migrations/` and `sandbox-core/src/users_conf.rs
 | `apply_pending_walks_chain`                                       | `sandbox-cli/src/cfg_migrations/mod.rs`                | Synthetic registry with V001 (0→1) and V002 (1→2); seed a tempfile at V0; run `apply_pending`; assert applied = `[1, 2]` and final version = 2. |
 | `apply_pending_skips_already_at_target`                           | same                                                   | Seed a tempfile at V2; run; assert applied = `[]`. |
 | `apply_pending_atomic_write_visible_only_after_complete`          | same                                                   | Inject a filesystem fault between `write_all` and `persist`; assert the file at `path` is still the pre-write content (NamedTempFile's rename-or-nothing). |
+| `registry_migrations_advance_exactly_one_version`                 | `sandbox-cli/src/cfg_migrations/mod.rs`                | Iterate the static registry; for every migration assert `m.to_version() == m.from_version() + 1`. Pins the binding selection rule in § 4.2 — a future contributor adding a multi-version-skip migration trips the test at compile-time-adjacent (unit-test) granularity. |
+| `apply_config_migration_refuses_non_root_caller`                  | `sandbox-cli/src/main.rs` (subcommand gate)            | Invoke `sandbox --apply-config-migration` with `getuid() != 0` (test runs as the test user); assert refusal with substring `requires root` and exit non-zero. |
+| `apply_config_migration_refuses_non_canonical_file`               | same                                                   | Invoke with `--file /tmp/fake.json`; assert refusal with substring `canonical paths`. |
+| `apply_config_migration_refuses_arbitrary_out_path`               | same                                                   | Invoke with `--file /etc/sandboxd/users.conf --out /tmp/whatever`; assert refusal with substring `tempfile under the same directory as --file`. |
+| `apply_config_migration_refuses_unknown_migration_id`             | same                                                   | Invoke with `--migration V999`; assert refusal with substring `not found in registry`. |
 | `validate_users_conf_schema_version_accepts_supported`            | `sandbox-core/src/users_conf.rs`                       | `UsersConfig { schema_version: Some(1), .. }` → `Ok(())` (when `DAEMON_MAX_SUPPORTED_USERS_CONF_SCHEMA == 1`). |
 | `validate_users_conf_schema_version_rejects_too_new`              | same                                                   | `schema_version: Some(3)` (with max 1) → `Err(SchemaTooNew { file_version: 3, daemon_max: 1, .. })`; assert hint substring `Run \`sandbox update\``. |
 | `validate_users_conf_schema_version_rejects_too_old`              | same                                                   | `schema_version: Some(0)` (with min 1) → `Err(SchemaTooOld { .. })`; assert hint substring `Run \`sandbox update\``. |
 | `validate_users_conf_schema_version_treats_absent_as_zero`        | same                                                   | `schema_version: None` → treated as 0 → SchemaTooOld if min > 0. |
-| `lock_file_acquisition_refuses_on_live_pid`                       | `sandbox-cli/src/update/lock.rs`                       | Pre-write a lock file with PID of a known-live process (current test process); attempt acquisition; assert refusal with `another update is in progress (pid <self>)`. |
-| `lock_file_acquisition_adopts_on_dead_pid`                        | same                                                   | Pre-write a lock file with a PID that doesn't exist (e.g. `999999`); attempt acquisition; assert adopt path runs, sticky `was_running` preserved. |
-| `lock_file_acquisition_preserves_was_running_across_adopt`        | same                                                   | Pre-write lock with `was_running: true` and dead PID; adopt; assert in-memory state has `was_running == true` regardless of current `systemctl is-active`. |
+| `lock_file_acquisition_refuses_on_live_holder`                    | `sandbox-cli/src/update/lock.rs`                       | Pre-acquire `LOCK_EX` on a tempfile in the test process (the FD stays open); run the acquisition logic in a thread; assert it returns the "another update is in progress" error. |
+| `lock_file_acquisition_adopts_on_dead_pid_payload`                | same                                                   | Pre-write a lock file with a payload claiming PID `999999` (non-existent); run acquisition; assert the adopt branch runs, returned `was_running` matches the pre-written payload. |
+| `lock_file_acquisition_preserves_was_running_across_adopt`        | same                                                   | Pre-write lock with `was_running: true` and dead PID; adopt; assert `was_running == true` regardless of current `systemctl is-active` output. |
+| `lock_file_flock_acquired_before_payload_write`                   | same                                                   | Instrument the acquire logic with a tracing hook; assert the flock is held before the payload `write` call (pins the ordering rule in § 6.2.2). |
+| `lock_file_released_on_process_exit`                              | same                                                   | Acquire lock in a subprocess; kill the subprocess; assert the FD-based flock is automatically released and a second acquisition succeeds immediately. |
 | `version_lifecycle_check_then_dry_run_then_apply`                 | `sandbox-cli/src/update/mod.rs`                        | Synthetic update flow with mocked daemon `/version` endpoint; run `--check` then `--dry-run` then a real apply; assert each phase's output shape and that no privileged calls fire in `--check` or `--dry-run`. |
-| `rebuild_image_gateway_refuses_with_pointer_to_update`            | `sandbox-cli/src/main.rs`                              | Invoke `sandbox rebuild-image gateway`; assert stderr substring `sandbox update`; assert exit code 2; assert no HTTP request was sent. |
+| `rebuild_image_gateway_backend_refuses_with_pointer_to_update`    | `sandbox-cli/src/main.rs`                              | Invoke `sandbox rebuild-image --backend gateway`; assert stderr substring `sandbox update`; assert exit code 2; assert no HTTP request was sent. |
+| `rebuild_image_container_backend_sends_correct_body`              | `sandbox-cli/src/main.rs`                              | Invoke `sandbox rebuild-image --backend container` against a mock daemon; assert HTTP body is `{"backend":"container",...}`. |
+| `rebuild_image_lima_backend_sends_correct_body`                   | `sandbox-cli/src/main.rs`                              | Invoke `sandbox rebuild-image --backend lima` against a mock daemon; assert HTTP body is `{"backend":"lima",...}`. |
 
 ### 9.3 · Integration tests (`integration_*` prefix)
 
@@ -2134,30 +2340,32 @@ framework apply loop, the daemon-side refusal logic, the lock file).
 
 ## 10 · Risks and open questions
 
-### 10.1 · Lock file location — operator-write vs daemon-write
+### 10.1 · Lock file mode choice
 
-The lock file is at `/var/lib/sandbox/.update.lock`, owned
-`sandbox:sandbox` mode `0600`. The CLI runs as the operator, not as
-`sandbox`. Every read/write of the lock file requires `sudo -k`.
+The lock file is at `/var/lib/sandbox/.update.lock`, mode `0664
+sandbox:sandbox`. Three modes were considered:
 
-Alternative considered: `/var/run/sandbox/.update.lock` (under the
-systemd `RuntimeDirectory=`; tmpfs; gone after reboot). Rejected:
-the lock must survive a reboot mid-update so re-runs can detect
-adoption. A tmpfs lock would be auto-released across reboots — fine
-for daemon-side runtime state, wrong for cross-reboot update
-serialization.
+**`0600`** (originally proposed): operators in the `sandbox` group
+cannot open it without `sudo`. Requires a root-level Rust helper subprocess
+to hold the flock FD alive, which is a significant implementation burden
+and difficult to test. Rejected.
 
-Alternative considered: `/var/lib/sandbox/.update.lock` mode `0660
-sandbox:sandbox`, group-writable by operators. Rejected: the
-`sandbox` group is the *socket-access* group (Spec 3 § 3.2), not the
-*can-mutate-daemon-state* group. Loosening the lock file's mode would
-contradict that boundary. Sudo is the right elevation for an
-operation that's already going to elevate later anyway.
+**`0664`** (chosen): operators in the `sandbox` group can open it
+directly (`O_RDWR|O_CREAT`), take the kernel flock via `flock(1)`,
+and write the JSON payload (via `sudo -k -u sandbox tee` for correct
+ownership). This allows straightforward shell-level acquisition with no
+long-lived helper subprocess. The `sandbox` group is the *socket-access*
+group (Spec 3 § 3.2), meaning all operators who can use `sandbox update`
+at all already have group membership. The `0664` mode does not expand
+the attack surface: the lock file contains only PID, timestamps, and
+version strings — no secrets, no session data.
 
-Status: **accepted**. The lock file is `0600 sandbox:sandbox` under
-`/var/lib/sandbox/`. Every `sandbox update` invocation pays a few
-`sudo -k` calls to read / write it; the cost is bounded and the audit
-trail is clear.
+**`/var/run/sandbox/.update.lock`** (tmpfs): would lose the sticky
+`was_running` flag across reboots mid-update. Rejected.
+
+Status: **`0664 sandbox:sandbox`** under `/var/lib/sandbox/`. The only
+`sudo` calls in the lock path are for the payload write (to keep
+`sandbox:sandbox` ownership consistent) and the final `rm -f`.
 
 ### 10.2 · The systemd `StateDirectory=` interaction
 
@@ -2364,7 +2572,7 @@ The following are **not** in Spec 5:
   the documented manual recipe in § 7.2. § 7.4 records the reasoning.
 - **Automatic periodic rebuild of the lite image.** Deferred; tracked
   as [GitHub issue #7](https://github.com/Koriit/sandboxd/issues/7).
-  `sandbox rebuild-image lite` is the manual entry point (§ 8).
+  `sandbox rebuild-image --backend container` is the manual entry point (§ 8).
 - **CHANGELOG / release notes display during `sandbox update`.** A
   future enhancement could fetch GH Releases' auto-generated notes
   and show them at the confirmation prompt; not in v1. Spec 4 § 10.8
@@ -2401,7 +2609,7 @@ The following are **not** in Spec 5:
 
 | Path                                                                         | Kind of change |
 |------------------------------------------------------------------------------|----------------|
-| `sandboxd/sandbox-cli/src/main.rs`                                           | New `Command::Update { ... }` variant (next to `Health` line 255, `Inspect` line 265, `RebuildImage` line 349, `Doctor` (Spec 3 § 6.5)). New `Command::RebuildImage { image: Option<RebuildImageImage>, ... }` positional alongside existing `--backend`. New hidden `Command::ApplyConfigMigration { file, migration, out }` for the framework's per-migration apply. New hidden `Command::DumpMigrationSet` for refinery introspection from `--check`. Dispatch wiring in `main()`. |
+| `sandboxd/sandbox-cli/src/main.rs`                                           | New `Command::Update { ... }` variant (next to `Health` line 255, `Inspect` line 265, `RebuildImage` line 349, `Doctor` (Spec 3 § 6.5)). `Command::RebuildImage` gains a `--backend gateway` arm (refused with pointer to `sandbox update`) per § 8.1 — no positional added. Two new hidden subcommands gated by `getuid() == 0` (§ 4.3 / § 6.2): `Command::ApplyConfigMigration { file, migration, out }` (per-migration apply, path-validated); `Command::DumpMigrationSet` (refinery introspection from `--check`, read-only). Lock acquisition is handled by `sandbox-cli/src/update/lock.rs` (pure Rust, no new subcommand — uses shell-level `flock` via a helper function that the `sandbox update` orchestration calls). Dispatch wiring in `main()`. |
 | `sandboxd/sandbox-cli/src/update/mod.rs`                                     | New module. Orchestration of the full update flow — pre-flight, lock, fetch, verify, extract, migrate-dry-run, confirm, stop, backup, install, setcap, migrate-apply, docker-load, start, verify, doctor, finalize, release-lock. |
 | `sandboxd/sandbox-cli/src/update/lock.rs`                                    | New. Lock file acquisition / adoption / release; flock + sticky `was_running` handling. |
 | `sandboxd/sandbox-cli/src/update/fetch.rs`                                   | New. Release tarball fetch (URL or local), cosign verify, MANIFEST parse + sha256 verify. |
@@ -2429,9 +2637,10 @@ are introduced.
 
 | Path                                                                          | Touch type |
 |-------------------------------------------------------------------------------|------------|
-| `sandboxd/sandbox-cli/src/main.rs`                                            | Edit: `Update`, `RebuildImage` positional, `ApplyConfigMigration` (hidden), `DumpMigrationSet` (hidden) variants + dispatch |
+| `sandboxd/sandbox-cli/src/main.rs`                                            | Edit: `Update` variant; `RebuildImage` gains `--backend gateway` refused arm; `ApplyConfigMigration` (hidden, root-gated) + `DumpMigrationSet` (hidden) variants + dispatch |
 | `sandboxd/sandbox-cli/src/update/mod.rs`                                      | New: update orchestration |
-| `sandboxd/sandbox-cli/src/update/lock.rs`                                     | New: lock-file handling, sticky `was_running` |
+| `sandboxd/sandbox-cli/src/backend.rs`                                         | Edit: `RebuildImageBackend::Gateway` variant added; refused dispatch arm in `dispatch_rebuild_image` |
+| `sandboxd/sandbox-cli/src/update/lock.rs`                                     | New: lock-file acquisition logic (shell-level `flock` wrapper), dead-PID adoption, sticky `was_running` read/write |
 | `sandboxd/sandbox-cli/src/update/fetch.rs`                                    | New: tarball fetch, cosign verify, MANIFEST verify |
 | `sandboxd/sandbox-cli/src/update/backup.rs`                                   | New: backup set + manifest + retention |
 | `sandboxd/sandbox-cli/src/update/migrate.rs`                                  | New: framework + sudo-rename glue |
