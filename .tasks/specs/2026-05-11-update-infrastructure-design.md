@@ -129,33 +129,21 @@ manifest (or reads MANIFEST from `--from`), and prints a status report. It
 does **not** acquire the lock file, does **not** mutate any state, does
 **not** require sudo.
 
-Sample output (upgrade available — example uses a hypothetical future
-release where `DAEMON_GUEST_PROTO_VERSION` has bumped from 1 to 2, so
-the "refreshable" classification is observable; on the day-one v1→v1.1
-path the daemon's proto range is still `1..1` and every existing
-session classifies as `compatible`):
+Sample output (upgrade available):
 
 ```
 Installed: sandboxd 1.0.0  (installed 2026-05-08T14:23:11Z by alice)
-Available: sandboxd 2.0.0  (released 2026-05-10T09:00:00Z, x86_64-unknown-linux-gnu)
+Available: sandboxd 1.1.0  (released 2026-05-10T09:00:00Z, x86_64-unknown-linux-gnu)
 Status:    update available
 
-Pending migrations:
+Pending config migrations (current installation):
   config: V002 (add per-pool rate limit metadata)
-  db:     V0007__add_rate_limit_columns.sql
 
-Stopped sessions (2):
-  0123456789ab  alice/feat-xyz   guest_proto=2  daemon_supports=2..2  → compatible
-  0234567890bc  alice/bugfix-q3  guest_proto=1  daemon_supports=2..2  → compatible (refreshable)
+Stopped sessions: 3
+  (for per-session target-protocol compatibility, use `sandbox update --dry-run`)
 
 Run `sudo sandbox update` to apply.
 ```
-
-A third row, classified as `recreate`, would surface only on a path
-where `can_refresh_in_place` returns `false` for the session's proto
-version (Spec 2 § 3.7 — v1's body returns `true` for any non-zero
-proto, so the recreate-on-update classification is reserved for
-future protocol changes the seam catches with a `false` arm).
 
 Up-to-date case:
 
@@ -165,35 +153,28 @@ Available: sandboxd 1.1.0
 Status:    up to date
 ```
 
-Field semantics:
+**Scope of `--check` output.** `--check` reports only information the
+*current* binary already has — no tarball fetch, no cosign verification,
+no extraction. This gives it a fast, no-sudo, no-network profile:
+
 - `Installed` row reads `installed_version`, `installed_at`,
   `installed_by_operator` from `/var/lib/sandbox/.install-state.json`
-  (Spec 4 § 4.5).
-- `Available` row reads the GH Releases API (or `MANIFEST` from a local
-  `--from` tarball) for the version, release timestamp, and arch.
-- `Pending migrations` enumerates pending config migrations by reading
-  `_schema_version` from `/etc/sandboxd/users.conf` (and any other
-  framework-managed files) and comparing to the registry's latest version
-  for each file. DB migrations are listed by file name from the target
-  tarball's embedded migration set (the tarball does not ship the
-  migrations directly, but each daemon binary embeds its own via
-  refinery's `embed_migrations!` macro at `sandbox-core/src/store.rs:18`;
-  `--check` extracts the staged daemon's embedded migration list by
-  invoking it with a hidden `--dump-migration-set` flag — see § 3.1.4).
-- `Stopped sessions` lists every session with `state = Stopped`,
-  printed with the persisted `guest_protocol_version` (Spec 2 § 3.1)
-  compared against the target binary's supported protocol range. The
-  classification is:
-  - **compatible** — `session.guest_protocol_version` is in the target
-    binary's accepted range (today: exact-match — Spec 2 § 3.3).
-  - **compatible (refreshable)** — outside the accepted range but
-    `can_refresh_in_place(session.guest_protocol_version)` returns true
-    (Spec 2 § 3.7). The session will refresh on next start.
-  - **recreate** — outside the accepted range and not refreshable;
-    operator must `sandbox session rm <id>` before the session can run
-    again under the new daemon.
-  The classification is informational. The actual refresh decision tree
-  (Spec 2 § 3.4) runs lazily at next `start_session` per session.
+  (Spec 4 § 4.5). The file is `0640 sandbox:sandbox` — readable by any
+  operator in the `sandbox` group without sudo.
+- `Available` row reads the GH Releases API latest-release tag (or the
+  `MANIFEST.version` from a local `--from` tarball).
+- `Pending config migrations` lists config migrations with a pending
+  `_schema_version` delta, read from the *current* CLI's
+  `cfg_migrations` registry (§ 4.2). No extraction needed. DB migrations
+  are **not** listed in `--check` output — they require invoking the new
+  daemon binary with `--dump-migration-set` (available only after tarball
+  extraction at § 3.1.10, which `--check` skips). Use `--dry-run` for
+  the full pending-migrations list including DB migrations.
+- `Stopped sessions` count uses the *current* daemon's
+  `DAEMON_GUEST_PROTO_VERSION` for classification. Per-session
+  `compatible`/`refreshable`/`recreate` detail — which requires the
+  *target* binary's `can_refresh_in_place` — is not shown by `--check`.
+  Use `--dry-run` for target-protocol per-session classification.
 
 `--check` exit codes:
 - `0` — up to date (installed version == available version; no action needed).
@@ -252,8 +233,7 @@ Stateful (§ 3.2) — would execute:
   ✓ § 3.2.18 record previous_version    would execute
   ✓ § 3.2.19 write backup manifest      would execute
   ✓ § 3.2.20 docker load gateway image  would execute
-  ~ § 3.2.21 install /usr/local/bin/sandbox     would skip (sha256 matches)
-  ✓ § 3.2.21 install /usr/local/bin/sandboxd    would execute
+  ✓ § 3.2.21 install binaries  (sandbox: skip — sha256 match / sandboxd: install / sandbox-route-helper: install)
   ✓ § 3.2.22 setcap on route-helper     would execute
   ✓ § 3.2.23 install systemd unit       would skip (identical)
   ✓ § 3.2.24 apply config migration V002 → users.conf
@@ -405,25 +385,51 @@ Refuse with the message from § 11; exit `2`. Log:
 
 #### § 3.1.3. Read install state file
 
-Open `/var/lib/sandbox/.install-state.json` (mode `0640 sandbox:sandbox`)
-with `sudo -k cat`. Parse fields via `jq` defensively (matches the
-uninstall.sh pattern in Spec 4 § 5.2.3):
+The install-state file `/var/lib/sandbox/.install-state.json` is mode
+`0640 sandbox:sandbox`. Operators in the `sandbox` group have group-read
+(`4` in `0640`) and can read it without elevation. The read strategy
+differs by invocation mode:
+
+**`--check` and `--dry-run` mode (no sudo):**
 
 ```sh
 state=/var/lib/sandbox/.install-state.json
-[ -r "$state" ] || die "install state file missing: $state — was this host installed via install.sh?"
+if [ -r "$state" ]; then
+    CURRENT_VERSION=$(jq -r '.installed_version // ""' "$state")
+    CURRENT_ARCH=$(jq -r    '.installed_arch // ""'    "$state")
+    CURRENT_INSTALLED_AT=$(jq -r '.installed_at // ""' "$state")
+else
+    # Operator not in sandbox group, or file absent — degrade gracefully.
+    CURRENT_VERSION="unknown"
+    CURRENT_ARCH=$(uname -m | sed 's/x86_64/x86_64-unknown-linux-gnu/;s/aarch64/aarch64-unknown-linux-gnu/')
+    CURRENT_INSTALLED_AT="unknown"
+fi
+```
+
+`--check` output prints "installed version: unknown" when the file is
+unreadable, and continues. `--dry-run` does the same. Neither mode
+exits hard on a missing state file — the available-version comparison
+still works; only the installed-version side of the diff is incomplete.
+
+**Full-update mode (with sudo):**
+
+```sh
+state=/var/lib/sandbox/.install-state.json
+[ -r "$state" ] || \
+    sudo -k test -r "$state" || \
+    die "install state file missing: $state — was this host installed via install.sh?"
 CURRENT_VERSION=$(sudo -k jq -r '.installed_version // ""' "$state")
 CURRENT_ARCH=$(sudo -k    jq -r '.installed_arch // ""'    "$state")
 CURRENT_INSTALLED_AT=$(sudo -k jq -r '.installed_at // ""' "$state")
 ```
 
-Log: `step=read_state installed_version=<v> installed_arch=<arch>`.
+In full-update mode, if the state file is absent or unreadable (e.g.,
+the host was installed before Spec 4 shipped, or someone deleted it),
+refuse with: "install state file missing; re-install with `install.sh`
+or set up the file manually per Spec 4 § 4.5." Spec 5 does **not**
+auto-bootstrap the state file — that would mask a corrupted install.
 
-If the state file is absent (e.g., the host was installed before Spec 4
-shipped, or someone deleted the file), refuse with hint: "install state
-file missing; re-install with `install.sh` or set up the file manually
-per Spec 4 § 4.5." Spec 5 does **not** auto-bootstrap the state file —
-that would mask a corrupted install.
+Log: `step=read_state installed_version=<v> installed_arch=<arch> degraded=<true|false>`.
 
 #### § 3.1.4. Determine target version, fetch / read MANIFEST
 
@@ -453,13 +459,15 @@ Log: `step=fetch_tarball source=<url-or-local> version=<v> size=NKB status=ok`.
 
 The DB migration set the staged daemon ships embeds via refinery's
 `embed_migrations!` macro (`sandbox-core/src/store.rs:18`). To enumerate
-pending DB migrations for `--check` / `--dry-run` / the confirmation
+pending DB migrations for `--dry-run` and the full-update confirmation
 prompt, the staged daemon is invoked with a hidden
 `--dump-migration-set` flag immediately after extraction (§ 3.1.10), it
 prints a JSON list of `(version, name)` tuples to stdout, and the CLI
 diffs against the live DB's `refinery_schema_history` table. The
 `--dump-migration-set` flag is a Spec 5-introduced daemon affordance,
-unprivileged and read-only.
+unprivileged and read-only. It is **not** used by `--check` — `--check`
+skips tarball extraction (§ 3.1.5) and therefore cannot invoke the new
+daemon binary. DB migration lines are omitted from `--check` output (§ 2.2).
 
 #### § 3.1.5. Compare versions
 
@@ -471,17 +479,21 @@ wording) and exit 0. No lock acquisition, no further work. Log:
 proceed to § 3.1.6 or beyond. Instead:
 
 1. Run § 3.1.6 (active session count — display only, no refusal).
-2. Run § 3.1.7 (stopped session compatibility classification — display only).
-3. Run § 3.1.11 (migration dry-run — to build the pending-migrations list).
+2. Run § 3.1.7 (stopped session count with *current*-binary protocol
+   classification — display only).
+3. Run § 3.1.11 (config-migration dry-run from the *current* CLI's
+   registry — display only; DB migrations are **not** enumerated since
+   that requires the extracted new daemon binary via `--dump-migration-set`).
 4. Print the `--check` output from § 2.2.
 5. Exit 3 (update available). Skip §§ 3.1.8–3.1.10, 3.1.12 (confirmation),
    and all of § 3.2 (including lock acquisition at § 3.2.13).
 
 The `--check` path never acquires the lock (§ 6.4 — consistent with
-§ 3.2.13 being the first stateful step), never contacts cosign, never
-extracts a tarball, and never prompts for confirmation. Its read-only
-character is enforced structurally here — a single early-exit gate —
-rather than relying on downstream per-step guards.
+§ 3.2.13 being the first stateful step), never fetches a tarball, never
+contacts cosign, never extracts a tarball, and never prompts for
+confirmation. Its no-sudo, no-network, read-only character is enforced
+structurally here — a single early-exit gate — rather than relying on
+downstream per-step guards.
 
 #### § 3.1.6. Active sessions check
 
@@ -509,17 +521,31 @@ is wedged and we want to upgrade anyway." Log:
 #### § 3.1.7. Stopped sessions compatibility enumeration
 
 Query the daemon for stopped sessions; for each, read
-`guest_protocol_version` (Spec 2 § 3.1) and classify against the target
-binary's supported range. The classification logic mirrors `--check`'s
-output (§ 2.2). The result is purely informational at this step — no
-state mutated, no sessions refreshed. The refresh-on-next-start
-mechanism (Spec 2 § 3.4) runs lazily after the upgrade lands.
+`guest_protocol_version` (Spec 2 § 3.1) and classify against a protocol
+range. The result is purely informational at this step — no state
+mutated, no sessions refreshed. The refresh-on-next-start mechanism
+(Spec 2 § 3.4) runs lazily after the upgrade lands.
 
-Sessions classified as `recreate` are listed by ID + name + reason in
-the confirmation prompt (§ 2.4); the operator can choose to abort and
-`sandbox session rm` those sessions before re-running update, or to
-proceed and accept that those sessions will return a `409 Conflict`
-with the recreate-guidance error (Spec 2 § 3.5) on next `start_session`.
+**Which binary's protocol range is used, by mode:**
+
+- **`--check` mode:** the *current* running daemon's
+  `DAEMON_GUEST_PROTO_VERSION` (already known, no extraction needed).
+  Classification is limited to `compatible` / `not-compatible` against
+  the current binary. Per-session `recreate` verdicts — which require
+  calling `can_refresh_in_place` from the *new* binary — are not shown;
+  `--check` output instead reports the session count and defers per-session
+  detail to `--dry-run` (§ 2.2).
+- **`--dry-run` and full-update mode:** the *target* binary's
+  `DAEMON_GUEST_PROTO_VERSION` (obtained via `--dump-migration-set` after
+  extraction at § 3.1.10). Full `compatible` / `compatible (refreshable)`
+  / `recreate` classification is available.
+
+Sessions classified as `recreate` (in `--dry-run` / full-update mode)
+are listed by ID + name + reason in the confirmation prompt (§ 2.4); the
+operator can choose to abort and `sandbox session rm` those sessions
+before re-running update, or to proceed and accept that those sessions
+will return a `409 Conflict` with the recreate-guidance error (Spec 2
+§ 3.5) on next `start_session`.
 
 Log: `step=stopped_sessions count=<n> compatible=<n> refreshable=<n> recreate=<n>`.
 
@@ -649,15 +675,22 @@ directly. Acquisition uses `flock -n -x` on an FD held open by the
 shell process itself (no helper subprocess). The full shell sequence
 is in § 6.2.1.
 
-Log: `step=acquire_lock pid=$$ target_version=<v> from_version=<v> was_running=<0|1> action=<acquire|adopt> status=ok`.
+Log: `step=acquire_lock pid=$$ target_version=<v> from_version=<v> was_running=<true|false> action=<acquire|adopt> status=ok`.
 
 #### § 3.2.14. Stop daemon (only if `was_running`)
 
 ```sh
-if [ "$WAS_RUNNING" -eq 1 ]; then
+if [ "$WAS_RUNNING" = "true" ]; then
     sudo -k systemctl stop sandboxd
 fi
 ```
+
+`WAS_RUNNING` holds the string `"true"` or `"false"` (JSON boolean
+representation from the lock-file payload via `jq -r '.was_running'`,
+and from `echo true`/`echo false` at first lock acquisition in § 6.2.1).
+The comparison uses `=` (string equality), not `-eq 1` (integer
+arithmetic), which would produce `integer expression expected` on a
+non-integer string and silently evaluate to false.
 
 `systemctl stop` is idempotent: it returns 0 immediately if the unit is
 already inactive. The conditional on `was_running` is so the upgrade
@@ -667,7 +700,7 @@ unless the operator manually `systemctl start`s afterward. The sticky
 `was_running` flag captured at lock acquisition (§ 6.4) carries this
 intent through any re-runs.
 
-Log: `step=stop_daemon was_running=<0|1> action=<stop|skip> status=ok`.
+Log: `step=stop_daemon was_running=<true|false> action=<stop|skip> status=ok`.
 
 #### § 3.2.15. Backup sessions.db
 
@@ -783,6 +816,14 @@ sudo -k jq --arg pv "$CURRENT_VERSION" '.previous_version = $pv' \
     /var/lib/sandbox/.install-state.json > "$state_tmp"
 sudo -k -u sandbox install -m 0640 "$state_tmp" /var/lib/sandbox/.install-state.json
 ```
+
+**Implementation note:** the shell pseudo-code is illustrative. The `>`
+redirect creates `state_tmp` owned by the outer shell's user (root or
+the operator), but the subsequent `sudo -k -u sandbox install` runs as
+`sandbox`, which cannot read a `0600` file owned by another user. In the
+Rust implementation (§ 13), the tmpfile is written by the `sandbox` user
+via `std::process::Command` — not via shell stdout redirect — so this
+ownership mismatch does not occur at runtime.
 
 `previous_version` is a new optional field on the install state schema
 (it didn't exist in install.sh's initial write per Spec 4 § 4.5).
@@ -1038,7 +1079,7 @@ Log: `step=prune_backups kept=2 pruned=<n>`.
 #### § 3.2.26. Start daemon (only if `was_running`)
 
 ```sh
-if [ "$WAS_RUNNING" -eq 1 ]; then
+if [ "$WAS_RUNNING" = "true" ]; then
     sudo -k systemctl start sandboxd
 fi
 ```
@@ -1056,7 +1097,7 @@ the daemon also refuses — the rollforward path is "run `sandbox
 update`," but we're already inside one. § 4.7 walks through this
 loop-prevention property.
 
-Log: `step=start_daemon was_running=<0|1> action=<start|skip> status=<ok|fail>`.
+Log: `step=start_daemon was_running=<true|false> action=<start|skip> status=<ok|fail>`.
 
 #### § 3.2.27. Verify post-start
 
@@ -1113,6 +1154,10 @@ sudo -k jq --arg v "$TARGET_VERSION" \
 sudo -k -u sandbox install -m 0640 "$state_tmp" /var/lib/sandbox/.install-state.json
 ```
 
+(**Implementation note:** same ownership caveat as § 3.2.18 — in the
+Rust implementation the tmpfile is written by the `sandbox` user via
+`std::process::Command`, not via shell stdout redirect.)
+
 Finalize the backup set's manifest with `completed_at` and
 `completed_ok: true`:
 
@@ -1121,7 +1166,7 @@ manifest_tmp=$(mktemp)
 sudo -k -u sandbox jq --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     '. + {"completed_at": $at, "completed_ok": true}' \
     "$backup_set/manifest.json" > "$manifest_tmp"
-sudo -k -u sandbox install -m 0644 "$manifest_tmp" "$backup_set/manifest.json"
+sudo -k -u sandbox install -m 0644 -o sandbox -g sandbox "$manifest_tmp" "$backup_set/manifest.json"
 ```
 
 Log: `step=finalize_state installed_version=<v> previous_version=<v> status=ok`,
@@ -2349,7 +2394,7 @@ version, then exercises an update flow.
 | `test_update_concurrent_refused`                                     | Install v1.0.0; start `sandbox update` in background; immediately run a second `sandbox update`; verify the second invocation refuses with `another update is in progress`. |
 | `test_update_preserves_customized_users_conf`                        | Install v1.0.0 (writes `users.conf` with V001 content); operator adds a custom subnet via direct edit; update to v1.1.0; verify the custom subnet survives in the post-update `users.conf`. |
 | `test_update_preserves_systemd_drop_in`                              | Install v1.0.0; operator drops in `/etc/systemd/system/sandboxd.service.d/override.conf`; update to v1.1.0; verify the drop-in is bit-for-bit unchanged. |
-| `test_update_with_recreate_session_classification`                   | Install v1.0.0; create one session (stamps `guest_protocol_version=1`); bump the test daemon to a hypothetical v1.1.0 that ships `DAEMON_GUEST_PROTO_VERSION=2` with `can_refresh_in_place(1) == false`; update; assert `--check` output lists the session as `recreate`; assert post-update, the session's `start_session` returns 409 with the recreate message (Spec 2 § 3.5). |
+| `test_update_with_recreate_session_classification`                   | Install v1.0.0; create one session (stamps `guest_protocol_version=1`); build a hypothetical v1.1.0 tarball with `DAEMON_GUEST_PROTO_VERSION=2` and `can_refresh_in_place(1) == false`; run `sandbox update --dry-run --from <tarball>`; assert the dry-run plan lists the session as `recreate` (uses target binary's `can_refresh_in_place`); assert `--check` output shows "Stopped sessions: 1" without per-session classification; then apply and assert the session's `start_session` returns 409 with the recreate message (Spec 2 § 3.5). |
 | `test_update_rejects_dev_install`                                    | On a dev-mode VM (no systemd unit installed, `~/.local/share/sandboxd/` populated), run `sandbox update`; verify refusal with the dev-mode message (§ 11). |
 | `test_update_backup_retention_prunes_oldest`                         | Install v1.0.0; update v1.0.0 → v1.1.0; update v1.1.0 → v1.2.0; update v1.2.0 → v1.3.0; verify exactly 2 successful backup sets remain (v1.1.0→v1.2.0 and v1.2.0→v1.3.0); the v1.0.0→v1.1.0 set is pruned. |
 | `test_update_partial_failure_backup_set_preserved`                   | Install v1.0.0; inject a failure at § 3.2.24 (migration apply); verify the backup set's `manifest.json` has `completed_ok: false` and is **not** pruned on a subsequent successful update. |
