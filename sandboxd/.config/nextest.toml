@@ -55,7 +55,12 @@ test-group = 'lima'
 #     `sandbox-net-*` networks under the same IPAM space and would
 #     race with each other and with the existing reaper /
 #     container-runtime tests on parallel runs.
-filter = 'test(/^integration_orphan_reaper/) | test(/^integration_reaper_/) | test(/^integration_container_runtime/) | test(/^integration_rootless_docker/) | test(/^integration_default_hardened_docker/)'
+#   - `integration_route_helper_for_user_*` exercise daemon→helper
+#     identity propagation by spinning up a real container in the
+#     `sandbox-{12hex}` namespace via `ContainerRuntime::start` with a
+#     stub route-helper binary; same namespace-pollution concern as
+#     the runtime/reaper tests above.
+filter = 'test(/^integration_orphan_reaper/) | test(/^integration_reaper_/) | test(/^integration_container_runtime/) | test(/^integration_rootless_docker/) | test(/^integration_default_hardened_docker/) | test(/^integration_route_helper_for_user_/) | test(/^integration_route_helper_missing_for_user_/)'
 test-group = 'docker-sandbox-namespace'
 
 [test-groups]

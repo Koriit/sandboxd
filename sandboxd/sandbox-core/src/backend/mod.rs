@@ -94,6 +94,28 @@ pub struct RuntimeStartArgs {
     /// `warn!` so test paths that omit the config remain explicit
     /// rather than silent.
     pub lima_config: Option<SessionConfig>,
+    /// Operator identity to pass to `sandbox-route-helper` via `--for-user`.
+    ///
+    /// `Some(<operator_name>)` for all backends when the daemon has resolved
+    /// the connecting client's identity via `SO_PEERCRED`. The value is
+    /// **only consumed** by `ContainerRuntime::start` today —
+    /// `LimaRuntime::start` does not invoke the route-helper and ignores
+    /// this field. It is threaded through `RuntimeStartArgs` on the Lima
+    /// call sites for forward-compatibility: if Lima networking ever
+    /// routes through `sandbox-route-helper` in a future spec, the caller
+    /// identity is already present without an API break. `None` means no
+    /// operator identity is available (test paths that omit the
+    /// extractor); the container runtime errors if `None` when a helper
+    /// path is configured (programming error — a handler reached
+    /// `runtime.start` without the operator extension).
+    ///
+    /// The route helper enforces pair-membership: BOTH the caller's uid
+    /// (the daemon, via `getuid`) AND the `--for-user` name must appear
+    /// in the chosen pool's `allow_users`. The daemon is **the operator
+    /// acting on behalf of** — the helper independently verifies that
+    /// assertion against `users.conf`, so a compromised daemon cannot
+    /// invent operators not already paired with the daemon's runtime uid.
+    pub for_user: Option<String>,
 }
 
 /// Opaque per-backend handle to a created session, returned by
@@ -334,6 +356,7 @@ mod tests {
         assert!(args.lima_bridge.is_none());
         assert!(args.lima_mac.is_none());
         assert!(args.lima_config.is_none());
+        assert!(args.for_user.is_none());
     }
 
     /// `RuntimeStartArgs` is `Clone` so handlers can capture it before

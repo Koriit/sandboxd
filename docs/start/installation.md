@@ -306,13 +306,19 @@ Schema:
 
 ```json
 {
+  "_schema_version": 1,
   "subnets": [
-    { "cidr": "<CIDR>", "allow_users": ["<unix-username>", "..."] }
+    { "cidr": "<CIDR>", "allow_users": ["sandbox", "<unix-username>", "..."] }
   ]
 }
 ```
 
 Multiple subnet entries are allowed; each binds one CIDR pool to a list of allowed Unix usernames. The daemon resolves `allow_users` entries to numeric uids via `getpwnam_r` at startup, so renaming a user with `usermod` takes effect on the next daemon start without editing this file.
+
+**Two conventions to know if you edit this file by hand:**
+
+- **`_schema_version`** is the integer-valued schema marker the config migration framework reads. The field is optional — an absent or `0` value is treated as a pre-V001 file and brought up to date by the framework on the next daemon start (V001 stamps `_schema_version: 1`). Hand-edited files that already match the post-V001 shape should include `_schema_version: 1` at the top; an unknown variant (e.g. typo `_shema_version`) is rejected with a parser error naming the bad key verbatim.
+- **`"sandbox"` in every pool's `allow_users`** is the system-user convention that pairs with the route helper's pair-membership check: every pool lists `"sandbox"` alongside the operator name (e.g. `["sandbox", "alice"]`). The V001 migration auto-prepends `"sandbox"` to each pool when it runs; if you write the file by hand, include it. The name is harmlessly unresolvable on dev boxes that have not provisioned a `sandbox` system account — the route helper treats unresolvable `allow_users` entries as non-matches without failing the rest of the pair check.
 
 For a single-user dev install, `make setup-users-conf` renders `contrib/users.conf.example` with `$USER` substituted in. The example ships **two pools**:
 
@@ -329,9 +335,10 @@ The manual equivalent of `make setup-users-conf`:
 sudo mkdir -p /etc/sandboxd
 sudo tee /etc/sandboxd/users.conf > /dev/null <<EOF
 {
+  "_schema_version": 1,
   "subnets": [
-    { "cidr": "10.209.0.0/20", "allow_users": ["$USER"] },
-    { "cidr": "10.220.0.0/20", "allow_users": ["$USER"] }
+    { "cidr": "10.209.0.0/20", "allow_users": ["sandbox", "$USER"] },
+    { "cidr": "10.220.0.0/20", "allow_users": ["sandbox", "$USER"] }
   ]
 }
 EOF

@@ -4,12 +4,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Bytes,
-    extract::{Path, State},
+    extract::{ConnectInfo, Path, Request, State, connect_info::Connected},
     http::StatusCode,
+    middleware::{Next, from_fn},
     response::IntoResponse,
     routing::{delete, get, post},
+    serve::IncomingStream,
 };
 use clap::Parser;
 use sandbox_core::backend::{
@@ -28,10 +30,10 @@ use sandbox_core::{
     ExecResponse, GateRequest, GateService, GateServiceOutcome, GateStatus, GatewayHealth,
     GatewayManager, GatewayShutdownReason, GatewayStatus, GuestConnector, GuestResponse,
     HealthComponent, LdsAckOutcome, LdsStatsProbe, LimaManager, NetworkHealth, NetworkInfo,
-    NetworkManager, PersistConfig, PersistentSink, Policy, PolicyApplyStatus, PolicyCompiler,
-    PolicyDistributor, SandboxError, Session, SessionConfig, SessionDto, SessionHealth, SessionId,
-    SessionIngestor, SessionMountInfo, SessionNetworkInfo, SessionState, SessionStore,
-    UpdatePolicyRequest, UsersConfig, VmIpSessionMap, VmStatus, attach_vm_to_bridge,
+    NetworkManager, OperatorIdentity, PersistConfig, PersistentSink, Policy, PolicyApplyStatus,
+    PolicyCompiler, PolicyDistributor, SandboxError, Session, SessionConfig, SessionDto,
+    SessionHealth, SessionId, SessionIngestor, SessionMountInfo, SessionNetworkInfo, SessionState,
+    SessionStore, UpdatePolicyRequest, UsersConfig, VmIpSessionMap, VmStatus, attach_vm_to_bridge,
     bind_gate_listener, detach_vm_from_bridge, generate_ca_inject_script, generate_domain_ip_rules,
     hash_policy, load_users_config, mac_from_session_id, propagate_dns_changes, read_resolved_json,
     remove_gate_socket, serve_gate_listener, users_conf_path, wait_for_lds_ack,
@@ -804,6 +806,170 @@ use sandboxd::error::error_response;
 use sandboxd::propagation::{PropagatedEdge, PropagationStates};
 
 // ---------------------------------------------------------------------------
+// Peer-credential acceptor
+// ---------------------------------------------------------------------------
+//
+// Helper-identity-assertion spec § 6.1: every connection accepted on the
+// daemon's Unix socket is augmented with the operator identity the
+// kernel reports via `SO_PEERCRED`. The acceptor reads the credentials
+// immediately after `accept(2)`, resolves the uid to a username via
+// `getpwuid_r` (`nix::unistd::User::from_uid`), and attaches the
+// resulting [`OperatorIdentity`] to every request flowing through the
+// connection through axum's `into_make_service_with_connect_info`
+// plumbing.
+//
+// Failure mode: a uid that does not resolve (host `/etc/passwd`
+// corruption, race with `userdel`, container-uid-without-passwd) closes
+// the stream and `warn!`-logs the unresolved uid. The acceptor continues
+// accepting the next connection rather than crashing the server — the
+// failure shape is rare and recoverable.
+//
+// The shape is implemented as a `Listener` impl whose `Addr` is the
+// resolved [`OperatorIdentity`]. axum's `Connected<IncomingStream<'_,
+// L>>` blanket impl picks up `L::Addr` and inserts it into the request
+// extensions. The retry-on-resolution-failure loop lives inside
+// `accept()` rather than the `Connected::connect_info` callback because
+// the trait's signature is synchronous (`fn connect_info(target) ->
+// Self`) and cannot refuse a connection — only the listener's accept
+// path can drop a stream and continue.
+
+/// Listener wrapper that reads `SO_PEERCRED` on every accepted
+/// connection and yields the resolved [`OperatorIdentity`] as the
+/// connection's `Addr`. Connections whose uid does not resolve are
+/// closed and logged; the listener continues accepting.
+struct PeerCredListener {
+    inner: UnixListener,
+}
+
+impl PeerCredListener {
+    fn new(inner: UnixListener) -> Self {
+        Self { inner }
+    }
+}
+
+/// Per-connection address type emitted by [`PeerCredListener`].
+///
+/// Local newtype wrapper around the workspace-shared
+/// [`OperatorIdentity`]. The wrapper exists for the Rust orphan rule:
+/// axum's `Connected` trait and `OperatorIdentity` both live outside
+/// this crate, so a direct `impl Connected<…> for OperatorIdentity`
+/// would not be permitted. The wrapper crate-locally satisfies the
+/// orphan rule, the `Connected::connect_info` impl unwraps it into
+/// `OperatorIdentity` for axum to insert as the request extension,
+/// and every consumer of the extension (handlers) extracts
+/// `Extension<OperatorIdentity>` directly.
+#[derive(Debug, Clone)]
+struct PeerCredAddr(OperatorIdentity);
+
+impl axum::serve::Listener for PeerCredListener {
+    type Io = tokio::net::UnixStream;
+    type Addr = PeerCredAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (stream, _peer_addr) = match self.inner.accept().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    // Transient accept(2) error — log and retry. Same
+                    // shape axum's built-in `UnixListener::accept` impl
+                    // uses (`handle_accept_error`), but inlined here
+                    // because the outer accept loop has to also handle
+                    // the per-stream peer-cred read.
+                    warn!(error = %e, "accept(2) failed; retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+            };
+
+            let ucred = match stream.peer_cred() {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(error = %e, "peer_cred() failed; closing connection");
+                    drop(stream);
+                    continue;
+                }
+            };
+
+            let uid_raw = ucred.uid();
+            match resolve_uid_to_name(uid_raw) {
+                Some(name) => {
+                    return (
+                        stream,
+                        PeerCredAddr(OperatorIdentity { uid: uid_raw, name }),
+                    );
+                }
+                None => {
+                    warn!(
+                        uid = uid_raw,
+                        "peer uid does not resolve to a username; closing connection"
+                    );
+                    drop(stream);
+                    continue;
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        // `Listener::local_addr` is documented as "the address this
+        // listener is bound to" — semantically meaningless for a
+        // peer-cred-augmented Unix listener (there is no remote address
+        // structurally; every accepted connection has its own
+        // `OperatorIdentity`). axum's `serve` does not call `local_addr`
+        // on the listener after binding, so this is unreachable in
+        // practice; we surface a structured error so a future caller
+        // that does invoke it sees a clear "this listener does not
+        // expose a single addr" reason rather than a fabricated value.
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "PeerCredListener has no single local addr — every \
+             connection has its own per-peer OperatorIdentity",
+        ))
+    }
+}
+
+/// Resolve a uid to a username via `getpwuid_r`. Returns `None` on any
+/// error (lookup failure or no matching record) so callers can collapse
+/// "Err" and "Ok(None)" to the same "deny" path.
+fn resolve_uid_to_name(uid: u32) -> Option<String> {
+    use nix::unistd::{Uid, User};
+
+    match User::from_uid(Uid::from_raw(uid)) {
+        Ok(Some(user)) => Some(user.name),
+        Ok(None) => None,
+        Err(_) => None,
+    }
+}
+
+/// Bridge from axum's `Connected` trait into the request extension
+/// map. axum's `IntoMakeServiceWithConnectInfo` invokes
+/// `Connected::connect_info` per accepted stream and inserts the result
+/// as a `ConnectInfo<PeerCredAddr>` request extension. The
+/// [`operator_identity_layer`] middleware then unwraps it into a plain
+/// `Extension<OperatorIdentity>` so handlers can pick it up with a
+/// single-purpose extractor.
+impl Connected<IncomingStream<'_, PeerCredListener>> for PeerCredAddr {
+    fn connect_info(stream: IncomingStream<'_, PeerCredListener>) -> Self {
+        stream.remote_addr().clone()
+    }
+}
+
+/// Per-request middleware that unwraps the per-connection
+/// `ConnectInfo<PeerCredAddr>` axum installs and inserts a plain
+/// `Extension<OperatorIdentity>` into the request's extension map.
+///
+/// Handlers extract `Extension<OperatorIdentity>` directly (per spec
+/// § 6.2 wire shape); the layer hides the listener's `PeerCredAddr`
+/// newtype so handler signatures do not have to reference an
+/// implementation detail of the orphan-rule workaround.
+async fn operator_identity_layer(mut req: Request, next: Next) -> axum::response::Response {
+    if let Some(ConnectInfo(addr)) = req.extensions().get::<ConnectInfo<PeerCredAddr>>().cloned() {
+        req.extensions_mut().insert(addr.0);
+    }
+    next.run(req).await
+}
+
+// ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
 
@@ -860,6 +1026,14 @@ fn app(state: Arc<AppState>) -> Router {
         .merge(events_router)
         .merge(policy_router)
         .merge(backends_router)
+        // Per-request layer that exposes the per-connection
+        // `ConnectInfo<PeerCredAddr>` (set by the
+        // `into_make_service_with_connect_info::<PeerCredAddr>()` plumbing)
+        // as a plain `Extension<OperatorIdentity>` extension. Handlers
+        // that require the operator identity extract it through that
+        // extractor; the layer is applied last so it wraps every
+        // sub-router merged above.
+        .layer(from_fn(operator_identity_layer))
 }
 
 /// Compute the initial CoreDNS policy file content for a brand-new session.
@@ -898,6 +1072,7 @@ fn compute_initial_dns_policy(req: &CreateSessionRequest) -> String {
 
 async fn create_session(
     State(state): State<Arc<AppState>>,
+    Extension(operator): Extension<OperatorIdentity>,
     Json(req): Json<CreateSessionRequest>,
 ) -> impl IntoResponse {
     // Determine workspace mode from the request: the `workspace` field
@@ -1404,10 +1579,16 @@ async fn create_session(
             // `RuntimeStartArgs` (they're Lima-only); pass them as
             // `None` so the contract is explicit at the call site
             // rather than implicit "happens to be ignored".
+            //
+            // `for_user` is the operator name resolved from the
+            // connecting socket's `SO_PEERCRED` — the container runtime
+            // emits it as the helper's `--for-user` argv flag for the
+            // pair-membership check.
             let args = RuntimeStartArgs {
                 lima_bridge: None,
                 lima_mac: None,
                 lima_config: None,
+                for_user: Some(operator.name.clone()),
             };
             match runtime.start(&handle, &args).await {
                 Ok(()) => {}
@@ -1961,10 +2142,17 @@ async fn create_session(
         {
             let runtime = runtime_for(&state, BackendKind::Lima);
             let handle = RuntimeHandle::from_session_id(&session_id);
+            // `for_user` is threaded through on the Lima path for
+            // forward-compatibility: Lima does not invoke the route
+            // helper today, but populating the field keeps every
+            // `runtime.start` call site uniform so a future contributor
+            // who adds a third backend or moves the start site across
+            // branches does not regress the pair-membership invariant.
             let args = RuntimeStartArgs {
                 lima_bridge: Some(network_info.bridge_name.clone()),
                 lima_mac: Some(vm_mac.clone()),
                 lima_config: Some(config.clone()),
+                for_user: Some(operator.name.clone()),
             };
             match runtime.start(&handle, &args).await {
                 Ok(()) => {}
@@ -2003,10 +2191,14 @@ async fn create_session(
         {
             let runtime = runtime_for(&state, BackendKind::Lima);
             let handle = RuntimeHandle::from_session_id(&session_id);
+            // `for_user` is threaded through on the Lima path for
+            // forward-compatibility — see the matching note on the
+            // fast-path branch above.
             let args = RuntimeStartArgs {
                 lima_bridge: Some(network_info.bridge_name.clone()),
                 lima_mac: Some(vm_mac.clone()),
                 lima_config: Some(config.clone()),
+                for_user: Some(operator.name.clone()),
             };
             match runtime.start(&handle, &args).await {
                 Ok(()) => {}
@@ -2660,6 +2852,7 @@ fn session_mount_info_for(session: &Session) -> SessionMountInfo {
 
 async fn start_session(
     State(state): State<Arc<AppState>>,
+    Extension(operator): Extension<OperatorIdentity>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let session = match state.store.get_session_by_name_or_id(&id) {
@@ -2722,10 +2915,15 @@ async fn start_session(
     {
         let runtime = runtime_for(&state, session.backend);
         let handle = RuntimeHandle::from_session_id(&session.id);
+        // `for_user` carries the operator name resolved from
+        // `SO_PEERCRED` on the connecting socket. Container backends
+        // emit it as the route helper's `--for-user` argv; Lima ignores
+        // it but accepts the field for forward-compatibility.
         let args = RuntimeStartArgs {
             lima_bridge: bridge_name.clone(),
             lima_mac: vm_mac.clone(),
             lima_config: Some(session.config.clone()),
+            for_user: Some(operator.name.clone()),
         };
         match runtime.start(&handle, &args).await {
             Ok(()) => {}
@@ -6499,10 +6697,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = app(Arc::clone(&state));
 
+    // Wrap the listener with the peer-cred acceptor (spec § 6.1): every
+    // accepted connection has `SO_PEERCRED` read, the uid resolved to a
+    // username, and the resulting `OperatorIdentity` attached to every
+    // request flowing through it via
+    // `into_make_service_with_connect_info`.
+    let listener = PeerCredListener::new(listener);
+
     // Graceful shutdown on SIGTERM / SIGINT.
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<PeerCredAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     // Tear down the persistent event sink before removing the socket.
     // `shutdown` aborts and joins the relay / sink / pruner tasks so

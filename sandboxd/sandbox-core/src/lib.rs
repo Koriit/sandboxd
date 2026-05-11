@@ -2,6 +2,7 @@ pub mod api;
 pub mod atomic_listener_writer;
 pub mod backend;
 pub mod ca;
+pub mod caller_identity;
 pub mod dns_gate;
 pub mod dns_propagation;
 pub mod error;
@@ -50,6 +51,7 @@ pub use backend::{
     compute_default_resource_limits, ensure_image, lite_image_tag_for_version, reap_orphans,
 };
 pub use ca::{CaManager, generate_ca_inject_script};
+pub use caller_identity::OperatorIdentity;
 pub use dns_gate::{
     DEFAULT_DEADLINE_MS, DNS_GATE_SOCKET_FILENAME, DNS_GATE_SOCKET_IN_CONTAINER,
     GATE_PROTOCOL_VERSION, GateAck, GateAckKind, GateError, GateErrorCode, GateErrorKind,

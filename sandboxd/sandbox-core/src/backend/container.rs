@@ -529,15 +529,23 @@ impl SessionRuntime for ContainerRuntime {
     }
 
     /// `docker start <name>`, then optionally invoke
-    /// `sandbox-route-helper <pid> <gateway-ip>` if a helper path was
-    /// registered. Spec § "Lifecycle" — the helper runs between
-    /// `docker start` and the agent-ready wait. Idempotent retries on
-    /// already-running containers are safe (Docker's start command is
+    /// `sandbox-route-helper --for-user <name> <pid> <gateway-ip>` if a
+    /// helper path was registered. Spec § "Lifecycle" — the helper runs
+    /// between `docker start` and the agent-ready wait. Idempotent retries
+    /// on already-running containers are safe (Docker's start command is
     /// idempotent for running containers).
+    ///
+    /// `args.for_user` carries the operator identity the daemon resolved
+    /// from `SO_PEERCRED` on the connecting socket. When a helper path is
+    /// configured AND `for_user` is `None`, this is a programming error
+    /// (the daemon dispatched through `runtime.start` without attaching
+    /// the operator extension); we surface it as
+    /// `SandboxError::Internal` rather than silently dropping the pair-
+    /// check assertion the helper relies on.
     async fn start(
         &self,
         handle: &RuntimeHandle,
-        _args: &RuntimeStartArgs,
+        args: &RuntimeStartArgs,
     ) -> Result<(), SandboxError> {
         let session_id = Self::session_id_from_handle(handle)?;
         let network = self.lookup_session(&session_id)?;
@@ -550,8 +558,16 @@ impl SessionRuntime for ContainerRuntime {
         .await?;
 
         if let Some(helper) = network.route_helper_path.as_ref() {
+            let for_user = args.for_user.as_deref().ok_or_else(|| {
+                SandboxError::Internal(
+                    "ContainerRuntime::start: route_helper_path is configured but \
+                     RuntimeStartArgs.for_user is None — handler dispatched \
+                     through runtime.start without the OperatorIdentity extension"
+                        .to_string(),
+                )
+            })?;
             let pid = inspect_container_pid(&container_name).await?;
-            invoke_route_helper(helper, pid, network.gateway_ip).await?;
+            invoke_route_helper(helper, pid, network.gateway_ip, for_user).await?;
         } else {
             debug!(
                 session_id = %session_id,
@@ -969,22 +985,36 @@ async fn inspect_container_pid(container_name: &str) -> Result<i32, SandboxError
     Ok(pid)
 }
 
-/// Spawn `sandbox-route-helper <pid> <gateway_ip>` and wait for
-/// completion. Per the route-helper contract (spec § "Networking →
-/// Helper authorization flow"), exit 0 is success and any non-zero
-/// exit is a deny — stderr carries the load-bearing reason which we
-/// surface to the caller verbatim.
+/// Spawn `sandbox-route-helper --for-user <name> <pid> <gateway_ip>`
+/// and wait for completion. Per the route-helper contract (spec §
+/// "Networking → Helper authorization flow"), exit 0 is success and any
+/// non-zero exit is a deny — stderr carries the load-bearing reason
+/// which we surface to the caller verbatim.
+///
+/// The `--for-user` flag is emitted BEFORE the two positional args to
+/// match the helper's `parse_argv` accept-flags-then-positionals order
+/// (helper crate-level docs § "Invocation"). `for_user` is the operator
+/// name the daemon resolved from `SO_PEERCRED`; the helper independently
+/// verifies it lands in `users.conf`'s `allow_users` for the chosen
+/// pool, alongside the daemon's own runtime uid (pair-membership check).
 async fn invoke_route_helper(
     helper: &Path,
     pid: i32,
     gateway_ip: IpAddr,
+    for_user: &str,
 ) -> Result<(), SandboxError> {
     let helper = helper.to_path_buf();
     let pid_arg = pid.to_string();
     let gw_arg = gateway_ip.to_string();
+    let for_user = for_user.to_string();
     tokio::task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new(&helper);
-        cmd.arg(&pid_arg).arg(&gw_arg);
+        // `--for-user <name>` precedes the two positional args — see
+        // the helper's `parse_argv` accept-flags-then-positionals order.
+        cmd.arg("--for-user")
+            .arg(&for_user)
+            .arg(&pid_arg)
+            .arg(&gw_arg);
         let output = run_with_timeout(&mut cmd, DOCKER_CMD_TIMEOUT, "sandbox-route-helper")
             .map_err(|e| match e {
                 SandboxError::Internal(msg) if msg.contains("failed to spawn") => {
