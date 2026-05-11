@@ -146,6 +146,10 @@ Spec 3 does not attempt to mitigate this.
 - Spec 1's per-user pair-check on `sandbox-route-helper` is the analogous
   control sandboxd *does* enforce — but it covers only our route-helper,
   not the QEMU bridge helper.
+- Spec 3 also *removes* the rootless-Docker code path that previously
+  generated a per-invocation nsenter wrapper around `qemu-bridge-helper`
+  inside `QEMU_WRAPPER_SCRIPT` (see § 9). The supported envelope is
+  rootful Docker; rootless Docker is explicitly not supported (§ 14).
 
 The deployment model therefore assumes operators on a multi-tenant box are
 **mutually-trusted members of the `sandbox` group**. The API-level trust
@@ -528,8 +532,8 @@ appended to the failure line so the operator can copy-paste a fix.
 | C4 | current user in `sandbox` group | `nix::unistd::getgroups()` + `Group::from_gid` lookup; check that `"sandbox"` is in the list | `sudo usermod -aG sandbox $USER; log out and back in` |
 | C5 | socket perms | `stat(socket_path)` → mode `0660`, owner `sandbox`, group `sandbox` | `restart sandboxd: sudo systemctl restart sandboxd` |
 | C6 | KVM accessible from daemon's uid | Daemon-side `/diagnostics` endpoint (§ 13 sketch) reports `[ -r /dev/kvm ] && [ -w /dev/kvm ]` as evaluated **inside the daemon process** | `add daemon user to kvm group: sudo usermod -aG kvm sandbox; sudo systemctl restart sandboxd; verify /dev/kvm exists` |
-| C7 | gateway image present | `docker image inspect sandbox-gateway:<daemon-version>` exits 0 (daemon-side, since the daemon runs `docker`) | `sandbox update` to bring images in (Spec 5); or rebuild via `make gateway-image` in dev |
-| C8 | lite image present | `docker image inspect sandboxd-lite:<daemon-version>` exits 0 (daemon-side) | `sandbox update`; or `make lite-image` in dev |
+| C7 | gateway image present (**hard**) | `docker image inspect sandbox-gateway:<daemon-version>` exits 0 (daemon-side, since the daemon runs `docker`). Hard failure — sessions cannot be created without it (§ 8.5). | `sandbox update` to load the image (Spec 5); or in dev: `make gateway-image && docker load` |
+| C8 | lite image present (**informational**) | `docker image inspect sandboxd-lite:<daemon-version>` exits 0 (daemon-side). Reported as `~ SKIPPED` with informational annotation when missing; daemon builds it on first session create (§ 8.4). Does not contribute to exit-code-1. | image will be built on first session create; or pre-build: `sandbox rebuild-image --backend container` |
 | C9 | route-helper has caps | `getcap /usr/local/libexec/sandboxd/sandbox-route-helper` reports `cap_net_admin,cap_sys_admin=eip`. Path resolved via `resolve_route_helper_path` (`sandboxd/sandboxd/src/main.rs:405`). | `sandbox update` re-runs setcap (Spec 5); or `make install-route-helper-prod-cap` in dev |
 | C10 | state dir mode | `stat /var/lib/sandbox/` (mode `0750`, owner `sandbox:sandbox`); plus `sessions/`, `events/`, `backups/` at `0700`; `sessions.db` at `0600` | `sudo chmod 0750 /var/lib/sandbox; sudo chown sandbox:sandbox /var/lib/sandbox` (the daemon corrects subdirs at next start; see § 5.4) |
 | C11 | users.conf reachable + parses + daemon's uid is in a pool | Daemon-side; the daemon's own startup already enforces this (`sandboxd/sandboxd/src/main.rs:6156-6177`), but the doctor surfaces it on a clean response surface rather than `journalctl` | If the daemon is running, this can't be failing; if it's not, the failure rolls up into C1 |
@@ -577,6 +581,33 @@ sandbox doctor — checking deployment
 
 11 checks passed, 0 failed, 0 skipped
 ```
+
+**Mixed output — daemon healthy but lite image not yet built**
+(verbose mode; the lite-image skip is informational, not a failure):
+
+```
+$ sandbox doctor --verbose
+sandbox doctor — checking deployment
+
+✓ daemon process running                 (sandboxd.service: active)
+✓ daemon reachable                       (/run/sandbox/sandboxd.sock)
+✓ CLI ↔ daemon version match             (1.0.3 == 1.0.3)
+✓ current user in 'sandbox' group        (alice ∈ docker,kvm,sandbox)
+✓ socket perms                           (srw-rw---- sandbox:sandbox)
+✓ KVM accessible                         (/dev/kvm readable+writable by daemon)
+✓ gateway image present                  (sandbox-gateway:1.0.3)
+~ lite image present                     SKIPPED (not built yet)
+    hint: image will be built on first session create; or pre-build:
+    sandbox rebuild-image --backend container
+✓ route-helper caps                      (cap_net_admin,cap_sys_admin=eip)
+✓ state dir mode                         (/var/lib/sandbox 0750 sandbox:sandbox)
+✓ users.conf has daemon pool             (10.209.0.0/20 → ['sandbox'])
+
+10 checks passed, 0 failed, 1 skipped
+```
+
+Exit code is `0` — the informational skip on C8 does not flip the run
+to failure.
 
 **Partial-fail output** (daemon-down, default mode — failures only):
 
@@ -787,16 +818,42 @@ skew is harder to diagnose than always-fresh).
 > Never `:latest`. Never an unpinned reference.
 
 The constant `DAEMON_VERSION` is `env!("CARGO_PKG_VERSION")` baked into
-the daemon at compile time. Old containers from prior daemon versions
-hold references to prior image tags by docker's reference-by-id semantics;
-they are not invalidated by a new daemon's tag preference.
+the daemon at compile time. Both images carry the daemon's version as
+their tag; that is the deliberate pinning strategy. Old containers from
+prior daemon versions hold references to prior image tags by docker's
+reference-by-id semantics; they are not invalidated by a new daemon's
+tag preference.
 
-### 8.2 · Where the image tag is selected
+### 8.2 · Two image lifecycles, two contracts
 
-**Lite image — already pinned.** `lite_image_tag_for_version` at
-`sandbox-core/src/backend/container.rs:126` produces
-`sandboxd-lite:<daemon_version>`. The daemon already calls it with
-`env!("CARGO_PKG_VERSION")` at `sandboxd/sandboxd/src/main.rs:6236`:
+The lite and gateway images differ in **how they reach the host**, and
+the daemon's behavior around each differs accordingly. The table below
+fixes the contract:
+
+| Aspect                  | Lite image (`sandboxd-lite:<ver>`)                                                | Gateway image (`sandbox-gateway:<ver>`)                                              |
+|-------------------------|-----------------------------------------------------------------------------------|---------------------------------------------------------------------------------------|
+| Source                  | Dockerfile embedded in the daemon via `include_str!` (`container.rs:144`)         | Built from `networking/gateway/Dockerfile` against the workspace                       |
+| Where it's built        | **By the daemon itself**, on demand, on first need                                  | **By GitHub Actions** at release time (Spec 4); shipped in the release tarball         |
+| Distribution to host    | Not shipped in the release tarball; daemon builds locally on first session create | Shipped in the release tarball as a `docker save` tar; install does `docker load`     |
+| Build trigger           | `ensure_image(daemon_version)` (`container.rs:1194`) called from `create_session` (`main.rs:1123`); explicit operator rebuild via `sandbox rebuild-image --backend container` | Build happens in CI; daemon never builds it. `sandbox rebuild-image --backend gateway` is **not supported** (Spec 4 territory). |
+| Tagging                 | Already pinned via `lite_image_tag_for_version(daemon_version)` (`container.rs:126`); daemon calls it with `env!("CARGO_PKG_VERSION")` at `main.rs:6236` | **Currently unpinned** — `GATEWAY_IMAGE` at `gateway.rs:127` is the bare name `"sandbox-gateway"`, which docker resolves as `:latest`. Spec 3 changes this. |
+| First-start check       | Informational only (§ 8.4) — daemon does **not** refuse to start; image is built on first need | **Hard contract** (§ 8.5) — daemon logs a clear error, refuses session-create until the image is loaded, but still starts so doctor can report |
+| Doctor check            | Informational (`~`); hint: image will be built on first session, or pre-build via `sandbox rebuild-image --backend container` | Hard failure (`✗`); hint: `sandbox update` (or in dev: `make gateway-image && docker load`) |
+
+The split exists because the lite image's Dockerfile depends only on
+public Debian packages and the daemon's embedded source — the daemon
+can rebuild it self-sufficiently. The gateway image's Dockerfile pulls
+the Envoy / CoreDNS / mitmproxy stack and links in the workspace's nft
+loggers (`networking/gateway/Dockerfile`); reproducing that build
+requires the full source tree and a non-trivial toolchain, which the
+release tarball cannot reasonably ship.
+
+### 8.3 · Where the image tags are selected
+
+**Lite image — already pinned, no change.**
+`lite_image_tag_for_version` at `sandbox-core/src/backend/container.rs:126`
+produces `sandboxd-lite:<daemon_version>`. The daemon already calls it
+with `env!("CARGO_PKG_VERSION")` at `sandboxd/sandboxd/src/main.rs:6236`:
 
 ```rust
 ContainerRuntime::new(
@@ -806,12 +863,13 @@ ContainerRuntime::new(
 ```
 
 `ensure_image(daemon_version)` (`container.rs:1194`) builds the image at
-that tag on first need. No change is required for the lite image. The
-existing self-test
+that tag on first need. The existing self-test
 `daemon_lite_image_tag_matches_ensure_image_for_same_version`
-(`main.rs:8007`) already pins the tag-shape contract.
+(`main.rs:8007`) pins the tag-shape contract. Spec 3 does not change
+this.
 
-**Gateway image — not pinned today.** `gateway.rs:127` declares:
+**Gateway image — not pinned today; Spec 3 pins it.**
+`gateway.rs:127` declares:
 
 ```rust
 pub const GATEWAY_IMAGE: &str = "sandbox-gateway";
@@ -853,17 +911,76 @@ gateway-image:
 where `GATEWAY_VERSION := $(shell awk -F'"' '/^version/ { print $$2; exit }' sandboxd/sandbox-core/Cargo.toml)` — symmetric to the existing
 `LITE_VERSION` at `Makefile:160`. (The gateway image's tag must match the
 **daemon's** version, which is the same as `sandbox-core`'s version by
-workspace inheritance.)
+workspace inheritance.) Spec 4 will replace this dev-only `docker build`
+with the CI-built artefact shipped in the release tarball, but the tag
+shape is the same.
 
-### 8.3 · Old images persist after update
+### 8.4 · Lite image — first-start behavior
+
+The lite image is **not** required at daemon startup. The daemon may
+start with `sandboxd-lite:<ver>` absent; it will be built the first
+time a session creation needs it via the existing `ensure_image` path
+(`container.rs:1194`), and the resulting image is tagged with the
+daemon's compile-time version.
+
+Doctor's C8 check (§ 6.2) treats lite-image absence as **informational**:
+
+```
+~ lite image not built yet           (sandboxd-lite:1.0.3)
+    hint: image will be built on first session create; or pre-build
+    with: sandbox rebuild-image --backend container
+```
+
+Skipped checks do not contribute to the failure exit-code. The
+operator-visible message is "this is fine, here's how to pre-warm if
+you want."
+
+Operator-driven rebuild remains supported via the existing
+`POST /rebuild-image` endpoint and the `sandbox rebuild-image
+--backend container` CLI subcommand. **Automatic periodic rebuild of
+the lite image is explicitly out of scope** — see § 14 and the
+deferred feature tracked as GitHub issue
+[Koriit/sandboxd#7](https://github.com/Koriit/sandboxd/issues/7).
+
+### 8.5 · Gateway image — first-start behavior
+
+The gateway image is **required** for session creation. The daemon
+checks for its presence at startup:
+
+1. After `ensure_base_dir_layout` (§ 5.4), before
+   `SessionStore::new` (`main.rs:6190`), run `docker image inspect
+   sandbox-gateway:<daemon_version>`.
+2. **Image missing** → log `error!` line naming the missing tag and
+   the daemon's version, with hint:
+   `gateway image missing: sandbox-gateway:1.0.3 — run 'sandbox update' to load (Spec 5), or 'docker load < gateway-image.tar' for the manual path`.
+3. **The daemon still starts** so `sandbox doctor` can report the
+   issue properly. Refusing to start would block diagnostics.
+4. Session-create requests for any backend that needs the gateway
+   (container and Lima both do — every session has a per-session
+   gateway container) return a clear `SandboxError` with the same
+   hint. This is the hard-failure surface operators see.
+
+Doctor's C7 check (§ 6.2) reports this as a hard failure (`✗`):
+
+```
+✗ gateway image present              (sandbox-gateway:1.0.3 not found)
+    hint: sandbox update (Spec 5); or in dev: make gateway-image && docker load
+```
+
+The gateway image is **not** rebuilt by the daemon. There is no
+`ensure_image`-equivalent for it; the daemon refuses to invent the
+image even if it had the source. The contract is: install lands
+the image, `sandbox update` replaces it, operators don't build it.
+
+### 8.6 · Old images persist after update
 
 Containers from prior daemon versions hold image-id references, not
 tag references — docker won't garbage-collect the underlying image
 layers as long as some container or recent image-tag points at them.
 After `sandbox update` (Spec 5) replaces the daemon binary with version
-`1.0.4`, the old `sandbox-gateway:1.0.3` tag survives (a container may
-still hold it; docker won't sweep it). Operators reclaim the disk with
-`docker image prune` manually.
+`1.0.4`, the old `sandbox-gateway:1.0.3` and `sandboxd-lite:1.0.3` tags
+survive (a container may still hold them; docker won't sweep them).
+Operators reclaim the disk with `docker image prune` manually.
 
 Spec 5's `sandbox update` is **explicitly forbidden** from auto-pruning
 old images. The reasoning: pruning is destructive, the operator may have
@@ -872,51 +989,23 @@ a stopped session that still needs the old image to start (Spec 5
 prior daemon version for gateway + lite). Operators run `docker image
 prune` when they want it.
 
-### 8.4 · First-start sanity check
-
-The daemon, on startup, verifies that both required images exist for
-its own version. Logic:
-
-1. After `ensure_base_dir_layout` (§ 5.4), before
-   `SessionStore::new` (`main.rs:6190`), run two `docker image inspect`
-   calls (one per image tag).
-2. Failure of either → log a `warn!` line naming the missing image and
-   the daemon's version, with a hint:
-   `image missing: sandbox-gateway:1.0.3 — run 'sandbox update' to populate (Spec 5)`
-3. **The daemon still starts.** `sandbox doctor` (C7, C8) is the
-   intended surface for this — refusing to start would mean an operator
-   can't even run `sandbox doctor` against a broken install.
-4. Session-create requests against a missing image return a clear
-   error (the existing `ensure_image` path at `container.rs:1194` is
-   already this contract for the lite image; the same shape extends to
-   the gateway image with a similar "image not found, run sandbox
-   update or build it" error).
-
-The existing `ensure_image` path is **build-on-demand** for dev mode —
-it knows how to construct the lite image from sources. In production
-(Spec 4 builds without source), `ensure_image` should refuse to build
-and direct the operator at `sandbox update`. The dev-vs-prod
-distinction is implementation detail; Spec 3 only specifies that the
-production behavior is "log warning at startup, refuse session-create,
-direct operator at sandbox update."
-
-## 9 · Removing explicit `helper=` references
+## 9 · Removing explicit `helper=` references and the rootless-Docker code path
 
 ### 9.1 · The principle
 
 > Sandboxd does not reference `qemu-bridge-helper`'s install path
-> directly in source. QEMU's `-netdev bridge,...,helper=<path>` syntax
-> mandates the `helper=` *key* when the netdev needs a bridge helper;
-> the *value* defaults to QEMU's compile-time `libexecdir` when omitted.
-> Sandboxd trusts QEMU's default and lets distro packaging resolve it.
+> anywhere. QEMU's `-netdev bridge,...` accepts an optional
+> `helper=<path>` parameter; when omitted, QEMU resolves the helper via
+> its compile-time `libexecdir` (different on Ubuntu/Debian vs
+> RHEL/Fedora). Sandboxd omits the parameter entirely and lets distro
+> packaging do its job.
 
-This is a less drastic change than the handoff describes. The reason is
-load-bearing for the rootless-Docker case (§ 9.2): in that case, the
-`helper=` value is a wrapper script generated at runtime, not the real
-helper, so the key must stay. The simplification we *can* make is
-removing the hardcoded `/usr/lib/qemu/qemu-bridge-helper` default for the
-**non-rootless** case, which is the common case on RHEL/Fedora (which
-ship the helper at `/usr/libexec/qemu-bridge-helper` instead).
+This is a **clean removal**, not a conditional. Sandboxd does not
+support rootless Docker (§ 14), so the previous rootless-Docker code
+path — which existed *only* to substitute a nsenter wrapper for the
+real bridge helper — is deleted outright. With rootless out of the
+supported envelope, there is nothing left that needs a runtime-
+substituted helper path.
 
 Verified via `qemu-system-x86_64 --help`:
 
@@ -933,106 +1022,91 @@ helper restores distro-portability.
 
 ### 9.2 · Audit — every occurrence in the codebase
 
-Comprehensive grep result, every reference to `qemu-bridge-helper` or
-`helper=` in source (the four `target/` build artifacts and the four
-`docs/` references that read as comments only are out of scope):
+Comprehensive grep result, every reference to `qemu-bridge-helper`,
+`helper=`, `rootless`-bridge-helper plumbing, or related rootless
+artefacts in source (the four `target/` build artefacts and `docs/`
+references that read as comments only are out of scope):
 
 | # | File:line | Reference | Action |
 |---|---|---|---|
-| H1 | `sandboxd/sandbox-core/src/lima.rs:155` | `# 2. Adds a second NIC connected to the Docker bridge via qemu-bridge-helper.` (comment in `QEMU_WRAPPER_SCRIPT`) | Keep — comment, no code impact. |
-| H2 | `sandboxd/sandbox-core/src/lima.rs:157` | `#    namespace, so a wrapper helper runs qemu-bridge-helper via nsenter.` (comment) | Keep — comment. |
-| H3 | `sandboxd/sandbox-core/src/lima.rs:194` | `# connected to the Docker bridge via qemu-bridge-helper.` (comment) | Keep — comment. |
-| H4 | `sandboxd/sandbox-core/src/lima.rs:196` | `BRIDGE_HELPER="${SANDBOX_BRIDGE_HELPER:-/usr/lib/qemu/qemu-bridge-helper}"` | **Change.** Drop the `:-/usr/lib/qemu/qemu-bridge-helper` default. The `SANDBOX_BRIDGE_HELPER` env override stays (test harnesses use it; `Makefile:208`'s `QEMU_BRIDGE_HELPER_PATH` is unrelated to runtime resolution). When the env is unset, `BRIDGE_HELPER` is empty, and the rootless-Docker branch (§ 9.2 H8 below) treats empty as "use QEMU's default" by **omitting `helper=<path>`** from the netdev line. |
-| H5 | `sandboxd/sandbox-core/src/lima.rs:200` | `# but qemu-bridge-helper must run inside the namespace to find the bridge` (comment) | Keep — comment. |
-| H6 | `sandboxd/sandbox-core/src/lima.rs:208-216` | rootless-Docker nsenter wrapper: `NSHELPER="$SCRIPT_DIR/bridge-helper-ns"`; the script execs `nsenter ... -- "$SANDBOX_REAL_BRIDGE_HELPER" "$@"`; then `BRIDGE_HELPER="$NSHELPER"`. | **Keep.** The wrapper script is load-bearing for the rootless-Docker case — QEMU on the host needs the helper to run inside rootlesskit's namespace. The wrapper substitutes for the real helper. After H4's change, the wrapper resolves `SANDBOX_REAL_BRIDGE_HELPER` to whatever `SANDBOX_BRIDGE_HELPER` was set to; if unset, the wrapper uses **its compile-time-resolvable** default. The wrapper script's body remains; only its environment-prep changes. See § 9.3 for the new resolution path. |
-| H7 | `sandboxd/sandbox-core/src/lima.rs:215` | `export SANDBOX_REAL_BRIDGE_HELPER="$BRIDGE_HELPER"` | **Adjust.** When `BRIDGE_HELPER` is empty (the new default), the wrapper falls back to QEMU's compile-time default. Practically, the wrapper script's first line becomes a `[ -z "$SANDBOX_REAL_BRIDGE_HELPER" ] && SANDBOX_REAL_BRIDGE_HELPER=/usr/lib/qemu/qemu-bridge-helper` shim, **OR** the lookup is delegated to `which qemu-bridge-helper` inside the rootlesskit namespace. The latter is cleaner but adds a runtime `PATH` lookup. The spec recommends the latter (cleaner, more portable across distros). |
-| H8 | `sandboxd/sandbox-core/src/lima.rs:220-222` | `-netdev bridge,id=net_sandbox,br=$SANDBOX_DOCKER_BRIDGE,helper=$BRIDGE_HELPER` | **Change conditionally.** When `BRIDGE_HELPER` is non-empty (rootless case: it's the path of the nsenter wrapper script), keep `helper=$BRIDGE_HELPER`. When empty (non-rootless, normal case), emit the netdev line **without** `helper=` so QEMU uses its built-in default. Shell-level: `EXTRA_ARGS="-netdev bridge,id=net_sandbox,br=$SANDBOX_DOCKER_BRIDGE${BRIDGE_HELPER:+,helper=$BRIDGE_HELPER} ..."`. |
-| H9 | `sandboxd/sandbox-core/src/lima.rs:228` | `# PR_SET_NO_NEW_PRIVS, which strips setuid from qemu-bridge-helper` (comment) | Keep — comment. |
-| H10 | `sandboxd/sandbox-core/src/lima.rs:424` | `/// second NIC connected to the Docker bridge via qemu-bridge-helper.` (doc comment) | Keep — comment. |
-| H11 | `sandboxd/sandbox-core/src/lima.rs:2806-2807` | Test: `assert!(QEMU_WRAPPER_SCRIPT.contains("qemu-bridge-helper"), "wrapper must reference qemu-bridge-helper")` | **Keep but verify still passes.** After the change, the wrapper still references `qemu-bridge-helper` (in comments and in the rootless-mode nsenter shim's fallback). The assertion remains green. |
-| H12 | `sandboxd/sandbox-core/src/lima.rs:2822-2825` | Test: `assert!("wrapper must NOT use -sandbox on (incompatible with qemu-bridge-helper setuid)")` | **Keep.** Unrelated to path resolution; about the `-sandbox` QEMU flag. |
-| H13 | `sandboxd/sandbox-core/src/vm_network.rs:3, 25, 99` | Doc comments referencing `qemu-bridge-helper` | Keep — comments. |
-| H14 | `sandboxd/sandboxd/src/main.rs:2683, 4372, 4807, 5188` | Comments referencing `qemu-bridge-helper` | Keep — comments. |
-| H15 | `sandboxd/sandbox-core/src/backend/mod.rs:80` | Doc comment referencing `qemu-bridge-helper` | Keep — comment. |
-| H16 | `Makefile:208` | `QEMU_BRIDGE_HELPER_PATH := /usr/lib/qemu/qemu-bridge-helper` (install-time setup-bridge-helper-setuid target) | **Keep for dev mode.** This is an install-time path that sets the setuid bit on the helper. It's a developer's `make setup-dev-env` concern, not a daemon-runtime concern. Spec 4's install script handles the production-mode equivalent and may probe for the helper at multiple paths. |
-| H17 | `Makefile:419-433` | `setup-bridge-helper-setuid` target | **Keep.** Unchanged — dev-mode setup. |
-| H18 | `Makefile:118` | Comment about bridge-helper test skips | Keep — comment. |
-| H19 | `Makefile:318, 350` | Comments / mkdir for `/etc/qemu/bridge.conf` | Keep — unrelated to helper path. |
+| H1 | `sandboxd/sandbox-core/src/lima.rs:155` | `# 2. Adds a second NIC connected to the Docker bridge via qemu-bridge-helper.` (comment header for `QEMU_WRAPPER_SCRIPT`) | **Edit.** Drop the second sentence about rootless: the wrapper no longer has a rootless branch. Final comment: `# 2. Adds a second NIC connected to the Docker bridge via qemu-bridge-helper.` |
+| H2 | `sandboxd/sandbox-core/src/lima.rs:156-157` | `#    For rootless Docker the bridge lives inside rootlesskit's network` / `#    namespace, so a wrapper helper runs qemu-bridge-helper via nsenter.` (comment) | **Delete.** Rootless code path is removed. |
+| H3 | `sandboxd/sandbox-core/src/lima.rs:194` | `# Bridge networking: if SANDBOX_DOCKER_BRIDGE is set, add a second NIC` / `# connected to the Docker bridge via qemu-bridge-helper.` (comment in script body) | **Keep.** Accurate, distro-agnostic comment. |
+| H4 | `sandboxd/sandbox-core/src/lima.rs:196` | `BRIDGE_HELPER="${SANDBOX_BRIDGE_HELPER:-/usr/lib/qemu/qemu-bridge-helper}"` | **Delete.** The `BRIDGE_HELPER` shell variable is gone. The `SANDBOX_BRIDGE_HELPER` env override is also retired (it existed solely to point the rootless wrapper at a custom helper for testing; with rootless gone, the override has no remaining callers in source). § 11.5 includes a grep test to ensure `SANDBOX_BRIDGE_HELPER` does not re-appear. |
+| H5 | `sandboxd/sandbox-core/src/lima.rs:198-202` | Five-line `# Rootless Docker: the bridge lives inside rootlesskit's network+user` / `# namespace. QEMU stays on the host (so Lima SSH port-forwarding works),` / `# but qemu-bridge-helper must run inside the namespace to find the bridge` / `# and create the TAP device there. The TAP fd is passed back over a unix` / `# socket, which works across namespace boundaries.` (comment block) | **Delete.** Rootless code path is removed. |
+| H6 | `sandboxd/sandbox-core/src/lima.rs:203` | `CHILD_PID_FILE="/run/user/$(id -u)/dockerd-rootless/child_pid"` | **Delete.** Rootlesskit-discovery line; no longer reachable after the rest of the rootless block is gone. |
+| H7 | `sandboxd/sandbox-core/src/lima.rs:204-218` | The full rootless conditional: `if [ -f "$CHILD_PID_FILE" ]; then ... fi`, including the generated `NSHELPER` script that nsenter-shims `qemu-bridge-helper`, `export SANDBOX_RLKIT_PID`, `export SANDBOX_REAL_BRIDGE_HELPER`, and the `BRIDGE_HELPER="$NSHELPER"` override. | **Delete.** Entire rootless-Docker branch removed in one block. The generated `bridge-helper-ns` script disappears with it; no caller remains. |
+| H8 | `sandboxd/sandbox-core/src/lima.rs:220-222` | `-netdev bridge,id=net_sandbox,br=$SANDBOX_DOCKER_BRIDGE,helper=$BRIDGE_HELPER` | **Edit.** Drop the `,helper=$BRIDGE_HELPER` segment entirely. The netdev line becomes `-netdev bridge,id=net_sandbox,br=$SANDBOX_DOCKER_BRIDGE`. QEMU resolves the helper via its compile-time `libexecdir` default. |
+| H9 | `sandboxd/sandbox-core/src/lima.rs:228` | `# PR_SET_NO_NEW_PRIVS, which strips setuid from qemu-bridge-helper` (comment in hardened-mode block) | **Keep.** The PR_SET_NO_NEW_PRIVS constraint is still in force and the comment is accurate (the hardened block intentionally avoids `-sandbox` for this reason). |
+| H10 | `sandboxd/sandbox-core/src/lima.rs:424` | `/// second NIC connected to the Docker bridge via qemu-bridge-helper.` (doc comment on `LimaConfig`) | **Keep.** Accurate, distro-agnostic doc. |
+| H11 | `sandboxd/sandbox-core/src/lima.rs:2806-2807` | Test: `assert!(QEMU_WRAPPER_SCRIPT.contains("qemu-bridge-helper"), "wrapper must reference qemu-bridge-helper")` | **Keep.** After the changes the wrapper still references `qemu-bridge-helper` in the surviving comment (H3) and in the `# PR_SET_NO_NEW_PRIVS` comment (H9). Assertion remains green. |
+| H12 | `sandboxd/sandbox-core/src/lima.rs:2822-2825` | Test: `"wrapper must NOT use -sandbox on (incompatible with qemu-bridge-helper setuid)"` | **Keep.** Unrelated to path resolution; about the `-sandbox` QEMU flag. |
+| H13 | `sandboxd/sandbox-core/src/vm_network.rs:3, 25, 99` | Doc comments referencing `qemu-bridge-helper` | **Keep.** Comments only. |
+| H14 | `sandboxd/sandboxd/src/main.rs:2683, 4372, 4807, 5188` | Comments referencing `qemu-bridge-helper` | **Keep.** Comments only. |
+| H15 | `sandboxd/sandbox-core/src/backend/mod.rs:80` | Doc comment referencing `qemu-bridge-helper` | **Keep.** Comment only. |
+| H16 | `Makefile:208` | `QEMU_BRIDGE_HELPER_PATH := /usr/lib/qemu/qemu-bridge-helper` | **Keep for dev mode.** Install-time setuid path for `make setup-dev-env`. Spec 4's install script will probe the helper's path independently on production hosts; that's a Spec 4 concern (§ 9.4). |
+| H17 | `Makefile:419-433` | `setup-bridge-helper-setuid` target | **Keep.** Dev-mode setuid setup. |
+| H18 | `Makefile:118` | Comment about bridge-helper test skips | **Keep.** Comment only. |
+| H19 | `Makefile:318, 350` | Comments / mkdir for `/etc/qemu/bridge.conf` | **Keep.** Unrelated to helper path. |
+| R1 | `sandboxd/sandbox-core/src/error.rs:43-73, 169-182` | `SandboxError::RootlessDockerRefused` variant + its `Display` body + a regression test pinning the `rootless docker` greppable token | **Keep.** This is the *refusal* infrastructure that defends against running on rootless hosts — it's the mechanism by which "we don't support rootless Docker" is enforced today. Removing it would silently re-admit rootless. Spec 3 does **not** touch it. |
+| R2 | `sandboxd/sandbox-core/src/backend/container_rootless_probe.rs` (file) | The rootless-Docker detector module | **Keep.** Same reasoning as R1 — this is the probe that triggers `RootlessDockerRefused`. Removing it would defeat the refusal. |
+| R3 | `sandboxd/sandbox-core/src/session.rs:357-410, 543, 702, 761, 799` | `SessionConfig::rootless_docker: Option<SessionRootlessDocker>` and the persisted `SessionRootlessDocker` struct (detected/forced bools) | **Keep.** This is the persisted *audit record* of what the rootless probe decided at session-create time; it surfaces in `sandbox inspect` output. It records the no-support enforcement, it does not enable rootless. On-disk forward-compat (`#[serde(default)]`) means leaving the field intact is safe; removing it would break older daemons reading newer DB rows. |
+| R4 | `sandboxd/sandboxd/src/main.rs:1020-1110, 1847-1859, 2391-2405, 2570-` | `--force-rootless-docker` opt-in plumbing + probe invocation + DTO projection | **Keep.** Explicit escape hatch for operators who accept the risk per-invocation (`sandbox create --force-rootless-docker`). The flag stays as documented in `sandbox-cli/src/main.rs:150-151`. Removing it without removing the refusal would leave the operator no way to test on a rootless host even when they intentionally accept the consequences. |
+| R5 | `sandboxd/sandbox-core/src/api/mapper.rs:86-172, 753-781` | `SessionDto::rootless: Option<SessionRootlessDockerDto>` + `with_rootless` setter + serializer tests | **Keep.** DTO projection of R3; on-the-wire forward-compat. |
 
-**Net code change:** one shell-script edit (H4 + H7 + H8) inside
-`QEMU_WRAPPER_SCRIPT` in `sandboxd/sandbox-core/src/lima.rs`. Two new
-tests (§ 11.5).
+**Net code change:** seven shell-script edits inside `QEMU_WRAPPER_SCRIPT`
+(H1, H2, H4, H5, H6, H7, H8) collapsing the rootless branch and dropping
+the `helper=` parameter. Zero changes to the `RootlessDockerRefused`
+refusal path (R1-R5). One new grep test (§ 11.5).
 
-### 9.3 · The new wrapper logic (non-rootless vs. rootless)
+The distinction is critical and worth restating: the artefacts in R1-R5
+**enforce** the no-rootless-support policy at the API layer (refuse to
+create sessions on rootless hosts). The artefacts in H4-H7 **enabled
+rootless to work at the QEMU-networking layer**. Removing R1-R5 would
+silently re-admit rootless. Removing H4-H7 closes the door at the
+networking layer too, in keeping with "we don't support rootless
+Docker." The two layers are independent; this revision touches only
+the networking layer.
 
-Updated `QEMU_WRAPPER_SCRIPT` body (only the bridge-networking block
-shown; the rest is unchanged):
+### 9.3 · The post-removal wrapper logic
+
+Updated `QEMU_WRAPPER_SCRIPT` bridge-networking block (the rest of the
+script — PCIe root-port, real-QEMU resolution, hardened-mode block —
+is unchanged):
 
 ```sh
 # Bridge networking: if SANDBOX_DOCKER_BRIDGE is set, add a second NIC
 # connected to the Docker bridge via qemu-bridge-helper.
+# QEMU resolves the helper via its compile-time libexecdir default
+# (different on Ubuntu/Debian (/usr/lib/qemu/) vs RHEL/Fedora
+# (/usr/libexec/)); sandboxd does not pin the path.
 if [ -n "$SANDBOX_DOCKER_BRIDGE" ]; then
-    # If SANDBOX_BRIDGE_HELPER is set, use it (test-harness override).
-    # Otherwise, let QEMU resolve qemu-bridge-helper via its compile-time
-    # libexecdir default — different on Ubuntu/Debian (/usr/lib/qemu/)
-    # vs RHEL/Fedora (/usr/libexec/).
-    BRIDGE_HELPER="${SANDBOX_BRIDGE_HELPER:-}"
-
-    # Rootless Docker: the bridge lives inside rootlesskit's network+user
-    # namespace. QEMU stays on the host but qemu-bridge-helper must run
-    # inside the namespace to find the bridge. The TAP fd is passed back
-    # over a unix socket. We generate a wrapper script that nsenter's the
-    # helper; the wrapper resolves the real helper via PATH inside the
-    # rootlesskit namespace (or via SANDBOX_BRIDGE_HELPER when set for
-    # test).
-    CHILD_PID_FILE="/run/user/$(id -u)/dockerd-rootless/child_pid"
-    if [ -f "$CHILD_PID_FILE" ]; then
-        RLKIT_PID="$(cat "$CHILD_PID_FILE")"
-        if [ -n "$RLKIT_PID" ] && [ -d "/proc/$RLKIT_PID" ]; then
-            NSHELPER="$SCRIPT_DIR/bridge-helper-ns"
-            cat > "$NSHELPER" <<'HELPEREOF'
-#!/bin/sh
-REAL_HELPER="${SANDBOX_REAL_BRIDGE_HELPER:-$(command -v qemu-bridge-helper 2>/dev/null || echo /usr/lib/qemu/qemu-bridge-helper)}"
-exec nsenter --preserve-credentials -U -n -t "$SANDBOX_RLKIT_PID" -- "$REAL_HELPER" "$@"
-HELPEREOF
-            chmod +x "$NSHELPER"
-            export SANDBOX_RLKIT_PID="$RLKIT_PID"
-            [ -n "$BRIDGE_HELPER" ] && export SANDBOX_REAL_BRIDGE_HELPER="$BRIDGE_HELPER"
-            BRIDGE_HELPER="$NSHELPER"
-        fi
-    fi
-
     EXTRA_ARGS="$EXTRA_ARGS \
-        -netdev bridge,id=net_sandbox,br=$SANDBOX_DOCKER_BRIDGE${BRIDGE_HELPER:+,helper=$BRIDGE_HELPER} \
+        -netdev bridge,id=net_sandbox,br=$SANDBOX_DOCKER_BRIDGE \
         -device virtio-net-pci,netdev=net_sandbox,mac=$SANDBOX_VM_MAC,bus=pcie-hotplug-port"
 fi
 ```
 
-Three changes vs. today:
+Three properties of the new shape:
 
-1. `BRIDGE_HELPER` defaults to empty, not to `/usr/lib/qemu/qemu-bridge-helper`.
-2. The nsenter wrapper resolves the real helper via `command -v` inside
-   the rootlesskit namespace, falling back to `/usr/lib/qemu/qemu-bridge-helper`
-   as the absolute-last-resort default (still hardcoded for graceful
-   degradation; in practice the `command -v` path will hit).
-3. The `-netdev bridge,...` line emits `helper=…` only when
-   `BRIDGE_HELPER` is non-empty (`${BRIDGE_HELPER:+,helper=$BRIDGE_HELPER}`
-   shell substitution).
+1. No `BRIDGE_HELPER` variable. The `SANDBOX_BRIDGE_HELPER` env override
+   is retired with it.
+2. No nsenter wrapper, no `bridge-helper-ns` file generation, no
+   rootlesskit pid lookup. The wrapper script is roughly 20 lines
+   shorter.
+3. The `-netdev bridge,...` line emits no `helper=` parameter; QEMU
+   uses its compile-time default.
 
 ### 9.4 · Implications for Spec 4
 
-Forward note. Spec 4's install script still needs to probe the helper's
-path to setuid it (the helper is shipped setuid-root by `qemu-system`
-packages on most distros, but rootless-Docker setups sometimes need a
-copy of the helper with adjusted owner/mode). The probed path may be
-recorded in Spec 4's install state file as a *fact about what install
-did* — useful for `sandbox update` to undo the setuid if needed. **The
-daemon never reads that file.** It's not daemon config; it's install
-metadata.
-
-State this clearly so Spec 4's author does not invent a `helper_path`
-config field that the daemon reads at startup. The daemon stays
-distro-agnostic about helper resolution.
+Forward note. Spec 4's install script may still want to *probe* the
+helper's path to setuid it (the helper is shipped setuid-root by
+`qemu-system` packages on most distros, but custom rebuilds or
+selinux-stripped variants sometimes need the bit re-applied). The
+probed path may be recorded in Spec 4's install state file as a fact
+about what install did — useful for `sandbox uninstall` to undo. **The
+daemon never reads that file.** It is not daemon config; it is install
+metadata. The daemon stays distro-agnostic about helper resolution.
 
 ## 10 · Daemon-side wiring of operator identity
 
@@ -1143,16 +1217,18 @@ Hermetic; per-check happy-path + failing-condition table.
 | `doctor_exits_1_on_any_failure` | one mock fails | — | exit code `1` |
 | `doctor_exits_2_on_internal_error` | inject a panic in the check runner | — | exit code `2` |
 
-### 11.5 · Unit tests — `helper=` regression
+### 11.5 · Unit tests — `helper=` and rootless removal regression
 
-Hermetic; static-asserts on `QEMU_WRAPPER_SCRIPT`.
+Hermetic; static-asserts on `QEMU_WRAPPER_SCRIPT` and grep-based lints.
 
 | Test name | Behavior |
 |---|---|
-| `qemu_wrapper_omits_helper_path_when_unset` | Assert that the wrapper's `BRIDGE_HELPER` default initializer is `""` (no literal `/usr/lib/qemu/qemu-bridge-helper` outside the nsenter fallback). |
-| `qemu_wrapper_emits_helper_arg_only_when_helper_set` | Assert the literal substring `${BRIDGE_HELPER:+,helper=$BRIDGE_HELPER}` is present. |
-| `qemu_wrapper_still_references_qemu_bridge_helper_in_nsenter_fallback` | Asserts the in-script nsenter fallback string `qemu-bridge-helper` is still there (so the assertion at `lima.rs:2806` keeps passing). |
-| `grep_test_no_hardcoded_helper_path_outside_comments` | CI-level grep test (in `tests/lints/`): assert that `/usr/lib/qemu/qemu-bridge-helper` appears in source only inside `#` comments, doc-comments, or the nsenter fallback line. Trivial-but-pays-back: blocks a future contributor from re-introducing the hardcoded path. |
+| `qemu_wrapper_emits_netdev_without_helper_param` | Assert that `QEMU_WRAPPER_SCRIPT` contains the substring `-netdev bridge,id=net_sandbox,br=$SANDBOX_DOCKER_BRIDGE \` (with no `,helper=` suffix). Anchor: the literal token `,helper=` does **not** appear in the netdev line. |
+| `qemu_wrapper_has_no_bridge_helper_variable` | Assert that the literal token `BRIDGE_HELPER=` does **not** appear anywhere in `QEMU_WRAPPER_SCRIPT`. Pins the deletion of the shell variable. |
+| `qemu_wrapper_has_no_rootlesskit_artefacts` | Assert that `QEMU_WRAPPER_SCRIPT` does **not** contain `dockerd-rootless`, `rootlesskit`, `nsenter`, `RLKIT_PID`, `NSHELPER`, `bridge-helper-ns`, or `SANDBOX_REAL_BRIDGE_HELPER`. Pins the rootless-Docker code path's removal. |
+| `qemu_wrapper_still_references_qemu_bridge_helper_in_comments` | Asserts the literal string `qemu-bridge-helper` is still present (surviving in comments + the `PR_SET_NO_NEW_PRIVS` block) so the assertion at `lima.rs:2806` keeps passing. |
+| `grep_test_no_hardcoded_helper_path_in_source` | CI-level grep test (in `tests/lints/`): assert that `/usr/lib/qemu/qemu-bridge-helper` does not appear in `sandboxd/sandbox-core/src/`, `sandboxd/sandboxd/src/`, or `sandboxd/sandbox-cli/src/`. The Makefile's `QEMU_BRIDGE_HELPER_PATH` for dev-mode setuid is explicitly out of scope (separate file class). Trivial-but-pays-back: blocks a future contributor from re-introducing the hardcoded path. |
+| `grep_test_no_sandbox_bridge_helper_env_var` | CI-level grep: assert `SANDBOX_BRIDGE_HELPER` does not appear in source (only-callers were the rootless wrapper; with that gone, the env override is retired). |
 
 ### 11.6 · Integration tests — `integration_*` profile
 
@@ -1165,9 +1241,13 @@ These require real out-of-process state.
 | `integration_version_endpoint_real_socket` | Real daemon, real socket; `curl --unix-socket /run/sandbox/sandboxd.sock http://localhost/version`; assert body shape and `Content-Type`. |
 | `integration_cli_refuses_on_version_skew` | Daemon built at version `0.1.0-test-a`; CLI built at `0.1.0-test-b`; CLI invocation refuses with the documented error; exit code `2`. (Two distinct cargo builds with `[patch]`-overridden version in a test workspace.) |
 | `integration_gateway_image_pinned_to_daemon_version` | Build the gateway image at the daemon's `CARGO_PKG_VERSION`; start a session; inspect the running gateway container; assert its image tag matches `sandbox-gateway:<daemon-version>`, not `:latest`. |
-| `integration_doctor_reports_missing_image` | Daemon started without first running `make gateway-image`; `sandbox doctor` reports C7 (gateway image present) as failed with the documented hint. |
-| `integration_doctor_full_pass_against_running_daemon` | Standard happy-path harness; `sandbox doctor --verbose` exits 0 and reports `11 checks passed, 0 failed, 0 skipped`. |
+| `integration_doctor_hard_fails_on_missing_gateway_image` | Daemon started without first running `make gateway-image`; `sandbox doctor` reports C7 (gateway image present) as `✗ FAILED` with the documented hint; doctor's exit code is `1`. |
+| `integration_doctor_informational_on_missing_lite_image` | Daemon started without first running `make lite-image`; `sandbox doctor` reports C8 (lite image present) as `~ SKIPPED` with hint about first-session build or `sandbox rebuild-image --backend container`; doctor's exit code is `0` (informational does not fail). |
+| `integration_session_create_builds_lite_image_on_demand` | Daemon started without lite image present; `sandbox session create --lite` succeeds; assert the lite image now exists at `sandboxd-lite:<daemon-version>`. |
+| `integration_session_create_refused_on_missing_gateway_image` | Daemon started without gateway image; attempt `sandbox session create`; assert the response is a clear error referencing the missing gateway image and pointing at `sandbox update`. |
+| `integration_doctor_full_pass_against_running_daemon` | Standard happy-path harness with both images pre-built; `sandbox doctor --verbose` exits 0 and reports all checks passed. |
 | `integration_kvm_check_via_daemon_diagnostics` | Daemon configured without `kvm` group membership; doctor's C6 reports the failure with the documented hint (the daemon-side `/diagnostics` route returns the diagnostic). |
+| `integration_qemu_wrapper_no_helper_param_in_netdev` | Trigger Lima VM start; capture the QEMU argv emitted by the wrapper; assert the `-netdev bridge,...` argument has no `helper=` segment. Pins the runtime behavior of the post-removal wrapper. |
 
 ### 11.7 · Notes on the systemd integration harness
 
@@ -1359,17 +1439,28 @@ to add a `--log-file` and ship logs through a different path. No
 doctor check needed — `journalctl -u sandboxd` is the canonical
 diagnostic and works out of the box.
 
-### 13.5 · The `helper=` rootless-fallback robustness
+### 13.5 · QEMU's helper-path resolution depends on distro packaging
 
-The new nsenter wrapper resolves the helper via
-`command -v qemu-bridge-helper` inside the rootlesskit namespace,
-falling back to `/usr/lib/qemu/qemu-bridge-helper` if not found. The
-fallback is hardcoded for graceful degradation on hosts where the
-rootlesskit namespace has a minimal `PATH`. The "ideal" solution
-(probe both `/usr/lib/qemu/` and `/usr/libexec/`) adds complexity for
-a case (rootless-Docker on RHEL/Fedora) that is rare in practice. The
-spec accepts the residual hardcoding inside the nsenter fallback
-because it's the safety-net path, not the primary path.
+After § 9's removal, the QEMU wrapper emits `-netdev bridge,...`
+without `helper=<path>`. QEMU resolves the bridge helper via its
+compile-time `libexecdir` default — typically
+`/usr/lib/qemu/qemu-bridge-helper` on Debian/Ubuntu and
+`/usr/libexec/qemu-bridge-helper` on RHEL/Fedora.
+
+This delegation works as long as the host's `qemu-system` package
+ships the bridge helper at the path QEMU was compiled to look for.
+That is the standard packaging contract; we have not found a distro
+that violates it. If a host arrives with a custom-built QEMU whose
+`libexecdir` disagrees with where the helper actually sits, the Lima
+backend will fail at session-start with a clear QEMU error
+(`qemu-bridge-helper not found`) — the operator can either reinstall
+the matching `qemu-system-common` package or point QEMU at the helper
+via `/etc/qemu/bridge.conf`. Sandboxd does not try to paper over a
+broken QEMU install.
+
+There is **no** `SANDBOX_BRIDGE_HELPER` env override anymore (§ 9.2 H4).
+The test harness paths that previously relied on it have no remaining
+callers — verified via the grep test in § 11.5.
 
 ### 13.6 · Doctor's parallel-check ordering
 
@@ -1420,6 +1511,30 @@ The following are **not** in Spec 3:
   daemon writes through journald; journald's own retention applies.
 - **A `sandbox-admin` group or admin-override API surface** — Spec 2 § 2.6
   defers this; Spec 3 does not introduce it.
+- **Rootless-Docker support.** Sandboxd does not support rootless
+  Docker, by design. The `RootlessDockerRefused` error
+  (`sandbox-core/src/error.rs:43-73`) actively refuses container-backend
+  session creation on hosts where `docker info` reports rootless mode;
+  `sandbox create --force-rootless-docker` is the explicit
+  per-invocation escape hatch for operators who accept the
+  consequences. Spec 3 *additionally* removes the rootless code path
+  that previously generated an nsenter wrapper around
+  `qemu-bridge-helper` for Lima networking (§ 9.2). Future contributors:
+  do not re-introduce rootless-aware code; the supported envelope is
+  rootful Docker only.
+- **Automatic periodic rebuild of the lite image.** Deferred during
+  the spec-arc brainstorm; tracked as GitHub issue
+  [Koriit/sandboxd#7](https://github.com/Koriit/sandboxd/issues/7).
+  The `/rebuild-image` endpoint (`sandboxd/src/main.rs:5252+`) and
+  `sandbox rebuild-image --backend container` CLI subcommand
+  (`sandbox-cli/src/main.rs:349`) are present for operator-driven
+  rebuilds; operators can wire them to a systemd timer or cron
+  themselves until the daemon-internal periodic rebuild lands.
+- **Daemon rebuild of the gateway image.** The `sandbox rebuild-image`
+  endpoint supports `--backend lima` and `--backend container`; there
+  is no `--backend gateway` variant and Spec 3 does not introduce one.
+  Gateway image refresh is `sandbox update` territory (Spec 5) since
+  the image is shipped pre-built per release (§ 8.2).
 
 ## 15 · Implementation notes (light)
 
@@ -1467,10 +1582,19 @@ new constant introduced.
 | `sandboxd/sandboxd/src/main.rs` | Edit: `/version` route + handler; `/diagnostics` route + handler (KVM access, image presence, guest-version drift); `ensure_base_dir_layout` function + call site |
 | `sandboxd/sandbox-core/src/store.rs` | Edit: chmod `sessions.db` to `0600` after `Connection::open` |
 | `sandboxd/sandbox-core/src/gateway.rs` | Edit: `GATEWAY_IMAGE_REPOSITORY` + `gateway_image_tag_for_version`; gateway-run call site uses version-pinned tag |
-| `sandboxd/sandbox-core/src/lima.rs` | Edit: `QEMU_WRAPPER_SCRIPT` body — drop hardcoded `/usr/lib/qemu/qemu-bridge-helper` default; emit `helper=…` only when set; nsenter fallback uses `command -v` |
+| `sandboxd/sandbox-core/src/lima.rs` | Edit: `QEMU_WRAPPER_SCRIPT` body — delete the entire rootless-Docker branch (lima.rs:156-218); drop the `BRIDGE_HELPER` variable; emit `-netdev bridge,...` with no `helper=` parameter |
 | `Makefile` | Edit: `gateway-image` target tags with `$(GATEWAY_VERSION)` (mirrors existing `lite-image` shape) |
 | `sandboxd/contrib/systemd/sandboxd.service` | New: canonical copy of the unit file (Spec 4 installs it) |
 | `sandboxd/sandbox-cli/tests/` | New tests per § 11.2, 11.3, 11.4 |
 | `sandboxd/sandboxd/tests/` | New tests per § 11.1, 11.5, 11.6 |
-| `tests/lints/no_hardcoded_helper_path.rs` (or similar) | New CI lint per § 11.5 |
+| `tests/lints/no_hardcoded_helper_path.rs` (or similar) | New CI lint per § 11.5 (covers `/usr/lib/qemu/qemu-bridge-helper` and `SANDBOX_BRIDGE_HELPER` greps) |
 | `docs/start/installation.md` | Edit: brief note about the system-service install model + `sandbox doctor` for diagnostics; the detailed install docs are Spec 4 territory |
+
+**Files explicitly *not* touched** (called out to forestall confusion):
+
+| Path | Reason untouched |
+|---|---|
+| `sandboxd/sandbox-core/src/error.rs` (the `RootlessDockerRefused` variant) | The rootless *refusal* path stays. § 9.2 R1-R5 enumerate the artefacts that enforce the no-rootless policy at the API layer; this revision removes only the QEMU-networking enabler (H4-H8). |
+| `sandboxd/sandbox-core/src/backend/container_rootless_probe.rs` | Same — this is the probe that triggers `RootlessDockerRefused`. |
+| `sandboxd/sandbox-core/src/session.rs` (`SessionConfig::rootless_docker`) | On-disk audit record of probe outcome. Forward-compat (`#[serde(default)]`) means leaving it intact is safe. |
+| `sandboxd/sandbox-cli/src/main.rs` (`--force-rootless-docker` arg) | Per-invocation operator escape hatch; unchanged. |
