@@ -151,47 +151,78 @@ no automatic cleanup occurs. The substrate state is orphaned, and the
 orphan list is unrecoverable from the daemon side (the DB row was the
 only catalogue tying a session ID to a substrate name).
 
-**Spec 2's response is a single `warn!` log emitted by `SessionStore::new`
-when refinery reports that V006 was applied in this run.** The log is
-emitted exactly once per daemon process (refinery's migration history
-table records the apply event; the log fires only when the V006 row is
-freshly inserted, not on subsequent boots where V006 is already in the
-history). The log carries a fixed message body so test assertions can
-match it:
+**Spec 2's response: a post-migration orphan scan that logs each found
+orphan at `warn!`, emitted once by `SessionStore::new` when refinery
+reports that V006 was applied in this run.** The scan and log fire
+exactly once per daemon process; refinery's migration history table
+records the apply event, so subsequent boots are silent.
 
-```
-WARN refinery applied V006 — pre-V006 sessions were deleted; the
-following substrate resources may now be orphaned:
-  - per-session directories under {base_dir}/sessions/
-  - Lima VMs named `sandbox-*`        (host: `limactl list`)
-  - Docker containers `sandbox-*`     (host: `docker ps -a --filter name=sandbox-`)
-  - Docker volumes `sandbox-home-*`   (host: `docker volume ls --filter name=sandbox-home-`)
-  - Docker networks `sandbox-net-*`   (host: `docker network ls --filter name=sandbox-net-`)
-  - Gateway containers `sandbox-gw-*` (host: `docker ps -a --filter name=sandbox-gw-`)
-Run `sandbox doctor` after upgrade to see the catalogue of orphans
-detected on this host. Manual cleanup recipe lives in the upgrade
-notes for the daemon version that introduced V006.
-```
+The scan procedure runs **after** `SessionStore::new` returns but **before**
+`AppState` is built — it operates only with the `base_dir` path and the
+ability to shell out to `limactl` and `docker`. Its steps:
 
-The log is `warn!` rather than `error!` because the daemon is fully
-operational — the orphans are operational debt, not a correctness
-failure. The cross-reference to `sandbox doctor` is a **forward
-pointer to Spec 3**, which is adding check C13 (orphan substrate
-detection) in parallel. **Spec 2 does not implement the doctor side
-and does not add a Rust-side sweep here.** The reasoning:
+1. **Lima VMs** — run `limactl list --output json` and log each entry
+   whose `name` matches `sandbox-*`:
+   ```
+   WARN orphaned Lima VM after V006: sandbox-0123456789ab (was stopped)
+   ```
+2. **Docker containers** — run `docker ps -a --filter name=sandbox- --format json`
+   and log each container name matching `sandbox-<id>` or `sandbox-gw-<id>`:
+   ```
+   WARN orphaned Docker container after V006: sandbox-0123456789ab (status: exited)
+   WARN orphaned Docker container after V006: sandbox-gw-0123456789ab (status: exited)
+   ```
+3. **Docker volumes** — run `docker volume ls --filter name=sandbox-home- --format json`
+   and log each:
+   ```
+   WARN orphaned Docker volume after V006: sandbox-home-0123456789ab
+   ```
+4. **Docker networks** — run `docker network ls --filter name=sandbox-net- --format json`
+   and log each:
+   ```
+   WARN orphaned Docker network after V006: sandbox-net-0123456789ab
+   ```
+5. **Filesystem session directories** — list `{base_dir}/sessions/` and log
+   each directory (these are safe to enumerate without Docker/Lima):
+   ```
+   WARN orphaned session directory after V006: {base_dir}/sessions/0123456789ab
+   ```
+6. After the per-orphan lines, emit one summary `warn!`:
+   ```
+   WARN V006 orphan scan complete — N orphan(s) logged above.
+        Run `sandbox doctor` (Spec 3) for a reconciliation report.
+        Do NOT auto-delete; review each orphan before cleanup.
+   ```
 
-- A Rust-side sweep at migration time runs inside the daemon's
-  startup path, before `AppState` is built; the runtime registry
-  (`runtime_for(&state, ...)`), Docker connection, and Lima manager are
-  not yet available. Shelling out to `docker` and `limactl` from
-  refinery's migration callback is the wrong place for runtime work.
-- A migration-time sweep would also be hard to test in isolation
-  (refinery's migration runner is purely SQL-shaped today; adding a
-  post-migration Rust hook would force a new test fixture).
-- The diagnostic surface is Spec 3's responsibility (`sandbox
-  doctor`); funneling the orphan check there gives operators one
-  place to look. The `warn!` log is the breadcrumb that tells them
-  to look.
+If `limactl` or `docker` is not installed or exits non-zero, log a single
+`warn!` that the tool is unavailable and skip that substrate (the daemon
+is not required to have both tools at startup — a container-only install
+may have no `limactl`).
+
+The logs are `warn!` rather than `error!` because the daemon is fully
+operational — the orphans are operational debt, not a correctness failure.
+Spec 2 does **not** auto-delete; the operator decides. The scan produces
+a visible record so the orphan state is no longer invisible.
+
+**Why a scan here and not in `sandbox doctor`?** The doctor check (Spec 3
+C13) will also enumerate orphans — but doctor runs on demand, not at
+startup. The V006 startup scan fires exactly once, at the moment the
+operator is most likely to notice ("the daemon just started after an
+upgrade; I see these warnings"). The doctor check then serves as a
+persistent cross-check. The two are complementary, not redundant. Spec 2
+does not own C13; it provides the startup-time signal that tells operators
+to run doctor.
+
+**Why not a Rust-side sweep (auto-delete)?**
+
+- Auto-deleting VMs and containers at daemon startup is a destructive
+  action in an unattended path. If the V006 migration fires during an
+  unrelated daemon restart (e.g., `systemctl restart sandboxd`), the
+  operator may not be watching and would not approve the deletion.
+- The per-session CA material under `{base_dir}/sessions/<id>/` may be
+  referenced by long-running processes outside the daemon's control.
+  Silent deletion would break them.
+- Spec 3 owns the diagnostic surface; Spec 2 contributes the breadcrumb.
 
 The dev-mode walkthrough at § 6.1 expands on the operator impact.
 
@@ -996,13 +1027,16 @@ to the regression and provides the test coverage below so the failure
 mode is observable rather than silently mysterious.
 
 The matching integration test
-(`integration_daemon_refuses_unresolvable_peer_cred`) is specified in
-§ 7.5; it asserts the daemon closes the connection cleanly without
-crashing when the connecting uid has no passwd entry. The same property
-on the route-helper side is covered by Spec 1 § 8.4
-(`integration_route_helper_denies_when_username_unresolvable` covers
-the `for_user` arg; § 7.5 here covers the **caller-uid** path that
-Spec 1's test does not exercise).
+(`integration_owner_isolation_uid_without_passwd_closes_connection`) is
+specified in § 7.5; it asserts the daemon closes the connection cleanly
+without crashing when the connecting uid has no passwd entry, and that
+no session data is leaked. The same property on the route-helper side is
+covered by Spec 1 § 8.4 (`integration_route_helper_uid_without_passwd_denies_cleanly`
+— the route-helper analog Spec 1 will add in a parallel revision).
+§ 7.5 here covers the **caller-uid** path that Spec 1's existing
+`integration_route_helper_denies_when_username_unresolvable` does not
+exercise (that test covers the `--for-user` arg, not the caller's own
+uid).
 
 ## 5 · Wire snapshot — before / after
 
@@ -1139,10 +1173,13 @@ each. The reconciler (`main.rs:2465-2487`) then iterates the now-empty
 session list on every `list_sessions` call and never reaches the runtime
 state, so the daemon performs no automatic substrate cleanup.
 
-`SessionStore::new` emits the `warn!` log specified in § 2.1.1
+`SessionStore::new` runs the orphan scan specified in § 2.1.1
 exactly once on the boot where V006 applies. Developers running
-`make setup-dev-env` see the log on first daemon restart after pulling
-in the V006-bearing daemon binary.
+`make setup-dev-env` see one `warn!` line per found orphan, followed
+by the summary line, on the first daemon restart after pulling in
+the V006-bearing daemon binary. The scan enumerates actual existing
+resources — orphans that have already been manually cleaned up do not
+produce a log line.
 
 The orphan footprint, by substrate:
 
@@ -1155,19 +1192,15 @@ The orphan footprint, by substrate:
 | Docker networks                             | `sandbox-net-<id>`             | `docker network rm sandbox-net-<id>` per network.                                                              |
 | Gateway containers                          | `sandbox-gw-<id>`              | `docker rm -f sandbox-gw-<id>` per gateway.                                                                    |
 
-For developers, the realistic cleanup path is to wait for **Spec 3's
-`sandbox doctor` check C13** (in-design at audit time, landing in
-parallel) to enumerate the orphans, then run the substrate `rm` commands
-or the doctor's optional `--fix` flag if Spec 3 chooses to expose one.
-Pre-Spec-3, the manual `docker ps -a --filter name=sandbox-` and
-`limactl list` walk surface the orphans by hand.
+For developers, the startup scan (§ 2.1.1) surfaces the orphans
+immediately — each found orphan is logged with its ID and type. The
+dev's cleanup path is to run the commands in the table above against
+each logged ID. Spec 3's `sandbox doctor` check C13 provides a
+persistent re-check surface after the one-time startup scan; pre-Spec-3,
+the startup log is the primary discovery mechanism.
 
-The spec considered three alternatives, all rejected:
+The spec considered two alternatives to the scan-and-log approach, both rejected:
 
-- **Add a Rust-side sweep at migration time** — refinery's `.sql`
-  migrations are intentionally code-free, and the runtime / Docker /
-  Lima clients are not constructed yet when refinery runs (the daemon's
-  `AppState` builds them after `SessionStore::new` returns).
 - **Defer V006 itself behind an operator-driven `sandbox update
   --confirm`** — V006 cannot be deferred; the schema bump is a daemon
   startup precondition (every subsequent `INSERT INTO sessions` writes
@@ -1177,6 +1210,13 @@ The spec considered three alternatives, all rejected:
   reconciler clean them up** — the marker leaks an unresolvable owner
   identity into the filter and forces a special-case carve-out (§ 2.1
   rejected this for the same reason).
+
+A **Rust-side auto-delete sweep** was also considered and rejected: the
+orphan scan in § 2.1.1 produces visibility without auto-destruction (see
+the reasoning there). The scan-and-log approach implemented here is a
+middle ground — the daemon actively discovers the orphans rather than just
+naming the patterns, but stops short of deleting them without operator
+confirmation.
 
 End-user installs (Spec 4) are greenfield: the V006-bearing daemon is
 the first daemon they run, `sessions.db` does not exist, and no
@@ -1309,7 +1349,7 @@ const ALLOW_LIST: &[&str] = &[
 
 | Test name                                                  | Behavior |
 |------------------------------------------------------------|----------|
-| `update_state_reconcile_callers_match_allow_list`          | Walk the workspace tree, collect every file:function that mentions `update_state_reconcile`, compare against `ALLOW_LIST`. Fails if any new caller is added without updating the list; also fails if a listed caller is removed (catches drift in both directions). |
+| `test_update_state_reconcile_caller_whitelist`             | Walk the workspace tree, collect every file:function that mentions `update_state_reconcile`, compare against `ALLOW_LIST`. Fails if any new caller is added without updating the list; also fails if a listed caller is removed (catches drift in both directions). |
 | `update_state_reconcile_not_called_from_request_handlers`  | Sub-check: assert no caller location is inside an `async fn` annotated with axum extractors (e.g., a function whose signature includes `State<Arc<AppState>>` or `Extension<OperatorIdentity>`). Belt-and-suspenders against the "developer adds a new handler that calls `_reconcile`" foot-gun. |
 
 The walk uses simple line-based string matching (not a full Rust parser).
@@ -1334,27 +1374,37 @@ constants, builds a `VersionResult`), so a direct call is sufficient:
 ### 7.5 · Integration tests
 
 Under `integration_*` prefix, selected by the `integration` nextest profile.
-The tests run **single-uid** (the test-runner's own uid); the alice/bob
-partition is verified at the storage layer by § 7.2's unit tests, not by
-faking peer-cred. See § 9.2 for why Spec 2 picks this option.
+Most tests run **single-uid** (the test-runner's own uid), using the
+synthetic-foreign-owner technique to verify the 404 shape without faking
+peer-cred. Multi-uid isolation tests that require two real distinct uids
+(`integration_session_isolation_404_on_foreign_id`) run inside the **Lima
+E2E VM** via the `peercred-connector` helper; see § 9.2 for the harness
+design. The unit tests in § 7.2 cover the alice-vs-bob storage-boundary
+filter directly with synthetic names.
 
-| Test name                                                              | Backend     | Behavior |
-|------------------------------------------------------------------------|-------------|----------|
-| `integration_create_stamps_owner_from_peercred`                        | container   | One create over the real Unix socket; assert the persisted row's `owner_username` matches `whoami` (the test-runner's username resolved via `getpwuid_r`). Verifies the `SO_PEERCRED` → handler-extractor → store-stamp threading. |
-| `integration_synthetic_foreign_owner_returns_404`                      | container   | Open the `SessionStore` directly and insert a row with `owner_username = "synthetic-other"` via the create-session-with-backend method (test fixture passes the synthetic name). Then issue `GET /sessions/<id>` over the daemon socket as the real test runner. Expect `404`. Repeats the request against every session-id endpoint (H3, H5, H6, H7, H8, H9, H10, H11, H12) and asserts each returns `404`. Verifies that the storage-boundary filter rejects the synthetic-owner row when reached via the HTTP layer threaded with the real peer-cred. |
-| `integration_list_returns_only_callers_sessions`                       | container   | Same fixture: insert one synthetic-owner row and one runner-owned row. `GET /sessions` over the socket returns one entry — the runner-owned one. |
-| `integration_daemon_refuses_unresolvable_peer_cred`                    | container   | Required by § 4.1. Run the daemon-side acceptor against a connection whose uid does not resolve. Implementation note: the test creates a synthetic uid in a fixture chroot whose `/etc/passwd` lacks that uid, opens a Unix socket connection from inside the chroot, and asserts the daemon's acceptor refuses the connection cleanly (`peer_cred` succeeds, `User::from_uid` returns `Ok(None)`, the daemon closes the stream and continues accepting). The daemon process must not crash; subsequent connections from a valid uid must succeed. If the chroot fixture overshoots the test's value, the implementer may downgrade to a unit test against `OperatorIdentity::from_peer_cred` with a synthetic non-resolvable uid — flagged in § 9.2. |
+| Test name                                                              | Backend / Harness | Behavior |
+|------------------------------------------------------------------------|-------------------|----------|
+| `integration_create_stamps_owner_from_peercred`                        | container / host  | One create over the real Unix socket; assert the persisted row's `owner_username` matches `whoami` (the test-runner's username resolved via `getpwuid_r`). Verifies the `SO_PEERCRED` → handler-extractor → store-stamp threading. |
+| `integration_synthetic_foreign_owner_returns_404`                      | container / host  | Open the `SessionStore` directly and insert a row with `owner_username = "synthetic-other"` via the create-session-with-backend method (test fixture passes the synthetic name). Then issue `GET /sessions/<id>` over the daemon socket as the real test runner. Expect `404`. Repeats the request against every session-id endpoint (H3, H5, H6, H7, H8, H9, H10, H11, H12) and asserts each returns `404`. Verifies that the storage-boundary filter rejects the synthetic-owner row when reached via the HTTP layer threaded with the real peer-cred. |
+| `integration_list_returns_only_callers_sessions`                       | container / host  | Same fixture: insert one synthetic-owner row and one runner-owned row. `GET /sessions` over the socket returns one entry — the runner-owned one. |
+| `integration_session_isolation_404_on_foreign_id`                      | container / **Lima E2E VM** | Requires two real uids (§ 9.2). The test operator (`agent`) creates a session; `peercred-connector --uid=$(id -u sandbox)` issues `GET /sessions/<id>` as the `sandbox` daemon user; assert `404`. Covers the genuine multi-uid partition end-to-end through the daemon's HTTP layer. Runs in the Lima E2E VM harness (Spec 4 § 6) with the provisioned `peercred-connector` helper. |
+| `integration_owner_isolation_uid_without_passwd_closes_connection`     | container / **Lima E2E VM** | Required by § 4.1. Inside the Lima VM, temporarily remove the test operator's `/etc/passwd` entry, attempt a Unix socket connection, assert the daemon closes the stream cleanly and does not crash, then restore the entry. Subsequent connections from a valid uid succeed. No session data is leaked. Cross-reference: Spec 1 will add `integration_route_helper_uid_without_passwd_denies_cleanly` as the route-helper analog. |
 | `integration_guest_refresh_container_backend`                          | container   | Seed a session row with `guest_protocol_version = 0` and an old `sandbox-guest` binary baked into the container; call `start_session`; assert (a) the refresh ran (binary mtime in the container changed; binary version inside the container reports the new value via the new `GuestRequest::Version` query), (b) the DB columns updated, (c) the session reached `Running`. |
 | `integration_guest_refresh_lima_backend`                               | lima        | Same as above. Marked `#[cfg_attr(not(has_kvm), ignore)]` or equivalent so CI runners without `/dev/kvm` skip it (existing convention for Lima integration tests). |
 | `integration_guest_refresh_refuses_when_unsalvageable`                 | container   | Seed a session row with `guest_protocol_version = 0` AND patch `can_refresh_in_place` (via a test-only `set_can_refresh_in_place_override` hook on the daemon) to return `false`; call `start_session`; assert the response is `409 Conflict` with body substring `refresh is not viable for this session` and `recreate the session`. |
 | `integration_guest_version_columns_persist_through_create_and_start`   | container   | Standard happy-path session create; read the row back; assert all three new columns hold non-default values and `guest_binary_version` matches `env!("CARGO_PKG_VERSION")` of the `sandbox-guest` crate. |
 | `integration_guest_version_query_returns_compiled_constants`           | container   | Standard happy-path session create + start; issue `GuestRequest::Version` through the `GuestConnector` against the running guest; assert the reply is `VersionResult` and that `protocol_version == DAEMON_GUEST_PROTO_VERSION` and `binary_version == SANDBOX_GUEST_VERSION`. Confirms the wire-level primitive works end-to-end against a real running session. |
-| `integration_v006_emits_orphan_warning_log`                            | container   | Seed a V005-shape `sessions.db` with one row; open it through `SessionStore::new`; capture `tracing` events; assert the `warn!` from § 2.1.1 fired exactly once with the fixed-message substring `pre-V006 sessions were deleted`. Re-open on the next iteration and assert the log does **not** fire (refinery's migration history table prevents the re-fire). |
+| `integration_v006_orphan_scan_logs_each_found_orphan`                  | container   | Seed a V005-shape `sessions.db` with one session row; also create a matching filesystem directory at `{base_dir}/sessions/<id>/` and a Docker container named `sandbox-<id>` in a stopped state. Open via `SessionStore::new`; capture `tracing` events; assert: (a) a `warn!` line appears for the orphaned directory, (b) a `warn!` line appears for the orphaned container, (c) the summary `warn!` fires with count 2, (d) no `warn!` fires for the session directory or container after a second `SessionStore::new` open (scan is single-fire per migration; also the orphans are present again but V006 is already in refinery's history table so no re-scan). Variant: re-run with no orphaned substrate — assert only the summary fires with count 0. |
 
-The tests above are single-uid by design (see § 9.2). The synthetic-
-foreign-owner approach gives integration-layer coverage of the `404` shape
-without the multi-uid harness cost; the unit tests in § 7.2 cover the
-genuine alice-vs-bob partition at the storage layer with synthetic names.
+Host-level tests (`integration_create_stamps_owner_from_peercred`,
+`integration_synthetic_foreign_owner_returns_404`,
+`integration_list_returns_only_callers_sessions`) are single-uid and run
+under `make test-integration`. The multi-uid tests
+(`integration_session_isolation_404_on_foreign_id`,
+`integration_owner_isolation_uid_without_passwd_closes_connection`) run
+inside the Lima E2E VM harness (Spec 4 § 6); see § 9.2 for the full
+harness design. Unit tests in § 7.2 cover the storage-boundary filter
+directly with synthetic names — those are the core property tests.
 
 ### 7.6 · `sandbox describe` / `sandbox inspect` output
 
@@ -1449,75 +1499,84 @@ disagrees with the DB column. The `Version` query is what makes that
 detectable; how that surfaces to operators is Spec 3's design surface.
 Spec 2 only owns the primitive.
 
-### 9.2 · Faking `SO_PEERCRED` in integration tests — Spec 2 picks single-uid
+### 9.2 · Multi-uid test harness for `SO_PEERCRED` — Lima VM path
 
-`SO_PEERCRED` is kernel-set on connect; you can't lie about it from
-userspace without dropping privileges first. Multi-uid integration tests
-either run under sudo and `setuid` between connects, or spawn setuid
-helper subprocesses owned by a second test user — both options bring
-real CI setup cost (a setuid helper to install with `chmod u+s`, a
-second uid to provision with `useradd`, root in the GitHub Actions
-runner to do both, and a corresponding tear-down to keep the workflow
-hermetic).
+`SO_PEERCRED` is kernel-set on connect; you cannot fake it from userspace
+without real privilege separation. Spec 2's isolation tests that require
+two distinct uids — the true end-to-end coverage of "alice cannot see
+bob's session through the daemon's HTTP layer" — **run inside the Lima
+E2E VM** as part of Spec 4's install E2E harness.
 
-**Spec 2 commits to option (b) — single-uid integration tests, paired
-with full storage-layer coverage of the filter.** The reasoning:
+**Why the Lima VM path?** The Lima VM already has multiple real OS users
+provisioned by Spec 3's install logic:
 
-- The storage-boundary filter (§ 2.4) is **where the safety property
-  lives**. Every `SessionStore` method gains `caller_username`, every
-  query gains the SQL `AND owner_username = ?`, and every method that
-  filters has a unit test in § 7.2 asserting alice-vs-bob isolation
-  against an in-memory store. That is the strongest possible test of
-  the filter itself — it directly exercises the SQL with synthetic
-  usernames passed as plain strings, no peer-cred involved.
-- The integration layer above it is responsible for the **threading**
-  of the caller identity from `SO_PEERCRED` into the `caller_username`
-  arg. That threading is a one-liner in each handler
-  (`Extension(operator): Extension<OperatorIdentity>` →
-  `store.get_session(&operator.name, ...)`). A single-uid integration
-  test against a real daemon validates that the threading runs and the
-  resolution succeeds; it cannot validate the per-caller partition
-  directly without a second uid.
-- The single-uid coverage gap is bounded: the only property the
-  single-uid integration cannot verify is "alice's HTTP request really
-  cannot reach bob's row through the daemon". The unit-level filter
-  test does verify it; the integration-layer test verifies the
-  threading is wired. A regression that bypasses both layers
-  simultaneously (filter wired correctly but handler forgets to pass
-  the operator name) is not the realistic failure mode — the typed
-  `caller_username: &str` parameter on `SessionStore` is mandatory and
-  the compiler catches the omission.
+- The **test operator** (the VM's primary user, typically `agent` at uid
+  1000) — the user who runs the E2E tests from inside the VM.
+- The **`sandbox` daemon user** (created by `install.sh` during test
+  setup, per Spec 3) — a distinct real uid on the same Linux kernel.
 
-The single-uid integration tests in § 7.5 therefore assert:
+These two uids give Spec 2's multi-uid tests both identities without
+provisioning anything extra. No `useradd` teardown is needed — the `sandbox`
+user is permanent for the test VM's lifetime.
 
-- The connecting uid's resolved username **is** stamped into the
-  persisted row (`owner_username`).
-- The daemon's response shape for foreign-id lookups is `404` (this is
-  tested by **synthesizing** a foreign-owner row directly through the
-  store with a fake `caller_username = "synthetic-other"`, then issuing
-  the HTTP request as the real test-runner uid; the foreign owner is
-  not the test runner, so the request returns 404).
-- The daemon closes the connection cleanly when the connecting uid has
-  no passwd entry (§ 7.5's `integration_daemon_refuses_unresolvable_peer_cred`,
-  required by § 4.1).
+**Provisioning the `peercred-connector` helper.** The Lima VM template
+for the install E2E tests (Spec 4 § 6) gains one setup step:
 
-**Forward note for Spec 4's CI infrastructure.** A future spec can
-upgrade the integration coverage to option (a) — the full multi-uid
-harness — when the CI setup appetite exists. The setup would entail:
+```sh
+install -o root -m 4755 \
+    "${SANDBOXD_TEST_HELPERS}/peercred-connector" \
+    /usr/local/lib/sandboxd-tests/peercred-connector
+```
 
-- A small setuid helper at `sandboxd/tests/helpers/peercred-connector`
-  that takes `--username=<name>` and an HTTP request body on stdin and
-  connects on behalf of the named uid.
-- A test fixture that runs `useradd ci-isolation-second` (and
-  `userdel` on tear-down) so the helper has a real second uid to drop
-  to.
-- A CI workflow setup step that runs the helper-install with
-  `chmod u+s` against the just-built test binary.
+This installs the helper setuid-root so it can `setuid(target_uid)` before
+connecting to the daemon socket. The helper's interface:
 
-The forward note exists so Spec 4's CI infrastructure design has a
-hook to attach to if the upgrade is requested. Spec 2 itself **does
-not require this**, and the test list in § 7.5 has been scoped to what
-single-uid coverage can verify.
+```
+peercred-connector --uid <target-uid> --request-file <file>
+```
+
+It drops to `target_uid`, opens a Unix socket connection to the daemon,
+writes the request from `<file>` on stdin, and prints the response on
+stdout. The helper exits non-zero on any error. It has no other behavior.
+
+**The two test uids.** All multi-uid E2E tests use:
+
+- `TARGET_UID_OPERATOR` — `$(id -u agent)` — the primary test operator
+- `TARGET_UID_DAEMON` — `$(id -u sandbox)` — the daemon service user
+
+These are resolved at test startup and passed to `peercred-connector --uid`.
+
+**Test coverage this enables.** Inside the Lima VM E2E harness:
+
+- `integration_session_isolation_404_on_foreign_id` — the operator
+  (`agent`) creates a session; the test uses `peercred-connector` with
+  `--uid=$(id -u sandbox)` to attempt `GET /sessions/<id>` as the
+  `sandbox` user; assert 404. Verifies end-to-end that a different uid's
+  HTTP request cannot see the operator's session.
+- `integration_owner_isolation_uid_without_passwd_closes_connection` —
+  inside the VM, temporarily remove the `agent` user's `/etc/passwd` entry
+  (edit `/etc/passwd` directly in the test fixture), attempt a connection,
+  assert the daemon closes cleanly and does not crash, then restore the
+  entry.
+
+**Host-based integration tests remain single-uid.** The host-level
+`integration_*` tests in `sandboxd/sandboxd/tests/` (run by
+`make test-integration`) cannot do multi-uid work on a typical developer
+machine. The synthetic-foreign-owner approach (§ 7.5's
+`integration_synthetic_foreign_owner_returns_404`) covers the filter
+threading at the integration layer without needing two peer-creds; the
+unit tests in § 7.2 cover the storage-boundary filter with synthetic
+names. The multi-uid end-to-end coverage is the Lima E2E harness's job.
+
+**Spec 4 inheritance.** Spec 4 § 6 (Lima-based E2E test harness) must add:
+
+1. `peercred-connector` binary to the test helper build target.
+2. The VM provisioning step above (`install -m 4755 ...`).
+3. A fixture variable `SANDBOXD_TEST_HELPERS` pointing to the built
+   helper directory.
+
+This is a forward note for Spec 4's CI infrastructure design — Spec 2
+specifies what is needed; Spec 4 owns the provisioning.
 
 ### 9.3 · Lima refresh's stop-then-start cycle
 
@@ -1592,7 +1651,7 @@ without daemon involvement.
 | Path | Kind of change |
 |---|---|
 | `sandboxd/sandbox-core/migrations/V006__add_owner_and_guest_versions.sql` | New migration — `DELETE FROM sessions;` + three `ALTER TABLE ADD COLUMN`. |
-| `sandboxd/sandbox-core/src/store.rs` | `SessionStore` methods gain `caller_username: &str` (§ 2.4 table). `row_to_session` reads the three new columns. New method `update_guest_versions(caller_username, id, proto, binary_version)`. `update_state_forced` is renamed to `update_state_reconcile` and **does not gain `caller_username`** (§ 2.4 "Reconciler hot path — pinned rule"). The doc-comment carries the allow-list-of-callers contract verbatim. After refinery applies migrations, emit the V006 orphan-warning `warn!` per § 2.1.1 when V006 was freshly applied in this run (refinery's history table is the seam — log fires only when V006's row is newly inserted). |
+| `sandboxd/sandbox-core/src/store.rs` | `SessionStore` methods gain `caller_username: &str` (§ 2.4 table). `row_to_session` reads the three new columns. New method `update_guest_versions(caller_username, id, proto, binary_version)`. `update_state_forced` is renamed to `update_state_reconcile` and **does not gain `caller_username`** (§ 2.4 "Reconciler hot path — pinned rule"). The doc-comment carries the allow-list-of-callers contract verbatim. After refinery applies migrations, run the V006 orphan scan per § 2.1.1: enumerate Lima VMs (`limactl list --output json`), Docker containers/volumes/networks (`docker ps -a / volume ls / network ls` with `sandbox-*` filters), and filesystem directories under `{base_dir}/sessions/`, log one `warn!` per found orphan, then the summary line. The scan fires only when V006 is freshly applied (refinery's history table is the seam). |
 | `sandboxd/sandbox-core/src/session.rs` | `Session` struct gains three new fields (`owner_username: String`, `guest_protocol_version: u32`, `guest_binary_version: String`); each `#[serde(default)]` for on-disk forward-compat per CLAUDE.md "On-disk compatibility". |
 | `sandboxd/sandbox-core/src/guest.rs` | New constants `DAEMON_GUEST_PROTO_VERSION: u32 = 1`, `SANDBOX_GUEST_VERSION: &str`. New `pub fn is_protocol_compatible(u32) -> bool`. New `pub fn can_refresh_in_place(u32) -> bool`. New `GuestRequest::Version` variant and `GuestResponse::VersionResult { protocol_version: u32, binary_version: String }` reply variant. |
 | `sandboxd/sandbox-guest/src/main.rs` | Handler for `GuestRequest::Version` returning `VersionResult` from the compile-time constants in `sandbox-core::guest`. Unit tests per § 7.4. |
@@ -1609,7 +1668,8 @@ without daemon involvement.
 | `sandboxd/sandbox-core/src/api.rs` | `SessionDto` decision (out of scope per § 8 — implementer's call on whether to surface the new columns on the wire). |
 | `sandboxd/sandbox-cli/src/main.rs` | No changes required for Spec 2. CLI flags and command structure are unchanged. |
 | `sandboxd/sandbox-core/tests/update_state_reconcile_allow_list.rs` | New: static-analysis test per § 7.3.1 (greps the workspace tree, asserts the caller set matches the pinned allow-list; runs under the default nextest profile). |
-| `sandboxd/sandboxd/tests/` | New file(s) for the integration tests in § 7.5 — `integration_session_isolation.rs` (synthetic-foreign-owner 404, `integration_daemon_refuses_unresolvable_peer_cred`, etc.), `integration_guest_refresh_container.rs`, `integration_guest_refresh_lima.rs`. |
+| `sandboxd/sandboxd/tests/` | New file(s) for the host-level integration tests in § 7.5 — `integration_session_isolation.rs` (synthetic-foreign-owner 404, orphan scan log assertion, etc.), `integration_guest_refresh_container.rs`, `integration_guest_refresh_lima.rs`. Multi-uid tests (`integration_session_isolation_404_on_foreign_id`, `integration_owner_isolation_uid_without_passwd_closes_connection`) are E2E tests in `tests/e2e/` using the `peercred-connector` helper inside the Lima VM (§ 9.2). |
+| `sandboxd/tests/helpers/peercred-connector/` | New: setuid helper binary for the Lima E2E harness (§ 9.2). Added to the test helper build target. Installed with `install -m 4755` inside the Lima VM template by Spec 4 § 6's provisioning step. |
 
 Coordination with Spec 1: if Spec 1 lands first, Spec 2 reuses its
 `OperatorIdentity` + custom acceptor verbatim. If Spec 2 lands first,
@@ -1625,7 +1685,7 @@ about the same set of UIDs.
 | Path | Touch type |
 |---|---|
 | `sandboxd/sandbox-core/migrations/V006__add_owner_and_guest_versions.sql` | New |
-| `sandboxd/sandbox-core/src/store.rs` | Edit: storage-boundary `caller_username` filter on every session-touching method; `update_guest_versions`; `update_state_forced` renamed to `update_state_reconcile` (no caller filter; doc-comment pins allow-list); V006-applied `warn!` log per § 2.1.1 |
+| `sandboxd/sandbox-core/src/store.rs` | Edit: storage-boundary `caller_username` filter on every session-touching method; `update_guest_versions`; `update_state_forced` renamed to `update_state_reconcile` (no caller filter; doc-comment pins allow-list); V006 orphan scan per § 2.1.1 (enumerate Lima VMs, Docker containers/volumes/networks, and `{base_dir}/sessions/` dirs; log one `warn!` per found orphan) |
 | `sandboxd/sandbox-core/src/session.rs` | Edit: three new fields on `Session`; `#[serde(default)]` for forward-compat |
 | `sandboxd/sandbox-core/src/guest.rs` | Edit: constants + compatibility predicates + `GuestRequest::Version` / `GuestResponse::VersionResult` variants |
 | `sandboxd/sandbox-guest/src/main.rs` | Edit: handler for `GuestRequest::Version`; unit tests for the handler and end-to-end loopback |
@@ -1642,7 +1702,9 @@ about the same set of UIDs.
 | `sandboxd/sandboxd/src/policy_http.rs` | Edit: thread caller identity through `propagation_status` |
 | `sandboxd/sandboxd/src/error.rs` | Edit: `GuestProtocolIncompatible` → 409 |
 | `sandboxd/sandbox-core/tests/update_state_reconcile_allow_list.rs` | New: static-analysis test for the reconciler-only caller contract (§ 7.3.1) |
-| `sandboxd/sandboxd/tests/integration_session_isolation.rs` | New |
+| `sandboxd/sandboxd/tests/integration_session_isolation.rs` | New: host-level single-uid isolation tests (synthetic-foreign-owner 404, orphan scan log assertion) |
 | `sandboxd/sandboxd/tests/integration_guest_refresh_container.rs` | New |
 | `sandboxd/sandboxd/tests/integration_guest_refresh_lima.rs` | New |
+| `sandboxd/tests/helpers/peercred-connector/src/main.rs` | New: setuid helper for Lima E2E multi-uid tests; drops to `--uid` then connects to daemon socket (§ 9.2) |
+| `tests/e2e/test_session_isolation.py` | New: Lima E2E tests for `integration_session_isolation_404_on_foreign_id` and `integration_owner_isolation_uid_without_passwd_closes_connection` using `peercred-connector` |
 | `docs/start/installation.md` | Edit: brief note about per-user session visibility, the recreate-on-incompat-upgrade behavior, and the strict-resolution CI implications from § 4.1 (operators in container-CI images need to provision a passwd entry for the runner uid) |
