@@ -128,6 +128,73 @@ Notes on the SQL shape:
   daemon-side enforcement (§ 2.4 — `create_session` always passes a non-empty
   username, never `''`) is sufficient.
 
+### 2.1.1 · Substrate-orphan footprint of the destructive migration
+
+V006's `DELETE FROM sessions` clears the daemon's catalogue of every
+existing session row, and the V003 FK cascade unwinds the policy
+descendants. It does **not** touch:
+
+1. The per-session **filesystem state** under `{base_dir}/sessions/<id>/`
+   (per-session CA material, persisted events, optional volume
+   payloads).
+2. **Lima VMs** named `sandbox-<id>` registered with the host's Lima
+   installation.
+3. **Docker containers and volumes** named `sandbox-<id>` /
+   `sandbox-home-<id>` on the host's Docker daemon.
+4. The corresponding **gateway containers** (`sandbox-gw-<id>`) and
+   **docker networks** (`sandbox-net-<id>`) the daemon's
+   `NetworkManager` and `GatewayManager` allocated.
+
+After V006 applies, the reconciler at `main.rs:2465-2487` iterates
+`list_sessions` (now empty) and never reaches the runtime state — so
+no automatic cleanup occurs. The substrate state is orphaned, and the
+orphan list is unrecoverable from the daemon side (the DB row was the
+only catalogue tying a session ID to a substrate name).
+
+**Spec 2's response is a single `warn!` log emitted by `SessionStore::new`
+when refinery reports that V006 was applied in this run.** The log is
+emitted exactly once per daemon process (refinery's migration history
+table records the apply event; the log fires only when the V006 row is
+freshly inserted, not on subsequent boots where V006 is already in the
+history). The log carries a fixed message body so test assertions can
+match it:
+
+```
+WARN refinery applied V006 — pre-V006 sessions were deleted; the
+following substrate resources may now be orphaned:
+  - per-session directories under {base_dir}/sessions/
+  - Lima VMs named `sandbox-*`        (host: `limactl list`)
+  - Docker containers `sandbox-*`     (host: `docker ps -a --filter name=sandbox-`)
+  - Docker volumes `sandbox-home-*`   (host: `docker volume ls --filter name=sandbox-home-`)
+  - Docker networks `sandbox-net-*`   (host: `docker network ls --filter name=sandbox-net-`)
+  - Gateway containers `sandbox-gw-*` (host: `docker ps -a --filter name=sandbox-gw-`)
+Run `sandbox doctor` after upgrade to see the catalogue of orphans
+detected on this host. Manual cleanup recipe lives in the upgrade
+notes for the daemon version that introduced V006.
+```
+
+The log is `warn!` rather than `error!` because the daemon is fully
+operational — the orphans are operational debt, not a correctness
+failure. The cross-reference to `sandbox doctor` is a **forward
+pointer to Spec 3**, which is adding check C13 (orphan substrate
+detection) in parallel. **Spec 2 does not implement the doctor side
+and does not add a Rust-side sweep here.** The reasoning:
+
+- A Rust-side sweep at migration time runs inside the daemon's
+  startup path, before `AppState` is built; the runtime registry
+  (`runtime_for(&state, ...)`), Docker connection, and Lima manager are
+  not yet available. Shelling out to `docker` and `limactl` from
+  refinery's migration callback is the wrong place for runtime work.
+- A migration-time sweep would also be hard to test in isolation
+  (refinery's migration runner is purely SQL-shaped today; adding a
+  post-migration Rust hook would force a new test fixture).
+- The diagnostic surface is Spec 3's responsibility (`sandbox
+  doctor`); funneling the orphan check there gives operators one
+  place to look. The `warn!` log is the breadcrumb that tells them
+  to look.
+
+The dev-mode walkthrough at § 6.1 expands on the operator impact.
+
 ### 2.2 · API-level filtering — the rule
 
 > Every endpoint that **accepts a session ID** filters that lookup by
@@ -182,7 +249,7 @@ current signature line in `sandbox-core/src/store.rs`:
 | `get_session`                                | 330          | gains `caller_username: &str`; returns `Ok(None)` when row exists but `owner_username` differs |
 | `list_sessions`                              | 349          | gains `caller_username: &str`; SQL `WHERE owner_username = ?1`            |
 | `update_state`                               | 388          | gains `caller_username: &str`; checks ownership before the transition     |
-| `update_state_forced`                        | 432          | gains `caller_username: &str`; reconciler path passes the persisted owner |
+| `update_state_reconcile` (renamed from `update_state_forced`) | 432 | **No `caller_username`.** Reconciler-only by contract — bypasses the storage-boundary filter by design. See "Reconciler hot path" below. |
 | `get_session_by_name_or_id`                  | 468          | gains `caller_username: &str`; every fallback path filters                |
 | `resolve_id_prefix`                          | 523          | gains `caller_username: &str`; prefix matching scoped to caller's rows    |
 | `set_network_info`                           | 582          | gains `caller_username: &str`                                             |
@@ -212,19 +279,60 @@ They are pure read-only fan-outs over every session, used to reconstruct
 daemon-internal data structures; introducing a caller filter here would be
 incoherent.
 
-The reconciler block inside `list_sessions` and `get_session` (the
-"DB-vs-Lima/Container state reconciliation" pattern at `main.rs:2465-2487`
-and `main.rs:2524-2545`) calls `update_state_forced` after observing a
-divergence between the persisted state and the runtime's status. That path
-uses the session's own `owner_username` (already loaded via `get_session`) as
-the caller value — the reconciler is not "alice's daemon-level action against
-alice's session", it is "the daemon reconciling alice's session against
-external reality", and the storage-boundary filter has to admit it. Two
-options: route the reconciler through a separate `update_state_reconcile`
-method without the filter, or have it pass `session.owner_username` as the
-caller. The spec recommends the **explicit `update_state_reconcile` method**
-because it documents the trust path at the call site rather than relying on
-the reconciler to launder the right username.
+**Reconciler hot path — pinned rule.** The reconciler block inside
+`list_sessions` and `get_session` (the "DB-vs-Lima/Container state
+reconciliation" pattern at `main.rs:2465-2487` and `main.rs:2524-2545`)
+must adjust persisted state after observing a divergence between the DB
+and the runtime's status. That path is not "alice's API request against
+alice's session" — it is "the daemon reconciling externally-observed
+substrate state against the catalogue" — and it cannot meaningfully
+participate in the caller-filter check (there is no HTTP caller in scope;
+the reconciler runs inside `list_sessions` / `get_session` after the
+session row has already been read).
+
+Spec 2 resolves this with a hard rule:
+
+> Today's `update_state_forced` is renamed to `update_state_reconcile`
+> and takes **no `caller_username`**. The method is reconciler-internal
+> by contract; **HTTP handlers must never call it.** All operator-driven
+> state transitions go through `update_state` (which takes
+> `caller_username` and enforces ownership). The rename is a deliberate
+> tripwire: a future contributor reaching for "force this state change"
+> sees the new name and the doc-comment, not the old one.
+
+The trait method's doc-comment carries this rule verbatim:
+
+```rust
+/// Forcibly set the state of a session, bypassing both state-machine
+/// validation and the storage-boundary ownership filter.
+///
+/// **INTERNAL: only the daemon's startup / reconciliation paths may
+/// call this method.** HTTP handlers must use [`Self::update_state`],
+/// which enforces ownership via the `caller_username` filter (Spec 2
+/// § 2.4). A call from a request handler is a security bug — it
+/// bypasses the per-caller 404-on-foreign-id property the rest of the
+/// store guarantees.
+///
+/// Authorized callers, exhaustively (Spec 2 § 7.3.1 enforces this
+/// list via a static-analysis test):
+/// - `list_sessions` and `get_session` reconciler blocks in
+///   `sandboxd::main` (DB-vs-runtime status divergence).
+/// - The `Creating`→`Running`/`Error` transitions in `create_session`
+///   and `start_session` *before* the session is owner-stamped (only
+///   on the error/cleanup branch; the happy path uses `update_state`).
+/// - Startup reconciliation in `sandboxd::main::main`.
+pub fn update_state_reconcile(
+    &self,
+    id: &SessionId,
+    state: SessionState,
+) -> Result<(), SandboxError>;
+```
+
+The allow-list is enforced by a unit test (§ 7.3.1 below) that greps the
+entire `sandboxd/` source tree for callers of `update_state_reconcile`
+and fails when the call set is not a subset of the named locations. The
+test reads as a static-analysis check, not a behaviour test, but it
+lives in the test suite so it runs on every `cargo nextest run`.
 
 ### 2.5 · Stable identity — username, not UID
 
@@ -857,6 +965,45 @@ detail; both Spec 1 and Spec 2 accept the bare-reset behavior because the
 failure mode is rare and the alternative (parse the HTTP request first
 just to write a richer error) breaks the layering.
 
+### 4.1 · CI implications of strict resolution
+
+The strict policy is a **deliberate production hardening** and a
+**deliberate CI regression** that adopters must address. Today's daemon
+runs the connection-acceptor without any uid → username dependency; an
+operator whose uid has no `/etc/passwd` entry (a routine state in
+minimal container-CI images, or in nspawn / chroot sandboxes that share
+the host kernel's uid space but not its passwd file) reaches the API
+without trouble. Spec 2's strict policy closes their connection.
+
+CI authors using the daemon in such environments have three remediation
+paths:
+
+1. Add `useradd` to the CI image's prep step so the runner uid has a
+   passwd entry. The common ten-line CI prep snippet
+   (`useradd --uid $(id -u) --create-home ci`) suffices and is the path
+   the spec recommends.
+2. Bind-mount a passwd file with the runner's uid present, if the CI
+   environment supports it.
+3. For ephemeral sandboxes that intentionally have no passwd file,
+   skip the daemon integration tests entirely until a passwd entry is
+   provisioned.
+
+The strictness is **not configurable** in v1 — the failure mode it
+protects against (an attacker-controlled passwd race during `userdel`)
+is a real correctness concern, and adding a "lax mode" knob would force
+every future contributor to reason about both branches. Spec 2 commits
+to the regression and provides the test coverage below so the failure
+mode is observable rather than silently mysterious.
+
+The matching integration test
+(`integration_daemon_refuses_unresolvable_peer_cred`) is specified in
+§ 7.5; it asserts the daemon closes the connection cleanly without
+crashing when the connecting uid has no passwd entry. The same property
+on the route-helper side is covered by Spec 1 § 8.4
+(`integration_route_helper_denies_when_username_unresolvable` covers
+the `for_user` arg; § 7.5 here covers the **caller-uid** path that
+Spec 1's test does not exercise).
+
 ## 5 · Wire snapshot — before / after
 
 Today's `POST /sessions` request (sketch):
@@ -983,27 +1130,58 @@ it on the daemon's HTTP API (`GET /sessions/{id}/version`,
 `make setup-dev-env` developers run the daemon as themselves. There is no
 dedicated `sandbox` system user yet (Spec 3). Spec 2's behavior in this mode:
 
-### 6.1 · One-time stopped-session loss
+### 6.1 · One-time stopped-session loss and substrate-orphan footprint
 
 On first daemon start after V006 lands, refinery applies the migration. The
 migration's first statement (`DELETE FROM sessions;`) removes every persisted
 session row. The cascade through V003's foreign keys removes policy rows for
-each. The per-session directories under `{base_dir}/sessions/{id}/` are
-**not** swept — the migration is a SQL transform; on-disk artefacts unwind
-through `delete_session`'s `fs::remove_dir_all` (`store.rs:872-876`), which
-the migration doesn't call. Operators see leftover directories with no
-matching DB rows; `sandbox session ls` returns empty. Cleanup is manual
-(`rm -rf $XDG_DATA_HOME/sandboxd/sessions/`) or deferred until the next
-`sandbox session create` reuses an ID (collision-free given the 48-bit ID
-space). The spec considered making the migration call into Rust to do the
-directory sweep; rejected because (a) refinery's `.sql` migrations are
-intentionally code-free for forward-port safety, and (b) the per-session
-directories on dev machines are cheap kilobytes, not the multi-gigabyte VM
-images (those live under Lima's own state, not under `sandboxd/sessions/`).
+each. The reconciler (`main.rs:2465-2487`) then iterates the now-empty
+session list on every `list_sessions` call and never reaches the runtime
+state, so the daemon performs no automatic substrate cleanup.
 
-This is the dev-mode loss the handoff calls out: stopped Lima/container
-sessions become unreferenceable. They cost a developer one `limactl delete`
-or `docker rm` per orphan to recover the resources; it is not catastrophic.
+`SessionStore::new` emits the `warn!` log specified in § 2.1.1
+exactly once on the boot where V006 applies. Developers running
+`make setup-dev-env` see the log on first daemon restart after pulling
+in the V006-bearing daemon binary.
+
+The orphan footprint, by substrate:
+
+| Resource                                    | Identifier pattern             | Manual cleanup                                                                                                |
+|---------------------------------------------|--------------------------------|---------------------------------------------------------------------------------------------------------------|
+| Per-session directories                     | `{base_dir}/sessions/<id>/`    | `rm -rf $XDG_DATA_HOME/sandboxd/sessions/<id>/` (or the dir matching the daemon's `--base-dir` argv).         |
+| Lima VMs                                    | `sandbox-<id>`                 | `limactl delete --force sandbox-<id>` per VM.                                                                  |
+| Docker containers                           | `sandbox-<id>`                 | `docker rm -f sandbox-<id>` per container.                                                                     |
+| Docker volumes                              | `sandbox-home-<id>`            | `docker volume rm sandbox-home-<id>` per volume.                                                               |
+| Docker networks                             | `sandbox-net-<id>`             | `docker network rm sandbox-net-<id>` per network.                                                              |
+| Gateway containers                          | `sandbox-gw-<id>`              | `docker rm -f sandbox-gw-<id>` per gateway.                                                                    |
+
+For developers, the realistic cleanup path is to wait for **Spec 3's
+`sandbox doctor` check C13** (in-design at audit time, landing in
+parallel) to enumerate the orphans, then run the substrate `rm` commands
+or the doctor's optional `--fix` flag if Spec 3 chooses to expose one.
+Pre-Spec-3, the manual `docker ps -a --filter name=sandbox-` and
+`limactl list` walk surface the orphans by hand.
+
+The spec considered three alternatives, all rejected:
+
+- **Add a Rust-side sweep at migration time** — refinery's `.sql`
+  migrations are intentionally code-free, and the runtime / Docker /
+  Lima clients are not constructed yet when refinery runs (the daemon's
+  `AppState` builds them after `SessionStore::new` returns).
+- **Defer V006 itself behind an operator-driven `sandbox update
+  --confirm`** — V006 cannot be deferred; the schema bump is a daemon
+  startup precondition (every subsequent `INSERT INTO sessions` writes
+  the three new columns), and refusing to start until the operator
+  confirms would block dev iteration on every daemon update.
+- **Stamp the orphans with a marker (`__legacy__`) and let the
+  reconciler clean them up** — the marker leaks an unresolvable owner
+  identity into the filter and forces a special-case carve-out (§ 2.1
+  rejected this for the same reason).
+
+End-user installs (Spec 4) are greenfield: the V006-bearing daemon is
+the first daemon they run, `sessions.db` does not exist, and no
+substrate orphans can pre-exist. The orphan footprint is a dev-mode
+upgrade concern only.
 
 ### 6.2 · Single-operator visibility — identical
 
@@ -1102,6 +1280,45 @@ Run under the default nextest profile (hermetic — no Docker, no Lima):
 | `can_refresh_in_place_accepts_known_versions`        | `1` (and `DAEMON_GUEST_PROTO_VERSION`)          | `true` |
 | `can_refresh_in_place_rejects_zero`                  | `0`                                            | `false` |
 
+### 7.3.1 · Static-analysis test for `update_state_reconcile` callers
+
+Hermetic. Lives at `sandboxd/sandbox-core/tests/update_state_reconcile_allow_list.rs`
+(or equivalent; the file location is implementation detail, but it must
+run under `cargo nextest run` in the default profile so a careless PR
+fails CI immediately).
+
+The test greps the `sandboxd/` workspace (excluding `target/`,
+`tests/`, and the trait definition itself) for the string
+`update_state_reconcile`, parses each hit's file:line, and asserts the
+set of caller locations is **exactly** the allow-list pinned in § 2.4's
+doc-comment:
+
+```rust
+const ALLOW_LIST: &[&str] = &[
+    // Reconciler blocks inside session-read handlers.
+    "sandboxd/sandboxd/src/main.rs::list_sessions",
+    "sandboxd/sandboxd/src/main.rs::get_session",
+    // Error/cleanup branches in create/start; the happy path uses
+    // update_state, not _reconcile.
+    "sandboxd/sandboxd/src/main.rs::create_session::error_cleanup",
+    "sandboxd/sandboxd/src/main.rs::start_session::error_cleanup",
+    // Startup reconciliation.
+    "sandboxd/sandboxd/src/main.rs::main::startup_reconcile",
+];
+```
+
+| Test name                                                  | Behavior |
+|------------------------------------------------------------|----------|
+| `update_state_reconcile_callers_match_allow_list`          | Walk the workspace tree, collect every file:function that mentions `update_state_reconcile`, compare against `ALLOW_LIST`. Fails if any new caller is added without updating the list; also fails if a listed caller is removed (catches drift in both directions). |
+| `update_state_reconcile_not_called_from_request_handlers`  | Sub-check: assert no caller location is inside an `async fn` annotated with axum extractors (e.g., a function whose signature includes `State<Arc<AppState>>` or `Extension<OperatorIdentity>`). Belt-and-suspenders against the "developer adds a new handler that calls `_reconcile`" foot-gun. |
+
+The walk uses simple line-based string matching (not a full Rust parser).
+The signal-to-noise is high because the method name is distinctive; the
+"function annotated with axum extractors" sub-check uses `regex` to
+match the function signature within ±10 lines of each hit. If the
+implementer prefers, the second check can be downgraded to a code
+review checklist item — but the first check is mandatory.
+
 ### 7.4 · Unit tests for guest version-reporting handler
 
 Hermetic — live in `sandbox-guest/src/main.rs` alongside the existing
@@ -1116,33 +1333,28 @@ constants, builds a `VersionResult`), so a direct call is sufficient:
 
 ### 7.5 · Integration tests
 
-Under `integration_*` prefix, selected by the `integration` nextest profile:
+Under `integration_*` prefix, selected by the `integration` nextest profile.
+The tests run **single-uid** (the test-runner's own uid); the alice/bob
+partition is verified at the storage layer by § 7.2's unit tests, not by
+faking peer-cred. See § 9.2 for why Spec 2 picks this option.
 
 | Test name                                                              | Backend     | Behavior |
 |------------------------------------------------------------------------|-------------|----------|
-| `integration_session_isolation_404_on_foreign_id`                      | container   | Two daemon connections faking different `SO_PEERCRED` uids each create a session; alice tries every endpoint (H3, H5, H6, H7, H8, H9, H10, H11, H12) against bob's ID; every response is `404`. |
-| `integration_session_list_per_caller_partition`                        | container   | Same setup; alice's `GET /sessions` returns only alice's session, bob's returns only bob's. |
-| `integration_create_stamps_owner_from_peercred`                        | container   | One create; assert the persisted row's `owner_username` matches the test runner's username. |
-| `integration_guest_refresh_container_backend`                          | container   | Seed a session row with `guest_protocol_version = 0` and an old `sandbox-guest` binary baked into the container; call `start_session`; assert (a) the refresh ran (binary mtime in the container changed; binary version inside the container reports the new value via a debug rpc), (b) the DB columns updated, (c) the session reached `Running`. |
+| `integration_create_stamps_owner_from_peercred`                        | container   | One create over the real Unix socket; assert the persisted row's `owner_username` matches `whoami` (the test-runner's username resolved via `getpwuid_r`). Verifies the `SO_PEERCRED` → handler-extractor → store-stamp threading. |
+| `integration_synthetic_foreign_owner_returns_404`                      | container   | Open the `SessionStore` directly and insert a row with `owner_username = "synthetic-other"` via the create-session-with-backend method (test fixture passes the synthetic name). Then issue `GET /sessions/<id>` over the daemon socket as the real test runner. Expect `404`. Repeats the request against every session-id endpoint (H3, H5, H6, H7, H8, H9, H10, H11, H12) and asserts each returns `404`. Verifies that the storage-boundary filter rejects the synthetic-owner row when reached via the HTTP layer threaded with the real peer-cred. |
+| `integration_list_returns_only_callers_sessions`                       | container   | Same fixture: insert one synthetic-owner row and one runner-owned row. `GET /sessions` over the socket returns one entry — the runner-owned one. |
+| `integration_daemon_refuses_unresolvable_peer_cred`                    | container   | Required by § 4.1. Run the daemon-side acceptor against a connection whose uid does not resolve. Implementation note: the test creates a synthetic uid in a fixture chroot whose `/etc/passwd` lacks that uid, opens a Unix socket connection from inside the chroot, and asserts the daemon's acceptor refuses the connection cleanly (`peer_cred` succeeds, `User::from_uid` returns `Ok(None)`, the daemon closes the stream and continues accepting). The daemon process must not crash; subsequent connections from a valid uid must succeed. If the chroot fixture overshoots the test's value, the implementer may downgrade to a unit test against `OperatorIdentity::from_peer_cred` with a synthetic non-resolvable uid — flagged in § 9.2. |
+| `integration_guest_refresh_container_backend`                          | container   | Seed a session row with `guest_protocol_version = 0` and an old `sandbox-guest` binary baked into the container; call `start_session`; assert (a) the refresh ran (binary mtime in the container changed; binary version inside the container reports the new value via the new `GuestRequest::Version` query), (b) the DB columns updated, (c) the session reached `Running`. |
 | `integration_guest_refresh_lima_backend`                               | lima        | Same as above. Marked `#[cfg_attr(not(has_kvm), ignore)]` or equivalent so CI runners without `/dev/kvm` skip it (existing convention for Lima integration tests). |
 | `integration_guest_refresh_refuses_when_unsalvageable`                 | container   | Seed a session row with `guest_protocol_version = 0` AND patch `can_refresh_in_place` (via a test-only `set_can_refresh_in_place_override` hook on the daemon) to return `false`; call `start_session`; assert the response is `409 Conflict` with body substring `refresh is not viable for this session` and `recreate the session`. |
 | `integration_guest_version_columns_persist_through_create_and_start`   | container   | Standard happy-path session create; read the row back; assert all three new columns hold non-default values and `guest_binary_version` matches `env!("CARGO_PKG_VERSION")` of the `sandbox-guest` crate. |
 | `integration_guest_version_query_returns_compiled_constants`           | container   | Standard happy-path session create + start; issue `GuestRequest::Version` through the `GuestConnector` against the running guest; assert the reply is `VersionResult` and that `protocol_version == DAEMON_GUEST_PROTO_VERSION` and `binary_version == SANDBOX_GUEST_VERSION`. Confirms the wire-level primitive works end-to-end against a real running session. |
+| `integration_v006_emits_orphan_warning_log`                            | container   | Seed a V005-shape `sessions.db` with one row; open it through `SessionStore::new`; capture `tracing` events; assert the `warn!` from § 2.1.1 fired exactly once with the fixed-message substring `pre-V006 sessions were deleted`. Re-open on the next iteration and assert the log does **not** fire (refinery's migration history table prevents the re-fire). |
 
-The fake-peercred plumbing for the isolation tests: the daemon-test fixture
-already exists for the container backend (the existing
-`tests/integration_*` infrastructure under
-`sandboxd/sandboxd/tests/`). For peer-cred faking, the cleanest path is to
-spin up two separate Unix-socket connections from the test process with
-distinct `SO_PEERCRED`s. Linux allows `SO_PEERCRED` to be set on a socket
-created via a different uid only via `setsockopt`-like paths that require
-privileges; the practical test approach is to run the test as one user and
-**spawn a helper subprocess** that connects as a different uid (the
-existing test harness already manages multiple service identities for
-gateway-container tests — same pattern). The handoff explicitly does not
-require Spec 2 to add new test infrastructure; if the path turns out to
-require it, that's a finding to be raised before implementation (this is a
-real risk — see § 9.2).
+The tests above are single-uid by design (see § 9.2). The synthetic-
+foreign-owner approach gives integration-layer coverage of the `404` shape
+without the multi-uid harness cost; the unit tests in § 7.2 cover the
+genuine alice-vs-bob partition at the storage layer with synthetic names.
 
 ### 7.6 · `sandbox describe` / `sandbox inspect` output
 
@@ -1237,26 +1449,75 @@ disagrees with the DB column. The `Version` query is what makes that
 detectable; how that surfaces to operators is Spec 3's design surface.
 Spec 2 only owns the primitive.
 
-### 9.2 · Faking `SO_PEERCRED` in integration tests
+### 9.2 · Faking `SO_PEERCRED` in integration tests — Spec 2 picks single-uid
 
 `SO_PEERCRED` is kernel-set on connect; you can't lie about it from
 userspace without dropping privileges first. Multi-uid integration tests
-either run under sudo and `setuid` between connects, or spawn helper
-subprocesses under different uids. The existing daemon test harness uses
-the test-runner's own uid; the new isolation tests at § 7.5 are the
-first ones in the codebase that genuinely need **two** uids.
+either run under sudo and `setuid` between connects, or spawn setuid
+helper subprocesses owned by a second test user — both options bring
+real CI setup cost (a setuid helper to install with `chmod u+s`, a
+second uid to provision with `useradd`, root in the GitHub Actions
+runner to do both, and a corresponding tear-down to keep the workflow
+hermetic).
 
-Realistic path: the integration-test harness gains a small helper binary
-under `sandboxd/tests/helpers/peercred-connector` that takes
-`--username=<name>` and `--session-id=<id>` argv, the runner installs it
-setuid in test setup (a one-time `chmod u+s` against a privileged helper),
-and the test invokes it to drive the foreign-uid requests. The complexity
-is non-trivial; if the implementer finds the harness work overshoots the
-isolation-test value, dropping to a single-process unit-level
-`SessionStore` filter test (per § 7.2) plus a smaller integration test
-that asserts the **404-shape** without faking peer-cred is an acceptable
-fallback. The spec leans on the unit tests (§ 7.2) for the core property
-and treats the multi-uid integration test as a high-confidence add-on.
+**Spec 2 commits to option (b) — single-uid integration tests, paired
+with full storage-layer coverage of the filter.** The reasoning:
+
+- The storage-boundary filter (§ 2.4) is **where the safety property
+  lives**. Every `SessionStore` method gains `caller_username`, every
+  query gains the SQL `AND owner_username = ?`, and every method that
+  filters has a unit test in § 7.2 asserting alice-vs-bob isolation
+  against an in-memory store. That is the strongest possible test of
+  the filter itself — it directly exercises the SQL with synthetic
+  usernames passed as plain strings, no peer-cred involved.
+- The integration layer above it is responsible for the **threading**
+  of the caller identity from `SO_PEERCRED` into the `caller_username`
+  arg. That threading is a one-liner in each handler
+  (`Extension(operator): Extension<OperatorIdentity>` →
+  `store.get_session(&operator.name, ...)`). A single-uid integration
+  test against a real daemon validates that the threading runs and the
+  resolution succeeds; it cannot validate the per-caller partition
+  directly without a second uid.
+- The single-uid coverage gap is bounded: the only property the
+  single-uid integration cannot verify is "alice's HTTP request really
+  cannot reach bob's row through the daemon". The unit-level filter
+  test does verify it; the integration-layer test verifies the
+  threading is wired. A regression that bypasses both layers
+  simultaneously (filter wired correctly but handler forgets to pass
+  the operator name) is not the realistic failure mode — the typed
+  `caller_username: &str` parameter on `SessionStore` is mandatory and
+  the compiler catches the omission.
+
+The single-uid integration tests in § 7.5 therefore assert:
+
+- The connecting uid's resolved username **is** stamped into the
+  persisted row (`owner_username`).
+- The daemon's response shape for foreign-id lookups is `404` (this is
+  tested by **synthesizing** a foreign-owner row directly through the
+  store with a fake `caller_username = "synthetic-other"`, then issuing
+  the HTTP request as the real test-runner uid; the foreign owner is
+  not the test runner, so the request returns 404).
+- The daemon closes the connection cleanly when the connecting uid has
+  no passwd entry (§ 7.5's `integration_daemon_refuses_unresolvable_peer_cred`,
+  required by § 4.1).
+
+**Forward note for Spec 4's CI infrastructure.** A future spec can
+upgrade the integration coverage to option (a) — the full multi-uid
+harness — when the CI setup appetite exists. The setup would entail:
+
+- A small setuid helper at `sandboxd/tests/helpers/peercred-connector`
+  that takes `--username=<name>` and an HTTP request body on stdin and
+  connects on behalf of the named uid.
+- A test fixture that runs `useradd ci-isolation-second` (and
+  `userdel` on tear-down) so the helper has a real second uid to drop
+  to.
+- A CI workflow setup step that runs the helper-install with
+  `chmod u+s` against the just-built test binary.
+
+The forward note exists so Spec 4's CI infrastructure design has a
+hook to attach to if the upgrade is requested. Spec 2 itself **does
+not require this**, and the test list in § 7.5 has been scoped to what
+single-uid coverage can verify.
 
 ### 9.3 · Lima refresh's stop-then-start cycle
 
@@ -1331,7 +1592,7 @@ without daemon involvement.
 | Path | Kind of change |
 |---|---|
 | `sandboxd/sandbox-core/migrations/V006__add_owner_and_guest_versions.sql` | New migration — `DELETE FROM sessions;` + three `ALTER TABLE ADD COLUMN`. |
-| `sandboxd/sandbox-core/src/store.rs` | `SessionStore` methods gain `caller_username: &str` (§ 2.4 table). `row_to_session` reads the three new columns. New method `update_guest_versions(caller_username, id, proto, binary_version)`. Reconciler-only paths split into `update_state_reconcile` to keep the storage boundary safe. |
+| `sandboxd/sandbox-core/src/store.rs` | `SessionStore` methods gain `caller_username: &str` (§ 2.4 table). `row_to_session` reads the three new columns. New method `update_guest_versions(caller_username, id, proto, binary_version)`. `update_state_forced` is renamed to `update_state_reconcile` and **does not gain `caller_username`** (§ 2.4 "Reconciler hot path — pinned rule"). The doc-comment carries the allow-list-of-callers contract verbatim. After refinery applies migrations, emit the V006 orphan-warning `warn!` per § 2.1.1 when V006 was freshly applied in this run (refinery's history table is the seam — log fires only when V006's row is newly inserted). |
 | `sandboxd/sandbox-core/src/session.rs` | `Session` struct gains three new fields (`owner_username: String`, `guest_protocol_version: u32`, `guest_binary_version: String`); each `#[serde(default)]` for on-disk forward-compat per CLAUDE.md "On-disk compatibility". |
 | `sandboxd/sandbox-core/src/guest.rs` | New constants `DAEMON_GUEST_PROTO_VERSION: u32 = 1`, `SANDBOX_GUEST_VERSION: &str`. New `pub fn is_protocol_compatible(u32) -> bool`. New `pub fn can_refresh_in_place(u32) -> bool`. New `GuestRequest::Version` variant and `GuestResponse::VersionResult { protocol_version: u32, binary_version: String }` reply variant. |
 | `sandboxd/sandbox-guest/src/main.rs` | Handler for `GuestRequest::Version` returning `VersionResult` from the compile-time constants in `sandbox-core::guest`. Unit tests per § 7.4. |
@@ -1347,7 +1608,8 @@ without daemon involvement.
 | `sandboxd/sandboxd/src/error.rs` | `error_response` adds the `GuestProtocolIncompatible` arm (→ `409 Conflict`). |
 | `sandboxd/sandbox-core/src/api.rs` | `SessionDto` decision (out of scope per § 8 — implementer's call on whether to surface the new columns on the wire). |
 | `sandboxd/sandbox-cli/src/main.rs` | No changes required for Spec 2. CLI flags and command structure are unchanged. |
-| `sandboxd/sandboxd/tests/` | New file(s) for the integration tests in § 7.4 — `integration_session_isolation.rs`, `integration_guest_refresh_container.rs`, `integration_guest_refresh_lima.rs`. |
+| `sandboxd/sandbox-core/tests/update_state_reconcile_allow_list.rs` | New: static-analysis test per § 7.3.1 (greps the workspace tree, asserts the caller set matches the pinned allow-list; runs under the default nextest profile). |
+| `sandboxd/sandboxd/tests/` | New file(s) for the integration tests in § 7.5 — `integration_session_isolation.rs` (synthetic-foreign-owner 404, `integration_daemon_refuses_unresolvable_peer_cred`, etc.), `integration_guest_refresh_container.rs`, `integration_guest_refresh_lima.rs`. |
 
 Coordination with Spec 1: if Spec 1 lands first, Spec 2 reuses its
 `OperatorIdentity` + custom acceptor verbatim. If Spec 2 lands first,
@@ -1363,7 +1625,7 @@ about the same set of UIDs.
 | Path | Touch type |
 |---|---|
 | `sandboxd/sandbox-core/migrations/V006__add_owner_and_guest_versions.sql` | New |
-| `sandboxd/sandbox-core/src/store.rs` | Edit: storage-boundary `caller_username` filter on every session-touching method; `update_guest_versions`; `update_state_reconcile` split |
+| `sandboxd/sandbox-core/src/store.rs` | Edit: storage-boundary `caller_username` filter on every session-touching method; `update_guest_versions`; `update_state_forced` renamed to `update_state_reconcile` (no caller filter; doc-comment pins allow-list); V006-applied `warn!` log per § 2.1.1 |
 | `sandboxd/sandbox-core/src/session.rs` | Edit: three new fields on `Session`; `#[serde(default)]` for forward-compat |
 | `sandboxd/sandbox-core/src/guest.rs` | Edit: constants + compatibility predicates + `GuestRequest::Version` / `GuestResponse::VersionResult` variants |
 | `sandboxd/sandbox-guest/src/main.rs` | Edit: handler for `GuestRequest::Version`; unit tests for the handler and end-to-end loopback |
@@ -1379,7 +1641,8 @@ about the same set of UIDs.
 | `sandboxd/sandboxd/src/events_http.rs` | Edit: thread caller identity through `get_session_events` |
 | `sandboxd/sandboxd/src/policy_http.rs` | Edit: thread caller identity through `propagation_status` |
 | `sandboxd/sandboxd/src/error.rs` | Edit: `GuestProtocolIncompatible` → 409 |
+| `sandboxd/sandbox-core/tests/update_state_reconcile_allow_list.rs` | New: static-analysis test for the reconciler-only caller contract (§ 7.3.1) |
 | `sandboxd/sandboxd/tests/integration_session_isolation.rs` | New |
 | `sandboxd/sandboxd/tests/integration_guest_refresh_container.rs` | New |
 | `sandboxd/sandboxd/tests/integration_guest_refresh_lima.rs` | New |
-| `docs/start/installation.md` | Edit: brief note about per-user session visibility and the recreate-on-incompat-upgrade behavior (forward-compat for operators upgrading) |
+| `docs/start/installation.md` | Edit: brief note about per-user session visibility, the recreate-on-incompat-upgrade behavior, and the strict-resolution CI implications from § 4.1 (operators in container-CI images need to provision a passwd entry for the runner uid) |
