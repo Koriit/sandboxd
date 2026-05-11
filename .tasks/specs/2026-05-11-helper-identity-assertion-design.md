@@ -234,7 +234,9 @@ comparison.
 Today's helper has a softer policy at line 125 — `caller_user` is `ok().flatten()` and
 used only for stderr clarity. The new policy is **strict**: the pair-check needs both
 identities reliably, so an unresolvable identity must deny. This is a behavior change;
-it lands with the helper changes in this spec.
+it lands with the helper changes in this spec. See § 9.1 for the CI implications of the
+strict policy (a deliberate regression that adopters in container-CI environments
+without a populated `/etc/passwd` for the test uid must account for).
 
 ### 3.5 · Audit log destination and shape
 
@@ -273,11 +275,46 @@ Fields:
 | `pid` | The `<container_pid>` positional argv value |
 
 Append-only writes via `OpenOptions::new().append(true).create(true).open(path)`. If the
-log open or write fails, the helper logs to stderr (`sandbox-route-helper: audit log
-write failed: <err>`) and **continues with the original decision** — an audit-log
-infrastructure failure must not become a denial of service to the routing path. (This
-is consistent with the broader principle that an unreachable log is less harmful than
-an unconditionally-failed network setup.)
+log open or write fails, the helper's response **depends on which path the decision
+took** — the routing-path-availability and forensic-record-availability invariants
+diverge here:
+
+- **Allow path** — write failure logs a structured stderr line and the helper
+  **continues with the allow** (installs the route, exits `0`). An audit-log
+  infrastructure failure (disk full, ENOSPC on the log directory, etc.) must not
+  become a denial of service to session creation — the unreachable log is less
+  harmful than an unconditionally-failed network setup.
+- **Deny path** — write failure logs the same structured stderr line and the
+  helper **still exits with `DENY_EXIT` (1)**. The deny itself was never in doubt
+  (it happens before and independently of the log write); the escalation here is
+  about the **forensic record**. Silently swallowing a "alice tried to mess with
+  bob's pool" record is the worst case for security audit: the deny goes through,
+  but the operator's investigation trail evaporates. Exiting non-zero with a
+  loud stderr line surfaces the missing-record condition to the daemon (which
+  already maps non-zero helper exits to a structured lifecycle event) and to any
+  human running the helper directly.
+
+In pseudo-Rust, the asymmetry at the audit-write site:
+
+```rust
+// Decision already made; `decision` is "allowed" or "denied".
+match write_audit_record(&record) {
+    Ok(()) => { /* normal exit path */ }
+    Err(e) => {
+        eprintln!("sandbox-route-helper: audit log write failed: {e}");
+        if decision == Decision::Denied {
+            // Forensic-record-availability escalation: surface the
+            // missing record even though the deny itself succeeded.
+            std::process::exit(DENY_EXIT);
+        }
+        // Allow path: continue — routing-path availability wins.
+    }
+}
+```
+
+The **deny-path-availability** invariant is preserved either way: the deny occurs
+regardless of whether the log write succeeded. The escalation only adds the
+forensic signal; it never converts an allow into a deny.
 
 ## 4 · `users.conf` schema convention
 
@@ -407,17 +444,33 @@ For the input value (a `serde_json::Value::Object`):
 
 ### 5.3 · Idempotency contract
 
-V001 is idempotent both at the per-pool and the per-file level:
+V001's transform is idempotent both at the per-pool and the per-file level:
 
 - A pool with `["sandbox", "alice"]` already correct → unchanged.
 - A pool with `["alice", "sandbox"]` (operator-added in a different order) → already
   contains `"sandbox"`, **no-op**. Operator's order is preserved.
 - A file with `_schema_version: 1` already at the top level → V001 does nothing.
 
-This matters for the framework (a re-applied migration must be safe), for operators
-who hand-edited their file in advance of the upgrade, and for the dev-mode path where
-a contributor's `users.conf` may already follow the post-V001 convention by the time
-V001 ships.
+**Framework observability.** Per Spec 5's selection rule (see Spec 5 § 4.2 — "every
+migration advances exactly one version"), the framework returns early when
+`current == target` and never invokes V001's `apply` on a file already at version
+`1`. The transform's "already at V001 → no-op" branch is therefore **unobservable
+from the framework's apply loop** under normal operation. It remains valuable as
+**defense in depth**: if some other code path (a test fixture, a future tool, an
+ad-hoc `cargo run` of the transform, or a hand-written script) invokes
+`migrate_v001` directly on an already-at-V001 input, the transform must not
+corrupt the file. The contract documented here is the transform's invariant — not
+a behavior the framework exercises.
+
+The per-pool idempotency (operator hand-added `"sandbox"` in a different order, or
+both names already present) **is** framework-observable: those inputs still read at
+`_schema_version` absent / `0`, so V001 is invoked, and its per-pool no-op handling
+must preserve operator order.
+
+This matters for the framework (a re-applied migration on the per-pool branch must
+be safe), for operators who hand-edited their file in advance of the upgrade, and
+for the dev-mode path where a contributor's `users.conf` may already follow the
+post-V001 convention by the time V001 ships.
 
 ### 5.4 · Output validation
 
@@ -806,6 +859,7 @@ infrastructure (`sandbox-route-helper/tests/integration_route_helper.rs:43-47`).
 | `integration_route_helper_defaults_for_user_to_caller_when_omitted` | Run helper *without* `--for-user`; pool contains `[runner]`; expects same outcome as `accepts_for_user_matching_caller`. |
 | `integration_route_helper_denies_when_caller_not_in_pool_even_with_valid_for_user` | Pool contains `[bob]` but `--for-user=bob`; caller is runner ≠ bob; expects deny. |
 | `integration_route_helper_denies_when_username_unresolvable` | `--for-user=definitely-not-a-real-user-9c3f` (the sentinel name reused from `users_conf.rs:1016-1031`); expects deny with substring `does not resolve to a uid`. |
+| `integration_route_helper_denies_when_caller_uid_unresolvable` | Runs the helper from a uid that has been deliberately removed from `/etc/passwd` between fixture setup and helper exec — implemented via a chroot fixture that prepares a mutated `/etc/passwd` (no entry for the test uid), OR via a Lima VM smoke test that creates a temporary user, drops it mid-test via `userdel`, and invokes the helper as the now-stranded uid. Asserts: helper exits `DENY_EXIT` (1), stderr contains the substring `caller uid` and `unresolvable` (or the precise wording from § 3.4 — `caller uid <n> does not resolve to a username`), and the audit log either records a denied entry with `reason` naming the resolution failure or — if the audit write itself fails because the caller cannot be named — emits the stderr escalation per § 3.5. This plugs the coverage gap left by today's softer `ok().flatten()` policy at `sandbox-route-helper/src/main.rs:125`, which is unverified at the integration layer. |
 | `integration_route_helper_writes_audit_log_on_allowed` | Verify a JSON line with `decision="allowed"` and both identities lands in the audit-log file. |
 | `integration_route_helper_writes_audit_log_on_denied` | Verify a JSON line with `decision="denied"`, `reason` substring, and both identities. |
 
@@ -873,6 +927,21 @@ policy is **strict**: an unresolvable identity is a deny. Three places are affec
    sees a fast, clear failure on `systemctl status`. This is desired — silent
    degradation is worse.
 
+**Deliberate behavior change — CI implications.** The strict policy is a deliberate
+regression from today's softening at `sandbox-route-helper/src/main.rs:125`. The
+trade is: today's policy quietly allows pair-checks to succeed for uids without a
+`/etc/passwd` entry; the new policy refuses them. This matters most in **container-CI
+environments** where the test-running uid is frequently not present in
+`/etc/passwd` (minimal CI images, ephemeral runner uids in the host's namespace).
+Adopters running integration tests in such environments must either (a) add a
+`useradd` step early in the CI workflow so the test uid resolves, or (b) accept
+the deny path in their tests and assert against it. The new integration test
+`integration_route_helper_denies_when_caller_uid_unresolvable` (§ 8.4) pins the
+deny shape so the CI-side fix is straightforward to verify. Spec 2 § 7.5 adds the
+**daemon-side** counterpart for the same regression (a test that runs the daemon
+in a uid-without-passwd environment and asserts the connection is closed cleanly);
+the two tests together cover both sides of the strict-resolution policy.
+
 ### 9.2 · Corrupt `users.conf`
 
 If `users.conf` does not parse (invalid JSON, invalid CIDR), today's helper refuses
@@ -921,6 +990,17 @@ will fail at the next network step, but no audit record is lost. This asymmetry 
 acceptable: the log records *the decision*, not *the side effect*. Operators
 investigating a session failure correlate against the daemon's lifecycle event for
 "helper invocation failed", not the audit log alone.
+
+A second asymmetry, between the allow and deny paths on **audit-log write failure**,
+is **actively handled** rather than merely acknowledged. See § 3.5 for the
+specification: an allow-path log-write failure logs to stderr and continues
+(routing-path-availability wins); a deny-path log-write failure logs to stderr
+**and exits `DENY_EXIT` (1)** to surface the missing forensic record. This trades
+one bit of behavior — non-zero exit on the deny path even though the deny itself
+already happened — for a load-bearing security-audit invariant: a forensic record of
+"alice tried to mess with bob's pool" never disappears silently. The deny-path
+availability is unchanged (the deny still occurs regardless of log state); only the
+forensic-record-availability invariant gains explicit escalation.
 
 ### 9.6 · Race between caller `getuid()` and `--for-user` resolution
 
