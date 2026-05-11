@@ -538,22 +538,28 @@ appended to the failure line so the operator can copy-paste a fix.
 | C9 | route-helper has caps | `getcap /usr/local/libexec/sandboxd/sandbox-route-helper` reports `cap_net_admin,cap_sys_admin=eip`. Path resolved via `resolve_route_helper_path` (`sandboxd/sandboxd/src/main.rs:405`). | `sandbox update` re-runs setcap (Spec 5); or `make install-route-helper-prod-cap` in dev |
 | C10 | state dir mode | `stat /var/lib/sandbox/` (mode `0750`, owner `sandbox:sandbox`); plus `sessions/`, `events/`, `backups/` at `0700`; `sessions.db` at `0600` | `sudo chmod 0750 /var/lib/sandbox; sudo chown sandbox:sandbox /var/lib/sandbox` (the daemon corrects subdirs at next start; see § 5.4) |
 | C11 | users.conf reachable + parses + daemon's uid is in a pool | Daemon-side; the daemon's own startup already enforces this (`sandboxd/sandboxd/src/main.rs:6156-6177`), but the doctor surfaces it on a clean response surface rather than `journalctl` | If the daemon is running, this can't be failing; if it's not, the failure rolls up into C1 |
-| C12 | running sessions guest-version drift (verbose only) | For each running session, the daemon issues `GuestRequest::Version` (Spec 2 § 3.10) and compares to `sessions.guest_protocol_version`. Skipped in default mode to keep doctor cheap. | `recreate the session: sandbox session rm <id> && sandbox session create ...` |
+| C12 | running sessions guest-version drift (verbose only) | For each running session owned by the caller (Spec 2 § 2.2 filter; see § 13.2), the daemon issues `GuestRequest::Version` (Spec 2 § 3.10) and compares to `sessions.guest_protocol_version`. Skipped in default mode to keep doctor cheap; per-session linear-cost note in § 13.6. | `recreate the session: sandbox session rm <id> && sandbox session create ...` |
+| C13 | orphan substrate resources (**informational**) | Enumerate Lima VMs matching `sandbox-*` via `limactl list --format json` and Docker containers matching `sandbox-*` via `docker ps -a --format '{{.Names}}' --filter 'name=^sandbox-'`. Cross-reference each substrate-side name (form: `sandbox-<session-id>`) against the daemon's session list (`GET /sessions`, scoped to the calling operator per Spec 2 § 2.3 H2). Any `sandbox-<id>` resource whose `<id>` does not appear in the operator's session list is an orphan. **Daemon-side** check via `/diagnostics` (see § 13.2 revised) so the cross-reference is scoped to the connecting operator. Severity is informational — orphans can arise from (a) Spec 2's V006 destructive migration on dev-mode upgrade, where DB rows are deleted but substrate state is not swept (Spec 2 § 6.1 + revision-time `warn!`), (b) manual operator action (`docker rm` of a session container while the daemon is down), or (c) a future `sandbox update --purge` mode. Doctor's job is to surface them; reclaim is the operator's call. | `orphan substrate resources detected; run` ``limactl delete <name>`` `or` ``docker rm <name>`` `to recover resources, or` ``--purge`` `mode if you've intentionally wiped sessions` |
 
 Execution flow:
 
-1. Doctor runs C1; if it fails, C2-C11 fall through (they require a
-   running, reachable daemon). They are reported as `SKIPPED`, not
-   `FAILED`, with an `(requires daemon)` annotation. C4 (group
-   membership) and C9 (route-helper caps) can still run — they don't
-   depend on the daemon — and are evaluated. C10 (state-dir mode) needs
-   read access to `/var/lib/sandbox/`; the parent dir is `0750` so an
-   operator in `sandbox` group can stat it. If they're not in the group,
-   doctor reports C10 as `SKIPPED (requires sandbox group membership)`.
+1. Doctor runs C1; if it fails, C2-C13 (excluding C4 and C9) fall through
+   (they require a running, reachable daemon). They are reported as
+   `SKIPPED`, not `FAILED`, with an `(requires daemon)` annotation.
+   C4 (group membership) and C9 (route-helper caps) can still run — they
+   don't depend on the daemon — and are evaluated. C10 (state-dir mode)
+   needs read access to `/var/lib/sandbox/`; the parent dir is `0750` so
+   an operator in `sandbox` group can stat it. If they're not in the
+   group, doctor reports C10 as `SKIPPED (requires sandbox group
+   membership)`.
 2. Doctor runs C2; if it fails (socket missing or `EACCES`), C3-C8,
-   C11-C12 fall through (they need the socket). Same `SKIPPED` shape.
+   C11-C13 fall through (they need the socket). Same `SKIPPED` shape.
 3. Otherwise doctor runs all remaining checks in parallel (they're
    independent HTTP calls plus a few syscalls).
+
+C13 is informational: a detected orphan does **not** contribute to the
+exit-code-1 condition. Operators see the report and decide whether to
+reclaim, accept, or investigate.
 
 `SKIPPED` is distinct from `FAILED`: skipped checks don't contribute to
 the exit-code-1 condition. A skipped check that is the consequence of
@@ -809,6 +815,100 @@ under a millisecond on a Unix socket — and the safety property is worth
 it. We deliberately do **not** cache "this daemon was version X two
 seconds ago" because the cache complicates the failure mode (cached-stale
 skew is harder to diagnose than always-fresh).
+
+### 7.6 · `--version` output format for `sandboxd` and `sandbox`
+
+Install/update scripts (Spec 4's `install.sh`, Spec 5's `update.sh`)
+parse `sandboxd --version` and `sandbox --version` to detect a
+pre-existing install's version. The output format must be stable
+across releases or those scripts will break silently. This subsection
+pins it.
+
+**Exact format**, identical for both binaries:
+
+```
+<binary-name> <semver>\n
+```
+
+Concretely:
+
+```
+$ sandboxd --version
+sandboxd 1.0.0
+
+$ sandbox --version
+sandbox 1.0.0
+```
+
+Rules:
+
+- **One line.** Terminated by a single `\n`. No preamble, no banner,
+  no trailing blank line.
+- **Two tokens, single space separator.** `awk '{print $2}'` is the
+  load-bearing parse used by `install.sh` (Spec 4 § 4.4.5) and by
+  `update.sh` (Spec 5 § 3.1.2); the format is pinned to keep that
+  parse stable.
+- **Token 1** is the binary's filename (`sandboxd` or `sandbox`),
+  emitted verbatim by clap from the crate's `name` attribute.
+- **Token 2** is the semver from `env!("CARGO_PKG_VERSION")` — three
+  numeric components separated by dots, optionally followed by a
+  pre-release / build-metadata suffix per the semver grammar
+  (`1.0.0-rc.1`, `1.0.0+build.5`). No surrounding text, **no
+  architecture suffix**, **no build SHA suffix**, no `version` /
+  `v` prefix.
+- **Exit code** is `0` on stdout.
+- **Goes to stdout**, not stderr.
+
+Implementation: clap's derive macro produces exactly this format
+when the `#[command(name = "...", version)]` attribute is set on
+the top-level CLI struct. `sandboxd/sandboxd/src/main.rs:49-50`
+(daemon) and `sandboxd/sandbox-cli/src/main.rs:26-28` (CLI)
+both need the `version` flag added to their existing
+`#[command(...)]` attributes. No custom `--version` handler is
+needed.
+
+A regression test in § 11 pins the exact-format invariant so a
+future contributor adding a build SHA suffix sees an immediate test
+failure rather than a silent install.sh parse-break weeks later.
+
+### 7.7 · Half-installed recovery asymmetry — forward note
+
+A "half-installed" host is one where some but not all of the install
+artefacts exist (e.g. binary at `/usr/local/bin/sandboxd` but no
+systemd unit; or unit installed but no `/etc/sandboxd/users.conf`;
+or `/var/lib/sandbox/.install-state.json` missing despite binaries
+present). The recovery policy across the spec arc is **asymmetric**
+between install and update:
+
+- **`install.sh` (Spec 4) recovers half-installed state by
+  reinstalling on top** — forward-progress semantics. Detection at
+  Spec 4 § 4.4.5 treats "binary present, install-state file missing"
+  as fresh-install and proceeds. The script is idempotent: stomping
+  on a half-installed host with a complete install produces a healthy
+  install. Operators who got interrupted run `install.sh` again.
+
+- **`sandbox update` (Spec 5) refuses half-installed state with a
+  clear error** — fail-fast semantics. `sandbox update` reads
+  `/var/lib/sandbox/.install-state.json` to know what to upgrade;
+  on a half-installed host that file is missing or malformed, so
+  the CLI cannot determine the "from" version. The error text
+  directs the operator to **run `install.sh` to recover**, then
+  re-attempt `sandbox update`.
+
+This asymmetry is deliberate. Update assumes a known starting state
+and refuses to invent one; install assumes nothing and lays down a
+fresh state. Operators stuck mid-install run `install.sh`;
+operators on a fresh-install host run `sandbox update` to upgrade.
+Specs 4 and 5 are responsible for implementing the respective
+detection and error wording; Spec 3 only documents the cross-spec
+expectation so the two halves don't drift.
+
+The `sandbox doctor` C1 / C10 / C11 checks can surface the
+half-installed state to operators who don't know what to run —
+e.g. C1 reports "daemon process running: ✗ (sandboxd.service:
+not-found)" + C9 reports "route-helper caps: ✗ (binary not
+present at /usr/local/libexec/sandboxd/...)" → operator's
+takeaway is "I'm not fully installed; run install.sh".
 
 ## 8 · Image tag pinning
 
@@ -1181,14 +1281,20 @@ or in a sibling module if `ensure_base_dir_layout` is extracted.
 | `ensure_base_dir_layout_noop_when_correct` | Pre-create all three subdirs with `0700`; call function; assert no log events. |
 | `ensure_base_dir_layout_errors_when_subdir_is_file` | Create `sessions` as a regular file; call function; assert it returns `SandboxError::Internal`. |
 
-### 11.2 · Unit tests — `/version` endpoint
+### 11.2 · Unit tests — `/version` endpoint and `--version` CLI output
 
-Hermetic; spin up the daemon's `app(...)` router in-process.
+Hermetic; spin up the daemon's `app(...)` router in-process for the
+HTTP endpoint; spawn `sandboxd` / `sandbox` binaries with `--version`
+argv for the CLI-output checks.
 
 | Test name | Behavior |
 |---|---|
 | `version_endpoint_returns_cargo_pkg_version` | Hit `GET /version`; assert body `{"version": "<env!(CARGO_PKG_VERSION)>"}`. |
 | `version_endpoint_returns_200_with_application_json` | Assert content-type and status. |
+| `sandboxd_dash_dash_version_matches_pinned_format` | `Command::new(sandboxd_path).arg("--version")`; assert stdout matches the literal pattern `^sandboxd <semver>\n$` where `<semver>` equals `env!("CARGO_PKG_VERSION")`. No extra tokens, no leading/trailing whitespace, no second line. Exit code `0`. Pins § 7.6's format invariant against accidental drift (e.g. a contributor adding a build SHA suffix). |
+| `sandbox_dash_dash_version_matches_pinned_format` | Same shape, but for the CLI binary; asserts `^sandbox <semver>\n$`. |
+| `sandboxd_dash_dash_version_is_parseable_by_awk_print_2` | Run `sandboxd --version`, pipe through `awk '{print $2}'` (in-process equivalent: split on whitespace, take index 1); assert the result equals `env!("CARGO_PKG_VERSION")` exactly. Mirrors `install.sh` (Spec 4 § 4.4.5) and `update.sh` (Spec 5 § 3.1.2) parse logic; failure of this test is a downstream-script breakage signal. |
+| `sandbox_dash_dash_version_is_parseable_by_awk_print_2` | Same for the CLI binary. |
 
 ### 11.3 · Unit tests — CLI version-equality check
 
@@ -1199,7 +1305,7 @@ Hermetic; uses an in-process mock of `send_request`'s `/version` call.
 | `cli_version_check_proceeds_on_match` | Mock daemon returns `{"version": "1.0.3"}`; CLI's compile-time version is `1.0.3` (via a test-only override hook); assertion: caller's HTTP request is sent. |
 | `cli_version_check_refuses_on_skew` | Mock daemon returns `{"version": "1.0.4"}`; CLI version is `1.0.3`; assertion: stderr substring `version mismatch`, `CLI is 1.0.3`, `daemon is 1.0.4`; exit code is `2`. |
 | `cli_version_check_bypassed_for_doctor` | Invoke `sandbox doctor`; mock daemon returns mismatched version; assertion: doctor still runs; C3 reports mismatch as a failed check, not as a refusal-to-run. |
-| `cli_version_check_bypassed_for_version_subcommand` | Invoke `sandbox version`; assertion: CLI does not call `/version` at all (no daemon connection); prints CLI's own version. |
+| `cli_version_check_bypassed_for_version_subcommand` | Invoke `sandbox version`; assertion: CLI does not call `/version` at all (no daemon connection); prints CLI's own version in the pinned `sandbox <semver>\n` format. |
 
 ### 11.4 · Unit tests — doctor check registry
 
@@ -1213,10 +1319,13 @@ Hermetic; per-check happy-path + failing-condition table.
 | `doctor_check_version_fails_on_skew` | mock `/version` returns different version | — | check fails; line substring `CLI=X, daemon=Y` |
 | `doctor_check_group_membership_passes` | mock `getgroups()` includes `sandbox` GID | — | check passes |
 | `doctor_check_group_membership_fails_with_hint` | mock `getgroups()` does not include `sandbox` | — | check fails; hint substring `usermod -aG sandbox` |
-| `doctor_skips_dependent_checks_when_daemon_down` | mock socket connect fails | — | C3 / C5-C8 / C11-C12 report `SKIPPED`; final summary counts them as skipped, not failed |
+| `doctor_skips_dependent_checks_when_daemon_down` | mock socket connect fails | — | C3 / C5-C8 / C11-C13 report `SKIPPED`; final summary counts them as skipped, not failed |
 | `doctor_exits_0_when_all_pass` | every mock returns success | — | process exit code `0` |
 | `doctor_exits_1_on_any_failure` | one mock fails | — | exit code `1` |
 | `doctor_exits_2_on_internal_error` | inject a panic in the check runner | — | exit code `2` |
+| `doctor_check_c13_reports_orphan_substrate_resource` | mock `/diagnostics` returns `substrate_orphans.containers: ["sandbox-0fedcba98765"]` | — | check fires as `~ informational`, line substring `orphan substrate resources detected`, hint substring `limactl delete` or `docker rm`; exit code unaffected (informational does not flip exit code) |
+| `doctor_check_c13_silent_when_no_orphans` | mock `/diagnostics` returns empty `substrate_orphans.lima_vms` and `containers` | — | C13 passes in `--verbose`, suppressed in default mode |
+| `doctor_exit_code_unaffected_by_c13_orphans` | mock C13 reports orphans + all other checks pass | — | exit code is `0` (informational only) |
 
 ### 11.5 · Unit tests — `helper=` and rootless removal regression
 
@@ -1249,6 +1358,10 @@ These require real out-of-process state.
 | `integration_doctor_full_pass_against_running_daemon` | Standard happy-path harness with both images pre-built; `sandbox doctor --verbose` exits 0 and reports all checks passed. |
 | `integration_kvm_check_via_daemon_diagnostics` | Daemon configured without `kvm` group membership; doctor's C6 reports the failure with the documented hint (the daemon-side `/diagnostics` route returns the diagnostic). |
 | `integration_qemu_wrapper_no_helper_param_in_netdev` | Trigger Lima VM start; capture the QEMU argv emitted by the wrapper; assert the `-netdev bridge,...` argument has no `helper=` segment. Pins the runtime behavior of the post-removal wrapper. |
+| `integration_diagnostics_filters_drift_by_owner` | Two operators (alice, bob — fake-peer-cred fixture per Spec 2 § 7.5 / § 9.2); each creates a running session. Alice `GET /diagnostics`; assert `guest_version_drift[].session_id` includes alice's ID and **not** bob's. Bob `GET /diagnostics`; symmetric. Pins § 13.2's per-operator filter; closes the C4 data-leak gap from the audit. |
+| `integration_diagnostics_filters_orphans_by_owner` | Pre-stage a Lima VM named `sandbox-<bob_id>` (where `bob_id` belongs to bob's session); alice `GET /diagnostics`; assert `substrate_orphans.lima_vms` includes `sandbox-<bob_id>` (orphan from alice's perspective because she doesn't own it); bob `GET /diagnostics`; assert it is **not** in his `substrate_orphans` list (matches his session). Verifies the asymmetric-by-design behavior documented in § 13.2. |
+| `integration_doctor_c13_surfaces_post_v006_orphan` | Pre-V006 dev DB containing one session row + one matching Lima VM + one matching Docker container; daemon starts and applies V006 (DB rows deleted); `sandbox doctor` reports C13 with both substrate resources flagged as orphans; doctor exit code `0` (informational). End-to-end check that the V006 destructive-migration crater (Spec 2 § 6.1) is surfaced by C13. |
+| `integration_sandboxd_version_format_pinned_in_release_build` | Build `sandboxd` in `--release` profile; spawn `sandboxd --version`; capture stdout; assert exact equality `sandboxd <CARGO_PKG_VERSION>\n` (regex `^sandboxd [0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.+-]+)?\n$`). Backs the format-stability contract in § 7.6 against release-profile-only artefacts (e.g. a build script injecting a SHA into release builds only). |
 
 ### 11.7 · Notes on the systemd integration harness
 
@@ -1363,7 +1476,7 @@ or land outside the daemon process; the unit's hardening blocks the
 straight path. We accept this as a future constraint rather than
 loosening today.
 
-### 13.2 · KVM check from CLI's UID
+### 13.2 · Daemon-side `/diagnostics` endpoint — scope and per-operator filtering
 
 The doctor check C6 (`KVM accessible`) cannot be implemented inside
 the CLI process: the CLI runs as the operator (alice), but the
@@ -1372,8 +1485,27 @@ operative question is "can the **daemon's** uid (sandbox) read/write
 can run Lima VMs.
 
 Solution: a new daemon-side endpoint `GET /diagnostics` that the
-doctor consults for daemon-uid-scoped checks (C6, C7, C8, C11, C12).
-The endpoint returns a JSON object:
+doctor consults for daemon-uid-scoped checks (C6, C7, C8, C11, C12)
+and for the substrate-orphan cross-reference (C13). The endpoint
+returns a JSON object containing **two classes of data**:
+
+1. **Host-scoped facts** — daemon UID, KVM readability, image
+   presence, users.conf pool. Common to every connecting operator;
+   not gated.
+2. **Per-operator scoped data** — guest-version drift and substrate
+   orphan listings. Filtered to the connecting operator's session
+   ownership per Spec 2 § 2's storage-boundary `owner_username`
+   filter.
+
+The endpoint is gated by the same `Extension<OperatorIdentity>`
+extractor every session-ID-shaped handler uses (Spec 1 § 6, Spec 2
+§ 4). The acceptor resolves `SO_PEERCRED.uid` → username; the
+handler reads `operator.name` and threads it through to
+`SessionStore::list_sessions(caller_username)` and the live
+`GuestRequest::Version` fan-out so the response includes **only**
+the calling operator's session IDs.
+
+Response shape (post-revision):
 
 ```json
 {
@@ -1393,16 +1525,45 @@ The endpoint returns a JSON object:
       "live_binary_version": "0.1.0",
       "drift":           false
     }
-  ]
+  ],
+  "substrate_orphans": {
+    "lima_vms":   ["sandbox-0fedcba98765"],
+    "containers": ["sandbox-0fedcba98765"]
+  }
 }
 ```
 
-The endpoint runs each check inside the daemon process (so the
-relevant uid is the daemon's, not the caller's), and returns the
-aggregated result. The doctor renders the response as the C6-C8 /
-C11-C12 lines. Auth: none required (the socket is already group-
-restricted, and the response leaks only filesystem facts + version
-info, no per-operator data).
+Filter semantics:
+
+- `guest_version_drift[]` — the daemon enumerates running sessions
+  via `SessionStore::list_sessions(operator.name)` (Spec 2 § 2.4
+  filter), issues `GuestRequest::Version` against each, and emits
+  one entry per session. Sessions owned by other operators are
+  **not in the source list**, so they cannot appear in the response.
+- `substrate_orphans.lima_vms[]` and `substrate_orphans.containers[]`
+  — enumerated from `limactl list` / `docker ps -a` (substrate-side,
+  unfiltered), cross-referenced against the same
+  `list_sessions(operator.name)` result. A `sandbox-<id>` substrate
+  resource appears in the orphan array iff `<id>` is **not** a
+  session owned by the connecting operator. **Caveat:** this means
+  a substrate resource backing bob's session looks like an orphan
+  from alice's perspective. That asymmetry is acceptable because
+  (a) the orphan list is informational, not a destructive action,
+  and (b) the alternative — listing all `sandbox-*` resources host-
+  wide — would leak bob's session IDs to alice, defeating Spec 2.
+  Operators should interpret C13 in the context of their own
+  sessions; the doctor output text in § 6.2 makes this implicit by
+  referring to "your" sessions.
+
+The host-scoped facts (KVM, images, users.conf pool, daemon
+identity) carry no per-operator data and are returned to any
+authenticated caller verbatim.
+
+Auth: the socket is group-restricted at `0660 sandbox:sandbox` — any
+connecting caller is an operator. `Extension<OperatorIdentity>`
+provides the per-operator filter; an unresolvable peer-cred uid
+closes the connection per the strict-resolution policy (Spec 1
+§ 9.1 / Spec 2 § 4). No additional auth surface is added.
 
 Place the route alongside `/version` and `/health` at
 `sandboxd/sandboxd/src/main.rs:858`.
@@ -1544,16 +1705,25 @@ spec's scope maps to a tractable change-set.
 
 - `sandboxd/sandbox-cli/src/doctor.rs` (new) — `Check` trait, check
   registry, parallel runner, output formatter.
-- `sandboxd/sandbox-cli/src/main.rs` — wire `Command::Doctor { verbose: bool }`
+- `sandboxd/sandbox-cli/src/main.rs` — add `version` to the
+  `#[command(name = "sandbox", about = "Manage sandbox sessions")]`
+  attribute at line 27 so clap auto-emits `sandbox <semver>\n` on
+  `--version` (§ 7.6 invariant). Wire `Command::Doctor { verbose: bool }`
   variant near the existing `Health` / `Inspect` / `Describe` variants
   (lines 255-290). Wire the dispatch arm in `main()` after `Inspect`'s
   handler. Add the strict-equality `/version` check inside
   `send_request` (line 1107) with `Doctor` / `Version` subcommand
   bypass.
-- `sandboxd/sandboxd/src/main.rs` — new `version_handler` next to
-  `health_check` (line 5347); new `/version` and `/diagnostics`
-  routes near `main.rs:858`; new `ensure_base_dir_layout` function
-  near `default_base_dir` (line 116); call site immediately after
+- `sandboxd/sandboxd/src/main.rs` — add `version` to the
+  `#[command(name = "sandboxd", ...)]` attribute at line 50 so
+  clap auto-emits `sandboxd <semver>\n` on `--version` (§ 7.6
+  invariant); new `version_handler` next to `health_check`
+  (line 5347); new `/version` and `/diagnostics` routes near
+  `main.rs:858`; `/diagnostics` handler takes
+  `Extension<OperatorIdentity>` and filters `guest_version_drift` /
+  `substrate_orphans` to the connecting operator's sessions per
+  § 13.2; new `ensure_base_dir_layout` function near
+  `default_base_dir` (line 116); call site immediately after
   `tokio::fs::create_dir_all(&base_dir)` (line 6130).
 - `sandboxd/sandbox-core/src/store.rs` — chmod `sessions.db` to `0600`
   immediately after `Connection::open` (line 90).
@@ -1579,8 +1749,8 @@ new constant introduced.
 | Path | Touch type |
 |---|---|
 | `sandboxd/sandbox-cli/src/doctor.rs` | New: check trait, registry, runner, output formatter |
-| `sandboxd/sandbox-cli/src/main.rs` | Edit: `Command::Doctor { verbose: bool }` variant + dispatch; strict-equality `/version` check in `send_request`; bypass for `version` / `doctor` |
-| `sandboxd/sandboxd/src/main.rs` | Edit: `/version` route + handler; `/diagnostics` route + handler (KVM access, image presence, guest-version drift); `ensure_base_dir_layout` function + call site |
+| `sandboxd/sandbox-cli/src/main.rs` | Edit: add `version` to `#[command(...)]` so clap emits the pinned `sandbox <semver>\n` format (§ 7.6); `Command::Doctor { verbose: bool }` variant + dispatch; strict-equality `/version` check in `send_request`; bypass for `version` / `doctor` |
+| `sandboxd/sandboxd/src/main.rs` | Edit: add `version` to `#[command(...)]` so clap emits the pinned `sandboxd <semver>\n` format (§ 7.6); `/version` route + handler; `/diagnostics` route + handler (host-scoped facts + per-operator-filtered `guest_version_drift` and `substrate_orphans` per § 13.2); `Extension<OperatorIdentity>` extractor on `/diagnostics` so the filter has the connecting operator's identity; `ensure_base_dir_layout` function + call site |
 | `sandboxd/sandbox-core/src/store.rs` | Edit: chmod `sessions.db` to `0600` after `Connection::open` |
 | `sandboxd/sandbox-core/src/gateway.rs` | Edit: `GATEWAY_IMAGE_REPOSITORY` + `gateway_image_tag_for_version`; gateway-run call site uses version-pinned tag |
 | `sandboxd/sandbox-core/src/lima.rs` | Edit: `QEMU_WRAPPER_SCRIPT` body — delete the entire rootless-Docker branch (lima.rs:156-218); drop the `BRIDGE_HELPER` variable; emit `-netdev bridge,...` with no `helper=` parameter |
