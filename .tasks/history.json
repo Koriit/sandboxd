@@ -1,13 +1,12 @@
 {
   "current_state": {
-    "milestone": "M11",
-    "session": "M11-S10",
-    "status": "completed",
-    "completed_sessions": 79,
-    "total_sessions": 89,
-    "next": "M12-S1 \u2014 UDP audit + pre-DNAT deny-event fix (#29). First session of M12 (10-session loose-ends + UDP-hardening milestone). Audit UDP path map end-to-end, replace IP_ORIGDSTADDR-only deny-logger lookup with a conntrack netlink lookup so deny events carry the pre-DNAT 5-tuple, rewrite m10_s3_end_to_end.rs Phase 8 test 2, add a load-style integration test, and produce docs/internal/m12-s1-udp-audit.md for downstream sessions. See docs/internal/milestones/M12.md."
+    "milestone": "M12",
+    "session": "M12-S13",
+    "status": "finished",
+    "completed_sessions": 92,
+    "total_sessions": 92,
+    "next": "M12 complete; user reviews verification map"
   },
-  "append_system_prompt": "We are building sandbox daemon with Lima VMs for coding agents.  \nSpecifically: we are fixing todos and loose ends before planning support for macOS.  \nSession plan: docs/internal/session-plan.md\n\nUse /session-tracking for progress tracking. Log decisions and discoveries \\u2014 they survive compaction. Block if design cannot be implemented.\n\nYou are running unsupervised \\u2014 make autonomous decisions and do not wait for user input. If you hit an issue only the user can resolve, use progress block to pause the session.\n\nKeep context clean: delegate exploration and implementation to subagents. Reserve main conversation for decisions and coordination.\n\nLeverage teams, especially when there are build tools and tests involved, as those usually produce a lot of logs and are good fit for dedicated teammate to run them.\n\nYou are running in isolated VM with passwordless sudo. You can install packages and change system settings as needed.",
   "current_log": null,
   "log": [
     {
@@ -1554,6 +1553,256 @@
         "Cidr4::parse",
         "LM14"
       ]
+    },
+    {
+      "session": "M12-S1",
+      "title": "UDP audit + pre-DNAT deny-event fix",
+      "summary": "Replaced IP_ORIGDSTADDR-only deny-logger UDP path with conntrack netlink lookup; UDP deny events now carry pre-DNAT 5-tuple. Hand-rolled netlink encoding via netlink-sys (published netlink-packet-netfilter v0.2.0 lacks conntrack). Phase 8 test 2 rewritten to assert pre-DNAT; new integration_udp_load_pre_dnat_attribution_holds_under_concurrent_flows exercises 12 concurrent flows. NLM_F_ACK pitfall locked in by comment + unit test (kernel ack-frame leaked into next pipelined recv). NLA_F_NET_BYTEORDER mask added per review (kernel-ABI hardening). Lookup miss \u2192 post-DNAT fallback + tracing::warn!. Init failure \u2192 hard-fail startup. Audit notes at docs/internal/m12-s1-udp-audit.md surface 3 S2-scope issues (dead allow-path, networking-design.md drifts) and 6 S9 candidates as deferred todos. Tests: 1206 hermetic + 66 integration all green; clippy/fmt clean. Commits: c3bc626 + 08c1d3e.",
+      "completed": "2026-05-01T02:03:12.345154Z",
+      "decisions": [
+        "M12-S1 conntrack lookup uses hand-rolled netlink encoding via netlink-sys (not netlink-packet-netfilter): published v0.2.0 lacks conntrack support, only nflog. ~250 LOC stable kernel ABI emit/parse with full hermetic test coverage. Cargo.toml comment locks rationale + 'revisit when crates.io ships conntrack' marker.",
+        "On conntrack lookup miss (entry GC'd / race), deny-logger falls back to post-DNAT bind_addr + tracing::warn!, not drop. Losing deny attribution is strictly worse than emitting with less-accurate destination. CONNTRACK_LOOKUP_MISSES counter exposed via pub fn (not yet wired to /health). On netlink-socket init failure, deny-logger hard-fails startup so Docker HEALTHCHECK flips unhealthy + sandboxd restarts.",
+        "All review findings (1 MAJOR + 2 minors fold-inline) resolved before commit: NLA byte-order mask + comprehensive byte-order tolerance test, Phase 8 docstring rewritten, misleading miss-counter test claim corrected. Reviewer's m3-m6 deferred to M12-S9 as explicit todos."
+      ],
+      "discoveries": [
+        "UDP allow-path is structurally dead, not just under-tested: nft DNATs policy_allow_udp to Envoy:10000, but gateway input chain rejects udp dport 10000 and Envoy has no UDP listener. M12-S2 'fully working UDP at transport' is bigger than planned \u2014 needs design decision (add Envoy UDP, reshape nft to skip Envoy for UDP, or remove dead path).",
+        "No conntrack/netlink crate in workspace today. M12-S1 implementation needs new dependency: rust-native (netlink-packet-netfilter / nfnetlink_conntrack-rs) vs C-linked (nfct via libnetfilter_conntrack). Decision pending implementation phase.",
+        "networking-design.md lives at repo root, not docs/internal/. Plan references and docs that point at docs/internal/networking-design.md are stale; future doc-reconciliation work should fix the path or move the file.",
+        "NLM_F_ACK on netfilter CT_GET corrupts pipelined lookups: kernel sends successful entry reply followed by separate NLMSG_ERROR(errno=0) ack frame which next lookup's recv() consumes. Fix: drop NLM_F_ACK; on miss kernel sends NLMSG_ERROR(-ENOENT) regardless. Single-flow tests miss this; load tests catch it. Locked in via comment + unit-test assertion."
+      ],
+      "artifacts": [
+        "ConntrackLookup",
+        "udp.rs",
+        "m10_s3_end_to_end.rs",
+        "m12-s1-udp-audit.md"
+      ]
+    },
+    {
+      "session": "M12-S2",
+      "title": "Fully working UDP at transport level",
+      "summary": "M12-S2 'Fully working UDP at transport level' complete. Restructured the UDP datapath end-to-end: (a) extracted sandbox-event-emitter shared lib crate; (b) renamed sandbox-deny-logger -> sandbox-nft-deny-logger, replaced conntrack-driven UDP attribution with kernel NFLOG (group 1) + drop, deleted src/conntrack.rs entirely; (c) added new sandbox-nft-allow-logger driven by NFCT NFNLGRP_CONNTRACK_NEW subscription, writing nft-allow.jsonl; (d) extended daemon ingest with strict layer/event pairing parser, DenyLoggerAllow envelope variant, allow_body_dto mapper, EventName::Allow filter; (e) gateway container ships dual binaries with launch-both-then-probe-both pattern (:10003 deny + :10004 allow health), dual-PID process monitor; (f) JSONL filenames flipped to spec-mandated nft-deny.jsonl + nft-allow.jsonl; (g) UDP allow-path skips Envoy entirely (TCP-only proxy); (h) reconciled 5 user-facing docs (networking.md, networking-design.md, network-policies.md, policy-model.md, troubleshooting.md) to silent-drop + five-process model. Test parity: 4 new e2e UDP allow-path tests in test_m4_policy.py (NTP allow, bidirectional echo NEW-only, multi-port-same-host, CIDR-edge), test_m3_networking.py UDP-skip removed and replaced with real deny-event assertion, synthetic-JSONL integration_nft_allow_logger_ingest.rs (2 tests). Verification: 1221 hermetic tests pass, integration profile clean, clippy clean, fmt clean, e2e Lima-backend 5/5 pass. Review verdict APPROVE with 0 blockers / 0 majors / 3 minor citation nits (folded in). Landed as 4 commits c1f069f..0336342 on master (not pushed; awaiting user authorization).",
+      "completed": "2026-05-01T14:34:13.846378Z",
+      "decisions": [
+        "M12-S2 spec open questions resolved: (1) NFLOG group=1; (2) silent drop, no ICMP unreachable (reconcile networking-design.md:1221 to silent drop); (3) per-source rate cap deferred to S9; (4) delete src/conntrack.rs entirely after UDP-deny moves to NFLOG (TCP-deny uses SO_ORIGINAL_DST, no remaining caller); (5) /health field names preserved through rename, new fields added for allow-logger; (6) JSONL filenames nft-deny.jsonl + nft-allow.jsonl; (7) allow events fire on NFCT_T_NEW only, flow-end deferred.",
+        "EventEmitter::open signature changed: now takes layer: &str so each binary can set its own layer tag (deny-logger vs allow-logger). Line enum's layer field is now &'a str (borrow from emitter's owned String) instead of &'static str. JSONL on-disk shape preserved byte-for-byte because callers pass the original literal.",
+        "AllowRecord field set identical to DenyRecord (orig_dst_ip, orig_dst_port, protocol, src_ip, src_port). Same envelope, distinguished by event discriminator only ('allow' vs 'deny'). flow_id deferred (Resolution 7 NEW-only \u2014 no second event to correlate); forward-compat via Option<T> + #[serde(default)] when needed.",
+        "JSONL 'layer' value pinned at 'deny-logger' across the rename \u2014 daemon-side ingest parser keys on this string literal. Crate name and binary name both flipped to sandbox-nft-deny-logger but the wire-shape layer tag stays. Allow-logger will use a distinct layer value (TBD in Phase 3, likely 'allow-logger').",
+        "Daemon-side ingest layer-tag asymmetry: on-bus DTO layer always 'deny-logger' (single nft-logger family per Decision 5); discriminator is event tag (deny/allow/rate_limited). On-disk JSONL retains producer-specific layer tags ('deny-logger' vs 'allow-logger'); parser enforces layer/event pairing. nft_logger.rs (renamed from deny_logger.rs) handles both producers with parse_5tuple helper.",
+        "Allow-logger /health on port :10004 with nfct_socket and allow_events_emitted_60s fields. health::run is now polymorphic with body_builder (deny_logger_body / allow_logger_body); each binary plugs in its own shape. netlink-sys reused for NFCT subscription \u2014 netlink-packet-netfilter v0.2.0 doesn't cover conntrack subsystem.",
+        "Phase 4 launch pattern: launch-both-then-probe-both. Gateway entrypoint launches sandbox-nft-deny-logger + sandbox-nft-allow-logger in parallel after mitmproxy/Envoy/CoreDNS, then sequential readiness probes (:10003 deny -> :10004 allow). Process-monitor iterates DENY_LOGGER_PID + ALLOW_LOGGER_PID; either exiting takes container down per Decision 4.",
+        "Phase 6 doc reconciliation completed across five files (179+/25-): networking.md (five processes, TCP/UDP-split datapath), networking-design.md (UDP subsection rewritten + ICMP-unreachable mandate reconciled to silent drop), network-policies.md (UDP destinations section with NTP/UDP-123 example), policy-model.md (UDP-specific caveats H4 block), troubleshooting.md (UDP traffic section, 4 sub-entries).",
+        "Phase 5 e2e test pattern: bash /dev/udp/ for one-shot UDP sends (universal), socat for bidirectional (read-back required). All assertions hit the on-bus DTO (layer='deny-logger' on bus, event tag discriminates allow/deny) \u2014 agnostic to on-disk JSONL filename. RFC-5737 TEST-NET-3 (203.0.113.1) used for negative-tuple deny assertions to avoid collision with idle VM traffic. NTP (time.cloudflare.com:123) chosen as bidirectional probe \u2014 universally reachable, real protocol response to validate.",
+        "M12-S2 commit split landed as 4 commits instead of suggested 6: c1f069f feat(nft-loggers)! collapses lib-extract + deny rework + allow-logger + daemon ingest because file-level interleaving (events/ingest/{nft_logger,watcher,envelope,mod}.rs all carry both deny and allow content). Restructure authorized by spec/plan; resulting commits all compile mid-sequence. Followed by f301c36 gateway, 514fb3e e2e tests, 0336342 docs."
+      ],
+      "discoveries": [
+        "NFLOG bind is a three-step handshake on NETLINK_NETFILTER: (1) PF_BIND cmd=3 [NOT 1, that's CMD_BIND], (2) per-group CMD_BIND cmd=1 [WITHOUT this kernel never routes packets to socket], (3) CFG_MODE COPY_PACKET. Locked in nft-deny-logger nflog.rs.",
+        "NFLOG recv buffer can pack multiple NFULNL_MSG_PACKET frames in one recvmsg(); parser must drain all of them (parse_all loop), not return after first. Single-msg parse loses all but the first event in a burst \u2014 caught only by load-style integration test.",
+        "Allow-logger uses synthetic-JSONL integration test approach (no gateway image dep): tests/sandboxd/integration_nft_allow_logger_ingest.rs writes nft-allow.jsonl + asserts ingest dispatch. Mirrors existing events_ingest_integration.rs pattern. Real-binary live e2e covered in Phase 4+5.",
+        "deny-logger JSONL filename still 'deny-logger.jsonl' on disk after Phase 4 (deliberate). Spec Resolution 6 mandates 'nft-deny.jsonl'. Coordinated rename touches: networking/gateway/entrypoint.sh DENY_LOGGER_OUT default, sandbox-nft-deny-logger main.rs clap default, sandbox-core watcher.rs DENY_LOGGER_JSONL constant. Phase 6 docs already written for spec-mandated name.",
+        "SIGTERM doesn't promptly kill nft-loggers because spawn_blocking netlink-recv threads aren't woken by tokio cancel. Pre-existing behavior (matches the deny-logger before split). Entrypoint's 10s SIGKILL escalation handles cleanup. Cosmetic; flagged as latent S9 cleanup.",
+        "JSONL rename completed across 7 files (5 tracked + 2 untracked from earlier in session). Watcher.rs gained a strengthened negative test asserting legacy 'deny-logger.jsonl' is no longer in KNOWN_FILES \u2014 turns the rename into a tested invariant. 2 files (sandbox-nft-deny-logger/src/main.rs and integration_nft_allow_logger_ingest.rs) are untracked-but-modified \u2014 Phase 7 commit split must keep these atomic with the tracked rename so it doesn't get split across commits.",
+        "Gateway image must be rebuilt before integration tests when sandboxd loggers change; make test-integration does NOT auto-rebuild. Phase 5 first run failed 3/5 m10_s3_end_to_end tests with stale image (old sandbox-deny-logger expecting DNAT-to-:10002 datapath); make gateway-image then re-run flipped to 5/5 green. Worth either: hardening Makefile dep chain (gateway-image stamp triggers integration profile rebuild), or callout in CONTRIBUTING.",
+        "Forward-chain invariant changed in M12-S2: pre-S2 'every saddr-accept also has daddr' assumption no longer holds because gateway.rs admits VM-subnet UDP wholesale at FORWARD (PREROUTING NFLOG+drop already filtered denied UDP). test_denied_traffic relaxed to skip the wholesale UDP-accept rule when checking the daddr invariant for TCP-class lines. Live nft list ruleset prints L4 protocol numerically: UDP=17, TCP=6 \u2014 e2e regex assertions need numeric form.",
+        "Review M12-S2 verdict: APPROVE with 3 mechanical Minor findings (no Blockers, no Majors). All seven Resolutions and six Decisions from the spec faithfully implemented. Wire-protocol code (NFLOG + NFCT) well-disciplined: NLA flag-bit masking, multi-message recv drain, group=0 rejection at bind, NEW-only NFCT subscription. Strict layer/event pairing parser rejects all four cross-pairs. Doc set internally consistent. Full review in .tasks/handoffs/20260501-161400-kio-reviewer-m12-s2-review.md"
+      ],
+      "artifacts": [
+        "docs/internal/m12-s1-udp-audit.md"
+      ]
+    },
+    {
+      "session": "M12-S3",
+      "title": "ECHConfig stripping fix + policy-version doc clarification",
+      "summary": "M12-S3 'ECHConfig stripping fix + policy-version doc clarification' complete. Two commits landed on master: (1) f61a3ee fix(coredns-plugin) \u2014 reverted M10-era blanket-deny of SVCB/HTTPS DNS queries to original strip-not-deny intent: CoreDNS forwards queries upstream and strips only the ECH SvcParam from the response, records and other SvcParams pass through. Empty-param records preserved. Old _Blocked tests renamed to _StripsECHParam, new _NonECHPassesThrough + _DeniedDomain coverage. networking-design.md, docs/concepts/networking.md, and 2026-04-25 sync-DNS-gating spec wording sharpened to specify param-level semantics. (2) b7400cf docs \u2014 one-paragraph clarification in policy-model.md and network-policies.md that 'version' is the schema discriminator (currently 2.0.0; minor 2.x.x accepted, major must match), not a per-policy revision counter; pointed readers at policy_hash on policy_propagated/policy_updated lifecycle events and expected_hash/propagated_hash on GET /sessions/{id}/policy/propagation-status. Verification: go test ./... -count=1 -race clean, 1221 hermetic Rust tests pass, clippy clean, fmt clean. Two follow-ups deferred: drop unused hasECHParam helper (S5 candidate), optional ECH e2e coverage (no-priority).",
+      "completed": "2026-05-01T16:36:23.397670Z",
+      "decisions": [
+        "M12-S3 #98 ECHConfig fix landed at param-level (not record-level). Spec wording sharpened: networking-design.md:493/800 + docs/concepts/networking.md:205 now say 'strips the ECH SvcParam ... records and other SvcParams pass through' instead of the M10-era ambiguous 'strips records that carry ECHConfig'. The M10-S10 sync-dns-gating spec at lines 178-180/385/857 reconciled: 'AAAA denied at request time; SVCB/HTTPS forwarded with ECH SvcParam stripped from response; gate is A-only'. New helpers stripECHFromSection/stripECHFromRR/filterECHParams replace the old filterECHRecords. hasECHParam retained but currently unused in production (in-scope bullet asked for wiring, not deletion)."
+      ],
+      "discoveries": [
+        "Policy version field clarification (#99) landed: policy-model.md and network-policies.md gain one paragraph each clarifying 'version' is the schema discriminator (currently 2.0.0; minor 2.x.x accepted, major must match), not a per-policy revision counter. Per-policy identity surface: policy_hash on policy_propagated/policy_updated lifecycle events and expected_hash/propagated_hash on GET /sessions/{id}/policy/propagation-status (sandbox-core/api/mod.rs:79-89 + lifecycle.rs:94-145). +4 lines, no code touched.",
+        "Empty-param HTTPS records (only ECH param, nothing else) are kept in the response with an empty Value slice rather than dropped. Locked in by TestStripECH_HTTPSOnlyECHEndsWithEmptyParams. Rationale: dropping would re-introduce record-level removal semantics, which is exactly what S3 reverts. Operators should expect to see HTTPS RRs with empty SvcParams in cases where the upstream sent only an ECH-bearing record."
+      ],
+      "artifacts": [
+        ".tasks/handoffs/20260430-225554-m12-verify-99-policy-version.md"
+      ]
+    },
+    {
+      "session": "M12-S4",
+      "title": "Daemon validation & gateway hardening + ubuntu preset",
+      "summary": "M12-S4 daemon validation + ubuntu preset shipped via 5 commits (37d74e1..d383e62) on master. (1) 37d74e1 reject --no-cache on container caps + reject fractional --cpus on Lima at HTTP boundary (PerSessionNoCache UnsupportedFeature variant; SessionSpec.no_cache: Option<bool> threaded as per-invocation flag, NOT persisted). (2) 9581e7c hermetic cross-session L4 forward-chain isolation tests against pub generate_forward_allow_ruleset (3 tests: positive admit, absence-of-accept walk, per-session generator hygiene). (3) 01e0494 retargets the orphan M11-S1 TODO at lima.rs:298 to the container-runtime side-map pattern; LimaRuntime::ip migration filed as deferred todo #123. (4) 14984d5 LM2.10 wording fix \u2014 drops 'stateless over RuntimeHandle' phrasing. (5) d383e62 ubuntu preset (NTP UDP/123 to ntp.ubuntu.com+time.ubuntu.com Transport-level + apt HTTPS/443 to archive+security.ubuntu.com Tls-level; udp_transport_rule helper added; Lima-only e2e smoke). All four verification gates green: cargo build clean, 1229/1229 nextest pass, clippy clean, fmt clean. Local-only \u2014 no push per session-tracking constraint.",
+      "completed": "2026-05-01T17:22:33.512608Z",
+      "decisions": [
+        "M12-S4 #82 test file named cross_session_l4_isolation_integration.rs (not integration_*-prefixed) per repo convention: integration_* prefix is reserved for tests needing Docker/Lima/nft CLIs (selected by integration profile); this test is hermetic (calls pub generate_forward_allow_ruleset and pattern-matches emitted nft text). 3 tests added: positive-admit shape; absence-of-accept walk (load-bearing); per-session generator hygiene.",
+        "M12-S4 ubuntu preset shipped: 4 rules \u2014 NTP UDP/123 to ntp.ubuntu.com + time.ubuntu.com (Transport level \u2014 only valid for UDP per PolicyCompiler::validate), apt HTTPS/443 to archive.ubuntu.com + security.ubuntu.com (Tls level). HTTP/80 omitted (Ubuntu 22.04+ uses HTTPS mirrors by default). snap/livepatch/changelogs omitted (no measurement available; preset can grow if real workloads need them). udp_transport_rule helper added next to existing http_rule/tls_rule. e2e variant delivered (test_ubuntu_preset_smoke, Lima-only \u2014 apt-update + UDP/123 allow event).",
+        "M12-S4 #95+#81 daemon validation landed: no_cache: Option<bool> field added to SessionSpec (per-invocation flag, NOT persisted to SessionConfig \u2014 passed to session_spec_from_config as a parameter), validate() returns UnsupportedFeature::PerSessionNoCache(caps.kind) on Some(true) against caps with per_session_no_cache=false. Lima fractional cpus rejected at HTTP daemon boundary (sandboxd/src/main.rs create_session) with 400 \u2014 hard-reject not soft-warn because SessionDto.warnings is for post-success operator notices, not malformed-sizing accept. Pattern mirrors existing rejects_hardened test. 5 tests added (3 unit + 2 integration)."
+      ],
+      "discoveries": [
+        "M11-S1 Phase 1C deferred work item (b) was missed at the close \u2014 LimaRuntime::ip() still shells out via 'limactl shell <vm> -- ip -4 addr show eth1' instead of reading from a per-session side map. ContainerRuntime (M11-S3 Phase 3A) implements the right pattern: sessions: Mutex<HashMap<SessionId, ContainerNetwork>> populated by register_session before SessionRuntime::create. M12-S4 #97 retargeted the TODO from 'M11-S1 Phase 1C' to a concrete pointer at the container-runtime side-map pattern; deferred-todo filed for the actual lima migration.",
+        "Forward-allow generator (gateway.rs:1601 generate_forward_allow_ruleset) is single-session by design \u2014 each session has its own gateway container with its own nft table state, so no multi-session compile surface exists. M12-S4 #82 cross-session L4 isolation is provable structurally against the single-session generator: compile A's ruleset, walk every accept rule, prove no accept admits a daddr outside A's own (subnet,gw_ip) \u2014 by disjoint-subnet construction, B's subnet/gateway/vm_ip are unreachable. Trailing reject catches the rest."
+      ],
+      "artifacts": [
+        "37d74e1,9581e7c,01e0494,14984d5,d383e62"
+      ]
+    },
+    {
+      "session": "M12-S5",
+      "title": "Reviewer-nit round-up + cleanup renames",
+      "summary": "M12-S5 reviewer-nit round-up shipped via 9 commits (79fb3d2..c678329) on master. (1) 79fb3d2 inlines ROUTE_HELPER_BINARY_NAME, lifts SANDBOX_ROUTE_HELPER_PATH from shared Daemon::spawn into per-test extend_env closures (only tests #2 and #4 actually invoke the helper), adds 2 hermetic outer-wrapper tests for resolve_route_helper_path env-read (#86p1+p3, #87). (2) 2c5e94e changes sandbox-nft-deny-logger tcp::bind signature to u32 with saturating clamp to i32::MAX (the u32 signature IS the wrapper); adds drop(outcomes) drain-window comment (#86p2+p4). (3) 0f251db adds metadata-follows-symlinks docstring sentence + lib.rs intentional-asymmetry comment for helper-side users-conf functions (Option B per caller-graph analysis: only sandbox-route-helper uses them via explicit path) (#88, #90). (4) 6d183e9 marks Cidr4::parse #[doc(hidden)] (Option A; caller graph fully internal to sandbox-core) (#94). (5) 4e1092c mixes std::process::id() & 0xff into unique_session_id (PID tiebreaker > atomic counter for cross-process disambiguation) + comprehensive rename to integration_reaper_skips_resources_when_sibling_network_has_no_ipv4_ipam (#91, #92). (6) 9c7eda1 drops single (M11-S10) tag from orphan_reaper module-doc heading; remaining 8 inline references explicitly deferred to M12-S6 (#93). (7) 4f519ad drops unused hasECHParam helper from coredns-plugin/strip.go (#121). (8) 145e844 adds nix-rust/nix#2748 reference comment above libc::syscall fallback in sandbox-route-helper (#60 follow-up). (9) c678329 clarifies sudo timestamp_timeout behavior in installation.md One-shot setup section (#89). All 9 verification gates green: cargo build clean, 1231/1231 nextest pass (+2 vs M12-S4 baseline of 1229 due to #87's two new tests), clippy -D warnings clean, fmt clean, Go build/test/vet clean, and three grep gates zero hits (ROUTE_HELPER_BINARY_NAME, integration_reaper_skips_network_with_missing_ipam, hasECHParam). Two deferred follow-ups filed: #124 (validate_canonical_users_conf_security symlink_metadata hardening \u2014 deferred half of M11-S9 reviewer Nit #6) and #125 (51 pre-existing rustdoc warnings in sandbox-cli/src/main.rs surfaced during F's gate). Local-only \u2014 no push per session-tracking constraint.",
+      "completed": "2026-05-01T17:48:55.072005Z",
+      "decisions": [
+        "M12-S5 batch C #90 lib.rs re-export asymmetry resolved as Option B (deliberate omission with rationale comment). Helper-side users-conf functions (load_users_config_route_helper, route_helper_users_conf_path) have a single caller \u2014 sandbox-route-helper/src/main.rs \u2014 that imports via the explicit sandbox_core::users_conf::... module path, not through the crate-root re-export. Re-exporting them at the root would broaden the API surface for zero benefit and dilute the privilege-asymmetry signal. Comment block above pub use users_conf::{...} now documents the asymmetry as intentional.",
+        "M12-S5 batch B #86 part 4 wrapper: changed sandbox-nft-deny-logger tcp::bind signature itself from i32 to u32 (saturating to i32::MAX before socket2 listen, which is c_int by external constraint) rather than introducing a parallel bind_u32 wrapper. Production caller is the only non-test consumer; test sites are trivial to update; parallel API would leave dead surface. The u32 signature IS the wrapper. Saturation chosen over try_into().expect(...) since the whole point was eliminating the .expect panic path \u2014 a u32 backlog is intentional behavior, not an error.",
+        "M12-S5 batch F #94 Cidr4::parse marked #[doc(hidden)] (Option A). Caller graph is fully internal: every call site lives in sandbox-core (users_conf.rs, backend/orphan_reaper.rs, integration_orphan_reaper{,_cidr}.rs). No external workspace crate calls parse; sandboxd consumes Cidr4 only as a value type. Function is pub rather than pub(crate) purely so integration-test binaries (external crates from rustc's POV) can import it \u2014 the textbook 'internal API' branch. Visibility unchanged so existing callers keep compiling; only the doc-surface signal changes. lib.rs Cidr4 re-export untouched (the value type stays public).",
+        "M12-S5 batch E #93 chose Option A (drop inline (M11-S10) tag from orphan_reaper.rs section heading) but scoped narrowly to the single tag the reviewer flagged. Eight other inline M11-S10 references in the same file are explicitly deferred to M12-S6's broader milestone-reference cleanup (todo #102) \u2014 expanding the scope here would conflict with M12-S6. #92 rename: integration_reaper_skips_resources_when_sibling_network_has_no_ipv4_ipam (sweep boundary stops at code/test/in-tree-doc; preserved in frozen historical records under docs/internal/milestones/M11.md, .tasks/specs, .tasks/progress.json, .tasks/history.json \u2014 those describe past state). #91 PID-byte tiebreaker (std::process::id() & 0xff) chosen over atomic counter \u2014 atomics are per-process and can't disambiguate two parallel CI processes both starting from 0."
+      ],
+      "discoveries": [
+        "M12-S5 batch A #86 part 3 was an architectural reshape, not a per-test deletion: the SANDBOX_ROUTE_HELPER_PATH env-var setting lived in shared Daemon::spawn (integration_rootless_docker.rs), not in per-test bodies. Lifted to module-level TEST_ROUTE_HELPER_PATH constant + per-test extend_env closures for tests #2 and #4 only (which actually invoke the route helper). Tests #1 and #5 (which reject before setup_session_networking) now leave the env var unset. #87 outer-wrapper unit-test hermetic strategy: real has_required_caps reads file caps and runners can't setcap fixtures (no CAP_SETFCAP), so the env-set test asserts via error-message content using a non-existent /tmp/... path; the env-unset test tolerates both Ok(canonical) (dev hosts with route-helper installed) and Err(message naming canonical) (clean CI) \u2014 proves the env-read seam without requiring a specific host state."
+      ],
+      "artifacts": [
+        "79fb3d2,2c5e94e,0f251db,6d183e9,4e1092c,9c7eda1,4f519ad,145e844,c678329"
+      ]
+    },
+    {
+      "session": "M12-S6",
+      "title": "Milestone-reference cleanup",
+      "summary": "M12-S6 milestone-reference cleanup completed via 2 commits on master (c44077f, 5effe40). 668 milestone-tag occurrences (matching regex Mn-Sn or Mn-Sn Phase X) reduced to 2 deliberate-keep residuals across the production tree (sandboxd/, networking/, tests/e2e/, CLAUDE.md). Sweep covered 107 files spanning sandbox-core (api/backend/events/session/store/policy.rs/gateway.rs/lib.rs + integration tests), sandbox-event-emitter wire crate (event/health/lib/limits.rs + Cargo.toml), sandbox-nft-{deny,allow}-logger (incl. Cargo.toml dep rationale), sandboxd daemon (main.rs/lib.rs/events_http.rs/Cargo.toml + 7 integration test files), sandbox-route-helper, sandbox-cli (main.rs/backend.rs/presets/{builtin,mod,user,param,merge}.rs + tests/{preset_cli,events_binary,integration_no_cache_rejection}.rs + cargo_fetch_trace.json fixture), tests/e2e (8 .py files), networking/mitmproxy (4 .py files), networking/gateway (entrypoint.sh, healthcheck.sh), networking/coredns-plugin (6 .go files), and orphan_reaper.rs (the 8 inline M11-S10 references explicitly deferred from M12-S5). Substantive narrative preserved by rephrasing to describe behavior rather than history; symbol names and test FUNCTION names baking milestone in were kept verbatim (external references); test FILE names like m10_s2_end_to_end.rs and m10_s3_end_to_end.rs preserved with explicit doc-comments at the top. CLAUDE.md gains a 'No milestone tags in code or tests' bullet under 'Key conventions' (todo #102, M12.md exit criterion). Dispatched 6 parallel W-subagents (W1-W6) in first wave; concurrent git-stash incidents in W2/W6 silently destroyed ~250 sites of W1/W3/W4 work. Recovered by committing surviving W2/W5/W6 output as intermediate checkpoint c44077f, then re-dispatching 3 R-subagents (R1/R2/R3) with explicit no-stash prohibition. Final 11 strays cleaned inline. Verification: cargo build clean, 1231/1231 nextest pass, clippy -D warnings clean, fmt clean, Go build/test/vet clean, Python/shell syntax clean. Local-only \u2014 no push per session-tracking constraint.",
+      "completed": "2026-05-01T18:56:06.181813Z",
+      "decisions": [
+        "M12-S6 commit shape: 2 commits on master (c44077f intermediate checkpoint + 5effe40 final), not the 'single PR with categories' the M12.md plan suggested. The intermediate checkpoint was forced by the stash-pop loss recovery \u2014 anchoring surviving W2/W5/W6 work before re-dispatching W1/W3/W4 needed a real commit. The two-commit shape is fine for review: c44077f covers sandbox-core/nft-loggers/event-emitter, 5effe40 covers daemon/cli/e2e/mitmproxy/coredns/gateway/orphan_reaper + CLAUDE.md convention bullet. Both messages enumerate categories in the body."
+      ],
+      "discoveries": [
+        "M12-S6 hazard: parallel cleanup subagents that ran 'git stash / git stash pop' to verify pre-existing baselines silently destroyed each other's in-flight edits. The pop reads from a stash created with the entire dirty tree (including sibling agents' work) and then pops into a tree the siblings have moved on from \u2014 net effect is silent edit loss reported as 'Dropped'. ~250 sites of cleanup work were lost in the first M12-S6 wave from W1/W3/W4 and had to be re-swept (R1/R2/R3) after committing surviving work as an intermediate checkpoint c44077f. Lesson: when delegating parallel sweep agents touching the same workspace, prohibit 'git stash' explicitly and direct them to 'git show <commit>:<path>' for pre-existing-state checks."
+      ],
+      "artifacts": [
+        "c44077f,5effe40"
+      ]
+    },
+    {
+      "session": "M12-S7",
+      "title": "Native cp via limactl cp / docker cp",
+      "summary": "Refactored sandbox cp from in-tree base64-chunk byte pump to native dispatch: plan_cp_command(backend, session, direction, host, remote) returning (limactl cp -r ...) or (docker cp ...). Established the dispatch surface M12-S8 will extend with plan_sync_command. Side benefits: directory copy now works (was broken), attributes preserved (mode/sparse), error messages reach operator verbatim, container cp works against stopped sessions. Dropped base64 dep from sandbox-cli. 6 unit + 7 integration tests pin invocations on both backends; full hermetic suite 1237/1237 + clippy clean. Filed two deferred follow-ups: #126 (deprecate dead daemon /upload /download endpoints) and #127 (E2E test_cp_native_attributes for sparse + mode round-trip). Committed as f3fc855.",
+      "completed": "2026-05-01T19:14:52.069341Z",
+      "decisions": [
+        "M12-S7 cp dispatch shape: parallel free-functions (plan_ssh_command + plan_cp_command), not a trait. Rationale: matches existing backend-keyed dispatch idiom in the CLI; trait object adds no polymorphism we use. M12-S8 sync lands a sibling plan_sync_command on the same surface."
+      ],
+      "discoveries": [
+        "Pre-refactor sandbox cp had broken directory-upload (std::fs::read fails on dirs, despite docs/guides/workspaces.md claiming dirs were 'transferred as chunked base64'). Native dispatch fixes this transparently \u2014 limactl cp -r and docker cp recurse by default.",
+        "limactl cp -r is harmless on plain files (scp ignores -r for non-directories); docker cp recurses by default and rejects unknown flags. Hence asymmetric flag set in plan_cp_command: limactl gets unconditional -r, docker gets none."
+      ],
+      "artifacts": [
+        "docs/guides/troubleshooting.md"
+      ]
+    },
+    {
+      "session": "M12-S8",
+      "title": "rsync-like directory sync",
+      "summary": "Shipped 'sandbox sync' as a separate command (chosen over a 'cp --rsync' flag for clearer semantics). plan_sync_command planner sibling of plan_cp_command returns (rsync, [-a, --delete, -e 'limactl shell' or 'docker exec -i', src, dst]). rsync is a hard requirement; provisioned into both base images (Lima cloud-init apt-get baseline + lite Dockerfile, with the apt step renamed to apt-baseline). 6 unit + 7 integration tests pin invocations on both backends; full hermetic 1243/1243 + clippy clean. E2E placeholders added but not run (todo #130). Filed deferred follow-ups #128 (rsync flag pass-through), #129 (sync-against-stopped session troubleshooting bullet), #130 (E2E execution). Committed as acaac2f.",
+      "completed": "2026-05-01T19:39:24.149802Z",
+      "decisions": [
+        "M12-S8: ship 'sandbox sync' as a separate command (not 'sandbox cp --rsync'). Rationale: cp and sync carry distinct semantics (one-shot retransfer vs incremental mirror with --delete); folding both into cp puts two mental models behind one verb. Each command's contract is now obvious from its name.",
+        "M12-S8: rsync remote-shell uses 'limactl shell' on Lima and 'docker exec -i' on container \u2014 both as the -e arg to rsync. Rejected 'ssh -F ~/.lima/<vm>/ssh.config' because it's an internal Lima artefact. Rejected '-it' for docker exec because TTY corrupts rsync's binary wire protocol.",
+        "M12-S8: rsync required (not optional). Provisioned in both base images (Lima cloud-init apt-get baseline + lite Dockerfile). No runtime pre-flight probe \u2014 native error from rsync when missing is clearer than a Rust-emitted check. Establishes new contract for session images going forward."
+      ],
+      "discoveries": [
+        "bash builtin echo silently consumes -e as 'interpret escapes' flag, corrupting argv recorders. The cp shim happened to never see -e; the sync shim cannot. Use 'printf %s\\n' in shim recorders.",
+        "Lima base-image content hash automatically picks up generate_base_template() changes \u2014 adding a package to the apt baseline transparently triggers a rebuild on next sandbox create via existing staleness-detection. No extra plumbing needed."
+      ],
+      "artifacts": [
+        "tests/e2e/test_m5_workspace.py"
+      ]
+    },
+    {
+      "session": "M12-S9",
+      "title": "Backlog buffer: surface and resolve any new M12 todos",
+      "summary": "Drained M12 deferred backlog from 21 \u2192 4. Resolved 10 todos this session (#106 docs reconcile, #110 #122 #127 E2E test additions, #112+#117+#119 nft-loggers parser counters + SIGTERM clean exit, #120 Makefile no-change disposition, #126 dead /upload /download endpoint removal, #128 sandbox sync trailing-args). Plus three fix-here items from earlier in S9: #124 (users.conf canonical-path symlink rejection), #125 (51 rustdoc warnings \u2192 0), #129 (sync-against-stopped troubleshooting bullet). Dropped 7 todos as obsoleted by M12-S2's UDP datapath rework: #105 #111 (allow-path real and kernel-resident now), #109 #113 #114 #115 #116 (all targeted code in deleted conntrack.rs). Remaining 4 deferred all have clear 'something big' or execution-only reasons: #107 ICMP-unreachable spec/impl reconciliation, #108 per-source UDP rate limit feature, #123 LimaRuntime::ip side-map refactor, #130 E2E sync execution. 6 commits landed. Full hermetic suite 1232/1232; integration cp+sync 15/15; clippy clean; rustdoc clean. Clean hand-off to M12-S10 verification.",
+      "completed": "2026-05-01T20:42:38.535379Z",
+      "decisions": [
+        "M12-S9 #125 fix policy: demote private-item doc links to backtick-quoted code text rather than promoting items to pub. The constraint was doc-only edits; items are private for sound reasons (module-internal helpers/validators)."
+      ],
+      "discoveries": [
+        "Rustdoc resolves a module's '//!' inner doc-attribute against the PARENT module's scope, not the module's own. self::/super:: workarounds don't resolve; only fully-qualified crate::... paths work \u2014 even for items defined in the same file. Discovered during the M12-S9 #125 sweep when fixing inner-doc links in container_rootless_probe.rs and test_support/mod.rs."
+      ],
+      "artifacts": [
+        "docs/internal/milestones/M12.md"
+      ]
+    },
+    {
+      "session": "M12-S10",
+      "title": "Claim-to-code verification (terminal session for M12)",
+      "summary": "M12-S10 terminal verification gate PASSED. Built claim-to-code map at docs/internal/milestones/M12-delivery.md covering every concrete claim across S1\u2013S9: each claim maps to (a) code+test locator, (b) Explicitly deferred bullet verified absent, or (c) tracked follow-on with defer reason. Verification: make test 1232/1232, make test-integration 85/85, clippy clean, rustdoc 0 warnings. Every deferred bullet verified absent from tree. 4 follow-ons retained with clear reasons (#107 #108 #123 #130). M12 status flipped to completed in session-plan.md. M12 \u2014 closing notes block appended to M12.md. make test-e2e remains the single pre-merge gap, tracked as #130 (~80 min wall-clock). Committed as 2b46173 (fmt) + ad5348c (verification + close).",
+      "completed": "2026-05-01T21:07:41.139722Z",
+      "decisions": [],
+      "artifacts": [
+        "docs/internal/session-plan.md"
+      ]
+    },
+    {
+      "session": "M12-S11",
+      "title": "M12 backlog cleanup + deferred sync E2E",
+      "summary": "M12-S11 cleanup landed across 5 commits. Source tree (43539a3): route-helper rootful-Docker fix (CAP_NET_ADMIN ambient raise via two-step Permitted\u2192Inheritable\u2192Ambient promotion); test fixture passes --user uid:gid so setns(pidfd, NEWNET) clears ptrace_may_access; lite Dockerfile pre-creates /home/agent/workspace; E2E cp/sync paths moved off read-only /tmp; install paths and docs refreshed for cap_net_admin,cap_sys_admin=eip. Earlier: Runtime::ip() trait deletion (c1420bb), milestone-tag rename sweep (6c8b6b6), milestone-plan post-close-session entry (e03d208), end-to-end docs refresh (120d02a), CLAUDE.md crate/migrations/transport corrections (f4d3bcb), Lima cp -r and sync trail-slash fix (3e888c4), and time.ubuntu.com / SVCB\u2192HTTPS preset and test fixes (9f07740). Verification: 1236/1236 hermetic, 87/87 integration, 3/3 route-helper integration, 60/60 container E2E from earlier in session. Full Lima E2E re-run was blocked by two pre-existing daemon issues (partial-Lima-dir cleanup #136 and silent base-image provision failure #137) \u2014 both filed as deferred todos with reproducers; both are out of S11 scope. Selected todos (#131, #133, #134, #135) all completed; #130 (sync E2E both backends) deferred as post-M12 long-running validation.",
+      "completed": "2026-05-02T23:00:21.391716Z",
+      "decisions": [
+        "Dropped todos #107, #108, #123 after one-by-one review. #107: no spec/impl divergence (silent UDP drop is the design per networking-design.md:1121,1229); converted into GH issue Koriit/sandboxd#3 to revisit deny-ICMP posture for UX. #108: category error - RateCap is ingest-pipeline back-pressure, not per-source fairness, and there is no cross-tenant masking surface (one gateway = one VM). #123: trait method Runtime::ip() was structurally unused (daemon owns the IP via NetworkInfo); deleted trait method, both impls, test stub, and integration sanity-check. Workspace builds clean, 1230 hermetic tests pass, clippy clean.",
+        "M12-S11 #131 landed in 6c8b6b6: 13 milestone-tagged test files renamed via git mv, 12 reference sites updated, CLAUDE.md exemption removed. Rust m10_s2/s3_end_to_end.rs became event_ingestion_pipeline.rs / gateway_deny_pipeline.rs. .tasks/handoffs/ left as historical record. make test (1230 pass) and make test-integration (85 pass) clean.",
+        "M12-S11 #134 (docs/ refresh) landed in 120d02a: 14 files updated. Notable corrections: --memory-mb\u2192--memory, --layer=allow-logger\u2192--event=allow, gateway 'four-process'\u2192'five-process' model, sandbox-deny-logger\u2192sandbox-nft-deny-logger crate paths, lite-mode default cpus 4GB (not 2GB), HTTP API now documents /policy/propagation-status, /backends, source_presets, backend, force_rootless_docker, no_cache rejection.",
+        "Groups A+B fix landed in 3e888c4: 'fix(sandbox-cli): condition lima cp -r on dir source; auto-trail-slash on sync'. plan_cp_command and plan_sync_command grew a source_is_dir parameter; the call sites (handle_cp, handle_sync) stat the host-side source for Upload and pass false for Download. -r only emitted on Lima cp when host source is a directory (rsync-backed limactl cp 2.x ENOTDIR fix). Trailing slash auto-appended on directory-source sync upload (rsync contents-mirror idiom). Planners stay pure functions; hermetic + integration tests cover both branches. 1236 hermetic, 17/17 cp+sync integration green.",
+        "Route-helper rootful-Docker fix: chose ambient-cap raise (PR_CAP_AMBIENT_RAISE on CAP_NET_ADMIN before ip(8) exec) over direct rtnetlink. File caps now cap_net_admin,cap_sys_admin=eip. ~3 LoC + caps crate dep, vs 40+ transitive deps for rtnetlink-rs."
+      ],
+      "discoveries": [
+        "CLAUDE.md was wrong on two structural facts before #133: (1) crate count was 4, actual is 8 (sandbox-core, sandboxd, sandbox-cli, sandbox-guest, sandbox-route-helper, sandbox-event-emitter, sandbox-nft-deny-logger, sandbox-nft-allow-logger). (2) Guest-agent transport described as 'TCP-over-SSH' but actual mechanism is socat over limactl shell / docker exec (no SSH). Refinery-embedded SQL migrations under sandbox-core/migrations/ are the real schema-evolution surface, not inline Rust in SessionStore. Fixed in f4d3bcb.",
+        "E2E full matrix run 52/66/1 in 65 min. Lima half: 38 pass / 8 fail. 6 of 8 are real M12 regressions: (A) sandbox cp Lima \u2014 limactl 2.1.1 internally uses rsync and -r flag breaks file copies (rsync change_dir ENOTDIR). plan_cp_command docstring assumed scp semantics that no longer hold. (B) sandbox sync \u2014 tests use no-trailing-slash on src dir, impl forwards verbatim to rsync, files land at synced/<basename>/ instead of synced/. Design call between impl auto-trail vs test fix. Other 2 Lima failures (ubuntu_preset_smoke nslookup NXDOMAIN, svcb empty response) need separate investigation. Container half and test_lite.py: by design \u2014 rootless Docker on this dev VM rejected by lite spec \u00a7 Non-goals 1195.",
+        "After Docker reinstall to rootful (29.4.0, containerd snapshotter), integration_route_helper_denies_when_netns_ip_outside_caller_subnet fails with 'setns failed: EPERM' on Docker container netns. cap'd helper (cap_sys_admin+ep on /usr/local/libexec/sandboxd-test/sandbox-route-helper) cannot setns into root-owned container PIDs even though container userns == host init userns. setns to own pid works; setns to PID 1 (root-owned) also fails. Likely Ubuntu 24.04 unprivileged_userns AppArmor profile or Linux 6.8 hardening wrt cross-uid setns. Pre-existing environmental issue, NOT a code regression: last green test-integration on 6c8b6b6 was under rootless Docker. Other 84/85 integration tests pass (cp/sync dispatch all green after this session's planner fix).",
+        "Group C E2E failures were both real upstream issues, not gateway/code regressions. (1) Canonical removed time.ubuntu.com from authoritative DNS \u2014 apex returns SOA-only for this name across ns1.canonical.com/8.8.8.8/1.1.1.1; only ntp.ubuntu.com resolves. (2) cloudflare.com publishes HTTPS (TYPE65) at apex, not SVCB (TYPE64); test_svcb_record_without_ech_reaches_vm asked TYPE64, upstream returned NOERROR-zero-answers correctly. Both fixed in 9f07740: drop time.ubuntu.com from UBUNTU_NTP_HOSTS preset (was a 2-host list, now 1-host) and update SVCB test to query TYPE65. SVCB/HTTPS share wire format and stripECHFromRR handles both arms identically, so HTTPS exercises the same code path.",
+        "Container backend (--lite) is broken under rootful Docker 29.4.0 \u2014 sandbox create fails with 'sandbox-route-helper denied (exit 1): RTNETLINK answers: Operation not permitted' / 'ip route replace failed: exit 2'. Root cause: under rootless Docker the container's netns lives in a child user namespace, so cap_sys_admin in the parent userns implicitly grants cap_net_admin in the child (Linux userns rule); under rootful Docker the netns sits in the init userns directly, so the helper's spawned ip(8) process has no caps and cannot RTM_NEWROUTE. Adding cap_net_admin to the helper file caps doesn't fix it \u2014 file caps are dropped at exec, the spawned ip(8) needs ambient caps (PR_CAP_AMBIENT_RAISE) or the helper should issue the netlink op directly. NEW regression from the rootful Docker switch, not from S11 cleanup work. Out of S11 scope; needs follow-up to make container backend rootful-Docker compatible. Container-backend E2E entirely blocked on this; Lima-backend E2E unaffected.",
+        "Rootless Docker masked the route-helper bug via userns cap promotion: CAP_SYS_ADMIN in parent userns implicitly grants all caps in child userns when operating on objects in child userns, so a cap-less ip(8) child still succeeded at RTM_NEWROUTE. Rootful Docker has no such promotion.",
+        "PR_CAP_AMBIENT_RAISE under setcap requires the helper to first raise CAP_NET_ADMIN from its Permitted to its Inheritable set. File caps =eip put the cap in the FILE's inheritable set, but on exec a thread's Inheritable is taken from the parent's Inheritable (the unprivileged caller's, which is empty). The helper must call caps::raise(Inheritable, NET_ADMIN) before caps::raise(Ambient, NET_ADMIN).",
+        "Docker cp can't write to a --read-only container's tmpfs (/tmp) and can't read from it either; it only sees the rootfs overlay. /home/agent (mounted as a Docker volume) is visible to docker cp because volumes are not part of the rootfs. Test paths under /home/agent/ work on both backends; /tmp/ paths only work on Lima.",
+        "Route-helper test setns(pidfd, CLONE_NEWNET) under rootful Docker is gated by ptrace_may_access(PTRACE_MODE_READ_REALCREDS), which checks BOTH real uid AND real gid of the target task. Production passes --user 1000:1000; the test fixture passed only --user 1000, leaving gid at busybox image default (root/0), so gid mismatch denied setns. Fixed by passing uid:gid in test fixture.",
+        "Pre-existing daemon bug surfaced during full Lima E2E re-run: when 'limactl clone' fails after writing disk/cidata.iso but before lima.yaml, the partial Lima dir poisons every subsequent limactl invocation across all instances \u2014 every limactl op fatals on the missing lima.yaml. Daemon does not rm -rf the partial dir on clone failure. Manifests as cascading failure of every Lima E2E test downstream of the first failure. Manual fix: rm -rf the broken Lima dir. Out of S11 scope but worth a follow-up todo.",
+        "Lima base image build silently accepts a failed docker install: cc_scripts_per_boot allows Lima provision.system scripts to exit non-zero without aborting cloud-init, so the daemon's 'golden base image build complete' message fires even when docker-ce apt install failed mid-run. Each cloned session VM then re-runs provision.system on its own first boot, hits the same network flakiness, and fails again \u2014 this is the upstream cause of the Lima E2E cascade. Verified by inspecting /home/olek.guest/.lima/sandbox-base/serial.log: 'step=docker start' present, 'step=docker done' missing. Pre-existing, out of S11 scope."
+      ],
+      "artifacts": [
+        "43539a3,9f07740,3e888c4,f4d3bcb,120d02a,6c8b6b6,e03d208,c1420bb"
+      ]
+    },
+    {
+      "session": "M12-S12",
+      "title": "Fix Lima daemon bugs (#136 partial-dir cleanup, #137 base-image provision validation) + run deferred sync E2E (#130)",
+      "summary": "Resolved all three remaining M12-S12 deferred todos: (1) #136 partial-clone cleanup \u2014 added cleanup_partial_lima_instance with limactl-delete-then-rm-rf fallback wired into both clone_vm error arms; (2) #137 base provisioning validation \u2014 added validate_base_provisioning probing socat/git/rsync/docker via 'limactl shell command -v' between base VM start and golden-image stamping; (3) #130 sync E2E \u2014 ran test_sync_full_tree, test_sync_incremental_no_op, test_sync_delete_mirroring, test_sync_attribute_preservation against both lima and container backends, all 8 passed in ~12 min. Also hardened provision templates against apt EAGAIN flake (Acquire::Queue-Mode access + Pipeline-Depth 0 + retry loops around apt-baseline and curl|sh docker install). 1236 hermetic + 87 integration tests green, clippy clean, sandbox-base rebuilt and validated end-to-end. Committed as 092693d.",
+      "completed": "2026-05-03T00:17:11.148381Z",
+      "decisions": [],
+      "discoveries": [
+        "Lima SLIRP networking surfaces apt EAGAIN ('Could not wait for server fd - select (11: Resource temporarily unavailable)') under concurrent fetches. Acquire::Queue-Mode 'access' alone is insufficient \u2014 Pipeline-Depth=0 (forces serial requests within each connection) is the load-bearing fix. With it, base-image apt-baseline succeeds first try in ~85s.",
+        "limactl clone is non-atomic: writes disk + cidata.iso BEFORE lima.yaml. Mid-clone interruption leaves a dir with no lima.yaml, which then poisons every subsequent limactl invocation host-wide ('open lima.yaml: no such file or directory'). Cleanup must try 'limactl delete --force' first then fall back to direct 'rm -rf $LIMA_HOME/<vm>' since limactl refuses to operate on the corrupted instance.",
+        "Cloud-init's cc_scripts_per_boot does NOT abort the boot when a per-boot script exits non-zero \u2014 it logs a warning and proceeds. So 'limactl start' returning success is necessary but NOT sufficient for declaring a base image golden. Must probe in-VM tools post-start (command -v socat git rsync docker) before stamping. Without the probe, downstream cloned VMs re-run the same flaky provisioning at session-create time."
+      ],
+      "artifacts": [
+        "sandboxd/sandbox-core/src/lima.rs"
+      ]
+    },
+    {
+      "session": "M12-S13",
+      "title": "SANDBOX_BASE_VM_NAME knob + drop conftest preflight sweep",
+      "summary": "Isolated e2e from production daemon state via SANDBOX_BASE_VM_NAME (sub-section A) and SANDBOX_USERS_CONF dual-pool layout (B); deleted the conftest preflight sweep (C) safely under the new pool isolation; landed zero-skip e2e marker convention (D), docs sweep (E), and a defensive eth0 MTU clamp on Lima base/session templates (F) that closed the libslirp PMTU blackhole exposed when (A)'s rename forced fresh apt-update during base-image build. Folded in an end-to-end stability sweep once the suite was actually exercised: connect()-based daemon-readiness probe (b8a123c + 10909e4 covering the six inline respawn paths missed by b8a123c), graceful-then-force base VM stop (a02ac9e), nextest filter loosening for module-path-prefixed unit tests (fafcbb8), per-test byte-window daemon-log auto-dump (24f49ca + c62eaac), Makefile green \u2713 (e655d38), and a manual-iterate-path doc note for the venv ABI trap (c84bfce, resolving the rediscovered #138). #140 (cargo always-rebuild on sandbox-guest + sandbox-route-helper) dropped as not reproducible \u2014 host fingerprint trace showed only up-to-date markers. Operator smokes #1-#3 (SANDBOX_BASE_VM_NAME validation, pool isolation while production live, make setup-users-conf upgrade idempotency) all passed. Full make test-e2e runs to completion under the cumulative fix set; bind\u2192listen race and libslirp PMTU were the dominant flake sources. M12 closes with this session.",
+      "completed": "2026-05-06T12:04:46.881480Z",
+      "decisions": [
+        "SANDBOX_BASE_VM_NAME is set on the e2e harness's own os.environ at conftest module-import time (via os.environ.setdefault), not just on the spawned daemon's env. This lets test_golden_image.py read it as a module-level constant before any session-scoped fixture runs, and keeps Popen(env=...) calls simple \u2014 children inherit the parent env. Future env-var-driven test config should follow the same pattern."
+      ],
+      "discoveries": [
+        "S13's CIDR + base-VM-name isolation does NOT isolate ~/.lima/ itself: neither e2e conftest nor Rust integration tests set LIMA_HOME, so test and production daemons share the global ~/.lima/ directory. Test cleanup operates by name pattern (sandbox-*) over the shared store. Full ~/.lima/ isolation would require per-test LIMA_HOME=<tempdir> on the spawned daemon and integration tests \u2014 out of scope for S13.",
+        "S13 sub-section (F) \u2014 Lima base/session templates clamp eth0 (SLIRP NIC) MTU to 1280 via netplan dropin in a new step=net-tune provision block. Root-caused to libslirp not propagating host-learned PMTU into guest TCP state; surfaced because (A)'s base-VM rename forced a fresh apt-update during base-image build instead of reusing operator's pre-built image. Universal-safe IPv6 floor (RFC 8200 \u00a75); same choice as Cloudflare WARP/Tailscale. Session runtime egress on eth1/gateway-bridge keeps default 1500 \u2014 agent workloads unaffected. Commit 83b6cb1.",
+        "nextest filter 'not test(/^integration_/)' in sandboxd/.config/nextest.toml only anchors against bare test names \u2014 it filters integration tests in tests/ directories but does NOT filter unit tests inside src/ whose qualified name has a module prefix (e.g. 'tcp::tests::integration_foo'). The CLAUDE.md convention works for unit tests too only after the regex is loosened to '(^|::)integration_'. Surfaced when renaming sandbox-nft-deny-logger src/-mod tcp tests; not previously visible because every prior integration_* test lived in tests/.",
+        "tests/e2e/conftest.py sandbox_daemon readiness probe was racing the daemon bind/listen window: socket file appears at bind, connect returns ECONNREFUSED until listen. The old socket_path.exists() check returned prematurely, causing intermittent ECONNREFUSED on the first CLI call under load. Fixed in commit b8a123c by replacing the existence poll with an actual AF_UNIX connect probe (FileNotFoundError plus ConnectionRefusedError = keep polling, success = ready, anything else propagates).",
+        "Base-image stop step 5 (build_base_image_inner): single graceful limactl stop with 120s budget timed out under e2e suite I/O contention (in-guest systemd shutdown + qcow2 fsync of dirty pagecache exceeds budget). Replaced with graceful-then-force fallback (60s graceful + 60s force, total ceiling unchanged at 120s). Warn! on fallback preserves diagnostic signal \u2014 operators correlate recurring fallbacks with host load vs. genuine guest-side regressions. Force-stop is safe for the base image because it is a build artifact (qcow2 flushes via QEMU SIGTERM exit handler; metadata file write at step 6 is what finalizes the build). Commit a02ac9e.",
+        "E2E test failures now auto-dump the last 100 lines of sandboxd stderr/stdout to pytest's failure section via pytest_runtest_makereport + autouse fixture in tests/e2e/conftest.py. Removes the manual /tmp/pytest-of-*/sandboxd0/sandboxd.{stderr,stdout}.log step that was previously the first diagnostic move on every flake.",
+        "Three e2e test files deliberately SIGKILL the session-scoped sandboxd and Popen a fresh one on the same --socket and --base-dir, reopening the existing stderr/stdout log paths in append mode: test_networking.py:test_daemon_restart_recovery (and its fallback at test_networking.py:1058), test_lite.py (~:755), and test_policy_persistence.py (~:241). The respawned Popen handle is swapped back into sandbox_daemon[\"process\"] (conftest.py:545-552, 574-584). This means a single pytest session can have multiple sandboxd 'sandboxd starting' lines in the same log file \u2014 entirely expected, not a crash signal. Future log-tailing diagnostics must take this into account.",
+        "The bind\u2192listen race in sandboxd's startup window also affected SIX inline daemon-respawn paths in three e2e tests \u2014 the b8a123c fix landed only in the session-scoped fixture, missing test_lite.py:768/878, test_networking.py:981/1069, and test_policy_persistence.py:254/351, all of which polled os.path.exists() instead of attempting a connect(). When any of those tests hit their respawn path, the next test in the suite raced ECONNREFUSED into the bind\u2192listen window. Fixed in 10909e4 by extracting wait_for_daemon_ready(socket_path, proc, timeout) into tests/e2e/conftest.py and routing all seven call sites (the fixture + the six inline ones) through it. Future inline-daemon-respawn code MUST use this helper, not os.path.exists.",
+        "End-to-end suite (make test-e2e) now runs to completion under the cumulative S13 fix set (commits up to 10909e4) \u2014 confirms the bind\u2192listen race and libslirp PMTU blackhole were the dominant flake sources. Operator-confirmed validation.",
+        "tests/e2e venv version-mismatch trap is fully addressed: Makefile guard via VENV_STAMP target with python-minor-version-stamped filename was already in place from commit ccd0fd7 (April 25, 2026, M10-S8) \u2014 make-driven path auto-rebuilds the venv when host python3 minor version differs from the stamped one. The remaining gap was the manual 'source tests/e2e/.venv/bin/activate && python -m pytest' fast-iteration path documented in CLAUDE.md, which bypasses make and surfaces the trap as a bare ModuleNotFoundError. Commit c84bfce adds a one-paragraph warning + rebuild command directly under that snippet.",
+        "Cargo always-rebuild symptom on sandbox-guest + sandbox-route-helper does not reproduce. Verified on host: two consecutive 'cargo build --workspace' invocations finish in ~5s each with no Compiling lines; alternating with 'cargo build --workspace --tests --features sandbox-route-helper/test-env-override' (the Makefile install-route-helper-test-cap path) also stays cached; full 'make build' completes in ~7s twice. CARGO_LOG=cargo::core::compiler::fingerprint=trace shows only 'up-to-date' / 'filesystem up-to-date' lines for sandbox-guest, no 'dirty' markers. Workspace has zero build.rs files, ruling out the original primary hypothesis. No env-baked stamps either. Original report likely captured transient behavior (parallel make targets touching files, or initial-cold-cache phase). Dropping #140 as not reproducible; if the symptom recurs the diagnostic command captured in .tasks/handoffs/20260506-133833-todo-140-cargo-cache-investigation.md identifies the dirty reason in one line."
+      ],
+      "artifacts": [
+        "Commits: 89ba80e, 23225f3, 7209821, 76e5453, 0aefdc3, 4eba850, 83b6cb1, fafcbb8, b8a123c, e655d38, a02ac9e, 24f49ca, c62eaac, 10909e4, c84bfce, b9a2430. Closing notes: docs/internal/milestones/M12.md '## M12-S13 \u2014 closing notes' section. Investigation handoff (preserved): .tasks/handoffs/20260506-133833-todo-140-cargo-cache-investigation.md. Diagnostic infra now in place: tests/e2e/conftest.py wait_for_daemon_ready() helper + per-test daemon-log dump fixture."
+      ]
     }
   ],
   "todos": [
@@ -1837,7 +2086,10 @@
       "text": "BUG M10-S3 Phase 8 discovery: UDP deny events carry post-DNAT destination (gateway_ip:10002) instead of pre-DNAT (user's real target). Root cause: IP_ORIGDSTADDR cmsg does not expose pre-DNAT destination for conntrack-DNAT'd UDP like TCP's SO_ORIGINAL_DST does. Fix path: add conntrack netlink lookup in deny-logger UDP handler. Blocks useful M10-S4 discovery workflow for UDP traffic (TCP is fine, works via SO_ORIGINAL_DST). Reproduction: Phase 8 test 2 in sandboxd/sandboxd/tests/m10_s3_end_to_end.rs which currently asserts post-DNAT tuple with explanatory comment.",
       "added_session": "M10-S3",
       "added_timestamp": "2026-04-22T20:17:06.875567Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M12-S1",
+      "resolved_session": "M12-S1",
+      "resolved_timestamp": "2026-05-01T02:03:00.383911Z"
     },
     {
       "id": 30,
@@ -2340,14 +2592,20 @@
       "text": "Future: validate or warn on fractional --cpus for Lima sessions. Today sandboxd/src/main.rs:929 truncates 1.5 \u2192 1 silently for Lima (Lima uses QEMU -smp integers). Either reject Lima fractional cpus at the daemon boundary with a 400, or surface a daemon warn! log + an operator-visible warning string in SessionDto.warnings. Surfaced by kio-reviewer over M11-S7.",
       "added_session": "M11-S7",
       "added_timestamp": "2026-04-28T18:45:46.336941Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M12-S4",
+      "resolved_session": "M12-S4",
+      "resolved_timestamp": "2026-05-01T17:05:42.333005Z"
     },
     {
       "id": 82,
       "text": "Add gateway nftables-integration coverage for cross-session L4 isolation (container backend). M11-S7's e2e _probe_gateway_tcp can only verify positive reachability on container \u2014 gateway DNAT prerouting (sandbox-core/src/gateway.rs:1462-1486) rewrites every TCP/UDP packet from session A's saddr before it can leave the bridge, so cross-session 'A cannot reach B's gateway' is invisible at L4 from inside the session. The structural disjoint-subnet check in test_concurrent_sessions covers the architectural contract on both backends, but the runtime traffic-isolation property is currently only behaviourally tested on Lima (via ICMP). Add an in-tree integration test in sandbox-core that asserts: a packet from session A's vm_subnet targeting session B's vm_subnet is dropped by the forward chain. No spec change required.",
       "added_session": "M11-S7",
       "added_timestamp": "2026-04-28T20:06:42.248100Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M12-S4",
+      "resolved_session": "M12-S4",
+      "resolved_timestamp": "2026-05-01T16:58:32.799954Z"
     },
     {
       "id": 83,
@@ -2383,98 +2641,140 @@
       "text": "kio-reviewer NITs from M11-S9 diff (non-blocking, accepted as-is): (1) ROUTE_HELPER_BINARY_NAME constant in sandboxd/src/main.rs survives only as one error-format param, could be inlined; (2) tcp.rs outcomes Vec deserves a one-line comment near drop(outcomes) clarifying it exists to keep admitted streams alive past the 300ms drain window; (3) integration_rootless_docker.rs sets SANDBOX_ROUTE_HELPER_PATH unconditionally even for tests #1 and #5 that never invoke the helper \u2014 minor redundancy; (4) sandbox-deny-logger bind() takes i32 backlog while production code clamps via try_into().expect() \u2014 could move clamp into a u32-signature wrapper. All low-priority cleanup; pick up in any future deny-logger or route-helper touch.",
       "added_session": "M11-S9",
       "added_timestamp": "2026-04-29T19:36:44.567881Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M12-S5",
+      "resolved_session": "M12-S5",
+      "resolved_timestamp": "2026-05-01T17:47:03.011410Z"
     },
     {
       "id": 87,
       "text": "Add unit test for outer resolve_route_helper_path() env-var read in sandboxd/src/main.rs \u2014 inner predicate has 4-corner coverage, outer wrapper is integration-test-only. Same unsafe set_var/restore pattern as users_conf_path_honors_env_override. (M11-S9 reviewer Minor #4)",
       "added_session": "M11-S9",
       "added_timestamp": "2026-04-29T20:59:38.083528Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M12-S5",
+      "resolved_session": "M12-S5",
+      "resolved_timestamp": "2026-05-01T17:47:03.011444Z"
     },
     {
       "id": 88,
       "text": "Add a sentence to validate_canonical_users_conf_security docstring noting metadata() follows symlinks \u2014 target file's owner/mode is what gets checked. Optional: switch to symlink_metadata + reject symlinks if threat model justifies. (M11-S9 reviewer Nit #6)",
       "added_session": "M11-S9",
       "added_timestamp": "2026-04-29T20:59:38.195890Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M12-S5",
+      "resolved_session": "M12-S5",
+      "resolved_timestamp": "2026-05-01T17:47:03.011448Z"
     },
     {
       "id": 89,
       "text": "Clarify in setup-dev-env Makefile recipes or installation.md that sudo authenticates once via timestamp_timeout \u2014 multiple [sudo] announce lines do not equal multiple password prompts. (M11-S9 reviewer Nit #7)",
       "added_session": "M11-S9",
       "added_timestamp": "2026-04-29T20:59:38.332224Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M12-S5",
+      "resolved_session": "M12-S5",
+      "resolved_timestamp": "2026-05-01T17:47:03.011451Z"
     },
     {
       "id": 90,
       "text": "Resolve lib.rs re-export asymmetry: sandbox-core re-exports daemon-side load_users_config/load_users_config_from/users_conf_path but not the helper-side load_users_config_route_helper/route_helper_users_conf_path. Either expose both or add a comment explaining the deliberate omission. (M11-S9 reviewer Nit #8)",
       "added_session": "M11-S9",
       "added_timestamp": "2026-04-29T20:59:38.484762Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M12-S5",
+      "resolved_session": "M12-S5",
+      "resolved_timestamp": "2026-05-01T17:47:03.011453Z"
     },
     {
       "id": 91,
       "text": "unique_session_id in integration tests (orphan_reaper.rs and orphan_reaper_cidr.rs) mixes per-test seed with wall-clock low-order nanos \u2014 parallel CI runs on same host could collide. Inherited from legacy. Hardening option: mix in std::process::id() or atomic counter. Out of S10 scope. (M11-S10 reviewer m-2)",
       "added_session": "M11-S10",
       "added_timestamp": "2026-04-29T22:32:16.414285Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M12-S5",
+      "resolved_session": "M12-S5",
+      "resolved_timestamp": "2026-05-01T17:47:03.011456Z"
     },
     {
       "id": 92,
       "text": "Optional rename: integration_reaper_skips_network_with_missing_ipam \u2192 integration_reaper_skips_resources_when_sibling_network_has_no_ipv4_ipam (or similar). Test attaches container to bridge, not the IPv6-only network, due to alpine IPv6 stack limits \u2014 name vs behavior asymmetry. Doc comment already explains. (M11-S10 reviewer m-3)",
       "added_session": "M11-S10",
       "added_timestamp": "2026-04-29T22:32:16.500244Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M12-S5",
+      "resolved_session": "M12-S5",
+      "resolved_timestamp": "2026-05-01T17:47:03.011458Z"
     },
     {
       "id": 93,
       "text": "Cross-reference style consistency: orphan_reaper.rs module docstring tags 'Dual-anchor ownership model (M11-S10)' inline; docs/concepts/networking.md doesn't mirror the milestone tag. Either remove inline tag (let git log carry it) or mirror in docs. (M11-S10 reviewer n-1)",
       "added_session": "M11-S10",
       "added_timestamp": "2026-04-29T22:32:16.581944Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M12-S5",
+      "resolved_session": "M12-S5",
+      "resolved_timestamp": "2026-05-01T17:47:03.011461Z"
     },
     {
       "id": 94,
       "text": "Cidr4::parse made pub during M11-S10 for orphan-reaper cross-module use. If meant as internal API, consider #[doc(hidden)] to signal 'may change'. If meant as stable public surface, leave as-is. Cidr4 is already re-exported from sandbox-core. (M11-S10 reviewer n-2)",
       "added_session": "M11-S10",
       "added_timestamp": "2026-04-29T22:32:16.666411Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M12-S5",
+      "resolved_session": "M12-S5",
+      "resolved_timestamp": "2026-05-01T17:47:03.011463Z"
     },
     {
       "id": 95,
       "text": "M12 prep \u2014 daemon-side --no-cache enforcement gap (spec \u00a7 Validation sites + per_session_no_cache: false for container). Add no_cache field to SessionSpec, populate from request when constructing the spec, and have SessionSpec::validate() return Err(UnsupportedFeature::PerSessionNoCache(caps.kind)) when caps.per_session_no_cache is false. Mirror the existing Hardening/WorkspaceMode pattern. Add daemon-side rejection test integration_create_session_container::..._rejects_no_cache mirroring ..._rejects_hardened. Resolves TODO(M11-S4) at sandboxd/sandbox-core/src/backend/spec.rs:178. Currently the CLI is the only enforcer; a non-CLI HTTP client posting {\"backend\":\"container\",\"no_cache\":true} is silently accepted. Surfaced by spec-delivery verifier post-M11-S10. (M12 / macOS-support prep)",
       "added_session": "M11-S10",
       "added_timestamp": "2026-04-30T16:42:33.634024Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M12-S4",
+      "resolved_session": "M12-S4",
+      "resolved_timestamp": "2026-05-01T17:05:42.332959Z"
     },
     {
       "id": 96,
       "text": "M12 prep \u2014 delivery doc LM2.10 wording correction. Currently characterizes container runtime as 'stateless over RuntimeHandle'; actually only the trait surface is stateless, the impl carries per-session network info on a Mutex<HashMap> side map populated by the daemon (M11-S3 Phase 3A architectural compromise). Update LM2.10 cell text in .tasks/specs/2026-04-22-lite-mode-container-backend-design/2026-04-22-lite-mode-container-backend-design-delivery.md to read 'trait surface stateless; per-session network state on a daemon-populated side map' or equivalent. Surfaced by spec-delivery verifier. (M12 / macOS-support prep)",
       "added_session": "M11-S10",
       "added_timestamp": "2026-04-30T16:42:33.724815Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M12-S4",
+      "resolved_session": "M12-S4",
+      "resolved_timestamp": "2026-05-01T16:43:51.327847Z"
     },
     {
       "id": 97,
       "text": "M12 prep \u2014 orphan TODO(M11-S1 Phase 1C) at sandboxd/sandbox-core/src/backend/lima.rs:298 about IP attribution wiring. Phase 1C is closed; the TODO references a phase that no longer exists in the plan. Investigate: check whether IP attribution was wired up elsewhere during M11; if yes, delete the TODO comment; if no, retarget to a real future phase or convert to a concrete tracker todo. Surfaced by spec-delivery verifier (one of two orphaned TODOs found). The companion TODO at spec.rs:178 will be resolved by the --no-cache daemon-enforcement todo and self-deletes. (M12 / macOS-support prep)",
       "added_session": "M11-S10",
       "added_timestamp": "2026-04-30T16:42:33.813864Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M12-S4",
+      "resolved_session": "M12-S4",
+      "resolved_timestamp": "2026-05-01T16:43:51.327800Z"
     },
     {
       "id": 98,
       "text": "echconfig is supposed to be stripped but it seems like the whole HTTP record is denied",
       "added_session": "M11-S10",
       "added_timestamp": "2026-04-30T19:53:57.629169Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M12-S3",
+      "resolved_session": "M12-S3",
+      "resolved_timestamp": "2026-05-01T15:39:02.009010Z"
     },
     {
       "id": 99,
       "text": "policy version field is not version of the policy, it's the version of the policy schema - this needs to be clarified",
       "added_session": "M11-S10",
       "added_timestamp": "2026-04-30T19:56:50.154535Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M12-S3",
+      "resolved_session": "M12-S3",
+      "resolved_timestamp": "2026-05-01T15:30:52.456625Z"
     },
     {
       "id": 100,
@@ -2490,14 +2790,20 @@
       "text": "shouldn't sandbox cp actually use limactl cp on lima and docker cp on docker backend?",
       "added_session": "M11-S10",
       "added_timestamp": "2026-04-30T19:57:47.977686Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M12-S7",
+      "resolved_session": "M12-S7",
+      "resolved_timestamp": "2026-05-01T19:14:51.979760Z"
     },
     {
       "id": 102,
       "text": "why are milestone references everywhere in the code and tests? they are only relevant in the plan which is an ephemeral execution artifact",
       "added_session": "M11-S10",
       "added_timestamp": "2026-04-30T20:01:30.766530Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M12-S6",
+      "resolved_session": "M12-S6",
+      "resolved_timestamp": "2026-05-01T18:55:43.776632Z"
     },
     {
       "id": 103,
@@ -2513,7 +2819,359 @@
       "text": "cp is fine but we need also full rsync-like sync for dirs; not just simple copy",
       "added_session": "M11-S10",
       "added_timestamp": "2026-04-30T20:02:27.652661Z",
-      "status": "deferred"
+      "status": "completed",
+      "selected_session": "M12-S8",
+      "resolved_session": "M12-S8",
+      "resolved_timestamp": "2026-05-01T19:39:24.063608Z"
+    },
+    {
+      "id": 105,
+      "text": "S2 scope expansion: UDP allow-path is structurally dead. nft DNATs to Envoy:10000 but Envoy has no UDP listener AND gateway input chain at gateway.rs:1547 rejects udp dport 10000. Pre-S2 design decision required: (a) add Envoy UDP listener, (b) reshape nft so allow-path UDP skips Envoy, or (c) explicitly remove dead path. M12-S2's 'fully working UDP at transport' bullet inherits this decision \u2014 see docs/internal/m12-s1-udp-audit.md sections b1/b2.",
+      "added_session": "M12-S1",
+      "added_timestamp": "2026-05-01T00:04:40.385546Z",
+      "status": "dropped",
+      "resolved_session": "M12-S9",
+      "resolved_timestamp": "2026-05-01T20:41:23.345452Z"
+    },
+    {
+      "id": 106,
+      "text": "S2 doc reconciliation: networking-design.md:1395 claims 'UDP policy is enforced purely by nftables (IP/port allow/deny) with no userland proxy' but the deny path runs through the userland sandbox-deny-logger binary. Spec drift \u2014 fix wording or change implementation.",
+      "added_session": "M12-S1",
+      "added_timestamp": "2026-05-01T00:04:40.548729Z",
+      "status": "completed",
+      "selected_session": "M12-S9",
+      "resolved_session": "M12-S9",
+      "resolved_timestamp": "2026-05-01T20:41:24.184416Z"
+    },
+    {
+      "id": 107,
+      "text": "S2 spec/impl reconciliation: networking-design.md:1221 mandates ICMP unreachable for UDP rejects, but sandbox-deny-logger drops silently. Either spec or impl needs to give. Decide as part of M12-S2.",
+      "added_session": "M12-S1",
+      "added_timestamp": "2026-05-01T00:04:40.668767Z",
+      "status": "dropped",
+      "resolved_session": "M12-S11",
+      "resolved_timestamp": "2026-05-02T11:08:17.098887Z"
+    },
+    {
+      "id": 108,
+      "text": "S9 candidate: no per-source UDP rate limit in sandbox-deny-logger. TCP path enforces a per-connection cap; UDP only has a per-process cap. A noisy sender from a single VM can starve the deny-event channel for other sessions.",
+      "added_session": "M12-S1",
+      "added_timestamp": "2026-05-01T00:04:40.799628Z",
+      "status": "dropped",
+      "resolved_session": "M12-S11",
+      "resolved_timestamp": "2026-05-02T11:08:17.098958Z"
+    },
+    {
+      "id": 109,
+      "text": "S9 candidate: UDP recvmsg buffer fixed at 128B in sandbox-deny-logger silently truncates with no MSG_TRUNC accounting. Larger UDP datagrams lose payload bytes invisibly. Either bump buffer or surface MSG_TRUNC counts in deny events.",
+      "added_session": "M12-S1",
+      "added_timestamp": "2026-05-01T00:04:40.930820Z",
+      "status": "dropped",
+      "resolved_session": "M12-S9",
+      "resolved_timestamp": "2026-05-01T20:41:23.429973Z"
+    },
+    {
+      "id": 110,
+      "text": "S9 candidate: http+udp policy validation is unit-tested only. No e2e/integration test boundary check that http+udp combinations are rejected at the daemon API level.",
+      "added_session": "M12-S1",
+      "added_timestamp": "2026-05-01T00:04:41.057384Z",
+      "status": "completed",
+      "selected_session": "M12-S9",
+      "resolved_session": "M12-S9",
+      "resolved_timestamp": "2026-05-01T20:41:24.409358Z"
+    },
+    {
+      "id": 111,
+      "text": "S9 candidate (links to S2 todo above): policy_allow_udp set populated by DNS propagation is dead-code scaffolding until allow-path is real. If S2 chooses 'remove dead path' option, this scaffolding should also be torn out. If S2 chooses 'fix allow-path', this is correct.",
+      "added_session": "M12-S1",
+      "added_timestamp": "2026-05-01T00:04:41.181220Z",
+      "status": "dropped",
+      "resolved_session": "M12-S9",
+      "resolved_timestamp": "2026-05-01T20:41:23.519441Z"
+    },
+    {
+      "id": 112,
+      "text": "S9 candidate: wire CONNTRACK_LOOKUP_MISSES atomic into /health JSON shape next to events_emitted_60s. Today operators only see lookup misses via tracing::warn! log lines; numeric signal would be useful for alerting without log scraping. Low priority \u2014 warn is sufficient until production load shows non-zero misses.",
+      "added_session": "M12-S1",
+      "added_timestamp": "2026-05-01T01:23:24.953272Z",
+      "status": "completed",
+      "selected_session": "M12-S9",
+      "resolved_session": "M12-S9",
+      "resolved_timestamp": "2026-05-01T20:41:24.583217Z"
+    },
+    {
+      "id": 113,
+      "text": "S9 candidate: conntrack netlink recv buffer fixed at 4096 bytes. Adequate for IPv4/UDP entries but a CT entry with rich extension NLAs (mark, timeout, helper) could exceed it. Today surfaces as LookupError::Protocol (deny event still ships via post-DNAT fallback). Tighten with MSG_TRUNC accounting or dynamic alloc if real workloads ever hit it.",
+      "added_session": "M12-S1",
+      "added_timestamp": "2026-05-01T01:23:29.108859Z",
+      "status": "dropped",
+      "resolved_session": "M12-S9",
+      "resolved_timestamp": "2026-05-01T20:41:23.634330Z"
+    },
+    {
+      "id": 114,
+      "text": "S9 candidate (review m3): in sandbox-deny-logger UDP receive loop, conntrack lookup runs unconditionally before rate_cap.try_admit(). Under a deny storm at >cap rate, every dropped datagram still pays the netlink send+recv cost. Cheap fix: invert order so lookup only runs on admitted datagrams (rate_limited summary doesn't need per-datagram tuples). Pairs naturally with #108 UDP rate-cap hardening.",
+      "added_session": "M12-S1",
+      "added_timestamp": "2026-05-01T01:36:07.734505Z",
+      "status": "dropped",
+      "resolved_session": "M12-S9",
+      "resolved_timestamp": "2026-05-01T20:41:23.736161Z"
+    },
+    {
+      "id": 115,
+      "text": "S9 candidate (review m4): conntrack netlink Socket is in blocking mode (netlink_sys::Socket::new doesn't set SOCK_NONBLOCK) and lookup runs inside tokio UDP task without spawn_blocking. Microsecond latency in practice and UDP task is single-purpose, but technically deviates from CLAUDE.md async/blocking convention. Either (a) add a comment explaining why blocking is acceptable here, or (b) wrap socket in tokio::io::unix::AsyncFd (the impl AsRawFd is already there). conntrack.rs:236-258, udp.rs:107-141.",
+      "added_session": "M12-S1",
+      "added_timestamp": "2026-05-01T01:36:12.064269Z",
+      "status": "dropped",
+      "resolved_session": "M12-S9",
+      "resolved_timestamp": "2026-05-01T20:41:23.832110Z"
+    },
+    {
+      "id": 116,
+      "text": "S9 candidate (review m5): iter_nlas in conntrack.rs:489-516 allocates Vec<(u16, &[u8])> per call, called 3-4x per kernel reply (top-level, IP sub-tuple, proto sub-tuple). Convert to lazy iterator (impl Iterator<Item = Result<(u16, &[u8]), LookupError>>) for zero-allocation walk. Tracking-only; not load-bearing today.",
+      "added_session": "M12-S1",
+      "added_timestamp": "2026-05-01T01:36:15.454298Z",
+      "status": "dropped",
+      "resolved_session": "M12-S9",
+      "resolved_timestamp": "2026-05-01T20:41:23.947842Z"
+    },
+    {
+      "id": 117,
+      "text": "S9 nit (review m6): in sandbox-deny-logger (binary crate), lookup_misses() and reset_lookup_misses() are pub + #[allow(dead_code)] \u2014 pub is misleading because [[bin]] crates have no library surface. Either tighten to pub(crate) or add a TODO(M12-S2)/wire-to-/health comment so the lifecycle is visible to grep. conntrack.rs:169-172.",
+      "added_session": "M12-S1",
+      "added_timestamp": "2026-05-01T01:36:18.613774Z",
+      "status": "completed",
+      "selected_session": "M12-S9",
+      "resolved_session": "M12-S9",
+      "resolved_timestamp": "2026-05-01T20:41:24.758018Z"
+    },
+    {
+      "id": 118,
+      "text": "S2 follow-up: coordinated deny-logger.jsonl -> nft-deny.jsonl rename per spec Resolution 6 (entrypoint env-var default + binary clap default + sandbox-core watcher constant DENY_LOGGER_JSONL -- atomic single change before Phase 7 close)",
+      "added_session": "M12-S2",
+      "added_timestamp": "2026-05-01T12:52:35.490625Z",
+      "status": "completed",
+      "selected_session": "M12-S2",
+      "resolved_session": "M12-S2",
+      "resolved_timestamp": "2026-05-01T13:03:03.928458Z"
+    },
+    {
+      "id": 119,
+      "text": "S9 candidate: nft-loggers SIGTERM clean exit. spawn_blocking netlink-recv not woken by tokio cancel; relies on 10s SIGKILL escalation. Could be fixed with non-blocking socket + poll/cancel-token or signal-arm fd close. Cosmetic, low priority.",
+      "added_session": "M12-S2",
+      "added_timestamp": "2026-05-01T12:52:37.023937Z",
+      "status": "completed",
+      "selected_session": "M12-S9",
+      "resolved_session": "M12-S9",
+      "resolved_timestamp": "2026-05-01T20:41:24.930116Z"
+    },
+    {
+      "id": 120,
+      "text": "S9 candidate: Makefile auto-rebuild gateway image when sandboxd nft-loggers change. Stamp dependency from sandbox-nft-deny-logger + sandbox-nft-allow-logger build outputs to gateway-image stamp. Currently silent staleness can mask integration test correctness.",
+      "added_session": "M12-S2",
+      "added_timestamp": "2026-05-01T14:03:54.735976Z",
+      "status": "completed",
+      "selected_session": "M12-S9",
+      "resolved_session": "M12-S9",
+      "resolved_timestamp": "2026-05-01T20:41:25.103829Z"
+    },
+    {
+      "id": 121,
+      "text": "S5 candidate: drop unused hasECHParam helper from networking/coredns-plugin/strip.go. After M12-S3 strip-the-param rewrite, only containsECHKey is called in production. M12-S3 in-scope bullet explicitly preserved hasECHParam. Trivial cleanup for the reviewer-nit round-up.",
+      "added_session": "M12-S3",
+      "added_timestamp": "2026-05-01T15:39:04.711781Z",
+      "status": "completed",
+      "selected_session": "M12-S5",
+      "resolved_session": "M12-S5",
+      "resolved_timestamp": "2026-05-01T17:47:03.011466Z"
+    },
+    {
+      "id": 122,
+      "text": "Optional ECH e2e coverage: verifier-recommended test asserting an SVCB-without-ECH record reaches the VM end-to-end. Not in M12-S3 exit criteria; could be its own e2e session if ECH propagation becomes a production concern.",
+      "added_session": "M12-S3",
+      "added_timestamp": "2026-05-01T15:39:06.291714Z",
+      "status": "completed",
+      "selected_session": "M12-S9",
+      "resolved_session": "M12-S9",
+      "resolved_timestamp": "2026-05-01T20:41:25.281670Z"
+    },
+    {
+      "id": 123,
+      "text": "LimaRuntime::ip should source IP from a per-session side map, not 'limactl shell'. sandbox-core/src/backend/lima.rs:303 currently shells out via 'limactl shell <vm> -- ip -4 addr show eth1' and parses the dotted-quad \u2014 requires VM running with eth1 up (neither holds during create / post-stop windows) and costs a limactl round-trip per call. ContainerRuntime (sandbox-core/src/backend/container.rs:245) already implements the right pattern: sessions: Mutex<HashMap<SessionId, ContainerNetwork>> populated by register_session before SessionRuntime::create, ip() returns from that map. Mirror it for Lima: add register_session(session_id, vm_ip) to LimaRuntime, daemon populates from NetworkInfo.vm_ip at create time, replace shell-out with side-map lookup. Original M11-S1 Phase 1C deferred work item (b).",
+      "added_session": "M12-S4",
+      "added_timestamp": "2026-05-01T16:43:49.695615Z",
+      "status": "dropped",
+      "resolved_session": "M12-S11",
+      "resolved_timestamp": "2026-05-02T11:08:17.098968Z"
+    },
+    {
+      "id": 124,
+      "text": "Harden validate_canonical_users_conf_security against symlinked canonical paths: switch from fs::metadata to fs::symlink_metadata and reject when the canonical /etc/sandboxd/users.conf is a symlink (return UsersConfigError::InsecureFile with a reason pointing at the install runbook). Add a unit test creating a symlink at a tempfile-canonical path and asserting refusal. Origin: M11-S9 reviewer Nit #6 (deferred from M12-S5 batch C; doc-only fix landed there as todo #88).",
+      "added_session": "M12-S5",
+      "added_timestamp": "2026-05-01T17:33:22.333445Z",
+      "status": "completed",
+      "selected_session": "M12-S9",
+      "resolved_session": "M12-S9",
+      "resolved_timestamp": "2026-05-01T19:58:58.447258Z"
+    },
+    {
+      "id": 125,
+      "text": "Fix 51 pre-existing rustdoc warnings in sandbox-cli/src/main.rs surfaced during M12-S5 #94 verification: unresolved-link to BackendKind / SessionSpec::validate / generic-parameter Self<E>, plus an unclosed <kind> HTML tag. Run 'cd sandboxd && cargo doc --workspace --no-deps' to enumerate the full list. Out of scope for the M12-S5 reviewer-nit round-up; candidate for a future doc-cleanup pass.",
+      "added_session": "M12-S5",
+      "added_timestamp": "2026-05-01T17:35:54.469954Z",
+      "status": "completed",
+      "selected_session": "M12-S9",
+      "resolved_session": "M12-S9",
+      "resolved_timestamp": "2026-05-01T19:58:58.447291Z"
+    },
+    {
+      "id": 126,
+      "text": "Deprecate or remove daemon /sessions/{id}/upload and /sessions/{id}/download endpoints. CLI-dead after M12-S7 cp refactor; only guest agent path inside daemon still uses them. Forward-compat decision (HTTP API) \u2014 file as separate change with rollback story.",
+      "added_session": "M12-S7",
+      "added_timestamp": "2026-05-01T19:14:19.879203Z",
+      "status": "completed",
+      "selected_session": "M12-S9",
+      "resolved_session": "M12-S9",
+      "resolved_timestamp": "2026-05-01T20:41:25.454507Z"
+    },
+    {
+      "id": 127,
+      "text": "E2E test_cp_native_attributes: round-trip a 10 MB sparse file with mode 0700 across both backends; verify size + mode preserved end-to-end. Validates that native limactl cp / docker cp preserve attributes the old base64-pump didn't (CLI never set mode on FileUploadRequest). Out of scope for M12-S7 (delegation forbade running full E2E).",
+      "added_session": "M12-S7",
+      "added_timestamp": "2026-05-01T19:14:19.963609Z",
+      "status": "completed",
+      "selected_session": "M12-S9",
+      "resolved_session": "M12-S9",
+      "resolved_timestamp": "2026-05-01T20:41:25.624449Z"
+    },
+    {
+      "id": 128,
+      "text": "Add trailing-args slot to 'sandbox sync' for rsync flag pass-through (--exclude, --bwlimit, --partial, --info=progress2). Use clap trailing_var_arg, mirroring the 'sandbox ssh' pattern. Additive and non-breaking. Defer until operator demand surfaces.",
+      "added_session": "M12-S8",
+      "added_timestamp": "2026-05-01T19:37:58.729372Z",
+      "status": "completed",
+      "selected_session": "M12-S9",
+      "resolved_session": "M12-S9",
+      "resolved_timestamp": "2026-05-01T20:41:25.796848Z"
+    },
+    {
+      "id": 129,
+      "text": "Add 'sync against stopped session' troubleshooting bullet to docs/guides/troubleshooting.md, symmetric with the cp-side entry. Native rsync error propagation already works; this is a doc-only follow-up for parity.",
+      "added_session": "M12-S8",
+      "added_timestamp": "2026-05-01T19:37:58.819300Z",
+      "status": "completed",
+      "selected_session": "M12-S9",
+      "resolved_session": "M12-S9",
+      "resolved_timestamp": "2026-05-01T19:58:58.447296Z"
+    },
+    {
+      "id": 130,
+      "text": "Run E2E sync tests against both backends after M12 closes: tests/e2e/test_m5_workspace.py::test_sync_full_tree, test_sync_incremental_no_op, test_sync_delete_mirroring, test_sync_attribute_preservation. Each takes ~10 min; full pair is ~80 min so out of scope for orchestrator session work.",
+      "added_session": "M12-S8",
+      "added_timestamp": "2026-05-01T19:37:58.910789Z",
+      "status": "completed",
+      "selected_session": "M12-S12",
+      "resolved_session": "M12-S12",
+      "resolved_timestamp": "2026-05-03T00:16:34.288684Z"
+    },
+    {
+      "id": 131,
+      "text": "Remove the milestone-tag exemption from CLAUDE.md and rename all milestone-tagged file/symbol names (e.g. tests/e2e/test_m4_policy.py, sandboxd/sandboxd/tests/m10_s3_end_to_end.rs, test_m85_golden_image.py, etc.) to milestone-agnostic names. CLAUDE.md currently says 'Test FILE names ... and symbol names that have already become external references are exempt \u2014 keep them.' \u2014 user wants no exceptions. Scope: (a) edit CLAUDE.md to remove the exemption sentence; (b) sweep tests/e2e/test_m*.py, sandboxd/**/tests/m*_s*_*.rs, sandboxd/**/tests/integration_m*_*.rs and any other milestone-tagged symbol/file; (c) update any pytest/cargo invocations or docs that name those files; (d) verify make test + make test-integration still discover the renamed tests.",
+      "added_session": "M12-S11",
+      "added_timestamp": "2026-05-02T11:10:51.721147Z",
+      "status": "completed",
+      "selected_session": "M12-S11",
+      "resolved_session": "M12-S11",
+      "resolved_timestamp": "2026-05-02T22:59:53.538963Z"
+    },
+    {
+      "id": 132,
+      "text": "CLAUDE.md is heavily out of date \u2014 refresh end to end. Specific staleness already noticed: (a) line 7 says 'Rust workspace (4 crates: sandbox-core, sandbox-cli, sandboxd, sandbox-guest)' but the workspace now also has sandbox-event-emitter, sandbox-nft-deny-logger, sandbox-nft-allow-logger, sandbox-route-helper \u2014 8 crates total; (b) line 17 'make test-integration: test + every #[ignore]d integration test' contradicts the integration_* prefix convention right below it (the #[ignore] gate was replaced by the prefix-based nextest profile in M11/M12 \u2014 no more #[ignore] for integration tests); (c) lines 49/55 example pytest invocations name milestone-tagged files (test_m5_git_remote.py, test_m1_vm_lifecycle.py) \u2014 these examples should change once #131 renames the files; (d) line 18 'make test-e2e ~30-45 min' may be optimistic now that the sync pair alone is ~80 min; verify against current full-suite wall-clock; (e) line 80 milestone-tag rule should drop the exemption sentence per #131. Sweep the whole file for accuracy: project structure, build commands, key conventions, on-disk compat. Cross-check against current Cargo.toml, Makefile, and recent commits.",
+      "added_session": "M12-S11",
+      "added_timestamp": "2026-05-02T11:11:32.313761Z",
+      "status": "dropped",
+      "resolved_session": "M12-S11",
+      "resolved_timestamp": "2026-05-02T11:12:21.838070Z"
+    },
+    {
+      "id": 133,
+      "text": "CLAUDE.md is heavily out of date. Sweep the file end to end and refresh against current reality (Cargo.toml, Makefile, recent commits, current conventions). Treat the file as having unknown breadth of staleness \u2014 do not assume any particular subset of issues is the full scope.",
+      "added_session": "M12-S11",
+      "added_timestamp": "2026-05-02T11:12:21.929952Z",
+      "status": "completed",
+      "selected_session": "M12-S11",
+      "resolved_session": "M12-S11",
+      "resolved_timestamp": "2026-05-02T22:59:53.539019Z"
+    },
+    {
+      "id": 134,
+      "text": "Comprehensive docs/ sweep \u2014 beyond CLAUDE.md, audit docs/concepts/, docs/guides/, docs/reference/, docs/internal/ (excluding milestones/) for staleness against current code reality. User worries multiple sections may be outdated.",
+      "added_session": "M12-S11",
+      "added_timestamp": "2026-05-02T11:45:05.830561Z",
+      "status": "completed",
+      "selected_session": "M12-S11",
+      "resolved_session": "M12-S11",
+      "resolved_timestamp": "2026-05-02T22:59:53.539026Z"
+    },
+    {
+      "id": 135,
+      "text": "integration_route_helper_denies_when_netns_ip_outside_caller_subnet setns EPERM under rootful Docker \u2014 likely ptrace_may_access on pidfd_open of root-owned PID, not a route-helper bug. Investigate after install.",
+      "added_session": "M12-S11",
+      "added_timestamp": "2026-05-02T17:44:45.717822Z",
+      "status": "completed",
+      "selected_session": "M12-S11",
+      "resolved_session": "M12-S11",
+      "resolved_timestamp": "2026-05-02T22:59:54.753016Z"
+    },
+    {
+      "id": 136,
+      "text": "Daemon Lima clone partial-dir cleanup: when limactl clone fails after writing disk/cidata.iso but before lima.yaml, daemon should rm -rf the partial /home/olek.guest/.lima/sandbox-XXXX dir (currently leaves it, which poisons every subsequent limactl invocation host-wide on any Lima instance until the operator manually cleans up). Reproducer: surfaced during M12-S11 final Lima E2E. Affects sandbox_core::lima clone error path.",
+      "added_session": "M12-S11",
+      "added_timestamp": "2026-05-02T22:21:59.431069Z",
+      "status": "completed",
+      "selected_session": "M12-S12",
+      "resolved_session": "M12-S12",
+      "resolved_timestamp": "2026-05-03T00:16:34.288730Z"
+    },
+    {
+      "id": 137,
+      "text": "Base image build silently accepts failed provision.system scripts. Lima's cc_scripts_per_boot allows non-zero exit without aborting cloud-init; the daemon's build_base_image_inner relies on 'limactl start' returning success, which doesn't check provisioning. Need to either grep the serial.log for all expected 'step=X done' markers post-start, or invoke a guest probe (e.g. 'command -v docker') to validate the image before declaring it golden. Without this, cloned VMs re-run provisioning on first boot and the same flakiness recurs per-session.",
+      "added_session": "M12-S11",
+      "added_timestamp": "2026-05-02T22:57:19.156597Z",
+      "status": "completed",
+      "selected_session": "M12-S12",
+      "resolved_session": "M12-S12",
+      "resolved_timestamp": "2026-05-03T00:16:34.288736Z"
+    },
+    {
+      "id": 138,
+      "text": "tests/e2e venv: surface a setup-time guard or doc note that a Python interpreter downgrade silently breaks the existing tests/e2e/.venv (ModuleNotFoundError: pytest). Either a one-line doc addition or a Makefile guard that detects venv-Python vs system-Python mismatch and re-runs venv creation. Surfaced during M12-S13 conftest readiness-probe verification (commit b8a123c).",
+      "added_session": "M12-S13",
+      "added_timestamp": "2026-05-05T14:55:50.475935Z",
+      "status": "completed",
+      "selected_session": "M12-S13",
+      "resolved_session": "M12-S13",
+      "resolved_timestamp": "2026-05-06T11:42:23.034007Z"
+    },
+    {
+      "id": 139,
+      "text": "Re-run test_level1_transport_udp[lima] under the new per-test dump window (commit c62eaac) to characterize the 'failed to load backend capabilities: cannot connect to sandboxd: Connection refused' root cause. Prior dump was conflated by other tests; per-test slice should pinpoint it.",
+      "added_session": "M12-S13",
+      "added_timestamp": "2026-05-05T21:41:27.371548Z",
+      "status": "completed",
+      "selected_session": "M12-S13",
+      "resolved_session": "M12-S13",
+      "resolved_timestamp": "2026-05-05T23:01:52.582524Z"
+    },
+    {
+      "id": 140,
+      "text": "Investigate why cargo recompiles sandbox-guest and sandbox-route-helper on every workspace build (~60-90s each) despite no source changes. Likely build-script-driven cache invalidation. Drag on iteration speed and on the e2e sandbox_binaries fixture warm-up.",
+      "added_session": "M12-S13",
+      "added_timestamp": "2026-05-05T21:41:28.899132Z",
+      "status": "dropped",
+      "selected_session": "M12-S13",
+      "resolved_session": "M12-S13",
+      "resolved_timestamp": "2026-05-06T11:42:23.124776Z"
     }
   ],
   "plan": "docs/internal/session-plan.md",
@@ -2583,62 +3241,44 @@
       "text": "Spec > plan override: .tasks/specs/2026-04-21-...-design.md line 846 uses 'rate_limited_count' for the summary event field. M10-S3 plan Q5 accidentally renamed it to 'dropped_events_count'; this was landed in Phase 1 commits 0fcc3ca-569f89a then corrected. When spec prose and plan override disagree on a wire field name, spec wins \u2014 call the discrepancy out in review rather than silently following the plan.",
       "added_at": "2026-04-22T14:14:50.174803Z",
       "session": "M10-S3"
+    },
+    {
+      "id": 13,
+      "text": "Default to running continuously to finish the full plan \u2014 do not check in between sessions. Open the next session and proceed unless something genuinely requires user input (missing credentials, ambiguous spec, broken environment).",
+      "added_at": "2026-05-01T15:26:56.824059Z",
+      "session": "M12-S3"
+    },
+    {
+      "id": 14,
+      "text": "Do NOT push to origin when running with session tracking active. Commits stay local; user pushes manually. Don't ask about pushing.",
+      "added_at": "2026-05-01T15:26:58.349608Z",
+      "session": "M12-S3"
+    },
+    {
+      "id": 15,
+      "text": "When delegating parallel sweep agents touching the same workspace (cleanup passes, refactors with broad file impact), explicitly prohibit 'git stash' and 'git stash pop' in the delegation prompts. Instruct agents to use 'git show <commit>:<path>' or 'git log <path>' for pre-existing-state checks. Stash captures the entire dirty tree including sibling work; pop restores to a tree siblings have moved on from, silently dropping edits with only a 'Dropped' message. Discovered M12-S6 cost ~250 sites of cleanup work.",
+      "added_at": "2026-05-01T18:55:43.274570Z",
+      "session": "M12-S6"
     }
   ],
   "plan_changes": [
     {
-      "timestamp": "2026-04-22T14:13:27.357852Z",
-      "old_total": 59,
-      "new_total": 66,
-      "reason": "M10 decomposed into 7 sessions (S1-S7) per docs/internal/milestones/M10.md; extending plan from 59 (M9-complete) to 66; M10-S1/S2 already landed in git (commits through 2d3b3e1), M10-S3 Phase 1 in progress on feat/m10-s3-deny-logger-dnat-restructure"
+      "timestamp": "2026-05-02T11:08:08.701194Z",
+      "old_total": 89,
+      "new_total": 90,
+      "reason": "post-M12 backlog cleanup: drop #107/#108/#123 (resolved this conversation) and run deferred sync E2E pair (#130)"
     },
     {
-      "timestamp": "2026-04-24T20:10:17.273446Z",
-      "old_total": 66,
-      "new_total": 67,
-      "reason": "Add M10-S8 for user polish & refactor: integration-test mechanism migration (naming prefix + nextest profile), flaky tcp-test root-cause fix, lima test categorization. Surfaced as needs while shipping M10."
+      "timestamp": "2026-05-02T23:03:25.389932Z",
+      "old_total": 90,
+      "new_total": 91,
+      "reason": "User declared M12 not done while deferred todos #136/#137/#130 remain open. Add M12-S12 to fix the two daemon bugs and run the deferred sync E2E."
     },
     {
-      "timestamp": "2026-04-25T16:37:09.796191Z",
-      "old_total": 67,
-      "new_total": 69,
-      "reason": "M10 expanded post-S8: M10-S9 residual sweep + M10-S10 synchronous DNS-policy gating"
-    },
-    {
-      "timestamp": "2026-04-26T13:19:37.920608Z",
-      "old_total": 69,
-      "new_total": 75,
-      "reason": "M11 'Lite mode: container backend' planned and committed (4c5bd69, 5448b46): 6 new sessions S1-S6 (backend abstraction, route helper, container runtime, --lite CLI, E2E parametrization, spec-delivery verification)"
-    },
-    {
-      "timestamp": "2026-04-27T10:39:13.772462Z",
-      "old_total": 75,
-      "new_total": 76,
-      "reason": "Add M12-S1 polish session: clear residual M11 quality items (todos #67/#72/#75/#62/#63/#64) before merge to main. Scope locked: cpus-precision normalization, test_m3_networking agnostic refactor unlocking 3 e2e skips, describe/inspect '0' sentinel cleanup, route-helper polish."
-    },
-    {
-      "timestamp": "2026-04-28T15:15:01.138366Z",
-      "old_total": 76,
-      "new_total": 77,
-      "reason": "Add M11-S8: rootless-Docker daemon enforcement + --force-rootless-docker escape hatch + PATH-stub test substrate. Spec \u00a7 Out of scope (line 1175) declares rootless Docker unsupported but daemon does not refuse it; test_lite_workspace_uid_alignment skipif silently masks the contract violation. S8 lands the daemon-side enforcement so the contract becomes verifiable."
-    },
-    {
-      "timestamp": "2026-04-29T15:43:41.782126Z",
-      "old_total": 77,
-      "new_total": 78,
-      "reason": "Added M11-S9: Route-helper auth hardening, dev-environment setup, test stability. Surfaced during flake-triage on make test-integration; bundles security-critical env-var lockdown for SANDBOX_USERS_CONF (route helper has cap_sys_admin, env override is local privilege escalation), daemon resolver simplification (4-step \u2192 2-step), install-path move to /usr/local/libexec/sandboxd/ per FHS, make setup-dev-env target with idempotent /etc setup, integration test refactor (drop CappedHelper, install at /usr/local/libexec/sandboxd-test/), and TCP listen-backlog test stability fix. See docs/internal/milestones/M11.md M11-S9 entry."
-    },
-    {
-      "timestamp": "2026-04-29T17:32:47.716743Z",
-      "old_total": 78,
-      "new_total": 79,
-      "reason": "Added M11-S10 (CIDR-scoped orphan reaper) \u2014 defense-in-depth filter for cross-daemon collision, deferred from M11-S9 to keep S9 cohesive around route-helper/dev-env theme."
-    },
-    {
-      "timestamp": "2026-04-30T23:44:50.974944Z",
-      "old_total": 79,
-      "new_total": 89,
-      "reason": "M12 added \u2014 10 sessions of loose-ends + UDP hardening before further feature work (S1 UDP audit/fix, S2 UDP transport parity, S3 ECH strip-not-deny, S4 daemon validation, S5 reviewer-nit round-up, S6 milestone-ref cleanup, S7 native cp, S8 rsync sync, S9 backlog buffer, S10 claim-to-code verification). 23 deferred todos at planning start; 3 dropped after parallel verification (#60, #100, #103); 20 covered by M12 sessions."
+      "timestamp": "2026-05-03T19:38:53.117218Z",
+      "old_total": 91,
+      "new_total": 92,
+      "reason": "Add M12-S13: SANDBOX_BASE_VM_NAME knob + drop conftest preflight sweep. Surfaced post-S12 \u2014 e2e harness still nukes production sandbox-base + sweeps every sandbox-* resource. Plan documented in docs/internal/milestones/M12.md."
     }
   ]
 }
