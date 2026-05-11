@@ -129,7 +129,8 @@ The `sandbox` group exists for **socket access**, not filesystem access.
 
 ### 2.4 · Known limitation — `qemu-bridge-helper` is cross-user
 
-**Confirmed limitation, lifted from `.tasks/handoffs/spec-arc-followups.md`.**
+**Confirmed limitation, lifted from `.tasks/handoffs/spec-arc-followups.md`.
+Tracked as GitHub issue [#8](https://github.com/Koriit/sandboxd/issues/8).**
 Spec 3 does not attempt to mitigate this.
 
 - `qemu-bridge-helper` is a setuid-root binary shipped and owned by QEMU. By
