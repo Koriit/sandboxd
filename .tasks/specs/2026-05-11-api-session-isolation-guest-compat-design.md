@@ -435,7 +435,7 @@ The JSON wire shape uses the daemon's existing `ApiError` body
 verbatim message above. No structured fields are added on the wire today —
 the prose **is** the contract surface, and pinning the message tokens
 (`refresh is not viable`, `recreate the session`) is the assertion anchor
-for integration tests (see § 7.4).
+for integration tests (see § 7.5).
 
 ### 3.6 · Where the embedded guest binary comes from
 
@@ -713,6 +713,106 @@ between refresh and start re-runs refresh on the next attempt (cheap and
 idempotent) rather than leaving the DB claiming "this session speaks the
 new protocol" against an unstarted runtime.
 
+### 3.10 · On-demand guest version query — stopped vs. running trust rule
+
+The compatibility predicate (§ 3.3) reads the **persisted**
+`sessions.guest_protocol_version` column. That value is authoritative
+**when the session is stopped** — the daemon is the sole writer of the
+column and writes it only at create time and after a successful refresh
+(§ 3.9), so on the start path the DB and the on-disk binary inside the
+session cannot diverge unless an operator manually edits one or the other.
+For a stopped session about to be started, DB-side state is good enough:
+**the refresh decision tree in § 3.4 stays exactly as specified**.
+
+But once the session is **running**, the daemon can talk to the guest
+directly. A diagnostic surface — what `sandbox doctor` will eventually
+report, what an integration test wants to assert post-start — benefits
+from asking the runtime "what version are you actually running?"
+rather than trusting the DB column alone. To support that, Spec 2 adds an
+on-demand version-query primitive to the guest wire protocol.
+
+The new request and reply pair:
+
+```rust
+// sandbox-core/src/guest.rs — extending the existing GuestRequest /
+// GuestResponse enums at lines 50 / 59. Tag-on-deserialise matches the
+// existing `#[serde(tag = "type")]` shape so old guest binaries that
+// don't recognise the new variant still produce a structured error.
+
+pub enum GuestRequest {
+    Ping,
+    Exec { command: String, args: Vec<String> },
+    Status,
+    Version,                              // <-- new
+}
+
+pub enum GuestResponse {
+    Pong,
+    ExecResult { exit_code: i32, stdout: String, stderr: String },
+    StatusResult { hostname: String, uptime_secs: u64, load_average: f64 },
+    Error { message: String },
+    VersionResult {                        // <-- new
+        protocol_version: u32,             // guest's compile-time DAEMON_GUEST_PROTO_VERSION
+        binary_version: String,            // guest's compile-time SANDBOX_GUEST_VERSION
+    },
+}
+```
+
+Guest-side handler is trivial — read its own compiled-in constants and
+return them. The handler lives in `sandbox-guest/src/main.rs` next to
+the existing `handle_request` dispatch at line 90:
+
+```rust
+async fn handle_request(request: GuestRequest) -> GuestResponse {
+    match request {
+        GuestRequest::Ping => GuestResponse::Pong,
+        GuestRequest::Exec { command, args } => handle_exec(command, args).await,
+        GuestRequest::Status => handle_status().await,
+        GuestRequest::Version => GuestResponse::VersionResult {
+            protocol_version: sandbox_core::guest::DAEMON_GUEST_PROTO_VERSION,
+            binary_version: sandbox_core::guest::SANDBOX_GUEST_VERSION.to_string(),
+        },
+    }
+}
+```
+
+The trust rule the daemon follows:
+
+| Session state | Compatibility decision input                                      | Why                                                                                                            |
+|---------------|-------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------|
+| `Stopped`     | persisted `sessions.guest_protocol_version`                       | Guest is not running; no live wire to query. Daemon wrote the column itself; safe to trust.                  |
+| `Running`     | live `GuestRequest::Version` reply (when the caller needs ground truth) | Guest is reachable; the daemon can ask. Decision is **for diagnostics / drift detection only**, not for the refresh-on-start path which never sees a running session. |
+
+This is **not** a connect-time handshake. The daemon does not
+automatically issue `Version` on every accepted guest connection or every
+start. The primitive exists so callers that genuinely need the live
+value (Spec 3's `sandbox doctor`; an opt-in defense-in-depth check
+described below) can request it on demand. Every other code path
+continues to use the persisted column.
+
+#### Forward note — Spec 3's `sandbox doctor`
+
+Spec 3 will design the `sandbox doctor` surface. That spec will use
+`GuestRequest::Version` to compare running-guest reports against the DB
+column and surface drift to operators. **Spec 2 only provides the protocol
+primitive; it does not design or implement the doctor side.** The query
+is added now because it shares the same wire-protocol diff as the new
+version constants and the same `GuestRequest` enum that
+`DAEMON_GUEST_PROTO_VERSION` already gates — splitting it across two
+specs would force `DAEMON_GUEST_PROTO_VERSION` to bump twice.
+
+#### Optional defense-in-depth post-start cross-check
+
+After a successful `start_session` (compatible path or refresh path), the
+daemon **may** issue `GuestRequest::Version` and compare the reply to the
+DB column. If they disagree, log a warning at `warn!` level. This is a
+forward note for implementer judgment — useful for catching the rare
+case where someone manually replaced `/usr/local/bin/sandbox-guest`
+inside a session out-of-band — but is **not a hard requirement** for
+Spec 2. The implementer can ship without it; if added, the cross-check
+must not block the start response (the session is, by then, running and
+serving the operator's request).
+
 ## 4 · `SO_PEERCRED` plumbing — relationship to Spec 1
 
 Spec 2 needs the operator's username to stamp `owner_username` on create and
@@ -831,6 +931,53 @@ nonexistent ID via `SandboxError::SessionNotFound` →
 `error_response` (`sandboxd/sandboxd/src/error.rs:62`). Alice cannot
 distinguish "doesn't exist" from "exists but isn't mine".
 
+### 5.1 · Guest wire protocol — request/reply additions
+
+The existing wire protocol uses JSON over a length-prefixed framing
+(`sandbox-core/src/guest.rs:80-103` for `write_message` / `read_message`;
+4-byte big-endian u32 length + payload, max 1 MiB). The `GuestRequest`
+and `GuestResponse` enums are tagged via `#[serde(tag = "type")]`
+(`guest.rs:49` and `guest.rs:58`). The new variants extend each enum
+unobtrusively — old guest binaries that don't recognise `Version` return
+`GuestResponse::Error { message: "..." }` from serde's default
+unknown-variant rejection, which the daemon already handles via its
+`GuestResponse::Error` arm.
+
+Wire shape, request:
+
+```json
+{ "type": "Version" }
+```
+
+Wire shape, reply (success):
+
+```json
+{
+  "type": "VersionResult",
+  "protocol_version": 1,
+  "binary_version": "0.1.0"
+}
+```
+
+Wire shape, reply from an old guest that doesn't know `Version`:
+
+```json
+{
+  "type": "Error",
+  "message": "unknown variant `Version`, expected one of `Ping`, `Exec`, `Status`"
+}
+```
+
+(Exact error text depends on the serde rendering; the daemon does not
+parse it — it falls through to "guest does not support Version" and the
+caller of the query handles that case as "guest is too old to self-report"
+— the persisted column remains the only available answer.)
+
+The guest's `Version` reply is **not** mapped onto an HTTP endpoint by
+Spec 2. The primitive lives on the daemon ↔ guest wire only. Surfacing
+it on the daemon's HTTP API (`GET /sessions/{id}/version`,
+`sandbox doctor`, etc.) is Spec 3's job.
+
 ## 6 · Backward compatibility — dev mode
 
 `make setup-dev-env` developers run the daemon as themselves. There is no
@@ -899,7 +1046,7 @@ each time, the proto version too.
 To exercise the refuse arm, a developer manually edits `can_refresh_in_place`
 to return `false` for the prior proto, rebuilds, and tries to start an old
 session. The 409 with the structured error message renders; the integration
-test in § 7.4 (`integration_guest_refresh_refuses_when_unsalvageable`)
+test in § 7.5 (`integration_guest_refresh_refuses_when_unsalvageable`)
 covers this without manual editing by feeding a synthetic
 `session.guest_protocol_version = 0` row through a test-only
 `SessionStore` constructor (the V006 default-`0` SQL placeholder is the
@@ -955,7 +1102,19 @@ Run under the default nextest profile (hermetic — no Docker, no Lima):
 | `can_refresh_in_place_accepts_known_versions`        | `1` (and `DAEMON_GUEST_PROTO_VERSION`)          | `true` |
 | `can_refresh_in_place_rejects_zero`                  | `0`                                            | `false` |
 
-### 7.4 · Integration tests
+### 7.4 · Unit tests for guest version-reporting handler
+
+Hermetic — live in `sandbox-guest/src/main.rs` alongside the existing
+`test_handle_ping` (`main.rs:260`) and `test_handle_status`
+(`main.rs:329`) handler tests. The handler is pure (reads compile-time
+constants, builds a `VersionResult`), so a direct call is sufficient:
+
+| Test name                                              | Behavior |
+|--------------------------------------------------------|----------|
+| `test_handle_version_returns_compiled_constants`       | Call `handle_request(GuestRequest::Version)`; assert the reply is `VersionResult` with `protocol_version == DAEMON_GUEST_PROTO_VERSION` and `binary_version == SANDBOX_GUEST_VERSION`. |
+| `test_end_to_end_version_over_loopback`                | Bind a `TcpListener` on `127.0.0.1:0`, spawn the existing `handle_connection` loop, send `GuestRequest::Version`, assert the deserialised reply matches the compile-time constants. Mirrors the existing `test_end_to_end_local` shape at `main.rs:458`. |
+
+### 7.5 · Integration tests
 
 Under `integration_*` prefix, selected by the `integration` nextest profile:
 
@@ -968,6 +1127,7 @@ Under `integration_*` prefix, selected by the `integration` nextest profile:
 | `integration_guest_refresh_lima_backend`                               | lima        | Same as above. Marked `#[cfg_attr(not(has_kvm), ignore)]` or equivalent so CI runners without `/dev/kvm` skip it (existing convention for Lima integration tests). |
 | `integration_guest_refresh_refuses_when_unsalvageable`                 | container   | Seed a session row with `guest_protocol_version = 0` AND patch `can_refresh_in_place` (via a test-only `set_can_refresh_in_place_override` hook on the daemon) to return `false`; call `start_session`; assert the response is `409 Conflict` with body substring `refresh is not viable for this session` and `recreate the session`. |
 | `integration_guest_version_columns_persist_through_create_and_start`   | container   | Standard happy-path session create; read the row back; assert all three new columns hold non-default values and `guest_binary_version` matches `env!("CARGO_PKG_VERSION")` of the `sandbox-guest` crate. |
+| `integration_guest_version_query_returns_compiled_constants`           | container   | Standard happy-path session create + start; issue `GuestRequest::Version` through the `GuestConnector` against the running guest; assert the reply is `VersionResult` and that `protocol_version == DAEMON_GUEST_PROTO_VERSION` and `binary_version == SANDBOX_GUEST_VERSION`. Confirms the wire-level primitive works end-to-end against a real running session. |
 
 The fake-peercred plumbing for the isolation tests: the daemon-test fixture
 already exists for the container backend (the existing
@@ -984,7 +1144,7 @@ require Spec 2 to add new test infrastructure; if the path turns out to
 require it, that's a finding to be raised before implementation (this is a
 real risk — see § 9.2).
 
-### 7.5 · `sandbox describe` / `sandbox inspect` output
+### 7.6 · `sandbox describe` / `sandbox inspect` output
 
 The new `owner_username` and version fields surface (or not) on these CLI
 commands per the existing DTO mapping rules at
@@ -1028,46 +1188,54 @@ The following are **not** in Spec 2:
 
 ## 9 · Risks and open questions
 
-### 9.1 · `sandbox-guest` has no wire-protocol version concept today
+### 9.1 · `sandbox-guest`'s wire-protocol version surface today (and what Spec 2 adds)
 
 Verified by inspection of `sandboxd/sandbox-guest/src/main.rs` (580 lines,
 covered in full) and `sandboxd/sandbox-core/src/guest.rs:50-74` (the
-`GuestRequest` / `GuestResponse` enums). There is no version field on the
-wire, no handshake, no version-stamped framing.
+`GuestRequest` / `GuestResponse` enums). The wire protocol today carries
+**no** version surface — no `Hello`, no version-stamped framing, no
+self-report.
 
-**Spec 2 adds the version concept on the host side only.** The version is
-known to the daemon (compile-time `pub const`) and persisted in
-`sessions.guest_protocol_version`. The daemon does **not** consult the
-guest binary at runtime to learn its version — the persisted value is the
-source of truth, refreshed by `update_guest_versions` after every successful
-refresh.
+Spec 2 adds **two distinct pieces** of version surface, used in
+**two distinct trust regimes**:
 
-This is a deliberate scoping decision. Adding a `GuestRequest::Hello`
-handshake variant that returns the guest's own `DAEMON_GUEST_PROTO_VERSION`
-constant is **possible** and would let the daemon double-check the
-persisted value against the guest's self-report — but it doesn't change the
-decision (the daemon already knows what it shipped on the last refresh)
-and it doesn't survive a deliberately-modified guest binary anyway. The
-risk-of-divergence is real but bounded: the only path that writes the
-persisted value is the daemon's own refresh, which writes both the
-in-VM/in-container binary and the DB column. The two cannot disagree
-unless someone (a) manually edits `sessions.db`, or (b) manually replaces
-`/usr/local/bin/sandbox-guest` inside a session. Both are operator-error
-scenarios; the daemon's compat check is **enough** to gate the start path
-on persisted state, and the runtime-error surface (deserialization errors
-from a mismatched guest) already exists as the fallback when persisted
-state is wrong.
+1. **Persisted column** (`sessions.guest_protocol_version`, § 3.1) — read
+   on the **stopped-session refresh-on-start path** in § 3.4. Daemon is
+   the sole writer (create time, post-refresh). Authoritative on the start
+   path because there is no live wire to ask. No handshake is added at
+   connect time, deliberately — a guest-side handshake on every connect
+   would force every existing `Ping` / `Exec` / `Status` call site to
+   negotiate, which the predicate (§ 3.3) does not need.
 
-A future spec could add the `Hello` handshake and use it to populate a
-**diagnostic** field (e.g., "DB says proto 2; guest reports proto 1") on
-`sandbox describe` output. Out of scope for Spec 2.
+2. **On-demand `GuestRequest::Version` primitive** (§ 3.10, § 5.1) — used
+   on the **running-session diagnostic path**. When the session is up and
+   a caller (Spec 3's `sandbox doctor`, an opt-in defense-in-depth check)
+   needs the ground truth from inside the session, it issues the query.
+   The reply carries both the guest's compile-time
+   `DAEMON_GUEST_PROTO_VERSION` and its `SANDBOX_GUEST_VERSION`.
 
-If, during implementation, this turns out to be a load-bearing assumption
-that doesn't hold — e.g., the protocol bumps frequently enough that the
-DB column drifts in practice — raise it and revisit before broadening the
-spec. The CLARIFY signal the handoff calls out: today there is no wire
-handshake, this spec does not add one, and it relies on the daemon being
-the sole writer of the persisted version column for that to be safe.
+The reasoning for the split: a connect-time handshake **on every guest
+exchange** buys nothing — the daemon already knows what it shipped on the
+last refresh, the persisted column tracks that, and every wire exchange
+would pay a round-trip for information the daemon usually already has. An
+**on-demand** query, on the other hand, is the natural primitive for the
+diagnostic surfaces Spec 3 will build, and for cross-checking the
+persisted column on a running session if the implementer wants
+defense-in-depth (see § 3.10's "optional post-start cross-check" note).
+
+What this resolves about the original CLARIFY signal: the wire protocol
+**does** gain a version surface in Spec 2, but only as the on-demand
+primitive — not as a handshake, not as part of the refresh decision tree,
+and not on a daemon HTTP endpoint. The refresh-on-start tree (§ 3.4)
+continues to be DB-driven; that path doesn't need a live query because
+the session it's reasoning about is, by definition, stopped.
+
+The remaining divergence risk: a running session whose
+`/usr/local/bin/sandbox-guest` has been replaced out-of-band (operator
+error or external automation) could report a `binary_version` that
+disagrees with the DB column. The `Version` query is what makes that
+detectable; how that surfaces to operators is Spec 3's design surface.
+Spec 2 only owns the primitive.
 
 ### 9.2 · Faking `SO_PEERCRED` in integration tests
 
@@ -1075,7 +1243,7 @@ the sole writer of the persisted version column for that to be safe.
 userspace without dropping privileges first. Multi-uid integration tests
 either run under sudo and `setuid` between connects, or spawn helper
 subprocesses under different uids. The existing daemon test harness uses
-the test-runner's own uid; the new isolation tests at § 7.4 are the
+the test-runner's own uid; the new isolation tests at § 7.5 are the
 first ones in the codebase that genuinely need **two** uids.
 
 Realistic path: the integration-test harness gains a small helper binary
@@ -1165,7 +1333,8 @@ without daemon involvement.
 | `sandboxd/sandbox-core/migrations/V006__add_owner_and_guest_versions.sql` | New migration — `DELETE FROM sessions;` + three `ALTER TABLE ADD COLUMN`. |
 | `sandboxd/sandbox-core/src/store.rs` | `SessionStore` methods gain `caller_username: &str` (§ 2.4 table). `row_to_session` reads the three new columns. New method `update_guest_versions(caller_username, id, proto, binary_version)`. Reconciler-only paths split into `update_state_reconcile` to keep the storage boundary safe. |
 | `sandboxd/sandbox-core/src/session.rs` | `Session` struct gains three new fields (`owner_username: String`, `guest_protocol_version: u32`, `guest_binary_version: String`); each `#[serde(default)]` for on-disk forward-compat per CLAUDE.md "On-disk compatibility". |
-| `sandboxd/sandbox-core/src/guest.rs` | New constants `DAEMON_GUEST_PROTO_VERSION: u32 = 1`, `SANDBOX_GUEST_VERSION: &str`. New `pub fn is_protocol_compatible(u32) -> bool`. New `pub fn can_refresh_in_place(u32) -> bool`. |
+| `sandboxd/sandbox-core/src/guest.rs` | New constants `DAEMON_GUEST_PROTO_VERSION: u32 = 1`, `SANDBOX_GUEST_VERSION: &str`. New `pub fn is_protocol_compatible(u32) -> bool`. New `pub fn can_refresh_in_place(u32) -> bool`. New `GuestRequest::Version` variant and `GuestResponse::VersionResult { protocol_version: u32, binary_version: String }` reply variant. |
+| `sandboxd/sandbox-guest/src/main.rs` | Handler for `GuestRequest::Version` returning `VersionResult` from the compile-time constants in `sandbox-core::guest`. Unit tests per § 7.4. |
 | `sandboxd/sandbox-core/src/error.rs` | New `SandboxError::GuestProtocolIncompatible { session_id, session_proto, daemon_proto, reason }` variant. |
 | `sandboxd/sandbox-core/src/backend/mod.rs` | `SessionRuntime` trait gains `async fn refresh_guest_binary(&self, handle: &RuntimeHandle) -> Result<(), SandboxError>`. |
 | `sandboxd/sandbox-core/src/backend/container.rs` | `ContainerRuntime::refresh_guest_binary` — `docker cp` of the embedded guest binary; container is expected to be Stopped on entry. |
@@ -1196,7 +1365,8 @@ about the same set of UIDs.
 | `sandboxd/sandbox-core/migrations/V006__add_owner_and_guest_versions.sql` | New |
 | `sandboxd/sandbox-core/src/store.rs` | Edit: storage-boundary `caller_username` filter on every session-touching method; `update_guest_versions`; `update_state_reconcile` split |
 | `sandboxd/sandbox-core/src/session.rs` | Edit: three new fields on `Session`; `#[serde(default)]` for forward-compat |
-| `sandboxd/sandbox-core/src/guest.rs` | Edit: constants + compatibility predicates |
+| `sandboxd/sandbox-core/src/guest.rs` | Edit: constants + compatibility predicates + `GuestRequest::Version` / `GuestResponse::VersionResult` variants |
+| `sandboxd/sandbox-guest/src/main.rs` | Edit: handler for `GuestRequest::Version`; unit tests for the handler and end-to-end loopback |
 | `sandboxd/sandbox-core/src/error.rs` | Edit: `GuestProtocolIncompatible` variant |
 | `sandboxd/sandbox-core/src/backend/mod.rs` | Edit: `SessionRuntime::refresh_guest_binary` trait method |
 | `sandboxd/sandbox-core/src/backend/container.rs` | Edit: `refresh_guest_binary` impl (docker cp of embedded bytes) |
