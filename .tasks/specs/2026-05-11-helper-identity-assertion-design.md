@@ -292,7 +292,13 @@ diverge here:
   but the operator's investigation trail evaporates. Exiting non-zero with a
   loud stderr line surfaces the missing-record condition to the daemon (which
   already maps non-zero helper exits to a structured lifecycle event) and to any
-  human running the helper directly.
+  human running the helper directly. **Note — security audit gap:** if this
+  escalation fires, the forensic record of the deny attempt was not written. On a
+  system where the audit log is routinely full, operators should investigate:
+  `journalctl -u sandboxd` for the non-zero helper exit events, and
+  `df -h /var/lib/sandbox` (or `df -h $XDG_RUNTIME_DIR`) to diagnose the disk
+  pressure. A routinely-missing audit log for deny paths is a monitoring signal,
+  not merely a disk-maintenance nit.
 
 In pseudo-Rust, the asymmetry at the audit-write site:
 
@@ -766,6 +772,8 @@ Each invariant holds independently:
 | `for_user == "alice"` | Daemon reads peer cred of CLI socket, also alice. |
 | Both in `allow_users` | Pair-check succeeds. |
 
+**Strict `getpwuid_r` assumption.** The flow above assumes `User::from_uid(alice's uid)` succeeds — i.e. the test user has a resolvable uid in `/etc/passwd`. In all supported development environments (host installs via `make setup-dev-env`, Lima VMs via Spec 4 § 6) this is always true. CI runners that execute tests inside a container or with a synthetic uid outside `/etc/passwd` will fail the pair-check at step 2 (daemon connection reset) and step 7 (helper exit `DENY_EXIT`). This is **intentional** — the strict-resolution policy (§ 3.4) is the behavior being enforced. No escape-hatch flag is provided; weakening the check in CI would undermine the security property this spec exists to deliver. Adopters using such CI environments must add a `useradd` step early in their workflow to give the test runner a resolvable uid.
+
 ### 7.2 · Pre-V001 deployments
 
 A dev box with a `users.conf` that has not been migrated yet (no `_schema_version`, no
@@ -859,9 +867,12 @@ infrastructure (`sandbox-route-helper/tests/integration_route_helper.rs:43-47`).
 | `integration_route_helper_defaults_for_user_to_caller_when_omitted` | Run helper *without* `--for-user`; pool contains `[runner]`; expects same outcome as `accepts_for_user_matching_caller`. |
 | `integration_route_helper_denies_when_caller_not_in_pool_even_with_valid_for_user` | Pool contains `[bob]` but `--for-user=bob`; caller is runner ≠ bob; expects deny. |
 | `integration_route_helper_denies_when_username_unresolvable` | `--for-user=definitely-not-a-real-user-9c3f` (the sentinel name reused from `users_conf.rs:1016-1031`); expects deny with substring `does not resolve to a uid`. |
-| `integration_route_helper_denies_when_caller_uid_unresolvable` | Runs the helper from a uid that has been deliberately removed from `/etc/passwd` between fixture setup and helper exec — implemented via a chroot fixture that prepares a mutated `/etc/passwd` (no entry for the test uid), OR via a Lima VM smoke test that creates a temporary user, drops it mid-test via `userdel`, and invokes the helper as the now-stranded uid. Asserts: helper exits `DENY_EXIT` (1), stderr contains the substring `caller uid` and `unresolvable` (or the precise wording from § 3.4 — `caller uid <n> does not resolve to a username`), and the audit log either records a denied entry with `reason` naming the resolution failure or — if the audit write itself fails because the caller cannot be named — emits the stderr escalation per § 3.5. This plugs the coverage gap left by today's softer `ok().flatten()` policy at `sandbox-route-helper/src/main.rs:125`, which is unverified at the integration layer. |
+| `integration_route_helper_uid_without_passwd_denies_cleanly` | **Lima-harness only** (see CI note below). Runs the helper from a uid that has no `/etc/passwd` entry. Fixture steps inside the Lima VM: (1) `sudo useradd -M -s /bin/false sandboxtest-nopasswd` to create a uid; (2) `sudo userdel sandboxtest-nopasswd` to remove its `/etc/passwd` entry while the uid number is temporarily stranded; (3) invoke the helper as that uid via `runuser -u sandboxtest-nopasswd` or via the `peercred-connector` fixture (Spec 2 § 9.2). Asserts: helper exits `DENY_EXIT` (1); stderr contains the wording from § 3.4 — `caller uid <n> does not resolve to a username`; helper does not hang or crash. The audit log may emit an escalation line per § 3.5 if the write path also fails to name the caller; this is acceptable. This test **must not run on the host CI runner** — the host runner uid must remain resolvable for all other integration tests. The Lima harness (Spec 4 § 6) provides the isolated VM environment where the ephemeral uid can be created and dropped without affecting the host. This plugs the coverage gap left by today's softer `ok().flatten()` policy at `sandbox-route-helper/src/main.rs:125`, which is unverified at the integration layer. |
 | `integration_route_helper_writes_audit_log_on_allowed` | Verify a JSON line with `decision="allowed"` and both identities lands in the audit-log file. |
 | `integration_route_helper_writes_audit_log_on_denied` | Verify a JSON line with `decision="denied"`, `reason` substring, and both identities. |
+| `test_audit_log_failure_on_deny_path_still_denies` | Mock the audit-log writer to return `ENOSPC` (implemented via a compile-time-injectable writer seam or by pointing the audit-log path at a read-only location). Invoke the helper on a request that will be denied (pair-check mismatch). Assert: helper exits with `DENY_EXIT` (1); stderr contains the audit-write-failure line (`sandbox-route-helper: audit log write failed: <reason>`); no audit record was written. Confirms § 3.5's deny-path escalation: the deny is enforced regardless of log-write outcome, and the stderr escalation fires. |
+
+**CI constraint for `integration_route_helper_uid_without_passwd_denies_cleanly`:** This test requires a controlled environment where a uid can be created and immediately removed from `/etc/passwd`. It **must run inside a Lima VM** (Spec 4 § 6 harness) — never on the host CI runner, whose uid must remain resolvable for all other integration tests to pass. The Lima E2E test harness provides the necessary isolation: the VM's `/etc/passwd` is independent of the host's, so the ephemeral `sandboxtest-nopasswd` uid can be created and deleted without side-effects.
 
 ### 8.5 · Integration tests — daemon → helper propagation
 
