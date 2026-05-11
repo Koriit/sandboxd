@@ -203,12 +203,75 @@ fn write_users_conf(contents: &str) -> NamedTempFile {
 /// the given users.conf tempfile via `SANDBOX_USERS_CONF`. The
 /// helper is the test-feature build (made by
 /// `install-route-helper-test-cap`), so it consults the env var.
+///
+/// This variant additionally redirects the audit log to a per-test
+/// tempdir so concurrent test runs (and the host's persistent
+/// `$XDG_RUNTIME_DIR/sandboxd/route-helper-audit.log`) do not
+/// interfere. Callers that don't care about the audit-log content can
+/// ignore the returned tempdir; it cleans up on drop. Callers that
+/// want to inspect the audit record use [`run_helper_with_audit`].
 fn run_helper(helper: &Path, users_conf: &NamedTempFile, args: &[&str]) -> Output {
+    let (_audit_dir, audit_path) = make_audit_log_path();
     Command::new(helper)
         .args(args)
         .env("SANDBOX_USERS_CONF", users_conf.path())
+        .env("SANDBOX_ROUTE_HELPER_AUDIT_LOG", &audit_path)
         .output()
         .expect("invoking helper should succeed")
+}
+
+/// Run the cap'd installed helper with an audit-log tempfile path
+/// injected via `SANDBOX_ROUTE_HELPER_AUDIT_LOG`. The helper test build
+/// (`test-env-override`) honors that env var — production builds
+/// ignore it (same privilege story as `SANDBOX_USERS_CONF`).
+///
+/// Returns `(Output, audit_lines)` where `audit_lines` is the parsed
+/// JSON-Lines content of the audit-log file after the helper exits.
+/// The caller asserts on both surfaces (subprocess exit code + audit
+/// records).
+fn run_helper_with_audit(
+    helper: &Path,
+    users_conf: &NamedTempFile,
+    audit_log_path: &Path,
+    args: &[&str],
+) -> (Output, Vec<serde_json::Value>) {
+    let output = Command::new(helper)
+        .args(args)
+        .env("SANDBOX_USERS_CONF", users_conf.path())
+        .env("SANDBOX_ROUTE_HELPER_AUDIT_LOG", audit_log_path)
+        .output()
+        .expect("invoking helper should succeed");
+    let audit_lines = read_audit_log_lines(audit_log_path);
+    (output, audit_lines)
+}
+
+/// Parse the audit-log file (JSON-Lines) and return one `Value` per
+/// non-empty line. Returns an empty Vec if the file does not yet exist
+/// (the helper denied so early it could not write a record) — callers
+/// distinguish "audit log empty" from "audit log absent" via this Vec's
+/// length.
+fn read_audit_log_lines(path: &Path) -> Vec<serde_json::Value> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    raw.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("audit-log line is not JSON: {line:?} err={e}"))
+        })
+        .collect()
+}
+
+/// Path to an audit-log file under a fresh tempdir. Returns the tempdir
+/// (kept alive by the caller so it is not removed mid-test) and the
+/// audit-log path inside it. Each integration test owns its own
+/// tempdir so parallel runs do not collide on a shared file.
+fn make_audit_log_path() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("audit-log tempdir");
+    let path = dir.path().join("route-helper-audit.log");
+    (dir, path)
 }
 
 // ---------------------------------------------------------------------------
@@ -252,13 +315,15 @@ fn integration_route_helper_denies_when_gateway_ip_outside_all_subnets() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 2 — caller uid not in subnet's allow_users (denies at step 4)
+// Test 2 — caller uid not in subnet's allow_users (denies at pair-check)
 // ---------------------------------------------------------------------------
 
-/// Verifies the step-4 deny branch: the gateway IP IS inside a
+/// Verifies the pair-check deny branch: the gateway IP IS inside a
 /// configured subnet, but that subnet's `allow_users` does not contain
-/// any name that resolves to the caller's uid. Helper denies before
-/// any netns operation.
+/// any name that resolves to the caller's uid (nor the implicit
+/// `--for-user=<caller>`). Helper denies before any netns operation
+/// with the spec § 3.3 stderr substring `pair-check failed` naming both
+/// identities.
 #[test]
 fn integration_route_helper_denies_when_caller_not_in_allow_users() {
     let helper = verify_installed_test_helper();
@@ -269,6 +334,7 @@ fn integration_route_helper_denies_when_caller_not_in_allow_users() {
     // name is treated as a non-match).
     let users_conf = write_users_conf(
         r#"{
+            "_schema_version": 1,
             "subnets": [
                 {
                     "cidr": "10.209.0.0/20",
@@ -278,8 +344,9 @@ fn integration_route_helper_denies_when_caller_not_in_allow_users() {
         }"#,
     );
 
-    // Gateway IP 10.209.0.2 IS inside the subnet — step 3 passes —
-    // but the caller's uid won't match the bogus allow_users entry.
+    // Gateway IP 10.209.0.2 IS inside the subnet — gateway-lookup
+    // passes — but neither the caller's uid nor the implicit
+    // `--for-user=<caller>` matches the bogus allow_users entry.
     let output = run_helper(&helper, &users_conf, &["1", "10.209.0.2"]);
 
     assert!(
@@ -289,9 +356,20 @@ fn integration_route_helper_denies_when_caller_not_in_allow_users() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let runner = runner_username();
     assert!(
-        stderr.contains("not in allow_users"),
-        "stderr must contain 'not in allow_users'; got: {stderr}"
+        stderr.contains("pair-check failed"),
+        "stderr must contain 'pair-check failed'; got: {stderr}"
+    );
+    // Spec § 3.3: stderr must name BOTH identities (caller and for-user)
+    // for forensic clarity.
+    assert!(
+        stderr.contains(&format!("caller={runner}")),
+        "stderr must include caller={runner}; got: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("for-user={runner}")),
+        "stderr must include for-user={runner} (defaulted from caller); got: {stderr}"
     );
 }
 
@@ -547,5 +625,578 @@ fn integration_route_helper_denies_when_netns_ip_outside_caller_subnet() {
         route_text.contains("198.18.0.1"),
         "container should still have the docker-installed default \
          via 198.18.0.1; got: {route_text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Pair-check + audit log tests — spec § 8.4
+// ---------------------------------------------------------------------------
+
+/// Spin up a Docker container on a bridge whose subnet matches the
+/// `users.conf` pool, returning the container fixture, the bridge
+/// CIDR (matching the users.conf pool), and the gateway IP. Used by
+/// the "allow path" pair-check tests below to drive the helper
+/// through to a successful route install.
+///
+/// Each test should pass a distinct `subnet` so cargo-nextest's
+/// parallel execution does not collide on the bridge's IPAM pool
+/// (Docker refuses to create a network whose subnet overlaps an
+/// existing one). The pool used by the calling test must allow the
+/// runner for that subnet.
+fn spawn_allow_path_container(subnet: &str) -> TestNetnsContainer {
+    TestNetnsContainer::spawn(subnet)
+}
+
+/// Render a users.conf with a single subnet at `cidr` whose
+/// `allow_users` is the supplied slice. The `_schema_version` field is
+/// present so the fixture exercises the post-V001 schema shape; this
+/// also pins the requirement that the route helper continues to parse
+/// post-V001 files.
+fn users_conf_for_pool(cidr: &str, allow_users: &[&str]) -> NamedTempFile {
+    let names: Vec<String> = allow_users.iter().map(|n| format!("\"{n}\"")).collect();
+    write_users_conf(&format!(
+        r#"{{
+            "_schema_version": 1,
+            "subnets": [
+                {{ "cidr": "{cidr}", "allow_users": [{}] }}
+            ]
+        }}"#,
+        names.join(", ")
+    ))
+}
+
+/// Find the (expected single) audit-log record in `lines` and assert
+/// the spec § 3.5 field schema: `decision`, `caller`, `for_user`,
+/// `gateway_ip`, `pid` always present; `pool` present iff
+/// gateway-ip-in-subnet (left to the caller to assert); `reason`
+/// present iff `decision == "denied"`; `ts` parseable as RFC 3339 UTC.
+fn assert_audit_record_shape(
+    lines: &[serde_json::Value],
+    expected_decision: &str,
+    expected_caller: &str,
+    expected_for_user: &str,
+    expected_pid: i32,
+) -> serde_json::Value {
+    assert_eq!(
+        lines.len(),
+        1,
+        "expected exactly one audit-log line; got {} lines: {:?}",
+        lines.len(),
+        lines
+    );
+    let r = &lines[0];
+    let ts = r["ts"]
+        .as_str()
+        .unwrap_or_else(|| panic!("audit record missing `ts`: {r}"));
+    // RFC 3339 parse (chrono accepts both `Z` and `+00:00` suffixes).
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .unwrap_or_else(|e| panic!("audit `ts` not RFC 3339: {ts:?} err={e}"));
+    assert_eq!(
+        r["decision"].as_str(),
+        Some(expected_decision),
+        "audit record decision mismatch: {r}"
+    );
+    assert_eq!(
+        r["caller"].as_str(),
+        Some(expected_caller),
+        "audit record caller mismatch: {r}"
+    );
+    assert_eq!(
+        r["for_user"].as_str(),
+        Some(expected_for_user),
+        "audit record for_user mismatch: {r}"
+    );
+    assert_eq!(
+        r["pid"].as_i64(),
+        Some(expected_pid as i64),
+        "audit record pid mismatch: {r}"
+    );
+    // `reason` field presence is decision-conditional per spec § 3.5.
+    match expected_decision {
+        "allowed" => assert!(
+            r.get("reason").is_none(),
+            "allowed audit record must NOT carry `reason`; got: {r}"
+        ),
+        "denied" => assert!(
+            r.get("reason").and_then(|v| v.as_str()).is_some(),
+            "denied audit record must carry `reason`; got: {r}"
+        ),
+        other => panic!("unexpected expected_decision: {other}"),
+    }
+    r.clone()
+}
+
+// ---------------------------------------------------------------------------
+// Allow path — `--for-user=<runner>`, matching caller (spec § 8.4)
+// ---------------------------------------------------------------------------
+
+/// Helper runs end-to-end with an explicit `--for-user=<runner>` that
+/// matches the caller's runtime uid; pool contains the runner; expect
+/// exit 0, allowed audit-log line, route installed inside the
+/// container's netns.
+#[test]
+fn integration_route_helper_accepts_for_user_matching_caller() {
+    let helper = verify_installed_test_helper();
+    let runner = runner_username();
+    // RFC 2544 benchmarking range — guaranteed not to overlap other
+    // tests' bridges. Each allow-path test uses a distinct /24 so
+    // parallel runs cannot collide on Docker's IPAM.
+    let subnet = "198.19.10.0/24";
+    let gateway_ip = "198.19.10.1";
+    let fixture = spawn_allow_path_container(subnet);
+    let users_conf = users_conf_for_pool(subnet, &[runner.as_str()]);
+    let (audit_dir, audit_path) = make_audit_log_path();
+    // `audit_dir` must outlive the helper invocation; bind so it isn't
+    // dropped on the same line.
+    let _audit_keep = audit_dir;
+
+    let pid_str = fixture.container_pid.to_string();
+    let (output, audit_lines) = run_helper_with_audit(
+        &helper,
+        &users_conf,
+        &audit_path,
+        &["--for-user", &runner, &pid_str, gateway_ip],
+    );
+
+    assert!(
+        output.status.success(),
+        "helper must allow; got exit failure. stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let record = assert_audit_record_shape(
+        &audit_lines,
+        "allowed",
+        &runner,
+        &runner,
+        fixture.container_pid,
+    );
+    assert_eq!(
+        record["pool"].as_str(),
+        Some(subnet),
+        "audit pool field mismatch: {record}"
+    );
+    assert_eq!(
+        record["gateway_ip"].as_str(),
+        Some(gateway_ip),
+        "audit gateway_ip field mismatch: {record}"
+    );
+
+    // Verify the route landed: container default route now points at
+    // the helper-installed gateway. The pre-test default (docker's own
+    // `10.209.0.1`) coincidentally matches our gateway; to confirm the
+    // helper actually ran a `replace`, we read the stdout which the
+    // helper emits on success (step 8).
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("route installed"),
+        "helper stdout must confirm route install; got: {stdout}"
+    );
+
+    let route = Command::new("docker")
+        .args([
+            "exec",
+            &fixture.container_name,
+            "ip",
+            "route",
+            "show",
+            "default",
+        ])
+        .output()
+        .expect("docker exec ip route should succeed");
+    let route_text = String::from_utf8_lossy(&route.stdout);
+    assert!(
+        route_text.contains(gateway_ip),
+        "container default route must point at the helper-installed gateway {gateway_ip}; got: {route_text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Deny path — `--for-user=<other>` mismatches the runner (spec § 8.4)
+// ---------------------------------------------------------------------------
+
+/// Helper runs with `--for-user` set to a name OTHER than the runner;
+/// pool contains ONLY the runner. Pair-check denies because for-user
+/// is not in `allow_users`. The deny path also exercises the spec
+/// § 3.3 stderr substring (`pair-check failed`) and the audit-record
+/// `decision="denied"` + `reason` field.
+#[test]
+fn integration_route_helper_denies_for_user_mismatch() {
+    let helper = verify_installed_test_helper();
+    let runner = runner_username();
+    // `root` always resolves (uid 0) on every supported host, so
+    // `for_user_uid` lookup succeeds — the deny happens at pair-check,
+    // not at name-resolution. We deliberately pick a name that is
+    // never the runner to keep the test stable regardless of who runs
+    // it. (If a test host happens to log in as `root`, the test fails
+    // its precondition assertion below before invoking the helper.)
+    let other = "root";
+    assert_ne!(
+        runner, other,
+        "test precondition: runner must not be `root` for the mismatch case"
+    );
+    // This deny test never creates a Docker bridge — the helper exits
+    // at pair-check long before pidfd_open. The CIDR here matches
+    // only the users.conf pool naming for the audit record's `pool`
+    // field; the gateway IP `10.209.0.2` must lie inside it.
+    let users_conf = users_conf_for_pool("10.209.0.0/24", &[runner.as_str()]);
+    let (audit_dir, audit_path) = make_audit_log_path();
+    let _audit_keep = audit_dir;
+
+    let (output, audit_lines) = run_helper_with_audit(
+        &helper,
+        &users_conf,
+        &audit_path,
+        // Pid 1 / gateway 10.209.0.2 — pid is irrelevant because the
+        // pair-check exits before reaching pidfd_open.
+        &["--for-user", other, "1", "10.209.0.2"],
+    );
+
+    assert!(
+        !output.status.success(),
+        "helper must deny; got exit success. stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("pair-check failed"),
+        "stderr must contain 'pair-check failed'; got: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("caller={runner}")),
+        "stderr must name caller={runner}; got: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("for-user={other}")),
+        "stderr must name for-user={other}; got: {stderr}"
+    );
+
+    let record = assert_audit_record_shape(&audit_lines, "denied", &runner, other, 1);
+    assert_eq!(
+        record["reason"].as_str(),
+        Some("pair-check failed"),
+        "audit `reason` must be 'pair-check failed'; got: {record}"
+    );
+    assert_eq!(
+        record["pool"].as_str(),
+        Some("10.209.0.0/24"),
+        "audit `pool` must name the chosen subnet on pair-check deny; got: {record}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Default `--for-user` path — omitting the flag (spec § 8.4)
+// ---------------------------------------------------------------------------
+
+/// Helper runs WITHOUT `--for-user`; the flag defaults to the caller's
+/// name per spec § 3.1, so pair-check is `(runner, runner)` against
+/// `[runner]` and succeeds. Otherwise identical to the explicit-flag
+/// allow-path test.
+#[test]
+fn integration_route_helper_defaults_for_user_to_caller_when_omitted() {
+    let helper = verify_installed_test_helper();
+    let runner = runner_username();
+    // Distinct /24 from the other allow-path tests to avoid Docker IPAM
+    // pool-overlap when nextest runs them in parallel.
+    let subnet = "198.19.11.0/24";
+    let gateway_ip = "198.19.11.1";
+    let fixture = spawn_allow_path_container(subnet);
+    let users_conf = users_conf_for_pool(subnet, &[runner.as_str()]);
+    let (audit_dir, audit_path) = make_audit_log_path();
+    let _audit_keep = audit_dir;
+
+    let pid_str = fixture.container_pid.to_string();
+    let (output, audit_lines) = run_helper_with_audit(
+        &helper,
+        &users_conf,
+        &audit_path,
+        // Note: no --for-user flag here.
+        &[&pid_str, gateway_ip],
+    );
+
+    assert!(
+        output.status.success(),
+        "helper must allow; got exit failure. stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Both `caller` and `for_user` are the runner — pair-check sees
+    // the same uid twice.
+    assert_audit_record_shape(
+        &audit_lines,
+        "allowed",
+        &runner,
+        &runner,
+        fixture.container_pid,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Caller not in pool — even with a valid `--for-user` (spec § 8.4)
+// ---------------------------------------------------------------------------
+
+/// Pool contains a name OTHER than the runner; `--for-user` matches
+/// that other name. Pair-check still denies because the caller is not
+/// in the pool. Demonstrates that an attacker who controls argv (e.g.
+/// a compromised daemon, post-Spec-3) cannot bypass isolation by
+/// asserting a victim's identity — the caller's own identity must
+/// also be in the pool.
+#[test]
+fn integration_route_helper_denies_when_caller_not_in_pool_even_with_valid_for_user() {
+    let helper = verify_installed_test_helper();
+    // Pool authorizes only `root` (uid 0). The runner is not root
+    // (asserted), so the pair-check denies even though `for_user`
+    // resolves cleanly and is in the pool.
+    let runner = runner_username();
+    assert_ne!(
+        runner, "root",
+        "test precondition: runner must not be `root` for this caller-not-in-pool case"
+    );
+    let users_conf = users_conf_for_pool("10.209.0.0/24", &["root"]);
+    let (audit_dir, audit_path) = make_audit_log_path();
+    let _audit_keep = audit_dir;
+
+    let (output, audit_lines) = run_helper_with_audit(
+        &helper,
+        &users_conf,
+        &audit_path,
+        &["--for-user", "root", "1", "10.209.0.2"],
+    );
+
+    assert!(
+        !output.status.success(),
+        "helper must deny; got exit success. stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("pair-check failed"),
+        "stderr must contain 'pair-check failed'; got: {stderr}"
+    );
+    let record = assert_audit_record_shape(&audit_lines, "denied", &runner, "root", 1);
+    assert_eq!(
+        record["reason"].as_str(),
+        Some("pair-check failed"),
+        "audit `reason` must be 'pair-check failed'; got: {record}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Unresolvable `--for-user` (spec § 8.4)
+// ---------------------------------------------------------------------------
+
+/// `--for-user` is a sentinel name that does not exist on the host.
+/// Per spec § 3.4 this is a strict deny path — the helper denies
+/// before reaching pair-check (it cannot even establish the
+/// for-user's numeric uid).
+#[test]
+fn integration_route_helper_denies_when_username_unresolvable() {
+    let helper = verify_installed_test_helper();
+    let runner = runner_username();
+    let users_conf = users_conf_for_pool("10.209.0.0/24", &[runner.as_str()]);
+    let (audit_dir, audit_path) = make_audit_log_path();
+    let _audit_keep = audit_dir;
+
+    // Sentinel name reused from `sandbox-core/src/users_conf.rs` —
+    // every host's `getpwnam_r` returns `Ok(None)` for it.
+    let bogus = "definitely-not-a-real-user-9c3f";
+    let (output, audit_lines) = run_helper_with_audit(
+        &helper,
+        &users_conf,
+        &audit_path,
+        &["--for-user", bogus, "1", "10.209.0.2"],
+    );
+
+    assert!(
+        !output.status.success(),
+        "helper must deny; got exit success. stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("does not resolve to a uid"),
+        "stderr must contain 'does not resolve to a uid'; got: {stderr}"
+    );
+
+    let record = assert_audit_record_shape(&audit_lines, "denied", &runner, bogus, 1);
+    assert_eq!(
+        record["reason"].as_str(),
+        Some("for-user-unresolvable"),
+        "audit `reason` must be 'for-user-unresolvable'; got: {record}"
+    );
+    // Pool field is absent — the deny happened before the users.conf
+    // subnet lookup ran.
+    assert!(
+        record.get("pool").is_none(),
+        "audit `pool` must be absent on for-user-unresolvable deny; got: {record}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Audit-log on allowed decision (spec § 8.4)
+// ---------------------------------------------------------------------------
+
+/// Independent of any specific decision branch: assert the precise
+/// JSON-Lines shape of an allowed-decision audit record. The allow
+/// path also drives a real Docker container so the helper actually
+/// completes step 8 (route installed), which is the production shape
+/// of the field set.
+#[test]
+fn integration_route_helper_writes_audit_log_on_allowed() {
+    let helper = verify_installed_test_helper();
+    let runner = runner_username();
+    // Distinct /24 from the other allow-path tests to avoid Docker IPAM
+    // pool-overlap when nextest runs them in parallel.
+    let subnet = "198.19.12.0/24";
+    let gateway_ip = "198.19.12.1";
+    let fixture = spawn_allow_path_container(subnet);
+    let users_conf = users_conf_for_pool(subnet, &[runner.as_str()]);
+    let (audit_dir, audit_path) = make_audit_log_path();
+    let _audit_keep = audit_dir;
+
+    let pid_str = fixture.container_pid.to_string();
+    let (output, audit_lines) = run_helper_with_audit(
+        &helper,
+        &users_conf,
+        &audit_path,
+        &["--for-user", &runner, &pid_str, gateway_ip],
+    );
+
+    assert!(
+        output.status.success(),
+        "helper must allow; got exit failure. stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let record = assert_audit_record_shape(
+        &audit_lines,
+        "allowed",
+        &runner,
+        &runner,
+        fixture.container_pid,
+    );
+    // All spec § 3.5 fields present on the allowed record (sans
+    // `reason`, asserted absent inside assert_audit_record_shape).
+    assert_eq!(record["pool"].as_str(), Some(subnet));
+    assert_eq!(record["gateway_ip"].as_str(), Some(gateway_ip));
+}
+
+// ---------------------------------------------------------------------------
+// Audit-log on denied decision (spec § 8.4)
+// ---------------------------------------------------------------------------
+
+/// Independent of stderr substring: assert the precise JSON-Lines
+/// shape of a denied-decision audit record. The for-user mismatch is
+/// the most representative deny because it exercises the pool-naming
+/// field (`pool`) which an unresolvable-for-user record cannot.
+#[test]
+fn integration_route_helper_writes_audit_log_on_denied() {
+    let helper = verify_installed_test_helper();
+    let runner = runner_username();
+    let other = "root";
+    assert_ne!(runner, other, "test precondition: runner must not be root");
+    let users_conf = users_conf_for_pool("10.209.0.0/24", &[runner.as_str()]);
+    let (audit_dir, audit_path) = make_audit_log_path();
+    let _audit_keep = audit_dir;
+
+    let (output, audit_lines) = run_helper_with_audit(
+        &helper,
+        &users_conf,
+        &audit_path,
+        &["--for-user", other, "1", "10.209.0.2"],
+    );
+
+    assert!(
+        !output.status.success(),
+        "helper must deny; got exit success. stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let record = assert_audit_record_shape(&audit_lines, "denied", &runner, other, 1);
+    assert_eq!(
+        record["reason"].as_str(),
+        Some("pair-check failed"),
+        "denied audit `reason` must be 'pair-check failed': {record}"
+    );
+    assert_eq!(
+        record["pool"].as_str(),
+        Some("10.209.0.0/24"),
+        "denied audit `pool` must name the chosen subnet: {record}"
+    );
+    assert_eq!(
+        record["gateway_ip"].as_str(),
+        Some("10.209.0.2"),
+        "denied audit `gateway_ip` must echo the argv value: {record}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Audit-log write failure on deny still denies (spec § 8.4)
+// ---------------------------------------------------------------------------
+
+/// Spec § 3.5: when the audit-log write fails on a deny path, the
+/// helper still exits `DENY_EXIT` AND escalates to stderr — the deny
+/// itself is unconditional and the forensic-record-availability
+/// invariant gains explicit escalation.
+///
+/// We force the write to fail by pointing
+/// `SANDBOX_ROUTE_HELPER_AUDIT_LOG` at a path under a parent that is
+/// itself a regular file (not a directory). `OpenOptions::open` then
+/// fails with ENOTDIR, the helper logs the stderr escalation line, and
+/// the process exits with `DENY_EXIT` despite no audit record having
+/// been written.
+#[test]
+fn integration_route_helper_audit_log_write_failure_on_deny_still_denies() {
+    let helper = verify_installed_test_helper();
+    let runner = runner_username();
+    let other = "root";
+    assert_ne!(runner, other, "test precondition: runner must not be root");
+
+    let users_conf = users_conf_for_pool("10.209.0.0/24", &[runner.as_str()]);
+
+    // Build a path whose parent is a regular file — `create_dir_all`
+    // and `open` both fail on this shape, so the audit writer returns
+    // `WriteFailed` regardless of the helper's level of effort.
+    let block_file =
+        NamedTempFile::new().expect("tempfile for audit-log path-blocker should succeed");
+    let audit_path = block_file.path().join("nested/route-helper-audit.log");
+    assert!(
+        !audit_path.exists(),
+        "test setup invariant: nested path must not yet exist"
+    );
+
+    let output = Command::new(&helper)
+        .args(["--for-user", other, "1", "10.209.0.2"])
+        .env("SANDBOX_USERS_CONF", users_conf.path())
+        .env("SANDBOX_ROUTE_HELPER_AUDIT_LOG", &audit_path)
+        .output()
+        .expect("invoking helper should succeed");
+
+    assert!(
+        !output.status.success(),
+        "helper must deny even when audit-log write fails; got exit success. stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // The deny reason itself surfaces.
+    assert!(
+        stderr.contains("pair-check failed"),
+        "stderr must contain 'pair-check failed' (deny still happens): {stderr}"
+    );
+    // The audit-write escalation surfaces too.
+    assert!(
+        stderr.contains("audit log write failed"),
+        "stderr must contain 'audit log write failed' escalation: {stderr}"
+    );
+    // The audit log file was never created (the helper could not
+    // open it).
+    assert!(
+        !audit_path.exists(),
+        "audit log file must not exist after a forced write failure: {}",
+        audit_path.display()
     );
 }

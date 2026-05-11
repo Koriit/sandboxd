@@ -5,43 +5,47 @@
 //! # Invocation
 //!
 //! ```text
-//! sandbox-route-helper <container_pid> <gateway_ip>
+//! sandbox-route-helper [--for-user <name>] <container_pid> <gateway_ip>
 //! ```
 //!
-//! Exactly two positional arguments. No flags, no stdin, no env-var
-//! configuration in production. The `SANDBOX_USERS_CONF` env var seam
-//! exists in `sandbox-core::users_conf` for daemon-side and helper-side
-//! integration tests, but the helper consults it ONLY when this crate
-//! is built with the `test-env-override` Cargo feature. Default
-//! production builds (used by the `install-route-helper-prod-cap` make
-//! target) ignore the env var entirely. See
-//! [`sandbox_core::users_conf::route_helper_users_conf_path`] for the
-//! gating logic.
+//! Two positional arguments preceded by an optional `--for-user <name>`
+//! flag. No stdin, no env-var configuration in production. The
+//! `SANDBOX_USERS_CONF` env var seam exists in `sandbox-core::users_conf`
+//! for daemon-side and helper-side integration tests, but the helper
+//! consults it ONLY when this crate is built with the `test-env-override`
+//! Cargo feature. Default production builds (used by the
+//! `install-route-helper-prod-cap` make target) ignore the env var
+//! entirely. See [`sandbox_core::users_conf::route_helper_users_conf_path`]
+//! for the gating logic.
 //!
 //! # Authorization flow
 //!
-//! Per the M11 lite-mode container backend spec (§ "Helper authorization
-//! flow"), every invocation runs eight ordered steps. Any step that
-//! denies prints a single `sandbox-route-helper: <reason>` line to
-//! stderr and exits with code `1`. No netns mutation occurs on the deny
-//! path — the helper exits before reaching step 7.
+//! Each invocation runs ordered steps; any step that denies prints a
+//! single `sandbox-route-helper: <reason>` line to stderr, writes an
+//! append-only JSON-Lines audit record (per spec § 3.5), and exits with
+//! code `1`. No netns mutation occurs on the deny path — the helper
+//! exits before reaching the route install.
 //!
-//! 1. Caller identity — read `getuid()`; resolve username best-effort
-//!    for stderr clarity.
-//! 2. Argv parse — already done above.
+//! 1. Caller identity — read `getuid()` and resolve to a username via
+//!    `getpwuid_r`. STRICT per spec § 3.4: unresolvable uid denies.
+//! 2. Argv parse — `--for-user <name>` (optional, defaults to caller)
+//!    plus the two positional args. Strict resolution of `--for-user`
+//!    via `getpwnam_r` per spec § 3.4.
 //! 3. Load `users.conf`; locate the subnet whose CIDR contains the
 //!    gateway IP argument.
-//! 4. Verify the caller's uid appears in that subnet's `allow_users`
-//!    (numeric comparison via `getpwnam_r`, per spec line 406-408).
+//! 4. **Pair-membership check** (spec §§ 3.1–3.2) — both the caller's
+//!    uid AND the `--for-user` uid must appear in the chosen pool's
+//!    `allow_users` (each resolved numerically via `getpwnam_r`).
 //! 5. `pidfd_open(container_pid)` then `setns(pidfd, CLONE_NEWNET)` —
 //!    closes the PID-recycle TOCTOU window that `setns(open("/proc/<pid>
 //!    /ns/net"))` would leave open.
 //! 6. Enumerate every IPv4 address on every non-`lo` interface inside
 //!    the netns; require all of them to live inside the caller's
 //!    subnet. A single outside-subnet address denies — that's the
-//!    cross-user MITM closure (spec lines 420-430).
+//!    cross-user MITM closure.
 //! 7. `ip route replace default via <gateway_ip>` inside the netns.
-//! 8. Exit 0 with a one-line stdout confirmation.
+//! 8. Append an `allowed`-decision audit record and exit 0 with a
+//!    one-line stdout confirmation.
 //!
 //! # Privilege model
 //!
@@ -94,6 +98,12 @@ use nix::sched::{CloneFlags, setns};
 use nix::unistd::{Uid, User};
 use sandbox_core::users_conf::{SubnetEntry, load_users_config_route_helper};
 
+mod audit;
+mod pair_check;
+
+use audit::{AuditOutcome, AuditRecord, Decision};
+use pair_check::{Verdict, pair_check};
+
 /// Single deny exit code per the spec — the stderr reason carries the
 /// "what went wrong" payload, distinct codes per step would only
 /// invite scripts to grow ad-hoc dependencies on internal step
@@ -101,52 +111,236 @@ use sandbox_core::users_conf::{SubnetEntry, load_users_config_route_helper};
 const DENY_EXIT: u8 = 1;
 
 fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(reason) => {
-            eprintln!("sandbox-route-helper: {reason}");
-            ExitCode::from(DENY_EXIT)
-        }
+    run()
+}
+
+/// Render the pool field for an audit record. Spec § 3.5 specifies the
+/// CIDR string form (e.g. `"10.209.0.0/20"`).
+fn pool_string(subnet: &SubnetEntry) -> String {
+    format!("{}/{}", subnet.cidr.base(), subnet.cidr.prefix_len())
+}
+
+/// Emit an audit record. The per-decision asymmetry (allow vs. deny on
+/// write failure) lives here, in one place, so the security contract is
+/// grep-able.
+///
+/// On allow-path write failure: log to stderr, return — the caller
+/// proceeds with the routing install. On deny-path write failure: log
+/// to stderr; the caller will already be on its way to exiting
+/// `DENY_EXIT`, so no extra escalation is needed at *this* call site,
+/// but for paths where the caller would otherwise have exited `0`
+/// (impossible by construction here, but the type prevents accidental
+/// regression), the return-value distinction is preserved.
+fn emit_audit(record: &AuditRecord<'_>) -> AuditOutcome {
+    let path = audit::audit_log_path();
+    audit::write_record(&path, record)
+}
+
+/// Deny path: write the audit-deny record (with the per-spec-§3.5
+/// escalation if the write fails), print the stderr reason, and return
+/// `DENY_EXIT`. Used by every deny branch in `run`.
+fn deny_with_audit(
+    reason_tag: &'static str,
+    stderr_msg: &str,
+    caller: &str,
+    for_user: &str,
+    pool: Option<&str>,
+    gateway_ip: &str,
+    pid: i32,
+) -> ExitCode {
+    let outcome = emit_audit(&AuditRecord {
+        decision: Decision::Denied { reason: reason_tag },
+        caller,
+        for_user,
+        pool,
+        gateway_ip,
+        pid,
+    });
+    eprintln!("sandbox-route-helper: {stderr_msg}");
+    if let AuditOutcome::WriteFailed(err) = outcome {
+        // Deny-path escalation per spec § 3.5: surface the missing
+        // forensic record on stderr. The deny itself is unconditional
+        // (the exit code below stays `DENY_EXIT`); the escalation only
+        // adds the operator-visible signal that the audit trail
+        // evaporated.
+        eprintln!("sandbox-route-helper: audit log write failed: {err}");
+    }
+    ExitCode::from(DENY_EXIT)
+}
+
+/// Allow-path post-success audit. Spec § 3.5: write-failure surfaces on
+/// stderr but DOES NOT block the allow (routing-path-availability wins).
+fn allow_audit(caller: &str, for_user: &str, pool: Option<&str>, gateway_ip: &str, pid: i32) {
+    let outcome = emit_audit(&AuditRecord {
+        decision: Decision::Allowed,
+        caller,
+        for_user,
+        pool,
+        gateway_ip,
+        pid,
+    });
+    if let AuditOutcome::WriteFailed(err) = outcome {
+        eprintln!("sandbox-route-helper: audit log write failed: {err}");
     }
 }
 
-/// Top-level orchestration. Every error returned bubbles up to `main`
-/// and surfaces as a single stderr line — the caller doesn't see step
-/// numbers, only the failure reason.
-fn run() -> Result<(), String> {
+/// Top-level orchestration. Each branch decides allow / deny and writes
+/// an audit record before returning the `ExitCode`. No deny branch
+/// reaches netns mutation (steps 5–7); pair-check denials and gateway-IP
+/// denials short-circuit early.
+fn run() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().collect();
-    let (container_pid, gateway_ip) = parse_argv(&args)?;
+    let parsed = match parse_argv(&args) {
+        Ok(p) => p,
+        Err(e) => {
+            // Argv-parse failures pre-date the audit-log contract: the
+            // helper cannot even name a caller/for-user pair, so no
+            // record can be written that conforms to the schema. Match
+            // the pre-change behavior — stderr + DENY_EXIT.
+            eprintln!("sandbox-route-helper: {e}");
+            return ExitCode::from(DENY_EXIT);
+        }
+    };
+    let ParsedArgs {
+        container_pid,
+        gateway_ip,
+        for_user_arg,
+    } = parsed;
+    let gateway_ip_str = gateway_ip.to_string();
 
-    // Step 1 — caller identity.
+    // Step 1 — caller identity. STRICT resolution per spec § 3.4:
+    // unresolvable uid is a deny path, not a stderr-clarity hint. The
+    // pair-check below needs both identities reliably; falling back to
+    // numeric-only comparison would allow a request whose `for_user`
+    // resolves to the same uid as `caller` (e.g. via NSS misconfig) to
+    // sneak through pair-check on a name-mismatch.
     let caller_uid = Uid::current();
-    // Username is best-effort for stderr clarity. A resolution failure
-    // (rare — typically only on /etc/passwd corruption) does not deny;
-    // the auth check uses the numeric uid.
-    let caller_user = User::from_uid(caller_uid).ok().flatten();
+    let caller_name = match User::from_uid(caller_uid) {
+        Ok(Some(u)) => u.name,
+        Ok(None) => {
+            let raw = caller_uid.as_raw();
+            let msg = format!("caller uid {raw} does not resolve to a username");
+            // No `caller` name to put in the audit record — fall back
+            // to `uid:<n>` so the deny is still recorded with as much
+            // identity as the helper could establish. The deny is
+            // unconditional regardless of audit-record completeness.
+            let placeholder = format!("uid:{raw}");
+            let for_user_for_audit = for_user_arg.as_deref().unwrap_or(placeholder.as_str());
+            return deny_with_audit(
+                "caller-uid-unresolvable",
+                &msg,
+                &placeholder,
+                for_user_for_audit,
+                None,
+                &gateway_ip_str,
+                container_pid,
+            );
+        }
+        Err(e) => {
+            let raw = caller_uid.as_raw();
+            let msg = format!("username resolution failed for uid {raw}: {e}");
+            let placeholder = format!("uid:{raw}");
+            let for_user_for_audit = for_user_arg.as_deref().unwrap_or(placeholder.as_str());
+            return deny_with_audit(
+                "caller-uid-resolution-error",
+                &msg,
+                &placeholder,
+                for_user_for_audit,
+                None,
+                &gateway_ip_str,
+                container_pid,
+            );
+        }
+    };
+
+    // `--for-user` defaults to the caller's name when omitted (§ 3.1),
+    // so direct-CLI helper invocations remain meaningful.
+    let for_user = for_user_arg.unwrap_or_else(|| caller_name.clone());
+
+    // Resolve `--for-user` to a uid strictly. An unresolvable for-user
+    // name is a deny path per § 3.4.
+    let for_user_uid = match User::from_name(&for_user) {
+        Ok(Some(u)) => u.uid.as_raw(),
+        Ok(None) => {
+            let msg = format!("--for-user {for_user} does not resolve to a uid");
+            return deny_with_audit(
+                "for-user-unresolvable",
+                &msg,
+                &caller_name,
+                &for_user,
+                None,
+                &gateway_ip_str,
+                container_pid,
+            );
+        }
+        Err(e) => {
+            let msg = format!("username resolution failed for {for_user}: {e}");
+            return deny_with_audit(
+                "for-user-resolution-error",
+                &msg,
+                &caller_name,
+                &for_user,
+                None,
+                &gateway_ip_str,
+                container_pid,
+            );
+        }
+    };
 
     // Step 3 — load users.conf and locate the gateway-IP's subnet.
     // `load_users_config_route_helper` ignores `SANDBOX_USERS_CONF` in
     // default builds and reads `/etc/sandboxd/users.conf`
     // unconditionally; only `test-env-override` builds honor the env
     // var. See the crate-level docstring + `route_helper_users_conf_path`.
-    let config = load_users_config_route_helper().map_err(|e| e.to_string())?;
-    let subnet = config
-        .find_subnet_by_gateway_ip(gateway_ip)
-        .ok_or_else(|| format!("gateway ip {gateway_ip} not in any subnet"))?;
+    let config = match load_users_config_route_helper() {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = e.to_string();
+            return deny_with_audit(
+                "users-conf-load-failed",
+                &msg,
+                &caller_name,
+                &for_user,
+                None,
+                &gateway_ip_str,
+                container_pid,
+            );
+        }
+    };
+    let subnet = match config.find_subnet_by_gateway_ip(gateway_ip) {
+        Some(s) => s,
+        None => {
+            let msg = format!("gateway ip {gateway_ip} not in any subnet");
+            return deny_with_audit(
+                "gateway-ip not in any subnet",
+                &msg,
+                &caller_name,
+                &for_user,
+                None,
+                &gateway_ip_str,
+                container_pid,
+            );
+        }
+    };
+    let pool = pool_string(subnet);
 
-    // Step 4 — allow_users check. NUMERIC ground truth: usernames in
-    // users.conf are admin-readability only (spec line 406-408).
-    if !subnet.allows_uid(caller_uid.as_raw()) {
-        return Err(format!(
-            "uid {} ({}) not in allow_users for subnet {}/{}",
-            caller_uid.as_raw(),
-            caller_user
-                .as_ref()
-                .map(|u| u.name.as_str())
-                .unwrap_or("<unknown>"),
-            subnet.cidr.base(),
-            subnet.cidr.prefix_len(),
-        ));
+    // Step 4 — pair-membership check per spec §§ 3.1–3.2. Both caller
+    // and for-user uids must appear in the pool's `allow_users` (each
+    // resolved numerically via `SubnetEntry::allows_uid`). On mismatch,
+    // exit DENY_EXIT with stderr naming both identities (§ 3.3).
+    let verdict = pair_check(subnet, caller_uid.as_raw(), for_user_uid);
+    if verdict == Verdict::Denied {
+        let msg =
+            format!("pair-check failed: caller={caller_name} for-user={for_user} pool={pool}");
+        return deny_with_audit(
+            "pair-check failed",
+            &msg,
+            &caller_name,
+            &for_user,
+            Some(&pool),
+            &gateway_ip_str,
+            container_pid,
+        );
     }
 
     // Step 5 — pidfd_open + setns(CLONE_NEWNET). Using a pidfd, not a
@@ -154,15 +348,37 @@ fn run() -> Result<(), String> {
     // pidfd_open binds to the *thread-group leader* identity at open
     // time, so a recycled pid in the meantime cannot redirect the
     // setns target.
-    let pidfd =
-        pidfd_open(container_pid).map_err(|errno| format_pidfd_error(container_pid, errno))?;
-    setns(&pidfd, CloneFlags::CLONE_NEWNET).map_err(|err| {
+    let pidfd = match pidfd_open(container_pid) {
+        Ok(fd) => fd,
+        Err(errno) => {
+            let msg = format_pidfd_error(container_pid, errno);
+            return deny_with_audit(
+                "pidfd-open-failed",
+                &msg,
+                &caller_name,
+                &for_user,
+                Some(&pool),
+                &gateway_ip_str,
+                container_pid,
+            );
+        }
+    };
+    if let Err(err) = setns(&pidfd, CloneFlags::CLONE_NEWNET) {
         // Drop the pidfd before returning so we don't leak it across
         // the deny path. It would close on process exit either way,
         // but explicit close keeps the fd lifecycle obvious.
         drop_pidfd(pidfd);
-        format!("setns failed: {err}")
-    })?;
+        let msg = format!("setns failed: {err}");
+        return deny_with_audit(
+            "setns-failed",
+            &msg,
+            &caller_name,
+            &for_user,
+            Some(&pool),
+            &gateway_ip_str,
+            container_pid,
+        );
+    }
 
     // After this point, the helper's /proc/self/ns/net symlink points
     // at the container's netns. getifaddrs() and the subsequent ip(8)
@@ -171,39 +387,152 @@ fn run() -> Result<(), String> {
     // Step 6 — every IPv4 address on every non-lo interface must live
     // inside the caller's subnet. A single outside-subnet address
     // denies (cross-user MITM closure).
-    enforce_netns_addresses_in_subnet(subnet)?;
+    if let Err(msg) = enforce_netns_addresses_in_subnet(subnet) {
+        return deny_with_audit(
+            "netns-address-outside-subnet",
+            &msg,
+            &caller_name,
+            &for_user,
+            Some(&pool),
+            &gateway_ip_str,
+            container_pid,
+        );
+    }
 
     // Step 7 — install the default route inside the netns.
-    install_default_route(gateway_ip)?;
+    if let Err(msg) = install_default_route(gateway_ip) {
+        return deny_with_audit(
+            "route-install-failed",
+            &msg,
+            &caller_name,
+            &for_user,
+            Some(&pool),
+            &gateway_ip_str,
+            container_pid,
+        );
+    }
 
-    // Step 8 — operator-facing confirmation.
+    // Step 8 — allow path. Record the audit line, then operator-facing
+    // confirmation. Audit-log write failure on the allow path is a
+    // stderr-only signal — routing-path-availability wins.
+    allow_audit(
+        &caller_name,
+        &for_user,
+        Some(&pool),
+        &gateway_ip_str,
+        container_pid,
+    );
     println!("sandbox-route-helper: route installed for pid {container_pid} via {gateway_ip}");
-    Ok(())
+    ExitCode::SUCCESS
 }
 
 // ---------------------------------------------------------------------------
 // Argv parsing
 // ---------------------------------------------------------------------------
 
-/// Parse the two positional arguments. `argv[0]` is the program name.
-fn parse_argv(args: &[OsString]) -> Result<(i32, Ipv4Addr), String> {
-    if args.len() != 3 {
-        return Err("usage: sandbox-route-helper <container_pid> <gateway_ip>".to_string());
+/// Parsed argv. `for_user_arg` is `None` if `--for-user` was omitted —
+/// the caller defaults it to `name(getuid())` per spec § 3.1, which
+/// preserves the pre-existing direct-CLI invocation shape.
+struct ParsedArgs {
+    container_pid: i32,
+    gateway_ip: Ipv4Addr,
+    for_user_arg: Option<String>,
+}
+
+/// Parse argv: optional `--for-user <name>` before the two positional
+/// args. `argv[0]` is the program name.
+///
+/// Hand-rolled per spec § 9.4 — pulling `clap` into the cap'd helper
+/// would inflate the TCB by several thousand lines that have to be
+/// reviewed for the privilege story. The flag accepts both
+/// `--for-user <name>` (two-arg form) and `--for-user=<name>` (one-arg
+/// form); both shapes show up in practice.
+fn parse_argv(args: &[OsString]) -> Result<ParsedArgs, String> {
+    const USAGE: &str =
+        "usage: sandbox-route-helper [--for-user <name>] <container_pid> <gateway_ip>";
+
+    // Walk argv left-to-right, consuming `--for-user` (and value) where
+    // it appears. Anything that is not the flag is a positional. We
+    // intentionally do NOT accept `--for-user` after the positionals,
+    // because the daemon emits it before them (§ 6.5) and an
+    // after-positionals form would create two ways to spell the same
+    // intent for no benefit.
+    let mut for_user_arg: Option<String> = None;
+    let mut positionals: Vec<&OsString> = Vec::with_capacity(2);
+
+    // argv[0] is the program name; skip it.
+    let mut iter = args.iter().enumerate().skip(1).peekable();
+    let mut accepting_flags = true;
+
+    while let Some((_idx, arg)) = iter.next() {
+        let arg_str = arg.to_string_lossy();
+        if accepting_flags && arg_str == "--for-user" {
+            // Two-argument form: --for-user NAME
+            let Some((_, value)) = iter.next() else {
+                return Err(format!("{USAGE} (missing value after --for-user)"));
+            };
+            if for_user_arg.is_some() {
+                return Err(format!("{USAGE} (--for-user specified more than once)"));
+            }
+            let name = value.to_string_lossy().into_owned();
+            if name.is_empty() {
+                return Err(format!("{USAGE} (--for-user value must be non-empty)"));
+            }
+            if name.starts_with("--") {
+                // Guard against the daemon accidentally passing
+                // `--for-user --some-other-flag`: the value would
+                // shadow a missing arg and tank pair-check later.
+                return Err(format!(
+                    "{USAGE} (--for-user value looks like a flag: {name})"
+                ));
+            }
+            for_user_arg = Some(name);
+        } else if accepting_flags && let Some(rest) = arg_str.strip_prefix("--for-user=") {
+            // Single-argument form: --for-user=NAME
+            if for_user_arg.is_some() {
+                return Err(format!("{USAGE} (--for-user specified more than once)"));
+            }
+            if rest.is_empty() {
+                return Err(format!("{USAGE} (--for-user value must be non-empty)"));
+            }
+            for_user_arg = Some(rest.to_string());
+        } else if accepting_flags && arg_str == "--" {
+            // End-of-flags sentinel — everything after this is
+            // positional. The daemon never emits this; it's a hook for
+            // operator debugging.
+            accepting_flags = false;
+        } else if accepting_flags && arg_str.starts_with("--") {
+            // Unknown flag. Reject — the helper deliberately does not
+            // accept arbitrary flags, and silently treating an unknown
+            // `--something` as a positional would hide typos in daemon-
+            // emitted argv.
+            return Err(format!("{USAGE} (unrecognised flag: {arg_str})"));
+        } else {
+            positionals.push(arg);
+        }
     }
 
-    let pid_arg = args[1].to_string_lossy();
+    if positionals.len() != 2 {
+        return Err(USAGE.to_string());
+    }
+
+    let pid_arg = positionals[0].to_string_lossy();
     let pid: i32 = pid_arg
         .parse()
         .ok()
         .filter(|n: &i32| *n >= 1)
         .ok_or_else(|| format!("invalid container pid: {pid_arg}"))?;
 
-    let ip_arg = args[2].to_string_lossy();
+    let ip_arg = positionals[1].to_string_lossy();
     let gateway_ip: Ipv4Addr = ip_arg
         .parse()
         .map_err(|_| format!("invalid gateway ip: {ip_arg}"))?;
 
-    Ok((pid, gateway_ip))
+    Ok(ParsedArgs {
+        container_pid: pid,
+        gateway_ip,
+        for_user_arg,
+    })
 }
 
 // ---------------------------------------------------------------------------
