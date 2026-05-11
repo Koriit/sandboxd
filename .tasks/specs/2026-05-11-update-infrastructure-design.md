@@ -105,7 +105,7 @@ sandbox update --cosign-bundle <path>         # air-gap sigstore verification (r
 sandbox update --check                        # read-only: report installed vs available, exit
 sandbox update --dry-run                      # print the plan; no privileged calls, no state mutation
 sandbox update --yes                          # skip the interactive confirmation prompt
-sandbox update --force                        # proceed past the "active sessions exist" guard (§ 3.1.7)
+sandbox update --force                        # proceed past the "active sessions exist" guard (§ 3.1.6)
 sandbox update --quiet | --verbose            # log volume
 sandbox update --source-url <base-url>        # tarball mirror (default: GitHub Releases)
 ```
@@ -115,7 +115,7 @@ The flag set is deliberately a superset of install.sh's flag vocabulary
 update --version`, `--from`, `--cosign-bundle`, `--yes`, `--verbose`,
 `--quiet`, `--source-url` as the same primitives applied to an upgrade.
 `--check` and `--dry-run` are upgrade-specific affordances; `--force`
-gates the active-session refusal in § 3.1.7.
+gates the active-session refusal in § 3.1.6.
 
 All other update-specific behavior — confirmation prompt, audit log
 destination, sticky `was_running` — does not require new flags.
@@ -233,29 +233,36 @@ Installed: sandboxd 1.0.0
 Available: sandboxd 1.1.0
 Status:    update available
 
-Plan (dry-run — no state will be mutated):
-  ✓ pre-flight checks            would execute
-  ✓ acquire lock                 would execute
-  ✓ fetch tarball                would execute
-  ✓ verify sigstore signature    would execute
-  ✓ extract + verify MANIFEST    would execute
-  ✓ migration dry-run            would execute
-  ✓ stop daemon (was_running=1)  would execute
-  ✓ backup sessions.db           would execute
-  ✓ backup /etc files            would execute
-  ✓ backup binaries              would execute
-  ~ install /usr/local/bin/sandbox        would skip (sha256 matches target)
-  ✓ install /usr/local/bin/sandboxd       would execute
-  ✓ install route-helper                  would execute
-  ✓ setcap on route-helper                would execute
-  ✓ apply config migration V002 → users.conf
-  ✓ docker load gateway image    would execute
-  ✓ prune older backups          would execute (keep last 2)
-  ✓ start daemon                 would execute
-  ✓ verify /version              would execute
-  ✓ run sandbox doctor           would execute
-  ✓ update install state         would execute
-  ✓ release lock                 would execute
+Pre-flight (§ 3.1) — read-only:
+  ✓ § 3.1.5  version compare            update available (1.0.0 → 1.1.0)
+  ✓ § 3.1.6  active sessions check      0 active sessions
+  ✓ § 3.1.7  stopped sessions compat    3 sessions, all compatible
+  ✓ § 3.1.8  disk space check           ok
+  ✓ § 3.1.9  cosign bootstrap           ok
+  ✓ § 3.1.10 sigstore verify            ok
+  ✓ § 3.1.11 migration dry-run          V002 pending for users.conf
+  ✓ § 3.1.12 confirmation prompt        (would prompt; --dry-run skips)
+
+Stateful (§ 3.2) — would execute:
+  ✓ § 3.2.13 acquire lock               would execute
+  ✓ § 3.2.14 stop daemon (was_running=1) would execute
+  ✓ § 3.2.15 backup sessions.db         would execute
+  ✓ § 3.2.16 backup /etc files          would execute
+  ✓ § 3.2.17 backup binaries            would execute
+  ✓ § 3.2.18 record previous_version    would execute
+  ✓ § 3.2.19 write backup manifest      would execute
+  ✓ § 3.2.20 docker load gateway image  would execute
+  ~ § 3.2.21 install /usr/local/bin/sandbox     would skip (sha256 matches)
+  ✓ § 3.2.21 install /usr/local/bin/sandboxd    would execute
+  ✓ § 3.2.22 setcap on route-helper     would execute
+  ✓ § 3.2.23 install systemd unit       would skip (identical)
+  ✓ § 3.2.24 apply config migration V002 → users.conf
+  ✓ § 3.2.25 prune older backups        would execute (keep last 2)
+  ✓ § 3.2.26 start daemon               would execute
+  ✓ § 3.2.27 verify /version            would execute
+  ✓ § 3.2.28 run sandbox doctor         would execute
+  ✓ § 3.2.29 update install state       would execute
+  ✓ § 3.2.30 release lock               would execute
 
 Run `sudo sandbox update` (without --dry-run) to apply.
 ```
@@ -273,9 +280,9 @@ applicable (e.g., disk space short, sigstore verification would fail).
 
 ### 2.4 · Confirmation prompt
 
-After pre-flight succeeds and before the first stateful change (§ 3.1.13
-in the step-by-step flow), `sandbox update` summarises the operation and
-prompts for confirmation. The prompt summarises:
+After pre-flight succeeds (§ 3.1.12, the confirmation prompt itself) and
+before the first stateful change (§ 3.2.13 — lock acquisition), `sandbox
+update` summarises the operation and prompts for confirmation. The prompt summarises:
 
 ```
 sandbox update will apply:
@@ -369,13 +376,13 @@ that makes it idempotent (so a re-run after partial failure converges),
 and the log line written.
 
 The flow has two phases: **pre-flight** (§ 3.1) is read-only and
-side-effect-free, ends with the operator confirmation prompt; **stateful
-steps** (§ 3.2) is the actual mutation, starting with the lock-file
-acquisition and ending with the install-state update.
+side-effect-free, ending with the operator confirmation prompt (§ 3.1.12);
+**stateful steps** (§ 3.2) begin with lock-file acquisition (§ 3.2.13)
+and end with the install-state update (§ 3.2.30).
 
 ### 3.1 · Pre-flight (read-only)
 
-#### 1. Arg parse + sanity checks
+#### § 3.1.1. Arg parse + sanity checks
 
 Parse flags per § 2.1; reject incompatible combinations (`--cosign-bundle`
 without `--from`, `--from` and `--source-url` together — `--from` is
@@ -383,7 +390,7 @@ local-only). Set defaults: `VERSION=latest`, `YES=0`, `VERBOSE=0`,
 `QUIET=0`, `FORCE=0`, `DRY_RUN=0`, `CHECK=0`. Initial log:
 `step=parse_args version=<v> from=<path-or-->`.
 
-#### 2. Detect dev mode and refuse
+#### § 3.1.2. Detect dev mode and refuse
 
 Per § 11 (back-compat — dev mode), refuse if this looks like a dev
 install. Detection:
@@ -396,7 +403,7 @@ install. Detection:
 Refuse with the message from § 11; exit `2`. Log:
 `step=dev_mode_check is_dev=<0|1> action=<continue|refuse>`.
 
-#### 3. Read install state file
+#### § 3.1.3. Read install state file
 
 Open `/var/lib/sandbox/.install-state.json` (mode `0640 sandbox:sandbox`)
 with `sudo -k cat`. Parse fields via `jq` defensively (matches the
@@ -418,7 +425,7 @@ file missing; re-install with `install.sh` or set up the file manually
 per Spec 4 § 4.5." Spec 5 does **not** auto-bootstrap the state file —
 that would mask a corrupted install.
 
-#### 4. Determine target version, fetch / read MANIFEST
+#### § 3.1.4. Determine target version, fetch / read MANIFEST
 
 If `--from <tarball>` is supplied, the target tarball is local; otherwise
 fetch from GitHub Releases (or `--source-url` mirror). The
@@ -448,32 +455,35 @@ The DB migration set the staged daemon ships embeds via refinery's
 `embed_migrations!` macro (`sandbox-core/src/store.rs:18`). To enumerate
 pending DB migrations for `--check` / `--dry-run` / the confirmation
 prompt, the staged daemon is invoked with a hidden
-`--dump-migration-set` flag immediately after extraction (§ 3.1.11), it
+`--dump-migration-set` flag immediately after extraction (§ 3.1.10), it
 prints a JSON list of `(version, name)` tuples to stdout, and the CLI
 diffs against the live DB's `refinery_schema_history` table. The
 `--dump-migration-set` flag is a Spec 5-introduced daemon affordance,
 unprivileged and read-only.
 
-#### 5. Compare versions
+#### § 3.1.5. Compare versions
 
-If `CURRENT_VERSION == TARGET_VERSION`, exit OK with "Status: up to date"
-(§ 2.2 wording). No lock acquisition, no further work. Log:
+If `CURRENT_VERSION == TARGET_VERSION`, print "Status: up to date" (§ 2.2
+wording) and exit 0. No lock acquisition, no further work. Log:
 `step=version_compare current=<v> target=<v> action=skip reason=up-to-date`.
 
-In `--check` mode, this is the only output and the flow ends here. In
-default mode, continue.
+**`--check` exit gate:** If `--check` mode *and* versions differ, do **not**
+proceed to § 3.1.6 or beyond. Instead:
 
-#### 6. Acquire lock
+1. Run § 3.1.6 (active session count — display only, no refusal).
+2. Run § 3.1.7 (stopped session compatibility classification — display only).
+3. Run § 3.1.11 (migration dry-run — to build the pending-migrations list).
+4. Print the `--check` output from § 2.2.
+5. Exit 3 (update available). Skip §§ 3.1.8–3.1.10, 3.1.12 (confirmation),
+   and all of § 3.2 (including lock acquisition at § 3.2.13).
 
-See § 6 for the full lock-file contract. Briefly: the lock file is
-`0664 sandbox:sandbox`; operators in the `sandbox` group can open it
-directly. Acquisition uses `flock -n -x` on an FD held open by the
-shell process itself (no helper subprocess). The full shell sequence
-is in § 6.2.1.
+The `--check` path never acquires the lock (§ 6.4 — consistent with
+§ 3.2.13 being the first stateful step), never contacts cosign, never
+extracts a tarball, and never prompts for confirmation. Its read-only
+character is enforced structurally here — a single early-exit gate —
+rather than relying on downstream per-step guards.
 
-Log: `step=acquire_lock pid=$$ target_version=<v> from_version=<v> was_running=<0|1> action=<acquire|adopt> status=ok`.
-
-#### 7. Active sessions check
+#### § 3.1.6. Active sessions check
 
 Query the daemon for active (non-Stopped) sessions:
 
@@ -496,7 +506,7 @@ the safe choice. `--force` is the escape hatch for "this host's daemon
 is wedged and we want to upgrade anyway." Log:
 `step=active_session_check active=<n> force=<0|1> status=<ok|refuse>`.
 
-#### 8. Stopped sessions compatibility enumeration
+#### § 3.1.7. Stopped sessions compatibility enumeration
 
 Query the daemon for stopped sessions; for each, read
 `guest_protocol_version` (Spec 2 § 3.1) and classify against the target
@@ -513,7 +523,7 @@ with the recreate-guidance error (Spec 2 § 3.5) on next `start_session`.
 
 Log: `step=stopped_sessions count=<n> compatible=<n> refreshable=<n> recreate=<n>`.
 
-#### 9. Disk space pre-flight
+#### § 3.1.8. Disk space pre-flight
 
 Same shape as install.sh § 4.4.7, but the budget is upgrade-specific:
 
@@ -527,7 +537,7 @@ Same shape as install.sh § 4.4.7, but the budget is upgrade-specific:
 Refuse with a clear free-space report if any are short. Log:
 `step=disk_check tmp_free=NMB var_free=NMB docker_free=NMB status=<ok|fail>`.
 
-#### 10. Cosign bootstrap
+#### § 3.1.9. Cosign bootstrap
 
 Identical mechanism to install.sh § 4.4.8. The pinned cosign version is
 the **same constant** install.sh uses (Spec 4 § 7.3 — `cosign v2.4.1` at
@@ -554,7 +564,7 @@ Air-gapped path (`--from` + no cosign binary downloaded) probes
 stage-cosign-locally message if absent. Log:
 `step=cosign_bootstrap version=v2.4.1 source=<download|local> status=ok`.
 
-#### 11. Sigstore verification + tarball extraction
+#### § 3.1.10. Sigstore verification + tarball extraction
 
 Identical to install.sh §§ 4.4.10–4.4.11:
 
@@ -586,7 +596,7 @@ truth for what the operator has installed today. Log:
 `step=sigstore_verify identity=<matched> status=ok`,
 `step=extract version=<v> arch=<arch> manifest_ok=true status=ok`.
 
-#### 12. Migration dry-run
+#### § 3.1.11. Migration dry-run
 
 This step is the key safety property. Before any state changes,
 materialise the post-migration content of every framework-managed
@@ -616,7 +626,7 @@ investigating the migration's input or fixing the file by hand.
 Log: `step=migration_dry_run files=<list> status=ok` or
 `step=migration_dry_run files=<list> error='<msg>' status=fail`.
 
-#### 13. Confirmation prompt (§ 2.4)
+#### § 3.1.12. Confirmation prompt (§ 2.4)
 
 The prompt summarises from-version → to-version, pending migrations,
 stopped session classification, and `was_running`. `--yes` skips.
@@ -630,7 +640,18 @@ From here on, every step inspects the current state and skips if it
 already matches the desired state. The flow can be re-run safely
 after any failure; convergence is the contract.
 
-#### 14. Stop daemon (only if `was_running`)
+#### § 3.2.13. Acquire lock
+
+The first stateful step: acquire the lock before any filesystem mutation.
+See § 6 for the full lock-file contract. Briefly: the lock file is
+`0664 sandbox:sandbox`; operators in the `sandbox` group can open it
+directly. Acquisition uses `flock -n -x` on an FD held open by the
+shell process itself (no helper subprocess). The full shell sequence
+is in § 6.2.1.
+
+Log: `step=acquire_lock pid=$$ target_version=<v> from_version=<v> was_running=<0|1> action=<acquire|adopt> status=ok`.
+
+#### § 3.2.14. Stop daemon (only if `was_running`)
 
 ```sh
 if [ "$WAS_RUNNING" -eq 1 ]; then
@@ -648,7 +669,7 @@ intent through any re-runs.
 
 Log: `step=stop_daemon was_running=<0|1> action=<stop|skip> status=ok`.
 
-#### 15. Backup sessions.db
+#### § 3.2.15. Backup sessions.db
 
 Create the backup set directory under `/var/lib/sandbox/backups/` (the
 dir was created by the daemon at first start per Spec 3 § 5.1, mode
@@ -679,7 +700,7 @@ fi
 
 Log: `step=backup_sessions_db path=<dst> sha256=<hex> action=<copy|skip>`.
 
-#### 16. Backup /etc files
+#### § 3.2.16. Backup /etc files
 
 `users.conf` is mode `0644 root:root` (Spec 4 § 4.4.19). `bridge.conf`
 is mode `0644 root:root` (`Makefile:355` / Spec 4 § 4.4.18 — matches
@@ -716,7 +737,7 @@ original mode bit-for-bit, which the rollback recipe (§ 7.2) relies on.
 
 Log: `step=backup_etc path=<dst> sha256=<hex> action=<copy|skip>`.
 
-#### 17. Backup binaries
+#### § 3.2.17. Backup binaries
 
 Each of `/usr/local/bin/sandboxd`, `/usr/local/bin/sandbox`, and
 `/usr/local/libexec/sandboxd/sandbox-route-helper` is stashed under the
@@ -750,7 +771,7 @@ done
 
 Log: `step=backup_binary src=<p> dst=<p> sha256=<hex> action=<copy|skip>`.
 
-#### 18. Update install state's `previous_version`
+#### § 3.2.18. Update install state's `previous_version`
 
 Before installing new binaries, record the old version in
 `.install-state.json` so that on a subsequent rollback the operator (or
@@ -771,7 +792,7 @@ field are tolerated.
 
 Log: `step=record_previous_version previous=<v> status=ok`.
 
-#### 19. Write backup manifest (in-progress marker)
+#### § 3.2.19. Write backup manifest (in-progress marker)
 
 Before installing binaries, write a `manifest.json` at the backup-set
 root with `completed_ok: false`. This marks the set as "in progress" —
@@ -805,23 +826,23 @@ requirement). By loading the image first, an interruption mid-flight
 leaves the system at "old binary, old image still present plus new
 image present alongside" — the old daemon still runs cleanly, and a
 re-run picks up where it left off without any half-state. The
-following steps are sequenced accordingly: docker load (step 20),
-then binary swap (step 21), then setcap, unit, migrations.
+following steps are sequenced accordingly: docker load (§ 3.2.20),
+then binary swap (§ 3.2.21), then setcap, unit, migrations.
 
 Idempotency contract under this ordering:
 
 | Re-entry point                                 | Convergence outcome                                                                                  |
 |-----------------------------------------------|-------------------------------------------------------------------------------------------------------|
-| Interrupted before step 20                    | Old binary, old image. Daemon if `was_running` is still healthy. Re-run resumes from step 20.        |
-| Interrupted after step 20, before step 21     | Old binary, **both** images present (idempotent: `docker image inspect` short-circuits on re-run).   |
-| Interrupted after step 21, before § 3.2.26   | New binary on disk, daemon stopped. Re-run resumes from the failing step; old image still present unless operator pruned, but the new image is also present (step 20 ran). The new daemon's start passes Spec 3 § 8.5's check. |
+| Interrupted before § 3.2.20                   | Old binary, old image. Daemon if `was_running` is still healthy. Re-run resumes from § 3.2.20.       |
+| Interrupted after § 3.2.20, before § 3.2.21  | Old binary, **both** images present (idempotent: `docker image inspect` short-circuits on re-run).   |
+| Interrupted after § 3.2.21, before § 3.2.26  | New binary on disk, daemon stopped. Re-run resumes from the failing step; old image still present unless operator pruned, but the new image is also present (§ 3.2.20 ran). The new daemon's start passes Spec 3 § 8.5's check. |
 | Interrupted between §§ 3.2.26 and 3.2.30      | New binary running. Lock file persists until § 3.2.30; re-run adopts and reaches the failing post-start step. |
 
 The post-load image-tag table check (`docker image inspect "$tag"`) at
-step 20's idempotency check is the convergence anchor — once a tag is
+§ 3.2.20's idempotency check is the convergence anchor — once a tag is
 present, the step short-circuits on every subsequent run.
 
-#### 20. `docker load` new gateway image
+#### § 3.2.20. `docker load` new gateway image
 
 Image load happens **before** the binary swap, per the binding ordering
 note above. Same shape as install.sh § 4.4.20:
@@ -843,7 +864,7 @@ Operators run `docker image prune` manually when they want.
 
 Log: `step=docker_load image=<tag> action=<load|skip> status=ok`.
 
-#### 21. Install new binaries
+#### § 3.2.21. Install new binaries
 
 Mirrors install.sh § 4.4.14 — sha256 compare for idempotency, atomic
 install via `install -D -m <mode> -o root -g root`:
@@ -870,7 +891,7 @@ touches the inode). The setcap step (§ 3.2.22) restores them.
 
 Log: `step=install_binary path=<dst> sha256=<hex> action=<install|skip> status=ok`.
 
-#### 22. Setcap on route-helper
+#### § 3.2.22. Setcap on route-helper
 
 Identical to install.sh § 4.4.15:
 
@@ -889,7 +910,7 @@ fi
 
 Log: `step=setcap caps=<v> action=<set|skip> status=ok`.
 
-#### 23. Install systemd unit (idempotent)
+#### § 3.2.23. Install systemd unit (idempotent)
 
 The new release's `systemd/sandboxd.service` may differ from the
 installed one (Spec 3 § 4.1 fixes the unit shape; future releases may
@@ -913,7 +934,7 @@ walks through the invariant. The check looks at the unit file only; the
 
 Log: `step=install_unit path=<p> sha256=<hex> action=<install|skip> status=ok`.
 
-#### 24. Apply config migrations (per file, atomically)
+#### § 3.2.24. Apply config migrations (per file, atomically)
 
 The framework runs its apply loop (§ 4.3) for each managed file. For
 each pending migration, in numeric order:
@@ -973,7 +994,7 @@ hop, and on a subsequent run the framework continues from there.
 
 Log: `step=migrate_<file> migration=V<NNN> path=<p> action=<apply|skip>`.
 
-#### 25. Prune older backup sets
+#### § 3.2.25. Prune older backup sets
 
 Only **successful** (`completed_ok: true`) backup sets are pruned. The
 current in-progress set (this run's manifest still says `false`) is
@@ -1014,7 +1035,7 @@ run's binaries or images.
 
 Log: `step=prune_backups kept=2 pruned=<n>`.
 
-#### 26. Start daemon (only if `was_running`)
+#### § 3.2.26. Start daemon (only if `was_running`)
 
 ```sh
 if [ "$WAS_RUNNING" -eq 1 ]; then
@@ -1037,7 +1058,7 @@ loop-prevention property.
 
 Log: `step=start_daemon was_running=<0|1> action=<start|skip> status=<ok|fail>`.
 
-#### 27. Verify post-start
+#### § 3.2.27. Verify post-start
 
 Wait for the daemon's socket to accept connections (Spec 3 §§ 4.1 / 5.1
 say systemd creates `/run/sandbox/` and the daemon binds the socket
@@ -1057,7 +1078,7 @@ daemon_ver=$(curl -fsSL --unix-socket "$sock" http://localhost/version | jq -r '
 
 Log: `step=verify_version daemon=<v> target=<v> status=<ok|fail>`.
 
-#### 28. Run `sandbox doctor`
+#### § 3.2.28. Run `sandbox doctor`
 
 Final sanity check. Spec 3 § 6 designs doctor; on a healthy post-upgrade
 host, every check passes:
@@ -1071,7 +1092,7 @@ update is incomplete. The operator sees the failed-checks list and the
 pointer to the backup set; the rollback recipe in § 7.2 is the
 recovery path. Log: `step=doctor result=<pass|fail>`.
 
-#### 29. Update install state + finalize backup manifest
+#### § 3.2.29. Update install state + finalize backup manifest
 
 Atomic update of the install state file — record the new
 `installed_version`, `installed_at` (now), `updated_by_operator` (from
@@ -1106,7 +1127,7 @@ sudo -k -u sandbox install -m 0644 "$manifest_tmp" "$backup_set/manifest.json"
 Log: `step=finalize_state installed_version=<v> previous_version=<v> status=ok`,
 `step=finalize_backup_manifest path=<p> status=ok`.
 
-#### 30. Release the lock
+#### § 3.2.30. Release the lock
 
 ```sh
 sudo -k rm -f /var/lib/sandbox/.update.lock
@@ -1122,7 +1143,7 @@ The upgrade explicitly does **not** touch:
 
 | Path / artefact                                                     | Why preserved |
 |---------------------------------------------------------------------|---------------|
-| `/etc/systemd/system/sandboxd.service.d/`                           | Spec 3 § 4.3 promise: operator drop-ins survive base-unit replacement. § 3.2.22 above touches only `sandboxd.service`, never the sibling `.service.d/`. |
+| `/etc/systemd/system/sandboxd.service.d/`                           | Spec 3 § 4.3 promise: operator drop-ins survive base-unit replacement. § 3.2.23 above touches only `sandboxd.service`, never the sibling `.service.d/`. |
 | `/var/lib/sandbox/sessions.db` (after the backup-then-upgrade)      | Backed up before the swap; refinery applies forward-only DB migrations on next daemon start (no CLI-side touch). |
 | Per-session directories under `/var/lib/sandbox/sessions/<id>/`     | Session state is owned by the daemon; the upgrade never reaches into per-session storage. |
 | `/var/lib/sandbox/route-helper-audit.log`                           | Appendable forensic log; the upgrade does not rotate or truncate it. The route-helper's audit-write policy (Spec 1's revision: deny-path write failure escalates with `DENY_EXIT`; allow-path write failure continues) is unaffected by the upgrade — Spec 5 inherits the policy as-is and the upgrade flow does not touch the audit log's file mode, owner, or content. |
@@ -1143,26 +1164,25 @@ The flow is idempotent, so transient failures are recovered by re-running
 | Failure                                                | Where it surfaces | Recovery                                                                                                  |
 |--------------------------------------------------------|--------------------|-----------------------------------------------------------------------------------------------------------|
 | Network failure during tarball fetch                   | § 3.1.4            | Re-run. No state mutated yet.                                                                              |
-| Sigstore verification failure                          | § 3.1.11           | Refuse; suggest checking system clock, cosign binary version, network. No state mutated.                  |
-| MANIFEST sha256 mismatch                               | § 3.1.11           | Refuse with the mismatched file name. Likely a corrupted download — re-fetch.                              |
-| Migration dry-run failure                              | § 3.1.12           | Refuse with a clear error pointing at the failing migration's `to_version`. No state mutated; safe to abort. |
-| Active sessions exist (no `--force`)                   | § 3.1.7            | Operator stops sessions or passes `--force` and re-runs.                                                   |
-| Disk space short                                       | § 3.1.9            | Operator frees space; re-runs.                                                                              |
+| Sigstore verification failure                          | § 3.1.10           | Refuse; suggest checking system clock, cosign binary version, network. No state mutated.                  |
+| MANIFEST sha256 mismatch                               | § 3.1.10           | Refuse with the mismatched file name. Likely a corrupted download — re-fetch.                              |
+| Migration dry-run failure                              | § 3.1.11           | Refuse with a clear error pointing at the failing migration's `to_version`. No state mutated; safe to abort. |
+| Active sessions exist (no `--force`)                   | § 3.1.6            | Operator stops sessions or passes `--force` and re-runs.                                                   |
+| Disk space short                                       | § 3.1.8            | Operator frees space; re-runs.                                                                              |
 | Lock held by live PID                                  | § 6.2              | Refuse with PID; operator investigates (probably another update in progress).                              |
 | Lock held by dead PID                                  | § 6.2              | Adopt the lock; log adoption; continue with the sticky `was_running` preserved.                            |
-| Migration apply failure (mid-§ 3.2.23)                 | § 3.2.23           | File at version of last successful migration; daemon refuses to start (§ 4.7); operator re-runs `sandbox update` or rolls back per § 7.2. |
+| Migration apply failure (mid-§ 3.2.24)                 | § 3.2.24           | File at version of last successful migration; daemon refuses to start (§ 4.7); operator re-runs `sandbox update` or rolls back per § 7.2. |
 | Daemon fails to start after upgrade                    | § 3.2.26           | `sandbox doctor` reports it (Spec 3 § 6.2); `journalctl -u sandboxd` shows the daemon-side error. Rollback recipe in § 7.2 is available. |
-| `sandbox doctor` reports failures post-upgrade         | § 3.2.28           | Backup set's `manifest.json` still has `completed_ok: false`; operator can roll back via § 7.2 or investigate the doctor's failure list. The lock file is **not** released until § 3.2.30 — re-running update without rollback will see a non-converging idempotent loop until either rollback or whatever doctor flagged is fixed. |
+| `sandbox doctor` reports failures post-upgrade         | § 3.2.28           | Backup set's `manifest.json` has `completed_ok: false`. The kernel flock is released when the process exits (FD closed); only the JSON payload file remains on disk. Re-running adopts the payload's `was_running` and re-attempts § 3.2.28 (and any subsequent step that was skipped). Operators either fix the underlying issue and re-run, or invoke the rollback recipe (§ 7.2) — step 8 of which removes the stale lock file. |
 | Refinery DB migration failure on next daemon start     | Daemon `tracing` → journald | Daemon refuses to start. `sandbox doctor` C1 reports it. Operator inspects journald; if the DB is corrupt the rollback recipe (§ 7.2) restores `sessions.db.bak` and the prior daemon binary together. |
 | Operator's CLI binary swapped mid-flight (§ 10.3)      | inside `sandbox update` itself | Linux file semantics: an executable mapped into a running process keeps its inode references until exit. The running `sandbox update` continues to its end with the **old** CLI binary's code; the new binary on disk is unaffected. |
 
-The lock file is released **only** after § 3.2.29 (install state + manifest
-update) completes. A failure between binary install (§ 3.2.20) and lock
-release leaves the lock present, so a re-run sees the lock, inspects the
-PID, finds it dead (the failed update process has exited), and adopts.
-The sticky `was_running` flag carries through. The idempotent inspections
-in §§ 3.2.15–28 skip already-completed work; the re-run reaches the
-failing step and re-attempts it.
+The kernel flock is released when the process exits (FD closed). The JSON
+payload file remains on disk after any non-§ 3.2.30 exit, so re-runs see
+the stale payload, find the dead PID, and adopt with the sticky
+`was_running`. A failure between binary install (§ 3.2.21) and lock release
+leaves the payload present; the idempotent inspections in §§ 3.2.15–29
+skip already-completed work and the re-run reaches the failing step.
 
 ## 4 · Config migration framework
 
@@ -1307,12 +1327,20 @@ pub fn registry() -> &'static [&'static dyn ConfigMigration] {
     ]
 }
 
+/// Return the full ordered list of pending migrations for `file` from
+/// `current` (exclusive) to `target` (inclusive). Used for display
+/// purposes — the `--check` pending-migrations summary and the
+/// confirmation prompt. The `apply_pending` loop in § 4.3 does NOT
+/// call this; it uses `find()` on the registry directly for sequential
+/// one-step-at-a-time application. Both are consistent with the
+/// "exactly one version per migration" contract: the list returned here
+/// is contiguous (V(current+1), V(current+2), … V(target)) because each
+/// entry advances from N to N+1.
 pub fn pending(file: TargetFile, current: u32, target: u32) -> Vec<&'static dyn ConfigMigration> {
     registry()
         .iter()
         .copied()
         .filter(|m| m.target_file() == file && m.from_version() >= current && m.to_version() <= target)
-        .filter(|m| m.from_version() == current /* will be widened in the apply loop */)
         .collect()
 }
 
@@ -1463,7 +1491,7 @@ Atomic write requires:
 
 The framework's `atomic_write` (Rust side) uses `tempfile::NamedTempFile::new_in(parent)`
 + `persist(path)` for the in-process path (the `--apply-config-migration`
-CLI subcommand's output). The outer shell loop (§ 3.2.23) then does the
+CLI subcommand's output). The outer shell loop (§ 3.2.24) then does the
 sudo-`mv` because the rename target lives under `/etc/`, owned by root.
 
 For `users.conf` specifically (Spec 4 § 4.4.19 sets it `0644 root:root`):
@@ -1838,15 +1866,16 @@ targets a directory that requires root to write in).
 ```sh
 lockfile=/var/lib/sandbox/.update.lock
 
-# Step 1: Attempt to open the file with group-write permission (0664).
-#         O_CREAT | O_RDWR: fine, the directory's group permission
-#         plus the file's 0664 mode allows the operator in sandbox group.
-#         If the file doesn't exist yet, it must be created under sudo
-#         first (the directory is 0750 sandbox:sandbox; only root or the
-#         sandbox user can create new files in it).
+# Step 1: Ensure the lock file exists at mode 0664 before the exec+flock.
+#         `install -m 0664` creates the file atomically at the target mode
+#         in a single syscall, avoiding the EACCES window that a two-step
+#         `touch`+`chmod` would create (between the `touch` at mode 0600
+#         and the subsequent `chmod 0664`, a racing operator's
+#         `exec {fd}<>` would fail with EACCES). If the file already
+#         exists, `install` overwrites it — this is safe here because the
+#         old payload is read *after* we hold the flock (step 3 below).
 if [ ! -f "$lockfile" ]; then
-    sudo -k -u sandbox touch "$lockfile"
-    sudo -k -u sandbox chmod 0664 "$lockfile"
+    sudo -k -u sandbox install -m 0664 /dev/null "$lockfile"
 fi
 
 # Step 2: Try non-blocking exclusive flock. The flock FD stays open
@@ -2323,7 +2352,7 @@ version, then exercises an update flow.
 | `test_update_with_recreate_session_classification`                   | Install v1.0.0; create one session (stamps `guest_protocol_version=1`); bump the test daemon to a hypothetical v1.1.0 that ships `DAEMON_GUEST_PROTO_VERSION=2` with `can_refresh_in_place(1) == false`; update; assert `--check` output lists the session as `recreate`; assert post-update, the session's `start_session` returns 409 with the recreate message (Spec 2 § 3.5). |
 | `test_update_rejects_dev_install`                                    | On a dev-mode VM (no systemd unit installed, `~/.local/share/sandboxd/` populated), run `sandbox update`; verify refusal with the dev-mode message (§ 11). |
 | `test_update_backup_retention_prunes_oldest`                         | Install v1.0.0; update v1.0.0 → v1.1.0; update v1.1.0 → v1.2.0; update v1.2.0 → v1.3.0; verify exactly 2 successful backup sets remain (v1.1.0→v1.2.0 and v1.2.0→v1.3.0); the v1.0.0→v1.1.0 set is pruned. |
-| `test_update_partial_failure_backup_set_preserved`                   | Install v1.0.0; inject a failure at § 3.2.23 (migration apply); verify the backup set's `manifest.json` has `completed_ok: false` and is **not** pruned on a subsequent successful update. |
+| `test_update_partial_failure_backup_set_preserved`                   | Install v1.0.0; inject a failure at § 3.2.24 (migration apply); verify the backup set's `manifest.json` has `completed_ok: false` and is **not** pruned on a subsequent successful update. |
 
 ### 9.2 · Unit tests (hermetic)
 
@@ -2716,6 +2745,6 @@ are introduced.
 | `sandboxd/sandbox-core/migrations/V00*.sql`                                  | Refinery DB migrations are forward-only; Spec 5 does not author DB migrations, only triggers them via daemon restart. |
 | `scripts/install.sh` / `scripts/uninstall.sh`                                | Spec 4 owns these. Spec 5's update flow appends to the same `/var/log/sandbox-install.log` but does not modify the install/uninstall scripts. |
 | `.github/workflows/release.yml`                                              | Spec 4 owns the release pipeline. Spec 5's tarball-consumption logic reuses the artefacts as-is. |
-| `/etc/systemd/system/sandboxd.service`                                       | Replaced via the upgrade flow per § 3.2.22 but the *content* is owned by Spec 3 § 4.1. Spec 5 inherits the shape. |
+| `/etc/systemd/system/sandboxd.service`                                       | Replaced via the upgrade flow per § 3.2.23 but the *content* is owned by Spec 3 § 4.1. Spec 5 inherits the shape. |
 | `sandboxd/sandbox-core/src/guest.rs`                                         | Spec 2 owns `GuestRequest::Version` and the compatibility predicates. Spec 5 only **consumes** them at § 3.1.8. |
 | `sandboxd/contrib/systemd/sandboxd.service`                                  | Workspace's canonical unit copy (Spec 3 § 15.5). Spec 5 reads it via the tarball. |
