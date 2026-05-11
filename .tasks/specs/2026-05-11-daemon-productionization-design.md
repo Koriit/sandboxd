@@ -323,11 +323,15 @@ LimitNOFILE=65536
 
 Make explicit:
 
-- **No daemon config file** (e.g. `/etc/sandboxd/daemon.conf`) in v1. All
-  configuration is flags on `ExecStart`, customizable via drop-ins. The
-  project's "config files are JSON" convention (CLAUDE.md) applies to
-  config *files* the daemon reads — `users.conf`, presets — not to the
-  daemon's own startup flags.
+- **No daemon *runtime-tuning* config file** (e.g. `/etc/sandboxd/daemon.conf`)
+  in v1. Daemon flags — socket path, base dir, log file, rebuild cadence —
+  live in `ExecStart` and operator drop-ins. `/etc/sandboxd/users.conf` is
+  a distinct *authorization* config (which operators can connect and which
+  CIDR pools they own); it is managed by Spec 1's V001 migration framework
+  and is not a daemon-tuning knob. The project's "config files are JSON"
+  convention (CLAUDE.md) applies to both, but they have different ownership
+  and lifecycle: `users.conf` is operator-edited and schema-versioned;
+  the tuning knobs are flags only.
 - **No `Wants=lima.service`.** Lima has no system service; `limactl` is
   invoked per-VM by the daemon. Adding `Wants=` to a nonexistent unit
   would fail at parse time.
@@ -538,7 +542,7 @@ appended to the failure line so the operator can copy-paste a fix.
 | C9 | route-helper has caps | `getcap /usr/local/libexec/sandboxd/sandbox-route-helper` reports `cap_net_admin,cap_sys_admin=eip`. Path resolved via `resolve_route_helper_path` (`sandboxd/sandboxd/src/main.rs:405`). | `sandbox update` re-runs setcap (Spec 5); or `make install-route-helper-prod-cap` in dev |
 | C10 | state dir mode | `stat /var/lib/sandbox/` (mode `0750`, owner `sandbox:sandbox`); plus `sessions/`, `events/`, `backups/` at `0700`; `sessions.db` at `0600` | `sudo chmod 0750 /var/lib/sandbox; sudo chown sandbox:sandbox /var/lib/sandbox` (the daemon corrects subdirs at next start; see § 5.4) |
 | C11 | users.conf reachable + parses + daemon's uid is in a pool | Daemon-side; the daemon's own startup already enforces this (`sandboxd/sandboxd/src/main.rs:6156-6177`), but the doctor surfaces it on a clean response surface rather than `journalctl` | If the daemon is running, this can't be failing; if it's not, the failure rolls up into C1 |
-| C12 | running sessions guest-version drift (verbose only) | For each running session owned by the caller, the daemon issues `GuestRequest::Version` (Spec 2 § 3.10) and compares to `sessions.guest_protocol_version`. Skipped in default mode to keep doctor cheap. | `recreate the session: sandbox session rm <id> && sandbox session create ...` |
+| C12 | running sessions guest-version drift (verbose only) | For each running session owned by the caller, the daemon issues `GuestRequest::Version` (Spec 2 § 3.10) and compares to `sessions.guest_protocol_version`. Skipped in default mode to keep doctor cheap. **O(N) cost:** C12 issues one `GuestRequest::Version` per running session; wall-clock time in `--verbose` mode scales linearly with the caller's session count. The `--verbose` gate is the primary mitigation; no per-query timeout is specified in v1 (implementer's judgment). | `recreate the session: sandbox session rm <id> && sandbox session create ...` |
 | C13 | orphan substrate resources (**warning — informational only**) | Enumerate Lima VMs matching `sandbox-*` via `limactl list --output json`; enumerate Docker containers matching `sandbox-*` via `docker ps -a --filter name=sandbox-`; enumerate per-session dirs under `{base_dir}/sessions/`. Cross-reference each substrate-side resource against the daemon's session list (`GET /sessions` scoped to the calling operator). Any `sandbox-<id>` resource whose `<id>` is not in the operator's session list is an orphan. Shown in `--verbose` always; in default mode only if orphans are detected. **Does not contribute to exit code 1.** C13 fires predictably the first time `sandbox doctor` runs after a V006 migration on a dev install that had prior sessions — this is expected behavior and is referenced by Spec 2 § 2.1's orphan-log note. | `"Orphaned substrate resources detected: <list>. These may be leftovers from a schema migration (V006). Remove with: limactl delete <name> / docker rm <name> / rm -rf {base_dir}/sessions/<id>/"` |
 
 Execution flow:

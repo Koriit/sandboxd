@@ -989,8 +989,18 @@ if [ -z "$operator" ] || [ "$operator" = "root" ]; then
     log_warn "step=operator_add operator=none action=skip"
     OPERATORS_ADDED=
 else
+    # Sanity-check that $SUDO_USER resolves to a real account before acting.
+    # $SUDO_USER is set by sudo and is normally trustworthy, but a hostile
+    # pre-export in an automated pipeline (e.g. SUDO_USER=root) would
+    # otherwise cause `usermod -aG sandbox root`.
+    if ! getent passwd "$operator" >/dev/null 2>&1; then
+        emit "$YELLOW!$RESET SUDO_USER='$operator' does not exist in /etc/passwd."
+        emit "  Skipping operator-group-add. Add manually after install:"
+        emit "      sudo usermod -aG sandbox <operator-username>"
+        log_warn "step=operator_add operator=$operator action=skip reason=unresolvable"
+        OPERATORS_ADDED=
     # Check membership before adding to keep the log honest.
-    if id -nG "$operator" 2>/dev/null | tr ' ' '\n' | grep -qx sandbox; then
+    elif id -nG "$operator" 2>/dev/null | tr ' ' '\n' | grep -qx sandbox; then
         log_ok "step=operator_add operator=$operator action=skip reason=already-member"
         OPERATORS_ADDED=""
     else
@@ -1002,7 +1012,10 @@ fi
 ```
 
 The script trusts `$SUDO_USER` (set by sudo to the invoking user's name) as
-the operator identity. If install.sh was run as root directly (no sudo, no
+the operator identity. The `getent passwd` check before `usermod` guards
+against hostile pre-exports of `$SUDO_USER` in automated pipelines; in
+standard operator usage (the human runs `sudo bash install.sh`) the check
+always passes. If install.sh was run as root directly (no sudo, no
 `$SUDO_USER`), the script skips this step with a clear instruction — the
 operator must add themselves manually because we don't have an identity to
 add. `OPERATORS_ADDED` enters the install-state record.

@@ -394,6 +394,9 @@ Notes:
   `0` and applies V001.
 - `deny_unknown_fields` stays. Typos on unrelated fields keep being rejected (today's
   `typo_on_allow_users_field_rejected` test, `users_conf.rs:773-789`, still passes).
+  The error message from `serde_json` when `deny_unknown_fields` rejects an unknown
+  key includes the key name — operators see the exact typo in the error output (e.g.
+  `"unknown field \`_shema_version\`"`).
 
 ### 4.3 · Preserving operator-customized content
 
@@ -695,6 +698,25 @@ attached to the handlers (not threaded only to the Container branches) avoids a 
 regression when a contributor adds a third backend or moves a `runtime.start()` site
 across branches.
 
+The `RuntimeStartArgs.for_user` field carries a doc-comment requirement to explain
+this to future readers:
+
+```rust
+/// Operator identity to pass to `sandbox-route-helper` via `--for-user`.
+///
+/// `Some(<operator_name>)` for all backends when the daemon has resolved
+/// the connecting client's identity via `SO_PEERCRED`. The value is
+/// **only consumed** by `ContainerRuntime::start` today — `LimaRuntime::start`
+/// does not invoke the route-helper and ignores this field. It is threaded
+/// through `RuntimeStartArgs` on Lima call sites (L1, L2) for
+/// forward-compatibility: if Lima networking ever routes through
+/// `sandbox-route-helper` in a future spec, the caller identity is already
+/// present without an API break. `None` means no operator identity is
+/// available (test paths that omit the extractor); the container runtime
+/// errors if `None` when a helper path is configured.
+pub for_user: Option<String>,
+```
+
 `restore_session_networking_lite` (`sandboxd/sandboxd/src/main.rs:4961-5068`) and
 `reconcile_networking` (`5497`+) do *not* call `runtime.start()` — they restore the
 gateway container only. They are not helper-invocation sites and need no changes.
@@ -853,6 +875,7 @@ Spec 5's job; this spec contributes the pure transform plus its tests.
 | `schema_version_absent_yields_none` | Today's `users.conf` (no field) parses cleanly with `schema_version = None`. |
 | `schema_version_present_populates_option` | `{"_schema_version": 1, ...}` parses with `Some(1)`. |
 | `schema_version_typo_rejected` | `"_schemaversion"` trips `deny_unknown_fields`. |
+| `users_conf_schema_version_typo_rejected_with_clear_error` | Parse a JSON blob containing `"_shema_version": 1` (one-character swap, the most common operator typo). Assert the parser returns `Err`. Assert the error string contains the literal text `_shema_version` so the operator sees exactly what they mistyped. This pins the serde error message contract: `deny_unknown_fields` names the rejected key verbatim. |
 
 ### 8.4 · Integration tests — helper binary
 

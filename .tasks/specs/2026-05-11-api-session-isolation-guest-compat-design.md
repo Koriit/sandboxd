@@ -505,7 +505,7 @@ on start_session(caller_username, session_id):
         // Normal start path — what `start_session` does today.
         proceed to existing main.rs:2680+
 
-    elif can_refresh_in_place(session):
+    elif can_refresh_in_place(session.guest_protocol_version):
         // Refresh the guest binary in place, then resume normal start.
         match runtime.refresh_guest_binary(&handle).await:
             Ok(()) ->
@@ -524,10 +524,15 @@ on start_session(caller_username, session_id):
         return 409 Conflict with the structured error from § 3.5.
 ```
 
-`can_refresh_in_place(session)` is the seam — its v1 body is described in
-§ 3.7. The two distinct refusal paths matter: refresh-failed is a transient
-infrastructure problem (try again), refresh-not-viable is a permanent
-mismatch (the operator must recreate).
+`can_refresh_in_place(session.guest_protocol_version)` is the seam — its v1
+body is described in § 3.7. The v1 signature takes `session_proto: u32`,
+extracting the field at the call site. If per-backend divergence later
+requires it, the signature widens to `(&Session)` — the call site in the
+pseudo-code above already holds the full `session` struct, so that widening
+is a one-line change at the call site and a signature update in § 3.7; no
+other plumbing changes. The two distinct refusal paths matter: refresh-failed
+is a transient infrastructure problem (try again), refresh-not-viable is a
+permanent mismatch (the operator must recreate).
 
 ### 3.5 · Refusal error shape
 
@@ -581,7 +586,7 @@ for integration tests (see § 7.5).
 The daemon already embeds the lite-mode Dockerfile via `include_str!`
 (`sandbox-core/src/backend/container.rs:144`) and **separately** locates the
 `sandbox-guest` binary at runtime via the `guest_agent_path` resolver
-(`sandbox-core/src/lima.rs:1926-1955`), which falls back to the directory
+(`sandbox-core/src/lima.rs:1939`), which falls back to the directory
 next to the running `sandboxd` executable. Both backends use the same
 resolver today (the container build copies the binary into a staging
 tempdir at `container.rs:1276-1283`, the Lima `install_guest_agent` path
