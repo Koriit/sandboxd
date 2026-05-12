@@ -209,6 +209,8 @@ sandbox prints stdout, exits with code 0
 | GET | `/sessions/{id}/events` | `get_events` | Replay or stream the session's event stream (traffic + lifecycle) |
 | GET | `/sessions/{id}/health` | `session_health` | Per-session health |
 | GET | `/health` | `health_check` | Global health |
+| GET | `/version` | `version_handler` | Daemon version as JSON `{"version": "X.Y.Z"}`; used by the CLI for the version-equality handshake |
+| GET | `/diagnostics` | `diagnostics_handler` | System-wide and per-operator diagnostic fields, scoped via peer-cred-resolved operator identity |
 | GET | `/backends` | `list_backends` | Capability matrix for the available session backends (Lima, container) |
 | POST | `/rebuild-image` | `rebuild_image` | Rebuild the pre-baked base VM image |
 | GET | `/base-image-status` | `base_image_status` | Check base image build status |

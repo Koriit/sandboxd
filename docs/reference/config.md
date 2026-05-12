@@ -81,8 +81,8 @@ The daemon passes a small set of environment variables to the QEMU wrapper scrip
 | `SANDBOX_QEMU_CPUS` | CPU quota for the cgroup wrapping QEMU. |
 | `SANDBOX_DOCKER_BRIDGE` | Docker bridge name to attach the VM's data NIC to. |
 | `SANDBOX_VM_MAC` | Deterministic MAC address for the VM's data NIC (derived from the session ID). |
-| `SANDBOX_BRIDGE_HELPER` | Override for the `qemu-bridge-helper` path. Defaults to `/usr/lib/qemu/qemu-bridge-helper`. |
-| `SANDBOX_RLKIT_PID` / `SANDBOX_REAL_BRIDGE_HELPER` | Used when the QEMU process runs under rootlesskit to jump back to the host network namespace for bridge-helper execution. |
+
+`SANDBOX_BRIDGE_HELPER` and `SANDBOX_RLKIT_PID` were removed; the QEMU wrapper no longer uses a helper-path indirection.
 
 ## Path resolution
 
