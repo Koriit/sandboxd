@@ -110,6 +110,21 @@ async fn spawn_dual_backend_daemon() -> (TempDir, String, SessionsCounter) {
                 },
             ),
         )
+        // The CLI's `send_request_with_timeout` issues `GET /version`
+        // on every connection (strict CLI ↔ daemon version-equality
+        // rule). Reporting our own CARGO_PKG_VERSION keeps the
+        // handshake passing so the `--no-cache` rejection path is
+        // exercised at the preflight stage — which is the contract
+        // these tests are pinning, not the version gate.
+        .route(
+            "/version",
+            get(|| async {
+                (
+                    StatusCode::OK,
+                    Json(json!({ "version": env!("CARGO_PKG_VERSION") })),
+                )
+            }),
+        )
         .with_state(counter_clone);
 
     let listener = UnixListener::bind(&sock_path).expect("bind unix socket");

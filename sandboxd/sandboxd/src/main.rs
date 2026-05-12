@@ -49,7 +49,7 @@ use tracing::{debug, error, info, warn};
 
 /// The sandbox daemon -- manages sandbox sessions via a Unix socket HTTP API.
 #[derive(Parser, Debug)]
-#[command(name = "sandboxd", about = "Sandbox daemon")]
+#[command(name = "sandboxd", about = "Sandbox daemon", version)]
 struct Args {
     /// Path to the Unix socket to listen on.
     #[arg(long, default_value_t = default_socket_path())]
@@ -1135,6 +1135,7 @@ fn app(state: Arc<AppState>) -> Router {
         .route("/rebuild-image", post(rebuild_image))
         .route("/base-image-status", get(base_image_status))
         .route("/health", get(health_check))
+        .route("/version", get(version_handler))
         .with_state(state)
         .merge(events_router)
         .merge(policy_router)
@@ -5918,6 +5919,25 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     (StatusCode::OK, Json(response)).into_response()
 }
 
+/// Version endpoint: `GET /version`
+///
+/// Returns the daemon's compile-time `CARGO_PKG_VERSION` as a single-
+/// field JSON object. The CLI hits this immediately after connecting
+/// over the unix socket and refuses to proceed unless its own
+/// `CARGO_PKG_VERSION` matches byte-for-byte (the strict-equality
+/// rule). The endpoint is unauthenticated and exposes no session or
+/// operator data — the socket is already group-restricted at
+/// `0660 sandbox:sandbox`, so anyone who can connect is an operator.
+async fn version_handler() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+        })),
+    )
+        .into_response()
+}
+
 // ---------------------------------------------------------------------------
 // Startup reconciliation
 // ---------------------------------------------------------------------------
@@ -8875,6 +8895,97 @@ mod tests {
         assert_ne!(
             daemon_runtime_tag, "sandboxd-lite:latest",
             "production daemon must not reference the :latest fixture tag"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // `/version` endpoint (spec § 7.2, § 11.2).
+    //
+    // The handler is parameter-less and returns the daemon's compile-time
+    // `CARGO_PKG_VERSION` wrapped in a single-field JSON object. Two pins:
+    //   - body matches `{"version": "<env!(CARGO_PKG_VERSION)>"}`
+    //   - `200 OK` + `Content-Type: application/json`
+    //
+    // We exercise the handler directly through its `IntoResponse` surface
+    // rather than going through `app(...)`: the route declaration is
+    // checked indirectly by the `integration_version_endpoint_real_socket`
+    // integration test, which hits the real router over a unix socket.
+    // -----------------------------------------------------------------------
+
+    /// Collect an `axum::body::Body` into a `Vec<u8>`. The test uses
+    /// `axum::body::to_bytes` with a generous cap (~64 KB) — the version
+    /// response is ~30 bytes, so the cap is loose but explicit.
+    async fn collect_body_to_vec(body: axum::body::Body) -> Vec<u8> {
+        axum::body::to_bytes(body, 64 * 1024)
+            .await
+            .expect("collect /version body")
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn version_endpoint_returns_cargo_pkg_version() {
+        let response = version_handler().await.into_response();
+        let bytes = collect_body_to_vec(response.into_body()).await;
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("response body must be valid JSON");
+        // The body must be a single-field object: `version` is the only
+        // key the daemon emits, and the value is the daemon's
+        // compile-time `CARGO_PKG_VERSION`. Operators rely on this
+        // shape — adding extra fields is a wire-shape break.
+        assert_eq!(
+            parsed,
+            serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }),
+            "spec § 7.2 pins the body shape to exactly \
+             `{{\"version\": \"<CARGO_PKG_VERSION>\"}}`"
+        );
+    }
+
+    #[tokio::test]
+    async fn version_endpoint_returns_200_with_application_json() {
+        let response = version_handler().await.into_response();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "spec § 7.2: handler returns 200 OK on every invocation; \
+             there is no error path"
+        );
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .expect("axum `Json` extractor must set Content-Type")
+            .to_str()
+            .expect("Content-Type is ASCII")
+            .to_string();
+        assert!(
+            content_type.starts_with("application/json"),
+            "axum `Json` sets `application/json` (may include `; charset=...`); got {content_type:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // `sandboxd --version` output format pin (spec § 7.6).
+    //
+    // Spec 4 § 4.4.5's half-installed-state detection parses the output
+    // with `awk '{print $2}'`, which depends on the format being exactly
+    // two space-separated tokens (`sandboxd <semver>`) followed by a
+    // single newline. A regression that adds a trailing token (build
+    // SHA, commit hash, ...) would silently break that parse.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sandboxd_version_flag_produces_pinned_two_token_line() {
+        // clap renders `--version` from `#[command(name, version)]`;
+        // we drive the same builder here so the test fails the moment
+        // a future change drops the `version` attribute or appends an
+        // extra token.
+        use clap::CommandFactory;
+        let rendered = Args::command().render_version();
+        assert_eq!(
+            rendered,
+            format!("sandboxd {}\n", env!("CARGO_PKG_VERSION")),
+            "spec § 7.6 pins `sandboxd --version` to exactly \
+             `sandboxd <semver>\\n`; any extra token silently breaks \
+             Spec 4 § 4.4.5's `awk '{{print $2}}'` parse"
         );
     }
 }

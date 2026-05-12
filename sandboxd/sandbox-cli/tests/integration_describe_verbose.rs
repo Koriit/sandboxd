@@ -77,6 +77,20 @@ async fn spawn_describe_daemon(session_id: &str, backend: &str) -> (TempDir, Str
                     async move { (StatusCode::OK, Json(dto)) }
                 }
             }),
+        )
+        // The CLI's `send_request_with_timeout` issues `GET /version`
+        // on every connection (strict CLI ↔ daemon version-equality
+        // rule). Reporting our own CARGO_PKG_VERSION keeps the
+        // handshake passing so the describe-verbose rendering reaches
+        // both the per-session lookup and the capability matrix.
+        .route(
+            "/version",
+            get(|| async {
+                (
+                    StatusCode::OK,
+                    Json(json!({ "version": env!("CARGO_PKG_VERSION") })),
+                )
+            }),
         );
 
     let listener = UnixListener::bind(&sock_path).expect("bind unix socket");

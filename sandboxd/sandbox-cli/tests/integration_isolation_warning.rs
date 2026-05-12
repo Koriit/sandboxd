@@ -78,6 +78,20 @@ async fn spawn_dual_backend_daemon() -> (TempDir, String) {
             post(
                 |_body: String| async move { (StatusCode::CREATED, Json(fake_session_dto_json())) },
             ),
+        )
+        // The CLI's `send_request_with_timeout` fires `GET /version`
+        // on every connection (strict CLI ↔ daemon version-equality
+        // rule). Reporting our own CARGO_PKG_VERSION keeps the
+        // handshake passing so the isolation-warning rendering path
+        // is exercised — the contract these tests pin.
+        .route(
+            "/version",
+            get(|| async {
+                (
+                    StatusCode::OK,
+                    Json(json!({ "version": env!("CARGO_PKG_VERSION") })),
+                )
+            }),
         );
 
     let listener = UnixListener::bind(&sock_path).expect("bind unix socket");

@@ -42,15 +42,30 @@ async fn spawn_fake_daemon(backend: &str) -> (TempDir, String) {
     let sock_str = sock_path.to_string_lossy().into_owned();
     let backend_owned = backend.to_string();
 
-    let app = Router::new().route(
-        "/sessions/{id}",
-        get({
-            move |_path: axum::extract::Path<String>| {
-                let dto = session_dto_json(TEST_SESSION_ID, &backend_owned);
-                async move { (StatusCode::OK, Json(dto)) }
-            }
-        }),
-    );
+    let app = Router::new()
+        .route(
+            "/sessions/{id}",
+            get({
+                move |_path: axum::extract::Path<String>| {
+                    let dto = session_dto_json(TEST_SESSION_ID, &backend_owned);
+                    async move { (StatusCode::OK, Json(dto)) }
+                }
+            }),
+        )
+        // The CLI's strict CLI ↔ daemon version-equality handshake
+        // fires on every `send_request_with_timeout` connection.
+        // Reporting our own CARGO_PKG_VERSION makes the handshake
+        // pass so the sync-dispatch flow reaches the session-lookup
+        // handler above.
+        .route(
+            "/version",
+            get(|| async {
+                (
+                    StatusCode::OK,
+                    Json(json!({ "version": env!("CARGO_PKG_VERSION") })),
+                )
+            }),
+        );
 
     let listener = UnixListener::bind(&sock_path).expect("bind unix socket");
     tokio::spawn(async move {

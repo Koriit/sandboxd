@@ -77,6 +77,20 @@ async fn spawn_counting_daemon() -> (TempDir, String, CountersHandle) {
                 },
             ),
         )
+        // The CLI's strict CLI ↔ daemon version-equality handshake
+        // fires `GET /version` on every `send_request_with_timeout`
+        // connection. Reporting our own CARGO_PKG_VERSION keeps the
+        // gate passing so the `/backends` cache assertion fires
+        // exactly once per create — the contract these tests pin.
+        .route(
+            "/version",
+            get(|| async {
+                (
+                    StatusCode::OK,
+                    Json(json!({ "version": env!("CARGO_PKG_VERSION") })),
+                )
+            }),
+        )
         .with_state(counters_for_routes);
 
     let listener = UnixListener::bind(&sock_path).expect("bind unix socket");

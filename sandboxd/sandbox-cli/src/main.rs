@@ -24,7 +24,7 @@ use sandbox_cli::presets::{self, Catalog, ParsedInvocation, Preset, PresetSource
 
 /// CLI client for managing sandbox sessions.
 #[derive(Parser, Debug)]
-#[command(name = "sandbox", about = "Manage sandbox sessions")]
+#[command(name = "sandbox", about = "Manage sandbox sessions", version)]
 struct Cli {
     /// Path to the sandboxd Unix socket.
     #[arg(long, global = true, default_value_t = default_socket_path())]
@@ -337,6 +337,27 @@ enum Command {
         /// Deny rows are colored red when stdout is a TTY.
         #[arg(long)]
         table: bool,
+    },
+    /// Print the CLI's own version and exit.
+    ///
+    /// Does **not** connect to the daemon — this is the local answer to
+    /// "what version of the CLI do I have?" and intentionally bypasses
+    /// the strict CLI ↔ daemon version-equality handshake every other
+    /// subcommand performs. Combine with `sandbox doctor` for "what
+    /// version of the daemon do I have?".
+    Version,
+    /// Diagnose the local sandboxd installation.
+    ///
+    /// Connects tolerantly: the CLI ↔ daemon strict-equality handshake
+    /// is bypassed for this subcommand so the operator can use doctor
+    /// to *diagnose* a version skew, not be refused by it. Full check
+    /// implementation lands in a follow-up session — this stub is the
+    /// dispatch arm so the bypass is structurally in place.
+    Doctor {
+        /// Print all checks (including passes) rather than just the
+        /// ones that failed or surfaced a skip-hint.
+        #[arg(long)]
+        verbose: bool,
     },
     /// Rebuild the pre-baked backend image(s).
     ///
@@ -926,6 +947,19 @@ fn build_request(command: &Command) -> Option<Request<String>> {
             // use, instead of silently sending the wrong request shape.
             return None;
         }
+        Command::Version | Command::Doctor { .. } => {
+            // `sandbox version` and `sandbox doctor` are dispatched at
+            // the top of `main` before `build_request` is called.
+            // Reaching this branch indicates a dispatch bug — the
+            // version-handshake bypass relies on these subcommands
+            // never reaching `send_request_with_timeout`, so returning
+            // `None` would silently send a malformed request instead
+            // of failing loudly.
+            unreachable!(
+                "`sandbox version` / `sandbox doctor` are handled client-side \
+                 in main() before build_request"
+            );
+        }
         // Ssh, Logs, Cp, Sync, Inspect, Describe, and Events are
         // handled specially -- not via a single buffered request/
         // response pair. Inspect and Describe issue one GET
@@ -1104,6 +1138,106 @@ fn format_memory_field(config: &sandbox_core::SessionConfigDto) -> String {
 /// setup, so this must be generous.
 const CLI_HTTP_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Exit code the CLI uses when it refuses to proceed because the
+/// daemon's reported version does not match the CLI's compile-time
+/// `CARGO_PKG_VERSION`. Distinct from `1` (daemon-side error after a
+/// successful handshake) so wrapper scripts can tell the two apart.
+const CLI_VERSION_MISMATCH_EXIT_CODE: i32 = 2;
+
+/// Format the verbatim stderr message printed when the CLI detects a
+/// version skew with the daemon. The tokens `version mismatch`,
+/// `CLI is`, `daemon is`, and `both must match` are load-bearing — the
+/// integration test in spec § 11.6 greps for them, and downstream
+/// scripts may match the wording to surface a friendly upgrade hint.
+fn render_version_mismatch_message(cli_version: &str, daemon_version: &str) -> String {
+    format!(
+        "sandbox: version mismatch\n  CLI is {cli_version}\n  daemon is {daemon_version}\n  both must match \u{2014} reinstall to align (sandbox update)"
+    )
+}
+
+/// Compare the CLI's compile-time version to the daemon's reported
+/// version under the strict-equality rule. Returns `Err(message)` with
+/// the verbatim stderr wording on skew so the caller can route the
+/// message to whatever sink suits (test capture vs. process stderr).
+fn check_daemon_version_equality(cli_version: &str, daemon_version: &str) -> Result<(), String> {
+    if cli_version == daemon_version {
+        Ok(())
+    } else {
+        Err(render_version_mismatch_message(cli_version, daemon_version))
+    }
+}
+
+/// Subcommands that bypass the strict CLI ↔ daemon version-equality
+/// check. `Version` answers locally without connecting to the daemon
+/// at all, so it never reaches the handshake. `Doctor` connects
+/// tolerantly: it must run *under* a skew so the operator can diagnose
+/// the skew via doctor's C3 check rather than being refused at the
+/// gate. Every other subcommand performs the strict equality check
+/// inside `send_request_with_timeout` immediately after socket
+/// connect, per spec § 7.5.
+///
+/// The dispatch in `main` short-circuits both `Version` and `Doctor`
+/// before reaching the socket-connect path, so this predicate is the
+/// single source of truth for the bypass set; it is queried by the
+/// unit tests in spec § 11.3 so the bypass surface is asserted at
+/// every refactor.
+#[cfg_attr(not(test), allow(dead_code))]
+fn command_bypasses_version_check(command: &Command) -> bool {
+    matches!(command, Command::Version | Command::Doctor { .. })
+}
+
+/// JSON body shape `GET /version` returns. The daemon emits a
+/// single-field object (`{"version": "<semver>"}`); the CLI only
+/// reads the `version` field, but parsing into a typed struct keeps
+/// the deserialization tolerant if the daemon later grows extra
+/// fields and lets us return a clean `Result` to the caller.
+#[derive(serde::Deserialize)]
+struct DaemonVersionResponse {
+    version: String,
+}
+
+/// Issue `GET /version` against an already-handshaken hyper sender and
+/// return the daemon's reported `CARGO_PKG_VERSION`. Errors map to the
+/// same `String`-message shape every other `send_request_with_timeout`
+/// failure mode uses, so the caller can short-circuit by propagating
+/// `?` without bespoke handling. Empty-body GET is sent as `String`
+/// because `send_request_with_timeout`'s sender is typed against
+/// `String` bodies (the caller's request and the version probe must
+/// share a body type).
+async fn fetch_daemon_version(
+    sender: &mut hyper::client::conn::http1::SendRequest<String>,
+) -> Result<String, String> {
+    let req = Request::builder()
+        .method("GET")
+        .uri("/version")
+        // Authority is meaningless on a unix socket; supply *something*
+        // so the request line parses cleanly through hyper's HTTP/1.1
+        // header validator.
+        .header("host", "localhost")
+        .body(String::new())
+        .expect("failed to build /version request");
+    let response = sender
+        .send_request(req)
+        .await
+        .map_err(|e| format!("version handshake failed: {e}"))?;
+    let status = response.status();
+    let body_bytes = response
+        .into_body()
+        .collect()
+        .await
+        .map_err(|e| format!("failed to read /version body: {e}"))?
+        .to_bytes();
+    if !status.is_success() {
+        let body = String::from_utf8_lossy(&body_bytes);
+        return Err(format!("daemon /version returned {status}: {body}"));
+    }
+    let parsed: DaemonVersionResponse = serde_json::from_slice(&body_bytes).map_err(|e| {
+        let body = String::from_utf8_lossy(&body_bytes);
+        format!("failed to parse /version response (`{body}`): {e}")
+    })?;
+    Ok(parsed.version)
+}
+
 async fn send_request(
     socket_path: &str,
     req: Request<String>,
@@ -1137,6 +1271,20 @@ async fn send_request_with_timeout(
                 eprintln!("connection error: {e}");
             }
         });
+
+        // Strict CLI ↔ daemon version-equality handshake (spec § 7.1).
+        // Fired on every CLI invocation that reaches the daemon — the
+        // bypass for `sandbox version` / `sandbox doctor` is handled
+        // upstream in `main` (see `command_bypasses_version_check`).
+        // Mismatch short-circuits with the verbatim stderr wording and
+        // exits with `CLI_VERSION_MISMATCH_EXIT_CODE` so the caller's
+        // request is never sent against a skewed daemon.
+        let daemon_version = fetch_daemon_version(&mut sender).await?;
+        let cli_version = env!("CARGO_PKG_VERSION");
+        if let Err(message) = check_daemon_version_equality(cli_version, &daemon_version) {
+            eprintln!("{message}");
+            process::exit(CLI_VERSION_MISMATCH_EXIT_CODE);
+        }
 
         let response = sender
             .send_request(req)
@@ -1280,6 +1428,16 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
             // handle_response. Reaching here indicates a dispatch bug.
             unreachable!(
                 "ssh/logs/cp/sync/inspect/describe/events commands should be handled before send_request"
+            );
+        }
+        Command::Version | Command::Doctor { .. } => {
+            // `sandbox version` and `sandbox doctor` exit from `main`
+            // before any HTTP request is sent; reaching `handle_response`
+            // for them indicates a dispatch bug. See the matching arm
+            // in `build_request` for the symmetric guard.
+            unreachable!(
+                "`sandbox version` / `sandbox doctor` are handled client-side \
+                 in main() before send_request"
             );
         }
     }
@@ -4309,6 +4467,31 @@ async fn main() {
 
     let cli = Cli::parse();
 
+    // `sandbox version` answers locally — never connect to the daemon.
+    // This is the deliberate bypass for the strict CLI ↔ daemon
+    // version-equality handshake every other subcommand performs
+    // inside `send_request_with_timeout`: the operator should always
+    // be able to ask "what version of the CLI do I have?" without a
+    // running daemon and without being refused by a skew. Output
+    // format is the same `<name> <semver>\n` pin as `sandbox --version`
+    // (spec § 7.6).
+    if matches!(cli.command, Command::Version) {
+        println!("sandbox {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
+    // `sandbox doctor` is the operator's diagnostic surface. Its full
+    // check-registry implementation lands in a follow-up session;
+    // this stub keeps the dispatch arm in place so the version-handshake
+    // bypass (see `command_bypasses_version_check`) is structurally
+    // complete — doctor connects tolerantly so it can *diagnose* a
+    // skew rather than be refused by the gate at the bottom of
+    // `send_request_with_timeout`.
+    if let Command::Doctor { verbose: _ } = &cli.command {
+        println!("sandbox doctor: not yet implemented");
+        return;
+    }
+
     // Handle ssh specially — it doesn't follow the normal request/response flow.
     if let Command::Ssh { session, command } = &cli.command {
         handle_ssh(&cli.socket, session, command).await;
@@ -6329,8 +6512,22 @@ mod tests {
     /// handling each request sequentially (each connection serves one
     /// request). Returns the socket path to pass to the CLI.
     fn spawn_fake_daemon(
-        routes: std::collections::HashMap<String, (u16, String)>,
+        mut routes: std::collections::HashMap<String, (u16, String)>,
     ) -> (tempfile::TempDir, String) {
+        // Auto-install the `/version` handshake route every fake
+        // daemon needs: `send_request_with_timeout` issues
+        // `GET /version` on every connection (strict CLI ↔ daemon
+        // version-equality rule), and the equality predicate must
+        // pass for the test's actual request to flow through. The
+        // route is overridable — a test that wants to exercise a
+        // skewed daemon can pre-populate the entry.
+        routes.entry("/version".to_string()).or_insert_with(|| {
+            (
+                200,
+                format!(r#"{{"version":"{}"}}"#, env!("CARGO_PKG_VERSION")),
+            )
+        });
+
         let tmp = tempfile::tempdir().expect("tempdir");
         let sock_path = tmp.path().join("sandboxd.sock");
         let sock_str = sock_path.to_string_lossy().to_string();
@@ -6339,38 +6536,75 @@ mod tests {
         // The listener is moved into the server thread; the TempDir stays
         // in the caller so the socket file lives for the duration of the
         // test.
+        //
+        // Each accepted connection now serves the version handshake +
+        // up to one subsequent request on the same HTTP/1.1 keep-
+        // alive: `send_request_with_timeout` fires `GET /version`
+        // first, reads the response, and then issues the caller's
+        // real request on the same connection. The fake server must
+        // therefore loop over reads-per-connection (read until the
+        // peer closes the socket) rather than closing after a single
+        // exchange. Each request is parsed as one line + headers
+        // (no body for GET) and the response carries `Connection:
+        // close` only after the **second** request, so the CLI's
+        // keep-alive driver is happy to send both requests.
         thread::spawn(move || {
             for conn in listener.incoming() {
                 let mut stream = match conn {
                     Ok(s) => s,
                     Err(_) => break,
                 };
-                let mut buf = [0u8; 4096];
-                let n = match stream.read(&mut buf) {
-                    Ok(n) => n,
-                    Err(_) => continue,
-                };
-                let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                // Parse the request line (first line).
-                let request_line = req.lines().next().unwrap_or("");
-                // Format: "GET /path HTTP/1.1"
-                let path = request_line.split_whitespace().nth(1).unwrap_or("");
+                // Serve up to two requests per connection (version
+                // handshake + caller's request). After the second
+                // request we send `Connection: close` and break.
+                let mut buf = vec![0u8; 8192];
+                let mut accumulated: Vec<u8> = Vec::new();
+                let mut served = 0;
+                loop {
+                    if served >= 2 {
+                        break;
+                    }
+                    // Read until we have at least one complete request
+                    // (terminated by `\r\n\r\n`).
+                    let header_end = loop {
+                        if let Some(pos) = accumulated.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break Some(pos);
+                        }
+                        let n = match stream.read(&mut buf) {
+                            Ok(0) => break None,
+                            Ok(n) => n,
+                            Err(_) => break None,
+                        };
+                        accumulated.extend_from_slice(&buf[..n]);
+                    };
+                    let Some(header_end) = header_end else {
+                        break;
+                    };
+                    let req = String::from_utf8_lossy(&accumulated[..header_end]).to_string();
+                    accumulated.drain(..header_end + 4);
+                    let request_line = req.lines().next().unwrap_or("");
+                    let path = request_line.split_whitespace().nth(1).unwrap_or("");
 
-                let (status, body) = routes
-                    .get(path)
-                    .cloned()
-                    .unwrap_or_else(|| (500, "{\"error\":\"unhandled path\"}".into()));
+                    let (status, body) = routes
+                        .get(path)
+                        .cloned()
+                        .unwrap_or_else(|| (500, "{\"error\":\"unhandled path\"}".into()));
 
-                let status_text = match status {
-                    200 => "OK",
-                    404 => "Not Found",
-                    _ => "Internal Server Error",
-                };
-                let response = format!(
-                    "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len(),
-                );
-                let _ = stream.write_all(response.as_bytes());
+                    let status_text = match status {
+                        200 => "OK",
+                        404 => "Not Found",
+                        _ => "Internal Server Error",
+                    };
+                    served += 1;
+                    let conn_header = if served >= 2 { "close" } else { "keep-alive" };
+                    let response = format!(
+                        "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: {conn_header}\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    if stream.write_all(response.as_bytes()).is_err() {
+                        break;
+                    }
+                }
                 let _ = stream.shutdown(std::net::Shutdown::Write);
             }
         });
@@ -7926,6 +8160,136 @@ mod tests {
         assert!(
             out.contains("forced:      no"),
             "forced: no must render when detected: yes; got {out:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // CLI ↔ daemon strict version-equality handshake (spec § 7.1, § 11.3).
+    //
+    // `check_daemon_version_equality` is the equality predicate
+    // `send_request_with_timeout` calls after `GET /version`; on `Ok`
+    // it proceeds, on `Err` it prints the verbatim stderr wording and
+    // `process::exit(2)`s. The four tests pin:
+    //   - proceeds on match (`Ok(())`)
+    //   - refuses on skew with the verbatim stderr substrings
+    //   - the bypass set covers `sandbox doctor`
+    //   - the bypass set covers `sandbox version`
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn version_handshake_proceeds_on_match() {
+        // The equality predicate returns `Ok(())` only when the
+        // daemon's reported version is byte-for-byte equal to the
+        // CLI's compile-time `CARGO_PKG_VERSION`. Same string in
+        // both slots → handshake passes and the caller's request is
+        // sent (the `Ok(())` branch in
+        // `send_request_with_timeout`).
+        let result = check_daemon_version_equality("1.0.3", "1.0.3");
+        assert!(
+            result.is_ok(),
+            "byte-for-byte match must pass the equality predicate; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn version_handshake_refuses_on_skew_with_verbatim_stderr() {
+        // The four tokens `version mismatch`, `CLI is`, `daemon is`,
+        // and `both must match` are load-bearing — the integration
+        // test in spec § 11.6 greps for them, and downstream scripts
+        // may match the wording to surface a friendly upgrade hint.
+        let err = check_daemon_version_equality("1.0.3", "1.0.4")
+            .expect_err("skewed pair must fail the equality predicate");
+        assert!(
+            err.contains("version mismatch"),
+            "stderr must contain `version mismatch`; got {err:?}"
+        );
+        assert!(
+            err.contains("CLI is 1.0.3"),
+            "stderr must report the CLI's version after `CLI is`; got {err:?}"
+        );
+        assert!(
+            err.contains("daemon is 1.0.4"),
+            "stderr must report the daemon's version after `daemon is`; got {err:?}"
+        );
+        assert!(
+            err.contains("both must match"),
+            "stderr must contain `both must match`; got {err:?}"
+        );
+        // The exit code is `2` (distinct from `1`, which the CLI
+        // uses for daemon-side errors *after* a successful handshake)
+        // — pinned by the constant the runtime calls `process::exit`
+        // with. The predicate itself does not exit; the runtime path
+        // routes the `Err` to stderr and then exits.
+        assert_eq!(
+            CLI_VERSION_MISMATCH_EXIT_CODE, 2,
+            "version-mismatch exit code is pinned to 2 by spec § 7.3"
+        );
+    }
+
+    #[test]
+    fn version_handshake_bypassed_for_doctor_subcommand() {
+        // `sandbox doctor` must remain functional under a skew — the
+        // operator uses doctor to *diagnose* the skew, so refusing to
+        // run it under skew would mean the operator has no way to
+        // diagnose. The bypass predicate is the single source of truth
+        // for the bypass set, queried at the top of `main` before any
+        // socket connect.
+        let cmd = Command::Doctor { verbose: false };
+        assert!(
+            command_bypasses_version_check(&cmd),
+            "`sandbox doctor` must bypass the strict-equality check; \
+             refusing to run doctor under skew leaves the operator with no \
+             diagnostic surface"
+        );
+        // The verbose variant must also bypass — bypass is keyed on
+        // the variant, not its arguments.
+        let cmd_verbose = Command::Doctor { verbose: true };
+        assert!(
+            command_bypasses_version_check(&cmd_verbose),
+            "`sandbox doctor --verbose` must also bypass the check"
+        );
+    }
+
+    #[test]
+    fn version_handshake_bypassed_for_version_subcommand() {
+        // `sandbox version` answers locally — the dispatch in `main`
+        // never opens a socket for it, so the version-handshake never
+        // fires. The bypass predicate confirms the variant is in the
+        // bypass set; any refactor that drops the early-return arm
+        // from `main` would still leave the predicate consistent, so
+        // this test also implicitly asserts the single source of
+        // truth.
+        let cmd = Command::Version;
+        assert!(
+            command_bypasses_version_check(&cmd),
+            "`sandbox version` must bypass the strict-equality check; it \
+             answers locally without a daemon connection"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // `sandbox --version` output format pin (spec § 7.6).
+    //
+    // The format is `sandbox <semver>\n` — exactly two space-separated
+    // tokens, with the semver in column 2. Spec 4 § 4.4.5's
+    // half-installed-state detection parses the output with
+    // `awk '{print $2}'`; a regression that adds a trailing token
+    // (build SHA, commit hash, ...) would silently break that parse.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sandbox_version_flag_produces_pinned_two_token_line() {
+        // clap derives the `--version` output from `#[command(name,
+        // version)]` — we render it here through the same builder and
+        // assert the exact `<name> <semver>\n` shape spec § 7.6 pins.
+        use clap::CommandFactory;
+        let rendered = Cli::command().render_version();
+        assert_eq!(
+            rendered,
+            format!("sandbox {}\n", env!("CARGO_PKG_VERSION")),
+            "spec § 7.6 pins the output to exactly `sandbox <semver>\\n`; \
+             any trailing token (build SHA, etc.) silently breaks Spec 4's \
+             `awk '{{print $2}}'` parse"
         );
     }
 }

@@ -85,10 +85,29 @@ async fn spawn_fake_daemon_for_create() -> (TempDir, String, CapturedBody) {
         // capture runs. Serve a minimal Lima-only matrix so the
         // preflight succeeds for these preset tests.
         .route("/backends", get(fake_backends_lima_only))
+        // The CLI also fetches `GET /version` immediately after the
+        // unix-socket handshake (strict CLI ↔ daemon version-equality
+        // rule). Without this route the version handshake fails with
+        // HTTP 404 and the CLI errors out before `POST /sessions`
+        // runs. Return the CLI's own compile-time version so the
+        // equality predicate passes and the test's payload assertion
+        // can fire.
+        .route("/version", get(fake_version_handler))
         .with_state(captured_clone);
 
     spawn_unix_server(&sock_path, app).await;
     (tmp, sock_str, captured)
+}
+
+/// `GET /version` handler reused by every fake daemon in this file.
+/// Reports the test binary's own `CARGO_PKG_VERSION` — which equals
+/// the `sandbox` CLI's `CARGO_PKG_VERSION` because both crates ship
+/// from the same workspace and inherit the same version field. The
+/// strict-equality predicate in `send_request_with_timeout` therefore
+/// passes and the test's actual request flows through to the
+/// capturing handler.
+async fn fake_version_handler() -> Json<Value> {
+    Json(json!({ "version": env!("CARGO_PKG_VERSION") }))
 }
 
 /// Minimal `/backends` body — a single Lima entry with the canonical
@@ -155,6 +174,11 @@ async fn spawn_fake_daemon_for_policy_update() -> (TempDir, String, CapturedBody
             "/dummy",
             delete(|| async { (StatusCode::NOT_FOUND, "") }),
         )
+        // The CLI's `send_request_with_timeout` does a `GET /version`
+        // handshake before every operator-issued request, so this
+        // fake daemon must respond to it or the policy-update tests
+        // fail at the handshake rather than at the payload capture.
+        .route("/version", get(fake_version_handler))
         .with_state(captured_clone);
 
     spawn_unix_server(&sock_path, app).await;
