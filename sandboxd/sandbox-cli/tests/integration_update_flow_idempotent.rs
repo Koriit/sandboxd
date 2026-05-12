@@ -246,10 +246,7 @@ fn integration_backup_retention_never_prunes_failed_sets() {
         "failed set preserved: {:?}",
         outcome.preserved_forensic
     );
-    assert!(
-        failed_dir.exists(),
-        "failed set must survive prune (§ 5.2)"
-    );
+    assert!(failed_dir.exists(), "failed set must survive prune (§ 5.2)");
 }
 
 /// Spec 5 § 3.2.18: the install-state's `previous_version` field is
