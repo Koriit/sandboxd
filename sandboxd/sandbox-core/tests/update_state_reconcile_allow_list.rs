@@ -47,20 +47,23 @@ const ALLOW_LIST: &[&str] = &[
     "sandboxd/src/main.rs:reconcile",
 ];
 
-/// Strings that must appear in the file content for a path to count
-/// as part of the analysis. The crate-root file containing the
-/// method *definition* (`store.rs`) is excluded — every occurrence
-/// inside that file is metadata (signature, doc-comment, the method
-/// body, allow-list tests), not a call site.
+/// Paths excluded from the call-site scan. The crate-root file
+/// containing the method *definition* (`store.rs`) is excluded —
+/// every occurrence inside that file is metadata (signature,
+/// doc-comment, the method body), not a call site. The allow-list
+/// test file itself is excluded for the same reason (it names the
+/// method in prose and in the `ALLOW_LIST` strings).
+///
+/// `/tests/` is **not** blanket-excluded: no test today calls
+/// `update_state_reconcile`, and the scan should fail loudly the
+/// first time one is added so the call site can be reviewed
+/// (test-side callers either belong in `ALLOW_LIST` with a
+/// rationale or should be rewritten to use `update_state`).
 fn is_excluded(path: &Path) -> bool {
     let s = path.to_string_lossy();
     s.contains("/target/")
         || s.contains("/sandbox-core/src/store.rs")
         || s.contains("/sandbox-core/tests/update_state_reconcile_allow_list.rs")
-        // Test directories are exempt: the per-caller filter contract
-        // is enforced on production code paths only.
-        || s.contains("/tests/")
-        || s.contains("/sandbox-core/src/store.rs")
 }
 
 /// Walk `dir` recursively, returning every `*.rs` file. Symlinks and

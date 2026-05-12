@@ -521,9 +521,9 @@ impl SessionStore {
     /// column added by V006 (api-session-isolation spec § 2.4) so every
     /// subsequent read or mutation filters by the caller's identity.
     /// `guest_proto` / `guest_bin_ver` are the protocol-version and
-    /// binary-version stamps that drive the start-time compat gate; in
-    /// M13-S4 they ride as placeholders (`0`, `""`) until M13-S5 wires
-    /// up the real constants.
+    /// binary-version stamps that drive the start-time compat gate
+    /// (api-session-isolation spec § 3.4); callers stamp the daemon's
+    /// current constants here so reads round-trip the real values.
     pub fn create_session(
         &self,
         config: SessionConfig,
@@ -882,14 +882,22 @@ impl SessionStore {
     /// property the rest of the store guarantees.
     ///
     /// Authorized callers, exhaustively (api-session-isolation spec
-    /// § 7.3.1 enforces this list via a static-analysis test):
-    /// - `list_sessions` and `get_session` reconciler blocks in
-    ///   `sandboxd::main` (DB-vs-runtime status divergence).
-    /// - The `Creating` -> `Running`/`Error` transitions in
-    ///   `create_session` and `start_session` *before* the session is
-    ///   owner-stamped (only on the error/cleanup branch; the happy
-    ///   path uses `update_state`).
-    /// - Startup reconciliation in `sandboxd::main::main`.
+    /// § 7.3.1 enforces this list via a static-analysis test in
+    /// `sandbox-core/tests/update_state_reconcile_allow_list.rs`):
+    /// - `sandboxd::main::list_sessions` — reconciler block inside the
+    ///   list handler that back-stamps observed runtime state onto
+    ///   rows already filtered by the caller's scope.
+    /// - `sandboxd::main::get_session` — same shape, single-session
+    ///   GET handler.
+    /// - `sandboxd::main::reconcile` — startup reconciliation that
+    ///   walks every persisted session regardless of owner.
+    ///
+    /// Note: error/cleanup branches in `create_session` /
+    /// `start_session` deliberately route through
+    /// `update_state(&operator.name, ...)` — they have an
+    /// `OperatorIdentity` in scope, so going through the owner-filtered
+    /// path keeps the per-caller invariant intact. Do not add a fourth
+    /// allow-list entry for those branches.
     pub fn update_state_reconcile(
         &self,
         id: &SessionId,

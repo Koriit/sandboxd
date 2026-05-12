@@ -5735,12 +5735,12 @@ async fn base_image_status(State(state): State<Arc<AppState>>) -> impl IntoRespo
 
 /// Global health endpoint: `GET /health`
 ///
-/// Returns gateway status per running session.
-async fn health_check(
-    State(state): State<Arc<AppState>>,
-    Extension(operator): Extension<OperatorIdentity>,
-) -> impl IntoResponse {
-    let sessions = match state.store.list_sessions(&operator.name) {
+/// Returns gateway status per running session. This is a daemon-wide
+/// ops probe and is explicitly carved out of per-caller filtering by
+/// api-session-isolation spec § 2.6 — the response covers every
+/// running session on the daemon regardless of caller identity.
+async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let sessions = match state.store.list_sessions_unfiltered() {
         Ok(s) => s,
         Err(e) => return error_response(e).into_response(),
     };

@@ -1,8 +1,8 @@
 //! Integration tests for the guest-version refresh path
 //! (api-session-isolation spec §§ 3.4, 3.8, 3.9; §§ 7.4, 7.5).
 //!
-//! These tests pin the pieces M13-S5 wires together so the
-//! refresh-on-start path stays observable end-to-end:
+//! These tests pin the refresh-on-start path so it stays observable
+//! end-to-end:
 //!
 //! - `integration_guest_refresh_container_backend` — runs
 //!   `refresh_guest_binary` against a real Docker container with an
@@ -128,8 +128,8 @@ fn integration_guest_refresh_updates_db_columns() {
             None,
             "test-operator",
             // Stale stamp — simulates a session created by an older
-            // daemon. The daemon's M13-S5 create path stamps the real
-            // constants now; this `0` / `""` shape mirrors what V006
+            // daemon. The current daemon create path stamps the real
+            // constants; this `0` / `""` shape mirrors what V006
             // bequeaths on migration default.
             0,
             "",
@@ -282,34 +282,17 @@ impl Drop for ContainerCleanup {
 /// the refresh can be observed by reading the file back and comparing
 /// to the daemon's actual sandbox-guest bytes.
 ///
-/// **Spec gap discovered during M13-S5 (escalation for M13-S6)**:
-/// api-session-isolation spec §§ 3.8.1, 9.4 claim `docker cp` writes
-/// through the docker daemon's storage driver and is unaffected by
-/// `--read-only`. Empirically on Docker 29.4 with the containerd
-/// snapshotter ("overlayfs" driver), `docker cp` of any file into a
-/// `--read-only` container's rootfs is rejected by dockerd with
-/// `Error response from daemon: container rootfs is marked read-only`
-/// regardless of destination path. The spec's premise is incorrect on
-/// modern Docker engines; the refresh-via-`docker cp` mechanism as
-/// specified does not work on the default-hardened lite container.
-///
-/// Workaround in this test: declare `VOLUME ["/usr/local/bin"]` in the
-/// test image so the binary's directory is bind-mounted from an
-/// anonymous volume at run time, which Docker allows `docker cp` to
-/// write into even with `--read-only` rootfs. The production lite image
-/// (`sandboxd/images/lite/Dockerfile`) does **not** carry this VOLUME
-/// declaration; bringing this refresh mechanism to production therefore
-/// requires either (a) adding `VOLUME ["/usr/local/bin/sandbox-guest"]`
-/// or `VOLUME ["/usr/local/bin"]` to the lite image, (b) changing the
-/// refresh mechanism (bind-mount the host-side guest binary at create
-/// time and re-stamp the host file on refresh), or (c) removing
-/// `--read-only` (a security regression — rejected).
-///
-/// This test pins the orchestration (stop → cp → idempotency) and the
-/// byte-equality contract against the workaround image so the M13-S5
-/// implementation has end-to-end Docker coverage. The spec-level
-/// resolution is tracked as a finding for M13-S6 review.
-const REFRESH_IMAGE_TAG: &str = "sandboxd-m13s5-refresh-test:latest";
+/// The test Dockerfile declares `VOLUME ["/usr/local/bin"]` to bypass
+/// the `--read-only` rootfs constraint that Docker 29.4+ (with the
+/// containerd snapshotter / overlayfs driver) enforces against
+/// `docker cp` writes — without the VOLUME declaration, `docker cp`
+/// into a `--read-only` container's rootfs is rejected by dockerd
+/// with `container rootfs is marked read-only` regardless of
+/// destination path. The production lite image does not yet carry
+/// this VOLUME declaration; see
+/// `.tasks/handoffs/m13-s6-refresh-readonly-gap.md` for the
+/// production-side resolution options.
+const REFRESH_IMAGE_TAG: &str = "sandboxd-refresh-test:latest";
 const REFRESH_DOCKERFILE: &str = "FROM alpine:latest\n\
 RUN mkdir -p /usr/local/bin && \\\n    \
 printf 'old-guest-placeholder\\n' > /usr/local/bin/sandbox-guest && \\\n    \

@@ -456,9 +456,7 @@ pub struct Session {
     /// time. Bumped only when the protocol shape changes; the
     /// `start_session` compat gate (api-session-isolation spec § 3.4)
     /// reads this to decide whether to take the fast path, refresh the
-    /// guest binary, or refuse. Spec 2's M13-S4 lays the column down
-    /// with a placeholder `0`; M13-S5 wires up the real constant and
-    /// the compat gate.
+    /// guest binary, or refuse.
     ///
     /// `#[serde(default)]` so JSON snapshots written by older code
     /// paths still deserialize cleanly (defaulting to `0`).
