@@ -15,15 +15,49 @@
 set -eu
 
 # ----------------------------------------------------------------------------
-# Pinned constants (trust root).
-# ----------------------------------------------------------------------------
+# Shared constants (sourced from scripts/lib.sh).
+#
+# The cosign pin and matching SHA-256 checksums are factored out into
+# `scripts/lib.sh` (Spec 5 § 3.1.9) so the `sandbox update` shell paths
+# can source the same trust root. Resolution order:
+#   1. `$SANDBOX_LIB_SH` env override (used by the in-tree test suite to
+#      point at a tempfile lib.sh).
+#   2. `$(dirname "$0")/lib.sh` when invoked from a local checkout.
+#   3. A bare `lib.sh` in the current working directory as a final
+#      fallback (handles `curl -fsSL .../install.sh | sh` where the
+#      deploy pipeline puts both files adjacent in site/public/).
+# A clear error message names the search order if all three miss.
+__sandbox_lib_sh_resolve() {
+    if [ -n "${SANDBOX_LIB_SH:-}" ] && [ -r "$SANDBOX_LIB_SH" ]; then
+        printf '%s' "$SANDBOX_LIB_SH"
+        return 0
+    fi
+    case "$0" in
+        */*)
+            __script_dir=$(dirname -- "$0")
+            if [ -r "$__script_dir/lib.sh" ]; then
+                printf '%s' "$__script_dir/lib.sh"
+                return 0
+            fi
+            ;;
+    esac
+    if [ -r "./lib.sh" ]; then
+        printf '%s' "./lib.sh"
+        return 0
+    fi
+    return 1
+}
 
-COSIGN_VERSION="v2.4.1"
-# sha256 of cosign's published Linux binaries for the pinned version above.
-# See § 7.3 of the install-infrastructure design spec for the bump process.
-# Source: https://github.com/sigstore/cosign/releases/download/v2.4.1/cosign_checksums.txt
-COSIGN_SHA256_AMD64="8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b"
-COSIGN_SHA256_ARM64="3b2e2e3854d0356c45fe6607047526ccd04742d20bd44afb5be91fa2a6e7cb4a"
+__sandbox_lib_sh_path=$(__sandbox_lib_sh_resolve) || {
+    printf 'install.sh: required shared library lib.sh not found; ' >&2
+    # shellcheck disable=SC2016
+    printf 'searched SANDBOX_LIB_SH, $(dirname $0)/lib.sh, ./lib.sh. ' >&2
+    printf 'Re-run from a checkout (scripts/install.sh) or stage lib.sh ' >&2
+    printf 'adjacent to install.sh.\n' >&2
+    exit 1
+}
+# shellcheck disable=SC1090
+. "$__sandbox_lib_sh_path"
 
 DEFAULT_SOURCE_URL="https://github.com/Koriit/sandboxd/releases/download"
 LATEST_API_URL="https://api.github.com/repos/Koriit/sandboxd/releases/latest"
