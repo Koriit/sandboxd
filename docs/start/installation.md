@@ -115,7 +115,7 @@ This removes the binaries, systemd unit, and any install-time changes recorded i
 curl -fsSL https://Koriit.github.io/sandboxd/uninstall.sh | bash -s -- --purge --yes
 ```
 
-`--force` overrides the "active sessions exist" refusal; resources may leak. `--purge` without `--yes` requires typing `PURGE` to confirm.
+`--force` overrides the running-daemon refusal; running sessions may leak. The current check is coarse (refuses when sandboxd's socket responds at all); a per-session active-session probe lands alongside `sandbox update` in a future release. `--purge` without `--yes` requires typing `PURGE` to confirm.
 
 ## Developer install (`make setup-dev-env`)
 

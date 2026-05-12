@@ -132,7 +132,7 @@ jobs:
 
       - name: Install sandboxd
         run: |
-          curl -fsSL https://example.invalid/install.sh | bash
+          curl -fsSL https://Koriit.github.io/sandboxd/install.sh | bash
 
       - name: Start daemon
         run: |

@@ -61,9 +61,13 @@ Uninstall sandboxd, reversing the changes recorded by install.sh.
 
 Options:
   --purge       Also delete /var/lib/sandbox/, the sandbox user, operator
-                group memberships, sandboxd.service.d/ drop-ins, and the
-                gateway docker image. Prompts unless --yes.
-  --force       Proceed even if active sessions exist (default: refuse).
+                group memberships, and the gateway docker image. Prompts
+                unless --yes. (Does not touch /etc/systemd/system/
+                sandboxd.service.d/, which is operator-owned.)
+  --force       Proceed even if sandboxd is running (default: refuse).
+                A per-session active-session probe lands with
+                'sandbox update' in a future release; for now the check
+                is coarse (any running daemon).
   --yes         Skip every confirmation prompt.
   --verbose     Echo every command before invocation.
   --quiet       Suppress non-error output.
@@ -157,37 +161,48 @@ parse_args() {
 }
 
 # ----------------------------------------------------------------------------
-# Step 2 — Refuse if sessions are active.
+# Step 2 — Refuse if the daemon is running.
+#
+# A finer-grained per-session probe (refuse only when actual sessions are
+# active) will land alongside `sandbox update` in a future release; that
+# work requires a daemon-side JSON-emitting subcommand that does not yet
+# exist. Until then this check is intentionally coarse: any responsive
+# daemon socket means refuse-without-force. That is a strict downgrade
+# from "active sessions" to "any daemon running" — coarser, but actually
+# working (the previous probe called a non-existent CLI subcommand and
+# silently always succeeded).
 # ----------------------------------------------------------------------------
 
-check_active_sessions() {
-    if [ ! -S "$SOCK_PATH" ]; then
-        log_ok "step=session_check active=0 reason=no-socket"
+socket_responsive() {
+    # Returns 0 iff the daemon socket exists AND a /health probe succeeds.
+    # curl is a hard prereq elsewhere in the operator-install path; if it
+    # is missing here we fall back to socket-existence alone (the bare
+    # presence of /run/sandbox/sandboxd.sock is a strong signal a daemon
+    # is up — systemd removes it on stop via the unit's RuntimeDirectory).
+    [ -S "$SOCK_PATH" ] || return 1
+    if ! command -v curl >/dev/null 2>&1; then
         return 0
     fi
-    if ! command -v sandbox >/dev/null 2>&1; then
-        log_warn "step=session_check action=skip reason=cli-missing"
+    curl --silent --show-error --max-time 2 \
+        --unix-socket "$SOCK_PATH" \
+        http://localhost/health \
+        >/dev/null 2>&1
+}
+
+check_daemon_running() {
+    if ! socket_responsive; then
+        log_ok "step=daemon_check running=0 reason=no-socket-or-unresponsive"
         return 0
     fi
-    if ! command -v jq >/dev/null 2>&1; then
-        log_warn "step=session_check action=skip reason=jq-missing"
-        return 0
-    fi
-    active=$(sandbox session ls --output json 2>/dev/null | jq 'length // 0' 2>/dev/null || echo 0)
-    if [ "${active:-0}" -gt 0 ] && [ "$FORCE" -eq 0 ]; then
-        log_fail "step=session_check active=$active force=0 action=refuse"
-        emit "${RED}x${RESET} Active sessions exist ($active). Stop them first:"
-        emit "    sandbox session ls"
-        emit "    sandbox session rm <id>"
-        emit "Or use --force to proceed anyway."
+    if [ "$FORCE" -eq 0 ]; then
+        log_fail "step=daemon_check running=1 force=0 action=refuse"
+        emit "${RED}x${RESET} sandboxd is running; stop it first:"
+        emit "    sudo systemctl stop sandboxd"
+        emit "Or pass --force to proceed anyway."
         exit 1
     fi
-    if [ "${active:-0}" -gt 0 ]; then
-        emit "${YELLOW}!${RESET} --force: proceeding with $active active session(s); resources may leak."
-        log_warn "step=session_check active=$active force=1 action=proceed"
-    else
-        log_ok "step=session_check active=0"
-    fi
+    emit "${YELLOW}!${RESET} --force: proceeding while sandboxd is running; sessions may leak."
+    log_warn "step=daemon_check running=1 force=1 action=proceed"
 }
 
 # ----------------------------------------------------------------------------
@@ -308,29 +323,38 @@ remove_bridge_conf_rules() {
     fi
 
     tmp=$(mktemp)
+    tmp_rules=$(mktemp)
     sudo -k cat /etc/qemu/bridge.conf | tee "$tmp" >/dev/null
-    count=0
-    # ADDED_BRIDGE_RULES is one rule per line.
-    printf '%s\n' "$ADDED_BRIDGE_RULES" | while IFS= read -r rule; do
-        [ -n "$rule" ] || continue
-        grep -vxF -- "$rule" "$tmp" > "${tmp}.new" || true
-        mv "${tmp}.new" "$tmp"
-        count=$((count + 1))
-        printf '%s\n' "$count"
-    done > /dev/null
+    original_lines=$(wc -l < "$tmp" 2>/dev/null || echo 0)
+    # ADDED_BRIDGE_RULES is one rule per line (jq output). Drop empty lines
+    # so an empty recorded set does not match every line in bridge.conf.
+    printf '%s\n' "$ADDED_BRIDGE_RULES" | awk 'NF' > "$tmp_rules"
+    rules_count=$(wc -l < "$tmp_rules" 2>/dev/null || echo 0)
 
-    if [ ! -s "$tmp" ]; then
+    # Single-pass awk: read the recorded rules into a set, then emit every
+    # bridge.conf line that is NOT in the set. No subshell, no per-rule
+    # rewrite — operator-added rules are preserved by construction.
+    awk 'NR==FNR { drop[$0]=1; next } !($0 in drop)' \
+        "$tmp_rules" "$tmp" > "${tmp}.new"
+    mv "${tmp}.new" "$tmp"
+
+    # Only delete /etc/qemu/bridge.conf if (i) the filtered result is empty
+    # AND (ii) the recorded rule count matches the original line count —
+    # i.e. every line in the file was one we added. Otherwise an operator-
+    # added rule sitting alongside ours would be lost.
+    if [ ! -s "$tmp" ] && [ "$rules_count" -gt 0 ] \
+       && [ "$rules_count" -eq "$original_lines" ]; then
         sudo -k rm -f /etc/qemu/bridge.conf
         record_removed "/etc/qemu/bridge.conf"
-        log_ok "step=bridge_conf action=remove_file reason=empty"
+        log_ok "step=bridge_conf action=remove_file reason=empty rules=$rules_count"
     elif ! cmp -s "$tmp" /etc/qemu/bridge.conf; then
         sudo -k install -m 0644 -o root -g root "$tmp" /etc/qemu/bridge.conf
         record_removed "added rules in /etc/qemu/bridge.conf"
-        log_ok "step=bridge_conf action=removed_lines"
+        log_ok "step=bridge_conf action=removed_lines rules=$rules_count"
     else
         log_ok "step=bridge_conf action=skip reason=no-matching-lines"
     fi
-    rm -f "$tmp" "${tmp}.new"
+    rm -f "$tmp" "$tmp_rules" "${tmp}.new"
 }
 
 # ----------------------------------------------------------------------------
@@ -434,7 +458,6 @@ purge_step() {
         if [ -n "$OPS_ADDED" ]; then
             emit "    'sandbox' group membership for: $(printf '%s' "$OPS_ADDED" | tr '\n' ' ')"
         fi
-        emit "    /etc/systemd/system/sandboxd.service.d/  (drop-in customizations)"
         printf 'Type %sPURGE%s to confirm: ' "$YELLOW" "$RESET"
         read -r confirm
         [ "$confirm" = "PURGE" ] || die "Aborted."
@@ -458,11 +481,9 @@ purge_step() {
         fi
     fi
 
-    if [ -d /etc/systemd/system/sandboxd.service.d ]; then
-        sudo -k rm -rf /etc/systemd/system/sandboxd.service.d
-        record_removed "/etc/systemd/system/sandboxd.service.d/"
-        log_ok "step=remove_drop_ins"
-    fi
+    # /etc/systemd/system/sandboxd.service.d/ is operator-owned (drop-in
+    # overrides); install.sh never creates it, uninstall.sh never removes it.
+    log_ok "step=remove_drop_ins action=skip reason=operator-owned"
 
     if [ "$HAVE_STATE" -eq 1 ] && [ -n "$OPS_ADDED" ]; then
         printf '%s\n' "$OPS_ADDED" | while IFS= read -r op; do
@@ -519,7 +540,7 @@ main() {
     parse_args "$@"
     setup_colors
 
-    check_active_sessions
+    check_daemon_running
     read_install_state
     stop_and_disable_unit
     remove_systemd_unit

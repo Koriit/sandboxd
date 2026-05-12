@@ -118,12 +118,16 @@ def test_uninstall_double_run_idempotent(
     ).stdout
     actions = parse_install_log_actions(log2)
 
-    # No removal action should fire on the second pass.
-    forbidden = {"rm", "remove", "unset", "create", "purge_state",
-                 "removed_lines"}
+    # Allow-list inversion: every action on the second pass MUST be
+    # in this set. A forbidden-list lets new mutating actions (e.g.
+    # ``disable``, ``stop``, ``remove_file`` — which uninstall.sh
+    # already emits) slip through if not enumerated; allow-listing
+    # fails closed when new step types are added.
+    allowed_actions = {"skip"}
     for step, step_actions in actions.items():
         for a in step_actions:
-            assert a not in forbidden, (
-                f"second uninstall mutated state: step={step} action={a}\n"
+            assert a in allowed_actions, (
+                f"second uninstall emitted disallowed action: "
+                f"step={step} action={a} (allowed: {allowed_actions})\n"
                 f"Log:\n{log2}"
             )

@@ -12,13 +12,15 @@ green, and the install state file is well-formed.
 
 from __future__ import annotations
 
-import json
-
 import pytest
 
 from conftest import (
+    assert_doctor_passes,
+    assert_full_install_landed,
     copy_tarball_to_vm,
     install_sh_cmd,
+    wait_for_socket,
+    wait_for_systemd_active,
     DEFAULT_FEDORA,
 )
 
@@ -45,39 +47,23 @@ def test_install_fresh_then_doctor_passes(
         f"stderr:\n{r.stderr}"
     )
 
-    # Post-conditions: binaries, systemd unit, sandbox user.
-    assert vm.shell("test -x /usr/local/bin/sandboxd").returncode == 0
-    assert vm.shell("test -x /usr/local/bin/sandbox").returncode == 0
-    assert vm.shell(
-        "test -x /usr/local/libexec/sandboxd/sandbox-route-helper"
-    ).returncode == 0
-    assert vm.shell(
-        "test -f /etc/systemd/system/sandboxd.service"
-    ).returncode == 0
-    assert vm.shell("id sandbox").returncode == 0
+    # Post-conditions: binaries, caps, systemd unit, sandbox user,
+    # well-formed install-state. Shared with the RHEL-paths variant.
+    assert_full_install_landed(vm)
 
-    # Route-helper has the expected file capabilities.
-    caps = vm.shell(
-        "getcap /usr/local/libexec/sandboxd/sandbox-route-helper",
-    ).stdout
-    assert "cap_net_admin,cap_sys_admin=eip" in caps, f"unexpected caps: {caps!r}"
-
-    # The install state file exists, is owned by sandbox:sandbox, and is
-    # valid JSON.
-    state_check = vm.shell(
-        "sudo cat /var/lib/sandbox/.install-state.json",
-        check=True, timeout=10,
-    )
-    state = json.loads(state_check.stdout)
-    assert state.get("installed_version")
-    assert state.get("schema_version") == 1 or "schema_version" not in state
-
-    # Start the daemon. systemd's `enable --now` will fail to bring the
-    # unit up if the gateway image is missing, the route-helper caps are
-    # wrong, etc., so this is a meaningful smoke.
-    r = vm.shell(
+    # Bring the daemon up. `enable --now` fails if the gateway image is
+    # missing, the route-helper caps are wrong, etc., so this is a
+    # meaningful smoke before doctor runs.
+    vm.shell(
         "sudo systemctl enable --now sandboxd", check=True, timeout=60,
     )
+    wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
+    wait_for_socket(vm.name, "/run/sandbox/sandboxd.sock", timeout=60)
+
+    # Doctor must report 0 failed checks — the test name promises green.
+    # `assert_doctor_passes` enforces both the exit code AND the
+    # "checks passed, 0 failed" output token per spec § 6.2.
+    assert_doctor_passes(vm)
 
     # ---------------- Uninstall path ----------------
 
@@ -108,6 +94,13 @@ def test_install_fresh_then_doctor_passes_rhel_paths(
     (vs. /usr/lib/qemu/qemu-bridge-helper on Debian-likes). Install.sh's
     probe step has to find both. OVMF lives at /usr/share/edk2/ovmf/ on
     Fedora; the prereq check also has to find both.
+
+    Asserts the same filesystem post-conditions as the Debian-family
+    variant (binaries, caps, state file, sandbox user) plus that the
+    bridge-helper probe resolved to the Fedora-layout path AND that the
+    running daemon reports doctor-green — the test name promises green
+    on RHEL paths; previously only log-content was checked, allowing an
+    install that emitted the right log but landed nothing to pass.
     """
     vm = vm_factory(distro_template)
     tarball_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64)
@@ -120,7 +113,7 @@ def test_install_fresh_then_doctor_passes_rhel_paths(
         f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
     )
 
-    # The install log should record the RHEL bridge-helper path.
+    # The install log records the RHEL bridge-helper path.
     log = vm.shell(
         "sudo cat /var/log/sandbox-install.log", check=True, timeout=10,
     ).stdout
@@ -129,7 +122,21 @@ def test_install_fresh_then_doctor_passes_rhel_paths(
         "expected RHEL bridge-helper path in install log; got:\n" + log
     )
 
-    # Doctor green — the host-prereq coverage proves the install
-    # converged on a real RHEL-family box.
-    # (We don't enable systemd here; doctor's checks are file-shape
-    # only, the systemd-active check is exercised by the systemd smoke.)
+    # The probe resolved to the real Fedora-layout binary — verify the
+    # file actually exists at that path (a log line alone could be
+    # written by a broken probe that never resolved).
+    assert vm.shell(
+        "test -x /usr/libexec/qemu-bridge-helper",
+    ).returncode == 0, "Fedora qemu-bridge-helper not found at /usr/libexec/"
+
+    # Shared filesystem-state asserts (binaries, caps, state, user).
+    assert_full_install_landed(vm)
+
+    # Doctor green on RHEL paths too. Same enable + wait + doctor as the
+    # Debian-family variant.
+    vm.shell(
+        "sudo systemctl enable --now sandboxd", check=True, timeout=60,
+    )
+    wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
+    wait_for_socket(vm.name, "/run/sandbox/sandboxd.sock", timeout=60)
+    assert_doctor_passes(vm)

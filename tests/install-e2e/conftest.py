@@ -589,17 +589,28 @@ def version_from_tarball(tarball_path):
     return m.group(1)
 
 
-def install_sh_cmd(tarball_in_vm, *extra_flags):
+def install_sh_cmd(tarball_in_vm, *extra_flags, env=None):
     """Build the canonical install.sh invocation used by every test.
 
     Always passes ``--from``, ``--version``, ``--yes``, ``--no-color``
     so test output is parser-friendly and idempotency assertions land
     on a known version string. Additional flags (e.g. ``--cosign-bundle``)
     can be appended.
+
+    ``env`` is an optional dict of environment variables exported to
+    the install.sh process (via ``sudo VAR=val ...``). Used by the
+    air-gapped test to set ``SANDBOX_INSTALL_SKIP_SIGSTORE=1`` (test-
+    only bypass; see install.sh::sigstore_verify).
     """
     ver = version_from_tarball(tarball_in_vm)
+    env_prefix = ""
+    if env:
+        # `sudo VAR=val ...` preserves the env var into the script's
+        # process; `sudo -E` would pull the entire current env in, which
+        # we deliberately avoid to keep the test's contract narrow.
+        env_prefix = " ".join(f"{k}={_sh_quote(v)}" for k, v in env.items()) + " "
     base = [
-        "sudo bash /tmp/install.sh",
+        f"sudo {env_prefix}bash /tmp/install.sh",
         f"--from {tarball_in_vm}",
         f"--version {ver}",
         "--yes",
@@ -609,19 +620,158 @@ def install_sh_cmd(tarball_in_vm, *extra_flags):
     return " ".join(base)
 
 
-def assert_doctor_passes(vm, *, user=None, timeout=60):
+def assert_doctor_passes(vm, *, user=None, timeout=60, sock_path=None):
     """Run `sandbox doctor` and assert it reports zero failures.
 
-    The CLI's doctor command exit code is 0 on green; we also check
-    the "0 failed" string for defensive coverage.
+    The CLI's doctor command exit code is 0 on green; we also assert
+    the ``"checks passed, 0 failed"`` token per spec § 6.2 — exit code
+    alone is insufficient because a broken doctor might silently exit 0
+    without performing checks.
+
+    Defaults to running as the ``sandbox`` system user with
+    ``SANDBOX_SOCKET=/run/sandbox/sandboxd.sock`` (matches the production
+    daemon's socket path and the runtime user of the systemd unit).
     """
-    cmd = "/usr/local/bin/sandbox doctor"
-    r = vm.shell(cmd, user=user, timeout=timeout)
-    # We pass through both stdout and a non-zero exit hint when the
-    # assertion fails to keep failures self-debugging.
+    if user is None:
+        user = "sandbox"
+    if sock_path is None:
+        sock_path = "/run/sandbox/sandboxd.sock"
+    # `sudo -u <user> env SANDBOX_SOCKET=... sandbox doctor` — the env
+    # wrapper is required because `sudo -u` drops most of the caller's
+    # env unless we replant the socket path explicitly. Mirrors
+    # integration_systemd_unit_smokes.
+    cmd = f"sudo -u {user} env SANDBOX_SOCKET={sock_path} /usr/local/bin/sandbox doctor"
+    r = vm.shell(cmd, timeout=timeout)
     text = r.stdout + r.stderr
     if r.returncode != 0:
         raise AssertionError(
             f"sandbox doctor exited {r.returncode}\n{text}"
         )
+    if "checks passed, 0 failed" not in r.stdout:
+        raise AssertionError(
+            f"sandbox doctor missing 'checks passed, 0 failed' token\n"
+            f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+        )
     return text
+
+
+def assert_full_install_landed(vm):
+    """Shared post-install filesystem-state asserts.
+
+    Covers the observable post-conditions every install path must
+    satisfy regardless of distro: binaries in place + executable, route-
+    helper has the expected file capabilities, systemd unit installed,
+    install-state file present and parseable, sandbox system user
+    created. Lifted into a helper so both the Debian-family and RHEL-
+    family happy-path tests assert the same contract (per § 6.3).
+    """
+    assert vm.shell("test -x /usr/local/bin/sandboxd").returncode == 0, (
+        "sandboxd binary missing or not executable"
+    )
+    assert vm.shell("test -x /usr/local/bin/sandbox").returncode == 0, (
+        "sandbox CLI binary missing or not executable"
+    )
+    assert vm.shell(
+        "test -x /usr/local/libexec/sandboxd/sandbox-route-helper"
+    ).returncode == 0, "route-helper missing or not executable"
+    assert vm.shell(
+        "test -f /etc/systemd/system/sandboxd.service"
+    ).returncode == 0, "systemd unit not installed"
+
+    caps = vm.shell(
+        "getcap /usr/local/libexec/sandboxd/sandbox-route-helper",
+    ).stdout
+    assert "cap_net_admin,cap_sys_admin=eip" in caps, (
+        f"unexpected route-helper caps: {caps!r}"
+    )
+
+    # State file exists and is valid JSON.
+    state_check = vm.shell(
+        "sudo cat /var/lib/sandbox/.install-state.json",
+        check=True, timeout=10,
+    )
+    state = json.loads(state_check.stdout)
+    assert state.get("installed_version"), (
+        f"install-state missing installed_version: {state!r}"
+    )
+    # `jq -e .` is the canonical "this is well-formed" smoke; cross-
+    # check that the same file parses under jq inside the VM (json.loads
+    # above runs on the host).
+    assert vm.shell(
+        "sudo jq -e . /var/lib/sandbox/.install-state.json",
+        timeout=10,
+    ).returncode == 0, "install-state.json not parseable by jq inside the VM"
+
+    # `getent passwd sandbox` returns a row; the daemon runs as this user.
+    r = vm.shell("getent passwd sandbox")
+    assert r.returncode == 0 and r.stdout.strip(), (
+        f"sandbox user missing: {r.stdout!r}"
+    )
+
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Pre-staged cosign binary (air-gapped test).
+# ---------------------------------------------------------------------------
+#
+# The air-gapped test exercises install.sh's `cosign_bootstrap` fallback
+# (which copies /usr/local/bin/cosign into the script's tmpdir after
+# verifying its sha256 against the pinned constant). To exercise that
+# path we pre-stage a cosign binary whose sha256 matches the constant
+# baked into install.sh. The binary is downloaded once per session on
+# the host (before any test goes air-gapped) and cached under
+# tests/install-e2e/dist/cosign-pinned/.
+
+# Mirrors the COSIGN_SHA256_AMD64 / COSIGN_VERSION constants in
+# scripts/install.sh. If install.sh bumps cosign, update these in
+# lockstep — there is no automated drift check (call out in the spec
+# review pass).
+COSIGN_VERSION = "v2.4.1"
+COSIGN_SHA256_AMD64 = (
+    "8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b"
+)
+COSIGN_SHA256_ARM64 = (
+    "3b2e2e3854d0356c45fe6607047526ccd04742d20bd44afb5be91fa2a6e7cb4a"
+)
+
+
+@pytest.fixture(scope="session")
+def pinned_cosign_binary() -> Path:
+    """Return a host-cached cosign binary matching install.sh's pin.
+
+    Downloaded once per session on the host (where network is
+    available) so individual VMs can have egress blocked before the
+    test body runs. The fixture verifies sha256 against the constant
+    install.sh bakes in; a mismatch fails fast rather than letting the
+    in-VM install.sh discover it.
+    """
+    cosign_dir = DIST_DIR / "cosign-pinned"
+    cosign_dir.mkdir(parents=True, exist_ok=True)
+    machine = subprocess.run(
+        ["uname", "-m"], capture_output=True, text=True
+    ).stdout.strip()
+    if machine == "x86_64":
+        cosign_bin = "cosign-linux-amd64"
+        expected_sha = COSIGN_SHA256_AMD64
+    elif machine == "aarch64":
+        cosign_bin = "cosign-linux-arm64"
+        expected_sha = COSIGN_SHA256_ARM64
+    else:
+        pytest.skip(f"no pinned cosign for {machine}")
+    dest = cosign_dir / cosign_bin
+    if not dest.exists() or hashlib.sha256(dest.read_bytes()).hexdigest() != expected_sha:
+        url = (
+            f"https://github.com/sigstore/cosign/releases/download/"
+            f"{COSIGN_VERSION}/{cosign_bin}"
+        )
+        subprocess.run(
+            ["curl", "-fsSL", "-o", str(dest), url],
+            check=True, timeout=300,
+        )
+    actual = hashlib.sha256(dest.read_bytes()).hexdigest()
+    if actual != expected_sha:
+        raise AssertionError(
+            f"cached cosign sha256 mismatch: got {actual} expected {expected_sha}"
+        )
+    return dest

@@ -37,6 +37,7 @@ SCRIPT_NAME="install.sh"
 # ----------------------------------------------------------------------------
 
 VERSION="latest"
+EXPLICIT_VERSION=0
 FROM=""
 COSIGN_BUNDLE=""
 SOURCE_URL="$DEFAULT_SOURCE_URL"
@@ -77,6 +78,8 @@ Install sandboxd from a signed release tarball.
 
 Options:
   --version <semver>        Pin install to the given release tag (default: latest).
+                            Optional when --from is set: the version is read
+                            from the tarball's MANIFEST.
   --from <path>             Use a local tarball instead of downloading.
   --cosign-bundle <path>    Use a local sigstore bundle (requires --from).
   --source-url <url>        Override base URL for tarball download.
@@ -179,10 +182,12 @@ parse_args() {
             --version)
                 [ $# -ge 2 ] || die "--version requires an argument"
                 VERSION="$2"
+                EXPLICIT_VERSION=1
                 shift 2
                 ;;
             --version=*)
                 VERSION="${1#--version=}"
+                EXPLICIT_VERSION=1
                 shift
                 ;;
             --from)
@@ -294,7 +299,25 @@ detect_tty() {
 # ----------------------------------------------------------------------------
 
 resolve_target_version() {
-    if [ "$VERSION" = "latest" ] && [ -z "$FROM" ]; then
+    if [ -n "$FROM" ] && [ "$EXPLICIT_VERSION" -eq 0 ]; then
+        # `--from` with no `--version`: the tarball is the canonical source.
+        # The filename can be tampered with; the MANIFEST is the sigstore-
+        # signed payload, so parse the version directly out of it without
+        # unpacking the whole archive. We read the embedded MANIFEST here
+        # (before sigstore_verify); verify() runs afterwards and asserts
+        # the same tarball+bundle pair, so a tampered MANIFEST would fail
+        # verification and abort the install before any state changes.
+        [ -f "$FROM" ] || die "tarball not found: $FROM"
+        manifest_blob=$(tar -O -xf "$FROM" --wildcards '*/MANIFEST' 2>/dev/null \
+            | head -c 4096)
+        resolved=$(printf '%s' "$manifest_blob" \
+            | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+            | head -n 1)
+        [ -n "$resolved" ] \
+            || die "could not read version from MANIFEST in $FROM"
+        VERSION="$resolved"
+        log_ok "step=resolve_version source=manifest version=$VERSION"
+    elif [ "$VERSION" = "latest" ] && [ -z "$FROM" ]; then
         emit "  resolving latest release tag ..."
         # Strip a leading 'v' from the tag if present.
         resolved=$(curl -fsSL "$LATEST_API_URL" 2>/dev/null \
@@ -555,6 +578,21 @@ tarball_fetch() {
 # ----------------------------------------------------------------------------
 
 sigstore_verify() {
+    # Test-only escape hatch. The Lima E2E harness assembles unsigned
+    # local-build tarballs that have no valid sigstore bundle; the
+    # air-gapped test exercises the rest of the script with this set so
+    # the un-patched cosign_bootstrap + comprehensive egress block are
+    # the actual code under test. THIS ENV VAR MUST NEVER BE SET IN
+    # PRODUCTION — it disables the cryptographic trust root that
+    # protects against tampered tarballs. The variable is documented
+    # here (not in --help / not in installation.md) so a real operator
+    # has no path to discover it; only the in-tree test harness sets it.
+    # Mirrors the route-helper's `test-env-override` Cargo feature
+    # pattern (see sandbox-route-helper/Cargo.toml).
+    if [ "${SANDBOX_INSTALL_SKIP_SIGSTORE:-0}" = "1" ]; then
+        log_warn "step=sigstore_verify action=skip reason=test-env-override"
+        return 0
+    fi
     "$COSIGN" verify-blob \
         --bundle "$TMPDIR_INSTALL/release.tar.gz.sigstore" \
         --certificate-identity-regexp '^https://github\.com/Koriit/sandboxd/\.github/workflows/release\.yml@' \

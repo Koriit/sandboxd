@@ -45,22 +45,41 @@ def test_install_refuses_wrong_arch_tarball(
         new_arch="aarch64-unknown-linux-gnu",
     )
 
-    copy_tarball_to_vm(vm, tampered)
+    tampered_in_vm = copy_tarball_to_vm(vm, tampered)
 
+    # Use install_sh_cmd so --version matches the tarball's top-level
+    # directory name (which encodes the ORIGINAL version, not the
+    # tampered arch). With --version correct, the extract step succeeds
+    # and the MANIFEST arch check is the load-bearing assertion under
+    # test. Previously the test invoked install.sh without --version,
+    # which made VERSION="latest" and tripped a pre-MANIFEST extract
+    # failure ("did not contain expected top-level directory") that
+    # masked the actual arch-mismatch check.
     r = vm.shell(
-        f"sudo bash /tmp/install.sh --from /tmp/{tampered.name} --yes --no-color",
+        install_sh_cmd(tampered_in_vm),
         timeout=300,
     )
     assert r.returncode != 0, (
         f"install.sh accepted a wrong-arch tarball:\n{r.stdout}\n{r.stderr}"
     )
     output = (r.stdout + r.stderr).lower()
-    # The script's extract step compares MANIFEST.arch against the
-    # detected host arch and dies with a "MANIFEST arch mismatch"
-    # message. The tarball top-level directory name also encodes arch,
-    # so a tarball-shape mismatch error is also acceptable.
-    assert ("arch" in output and "mismatch" in output) or "did not contain expected" in output, (
-        f"missing wrong-arch error message:\n{r.stdout}\n{r.stderr}"
+    # ONLY the MANIFEST arch-mismatch path is acceptable. Previously
+    # the test allowed a pre-MANIFEST extract failure too, which let a
+    # regression in MANIFEST.arch validation pass undetected.
+    assert "arch" in output and "mismatch" in output, (
+        f"missing MANIFEST arch-mismatch error:\n{r.stdout}\n{r.stderr}"
+    )
+    # Cross-check against the install log: arch_detect must have run
+    # (so we're past the pre-extract distro/arch sanity steps) and the
+    # extract step must NOT have logged manifest_ok=true.
+    log = vm.shell(
+        "sudo cat /var/log/sandbox-install.log", check=True, timeout=10,
+    ).stdout
+    assert "step=arch_detect" in log, (
+        f"install log missing step=arch_detect (test never reached MANIFEST check):\n{log}"
+    )
+    assert "manifest_ok=true" not in log, (
+        f"install log claims manifest_ok=true on a wrong-arch tarball:\n{log}"
     )
 
 
