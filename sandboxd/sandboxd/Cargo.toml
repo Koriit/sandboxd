@@ -58,6 +58,15 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# `hyper` + `hyper-util` provide an HTTP/1.1 client over the per-test
+# `tokio::net::UnixStream` so `integration_owner_peercred.rs` can drive
+# `POST /sessions` through the real `PeerCredListener` acceptor (mirrors
+# the production `sandbox` CLI's HTTP-over-unix path in
+# `sandbox-cli/src/main.rs`). Other integration tests stay on the
+# `tower::ServiceExt::oneshot` in-process router path that bypasses the
+# socket; the peer-cred test is the only one that needs a real listener.
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 http-body-util = { workspace = true }
 refinery.workspace = true
 rusqlite.workspace = true

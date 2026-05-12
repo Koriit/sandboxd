@@ -1641,6 +1641,8 @@ dependencies = [
  "chrono",
  "clap",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "libc",
  "nix",
  "refinery",

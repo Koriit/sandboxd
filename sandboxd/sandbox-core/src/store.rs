@@ -3886,6 +3886,234 @@ mod tests {
         assert_eq!(bin, "");
     }
 
+    /// V006's substrate-orphan scan emits one `warn!` line per
+    /// orphaned `{base_dir}/sessions/<id>/` directory plus a summary
+    /// `warn!` carrying the total count. The scan fires exactly once,
+    /// on the boot where refinery just applied V006.
+    ///
+    /// Pinned shape:
+    ///   * One `v006_orphan_session_dir` `warn!` per seeded directory,
+    ///     carrying the directory's path in the `path` field.
+    ///   * One `v006_orphan_scan_complete` summary `warn!` with
+    ///     `orphan_count` ≥ the per-directory event count (additional
+    ///     orphans may surface from `limactl`/`docker` when those tools
+    ///     happen to be present and list `sandbox-*` resources on the
+    ///     host; the scan logs and continues either way).
+    ///
+    /// Why the integration prefix on a hermetic test: the host may
+    /// have `limactl`/`docker` installed and may list real `sandbox-*`
+    /// VMs/containers/volumes/networks alongside the seeded fixtures.
+    /// The hermetic default profile would still pass, but running this
+    /// test alongside other tests that create real `sandbox-{id}`
+    /// substrate would yield false positives in the summary count
+    /// assertion. Running under the integration profile gives the
+    /// test access to the `docker-sandbox-namespace` serialization
+    /// group so it does not race those tests.
+    #[test]
+    fn integration_v006_orphan_scan_logs_each_found_orphan() {
+        use std::sync::{Arc, Mutex as StdMutex};
+        use tracing::subscriber::with_default;
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::{Layer, Registry};
+
+        /// Captures every `warn!` event whose `event` field is one of
+        /// the V006-orphan-scan markers, plus its discriminating field
+        /// (`path` for the per-directory event, `orphan_count` for the
+        /// summary). Other tracing events (and tool-unavailable warnings
+        /// emitted when `limactl`/`docker` are missing on the test host)
+        /// are recorded too, so the test can assert *additional* events
+        /// did not fire.
+        #[derive(Clone, Default)]
+        struct EventLog {
+            /// (event_name, path_or_count_as_string)
+            entries: Arc<StdMutex<Vec<(String, String)>>>,
+        }
+
+        struct EventLogLayer(EventLog);
+
+        impl<S> Layer<S> for EventLogLayer
+        where
+            S: tracing::Subscriber,
+        {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Visitor {
+                    event_name: Option<String>,
+                    path: Option<String>,
+                    orphan_count: Option<u64>,
+                }
+                impl tracing::field::Visit for Visitor {
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        match field.name() {
+                            "event" => self.event_name = Some(value.to_string()),
+                            "path" => self.path = Some(value.to_string()),
+                            _ => {}
+                        }
+                    }
+                    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                        if field.name() == "orphan_count" {
+                            self.orphan_count = Some(value);
+                        }
+                    }
+                    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+                        if field.name() == "orphan_count" && value >= 0 {
+                            self.orphan_count = Some(value as u64);
+                        }
+                    }
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        // `path = %p` for `PathBuf`/`Path` may surface
+                        // through `record_debug` depending on the
+                        // formatter; mirror the V004 test's tolerance.
+                        if field.name() == "path" {
+                            self.path = Some(format!("{value:?}").trim_matches('"').to_string());
+                        }
+                    }
+                }
+                let mut v = Visitor {
+                    event_name: None,
+                    path: None,
+                    orphan_count: None,
+                };
+                event.record(&mut v);
+                if let Some(name) = v.event_name {
+                    let detail = match (v.path, v.orphan_count) {
+                        (Some(p), _) => p,
+                        (None, Some(n)) => n.to_string(),
+                        _ => String::new(),
+                    };
+                    self.0.entries.lock().unwrap().push((name, detail));
+                }
+            }
+        }
+
+        let dir = TempDir::new().expect("tempdir");
+        let base_dir = dir.path().to_path_buf();
+        let db_path = base_dir.join("sessions.db");
+
+        // Seed a V005-shape DB with two session rows. V006's
+        // `DELETE FROM sessions` will then wipe both rows, leaving the
+        // session directories we create below as substrate orphans.
+        let seeded_ids = ["aaaaaaaaaaaa", "bbbbbbbbbbbb"];
+        {
+            let mut conn = Connection::open(&db_path).expect("open raw");
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            embedded::migrations::runner()
+                .set_target(refinery::Target::Version(5))
+                .run(&mut conn)
+                .expect("V001..V005");
+
+            let now = Utc::now().to_rfc3339();
+            for sid in seeded_ids {
+                conn.execute(
+                    "INSERT INTO sessions (id, name, state, config, created_at, updated_at, backend)
+                     VALUES (?1, ?2, 'Stopped', '{}', ?3, ?3, 'lima')",
+                    params![sid, sid, now],
+                )
+                .unwrap();
+            }
+        }
+
+        // Materialise the matching per-session directories so the
+        // filesystem scan has substrate to find. The session id is the
+        // directory name (`SessionStore::session_dir`'s shape).
+        for sid in seeded_ids {
+            fs::create_dir_all(base_dir.join("sessions").join(sid)).expect("seed session dir");
+        }
+
+        // Drive the scan via `SessionStore::new` under a scoped tracing
+        // subscriber so the captured events are isolated from any
+        // other tests sharing the default subscriber.
+        let log = EventLog::default();
+        let subscriber = Registry::default().with(EventLogLayer(log.clone()));
+        let (_store, _orphans) = with_default(subscriber, || {
+            SessionStore::new(base_dir.clone()).expect("open at V006")
+        });
+
+        let entries = log.entries.lock().unwrap().clone();
+
+        // (a) A per-directory `v006_orphan_session_dir` warn! must
+        // fire for each seeded directory, carrying the directory path
+        // in the `path` field.
+        let session_dir_events: Vec<&(String, String)> = entries
+            .iter()
+            .filter(|(name, _)| name == "v006_orphan_session_dir")
+            .collect();
+        for sid in seeded_ids {
+            let expected_suffix = std::path::Path::new("sessions")
+                .join(sid)
+                .display()
+                .to_string();
+            assert!(
+                session_dir_events
+                    .iter()
+                    .any(|(_, path)| path.ends_with(&expected_suffix)),
+                "expected a v006_orphan_session_dir warn! whose path ends with {expected_suffix:?}; \
+                 got: {session_dir_events:?}",
+            );
+        }
+        assert!(
+            session_dir_events.len() >= seeded_ids.len(),
+            "expected ≥{} v006_orphan_session_dir events (one per seeded directory); got {}",
+            seeded_ids.len(),
+            session_dir_events.len(),
+        );
+
+        // (b) Exactly one summary `v006_orphan_scan_complete` event,
+        // with `orphan_count` ≥ the number of seeded directories. (The
+        // host may surface additional `sandbox-*` resources from
+        // `limactl`/`docker`; we assert the lower bound rather than
+        // exact equality to stay portable across hosts.)
+        let summary_events: Vec<&(String, String)> = entries
+            .iter()
+            .filter(|(name, _)| name == "v006_orphan_scan_complete")
+            .collect();
+        assert_eq!(
+            summary_events.len(),
+            1,
+            "expected exactly one v006_orphan_scan_complete summary; got {summary_events:?}",
+        );
+        let count: u64 = summary_events[0]
+            .1
+            .parse()
+            .expect("summary orphan_count must parse as u64");
+        assert!(
+            count >= seeded_ids.len() as u64,
+            "summary count ({count}) must be ≥ seeded directory count ({})",
+            seeded_ids.len(),
+        );
+
+        // (c) Single-fire contract: a second open must not re-fire the
+        // scan. Capture again and assert no orphan events surface, even
+        // though the seeded directories still exist on disk.
+        let log2 = EventLog::default();
+        let subscriber2 = Registry::default().with(EventLogLayer(log2.clone()));
+        let (_store2, _orphans2) = with_default(subscriber2, || {
+            SessionStore::new(base_dir.clone()).expect("second open at V006")
+        });
+        let entries2 = log2.entries.lock().unwrap().clone();
+        let second_orphan_events: Vec<&(String, String)> = entries2
+            .iter()
+            .filter(|(name, _)| {
+                name == "v006_orphan_session_dir"
+                    || name == "v006_orphan_scan_complete"
+                    || name == "v006_orphan_lima_vm"
+                    || name == "v006_orphan_docker"
+            })
+            .collect();
+        assert!(
+            second_orphan_events.is_empty(),
+            "V006 orphan scan must be single-fire per migration; \
+             unexpected re-fire on reopen: {second_orphan_events:?}",
+        );
+    }
+
     /// V006 is idempotent across reopens: refinery's
     /// `refinery_schema_history` table makes the migration a no-op on
     /// the second `SessionStore::new`. The destructive DELETE only
