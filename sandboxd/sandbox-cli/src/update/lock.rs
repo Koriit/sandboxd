@@ -32,9 +32,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use nix::errno::Errno;
+use nix::fcntl::FlockArg;
 #[allow(deprecated)]
 use nix::fcntl::flock;
-use nix::fcntl::FlockArg;
 use nix::sys::signal::kill;
 use nix::unistd::Pid;
 
@@ -282,10 +282,7 @@ pub fn acquire(params: AcquireParams<'_>) -> Result<UpdateLock, LockError> {
 
     // Step 4: Write the new payload under the held lock.
     let self_pid = params.self_pid.unwrap_or_else(std::process::id);
-    let started_at = params
-        .started_at
-        .clone()
-        .unwrap_or_else(default_started_at);
+    let started_at = params.started_at.clone().unwrap_or_else(default_started_at);
     let payload = LockPayload {
         pid: self_pid,
         started_at,
@@ -420,11 +417,7 @@ fn compute_stale_hours(iso: &str) -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let then = u64::try_from(parsed.timestamp().max(0)).unwrap_or(0);
-    if now > then {
-        (now - then) / 3600
-    } else {
-        0
-    }
+    if now > then { (now - then) / 3600 } else { 0 }
 }
 
 // ---------------------------------------------------------------------------
@@ -434,8 +427,8 @@ fn compute_stale_hours(iso: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn tmp_lock_path() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -504,9 +497,7 @@ mod tests {
         // `AdoptStale`. We use `chrono::Utc::now()` rather than a
         // hard-coded ISO string so the test does not bit-rot as the
         // wall clock moves.
-        let recent = chrono::Utc::now()
-            .format("%Y-%m-%dT%H:%M:%SZ")
-            .to_string();
+        let recent = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         std::fs::write(
             &path,
             serde_json::to_vec(&LockPayload {
@@ -548,9 +539,7 @@ mod tests {
         // so the AdoptStale branch isn't triggered (the stickiness
         // contract is the same either way, but Adopt is the spec's
         // primary case).
-        let recent = chrono::Utc::now()
-            .format("%Y-%m-%dT%H:%M:%SZ")
-            .to_string();
+        let recent = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         std::fs::write(
             &path,
             serde_json::to_vec(&LockPayload {
