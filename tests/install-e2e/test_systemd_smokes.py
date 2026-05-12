@@ -26,6 +26,7 @@ from conftest import (
     copy_tarball_to_vm,
     install_sh_cmd,
     wait_for_socket,
+    wait_for_systemd_active,
 )
 
 
@@ -62,11 +63,10 @@ def integration_systemd_unit_smokes(
         f"systemctl enable --now sandboxd failed:\n{r.stdout}\n{r.stderr}"
     )
 
-    # 3. Active (running).
-    r = vm.shell("systemctl is-active sandboxd")
-    assert r.stdout.strip() == "active", (
-        f"sandboxd unit state: {r.stdout!r} (expected 'active')"
-    )
+    # 3. Active (running). systemctl enable --now returns once the unit is
+    # enqueued; the daemon may still be in 'activating' when it returns, so
+    # poll until it reaches 'active' (or short-circuit on 'failed').
+    wait_for_systemd_active(vm.name, "sandboxd", timeout=30)
 
     # 4. Socket exists with the expected mode.
     wait_for_socket(vm.name, "/run/sandbox/sandboxd.sock", timeout=30)

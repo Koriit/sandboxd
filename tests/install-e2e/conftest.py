@@ -146,6 +146,49 @@ def wait_for_socket(vm_name, sock_path, *, timeout=SOCKET_WAIT_TIMEOUT):
     )
 
 
+def wait_for_systemd_active(vm_name, unit, *, timeout=30):
+    """Poll ``systemctl is-active <unit>`` until it returns ``active``.
+
+    ``systemctl enable --now`` returns once the unit is *enqueued* — the
+    daemon may still be in the ``activating`` state when the call returns.
+    This helper closes that race by polling until the unit reaches a
+    terminal state. On ``failed`` we short-circuit (no point waiting) and
+    surface a journal dump in the AssertionError to keep failures
+    self-debugging.
+    """
+    deadline = time.monotonic() + timeout
+    last = ""
+    while time.monotonic() < deadline:
+        result = lima_shell(
+            vm_name,
+            f"systemctl is-active {unit}",
+            timeout=10,
+        )
+        last = result.stdout.strip()
+        if last == "active":
+            return
+        if last == "failed":
+            journal = lima_shell(
+                vm_name,
+                f"sudo journalctl -u {unit} -n 50 --no-pager",
+                timeout=15,
+            ).stdout
+            raise AssertionError(
+                f"{unit} entered failed state\n"
+                f"--- journalctl -u {unit} -n 50 ---\n{journal}"
+            )
+        time.sleep(1)
+    journal = lima_shell(
+        vm_name,
+        f"sudo journalctl -u {unit} -n 50 --no-pager",
+        timeout=15,
+    ).stdout
+    raise AssertionError(
+        f"{unit} did not reach active within {timeout}s (last state: {last!r})\n"
+        f"--- journalctl -u {unit} -n 50 ---\n{journal}"
+    )
+
+
 def lima_vm_name(prefix="iet"):
     """A short, unique VM name. Lima caps at 60 chars; keep margin."""
     return f"sb-{prefix}-{uuid.uuid4().hex[:8]}"

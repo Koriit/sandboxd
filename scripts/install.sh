@@ -313,23 +313,34 @@ resolve_target_version() {
 detect_preexisting() {
     if [ -x /usr/local/bin/sandboxd ]; then
         existing_ver=$(/usr/local/bin/sandboxd --version 2>/dev/null | awk '{print $2}')
+        # Fallback: if the binary cannot report its version (e.g. it was built
+        # against a newer glibc than the host, missing shared libs, or any
+        # other run-time failure), consult the install-state file written by
+        # the previous successful install. Without this fallback a broken-but-
+        # present binary masks the version comparison and we incorrectly fall
+        # through to the refuse path on a same-version re-install.
+        if [ -z "$existing_ver" ] && [ -r "$STATE_PATH" ]; then
+            existing_ver=$(sed -n 's/.*"installed_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+                "$STATE_PATH" 2>/dev/null \
+                | head -n 1)
+        fi
         if [ -z "$TARGET_VER" ]; then
             # Couldn't resolve target version yet (e.g. --from path). Trust
             # the local binary's version as the comparison key for skip.
             TARGET_VER="$existing_ver"
         fi
-        if [ "$existing_ver" = "$TARGET_VER" ]; then
+        if [ -n "$existing_ver" ] && [ "$existing_ver" = "$TARGET_VER" ]; then
             log_ok "step=preexist version=$existing_ver action=skip"
             emit "${GREEN}+${RESET} sandboxd $existing_ver is already installed"
             cleanup_tmpdir
             exit 0
         fi
-        emit "${YELLOW}!${RESET} sandboxd $existing_ver is already installed."
+        emit "${YELLOW}!${RESET} sandboxd ${existing_ver:-(unknown)} is already installed."
         emit "  install.sh installs from scratch only."
         emit "  To upgrade or downgrade, run:"
         emit "      sudo sandbox update --version $TARGET_VER"
         emit "  (Not yet available — re-run install.sh once update lands.)"
-        log_warn "step=preexist version=$existing_ver target=$TARGET_VER action=refuse"
+        log_warn "step=preexist version=${existing_ver:-unknown} target=$TARGET_VER action=refuse"
         exit 1
     fi
     log_ok "step=preexist version=none action=continue"
