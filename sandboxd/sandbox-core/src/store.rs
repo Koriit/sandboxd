@@ -90,6 +90,29 @@ impl SessionStore {
         let db_path = base_dir.join("sessions.db");
         let mut conn = Connection::open(&db_path)?;
 
+        // Enforce the on-disk mode for the SQLite file. SQLite's
+        // `Connection::open` does not let callers pass an explicit
+        // mode, so the file is created with whatever permission mask
+        // `open(2)` produces under the process umask — typically
+        // `0644`, which is a security regression on a system service
+        // that holds session secrets. Chmod immediately after the
+        // first successful open so the file is `0600` on every
+        // startup; if the chmod fails, refuse to start. An
+        // unprotected `sessions.db` is the kind of regression that
+        // would otherwise slip through under a forgiving umask.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600)).map_err(
+                |e| {
+                    SandboxError::Internal(format!(
+                        "failed to chmod {} to 0600 (sessions.db must be 0600 to protect \
+                         persisted session secrets): {e}",
+                        db_path.display()
+                    ))
+                },
+            )?;
+        }
+
         // Enable WAL mode for better concurrent read performance.
         conn.pragma_update(None, "journal_mode", "WAL")?;
 

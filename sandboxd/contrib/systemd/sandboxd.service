@@ -1,0 +1,41 @@
+[Unit]
+Description=sandboxd — isolated environment broker
+Documentation=https://github.com/kontaktio/sandbox-daemon
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=sandbox
+Group=sandbox
+
+# State and runtime dirs are auto-created with correct ownership/modes.
+# systemd will mkdir /var/lib/sandbox and /run/sandbox if they do not
+# exist, and chown sandbox:sandbox + chmod 0750 on each.
+StateDirectory=sandbox
+StateDirectoryMode=0750
+RuntimeDirectory=sandbox
+RuntimeDirectoryMode=0750
+
+# Operators customize via `systemctl edit sandboxd` (drop-in override),
+# not by editing this file. See § 4.3.
+ExecStart=/usr/local/bin/sandboxd \
+    --base-dir /var/lib/sandbox \
+    --socket /run/sandbox/sandboxd.sock
+
+# Restart policy: any crash bounces; stop bouncing if it crashes >5 times
+# in 5 minutes (likely a config problem that won't fix itself).
+Restart=on-failure
+RestartSec=5s
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Hardening — each directive has a one-line rationale in § 4.2.
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+DeviceAllow=/dev/kvm rw
+
+[Install]
+WantedBy=multi-user.target

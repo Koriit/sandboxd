@@ -16,7 +16,9 @@
 
 use std::process::Command;
 
-use sandbox_core::gateway::{GATEWAY_IMAGE, GatewayManager, GatewayStatus, container_name};
+use sandbox_core::gateway::{
+    GatewayManager, GatewayStatus, container_name, gateway_image_tag_for_version,
+};
 use sandbox_core::network::NetworkManager;
 use sandbox_core::session::SessionId;
 use sandbox_core::{
@@ -196,7 +198,7 @@ fn integration_gateway_nftables_injection_standalone() {
             "net.ipv4.ip_forward=1",
             "--entrypoint",
             "sleep",
-            GATEWAY_IMAGE,
+            &gateway_image_tag_for_version(env!("CARGO_PKG_VERSION")),
             "300",
         ])
         .output()

@@ -123,6 +123,119 @@ fn default_base_dir() -> String {
     format!("{home}/.local/share/sandboxd")
 }
 
+/// State-dir subdirectories whose mode the daemon enforces on every
+/// startup. Each is created with mode `0700` if absent; an existing
+/// directory with a different mode is corrected in place with a
+/// `warn!` line; an existing path that is not a directory is fatal.
+///
+/// The set is small and stable; carry it as a `&[&str]` so a future
+/// caller can introspect or iterate without re-importing the list.
+const BASE_DIR_SUBDIRS: &[&str] = &["sessions", "events", "backups"];
+
+/// The numeric mode every per-daemon state-dir subdirectory must
+/// carry. `0700` matches the daemon-uid-only access expectation
+/// recorded in the daemon-productionization spec § 5.1: the daemon
+/// reads and writes its own state; no other uid has any business
+/// there.
+const BASE_DIR_SUBDIR_MODE: u32 = 0o700;
+
+/// Enforce the base-dir layout invariants on every startup.
+///
+/// Called once from `main`, immediately after the daemon has ensured
+/// the base-dir itself exists and before any code path opens
+/// `sessions.db`. The function is synchronous and CPU-cheap (three
+/// `stat` calls in the happy path), so it does not need a
+/// `spawn_blocking` wrapper.
+///
+/// Behavior per subdir:
+///
+/// 1. Missing → create with mode [`BASE_DIR_SUBDIR_MODE`].
+/// 2. Present with a different mode → log `warn!`, then chmod in
+///    place. Continue startup.
+/// 3. Present with the correct mode → no-op.
+/// 4. Path exists but is **not** a directory → log `error!` and
+///    return `SandboxError::Internal`. The daemon refuses to start
+///    so a misconfigured filesystem can't be papered over.
+/// 5. Chmod (or create) fails → propagate the `io::Error` through
+///    `SandboxError::Io`; the daemon refuses to start.
+fn ensure_base_dir_layout(base_dir: &std::path::Path) -> Result<(), SandboxError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    for sub in BASE_DIR_SUBDIRS {
+        let path = base_dir.join(sub);
+        match std::fs::metadata(&path) {
+            Ok(md) if md.is_dir() => {
+                let mode = md.permissions().mode() & 0o777;
+                if mode != BASE_DIR_SUBDIR_MODE {
+                    warn!(
+                        path = %path.display(),
+                        current = format!("{mode:o}"),
+                        expected = format!("{BASE_DIR_SUBDIR_MODE:o}"),
+                        "subdir mode is not 0700; correcting"
+                    );
+                    let mut perms = md.permissions();
+                    perms.set_mode(BASE_DIR_SUBDIR_MODE);
+                    std::fs::set_permissions(&path, perms).map_err(|e| {
+                        error!(
+                            path = %path.display(),
+                            error = %e,
+                            "failed to chmod subdir to 0700; refusing to start"
+                        );
+                        SandboxError::Io(e)
+                    })?;
+                }
+            }
+            Ok(_) => {
+                error!(
+                    path = %path.display(),
+                    "expected a directory but found a non-directory; refusing to start"
+                );
+                return Err(SandboxError::Internal(format!(
+                    "{} exists but is not a directory",
+                    path.display()
+                )));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&path).map_err(|e| {
+                    error!(
+                        path = %path.display(),
+                        error = %e,
+                        "failed to create subdir; refusing to start"
+                    );
+                    SandboxError::Io(e)
+                })?;
+                std::fs::set_permissions(
+                    &path,
+                    std::fs::Permissions::from_mode(BASE_DIR_SUBDIR_MODE),
+                )
+                .map_err(|e| {
+                    error!(
+                        path = %path.display(),
+                        error = %e,
+                        "failed to set initial mode on subdir; refusing to start"
+                    );
+                    SandboxError::Io(e)
+                })?;
+            }
+            Err(e) => {
+                error!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to stat subdir; refusing to start"
+                );
+                return Err(SandboxError::Io(e));
+            }
+        }
+    }
+    Ok(())
+}
+
+// Image-presence probe and the operator-facing missing-image hint
+// live in `sandbox-core::gateway` so the integration test suite (which
+// imports from sandbox-core, not the daemon binary) can pin the same
+// byte sequence the daemon emits.
+use sandbox_core::gateway::{gateway_image_present, missing_gateway_image_hint};
+
 // ---------------------------------------------------------------------------
 // users.conf startup validation
 // ---------------------------------------------------------------------------
@@ -1075,6 +1188,40 @@ async fn create_session(
     Extension(operator): Extension<OperatorIdentity>,
     Json(req): Json<CreateSessionRequest>,
 ) -> impl IntoResponse {
+    // Pre-flight: refuse the request when the daemon-version-tagged
+    // gateway image is not loaded on the host. Both backends spin up
+    // a per-session gateway container; without the image, every
+    // downstream path (Lima or container) would fail several hundred
+    // lines later inside `GatewayManager::create_gateway` with a
+    // less informative `docker run` stderr. The early bail produces
+    // the operator-visible hint that points at `sandbox update`. The
+    // check is cheap (one `docker image inspect`) and is run per
+    // request so a post-startup image load is picked up without
+    // bouncing the daemon.
+    let gateway_tag =
+        sandbox_core::gateway::gateway_image_tag_for_version(env!("CARGO_PKG_VERSION"));
+    let gateway_tag_for_check = gateway_tag.clone();
+    let present_result =
+        tokio::task::spawn_blocking(move || gateway_image_present(&gateway_tag_for_check)).await;
+    match present_result {
+        Ok(Ok(true)) => { /* image present — proceed */ }
+        Ok(Ok(false)) => {
+            return error_response(SandboxError::Gateway(missing_gateway_image_hint(
+                &gateway_tag,
+            )))
+            .into_response();
+        }
+        Ok(Err(e)) => {
+            return error_response(e).into_response();
+        }
+        Err(join_err) => {
+            return error_response(SandboxError::Internal(format!(
+                "gateway image inspect task panicked: {join_err}"
+            )))
+            .into_response();
+        }
+    }
+
     // Determine workspace mode from the request: the `workspace` field
     // takes precedence; fall back to `repo` for backward compatibility.
     let workspace_mode = if let Some(ref ws) = req.workspace {
@@ -6550,6 +6697,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create the base directory if it doesn't exist.
     tokio::fs::create_dir_all(&base_dir).await?;
 
+    // Enforce the base-dir subdir layout invariants (mode 0700 on
+    // `sessions/`, `events/`, `backups/`) before any code path opens
+    // a database, registers a gateway image, or migrates the schema.
+    // Running this synchronously is cheap (three stat calls in the
+    // happy path) and keeps the operator-visible failure surface
+    // tight: if the chmod fails because the operator left a stale
+    // root-owned subdir behind, the daemon refuses to start with a
+    // clear error before anything downstream is touched.
+    {
+        let base_dir = base_dir.clone();
+        tokio::task::spawn_blocking(move || ensure_base_dir_layout(&base_dir))
+            .await
+            .map_err(|e| SandboxError::Internal(format!("base-dir layout task panicked: {e}")))??;
+    }
+
+    // Gateway-image presence check. The daemon does NOT refuse to
+    // start when the image is missing; refusing would block the
+    // diagnostic surface (the operator's first instinct on a broken
+    // install is to run `sandbox doctor` against the daemon, and we
+    // want that to succeed and report the missing image). Instead we
+    // log a clear `error!` line here so journald surfaces it
+    // immediately, and `create_session` returns
+    // `SandboxError::Gateway` with the same hint so the failure
+    // surface is consistent.
+    let gateway_image_tag =
+        sandbox_core::gateway::gateway_image_tag_for_version(env!("CARGO_PKG_VERSION"));
+    {
+        let tag = gateway_image_tag.clone();
+        let present = tokio::task::spawn_blocking(move || gateway_image_present(&tag))
+            .await
+            .map_err(|e| {
+                SandboxError::Internal(format!("gateway image inspect task panicked: {e}"))
+            })?;
+        match present {
+            Ok(true) => {
+                info!(tag = %gateway_image_tag, "gateway image present");
+            }
+            Ok(false) => {
+                error!(
+                    tag = %gateway_image_tag,
+                    hint = %missing_gateway_image_hint(&gateway_image_tag),
+                    "gateway image missing; daemon continues to start so 'sandbox doctor' can report it, but session-create will be refused"
+                );
+            }
+            Err(e) => {
+                // Could not invoke `docker image inspect` at all
+                // (docker daemon unreachable, binary missing). Surface
+                // the same way as "missing" — refusing to start here
+                // would defeat the doctor-first contract above.
+                error!(
+                    tag = %gateway_image_tag,
+                    error = %e,
+                    "could not verify gateway image presence; daemon continues to start"
+                );
+            }
+        }
+    }
+
     // Create the socket directory if it doesn't exist.
     if let Some(parent) = socket_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -8446,6 +8651,202 @@ mod tests {
         assert!(
             msg.contains("lima") && msg.contains("container"),
             "error should list the valid backends; got: {msg}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ensure_base_dir_layout — startup state-dir mode enforcement.
+    //
+    // The function is synchronous and operates on `std::fs::*` only;
+    // we drive it against a tempdir per test so no two cases share
+    // filesystem state. The four cases pin the four behaviors
+    // documented in the daemon-productionization spec § 5.4:
+    //   1. missing subdir → created at mode 0700
+    //   2. wrong mode → corrected in place
+    //   3. correct mode → no-op
+    //   4. subdir is a regular file → SandboxError::Internal, refuse start
+    // -----------------------------------------------------------------------
+
+    /// All three subdirs (`sessions/`, `events/`, `backups/`) are
+    /// created with mode `0700` when the base directory is empty.
+    /// Pins the "fresh install" path: the daemon's first start
+    /// produces a layout that matches what the doctor's C10 check
+    /// expects, with no operator intervention.
+    #[test]
+    fn ensure_base_dir_layout_creates_missing_subdirs() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        ensure_base_dir_layout(tmp.path()).expect("first-run layout must succeed");
+
+        for sub in BASE_DIR_SUBDIRS {
+            let path = tmp.path().join(sub);
+            let md = std::fs::metadata(&path)
+                .unwrap_or_else(|e| panic!("expected {} to exist: {e}", path.display()));
+            assert!(md.is_dir(), "{} must be a directory", path.display());
+            let mode = md.permissions().mode() & 0o777;
+            assert_eq!(
+                mode,
+                BASE_DIR_SUBDIR_MODE,
+                "{} was created with mode {mode:o}, expected {expected:o}",
+                path.display(),
+                expected = BASE_DIR_SUBDIR_MODE
+            );
+        }
+    }
+
+    /// A pre-existing subdir with a non-`0700` mode is corrected in
+    /// place. The recovery path: an operator who created the dir
+    /// manually with `mkdir` (default mode `0755` under umask 022)
+    /// shouldn't be forced to chmod every dir by hand on the first
+    /// daemon start. The `warn!` line is the operator-visible
+    /// signal that the correction happened.
+    #[test]
+    fn ensure_base_dir_layout_corrects_wrong_mode_with_warn() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir(&sessions).expect("create sessions");
+        std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o755))
+            .expect("seed mode 0755");
+
+        // Sanity: the precondition is what we expect before the call.
+        let pre = std::fs::metadata(&sessions)
+            .expect("metadata pre")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            pre, 0o755,
+            "test setup must seed sessions/ at 0755; got {pre:o}"
+        );
+
+        ensure_base_dir_layout(tmp.path()).expect("correction path must not error");
+
+        let post = std::fs::metadata(&sessions)
+            .expect("metadata post")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            post, BASE_DIR_SUBDIR_MODE,
+            "sessions/ mode must be corrected to 0700; got {post:o}"
+        );
+
+        // The other two subdirs are created fresh in the same call,
+        // also at 0700.
+        for sub in &["events", "backups"] {
+            let path = tmp.path().join(sub);
+            let mode = std::fs::metadata(&path)
+                .expect("metadata other")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode,
+                BASE_DIR_SUBDIR_MODE,
+                "{} must be created at 0700; got {mode:o}",
+                path.display()
+            );
+        }
+    }
+
+    /// When every subdir already exists at the correct mode the
+    /// function is a no-op — no chmod, no recreate, no `warn!`. Pins
+    /// the steady-state behavior on subsequent daemon starts.
+    #[test]
+    fn ensure_base_dir_layout_noop_when_modes_correct() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        for sub in BASE_DIR_SUBDIRS {
+            let path = tmp.path().join(sub);
+            std::fs::create_dir(&path).unwrap_or_else(|e| panic!("create {sub}: {e}"));
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(BASE_DIR_SUBDIR_MODE))
+                .unwrap_or_else(|e| panic!("chmod {sub}: {e}"));
+        }
+
+        // Snapshot mtimes before the call so we can detect any
+        // unintended write-through (chmod or recreate would bump
+        // ctime; recreation would also reset mtime).
+        let mtimes_before: Vec<_> = BASE_DIR_SUBDIRS
+            .iter()
+            .map(|sub| {
+                std::fs::metadata(tmp.path().join(sub))
+                    .expect("metadata pre")
+                    .modified()
+                    .expect("mtime pre")
+            })
+            .collect();
+
+        ensure_base_dir_layout(tmp.path()).expect("steady-state path must succeed");
+
+        for (sub, mtime_pre) in BASE_DIR_SUBDIRS.iter().zip(mtimes_before.iter()) {
+            let md = std::fs::metadata(tmp.path().join(sub)).expect("metadata post");
+            let mode = md.permissions().mode() & 0o777;
+            assert_eq!(
+                mode, BASE_DIR_SUBDIR_MODE,
+                "{sub} mode must remain 0700; got {mode:o}"
+            );
+            let mtime_post = md.modified().expect("mtime post");
+            assert_eq!(
+                &mtime_post, mtime_pre,
+                "{sub} mtime must not change under the no-op path"
+            );
+        }
+    }
+
+    /// A non-directory at the subdir path is fatal: refuse to start.
+    /// The daemon won't silently rename or unlink the offending file;
+    /// the operator has to resolve the conflict explicitly.
+    #[test]
+    fn ensure_base_dir_layout_errors_when_subdir_is_a_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sessions = tmp.path().join("sessions");
+        std::fs::write(&sessions, b"not a dir").expect("seed file");
+
+        let err = ensure_base_dir_layout(tmp.path())
+            .expect_err("non-directory subdir must produce SandboxError");
+        match err {
+            SandboxError::Internal(msg) => {
+                assert!(
+                    msg.contains("sessions") && msg.contains("not a directory"),
+                    "error must name the path and the failure reason; got: {msg}"
+                );
+            }
+            other => panic!("expected SandboxError::Internal, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // gateway image tag pinning — pin the symmetry between the
+    // gateway and lite image tag helpers, so any future drift of the
+    // tag format is caught at compile/test time.
+    // -----------------------------------------------------------------------
+
+    /// `gateway_image_tag_for_version` produces
+    /// `sandbox-gateway:<version>` for an arbitrary version string —
+    /// no leading-colon edge cases, no stray slashes. Mirrors
+    /// `daemon_lite_image_tag_matches_ensure_image_for_same_version`
+    /// for the gateway image side of the same pinning rule.
+    #[test]
+    fn gateway_image_tag_for_version_matches_repository_colon_version_shape() {
+        let tag = sandbox_core::gateway::gateway_image_tag_for_version("1.2.3");
+        assert_eq!(tag, "sandbox-gateway:1.2.3");
+    }
+
+    /// Production daemon must never compose the `:latest` reference.
+    /// `CARGO_PKG_VERSION` is non-empty by definition (cargo enforces
+    /// a semver string in `Cargo.toml`), so the tag always has a
+    /// non-trivial right-hand side.
+    #[test]
+    fn gateway_image_tag_for_daemon_version_is_not_latest() {
+        let tag = sandbox_core::gateway::gateway_image_tag_for_version(env!("CARGO_PKG_VERSION"));
+        assert_ne!(tag, "sandbox-gateway:latest");
+        assert!(
+            tag.starts_with("sandbox-gateway:"),
+            "tag must use the canonical repository prefix; got: {tag}"
         );
     }
 

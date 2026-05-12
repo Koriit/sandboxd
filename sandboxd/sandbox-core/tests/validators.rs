@@ -44,6 +44,7 @@
 use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use sandbox_core::gateway::gateway_image_tag_for_version;
 use sandbox_core::network::NetworkInfo;
 use sandbox_core::policy::SCHEMA_VERSION;
 use sandbox_core::{
@@ -51,8 +52,6 @@ use sandbox_core::{
     LISTENER_DIR_IN_CONTAINER, LISTENER_FILE_IN_CONTAINER, Policy, PolicyCompiler, PolicyRule,
     Protocol, ResolvedMapping, ResolvedReport, generate_domain_ip_rules,
 };
-
-const GATEWAY_IMAGE: &str = "sandbox-gateway";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -171,7 +170,7 @@ impl TestContainer {
                 "--cap-add=NET_ADMIN",
                 "--entrypoint",
                 "sleep",
-                GATEWAY_IMAGE,
+                &gateway_image_tag_for_version(env!("CARGO_PKG_VERSION")),
                 "infinity",
             ])
             .output()

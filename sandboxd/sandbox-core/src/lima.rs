@@ -153,8 +153,6 @@ const QEMU_WRAPPER_SCRIPT: &str = r#"#!/bin/sh
 #
 # When SANDBOX_DOCKER_BRIDGE is set:
 # 2. Adds a second NIC connected to the Docker bridge via qemu-bridge-helper.
-#    For rootless Docker the bridge lives inside rootlesskit's network
-#    namespace, so a wrapper helper runs qemu-bridge-helper via nsenter.
 #
 # When SANDBOX_QEMU_HARDENED=1:
 # 3. Disables unnecessary devices (USB, sound, display, floppy, HPET, etc.)
@@ -192,33 +190,12 @@ EXTRA_ARGS="-device pcie-root-port,id=pcie-hotplug-port,bus=pcie.0,chassis=1"
 
 # Bridge networking: if SANDBOX_DOCKER_BRIDGE is set, add a second NIC
 # connected to the Docker bridge via qemu-bridge-helper.
+# QEMU resolves the helper via its compile-time libexecdir default
+# (different on Ubuntu/Debian (/usr/lib/qemu/) vs RHEL/Fedora
+# (/usr/libexec/)); sandboxd does not pin the path.
 if [ -n "$SANDBOX_DOCKER_BRIDGE" ]; then
-    BRIDGE_HELPER="${SANDBOX_BRIDGE_HELPER:-/usr/lib/qemu/qemu-bridge-helper}"
-
-    # Rootless Docker: the bridge lives inside rootlesskit's network+user
-    # namespace.  QEMU stays on the host (so Lima SSH port-forwarding works),
-    # but qemu-bridge-helper must run inside the namespace to find the bridge
-    # and create the TAP device there.  The TAP fd is passed back over a unix
-    # socket, which works across namespace boundaries.
-    CHILD_PID_FILE="/run/user/$(id -u)/dockerd-rootless/child_pid"
-    if [ -f "$CHILD_PID_FILE" ]; then
-        RLKIT_PID="$(cat "$CHILD_PID_FILE")"
-        if [ -n "$RLKIT_PID" ] && [ -d "/proc/$RLKIT_PID" ]; then
-            # Create a small wrapper script that nsenter's the helper
-            NSHELPER="$SCRIPT_DIR/bridge-helper-ns"
-            cat > "$NSHELPER" <<'HELPEREOF'
-#!/bin/sh
-exec nsenter --preserve-credentials -U -n -t "$SANDBOX_RLKIT_PID" -- "$SANDBOX_REAL_BRIDGE_HELPER" "$@"
-HELPEREOF
-            chmod +x "$NSHELPER"
-            export SANDBOX_RLKIT_PID="$RLKIT_PID"
-            export SANDBOX_REAL_BRIDGE_HELPER="$BRIDGE_HELPER"
-            BRIDGE_HELPER="$NSHELPER"
-        fi
-    fi
-
     EXTRA_ARGS="$EXTRA_ARGS \
-        -netdev bridge,id=net_sandbox,br=$SANDBOX_DOCKER_BRIDGE,helper=$BRIDGE_HELPER \
+        -netdev bridge,id=net_sandbox,br=$SANDBOX_DOCKER_BRIDGE \
         -device virtio-net-pci,netdev=net_sandbox,mac=$SANDBOX_VM_MAC,bus=pcie-hotplug-port"
 fi
 
@@ -1705,6 +1682,17 @@ provision:
         Ok(wrapper_path)
     }
 
+    /// Test-only escape hatch: write the QEMU wrapper script to disk
+    /// under the manager's `base_dir/libexec/` and return its path.
+    /// Used by the workspace's integration tests to drive the wrapper
+    /// against a stub QEMU and capture its composed argv. Production
+    /// callers go through [`LimaManager::start_vm`], which invokes
+    /// the private [`Self::ensure_qemu_wrapper`] internally.
+    #[doc(hidden)]
+    pub fn ensure_qemu_wrapper_for_test(&self) -> Result<PathBuf, SandboxError> {
+        self.ensure_qemu_wrapper()
+    }
+
     fn session_dir(&self, session_id: &SessionId) -> PathBuf {
         self.base_dir.join("sessions").join(session_id.as_str())
     }
@@ -2847,6 +2835,92 @@ mod tests {
         assert!(
             QEMU_WRAPPER_SCRIPT.contains("TasksMax=256"),
             "wrapper must set TasksMax cgroup limit"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Regression: `helper=` and rootless-Docker removal.
+    //
+    // QEMU's `-netdev bridge,...` accepts an optional `helper=<path>`;
+    // when omitted, QEMU resolves the helper via its compile-time
+    // `libexecdir` (different on Ubuntu/Debian vs RHEL/Fedora).
+    // Sandboxd no longer pins the helper path nor carries a
+    // rootless-Docker code path; the tests below pin the post-removal
+    // shape so a future contributor cannot silently reintroduce the
+    // hardcoded path or the rootless wrapper.
+    //
+    // Spec reference: daemon-productionization §§ 9.1-9.3 + § 11.5.
+    // ---------------------------------------------------------------
+
+    /// The `-netdev bridge,…` line emits no `helper=` parameter. The
+    /// surrounding substring (`br=$SANDBOX_DOCKER_BRIDGE \\\n`) is
+    /// load-bearing: it terminates the netdev token without a comma,
+    /// proving no `,helper=` follows.
+    #[test]
+    fn qemu_wrapper_emits_netdev_without_helper_param() {
+        assert!(
+            QEMU_WRAPPER_SCRIPT
+                .contains("-netdev bridge,id=net_sandbox,br=$SANDBOX_DOCKER_BRIDGE \\\n"),
+            "wrapper must emit `-netdev bridge,id=net_sandbox,br=$SANDBOX_DOCKER_BRIDGE \\` \
+             with NO `,helper=` segment; full script:\n{QEMU_WRAPPER_SCRIPT}"
+        );
+        assert!(
+            !QEMU_WRAPPER_SCRIPT.contains(",helper="),
+            "wrapper must NOT carry a `,helper=` segment anywhere (QEMU resolves the helper via \
+             its compile-time libexecdir); full script:\n{QEMU_WRAPPER_SCRIPT}"
+        );
+    }
+
+    /// The `BRIDGE_HELPER` shell variable is gone — both the
+    /// assignment site (`BRIDGE_HELPER=…`) and any later
+    /// dereference. Anchored on the assignment-form token so a stray
+    /// comment containing the word "helper" does not flag a false
+    /// positive.
+    #[test]
+    fn qemu_wrapper_has_no_bridge_helper_variable() {
+        assert!(
+            !QEMU_WRAPPER_SCRIPT.contains("BRIDGE_HELPER="),
+            "wrapper must NOT carry a `BRIDGE_HELPER=` shell variable; full script:\n\
+             {QEMU_WRAPPER_SCRIPT}"
+        );
+    }
+
+    /// None of the rootless-Docker artefacts that the previous
+    /// rootless branch introduced may survive in the wrapper. Each
+    /// token is named explicitly so the failure pinpoints which
+    /// artefact slipped back in.
+    #[test]
+    fn qemu_wrapper_has_no_rootlesskit_artefacts() {
+        for token in [
+            "dockerd-rootless",
+            "rootlesskit",
+            "nsenter",
+            "RLKIT_PID",
+            "NSHELPER",
+            "bridge-helper-ns",
+            "SANDBOX_REAL_BRIDGE_HELPER",
+        ] {
+            assert!(
+                !QEMU_WRAPPER_SCRIPT.contains(token),
+                "wrapper must NOT carry rootless-Docker artefact `{token}`; \
+                 full script:\n{QEMU_WRAPPER_SCRIPT}"
+            );
+        }
+    }
+
+    /// The literal string `qemu-bridge-helper` is still present —
+    /// the surviving comments in the bridge-networking block and the
+    /// `PR_SET_NO_NEW_PRIVS` block reference it by name. Pinning this
+    /// keeps the existing `test_qemu_wrapper_includes_bridge_networking`
+    /// assertion green and forecloses an over-zealous future edit
+    /// that strips even the descriptive comment.
+    #[test]
+    fn qemu_wrapper_still_references_qemu_bridge_helper_in_comments() {
+        assert!(
+            QEMU_WRAPPER_SCRIPT.contains("qemu-bridge-helper"),
+            "wrapper must keep the descriptive `qemu-bridge-helper` references \
+             in its comments so operators can grep for the integration; \
+             full script:\n{QEMU_WRAPPER_SCRIPT}"
         );
     }
 

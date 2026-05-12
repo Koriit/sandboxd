@@ -123,8 +123,65 @@ impl DockerHealth {
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Docker image name for the gateway container.
-pub const GATEWAY_IMAGE: &str = "sandbox-gateway";
+/// Docker image **repository** (no tag) for the gateway container.
+/// The full reference threaded into `docker run` is composed by
+/// [`gateway_image_tag_for_version`] using the daemon's compile-time
+/// `CARGO_PKG_VERSION` so production session-create never resolves
+/// the bare repository name as `:latest` — the daemon-productionization
+/// spec § 8.1 forbids unpinned references.
+pub const GATEWAY_IMAGE_REPOSITORY: &str = "sandbox-gateway";
+
+/// Compose the full `sandbox-gateway:<daemon_version>` image tag from a
+/// daemon version string. Mirrors `lite_image_tag_for_version` so the
+/// two image lifecycles use the same composition pattern; the daemon
+/// passes `env!("CARGO_PKG_VERSION")` at every call site so the gateway
+/// tag matches the daemon's compile-time version exactly.
+pub fn gateway_image_tag_for_version(daemon_version: &str) -> String {
+    format!("{GATEWAY_IMAGE_REPOSITORY}:{daemon_version}")
+}
+
+/// Probe whether the daemon-version-tagged gateway image is loaded on
+/// the host. Returns `Ok(true)` when `docker image inspect <tag>`
+/// exits 0, `Ok(false)` when the inspect fails with the well-known
+/// docker-cli idiom for an absent tag (`no such image` / `no such
+/// object` in stderr), and `Err(SandboxError::Gateway(_))` when
+/// docker itself cannot be invoked or fails for some other reason.
+///
+/// The synchronous shape is deliberate so the daemon's startup path
+/// and `create_session` pre-flight can `spawn_blocking` it on their
+/// own terms; both call sites cost one `docker image inspect` and
+/// neither needs to be cancellable.
+pub fn gateway_image_present(tag: &str) -> Result<bool, SandboxError> {
+    let output = std::process::Command::new("docker")
+        .args(["image", "inspect", tag])
+        .output()
+        .map_err(|e| SandboxError::Gateway(format!("failed to spawn docker image inspect: {e}")))?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    let stderr_lower = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    if stderr_lower.contains("no such image") || stderr_lower.contains("no such object") {
+        return Ok(false);
+    }
+    Err(SandboxError::Gateway(format!(
+        "docker image inspect {tag} failed unexpectedly: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
+}
+
+/// Render the operator-facing hint for a missing gateway image. Pulled
+/// out as a function so the same byte sequence is emitted by the
+/// daemon's startup `error!` log and by the `SandboxError::Gateway`
+/// that session-create returns; integration tests pin the substring
+/// once. Substring contract: the rendered string contains
+/// `sandbox update` (the operator's primary remediation) and names
+/// the missing tag.
+pub fn missing_gateway_image_hint(tag: &str) -> String {
+    format!(
+        "gateway image missing: {tag} — run 'sandbox update' to load (Spec 5), \
+         or 'docker load < gateway-image.tar' for the manual path"
+    )
+}
 
 /// Maximum time to wait for individual component readiness.
 const COMPONENT_READY_TIMEOUT: Duration = Duration::from_secs(45);
@@ -486,7 +543,7 @@ impl GatewayManager {
             "unless-stopped".to_string(),
             "--label".to_string(),
             format!("sandbox.session_id={session_id}"),
-            GATEWAY_IMAGE.to_string(),
+            gateway_image_tag_for_version(env!("CARGO_PKG_VERSION")),
         ]);
 
         let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();

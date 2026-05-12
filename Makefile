@@ -136,8 +136,16 @@ test-e2e: test-e2e-matrix
 # can `COPY sandboxd/` into its builder. `.dockerignore` at the repo root
 # keeps `sandboxd/target/` and other heavy directories out of the context
 # upload.
+# The gateway image is tagged with the workspace's `sandbox-core`
+# package version so the daemon's `CARGO_PKG_VERSION` (used at runtime
+# to compose `sandbox-gateway:<version>`) and the image actually built
+# here agree byte-for-byte. The daemon refuses to compose
+# `sandbox-gateway:latest`; pinning here is what makes
+# `make gateway-image && sandbox session create` work end-to-end.
+GATEWAY_VERSION := $(shell awk -F'"' '/^version/ { print $$2; exit }' sandboxd/sandbox-core/Cargo.toml)
+
 gateway-image:
-	docker build -t sandbox-gateway -f networking/gateway/Dockerfile .
+	docker build -t sandbox-gateway:$(GATEWAY_VERSION) -f networking/gateway/Dockerfile .
 
 # Build the lite-mode container image as `sandboxd-lite:<workspace-version>`,
 # matching the `<repository>:<daemon-version>` tag scheme that
