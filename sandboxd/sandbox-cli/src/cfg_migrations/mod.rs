@@ -121,6 +121,11 @@ pub trait ConfigMigration: Sync {
     fn target_file(&self) -> TargetFile;
     /// `from_version` it expects to read. Used by the apply loop to
     /// pick the next pending migration; also documents intent.
+    ///
+    /// The `from_` prefix is a schema-version qualifier (paired with
+    /// `to_version`) — not a Rust "constructor from X" convention —
+    /// so clippy's wrong-self-convention check is suppressed here.
+    #[allow(clippy::wrong_self_convention)]
     fn from_version(&self) -> u32;
     /// `to_version` it produces. After apply, the file's
     /// `_schema_version` (or header marker) reads this value.
@@ -150,11 +155,7 @@ pub fn registry() -> &'static [&'static dyn ConfigMigration] {
 /// confirmation prompt. The `apply_pending` loop in § 4.3 does NOT
 /// call this; it uses `find()` on the registry directly for sequential
 /// one-step-at-a-time application.
-pub fn pending(
-    file: TargetFile,
-    current: u32,
-    target: u32,
-) -> Vec<&'static dyn ConfigMigration> {
+pub fn pending(file: TargetFile, current: u32, target: u32) -> Vec<&'static dyn ConfigMigration> {
     registry()
         .iter()
         .copied()
@@ -222,8 +223,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), MigrationError> {
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
-    tmp.persist(path)
-        .map_err(|e| MigrationError::Io(e.error))?;
+    tmp.persist(path).map_err(|e| MigrationError::Io(e.error))?;
     Ok(())
 }
 
@@ -461,7 +461,9 @@ mod tests {
     where
         F: FnOnce(),
     {
-        let _ser = test_registry_serializer().lock().unwrap_or_else(|e| e.into_inner());
+        let _ser = test_registry_serializer()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let slot = test_registry_slot();
         {
             let mut g = slot.lock().unwrap();
@@ -542,8 +544,10 @@ mod tests {
         static REG: &[&dyn ConfigMigration] = &[&StubV001Then1, &StubV002Then2];
         let mut applied_result: Option<Result<Vec<u32>, MigrationError>> = None;
         with_test_registry(REG, || {
-            applied_result =
-                Some(apply_pending_at_with_test_registry(TargetFile::UsersConf, &path));
+            applied_result = Some(apply_pending_at_with_test_registry(
+                TargetFile::UsersConf,
+                &path,
+            ));
         });
         let applied = applied_result.unwrap().expect("walk succeeds");
         assert_eq!(applied, vec![101, 102], "walked V101 then V102");
@@ -566,10 +570,16 @@ mod tests {
         static REG: &[&dyn ConfigMigration] = &[&StubV001Then1, &StubV002Then2];
         let mut result: Option<Result<Vec<u32>, MigrationError>> = None;
         with_test_registry(REG, || {
-            result = Some(apply_pending_at_with_test_registry(TargetFile::UsersConf, &path));
+            result = Some(apply_pending_at_with_test_registry(
+                TargetFile::UsersConf,
+                &path,
+            ));
         });
         let applied = result.unwrap().expect("skip path returns Ok");
-        assert!(applied.is_empty(), "no migrations to apply, got {:?}", applied);
+        assert!(
+            applied.is_empty(),
+            "no migrations to apply, got {applied:?}"
+        );
 
         let mtime_after = std::fs::metadata(&path).unwrap().modified().unwrap();
         assert_eq!(

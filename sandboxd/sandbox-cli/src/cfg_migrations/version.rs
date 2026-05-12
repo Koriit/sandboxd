@@ -28,9 +28,8 @@ use super::{MigrationError, TargetFile};
 pub fn read_schema_version(bytes: &[u8], file: TargetFile) -> Result<u32, MigrationError> {
     match file {
         TargetFile::UsersConf => {
-            let v: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| {
-                MigrationError::Parse(format!("users.conf is not valid JSON: {e}"))
-            })?;
+            let v: serde_json::Value = serde_json::from_slice(bytes)
+                .map_err(|e| MigrationError::Parse(format!("users.conf is not valid JSON: {e}")))?;
             Ok(v.get("_schema_version")
                 .and_then(|v| v.as_u64())
                 .map(|n| n as u32)
@@ -113,8 +112,7 @@ mod tests {
         // A bridge.conf without the header (typical of pre-migration
         // installs, or operator-only files) reads as version 0.
         let bytes = b"allow sb-*\nallow virbr0\n";
-        let v =
-            read_schema_version(bytes, TargetFile::BridgeConf).expect("no header maps to 0");
+        let v = read_schema_version(bytes, TargetFile::BridgeConf).expect("no header maps to 0");
         assert_eq!(v, 0);
     }
 

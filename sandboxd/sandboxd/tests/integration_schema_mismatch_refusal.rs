@@ -101,8 +101,8 @@ fn spawn_and_wait(users_conf: &str, deadline_secs: u64) -> (String, i32) {
 // ---------------------------------------------------------------------------
 
 /// `users.conf` at `_schema_version: 99` (ahead of the binary's max of
-/// 1) refuses startup. Spec 5 § 4.7 names the substring
-/// `users.conf schema version 99 is newer`.
+/// 1) refuses startup. Spec 5 § 4.7 names the substring `users.conf
+/// schema version 99 is newer`.
 #[test]
 fn integration_daemon_refuses_start_on_schema_too_new() {
     let raw = r#"{

@@ -156,7 +156,9 @@ pub enum UsersConfigError {
     /// load-bearing for the integration test
     /// `integration_daemon_refuses_start_on_schema_too_new` — any
     /// rewording must keep that substring.
-    #[error("users.conf schema version {file_version} is newer than this binary supports (max: {daemon_max}). {hint}")]
+    #[error(
+        "users.conf schema version {file_version} is newer than this binary supports (max: {daemon_max}). {hint}"
+    )]
     SchemaTooNew {
         file_version: u32,
         daemon_max: u32,
@@ -170,7 +172,9 @@ pub enum UsersConfigError {
     ///
     /// The literal token `users.conf schema version <N> is older` is
     /// load-bearing for `integration_daemon_refuses_start_on_schema_too_old`.
-    #[error("users.conf schema version {file_version} is older than this binary supports (min: {daemon_min}). {hint}")]
+    #[error(
+        "users.conf schema version {file_version} is older than this binary supports (min: {daemon_min}). {hint}"
+    )]
     SchemaTooOld {
         file_version: u32,
         daemon_min: u32,
@@ -221,21 +225,19 @@ pub fn validate_users_conf_schema_version(cfg: &UsersConfig) -> Result<(), Users
         return Err(UsersConfigError::SchemaTooNew {
             file_version: v,
             daemon_max: DAEMON_MAX_SUPPORTED_USERS_CONF_SCHEMA,
-            hint: format!(
-                "This typically indicates a downgrade or an interrupted update. \
-                 Run `sandbox update` to fix, or restore from backup at \
-                 /var/lib/sandbox/backups/<latest>/users.conf.bak."
-            ),
+            hint: "This typically indicates a downgrade or an interrupted update. \
+                   Run `sandbox update` to fix, or restore from backup at \
+                   /var/lib/sandbox/backups/<latest>/users.conf.bak."
+                .to_string(),
         });
     }
     if v < DAEMON_MIN_SUPPORTED_USERS_CONF_SCHEMA {
         return Err(UsersConfigError::SchemaTooOld {
             file_version: v,
             daemon_min: DAEMON_MIN_SUPPORTED_USERS_CONF_SCHEMA,
-            hint: format!(
-                "The config migration framework has not yet applied pending migrations. \
-                 Run `sandbox update` to bring the file up to date."
-            ),
+            hint: "The config migration framework has not yet applied pending migrations. \
+                   Run `sandbox update` to bring the file up to date."
+                .to_string(),
         });
     }
     Ok(())

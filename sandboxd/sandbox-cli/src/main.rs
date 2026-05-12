@@ -4240,8 +4240,8 @@ fn apply_config_migration_gate(
     out_arg: &str,
     euid: nix::unistd::Uid,
 ) -> ApplyGateOutcome {
-    use std::path::Path;
     use sandbox_cli::cfg_migrations::TargetFile;
+    use std::path::Path;
 
     // Arm 1 — caller must be root.
     if !euid.is_root() {
@@ -8741,7 +8741,7 @@ mod tests {
 
     /// parse_migration_id round-trip.
     #[test]
-    fn parse_migration_id_accepts_V001_v001_and_rejects_others() {
+    fn parse_migration_id_accepts_v001_v001_and_rejects_others() {
         assert_eq!(parse_migration_id("V001"), Some(1));
         assert_eq!(parse_migration_id("v001"), Some(1));
         assert_eq!(parse_migration_id("V42"), Some(42));

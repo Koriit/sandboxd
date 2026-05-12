@@ -135,7 +135,7 @@ fn integration_dump_migration_set_exits_zero_with_documented_json_shape() {
 /// `"sandbox"` to every `allow_users` per Spec 1 § 5.5.
 #[test]
 fn integration_config_migration_applies_v001_to_legacy_file() {
-    use sandbox_cli::cfg_migrations::{apply_pending_at, TargetFile};
+    use sandbox_cli::cfg_migrations::{TargetFile, apply_pending_at};
 
     let tmp = TempDir::new().expect("tempdir");
     let path = tmp.path().join("users.conf");
@@ -154,8 +154,7 @@ fn integration_config_migration_applies_v001_to_legacy_file() {
     assert_eq!(applied, vec![1], "V001 applied exactly once");
 
     let post_bytes = std::fs::read(&path).expect("read post-migration");
-    let post: serde_json::Value =
-        serde_json::from_slice(&post_bytes).expect("post is valid JSON");
+    let post: serde_json::Value = serde_json::from_slice(&post_bytes).expect("post is valid JSON");
 
     assert_eq!(
         post["_schema_version"],
@@ -186,8 +185,8 @@ fn integration_config_migration_applies_v001_to_legacy_file() {
     );
 
     // Idempotency: re-running yields the same file.
-    let applied_again = apply_pending_at(TargetFile::UsersConf, &path)
-        .expect("re-apply skip path returns Ok");
+    let applied_again =
+        apply_pending_at(TargetFile::UsersConf, &path).expect("re-apply skip path returns Ok");
     assert!(
         applied_again.is_empty(),
         "second run must be a no-op; got applied={applied_again:?}"

@@ -73,7 +73,9 @@ pub enum BridgeConfigError {
 
     /// The file's `# sandbox-schema-version: <int>` header is **newer**
     /// than this daemon binary supports.
-    #[error("bridge.conf schema version {file_version} is newer than this binary supports (max: {daemon_max}). {hint}")]
+    #[error(
+        "bridge.conf schema version {file_version} is newer than this binary supports (max: {daemon_max}). {hint}"
+    )]
     SchemaTooNew {
         file_version: u32,
         daemon_max: u32,
@@ -82,7 +84,9 @@ pub enum BridgeConfigError {
 
     /// The file's `# sandbox-schema-version: <int>` header is **older**
     /// than this daemon binary supports.
-    #[error("bridge.conf schema version {file_version} is older than this binary supports (min: {daemon_min}). {hint}")]
+    #[error(
+        "bridge.conf schema version {file_version} is older than this binary supports (min: {daemon_min}). {hint}"
+    )]
     SchemaTooOld {
         file_version: u32,
         daemon_min: u32,
@@ -168,7 +172,15 @@ pub fn validate_schema_version_at(path: &Path) -> Result<(), BridgeConfigError> 
                 .to_string(),
         });
     }
-    if v < DAEMON_MIN_SUPPORTED_BRIDGE_CONF_SCHEMA {
+    // The MIN/MAX symmetric check below is dead at v1 (MIN==0, u32 is
+    // non-negative) but kept verbatim so that when a future migration
+    // raises `DAEMON_MIN_SUPPORTED_BRIDGE_CONF_SCHEMA` past zero the
+    // refusal arm fires without a code change. Clippy
+    // (absurd_extreme_comparisons) flags the always-false `<` against a
+    // u32 zero floor; the allow is scoped to this single comparison.
+    #[allow(clippy::absurd_extreme_comparisons)]
+    let too_old = v < DAEMON_MIN_SUPPORTED_BRIDGE_CONF_SCHEMA;
+    if too_old {
         return Err(BridgeConfigError::SchemaTooOld {
             file_version: v,
             daemon_min: DAEMON_MIN_SUPPORTED_BRIDGE_CONF_SCHEMA,
