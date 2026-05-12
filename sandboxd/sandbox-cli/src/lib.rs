@@ -11,6 +11,7 @@
 
 pub mod backend;
 pub mod backends_cache;
+pub mod cfg_migrations;
 pub mod cli_xdg;
 pub mod doctor;
 pub mod presets;

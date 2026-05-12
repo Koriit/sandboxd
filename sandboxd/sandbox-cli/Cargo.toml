@@ -29,6 +29,13 @@ nix = { version = "0.29", features = ["user"] }
 sandbox-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# `cfg_migrations::atomic_write` uses `NamedTempFile::new_in(parent) +
+# persist(path)` to land each migration's output via rename(2) on the
+# same filesystem (Spec 5 § 4.4). Tempfile was already a dev-dep here
+# for the binary-level tests; promoted to a runtime dep because the
+# migration framework's atomic-write path is production code.
+tempfile.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
@@ -38,4 +45,3 @@ tracing.workspace = true
 # (non-follow) process exit behavior. See the `Connection: close` +
 # drop-order fix in `src/main.rs::stream_events_to_stdout`.
 axum.workspace = true
-tempfile.workspace = true
