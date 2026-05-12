@@ -240,6 +240,10 @@ A per-session CA is generated for each session. The CA private key exists only i
 
 Without a policy, all outbound network traffic is blocked. DNS queries return `NXDOMAIN` for all domains. Only explicitly allowed destinations (by policy rules) can be reached.
 
+### API isolation
+
+The daemon socket is shared by every operator on the host, but each session is owned by the user that created it. The daemon learns the connecting uid from the kernel via `SO_PEERCRED` on every accepted connection, stamps that identity into the session row on create, and filters every storage read and write by `owner_username` at the `SessionStore` boundary. A request for a session owned by a different operator returns HTTP 404 — indistinguishable from a non-existent session ID — so foreign session IDs cannot be enumerated through the API. The `owner_username` field is exposed on `SessionDto`. See [Sessions → Session ownership](/concepts/sessions/#session-ownership) for the full model.
+
 ## Storage
 
 ### SQLite database

@@ -378,7 +378,44 @@ getcap /usr/local/libexec/sandboxd/sandbox-route-helper
 # Expected: /usr/local/libexec/sandboxd/sandbox-route-helper cap_net_admin,cap_sys_admin=eip
 ```
 
-Do **not** make this binary setuid root. The capability approach is intentional: the daemon stays unprivileged, and the helper acquires only the kernel permissions it needs (joining a container's network namespace via `pidfd_open(2)` + `setns(2)`, and installing the default route inside it). The helper is invoked by sandboxd, not by operators directly, and it cross-checks the caller's uid against the same `users.conf` `allow_users` list — operators with no `allow_users` entry cannot use it even if they can execute the binary.
+Do **not** make this binary setuid root. The capability approach is intentional: the daemon stays unprivileged, and the helper acquires only the kernel permissions it needs (joining a container's network namespace via `pidfd_open(2)` + `setns(2)`, and installing the default route inside it). The helper is invoked by sandboxd, not by operators directly, and it enforces a **pair-membership check** against `users.conf` before any namespace mutation: both the calling process's uid (the daemon, via `getuid`) and the operator name passed in `--for-user` (which the daemon reads from `SO_PEERCRED` on its accepted Unix socket) must appear in the same pool's `allow_users`. Operators with no `allow_users` entry cannot run sessions even if they can execute the helper, and a compromised daemon cannot invent operator names that are not already paired with its own runtime uid. See [Audit log](#audit-log) below for where every allow/deny decision is recorded.
+
+#### Audit log
+
+The route helper writes a JSON-Lines record to disk on **every** invocation — both allowed and denied — so operators triaging a deny, or just confirming that authorization is being audited, have a forensic trail.
+
+**Location.** The helper resolves the audit-log path in this order:
+
+1. `$XDG_RUNTIME_DIR/sandboxd/route-helper-audit.log` (typically `/run/user/$UID/sandboxd/route-helper-audit.log`).
+2. `$HOME/.local/share/sandboxd/route-helper-audit.log` (fallback when `XDG_RUNTIME_DIR` is unset).
+3. `/tmp/sandboxd/route-helper-audit.log` (last-resort fallback when neither variable is set, e.g. in containerised environments without `HOME`).
+
+The parent directory is created on the first invocation if it does not exist.
+
+**Format.** One JSON object per line; fields:
+
+| Field | Type | Notes |
+|-------|------|-------|
+| `ts` | RFC 3339 timestamp, millisecond precision (`Z` suffix) | Wall-clock time the record was written. |
+| `decision` | `"allowed"` or `"denied"` | The helper's authorization outcome. |
+| `reason` | string | Present only on `decision: "denied"`. Short tag — e.g. `"pair-check failed"`, `"gateway-ip not in any subnet"`. |
+| `caller` | string | Username resolved from the helper's own `getuid()` (the daemon's runtime uid). |
+| `for_user` | string | Value of the helper's `--for-user` argument (the operator name the daemon asserts). |
+| `pool` | string (CIDR) | The matched subnet, e.g. `"10.209.0.0/20"`. Omitted when the gateway IP did not match any configured subnet (i.e. `reason: "gateway-ip not in any subnet"`). |
+| `gateway_ip` | string | The gateway IP the helper was asked to install a route to. |
+| `pid` | integer | The helper's own PID. |
+
+Example lines:
+
+```jsonl
+{"ts":"2026-05-11T14:23:09.123Z","decision":"allowed","caller":"alice","for_user":"alice","pool":"10.209.0.0/20","gateway_ip":"10.209.0.2","pid":12345}
+{"ts":"2026-05-11T14:23:11.477Z","decision":"denied","reason":"pair-check failed","caller":"alice","for_user":"bob","pool":"10.210.0.0/20","gateway_ip":"10.210.0.2","pid":12346}
+```
+
+**Write-failure asymmetry.** The two paths handle audit-log write failures differently:
+
+- **Allow path.** A failed audit-log write is logged to stderr but otherwise swallowed; the helper still installs the route and exits success. Audit-log infrastructure failures (disk full, missing parent dir, ENOSPC) must not cause a denial-of-service to session creation — routing availability wins, and the missing record surfaces as a daemon-side stderr line for the operator to triage.
+- **Deny path.** A failed audit-log write is **escalated**: the helper logs to stderr **and** exits with the deny exit code (`1`). The deny itself already happened — the escalation here ensures the forensic record does not evaporate silently when an attacker (or a misconfigured environment) tries to censor a deny by making the log unwritable.
 
 #### Privilege boundary: `SANDBOX_USERS_CONF` is feature-gated
 

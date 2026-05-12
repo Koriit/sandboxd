@@ -32,6 +32,17 @@ Every session has a 12-character lowercase-hex **session ID** (for example `550e
 
 See the [CLI reference](/reference/cli/) for the prefix-disambiguation rules.
 
+## Session ownership
+
+Every session is owned by the Unix user that created it. The daemon enforces this at the storage boundary so concurrent operators on the same host cannot see or mutate each other's sessions, even though they share one daemon process and one SQLite database.
+
+- **Identity stamping.** When a connection is accepted on the daemon's Unix socket, the daemon reads the connecting process's uid via `SO_PEERCRED` and resolves it to a username with `getpwuid_r`. The resulting identity is unforgeable by the client — it comes from the kernel, not from the request body. Every session row is stamped with this `owner_username` at creation time.
+- **Storage-boundary enforcement.** Every `SessionStore` method that reads or mutates a session row takes a `caller_username` argument and applies `AND owner_username = ?` to its SQL. Listing returns only the caller's own sessions; a `get`/`update`/`delete` against a session owned by someone else is treated as if the row did not exist.
+- **404 on foreign IDs.** Looking up a session that exists but belongs to a different operator returns HTTP 404, indistinguishable from a session ID that was never created. This prevents enumeration leaks — a caller cannot learn that "this ID is taken" without being its owner.
+- **`owner_username` on the wire.** `SessionDto` (the API response shape for `GET /sessions` and `GET /sessions/{id}`) carries an `owner_username` field so a client can see which user owns each session in its own list, and so future multi-operator tooling has a stable handle.
+
+Internal daemon paths that need to walk every row regardless of owner (startup reconciliation against the backend inventory, the V006 orphan scan) go through explicitly-named unfiltered methods on `SessionStore`; the production HTTP surface has no such escape hatch.
+
 ## Lifecycle
 
 A session moves through four states. The daemon validates every transition — you cannot skip states, and `Error` is terminal.
