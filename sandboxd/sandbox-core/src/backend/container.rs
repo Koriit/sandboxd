@@ -127,6 +127,35 @@ pub fn lite_image_tag_for_version(daemon_version: &str) -> String {
     format!("{LITE_IMAGE_REPOSITORY}:{daemon_version}")
 }
 
+/// Env-var name a `test-env-override` build of the daemon consults to
+/// override the lite-image tag it probes for via `/diagnostics`.
+/// Production builds ignore the variable.
+pub const LITE_TAG_OVERRIDE_ENV: &str = "SANDBOX_LITE_TAG_OVERRIDE";
+
+/// Resolve the lite-image tag the **running daemon** should probe for
+/// when reporting `lite_image_present` on `/diagnostics`. Default
+/// builds always compose the canonical
+/// `sandboxd-lite:<daemon_version>` tag. Test builds opting into the
+/// `test-env-override` Cargo feature additionally consult
+/// [`LITE_TAG_OVERRIDE_ENV`] so the doctor-diagnostics integration
+/// tests can drive the absent-image branch deterministically without
+/// depending on the host's docker image inventory.
+///
+/// Only the `/diagnostics` probe is routed through this helper —
+/// `ensure_image` / `rebuild_lite_image` still compose the canonical
+/// tag because they actually build the image and a tag mismatch there
+/// would corrupt the build cache. The override exists purely to
+/// influence the *presence probe*'s answer.
+pub fn lite_image_tag_for_daemon_probe(daemon_version: &str) -> String {
+    #[cfg(feature = "test-env-override")]
+    if let Ok(tag) = std::env::var(LITE_TAG_OVERRIDE_ENV)
+        && !tag.is_empty()
+    {
+        return tag;
+    }
+    lite_image_tag_for_version(daemon_version)
+}
+
 /// Verbatim warning emitted on first-use rebuild of the lite image.
 ///
 /// Spec § "Image building / First-use warning" pins this exact byte

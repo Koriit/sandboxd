@@ -100,6 +100,15 @@ impl Daemon {
     /// socket is observable on disk. `pool_cidr` lets each test pick
     /// its own /24 so parallel runs don't collide.
     fn spawn(pool_cidr: &str) -> Self {
+        Self::spawn_with_env(pool_cidr, &[])
+    }
+
+    /// As [`spawn`], but threads extra `(key, value)` env vars into
+    /// the daemon's process environment. Used by the gateway- and
+    /// lite-image tag-override tests to point the daemon at a
+    /// guaranteed-absent tag without depending on the host's docker
+    /// image inventory.
+    fn spawn_with_env(pool_cidr: &str, extra_env: &[(&str, &str)]) -> Self {
         let tmp = tempfile::tempdir().expect("tempdir");
         let user = current_username();
         let socket = tmp.path().join("sandboxd.sock");
@@ -123,6 +132,9 @@ impl Daemon {
             .env("RUST_LOG", "info")
             .stdout(Stdio::from(stdout_fh))
             .stderr(Stdio::from(stderr_fh));
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
         let proc = cmd.spawn().expect("spawn sandboxd");
         let daemon = Self {
             socket,
@@ -203,7 +215,7 @@ async fn http_get(
 }
 
 // ---------------------------------------------------------------------------
-// Test 1 — startup subdir mode correction (lands here from M14-S1)
+// Test 1 — startup subdir mode correction
 // ---------------------------------------------------------------------------
 
 /// Pre-create `<base_dir>/sessions/` with mode `0755`; start the
@@ -286,28 +298,43 @@ fn integration_subdir_mode_correction_at_startup() {
 // Test 2 — doctor exits 1 when gateway image is missing
 // ---------------------------------------------------------------------------
 
-/// Spawn a daemon on a host where the gateway image is guaranteed
-/// missing (we use a timestamped tag override so the test doesn't
-/// depend on the host's current image inventory). Run `sandbox
-/// doctor --verbose`. Assert:
+/// Spawn a daemon pointed at a guaranteed-absent gateway-image tag
+/// (timestamp-suffixed, so concurrent test runs and any pre-built
+/// `sandbox-gateway:<version>` on the host don't collide) and run
+/// `sandbox doctor --verbose`. The tag-override env var is honored
+/// only when `sandbox-core` is built with the `test-env-override`
+/// feature (production builds ignore it — see Cargo.toml). The test
+/// asserts unconditionally:
 ///
-/// - exit code is `1` (a check failed),
-/// - the output mentions the gateway-image-present check is failing.
+/// - exit code is `1` (C7 hard-failed),
+/// - C7 row renders the `✗` glyph and names the gateway-image check,
+/// - the row carries the remediation hint substring spec § 8.5
+///   mandates (`sandbox update` and/or `make gateway-image`).
 ///
-/// We probe `GET /diagnostics` directly to confirm the daemon-side
-/// answer is `gateway_image_present: false`, which is the wire
-/// payload doctor's C7 check trips on.
+/// We additionally probe `GET /diagnostics` to pin the wire-level
+/// answer the doctor's C7 check trips on: `gateway_image_present`
+/// must be `false`.
+///
+/// The unique-tag isolation pattern mirrors
+/// `integration_gateway_image_pinned_to_daemon_version` (suffixing
+/// the tag with `SystemTime::now().duration_since(UNIX_EPOCH).as_nanos()`)
+/// so a passing run never depends on the host's docker inventory.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn integration_doctor_hard_fails_on_missing_gateway_image() {
-    // Build the daemon at its real `CARGO_PKG_VERSION`; the gateway
-    // image at `sandbox-gateway:<that version>` may or may not exist
-    // locally. To force a clean miss we sidestep the host's docker
-    // inventory: we read `/diagnostics` and trust the daemon's own
-    // probe. If the host happens to have the image, this test
-    // would degrade to "no-op pass" rather than a false positive —
-    // the doctor's CLI exit-code path is still pinned by the
-    // remaining assertions in this file.
-    let daemon = Daemon::spawn("10.232.0.0/24");
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    // No `docker tag` step — the tag is *only* probed via `docker
+    // image inspect` (which returns "no such image"), never built or
+    // run. Leak-proof by construction.
+    let absent_tag = format!("sandbox-gateway:doctor-itest-absent-{nanos}");
+    let daemon = Daemon::spawn_with_env(
+        "10.232.0.0/24",
+        &[("SANDBOX_GATEWAY_TAG_OVERRIDE", &absent_tag)],
+    );
 
     let (status, body) = http_get(&daemon.socket, "/diagnostics", Duration::from_secs(10)).await;
     assert_eq!(status, hyper::StatusCode::OK);
@@ -316,6 +343,14 @@ async fn integration_doctor_hard_fails_on_missing_gateway_image() {
         .get("gateway_image_present")
         .and_then(|v| v.as_bool())
         .expect("gateway_image_present is bool");
+    assert!(
+        !gateway_present,
+        "daemon must report gateway_image_present=false when its override \
+         tag points at an absent image; got true. body={parsed}. \
+         (If this fires, the `test-env-override` feature is likely off — \
+         confirm `--features sandbox-route-helper/test-env-override` is on \
+         the cargo invocation, which transitively enables `sandbox-core/test-env-override`.)"
+    );
 
     // Run `sandbox doctor` against the daemon. Doctor connects with
     // the version-handshake bypass so it reaches the daemon despite
@@ -331,52 +366,57 @@ async fn integration_doctor_hard_fails_on_missing_gateway_image() {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let exit_code = output.status.code().expect("exited normally");
 
-    if gateway_present {
-        // Host had the image — doctor's C7 passes; exit code should
-        // be 0 unless some unrelated check fails. We only assert the
-        // C7 row is `Pass`.
-        assert!(
-            stdout.contains("gateway image present"),
-            "verbose mode must echo the C7 check name; got: {stdout}"
-        );
-        assert!(
-            stdout.contains("\u{2713}") && stdout.contains("gateway image present"),
-            "C7 must render as Pass when daemon reports gateway_image_present=true; got: {stdout}"
-        );
-    } else {
-        // Host did not have the image — doctor's C7 must fail (hard
-        // fail, exit code 1).
-        assert_eq!(
-            exit_code, 1,
-            "doctor must exit 1 when gateway image is missing; got {exit_code}, stdout={stdout}"
-        );
-        assert!(
-            stdout.contains("gateway image present"),
-            "fail row must echo the C7 check name; got: {stdout}"
-        );
-        assert!(
-            stdout.contains("\u{2717}"),
-            "missing gateway image must render the ✗ glyph; got: {stdout}"
-        );
-        assert!(
-            stdout.contains("sandbox update") || stdout.contains("make gateway-image"),
-            "C7 fail hint must point at the remediation; got: {stdout}"
-        );
-    }
+    // Spec § 8.5: missing gateway image → C7 is a hard failure;
+    // doctor's process exit code flips to 1.
+    assert_eq!(
+        exit_code, 1,
+        "doctor must exit 1 when gateway image is missing; got {exit_code}, stdout={stdout}"
+    );
+    assert!(
+        stdout.contains("gateway image present"),
+        "C7 row must always render; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("\u{2717}"),
+        "missing gateway image must render the ✗ glyph on the C7 row; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("sandbox update") || stdout.contains("make gateway-image"),
+        "C7 fail hint must point at the remediation (`sandbox update` or `make gateway-image`); \
+         got: {stdout}"
+    );
 }
 
 // ---------------------------------------------------------------------------
 // Test 3 — doctor stays informational when only the lite image is missing
 // ---------------------------------------------------------------------------
 
-/// Spawn a daemon and run `sandbox doctor --verbose`. The lite image
-/// is built on first session-create — it may be absent. When absent,
-/// doctor's C8 must render as `SKIPPED (not built yet)` with the
-/// build-on-first-use hint; doctor's exit code must NOT flip to `1`
-/// because of C8 alone (informational only per spec § 6.2).
+/// Spawn a daemon pointed at a guaranteed-absent lite-image tag
+/// (timestamp-suffixed unique tag, mirroring the gateway test's
+/// isolation pattern). Run `sandbox doctor --verbose`. The lite
+/// image is informational only per spec § 6.2 / § 8.4 — missing it
+/// must NOT trip the C8 row to `✗`. The test asserts unconditionally:
+///
+/// - `/diagnostics` reports `lite_image_present: false`,
+/// - C8 row renders with the `SKIPPED` / `not built yet` annotation,
+/// - doctor's exit code is `0` or `1` (never `2` — doctor-itself-broken).
+///
+/// The tag-override env var (`SANDBOX_LITE_TAG_OVERRIDE`) is honored
+/// only when `sandbox-core` is built with the `test-env-override`
+/// feature; production builds ignore it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn integration_doctor_informational_on_missing_lite_image() {
-    let daemon = Daemon::spawn("10.233.0.0/24");
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let absent_tag = format!("sandboxd-lite:doctor-itest-absent-{nanos}");
+    let daemon = Daemon::spawn_with_env(
+        "10.233.0.0/24",
+        &[("SANDBOX_LITE_TAG_OVERRIDE", &absent_tag)],
+    );
 
     let (status, body) = http_get(&daemon.socket, "/diagnostics", Duration::from_secs(10)).await;
     assert_eq!(status, hyper::StatusCode::OK);
@@ -385,6 +425,14 @@ async fn integration_doctor_informational_on_missing_lite_image() {
         .get("lite_image_present")
         .and_then(|v| v.as_bool())
         .expect("lite_image_present is bool");
+    assert!(
+        !lite_present,
+        "daemon must report lite_image_present=false when its override \
+         tag points at an absent image; got true. body={parsed}. \
+         (If this fires, the `test-env-override` feature is likely off — \
+         confirm `--features sandbox-route-helper/test-env-override` is on \
+         the cargo invocation.)"
+    );
 
     let output = std::process::Command::new(sandbox_cli_bin())
         .arg("--socket")
@@ -397,35 +445,26 @@ async fn integration_doctor_informational_on_missing_lite_image() {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let exit_code = output.status.code().expect("exited normally");
 
-    if lite_present {
-        // C8 passes — no exit-code impact.
-        assert!(
-            stdout.contains("lite image present"),
-            "verbose mode must echo C8; got: {stdout}"
-        );
-    } else {
-        // C8 must render as Skip (not Fail). The SKIPPED token is the
-        // load-bearing assertion; on its own C8 does not raise
-        // exit code 1, but other checks (e.g. C7, C9) may, so we
-        // assert only the C8-side contract here.
-        assert!(
-            stdout.contains("lite image present"),
-            "C8 row must always appear in verbose mode; got: {stdout}"
-        );
-        assert!(
-            stdout.contains("SKIPPED") || stdout.contains("not built yet"),
-            "missing lite image must render as SKIPPED (informational); got: {stdout}"
-        );
-        // Exit code must not be raised *because of C8 alone*. We
-        // can't isolate it perfectly here without disabling other
-        // checks, but the contract is "C8 alone never trips exit
-        // 1"; the test asserts the more falsifiable "exit code is
-        // 0 OR 1 — never 2 (doctor-itself-broken)".
-        assert!(
-            exit_code == 0 || exit_code == 1,
-            "doctor exit code must be 0 or 1 (never 2 — doctor-itself-broken); got {exit_code}"
-        );
-    }
+    // C8 must render — and as Skip (not Fail). The SKIPPED token is
+    // the load-bearing assertion; missing-lite alone does not raise
+    // doctor's exit code to `1` (spec § 6.2 — informational only).
+    assert!(
+        stdout.contains("lite image present"),
+        "C8 row must always appear in verbose mode; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("SKIPPED") || stdout.contains("not built yet"),
+        "missing lite image must render as SKIPPED / `not built yet` (informational); \
+         got: {stdout}"
+    );
+    // Exit code must not be raised because of C8 alone. Other
+    // checks (e.g. C7, C9) may still trip exit code 1 on a CI host
+    // lacking the gateway image or the cap'd route helper, so we
+    // assert the more falsifiable "exit code is 0 OR 1 — never 2".
+    assert!(
+        exit_code == 0 || exit_code == 1,
+        "doctor exit code must be 0 or 1 (never 2 — doctor-itself-broken); got {exit_code}"
+    );
 }
 
 // ---------------------------------------------------------------------------

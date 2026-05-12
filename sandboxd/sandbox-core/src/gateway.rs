@@ -140,6 +140,35 @@ pub fn gateway_image_tag_for_version(daemon_version: &str) -> String {
     format!("{GATEWAY_IMAGE_REPOSITORY}:{daemon_version}")
 }
 
+/// Env-var name a `test-env-override` build of the daemon consults to
+/// override the gateway-image tag it probes for. Production builds
+/// ignore the variable.
+pub const GATEWAY_TAG_OVERRIDE_ENV: &str = "SANDBOX_GATEWAY_TAG_OVERRIDE";
+
+/// Resolve the gateway-image tag the **running daemon** should probe
+/// for. Default builds always compose the canonical
+/// `sandbox-gateway:<daemon_version>` tag (this is the only behavior
+/// production binaries can reach). Test builds opting into the
+/// `test-env-override` Cargo feature additionally consult
+/// [`GATEWAY_TAG_OVERRIDE_ENV`] so the doctor-diagnostics integration
+/// tests can point the daemon at a guaranteed-absent tag (and thereby
+/// pin the missing-image failure surface) without depending on the
+/// host's docker image inventory.
+///
+/// All daemon call sites that previously composed the tag directly
+/// from `CARGO_PKG_VERSION` route through here, so a single env-var
+/// flip redirects every probe (startup log, `/diagnostics`,
+/// `create_session` pre-flight).
+pub fn gateway_image_tag_for_daemon(daemon_version: &str) -> String {
+    #[cfg(feature = "test-env-override")]
+    if let Ok(tag) = std::env::var(GATEWAY_TAG_OVERRIDE_ENV)
+        && !tag.is_empty()
+    {
+        return tag;
+    }
+    gateway_image_tag_for_version(daemon_version)
+}
+
 /// Probe whether the daemon-version-tagged gateway image is loaded on
 /// the host. Returns `Ok(true)` when `docker image inspect <tag>`
 /// exits 0, `Ok(false)` when the inspect fails with the well-known

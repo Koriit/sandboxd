@@ -57,6 +57,19 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 
+[features]
+# `test-env-override` — forwarded to `sandbox-core/test-env-override`.
+# When enabled, the daemon's gateway-image / lite-image presence-probe
+# helpers consult `SANDBOX_GATEWAY_TAG_OVERRIDE` /
+# `SANDBOX_LITE_TAG_OVERRIDE` so the doctor-diagnostics integration
+# tests can point the daemon at a guaranteed-absent tag and exercise
+# the missing-image failure surface independently of the host's docker
+# image inventory. The route-helper users.conf override is gated by
+# the same feature on `sandbox-core`; both are off in production
+# builds (the daemon's behavior must not depend on attacker-readable
+# process environment).
+test-env-override = ["sandbox-core/test-env-override"]
+
 [dev-dependencies]
 # `hyper` + `hyper-util` provide an HTTP/1.1 client over the per-test
 # `tokio::net::UnixStream` so `integration_owner_peercred.rs` can drive

@@ -1217,7 +1217,7 @@ async fn create_session(
     // request so a post-startup image load is picked up without
     // bouncing the daemon.
     let gateway_tag =
-        sandbox_core::gateway::gateway_image_tag_for_version(env!("CARGO_PKG_VERSION"));
+        sandbox_core::gateway::gateway_image_tag_for_daemon(env!("CARGO_PKG_VERSION"));
     let gateway_tag_for_check = gateway_tag.clone();
     let present_result =
         tokio::task::spawn_blocking(move || gateway_image_present(&gateway_tag_for_check)).await;
@@ -6003,8 +6003,8 @@ async fn diagnostics_handler(
     .unwrap_or(false);
 
     let gateway_tag =
-        sandbox_core::gateway::gateway_image_tag_for_version(env!("CARGO_PKG_VERSION"));
-    let lite_tag = sandbox_core::lite_image_tag_for_version(env!("CARGO_PKG_VERSION"));
+        sandbox_core::gateway::gateway_image_tag_for_daemon(env!("CARGO_PKG_VERSION"));
+    let lite_tag = sandbox_core::lite_image_tag_for_daemon_probe(env!("CARGO_PKG_VERSION"));
     let gateway_image_present = {
         let tag = gateway_tag.clone();
         tokio::task::spawn_blocking(move || {
@@ -6980,7 +6980,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `SandboxError::Gateway` with the same hint so the failure
     // surface is consistent.
     let gateway_image_tag =
-        sandbox_core::gateway::gateway_image_tag_for_version(env!("CARGO_PKG_VERSION"));
+        sandbox_core::gateway::gateway_image_tag_for_daemon(env!("CARGO_PKG_VERSION"));
     {
         let tag = gateway_image_tag.clone();
         let present = tokio::task::spawn_blocking(move || gateway_image_present(&tag))

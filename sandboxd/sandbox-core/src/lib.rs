@@ -46,9 +46,10 @@ pub use backend::{
     AsyncReadWrite, BackendInfo, BackendKind, BackendSpecific, Capabilities, CliDockerOps,
     ContainerNetwork, ContainerRuntime, ContainerTransport, DEFAULT_LITE_IMAGE_TAG, DockerOps,
     EnsureImageOutcome, ExitCode, GuestTransport, IsolationLevel, LITE_FIRST_USE_WARNING,
-    LITE_IMAGE_REPOSITORY, LimaRuntime, LimaTransport, ReaperReport, RuntimeHandle,
-    RuntimeStartArgs, RuntimeStatus, SessionRuntime, SessionSpec, UnsupportedFeature,
-    compute_default_resource_limits, ensure_image, lite_image_tag_for_version, reap_orphans,
+    LITE_IMAGE_REPOSITORY, LITE_TAG_OVERRIDE_ENV, LimaRuntime, LimaTransport, ReaperReport,
+    RuntimeHandle, RuntimeStartArgs, RuntimeStatus, SessionRuntime, SessionSpec,
+    UnsupportedFeature, compute_default_resource_limits, ensure_image,
+    lite_image_tag_for_daemon_probe, lite_image_tag_for_version, reap_orphans,
 };
 pub use ca::{CaManager, generate_ca_inject_script};
 pub use caller_identity::OperatorIdentity;
