@@ -5673,6 +5673,7 @@ mod tests {
             state: SessionState::Running,
             created_at,
             updated_at: created_at,
+            owner_username: "test-operator".into(),
             config: SessionConfigDto {
                 cpus: 2.0,
                 memory_mb: 4096,

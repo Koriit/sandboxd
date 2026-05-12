@@ -25,9 +25,15 @@ use http_body_util::BodyExt;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-use sandbox_core::{PropagationStatusResponse, SessionConfig, SessionStore};
+use sandbox_core::{OperatorIdentity, PropagationStatusResponse, SessionConfig, SessionStore};
 use sandboxd::policy_http::{PolicyApiState, policy_router};
 use sandboxd::propagation::PropagationStates;
+
+/// Username every test-side caller is stamped as. The handler now
+/// requires an `Extension<OperatorIdentity>`, and the session-store
+/// filter rejects rows that don't match this name — so every fixture
+/// session and every test request goes through under the same identity.
+const TEST_CALLER: &str = "test-operator";
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -46,7 +52,13 @@ fn fresh_store() -> (Arc<SessionStore>, TempDir) {
 /// a name so the name-or-id resolution path can be exercised too.
 fn provision_session(store: &SessionStore, name: Option<&str>) -> sandbox_core::SessionId {
     let session = store
-        .create_session(SessionConfig::default(), name.map(String::from))
+        .create_session(
+            SessionConfig::default(),
+            name.map(String::from),
+            TEST_CALLER,
+            0,
+            "",
+        )
         .expect("create session");
     session.id
 }
@@ -54,7 +66,11 @@ fn provision_session(store: &SessionStore, name: Option<&str>) -> sandbox_core::
 /// Build the policy sub-router over a fresh `(store, tracker)` pair.
 fn build_router(store: Arc<SessionStore>, states: Arc<PropagationStates>) -> axum::Router {
     let state = Arc::new(PolicyApiState::new(store, states));
-    policy_router(state)
+    // Layer in a synthetic `OperatorIdentity` so handlers that require
+    // it through `Extension<OperatorIdentity>` resolve successfully —
+    // the production daemon's `operator_identity_layer` inserts it from
+    // `SO_PEERCRED`; tests using `oneshot` need to inject it directly.
+    policy_router(state).layer(axum::Extension(OperatorIdentity::new(1000, TEST_CALLER)))
 }
 
 /// Issue a `GET /sessions/{id}/policy/propagation-status` against
@@ -212,4 +228,67 @@ async fn resolves_by_name_and_by_id() {
     assert_eq!(body_by_name.expected_hash, body_by_id.expected_hash);
     assert_eq!(body_by_name.propagated_hash, body_by_id.propagated_hash);
     assert_eq!(body_by_name.propagated, body_by_id.propagated);
+}
+
+/// Spec § 2.4 + § 7.5 — foreign session ids must surface as HTTP 404,
+/// indistinguishable on the wire from a truly nonexistent id. The
+/// handler resolves through `get_session_by_name_or_id`, which is
+/// scoped to the caller's `owner_username`; alice's session is
+/// invisible to bob.
+///
+/// The router is built with a synthetic `OperatorIdentity` for `bob`,
+/// while the row was created under `alice`. The wire response shape
+/// (status, body) must match the shape for a never-existed id.
+#[tokio::test]
+async fn foreign_session_id_returns_404() {
+    let (store, _tmp) = fresh_store();
+    // Alice owns the row. We seed via the store directly (not via
+    // `provision_session`, which uses the shared TEST_CALLER).
+    let session = store
+        .create_session(
+            sandbox_core::SessionConfig::default(),
+            Some("alice-secret".into()),
+            "alice",
+            0,
+            "",
+        )
+        .expect("alice creates session");
+
+    let states = Arc::new(PropagationStates::new());
+    let state = Arc::new(sandboxd::policy_http::PolicyApiState::new(store, states));
+    // Route bob's requests — bob's identity, not alice's.
+    let router = sandboxd::policy_http::policy_router(state)
+        .layer(axum::Extension(OperatorIdentity::new(2000, "bob")));
+
+    // GET alice's session id under bob's identity must be 404 with the
+    // same body shape as a truly unknown id.
+    let (status_by_id, _) = get_status(router, session.id.as_str()).await;
+    assert_eq!(
+        status_by_id,
+        StatusCode::NOT_FOUND,
+        "foreign id must be 404 (not 403) so existence stays hidden"
+    );
+
+    // GET by name (alice named the session "alice-secret") under bob's
+    // identity must also 404 — name resolution is caller-scoped.
+    let states2 = Arc::new(PropagationStates::new());
+    let (store2, _tmp2) = fresh_store();
+    let _ = store2
+        .create_session(
+            sandbox_core::SessionConfig::default(),
+            Some("alice-secret".into()),
+            "alice",
+            0,
+            "",
+        )
+        .unwrap();
+    let state2 = Arc::new(sandboxd::policy_http::PolicyApiState::new(store2, states2));
+    let router2 = sandboxd::policy_http::policy_router(state2)
+        .layer(axum::Extension(OperatorIdentity::new(2000, "bob")));
+    let (status_by_name, _) = get_status(router2, "alice-secret").await;
+    assert_eq!(
+        status_by_name,
+        StatusCode::NOT_FOUND,
+        "name lookup must also be caller-scoped; bob must not see alice's named session"
+    );
 }

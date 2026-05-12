@@ -301,13 +301,16 @@ async fn integration_create_session_container_backend_round_trip() {
             SessionConfig::default(),
             Some("phase3d-roundtrip".into()),
             BackendKind::Container,
+            "test-operator",
+            0,
+            "",
         )
         .expect("persist session row");
     assert_eq!(session.backend, BackendKind::Container);
 
     // Confirm the row reads back unchanged after the SQLite write.
     let reloaded = store
-        .get_session_by_name_or_id(session.id.as_str())
+        .get_session_by_name_or_id(session.id.as_str(), "test-operator")
         .expect("query session by id")
         .expect("session row present");
     assert_eq!(reloaded.backend, BackendKind::Container);

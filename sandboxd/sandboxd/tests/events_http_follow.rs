@@ -49,10 +49,16 @@ use tempfile::TempDir;
 use tower::ServiceExt;
 
 use sandbox_core::{
-    DnsEvent, Event, EventBus, EventBusConfig, EventEnvelope, SessionConfig, SessionStore,
-    TrafficEvent,
+    DnsEvent, Event, EventBus, EventBusConfig, EventEnvelope, OperatorIdentity, SessionConfig,
+    SessionStore, TrafficEvent,
 };
 use sandboxd::events_http::{APPLICATION_JSONL, EventsApiState, events_router};
+
+/// Username every test-side caller is stamped as. The handler now
+/// requires an `Extension<OperatorIdentity>`, and the session-store
+/// filter rejects rows that don't match this name — so every fixture
+/// session and every test request goes through under the same identity.
+const TEST_CALLER: &str = "test-operator";
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -69,7 +75,7 @@ fn fresh_store() -> (Arc<SessionStore>, TempDir) {
 /// Create a session in `store`, register it with `bus`, return its id.
 fn provision_session(store: &SessionStore, bus: &EventBus) -> sandbox_core::SessionId {
     let session = store
-        .create_session(SessionConfig::default(), None)
+        .create_session(SessionConfig::default(), None, TEST_CALLER, 0, "")
         .expect("create session");
     bus.register_session(session.id);
     session.id
@@ -102,7 +108,11 @@ fn dns_allowed(session: sandbox_core::SessionId, query: &str) -> Event {
 /// keep the `TempDir` alive for the SQLite file on disk.
 fn build_router(store: Arc<SessionStore>, bus: EventBus) -> axum::Router {
     let state = Arc::new(EventsApiState::new(store, bus));
-    events_router(state)
+    // Layer in a synthetic `OperatorIdentity` so handlers that require
+    // it through `Extension<OperatorIdentity>` resolve successfully —
+    // the production daemon's `operator_identity_layer` inserts it from
+    // `SO_PEERCRED`; tests using `oneshot` need to inject it directly.
+    events_router(state).layer(axum::Extension(OperatorIdentity::new(1000, TEST_CALLER)))
 }
 
 /// Issue `GET <uri>` against `router` without collecting the body.

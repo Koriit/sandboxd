@@ -1316,10 +1316,18 @@ async fn create_session(
     // `req.name` is cloned because both backend branches below need to
     // reach back into `req` (workspace mode for container, repo/policy
     // for the shared post-create plumbing).
+    // Spec 2: the session is stamped with the operator's username at
+    // creation time so every subsequent per-caller filter in
+    // `SessionStore` matches. Guest-version fields are placeholders for
+    // now — M13-S5 wires real constants once the guest agent is built
+    // with the spec'd compatibility metadata.
     let session = match state.store.create_session_with_backend(
         config.clone(),
         req.name.clone(),
         backend_kind,
+        &operator.name,
+        0,
+        "",
     ) {
         Ok(s) => s,
         Err(e) => return error_response(e).into_response(),
@@ -1337,11 +1345,15 @@ async fn create_session(
         {
             Ok(Ok(dir)) => dir,
             Ok(Err(e)) => {
-                let _ = state.store.update_state(&session_id, SessionState::Error);
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
                 return error_response(e).into_response();
             }
             Err(e) => {
-                let _ = state.store.update_state(&session_id, SessionState::Error);
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
                 return error_response(SandboxError::Internal(format!("task join error: {e}")))
                     .into_response();
             }
@@ -1360,11 +1372,15 @@ async fn create_session(
                     CaManager::remove_session_ca(&base_dir, &sid)
                 })
                 .await;
-                let _ = state.store.update_state(&session_id, SessionState::Error);
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
                 return error_response(e).into_response();
             }
             Err(e) => {
-                let _ = state.store.update_state(&session_id, SessionState::Error);
+                let _ = state
+                    .store
+                    .update_state(&session_id, &operator.name, SessionState::Error);
                 return error_response(SandboxError::Internal(format!("task join error: {e}")))
                     .into_response();
             }
@@ -1418,7 +1434,9 @@ async fn create_session(
                 let _ = CaManager::remove_session_ca(&base_dir, &sid);
             })
             .await;
-            let _ = $state.store.update_state(&$session_id, SessionState::Error);
+            let _ = $state
+                .store
+                .update_state(&$session_id, &operator.name, SessionState::Error);
             return $err_resp;
         }};
     }
@@ -1434,7 +1452,9 @@ async fn create_session(
                 let _ = CaManager::remove_session_ca(&base_dir, &sid);
             })
             .await;
-            let _ = $state.store.update_state(&$session_id, SessionState::Error);
+            let _ = $state
+                .store
+                .update_state(&$session_id, &operator.name, SessionState::Error);
             return $err_resp;
         }};
     }
@@ -1704,7 +1724,10 @@ async fn create_session(
         // starts so the listener's `get_network_info` lookup
         // succeeds (it needs the subnet + gateway IP for ruleset
         // generation).
-        if let Err(e) = state.store.set_network_info(&session_id, &network_info) {
+        if let Err(e) = state
+            .store
+            .set_network_info(&session_id, &operator.name, &network_info)
+        {
             cleanup_lite_gateway_and_return!(error_response(e).into_response());
         }
 
@@ -1722,7 +1745,10 @@ async fn create_session(
         // `docker create --network <name> --ip <ip>`, and CA
         // injection is the lite image's responsibility at build
         // time.)
-        if let Err(e) = state.store.update_state(&session_id, SessionState::Running) {
+        if let Err(e) = state
+            .store
+            .update_state(&session_id, &operator.name, SessionState::Running)
+        {
             cleanup_lite_gateway_and_return!(error_response(e).into_response());
         }
 
@@ -1780,6 +1806,7 @@ async fn create_session(
             let initial_presets = req.source_presets.clone();
             match apply_policy(
                 &session_id,
+                &operator.name,
                 &policy,
                 &state,
                 ApplyKind::Initial {
@@ -1853,6 +1880,7 @@ async fn create_session(
                         ));
                         return fail_explicit_repo_clone(
                             &state.store,
+                            &operator.name,
                             &state.gateway,
                             &state.network,
                             &state.ingestors,
@@ -1875,6 +1903,7 @@ async fn create_session(
                     ));
                     return fail_explicit_repo_clone(
                         &state.store,
+                        &operator.name,
                         &state.gateway,
                         &state.network,
                         &state.ingestors,
@@ -1890,6 +1919,7 @@ async fn create_session(
                     ));
                     return fail_explicit_repo_clone(
                         &state.store,
+                        &operator.name,
                         &state.gateway,
                         &state.network,
                         &state.ingestors,
@@ -1905,6 +1935,7 @@ async fn create_session(
                     ));
                     return fail_explicit_repo_clone(
                         &state.store,
+                        &operator.name,
                         &state.gateway,
                         &state.network,
                         &state.ingestors,
@@ -1949,6 +1980,7 @@ async fn create_session(
                         ));
                         return fail_explicit_boot_cmd(
                             &state.store,
+                            &operator.name,
                             &state.gateway,
                             &state.network,
                             &state.ingestors,
@@ -1971,6 +2003,7 @@ async fn create_session(
                     ));
                     return fail_explicit_boot_cmd(
                         &state.store,
+                        &operator.name,
                         &state.gateway,
                         &state.network,
                         &state.ingestors,
@@ -1986,6 +2019,7 @@ async fn create_session(
                     ));
                     return fail_explicit_boot_cmd(
                         &state.store,
+                        &operator.name,
                         &state.gateway,
                         &state.network,
                         &state.ingestors,
@@ -2001,6 +2035,7 @@ async fn create_session(
                     ));
                     return fail_explicit_boot_cmd(
                         &state.store,
+                        &operator.name,
                         &state.gateway,
                         &state.network,
                         &state.ingestors,
@@ -2013,7 +2048,7 @@ async fn create_session(
             }
         }
 
-        let created = match state.store.get_session(&session_id) {
+        let created = match state.store.get_session(&session_id, &operator.name) {
             Ok(Some(s)) => s,
             Ok(None) => {
                 cleanup_lite_gateway_and_return!(
@@ -2282,7 +2317,10 @@ async fn create_session(
     }
 
     // Update state to Running.
-    if let Err(e) = state.store.update_state(&session_id, SessionState::Running) {
+    if let Err(e) = state
+        .store
+        .update_state(&session_id, &operator.name, SessionState::Running)
+    {
         return error_response(e).into_response();
     }
 
@@ -2297,6 +2335,7 @@ async fn create_session(
     let initial_dns_policy = Some(initial_dns_policy_owned.as_str());
     match setup_session_networking(
         &session_id,
+        &operator.name,
         &network_info,
         &ca_dir,
         &state,
@@ -2309,7 +2348,9 @@ async fn create_session(
         }
         Err(e) => {
             error!(%session_id, error = %e, "networking setup failed");
-            let _ = state.store.update_state(&session_id, SessionState::Error);
+            let _ = state
+                .store
+                .update_state(&session_id, &operator.name, SessionState::Error);
             // Best-effort teardown of any partial networking state.
             teardown_session_networking(&session_id, &state).await;
             return error_response(e).into_response();
@@ -2334,6 +2375,7 @@ async fn create_session(
         let initial_presets = req.source_presets.clone();
         match apply_policy(
             &session_id,
+            &operator.name,
             &policy,
             &state,
             ApplyKind::Initial {
@@ -2348,6 +2390,7 @@ async fn create_session(
             Err(e) => {
                 return fail_explicit_policy_apply(
                     &state.store,
+                    &operator.name,
                     &state.gateway,
                     &state.network,
                     &state.ingestors,
@@ -2398,6 +2441,7 @@ async fn create_session(
                     ));
                     return fail_explicit_repo_clone(
                         &state.store,
+                        &operator.name,
                         &state.gateway,
                         &state.network,
                         &state.ingestors,
@@ -2420,6 +2464,7 @@ async fn create_session(
                 ));
                 return fail_explicit_repo_clone(
                     &state.store,
+                    &operator.name,
                     &state.gateway,
                     &state.network,
                     &state.ingestors,
@@ -2435,6 +2480,7 @@ async fn create_session(
                 ));
                 return fail_explicit_repo_clone(
                     &state.store,
+                    &operator.name,
                     &state.gateway,
                     &state.network,
                     &state.ingestors,
@@ -2450,6 +2496,7 @@ async fn create_session(
                 ));
                 return fail_explicit_repo_clone(
                     &state.store,
+                    &operator.name,
                     &state.gateway,
                     &state.network,
                     &state.ingestors,
@@ -2494,6 +2541,7 @@ async fn create_session(
                     ));
                     return fail_explicit_boot_cmd(
                         &state.store,
+                        &operator.name,
                         &state.gateway,
                         &state.network,
                         &state.ingestors,
@@ -2516,6 +2564,7 @@ async fn create_session(
                 ));
                 return fail_explicit_boot_cmd(
                     &state.store,
+                    &operator.name,
                     &state.gateway,
                     &state.network,
                     &state.ingestors,
@@ -2531,6 +2580,7 @@ async fn create_session(
                 ));
                 return fail_explicit_boot_cmd(
                     &state.store,
+                    &operator.name,
                     &state.gateway,
                     &state.network,
                     &state.ingestors,
@@ -2546,6 +2596,7 @@ async fn create_session(
                 ));
                 return fail_explicit_boot_cmd(
                     &state.store,
+                    &operator.name,
                     &state.gateway,
                     &state.network,
                     &state.ingestors,
@@ -2559,7 +2610,7 @@ async fn create_session(
     }
 
     // Re-fetch the session to get the updated state and timestamp.
-    let created = match state.store.get_session(&session_id) {
+    let created = match state.store.get_session(&session_id, &operator.name) {
         Ok(Some(s)) => s,
         Ok(None) => {
             return error_response(SandboxError::SessionNotFound(session_id.to_string()))
@@ -2636,8 +2687,11 @@ async fn probe_gateway_status(state: &AppState, session: &Session) -> Option<Str
     )
 }
 
-async fn list_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let sessions = match state.store.list_sessions() {
+async fn list_sessions(
+    State(state): State<Arc<AppState>>,
+    Extension(operator): Extension<OperatorIdentity>,
+) -> impl IntoResponse {
+    let sessions = match state.store.list_sessions(&operator.name) {
         Ok(s) => s,
         Err(e) => return error_response(e).into_response(),
     };
@@ -2665,14 +2719,14 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse 
                         s.state = SessionState::Stopped;
                         let _ = state
                             .store
-                            .update_state_forced(&s.id, SessionState::Stopped);
+                            .update_state_reconcile(&s.id, SessionState::Stopped);
                     }
                     // DB says Stopped but Lima says Running => update to Running
                     (SessionState::Stopped, VmStatus::Running) => {
                         s.state = SessionState::Running;
                         let _ = state
                             .store
-                            .update_state_forced(&s.id, SessionState::Running);
+                            .update_state_reconcile(&s.id, SessionState::Running);
                     }
                     _ => {}
                 }
@@ -2697,9 +2751,10 @@ async fn list_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse 
 
 async fn get_session(
     State(state): State<Arc<AppState>>,
+    Extension(operator): Extension<OperatorIdentity>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let session = match state.store.get_session_by_name_or_id(&id) {
+    let session = match state.store.get_session_by_name_or_id(&id, &operator.name) {
         Ok(Some(s)) => s,
         Ok(None) => return error_response(SandboxError::SessionNotFound(id)).into_response(),
         Err(e) => return error_response(e).into_response(),
@@ -2723,13 +2778,13 @@ async fn get_session(
                     session.state = SessionState::Stopped;
                     let _ = state
                         .store
-                        .update_state_forced(&session.id, SessionState::Stopped);
+                        .update_state_reconcile(&session.id, SessionState::Stopped);
                 }
                 (SessionState::Stopped, sandbox_core::backend::RuntimeStatus::Running) => {
                     session.state = SessionState::Running;
                     let _ = state
                         .store
-                        .update_state_forced(&session.id, SessionState::Running);
+                        .update_state_reconcile(&session.id, SessionState::Running);
                 }
                 _ => {}
             }
@@ -2791,7 +2846,10 @@ fn session_network_info_for(
     state: &Arc<AppState>,
     session_id: &SessionId,
 ) -> Option<SessionNetworkInfo> {
-    match state.store.get_network_info(session_id) {
+    // Daemon-internal read after handler-side ownership has been
+    // verified upstream; the unfiltered helper avoids re-threading the
+    // operator name through every inspection-only call site.
+    match state.store.get_network_info_unfiltered(session_id) {
         Ok(Some(ni)) => Some(SessionNetworkInfo {
             gateway_ip: ni.gateway_ip,
             session_ip: ni.vm_ip,
@@ -2855,7 +2913,7 @@ async fn start_session(
     Extension(operator): Extension<OperatorIdentity>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let session = match state.store.get_session_by_name_or_id(&id) {
+    let session = match state.store.get_session_by_name_or_id(&id, &operator.name) {
         Ok(Some(s)) => s,
         Ok(None) => return error_response(SandboxError::SessionNotFound(id)).into_response(),
         Err(e) => return error_response(e).into_response(),
@@ -2928,7 +2986,9 @@ async fn start_session(
         match runtime.start(&handle, &args).await {
             Ok(()) => {}
             Err(e) => {
-                let _ = state.store.update_state(&session.id, SessionState::Error);
+                let _ = state
+                    .store
+                    .update_state(&session.id, &operator.name, SessionState::Error);
                 return error_response(e).into_response();
             }
         }
@@ -2944,18 +3004,25 @@ async fn start_session(
                 "guest agent returned unexpected response to ping after start".into(),
             );
             error!(session_id = %session.id, "guest agent ping: unexpected response");
-            let _ = state.store.update_state(&session.id, SessionState::Error);
+            let _ = state
+                .store
+                .update_state(&session.id, &operator.name, SessionState::Error);
             return error_response(err).into_response();
         }
         Err(e) => {
             error!(session_id = %session.id, error = %e, "guest agent ping failed after start");
-            let _ = state.store.update_state(&session.id, SessionState::Error);
+            let _ = state
+                .store
+                .update_state(&session.id, &operator.name, SessionState::Error);
             return error_response(e).into_response();
         }
     }
 
     // Update state to Running.
-    if let Err(e) = state.store.update_state(&session.id, SessionState::Running) {
+    if let Err(e) = state
+        .store
+        .update_state(&session.id, &operator.name, SessionState::Running)
+    {
         return error_response(e).into_response();
     }
 
@@ -2967,8 +3034,10 @@ async fn start_session(
     // `sudo bash -c ...` inside the guest, and the lite image has neither
     // sudo nor those bridge helpers (M11 spec § "Routing").
     let restore_result = match session.backend {
-        BackendKind::Container => restore_session_networking_lite(&session.id, &state).await,
-        BackendKind::Lima => restore_session_networking(&session.id, &state).await,
+        BackendKind::Container => {
+            restore_session_networking_lite(&session.id, &operator.name, &state).await
+        }
+        BackendKind::Lima => restore_session_networking(&session.id, &operator.name, &state).await,
     };
     match restore_result {
         Ok(()) => {
@@ -2976,7 +3045,9 @@ async fn start_session(
         }
         Err(e) => {
             error!(session_id = %session.id, error = %e, "networking restore failed after start");
-            let _ = state.store.update_state(&session.id, SessionState::Error);
+            let _ = state
+                .store
+                .update_state(&session.id, &operator.name, SessionState::Error);
             // Best-effort teardown of any partial networking state.
             teardown_session_networking(&session.id, &state).await;
             return error_response(e).into_response();
@@ -2984,7 +3055,7 @@ async fn start_session(
     }
 
     // Re-fetch the session to get the updated state and timestamp.
-    let refreshed = match state.store.get_session(&session.id) {
+    let refreshed = match state.store.get_session(&session.id, &operator.name) {
         Ok(Some(s)) => s,
         Ok(None) => {
             return error_response(SandboxError::SessionNotFound(session.id.to_string()))
@@ -3007,9 +3078,10 @@ async fn start_session(
 
 async fn stop_session(
     State(state): State<Arc<AppState>>,
+    Extension(operator): Extension<OperatorIdentity>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let session = match state.store.get_session_by_name_or_id(&id) {
+    let session = match state.store.get_session_by_name_or_id(&id, &operator.name) {
         Ok(Some(s)) => s,
         Ok(None) => return error_response(SandboxError::SessionNotFound(id)).into_response(),
         Err(e) => return error_response(e).into_response(),
@@ -3087,13 +3159,18 @@ async fn stop_session(
             Ok(()) => {}
             Err(e) => {
                 state.sessions_stopping.lock().await.remove(&session.id);
-                let _ = state.store.update_state(&session.id, SessionState::Error);
+                let _ = state
+                    .store
+                    .update_state(&session.id, &operator.name, SessionState::Error);
                 return error_response(e).into_response();
             }
         }
     }
 
-    if let Err(e) = state.store.update_state(&session.id, SessionState::Stopped) {
+    if let Err(e) = state
+        .store
+        .update_state(&session.id, &operator.name, SessionState::Stopped)
+    {
         state.sessions_stopping.lock().await.remove(&session.id);
         return error_response(e).into_response();
     }
@@ -3102,7 +3179,7 @@ async fn stop_session(
 
     info!(session_id = %session.id, "session stopped");
 
-    let refreshed = match state.store.get_session(&session.id) {
+    let refreshed = match state.store.get_session(&session.id, &operator.name) {
         Ok(Some(s)) => s,
         Ok(None) => {
             return error_response(SandboxError::SessionNotFound(session.id.to_string()))
@@ -3121,9 +3198,10 @@ async fn stop_session(
 
 async fn remove_session(
     State(state): State<Arc<AppState>>,
+    Extension(operator): Extension<OperatorIdentity>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let session = match state.store.get_session_by_name_or_id(&id) {
+    let session = match state.store.get_session_by_name_or_id(&id, &operator.name) {
         Ok(Some(s)) => s,
         Ok(None) => return error_response(SandboxError::SessionNotFound(id)).into_response(),
         Err(e) => return error_response(e).into_response(),
@@ -3216,7 +3294,7 @@ async fn remove_session(
     // the window in which store + bus disagree as short as possible.
     // The vm_ip is looked up from the store; if network_info was absent
     // or unparseable, unbind is a no-op.
-    match state.store.get_network_info(&session.id) {
+    match state.store.get_network_info(&session.id, &operator.name) {
         Ok(Some(ni)) => match ni.vm_ip.parse::<std::net::Ipv4Addr>() {
             Ok(ip) => {
                 state.vm_ip_map.unbind(ip);
@@ -3252,7 +3330,7 @@ async fn remove_session(
     state.propagation_states.remove(&session.id).await;
 
     // Delete the session from the store.
-    if let Err(e) = state.store.delete_session(&session.id) {
+    if let Err(e) = state.store.delete_session(&session.id, &operator.name) {
         return error_response(e).into_response();
     }
 
@@ -3262,10 +3340,11 @@ async fn remove_session(
 
 async fn exec_in_session(
     State(state): State<Arc<AppState>>,
+    Extension(operator): Extension<OperatorIdentity>,
     Path(id): Path<String>,
     Json(req): Json<ExecRequest>,
 ) -> impl IntoResponse {
-    let session = match state.store.get_session_by_name_or_id(&id) {
+    let session = match state.store.get_session_by_name_or_id(&id, &operator.name) {
         Ok(Some(s)) => s,
         Ok(None) => return error_response(SandboxError::SessionNotFound(id)).into_response(),
         Err(e) => return error_response(e).into_response(),
@@ -3325,10 +3404,11 @@ async fn exec_in_session(
 /// `POST /sessions/{id}/policy` -- update the policy for a running session.
 async fn update_policy(
     State(state): State<Arc<AppState>>,
+    Extension(operator): Extension<OperatorIdentity>,
     Path(id): Path<String>,
     Json(req): Json<UpdatePolicyRequest>,
 ) -> impl IntoResponse {
-    let session = match state.store.get_session_by_name_or_id(&id) {
+    let session = match state.store.get_session_by_name_or_id(&id, &operator.name) {
         Ok(Some(s)) => s,
         Ok(None) => return error_response(SandboxError::SessionNotFound(id)).into_response(),
         Err(e) => return error_response(e).into_response(),
@@ -3344,6 +3424,7 @@ async fn update_policy(
 
     match apply_policy(
         &session.id,
+        &operator.name,
         &req.policy,
         &state,
         ApplyKind::Update {
@@ -3376,9 +3457,10 @@ async fn update_policy(
 /// cannot linger) and returns 200.
 async fn clear_policy(
     State(state): State<Arc<AppState>>,
+    Extension(operator): Extension<OperatorIdentity>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let session = match state.store.get_session_by_name_or_id(&id) {
+    let session = match state.store.get_session_by_name_or_id(&id, &operator.name) {
         Ok(Some(s)) => s,
         Ok(None) => return error_response(SandboxError::SessionNotFound(id)).into_response(),
         Err(e) => return error_response(e).into_response(),
@@ -3392,7 +3474,7 @@ async fn clear_policy(
         .into_response();
     }
 
-    match clear_session_policy(&session.id, &state).await {
+    match clear_session_policy(&session.id, &operator.name, &state).await {
         Ok(()) => {
             info!(session_id = %session.id, "policy cleared (fail-closed)");
             let body = serde_json::json!({
@@ -3425,13 +3507,17 @@ async fn clear_policy(
 /// fails we leave the DB row in place so a retry can complete the clear.
 async fn clear_session_policy(
     session_id: &SessionId,
+    caller_username: &str,
     state: &AppState,
 ) -> Result<(), SandboxError> {
-    let network_info = state.store.get_network_info(session_id)?.ok_or_else(|| {
-        SandboxError::Internal(format!(
-            "no network info for session {session_id} (networking not configured)"
-        ))
-    })?;
+    let network_info = state
+        .store
+        .get_network_info(session_id, caller_username)?
+        .ok_or_else(|| {
+            SandboxError::Internal(format!(
+                "no network info for session {session_id} (networking not configured)"
+            ))
+        })?;
 
     // Compile an empty policy — CoreDnsConfig becomes empty allow-list,
     // mitmproxy rules become empty (deny-all), Envoy listener becomes an
@@ -3495,7 +3581,7 @@ async fn clear_session_policy(
     }
 
     // Persist the clear.  Idempotent: safe to call when no row exists.
-    state.store.delete_policy(session_id)?;
+    state.store.delete_policy(session_id, caller_username)?;
 
     // Drop the in-memory entry so the DNS propagation loop — if any — has
     // nothing to work with, then cancel the loop itself.
@@ -3550,6 +3636,7 @@ enum ApplyKind {
 /// subscribers can alert on failed applies without polling.
 async fn apply_policy(
     session_id: &SessionId,
+    caller_username: &str,
     policy: &Policy,
     state: &AppState,
     kind: ApplyKind,
@@ -3566,7 +3653,7 @@ async fn apply_policy(
         ApplyKind::Initial { .. } | ApplyKind::Restoration => None,
     };
 
-    let result = apply_policy_inner(session_id, policy, state).await;
+    let result = apply_policy_inner(session_id, caller_username, policy, state).await;
 
     // Emit the lifecycle event after the apply has either fully
     // succeeded or failed — never in the middle of a partial state.
@@ -3611,15 +3698,19 @@ async fn apply_policy(
 /// leaking emission behavior into call sites.
 async fn apply_policy_inner(
     session_id: &SessionId,
+    caller_username: &str,
     policy: &Policy,
     state: &AppState,
 ) -> Result<(), SandboxError> {
     // Look up network info for this session.
-    let network_info = state.store.get_network_info(session_id)?.ok_or_else(|| {
-        SandboxError::Internal(format!(
-            "no network info for session {session_id} (networking not configured)"
-        ))
-    })?;
+    let network_info = state
+        .store
+        .get_network_info(session_id, caller_username)?
+        .ok_or_else(|| {
+            SandboxError::Internal(format!(
+                "no network info for session {session_id} (networking not configured)"
+            ))
+        })?;
 
     // Compile the policy.
     let compiled = PolicyCompiler::compile(policy, &network_info)?;
@@ -3685,7 +3776,9 @@ async fn apply_policy_inner(
     // budget.  If the transaction fails, propagate the error upward —
     // the in-memory map below is not touched, so the DNS propagation
     // loop keeps serving whatever policy was active before this call.
-    state.store.set_policy(session_id, policy)?;
+    state
+        .store
+        .set_policy(session_id, caller_username, policy)?;
 
     // Store the policy for the DNS propagation loop.  Done last so a
     // partially-persisted state cannot leave the in-memory map advertising
@@ -3722,7 +3815,10 @@ async fn start_dns_propagation_loop(session_id: &SessionId, state: &AppState) {
     let propagation_states = Arc::clone(&state.propagation_states);
     let event_bus = state.event_bus.clone();
 
-    let network_info = match state.store.get_network_info(session_id) {
+    // Daemon-internal read: this loop is spawned by callers that have
+    // already authorized the session via the per-caller filter
+    // (`apply_policy_inner`, `start_session`, `restore_session_networking`).
+    let network_info = match state.store.get_network_info_unfiltered(session_id) {
         Ok(Some(info)) => info,
         Ok(None) => {
             warn!(
@@ -3825,7 +3921,10 @@ async fn start_dns_gate_listener(session_id: &SessionId, state: &AppState) {
         }
     }
 
-    let network_info = match state.store.get_network_info(session_id) {
+    // Daemon-internal read: callers (`apply_policy_inner`, `start_session`,
+    // `restore_session_networking_*`) have already authorized the session
+    // via the per-caller filter at the handler boundary.
+    let network_info = match state.store.get_network_info_unfiltered(session_id) {
         Ok(Some(info)) => info,
         Ok(None) => {
             warn!(
@@ -4575,6 +4674,7 @@ async fn abort_session_ingestor(session_id: &SessionId, state: &AppState) {
 /// 4. Store network info in DB
 async fn setup_session_networking(
     session_id: &SessionId,
+    caller_username: &str,
     network_info: &sandbox_core::NetworkInfo,
     ca_dir: &std::path::Path,
     state: &AppState,
@@ -4663,7 +4763,9 @@ async fn setup_session_networking(
     // VM hasn't joined the bridge yet, so write order doesn't matter
     // to traffic correctness) while ensuring the listener can come
     // up.
-    state.store.set_network_info(session_id, network_info)?;
+    state
+        .store
+        .set_network_info(session_id, caller_username, network_info)?;
 
     // Start the synchronous DNS-gate UDS listener.
     // The events host directory was created by `create_gateway` and is
@@ -4730,6 +4832,7 @@ async fn setup_session_networking(
 /// below.
 async fn fail_explicit_policy_apply(
     store: &SessionStore,
+    caller_username: &str,
     gateway: &Arc<GatewayManager>,
     network: &Arc<NetworkManager>,
     ingestors: &Mutex<HashMap<SessionId, SessionIngestor>>,
@@ -4741,7 +4844,7 @@ async fn fail_explicit_policy_apply(
         error = %e,
         "failed to apply explicit initial policy — failing create"
     );
-    let _ = store.update_state(session_id, SessionState::Error);
+    let _ = store.update_state(session_id, caller_username, SessionState::Error);
     teardown_session_networking_parts(session_id, gateway, network, ingestors).await;
     error_response(e)
 }
@@ -4773,6 +4876,7 @@ async fn fail_explicit_policy_apply(
 /// `tests::fail_explicit_repo_clone_marks_session_error_and_returns_5xx`.
 async fn fail_explicit_repo_clone(
     store: &SessionStore,
+    caller_username: &str,
     gateway: &Arc<GatewayManager>,
     network: &Arc<NetworkManager>,
     ingestors: &Mutex<HashMap<SessionId, SessionIngestor>>,
@@ -4784,7 +4888,7 @@ async fn fail_explicit_repo_clone(
         error = %e,
         "failed to clone explicit --repo URL into VM — failing create"
     );
-    let _ = store.update_state(session_id, SessionState::Error);
+    let _ = store.update_state(session_id, caller_username, SessionState::Error);
     teardown_session_networking_parts(session_id, gateway, network, ingestors).await;
     error_response(e)
 }
@@ -4820,6 +4924,7 @@ async fn fail_explicit_repo_clone(
 /// `tests::fail_explicit_boot_cmd_marks_session_error_and_returns_5xx`.
 async fn fail_explicit_boot_cmd(
     store: &SessionStore,
+    caller_username: &str,
     gateway: &Arc<GatewayManager>,
     network: &Arc<NetworkManager>,
     ingestors: &Mutex<HashMap<SessionId, SessionIngestor>>,
@@ -4831,7 +4936,7 @@ async fn fail_explicit_boot_cmd(
         error = %e,
         "failed to run explicit --boot-cmd in VM — failing create"
     );
-    let _ = store.update_state(session_id, SessionState::Error);
+    let _ = store.update_state(session_id, caller_username, SessionState::Error);
     teardown_session_networking_parts(session_id, gateway, network, ingestors).await;
     error_response(e)
 }
@@ -4935,7 +5040,7 @@ async fn teardown_session_networking(session_id: &SessionId, state: &AppState) {
 ///
 /// Policy re-application is best-effort: failures are logged but do not
 /// propagate, matching the non-fatal semantics of initial policy setup.
-async fn reapply_session_policy(session_id: &SessionId, state: &AppState) {
+async fn reapply_session_policy(session_id: &SessionId, caller_username: &str, state: &AppState) {
     let container = gateway_container_name(session_id);
 
     // The in-memory map is cleared on stop, so fall back to the persistent
@@ -4947,7 +5052,7 @@ async fn reapply_session_policy(session_id: &SessionId, state: &AppState) {
     };
     let policy = match policy {
         Some(p) => Some(p),
-        None => match state.store.get_policy(session_id) {
+        None => match state.store.get_policy(session_id, caller_username) {
             Ok(p) => p,
             Err(e) => {
                 warn!(
@@ -4961,7 +5066,15 @@ async fn reapply_session_policy(session_id: &SessionId, state: &AppState) {
     };
 
     if let Some(policy) = policy {
-        match apply_policy(session_id, &policy, state, ApplyKind::Restoration).await {
+        match apply_policy(
+            session_id,
+            caller_username,
+            &policy,
+            state,
+            ApplyKind::Restoration,
+        )
+        .await
+        {
             Ok(()) => {
                 info!(
                     session_id = %session_id,
@@ -5008,10 +5121,11 @@ async fn reapply_session_policy(session_id: &SessionId, state: &AppState) {
 /// setup.
 async fn restore_session_networking(
     session_id: &SessionId,
+    caller_username: &str,
     state: &AppState,
 ) -> Result<(), SandboxError> {
     // Check that network info exists in DB (otherwise there's nothing to restore).
-    let network_info = match state.store.get_network_info(session_id)? {
+    let network_info = match state.store.get_network_info(session_id, caller_username)? {
         Some(info) => info,
         None => {
             info!(
@@ -5050,7 +5164,10 @@ async fn restore_session_networking(
     let has_stored_policy = {
         let policies = state.session_policies.lock().await;
         policies.contains_key(session_id)
-    } || matches!(state.store.get_policy(session_id), Ok(Some(_)));
+    } || matches!(
+        state.store.get_policy(session_id, caller_username),
+        Ok(Some(_))
+    );
     let initial_dns_policy_owned: String;
     let initial_dns_policy = if !has_stored_policy {
         initial_dns_policy_owned = CoreDnsConfig::empty_policy_file_content();
@@ -5121,7 +5238,7 @@ async fn restore_session_networking(
     // If a policy is stored, compile and distribute it to the running
     // gateway.  If no policy is stored, the allow-all was already written
     // during gateway creation above, so reapply only writes if needed.
-    reapply_session_policy(session_id, state).await;
+    reapply_session_policy(session_id, caller_username, state).await;
 
     // 3. Configure the bridge NIC inside the VM (already present from boot).
     if let Err(e) = attach_vm_to_bridge(session_id, &network_info, &state.guest).await {
@@ -5158,12 +5275,13 @@ async fn restore_session_networking(
 /// `inject_ca_into_vm`) are intentionally absent.
 async fn restore_session_networking_lite(
     session_id: &SessionId,
+    caller_username: &str,
     state: &AppState,
 ) -> Result<(), SandboxError> {
     // Network info must be present in the DB (set during create_session
     // step 6); without it there's nothing to rebuild. Mirrors the Lima
     // restore guard at the top of `restore_session_networking`.
-    let network_info = match state.store.get_network_info(session_id)? {
+    let network_info = match state.store.get_network_info(session_id, caller_username)? {
         Some(info) => info,
         None => {
             info!(
@@ -5201,7 +5319,10 @@ async fn restore_session_networking_lite(
     let has_stored_policy = {
         let policies = state.session_policies.lock().await;
         policies.contains_key(session_id)
-    } || matches!(state.store.get_policy(session_id), Ok(Some(_)));
+    } || matches!(
+        state.store.get_policy(session_id, caller_username),
+        Ok(Some(_))
+    );
     let initial_dns_policy_owned: String;
     let initial_dns_policy = if !has_stored_policy {
         initial_dns_policy_owned = CoreDnsConfig::empty_policy_file_content();
@@ -5260,7 +5381,7 @@ async fn restore_session_networking_lite(
     // 5. Re-apply the session's stored policy (if any) to the fresh
     // gateway. No-op when no policy is stored; the empty allow-all was
     // already pushed during create_gateway above via initial_dns_policy.
-    reapply_session_policy(session_id, state).await;
+    reapply_session_policy(session_id, caller_username, state).await;
 
     Ok(())
 }
@@ -5283,9 +5404,10 @@ fn format_gateway_status(gateway: &GatewayManager, session_id: &SessionId) -> St
 /// Per-session health endpoint: `GET /sessions/{id}/health`
 async fn session_health(
     State(state): State<Arc<AppState>>,
+    Extension(operator): Extension<OperatorIdentity>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let session = match state.store.get_session_by_name_or_id(&id) {
+    let session = match state.store.get_session_by_name_or_id(&id, &operator.name) {
         Ok(Some(s)) => s,
         Ok(None) => return error_response(SandboxError::SessionNotFound(id)).into_response(),
         Err(e) => return error_response(e).into_response(),
@@ -5385,7 +5507,11 @@ async fn session_health(
     // Network health: check if the Docker bridge exists.
     // TAP devices are now managed by QEMU via qemu-bridge-helper and are
     // created/destroyed with the VM process — no separate host-side check.
-    let network_info = state.store.get_network_info(&session.id).ok().flatten();
+    let network_info = state
+        .store
+        .get_network_info(&session.id, &operator.name)
+        .ok()
+        .flatten();
     let bridge_exists = if let Some(ref info) = network_info {
         let docker_network_name = info.docker_network_name.clone();
         tokio::task::spawn_blocking(move || {
@@ -5542,8 +5668,11 @@ async fn base_image_status(State(state): State<Arc<AppState>>) -> impl IntoRespo
 /// Global health endpoint: `GET /health`
 ///
 /// Returns gateway status per running session.
-async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let sessions = match state.store.list_sessions() {
+async fn health_check(
+    State(state): State<Arc<AppState>>,
+    Extension(operator): Extension<OperatorIdentity>,
+) -> impl IntoResponse {
+    let sessions = match state.store.list_sessions(&operator.name) {
         Ok(s) => s,
         Err(e) => return error_response(e).into_response(),
     };
@@ -5593,7 +5722,10 @@ async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 /// extension once additional backends ship a comparable inventory
 /// surface.
 fn reconcile(store: &SessionStore, lima_runtime: &LimaRuntime) {
-    let sessions = match store.list_sessions() {
+    // Daemon startup path — runs before any HTTP handler, so per-caller
+    // filtering would be meaningless here. Use the unfiltered helper to
+    // walk every persisted session.
+    let sessions = match store.list_sessions_unfiltered() {
         Ok(s) => s,
         Err(e) => {
             error!(error = %e, "reconciliation: failed to list sessions");
@@ -5643,7 +5775,7 @@ fn reconcile(store: &SessionStore, lima_runtime: &LimaRuntime) {
                     state = %session.state,
                     "reconciliation: VM missing, marking session as Error"
                 );
-                let _ = store.update_state_forced(&session.id, SessionState::Error);
+                let _ = store.update_state_reconcile(&session.id, SessionState::Error);
                 fixed_count += 1;
             }
             // VM missing, session already stopped or errored -> OK
@@ -5659,7 +5791,7 @@ fn reconcile(store: &SessionStore, lima_runtime: &LimaRuntime) {
                         session_id = %session.id,
                         "reconciliation: VM stopped but session says Running, updating to Stopped"
                     );
-                    let _ = store.update_state_forced(&session.id, SessionState::Stopped);
+                    let _ = store.update_state_reconcile(&session.id, SessionState::Stopped);
                     fixed_count += 1;
                 }
                 (SessionState::Stopped, VmStatus::Running) => {
@@ -5667,7 +5799,7 @@ fn reconcile(store: &SessionStore, lima_runtime: &LimaRuntime) {
                         session_id = %session.id,
                         "reconciliation: VM running but session says Stopped, updating to Running"
                     );
-                    let _ = store.update_state_forced(&session.id, SessionState::Running);
+                    let _ = store.update_state_reconcile(&session.id, SessionState::Running);
                     fixed_count += 1;
                 }
                 _ => {
@@ -5693,7 +5825,9 @@ fn reconcile(store: &SessionStore, lima_runtime: &LimaRuntime) {
 ///
 /// For each Stopped session: ensure gateway is stopped and TAP is removed.
 async fn reconcile_networking(state: &AppState) {
-    let sessions = match state.store.list_sessions() {
+    // Daemon-internal reconciler — every session row regardless of
+    // owner. Per-caller filtering does not apply here.
+    let sessions = match state.store.list_sessions_unfiltered() {
         Ok(s) => s,
         Err(e) => {
             error!(error = %e, "network reconciliation: failed to list sessions");
@@ -5761,24 +5895,28 @@ async fn reconcile_networking(state: &AppState) {
                             "network reconciliation: gateway not healthy, attempting restart"
                         );
 
-                        let network_info = match state.store.get_network_info(&session.id) {
-                            Ok(Some(info)) => info,
-                            Ok(None) => {
-                                warn!(
-                                    session_id = %session.id,
-                                    "network reconciliation: no network info, skipping"
-                                );
-                                continue;
-                            }
-                            Err(e) => {
-                                warn!(
-                                    session_id = %session.id,
-                                    error = %e,
-                                    "network reconciliation: failed to get network info"
-                                );
-                                continue;
-                            }
-                        };
+                        // Daemon-internal reconciler — every session row
+                        // regardless of owner. Per-caller filtering does
+                        // not apply here.
+                        let network_info =
+                            match state.store.get_network_info_unfiltered(&session.id) {
+                                Ok(Some(info)) => info,
+                                Ok(None) => {
+                                    warn!(
+                                        session_id = %session.id,
+                                        "network reconciliation: no network info, skipping"
+                                    );
+                                    continue;
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        session_id = %session.id,
+                                        error = %e,
+                                        "network reconciliation: failed to get network info"
+                                    );
+                                    continue;
+                                }
+                            };
 
                         // Ensure Docker network exists.
                         let net = Arc::clone(&state.network);
@@ -5874,7 +6012,13 @@ async fn reconcile_networking(state: &AppState) {
                                 // connection records on startup.
                                 spawn_session_ingestor(&session.id, state).await;
                                 // Re-apply the session's policy to the fresh gateway.
-                                reapply_session_policy(&session.id, state).await;
+                                // Daemon-internal reconciler scope — the
+                                // session was selected via the unfiltered
+                                // listing above, so reuse the row's own
+                                // `owner_username` for the per-caller
+                                // filter on the policy lookup.
+                                reapply_session_policy(&session.id, &session.owner_username, state)
+                                    .await;
                                 restored += 1;
                             }
                         }
@@ -6018,7 +6162,9 @@ async fn gateway_monitor(state: Arc<AppState>) {
     loop {
         tokio::time::sleep(poll_interval).await;
 
-        let sessions = match state.store.list_sessions() {
+        // Daemon-internal reconciler — every session row regardless of
+        // owner. Per-caller filtering does not apply here.
+        let sessions = match state.store.list_sessions_unfiltered() {
             Ok(s) => s,
             Err(e) => {
                 warn!(error = %e, "gateway monitor: failed to list sessions");
@@ -6177,7 +6323,10 @@ async fn gateway_monitor(state: Arc<AppState>) {
                         "gateway monitor: gateway not healthy, attempting recovery"
                     );
 
-                    let network_info = match state.store.get_network_info(&session.id) {
+                    // Daemon-internal reconciler — every session row
+                    // regardless of owner. Per-caller filtering does
+                    // not apply here.
+                    let network_info = match state.store.get_network_info_unfiltered(&session.id) {
                         Ok(Some(info)) => info,
                         Ok(None) => {
                             warn!(
@@ -6273,7 +6422,13 @@ async fn gateway_monitor(state: Arc<AppState>) {
                             // leaking until daemon exit.
                             spawn_session_ingestor(&session.id, &state).await;
                             // Re-apply the session's policy to the fresh gateway.
-                            reapply_session_policy(&session.id, &state).await;
+                            // Daemon-internal reconciler scope — the
+                            // session was selected via the unfiltered
+                            // listing above, so reuse the row's own
+                            // `owner_username` for the per-caller
+                            // filter on the policy lookup.
+                            reapply_session_policy(&session.id, &session.owner_username, &state)
+                                .await;
                         }
                         Ok(Err(e)) => {
                             error!(
@@ -6548,7 +6703,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // derived session id is not in `sessions.db` is removed.
     // Best-effort and idempotent — a Docker hiccup logs and continues
     // rather than aborting startup.
-    let live_session_ids: HashSet<SessionId> = match store.list_sessions() {
+    // Daemon-internal orphan reaper — needs every session row regardless
+    // of owner. Per-caller filtering does not apply here.
+    let live_session_ids: HashSet<SessionId> = match store.list_sessions_unfiltered() {
         Ok(sessions) => sessions.into_iter().map(|s| s.id).collect(),
         Err(e) => {
             warn!(
@@ -7795,10 +7952,16 @@ mod tests {
         // Create a session and move it to `Running` — the only state
         // from which `create_session` reaches the `apply_policy` call.
         let session = store
-            .create_session(SessionConfig::default(), Some("policy-fail-test".into()))
+            .create_session(
+                SessionConfig::default(),
+                Some("policy-fail-test".into()),
+                "test-operator",
+                0,
+                "",
+            )
             .expect("create session");
         store
-            .update_state(&session.id, SessionState::Running)
+            .update_state(&session.id, "test-operator", SessionState::Running)
             .expect("transition Creating → Running");
 
         // Build the minimal manager surface the helper consumes. None
@@ -7823,6 +7986,7 @@ mod tests {
         let synthetic_err = SandboxError::Gateway("synthetic: gateway unreachable".into());
         let (status, Json(body)) = fail_explicit_policy_apply(
             &store,
+            "test-operator",
             &gateway,
             &network,
             &ingestors,
@@ -7850,7 +8014,7 @@ mod tests {
         // failed create is distinguishable from an inconsistent
         // `Running` session.
         let reloaded = store
-            .get_session(&session.id)
+            .get_session(&session.id, "test-operator")
             .expect("store readable")
             .expect("session row still present");
         assert_eq!(
@@ -7897,10 +8061,16 @@ mod tests {
         // Move the session to `Running` — the only state from which
         // `create_session` reaches the `git clone` block.
         let session = store
-            .create_session(SessionConfig::default(), Some("clone-fail-test".into()))
+            .create_session(
+                SessionConfig::default(),
+                Some("clone-fail-test".into()),
+                "test-operator",
+                0,
+                "",
+            )
             .expect("create session");
         store
-            .update_state(&session.id, SessionState::Running)
+            .update_state(&session.id, "test-operator", SessionState::Running)
             .expect("transition Creating → Running");
 
         let gateway = Arc::new(GatewayManager::new());
@@ -7922,6 +8092,7 @@ mod tests {
         );
         let (status, Json(body)) = fail_explicit_repo_clone(
             &store,
+            "test-operator",
             &gateway,
             &network,
             &ingestors,
@@ -7962,7 +8133,7 @@ mod tests {
         // / `inspect` surface the failed create rather than a
         // misleading `Running` row with an empty workspace.
         let reloaded = store
-            .get_session(&session.id)
+            .get_session(&session.id, "test-operator")
             .expect("store readable")
             .expect("session row still present");
         assert_eq!(
@@ -8048,10 +8219,16 @@ mod tests {
         // Move the session to `Running` — the only state from which
         // `create_session` reaches the boot-command block.
         let session = store
-            .create_session(SessionConfig::default(), Some("boot-cmd-fail-test".into()))
+            .create_session(
+                SessionConfig::default(),
+                Some("boot-cmd-fail-test".into()),
+                "test-operator",
+                0,
+                "",
+            )
             .expect("create session");
         store
-            .update_state(&session.id, SessionState::Running)
+            .update_state(&session.id, "test-operator", SessionState::Running)
             .expect("transition Creating → Running");
 
         let gateway = Arc::new(GatewayManager::new());
@@ -8075,6 +8252,7 @@ mod tests {
         );
         let (status, Json(body)) = fail_explicit_boot_cmd(
             &store,
+            "test-operator",
             &gateway,
             &network,
             &ingestors,
@@ -8116,7 +8294,7 @@ mod tests {
         // misleading `Running` row whose boot command's side effects
         // are unrealised.
         let reloaded = store
-            .get_session(&session.id)
+            .get_session(&session.id, "test-operator")
             .expect("store readable")
             .expect("session row still present");
         assert_eq!(

@@ -75,6 +75,11 @@ impl From<&Session> for SessionDto {
             state: session.state,
             created_at: session.created_at,
             updated_at: session.updated_at,
+            // V006 stamps the operator's username into the session row
+            // (api-session-isolation spec § 2.4 + § 2.6) at create time;
+            // surface that value verbatim on the wire so list / get
+            // endpoints render the owner without a separate lookup.
+            owner_username: session.owner_username.clone(),
             config,
             guest_agent_status: None,
             gateway_status: None,

@@ -1,5 +1,6 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::str::FromStr;
 use std::sync::Mutex;
 
@@ -97,19 +98,26 @@ impl SessionStore {
         // row) is deleted. SQLite requires this pragma per-connection.
         conn.pragma_update(None, "foreign_keys", "ON")?;
 
-        // Run migrations in two passes so V004's `DELETE FROM
+        // Run migrations in three passes so V004's `DELETE FROM
         // policy_rules` doesn't erase the rule counts we want to
-        // attribute onto the `policy_reset_on_upgrade` event.
+        // attribute onto the `policy_reset_on_upgrade` event, and so
+        // V006's destructive `DELETE FROM sessions` doesn't cascade-
+        // delete the orphaned `session_policies` rows we want to
+        // sweep + emit events for.
         //
         //   Pass 1: Target::Version(3) — apply V001..V003, then
         //           snapshot per-session rule counts from the v1
         //           schema while rows still exist.
-        //   Pass 2: unbounded run() — apply V004 and anything later.
+        //   Pass 2: Target::Version(5) — apply V004 (and V005), then
+        //           sweep the v1 orphans into `policy_reset_on_upgrade`
+        //           events while the parent `session_policies` rows
+        //           still exist (V006 below cascades them away).
+        //   Pass 3: unbounded run() — apply V006 and anything later.
         //
         // On databases already at >= V004 (second boot, tests that
         // seed at V004 directly), pass 1 is a no-op and the snapshot
         // is empty; the sweep below finds no orphans and emits no
-        // events.  That keeps the two-pass split transparent to
+        // events.  That keeps the multi-pass split transparent to
         // existing tests.
         embedded::migrations::runner()
             .set_target(refinery::Target::Version(3))
@@ -118,9 +126,24 @@ impl SessionStore {
 
         let pre_v004_rule_counts = Self::snapshot_pre_v004_rule_counts(&conn)?;
 
+        // Snapshot the set of refinery-applied migration versions
+        // *before* the unbounded run; comparing the post-run set to
+        // this lets us detect "V006 was just applied in this boot"
+        // exactly once (subsequent boots find V006 already in the
+        // history table and the orphan scan stays silent). The set is
+        // small (one row per migration) so a HashSet is overkill — a
+        // Vec scan is fine.
+        let applied_before: Vec<u32> = Self::applied_migration_versions(&conn);
+
+        // Pass 2: apply V004+V005 only. V004 deletes v1 rule rows but
+        // leaves their parent `session_policies` rows in place — that
+        // is exactly the orphan shape `purge_orphaned_policies_and_emit_reset_events`
+        // sweeps. Stopping the runner at V5 ensures V006 has not yet
+        // wiped `sessions` (and cascaded through `session_policies`).
         embedded::migrations::runner()
+            .set_target(refinery::Target::Version(5))
             .run(&mut conn)
-            .map_err(|e| SandboxError::Internal(format!("migration error (V004+): {e}")))?;
+            .map_err(|e| SandboxError::Internal(format!("migration error (V004..V005): {e}")))?;
 
         // V004 turns v1-shaped policy rules into `session_policies` rows
         // with no children.  Sweep those orphans here and emit a
@@ -135,6 +158,25 @@ impl SessionStore {
         let orphans =
             Self::purge_orphaned_policies_and_emit_reset_events(&conn, &pre_v004_rule_counts)?;
 
+        // Pass 3: apply V006 and anything later. The unbounded run is a
+        // no-op when the DB is already at the latest version.
+        let report = embedded::migrations::runner()
+            .run(&mut conn)
+            .map_err(|e| SandboxError::Internal(format!("migration error (V006+): {e}")))?;
+
+        // V006 substrate-orphan scan (api-session-isolation spec § 2.1.1).
+        // Fires exactly once: on the boot where refinery just applied
+        // V006. The refinery report tells us which versions ran this
+        // pass; cross-checking against `applied_before` would be
+        // redundant because `report.applied_migrations()` lists only
+        // the migrations applied *during this run*. The scan is
+        // diagnostic — it logs and does not delete.
+        let v006_just_applied = report.applied_migrations().iter().any(|m| m.version() == 6)
+            && !applied_before.contains(&6);
+        if v006_just_applied {
+            Self::run_v006_orphan_scan(&base_dir);
+        }
+
         Ok((
             Self {
                 conn: Mutex::new(conn),
@@ -142,6 +184,234 @@ impl SessionStore {
             },
             orphans,
         ))
+    }
+
+    /// Read the set of refinery-applied migration versions from the
+    /// schema-history table. Returns an empty list if the table does
+    /// not yet exist (fresh DB before any migration runs).
+    fn applied_migration_versions(conn: &Connection) -> Vec<u32> {
+        let mut stmt = match conn.prepare("SELECT version FROM refinery_schema_history") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map([], |row| row.get::<_, i64>(0)) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        for row in rows.flatten() {
+            if row >= 0 {
+                out.push(row as u32);
+            }
+        }
+        out
+    }
+
+    /// Substrate-orphan scan emitted exactly once on the boot where
+    /// V006 is freshly applied. Enumerates Lima VMs, Docker containers,
+    /// volumes, networks, and `{base_dir}/sessions/<id>/` directories
+    /// matching the daemon's `sandbox-*` naming conventions, and logs
+    /// one `warn!` line per found orphan plus a summary line.
+    ///
+    /// **Diagnostic only.** The scan never deletes — that is the
+    /// operator's call once they have read the log lines. Spec 2 §
+    /// 2.1.1 lays out the rationale.
+    fn run_v006_orphan_scan(base_dir: &Path) {
+        let mut found: u32 = 0;
+
+        found += Self::v006_scan_lima_vms();
+        found += Self::v006_scan_docker_resource(
+            "container",
+            &[
+                "ps",
+                "-a",
+                "--filter",
+                "name=sandbox-",
+                "--format",
+                "{{.Names}} {{.Status}}",
+            ],
+            |line| {
+                let mut parts = line.splitn(2, ' ');
+                let name = parts.next()?.trim().to_string();
+                if !name.starts_with("sandbox-") {
+                    return None;
+                }
+                let status = parts.next().unwrap_or("unknown").trim().to_string();
+                Some((name, status))
+            },
+            "Docker container",
+        );
+        found += Self::v006_scan_docker_resource(
+            "volume",
+            &[
+                "volume",
+                "ls",
+                "--filter",
+                "name=sandbox-home-",
+                "--format",
+                "{{.Name}}",
+            ],
+            |line| {
+                let name = line.trim().to_string();
+                if name.starts_with("sandbox-home-") {
+                    Some((name, String::new()))
+                } else {
+                    None
+                }
+            },
+            "Docker volume",
+        );
+        found += Self::v006_scan_docker_resource(
+            "network",
+            &[
+                "network",
+                "ls",
+                "--filter",
+                "name=sandbox-net-",
+                "--format",
+                "{{.Name}}",
+            ],
+            |line| {
+                let name = line.trim().to_string();
+                if name.starts_with("sandbox-net-") {
+                    Some((name, String::new()))
+                } else {
+                    None
+                }
+            },
+            "Docker network",
+        );
+        found += Self::v006_scan_session_directories(base_dir);
+
+        warn!(
+            event = "v006_orphan_scan_complete",
+            orphan_count = found,
+            "V006 orphan scan complete - {found} orphan(s) logged above. \
+             Run `sandbox doctor` (Spec 3) for a reconciliation report. \
+             Do NOT auto-delete; review each orphan before cleanup."
+        );
+    }
+
+    /// Run `limactl list --json` and `warn!`-log each VM whose name
+    /// starts with `sandbox-`. Returns the count of orphans logged.
+    fn v006_scan_lima_vms() -> u32 {
+        let output = match Command::new("limactl").args(["list", "--json"]).output() {
+            Ok(o) if o.status.success() => o,
+            Ok(_) | Err(_) => {
+                warn!(
+                    event = "v006_orphan_scan_tool_unavailable",
+                    tool = "limactl",
+                    "V006 orphan scan: limactl is unavailable or failed; \
+                     skipping Lima VM enumeration"
+                );
+                return 0;
+            }
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut found = 0u32;
+        for line in stdout.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let parsed: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let name = match parsed.get("name").and_then(|n| n.as_str()) {
+                Some(n) if n.starts_with("sandbox-") => n.to_string(),
+                _ => continue,
+            };
+            let status = parsed
+                .get("status")
+                .and_then(|s| s.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            warn!(
+                event = "v006_orphan_lima_vm",
+                vm_name = %name,
+                status = %status,
+                "orphaned Lima VM after V006: {name} (status: {status})"
+            );
+            found += 1;
+        }
+        found
+    }
+
+    /// Run a `docker ...` command and parse one orphan per output
+    /// line. The `parse` callback returns `(name, status_string)` for
+    /// matching lines or `None` to skip. Returns the count of orphans
+    /// logged.
+    fn v006_scan_docker_resource(
+        kind: &str,
+        args: &[&str],
+        parse: impl Fn(&str) -> Option<(String, String)>,
+        label: &str,
+    ) -> u32 {
+        let output = match Command::new("docker").args(args).output() {
+            Ok(o) if o.status.success() => o,
+            Ok(_) | Err(_) => {
+                warn!(
+                    event = "v006_orphan_scan_tool_unavailable",
+                    tool = "docker",
+                    kind = kind,
+                    "V006 orphan scan: docker is unavailable or failed; \
+                     skipping {kind} enumeration"
+                );
+                return 0;
+            }
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut found = 0u32;
+        for line in stdout.lines() {
+            if let Some((name, status)) = parse(line) {
+                if status.is_empty() {
+                    warn!(
+                        event = "v006_orphan_docker",
+                        kind = kind,
+                        name = %name,
+                        "orphaned {label} after V006: {name}"
+                    );
+                } else {
+                    warn!(
+                        event = "v006_orphan_docker",
+                        kind = kind,
+                        name = %name,
+                        status = %status,
+                        "orphaned {label} after V006: {name} (status: {status})"
+                    );
+                }
+                found += 1;
+            }
+        }
+        found
+    }
+
+    /// Enumerate `{base_dir}/sessions/<id>/` directories and
+    /// `warn!`-log each. Returns the count of orphans logged.
+    fn v006_scan_session_directories(base_dir: &Path) -> u32 {
+        let sessions_dir = base_dir.join("sessions");
+        let entries = match fs::read_dir(&sessions_dir) {
+            Ok(e) => e,
+            Err(_) => return 0,
+        };
+        let mut found = 0u32;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let path_str = path.display().to_string();
+            warn!(
+                event = "v006_orphan_session_dir",
+                path = %path_str,
+                "orphaned session directory after V006: {path_str}"
+            );
+            found += 1;
+        }
+        found
     }
 
     /// Snapshot per-session `policy_rules` row counts at the V003
@@ -246,16 +516,34 @@ impl SessionStore {
     /// If the generated 12-hex ID collides with an existing session (rare but
     /// possible with 48 bits of entropy), the session is regenerated and
     /// re-inserted up to `INSERT_COLLISION_RETRIES` times before failing.
+    ///
+    /// `owner_username` is stamped into the `sessions.owner_username`
+    /// column added by V006 (api-session-isolation spec § 2.4) so every
+    /// subsequent read or mutation filters by the caller's identity.
+    /// `guest_proto` / `guest_bin_ver` are the protocol-version and
+    /// binary-version stamps that drive the start-time compat gate; in
+    /// M13-S4 they ride as placeholders (`0`, `""`) until M13-S5 wires
+    /// up the real constants.
     pub fn create_session(
         &self,
         config: SessionConfig,
         name: Option<String>,
+        owner_username: &str,
+        guest_proto: u32,
+        guest_bin_ver: &str,
     ) -> Result<Session, SandboxError> {
         // Back-compat shim: the public `create_session` defaults to
         // the Lima backend so existing call sites (and tests) keep
         // their behaviour unchanged. Container-backed sessions go
         // through `create_session_with_backend`.
-        self.create_session_with_backend(config, name, crate::backend::BackendKind::Lima)
+        self.create_session_with_backend(
+            config,
+            name,
+            crate::backend::BackendKind::Lima,
+            owner_username,
+            guest_proto,
+            guest_bin_ver,
+        )
     }
 
     /// Like [`Self::create_session`], but lets the caller pin which backend
@@ -267,13 +555,20 @@ impl SessionStore {
         config: SessionConfig,
         name: Option<String>,
         backend: crate::backend::BackendKind,
+        owner_username: &str,
+        guest_proto: u32,
+        guest_bin_ver: &str,
     ) -> Result<Session, SandboxError> {
         let config_json = serde_json::to_string(&config)
             .map_err(|e| SandboxError::Internal(format!("failed to serialize config: {e}")))?;
 
         let mut attempt = 0u32;
         loop {
-            let session = Session::with_config_and_backend(name.clone(), config.clone(), backend);
+            let mut session =
+                Session::with_config_and_backend(name.clone(), config.clone(), backend);
+            session.owner_username = owner_username.to_string();
+            session.guest_protocol_version = guest_proto;
+            session.guest_binary_version = guest_bin_ver.to_string();
             match self.try_insert_session(&session, &config_json) {
                 Ok(()) => {
                     fs::create_dir_all(self.session_dir(&session.id))?;
@@ -302,8 +597,9 @@ impl SessionStore {
         })?;
 
         let res = conn.execute(
-            "INSERT INTO sessions (id, name, state, config, created_at, updated_at, backend)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO sessions (id, name, state, config, created_at, updated_at, backend, \
+                 owner_username, guest_protocol_version, guest_binary_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 session.id.as_str(),
                 session.name,
@@ -312,6 +608,9 @@ impl SessionStore {
                 session.created_at.to_rfc3339(),
                 session.updated_at.to_rfc3339(),
                 session.backend.as_str(),
+                session.owner_username,
+                session.guest_protocol_version as i64,
+                session.guest_binary_version,
             ],
         );
 
@@ -327,14 +626,55 @@ impl SessionStore {
     }
 
     /// Retrieve a session by ID, or `None` if it does not exist.
-    pub fn get_session(&self, id: &SessionId) -> Result<Option<Session>, SandboxError> {
+    ///
+    /// Per-caller isolation (api-session-isolation spec § 2.4): the
+    /// `WHERE` clause also filters `owner_username = ?caller_username`,
+    /// so a foreign session ID is indistinguishable on the wire from a
+    /// truly nonexistent ID — both return `Ok(None)` and the handler
+    /// layer maps that to HTTP 404.
+    pub fn get_session(
+        &self,
+        id: &SessionId,
+        caller_username: &str,
+    ) -> Result<Option<Session>, SandboxError> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, name, state, config, created_at, updated_at, backend
+            "SELECT id, name, state, config, created_at, updated_at, backend, \
+                 owner_username, guest_protocol_version, guest_binary_version
+             FROM sessions WHERE id = ?1 AND owner_username = ?2",
+        )?;
+
+        let mut rows = stmt.query(params![id.as_str(), caller_username])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row_to_session(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Internal helper for daemon-side subsystems that need to read a
+    /// row by id without an HTTP caller in scope. **Not for handler
+    /// code.** Use [`Self::get_session`] from any request path so the
+    /// per-caller filter is enforced; this entry point exists only for
+    /// the `GuestConnector`, the propagation tracker, and the lifecycle
+    /// reconciler — all daemon-internal subsystems that operate on
+    /// sessions previously authorized by a per-caller lookup at the
+    /// handler boundary.
+    pub(crate) fn get_session_unfiltered(
+        &self,
+        id: &SessionId,
+    ) -> Result<Option<Session>, SandboxError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
+
+        let mut stmt = conn.prepare(
+            "SELECT id, name, state, config, created_at, updated_at, backend, \
+                 owner_username, guest_protocol_version, guest_binary_version
              FROM sessions WHERE id = ?1",
         )?;
 
@@ -345,19 +685,63 @@ impl SessionStore {
         }
     }
 
-    /// List all sessions.
-    pub fn list_sessions(&self) -> Result<Vec<Session>, SandboxError> {
+    /// List all sessions owned by `caller_username`.
+    ///
+    /// Per-caller isolation (api-session-isolation spec § 2.4): each
+    /// caller sees only their own rows. Other operators' sessions never
+    /// surface on the wire — list endpoints return disjoint result sets
+    /// per caller.
+    /// Internal helper for daemon-side reconciliation and reconciler
+    /// tasks that need the full session inventory irrespective of
+    /// caller. **Not for handler code.** HTTP handlers must use
+    /// [`Self::list_sessions`], which enforces ownership via the
+    /// `caller_username` filter. See `api-session-isolation` spec § 2.4
+    /// for the rationale.
+    pub fn list_sessions_unfiltered(&self) -> Result<Vec<Session>, SandboxError> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, name, state, config, created_at, updated_at, backend
+            "SELECT id, name, state, config, created_at, updated_at, backend, \
+                 owner_username, guest_protocol_version, guest_binary_version
              FROM sessions ORDER BY created_at ASC",
         )?;
 
         let rows = stmt.query_map([], |row| {
+            row_to_session(row).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        e.to_string(),
+                    )),
+                )
+            })
+        })?;
+
+        let mut sessions = Vec::new();
+        for row in rows {
+            sessions.push(row?);
+        }
+        Ok(sessions)
+    }
+
+    pub fn list_sessions(&self, caller_username: &str) -> Result<Vec<Session>, SandboxError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
+
+        let mut stmt = conn.prepare(
+            "SELECT id, name, state, config, created_at, updated_at, backend, \
+                 owner_username, guest_protocol_version, guest_binary_version
+             FROM sessions WHERE owner_username = ?1 ORDER BY created_at ASC",
+        )?;
+
+        let rows = stmt.query_map(params![caller_username], |row| {
             row_to_session(row).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
                     0,
@@ -383,11 +767,18 @@ impl SessionStore {
     /// (see [`SessionState::can_transition_to`]).  Returns
     /// `SandboxError::InvalidState` if the transition is not valid.
     ///
-    /// For reconciliation or crash-recovery code that must force a state
-    /// regardless of the current value, use [`Self::update_state_forced`] instead.
+    /// Per-caller isolation (api-session-isolation spec § 2.4): only
+    /// rows owned by `caller_username` are considered; a foreign-owner
+    /// row surfaces as `Err(SessionNotFound)` so the handler layer
+    /// returns HTTP 404 indistinguishable from a truly-nonexistent ID.
+    ///
+    /// For reconciliation or crash-recovery code that must force a
+    /// state regardless of the current value AND has no HTTP caller in
+    /// scope, use [`Self::update_state_reconcile`] instead.
     pub fn update_state(
         &self,
         id: &SessionId,
+        caller_username: &str,
         new_state: SessionState,
     ) -> Result<(), SandboxError> {
         let conn = self
@@ -396,9 +787,14 @@ impl SessionStore {
             .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
 
         // Fetch the current state so we can validate the transition.
+        // Combines the caller-ownership filter and the state read in
+        // one query: a row that exists for a different owner returns
+        // `None` here, which maps to `SessionNotFound` — the same
+        // shape the handler layer hides as HTTP 404.
         let current_state = {
-            let mut stmt = conn.prepare("SELECT state FROM sessions WHERE id = ?1")?;
-            let mut rows = stmt.query(params![id.as_str()])?;
+            let mut stmt =
+                conn.prepare("SELECT state FROM sessions WHERE id = ?1 AND owner_username = ?2")?;
+            let mut rows = stmt.query(params![id.as_str(), caller_username])?;
             match rows.next()? {
                 Some(row) => {
                     let state_str: String = row.get(0)?;
@@ -416,20 +812,39 @@ impl SessionStore {
 
         let now = Utc::now();
         conn.execute(
-            "UPDATE sessions SET state = ?1, updated_at = ?2 WHERE id = ?3",
-            params![new_state.to_string(), now.to_rfc3339(), id.as_str()],
+            "UPDATE sessions SET state = ?1, updated_at = ?2
+             WHERE id = ?3 AND owner_username = ?4",
+            params![
+                new_state.to_string(),
+                now.to_rfc3339(),
+                id.as_str(),
+                caller_username,
+            ],
         )?;
 
         Ok(())
     }
 
-    /// Forcibly set the state of a session, bypassing state machine validation.
+    /// Forcibly set the state of a session, bypassing both state-machine
+    /// validation and the storage-boundary ownership filter.
     ///
-    /// This is intended **only** for reconciliation and crash-recovery code
-    /// that must align the DB with external reality (e.g. a VM that was
-    /// found running when the DB says Stopped).  Normal handler code should
-    /// use [`Self::update_state`] which enforces the state machine.
-    pub fn update_state_forced(
+    /// **INTERNAL: only the daemon's startup / reconciliation paths may
+    /// call this method.** HTTP handlers must use [`Self::update_state`],
+    /// which enforces ownership via the `caller_username` filter
+    /// (api-session-isolation spec § 2.4). A call from a request handler
+    /// is a security bug — it bypasses the per-caller 404-on-foreign-id
+    /// property the rest of the store guarantees.
+    ///
+    /// Authorized callers, exhaustively (api-session-isolation spec
+    /// § 7.3.1 enforces this list via a static-analysis test):
+    /// - `list_sessions` and `get_session` reconciler blocks in
+    ///   `sandboxd::main` (DB-vs-runtime status divergence).
+    /// - The `Creating` -> `Running`/`Error` transitions in
+    ///   `create_session` and `start_session` *before* the session is
+    ///   owner-stamped (only on the error/cleanup branch; the happy
+    ///   path uses `update_state`).
+    /// - Startup reconciliation in `sandboxd::main::main`.
+    pub fn update_state_reconcile(
         &self,
         id: &SessionId,
         state: SessionState,
@@ -462,18 +877,27 @@ impl SessionStore {
     ///    lowercase hex chars), try [`Self::resolve_id_prefix`]. Returns the matching
     ///    session if exactly one ID has this prefix.
     ///
+    /// Per-caller isolation (api-session-isolation spec § 2.4): every
+    /// fallback path filters on `owner_username = caller_username`, so
+    /// foreign rows never surface and the 404-on-foreign-id property
+    /// holds across name lookup, ID prefix, and full-ID paths.
+    ///
     /// Returns `None` if no session matches. Returns
     /// [`SandboxError::InvalidArgument`] if the prefix matches multiple
-    /// sessions (ambiguous).
-    pub fn get_session_by_name_or_id(&self, query: &str) -> Result<Option<Session>, SandboxError> {
+    /// caller-owned sessions (ambiguous).
+    pub fn get_session_by_name_or_id(
+        &self,
+        query: &str,
+        caller_username: &str,
+    ) -> Result<Option<Session>, SandboxError> {
         // Try exact SessionId first.
         if let Ok(id) = SessionId::parse(query) {
-            if let Some(session) = self.get_session(&id)? {
+            if let Some(session) = self.get_session(&id, caller_username)? {
                 return Ok(Some(session));
             }
         }
 
-        // Try exact name lookup.
+        // Try exact name lookup, scoped to caller-owned rows.
         {
             let conn = self
                 .conn
@@ -481,19 +905,20 @@ impl SessionStore {
                 .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
 
             let mut stmt = conn.prepare(
-                "SELECT id, name, state, config, created_at, updated_at, backend
-                 FROM sessions WHERE name = ?1",
+                "SELECT id, name, state, config, created_at, updated_at, backend, \
+                     owner_username, guest_protocol_version, guest_binary_version
+                 FROM sessions WHERE name = ?1 AND owner_username = ?2",
             )?;
 
-            let mut rows = stmt.query(params![query])?;
+            let mut rows = stmt.query(params![query, caller_username])?;
             if let Some(row) = rows.next()? {
                 return Ok(Some(row_to_session(row)?));
             }
         }
 
         // Fall back to ID prefix resolution.
-        match self.resolve_id_prefix(query)? {
-            ResolveOutcome::Found(id) => self.get_session(&id),
+        match self.resolve_id_prefix(query, caller_username)? {
+            ResolveOutcome::Found(id) => self.get_session(&id, caller_username),
             ResolveOutcome::Ambiguous(ids) => {
                 let list = ids
                     .iter()
@@ -508,19 +933,27 @@ impl SessionStore {
         }
     }
 
-    /// Resolve a session ID prefix to a full ID.
+    /// Resolve a session ID prefix to a full ID, scoped to caller-owned rows.
     ///
     /// The prefix must be between 1 and 12 lowercase hex characters. Returns:
-    /// - [`ResolveOutcome::Found`] if exactly one session ID starts with the
-    ///   prefix.
-    /// - [`ResolveOutcome::NotFound`] if no session matches.
-    /// - [`ResolveOutcome::Ambiguous`] if multiple sessions match, listing all
-    ///   matching IDs.
+    /// - [`ResolveOutcome::Found`] if exactly one caller-owned session ID
+    ///   starts with the prefix.
+    /// - [`ResolveOutcome::NotFound`] if no caller-owned session matches.
+    /// - [`ResolveOutcome::Ambiguous`] if multiple caller-owned sessions
+    ///   match, listing all matching IDs.
+    ///
+    /// Per-caller isolation (api-session-isolation spec § 2.4): foreign-
+    /// owner rows are invisible — a prefix that matches another
+    /// operator's session ID returns `NotFound`, not the foreign ID.
     ///
     /// An empty prefix returns `NotFound` (it would otherwise match every
     /// session and the ambiguity list would be unbounded). A prefix longer
     /// than 12 chars or containing non-hex characters returns `NotFound`.
-    pub fn resolve_id_prefix(&self, prefix: &str) -> Result<ResolveOutcome, SandboxError> {
+    pub fn resolve_id_prefix(
+        &self,
+        prefix: &str,
+        caller_username: &str,
+    ) -> Result<ResolveOutcome, SandboxError> {
         if prefix.is_empty() || prefix.len() > SessionId::LEN {
             return Ok(ResolveOutcome::NotFound);
         }
@@ -539,8 +972,11 @@ impl SessionStore {
         // `LIMIT 2` is sufficient — we only need to distinguish 0 / 1 / 2+
         // matches. When ambiguous we fall through to a second query that
         // returns all matches for a helpful error message.
-        let mut stmt = conn.prepare("SELECT id FROM sessions WHERE id LIKE ?1 || '%' LIMIT 2")?;
-        let rows = stmt.query_map(params![prefix], |row| {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM sessions \
+             WHERE id LIKE ?1 || '%' AND owner_username = ?2 LIMIT 2",
+        )?;
+        let rows = stmt.query_map(params![prefix, caller_username], |row| {
             let s: String = row.get(0)?;
             Ok(s)
         })?;
@@ -559,9 +995,11 @@ impl SessionStore {
             }
             _ => {
                 // Fetch all matches for a helpful error message.
-                let mut stmt =
-                    conn.prepare("SELECT id FROM sessions WHERE id LIKE ?1 || '%' ORDER BY id")?;
-                let rows = stmt.query_map(params![prefix], |row| {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM sessions \
+                     WHERE id LIKE ?1 || '%' AND owner_username = ?2 ORDER BY id",
+                )?;
+                let rows = stmt.query_map(params![prefix, caller_username], |row| {
                     let s: String = row.get(0)?;
                     Ok(s)
                 })?;
@@ -579,9 +1017,15 @@ impl SessionStore {
     }
 
     /// Store network info for a session (serialized as JSON).
+    ///
+    /// Per-caller isolation (api-session-isolation spec § 2.4): only
+    /// rows owned by `caller_username` are mutated; a foreign-owner row
+    /// surfaces as `Err(SessionNotFound)` so the handler layer returns
+    /// HTTP 404 indistinguishable from a truly-nonexistent ID.
     pub fn set_network_info(
         &self,
         id: &SessionId,
+        caller_username: &str,
         info: &crate::network::NetworkInfo,
     ) -> Result<(), SandboxError> {
         let json = serde_json::to_string(info).map_err(|e| {
@@ -594,8 +1038,9 @@ impl SessionStore {
             .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
 
         let rows_affected = conn.execute(
-            "UPDATE sessions SET network_info = ?1 WHERE id = ?2",
-            params![json, id.as_str()],
+            "UPDATE sessions SET network_info = ?1
+             WHERE id = ?2 AND owner_username = ?3",
+            params![json, id.as_str(), caller_username],
         )?;
 
         if rows_affected == 0 {
@@ -606,7 +1051,60 @@ impl SessionStore {
     }
 
     /// Retrieve network info for a session, if it has been set.
+    ///
+    /// Per-caller isolation (api-session-isolation spec § 2.4): a
+    /// foreign-owner row is invisible — a query for a session ID
+    /// the caller does not own surfaces as `Err(SessionNotFound)`
+    /// (same shape as a truly-nonexistent ID).
     pub fn get_network_info(
+        &self,
+        id: &SessionId,
+        caller_username: &str,
+    ) -> Result<Option<crate::network::NetworkInfo>, SandboxError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
+
+        let mut stmt = conn
+            .prepare("SELECT network_info FROM sessions WHERE id = ?1 AND owner_username = ?2")?;
+
+        let mut rows = stmt.query(params![id.as_str(), caller_username])?;
+        match rows.next()? {
+            Some(row) => {
+                let json: Option<String> = row.get(0)?;
+                match json {
+                    Some(j) => {
+                        let info: crate::network::NetworkInfo =
+                            serde_json::from_str(&j).map_err(|e| {
+                                SandboxError::Internal(format!(
+                                    "invalid network_info JSON in database: {e}"
+                                ))
+                            })?;
+                        Ok(Some(info))
+                    }
+                    None => Ok(None),
+                }
+            }
+            None => Err(SandboxError::SessionNotFound(id.to_string())),
+        }
+    }
+
+    /// Internal helper for daemon-side subsystems that need to read
+    /// `network_info` by id without an HTTP caller in scope. **Not for
+    /// handler code.** Same authorization contract as
+    /// [`Self::get_session_unfiltered`] — handlers must have already
+    /// authorized the session via a per-caller lookup before any
+    /// daemon-internal subsystem reaches this entry point.
+    ///
+    /// Exposed as `pub` (not `pub(crate)`) so the daemon binary's
+    /// reconcilers, gateway monitor, and DNS-loop listener — which all
+    /// live in the `sandboxd` crate and walk every session row
+    /// irrespective of owner — can reach it. The "internal-only"
+    /// contract is enforced by the rustdoc + the
+    /// `update_state_reconcile` allow-list test (see
+    /// `tests/update_state_reconcile_allow_list.rs`).
+    pub fn get_network_info_unfiltered(
         &self,
         id: &SessionId,
     ) -> Result<Option<crate::network::NetworkInfo>, SandboxError> {
@@ -686,13 +1184,31 @@ impl SessionStore {
     ///
     /// The `session_id` **must** reference an existing row in the
     /// `sessions` table (the FK from `session_policies` is enforced).
-    pub fn set_policy(&self, id: &SessionId, policy: &Policy) -> Result<(), SandboxError> {
+    pub fn set_policy(
+        &self,
+        id: &SessionId,
+        caller_username: &str,
+        policy: &Policy,
+    ) -> Result<(), SandboxError> {
         let mut conn = self
             .conn
             .lock()
             .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
 
         let tx = conn.transaction()?;
+
+        // Per-caller isolation (api-session-isolation spec § 2.4): a
+        // mutation targeting a foreign-owner row surfaces as
+        // `SessionNotFound`. The owner check runs *inside* the
+        // transaction so a concurrent `delete_session` cannot race in
+        // between the check and the parent-row delete.
+        {
+            let mut stmt =
+                tx.prepare("SELECT 1 FROM sessions WHERE id = ?1 AND owner_username = ?2")?;
+            if !stmt.exists(params![id.as_str(), caller_username])? {
+                return Err(SandboxError::SessionNotFound(id.to_string()));
+            }
+        }
 
         // DELETE parent row; CASCADE clears the children.  If no row
         // exists this is a no-op — matches "first-time apply" semantics.
@@ -760,19 +1276,62 @@ impl SessionStore {
     /// session was already removed the DELETE is still a safe no-op because
     /// the FK only constrains writes into `session_policies`, not deletes
     /// out of it.
-    pub fn delete_policy(&self, id: &SessionId) -> Result<(), SandboxError> {
+    pub fn delete_policy(&self, id: &SessionId, caller_username: &str) -> Result<(), SandboxError> {
         let mut conn = self
             .conn
             .lock()
             .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
 
         let tx = conn.transaction()?;
-        tx.execute(
-            "DELETE FROM session_policies WHERE session_id = ?1",
-            params![id.as_str()],
-        )?;
-        tx.commit()?;
-        Ok(())
+        // Per-caller isolation (api-session-isolation spec § 2.4):
+        // policy deletion is idempotent (no-op for missing rows) by
+        // contract, but a foreign-owner session must not even be
+        // *probed* via this call site — surface SessionNotFound for
+        // a row that exists under a different owner.
+        //
+        // Probe results in a separate scope so the prepared-statement
+        // borrows on `tx` are dropped before `tx.commit()`.
+        enum DeleteAction {
+            Forbidden,
+            NoOp,
+            Delete,
+        }
+        let action = {
+            let mut owned_stmt =
+                tx.prepare("SELECT 1 FROM sessions WHERE id = ?1 AND owner_username = ?2")?;
+            let owned = owned_stmt.exists(params![id.as_str(), caller_username])?;
+            if owned {
+                DeleteAction::Delete
+            } else {
+                // Distinguish "row owned by someone else" from "no
+                // session row at all": a totally absent row is allowed
+                // to no-op (the spec's idempotence rule); a foreign-
+                // owner row must surface 404 so the caller can't probe
+                // existence.
+                let mut probe = tx.prepare("SELECT 1 FROM sessions WHERE id = ?1")?;
+                if probe.exists(params![id.as_str()])? {
+                    DeleteAction::Forbidden
+                } else {
+                    DeleteAction::NoOp
+                }
+            }
+        };
+
+        match action {
+            DeleteAction::Forbidden => Err(SandboxError::SessionNotFound(id.to_string())),
+            DeleteAction::NoOp => {
+                tx.commit()?;
+                Ok(())
+            }
+            DeleteAction::Delete => {
+                tx.execute(
+                    "DELETE FROM session_policies WHERE session_id = ?1",
+                    params![id.as_str()],
+                )?;
+                tx.commit()?;
+                Ok(())
+            }
+        }
     }
 
     /// Retrieve the policy stored for a session.
@@ -783,11 +1342,27 @@ impl SessionStore {
     /// logged and `Ok(None)` is returned — callers must treat this the
     /// same as "no policy" so the daemon does not crash on a corrupted
     /// row.  The next successful `set_policy` overwrites the entry.
-    pub fn get_policy(&self, id: &SessionId) -> Result<Option<Policy>, SandboxError> {
+    pub fn get_policy(
+        &self,
+        id: &SessionId,
+        caller_username: &str,
+    ) -> Result<Option<Policy>, SandboxError> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
+
+        // Per-caller isolation (api-session-isolation spec § 2.4): a
+        // foreign-owner session surfaces as `Ok(None)` — same shape as
+        // a session with no policy, which is identical to the shape an
+        // unprovisioned session presents.
+        {
+            let mut stmt =
+                conn.prepare("SELECT 1 FROM sessions WHERE id = ?1 AND owner_username = ?2")?;
+            if !stmt.exists(params![id.as_str(), caller_username])? {
+                return Ok(None);
+            }
+        }
 
         match read_policy(&conn, id) {
             Ok(Some(policy)) => Ok(Some(policy)),
@@ -856,14 +1431,25 @@ impl SessionStore {
     }
 
     /// Delete a session from the database and remove its per-session directory.
-    pub fn delete_session(&self, id: &SessionId) -> Result<(), SandboxError> {
+    ///
+    /// Per-caller isolation (api-session-isolation spec § 2.4): only
+    /// rows owned by `caller_username` may be deleted; a foreign-owner
+    /// row surfaces as `Err(SessionNotFound)` so the handler layer
+    /// returns HTTP 404 indistinguishable from a truly-nonexistent ID.
+    pub fn delete_session(
+        &self,
+        id: &SessionId,
+        caller_username: &str,
+    ) -> Result<(), SandboxError> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
 
-        let rows_affected =
-            conn.execute("DELETE FROM sessions WHERE id = ?1", params![id.as_str()])?;
+        let rows_affected = conn.execute(
+            "DELETE FROM sessions WHERE id = ?1 AND owner_username = ?2",
+            params![id.as_str(), caller_username],
+        )?;
 
         if rows_affected == 0 {
             return Err(SandboxError::SessionNotFound(id.to_string()));
@@ -1114,6 +1700,10 @@ enum InsertError {
 }
 
 /// Parse a row from the sessions table into a `Session`.
+///
+/// Column order matches every `SELECT ... FROM sessions` in this module:
+/// `id, name, state, config, created_at, updated_at, backend,
+///  owner_username, guest_protocol_version, guest_binary_version`.
 fn row_to_session(row: &rusqlite::Row<'_>) -> Result<Session, SandboxError> {
     let id_str: String = row.get(0)?;
     let name: Option<String> = row.get(1)?;
@@ -1128,6 +1718,13 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> Result<Session, SandboxError> {
     // silently mis-dispatching, in case operators ever hand-edit
     // the SQLite file.
     let backend_str: String = row.get(6)?;
+    // Columns 7..=9 were introduced by V006. The migration's
+    // destructive `DELETE FROM sessions` + `NOT NULL DEFAULT` clauses
+    // guarantee every row has a value; reads are hard rather than
+    // tolerant.
+    let owner_username: String = row.get(7)?;
+    let guest_protocol_version: i64 = row.get(8)?;
+    let guest_binary_version: String = row.get(9)?;
 
     let id = SessionId::parse(&id_str)
         .map_err(|e| SandboxError::Internal(format!("invalid session id in database: {e}")))?;
@@ -1149,6 +1746,12 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> Result<Session, SandboxError> {
         .parse::<crate::backend::BackendKind>()
         .map_err(|e| SandboxError::Internal(format!("invalid backend in database: {e}")))?;
 
+    let guest_protocol_version = u32::try_from(guest_protocol_version.max(0)).map_err(|_| {
+        SandboxError::Internal(format!(
+            "guest_protocol_version out of u32 range: {guest_protocol_version}"
+        ))
+    })?;
+
     Ok(Session {
         id,
         name,
@@ -1157,6 +1760,9 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> Result<Session, SandboxError> {
         created_at,
         updated_at,
         backend,
+        owner_username,
+        guest_protocol_version,
+        guest_binary_version,
     })
 }
 
@@ -1177,6 +1783,14 @@ mod tests {
         (store, dir)
     }
 
+    /// Per-caller isolation (api-session-isolation spec § 2.4) requires
+    /// every public store call to carry an owner identity. Tests in this
+    /// module that pre-date Spec 2 use this constant so the per-caller
+    /// filter is satisfied without making the test bodies noisier than
+    /// the assertions they perform. Tests that *exercise* the per-caller
+    /// isolation rules use distinct usernames inline.
+    const TEST_CALLER: &str = "test-operator";
+
     /// Return a `SessionId` that is guaranteed not to exist in the store.
     fn missing_id() -> SessionId {
         SessionId::parse("ffffffffffff").unwrap()
@@ -1187,14 +1801,17 @@ mod tests {
         let (store, _dir) = test_store();
 
         let config = SessionConfig::default();
-        let session = store.create_session(config, None).expect("create failed");
+        let session = store
+            .create_session(config, None, TEST_CALLER, 0, "")
+            .expect("create failed");
 
         assert_eq!(session.state, SessionState::Creating);
         assert!(session.name.is_none());
         assert_eq!(session.id.as_str().len(), SessionId::LEN);
+        assert_eq!(session.owner_username, TEST_CALLER);
 
         let fetched = store
-            .get_session(&session.id)
+            .get_session(&session.id, TEST_CALLER)
             .expect("get failed")
             .expect("session should exist");
 
@@ -1205,6 +1822,7 @@ mod tests {
         assert_eq!(fetched.config.disk_gb, session.config.disk_gb);
         assert_eq!(fetched.created_at, session.created_at);
         assert_eq!(fetched.updated_at, session.updated_at);
+        assert_eq!(fetched.owner_username, TEST_CALLER);
     }
 
     #[test]
@@ -1212,13 +1830,19 @@ mod tests {
         let (store, _dir) = test_store();
 
         let session = store
-            .create_session(SessionConfig::default(), Some("my-sandbox".into()))
+            .create_session(
+                SessionConfig::default(),
+                Some("my-sandbox".into()),
+                TEST_CALLER,
+                0,
+                "",
+            )
             .expect("create failed");
 
         assert_eq!(session.name, Some("my-sandbox".into()));
 
         let fetched = store
-            .get_session(&session.id)
+            .get_session(&session.id, TEST_CALLER)
             .expect("get failed")
             .expect("session should exist");
 
@@ -1230,16 +1854,28 @@ mod tests {
         let (store, _dir) = test_store();
 
         let s1 = store
-            .create_session(SessionConfig::default(), Some("first".into()))
+            .create_session(
+                SessionConfig::default(),
+                Some("first".into()),
+                TEST_CALLER,
+                0,
+                "",
+            )
             .expect("create s1");
         let s2 = store
-            .create_session(SessionConfig::default(), Some("second".into()))
+            .create_session(
+                SessionConfig::default(),
+                Some("second".into()),
+                TEST_CALLER,
+                0,
+                "",
+            )
             .expect("create s2");
         let s3 = store
-            .create_session(SessionConfig::default(), None)
+            .create_session(SessionConfig::default(), None, TEST_CALLER, 0, "")
             .expect("create s3");
 
-        let list = store.list_sessions().expect("list failed");
+        let list = store.list_sessions(TEST_CALLER).expect("list failed");
         assert_eq!(list.len(), 3);
 
         let ids: Vec<SessionId> = list.iter().map(|s| s.id).collect();
@@ -1253,7 +1889,7 @@ mod tests {
         let (store, _dir) = test_store();
 
         let session = store
-            .create_session(SessionConfig::default(), None)
+            .create_session(SessionConfig::default(), None, TEST_CALLER, 0, "")
             .expect("create");
 
         let original_updated_at = session.updated_at;
@@ -1262,11 +1898,11 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
 
         store
-            .update_state(&session.id, SessionState::Running)
+            .update_state(&session.id, TEST_CALLER, SessionState::Running)
             .expect("update state");
 
         let fetched = store
-            .get_session(&session.id)
+            .get_session(&session.id, TEST_CALLER)
             .expect("get")
             .expect("exists");
 
@@ -1279,12 +1915,14 @@ mod tests {
         let (store, _dir) = test_store();
 
         let session = store
-            .create_session(SessionConfig::default(), None)
+            .create_session(SessionConfig::default(), None, TEST_CALLER, 0, "")
             .expect("create");
 
-        store.delete_session(&session.id).expect("delete");
+        store
+            .delete_session(&session.id, TEST_CALLER)
+            .expect("delete");
 
-        let fetched = store.get_session(&session.id).expect("get");
+        let fetched = store.get_session(&session.id, TEST_CALLER).expect("get");
         assert!(fetched.is_none());
     }
 
@@ -1293,7 +1931,7 @@ mod tests {
         let (store, _dir) = test_store();
 
         let session = store
-            .create_session(SessionConfig::default(), None)
+            .create_session(SessionConfig::default(), None, TEST_CALLER, 0, "")
             .expect("create");
 
         let session_dir = store.session_dir(&session.id);
@@ -1302,7 +1940,9 @@ mod tests {
             "session dir should exist after create"
         );
 
-        store.delete_session(&session.id).expect("delete");
+        store
+            .delete_session(&session.id, TEST_CALLER)
+            .expect("delete");
         assert!(
             !session_dir.exists(),
             "session dir should be removed after delete"
@@ -1313,7 +1953,7 @@ mod tests {
     fn test_get_nonexistent() {
         let (store, _dir) = test_store();
 
-        let result = store.get_session(&missing_id()).expect("get");
+        let result = store.get_session(&missing_id(), TEST_CALLER).expect("get");
         assert!(result.is_none());
     }
 
@@ -1322,25 +1962,25 @@ mod tests {
         let (store, _dir) = test_store();
 
         let session = store
-            .create_session(SessionConfig::default(), None)
+            .create_session(SessionConfig::default(), None, TEST_CALLER, 0, "")
             .expect("create");
 
         assert_eq!(session.state, SessionState::Creating);
 
         store
-            .update_state(&session.id, SessionState::Running)
+            .update_state(&session.id, TEST_CALLER, SessionState::Running)
             .expect("to running");
         let s = store
-            .get_session(&session.id)
+            .get_session(&session.id, TEST_CALLER)
             .expect("get")
             .expect("exists");
         assert_eq!(s.state, SessionState::Running);
 
         store
-            .update_state(&session.id, SessionState::Stopped)
+            .update_state(&session.id, TEST_CALLER, SessionState::Stopped)
             .expect("to stopped");
         let s = store
-            .get_session(&session.id)
+            .get_session(&session.id, TEST_CALLER)
             .expect("get")
             .expect("exists");
         assert_eq!(s.state, SessionState::Stopped);
@@ -1359,11 +1999,17 @@ mod tests {
             handles.push(thread::spawn(move || {
                 let name = format!("thread-{i}");
                 let session = store
-                    .create_session(SessionConfig::default(), Some(name.clone()))
+                    .create_session(
+                        SessionConfig::default(),
+                        Some(name.clone()),
+                        TEST_CALLER,
+                        0,
+                        "",
+                    )
                     .expect("create");
 
                 let fetched = store
-                    .get_session(&session.id)
+                    .get_session(&session.id, TEST_CALLER)
                     .expect("get")
                     .expect("exists");
 
@@ -1377,7 +2023,7 @@ mod tests {
             .map(|h| h.join().expect("thread panicked"))
             .collect();
 
-        let list = store.list_sessions().expect("list");
+        let list = store.list_sessions(TEST_CALLER).expect("list");
         assert_eq!(list.len(), 8);
         for id in &ids {
             assert!(list.iter().any(|s| s.id == *id));
@@ -1411,7 +2057,7 @@ mod tests {
     fn test_update_state_nonexistent() {
         let (store, _dir) = test_store();
 
-        let result = store.update_state(&missing_id(), SessionState::Running);
+        let result = store.update_state(&missing_id(), TEST_CALLER, SessionState::Running);
         assert!(matches!(result, Err(SandboxError::SessionNotFound(_))));
     }
 
@@ -1419,7 +2065,7 @@ mod tests {
     fn test_delete_nonexistent() {
         let (store, _dir) = test_store();
 
-        let result = store.delete_session(&missing_id());
+        let result = store.delete_session(&missing_id(), TEST_CALLER);
         assert!(matches!(result, Err(SandboxError::SessionNotFound(_))));
     }
 
@@ -1441,11 +2087,11 @@ mod tests {
         };
 
         let session = store
-            .create_session(config, Some("custom".into()))
+            .create_session(config, Some("custom".into()), TEST_CALLER, 0, "")
             .expect("create");
 
         let fetched = store
-            .get_session(&session.id)
+            .get_session(&session.id, TEST_CALLER)
             .expect("get")
             .expect("exists");
 
@@ -1476,11 +2122,11 @@ mod tests {
         };
 
         let session = store
-            .create_session(config, Some("enriched".into()))
+            .create_session(config, Some("enriched".into()), TEST_CALLER, 0, "")
             .expect("create");
 
         let fetched = store
-            .get_session(&session.id)
+            .get_session(&session.id, TEST_CALLER)
             .expect("get")
             .expect("exists");
 
@@ -1502,7 +2148,13 @@ mod tests {
         let (store, dir) = test_store();
 
         let session = store
-            .create_session(SessionConfig::default(), Some("legacy".into()))
+            .create_session(
+                SessionConfig::default(),
+                Some("legacy".into()),
+                TEST_CALLER,
+                0,
+                "",
+            )
             .expect("create");
 
         // Open a separate connection to rewrite the column.  The store's
@@ -1519,7 +2171,7 @@ mod tests {
         }
 
         let fetched = store
-            .get_session(&session.id)
+            .get_session(&session.id, TEST_CALLER)
             .expect("get")
             .expect("exists");
 
@@ -1534,7 +2186,7 @@ mod tests {
         let (store, dir) = test_store();
 
         let session = store
-            .create_session(SessionConfig::default(), None)
+            .create_session(SessionConfig::default(), None, TEST_CALLER, 0, "")
             .expect("create");
 
         let expected = dir.path().join("sessions").join(session.id.as_str());
@@ -1547,11 +2199,17 @@ mod tests {
         let (store, _dir) = test_store();
 
         let session = store
-            .create_session(SessionConfig::default(), Some("named".into()))
+            .create_session(
+                SessionConfig::default(),
+                Some("named".into()),
+                TEST_CALLER,
+                0,
+                "",
+            )
             .expect("create");
 
         let fetched = store
-            .get_session_by_name_or_id(session.id.as_str())
+            .get_session_by_name_or_id(session.id.as_str(), TEST_CALLER)
             .expect("get by id")
             .expect("should exist");
 
@@ -1563,11 +2221,17 @@ mod tests {
         let (store, _dir) = test_store();
 
         let session = store
-            .create_session(SessionConfig::default(), Some("lookup-test".into()))
+            .create_session(
+                SessionConfig::default(),
+                Some("lookup-test".into()),
+                TEST_CALLER,
+                0,
+                "",
+            )
             .expect("create");
 
         let fetched = store
-            .get_session_by_name_or_id("lookup-test")
+            .get_session_by_name_or_id("lookup-test", TEST_CALLER)
             .expect("get by name")
             .expect("should exist");
 
@@ -1580,7 +2244,7 @@ mod tests {
         let (store, _dir) = test_store();
 
         let result = store
-            .get_session_by_name_or_id("nonexistent")
+            .get_session_by_name_or_id("nonexistent", TEST_CALLER)
             .expect("should not error");
 
         assert!(result.is_none());
@@ -1591,7 +2255,7 @@ mod tests {
         let (store, _dir) = test_store();
 
         let result = store
-            .get_session_by_name_or_id(missing_id().as_str())
+            .get_session_by_name_or_id(missing_id().as_str(), TEST_CALLER)
             .expect("should not error");
 
         assert!(result.is_none());
@@ -1604,14 +2268,14 @@ mod tests {
         let (store, _dir) = test_store();
 
         let session = store
-            .create_session(SessionConfig::default(), None)
+            .create_session(SessionConfig::default(), None, TEST_CALLER, 0, "")
             .expect("create");
 
         // First 6 chars should be enough to uniquely identify it in a store
         // with only one session.
         let prefix = &session.id.as_str()[..6];
         let outcome = store
-            .resolve_id_prefix(prefix)
+            .resolve_id_prefix(prefix, TEST_CALLER)
             .expect("resolve should not error");
         assert_eq!(outcome, ResolveOutcome::Found(session.id));
     }
@@ -1621,11 +2285,11 @@ mod tests {
         let (store, _dir) = test_store();
 
         let session = store
-            .create_session(SessionConfig::default(), None)
+            .create_session(SessionConfig::default(), None, TEST_CALLER, 0, "")
             .expect("create");
 
         let outcome = store
-            .resolve_id_prefix(session.id.as_str())
+            .resolve_id_prefix(session.id.as_str(), TEST_CALLER)
             .expect("resolve full id");
         assert_eq!(outcome, ResolveOutcome::Found(session.id));
     }
@@ -1634,13 +2298,13 @@ mod tests {
     fn test_resolve_id_prefix_not_found() {
         let (store, _dir) = test_store();
         let _session = store
-            .create_session(SessionConfig::default(), None)
+            .create_session(SessionConfig::default(), None, TEST_CALLER, 0, "")
             .expect("create");
 
         // Use a prefix unlikely to collide: the all-f prefix is extremely
         // rare in UUID v4 output.
         let outcome = store
-            .resolve_id_prefix("fffffff")
+            .resolve_id_prefix("fffffff", TEST_CALLER)
             .expect("resolve should not error");
         // If by astronomical chance the session starts with fffffff, rerun.
         match outcome {
@@ -1662,8 +2326,10 @@ mod tests {
             for suffix in ["aa", "bb"] {
                 let id = format!("cafebabe00{suffix}");
                 conn.execute(
-                    "INSERT INTO sessions (id, name, state, config, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    "INSERT INTO sessions (id, name, state, config, created_at, updated_at,
+                                            owner_username, guest_protocol_version,
+                                            guest_binary_version)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                     params![
                         id,
                         Option::<String>::None,
@@ -1671,6 +2337,9 @@ mod tests {
                         base_config,
                         now,
                         now,
+                        TEST_CALLER,
+                        0i64,
+                        "",
                     ],
                 )
                 .unwrap();
@@ -1678,7 +2347,7 @@ mod tests {
         }
 
         let outcome = store
-            .resolve_id_prefix("cafebabe")
+            .resolve_id_prefix("cafebabe", TEST_CALLER)
             .expect("resolve ambiguous");
         match outcome {
             ResolveOutcome::Ambiguous(ids) => {
@@ -1691,7 +2360,7 @@ mod tests {
 
         // A more specific prefix resolves uniquely.
         let outcome = store
-            .resolve_id_prefix("cafebabe00a")
+            .resolve_id_prefix("cafebabe00a", TEST_CALLER)
             .expect("resolve specific");
         match outcome {
             ResolveOutcome::Found(id) => assert_eq!(id.as_str(), "cafebabe00aa"),
@@ -1703,28 +2372,30 @@ mod tests {
     fn test_resolve_id_prefix_empty_or_invalid() {
         let (store, _dir) = test_store();
         let _ = store
-            .create_session(SessionConfig::default(), None)
+            .create_session(SessionConfig::default(), None, TEST_CALLER, 0, "")
             .expect("create");
 
         // Empty prefix: NotFound.
         assert_eq!(
-            store.resolve_id_prefix("").expect("empty"),
+            store.resolve_id_prefix("", TEST_CALLER).expect("empty"),
             ResolveOutcome::NotFound
         );
         // Non-hex chars: NotFound.
         assert_eq!(
-            store.resolve_id_prefix("xyz").expect("non-hex"),
+            store
+                .resolve_id_prefix("xyz", TEST_CALLER)
+                .expect("non-hex"),
             ResolveOutcome::NotFound
         );
         // Uppercase: NotFound (ids are stored lowercase).
         assert_eq!(
-            store.resolve_id_prefix("ABC").expect("upper"),
+            store.resolve_id_prefix("ABC", TEST_CALLER).expect("upper"),
             ResolveOutcome::NotFound
         );
         // Too long: NotFound.
         assert_eq!(
             store
-                .resolve_id_prefix(&"a".repeat(SessionId::LEN + 1))
+                .resolve_id_prefix(&"a".repeat(SessionId::LEN + 1), TEST_CALLER)
                 .expect("too long"),
             ResolveOutcome::NotFound
         );
@@ -1737,12 +2408,12 @@ mod tests {
         let (store, _dir) = test_store();
 
         let session = store
-            .create_session(SessionConfig::default(), None)
+            .create_session(SessionConfig::default(), None, TEST_CALLER, 0, "")
             .expect("create");
 
         // Initially no network info.
         let info = store
-            .get_network_info(&session.id)
+            .get_network_info(&session.id, TEST_CALLER)
             .expect("get_network_info");
         assert!(info.is_none());
 
@@ -1756,12 +2427,12 @@ mod tests {
         };
 
         store
-            .set_network_info(&session.id, &net_info)
+            .set_network_info(&session.id, TEST_CALLER, &net_info)
             .expect("set_network_info");
 
         // Retrieve it.
         let fetched = store
-            .get_network_info(&session.id)
+            .get_network_info(&session.id, TEST_CALLER)
             .expect("get_network_info")
             .expect("should have network info");
 
@@ -1784,7 +2455,7 @@ mod tests {
             docker_network_name: "sandbox-net-xxx".to_string(),
         };
 
-        let result = store.set_network_info(&missing_id(), &net_info);
+        let result = store.set_network_info(&missing_id(), TEST_CALLER, &net_info);
         assert!(matches!(result, Err(SandboxError::SessionNotFound(_))));
     }
 
@@ -1792,7 +2463,7 @@ mod tests {
     fn test_get_network_info_nonexistent_session() {
         let (store, _dir) = test_store();
 
-        let result = store.get_network_info(&missing_id());
+        let result = store.get_network_info(&missing_id(), TEST_CALLER);
         assert!(matches!(result, Err(SandboxError::SessionNotFound(_))));
     }
 
@@ -1801,13 +2472,31 @@ mod tests {
         let (store, _dir) = test_store();
 
         let s1 = store
-            .create_session(SessionConfig::default(), Some("s1".into()))
+            .create_session(
+                SessionConfig::default(),
+                Some("s1".into()),
+                TEST_CALLER,
+                0,
+                "",
+            )
             .expect("create s1");
         let s2 = store
-            .create_session(SessionConfig::default(), Some("s2".into()))
+            .create_session(
+                SessionConfig::default(),
+                Some("s2".into()),
+                TEST_CALLER,
+                0,
+                "",
+            )
             .expect("create s2");
         let _s3 = store
-            .create_session(SessionConfig::default(), Some("s3".into()))
+            .create_session(
+                SessionConfig::default(),
+                Some("s3".into()),
+                TEST_CALLER,
+                0,
+                "",
+            )
             .expect("create s3");
 
         // Set network info on s1 and s2, leave s3 without.
@@ -1826,8 +2515,12 @@ mod tests {
             docker_network_name: format!("sandbox-net-{}", s2.id),
         };
 
-        store.set_network_info(&s1.id, &info1).expect("set s1");
-        store.set_network_info(&s2.id, &info2).expect("set s2");
+        store
+            .set_network_info(&s1.id, TEST_CALLER, &info1)
+            .expect("set s1");
+        store
+            .set_network_info(&s2.id, TEST_CALLER, &info2)
+            .expect("set s2");
 
         let entries = store
             .list_sessions_with_network_info()
@@ -1847,22 +2540,22 @@ mod tests {
         let (store, _dir) = test_store();
 
         let session = store
-            .create_session(SessionConfig::default(), None)
+            .create_session(SessionConfig::default(), None, TEST_CALLER, 0, "")
             .expect("create");
 
         // Creating -> Running: valid
         store
-            .update_state(&session.id, SessionState::Running)
+            .update_state(&session.id, TEST_CALLER, SessionState::Running)
             .expect("Creating -> Running should succeed");
 
         // Running -> Stopped: valid
         store
-            .update_state(&session.id, SessionState::Stopped)
+            .update_state(&session.id, TEST_CALLER, SessionState::Stopped)
             .expect("Running -> Stopped should succeed");
 
         // Stopped -> Running: valid
         store
-            .update_state(&session.id, SessionState::Running)
+            .update_state(&session.id, TEST_CALLER, SessionState::Running)
             .expect("Stopped -> Running should succeed");
     }
 
@@ -1871,11 +2564,11 @@ mod tests {
         let (store, _dir) = test_store();
 
         let session = store
-            .create_session(SessionConfig::default(), None)
+            .create_session(SessionConfig::default(), None, TEST_CALLER, 0, "")
             .expect("create");
 
         // Creating -> Stopped: invalid
-        let result = store.update_state(&session.id, SessionState::Stopped);
+        let result = store.update_state(&session.id, TEST_CALLER, SessionState::Stopped);
         assert!(
             matches!(result, Err(SandboxError::InvalidState(_))),
             "Creating -> Stopped should be rejected, got: {result:?}"
@@ -1883,11 +2576,11 @@ mod tests {
 
         // Advance to Error
         store
-            .update_state(&session.id, SessionState::Error)
+            .update_state(&session.id, TEST_CALLER, SessionState::Error)
             .expect("Creating -> Error should succeed");
 
         // Error -> Running: invalid (Error is terminal)
-        let result = store.update_state(&session.id, SessionState::Running);
+        let result = store.update_state(&session.id, TEST_CALLER, SessionState::Running);
         assert!(
             matches!(result, Err(SandboxError::InvalidState(_))),
             "Error -> Running should be rejected, got: {result:?}"
@@ -1895,44 +2588,45 @@ mod tests {
     }
 
     #[test]
-    fn test_update_state_forced_bypasses_validation() {
+    fn test_update_state_reconcile_bypasses_validation() {
         let (store, _dir) = test_store();
 
         let session = store
-            .create_session(SessionConfig::default(), None)
+            .create_session(SessionConfig::default(), None, TEST_CALLER, 0, "")
             .expect("create");
 
-        // Creating -> Stopped: normally invalid, but forced should work
+        // Creating -> Stopped: normally invalid, but the reconcile path
+        // skips validation (and skips the per-caller filter).
         store
-            .update_state_forced(&session.id, SessionState::Stopped)
-            .expect("forced Creating -> Stopped should succeed");
+            .update_state_reconcile(&session.id, SessionState::Stopped)
+            .expect("reconcile Creating -> Stopped should succeed");
 
         let fetched = store
-            .get_session(&session.id)
+            .get_session(&session.id, TEST_CALLER)
             .expect("get")
             .expect("exists");
         assert_eq!(fetched.state, SessionState::Stopped);
 
-        // Set to Error, then force back to Running
+        // Set to Error, then reconcile back to Running.
         store
-            .update_state_forced(&session.id, SessionState::Error)
-            .expect("forced -> Error");
+            .update_state_reconcile(&session.id, SessionState::Error)
+            .expect("reconcile -> Error");
         store
-            .update_state_forced(&session.id, SessionState::Running)
-            .expect("forced Error -> Running should succeed");
+            .update_state_reconcile(&session.id, SessionState::Running)
+            .expect("reconcile Error -> Running should succeed");
 
         let fetched = store
-            .get_session(&session.id)
+            .get_session(&session.id, TEST_CALLER)
             .expect("get")
             .expect("exists");
         assert_eq!(fetched.state, SessionState::Running);
     }
 
     #[test]
-    fn test_update_state_forced_nonexistent() {
+    fn test_update_state_reconcile_nonexistent() {
         let (store, _dir) = test_store();
 
-        let result = store.update_state_forced(&missing_id(), SessionState::Running);
+        let result = store.update_state_reconcile(&missing_id(), SessionState::Running);
         assert!(matches!(result, Err(SandboxError::SessionNotFound(_))));
     }
 
@@ -1984,19 +2678,30 @@ mod tests {
     fn test_set_and_get_policy_round_trip_with_http_filters() {
         let (store, _dir) = test_store();
         let session = store
-            .create_session(SessionConfig::default(), Some("pol".into()))
+            .create_session(
+                SessionConfig::default(),
+                Some("pol".into()),
+                TEST_CALLER,
+                0,
+                "",
+            )
             .expect("create");
 
         // No policy yet.
-        assert!(store.get_policy(&session.id).expect("get_policy").is_none());
+        assert!(
+            store
+                .get_policy(&session.id, TEST_CALLER)
+                .expect("get_policy")
+                .is_none()
+        );
 
         let policy = sample_http_policy();
         store
-            .set_policy(&session.id, &policy)
+            .set_policy(&session.id, TEST_CALLER, &policy)
             .expect("set_policy should succeed");
 
         let loaded = store
-            .get_policy(&session.id)
+            .get_policy(&session.id, TEST_CALLER)
             .expect("get_policy should not error")
             .expect("policy should be present");
 
@@ -2039,11 +2744,13 @@ mod tests {
     fn test_set_policy_replaces_previous() {
         let (store, _dir) = test_store();
         let session = store
-            .create_session(SessionConfig::default(), None)
+            .create_session(SessionConfig::default(), None, TEST_CALLER, 0, "")
             .expect("create");
 
         let first = sample_http_policy();
-        store.set_policy(&session.id, &first).expect("set first");
+        store
+            .set_policy(&session.id, TEST_CALLER, &first)
+            .expect("set first");
 
         // Overwrite with a single-rule policy.
         let second = Policy {
@@ -2056,10 +2763,12 @@ mod tests {
                 level: AssuranceLevel::Transport,
             }],
         };
-        store.set_policy(&session.id, &second).expect("set second");
+        store
+            .set_policy(&session.id, TEST_CALLER, &second)
+            .expect("set second");
 
         let loaded = store
-            .get_policy(&session.id)
+            .get_policy(&session.id, TEST_CALLER)
             .expect("get")
             .expect("present");
         assert_eq!(loaded.rules.len(), 1);
@@ -2085,10 +2794,15 @@ mod tests {
     fn test_get_policy_returns_none_when_unset() {
         let (store, _dir) = test_store();
         let session = store
-            .create_session(SessionConfig::default(), None)
+            .create_session(SessionConfig::default(), None, TEST_CALLER, 0, "")
             .expect("create");
 
-        assert!(store.get_policy(&session.id).unwrap().is_none());
+        assert!(
+            store
+                .get_policy(&session.id, TEST_CALLER)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -2096,13 +2810,31 @@ mod tests {
         let (store, _dir) = test_store();
 
         let s1 = store
-            .create_session(SessionConfig::default(), Some("one".into()))
+            .create_session(
+                SessionConfig::default(),
+                Some("one".into()),
+                TEST_CALLER,
+                0,
+                "",
+            )
             .expect("create s1");
         let s2 = store
-            .create_session(SessionConfig::default(), Some("two".into()))
+            .create_session(
+                SessionConfig::default(),
+                Some("two".into()),
+                TEST_CALLER,
+                0,
+                "",
+            )
             .expect("create s2");
         let _s3 = store
-            .create_session(SessionConfig::default(), Some("three".into()))
+            .create_session(
+                SessionConfig::default(),
+                Some("three".into()),
+                TEST_CALLER,
+                0,
+                "",
+            )
             .expect("create s3");
 
         let p1 = sample_http_policy();
@@ -2117,8 +2849,8 @@ mod tests {
             }],
         };
 
-        store.set_policy(&s1.id, &p1).expect("set p1");
-        store.set_policy(&s2.id, &p2).expect("set p2");
+        store.set_policy(&s1.id, TEST_CALLER, &p1).expect("set p1");
+        store.set_policy(&s2.id, TEST_CALLER, &p2).expect("set p2");
 
         let all = store.load_all_policies().expect("load_all_policies");
         assert_eq!(
@@ -2145,7 +2877,13 @@ mod tests {
         // to the caller.
         let (store, _dir) = test_store();
         let session = store
-            .create_session(SessionConfig::default(), Some("corrupt".into()))
+            .create_session(
+                SessionConfig::default(),
+                Some("corrupt".into()),
+                TEST_CALLER,
+                0,
+                "",
+            )
             .expect("create");
 
         // Insert a parent row and an http rule — but no filter rows.
@@ -2167,12 +2905,23 @@ mod tests {
         }
 
         // get_policy swallows the corrupt row.
-        assert!(store.get_policy(&session.id).unwrap().is_none());
+        assert!(
+            store
+                .get_policy(&session.id, TEST_CALLER)
+                .unwrap()
+                .is_none()
+        );
 
         // load_all_policies returns an entry-free result for this session,
         // alongside any valid siblings.
         let other = store
-            .create_session(SessionConfig::default(), Some("ok".into()))
+            .create_session(
+                SessionConfig::default(),
+                Some("ok".into()),
+                TEST_CALLER,
+                0,
+                "",
+            )
             .expect("create sibling");
         let good = Policy {
             version: "2.0.0".into(),
@@ -2184,7 +2933,9 @@ mod tests {
                 level: AssuranceLevel::Transport,
             }],
         };
-        store.set_policy(&other.id, &good).expect("set sibling");
+        store
+            .set_policy(&other.id, TEST_CALLER, &good)
+            .expect("set sibling");
 
         let all = store.load_all_policies().expect("load_all_policies");
         assert_eq!(
@@ -2202,7 +2953,7 @@ mod tests {
         // leave no stray rows in the child tables.
         let (store, _dir) = test_store();
 
-        let result = store.set_policy(&missing_id(), &sample_http_policy());
+        let result = store.set_policy(&missing_id(), TEST_CALLER, &sample_http_policy());
         assert!(
             result.is_err(),
             "set_policy for missing session must fail, got {result:?}"
@@ -2234,12 +2985,12 @@ mod tests {
         // policy must still be retrievable afterwards.
         let (store, _dir) = test_store();
         let session = store
-            .create_session(SessionConfig::default(), None)
+            .create_session(SessionConfig::default(), None, TEST_CALLER, 0, "")
             .expect("create");
 
         let initial = sample_http_policy();
         store
-            .set_policy(&session.id, &initial)
+            .set_policy(&session.id, TEST_CALLER, &initial)
             .expect("set initial");
 
         // Force a mid-transaction failure by starting a second
@@ -2276,7 +3027,7 @@ mod tests {
         // The original policy survives because the rollback undid the
         // destructive DELETE.
         let still_there = store
-            .get_policy(&session.id)
+            .get_policy(&session.id, TEST_CALLER)
             .expect("get")
             .expect("original policy must survive rolled-back transaction");
         assert_eq!(still_there.rules.len(), initial.rules.len());
@@ -2286,13 +3037,15 @@ mod tests {
     fn test_delete_session_cascades_policy_rows() {
         let (store, _dir) = test_store();
         let session = store
-            .create_session(SessionConfig::default(), None)
+            .create_session(SessionConfig::default(), None, TEST_CALLER, 0, "")
             .expect("create");
         store
-            .set_policy(&session.id, &sample_http_policy())
+            .set_policy(&session.id, TEST_CALLER, &sample_http_policy())
             .expect("set_policy");
 
-        store.delete_session(&session.id).expect("delete");
+        store
+            .delete_session(&session.id, TEST_CALLER)
+            .expect("delete");
 
         // Cascade should have cleared every policy row for this session.
         let conn = store.conn.lock().unwrap();
@@ -2328,18 +3081,26 @@ mod tests {
         {
             let (store, _orphans) = SessionStore::new(path.clone()).expect("open");
             let session = store
-                .create_session(SessionConfig::default(), Some("pol".into()))
+                .create_session(
+                    SessionConfig::default(),
+                    Some("pol".into()),
+                    TEST_CALLER,
+                    0,
+                    "",
+                )
                 .expect("create");
             session_id = session.id;
             let policy = sample_http_policy();
             expected_rule_count = policy.rules.len();
-            store.set_policy(&session_id, &policy).expect("set_policy");
+            store
+                .set_policy(&session_id, TEST_CALLER, &policy)
+                .expect("set_policy");
         }
 
         // Drop and reopen.
         let (reopened, _orphans) = SessionStore::new(path).expect("reopen");
         let loaded = reopened
-            .get_policy(&session_id)
+            .get_policy(&session_id, TEST_CALLER)
             .expect("get_policy after reopen")
             .expect("policy should still be present after reopen");
         assert_eq!(loaded.rules.len(), expected_rule_count);
@@ -2557,16 +3318,36 @@ mod tests {
             // (no inserts for session 3)
         }
 
-        // Open via SessionStore::new — this runs V004 + the orphan
-        // sweep.  Run under the recording subscriber so we capture the
-        // `policy_reset_on_upgrade` events.
+        // Drive migrations directly via refinery (target V005), then
+        // invoke the V004 sweep helpers in isolation. We cannot use
+        // `SessionStore::new` here because V006's `DELETE FROM sessions`
+        // would cascade-delete every `session_policies` row before
+        // V004's sweep ever sees them. The V004 sweep is its own
+        // unit; testing it in isolation matches the spec — V006's
+        // destructive step is covered separately by the V006 tests
+        // below.
         let swept_sessions = with_default(subscriber, || {
-            let (store, orphans) =
-                SessionStore::new(dir.path().to_path_buf()).expect("open v2 store");
+            let mut conn = Connection::open(&db_path).expect("reopen raw");
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            embedded::migrations::runner()
+                .set_target(refinery::Target::Version(5))
+                .run(&mut conn)
+                .expect("apply V004..V005");
 
-            // Assert: the orphan list returned to the caller matches
-            // the two v1-shaped sessions, with the pre-V004 rule
-            // counts captured before the migration dropped them.
+            // Snapshot would run *before* V004 in production, but here
+            // V004 has already deleted the rules. Seed the snapshot
+            // manually to match the production contract — the sweep
+            // helper only uses this map to populate
+            // `previous_rule_count`.
+            let mut pre_counts: std::collections::HashMap<String, u32> =
+                std::collections::HashMap::new();
+            pre_counts.insert(v1_session_purge_only.clone(), 3);
+            pre_counts.insert(v1_session_mixed.clone(), 2);
+
+            let orphans =
+                SessionStore::purge_orphaned_policies_and_emit_reset_events(&conn, &pre_counts)
+                    .expect("sweep orphans");
+
             let mut orphan_by_session: std::collections::HashMap<&str, u32> = orphans
                 .iter()
                 .map(|o| (o.session_id.as_str(), o.previous_rule_count))
@@ -2588,7 +3369,6 @@ mod tests {
             );
 
             // Assert: both v1-shaped sessions are gone from session_policies.
-            let conn = store.conn.lock().unwrap();
             let remaining: i64 = conn
                 .query_row("SELECT COUNT(*) FROM session_policies", [], |r| r.get(0))
                 .unwrap();
@@ -2630,7 +3410,7 @@ mod tests {
                 "session rows must not be touched by V004"
             );
 
-            drop(conn);
+            let _ = v2_session_should_survive;
             (v1_session_purge_only.clone(), v1_session_mixed.clone())
         });
 
@@ -2811,8 +3591,19 @@ mod tests {
             );
         }
 
-        // Now run the full migration set — this applies V005.
-        let (_store, _orphans) = SessionStore::new(dir.path().to_path_buf()).expect("open at V005");
+        // Apply only V005 — using `SessionStore::new` here would
+        // additionally run V006, whose `DELETE FROM sessions` wipes the
+        // pre-existing rows this test wants to inspect for the
+        // `DEFAULT 'lima'` behaviour. V006's destructive step has its
+        // own coverage in `test_v006_*` below.
+        {
+            let mut conn = Connection::open(&db_path).expect("reopen raw");
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            embedded::migrations::runner()
+                .set_target(refinery::Target::Version(5))
+                .run(&mut conn)
+                .expect("apply V005");
+        }
 
         let conn = Connection::open(&db_path).unwrap();
 
@@ -2885,5 +3676,423 @@ mod tests {
             .unwrap()
             .map(|r| r.unwrap())
             .collect()
+    }
+
+    // ========================================================================
+    // V006 migration tests (api-session-isolation spec § 7.1)
+    // ========================================================================
+
+    /// V006 on a fresh DB: refinery runs V001..V006 with no rows to
+    /// destroy. The three new columns are present afterwards.
+    #[test]
+    fn test_v006_applies_cleanly_to_fresh_db() {
+        let dir = TempDir::new().expect("tempdir");
+        let (_store, _orphans) = SessionStore::new(dir.path().to_path_buf()).expect("open fresh");
+
+        let conn = Connection::open(dir.path().join("sessions.db")).unwrap();
+        let cols = column_names(&conn, "sessions");
+        for expected in &[
+            "owner_username",
+            "guest_protocol_version",
+            "guest_binary_version",
+        ] {
+            assert!(
+                cols.iter().any(|c| c == expected),
+                "expected column `{expected}` after V006; got {cols:?}"
+            );
+        }
+    }
+
+    /// V006 on a V005-seeded DB with sessions present: the destructive
+    /// `DELETE FROM sessions` step wipes pre-existing rows AND cascades
+    /// through `session_policies` -> `policy_rules` ->
+    /// `policy_rule_http_filters` (via the V003 foreign keys). Spec §
+    /// 2.1 calls this out — every existing dev session is volatile and
+    /// the cascade is the correct teardown shape for an upgrade.
+    #[test]
+    fn test_v006_deletes_existing_sessions_on_dev_upgrade() {
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("sessions.db");
+
+        // Seed at V005 with a session row and a policy chain.
+        {
+            let mut conn = Connection::open(&db_path).expect("open raw");
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            embedded::migrations::runner()
+                .set_target(refinery::Target::Version(5))
+                .run(&mut conn)
+                .expect("V001..V005");
+
+            let now = Utc::now().to_rfc3339();
+            for sid in &["aaaaaaaaaaaa", "bbbbbbbbbbbb"] {
+                conn.execute(
+                    "INSERT INTO sessions (id, name, state, config, created_at, updated_at, backend)
+                     VALUES (?1, ?2, 'Stopped', '{}', ?3, ?3, 'lima')",
+                    params![sid, sid, now],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO session_policies (session_id, version) VALUES (?1, '2.0.0')",
+                    params![sid],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO policy_rules
+                        (session_id, rule_order, destination_kind, host_value, port, level, protocol, reason)
+                     VALUES (?1, 0, 'domain', 'example.com', 443, 'deny', 'tcp', 'seed')",
+                    params![sid],
+                )
+                .unwrap();
+            }
+
+            // Sanity: rows are present pre-V006.
+            let count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 2, "two session rows must be present at V005");
+        }
+
+        // Open via SessionStore::new — runs V006 (and triggers the
+        // destructive DELETE + cascade).
+        let (_store, _orphans) = SessionStore::new(dir.path().to_path_buf()).expect("open at V006");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let sessions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sessions, 0, "V006 must wipe pre-existing session rows");
+
+        let policies: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_policies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(policies, 0, "V006 cascade must wipe session_policies");
+
+        let rules: i64 = conn
+            .query_row("SELECT COUNT(*) FROM policy_rules", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rules, 0, "V006 cascade must wipe policy_rules");
+    }
+
+    /// V006's `ADD COLUMN ... NOT NULL DEFAULT ''` shape pins the
+    /// constraints: subsequent `INSERT`s that omit `owner_username`
+    /// pick up the empty-string default rather than failing — that is
+    /// the only way refinery could apply `NOT NULL` to a populated
+    /// table. The intent here is to pin the *shape* (not-null +
+    /// default), not the daemon's behaviour (the daemon never relies
+    /// on the default; it stamps a real username at create time).
+    #[test]
+    fn test_v006_columns_have_correct_constraints() {
+        let dir = TempDir::new().expect("tempdir");
+        let (_store, _orphans) = SessionStore::new(dir.path().to_path_buf()).expect("open");
+
+        let conn = Connection::open(dir.path().join("sessions.db")).unwrap();
+
+        // Inspect table_info: each of the three V006 columns must
+        // report `notnull = 1`.
+        let mut stmt = conn.prepare("PRAGMA table_info(sessions)").unwrap();
+        let rows: Vec<(String, i64)> = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(3)?))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        for expected in &[
+            "owner_username",
+            "guest_protocol_version",
+            "guest_binary_version",
+        ] {
+            let (_, notnull) = rows
+                .iter()
+                .find(|(c, _)| c == expected)
+                .unwrap_or_else(|| panic!("missing column {expected}"));
+            assert_eq!(*notnull, 1, "{expected} must be NOT NULL");
+        }
+
+        // Inserts that omit the V006 columns pick up the SQL DEFAULTs
+        // — confirms the migration declared them.
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO sessions (id, name, state, config, created_at, updated_at, backend)
+             VALUES (?1, ?2, 'Stopped', '{}', ?3, ?3, 'lima')",
+            params!["cccccccccccc", "implicit-default", now],
+        )
+        .expect("insert with V006 column defaults must succeed");
+
+        let (owner, proto, bin): (String, i64, String) = conn
+            .query_row(
+                "SELECT owner_username, guest_protocol_version, guest_binary_version \
+                 FROM sessions WHERE id = ?1",
+                params!["cccccccccccc"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(owner, "");
+        assert_eq!(proto, 0);
+        assert_eq!(bin, "");
+    }
+
+    /// V006 is idempotent across reopens: refinery's
+    /// `refinery_schema_history` table makes the migration a no-op on
+    /// the second `SessionStore::new`. The destructive DELETE only
+    /// fires the first time. Test: open the store twice, insert a row
+    /// between opens via the public API, assert the row survives the
+    /// second open.
+    #[test]
+    fn test_v006_idempotent_on_reapply() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().to_path_buf();
+
+        let session_id = {
+            let (store, _orphans) = SessionStore::new(path.clone()).expect("first open");
+            let session = store
+                .create_session(SessionConfig::default(), None, "alice", 0, "")
+                .expect("create");
+            session.id
+        };
+
+        // Second open — V006 is already in the history table and must
+        // not re-fire its DELETE. The session created above must
+        // survive.
+        let (store, _orphans) = SessionStore::new(path).expect("second open");
+        let row = store
+            .get_session(&session_id, "alice")
+            .expect("get")
+            .expect("session row must survive reopen");
+        assert_eq!(row.owner_username, "alice");
+    }
+
+    // ========================================================================
+    // Per-caller filtering tests (api-session-isolation spec § 7.2)
+    // ========================================================================
+
+    /// Stamps the `caller_username` arg into the row.
+    #[test]
+    fn test_create_stamps_caller_username() {
+        let (store, _dir) = test_store();
+        let session = store
+            .create_session(SessionConfig::default(), None, "alice", 0, "")
+            .expect("create");
+        assert_eq!(session.owner_username, "alice");
+
+        // And the value round-trips through SQLite, not just the
+        // in-memory return value.
+        let reloaded = store
+            .get_session(&session.id, "alice")
+            .expect("get")
+            .expect("present");
+        assert_eq!(reloaded.owner_username, "alice");
+    }
+
+    /// `get_session` returns `Ok(Some(_))` when called by the owner.
+    #[test]
+    fn test_get_returns_own_session() {
+        let (store, _dir) = test_store();
+        let session = store
+            .create_session(SessionConfig::default(), None, "alice", 0, "")
+            .expect("create");
+        let got = store
+            .get_session(&session.id, "alice")
+            .expect("get")
+            .expect("alice sees her own session");
+        assert_eq!(got.id, session.id);
+    }
+
+    /// `get_session` returns `Ok(None)` for a foreign session id — the
+    /// same shape as a truly nonexistent id, so handlers map both to
+    /// HTTP 404 indistinguishably.
+    #[test]
+    fn test_get_returns_none_for_foreign_session() {
+        let (store, _dir) = test_store();
+        let session = store
+            .create_session(SessionConfig::default(), None, "alice", 0, "")
+            .expect("alice creates");
+        let got = store.get_session(&session.id, "bob").expect("get");
+        assert!(
+            got.is_none(),
+            "bob must NOT see alice's session (got {got:?})"
+        );
+    }
+
+    /// `list_sessions` returns the caller's rows only.
+    #[test]
+    fn test_list_returns_only_callers_sessions() {
+        let (store, _dir) = test_store();
+        let a1 = store
+            .create_session(SessionConfig::default(), Some("a1".into()), "alice", 0, "")
+            .unwrap();
+        let a2 = store
+            .create_session(SessionConfig::default(), Some("a2".into()), "alice", 0, "")
+            .unwrap();
+        let _b = store
+            .create_session(SessionConfig::default(), Some("b1".into()), "bob", 0, "")
+            .unwrap();
+
+        let alices = store.list_sessions("alice").expect("alice list");
+        assert_eq!(alices.len(), 2);
+        let ids: std::collections::HashSet<_> = alices.iter().map(|s| s.id).collect();
+        assert!(ids.contains(&a1.id));
+        assert!(ids.contains(&a2.id));
+    }
+
+    /// `list_sessions` returns an empty Vec for a caller with no rows
+    /// — *not* an error, mirroring the shape `GET /sessions` expects
+    /// when an operator has never created anything.
+    #[test]
+    fn test_list_empty_for_caller_with_no_sessions() {
+        let (store, _dir) = test_store();
+        let _ = store
+            .create_session(SessionConfig::default(), None, "alice", 0, "")
+            .unwrap();
+        let carols = store.list_sessions("carol").expect("carol list");
+        assert!(carols.is_empty());
+    }
+
+    /// `update_state` refuses to mutate a foreign session — same
+    /// `SessionNotFound` shape get_session returns. The mutator does
+    /// not need an extra error variant.
+    #[test]
+    fn test_update_state_refuses_foreign_session() {
+        let (store, _dir) = test_store();
+        let session = store
+            .create_session(SessionConfig::default(), None, "alice", 0, "")
+            .unwrap();
+        // Move alice's session forward through the FSM first so the
+        // attempted bob-update has a valid transition target —
+        // otherwise an `InvalidState` could mask the ownership reject.
+        store
+            .update_state(&session.id, "alice", SessionState::Running)
+            .expect("alice transitions her own row");
+
+        let err = store
+            .update_state(&session.id, "bob", SessionState::Stopped)
+            .expect_err("bob must not be allowed to mutate alice's session");
+        assert!(
+            matches!(err, SandboxError::SessionNotFound(_)),
+            "foreign-owner update must surface as SessionNotFound; got {err:?}"
+        );
+    }
+
+    /// `delete_session` refuses to remove a foreign row — same shape
+    /// as `update_state` above.
+    #[test]
+    fn test_delete_refuses_foreign_session() {
+        let (store, _dir) = test_store();
+        let session = store
+            .create_session(SessionConfig::default(), None, "alice", 0, "")
+            .unwrap();
+
+        let err = store
+            .delete_session(&session.id, "bob")
+            .expect_err("bob must not be allowed to delete alice's session");
+        assert!(
+            matches!(err, SandboxError::SessionNotFound(_)),
+            "foreign-owner delete must surface as SessionNotFound; got {err:?}"
+        );
+
+        // And the row is still there from alice's perspective.
+        let still = store
+            .get_session(&session.id, "alice")
+            .expect("alice get")
+            .expect("session row must remain after failed foreign delete");
+        assert_eq!(still.id, session.id);
+    }
+
+    /// Prefix resolution (`get_session_by_name_or_id`) is scoped to
+    /// the caller. Alice's row is invisible when bob queries by id
+    /// prefix; bob's own id with a similar prefix is returned.
+    ///
+    /// Uses the public `create_session` API + a real `SessionConfig`
+    /// so the row's `config_json` deserialises correctly when the row
+    /// is later read back. The test rewrites the random ids to a
+    /// deterministic prefix shape via a direct SQL UPDATE so the
+    /// prefix-match path is exercised deterministically.
+    #[test]
+    fn test_prefix_resolution_scoped_to_caller() {
+        let (store, _dir) = test_store();
+        let alice = store
+            .create_session(SessionConfig::default(), None, "alice", 0, "")
+            .unwrap();
+        let bob = store
+            .create_session(SessionConfig::default(), None, "bob", 0, "")
+            .unwrap();
+
+        // Rewrite the ids so the prefix-match path has a known shared
+        // first hex digit. Otherwise `create_session` mints random
+        // ids and the prefix lookup would just be a name-lookup
+        // disguise.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE sessions SET id = ?1 WHERE id = ?2",
+                params!["0123456789ab", alice.id.as_str()],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE sessions SET id = ?1 WHERE id = ?2",
+                params!["0fedcba98765", bob.id.as_str()],
+            )
+            .unwrap();
+        }
+
+        // Bob queries the prefix `01` — which would match alice's row
+        // if the prefix-resolution path were unscoped. The scoped
+        // version returns None because no row with that prefix exists
+        // under bob's ownership.
+        let result = store
+            .get_session_by_name_or_id("01", "bob")
+            .expect("resolve");
+        assert!(
+            result.is_none(),
+            "bob must not see alice's row via prefix; got {result:?}"
+        );
+
+        // Sanity: bob's own short prefix resolves to his row.
+        let mine = store
+            .get_session_by_name_or_id("0f", "bob")
+            .expect("resolve")
+            .expect("bob's own prefix");
+        assert_eq!(mine.id.as_str(), "0fedcba98765");
+    }
+
+    /// Name resolution is scoped to the caller: two operators can both
+    /// have a session named `staging`, and each gets back their own.
+    #[test]
+    fn test_name_resolution_scoped_to_caller() {
+        let (store, _dir) = test_store();
+        let alices_staging = store
+            .create_session(
+                SessionConfig::default(),
+                Some("staging".into()),
+                "alice",
+                0,
+                "",
+            )
+            .unwrap();
+        let bobs_staging = store
+            .create_session(
+                SessionConfig::default(),
+                Some("staging".into()),
+                "bob",
+                0,
+                "",
+            )
+            .unwrap();
+
+        let alices_view = store
+            .get_session_by_name_or_id("staging", "alice")
+            .expect("resolve")
+            .expect("alice's staging");
+        assert_eq!(alices_view.id, alices_staging.id);
+
+        let bobs_view = store
+            .get_session_by_name_or_id("staging", "bob")
+            .expect("resolve")
+            .expect("bob's staging");
+        assert_eq!(bobs_view.id, bobs_staging.id);
+
+        // And neither sees the other's row.
+        assert_ne!(alices_view.id, bobs_staging.id);
+        assert_ne!(bobs_view.id, alices_staging.id);
     }
 }

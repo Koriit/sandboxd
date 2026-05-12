@@ -33,13 +33,13 @@
 use std::sync::Arc;
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
 };
-use sandbox_core::{PropagationStatusResponse, SandboxError, SessionStore};
+use sandbox_core::{OperatorIdentity, PropagationStatusResponse, SandboxError, SessionStore};
 
 use crate::error::error_response as map_error;
 use crate::propagation::PropagationStates;
@@ -101,9 +101,13 @@ pub fn policy_router(state: Arc<PolicyApiState>) -> Router {
 /// - Returns 404 when the session does not exist.
 pub async fn propagation_status(
     State(state): State<Arc<PolicyApiState>>,
+    Extension(operator): Extension<OperatorIdentity>,
     Path(id): Path<String>,
 ) -> Response {
-    let session = match state.store.get_session_by_name_or_id(&id) {
+    // Resolve session name-or-id, scoped to the caller's owner_username
+    // so a foreign session id returns the same 404 shape as a truly
+    // nonexistent id (spec § 2.4).
+    let session = match state.store.get_session_by_name_or_id(&id, &operator.name) {
         Ok(Some(s)) => s,
         Ok(None) => return map_error(SandboxError::SessionNotFound(id)).into_response(),
         Err(e) => return map_error(e).into_response(),

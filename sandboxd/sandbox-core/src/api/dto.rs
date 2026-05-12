@@ -39,6 +39,23 @@ pub struct SessionDto {
     pub state: SessionState,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Username of the operator that created the session — the value
+    /// the daemon read from `SO_PEERCRED` + `getpwuid_r` at create
+    /// time and stamped into the `owner_username` SQL column
+    /// (api-session-isolation spec § 2.4 + § 2.6). Surfaced on the
+    /// wire so `sandbox ps` / `inspect` can render "who owns this
+    /// session" without a separate lookup; since every list / get
+    /// endpoint is already filtered to the caller's own sessions, the
+    /// value is always the calling operator's username — kept on the
+    /// wire as an additive, self-describing field rather than implicit
+    /// context the client has to reconstruct.
+    ///
+    /// Additive on the wire: older daemons rolling forward don't see
+    /// the field, and older clients reading a newer response silently
+    /// ignore the unknown key. `#[serde(default)]` covers both
+    /// directions when the field is read back from disk or replay.
+    #[serde(default)]
+    pub owner_username: String,
     pub config: SessionConfigDto,
     /// Guest agent connectivity status: `"connected"`, `"unreachable"`,
     /// or `null` when the session is not running.

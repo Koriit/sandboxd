@@ -24,6 +24,12 @@ use sandbox_core::{
 };
 use tempfile::TempDir;
 
+/// Username every test-side caller is stamped as. The per-caller
+/// `owner_username` filter (spec § 2.4) requires every store call to
+/// carry the same identity so the fixture session is visible to later
+/// reads.
+const TEST_CALLER: &str = "test-operator";
+
 fn restrictive_policy() -> Policy {
     Policy {
         version: "2.0.0".into(),
@@ -64,14 +70,22 @@ fn policy_survives_store_reopen() {
     {
         let (store, _orphans) = SessionStore::new(base_dir.clone()).expect("open store");
         let session = store
-            .create_session(SessionConfig::default(), Some("restart-test".into()))
+            .create_session(
+                SessionConfig::default(),
+                Some("restart-test".into()),
+                TEST_CALLER,
+                0,
+                "",
+            )
             .expect("create session");
         session_id = session.id;
 
         let policy = restrictive_policy();
         expected_json = serde_json::to_value(&policy).expect("serialize policy");
 
-        store.set_policy(&session_id, &policy).expect("set_policy");
+        store
+            .set_policy(&session_id, TEST_CALLER, &policy)
+            .expect("set_policy");
     }
 
     // Reopen the store on the same directory (simulates a daemon
@@ -81,7 +95,7 @@ fn policy_survives_store_reopen() {
     let (reopened, _orphans) = SessionStore::new(base_dir).expect("reopen store");
 
     let loaded = reopened
-        .get_policy(&session_id)
+        .get_policy(&session_id, TEST_CALLER)
         .expect("get_policy after reopen")
         .expect("policy must be present after reopen");
 
@@ -104,13 +118,31 @@ fn load_all_policies_hydrates_in_memory_map() {
     let (store, _orphans) = SessionStore::new(base_dir.clone()).expect("open store");
 
     let s1 = store
-        .create_session(SessionConfig::default(), Some("alpha".into()))
+        .create_session(
+            SessionConfig::default(),
+            Some("alpha".into()),
+            TEST_CALLER,
+            0,
+            "",
+        )
         .expect("create alpha");
     let s2 = store
-        .create_session(SessionConfig::default(), Some("beta".into()))
+        .create_session(
+            SessionConfig::default(),
+            Some("beta".into()),
+            TEST_CALLER,
+            0,
+            "",
+        )
         .expect("create beta");
     let _s3 = store
-        .create_session(SessionConfig::default(), Some("no-policy".into()))
+        .create_session(
+            SessionConfig::default(),
+            Some("no-policy".into()),
+            TEST_CALLER,
+            0,
+            "",
+        )
         .expect("create no-policy");
 
     let p1 = restrictive_policy();
@@ -125,8 +157,8 @@ fn load_all_policies_hydrates_in_memory_map() {
         }],
     };
 
-    store.set_policy(&s1.id, &p1).expect("set p1");
-    store.set_policy(&s2.id, &p2).expect("set p2");
+    store.set_policy(&s1.id, TEST_CALLER, &p1).expect("set p1");
+    store.set_policy(&s2.id, TEST_CALLER, &p2).expect("set p2");
 
     // Drop and reopen — the same pattern the daemon uses on startup.
     drop(store);

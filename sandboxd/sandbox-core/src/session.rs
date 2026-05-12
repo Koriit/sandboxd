@@ -438,6 +438,41 @@ pub struct Session {
     /// authoritative source remains the SQLite column.
     #[serde(default)]
     pub backend: crate::backend::BackendKind,
+    /// Username of the operator who created this session. Stamped at
+    /// `POST /sessions` from `SO_PEERCRED`-resolved identity and used
+    /// as the per-caller filter on every subsequent
+    /// `SessionStore` read or mutation (api-session-isolation spec
+    /// § 2.4). Persisted as the `sessions.owner_username` SQLite column
+    /// added by migration V006; legacy rows written before V006 are
+    /// erased by V006's destructive `DELETE FROM sessions` step, so
+    /// every row reaching this field has a real value.
+    ///
+    /// `#[serde(default)]` so JSON snapshots written by older code
+    /// paths still deserialize cleanly (defaulting to the empty string);
+    /// the authoritative source remains the SQLite column.
+    #[serde(default)]
+    pub owner_username: String,
+    /// Daemon ↔ guest wire-protocol version stamped at session-create
+    /// time. Bumped only when the protocol shape changes; the
+    /// `start_session` compat gate (api-session-isolation spec § 3.4)
+    /// reads this to decide whether to take the fast path, refresh the
+    /// guest binary, or refuse. Spec 2's M13-S4 lays the column down
+    /// with a placeholder `0`; M13-S5 wires up the real constant and
+    /// the compat gate.
+    ///
+    /// `#[serde(default)]` so JSON snapshots written by older code
+    /// paths still deserialize cleanly (defaulting to `0`).
+    #[serde(default)]
+    pub guest_protocol_version: u32,
+    /// Semver of the `sandbox-guest` binary running inside this
+    /// session's VM/container. Bumped on every guest release; surfaced
+    /// in `sandbox describe` / diagnostic paths only (no decision
+    /// logic reads this — that's `guest_protocol_version`'s role).
+    ///
+    /// `#[serde(default)]` so JSON snapshots written by older code
+    /// paths still deserialize cleanly (defaulting to the empty string).
+    #[serde(default)]
+    pub guest_binary_version: String,
 }
 
 impl Session {
@@ -456,6 +491,9 @@ impl Session {
             updated_at: now,
             config: SessionConfig::default(),
             backend: crate::backend::BackendKind::Lima,
+            owner_username: String::new(),
+            guest_protocol_version: 0,
+            guest_binary_version: String::new(),
         }
     }
 
@@ -483,6 +521,9 @@ impl Session {
             updated_at: now,
             config,
             backend,
+            owner_username: String::new(),
+            guest_protocol_version: 0,
+            guest_binary_version: String::new(),
         }
     }
 

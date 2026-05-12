@@ -223,9 +223,13 @@ impl GuestConnector {
         session_id: &SessionId,
         request: GuestRequest,
     ) -> Result<GuestResponse, SandboxError> {
+        // Daemon-internal subsystem: the handler boundary already
+        // performed the per-caller ownership check before reaching
+        // `GuestConnector`, so the bypass is safe (api-session-isolation
+        // spec § 2.4).
         let session = self
             .store
-            .get_session(session_id)?
+            .get_session_unfiltered(session_id)?
             .ok_or_else(|| SandboxError::SessionNotFound(session_id.to_string()))?;
 
         let runtime = self.runtimes.get(&session.backend).ok_or_else(|| {
@@ -880,7 +884,14 @@ mod tests {
     async fn guest_connector_dispatches_to_lima_transport_for_lima_session() {
         let (_temp, store, runtimes, observed) = build_dispatch_fixture();
         let session = store
-            .create_session_with_backend(SessionConfig::default(), None, BackendKind::Lima)
+            .create_session_with_backend(
+                SessionConfig::default(),
+                None,
+                BackendKind::Lima,
+                "test-operator",
+                0,
+                "",
+            )
             .unwrap();
 
         let connector = GuestConnector::new(runtimes, Arc::clone(&store));
@@ -898,7 +909,14 @@ mod tests {
     async fn guest_connector_dispatches_to_container_transport_for_container_session() {
         let (_temp, store, runtimes, observed) = build_dispatch_fixture();
         let session = store
-            .create_session_with_backend(SessionConfig::default(), None, BackendKind::Container)
+            .create_session_with_backend(
+                SessionConfig::default(),
+                None,
+                BackendKind::Container,
+                "test-operator",
+                0,
+                "",
+            )
             .unwrap();
 
         let connector = GuestConnector::new(runtimes, Arc::clone(&store));
@@ -936,7 +954,14 @@ mod tests {
         let (store, _orphans) = SessionStore::new(temp.path().to_path_buf()).unwrap();
         let store = Arc::new(store);
         let session = store
-            .create_session_with_backend(SessionConfig::default(), None, BackendKind::Container)
+            .create_session_with_backend(
+                SessionConfig::default(),
+                None,
+                BackendKind::Container,
+                "test-operator",
+                0,
+                "",
+            )
             .unwrap();
 
         // Registry holds Lima only — the container session has no

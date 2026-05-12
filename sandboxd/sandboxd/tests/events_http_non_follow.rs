@@ -32,9 +32,16 @@ use tower::ServiceExt;
 use sandbox_core::{
     DenyLoggerDeny, DenyLoggerEvent, DenyProtocol, DnsEvent, EnvoyConnection, EnvoyEvent, Event,
     EventBus, EventEnvelope, GatewayShutdownReason, HealthComponent, LifecycleEvent,
-    MitmproxyEvent, SessionConfig, SessionStore, TrafficEvent,
+    MitmproxyEvent, OperatorIdentity, SessionConfig, SessionStore, TrafficEvent,
 };
 use sandboxd::events_http::{APPLICATION_JSONL, EventsApiState, events_router};
+
+/// Username every test-side caller is stamped as. The `events_router`
+/// handler now requires an `Extension<OperatorIdentity>`, and the
+/// session-store filter rejects rows that don't match this name — so
+/// every fixture session and every test request goes through under the
+/// same identity.
+const TEST_CALLER: &str = "test-operator";
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -65,7 +72,13 @@ fn provision_session(
     name: Option<&str>,
 ) -> sandbox_core::SessionId {
     let session = store
-        .create_session(SessionConfig::default(), name.map(String::from))
+        .create_session(
+            SessionConfig::default(),
+            name.map(String::from),
+            TEST_CALLER,
+            0,
+            "",
+        )
         .expect("create session");
     bus.register_session(session.id);
     session.id
@@ -169,7 +182,11 @@ fn publish_all(bus: &EventBus, events: impl IntoIterator<Item = Event>) {
 /// keep the `TempDir` alive for the SQLite file on disk.
 fn build_router(store: Arc<SessionStore>, bus: EventBus) -> axum::Router {
     let state = Arc::new(EventsApiState::new(store, bus));
-    events_router(state)
+    // Layer in a synthetic `OperatorIdentity` so handlers that require
+    // it through `Extension<OperatorIdentity>` resolve successfully —
+    // the production daemon's `operator_identity_layer` inserts it from
+    // `SO_PEERCRED`; tests using `oneshot` need to inject it directly.
+    events_router(state).layer(axum::Extension(OperatorIdentity::new(1000, TEST_CALLER)))
 }
 
 /// Thin convenience around `ServiceExt::oneshot` that takes a
@@ -462,7 +479,7 @@ async fn get_events_unregistered_session_returns_empty_200() {
     let bus = EventBus::default();
     // Create a session in the store but do NOT register it with the bus.
     let session = store
-        .create_session(SessionConfig::default(), None)
+        .create_session(SessionConfig::default(), None, TEST_CALLER, 0, "")
         .expect("create session");
 
     let router = build_router(store, bus);

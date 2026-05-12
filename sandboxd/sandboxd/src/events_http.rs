@@ -45,7 +45,7 @@
 use std::sync::Arc;
 
 use axum::{
-    Router,
+    Extension, Router,
     body::{Body, Bytes},
     extract::{Path, State},
     http::{StatusCode, header::CONTENT_TYPE},
@@ -55,7 +55,8 @@ use axum::{
 use axum_extra::extract::Query;
 use chrono::Utc;
 use sandbox_core::{
-    EventBus, EventsFilter, EventsQueryDto, SandboxError, SessionStore, event_to_jsonl_line,
+    EventBus, EventsFilter, EventsQueryDto, OperatorIdentity, SandboxError, SessionStore,
+    event_to_jsonl_line,
 };
 use tokio::sync::broadcast::error::RecvError;
 
@@ -123,11 +124,14 @@ pub fn events_router(state: Arc<EventsApiState>) -> Router {
 /// convention in `CLAUDE.md`.
 pub async fn get_session_events(
     State(state): State<Arc<EventsApiState>>,
+    Extension(operator): Extension<OperatorIdentity>,
     Path(id): Path<String>,
     Query(q): Query<EventsQueryDto>,
 ) -> Response {
-    // Resolve session name-or-id.
-    let session = match state.store.get_session_by_name_or_id(&id) {
+    // Resolve session name-or-id, scoped to the caller's owner_username
+    // so a foreign session id returns the same 404 shape as a truly
+    // nonexistent id (spec § 2.4).
+    let session = match state.store.get_session_by_name_or_id(&id, &operator.name) {
         Ok(Some(s)) => s,
         Ok(None) => return error_response(SandboxError::SessionNotFound(id)),
         Err(e) => return error_response(e),
