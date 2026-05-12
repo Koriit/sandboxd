@@ -26,8 +26,14 @@
 //!    daemon is short-circuited to `SKIPPED (requires daemon)`. C4
 //!    (group membership), C9 (route-helper caps), and C10 (state-dir
 //!    mode) can still run because they only consult host state.
-//! 2. Parallel — C3-C13 fan out via `tokio::task::spawn` and join
-//!    before the formatter walks the result table.
+//! 2. Parallel — C3-C13 fan out via `tokio::task::JoinSet` so the
+//!    HTTP-bound checks (C3, C6-C8, C11-C13) and the host-side checks
+//!    (C4, C9, C10) execute concurrently. `GET /diagnostics` is
+//!    fetched once before the fan-out and shared via `Arc` so the
+//!    daemon-side checks do not refetch. Results are reimposed in
+//!    canonical order (C3 first, C13 last) before the formatter
+//!    walks the table — fan-out completion order is non-deterministic
+//!    but the rendered report is byte-stable.
 //!
 //! # Exit codes (§ 6.4)
 //!
@@ -48,12 +54,102 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use http_body_util::BodyExt;
 use hyper::Request;
 use hyper_util::rt::TokioIo;
 use tokio::net::UnixStream;
+
+// ---------------------------------------------------------------------------
+// Internal-error type (spec § 6.4 — exit code 2)
+// ---------------------------------------------------------------------------
+
+/// `doctor` itself could not run. Surfaces to `process::exit(2)` per
+/// spec § 6.4, distinct from exit-1 ("daemon-side check failed") so
+/// operator scripts can disambiguate "doctor broken" from "deployment
+/// broken".
+///
+/// Sources of internal failure:
+/// * `SocketPathUnresolvable` — neither `SANDBOX_SOCKET` nor
+///   `XDG_RUNTIME_DIR` nor `HOME` yielded a path. Default fallback
+///   to `/tmp` is wrong for diagnostics; we want the operator to
+///   see the env-var misconfiguration explicitly.
+/// * `Panic` — a check panicked. The renderer or any spawned check
+///   that hits an unrecoverable bug should not pretend the rest of
+///   the report is valid; we route to exit 2 so CI catches it.
+#[derive(Debug)]
+pub enum DoctorInternalError {
+    /// Neither `SANDBOX_SOCKET`, `XDG_RUNTIME_DIR`, nor `HOME` is set —
+    /// the doctor cannot decide which socket to probe.
+    SocketPathUnresolvable {
+        /// Operator-facing message describing the missing inputs.
+        reason: String,
+    },
+    /// A check or the renderer panicked. The captured payload is best-
+    /// effort (panics often carry `&'static str` or `String`).
+    Panic {
+        /// Best-effort string form of the panic payload.
+        message: String,
+    },
+}
+
+impl std::fmt::Display for DoctorInternalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SocketPathUnresolvable { reason } => {
+                write!(f, "doctor: cannot resolve socket path: {reason}")
+            }
+            Self::Panic { message } => write!(f, "doctor: internal panic: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for DoctorInternalError {}
+
+/// Strict socket-path resolver for the doctor entry point.
+///
+/// Matches `default_socket_path` in `main.rs` *except* that it surfaces
+/// the "no env vars set" case as a [`DoctorInternalError`] rather than
+/// silently falling back to `/tmp`. The fallback is fine for normal CLI
+/// commands (they will fail to connect and report a clean error), but
+/// doctor's job is to diagnose deployments — guessing a path here
+/// would mask the actual misconfiguration.
+///
+/// Precedence: `SANDBOX_SOCKET` (any non-empty value) > `XDG_RUNTIME_DIR`
+/// > `HOME`. With none of these set, returns `Err`.
+pub fn resolve_socket_path_strict() -> Result<String, DoctorInternalError> {
+    resolve_socket_path_strict_with(|name| std::env::var(name).ok())
+}
+
+/// Pure inner of [`resolve_socket_path_strict`], parameterised over
+/// the env-var lookup so unit tests can drive the predicate without
+/// mutating real process env state (which would race with other
+/// concurrent tests under cargo's threaded runner).
+pub(crate) fn resolve_socket_path_strict_with<F>(get: F) -> Result<String, DoctorInternalError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(sock) = get("SANDBOX_SOCKET")
+        && !sock.is_empty()
+    {
+        return Ok(sock);
+    }
+    if let Some(runtime_dir) = get("XDG_RUNTIME_DIR")
+        && !runtime_dir.is_empty()
+    {
+        return Ok(format!("{runtime_dir}/sandboxd/sandboxd.sock"));
+    }
+    if let Some(home) = get("HOME")
+        && !home.is_empty()
+    {
+        return Ok(format!("{home}/.local/share/sandboxd/sandboxd.sock"));
+    }
+    Err(DoctorInternalError::SocketPathUnresolvable {
+        reason: "neither SANDBOX_SOCKET, XDG_RUNTIME_DIR, nor HOME is set".to_string(),
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -66,12 +162,43 @@ use tokio::net::UnixStream;
 /// `verbose=false` suppresses passing rows so the operator sees only
 /// the actionable failures + skips; `verbose=true` echoes every row.
 /// In both modes the summary line is always rendered.
-pub async fn run(socket_path: &str, verbose: bool) -> i32 {
+///
+/// Returns `Err(DoctorInternalError)` when doctor itself cannot run
+/// (socket path unresolvable, renderer panicked, etc.); the caller is
+/// responsible for mapping that to `process::exit(2)` per spec § 6.4.
+pub async fn run(socket_path: &str, verbose: bool) -> Result<i32, DoctorInternalError> {
     let outcomes = execute_checks(socket_path).await;
-    let mut out = std::io::stdout().lock();
-    let exit_code = render_report(&mut out, &outcomes, verbose);
-    let _ = std::io::Write::flush(&mut out);
-    exit_code
+    // The renderer is synchronous and writes to stdout; wrap in
+    // `catch_unwind` so a panic in formatting routes to exit-2 rather
+    // than aborting the process with code 101. `AssertUnwindSafe` is
+    // safe here because nothing the renderer touches is observed after
+    // the panic boundary (stdout is line-buffered; on panic we flush
+    // best-effort and propagate).
+    let render_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut out = std::io::stdout().lock();
+        let exit_code = render_report(&mut out, &outcomes, verbose);
+        let _ = std::io::Write::flush(&mut out);
+        exit_code
+    }));
+    match render_result {
+        Ok(code) => Ok(code),
+        Err(payload) => Err(DoctorInternalError::Panic {
+            message: panic_payload_to_string(&payload),
+        }),
+    }
+}
+
+/// Best-effort stringification of a `catch_unwind` payload. Panics
+/// most commonly carry `&'static str` or `String`; anything else is
+/// reported as `<non-string panic payload>`.
+fn panic_payload_to_string(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -133,10 +260,18 @@ const DOCTOR_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Public-in-crate so the unit tests in `mod tests` can exercise the
 /// runner directly. The wrapper [`run`] composes this with the
 /// formatter and stdout sink.
+///
+/// Phase 1 (serial, gating): C1, C2. If C2 fails the daemon-side
+/// checks short-circuit to `SKIPPED (requires daemon)`.
+/// Phase 2 (parallel): C3-C13 are spawned concurrently on a
+/// [`tokio::task::JoinSet`]; the shared `/diagnostics` payload is
+/// fetched once before the fan-out and shared via `Arc`. After all
+/// tasks join, results are sorted by check id so the rendered output
+/// is byte-stable regardless of completion order.
 pub(crate) async fn execute_checks(socket_path: &str) -> Vec<CheckRow> {
     let mut rows: Vec<CheckRow> = Vec::with_capacity(13);
 
-    // Serial phase: C1, C2.
+    // Phase 1 — serial gating.
     let c1 = check_daemon_running(socket_path).await;
     let daemon_running = matches!(c1.outcome, CheckOutcome::Pass { .. });
     rows.push(c1);
@@ -156,41 +291,104 @@ pub(crate) async fn execute_checks(socket_path: &str) -> Vec<CheckRow> {
     let socket_reachable = matches!(c2.outcome, CheckOutcome::Pass { .. });
     rows.push(c2);
 
-    // Parallel phase. Checks that don't depend on the daemon (C4, C9,
-    // C10) still run unconditionally; checks that do (C3, C5, C6, C7,
-    // C8, C11, C12, C13) short-circuit to `SKIPPED (requires daemon)`
-    // when the serial phase failed.
-
-    // Diagnostics payload fetched once and shared across the
-    // daemon-side checks (C6, C7, C8, C11, C12, C13).
-    let diagnostics = if socket_reachable {
+    // Phase 2 — parallel fan-out. Diagnostics payload is fetched once
+    // *before* the fan-out so the daemon-side checks (C6, C7, C8, C11,
+    // C12, C13) share a single HTTP round-trip via `Arc`.
+    let diagnostics: Arc<Option<DiagnosticsPayload>> = Arc::new(if socket_reachable {
         fetch_diagnostics(socket_path).await
     } else {
         None
-    };
+    });
 
-    rows.push(check_version_match(socket_path, socket_reachable).await);
-    rows.push(check_group_membership());
-    rows.push(check_socket_perms(socket_path, socket_reachable));
-    rows.push(check_kvm_accessible(diagnostics.as_ref(), socket_reachable));
-    rows.push(check_gateway_image(diagnostics.as_ref(), socket_reachable));
-    rows.push(check_lite_image(diagnostics.as_ref(), socket_reachable));
-    rows.push(check_route_helper_caps());
-    rows.push(check_state_dir_mode());
-    rows.push(check_users_conf_pool(
-        diagnostics.as_ref(),
-        socket_reachable,
-    ));
-    rows.push(check_guest_version_drift(
-        diagnostics.as_ref(),
-        socket_reachable,
-    ));
-    rows.push(check_substrate_orphans(
-        diagnostics.as_ref(),
-        socket_reachable,
-    ));
+    let mut set: tokio::task::JoinSet<CheckRow> = tokio::task::JoinSet::new();
+
+    // C3 — async (HTTP).
+    {
+        let socket = socket_path.to_string();
+        set.spawn(async move { check_version_match(&socket, socket_reachable).await });
+    }
+    // C4 — sync (group lookup); push through `spawn_blocking` so the
+    // fan-out is genuinely concurrent rather than parking the runtime.
+    set.spawn_blocking(check_group_membership);
+    // C5 — sync (stat on the unix socket).
+    {
+        let socket = socket_path.to_string();
+        set.spawn_blocking(move || check_socket_perms(&socket, socket_reachable));
+    }
+    // C6 — sync transform over the shared diagnostics payload.
+    {
+        let diag = Arc::clone(&diagnostics);
+        set.spawn_blocking(move || check_kvm_accessible(diag.as_ref().as_ref(), socket_reachable));
+    }
+    // C7
+    {
+        let diag = Arc::clone(&diagnostics);
+        set.spawn_blocking(move || check_gateway_image(diag.as_ref().as_ref(), socket_reachable));
+    }
+    // C8
+    {
+        let diag = Arc::clone(&diagnostics);
+        set.spawn_blocking(move || check_lite_image(diag.as_ref().as_ref(), socket_reachable));
+    }
+    // C9 — sync (forks `getcap`).
+    set.spawn_blocking(check_route_helper_caps);
+    // C10 — sync (stat on /var/lib/sandbox).
+    set.spawn_blocking(check_state_dir_mode);
+    // C11
+    {
+        let diag = Arc::clone(&diagnostics);
+        set.spawn_blocking(move || check_users_conf_pool(diag.as_ref().as_ref(), socket_reachable));
+    }
+    // C12
+    {
+        let diag = Arc::clone(&diagnostics);
+        set.spawn_blocking(move || {
+            check_guest_version_drift(diag.as_ref().as_ref(), socket_reachable)
+        });
+    }
+    // C13
+    {
+        let diag = Arc::clone(&diagnostics);
+        set.spawn_blocking(move || {
+            check_substrate_orphans(diag.as_ref().as_ref(), socket_reachable)
+        });
+    }
+
+    // Drain the JoinSet; a panicking task surfaces as a `JoinError`
+    // and is re-raised here so [`run`]'s `catch_unwind` boundary routes
+    // it to exit code 2 per spec § 6.4.
+    let mut parallel: Vec<CheckRow> = Vec::with_capacity(11);
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok(row) => parallel.push(row),
+            Err(e) => {
+                if e.is_panic() {
+                    std::panic::resume_unwind(e.into_panic());
+                }
+                // Cancelled task (only happens on JoinSet drop or
+                // explicit abort, neither applies here). Treat as a
+                // panic so it routes to exit 2 rather than silently
+                // dropping a check row.
+                panic!("doctor parallel check cancelled unexpectedly: {e}");
+            }
+        }
+    }
+
+    // Reimpose canonical order (C3, C4, ..., C13) so the rendered
+    // report is byte-stable regardless of completion order.
+    parallel.sort_by_key(|row| check_id_ordinal(row.id));
+    rows.extend(parallel);
 
     rows
+}
+
+/// Canonical sort key for check ids. Maps `"C3"` -> 3, `"C13"` -> 13.
+/// Unknown ids sort to the end so test fixtures with synthetic ids
+/// stay deterministic instead of panicking.
+fn check_id_ordinal(id: &str) -> u32 {
+    id.strip_prefix('C')
+        .and_then(|n| n.parse::<u32>().ok())
+        .unwrap_or(u32::MAX)
 }
 
 // ---------------------------------------------------------------------------
@@ -1658,5 +1856,79 @@ mod tests {
             "C8 skip with hint must surface even without verbose; got: {out}"
         );
         assert!(out.contains("hint: image will be built on first session create"));
+    }
+
+    /// Spec § 6.4 — when doctor itself cannot resolve a socket path
+    /// (neither `SANDBOX_SOCKET`, `XDG_RUNTIME_DIR`, nor `HOME` is
+    /// set), the strict resolver must surface
+    /// [`DoctorInternalError::SocketPathUnresolvable`] so the CLI
+    /// dispatch in `main.rs` can route it to `process::exit(2)`. This
+    /// pins the exit-2 contract at the unit boundary; the matching
+    /// CLI-level subprocess assertion lives alongside the other
+    /// `integration_doctor_*` tests.
+    #[test]
+    fn doctor_returns_internal_error_when_socket_path_unresolvable() {
+        // No env vars set → strict resolver must error.
+        let res = resolve_socket_path_strict_with(|_| None);
+        match res {
+            Err(DoctorInternalError::SocketPathUnresolvable { reason }) => {
+                assert!(
+                    reason.contains("SANDBOX_SOCKET"),
+                    "reason must enumerate the missing inputs; got: {reason}"
+                );
+            }
+            other => panic!(
+                "expected SocketPathUnresolvable when no env vars set; got: {other:?}"
+            ),
+        }
+
+        // Empty-string env vars are treated as unset — fall through
+        // the full chain, then error.
+        let res = resolve_socket_path_strict_with(|_| Some(String::new()));
+        assert!(
+            matches!(res, Err(DoctorInternalError::SocketPathUnresolvable { .. })),
+            "empty-string env vars must not satisfy the resolver"
+        );
+
+        // Precedence: SANDBOX_SOCKET wins outright when populated.
+        let res = resolve_socket_path_strict_with(|name| match name {
+            "SANDBOX_SOCKET" => Some("/tmp/explicit.sock".to_string()),
+            "XDG_RUNTIME_DIR" => Some("/run/user/1000".to_string()),
+            "HOME" => Some("/home/alice".to_string()),
+            _ => None,
+        });
+        assert_eq!(res.ok().as_deref(), Some("/tmp/explicit.sock"));
+
+        // XDG_RUNTIME_DIR wins over HOME when SANDBOX_SOCKET is unset.
+        let res = resolve_socket_path_strict_with(|name| match name {
+            "XDG_RUNTIME_DIR" => Some("/run/user/1000".to_string()),
+            "HOME" => Some("/home/alice".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            res.ok().as_deref(),
+            Some("/run/user/1000/sandboxd/sandboxd.sock")
+        );
+    }
+
+    /// Spec § 6.4 — `DoctorInternalError::Display` carries the
+    /// operator-facing message that gets written to stderr before
+    /// `process::exit(2)`. Pin the wording so the CLI dispatch stays
+    /// diagnosable.
+    #[test]
+    fn doctor_internal_error_display_is_operator_friendly() {
+        let e = DoctorInternalError::SocketPathUnresolvable {
+            reason: "no env".to_string(),
+        };
+        let s = format!("{e}");
+        assert!(s.contains("cannot resolve socket path"), "got: {s}");
+        assert!(s.contains("no env"), "must echo the inner reason; got: {s}");
+
+        let e = DoctorInternalError::Panic {
+            message: "kaboom".to_string(),
+        };
+        let s = format!("{e}");
+        assert!(s.contains("internal panic"), "got: {s}");
+        assert!(s.contains("kaboom"), "must echo the panic payload; got: {s}");
     }
 }

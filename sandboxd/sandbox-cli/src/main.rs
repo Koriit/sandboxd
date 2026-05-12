@@ -4491,10 +4491,16 @@ async fn main() {
     // Exit code semantics (spec § 6.4):
     //   `0` — every check pass or skip
     //   `1` — at least one check fails
-    //   `2` — doctor itself couldn't run
+    //   `2` — doctor itself couldn't run (socket path unresolvable,
+    //         internal panic, etc.)
     if let Command::Doctor { verbose } = &cli.command {
-        let code = sandbox_cli::doctor::run(&cli.socket, *verbose).await;
-        process::exit(code);
+        match sandbox_cli::doctor::run(&cli.socket, *verbose).await {
+            Ok(code) => process::exit(code),
+            Err(e) => {
+                eprintln!("sandbox doctor: internal error: {e}");
+                process::exit(2);
+            }
+        }
     }
 
     // Handle ssh specially — it doesn't follow the normal request/response flow.
