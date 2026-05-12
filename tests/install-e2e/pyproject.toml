@@ -1,0 +1,21 @@
+[project]
+name = "sandbox-install-e2e"
+version = "0.1.0"
+description = "Lima E2E harness for sandboxd install.sh / uninstall.sh"
+requires-python = ">=3.12"
+dependencies = [
+    "pytest>=8.0",
+    "pytest-timeout>=2.4",
+]
+
+[tool.setuptools]
+py-modules = []
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_*.py"]
+python_functions = ["test_*", "integration_*"]
+timeout = 900
+markers = [
+    "lima: requires limactl + KVM (every test in this suite)",
+]

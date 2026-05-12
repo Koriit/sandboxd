@@ -1,0 +1,88 @@
+"""systemd unit smoke test deferred from M14-S3.
+
+Per `docs/internal/milestones/M14.md` and `M15.md`, the
+``integration_systemd_unit_smokes`` test was deferred to this milestone
+because it requires a Lima-controlled VM with systemd-inside. The Lima
+install harness ships that environment; the test lives here rather
+than in a Rust `integration_*` test because the assertions are about
+the systemd unit's runtime behavior on a stock Linux distro, not about
+the daemon binary in isolation.
+
+What it checks (per M15 § "The integration_systemd_unit_smokes test"):
+
+1. install.sh lands the unit at /etc/systemd/system/sandboxd.service.
+2. ``systemctl enable --now sandboxd`` succeeds.
+3. The unit reaches `active (running)`.
+4. /run/sandbox/sandboxd.sock exists with mode 0660.
+5. sandbox doctor exits 0.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from conftest import (
+    assert_doctor_passes,
+    copy_tarball_to_vm,
+    install_sh_cmd,
+    wait_for_socket,
+)
+
+
+@pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
+def integration_systemd_unit_smokes(
+    distro_template, vm_factory, release_tarball_x86_64
+):
+    """systemd unit installs, starts, listens, and passes doctor.
+
+    Function name is `integration_*` (rather than `test_*`) per the
+    project's `integration_*` profile naming convention; the harness's
+    pyproject.toml lists this prefix in ``python_functions`` so pytest
+    collects it.
+    """
+    vm = vm_factory(distro_template)
+    tarball_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64)
+
+    r = vm.shell(
+        install_sh_cmd(tarball_in_vm),
+        timeout=600,
+    )
+    assert r.returncode == 0, f"install failed:\n{r.stdout}\n{r.stderr}"
+
+    # 1. Unit file installed.
+    assert vm.shell(
+        "test -f /etc/systemd/system/sandboxd.service"
+    ).returncode == 0
+
+    # 2. systemctl enable --now sandboxd succeeds.
+    r = vm.shell(
+        "sudo systemctl enable --now sandboxd", timeout=60,
+    )
+    assert r.returncode == 0, (
+        f"systemctl enable --now sandboxd failed:\n{r.stdout}\n{r.stderr}"
+    )
+
+    # 3. Active (running).
+    r = vm.shell("systemctl is-active sandboxd")
+    assert r.stdout.strip() == "active", (
+        f"sandboxd unit state: {r.stdout!r} (expected 'active')"
+    )
+
+    # 4. Socket exists with the expected mode.
+    wait_for_socket(vm.name, "/run/sandbox/sandboxd.sock", timeout=30)
+    r = vm.shell(
+        "stat -c '%a %U %G' /run/sandbox/sandboxd.sock", check=True,
+    )
+    parts = r.stdout.strip().split()
+    assert len(parts) == 3, f"unexpected stat output: {r.stdout!r}"
+    mode, owner, group = parts
+    assert mode == "660", f"socket mode is {mode}, expected 660"
+    assert owner == "sandbox", f"socket owner is {owner}, expected sandbox"
+    assert group == "sandbox", f"socket group is {group}, expected sandbox"
+
+    # 5. sandbox doctor exits 0. Run as root for the smoke (peer-cred
+    # checks honor root; the operator-group plumbing is exercised by
+    # the happy-path tests).
+    text = assert_doctor_passes(vm)
+    # Just confirm doctor produced output; we don't pin specific lines.
+    assert text, "sandbox doctor produced no output"

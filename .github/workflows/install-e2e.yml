@@ -1,0 +1,58 @@
+name: Install E2E
+
+# PR-time scope is paths-filtered to scripts-only changes; non-script PRs
+# do not pay the cost. Merge-to-main runs unconditionally on script changes.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/install.sh'
+      - 'scripts/uninstall.sh'
+      - 'tests/install-e2e/**'
+      - '.github/workflows/install-e2e.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'scripts/install.sh'
+      - 'scripts/uninstall.sh'
+      - 'tests/install-e2e/**'
+      - '.github/workflows/install-e2e.yml'
+  workflow_dispatch:
+
+jobs:
+  install-e2e:
+    # Lima requires KVM / nested virtualization. GitHub-hosted runners
+    # do not expose /dev/kvm; this job rides on the same
+    # `[self-hosted, kvm]` runner label `ci.yml`'s `e2e-matrix` job
+    # uses. Spec § 10.2 flags the dependency.
+    runs-on: [self-hosted, kvm]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.88.0'
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            sandboxd/target
+          key: install-e2e-${{ hashFiles('sandboxd/**/Cargo.lock') }}
+
+      - name: Build local release tarball
+        run: ./tests/install-e2e/build-local-tarball.sh
+
+      - name: Run install/uninstall harness
+        run: |
+          cd tests/install-e2e
+          python -m venv .venv
+          .venv/bin/pip install -r requirements.txt
+          .venv/bin/python -m pytest -v --timeout=900

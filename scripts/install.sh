@@ -681,13 +681,17 @@ install_binaries() {
 setcap_route_helper() {
     helper=/usr/local/libexec/sandboxd/sandbox-route-helper
     expected="cap_net_admin,cap_sys_admin=eip"
-    current=$(getcap "$helper" 2>/dev/null | sed -e 's|^.*= ||')
+    # `getcap` output format varies by libcap version. Older libcap
+    # ( < ~2.30) emits ``<path> = <caps>+ep``; newer libcap emits
+    # ``<path> <caps>=eip`` (Ubuntu 22.04+, Fedora 36+). Use awk to
+    # take the last whitespace-separated field so both formats parse.
+    current=$(getcap "$helper" 2>/dev/null | awk '{print $NF}')
     if [ "$current" = "$expected" ]; then
         log_ok "step=setcap caps=$expected action=skip reason=already-set"
         return 0
     fi
     sudo -k setcap "$expected" "$helper"
-    new=$(getcap "$helper" 2>/dev/null | sed -e 's|^.*= ||')
+    new=$(getcap "$helper" 2>/dev/null | awk '{print $NF}')
     [ "$new" = "$expected" ] || die "setcap verification failed: got '$new'"
     log_ok "step=setcap caps=$expected action=set"
 }
