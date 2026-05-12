@@ -117,6 +117,7 @@ export default defineConfig({
             { label: 'Hardening', slug: 'guides/hardening' },
             { label: 'Lite mode', slug: 'guides/lite-mode' },
             { label: 'Integrate an agent', slug: 'guides/integrate-agent' },
+            { label: 'Roll back an upgrade', slug: 'guides/rollback' },
             { label: 'Troubleshooting', slug: 'guides/troubleshooting' },
           ],
         },

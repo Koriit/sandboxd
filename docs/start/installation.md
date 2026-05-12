@@ -117,6 +117,34 @@ curl -fsSL https://Koriit.github.io/sandboxd/uninstall.sh | bash -s -- --purge -
 
 `--force` overrides the running-daemon refusal; running sessions may leak. The current check is coarse (refuses when sandboxd's socket responds at all); a per-session active-session probe lands alongside `sandbox update` in a future release. `--purge` without `--yes` requires typing `PURGE` to confirm.
 
+### To upgrade
+
+Once installed, upgrade to a new release via `sudo sandbox update`. The CLI handles the full flow — pre-flight checks, sigstore verification, atomic backup of the current install, daemon stop / binary swap / daemon restart, post-upgrade `doctor` — and is itself idempotent: re-running after an interrupted upgrade converges to the same end state.
+
+```bash
+# Resolve `latest` via the GitHub Releases API and apply.
+sudo sandbox update
+
+# Pre-flight only — print the upgrade plan, exit without mutating anything.
+sandbox update --check
+sandbox update --dry-run
+
+# Pin a specific target.
+sudo sandbox update --version 1.2.0
+
+# Air-gapped: pre-staged tarball + sigstore bundle, no network.
+sudo sandbox update \
+    --from /path/to/sandboxd-1.2.0-x86_64-unknown-linux-gnu.tar.gz \
+    --cosign-bundle /path/to/sandboxd-1.2.0-x86_64-unknown-linux-gnu.tar.gz.sigstore \
+    --yes
+```
+
+`--check` and `--dry-run` are read-only — they do not acquire the update lock, do not stop the daemon, and do not mutate any state. `--check` exits `0` (already up to date) or `3` (update available); `--dry-run` prints the 18 stateful steps that would run.
+
+A full upgrade keeps a versioned backup of every file the installer wrote under `/var/lib/sandbox/backups/<timestamp>-from-<v>-to-<v>/`. The last two successful sets are kept; older ones are pruned automatically. Sets from interrupted or failed upgrades carry `completed_ok: false` and are preserved forensically — they are never auto-pruned.
+
+If something goes wrong: the upgrade is auto-recoverable (re-run `sudo sandbox update`); for manual rollback to an earlier version, follow the [rollback recipe](/guides/rollback/).
+
 ## Developer install (`make setup-dev-env`)
 
 For contributors building sandboxd from source. This path runs the daemon as your own user (not the system `sandbox` user) with state under `~/.local/share/sandboxd/`. Helper installation, bridge-conf, `users.conf`, and the setuid step are folded into `make setup-dev-env`. See [Developer install — build from source](#developer-install--build-from-source) below for the full walkthrough. The two paths can coexist on the same host, but should not run two daemons in parallel: see [Dev-mode vs operator-mode coexistence](#dev-mode-vs-operator-mode-coexistence) below before mixing them.
