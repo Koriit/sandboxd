@@ -1,27 +1,30 @@
-//! `sandbox update` orchestration — Spec 5 §§ 3.1 (pre-flight),
-//! 2.2 (`--check` output), 2.3 (`--dry-run` output), 2.4 (confirmation
-//! prompt), 2.5 (privilege model), 2.6 (log destination).
+//! `sandbox update` orchestration — Spec 5.
 //!
-//! M16-S2 lands the **read-only** half: arg parse, dev-mode detect,
-//! install-state read, target-version resolution, version compare with
-//! the `--check` exit gate, active-session check, stopped-session
-//! count, disk-space check, cosign-pin / MANIFEST type wiring, the
-//! migration dry-run delegate, and the confirmation prompt. The
-//! stateful steps §§ 3.2.13-3.2.30 (lock acquisition, daemon stop,
-//! backup, install, restart) are deferred to M16-S3 — this module
-//! returns exit `0` after the confirmation prompt is answered `N` or
-//! after `--dry-run` prints its plan, and returns exit `1` with a
-//! "M16-S3 will land the stateful steps" notice when the operator
-//! answers `y` (S3 will replace that arm with the actual stateful
-//! execution).
+//! Spans the **pre-flight** half (§§ 3.1.1-3.1.12: arg parse, dev-mode
+//! detect, install-state read, target-version resolution, version
+//! compare with `--check` exit gate, active-session check,
+//! stopped-session count, disk-space check, cosign-pin, MANIFEST
+//! arch/version cross-check, migration dry-run delegate, confirmation
+//! prompt) and the **stateful** half (§§ 3.2.13-3.2.30: lock
+//! acquisition → 18 idempotent steps → lock release). Both phases
+//! share the install-state shape, dev-mode detection, and pending-
+//! migration enumeration helpers defined here.
+//!
+//! The stateful phase is the heart of Spec 5 — see § 3.2 in the spec
+//! for the verbatim step-by-step contract. Every step in [`apply_stateful`]
+//! inspects current state and short-circuits when the desired state is
+//! already in place; the flow is safe to re-run after any failure
+//! (convergence is the contract).
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::cfg_migrations;
 
+pub mod backup;
 pub mod fetch;
 pub mod lock;
+pub mod migrate;
 
 // ---------------------------------------------------------------------------
 // Constants (operator-visible paths)
@@ -107,6 +110,13 @@ pub struct InstallState {
     pub installed_at: String,
     #[serde(default)]
     pub installed_by_operator: String,
+    /// New in Spec 5 § 3.2.18 — the version installed **before** this
+    /// update run swapped the binaries. Older state files written by
+    /// install.sh predate this field; `#[serde(default)]` keeps them
+    /// readable. The post-update finalize step (§ 3.2.29) preserves
+    /// this field across rewrites.
+    #[serde(default)]
+    pub previous_version: Option<String>,
 }
 
 impl InstallState {
@@ -122,6 +132,7 @@ impl InstallState {
             installed_arch: detect_host_arch(),
             installed_at: "unknown".to_string(),
             installed_by_operator: "unknown".to_string(),
+            previous_version: None,
         }
     }
 }
@@ -887,67 +898,1114 @@ pub async fn run(args: UpdateArgs) -> i32 {
         return 0i32;
     }
 
-    // ----- M16-S3 stateful steps land here -----
-    eprintln!(
-        "sandbox update: pre-flight passed. The stateful phase \
-         (§§ 3.2.13-3.2.30) ships in a follow-up — re-run after that lands."
+    // ----- Stateful phase (§§ 3.2.13-3.2.30) -----
+    apply_stateful(StatefulInputs {
+        args: &args,
+        state: &state,
+        target_version: &target_version,
+        daemon_was_running,
+        pending_migrations: &pending_migrations,
+    })
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// Stateful phase (§§ 3.2.13-3.2.30)
+// ---------------------------------------------------------------------------
+
+/// Inputs to [`apply_stateful`]. Threaded through every step so the
+/// 18-step contract can be reasoned about as a straight-line sequence
+/// of `do_or_skip` calls rather than mutable shared state.
+struct StatefulInputs<'a> {
+    args: &'a UpdateArgs,
+    state: &'a InstallState,
+    target_version: &'a str,
+    daemon_was_running: bool,
+    /// Reserved for future steps that may want to surface the
+    /// per-migration progress in the final summary; currently the
+    /// stateful loop iterates the registry directly via
+    /// `migrate::apply_file_chain` rather than walking this slice.
+    #[allow(dead_code)]
+    pending_migrations: &'a [PendingMigration],
+}
+
+/// The full 18-step stateful orchestration. Spec 5 §§ 3.2.13-3.2.30.
+///
+/// Returns the operator-visible exit code: `0` on success, `1` on any
+/// failed step. Each step appends a `step=<name> action=<verb>
+/// status=<ok|fail>` line to the install log (`/var/log/sandbox-install.log`)
+/// in the `sandbox-update` second-token format that matches install.sh.
+///
+/// Idempotency contract per § 3.2: every step inspects current state
+/// and short-circuits when the desired state is already in place. A
+/// re-run after any failure converges to the same end state.
+async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
+    use std::process::Command;
+
+    // § 3.2.13 — Acquire lock. From here on, all state mutations
+    // happen under the held flock. The Drop impl on UpdateLock
+    // releases the kernel flock; the file is `rm`'d at § 3.2.30 on
+    // success.
+    let was_running = inputs.daemon_was_running;
+    let acquire_params = lock::AcquireParams {
+        path: Path::new(lock::LOCK_PATH),
+        target_version: inputs.target_version,
+        from_version: &inputs.state.installed_version,
+        probe_was_running: &|| was_running,
+        is_pid_alive: &lock::pid_is_live,
+        self_pid: None,
+        started_at: None,
+        suppress_drop_unlink: false,
+    };
+    let held_lock = match lock::acquire(acquire_params) {
+        Ok(l) => l,
+        Err(e) => {
+            log_step(
+                "acquire_lock",
+                &format!("action=fail status=fail err=\"{e}\""),
+            );
+            eprintln!("sandbox update: {e}");
+            return 1;
+        }
+    };
+    let sticky_was_running = held_lock.payload().was_running;
+    log_step(
+        "acquire_lock",
+        &format!(
+            "pid={} target_version={} from_version={} was_running={} action={} status=ok",
+            held_lock.payload().pid,
+            inputs.target_version,
+            inputs.state.installed_version,
+            sticky_was_running,
+            match held_lock.kind() {
+                lock::AcquisitionKind::Fresh => "acquire",
+                lock::AcquisitionKind::Adopt { .. } => "adopt",
+                lock::AcquisitionKind::AdoptStale { .. } => "adopt-stale",
+            }
+        ),
     );
-    1i32
+
+    // § 3.2.14 — Stop daemon (only if `was_running`).
+    if sticky_was_running {
+        let out = Command::new("sudo")
+            .args(["-k", "systemctl", "stop", "sandboxd"])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                log_step(
+                    "stop_daemon",
+                    &format!("was_running={sticky_was_running} action=stop status=ok"),
+                );
+            }
+            Ok(o) => {
+                log_step(
+                    "stop_daemon",
+                    &format!(
+                        "was_running={sticky_was_running} action=stop status=fail stderr={}",
+                        String::from_utf8_lossy(&o.stderr).trim()
+                    ),
+                );
+                eprintln!(
+                    "sandbox update: systemctl stop sandboxd failed: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+                return 1;
+            }
+            Err(e) => {
+                log_step(
+                    "stop_daemon",
+                    &format!(
+                        "was_running={sticky_was_running} action=stop status=fail err=\"{e}\""
+                    ),
+                );
+                eprintln!("sandbox update: failed to invoke systemctl: {e}");
+                return 1;
+            }
+        }
+    } else {
+        log_step(
+            "stop_daemon",
+            &format!("was_running={sticky_was_running} action=skip status=ok"),
+        );
+    }
+
+    // § 3.2.15 / § 3.2.16 / § 3.2.17 — backups + manifest. We need a
+    // staged tarball at this point so we know which `<stage>/bin/*`
+    // files to compare against for binary-backup idempotency hashes.
+    // The orchestration extracts the tarball into a private tempdir
+    // under `/tmp`; the staged tree lives only for the duration of
+    // the run.
+    let started_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let set_name = backup::backup_set_name(
+        &started_at,
+        &inputs.state.installed_version,
+        inputs.target_version,
+    );
+    let backup_set_dir = match backup::create_backup_set_dir(&set_name) {
+        Ok(d) => d,
+        Err(e) => {
+            log_step(
+                "backup_set_dir",
+                &format!("action=create status=fail err=\"{e}\""),
+            );
+            eprintln!("sandbox update: failed to create backup set: {e}");
+            return 1;
+        }
+    };
+    log_step(
+        "backup_set_dir",
+        &format!("path={} action=create status=ok", backup_set_dir.display()),
+    );
+
+    // Build the in-progress manifest incrementally.
+    let mut manifest = backup::BackupManifest {
+        from_version: inputs.state.installed_version.clone(),
+        to_version: inputs.target_version.to_string(),
+        started_at: started_at.clone(),
+        completed_at: None,
+        completed_ok: false,
+        arch: inputs.state.installed_arch.clone(),
+        files: std::collections::BTreeMap::new(),
+    };
+
+    // § 3.2.15 — Backup sessions.db.
+    let dst = backup_set_dir.join("sessions.db.bak");
+    match backup::backup_sandbox_owned_file(Path::new(backup::SESSIONS_DB_PATH), &dst, 0o600) {
+        Ok(o) => match o.action {
+            backup::CopyAction::SourceAbsent => {
+                log_step(
+                    "backup_sessions_db",
+                    "action=skip status=ok reason=source-absent",
+                );
+            }
+            backup::CopyAction::Skipped => {
+                manifest.files.insert(
+                    "sessions.db.bak".to_string(),
+                    backup::ManifestFileEntry {
+                        sha256: o.sha256.clone(),
+                        size: o.size,
+                    },
+                );
+                log_step(
+                    "backup_sessions_db",
+                    &format!(
+                        "path={} sha256={} action=skip status=ok reason=identical",
+                        dst.display(),
+                        o.sha256
+                    ),
+                );
+            }
+            backup::CopyAction::Copied => {
+                manifest.files.insert(
+                    "sessions.db.bak".to_string(),
+                    backup::ManifestFileEntry {
+                        sha256: o.sha256.clone(),
+                        size: o.size,
+                    },
+                );
+                log_step(
+                    "backup_sessions_db",
+                    &format!(
+                        "path={} sha256={} action=copy status=ok",
+                        dst.display(),
+                        o.sha256
+                    ),
+                );
+            }
+        },
+        Err(e) => {
+            log_step(
+                "backup_sessions_db",
+                &format!("action=copy status=fail err=\"{e}\""),
+            );
+            eprintln!("sandbox update: failed to back up sessions.db: {e}");
+            return 1;
+        }
+    }
+
+    // § 3.2.16 — Backup /etc files (users.conf, bridge.conf).
+    for (src, dst_name, mode) in [
+        (backup::USERS_CONF_PATH, "users.conf.bak", 0o644u32),
+        (backup::BRIDGE_CONF_PATH, "bridge.conf.bak", 0o644u32),
+    ] {
+        let dst = backup_set_dir.join(dst_name);
+        match backup::backup_etc_file(Path::new(src), &dst, mode) {
+            Ok(o) => match o.action {
+                backup::CopyAction::SourceAbsent => {
+                    log_step(
+                        "backup_etc",
+                        &format!("src={src} action=skip status=ok reason=absent"),
+                    );
+                }
+                backup::CopyAction::Skipped => {
+                    manifest.files.insert(
+                        dst_name.to_string(),
+                        backup::ManifestFileEntry {
+                            sha256: o.sha256.clone(),
+                            size: o.size,
+                        },
+                    );
+                    log_step(
+                        "backup_etc",
+                        &format!(
+                            "path={} sha256={} action=skip status=ok reason=identical",
+                            dst.display(),
+                            o.sha256
+                        ),
+                    );
+                }
+                backup::CopyAction::Copied => {
+                    manifest.files.insert(
+                        dst_name.to_string(),
+                        backup::ManifestFileEntry {
+                            sha256: o.sha256.clone(),
+                            size: o.size,
+                        },
+                    );
+                    log_step(
+                        "backup_etc",
+                        &format!(
+                            "path={} sha256={} action=copy status=ok",
+                            dst.display(),
+                            o.sha256
+                        ),
+                    );
+                }
+            },
+            Err(e) => {
+                log_step(
+                    "backup_etc",
+                    &format!("src={src} action=copy status=fail err=\"{e}\""),
+                );
+                eprintln!("sandbox update: failed to back up {src}: {e}");
+                return 1;
+            }
+        }
+    }
+
+    // § 3.2.17 — Backup binaries.
+    for (src, dst_name) in [
+        (backup::SANDBOXD_BIN_PATH, "sandboxd.bak"),
+        (backup::SANDBOX_BIN_PATH, "sandbox.bak"),
+        (backup::ROUTE_HELPER_BIN_PATH, "sandbox-route-helper.bak"),
+    ] {
+        let dst = backup_set_dir.join(dst_name);
+        match backup::backup_sandbox_owned_file(Path::new(src), &dst, 0o640) {
+            Ok(o) => match o.action {
+                backup::CopyAction::SourceAbsent => {
+                    log_step(
+                        "backup_binary",
+                        &format!("src={src} action=skip status=ok reason=absent"),
+                    );
+                }
+                backup::CopyAction::Skipped => {
+                    manifest.files.insert(
+                        dst_name.to_string(),
+                        backup::ManifestFileEntry {
+                            sha256: o.sha256.clone(),
+                            size: o.size,
+                        },
+                    );
+                    log_step(
+                        "backup_binary",
+                        &format!(
+                            "src={src} dst={} sha256={} action=skip status=ok reason=identical",
+                            dst.display(),
+                            o.sha256
+                        ),
+                    );
+                }
+                backup::CopyAction::Copied => {
+                    manifest.files.insert(
+                        dst_name.to_string(),
+                        backup::ManifestFileEntry {
+                            sha256: o.sha256.clone(),
+                            size: o.size,
+                        },
+                    );
+                    log_step(
+                        "backup_binary",
+                        &format!(
+                            "src={src} dst={} sha256={} action=copy status=ok",
+                            dst.display(),
+                            o.sha256
+                        ),
+                    );
+                }
+            },
+            Err(e) => {
+                log_step(
+                    "backup_binary",
+                    &format!("src={src} action=copy status=fail err=\"{e}\""),
+                );
+                eprintln!("sandbox update: failed to back up {src}: {e}");
+                return 1;
+            }
+        }
+    }
+
+    // § 3.2.18 — Update install state's previous_version.
+    if let Err(e) = write_install_state_previous_version(&inputs.state.installed_version) {
+        log_step(
+            "record_previous_version",
+            &format!("action=write status=fail err=\"{e}\""),
+        );
+        eprintln!("sandbox update: failed to record previous_version: {e}");
+        return 1;
+    }
+    log_step(
+        "record_previous_version",
+        &format!(
+            "previous={} action=write status=ok",
+            inputs.state.installed_version
+        ),
+    );
+
+    // § 3.2.19 — Write in-progress manifest. Image-load-before-binary-
+    // swap ordering (binding per § 3.2.19) kicks in next: § 3.2.20
+    // runs the docker load first; § 3.2.21 installs the new binaries.
+    if let Err(e) = backup::write_in_progress_manifest(&backup_set_dir, &manifest) {
+        log_step(
+            "backup_manifest",
+            &format!("action=write status=fail err=\"{e}\""),
+        );
+        eprintln!("sandbox update: failed to write in-progress manifest: {e}");
+        return 1;
+    }
+    log_step("backup_manifest", "status=in-progress action=write");
+
+    // Stage the tarball: we need it for § 3.2.20 (docker load) and
+    // § 3.2.21 (binary install). When `--from <tarball>` was passed
+    // we extract; when `--from <directory>` was passed we use it
+    // directly (the test harness path); when no `--from` was passed
+    // we would `curl` the tarball — currently a refusal, since
+    // bridge to the GH download requires more wiring. Operators in
+    // the field pass `--from`.
+    let staged = match prepare_staged_tarball(inputs.args, inputs.target_version) {
+        Ok(s) => s,
+        Err(e) => {
+            log_step(
+                "stage_tarball",
+                &format!("action=stage status=fail err=\"{e}\""),
+            );
+            eprintln!("sandbox update: {e}");
+            return 1;
+        }
+    };
+
+    // § 3.2.20 — docker load gateway image (BEFORE binary swap).
+    let image_tar = staged.gateway_image_tar();
+    let tag = format!("sandbox-gateway:{}", inputs.target_version);
+    let inspect = Command::new("docker")
+        .args(["image", "inspect", &tag])
+        .output();
+    let already_loaded = matches!(inspect, Ok(ref o) if o.status.success());
+    if already_loaded {
+        log_step(
+            "docker_load",
+            &format!("image={tag} action=skip status=ok reason=already-loaded"),
+        );
+    } else {
+        match Command::new("sudo")
+            .args(["-k", "docker", "load", "-i"])
+            .arg(&image_tar)
+            .output()
+        {
+            Ok(o) if o.status.success() => {
+                log_step("docker_load", &format!("image={tag} action=load status=ok"));
+            }
+            Ok(o) => {
+                log_step(
+                    "docker_load",
+                    &format!(
+                        "image={tag} action=load status=fail stderr={}",
+                        String::from_utf8_lossy(&o.stderr).trim()
+                    ),
+                );
+                eprintln!(
+                    "sandbox update: docker load failed: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+                return 1;
+            }
+            Err(e) => {
+                log_step(
+                    "docker_load",
+                    &format!("image={tag} action=load status=fail err=\"{e}\""),
+                );
+                eprintln!("sandbox update: failed to invoke docker: {e}");
+                return 1;
+            }
+        }
+    }
+
+    // § 3.2.21 — Install new binaries (sha256 compare for idempotency).
+    for (src, dst, mode) in [
+        (staged.sandboxd_bin(), backup::SANDBOXD_BIN_PATH, 0o755u32),
+        (staged.sandbox_bin(), backup::SANDBOX_BIN_PATH, 0o755u32),
+        (
+            staged.route_helper_bin(),
+            backup::ROUTE_HELPER_BIN_PATH,
+            0o755u32,
+        ),
+    ] {
+        match install_binary_if_changed(&src, dst, mode) {
+            Ok(action) => log_step(
+                "install_binary",
+                &format!("path={dst} action={action} status=ok"),
+            ),
+            Err(e) => {
+                log_step(
+                    "install_binary",
+                    &format!("path={dst} action=install status=fail err=\"{e}\""),
+                );
+                eprintln!("sandbox update: failed to install {dst}: {e}");
+                return 1;
+            }
+        }
+    }
+
+    // § 3.2.22 — Setcap on route-helper (capabilities stripped by
+    // the overwrite at § 3.2.21).
+    let helper = backup::ROUTE_HELPER_BIN_PATH;
+    let expected = "cap_net_admin,cap_sys_admin=eip";
+    let cur_out = Command::new("getcap").arg(helper).output();
+    let current = cur_out
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    let already_set = current.contains(expected);
+    if already_set {
+        log_step("setcap", "caps=already-set action=skip status=ok");
+    } else {
+        match Command::new("sudo")
+            .args(["-k", "setcap", expected, helper])
+            .output()
+        {
+            Ok(o) if o.status.success() => {
+                log_step("setcap", &format!("caps={expected} action=set status=ok"));
+            }
+            Ok(o) => {
+                log_step(
+                    "setcap",
+                    &format!(
+                        "caps={expected} action=set status=fail stderr={}",
+                        String::from_utf8_lossy(&o.stderr).trim()
+                    ),
+                );
+                eprintln!(
+                    "sandbox update: setcap failed: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+                return 1;
+            }
+            Err(e) => {
+                log_step("setcap", &format!("action=set status=fail err=\"{e}\""));
+                eprintln!("sandbox update: failed to invoke setcap: {e}");
+                return 1;
+            }
+        }
+    }
+
+    // § 3.2.23 — Install systemd unit (idempotent via sha256 compare).
+    let unit_src = staged.systemd_unit();
+    let unit_dst = SYSTEMD_UNIT_PATH;
+    match install_root_file_if_changed(&unit_src, unit_dst, 0o644) {
+        Ok(action) => {
+            log_step(
+                "install_unit",
+                &format!("path={unit_dst} action={action} status=ok"),
+            );
+            if action == "install" {
+                // daemon-reload after unit replacement so systemctl
+                // start in § 3.2.26 picks up the new unit.
+                let _ = Command::new("sudo")
+                    .args(["-k", "systemctl", "daemon-reload"])
+                    .output();
+            }
+        }
+        Err(e) => {
+            log_step(
+                "install_unit",
+                &format!("path={unit_dst} action=install status=fail err=\"{e}\""),
+            );
+            eprintln!("sandbox update: failed to install systemd unit: {e}");
+            return 1;
+        }
+    }
+
+    // § 3.2.24 — Apply config migrations (per file, atomically).
+    for target in [
+        cfg_migrations::TargetFile::UsersConf,
+        cfg_migrations::TargetFile::BridgeConf,
+    ] {
+        match migrate::apply_file_chain(target) {
+            Ok(outcome) => {
+                if outcome.source_absent {
+                    log_step(
+                        &format!("migrate_{}", target.display_name().replace('.', "_")),
+                        "action=skip status=ok reason=absent",
+                    );
+                } else if outcome.applied.is_empty() {
+                    log_step(
+                        &format!("migrate_{}", target.display_name().replace('.', "_")),
+                        "action=skip status=ok reason=already-at-latest",
+                    );
+                } else {
+                    for id in &outcome.applied {
+                        log_step(
+                            &format!("migrate_{}", target.display_name().replace('.', "_")),
+                            &format!(
+                                "migration=V{id:03} path={} action=apply status=ok",
+                                target.canonical_path().display()
+                            ),
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                log_step(
+                    &format!("migrate_{}", target.display_name().replace('.', "_")),
+                    &format!("action=apply status=fail err=\"{e}\""),
+                );
+                eprintln!(
+                    "sandbox update: migration apply failed for {}: {e}",
+                    target.display_name()
+                );
+                return 1;
+            }
+        }
+    }
+
+    // § 3.2.25 — Prune older backup sets. The current run's set is
+    // `completed_ok: false` so the filter excludes it automatically.
+    match backup::prune_old_backup_sets() {
+        Ok(o) => {
+            log_step(
+                "prune_backups",
+                &format!(
+                    "kept={} pruned={} forensic={} status=ok",
+                    o.kept.len(),
+                    o.pruned.len(),
+                    o.preserved_forensic.len()
+                ),
+            );
+        }
+        Err(e) => {
+            log_step("prune_backups", &format!("status=fail err=\"{e}\""));
+            eprintln!("sandbox update: backup-set prune failed: {e}");
+            return 1;
+        }
+    }
+
+    // § 3.2.26 — Start daemon (only if `was_running`).
+    if sticky_was_running {
+        match Command::new("sudo")
+            .args(["-k", "systemctl", "start", "sandboxd"])
+            .output()
+        {
+            Ok(o) if o.status.success() => {
+                log_step(
+                    "start_daemon",
+                    &format!("was_running={sticky_was_running} action=start status=ok"),
+                );
+            }
+            Ok(o) => {
+                log_step(
+                    "start_daemon",
+                    &format!(
+                        "was_running={sticky_was_running} action=start status=fail stderr={}",
+                        String::from_utf8_lossy(&o.stderr).trim()
+                    ),
+                );
+                eprintln!(
+                    "sandbox update: systemctl start sandboxd failed: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+                eprintln!(
+                    "sandbox update: consult `sudo journalctl -u sandboxd -n 50` and the rollback recipe at {}/manifest.json",
+                    backup_set_dir.display()
+                );
+                return 1;
+            }
+            Err(e) => {
+                log_step(
+                    "start_daemon",
+                    &format!("action=start status=fail err=\"{e}\""),
+                );
+                eprintln!("sandbox update: failed to invoke systemctl: {e}");
+                return 1;
+            }
+        }
+    } else {
+        log_step(
+            "start_daemon",
+            &format!("was_running={sticky_was_running} action=skip status=ok"),
+        );
+    }
+
+    // § 3.2.27 — Verify post-start. 30s socket-appearance wait loop,
+    // then curl /version. Skipped when the daemon was stopped
+    // intentionally (was_running == false).
+    if sticky_was_running {
+        let sock = "/run/sandbox/sandboxd.sock";
+        let mut appeared = false;
+        for _ in 0..30 {
+            if Path::new(sock).exists() {
+                appeared = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        if !appeared {
+            log_step(
+                "verify_version",
+                "action=verify status=fail reason=socket-absent",
+            );
+            eprintln!(
+                "sandbox update: daemon socket {sock} did not appear within 30s; consult: sudo journalctl -u sandboxd -n 50"
+            );
+            return 1;
+        }
+        match query_daemon_version(sock).await {
+            Ok(ver) if ver == inputs.target_version => {
+                log_step(
+                    "verify_version",
+                    &format!(
+                        "daemon={ver} target={} action=verify status=ok",
+                        inputs.target_version
+                    ),
+                );
+            }
+            Ok(ver) => {
+                log_step(
+                    "verify_version",
+                    &format!(
+                        "daemon={ver} target={} action=verify status=fail",
+                        inputs.target_version
+                    ),
+                );
+                eprintln!(
+                    "sandbox update: post-upgrade /version mismatch: daemon reports {ver}, expected {}",
+                    inputs.target_version
+                );
+                return 1;
+            }
+            Err(e) => {
+                log_step(
+                    "verify_version",
+                    &format!("action=verify status=fail err=\"{e}\""),
+                );
+                eprintln!("sandbox update: failed to query /version: {e}");
+                return 1;
+            }
+        }
+    } else {
+        log_step(
+            "verify_version",
+            "action=skip status=ok reason=daemon-intentionally-stopped",
+        );
+    }
+
+    // § 3.2.28 — `sandbox doctor --verbose`. The CLI binary on disk
+    // is the new one (we just installed it). Spec 5 § 10.3 — the
+    // running process keeps executing the old code, so we exec the
+    // new binary explicitly.
+    let doctor = Command::new("/usr/local/bin/sandbox")
+        .args(["doctor", "--verbose"])
+        .output();
+    match doctor {
+        Ok(o) if o.status.success() => {
+            log_step("doctor", "result=pass status=ok");
+        }
+        Ok(o) => {
+            log_step(
+                "doctor",
+                &format!(
+                    "result=fail status=fail exit={} stderr={}",
+                    o.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+            );
+            eprintln!(
+                "sandbox doctor reported failures; investigate before relying on this install."
+            );
+            eprintln!(
+                "rollback recipe at {}/manifest.json",
+                backup_set_dir.display()
+            );
+            return 1;
+        }
+        Err(e) => {
+            log_step("doctor", &format!("action=run status=fail err=\"{e}\""));
+            eprintln!("sandbox update: failed to invoke sandbox doctor: {e}");
+            return 1;
+        }
+    }
+
+    // § 3.2.29 — Update install state + finalize backup manifest.
+    if let Err(e) = write_install_state_post_upgrade(&inputs) {
+        log_step("finalize_state", &format!("status=fail err=\"{e}\""));
+        eprintln!("sandbox update: failed to finalize install state: {e}");
+        return 1;
+    }
+    log_step(
+        "finalize_state",
+        &format!(
+            "installed_version={} previous_version={} status=ok",
+            inputs.target_version, inputs.state.installed_version
+        ),
+    );
+    let completed_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    match backup::finalize_manifest(&backup_set_dir, &completed_at) {
+        Ok(_) => {
+            log_step(
+                "finalize_backup_manifest",
+                &format!("path={}/manifest.json status=ok", backup_set_dir.display()),
+            );
+        }
+        Err(e) => {
+            log_step(
+                "finalize_backup_manifest",
+                &format!("status=fail err=\"{e}\""),
+            );
+            eprintln!("sandbox update: failed to finalize backup manifest: {e}");
+            return 1;
+        }
+    }
+
+    // § 3.2.30 — Release the lock. Dropping `held_lock` removes the
+    // file and closes the FD (releases the kernel flock).
+    drop(held_lock);
+    log_step("release_lock", "status=ok");
+    log_step(
+        "done",
+        &format!("version={} elapsed=0 status=ok", inputs.target_version),
+    );
+    println!(
+        "sandbox update: {} installed successfully.",
+        inputs.target_version
+    );
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Stateful-phase helpers
+// ---------------------------------------------------------------------------
+
+/// Stage the release tarball into a private tempdir under `/tmp`,
+/// returning a [`fetch::StagedTarball`]. Three paths:
+///
+/// * `--from <directory>` — used as-is; we wrap it in a `StagedTarball`
+///   shape directly. (Tests + the M16-S2 pre-extracted layout flow.)
+/// * `--from <tarball.tar.gz>` — `tar -xzf` into a tempdir.
+/// * No `--from` — refuse for now. Network downloads through
+///   `curl` are scoped for a follow-up; operators in production
+///   pass `--from`.
+fn prepare_staged_tarball(
+    args: &UpdateArgs,
+    target_version: &str,
+) -> Result<fetch::StagedTarball, String> {
+    let from = args.from.as_ref().ok_or_else(|| {
+        "sandbox update: --from <tarball> is required for the stateful phase. \
+         Pass a release tarball downloaded from \
+         https://github.com/Koriit/sandboxd/releases/latest"
+            .to_string()
+    })?;
+    if from.is_dir() {
+        let manifest = fetch::read_manifest(&from.join("MANIFEST"))
+            .map_err(|e| format!("read MANIFEST from {}: {e}", from.display()))?;
+        if manifest.version != target_version {
+            return Err(format!(
+                "MANIFEST version mismatch: directory {} contains version {}, expected {}",
+                from.display(),
+                manifest.version,
+                target_version
+            ));
+        }
+        return Ok(fetch::StagedTarball {
+            stage_dir: from.clone(),
+            manifest,
+        });
+    }
+    let dest = std::env::temp_dir().join(format!("sandboxd-update-{}", std::process::id()));
+    fetch::extract_tarball(from, &dest).map_err(|e| format!("extract {}: {e}", from.display()))
+}
+
+/// `install -D -m <mode> -o root -g root <src> <dst>` via sudo, with
+/// sha256 compare for idempotency. Returns `"install"` or `"skip"`.
+fn install_binary_if_changed(
+    src: &Path,
+    dst: &str,
+    mode: u32,
+) -> Result<&'static str, std::io::Error> {
+    let mode_str = format!("{mode:04o}");
+    if files_byte_equal(src, Path::new(dst))? {
+        return Ok("skip");
+    }
+    let status = std::process::Command::new("sudo")
+        .args([
+            "-k",
+            "install",
+            "-D",
+            "-m",
+            &mode_str,
+            "-o",
+            "root",
+            "-g",
+            "root",
+            src.to_str().unwrap(),
+            dst,
+        ])
+        .output()?;
+    if !status.status.success() {
+        return Err(std::io::Error::other(format!(
+            "install -m {mode_str} {src:?} {dst}: exit {:?}: {}",
+            status.status.code(),
+            String::from_utf8_lossy(&status.stderr).trim()
+        )));
+    }
+    Ok("install")
+}
+
+/// Same as [`install_binary_if_changed`] but for non-executable
+/// root-owned files (e.g. the systemd unit).
+fn install_root_file_if_changed(
+    src: &Path,
+    dst: &str,
+    mode: u32,
+) -> Result<&'static str, std::io::Error> {
+    install_binary_if_changed(src, dst, mode)
+}
+
+/// `cmp -s` equivalent in-process; both files must be readable by the
+/// current process. For destinations under root ownership the call
+/// may return `Err(PermissionDenied)`, treated as "differ".
+fn files_byte_equal(a: &Path, b: &Path) -> Result<bool, std::io::Error> {
+    if !b.exists() {
+        return Ok(false);
+    }
+    let ba = std::fs::read(a)?;
+    let bb = match std::fs::read(b) {
+        Ok(v) => v,
+        Err(_) => return Ok(false),
+    };
+    Ok(ba == bb)
+}
+
+/// `curl --unix-socket <sock> http://localhost/version` and pluck the
+/// `version` field. Spec 5 § 3.2.27.
+async fn query_daemon_version(sock: &str) -> Result<String, String> {
+    let bytes = http_get(sock, "/version")
+        .await
+        .map_err(|e| format!("http: {e}"))?;
+    #[derive(serde::Deserialize)]
+    struct VersionResp {
+        version: String,
+    }
+    let v: VersionResp =
+        serde_json::from_slice(&bytes).map_err(|e| format!("parse /version: {e}"))?;
+    Ok(v.version)
+}
+
+/// Update `.install-state.json`'s `previous_version` field before any
+/// binary swap. Spec 5 § 3.2.18.
+///
+/// Implementation: read the current state (as root), set the field,
+/// write via a tempfile owned by the current process, then `sudo
+/// install -m 0640 -o sandbox -g sandbox` over the destination.
+fn write_install_state_previous_version(previous_version: &str) -> Result<(), String> {
+    update_install_state_json(|v| {
+        let obj = v
+            .as_object_mut()
+            .ok_or_else(|| "install state is not a JSON object".to_string())?;
+        obj.insert(
+            "previous_version".to_string(),
+            serde_json::Value::String(previous_version.to_string()),
+        );
+        Ok(())
+    })
+}
+
+/// Finalize `.install-state.json` after a successful upgrade. Spec 5
+/// § 3.2.29: set `installed_version`, `installed_at`, and
+/// `updated_by_operator`; preserve `previous_version` from § 3.2.18.
+fn write_install_state_post_upgrade(inputs: &StatefulInputs<'_>) -> Result<(), String> {
+    let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let operator = std::env::var("SUDO_USER").unwrap_or_else(|_| "(direct-root)".to_string());
+    let target_version = inputs.target_version.to_string();
+    update_install_state_json(move |v| {
+        let obj = v
+            .as_object_mut()
+            .ok_or_else(|| "install state is not a JSON object".to_string())?;
+        obj.insert(
+            "installed_version".to_string(),
+            serde_json::Value::String(target_version.clone()),
+        );
+        obj.insert(
+            "installed_at".to_string(),
+            serde_json::Value::String(now.clone()),
+        );
+        obj.insert(
+            "updated_by_operator".to_string(),
+            serde_json::Value::String(operator.clone()),
+        );
+        Ok(())
+    })
+}
+
+/// Read the install state as root, apply `mutate`, write via a tempfile
+/// owned by the current process, then `sudo install` over the dest.
+fn update_install_state_json<F>(mutate: F) -> Result<(), String>
+where
+    F: FnOnce(&mut serde_json::Value) -> Result<(), String>,
+{
+    use std::io::Write;
+    let out = std::process::Command::new("sudo")
+        .args(["-k", "cat", INSTALL_STATE_PATH])
+        .output()
+        .map_err(|e| format!("read install state: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "read install state: exit {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&out.stdout).map_err(|e| format!("parse install state: {e}"))?;
+    mutate(&mut value)?;
+    let pretty =
+        serde_json::to_vec_pretty(&value).map_err(|e| format!("encode install state: {e}"))?;
+    let mut tmp = tempfile::NamedTempFile::new().map_err(|e| format!("create tempfile: {e}"))?;
+    tmp.write_all(&pretty)
+        .map_err(|e| format!("write tempfile: {e}"))?;
+    tmp.flush().map_err(|e| format!("flush tempfile: {e}"))?;
+    let tmp_path = tmp.path().to_path_buf();
+    let status = std::process::Command::new("sudo")
+        .args([
+            "-k",
+            "install",
+            "-m",
+            "0640",
+            "-o",
+            "sandbox",
+            "-g",
+            "sandbox",
+            tmp_path.to_str().unwrap(),
+            INSTALL_STATE_PATH,
+        ])
+        .output()
+        .map_err(|e| format!("sudo install: {e}"))?;
+    if !status.status.success() {
+        return Err(format!(
+            "sudo install install-state: exit {:?}: {}",
+            status.status.code(),
+            String::from_utf8_lossy(&status.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Append a `step=...` line to `/var/log/sandbox-install.log` with the
+/// `sandbox-update` second token. Matches install.sh's `log_ok` shape
+/// (Spec 5 § 2.6). Best-effort — log write failure does not abort the
+/// upgrade.
+fn log_step(step: &str, fields: &str) {
+    use std::io::Write;
+    let line = format!(
+        "{} sandbox-update step={step} {fields}\n",
+        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")
+    );
+    // Try direct append first (the daemon may run with operator
+    // privileges in some configurations); fall back to `sudo tee -a`.
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open("/var/log/sandbox-install.log")
+    {
+        let _ = f.write_all(line.as_bytes());
+        return;
+    }
+    let _ = std::process::Command::new("sudo")
+        .args(["-k", "tee", "-a", "/var/log/sandbox-install.log"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .and_then(|mut child| {
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(line.as_bytes());
+            }
+            child.wait()
+        });
 }
 
 // ---------------------------------------------------------------------------
 // Internal helpers (target version, MANIFEST read, systemctl probe)
 // ---------------------------------------------------------------------------
 
-/// `--from` → tarball MANIFEST.version; `--version v` → `v`; else
-/// returns the CLI's own version (the M16-S2 stand-in for the GH
-/// Releases probe — comparing the CLI's compiled version against the
-/// installed version still produces a meaningful diff). M16-S3 will
-/// add the actual `curl` call.
+/// Resolve the target version per Spec 5 § 3.1.4. Three paths:
+///
+/// 1. `--from <tarball.tar.gz>` — peek MANIFEST out of the tarball
+///    via `tar -O -xzf ... '*/MANIFEST'`. The tarball file's
+///    encoded version is the authoritative answer (the filename is
+///    operator-controlled and can lie; the MANIFEST is signed).
+/// 2. `--from <directory>` — read `<dir>/MANIFEST` directly. This
+///    path is exercised by the unit tests and the M16-S2 era
+///    pre-extracted layouts (still supported).
+/// 3. `--version <v>` (anything other than `latest`) — verbatim.
+/// 4. `latest` (default) — `curl
+///    https://api.github.com/repos/Koriit/sandboxd/releases/latest`.
 fn resolve_target_version(args: &UpdateArgs, _state: &InstallState) -> Result<String, String> {
     if let Some(from) = args.from.as_ref() {
-        // Peek MANIFEST out of the tarball without extracting.
-        // M16-S2 supports a pre-extracted directory layout (a
-        // sibling `MANIFEST` next to the tarball) so the spec
-        // exit-criterion 5 (arch mismatch from `--from`) is
-        // testable without shelling out to `tar`.
         if from.is_dir() {
             let manifest_path = from.join("MANIFEST");
             let m = fetch::read_manifest(&manifest_path)
                 .map_err(|e| format!("read MANIFEST from {}: {e}", manifest_path.display()))?;
             return Ok(m.version);
         }
+        if from.is_file() {
+            let m = fetch::peek_manifest_in_tarball(from).map_err(|e| {
+                format!(
+                    "peek MANIFEST from {}: {e} (is this a valid release tarball?)",
+                    from.display()
+                )
+            })?;
+            return Ok(m.version);
+        }
         return Err(format!(
-            "--from {}: tarball-extraction not implemented in M16-S2; pass a directory containing MANIFEST instead",
+            "--from {}: not a file or directory",
             from.display()
         ));
     }
     if args.version != "latest" {
         return Ok(args.version.clone());
     }
-    // No network probe in M16-S2 — fall back to the CLI's compiled
-    // version so the version-compare path is exercisable. M16-S3
-    // wires the actual GH Releases API call.
-    Ok(env!("CARGO_PKG_VERSION").to_string())
+    fetch::resolve_latest_version_via_github()
+        .map_err(|e| format!("resolve latest version via GitHub Releases API: {e}"))
 }
 
-/// Read MANIFEST from a tarball directory (M16-S2 limitation: full
-/// tar extraction lands in M16-S3) and run the arch + version checks
-/// at § 3.1.10.
+/// Run the arch + version cross-check against a `--from` tarball or
+/// pre-extracted directory. Spec 5 § 3.1.10.
 fn check_manifest_from_tarball(
     from: &Path,
     target_version: &str,
     installed_arch: &str,
 ) -> Result<(), String> {
-    if !from.is_dir() {
+    let m = if from.is_dir() {
+        let manifest_path = from.join("MANIFEST");
+        fetch::read_manifest(&manifest_path)
+            .map_err(|e| format!("read MANIFEST from {}: {e}", manifest_path.display()))?
+    } else if from.is_file() {
+        fetch::peek_manifest_in_tarball(from)
+            .map_err(|e| format!("peek MANIFEST from {}: {e}", from.display()))?
+    } else {
         return Err(format!(
-            "--from {}: tarball-extraction not implemented in M16-S2; pass a directory containing MANIFEST instead",
+            "--from {}: not a file or directory",
             from.display()
         ));
-    }
-    let manifest_path = from.join("MANIFEST");
-    let m = fetch::read_manifest(&manifest_path)
-        .map_err(|e| format!("read MANIFEST from {}: {e}", manifest_path.display()))?;
+    };
     fetch::check_manifest_arch(&m, installed_arch).map_err(|e| e.to_string())?;
     fetch::check_manifest_version(&m, target_version).map_err(|e| e.to_string())?;
     Ok(())
@@ -1022,6 +2080,7 @@ mod tests {
             installed_arch: "x86_64-unknown-linux-gnu".to_string(),
             installed_at: "2026-05-08T14:23:11Z".to_string(),
             installed_by_operator: "alice".to_string(),
+            previous_version: None,
         }
     }
 

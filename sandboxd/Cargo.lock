@@ -1521,6 +1521,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "nix",
+ "ring",
  "sandbox-core",
  "serde",
  "serde_json",

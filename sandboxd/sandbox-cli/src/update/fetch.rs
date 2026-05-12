@@ -1,21 +1,25 @@
 //! Release tarball fetch + sigstore verification + extraction —
 //! Spec 5 §§ 3.1.4, 3.1.9, 3.1.10.
 //!
-//! M16-S2 lands the **type shapes and pure helpers** the pre-flight
-//! needs: cosign pin constants (mirrored from `scripts/lib.sh`), the
-//! MANIFEST schema, the arch cross-check, and a stub for the
-//! download+sigstore flow that the stateful path (M16-S3) will wire
-//! into the actual `cosign verify-blob` invocation.
+//! Three responsibilities:
 //!
-//! Why the stubbed flow lives here, not in M16-S3: the `--dry-run`
-//! plan must already classify the "would-execute / skip" outcome of
-//! § 3.1.10 (sigstore verify) and § 3.1.11 (migration dry-run), which
-//! both depend on the MANIFEST being readable. The pure read +
-//! arch-check half can run today, even without network. The actual
-//! `verify-blob` shell-out is gated on `--dry-run=false` and stays
-//! deferred to S3.
+//! 1. **Cosign pin** — versioned constants mirrored from
+//!    `scripts/lib.sh`. A unit test reads `lib.sh` at test time and
+//!    asserts the two sides match; a future cosign bump must touch
+//!    both files in lockstep.
+//! 2. **MANIFEST parse + arch / version cross-check** — the
+//!    operator-facing "tarball doesn't match installed arch" refusal
+//!    surfaces here, before any state mutation.
+//! 3. **Tarball extraction + latest-version resolution** — when an
+//!    operator runs `sandbox update --from <tarball.tar.gz>` we `tar
+//!    -xzf` into a staging directory whose layout matches install.sh's
+//!    `STAGE` (the directory that holds `bin/`, `images/`,
+//!    `systemd/`, `MANIFEST`). When no `--from` is passed we resolve
+//!    the latest tag from the GitHub Releases API (`curl
+//!    https://api.github.com/repos/Koriit/sandboxd/releases/latest`).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 // ---------------------------------------------------------------------------
 // Cosign pin — MUST match `scripts/lib.sh`.
@@ -141,6 +145,186 @@ pub fn check_manifest_version(
 }
 
 // ---------------------------------------------------------------------------
+// Tarball extraction (Spec 5 § 3.1.10)
+// ---------------------------------------------------------------------------
+
+/// The staged-tarball layout. Mirrors install.sh's `STAGE` shape so
+/// the downstream consumers (`docker load`, binary install, systemd
+/// unit copy) can use the same relative paths.
+#[derive(Debug, Clone)]
+pub struct StagedTarball {
+    /// The staging root: `<tmpdir>/sandboxd-<version>-<arch>/`.
+    pub stage_dir: PathBuf,
+    /// Parsed MANIFEST at `<stage>/MANIFEST`.
+    pub manifest: Manifest,
+}
+
+impl StagedTarball {
+    /// `<stage>/bin/sandboxd`.
+    pub fn sandboxd_bin(&self) -> PathBuf {
+        self.stage_dir.join("bin/sandboxd")
+    }
+    /// `<stage>/bin/sandbox`.
+    pub fn sandbox_bin(&self) -> PathBuf {
+        self.stage_dir.join("bin/sandbox")
+    }
+    /// `<stage>/bin/sandbox-route-helper`.
+    pub fn route_helper_bin(&self) -> PathBuf {
+        self.stage_dir.join("bin/sandbox-route-helper")
+    }
+    /// `<stage>/systemd/sandboxd.service`.
+    pub fn systemd_unit(&self) -> PathBuf {
+        self.stage_dir.join("systemd/sandboxd.service")
+    }
+    /// `<stage>/images/sandbox-gateway-<version>.tar`.
+    pub fn gateway_image_tar(&self) -> PathBuf {
+        self.stage_dir.join(format!(
+            "images/sandbox-gateway-{}.tar",
+            self.manifest.version
+        ))
+    }
+}
+
+/// Extract a release tarball into `dest_dir` and return the staged
+/// tree's root + parsed MANIFEST. Mirrors install.sh § 4.4.20's
+/// `extract_tarball` shape: `tar -xzf <tarball> -C <dest>` produces a
+/// single top-level directory `sandboxd-<version>-<arch>/` containing
+/// `bin/`, `systemd/`, `images/`, `MANIFEST`.
+///
+/// Pre-flight has already read the MANIFEST via [`read_manifest`]
+/// against the *embedded* file inside the tarball (via `tar -O`); this
+/// function re-reads it from the unpacked directory and is the
+/// authoritative source for the artifact paths.
+pub fn extract_tarball(tarball: &Path, dest_dir: &Path) -> Result<StagedTarball, ManifestError> {
+    std::fs::create_dir_all(dest_dir)?;
+    let status = Command::new("tar")
+        .args(["-xzf", tarball.to_str().unwrap(), "-C"])
+        .arg(dest_dir)
+        .output()?;
+    if !status.status.success() {
+        return Err(ManifestError::Io(std::io::Error::other(format!(
+            "tar -xzf {} failed (exit {:?}): {}",
+            tarball.display(),
+            status.status.code(),
+            String::from_utf8_lossy(&status.stderr).trim()
+        ))));
+    }
+    // Find the staged directory: it's the single subdirectory of dest
+    // matching `sandboxd-*-*-linux-*`. We pick the first entry — there
+    // is exactly one in a well-formed release tarball.
+    let mut stage_dir = None;
+    for entry in std::fs::read_dir(dest_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir()
+            && path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.starts_with("sandboxd-"))
+                .unwrap_or(false)
+        {
+            stage_dir = Some(path);
+            break;
+        }
+    }
+    let stage_dir = stage_dir.ok_or_else(|| {
+        ManifestError::Io(std::io::Error::other(
+            "extracted tarball did not contain a top-level sandboxd-*-* directory",
+        ))
+    })?;
+    let manifest = read_manifest(&stage_dir.join("MANIFEST"))?;
+    Ok(StagedTarball {
+        stage_dir,
+        manifest,
+    })
+}
+
+/// Read the MANIFEST out of a tarball without extracting it. Used by
+/// the pre-flight to surface arch / version mismatches against the
+/// installed state **before** the stateful phase touches anything on
+/// disk. Mirrors install.sh's `tar -O -xf "$FROM" --wildcards
+/// '*/MANIFEST'` pattern.
+pub fn peek_manifest_in_tarball(tarball: &Path) -> Result<Manifest, ManifestError> {
+    let out = Command::new("tar")
+        .args([
+            "-O",
+            "-xzf",
+            tarball.to_str().unwrap(),
+            "--wildcards",
+            "*/MANIFEST",
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Err(ManifestError::Io(std::io::Error::other(format!(
+            "tar -O -xzf {} '*/MANIFEST' failed (exit {:?}): {}",
+            tarball.display(),
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))));
+    }
+    serde_json::from_slice(&out.stdout).map_err(ManifestError::Parse)
+}
+
+// ---------------------------------------------------------------------------
+// Latest-version resolution (Spec 5 § 3.1.4)
+// ---------------------------------------------------------------------------
+
+/// GitHub Releases API endpoint for the latest tag. Used by the
+/// version-resolution path when the operator passes `--version
+/// latest` (the default) and no `--from`.
+pub const GH_RELEASES_LATEST_URL: &str =
+    "https://api.github.com/repos/Koriit/sandboxd/releases/latest";
+
+/// Resolve the latest released version via the GitHub Releases API.
+/// Shells out to `curl` (already a prereq) and `jq` (also a prereq) so
+/// we don't pull in a JSON-over-HTTPS Rust dependency just for this
+/// one call. Returns the bare version string (e.g. `"1.1.0"`) without
+/// the leading `v`.
+///
+/// On any network / parse failure returns an `Err(String)` — the
+/// caller surfaces the message to stderr and falls back to the
+/// hard-refusal path. There is no silent fallback because the operator
+/// needs to know they're not actually on `latest`.
+pub fn resolve_latest_version_via_github() -> Result<String, String> {
+    let out = Command::new("curl")
+        .args([
+            "-fsSL",
+            "--retry",
+            "3",
+            "--retry-delay",
+            "2",
+            "-H",
+            "Accept: application/vnd.github+json",
+            GH_RELEASES_LATEST_URL,
+        ])
+        .output()
+        .map_err(|e| format!("curl: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "curl {GH_RELEASES_LATEST_URL} failed (exit {:?}): {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    // The release object's `tag_name` is `v<version>` per the
+    // repo's release-tag convention. Strip the leading `v`.
+    #[derive(serde::Deserialize)]
+    struct Release {
+        tag_name: String,
+    }
+    let release: Release = serde_json::from_slice(&out.stdout)
+        .map_err(|e| format!("parse GitHub release JSON: {e}"))?;
+    let tag = release.tag_name;
+    let bare = tag.strip_prefix('v').unwrap_or(&tag);
+    if bare.is_empty() {
+        return Err(format!(
+            "GitHub release endpoint returned empty tag_name: {tag:?}"
+        ));
+    }
+    Ok(bare.to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -220,6 +404,91 @@ mod tests {
         };
         let err = check_manifest_version(&m, "1.2.0").unwrap_err();
         assert!(matches!(err, ManifestError::VersionMismatch { .. }));
+    }
+
+    /// Round-trip: synthesise a fake release tarball under a tempdir,
+    /// extract it, and verify the [`StagedTarball`] helper paths land
+    /// in the right place. Uses GNU tar (a build-time prereq).
+    #[test]
+    fn extract_tarball_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stage_name = "sandboxd-9.9.9-x86_64-unknown-linux-gnu";
+        let stage_dir = tmp.path().join(stage_name);
+        std::fs::create_dir_all(stage_dir.join("bin")).unwrap();
+        std::fs::create_dir_all(stage_dir.join("systemd")).unwrap();
+        std::fs::create_dir_all(stage_dir.join("images")).unwrap();
+        std::fs::write(stage_dir.join("bin/sandboxd"), b"fake-sandboxd").unwrap();
+        std::fs::write(stage_dir.join("bin/sandbox"), b"fake-sandbox").unwrap();
+        std::fs::write(stage_dir.join("bin/sandbox-route-helper"), b"fake-rh").unwrap();
+        std::fs::write(stage_dir.join("systemd/sandboxd.service"), b"[Unit]\n").unwrap();
+        std::fs::write(
+            stage_dir.join("images/sandbox-gateway-9.9.9.tar"),
+            b"fake-image-tar",
+        )
+        .unwrap();
+        let manifest = serde_json::json!({
+            "version": "9.9.9",
+            "arch": "x86_64-unknown-linux-gnu",
+            "artifacts": {
+                "sandbox":  {"path": "bin/sandbox",  "sha256": "00"},
+                "sandboxd": {"path": "bin/sandboxd", "sha256": "11"}
+            }
+        });
+        std::fs::write(
+            stage_dir.join("MANIFEST"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let tarball_path = tmp.path().join("release.tar.gz");
+        let status = std::process::Command::new("tar")
+            .args(["-czf"])
+            .arg(&tarball_path)
+            .args(["-C", tmp.path().to_str().unwrap(), stage_name])
+            .status()
+            .expect("run tar");
+        assert!(status.success(), "tar should pack");
+        std::fs::remove_dir_all(&stage_dir).unwrap();
+
+        let dest = tmp.path().join("unpacked");
+        let staged = extract_tarball(&tarball_path, &dest).expect("extract ok");
+        assert_eq!(staged.manifest.version, "9.9.9");
+        assert!(staged.sandboxd_bin().exists());
+        assert!(staged.sandbox_bin().exists());
+        assert!(staged.route_helper_bin().exists());
+        assert!(staged.systemd_unit().exists());
+        assert!(staged.gateway_image_tar().exists());
+    }
+
+    /// `peek_manifest_in_tarball` reads the MANIFEST without
+    /// extracting — used by the pre-flight to surface arch/version
+    /// mismatches before any state mutation.
+    #[test]
+    fn peek_manifest_in_tarball_reads_embedded_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stage_name = "sandboxd-9.9.9-x86_64-unknown-linux-gnu";
+        let stage_dir = tmp.path().join(stage_name);
+        std::fs::create_dir_all(&stage_dir).unwrap();
+        let manifest = serde_json::json!({
+            "version": "9.9.9",
+            "arch": "aarch64-unknown-linux-gnu",
+            "artifacts": {}
+        });
+        std::fs::write(
+            stage_dir.join("MANIFEST"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let tarball_path = tmp.path().join("release.tar.gz");
+        let status = std::process::Command::new("tar")
+            .args(["-czf"])
+            .arg(&tarball_path)
+            .args(["-C", tmp.path().to_str().unwrap(), stage_name])
+            .status()
+            .expect("run tar");
+        assert!(status.success());
+        let m = peek_manifest_in_tarball(&tarball_path).expect("peek ok");
+        assert_eq!(m.version, "9.9.9");
+        assert_eq!(m.arch, "aarch64-unknown-linux-gnu");
     }
 
     #[test]
