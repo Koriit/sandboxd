@@ -44,6 +44,24 @@ jobs:
         working-directory: sandboxd
         run: cargo clippy --workspace -- -D warnings
 
+  # Shellcheck for the install / uninstall scripts. The spec's install-
+  # infrastructure design (§ 8.2) requires POSIX-sh (`-s sh`) plus
+  # stylistic warnings (`-S style`) on both scripts. The scripts
+  # themselves land in a follow-up session; until then the step
+  # short-circuits when neither file exists rather than failing CI.
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Shellcheck
+        run: |
+          if [ -f scripts/install.sh ] || [ -f scripts/uninstall.sh ]; then
+            shellcheck -s sh -S style scripts/install.sh scripts/uninstall.sh
+          else
+            echo "scripts/install.sh and scripts/uninstall.sh not present yet; skipping."
+          fi
+
   # PR-time + push-to-main: container backend only. Spec § "CI policy"
   # (lines ~1060-1070): "PR | Full E2E against container only | ~5-10 min".
   # Lite has no Lima/KVM dependency, so this job runs unmodified on stock

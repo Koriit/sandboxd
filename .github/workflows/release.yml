@@ -1,0 +1,215 @@
+name: Release
+
+# Tag-triggered release pipeline.
+#
+# The release process is: bump every workspace crate's `version` field
+# (sandboxd/*/Cargo.toml) to X.Y.Z, commit on main, tag vX.Y.Z, push the
+# tag. This workflow fires on the tag push and builds against the tagged
+# commit. Pre-release tags (-rc1, -alpha.2) are supported by the second
+# pattern so release-candidate testing uses the same pipeline. The
+# workflow does NOT fire on branch pushes, PRs, or releases edited in
+# the GitHub UI.
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'           # e.g. v1.0.0, v1.2.3
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'         # e.g. v1.0.0-rc1, v1.0.0-alpha.2
+
+# Minimum-required scopes for the entire workflow:
+#   contents: write       — softprops/action-gh-release uploads tarball
+#                           and sigstore bundle to the GitHub Release
+#   id-token: write       — sigstore keyless signing via the GH Actions
+#                           OIDC token issuer
+#   attestations: write   — actions/attest-build-provenance writes the
+#                           SLSA build-provenance attestation to the
+#                           repo's attestations API
+#
+# Notably absent:
+#   packages: write   — we do not push to GHCR
+#   pages: write      — Pages publication is the docs workflow's job,
+#                       not this one. install.sh / uninstall.sh ride
+#                       the docs deploy (see install-infra spec § 4.1).
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build:
+    # Two parallel jobs, one per supported arch. The arch is the
+    # tarball's <arch> component and the MANIFEST.arch value.
+    #
+    # fail-fast: false so an aarch64 build failure does not cancel a
+    # successful x86_64 build mid-flight — the release is publishable
+    # partial (single arch attached, second arch missing) which is
+    # recoverable; a fast-fail would orphan sigstore attestations.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm   # GitHub-hosted ARM64 Linux runner; GA since 2025
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write       # for attaching artifacts to the GitHub Release
+      id-token: write       # for sigstore keyless signing via GH Actions OIDC
+      attestations: write   # for actions/attest-build-provenance
+    steps:
+      - name: Checkout (at the tag)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # full history; build_sha needs the resolved commit
+
+      - name: Resolve version
+        id: version
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"          # vX.Y.Z[-prerelease]
+          ver="${tag#v}"                          # X.Y.Z[-prerelease]
+          echo "tag=$tag"  >> "$GITHUB_OUTPUT"
+          echo "ver=$ver"  >> "$GITHUB_OUTPUT"
+          # Sanity-check: the Cargo.toml version must match the tag.
+          # Pull `sandboxd/sandboxd/Cargo.toml`'s version field and compare.
+          cargo_ver=$(awk -F'"' '/^version/ { print $2; exit }' \
+              sandboxd/sandboxd/Cargo.toml)
+          if [ "$cargo_ver" != "$ver" ]; then
+            echo "::error::tag $tag does not match Cargo.toml version $cargo_ver" >&2
+            exit 1
+          fi
+
+      - name: Install Rust toolchain (pinned)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # Read from rust-toolchain.toml in the workspace; ensures CI and
+          # release use the same channel (currently 1.88.0, see
+          # sandboxd/rust-toolchain.toml).
+          toolchain: '1.88.0'
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            sandboxd/target
+          key: release-${{ matrix.target }}-${{ hashFiles('sandboxd/**/Cargo.lock') }}
+
+      - name: Build workspace (release profile)
+        working-directory: sandboxd
+        run: cargo build --workspace --release --target ${{ matrix.target }}
+
+      - name: Build gateway image
+        # Note: `make gateway-image` invokes `docker build -t sandbox-gateway -f
+        # networking/gateway/Dockerfile .` (Makefile:139-140). A follow-up spec
+        # changes this target to tag with $(GATEWAY_VERSION) — the same as the
+        # daemon's Cargo.toml version. We invoke the (post-Spec-3) target and
+        # then re-tag for clarity below.
+        env:
+          GATEWAY_VERSION: ${{ steps.version.outputs.ver }}
+        run: |
+          make gateway-image
+          docker tag sandbox-gateway:${GATEWAY_VERSION} \
+                     sandbox-gateway:${GATEWAY_VERSION}-${{ matrix.target }}
+          docker save sandbox-gateway:${GATEWAY_VERSION} \
+              -o sandbox-gateway-${GATEWAY_VERSION}.tar
+
+      - name: Assemble tarball
+        env:
+          VER: ${{ steps.version.outputs.ver }}
+          ARCH: ${{ matrix.target }}
+          BUILD_SHA: ${{ github.sha }}
+        run: |
+          stage="sandboxd-${VER}-${ARCH}"
+          mkdir -p "$stage"/{bin,libexec,systemd,images,attestations}
+          install -m 0755 \
+              sandboxd/target/${ARCH}/release/sandboxd \
+              "$stage/bin/sandboxd"
+          install -m 0755 \
+              sandboxd/target/${ARCH}/release/sandbox \
+              "$stage/bin/sandbox"
+          install -m 0755 \
+              sandboxd/target/${ARCH}/release/sandbox-route-helper \
+              "$stage/bin/sandbox-route-helper"
+          install -m 0644 \
+              sandboxd/contrib/systemd/sandboxd.service \
+              "$stage/systemd/sandboxd.service"
+          mv sandbox-gateway-${VER}.tar \
+             "$stage/images/sandbox-gateway-${VER}.tar"
+          # Generate MANIFEST (§ 2.3 shape).
+          python3 - <<'PY' "$stage" "$VER" "$ARCH" "$BUILD_SHA"
+          import hashlib, json, os, sys, datetime
+          stage, ver, arch, build_sha = sys.argv[1:5]
+          def sha256(p):
+              h = hashlib.sha256()
+              with open(p, "rb") as f:
+                  for blk in iter(lambda: f.read(1 << 20), b""):
+                      h.update(blk)
+              return h.hexdigest()
+          artifacts = {
+              "sandboxd":               {"path": "bin/sandboxd"},
+              "sandbox":                {"path": "bin/sandbox"},
+              "sandbox-route-helper":   {"path": "bin/sandbox-route-helper"},
+              "gateway-image":          {"path": f"images/sandbox-gateway-{ver}.tar",
+                                          "docker_tag": f"sandbox-gateway:{ver}"},
+              "systemd-unit":           {"path": "systemd/sandboxd.service"},
+          }
+          for a in artifacts.values():
+              a["sha256"] = sha256(os.path.join(stage, a["path"]))
+          manifest = {
+              "version":     ver,
+              "arch":        arch,
+              "build_sha":   build_sha,
+              "build_time":  datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "artifacts":   artifacts,
+          }
+          with open(os.path.join(stage, "MANIFEST"), "w") as f:
+              json.dump(manifest, f, indent=2, sort_keys=True)
+          PY
+          tar -czf "${stage}.tar.gz" "$stage"
+
+      - name: Install cosign (pinned)
+        uses: sigstore/cosign-installer@v3.7.0   # pinned by major+minor
+        with:
+          cosign-release: 'v2.4.1'                # pinned exact
+
+      - name: Sign tarball (keyless OIDC)
+        env:
+          VER: ${{ steps.version.outputs.ver }}    # spec § 3.3 writes `VER:  ${{...}}` (two spaces); collapsed here to one to satisfy yamllint
+          ARCH: ${{ matrix.target }}
+        run: |
+          cosign sign-blob --yes \
+              --bundle "sandboxd-${VER}-${ARCH}.tar.gz.sigstore" \
+              "sandboxd-${VER}-${ARCH}.tar.gz"
+
+      - name: Build provenance attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: 'sandboxd-${{ steps.version.outputs.ver }}-${{ matrix.target }}.tar.gz'
+
+      - name: Upload artifacts to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          fail_on_unmatched_files: true
+          files: |
+            sandboxd-${{ steps.version.outputs.ver }}-${{ matrix.target }}.tar.gz
+            sandboxd-${{ steps.version.outputs.ver }}-${{ matrix.target }}.tar.gz.sigstore
+
+  # publish-install-script:
+  #
+  # The install-infrastructure spec § 3.3 mentions a second top-level
+  # `publish-install-script` job that runs after both matrix jobs and
+  # publishes scripts/install.sh + scripts/uninstall.sh to GitHub Pages.
+  # However § 4.1 explicitly states "The release workflow does NOT
+  # re-publish the scripts (they ride the docs deploy)" — the canonical
+  # path is for `docs.yml` to pick up `site/public/install.sh` (a copy
+  # or symlink of `scripts/install.sh`) on every push to main.
+  #
+  # Following § 4.1 (the authoritative hosting section), this workflow
+  # therefore intentionally does not publish the install scripts. The
+  # install.sh / uninstall.sh scripts themselves are written in a
+  # follow-up spec; once they exist, the docs workflow will pick them
+  # up automatically via `site/public/`.
