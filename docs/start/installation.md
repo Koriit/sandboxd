@@ -1,23 +1,125 @@
 ---
 title: Installation
-description: Full prerequisite, dependency, and build steps for running sandboxd on Linux — KVM, Docker, Lima, QEMU, and Rust.
+description: Install sandboxd on Linux via the signed install.sh, with a developer-mode fallback for repository contributors.
 ---
 
-This guide covers system requirements, dependency installation, and building sandboxd from source. If you want the fast path, skim the [Quickstart](/start/quickstart/) instead.
+This guide covers two install paths:
+
+- [**Operator install**](#operator-install-curl--bash) — the supported production install via the signed `install.sh` hosted on GitHub Pages. This is what you want unless you're building sandboxd from source.
+- [**Developer install**](#developer-install-make-setup-dev-env) — for contributors who want to build the daemon from source and run it as their own user. Same machine-level prerequisites; different artifact layout.
+
+If you want the fast path through create/exec/ssh once installed, see [Quickstart](/start/quickstart/).
 
 ## System requirements
 
 | Requirement | Minimum | Notes |
 |-------------|---------|-------|
-| OS | Linux (x86_64) | Tested on Ubuntu 22.04/24.04 |
+| OS | Linux (x86_64 or aarch64) | Tested on Ubuntu 22.04/24.04 |
 | Linux kernel | 5.8+ | `sandbox-route-helper` needs `pidfd_open(2)` (5.3+) and `setns(pidfd, ...)` (5.8+) |
 | KVM | `/dev/kvm` accessible | Required for hardware-accelerated VMs |
 | Docker | 24.0+ | For gateway containers and networking |
 | Lima | 2.1+ | VM management (`limactl` must be on PATH); skippable at runtime if you only use [lite mode](/guides/lite-mode/) |
-| Rust | 1.88+ (stable) | For building from source |
 | QEMU | 8.0+ | `qemu-system-x86` with OVMF firmware |
-| Go | 1.22+ | For the CoreDNS policy plugin |
-| Python | 3.12+ | For E2E tests only |
+| `setcap`, `jq`, `curl` | any recent | `install.sh` probes for all three |
+| Rust | 1.88+ (stable) | Developer install only — for building from source |
+| Go | 1.22+ | Developer install only — for the CoreDNS policy plugin |
+| Python | 3.12+ | Developer install only — for E2E tests |
+
+Sections below cover the prerequisites in detail. If `install.sh` finds any missing it will refuse and print the exact package names per detected distro.
+
+## Operator install (`curl | bash`)
+
+The signed installer lives at `https://Koriit.github.io/sandboxd/install.sh`. It is POSIX-shell, fully idempotent, and re-runnable.
+
+```bash
+curl -fsSL https://Koriit.github.io/sandboxd/install.sh | bash
+```
+
+This walks 24 steps: prereq probe, sigstore-verified tarball download, binary install, `sandbox` system-user create, `setcap` on the route helper, `setuid` on `qemu-bridge-helper`, `docker load` of the gateway image, and `systemd` unit install. Every privileged step uses `sudo -k`. A re-run on an already-installed host detects each desired end-state and logs `action=skip`.
+
+After install, finish the two follow-up steps the installer prints:
+
+```bash
+# 1. Activate sandbox-group membership in your current shell.
+newgrp sandbox    # or log out and back in
+
+# 2. Start the daemon under systemd.
+sudo systemctl enable --now sandboxd
+
+# 3. Verify the install.
+sandbox doctor
+```
+
+### Variants
+
+```bash
+# Pin a specific release.
+curl -fsSL https://Koriit.github.io/sandboxd/install.sh | bash -s -- --version 1.1.0
+
+# Air-gapped: the operator already has the tarball locally.
+curl -fsSL https://Koriit.github.io/sandboxd/install.sh | bash -s -- \
+    --from /path/to/sandboxd-1.1.0-x86_64-unknown-linux-gnu.tar.gz
+
+# Fully offline: pre-staged tarball + sigstore bundle, no network at all.
+curl -fsSL https://Koriit.github.io/sandboxd/install.sh | bash -s -- \
+    --from /path/to/sandboxd-1.1.0-x86_64-unknown-linux-gnu.tar.gz \
+    --cosign-bundle /path/to/sandboxd-1.1.0-x86_64-unknown-linux-gnu.tar.gz.sigstore
+
+# Non-interactive (no prompts).
+curl -fsSL https://Koriit.github.io/sandboxd/install.sh | bash -s -- --yes
+```
+
+Full flag list: `--version`, `--from`, `--cosign-bundle`, `--source-url`, `--yes`, `--verbose`, `--quiet`, `--no-color`, `--help`.
+
+### What it installs
+
+| Artifact | Destination |
+|---|---|
+| `sandboxd` binary | `/usr/local/bin/sandboxd` |
+| `sandbox` CLI | `/usr/local/bin/sandbox` |
+| `sandbox-route-helper` | `/usr/local/libexec/sandboxd/sandbox-route-helper` (with `cap_net_admin,cap_sys_admin=eip`) |
+| systemd unit | `/etc/systemd/system/sandboxd.service` |
+| `users.conf` | `/etc/sandboxd/users.conf` |
+| Bridge authorization | `allow sb-*` appended to `/etc/qemu/bridge.conf` |
+| Gateway image | `sandbox-gateway:<version>` loaded into Docker |
+| Daemon state dir | `/var/lib/sandbox/` (owner `sandbox:sandbox`, mode `0750`) |
+| Install state record | `/var/lib/sandbox/.install-state.json` |
+| Install log | `/var/log/sandbox-install.log` |
+
+The `sandbox` system user is created (if not already present); the invoking operator (from `$SUDO_USER`) is added to the `sandbox` group.
+
+### Trust chain
+
+The install chain is auditable at every link:
+
+1. **TLS to GitHub Pages** delivers `install.sh` (standard `*.github.io` TLS).
+2. **`install.sh` pins cosign** at version `v2.4.1` by sha256. The script downloads cosign, verifies the binary, and refuses on mismatch.
+3. **cosign verifies the release tarball's sigstore bundle** against the project's GitHub Actions OIDC identity (`https://github.com/Koriit/sandboxd/.github/workflows/release.yml`). Any other signing identity is rejected.
+4. **`install.sh` re-checks each artifact's sha256** against the tarball's `MANIFEST` file.
+
+For an air-gapped review pass, fetch the script first and read it before piping to `bash`:
+
+```bash
+curl -fsSL https://Koriit.github.io/sandboxd/install.sh | less
+```
+
+### Uninstall
+
+```bash
+curl -fsSL https://Koriit.github.io/sandboxd/uninstall.sh | bash -s -- --yes
+```
+
+This removes the binaries, systemd unit, and any install-time changes recorded in `/var/lib/sandbox/.install-state.json` (only reverts changes the installer made). State at `/var/lib/sandbox/` and the `sandbox` user are preserved; add `--purge` to also remove them.
+
+```bash
+curl -fsSL https://Koriit.github.io/sandboxd/uninstall.sh | bash -s -- --purge --yes
+```
+
+`--force` overrides the "active sessions exist" refusal; resources may leak. `--purge` without `--yes` requires typing `PURGE` to confirm.
+
+## Developer install (`make setup-dev-env`)
+
+For contributors building sandboxd from source. This path runs the daemon as your own user (not the system `sandbox` user) with state under `~/.local/share/sandboxd/`. Helper installation, bridge-conf, `users.conf`, and the setuid step are folded into `make setup-dev-env`. See [Developer install — build from source](#developer-install--build-from-source) below for the full walkthrough. The two paths can coexist on the same host, but should not run two daemons in parallel: see [Dev-mode vs operator-mode coexistence](#dev-mode-vs-operator-mode-coexistence) below before mixing them.
 
 ## KVM setup
 
@@ -66,7 +168,7 @@ If KVM is not available, check that your CPU supports hardware virtualization (I
 
 ### qemu-bridge-helper setup
 
-The QEMU bridge helper (`qemu-bridge-helper`) is a setuid binary that creates TAP devices and attaches them to bridge networks. It must be installed and configured for sandbox networking to work.
+The QEMU bridge helper (`qemu-bridge-helper`) is a setuid binary that creates TAP devices and attaches them to bridge networks. It must be installed and configured for sandbox networking to work. The operator-install path handles this for you; the steps below are the manual equivalent for the developer path.
 
 Verify the binary exists and is setuid:
 
@@ -89,7 +191,7 @@ echo "allow all" | sudo tee /etc/qemu/bridge.conf
 sudo chmod 644 /etc/qemu/bridge.conf
 ```
 
-sandboxd creates a fresh Docker-managed bridge per session (named `sb-{session_id}`), so `qemu-bridge-helper` needs permission to attach TAP devices to any bridge name. `allow all` is the simplest rule; if you want to scope it, list each session bridge explicitly or match the `sb-*` prefix via repeated `allow` lines.
+sandboxd creates a fresh Docker-managed bridge per session (named `sb-{session_id}`), so `qemu-bridge-helper` needs permission to attach TAP devices to any bridge name. `allow all` is the dev-box convenience; the operator-install path narrows this to `allow sb-*` (production scope).
 
 ## Docker setup
 
@@ -198,9 +300,9 @@ lima
 
 `limactl start` downloads the OS image and nerdctl on first run. `lima` drops you into a shell inside the VM. You do not need this step for sandboxd — sandboxd drives `limactl` directly.
 
-## Rust toolchain
+## Developer install — build from source
 
-sandboxd is written in Rust. You need the stable toolchain to build from source.
+Skip this section unless you are building sandboxd from a local checkout. For an operator install, see [Operator install (`curl | bash`)](#operator-install-curl--bash) above.
 
 ### Install Rust via rustup
 
@@ -215,8 +317,6 @@ source $HOME/.cargo/env
 rustc --version
 # Should be 1.88.0 or newer
 ```
-
-## Build from source
 
 ### Clone the repository
 
@@ -272,11 +372,11 @@ make test-e2e           # End-to-end tests (pytest, requires running daemon)
 
 ## sandboxd configuration
 
-Two one-time steps are required before the daemon starts: a system-wide config file at `/etc/sandboxd/users.conf`, and a privileged helper binary at `/usr/local/libexec/sandboxd/sandbox-route-helper`. Both stay in place across upgrades.
+Two one-time steps are required before the daemon starts: a system-wide config file at `/etc/sandboxd/users.conf`, and a privileged helper binary at `/usr/local/libexec/sandboxd/sandbox-route-helper`. Both stay in place across upgrades. The [operator install](#operator-install-curl--bash) handles both for you; this section documents the manual equivalent used by the developer path.
 
 ### One-shot setup: `make setup-dev-env`
 
-The repository ships a make target that runs every per-host install/configure step the project needs. It prints `[sudo] <exact change>` before each privileged operation so you see what is about to be modified before authenticating, and is fully idempotent — re-running on an already-configured host prints `✓ already configured` for every step and invokes no `sudo`.
+The repository ships a make target that runs every per-host install/configure step the project needs. It prints `[sudo] <exact change>` before each privileged operation so you see what is about to be modified before authenticating, and is fully idempotent — re-running on an already-configured host prints `+ already configured` for every step and invokes no `sudo`.
 
 Multiple `[sudo]` announce lines do not mean multiple password prompts: `sudo` caches your authentication for a few minutes (the `timestamp_timeout` setting, typically 5–15 minutes on most distros), so you usually authenticate once at the first privileged step and the rest run silently. If enough time has elapsed between steps, `sudo` will re-prompt — that is normal.
 
@@ -327,7 +427,7 @@ For a single-user dev install, `make setup-users-conf` renders `contrib/users.co
 | `10.209.0.0/20` | Production pool | The operator's `sandboxd` reading the canonical `/etc/sandboxd/users.conf`. The daemon's `find_subnet_by_uid` lookup returns this entry first since it appears first in the array. |
 | `10.220.0.0/20` | E2E test pool | The e2e test daemon, which `tests/e2e/conftest.py` launches with `SANDBOX_USERS_CONF` pointing at a tempfile users.conf containing only this entry. The production `sandbox-route-helper` continues reading the canonical file — which lists both pools — so authorization for the test pool's gateway IP succeeds without weakening the [`SANDBOX_USERS_CONF` privilege boundary](#privilege-boundary-sandbox_users_conf-is-feature-gated). |
 
-The two pools are non-overlapping `/20` blocks. Disjoint CIDRs let the M11-S10 CIDR-scoped reaper distinguish test-daemon resources from production-daemon resources at startup, so a `make test-e2e` run never touches a live production session.
+The two pools are non-overlapping `/20` blocks. Disjoint CIDRs let the CIDR-scoped reaper distinguish test-daemon resources from production-daemon resources at startup, so a `make test-e2e` run never touches a live production session.
 
 The manual equivalent of `make setup-users-conf`:
 
@@ -350,7 +450,7 @@ The shell-redirect through `sudo tee` is intentional — `sudo echo ... > file` 
 
 ##### Upgrade path for hosts installed before the dual-pool layout
 
-Hosts that ran `make setup-dev-env` before the dual-pool layout landed carry a single-pool canonical file (production pool only). Re-running `make setup-users-conf` on such a host detects the missing test pool and idempotently appends it via a `python3` JSON round-trip; operator-added entries are preserved untouched. A second invocation prints `✓ already configured` and invokes no `sudo`. `contrib/users.conf.example` is the source of truth for the layout — diff against it if you want to confirm what `make setup-users-conf` will install on a fresh host.
+Hosts that ran `make setup-dev-env` before the dual-pool layout landed carry a single-pool canonical file (production pool only). Re-running `make setup-users-conf` on such a host detects the missing test pool and idempotently appends it via a `python3` JSON round-trip; operator-added entries are preserved untouched. A second invocation prints `+ already configured` and invokes no `sudo`. `contrib/users.conf.example` is the source of truth for the layout — diff against it if you want to confirm what `make setup-users-conf` will install on a fresh host.
 
 #### `SANDBOX_USERS_CONF` env-var override
 
@@ -423,68 +523,45 @@ The route helper runs with `cap_net_admin,cap_sys_admin=eip`. Honoring an attack
 
 The daemon itself continues to honor `SANDBOX_USERS_CONF` unconditionally because the daemon is not the privilege boundary — only the cap'd helper is.
 
+## Dev-mode vs operator-mode coexistence
+
+The two install paths produce different layouts:
+
+| Artifact | Developer install (`make setup-dev-env`) | Operator install (`install.sh`) |
+|---|---|---|
+| `sandboxd` binary | Run from `sandboxd/target/release/sandboxd` | `/usr/local/bin/sandboxd` |
+| `sandbox` CLI | Run from `sandboxd/target/release/sandbox` | `/usr/local/bin/sandbox` |
+| `sandbox-route-helper` | `/usr/local/libexec/sandboxd/sandbox-route-helper` | Same path |
+| systemd unit | Not installed (run by hand) | `/etc/systemd/system/sandboxd.service` |
+| State dir | `~/.local/share/sandboxd/` | `/var/lib/sandbox/` |
+| Socket | `$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock` | `/run/sandbox/sandboxd.sock` |
+| `sandbox` user | Not created | Created |
+| `users.conf` | `["sandbox", "$USER"]` | `["sandbox", "<invoking-operator>"]` |
+| `bridge.conf` | `allow all` (dev convenience) | `allow sb-*` (production scope) |
+
+`install.sh`'s pre-existing-install detection refuses if `/usr/local/bin/sandboxd` exists. The developer's daemon under `sandboxd/target/release/sandboxd` is not detected by that check, so `install.sh` runs successfully on a dev box — but the two daemons should not run at the same time. To migrate from the developer path to the operator install: stop the dev daemon, optionally copy `~/.local/share/sandboxd/sessions.db` to `/var/lib/sandbox/sessions.db` (manual operation, no automated migration yet), then run `install.sh` and `sudo systemctl enable --now sandboxd`.
+
 ## First run
 
-### 1. Start the daemon
+After install, drive sandboxd through the CLI:
 
 ```bash
-sandboxd/target/debug/sandboxd
-```
+# Create a session.
+sandbox create --name hello
 
-The daemon creates its state directory at `~/.local/share/sandboxd/` (SQLite database, session data, CA certificates) and listens on `$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock` (typically `/run/user/$UID/sandboxd/sandboxd.sock`). Set `$XDG_DATA_HOME` or `$XDG_RUNTIME_DIR` to customize, or use `--base-dir` and `--socket` flags. No root or sudo is needed — the daemon runs as your regular user.
-
-To customize paths:
-
-```bash
-sandboxd/target/debug/sandboxd --socket /tmp/sandbox.sock --base-dir /tmp/sandbox-state
-```
-
-### 2. Create your first session
-
-In a separate terminal:
-
-```bash
-sandboxd/target/debug/sandbox create --name hello
-```
-
-On the first run, Lima downloads the Ubuntu 24.04 cloud image (about 700 MB). This is cached for subsequent sessions. The full create process (image download, VM boot, guest agent installation, networking setup) takes 2 to 5 minutes on first run, under 1 minute on subsequent runs with a cached image.
-
-### 3. Verify the session
-
-```bash
+# Verify.
 sandbox ps
-```
 
-Expected output:
-
-```
-ID                                    NAME   STATE       AGENT        GATEWAY      CREATED
-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx  hello  running     connected    healthy      30s ago
-```
-
-### 4. Run a command
-
-```bash
+# Run a command.
 sandbox exec hello -- uname -a
-```
 
-### 5. Clean up
-
-```bash
+# Clean up.
 sandbox rm hello
 ```
 
-## System-service deployment (production)
+Operator-install: the CLI talks to `/run/sandbox/sandboxd.sock` (via the `sandbox` group). Developer install: the CLI talks to `$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock` after you start the daemon (`sandboxd/target/debug/sandboxd`).
 
-The dev workflow above runs the daemon as your own user with state at `~/.local/share/sandboxd/` and the socket under `$XDG_RUNTIME_DIR`. The production deployment model is different:
-
-- The daemon runs as a dedicated `sandbox` system user (uid not your own) under a systemd unit (`sandboxd.service`).
-- State lives at `/var/lib/sandbox/` (mode `0750`, owned by `sandbox:sandbox`).
-- The unix socket lives at `/run/sandbox/sandboxd.sock` (mode `0660`, owner `sandbox:sandbox`).
-- Operators must be in the `sandbox` group to connect; group membership is the access boundary.
-- The route-helper is installed at `/usr/local/libexec/sandboxd/sandbox-route-helper` with `cap_net_admin,cap_sys_admin=eip`.
-
-The canonical systemd unit file ships in `sandboxd/contrib/systemd/sandboxd.service`; the installer (Spec 4 — `install.sh`) lays it down with the matching state directory, route-helper capability, and `users.conf` template. Until the installer lands, operators following the install path manually should mirror the unit file's `User=`, `Group=`, `StateDirectory=`, and `RuntimeDirectory=` directives.
+On the first run, Lima downloads the Ubuntu 24.04 cloud image (about 700 MB). This is cached for subsequent sessions. The full create process (image download, VM boot, guest agent installation, networking setup) takes 2 to 5 minutes on first run, under 1 minute on subsequent runs with a cached image.
 
 ## Diagnosing problems: `sandbox doctor`
 

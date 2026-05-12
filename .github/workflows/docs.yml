@@ -6,6 +6,9 @@ on:
     paths:
       - 'docs/**'
       - 'site/**'
+      - 'scripts/install.sh'
+      - 'scripts/uninstall.sh'
+      - '.github/workflows/docs.yml'
   workflow_dispatch:
 
 permissions:
@@ -44,6 +47,21 @@ jobs:
 
       - name: Install Chromium for rehype-mermaid
         run: npx playwright install --with-deps chromium
+
+      # Stage the install/uninstall scripts inside site/public/ so they ride
+      # the Pages deployment. Astro copies site/public/ verbatim into
+      # site/dist/, so the resulting URLs are
+      #   https://Koriit.github.io/sandboxd/install.sh
+      #   https://Koriit.github.io/sandboxd/uninstall.sh
+      # We copy at build time (rather than symlinking) so the repo's
+      # canonical source stays under scripts/ and the staged file is a
+      # plain regular file regardless of build-environment symlink
+      # behaviour.
+      - name: Stage install scripts
+        working-directory: ${{ github.workspace }}
+        run: |
+          cp scripts/install.sh site/public/install.sh
+          cp scripts/uninstall.sh site/public/uninstall.sh
 
       - name: Type-check and Astro check
         run: npm run check
