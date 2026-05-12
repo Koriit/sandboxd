@@ -1877,9 +1877,7 @@ mod tests {
                     "reason must enumerate the missing inputs; got: {reason}"
                 );
             }
-            other => panic!(
-                "expected SocketPathUnresolvable when no env vars set; got: {other:?}"
-            ),
+            other => panic!("expected SocketPathUnresolvable when no env vars set; got: {other:?}"),
         }
 
         // Empty-string env vars are treated as unset — fall through
@@ -1929,6 +1927,9 @@ mod tests {
         };
         let s = format!("{e}");
         assert!(s.contains("internal panic"), "got: {s}");
-        assert!(s.contains("kaboom"), "must echo the panic payload; got: {s}");
+        assert!(
+            s.contains("kaboom"),
+            "must echo the panic payload; got: {s}"
+        );
     }
 }

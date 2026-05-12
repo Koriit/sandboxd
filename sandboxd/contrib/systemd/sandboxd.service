@@ -9,6 +9,12 @@ Type=simple
 User=sandbox
 Group=sandbox
 
+# Defense-in-depth for the unix socket mode: the daemon explicitly
+# chmod()s sandboxd.sock to 0660 immediately after bind(), but
+# UMask=0117 ensures the inode never even momentarily exists at a
+# more permissive mode under a pre-exec race. See spec § 5.1.
+UMask=0117
+
 # State and runtime dirs are auto-created with correct ownership/modes.
 # systemd will mkdir /var/lib/sandbox and /run/sandbox if they do not
 # exist, and chown sandbox:sandbox + chmod 0750 on each.

@@ -230,6 +230,48 @@ fn ensure_base_dir_layout(base_dir: &std::path::Path) -> Result<(), SandboxError
     Ok(())
 }
 
+/// Mode pinned on `sandboxd.sock` immediately after bind. The
+/// daemon-productionization spec § 5.1 documents the socket as
+/// `0660 sandbox:sandbox`; doctor check C5 reads `stat(sock).mode &
+/// 0o777` against this constant. Forcing the mode explicitly avoids
+/// a false-negative on a host running under a `077`-style umask
+/// where `bind()` would otherwise land the socket at `0600` (or, on
+/// the more common `022` server umask, at `0644` — too permissive
+/// for the group-only contract).
+const SOCKET_MODE: u32 = 0o660;
+
+/// Bind the unix socket and pin its mode to `0660` before any client
+/// can connect.
+///
+/// `tokio::net::UnixListener::bind` creates the socket inode under the
+/// process umask, so the mode of the resulting file is non-deterministic
+/// across operator environments. The daemon-productionization spec
+/// § 5.1 nails the contract at `0660`; doctor check C5 (§ 6.3) reads
+/// the on-disk mode to verify it. Calling `set_permissions` immediately
+/// after the bind, before the accept loop starts, makes the contract
+/// hold regardless of umask and regardless of whether the operator
+/// remembered to set `UMask=0117` in the systemd drop-in.
+///
+/// A failure to chmod the socket is fatal: an unenforceable mode is a
+/// silent security regression we will not let through.
+fn bind_socket(socket_path: &std::path::Path) -> std::io::Result<UnixListener> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let listener = UnixListener::bind(socket_path)?;
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(SOCKET_MODE)).map_err(
+        |e| {
+            error!(
+                path = %socket_path.display(),
+                error = %e,
+                mode = format!("{SOCKET_MODE:o}"),
+                "failed to pin socket mode; refusing to start"
+            );
+            e
+        },
+    )?;
+    Ok(listener)
+}
+
 // Image-presence probe and the operator-facing missing-image hint
 // live in `sandbox-core::gateway` so the integration test suite (which
 // imports from sandbox-core, not the daemon binary) can pin the same
@@ -7395,7 +7437,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::fs::remove_file(&socket_path).await?;
     }
 
-    let listener = UnixListener::bind(&socket_path)?;
+    let listener = bind_socket(&socket_path)?;
 
     info!(socket = %socket_path.display(), "sandboxd listening");
 
@@ -9091,6 +9133,62 @@ mod tests {
             }
             other => panic!("expected SandboxError::Internal, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // bind_socket — socket mode pin.
+    //
+    // The daemon-productionization spec § 5.1 fixes
+    // `/run/sandbox/sandboxd.sock` at mode `0660`, and doctor check C5
+    // reads `stat(sock).mode & 0o777` against that constant. The
+    // umask of the invoking process is unconstrained (dev shells run
+    // at `022`; production systemd units may or may not carry
+    // `UMask=0117`), so the daemon has to chmod the inode itself
+    // immediately after `bind()` returns. This test pins that
+    // behavior independently of the umask the test binary was
+    // launched under.
+    // -----------------------------------------------------------------------
+
+    /// The socket inode created by `bind_socket` carries mode `0660`
+    /// regardless of the test process's umask. Pins the spec § 5.1
+    /// contract that doctor check C5 reads.
+    #[tokio::test]
+    async fn socket_bind_sets_mode_0660() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Force a permissive umask in the test process so the
+        // assertion catches the case where the daemon would have
+        // relied on umask filtering alone. `0o022` is the standard
+        // server-default umask; without an explicit chmod the socket
+        // would land at `0o755 & !0o022 == 0o755` for a fresh inode,
+        // i.e. world-readable — exactly the contract violation this
+        // test exists to prevent.
+        //
+        // SAFETY: `libc::umask` is process-global; tests run in a
+        // single shared process under cargo-nextest only when the
+        // `test-threads=1` flag is set, but each `#[tokio::test]`
+        // gets its own runtime and tempdir, and we never restore the
+        // umask — that's fine because every test that creates files
+        // through `tempfile` does so under its own private directory
+        // path and the umask is irrelevant once the test process
+        // exits. A future test that depends on a specific umask
+        // should set it itself.
+        unsafe {
+            libc::umask(0o022);
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket_path = tmp.path().join("sandboxd.sock");
+
+        let _listener = bind_socket(&socket_path).expect("bind_socket must succeed");
+
+        let md = std::fs::metadata(&socket_path)
+            .expect("socket inode must exist after a successful bind");
+        let mode = md.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o660,
+            "socket mode must be pinned to 0660 (spec § 5.1, doctor C5); got {mode:o}"
+        );
     }
 
     // -----------------------------------------------------------------------
