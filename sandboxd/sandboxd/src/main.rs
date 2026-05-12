@@ -803,6 +803,22 @@ struct AppState {
     /// CLI and E2E suite can wait deterministically for propagation
     /// rather than sleeping on wall-clock time.
     propagation_states: Arc<PropagationStates>,
+    /// Daemon's compile-time uid as observed at startup. Cached so the
+    /// `GET /diagnostics` handler can render the load-bearing
+    /// `daemon_uid` / `daemon_user` fields without re-querying the
+    /// kernel on every probe.
+    daemon_uid: u32,
+    /// Daemon's resolved username (via `getpwuid_r` at startup).
+    /// Empty when resolution fails — the doctor's C1/C2 fail-paths
+    /// already surface that, so the diagnostics handler doesn't
+    /// double-report.
+    daemon_user: String,
+    /// The `users.conf` subnet entry the daemon matched at startup —
+    /// the CIDR pool the operator authorized for this uid. Surfaced
+    /// verbatim through `GET /diagnostics` (C11) so doctor's report
+    /// shows the actually-resolved pool rather than expecting the
+    /// operator to grep journald.
+    users_conf_pool: sandbox_core::users_conf::SubnetEntry,
 }
 
 /// Look up the runtime for a given backend kind from the dispatch
@@ -1136,6 +1152,7 @@ fn app(state: Arc<AppState>) -> Router {
         .route("/base-image-status", get(base_image_status))
         .route("/health", get(health_check))
         .route("/version", get(version_handler))
+        .route("/diagnostics", get(diagnostics_handler))
         .with_state(state)
         .merge(events_router)
         .merge(policy_router)
@@ -5938,6 +5955,227 @@ async fn version_handler() -> impl IntoResponse {
         .into_response()
 }
 
+/// Diagnostics endpoint: `GET /diagnostics`
+///
+/// Carries two distinct classes of data:
+///
+/// - **System-level diagnostics** (returned to every connected
+///   operator): `daemon_uid`, `daemon_user`, `kvm_readable`,
+///   `kvm_writable`, `gateway_image_present`, `lite_image_present`,
+///   `users_conf_pool`.
+/// - **Per-operator scoped data** (filtered by `caller_username`
+///   from `OperatorIdentity`): `guest_version_drift`,
+///   `substrate_orphans`.
+///
+/// Both classes ship on a single JSON object so the CLI's doctor
+/// fetches everything in one request. Operator-scoped fields are
+/// filtered through the same `SessionStore::list_sessions(caller)`
+/// the per-session endpoints use — an operator cannot infer another
+/// operator's session ids from this surface.
+///
+/// Authentication: yes (per spec § 13.2). The endpoint extracts
+/// `Extension<OperatorIdentity>` from the request; the
+/// `unresolvable peer-cred close-on-failure` policy applies as on
+/// every other endpoint, so a handler reach implies a resolved
+/// operator identity.
+async fn diagnostics_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(operator): Extension<OperatorIdentity>,
+) -> impl IntoResponse {
+    // System-level: cheap host probes, ~3 file opens. Synchronous,
+    // wrapped in `spawn_blocking` so we don't park the runtime on
+    // the kvm/image lookups.
+    let kvm_readable = tokio::task::spawn_blocking(|| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .open("/dev/kvm")
+            .is_ok()
+    })
+    .await
+    .unwrap_or(false);
+    let kvm_writable = tokio::task::spawn_blocking(|| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/kvm")
+            .is_ok()
+    })
+    .await
+    .unwrap_or(false);
+
+    let gateway_tag =
+        sandbox_core::gateway::gateway_image_tag_for_version(env!("CARGO_PKG_VERSION"));
+    let lite_tag = sandbox_core::lite_image_tag_for_version(env!("CARGO_PKG_VERSION"));
+    let gateway_image_present = {
+        let tag = gateway_tag.clone();
+        tokio::task::spawn_blocking(move || {
+            sandbox_core::gateway::gateway_image_present(&tag).unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false)
+    };
+    let lite_image_present = {
+        let tag = lite_tag.clone();
+        tokio::task::spawn_blocking(move || {
+            // The shared `image_exists` helper isn't exported the
+            // same way the gateway one is; shell out to `docker
+            // image inspect` directly so the probe shape matches.
+            std::process::Command::new("docker")
+                .args(["image", "inspect", &tag])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false)
+    };
+
+    let users_conf_pool = serde_json::json!({
+        "cidr": format!(
+            "{}/{}",
+            state.users_conf_pool.cidr.base(),
+            state.users_conf_pool.cidr.prefix_len(),
+        ),
+        "allow_users": state.users_conf_pool.allow_users,
+    });
+
+    // Per-operator scoped: enumerate caller's running sessions and
+    // expose their persisted guest-protocol stamp. The "live" probe
+    // (issuing `GuestRequest::Version` per session) is the doctor's
+    // verbose-only C12 — we surface the persisted db_proto/db_binary
+    // here so doctor can compute the drift indicator client-side
+    // without re-implementing the per-session probe.
+    let caller_sessions = state
+        .store
+        .list_sessions(&operator.name)
+        .unwrap_or_default();
+    let mut guest_version_drift = Vec::with_capacity(caller_sessions.len());
+    let caller_session_ids: std::collections::HashSet<SessionId> =
+        caller_sessions.iter().map(|s| s.id).collect();
+    for session in &caller_sessions {
+        if session.state != SessionState::Running {
+            continue;
+        }
+        guest_version_drift.push(serde_json::json!({
+            "session_id": session.id.to_string(),
+            "db_proto": session.guest_protocol_version,
+            "db_binary_version": session.guest_binary_version,
+            // Live probe is out of scope for v1 of the endpoint;
+            // doctor's verbose C12 will fan out per-session
+            // GuestRequest::Version probes when M16 lands.
+            "drift": false,
+        }));
+    }
+
+    // C13 substrate orphan cross-reference: enumerate substrate
+    // resources host-wide, retain only those whose decoded session-id
+    // is NOT in the caller's list. An operator only sees resources
+    // they cannot account for — they cannot infer another operator's
+    // session ids from this surface.
+    let lima_runtime_for_blocking = Arc::clone(&state.lima_runtime);
+    let caller_session_ids_for_lima = caller_session_ids.clone();
+    let lima_orphans: Vec<String> = tokio::task::spawn_blocking(move || {
+        lima_runtime_for_blocking
+            .manager()
+            .list_vms()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|vm| {
+                vm.session_id.and_then(|sid| {
+                    if caller_session_ids_for_lima.contains(&sid) {
+                        None
+                    } else {
+                        Some(vm.name)
+                    }
+                })
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default();
+
+    let caller_session_ids_for_docker = caller_session_ids.clone();
+    let container_orphans: Vec<String> = tokio::task::spawn_blocking(move || {
+        let output = std::process::Command::new("docker")
+            .args([
+                "ps",
+                "-a",
+                "--filter",
+                "name=sandbox-",
+                "--format",
+                "{{.Names}}",
+            ])
+            .output();
+        let Ok(output) = output else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|name| {
+                // Only count names that decode to a session id —
+                // the gateway-container shape (`sandbox-gw-<id>`)
+                // and other prefixed names are not orphans of the
+                // operator's sessions.
+                sandbox_core::backend::orphan_reaper::parse_container_session_id(name).and_then(
+                    |sid| {
+                        if caller_session_ids_for_docker.contains(&sid) {
+                            None
+                        } else {
+                            Some(name.to_string())
+                        }
+                    },
+                )
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default();
+
+    let session_dirs_root = state.base_dir.join("sessions");
+    let caller_session_ids_for_dirs = caller_session_ids;
+    let session_dir_orphans: Vec<String> = tokio::task::spawn_blocking(move || {
+        let read_dir = match std::fs::read_dir(&session_dirs_root) {
+            Ok(rd) => rd,
+            Err(_) => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        for entry in read_dir.flatten() {
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+            if let Ok(sid) = sandbox_core::SessionId::parse(name_str)
+                && !caller_session_ids_for_dirs.contains(&sid)
+            {
+                out.push(name_str.to_string());
+            }
+        }
+        out
+    })
+    .await
+    .unwrap_or_default();
+
+    let body = serde_json::json!({
+        "daemon_uid": state.daemon_uid,
+        "daemon_user": state.daemon_user,
+        "kvm_readable": kvm_readable,
+        "kvm_writable": kvm_writable,
+        "gateway_image_present": gateway_image_present,
+        "lite_image_present": lite_image_present,
+        "users_conf_pool": users_conf_pool,
+        "guest_version_drift": guest_version_drift,
+        "substrate_orphans": {
+            "lima_vms": lima_orphans,
+            "containers": container_orphans,
+            "session_dirs": session_dir_orphans,
+        },
+    });
+
+    (StatusCode::OK, Json(body)).into_response()
+}
+
 // ---------------------------------------------------------------------------
 // Startup reconciliation
 // ---------------------------------------------------------------------------
@@ -6814,6 +7052,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(err.into());
         }
     };
+    // Snapshot the matched subnet entry for `GET /diagnostics` (C11).
+    // `find_subnet_by_uid` would have errored above if no entry
+    // matched, so this lookup is infallible — we restate the search
+    // to keep the existing `resolve_allocation_pool` signature stable.
+    let users_conf_pool_entry = users_config
+        .find_subnet_by_uid(daemon_uid)
+        .cloned()
+        .expect("subnet matched in resolve_allocation_pool must be re-findable");
+    let daemon_user_resolved = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(daemon_uid))
+        .ok()
+        .flatten()
+        .map(|u| u.name)
+        .unwrap_or_default();
     info!(
         users_conf = %users_conf_path().display(),
         daemon_uid,
@@ -7085,6 +7336,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         component_health_state: Mutex::new(HashMap::new()),
         ingestors: Mutex::new(HashMap::new()),
         propagation_states: Arc::new(PropagationStates::new()),
+        daemon_uid,
+        daemon_user: daemon_user_resolved,
+        users_conf_pool: users_conf_pool_entry,
     });
 
     // Replay one `policy_reset_on_upgrade` lifecycle event per

@@ -12,4 +12,5 @@
 pub mod backend;
 pub mod backends_cache;
 pub mod cli_xdg;
+pub mod doctor;
 pub mod presets;

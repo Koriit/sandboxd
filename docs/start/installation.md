@@ -474,6 +474,38 @@ sandbox exec hello -- uname -a
 sandbox rm hello
 ```
 
+## System-service deployment (production)
+
+The dev workflow above runs the daemon as your own user with state at `~/.local/share/sandboxd/` and the socket under `$XDG_RUNTIME_DIR`. The production deployment model is different:
+
+- The daemon runs as a dedicated `sandbox` system user (uid not your own) under a systemd unit (`sandboxd.service`).
+- State lives at `/var/lib/sandbox/` (mode `0750`, owned by `sandbox:sandbox`).
+- The unix socket lives at `/run/sandbox/sandboxd.sock` (mode `0660`, owner `sandbox:sandbox`).
+- Operators must be in the `sandbox` group to connect; group membership is the access boundary.
+- The route-helper is installed at `/usr/local/libexec/sandboxd/sandbox-route-helper` with `cap_net_admin,cap_sys_admin=eip`.
+
+The canonical systemd unit file ships in `sandboxd/contrib/systemd/sandboxd.service`; the installer (Spec 4 — `install.sh`) lays it down with the matching state directory, route-helper capability, and `users.conf` template. Until the installer lands, operators following the install path manually should mirror the unit file's `User=`, `Group=`, `StateDirectory=`, and `RuntimeDirectory=` directives.
+
+## Diagnosing problems: `sandbox doctor`
+
+After installation, run `sandbox doctor` to verify every load-bearing invariant in one call. The command is the single entry point for "is my install healthy?" diagnosis. It checks:
+
+- the daemon is running (systemd in production, socket-connect in dev mode);
+- the CLI and daemon report the same `CARGO_PKG_VERSION`;
+- the caller is in the `sandbox` group (or, in dev mode, that no `sandbox` group exists);
+- the socket has the expected mode;
+- the daemon's uid can read+write `/dev/kvm`;
+- the gateway and lite container images are loaded (the lite image is built on first use);
+- the route-helper has its setcap capability;
+- the state directory exists with the expected mode + ownership;
+- `users.conf` parses and lists the daemon's user;
+- no running session is on a drift'd guest protocol;
+- no orphan substrate resources are leaking host-wide.
+
+Exit codes follow the `git`/`make` convention: `0` for clean, `1` for "at least one check failed", `2` for "doctor itself could not run". Add `--verbose` to see every check (passes are suppressed by default so the failure list is the actionable surface). Each failure carries a `hint:` line operators can copy-paste — usually a single shell command that fixes it.
+
+In dev mode (no `sandbox` system user, daemon run by hand), checks specific to the system-service shape (group membership, socket-mode strictness, state-dir ownership) degrade to informational skips so the dev workflow still passes a clean run.
+
 ## Next steps
 
 - [Quickstart](/start/quickstart/) for the condensed path through create/exec/ssh.

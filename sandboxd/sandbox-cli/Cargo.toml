@@ -19,6 +19,13 @@ clap.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+# `nix::unistd::{getgroups, getuid, Group, User}` powers `sandbox doctor`'s
+# C4 (current user in `sandbox` group) check, which iterates the calling
+# process's supplementary GIDs and resolves them to names. The `user`
+# feature gates `Group`/`User`; sandbox-core and sandboxd already opt
+# into the same feature flag so the workspace stays on one `nix`
+# version.
+nix = { version = "0.29", features = ["user"] }
 sandbox-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true

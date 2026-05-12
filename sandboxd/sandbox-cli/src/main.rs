@@ -4480,16 +4480,21 @@ async fn main() {
         return;
     }
 
-    // `sandbox doctor` is the operator's diagnostic surface. Its full
-    // check-registry implementation lands in a follow-up session;
-    // this stub keeps the dispatch arm in place so the version-handshake
-    // bypass (see `command_bypasses_version_check`) is structurally
-    // complete — doctor connects tolerantly so it can *diagnose* a
-    // skew rather than be refused by the gate at the bottom of
-    // `send_request_with_timeout`.
-    if let Command::Doctor { verbose: _ } = &cli.command {
-        println!("sandbox doctor: not yet implemented");
-        return;
+    // `sandbox doctor` is the operator's diagnostic surface. It
+    // intentionally bypasses the strict CLI ↔ daemon version-equality
+    // handshake (see `command_bypasses_version_check`) so the operator
+    // can use doctor to *diagnose* a skew rather than be refused by
+    // the gate inside `send_request_with_timeout`. Doctor itself
+    // probes `/version` directly via its C3 check; the comparison is
+    // surfaced as a `Fail` row, not a refusal.
+    //
+    // Exit code semantics (spec § 6.4):
+    //   `0` — every check pass or skip
+    //   `1` — at least one check fails
+    //   `2` — doctor itself couldn't run
+    if let Command::Doctor { verbose } = &cli.command {
+        let code = sandbox_cli::doctor::run(&cli.socket, *verbose).await;
+        process::exit(code);
     }
 
     // Handle ssh specially — it doesn't follow the normal request/response flow.
