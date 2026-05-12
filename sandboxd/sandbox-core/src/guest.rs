@@ -40,6 +40,95 @@ pub const MAX_MESSAGE_SIZE: u32 = 1_048_576;
 /// Timeout for a single guest agent request/response cycle.
 const GUEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Wire-protocol version the daemon speaks to `sandbox-guest`. Bumped
+/// when a [`GuestRequest`] or [`GuestResponse`] variant is added,
+/// removed, renamed, or changes shape — i.e., when an old guest binary
+/// would no longer round-trip a message exchanged with a new daemon.
+///
+/// **Not** bumped for guest-binary changes that don't touch the wire
+/// (e.g. an exec timeout adjustment, internal logging change).
+pub const DAEMON_GUEST_PROTO_VERSION: u32 = 1;
+
+/// Semver of the embedded `sandbox-guest` binary. Stamped into
+/// `sessions.guest_binary_version` on create and on every refresh.
+///
+/// Sourced at build time from `sandbox-guest/Cargo.toml` via the
+/// `sandbox-core` build script so the daemon never has to mirror the
+/// guest crate's version by hand.
+pub const SANDBOX_GUEST_VERSION: &str = env!("SANDBOX_GUEST_VERSION");
+
+/// `true` when this daemon can drive the wire protocol of a session
+/// last touched at `session_proto`.
+///
+/// For v1 the daemon supports exactly one protocol version (its own);
+/// future widening (a multi-version range, e.g.
+/// `DAEMON_GUEST_PROTO_VERSION-1 ..= DAEMON_GUEST_PROTO_VERSION`) lands
+/// in a follow-up spec and only edits this function.
+pub fn is_protocol_compatible(session_proto: u32) -> bool {
+    session_proto == DAEMON_GUEST_PROTO_VERSION
+}
+
+/// `true` when this daemon's refresh path can realistically install
+/// its embedded guest binary into a session at `session_proto`.
+///
+/// For v1 the answer is "yes for every protocol version we recognise";
+/// the seam exists so a future protocol change with an irreconcilable
+/// break (e.g. a wire framing change that an old guest cannot
+/// understand even to read the "please upgrade yourself" message) can
+/// flip its arm to `false` without touching the daemon dispatch.
+///
+/// `session_proto == 0` is treated as "unknown / pre-V006 record" — but
+/// V006 deletes all rows on apply (spec § 2.1), so this arm is
+/// defensive: in practice every row reaches this function with a real
+/// proto value. Integration tests construct synthetic `proto = 0` rows
+/// to drive the refuse arm of the start-session decision tree.
+pub fn can_refresh_in_place(session_proto: u32) -> bool {
+    session_proto != 0
+}
+
+/// Stage the daemon-side `sandbox-guest` binary into a host tempfile
+/// with mode `0o755`, ready to be `docker cp`'d or `limactl copy`'d
+/// into a session at refresh time.
+///
+/// Spec 2 § 3.6 specifies `include_bytes!` for production builds (Spec
+/// 4 territory); for Spec 2's dev-mode-only scope, the daemon reads
+/// the sibling binary via the existing
+/// [`crate::lima::guest_agent_path`] resolver and stages it through
+/// [`tempfile::NamedTempFile`] so the refresh sequence has a stable
+/// host path to hand to the backend command. The tempfile is preserved
+/// across the resulting `NamedTempFile` value; dropping the returned
+/// handle deletes it on the host.
+pub fn stage_embedded_guest_binary() -> Result<tempfile::NamedTempFile, SandboxError> {
+    let agent_src = crate::lima::guest_agent_path()?;
+    if !agent_src.exists() {
+        return Err(SandboxError::Internal(format!(
+            "embedded guest binary not found at {}",
+            agent_src.display()
+        )));
+    }
+    let bytes = std::fs::read(&agent_src).map_err(|e| {
+        SandboxError::Internal(format!(
+            "failed to read guest binary at {}: {e}",
+            agent_src.display()
+        ))
+    })?;
+
+    let mut tempfile = tempfile::NamedTempFile::new()?;
+    {
+        use std::io::Write;
+        tempfile.write_all(&bytes)?;
+        tempfile.flush()?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(tempfile.path())?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(tempfile.path(), perms)?;
+    }
+    Ok(tempfile)
+}
+
 // ---------------------------------------------------------------------------
 // Protocol types
 // ---------------------------------------------------------------------------
@@ -49,8 +138,19 @@ const GUEST_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 #[serde(tag = "type")]
 pub enum GuestRequest {
     Ping,
-    Exec { command: String, args: Vec<String> },
+    Exec {
+        command: String,
+        args: Vec<String>,
+    },
     Status,
+    /// Ask the guest to self-report its compile-time
+    /// [`DAEMON_GUEST_PROTO_VERSION`] and [`SANDBOX_GUEST_VERSION`]
+    /// constants. Used by diagnostic surfaces (Spec 3's `sandbox
+    /// doctor`, optional post-start cross-checks) to detect drift
+    /// between the persisted DB columns and the actually-running guest
+    /// binary. Not part of the refresh-on-start decision tree — that
+    /// path is DB-driven (spec § 3.10).
+    Version,
 }
 
 /// A response sent from the guest agent back to the host.
@@ -70,6 +170,12 @@ pub enum GuestResponse {
     },
     Error {
         message: String,
+    },
+    /// Reply to [`GuestRequest::Version`]; carries the guest's
+    /// compile-time protocol and binary versions.
+    VersionResult {
+        protocol_version: u32,
+        binary_version: String,
     },
 }
 
@@ -426,6 +532,10 @@ mod tests {
         let status = GuestRequest::Status;
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains(r#""type":"Status"#));
+
+        let version = GuestRequest::Version;
+        let json = serde_json::to_string(&version).unwrap();
+        assert!(json.contains(r#""type":"Version"#));
     }
 
     #[test]
@@ -456,6 +566,14 @@ mod tests {
         };
         let json = serde_json::to_string(&error).unwrap();
         assert!(json.contains(r#""type":"Error"#));
+
+        let version = GuestResponse::VersionResult {
+            protocol_version: DAEMON_GUEST_PROTO_VERSION,
+            binary_version: SANDBOX_GUEST_VERSION.into(),
+        };
+        let json = serde_json::to_string(&version).unwrap();
+        assert!(json.contains(r#""type":"VersionResult"#));
+        assert!(json.contains(r#""protocol_version":1"#));
     }
 
     #[test]
@@ -467,6 +585,7 @@ mod tests {
                 args: vec!["-c".into(), "echo test".into()],
             },
             GuestRequest::Status,
+            GuestRequest::Version,
         ];
 
         for req in &requests {
@@ -496,6 +615,10 @@ mod tests {
             },
             GuestResponse::Error {
                 message: "fail".into(),
+            },
+            GuestResponse::VersionResult {
+                protocol_version: DAEMON_GUEST_PROTO_VERSION,
+                binary_version: SANDBOX_GUEST_VERSION.into(),
             },
         ];
 
@@ -683,6 +806,10 @@ mod tests {
                         uptime_secs: 100,
                         load_average: 0.0,
                     },
+                    GuestRequest::Version => GuestResponse::VersionResult {
+                        protocol_version: DAEMON_GUEST_PROTO_VERSION,
+                        binary_version: SANDBOX_GUEST_VERSION.into(),
+                    },
                 };
 
                 let response_bytes = serde_json::to_vec(&response).unwrap();
@@ -824,6 +951,12 @@ mod tests {
             _stderr: Box<dyn AsyncWrite + Unpin + Send>,
         ) -> Result<ExitCode, SandboxError> {
             unimplemented!("StubRuntime::exec_interactive — not exercised by guest dispatch tests")
+        }
+
+        async fn refresh_guest_binary(&self, _handle: &RuntimeHandle) -> Result<(), SandboxError> {
+            unimplemented!(
+                "StubRuntime::refresh_guest_binary — not exercised by guest dispatch tests"
+            )
         }
     }
 
@@ -989,6 +1122,63 @@ mod tests {
         assert!(
             observed.lock().unwrap().is_empty(),
             "no transport should be opened"
+        );
+    }
+
+    // -- Compatibility-predicate tests (Spec 2 § 7.3) -----------------------
+
+    #[test]
+    fn is_compatible_matches_current_version() {
+        assert!(is_protocol_compatible(DAEMON_GUEST_PROTO_VERSION));
+    }
+
+    #[test]
+    fn is_compatible_rejects_older_version() {
+        // DAEMON_GUEST_PROTO_VERSION is currently `1`; this anchors the
+        // "older version" arm. If/when the daemon ever bumps to >=2 the
+        // assertion stays well-typed.
+        let older = DAEMON_GUEST_PROTO_VERSION.saturating_sub(1);
+        if older < DAEMON_GUEST_PROTO_VERSION {
+            assert!(!is_protocol_compatible(older));
+        }
+    }
+
+    #[test]
+    fn is_compatible_rejects_future_version() {
+        assert!(!is_protocol_compatible(DAEMON_GUEST_PROTO_VERSION + 1));
+    }
+
+    #[test]
+    fn is_compatible_rejects_zero() {
+        assert!(!is_protocol_compatible(0));
+    }
+
+    #[test]
+    fn can_refresh_in_place_accepts_known_versions() {
+        assert!(can_refresh_in_place(1));
+        assert!(can_refresh_in_place(DAEMON_GUEST_PROTO_VERSION));
+    }
+
+    #[test]
+    fn can_refresh_in_place_rejects_zero() {
+        assert!(!can_refresh_in_place(0));
+    }
+
+    #[test]
+    fn sandbox_guest_version_is_non_empty_semver_shape() {
+        // Build script sourced the value from sandbox-guest/Cargo.toml.
+        // We don't pin the literal here so a bump in that crate doesn't
+        // require a parallel edit, but assert the shape so a regression
+        // (empty string, garbage) trips loudly. Length check goes via
+        // `len` (rather than `is_empty`) because clippy refuses to
+        // accept `is_empty` on a `const &str`.
+        assert!(
+            SANDBOX_GUEST_VERSION.len() >= 3,
+            "SANDBOX_GUEST_VERSION should be a non-empty semver string"
+        );
+        assert!(
+            SANDBOX_GUEST_VERSION.contains('.'),
+            "SANDBOX_GUEST_VERSION should look semver-ish (contain a dot): {SANDBOX_GUEST_VERSION}"
         );
     }
 }

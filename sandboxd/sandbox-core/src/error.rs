@@ -71,6 +71,32 @@ pub enum SandboxError {
         operating outside the supported envelope"
     )]
     RootlessDockerRefused,
+
+    /// The session's persisted `guest_protocol_version` does not match
+    /// the daemon's `DAEMON_GUEST_PROTO_VERSION`, and the refresh path
+    /// has determined the session is not refreshable in place
+    /// (`can_refresh_in_place` returned `false`). The operator must
+    /// recreate the session.
+    ///
+    /// HTTP mapping: `409 Conflict` — the request is well-formed and
+    /// authorized but the session's persisted state is incompatible
+    /// with the current daemon.
+    ///
+    /// The literal tokens `refresh is not viable` and
+    /// `recreate the session` are load-bearing for the integration
+    /// tests pinned in the api-session-isolation spec § 7.5.
+    #[error(
+        "session {session_id} was created with guest protocol {session_proto}; \
+        daemon supports {daemon_proto}; refresh is not viable for this session \
+        (reason: {reason}); recreate the session: \
+        `sandbox session rm {session_id} && sandbox session create ...`"
+    )]
+    GuestProtocolIncompatible {
+        session_id: String,
+        session_proto: u32,
+        daemon_proto: u32,
+        reason: String,
+    },
 }
 
 /// Map a [`UsersConfigError`] into [`SandboxError::InvalidArgument`].
@@ -185,6 +211,40 @@ mod tests {
         assert!(
             msg.contains("§ Non-goals line 1195"),
             "missing spec citation: {msg}"
+        );
+    }
+
+    #[test]
+    fn guest_protocol_incompatible_display_carries_load_bearing_tokens() {
+        // The api-session-isolation spec § 7.5 integration tests assert
+        // both `refresh is not viable` and `recreate the session` as
+        // substrings of the response body. The full Display string is
+        // generated from the `#[error(...)]` template above; this test
+        // pins those tokens here so a rewording of the template breaks
+        // the unit test long before the HTTP-level integration test.
+        let err = SandboxError::GuestProtocolIncompatible {
+            session_id: "0123456789ab".into(),
+            session_proto: 0,
+            daemon_proto: 1,
+            reason: "session_proto is 0 (pre-V006 placeholder)".into(),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refresh is not viable"),
+            "missing greppable token `refresh is not viable`: {msg}"
+        );
+        assert!(
+            msg.contains("recreate the session"),
+            "missing greppable token `recreate the session`: {msg}"
+        );
+        assert!(msg.contains("0123456789ab"), "missing session id: {msg}");
+        assert!(
+            msg.contains("guest protocol 0"),
+            "missing session_proto: {msg}"
+        );
+        assert!(
+            msg.contains("daemon supports 1"),
+            "missing daemon_proto: {msg}"
         );
     }
 

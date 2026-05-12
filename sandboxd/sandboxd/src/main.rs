@@ -1318,16 +1318,17 @@ async fn create_session(
     // for the shared post-create plumbing).
     // Spec 2: the session is stamped with the operator's username at
     // creation time so every subsequent per-caller filter in
-    // `SessionStore` matches. Guest-version fields are placeholders for
-    // now — M13-S5 wires real constants once the guest agent is built
-    // with the spec'd compatibility metadata.
+    // `SessionStore` matches. Guest-version fields are stamped from
+    // the daemon's compiled-in constants so the start-time compat
+    // predicate (api-session-isolation spec § 3.3) immediately accepts
+    // freshly-created sessions on the fast path.
     let session = match state.store.create_session_with_backend(
         config.clone(),
         req.name.clone(),
         backend_kind,
         &operator.name,
-        0,
-        "",
+        sandbox_core::guest::DAEMON_GUEST_PROTO_VERSION,
+        sandbox_core::guest::SANDBOX_GUEST_VERSION,
     ) {
         Ok(s) => s,
         Err(e) => return error_response(e).into_response(),
@@ -2928,6 +2929,51 @@ async fn start_session(
         .into_response();
     }
 
+    // Guest-version compat gate (api-session-isolation spec § 3.4).
+    // The persisted `guest_protocol_version` decides which arm we
+    // enter:
+    //   - compatible: existing fast path, no refresh.
+    //   - refreshable: `runtime.refresh_guest_binary` then the fast
+    //     path; on success, atomically stamp the new versions into the
+    //     row (§ 3.9).
+    //   - otherwise: 409 with the structured `GuestProtocolIncompatible`
+    //     error.
+    let needs_refresh =
+        if sandbox_core::guest::is_protocol_compatible(session.guest_protocol_version) {
+            false
+        } else if sandbox_core::guest::can_refresh_in_place(session.guest_protocol_version) {
+            info!(
+                session_id = %session.id,
+                session_proto = session.guest_protocol_version,
+                daemon_proto = sandbox_core::guest::DAEMON_GUEST_PROTO_VERSION,
+                "guest protocol mismatch — refreshing guest binary in place before start"
+            );
+            let runtime = runtime_for(&state, session.backend);
+            let handle = RuntimeHandle::from_session_id(&session.id);
+            match runtime.refresh_guest_binary(&handle).await {
+                Ok(()) => true,
+                Err(e) => {
+                    error!(
+                        session_id = %session.id,
+                        error = %e,
+                        "guest-refresh failed for session"
+                    );
+                    return error_response(e).into_response();
+                }
+            }
+        } else {
+            return error_response(SandboxError::GuestProtocolIncompatible {
+                session_id: session.id.to_string(),
+                session_proto: session.guest_protocol_version,
+                daemon_proto: sandbox_core::guest::DAEMON_GUEST_PROTO_VERSION,
+                reason: format!(
+                    "session_proto={} is not refreshable by this daemon",
+                    session.guest_protocol_version
+                ),
+            })
+            .into_response();
+        };
+
     info!(session_id = %session.id, "starting session");
 
     // Ensure the Docker bridge network exists BEFORE starting the VM so the
@@ -3024,6 +3070,28 @@ async fn start_session(
         .update_state(&session.id, &operator.name, SessionState::Running)
     {
         return error_response(e).into_response();
+    }
+
+    // Atomic guest-version stamp: only after BOTH refresh and start
+    // succeed do we update the persisted version columns (api-session-
+    // isolation spec § 3.9). A failure here is logged but does not
+    // fail the start — the runtime is genuinely running, and a future
+    // start_session will re-run the (idempotent) refresh + retry the
+    // update.
+    if needs_refresh {
+        if let Err(e) = state.store.update_guest_versions(
+            &operator.name,
+            &session.id,
+            sandbox_core::guest::DAEMON_GUEST_PROTO_VERSION,
+            sandbox_core::guest::SANDBOX_GUEST_VERSION,
+        ) {
+            error!(
+                session_id = %session.id,
+                error = %e,
+                "update_guest_versions failed after successful refresh + start; \
+                 the next start_session will re-run refresh idempotently"
+            );
+        }
     }
 
     // Restore remaining networking: gateway container, plus (Lima-only)

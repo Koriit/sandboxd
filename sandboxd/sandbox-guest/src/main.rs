@@ -7,7 +7,8 @@
 use std::time::Duration;
 
 use sandbox_core::guest::{
-    GUEST_AGENT_PORT, GuestRequest, GuestResponse, read_message, write_message,
+    DAEMON_GUEST_PROTO_VERSION, GUEST_AGENT_PORT, GuestRequest, GuestResponse,
+    SANDBOX_GUEST_VERSION, read_message, write_message,
 };
 use tokio::net::TcpListener;
 use tokio::process::Command;
@@ -92,6 +93,10 @@ async fn handle_request(request: GuestRequest) -> GuestResponse {
         GuestRequest::Ping => GuestResponse::Pong,
         GuestRequest::Exec { command, args } => handle_exec(command, args).await,
         GuestRequest::Status => handle_status().await,
+        GuestRequest::Version => GuestResponse::VersionResult {
+            protocol_version: DAEMON_GUEST_PROTO_VERSION,
+            binary_version: SANDBOX_GUEST_VERSION.to_string(),
+        },
     }
 }
 
@@ -324,6 +329,50 @@ mod tests {
             }
             other => panic!("expected Error, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_handle_version_returns_compiled_constants() {
+        let response = handle_request(GuestRequest::Version).await;
+        match response {
+            GuestResponse::VersionResult {
+                protocol_version,
+                binary_version,
+            } => {
+                assert_eq!(protocol_version, DAEMON_GUEST_PROTO_VERSION);
+                assert_eq!(binary_version, SANDBOX_GUEST_VERSION);
+            }
+            other => panic!("expected VersionResult, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_end_to_end_version_over_loopback() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_connection(stream).await.unwrap();
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let response = send_request_over(&mut stream, &GuestRequest::Version)
+            .await
+            .unwrap();
+
+        match response {
+            GuestResponse::VersionResult {
+                protocol_version,
+                binary_version,
+            } => {
+                assert_eq!(protocol_version, DAEMON_GUEST_PROTO_VERSION);
+                assert_eq!(binary_version, SANDBOX_GUEST_VERSION);
+            }
+            other => panic!("expected VersionResult, got: {other:?}"),
+        }
+
+        server.await.unwrap();
     }
 
     #[tokio::test]

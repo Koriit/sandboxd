@@ -322,6 +322,23 @@ pub trait SessionRuntime: Send + Sync {
         stdout: Box<dyn AsyncWrite + Unpin + Send>,
         stderr: Box<dyn AsyncWrite + Unpin + Send>,
     ) -> Result<ExitCode, SandboxError>;
+
+    /// Push the daemon's embedded `sandbox-guest` binary into the
+    /// session addressed by `handle` so that the next
+    /// `runtime.start` exec picks up the new binary.
+    ///
+    /// Implementations are responsible for the order of operations
+    /// within their own substrate (start the runtime if it was stopped,
+    /// push the binary, restart the guest service, return the runtime
+    /// to its previous state if it wasn't already started for this
+    /// call) and for atomicity within that substrate. The daemon
+    /// orchestrator (api-session-isolation spec § 3.4) only resumes
+    /// the normal start path after `Ok(())`.
+    ///
+    /// Idempotent — repeated invocations of this method on the same
+    /// session must observe the same outcome as a single invocation,
+    /// so crash-recovery flows can re-run refresh without harm.
+    async fn refresh_guest_binary(&self, handle: &RuntimeHandle) -> Result<(), SandboxError>;
 }
 
 #[cfg(test)]

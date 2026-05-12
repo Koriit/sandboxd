@@ -60,7 +60,12 @@ test-group = 'lima'
 #     `sandbox-{12hex}` namespace via `ContainerRuntime::start` with a
 #     stub route-helper binary; same namespace-pollution concern as
 #     the runtime/reaper tests above.
-filter = 'test(/^integration_orphan_reaper/) | test(/^integration_reaper_/) | test(/^integration_container_runtime/) | test(/^integration_rootless_docker/) | test(/^integration_default_hardened_docker/) | test(/^integration_route_helper_for_user_/) | test(/^integration_route_helper_missing_for_user_/)'
+#   - `integration_guest_refresh_container_backend` drives
+#     `ContainerRuntime::refresh_guest_binary` against a real
+#     `sandbox-{12hex}` container; a parallel orphan-reaper test
+#     would reap the in-flight container between `runtime.stop` and
+#     the post-refresh byte-equality assertion.
+filter = 'test(/^integration_orphan_reaper/) | test(/^integration_reaper_/) | test(/^integration_container_runtime/) | test(/^integration_rootless_docker/) | test(/^integration_default_hardened_docker/) | test(/^integration_route_helper_for_user_/) | test(/^integration_route_helper_missing_for_user_/) | test(/^integration_guest_refresh_container_backend/)'
 test-group = 'docker-sandbox-namespace'
 
 [test-groups]

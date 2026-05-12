@@ -298,6 +298,60 @@ impl SessionRuntime for LimaRuntime {
         })
     }
 
+    /// Refresh the guest binary inside a Lima VM.
+    ///
+    /// Lima provisions a full VM with systemd inside; the steps mirror
+    /// the existing `LimaManager::install_guest_agent` body but operate
+    /// on an already-created VM rather than first-time install:
+    ///
+    /// 1. Ensure the VM is running (`limactl start` is idempotent — it
+    ///    no-ops on an already-running VM and brings up a stopped one).
+    ///    Required because `limactl copy` needs a running VM.
+    /// 2. Stage the daemon-side guest binary to a host tempfile.
+    /// 3. `limactl copy` → `sudo mv` → `sudo chmod +x` to land the
+    ///    binary at the canonical in-VM path.
+    /// 4. `systemctl restart sandbox-guest` so the systemd service
+    ///    re-execs against the new binary.
+    /// 5. `limactl stop` to return the VM to the Stopped baseline. The
+    ///    orchestrator's subsequent `runtime.start` brings the VM back
+    ///    up cleanly; the second start is fast (warm caches) and keeps
+    ///    `Session.state` in lockstep with the substrate.
+    ///
+    /// Wrapped in `tokio::task::spawn_blocking` per `CLAUDE.md` because
+    /// `limactl` invocations are synchronous `std::process::Command`
+    /// calls.
+    async fn refresh_guest_binary(&self, handle: &RuntimeHandle) -> Result<(), SandboxError> {
+        let vm_name = handle.as_str().to_string();
+        let manager = Arc::clone(&self.manager);
+
+        // Stage the host-side tempfile before spawning the blocking
+        // closure so the tempfile's lifetime spans every `limactl copy`
+        // / `shell` call below.
+        let tempfile = tokio::task::spawn_blocking(crate::guest::stage_embedded_guest_binary)
+            .await
+            .map_err(|e| {
+                SandboxError::Internal(format!(
+                    "spawn_blocking join failed staging guest binary: {e}"
+                ))
+            })??;
+        let tempfile_path = tempfile.path().to_path_buf();
+
+        let result = tokio::task::spawn_blocking(move || {
+            refresh_lima_guest_binary_blocking(&manager, &vm_name, &tempfile_path)
+        })
+        .await
+        .map_err(|e| {
+            SandboxError::Internal(format!(
+                "spawn_blocking join failed during Lima guest refresh: {e}"
+            ))
+        })?;
+
+        // Drop the tempfile only after the blocking sequence finishes.
+        drop(tempfile);
+
+        result
+    }
+
     /// Run a command inside the VM with stdio streamed through the
     /// caller-supplied byte sinks. Mirrors today's `sandbox ssh` /
     /// `sandbox exec` flow (`limactl shell <vm> -- <cmd>`) but with
@@ -368,6 +422,152 @@ impl SessionRuntime for LimaRuntime {
 
         Ok(ExitCode(status.code().unwrap_or(-1)))
     }
+}
+
+/// Synchronous body of [`LimaRuntime::refresh_guest_binary`]. Lives as
+/// a free function so the async wrapper can hand it to
+/// `tokio::task::spawn_blocking` without capturing the trait's `&self`
+/// across the boundary.
+///
+/// `tempfile_path` is the host-side staged guest binary; the caller
+/// owns the `NamedTempFile` and drops it once this function returns.
+fn refresh_lima_guest_binary_blocking(
+    manager: &LimaManager,
+    vm_name: &str,
+    tempfile_path: &std::path::Path,
+) -> Result<(), SandboxError> {
+    use std::process::Command as StdCommand;
+
+    use crate::process::run_with_timeout;
+
+    /// Wall-clock per-step timeout. Matches the `INSTALL_GUEST_AGENT_STEP_TIMEOUT`
+    /// used by the existing `LimaManager::install_guest_agent` path.
+    const STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Wall-clock timeout for `limactl start` — first-boot of a stopped
+    /// VM can take longer than a single shell command. Mirrors
+    /// `LimaManager`'s start-VM timeout intent (the manager's start
+    /// path uses a larger budget too).
+    const START_VM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+    let limactl = manager.limactl_path();
+
+    // 1. Ensure the VM is running. `limactl start` is idempotent — a
+    //    no-op on a running VM, boots a stopped one — so we don't need
+    //    to check the status first.
+    tracing::debug!(vm = %vm_name, "refresh_guest_binary: ensuring VM is running");
+    let output = run_with_timeout(
+        StdCommand::new(limactl)
+            .args(["start", vm_name])
+            .arg("--tty=false"),
+        START_VM_TIMEOUT,
+        "limactl start (guest refresh)",
+    )?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(SandboxError::Lima(format!(
+            "failed to start VM {vm_name} for guest refresh: {stderr}"
+        )));
+    }
+
+    // 2. Copy the staged binary into the VM (writable user path).
+    let copy_src = tempfile_path.to_string_lossy().to_string();
+    let copy_dst = format!("{vm_name}:/tmp/sandbox-guest-new");
+    let output = run_with_timeout(
+        StdCommand::new(limactl).args(["copy", &copy_src, &copy_dst]),
+        STEP_TIMEOUT,
+        "limactl copy (guest refresh)",
+    )?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(SandboxError::Lima(format!(
+            "failed to copy guest binary to {vm_name}: {stderr}"
+        )));
+    }
+
+    // 3a. sudo mv into /usr/local/bin/.
+    let output = run_with_timeout(
+        StdCommand::new(limactl).args([
+            "shell",
+            vm_name,
+            "--",
+            "sudo",
+            "mv",
+            "/tmp/sandbox-guest-new",
+            "/usr/local/bin/sandbox-guest",
+        ]),
+        STEP_TIMEOUT,
+        "limactl shell mv (guest refresh)",
+    )?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(SandboxError::Lima(format!(
+            "failed to install refreshed guest binary in {vm_name}: {stderr}"
+        )));
+    }
+
+    // 3b. sudo chmod +x.
+    let output = run_with_timeout(
+        StdCommand::new(limactl).args([
+            "shell",
+            vm_name,
+            "--",
+            "sudo",
+            "chmod",
+            "+x",
+            "/usr/local/bin/sandbox-guest",
+        ]),
+        STEP_TIMEOUT,
+        "limactl shell chmod (guest refresh)",
+    )?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(SandboxError::Lima(format!(
+            "failed to chmod refreshed guest binary in {vm_name}: {stderr}"
+        )));
+    }
+
+    // 4. Restart the systemd service so the running guest is the new
+    //    binary.
+    let output = run_with_timeout(
+        StdCommand::new(limactl).args([
+            "shell",
+            vm_name,
+            "--",
+            "sudo",
+            "systemctl",
+            "restart",
+            "sandbox-guest",
+        ]),
+        STEP_TIMEOUT,
+        "limactl shell systemctl restart (guest refresh)",
+    )?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(SandboxError::Lima(format!(
+            "failed to restart sandbox-guest service in {vm_name}: {stderr}"
+        )));
+    }
+
+    // 5. Return the VM to the Stopped baseline. `runtime.start` from
+    //    the orchestrator will boot it back up, keeping `Session.state`
+    //    in lockstep with the substrate transition.
+    let output = run_with_timeout(
+        StdCommand::new(limactl)
+            .args(["stop", vm_name])
+            .arg("--tty=false"),
+        STEP_TIMEOUT,
+        "limactl stop (guest refresh)",
+    )?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(SandboxError::Lima(format!(
+            "failed to stop VM {vm_name} after guest refresh: {stderr}"
+        )));
+    }
+
+    tracing::info!(vm = %vm_name, "guest binary refreshed");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

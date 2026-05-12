@@ -664,6 +664,72 @@ impl SessionRuntime for ContainerRuntime {
         })
     }
 
+    /// Refresh the in-container `sandbox-guest` binary so the next
+    /// `start` exec picks it up.
+    ///
+    /// The lite container has no init system —
+    /// `ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/sandbox-guest"]`
+    /// is the only path the new binary becomes the live process. We
+    /// therefore stop the container first (idempotent for an already-
+    /// stopped container — and `start_session` only invokes refresh
+    /// after asserting `session.state == Stopped`), `docker cp` the
+    /// embedded binary into the writable layer, and return. The
+    /// orchestrator (`start_session`) calls `runtime.start` next, which
+    /// runs `docker start` and the tini→sandbox-guest exec picks up the
+    /// new file.
+    ///
+    /// `docker cp` writes through the docker daemon's storage driver,
+    /// not the container's view of `/`, so it works on running and
+    /// stopped containers alike and is unaffected by `--read-only`
+    /// (api-session-isolation spec § 3.8.1).
+    async fn refresh_guest_binary(&self, handle: &RuntimeHandle) -> Result<(), SandboxError> {
+        let container_name = handle.as_str().to_string();
+
+        // 1. Ensure the container is stopped. `start_session` only
+        //    invokes this method when `session.state == Stopped`, so
+        //    this is almost always a no-op; the explicit defensive stop
+        //    avoids "container is running" errors from `docker cp` when
+        //    a future caller invokes refresh against a hot container.
+        let stop_args = [
+            "stop".to_string(),
+            "-t".to_string(),
+            "5".to_string(),
+            container_name.clone(),
+        ];
+        match run_docker(&stop_args, "docker stop (container refresh)").await {
+            Ok(_) => {}
+            Err(SandboxError::Gateway(msg))
+                if msg.contains("is not running") || msg.contains("No such container") => {}
+            Err(other) => return Err(other),
+        }
+
+        // 2. Stage the embedded guest binary to a host tempfile with
+        //    mode 0o755 so `docker cp`'s mode-preservation lands an
+        //    executable file inside the container.
+        let tempfile = tokio::task::spawn_blocking(crate::guest::stage_embedded_guest_binary)
+            .await
+            .map_err(|e| {
+                SandboxError::Internal(format!(
+                    "spawn_blocking join failed staging guest binary: {e}"
+                ))
+            })??;
+
+        // 3. Push it into the container's writable layer at the canonical
+        //    in-container path.
+        let cp_args = [
+            "cp".to_string(),
+            tempfile.path().to_string_lossy().into_owned(),
+            format!("{container_name}:/usr/local/bin/sandbox-guest"),
+        ];
+        run_docker(&cp_args, "docker cp (guest refresh)").await?;
+
+        // 4. Drop the host tempfile — its contents are now inside the
+        //    container's writable layer.
+        drop(tempfile);
+
+        Ok(())
+    }
+
     async fn exec_interactive(
         &self,
         handle: &RuntimeHandle,

@@ -825,6 +825,52 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Update both guest-version fields for a session atomically.
+    ///
+    /// Called by `start_session`'s refresh decision tree (api-session-
+    /// isolation spec § 3.9) **only after** both
+    /// `runtime.refresh_guest_binary` and `runtime.start` have returned
+    /// `Ok(())`, so a write here means the in-VM/in-container binary
+    /// really is at `proto` / `binary_version`.
+    ///
+    /// Per-caller isolation: the `UPDATE` filters on
+    /// `owner_username = caller_username` so a session belonging to a
+    /// different operator surfaces as `SessionNotFound` rather than
+    /// silently mutating a foreign row.
+    pub fn update_guest_versions(
+        &self,
+        caller_username: &str,
+        id: &SessionId,
+        proto: u32,
+        binary_version: &str,
+    ) -> Result<(), SandboxError> {
+        let now = Utc::now();
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
+
+        let rows_affected = conn.execute(
+            "UPDATE sessions SET guest_protocol_version = ?1, \
+                 guest_binary_version = ?2, updated_at = ?3 \
+             WHERE id = ?4 AND owner_username = ?5",
+            params![
+                proto as i64,
+                binary_version,
+                now.to_rfc3339(),
+                id.as_str(),
+                caller_username,
+            ],
+        )?;
+
+        if rows_affected == 0 {
+            return Err(SandboxError::SessionNotFound(id.to_string()));
+        }
+
+        Ok(())
+    }
+
     /// Forcibly set the state of a session, bypassing both state-machine
     /// validation and the storage-boundary ownership filter.
     ///
