@@ -39,6 +39,8 @@ use sandbox_core::{
     remove_gate_socket, serve_gate_listener, users_conf_path, wait_for_lds_ack,
     write_file_to_container,
 };
+use sandbox_core::bridge_conf;
+use sandbox_core::users_conf::validate_users_conf_schema_version;
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -7087,6 +7089,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(sandbox_err.into());
         }
     };
+    // Spec 5 § 4.7 — convergence anchor that forces operators to run
+    // `sandbox update` when the on-disk config file drifts behind (or
+    // ahead of) the binary's supported schema range. The `users.conf`
+    // validator fires immediately after `load_users_config()` succeeds;
+    // the bridge.conf validator follows the same shape but reads the
+    // first-line `# sandbox-schema-version:` header rather than a JSON
+    // field. The daemon refuses to start on either mismatch — systemd's
+    // `Restart=on-failure` keeps re-trying until `StartLimitBurst` hits,
+    // at which point `journalctl -u sandboxd` shows the operator-facing
+    // error.
+    if let Err(err) = validate_users_conf_schema_version(&users_config) {
+        let sandbox_err: SandboxError = err.into();
+        eprintln!("sandboxd: {sandbox_err}");
+        return Err(sandbox_err.into());
+    }
+    if let Err(err) = bridge_conf::validate_schema_version() {
+        eprintln!("sandboxd: {err}");
+        return Err(SandboxError::InvalidArgument(err.to_string()).into());
+    }
     let allocation_pool = match resolve_allocation_pool(daemon_uid, &users_config) {
         Ok(cidr) => cidr,
         Err(err) => {

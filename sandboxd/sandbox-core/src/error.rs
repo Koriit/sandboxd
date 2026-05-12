@@ -249,6 +249,59 @@ mod tests {
     }
 
     #[test]
+    fn users_config_schema_too_new_maps_to_invalid_argument_with_clear_display() {
+        // Spec 5 § 4.7 + § 13: the daemon-startup validator's two
+        // schema-mismatch variants ride through the same
+        // `From<UsersConfigError> for SandboxError` mapping the rest of
+        // the loader uses (`to_string()` → `InvalidArgument`). The load-
+        // bearing substring is `is newer than this binary supports` so
+        // the integration test in `integration_daemon_refuses_start_on_schema_too_new`
+        // can match without depending on surrounding prose.
+        let users_err = UsersConfigError::SchemaTooNew {
+            file_version: 99,
+            daemon_max: 1,
+            hint: "Run `sandbox update`.".to_string(),
+        };
+        let users_msg = users_err.to_string();
+        let sandbox_err: SandboxError = users_err.into();
+        match sandbox_err {
+            SandboxError::InvalidArgument(msg) => {
+                assert_eq!(msg, users_msg, "mapping must be lossless");
+                assert!(
+                    msg.contains("is newer"),
+                    "Display must use the load-bearing `is newer` token; got: {msg}"
+                );
+                assert!(
+                    msg.contains("schema version 99"),
+                    "Display must include the file's version; got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn users_config_schema_too_old_maps_to_invalid_argument_with_clear_display() {
+        let users_err = UsersConfigError::SchemaTooOld {
+            file_version: 0,
+            daemon_min: 1,
+            hint: "Run `sandbox update`.".to_string(),
+        };
+        let users_msg = users_err.to_string();
+        let sandbox_err: SandboxError = users_err.into();
+        match sandbox_err {
+            SandboxError::InvalidArgument(msg) => {
+                assert_eq!(msg, users_msg, "mapping must be lossless");
+                assert!(
+                    msg.contains("is older"),
+                    "Display must use the load-bearing `is older` token; got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn users_config_error_maps_to_invalid_argument_preserving_path_and_docs() {
         // The `FileNotFound` variant's Display includes both the file
         // path and the install-docs pointer; both must survive the

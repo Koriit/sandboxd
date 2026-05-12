@@ -146,6 +146,99 @@ pub enum UsersConfigError {
     /// operators can re-run the install step that produced the file.
     #[error("users.conf at {path} fails security check: {reason}")]
     InsecureFile { path: PathBuf, reason: &'static str },
+
+    /// The file's `_schema_version` is **newer** than this daemon binary
+    /// supports. Typically indicates a downgrade or an interrupted update.
+    /// `hint` carries the recovery pointer (run `sandbox update`, or
+    /// restore from backup) so the operator's next step is one read away.
+    ///
+    /// The literal token `users.conf schema version <N> is newer` is
+    /// load-bearing for the integration test
+    /// `integration_daemon_refuses_start_on_schema_too_new` — any
+    /// rewording must keep that substring.
+    #[error("users.conf schema version {file_version} is newer than this binary supports (max: {daemon_max}). {hint}")]
+    SchemaTooNew {
+        file_version: u32,
+        daemon_max: u32,
+        hint: String,
+    },
+
+    /// The file's `_schema_version` is **older** than this daemon binary
+    /// supports — the config migration framework has not yet applied
+    /// pending migrations to bring the file up to date. `hint` points the
+    /// operator at `sandbox update` as the rollforward path.
+    ///
+    /// The literal token `users.conf schema version <N> is older` is
+    /// load-bearing for `integration_daemon_refuses_start_on_schema_too_old`.
+    #[error("users.conf schema version {file_version} is older than this binary supports (min: {daemon_min}). {hint}")]
+    SchemaTooOld {
+        file_version: u32,
+        daemon_min: u32,
+        hint: String,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Daemon-side schema-mismatch refusal (Spec 5 § 4.7)
+// ---------------------------------------------------------------------------
+
+/// The newest `users.conf` schema version this daemon binary can read.
+///
+/// At v1, MAX equals MIN (both 1) because only one schema version exists.
+/// The pair establishes the pattern: when a future daemon supports both
+/// v1 and v2 files (e.g. a rolling-upgrade window where some operators
+/// have already run `sandbox update` but others haven't yet), MIN stays
+/// at 1 and MAX advances to 2. The validator's `MIN <= v <= MAX` range
+/// check is written once and covers both eras without modification.
+pub const DAEMON_MAX_SUPPORTED_USERS_CONF_SCHEMA: u32 = 1;
+
+/// The oldest `users.conf` schema version this daemon binary can read.
+/// See [`DAEMON_MAX_SUPPORTED_USERS_CONF_SCHEMA`] for the rationale on
+/// keeping MIN and MAX as separate constants even when they share a
+/// value today.
+pub const DAEMON_MIN_SUPPORTED_USERS_CONF_SCHEMA: u32 = 1;
+
+/// Validate that a loaded [`UsersConfig`]'s `_schema_version` is in the
+/// daemon's supported range.
+///
+/// Called by the daemon immediately after `load_users_config()` succeeds
+/// (Spec 5 § 4.7 — convergence anchor that forces operators to run
+/// `sandbox update` when the config file drifts behind the binary's
+/// supported version). The file's `_schema_version` is `Option<u32>`
+/// (Spec 1 § 4.2) — `None` is treated as `0`, which means a pre-V001
+/// file fails the `MIN >= 1` check on a daemon that requires V001.
+///
+/// Returns `Err(SchemaTooNew { .. })` when the file is ahead of the
+/// daemon (typical cause: downgrade or interrupted update), and
+/// `Err(SchemaTooOld { .. })` when the file is behind (typical cause:
+/// daemon was upgraded but the framework hasn't applied pending
+/// migrations yet). Both variants carry a `hint` that names
+/// `sandbox update` and the backup directory so the operator's recovery
+/// path is one read away.
+pub fn validate_users_conf_schema_version(cfg: &UsersConfig) -> Result<(), UsersConfigError> {
+    let v = cfg.schema_version.unwrap_or(0);
+    if v > DAEMON_MAX_SUPPORTED_USERS_CONF_SCHEMA {
+        return Err(UsersConfigError::SchemaTooNew {
+            file_version: v,
+            daemon_max: DAEMON_MAX_SUPPORTED_USERS_CONF_SCHEMA,
+            hint: format!(
+                "This typically indicates a downgrade or an interrupted update. \
+                 Run `sandbox update` to fix, or restore from backup at \
+                 /var/lib/sandbox/backups/<latest>/users.conf.bak."
+            ),
+        });
+    }
+    if v < DAEMON_MIN_SUPPORTED_USERS_CONF_SCHEMA {
+        return Err(UsersConfigError::SchemaTooOld {
+            file_version: v,
+            daemon_min: DAEMON_MIN_SUPPORTED_USERS_CONF_SCHEMA,
+            hint: format!(
+                "The config migration framework has not yet applied pending migrations. \
+                 Run `sandbox update` to bring the file up to date."
+            ),
+        });
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1674,5 +1767,110 @@ mod tests {
             entry.get("allow_users"),
             Some(&serde_json::json!(["sandbox", "alice"])),
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Daemon-side schema-version validator (Spec 5 § 4.7).
+    //
+    // Construct a `UsersConfig` directly with the field we want to drive;
+    // the validator is a pure function on the loaded struct, so we don't
+    // need a tempfile round-trip here. The Cidr in the (empty) subnets
+    // vec is irrelevant — the validator only looks at `schema_version`.
+    // -----------------------------------------------------------------
+
+    fn cfg_with_version(v: Option<u32>) -> UsersConfig {
+        UsersConfig {
+            schema_version: v,
+            subnets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn validate_users_conf_schema_version_accepts_supported() {
+        let cfg = cfg_with_version(Some(DAEMON_MAX_SUPPORTED_USERS_CONF_SCHEMA));
+        validate_users_conf_schema_version(&cfg).expect("max-supported version must validate");
+
+        let cfg_min = cfg_with_version(Some(DAEMON_MIN_SUPPORTED_USERS_CONF_SCHEMA));
+        validate_users_conf_schema_version(&cfg_min).expect("min-supported version must validate");
+    }
+
+    #[test]
+    fn validate_users_conf_schema_version_rejects_too_new() {
+        let cfg = cfg_with_version(Some(DAEMON_MAX_SUPPORTED_USERS_CONF_SCHEMA + 2));
+        let err = validate_users_conf_schema_version(&cfg)
+            .expect_err("ahead-of-binary version must error");
+        match &err {
+            UsersConfigError::SchemaTooNew {
+                file_version,
+                daemon_max,
+                hint,
+            } => {
+                assert_eq!(*file_version, DAEMON_MAX_SUPPORTED_USERS_CONF_SCHEMA + 2);
+                assert_eq!(*daemon_max, DAEMON_MAX_SUPPORTED_USERS_CONF_SCHEMA);
+                assert!(
+                    hint.contains("sandbox update"),
+                    "hint must point at `sandbox update`; got: {hint}"
+                );
+            }
+            other => panic!("expected SchemaTooNew, got {other:?}"),
+        }
+        let display = err.to_string();
+        assert!(
+            display.contains("is newer"),
+            "Display must use the load-bearing `is newer` token; got: {display}"
+        );
+        assert!(
+            display.contains("sandbox update"),
+            "Display must surface the hint; got: {display}"
+        );
+    }
+
+    #[test]
+    fn validate_users_conf_schema_version_rejects_too_old() {
+        // Synthesise an "older" scenario by handing the validator a
+        // version below MIN. With MIN==1, the only `< 1` slot is 0 —
+        // which is also the "absent" treatment (`treats_absent_as_zero`
+        // pins that branch). We still want a dedicated test for the
+        // Some(0) shape because in a future era MIN > 1 the two cases
+        // diverge.
+        let cfg = cfg_with_version(Some(0));
+        let err = validate_users_conf_schema_version(&cfg)
+            .expect_err("behind-of-binary version must error");
+        match &err {
+            UsersConfigError::SchemaTooOld {
+                file_version,
+                daemon_min,
+                hint,
+            } => {
+                assert_eq!(*file_version, 0);
+                assert_eq!(*daemon_min, DAEMON_MIN_SUPPORTED_USERS_CONF_SCHEMA);
+                assert!(
+                    hint.contains("sandbox update"),
+                    "hint must point at `sandbox update`; got: {hint}"
+                );
+            }
+            other => panic!("expected SchemaTooOld, got {other:?}"),
+        }
+        let display = err.to_string();
+        assert!(
+            display.contains("is older"),
+            "Display must use the load-bearing `is older` token; got: {display}"
+        );
+    }
+
+    #[test]
+    fn validate_users_conf_schema_version_treats_absent_as_zero() {
+        // `schema_version: None` (file with no `_schema_version` key)
+        // is treated as `0` by the validator; with MIN == 1 that
+        // surfaces as SchemaTooOld at file_version=0.
+        let cfg = cfg_with_version(None);
+        let err = validate_users_conf_schema_version(&cfg)
+            .expect_err("absent _schema_version must be treated as 0 and rejected");
+        match err {
+            UsersConfigError::SchemaTooOld { file_version, .. } => {
+                assert_eq!(file_version, 0, "absent must map to file_version=0");
+            }
+            other => panic!("expected SchemaTooOld(file_version=0), got {other:?}"),
+        }
     }
 }

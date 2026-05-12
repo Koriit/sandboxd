@@ -1,6 +1,7 @@
 pub mod api;
 pub mod atomic_listener_writer;
 pub mod backend;
+pub mod bridge_conf;
 pub mod ca;
 pub mod caller_identity;
 pub mod dns_gate;
