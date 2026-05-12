@@ -384,6 +384,42 @@ enum Command {
         #[arg(long)]
         no_cache: bool,
     },
+
+    /// Hidden internal affordance: apply a single config migration in
+    /// memory and write the result to `--out`. The outer
+    /// `sandbox update` flow then `sudo -k mv`s the output into place.
+    ///
+    /// Refusal arms (Spec 5 § 4.3 access-gating block — `clap-hide` is
+    /// not access control):
+    ///
+    /// 1. Caller must be root (`getuid() == 0`).
+    /// 2. `--file` must be one of the registry's canonical paths
+    ///    (`/etc/sandboxd/users.conf` or `/etc/qemu/bridge.conf`).
+    /// 3. `--out` must be a tempfile under the same directory as
+    ///    `--file` with basename matching
+    ///    `\.<file-basename>\.tmp\.V[0-9]+$`.
+    /// 4. `--migration` must resolve to a registered migration whose
+    ///    `target_file()` matches the validated `--file`.
+    #[command(hide = true, name = "apply-config-migration")]
+    ApplyConfigMigration {
+        /// Input file path (must be one of the canonical paths).
+        #[arg(long)]
+        file: String,
+        /// Migration to apply, as `V<NNN>` (e.g. `V001`).
+        #[arg(long)]
+        migration: String,
+        /// Output tempfile path (must be a tempfile under `--file`'s
+        /// parent directory).
+        #[arg(long)]
+        out: String,
+    },
+
+    /// Hidden internal affordance: print the static migration registry
+    /// as JSON to stdout. Used by `sandbox update --dry-run` for the
+    /// stopped-session classification step (Spec 5 § 3.1.4). Read-only
+    /// — no privilege check, no path arguments.
+    #[command(hide = true, name = "dump-migration-set")]
+    DumpMigrationSet,
 }
 
 /// Policy subcommands.
@@ -975,6 +1011,15 @@ fn build_request(command: &Command) -> Option<Request<String>> {
         | Command::Inspect { .. }
         | Command::Describe { .. }
         | Command::Events { .. } => return None,
+        // Hidden internal affordances for `sandbox update`. Both are
+        // dispatched client-side in `main()` before `build_request`
+        // is reached. Reaching this branch indicates a dispatch bug.
+        Command::ApplyConfigMigration { .. } | Command::DumpMigrationSet => {
+            unreachable!(
+                "`sandbox apply-config-migration` / `dump-migration-set` are handled \
+                 client-side in main() before build_request"
+            );
+        }
     };
     Some(req)
 }
@@ -1183,7 +1228,13 @@ fn check_daemon_version_equality(cli_version: &str, daemon_version: &str) -> Res
 /// every refactor.
 #[cfg_attr(not(test), allow(dead_code))]
 fn command_bypasses_version_check(command: &Command) -> bool {
-    matches!(command, Command::Version | Command::Doctor { .. })
+    matches!(
+        command,
+        Command::Version
+            | Command::Doctor { .. }
+            | Command::ApplyConfigMigration { .. }
+            | Command::DumpMigrationSet
+    )
 }
 
 /// JSON body shape `GET /version` returns. The daemon emits a
@@ -1437,6 +1488,16 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
             // in `build_request` for the symmetric guard.
             unreachable!(
                 "`sandbox version` / `sandbox doctor` are handled client-side \
+                 in main() before send_request"
+            );
+        }
+        Command::ApplyConfigMigration { .. } | Command::DumpMigrationSet => {
+            // Hidden config-migration affordances are handled client-
+            // side in `main()` and `process::exit` before any HTTP
+            // request fires. Reaching `handle_response` for them
+            // indicates a dispatch bug.
+            unreachable!(
+                "`apply-config-migration` / `dump-migration-set` are handled client-side \
                  in main() before send_request"
             );
         }
@@ -4144,6 +4205,199 @@ async fn check_base_image_staleness(socket_path: &str) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Hidden `--apply-config-migration` / `--dump-migration-set` handlers
+// ---------------------------------------------------------------------------
+
+/// Refusal handler for the access-gated `apply-config-migration`
+/// hidden subcommand. Returns the process exit code; the caller
+/// `process::exit`s on it.
+///
+/// Spec 5 § 4.3 access-gating block — four refusal arms applied in
+/// order. The first match wins (we don't continue to deeper checks if
+/// the caller is unprivileged, etc.).
+fn handle_apply_config_migration(file_arg: &str, migration_arg: &str, out_arg: &str) -> i32 {
+    apply_config_migration_inner(file_arg, migration_arg, out_arg, nix::unistd::geteuid())
+}
+
+/// Outcome of the access-gate checks. Either we have a validated
+/// `(target_file, migration_id)` pair to act on, or we surface a
+/// refusal string the caller writes to stderr and exits non-zero.
+enum ApplyGateOutcome {
+    Refuse(String),
+    Proceed {
+        target_file: sandbox_cli::cfg_migrations::TargetFile,
+        migration_id: u32,
+    },
+}
+
+/// Pure access-gate function used by the unit tests to verify each
+/// refusal arm's stderr substring. Mirrors the four arms in Spec 5
+/// § 4.3 exactly.
+fn apply_config_migration_gate(
+    file_arg: &str,
+    migration_arg: &str,
+    out_arg: &str,
+    euid: nix::unistd::Uid,
+) -> ApplyGateOutcome {
+    use std::path::Path;
+    use sandbox_cli::cfg_migrations::TargetFile;
+
+    // Arm 1 — caller must be root.
+    if !euid.is_root() {
+        return ApplyGateOutcome::Refuse(
+            "--apply-config-migration is internal to `sandbox update` and requires root; \
+             run via `sudo sandbox update` instead"
+                .to_string(),
+        );
+    }
+
+    // Arm 2 — --file must be one of the registry's canonical paths.
+    let file_path = Path::new(file_arg);
+    let target_file = match TargetFile::from_canonical_path(file_path) {
+        Some(tf) => tf,
+        None => {
+            return ApplyGateOutcome::Refuse(format!(
+                "--file must be one of the registry's canonical paths \
+                 (/etc/sandboxd/users.conf, /etc/qemu/bridge.conf); got: {file_arg}"
+            ));
+        }
+    };
+
+    // Arm 3 — --out must be a tempfile under --file's parent dir, with
+    // basename `\.<file-basename>\.tmp\.V[0-9]+$`.
+    let out_path = Path::new(out_arg);
+    let file_parent = file_path
+        .parent()
+        .expect("canonical path has a parent (validated by from_canonical_path)");
+    let out_parent = out_path.parent().unwrap_or_else(|| Path::new(""));
+    let file_basename = file_path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let out_basename = out_path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let expected_prefix = format!(".{file_basename}.tmp.V");
+    let basename_ok = out_basename.starts_with(&expected_prefix)
+        && out_basename[expected_prefix.len()..]
+            .chars()
+            .all(|c| c.is_ascii_digit())
+        && out_basename.len() > expected_prefix.len();
+    if out_parent != file_parent || !basename_ok {
+        return ApplyGateOutcome::Refuse(format!(
+            "--out must be a tempfile under the same directory as --file, with \
+             basename matching `.{file_basename}.tmp.V<NNN>`; got: {out_arg}"
+        ));
+    }
+
+    // Arm 4 — --migration must resolve in the registry against the
+    // validated target file.
+    let migration_id = match parse_migration_id(migration_arg) {
+        Some(id) => id,
+        None => {
+            return ApplyGateOutcome::Refuse(format!(
+                "--migration must be of the form V<NNN> (e.g. V001); got: {migration_arg}"
+            ));
+        }
+    };
+    let migration = match sandbox_cli::cfg_migrations::find_by_id(migration_id) {
+        Some(m) if m.target_file() == target_file => m,
+        _ => {
+            return ApplyGateOutcome::Refuse(format!(
+                "migration V{migration_id:03} not found in registry for {}",
+                target_file.display_name()
+            ));
+        }
+    };
+
+    ApplyGateOutcome::Proceed {
+        target_file,
+        migration_id: migration.id(),
+    }
+}
+
+/// uid-injectable inner so the unit tests can exercise the non-root
+/// refusal arm without actually running as root. Production callers go
+/// through [`handle_apply_config_migration`].
+fn apply_config_migration_inner(
+    file_arg: &str,
+    migration_arg: &str,
+    out_arg: &str,
+    euid: nix::unistd::Uid,
+) -> i32 {
+    use std::path::Path;
+
+    let (target_file, migration_id) =
+        match apply_config_migration_gate(file_arg, migration_arg, out_arg, euid) {
+            ApplyGateOutcome::Refuse(msg) => {
+                eprintln!("sandbox: {msg}");
+                return 1;
+            }
+            ApplyGateOutcome::Proceed {
+                target_file,
+                migration_id,
+            } => (target_file, migration_id),
+        };
+
+    let file_path = Path::new(file_arg);
+    let out_path = Path::new(out_arg);
+
+    // All gates passed. Read --file, apply in memory, validate, write
+    // to --out via the framework's atomic_write. The outer
+    // `sandbox update` shell flow then `sudo -k mv`s --out into place.
+    let input = match std::fs::read(file_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("sandbox: failed to read {file_arg}: {e}");
+            return 1;
+        }
+    };
+    let transformed = match sandbox_cli::cfg_migrations::apply_migration_in_memory(
+        migration_id,
+        &input,
+        target_file,
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("sandbox: migration apply failed for {file_arg}: {e}");
+            return 1;
+        }
+    };
+    if let Err(e) = sandbox_cli::cfg_migrations::atomic_write(out_path, &transformed) {
+        eprintln!("sandbox: failed to write {out_arg}: {e}");
+        return 1;
+    }
+    0
+}
+
+/// Parse `V<NNN>` (e.g. `V001`) into an integer. Returns `None` for
+/// any other shape — the caller surfaces a refusal.
+fn parse_migration_id(raw: &str) -> Option<u32> {
+    let tail = raw.strip_prefix('V').or_else(|| raw.strip_prefix('v'))?;
+    if tail.is_empty() || !tail.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    tail.parse::<u32>().ok()
+}
+
+/// `--dump-migration-set` handler. Writes the JSON shape pinned in
+/// Spec 5 § 3.1.4 to stdout. Read-only; exits `0` on success.
+fn handle_dump_migration_set() -> i32 {
+    let entries = sandbox_cli::cfg_migrations::dump_migration_set();
+    match serde_json::to_string(&entries) {
+        Ok(s) => {
+            println!("{s}");
+            0
+        }
+        Err(e) => {
+            eprintln!("sandbox: failed to serialise migration set: {e}");
+            1
+        }
+    }
+}
+
 /// Per-backend dispatcher for `sandbox rebuild-image`.
 ///
 /// Spec § "`rebuild-image`: extend the existing flat command" requires
@@ -4159,6 +4413,19 @@ async fn check_base_image_staleness(socket_path: &str) {
 /// - At least one backend fails → exit 1 (after attempting every
 ///   selected backend).
 async fn dispatch_rebuild_image(socket_path: &str, backend: RebuildImageBackend, no_cache: bool) {
+    // Spec 5 § 8.1: `--backend gateway` is refused client-side with
+    // exit code 2 and a verbatim pointer at `sandbox update`. The
+    // refusal must fire before any HTTP request is built; the unit
+    // test `rebuild_image_gateway_backend_refuses_with_pointer_to_update`
+    // asserts no request is sent.
+    if matches!(backend, RebuildImageBackend::Gateway) {
+        eprintln!(
+            "sandbox: --backend gateway is not supported for rebuild-image.\n  \
+             The gateway image is shipped pre-built per release and loaded by \
+             `sandbox update`.\n  To refresh the gateway image, run: sudo sandbox update"
+        );
+        process::exit(2);
+    }
     // Drive the dispatcher through the production HTTP layer; the
     // unit tests below substitute a fake closure to drive the loop
     // without a real Unix socket.
@@ -4501,6 +4768,23 @@ async fn main() {
                 process::exit(2);
             }
         }
+    }
+
+    // Hidden affordances for `sandbox update` orchestration (Spec 5
+    // § 4.3 / § 3.1.4). Both dispatch entirely client-side — no
+    // socket access — so route them before any other branch.
+    if let Command::ApplyConfigMigration {
+        file,
+        migration,
+        out,
+    } = &cli.command
+    {
+        let code = handle_apply_config_migration(file, migration, out);
+        process::exit(code);
+    }
+    if matches!(&cli.command, Command::DumpMigrationSet) {
+        let code = handle_dump_migration_set();
+        process::exit(code);
     }
 
     // Handle ssh specially — it doesn't follow the normal request/response flow.
@@ -8302,5 +8586,194 @@ mod tests {
              any trailing token (build SHA, etc.) silently breaks Spec 4's \
              `awk '{{print $2}}'` parse"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Spec 5 § 8.1 — `rebuild-image --backend gateway` refusal.
+    // -----------------------------------------------------------------------
+
+    /// Pin the `Gateway` variant parses, and the refusal text is
+    /// reachable through the dispatcher.
+    ///
+    /// The dispatcher calls `process::exit(2)` on the refusal arm, so
+    /// we exercise the prefix logic by parsing the CLI and asserting
+    /// the variant survives clap's value-enum mapping. The
+    /// stderr-text and exit-code assertion lives in a separate
+    /// subprocess test below.
+    #[test]
+    fn parse_rebuild_image_backend_gateway() {
+        let cli = Cli::parse_from(["sandbox", "rebuild-image", "--backend", "gateway"]);
+        match cli.command {
+            Command::RebuildImage { backend, no_cache } => {
+                assert_eq!(backend, RebuildImageBackend::Gateway);
+                assert!(!no_cache);
+            }
+            other => panic!("expected RebuildImage with Gateway, got: {other:?}"),
+        }
+    }
+
+    // `rebuild_image_gateway_backend_refuses_with_pointer_to_update` is
+    // owned by `tests/integration_cfg_migrations_cli.rs` because it
+    // spawns the compiled binary as a subprocess (the
+    // `CARGO_BIN_EXE_sandbox` env var is only set for integration-test
+    // crates, not for unit tests living inside the binary's own
+    // `src/main.rs`). The unit-level surface is covered by
+    // `parse_rebuild_image_backend_gateway` (variant parses) above.
+
+    /// Spec 5 § 9.2 — `rebuild_image_container_backend_sends_correct_body`.
+    /// Regression: the existing dispatch test already pins the wire
+    /// body shape (see `dispatch_rebuild_image_container_only_fires_once`
+    /// elsewhere in this module); this test names the assertion under
+    /// the spec's exact label so the spec's § 9.2 row maps 1:1 to a
+    /// test function name.
+    #[tokio::test]
+    async fn rebuild_image_container_backend_sends_correct_body() {
+        let recorder = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let send = make_recording_sender(std::collections::HashMap::new(), recorder.clone());
+        let outcome = run_rebuild_image_dispatch(RebuildImageBackend::Container, false, send).await;
+        assert!(outcome.all_ok);
+        let calls = recorder.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "container backend → exactly one HTTP call");
+        assert_eq!(calls[0].0, sandbox_core::backend::BackendKind::Container);
+        let body: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
+        assert_eq!(body["backend"], serde_json::json!("container"));
+        assert_eq!(body["no_cache"], serde_json::json!(false));
+    }
+
+    /// Spec 5 § 9.2 — `rebuild_image_lima_backend_sends_correct_body`.
+    #[tokio::test]
+    async fn rebuild_image_lima_backend_sends_correct_body() {
+        let recorder = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let send = make_recording_sender(std::collections::HashMap::new(), recorder.clone());
+        let outcome = run_rebuild_image_dispatch(RebuildImageBackend::Lima, true, send).await;
+        assert!(outcome.all_ok);
+        let calls = recorder.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "lima backend → exactly one HTTP call");
+        assert_eq!(calls[0].0, sandbox_core::backend::BackendKind::Lima);
+        let body: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
+        assert_eq!(body["backend"], serde_json::json!("lima"));
+        assert_eq!(body["no_cache"], serde_json::json!(true));
+    }
+
+    // -----------------------------------------------------------------------
+    // Spec 5 § 4.3 — `--apply-config-migration` access gating.
+    //
+    // Four refusal arms, applied in order. Tests drive the inner
+    // function with an injected euid so we can exercise the non-root
+    // refusal arm without actually being root.
+    // -----------------------------------------------------------------------
+
+    /// Helper: drive the access gate and assert it produced a refusal
+    /// whose message carries the given substring. Each refusal arm in
+    /// § 4.3 names a load-bearing substring that we pin here.
+    fn assert_gate_refuses_with(
+        file_arg: &str,
+        migration_arg: &str,
+        out_arg: &str,
+        euid: nix::unistd::Uid,
+        substr: &str,
+    ) {
+        match apply_config_migration_gate(file_arg, migration_arg, out_arg, euid) {
+            ApplyGateOutcome::Refuse(msg) => {
+                assert!(
+                    msg.contains(substr),
+                    "expected refusal substring `{substr}`; got: {msg}"
+                );
+            }
+            ApplyGateOutcome::Proceed { .. } => {
+                panic!("gate must refuse; substring expected: {substr}");
+            }
+        }
+    }
+
+    /// Spec 5 § 9.2 `apply_config_migration_refuses_non_root_caller`.
+    /// Pins the `requires root` substring from arm 1.
+    #[test]
+    fn apply_config_migration_refuses_non_root_caller() {
+        assert_gate_refuses_with(
+            "/etc/sandboxd/users.conf",
+            "V001",
+            "/etc/sandboxd/.users.conf.tmp.V001",
+            nix::unistd::Uid::from_raw(1000),
+            "requires root",
+        );
+    }
+
+    /// Spec 5 § 9.2 `apply_config_migration_refuses_non_canonical_file`.
+    /// Pins the `canonical paths` substring from arm 2.
+    #[test]
+    fn apply_config_migration_refuses_non_canonical_file() {
+        assert_gate_refuses_with(
+            "/tmp/fake.json",
+            "V001",
+            "/tmp/.fake.json.tmp.V001",
+            nix::unistd::Uid::from_raw(0),
+            "canonical paths",
+        );
+    }
+
+    /// Spec 5 § 9.2 `apply_config_migration_refuses_arbitrary_out_path`.
+    /// Pins the `tempfile under the same directory as --file`
+    /// substring from arm 3.
+    #[test]
+    fn apply_config_migration_refuses_arbitrary_out_path() {
+        assert_gate_refuses_with(
+            "/etc/sandboxd/users.conf",
+            "V001",
+            "/tmp/whatever",
+            nix::unistd::Uid::from_raw(0),
+            "tempfile under the same directory as --file",
+        );
+    }
+
+    /// Spec 5 § 9.2 `apply_config_migration_refuses_unknown_migration_id`.
+    /// Pins the `not found in registry` substring from arm 4.
+    #[test]
+    fn apply_config_migration_refuses_unknown_migration_id() {
+        assert_gate_refuses_with(
+            "/etc/sandboxd/users.conf",
+            "V999",
+            "/etc/sandboxd/.users.conf.tmp.V999",
+            nix::unistd::Uid::from_raw(0),
+            "not found in registry",
+        );
+    }
+
+    /// parse_migration_id round-trip.
+    #[test]
+    fn parse_migration_id_accepts_V001_v001_and_rejects_others() {
+        assert_eq!(parse_migration_id("V001"), Some(1));
+        assert_eq!(parse_migration_id("v001"), Some(1));
+        assert_eq!(parse_migration_id("V42"), Some(42));
+        assert_eq!(parse_migration_id("001"), None, "missing prefix");
+        assert_eq!(parse_migration_id("V"), None, "no digits");
+        assert_eq!(parse_migration_id("Vabc"), None, "non-digits");
+        assert_eq!(parse_migration_id("VFOO1"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Spec 5 § 3.1.4 — `--dump-migration-set`.
+    // -----------------------------------------------------------------------
+
+    /// Spec 5 exit-criteria #9: `sandbox dump-migration-set` exits 0
+    /// and prints a JSON array. Unit-tested at the handler level
+    /// here; the subprocess shape (which exercises `process::exit(0)`)
+    /// lives in `tests/integration_cfg_migrations_cli.rs`.
+    #[test]
+    fn dump_migration_set_handler_returns_zero() {
+        // The handler writes to stdout. We can't easily capture stdout
+        // from a unit test, so we verify the structure of
+        // `dump_migration_set()` directly (the only thing the handler
+        // does is `serde_json::to_string` on it). The subprocess test
+        // owns the stdout-capture half.
+        let entries = sandbox_cli::cfg_migrations::dump_migration_set();
+        assert!(!entries.is_empty(), "registry has at least V001");
+        for e in &entries {
+            assert!(e.id > 0);
+            assert!(!e.name.is_empty());
+            assert!(!e.target_file.is_empty());
+        }
+        // Verify the JSON shape one layer up — to_string returns Ok.
+        let _ = serde_json::to_string(&entries).expect("serialise");
     }
 }

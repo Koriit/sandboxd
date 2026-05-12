@@ -79,6 +79,14 @@ pub enum RebuildImageBackend {
     Container,
     /// Rebuild every installed backend's image.
     All,
+    /// Gateway image: refused. The gateway image is shipped pre-built
+    /// per release and loaded by `sandbox update`; building it locally
+    /// requires the full source tree, Docker, and network access to
+    /// upstream registries. Spec 5 § 8.1 keeps this variant in the
+    /// enum so operators who try `sandbox rebuild-image --backend
+    /// gateway` get a clear error message that points at `sandbox
+    /// update` rather than a "no such variant" clap error.
+    Gateway,
 }
 
 impl RebuildImageBackend {
@@ -92,11 +100,21 @@ impl RebuildImageBackend {
     /// rather than ordering, but a stable order is the only way to keep
     /// the operator-facing stderr lines reproducible and the dispatch
     /// test deterministic.
+    ///
+    /// The `Gateway` variant is intentionally excluded — the dispatcher
+    /// short-circuits on `Gateway` with an exit-2 refusal before it
+    /// reaches `into_kinds`. Returning an empty `Vec` here would let
+    /// a future caller silently no-op, so we panic instead: any code
+    /// path that reaches `into_kinds` with `Gateway` is a bug.
     pub fn into_kinds(self) -> Vec<BackendKind> {
         match self {
             Self::Lima => vec![BackendKind::Lima],
             Self::Container => vec![BackendKind::Container],
             Self::All => vec![BackendKind::Lima, BackendKind::Container],
+            Self::Gateway => panic!(
+                "RebuildImageBackend::Gateway must be refused at dispatch entry, \
+                 not handed to into_kinds"
+            ),
         }
     }
 }
