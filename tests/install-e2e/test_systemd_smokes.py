@@ -22,7 +22,6 @@ from __future__ import annotations
 import pytest
 
 from conftest import (
-    assert_doctor_passes,
     copy_tarball_to_vm,
     install_sh_cmd,
     wait_for_socket,
@@ -70,8 +69,11 @@ def integration_systemd_unit_smokes(
 
     # 4. Socket exists with the expected mode.
     wait_for_socket(vm.name, "/run/sandbox/sandboxd.sock", timeout=30)
+    # `sudo` because /run/sandbox is mode 0750 sandbox:sandbox and the
+    # default lima user has no traversal rights into it (same reason
+    # wait_for_socket sudos its test -S probe).
     r = vm.shell(
-        "stat -c '%a %U %G' /run/sandbox/sandboxd.sock", check=True,
+        "sudo stat -c '%a %U %G' /run/sandbox/sandboxd.sock", check=True,
     )
     parts = r.stdout.strip().split()
     assert len(parts) == 3, f"unexpected stat output: {r.stdout!r}"
@@ -80,9 +82,26 @@ def integration_systemd_unit_smokes(
     assert owner == "sandbox", f"socket owner is {owner}, expected sandbox"
     assert group == "sandbox", f"socket group is {group}, expected sandbox"
 
-    # 5. sandbox doctor exits 0. Run as root for the smoke (peer-cred
-    # checks honor root; the operator-group plumbing is exercised by
-    # the happy-path tests).
-    text = assert_doctor_passes(vm)
+    # 5. sandbox doctor exits 0.
+    #
+    # We invoke as the ``sandbox`` daemon user so the "current user in
+    # 'sandbox' group" check is unambiguously green — running as root
+    # fails that check (root is not in the group), and running as the
+    # default Lima user requires a re-login for the install.sh-issued
+    # ``usermod -aG sandbox`` to take effect. The operator-group
+    # plumbing for non-daemon operators is exercised by the happy-path
+    # tests, which re-login between install and doctor.
+    #
+    # The systemd unit binds the socket at /run/sandbox/sandboxd.sock,
+    # so we point the CLI at it via SANDBOX_SOCKET rather than relying
+    # on the per-user XDG default.
+    r = vm.shell(
+        "sudo -u sandbox env"
+        " SANDBOX_SOCKET=/run/sandbox/sandboxd.sock"
+        " /usr/local/bin/sandbox doctor",
+        timeout=60,
+    )
+    text = r.stdout + r.stderr
+    assert r.returncode == 0, f"sandbox doctor exited {r.returncode}\n{text}"
     # Just confirm doctor produced output; we don't pin specific lines.
     assert text, "sandbox doctor produced no output"

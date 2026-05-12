@@ -130,12 +130,20 @@ def lima_cp(vm_name, src, dst):
 
 
 def wait_for_socket(vm_name, sock_path, *, timeout=SOCKET_WAIT_TIMEOUT):
-    """Block until <sock_path> exists inside the VM as a unix socket."""
+    """Block until <sock_path> exists inside the VM as a unix socket.
+
+    Runs the probe under ``sudo`` because the parent runtime directory
+    (``/run/sandbox``) is created by systemd at mode 0750 owned by
+    ``sandbox:sandbox`` — the default ``lima`` user that ``limactl
+    shell`` lands as is not in the ``sandbox`` group, so an unprivileged
+    ``test -S`` would always fail with EACCES regardless of whether the
+    socket exists.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         result = lima_shell(
             vm_name,
-            f"test -S {sock_path} && echo ok",
+            f"sudo test -S {sock_path} && echo ok",
             timeout=10,
         )
         if result.returncode == 0 and "ok" in result.stdout:
