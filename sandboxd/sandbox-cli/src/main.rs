@@ -385,6 +385,73 @@ enum Command {
         no_cache: bool,
     },
 
+    /// Apply a pending sandboxd upgrade (or report what would happen).
+    ///
+    /// `sandbox update` orchestrates Spec 5 § 3's full upgrade flow:
+    /// pre-flight checks (read-only), confirmation prompt, and the
+    /// stateful steps that stop the daemon, install new binaries, run
+    /// config migrations, and restart. Each privileged step uses
+    /// `sudo -k <action>` so every elevation appears as its own line
+    /// in `/var/log/sandbox-install.log` (Spec 5 § 2.6).
+    ///
+    /// Exit codes (Spec 5 § 2.2):
+    /// - `0` — up to date (`--check`), `--dry-run` printed plan, or
+    ///   confirmation prompt answered `N`.
+    /// - `1` — error (pre-flight refused, network failure, etc.).
+    /// - `2` — argument-parse failure / refused flag combination
+    ///   (e.g. `--cosign-bundle` without `--from`).
+    /// - `3` — update available (`--check` only); machine-readable
+    ///   signal for "an update is waiting; run `sandbox update` to
+    ///   apply".
+    Update {
+        /// Pin to a specific release tag (default: latest).
+        #[arg(long, default_value = "latest")]
+        version: String,
+        /// Use a pre-staged local tarball instead of fetching from
+        /// GitHub Releases. Required for air-gapped operation;
+        /// requires `--cosign-bundle` (or a sibling `.sigstore` file).
+        #[arg(long)]
+        from: Option<std::path::PathBuf>,
+        /// Path to a sigstore bundle for `--from` air-gap
+        /// verification. Required when the tarball does not have a
+        /// sibling `<tarball>.sigstore` file.
+        #[arg(long, requires = "from")]
+        cosign_bundle: Option<std::path::PathBuf>,
+        /// Override the default release-tarball base URL. Mutually
+        /// exclusive with `--from` (which is local-only).
+        #[arg(
+            long,
+            default_value = "https://github.com/Koriit/sandboxd/releases/download"
+        )]
+        source_url: String,
+        /// Read-only mode: report installed vs available, then exit.
+        /// Never acquires the lock, never contacts cosign, never
+        /// extracts anything. Spec 5 § 2.2.
+        #[arg(long, conflicts_with = "dry_run")]
+        check: bool,
+        /// Read-only mode: print the step-by-step plan
+        /// (`would execute` / `would skip` per stateful step) and
+        /// exit. Never mutates state. Spec 5 § 2.3.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the interactive confirmation prompt. Equivalent to
+        /// answering `y`. Spec 5 § 2.4.
+        #[arg(long)]
+        yes: bool,
+        /// Proceed past the "active sessions exist" guard
+        /// (§ 3.1.6). The daemon stop will terminate active
+        /// sessions mid-flight — use only when the daemon is wedged
+        /// and you want to upgrade anyway.
+        #[arg(long)]
+        force: bool,
+        /// Quieter logging.
+        #[arg(long, conflicts_with = "verbose")]
+        quiet: bool,
+        /// Verbose logging.
+        #[arg(long)]
+        verbose: bool,
+    },
+
     /// Hidden internal affordance: apply a single config migration in
     /// memory and write the result to `--out`. The outer
     /// `sandbox update` flow then `sudo -k mv`s the output into place.
@@ -1020,6 +1087,13 @@ fn build_request(command: &Command) -> Option<Request<String>> {
                  client-side in main() before build_request"
             );
         }
+        // `sandbox update` runs its own orchestration (pre-flight,
+        // confirmation prompt, stateful steps). It owns the full
+        // process lifecycle and never hits the single-request /
+        // single-response build_request pipeline.
+        Command::Update { .. } => {
+            unreachable!("`sandbox update` is handled client-side in main() before build_request");
+        }
     };
     Some(req)
 }
@@ -1234,6 +1308,11 @@ fn command_bypasses_version_check(command: &Command) -> bool {
             | Command::Doctor { .. }
             | Command::ApplyConfigMigration { .. }
             | Command::DumpMigrationSet
+            // `sandbox update` must run under a CLI/daemon version
+            // skew — the whole point is to *resolve* that skew. The
+            // pre-flight queries the daemon read-only (active sessions
+            // count) and tolerates `/version` returning anything.
+            | Command::Update { .. }
     )
 }
 
@@ -1500,6 +1579,12 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
                 "`apply-config-migration` / `dump-migration-set` are handled client-side \
                  in main() before send_request"
             );
+        }
+        Command::Update { .. } => {
+            // `sandbox update` runs its own orchestration loop in
+            // `update::run`; the generic single-request pipeline is
+            // never engaged. Reaching here is a dispatch bug.
+            unreachable!("`sandbox update` is handled client-side in main() before send_request");
         }
     }
 
@@ -4914,6 +4999,41 @@ async fn main() {
     if let Command::RebuildImage { backend, no_cache } = &cli.command {
         dispatch_rebuild_image(&cli.socket, *backend, *no_cache).await;
         return;
+    }
+
+    // `sandbox update` runs its own orchestration loop (pre-flight,
+    // confirmation prompt, stateful steps). Spec 5 § 2.2 / § 2.3 pin
+    // its exit-code semantics (0 / 1 / 2 / 3); `update::run` returns
+    // the exit code as a `process::ExitCode`, which `process::exit`
+    // here forwards verbatim.
+    if let Command::Update {
+        version,
+        from,
+        cosign_bundle,
+        source_url,
+        check,
+        dry_run,
+        yes,
+        force,
+        quiet,
+        verbose,
+    } = &cli.command
+    {
+        let args = sandbox_cli::update::UpdateArgs {
+            version: version.clone(),
+            from: from.clone(),
+            cosign_bundle: cosign_bundle.clone(),
+            source_url: source_url.clone(),
+            check: *check,
+            dry_run: *dry_run,
+            yes: *yes,
+            force: *force,
+            quiet: *quiet,
+            verbose: *verbose,
+            socket_path: cli.socket.clone(),
+        };
+        let code = sandbox_cli::update::run(args).await;
+        std::process::exit(code);
     }
 
     // Create has a dedicated dispatch path because the request body
