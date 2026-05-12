@@ -430,14 +430,106 @@ check_prereqs() {
 
     if [ -n "$missing" ]; then
         emit "${RED}x${RESET} missing prerequisites:"
+        mgr=$(detect_pkg_mgr 2>/dev/null || true)
         for m in $missing; do
-            emit "    - $m"
+            pkg=""
+            if [ -n "$mgr" ]; then
+                pkg=$(pkg_name_for "$m" "$mgr" 2>/dev/null || true)
+            fi
+            if [ -n "$pkg" ]; then
+                hint=$(pkg_hint_for "$m")
+                if [ -n "$hint" ]; then
+                    emit "    - $m:    $mgr install $pkg     $hint"
+                else
+                    emit "    - $m:    $mgr install $pkg"
+                fi
+            else
+                emit "    - $m"
+            fi
         done
         emit "  Install these, then re-run install.sh."
         log_fail "step=prereq missing=$(printf '%s' "$missing" | tr ' ' ',')"
         exit 1
     fi
     log_ok "step=prereq missing=none"
+}
+
+# Detect the host's package manager from /etc/os-release's ID/ID_LIKE.
+# Emits one of {apt, dnf, pacman, zypper} on stdout and returns 0 on a
+# recognised distro family; returns 1 otherwise (caller falls back to a
+# bare-name list).
+detect_pkg_mgr() {
+    [ -r /etc/os-release ] || return 1
+    # shellcheck disable=SC1091
+    . /etc/os-release 2>/dev/null
+    for id in ${ID:-} ${ID_LIKE:-}; do
+        case "$id" in
+            debian|ubuntu)        echo apt;    return 0 ;;
+            fedora|rhel|centos)   echo dnf;    return 0 ;;
+            arch)                 echo pacman; return 0 ;;
+            opensuse*|suse|sles)  echo zypper; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Map a sandboxd prereq name to a package name for the given manager.
+# Returns 1 with no output if the prereq is not packaged (e.g. kernel
+# version, where the fix is an OS upgrade, not a package install).
+pkg_name_for() {
+    prereq=$1
+    mgr=$2
+    case "$prereq" in
+        docker)
+            case "$mgr" in apt) echo docker.io ;; *) echo docker ;; esac ;;
+        lima)
+            echo lima ;;
+        qemu-system-x86_64)
+            case "$mgr" in
+                apt|dnf) echo qemu-system-x86 ;;
+                pacman)  echo qemu-base ;;
+                zypper)  echo qemu-x86 ;;
+                *)       echo qemu ;;
+            esac ;;
+        qemu-system-aarch64)
+            case "$mgr" in
+                apt)    echo qemu-system-arm ;;
+                dnf)    echo qemu-system-aarch64 ;;
+                pacman) echo qemu-arch-extra ;;
+                zypper) echo qemu-arm ;;
+                *)      echo qemu ;;
+            esac ;;
+        ovmf)
+            case "$mgr" in
+                apt)           echo ovmf ;;
+                dnf|pacman)    echo edk2-ovmf ;;
+                zypper)        echo qemu-ovmf-x86_64 ;;
+                *)             echo ovmf ;;
+            esac ;;
+        setcap)
+            case "$mgr" in
+                apt)         echo libcap2-bin ;;
+                dnf|pacman)  echo libcap ;;
+                zypper)      echo libcap-progs ;;
+                *)           echo libcap ;;
+            esac ;;
+        jq|curl|tar) echo "$prereq" ;;
+        sha256sum)   echo coreutils ;;
+        kernel-5.8+) return 1 ;;
+        *)           echo "$prereq" ;;
+    esac
+}
+
+# Special-case URL hints appended after the install command — for
+# prereqs whose distro packages are commonly out-of-date or unavailable
+# in default repos and where upstream docs are the canonical install
+# path. Matches the example in spec § 4.4.6.
+pkg_hint_for() {
+    case "$1" in
+        docker) echo "# or follow https://docs.docker.com/engine/install/" ;;
+        lima)   echo "# or download from https://github.com/lima-vm/lima/releases" ;;
+        *)      ;;
+    esac
 }
 
 # ----------------------------------------------------------------------------
