@@ -41,7 +41,7 @@ sudo -u sandbox cat "$BACKUP_DIR/manifest.json"
 #    from the prior release tarball BEFORE starting the rolled-back daemon
 #    (the daemon refuses to start without its versioned gateway image).
 PREV_VERSION=$(sudo -u sandbox jq -r '.from_version' "$BACKUP_DIR/manifest.json")
-if ! docker image inspect "sandbox-gateway:${PREV_VERSION}" >/dev/null 2>&1; then
+if ! sudo docker image inspect "sandbox-gateway:${PREV_VERSION}" >/dev/null 2>&1; then
     echo "Prior gateway image sandbox-gateway:${PREV_VERSION} is missing (likely pruned)."
     echo "Re-load it from the prior release tarball, e.g.:"
     echo "    sudo docker load -i sandboxd-${PREV_VERSION}-$(uname -m)-unknown-linux-gnu/images/sandbox-gateway-${PREV_VERSION}.tar"

@@ -101,7 +101,7 @@ BACKUP_DIR=$(sudo -u sandbox sh -c 'ls -td /var/lib/sandbox/backups/*/' \
                | head -1)
 test -n "$BACKUP_DIR"
 PREV_VERSION=$(sudo -u sandbox jq -r '.from_version' "$BACKUP_DIR/manifest.json")
-docker image inspect "sandbox-gateway:${PREV_VERSION}" >/dev/null
+sudo docker image inspect "sandbox-gateway:${PREV_VERSION}" >/dev/null
 sudo systemctl stop sandboxd
 sudo install -m 0755 -o root -g root "$BACKUP_DIR/sandboxd.bak"             /usr/local/bin/sandboxd
 sudo install -m 0755 -o root -g root "$BACKUP_DIR/sandbox.bak"              /usr/local/bin/sandbox
