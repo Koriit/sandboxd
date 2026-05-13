@@ -8,11 +8,13 @@ This test installs base v, then runs three updates v → v.1 → v.2 →
 v.3. After the third update, exactly 2 successful sets remain (the
 v.1→v.2 and v.2→v.3 transitions); the v→v.1 set is pruned.
 
-Single-version-tarball caveat: the bumped tarballs ship the same
-binaries (only MANIFEST.version differs), so the daemon's ``/version``
-endpoint reports the base version throughout. The test asserts the
-*observable retention behavior* via the on-disk backup-set count and
-the manifests' ``to_version`` strings.
+The three bumped tarballs are genuine v.1, v.2, v.3 binaries built
+by the ``release_tarball_x86_64_bumped_chain`` fixture — each link
+sed-rewrites every crate's Cargo.toml to the link's target version
+and runs ``cargo build --workspace --release``. ``verify_version``
+inside ``sandbox update`` requires the post-restart ``/version`` to
+match the MANIFEST version or the run aborts, so a MANIFEST-only
+fake bump won't satisfy this test.
 """
 
 from __future__ import annotations
@@ -24,23 +26,18 @@ import pytest
 from conftest import (
     copy_tarball_to_vm,
     install_sh_cmd,
-    make_bumped_tarball,
-    retag_gateway_image_in_vm,
     version_from_tarball,
     wait_for_socket,
     wait_for_systemd_active,
 )
 
 
-def _bump_to(version, new_patch):
-    parts = version.split(".")
-    parts[-1] = str(new_patch)
-    return ".".join(parts)
-
-
 @pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
 def test_update_backup_retention_prunes_oldest(
-    distro_template, vm_factory, release_tarball_x86_64, tmp_path
+    distro_template,
+    vm_factory,
+    release_tarball_x86_64,
+    release_tarball_x86_64_bumped_chain,
 ):
     """Three consecutive updates leave 2 successful backup sets on disk.
 
@@ -58,26 +55,16 @@ def test_update_backup_retention_prunes_oldest(
     wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
     wait_for_socket(vm.name, "/run/sandbox/sandboxd.sock", timeout=60)
 
-    # Build 3 bumped tarballs.
-    parts = base_ver.split(".")
-    base_patch = int(parts[-1])
-    vers = [
-        _bump_to(base_ver, base_patch + 1),
-        _bump_to(base_ver, base_patch + 2),
-        _bump_to(base_ver, base_patch + 3),
-    ]
-    tarballs = [
-        make_bumped_tarball(release_tarball_x86_64, v, dst_dir=tmp_path)
-        for v in vers
-    ]
+    # Stage 3 genuine bumped tarballs (v.1, v.2, v.3) from the chain
+    # fixture. Each link is a real bumped binary whose /version
+    # endpoint reports the bumped version, satisfying verify_version.
+    assert len(release_tarball_x86_64_bumped_chain) >= 3, (
+        f"chain fixture must produce >= 3 bumped tarballs for the "
+        f"retention test, got {len(release_tarball_x86_64_bumped_chain)}"
+    )
+    tarballs = release_tarball_x86_64_bumped_chain[:3]
+    vers = [version_from_tarball(t) for t in tarballs]
     in_vm = [copy_tarball_to_vm(vm, t, dst="/tmp") for t in tarballs]
-    # Pre-tag the gateway image for every version in the chain.
-    for v in vers:
-        retag_gateway_image_in_vm(
-            vm,
-            from_tag=f"sandbox-gateway:{base_ver}",
-            to_tag=f"sandbox-gateway:{v}",
-        )
 
     # Run the three updates in order. Each must succeed and produce a
     # new backup set in `/var/lib/sandbox/backups/`.

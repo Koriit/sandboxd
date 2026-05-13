@@ -24,8 +24,6 @@ import pytest
 from conftest import (
     copy_tarball_to_vm,
     install_sh_cmd,
-    make_bumped_tarball,
-    retag_gateway_image_in_vm,
     version_from_tarball,
     wait_for_socket,
     wait_for_systemd_active,
@@ -34,7 +32,10 @@ from conftest import (
 
 @pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
 def test_update_concurrent_refused(
-    distro_template, vm_factory, release_tarball_x86_64, tmp_path
+    distro_template,
+    vm_factory,
+    release_tarball_x86_64,
+    release_tarball_x86_64_bumped,
 ):
     """A held flock on `/var/lib/sandbox/.update.lock` forces the second
     `sandbox update` to refuse with "another update is in progress".
@@ -56,18 +57,11 @@ def test_update_concurrent_refused(
     wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
     wait_for_socket(vm.name, "/run/sandbox/sandboxd.sock", timeout=60)
 
-    # Build a bumped tarball so the version-compare branch reports
-    # "update available" and the run reaches the lock-acquire step
-    # (same-version short-circuits before any lock is taken).
-    bumped_ver = _bump_patch(base_ver)
-    bumped = make_bumped_tarball(release_tarball_x86_64, bumped_ver,
-                                 dst_dir=tmp_path)
-    bumped_in_vm = copy_tarball_to_vm(vm, bumped)
-    retag_gateway_image_in_vm(
-        vm,
-        from_tag=f"sandbox-gateway:{base_ver}",
-        to_tag=f"sandbox-gateway:{bumped_ver}",
-    )
+    # Stage a genuine bumped tarball so the version-compare branch
+    # reports "update available" and the run reaches the lock-acquire
+    # step (same-version short-circuits before any lock is taken).
+    bumped_ver = version_from_tarball(release_tarball_x86_64_bumped)
+    bumped_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64_bumped)
 
     # Synthesise a held lock: a background `flock -n <lock> sleep 60`
     # holds the kernel flock. We write the payload first (mode 0664
@@ -128,18 +122,6 @@ def test_update_concurrent_refused(
     assert vm.shell(
         "sudo test -e /var/lib/sandbox/.update.lock"
     ).returncode == 0, "held lock file disappeared during refused run"
-
-
-def _bump_patch(version):
-    """Return version with the patch component incremented by one.
-
-    ``1.0.0`` → ``1.0.1``; ``0.1.0`` → ``0.1.1``; etc.
-    """
-    parts = version.split(".")
-    if len(parts) != 3:
-        raise AssertionError(f"unexpected version shape: {version}")
-    parts[-1] = str(int(parts[-1]) + 1)
-    return ".".join(parts)
 
 
 def _sh_quote(s):

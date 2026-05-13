@@ -462,6 +462,84 @@ def release_tarball_x86_64_bumped(release_tarball_x86_64) -> Path:
     return tarball
 
 
+@pytest.fixture(scope="session")
+def release_tarball_x86_64_bumped_chain(release_tarball_x86_64) -> list:
+    """Build a chain of N successively bumped release tarballs.
+
+    ``test_update_backup_retention`` needs three real bumped binaries
+    in sequence (v → v+1 → v+2 → v+3) to verify Spec 5 § 5.2's keep=2
+    retention prune. The synthesised MANIFEST-only fake-bump path
+    can't satisfy this: ``verify_version`` in the update flow queries
+    the daemon's ``/version`` post-restart and aborts on mismatch.
+
+    Each link in the chain is built independently by re-driving
+    ``build-local-tarball.sh`` with ``SANDBOX_RELEASE_BUMP_VERSION``
+    set to the chain step's version. The script's EXIT-trap restores
+    the workspace Cargo.toml files between invocations, so each
+    invocation starts from the committed source and sed-rewrites
+    forward to its own target version.
+
+    All bumped builds share ``sandboxd/target/portable-bumped/`` as
+    their cargo target dir; this keeps the base build's target dir
+    untouched. Successive bumped builds invalidate every crate's
+    ``CARGO_PKG_VERSION`` fingerprint, so each link's compile is
+    near-full — that is the cost of producing genuinely distinct
+    binaries. The fixture is ``scope="session"``, so this happens
+    once per pytest invocation.
+
+    Cache shape per link: ``dist/sandboxd-<v>-<arch>.tar.gz``. A link
+    is rebuilt only when its cached tarball is older than the
+    youngest ``*.rs`` file in the workspace (same shape as the
+    single bumped fixture). ``SANDBOX_RELEASE_FORCE_REBUILD=1``
+    forces every link to rebuild.
+
+    Returns: list of pathlib.Path entries, ordered (oldest → newest).
+    Length defaults to 3; override with ``SANDBOX_RELEASE_BUMP_CHAIN_LEN``.
+    """
+    if subprocess.run(["uname", "-m"], capture_output=True, text=True).stdout.strip() != "x86_64":
+        pytest.skip("release_tarball_x86_64_bumped_chain fixture only assembles on x86_64 hosts")
+
+    base_ver = _read_workspace_version()
+    chain_len = int(os.environ.get("SANDBOX_RELEASE_BUMP_CHAIN_LEN", "3"))
+    if chain_len < 1:
+        raise AssertionError(
+            f"SANDBOX_RELEASE_BUMP_CHAIN_LEN must be >= 1, got {chain_len}"
+        )
+
+    # Generate the chain versions by repeatedly bumping the patch
+    # component. Same shape as the single bumped fixture: X.Y.Z ->
+    # X.Y.(Z+1) -> X.Y.(Z+2) -> ...
+    chain_versions = []
+    cur = base_ver
+    for _ in range(chain_len):
+        cur = _bump_patch_version(cur)
+        chain_versions.append(cur)
+
+    arch = "x86_64-unknown-linux-gnu"
+    chain_tarballs = []
+    force_rebuild = os.environ.get("SANDBOX_RELEASE_FORCE_REBUILD") == "1"
+    newest_rs = _newest_rs_mtime()
+
+    for ver in chain_versions:
+        tarball = DIST_DIR / f"sandboxd-{ver}-{arch}.tar.gz"
+        stale = not tarball.exists() or tarball.stat().st_mtime < newest_rs
+
+        if force_rebuild or stale:
+            env = os.environ.copy()
+            env["SANDBOX_RELEASE_BUMP_VERSION"] = ver
+            subprocess.run(
+                [str(HERE / "build-local-tarball.sh")],
+                check=True,
+                timeout=3600,
+                env=env,
+            )
+
+        assert tarball.exists(), f"chain link not produced: {tarball}"
+        chain_tarballs.append(tarball)
+
+    return chain_tarballs
+
+
 def _read_workspace_version() -> str:
     cargo_toml = PROJECT_ROOT / "sandboxd" / "sandboxd" / "Cargo.toml"
     for line in cargo_toml.read_text().splitlines():
@@ -713,121 +791,6 @@ def version_from_tarball(tarball_path):
             f"could not parse version from tarball name: {name}"
         )
     return m.group(1)
-
-
-def make_bumped_tarball(base_tarball, new_version, *, dst_dir=None):
-    """Repack ``base_tarball`` with a synthetic bumped version.
-
-    Spec 5 § 9.1's update tests are written against transitions like
-    ``v1.0.0 → v1.1.0``. Building a second release tarball with a
-    different *binary* version requires either CI-style cross-builds
-    (slow + complicated) or version-bumping the source tree (mutates the
-    workspace under test). Both are heavy.
-
-    This helper takes the existing single-version tarball and rewrites
-    just the metadata so the update flow believes it's a different
-    version:
-
-      1. extract to a temp dir;
-      2. rename ``sandboxd-<base>-<arch>/`` → ``sandboxd-<new>-<arch>/``;
-      3. rewrite ``MANIFEST.version`` to ``new_version``;
-      4. rename ``images/sandbox-gateway-<base>.tar`` →
-         ``sandbox-gateway-<new>.tar`` (the bytes stay the same — the
-         daemon's image-load step short-circuits on ``docker image
-         inspect`` when the tag exists in the VM, which the test sets up
-         with a manual ``docker tag``);
-      5. repack as ``sandboxd-<new>-<arch>.tar.gz``.
-
-    The synthesised tarball still ships the **original** v<base>
-    binaries. Tests that observe daemon ``/version`` after the upgrade
-    will read the binary's compiled-in version (= the base version),
-    NOT the synthesised ``new_version``. The synthesised version is
-    visible only in:
-
-      * ``MANIFEST.version`` inside the tarball;
-      * the staged directory + image-tar paths;
-      * ``install_state.installed_version`` (written by the update flow
-        from the MANIFEST, not from the binary).
-
-    Tests that assert "daemon at v1.1.0 after upgrade" cannot be
-    satisfied by this helper — they need a genuinely-different binary,
-    which Spec 5 § 9.1 acknowledges as a multi-version harness gap. The
-    skips in the test files document this constraint explicitly.
-
-    Returns the path to the bumped tarball; the caller is responsible
-    for copying it into the VM via ``copy_tarball_to_vm``.
-    """
-    import tarfile
-    import tempfile
-
-    base_tarball = Path(base_tarball)
-    base_ver = version_from_tarball(base_tarball)
-    if new_version == base_ver:
-        raise AssertionError(
-            f"make_bumped_tarball: new_version {new_version} == base_version; "
-            "use the base tarball directly"
-        )
-    arch = "x86_64-unknown-linux-gnu"
-    if dst_dir is None:
-        dst_dir = DIST_DIR
-    dst_dir = Path(dst_dir)
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    new_tarball = dst_dir / f"sandboxd-{new_version}-{arch}.tar.gz"
-    if new_tarball.exists():
-        return new_tarball  # cached
-
-    with tempfile.TemporaryDirectory(prefix="bumped-tar-") as tmp:
-        tmp = Path(tmp)
-        with tarfile.open(base_tarball, "r:gz") as tf:
-            tf.extractall(tmp)
-        old_stage = tmp / f"sandboxd-{base_ver}-{arch}"
-        new_stage = tmp / f"sandboxd-{new_version}-{arch}"
-        old_stage.rename(new_stage)
-
-        # Rewrite MANIFEST.version (preserve all other fields).
-        manifest_path = new_stage / "MANIFEST"
-        manifest = json.loads(manifest_path.read_text())
-        manifest["version"] = new_version
-        # Also bump the gateway-image path key — the daemon reads
-        # `staged.gateway_image_tar()` as `images/sandbox-gateway-<ver>.tar`,
-        # so the artifact path needs to match.
-        if "gateway-image" in manifest.get("artifacts", {}):
-            manifest["artifacts"]["gateway-image"]["path"] = (
-                f"images/sandbox-gateway-{new_version}.tar"
-            )
-            manifest["artifacts"]["gateway-image"]["docker_tag"] = (
-                f"sandbox-gateway:{new_version}"
-            )
-        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
-
-        # Rename gateway-image tar (same bytes).
-        old_image = new_stage / "images" / f"sandbox-gateway-{base_ver}.tar"
-        new_image = new_stage / "images" / f"sandbox-gateway-{new_version}.tar"
-        if old_image.exists():
-            old_image.rename(new_image)
-
-        # Repack.
-        with tarfile.open(new_tarball, "w:gz") as tf:
-            tf.add(new_stage, arcname=new_stage.name)
-
-    # Sigstore stub.
-    Path(str(new_tarball) + ".sigstore").write_bytes(b"")
-    return new_tarball
-
-
-def retag_gateway_image_in_vm(vm, *, from_tag, to_tag):
-    """Manually ``docker tag`` the gateway image inside the VM.
-
-    The bumped tarball's image-tar bytes are identical to the base
-    tarball's, but the daemon's ``docker image inspect
-    sandbox-gateway:<new>`` short-circuit means a load is never
-    attempted. We pre-tag the already-loaded image so the inspect
-    succeeds.
-    """
-    vm.shell(
-        f"sudo docker tag {from_tag} {to_tag}",
-        check=True, timeout=30,
-    )
 
 
 def install_sh_cmd(tarball_in_vm, *extra_flags, env=None):

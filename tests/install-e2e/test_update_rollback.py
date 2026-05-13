@@ -5,12 +5,12 @@ automated ``sandbox rollback`` subcommand (§ 12 out of scope). This
 test installs base version v, updates to a bumped v', then runs the
 verbatim recipe from § 7.2 and asserts the rolled-back state.
 
-Single-version-tarball caveat: the rolled-back binary IS the same
-binary as the post-update binary (the bumped tarball reships v's
-binaries with a v' MANIFEST). So ``/version`` returns v in both
-states; the assertions land on ``install_state.installed_version``
-(written from MANIFEST.version) and the backup-set's
-``manifest.from_version``.
+The bumped tarball is a genuine v' build (every crate's Cargo.toml
+sed-rewritten before ``cargo build --workspace --release``), so the
+daemon's ``/version`` endpoint truthfully reports v' post-update and
+v after the rollback recipe puts the v binary back. The assertions
+land on ``install_state.installed_version`` (written from
+MANIFEST.version) and the backup-set's ``manifest.from_version``.
 """
 
 from __future__ import annotations
@@ -22,25 +22,18 @@ import pytest
 from conftest import (
     copy_tarball_to_vm,
     install_sh_cmd,
-    make_bumped_tarball,
-    retag_gateway_image_in_vm,
     version_from_tarball,
     wait_for_socket,
     wait_for_systemd_active,
 )
 
 
-def _bump_patch(version):
-    parts = version.split(".")
-    if len(parts) != 3:
-        raise AssertionError(f"unexpected version shape: {version}")
-    parts[-1] = str(int(parts[-1]) + 1)
-    return ".".join(parts)
-
-
 @pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
 def test_update_then_manual_rollback(
-    distro_template, vm_factory, release_tarball_x86_64, tmp_path
+    distro_template,
+    vm_factory,
+    release_tarball_x86_64,
+    release_tarball_x86_64_bumped,
 ):
     """End-to-end rollback recipe from Spec 5 § 7.2.
 
@@ -71,15 +64,8 @@ def test_update_then_manual_rollback(
     assert len(pre_sessions_sha) == 64
 
     # 2. Update to bumped version.
-    bumped_ver = _bump_patch(base_ver)
-    bumped = make_bumped_tarball(release_tarball_x86_64, bumped_ver,
-                                 dst_dir=tmp_path)
-    bumped_in_vm = copy_tarball_to_vm(vm, bumped)
-    retag_gateway_image_in_vm(
-        vm,
-        from_tag=f"sandbox-gateway:{base_ver}",
-        to_tag=f"sandbox-gateway:{bumped_ver}",
-    )
+    bumped_ver = version_from_tarball(release_tarball_x86_64_bumped)
+    bumped_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64_bumped)
     r = vm.shell(
         f"sudo sandbox update --from {bumped_in_vm} --yes",
         timeout=300,
@@ -99,11 +85,11 @@ def test_update_then_manual_rollback(
         f"previous_version not recorded: {state!r}"
     )
 
-    # 3. Run the rollback recipe (Spec 5 § 7.2). Verbatim, with a couple
-    # of test-mode adjustments:
-    #   * Step 2 (gateway image inspect) — succeeds because we never
-    #     pruned the v image (and v' is identical bytes anyway in the
-    #     bumped-tarball harness).
+    # 3. Run the rollback recipe (Spec 5 § 7.2). Verbatim, with one
+    # test-mode caveat:
+    #   * Step 2 (gateway image inspect) — succeeds because the base
+    #     install's docker-load left ``sandbox-gateway:<base>`` resident
+    #     in the VM, and the rollback recipe inspects exactly that tag.
     #   * The ``ls -td`` selector picks the newest set with
     #     completed_ok=true; in this test there is exactly one set
     #     and it has completed_ok=true, so it is selected.
@@ -156,15 +142,18 @@ sudo systemctl start sandboxd
     # The daemon is back up.
     wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
     wait_for_socket(vm.name, "/run/sandbox/sandboxd.sock", timeout=60)
-    # /version is served (we don't assert the exact version string —
-    # both base and bumped binaries are the same bytes in this
-    # harness).
+    # /version is served and reports the rolled-back binary's version
+    # (= the base version). With a genuine bumped binary, this pins
+    # the rollback's "the v binary is back on disk" contract.
     ver_probe = vm.shell(
         "sudo curl -fsSL --unix-socket /run/sandbox/sandboxd.sock "
         "http://localhost/version | jq -r .version",
         check=True, timeout=10,
     ).stdout.strip()
-    assert ver_probe, "daemon /version did not return a version string"
+    assert ver_probe == base_ver, (
+        f"daemon /version did not return the base version after rollback: "
+        f"got {ver_probe!r}, expected {base_ver!r}"
+    )
     # Lock file gone (recipe step 8).
     assert vm.shell(
         "sudo test -e /var/lib/sandbox/.update.lock"

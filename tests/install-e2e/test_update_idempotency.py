@@ -12,13 +12,14 @@ Three end-to-end cases against a Lima VM:
   ``manifest.json`` carries ``completed_ok: false`` and survives a
   subsequent successful run's retention prune.
 
-Both tests use a synthesised "bumped" tarball (see
-``conftest.make_bumped_tarball``) — the bumped tarball ships the SAME
-binaries as the base tarball with a rewritten MANIFEST version. The
-daemon's ``/version`` endpoint therefore still reports the base
-version after the update; tests assert on ``install_state`` and the
-backup set's ``manifest.json`` instead (those record the MANIFEST
-version, not the binary's compiled-in version).
+Both tests use a genuine bumped tarball (see
+``conftest.release_tarball_x86_64_bumped``) — the bumped tarball
+ships a binary built from sed-rewritten ``Cargo.toml`` files, so the
+daemon's ``/version`` endpoint reports the bumped version after the
+update. The assertions still land on ``install_state`` and the
+backup set's ``manifest.json`` (those record the MANIFEST version);
+``verify_version`` inside ``sandbox update`` requires the binary's
+compiled-in version to match the MANIFEST or the run aborts.
 """
 
 from __future__ import annotations
@@ -30,25 +31,18 @@ import pytest
 from conftest import (
     copy_tarball_to_vm,
     install_sh_cmd,
-    make_bumped_tarball,
-    retag_gateway_image_in_vm,
     version_from_tarball,
     wait_for_socket,
     wait_for_systemd_active,
 )
 
 
-def _bump_patch(version):
-    parts = version.split(".")
-    if len(parts) != 3:
-        raise AssertionError(f"unexpected version shape: {version}")
-    parts[-1] = str(int(parts[-1]) + 1)
-    return ".".join(parts)
-
-
 @pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
 def test_update_interrupted_then_resumed(
-    distro_template, vm_factory, release_tarball_x86_64, tmp_path
+    distro_template,
+    vm_factory,
+    release_tarball_x86_64,
+    release_tarball_x86_64_bumped,
 ):
     """Inject a transient failure mid-update; the resume run converges.
 
@@ -80,15 +74,8 @@ def test_update_interrupted_then_resumed(
     wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
     wait_for_socket(vm.name, "/run/sandbox/sandboxd.sock", timeout=60)
 
-    bumped_ver = _bump_patch(base_ver)
-    bumped = make_bumped_tarball(release_tarball_x86_64, bumped_ver,
-                                 dst_dir=tmp_path)
-    bumped_in_vm = copy_tarball_to_vm(vm, bumped)
-    retag_gateway_image_in_vm(
-        vm,
-        from_tag=f"sandbox-gateway:{base_ver}",
-        to_tag=f"sandbox-gateway:{bumped_ver}",
-    )
+    bumped_ver = version_from_tarball(release_tarball_x86_64_bumped)
+    bumped_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64_bumped)
 
     # Pre-write a stale lock payload claiming a dead PID. The adoption
     # branch in `lock::acquire` walks "is the holder PID live?" — for
@@ -167,7 +154,10 @@ def test_update_interrupted_then_resumed(
 
 @pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
 def test_update_partial_failure_backup_set_preserved(
-    distro_template, vm_factory, release_tarball_x86_64, tmp_path
+    distro_template,
+    vm_factory,
+    release_tarball_x86_64,
+    release_tarball_x86_64_bumped,
 ):
     """A failure mid-update leaves the backup set with completed_ok=false
     and that set is preserved across the subsequent successful run's
@@ -197,15 +187,8 @@ def test_update_partial_failure_backup_set_preserved(
     vm.shell("sudo systemctl enable --now sandboxd", check=True, timeout=60)
     wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
 
-    bumped_ver = _bump_patch(base_ver)
-    bumped = make_bumped_tarball(release_tarball_x86_64, bumped_ver,
-                                 dst_dir=tmp_path)
-    bumped_in_vm = copy_tarball_to_vm(vm, bumped)
-    retag_gateway_image_in_vm(
-        vm,
-        from_tag=f"sandbox-gateway:{base_ver}",
-        to_tag=f"sandbox-gateway:{bumped_ver}",
-    )
+    bumped_ver = version_from_tarball(release_tarball_x86_64_bumped)
+    bumped_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64_bumped)
 
     # Snapshot the original users.conf so we can restore it after the
     # injected failure. install.sh writes users.conf at § 4.4.17.

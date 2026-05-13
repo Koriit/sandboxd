@@ -25,25 +25,18 @@ import pytest
 from conftest import (
     copy_tarball_to_vm,
     install_sh_cmd,
-    make_bumped_tarball,
-    retag_gateway_image_in_vm,
     version_from_tarball,
     wait_for_socket,
     wait_for_systemd_active,
 )
 
 
-def _bump_patch(version):
-    parts = version.split(".")
-    if len(parts) != 3:
-        raise AssertionError(f"unexpected version shape: {version}")
-    parts[-1] = str(int(parts[-1]) + 1)
-    return ".".join(parts)
-
-
 @pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
 def test_update_air_gapped(
-    distro_template, vm_factory, release_tarball_x86_64, tmp_path
+    distro_template,
+    vm_factory,
+    release_tarball_x86_64,
+    release_tarball_x86_64_bumped,
 ):
     """Install the daemon, drop egress, run `sandbox update --from`.
 
@@ -63,18 +56,10 @@ def test_update_air_gapped(
     wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
     wait_for_socket(vm.name, "/run/sandbox/sandboxd.sock", timeout=60)
 
-    # Pre-stage the bumped tarball (still requires network for tar
-    # operations in pinned mode? No — the build is host-side; copy is
-    # already done by `copy_tarball_to_vm` BEFORE egress drop).
-    bumped_ver = _bump_patch(base_ver)
-    bumped = make_bumped_tarball(release_tarball_x86_64, bumped_ver,
-                                 dst_dir=tmp_path)
-    bumped_in_vm = copy_tarball_to_vm(vm, bumped)
-    retag_gateway_image_in_vm(
-        vm,
-        from_tag=f"sandbox-gateway:{base_ver}",
-        to_tag=f"sandbox-gateway:{bumped_ver}",
-    )
+    # Pre-stage the bumped tarball BEFORE egress drop. The tarball is
+    # built host-side and copied into the VM here.
+    bumped_ver = version_from_tarball(release_tarball_x86_64_bumped)
+    bumped_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64_bumped)
 
     # Warm up iptables.
     vm.shell(

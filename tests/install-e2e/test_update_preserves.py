@@ -13,10 +13,13 @@ Two preservation contracts are exercised end-to-end:
   update's config-migration step must roll the schema forward without
   dropping the custom line (Spec 1 § 5.5 Input C → Output C').
 
-  CAVEAT: with the single-version tarball harness no real migration
-  fires (the registry has only V001 which install.sh's `users.conf`
-  template already lands at). This test pins the *observable*
-  invariant — the file is identical pre and post update.
+  CAVEAT: the bumped tarball is built from a patch-bumped Cargo.toml,
+  not a Cargo.toml that registers a new V002 migration, so the
+  framework's apply chain is a no-op across this update. The test
+  pins the *observable* invariant — the operator's custom subnet
+  line survives the update — which is the user-facing contract Spec 1
+  § 5.5 commits to. V001→V002 chaining is exercised by the unit and
+  integration migration tests.
 """
 
 from __future__ import annotations
@@ -28,19 +31,8 @@ import pytest
 from conftest import (
     copy_tarball_to_vm,
     install_sh_cmd,
-    make_bumped_tarball,
-    retag_gateway_image_in_vm,
-    version_from_tarball,
     wait_for_systemd_active,
 )
-
-
-def _bump_patch(version):
-    parts = version.split(".")
-    if len(parts) != 3:
-        raise AssertionError(f"unexpected version shape: {version}")
-    parts[-1] = str(int(parts[-1]) + 1)
-    return ".".join(parts)
 
 
 def _sh_quote(s):
@@ -49,7 +41,10 @@ def _sh_quote(s):
 
 @pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
 def test_update_preserves_systemd_drop_in(
-    distro_template, vm_factory, release_tarball_x86_64, tmp_path
+    distro_template,
+    vm_factory,
+    release_tarball_x86_64,
+    release_tarball_x86_64_bumped,
 ):
     """A systemd drop-in survives the update bit-for-bit.
 
@@ -60,7 +55,6 @@ def test_update_preserves_systemd_drop_in(
     """
     vm = vm_factory(distro_template)
     base_tarball = copy_tarball_to_vm(vm, release_tarball_x86_64)
-    base_ver = version_from_tarball(base_tarball)
 
     r = vm.shell(install_sh_cmd(base_tarball), timeout=600)
     assert r.returncode == 0
@@ -89,16 +83,8 @@ def test_update_preserves_systemd_drop_in(
     ).stdout.strip()
     assert len(pre_sha) == 64
 
-    # Run a synthesised update (bumped MANIFEST version).
-    bumped_ver = _bump_patch(base_ver)
-    bumped = make_bumped_tarball(release_tarball_x86_64, bumped_ver,
-                                 dst_dir=tmp_path)
-    bumped_in_vm = copy_tarball_to_vm(vm, bumped)
-    retag_gateway_image_in_vm(
-        vm,
-        from_tag=f"sandbox-gateway:{base_ver}",
-        to_tag=f"sandbox-gateway:{bumped_ver}",
-    )
+    # Run the update against a genuine bumped tarball.
+    bumped_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64_bumped)
     r = vm.shell(
         f"sudo sandbox update --from {bumped_in_vm} --yes",
         timeout=300,
@@ -127,7 +113,10 @@ def test_update_preserves_systemd_drop_in(
 
 @pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
 def test_update_preserves_customized_users_conf(
-    distro_template, vm_factory, release_tarball_x86_64, tmp_path
+    distro_template,
+    vm_factory,
+    release_tarball_x86_64,
+    release_tarball_x86_64_bumped,
 ):
     """A custom subnet added to users.conf survives the update.
 
@@ -146,7 +135,6 @@ def test_update_preserves_customized_users_conf(
     """
     vm = vm_factory(distro_template)
     base_tarball = copy_tarball_to_vm(vm, release_tarball_x86_64)
-    base_ver = version_from_tarball(base_tarball)
 
     r = vm.shell(install_sh_cmd(base_tarball), timeout=600)
     assert r.returncode == 0
@@ -176,16 +164,8 @@ def test_update_preserves_customized_users_conf(
         check=True, timeout=10,
     )
 
-    # Run the synthesised update.
-    bumped_ver = _bump_patch(base_ver)
-    bumped = make_bumped_tarball(release_tarball_x86_64, bumped_ver,
-                                 dst_dir=tmp_path)
-    bumped_in_vm = copy_tarball_to_vm(vm, bumped)
-    retag_gateway_image_in_vm(
-        vm,
-        from_tag=f"sandbox-gateway:{base_ver}",
-        to_tag=f"sandbox-gateway:{bumped_ver}",
-    )
+    # Run the update against a genuine bumped tarball.
+    bumped_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64_bumped)
     r = vm.shell(
         f"sudo sandbox update --from {bumped_in_vm} --yes",
         timeout=300,
