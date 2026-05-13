@@ -15,17 +15,17 @@ M16-S5. Format follows
 |------|-------:|------------:|-----------------:|-----------------:|---------:|
 | P0 — Sequence context (§ 0)                       |  4 |  4 |  0 | 0 | 0 |
 | P1 — Motivation (§ 1)                             |  4 |  4 |  0 | 0 | 0 |
-| P2 — CLI surface (§ 2)                            | 30 | 27 |  2 | 1 | 0 |
-| P3 — Update flow (§ 3)                            | 64 | 60 |  0 | 4 | 0 |
+| P2 — CLI surface (§ 2)                            | 30 | 29 |  0 | 1 | 0 |
+| P3 — Update flow (§ 3)                            | 64 | 63 |  0 | 1 | 0 |
 | P4 — Config-migration framework (§ 4)             | 31 | 31 |  0 | 0 | 0 |
 | P5 — Backup mechanics (§ 5)                       | 14 | 14 |  0 | 0 | 0 |
 | P6 — Lock file (§ 6)                              | 18 | 18 |  0 | 0 | 0 |
-| P7 — Documented rollback recipe (§ 7)             | 14 | 14 |  0 | 0 | 0 |
-| P8 — `sandbox rebuild-image` subcommand (§ 8)     |  8 |  8 |  0 | 0 | 0 |
+| P7 — Documented rollback recipe (§ 7)             | 14 | 13 |  1 | 0 | 0 |
+| P8 — `sandbox rebuild-image` subcommand (§ 8)     |  8 |  6 |  2 | 0 | 0 |
 | P9 — Test plan (§ 9)                              | 38 | 37 |  0 | 1 | 0 |
 | P10 — Risks / open questions (§ 10)               |  8 |  7 |  0 | 1 | 0 |
 | P11 — Backward compatibility — dev mode (§ 11)    |  4 |  4 |  0 | 0 | 0 |
-| **Grand total (Spec 5 § 1–11)**                  | **237** | **228** | **2** | **7** | **0** |
+| **Grand total (Spec 5 § 1–11)**                  | **237** | **230** | **3** | **4** | **0** |
 
 Part 2 (Arc-level forward constraints), Part 3 (§ 12 out-of-scope greps),
 Part 4 (§ 3.3 preserved-artefacts greps), and Part 5 (known-gap
@@ -90,7 +90,7 @@ reconciliation) appear below the per-section tables.
 | # | Claim | Status | Code | Test |
 |---|-------|--------|------|------|
 | P2.19 | `--dry-run` prints same data as `--check` plus 18-step plan | (a) | `sandboxd/sandbox-cli/src/update/mod.rs:653 render_dry_run` (lines 720-742 list all 18 steps) | `tests/install-e2e/test_update_check.py:119` |
-| P2.20 | Each step rendered as `would execute` / `would skip` | (a) | `sandboxd/sandbox-cli/src/update/mod.rs:741` `would execute` line (`would skip` short-circuit deferred per todo #171) | Inspection |
+| P2.20 | Each step rendered as `would execute` / `would skip` | (c) | `sandboxd/sandbox-cli/src/update/mod.rs:741` renders flat `would execute`; per-step `would skip` short-circuit deferred per **todo #171** MAY-FIX sweep (stateful-step skip-on-match computation). → M16+ | Inspection — `would execute` rendering exercised by `tests/install-e2e/test_update_check.py:119` |
 | P2.21 | `--dry-run` requires sudo only insofar as it reads mode-0640 state file; degrades gracefully when un-readable | (a) | `sandboxd/sandbox-cli/src/update/mod.rs:159-169 read_install_state` returns `Ok(None)` on `PermissionDenied`; read-only modes fall back via `InstallState::unknown_with_host_arch` (`:129-138`) | `tests/install-e2e/test_update_check.py:119 test_update_dry_run_does_not_mutate` |
 | P2.22 | `--dry-run` exit code: 0 if plan consistent, 1 if pre-flight blocks | (a) | `sandboxd/sandbox-cli/src/update/mod.rs:1039-1052` disk-fail returns 1; success path returns 0 at the end of `--dry-run` short-circuit | Inspection — flow gate |
 
@@ -115,11 +115,9 @@ reconciliation) appear below the per-section tables.
 | # | Claim | Status | Code | Test |
 |---|-------|--------|------|------|
 | P2.29 | Same file as install.sh/uninstall.sh; second token distinguishes (install.sh, uninstall.sh, sandbox-update) | (a) | `sandboxd/sandbox-cli/src/update/mod.rs:2378` `format!("{} sandbox-update step={step} ...")` | Arc-level Part 2 row 6 below verifies token shape; spot-check below |
-| P2.30 | Sharing rationale (one file per host, shared format, logrotate parity) | (b) | Spec § 2.6 prose; no code artifact required — discussion of design choice (and § 12 doesn't carry separate `/var/log/sandbox-update.log`; "log rotation control by operator" / `sandbox update --downgrade` etc. are scoped out) | n/a — narrative |
+| P2.30 | Sharing rationale (one file per host, shared format, logrotate parity) | (a) | `sandboxd/sandbox-cli/src/update/mod.rs:2375 log_step` writes to `/var/log/sandbox-install.log` (the install-script log), not a separate update log; grep `grep -rE 'sandbox-update\.log\|sandbox-update.log' sandboxd/sandbox-cli/src/` → 0 matches — the absence-of-separate-log IS the contract. Sharing implemented by reusing the install-log writer + `sandbox-update` second token (P2.29) | Inspection — Part 2 row 6 (arc-level) verifies the token shape against Spec 4 § 4.6 |
 
-(P2.30 maps to (b) by spec § 12 / § 2.6 framing: the design declines to introduce a separate log file. This is the only § 2.* prose claim that lacks a code artefact; the absence-of-separate-log IS the contract.)
-
-(P2.20 partially mapped: spec § 2.3 has the `(sandbox: skip — sha256 match / sandboxd: install / sandbox-route-helper: install)` per-step sub-annotation, which is `would skip` granularity. Implementation renders flat `would execute` rather than per-binary skip; tracked as **todo #171** MAY-FIX sweep (item: stateful-step skip-on-match computation).)
+(P2.30 maps to (a) via the absence-of-separate-log contract: the implementation writes through the install-script log path with a `sandbox-update` second token rather than introducing `/var/log/sandbox-update.log`. Format-wise, P2.30 is not § 12-scoped — § 12 declines a number of other features but does not bullet this sharing choice; the code-side absence is the binding artefact.)
 
 (P2.21 partial: spec § 2.3 says "neither mode hard-exits on a missing state file", which the implementation honours (`Ok(None)` → `unknown_with_host_arch`). The "`--dry-run` does not invoke any `sudo -k` calls" — strictly true for the read-only short-circuit at `:1023-1024`. Tracked under (a).)
 
@@ -215,9 +213,9 @@ absent from `sandbox-cli/src/update/**/*.rs`.
 | P3.63 | Migration apply mid-flight failure → file at version of last successful migration; daemon refuses to start; operator re-runs or rolls back | (a) | `sandboxd/sandbox-cli/src/update/migrate.rs:92 apply_file_chain` (per-step atomic write) + daemon refusal at `sandboxd/sandbox-core/src/users_conf.rs:222 validate_users_conf_schema_version` | `sandboxd/sandbox-cli/src/cfg_migrations/mod.rs:614 apply_pending_atomic_write_visible_only_after_complete` |
 | P3.64 | Refinery DB migration failure on next daemon start → daemon refuses; doctor C1 reports; recovery via § 7.2 rollback | (a) | Refinery semantics via `sandbox-core/src/store.rs:18 embed_migrations!`; doctor C1 at `sandbox-cli/src/doctor.rs`; rollback recipe at spec § 7.2 | Spec 2 § 7.1 + Spec 3 § 6.2 delivery rows; integration test `sandboxd/sandboxd/tests/integration_schema_mismatch_refusal.rs:107` covers the daemon-side refusal class |
 
-(P3.34 maps to (c) tracked-todo: **todo #170** captures the spec-text reordering pass; implementation is correct as-shipped. The remaining (c) rows are P3.16's downstream — specifically the cosign integration test gap **todo #172**, the dev-mode 4-criterion check / log-step gaps under **todo #171**, and the WAL-checkpoint review under **todo #167**.)
+(P3.34 maps to (c) tracked-todo: **todo #170** captures the spec-text reordering pass; implementation is correct as-shipped. Other Spec-5 follow-on todos that touch § 3 rows (#167 WAL-checkpoint review on P3.19, #171 MAY-FIX sweep items, #172 cosign integration test on P3.13) are cross-referenced in Part 5 — those rows ship (a) per spec contract; the todos capture incremental hardening, not unshipped behaviour.)
 
-Spec 5 § 3 has 64 numbered or paragraph-anchored claims; 60 ship, 4 are tracked as todos (#167, #170, #171, #172).
+Spec 5 § 3 has 64 numbered or paragraph-anchored claims; 63 ship, 1 is tracked as a todo (#170 — P3.34 spec-text reorder).
 
 ---
 
@@ -462,7 +460,7 @@ Spec 5 § 3 has 64 numbered or paragraph-anchored claims; 60 ship, 4 are tracked
 | P9.6 | `test_update_concurrent_refused` | (a) | `tests/install-e2e/test_update_concurrent_refused.py:34 test_update_concurrent_refused` | self |
 | P9.7 | `test_update_preserves_customized_users_conf` | (a) | `tests/install-e2e/test_update_preserves.py:115 test_update_preserves_customized_users_conf` | self |
 | P9.8 | `test_update_preserves_systemd_drop_in` | (a) | `tests/install-e2e/test_update_preserves.py:43 test_update_preserves_systemd_drop_in` | self |
-| P9.9 | `test_update_with_recreate_session_classification` | (c) | Implementation gap captured at **todo #166** — `--dry-run` per-session classification ships via `--dump-proto-version` (P3.10) but the E2E variant is in design-only form; runtime arm already covered by `sandboxd/sandboxd/tests/integration_guest_refresh.rs`. → M16+ | The dry-run classification machinery itself is exercised by `sandboxd/sandbox-cli/src/update/mod.rs:2921 version_lifecycle_check_then_dry_run_then_apply`; the E2E recreate test remains deferred per todo #166 |
+| P9.9 | `test_update_with_recreate_session_classification` | (c) | E2E test gap captured at **todo #174** — `--dry-run` per-session classification ships via `--dump-proto-version` (P3.10) and `classify_stopped_sessions` (P3.9); runtime arm already covered by `sandboxd/sandboxd/tests/integration_guest_refresh.rs`. The only outstanding piece is the end-to-end variant in `tests/install-e2e/`. → M16+ | The dry-run classification machinery itself is exercised by `sandboxd/sandbox-cli/src/update/mod.rs:2921 version_lifecycle_check_then_dry_run_then_apply`; the E2E recreate test remains deferred per todo #174 |
 | P9.10 | `test_update_rejects_dev_install` | (a) | `tests/install-e2e/test_update_rejects_dev_install.py:24 test_update_rejects_dev_install` | self |
 | P9.11 | `test_update_backup_retention_prunes_oldest` + `test_update_partial_failure_backup_set_preserved` | (a) | `tests/install-e2e/test_update_backup_retention.py:36 test_update_backup_retention_prunes_oldest` + `tests/install-e2e/test_update_idempotency.py:236 test_update_partial_failure_backup_set_preserved` | self |
 
@@ -562,13 +560,14 @@ of `sandboxd/sandbox-core/src/users_conf.rs`).
 | OOS2 | Automatic periodic lite image rebuild | `grep -rE 'periodic|cron|systemd-run' sandboxd/sandbox-cli/src/update/ sandboxd/sandbox-cli/src/cfg_migrations/` | **absent** — operator self-service per § 8.3 |
 | OOS3 | CHANGELOG / release notes display | `grep -rE 'CHANGELOG|release.notes|release.body' sandboxd/sandbox-cli/src/update/` | **absent** — no fetch/display of release notes in update flow |
 | OOS4 | CLI-side telemetry / phone-home | `grep -rE 'telemetry|phone[._]?home' sandboxd/sandbox-cli/src/` | **absent** — only outbound calls are GH Releases + sigstore (all opt-out via `--from`/`--cosign-bundle`) |
-| OOS5 | Cross-machine update orchestration | `grep -rE 'cluster|fleet|orchestration' sandboxd/sandbox-cli/src/update/` | **absent** — per-host lock per `/var/lib/sandbox/.update.lock` |
+| OOS5 | Cross-machine update orchestration | `grep -rE 'cluster|fleet|orchestration' sandboxd/sandbox-cli/src/update/` | **no flag/code present** — only matches are doc-comment uses of "orchestration" (e.g. `update/mod.rs:1`, `:244`, `:1243`, `:1346`) describing the single-host stateful pipeline; per-host lock at `/var/lib/sandbox/.update.lock` is the only coordination primitive |
 | OOS6 | `sandbox update --downgrade` | `grep -rE 'downgrade|--downgrade' sandboxd/sandbox-cli/src/update/ sandboxd/sandbox-cli/src/main.rs` | **absent** — clap surface has no `--downgrade`; tracked under todo #171 for an explicit refusal gate at the version-compare site |
 | OOS7 | DB schema downgrade | `grep -rE 'down\.sql|reverse.migration' sandboxd/sandbox-core/migrations/ sandboxd/sandbox-cli/src/cfg_migrations/` | **absent** — refinery is forward-only; no `down.sql` files exist |
-| OOS8 | `--pre-flight` separate flag | `grep -rE 'pre.flight|--pre-flight' sandboxd/sandbox-cli/src/main.rs sandboxd/sandbox-cli/src/update/` | **absent** — subsumed by `--check` + `--dry-run` |
+| OOS8 | `--pre-flight` separate flag | `grep -rE 'pre.flight|--pre-flight' sandboxd/sandbox-cli/src/main.rs sandboxd/sandbox-cli/src/update/` | **no flag present** — matches are doc-comment references describing the § 3.1 pre-flight phase (e.g. `main.rs:391,400,493,1103,1327`, `update/mod.rs:3,99,284,327,…`); no clap surface introduces a separate `--pre-flight` argument. Subsumed by `--check` + `--dry-run` |
 | OOS9 | `down` migrations in config framework | `grep -rE 'down_version|down_apply|reverse_apply' sandboxd/sandbox-cli/src/cfg_migrations/` | **absent** — `ConfigMigration` trait has only `apply`, no `revert`/`down` |
+| OOS10 | Modifying the gateway image build process | `grep -rE 'docker build|image build|networking/Dockerfile|gateway.*build|make gateway-image' sandboxd/sandbox-cli/src/update/ sandboxd/sandbox-cli/src/cfg_migrations/` | **no build invocation present** — only hit is the dev-mode refusal text at `sandboxd/sandbox-cli/src/update/mod.rs:204` ("`make gateway-image` rebuilds the gateway image") which points dev operators at the dev-mode workflow. Spec 5's update path loads the CI-built gateway image via `docker load` (§ 3.2.20), never builds it; `make gateway-image` is dev-mode only per spec § 12 |
 
-All nine out-of-scope items are verified absent from newly-added Spec 5 code paths.
+All ten out-of-scope items are verified absent from newly-added Spec 5 code paths.
 
 ---
 
@@ -607,7 +606,8 @@ Cross-reference of all `progress` todos tagged as Spec-5 follow-ons:
 | #163 | Lima 2.1.1 fedora-40/41 spec-wording | n/a (Spec 4 E2E side) | M16+ |
 | #164 | tests/install-e2e/conftest.py cosign patch-out spec-replay verification | n/a (Spec 4 E2E side) | M16+ |
 | #165 | install.sh `--from` requires `--version` — `--help` clarification | n/a (install.sh side) | M16+ |
-| #166 | `sandbox update --dry-run` per-session compat classification — E2E variant | P9.9 row | M16+ — runtime arm covered by `integration_guest_refresh.rs` |
+| #166 | `sandbox update --dry-run` per-session compat classification — CLI surface | (closed M16-S4 — superseded by #174 for the E2E variant) | done |
+| #174 | E2E `test_update_with_recreate_session_classification` — install-e2e variant | P9.9 row | M16+ — runtime arm covered by `integration_guest_refresh.rs` |
 | #167 | `sandbox update` WAL-checkpoint of `sessions.db` before backup | P3.19 (sessions.db backup) — production correctness gap, not blocking | M16+ |
 | #168 | release_tarball_x86_64 base-fixture cache invalidation | n/a (E2E test infra) | M16+ |
 | #169 | sandbox-user `nologin` landmine docs for test authors | n/a (test infra) | M16+ |
@@ -623,12 +623,12 @@ All Spec-5-related todos mapped to delivery rows or scoped outside Spec 5.
 
 | Category       | Count |
 |----------------|------:|
-| (a) shipped     | 228 |
-| (b) out-of-scope |   2 |
-| (c) tracked-todo |   7 |
+| (a) shipped     | 230 |
+| (b) out-of-scope |   3 |
+| (c) tracked-todo |   4 |
 | BLOCKER         |   0 |
 | Arc-level checks |   6 |
-| § 12 out-of-scope greps |   9 |
+| § 12 out-of-scope greps |  10 |
 | § 3.3 preserved-artefacts greps |   9 |
 
 Conjunctive hard gate: **PASS** — zero BLOCKERs, every concrete claim in Spec 5 §§ 1–11 has a code/test locator or an out-of-scope citation; every arc-level forward constraint from Specs 1–4 is honoured by a `file:line` locator; every § 12 out-of-scope item is grep-confirmed absent from newly-added code paths; every § 3.3 preserved-artefact is grep-confirmed untouched.
