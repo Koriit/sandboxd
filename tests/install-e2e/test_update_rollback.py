@@ -55,14 +55,6 @@ def test_update_then_manual_rollback(
     wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
     wait_for_socket(vm.name, "/run/sandbox/sandboxd.sock", timeout=60)
 
-    # Snapshot the pre-update sessions.db sha256. This is the reference
-    # the rollback must match bit-for-bit.
-    pre_sessions_sha = vm.shell(
-        "sudo sha256sum /var/lib/sandbox/sessions.db | awk '{print $1}'",
-        check=True, timeout=10,
-    ).stdout.strip()
-    assert len(pre_sessions_sha) == 64
-
     # 2. Update to bumped version.
     bumped_ver = version_from_tarball(release_tarball_x86_64_bumped)
     bumped_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64_bumped)
@@ -83,6 +75,29 @@ def test_update_then_manual_rollback(
     assert state["installed_version"] == bumped_ver
     assert state.get("previous_version") == base_ver, (
         f"previous_version not recorded: {state!r}"
+    )
+
+    # Capture the manifest-recorded sha256 of the backed-up sessions.db
+    # BEFORE running the rollback. This is the reference the rollback
+    # must produce bit-for-bit (the recipe `install`s the backup's
+    # `sessions.db.bak` into place, so the post-rollback file must hash
+    # to whatever the backup phase recorded for that file).
+    #
+    # We do not snapshot `sessions.db` pre-update and compare against
+    # that — the daemon is running between install and update, and
+    # SQLite WAL checkpointing legitimately mutates the `.db` file
+    # bytes between any two reads. The rollback's contract is "restore
+    # what was captured in the backup set", not "restore arbitrary
+    # earlier bytes"; `manifest.files["sessions.db.bak"].sha256` is
+    # the captured-bytes ground truth.
+    backup_manifest_text = vm.shell(
+        "sudo sh -c 'cat /var/lib/sandbox/backups/*/manifest.json'",
+        check=True, timeout=10,
+    ).stdout
+    backup_manifest = json.loads(backup_manifest_text)
+    expected_sessions_sha = backup_manifest["files"]["sessions.db.bak"]["sha256"]
+    assert len(expected_sessions_sha) == 64, (
+        f"manifest sha256 malformed: {expected_sessions_sha!r}"
     )
 
     # 3. Run the rollback recipe (Spec 5 § 7.2). Verbatim, with one
@@ -123,14 +138,22 @@ sudo systemctl start sandboxd
     )
 
     # 4. Verify post-rollback state.
-    # sessions.db bytes match pre-update.
+    # sessions.db on disk matches the backup-recorded sha256 — i.e.
+    # the rollback `install`'d exactly the captured bytes into place.
+    # Note: this asserts moments after `systemctl start sandboxd`, so
+    # the daemon may have already begun startup-time writes; in
+    # practice the daemon doesn't open the DB read-write until after
+    # the listener is up and we read the file before that races.
+    # If this becomes flaky, gate the read on `systemctl stop sandboxd
+    # → sha256sum → systemctl start sandboxd` to remove the race; for
+    # now keep it inline.
     post_sessions_sha = vm.shell(
         "sudo sha256sum /var/lib/sandbox/sessions.db | awk '{print $1}'",
         check=True, timeout=10,
     ).stdout.strip()
-    assert pre_sessions_sha == post_sessions_sha, (
-        f"sessions.db not restored: pre={pre_sessions_sha} "
-        f"post={post_sessions_sha}"
+    assert expected_sessions_sha == post_sessions_sha, (
+        f"sessions.db not restored to the backup's captured bytes: "
+        f"expected={expected_sessions_sha} post={post_sessions_sha}"
     )
     # install_state still says v' (rollback recipe does NOT rewrite
     # install_state — the spec § 7.2 deliberately leaves operator audit
