@@ -16,14 +16,6 @@ The bumped binary's ``/version`` endpoint reports the bumped
 version literally, so ``test_update_fresh_install_to_next_version``
 can assert "daemon at v' after the upgrade" against the genuine
 binary output.
-
-``test_update_with_recreate_session_classification`` is the second
-test from this file's earlier ``_skipped`` incarnation. It remains
-skipped because the recreate-classification arm it asserts on
-does not exist in the CLI ``--dry-run`` output yet — the gap is
-documented in a handoff file (see ``HANDOFF_FILE`` constant
-below). The skip is loud + points at the handoff so the
-remaining work is visible in CI output.
 """
 
 from __future__ import annotations
@@ -38,12 +30,6 @@ from conftest import (
     version_from_tarball,
     wait_for_socket,
     wait_for_systemd_active,
-)
-
-
-HANDOFF_FILE = (
-    ".tasks/handoffs/20260513-093711-install-e2e-"
-    "recreate-classification-cli-gap.md"
 )
 
 
@@ -134,30 +120,4 @@ def test_update_fresh_install_to_next_version(
     )
     assert state["installed_version"] == bumped_ver, (
         f"install-state did not advance to {bumped_ver}: {state!r}"
-    )
-
-
-@pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
-def test_update_with_recreate_session_classification(
-    distro_template, vm_factory, release_tarball_x86_64
-):
-    """Session classified `recreate` when guest proto advances — CLI gap.
-
-    The skip rationale moved out of the inline string into a handoff
-    file because the gap is broader than "needs a bumped
-    DAEMON_GUEST_PROTO_VERSION": the CLI's ``--dry-run`` renderer
-    emits an aggregate ``stopped sessions compat: N sessions`` line
-    only — there is no per-session classification verb (`recreate` /
-    `refresh-in-place`) to assert on. Even with a v' binary whose
-    proto-version differs, the output would be identical to v's, so
-    the test premise has no observable hook.
-
-    Resolving this requires either extending the CLI (option A) or
-    reframing the test against the daemon's start-session arm
-    (option B); both options are documented in the handoff.
-    """
-    pytest.skip(
-        f"requires CLI extension to emit per-session recreate "
-        f"classification in `sandbox update --dry-run` output. See {HANDOFF_FILE} "
-        f"for both proposed resolutions (CLI extension or test reframing)."
     )
