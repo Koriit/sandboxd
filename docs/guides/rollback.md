@@ -12,9 +12,11 @@ There is no automated `sandbox rollback` subcommand in this release. The rationa
 Backup sets are timestamped directories under `/var/lib/sandbox/backups/`. Each ships a `manifest.json` recording from/to versions, arch, and a per-file sha256 of the captured bytes.
 
 ```bash
-sudo -u sandbox ls -ld /var/lib/sandbox/backups/*/
-sudo -u sandbox jq -r '"\(.from_version) → \(.to_version) (completed_ok=\(.completed_ok))"' \
-    /var/lib/sandbox/backups/*/manifest.json
+# The backups directory is mode 0700 sandbox:sandbox, so the glob has
+# to expand inside a shell running as the sandbox user. The `sh -c`
+# wrapper is what gives the shell access to traverse the directory.
+sudo -u sandbox sh -c 'ls -ld /var/lib/sandbox/backups/*/'
+sudo -u sandbox sh -c 'jq -r "\"\(.from_version) → \(.to_version) (completed_ok=\(.completed_ok))\"" /var/lib/sandbox/backups/*/manifest.json'
 ```
 
 The most-recent set with `completed_ok: true` is the default target — it captures the state immediately before the last successful upgrade. Sets with `completed_ok: false` are forensic (a failed or interrupted upgrade) — restorable but the operator should understand they correspond to an aborted upgrade rather than a clean checkpoint.
@@ -25,7 +27,10 @@ Copy-paste verbatim. Every step is announced before its `sudo`; review what is a
 
 ```bash
 # 1. Identify the backup set to restore. Default: most-recent successful set.
-BACKUP_DIR=$(sudo -u sandbox ls -td /var/lib/sandbox/backups/*/ \
+#    The outer `sh -c` wrapping is required: `/var/lib/sandbox/backups/`
+#    is mode 0700 sandbox:sandbox, and the glob has to expand inside a
+#    shell running as the sandbox user.
+BACKUP_DIR=$(sudo -u sandbox sh -c 'ls -td /var/lib/sandbox/backups/*/' \
                | xargs -I{} sudo -u sandbox sh -c \
                    'test "$(jq -r .completed_ok < "{}/manifest.json")" = "true" && echo "{}"' \
                | head -1)

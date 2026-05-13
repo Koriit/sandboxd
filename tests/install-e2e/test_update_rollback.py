@@ -95,7 +95,7 @@ def test_update_then_manual_rollback(
     #     and it has completed_ok=true, so it is selected.
     rollback_recipe = r"""
 set -eux
-BACKUP_DIR=$(sudo -u sandbox ls -td /var/lib/sandbox/backups/*/ \
+BACKUP_DIR=$(sudo -u sandbox sh -c 'ls -td /var/lib/sandbox/backups/*/' \
                | xargs -I{} sudo -u sandbox sh -c \
                    'test "$(jq -r .completed_ok < "{}/manifest.json")" = "true" && echo "{}"' \
                | head -1)
