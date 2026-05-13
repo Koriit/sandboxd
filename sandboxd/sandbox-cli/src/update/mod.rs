@@ -812,6 +812,16 @@ pub async fn run(args: UpdateArgs) -> i32 {
 
     // ----- Full-update path (no flags) -----
 
+    // § 3.1.5 up-to-date short-circuit — this MUST run before any
+    // pre-flight gate (§ 3.1.6 active sessions, § 3.1.8 disk, ...).
+    // An operator already at the target version should see the no-op
+    // fast path, not an active-sessions refusal that only applies
+    // when there is actually work to do.
+    if matches!(compare, VersionCompare::UpToDate) {
+        println!("Status: up to date");
+        return 0i32;
+    }
+
     // § 3.1.6 — active sessions check.
     if session_counts.reachable && session_counts.active > 0 && !args.force {
         eprintln!(
@@ -823,12 +833,6 @@ pub async fn run(args: UpdateArgs) -> i32 {
             session_counts.active
         );
         return 1i32;
-    }
-
-    // Up-to-date short-circuit (§ 3.1.5).
-    if matches!(compare, VersionCompare::UpToDate) {
-        println!("Status: up to date");
-        return 0i32;
     }
 
     // § 3.1.8 — disk space.
