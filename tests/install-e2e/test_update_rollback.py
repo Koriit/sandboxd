@@ -20,6 +20,7 @@ import json
 import pytest
 
 from conftest import (
+    assert_doctor_passes,
     copy_tarball_to_vm,
     install_sh_cmd,
     version_from_tarball,
@@ -181,3 +182,11 @@ sudo systemctl start sandboxd
     assert vm.shell(
         "sudo test -e /var/lib/sandbox/.update.lock"
     ).returncode != 0, "lock file should be removed by rollback recipe"
+
+    # Spec § 7.2 step 10 — rollback recipe ends with sandbox doctor;
+    # doctor must pass regardless of install_state/version skew. The
+    # rollback leaves install_state.installed_version pointing at the
+    # bumped version while /version (and the binary on disk) report
+    # the rolled-back base version; doctor's green-light gate is the
+    # spec-mandated recipe terminator and must succeed under that skew.
+    assert_doctor_passes(vm)
