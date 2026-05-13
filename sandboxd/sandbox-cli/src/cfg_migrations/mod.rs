@@ -181,7 +181,7 @@ pub fn latest_for(file: TargetFile) -> u32 {
 // ---------------------------------------------------------------------------
 
 /// One entry in the JSON output of `sandbox --dump-migration-set`. The
-/// shape is the operator-stable contract M16-S2's `--dry-run`
+/// shape is the operator-stable contract the update `--dry-run`
 /// stopped-session classification depends on; field names are pinned
 /// here so future migrations can be added without renaming keys.
 #[derive(Debug, Clone, serde::Serialize)]

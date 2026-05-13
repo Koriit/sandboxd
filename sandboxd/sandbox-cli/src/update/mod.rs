@@ -184,7 +184,7 @@ pub fn is_dev_mode(systemd_unit: &Path, install_state: &Path) -> bool {
         // we cannot escalate from Rust without external help, so a
         // missing file (regardless of mode) trips dev-mode here. The
         // outer shell wrapper around `sandbox update` can elevate
-        // before invoking the CLI when needed (M16-S3 wires that).
+        // before invoking the CLI when needed.
         return true;
     }
     false
@@ -714,9 +714,8 @@ pub fn render_dry_run<W: Write>(
     writeln!(out, "Stateful (§ 3.2) — would execute:")?;
     // The 18 stateful steps, in spec order. Per § 2.3 the verdict is
     // either "would execute" or "would skip" — we render every step as
-    // "would execute" here since M16-S2 does not yet compute the
-    // skip-on-match optimization (M16-S3 wires the idempotency
-    // shortcuts).
+    // "would execute" here because the skip-on-match (idempotency
+    // shortcut) computation is not yet implemented.
     let steps: [(&str, &str); 18] = [
         ("§ 3.2.13", "acquire lock"),
         ("§ 3.2.14", "stop daemon"),
@@ -955,15 +954,11 @@ pub async fn run(args: UpdateArgs) -> i32 {
         }
     };
 
-    // § 3.1.4 — target-version resolution. Without network access for
-    // M16-S2 we resolve via three deterministic paths:
+    // § 3.1.4 — target-version resolution. Three paths:
     //   1. `--from <tarball>` → read MANIFEST.version from the local
     //      tarball; no network call.
     //   2. `--version <v>` → use that string verbatim.
-    //   3. `latest` (default) → without the network probe the
-    //      authoritative answer is unknown; for `--check` we emit
-    //      "available: unknown" and exit `1`; for the full path
-    //      M16-S3 wires the GH Releases API.
+    //   3. `latest` (default) → query the GitHub Releases API.
     let target_version = match resolve_target_version(&args, &state) {
         Ok(v) => v,
         Err(msg) => {
@@ -1180,7 +1175,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
 
     // § 3.1.12 — confirmation prompt.
     // The sticky `was_running` is sampled here from the live systemd
-    // probe (the lock isn't acquired yet — that's M16-S3).
+    // probe (the lock isn't acquired yet — that happens in § 3.2.13).
     let daemon_was_running = systemctl_is_active("sandboxd");
     let summary = render_confirmation_summary(
         &state.installed_version,
@@ -2082,7 +2077,7 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
 /// returning a [`fetch::StagedTarball`]. Three paths:
 ///
 /// * `--from <directory>` — used as-is; we wrap it in a `StagedTarball`
-///   shape directly. (Tests + the M16-S2 pre-extracted layout flow.)
+///   shape directly. (Tests + the pre-extracted layout flow.)
 /// * `--from <tarball.tar.gz>` — `tar -xzf` into a tempdir.
 /// * No `--from` — refuse for now. Network downloads through
 ///   `curl` are scoped for a follow-up; operators in production
@@ -2413,8 +2408,8 @@ fn log_step(step: &str, fields: &str) {
 ///    encoded version is the authoritative answer (the filename is
 ///    operator-controlled and can lie; the MANIFEST is signed).
 /// 2. `--from <directory>` — read `<dir>/MANIFEST` directly. This
-///    path is exercised by the unit tests and the M16-S2 era
-///    pre-extracted layouts (still supported).
+///    path is exercised by the unit tests and the pre-extracted
+///    layout flow.
 /// 3. `--version <v>` (anything other than `latest`) — verbatim.
 /// 4. `latest` (default) — `curl
 ///    https://api.github.com/repos/Koriit/sandboxd/releases/latest`.
@@ -2764,7 +2759,7 @@ mod tests {
 
     /// `render_confirmation_summary` renders the operator-visible
     /// three-bucket breakdown when the per-session classification was
-    /// computed; this pins the prompt shape the M16-S4 spec § 2.4
+    /// computed; this pins the prompt shape Spec 5 § 2.4
     /// recreate-classification contract calls for.
     #[test]
     fn confirmation_summary_renders_three_bucket_breakdown() {
@@ -2913,7 +2908,7 @@ mod tests {
         assert!(err.contains("MANIFEST arch mismatch"), "got: {err}");
     }
 
-    /// **The version-lifecycle test the M16-S2 plan calls out:**
+    /// **Version-lifecycle test:**
     /// `--check` → `--dry-run` → confirmation prompt 'N' all share the
     /// same input shape; assert each phase output shape and that the
     /// read-only modes never touched the lock path.

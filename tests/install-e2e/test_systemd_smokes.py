@@ -1,14 +1,12 @@
-"""systemd unit smoke test deferred from M14-S3.
+"""systemd unit smoke test.
 
-Per `docs/internal/milestones/M14.md` and `M15.md`, the
-``integration_systemd_unit_smokes`` test was deferred to this milestone
-because it requires a Lima-controlled VM with systemd-inside. The Lima
-install harness ships that environment; the test lives here rather
-than in a Rust `integration_*` test because the assertions are about
-the systemd unit's runtime behavior on a stock Linux distro, not about
-the daemon binary in isolation.
+This test requires a Lima-controlled VM with systemd-inside, which the
+Lima install harness ships. The test lives here rather than in a Rust
+``integration_*`` test because the assertions are about the systemd
+unit's runtime behavior on a stock Linux distro, not about the daemon
+binary in isolation.
 
-What it checks (per M15 § "The integration_systemd_unit_smokes test"):
+What it checks:
 
 1. install.sh lands the unit at /etc/systemd/system/sandboxd.service.
 2. ``systemctl enable --now sandboxd`` succeeds.

@@ -8948,7 +8948,7 @@ mod tests {
     /// `--dump-proto-version` emits the single-field
     /// `{ "daemon_guest_proto_version": <u32> }` payload carrying this
     /// binary's `DAEMON_GUEST_PROTO_VERSION`. The shape is the
-    /// operator-stable contract M16-S4's pre-flight depends on for the
+    /// operator-stable contract the update pre-flight depends on for
     /// per-session compat classification (§ 3.1.7). Subprocess shape
     /// lives in `tests/integration_cfg_migrations_cli.rs`.
     #[test]

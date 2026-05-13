@@ -84,10 +84,9 @@ os.environ.setdefault("SANDBOX_BASE_VM_NAME", "sandbox-test-base")
 
 # CIDR pool of /28 blocks the e2e test daemon allocates session networks
 # from. Disjoint from the production pool (10.209.0.0/20) so the
-# M11-S10 CIDR-scoped reaper has something to filter on: the test
-# daemon's startup cleanup only deletes session resources falling inside
-# this CIDR, leaving any live production sessions in 10.209.0.0/20
-# untouched.
+# CIDR-scoped reaper has something to filter on: the test daemon's
+# startup cleanup only deletes session resources falling inside this
+# CIDR, leaving any live production sessions in 10.209.0.0/20 untouched.
 E2E_TEST_POOL_CIDR = "10.220.0.0/20"
 
 # The test daemon reads its users.conf from a tempfile we own, written
@@ -95,12 +94,12 @@ E2E_TEST_POOL_CIDR = "10.220.0.0/20"
 # (10.220.0.0/20) so the daemon's `find_subnet_by_uid` lookup at startup
 # returns the test pool — not the production pool the canonical
 # `/etc/sandboxd/users.conf` lists first. The daemon honors
-# `SANDBOX_USERS_CONF` unconditionally per M11-S9 (it is not the
-# privilege boundary; only the cap'd route helper is, and the helper
-# default-build refuses the env var). The production route helper
+# `SANDBOX_USERS_CONF` unconditionally — it is not the privilege
+# boundary; only the cap'd route helper is, and the helper
+# default-build refuses the env var. The production route helper
 # continues reading the canonical file — which lists both pools after
 # `make setup-users-conf` — so authorization for the test pool's
-# gateway IP succeeds without weakening the M11-S9 boundary.
+# gateway IP succeeds without weakening the privilege boundary.
 #
 # Tempfile is owned by the test runner's uid (the daemon does not run
 # the route-helper-style ownership check on the env-var path) and is
