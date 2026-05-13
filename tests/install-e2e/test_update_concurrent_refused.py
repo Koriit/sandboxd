@@ -63,6 +63,24 @@ def test_update_concurrent_refused(
     bumped_ver = version_from_tarball(release_tarball_x86_64_bumped)
     bumped_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64_bumped)
 
+    # Extract the bumped tarball and feed the staged-directory shape
+    # (`--from <dir>`) to `sandbox update`. The CLI's § 3.1.10 sigstore
+    # precondition runs BEFORE the lock acquire (§ 3.2.13); since the
+    # gate only fires when `from.is_file()`, the directory shape skips
+    # the cosign call and lets execution reach the lock-acquire branch
+    # under test. The harness does not stage a host-side cosign binary
+    # (`_COSIGN_BOOTSTRAP_REPLACEMENT` in conftest.py no-ops the install.sh
+    # cosign bootstrap), so a `--from <tarball>` invocation here would
+    # fail at the sigstore step before ever encountering the held flock.
+    stage_dir = "/tmp/sandbox-update-concurrent-stage"
+    arch = "x86_64-unknown-linux-gnu"
+    vm.shell(
+        f"sudo rm -rf {stage_dir} && mkdir -p {stage_dir} && "
+        f"tar xzf {bumped_in_vm} -C {stage_dir}",
+        check=True, timeout=60,
+    )
+    extracted_root = f"{stage_dir}/sandboxd-{bumped_ver}-{arch}"
+
     # Synthesise a held lock: a background `flock -n <lock> sleep 60`
     # holds the kernel flock. We write the payload first (mode 0664
     # owner sandbox:sandbox per Spec 5 § 10.1), then hand the FD to flock.
@@ -119,7 +137,7 @@ if sudo flock -n /var/lib/sandbox/.update.lock -c true; then
     exit 71
 fi
 # The real test: `sandbox update` must refuse.
-sudo sandbox update --from {bumped_in_vm} --yes
+sudo sandbox update --from {extracted_root} --yes
 RC=$?
 sudo kill "$HOLDER_PID" 2>/dev/null
 wait "$HOLDER_PID" 2>/dev/null

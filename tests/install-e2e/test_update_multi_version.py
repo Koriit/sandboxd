@@ -76,16 +76,33 @@ def test_update_fresh_install_to_next_version(
         f"pre-update daemon /version mismatch: got {pre}, expected {base_ver}"
     )
 
-    # Stage the bumped (v') tarball and run `sandbox update --from <tar>`.
+    # Stage the bumped (v') tarball and run `sandbox update --from <dir>`.
+    #
+    # Feed the staged-directory shape (`--from <dir>`), not the tarball:
+    # the CLI's § 3.1.10 sigstore precondition only fires when
+    # `from.is_file()` is true, so a directory short-circuits the
+    # cosign call. The test harness has no host-side cosign binary at
+    # the canonical path (`_COSIGN_BOOTSTRAP_REPLACEMENT` in conftest.py
+    # patches install.sh's bootstrap to a no-op), so a `--from <tarball>`
+    # invocation would fail before reaching the multi-version contract
+    # under test (Spec 5 § 9.1).
     bumped_tarball_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64_bumped)
     bumped_ver = version_from_tarball(bumped_tarball_in_vm)
     assert bumped_ver != base_ver, (
         f"bumped fixture produced the same version as base: {bumped_ver}; "
         "the multi-version contract requires distinct versions"
     )
+    stage_dir = "/tmp/sandbox-update-multi-version-stage"
+    arch = "x86_64-unknown-linux-gnu"
+    vm.shell(
+        f"sudo rm -rf {stage_dir} && mkdir -p {stage_dir} && "
+        f"tar xzf {bumped_tarball_in_vm} -C {stage_dir}",
+        check=True, timeout=60,
+    )
+    extracted_root = f"{stage_dir}/sandboxd-{bumped_ver}-{arch}"
 
     r = vm.shell(
-        f"sudo sandbox update --from {bumped_tarball_in_vm} --yes",
+        f"sudo sandbox update --from {extracted_root} --yes",
         timeout=600,
     )
     assert r.returncode == 0, (

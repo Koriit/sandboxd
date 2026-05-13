@@ -66,6 +66,26 @@ def test_update_backup_retention_prunes_oldest(
     vers = [version_from_tarball(t) for t in tarballs]
     in_vm = [copy_tarball_to_vm(vm, t, dst="/tmp") for t in tarballs]
 
+    # Extract each link's tarball into its own staging dir and feed the
+    # extracted root to `sandbox update` via `--from <dir>`. The
+    # directory shape short-circuits the § 3.1.10 sigstore precondition
+    # (`verify_signature` only runs when `from.is_file()` is true), so
+    # the test does not depend on a host-side cosign binary at the
+    # canonical path. The test harness's `_COSIGN_BOOTSTRAP_REPLACEMENT`
+    # in conftest.py patches install.sh's cosign bootstrap to a no-op,
+    # so any `--from <tarball>` invocation here would fail before
+    # reaching the retention contract under test (§§ 3.2.25, 5.2).
+    arch = "x86_64-unknown-linux-gnu"
+    extracted_roots = []
+    for idx, tarball_in_vm in enumerate(in_vm):
+        stage_dir = f"/tmp/sandbox-update-retention-stage-{idx}"
+        vm.shell(
+            f"sudo rm -rf {stage_dir} && mkdir -p {stage_dir} && "
+            f"tar xzf {tarball_in_vm} -C {stage_dir}",
+            check=True, timeout=60,
+        )
+        extracted_roots.append(f"{stage_dir}/sandboxd-{vers[idx]}-{arch}")
+
     # Run the three updates in order. Each must succeed and produce a
     # new backup set in `/var/lib/sandbox/backups/`.
     expected_to_versions_after_each = [
@@ -76,9 +96,9 @@ def test_update_backup_retention_prunes_oldest(
         # After update 3: 2 successful sets (the oldest is pruned).
         [(vers[0], vers[1]), (vers[1], vers[2])],
     ]
-    for idx, tarball_in_vm in enumerate(in_vm):
+    for idx, extracted_root in enumerate(extracted_roots):
         r = vm.shell(
-            f"sudo sandbox update --from {tarball_in_vm} --yes",
+            f"sudo sandbox update --from {extracted_root} --yes",
             timeout=300,
         )
         assert r.returncode == 0, (

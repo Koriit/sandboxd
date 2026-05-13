@@ -31,6 +31,7 @@ import pytest
 from conftest import (
     copy_tarball_to_vm,
     install_sh_cmd,
+    version_from_tarball,
     wait_for_systemd_active,
 )
 
@@ -84,9 +85,27 @@ def test_update_preserves_systemd_drop_in(
     assert len(pre_sha) == 64
 
     # Run the update against a genuine bumped tarball.
+    #
+    # Feed the staged-directory shape (`--from <dir>`), not the tarball:
+    # the CLI's § 3.1.10 sigstore precondition only fires when
+    # `from.is_file()` is true, so a directory short-circuits the
+    # cosign call. The test harness has no host-side cosign binary at
+    # the canonical path (`_COSIGN_BOOTSTRAP_REPLACEMENT` in conftest.py
+    # patches install.sh's bootstrap to a no-op), so a `--from <tarball>`
+    # invocation would fail before reaching the drop-in preservation
+    # contract under test (§§ 4.5, 9.1).
     bumped_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64_bumped)
+    bumped_ver = version_from_tarball(bumped_in_vm)
+    stage_dir = "/tmp/sandbox-update-preserves-dropin-stage"
+    arch = "x86_64-unknown-linux-gnu"
+    vm.shell(
+        f"sudo rm -rf {stage_dir} && mkdir -p {stage_dir} && "
+        f"tar xzf {bumped_in_vm} -C {stage_dir}",
+        check=True, timeout=60,
+    )
+    extracted_root = f"{stage_dir}/sandboxd-{bumped_ver}-{arch}"
     r = vm.shell(
-        f"sudo sandbox update --from {bumped_in_vm} --yes",
+        f"sudo sandbox update --from {extracted_root} --yes",
         timeout=300,
     )
     assert r.returncode == 0, (
@@ -165,9 +184,27 @@ def test_update_preserves_customized_users_conf(
     )
 
     # Run the update against a genuine bumped tarball.
+    #
+    # Feed the staged-directory shape (`--from <dir>`), not the tarball:
+    # the CLI's § 3.1.10 sigstore precondition only fires when
+    # `from.is_file()` is true, so a directory short-circuits the
+    # cosign call. The test harness has no host-side cosign binary at
+    # the canonical path (`_COSIGN_BOOTSTRAP_REPLACEMENT` in conftest.py
+    # patches install.sh's bootstrap to a no-op), so a `--from <tarball>`
+    # invocation would fail before reaching the users.conf-preservation
+    # contract under test (Spec 1 § 5.5, Spec 5 § 4.5).
     bumped_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64_bumped)
+    bumped_ver = version_from_tarball(bumped_in_vm)
+    stage_dir = "/tmp/sandbox-update-preserves-users-stage"
+    arch = "x86_64-unknown-linux-gnu"
+    vm.shell(
+        f"sudo rm -rf {stage_dir} && mkdir -p {stage_dir} && "
+        f"tar xzf {bumped_in_vm} -C {stage_dir}",
+        check=True, timeout=60,
+    )
+    extracted_root = f"{stage_dir}/sandboxd-{bumped_ver}-{arch}"
     r = vm.shell(
-        f"sudo sandbox update --from {bumped_in_vm} --yes",
+        f"sudo sandbox update --from {extracted_root} --yes",
         timeout=300,
     )
     assert r.returncode == 0, (

@@ -61,6 +61,26 @@ def test_update_air_gapped(
     bumped_ver = version_from_tarball(release_tarball_x86_64_bumped)
     bumped_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64_bumped)
 
+    # Extract the bumped tarball into a staging dir BEFORE the egress
+    # drop. We feed `--from <dir>` (not `--from <tarball>`) to the
+    # update so the CLI's § 3.1.10 sigstore precondition short-circuits:
+    # `verify_signature` only runs when `from.is_file()` is true, so a
+    # directory shape skips the cosign call. The test harness does not
+    # stage a host-side cosign binary (see conftest's
+    # `_COSIGN_BOOTSTRAP_REPLACEMENT`), and any `--from <tarball>`
+    # invocation would fail with "cosign binary not found" before this
+    # test ever reaches its contract (air-gapped operation, § 6.3).
+    # `tar` is local and air-gap-compatible, so extracting before the
+    # egress drop costs nothing relative to the contract under test.
+    stage_dir = "/tmp/sandbox-update-air-gapped-stage"
+    arch = "x86_64-unknown-linux-gnu"
+    vm.shell(
+        f"sudo rm -rf {stage_dir} && mkdir -p {stage_dir} && "
+        f"tar xzf {bumped_in_vm} -C {stage_dir}",
+        check=True, timeout=60,
+    )
+    extracted_root = f"{stage_dir}/sandboxd-{bumped_ver}-{arch}"
+
     # Warm up iptables.
     vm.shell(
         "set -eux; "
@@ -90,7 +110,7 @@ def test_update_air_gapped(
 
     # The real test: sandbox update completes despite egress block.
     r = vm.shell(
-        f"sudo sandbox update --from {bumped_in_vm} --yes",
+        f"sudo sandbox update --from {extracted_root} --yes",
         timeout=300,
     )
     assert r.returncode == 0, (
