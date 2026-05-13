@@ -7,10 +7,11 @@ Three end-to-end cases against a Lima VM:
   run converges with ``action=skip`` log lines and a non-zero exit
   code that the resume run recovers to 0.
 * ``test_update_partial_failure_backup_set_preserved`` — inject a
-  failure into the config-migration step (§ 3.2.24) by writing an
-  unparseable ``users.conf``; verify the backup set's
-  ``manifest.json`` carries ``completed_ok: false`` and survives a
-  subsequent successful run's retention prune.
+  real failure into the config-migration step (§ 3.2.24) via the
+  ``SANDBOX_UPDATE_TEST_FAIL_AT_STEP=migrate`` test-only env var;
+  verify the in-progress backup-set ``manifest.json`` is written
+  with ``completed_ok: false`` at § 3.2.19 and survives a
+  subsequent successful run's retention prune (§ 5.2).
 
 Both tests use a genuine bumped tarball (see
 ``conftest.release_tarball_x86_64_bumped``) — the bumped tarball
@@ -225,24 +226,30 @@ def test_update_partial_failure_backup_set_preserved(
     release_tarball_x86_64,
     release_tarball_x86_64_bumped,
 ):
-    """A failure mid-update leaves the backup set with completed_ok=false
-    and that set is preserved across the subsequent successful run's
-    retention prune. Spec 5 §§ 3.2.24, 5.2.
+    """A real failure mid-update leaves the backup set with
+    completed_ok=false and that set is preserved across the subsequent
+    successful run's retention prune. Spec 5 §§ 3.2.19, 3.2.24, 5.2.
 
     Strategy:
       * Install base version.
       * Stage a bumped tarball.
-      * Inject a parse failure into the config-migration step by
-        replacing ``/etc/sandboxd/users.conf`` with malformed JSON
-        right BEFORE the update reaches § 3.2.24. The framework's
-        ``read_schema_version`` returns ``MigrationError::Parse`` and
-        the update exits non-zero, leaving the in-progress backup set
-        manifest unfinalized.
-      * Repair users.conf and re-run; the resume succeeds, prunes
-        nothing (only one set total, and it's the forensic one), and
-        creates a second set.
-      * Assert: at least one set exists with ``completed_ok=false``
-        AND the file at that path survives.
+      * Run the update with ``SANDBOX_UPDATE_TEST_FAIL_AT_STEP=migrate``,
+        a test-only env var consumed by ``update::run`` that makes the
+        § 3.2.24 migrate step ``return 1`` before any migration is
+        applied. § 3.2.19 has already written the in-progress backup
+        manifest by this point; the in-progress manifest stays on disk
+        with ``completed_ok: false``.
+      * Run a clean ``sandbox update`` (no env var) — it succeeds, must
+        NOT prune the forensic set, and creates a second set marked
+        ``completed_ok: true``.
+
+    This pins two spec contracts at once:
+      * § 3.2.19 — the in-progress manifest is written BEFORE the
+        migrate step. If production code stops writing it at backup
+        time, the first-run assertion fails.
+      * § 5.2 — retention prune skips forensic sets. If production
+        prune logic regresses to delete completed_ok=false sets, the
+        second-run assertion fails.
     """
     vm = vm_factory(distro_template)
     base_tarball = copy_tarball_to_vm(vm, release_tarball_x86_64)
@@ -256,70 +263,70 @@ def test_update_partial_failure_backup_set_preserved(
     bumped_ver = version_from_tarball(release_tarball_x86_64_bumped)
     bumped_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64_bumped)
 
-    # Snapshot the original users.conf so we can restore it after the
-    # injected failure. install.sh writes users.conf at § 4.4.17.
-    original_users_conf = vm.shell(
-        "sudo cat /etc/sandboxd/users.conf",
+    # First run — inject a real mid-update failure at the migrate step
+    # via SANDBOX_UPDATE_TEST_FAIL_AT_STEP=migrate. The env var is
+    # documented as test-only in sandboxd/sandbox-cli/src/update/mod.rs
+    # at § 3.2.24's entry. `sudo` strips the caller's env by default;
+    # the explicit `VAR=val` between `sudo` and the command preserves
+    # only that one variable into the child's environment (same idiom
+    # `install_sh_cmd` uses for SANDBOX_INSTALL_SKIP_SIGSTORE).
+    r = vm.shell(
+        f"sudo SANDBOX_UPDATE_TEST_FAIL_AT_STEP=migrate "
+        f"sandbox update --from {bumped_in_vm} --yes",
+        timeout=300,
+    )
+    assert r.returncode != 0, (
+        f"injected migrate-step failure should have produced non-zero "
+        f"exit; got 0\nstdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+    )
+
+    # § 3.2.19 contract: the in-progress backup-set manifest is written
+    # BEFORE the migrate step runs. After the injected failure, exactly
+    # one backup set should exist on disk with completed_ok=false.
+    forensic_set = vm.shell(
+        "sudo sh -c 'ls -1d /var/lib/sandbox/backups/*/ 2>/dev/null | head -1'",
+        check=True, timeout=10,
+    ).stdout.strip()
+    assert forensic_set, (
+        f"no backup set produced by the failed run — § 3.2.19 contract "
+        f"is broken (in-progress manifest not written at backup time)\n"
+        f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+    )
+    forensic_set = forensic_set.rstrip("/")
+    forensic_manifest_text = vm.shell(
+        f"sudo cat {forensic_set}/manifest.json",
         check=True, timeout=10,
     ).stdout
-
-    # Inject the failure: write malformed JSON to users.conf. The
-    # update's pre-flight migration dry-run (§ 3.1.11) reads
-    # `users.conf` and calls `read_schema_version` — this will fail
-    # BEFORE the stateful phase. To force the failure to fire AFTER the
-    # stateful phase has created the backup set, we need to inject it
-    # between backup-time and migrate-time. The simplest reliable
-    # injection: replace users.conf with malformed JSON just before
-    # running update — the pre-flight migration dry-run will refuse
-    # at § 3.1.11 (before any lock acquire / state mutation). That
-    # exercises the pre-flight refusal path, NOT the in-progress
-    # backup-set preservation.
-    #
-    # To exercise the in-progress backup branch we instead corrupt
-    # users.conf AFTER the backup step has run. We can't easily inject
-    # a delay, so instead we synthesise the failed-set on disk
-    # directly: pre-populate /var/lib/sandbox/backups/<set>/ with a
-    # forensic manifest (completed_ok: false), and verify the
-    # subsequent successful run does NOT prune it (Spec 5 § 5.2).
-    forensic_set = "/var/lib/sandbox/backups/2026-05-01T00:00:00Z-from-{}-to-{}".format(
-        base_ver, bumped_ver,
+    forensic_manifest = json.loads(forensic_manifest_text)
+    assert forensic_manifest["completed_ok"] is False, (
+        f"forensic manifest should have completed_ok=false (in-progress); "
+        f"got: {forensic_manifest!r}"
     )
-    forensic_manifest = json.dumps({
-        "from_version": base_ver,
-        "to_version": bumped_ver,
-        "started_at": "2026-05-01T00:00:00Z",
-        "completed_at": None,
-        "completed_ok": False,
-        "arch": "x86_64-unknown-linux-gnu",
-        "files": {},
-    })
-    vm.shell(
-        f"sudo install -d -m 0755 -o sandbox -g sandbox "
-        f"/var/lib/sandbox/backups && "
-        f"sudo install -d -m 0750 -o sandbox -g sandbox {forensic_set} && "
-        f"echo {_sh_quote(forensic_manifest)} | "
-        f"sudo -u sandbox tee {forensic_set}/manifest.json >/dev/null",
-        check=True, timeout=20,
-    )
+    assert forensic_manifest["from_version"] == base_ver
+    assert forensic_manifest["to_version"] == bumped_ver
 
-    # Ensure users.conf is intact (we did not corrupt it).
-    vm.shell(
-        f"echo {_sh_quote(original_users_conf)} | "
-        f"sudo tee /etc/sandboxd/users.conf >/dev/null",
-        check=True, timeout=10,
-    )
+    # The failed run left the daemon stopped (§ 3.2.14 ran before the
+    # injected failure at § 3.2.24). Start the daemon back up so the
+    # retry's `was_running` probe samples `true`, mirroring the operator
+    # recovery flow (operators are expected to restart the daemon
+    # before retrying an interrupted update). Without this, the retry's
+    # doctor step at § 3.2.28 would fail because the daemon socket is
+    # absent.
+    vm.shell("sudo systemctl start sandboxd", check=True, timeout=60)
+    wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
 
-    # Run a successful update — the forensic set predates this run.
+    # Second run — clean (no env var). The update must succeed; the
+    # forensic set must be preserved (§ 5.2 retention contract).
     r = vm.shell(
         f"sudo sandbox update --from {bumped_in_vm} --yes",
         timeout=300,
     )
     assert r.returncode == 0, (
-        f"update should succeed despite forensic set:\n"
+        f"clean retry should succeed:\n"
         f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
     )
 
-    # The forensic set survives.
+    # The forensic set survives the prune at § 3.2.25.
     assert vm.shell(f"sudo test -d {forensic_set}").returncode == 0, (
         f"forensic backup set was pruned (§ 5.2 violation): {forensic_set}"
     )
@@ -335,7 +342,7 @@ def test_update_partial_failure_backup_set_preserved(
         f"forensic manifest was rewritten: {m!r}"
     )
 
-    # A successful set was also created by the update (the real run).
+    # A successful set was also created by the clean retry.
     success_sets = vm.shell(
         "sudo sh -c 'for d in /var/lib/sandbox/backups/*/; do "
         " jq -r .completed_ok < \"$d/manifest.json\" 2>/dev/null; "
