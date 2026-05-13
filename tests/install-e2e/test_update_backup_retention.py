@@ -86,26 +86,17 @@ def test_update_backup_retention_prunes_oldest(
             f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
         )
         # Enumerate backup sets with completed_ok=true and verify the
-        # expected (from_version, to_version) pairs.
+        # expected (from_version, to_version) pairs. `jq -s .` slurps
+        # the manifest files into a single JSON array, sidestepping the
+        # delimiter-parsing fragility of a `cat + echo ,` loop (when
+        # `cat` doesn't emit a trailing newline the boundary between
+        # manifests is `},{` rather than `}\n,\n{`, defeating any
+        # split-on-newline-comma-newline approach).
         manifests = vm.shell(
-            "sudo sh -c 'for d in /var/lib/sandbox/backups/*/; do "
-            "  cat \"$d/manifest.json\"; echo ,; "
-            "done'",
+            "sudo sh -c 'jq -s . /var/lib/sandbox/backups/*/manifest.json'",
             check=True, timeout=20,
         ).stdout
-        # The output is a sequence of JSON docs separated by commas;
-        # parse them by splitting on the trailing comma + newline.
-        manifest_blobs = [
-            blob.strip() for blob in manifests.split("\n,\n") if blob.strip()
-        ]
-        # The final blob has a trailing `,` from the loop — strip it.
-        manifest_blobs = [b.rstrip(",").strip() for b in manifest_blobs if b.rstrip(",").strip()]
-        parsed = []
-        for blob in manifest_blobs:
-            try:
-                parsed.append(json.loads(blob))
-            except json.JSONDecodeError:
-                continue
+        parsed = json.loads(manifests)
         ok_pairs = sorted(
             (m["from_version"], m["to_version"])
             for m in parsed
