@@ -155,7 +155,7 @@ fn write_users_conf(dir: &Path) -> PathBuf {
     // production 10.209.0.0/24 to avoid colliding with a real
     // daemon if one happens to be running on the same host.
     let path = dir.join("users.conf");
-    let body = format!(r#"{{"subnets":[{{"cidr":"10.219.0.0/24","allow_users":["{user}"]}}]}}"#,);
+    let body = format!(r#"{{"_schema_version":1,"subnets":[{{"cidr":"10.219.0.0/24","allow_users":["{user}"]}}]}}"#,);
     let mut f = std::fs::File::create(&path).expect("create users.conf");
     f.write_all(body.as_bytes()).expect("write users.conf");
     f.flush().expect("flush users.conf");

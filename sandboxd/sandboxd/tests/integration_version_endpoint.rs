@@ -68,7 +68,7 @@ fn current_username() -> String {
 /// The subnet itself is irrelevant — this test never creates sessions.
 fn write_users_conf(dir: &Path, user: &str) -> PathBuf {
     let path = dir.join("users.conf");
-    let body = format!(r#"{{"subnets":[{{"cidr":"10.219.0.0/24","allow_users":["{user}"]}}]}}"#);
+    let body = format!(r#"{{"_schema_version":1,"subnets":[{{"cidr":"10.219.0.0/24","allow_users":["{user}"]}}]}}"#);
     let mut f = std::fs::File::create(&path).expect("create users.conf");
     f.write_all(body.as_bytes()).expect("write users.conf");
     f.flush().expect("flush users.conf");
