@@ -22,6 +22,30 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 // ---------------------------------------------------------------------------
+// Cosign / sigstore paths
+// ---------------------------------------------------------------------------
+
+/// On-disk location of the `cosign` binary used for `verify-blob`.
+/// install.sh's `cosign_bootstrap` step (Spec 4 § 4.4.8) is the canonical
+/// installer; `sandbox update` reuses the result. If the file is missing
+/// the update flow refuses with [`FetchError::CosignNotFound`] pointing
+/// the operator at the install docs — bootstrapping cosign from the
+/// update flow is deliberately out of scope.
+pub const COSIGN_BIN_PATH: &str = "/usr/local/bin/cosign";
+
+/// Fulcio certificate-identity regexp matching tarballs signed by the
+/// official release workflow. **MUST stay byte-identical to install.sh's
+/// `sigstore_verify`** (`scripts/install.sh`) — divergence would make
+/// either side accept tarballs the other refuses.
+pub const COSIGN_CERT_IDENTITY_REGEXP: &str =
+    r"^https://github\.com/Koriit/sandboxd/\.github/workflows/release\.yml@";
+
+/// OIDC issuer matching the GitHub Actions workflow that signs official
+/// release tarballs. **MUST stay byte-identical to install.sh's
+/// `sigstore_verify`.**
+pub const COSIGN_CERT_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
+
+// ---------------------------------------------------------------------------
 // Cosign pin — MUST match `scripts/lib.sh`.
 // ---------------------------------------------------------------------------
 
@@ -104,6 +128,113 @@ pub enum ManifestError {
         tarball_version: String,
         target_version: String,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Sigstore verification + per-file digest check (Spec 5 § 3.1.10)
+// ---------------------------------------------------------------------------
+
+/// Errors surfaced by [`verify_signature`]. Kept distinct from
+/// [`ManifestError`] because these are the trust-chain refusals — the
+/// operator-visible message at the call site needs to make the security
+/// implication explicit.
+#[derive(Debug, thiserror::Error)]
+pub enum FetchError {
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    /// `/usr/local/bin/cosign` is absent. Surfaced when the operator
+    /// never ran install.sh on this host, or has uninstalled cosign
+    /// out-of-band. The update flow does not bootstrap cosign — that is
+    /// install.sh's responsibility (Spec 5 § 3.1.9, separation of
+    /// concerns).
+    #[error(
+        "cosign binary not found at {path} — \
+         run install.sh once on this host first (it stages the pinned cosign), \
+         or stage it manually under {path}"
+    )]
+    CosignNotFound { path: String },
+    /// Sibling `<tarball>.sigstore` is missing and no `--cosign-bundle`
+    /// was passed. Surfaced before the cosign subprocess is even
+    /// invoked.
+    #[error(
+        "no cosign bundle: pass --cosign-bundle or place a `<tarball>.sigstore` \
+         file next to the release tarball"
+    )]
+    BundleNotFound { tarball: String },
+    /// `cosign verify-blob` returned a non-zero exit status. Stderr is
+    /// captured verbatim so the operator can copy-paste it into a bug
+    /// report.
+    #[error("sigstore verification failed: {stderr}")]
+    SignatureVerifyFailed { stderr: String },
+}
+
+/// Resolve the cosign bundle path that pairs with `tarball`. If
+/// `bundle_override` is `Some` (operator passed `--cosign-bundle`), that
+/// wins. Otherwise we look for `<tarball>.sigstore` as a sibling — same
+/// convention install.sh § 4.4.10 uses.
+fn resolve_bundle_path(
+    tarball: &Path,
+    bundle_override: Option<&Path>,
+) -> Result<PathBuf, FetchError> {
+    if let Some(b) = bundle_override {
+        if !b.exists() {
+            return Err(FetchError::BundleNotFound {
+                tarball: tarball.display().to_string(),
+            });
+        }
+        return Ok(b.to_path_buf());
+    }
+    let sibling = {
+        let mut s = tarball.as_os_str().to_owned();
+        s.push(".sigstore");
+        PathBuf::from(s)
+    };
+    if sibling.exists() {
+        return Ok(sibling);
+    }
+    Err(FetchError::BundleNotFound {
+        tarball: tarball.display().to_string(),
+    })
+}
+
+/// Spec 5 § 3.1.10: invoke `cosign verify-blob` against the release
+/// tarball before any extraction. Mirrors install.sh's `sigstore_verify`
+/// byte-for-byte on the flags so a tarball that install.sh accepts is
+/// also accepted here (and vice versa).
+///
+/// Pre-conditions:
+/// * `/usr/local/bin/cosign` exists. The update flow does not bootstrap
+///   cosign — operators get cosign by running install.sh once. Surfaces
+///   [`FetchError::CosignNotFound`] otherwise.
+/// * A signature bundle is locatable — either passed as `bundle` or
+///   found as `<tarball>.sigstore` sibling.
+///
+/// On success the operator's tarball is cryptographically attested to
+/// have come from the official release workflow.
+pub fn verify_signature(tarball: &Path, bundle: Option<&Path>) -> Result<(), FetchError> {
+    let cosign = Path::new(COSIGN_BIN_PATH);
+    if !cosign.exists() {
+        return Err(FetchError::CosignNotFound {
+            path: COSIGN_BIN_PATH.to_string(),
+        });
+    }
+    let bundle_path = resolve_bundle_path(tarball, bundle)?;
+    let out = Command::new(COSIGN_BIN_PATH)
+        .arg("verify-blob")
+        .arg("--bundle")
+        .arg(&bundle_path)
+        .arg("--certificate-identity-regexp")
+        .arg(COSIGN_CERT_IDENTITY_REGEXP)
+        .arg("--certificate-oidc-issuer")
+        .arg(COSIGN_CERT_OIDC_ISSUER)
+        .arg(tarball)
+        .output()?;
+    if !out.status.success() {
+        return Err(FetchError::SignatureVerifyFailed {
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Read a MANIFEST JSON file at `path`.

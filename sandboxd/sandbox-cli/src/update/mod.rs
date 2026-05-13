@@ -847,15 +847,39 @@ pub async fn run(args: UpdateArgs) -> i32 {
         return 1i32;
     }
 
-    // §§ 3.1.9 / 3.1.10 — cosign bootstrap, sigstore verify, extract.
-    // For `--from` we can read MANIFEST and surface arch mismatch
-    // *before any state mutation* (an exit-criterion). Sigstore
-    // verify itself shells out to `cosign verify-blob`; M16-S3
-    // wires that. For now we read MANIFEST and run the cross-check.
+    // §§ 3.1.9 / 3.1.10 — cosign bootstrap (handled by install.sh on a
+    // prior run; we only invoke verify-blob here), sigstore verify, then
+    // MANIFEST arch + version cross-check.
+    //
+    // The arch/version cross-check is cheap and surfaces operator-facing
+    // mismatches before we ever invoke cosign. The sigstore step is the
+    // trust root for the tarball bytes: a tampered tarball with a valid
+    // MANIFEST shape but mutated artefact bytes is caught by the
+    // signature check on the whole tarball, then again by the per-file
+    // sha256 check that runs after extraction (see prologue to § 3.2.20).
     if let Some(from) = args.from.as_ref() {
         if let Err(e) = check_manifest_from_tarball(from, &target_version, &state.installed_arch) {
             eprintln!("sandbox update: {e}");
             return 1i32;
+        }
+        // Sigstore verify runs only against a tarball file. The
+        // directory `--from <dir>` path is a test harness shape (the
+        // operator never passes a directory in production) and has no
+        // tarball to sign, so we skip the cosign step there.
+        if from.is_file() {
+            match fetch::verify_signature(from, args.cosign_bundle.as_deref()) {
+                Ok(()) => {
+                    log_step("sigstore_verify", "action=verify status=ok");
+                }
+                Err(e) => {
+                    log_step(
+                        "sigstore_verify",
+                        &format!("action=verify status=fail err=\"{e}\""),
+                    );
+                    eprintln!("sandbox update: {e}");
+                    return 1i32;
+                }
+            }
         }
     }
 
