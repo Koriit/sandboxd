@@ -40,6 +40,7 @@ PROJECT_ROOT = HERE.parent.parent
 SCRIPTS_DIR = PROJECT_ROOT / "scripts"
 INSTALL_SH = SCRIPTS_DIR / "install.sh"
 UNINSTALL_SH = SCRIPTS_DIR / "uninstall.sh"
+LIB_SH = SCRIPTS_DIR / "lib.sh"
 
 DIST_DIR = HERE / "dist"
 LOGS_DIR = HERE / "logs"
@@ -495,6 +496,9 @@ def _stage_scripts(vm, *, patch_install):
     else:
         vm.cp(INSTALL_SH, "/tmp/install.sh")
     vm.cp(UNINSTALL_SH, "/tmp/uninstall.sh")
+    # install.sh sources scripts/lib.sh (cosign pin constants) — stage it
+    # adjacent so the in-tree fallback `$(dirname $0)/lib.sh` resolves.
+    vm.cp(LIB_SH, "/tmp/lib.sh")
     vm.shell("chmod +x /tmp/install.sh /tmp/uninstall.sh", check=True)
 
 

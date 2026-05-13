@@ -15,18 +15,32 @@
 set -eu
 
 # ----------------------------------------------------------------------------
-# Shared constants (sourced from scripts/lib.sh).
+# Shared constants — bootstrap copy of scripts/lib.sh.
 #
-# The cosign pin and matching SHA-256 checksums are factored out into
-# `scripts/lib.sh` (Spec 5 § 3.1.9) so the `sandbox update` shell paths
-# can source the same trust root. Resolution order:
-#   1. `$SANDBOX_LIB_SH` env override (used by the in-tree test suite to
-#      point at a tempfile lib.sh).
+# These constants MUST stay byte-identical to the values in
+# `scripts/lib.sh` (Spec 5 § 3.1.9). The drift-check test
+# `tests/install-e2e/test_lib_sh_drift.py` enforces this.
+#
+# Why duplicate? `install.sh` is delivered via `curl ... | bash`, so the
+# bash process reading from stdin has no adjacent lib.sh to source. The
+# canonical lib.sh remains authoritative for `sandbox update` (which is
+# delivered as part of the tarball where lib.sh ships beside its
+# consumers); install.sh carries the values inline so the curl-bash UX
+# works without a second network fetch. When invoked from a local
+# checkout, install.sh prefers the on-disk lib.sh (resolution order
+# below) so a developer editing lib.sh sees their changes immediately
+# without re-running the drift sync.
+COSIGN_VERSION="v2.4.1"
+COSIGN_SHA256_AMD64="8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b"
+COSIGN_SHA256_ARM64="3b2e2e3854d0356c45fe6607047526ccd04742d20bd44afb5be91fa2a6e7cb4a"
+
+# Optional override: source lib.sh if found on disk (in-tree dev
+# workflow). Resolution order:
+#   1. `$SANDBOX_LIB_SH` env override (used by the in-tree test suite).
 #   2. `$(dirname "$0")/lib.sh` when invoked from a local checkout.
-#   3. A bare `lib.sh` in the current working directory as a final
-#      fallback (handles `curl -fsSL .../install.sh | sh` where the
-#      deploy pipeline puts both files adjacent in site/public/).
-# A clear error message names the search order if all three miss.
+#   3. A bare `lib.sh` in the current working directory.
+# Falls through silently if none match — the inline constants above are
+# the production trust root.
 __sandbox_lib_sh_resolve() {
     if [ -n "${SANDBOX_LIB_SH:-}" ] && [ -r "$SANDBOX_LIB_SH" ]; then
         printf '%s' "$SANDBOX_LIB_SH"
@@ -48,16 +62,10 @@ __sandbox_lib_sh_resolve() {
     return 1
 }
 
-__sandbox_lib_sh_path=$(__sandbox_lib_sh_resolve) || {
-    printf 'install.sh: required shared library lib.sh not found; ' >&2
-    # shellcheck disable=SC2016
-    printf 'searched SANDBOX_LIB_SH, $(dirname $0)/lib.sh, ./lib.sh. ' >&2
-    printf 'Re-run from a checkout (scripts/install.sh) or stage lib.sh ' >&2
-    printf 'adjacent to install.sh.\n' >&2
-    exit 1
+__sandbox_lib_sh_path=$(__sandbox_lib_sh_resolve) && {
+    # shellcheck disable=SC1090
+    . "$__sandbox_lib_sh_path"
 }
-# shellcheck disable=SC1090
-. "$__sandbox_lib_sh_path"
 
 DEFAULT_SOURCE_URL="https://github.com/Koriit/sandboxd/releases/download"
 LATEST_API_URL="https://api.github.com/repos/Koriit/sandboxd/releases/latest"
