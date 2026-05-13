@@ -125,6 +125,41 @@ fn integration_dump_migration_set_exits_zero_with_documented_json_shape() {
 }
 
 // ---------------------------------------------------------------------------
+// dump-proto-version (Spec 5 § 3.1.7 — pre-flight per-session classification)
+// ---------------------------------------------------------------------------
+
+/// `sandbox dump-proto-version` exits 0 and emits the documented
+/// single-field payload carrying this binary's
+/// `DAEMON_GUEST_PROTO_VERSION`. Invoked by the `sandbox update`
+/// pre-flight against the staged (target-version) CLI binary so the
+/// confirmation prompt can render the per-session compat breakdown
+/// against the *target* proto rather than the current one.
+#[test]
+fn integration_dump_proto_version_exits_zero_with_documented_json_shape() {
+    let output = Command::new(sandbox_bin())
+        .arg("dump-proto-version")
+        .output()
+        .expect("spawn sandbox CLI");
+    let code = output.status.code().expect("exited normally");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(code, 0, "must exit 0; stderr was:\n{stderr}");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout must be a JSON object");
+    let obj = parsed.as_object().expect("object");
+    let v = obj
+        .get("daemon_guest_proto_version")
+        .and_then(|v| v.as_u64())
+        .expect("daemon_guest_proto_version u64");
+    assert_eq!(
+        v as u32,
+        sandbox_core::guest::DAEMON_GUEST_PROTO_VERSION,
+        "payload must mirror the daemon's DAEMON_GUEST_PROTO_VERSION constant"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // integration_config_migration_applies_v001_to_legacy_file (Spec 5 § 9.3)
 // ---------------------------------------------------------------------------
 

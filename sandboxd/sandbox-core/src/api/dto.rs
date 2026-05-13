@@ -137,6 +137,22 @@ pub struct SessionDto {
     /// omit the field entirely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rootless: Option<SessionRootlessDocker>,
+    /// Persisted guest-protocol version this session last touched.
+    /// Mirrors the `guest_protocol_version` column on the persisted
+    /// [`crate::session::Session`] row — the value the daemon stamped
+    /// after the most recent successful guest-agent handshake (or `0`
+    /// for legacy rows that predate the V006 migration that introduces
+    /// the column). Surfaced on the wire so the `sandbox update`
+    /// pre-flight can classify each persisted session against the
+    /// target binary's `DAEMON_GUEST_PROTO_VERSION` and render the
+    /// per-session `ok / refresh-in-place / recreate` breakdown in the
+    /// confirmation prompt without round-tripping through a separate
+    /// probe endpoint. Additive on the wire: records and clients that
+    /// predate the field round-trip via `#[serde(default)]` (a missing
+    /// value deserialises to `0`, matching the "unknown / pre-V006"
+    /// sentinel the runtime already understands).
+    #[serde(default)]
+    pub guest_protocol_version: u32,
 }
 
 /// Wire representation of the rootless-Docker probe outcome stamped

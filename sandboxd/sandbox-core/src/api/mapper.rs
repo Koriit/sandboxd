@@ -89,6 +89,7 @@ impl From<&Session> for SessionDto {
             network: None,
             mounts: None,
             rootless: None,
+            guest_protocol_version: session.guest_protocol_version,
         }
     }
 }

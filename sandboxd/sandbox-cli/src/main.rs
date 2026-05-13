@@ -487,6 +487,17 @@ enum Command {
     /// — no privilege check, no path arguments.
     #[command(hide = true, name = "dump-migration-set")]
     DumpMigrationSet,
+
+    /// Hidden internal affordance: print the daemon-side guest protocol
+    /// constants as JSON to stdout. Invoked by `sandbox update` against
+    /// the *staged* (target-version) CLI binary so the pre-flight can
+    /// classify each persisted session against the upgrade target's
+    /// `DAEMON_GUEST_PROTO_VERSION` (Spec 5 § 3.1.7). The shape is
+    /// `{ "daemon_guest_proto_version": <u32> }` — operator-stable, so
+    /// future protocol bumps add fields rather than renaming this key.
+    /// Read-only; no privilege check, no path arguments.
+    #[command(hide = true, name = "dump-proto-version")]
+    DumpProtoVersion,
 }
 
 /// Policy subcommands.
@@ -1078,13 +1089,15 @@ fn build_request(command: &Command) -> Option<Request<String>> {
         | Command::Inspect { .. }
         | Command::Describe { .. }
         | Command::Events { .. } => return None,
-        // Hidden internal affordances for `sandbox update`. Both are
+        // Hidden internal affordances for `sandbox update`. All three are
         // dispatched client-side in `main()` before `build_request`
         // is reached. Reaching this branch indicates a dispatch bug.
-        Command::ApplyConfigMigration { .. } | Command::DumpMigrationSet => {
+        Command::ApplyConfigMigration { .. }
+        | Command::DumpMigrationSet
+        | Command::DumpProtoVersion => {
             unreachable!(
-                "`sandbox apply-config-migration` / `dump-migration-set` are handled \
-                 client-side in main() before build_request"
+                "`sandbox apply-config-migration` / `dump-migration-set` / \
+                 `dump-proto-version` are handled client-side in main() before build_request"
             );
         }
         // `sandbox update` runs its own orchestration (pre-flight,
@@ -1308,6 +1321,7 @@ fn command_bypasses_version_check(command: &Command) -> bool {
             | Command::Doctor { .. }
             | Command::ApplyConfigMigration { .. }
             | Command::DumpMigrationSet
+            | Command::DumpProtoVersion
             // `sandbox update` must run under a CLI/daemon version
             // skew — the whole point is to *resolve* that skew. The
             // pre-flight queries the daemon read-only (active sessions
@@ -1570,14 +1584,16 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
                  in main() before send_request"
             );
         }
-        Command::ApplyConfigMigration { .. } | Command::DumpMigrationSet => {
-            // Hidden config-migration affordances are handled client-
-            // side in `main()` and `process::exit` before any HTTP
-            // request fires. Reaching `handle_response` for them
-            // indicates a dispatch bug.
+        Command::ApplyConfigMigration { .. }
+        | Command::DumpMigrationSet
+        | Command::DumpProtoVersion => {
+            // Hidden config-migration / proto-version affordances are
+            // handled client-side in `main()` and `process::exit`
+            // before any HTTP request fires. Reaching `handle_response`
+            // for them indicates a dispatch bug.
             unreachable!(
-                "`apply-config-migration` / `dump-migration-set` are handled client-side \
-                 in main() before send_request"
+                "`apply-config-migration` / `dump-migration-set` / `dump-proto-version` \
+                 are handled client-side in main() before send_request"
             );
         }
         Command::Update { .. } => {
@@ -4483,6 +4499,29 @@ fn handle_dump_migration_set() -> i32 {
     }
 }
 
+/// `--dump-proto-version` handler. Writes a single-field JSON object
+/// `{ "daemon_guest_proto_version": <u32> }` carrying this binary's
+/// `sandbox_core::guest::DAEMON_GUEST_PROTO_VERSION`. Invoked by the
+/// `sandbox update` pre-flight against the *staged* (target-version)
+/// CLI binary so it can classify each persisted session against the
+/// upgrade target's protocol constant (Spec 5 § 3.1.7). Read-only;
+/// exits `0` on success.
+fn handle_dump_proto_version() -> i32 {
+    let payload = serde_json::json!({
+        "daemon_guest_proto_version": sandbox_core::guest::DAEMON_GUEST_PROTO_VERSION,
+    });
+    match serde_json::to_string(&payload) {
+        Ok(s) => {
+            println!("{s}");
+            0
+        }
+        Err(e) => {
+            eprintln!("sandbox: failed to serialise proto-version payload: {e}");
+            1
+        }
+    }
+}
+
 /// Per-backend dispatcher for `sandbox rebuild-image`.
 ///
 /// Spec § "`rebuild-image`: extend the existing flat command" requires
@@ -4869,6 +4908,10 @@ async fn main() {
     }
     if matches!(&cli.command, Command::DumpMigrationSet) {
         let code = handle_dump_migration_set();
+        process::exit(code);
+    }
+    if matches!(&cli.command, Command::DumpProtoVersion) {
+        let code = handle_dump_proto_version();
         process::exit(code);
     }
 
@@ -6292,6 +6335,7 @@ mod tests {
             network: None,
             mounts: None,
             rootless: None,
+            guest_protocol_version: 0,
         }
     }
 
@@ -8895,5 +8939,33 @@ mod tests {
         }
         // Verify the JSON shape one layer up — to_string returns Ok.
         let _ = serde_json::to_string(&entries).expect("serialise");
+    }
+
+    // -----------------------------------------------------------------------
+    // Spec 5 § 3.1.7 — `--dump-proto-version`.
+    // -----------------------------------------------------------------------
+
+    /// `--dump-proto-version` emits the single-field
+    /// `{ "daemon_guest_proto_version": <u32> }` payload carrying this
+    /// binary's `DAEMON_GUEST_PROTO_VERSION`. The shape is the
+    /// operator-stable contract M16-S4's pre-flight depends on for the
+    /// per-session compat classification (§ 3.1.7). Subprocess shape
+    /// lives in `tests/integration_cfg_migrations_cli.rs`.
+    #[test]
+    fn dump_proto_version_payload_carries_daemon_proto_const() {
+        let payload = serde_json::json!({
+            "daemon_guest_proto_version": sandbox_core::guest::DAEMON_GUEST_PROTO_VERSION,
+        });
+        let json = serde_json::to_string(&payload).expect("serialise");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        let v = parsed
+            .get("daemon_guest_proto_version")
+            .and_then(|v| v.as_u64())
+            .expect("daemon_guest_proto_version u64");
+        assert_eq!(
+            v as u32,
+            sandbox_core::guest::DAEMON_GUEST_PROTO_VERSION,
+            "payload must mirror the constant"
+        );
     }
 }
