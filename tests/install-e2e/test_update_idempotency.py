@@ -135,13 +135,17 @@ def test_update_interrupted_then_resumed(
     ).returncode != 0, "lock file should be unlinked on a successful update"
 
     # Backup set landed: exactly one set with completed_ok=true.
+    # `/var/lib/sandbox/backups/` is mode 0700 sandbox:sandbox, so the
+    # glob has to expand inside `sudo sh -c` (the outer shell can't
+    # traverse the dir to list its children). Matches the
+    # `success_sets` shape in the partial-failure test below.
     set_count = int(vm.shell(
-        "sudo ls -1d /var/lib/sandbox/backups/*/ 2>/dev/null | wc -l",
+        "sudo sh -c 'ls -1d /var/lib/sandbox/backups/*/ 2>/dev/null | wc -l'",
         check=True, timeout=10,
     ).stdout.strip())
     assert set_count == 1, f"expected 1 backup set, got {set_count}"
     manifest_text = vm.shell(
-        "sudo cat /var/lib/sandbox/backups/*/manifest.json",
+        "sudo sh -c 'cat /var/lib/sandbox/backups/*/manifest.json'",
         check=True, timeout=10,
     ).stdout
     manifest = json.loads(manifest_text)
