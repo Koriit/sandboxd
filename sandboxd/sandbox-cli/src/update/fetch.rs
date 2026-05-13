@@ -21,6 +21,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use ring::digest;
+
 // ---------------------------------------------------------------------------
 // Cosign / sigstore paths
 // ---------------------------------------------------------------------------
@@ -134,10 +136,10 @@ pub enum ManifestError {
 // Sigstore verification + per-file digest check (Spec 5 § 3.1.10)
 // ---------------------------------------------------------------------------
 
-/// Errors surfaced by [`verify_signature`]. Kept distinct from
-/// [`ManifestError`] because these are the trust-chain refusals — the
-/// operator-visible message at the call site needs to make the security
-/// implication explicit.
+/// Errors surfaced by [`verify_signature`] and [`verify_artifact_digests`].
+/// Kept distinct from [`ManifestError`] because these are the trust-chain
+/// refusals — the operator-visible message at the call site needs to make
+/// the security implication explicit.
 #[derive(Debug, thiserror::Error)]
 pub enum FetchError {
     #[error("io: {0}")]
@@ -166,6 +168,15 @@ pub enum FetchError {
     /// report.
     #[error("sigstore verification failed: {stderr}")]
     SignatureVerifyFailed { stderr: String },
+    /// A file unpacked from the tarball hashed to bytes that do not
+    /// match the value recorded in MANIFEST. Surfaces before any
+    /// extracted artefact is installed.
+    #[error("MANIFEST artefact digest mismatch for {path}: expected {expected}, got {got}")]
+    ArtifactDigestMismatch {
+        path: String,
+        expected: String,
+        got: String,
+    },
 }
 
 /// Resolve the cosign bundle path that pairs with `tarball`. If
@@ -235,6 +246,53 @@ pub fn verify_signature(tarball: &Path, bundle: Option<&Path>) -> Result<(), Fet
         });
     }
     Ok(())
+}
+
+/// Spec 5 § 3.1.10: after the tarball is extracted, every entry in
+/// `manifest.artifacts` must hash-match its on-disk file under
+/// `stage.stage_dir`. Mirrors install.sh's `sha256sum -c` step. The
+/// trust chain is `cosign(tarball) → manifest(tarball-bytes) → sha256(file
+/// vs manifest)`; this function pins the third link.
+pub fn verify_artifact_digests(stage: &StagedTarball) -> Result<(), FetchError> {
+    for (_key, entry) in stage.manifest.artifacts.iter() {
+        let file_path = stage.stage_dir.join(&entry.path);
+        let got = sha256_hex_of_file(&file_path)?;
+        if !got.eq_ignore_ascii_case(&entry.sha256) {
+            return Err(FetchError::ArtifactDigestMismatch {
+                path: entry.path.clone(),
+                expected: entry.sha256.clone(),
+                got,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Stream-hash a file with SHA-256 and return the hex digest. Reuses the
+/// `ring` crate already pulled in by `update::backup` for the backup-set
+/// manifest hashes; not factored to a shared helper because that helper
+/// is privately-typed against `BackupError` and a cross-module
+/// dependency would couple two otherwise-independent error surfaces.
+fn sha256_hex_of_file(path: &Path) -> Result<String, FetchError> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut ctx = digest::Context::new(&digest::SHA256);
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        ctx.update(&buf[..n]);
+    }
+    let bytes = ctx.finish();
+    let mut s = String::with_capacity(bytes.as_ref().len() * 2);
+    const HEX: &[u8] = b"0123456789abcdef";
+    for b in bytes.as_ref() {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    Ok(s)
 }
 
 /// Read a MANIFEST JSON file at `path`.

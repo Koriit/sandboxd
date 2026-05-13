@@ -1317,6 +1317,31 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         }
     };
 
+    // § 3.1.10 (trailing half) — every file unpacked from the tarball
+    // must hash-match the value MANIFEST records for it. The sigstore
+    // step earlier signed the tarball's bytes; this step closes the
+    // loop on a per-file basis, catching a tampered MANIFEST that
+    // somehow slipped the upstream signature check.
+    match fetch::verify_artifact_digests(&staged) {
+        Ok(()) => {
+            log_step(
+                "sha256_verify",
+                &format!(
+                    "action=verify count={} status=ok",
+                    staged.manifest.artifacts.len()
+                ),
+            );
+        }
+        Err(e) => {
+            log_step(
+                "sha256_verify",
+                &format!("action=verify status=fail err=\"{e}\""),
+            );
+            eprintln!("sandbox update: {e}");
+            return 1;
+        }
+    }
+
     // § 3.2.20 — docker load gateway image (BEFORE binary swap).
     let image_tar = staged.gateway_image_tar();
     let tag = format!("sandbox-gateway:{}", inputs.target_version);
