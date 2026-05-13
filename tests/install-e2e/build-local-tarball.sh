@@ -46,6 +46,28 @@
 #                                  (useful for re-tarring an existing build)
 #   SANDBOX_RELEASE_SKIP_GATEWAY  set to 1 to skip `make gateway-image`
 #   SANDBOX_RELEASE_PORTABLE_BUILD  see above (auto if unset)
+#   SANDBOX_RELEASE_BUMP_VERSION   build the workspace at this synthetic
+#                                  version instead of the current
+#                                  CARGO_PKG_VERSION. Every crate's
+#                                  Cargo.toml is sed-rewritten before the
+#                                  build and restored on EXIT (trap).
+#                                  Output dir flips to
+#                                  `sandboxd/target/portable-bumped/release`
+#                                  so the bumped and base builds keep
+#                                  independent cargo fingerprints — switching
+#                                  between them does not trigger a full
+#                                  re-compile. The resulting tarball reports
+#                                  the bumped version in both filename and
+#                                  MANIFEST, and the daemon's `/version`
+#                                  endpoint (CARGO_PKG_VERSION) genuinely
+#                                  reports the bumped version. This is the
+#                                  multi-version harness Spec 5 § 9.1's
+#                                  `test_update_fresh_install_to_next_version`
+#                                  depends on. The first bumped build is
+#                                  slower than incremental rebuilds since
+#                                  every crate's CARGO_PKG_VERSION env var
+#                                  changes — `cargo` rebuilds anything that
+#                                  picked it up via `env!`.
 #
 # This script is POSIX sh; do not introduce bashisms (CI runs
 # `shellcheck -s sh -S style`).
@@ -67,12 +89,17 @@ mkdir -p "$OUT_DIR"
 # Resolve workspace version and arch.
 # ----------------------------------------------------------------------------
 
-VER=$(awk -F'"' '/^version/ { print $2; exit }' \
+BASE_VER=$(awk -F'"' '/^version/ { print $2; exit }' \
     "$ROOT/sandboxd/sandboxd/Cargo.toml")
-if [ -z "$VER" ]; then
+if [ -z "$BASE_VER" ]; then
     printf 'build-local-tarball.sh: could not read version from sandboxd/sandboxd/Cargo.toml\n' >&2
     exit 1
 fi
+
+# Effective build version — either the Cargo.toml value or the operator-
+# supplied bump. The bump path sed-rewrites every crate's Cargo.toml
+# before invoking cargo, then restores them via an EXIT trap.
+VER="${SANDBOX_RELEASE_BUMP_VERSION:-$BASE_VER}"
 
 case "$(uname -m)" in
     x86_64)  ARCH="x86_64-unknown-linux-gnu" ;;
@@ -86,8 +113,111 @@ esac
 STAGE_NAME="sandboxd-${VER}-${ARCH}"
 TARBALL="${OUT_DIR}/${STAGE_NAME}.tar.gz"
 
-printf 'build-local-tarball.sh: version=%s arch=%s out=%s\n' \
-    "$VER" "$ARCH" "$TARBALL"
+if [ "$VER" = "$BASE_VER" ]; then
+    printf 'build-local-tarball.sh: version=%s arch=%s out=%s\n' \
+        "$VER" "$ARCH" "$TARBALL"
+else
+    printf 'build-local-tarball.sh: version=%s (bumped from %s) arch=%s out=%s\n' \
+        "$VER" "$BASE_VER" "$ARCH" "$TARBALL"
+fi
+
+# ----------------------------------------------------------------------------
+# Cargo.toml version bump + restore.
+#
+# The crates do not inherit `package.version` from the workspace root —
+# each crate's `Cargo.toml` carries its own literal `version = "X.Y.Z"`.
+# To produce a binary whose `CARGO_PKG_VERSION` differs from the
+# committed source, we sed-rewrite every crate's literal in place, run
+# the build, then restore the originals via a trap that fires on EXIT
+# (success or failure).
+#
+# The trap is installed unconditionally — it is a no-op when no files
+# have been rewritten. We use `cp -p` so the saved copy preserves the
+# original mtime; restoring it that way prevents stale cargo cache
+# fingerprints from drifting incremental-build accounting.
+# ----------------------------------------------------------------------------
+
+# Snapshot/restore wired up only when the bump is non-empty AND differs
+# from the committed version. Idempotent: running the script with
+# SANDBOX_RELEASE_BUMP_VERSION equal to the on-disk version is a no-op.
+BUMP_SNAPSHOT_DIR=""
+BUMP_LOCK_SNAPSHOT=""
+if [ -n "${SANDBOX_RELEASE_BUMP_VERSION:-}" ] \
+   && [ "$SANDBOX_RELEASE_BUMP_VERSION" != "$BASE_VER" ]; then
+    BUMP_SNAPSHOT_DIR=$(mktemp -d)
+    # Find every crate Cargo.toml under sandboxd/ (excludes the
+    # workspace root because the root file does not carry a literal
+    # `version = "X.Y.Z"` — version lives in each crate).
+    BUMP_FILES=$(find "$ROOT/sandboxd" -mindepth 2 -maxdepth 2 \
+        -name Cargo.toml -print)
+    if [ -z "$BUMP_FILES" ]; then
+        printf 'build-local-tarball.sh: bump requested but no crate Cargo.toml found\n' >&2
+        exit 1
+    fi
+    # Cargo.lock is overwritten by `cargo build` to reflect the bumped
+    # crate versions. Snapshot it so we can restore the committed
+    # version after the build.
+    if [ -f "$ROOT/sandboxd/Cargo.lock" ]; then
+        BUMP_LOCK_SNAPSHOT="$BUMP_SNAPSHOT_DIR/Cargo.lock"
+        cp -p "$ROOT/sandboxd/Cargo.lock" "$BUMP_LOCK_SNAPSHOT"
+    fi
+fi
+
+# The restore trap runs on EXIT (success or failure). The single-quoted
+# body is re-evaluated at trap time so the variables are read live.
+restore_cargo_versions() {
+    if [ -z "$BUMP_SNAPSHOT_DIR" ] || [ ! -d "$BUMP_SNAPSHOT_DIR" ]; then
+        return 0
+    fi
+    # Walk the snapshot dir; each saved file's basename encodes the
+    # original crate name. We sed-restored the literal version, but
+    # the safest restore is to copy the snapshot file back verbatim.
+    for snap in "$BUMP_SNAPSHOT_DIR"/*.cargo-toml; do
+        [ -f "$snap" ] || continue
+        crate=$(basename "$snap" .cargo-toml)
+        dst="$ROOT/sandboxd/$crate/Cargo.toml"
+        if [ -f "$dst" ]; then
+            cp -p "$snap" "$dst"
+        fi
+    done
+    # Restore Cargo.lock too — `cargo build` would have rewritten it
+    # with the bumped versions during the build.
+    if [ -n "$BUMP_LOCK_SNAPSHOT" ] && [ -f "$BUMP_LOCK_SNAPSHOT" ]; then
+        cp -p "$BUMP_LOCK_SNAPSHOT" "$ROOT/sandboxd/Cargo.lock"
+    fi
+    rm -rf "$BUMP_SNAPSHOT_DIR"
+    BUMP_SNAPSHOT_DIR=""
+    BUMP_LOCK_SNAPSHOT=""
+}
+
+# Trap EXIT (covers normal exit + most error paths under `set -e`).
+trap restore_cargo_versions EXIT INT TERM
+
+if [ -n "$BUMP_SNAPSHOT_DIR" ]; then
+    printf 'build-local-tarball.sh: rewriting Cargo.toml version=%s -> %s in every crate\n' \
+        "$BASE_VER" "$VER"
+    # POSIX sh has no arrays; iterate the newline-delimited list via a
+    # heredoc-fed `while` (no pipe — a pipe forks a subshell and the
+    # `exit 1` inside the loop would not terminate the outer script).
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        crate=$(basename "$(dirname "$f")")
+        cp -p "$f" "$BUMP_SNAPSHOT_DIR/${crate}.cargo-toml"
+        # Match the first `version = "..."` line (the package version
+        # always lives in the file's first 10 lines, before any
+        # `[dependencies]` or other tables that might carry their own
+        # `version = "..."` for deps). We anchor to `^version`.
+        sed -i.bak -e "0,/^version = \"[^\"]*\"\$/{s/^version = \"[^\"]*\"\$/version = \"${VER}\"/}" "$f"
+        rm -f "${f}.bak"
+        # Confirm the rewrite landed.
+        if ! grep -q "^version = \"${VER}\"\$" "$f"; then
+            printf 'build-local-tarball.sh: failed to rewrite version in %s\n' "$f" >&2
+            exit 1
+        fi
+    done <<EOF
+$BUMP_FILES
+EOF
+fi
 
 # ----------------------------------------------------------------------------
 # Decide native vs. portable (docker) build.
@@ -153,11 +283,26 @@ printf 'build-local-tarball.sh: portable_build=%s (%s)\n' \
 # When building portably we redirect cargo into a dedicated target dir
 # so portable and native artifacts do not invalidate each other's
 # fingerprints. Native builds use the default `target/release`.
-if [ "$portable_build" = "1" ]; then
-    RELEASE_DIR="$ROOT/sandboxd/target/portable/release"
-else
-    RELEASE_DIR="$ROOT/sandboxd/target/release"
+#
+# The bumped build (SANDBOX_RELEASE_BUMP_VERSION) layers a `-bumped`
+# suffix so switching between the base and bumped builds does not
+# invalidate the other's incremental cache — every crate's
+# `CARGO_PKG_VERSION` env-var changes between the two builds, which
+# would otherwise force a full rebuild on every flip.
+TARGET_VARIANT="portable"
+if [ "$portable_build" = "0" ]; then
+    TARGET_VARIANT="release"
 fi
+if [ -n "$BUMP_SNAPSHOT_DIR" ]; then
+    TARGET_VARIANT="${TARGET_VARIANT}-bumped"
+fi
+case "$TARGET_VARIANT" in
+    portable)         CARGO_TARGET_SUBDIR="target/portable" ;;
+    portable-bumped)  CARGO_TARGET_SUBDIR="target/portable-bumped" ;;
+    release)          CARGO_TARGET_SUBDIR="target" ;;
+    release-bumped)   CARGO_TARGET_SUBDIR="target/bumped" ;;
+esac
+RELEASE_DIR="$ROOT/sandboxd/${CARGO_TARGET_SUBDIR}/release"
 
 # ----------------------------------------------------------------------------
 # Build workspace (release profile).
@@ -209,9 +354,10 @@ elif [ "$portable_build" = "1" ]; then
         -v "$BUILD_CACHE/rustup:/rustup:rw" \
         -e CARGO_HOME=/cargo-home \
         -e RUSTUP_HOME=/rustup \
-        -e CARGO_TARGET_DIR=/work/sandboxd/target/portable \
+        -e CARGO_TARGET_DIR="/work/sandboxd/${CARGO_TARGET_SUBDIR}" \
         -e HOST_UID="$UID_HOST" \
         -e HOST_GID="$GID_HOST" \
+        -e CARGO_TARGET_SUBDIR="$CARGO_TARGET_SUBDIR" \
         -w /work/sandboxd \
         ubuntu:22.04 \
         sh -c '
@@ -235,7 +381,7 @@ elif [ "$portable_build" = "1" ]; then
             cargo build --workspace --release
             # Chown the produced artifacts so the host user can stage,
             # tar, and (eventually) clean them without sudo.
-            chown -R "$HOST_UID:$HOST_GID" /work/sandboxd/target/portable
+            chown -R "$HOST_UID:$HOST_GID" "/work/sandboxd/${CARGO_TARGET_SUBDIR}"
         '
 else
     printf 'build-local-tarball.sh: cargo build --workspace --release (host) ...\n'
@@ -260,6 +406,28 @@ done
 
 GATEWAY_TAG="sandbox-gateway:${VER}"
 GATEWAY_TAR="${OUT_DIR}/sandbox-gateway-${VER}.tar"
+
+# Bumped builds: the gateway image bytes do not depend on the
+# workspace's Cargo.toml version (the Dockerfile sources its own base
+# images). When SANDBOX_RELEASE_BUMP_VERSION is set we can short-
+# circuit the docker-save step by tagging the base-version image and
+# copying its already-saved tarball instead of re-saving identical
+# bytes. This also lets the bumped tarball ship even when the host
+# never had docker access to build the gateway directly.
+if [ -n "$BUMP_SNAPSHOT_DIR" ] && [ ! -f "$GATEWAY_TAR" ]; then
+    BASE_GATEWAY_TAR="${OUT_DIR}/sandbox-gateway-${BASE_VER}.tar"
+    if [ -f "$BASE_GATEWAY_TAR" ]; then
+        printf 'build-local-tarball.sh: bumped build reusing base gateway tar %s -> %s\n' \
+            "$BASE_GATEWAY_TAR" "$GATEWAY_TAR"
+        cp "$BASE_GATEWAY_TAR" "$GATEWAY_TAR"
+    fi
+    if command -v docker >/dev/null 2>&1 \
+       && docker image inspect "sandbox-gateway:${BASE_VER}" >/dev/null 2>&1; then
+        # Make the bumped tag exist locally too — install.sh's docker-
+        # load step inspects this tag when it runs inside the test VM.
+        docker tag "sandbox-gateway:${BASE_VER}" "$GATEWAY_TAG" 2>/dev/null || true
+    fi
+fi
 
 if [ "${SANDBOX_RELEASE_SKIP_GATEWAY:-0}" = "1" ]; then
     printf 'build-local-tarball.sh: SKIP_GATEWAY=1, reusing existing gateway image tarball\n'

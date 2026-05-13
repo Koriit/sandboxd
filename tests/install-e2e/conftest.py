@@ -340,6 +340,128 @@ def release_tarball_x86_64() -> Path:
     return tarball
 
 
+def _bump_patch_version(version: str) -> str:
+    """Return ``version`` with its patch component incremented by one.
+
+    The bump shape matches the convention documented in the release
+    notes ("patch bump for an unreleased version"): ``X.Y.Z`` ->
+    ``X.Y.(Z+1)``. Anything else (e.g. pre-release suffixes) raises —
+    we want a loud refusal rather than a silently-wrong target version
+    in the multi-version harness.
+    """
+    parts = version.split(".")
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        raise AssertionError(
+            f"unexpected version shape for bump: {version!r}; "
+            "expected three numeric dot-separated components"
+        )
+    parts[-1] = str(int(parts[-1]) + 1)
+    return ".".join(parts)
+
+
+def _newest_rs_mtime() -> float:
+    """Return the youngest mtime (in seconds since epoch) across every
+    ``*.rs`` file under the workspace.
+
+    Used by the bumped-tarball fixture's cache-validity check: a cached
+    tarball whose mtime is older than the youngest source file is
+    stale and must be rebuilt. Walks ``sandboxd/`` only (the workspace
+    root), skipping the cargo target dir which contains build-time
+    generated ``.rs`` files we don't want to invalidate against.
+    """
+    workspace = PROJECT_ROOT / "sandboxd"
+    newest = 0.0
+    for root, dirs, files in os.walk(workspace):
+        # Skip target/, .git/, etc. — they contain generated or
+        # unrelated files we don't want to invalidate against.
+        dirs[:] = [d for d in dirs if d not in ("target", ".git", "node_modules")]
+        for name in files:
+            if name.endswith(".rs"):
+                try:
+                    mtime = os.path.getmtime(os.path.join(root, name))
+                    if mtime > newest:
+                        newest = mtime
+                except OSError:
+                    continue
+    return newest
+
+
+@pytest.fixture(scope="session")
+def release_tarball_x86_64_bumped(release_tarball_x86_64) -> Path:
+    """Build a release tarball at a bumped version distinct from the
+    workspace's current CARGO_PKG_VERSION.
+
+    The bump produces a genuine v' binary — every crate's Cargo.toml
+    is sed-rewritten to the bumped version, ``cargo build --workspace
+    --release`` runs against the rewrite, the tarball is assembled,
+    and the Cargo.toml files are restored via an EXIT trap inside
+    ``build-local-tarball.sh``. This is what
+    ``test_update_fresh_install_to_next_version`` needs: a tarball
+    whose binary's ``/version`` endpoint reports a different value
+    than the base tarball's.
+
+    Cache shape:
+
+    * Output: ``tests/install-e2e/dist/sandboxd-<bumped>-<arch>.tar.gz``.
+    * Skip rebuild when the cached tarball's mtime is newer than the
+      youngest ``*.rs`` file in the workspace tree. This is the same
+      shape as cargo's incremental cache, lifted up to the tarball
+      level. ``SANDBOX_RELEASE_FORCE_REBUILD=1`` overrides.
+
+    The bump version defaults to a patch-level bump (``X.Y.Z`` ->
+    ``X.Y.(Z+1)``); set ``SANDBOX_RELEASE_BUMP_VERSION`` in the
+    pytest invocation env to pick a different shape (the build
+    script honours the same env var).
+
+    Depends on ``release_tarball_x86_64`` so the base tarball is
+    built first — the bumped build reuses the same docker cargo cache
+    (under ``tests/install-e2e/.build-cache``) so the bumped rebuild
+    is incremental on a warm cache. The two builds use distinct
+    target dirs (``target/portable`` vs ``target/portable-bumped``)
+    to keep their cargo fingerprints isolated across version-flips.
+    """
+    if subprocess.run(["uname", "-m"], capture_output=True, text=True).stdout.strip() != "x86_64":
+        pytest.skip("release_tarball_x86_64_bumped fixture only assembles on x86_64 hosts")
+
+    base_ver = _read_workspace_version()
+    bumped_ver = os.environ.get("SANDBOX_RELEASE_BUMP_VERSION") \
+        or _bump_patch_version(base_ver)
+    if bumped_ver == base_ver:
+        raise AssertionError(
+            f"bumped version equals base version ({bumped_ver}); "
+            "the multi-version harness requires distinct versions"
+        )
+
+    arch = "x86_64-unknown-linux-gnu"
+    tarball = DIST_DIR / f"sandboxd-{bumped_ver}-{arch}.tar.gz"
+
+    force_rebuild = os.environ.get("SANDBOX_RELEASE_FORCE_REBUILD") == "1"
+    stale = (
+        not tarball.exists()
+        or tarball.stat().st_mtime < _newest_rs_mtime()
+    )
+
+    if force_rebuild or stale:
+        env = os.environ.copy()
+        env["SANDBOX_RELEASE_BUMP_VERSION"] = bumped_ver
+        # The build script auto-detects the bumped build and reuses
+        # the base tarball's gateway-image bytes (identical) rather
+        # than re-running `make gateway-image`. The bumped cargo
+        # build uses a separate target dir
+        # (`sandboxd/target/portable-bumped/`) so the base build's
+        # incremental cache is unaffected.
+        subprocess.run(
+            [str(HERE / "build-local-tarball.sh")],
+            check=True,
+            timeout=3600,  # first build is slow: every crate rebuilds
+                            # because CARGO_PKG_VERSION env-var changes.
+            env=env,
+        )
+
+    assert tarball.exists(), f"bumped tarball not produced: {tarball}"
+    return tarball
+
+
 def _read_workspace_version() -> str:
     cargo_toml = PROJECT_ROOT / "sandboxd" / "sandboxd" / "Cargo.toml"
     for line in cargo_toml.read_text().splitlines():
