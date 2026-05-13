@@ -1471,10 +1471,40 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
             );
             if action == "install" {
                 // daemon-reload after unit replacement so systemctl
-                // start in § 3.2.26 picks up the new unit.
-                let _ = Command::new("sudo")
+                // start in § 3.2.26 picks up the new unit. A swallowed
+                // failure would leave systemd serving the cached view
+                // of the OLD unit while we'd happily report ok — fail
+                // loud instead, with a forensic-parity log line.
+                match Command::new("sudo")
                     .args(["-k", "systemctl", "daemon-reload"])
-                    .output();
+                    .output()
+                {
+                    Ok(o) if o.status.success() => {
+                        log_step("daemon_reload", "action=reload status=ok");
+                    }
+                    Ok(o) => {
+                        log_step(
+                            "daemon_reload",
+                            &format!(
+                                "action=reload status=fail stderr=\"{}\"",
+                                String::from_utf8_lossy(&o.stderr).trim()
+                            ),
+                        );
+                        eprintln!(
+                            "sandbox update: systemctl daemon-reload failed: {}",
+                            String::from_utf8_lossy(&o.stderr).trim()
+                        );
+                        return 1;
+                    }
+                    Err(e) => {
+                        log_step(
+                            "daemon_reload",
+                            &format!("action=reload status=fail err=\"{e}\""),
+                        );
+                        eprintln!("sandbox update: failed to invoke systemctl daemon-reload: {e}");
+                        return 1;
+                    }
+                }
             }
         }
         Err(e) => {
