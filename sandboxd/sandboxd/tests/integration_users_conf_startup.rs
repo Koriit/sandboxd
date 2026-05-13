@@ -155,6 +155,7 @@ fn integration_users_conf_startup_refuses_when_no_matching_subnet() {
     // Sentinel username that cannot resolve via `getpwnam_r` on any
     // real host — Phase 2A's loader treats `Ok(None)` as a non-match.
     let raw = r#"{
+        "_schema_version": 1,
         "subnets": [
             {
                 "cidr": "10.209.0.0/20",
