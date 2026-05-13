@@ -545,6 +545,17 @@ fn write_sandbox_owned_file(dst: &Path, bytes: &[u8], mode: u32) -> Result<(), B
     use std::io::Write;
     tmp.write_all(bytes).map_err(BackupError::Io)?;
     tmp.flush().map_err(BackupError::Io)?;
+    // `NamedTempFile` defaults to mode 0600 owned by the running process
+    // (root, when invoked via `sudo sandbox update`). The downstream
+    // `sudo -u sandbox install` reads this file as the `sandbox` user;
+    // widen the read bit so the install succeeds. The destination mode is
+    // set independently by `install -m <mode>`.
+    use std::os::unix::fs::PermissionsExt;
+    let mut perm = std::fs::metadata(tmp.path())
+        .map_err(BackupError::Io)?
+        .permissions();
+    perm.set_mode(0o644);
+    std::fs::set_permissions(tmp.path(), perm).map_err(BackupError::Io)?;
     let tmp_path = tmp.path().to_path_buf();
     let mode_str = format!("{mode:04o}");
     run_sudo(&[
