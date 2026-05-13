@@ -1435,6 +1435,31 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
     }
 
     // § 3.2.24 — Apply config migrations (per file, atomically).
+    //
+    // Test-only failure-injection hook — DO NOT set in production.
+    // Used by tests/install-e2e/test_update_idempotency.py
+    // (test_update_partial_failure_backup_set_preserved) to verify the
+    // spec-§ 3.2.19 in-progress-manifest contract: a mid-update failure
+    // at the migrate step must leave a backup-set manifest with
+    // `completed_ok: false` on disk, which the next successful run
+    // must preserve (spec § 5.2). When `SANDBOX_UPDATE_TEST_FAIL_AT_STEP`
+    // is set to `migrate`, return a failure here before any migration
+    // runs — the in-progress manifest from § 3.2.19 is already on disk.
+    if std::env::var("SANDBOX_UPDATE_TEST_FAIL_AT_STEP")
+        .ok()
+        .as_deref()
+        == Some("migrate")
+    {
+        log_step(
+            "migrate",
+            "action=apply status=fail err=\"test-only injected failure (SANDBOX_UPDATE_TEST_FAIL_AT_STEP=migrate)\"",
+        );
+        eprintln!(
+            "sandbox update: migration step aborted by test-only env var \
+             SANDBOX_UPDATE_TEST_FAIL_AT_STEP=migrate"
+        );
+        return 1;
+    }
     for target in [
         cfg_migrations::TargetFile::UsersConf,
         cfg_migrations::TargetFile::BridgeConf,
