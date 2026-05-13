@@ -588,46 +588,88 @@ mod tests {
         );
     }
 
-    /// The atomic-write contract: the destination path holds the
-    /// pre-write content (or no content) until `persist` runs; readers
-    /// never see a half-written file. We exercise this by writing into
-    /// a tempfile parent that does not exist — `NamedTempFile::new_in`
-    /// errors before any byte hits `path`, so the destination is
-    /// untouched. This is the failure-mode counterpart to a successful
-    /// rename: either both happen (write + rename) or neither does.
+    /// The atomic-write contract: a failed `atomic_write` against the
+    /// canonical path leaves that path holding its pre-write bytes —
+    /// readers never see a half-written file. This is the security
+    /// boundary protecting `/etc/sandboxd/users.conf` against
+    /// half-applied config migrations.
+    ///
+    /// Fault injection: pre-populate `path` with "before" bytes, then
+    /// chmod its parent directory to `0o555` (read+execute, no write).
+    /// `atomic_write` calls `NamedTempFile::new_in(parent)` first,
+    /// which fails with `EACCES` because creating a new entry in the
+    /// parent requires write permission. Crucially the fault targets
+    /// the **same** path the post-assertion reads, so the test would
+    /// fail if `atomic_write` were ever rewritten to `std::fs::write`
+    /// directly (the non-atomic shape): a direct `fs::write` to an
+    /// existing file inside a `0o555` parent still succeeds because
+    /// truncating an existing file does not require parent write
+    /// permission — the test would observe `path` mutated to the new
+    /// bytes and fail.
+    ///
+    /// Skipped under root: `chmod 0o555` does not constrain `EUID == 0`,
+    /// so the fault injection is a no-op and `atomic_write` would
+    /// succeed. The unit-test profile runs as a regular user.
     #[test]
     fn apply_pending_atomic_write_visible_only_after_complete() {
+        if nix::unistd::geteuid().is_root() {
+            eprintln!(
+                "skipping: EUID == 0 bypasses chmod 0o555 fault injection; \
+                 contract is exercised by the non-root path."
+            );
+            return;
+        }
+
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
         let tmp = tempfile::tempdir().expect("tempdir");
-        let path = tmp.path().join("users.conf");
+        // Use a dedicated sub-directory so the chmod only affects the
+        // parent of `path`, not the tempdir's own writeable root. This
+        // keeps the tempdir's `Drop` cleanup unaffected if the
+        // post-test chmod-restore is skipped for any reason.
+        let parent = tmp.path().join("etc-sandboxd");
+        fs::create_dir(&parent).expect("create parent dir");
+
+        let path = parent.join("users.conf");
         let original = br#"{"subnets":[{"cidr":"10.0.0.0/24","allow_users":["sandbox","alice"]}]}"#;
-        std::fs::write(&path, original).unwrap();
+        fs::write(&path, original).expect("seed pre-write bytes");
 
-        // Inject a fault: pre-existing path whose parent is a regular
-        // file (so `NamedTempFile::new_in(parent)` returns ENOTDIR
-        // before any write happens). The destination path's content
-        // must be the pre-write bytes after the failure.
-        let blocker = tmp.path().join("blocker");
-        std::fs::write(&blocker, b"i am not a directory").unwrap();
-        // The synthetic target path lives "inside" the blocker — its
-        // parent is a regular file, not a dir.
-        let synthetic = blocker.join("users.conf");
+        // RAII guard: restore `parent` to 0o755 on drop so the
+        // tempdir's recursive cleanup can remove entries inside it,
+        // even if the test body panics before its final statement.
+        struct RestoreMode<'a>(&'a Path);
+        impl Drop for RestoreMode<'_> {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(self.0, fs::Permissions::from_mode(0o755));
+            }
+        }
+        let _restore = RestoreMode(&parent);
 
-        // Direct call: assert atomic_write errors and the original
-        // file (which we have not touched) is bit-for-bit preserved.
-        let err = atomic_write(&synthetic, b"new content")
-            .expect_err("write under a non-directory parent must error");
+        // Inject the fault: parent dir loses write permission. New
+        // entries (the tempfile that `atomic_write` would create) are
+        // refused; an existing file (`path`) keeps its 0o644 mode so a
+        // hypothetical non-atomic rewrite could still mutate it — that
+        // asymmetry is what makes this test distinguish atomic from
+        // non-atomic implementations.
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o555))
+            .expect("chmod parent to 0o555");
+
+        let err = atomic_write(&path, b"new content")
+            .expect_err("atomic_write into a read-only parent dir must error");
         match err {
             MigrationError::Io(_) => {}
             other => panic!("expected Io, got {other:?}"),
         }
 
-        // The pre-existing canonical-path file we wrote earlier must
-        // still hold its original content: the failed write touched
-        // `synthetic`, not `path`, so we assert the original `path`
-        // is unmodified — the same invariant the apply loop relies on
-        // (a failed migration never leaves the canonical path in a
-        // half-applied state).
-        let post = std::fs::read(&path).unwrap();
+        // The canonical path's content must be byte-for-byte the
+        // pre-write bytes: a failed atomic_write never leaves `path`
+        // in a half-applied state. (This assertion would fail under a
+        // non-atomic rewrite — see the test-level doc-comment.)
+        //
+        // Read while parent is still 0o555 to keep the fault scope
+        // tight; read+execute is enough to traverse + open the file.
+        let post = fs::read(&path).expect("read canonical path back");
         assert_eq!(
             post.as_slice(),
             original,
