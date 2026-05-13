@@ -635,6 +635,174 @@ mod tests {
         );
     }
 
+    /// Pin the first arm of `validate_against_target_schema`: a
+    /// migration whose `apply()` returns JSON that does not satisfy
+    /// the strict `UsersConfig` schema (here: `subnets` field missing
+    /// against the non-Option, `deny_unknown_fields` struct) must be
+    /// rejected with `MigrationError::Validation` before the atomic
+    /// rename — the file on disk stays at its pre-migration content.
+    ///
+    /// Spec 5 § 4.4 fail-closed contract: a buggy migration that
+    /// produces bytes the daemon won't load must never reach the
+    /// canonical path. A regression that disabled the round-trip
+    /// check would trip this test.
+    #[test]
+    fn apply_pending_rejects_migration_whose_bytes_fail_target_schema() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("users.conf");
+        let pre_bytes =
+            br#"{"subnets":[{"cidr":"10.0.0.0/24","allow_users":["sandbox","alice"]}]}"#;
+        std::fs::write(&path, pre_bytes).unwrap();
+
+        static REG: &[&dyn ConfigMigration] = &[&StubBytesMissSubnets];
+        let mut result: Option<Result<Vec<u32>, MigrationError>> = None;
+        with_test_registry(REG, || {
+            result = Some(apply_pending_at_with_test_registry(
+                TargetFile::UsersConf,
+                &path,
+            ));
+        });
+        let err = result
+            .unwrap()
+            .expect_err("schema-failing bytes must error");
+        match err {
+            MigrationError::Validation(msg) => {
+                assert!(
+                    msg.contains("does not satisfy UsersConfig schema"),
+                    "Validation message must name the schema failure; got: {msg}"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+
+        // Fail-closed: the canonical path must still read the
+        // pre-migration bytes — atomic_write is never reached.
+        let post = std::fs::read(&path).unwrap();
+        assert_eq!(
+            post.as_slice(),
+            pre_bytes,
+            "failed validation must not mutate the canonical path"
+        );
+    }
+
+    /// Pin the second arm of `validate_against_target_schema`: a
+    /// migration whose `apply()` returns bytes that round-trip through
+    /// `UsersConfig` cleanly but stamp the wrong `_schema_version`
+    /// (here: 0 while the migration's `to_version()` is 1) must be
+    /// rejected with `MigrationError::Validation` before the atomic
+    /// rename — the file on disk stays at its pre-migration content.
+    ///
+    /// Spec 5 § 4.5 contract: every migration is responsible for
+    /// stamping its `to_version` into the file. A regression that
+    /// disabled the version-marker sanity check would trip this test.
+    #[test]
+    fn apply_pending_rejects_migration_whose_bytes_stamp_wrong_version() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("users.conf");
+        let pre_bytes =
+            br#"{"subnets":[{"cidr":"10.0.0.0/24","allow_users":["sandbox","alice"]}]}"#;
+        std::fs::write(&path, pre_bytes).unwrap();
+
+        static REG: &[&dyn ConfigMigration] = &[&StubBytesStampWrongVersion];
+        let mut result: Option<Result<Vec<u32>, MigrationError>> = None;
+        with_test_registry(REG, || {
+            result = Some(apply_pending_at_with_test_registry(
+                TargetFile::UsersConf,
+                &path,
+            ));
+        });
+        let err = result
+            .unwrap()
+            .expect_err("wrong version-stamp bytes must error");
+        match err {
+            MigrationError::Validation(msg) => {
+                assert!(
+                    msg.contains("post-migration schema version is 0, expected 1"),
+                    "Validation message must name the version mismatch; got: {msg}"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+
+        // Fail-closed: the canonical path must still read the
+        // pre-migration bytes — atomic_write is never reached.
+        let post = std::fs::read(&path).unwrap();
+        assert_eq!(
+            post.as_slice(),
+            pre_bytes,
+            "failed validation must not mutate the canonical path"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Synthetic migrations used by the two validation-arm tests above.
+    // Each returns bytes that defeat one — and only one — of the two
+    // arms inside `validate_against_target_schema`, so each arm has its
+    // own failing-bytes pin. (Items in a module are order-independent
+    // in Rust; declared here for proximity to the existing stubs.)
+    // ---------------------------------------------------------------------
+
+    /// Synthetic V001 whose `apply()` produces JSON that parses but
+    /// lacks the required `subnets` field — the strict `UsersConfig`
+    /// round-trip (deny_unknown_fields + non-Option `subnets`) must
+    /// reject it. Used by
+    /// `apply_pending_rejects_migration_whose_bytes_fail_target_schema`.
+    struct StubBytesMissSubnets;
+    impl ConfigMigration for StubBytesMissSubnets {
+        fn id(&self) -> u32 {
+            201
+        }
+        fn name(&self) -> &'static str {
+            "stub_bytes_miss_subnets"
+        }
+        fn target_file(&self) -> TargetFile {
+            TargetFile::UsersConf
+        }
+        fn from_version(&self) -> u32 {
+            0
+        }
+        fn to_version(&self) -> u32 {
+            1
+        }
+        fn apply(&self, _bytes: &[u8]) -> Result<Vec<u8>, MigrationError> {
+            // Valid JSON, version stamp present at the migration's
+            // declared `to_version`, but `subnets` is missing. The
+            // strict `UsersConfig` round-trip must refuse this.
+            Ok(br#"{"_schema_version":1}"#.to_vec())
+        }
+    }
+
+    /// Synthetic V001 whose `apply()` produces structurally valid
+    /// `UsersConfig`-shaped bytes (so the strict round-trip passes)
+    /// but stamps `_schema_version: 0` instead of the migration's
+    /// declared `to_version() == 1`. The post-migration version-marker
+    /// check must reject it. Used by
+    /// `apply_pending_rejects_migration_whose_bytes_stamp_wrong_version`.
+    struct StubBytesStampWrongVersion;
+    impl ConfigMigration for StubBytesStampWrongVersion {
+        fn id(&self) -> u32 {
+            202
+        }
+        fn name(&self) -> &'static str {
+            "stub_bytes_stamp_wrong_version"
+        }
+        fn target_file(&self) -> TargetFile {
+            TargetFile::UsersConf
+        }
+        fn from_version(&self) -> u32 {
+            0
+        }
+        fn to_version(&self) -> u32 {
+            1
+        }
+        fn apply(&self, _bytes: &[u8]) -> Result<Vec<u8>, MigrationError> {
+            // Valid `UsersConfig` shape, but the version stamp is 0
+            // while `to_version()` is 1 — the version-marker arm must
+            // refuse this.
+            Ok(br#"{"_schema_version":0,"subnets":[]}"#.to_vec())
+        }
+    }
+
     /// Pin the binding selection rule from Spec 5 § 4.2: every entry
     /// in the **production** registry has `to_version() ==
     /// from_version() + 1`. A future contributor adding a
