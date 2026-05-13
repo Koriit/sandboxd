@@ -81,21 +81,30 @@ def test_update_concurrent_refused(
         check=True, timeout=30,
     )
     # Hold the flock and run the refused `sandbox update` inside the
-    # SAME `vm.shell()` call. A prior shape used a background `setsid
-    # nohup ... &` holder across two separate `vm.shell()` calls;
-    # systemd-logind on the guest reaps user processes when the SSH
-    # session that spawned them exits (`KillUserProcesses=yes`), so
-    # by the time the second `vm.shell()` ran `sandbox update`, the
-    # holder was dead and the update succeeded by adopting the dead
-    # PID's lock. Consolidating into one SSH session keeps the holder
-    # alive for the concurrency window.
+    # SAME `vm.shell()` call. Two earlier shapes did not work:
+    #   1. Background `setsid nohup sudo -u sandbox flock ... &` across
+    #      two separate `vm.shell()` calls — the guest's systemd-logind
+    #      reaped the holder between SSH sessions.
+    #   2. Consolidated `sudo -u sandbox flock -c "sleep 60"` in one
+    #      call — `sandbox` has `nologin` as its shell, and although
+    #      `sudo -u sandbox <cmd>` works for direct commands, `flock`'s
+    #      `-c` arg internally invokes a shell which on this user's
+    #      PAM/account stack rejects with "This account is currently
+    #      not available", so the holder exits immediately.
+    #
+    # Hold the flock as root. The kernel `flock` is advisory on the
+    # file inode and is per-process; the daemon-side update code runs
+    # as root via `sudo sandbox update` but that's a DIFFERENT process,
+    # so the lock still blocks. The test asserts the daemon's
+    # concurrency guard fires when ANY process holds the flock — it
+    # doesn't care about the holder's identity.
     #
     # Sanity-check exit codes (70/71) surface as a recipe-side
     # failure with a distinct rc so test assertions can tell harness
     # bugs apart from update-side regressions.
     refusal_recipe = f"""
 set -u
-sudo -u sandbox flock -n /var/lib/sandbox/.update.lock -c "sleep 60" &
+sudo flock -n /var/lib/sandbox/.update.lock -c "sleep 60" &
 HOLDER_PID=$!
 sleep 1
 # Sanity 1: holder process alive.
@@ -104,15 +113,15 @@ if ! ps -p "$HOLDER_PID" >/dev/null; then
     exit 70
 fi
 # Sanity 2: lock truly held (a competing non-blocking flock must fail).
-if sudo -u sandbox flock -n /var/lib/sandbox/.update.lock -c true; then
+if sudo flock -n /var/lib/sandbox/.update.lock -c true; then
     echo 'flock holder did not actually take the lock' >&2
-    kill "$HOLDER_PID" 2>/dev/null
+    sudo kill "$HOLDER_PID" 2>/dev/null
     exit 71
 fi
 # The real test: `sandbox update` must refuse.
 sudo sandbox update --from {bumped_in_vm} --yes
 RC=$?
-kill "$HOLDER_PID" 2>/dev/null
+sudo kill "$HOLDER_PID" 2>/dev/null
 wait "$HOLDER_PID" 2>/dev/null
 exit $RC
 """
