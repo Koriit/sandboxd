@@ -324,6 +324,149 @@ pub async fn fetch_session_counts(socket_path: &str) -> SessionCounts {
     counts
 }
 
+/// Stopped-session compat bucket — Spec 5 § 3.1.7. The pre-flight
+/// classifies each stopped session against the target binary's
+/// `DAEMON_GUEST_PROTO_VERSION` and renders the three-bucket
+/// breakdown in the confirmation prompt so the operator knows up
+/// front whether a session will be picked up by an in-place refresh
+/// or whether it'll need to be recreated after the upgrade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompatBucket {
+    /// `session_proto == target_proto` — the upgraded daemon talks the
+    /// session's protocol directly; no refresh needed.
+    Ok,
+    /// `can_refresh_in_place(session_proto, target_proto)` is true —
+    /// the upgraded daemon's refresh path can re-stage the embedded
+    /// guest binary into the session at first start.
+    RefreshInPlace,
+    /// Neither — the session must be recreated against the new
+    /// daemon.
+    Recreate,
+}
+
+impl CompatBucket {
+    /// Operator-facing single-token label rendered in the confirmation
+    /// prompt and `--dry-run` output.
+    pub fn label(self) -> &'static str {
+        match self {
+            CompatBucket::Ok => "ok",
+            CompatBucket::RefreshInPlace => "refresh-in-place",
+            CompatBucket::Recreate => "recreate",
+        }
+    }
+}
+
+/// One row in the per-session compat classification: session id +
+/// the protocol version the daemon last stamped on it + the bucket it
+/// falls into for a given target.
+#[derive(Debug, Clone)]
+pub struct SessionCompat {
+    pub id: String,
+    pub session_proto: u32,
+    pub bucket: CompatBucket,
+}
+
+/// Snapshot of the per-session compat classification surfaced in the
+/// confirmation prompt and the install log. Spec 5 § 3.1.7.
+#[derive(Debug, Clone, Default)]
+pub struct SessionCompatSet {
+    pub target_proto: u32,
+    pub stopped: Vec<SessionCompat>,
+    /// `true` iff the daemon was reachable AND the staged binary's
+    /// `--dump-proto-version` returned an answer. When either piece is
+    /// missing the prompt elides the per-session breakdown and falls
+    /// back to the flat `stopped sessions: N` line.
+    pub classified: bool,
+}
+
+/// Classify a single session against the upgrade target's protocol
+/// version. Same three-bucket decision tree the daemon's runtime arm
+/// (`start-session`) uses, factored out so the CLI can render it ahead
+/// of time. Spec 5 § 3.1.7.
+///
+/// Mirrors [`sandbox_core::guest::is_protocol_compatible`] /
+/// [`sandbox_core::guest::can_refresh_in_place`] but applied against
+/// the *target* protocol rather than the current daemon's, so the
+/// classification reflects post-upgrade behaviour rather than pre.
+pub fn classify_session_compat(session_proto: u32, target_proto: u32) -> CompatBucket {
+    if session_proto == target_proto {
+        CompatBucket::Ok
+    } else if session_proto != 0 {
+        // `can_refresh_in_place` is `session_proto != 0` for the
+        // current daemon (Spec 5 § 3.1.7's "session_proto == 0 →
+        // unsalvageable" arm). The target binary's predicate may
+        // widen this in a future release; until that happens, mirror
+        // the constant so the classification matches runtime
+        // semantics.
+        CompatBucket::RefreshInPlace
+    } else {
+        CompatBucket::Recreate
+    }
+}
+
+/// Best-effort fetch of stopped sessions and their persisted
+/// `guest_protocol_version`. Returns an empty `Vec` when the daemon
+/// is unreachable or the response is malformed — the read-only modes
+/// degrade gracefully. The list endpoint already filters to the
+/// caller's own sessions (api-session-isolation spec § 2.4), so this
+/// is the operator's view, not the system-wide one.
+async fn fetch_stopped_sessions_with_proto(socket_path: &str) -> Vec<(String, u32)> {
+    let body = match http_get(socket_path, "/sessions").await {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    #[derive(serde::Deserialize)]
+    struct Snip {
+        id: String,
+        state: String,
+        #[serde(default)]
+        guest_protocol_version: u32,
+    }
+    let sessions: Vec<Snip> = match serde_json::from_slice(&body) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    sessions
+        .into_iter()
+        .filter(|s| s.state == "Stopped")
+        .map(|s| (s.id, s.guest_protocol_version))
+        .collect()
+}
+
+/// Classify each stopped session against `target_proto`. Returns an
+/// empty `SessionCompatSet` (with `classified: false`) when the
+/// daemon is unreachable.
+pub async fn classify_stopped_sessions(socket_path: &str, target_proto: u32) -> SessionCompatSet {
+    // The daemon-reachability signal comes from a fresh `/sessions`
+    // call rather than from a possibly-stale earlier `SessionCounts`.
+    // We re-fetch here so the prompt's classification block reflects
+    // the moment immediately before the operator confirms — no race
+    // window where a session quietly transitions between two calls.
+    let body = match http_get(socket_path, "/sessions").await {
+        Ok(b) => b,
+        Err(_) => return SessionCompatSet::default(),
+    };
+    let _: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return SessionCompatSet::default(),
+    };
+    let stopped = fetch_stopped_sessions_with_proto(socket_path).await;
+    let mut rows: Vec<SessionCompat> = stopped
+        .into_iter()
+        .map(|(id, proto)| SessionCompat {
+            id,
+            session_proto: proto,
+            bucket: classify_session_compat(proto, target_proto),
+        })
+        .collect();
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    SessionCompatSet {
+        target_proto,
+        stopped: rows,
+        classified: true,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Disk-space check (§ 3.1.8)
 // ---------------------------------------------------------------------------
@@ -611,12 +754,24 @@ pub fn render_dry_run<W: Write>(
 
 /// Render the confirmation prompt summary (no input read; caller wires
 /// up stdin). § 2.4. Returns the rendered string.
+///
+/// `pending_db_migrations` is the staged daemon's migration set as
+/// returned by `dump-migration-set`; passing an empty slice elides the
+/// "pending db migrations" block from the prompt (the read-only modes
+/// don't extract the tarball and therefore can't enumerate it).
+///
+/// `session_compat` is the per-session compat classification computed
+/// against the target binary's `DAEMON_GUEST_PROTO_VERSION`; passing a
+/// `None` (or a `SessionCompatSet` with `classified: false`) renders
+/// the flat `stopped sessions: N` line, matching the prior shape.
 pub fn render_confirmation_summary(
     from_version: &str,
     to_version: &str,
     pending_config_migrations: &[PendingMigration],
+    pending_db_migrations: &[StagedMigrationEntry],
     daemon_was_running: bool,
     session_counts: &SessionCounts,
+    session_compat: Option<&SessionCompatSet>,
 ) -> String {
     let mut s = String::new();
     s.push_str("sandbox update will apply:\n");
@@ -634,7 +789,20 @@ pub fn render_confirmation_summary(
             names.join(", ")
         ));
     }
-    s.push_str("  pending db migrations:      (enumerated after extraction at § 3.1.10)\n");
+    if pending_db_migrations.is_empty() {
+        s.push_str("  pending db migrations:      none\n");
+    } else {
+        s.push_str(&format!(
+            "  pending db migrations:      {}\n",
+            pending_db_migrations.len()
+        ));
+        for m in pending_db_migrations {
+            s.push_str(&format!(
+                "    - V{:03} ({}): {} -> {} [{}]\n",
+                m.id, m.name, m.from_version, m.to_version, m.target_file
+            ));
+        }
+    }
     s.push_str(&format!(
         "  daemon status now:          {}\n",
         if daemon_was_running {
@@ -643,10 +811,43 @@ pub fn render_confirmation_summary(
             "inactive (will remain stopped after upgrade)"
         }
     ));
-    s.push_str(&format!(
-        "  stopped sessions:           {}\n",
-        session_counts.stopped
-    ));
+    // Per-session compat breakdown: § 3.1.7. When the daemon was
+    // unreachable (`classified == false`), fall back to the flat count.
+    let classified = session_compat.is_some_and(|c| c.classified);
+    if classified {
+        let compat = session_compat.expect("classified implies Some");
+        let mut ok = 0usize;
+        let mut refresh = 0usize;
+        let mut recreate = 0usize;
+        for row in &compat.stopped {
+            match row.bucket {
+                CompatBucket::Ok => ok += 1,
+                CompatBucket::RefreshInPlace => refresh += 1,
+                CompatBucket::Recreate => recreate += 1,
+            }
+        }
+        s.push_str(&format!(
+            "  stopped sessions compat:    {} sessions  (ok={}, refresh-in-place={}, recreate={})\n",
+            compat.stopped.len(),
+            ok,
+            refresh,
+            recreate
+        ));
+        for row in &compat.stopped {
+            s.push_str(&format!(
+                "    - {}  proto={} -> {}  {}\n",
+                row.id,
+                row.session_proto,
+                compat.target_proto,
+                row.bucket.label()
+            ));
+        }
+    } else {
+        s.push_str(&format!(
+            "  stopped sessions:           {}\n",
+            session_counts.stopped
+        ));
+    }
     s.push('\n');
     s.push_str("Proceed? [y/N]:");
     s
@@ -887,6 +1088,45 @@ pub async fn run(args: UpdateArgs) -> i32 {
         }
     }
 
+    // § 3.1.10 (extract + sha256 cross-check) — stage the tarball BEFORE
+    // the confirmation prompt so the prompt can enumerate the target's
+    // DB migrations and classify each session against the *target*
+    // binary's protocol version. Extraction itself is to a private
+    // tempdir; the lock is acquired later (§ 3.2.13) before any
+    // host-state mutation. Failure here is operator-actionable so we
+    // surface it directly rather than waiting until the lock-held
+    // window.
+    let staged = match prepare_staged_tarball(&args, &target_version) {
+        Ok(s) => s,
+        Err(e) => {
+            log_step(
+                "stage_tarball",
+                &format!("action=stage status=fail err=\"{e}\""),
+            );
+            eprintln!("sandbox update: {e}");
+            return 1i32;
+        }
+    };
+    match fetch::verify_artifact_digests(&staged) {
+        Ok(()) => {
+            log_step(
+                "sha256_verify",
+                &format!(
+                    "action=verify count={} status=ok",
+                    staged.manifest.artifacts.len()
+                ),
+            );
+        }
+        Err(e) => {
+            log_step(
+                "sha256_verify",
+                &format!("action=verify status=fail err=\"{e}\""),
+            );
+            eprintln!("sandbox update: {e}");
+            return 1i32;
+        }
+    }
+
     // § 3.1.11 — migration dry-run delegate. We run the framework's
     // in-memory walk against the current registry; § 3.2.24 will
     // commit the actual writes during the stateful phase (S3).
@@ -903,6 +1143,41 @@ pub async fn run(args: UpdateArgs) -> i32 {
         }
     }
 
+    // § 3.1.4 / § 3.1.7 — query the staged (target-version) binary for
+    // (a) the pending DB-migration enumeration and (b) the target
+    // daemon's `DAEMON_GUEST_PROTO_VERSION`. Both are read-only
+    // subprocess calls against the just-extracted binary; failure here
+    // does not block the upgrade — we degrade to the unclassified
+    // prompt shape and log the reason, so operator awareness wins over
+    // pre-flight rigidity.
+    let staged_sandbox = staged.sandbox_bin();
+    let pending_db_migrations = match query_staged_migration_set(&staged_sandbox) {
+        Ok(entries) => entries,
+        Err(e) => {
+            log_step(
+                "dump_migration_set",
+                &format!("action=query status=fail err=\"{e}\""),
+            );
+            Vec::new()
+        }
+    };
+    let session_compat = match query_staged_proto_version(&staged_sandbox) {
+        Ok(target_proto) => {
+            log_step(
+                "dump_proto_version",
+                &format!("action=query target_proto={target_proto} status=ok"),
+            );
+            Some(classify_stopped_sessions(&args.socket_path, target_proto).await)
+        }
+        Err(e) => {
+            log_step(
+                "dump_proto_version",
+                &format!("action=query status=fail err=\"{e}\""),
+            );
+            None
+        }
+    };
+
     // § 3.1.12 — confirmation prompt.
     // The sticky `was_running` is sampled here from the live systemd
     // probe (the lock isn't acquired yet — that's M16-S3).
@@ -911,8 +1186,10 @@ pub async fn run(args: UpdateArgs) -> i32 {
         &state.installed_version,
         &target_version,
         &pending_migrations,
+        &pending_db_migrations,
         daemon_was_running,
         &session_counts,
+        session_compat.as_ref(),
     );
     print!("{summary} ");
     let _ = std::io::stdout().flush();
@@ -928,11 +1205,11 @@ pub async fn run(args: UpdateArgs) -> i32 {
 
     // ----- Stateful phase (§§ 3.2.13-3.2.30) -----
     apply_stateful(StatefulInputs {
-        args: &args,
         state: &state,
         target_version: &target_version,
         daemon_was_running,
         pending_migrations: &pending_migrations,
+        staged: &staged,
     })
     .await
 }
@@ -945,7 +1222,6 @@ pub async fn run(args: UpdateArgs) -> i32 {
 /// 18-step contract can be reasoned about as a straight-line sequence
 /// of `do_or_skip` calls rather than mutable shared state.
 struct StatefulInputs<'a> {
-    args: &'a UpdateArgs,
     state: &'a InstallState,
     target_version: &'a str,
     daemon_was_running: bool,
@@ -955,6 +1231,13 @@ struct StatefulInputs<'a> {
     /// `migrate::apply_file_chain` rather than walking this slice.
     #[allow(dead_code)]
     pending_migrations: &'a [PendingMigration],
+    /// The staged tarball — extracted during the pre-flight (after
+    /// sigstore verify, before the confirmation prompt) so the prompt
+    /// can enumerate the target binary's DB migrations and protocol
+    /// version. Threaded through here so the stateful phase doesn't
+    /// re-stage; the directory lives only for the duration of the
+    /// process and is reaped on exit.
+    staged: &'a fetch::StagedTarball,
 }
 
 /// The full 18-step stateful orchestration. Spec 5 §§ 3.2.13-3.2.30.
@@ -1302,49 +1585,12 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
     }
     log_step("backup_manifest", "status=in-progress action=write");
 
-    // Stage the tarball: we need it for § 3.2.20 (docker load) and
-    // § 3.2.21 (binary install). When `--from <tarball>` was passed
-    // we extract; when `--from <directory>` was passed we use it
-    // directly (the test harness path); when no `--from` was passed
-    // we would `curl` the tarball — currently a refusal, since
-    // bridge to the GH download requires more wiring. Operators in
-    // the field pass `--from`.
-    let staged = match prepare_staged_tarball(inputs.args, inputs.target_version) {
-        Ok(s) => s,
-        Err(e) => {
-            log_step(
-                "stage_tarball",
-                &format!("action=stage status=fail err=\"{e}\""),
-            );
-            eprintln!("sandbox update: {e}");
-            return 1;
-        }
-    };
-
-    // § 3.1.10 (trailing half) — every file unpacked from the tarball
-    // must hash-match the value MANIFEST records for it. The sigstore
-    // step earlier signed the tarball's bytes; this step closes the
-    // loop on a per-file basis, catching a tampered MANIFEST that
-    // somehow slipped the upstream signature check.
-    match fetch::verify_artifact_digests(&staged) {
-        Ok(()) => {
-            log_step(
-                "sha256_verify",
-                &format!(
-                    "action=verify count={} status=ok",
-                    staged.manifest.artifacts.len()
-                ),
-            );
-        }
-        Err(e) => {
-            log_step(
-                "sha256_verify",
-                &format!("action=verify status=fail err=\"{e}\""),
-            );
-            eprintln!("sandbox update: {e}");
-            return 1;
-        }
-    }
+    // The tarball was staged + sha256-verified during the pre-flight
+    // (after sigstore verify, before the confirmation prompt) so the
+    // prompt could enumerate the target binary's DB migrations and
+    // protocol version. We re-use that staged tree here — no second
+    // extraction.
+    let staged = inputs.staged;
 
     // § 3.2.20 — docker load gateway image (BEFORE binary swap).
     let image_tar = staged.gateway_image_tar();
@@ -1871,6 +2117,82 @@ fn prepare_staged_tarball(
     fetch::extract_tarball(from, &dest).map_err(|e| format!("extract {}: {e}", from.display()))
 }
 
+/// One entry returned by the staged binary's `--dump-migration-set`.
+/// Shape-compatible with [`crate::cfg_migrations::MigrationEntry`] but
+/// re-declared here as the wire-side view so the CLI can render
+/// dump-output read from a *different* binary version without sharing
+/// types with the producer.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct StagedMigrationEntry {
+    pub id: u32,
+    pub name: String,
+    pub from_version: u32,
+    pub to_version: u32,
+    pub target_file: String,
+}
+
+/// Run the staged CLI's `--dump-migration-set` and parse the result.
+/// The dump is read-only (no privilege, no path arguments) and runs
+/// entirely inside the binary's process — invoking it on the unstaged
+/// (current-version) binary is also safe, but the point is to read
+/// the *target* registry so the prompt enumerates what the upgrade
+/// will actually apply.
+pub fn query_staged_migration_set(
+    staged_sandbox: &Path,
+) -> Result<Vec<StagedMigrationEntry>, String> {
+    let out = std::process::Command::new(staged_sandbox)
+        .arg("dump-migration-set")
+        .output()
+        .map_err(|e| {
+            format!(
+                "invoke {} dump-migration-set: {e}",
+                staged_sandbox.display()
+            )
+        })?;
+    if !out.status.success() {
+        return Err(format!(
+            "{} dump-migration-set: exit {:?}: {}",
+            staged_sandbox.display(),
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let entries: Vec<StagedMigrationEntry> = serde_json::from_slice(&out.stdout)
+        .map_err(|e| format!("parse migration set from {}: {e}", staged_sandbox.display()))?;
+    Ok(entries)
+}
+
+/// Run the staged CLI's `--dump-proto-version` and extract the target
+/// daemon's `DAEMON_GUEST_PROTO_VERSION`. The JSON shape is pinned at
+/// `{ "daemon_guest_proto_version": <u32> }` — operator-stable so
+/// future protocol bumps add fields rather than renaming this key.
+pub fn query_staged_proto_version(staged_sandbox: &Path) -> Result<u32, String> {
+    #[derive(serde::Deserialize)]
+    struct Payload {
+        daemon_guest_proto_version: u32,
+    }
+    let out = std::process::Command::new(staged_sandbox)
+        .arg("dump-proto-version")
+        .output()
+        .map_err(|e| {
+            format!(
+                "invoke {} dump-proto-version: {e}",
+                staged_sandbox.display()
+            )
+        })?;
+    if !out.status.success() {
+        return Err(format!(
+            "{} dump-proto-version: exit {:?}: {}",
+            staged_sandbox.display(),
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let payload: Payload = serde_json::from_slice(&out.stdout)
+        .map_err(|e| format!("parse proto-version from {}: {e}", staged_sandbox.display()))?;
+    Ok(payload.daemon_guest_proto_version)
+}
+
 /// `install -D -m <mode> -o root -g root <src> <dst>` via sudo, with
 /// sha256 compare for idempotency. Returns `"install"` or `"skip"`.
 fn install_binary_if_changed(
@@ -2375,12 +2697,14 @@ mod tests {
             "1.0.0",
             "1.1.0",
             &[],
+            &[],
             true,
             &SessionCounts {
                 active: 0,
                 stopped: 0,
                 reachable: true,
             },
+            None,
         );
         assert!(s.contains("Proceed? [y/N]:"), "got: {s}");
     }
@@ -2407,6 +2731,123 @@ mod tests {
         assert_eq!(
             compare_versions("unknown", "1.1.0"),
             VersionCompare::InstalledUnknown
+        );
+    }
+
+    /// Spec 5 § 3.1.7 — `classify_session_compat` splits sessions into
+    /// three buckets: `Ok` for exact-match, `RefreshInPlace` when the
+    /// target's `can_refresh_in_place` accepts the session's proto,
+    /// `Recreate` for the unsalvageable case (`session_proto == 0`).
+    #[test]
+    fn classify_session_compat_three_buckets() {
+        // Same proto → no-op.
+        assert_eq!(classify_session_compat(2, 2), CompatBucket::Ok);
+        // Older proto, non-zero → refresh.
+        assert_eq!(classify_session_compat(1, 2), CompatBucket::RefreshInPlace);
+        // Newer-than-target proto, non-zero → refresh (the daemon's
+        // refresh path stages its embedded guest into the session;
+        // narrowing this is a future-spec change, not a current bucket).
+        assert_eq!(classify_session_compat(3, 2), CompatBucket::RefreshInPlace);
+        // Proto = 0 (legacy / pre-V006) → unsalvageable.
+        assert_eq!(classify_session_compat(0, 2), CompatBucket::Recreate);
+    }
+
+    /// `CompatBucket::label` returns the operator-facing tokens we
+    /// render in the confirmation prompt; pinned here so a future
+    /// rename of an enum variant doesn't silently change the prompt.
+    #[test]
+    fn compat_bucket_labels_are_stable_tokens() {
+        assert_eq!(CompatBucket::Ok.label(), "ok");
+        assert_eq!(CompatBucket::RefreshInPlace.label(), "refresh-in-place");
+        assert_eq!(CompatBucket::Recreate.label(), "recreate");
+    }
+
+    /// `render_confirmation_summary` renders the operator-visible
+    /// three-bucket breakdown when the per-session classification was
+    /// computed; this pins the prompt shape the M16-S4 spec § 2.4
+    /// recreate-classification contract calls for.
+    #[test]
+    fn confirmation_summary_renders_three_bucket_breakdown() {
+        let compat = SessionCompatSet {
+            target_proto: 2,
+            stopped: vec![
+                SessionCompat {
+                    id: "alpha".to_string(),
+                    session_proto: 2,
+                    bucket: CompatBucket::Ok,
+                },
+                SessionCompat {
+                    id: "beta".to_string(),
+                    session_proto: 1,
+                    bucket: CompatBucket::RefreshInPlace,
+                },
+                SessionCompat {
+                    id: "gamma".to_string(),
+                    session_proto: 0,
+                    bucket: CompatBucket::Recreate,
+                },
+            ],
+            classified: true,
+        };
+        let pending_db = [StagedMigrationEntry {
+            id: 7,
+            name: "add_widget_table".to_string(),
+            from_version: 6,
+            to_version: 7,
+            target_file: "sessions.db".to_string(),
+        }];
+        let s = render_confirmation_summary(
+            "1.0.0",
+            "1.1.0",
+            &[],
+            &pending_db,
+            true,
+            &SessionCounts {
+                active: 0,
+                stopped: 3,
+                reachable: true,
+            },
+            Some(&compat),
+        );
+        assert!(s.contains("ok=1"), "got: {s}");
+        assert!(s.contains("refresh-in-place=1"), "got: {s}");
+        assert!(s.contains("recreate=1"), "got: {s}");
+        assert!(s.contains("alpha"), "got: {s}");
+        assert!(s.contains("beta"), "got: {s}");
+        assert!(s.contains("gamma"), "got: {s}");
+        assert!(s.contains("V007 (add_widget_table)"), "got: {s}");
+        assert!(s.contains("6 -> 7"), "got: {s}");
+        assert!(s.contains("[sessions.db]"), "got: {s}");
+        // Placeholder spec-internals string is gone.
+        assert!(
+            !s.contains("(enumerated after extraction at"),
+            "placeholder leaked: {s}"
+        );
+    }
+
+    /// When the classification step couldn't run (daemon unreachable
+    /// or staged-binary probe failed), the prompt falls back to the
+    /// flat `stopped sessions: N` line — no spec-internals leak.
+    #[test]
+    fn confirmation_summary_falls_back_to_flat_count_without_classification() {
+        let s = render_confirmation_summary(
+            "1.0.0",
+            "1.1.0",
+            &[],
+            &[],
+            true,
+            &SessionCounts {
+                active: 0,
+                stopped: 4,
+                reachable: true,
+            },
+            None,
+        );
+        assert!(s.contains("stopped sessions:           4"), "got: {s}");
+        assert!(s.contains("pending db migrations:      none"), "got: {s}");
+        assert!(
+            !s.contains("(enumerated after extraction at"),
+            "placeholder leaked: {s}"
         );
     }
 
@@ -2533,12 +2974,14 @@ mod tests {
             "1.0.0",
             "1.1.0",
             &[],
+            &[],
             true,
             &SessionCounts {
                 active: 0,
                 stopped: 0,
                 reachable: true,
             },
+            None,
         );
         assert!(
             summary.contains("Proceed? [y/N]:"),
