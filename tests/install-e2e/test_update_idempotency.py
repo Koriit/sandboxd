@@ -89,15 +89,11 @@ def test_update_interrupted_then_resumed(
     # We extract the bumped tarball into the VM and `install` its
     # bin/sandboxd and bin/sandbox-route-helper to the canonical paths.
     # We deliberately do NOT pre-stage `bin/sandbox` (the CLI binary
-    # itself): the running `sudo sandbox update` invocation that
-    # follows must execute the base v binary, not the bumped v'. The
-    # update flow's pre-flight steps (e.g. cosign verify-blob at
-    # § 3.1.10) require `/usr/local/bin/cosign` to exist on the host;
-    # install.sh stages cosign into its own tempdir and does not place
-    # it at the canonical path the v' binary expects. Pre-staging the
-    # v' CLI here would silently break the pre-flight when it executes.
-    # The remaining two binary swaps still emit `action=skip`, which is
-    # what the assertion below pins.
+    # itself) — the resume invocation below should be executed by the
+    # base v binary on disk, keeping a clean "the running CLI is v,
+    # not v'" invariant for the test. The remaining two binary swaps
+    # still emit `action=skip` for the install_binary step on resume,
+    # which is what the spec § 9.1 idempotency assertion below pins.
     stage_dir = "/tmp/sandbox-update-prestage"
     vm.shell(
         f"sudo rm -rf {stage_dir} && mkdir -p {stage_dir} && "
@@ -152,8 +148,17 @@ def test_update_interrupted_then_resumed(
     # path. Truncate the install log so we read just this run's lines.
     vm.shell("sudo truncate -s 0 /var/log/sandbox-install.log", check=True)
 
+    # Feed `--from <extracted_root>` (directory shape), not the tarball.
+    # The base v CLI on disk was built from the same source tree as v'
+    # and therefore also calls cosign verify-blob at § 3.1.10 when given
+    # a tarball; using the staged-directory shape bypasses that gate
+    # (`prepare_staged_tarball` treats a directory as already-staged and
+    # the call site skips `verify_signature` when `from.is_file()` is
+    # false). The contract under test is idempotency on resume, not
+    # signature verification — keeping cosign out of this test removes
+    # an unrelated host dependency.
     r = vm.shell(
-        f"sudo sandbox update --from {bumped_in_vm} --yes",
+        f"sudo sandbox update --from {extracted_root} --yes",
         timeout=300,
     )
     assert r.returncode == 0, (
@@ -271,6 +276,22 @@ def test_update_partial_failure_backup_set_preserved(
     bumped_ver = version_from_tarball(release_tarball_x86_64_bumped)
     bumped_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64_bumped)
 
+    # Use the staged-directory shape (`--from <dir>`) for both runs so
+    # this test stays decoupled from host cosign. The Rust update flow
+    # invokes `cosign verify-blob` at § 3.1.10 only when `from.is_file()`;
+    # a directory is treated as already-staged and the signature gate
+    # is skipped. The contracts pinned here (§ 3.2.19 forensic manifest,
+    # § 5.2 retention preservation) live in the stateful phase, well
+    # past the pre-flight signature step.
+    stage_dir = "/tmp/sandbox-update-partial-failure-stage"
+    arch = "x86_64-unknown-linux-gnu"
+    vm.shell(
+        f"sudo rm -rf {stage_dir} && mkdir -p {stage_dir} && "
+        f"tar xzf {bumped_in_vm} -C {stage_dir}",
+        check=True, timeout=60,
+    )
+    extracted_root = f"{stage_dir}/sandboxd-{bumped_ver}-{arch}"
+
     # First run — inject a real mid-update failure at the migrate step
     # via SANDBOX_UPDATE_TEST_FAIL_AT_STEP=migrate. The env var is
     # documented as test-only in sandboxd/sandbox-cli/src/update/mod.rs
@@ -280,7 +301,7 @@ def test_update_partial_failure_backup_set_preserved(
     # `install_sh_cmd` uses for SANDBOX_INSTALL_SKIP_SIGSTORE).
     r = vm.shell(
         f"sudo SANDBOX_UPDATE_TEST_FAIL_AT_STEP=migrate "
-        f"sandbox update --from {bumped_in_vm} --yes",
+        f"sandbox update --from {extracted_root} --yes",
         timeout=300,
     )
     assert r.returncode != 0, (
@@ -324,28 +345,11 @@ def test_update_partial_failure_backup_set_preserved(
     wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
 
     # Second run — clean (no env var). The update must succeed; the
-    # forensic set must be preserved (§ 5.2 retention contract).
-    #
-    # The first run's binary-install step (§ 3.2.21) ran successfully
-    # before the migrate-step failure, so /usr/local/bin/sandbox is now
-    # the v' binary. The v' binary calls cosign verify-blob at § 3.1.10
-    # (Spec 5's signature gate). The harness pre-stages the release
-    # tarball but not a host-side `/usr/local/bin/cosign`; the v'
-    # binary refuses to extract without it. To exercise the migrate-
-    # step retry without depending on host cosign, we use the staged
-    # directory shape: `--from <dir>` reads MANIFEST from the dir and
-    # skips the signature gate (`prepare_staged_tarball` treats a
-    # directory as already-staged, mirroring the test-harness branch).
-    # Same shape `test_update_partial_failure_backup_set_preserved`
-    # would use if it weren't sandwiched by a successful first run.
-    stage_dir_retry = "/tmp/sandbox-update-retry-stage"
-    arch = "x86_64-unknown-linux-gnu"
-    vm.shell(
-        f"sudo rm -rf {stage_dir_retry} && mkdir -p {stage_dir_retry} && "
-        f"tar xzf {bumped_in_vm} -C {stage_dir_retry}",
-        check=True, timeout=60,
-    )
-    extracted_root = f"{stage_dir_retry}/sandboxd-{bumped_ver}-{arch}"
+    # forensic set must be preserved (§ 5.2 retention contract). Reuse
+    # the same staged directory as the first run — `--from <dir>` is a
+    # pure read of the staged inputs, the first run's failure happened
+    # at § 3.2.24 (migrate), well past extraction, so the staged tree
+    # is unchanged.
     r = vm.shell(
         f"sudo sandbox update --from {extracted_root} --yes",
         timeout=300,

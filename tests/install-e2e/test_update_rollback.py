@@ -57,10 +57,25 @@ def test_update_then_manual_rollback(
     wait_for_socket(vm.name, "/run/sandbox/sandboxd.sock", timeout=60)
 
     # 2. Update to bumped version.
+    #
+    # Feed the staged-directory shape (`--from <dir>`), not the tarball.
+    # The base v CLI calls cosign verify-blob at § 3.1.10 when given a
+    # tarball; the directory shape treats inputs as already-staged and
+    # skips the signature gate. This test's contract is § 7.2 manual
+    # rollback, not signature verification — the cosign coupling is
+    # exercised under dedicated tests, not here.
     bumped_ver = version_from_tarball(release_tarball_x86_64_bumped)
     bumped_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64_bumped)
+    stage_dir = "/tmp/sandbox-update-rollback-stage"
+    arch = "x86_64-unknown-linux-gnu"
+    vm.shell(
+        f"sudo rm -rf {stage_dir} && mkdir -p {stage_dir} && "
+        f"tar xzf {bumped_in_vm} -C {stage_dir}",
+        check=True, timeout=60,
+    )
+    extracted_root = f"{stage_dir}/sandboxd-{bumped_ver}-{arch}"
     r = vm.shell(
-        f"sudo sandbox update --from {bumped_in_vm} --yes",
+        f"sudo sandbox update --from {extracted_root} --yes",
         timeout=300,
     )
     assert r.returncode == 0, (
