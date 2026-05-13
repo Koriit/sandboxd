@@ -346,10 +346,13 @@ pub struct PruneOutcome {
 /// 4. Sort completed sets by `started_at` descending.
 /// 5. Keep the first `RETENTION_KEEP`; `rm -rf` the rest.
 ///
-/// The current run's set is by construction `completed_ok: false` at
-/// this point (§ 3.2.19 wrote the in-progress marker; § 3.2.29 sets it
-/// to true after this prune step) — it lands in the "preserved" bucket
-/// and is not pruned.
+/// Call ordering: this function runs AFTER `finalize_manifest`
+/// (§ 3.2.29 flips the current run's set to `completed_ok: true`),
+/// so the current run is counted as one of the `RETENTION_KEEP`
+/// most-recent successful sets. Running it before finalize would
+/// leave the current set at `completed_ok: false`, partition it
+/// into the "preserved" bucket, and drift the on-disk count to
+/// `RETENTION_KEEP + 1` in steady state.
 pub fn prune_old_backup_sets() -> Result<PruneOutcome, BackupError> {
     prune_old_backup_sets_at(Path::new(BACKUPS_ROOT))
 }

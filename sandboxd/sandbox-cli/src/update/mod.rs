@@ -1477,27 +1477,6 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         }
     }
 
-    // § 3.2.25 — Prune older backup sets. The current run's set is
-    // `completed_ok: false` so the filter excludes it automatically.
-    match backup::prune_old_backup_sets() {
-        Ok(o) => {
-            log_step(
-                "prune_backups",
-                &format!(
-                    "kept={} pruned={} forensic={} status=ok",
-                    o.kept.len(),
-                    o.pruned.len(),
-                    o.preserved_forensic.len()
-                ),
-            );
-        }
-        Err(e) => {
-            log_step("prune_backups", &format!("status=fail err=\"{e}\""));
-            eprintln!("sandbox update: backup-set prune failed: {e}");
-            return 1;
-        }
-    }
-
     // § 3.2.26 — Start daemon (only if `was_running`).
     if sticky_was_running {
         match Command::new("sudo")
@@ -1696,6 +1675,32 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
                 &format!("status=fail err=\"{e}\""),
             );
             eprintln!("sandbox update: failed to finalize backup manifest: {e}");
+            return 1;
+        }
+    }
+
+    // § 3.2.25 — Prune older backup sets. Runs AFTER finalize_manifest
+    // so the current run's set is `completed_ok: true` at this point
+    // and counts toward `RETENTION_KEEP=2`. The earlier ordering
+    // (prune before finalize) left the current set at
+    // `completed_ok: false`, so `prune_old_backup_sets` skipped it
+    // when applying the keep-limit and the on-disk count drifted to
+    // `RETENTION_KEEP + 1` in steady state.
+    match backup::prune_old_backup_sets() {
+        Ok(o) => {
+            log_step(
+                "prune_backups",
+                &format!(
+                    "kept={} pruned={} forensic={} status=ok",
+                    o.kept.len(),
+                    o.pruned.len(),
+                    o.preserved_forensic.len()
+                ),
+            );
+        }
+        Err(e) => {
+            log_step("prune_backups", &format!("status=fail err=\"{e}\""));
+            eprintln!("sandbox update: backup-set prune failed: {e}");
             return 1;
         }
     }
