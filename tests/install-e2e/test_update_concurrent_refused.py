@@ -80,32 +80,46 @@ def test_update_concurrent_refused(
         f"sudo chmod 0664 /var/lib/sandbox/.update.lock",
         check=True, timeout=30,
     )
-    # Background flock holder — runs as user `sandbox` (matches the
-    # lock file's owner) so it has rw access. setsid+nohup so it
-    # survives the shell session exit; flock -n returns 0 only if it
-    # acquired the lock (which it should since we just wrote a fresh
-    # file).
-    vm.shell(
-        "sudo -u sandbox sh -c 'setsid nohup flock -n "
-        "/var/lib/sandbox/.update.lock -c \"sleep 60\" "
-        ">/tmp/flock-holder.log 2>&1 &' && sleep 1",
-        check=True, timeout=15,
-    )
-    # Sanity: confirm the flock is actually held by attempting a
-    # non-blocking acquisition that must fail.
-    sanity = vm.shell(
-        "sudo -u sandbox flock -n /var/lib/sandbox/.update.lock -c true",
-        timeout=10,
-    )
-    assert sanity.returncode != 0, (
-        "background flock did not take the lock — concurrent test cannot "
-        "proceed (the second sandbox update would succeed in acquiring)"
-    )
-
-    # Now run the real `sandbox update` — it MUST refuse.
-    r = vm.shell(
-        f"sudo sandbox update --from {bumped_in_vm} --yes",
-        timeout=30,
+    # Hold the flock and run the refused `sandbox update` inside the
+    # SAME `vm.shell()` call. A prior shape used a background `setsid
+    # nohup ... &` holder across two separate `vm.shell()` calls;
+    # systemd-logind on the guest reaps user processes when the SSH
+    # session that spawned them exits (`KillUserProcesses=yes`), so
+    # by the time the second `vm.shell()` ran `sandbox update`, the
+    # holder was dead and the update succeeded by adopting the dead
+    # PID's lock. Consolidating into one SSH session keeps the holder
+    # alive for the concurrency window.
+    #
+    # Sanity-check exit codes (70/71) surface as a recipe-side
+    # failure with a distinct rc so test assertions can tell harness
+    # bugs apart from update-side regressions.
+    refusal_recipe = f"""
+set -u
+sudo -u sandbox flock -n /var/lib/sandbox/.update.lock -c "sleep 60" &
+HOLDER_PID=$!
+sleep 1
+# Sanity 1: holder process alive.
+if ! ps -p "$HOLDER_PID" >/dev/null; then
+    echo 'flock holder died before sandbox update launched' >&2
+    exit 70
+fi
+# Sanity 2: lock truly held (a competing non-blocking flock must fail).
+if sudo -u sandbox flock -n /var/lib/sandbox/.update.lock -c true; then
+    echo 'flock holder did not actually take the lock' >&2
+    kill "$HOLDER_PID" 2>/dev/null
+    exit 71
+fi
+# The real test: `sandbox update` must refuse.
+sudo sandbox update --from {bumped_in_vm} --yes
+RC=$?
+kill "$HOLDER_PID" 2>/dev/null
+wait "$HOLDER_PID" 2>/dev/null
+exit $RC
+"""
+    r = vm.shell(refusal_recipe, timeout=120)
+    assert r.returncode not in (70, 71), (
+        f"test harness failure (not a sandbox update regression):\n"
+        f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
     )
     assert r.returncode != 0, (
         f"`sandbox update` should have refused while flock was held; "
