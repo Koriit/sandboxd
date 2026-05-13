@@ -31,6 +31,7 @@ import pytest
 from conftest import (
     copy_tarball_to_vm,
     install_sh_cmd,
+    parse_install_log_actions,
     version_from_tarball,
     wait_for_socket,
     wait_for_systemd_active,
@@ -77,15 +78,60 @@ def test_update_interrupted_then_resumed(
     bumped_ver = version_from_tarball(release_tarball_x86_64_bumped)
     bumped_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64_bumped)
 
+    # Pre-stage the bumped binaries at their canonical destinations so
+    # the resume run sees `action=skip reason=identical` at §§ 3.2.15-17.
+    # `install_binary_if_changed` skips if the source and destination are
+    # byte-equal (sha256 compare in spirit, byte-compare in code). The
+    # resume run unpacks the same bumped tarball into a staging dir; the
+    # bytes will match exactly because both are the same tarball.
+    #
+    # We extract the bumped tarball into the VM and `install` its
+    # bin/sandboxd, bin/sandbox, libexec helper to the canonical paths.
+    # This simulates "a prior run already installed the new binaries but
+    # crashed before completing later steps" — the idempotency contract
+    # under test.
+    stage_dir = "/tmp/sandbox-update-prestage"
+    vm.shell(
+        f"sudo rm -rf {stage_dir} && mkdir -p {stage_dir} && "
+        f"tar xzf {bumped_in_vm} -C {stage_dir}",
+        check=True, timeout=60,
+    )
+    # The tarball top-level dir is `sandboxd-<ver>-<arch>/`.
+    arch = "x86_64-unknown-linux-gnu"
+    extracted_root = f"{stage_dir}/sandboxd-{bumped_ver}-{arch}"
+    vm.shell(
+        f"sudo install -D -m 0755 -o root -g root "
+        f"{extracted_root}/bin/sandboxd /usr/local/bin/sandboxd && "
+        f"sudo install -D -m 0755 -o root -g root "
+        f"{extracted_root}/bin/sandbox /usr/local/bin/sandbox && "
+        f"sudo install -D -m 0755 -o root -g root "
+        f"{extracted_root}/bin/sandbox-route-helper "
+        f"/usr/local/libexec/sandboxd/sandbox-route-helper",
+        check=True, timeout=30,
+    )
+
     # Pre-write a stale lock payload claiming a dead PID. The adoption
     # branch in `lock::acquire` walks "is the holder PID live?" — for
     # PID 999999 (effectively never alive), it adopts the lock and
     # preserves `was_running: true` (sticky).
+    #
+    # `started_at` is computed inside the VM as 5 minutes ago to keep
+    # the test deterministic against the adopt-fresh-vs-adopt-stale
+    # boundary: a hard-coded date drifts older every day this test sits
+    # in tree, and once it crosses the staleness threshold the adopt
+    # branch flips, which silently changes what this test pins. A
+    # rolling "5 minutes ago" is always fresh, so this test always
+    # exercises adopt-fresh (or, equivalently, the live-holder-dead-PID
+    # branch — both branches preserve sticky `was_running`).
+    started_at = vm.shell(
+        "date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%SZ",
+        check=True, timeout=10,
+    ).stdout.strip()
     stale_payload = json.dumps({
         "pid": 999999,
         "target_version": bumped_ver,
         "from_version": base_ver,
-        "started_at": "2026-05-12T00:00:00Z",
+        "started_at": started_at,
         "was_running": True,
     })
     vm.shell(
@@ -116,6 +162,22 @@ def test_update_interrupted_then_resumed(
     ).stdout
     assert "step=acquire_lock" in log and ("action=adopt-stale" in log or "action=adopt" in log), (
         f"resume run should have adopted the stale lock; log:\n{log}"
+    )
+
+    # Spec § 9.1 contract: "the resume run mostly skips already-completed
+    # steps". Parse the install log and count `action=skip` lines. With
+    # the three bumped binaries pre-staged, all three `install_binary`
+    # entries (sandboxd, sandbox, sandbox-route-helper) must record
+    # action=skip. The spec lists 18 stateful steps; 3 of those are
+    # install-binary steps that must skip-on-identical.
+    parsed = parse_install_log_actions(log)
+    install_binary_actions = parsed.get("install_binary", [])
+    skip_count = install_binary_actions.count("skip")
+    assert skip_count >= 3, (
+        f"expected at least 3 install_binary steps with action=skip "
+        f"(sandboxd, sandbox, sandbox-route-helper pre-staged at "
+        f"canonical paths); got {skip_count} skip(s) in "
+        f"install_binary={install_binary_actions!r}\nlog:\n{log}"
     )
 
     # Install-state flipped to the bumped version.
