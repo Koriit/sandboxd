@@ -1611,8 +1611,34 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
     // is the new one (we just installed it). Spec 5 § 10.3 — the
     // running process keeps executing the old code, so we exec the
     // new binary explicitly.
-    let doctor = Command::new("/usr/local/bin/sandbox")
-        .args(["doctor", "--verbose"])
+    //
+    // Drop privileges to the `sandbox` user for the doctor invocation.
+    // The operator runs `sudo sandbox update`, so this code runs as
+    // root; doctor's C4 check (`current user in 'sandbox' group`) reads
+    // the calling process's `getgroups()`, and root is not in the
+    // sandbox group, so C4 would `Fail` and the doctor would exit 1
+    // even on an otherwise-healthy host. Running doctor as the
+    // `sandbox` user matches the operator-facing contract (operators
+    // are added to the sandbox group by install.sh § 4.4.10) and
+    // mirrors how `assert_doctor_passes` in the e2e harness invokes it.
+    //
+    // `SANDBOX_SOCKET` is explicitly planted to the systemd-managed
+    // path: `sudo -u sandbox` drops most env vars, the target user has
+    // no `XDG_RUNTIME_DIR`, and the default fallback resolves to
+    // `$HOME/.local/share/sandboxd/sandboxd.sock` which is wrong for
+    // the systemd-managed daemon. Use `env SANDBOX_SOCKET=...` to
+    // replant it (same shape as `assert_doctor_passes`).
+    let doctor = Command::new("sudo")
+        .args([
+            "-k",
+            "-u",
+            "sandbox",
+            "env",
+            "SANDBOX_SOCKET=/run/sandbox/sandboxd.sock",
+            "/usr/local/bin/sandbox",
+            "doctor",
+            "--verbose",
+        ])
         .output();
     match doctor {
         Ok(o) if o.status.success() => {
