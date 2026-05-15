@@ -65,13 +65,23 @@ test-group = 'lima'
 #     `sandbox-{12hex}` container; a parallel orphan-reaper test
 #     would reap the in-flight container between `runtime.stop` and
 #     the post-refresh byte-equality assertion.
+#   - `integration_guest_binary_swap_picked_up_by_new_sessions` and
+#     `integration_guest_binary_shared_inode_across_sessions`
+#     (M16-S6 amendment to api-session-isolation spec § 3.8.1) each
+#     create two real `sandbox-{12hex}` containers and assert on
+#     their bind-mounted guest binaries; a parallel orphan-reaper
+#     or other namespace-touching test would race the lifecycle
+#     assertions, and concurrent docker rm against a container the
+#     test still holds an explicit `runtime.delete` for has been
+#     observed to surface as "removal of container ... is already
+#     in progress" from dockerd.
 #   - `integration_create_stamps_owner_from_peercred` fires a Lima
 #     `POST /sessions` against a real daemon; on hosts with docker
 #     installed, the handler reaches `create_network` and briefly
 #     allocates a `sandbox-net-{id}` bridge before the test reads
 #     the persisted row and tears the daemon down. Belongs in the
 #     same group so a parallel reaper does not race the cleanup.
-filter = 'test(/^integration_orphan_reaper/) | test(/^integration_reaper_/) | test(/^integration_container_runtime/) | test(/^integration_rootless_docker/) | test(/^integration_default_hardened_docker/) | test(/^integration_route_helper_for_user_/) | test(/^integration_route_helper_missing_for_user_/) | test(/^integration_guest_refresh_container_backend/) | test(/^integration_create_stamps_owner_from_peercred/)'
+filter = 'test(/^integration_orphan_reaper/) | test(/^integration_reaper_/) | test(/^integration_container_runtime/) | test(/^integration_rootless_docker/) | test(/^integration_default_hardened_docker/) | test(/^integration_route_helper_for_user_/) | test(/^integration_route_helper_missing_for_user_/) | test(/^integration_guest_refresh_container_backend/) | test(/^integration_guest_binary_swap_picked_up_by_new_sessions/) | test(/^integration_guest_binary_shared_inode_across_sessions/) | test(/^integration_create_stamps_owner_from_peercred/)'
 test-group = 'docker-sandbox-namespace'
 
 [test-groups]
