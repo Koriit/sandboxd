@@ -263,8 +263,8 @@ fn container_spec() -> SessionSpec {
 /// passes as `staged_guest_path`. Tests that `docker create` a real
 /// container need the bind-mount source to exist on disk; tests that
 /// only exercise hermetic capability checks pass a synthetic path
-/// directly to `ContainerRuntime::new`. M16-S6 amendment to
-/// api-session-isolation spec § 3.8.1.
+/// directly to `ContainerRuntime::new`. See api-session-isolation
+/// spec § 3.8.1 for the bind-mount design.
 fn staged_guest_path_for_tests() -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::OnceLock;

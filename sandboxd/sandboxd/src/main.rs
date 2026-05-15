@@ -135,12 +135,12 @@ fn default_base_dir() -> String {
 ///
 /// `guest/` holds the daemon-staged `sandbox-guest` binary that every
 /// container session bind-mounts read-only at
-/// `/usr/local/bin/sandbox-guest` (api-session-isolation spec § 3.8.1,
-/// M16-S6 amendment + daemon-productionization spec § 5.4 forward
-/// note). The staging step itself runs immediately after this layout
-/// enforcer; the subdir must exist beforehand because the atomic
-/// sibling-tempfile-and-rename pattern places the tempfile in
-/// `guest/`'s parent on the same filesystem.
+/// `/usr/local/bin/sandbox-guest` (api-session-isolation spec § 3.8.1
+/// + daemon-productionization spec § 5.4). The staging step itself
+/// runs immediately after this layout enforcer; the subdir must
+/// exist beforehand because the atomic sibling-tempfile-and-rename
+/// pattern places the tempfile in `guest/`'s parent on the same
+/// filesystem.
 const BASE_DIR_SUBDIRS: &[&str] = &["sessions", "events", "backups", "guest"];
 
 /// The numeric mode every per-daemon state-dir subdirectory must
@@ -7026,12 +7026,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Stage the embedded `sandbox-guest` binary into `{base_dir}/guest/`
     // so every container session can bind-mount it read-only at
     // `/usr/local/bin/sandbox-guest`. Spec: api-session-isolation §
-    // 3.8.1 (M16-S6 amendment). Runs once at startup, idempotent
-    // (sha256 compare); refresh becomes `docker restart` rather than
-    // `docker cp` because the staged binary is already current. The
-    // operation is synchronous + CPU-cheap (one read, one hash, one
-    // optional rename) — `spawn_blocking` keeps it off the tokio
-    // worker for the same reason `ensure_base_dir_layout` did.
+    // 3.8.1. Runs once at startup, idempotent (sha256 compare);
+    // refresh becomes `docker restart` rather than `docker cp`
+    // because the staged binary is already current. The operation
+    // is synchronous + CPU-cheap (one read, one hash, one optional
+    // rename) — `spawn_blocking` keeps it off the tokio worker for
+    // the same reason `ensure_base_dir_layout` did.
     {
         let base_dir = base_dir.clone();
         tokio::task::spawn_blocking(move || {
@@ -7225,7 +7225,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // path read-only into every container at
     // `/usr/local/bin/sandbox-guest`; refresh becomes `docker
     // restart` against the same already-current source
-    // (api-session-isolation spec § 3.8.1, M16-S6 amendment).
+    // (api-session-isolation spec § 3.8.1).
     let staged_guest_path = sandbox_core::staged_guest_path(&base_dir);
     let container_runtime = ContainerRuntime::new(
         lite_image_tag_for_version(env!("CARGO_PKG_VERSION")),

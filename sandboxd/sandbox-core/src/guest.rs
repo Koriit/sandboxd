@@ -134,8 +134,7 @@ pub fn stage_embedded_guest_binary() -> Result<tempfile::NamedTempFile, SandboxE
 // ---------------------------------------------------------------------------
 // Startup staging — daemon writes `sandbox-guest` into its state dir once
 // at startup and every container session bind-mounts that path read-only
-// at `/usr/local/bin/sandbox-guest` (api-session-isolation spec § 3.8.1,
-// M16-S6 amendment).
+// at `/usr/local/bin/sandbox-guest` (api-session-isolation spec § 3.8.1).
 // ---------------------------------------------------------------------------
 
 /// Relative path inside `base_dir` where the daemon stages the
@@ -1413,7 +1412,7 @@ mod tests {
         );
     }
 
-    // -- Startup staging tests (M16-S6 — bind-mount design) -----------------
+    // -- Startup staging tests (bind-mount design) -------------------------
 
     /// Helper: prepare a fresh `guest/` subdir inside a tempdir and
     /// return both the subdir path and the destination file path the

@@ -236,8 +236,8 @@ fn container_spec() -> SessionSpec {
 /// Resolve a stable host path for the bind-mount source the runtime
 /// passes as `staged_guest_path`. Necessary for any test that
 /// `docker create`s a real container — dockerd errors at create time
-/// if the mount source does not exist. M16-S6 amendment to
-/// api-session-isolation spec § 3.8.1.
+/// if the mount source does not exist. See api-session-isolation
+/// spec § 3.8.1 for the bind-mount design.
 fn staged_guest_path_for_tests() -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::OnceLock;

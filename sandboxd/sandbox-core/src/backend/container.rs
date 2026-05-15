@@ -272,8 +272,8 @@ pub struct ContainerRuntime {
     /// {staged_guest_path}:/usr/local/bin/sandbox-guest:ro` bind-mount
     /// at `docker create` time so the in-image baked guest is overlaid
     /// by the daemon's current binary; refresh is implemented as a
-    /// `docker restart` (api-session-isolation spec § 3.8.1, M16-S6
-    /// amendment). The path is set by the daemon at construction time
+    /// `docker restart` (api-session-isolation spec § 3.8.1). The path
+    /// is set by the daemon at construction time
     /// (see `main.rs` — pointed at `{base_dir}/guest/sandbox-guest`)
     /// and pinned for the runtime's lifetime; the daemon's startup
     /// staging step is the sole writer of the underlying file.
@@ -330,8 +330,8 @@ impl ContainerRuntime {
     /// Return the host path the runtime bind-mounts read-only into
     /// every container at `/usr/local/bin/sandbox-guest`. Used by
     /// integration tests to read the staged bytes and assert they
-    /// equal the in-container post-refresh contents (M16-S6 §
-    /// integration_guest_refresh_container_backend).
+    /// equal the in-container post-refresh contents (exercised by
+    /// `integration_guest_refresh_container_backend`).
     pub fn staged_guest_path(&self) -> &Path {
         &self.staged_guest_path
     }
@@ -519,7 +519,7 @@ fn build_create_argv(
         )
     });
     let ca_args = build_ca_mount_args(network);
-    // api-session-isolation spec § 3.8.1 (M16-S6 amendment) — the
+    // api-session-isolation spec § 3.8.1 — the
     // daemon-staged `sandbox-guest` is bind-mounted read-only at the
     // canonical in-container path so refresh becomes `docker restart`
     // rather than a `docker cp` into the `--read-only` rootfs. One
@@ -589,10 +589,10 @@ fn build_create_argv(
 }
 
 /// Compose the `docker restart` argv for the container backend's
-/// refresh path (M16-S6 amendment to api-session-isolation spec §
-/// 3.8.1). Pure function so the unit test pins the load-bearing
-/// `restart` subcommand and rules out a regression that reintroduces
-/// the obsolete `docker cp` path.
+/// refresh path (api-session-isolation spec § 3.8.1). Pure function
+/// so the unit test pins the load-bearing `restart` subcommand and
+/// rules out a regression that reintroduces the obsolete `docker
+/// cp` path.
 fn build_refresh_argv(container_name: &str) -> Vec<String> {
     vec!["restart".to_string(), container_name.to_string()]
 }
@@ -613,9 +613,9 @@ impl SessionRuntime for ContainerRuntime {
 
     /// `docker create` the container with hardening flags, network
     /// attachment, DNS pointer, named home volume, the read-only
-    /// bind-mount of the daemon-staged `sandbox-guest` binary (M16-S6
-    /// amendment to api-session-isolation spec § 3.8.1), and the
-    /// optional workspace bind-mount.
+    /// bind-mount of the daemon-staged `sandbox-guest` binary
+    /// (api-session-isolation spec § 3.8.1), and the optional
+    /// workspace bind-mount.
     async fn create(
         &self,
         session_id: &SessionId,
@@ -788,8 +788,8 @@ impl SessionRuntime for ContainerRuntime {
     /// Refresh the in-container `sandbox-guest` binary so the next
     /// `start` exec picks it up.
     ///
-    /// **M16-S6 amendment (bind-mount design).** The lite container has
-    /// no init system — `ENTRYPOINT ["/usr/bin/tini", "--",
+    /// **Bind-mount design.** The lite container has no init system —
+    /// `ENTRYPOINT ["/usr/bin/tini", "--",
     /// "/usr/local/bin/sandbox-guest"]` is the only path the new binary
     /// becomes the live process. Under the bind-mount design (spec §
     /// 3.8.1), the daemon stages `sandbox-guest` once at startup into
@@ -1784,14 +1784,15 @@ mod tests {
         );
     }
 
-    /// M16-S6 — the daemon-staged `sandbox-guest` is bind-mounted
-    /// read-only into every container at the canonical in-container
-    /// path. The flag pair must appear verbatim in the `docker create`
-    /// argv; a regression in the source path, destination, or `:ro`
-    /// mode flag would silently break the bind-mount design (refresh
-    /// would still appear to succeed via `docker restart`, but the
-    /// in-container `/usr/local/bin/sandbox-guest` would be the old
-    /// in-image baked binary rather than the daemon-current one).
+    /// The daemon-staged `sandbox-guest` is bind-mounted read-only
+    /// into every container at the canonical in-container path
+    /// (api-session-isolation spec § 3.8.1). The flag pair must
+    /// appear verbatim in the `docker create` argv; a regression in
+    /// the source path, destination, or `:ro` mode flag would
+    /// silently break the bind-mount design (refresh would still
+    /// appear to succeed via `docker restart`, but the in-container
+    /// `/usr/local/bin/sandbox-guest` would be the old in-image
+    /// baked binary rather than the daemon-current one).
     #[test]
     fn container_run_argv_contains_guest_bind_mount() {
         let sid = SessionId::parse("0123456789ab").expect("valid 12-hex");
@@ -1838,7 +1839,7 @@ mod tests {
         assert_eq!(
             mount_spec,
             "/var/lib/sandbox/guest/sandbox-guest:/usr/local/bin/sandbox-guest:ro",
-            "guest bind-mount spec drift — load-bearing for the M16-S6 design",
+            "guest bind-mount spec drift — load-bearing for the bind-mount design",
         );
 
         // Order invariant: the bind-mount must come BEFORE the image
@@ -1858,13 +1859,14 @@ mod tests {
         );
     }
 
-    /// M16-S6 — `refresh_guest_binary` must invoke `docker restart`,
-    /// NOT `docker cp`. The original Spec 2 § 3.8.1 design used `cp`
-    /// to push the embedded bytes into the container's writable layer;
-    /// the bind-mount design replaces that with a restart against the
-    /// already-current bind-mount source. This test pins the argv
-    /// shape so a regression that reintroduces `docker cp` is caught
-    /// without needing a live Docker daemon.
+    /// `refresh_guest_binary` must invoke `docker restart`, NOT
+    /// `docker cp`. The original api-session-isolation spec § 3.8.1
+    /// design used `cp` to push the embedded bytes into the
+    /// container's writable layer; the bind-mount design replaces
+    /// that with a restart against the already-current bind-mount
+    /// source. This test pins the argv shape so a regression that
+    /// reintroduces `docker cp` is caught without needing a live
+    /// Docker daemon.
     #[test]
     fn refresh_guest_binary_container_invokes_restart_not_cp() {
         let argv = build_refresh_argv("sandbox-0123456789ab");
@@ -1874,9 +1876,9 @@ mod tests {
         );
         assert!(
             !argv.iter().any(|a| a == "cp"),
-            "refresh must not invoke `docker cp` — the M16-S6 amendment to \
-             api-session-isolation spec § 3.8.1 replaced cp with the \
-             bind-mount + restart design; got argv {argv:?}",
+            "refresh must not invoke `docker cp` — api-session-isolation \
+             spec § 3.8.1 replaced cp with the bind-mount + restart \
+             design; got argv {argv:?}",
         );
         assert_eq!(
             argv.last().map(String::as_str),

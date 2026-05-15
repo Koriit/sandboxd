@@ -1,11 +1,11 @@
 //! Integration tests for the guest-version refresh path
 //! (api-session-isolation spec §§ 3.4, 3.8, 3.9; §§ 7.4, 7.5).
 //!
-//! After the M16-S6 amendment to spec § 3.8.1 (bind-mount design),
-//! the container backend's refresh path is no longer a `docker cp`
-//! into the rootfs; instead, the daemon stages `sandbox-guest` once
-//! into `{base_dir}/guest/sandbox-guest` at startup and every
-//! container session bind-mounts that path read-only at
+//! Under spec § 3.8.1's bind-mount design, the container backend's
+//! refresh path is not a `docker cp` into the rootfs; instead, the
+//! daemon stages `sandbox-guest` once into
+//! `{base_dir}/guest/sandbox-guest` at startup and every container
+//! session bind-mounts that path read-only at
 //! `/usr/local/bin/sandbox-guest`. Refresh becomes `docker restart`.
 //!
 //! Test coverage in this file:
@@ -339,10 +339,10 @@ fn placeholder_sleep_script(version_tag: &str) -> Vec<u8> {
     format!(
         "#!/usr/bin/env bash\n\
          # synthetic-sandbox-guest version={version_tag}\n\
-         # M16-S6 integration test placeholder — sleeps long enough\n\
-         # for the host-side assertions to read back the bind-mount\n\
-         # contents and (for the shared-inode test) stat both\n\
-         # containers' /usr/local/bin/sandbox-guest.\n\
+         # Test stub binary — sleeps long enough for the host-side\n\
+         # assertions to read back the bind-mount contents and (for\n\
+         # the shared-inode test) stat both containers'\n\
+         # /usr/local/bin/sandbox-guest.\n\
          exec sleep 300\n",
     )
     .into_bytes()
@@ -384,7 +384,7 @@ fn read_in_container_guest_bytes(container_name: &str) -> Vec<u8> {
     std::fs::read(&host_dst).expect("read host tempfile")
 }
 
-/// Spec § 7.4 (M16-S6 bind-mount design) — exercise the container
+/// Spec § 7.4 (bind-mount design) — exercise the container
 /// backend's `refresh_guest_binary` end-to-end against the
 /// production-shape `--read-only` lite image
 /// (`sandboxd-lite:<workspace_version>`, the same image `make
@@ -477,8 +477,8 @@ async fn integration_guest_refresh_container_backend() {
         in_container, on_host,
         "post-refresh in-container `/usr/local/bin/sandbox-guest` must be \
          bit-identical to the daemon's host-side staged file — that's the \
-         load-bearing property of the bind-mount design (M16-S6 amendment to \
-         api-session-isolation spec § 3.8.1)"
+         load-bearing property of the bind-mount design (api-session-isolation \
+         spec § 3.8.1)"
     );
 
     // Idempotency: re-running refresh against the same container is a
@@ -519,9 +519,9 @@ async fn integration_guest_refresh_container_backend() {
     runtime.delete(&handle).await.expect("runtime.delete");
 }
 
-/// M16-S6 — change the host-side staged file's bytes between two
-/// container creates; verify the second container sees the new bytes
-/// through its bind-mount.
+/// Change the host-side staged file's bytes between two container
+/// creates; verify the second container sees the new bytes through
+/// its bind-mount (api-session-isolation spec § 3.8.1).
 ///
 /// This pins the "new sessions automatically pick up the refreshed
 /// daemon's guest" property of the bind-mount design: a daemon
@@ -635,9 +635,9 @@ async fn integration_guest_binary_swap_picked_up_by_new_sessions() {
         .expect("runtime.delete #2");
 }
 
-/// M16-S6 — start two container sessions; verify their bind-mounted
+/// Start two container sessions; verify their bind-mounted
 /// `/usr/local/bin/sandbox-guest` resolves to the same backing inode
-/// on the host.
+/// on the host (api-session-isolation spec § 3.8.1).
 ///
 /// The bind-mount design's load-bearing property is that one host
 /// inode is shared across every live session — the kernel does not
@@ -665,8 +665,8 @@ async fn integration_guest_binary_swap_picked_up_by_new_sessions() {
 ///    test more fragile to container-lifecycle races).
 ///
 /// The combination of (1) and (2) covers the kernel-level invariant
-/// and the docker-side wiring; together they pin the M16-S6
-/// shared-inode property under realistic load.
+/// and the docker-side wiring; together they pin the shared-inode
+/// property under realistic load.
 #[tokio::test]
 async fn integration_guest_binary_shared_inode_across_sessions() {
     let base_dir = TempDir::new().expect("tempdir base_dir");
