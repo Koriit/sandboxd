@@ -267,6 +267,17 @@ pub struct ContainerRuntime {
     /// used.
     user_uid: u32,
     user_gid: u32,
+    /// Host path of the daemon-staged `sandbox-guest` binary. Every
+    /// container created by this runtime gets a `-v
+    /// {staged_guest_path}:/usr/local/bin/sandbox-guest:ro` bind-mount
+    /// at `docker create` time so the in-image baked guest is overlaid
+    /// by the daemon's current binary; refresh is implemented as a
+    /// `docker restart` (api-session-isolation spec § 3.8.1, M16-S6
+    /// amendment). The path is set by the daemon at construction time
+    /// (see `main.rs` — pointed at `{base_dir}/guest/sandbox-guest`)
+    /// and pinned for the runtime's lifetime; the daemon's startup
+    /// staging step is the sole writer of the underlying file.
+    staged_guest_path: PathBuf,
     /// Per-session network info, populated by the daemon (3D) or by
     /// tests before [`SessionRuntime::create`]. Keyed on the session id
     /// so a single runtime instance handles every session.
@@ -275,26 +286,34 @@ pub struct ContainerRuntime {
 
 impl ContainerRuntime {
     /// Construct a container runtime with the given image tag, default
-    /// resource ceilings, and container-process uid/gid.
+    /// resource ceilings, container-process uid/gid, and staged
+    /// guest-binary path.
     ///
     /// `image_tag` is the docker image used for `docker create`. Phase 3B
-    /// computes this from the daemon version (`sandboxd-lite:<ver>`); 3A
+    /// computes this from the daemon version (`sandboxd-lite:<ver>`);
     /// tests pass any image they have available.
     ///
     /// `default_memory_mb` / `default_cpus` are applied when the
     /// [`SessionSpec`] does not override them. Phase 3D computes the
-    /// 80%-of-host defaults; 3A tests pass arbitrary values.
+    /// 80%-of-host defaults; tests pass arbitrary values.
     ///
     /// `user_uid` / `user_gid` are the in-container runtime identity.
     /// Spec § "Hardening" mandates non-root; spec § "Workspace" mandates
     /// alignment with the host operator's uid when the host uid is not
     /// 1000.
+    ///
+    /// `staged_guest_path` is the host path bound read-only into every
+    /// container at `/usr/local/bin/sandbox-guest`. The daemon stages
+    /// the embedded `sandbox-guest` bytes at this path at startup; the
+    /// runtime treats it as opaque (it never reads or writes the file
+    /// itself).
     pub fn new(
         image_tag: impl Into<String>,
         default_memory_mb: u32,
         default_cpus: f64,
         user_uid: u32,
         user_gid: u32,
+        staged_guest_path: impl Into<PathBuf>,
     ) -> Arc<Self> {
         Arc::new(Self {
             capabilities: capabilities_for_container(),
@@ -303,8 +322,18 @@ impl ContainerRuntime {
             default_cpus,
             user_uid,
             user_gid,
+            staged_guest_path: staged_guest_path.into(),
             sessions: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Return the host path the runtime bind-mounts read-only into
+    /// every container at `/usr/local/bin/sandbox-guest`. Used by
+    /// integration tests to read the staged bytes and assert they
+    /// equal the in-container post-refresh contents (M16-S6 §
+    /// integration_guest_refresh_container_backend).
+    pub fn staged_guest_path(&self) -> &Path {
+        &self.staged_guest_path
     }
 
     /// Image tag this runtime uses on `docker create` / `docker build`.
@@ -437,6 +466,138 @@ fn capabilities_for_container() -> Capabilities {
 }
 
 // ---------------------------------------------------------------------------
+// Pure argv builders — extracted so unit tests can assert the
+// load-bearing flags without spawning a docker subprocess.
+// ---------------------------------------------------------------------------
+
+/// Compose the `docker create` argv for a container session.
+///
+/// Pure function — no syscalls, no docker invocation. The runtime
+/// hands off the returned `Vec<String>` to `run_docker`.
+///
+/// Argument order is part of the contract: the unit tests in
+/// `tests::container_run_argv_contains_guest_bind_mount` pin the
+/// expected `-v` mount string so a regression in the bind-mount
+/// source path, destination, or `:ro` mode flag surfaces immediately.
+///
+/// Trailing positional `image_tag` must come last so subsequent
+/// entrypoint args (none today) line up with docker's CLI grammar.
+#[allow(clippy::too_many_arguments)] // Each arg is a load-bearing slot
+// the daemon already holds; collapsing them into a struct would
+// duplicate ContainerRuntime's own field set without buying
+// readability.
+fn build_create_argv(
+    session_id: &SessionId,
+    network: &ContainerNetwork,
+    image_tag: &str,
+    user_uid: u32,
+    user_gid: u32,
+    memory_mb: u32,
+    cpus: f64,
+    staged_guest_path: &Path,
+) -> Vec<String> {
+    let container_name = format!("sandbox-{session_id}");
+    let home_volume = home_volume_name(session_id);
+    let user_arg = format!("{user_uid}:{user_gid}");
+    let memory_arg = format!("{memory_mb}m");
+    let cpus_arg = format_cpus(cpus);
+    let pids_arg = PIDS_LIMIT.to_string();
+    let dns_arg = network.gateway_ip.to_string();
+    let ip_arg = network.container_ip.to_string();
+    let label_arg = format!("sandbox.session_id={session_id}");
+    let home_mount = format!("type=volume,src={home_volume},dst=/home/agent");
+    let workspace_mount = network.workspace_host_path.as_ref().map(|p| {
+        // Spec § "Workspace" — bind target unified with Lima at
+        // `/home/agent/workspace/`. The home volume mounts at
+        // `/home/agent`; this bind shadows the volume's content
+        // at the workspace subdirectory, which is the intended
+        // semantics (operator-supplied workspace files take
+        // precedence over the volume's empty `workspace/`).
+        format!(
+            "type=bind,src={},dst=/home/agent/workspace/",
+            p.to_string_lossy().into_owned()
+        )
+    });
+    let ca_args = build_ca_mount_args(network);
+    // api-session-isolation spec § 3.8.1 (M16-S6 amendment) — the
+    // daemon-staged `sandbox-guest` is bind-mounted read-only at the
+    // canonical in-container path so refresh becomes `docker restart`
+    // rather than a `docker cp` into the `--read-only` rootfs. One
+    // inode is shared across every live container session; the kernel
+    // page cache for the guest binary is shared too.
+    let guest_bind_mount = format!(
+        "{}:/usr/local/bin/sandbox-guest:ro",
+        staged_guest_path.to_string_lossy()
+    );
+
+    let mut args: Vec<String> = vec![
+        "create".to_string(),
+        "--name".to_string(),
+        container_name,
+        "--hostname".to_string(),
+        session_id.to_string(),
+        "--network".to_string(),
+        network.docker_network.clone(),
+        "--ip".to_string(),
+        ip_arg,
+        "--dns".to_string(),
+        dns_arg,
+        // Hardening — every flag in spec § "Hardening" applied
+        // verbatim, in table order.
+        "--read-only".to_string(),
+        "--tmpfs".to_string(),
+        format!("/tmp:{TMPFS_TMP_FLAGS}"),
+        "--tmpfs".to_string(),
+        format!("/run:{TMPFS_RUN_FLAGS}"),
+        "--security-opt".to_string(),
+        "no-new-privileges".to_string(),
+        "--security-opt".to_string(),
+        "seccomp=builtin".to_string(),
+        "--cap-drop".to_string(),
+        "ALL".to_string(),
+        "--user".to_string(),
+        user_arg,
+        "--pids-limit".to_string(),
+        pids_arg,
+        "--memory".to_string(),
+        memory_arg,
+        "--cpus".to_string(),
+        cpus_arg,
+        "--restart".to_string(),
+        "no".to_string(),
+        "--label".to_string(),
+        label_arg,
+        "--mount".to_string(),
+        home_mount,
+        // Bind-mount of the daemon-staged guest binary — read-only,
+        // overlays the in-image baked `/usr/local/bin/sandbox-guest`.
+        "-v".to_string(),
+        guest_bind_mount,
+    ];
+
+    if let Some(mount) = workspace_mount {
+        args.push("--mount".to_string());
+        args.push(mount);
+    }
+
+    args.extend(ca_args);
+
+    // Trailing positional: image tag — must come last so subsequent
+    // entrypoint args (none here) line up with the docker CLI grammar.
+    args.push(image_tag.to_string());
+    args
+}
+
+/// Compose the `docker restart` argv for the container backend's
+/// refresh path (M16-S6 amendment to api-session-isolation spec §
+/// 3.8.1). Pure function so the unit test pins the load-bearing
+/// `restart` subcommand and rules out a regression that reintroduces
+/// the obsolete `docker cp` path.
+fn build_refresh_argv(container_name: &str) -> Vec<String> {
+    vec!["restart".to_string(), container_name.to_string()]
+}
+
+// ---------------------------------------------------------------------------
 // SessionRuntime impl
 // ---------------------------------------------------------------------------
 
@@ -451,8 +612,10 @@ impl SessionRuntime for ContainerRuntime {
     }
 
     /// `docker create` the container with hardening flags, network
-    /// attachment, DNS pointer, named home volume, and the optional
-    /// workspace bind mount.
+    /// attachment, DNS pointer, named home volume, the read-only
+    /// bind-mount of the daemon-staged `sandbox-guest` binary (M16-S6
+    /// amendment to api-session-isolation spec § 3.8.1), and the
+    /// optional workspace bind-mount.
     async fn create(
         &self,
         session_id: &SessionId,
@@ -463,92 +626,21 @@ impl SessionRuntime for ContainerRuntime {
 
         let network = self.lookup_session(session_id)?;
         let (memory_mb, cpus) = self.resource_ceilings(spec)?;
-        let container_name = format!("sandbox-{session_id}");
-        let home_volume = home_volume_name(session_id);
-        let user_arg = format!("{}:{}", self.user_uid, self.user_gid);
-        let memory_arg = format!("{memory_mb}m");
-        let cpus_arg = format_cpus(cpus);
-        let pids_arg = PIDS_LIMIT.to_string();
-        let dns_arg = network.gateway_ip.to_string();
-        let ip_arg = network.container_ip.to_string();
-        let label_arg = format!("sandbox.session_id={session_id}");
-        let home_mount = format!("type=volume,src={home_volume},dst=/home/agent");
-        let workspace_mount = network.workspace_host_path.as_ref().map(|p| {
-            // Spec § "Workspace" — bind target unified with Lima at
-            // `/home/agent/workspace/`. The home volume mounts at
-            // `/home/agent`; this bind shadows the volume's content
-            // at the workspace subdirectory, which is the intended
-            // semantics (operator-supplied workspace files take
-            // precedence over the volume's empty `workspace/`).
-            format!(
-                "type=bind,src={},dst=/home/agent/workspace/",
-                p.to_string_lossy().into_owned()
-            )
-        });
-        let ca_args = build_ca_mount_args(&network);
-        // `WorkspaceMode::Clone` is part of the container backend's
-        // capability matrix; the daemon dispatches the in-guest
-        // `git clone` step after `runtime.start` completes, exactly
-        // like the Lima `--repo` path. `runtime.create` only owns
-        // the `docker create` arguments, which are identical for
-        // `Empty`, `Clone`, and `Shared` (the bind mount is the only
-        // knob, and `Clone` does not bind a host path).
 
-        let mut args: Vec<String> = vec![
-            "create".to_string(),
-            "--name".to_string(),
-            container_name.clone(),
-            "--hostname".to_string(),
-            session_id.to_string(),
-            "--network".to_string(),
-            network.docker_network.clone(),
-            "--ip".to_string(),
-            ip_arg,
-            "--dns".to_string(),
-            dns_arg,
-            // Hardening — every flag in spec § "Hardening" applied
-            // verbatim, in table order.
-            "--read-only".to_string(),
-            "--tmpfs".to_string(),
-            format!("/tmp:{TMPFS_TMP_FLAGS}"),
-            "--tmpfs".to_string(),
-            format!("/run:{TMPFS_RUN_FLAGS}"),
-            "--security-opt".to_string(),
-            "no-new-privileges".to_string(),
-            "--security-opt".to_string(),
-            "seccomp=builtin".to_string(),
-            "--cap-drop".to_string(),
-            "ALL".to_string(),
-            "--user".to_string(),
-            user_arg,
-            "--pids-limit".to_string(),
-            pids_arg,
-            "--memory".to_string(),
-            memory_arg,
-            "--cpus".to_string(),
-            cpus_arg,
-            "--restart".to_string(),
-            "no".to_string(),
-            "--label".to_string(),
-            label_arg,
-            "--mount".to_string(),
-            home_mount,
-        ];
-
-        if let Some(mount) = workspace_mount {
-            args.push("--mount".to_string());
-            args.push(mount);
-        }
-
-        args.extend(ca_args);
-
-        // Trailing positional: image tag — must come last so subsequent
-        // entrypoint args (none here) line up with the docker CLI grammar.
-        args.push(self.image_tag.clone());
+        let args = build_create_argv(
+            session_id,
+            &network,
+            &self.image_tag,
+            self.user_uid,
+            self.user_gid,
+            memory_mb,
+            cpus,
+            &self.staged_guest_path,
+        );
 
         debug!(
             session_id = %session_id,
-            container = %container_name,
+            container = %format!("sandbox-{session_id}"),
             image = %self.image_tag,
             "ContainerRuntime: docker create"
         );
@@ -696,29 +788,31 @@ impl SessionRuntime for ContainerRuntime {
     /// Refresh the in-container `sandbox-guest` binary so the next
     /// `start` exec picks it up.
     ///
-    /// The lite container has no init system —
-    /// `ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/sandbox-guest"]`
-    /// is the only path the new binary becomes the live process. We
-    /// therefore stop the container first (idempotent for an already-
-    /// stopped container — and `start_session` only invokes refresh
-    /// after asserting `session.state == Stopped`), `docker cp` the
-    /// embedded binary into the writable layer, and return. The
-    /// orchestrator (`start_session`) calls `runtime.start` next, which
-    /// runs `docker start` and the tini→sandbox-guest exec picks up the
-    /// new file.
+    /// **M16-S6 amendment (bind-mount design).** The lite container has
+    /// no init system — `ENTRYPOINT ["/usr/bin/tini", "--",
+    /// "/usr/local/bin/sandbox-guest"]` is the only path the new binary
+    /// becomes the live process. Under the bind-mount design (spec §
+    /// 3.8.1), the daemon stages `sandbox-guest` once at startup into
+    /// `{base_dir}/guest/sandbox-guest` and `create()` adds a
+    /// read-only bind-mount of that path at the canonical in-container
+    /// location. Refresh therefore reduces to **`docker restart`** —
+    /// the bind-mount source is already current (the daemon-staging
+    /// step pinned it before any session was started this boot), so
+    /// the restart re-execs `tini` against the up-to-date binary
+    /// without touching the `--read-only` rootfs.
     ///
-    /// `docker cp` writes through the docker daemon's storage driver,
-    /// not the container's view of `/`, so it works on running and
-    /// stopped containers alike and is unaffected by `--read-only`
-    /// (api-session-isolation spec § 3.8.1).
+    /// A defensive `docker stop -t 5` runs first because `start_session`
+    /// asserts `session.state == Stopped` before invoking refresh; the
+    /// stop is idempotent ("is not running" / "No such container" are
+    /// swallowed) so a future caller invoking refresh against a hot
+    /// container does not surface a spurious error.
     async fn refresh_guest_binary(&self, handle: &RuntimeHandle) -> Result<(), SandboxError> {
         let container_name = handle.as_str().to_string();
 
-        // 1. Ensure the container is stopped. `start_session` only
-        //    invokes this method when `session.state == Stopped`, so
-        //    this is almost always a no-op; the explicit defensive stop
-        //    avoids "container is running" errors from `docker cp` when
-        //    a future caller invokes refresh against a hot container.
+        // 1. Defensive stop. Idempotent — `start_session` only invokes
+        //    this method when `session.state == Stopped`, but a future
+        //    caller (e.g. an admin re-running refresh against a hot
+        //    container) should not trip on "container is running".
         let stop_args = [
             "stop".to_string(),
             "-t".to_string(),
@@ -732,29 +826,15 @@ impl SessionRuntime for ContainerRuntime {
             Err(other) => return Err(other),
         }
 
-        // 2. Stage the embedded guest binary to a host tempfile with
-        //    mode 0o755 so `docker cp`'s mode-preservation lands an
-        //    executable file inside the container.
-        let tempfile = tokio::task::spawn_blocking(crate::guest::stage_embedded_guest_binary)
-            .await
-            .map_err(|e| {
-                SandboxError::Internal(format!(
-                    "spawn_blocking join failed staging guest binary: {e}"
-                ))
-            })??;
-
-        // 3. Push it into the container's writable layer at the canonical
-        //    in-container path.
-        let cp_args = [
-            "cp".to_string(),
-            tempfile.path().to_string_lossy().into_owned(),
-            format!("{container_name}:/usr/local/bin/sandbox-guest"),
-        ];
-        run_docker(&cp_args, "docker cp (guest refresh)").await?;
-
-        // 4. Drop the host tempfile — its contents are now inside the
-        //    container's writable layer.
-        drop(tempfile);
+        // 2. Restart the container so `tini` re-execs the bind-mounted
+        //    `/usr/local/bin/sandbox-guest`. `docker restart` is
+        //    idempotent on a stopped container (it just starts it) and
+        //    on a running container (it does a stop+start). The
+        //    bind-mount source itself is the daemon's
+        //    `{base_dir}/guest/sandbox-guest`, staged at boot — see
+        //    `sandbox_core::stage_embedded_guest_binary_into_base_dir`.
+        let restart_args = build_refresh_argv(&container_name);
+        run_docker(&restart_args, "docker restart (guest refresh)").await?;
 
         Ok(())
     }
@@ -1478,7 +1558,18 @@ mod tests {
     use crate::session::WorkspaceModeKind;
 
     fn test_runtime() -> Arc<ContainerRuntime> {
-        ContainerRuntime::new(DEFAULT_LITE_IMAGE_TAG, 2048, 2.0, 1000, 1000)
+        // Unit tests never run docker, so the staged-guest path is a
+        // synthetic value that never gets resolved against the file
+        // system. Integration tests that actually `docker run` pass a
+        // real tempfile path.
+        ContainerRuntime::new(
+            DEFAULT_LITE_IMAGE_TAG,
+            2048,
+            2.0,
+            1000,
+            1000,
+            "/var/lib/sandbox/guest/sandbox-guest",
+        )
     }
 
     /// `kind()` reports the static `BackendKind::Container` constant —
@@ -1690,6 +1781,107 @@ mod tests {
         assert!(
             build_ca_mount_args(&no_ca).is_empty(),
             "build_ca_mount_args must be a no-op when ca_host_path is None",
+        );
+    }
+
+    /// M16-S6 — the daemon-staged `sandbox-guest` is bind-mounted
+    /// read-only into every container at the canonical in-container
+    /// path. The flag pair must appear verbatim in the `docker create`
+    /// argv; a regression in the source path, destination, or `:ro`
+    /// mode flag would silently break the bind-mount design (refresh
+    /// would still appear to succeed via `docker restart`, but the
+    /// in-container `/usr/local/bin/sandbox-guest` would be the old
+    /// in-image baked binary rather than the daemon-current one).
+    #[test]
+    fn container_run_argv_contains_guest_bind_mount() {
+        let sid = SessionId::parse("0123456789ab").expect("valid 12-hex");
+        let network = ContainerNetwork {
+            docker_network: "sandbox-net-x".into(),
+            container_ip: "10.0.0.3".parse().unwrap(),
+            gateway_ip: "10.0.0.2".parse().unwrap(),
+            workspace_host_path: None,
+            route_helper_path: None,
+            ca_host_path: None,
+        };
+        let staged_path = std::path::PathBuf::from("/var/lib/sandbox/guest/sandbox-guest");
+        let args = build_create_argv(
+            &sid,
+            &network,
+            DEFAULT_LITE_IMAGE_TAG,
+            1000,
+            1000,
+            512,
+            1.0,
+            &staged_path,
+        );
+
+        // Locate the `-v` flag — there is exactly one in the canonical
+        // argv (workspace bind-mounts use `--mount`, the CA bind-mount
+        // uses `--mount`, only the guest bind-mount uses `-v`). The
+        // shape is asserted as a literal so any drift in the source
+        // path, destination, or `:ro` mode flag surfaces immediately.
+        let v_positions: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| if a == "-v" { Some(i) } else { None })
+            .collect();
+        assert_eq!(
+            v_positions.len(),
+            1,
+            "expected exactly one `-v` flag (the guest bind-mount); got {} in argv {args:?}",
+            v_positions.len(),
+        );
+        let v_idx = v_positions[0];
+        let mount_spec = args
+            .get(v_idx + 1)
+            .expect("`-v` must be followed by a mount spec");
+        assert_eq!(
+            mount_spec,
+            "/var/lib/sandbox/guest/sandbox-guest:/usr/local/bin/sandbox-guest:ro",
+            "guest bind-mount spec drift — load-bearing for the M16-S6 design",
+        );
+
+        // Order invariant: the bind-mount must come BEFORE the image
+        // tag (the trailing positional). Docker's CLI grammar requires
+        // all flags to precede the image; if a refactor accidentally
+        // pushes `-v` after the image, docker errors with "unknown
+        // shorthand flag" at runtime.
+        let image_idx = args
+            .iter()
+            .position(|a| a == DEFAULT_LITE_IMAGE_TAG)
+            .expect("image tag must appear in argv");
+        assert!(
+            v_idx < image_idx,
+            "guest bind-mount `-v` (at index {v_idx}) must precede image tag \
+             (at index {image_idx}); docker's CLI grammar rejects flags after \
+             positional args",
+        );
+    }
+
+    /// M16-S6 — `refresh_guest_binary` must invoke `docker restart`,
+    /// NOT `docker cp`. The original Spec 2 § 3.8.1 design used `cp`
+    /// to push the embedded bytes into the container's writable layer;
+    /// the bind-mount design replaces that with a restart against the
+    /// already-current bind-mount source. This test pins the argv
+    /// shape so a regression that reintroduces `docker cp` is caught
+    /// without needing a live Docker daemon.
+    #[test]
+    fn refresh_guest_binary_container_invokes_restart_not_cp() {
+        let argv = build_refresh_argv("sandbox-0123456789ab");
+        assert_eq!(
+            argv[0], "restart",
+            "refresh must use `docker restart`; got argv {argv:?}",
+        );
+        assert!(
+            !argv.iter().any(|a| a == "cp"),
+            "refresh must not invoke `docker cp` — the M16-S6 amendment to \
+             api-session-isolation spec § 3.8.1 replaced cp with the \
+             bind-mount + restart design; got argv {argv:?}",
+        );
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("sandbox-0123456789ab"),
+            "container name must be the trailing positional argument",
         );
     }
 

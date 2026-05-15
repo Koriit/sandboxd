@@ -7219,12 +7219,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // it to the same `lite_image_tag_for_version` helper that
     // `ensure_image` and `rebuild_lite_image` use closes the drift at
     // one source.
+    // `sandbox_core::staged_guest_path(&base_dir)` resolves to
+    // `{base_dir}/guest/sandbox-guest` — the file the daemon's
+    // startup staging step wrote above. The runtime bind-mounts that
+    // path read-only into every container at
+    // `/usr/local/bin/sandbox-guest`; refresh becomes `docker
+    // restart` against the same already-current source
+    // (api-session-isolation spec § 3.8.1, M16-S6 amendment).
+    let staged_guest_path = sandbox_core::staged_guest_path(&base_dir);
     let container_runtime = ContainerRuntime::new(
         lite_image_tag_for_version(env!("CARGO_PKG_VERSION")),
         default_memory_mb,
         default_cpus,
         container_uid,
         container_gid,
+        staged_guest_path,
     );
     runtimes.insert(
         BackendKind::Container,
