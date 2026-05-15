@@ -46,7 +46,7 @@ test:
 # `install-route-helper-test-cap`). Flag must match the install step
 # or the test's checksum check rejects the on-disk cap'd binary as
 # stale.
-test-integration: gateway-image install-route-helper-test-cap
+test-integration: gateway-image lite-image install-route-helper-test-cap
 	cd sandboxd && \
 	    cargo build --workspace --features sandbox-route-helper/test-env-override && \
 	    cargo nextest run --workspace --profile integration --features sandbox-route-helper/test-env-override

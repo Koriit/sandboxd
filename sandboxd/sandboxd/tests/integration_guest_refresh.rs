@@ -1,32 +1,50 @@
 //! Integration tests for the guest-version refresh path
 //! (api-session-isolation spec §§ 3.4, 3.8, 3.9; §§ 7.4, 7.5).
 //!
-//! These tests pin the refresh-on-start path so it stays observable
-//! end-to-end:
+//! After the M16-S6 amendment to spec § 3.8.1 (bind-mount design),
+//! the container backend's refresh path is no longer a `docker cp`
+//! into the rootfs; instead, the daemon stages `sandbox-guest` once
+//! into `{base_dir}/guest/sandbox-guest` at startup and every
+//! container session bind-mounts that path read-only at
+//! `/usr/local/bin/sandbox-guest`. Refresh becomes `docker restart`.
 //!
-//! - `integration_guest_refresh_container_backend` — runs
-//!   `refresh_guest_binary` against a real Docker container with an
-//!   old `sandbox-guest` binary baked at `/usr/local/bin/sandbox-guest`
-//!   and asserts (a) the binary mtime / byte content changes after the
-//!   refresh, (b) the container survives the stop-then-cp dance.
-//! - `integration_guest_refresh_updates_db_columns` — exercises the
-//!   `SessionStore::update_guest_versions` call site so a successful
-//!   refresh stamps the daemon's current proto / binary versions into
-//!   the row. Hermetic — no Docker required.
-//! - `integration_guest_refresh_fast_path_skips_refresh` — pins the
-//!   property that a session with a compatible
-//!   `guest_protocol_version` does not trigger the refresh seam. Uses
-//!   the `is_protocol_compatible` predicate to spell out the decision
-//!   the daemon's `start_session` makes; the absence of any side
-//!   effect from `refresh_guest_binary` here mirrors the daemon's
-//!   intent. Hermetic.
+//! Test coverage in this file:
+//!
 //! - `integration_guest_refresh_refuses_when_unsalvageable` —
 //!   constructs the `GuestProtocolIncompatible` error variant the
-//!   daemon returns on the refuse arm and asserts the daemon-side
-//!   `error_response` helper maps it to HTTP 409 with both load-bearing
-//!   message tokens (`refresh is not viable`, `recreate the session`).
+//!   daemon returns on the refuse arm; asserts the daemon-side
+//!   `error_response` helper maps it to HTTP 409 with both
+//!   load-bearing message tokens. Hermetic.
+//! - `integration_guest_refresh_fast_path_skips_refresh` — pins the
+//!   compat-predicate decision the daemon's `start_session` makes
+//!   when the persisted column matches `DAEMON_GUEST_PROTO_VERSION`.
 //!   Hermetic.
+//! - `integration_guest_refresh_updates_db_columns` — exercises
+//!   `SessionStore::update_guest_versions` so a successful refresh
+//!   stamps the daemon's current versions into the row. Hermetic.
+//! - `integration_guest_refresh_update_versions_filters_by_owner` —
+//!   foreign-owner rejection on the same store call. Hermetic.
+//! - `integration_guest_refresh_container_backend` — runs against
+//!   the production-shape `--read-only` lite image
+//!   (`sandboxd-lite:<workspace_version>`, produced by
+//!   `make lite-image`). Asserts the in-container
+//!   `/usr/local/bin/sandbox-guest` post-restart bytes are
+//!   bit-identical to the daemon's staged-source bytes (the
+//!   bind-mount design's load-bearing property) and that
+//!   `update_guest_versions` lands. Docker-required.
+//! - `integration_guest_binary_swap_picked_up_by_new_sessions` —
+//!   change the host-side staged bytes between two container creates;
+//!   verify the second container sees the new bytes through its bind-
+//!   mount. Pins the "new sessions automatically pick up the
+//!   refreshed daemon's guest" property. Docker-required.
+//! - `integration_guest_binary_shared_inode_across_sessions` — start
+//!   two container sessions; verify their bind-mounted
+//!   `/usr/local/bin/sandbox-guest` resolves to the same backing
+//!   inode on the host (the "one inode shared across every live
+//!   session" property the bind-mount design preserves over a copy-
+//!   per-session approach). Docker-required.
 
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -35,9 +53,11 @@ use axum::Json;
 use axum::http::StatusCode;
 use sandbox_core::backend::{
     BackendKind, ContainerNetwork, ContainerRuntime, RuntimeStartArgs, SessionRuntime,
+    lite_image_tag_for_version,
 };
 use sandbox_core::guest::{
-    DAEMON_GUEST_PROTO_VERSION, SANDBOX_GUEST_VERSION, can_refresh_in_place, is_protocol_compatible,
+    DAEMON_GUEST_PROTO_VERSION, SANDBOX_GUEST_VERSION, can_refresh_in_place,
+    is_protocol_compatible,
 };
 use sandbox_core::session::SessionId;
 use sandbox_core::{
@@ -94,18 +114,12 @@ fn integration_guest_refresh_refuses_when_unsalvageable() {
 /// `refresh_guest_binary` on every start.
 #[test]
 fn integration_guest_refresh_fast_path_skips_refresh() {
-    // The compat predicate matches the constant the daemon stamps on
-    // create. Any drift between them would force refresh on every
-    // start.
     assert!(
         is_protocol_compatible(DAEMON_GUEST_PROTO_VERSION),
         "is_protocol_compatible must accept DAEMON_GUEST_PROTO_VERSION; \
          drift would force refresh on every start"
     );
 
-    // The fast path never reaches `can_refresh_in_place`, but the
-    // refuse arm is gated on it: assert proto=0 maps to refuse so the
-    // refuse-arm test's premise stays valid.
     assert!(!can_refresh_in_place(0));
 }
 
@@ -176,7 +190,6 @@ fn integration_guest_refresh_update_versions_filters_by_owner() {
         "expected SessionNotFound, got: {err:?}"
     );
 
-    // Alice's row is untouched.
     let alice_row = store
         .get_session(&session.id, "alice")
         .expect("read back")
@@ -186,7 +199,7 @@ fn integration_guest_refresh_update_versions_filters_by_owner() {
 }
 
 // ---------------------------------------------------------------------------
-// Docker-required integration test (container refresh)
+// Docker-required integration tests (container refresh, bind-mount design)
 // ---------------------------------------------------------------------------
 
 /// Tiny `docker network create` wrapper that cleans up on drop.
@@ -277,54 +290,62 @@ impl Drop for ContainerCleanup {
     }
 }
 
-/// Build the same sleep-image used by the round-trip integration test.
-/// Ships an old (placeholder) `sandbox-guest` at the canonical path so
-/// the refresh can be observed by reading the file back and comparing
-/// to the daemon's actual sandbox-guest bytes.
-///
-/// The test Dockerfile declares `VOLUME ["/usr/local/bin"]` to bypass
-/// the `--read-only` rootfs constraint that Docker 29.4+ (with the
-/// containerd snapshotter / overlayfs driver) enforces against
-/// `docker cp` writes — without the VOLUME declaration, `docker cp`
-/// into a `--read-only` container's rootfs is rejected by dockerd
-/// with `container rootfs is marked read-only` regardless of
-/// destination path. The production lite image does not yet carry
-/// this VOLUME declaration; see
-/// `.tasks/handoffs/m13-s6-refresh-readonly-gap.md` for the
-/// production-side resolution options.
-const REFRESH_IMAGE_TAG: &str = "sandboxd-refresh-test:latest";
-const REFRESH_DOCKERFILE: &str = "FROM alpine:latest\n\
-RUN mkdir -p /usr/local/bin && \\\n    \
-printf 'old-guest-placeholder\\n' > /usr/local/bin/sandbox-guest && \\\n    \
-chmod +x /usr/local/bin/sandbox-guest\n\
-VOLUME [\"/usr/local/bin\"]\n\
-ENTRYPOINT [\"sh\", \"-c\", \"exec sleep 3600\"]\n";
+/// Production-shape lite image tag — `sandboxd-lite:<workspace_version>`,
+/// exactly what `make lite-image` produces (using the same
+/// `lite_image_tag_for_version` helper the daemon's `ensure_image`
+/// uses at runtime). The integration profile depends on `lite-image`
+/// in the Makefile; if a developer iterates without rebuilding the
+/// image after a workspace-version bump the test would error with a
+/// clear "image not found" message from dockerd.
+fn lite_image_tag() -> String {
+    lite_image_tag_for_version(env!("CARGO_PKG_VERSION"))
+}
 
-static REFRESH_IMAGE_BUILD: std::sync::Once = std::sync::Once::new();
+/// Stage `bytes` (with mode 0755) into a per-test base directory's
+/// `guest/sandbox-guest`. Returns the absolute host path. Mirrors
+/// what `sandbox_core::stage_embedded_guest_binary_into_base_dir`
+/// does at daemon startup so the test fixture exercises the same
+/// on-disk shape every container session sees.
+fn stage_test_guest(base_dir: &std::path::Path, bytes: &[u8]) -> PathBuf {
+    let guest_dir = base_dir.join(sandbox_core::STAGED_GUEST_SUBDIR);
+    std::fs::create_dir_all(&guest_dir).expect("create guest subdir");
+    let path = sandbox_core::staged_guest_path(base_dir);
+    // Re-use the production staging function so a regression in the
+    // atomic-write or chmod logic surfaces here too. Synthetic bytes
+    // mean the resulting "guest" never actually executes useful
+    // protocol code; the bind-mount design is what the test exercises.
+    let outcome =
+        sandbox_core::stage_guest_binary_at(&path, bytes).expect("stage_guest_binary_at");
+    assert!(
+        matches!(
+            outcome,
+            sandbox_core::StageOutcome::Wrote | sandbox_core::StageOutcome::Rewrote
+        ),
+        "first stage on a freshly-created subdir must write or rewrite, not skip; \
+         got {outcome:?}",
+    );
+    path
+}
 
-fn ensure_refresh_image() {
-    REFRESH_IMAGE_BUILD.call_once(|| {
-        use std::io::Write;
-        let mut child = Command::new("docker")
-            .args(["build", "-t", REFRESH_IMAGE_TAG, "-"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("docker build invokable");
-        {
-            let stdin = child.stdin.as_mut().expect("docker build stdin");
-            stdin
-                .write_all(REFRESH_DOCKERFILE.as_bytes())
-                .expect("write Dockerfile");
-        }
-        let output = child.wait_with_output().expect("docker build exit");
-        assert!(
-            output.status.success(),
-            "docker build {REFRESH_IMAGE_TAG} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    });
+/// A bash one-liner that sleeps long enough for the test to complete
+/// its assertions. The lite-image entrypoint is
+/// `["/usr/bin/tini", "--", "/usr/local/bin/sandbox-guest"]`; the
+/// bind-mount overlays the in-image binary, so the file the
+/// container actually exec's is our synthetic script. Using `bash`
+/// rather than `sh` because the lite image ships `bash` (per the
+/// Dockerfile's apt-get) and the shebang surfaces cleanly to the
+/// kernel's `execve`.
+fn placeholder_sleep_script(version_tag: &str) -> Vec<u8> {
+    format!(
+        "#!/usr/bin/env bash\n\
+         # synthetic-sandbox-guest version={version_tag}\n\
+         # M16-S6 integration test placeholder — sleeps long enough\n\
+         # for the host-side assertions to read back the bind-mount\n\
+         # contents and (for the shared-inode test) stat both\n\
+         # containers' /usr/local/bin/sandbox-guest.\n\
+         exec sleep 300\n",
+    )
+    .into_bytes()
 }
 
 fn refresh_spec() -> SessionSpec {
@@ -343,7 +364,7 @@ fn refresh_spec() -> SessionSpec {
 }
 
 /// Read the bytes of `/usr/local/bin/sandbox-guest` from inside a
-/// stopped container via `docker cp` into a host tempfile.
+/// container via `docker cp` into a host tempfile.
 fn read_in_container_guest_bytes(container_name: &str) -> Vec<u8> {
     let tmp = TempDir::new().expect("tempdir");
     let host_dst = tmp.path().join("guest-readback");
@@ -363,30 +384,57 @@ fn read_in_container_guest_bytes(container_name: &str) -> Vec<u8> {
     std::fs::read(&host_dst).expect("read host tempfile")
 }
 
-/// Spec § 7.4 — exercise the container backend's `refresh_guest_binary`
-/// end-to-end against a real Docker container. Asserts:
+/// Spec § 7.4 (M16-S6 bind-mount design) — exercise the container
+/// backend's `refresh_guest_binary` end-to-end against the
+/// production-shape `--read-only` lite image
+/// (`sandboxd-lite:<workspace_version>`, the same image `make
+/// lite-image` produces). Asserts:
 ///
-/// 1. Refresh succeeds against a stopped container with an old
-///    placeholder `sandbox-guest` baked in.
-/// 2. After refresh, the in-container `/usr/local/bin/sandbox-guest`
-///    bytes match the daemon's sibling guest binary bytes (i.e. the
-///    refresh actually replaced the file).
-/// 3. The refresh sequence is idempotent — a second call against the
+/// 1. Refresh succeeds against a stopped container.
+/// 2. After refresh + start, the in-container
+///    `/usr/local/bin/sandbox-guest` bytes are bit-identical to the
+///    daemon's staged copy on the host (the bind-mount property).
+/// 3. `SessionStore::update_guest_versions` writes the daemon's
+///    current `DAEMON_GUEST_PROTO_VERSION` / `SANDBOX_GUEST_VERSION`
+///    into the row, mirroring the daemon's post-refresh atomic
+///    update (spec § 3.9).
+/// 4. The refresh sequence is idempotent — a second call against the
 ///    same container succeeds.
+///
+/// The lite image's ENTRYPOINT is `["/usr/bin/tini", "--",
+/// "/usr/local/bin/sandbox-guest"]`; the bind-mount overlays the
+/// in-image binary with a synthetic shell script so the container
+/// stays alive long enough for the assertions. The production
+/// `sandbox-guest` would also stay alive (it binds TCP :5123 and
+/// listens forever), but the placeholder removes a network / port
+/// dependency from this test.
 #[tokio::test]
 async fn integration_guest_refresh_container_backend() {
-    ensure_refresh_image();
     let net = TestNetwork::create("refresh");
-    let runtime = ContainerRuntime::new(REFRESH_IMAGE_TAG, 128, 1.0, 1000, 1000);
 
-    // Spin up a session row + the container itself.
-    let tmp = TempDir::new().expect("tempdir");
+    // Per-test base directory. The daemon would point its
+    // `staged_guest_path` at `{base_dir}/guest/sandbox-guest`; the
+    // test fixture stages a synthetic script at that path so the
+    // bind-mount lands an executable file inside the container.
+    let base_dir = TempDir::new().expect("tempdir base_dir");
+    let staged_path = stage_test_guest(base_dir.path(), &placeholder_sleep_script("v-new"));
+
+    let runtime = ContainerRuntime::new(
+        lite_image_tag(),
+        128,
+        1.0,
+        1000,
+        1000,
+        staged_path.clone(),
+    );
+
+    let tmp = TempDir::new().expect("tempdir for store");
     let (store, _orphans) = SessionStore::new(tmp.path().to_path_buf()).expect("open store");
     let store = Arc::new(store);
     let session = store
         .create_session_with_backend(
             SessionConfig::default(),
-            Some("m13s5-refresh".into()),
+            Some("m16-s6-refresh".into()),
             BackendKind::Container,
             "test-operator",
             // Stale stamp — simulates an older daemon's session.
@@ -407,51 +455,341 @@ async fn integration_guest_refresh_container_backend() {
         .await
         .expect("runtime.start");
 
-    // Stop the container — the refresh sequence requires (and
-    // explicitly defends against) a stopped container.
+    // Stop before refresh — the orchestrator (`start_session`) asserts
+    // `state == Stopped` before invoking refresh; mirror that
+    // precondition.
     runtime.stop(&handle).await.expect("runtime.stop");
 
-    // Capture the old bytes so we can detect change.
-    let container_name = handle.as_str().to_string();
-    let old_bytes = read_in_container_guest_bytes(&container_name);
-    assert!(
-        old_bytes.starts_with(b"old-guest-placeholder"),
-        "pre-refresh in-container guest should be the placeholder"
-    );
-
-    // Drive the refresh — first invocation.
+    // Drive refresh = `docker restart`.
     runtime
         .refresh_guest_binary(&handle)
         .await
         .expect("refresh_guest_binary (first call)");
 
-    let new_bytes = read_in_container_guest_bytes(&container_name);
-    let daemon_bytes = std::fs::read(sandbox_core::guest_agent_path().expect("guest_agent_path"))
-        .expect("read daemon-side sandbox-guest");
-
+    // The container is now running again (refresh restarts it); the
+    // in-container `/usr/local/bin/sandbox-guest` resolves through
+    // the bind-mount to our staged file, so its bytes must equal the
+    // host-side staged bytes.
+    let container_name = handle.as_str().to_string();
+    let in_container = read_in_container_guest_bytes(&container_name);
+    let on_host = std::fs::read(&staged_path).expect("read host staged guest");
     assert_eq!(
-        new_bytes, daemon_bytes,
-        "post-refresh in-container guest must match daemon-side bytes"
-    );
-    assert_ne!(
-        new_bytes, old_bytes,
-        "refresh must have replaced the placeholder"
+        in_container, on_host,
+        "post-refresh in-container `/usr/local/bin/sandbox-guest` must be \
+         bit-identical to the daemon's host-side staged file — that's the \
+         load-bearing property of the bind-mount design (M16-S6 amendment to \
+         api-session-isolation spec § 3.8.1)"
     );
 
     // Idempotency: re-running refresh against the same container is a
-    // no-op modulo writes (api-session-isolation spec § 3.9 motivates
-    // the property — a daemon crash after refresh but before start
-    // re-runs refresh on the next attempt).
+    // no-op modulo restarting it again. The bind-mount source hasn't
+    // changed; the container's binary stays bit-identical.
     runtime
         .refresh_guest_binary(&handle)
         .await
         .expect("refresh_guest_binary (second call)");
-
     let after_second = read_in_container_guest_bytes(&container_name);
     assert_eq!(
-        after_second, daemon_bytes,
-        "second refresh keeps the daemon-side bytes in place"
+        after_second, on_host,
+        "second refresh must leave the bind-mount source intact",
     );
 
+    // Spec § 3.9 — after refresh + start succeed, the daemon stamps
+    // the current versions on the row. Mirror the orchestrator's
+    // call here so the integration coverage includes the store-side
+    // write (the existing hermetic test
+    // `integration_guest_refresh_updates_db_columns` covers the
+    // store API in isolation; this assertion ties it to the live
+    // refresh path).
+    store
+        .update_guest_versions(
+            "test-operator",
+            &session.id,
+            DAEMON_GUEST_PROTO_VERSION,
+            SANDBOX_GUEST_VERSION,
+        )
+        .expect("update_guest_versions");
+    let row = store
+        .get_session(&session.id, "test-operator")
+        .expect("read row")
+        .expect("row present");
+    assert_eq!(row.guest_protocol_version, DAEMON_GUEST_PROTO_VERSION);
+    assert_eq!(row.guest_binary_version, SANDBOX_GUEST_VERSION);
+
     runtime.delete(&handle).await.expect("runtime.delete");
+}
+
+/// M16-S6 — change the host-side staged file's bytes between two
+/// container creates; verify the second container sees the new bytes
+/// through its bind-mount.
+///
+/// This pins the "new sessions automatically pick up the refreshed
+/// daemon's guest" property of the bind-mount design: a daemon
+/// upgrade that stages new bytes into `{base_dir}/guest/sandbox-guest`
+/// changes what every subsequent container session sees at
+/// `/usr/local/bin/sandbox-guest`, without per-session refresh work.
+#[tokio::test]
+async fn integration_guest_binary_swap_picked_up_by_new_sessions() {
+    let net = TestNetwork::create("swap");
+    let base_dir = TempDir::new().expect("tempdir base_dir");
+
+    // Stage v1 and create container #1.
+    let staged_path = stage_test_guest(base_dir.path(), &placeholder_sleep_script("v-one"));
+    let runtime = ContainerRuntime::new(
+        lite_image_tag(),
+        128,
+        1.0,
+        1000,
+        1000,
+        staged_path.clone(),
+    );
+
+    let tmp = TempDir::new().expect("tempdir for store");
+    let (store, _orphans) = SessionStore::new(tmp.path().to_path_buf()).expect("open store");
+    let store = Arc::new(store);
+
+    let session_one = store
+        .create_session_with_backend(
+            SessionConfig::default(),
+            Some("m16-s6-swap-one".into()),
+            BackendKind::Container,
+            "test-operator",
+            DAEMON_GUEST_PROTO_VERSION,
+            SANDBOX_GUEST_VERSION,
+        )
+        .expect("persist session #1");
+    let _c1 = ContainerCleanup::new(&session_one.id);
+    runtime.register_session(session_one.id, net.to_container_network());
+    let handle_one = runtime
+        .create(&session_one.id, &refresh_spec())
+        .await
+        .expect("runtime.create #1");
+    runtime
+        .start(&handle_one, &RuntimeStartArgs::default())
+        .await
+        .expect("runtime.start #1");
+
+    let c1_bytes = read_in_container_guest_bytes(handle_one.as_str());
+    assert!(
+        c1_bytes.windows("v-one".len()).any(|w| w == b"v-one"),
+        "container #1 must see v-one bytes through its bind-mount; got {} bytes",
+        c1_bytes.len(),
+    );
+
+    // Swap: rewrite the staged file with v2 bytes. The atomic rename
+    // happens inside `stage_guest_binary_at`; container #1's
+    // bind-mount continues to resolve to the OLD inode (the kernel
+    // captured the inode at mount time) — that's a kernel-level
+    // guarantee we don't assert here, we only assert that NEW
+    // containers see the NEW bytes.
+    let v2_bytes = placeholder_sleep_script("v-two-rewritten");
+    let outcome = sandbox_core::stage_guest_binary_at(&staged_path, &v2_bytes)
+        .expect("stage v2 bytes");
+    assert_eq!(
+        outcome,
+        sandbox_core::StageOutcome::Rewrote,
+        "staging different bytes over an existing file must take the Rewrote arm",
+    );
+
+    // New network for container #2 (each container needs its own /28 IP).
+    let net2 = TestNetwork::create("swap2");
+
+    let session_two = store
+        .create_session_with_backend(
+            SessionConfig::default(),
+            Some("m16-s6-swap-two".into()),
+            BackendKind::Container,
+            "test-operator",
+            DAEMON_GUEST_PROTO_VERSION,
+            SANDBOX_GUEST_VERSION,
+        )
+        .expect("persist session #2");
+    let _c2 = ContainerCleanup::new(&session_two.id);
+    runtime.register_session(session_two.id, net2.to_container_network());
+    let handle_two = runtime
+        .create(&session_two.id, &refresh_spec())
+        .await
+        .expect("runtime.create #2");
+    runtime
+        .start(&handle_two, &RuntimeStartArgs::default())
+        .await
+        .expect("runtime.start #2");
+
+    let c2_bytes = read_in_container_guest_bytes(handle_two.as_str());
+    assert!(
+        c2_bytes
+            .windows("v-two-rewritten".len())
+            .any(|w| w == b"v-two-rewritten"),
+        "container #2 must see v-two bytes through its bind-mount after the \
+         host-side staged file was rewritten; got {} bytes",
+        c2_bytes.len(),
+    );
+
+    runtime
+        .delete(&handle_one)
+        .await
+        .expect("runtime.delete #1");
+    runtime
+        .delete(&handle_two)
+        .await
+        .expect("runtime.delete #2");
+}
+
+/// M16-S6 — start two container sessions; verify their bind-mounted
+/// `/usr/local/bin/sandbox-guest` resolves to the same backing inode
+/// on the host.
+///
+/// This pins the "one inode shared across every live session"
+/// property of the bind-mount design. A copy-per-session approach
+/// would produce N inodes for N containers and N copies of the
+/// binary in the kernel page cache; the bind-mount keeps it at one,
+/// regardless of how many sessions are live. The property is read
+/// off `/proc/<pid>/root/usr/local/bin/sandbox-guest`'s host-visible
+/// inode via `docker inspect`'s State.Pid + the host's stat.
+#[tokio::test]
+async fn integration_guest_binary_shared_inode_across_sessions() {
+    let base_dir = TempDir::new().expect("tempdir base_dir");
+    let staged_path = stage_test_guest(base_dir.path(), &placeholder_sleep_script("shared"));
+    let runtime = ContainerRuntime::new(
+        lite_image_tag(),
+        128,
+        1.0,
+        1000,
+        1000,
+        staged_path.clone(),
+    );
+
+    let tmp = TempDir::new().expect("tempdir for store");
+    let (store, _orphans) = SessionStore::new(tmp.path().to_path_buf()).expect("open store");
+    let store = Arc::new(store);
+
+    // Stage A.
+    let net_a = TestNetwork::create("shareda");
+    let session_a = store
+        .create_session_with_backend(
+            SessionConfig::default(),
+            Some("m16-s6-share-a".into()),
+            BackendKind::Container,
+            "test-operator",
+            DAEMON_GUEST_PROTO_VERSION,
+            SANDBOX_GUEST_VERSION,
+        )
+        .expect("persist session A");
+    let _cleanup_a = ContainerCleanup::new(&session_a.id);
+    runtime.register_session(session_a.id, net_a.to_container_network());
+    let handle_a = runtime
+        .create(&session_a.id, &refresh_spec())
+        .await
+        .expect("runtime.create A");
+    runtime
+        .start(&handle_a, &RuntimeStartArgs::default())
+        .await
+        .expect("runtime.start A");
+
+    // Stage B.
+    let net_b = TestNetwork::create("sharedb");
+    let session_b = store
+        .create_session_with_backend(
+            SessionConfig::default(),
+            Some("m16-s6-share-b".into()),
+            BackendKind::Container,
+            "test-operator",
+            DAEMON_GUEST_PROTO_VERSION,
+            SANDBOX_GUEST_VERSION,
+        )
+        .expect("persist session B");
+    let _cleanup_b = ContainerCleanup::new(&session_b.id);
+    runtime.register_session(session_b.id, net_b.to_container_network());
+    let handle_b = runtime
+        .create(&session_b.id, &refresh_spec())
+        .await
+        .expect("runtime.create B");
+    runtime
+        .start(&handle_b, &RuntimeStartArgs::default())
+        .await
+        .expect("runtime.start B");
+
+    // Resolve each container's PID and stat its
+    // `/proc/<pid>/root/usr/local/bin/sandbox-guest` from the host.
+    // The bind-mount source's inode must be the same in both views.
+    let inode_a = inode_of_in_container_guest(handle_a.as_str());
+    let inode_b = inode_of_in_container_guest(handle_b.as_str());
+    let host_inode = inode_of(&staged_path);
+
+    assert_eq!(
+        inode_a, host_inode,
+        "container A's bind-mounted /usr/local/bin/sandbox-guest must share \
+         the host-side staged inode; the bind-mount design's load-bearing \
+         property is that the kernel page cache for the guest binary is \
+         shared across every live session",
+    );
+    assert_eq!(
+        inode_b, host_inode,
+        "container B's bind-mounted /usr/local/bin/sandbox-guest must share \
+         the host-side staged inode (same reason as A)",
+    );
+    assert_eq!(
+        inode_a, inode_b,
+        "containers A and B must share one inode for the bind-mounted \
+         guest binary; a copy-per-session approach would produce two \
+         distinct inodes and defeat the page-cache-sharing motivation",
+    );
+
+    runtime.delete(&handle_a).await.expect("runtime.delete A");
+    runtime.delete(&handle_b).await.expect("runtime.delete B");
+}
+
+/// `stat -c %i <path>` via the standard-library `metadata` ino()
+/// rather than shelling out to `stat`.
+fn inode_of(path: &std::path::Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path)
+        .unwrap_or_else(|e| panic!("stat {} failed: {e}", path.display()))
+        .ino()
+}
+
+/// Read the bind-mounted `/usr/local/bin/sandbox-guest` inode from
+/// inside the container's mount namespace by traversing
+/// `/proc/<container_pid>/root/usr/local/bin/sandbox-guest` from the
+/// host. The container's PID comes from `docker inspect -f
+/// '{{.State.Pid}}'`.
+///
+/// `/proc/<pid>/root` resolves on the host to a path that opens the
+/// container's mount namespace, so a stat of the resulting absolute
+/// path goes through the same filesystem the container sees —
+/// including the bind-mount overlay. The inode reported is the
+/// underlying host inode (the bind-mount source); two containers
+/// sharing the same bind-mount source report identical inodes
+/// regardless of how the kernel renders them inside each container's
+/// view.
+///
+/// This requires the test runner to have permission to traverse
+/// `/proc/<pid>/root` of containers running as uid 1000 — true on
+/// every dev host that runs the existing integration suite (the
+/// test runner is the same uid that owns the docker daemon's
+/// connection, and `/proc/<pid>/root` is `r-x------` owned by the
+/// process's uid; on rootless docker the daemon runs as the test
+/// user too).
+fn inode_of_in_container_guest(container_name: &str) -> u64 {
+    let output = Command::new("docker")
+        .args(["inspect", "-f", "{{.State.Pid}}", container_name])
+        .output()
+        .expect("docker inspect invokable");
+    assert!(
+        output.status.success(),
+        "docker inspect {container_name} for PID failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let pid_str = String::from_utf8(output.stdout).expect("PID utf8");
+    let pid: u32 = pid_str.trim().parse().unwrap_or_else(|e| {
+        panic!("parse PID {pid_str:?} from docker inspect failed: {e}")
+    });
+    assert!(
+        pid != 0,
+        "container {container_name} has PID 0 — it must be running for \
+         the bind-mount inode check",
+    );
+    let proc_path =
+        PathBuf::from(format!("/proc/{pid}/root/usr/local/bin/sandbox-guest"));
+    inode_of(&proc_path)
 }
