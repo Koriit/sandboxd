@@ -79,7 +79,9 @@ pub use gateway::{
     NFT_POLICY_ALLOW_TCP_SET, NFT_POLICY_ALLOW_UDP_SET,
 };
 pub use guest::{
-    GUEST_AGENT_PORT, GuestConnector, GuestRequest, GuestResponse, MAX_MESSAGE_SIZE, read_message,
+    GUEST_AGENT_PORT, GuestConnector, GuestRequest, GuestResponse, MAX_MESSAGE_SIZE,
+    STAGED_GUEST_FILE_RELPATH, STAGED_GUEST_SUBDIR, StageOutcome, read_message,
+    stage_embedded_guest_binary_into_base_dir, stage_guest_binary_at, staged_guest_path,
     write_message,
 };
 pub use lds_ack::{

@@ -132,7 +132,16 @@ fn default_base_dir() -> String {
 ///
 /// The set is small and stable; carry it as a `&[&str]` so a future
 /// caller can introspect or iterate without re-importing the list.
-const BASE_DIR_SUBDIRS: &[&str] = &["sessions", "events", "backups"];
+///
+/// `guest/` holds the daemon-staged `sandbox-guest` binary that every
+/// container session bind-mounts read-only at
+/// `/usr/local/bin/sandbox-guest` (api-session-isolation spec § 3.8.1,
+/// M16-S6 amendment + daemon-productionization spec § 5.4 forward
+/// note). The staging step itself runs immediately after this layout
+/// enforcer; the subdir must exist beforehand because the atomic
+/// sibling-tempfile-and-rename pattern places the tempfile in
+/// `guest/`'s parent on the same filesystem.
+const BASE_DIR_SUBDIRS: &[&str] = &["sessions", "events", "backups", "guest"];
 
 /// The numeric mode every per-daemon state-dir subdirectory must
 /// carry. `0700` matches the daemon-uid-only access expectation
@@ -7000,18 +7009,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::fs::create_dir_all(&base_dir).await?;
 
     // Enforce the base-dir subdir layout invariants (mode 0700 on
-    // `sessions/`, `events/`, `backups/`) before any code path opens
-    // a database, registers a gateway image, or migrates the schema.
-    // Running this synchronously is cheap (three stat calls in the
-    // happy path) and keeps the operator-visible failure surface
-    // tight: if the chmod fails because the operator left a stale
-    // root-owned subdir behind, the daemon refuses to start with a
-    // clear error before anything downstream is touched.
+    // `sessions/`, `events/`, `backups/`, `guest/`) before any code
+    // path opens a database, registers a gateway image, or migrates
+    // the schema.  Running this synchronously is cheap (a handful of
+    // stat calls in the happy path) and keeps the operator-visible
+    // failure surface tight: if the chmod fails because the operator
+    // left a stale root-owned subdir behind, the daemon refuses to
+    // start with a clear error before anything downstream is touched.
     {
         let base_dir = base_dir.clone();
         tokio::task::spawn_blocking(move || ensure_base_dir_layout(&base_dir))
             .await
             .map_err(|e| SandboxError::Internal(format!("base-dir layout task panicked: {e}")))??;
+    }
+
+    // Stage the embedded `sandbox-guest` binary into `{base_dir}/guest/`
+    // so every container session can bind-mount it read-only at
+    // `/usr/local/bin/sandbox-guest`. Spec: api-session-isolation §
+    // 3.8.1 (M16-S6 amendment). Runs once at startup, idempotent
+    // (sha256 compare); refresh becomes `docker restart` rather than
+    // `docker cp` because the staged binary is already current. The
+    // operation is synchronous + CPU-cheap (one read, one hash, one
+    // optional rename) — `spawn_blocking` keeps it off the tokio
+    // worker for the same reason `ensure_base_dir_layout` did.
+    {
+        let base_dir = base_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            sandbox_core::stage_embedded_guest_binary_into_base_dir(&base_dir)
+        })
+        .await
+        .map_err(|e| SandboxError::Internal(format!("guest-staging task panicked: {e}")))??;
     }
 
     // Gateway-image presence check. The daemon does NOT refuse to
