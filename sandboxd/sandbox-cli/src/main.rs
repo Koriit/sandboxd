@@ -1340,6 +1340,32 @@ struct DaemonVersionResponse {
     version: String,
 }
 
+/// Run the strict CLI ↔ daemon version-equality handshake against an
+/// already-handshaken hyper sender. On skew the verbatim stderr message
+/// is printed and the process exits with [`CLI_VERSION_MISMATCH_EXIT_CODE`]
+/// — there is no return path to the caller, matching the original
+/// in-line implementation that lived inside `send_request_with_timeout`.
+///
+/// Shared between the normal request/response path
+/// (`send_request_with_timeout`) and the long-lived streaming path
+/// (`stream_events_to_stdout`) so every side-channel CLI command that
+/// connects to the daemon goes through the same equality gate, per
+/// Spec 3 § 7.3. Subcommands that need to bypass the check (e.g.
+/// `sandbox version`, `sandbox doctor`, `sandbox update`) are routed
+/// before the socket-connect path in `main` and never call this
+/// helper — see [`command_bypasses_version_check`].
+async fn enforce_version_handshake(
+    sender: &mut hyper::client::conn::http1::SendRequest<String>,
+) -> Result<(), String> {
+    let daemon_version = fetch_daemon_version(sender).await?;
+    let cli_version = env!("CARGO_PKG_VERSION");
+    if let Err(message) = check_daemon_version_equality(cli_version, &daemon_version) {
+        eprintln!("{message}");
+        process::exit(CLI_VERSION_MISMATCH_EXIT_CODE);
+    }
+    Ok(())
+}
+
 /// Issue `GET /version` against an already-handshaken hyper sender and
 /// return the daemon's reported `CARGO_PKG_VERSION`. Errors map to the
 /// same `String`-message shape every other `send_request_with_timeout`
@@ -1422,13 +1448,11 @@ async fn send_request_with_timeout(
         // upstream in `main` (see `command_bypasses_version_check`).
         // Mismatch short-circuits with the verbatim stderr wording and
         // exits with `CLI_VERSION_MISMATCH_EXIT_CODE` so the caller's
-        // request is never sent against a skewed daemon.
-        let daemon_version = fetch_daemon_version(&mut sender).await?;
-        let cli_version = env!("CARGO_PKG_VERSION");
-        if let Err(message) = check_daemon_version_equality(cli_version, &daemon_version) {
-            eprintln!("{message}");
-            process::exit(CLI_VERSION_MISMATCH_EXIT_CODE);
-        }
+        // request is never sent against a skewed daemon. The same
+        // helper is invoked from `stream_events_to_stdout` so the
+        // streaming side-channel inherits the gate symmetrically per
+        // Spec 3 § 7.3.
+        enforce_version_handshake(&mut sender).await?;
 
         let response = sender
             .send_request(req)
@@ -3384,6 +3408,16 @@ async fn stream_events_to_stdout(socket_path: &str, args: &EventsArgs) -> Result
             }
         }
     });
+
+    // Strict CLI ↔ daemon version-equality handshake (Spec 3 § 7.3).
+    // `sandbox events` does not reach `send_request_with_timeout`
+    // because of its streaming response shape, but the version gate
+    // must still fire so a CLI ↔ daemon skew refuses the stream
+    // before any session-scoped data crosses the wire. Mismatch
+    // exits the process with the verbatim wording other side-channel
+    // commands print; the streaming sender is shut down by the
+    // process exit.
+    enforce_version_handshake(&mut sender).await?;
 
     let mut response = sender
         .send_request(req)
