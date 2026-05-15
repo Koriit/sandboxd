@@ -680,6 +680,23 @@ image build (`sandbox-core/src/backend/container.rs:1276`) for container.
 
 #### 3.8.1 · Container backend
 
+> **Amended in M16-S6 (bind-mount design).** The original `docker cp`
+> refresh design below is empirically broken on Docker 29.4+ with the
+> containerd snapshotter against `--read-only` containers: dockerd
+> rejects writes into the rootfs with "container rootfs is marked
+> read-only" regardless of whether the storage driver could in
+> principle accept them. M13-S5 surfaced this; deferred todos #141,
+> #142, #147, #154 all queued behind the same gap. M16-S6 replaces
+> the per-refresh `docker cp` with a **read-only bind-mount** of a
+> daemon-staged guest binary, and turns refresh into a `docker
+> restart`. The original `docker cp` design is preserved verbatim
+> below as historical context (under "Historical note — superseded
+> `docker cp` design") so the reasoning behind the substrate's
+> constraints stays auditable. See `docs/internal/milestones/M16.md`
+> § M16-S6 for the amendment rationale.
+
+##### Bind-mount design (M16-S6, current implementation)
+
 Reality check first: the lite-mode container has **no init system**. Its
 `Dockerfile` (`sandboxd/images/lite/Dockerfile:45`) sets
 `ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/sandbox-guest"]`. There is
@@ -689,55 +706,176 @@ PID 2 under `tini` as PID 1. Restarting the guest binary in place means
 only way the new binary becomes the live process.
 
 The container also runs with `--read-only` rootfs
-(`container.rs:482`), but `docker cp` writes to the container's mutable
-layer through the docker daemon's storage driver (not the container's view
-of `/`), so it works on both running and stopped containers regardless of
-`--read-only`. The constraint that matters is the init reality, not the
-filesystem flag.
+(`container.rs:482`); the production lite image carries no `VOLUME`
+declaration over `/usr/local/bin/`, so any write into the rootfs (whether
+via `docker cp` or `docker exec ... chmod`) is rejected by dockerd. The
+fix is to take the rootfs out of the equation: the daemon stages
+`sandbox-guest` once into its own state directory, and every container
+**bind-mounts that path read-only** at `/usr/local/bin/sandbox-guest`,
+overlaying the in-image binary. Refresh stops being a rootfs write at
+all — it becomes a container restart that re-execs `tini` against the
+already-current bind source.
 
-Refresh procedure for the container backend
-(`sandbox-core/src/backend/container.rs:537-566` is where the new method
-lives, next to `start`):
+Component responsibilities:
+
+1. **Daemon startup** stages the embedded `sandbox-guest` bytes (via
+   the option-A `include_bytes!` mechanism from § 3.6 — Spec 2 ships
+   the dev-mode sibling-file source; Spec 4 swaps that for the
+   compile-time embed) into `{base_dir}/guest/sandbox-guest` at mode
+   `0o755`, owner `sandbox:sandbox`. Idempotent on every startup —
+   the existing on-disk file's sha256 is compared to the embedded
+   bytes; on match, the file is left alone; on mismatch, it is
+   rewritten via a sibling-tempfile-and-rename atomic-write; if
+   absent, it is created. The `guest/` subdir itself is created by
+   Spec 3 § 5.4's `ensure_base_dir_layout` (extended in lockstep with
+   this amendment).
+
+2. **`ContainerRuntime::create`** adds a single arg pair to the
+   `docker create` argv:
+
+   ```
+   -v {base_dir}/guest/sandbox-guest:/usr/local/bin/sandbox-guest:ro
+   ```
+
+   The bind-mount is read-only (`:ro`) — the guest process inside the
+   container cannot rewrite the source even if the rootfs were writable.
+   The source path is the daemon-staged copy at the path
+   `{base_dir}/guest/sandbox-guest`, threaded into `ContainerRuntime`
+   at construction time so the runtime never has to ask the daemon
+   for it at create time.
+
+3. **`ContainerRuntime::refresh_guest_binary`** becomes a defensive
+   `docker stop -t 5` (already-stopped is a no-op — the orchestrator
+   asserts `session.state == Stopped` before calling refresh) followed
+   by a `docker restart` of the container. The daemon-staged binary at
+   the bind-mount source is already current (the startup staging step
+   pinned it before any session was started this boot); the restart
+   simply re-execs `tini` against the bind-mount, which picks up the
+   new binary via the kernel's normal `execve` path. No rootfs write,
+   no `docker cp`, no tempfile.
+
+Pseudo-code:
 
 ```
 fn refresh_guest_binary(handle):
     container_name = handle.as_str()                    # "sandbox-{session_id}"
 
-    # 1. Ensure the container is stopped — refresh runs only from
-    #    `start_session`, which enforces session.state == Stopped, so
-    #    the container is almost certainly already stopped. A defensive
-    #    `docker stop` is a no-op for an already-stopped container.
-    docker stop -t 5 <container_name>     # idempotent; ignore "is not running"
+    # 1. Defensive stop — `start_session` asserts state == Stopped
+    #    before calling refresh, so the container is almost certainly
+    #    stopped already. Idempotent; ignore "is not running".
+    docker stop -t 5 <container_name>
 
-    # 2. Stage the embedded guest binary to a host tempfile.
-    let tempfile = write_embedded_guest_to_tempfile()?;
+    # 2. Restart the container. The bind-mount source (daemon-staged
+    #    at boot) is already current; `docker restart` re-execs `tini`
+    #    against `/usr/local/bin/sandbox-guest`, which is now the
+    #    staged binary by virtue of the mount.
+    docker restart <container_name>
 
-    # 3. Push it into the container's writable layer at the canonical path.
-    docker cp <tempfile> <container_name>:/usr/local/bin/sandbox-guest
-    docker exec --user 0 ... chmod is NOT possible (container is stopped, and
-        --user 0 is forbidden by the spec hardening anyway).
-    # docker cp preserves source mode; the tempfile is written with 0755
-    # so the in-container file inherits +x. Verified by the integration
-    # test in § 7.4.
-
-    # 4. Drop the host tempfile — its contents are now inside the container.
-    drop(tempfile);
-
-    # 5. Return Ok. The orchestrator (§ 3.4) calls `runtime.start(handle, args)`
-    #    next, which runs `docker start` and the existing tini-->sandbox-guest
-    #    entrypoint exec picks up the new binary.
+    # 3. Return Ok. The orchestrator (§ 3.4) calls runtime.start
+    #    next; for the container backend that is a `docker start`
+    #    which is idempotent for an already-running container (docker
+    #    treats it as a no-op).
 ```
 
-This means `refresh_guest_binary` for the container backend is logically
-**`docker cp` only** — it does not start the container itself. The
-orchestrator's next step (the existing `runtime.start` at `main.rs:2730`) is
-the start. This keeps refresh idempotent: a daemon that crashes between
-"binary pushed" and "container started" leaves the session in `Stopped` with
-the new binary on disk, and the next `start_session` re-runs the compat check,
-finds the proto still mismatched (DB wasn't updated), re-pushes the same
-binary (a no-op `docker cp`), then starts. Atomicity is provided by the
-single `SessionStore.update_guest_versions` call **after** the runtime start
-succeeds (§ 3.9).
+Why this is materially simpler than the `docker cp` design it replaces:
+
+- **One inode is shared across every live container session.** The
+  bind-mount source is a single file on the daemon's state dir; every
+  container's `/usr/local/bin/sandbox-guest` resolves to that same
+  inode. The kernel page cache for the guest binary is shared, so the
+  N-container memory footprint of N copies collapses to one copy.
+- **`--read-only` rootfs is no longer a constraint.** The bind-mount
+  sidesteps the rootfs entirely; dockerd never sees a write into the
+  RO layer.
+- **No per-refresh staging.** The staging is one-shot at daemon startup,
+  not per-session-per-refresh. The hot path (`refresh_guest_binary`)
+  becomes a single `docker restart`.
+- **Crash recovery is unchanged in shape.** If the daemon crashes
+  between refresh and `update_guest_versions` (§ 3.9), the next
+  `start_session` re-runs the compat check, finds the proto still
+  mismatched (DB wasn't updated), invokes refresh again — a `docker
+  restart` of an already-restarted container is a no-op modulo wall
+  clock. § 3.9's "idempotent refresh" property holds.
+
+Migration of live sessions created on the previous container shape
+(no bind-mount, with `sandbox-guest` baked into the image layer):
+no new migration code is required. The lite image continues to bake
+`sandbox-guest` into `/usr/local/bin/sandbox-guest` (the Dockerfile
+shape is unchanged), so a legacy container restarted by this daemon
+has a current-version binary at that path either way — either the
+bind-mount overlays the in-image binary with the staged copy (newer
+container creates), or the in-image binary stands alone for legacy
+containers and the compat gate (§ 3.4) drives the refresh decision
+based on the persisted column. Either branch ends with a session
+that speaks the current protocol.
+
+##### Historical note — superseded `docker cp` design
+
+The original Spec 2 § 3.8.1 design used `docker cp` to push the
+embedded guest bytes into the container's writable layer per refresh.
+That design predates the M13-S5 verification of the
+read-only-rootfs/storage-driver interaction on modern Docker; it is
+preserved verbatim here so the reasoning that motivated the bind-mount
+swap stays auditable.
+
+> Reality check first: the lite-mode container has **no init system**. Its
+> `Dockerfile` (`sandboxd/images/lite/Dockerfile:45`) sets
+> `ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/sandbox-guest"]`. There is
+> no systemd, no `service` command, no supervisord — `sandbox-guest` runs as
+> PID 2 under `tini` as PID 1. Restarting the guest binary in place means
+> **stopping and starting the container**, because the entrypoint exec is the
+> only way the new binary becomes the live process.
+>
+> The container also runs with `--read-only` rootfs
+> (`container.rs:482`), but `docker cp` writes to the container's mutable
+> layer through the docker daemon's storage driver (not the container's view
+> of `/`), so it works on both running and stopped containers regardless of
+> `--read-only`. The constraint that matters is the init reality, not the
+> filesystem flag.
+>
+> Refresh procedure for the container backend
+> (`sandbox-core/src/backend/container.rs:537-566` is where the new method
+> lives, next to `start`):
+>
+> ```
+> fn refresh_guest_binary(handle):
+>     container_name = handle.as_str()                    # "sandbox-{session_id}"
+>
+>     # 1. Ensure the container is stopped — refresh runs only from
+>     #    `start_session`, which enforces session.state == Stopped, so
+>     #    the container is almost certainly already stopped. A defensive
+>     #    `docker stop` is a no-op for an already-stopped container.
+>     docker stop -t 5 <container_name>     # idempotent; ignore "is not running"
+>
+>     # 2. Stage the embedded guest binary to a host tempfile.
+>     let tempfile = write_embedded_guest_to_tempfile()?;
+>
+>     # 3. Push it into the container's writable layer at the canonical path.
+>     docker cp <tempfile> <container_name>:/usr/local/bin/sandbox-guest
+>     docker exec --user 0 ... chmod is NOT possible (container is stopped, and
+>         --user 0 is forbidden by the spec hardening anyway).
+>     # docker cp preserves source mode; the tempfile is written with 0755
+>     # so the in-container file inherits +x. Verified by the integration
+>     # test in § 7.4.
+>
+>     # 4. Drop the host tempfile — its contents are now inside the container.
+>     drop(tempfile);
+>
+>     # 5. Return Ok. The orchestrator (§ 3.4) calls `runtime.start(handle, args)`
+>     #    next, which runs `docker start` and the existing tini-->sandbox-guest
+>     #    entrypoint exec picks up the new binary.
+> ```
+>
+> This means `refresh_guest_binary` for the container backend is logically
+> **`docker cp` only** — it does not start the container itself. The
+> orchestrator's next step (the existing `runtime.start` at `main.rs:2730`) is
+> the start. This keeps refresh idempotent: a daemon that crashes between
+> "binary pushed" and "container started" leaves the session in `Stopped` with
+> the new binary on disk, and the next `start_session` re-runs the compat check,
+> finds the proto still mismatched (DB wasn't updated), re-pushes the same
+> binary (a no-op `docker cp`), then starts. Atomicity is provided by the
+> single `SessionStore.update_guest_versions` call **after** the runtime start
+> succeeds (§ 3.9).
 
 #### 3.8.2 · Lima/QEMU backend
 
@@ -1600,21 +1738,54 @@ rare (a sandboxd update boundary), and start time on the refresh path is
 already secondary to the refresh's content (the binary copy + service
 restart dominates).
 
-### 9.4 · `docker cp` on a `--read-only` container
+### 9.4 · `--read-only` rootfs and refresh writes
 
-Verified above (§ 3.8.1) that `docker cp` writes through the docker
-daemon's storage driver and is unaffected by `--read-only`. There's one
-caveat: the writable layer for a `--read-only` container is implementation-
-specific (overlay2 mounts the upperdir read-only; rootless docker uses
-fuse-overlayfs; some storage drivers may behave differently). The
-container backend already requires default-hardened docker (per
-`SandboxError::RootlessDockerRefused` at `sandbox-core/src/error.rs:73`,
-and the rootless-docker probe at `sandbox-core/src/backend/container_rootless_probe.rs`),
-so the supported surface is overlay2 on regular dockerd. The
-`integration_guest_refresh_container_backend` test pins this for the
-storage driver the CI runner uses; if production lands a host with a
-non-overlay2 driver, the failure surfaces in that integration test before
-it reaches operators.
+> **Amended in M16-S6 (bind-mount design).** The original "docker cp
+> works on --read-only" premise was invalidated by M13-S5 measurement
+> on modern Docker (29.4+, containerd snapshotter): dockerd refuses
+> writes into a `--read-only` rootfs regardless of which storage
+> driver underlies the writable layer. The new bind-mount design
+> (§ 3.8.1) eliminates the write entirely — refresh becomes a `docker
+> restart` against a daemon-staged bind-mount source, so the rootfs
+> is never touched. The original prose is preserved verbatim below
+> as historical context. See `docs/internal/milestones/M16.md` §
+> M16-S6 for the amendment rationale.
+
+Under the bind-mount design (§ 3.8.1), the `--read-only` rootfs
+constraint is no longer a refresh concern: the daemon stages
+`sandbox-guest` into its own state directory once at startup and
+every container bind-mounts that path read-only at
+`/usr/local/bin/sandbox-guest`. Refresh becomes `docker restart`, the
+rootfs is never written, and the question of which storage driver
+underlies the writable layer becomes irrelevant for refresh purposes.
+
+The remaining risk surface is the bind-mount itself: a container that
+cannot read the source path (e.g. if the daemon's `guest/` subdir was
+chmodded to a mode that excludes other-readability) would fail at
+`docker create` time with a mount error, surfaced cleanly to the
+operator. The daemon-startup staging step pins the mode at `0o755`
+on the staged file and Spec 3 § 5.4 pins the parent directory mode at
+`0o700` owned by the daemon's `sandbox` user; the container's user
+(uid 1000, the `agent` account) reaches the staged file via the
+kernel's normal path-traversal which the read-only bind-mount
+permits, exactly the same shape that already works for the per-session
+CA bind-mount.
+
+##### Historical note — superseded "`docker cp` works on --read-only" claim
+
+> Verified above (§ 3.8.1) that `docker cp` writes through the docker
+> daemon's storage driver and is unaffected by `--read-only`. There's one
+> caveat: the writable layer for a `--read-only` container is implementation-
+> specific (overlay2 mounts the upperdir read-only; rootless docker uses
+> fuse-overlayfs; some storage drivers may behave differently). The
+> container backend already requires default-hardened docker (per
+> `SandboxError::RootlessDockerRefused` at `sandbox-core/src/error.rs:73`,
+> and the rootless-docker probe at `sandbox-core/src/backend/container_rootless_probe.rs`),
+> so the supported surface is overlay2 on regular dockerd. The
+> `integration_guest_refresh_container_backend` test pins this for the
+> storage driver the CI runner uses; if production lands a host with a
+> non-overlay2 driver, the failure surfaces in that integration test before
+> it reaches operators.
 
 ### 9.5 · The "session created by an older daemon, refresh runs, refresh fails partway" path
 

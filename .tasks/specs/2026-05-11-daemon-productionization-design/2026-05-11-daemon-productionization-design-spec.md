@@ -370,6 +370,8 @@ honor; the install script and systemd handle the parent dirs.
 | `/var/lib/sandbox/sessions/<id>/events/`            | 0700 | sandbox:sandbox  | `events::persist::writer` (`sandbox-core/src/events/persist/writer.rs:100`) when `--events-persist` | JSONL event files. |
 | `/var/lib/sandbox/events/`                          | 0700 | sandbox:sandbox  | daemon at first start          | Reserved for future cross-session event aggregation; created unconditionally for consistency. |
 | `/var/lib/sandbox/backups/`                         | 0700 | sandbox:sandbox  | daemon at first start          | Populated by Spec 5's `sandbox update` (config migration backups). |
+| `/var/lib/sandbox/guest/`                           | 0700 | sandbox:sandbox  | daemon at first start          | Bind-mount source for the per-session `sandbox-guest` overlay (Spec 2 § 3.8.1, M16-S6 amendment). |
+| `/var/lib/sandbox/guest/sandbox-guest`              | 0755 | sandbox:sandbox  | daemon at every start (idempotent sha256-compare-and-write) | Read-only bind-mounted into every container session at `/usr/local/bin/sandbox-guest`. Mode 0755 so the container's `agent` user can `execve` it through the mount. |
 | `/var/lib/sandbox/route-helper-audit.log`           | 0600 | sandbox:sandbox  | route-helper on first invocation (Spec 1 § 3.5) | Append-only JSONL audit. |
 | `/run/sandbox/`                                     | 0750 | sandbox:sandbox  | systemd `RuntimeDirectory=`    | Cleared on stop by systemd. |
 | `/run/sandbox/sandboxd.sock`                        | 0660 | sandbox:sandbox  | daemon at start (`UnixListener::bind`, `main.rs:6496`) | Group access for operators. |
@@ -460,7 +462,15 @@ from `sandboxd/sandboxd/src/main.rs` immediately after the existing
 `tokio::fs::create_dir_all(&base_dir).await?` at line 6130 and before the
 `SessionStore::new(base_dir.clone())` call at line 6190.
 
-Behavior, per subdir (`sessions/`, `events/`, `backups/`):
+Behavior, per subdir (`sessions/`, `events/`, `backups/`, `guest/`):
+
+> The `guest/` subdir was added in M16-S6 (Spec 2 § 3.8.1 amendment).
+> It holds a single file, `guest/sandbox-guest`, staged once per
+> daemon startup and bind-mounted read-only into every container
+> session at `/usr/local/bin/sandbox-guest` (Spec 2 § 3.8.1 details).
+> The subdir follows the same `0o700` mode rule as its siblings;
+> the staged file inside is `0o755` so the container's `agent` user
+> can `execve` it through the bind-mount.
 
 1. If the subdir does not exist → create it with mode `0700`.
 2. If the subdir exists with mode `!= 0700` → log a `warn!` line naming the
