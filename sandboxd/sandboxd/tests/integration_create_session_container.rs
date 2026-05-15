@@ -259,6 +259,30 @@ fn container_spec() -> SessionSpec {
     }
 }
 
+/// Resolve a stable host path for the bind-mount source the runtime
+/// passes as `staged_guest_path`. Tests that `docker create` a real
+/// container need the bind-mount source to exist on disk; tests that
+/// only exercise hermetic capability checks pass a synthetic path
+/// directly to `ContainerRuntime::new`. M16-S6 amendment to
+/// api-session-isolation spec § 3.8.1.
+fn staged_guest_path_for_tests() -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::OnceLock;
+    static GUEST_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
+    GUEST_PATH
+        .get_or_init(|| {
+            let dir = std::env::temp_dir().join("sandboxd-test-staged-guest");
+            std::fs::create_dir_all(&dir).expect("create test staged-guest dir");
+            let path = dir.join("sandbox-guest");
+            std::fs::write(&path, b"placeholder-sandbox-guest-for-integration-tests\n")
+                .expect("write placeholder staged-guest binary");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod 0755 on placeholder staged-guest binary");
+            path
+        })
+        .clone()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -288,7 +312,14 @@ fn container_spec() -> SessionSpec {
 async fn integration_create_session_container_backend_round_trip() {
     ensure_round_trip_image();
     let net = TestNetwork::create("roundtrip");
-    let runtime = ContainerRuntime::new(ROUND_TRIP_IMAGE_TAG, 256, 1.0, 1000, 1000);
+    let runtime = ContainerRuntime::new(
+        ROUND_TRIP_IMAGE_TAG,
+        256,
+        1.0,
+        1000,
+        1000,
+        staged_guest_path_for_tests(),
+    );
 
     // Persist a session with `BackendKind::Container` and assert the
     // round trip through SQLite preserves the backend tag — this is
@@ -456,7 +487,14 @@ fn integration_create_session_container_rejects_hardened() {
     // contract from the runtime side — `hardening_flag: false`. This
     // is the matrix the daemon's `runtime.capabilities()` returns
     // when the create handler runs `spec.validate(caps)`.
-    let runtime = ContainerRuntime::new("phase3d-rejects-hardened-test:none", 256, 1.0, 1000, 1000);
+    let runtime = ContainerRuntime::new(
+        "phase3d-rejects-hardened-test:none",
+        256,
+        1.0,
+        1000,
+        1000,
+        "/nonexistent/staged-guest-not-used-in-hermetic-test",
+    );
     assert_eq!(runtime.kind(), BackendKind::Container);
     assert!(
         !runtime.capabilities().hardening_flag,
@@ -524,6 +562,7 @@ fn integration_create_session_container_advertises_workspace_capabilities() {
         1.0,
         1000,
         1000,
+        "/nonexistent/staged-guest-not-used-in-hermetic-test",
     );
 
     // (1) Capability shape — exactly `{ Shared, Clone }`, no more, no less.
@@ -627,7 +666,14 @@ fn integration_create_session_container_rejects_no_cache() {
     // contract from the runtime side — `per_session_no_cache: false`.
     // This is the matrix the daemon's `runtime.capabilities()` returns
     // when the create handler runs `spec.validate(caps)`.
-    let runtime = ContainerRuntime::new("rejects-no-cache-test:none", 256, 1.0, 1000, 1000);
+    let runtime = ContainerRuntime::new(
+        "rejects-no-cache-test:none",
+        256,
+        1.0,
+        1000,
+        1000,
+        "/nonexistent/staged-guest-not-used-in-hermetic-test",
+    );
     assert_eq!(runtime.kind(), BackendKind::Container);
     assert!(
         !runtime.capabilities().per_session_no_cache,
