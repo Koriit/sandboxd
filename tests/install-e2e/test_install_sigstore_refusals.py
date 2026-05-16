@@ -135,11 +135,15 @@ def test_install_aborts_on_tampered_tarball(
         "the tampered-signature contract"
     )
 
-    # Flip the first byte of the tarball. We use dd to write a single
-    # byte rather than sed/awk so binary-safe behaviour is guaranteed
-    # regardless of locale settings inside the VM.
+    # Flip the first byte of the tarball. We overwrite byte 0 with a
+    # NUL from /dev/zero rather than going through printf (whose
+    # \xNN form is a bash extension; POSIX sh doesn't accept it).
+    # conv=notrunc keeps the file size; bs=1 count=1 writes one byte.
+    # status=none keeps the test output clean; on failure we re-run
+    # without it to surface the underlying error.
     vm.shell(
-        f"printf '\\x00' | sudo dd of={tarball_in_vm} bs=1 count=1 conv=notrunc 2>/dev/null",
+        f"sudo dd if=/dev/zero of={tarball_in_vm} bs=1 count=1 "
+        f"conv=notrunc status=none",
         check=True, timeout=10,
     )
 
