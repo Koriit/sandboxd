@@ -20,6 +20,24 @@ All commands accept the `--socket` and `--yes` options:
 sandbox --socket /tmp/custom.sock ps
 ```
 
+## Caller identity and per-operator scope
+
+Every CLI invocation connects to the daemon over its Unix socket; the kernel verifies the caller's UID via `SO_PEERCRED` and the daemon resolves that UID to a username for ownership stamping. There is no API key, no token, no `--user` flag — your operating-system identity *is* the credential.
+
+Session views are caller-scoped:
+
+- `sandbox ps`, `sandbox describe`, and every per-session subcommand operate only on sessions owned by the invoking operator.
+- A session created by another operator is invisible: `sandbox ps` omits the row, and any attempt to address its ID with `sandbox start <id>`, `sandbox exec <id>`, `sandbox rm <id>`, etc., returns "session not found" (same wire shape as a truly-not-found ID; the daemon does not distinguish the two cases).
+- Root (`sudo sandbox ps`) sees the union of every operator's sessions — root resolves to the `root` username at the daemon, which has no per-user partition. There is no admin override in v1 for non-root operators; if you need to inspect another operator's sessions, run as that operator.
+
+Implications:
+
+- Two operators on the same host can run `sandbox create` concurrently without colliding. Each sees only their own sessions; subnet allocation is daemon-wide and prevents IP overlap.
+- `sandbox rm` cannot remove another operator's session — root is the only escape hatch.
+- The `sandbox` system user (the daemon's runtime user post-install) is not a special case at the API: a `sudo -u sandbox sandbox ps` lists only sessions whose `owner_username` is `sandbox`, which in normal operation is none.
+
+For the HTTP-level mechanics see [HTTP API: caller identity and per-caller isolation](/reference/http-api/#caller-identity-and-per-caller-isolation).
+
 ## Session identifiers
 
 Every session has an auto-generated 12-character lowercase hex **session ID** (e.g. `550e8400e29b`). Commands that take a `<session>` argument accept any of:
@@ -236,7 +254,9 @@ sandbox rm 0123456789ab
 
 ## sandbox ps
 
-List all sandbox sessions with their current state, guest agent status, and gateway status.
+List sandbox sessions owned by the invoking operator with their current state, guest agent status, and gateway status.
+
+The listing is **caller-scoped**: each operator sees only the sessions they created. A session created by another operator is omitted entirely — there is no "owned by X" column because every row is owned by the caller. Running `sudo sandbox ps` lists root-owned sessions; on a freshly-installed host with no root-created sessions, that is normally an empty table. See [Caller identity and per-operator scope](#caller-identity-and-per-operator-scope) for the full ownership model.
 
 ### Synopsis
 
