@@ -1200,3 +1200,121 @@ fn integration_route_helper_audit_log_write_failure_on_deny_still_denies() {
         audit_path.display()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Audit-log write failure on allow still allows (spec § 3.5, § 8.4)
+// ---------------------------------------------------------------------------
+
+/// Spec § 3.5 prescribes asymmetric handling of an audit-log write
+/// failure across the two decision paths:
+///
+/// - **Allow path** — log to stderr, return — the privilege has
+///   already been granted; an audit-log infrastructure failure (disk
+///   full, ENOSPC, missing parent dir) must not be a denial of service
+///   to session creation. Routing-path availability wins.
+/// - **Deny path** — log to stderr **and** exit `DENY_EXIT` (covered
+///   by `integration_route_helper_audit_log_write_failure_on_deny_still_denies`
+///   above).
+///
+/// This test pins the allow-side half of that asymmetry. We force the
+/// audit write to fail by pointing `SANDBOX_ROUTE_HELPER_AUDIT_LOG` at
+/// a path under a parent that is itself a regular file (so
+/// `create_dir_all` returns ENOTDIR). The helper still proceeds through
+/// the routing install — exit `0`, `"route installed"` on stdout, the
+/// container's default route updated — but stderr must carry the
+/// `"audit log write failed"` escalation line so an operator notices
+/// the missing forensic record.
+///
+/// The fault-injection shape is identical to the deny-path test: a
+/// `NamedTempFile`-rooted nested path that cannot be created. The
+/// difference is in the helper's argv (allow-path: `for-user` matches
+/// pool entry) and the expected exit code.
+#[test]
+fn integration_route_helper_audit_log_write_failure_on_allow_still_allows() {
+    let helper = verify_installed_test_helper();
+    let runner = runner_username();
+    // Distinct /24 from the other allow-path tests to avoid Docker IPAM
+    // pool-overlap when nextest runs them in parallel.
+    let subnet = "198.19.13.0/24";
+    let gateway_ip = "198.19.13.1";
+    let fixture = spawn_allow_path_container(subnet);
+    let users_conf = users_conf_for_pool(subnet, &[runner.as_str()]);
+
+    // Build a path whose parent is a regular file — `create_dir_all`
+    // fails with ENOTDIR, so the audit writer returns `WriteFailed`
+    // regardless of the helper's level of effort. Same shape as the
+    // deny-path test above.
+    let block_file =
+        NamedTempFile::new().expect("tempfile for audit-log path-blocker should succeed");
+    let audit_path = block_file.path().join("nested/route-helper-audit.log");
+    assert!(
+        !audit_path.exists(),
+        "test setup invariant: nested audit path must not yet exist"
+    );
+
+    let pid_str = fixture.container_pid.to_string();
+    let output = Command::new(&helper)
+        .args(["--for-user", &runner, &pid_str, gateway_ip])
+        .env("SANDBOX_USERS_CONF", users_conf.path())
+        .env("SANDBOX_ROUTE_HELPER_AUDIT_LOG", &audit_path)
+        .output()
+        .expect("invoking helper should succeed");
+
+    // Allow honored: exit 0 despite the audit-log failure (spec § 3.5
+    // — routing-path-availability wins on the allow side).
+    assert!(
+        output.status.success(),
+        "helper must still allow when audit-log write fails on the allow path; \
+         got exit failure. stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The step-8 success line still surfaces.
+    assert!(
+        stdout.contains("route installed"),
+        "helper stdout must confirm route install on the allow path; got: {stdout}"
+    );
+
+    // The audit-write escalation must surface on stderr — the
+    // forensic-record-availability invariant gains an operator-visible
+    // signal even though the deny code path does not fire.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("audit log write failed"),
+        "stderr must contain 'audit log write failed' escalation on allow-path; \
+         got: {stderr}"
+    );
+
+    // The audit log file was never created (the helper could not
+    // open it).
+    assert!(
+        !audit_path.exists(),
+        "audit log file must not exist after a forced write failure: {}",
+        audit_path.display()
+    );
+
+    // Sanity: the route actually landed inside the container despite
+    // the audit-log failure. The route helper must never short-circuit
+    // an allow on an audit-write failure (spec § 3.5: routing-path-
+    // availability wins on the allow side); assert the post-install
+    // state directly to catch any future regression that conflates the
+    // two paths' fault handling.
+    let route = Command::new("docker")
+        .args([
+            "exec",
+            &fixture.container_name,
+            "ip",
+            "route",
+            "show",
+            "default",
+        ])
+        .output()
+        .expect("docker exec ip route should succeed");
+    let route_text = String::from_utf8_lossy(&route.stdout);
+    assert!(
+        route_text.contains(gateway_ip),
+        "container default route must point at the helper-installed gateway {gateway_ip} \
+         even when the allow-path audit-log write failed; got: {route_text}"
+    );
+}
