@@ -9,6 +9,9 @@
 
 # Rust build artifacts
 /sandboxd/target/
+# Standalone test-helper crate (not part of the workspace)
+/sandboxd/tests/helpers/peercred-connector/target/
+/sandboxd/tests/helpers/peercred-connector/Cargo.lock
 
 # Python
 /tests/e2e/.venv/

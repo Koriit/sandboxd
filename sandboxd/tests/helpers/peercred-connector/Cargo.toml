@@ -1,0 +1,54 @@
+# Empty `[workspace]` table marks this crate as standalone — it
+# lives under `sandboxd/tests/helpers/` but is deliberately NOT a
+# member of the parent `sandboxd/Cargo.toml` workspace. A
+# workspace-level `cargo build --workspace` does not pull this
+# helper into the release build's feature graph; release tarballs
+# never carry it. The future Lima multi-uid test harness that
+# consumes this binary will build it with an explicit
+# `cd sandboxd/tests/helpers/peercred-connector && cargo build --release`.
+[workspace]
+
+[package]
+name = "peercred-connector"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.88"
+publish = false
+
+# Test-harness binary, not a workspace product. Lives under
+# `sandboxd/tests/helpers/` to keep the production build target
+# membership clean — release tarballs ship the four `sandboxd/*`
+# crates plus the route-helper, never this one.
+#
+# Spec reference: api-session-isolation § 9.2 — "Multi-uid test
+# harness for `SO_PEERCRED` — Lima VM path". The helper is installed
+# setuid-root inside the Lima E2E test VM template
+# (`install -o root -m 4755 .../peercred-connector
+# /usr/local/lib/sandboxd-tests/peercred-connector`) so the tests
+# can connect to the daemon socket under a target uid distinct from
+# the test runner's. The setuid bit is necessary because
+# `SO_PEERCRED` is kernel-set on connect — it cannot be faked
+# from userspace without real privilege separation.
+
+[[bin]]
+name = "peercred-connector"
+path = "src/main.rs"
+
+[dependencies]
+# `unistd::setuid` + `unistd::setgid` for the post-`setresuid` uid
+# drop. Pinned to the same `0.29` line `sandbox-core` and
+# `sandbox-route-helper` use in the parent workspace — kept in
+# sync manually since this crate is standalone (not a workspace
+# member).
+nix = { version = "0.29", features = ["user"] }
+# `libc::setresuid` + `libc::setresgid` for the strict drop (the
+# `nix` wrappers do not expose `setres*` directly). Same `0.2`
+# line the route-helper uses.
+libc = "0.2"
+# Stderr error rendering via `Display`. No serde / no transport
+# layer — the helper writes the daemon's bytes verbatim to stdout
+# and any error to stderr. Pinned to `2` to match the parent
+# workspace's `thiserror = "2"`; kept in sync manually since this
+# crate is standalone.
+thiserror = "2"
