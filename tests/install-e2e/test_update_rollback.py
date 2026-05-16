@@ -35,6 +35,7 @@ def test_update_then_manual_rollback(
     vm_factory,
     release_tarball_x86_64,
     release_tarball_x86_64_bumped,
+    sigstore_stack,
 ):
     """End-to-end rollback recipe from Spec 5 § 7.2.
 
@@ -50,7 +51,10 @@ def test_update_then_manual_rollback(
     base_ver = version_from_tarball(base_tarball)
 
     # 1. Install base.
-    r = vm.shell(install_sh_cmd(base_tarball), timeout=600)
+    r = vm.shell(
+        install_sh_cmd(base_tarball, vm=vm, sigstore_stack=sigstore_stack),
+        timeout=600,
+    )
     assert r.returncode == 0
     vm.shell("sudo systemctl enable --now sandboxd", check=True, timeout=60)
     wait_for_systemd_active(vm.name, "sandboxd", timeout=60)

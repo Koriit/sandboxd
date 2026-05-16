@@ -1,21 +1,25 @@
 """Shared fixtures + helpers for the install.sh / uninstall.sh Lima harness.
 
 The harness boots a fresh Lima VM per test, copies the locally-built
-release tarball into it, copies a patched install.sh/uninstall.sh into
-it, and runs the install path end-to-end. Each VM is torn down in the
-test's ``finally``; the suite is intentionally serial.
+release tarball into it (sibling ``.sigstore`` bundle included), copies
+the unmodified install.sh/uninstall.sh into it, and runs the install
+path end-to-end. Each VM is torn down in the test's ``finally``; the
+suite is intentionally serial.
 
-Why patch install.sh? Two reasons:
+The release tarball assembled by ``build-local-tarball.sh`` is signed
+against the local Sigstore stack (see ``sigstore_stack`` fixture and
+``tests/install-e2e/sigstore-stack/``). install.sh runs unmodified;
+the SANDBOX_INSTALL_TEST_* env vars (set by ``install_sh_cmd`` when
+passed a ``sigstore_stack`` handle) redirect cosign's trust material
+at the local stack so the real cosign verify-blob path is exercised
+end-to-end against a real signature. Operator-discoverable surface
+(``--help``, ``installation.md``) is unchanged; the env vars are
+deliberately undocumented test-only escape hatches.
 
-* The release tarball assembled by ``build-local-tarball.sh`` is
-  unsigned. The script's sigstore-verify step would otherwise refuse it.
-* Downloading the real cosign binary inside every VM is slow and noisy.
-
-The patch replaces ``cosign_bootstrap`` and ``sigstore_verify`` with
-no-ops that emit the same log lines as the real flow. Every other step
-(arch detect, prereq, useradd, setcap, docker load, systemd unit
-install, write_install_state, ...) runs unmodified — those are the
-steps the harness exists to exercise.
+The air-gapped test path (``test_install_air_gapped.py``) is the
+single exception: it exercises install.sh's cosign-download +
+SANDBOX_INSTALL_SKIP_SIGSTORE bypass path deliberately, so it stages
+cosign by hand and sets the skip env var explicitly.
 """
 
 from __future__ import annotations
@@ -258,78 +262,6 @@ def lima_delete(vm_name):
         ["limactl", "delete", "--force", vm_name],
         capture_output=True, text=True, timeout=120,
     )
-
-
-# ---------------------------------------------------------------------------
-# Install-script patching.
-# ---------------------------------------------------------------------------
-#
-# The patches turn cosign_bootstrap + sigstore_verify into no-ops so the
-# locally-assembled (unsigned) tarball passes through the rest of
-# install.sh unchanged. They are applied to a tempfile copy; the
-# canonical scripts/install.sh on disk is untouched.
-
-_COSIGN_PATCH_TAG = "# PATCHED-BY-INSTALL-E2E"
-
-_COSIGN_BOOTSTRAP_REPLACEMENT = f"""cosign_bootstrap() {{
-    {_COSIGN_PATCH_TAG}
-    COSIGN=/bin/true
-    log_ok "step=cosign_bootstrap version=stub source=test"
-}}
-"""
-
-_SIGSTORE_VERIFY_REPLACEMENT = f"""sigstore_verify() {{
-    {_COSIGN_PATCH_TAG}
-    log_ok "step=sigstore_verify bundle=stub identity=test"
-}}
-"""
-
-
-def _patch_install_sh(src_path, dst_path):
-    """Write a patched copy of install.sh to dst_path.
-
-    Replaces the cosign_bootstrap() and sigstore_verify() function
-    bodies with stub implementations that log the same step names.
-    """
-    text = Path(src_path).read_text()
-    text = _replace_shell_function(text, "cosign_bootstrap",
-                                   _COSIGN_BOOTSTRAP_REPLACEMENT)
-    text = _replace_shell_function(text, "sigstore_verify",
-                                   _SIGSTORE_VERIFY_REPLACEMENT)
-    Path(dst_path).write_text(text)
-    os.chmod(dst_path, 0o755)
-
-
-def _replace_shell_function(text, func_name, replacement):
-    """Replace ``<func_name>() { ... }`` (POSIX shell) with replacement.
-
-    Matches the function header, then walks brace depth (ignoring
-    quoted braces is heuristic but install.sh has no such cases in
-    cosign_bootstrap / sigstore_verify).
-    """
-    header_re = re.compile(rf"^{re.escape(func_name)}\(\)\s*\{{\s*$",
-                           re.MULTILINE)
-    m = header_re.search(text)
-    if not m:
-        raise AssertionError(f"could not find {func_name}() in install.sh")
-    start = m.start()
-    # Walk braces from the opening { (which is at m.end() - 1).
-    i = m.end() - 1
-    depth = 0
-    while i < len(text):
-        c = text[i]
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                end = i + 1
-                # Consume the trailing newline if present.
-                if end < len(text) and text[end] == "\n":
-                    end += 1
-                return text[:start] + replacement + text[end:]
-        i += 1
-    raise AssertionError(f"unmatched braces in {func_name}()")
 
 
 # ---------------------------------------------------------------------------
@@ -635,8 +567,7 @@ def vm_factory(request):
     created = []
     test_name = request.node.name.replace("/", "_").replace(":", "_")[:80]
 
-    def _factory(template, *, install_prereqs=True, install_scripts=True,
-                 patch_install_sh=True):
+    def _factory(template, *, install_prereqs=True, install_scripts=True):
         name = lima_vm_name()
         lima_start(name, template)
         vm = VM(name=name, distro=template)
@@ -646,7 +577,7 @@ def vm_factory(request):
             _install_prereqs(vm)
 
         if install_scripts:
-            _stage_scripts(vm, patch_install=patch_install_sh)
+            _stage_scripts(vm)
 
         return vm
 
@@ -731,21 +662,15 @@ def _install_prereqs(vm):
     )
 
 
-def _stage_scripts(vm, *, patch_install):
-    """Copy install.sh + uninstall.sh into /tmp inside the VM."""
-    if patch_install:
-        # Write the patched script to a host-side tempfile, then copy.
-        import tempfile
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".sh", prefix="install-patched-",
-            delete=False,
-        ) as tf:
-            tf.close()
-            _patch_install_sh(INSTALL_SH, tf.name)
-            vm.cp(tf.name, "/tmp/install.sh")
-            os.unlink(tf.name)
-    else:
-        vm.cp(INSTALL_SH, "/tmp/install.sh")
+def _stage_scripts(vm):
+    """Copy install.sh + uninstall.sh into /tmp inside the VM.
+
+    install.sh is staged unmodified — the harness no longer patches
+    cosign_bootstrap or sigstore_verify. The real cosign verify-blob
+    path runs against the local Sigstore stack via the
+    SANDBOX_INSTALL_TEST_* env vars that ``install_sh_cmd`` injects.
+    """
+    vm.cp(INSTALL_SH, "/tmp/install.sh")
     vm.cp(UNINSTALL_SH, "/tmp/uninstall.sh")
     # install.sh sources scripts/lib.sh (cosign pin constants) — stage it
     # adjacent so the in-tree fallback `$(dirname $0)/lib.sh` resolves.

@@ -26,120 +26,29 @@ import os
 import shutil
 import subprocess
 import sys
-import time
-import urllib.request
 from pathlib import Path
 
 import pytest
 
 
 HERE = Path(__file__).resolve().parent
-STACK_DIR = HERE / "sigstore-stack"
 
 COSIGN_BIN = os.environ.get("COSIGN_BIN", shutil.which("cosign") or "/tmp/cosign")
 
 
-# ---------------------------------------------------------------------------
-# Module-scope: bring the stack up once, tear down at the end.
-# ---------------------------------------------------------------------------
-
-
-def _docker_compose_available() -> bool:
-    if not shutil.which("docker"):
-        return False
-    rc = subprocess.run(
-        ["docker", "compose", "version"],
-        capture_output=True, text=True,
-    )
-    return rc.returncode == 0
-
-
-def _wait_http(url: str, deadline_seconds: float, accept_404: bool = False) -> None:
-    """Poll *url* until it returns 200 (or 404 if ``accept_404``)."""
-    deadline = time.monotonic() + deadline_seconds
-    last_err = None
-    while time.monotonic() < deadline:
-        try:
-            with urllib.request.urlopen(url, timeout=2) as resp:
-                if resp.status == 200:
-                    return
-                if accept_404 and resp.status == 404:
-                    return
-        except Exception as e:  # noqa: BLE001 — best-effort retry
-            last_err = e
-        time.sleep(0.5)
-    raise RuntimeError(f"timed out waiting for {url}: {last_err}")
-
-
-def _compose(*args: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["docker", "compose", *args],
-        cwd=STACK_DIR,
-        check=check,
-        capture_output=True,
-        text=True,
-    )
+# The stack itself is brought up by the session-scope ``sigstore_stack``
+# fixture in conftest.py. This module-scope wrapper is a thin filter
+# that adds a cosign-binary skip on top of the session fixture's
+# docker-compose skip — the smoke test calls cosign directly on the
+# host, so a missing cosign binary means we cannot exercise the
+# acceptance contract regardless of whether the stack is up.
 
 
 @pytest.fixture(scope="module")
-def sigstore_stack():
-    """Bring the stack up; yield a handle; tear down at module-end."""
-    if not _docker_compose_available():
-        pytest.skip("docker compose not available")
+def stack_with_cosign(sigstore_stack):
     if not Path(COSIGN_BIN).is_file():
         pytest.skip(f"cosign binary not found at {COSIGN_BIN}")
-
-    # Generate stack state on disk (idempotent).
-    init_rc = subprocess.run(
-        [str(STACK_DIR / "init.sh")],
-        capture_output=True,
-        text=True,
-    )
-    assert init_rc.returncode == 0, (
-        f"init.sh failed: rc={init_rc.returncode}\n"
-        f"stdout:\n{init_rc.stdout}\nstderr:\n{init_rc.stderr}"
-    )
-
-    # Bring the stack up. We don't pass --wait because most of our
-    # downstream services are distroless and have no in-container
-    # healthcheck; we readiness-probe from the host below.
-    bringup = _compose("up", "-d", check=False)
-    if bringup.returncode != 0:
-        teardown = _compose("down", "-v", check=False)
-        raise RuntimeError(
-            f"docker compose up failed: rc={bringup.returncode}\n"
-            f"stdout:\n{bringup.stdout}\nstderr:\n{bringup.stderr}\n"
-            f"teardown stdout:\n{teardown.stdout}\n"
-            f"teardown stderr:\n{teardown.stderr}"
-        )
-
-    try:
-        # Probe each host-exposed endpoint. Fulcio's /healthz handler
-        # returns SERVING only once its downstream dependencies (CT log
-        # included) are reachable, so we don't need a separate
-        # tesseract probe — and tesseract isn't host-port-exposed.
-        _wait_http("http://127.0.0.1:5555/healthz", deadline_seconds=120.0)
-        _wait_http("http://127.0.0.1:3000/ping", deadline_seconds=60.0)
-
-        # Cache the Rekor public key so the verify step can pass it
-        # via SIGSTORE_REKOR_PUBLIC_KEY.
-        rekor_pub_path = STACK_DIR / "state" / "rekor.pub.cached.pem"
-        with urllib.request.urlopen(
-            "http://127.0.0.1:3000/api/v1/log/publicKey", timeout=5,
-        ) as resp:
-            rekor_pub_path.write_bytes(resp.read())
-
-        yield {
-            "fulcio_url": "http://127.0.0.1:5555",
-            "rekor_url": "http://127.0.0.1:3000",
-            "ct_log_public_key": STACK_DIR / "state" / "ct-log" / "pubkey.pem",
-            "fulcio_root_chain": STACK_DIR / "state" / "fulcio-root" / "root.pem",
-            "rekor_public_key": rekor_pub_path,
-            "oidc_signing_key": STACK_DIR / "state" / "oidc" / "signing.key.pem",
-            "mint_token_script": STACK_DIR / "mint_token.py",
-        }
-    finally:
-        _compose("down", "-v", check=False)
+    return sigstore_stack
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +59,7 @@ def sigstore_stack():
 
 
 @pytest.mark.timeout(180)
-def test_cosign_sign_and_verify_blob_end_to_end(sigstore_stack, tmp_path):
+def test_cosign_sign_and_verify_blob_end_to_end(stack_with_cosign, tmp_path):
     """sign-blob + verify-blob round-trip against the local stack.
 
     Exercises the full chain that install.sh's ``sigstore_verify`` step
@@ -158,6 +67,7 @@ def test_cosign_sign_and_verify_blob_end_to_end(sigstore_stack, tmp_path):
     string (literal ``https://token.actions.githubusercontent.com``) and
     the production-shaped subject identity regex.
     """
+    stack = stack_with_cosign
     venv_python = HERE / ".venv" / "bin" / "python"
     python = str(venv_python) if venv_python.is_file() else sys.executable
 
@@ -168,7 +78,7 @@ def test_cosign_sign_and_verify_blob_end_to_end(sigstore_stack, tmp_path):
 
     # Mint the JWT.
     mint_rc = subprocess.run(
-        [python, str(sigstore_stack["mint_token_script"])],
+        [python, str(stack.mint_token_script)],
         check=True, capture_output=True, text=True,
     )
     token = mint_rc.stdout.strip()
@@ -177,14 +87,14 @@ def test_cosign_sign_and_verify_blob_end_to_end(sigstore_stack, tmp_path):
     # cosign sign-blob.
     sign_env = {
         **os.environ,
-        "SIGSTORE_CT_LOG_PUBLIC_KEY_FILE": str(sigstore_stack["ct_log_public_key"]),
+        "SIGSTORE_CT_LOG_PUBLIC_KEY_FILE": str(stack.ct_log_public_key_path),
     }
     sign_rc = subprocess.run(
         [
             COSIGN_BIN, "sign-blob",
             "--identity-token", token,
-            "--fulcio-url", sigstore_stack["fulcio_url"],
-            "--rekor-url", sigstore_stack["rekor_url"],
+            "--fulcio-url", stack.fulcio_url,
+            "--rekor-url", stack.rekor_url,
             "--output-signature", str(sig),
             "--output-certificate", str(cert),
             "--yes",
@@ -202,8 +112,8 @@ def test_cosign_sign_and_verify_blob_end_to_end(sigstore_stack, tmp_path):
     # cosign verify-blob with the production identity flags.
     verify_env = {
         **os.environ,
-        "SIGSTORE_CT_LOG_PUBLIC_KEY_FILE": str(sigstore_stack["ct_log_public_key"]),
-        "SIGSTORE_REKOR_PUBLIC_KEY": str(sigstore_stack["rekor_public_key"]),
+        "SIGSTORE_CT_LOG_PUBLIC_KEY_FILE": str(stack.ct_log_public_key_path),
+        "SIGSTORE_REKOR_PUBLIC_KEY": str(stack.rekor_public_key_path),
     }
     verify_rc = subprocess.run(
         [
@@ -212,8 +122,8 @@ def test_cosign_sign_and_verify_blob_end_to_end(sigstore_stack, tmp_path):
             r"^https://github\.com/Koriit/sandboxd/\.github/workflows/release\.yml@.*",
             "--certificate-oidc-issuer",
             "https://token.actions.githubusercontent.com",
-            "--certificate-chain", str(sigstore_stack["fulcio_root_chain"]),
-            "--rekor-url", sigstore_stack["rekor_url"],
+            "--certificate-chain", str(stack.fulcio_root_path),
+            "--rekor-url", stack.rekor_url,
             "--signature", str(sig),
             "--certificate", str(cert),
             str(blob),

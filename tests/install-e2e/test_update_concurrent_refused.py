@@ -36,6 +36,7 @@ def test_update_concurrent_refused(
     vm_factory,
     release_tarball_x86_64,
     release_tarball_x86_64_bumped,
+    sigstore_stack,
 ):
     """A held flock on `/var/lib/sandbox/.update.lock` forces the second
     `sandbox update` to refuse with "another update is in progress".
@@ -51,7 +52,10 @@ def test_update_concurrent_refused(
     base_tarball = copy_tarball_to_vm(vm, release_tarball_x86_64)
     base_ver = version_from_tarball(base_tarball)
 
-    r = vm.shell(install_sh_cmd(base_tarball), timeout=600)
+    r = vm.shell(
+        install_sh_cmd(base_tarball, vm=vm, sigstore_stack=sigstore_stack),
+        timeout=600,
+    )
     assert r.returncode == 0, f"install failed:\n{r.stdout}\n{r.stderr}"
     vm.shell("sudo systemctl enable --now sandboxd", check=True, timeout=60)
     wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
@@ -68,10 +72,9 @@ def test_update_concurrent_refused(
     # precondition runs BEFORE the lock acquire (§ 3.2.13); since the
     # gate only fires when `from.is_file()`, the directory shape skips
     # the cosign call and lets execution reach the lock-acquire branch
-    # under test. The harness does not stage a host-side cosign binary
-    # (`_COSIGN_BOOTSTRAP_REPLACEMENT` in conftest.py no-ops the install.sh
-    # cosign bootstrap), so a `--from <tarball>` invocation here would
-    # fail at the sigstore step before ever encountering the held flock.
+    # under test. A `--from <tarball>` invocation here would route
+    # through cosign verify-blob, which adds noise that obscures the
+    # lock-acquire contract under test.
     stage_dir = "/tmp/sandbox-update-concurrent-stage"
     arch = "x86_64-unknown-linux-gnu"
     vm.shell(

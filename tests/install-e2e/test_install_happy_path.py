@@ -27,18 +27,23 @@ from conftest import (
 
 @pytest.mark.parametrize("distro_template", ["ubuntu-22.04", "debian-12"])
 def test_install_fresh_then_doctor_passes(
-    distro_template, vm_factory, release_tarball_x86_64
+    distro_template, vm_factory, release_tarball_x86_64, sigstore_stack,
 ):
     """Fresh VM, install.sh runs, sandbox doctor reports green.
 
     Then uninstall.sh runs (without --purge) and we verify state is kept.
+
+    Exercises the real cosign verify-blob path against the locally-signed
+    tarball: install.sh runs unmodified; the SANDBOX_INSTALL_TEST_* env
+    vars (set by ``install_sh_cmd`` when passed a ``sigstore_stack``
+    handle) redirect cosign's trust material at the local stack.
     """
     vm = vm_factory(distro_template)
     tarball_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64)
 
     # Run install.sh with --from (skips the network download).
     r = vm.shell(
-        install_sh_cmd(tarball_in_vm),
+        install_sh_cmd(tarball_in_vm, vm=vm, sigstore_stack=sigstore_stack),
         timeout=600,
     )
     assert r.returncode == 0, (
@@ -86,7 +91,7 @@ def test_install_fresh_then_doctor_passes(
 
 @pytest.mark.parametrize("distro_template", [DEFAULT_FEDORA])
 def test_install_fresh_then_doctor_passes_rhel_paths(
-    distro_template, vm_factory, release_tarball_x86_64
+    distro_template, vm_factory, release_tarball_x86_64, sigstore_stack,
 ):
     """RHEL-family path coverage: bridge-helper under /usr/libexec/.
 
@@ -105,7 +110,7 @@ def test_install_fresh_then_doctor_passes_rhel_paths(
     vm = vm_factory(distro_template)
     tarball_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64)
     r = vm.shell(
-        install_sh_cmd(tarball_in_vm),
+        install_sh_cmd(tarball_in_vm, vm=vm, sigstore_stack=sigstore_stack),
         timeout=600,
     )
     assert r.returncode == 0, (

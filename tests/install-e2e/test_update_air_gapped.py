@@ -38,6 +38,7 @@ def test_update_air_gapped(
     vm_factory,
     release_tarball_x86_64,
     release_tarball_x86_64_bumped,
+    sigstore_stack,
 ):
     """Install the daemon, drop egress, run `sandbox update --from`.
 
@@ -50,8 +51,13 @@ def test_update_air_gapped(
     base_tarball = copy_tarball_to_vm(vm, release_tarball_x86_64)
     base_ver = version_from_tarball(base_tarball)
 
-    # Initial install with network available.
-    r = vm.shell(install_sh_cmd(base_tarball), timeout=600)
+    # Initial install with network available. Runs against the local
+    # Sigstore stack which is reachable here (egress block lands after
+    # the install completes).
+    r = vm.shell(
+        install_sh_cmd(base_tarball, vm=vm, sigstore_stack=sigstore_stack),
+        timeout=600,
+    )
     assert r.returncode == 0
     vm.shell("sudo systemctl enable --now sandboxd", check=True, timeout=60)
     wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
@@ -66,13 +72,12 @@ def test_update_air_gapped(
     # drop. We feed `--from <dir>` (not `--from <tarball>`) to the
     # update so the CLI's § 3.1.10 sigstore precondition short-circuits:
     # `verify_signature` only runs when `from.is_file()` is true, so a
-    # directory shape skips the cosign call. The test harness does not
-    # stage a host-side cosign binary (see conftest's
-    # `_COSIGN_BOOTSTRAP_REPLACEMENT`), and any `--from <tarball>`
-    # invocation would fail with "cosign binary not found" before this
-    # test ever reaches its contract (air-gapped operation, § 6.3).
-    # `tar` is local and air-gap-compatible, so extracting before the
-    # egress drop costs nothing relative to the contract under test.
+    # directory shape skips the cosign call. Any `--from <tarball>`
+    # invocation would route through cosign verify-blob — which needs
+    # the local Sigstore stack reachable from inside the VM and is
+    # outside the air-gapped contract under test (§ 6.3). `tar` is
+    # local and air-gap-compatible, so extracting before the egress
+    # drop costs nothing relative to the contract under test.
     stage_dir = "/tmp/sandbox-update-air-gapped-stage"
     arch = "x86_64-unknown-linux-gnu"
     vm.shell(

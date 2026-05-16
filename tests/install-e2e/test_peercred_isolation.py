@@ -87,6 +87,7 @@ def _bring_up_peercred_vm(
     distro_template,
     release_tarball_x86_64,
     peercred_connector_binary,
+    sigstore_stack,
 ):
     """Common setup for all three multi-uid peercred tests.
 
@@ -117,7 +118,10 @@ def _bring_up_peercred_vm(
     vm = vm_factory(distro_template)
     tarball_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64)
 
-    r = vm.shell(install_sh_cmd(tarball_in_vm), timeout=600)
+    r = vm.shell(
+        install_sh_cmd(tarball_in_vm, vm=vm, sigstore_stack=sigstore_stack),
+        timeout=600,
+    )
     assert r.returncode == 0, (
         f"install.sh failed (exit {r.returncode})\n"
         f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
@@ -164,6 +168,7 @@ def integration_route_helper_uid_without_passwd_denies_cleanly(
     vm_factory,
     release_tarball_x86_64,
     peercred_connector_binary,
+    sigstore_stack,
 ):
     """A route-helper invocation from a uid with no /etc/passwd entry
     must be denied at the caller-identity step (Spec 1 § 3.4), with
@@ -205,6 +210,7 @@ def integration_route_helper_uid_without_passwd_denies_cleanly(
         distro_template,
         release_tarball_x86_64,
         peercred_connector_binary,
+        sigstore_stack,
     )
 
     # Stage a world-writable XDG_RUNTIME_DIR so uid 7777 can write the
@@ -358,6 +364,7 @@ def integration_owner_isolation_uid_without_passwd_closes_connection(
     vm_factory,
     release_tarball_x86_64,
     peercred_connector_binary,
+    sigstore_stack,
 ):
     """The daemon's peercred acceptor closes connections from uids
     that do not resolve in ``/etc/passwd``, per Spec 2 § 4.1.
@@ -396,6 +403,7 @@ def integration_owner_isolation_uid_without_passwd_closes_connection(
         distro_template,
         release_tarball_x86_64,
         peercred_connector_binary,
+        sigstore_stack,
     )
 
     # Compose a GET /sessions request. The exact endpoint does not
@@ -624,6 +632,7 @@ def integration_session_isolation_404_on_foreign_id(
     vm_factory,
     release_tarball_x86_64,
     peercred_connector_binary,
+    sigstore_stack,
 ):
     """A session owned by alice returns 404 when queried by bob.
 
@@ -663,6 +672,7 @@ def integration_session_isolation_404_on_foreign_id(
         distro_template,
         release_tarball_x86_64,
         peercred_connector_binary,
+        sigstore_stack,
     )
 
     # Synthesize a session id alice owns. The id format is 12 lowercase

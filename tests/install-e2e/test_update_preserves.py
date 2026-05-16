@@ -48,6 +48,7 @@ def test_update_preserves_systemd_drop_in(
     vm_factory,
     release_tarball_x86_64,
     release_tarball_x86_64_bumped,
+    sigstore_stack,
 ):
     """A systemd drop-in survives the update bit-for-bit.
 
@@ -59,7 +60,10 @@ def test_update_preserves_systemd_drop_in(
     vm = vm_factory(distro_template)
     base_tarball = copy_tarball_to_vm(vm, release_tarball_x86_64)
 
-    r = vm.shell(install_sh_cmd(base_tarball), timeout=600)
+    r = vm.shell(
+        install_sh_cmd(base_tarball, vm=vm, sigstore_stack=sigstore_stack),
+        timeout=600,
+    )
     assert r.returncode == 0
     vm.shell("sudo systemctl enable --now sandboxd", check=True, timeout=60)
     wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
@@ -91,11 +95,9 @@ def test_update_preserves_systemd_drop_in(
     # Feed the staged-directory shape (`--from <dir>`), not the tarball:
     # the CLI's § 3.1.10 sigstore precondition only fires when
     # `from.is_file()` is true, so a directory short-circuits the
-    # cosign call. The test harness has no host-side cosign binary at
-    # the canonical path (`_COSIGN_BOOTSTRAP_REPLACEMENT` in conftest.py
-    # patches install.sh's bootstrap to a no-op), so a `--from <tarball>`
-    # invocation would fail before reaching the drop-in preservation
-    # contract under test (§§ 4.5, 9.1).
+    # cosign call. Going through `--from <tarball>` would route
+    # through cosign verify-blob and add noise that obscures the
+    # drop-in preservation contract under test (§§ 4.5, 9.1).
     bumped_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64_bumped)
     bumped_ver = version_from_tarball(bumped_in_vm)
     stage_dir = "/tmp/sandbox-update-preserves-dropin-stage"
@@ -145,6 +147,7 @@ def test_update_preserves_customized_users_conf(
     vm_factory,
     release_tarball_x86_64,
     release_tarball_x86_64_bumped,
+    sigstore_stack,
 ):
     """A custom subnet added to users.conf survives the update.
 
@@ -164,7 +167,10 @@ def test_update_preserves_customized_users_conf(
     vm = vm_factory(distro_template)
     base_tarball = copy_tarball_to_vm(vm, release_tarball_x86_64)
 
-    r = vm.shell(install_sh_cmd(base_tarball), timeout=600)
+    r = vm.shell(
+        install_sh_cmd(base_tarball, vm=vm, sigstore_stack=sigstore_stack),
+        timeout=600,
+    )
     assert r.returncode == 0
     vm.shell("sudo systemctl enable --now sandboxd", check=True, timeout=60)
     wait_for_systemd_active(vm.name, "sandboxd", timeout=60)

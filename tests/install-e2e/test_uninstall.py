@@ -20,14 +20,14 @@ from conftest import copy_tarball_to_vm, install_sh_cmd, parse_install_log_actio
 
 @pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
 def test_uninstall_after_install_clean(
-    distro_template, vm_factory, release_tarball_x86_64
+    distro_template, vm_factory, release_tarball_x86_64, sigstore_stack,
 ):
     """No-purge uninstall leaves state dir intact."""
     vm = vm_factory(distro_template)
     tarball_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64)
 
     r = vm.shell(
-        install_sh_cmd(tarball_in_vm),
+        install_sh_cmd(tarball_in_vm, vm=vm, sigstore_stack=sigstore_stack),
         timeout=600,
     )
     assert r.returncode == 0, f"install failed:\n{r.stdout}\n{r.stderr}"
@@ -49,14 +49,14 @@ def test_uninstall_after_install_clean(
 
 @pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
 def test_uninstall_with_purge_removes_user_and_state(
-    distro_template, vm_factory, release_tarball_x86_64
+    distro_template, vm_factory, release_tarball_x86_64, sigstore_stack,
 ):
     """--purge --yes removes /var/lib/sandbox/, sandbox user, and gateway image."""
     vm = vm_factory(distro_template)
     tarball_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64)
 
     r = vm.shell(
-        install_sh_cmd(tarball_in_vm),
+        install_sh_cmd(tarball_in_vm, vm=vm, sigstore_stack=sigstore_stack),
         timeout=600,
     )
     assert r.returncode == 0, f"install failed:\n{r.stdout}\n{r.stderr}"
@@ -84,14 +84,14 @@ def test_uninstall_with_purge_removes_user_and_state(
 
 @pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
 def test_uninstall_double_run_idempotent(
-    distro_template, vm_factory, release_tarball_x86_64
+    distro_template, vm_factory, release_tarball_x86_64, sigstore_stack,
 ):
     """Second uninstall is a no-op (every step logs skip)."""
     vm = vm_factory(distro_template)
     tarball_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64)
 
     r = vm.shell(
-        install_sh_cmd(tarball_in_vm),
+        install_sh_cmd(tarball_in_vm, vm=vm, sigstore_stack=sigstore_stack),
         timeout=600,
     )
     assert r.returncode == 0, f"install failed:\n{r.stdout}\n{r.stderr}"

@@ -29,7 +29,7 @@ from conftest import (
 
 @pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
 def integration_systemd_unit_smokes(
-    distro_template, vm_factory, release_tarball_x86_64
+    distro_template, vm_factory, release_tarball_x86_64, sigstore_stack,
 ):
     """systemd unit installs, starts, listens, and passes doctor.
 
@@ -42,7 +42,7 @@ def integration_systemd_unit_smokes(
     tarball_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64)
 
     r = vm.shell(
-        install_sh_cmd(tarball_in_vm),
+        install_sh_cmd(tarball_in_vm, vm=vm, sigstore_stack=sigstore_stack),
         timeout=600,
     )
     assert r.returncode == 0, f"install failed:\n{r.stdout}\n{r.stderr}"

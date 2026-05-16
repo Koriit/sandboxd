@@ -55,8 +55,16 @@ def test_install_refuses_wrong_arch_tarball(
     # which made VERSION="latest" and tripped a pre-MANIFEST extract
     # failure ("did not contain expected top-level directory") that
     # masked the actual arch-mismatch check.
+    #
+    # SANDBOX_INSTALL_SKIP_SIGSTORE=1: the re-packed tampered tarball
+    # has no valid signature bundle (the local stack signed the
+    # original; the tampered bytes don't satisfy that signature).
+    # Bypassing sigstore_verify keeps the test focused on the
+    # MANIFEST arch-mismatch refusal under test rather than coupling
+    # it to the tampered-signature negative path.
     r = vm.shell(
-        install_sh_cmd(tampered_in_vm),
+        install_sh_cmd(tampered_in_vm,
+                       env={"SANDBOX_INSTALL_SKIP_SIGSTORE": "1"}),
         timeout=300,
     )
     assert r.returncode != 0, (
@@ -85,7 +93,7 @@ def test_install_refuses_wrong_arch_tarball(
 
 @pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
 def test_install_refuses_when_preexisting(
-    distro_template, vm_factory, release_tarball_x86_64, tmp_path
+    distro_template, vm_factory, release_tarball_x86_64, sigstore_stack, tmp_path,
 ):
     """Same-version re-install short-circuits (exit 0). Different-version refuses (exit 1).
 
@@ -98,14 +106,14 @@ def test_install_refuses_when_preexisting(
 
     # First install.
     r = vm.shell(
-        install_sh_cmd(tarball_in_vm),
+        install_sh_cmd(tarball_in_vm, vm=vm, sigstore_stack=sigstore_stack),
         timeout=600,
     )
     assert r.returncode == 0, f"first install failed:\n{r.stdout}\n{r.stderr}"
 
     # Second install at the same version: exit 0 (idempotent skip).
     r2 = vm.shell(
-        install_sh_cmd(tarball_in_vm),
+        install_sh_cmd(tarball_in_vm, vm=vm, sigstore_stack=sigstore_stack),
         timeout=120,
     )
     assert r2.returncode == 0, (

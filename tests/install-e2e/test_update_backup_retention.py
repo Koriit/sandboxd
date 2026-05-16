@@ -38,6 +38,7 @@ def test_update_backup_retention_prunes_oldest(
     vm_factory,
     release_tarball_x86_64,
     release_tarball_x86_64_bumped_chain,
+    sigstore_stack,
 ):
     """Three consecutive updates leave 2 successful backup sets on disk.
 
@@ -49,7 +50,10 @@ def test_update_backup_retention_prunes_oldest(
     base_ver = version_from_tarball(base_tarball)
 
     # Install base.
-    r = vm.shell(install_sh_cmd(base_tarball), timeout=600)
+    r = vm.shell(
+        install_sh_cmd(base_tarball, vm=vm, sigstore_stack=sigstore_stack),
+        timeout=600,
+    )
     assert r.returncode == 0
     vm.shell("sudo systemctl enable --now sandboxd", check=True, timeout=60)
     wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
@@ -70,11 +74,11 @@ def test_update_backup_retention_prunes_oldest(
     # extracted root to `sandbox update` via `--from <dir>`. The
     # directory shape short-circuits the § 3.1.10 sigstore precondition
     # (`verify_signature` only runs when `from.is_file()` is true), so
-    # the test does not depend on a host-side cosign binary at the
-    # canonical path. The test harness's `_COSIGN_BOOTSTRAP_REPLACEMENT`
-    # in conftest.py patches install.sh's cosign bootstrap to a no-op,
-    # so any `--from <tarball>` invocation here would fail before
-    # reaching the retention contract under test (§§ 3.2.25, 5.2).
+    # the test does not depend on the local Sigstore stack being
+    # reachable from inside the VM during the update path. Going
+    # through `--from <tarball>` would route through cosign
+    # verify-blob and add noise that obscures the retention contract
+    # under test (§§ 3.2.25, 5.2).
     arch = "x86_64-unknown-linux-gnu"
     extracted_roots = []
     for idx, tarball_in_vm in enumerate(in_vm):

@@ -16,7 +16,7 @@ from conftest import copy_tarball_to_vm, install_sh_cmd, parse_install_log_actio
 
 @pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
 def test_install_idempotent_double_run(
-    distro_template, vm_factory, release_tarball_x86_64
+    distro_template, vm_factory, release_tarball_x86_64, sigstore_stack,
 ):
     """Second run of install.sh is a full no-op.
 
@@ -31,7 +31,7 @@ def test_install_idempotent_double_run(
 
     # First run.
     r1 = vm.shell(
-        install_sh_cmd(tarball_in_vm),
+        install_sh_cmd(tarball_in_vm, vm=vm, sigstore_stack=sigstore_stack),
         timeout=600,
     )
     assert r1.returncode == 0, f"first run failed:\n{r1.stdout}\n{r1.stderr}"
@@ -41,7 +41,7 @@ def test_install_idempotent_double_run(
 
     # Second run.
     r2 = vm.shell(
-        install_sh_cmd(tarball_in_vm),
+        install_sh_cmd(tarball_in_vm, vm=vm, sigstore_stack=sigstore_stack),
         timeout=120,
     )
     assert r2.returncode == 0, f"second run failed:\n{r2.stdout}\n{r2.stderr}"
@@ -76,7 +76,7 @@ _PARTIAL_FAILURE_MARKER = "# PARTIAL_FAILURE_INJECTION"
 
 @pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
 def test_install_partial_failure_recovery(
-    distro_template, vm_factory, release_tarball_x86_64
+    distro_template, vm_factory, release_tarball_x86_64, sigstore_stack,
 ):
     """Kill the install mid-step, re-run, verify continuation.
 
@@ -122,7 +122,7 @@ def test_install_partial_failure_recovery(
 
     # First run aborts mid-script with exit 1.
     r1 = vm.shell(
-        install_sh_cmd(tarball_in_vm),
+        install_sh_cmd(tarball_in_vm, vm=vm, sigstore_stack=sigstore_stack),
         timeout=600,
     )
     assert r1.returncode != 0, (
@@ -158,7 +158,7 @@ def test_install_partial_failure_recovery(
 
     # Recovery run.
     r2 = vm.shell(
-        install_sh_cmd(tarball_in_vm),
+        install_sh_cmd(tarball_in_vm, vm=vm, sigstore_stack=sigstore_stack),
         timeout=600,
     )
     assert r2.returncode == 0, (

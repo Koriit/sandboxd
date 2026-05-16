@@ -40,6 +40,7 @@ def test_update_fresh_install_to_next_version(
     vm_factory,
     release_tarball_x86_64,
     release_tarball_x86_64_bumped,
+    sigstore_stack,
 ):
     """Daemon reports v' after `sandbox update --from <bumped tarball>`.
 
@@ -61,7 +62,10 @@ def test_update_fresh_install_to_next_version(
     base_tarball_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64)
     base_ver = version_from_tarball(base_tarball_in_vm)
 
-    r = vm.shell(install_sh_cmd(base_tarball_in_vm), timeout=600)
+    r = vm.shell(
+        install_sh_cmd(base_tarball_in_vm, vm=vm, sigstore_stack=sigstore_stack),
+        timeout=600,
+    )
     assert r.returncode == 0, f"base install failed:\n{r.stdout}\n{r.stderr}"
     vm.shell("sudo systemctl enable --now sandboxd", check=True, timeout=60)
     wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
@@ -82,11 +86,9 @@ def test_update_fresh_install_to_next_version(
     # Feed the staged-directory shape (`--from <dir>`), not the tarball:
     # the CLI's § 3.1.10 sigstore precondition only fires when
     # `from.is_file()` is true, so a directory short-circuits the
-    # cosign call. The test harness has no host-side cosign binary at
-    # the canonical path (`_COSIGN_BOOTSTRAP_REPLACEMENT` in conftest.py
-    # patches install.sh's bootstrap to a no-op), so a `--from <tarball>`
-    # invocation would fail before reaching the multi-version contract
-    # under test (Spec 5 § 9.1).
+    # cosign call. Going through `--from <tarball>` would route
+    # through cosign verify-blob and add noise that obscures the
+    # multi-version contract under test (Spec 5 § 9.1).
     bumped_tarball_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64_bumped)
     bumped_ver = version_from_tarball(bumped_tarball_in_vm)
     assert bumped_ver != base_ver, (

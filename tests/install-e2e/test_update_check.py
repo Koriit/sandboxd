@@ -30,7 +30,7 @@ from conftest import (
 
 @pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
 def test_update_check_does_not_mutate(
-    distro_template, vm_factory, release_tarball_x86_64
+    distro_template, vm_factory, release_tarball_x86_64, sigstore_stack,
 ):
     """`sandbox update --check` never touches state.
 
@@ -46,7 +46,10 @@ def test_update_check_does_not_mutate(
     version = version_from_tarball(tarball_in_vm)
 
     # Install the daemon to the staged version.
-    r = vm.shell(install_sh_cmd(tarball_in_vm), timeout=600)
+    r = vm.shell(
+        install_sh_cmd(tarball_in_vm, vm=vm, sigstore_stack=sigstore_stack),
+        timeout=600,
+    )
     assert r.returncode == 0, f"install failed:\n{r.stdout}\n{r.stderr}"
     vm.shell(
         "sudo systemctl enable --now sandboxd", check=True, timeout=60,
@@ -117,7 +120,7 @@ def test_update_check_does_not_mutate(
 
 @pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
 def test_update_dry_run_does_not_mutate(
-    distro_template, vm_factory, release_tarball_x86_64
+    distro_template, vm_factory, release_tarball_x86_64, sigstore_stack,
 ):
     """`sandbox update --dry-run` is read-only.
 
@@ -128,7 +131,10 @@ def test_update_dry_run_does_not_mutate(
     vm = vm_factory(distro_template)
     tarball_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64)
 
-    r = vm.shell(install_sh_cmd(tarball_in_vm), timeout=600)
+    r = vm.shell(
+        install_sh_cmd(tarball_in_vm, vm=vm, sigstore_stack=sigstore_stack),
+        timeout=600,
+    )
     assert r.returncode == 0
     vm.shell("sudo systemctl enable --now sandboxd", check=True, timeout=60)
     wait_for_systemd_active(vm.name, "sandboxd", timeout=60)

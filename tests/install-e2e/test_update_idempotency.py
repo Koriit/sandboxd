@@ -45,6 +45,7 @@ def test_update_interrupted_then_resumed(
     vm_factory,
     release_tarball_x86_64,
     release_tarball_x86_64_bumped,
+    sigstore_stack,
 ):
     """Inject a transient failure mid-update; the resume run converges.
 
@@ -70,7 +71,10 @@ def test_update_interrupted_then_resumed(
     base_tarball = copy_tarball_to_vm(vm, release_tarball_x86_64)
     base_ver = version_from_tarball(base_tarball)
 
-    r = vm.shell(install_sh_cmd(base_tarball), timeout=600)
+    r = vm.shell(
+        install_sh_cmd(base_tarball, vm=vm, sigstore_stack=sigstore_stack),
+        timeout=600,
+    )
     assert r.returncode == 0, f"install failed:\n{r.stdout}\n{r.stderr}"
     vm.shell("sudo systemctl enable --now sandboxd", check=True, timeout=60)
     wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
@@ -243,6 +247,7 @@ def test_update_partial_failure_backup_set_preserved(
     vm_factory,
     release_tarball_x86_64,
     release_tarball_x86_64_bumped,
+    sigstore_stack,
 ):
     """A real failure mid-update leaves the backup set with
     completed_ok=false and that set is preserved across the subsequent
@@ -273,7 +278,10 @@ def test_update_partial_failure_backup_set_preserved(
     base_tarball = copy_tarball_to_vm(vm, release_tarball_x86_64)
     base_ver = version_from_tarball(base_tarball)
 
-    r = vm.shell(install_sh_cmd(base_tarball), timeout=600)
+    r = vm.shell(
+        install_sh_cmd(base_tarball, vm=vm, sigstore_stack=sigstore_stack),
+        timeout=600,
+    )
     assert r.returncode == 0
     vm.shell("sudo systemctl enable --now sandboxd", check=True, timeout=60)
     wait_for_systemd_active(vm.name, "sandboxd", timeout=60)

@@ -49,10 +49,11 @@ def test_install_air_gapped(
     signature; everything else (extract, MANIFEST checks, useradd,
     setcap, docker load, systemd install) runs unmodified.
     """
-    # Unpatched install.sh — the harness's default cosign-stub patches
-    # are NOT applied; we want the real cosign_bootstrap to find our
-    # pre-staged binary.
-    vm = vm_factory(distro_template, patch_install_sh=False)
+    # The harness no longer patches install.sh in any mode; we want
+    # the real cosign_bootstrap to find our pre-staged binary, and
+    # sigstore_verify to short-circuit via SANDBOX_INSTALL_SKIP_SIGSTORE
+    # (the test-only escape hatch documented in install.sh).
+    vm = vm_factory(distro_template)
 
     # Ensure iptables(-nft) is installed and the kernel modules are
     # warmed up before egress block. The Lima Ubuntu image ships
