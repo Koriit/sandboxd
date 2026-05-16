@@ -574,7 +574,10 @@ async fn integration_kvm_check_via_daemon_diagnostics() {
 
     // Spec § 13.2 enumerates the system-level fields the endpoint
     // returns. Pin the keys here so a regression that renames or
-    // drops one fails this test loudly.
+    // drops one fails this test loudly. The `*_probe_failed` /
+    // `*_probe_error` companions added per the Spec 3 § 13.2
+    // `probe_failed` variant must also appear so doctor C7/C8 can
+    // distinguish "image absent" from "probe could not run".
     for key in [
         "daemon_uid",
         "daemon_user",
@@ -582,6 +585,10 @@ async fn integration_kvm_check_via_daemon_diagnostics() {
         "kvm_writable",
         "gateway_image_present",
         "lite_image_present",
+        "gateway_image_probe_failed",
+        "lite_image_probe_failed",
+        "gateway_image_probe_error",
+        "lite_image_probe_error",
         "users_conf_pool",
         "guest_version_drift",
         "substrate_orphans",

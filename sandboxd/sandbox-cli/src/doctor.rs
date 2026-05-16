@@ -887,6 +887,31 @@ fn check_gateway_image(
             name: "gateway image present",
             outcome: CheckOutcome::Pass { detail: tag },
         },
+        Some(d) if d.gateway_image_probe_failed => {
+            // Spec 3 § 13.2 `probe_failed` variant: the daemon's
+            // `docker image inspect` could not run to a verdict, so
+            // we cannot tell whether the image is loaded. Emit the
+            // "restart docker / sandboxd" hint instead of the
+            // misleading "run sandbox update to load the image" hint
+            // C7 emits when the probe ran and reported absence.
+            let detail = match d.gateway_image_probe_error.as_deref() {
+                Some(err) if !err.is_empty() => format!("probe failed: {err}"),
+                _ => "probe failed".to_string(),
+            };
+            CheckRow {
+                id: "C7",
+                name: "gateway image present",
+                outcome: CheckOutcome::Fail {
+                    detail,
+                    hint: Some(
+                        "verify docker is reachable from the daemon's uid \
+                         (sudo -u sandbox docker info); restart sandboxd \
+                         once docker is responsive: sudo systemctl restart sandboxd"
+                            .to_string(),
+                    ),
+                },
+            }
+        }
         Some(_) => CheckRow {
             id: "C7",
             name: "gateway image present",
@@ -933,6 +958,31 @@ fn check_lite_image(diagnostics: Option<&DiagnosticsPayload>, socket_reachable: 
             name: "lite image present",
             outcome: CheckOutcome::Pass { detail: tag },
         },
+        Some(d) if d.lite_image_probe_failed => {
+            // Spec 3 § 13.2 `probe_failed` variant: docker probe did
+            // not run to a verdict. C8 is informational (the lite
+            // image is built on first session-create), so we render
+            // this as `Skip` — but with the probe-failure detail and
+            // hint, not the "not built yet" wording C8 emits when
+            // the probe genuinely reports absence.
+            let detail = match d.lite_image_probe_error.as_deref() {
+                Some(err) if !err.is_empty() => format!("probe failed: {err}"),
+                _ => "probe failed".to_string(),
+            };
+            CheckRow {
+                id: "C8",
+                name: "lite image present",
+                outcome: CheckOutcome::Skip {
+                    detail,
+                    hint: Some(
+                        "verify docker is reachable from the daemon's uid \
+                         (sudo -u sandbox docker info); restart sandboxd \
+                         once docker is responsive: sudo systemctl restart sandboxd"
+                            .to_string(),
+                    ),
+                },
+            }
+        }
         Some(_) => CheckRow {
             id: "C8",
             name: "lite image present",
@@ -1333,6 +1383,29 @@ pub(crate) struct DiagnosticsPayload {
     pub gateway_image_present: bool,
     #[serde(default)]
     pub lite_image_present: bool,
+    /// `true` when the daemon's `docker image inspect` probe could
+    /// not run to a verdict (docker daemon unreachable, fork
+    /// failure, unexpected stderr). Spec 3 § 13.2 added the variant
+    /// so C7 can emit the "restart docker / sandboxd" hint instead
+    /// of the misleading "image missing" hint. `#[serde(default)]`
+    /// keeps this readable against an older daemon that omits the
+    /// field (in which case probe failure was conflated with absence
+    /// — the pre-fix behaviour).
+    #[serde(default)]
+    pub gateway_image_probe_failed: bool,
+    /// Operator-facing reason the gateway-image probe failed. `None`
+    /// when the probe succeeded or when an older daemon omits the
+    /// field.
+    #[serde(default)]
+    pub gateway_image_probe_error: Option<String>,
+    /// Sibling of [`Self::gateway_image_probe_failed`] for the lite
+    /// image probe (C8). Same semantics, same fallback shape.
+    #[serde(default)]
+    pub lite_image_probe_failed: bool,
+    /// Sibling of [`Self::gateway_image_probe_error`] for the lite
+    /// image probe.
+    #[serde(default)]
+    pub lite_image_probe_error: Option<String>,
     #[serde(default)]
     pub users_conf_pool: Option<UsersConfPoolDto>,
     #[serde(default)]
@@ -1814,6 +1887,192 @@ mod tests {
             }
             other => panic!("expected Fail, got {other:?}"),
         }
+    }
+
+    /// Test helper: build a synthetic `DiagnosticsPayload` for the
+    /// C7/C8 unit tests. Defaults every field to the "probe ran,
+    /// image absent" shape so callers only set the fields they want
+    /// to vary.
+    fn diag_default() -> DiagnosticsPayload {
+        DiagnosticsPayload {
+            daemon_uid: 0,
+            daemon_user: "sandbox".to_string(),
+            kvm_readable: false,
+            kvm_writable: false,
+            gateway_image_present: false,
+            lite_image_present: false,
+            gateway_image_probe_failed: false,
+            gateway_image_probe_error: None,
+            lite_image_probe_failed: false,
+            lite_image_probe_error: None,
+            users_conf_pool: None,
+            guest_version_drift: None,
+            substrate_orphans: None,
+        }
+    }
+
+    /// C7 — probe succeeded, image present → Pass row carries the
+    /// tag verbatim. Baseline case before the `probe_failed`
+    /// variant.
+    #[test]
+    fn c7_passes_when_gateway_image_present() {
+        let mut d = diag_default();
+        d.gateway_image_present = true;
+        let row = check_gateway_image(Some(&d), true);
+        assert_eq!(row.id, "C7");
+        match row.outcome {
+            CheckOutcome::Pass { .. } => {}
+            other => panic!("expected Pass, got {other:?}"),
+        }
+    }
+
+    /// C7 — probe ran, image absent → Fail with the "run sandbox
+    /// update" hint. The hint must NOT mention docker daemon
+    /// reachability — that's the `probe_failed` branch.
+    #[test]
+    fn c7_fails_with_update_hint_when_gateway_image_absent_but_probe_ok() {
+        let d = diag_default();
+        let row = check_gateway_image(Some(&d), true);
+        match row.outcome {
+            CheckOutcome::Fail { detail, hint } => {
+                assert!(
+                    detail.contains("missing"),
+                    "absent-image detail must say 'missing'; got: {detail}"
+                );
+                let h = hint.expect("absent image must carry a hint");
+                assert!(
+                    h.contains("sandbox update"),
+                    "absent-image hint must reference 'sandbox update'; got: {h}"
+                );
+                assert!(
+                    !h.contains("docker is reachable"),
+                    "absent-image hint must not mention docker reachability \
+                     (that's the probe_failed branch); got: {h}"
+                );
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    /// C7 — Spec 3 § 13.2 `probe_failed` variant: the daemon could
+    /// not run `docker image inspect` to a verdict. The doctor row
+    /// must remain Fail (C7 is a hard check) but the hint must
+    /// guide the operator toward docker / sandboxd reachability,
+    /// not toward loading the image.
+    #[test]
+    fn c7_fails_with_docker_hint_when_gateway_probe_failed() {
+        let mut d = diag_default();
+        d.gateway_image_probe_failed = true;
+        d.gateway_image_probe_error = Some("Cannot connect to the Docker daemon".to_string());
+        let row = check_gateway_image(Some(&d), true);
+        match row.outcome {
+            CheckOutcome::Fail { detail, hint } => {
+                assert!(
+                    detail.contains("probe failed"),
+                    "probe-failure detail must say 'probe failed'; got: {detail}"
+                );
+                assert!(
+                    detail.contains("Cannot connect to the Docker daemon"),
+                    "probe-failure detail must echo the operator-facing reason; got: {detail}"
+                );
+                let h = hint.expect("probe-failure must carry a hint");
+                assert!(
+                    h.contains("docker is reachable"),
+                    "probe-failure hint must mention docker reachability; got: {h}"
+                );
+                assert!(
+                    !h.contains("sandbox update"),
+                    "probe-failure hint must not suggest sandbox update \
+                     (that's the absent-image branch); got: {h}"
+                );
+            }
+            other => panic!("expected Fail, got {other:?}"),
+        }
+    }
+
+    /// C8 — probe ran, image absent → Skip with the "built on
+    /// first session create" annotation (informational; no failure).
+    #[test]
+    fn c8_skips_with_first_create_hint_when_lite_image_absent_but_probe_ok() {
+        let d = diag_default();
+        let row = check_lite_image(Some(&d), true);
+        match row.outcome {
+            CheckOutcome::Skip { detail, hint } => {
+                assert!(
+                    detail.contains("not built yet"),
+                    "absent-image detail must say 'not built yet'; got: {detail}"
+                );
+                let h = hint.expect("absent image must carry a hint");
+                assert!(
+                    h.contains("first session create"),
+                    "absent-image hint must reference 'first session create'; got: {h}"
+                );
+                assert!(
+                    !h.contains("docker is reachable"),
+                    "absent-image hint must not mention docker reachability; got: {h}"
+                );
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
+    }
+
+    /// C8 — Spec 3 § 13.2 `probe_failed`: lite-image probe could
+    /// not run to a verdict. C8 stays Skip (informational), but the
+    /// hint switches to docker / sandboxd reachability so an
+    /// operator doesn't waste time on `sandbox rebuild-image` when
+    /// the docker daemon is the actual problem.
+    #[test]
+    fn c8_skips_with_docker_hint_when_lite_probe_failed() {
+        let mut d = diag_default();
+        d.lite_image_probe_failed = true;
+        d.lite_image_probe_error = Some("docker: exec format error".to_string());
+        let row = check_lite_image(Some(&d), true);
+        match row.outcome {
+            CheckOutcome::Skip { detail, hint } => {
+                assert!(
+                    detail.contains("probe failed"),
+                    "probe-failure detail must say 'probe failed'; got: {detail}"
+                );
+                assert!(
+                    detail.contains("docker: exec format error"),
+                    "probe-failure detail must echo the operator-facing reason; got: {detail}"
+                );
+                let h = hint.expect("probe-failure must carry a hint");
+                assert!(
+                    h.contains("docker is reachable"),
+                    "probe-failure hint must mention docker reachability; got: {h}"
+                );
+            }
+            other => panic!("expected Skip, got {other:?}"),
+        }
+    }
+
+    /// `DiagnosticsPayload` tolerates a payload written by an older
+    /// daemon that does not emit `gateway_image_probe_failed` /
+    /// `lite_image_probe_failed` / `*_probe_error`. The bool fields
+    /// default to `false` and the optional reasons stay `None`, so
+    /// C7/C8 render the legacy "absent-image" branches.
+    #[test]
+    fn diagnostics_payload_back_compat_omitted_probe_failed_fields() {
+        let body = serde_json::json!({
+            "daemon_uid": 1003,
+            "daemon_user": "sandbox",
+            "kvm_readable": true,
+            "kvm_writable": true,
+            "gateway_image_present": true,
+            "lite_image_present": false,
+            "users_conf_pool": {
+                "cidr": "10.209.0.0/20",
+                "allow_users": ["sandbox"]
+            }
+        });
+        let parsed: DiagnosticsPayload =
+            serde_json::from_value(body).expect("legacy payload must still parse");
+        assert!(parsed.gateway_image_present);
+        assert!(!parsed.gateway_image_probe_failed);
+        assert!(parsed.gateway_image_probe_error.is_none());
+        assert!(!parsed.lite_image_probe_failed);
+        assert!(parsed.lite_image_probe_error.is_none());
     }
 
     /// `is_prod_install_signal` flips on the presence of the

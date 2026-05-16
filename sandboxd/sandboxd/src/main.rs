@@ -136,7 +136,7 @@ fn default_base_dir() -> String {
 /// `guest/` holds the daemon-staged `sandbox-guest` binary that every
 /// container session bind-mounts read-only at
 /// `/usr/local/bin/sandbox-guest` (api-session-isolation spec § 3.8.1
-/// + daemon-productionization spec § 5.4). The staging step itself
+/// and daemon-productionization spec § 5.4). The staging step itself
 /// runs immediately after this layout enforcer; the subdir must
 /// exist beforehand because the atomic sibling-tempfile-and-rename
 /// pattern places the tempfile in `guest/`'s parent on the same
@@ -6015,7 +6015,12 @@ async fn version_handler() -> impl IntoResponse {
 /// - **System-level diagnostics** (returned to every connected
 ///   operator): `daemon_uid`, `daemon_user`, `kvm_readable`,
 ///   `kvm_writable`, `gateway_image_present`, `lite_image_present`,
-///   `users_conf_pool`.
+///   `gateway_image_probe_failed`, `lite_image_probe_failed`,
+///   `gateway_image_probe_error`, `lite_image_probe_error`,
+///   `users_conf_pool`. The `*_probe_failed` companions to the
+///   image-presence booleans distinguish "docker reports image
+///   absent" from "probe could not run" per Spec 3 § 13.2 so
+///   doctor's C7/C8 can emit the right operator hint.
 /// - **Per-operator scoped data** (filtered by `caller_username`
 ///   from `OperatorIdentity`): `guest_version_drift`,
 ///   `substrate_orphans`.
@@ -6058,29 +6063,69 @@ async fn diagnostics_handler(
     let gateway_tag =
         sandbox_core::gateway::gateway_image_tag_for_daemon(env!("CARGO_PKG_VERSION"));
     let lite_tag = sandbox_core::lite_image_tag_for_daemon_probe(env!("CARGO_PKG_VERSION"));
-    let gateway_image_present = {
+
+    // Probe outcome: the daemon distinguishes three states per
+    // Spec 3 § 13.2 (probe_failed variant) so doctor's C7/C8 can
+    // emit the right operator hint — "image missing" vs "docker
+    // daemon unreachable" need different remediations. Returning
+    // (present, probe_failed_error) keeps the wire shape
+    // backward-compatible: older CLIs still read `gateway_image_present`
+    // as `false` on probe failure, while newer CLIs read the
+    // `gateway_image_probe_failed` companion field for the rich
+    // outcome.
+    let gateway_probe = {
         let tag = gateway_tag.clone();
-        tokio::task::spawn_blocking(move || {
-            sandbox_core::gateway::gateway_image_present(&tag).unwrap_or(false)
-        })
-        .await
-        .unwrap_or(false)
+        let join = tokio::task::spawn_blocking(move || sandbox_core::gateway::gateway_image_present(&tag)).await;
+        match join {
+            Ok(Ok(true)) => (true, None),
+            Ok(Ok(false)) => (false, None),
+            Ok(Err(e)) => (false, Some(format!("{e}"))),
+            Err(e) => (false, Some(format!("daemon-side probe task failed to run: {e}"))),
+        }
     };
-    let lite_image_present = {
+    let lite_probe = {
         let tag = lite_tag.clone();
-        tokio::task::spawn_blocking(move || {
+        let join = tokio::task::spawn_blocking(move || {
             // The shared `image_exists` helper isn't exported the
             // same way the gateway one is; shell out to `docker
             // image inspect` directly so the probe shape matches.
-            std::process::Command::new("docker")
+            // Distinguish three cases the way `gateway_image_present`
+            // does: exit-0 → present, exit-non-zero with `no such
+            // image` / `no such object` stderr → absent, anything
+            // else → probe failure (docker daemon unreachable, PATH
+            // missing, etc.).
+            match std::process::Command::new("docker")
                 .args(["image", "inspect", &tag])
                 .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false)
+            {
+                Ok(out) if out.status.success() => Ok(true),
+                Ok(out) => {
+                    let stderr_lower = String::from_utf8_lossy(&out.stderr).to_lowercase();
+                    if stderr_lower.contains("no such image") || stderr_lower.contains("no such object") {
+                        Ok(false)
+                    } else {
+                        Err(format!(
+                            "docker image inspect {tag} failed unexpectedly: {}",
+                            String::from_utf8_lossy(&out.stderr).trim()
+                        ))
+                    }
+                }
+                Err(e) => Err(format!("failed to spawn docker image inspect: {e}")),
+            }
         })
-        .await
-        .unwrap_or(false)
+        .await;
+        match join {
+            Ok(Ok(true)) => (true, None),
+            Ok(Ok(false)) => (false, None),
+            Ok(Err(e)) => (false, Some(e)),
+            Err(e) => (false, Some(format!("daemon-side probe task failed to run: {e}"))),
+        }
     };
+
+    let gateway_image_present = gateway_probe.0;
+    let lite_image_present = lite_probe.0;
+    let gateway_image_probe_error = gateway_probe.1;
+    let lite_image_probe_error = lite_probe.1;
 
     let users_conf_pool = serde_json::json!({
         "cidr": format!(
@@ -6217,6 +6262,20 @@ async fn diagnostics_handler(
         "kvm_writable": kvm_writable,
         "gateway_image_present": gateway_image_present,
         "lite_image_present": lite_image_present,
+        // `*_probe_failed` discriminates "docker reports image
+        // absent" (probe ran, result negative) from "docker daemon
+        // unreachable / fork failed / unexpected stderr" (probe did
+        // not run to a verdict). Spec 3 § 13.2 — added so doctor
+        // C7/C8 can emit the right operator hint (image-missing →
+        // `sandbox update`; probe-failed → restart docker /
+        // sandboxd). When the probe succeeded the field is `false`;
+        // when it failed the matching `*_probe_error` field carries
+        // the operator-facing reason. Old CLIs that only read the
+        // bool still get a sane `false`-on-failure value.
+        "gateway_image_probe_failed": gateway_image_probe_error.is_some(),
+        "gateway_image_probe_error": gateway_image_probe_error,
+        "lite_image_probe_failed": lite_image_probe_error.is_some(),
+        "lite_image_probe_error": lite_image_probe_error,
         "users_conf_pool": users_conf_pool,
         "guest_version_drift": guest_version_drift,
         "substrate_orphans": {
