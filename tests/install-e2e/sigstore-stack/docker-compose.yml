@@ -39,7 +39,12 @@ services:
       start_period: 3s
 
   tesseract:
-    image: ghcr.io/transparency-dev/tesseract/posix:latest
+    # Pinned by digest for reproducibility. To bump: `docker pull
+    # ghcr.io/transparency-dev/tesseract/posix:latest` then read
+    # `RepoDigests` from `docker image inspect`. Pin lockstep with any
+    # refresh of the Fulcio image so the CT-log/Fulcio compatibility
+    # matrix stays observed.
+    image: ghcr.io/transparency-dev/tesseract/posix@sha256:0fe8cbf3e0c0c0fb95c323e9809cef1ca6851c7c4b200b089c72e5da15e5d179
     restart: unless-stopped
     networks:
       - sigstore
