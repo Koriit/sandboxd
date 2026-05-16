@@ -539,7 +539,28 @@ def _inject_synthetic_session(vm, *, session_id, owner_username, backend="lima")
     file-level locking lets a separate ``sqlite3`` process write while
     the daemon is running, with brief contention at worst. For a
     single small INSERT this is well within tolerance.
+
+    sqlite3 CLI dependency: the install-e2e VM's package set
+    (`_install_prereqs`) only installs what install.sh's
+    ``check_prereqs`` verifies — ``sqlite3`` is NOT in that set. This
+    helper is the only consumer of the sqlite3 CLI in the test suite,
+    so we install it lazily here. ``apt-get install`` is idempotent;
+    if the package is already present the call is a near-noop.
     """
+    # Lazy install of the sqlite3 CLI. Scoped to this helper because
+    # only the synthetic-injection path uses it; we don't want to bloat
+    # ``_install_prereqs`` with a dependency that install.sh itself
+    # does not require.
+    vm.shell(
+        "set -eux; "
+        "export DEBIAN_FRONTEND=noninteractive; "
+        "if ! command -v sqlite3 >/dev/null 2>&1; then "
+        "  sudo apt-get install -y --no-install-recommends sqlite3; "
+        "fi",
+        check=True,
+        timeout=120,
+    )
+
     config_json = json.dumps(
         {
             "cpus": 2,
