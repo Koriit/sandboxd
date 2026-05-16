@@ -758,10 +758,46 @@ sigstore_verify() {
         log_warn "step=sigstore_verify action=skip reason=test-env-override"
         return 0
     fi
+
+    # Test-only trust-material redirect. The install-e2e harness boots
+    # a local Sigstore stack (Fulcio + Rekor + CT log) and signs the
+    # local-build tarball against it, so the real cosign verify-blob
+    # path can be exercised end-to-end without reaching the production
+    # sigstore.dev TUF mirror. The four SANDBOX_INSTALL_TEST_* env vars
+    # below let the harness substitute the trust roots; the identity
+    # values (certificate-identity-regexp, certificate-oidc-issuer)
+    # stay byte-identical to production because the local stack mints
+    # tokens that satisfy them. Unset → behavior byte-identical to a
+    # production install (no extra cosign flags, no extra env vars
+    # exported to the cosign process). THESE ENV VARS MUST NEVER BE
+    # SET IN PRODUCTION — same warning as SANDBOX_INSTALL_SKIP_SIGSTORE
+    # above; deliberately undocumented in --help / installation.md.
+    cert_chain_arg=""
+    rekor_url_arg=""
+    if [ -n "${SANDBOX_INSTALL_TEST_FULCIO_ROOT:-}" ]; then
+        cert_chain_arg="--certificate-chain=${SANDBOX_INSTALL_TEST_FULCIO_ROOT}"
+    fi
+    if [ -n "${SANDBOX_INSTALL_TEST_REKOR_URL:-}" ]; then
+        rekor_url_arg="--rekor-url=${SANDBOX_INSTALL_TEST_REKOR_URL}"
+    fi
+    # cosign reads these env vars directly when present; passing them
+    # via the script's process environment is sufficient.
+    if [ -n "${SANDBOX_INSTALL_TEST_REKOR_PUBLIC_KEY:-}" ]; then
+        export SIGSTORE_REKOR_PUBLIC_KEY="${SANDBOX_INSTALL_TEST_REKOR_PUBLIC_KEY}"
+    fi
+    if [ -n "${SANDBOX_INSTALL_TEST_CT_LOG_PUBLIC_KEY:-}" ]; then
+        export SIGSTORE_CT_LOG_PUBLIC_KEY_FILE="${SANDBOX_INSTALL_TEST_CT_LOG_PUBLIC_KEY}"
+    fi
+
+    # shellcheck disable=SC2086 # cert_chain_arg + rekor_url_arg are
+    # deliberately unquoted so empty values expand to nothing rather
+    # than passing a bare `''` argv slot that cosign would reject.
     "$COSIGN" verify-blob \
         --bundle "$TMPDIR_INSTALL/release.tar.gz.sigstore" \
         --certificate-identity-regexp '^https://github\.com/Koriit/sandboxd/\.github/workflows/release\.yml@' \
         --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+        $cert_chain_arg \
+        $rekor_url_arg \
         "$TMPDIR_INSTALL/release.tar.gz" \
         >/dev/null 2>&1 \
         || die "sigstore verification failed for $TMPDIR_INSTALL/release.tar.gz"
