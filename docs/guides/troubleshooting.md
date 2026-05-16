@@ -443,6 +443,37 @@ Fix: create sessions with more resources (`sandbox create --cpus 4 --memory 8192
 
 Slow I/O causes: thin-provisioned disk growth, host disk contention, 9p overhead on shared mounts. For disk-intensive workloads, use clone mode (`--repo`) instead of shared mounts.
 
+## Session create refused — route-helper denied
+
+**Symptom:** `sandbox create` fails late in the create flow with an error mentioning the route helper, networking setup, or a per-session lifecycle event of the shape `route_helper_failed exit=1`. The daemon's journal shows the helper invocation that refused.
+
+The route helper enforces a **pair-membership rule**: the operator invoking it (`getuid()` of the helper process, resolved to a username) and the operator the network is being installed for (`--for-user <name>`, defaulting to the caller) must both appear in the `allow_users` list of the subnet pool the route is being installed into (`/etc/sandboxd/users.conf`). Any mismatch is denied; the helper exits non-zero, the daemon surfaces the failure as the session-create lifecycle event, and the session is rolled back.
+
+Every helper invocation — allowed or denied — writes one JSON-Lines record to the audit log. To diagnose a deny:
+
+```bash
+# Production (post-Spec-3 daemon runs as the `sandbox` user):
+sudo -u sandbox tail -n 20 /var/lib/sandbox/route-helper-audit.log
+
+# Today's-mode / dev-mode (daemon runs as the invoking operator):
+tail -n 20 "$XDG_RUNTIME_DIR/sandboxd/route-helper-audit.log"
+# Or, if XDG_RUNTIME_DIR is unset (rare): ~/.local/share/sandboxd/route-helper-audit.log
+```
+
+The last record corresponds to the failing create attempt. Each record has the shape:
+
+```json
+{"ts":"2026-05-11T14:23:11.477Z","decision":"denied","reason":"pair-check failed","caller":"alice","for_user":"bob","pool":"10.210.0.0/20","gateway_ip":"10.210.0.2","pid":12346}
+```
+
+The **`reason`** field carries a short tag for the deny class. Common values:
+
+- `"pair-check failed"` — either `caller` or `for_user` (or both) is not in the target pool's `allow_users`. Edit `/etc/sandboxd/users.conf` to add the missing operator to the pool, then retry. The `sandbox` daemon user is added automatically by config migration V001; if it is missing for a pool, the file's `_schema_version` likely predates V001 (`sandbox update` migrates it forward).
+- `"gateway-ip not in any subnet"` — the daemon asked for a gateway IP that does not fall into any configured pool's CIDR. This is a daemon-side or `users.conf` configuration drift, not an operator-permissions issue.
+- `"username resolution failed"` — `getpwuid_r` could not resolve the helper's UID (e.g., the caller's `/etc/passwd` entry vanished). Restore the entry and retry.
+
+If the audit log itself is missing or the deny path was hit with a write failure, `journalctl -u sandboxd` will show a non-zero helper exit even when no audit record was written — a write failure on the deny path is explicitly escalated (the helper still exits non-zero with a stderr line) so the missing-record case never silences the deny. In that case, check `df -h /var/lib/sandbox` (production) or `df -h $XDG_RUNTIME_DIR` (today's mode) for disk-pressure root causes.
+
 ## Session stuck in Creating
 
 **Symptom:** Session stays in `Creating`, never reaches `Running`.
