@@ -133,6 +133,12 @@ export default defineConfig({
           ],
         },
         {
+          label: 'Operate',
+          items: [
+            { label: 'Update sandboxd', slug: 'operate/update' },
+          ],
+        },
+        {
           label: 'Reference',
           items: [
             { label: 'CLI reference', slug: 'reference/cli' },
