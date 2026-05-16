@@ -7,6 +7,19 @@ description: Endpoints served by sandboxd over its Unix socket — request and r
 
 The CLI is a thin wrapper over this API. Every endpoint accepts and returns JSON. All `{id}` path parameters accept either a full session ID, a unique session-ID prefix, or a session name.
 
+## Caller identity and per-caller isolation
+
+Every connection to the daemon socket is authenticated by `SO_PEERCRED` — the kernel-verified UID of the connecting process. The daemon resolves that UID to a username via `getpwuid_r` and uses the resulting name (the **caller's username**, not the UID) as the session-ownership identity. Usernames are stable in `/etc/passwd`; UIDs are reassignable, so a row stamped with a UID could surface to a future `useradd --uid` of the same number. UID-to-username resolution failures (`getpwuid_r` returns no record, or the process's UID has no `passwd` entry) close the connection cleanly without leaking session data.
+
+Every session-shaped endpoint enforces caller scope at the storage boundary:
+
+- **List endpoints** return only rows where `owner_username` matches the caller. Alice's `GET /sessions` cannot see Bob's sessions.
+- **Per-session endpoints** (`GET`, `DELETE`, `POST .../start|stop|exec|policy|health|events`) return **`404 Not Found`** when the addressed session ID exists but is owned by a different user. The wire body is byte-for-byte identical to the truly-not-found response — `{"error":"session not found: <id>"}` — so callers cannot distinguish "doesn't exist" from "exists but isn't mine". The 404-over-403 choice is deliberate: existence is information; leaking it would let Alice enumerate Bob's session UUIDs via timing or response shape.
+
+The four top-level non-session endpoints (`POST /rebuild-image`, `GET /base-image-status`, `GET /health`, `GET /backends`) carry no per-user surface and are not filtered.
+
+The per-endpoint audit table below records, for every session-shaped endpoint, the ownership behavior; the same scope rule applies to every future endpoint that takes an `{id}` path parameter, because the filter lives in `SessionStore`, not at the handler.
+
 ## Calling the socket
 
 With `curl`:
@@ -38,6 +51,36 @@ Status-code mapping:
 | Internal failure (lima, gateway, CA, I/O, DB) | `500 Internal Server Error` |
 
 Success status codes are documented per endpoint below.
+
+## Per-endpoint isolation audit
+
+| # | Endpoint | Caller-scope behavior |
+|---|---|---|
+| H1 | `POST /sessions` | Stamps `owner_username` on the new row from the caller's resolved username. The request body has no field that can spoof it. |
+| H2 | `GET /sessions` | Returns only rows where `owner_username` equals the caller. |
+| H3 | `GET /sessions/{id}` | `404` when the row exists but `owner_username` differs (same wire shape as truly-not-found). |
+| H4 | `DELETE /sessions/{id}` | `404` on foreign ID. |
+| H5 | `POST /sessions/{id}/start` | `404` on foreign ID. |
+| H6 | `POST /sessions/{id}/stop` | `404` on foreign ID. |
+| H7 | `POST /sessions/{id}/exec` | `404` on foreign ID. |
+| H8 | `POST /sessions/{id}/policy` | `404` on foreign ID. |
+| H9 | `DELETE /sessions/{id}/policy` | `404` on foreign ID. |
+| H10 | `GET /sessions/{id}/health` | `404` on foreign ID. |
+| H11 | `GET /sessions/{id}/events` | `404` on foreign ID. |
+| H12 | `GET /sessions/{id}/policy/propagation-status` | `404` on foreign ID. |
+
+The four non-session endpoints (`POST /rebuild-image`, `GET /base-image-status`, `GET /health`, `GET /backends`) have no caller filter — they expose only daemon-global state.
+
+A foreign-id `404` over the wire (the literal body the daemon emits for both the truly-missing and the foreign-owned case):
+
+```http
+HTTP/1.1 404 Not Found
+Content-Type: application/json
+
+{ "error": "session not found: a1b2c3d4e5f6" }
+```
+
+There is no separate `403 Forbidden` response shape; mutating endpoints (H4–H9) also collapse the "not yours" case into `404`. No cross-user mutation path exists.
 
 ## Sessions
 
@@ -80,7 +123,7 @@ Success: `200 OK` with a `SessionDto` body (see below).
 
 No request body.
 
-Success: `200 OK` with a JSON array of `SessionDto` objects. The list endpoint deliberately omits the `policy` field to keep the response cheap; use `GET /sessions/{id}` for that.
+Success: `200 OK` with a JSON array of `SessionDto` objects, filtered to rows the caller owns (see [Caller identity and per-caller isolation](#caller-identity-and-per-caller-isolation)). The list endpoint deliberately omits the `policy` field to keep the response cheap; use `GET /sessions/{id}` for that.
 
 ### `GET /sessions/{id}` — describe one session
 
@@ -362,6 +405,7 @@ Field names and shapes evolve with the capability schema; consult the `sandbox-c
 {
   "id": "a1b2c3d4e5f6",
   "name": "dev",
+  "owner_username": "alice",
   "state": "running",
   "created_at": "2026-04-18T10:00:00Z",
   "updated_at": "2026-04-18T10:05:00Z",
@@ -398,6 +442,7 @@ Field names and shapes evolve with the capability schema; consult the `sandbox-c
 Notes:
 
 - `state` is one of `creating`, `running`, `stopped`, `error`.
+- `owner_username` is the resolved username (from `SO_PEERCRED` at create time) of the operator who created the session. The list and single-session endpoints always return the caller's own username here — the field is included as a sanity check so operators can confirm the connection's authenticated identity. The daemon never returns a row whose `owner_username` differs from the caller (per the [isolation audit](#per-endpoint-isolation-audit)).
 - `workspace_mode` is a rendered string: `shared:<absolute host path>` or `clone:<repo url>`, or omitted if none was set.
 - `guest_agent_status` / `gateway_status` are omitted when the session is not running.
 - `policy` is only populated by `GET /sessions/{id}`; the list endpoint omits it.
