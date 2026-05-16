@@ -789,18 +789,41 @@ sigstore_verify() {
         export SIGSTORE_CT_LOG_PUBLIC_KEY_FILE="${SANDBOX_INSTALL_TEST_CT_LOG_PUBLIC_KEY}"
     fi
 
+    # Test-only diagnostic toggle. In production, cosign's stdout/stderr
+    # are suppressed to keep install output clean; that makes test
+    # triage impossible when verify-blob fails inside a Lima VM. When
+    # SANDBOX_INSTALL_TEST_DEBUG_COSIGN_STDERR=1 is set, route the
+    # cosign output to a fixed log file BEFORE die() fires, so the
+    # operator (or test harness) can read what cosign actually said.
+    # MUST NEVER BE SET IN PRODUCTION — exposing cosign internals to
+    # the install log is at best noise, at worst an info-leak vector;
+    # documented here (not in --help) for the same reasons as the
+    # SANDBOX_INSTALL_TEST_* trust-material vars above.
+    cosign_debug_log="/tmp/sandbox-install-cosign-debug.log"
     # shellcheck disable=SC2086 # cert_chain_arg + rekor_url_arg are
     # deliberately unquoted so empty values expand to nothing rather
     # than passing a bare `''` argv slot that cosign would reject.
-    "$COSIGN" verify-blob \
-        --bundle "$TMPDIR_INSTALL/release.tar.gz.sigstore" \
-        --certificate-identity-regexp '^https://github\.com/Koriit/sandboxd/\.github/workflows/release\.yml@' \
-        --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
-        $cert_chain_arg \
-        $rekor_url_arg \
-        "$TMPDIR_INSTALL/release.tar.gz" \
-        >/dev/null 2>&1 \
-        || die "sigstore verification failed for $TMPDIR_INSTALL/release.tar.gz"
+    if [ "${SANDBOX_INSTALL_TEST_DEBUG_COSIGN_STDERR:-0}" = "1" ]; then
+        "$COSIGN" verify-blob \
+            --bundle "$TMPDIR_INSTALL/release.tar.gz.sigstore" \
+            --certificate-identity-regexp '^https://github\.com/Koriit/sandboxd/\.github/workflows/release\.yml@' \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            $cert_chain_arg \
+            $rekor_url_arg \
+            "$TMPDIR_INSTALL/release.tar.gz" \
+            >"$cosign_debug_log" 2>&1 \
+            || die "sigstore verification failed for $TMPDIR_INSTALL/release.tar.gz (cosign log: $cosign_debug_log)"
+    else
+        "$COSIGN" verify-blob \
+            --bundle "$TMPDIR_INSTALL/release.tar.gz.sigstore" \
+            --certificate-identity-regexp '^https://github\.com/Koriit/sandboxd/\.github/workflows/release\.yml@' \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            $cert_chain_arg \
+            $rekor_url_arg \
+            "$TMPDIR_INSTALL/release.tar.gz" \
+            >/dev/null 2>&1 \
+            || die "sigstore verification failed for $TMPDIR_INSTALL/release.tar.gz"
+    fi
     log_ok "step=sigstore_verify bundle=release.tar.gz.sigstore identity=Koriit/sandboxd/release.yml"
 }
 

@@ -803,6 +803,13 @@ def stage_sigstore_trust_material_in_vm(vm, stack):
         # a future per-VM signing fixture) dial it. Currently unused
         # by sigstore_verify.
         "SANDBOX_INSTALL_TEST_FULCIO_URL": fulcio_url,
+        # Test-only diagnostic toggle (install.sh::sigstore_verify):
+        # route cosign verify-blob's stdout+stderr to
+        # /tmp/sandbox-install-cosign-debug.log so the test harness
+        # can recover the real cosign error after a failure. Without
+        # this, production's `>/dev/null 2>&1` suppression makes
+        # triage impossible. MUST NEVER BE SET IN PRODUCTION.
+        "SANDBOX_INSTALL_TEST_DEBUG_COSIGN_STDERR": "1",
     }
 
 
