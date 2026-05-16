@@ -1911,38 +1911,104 @@ provision:
 // VM naming helpers (public for tests)
 // ---------------------------------------------------------------------------
 
+/// Production install path for the `sandbox-guest` helper binary.
+///
+/// The helper is a daemon-internal artifact (not operator-facing), so
+/// it lives under `/usr/local/libexec/sandboxd/` per FHS § 4.7 — the
+/// same directory the cap'd `sandbox-route-helper` is installed to.
+/// `scripts/install.sh` lays it down here, `scripts/uninstall.sh`
+/// removes it, and the daemon's startup-staging path (and Lima VM
+/// provisioning) reads it from this location.
+pub const PRODUCTION_GUEST_BINARY_PATH: &str = "/usr/local/libexec/sandboxd/sandbox-guest";
+
+/// Env-var name a `test-env-override` build of the daemon consults to
+/// redirect [`guest_agent_path`] at an alternate `sandbox-guest`
+/// binary. Production builds ignore this variable; the integration-
+/// test harness sets it so a test-local cargo build can drive the
+/// staging path without installing into `/usr/local/libexec/`.
+pub const GUEST_BINARY_PATH_OVERRIDE_ENV: &str = "SANDBOXD_GUEST_BINARY_PATH";
+
 /// Resolve the path to the `sandbox-guest` binary.
 ///
-/// In production the agent binary lives next to the daemon binary
-/// (e.g. `target/debug/sandbox-guest` alongside `target/debug/sandboxd`,
-/// or `/usr/local/bin/sandbox-guest` next to `/usr/local/bin/sandboxd`).
-/// Under `cargo nextest`, however, `current_exe()` resolves to a test
-/// binary inside `target/debug/deps/<hash>` while `cargo build --bin
-/// sandbox-guest` writes to `target/debug/sandbox-guest` — one level up.
-/// To support integration tests that invoke this path on a clean
-/// `target/`, we look in both locations and return the first that
-/// exists. If neither exists, we fall back to the production-shaped
-/// sibling path so the resulting `SandboxError` from a downstream
-/// open/exec call still names the canonical location.
+/// `sandbox-guest` is a daemon-internal helper, not an operator-
+/// facing tool. In production it is installed by `scripts/install.sh`
+/// to [`PRODUCTION_GUEST_BINARY_PATH`]. In `cargo` / `cargo nextest`
+/// dev workflows the workspace build writes it to
+/// `target/{debug,release}/sandbox-guest`, which is either a sibling
+/// of `sandboxd` (release / `cargo run`) or a grandparent of the
+/// nextest test binary (`target/debug/deps/<hash>/<test>`).
+///
+/// Resolution order — first existing path wins:
+///
+/// 1. **`test-env-override`-only**: the value of
+///    `SANDBOXD_GUEST_BINARY_PATH` if set (the integration-test
+///    harness's dev loop pins this so a freshly `cargo build`'d guest
+///    binary can be staged without polluting `/usr/local/libexec/`).
+///    Production builds skip this branch entirely; the env var is
+///    untrusted on a daemon that may have CAP_NET_ADMIN / read access
+///    to private state.
+/// 2. **Production install path** [`PRODUCTION_GUEST_BINARY_PATH`].
+/// 3. **Dev sibling**: `current_exe().parent() / "sandbox-guest"` —
+///    catches `cargo run -p sandboxd` where both binaries live in
+///    `target/{debug,release}/`.
+/// 4. **Dev grandparent**: `current_exe().parent().parent() /
+///    "sandbox-guest"` — catches `cargo nextest run`, where the test
+///    binary lives in `target/debug/deps/<hash>` while `cargo build
+///    --bin sandbox-guest` writes to `target/debug/sandbox-guest`.
+///
+/// On miss, returns an error naming every path tried so the operator
+/// log surfaces exactly which locations the daemon checked.
 pub fn guest_agent_path() -> Result<PathBuf, SandboxError> {
+    let mut tried: Vec<PathBuf> = Vec::new();
+
+    // 1. test-env-override.
+    #[cfg(feature = "test-env-override")]
+    if let Ok(p) = std::env::var(GUEST_BINARY_PATH_OVERRIDE_ENV)
+        && !p.is_empty()
+    {
+        let candidate = PathBuf::from(p);
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+        tried.push(candidate);
+    }
+
+    // 2. Production install path.
+    let production = PathBuf::from(PRODUCTION_GUEST_BINARY_PATH);
+    if production.exists() {
+        return Ok(production);
+    }
+    tried.push(production);
+
+    // 3-4. Dev fallbacks (sibling and grandparent of current_exe).
     let exe = std::env::current_exe().map_err(|e| {
         SandboxError::Internal(format!("failed to determine current executable path: {e}"))
     })?;
-    let dir = exe.parent().ok_or_else(|| {
-        SandboxError::Internal("executable path has no parent directory".to_string())
-    })?;
-    let primary = dir.join("sandbox-guest");
-    if primary.exists() {
-        return Ok(primary);
-    }
-    // Nextest: `target/debug/deps/<test>` → check `target/debug/`.
-    if let Some(parent) = dir.parent() {
-        let fallback = parent.join("sandbox-guest");
-        if fallback.exists() {
-            return Ok(fallback);
+    if let Some(dir) = exe.parent() {
+        let sibling = dir.join("sandbox-guest");
+        if sibling.exists() {
+            return Ok(sibling);
+        }
+        tried.push(sibling);
+        if let Some(parent) = dir.parent() {
+            let grandparent_sibling = parent.join("sandbox-guest");
+            if grandparent_sibling.exists() {
+                return Ok(grandparent_sibling);
+            }
+            tried.push(grandparent_sibling);
         }
     }
-    Ok(primary)
+
+    let tried_list = tried
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(SandboxError::Internal(format!(
+        "sandbox-guest binary not found; tried: [{tried_list}]. \
+         Install the release tarball (which places it at {PRODUCTION_GUEST_BINARY_PATH}) \
+         or run `cargo build --workspace` so a dev-build sibling is available."
+    )))
 }
 
 /// Prefix applied to all sandbox VM names.
@@ -3366,14 +3432,65 @@ mod tests {
     }
 
     #[test]
-    fn test_guest_agent_path_returns_sibling_of_current_exe() {
+    fn test_guest_agent_path_returns_a_sandbox_guest_path_when_resolved() {
+        // `cargo nextest run --workspace` does not build `sandbox-guest`
+        // (no crate transitively depends on it), so this test cannot
+        // assume any of the four resolution branches is satisfied in a
+        // hermetic test run. Instead, exercise the function and accept
+        // either outcome:
+        //   * `Ok(path)` — at least one branch (production install,
+        //     dev sibling, or dev grandparent) resolved. The
+        //     `file_name()` must be `sandbox-guest`.
+        //   * `Err(_)` — every branch missed. The error message must
+        //     name `sandbox-guest` so the operator log is greppable.
+        match guest_agent_path() {
+            Ok(path) => {
+                assert_eq!(
+                    path.file_name().unwrap(),
+                    std::ffi::OsStr::new("sandbox-guest"),
+                    "guest_agent_path should return a path ending in sandbox-guest"
+                );
+            }
+            Err(SandboxError::Internal(msg)) => {
+                assert!(
+                    msg.contains("sandbox-guest"),
+                    "miss-error should name the binary it was looking for: {msg}"
+                );
+                assert!(
+                    msg.contains(PRODUCTION_GUEST_BINARY_PATH),
+                    "miss-error should name the production install path so \
+                     operators know what to install: {msg}"
+                );
+            }
+            Err(other) => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "test-env-override")]
+    #[test]
+    fn test_guest_agent_path_honors_env_override_under_test_feature() {
+        // Synthesize a sandbox-guest stand-in and pin the override at
+        // it; the resolver must return that path before checking the
+        // production install location.
+        let dir = tempfile::TempDir::new().expect("create tempdir");
+        let pinned = dir.path().join("sandbox-guest");
+        std::fs::write(&pinned, b"#!/bin/echo synthetic\n").expect("write stub");
+
+        let prev = std::env::var(GUEST_BINARY_PATH_OVERRIDE_ENV).ok();
+        // SAFETY: setting/unsetting env vars is unsafe in Rust 2024
+        // because of cross-thread races; we accept the risk in a unit
+        // test that doesn't spawn other env-reading threads.
+        unsafe { std::env::set_var(GUEST_BINARY_PATH_OVERRIDE_ENV, &pinned) };
         let result = guest_agent_path();
-        // In test context this should succeed (current_exe is the test binary).
-        assert!(result.is_ok());
-        let path = result.unwrap();
-        assert!(
-            path.file_name().unwrap() == "sandbox-guest",
-            "guest_agent_path should return a path ending in sandbox-guest"
-        );
+        // SAFETY: see rationale above.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(GUEST_BINARY_PATH_OVERRIDE_ENV, v),
+                None => std::env::remove_var(GUEST_BINARY_PATH_OVERRIDE_ENV),
+            }
+        }
+
+        let resolved = result.expect("override should resolve");
+        assert_eq!(resolved, pinned);
     }
 }

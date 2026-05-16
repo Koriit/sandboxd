@@ -81,16 +81,15 @@ pub use gateway::{
 pub use guest::{
     GUEST_AGENT_PORT, GuestConnector, GuestRequest, GuestResponse, MAX_MESSAGE_SIZE,
     STAGED_GUEST_FILE_RELPATH, STAGED_GUEST_SUBDIR, StageOutcome, read_message,
-    stage_embedded_guest_binary_into_base_dir, stage_guest_binary_at, staged_guest_path,
-    write_message,
+    stage_guest_binary_at, stage_guest_binary_into_base_dir, staged_guest_path, write_message,
 };
 pub use lds_ack::{
     DockerExecLdsProbe, LdsAckOutcome, LdsCounters, LdsStatsProbe, parse_lds_counters,
     wait_for_lds_ack,
 };
 pub use lima::{
-    BaseImageMeta, BaseImageStatus, DEFAULT_BASE_VM_NAME, LimaManager, VmInfo, VmStatus,
-    guest_agent_path,
+    BaseImageMeta, BaseImageStatus, DEFAULT_BASE_VM_NAME, GUEST_BINARY_PATH_OVERRIDE_ENV,
+    LimaManager, PRODUCTION_GUEST_BINARY_PATH, VmInfo, VmStatus, guest_agent_path,
 };
 pub use network::{NetworkInfo, NetworkManager};
 pub use policy::{

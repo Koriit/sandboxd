@@ -2462,30 +2462,15 @@ async fn create_session(
             }
         }
 
-        // 2c. Install the guest agent into the VM.
-        let guest_binary_path = match std::env::current_exe() {
-            Ok(exe) => match exe.parent() {
-                Some(dir) => dir.join("sandbox-guest"),
-                None => {
-                    cleanup_and_return!(
-                        state,
-                        session_id,
-                        error_response(SandboxError::Internal(
-                            "executable path has no parent directory".to_string(),
-                        ))
-                        .into_response()
-                    );
-                }
-            },
+        // 2c. Install the guest agent into the VM. Resolve the host-
+        // side source via the shared `guest_agent_path` resolver so
+        // production installs read from `/usr/local/libexec/sandboxd/`
+        // and dev builds fall back to the cargo target — the same
+        // contract the container-backend startup-staging path uses.
+        let guest_binary_path = match sandbox_core::guest_agent_path() {
+            Ok(p) => p,
             Err(e) => {
-                cleanup_and_return!(
-                    state,
-                    session_id,
-                    error_response(SandboxError::Internal(format!(
-                        "failed to determine daemon executable path: {e}"
-                    )))
-                    .into_response()
-                );
+                cleanup_and_return!(state, session_id, error_response(e).into_response());
             }
         };
 
@@ -7082,19 +7067,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| SandboxError::Internal(format!("base-dir layout task panicked: {e}")))??;
     }
 
-    // Stage the embedded `sandbox-guest` binary into `{base_dir}/guest/`
-    // so every container session can bind-mount it read-only at
-    // `/usr/local/bin/sandbox-guest`. Spec: api-session-isolation §
-    // 3.8.1. Runs once at startup, idempotent (sha256 compare);
-    // refresh becomes `docker restart` rather than `docker cp`
-    // because the staged binary is already current. The operation
-    // is synchronous + CPU-cheap (one read, one hash, one optional
-    // rename) — `spawn_blocking` keeps it off the tokio worker for
-    // the same reason `ensure_base_dir_layout` did.
+    // Stage the daemon-side `sandbox-guest` binary into
+    // `{base_dir}/guest/` so every container session can bind-mount it
+    // read-only at `/usr/local/bin/sandbox-guest`. Runs once at
+    // startup, idempotent (sha256 compare); refresh becomes `docker
+    // restart` rather than `docker cp` because the staged binary is
+    // already current. The operation is synchronous + CPU-cheap (one
+    // read, one hash, one optional rename) — `spawn_blocking` keeps
+    // it off the tokio worker for the same reason
+    // `ensure_base_dir_layout` did. The source binary is resolved via
+    // `sandbox_core::guest_agent_path` — production builds find it at
+    // the FHS install path, dev builds fall back to the cargo target.
     {
         let base_dir = base_dir.clone();
         tokio::task::spawn_blocking(move || {
-            sandbox_core::stage_embedded_guest_binary_into_base_dir(&base_dir)
+            sandbox_core::stage_guest_binary_into_base_dir(&base_dir)
         })
         .await
         .map_err(|e| SandboxError::Internal(format!("guest-staging task panicked: {e}")))??;

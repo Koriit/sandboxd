@@ -303,7 +303,7 @@ fn lite_image_tag() -> String {
 
 /// Stage `bytes` (with mode 0755) into a per-test base directory's
 /// `guest/sandbox-guest`. Returns the absolute host path. Mirrors
-/// what `sandbox_core::stage_embedded_guest_binary_into_base_dir`
+/// what `sandbox_core::stage_guest_binary_into_base_dir`
 /// does at daemon startup so the test fixture exercises the same
 /// on-disk shape every container session sees.
 fn stage_test_guest(base_dir: &std::path::Path, bytes: &[u8]) -> PathBuf {

@@ -92,19 +92,18 @@ pub fn can_refresh_in_place(session_proto: u32) -> bool {
 /// with mode `0o755`, ready to be `docker cp`'d or `limactl copy`'d
 /// into a session at refresh time.
 ///
-/// Spec 2 § 3.6 specifies `include_bytes!` for production builds (Spec
-/// 4 territory); for Spec 2's dev-mode-only scope, the daemon reads
-/// the sibling binary via the existing
-/// [`crate::lima::guest_agent_path`] resolver and stages it through
-/// [`tempfile::NamedTempFile`] so the refresh sequence has a stable
-/// host path to hand to the backend command. The tempfile is preserved
-/// across the resulting `NamedTempFile` value; dropping the returned
-/// handle deletes it on the host.
-pub fn stage_embedded_guest_binary() -> Result<tempfile::NamedTempFile, SandboxError> {
+/// Reads the source bytes from the host filesystem via the
+/// [`crate::lima::guest_agent_path`] resolver — production builds find
+/// it at the FHS-canonical install path under `/usr/local/libexec/`;
+/// dev / test builds fall back to the cargo target directory. The
+/// bytes are written into a [`tempfile::NamedTempFile`] so the refresh
+/// sequence has a stable host path to hand to the backend command.
+/// Dropping the returned handle deletes the tempfile on the host.
+pub fn stage_guest_binary_to_tempfile() -> Result<tempfile::NamedTempFile, SandboxError> {
     let agent_src = crate::lima::guest_agent_path()?;
     if !agent_src.exists() {
         return Err(SandboxError::Internal(format!(
-            "embedded guest binary not found at {}",
+            "guest binary not found at {}",
             agent_src.display()
         )));
     }
@@ -323,27 +322,28 @@ fn atomic_write_executable(dst: &Path, bytes: &[u8]) -> Result<(), SandboxError>
     Ok(())
 }
 
-/// Stage the embedded `sandbox-guest` binary into the daemon's state
-/// directory at [`staged_guest_path(base_dir)`][staged_guest_path].
+/// Stage the daemon-side `sandbox-guest` binary into the daemon's
+/// state directory at [`staged_guest_path(base_dir)`][staged_guest_path].
 ///
-/// Reads the bytes via the existing sibling-file resolver
-/// ([`crate::lima::guest_agent_path`]) — the same dev-mode source
-/// [`stage_embedded_guest_binary`] uses for the per-refresh tempfile.
-/// Spec 4 will swap that resolver for compile-time `include_bytes!`
-/// (spec § 3.6 option A); the staging contract here is unchanged
-/// either way because [`stage_guest_binary_at`] takes raw bytes.
+/// Reads the bytes from the host filesystem via the
+/// [`crate::lima::guest_agent_path`] resolver — production builds find
+/// it at the FHS-canonical install path, dev / test builds fall back
+/// to the in-tree `target/{debug,release}/sandbox-guest`. The bytes
+/// are then handed to [`stage_guest_binary_at`] which applies the
+/// idempotent sha256-compare + sibling-tempfile-rename contract.
 ///
 /// Idempotent per [`stage_guest_binary_at`]'s contract — safe to call
 /// on every daemon startup. Logs at `info!` with the outcome so the
 /// startup journal records whether the staged binary changed since the
-/// previous boot.
-pub fn stage_embedded_guest_binary_into_base_dir(
-    base_dir: &Path,
-) -> Result<StageOutcome, SandboxError> {
+/// previous boot. On failure the [`crate::lima::guest_agent_path`]
+/// error is surfaced verbatim so operators can see which install
+/// location was missing (production, test-env override, or dev
+/// sibling).
+pub fn stage_guest_binary_into_base_dir(base_dir: &Path) -> Result<StageOutcome, SandboxError> {
     let src = crate::lima::guest_agent_path()?;
     let bytes = std::fs::read(&src).map_err(|e| {
         SandboxError::Internal(format!(
-            "stage_embedded_guest_binary_into_base_dir: failed to read {} : {e}",
+            "stage_guest_binary_into_base_dir: failed to read {} : {e}",
             src.display()
         ))
     })?;

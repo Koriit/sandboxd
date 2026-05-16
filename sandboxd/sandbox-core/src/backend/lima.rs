@@ -327,7 +327,7 @@ impl SessionRuntime for LimaRuntime {
         // Stage the host-side tempfile before spawning the blocking
         // closure so the tempfile's lifetime spans every `limactl copy`
         // / `shell` call below.
-        let tempfile = tokio::task::spawn_blocking(crate::guest::stage_embedded_guest_binary)
+        let tempfile = tokio::task::spawn_blocking(crate::guest::stage_guest_binary_to_tempfile)
             .await
             .map_err(|e| {
                 SandboxError::Internal(format!(

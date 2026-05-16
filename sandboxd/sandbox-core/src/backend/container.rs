@@ -832,7 +832,7 @@ impl SessionRuntime for ContainerRuntime {
         //    on a running container (it does a stop+start). The
         //    bind-mount source itself is the daemon's
         //    `{base_dir}/guest/sandbox-guest`, staged at boot — see
-        //    `sandbox_core::stage_embedded_guest_binary_into_base_dir`.
+        //    `sandbox_core::stage_guest_binary_into_base_dir`.
         let restart_args = build_refresh_argv(&container_name);
         run_docker(&restart_args, "docker restart (guest refresh)").await?;
 
