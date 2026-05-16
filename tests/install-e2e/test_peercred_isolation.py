@@ -34,11 +34,13 @@ together).
 
 from __future__ import annotations
 
+import re
 import time
 
 import pytest
 
 from conftest import (
+    PEERCRED_CONNECTOR_VM_PATH,
     TEST_UID_NOPASSWD,
     copy_tarball_to_vm,
     install_multi_operator_users_conf,
@@ -307,6 +309,169 @@ def integration_route_helper_uid_without_passwd_denies_cleanly(
     assert r.returncode == 0, (
         f"sandbox doctor reports unhealthy after route-helper deny:\n"
         f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+    )
+
+
+
+
+# ---------------------------------------------------------------------------
+# #150 — daemon closes connection from uid without passwd
+# ---------------------------------------------------------------------------
+
+def _request_bytes(line, headers=None):
+    """Compose an HTTP/1.1 request blob with CRLF framing.
+
+    ``line`` is the request line (``GET /foo HTTP/1.1``); ``headers``
+    is an iterable of ``(name, value)`` tuples. The body is always
+    empty — these tests don't POST. ``Connection: close`` is added so
+    the daemon hangs up after the response, letting peercred-connector
+    return promptly.
+    """
+    if headers is None:
+        headers = []
+    hdrs = list(headers) + [("Host", "localhost"), ("Connection", "close")]
+    head = line + "\r\n"
+    head += "".join(f"{n}: {v}\r\n" for n, v in hdrs)
+    head += "\r\n"
+    return head
+
+
+@pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
+def integration_owner_isolation_uid_without_passwd_closes_connection(
+    distro_template,
+    vm_factory,
+    release_tarball_x86_64,
+    peercred_connector_binary,
+):
+    """The daemon's peercred acceptor closes connections from uids
+    that do not resolve in ``/etc/passwd``, per Spec 2 § 4.1.
+
+    Behavior pinned:
+      * peercred-connector's ``setresuid(7777)`` succeeds (the helper
+        is installed setuid-root).
+      * The unix-socket connect completes (TCP-level handshake; the
+        kernel does not reject the connect based on peercred).
+      * The daemon's acceptor reads ``SO_PEERCRED`` → uid 7777, calls
+        ``getpwuid_r`` → ``None``, ``drop(stream)``s, no bytes flow
+        back to the helper.
+      * peercred-connector reports zero bytes read; its stdout is
+        empty.
+      * The daemon journal shows the per-connection ``warn!`` line
+        documenting the no-resolve close. No panic, no error response,
+        no leaked socket.
+      * Subsequent connections from a resolvable uid (alice) succeed,
+        proving the daemon recovered cleanly.
+
+    Wire-level note: ``UnixStream`` connect is a synchronous primitive
+    that returns once both endpoints have the socket-pair, regardless
+    of any in-band protocol. The daemon's ``drop(stream)`` after the
+    failed resolve causes the kernel to send FIN to the client; the
+    client sees EOF on read. peercred-connector's read loop terminates
+    at the first ``n == 0``.
+    """
+    vm = _bring_up_peercred_vm(
+        vm_factory,
+        distro_template,
+        release_tarball_x86_64,
+        peercred_connector_binary,
+    )
+
+    # Compose a GET /sessions request. The exact endpoint does not
+    # matter — the daemon never parses HTTP because the connection
+    # closes before the first read; the request bytes are flushed but
+    # discarded.
+    req = _request_bytes("GET /sessions HTTP/1.1")
+    vm.shell(
+        f"cat > /tmp/req-7777 <<'EOF'\n{req}EOF",
+        check=True,
+    )
+
+    # Mark the journal cursor so the subsequent assertion only inspects
+    # events from this test rather than the install-time noise.
+    cursor_line = vm.shell(
+        "sudo journalctl -u sandboxd --show-cursor -n 1 --no-pager | tail -1",
+        check=True,
+    ).stdout.strip()
+    # ``--show-cursor`` prints ``-- cursor: s=...`` on the last line.
+    cursor_match = re.search(r"cursor:\s*(\S+)", cursor_line)
+    assert cursor_match, (
+        f"could not extract journal cursor from: {cursor_line!r}"
+    )
+    cursor = cursor_match.group(1)
+
+    # Invoke peercred-connector as uid 7777. The invoking shell is
+    # ``lima`` (the default Lima user, in the ``sandbox`` group via
+    # install.sh's ``add_operator_to_group``). The helper inherits
+    # lima's supplementary groups, then ``setresuid(7777)`` drops the
+    # real/effective/saved uid+gid; supplementary groups (including
+    # ``sandbox``) are NOT touched by ``setresgid`` and so the helper
+    # retains group-read access to the 0660 daemon socket. This is
+    # the same shape Spec 2 § 9.2 specifies for the multi-uid harness.
+    r = vm.shell(
+        f"sudo -u lima {PEERCRED_CONNECTOR_VM_PATH} "
+        f"--uid {TEST_UID_NOPASSWD} "
+        f"--request-file /tmp/req-7777 "
+        f"--socket {DAEMON_SOCK}",
+        timeout=30,
+    )
+
+    # The connector exits cleanly: the read loop saw EOF immediately
+    # (no bytes from the daemon) and write_all succeeded against the
+    # not-yet-closed write half. Exit 0 is the expected path because
+    # the connector treats EOF as a clean close.
+    assert r.returncode == 0, (
+        f"peercred-connector exited {r.returncode}; expected 0 (clean EOF)\n"
+        f"stdout:\n{r.stdout!r}\nstderr:\n{r.stderr!r}"
+    )
+
+    # Daemon wrote no bytes to the stream — Spec 2 § 4.1's "closed
+    # without a response" invariant.
+    assert r.stdout == "", (
+        f"daemon should not have sent any bytes to uid {TEST_UID_NOPASSWD}; "
+        f"got stdout: {r.stdout!r}"
+    )
+
+    # ---------------- Journal assertion ----------------
+
+    # The acceptor's no-resolve branch logs a structured ``warn!`` line
+    # documenting the close. Read from the cursor we stashed pre-
+    # invocation so we don't get false positives from install-time
+    # log noise. The match is on the substring the acceptor emits.
+    journal = vm.shell(
+        f"sudo journalctl -u sandboxd --after-cursor='{cursor}' --no-pager",
+        check=True,
+        timeout=15,
+    ).stdout
+    # Two substrings to look for, both from the acceptor's branch:
+    #   1. ``peer uid does not resolve to a username; closing connection``
+    #   2. ``uid=7777``
+    # Combining them protects against an unrelated warn line that
+    # happens to mention "uid=7777" or "closing connection".
+    assert "peer uid does not resolve to a username" in journal, (
+        f"sandboxd journal missing acceptor's no-resolve warn line:\n"
+        f"{journal}"
+    )
+    assert f"uid={TEST_UID_NOPASSWD}" in journal or f"uid=\"{TEST_UID_NOPASSWD}\"" in journal, (
+        f"sandboxd journal missing uid={TEST_UID_NOPASSWD} marker:\n"
+        f"{journal}"
+    )
+
+    # ---------------- Recovery assertion ----------------
+    #
+    # The daemon recovered cleanly: a subsequent connection from a
+    # resolvable uid (alice) lands and the daemon emits a valid
+    # response. We use the CLI ``sandbox ps`` as the simplest probe —
+    # it sends ``GET /sessions`` which the daemon handles end-to-end
+    # for any caller in the ``sandbox`` group. Empty session list is
+    # fine; we only need a 200.
+    r = vm.shell(
+        f"sudo -u alice env SANDBOX_SOCKET={DAEMON_SOCK} "
+        "/usr/local/bin/sandbox ps",
+        timeout=30,
+    )
+    assert r.returncode == 0, (
+        f"sandbox ps as alice failed after the no-passwd close (the daemon "
+        f"should have recovered):\nstdout:\n{r.stdout}\nstderr:\n{r.stderr}"
     )
 
 
