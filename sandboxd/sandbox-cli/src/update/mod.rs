@@ -711,11 +711,50 @@ pub fn render_dry_run<W: Write>(
     )?;
     writeln!(out)?;
 
-    writeln!(out, "Stateful (§ 3.2) — would execute:")?;
+    writeln!(out, "Stateful (§ 3.2) — projected:")?;
     // The 18 stateful steps, in spec order. Per § 2.3 the verdict is
-    // either "would execute" or "would skip" — we render every step as
-    // "would execute" here because the skip-on-match (idempotency
-    // shortcut) computation is not yet implemented.
+    // either "would execute" or "would skip" — we now project the
+    // per-step idempotency check onto the read-only inputs so the
+    // operator sees which steps are no-ops against the current
+    // state. The exit criterion for M16-S7 is: an up-to-date
+    // installation labels every applicable step `would skip`.
+    //
+    // Step verdicts:
+    //
+    // - Steps that never have an idempotency shortcut (they always
+    //   converge by re-running their setup logic, even if that
+    //   logic is a no-op) stay `would execute`: § 3.2.13 (lock
+    //   acquire), § 3.2.19 (manifest write), § 3.2.25 (prune
+    //   no-op when nothing eligible), § 3.2.26 (daemon start),
+    //   § 3.2.27 (version verify), § 3.2.28 (doctor), § 3.2.29
+    //   (install-state finalize), § 3.2.30 (lock release).
+    //
+    // - Steps that have a "destination already matches source"
+    //   idempotency shortcut (sha256-compared file copies, image
+    //   already loaded, caps already set) flip to `would skip`
+    //   when the current install is at the target version: every
+    //   file the step writes is byte-identical with the on-disk
+    //   destination.
+    //
+    // - § 3.2.14 (stop daemon) skips when the daemon is not
+    //   running (the on-disk `was_running` probe runs at start
+    //   time; --dry-run cannot reach the daemon-running probe
+    //   from a read-only pre-flight, so we render this as `would
+    //   execute` outside the up-to-date case).
+    //
+    // - § 3.2.24 (apply config migrations) skips when the
+    //   pre-flight enumerated zero pending migrations (already
+    //   surfaced in § 3.1.11).
+    //
+    // Treating "current == target" as the gate for the
+    // sha256-shortcut steps is a conservative projection: a fresh
+    // update against an older install MUST execute each of these
+    // (the sources differ from the destinations on disk), so the
+    // `would execute` verdict is correct there. The projection
+    // shape is captured in [`stateful_step_verdict`] so the rules
+    // can be unit-tested in isolation.
+    let up_to_date = matches!(r.compare, VersionCompare::UpToDate);
+    let has_pending_migrations = !r.pending_config_migrations.is_empty();
     let steps: [(&str, &str); 18] = [
         ("§ 3.2.13", "acquire lock"),
         ("§ 3.2.14", "stop daemon"),
@@ -737,7 +776,8 @@ pub fn render_dry_run<W: Write>(
         ("§ 3.2.30", "release lock"),
     ];
     for (id, name) in steps {
-        writeln!(out, "  ✓ {id} {name:<28}  would execute")?;
+        let verdict = stateful_step_verdict(id, up_to_date, has_pending_migrations);
+        writeln!(out, "  ✓ {id} {name:<28}  {verdict}")?;
     }
     writeln!(out)?;
     writeln!(
@@ -745,6 +785,65 @@ pub fn render_dry_run<W: Write>(
         "Run `sudo sandbox update` (without --dry-run) to apply."
     )?;
     Ok(())
+}
+
+/// Project the per-step idempotency check onto the read-only
+/// `--dry-run` inputs. Returns `"would skip"` when the step is
+/// projected to be a no-op against the current install, `"would
+/// execute"` otherwise. Spec 5 § 2.3.
+///
+/// `up_to_date` is `current_installed_version == target_version`:
+/// the pre-condition under which every sha256-compared file copy
+/// would find the destination matching the source and short-circuit.
+/// `has_pending_migrations` flips § 3.2.24's verdict.
+///
+/// The projection deliberately stays read-only — it does NOT shell
+/// out to compare actual on-disk sha256s or query docker / setcap
+/// state. Doing so would (a) repeat work the stateful phase already
+/// guards, (b) require sudo, and (c) couple the dry-run renderer to
+/// production-only paths. The "current == target" gate is the
+/// minimum that fulfils the M16-S7 exit criterion ("up-to-date
+/// installation labels every applicable step `would skip`") without
+/// over-promising on a stale install where some steps may still be
+/// idempotent (e.g. systemd unit at the same path with identical
+/// bytes despite a binary delta).
+pub fn stateful_step_verdict(
+    step_id: &str,
+    up_to_date: bool,
+    has_pending_migrations: bool,
+) -> &'static str {
+    // The steps that always execute regardless of state — lock
+    // acquisition, manifest write, the post-install verification
+    // chain (start/version/doctor/state/lock-release), and
+    // retention prune (a no-op when nothing is eligible, but still
+    // runs the enumeration).
+    match step_id {
+        "§ 3.2.13" | "§ 3.2.19" | "§ 3.2.25" | "§ 3.2.26" | "§ 3.2.27" | "§ 3.2.28"
+        | "§ 3.2.29" | "§ 3.2.30" => return "would execute",
+        _ => {}
+    }
+    // § 3.2.24 — config migration apply: skips when no pending.
+    if step_id == "§ 3.2.24" {
+        return if has_pending_migrations {
+            "would execute"
+        } else {
+            "would skip"
+        };
+    }
+    // § 3.2.14 (stop daemon) — without a running-daemon probe in
+    // the read-only pre-flight we conservatively render `would
+    // execute` outside the up-to-date case. On an up-to-date
+    // install there is no operator-intent to swap binaries, so we
+    // also mark this `would skip` (the daemon would not be stopped
+    // because nothing else mutates).
+    //
+    // Every other step with a sha256 / image-presence / caps /
+    // unit-bytes idempotency shortcut: skip when current == target.
+    if up_to_date {
+        "would skip"
+    } else {
+        "would execute"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2699,6 +2798,138 @@ mod tests {
             s.contains("Run `sudo sandbox update` to apply."),
             "got:\n{s}"
         );
+    }
+
+    /// `--dry-run` against an up-to-date install must label every
+    /// applicable step `would skip`. M16-S7 exit criterion: the
+    /// renderer projects per-step idempotency onto the read-only
+    /// inputs so an operator can verify the update is a no-op
+    /// without invoking the stateful phase.
+    ///
+    /// The eight always-execute steps stay `would execute` per the
+    /// `stateful_step_verdict` rationale — they have no
+    /// idempotency shortcut to project; their bodies converge by
+    /// running. The remaining ten flip to `would skip` on an
+    /// up-to-date install.
+    #[test]
+    fn dry_run_up_to_date_install_labels_idempotent_steps_would_skip() {
+        let state = sample_state();
+        let report = CheckReport {
+            state: &state,
+            target_version: &state.installed_version, // up to date
+            target_arch: "x86_64-unknown-linux-gnu",
+            target_released_at: None,
+            compare: VersionCompare::UpToDate,
+            pending_config_migrations: vec![],
+            session_counts: SessionCounts {
+                active: 0,
+                stopped: 0,
+                reachable: true,
+            },
+        };
+        let disk = DiskCheck {
+            rows: vec![DiskRow {
+                path: PathBuf::from("/tmp"),
+                free_kb: 9_000_000,
+                needed_kb: 1024 * 1024,
+            }],
+        };
+        let mut out = Vec::new();
+        render_dry_run(&mut out, &report, &disk).unwrap();
+        let s = String::from_utf8(out).unwrap();
+
+        // Every step with a sha256 / image-presence / caps /
+        // unit-bytes idempotency shortcut must read `would skip`
+        // on an up-to-date install. § 3.2.14 (stop daemon) is in
+        // the up-to-date skip group per the projection rationale.
+        for id in [
+            "§ 3.2.14",
+            "§ 3.2.15",
+            "§ 3.2.16",
+            "§ 3.2.17",
+            "§ 3.2.18",
+            "§ 3.2.20",
+            "§ 3.2.21",
+            "§ 3.2.22",
+            "§ 3.2.23",
+            "§ 3.2.24",
+        ] {
+            let needle = format!("{id} ");
+            let line = s
+                .lines()
+                .find(|l| l.contains(&needle))
+                .unwrap_or_else(|| panic!("step {id} missing from dry-run:\n{s}"));
+            assert!(
+                line.contains("would skip"),
+                "step {id} must read `would skip` on an up-to-date install; got: {line}"
+            );
+        }
+
+        // The always-execute steps still read `would execute`.
+        for id in [
+            "§ 3.2.13",
+            "§ 3.2.19",
+            "§ 3.2.25",
+            "§ 3.2.26",
+            "§ 3.2.27",
+            "§ 3.2.28",
+            "§ 3.2.29",
+            "§ 3.2.30",
+        ] {
+            let needle = format!("{id} ");
+            let line = s
+                .lines()
+                .find(|l| l.contains(&needle))
+                .unwrap_or_else(|| panic!("step {id} missing from dry-run:\n{s}"));
+            assert!(
+                line.contains("would execute"),
+                "step {id} must read `would execute` (always-execute step); got: {line}"
+            );
+        }
+    }
+
+    /// `stateful_step_verdict` projects the per-step idempotency
+    /// rules without touching the renderer. Pin a few critical
+    /// rows: § 3.2.13 always executes (lock acquire), § 3.2.21
+    /// flips with up-to-date, § 3.2.24 flips with the pending-
+    /// migrations bool.
+    #[test]
+    fn stateful_step_verdict_rules() {
+        // Always-execute steps ignore both inputs.
+        for id in [
+            "§ 3.2.13",
+            "§ 3.2.19",
+            "§ 3.2.25",
+            "§ 3.2.26",
+            "§ 3.2.27",
+            "§ 3.2.28",
+            "§ 3.2.29",
+            "§ 3.2.30",
+        ] {
+            assert_eq!(stateful_step_verdict(id, true, true), "would execute");
+            assert_eq!(stateful_step_verdict(id, true, false), "would execute");
+            assert_eq!(stateful_step_verdict(id, false, true), "would execute");
+            assert_eq!(stateful_step_verdict(id, false, false), "would execute");
+        }
+        // sha256-shortcut steps: flip on up-to-date.
+        for id in [
+            "§ 3.2.15",
+            "§ 3.2.16",
+            "§ 3.2.17",
+            "§ 3.2.20",
+            "§ 3.2.21",
+            "§ 3.2.22",
+            "§ 3.2.23",
+        ] {
+            assert_eq!(stateful_step_verdict(id, true, false), "would skip");
+            assert_eq!(stateful_step_verdict(id, false, false), "would execute");
+        }
+        // § 3.2.24 flips on pending-migrations independently of
+        // up-to-date.
+        assert_eq!(stateful_step_verdict("§ 3.2.24", false, true), "would execute");
+        assert_eq!(stateful_step_verdict("§ 3.2.24", false, false), "would skip");
+        assert_eq!(stateful_step_verdict("§ 3.2.24", true, true), "would execute");
+        assert_eq!(stateful_step_verdict("§ 3.2.24", true, false), "would skip");
     }
 
     /// `--dry-run` lists all 18 stateful step ids (§§ 3.2.13-3.2.30).
