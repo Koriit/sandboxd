@@ -203,11 +203,10 @@ def test_update_preserves_customized_users_conf(
     # Feed the staged-directory shape (`--from <dir>`), not the tarball:
     # the CLI's § 3.1.10 sigstore precondition only fires when
     # `from.is_file()` is true, so a directory short-circuits the
-    # cosign call. The test harness has no host-side cosign binary at
-    # the canonical path (`_COSIGN_BOOTSTRAP_REPLACEMENT` in conftest.py
-    # patches install.sh's bootstrap to a no-op), so a `--from <tarball>`
-    # invocation would fail before reaching the users.conf-preservation
-    # contract under test (Spec 1 § 5.5, Spec 5 § 4.5).
+    # cosign call. Going through `--from <tarball>` would route
+    # through cosign verify-blob and add noise that obscures the
+    # users.conf-preservation contract under test (Spec 1 § 5.5,
+    # Spec 5 § 4.5).
     bumped_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64_bumped)
     bumped_ver = version_from_tarball(bumped_in_vm)
     stage_dir = "/tmp/sandbox-update-preserves-users-stage"
