@@ -3379,15 +3379,73 @@ mod tests {
 
     /// `enumerate_pending_config_migrations` returns an empty vec when
     /// the canonical paths are unreadable — the read-only modes degrade
-    /// gracefully.
+    /// gracefully — and a list of well-shaped `PendingMigration` entries
+    /// when they ARE readable and below-latest.
+    ///
+    /// The previous shape `assert!(got.iter().all(|m| !m.name.is_empty()))`
+    /// was vacuously true on an empty vec — a regression that returned
+    /// a vec of garbage entries with empty `.name` strings would have
+    /// also passed on a dev host that happens to have a readable
+    /// users.conf. The fix splits into two branches:
+    ///
+    /// - If the canonical paths are not readable (no users.conf, or
+    ///   permission denied for the test's uid): the function MUST
+    ///   return an empty vec. We pin that exactly.
+    /// - If a path IS readable and below-latest: each returned entry
+    ///   must have a non-empty `name` AND a non-empty `target_file`
+    ///   (the field-shape invariant the original vacuous assertion
+    ///   was trying to express but couldn't reach on an empty vec).
+    ///
+    /// The branch is determined at test time by probing the canonical
+    /// users.conf path for read access; the test does not skip — it
+    /// runs the appropriate set of assertions for the host state it
+    /// observes.
     #[test]
     fn enumerate_pending_returns_empty_when_paths_absent() {
-        // Running this test in a clean environment: /etc/sandboxd/users.conf
-        // either does not exist or is not readable. Either way the
-        // result is an empty Vec (the function's `continue` arms
-        // tolerate both).
         let got = enumerate_pending_config_migrations();
-        assert!(got.iter().all(|m| !m.name.is_empty()));
+
+        // Probe the canonical path the way `enumerate_pending_config_migrations`
+        // does internally: try to read it. If `std::fs::read` succeeds,
+        // the host has the file readable by the test's uid and we
+        // expect a populated vec; otherwise empty.
+        //
+        // `users_conf_path()` resolves the canonical or env-override
+        // location depending on the daemon build; reuse the same
+        // resolver so the test follows the function under test rather
+        // than reaching past it.
+        let canonical_readable =
+            std::fs::read(sandbox_core::users_conf::users_conf_path()).is_ok();
+
+        if canonical_readable {
+            // A dev host with /etc/sandboxd/users.conf readable. The
+            // returned entries (if any) must each carry a non-empty
+            // name and a non-empty target_file — pin the field-shape
+            // invariant directly rather than via `iter().all(...)`
+            // which would still vacuously pass on a fully-up-to-date
+            // file.
+            for entry in &got {
+                assert!(
+                    !entry.name.is_empty(),
+                    "PendingMigration `name` must be non-empty; got: {entry:?}"
+                );
+                assert!(
+                    !entry.target_file.is_empty(),
+                    "PendingMigration `target_file` must be non-empty; got: {entry:?}"
+                );
+            }
+        } else {
+            // Clean environment (the spec contract this test
+            // originally claimed to pin): canonical path is not
+            // readable, so the function returns an empty vec — the
+            // `continue` arms in `enumerate_pending_config_migrations`
+            // tolerate both ENOENT and EACCES.
+            assert!(
+                got.is_empty(),
+                "canonical paths are unreadable but the function returned {got:?}; \
+                 the `continue` arms must keep the outer Vec empty under either \
+                 ENOENT or EACCES"
+            );
+        }
     }
 
     /// **Exit-criterion 5:** `sandbox update --from <dir>` with a

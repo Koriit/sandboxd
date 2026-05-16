@@ -1772,6 +1772,171 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // Negative-input branches in migrate_v001 (defensive coverage).
+    //
+    // The function is permissive on shape so a corrupted users.conf
+    // does not crash the migration walk — instead unparseable bytes
+    // ride through unchanged and the daemon-side schema validator
+    // (`validate_users_conf_schema_version` below) surfaces the
+    // problem with a typed error. These tests pin each "this is not
+    // a shape I understand, so I'll skip the transform" branch the
+    // function takes (lines 526-527 for top-level non-object; lines
+    // 535-543 for `subnets` not-an-array / entry not-an-object /
+    // `allow_users` not-an-array / `allow_users`-absent).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn v001_non_object_top_level_rides_through_unchanged() {
+        // The transform's first match-or-else returns `value`
+        // verbatim when the top level isn't an object — the V001
+        // transform has nothing to do with a scalar / array / null
+        // root, so the input passes through and the
+        // schema-version validator downstream surfaces the shape
+        // problem with a clear error.
+        let scalar = serde_json::Value::Number(42u32.into());
+        assert_eq!(migrate_v001(scalar.clone()), scalar);
+
+        let array = serde_json::json!([1, 2, 3]);
+        assert_eq!(migrate_v001(array.clone()), array);
+
+        let null = serde_json::Value::Null;
+        assert_eq!(migrate_v001(null.clone()), null);
+
+        let string = serde_json::Value::String("not-a-config".to_string());
+        assert_eq!(migrate_v001(string.clone()), string);
+    }
+
+    #[test]
+    fn v001_subnets_not_array_stamps_version_only() {
+        // Top-level object with a `subnets` that is NOT an array:
+        // the V001 transform takes the `else { continue }`-style
+        // arm (the `Some(Array(_))` pattern fails to match), so the
+        // function still stamps `_schema_version` at the top level
+        // but does not touch the malformed `subnets` field.
+        let input = serde_json::json!({
+            "subnets": "this is a string, not an array",
+        });
+        let output = migrate_v001(input.clone());
+        let obj = output.as_object().expect("top stays object");
+        assert_eq!(obj.get("_schema_version"), Some(&serde_json::json!(1)));
+        assert_eq!(
+            obj.get("subnets"),
+            Some(&serde_json::json!("this is a string, not an array")),
+            "malformed subnets must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn v001_subnets_absent_stamps_version_only() {
+        // Top-level object with NO `subnets` key at all: the
+        // transform stamps `_schema_version` and does not synthesise
+        // a subnets field (V001 is not a "fill in missing defaults"
+        // pass — that's the parent application's job).
+        let input = serde_json::json!({
+            "comment": "users config without subnets is non-canonical but tolerated"
+        });
+        let output = migrate_v001(input);
+        let obj = output.as_object().expect("top stays object");
+        assert_eq!(obj.get("_schema_version"), Some(&serde_json::json!(1)));
+        assert!(
+            obj.get("subnets").is_none(),
+            "V001 must not synthesise a `subnets` field when input has none"
+        );
+        assert_eq!(
+            obj.get("comment"),
+            Some(&serde_json::json!(
+                "users config without subnets is non-canonical but tolerated"
+            )),
+            "unrelated keys must ride through unchanged"
+        );
+    }
+
+    #[test]
+    fn v001_subnet_entry_not_object_rides_through() {
+        // `subnets[i]` is not an object — the inner
+        // `let Some(entry_obj) = entry.as_object_mut() else { continue }`
+        // arm fires; the malformed entry is skipped without crashing
+        // the loop, and any well-formed siblings are still migrated.
+        let input = serde_json::json!({
+            "subnets": [
+                "junk-not-an-object",
+                { "cidr": "10.209.0.0/24", "allow_users": ["alice"] }
+            ]
+        });
+        let output = migrate_v001(input);
+        let subnets = output["subnets"].as_array().expect("subnets array");
+        assert_eq!(subnets.len(), 2, "loop must visit every entry");
+        // The malformed entry rides through unchanged.
+        assert_eq!(subnets[0], serde_json::json!("junk-not-an-object"));
+        // The well-formed sibling was migrated normally.
+        assert_eq!(
+            subnets[1].get("allow_users"),
+            Some(&serde_json::json!(["sandbox", "alice"])),
+            "well-formed sibling entries must still be migrated"
+        );
+    }
+
+    #[test]
+    fn v001_allow_users_not_array_rides_through() {
+        // `subnets[i].allow_users` is not an array — the inner
+        // `let Some(Array(allow_users)) = entry_obj.get_mut("allow_users") else { continue }`
+        // arm fires; the entry is skipped (no `"sandbox"` insertion)
+        // but other fields on the same entry survive.
+        let input = serde_json::json!({
+            "subnets": [
+                {
+                    "cidr": "10.209.0.0/24",
+                    "allow_users": "this should be an array",
+                    "comment": "alice prod"
+                }
+            ]
+        });
+        let output = migrate_v001(input);
+        let entry = output["subnets"][0].as_object().expect("entry is object");
+        // allow_users left unchanged (no prepended "sandbox").
+        assert_eq!(
+            entry.get("allow_users"),
+            Some(&serde_json::json!("this should be an array"))
+        );
+        // The companion fields ride through.
+        assert_eq!(entry.get("cidr"), Some(&serde_json::json!("10.209.0.0/24")));
+        assert_eq!(entry.get("comment"), Some(&serde_json::json!("alice prod")));
+        // Top-level schema version stamped, as always.
+        assert_eq!(
+            output.get("_schema_version"),
+            Some(&serde_json::json!(1))
+        );
+    }
+
+    #[test]
+    fn v001_allow_users_absent_rides_through() {
+        // The entry is an object but has no `allow_users` key — the
+        // same `else { continue }` arm fires from a different angle
+        // (`get_mut("allow_users")` returns `None`). The transform
+        // does not synthesise an `allow_users` field; it leaves the
+        // entry intact and stamps the top-level version.
+        let input = serde_json::json!({
+            "subnets": [
+                {
+                    "cidr": "10.209.0.0/24",
+                    "comment": "missing allow_users — defensive shape"
+                }
+            ]
+        });
+        let output = migrate_v001(input);
+        let entry = output["subnets"][0].as_object().expect("entry is object");
+        assert!(
+            entry.get("allow_users").is_none(),
+            "V001 must not synthesise `allow_users` when absent"
+        );
+        assert_eq!(entry.get("cidr"), Some(&serde_json::json!("10.209.0.0/24")));
+        assert_eq!(
+            output.get("_schema_version"),
+            Some(&serde_json::json!(1))
+        );
+    }
+
+    // -----------------------------------------------------------------
     // Daemon-side schema-version validator (Spec 5 § 4.7).
     //
     // Construct a `UsersConfig` directly with the field we want to drive;

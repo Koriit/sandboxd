@@ -498,6 +498,14 @@ mod tests {
         .expect("first acquire");
         assert_eq!(holder.payload().pid, 11111);
 
+        // Capture the holder's on-disk payload bytes *before* the
+        // second acquisition attempts to touch the file. The refuse
+        // path must NOT mutate the lock file — the on-disk payload
+        // must continue to point at the live holder so a subsequent
+        // operator inspection (`cat /var/lib/sandbox/.update.lock`)
+        // still names the right pid.
+        let on_disk_before = std::fs::read(&path).expect("read on-disk payload");
+
         // Second acquisition with the predecessor PID reported as
         // *alive* must refuse.
         let err = acquire(AcquireParams {
@@ -516,7 +524,211 @@ mod tests {
             LockError::HeldByLivePid { pid } => assert_eq!(pid, 11111),
             other => panic!("expected HeldByLivePid, got {other:?}"),
         }
+
+        // On-disk payload must be byte-identical to what the holder
+        // wrote — the refuse branch must not have overwritten the
+        // live holder's pid/started_at with the attempted-new
+        // 22222 values.
+        let on_disk_after = std::fs::read(&path).expect("read on-disk payload after refuse");
+        assert_eq!(
+            on_disk_before, on_disk_after,
+            "refuse branch must not mutate the on-disk payload; \
+             operator inspection of the lock file must continue to name the live holder"
+        );
+        let parsed: LockPayload =
+            serde_json::from_slice(&on_disk_after).expect("on-disk payload still parses");
+        assert_eq!(
+            parsed.pid, 11111,
+            "on-disk pid must remain the live holder's (11111); got {parsed:?}"
+        );
+
         drop(holder);
+    }
+
+    /// § 6.4 (on-disk half): the sticky `was_running` byte that
+    /// `lock_file_acquisition_preserves_was_running_across_adopt`
+    /// asserts in-memory must also reach disk under the held flock,
+    /// so an operator reading the lock file post-adopt sees the
+    /// stickied value. Without this on-disk assertion, a regression
+    /// that updated only `UpdateLock::payload` (the in-memory copy)
+    /// without writing through `write_payload` would still pass the
+    /// in-memory test.
+    #[test]
+    fn lock_file_acquisition_preserves_was_running_on_disk() {
+        let (_dir, path) = tmp_lock_path();
+        let recent = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        // Predecessor wrote was_running=true.
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&LockPayload {
+                pid: 99999,
+                started_at: recent,
+                target_version: "1.1.0".to_string(),
+                from_version: "1.0.0".to_string(),
+                was_running: true,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Probe says "not running now"; the sticky must override.
+        let held = acquire(AcquireParams {
+            path: &path,
+            target_version: "1.1.0",
+            from_version: "1.0.0",
+            probe_was_running: &never_running,
+            is_pid_alive: &always_dead,
+            self_pid: Some(22222),
+            started_at: None,
+            // Keep the on-disk file after Drop so we can read its
+            // contents back; suppress the unlink. Tests use this
+            // hook (see `suppress_drop_unlink` field doc); production
+            // never sets it.
+            suppress_drop_unlink: true,
+        })
+        .expect("adopt succeeds");
+        assert!(held.payload().was_running, "in-memory sticky flag");
+
+        let on_disk: LockPayload =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).expect("parse on-disk");
+        assert!(
+            on_disk.was_running,
+            "on-disk sticky flag must match in-memory; got {on_disk:?}"
+        );
+        // Belt-and-suspenders: the on-disk pid must also be the
+        // adopter's, confirming the write happened.
+        assert_eq!(on_disk.pid, 22222);
+
+        // Explicit drop while the file is still alive (suppress_unlink
+        // is true). Test cleanup falls through to the tempdir on
+        // tempdir drop.
+        drop(held);
+    }
+
+    /// `LockError::Open` is the operator-visible mapping for "the
+    /// lockfile's parent directory does not exist" — the
+    /// `OpenOptions::open` call returns `ENOENT`, the `map_err` arm
+    /// wraps it as `Open { path, source }`. Coverage gap:
+    /// previously every test ran against a tempdir whose parent
+    /// existed, so the mapping was never exercised under cargo
+    /// llvm-cov.
+    #[test]
+    fn acquire_returns_open_error_on_missing_parent_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Parent dir does not exist — `nested/dir` is uncreated.
+        let path = dir.path().join("nested/dir/.update.lock");
+        assert!(
+            !path.parent().unwrap().exists(),
+            "test precondition: parent dir must not yet exist"
+        );
+
+        let err = acquire(AcquireParams {
+            path: &path,
+            target_version: "1.1.0",
+            from_version: "1.0.0",
+            probe_was_running: &always_running,
+            is_pid_alive: &always_dead,
+            self_pid: Some(11111),
+            started_at: Some("2026-05-11T00:00:00Z".to_string()),
+            suppress_drop_unlink: false,
+        })
+        .expect_err("must fail when parent dir is missing");
+
+        match err {
+            LockError::Open {
+                path: reported_path,
+                source,
+            } => {
+                assert_eq!(
+                    reported_path, path,
+                    "Open variant must carry the path that failed to open; got {reported_path:?}"
+                );
+                assert_eq!(
+                    source.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "underlying io::Error must surface ENOENT; got kind {:?}",
+                    source.kind()
+                );
+            }
+            other => panic!("expected LockError::Open, got {other:?}"),
+        }
+    }
+
+    /// Spec § 6.2.3: the dead-PID retry branch. When the prior PID
+    /// is reported dead, the helper sleeps briefly and retries
+    /// `flock` once. If a *competing* adopter takes the flock during
+    /// the sleep, the retry also fails — surfaced as
+    /// `LockError::BusyAfterRetry` per the variant.
+    ///
+    /// Synthesising the race: open the lockfile in the test
+    /// process, take the kernel flock and hold it across the
+    /// `acquire` call. The acquire path reads the prior payload
+    /// (dead pid), sleeps 1s, retries, fails again — and returns
+    /// `BusyAfterRetry`. The 1s sleep is intentional in the
+    /// production path (race window) and unavoidable in the test;
+    /// this is the single test that exercises it.
+    #[test]
+    fn acquire_returns_busy_after_retry_when_competing_adopter_wins() {
+        let (_dir, path) = tmp_lock_path();
+        // Seed a payload whose pid we'll report as dead. The
+        // payload bytes do not need to be parseable — the dead-PID
+        // retry branch fires regardless of whether the payload
+        // parses, as long as the flock attempt fails. Use a
+        // well-formed payload anyway so the read_payload step
+        // doesn't trip a tracing::warn that would clutter the test
+        // log.
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&LockPayload {
+                pid: 99999,
+                started_at: chrono::Utc::now()
+                    .format("%Y-%m-%dT%H:%M:%SZ")
+                    .to_string(),
+                target_version: "1.1.0".to_string(),
+                from_version: "1.0.0".to_string(),
+                was_running: false,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Take the flock from this test process and hold it across
+        // the `acquire` call below. The acquire helper opens its
+        // own FD on the same inode; its non-blocking flock will
+        // EWOULDBLOCK both times.
+        let competing = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open competing FD");
+        #[allow(deprecated)]
+        flock(competing.as_raw_fd(), FlockArg::LockExclusiveNonblock)
+            .expect("test fixture: competing flock must succeed");
+
+        let err = acquire(AcquireParams {
+            path: &path,
+            target_version: "1.1.0",
+            from_version: "1.0.0",
+            probe_was_running: &never_running,
+            // Prior pid is dead — fires the retry branch (not the
+            // HeldByLivePid branch).
+            is_pid_alive: &always_dead,
+            self_pid: Some(22222),
+            started_at: None,
+            suppress_drop_unlink: false,
+        })
+        .expect_err("must fail because competing flock blocks both attempts");
+
+        assert!(
+            matches!(err, LockError::BusyAfterRetry),
+            "dead-pid retry that finds another adopter holding the flock must \
+             surface as LockError::BusyAfterRetry; got {err:?}"
+        );
+
+        // Release the competing flock explicitly via drop. The
+        // tempdir's recursive cleanup handles the lockfile on
+        // tempdir Drop.
+        drop(competing);
     }
 
     /// § 6.2.3 row 3: file present + flock released + PID dead → adopt.
