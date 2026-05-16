@@ -291,6 +291,18 @@ def release_tarball_x86_64(sigstore_stack) -> Path:
       fixture's check (`release_tarball_x86_64_bumped` below) so a
       workspace ``.rs`` edit invalidates the cached tarball.
       ``SANDBOX_RELEASE_FORCE_REBUILD=1`` overrides.
+    * Re-sign (without rebuilding binaries) when the cached
+      ``.sigstore`` bundle is older than the live stack's rekor public
+      key (``sigstore-stack/state/rekor.pub.cached.pem``). The local
+      Rekor instance runs with ``--rekor_server.signer=memory``, so
+      every container restart mints a fresh key. A bundle signed by a
+      previous run encodes a logID derived from the now-defunct key;
+      cosign verify-blob rejects it with ``rekor log public key not
+      found for payload``. The fixture detects this by comparing
+      mtimes — ``sigstore_stack`` writes the rekor pubkey cache file
+      on every bring-up — and re-drives ``build-local-tarball.sh``
+      with ``SANDBOX_RELEASE_SKIP_BUILD=1`` to re-stage + re-sign
+      without paying the cargo cost.
 
     Without the mtime guard, an iteration cycle that edits Rust code and
     re-runs pytest would happily reuse a stale tarball whose binaries
@@ -305,11 +317,25 @@ def release_tarball_x86_64(sigstore_stack) -> Path:
     ver = _read_workspace_version()
     arch = "x86_64-unknown-linux-gnu"
     tarball = DIST_DIR / f"sandboxd-{ver}-{arch}.tar.gz"
+    bundle = Path(f"{tarball}.sigstore")
+    rekor_pub_cache = SIGSTORE_STACK_DIR / "state" / "rekor.pub.cached.pem"
 
     force_rebuild = os.environ.get("SANDBOX_RELEASE_FORCE_REBUILD") == "1"
     stale = (
         not tarball.exists()
         or tarball.stat().st_mtime < _newest_rs_mtime()
+    )
+    # Bundle is stale relative to the live rekor key when the
+    # sigstore_stack fixture (which writes rekor_pub_cache on every
+    # bring-up) wrote a newer file than the cached bundle. A non-empty
+    # bundle is the canonical "tarball was signed against a previous
+    # stack run" signal — a zero-byte stub is the stack-down fallback
+    # and never triggers re-sign.
+    bundle_stale = (
+        bundle.exists()
+        and bundle.stat().st_size > 0
+        and rekor_pub_cache.exists()
+        and bundle.stat().st_mtime < rekor_pub_cache.stat().st_mtime
     )
 
     if force_rebuild or stale:
@@ -317,6 +343,18 @@ def release_tarball_x86_64(sigstore_stack) -> Path:
             [str(HERE / "build-local-tarball.sh")],
             check=True,
             timeout=1800,
+        )
+    elif bundle_stale:
+        # Cargo + gateway artefacts are still fresh; only re-stage,
+        # re-tar, and re-sign. Pays no cargo build cost.
+        env = os.environ.copy()
+        env["SANDBOX_RELEASE_SKIP_BUILD"] = "1"
+        env["SANDBOX_RELEASE_SKIP_GATEWAY"] = "1"
+        subprocess.run(
+            [str(HERE / "build-local-tarball.sh")],
+            check=True,
+            timeout=600,
+            env=env,
         )
 
     assert tarball.exists(), f"tarball not produced: {tarball}"
@@ -417,11 +455,23 @@ def release_tarball_x86_64_bumped(release_tarball_x86_64, sigstore_stack) -> Pat
 
     arch = "x86_64-unknown-linux-gnu"
     tarball = DIST_DIR / f"sandboxd-{bumped_ver}-{arch}.tar.gz"
+    bundle = Path(f"{tarball}.sigstore")
+    rekor_pub_cache = SIGSTORE_STACK_DIR / "state" / "rekor.pub.cached.pem"
 
     force_rebuild = os.environ.get("SANDBOX_RELEASE_FORCE_REBUILD") == "1"
     stale = (
         not tarball.exists()
         or tarball.stat().st_mtime < _newest_rs_mtime()
+    )
+    # Mirror release_tarball_x86_64's bundle-staleness check: the local
+    # Rekor signer is memory-only, so every stack restart invalidates
+    # any previously-written .sigstore bundle. Re-sign without rebuild
+    # via SANDBOX_RELEASE_SKIP_BUILD=1.
+    bundle_stale = (
+        bundle.exists()
+        and bundle.stat().st_size > 0
+        and rekor_pub_cache.exists()
+        and bundle.stat().st_mtime < rekor_pub_cache.stat().st_mtime
     )
 
     if force_rebuild or stale:
@@ -438,6 +488,17 @@ def release_tarball_x86_64_bumped(release_tarball_x86_64, sigstore_stack) -> Pat
             check=True,
             timeout=3600,  # first build is slow: every crate rebuilds
                             # because CARGO_PKG_VERSION env-var changes.
+            env=env,
+        )
+    elif bundle_stale:
+        env = os.environ.copy()
+        env["SANDBOX_RELEASE_BUMP_VERSION"] = bumped_ver
+        env["SANDBOX_RELEASE_SKIP_BUILD"] = "1"
+        env["SANDBOX_RELEASE_SKIP_GATEWAY"] = "1"
+        subprocess.run(
+            [str(HERE / "build-local-tarball.sh")],
+            check=True,
+            timeout=600,
             env=env,
         )
 
@@ -502,10 +563,18 @@ def release_tarball_x86_64_bumped_chain(release_tarball_x86_64, sigstore_stack) 
     chain_tarballs = []
     force_rebuild = os.environ.get("SANDBOX_RELEASE_FORCE_REBUILD") == "1"
     newest_rs = _newest_rs_mtime()
+    rekor_pub_cache = SIGSTORE_STACK_DIR / "state" / "rekor.pub.cached.pem"
 
     for ver in chain_versions:
         tarball = DIST_DIR / f"sandboxd-{ver}-{arch}.tar.gz"
+        bundle = Path(f"{tarball}.sigstore")
         stale = not tarball.exists() or tarball.stat().st_mtime < newest_rs
+        bundle_stale = (
+            bundle.exists()
+            and bundle.stat().st_size > 0
+            and rekor_pub_cache.exists()
+            and bundle.stat().st_mtime < rekor_pub_cache.stat().st_mtime
+        )
 
         if force_rebuild or stale:
             env = os.environ.copy()
@@ -514,6 +583,17 @@ def release_tarball_x86_64_bumped_chain(release_tarball_x86_64, sigstore_stack) 
                 [str(HERE / "build-local-tarball.sh")],
                 check=True,
                 timeout=3600,
+                env=env,
+            )
+        elif bundle_stale:
+            env = os.environ.copy()
+            env["SANDBOX_RELEASE_BUMP_VERSION"] = ver
+            env["SANDBOX_RELEASE_SKIP_BUILD"] = "1"
+            env["SANDBOX_RELEASE_SKIP_GATEWAY"] = "1"
+            subprocess.run(
+                [str(HERE / "build-local-tarball.sh")],
+                check=True,
+                timeout=600,
                 env=env,
             )
 
