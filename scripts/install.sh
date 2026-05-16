@@ -128,8 +128,16 @@ Install sandboxd from a signed release tarball.
 Options:
   --version <semver>        Pin install to the given release tag (default: latest).
                             Optional when --from is set: the version is read
-                            from the tarball's MANIFEST.
-  --from <path>             Use a local tarball instead of downloading.
+                            from the tarball's embedded (sigstore-signed)
+                            MANIFEST, not the tarball's filename. If both
+                            --version and --from are given, the strings must
+                            match the MANIFEST or the install aborts before
+                            any state change.
+  --from <path>             Use a local tarball instead of downloading. The
+                            path must point at a real
+                            sandboxd-<v>-<arch>.tar.gz produced by the release
+                            pipeline (the filename is operator-controlled and
+                            is not trusted — the MANIFEST is).
   --cosign-bundle <path>    Use a local sigstore bundle (requires --from).
   --source-url <url>        Override base URL for tarball download.
   --yes                     Skip every confirmation prompt.
@@ -147,9 +155,20 @@ Examples:
   # Latest tagged release.
   curl -fsSL https://Koriit.github.io/sandboxd/install.sh | bash
 
+  # Pin a specific version (network download).
+  curl -fsSL https://Koriit.github.io/sandboxd/install.sh | bash -s -- \\
+      --version 1.0.0
+
   # Air-gapped (operator already has the tarball locally).
+  # --version is optional here: the version is read from the tarball's
+  # MANIFEST, so the filename you pass to --from is never trusted on its own.
   curl -fsSL https://Koriit.github.io/sandboxd/install.sh | bash -s -- \\
       --from /path/to/sandboxd-1.0.0-x86_64-unknown-linux-gnu.tar.gz
+
+  # Air-gapped + local sigstore bundle (no network at all).
+  curl -fsSL https://Koriit.github.io/sandboxd/install.sh | bash -s -- \\
+      --from /path/to/sandboxd-1.0.0-x86_64-unknown-linux-gnu.tar.gz \\
+      --cosign-bundle /path/to/sandboxd-1.0.0-x86_64-unknown-linux-gnu.tar.gz.sigstore
 
 See https://Koriit.github.io/sandboxd/start/installation/ for the full guide.
 EOF
