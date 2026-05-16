@@ -230,16 +230,51 @@ pub fn verify_signature(tarball: &Path, bundle: Option<&Path>) -> Result<(), Fet
         });
     }
     let bundle_path = resolve_bundle_path(tarball, bundle)?;
-    let out = Command::new(COSIGN_BIN_PATH)
-        .arg("verify-blob")
+    let mut cmd = Command::new(COSIGN_BIN_PATH);
+    cmd.arg("verify-blob")
         .arg("--bundle")
         .arg(&bundle_path)
         .arg("--certificate-identity-regexp")
         .arg(COSIGN_CERT_IDENTITY_REGEXP)
         .arg("--certificate-oidc-issuer")
-        .arg(COSIGN_CERT_OIDC_ISSUER)
-        .arg(tarball)
-        .output()?;
+        .arg(COSIGN_CERT_OIDC_ISSUER);
+
+    // Test-only trust-material redirect. Mirrors install.sh's
+    // SANDBOX_INSTALL_TEST_* env vars so the install-e2e harness can
+    // run a locally-signed tarball through `sandbox update` against the
+    // local Sigstore stack — exercising the real cosign verify-blob
+    // code path end-to-end. THESE ENV VARS MUST NEVER BE SET IN
+    // PRODUCTION; they substitute the cryptographic trust root that
+    // protects operators against tampered tarballs. Deliberately
+    // undocumented (no --help mention, no entry in installation.md);
+    // mirrors the route-helper's `test-env-override` Cargo feature
+    // pattern and the install.sh SANDBOX_INSTALL_SKIP_SIGSTORE comment.
+    if let Ok(path) = std::env::var("SANDBOX_UPDATE_TEST_FULCIO_ROOT")
+        && !path.is_empty()
+    {
+        cmd.arg("--certificate-chain").arg(&path);
+    }
+    if let Ok(url) = std::env::var("SANDBOX_UPDATE_TEST_REKOR_URL")
+        && !url.is_empty()
+    {
+        cmd.arg("--rekor-url").arg(&url);
+    }
+    // cosign reads SIGSTORE_REKOR_PUBLIC_KEY / SIGSTORE_CT_LOG_PUBLIC_KEY_FILE
+    // directly from the environment; replant them under cosign's name
+    // when the harness supplied them. Empty strings are treated as
+    // unset to keep the no-op default tight.
+    if let Ok(path) = std::env::var("SANDBOX_UPDATE_TEST_REKOR_PUBLIC_KEY")
+        && !path.is_empty()
+    {
+        cmd.env("SIGSTORE_REKOR_PUBLIC_KEY", path);
+    }
+    if let Ok(path) = std::env::var("SANDBOX_UPDATE_TEST_CT_LOG_PUBLIC_KEY")
+        && !path.is_empty()
+    {
+        cmd.env("SIGSTORE_CT_LOG_PUBLIC_KEY_FILE", path);
+    }
+
+    let out = cmd.arg(tarball).output()?;
     if !out.status.success() {
         return Err(FetchError::SignatureVerifyFailed {
             stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
