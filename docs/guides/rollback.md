@@ -74,9 +74,25 @@ sudo setcap cap_net_admin,cap_sys_admin=eip /usr/local/libexec/sandboxd/sandbox-
 sudo install -m 0644 -o root -g root "$BACKUP_DIR/users.conf.bak"  /etc/sandboxd/users.conf
 sudo install -m 0644 -o root -g root "$BACKUP_DIR/bridge.conf.bak" /etc/qemu/bridge.conf
 
-# 7. Restore sessions.db. The backup is owned sandbox:sandbox at mode 0600; the
-#    explicit -o sandbox -g sandbox restores ownership.
+# 7. Restore sessions.db plus its WAL companion files. The daemon runs SQLite
+#    in WAL journal mode, so committed-but-not-checkpointed transactions live
+#    in `sessions.db-wal` (with offsets indexed in `sessions.db-shm`).
+#    Restoring only `sessions.db` would drop those in-flight commits.
+#    The `-wal` / `-shm` files may legitimately be absent in the backup set
+#    (SQLite removes them on clean close); restore each only if present.
+#    All three files are owned sandbox:sandbox at mode 0600; the explicit
+#    -o sandbox -g sandbox restores ownership.
 sudo install -m 0600 -o sandbox -g sandbox "$BACKUP_DIR/sessions.db.bak" /var/lib/sandbox/sessions.db
+if [ -f "$BACKUP_DIR/sessions.db-wal.bak" ]; then
+    sudo install -m 0600 -o sandbox -g sandbox "$BACKUP_DIR/sessions.db-wal.bak" /var/lib/sandbox/sessions.db-wal
+else
+    sudo rm -f /var/lib/sandbox/sessions.db-wal
+fi
+if [ -f "$BACKUP_DIR/sessions.db-shm.bak" ]; then
+    sudo install -m 0600 -o sandbox -g sandbox "$BACKUP_DIR/sessions.db-shm.bak" /var/lib/sandbox/sessions.db-shm
+else
+    sudo rm -f /var/lib/sandbox/sessions.db-shm
+fi
 
 # 8. Remove the stale lock file (if present from a failed update). The lock survives
 #    until the final step of the upgrade; if the upgrade exited before then, the

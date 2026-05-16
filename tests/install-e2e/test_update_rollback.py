@@ -119,6 +119,17 @@ def test_update_then_manual_rollback(
     assert len(expected_sessions_sha) == 64, (
         f"manifest sha256 malformed: {expected_sessions_sha!r}"
     )
+    # The WAL / SHM companion files may or may not be present in the backup
+    # set: SQLite removes them on clean close, so a daemon that drained its
+    # WAL before the snapshot will produce a backup without them. Capture
+    # the manifest's view so we can assert the rolled-back filesystem
+    # matches it exactly (file present at expected sha256, or absent).
+    expected_wal_sha = (
+        backup_manifest["files"].get("sessions.db-wal.bak", {}).get("sha256")
+    )
+    expected_shm_sha = (
+        backup_manifest["files"].get("sessions.db-shm.bak", {}).get("sha256")
+    )
 
     # 3. Run the rollback recipe (Spec 5 § 7.2). The recipe is split
     # into two phases here so the sessions.db sha256 can be sampled
@@ -153,6 +164,16 @@ if [ -f "$BACKUP_DIR/bridge.conf.bak" ]; then
     sudo install -m 0644 -o root -g root "$BACKUP_DIR/bridge.conf.bak" /etc/qemu/bridge.conf
 fi
 sudo install -m 0600 -o sandbox -g sandbox "$BACKUP_DIR/sessions.db.bak" /var/lib/sandbox/sessions.db
+if [ -f "$BACKUP_DIR/sessions.db-wal.bak" ]; then
+    sudo install -m 0600 -o sandbox -g sandbox "$BACKUP_DIR/sessions.db-wal.bak" /var/lib/sandbox/sessions.db-wal
+else
+    sudo rm -f /var/lib/sandbox/sessions.db-wal
+fi
+if [ -f "$BACKUP_DIR/sessions.db-shm.bak" ]; then
+    sudo install -m 0600 -o sandbox -g sandbox "$BACKUP_DIR/sessions.db-shm.bak" /var/lib/sandbox/sessions.db-shm
+else
+    sudo rm -f /var/lib/sandbox/sessions.db-shm
+fi
 sudo rm -f /var/lib/sandbox/.update.lock
 """
     r = vm.shell(rollback_phase1, timeout=120)
@@ -171,6 +192,32 @@ sudo rm -f /var/lib/sandbox/.update.lock
     assert expected_sessions_sha == post_sessions_sha, (
         f"sessions.db not restored to the backup's captured bytes: "
         f"expected={expected_sessions_sha} post={post_sessions_sha}"
+    )
+
+    # Verify the WAL / SHM companion files landed in the state the manifest
+    # records. SQLite runs in WAL journal mode (see
+    # sandbox-cli/src/update/backup.rs), so committed-but-not-checkpointed
+    # transactions live in `sessions.db-wal` with offsets indexed in
+    # `sessions.db-shm`. The rollback recipe restores both alongside
+    # `sessions.db` when the backup captured them, and removes any stale
+    # copy on disk when the backup did not capture them — the daemon must
+    # see a coherent triple, not a mismatched mix of old/new files.
+    def _post_companion_state(host_path: str) -> str | None:
+        probe = vm.shell(
+            f"sudo sh -c 'if [ -f {host_path} ]; then sha256sum {host_path} | awk \"{{print \\$1}}\"; else echo MISSING; fi'",
+            check=True, timeout=10,
+        ).stdout.strip()
+        return None if probe == "MISSING" else probe
+
+    post_wal_sha = _post_companion_state("/var/lib/sandbox/sessions.db-wal")
+    post_shm_sha = _post_companion_state("/var/lib/sandbox/sessions.db-shm")
+    assert post_wal_sha == expected_wal_sha, (
+        f"sessions.db-wal not restored to the manifest's recorded state: "
+        f"expected={expected_wal_sha!r} post={post_wal_sha!r}"
+    )
+    assert post_shm_sha == expected_shm_sha, (
+        f"sessions.db-shm not restored to the manifest's recorded state: "
+        f"expected={expected_shm_sha!r} post={post_shm_sha!r}"
     )
 
     # Phase 2 — start the daemon. Now that the sha check has landed,
