@@ -528,9 +528,103 @@ PY
 
 ( cd "$OUT_DIR" && tar -czf "${STAGE_NAME}.tar.gz" "$STAGE_NAME" )
 
-# A zero-byte sigstore stub. The harness patches cosign verify-blob to
-# always succeed, so the bundle is consumed but never parsed.
-: > "${TARBALL}.sigstore"
+# ----------------------------------------------------------------------------
+# Sign the tarball against the local Sigstore stack.
+# ----------------------------------------------------------------------------
+#
+# The install-e2e harness boots the seven-container stack under
+# tests/install-e2e/sigstore-stack/ as a pytest session-scope fixture
+# *before* this script runs, so the stack endpoints below are
+# reachable on 127.0.0.1 when we drive cosign here. We probe
+# Fulcio's /healthz once with a short deadline:
+#
+# * Probe succeeds → mint a JWT, sign the tarball, write the
+#   `.sigstore` bundle. install.sh's sigstore_verify, given the
+#   matching SANDBOX_INSTALL_TEST_* env vars, will verify the
+#   tarball cryptographically.
+#
+# * Probe fails (stack not up, no docker compose available, port
+#   collision, …) → fall back to the zero-byte sigstore stub.
+#   sigstore_verify with SANDBOX_INSTALL_SKIP_SIGSTORE=1 still
+#   accepts that shape, so the air-gapped test stays runnable on
+#   hosts without the local stack.
+#
+# The behavioural contract is "if the stack is up, the tarball gets
+# a real signature"; the conftest fixture is responsible for
+# bringing the stack up first.
+SIGSTORE_FULCIO_URL="${SIGSTORE_FULCIO_URL:-http://127.0.0.1:5555}"
+SIGSTORE_REKOR_URL="${SIGSTORE_REKOR_URL:-http://127.0.0.1:3000}"
+STACK_DIR="$SCRIPT_DIR/sigstore-stack"
+
+stack_up=0
+if command -v curl >/dev/null 2>&1; then
+    if curl -fsS --max-time 2 -o /dev/null "${SIGSTORE_FULCIO_URL}/healthz"; then
+        stack_up=1
+    fi
+fi
+
+cosign_bin="${COSIGN_BIN:-}"
+if [ -z "$cosign_bin" ]; then
+    if command -v cosign >/dev/null 2>&1; then
+        cosign_bin="$(command -v cosign)"
+    elif [ -x /tmp/cosign ]; then
+        cosign_bin="/tmp/cosign"
+    fi
+fi
+
+if [ "$stack_up" -eq 1 ] && [ -n "$cosign_bin" ] && [ -x "$cosign_bin" ]; then
+    printf 'build-local-tarball.sh: signing tarball against local Sigstore stack\n'
+
+    # Mint the JWT via the in-tree helper. We prefer the install-e2e
+    # venv's python (which has pyjwt[crypto] + cryptography installed)
+    # over the host python; the venv is a hard dep of the test suite.
+    mint_python="${PYTHON:-python3}"
+    if [ -x "$SCRIPT_DIR/.venv/bin/python" ]; then
+        mint_python="$SCRIPT_DIR/.venv/bin/python"
+    fi
+    token=$("$mint_python" "$STACK_DIR/mint_token.py")
+    if [ -z "$token" ]; then
+        printf 'build-local-tarball.sh: mint_token.py produced empty token\n' >&2
+        exit 1
+    fi
+
+    sig_path="${TARBALL}.sig.tmp"
+    cert_path="${TARBALL}.cert.tmp"
+    bundle_path="${TARBALL}.sigstore"
+
+    # SIGSTORE_CT_LOG_PUBLIC_KEY_FILE lets cosign verify the SCT
+    # tesseract returned; without it cosign 2.4.x rejects the
+    # signing-time SCT verification.
+    SIGSTORE_CT_LOG_PUBLIC_KEY_FILE="$STACK_DIR/state/ct-log/pubkey.pem" \
+    "$cosign_bin" sign-blob \
+        --identity-token "$token" \
+        --fulcio-url "$SIGSTORE_FULCIO_URL" \
+        --rekor-url "$SIGSTORE_REKOR_URL" \
+        --bundle "$bundle_path" \
+        --output-signature "$sig_path" \
+        --output-certificate "$cert_path" \
+        --yes \
+        "$TARBALL"
+
+    # The --bundle file is the production sibling-file shape that
+    # install.sh's sigstore_verify reads via --bundle. The split
+    # sig/cert files are intermediates we don't ship; keep them
+    # around for negative-test scaffolding (tampered-signature tests
+    # need a sig file separately) under their .tmp suffixes.
+    rm -f "$sig_path" "$cert_path"
+    printf 'build-local-tarball.sh: wrote sigstore bundle %s\n' "$bundle_path"
+else
+    if [ "$stack_up" -eq 0 ]; then
+        printf 'build-local-tarball.sh: local Sigstore stack not reachable at %s/healthz; emitting zero-byte sigstore stub\n' \
+            "$SIGSTORE_FULCIO_URL" >&2
+    else
+        printf 'build-local-tarball.sh: no cosign binary on PATH or /tmp/cosign; emitting zero-byte sigstore stub\n' >&2
+    fi
+    # Zero-byte stub. install.sh's sigstore_verify with
+    # SANDBOX_INSTALL_SKIP_SIGSTORE=1 still accepts this shape; the
+    # air-gapped test path uses this fallback.
+    : > "${TARBALL}.sigstore"
+fi
 
 # Cleanup intermediate stage dir but keep the gateway tar around in case
 # of SKIP_GATEWAY=1 reuse.
