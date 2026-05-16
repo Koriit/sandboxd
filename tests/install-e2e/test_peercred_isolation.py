@@ -34,13 +34,16 @@ together).
 
 from __future__ import annotations
 
+import json
 import re
 import time
+import uuid
 
 import pytest
 
 from conftest import (
     PEERCRED_CONNECTOR_VM_PATH,
+    TEST_UID_BOB,
     TEST_UID_NOPASSWD,
     copy_tarball_to_vm,
     install_multi_operator_users_conf,
@@ -475,3 +478,215 @@ def integration_owner_isolation_uid_without_passwd_closes_connection(
     )
 
 
+# ---------------------------------------------------------------------------
+# #151 — session isolation: 404 on foreign session id
+# ---------------------------------------------------------------------------
+
+def _inject_synthetic_session(vm, *, session_id, owner_username, backend="lima"):
+    """INSERT a session row directly into sessions.db with the given
+    owner. Bypasses the create-session HTTP path so the test does not
+    have to pay the cost of booting a real backend (Lima VM or
+    container).
+
+    The row's ``config_json`` is the minimal valid SessionConfig
+    serialization (``cpus``, ``memory_mb``, ``disk_gb``, ``hardened``).
+    The ``state`` is ``Stopped`` so the GET handler's runtime-status
+    enrichment short-circuits without attempting to probe a non-
+    existent backend handle.
+
+    Note: the daemon holds the sqlite connection over a mutex; SQLite
+    file-level locking lets a separate ``sqlite3`` process write while
+    the daemon is running, with brief contention at worst. For a
+    single small INSERT this is well within tolerance.
+    """
+    config_json = json.dumps(
+        {
+            "cpus": 2,
+            "memory_mb": 4096,
+            "disk_gb": 20,
+            "hardened": True,
+        }
+    )
+    # ISO-8601 timestamps with 'Z' suffix to match the daemon's
+    # ``DateTime<Utc>::to_rfc3339()`` output. SQLite stores them as
+    # TEXT; the daemon parses with ``DateTime::parse_from_rfc3339``.
+    now = "2026-05-16T00:00:00Z"
+    # Escape single quotes for shell. The values we're inserting are
+    # under our control (no operator-supplied substrings), so a
+    # heredoc-into-sqlite3 is safe.
+    sql = (
+        "INSERT INTO sessions "
+        "(id, name, state, config, created_at, updated_at, backend, "
+        " owner_username, guest_protocol_version, guest_binary_version) "
+        f"VALUES ('{session_id}', NULL, 'Stopped', '{config_json}', "
+        f"'{now}', '{now}', '{backend}', '{owner_username}', 1, '0.1.0');"
+    )
+    vm.shell(
+        f"sudo sqlite3 /var/lib/sandbox/sessions.db \"{sql}\"",
+        check=True,
+        timeout=10,
+    )
+
+
+def _parse_http_status(response_bytes):
+    """Return the integer status code from an HTTP/1.1 response, or
+    raise AssertionError with the raw bytes on a malformed response.
+
+    peercred-connector dumps the daemon's raw response to stdout; we
+    parse the status line directly rather than depending on a Python
+    HTTP client (none of which understand reading from a string).
+    """
+    text = response_bytes
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    first_line, _, rest = text.partition("\r\n")
+    parts = first_line.split(" ", 2)
+    if len(parts) < 2 or not parts[1].isdigit():
+        raise AssertionError(
+            f"malformed HTTP status line: {first_line!r}\n"
+            f"full response:\n{text!r}"
+        )
+    return int(parts[1]), rest
+
+
+@pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
+def integration_session_isolation_404_on_foreign_id(
+    distro_template,
+    vm_factory,
+    release_tarball_x86_64,
+    peercred_connector_binary,
+):
+    """A session owned by alice returns 404 when queried by bob.
+
+    Behavior pinned (Spec 2 § 5 + § 7.5 + § 9.2):
+      * A session row owned by ``owner_username = alice`` is invisible
+        to a peercred caller resolved as ``bob`` — the SessionStore
+        filter rejects foreign-owner rows from every per-id endpoint
+        (H3, H5, H6, ...; for this test we exercise H3 ``GET /sessions/{id}``).
+      * The 404 body matches ``{"error":"session not found: <id>"}``
+        verbatim (Spec § 5 wire-shape: indistinguishable from a truly
+        nonexistent id, so bob cannot infer existence-but-not-owned).
+      * No 403 leaks through — the spec is explicit that the response
+        is 404, not 403, to avoid telegraphing whether the id exists.
+
+    Mechanism:
+      * A fake row is INSERTed directly into ``/var/lib/sandbox/sessions.db``
+        via ``sqlite3`` (run as root), owner = alice. The daemon's
+        in-memory state holds nothing; reads go through the open
+        sqlite handle and see the new row on next query.
+      * ``peercred-connector --uid <bob>`` opens the daemon socket
+        under bob's uid (kernel-set SO_PEERCRED), writes the GET
+        request, and forwards the daemon's response to stdout.
+      * The test asserts on the parsed status code (404) and the
+        response body shape.
+
+    Why not create via the CLI as alice? The full create path runs
+    backend provisioning (Lima VM boot or container start) plus
+    network + CA setup, which is expensive and orthogonal to the
+    invariant under test (the per-caller storage filter). The
+    synthetic-row injection is the same technique Spec 2 § 7.5 uses
+    for the host-level ``integration_synthetic_foreign_owner_returns_404``
+    test; here we lift it into the Lima multi-uid harness so the
+    peercred path is end-to-end real.
+    """
+    vm = _bring_up_peercred_vm(
+        vm_factory,
+        distro_template,
+        release_tarball_x86_64,
+        peercred_connector_binary,
+    )
+
+    # Synthesize a session id alice owns. The id format is 12 lowercase
+    # hex chars per Spec § "session id format"; we generate one fresh
+    # for the test so we never collide with anything else in the DB.
+    session_id = uuid.uuid4().hex[:12]
+    _inject_synthetic_session(
+        vm,
+        session_id=session_id,
+        owner_username="alice",
+    )
+
+    # Sanity check: alice CAN see her own row through the daemon.
+    # Use ``sandbox ps`` as the simplest probe — running as alice via
+    # the CLI exercises the peercred path end-to-end. The CLI renders
+    # a text table with the full session id in the first column; we
+    # only need the presence of the id to confirm alice's filter view
+    # returned the synthetic row.
+    r = vm.shell(
+        f"sudo -u alice env SANDBOX_SOCKET={DAEMON_SOCK} "
+        "/usr/local/bin/sandbox ps",
+        timeout=30,
+    )
+    assert r.returncode == 0, (
+        f"sandbox ps as alice failed:\n"
+        f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+    )
+    assert session_id in r.stdout, (
+        f"alice's `sandbox ps` did not list the synthetic row "
+        f"{session_id!r}:\nstdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+    )
+
+    # ---------------- The actual isolation assertion ----------------
+
+    # Compose GET /sessions/<session_id> as the request body.
+    req = _request_bytes(f"GET /sessions/{session_id} HTTP/1.1")
+    vm.shell(
+        f"cat > /tmp/req-bob-get <<'EOF'\n{req}EOF",
+        check=True,
+    )
+
+    # Run peercred-connector as bob's uid. ``sudo -u lima`` invokes
+    # the helper from the lima user (in ``sandbox`` group) so the
+    # helper inherits the sandbox supplementary group through the
+    # setuid-exec; then setresuid(bob) drops to bob, retaining the
+    # supplementary group → socket connect works → peercred reports
+    # bob's uid to the daemon.
+    r = vm.shell(
+        f"sudo -u lima {PEERCRED_CONNECTOR_VM_PATH} "
+        f"--uid {TEST_UID_BOB} "
+        f"--request-file /tmp/req-bob-get "
+        f"--socket {DAEMON_SOCK}",
+        timeout=30,
+    )
+    assert r.returncode == 0, (
+        f"peercred-connector --uid={TEST_UID_BOB} exited {r.returncode}\n"
+        f"stdout:\n{r.stdout!r}\nstderr:\n{r.stderr!r}"
+    )
+
+    status, rest = _parse_http_status(r.stdout)
+    assert status == 404, (
+        f"GET /sessions/{session_id} as bob: expected 404, got {status}\n"
+        f"full response:\n{r.stdout!r}"
+    )
+
+    # Body shape per Spec § 5: ``{"error":"session not found: <id>"}``.
+    # The body is at the tail of the response after the blank line
+    # separating headers from body.
+    body_split = rest.split("\r\n\r\n", 1)
+    assert len(body_split) == 2, (
+        f"could not separate headers from body in:\n{rest!r}"
+    )
+    body = body_split[1]
+    body_json = json.loads(body)
+    assert body_json == {"error": f"session not found: {session_id}"}, (
+        f"body did not match Spec § 5 shape; got: {body_json!r}"
+    )
+
+    # ---------------- Sanity: bob ALSO cannot see it via list ----------------
+
+    # Spec § 5 also pins ``GET /sessions`` (the list endpoint) — bob's
+    # ``sandbox ps`` must not surface alice's row. Re-using the CLI
+    # path because it's the operator-visible surface for the list
+    # endpoint.
+    r = vm.shell(
+        f"sudo -u bob env SANDBOX_SOCKET={DAEMON_SOCK} "
+        "/usr/local/bin/sandbox ps",
+        timeout=30,
+    )
+    assert r.returncode == 0, (
+        f"sandbox ps as bob failed:\nstdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+    )
+    assert session_id not in r.stdout, (
+        f"bob's `sandbox ps` leaked alice's session id {session_id!r}:\n"
+        f"{r.stdout}"
+    )
