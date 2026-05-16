@@ -1,0 +1,57 @@
+# Local Fulcio config — single OIDC issuer impersonating GitHub Actions.
+#
+# Fulcio validates incoming JWTs against the issuer URL listed below by:
+#   1. Fetching <issuer>/.well-known/openid-configuration over HTTPS.
+#   2. Fetching the JWKS document referenced therein.
+#   3. Validating the JWT signature against that JWKS.
+#
+# The compose file adds an extra_hosts entry that maps
+# token.actions.githubusercontent.com to the local oidc container, and the
+# CACert below contains the inline PEM body of the CA that signed the oidc
+# container's TLS leaf.  Together these let Fulcio trust the local nginx
+# as the production issuer's well-known endpoint.
+#
+# The ca-cert field is **substituted by init.sh** at stack bring-up time —
+# this file is a template; the live copy is rendered to state/fulcio/config.yaml.
+
+define:
+  - &github-type "github-workflow"
+
+oidc-issuers:
+  https://token.actions.githubusercontent.com:
+    issuer-url: https://token.actions.githubusercontent.com
+    client-id: sigstore
+    type: ci-provider
+    ci-provider: *github-type
+    contact: test@local
+    description: "Local impersonation of GitHub Actions OIDC"
+    ca-cert: |
+@@CA_CERT_PEM@@
+
+ci-issuer-metadata:
+  *github-type:
+    default-template-values:
+      url: "https://github.com"
+      environment: ""
+    extension-templates:
+      github-workflow-trigger: "event_name"
+      github-workflow-sha: "sha"
+      github-workflow-name: "workflow"
+      github-workflow-repository: "repository"
+      github-workflow-ref: "ref"
+      build-signer-uri: "{{ .url }}/{{ .job_workflow_ref }}"
+      build-signer-digest: "job_workflow_sha"
+      runner-environment: "runner_environment"
+      source-repository-uri: "{{ .url }}/{{ .repository }}"
+      source-repository-digest: "sha"
+      source-repository-ref: "ref"
+      source-repository-identifier: "repository_id"
+      source-repository-owner-uri: "{{ .url }}/{{ .repository_owner }}"
+      source-repository-owner-identifier: "repository_owner_id"
+      build-config-uri: "{{ .url }}/{{ .workflow_ref }}"
+      build-config-digest: "workflow_sha"
+      build-trigger: "event_name"
+      run-invocation-uri: "{{ .url }}/{{ .repository }}/actions/runs/{{ .run_id }}/attempts/{{ .run_attempt }}"
+      source-repository-visibility-at-signing: "repository_visibility"
+      deployment-environment: "environment"
+    subject-alternative-name-template: "{{ .url }}/{{ .job_workflow_ref }}"
