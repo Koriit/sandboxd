@@ -1001,3 +1001,298 @@ def pinned_cosign_binary() -> Path:
             f"cached cosign sha256 mismatch: got {actual} expected {expected_sha}"
         )
     return dest
+
+
+# ---------------------------------------------------------------------------
+# Multi-uid peercred test harness (Spec 2 § 9.2, Spec 1 § 8.4).
+# ---------------------------------------------------------------------------
+#
+# The peercred-connector helper lives at
+# ``sandboxd/tests/helpers/peercred-connector`` as a deliberately
+# standalone Cargo crate (NOT a workspace member, see the crate's
+# Cargo.toml). The release tarball never ships it; the host-side
+# fixture builds it on demand and copies it into the Lima VM
+# alongside the install tarball, where the in-VM provisioning step
+# installs it setuid-root at ``/usr/local/lib/sandboxd-tests/``.
+#
+# Why setuid-root: ``SO_PEERCRED`` is kernel-set on ``connect(2)``;
+# faking the peer uid requires real privilege separation. The helper
+# drops to a caller-specified numeric uid (``setresuid``/``setresgid``)
+# before opening the daemon socket, so the daemon's per-connection
+# acceptor reads the dropped uid through the kernel.
+
+PEERCRED_CONNECTOR_CRATE_DIR = (
+    PROJECT_ROOT / "sandboxd" / "tests" / "helpers" / "peercred-connector"
+)
+PEERCRED_CONNECTOR_BINARY = (
+    PEERCRED_CONNECTOR_CRATE_DIR / "target" / "release" / "peercred-connector"
+)
+PEERCRED_CONNECTOR_VM_PATH = "/usr/local/lib/sandboxd-tests/peercred-connector"
+
+
+@pytest.fixture(scope="session")
+def peercred_connector_binary() -> Path:
+    """Build ``peercred-connector`` once per session, return its host path.
+
+    The crate is standalone (no workspace membership) so a host-side
+    ``cargo build --release`` from its own directory produces the
+    binary at ``target/release/peercred-connector`` without invalidating
+    the workspace cargo cache. The binary is rebuilt only when stale
+    relative to the crate's own source files.
+
+    Cache shape mirrors the release-tarball fixture: a stamp file in
+    the crate's ``target/`` records the source-mtime; we recompile only
+    when any ``src/*.rs`` is newer than the existing binary. Set
+    ``SANDBOX_PEERCRED_CONNECTOR_FORCE_REBUILD=1`` to override.
+
+    The host build is x86_64 → x86_64 (release tarball is x86_64-only
+    today, so the Lima E2E VMs are x86_64). Cross-host is left to a
+    follow-up if the matrix ever widens.
+    """
+    if subprocess.run(
+        ["uname", "-m"], capture_output=True, text=True
+    ).stdout.strip() != "x86_64":
+        pytest.skip(
+            "peercred_connector_binary fixture only builds on x86_64 hosts"
+        )
+
+    force_rebuild = (
+        os.environ.get("SANDBOX_PEERCRED_CONNECTOR_FORCE_REBUILD") == "1"
+    )
+    stale = (
+        force_rebuild
+        or not PEERCRED_CONNECTOR_BINARY.exists()
+        or PEERCRED_CONNECTOR_BINARY.stat().st_mtime
+        < _newest_helper_src_mtime()
+    )
+
+    if stale:
+        subprocess.run(
+            ["cargo", "build", "--release"],
+            cwd=PEERCRED_CONNECTOR_CRATE_DIR,
+            check=True,
+            timeout=600,
+        )
+
+    if not PEERCRED_CONNECTOR_BINARY.exists():
+        raise AssertionError(
+            f"peercred-connector did not build at {PEERCRED_CONNECTOR_BINARY}"
+        )
+    return PEERCRED_CONNECTOR_BINARY
+
+
+def _newest_helper_src_mtime() -> float:
+    """Return youngest mtime across the peercred-connector crate sources.
+
+    Walks ``src/`` and ``Cargo.toml``; skips ``target/``. Same shape as
+    ``_newest_rs_mtime`` but scoped to a single helper crate.
+    """
+    newest = 0.0
+    candidates = [
+        PEERCRED_CONNECTOR_CRATE_DIR / "Cargo.toml",
+        PEERCRED_CONNECTOR_CRATE_DIR / "Cargo.lock",
+    ]
+    for c in candidates:
+        if c.exists():
+            try:
+                m = c.stat().st_mtime
+                if m > newest:
+                    newest = m
+            except OSError:
+                pass
+    src = PEERCRED_CONNECTOR_CRATE_DIR / "src"
+    if src.exists():
+        for root, dirs, files in os.walk(src):
+            dirs[:] = [d for d in dirs if d not in ("target", ".git")]
+            for name in files:
+                if name.endswith(".rs"):
+                    try:
+                        m = os.path.getmtime(os.path.join(root, name))
+                        if m > newest:
+                            newest = m
+                    except OSError:
+                        continue
+    return newest
+
+
+def provision_peercred_connector_in_vm(vm, host_binary):
+    """Copy ``peercred-connector`` into the VM and install it setuid-root.
+
+    Mirrors Spec 2 § 9.2's provisioning recipe:
+
+    ```
+    install -o root -g root -m 4755 <built-binary> \
+        /usr/local/lib/sandboxd-tests/peercred-connector
+    ```
+
+    The 4755 mode is **required** for the helper's privilege drop to
+    actually take effect — ``setresuid`` from a non-root process whose
+    euid is not 0 is a no-op, and the helper detects that case
+    (``Error::PrivDropFailed``) by re-reading ``geteuid()`` after the
+    call. Without setuid-root, every multi-uid test would fail loudly
+    at the helper's drop-verification step.
+    """
+    vm.cp(host_binary, "/tmp/peercred-connector")
+    vm.shell(
+        "sudo install -d -m 0755 -o root -g root /usr/local/lib/sandboxd-tests",
+        check=True,
+    )
+    vm.shell(
+        "sudo install -o root -g root -m 4755 /tmp/peercred-connector "
+        f"{PEERCRED_CONNECTOR_VM_PATH}",
+        check=True,
+    )
+    # Verify the setuid bit took — ``install -m 4755`` is supposed to
+    # apply 04755, but some fs mount options (nosuid) silently strip
+    # the setuid bit, which would make the helper's privilege drop
+    # mis-fire later in mysterious ways. Cross-check the resulting
+    # mode and fail loudly here instead.
+    r = vm.shell(
+        f"stat -c '%a' {PEERCRED_CONNECTOR_VM_PATH}",
+        check=True,
+    )
+    mode = r.stdout.strip()
+    if mode != "4755":
+        raise AssertionError(
+            f"peercred-connector setuid bit not preserved: mode={mode!r} "
+            f"(filesystem may be mounted nosuid; cannot exercise multi-uid "
+            f"peercred tests on this VM)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Multi-operator user provisioning inside the test VM.
+# ---------------------------------------------------------------------------
+#
+# Three test identities live alongside the install-created ``sandbox``
+# daemon user:
+#
+# - ``alice`` (uid 4001) — primary test operator, owns sessions
+# - ``bob`` (uid 4002)   — second operator, attempts cross-user reads
+# - uid 7777             — synthetic uid with NO ``/etc/passwd`` entry,
+#                          used by tests that pin the unresolvable-uid
+#                          deny/close behavior (Spec 1 § 8.4 #148 and
+#                          Spec 2 § 4.1 / 7.5 #150)
+#
+# alice and bob both join the ``sandbox`` group so they can traverse
+# the socket's 0660 sandbox:sandbox parent dir / socket node. The
+# install harness's pre-existing ``lima`` user is also in that group
+# (install.sh's ``add_operator_to_group`` does this when run under
+# sudo); we don't reuse ``lima`` because Spec 2 § 7.5 wants two real
+# operator uids distinct from any administrative role.
+#
+# uid 7777 is created with ``useradd`` and immediately ``userdel``-ed
+# so the uid number remains stranded in the kernel uid space without
+# a passwd entry — exactly the "uid without passwd lookup result"
+# state the deny/close tests exercise. The ``userdel`` step is what
+# decouples the uid number from the name; this is the same shape Spec
+# 1 § 8.4 specifies for the route-helper test.
+
+TEST_UID_ALICE = 4001
+TEST_UID_BOB = 4002
+# Synthetic uid with no /etc/passwd entry. Chosen well above the
+# system-uid (<1000) and below the dynamic-uid (>65000) ranges; not in
+# /etc/passwd on any stock Lima distro template.
+TEST_UID_NOPASSWD = 7777
+
+
+def provision_test_operators_in_vm(vm):
+    """Create alice and bob inside the VM and join them to ``sandbox`` group.
+
+    Idempotent: re-running against a VM that already has the users is
+    a no-op (the ``id -u alice`` short-circuit avoids a duplicate
+    ``useradd``).
+
+    Pre-condition: the ``sandbox`` group must already exist (install.sh
+    creates it via ``useradd --system --user-group sandbox``); callers
+    invoke this fixture after install.
+    """
+    cmd = (
+        "set -eux; "
+        f"if ! id -u alice >/dev/null 2>&1; then "
+        f"  sudo useradd --uid {TEST_UID_ALICE} --create-home --shell /bin/sh alice; "
+        "fi; "
+        f"if ! id -u bob >/dev/null 2>&1; then "
+        f"  sudo useradd --uid {TEST_UID_BOB} --create-home --shell /bin/sh bob; "
+        "fi; "
+        "sudo usermod -aG sandbox alice; "
+        "sudo usermod -aG sandbox bob; "
+    )
+    vm.shell(cmd, check=True, timeout=60)
+
+
+def install_multi_operator_users_conf(vm):
+    """Rewrite /etc/sandboxd/users.conf to include alice and bob.
+
+    Replaces the install-default ``allow_users: ["sandbox", "lima"]``
+    with ``["sandbox", "alice", "bob"]`` so the daemon's startup
+    subnet-resolution finds the same row regardless of which test
+    operator we run as later. Callers must restart sandboxd after
+    invoking this — the daemon reads users.conf once at startup.
+    """
+    users_conf = (
+        '{\n'
+        '  "_schema_version": 1,\n'
+        '  "subnets": [\n'
+        '    {\n'
+        '      "comment": "Test pool — multi-uid peercred isolation suite.",\n'
+        '      "cidr": "10.209.0.0/20",\n'
+        '      "allow_users": ["sandbox", "alice", "bob"]\n'
+        '    }\n'
+        '  ]\n'
+        '}\n'
+    )
+    # Stage via /tmp then sudo-install so we don't depend on the test
+    # runner having root-writable /etc.
+    vm.shell(
+        "cat > /tmp/users.conf <<'EOF'\n" + users_conf + "EOF",
+        check=True,
+    )
+    vm.shell(
+        "sudo install -m 0644 -o root -g root /tmp/users.conf "
+        "/etc/sandboxd/users.conf",
+        check=True,
+    )
+
+
+def restart_sandboxd(vm, *, timeout=60):
+    """Restart sandboxd and wait for the socket to reappear.
+
+    Convenience wrapper around ``systemctl restart`` +
+    ``wait_for_systemd_active`` + ``wait_for_socket``.
+    """
+    vm.shell("sudo systemctl restart sandboxd", check=True, timeout=timeout)
+    wait_for_systemd_active(vm.name, "sandboxd", timeout=timeout)
+    wait_for_socket(vm.name, "/run/sandbox/sandboxd.sock", timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
+# Route-helper audit-log scraping (Spec 1 § 3.5).
+# ---------------------------------------------------------------------------
+
+def read_route_helper_audit_log(vm, audit_log_path):
+    """Cat the audit log out of the VM and parse JSON-Lines records.
+
+    Returns a list of dicts (one per record). Empty list if the file
+    does not exist (the helper writes to the resolved path on demand;
+    an absent file means no record was ever appended). Per Spec 1
+    § 3.5 every invocation writes exactly one record.
+
+    The audit-log path inside the VM depends on the helper's
+    ``audit_log_path()`` resolution: usually
+    ``$XDG_RUNTIME_DIR/sandboxd/route-helper-audit.log`` for the
+    daemon-driven path, but tests that invoke the helper directly
+    pin the path via ``XDG_RUNTIME_DIR`` in the invocation
+    environment so they can read a known location.
+    """
+    r = vm.shell(
+        f"sudo cat {audit_log_path} 2>/dev/null || true",
+        timeout=10,
+    )
+    records = []
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        records.append(json.loads(line))
+    return records
