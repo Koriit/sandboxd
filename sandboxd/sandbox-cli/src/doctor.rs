@@ -679,6 +679,37 @@ fn real_group_resolver() -> Result<GroupMembership, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Dev-vs-prod classification signal (Spec 3 § 12.2 / Spec 4 § 4.5)
+// ---------------------------------------------------------------------------
+
+/// Canonical signal for "this host was provisioned by install.sh" —
+/// the install-state file at `/var/lib/sandbox/.install-state.json`
+/// (Spec 4 § 4.5). When the file is present the install is a
+/// system-service install and doctor's environment-aware checks
+/// (C5, C10) run their strict-mode comparisons; when it is absent
+/// the install is dev mode (or corrupted, same disposition) and the
+/// strict-mode comparisons are skipped per Spec 3 § 12.2.
+///
+/// Pulled into a pure function so it can be unit-tested against
+/// synthetic paths; the production callers pass [`INSTALL_STATE_PATH`].
+///
+/// Earlier revisions of the doctor used `nix::unistd::User::from_name("sandbox")`
+/// as the dev-vs-prod heuristic. That signal conflates two
+/// independent host facts — "the `sandbox` system user exists" and
+/// "the host was installed by install.sh" — and produced misleading
+/// hints during the M15 installer window (the user appears before
+/// the install-state file, and during uninstall the file disappears
+/// before the user). The install-state file's lifecycle is bound to
+/// install.sh's two-phase write (atomic move after every other
+/// invariant is in place), so it is the single source of truth that
+/// other M16 paths already consult (`is_dev_mode` in
+/// `update/mod.rs`, the `--check` / `--dry-run` graceful-degradation
+/// branches in the same module).
+fn is_prod_install_signal(install_state_path: &Path) -> bool {
+    install_state_path.exists()
+}
+
+// ---------------------------------------------------------------------------
 // Individual checks — C5 (socket perms)
 // ---------------------------------------------------------------------------
 
@@ -687,8 +718,9 @@ fn real_group_resolver() -> Result<GroupMembership, String> {
 /// Production: `srw-rw---- sandbox:sandbox` (mode `0660`). Dev: the
 /// developer owns the socket under `$XDG_RUNTIME_DIR/sandboxd/`; the
 /// mode varies and the spec § 12.2 specifies a `Skip (dev mode)` row.
-/// We classify dev mode as "no `sandbox` user on the host"; on that
-/// signal, we skip the strict-mode comparison.
+/// Dev-vs-prod classification uses the install-state file's presence
+/// per [`is_prod_install_signal`]; the strict-mode comparison is
+/// applied only on prod installs.
 fn check_socket_perms(socket_path: &str, socket_reachable: bool) -> CheckRow {
     if !socket_reachable {
         return CheckRow {
@@ -715,13 +747,11 @@ fn check_socket_perms(socket_path: &str, socket_reachable: bool) -> CheckRow {
         }
     };
 
-    // Dev-mode signal: no `sandbox` user on the host means no
-    // `0660 sandbox:sandbox` to require.
-    let sandbox_user_exists = nix::unistd::User::from_name("sandbox")
-        .ok()
-        .flatten()
-        .is_some();
-    if !sandbox_user_exists {
+    // Dev-mode signal: absence of the install-state file at
+    // `/var/lib/sandbox/.install-state.json` (Spec 4 § 4.5) means
+    // there is no system install of sandboxd, so there is no
+    // `0660 sandbox:sandbox` invariant to require.
+    if !is_prod_install_signal(Path::new(crate::update::INSTALL_STATE_PATH)) {
         let mode = metadata.permissions().mode() & 0o777;
         return CheckRow {
             id: "C5",
@@ -1023,20 +1053,18 @@ fn check_route_helper_caps() -> CheckRow {
 /// systemd unit's `StateDirectory` invariant). Dev: the operator's
 /// own `~/.local/share/sandboxd/` lives at the developer's umask;
 /// we skip the strict-mode comparison with the dev-mode annotation
-/// per spec § 12.2.
+/// per spec § 12.2. Dev-vs-prod classification consults the
+/// install-state file (Spec 4 § 4.5) via [`is_prod_install_signal`].
 fn check_state_dir_mode() -> CheckRow {
     const PROD_PATH: &str = "/var/lib/sandbox";
     let path = Path::new(PROD_PATH);
-    let sandbox_user_exists = nix::unistd::User::from_name("sandbox")
-        .ok()
-        .flatten()
-        .is_some();
-    if !sandbox_user_exists {
+    if !is_prod_install_signal(Path::new(crate::update::INSTALL_STATE_PATH)) {
         return CheckRow {
             id: "C10",
             name: "state dir mode",
             outcome: CheckOutcome::Skip {
-                detail: "dev mode \u{2014} no sandbox user/systemd StateDirectory".to_string(),
+                detail: "dev mode \u{2014} no install-state file / not a system install"
+                    .to_string(),
                 hint: None,
             },
         };
@@ -1786,6 +1814,27 @@ mod tests {
             }
             other => panic!("expected Fail, got {other:?}"),
         }
+    }
+
+    /// `is_prod_install_signal` flips on the presence of the
+    /// install-state file at `/var/lib/sandbox/.install-state.json`
+    /// (Spec 4 § 4.5). Pinned here so a future refactor can't
+    /// silently widen the predicate to consult system-user existence
+    /// again — that's the conflation #156 fixed.
+    #[test]
+    fn prod_install_signal_returns_true_when_install_state_file_present() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join(".install-state.json");
+        std::fs::write(&path, b"{}").unwrap();
+        assert!(is_prod_install_signal(&path));
+    }
+
+    #[test]
+    fn prod_install_signal_returns_false_when_install_state_file_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join(".install-state.json");
+        // Deliberately do not create the file.
+        assert!(!is_prod_install_signal(&path));
     }
 
     /// Daemon-down (C1 fails) → C3-C13 that depend on the daemon must
