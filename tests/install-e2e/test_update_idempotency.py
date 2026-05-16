@@ -87,13 +87,14 @@ def test_update_interrupted_then_resumed(
     # bytes will match exactly because both are the same tarball.
     #
     # We extract the bumped tarball into the VM and `install` its
-    # bin/sandboxd and bin/sandbox-route-helper to the canonical paths.
-    # We deliberately do NOT pre-stage `bin/sandbox` (the CLI binary
-    # itself) — the resume invocation below should be executed by the
-    # base v binary on disk, keeping a clean "the running CLI is v,
-    # not v'" invariant for the test. The remaining two binary swaps
-    # still emit `action=skip` for the install_binary step on resume,
-    # which is what the spec § 9.1 idempotency assertion below pins.
+    # bin/sandboxd, bin/sandbox-route-helper, and bin/sandbox-guest to
+    # the canonical paths. We deliberately do NOT pre-stage `bin/sandbox`
+    # (the CLI binary itself) — the resume invocation below should be
+    # executed by the base v binary on disk, keeping a clean "the
+    # running CLI is v, not v'" invariant for the test. The remaining
+    # three binary swaps still emit `action=skip` for the install_binary
+    # step on resume, which is what the spec § 9.1 idempotency
+    # assertion below pins.
     stage_dir = "/tmp/sandbox-update-prestage"
     vm.shell(
         f"sudo rm -rf {stage_dir} && mkdir -p {stage_dir} && "
@@ -108,7 +109,10 @@ def test_update_interrupted_then_resumed(
         f"{extracted_root}/bin/sandboxd /usr/local/bin/sandboxd && "
         f"sudo install -D -m 0755 -o root -g root "
         f"{extracted_root}/bin/sandbox-route-helper "
-        f"/usr/local/libexec/sandboxd/sandbox-route-helper",
+        f"/usr/local/libexec/sandboxd/sandbox-route-helper && "
+        f"sudo install -D -m 0755 -o root -g root "
+        f"{extracted_root}/bin/sandbox-guest "
+        f"/usr/local/libexec/sandboxd/sandbox-guest",
         check=True, timeout=30,
     )
 
@@ -177,20 +181,21 @@ def test_update_interrupted_then_resumed(
 
     # Spec § 9.1 contract: "the resume run mostly skips already-completed
     # steps". Parse the install log and count `action=skip` lines. With
-    # two of the three bumped binaries pre-staged (sandboxd, sandbox-
-    # route-helper; see the rationale at pre-stage time), both of those
-    # `install_binary` entries must record action=skip. The third
-    # `install_binary` (sandbox CLI) is expected to land as action=install
-    # because we intentionally left the v binary in place. The spec lists
-    # 18 stateful steps; this assertion pins the idempotency contract on
-    # the binary-install layer specifically.
+    # three of the four bumped binaries pre-staged (sandboxd, sandbox-
+    # route-helper, sandbox-guest; see the rationale at pre-stage time),
+    # all three of those `install_binary` entries must record
+    # action=skip. The fourth `install_binary` (sandbox CLI) is expected
+    # to land as action=install because we intentionally left the v
+    # binary in place. The spec lists 18 stateful steps; this assertion
+    # pins the idempotency contract on the binary-install layer
+    # specifically.
     parsed = parse_install_log_actions(log)
     install_binary_actions = parsed.get("install_binary", [])
     skip_count = install_binary_actions.count("skip")
-    assert skip_count >= 2, (
-        f"expected at least 2 install_binary steps with action=skip "
-        f"(sandboxd, sandbox-route-helper pre-staged at canonical paths); "
-        f"got {skip_count} skip(s) in "
+    assert skip_count >= 3, (
+        f"expected at least 3 install_binary steps with action=skip "
+        f"(sandboxd, sandbox-route-helper, sandbox-guest pre-staged at "
+        f"canonical paths); got {skip_count} skip(s) in "
         f"install_binary={install_binary_actions!r}\nlog:\n{log}"
     )
 

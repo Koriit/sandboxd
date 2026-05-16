@@ -140,6 +140,7 @@ sudo systemctl stop sandboxd
 sudo install -m 0755 -o root -g root "$BACKUP_DIR/sandboxd.bak"             /usr/local/bin/sandboxd
 sudo install -m 0755 -o root -g root "$BACKUP_DIR/sandbox.bak"              /usr/local/bin/sandbox
 sudo install -m 0755 -o root -g root "$BACKUP_DIR/sandbox-route-helper.bak" /usr/local/libexec/sandboxd/sandbox-route-helper
+sudo install -m 0755 -o root -g root "$BACKUP_DIR/sandbox-guest.bak"        /usr/local/libexec/sandboxd/sandbox-guest
 sudo setcap cap_net_admin,cap_sys_admin=eip /usr/local/libexec/sandboxd/sandbox-route-helper
 sudo install -m 0644 -o root -g root "$BACKUP_DIR/users.conf.bak"  /etc/sandboxd/users.conf
 # bridge.conf is optional — the daemon refuses on the schema check

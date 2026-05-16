@@ -886,6 +886,13 @@ install_binaries() {
     install_binary "$STAGE/bin/sandbox"  /usr/local/bin/sandbox  0755
     install_binary "$STAGE/bin/sandbox-route-helper" \
         /usr/local/libexec/sandboxd/sandbox-route-helper 0755
+    # sandbox-guest is a daemon-internal helper (not operator-facing):
+    # the daemon stages it into its base_dir at startup so every
+    # container session can bind-mount it read-only at
+    # /usr/local/bin/sandbox-guest. FHS § 4.7 places non-user-facing
+    # helpers under libexec/, matching sandbox-route-helper above.
+    install_binary "$STAGE/bin/sandbox-guest" \
+        /usr/local/libexec/sandboxd/sandbox-guest 0755
 }
 
 # ----------------------------------------------------------------------------

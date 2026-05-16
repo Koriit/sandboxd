@@ -1783,6 +1783,7 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         (backup::SANDBOXD_BIN_PATH, "sandboxd.bak"),
         (backup::SANDBOX_BIN_PATH, "sandbox.bak"),
         (backup::ROUTE_HELPER_BIN_PATH, "sandbox-route-helper.bak"),
+        (backup::GUEST_BIN_PATH, "sandbox-guest.bak"),
     ] {
         let dst = backup_set_dir.join(dst_name);
         match backup::backup_sandbox_owned_file(Path::new(src), &dst, 0o640) {
@@ -1931,6 +1932,7 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
             backup::ROUTE_HELPER_BIN_PATH,
             0o755u32,
         ),
+        (staged.guest_bin(), backup::GUEST_BIN_PATH, 0o755u32),
     ] {
         match install_binary_if_changed(&src, dst, mode) {
             Ok(action) => log_step(

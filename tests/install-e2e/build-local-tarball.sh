@@ -388,7 +388,7 @@ else
     ( cd "$ROOT/sandboxd" && cargo build --workspace --release )
 fi
 
-for bin in sandboxd sandbox sandbox-route-helper; do
+for bin in sandboxd sandbox sandbox-route-helper sandbox-guest; do
     if [ ! -x "$RELEASE_DIR/$bin" ]; then
         printf 'build-local-tarball.sh: missing release binary: %s/%s\n' \
             "$RELEASE_DIR" "$bin" >&2
@@ -465,6 +465,12 @@ install -m 0755 "$RELEASE_DIR/sandbox" \
     "$STAGE_DIR/bin/sandbox"
 install -m 0755 "$RELEASE_DIR/sandbox-route-helper" \
     "$STAGE_DIR/bin/sandbox-route-helper"
+# sandbox-guest is a daemon-internal helper; install.sh lands it
+# under /usr/local/libexec/sandboxd/ on the host (FHS § 4.7).
+# The tarball uses a flat bin/ layout for simplicity — install.sh
+# owns the FHS placement.
+install -m 0755 "$RELEASE_DIR/sandbox-guest" \
+    "$STAGE_DIR/bin/sandbox-guest"
 install -m 0644 "$ROOT/sandboxd/contrib/systemd/sandboxd.service" \
     "$STAGE_DIR/systemd/sandboxd.service"
 cp "$GATEWAY_TAR" "$STAGE_DIR/images/sandbox-gateway-${VER}.tar"
@@ -495,6 +501,7 @@ artifacts = {
     "sandboxd":              {"path": "bin/sandboxd"},
     "sandbox":               {"path": "bin/sandbox"},
     "sandbox-route-helper":  {"path": "bin/sandbox-route-helper"},
+    "sandbox-guest":         {"path": "bin/sandbox-guest"},
     "gateway-image":         {"path": f"images/sandbox-gateway-{ver}.tar",
                               "docker_tag": f"sandbox-gateway:{ver}"},
     "systemd-unit":          {"path": "systemd/sandboxd.service"},

@@ -361,6 +361,12 @@ impl StagedTarball {
     pub fn route_helper_bin(&self) -> PathBuf {
         self.stage_dir.join("bin/sandbox-route-helper")
     }
+    /// `<stage>/bin/sandbox-guest`. The tarball uses a flat `bin/`
+    /// layout; install.sh repoints to `/usr/local/libexec/sandboxd/`
+    /// when laying it down on the host.
+    pub fn guest_bin(&self) -> PathBuf {
+        self.stage_dir.join("bin/sandbox-guest")
+    }
     /// `<stage>/systemd/sandboxd.service`.
     pub fn systemd_unit(&self) -> PathBuf {
         self.stage_dir.join("systemd/sandboxd.service")
@@ -609,6 +615,7 @@ mod tests {
         std::fs::write(stage_dir.join("bin/sandboxd"), b"fake-sandboxd").unwrap();
         std::fs::write(stage_dir.join("bin/sandbox"), b"fake-sandbox").unwrap();
         std::fs::write(stage_dir.join("bin/sandbox-route-helper"), b"fake-rh").unwrap();
+        std::fs::write(stage_dir.join("bin/sandbox-guest"), b"fake-guest").unwrap();
         std::fs::write(stage_dir.join("systemd/sandboxd.service"), b"[Unit]\n").unwrap();
         std::fs::write(
             stage_dir.join("images/sandbox-gateway-9.9.9.tar"),
@@ -644,6 +651,7 @@ mod tests {
         assert!(staged.sandboxd_bin().exists());
         assert!(staged.sandbox_bin().exists());
         assert!(staged.route_helper_bin().exists());
+        assert!(staged.guest_bin().exists());
         assert!(staged.systemd_unit().exists());
         assert!(staged.gateway_image_tar().exists());
     }

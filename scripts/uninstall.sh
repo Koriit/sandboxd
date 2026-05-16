@@ -430,7 +430,8 @@ defer_route_helper_caps() {
 remove_binaries() {
     for bin in /usr/local/bin/sandboxd \
                /usr/local/bin/sandbox \
-               /usr/local/libexec/sandboxd/sandbox-route-helper
+               /usr/local/libexec/sandboxd/sandbox-route-helper \
+               /usr/local/libexec/sandboxd/sandbox-guest
     do
         if [ -f "$bin" ]; then
             sudo -k rm -f "$bin"
