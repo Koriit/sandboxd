@@ -29,6 +29,10 @@ over the two scenarios above.
 
 from __future__ import annotations
 
+import os
+import shutil
+import tempfile
+
 import pytest
 
 from conftest import (
@@ -135,30 +139,36 @@ def test_install_aborts_on_tampered_tarball(
         "the tampered-signature contract"
     )
 
-    # Flip the first byte of the tarball. We overwrite byte 0 with a
-    # NUL from /dev/zero rather than going through printf (whose
-    # \xNN form is a bash extension; POSIX sh doesn't accept it).
-    # conv=notrunc keeps the file size; bs=1 count=1 writes one byte.
-    # status=none keeps the test output clean; on failure we re-run
-    # without it to surface the underlying error.
+    # Flip the first byte of the tarball.
     #
-    # chmod first: the tarball was planted by limactl copy under the
-    # invoking user; the default Lima user has umask 0077 so the file
-    # lands mode 0600. `sudo dd of=<file>` re-opens the file for write
-    # — on some Lima kernels this hits EACCES even as root (likely a
-    # mount-option interaction with the user-home overlay). Flipping
-    # to world-writable first sidesteps it without changing the bytes
-    # we care about. The byte-flip itself is the security-relevant
-    # mutation; the mode change is harmless harness scaffolding.
-    vm.shell(
-        f"sudo chmod 0666 {tarball_in_vm}",
-        check=True, timeout=10,
-    )
-    vm.shell(
-        f"sudo dd if=/dev/zero of={tarball_in_vm} bs=1 count=1 "
-        f"conv=notrunc status=none",
-        check=True, timeout=10,
-    )
+    # Earlier iterations of this test tampered in-place via `sudo dd
+    # of=$tarball ...`, which kept hitting EACCES on Lima even after
+    # a prior `sudo chmod 0666 $tarball`. dd's open(O_WRONLY) failed
+    # despite the caller being root via sudo — likely a Lima
+    # overlay-/tmp interaction with dd's open-flag combination.
+    # `sudo chmod` works, `sudo cat $file` works, `sudo dd of=$file`
+    # does not.
+    #
+    # Working approach: prepare the tampered bytes outside the VM
+    # using stdlib (read host tarball, NUL byte 0, hold in memory),
+    # write a tampered sibling under /tmp on the host, copy it INTO
+    # the VM over the original path via limactl-copy. limactl-copy's
+    # write path inside the guest is the same one that planted the
+    # untouched tarball in the first place, so it is known to work.
+    # The byte-flip semantics (offset 0 zeroed, length unchanged) are
+    # preserved.
+    with tempfile.NamedTemporaryFile(
+        prefix="tampered-", suffix=".tar.gz", delete=False,
+    ) as tampered:
+        shutil.copyfile(release_tarball_x86_64, tampered.name)
+    try:
+        with open(tampered.name, "r+b") as f:
+            f.seek(0)
+            f.write(b"\x00")
+        # Overwrite the in-VM path with the tampered file.
+        vm.cp(tampered.name, tarball_in_vm)
+    finally:
+        os.unlink(tampered.name)
 
     r = vm.shell(
         install_sh_cmd(tarball_in_vm, env=env),
