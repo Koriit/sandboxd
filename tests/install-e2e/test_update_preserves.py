@@ -29,9 +29,11 @@ import json
 import pytest
 
 from conftest import (
+    assert_doctor_passes,
     copy_tarball_to_vm,
     install_sh_cmd,
     version_from_tarball,
+    wait_for_socket,
     wait_for_systemd_active,
 )
 
@@ -129,6 +131,13 @@ def test_update_preserves_systemd_drop_in(
         f"sudo grep -q 'SANDBOX_TEST_MARKER=operator-owned' {drop_in_path}",
     ).returncode == 0
 
+    # Spec § 7.2 step 10: post-update doctor green-light. Waits for
+    # the daemon socket first (the update restarts the unit at
+    # § 3.2.26; the unit may still be activating when the CLI returns).
+    wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
+    wait_for_socket(vm.name, "/run/sandbox/sandboxd.sock", timeout=60)
+    assert_doctor_passes(vm)
+
 
 @pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
 def test_update_preserves_customized_users_conf(
@@ -221,3 +230,12 @@ def test_update_preserves_customized_users_conf(
     assert "192.168.99.0/24" in cidrs, (
         f"custom subnet dropped during update; post subnets: {post!r}"
     )
+
+    # Spec § 7.2 step 10: post-update doctor green-light. The
+    # customized users.conf must still validate against the daemon's
+    # schema — doctor's daemon-startup check is the post-update
+    # signal that the schema-mismatch refusal (Spec 5 § 4.7) did
+    # NOT fire.
+    wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
+    wait_for_socket(vm.name, "/run/sandbox/sandboxd.sock", timeout=60)
+    assert_doctor_passes(vm)

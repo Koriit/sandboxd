@@ -23,6 +23,7 @@ import json
 import pytest
 
 from conftest import (
+    assert_doctor_passes,
     copy_tarball_to_vm,
     install_sh_cmd,
     version_from_tarball,
@@ -132,3 +133,14 @@ def test_update_air_gapped(
     # Daemon back up.
     wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
     wait_for_socket(vm.name, "/run/sandbox/sandboxd.sock", timeout=60)
+
+    # Spec § 7.2 step 10 (the post-update green-light gate): run
+    # `sandbox doctor` and assert all checks pass. Doctor's checks
+    # run against the local unix socket (egress is blocked but
+    # loopback is allowed by the iptables fixture above), so the
+    # call works in the air-gapped state. Without this assertion,
+    # a regression that left the daemon in a "running but unhealthy"
+    # state post-update (e.g. KVM access dropped, gateway image
+    # tag mismatched) would have passed the systemctl + socket
+    # checks above silently.
+    assert_doctor_passes(vm)

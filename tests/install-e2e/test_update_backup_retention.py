@@ -127,3 +127,22 @@ def test_update_backup_retention_prunes_oldest(
             f"after update {idx + 1}: expected backup sets {expected}, "
             f"got {ok_pairs}\nraw:\n{manifests}"
         )
+        # Total manifest count must equal the expected `ok_pairs`
+        # length. Spec § 5.2 keep=2 prunes successful sets to two;
+        # the only manifests that ride past the prune are (a) the
+        # two most recent successful sets, (b) forensic
+        # `completed_ok != true` sets (preserved indefinitely).
+        # The retention test never injects a forensic failure, so
+        # the on-disk total must match the `completed_ok=true` count
+        # exactly. Without this assertion, a regression that left an
+        # orphan forensic survivor on disk (e.g. a partial-failure
+        # manifest a previous update wrote but never cleaned up)
+        # would silently inflate the directory without tripping the
+        # `ok_pairs == expected` check above.
+        assert len(parsed) == len(expected), (
+            f"after update {idx + 1}: total backup-set manifest count "
+            f"({len(parsed)}) must equal the expected completed_ok count "
+            f"({len(expected)}); the surplus would indicate an orphan "
+            f"forensic survivor in /var/lib/sandbox/backups/ that the "
+            f"prune missed.\nraw:\n{manifests}"
+        )

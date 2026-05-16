@@ -25,6 +25,7 @@ import json
 import pytest
 
 from conftest import (
+    assert_doctor_passes,
     copy_tarball_to_vm,
     install_sh_cmd,
     version_from_tarball,
@@ -138,3 +139,37 @@ def test_update_fresh_install_to_next_version(
     assert state["installed_version"] == bumped_ver, (
         f"install-state did not advance to {bumped_ver}: {state!r}"
     )
+
+    # 3. sessions.db integrity — Spec 5 § 3.2.15 backs the DB up
+    # to /var/lib/sandbox/backups/, then preserves the live copy
+    # through the update. After a successful update the live DB at
+    # /var/lib/sandbox/sessions.db must (a) exist, (b) be a
+    # well-formed SQLite database (sqlite3's `PRAGMA integrity_check`
+    # returns "ok"), and (c) carry the `sessions` table the daemon
+    # depends on for queries. Without these assertions a regression
+    # that left the DB truncated or corrupted post-update would only
+    # surface on the next session-create — too late for the update
+    # test to catch.
+    integrity = vm.shell(
+        "sudo sqlite3 /var/lib/sandbox/sessions.db 'PRAGMA integrity_check;'",
+        check=True, timeout=10,
+    )
+    assert integrity.stdout.strip() == "ok", (
+        f"post-update sessions.db integrity_check failed: {integrity.stdout!r}; "
+        f"the live DB at /var/lib/sandbox/sessions.db is corrupted or truncated"
+    )
+    # `sessions` table must exist (the migration set is up-to-date
+    # post-update; the table presence is the minimum schema-shape
+    # assertion).
+    sessions_table = vm.shell(
+        "sudo sqlite3 /var/lib/sandbox/sessions.db "
+        "\"SELECT name FROM sqlite_master WHERE type='table' AND name='sessions';\"",
+        check=True, timeout=10,
+    )
+    assert sessions_table.stdout.strip() == "sessions", (
+        f"post-update sessions.db missing `sessions` table: {sessions_table.stdout!r}"
+    )
+
+    # 4. Spec § 7.2 step 10 (post-update green-light gate): doctor
+    # passes against the running v' daemon.
+    assert_doctor_passes(vm)

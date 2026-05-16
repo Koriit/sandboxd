@@ -116,15 +116,18 @@ def test_update_then_manual_rollback(
         f"manifest sha256 malformed: {expected_sessions_sha!r}"
     )
 
-    # 3. Run the rollback recipe (Spec 5 § 7.2). Verbatim, with one
-    # test-mode caveat:
-    #   * Step 2 (gateway image inspect) — succeeds because the base
-    #     install's docker-load left ``sandbox-gateway:<base>`` resident
-    #     in the VM, and the rollback recipe inspects exactly that tag.
-    #   * The ``ls -td`` selector picks the newest set with
-    #     completed_ok=true; in this test there is exactly one set
-    #     and it has completed_ok=true, so it is selected.
-    rollback_recipe = r"""
+    # 3. Run the rollback recipe (Spec 5 § 7.2). The recipe is split
+    # into two phases here so the sessions.db sha256 can be sampled
+    # AFTER the install but BEFORE `systemctl start sandboxd`. Without
+    # the split, a parallel WAL checkpoint or any startup-time DB write
+    # could mutate the bytes between `install` and our read, producing
+    # a sha mismatch that does NOT reflect a real rollback regression.
+    # The recipe content is otherwise verbatim with the spec.
+    #
+    # Phase 1 — stop + install backup artifacts. Stops short of
+    # `systemctl start sandboxd` so the daemon never gets a chance
+    # to mutate the freshly-restored sessions.db.
+    rollback_phase1 = r"""
 set -eux
 BACKUP_DIR=$(sudo -u sandbox sh -c 'ls -td /var/lib/sandbox/backups/*/' \
                | xargs -I{} sudo -u sandbox sh -c \
@@ -146,23 +149,16 @@ if [ -f "$BACKUP_DIR/bridge.conf.bak" ]; then
 fi
 sudo install -m 0600 -o sandbox -g sandbox "$BACKUP_DIR/sessions.db.bak" /var/lib/sandbox/sessions.db
 sudo rm -f /var/lib/sandbox/.update.lock
-sudo systemctl start sandboxd
 """
-    r = vm.shell(rollback_recipe, timeout=120)
+    r = vm.shell(rollback_phase1, timeout=120)
     assert r.returncode == 0, (
-        f"rollback recipe failed:\n{r.stdout}\n{r.stderr}"
+        f"rollback recipe phase 1 (stop + install) failed:\n{r.stdout}\n{r.stderr}"
     )
 
-    # 4. Verify post-rollback state.
-    # sessions.db on disk matches the backup-recorded sha256 — i.e.
-    # the rollback `install`'d exactly the captured bytes into place.
-    # Note: this asserts moments after `systemctl start sandboxd`, so
-    # the daemon may have already begun startup-time writes; in
-    # practice the daemon doesn't open the DB read-write until after
-    # the listener is up and we read the file before that races.
-    # If this becomes flaky, gate the read on `systemctl stop sandboxd
-    # → sha256sum → systemctl start sandboxd` to remove the race; for
-    # now keep it inline.
+    # 4. Verify the post-install sha256 of sessions.db BEFORE
+    # restarting the daemon. With sandboxd stopped, nothing on the
+    # host can write to the DB — the bytes we read here are exactly
+    # what the rollback's `install` step put in place.
     post_sessions_sha = vm.shell(
         "sudo sha256sum /var/lib/sandbox/sessions.db | awk '{print $1}'",
         check=True, timeout=10,
@@ -170,6 +166,14 @@ sudo systemctl start sandboxd
     assert expected_sessions_sha == post_sessions_sha, (
         f"sessions.db not restored to the backup's captured bytes: "
         f"expected={expected_sessions_sha} post={post_sessions_sha}"
+    )
+
+    # Phase 2 — start the daemon. Now that the sha check has landed,
+    # the daemon's startup-time DB writes (WAL checkpoint, etc.) are
+    # harmless to our assertion.
+    r = vm.shell("sudo systemctl start sandboxd", timeout=60)
+    assert r.returncode == 0, (
+        f"rollback recipe phase 2 (systemctl start) failed:\n{r.stdout}\n{r.stderr}"
     )
     # install_state still says v' (rollback recipe does NOT rewrite
     # install_state — the spec § 7.2 deliberately leaves operator audit

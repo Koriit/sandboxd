@@ -84,11 +84,27 @@ def test_update_concurrent_refused(
     # Synthesise a held lock: a background `flock -n <lock> sleep 60`
     # holds the kernel flock. We write the payload first (mode 0664
     # owner sandbox:sandbox per Spec 5 § 10.1), then hand the FD to flock.
+    #
+    # `started_at` is rendered dynamically as "5 minutes ago" so the
+    # payload appears RECENT against the lock's 24-hour staleness
+    # threshold (Spec § 6.2.3 — `AdoptStale` fires for payloads older
+    # than 24h). A fixed timestamp like "2026-05-12T00:00:00Z" was
+    # safe when first written but drifts past 24h as the calendar
+    # advances, eventually crossing the adopt-vs-adopt-stale
+    # boundary. The dynamic value pins the test against the
+    # `HeldByLivePid` refusal path the spec contract names; an
+    # adopt-stale outcome would mean a different code path which
+    # this test is not designed to exercise.
+    started_at = vm.shell(
+        "date -u -d '5 minutes ago' '+%Y-%m-%dT%H:%M:%SZ'",
+        check=True, timeout=10,
+    ).stdout.strip()
+    assert len(started_at) > 0, "date(1) must produce an RFC3339 timestamp"
     payload = json.dumps({
         "pid": 999999,  # any int — the live holder is the sleep proc
         "target_version": bumped_ver,
         "from_version": base_ver,
-        "started_at": "2026-05-12T00:00:00Z",
+        "started_at": started_at,
         "was_running": True,
     })
     vm.shell(
@@ -152,10 +168,21 @@ exit $RC
         f"`sandbox update` should have refused while flock was held; "
         f"got exit 0\nstdout:\n{r.stdout}\nstderr:\n{r.stderr}"
     )
-    combined = r.stdout + r.stderr
-    assert "another" in combined and "update" in combined and "in progress" in combined, (
-        f"refusal message missing 'another ... update ... in progress' marker:\n"
-        f"{combined}"
+    # Spec § 6.2: `LockError::HeldByLivePid` surfaces via `eprintln!`
+    # (the CLI's standard error-rendering path), so the refusal
+    # message must land on STDERR only — stdout should be empty
+    # modulo any `log_step` lines that fire before the lock probe.
+    # The previous shape asserted on `r.stdout + r.stderr` combined,
+    # which would have passed even if the refusal silently leaked to
+    # stdout (a regression that swapped `eprintln!` for `println!`).
+    assert (
+        "another" in r.stderr
+        and "update" in r.stderr
+        and "in progress" in r.stderr
+    ), (
+        f"refusal message must land on stderr (spec § 6.2 — error rendering via "
+        f"eprintln!); missing 'another ... update ... in progress' marker.\n"
+        f"stderr:\n{r.stderr}\nstdout (for diagnostic context only):\n{r.stdout}"
     )
 
     # The lock file survives the refused run (the refused process did
