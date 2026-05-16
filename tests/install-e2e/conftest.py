@@ -216,6 +216,16 @@ def lima_start(vm_name, template, *, cpus=2, memory_gib=2, disk_gib=10):
     test runner). We zero out mounts via ``--set`` so the test guest is
     fully isolated from the host filesystem; files are copied in
     explicitly via ``limactl copy``.
+
+    Production-hostname injection: Lima's ``hostResolver.hosts`` map
+    rewrites DNS lookups inside the VM to point production sigstore
+    hostnames at ``host.lima.internal`` — which is the qemu user-net
+    gateway address (typically 192.168.5.2) and reaches the host's
+    127.0.0.1-bound Sigstore stack via Lima's port forwarding. The
+    entries are inert when the local Sigstore stack isn't running:
+    install.sh consults them only when the SANDBOX_INSTALL_TEST_*
+    trust-material env vars are also set, which the harness wires up
+    in lockstep with the stack-up signal.
     """
     cmd = [
         "limactl", "start",
@@ -225,6 +235,18 @@ def lima_start(vm_name, template, *, cpus=2, memory_gib=2, disk_gib=10):
         f"--memory={memory_gib}",
         f"--disk={disk_gib}",
         "--set", ".mounts=[]",
+        # Map production sigstore hostnames to host.lima.internal so a
+        # cosign sign/verify inside the VM dialled against the
+        # production hostname lands on the host-bound local stack. The
+        # entries merge into the resolved Lima YAML's hostResolver.hosts
+        # map; they are inert when the stack isn't reachable.
+        # Multiple --set flags compose via yq.
+        "--set",
+        '.hostResolver.hosts."token.actions.githubusercontent.com" = "host.lima.internal"',
+        "--set",
+        '.hostResolver.hosts."fulcio.local" = "host.lima.internal"',
+        "--set",
+        '.hostResolver.hosts."rekor.local" = "host.lima.internal"',
         "--tty=false",
     ]
     _run(cmd, timeout=VM_BOOT_TIMEOUT)
@@ -315,12 +337,19 @@ def _replace_shell_function(text, func_name, replacement):
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="session")
-def release_tarball_x86_64() -> Path:
+def release_tarball_x86_64(sigstore_stack) -> Path:
     """Build the local release tarball once per test session.
 
     Drives ``build-local-tarball.sh``; honors the script's
     SANDBOX_RELEASE_SKIP_BUILD / SKIP_GATEWAY env vars when set in the
     pytest invocation environment so iteration is fast.
+
+    Depends on ``sigstore_stack``: the build script signs the
+    tarball against the local Fulcio + Rekor stack so install.sh's
+    real ``cosign verify-blob`` path can run end-to-end. If
+    ``sigstore_stack`` skipped (no Docker on the host), the build
+    script emits a zero-byte sigstore stub and downstream tests must
+    rely on the ``SANDBOX_INSTALL_SKIP_SIGSTORE=1`` test-only escape.
 
     Cache shape:
 
@@ -409,7 +438,7 @@ def _newest_rs_mtime() -> float:
 
 
 @pytest.fixture(scope="session")
-def release_tarball_x86_64_bumped(release_tarball_x86_64) -> Path:
+def release_tarball_x86_64_bumped(release_tarball_x86_64, sigstore_stack) -> Path:
     """Build a release tarball at a bumped version distinct from the
     workspace's current CARGO_PKG_VERSION.
 
@@ -485,7 +514,7 @@ def release_tarball_x86_64_bumped(release_tarball_x86_64) -> Path:
 
 
 @pytest.fixture(scope="session")
-def release_tarball_x86_64_bumped_chain(release_tarball_x86_64) -> list:
+def release_tarball_x86_64_bumped_chain(release_tarball_x86_64, sigstore_stack) -> list:
     """Build a chain of N successively bumped release tarballs.
 
     ``test_update_backup_retention`` needs three real bumped binaries
@@ -793,6 +822,65 @@ def copy_tarball_to_vm(vm, tarball_path, dst="/tmp"):
     return dst_path
 
 
+SIGSTORE_TRUST_MATERIAL_VM_DIR = "/tmp/sandboxd-sigstore-trust"
+
+
+def stage_sigstore_trust_material_in_vm(vm, stack):
+    """Copy the local Sigstore stack's trust material into the VM.
+
+    Plants four files under
+    ``/tmp/sandboxd-sigstore-trust/`` inside the guest:
+
+      fulcio-root.pem     Fulcio CA root used by --certificate-chain.
+      rekor.pub.pem       Rekor server public key (transparency log).
+      ct-log.pub.pem      CT log public key (used at sign time, and
+                          referenced during verify-blob when the
+                          signing-time SCT is embedded in the cert).
+
+    Returns a dict of env-var values pointing at the in-VM paths,
+    suitable for splatting into ``install_sh_cmd(..., env={...})``.
+    The URLs (Fulcio, Rekor) are rewritten to ``host.lima.internal``
+    so the cosign client inside the VM reaches the host-bound stack
+    via Lima's qemu user-net gateway.
+    """
+    vm.shell(f"mkdir -p {SIGSTORE_TRUST_MATERIAL_VM_DIR}", check=True, timeout=10)
+
+    in_vm_fulcio = f"{SIGSTORE_TRUST_MATERIAL_VM_DIR}/fulcio-root.pem"
+    in_vm_rekor = f"{SIGSTORE_TRUST_MATERIAL_VM_DIR}/rekor.pub.pem"
+    in_vm_ctlog = f"{SIGSTORE_TRUST_MATERIAL_VM_DIR}/ct-log.pub.pem"
+
+    vm.cp(stack.fulcio_root_path, in_vm_fulcio)
+    vm.cp(stack.rekor_public_key_path, in_vm_rekor)
+    vm.cp(stack.ct_log_public_key_path, in_vm_ctlog)
+
+    # Rewrite localhost-bound URLs to the Lima host-gateway name. The
+    # `host.lima.internal` hostname is predefined by Lima's
+    # hostResolver and points at the qemu user-net gateway IP, which
+    # reaches the host's 127.0.0.1-bound Docker port mappings.
+    fulcio_url = stack.fulcio_url.replace("127.0.0.1", "host.lima.internal")
+    rekor_url = stack.rekor_url.replace("127.0.0.1", "host.lima.internal")
+
+    return {
+        "SANDBOX_INSTALL_TEST_FULCIO_ROOT": in_vm_fulcio,
+        "SANDBOX_INSTALL_TEST_REKOR_URL": rekor_url,
+        "SANDBOX_INSTALL_TEST_REKOR_PUBLIC_KEY": in_vm_rekor,
+        "SANDBOX_INSTALL_TEST_CT_LOG_PUBLIC_KEY": in_vm_ctlog,
+        # Echoed for fixtures that want to invoke sandbox-cli's update
+        # path against the local stack (SANDBOX_UPDATE_TEST_* mirrors
+        # the install-side prefix; see sandboxd/sandbox-cli/src/update/
+        # fetch.rs::verify_signature).
+        "SANDBOX_UPDATE_TEST_FULCIO_ROOT": in_vm_fulcio,
+        "SANDBOX_UPDATE_TEST_REKOR_URL": rekor_url,
+        "SANDBOX_UPDATE_TEST_REKOR_PUBLIC_KEY": in_vm_rekor,
+        "SANDBOX_UPDATE_TEST_CT_LOG_PUBLIC_KEY": in_vm_ctlog,
+        # Side-band: the fulcio URL isn't consumed by verify-blob, but
+        # surfacing it lets tests that want to sign inside the VM (e.g.
+        # a future per-VM signing fixture) dial it. Currently unused
+        # by sigstore_verify.
+        "SANDBOX_INSTALL_TEST_FULCIO_URL": fulcio_url,
+    }
+
+
 _TARBALL_VERSION_RE = re.compile(r"^sandboxd-([^-]+(?:\.[^-]+)*)-")
 
 
@@ -815,7 +903,8 @@ def version_from_tarball(tarball_path):
     return m.group(1)
 
 
-def install_sh_cmd(tarball_in_vm, *extra_flags, env=None):
+def install_sh_cmd(tarball_in_vm, *extra_flags, env=None,
+                   vm=None, sigstore_stack=None):
     """Build the canonical install.sh invocation used by every test.
 
     Always passes ``--from``, ``--version``, ``--yes``, ``--no-color``
@@ -827,14 +916,28 @@ def install_sh_cmd(tarball_in_vm, *extra_flags, env=None):
     the install.sh process (via ``sudo VAR=val ...``). Used by the
     air-gapped test to set ``SANDBOX_INSTALL_SKIP_SIGSTORE=1`` (test-
     only bypass; see install.sh::sigstore_verify).
+
+    ``vm`` + ``sigstore_stack``: when both are passed, the local
+    Sigstore stack's trust material is staged inside the VM and the
+    resulting SANDBOX_INSTALL_TEST_* env vars are merged into ``env``
+    (without overriding caller-supplied values). This is the canonical
+    plumbing for "run install.sh against a locally-signed tarball" —
+    every happy-path test using the session-scope ``release_tarball_*``
+    fixtures takes this branch. Mutates the VM (limactl copy) as a
+    side effect; sequential tests don't observe one another.
     """
     ver = version_from_tarball(tarball_in_vm)
-    env_prefix = ""
+    merged_env = {}
+    if vm is not None and sigstore_stack is not None:
+        merged_env.update(stage_sigstore_trust_material_in_vm(vm, sigstore_stack))
     if env:
+        merged_env.update(env)
+    env_prefix = ""
+    if merged_env:
         # `sudo VAR=val ...` preserves the env var into the script's
         # process; `sudo -E` would pull the entire current env in, which
         # we deliberately avoid to keep the test's contract narrow.
-        env_prefix = " ".join(f"{k}={_sh_quote(v)}" for k, v in env.items()) + " "
+        env_prefix = " ".join(f"{k}={_sh_quote(v)}" for k, v in merged_env.items()) + " "
     base = [
         f"sudo {env_prefix}bash /tmp/install.sh",
         f"--from {tarball_in_vm}",
