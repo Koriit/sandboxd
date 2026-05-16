@@ -901,6 +901,12 @@ def assert_full_install_landed(vm):
         "test -x /usr/local/libexec/sandboxd/sandbox-route-helper"
     ).returncode == 0, "route-helper missing or not executable"
     assert vm.shell(
+        "test -x /usr/local/libexec/sandboxd/sandbox-guest"
+    ).returncode == 0, (
+        "sandbox-guest missing or not executable — daemon startup "
+        "staging will fail to read it; see install.sh::install_binaries"
+    )
+    assert vm.shell(
         "test -f /etc/systemd/system/sandboxd.service"
     ).returncode == 0, "systemd unit not installed"
 
