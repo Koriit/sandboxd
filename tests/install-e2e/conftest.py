@@ -1272,6 +1272,33 @@ def restart_sandboxd(vm, *, timeout=60):
     wait_for_socket(vm.name, "/run/sandbox/sandboxd.sock", timeout=timeout)
 
 
+def vm_invoking_user(vm):
+    """Return the in-VM username that ``limactl shell`` lands as.
+
+    Lima maps the host invoking user (`$USER` on the host) onto an
+    in-VM account; the name is host-dependent (`lima` on Lima's stock
+    bootstrap, but matches `$USER` once the host's user differs from
+    the template's default `lima` user). This helper captures the name
+    by running an unwrapped ``whoami`` inside the VM through
+    ``limactl shell`` (i.e. NOT under ``sudo -u <name>``), which is
+    exactly the user identity that install.sh's ``add_operator_to_group``
+    joined to the ``sandbox`` group at install time.
+
+    Tests that need to invoke a setuid-root helper from a uid which is
+    a member of ``sandbox`` (so the kernel-side socket-traversal check
+    on the 0660 socket succeeds before ``setresuid`` drops to the
+    target uid) should use this name rather than a hardcoded ``lima``.
+    """
+    r = vm.shell("whoami", check=True, timeout=10)
+    name = r.stdout.strip()
+    if not name:
+        raise AssertionError(
+            f"vm_invoking_user: `whoami` returned empty output "
+            f"(stdout={r.stdout!r}, stderr={r.stderr!r})"
+        )
+    return name
+
+
 # ---------------------------------------------------------------------------
 # Route-helper audit-log scraping (Spec 1 § 3.5).
 # ---------------------------------------------------------------------------

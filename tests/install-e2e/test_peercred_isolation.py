@@ -52,6 +52,7 @@ from conftest import (
     provision_test_operators_in_vm,
     read_route_helper_audit_log,
     restart_sandboxd,
+    vm_invoking_user,
     wait_for_socket,
     wait_for_systemd_active,
 )
@@ -89,8 +90,13 @@ def _bring_up_peercred_vm(
 ):
     """Common setup for all three multi-uid peercred tests.
 
-    Returns the VM handle once the daemon is up, alice and bob exist,
-    and the peercred-connector is installed setuid-root.
+    Returns ``(vm, invoking_user)`` once the daemon is up, alice and
+    bob exist, and the peercred-connector is installed setuid-root.
+    ``invoking_user`` is the in-VM username that ``limactl shell``
+    lands as (i.e. the user that install.sh's ``add_operator_to_group``
+    joined to the ``sandbox`` group, host-dependent — ``lima`` on the
+    stock Lima default, but matches the host's ``$USER`` when the host
+    user differs).
 
     Steps:
       1. Boot a fresh VM, copy the tarball, run install.sh end-to-end.
@@ -100,10 +106,13 @@ def _bring_up_peercred_vm(
       4. Rewrite ``/etc/sandboxd/users.conf`` so the daemon's startup
          subnet-resolver matches the daemon (``sandbox``) AND alice
          AND bob. The default install only lists the install-time
-         operator (``lima``), not alice or bob.
+         operator, not alice or bob.
       5. Restart sandboxd so the rewritten users.conf takes effect.
       6. Provision the peercred-connector setuid-root binary into
          ``/usr/local/lib/sandboxd-tests/peercred-connector``.
+      7. Capture the invoking-user name for tests that need to invoke
+         the setuid-root peercred-connector from a uid already in the
+         ``sandbox`` group.
     """
     vm = vm_factory(distro_template)
     tarball_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64)
@@ -126,9 +135,9 @@ def _bring_up_peercred_vm(
 
     # Rewrite users.conf so the daemon's startup subnet-resolver finds
     # itself in a pool; alice and bob join that pool. The default
-    # install only listed ``lima`` (and sometimes nothing — when the
-    # install was run as root with no SUDO_USER); the rewrite makes
-    # the test independent of which user invoked sudo.
+    # install only listed the invoking operator (and sometimes nothing
+    # — when the install was run as root with no SUDO_USER); the rewrite
+    # makes the test independent of which user invoked sudo.
     install_multi_operator_users_conf(vm)
 
     # Bounce the daemon so the rewritten users.conf takes effect.
@@ -138,7 +147,11 @@ def _bring_up_peercred_vm(
     # helper is only consumed by the tests, not by install.sh.
     provision_peercred_connector_in_vm(vm, peercred_connector_binary)
 
-    return vm
+    # Resolve the in-VM invoking user once (host-dependent — ``lima``
+    # on Lima's default user mapping, host ``$USER`` otherwise).
+    invoking_user = vm_invoking_user(vm)
+
+    return vm, invoking_user
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +200,7 @@ def integration_route_helper_uid_without_passwd_denies_cleanly(
       tempdir so the audit-log write succeeds even from a uid that
       has no homedir or default runtime dir.
     """
-    vm = _bring_up_peercred_vm(
+    vm, _invoking_user = _bring_up_peercred_vm(
         vm_factory,
         distro_template,
         release_tarball_x86_64,
@@ -372,7 +385,7 @@ def integration_owner_isolation_uid_without_passwd_closes_connection(
     client sees EOF on read. peercred-connector's read loop terminates
     at the first ``n == 0``.
     """
-    vm = _bring_up_peercred_vm(
+    vm, invoking_user = _bring_up_peercred_vm(
         vm_factory,
         distro_template,
         release_tarball_x86_64,
@@ -402,16 +415,18 @@ def integration_owner_isolation_uid_without_passwd_closes_connection(
     )
     cursor = cursor_match.group(1)
 
-    # Invoke peercred-connector as uid 7777. The invoking shell is
-    # ``lima`` (the default Lima user, in the ``sandbox`` group via
-    # install.sh's ``add_operator_to_group``). The helper inherits
-    # lima's supplementary groups, then ``setresuid(7777)`` drops the
-    # real/effective/saved uid+gid; supplementary groups (including
-    # ``sandbox``) are NOT touched by ``setresgid`` and so the helper
-    # retains group-read access to the 0660 daemon socket. This is
-    # the same shape Spec 2 § 9.2 specifies for the multi-uid harness.
+    # Invoke peercred-connector as the install-time operator (host-
+    # dependent — ``lima`` on Lima's default user mapping, host
+    # ``$USER`` otherwise). That user was added to the ``sandbox``
+    # group by install.sh's ``add_operator_to_group``. The helper
+    # inherits their supplementary groups, then ``setresuid(7777)``
+    # drops the real/effective/saved uid+gid; supplementary groups
+    # (including ``sandbox``) are NOT touched by ``setresgid`` and so
+    # the helper retains group-read access to the 0660 daemon socket.
+    # This is the same shape Spec 2 § 9.2 specifies for the multi-uid
+    # harness.
     r = vm.shell(
-        f"sudo -u lima {PEERCRED_CONNECTOR_VM_PATH} "
+        f"sudo -u {invoking_user} {PEERCRED_CONNECTOR_VM_PATH} "
         f"--uid {TEST_UID_NOPASSWD} "
         f"--request-file /tmp/req-7777 "
         f"--socket {DAEMON_SOCK}",
@@ -589,7 +604,7 @@ def integration_session_isolation_404_on_foreign_id(
     test; here we lift it into the Lima multi-uid harness so the
     peercred path is end-to-end real.
     """
-    vm = _bring_up_peercred_vm(
+    vm, invoking_user = _bring_up_peercred_vm(
         vm_factory,
         distro_template,
         release_tarball_x86_64,
@@ -635,14 +650,16 @@ def integration_session_isolation_404_on_foreign_id(
         check=True,
     )
 
-    # Run peercred-connector as bob's uid. ``sudo -u lima`` invokes
-    # the helper from the lima user (in ``sandbox`` group) so the
-    # helper inherits the sandbox supplementary group through the
-    # setuid-exec; then setresuid(bob) drops to bob, retaining the
-    # supplementary group → socket connect works → peercred reports
-    # bob's uid to the daemon.
+    # Run peercred-connector as bob's uid. ``sudo -u <invoking_user>``
+    # invokes the helper from the install-time operator (host-dependent
+    # — ``lima`` on Lima's default user mapping, host ``$USER``
+    # otherwise; in either case in the ``sandbox`` group via install.sh's
+    # ``add_operator_to_group``) so the helper inherits the sandbox
+    # supplementary group through the setuid-exec; then setresuid(bob)
+    # drops to bob, retaining the supplementary group -> socket connect
+    # works -> peercred reports bob's uid to the daemon.
     r = vm.shell(
-        f"sudo -u lima {PEERCRED_CONNECTOR_VM_PATH} "
+        f"sudo -u {invoking_user} {PEERCRED_CONNECTOR_VM_PATH} "
         f"--uid {TEST_UID_BOB} "
         f"--request-file /tmp/req-bob-get "
         f"--socket {DAEMON_SOCK}",
