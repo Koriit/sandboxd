@@ -321,6 +321,22 @@ def release_tarball_x86_64() -> Path:
     Drives ``build-local-tarball.sh``; honors the script's
     SANDBOX_RELEASE_SKIP_BUILD / SKIP_GATEWAY env vars when set in the
     pytest invocation environment so iteration is fast.
+
+    Cache shape:
+
+    * Output: ``tests/install-e2e/dist/sandboxd-<ver>-<arch>.tar.gz``.
+    * Skip rebuild when the cached tarball's mtime is newer than the
+      youngest ``*.rs`` file in the workspace tree. Mirrors the bumped
+      fixture's check (`release_tarball_x86_64_bumped` below) so a
+      workspace ``.rs`` edit invalidates the cached tarball.
+      ``SANDBOX_RELEASE_FORCE_REBUILD=1`` overrides.
+
+    Without the mtime guard, an iteration cycle that edits Rust code and
+    re-runs pytest would happily reuse a stale tarball whose binaries
+    were built against the *pre-edit* tree — so tests would pass /
+    fail against artifacts that no longer reflect HEAD. The
+    ``test_release_tarball_x86_64_fixture_invalidates_on_rs_touch``
+    pytest case below pins this contract.
     """
     if subprocess.run(["uname", "-m"], capture_output=True, text=True).stdout.strip() != "x86_64":
         pytest.skip("release_tarball_x86_64 fixture only assembles on x86_64 hosts")
@@ -329,7 +345,13 @@ def release_tarball_x86_64() -> Path:
     arch = "x86_64-unknown-linux-gnu"
     tarball = DIST_DIR / f"sandboxd-{ver}-{arch}.tar.gz"
 
-    if not tarball.exists() or os.environ.get("SANDBOX_RELEASE_FORCE_REBUILD") == "1":
+    force_rebuild = os.environ.get("SANDBOX_RELEASE_FORCE_REBUILD") == "1"
+    stale = (
+        not tarball.exists()
+        or tarball.stat().st_mtime < _newest_rs_mtime()
+    )
+
+    if force_rebuild or stale:
         subprocess.run(
             [str(HERE / "build-local-tarball.sh")],
             check=True,
