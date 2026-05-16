@@ -139,7 +139,24 @@ sudo sandbox update \
     --yes
 ```
 
-`--check` and `--dry-run` are read-only — they do not acquire the update lock, do not stop the daemon, and do not mutate any state. `--check` exits `0` (already up to date) or `3` (update available); `--dry-run` prints the 18 stateful steps that would run.
+`--check` and `--dry-run` are read-only — they do not acquire the update lock, do not stop the daemon, and do not mutate any state. `--dry-run` prints the 18 stateful steps that would run.
+
+`sandbox update` exit codes:
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success — for a full update: applied; for `--check`: already up to date; for `--dry-run`: plan printed; for the confirmation prompt: answered `N`. |
+| `1` | Runtime error — pre-flight refused, daemon unreachable, network failure, cosign-verify failed, partial-failure mid-flow. The operator should investigate before retrying. |
+| `2` | Argument-parse failure or a refused flag combination (e.g. `--cosign-bundle` without `--from`). |
+| `3` | `--check` only — an update is available (installed version < available version). Scripts can branch on this without parsing stdout. |
+
+Example: script around `--check`:
+
+```bash
+sandbox update --check; rc=$?
+[ $rc -eq 1 ] && { echo "check failed; investigate before updating" >&2; exit 1; }
+[ $rc -eq 3 ] && sudo sandbox update --yes
+```
 
 A full upgrade keeps a versioned backup of every file the installer wrote under `/var/lib/sandbox/backups/<timestamp>-from-<v>-to-<v>/`. The last two successful sets are kept; older ones are pruned automatically. Sets from interrupted or failed upgrades carry `completed_ok: false` and are preserved forensically — they are never auto-pruned.
 

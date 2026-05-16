@@ -34,6 +34,15 @@ BACKUP_DIR=$(sudo -u sandbox sh -c 'ls -td /var/lib/sandbox/backups/*/' \
                | xargs -I{} sudo -u sandbox sh -c \
                    'test "$(jq -r .completed_ok < "{}/manifest.json")" = "true" && echo "{}"' \
                | head -1)
+if [ -z "$BACKUP_DIR" ]; then
+    echo "No backup set with completed_ok=true under /var/lib/sandbox/backups/." >&2
+    echo "Either no successful update has run on this host, or every backup" >&2
+    echo "set is forensic (completed_ok=false)." >&2
+    echo "Inspect the directory directly:" >&2
+    echo "    sudo -u sandbox sh -c 'ls -la /var/lib/sandbox/backups/'" >&2
+    echo "and pick a set manually by setting BACKUP_DIR yourself." >&2
+    exit 1
+fi
 echo "Rolling back from backup: $BACKUP_DIR"
 sudo -u sandbox cat "$BACKUP_DIR/manifest.json"
 

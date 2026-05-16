@@ -1138,3 +1138,99 @@ sandbox rebuild-image --backend container --no-cache
 # Rebuild only the Lima golden image.
 sandbox rebuild-image --backend lima
 ```
+
+---
+
+## sandbox update
+
+Apply a pending sandboxd upgrade — or report what would happen. Orchestrates the full upgrade flow: pre-flight checks (read-only), confirmation prompt, then the stateful steps that stop the daemon, install new binaries, run config migrations, and restart. Each privileged step uses `sudo -k <action>` so every elevation appears as its own line in `/var/log/sandbox-install.log`. The operator-facing walkthrough lives at [Operate: update](/operate/update/).
+
+### Synopsis
+
+```
+sudo sandbox update [--version <v>] [--from <path>] [--cosign-bundle <path>]
+                    [--source-url <url>] [--check] [--dry-run] [--yes]
+                    [--force] [--quiet|--verbose]
+```
+
+### Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--version <semver>` | `latest` | Pin to a specific release tag. With no flag, the latest tag is resolved via the GitHub Releases API. |
+| `--from <path>` | | Use a pre-staged local tarball (or extracted directory) instead of fetching from GitHub Releases. Required for air-gapped operation; the version is read from the embedded `MANIFEST`, not the filename. |
+| `--cosign-bundle <path>` | | Path to a sigstore bundle for `--from` verification. Requires `--from`. When omitted, the CLI looks for a sibling `<tarball>.sigstore` file. |
+| `--source-url <url>` | GitHub Releases | Override the default release-tarball base URL. Mutually exclusive with `--from`. |
+| `--check` | | Read-only mode: report installed vs available, then exit. Never acquires the update lock, never contacts cosign, never extracts anything. See exit codes below. |
+| `--dry-run` | | Read-only mode: print the step-by-step plan (`would execute` or `would skip` per stateful step) and exit. Never mutates state. |
+| `--yes` | | Skip the interactive confirmation prompt. Equivalent to answering `y`. |
+| `--force` | | Proceed past the "active sessions exist" guard. The daemon stop will terminate active sessions mid-flight — use only when the daemon is wedged and you want to upgrade anyway. |
+| `--quiet` | | Quieter logging (one line per major step). |
+| `--verbose` | | Verbose logging (full per-step detail). |
+
+`--check` and `--dry-run` are read-only and may be run without `sudo`. Every other invocation requires `sudo sandbox update` (the CLI binary itself is unprivileged; each step re-elevates via `sudo -k`).
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success: applied; `--check` reported up-to-date; `--dry-run` printed plan; or confirmation answered `N`. |
+| `1` | Runtime error — pre-flight refused, daemon unreachable, network failure, cosign-verify failed, partial-failure mid-flow. |
+| `2` | Argument-parse failure or refused flag combination (e.g. `--cosign-bundle` without `--from`). |
+| `3` | `--check` only — an update is available. Machine-readable signal. |
+
+### Examples
+
+```bash
+# Resolve `latest` via the GitHub Releases API and apply.
+sudo sandbox update
+
+# Pre-flight only — print the upgrade plan, exit without mutating anything.
+sandbox update --check
+sandbox update --dry-run
+
+# Pin a specific target version.
+sudo sandbox update --version 1.2.0
+
+# Air-gapped: pre-staged tarball + sigstore bundle, no network.
+sudo sandbox update \
+    --from /path/to/sandboxd-1.2.0-x86_64-unknown-linux-gnu.tar.gz \
+    --cosign-bundle /path/to/sandboxd-1.2.0-x86_64-unknown-linux-gnu.tar.gz.sigstore \
+    --yes
+
+# Branch on --check exit code in a script.
+sandbox update --check; rc=$?
+[ $rc -eq 3 ] && sudo sandbox update --yes
+```
+
+For the full operator walkthrough — pre-flight, the stateful flow, backup mechanics, lock-file semantics, and the rollback recipe — see [Operate: update](/operate/update/). For the manual recipe to restore a previous release, see [Roll back a sandboxd upgrade](/guides/rollback/).
+
+---
+
+## sandbox doctor
+
+Diagnose the local sandboxd installation. Connects tolerantly: the CLI ↔ daemon strict-equality version handshake is bypassed for this subcommand, so `sandbox doctor` can *diagnose* a version skew rather than be refused by it. The same property makes `doctor` the load-bearing post-update verification step and the post-rollback green-light gate in the [rollback recipe](/guides/rollback/).
+
+### Synopsis
+
+```
+sandbox doctor [--verbose]
+```
+
+### Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--verbose` | | Print every check (including passes) rather than only failures and skip-hints. |
+
+### Examples
+
+```bash
+# Standard run — prints failures only by default.
+sandbox doctor
+
+# Full check listing including passes.
+sandbox doctor --verbose
+```
+
+The check shape, individual probes, and remediation hints are an evolving surface; consult the command's output for the authoritative list.
