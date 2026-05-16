@@ -255,7 +255,27 @@ pub fn acquire(params: AcquireParams<'_>) -> Result<UpdateLock, LockError> {
         // the holder is live. The read is *without* the flock — we may
         // see a partial write; the parse-failure / PID-zero branch
         // tolerates that (§ 6.2.2).
-        let prior = read_payload(&file).unwrap_or(None);
+        //
+        // We tolerate parse failure (covered by `read_payload`'s
+        // internal `serde_json::from_str(..).ok()` collapse) and
+        // legitimate empty-payload, but an I/O error reading the
+        // file itself is unexpected and worth surfacing via
+        // `tracing::warn!` — the previous `unwrap_or(None)` swallowed
+        // it silently, so an operator chasing a stuck lock had no
+        // signal that read_payload itself failed. The graceful-degrade
+        // behaviour (treat as held by an unknown holder; fall through
+        // to the dead-PID-retry path) is preserved so a transient
+        // read glitch doesn't crash the upgrade.
+        let prior = match read_payload(&file) {
+            Ok(payload) => payload,
+            Err(e) => {
+                tracing::warn!(
+                    target: "sandbox-update",
+                    "lock acquire: read_payload failed (treating as no prior payload): {e}"
+                );
+                None
+            }
+        };
         let held_pid = prior.as_ref().map(|p| p.pid).unwrap_or(0);
         if held_pid > 0 && (params.is_pid_alive)(held_pid) {
             return Err(LockError::HeldByLivePid { pid: held_pid });
@@ -406,11 +426,22 @@ fn default_started_at() -> String {
 }
 
 /// Hours since the given ISO-8601 timestamp. Returns 0 on parse error
-/// (treated as "fresh enough").
+/// (treated as "fresh enough" — the conservative side, since adopt
+/// vs adopt-stale only differ in the operator-facing log line; both
+/// proceed with the acquisition). Parse failures are surfaced via
+/// `tracing::warn!` so an operator chasing a stuck lock sees the
+/// timestamp shape that confused the parser; the previous silent
+/// return-0 hid this clue.
 fn compute_stale_hours(iso: &str) -> u64 {
     let parsed = match chrono::DateTime::parse_from_rfc3339(iso) {
         Ok(t) => t,
-        Err(_) => return 0,
+        Err(e) => {
+            tracing::warn!(
+                target: "sandbox-update",
+                "compute_stale_hours: rfc3339 parse failed for `{iso}` ({e}); treating as fresh"
+            );
+            return 0;
+        }
     };
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)

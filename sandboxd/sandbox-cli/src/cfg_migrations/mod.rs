@@ -278,12 +278,20 @@ fn validate_against_target_schema(
 /// consistent version after every successful migration, never in a
 /// half-applied state.
 ///
-/// Convenience wrapper that uses [`TargetFile::canonical_path`]. Used
-/// by `sandbox update`'s in-process orchestration. The hidden
-/// `--apply-config-migration` CLI affordance drives [`apply_pending_at`]
-/// directly so it can target a tempfile path the outer shell flow
-/// `sudo -k mv`s into place.
-pub fn apply_pending(file: TargetFile) -> Result<Vec<u32>, MigrationError> {
+/// Convenience wrapper that uses [`TargetFile::canonical_path`]. The
+/// hidden `--apply-config-migration` CLI affordance drives
+/// [`apply_pending_at`] directly so it can target a tempfile path
+/// the outer shell flow `sudo -k mv`s into place; `sandbox update`'s
+/// in-process orchestration drives [`apply_migration_in_memory`] for
+/// per-migration control over the temp-and-rename pattern. This
+/// wrapper has no production caller today and is `pub(crate)` +
+/// `#[allow(dead_code)]` so a future framework consumer can adopt
+/// it (against the canonical `/etc/...` path) without first
+/// widening the visibility back out — keeping the API surface
+/// minimal while leaving the obvious "apply to canonical path"
+/// shortcut available.
+#[allow(dead_code)]
+pub(crate) fn apply_pending(file: TargetFile) -> Result<Vec<u32>, MigrationError> {
     let path = file.canonical_path();
     apply_pending_at(file, &path)
 }

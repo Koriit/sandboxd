@@ -583,6 +583,22 @@ pub struct PendingMigration {
     pub target_file: &'static str,
 }
 
+/// Convert a `ConfigMigration::name()` slug (snake_case module suffix
+/// such as `add_sandbox_to_allow_users`) into the human-friendly
+/// rendering Spec 5 § 2.2 pins for `--check` output. Underscores
+/// become spaces; everything else is left verbatim so existing
+/// migration names that already read naturally (e.g. a future
+/// `add per-pool rate limit metadata`-style slug) round-trip through
+/// unchanged when written that way.
+///
+/// Pulled into a pure function so the rendering rule is independently
+/// testable and shared between any future caller (e.g. the
+/// confirmation-prompt enumeration if it later surfaces the same
+/// list).
+pub fn pending_migration_human_description(name: &str) -> String {
+    name.replace('_', " ")
+}
+
 /// Render the `--check` report to a sink. Spec 5 § 2.2 output shape.
 pub fn render_check_report<W: Write>(out: &mut W, r: &CheckReport<'_>) -> std::io::Result<()> {
     match r.compare {
@@ -624,7 +640,12 @@ pub fn render_check_report<W: Write>(out: &mut W, r: &CheckReport<'_>) -> std::i
     if !r.pending_config_migrations.is_empty() {
         writeln!(out, "Pending config migrations (current installation):")?;
         for m in &r.pending_config_migrations {
-            writeln!(out, "  config: V{:03} ({})", m.id, m.name)?;
+            writeln!(
+                out,
+                "  config: V{:03} ({})",
+                m.id,
+                pending_migration_human_description(&m.name)
+            )?;
         }
         writeln!(out)?;
     }
@@ -983,6 +1004,16 @@ pub fn read_yes_no<R: Read>(input: R) -> bool {
 /// permission-denied for the read-only mode) returns an empty list —
 /// the operator sees a blank `Pending config migrations` section, the
 /// same graceful-degradation pattern as the install-state read.
+///
+/// Read or schema-parse errors are surfaced via `tracing::warn!` so a
+/// debug-level operator (or the full-update audit trail) sees the
+/// reason a config file was elided from the pending list. The
+/// silent-continue behaviour was a real footgun: an operator running
+/// `sandbox update --check` against a `users.conf` corrupted by a
+/// half-applied earlier migration would get an empty pending list
+/// rather than a clear "file unreadable" signal. The graceful-degrade
+/// outer contract (Vec rather than Result) is preserved so the
+/// confirmation prompt path stays robust.
 pub fn enumerate_pending_config_migrations() -> Vec<PendingMigration> {
     let mut out = Vec::new();
     for file in [
@@ -992,11 +1023,25 @@ pub fn enumerate_pending_config_migrations() -> Vec<PendingMigration> {
         let path = file.canonical_path();
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    target: "sandbox-update",
+                    "enumerate_pending_config_migrations: read failed for {}: {e}",
+                    path.display()
+                );
+                continue;
+            }
         };
         let current = match cfg_migrations::read_schema_version(&bytes, file) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    target: "sandbox-update",
+                    "enumerate_pending_config_migrations: schema-version parse failed for {}: {e:?}",
+                    path.display()
+                );
+                continue;
+            }
         };
         let target = cfg_migrations::latest_for(file);
         if current >= target {
@@ -1026,28 +1071,72 @@ pub fn enumerate_pending_config_migrations() -> Vec<PendingMigration> {
 pub async fn run(args: UpdateArgs) -> i32 {
     // § 3.1.1 — arg-parse + sanity.
     if let Err(msg) = args.validate() {
+        // Log the arg-validation refusal so the operator's audit
+        // trail names the rejected combination before the eprintln
+        // exit. Spec § 3.1.1 mandates a `step=parse_args` line
+        // regardless of outcome.
+        log_step(
+            "parse_args",
+            &format!("action=validate status=fail err=\"{msg}\""),
+        );
         eprintln!("sandbox update: {msg}");
         return 2i32;
     }
+    log_step(
+        "parse_args",
+        &format!(
+            "version={} from={} check={} dry_run={} force={} status=ok",
+            args.version,
+            args.from
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            args.check,
+            args.dry_run,
+            args.force,
+        ),
+    );
 
     // § 3.1.2 — dev-mode detect / refuse.
     if is_dev_mode(Path::new(SYSTEMD_UNIT_PATH), Path::new(INSTALL_STATE_PATH)) {
+        log_step("dev_mode_check", "is_dev=1 action=refuse status=fail");
         eprintln!("{}", dev_mode_refusal_text());
         return 2i32;
     }
+    log_step("dev_mode_check", "is_dev=0 action=continue status=ok");
 
     // § 3.1.3 — install state read (graceful in read-only modes;
     // hard refusal in full-update mode).
     let state = match read_install_state(Path::new(INSTALL_STATE_PATH)) {
-        Ok(Some(s)) => s,
-        Ok(None) if args.is_read_only() => InstallState::unknown_with_host_arch(),
+        Ok(Some(s)) => {
+            log_step(
+                "read_state",
+                &format!(
+                    "installed_version={} installed_arch={} degraded=false status=ok",
+                    s.installed_version, s.installed_arch
+                ),
+            );
+            s
+        }
+        Ok(None) if args.is_read_only() => {
+            log_step(
+                "read_state",
+                "installed_version=unknown degraded=true status=ok",
+            );
+            InstallState::unknown_with_host_arch()
+        }
         Ok(None) => {
+            log_step(
+                "read_state",
+                "installed_version=missing degraded=false status=fail",
+            );
             eprintln!(
                 "sandbox update: install state file missing: {INSTALL_STATE_PATH} — was this host installed via install.sh?"
             );
             return 1i32;
         }
         Err(e) => {
+            log_step("read_state", &format!("status=fail err=\"{e}\""));
             eprintln!("sandbox update: failed to read install state: {e}");
             return 1i32;
         }
@@ -1059,8 +1148,18 @@ pub async fn run(args: UpdateArgs) -> i32 {
     //   2. `--version <v>` → use that string verbatim.
     //   3. `latest` (default) → query the GitHub Releases API.
     let target_version = match resolve_target_version(&args, &state) {
-        Ok(v) => v,
+        Ok(v) => {
+            log_step(
+                "fetch_tarball",
+                &format!("action=resolve target_version={v} status=ok"),
+            );
+            v
+        }
         Err(msg) => {
+            log_step(
+                "fetch_tarball",
+                &format!("action=resolve status=fail err=\"{msg}\""),
+            );
             eprintln!("sandbox update: {msg}");
             return 1i32;
         }
@@ -1068,6 +1167,19 @@ pub async fn run(args: UpdateArgs) -> i32 {
 
     // § 3.1.5 — version compare.
     let compare = compare_versions(&state.installed_version, &target_version);
+    log_step(
+        "version_compare",
+        &format!(
+            "current={} target={} verdict={} status=ok",
+            state.installed_version,
+            target_version,
+            match compare {
+                VersionCompare::UpToDate => "up-to-date",
+                VersionCompare::UpdateAvailable => "update-available",
+                VersionCompare::InstalledUnknown => "installed-unknown",
+            }
+        ),
+    );
 
     // Build the report skeleton — shared by `--check` and `--dry-run`.
     let session_counts = fetch_session_counts(&args.socket_path).await;
@@ -1119,6 +1231,13 @@ pub async fn run(args: UpdateArgs) -> i32 {
 
     // § 3.1.6 — active sessions check.
     if session_counts.reachable && session_counts.active > 0 && !args.force {
+        log_step(
+            "active_session_check",
+            &format!(
+                "active={} force={} action=refuse status=fail",
+                session_counts.active, args.force
+            ),
+        );
         eprintln!(
             "sandbox update: {} session(s) active. Stop them first:\n  \
              sandbox session ls\n  \
@@ -1129,9 +1248,17 @@ pub async fn run(args: UpdateArgs) -> i32 {
         );
         return 1i32;
     }
+    log_step(
+        "active_session_check",
+        &format!(
+            "active={} force={} action=continue status=ok",
+            session_counts.active, args.force
+        ),
+    );
 
     // § 3.1.8 — disk space.
     if !disk.passes() {
+        log_step("disk_check", "action=check status=fail");
         eprintln!("sandbox update: disk-space check failed:");
         for row in &disk.rows {
             if row.free_kb < row.needed_kb {
@@ -1145,6 +1272,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
         }
         return 1i32;
     }
+    log_step("disk_check", "action=check status=ok");
 
     // §§ 3.1.9 / 3.1.10 — cosign bootstrap (handled by install.sh on a
     // prior run; we only invoke verify-blob here), sigstore verify, then
@@ -1191,10 +1319,20 @@ pub async fn run(args: UpdateArgs) -> i32 {
     // surface it directly rather than waiting until the lock-held
     // window.
     let staged = match prepare_staged_tarball(&args, &target_version) {
-        Ok(s) => s,
+        Ok(s) => {
+            log_step(
+                "extract",
+                &format!(
+                    "action=stage version={} stage_dir={} status=ok",
+                    target_version,
+                    s.stage_dir.display()
+                ),
+            );
+            s
+        }
         Err(e) => {
             log_step(
-                "stage_tarball",
+                "extract",
                 &format!("action=stage status=fail err=\"{e}\""),
             );
             eprintln!("sandbox update: {e}");
@@ -1229,12 +1367,30 @@ pub async fn run(args: UpdateArgs) -> i32 {
         cfg_migrations::TargetFile::BridgeConf,
     ] {
         if let Err(e) = dry_run_migration(file) {
+            log_step(
+                "migration_dry_run",
+                &format!(
+                    "file={} action=dry-run status=fail err=\"{e}\"",
+                    file.display_name()
+                ),
+            );
             eprintln!(
                 "sandbox update: migration dry-run failed for {}: {e}",
                 file.display_name()
             );
             return 1i32;
         }
+        log_step(
+            "migration_dry_run",
+            &format!(
+                "file={} action=dry-run pending={} status=ok",
+                file.display_name(),
+                pending_migrations
+                    .iter()
+                    .filter(|m| m.target_file == file.display_name())
+                    .count()
+            ),
+        );
     }
 
     // § 3.1.4 / § 3.1.7 — query the staged (target-version) binary for
@@ -1293,9 +1449,20 @@ pub async fn run(args: UpdateArgs) -> i32 {
         read_yes_no(std::io::stdin().lock())
     };
     if !proceed {
+        log_step(
+            "confirm",
+            "action=prompt response=abort yes_flag=false status=ok",
+        );
         println!("aborted.");
         return 0i32;
     }
+    log_step(
+        "confirm",
+        &format!(
+            "action=prompt response=proceed yes_flag={} status=ok",
+            args.yes
+        ),
+    );
 
     // ----- Stateful phase (§§ 3.2.13-3.2.30) -----
     apply_stateful(StatefulInputs {
@@ -2797,6 +2964,30 @@ mod tests {
         assert!(
             s.contains("Run `sudo sandbox update` to apply."),
             "got:\n{s}"
+        );
+    }
+
+    /// `pending_migration_human_description` translates the
+    /// snake_case migration slug used in `ConfigMigration::name()`
+    /// into the human-friendly rendering Spec 5 § 2.2 pins for
+    /// `--check`. Underscores become spaces; everything else is
+    /// verbatim. The default migration name shipped in the spec
+    /// (`add per-pool rate limit metadata`) already reads as a
+    /// human sentence so it round-trips unchanged.
+    #[test]
+    fn pending_migration_human_description_replaces_underscores() {
+        assert_eq!(
+            pending_migration_human_description("add_sandbox_to_allow_users"),
+            "add sandbox to allow users"
+        );
+    }
+
+    #[test]
+    fn pending_migration_human_description_leaves_human_names_verbatim() {
+        // Spaces, dashes, parentheses, digits all pass through.
+        assert_eq!(
+            pending_migration_human_description("add per-pool rate limit metadata (v2)"),
+            "add per-pool rate limit metadata (v2)"
         );
     }
 

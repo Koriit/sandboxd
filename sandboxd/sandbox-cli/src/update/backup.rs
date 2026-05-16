@@ -480,14 +480,34 @@ fn hex_encode(bytes: &[u8]) -> String {
 // Sudo plumbing
 // ---------------------------------------------------------------------------
 
-/// Run `sudo <args>` and propagate stderr on non-zero exit.
+/// `sudo` invocation prefix every backup helper runs through. The
+/// `-k` flag forces a fresh credential prompt by discarding any
+/// cached operator credentials before the call; Spec 5 § 6.3 names
+/// this the "no-cached-sudo" invariant — every privileged step in
+/// the update flow must re-authenticate so an unattended terminal
+/// session cannot inadvertently authorize a stateful mutation.
+///
+/// The helpers below splice this prefix in front of the caller's
+/// args so the invariant is enforced centrally rather than relying
+/// on every call site to remember the `-k`. Calls that nominally
+/// supply their own `-k` still work — sudo accepts repeated `-k` —
+/// but the canonical pattern is now to pass only the post-`sudo -k`
+/// argv.
+const SUDO_PREFIX: &[&str] = &["-k"];
+
+/// Run `sudo -k <args>` and propagate stderr on non-zero exit. The
+/// `-k` (kill cached credentials) prefix is enforced internally —
+/// callers pass only the post-`-k` argv. Calls that still include
+/// a redundant `-k` are tolerated (repeated `-k` is idempotent in
+/// sudo).
 fn run_sudo(args: &[&str]) -> Result<(), BackupError> {
     let mut cmd = Command::new("sudo");
+    cmd.args(SUDO_PREFIX);
     cmd.args(args);
     let status = cmd.output().map_err(BackupError::Io)?;
     if !status.status.success() {
         return Err(BackupError::Subprocess {
-            cmd: format!("sudo {}", args.join(" ")),
+            cmd: format!("sudo -k {}", args.join(" ")),
             code: status.status.code(),
             stderr: String::from_utf8_lossy(&status.stderr).into_owned(),
         });
@@ -495,14 +515,16 @@ fn run_sudo(args: &[&str]) -> Result<(), BackupError> {
     Ok(())
 }
 
-/// Run `sudo <args>` and return stdout bytes on success.
+/// Run `sudo -k <args>` and return stdout bytes on success. Same
+/// `-k`-enforcement semantics as [`run_sudo`].
 fn run_sudo_capture(args: &[&str]) -> Result<Vec<u8>, BackupError> {
     let mut cmd = Command::new("sudo");
+    cmd.args(SUDO_PREFIX);
     cmd.args(args);
     let out = cmd.output().map_err(BackupError::Io)?;
     if !out.status.success() {
         return Err(BackupError::Subprocess {
-            cmd: format!("sudo {}", args.join(" ")),
+            cmd: format!("sudo -k {}", args.join(" ")),
             code: out.status.code(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         });

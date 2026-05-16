@@ -1522,6 +1522,7 @@ dependencies = [
  "hyper-util",
  "nix",
  "ring",
+ "rusqlite",
  "sandbox-core",
  "serde",
  "serde_json",

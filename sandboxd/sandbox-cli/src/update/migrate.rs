@@ -46,6 +46,16 @@ use crate::cfg_migrations;
 /// one the `--apply-config-migration` gate accepts).
 pub fn tempfile_path_for(target: cfg_migrations::TargetFile, migration_id: u32) -> PathBuf {
     let canonical = target.canonical_path();
+    // SAFETY: `TargetFile::canonical_path` returns an absolute
+    // file path baked into source code (e.g. `/etc/sandboxd/users.conf`).
+    // Every variant has a non-empty parent (`/etc/sandboxd/` or
+    // `/etc/qemu/`) and a non-empty basename by construction, so
+    // both `.expect()`s here are infallible. The
+    // `target_file_canonical_path_round_trip` test in
+    // `cfg_migrations::tests` exercises every registered variant
+    // through `canonical_path` → `from_canonical_path`, so a
+    // future variant that violated the parent/basename invariant
+    // would fail that round-trip first.
     let parent = canonical.parent().expect("canonical path has a parent");
     let basename = canonical
         .file_name()
