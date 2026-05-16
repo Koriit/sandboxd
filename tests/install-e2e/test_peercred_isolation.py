@@ -381,9 +381,15 @@ def integration_owner_isolation_uid_without_passwd_closes_connection(
     Wire-level note: ``UnixStream`` connect is a synchronous primitive
     that returns once both endpoints have the socket-pair, regardless
     of any in-band protocol. The daemon's ``drop(stream)`` after the
-    failed resolve causes the kernel to send FIN to the client; the
-    client sees EOF on read. peercred-connector's read loop terminates
-    at the first ``n == 0``.
+    failed resolve closes the kernel socket; depending on whether any
+    bytes are queued in the receive buffer when close() runs, the
+    kernel may emit either a graceful FIN (peer reads ``n == 0`` and
+    the connector exits 0) or RST (peer reads ``ECONNRESET`` and the
+    connector exits 4 with "Connection reset by peer" on stderr).
+    Spec 2 § 4.1 specifies "close the connection without sending a
+    response" — both close shapes satisfy that invariant, since the
+    observable contract is "no response bytes flowed back to the
+    client". This test therefore accepts either arm.
     """
     vm, invoking_user = _bring_up_peercred_vm(
         vm_factory,
@@ -433,21 +439,41 @@ def integration_owner_isolation_uid_without_passwd_closes_connection(
         timeout=30,
     )
 
-    # The connector exits cleanly: the read loop saw EOF immediately
-    # (no bytes from the daemon) and write_all succeeded against the
-    # not-yet-closed write half. Exit 0 is the expected path because
-    # the connector treats EOF as a clean close.
-    assert r.returncode == 0, (
-        f"peercred-connector exited {r.returncode}; expected 0 (clean EOF)\n"
-        f"stdout:\n{r.stdout!r}\nstderr:\n{r.stderr!r}"
-    )
-
-    # Daemon wrote no bytes to the stream — Spec 2 § 4.1's "closed
-    # without a response" invariant.
-    assert r.stdout == "", (
-        f"daemon should not have sent any bytes to uid {TEST_UID_NOPASSWD}; "
-        f"got stdout: {r.stdout!r}"
-    )
+    # Spec 2 § 4.1 invariant: the daemon closed the connection without
+    # sending a response. Two observable shapes both satisfy this:
+    #
+    #   - exit 0, empty stdout, empty stderr: the kernel delivered a
+    #     graceful FIN; the connector's read loop saw ``n == 0`` and
+    #     treated EOF as a clean close.
+    #   - exit 4, empty stdout, stderr containing "Connection reset by
+    #     peer": the kernel delivered RST (daemon's ``drop(stream)``
+    #     closed the fd with the request bytes still queued in the
+    #     receive buffer); the connector's ``read_response`` returned
+    #     ECONNRESET and it exited with code 4.
+    #
+    # Both arms pin the same wire-level invariant: no response bytes
+    # flowed back to the client. The choice between FIN and RST is a
+    # kernel-side function of whether unread data is queued at close-
+    # time (see TODO note at the end of the test about whether the
+    # daemon SHOULD prefer graceful FIN — out of scope for this test).
+    if r.returncode == 0:
+        assert r.stdout == "" and r.stderr == "", (
+            f"daemon close-without-response (FIN arm): expected empty "
+            f"stdout/stderr; got stdout={r.stdout!r} stderr={r.stderr!r}"
+        )
+    elif r.returncode == 4:
+        assert r.stdout == "" and "Connection reset by peer" in r.stderr, (
+            f"daemon close-without-response (RST arm): expected empty "
+            f"stdout and 'Connection reset by peer' in stderr; got "
+            f"stdout={r.stdout!r} stderr={r.stderr!r}"
+        )
+    else:
+        raise AssertionError(
+            f"peercred-connector exited {r.returncode}; expected 0 "
+            f"(graceful FIN) or 4 (RST). Both satisfy Spec 2 § 4.1's "
+            f"'close without sending a response' invariant.\n"
+            f"stdout:\n{r.stdout!r}\nstderr:\n{r.stderr!r}"
+        )
 
     # ---------------- Journal assertion ----------------
 
