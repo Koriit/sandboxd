@@ -968,6 +968,155 @@ COSIGN_SHA256_ARM64 = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Local Sigstore stack — session-scope fixture.
+# ---------------------------------------------------------------------------
+#
+# The seven-container stack under ``tests/install-e2e/sigstore-stack/``
+# stands in for the production Fulcio + Rekor + CT-log trio so install.sh
+# (and ``sandbox update``) can exercise the real cosign verify-blob path
+# against locally-signed tarballs. See the README.md alongside
+# ``docker-compose.yml`` for operator notes; the architectural
+# rationale (DNS interception, TLS CA injection, JWT minting strategy)
+# is recorded in the stack's bring-up handoff in ``.tasks/handoffs/``.
+
+SIGSTORE_STACK_DIR = HERE / "sigstore-stack"
+
+
+@dataclass(frozen=True)
+class SigstoreStackHandle:
+    """Handle on the running Sigstore stack returned by ``sigstore_stack``.
+
+    All paths reference files on the *host* (the stack runs on the host
+    via ``docker compose``). Tests that need these inside a Lima VM are
+    responsible for copying the files in via ``vm.cp``; the typical
+    pattern is ``copy_signed_tarball_to_vm`` (defined below), which also
+    plants the sibling ``.sigstore`` bundle.
+
+    The URLs (``fulcio_url``, ``rekor_url``, ``oidc_url``) are
+    host-side bindings on ``127.0.0.1``; install.sh running inside a
+    Lima VM reaches them as ``host.lima.internal:PORT`` after the
+    ``hostResolver.hosts`` injection performed at VM start time.
+    """
+
+    fulcio_url: str
+    rekor_url: str
+    oidc_url: str
+    fulcio_root_path: Path
+    rekor_public_key_path: Path
+    ct_log_public_key_path: Path
+    oidc_signing_key_path: Path
+    mint_token_script: Path
+
+
+def _docker_compose_available() -> bool:
+    if not shutil.which("docker"):
+        return False
+    rc = subprocess.run(
+        ["docker", "compose", "version"], capture_output=True, text=True,
+    )
+    return rc.returncode == 0
+
+
+def _sigstore_compose(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["docker", "compose", *args],
+        cwd=SIGSTORE_STACK_DIR,
+        check=check,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _wait_http_200(url: str, deadline_seconds: float) -> None:
+    """Poll *url* until it returns HTTP 200. Best-effort retry on any error."""
+    import urllib.request
+    deadline = time.monotonic() + deadline_seconds
+    last_err = None
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=2) as resp:
+                if resp.status == 200:
+                    return
+        except Exception as e:  # noqa: BLE001 — best-effort retry
+            last_err = e
+        time.sleep(0.5)
+    raise RuntimeError(f"timed out waiting for {url}: {last_err}")
+
+
+@pytest.fixture(scope="session")
+def sigstore_stack():
+    """Bring up the local Sigstore stack once per pytest session.
+
+    Skips the whole session if docker compose is unavailable; tests
+    that depend on the fixture will be skipped, which is the right
+    behaviour on hosts without Docker (smoke test included).
+
+    The stack runs on the host (127.0.0.1:5555 Fulcio, :3000 Rekor,
+    :8443 OIDC discovery). Tests running install.sh inside a Lima VM
+    reach the stack via ``host.lima.internal:PORT`` after the VM
+    factory injects the ``hostResolver.hosts`` entries (see
+    ``lima_start``); tests running cosign on the host (the smoke test)
+    use ``127.0.0.1`` directly.
+    """
+    if not _docker_compose_available():
+        pytest.skip("docker compose not available; sigstore_stack unusable")
+
+    # Idempotent state generation.
+    init_rc = subprocess.run(
+        [str(SIGSTORE_STACK_DIR / "init.sh")],
+        capture_output=True, text=True,
+    )
+    if init_rc.returncode != 0:
+        raise RuntimeError(
+            f"sigstore-stack init.sh failed: rc={init_rc.returncode}\n"
+            f"stdout:\n{init_rc.stdout}\nstderr:\n{init_rc.stderr}"
+        )
+
+    bringup = _sigstore_compose("up", "-d", check=False)
+    if bringup.returncode != 0:
+        # Surface the failure with teardown noise so the operator sees
+        # both the bring-up error AND the cleanup result.
+        teardown = _sigstore_compose("down", "-v", check=False)
+        raise RuntimeError(
+            f"docker compose up failed: rc={bringup.returncode}\n"
+            f"stdout:\n{bringup.stdout}\nstderr:\n{bringup.stderr}\n"
+            f"teardown stdout:\n{teardown.stdout}\n"
+            f"teardown stderr:\n{teardown.stderr}"
+        )
+
+    try:
+        # Fulcio's /healthz blocks until its downstream deps (CT log
+        # included) are reachable, so we don't need a separate
+        # tesseract probe.
+        _wait_http_200("http://127.0.0.1:5555/healthz", deadline_seconds=120.0)
+        # Rekor's /ping returns 200 once Trillian is initialised.
+        _wait_http_200("http://127.0.0.1:3000/ping", deadline_seconds=60.0)
+
+        # Cache the Rekor public key on disk so install.sh inside the
+        # VM (which gets the file copied in) can point at a path rather
+        # than re-fetching at install time.
+        rekor_pub_path = SIGSTORE_STACK_DIR / "state" / "rekor.pub.cached.pem"
+        import urllib.request
+        with urllib.request.urlopen(
+            "http://127.0.0.1:3000/api/v1/log/publicKey", timeout=5,
+        ) as resp:
+            rekor_pub_path.write_bytes(resp.read())
+
+        yield SigstoreStackHandle(
+            fulcio_url="http://127.0.0.1:5555",
+            rekor_url="http://127.0.0.1:3000",
+            oidc_url="https://127.0.0.1:8443",
+            fulcio_root_path=SIGSTORE_STACK_DIR / "state" / "fulcio-root" / "root.pem",
+            rekor_public_key_path=rekor_pub_path,
+            ct_log_public_key_path=SIGSTORE_STACK_DIR / "state" / "ct-log" / "pubkey.pem",
+            oidc_signing_key_path=SIGSTORE_STACK_DIR / "state" / "oidc" / "signing.key.pem",
+            mint_token_script=SIGSTORE_STACK_DIR / "mint_token.py",
+        )
+    finally:
+        _sigstore_compose("down", "-v", check=False)
+
+
 @pytest.fixture(scope="session")
 def pinned_cosign_binary() -> Path:
     """Return a host-cached cosign binary matching install.sh's pin.
