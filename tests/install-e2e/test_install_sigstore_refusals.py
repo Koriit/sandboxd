@@ -141,6 +141,19 @@ def test_install_aborts_on_tampered_tarball(
     # conv=notrunc keeps the file size; bs=1 count=1 writes one byte.
     # status=none keeps the test output clean; on failure we re-run
     # without it to surface the underlying error.
+    #
+    # chmod first: the tarball was planted by limactl copy under the
+    # invoking user; the default Lima user has umask 0077 so the file
+    # lands mode 0600. `sudo dd of=<file>` re-opens the file for write
+    # — on some Lima kernels this hits EACCES even as root (likely a
+    # mount-option interaction with the user-home overlay). Flipping
+    # to world-writable first sidesteps it without changing the bytes
+    # we care about. The byte-flip itself is the security-relevant
+    # mutation; the mode change is harmless harness scaffolding.
+    vm.shell(
+        f"sudo chmod 0666 {tarball_in_vm}",
+        check=True, timeout=10,
+    )
     vm.shell(
         f"sudo dd if=/dev/zero of={tarball_in_vm} bs=1 count=1 "
         f"conv=notrunc status=none",
