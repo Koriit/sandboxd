@@ -434,7 +434,7 @@ async fn integration_guest_refresh_container_backend() {
     let session = store
         .create_session_with_backend(
             SessionConfig::default(),
-            Some("m16-s6-refresh".into()),
+            Some("bind-mount-refresh".into()),
             BackendKind::Container,
             "test-operator",
             // Stale stamp — simulates an older daemon's session.
@@ -551,7 +551,7 @@ async fn integration_guest_binary_swap_picked_up_by_new_sessions() {
     let session_one = store
         .create_session_with_backend(
             SessionConfig::default(),
-            Some("m16-s6-swap-one".into()),
+            Some("swap-one".into()),
             BackendKind::Container,
             "test-operator",
             DAEMON_GUEST_PROTO_VERSION,
@@ -597,7 +597,7 @@ async fn integration_guest_binary_swap_picked_up_by_new_sessions() {
     let session_two = store
         .create_session_with_backend(
             SessionConfig::default(),
-            Some("m16-s6-swap-two".into()),
+            Some("swap-two".into()),
             BackendKind::Container,
             "test-operator",
             DAEMON_GUEST_PROTO_VERSION,
@@ -689,7 +689,7 @@ async fn integration_guest_binary_shared_inode_across_sessions() {
     let session_a = store
         .create_session_with_backend(
             SessionConfig::default(),
-            Some("m16-s6-share-a".into()),
+            Some("share-a".into()),
             BackendKind::Container,
             "test-operator",
             DAEMON_GUEST_PROTO_VERSION,
@@ -712,7 +712,7 @@ async fn integration_guest_binary_shared_inode_across_sessions() {
     let session_b = store
         .create_session_with_backend(
             SessionConfig::default(),
-            Some("m16-s6-share-b".into()),
+            Some("share-b".into()),
             BackendKind::Container,
             "test-operator",
             DAEMON_GUEST_PROTO_VERSION,
