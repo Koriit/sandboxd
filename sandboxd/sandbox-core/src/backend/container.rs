@@ -267,17 +267,20 @@ pub struct ContainerRuntime {
     /// used.
     user_uid: u32,
     user_gid: u32,
-    /// Host path of the daemon-staged `sandbox-guest` binary. Every
+    /// Host path of the installed `sandbox-guest` binary. Every
     /// container created by this runtime gets a `-v
-    /// {staged_guest_path}:/usr/local/bin/sandbox-guest:ro` bind-mount
+    /// {guest_bind_source}:/usr/local/bin/sandbox-guest:ro` bind-mount
     /// at `docker create` time so the in-image baked guest is overlaid
     /// by the daemon's current binary; refresh is implemented as a
     /// `docker restart` (api-session-isolation spec § 3.8.1). The path
-    /// is set by the daemon at construction time
-    /// (see `main.rs` — pointed at `{base_dir}/guest/sandbox-guest`)
-    /// and pinned for the runtime's lifetime; the daemon's startup
-    /// staging step is the sole writer of the underlying file.
-    staged_guest_path: PathBuf,
+    /// is set by the daemon at construction time (see `main.rs` —
+    /// resolved via `sandbox_core::guest_agent_path`, which finds the
+    /// FHS install path `/usr/local/libexec/sandboxd/sandbox-guest` in
+    /// production and falls back to the cargo target in dev) and pinned
+    /// for the runtime's lifetime. `sandbox update` atomically renames
+    /// the libexec file, so the bind-mount source is always coherent
+    /// without a daemon-side staging step.
+    guest_bind_source: PathBuf,
     /// Per-session network info, populated by the daemon (3D) or by
     /// tests before [`SessionRuntime::create`]. Keyed on the session id
     /// so a single runtime instance handles every session.
@@ -302,18 +305,19 @@ impl ContainerRuntime {
     /// alignment with the host operator's uid when the host uid is not
     /// 1000.
     ///
-    /// `staged_guest_path` is the host path bound read-only into every
-    /// container at `/usr/local/bin/sandbox-guest`. The daemon stages
-    /// the embedded `sandbox-guest` bytes at this path at startup; the
-    /// runtime treats it as opaque (it never reads or writes the file
-    /// itself).
+    /// `guest_bind_source` is the host path bound read-only into every
+    /// container at `/usr/local/bin/sandbox-guest`. The daemon resolves
+    /// it via `sandbox_core::guest_agent_path` (production: the FHS
+    /// libexec install path; dev / test: the cargo target sibling).
+    /// The runtime treats the path as opaque — it never reads or writes
+    /// the file itself.
     pub fn new(
         image_tag: impl Into<String>,
         default_memory_mb: u32,
         default_cpus: f64,
         user_uid: u32,
         user_gid: u32,
-        staged_guest_path: impl Into<PathBuf>,
+        guest_bind_source: impl Into<PathBuf>,
     ) -> Arc<Self> {
         Arc::new(Self {
             capabilities: capabilities_for_container(),
@@ -322,18 +326,18 @@ impl ContainerRuntime {
             default_cpus,
             user_uid,
             user_gid,
-            staged_guest_path: staged_guest_path.into(),
+            guest_bind_source: guest_bind_source.into(),
             sessions: Mutex::new(HashMap::new()),
         })
     }
 
     /// Return the host path the runtime bind-mounts read-only into
     /// every container at `/usr/local/bin/sandbox-guest`. Used by
-    /// integration tests to read the staged bytes and assert they
+    /// integration tests to read the source bytes and assert they
     /// equal the in-container post-refresh contents (exercised by
     /// `integration_guest_refresh_container_backend`).
-    pub fn staged_guest_path(&self) -> &Path {
-        &self.staged_guest_path
+    pub fn guest_bind_source(&self) -> &Path {
+        &self.guest_bind_source
     }
 
     /// Image tag this runtime uses on `docker create` / `docker build`.
@@ -494,7 +498,7 @@ fn build_create_argv(
     user_gid: u32,
     memory_mb: u32,
     cpus: f64,
-    staged_guest_path: &Path,
+    guest_bind_source: &Path,
 ) -> Vec<String> {
     let container_name = format!("sandbox-{session_id}");
     let home_volume = home_volume_name(session_id);
@@ -519,15 +523,17 @@ fn build_create_argv(
         )
     });
     let ca_args = build_ca_mount_args(network);
-    // api-session-isolation spec § 3.8.1 — the
-    // daemon-staged `sandbox-guest` is bind-mounted read-only at the
-    // canonical in-container path so refresh becomes `docker restart`
-    // rather than a `docker cp` into the `--read-only` rootfs. One
-    // inode is shared across every live container session; the kernel
-    // page cache for the guest binary is shared too.
+    // api-session-isolation spec § 3.8.1 — the installed
+    // `sandbox-guest` is bind-mounted read-only at the canonical
+    // in-container path so refresh becomes `docker restart` rather
+    // than a `docker cp` into the `--read-only` rootfs. One inode is
+    // shared across every live container session; the kernel page
+    // cache for the guest binary is shared too. The source is the
+    // FHS libexec install path; `sandbox update` atomically renames
+    // it so the bind-mount source is always coherent.
     let guest_bind_mount = format!(
         "{}:/usr/local/bin/sandbox-guest:ro",
-        staged_guest_path.to_string_lossy()
+        guest_bind_source.to_string_lossy()
     );
 
     let mut args: Vec<String> = vec![
@@ -635,7 +641,7 @@ impl SessionRuntime for ContainerRuntime {
             self.user_gid,
             memory_mb,
             cpus,
-            &self.staged_guest_path,
+            &self.guest_bind_source,
         );
 
         debug!(
@@ -830,9 +836,11 @@ impl SessionRuntime for ContainerRuntime {
         //    `/usr/local/bin/sandbox-guest`. `docker restart` is
         //    idempotent on a stopped container (it just starts it) and
         //    on a running container (it does a stop+start). The
-        //    bind-mount source itself is the daemon's
-        //    `{base_dir}/guest/sandbox-guest`, staged at boot — see
-        //    `sandbox_core::stage_guest_binary_into_base_dir`.
+        //    bind-mount source is the installed `sandbox-guest` at the
+        //    FHS libexec path (resolved via
+        //    `sandbox_core::guest_agent_path`); `sandbox update`
+        //    atomically renames that file so the source is always
+        //    current.
         let restart_args = build_refresh_argv(&container_name);
         run_docker(&restart_args, "docker restart (guest refresh)").await?;
 
@@ -1784,8 +1792,8 @@ mod tests {
         );
     }
 
-    /// The daemon-staged `sandbox-guest` is bind-mounted read-only
-    /// into every container at the canonical in-container path
+    /// The installed `sandbox-guest` is bind-mounted read-only into
+    /// every container at the canonical in-container path
     /// (api-session-isolation spec § 3.8.1). The flag pair must
     /// appear verbatim in the `docker create` argv; a regression in
     /// the source path, destination, or `:ro` mode flag would
@@ -1804,7 +1812,8 @@ mod tests {
             route_helper_path: None,
             ca_host_path: None,
         };
-        let staged_path = std::path::PathBuf::from("/var/lib/sandbox/guest/sandbox-guest");
+        let guest_bind_source =
+            std::path::PathBuf::from("/usr/local/libexec/sandboxd/sandbox-guest");
         let args = build_create_argv(
             &sid,
             &network,
@@ -1813,7 +1822,7 @@ mod tests {
             1000,
             512,
             1.0,
-            &staged_path,
+            &guest_bind_source,
         );
 
         // Locate the `-v` flag — there is exactly one in the canonical
@@ -1837,8 +1846,7 @@ mod tests {
             .get(v_idx + 1)
             .expect("`-v` must be followed by a mount spec");
         assert_eq!(
-            mount_spec,
-            "/var/lib/sandbox/guest/sandbox-guest:/usr/local/bin/sandbox-guest:ro",
+            mount_spec, "/usr/local/libexec/sandboxd/sandbox-guest:/usr/local/bin/sandbox-guest:ro",
             "guest bind-mount spec drift — load-bearing for the bind-mount design",
         );
 

@@ -2,10 +2,10 @@
 //! (api-session-isolation spec §§ 3.4, 3.8, 3.9; §§ 7.4, 7.5).
 //!
 //! Under spec § 3.8.1's bind-mount design, the container backend's
-//! refresh path is not a `docker cp` into the rootfs; instead, the
-//! daemon stages `sandbox-guest` once into
-//! `{base_dir}/guest/sandbox-guest` at startup and every container
-//! session bind-mounts that path read-only at
+//! refresh path is not a `docker cp` into the rootfs; instead, every
+//! container session bind-mounts the installed `sandbox-guest` from
+//! the FHS libexec path (`/usr/local/libexec/sandboxd/sandbox-guest`,
+//! atomically renamed by `sandbox update`) read-only at
 //! `/usr/local/bin/sandbox-guest`. Refresh becomes `docker restart`.
 //!
 //! Test coverage in this file:
@@ -29,14 +29,15 @@
 //!   (`sandboxd-lite:<workspace_version>`, produced by
 //!   `make lite-image`). Asserts the in-container
 //!   `/usr/local/bin/sandbox-guest` post-restart bytes are
-//!   bit-identical to the daemon's staged-source bytes (the
+//!   bit-identical to the host-side bind-mount source bytes (the
 //!   bind-mount design's load-bearing property) and that
 //!   `update_guest_versions` lands. Docker-required.
 //! - `integration_guest_binary_swap_picked_up_by_new_sessions` —
-//!   change the host-side staged bytes between two container creates;
-//!   verify the second container sees the new bytes through its bind-
-//!   mount. Pins the "new sessions automatically pick up the
-//!   refreshed daemon's guest" property. Docker-required.
+//!   change the host-side bind-mount source bytes between two
+//!   container creates; verify the second container sees the new
+//!   bytes through its bind-mount. Pins the "new sessions
+//!   automatically pick up the refreshed guest" property. Docker-
+//!   required.
 //! - `integration_guest_binary_shared_inode_across_sessions` — start
 //!   two container sessions; verify their bind-mounted
 //!   `/usr/local/bin/sandbox-guest` resolves to the same backing
@@ -301,30 +302,39 @@ fn lite_image_tag() -> String {
     lite_image_tag_for_version(env!("CARGO_PKG_VERSION"))
 }
 
-/// Stage `bytes` (with mode 0755) into a per-test base directory's
-/// `guest/sandbox-guest`. Returns the absolute host path. Mirrors
-/// what `sandbox_core::stage_guest_binary_into_base_dir`
-/// does at daemon startup so the test fixture exercises the same
-/// on-disk shape every container session sees.
-fn stage_test_guest(base_dir: &std::path::Path, bytes: &[u8]) -> PathBuf {
-    let guest_dir = base_dir.join(sandbox_core::STAGED_GUEST_SUBDIR);
-    std::fs::create_dir_all(&guest_dir).expect("create guest subdir");
-    let path = sandbox_core::staged_guest_path(base_dir);
-    // Re-use the production staging function so a regression in the
-    // atomic-write or chmod logic surfaces here too. Synthetic bytes
-    // mean the resulting "guest" never actually executes useful
-    // protocol code; the bind-mount design is what the test exercises.
-    let outcome =
-        sandbox_core::stage_guest_binary_at(&path, bytes).expect("stage_guest_binary_at");
-    assert!(
-        matches!(
-            outcome,
-            sandbox_core::StageOutcome::Wrote | sandbox_core::StageOutcome::Rewrote
-        ),
-        "first stage on a freshly-created subdir must write or rewrite, not skip; \
-         got {outcome:?}",
-    );
+/// Drop `bytes` (with mode 0755) at `{base_dir}/sandbox-guest` and
+/// return the absolute host path. The path becomes the bind-mount
+/// source the runtime passes as `guest_bind_source`; synthetic bytes
+/// mean the resulting "guest" never actually executes useful
+/// protocol code, but the kernel still happily mounts the file at
+/// `/usr/local/bin/sandbox-guest` inside the container so the
+/// bind-mount property the test pins is observable.
+fn place_test_guest(base_dir: &std::path::Path, bytes: &[u8]) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = base_dir.join("sandbox-guest");
+    std::fs::write(&path, bytes).expect("write test guest binary");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod 0755 on test guest binary");
     path
+}
+
+/// Atomically replace the file at `path` with `bytes` via a
+/// sibling-tempfile-and-rename. Used by the bind-mount-swap test to
+/// prove that NEW containers see the new bytes through their
+/// bind-mount after the host-side source is rewritten in place.
+fn replace_test_guest_atomically(path: &std::path::Path, bytes: &[u8]) {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let parent = path.parent().expect("path has parent");
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".sandbox-guest-test-")
+        .tempfile_in(parent)
+        .expect("tempfile_in parent");
+    tmp.write_all(bytes).expect("write tempfile");
+    tmp.flush().expect("flush tempfile");
+    std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755))
+        .expect("chmod 0755 on tempfile");
+    tmp.persist(path).expect("atomic rename onto path");
 }
 
 /// A bash one-liner that sleeps long enough for the test to complete
@@ -413,11 +423,13 @@ async fn integration_guest_refresh_container_backend() {
     let net = TestNetwork::create("refresh");
 
     // Per-test base directory. The daemon would point its
-    // `staged_guest_path` at `{base_dir}/guest/sandbox-guest`; the
-    // test fixture stages a synthetic script at that path so the
-    // bind-mount lands an executable file inside the container.
+    // `guest_bind_source` at the FHS install path
+    // (`/usr/local/libexec/sandboxd/sandbox-guest`); the test fixture
+    // drops a synthetic script at a tempdir path so the bind-mount
+    // lands an executable file inside the container without depending
+    // on a real install.
     let base_dir = TempDir::new().expect("tempdir base_dir");
-    let staged_path = stage_test_guest(base_dir.path(), &placeholder_sleep_script("v-new"));
+    let staged_path = place_test_guest(base_dir.path(), &placeholder_sleep_script("v-new"));
 
     let runtime = ContainerRuntime::new(
         lite_image_tag(),
@@ -519,14 +531,14 @@ async fn integration_guest_refresh_container_backend() {
     runtime.delete(&handle).await.expect("runtime.delete");
 }
 
-/// Change the host-side staged file's bytes between two container
+/// Change the host-side bind-mount source bytes between two container
 /// creates; verify the second container sees the new bytes through
 /// its bind-mount (api-session-isolation spec § 3.8.1).
 ///
 /// This pins the "new sessions automatically pick up the refreshed
-/// daemon's guest" property of the bind-mount design: a daemon
-/// upgrade that stages new bytes into `{base_dir}/guest/sandbox-guest`
-/// changes what every subsequent container session sees at
+/// daemon's guest" property of the bind-mount design: a `sandbox
+/// update` that atomically renames the libexec binary changes what
+/// every subsequent container session sees at
 /// `/usr/local/bin/sandbox-guest`, without per-session refresh work.
 #[tokio::test]
 async fn integration_guest_binary_swap_picked_up_by_new_sessions() {
@@ -534,7 +546,7 @@ async fn integration_guest_binary_swap_picked_up_by_new_sessions() {
     let base_dir = TempDir::new().expect("tempdir base_dir");
 
     // Stage v1 and create container #1.
-    let staged_path = stage_test_guest(base_dir.path(), &placeholder_sleep_script("v-one"));
+    let staged_path = place_test_guest(base_dir.path(), &placeholder_sleep_script("v-one"));
     let runtime = ContainerRuntime::new(
         lite_image_tag(),
         128,
@@ -576,20 +588,14 @@ async fn integration_guest_binary_swap_picked_up_by_new_sessions() {
         c1_bytes.len(),
     );
 
-    // Swap: rewrite the staged file with v2 bytes. The atomic rename
-    // happens inside `stage_guest_binary_at`; container #1's
+    // Swap: rewrite the host-side bind-mount source with v2 bytes
+    // via an atomic sibling-tempfile-and-rename. Container #1's
     // bind-mount continues to resolve to the OLD inode (the kernel
     // captured the inode at mount time) — that's a kernel-level
     // guarantee we don't assert here, we only assert that NEW
     // containers see the NEW bytes.
     let v2_bytes = placeholder_sleep_script("v-two-rewritten");
-    let outcome = sandbox_core::stage_guest_binary_at(&staged_path, &v2_bytes)
-        .expect("stage v2 bytes");
-    assert_eq!(
-        outcome,
-        sandbox_core::StageOutcome::Rewrote,
-        "staging different bytes over an existing file must take the Rewrote arm",
-    );
+    replace_test_guest_atomically(&staged_path, &v2_bytes);
 
     // New network for container #2 (each container needs its own /28 IP).
     let net2 = TestNetwork::create("swap2");
@@ -670,7 +676,7 @@ async fn integration_guest_binary_swap_picked_up_by_new_sessions() {
 #[tokio::test]
 async fn integration_guest_binary_shared_inode_across_sessions() {
     let base_dir = TempDir::new().expect("tempdir base_dir");
-    let staged_path = stage_test_guest(base_dir.path(), &placeholder_sleep_script("shared"));
+    let staged_path = place_test_guest(base_dir.path(), &placeholder_sleep_script("shared"));
     let runtime = ContainerRuntime::new(
         lite_image_tag(),
         128,

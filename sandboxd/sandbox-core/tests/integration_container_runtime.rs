@@ -204,14 +204,14 @@ fn container_spec() -> SessionSpec {
 }
 
 /// Resolve a stable host path for the bind-mount source the runtime
-/// passes as `staged_guest_path`. The path must exist before
+/// passes as `guest_bind_source`. The path must exist before
 /// `docker create` runs (otherwise dockerd errors on the mount source),
-/// so we stage a small placeholder file in a process-global tempdir
+/// so we drop a small placeholder file in a process-global tempdir
 /// and reuse the same path across every integration test in this
 /// file. Tests in this module are not exercising refresh — they just
 /// need the bind-mount source to be a real, executable host file so
 /// the create/start lifecycle assertions hold.
-fn staged_guest_path_for_tests() -> std::path::PathBuf {
+fn guest_bind_source_for_tests() -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::OnceLock;
     static GUEST_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
@@ -221,13 +221,13 @@ fn staged_guest_path_for_tests() -> std::path::PathBuf {
             // lifetime; the underlying file is not unlinked because
             // every test in this file reuses the same path and racing
             // `docker create` against an unlinked source would flake.
-            let dir = std::env::temp_dir().join("sandboxd-test-staged-guest");
-            std::fs::create_dir_all(&dir).expect("create test staged-guest dir");
+            let dir = std::env::temp_dir().join("sandboxd-test-guest-bind-source");
+            std::fs::create_dir_all(&dir).expect("create test guest-bind-source dir");
             let path = dir.join("sandbox-guest");
             std::fs::write(&path, b"placeholder-sandbox-guest-for-integration-tests\n")
-                .expect("write placeholder staged-guest binary");
+                .expect("write placeholder guest binary");
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod 0755 on placeholder staged-guest binary");
+                .expect("chmod 0755 on placeholder guest binary");
             path
         })
         .clone()
@@ -240,7 +240,7 @@ fn make_runtime() -> std::sync::Arc<ContainerRuntime> {
         1.0,
         1000,
         1000,
-        staged_guest_path_for_tests(),
+        guest_bind_source_for_tests(),
     )
 }
 

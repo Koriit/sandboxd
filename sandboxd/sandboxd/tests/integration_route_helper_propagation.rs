@@ -234,23 +234,23 @@ fn container_spec() -> SessionSpec {
 }
 
 /// Resolve a stable host path for the bind-mount source the runtime
-/// passes as `staged_guest_path`. Necessary for any test that
+/// passes as `guest_bind_source`. Necessary for any test that
 /// `docker create`s a real container — dockerd errors at create time
 /// if the mount source does not exist. See api-session-isolation
 /// spec § 3.8.1 for the bind-mount design.
-fn staged_guest_path_for_tests() -> std::path::PathBuf {
+fn guest_bind_source_for_tests() -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::OnceLock;
     static GUEST_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
     GUEST_PATH
         .get_or_init(|| {
-            let dir = std::env::temp_dir().join("sandboxd-test-staged-guest");
-            std::fs::create_dir_all(&dir).expect("create test staged-guest dir");
+            let dir = std::env::temp_dir().join("sandboxd-test-guest-bind-source");
+            std::fs::create_dir_all(&dir).expect("create test guest-bind-source dir");
             let path = dir.join("sandbox-guest");
             std::fs::write(&path, b"placeholder-sandbox-guest-for-integration-tests\n")
-                .expect("write placeholder staged-guest binary");
+                .expect("write placeholder guest binary");
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod 0755 on placeholder staged-guest binary");
+                .expect("chmod 0755 on placeholder guest binary");
             path
         })
         .clone()
@@ -282,7 +282,14 @@ async fn integration_route_helper_for_user_propagated() {
     let (stub_path, capture_path) = install_stub_helper(stub_dir.path());
 
     let net = TestNetwork::create("propagated");
-    let runtime = ContainerRuntime::new(SLEEP_IMAGE_TAG, 256, 1.0, 1000, 1000, staged_guest_path_for_tests());
+    let runtime = ContainerRuntime::new(
+        SLEEP_IMAGE_TAG,
+        256,
+        1.0,
+        1000,
+        1000,
+        guest_bind_source_for_tests(),
+    );
 
     let session_id = SessionId::generate();
     let _cleanup = ContainerCleanup::new(&session_id);
@@ -456,7 +463,14 @@ async fn integration_route_helper_missing_for_user_with_helper_path_errors() {
     let (stub_path, capture_path) = install_stub_helper(stub_dir.path());
 
     let net = TestNetwork::create("missingfor");
-    let runtime = ContainerRuntime::new(SLEEP_IMAGE_TAG, 256, 1.0, 1000, 1000, staged_guest_path_for_tests());
+    let runtime = ContainerRuntime::new(
+        SLEEP_IMAGE_TAG,
+        256,
+        1.0,
+        1000,
+        1000,
+        guest_bind_source_for_tests(),
+    );
 
     let session_id = SessionId::generate();
     let _cleanup = ContainerCleanup::new(&session_id);

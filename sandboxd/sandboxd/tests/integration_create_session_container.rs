@@ -260,24 +260,24 @@ fn container_spec() -> SessionSpec {
 }
 
 /// Resolve a stable host path for the bind-mount source the runtime
-/// passes as `staged_guest_path`. Tests that `docker create` a real
+/// passes as `guest_bind_source`. Tests that `docker create` a real
 /// container need the bind-mount source to exist on disk; tests that
 /// only exercise hermetic capability checks pass a synthetic path
 /// directly to `ContainerRuntime::new`. See api-session-isolation
 /// spec § 3.8.1 for the bind-mount design.
-fn staged_guest_path_for_tests() -> std::path::PathBuf {
+fn guest_bind_source_for_tests() -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::OnceLock;
     static GUEST_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
     GUEST_PATH
         .get_or_init(|| {
-            let dir = std::env::temp_dir().join("sandboxd-test-staged-guest");
-            std::fs::create_dir_all(&dir).expect("create test staged-guest dir");
+            let dir = std::env::temp_dir().join("sandboxd-test-guest-bind-source");
+            std::fs::create_dir_all(&dir).expect("create test guest-bind-source dir");
             let path = dir.join("sandbox-guest");
             std::fs::write(&path, b"placeholder-sandbox-guest-for-integration-tests\n")
-                .expect("write placeholder staged-guest binary");
+                .expect("write placeholder guest binary");
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod 0755 on placeholder staged-guest binary");
+                .expect("chmod 0755 on placeholder guest binary");
             path
         })
         .clone()
@@ -318,7 +318,7 @@ async fn integration_create_session_container_backend_round_trip() {
         1.0,
         1000,
         1000,
-        staged_guest_path_for_tests(),
+        guest_bind_source_for_tests(),
     );
 
     // Persist a session with `BackendKind::Container` and assert the

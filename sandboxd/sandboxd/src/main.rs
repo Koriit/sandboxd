@@ -132,16 +132,7 @@ fn default_base_dir() -> String {
 ///
 /// The set is small and stable; carry it as a `&[&str]` so a future
 /// caller can introspect or iterate without re-importing the list.
-///
-/// `guest/` holds the daemon-staged `sandbox-guest` binary that every
-/// container session bind-mounts read-only at
-/// `/usr/local/bin/sandbox-guest` (api-session-isolation spec § 3.8.1
-/// and daemon-productionization spec § 5.4). The staging step itself
-/// runs immediately after this layout enforcer; the subdir must
-/// exist beforehand because the atomic sibling-tempfile-and-rename
-/// pattern places the tempfile in `guest/`'s parent on the same
-/// filesystem.
-const BASE_DIR_SUBDIRS: &[&str] = &["sessions", "events", "backups", "guest"];
+const BASE_DIR_SUBDIRS: &[&str] = &["sessions", "events", "backups"];
 
 /// The numeric mode every per-daemon state-dir subdirectory must
 /// carry. `0700` matches the daemon-uid-only access expectation
@@ -7053,38 +7044,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::fs::create_dir_all(&base_dir).await?;
 
     // Enforce the base-dir subdir layout invariants (mode 0700 on
-    // `sessions/`, `events/`, `backups/`, `guest/`) before any code
-    // path opens a database, registers a gateway image, or migrates
-    // the schema.  Running this synchronously is cheap (a handful of
-    // stat calls in the happy path) and keeps the operator-visible
-    // failure surface tight: if the chmod fails because the operator
-    // left a stale root-owned subdir behind, the daemon refuses to
-    // start with a clear error before anything downstream is touched.
+    // `sessions/`, `events/`, `backups/`) before any code path opens a
+    // database, registers a gateway image, or migrates the schema.
+    // Running this synchronously is cheap (a handful of stat calls in
+    // the happy path) and keeps the operator-visible failure surface
+    // tight: if the chmod fails because the operator left a stale
+    // root-owned subdir behind, the daemon refuses to start with a
+    // clear error before anything downstream is touched.
     {
         let base_dir = base_dir.clone();
         tokio::task::spawn_blocking(move || ensure_base_dir_layout(&base_dir))
             .await
             .map_err(|e| SandboxError::Internal(format!("base-dir layout task panicked: {e}")))??;
-    }
-
-    // Stage the daemon-side `sandbox-guest` binary into
-    // `{base_dir}/guest/` so every container session can bind-mount it
-    // read-only at `/usr/local/bin/sandbox-guest`. Runs once at
-    // startup, idempotent (sha256 compare); refresh becomes `docker
-    // restart` rather than `docker cp` because the staged binary is
-    // already current. The operation is synchronous + CPU-cheap (one
-    // read, one hash, one optional rename) — `spawn_blocking` keeps
-    // it off the tokio worker for the same reason
-    // `ensure_base_dir_layout` did. The source binary is resolved via
-    // `sandbox_core::guest_agent_path` — production builds find it at
-    // the FHS install path, dev builds fall back to the cargo target.
-    {
-        let base_dir = base_dir.clone();
-        tokio::task::spawn_blocking(move || {
-            sandbox_core::stage_guest_binary_into_base_dir(&base_dir)
-        })
-        .await
-        .map_err(|e| SandboxError::Internal(format!("guest-staging task panicked: {e}")))??;
     }
 
     // Gateway-image presence check. The daemon does NOT refuse to
@@ -7265,21 +7236,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // it to the same `lite_image_tag_for_version` helper that
     // `ensure_image` and `rebuild_lite_image` use closes the drift at
     // one source.
-    // `sandbox_core::staged_guest_path(&base_dir)` resolves to
-    // `{base_dir}/guest/sandbox-guest` — the file the daemon's
-    // startup staging step wrote above. The runtime bind-mounts that
-    // path read-only into every container at
+    // The container backend bind-mounts the installed `sandbox-guest`
+    // binary read-only into every session at
     // `/usr/local/bin/sandbox-guest`; refresh becomes `docker
     // restart` against the same already-current source
-    // (api-session-isolation spec § 3.8.1).
-    let staged_guest_path = sandbox_core::staged_guest_path(&base_dir);
+    // (api-session-isolation spec § 3.8.1). The bind-mount source is
+    // resolved via `sandbox_core::guest_agent_path` — production
+    // builds find it at the FHS install path
+    // (`/usr/local/libexec/sandboxd/sandbox-guest`), dev / test builds
+    // fall back to the cargo target directory. `sandbox update`
+    // atomically renames the libexec file, so the bind-mount source is
+    // always coherent without a daemon-side staging step.
+    let guest_bind_source = sandbox_core::guest_agent_path()?;
     let container_runtime = ContainerRuntime::new(
         lite_image_tag_for_version(env!("CARGO_PKG_VERSION")),
         default_memory_mb,
         default_cpus,
         container_uid,
         container_gid,
-        staged_guest_path,
+        guest_bind_source,
     );
     runtimes.insert(
         BackendKind::Container,

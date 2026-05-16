@@ -680,22 +680,29 @@ image build (`sandbox-core/src/backend/container.rs:1276`) for container.
 
 #### 3.8.1 · Container backend
 
-> **Amended in M16-S6 (bind-mount design).** The original `docker cp`
+> **Amended in M16-S6 (bind-mount design); simplified in M16-S13
+> (bind-mount directly from libexec).** The original `docker cp`
 > refresh design below is empirically broken on Docker 29.4+ with the
 > containerd snapshotter against `--read-only` containers: dockerd
 > rejects writes into the rootfs with "container rootfs is marked
 > read-only" regardless of whether the storage driver could in
 > principle accept them. M13-S5 surfaced this; deferred todos #141,
-> #142, #147, #154 all queued behind the same gap. M16-S6 replaces
+> #142, #147, #154 all queued behind the same gap. M16-S6 replaced
 > the per-refresh `docker cp` with a **read-only bind-mount** of a
-> daemon-staged guest binary, and turns refresh into a `docker
-> restart`. The original `docker cp` design is preserved verbatim
-> below as historical context (under "Historical note — superseded
-> `docker cp` design") so the reasoning behind the substrate's
-> constraints stays auditable. See `docs/internal/milestones/M16.md`
-> § M16-S6 for the amendment rationale.
+> daemon-staged guest binary, and turned refresh into a `docker
+> restart`. M16-S13 further simplified the design: with
+> `sandbox-guest` shipping at the FHS libexec path after M16-S10
+> (and `sandbox update` atomically renaming it like every other
+> installed binary), the daemon-side staging copy under
+> `{base_dir}/guest/sandbox-guest` was redundant — the bind-mount
+> source can be the libexec path directly. The original `docker cp`
+> design is preserved verbatim below as historical context (under
+> "Historical note — superseded `docker cp` design") so the
+> reasoning behind the substrate's constraints stays auditable. See
+> `docs/internal/milestones/M16.md` § M16-S6 and § M16-S13 for the
+> amendment rationale.
 
-##### Bind-mount design (M16-S6, current implementation)
+##### Bind-mount design (M16-S6 + M16-S13, current implementation)
 
 Reality check first: the lite-mode container has **no init system**. Its
 `Dockerfile` (`sandboxd/images/lite/Dockerfile:45`) sets
@@ -709,50 +716,48 @@ The container also runs with `--read-only` rootfs
 (`container.rs:482`); the production lite image carries no `VOLUME`
 declaration over `/usr/local/bin/`, so any write into the rootfs (whether
 via `docker cp` or `docker exec ... chmod`) is rejected by dockerd. The
-fix is to take the rootfs out of the equation: the daemon stages
-`sandbox-guest` once into its own state directory, and every container
-**bind-mounts that path read-only** at `/usr/local/bin/sandbox-guest`,
-overlaying the in-image binary. Refresh stops being a rootfs write at
-all — it becomes a container restart that re-execs `tini` against the
-already-current bind source.
+fix is to take the rootfs out of the equation: every container
+**bind-mounts the installed `sandbox-guest` binary read-only** at
+`/usr/local/bin/sandbox-guest`, overlaying the in-image binary. Refresh
+stops being a rootfs write at all — it becomes a container restart that
+re-execs `tini` against the already-current bind source.
 
 Component responsibilities:
 
-1. **Daemon startup** stages the embedded `sandbox-guest` bytes (via
-   the option-A `include_bytes!` mechanism from § 3.6 — Spec 2 ships
-   the dev-mode sibling-file source; Spec 4 swaps that for the
-   compile-time embed) into `{base_dir}/guest/sandbox-guest` at mode
-   `0o755`, owner `sandbox:sandbox`. Idempotent on every startup —
-   the existing on-disk file's sha256 is compared to the embedded
-   bytes; on match, the file is left alone; on mismatch, it is
-   rewritten via a sibling-tempfile-and-rename atomic-write; if
-   absent, it is created. The `guest/` subdir itself is created by
-   Spec 3 § 5.4's `ensure_base_dir_layout` (extended in lockstep with
-   this amendment).
+1. **`sandbox update`** installs `sandbox-guest` at the FHS-canonical
+   libexec path (`/usr/local/libexec/sandboxd/sandbox-guest`, mode
+   `0o755`, owner `root:root`) via the same atomic-rename install
+   shape it uses for `sandboxd`, `sandbox`, and `sandbox-route-helper`
+   (Spec 5 § 3.2). The atomic rename makes the bind-mount source
+   coherent without any daemon-side staging — a refresh started after
+   `sandbox update` returns sees the new bytes; a refresh started
+   before sees the old bytes; no torn read is possible because the
+   inode swap is atomic.
 
 2. **`ContainerRuntime::create`** adds a single arg pair to the
    `docker create` argv:
 
    ```
-   -v {base_dir}/guest/sandbox-guest:/usr/local/bin/sandbox-guest:ro
+   -v /usr/local/libexec/sandboxd/sandbox-guest:/usr/local/bin/sandbox-guest:ro
    ```
 
    The bind-mount is read-only (`:ro`) — the guest process inside the
    container cannot rewrite the source even if the rootfs were writable.
-   The source path is the daemon-staged copy at the path
-   `{base_dir}/guest/sandbox-guest`, threaded into `ContainerRuntime`
-   at construction time so the runtime never has to ask the daemon
-   for it at create time.
+   The source path is resolved at daemon startup via
+   `sandbox_core::guest_agent_path` (production: the FHS libexec
+   install path; dev / test: a cargo target sibling) and threaded into
+   `ContainerRuntime` at construction time so the runtime never has to
+   ask the daemon for it at create time.
 
 3. **`ContainerRuntime::refresh_guest_binary`** becomes a defensive
    `docker stop -t 5` (already-stopped is a no-op — the orchestrator
    asserts `session.state == Stopped` before calling refresh) followed
-   by a `docker restart` of the container. The daemon-staged binary at
-   the bind-mount source is already current (the startup staging step
-   pinned it before any session was started this boot); the restart
-   simply re-execs `tini` against the bind-mount, which picks up the
-   new binary via the kernel's normal `execve` path. No rootfs write,
-   no `docker cp`, no tempfile.
+   by a `docker restart` of the container. The libexec source at the
+   bind-mount path is already current (whatever `sandbox update` left
+   there is what the next refresh sees); the restart simply re-execs
+   `tini` against the bind-mount, which picks up the new binary via
+   the kernel's normal `execve` path. No rootfs write, no `docker
+   cp`, no tempfile, no daemon-side staging step.
 
 Pseudo-code:
 
@@ -765,10 +770,11 @@ fn refresh_guest_binary(handle):
     #    stopped already. Idempotent; ignore "is not running".
     docker stop -t 5 <container_name>
 
-    # 2. Restart the container. The bind-mount source (daemon-staged
-    #    at boot) is already current; `docker restart` re-execs `tini`
-    #    against `/usr/local/bin/sandbox-guest`, which is now the
-    #    staged binary by virtue of the mount.
+    # 2. Restart the container. The bind-mount source (the libexec
+    #    file last touched by `sandbox update`) is already current;
+    #    `docker restart` re-execs `tini` against
+    #    `/usr/local/bin/sandbox-guest`, which is now the installed
+    #    binary by virtue of the mount.
     docker restart <container_name>
 
     # 3. Return Ok. The orchestrator (§ 3.4) calls runtime.start
@@ -780,16 +786,18 @@ fn refresh_guest_binary(handle):
 Why this is materially simpler than the `docker cp` design it replaces:
 
 - **One inode is shared across every live container session.** The
-  bind-mount source is a single file on the daemon's state dir; every
+  bind-mount source is a single file at the FHS libexec path; every
   container's `/usr/local/bin/sandbox-guest` resolves to that same
   inode. The kernel page cache for the guest binary is shared, so the
   N-container memory footprint of N copies collapses to one copy.
 - **`--read-only` rootfs is no longer a constraint.** The bind-mount
   sidesteps the rootfs entirely; dockerd never sees a write into the
   RO layer.
-- **No per-refresh staging.** The staging is one-shot at daemon startup,
-  not per-session-per-refresh. The hot path (`refresh_guest_binary`)
-  becomes a single `docker restart`.
+- **No daemon-side staging.** `sandbox update` is the sole writer of
+  the libexec file, and its atomic rename is what makes the bind-mount
+  source coherent. The daemon does not maintain a second copy under
+  its state directory. The hot path (`refresh_guest_binary`) is a
+  single `docker restart`.
 - **Crash recovery is unchanged in shape.** If the daemon crashes
   between refresh and `update_guest_versions` (§ 3.9), the next
   `start_session` re-runs the compat check, finds the proto still
