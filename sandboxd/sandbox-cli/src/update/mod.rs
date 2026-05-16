@@ -2051,8 +2051,10 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
 
     // § 3.2.24 — Apply config migrations (per file, atomically).
     //
-    // Test-only failure-injection hook — DO NOT set in production.
-    // Used by tests/install-e2e/test_update_idempotency.py
+    // Test-only failure-injection hook gated behind the
+    // `test-env-override` Cargo feature so the env-var name string
+    // never appears in a release binary. Used by
+    // tests/install-e2e/test_update_idempotency.py
     // (test_update_partial_failure_backup_set_preserved) to verify the
     // spec-§ 3.2.19 in-progress-manifest contract: a mid-update failure
     // at the migrate step must leave a backup-set manifest with
@@ -2060,6 +2062,7 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
     // must preserve (spec § 5.2). When `SANDBOX_UPDATE_TEST_FAIL_AT_STEP`
     // is set to `migrate`, return a failure here before any migration
     // runs — the in-progress manifest from § 3.2.19 is already on disk.
+    #[cfg(feature = "test-env-override")]
     if std::env::var("SANDBOX_UPDATE_TEST_FAIL_AT_STEP")
         .ok()
         .as_deref()

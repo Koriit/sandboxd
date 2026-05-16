@@ -64,3 +64,23 @@ axum.workspace = true
 # `sandbox-core` and `sandboxd`; `bundled` keeps the test
 # hermetic against the host's libsqlite3 version.
 rusqlite.workspace = true
+
+# Optional features.
+#
+# `test-env-override` — opts the `sandbox update` Sigstore signature-
+# verification path into honoring `SANDBOX_UPDATE_TEST_FULCIO_ROOT`,
+# `SANDBOX_UPDATE_TEST_REKOR_URL`,
+# `SANDBOX_UPDATE_TEST_REKOR_PUBLIC_KEY`, and
+# `SANDBOX_UPDATE_TEST_CT_LOG_PUBLIC_KEY` so the install-e2e harness can
+# point cosign at the local Sigstore stack. Default release builds
+# ignore the env vars: an operator running a production-signed binary
+# must not be able to substitute the cryptographic trust root through
+# the process environment (an attacker with that level of access could
+# silently install a tampered tarball under the same `sandbox update`
+# flow). The install-e2e build pipeline (`tests/install-e2e/
+# build-local-tarball.sh`) enables the feature so its locally-signed
+# tarballs verify against the local stack. Mirrors the pattern on
+# `sandbox-core`'s `test-env-override` (route-helper users.conf
+# redirect).
+[features]
+test-env-override = []

@@ -378,14 +378,26 @@ elif [ "$portable_build" = "1" ]; then
             fi
             export PATH="$CARGO_HOME/bin:$PATH"
             cargo --version
-            cargo build --workspace --release
+            # `--features sandbox-cli/test-env-override` opts the
+            # cosign verify-blob path into honoring SANDBOX_UPDATE_TEST_*
+            # env vars so the harness can point cosign at the local
+            # Sigstore stack. Production release builds (cargo build
+            # --workspace --release with no extra features) compile the
+            # env-var reads out entirely — the e2e harness is the only
+            # caller that wants them.
+            cargo build --workspace --release \
+                --features sandbox-cli/test-env-override
             # Chown the produced artifacts so the host user can stage,
             # tar, and (eventually) clean them without sudo.
             chown -R "$HOST_UID:$HOST_GID" "/work/sandboxd/${CARGO_TARGET_SUBDIR}"
         '
 else
     printf 'build-local-tarball.sh: cargo build --workspace --release (host) ...\n'
-    ( cd "$ROOT/sandboxd" && cargo build --workspace --release )
+    # See the comment in the docker arm above for why
+    # `--features sandbox-cli/test-env-override` is enabled here.
+    ( cd "$ROOT/sandboxd" \
+        && cargo build --workspace --release \
+            --features sandbox-cli/test-env-override )
 fi
 
 for bin in sandboxd sandbox sandbox-route-helper sandbox-guest; do

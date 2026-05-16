@@ -239,39 +239,49 @@ pub fn verify_signature(tarball: &Path, bundle: Option<&Path>) -> Result<(), Fet
         .arg("--certificate-oidc-issuer")
         .arg(COSIGN_CERT_OIDC_ISSUER);
 
-    // Test-only trust-material redirect. Mirrors install.sh's
-    // SANDBOX_INSTALL_TEST_* env vars so the install-e2e harness can
-    // run a locally-signed tarball through `sandbox update` against the
-    // local Sigstore stack — exercising the real cosign verify-blob
-    // code path end-to-end. THESE ENV VARS MUST NEVER BE SET IN
-    // PRODUCTION; they substitute the cryptographic trust root that
-    // protects operators against tampered tarballs. Deliberately
-    // undocumented (no --help mention, no entry in installation.md);
-    // mirrors the route-helper's `test-env-override` Cargo feature
-    // pattern and the install.sh SANDBOX_INSTALL_SKIP_SIGSTORE comment.
-    if let Ok(path) = std::env::var("SANDBOX_UPDATE_TEST_FULCIO_ROOT")
-        && !path.is_empty()
+    // Test-only trust-material redirect, gated behind the
+    // `test-env-override` Cargo feature so the env-var name strings
+    // never appear in a release binary. The install-e2e harness builds
+    // `sandbox-cli` with `--features test-env-override` and signs its
+    // local tarball against an in-tree Sigstore stack; the four
+    // SANDBOX_UPDATE_TEST_* env vars below let the harness substitute
+    // the trust roots so the real cosign verify-blob code path is
+    // exercised end-to-end against locally-signed material.
+    //
+    // Production release builds compile this block out entirely — an
+    // attacker who controls the daemon's process environment cannot
+    // silently substitute the cryptographic trust root, because the
+    // env-var reads do not exist in the binary. Mirrors the pattern on
+    // `sandbox-core`'s `test-env-override` feature (route-helper
+    // users.conf redirect) and the daemon's gateway/Lima test
+    // overrides.
+    #[cfg(feature = "test-env-override")]
     {
-        cmd.arg("--certificate-chain").arg(&path);
-    }
-    if let Ok(url) = std::env::var("SANDBOX_UPDATE_TEST_REKOR_URL")
-        && !url.is_empty()
-    {
-        cmd.arg("--rekor-url").arg(&url);
-    }
-    // cosign reads SIGSTORE_REKOR_PUBLIC_KEY / SIGSTORE_CT_LOG_PUBLIC_KEY_FILE
-    // directly from the environment; replant them under cosign's name
-    // when the harness supplied them. Empty strings are treated as
-    // unset to keep the no-op default tight.
-    if let Ok(path) = std::env::var("SANDBOX_UPDATE_TEST_REKOR_PUBLIC_KEY")
-        && !path.is_empty()
-    {
-        cmd.env("SIGSTORE_REKOR_PUBLIC_KEY", path);
-    }
-    if let Ok(path) = std::env::var("SANDBOX_UPDATE_TEST_CT_LOG_PUBLIC_KEY")
-        && !path.is_empty()
-    {
-        cmd.env("SIGSTORE_CT_LOG_PUBLIC_KEY_FILE", path);
+        if let Ok(path) = std::env::var("SANDBOX_UPDATE_TEST_FULCIO_ROOT")
+            && !path.is_empty()
+        {
+            cmd.arg("--certificate-chain").arg(&path);
+        }
+        if let Ok(url) = std::env::var("SANDBOX_UPDATE_TEST_REKOR_URL")
+            && !url.is_empty()
+        {
+            cmd.arg("--rekor-url").arg(&url);
+        }
+        // cosign reads SIGSTORE_REKOR_PUBLIC_KEY /
+        // SIGSTORE_CT_LOG_PUBLIC_KEY_FILE directly from the environment;
+        // replant them under cosign's name when the harness supplied
+        // them. Empty strings are treated as unset to keep the no-op
+        // default tight.
+        if let Ok(path) = std::env::var("SANDBOX_UPDATE_TEST_REKOR_PUBLIC_KEY")
+            && !path.is_empty()
+        {
+            cmd.env("SIGSTORE_REKOR_PUBLIC_KEY", path);
+        }
+        if let Ok(path) = std::env::var("SANDBOX_UPDATE_TEST_CT_LOG_PUBLIC_KEY")
+            && !path.is_empty()
+        {
+            cmd.env("SIGSTORE_CT_LOG_PUBLIC_KEY_FILE", path);
+        }
     }
 
     let out = cmd.arg(tarball).output()?;
