@@ -1374,58 +1374,81 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         files: std::collections::BTreeMap::new(),
     };
 
-    // § 3.2.15 — Backup sessions.db.
-    let dst = backup_set_dir.join("sessions.db.bak");
-    match backup::backup_sandbox_owned_file(Path::new(backup::SESSIONS_DB_PATH), &dst, 0o600) {
-        Ok(o) => match o.action {
-            backup::CopyAction::SourceAbsent => {
+    // § 3.2.15 — Backup sessions.db plus its WAL companion files.
+    // The daemon runs SQLite in WAL journal mode (`store.rs:117`);
+    // committed transactions may live in `sessions.db-wal` between
+    // checkpoints, with offsets indexed via `sessions.db-shm`. A
+    // backup that copied only `sessions.db` would silently lose any
+    // post-last-checkpoint commits. Bundling all three files lets
+    // SQLite restore cleanly without manual `PRAGMA wal_checkpoint`
+    // orchestration — the daemon's stop at § 3.2.14 has already
+    // ensured the WAL is quiescent for a clean shutdown, but the
+    // bundle is also correct against a daemon killed mid-write
+    // (the recovery path SQLite runs on next open handles a
+    // truncated WAL transparently).
+    //
+    // Each companion file is copied via the same idempotent
+    // `backup_sandbox_owned_file` helper; the WAL/SHM may legitimately
+    // be absent (a freshly-checkpointed daemon removes them at
+    // close), so `SourceAbsent` is the spec-faithful no-op outcome
+    // for those two paths, not a failure.
+    for (src, dst_name) in [
+        (backup::SESSIONS_DB_PATH, "sessions.db.bak"),
+        (backup::SESSIONS_DB_WAL_PATH, "sessions.db-wal.bak"),
+        (backup::SESSIONS_DB_SHM_PATH, "sessions.db-shm.bak"),
+    ] {
+        let dst = backup_set_dir.join(dst_name);
+        match backup::backup_sandbox_owned_file(Path::new(src), &dst, 0o600) {
+            Ok(o) => match o.action {
+                backup::CopyAction::SourceAbsent => {
+                    log_step(
+                        "backup_sessions_db",
+                        &format!("src={src} action=skip status=ok reason=source-absent"),
+                    );
+                }
+                backup::CopyAction::Skipped => {
+                    manifest.files.insert(
+                        dst_name.to_string(),
+                        backup::ManifestFileEntry {
+                            sha256: o.sha256.clone(),
+                            size: o.size,
+                        },
+                    );
+                    log_step(
+                        "backup_sessions_db",
+                        &format!(
+                            "src={src} path={} sha256={} action=skip status=ok reason=identical",
+                            dst.display(),
+                            o.sha256
+                        ),
+                    );
+                }
+                backup::CopyAction::Copied => {
+                    manifest.files.insert(
+                        dst_name.to_string(),
+                        backup::ManifestFileEntry {
+                            sha256: o.sha256.clone(),
+                            size: o.size,
+                        },
+                    );
+                    log_step(
+                        "backup_sessions_db",
+                        &format!(
+                            "src={src} path={} sha256={} action=copy status=ok",
+                            dst.display(),
+                            o.sha256
+                        ),
+                    );
+                }
+            },
+            Err(e) => {
                 log_step(
                     "backup_sessions_db",
-                    "action=skip status=ok reason=source-absent",
+                    &format!("src={src} action=copy status=fail err=\"{e}\""),
                 );
+                eprintln!("sandbox update: failed to back up {src}: {e}");
+                return 1;
             }
-            backup::CopyAction::Skipped => {
-                manifest.files.insert(
-                    "sessions.db.bak".to_string(),
-                    backup::ManifestFileEntry {
-                        sha256: o.sha256.clone(),
-                        size: o.size,
-                    },
-                );
-                log_step(
-                    "backup_sessions_db",
-                    &format!(
-                        "path={} sha256={} action=skip status=ok reason=identical",
-                        dst.display(),
-                        o.sha256
-                    ),
-                );
-            }
-            backup::CopyAction::Copied => {
-                manifest.files.insert(
-                    "sessions.db.bak".to_string(),
-                    backup::ManifestFileEntry {
-                        sha256: o.sha256.clone(),
-                        size: o.size,
-                    },
-                );
-                log_step(
-                    "backup_sessions_db",
-                    &format!(
-                        "path={} sha256={} action=copy status=ok",
-                        dst.display(),
-                        o.sha256
-                    ),
-                );
-            }
-        },
-        Err(e) => {
-            log_step(
-                "backup_sessions_db",
-                &format!("action=copy status=fail err=\"{e}\""),
-            );
-            eprintln!("sandbox update: failed to back up sessions.db: {e}");
-            return 1;
         }
     }
 

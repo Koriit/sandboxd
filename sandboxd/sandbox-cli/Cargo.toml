@@ -57,3 +57,10 @@ tracing.workspace = true
 # (non-follow) process exit behavior. See the `Connection: close` +
 # drop-order fix in `src/main.rs::stream_events_to_stdout`.
 axum.workspace = true
+# `rusqlite` powers the WAL-safe backup unit test that opens a
+# synthetic `.db` + `-wal` + `-shm` bundle (written by a daemon
+# killed mid-write) and asserts the restored DB contains the most
+# recent committed transaction. The workspace dep is shared with
+# `sandbox-core` and `sandboxd`; `bundled` keeps the test
+# hermetic against the host's libsqlite3 version.
+rusqlite.workspace = true

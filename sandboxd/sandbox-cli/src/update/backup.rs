@@ -59,6 +59,16 @@ pub const RETENTION_KEEP: usize = 2;
 
 /// The sandbox-owned production paths the backup set captures.
 pub const SESSIONS_DB_PATH: &str = "/var/lib/sandbox/sessions.db";
+/// SQLite WAL companion file. The daemon runs in WAL journal mode
+/// (`store.rs:117`), so uncommitted-on-disk-but-committed-in-WAL
+/// transactions live in `sessions.db-wal` between checkpoints. Backing
+/// up only `sessions.db` would lose those records if the daemon was
+/// not cleanly stopped before the snapshot.
+pub const SESSIONS_DB_WAL_PATH: &str = "/var/lib/sandbox/sessions.db-wal";
+/// SQLite shared-memory index file. The WAL header references offsets
+/// stored here; SQLite recovers cleanly from a bundle containing
+/// (.db, -wal, -shm) without manual checkpoint orchestration.
+pub const SESSIONS_DB_SHM_PATH: &str = "/var/lib/sandbox/sessions.db-shm";
 pub const USERS_CONF_PATH: &str = "/etc/sandboxd/users.conf";
 pub const BRIDGE_CONF_PATH: &str = "/etc/qemu/bridge.conf";
 pub const SANDBOXD_BIN_PATH: &str = "/usr/local/bin/sandboxd";
@@ -780,6 +790,226 @@ mod tests {
         assert_eq!(parsed.files.len(), 1);
         assert!(!parsed.completed_ok);
         assert!(parsed.completed_at.is_none());
+    }
+
+    /// WAL-safe backup contract: a SQLite database in WAL mode
+    /// whose connection is dropped mid-write — leaving committed
+    /// transactions in `sessions.db-wal` (and the offset index in
+    /// `sessions.db-shm`) — is restored intact when the backup
+    /// captures all three files as a bundle. A backup that copies
+    /// only `sessions.db` loses the most recent commit; the bundle
+    /// recovers it via SQLite's normal WAL-replay on first open.
+    ///
+    /// This pins the design contract behind extending § 3.2.15 to
+    /// bundle `sessions.db` + `sessions.db-wal` + `sessions.db-shm`
+    /// (M16-S7 exit criterion). The test uses plain `std::fs::copy`
+    /// to exercise the design contract — the production
+    /// `backup_sandbox_owned_file` adds sudo plumbing and sha256
+    /// idempotency on top of the same bundling.
+    #[test]
+    fn wal_bundle_restores_most_recent_committed_transaction() {
+        use rusqlite::Connection;
+
+        let src_tmp = tempfile::tempdir().expect("src tempdir");
+        let src_db = src_tmp.path().join("sessions.db");
+
+        // Phase 1 — write a row in WAL mode, then drop the
+        // connection WITHOUT issuing `PRAGMA wal_checkpoint`. This
+        // is the "daemon killed mid-write" simulation: the commit
+        // lands in `sessions.db-wal` but never makes it into the
+        // main `.db` file. We use two trick-knobs to keep the WAL
+        // populated past connection drop:
+        //   1. `PRAGMA wal_autocheckpoint = 0` — disables the
+        //      every-1000-pages auto-checkpoint that would otherwise
+        //      flush the WAL during the INSERT.
+        //   2. A second long-lived "reader" connection — SQLite
+        //      skips the close-time checkpoint when another
+        //      connection still has the WAL open. This pins the
+        //      "daemon was killed; no clean shutdown" scenario
+        //      against hosts whose libsqlite3 would otherwise
+        //      auto-checkpoint on the writer's drop.
+        let _reader = Connection::open(&src_db).expect("open reader");
+        _reader
+            .pragma_update(None, "journal_mode", "WAL")
+            .expect("reader journal_mode=WAL");
+        _reader
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("reader wal_autocheckpoint=0");
+        {
+            let conn = Connection::open(&src_db).expect("open writer");
+            conn.pragma_update(None, "journal_mode", "WAL")
+                .expect("writer journal_mode=WAL");
+            conn.pragma_update(None, "wal_autocheckpoint", 0)
+                .expect("writer wal_autocheckpoint=0");
+            conn.execute_batch(
+                "CREATE TABLE sessions (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
+            )
+            .expect("schema");
+            conn.execute(
+                "INSERT INTO sessions (id, name) VALUES (?1, ?2);",
+                rusqlite::params![1, "kept-across-wal-replay"],
+            )
+            .expect("insert");
+            // Drop the writer without explicit checkpoint. The
+            // surviving `_reader` connection keeps SQLite from
+            // close-time-checkpointing, leaving the WAL+SHM as the
+            // canonical record of the commit. We deliberately keep
+            // `_reader` alive (it's bound to the outer scope) until
+            // the snapshot is captured.
+            drop(conn);
+        }
+
+        // Sanity: WAL companion must exist and be non-empty. If the
+        // host's SQLite still managed to auto-checkpoint the test's
+        // premise doesn't hold; skip the WAL-safe assertion (we
+        // cannot pin a contract we can't reproduce).
+        let src_wal = src_tmp.path().join("sessions.db-wal");
+        let src_shm = src_tmp.path().join("sessions.db-shm");
+        let Ok(wal_meta) = std::fs::metadata(&src_wal) else {
+            eprintln!(
+                "warning: -wal file missing after drop; host SQLite likely \
+                 auto-checkpointed despite wal_autocheckpoint=0 and a held \
+                 reader connection — test cannot pin the WAL-safe contract \
+                 on this host"
+            );
+            return;
+        };
+        if wal_meta.len() == 0 {
+            eprintln!("warning: -wal file empty after drop; skipping WAL-safe assertion");
+            return;
+        }
+        assert!(src_shm.exists(), "-shm must exist alongside -wal");
+
+        // Phase 2 — bundle all three files into a backup set
+        // mirroring what § 3.2.15 produces in production. Plain
+        // `fs::copy` exercises the file-bundling contract without
+        // sudo; production's `backup_sandbox_owned_file` adds
+        // sha256-idempotency + ownership transfer on top.
+        let backup_tmp = tempfile::tempdir().expect("backup tempdir");
+        let backup_set = backup_tmp.path().join("set");
+        std::fs::create_dir_all(&backup_set).unwrap();
+        for (src, dst_name) in [
+            (&src_db, "sessions.db.bak"),
+            (&src_wal, "sessions.db-wal.bak"),
+            (&src_shm, "sessions.db-shm.bak"),
+        ] {
+            std::fs::copy(src, backup_set.join(dst_name)).expect("copy succeeds");
+        }
+
+        // Phase 3 — stage the backup as a recoverable triple under
+        // a fresh tempdir, restoring the canonical filenames SQLite
+        // expects. The rollback recipe documents this same step
+        // (`sudo install -m 0600 sessions.db.bak /var/lib/sandbox/sessions.db`
+        // and the matching `.db-wal` / `.db-shm` copies).
+        let restore_tmp = tempfile::tempdir().expect("restore tempdir");
+        let restore_db = restore_tmp.path().join("sessions.db");
+        let restore_wal = restore_tmp.path().join("sessions.db-wal");
+        let restore_shm = restore_tmp.path().join("sessions.db-shm");
+        std::fs::copy(backup_set.join("sessions.db.bak"), &restore_db).unwrap();
+        std::fs::copy(backup_set.join("sessions.db-wal.bak"), &restore_wal).unwrap();
+        std::fs::copy(backup_set.join("sessions.db-shm.bak"), &restore_shm).unwrap();
+
+        // Drop the held reader now that the bundle has been
+        // captured. Leaving it open through phase 4 would not
+        // affect correctness (the restore lives in a different
+        // tempdir on a different inode), but releasing it pins
+        // the test's resource lifecycle to the backup capture.
+        drop(_reader);
+
+        // Phase 4 — open the restored database. SQLite's normal
+        // WAL-recovery on first open re-applies the committed
+        // transactions sitting in `-wal`, and the row written in
+        // phase 1 must be visible.
+        let conn = Connection::open(&restore_db).expect("open restored");
+        let name: String = conn
+            .query_row(
+                "SELECT name FROM sessions WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("recovered row must be present");
+        assert_eq!(name, "kept-across-wal-replay");
+    }
+
+    /// Companion to the WAL bundle test: pin the negative case —
+    /// when ONLY `sessions.db` is captured (no `-wal`, no `-shm`),
+    /// the restored DB does NOT see the most recent commit. This
+    /// is the failure mode the bundle fix exists to prevent;
+    /// pinning both halves catches a future refactor that
+    /// accidentally narrows the backup back to a single file.
+    #[test]
+    fn db_only_backup_loses_uncheckpointed_wal_transaction() {
+        use rusqlite::Connection;
+
+        let src_tmp = tempfile::tempdir().expect("src tempdir");
+        let src_db = src_tmp.path().join("sessions.db");
+        // Same trick as the positive case: hold an open reader to
+        // suppress the close-time checkpoint. See the comment in
+        // `wal_bundle_restores_most_recent_committed_transaction`
+        // for the rationale.
+        let _reader = Connection::open(&src_db).expect("open reader");
+        _reader
+            .pragma_update(None, "journal_mode", "WAL")
+            .expect("reader journal_mode=WAL");
+        _reader
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("reader wal_autocheckpoint=0");
+        {
+            let conn = Connection::open(&src_db).expect("open writer");
+            conn.pragma_update(None, "journal_mode", "WAL")
+                .expect("writer journal_mode=WAL");
+            conn.pragma_update(None, "wal_autocheckpoint", 0)
+                .expect("writer wal_autocheckpoint=0");
+            conn.execute_batch(
+                "CREATE TABLE sessions (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
+            )
+            .expect("schema");
+            conn.execute(
+                "INSERT INTO sessions (id, name) VALUES (?1, ?2);",
+                rusqlite::params![1, "kept-across-wal-replay"],
+            )
+            .expect("insert");
+            drop(conn);
+        }
+        let src_wal = src_tmp.path().join("sessions.db-wal");
+        let Ok(wal_meta) = std::fs::metadata(&src_wal) else {
+            // Host SQLite checkpointed despite the suppression
+            // tricks; the negative-case premise doesn't apply.
+            return;
+        };
+        if wal_meta.len() == 0 {
+            // Same: host auto-checkpointed and emptied the WAL.
+            return;
+        }
+
+        // Backup `.db` only — no `-wal`, no `-shm`.
+        let backup_tmp = tempfile::tempdir().expect("backup tempdir");
+        let backup_db = backup_tmp.path().join("sessions.db");
+        std::fs::copy(&src_db, &backup_db).expect("copy succeeds");
+
+        // Release the reader now that we've snapshotted; the
+        // negative case opens the restore independently.
+        drop(_reader);
+
+        // Open the lone-db restore.
+        let conn = Connection::open(&backup_db).expect("open restored");
+        // The table itself might not exist (CREATE TABLE landed in
+        // the WAL too), or the row might be missing. Either way,
+        // the SELECT must NOT find the committed row.
+        let lookup: rusqlite::Result<String> = conn.query_row(
+            "SELECT name FROM sessions WHERE id = 1",
+            [],
+            |row| row.get(0),
+        );
+        match lookup {
+            Err(_) => { /* Table or row absent — the loss-on-recovery contract */ }
+            Ok(name) => panic!(
+                "db-only backup unexpectedly recovered the WAL transaction \
+                 (name={name:?}); the WAL-safe bundling contract is now moot — \
+                 maybe SQLite auto-checkpointed and the negative case no \
+                 longer holds"
+            ),
+        }
     }
 
     /// Manifest tolerates an older payload that lacks `completed_at`
