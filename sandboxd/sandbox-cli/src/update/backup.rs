@@ -823,11 +823,11 @@ mod tests {
     /// recovers it via SQLite's normal WAL-replay on first open.
     ///
     /// This pins the design contract behind extending § 3.2.15 to
-    /// bundle `sessions.db` + `sessions.db-wal` + `sessions.db-shm`
-    /// (M16-S7 exit criterion). The test uses plain `std::fs::copy`
-    /// to exercise the design contract — the production
-    /// `backup_sandbox_owned_file` adds sudo plumbing and sha256
-    /// idempotency on top of the same bundling.
+    /// bundle `sessions.db` + `sessions.db-wal` + `sessions.db-shm`.
+    /// The test uses plain `std::fs::copy` to exercise the design
+    /// contract — the production `backup_sandbox_owned_file` adds
+    /// sudo plumbing and sha256 idempotency on top of the same
+    /// bundling.
     #[test]
     fn wal_bundle_restores_most_recent_committed_transaction() {
         use rusqlite::Connection;

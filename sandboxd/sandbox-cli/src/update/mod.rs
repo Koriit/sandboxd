@@ -737,8 +737,8 @@ pub fn render_dry_run<W: Write>(
     // either "would execute" or "would skip" — we now project the
     // per-step idempotency check onto the read-only inputs so the
     // operator sees which steps are no-ops against the current
-    // state. The exit criterion for M16-S7 is: an up-to-date
-    // installation labels every applicable step `would skip`.
+    // state. An up-to-date installation labels every applicable
+    // step `would skip`.
     //
     // Step verdicts:
     //
@@ -823,7 +823,7 @@ pub fn render_dry_run<W: Write>(
 /// state. Doing so would (a) repeat work the stateful phase already
 /// guards, (b) require sudo, and (c) couple the dry-run renderer to
 /// production-only paths. The "current == target" gate is the
-/// minimum that fulfils the M16-S7 exit criterion ("up-to-date
+/// minimum that fulfils the read-only contract ("up-to-date
 /// installation labels every applicable step `would skip`") without
 /// over-promising on a stale install where some steps may still be
 /// idempotent (e.g. systemd unit at the same path with identical
@@ -2992,10 +2992,10 @@ mod tests {
     }
 
     /// `--dry-run` against an up-to-date install must label every
-    /// applicable step `would skip`. M16-S7 exit criterion: the
-    /// renderer projects per-step idempotency onto the read-only
-    /// inputs so an operator can verify the update is a no-op
-    /// without invoking the stateful phase.
+    /// applicable step `would skip`. The renderer projects per-step
+    /// idempotency onto the read-only inputs so an operator can
+    /// verify the update is a no-op without invoking the stateful
+    /// phase.
     ///
     /// The eight always-execute steps stay `would execute` per the
     /// `stateful_step_verdict` rationale — they have no
