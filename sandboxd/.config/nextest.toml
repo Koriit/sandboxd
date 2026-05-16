@@ -67,7 +67,7 @@ test-group = 'lima'
 #     the post-refresh byte-equality assertion.
 #   - `integration_guest_binary_swap_picked_up_by_new_sessions` and
 #     `integration_guest_binary_shared_inode_across_sessions`
-#     (M16-S6 amendment to api-session-isolation spec § 3.8.1) each
+#     (api-session-isolation spec § 3.8.1) each
 #     create two real `sandbox-{12hex}` containers and assert on
 #     their bind-mounted guest binaries; a parallel orphan-reaper
 #     or other namespace-touching test would race the lifecycle
