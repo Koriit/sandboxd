@@ -573,9 +573,16 @@ def _inject_synthetic_session(vm, *, session_id, owner_username, backend="lima")
     # ``DateTime<Utc>::to_rfc3339()`` output. SQLite stores them as
     # TEXT; the daemon parses with ``DateTime::parse_from_rfc3339``.
     now = "2026-05-16T00:00:00Z"
-    # Escape single quotes for shell. The values we're inserting are
-    # under our control (no operator-supplied substrings), so a
-    # heredoc-into-sqlite3 is safe.
+    # The SQL contains single-quote string literals (around the column
+    # values) AND embedded double-quotes (from the JSON keys inside
+    # ``config_json``). Passing this through ``sh -c`` with the SQL
+    # wrapped in double-quotes lets the shell interpret the JSON's
+    # ``"`` characters as quote toggles, stripping them and leaving
+    # sqlite3 with bare-word "keys"; SQLite then rejects the inserted
+    # row at read-time with "invalid config JSON: key must be a string".
+    # Use a heredoc piped into sqlite3 instead: the heredoc body is
+    # opaque to the shell when quoted with ``<<'SQL'``, so the JSON
+    # survives intact.
     sql = (
         "INSERT INTO sessions "
         "(id, name, state, config, created_at, updated_at, backend, "
@@ -584,7 +591,7 @@ def _inject_synthetic_session(vm, *, session_id, owner_username, backend="lima")
         f"'{now}', '{now}', '{backend}', '{owner_username}', 1, '0.1.0');"
     )
     vm.shell(
-        f"sudo sqlite3 /var/lib/sandbox/sessions.db \"{sql}\"",
+        f"sudo sqlite3 /var/lib/sandbox/sessions.db <<'SQL'\n{sql}\nSQL",
         check=True,
         timeout=10,
     )
