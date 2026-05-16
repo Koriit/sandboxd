@@ -2363,28 +2363,59 @@ where
     Ok(())
 }
 
-/// Append a `step=...` line to `/var/log/sandbox-install.log` with the
-/// `sandbox-update` second token. Matches install.sh's `log_ok` shape
-/// (Spec 5 § 2.6). Best-effort — log write failure does not abort the
-/// upgrade.
+/// Canonical install-log path. Spec 4 § 4.6. Operators on hosts where
+/// `/var/log` is read-only can override via `$SANDBOXD_INSTALL_LOG`
+/// (parsed by [`resolve_install_log_path`]); install.sh / uninstall.sh
+/// read the same env var so the three writers stay in sync.
+pub const DEFAULT_INSTALL_LOG_PATH: &str = "/var/log/sandbox-install.log";
+
+/// Env var that overrides [`DEFAULT_INSTALL_LOG_PATH`]. Mirrors the
+/// shell-side `${SANDBOXD_INSTALL_LOG:-…}` expansion install.sh /
+/// uninstall.sh use.
+pub const INSTALL_LOG_ENV_VAR: &str = "SANDBOXD_INSTALL_LOG";
+
+/// Resolve the install log path operator-side. The env var takes
+/// precedence when set to a non-empty value; otherwise the canonical
+/// `/var/log/sandbox-install.log` is used. Pulled into a pure
+/// function (taking the env-var value as input) so tests can drive
+/// every branch without poking the process env.
+///
+/// Pre-existing callers were hardcoded to the canonical path; this
+/// indirection lets `sandbox update`'s `log_step` instrumentation
+/// honour the same override install.sh respects, so an operator who
+/// pinned `SANDBOXD_INSTALL_LOG=/srv/log/sandboxd.log` at install
+/// time keeps the update audit trail in the same place.
+pub fn resolve_install_log_path(env_override: Option<&str>) -> String {
+    match env_override {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => DEFAULT_INSTALL_LOG_PATH.to_string(),
+    }
+}
+
+/// Append a `step=...` line to the install log (default
+/// `/var/log/sandbox-install.log`, or whatever
+/// `$SANDBOXD_INSTALL_LOG` points at) with the `sandbox-update`
+/// second token. Matches install.sh's `log_ok` shape (Spec 5 § 2.6).
+/// Best-effort — log write failure does not abort the upgrade.
 fn log_step(step: &str, fields: &str) {
     use std::io::Write;
     let line = format!(
         "{} sandbox-update step={step} {fields}\n",
         chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")
     );
+    let path = resolve_install_log_path(std::env::var(INSTALL_LOG_ENV_VAR).ok().as_deref());
     // Try direct append first (the daemon may run with operator
     // privileges in some configurations); fall back to `sudo tee -a`.
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .append(true)
         .create(true)
-        .open("/var/log/sandbox-install.log")
+        .open(&path)
     {
         let _ = f.write_all(line.as_bytes());
         return;
     }
     let _ = std::process::Command::new("sudo")
-        .args(["-k", "tee", "-a", "/var/log/sandbox-install.log"])
+        .args(["-k", "tee", "-a", &path])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -2871,6 +2902,34 @@ mod tests {
         let p = tmp.path().join("missing.json");
         let got = read_install_state(&p).unwrap();
         assert!(got.is_none());
+    }
+
+    /// `resolve_install_log_path` honours a non-empty
+    /// `$SANDBOXD_INSTALL_LOG` value verbatim (Spec 4 § 4.6 env
+    /// override). Pure-function test — pinned against a synthetic
+    /// path so the process env is never poked.
+    #[test]
+    fn install_log_path_respects_env_override() {
+        let path = resolve_install_log_path(Some("/srv/log/sandboxd.log"));
+        assert_eq!(path, "/srv/log/sandboxd.log");
+    }
+
+    /// `resolve_install_log_path` falls back to the canonical
+    /// `/var/log/sandbox-install.log` when the env value is unset.
+    #[test]
+    fn install_log_path_falls_back_when_env_unset() {
+        let path = resolve_install_log_path(None);
+        assert_eq!(path, DEFAULT_INSTALL_LOG_PATH);
+    }
+
+    /// An empty env value (`SANDBOXD_INSTALL_LOG=`) is treated as
+    /// "not set" — mirrors the shell-side `${SANDBOXD_INSTALL_LOG:-…}`
+    /// expansion install.sh / uninstall.sh use, where `:-` falls
+    /// back on both unset and empty.
+    #[test]
+    fn install_log_path_falls_back_on_empty_env_value() {
+        let path = resolve_install_log_path(Some(""));
+        assert_eq!(path, DEFAULT_INSTALL_LOG_PATH);
     }
 
     /// `enumerate_pending_config_migrations` returns an empty vec when

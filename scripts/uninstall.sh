@@ -20,7 +20,11 @@ set -eu
 # Defaults.
 # ----------------------------------------------------------------------------
 
-INSTALL_LOG="/var/log/sandbox-install.log"
+# Install log destination. `$SANDBOXD_INSTALL_LOG` mirrors install.sh
+# so the two scripts append to the same operator-overridden file
+# when set; unset / empty falls back to the canonical
+# `/var/log/sandbox-install.log` (Spec 4 § 4.6).
+INSTALL_LOG="${SANDBOXD_INSTALL_LOG:-/var/log/sandbox-install.log}"
 STATE_PATH="/var/lib/sandbox/.install-state.json"
 SCRIPT_NAME="uninstall.sh"
 SOCK_PATH="/run/sandbox/sandboxd.sock"
@@ -73,6 +77,12 @@ Options:
   --quiet       Suppress non-error output.
   --no-color    Force plain text output.
   --help        Print this message and exit.
+
+Environment variables:
+  SANDBOXD_INSTALL_LOG      Override the install-log path (default
+                            /var/log/sandbox-install.log). Mirrors
+                            install.sh so both scripts append to the
+                            same file under an operator override.
 
 By default uninstall.sh removes only binaries, the systemd unit, the
 route-helper, and any tracked install-time changes recorded in

@@ -70,7 +70,14 @@ __sandbox_lib_sh_path=$(__sandbox_lib_sh_resolve) && {
 DEFAULT_SOURCE_URL="https://github.com/Koriit/sandboxd/releases/download"
 LATEST_API_URL="https://api.github.com/repos/Koriit/sandboxd/releases/latest"
 
-INSTALL_LOG="/var/log/sandbox-install.log"
+# Install log destination. Defaults to `/var/log/sandbox-install.log`
+# (Spec 4 § 4.6). Operators on hosts where `/var/log` is read-only —
+# container-build chroots, read-only-root images, ephemeral CI VMs —
+# can override via `$SANDBOXD_INSTALL_LOG`. The override is honoured
+# verbatim; an empty or unset variable falls back to the canonical
+# path. `sandbox update` reads the same env var for parity (see
+# `sandbox-cli/src/update/mod.rs::resolve_install_log_path`).
+INSTALL_LOG="${SANDBOXD_INSTALL_LOG:-/var/log/sandbox-install.log}"
 STATE_PATH="/var/lib/sandbox/.install-state.json"
 SCRIPT_NAME="install.sh"
 
@@ -130,6 +137,11 @@ Options:
   --quiet                   Suppress non-error output.
   --no-color                Force plain text output.
   --help                    Print this message and exit.
+
+Environment variables:
+  SANDBOXD_INSTALL_LOG      Override the install-log path (default
+                            /var/log/sandbox-install.log). Useful on
+                            hosts where /var/log is read-only.
 
 Examples:
   # Latest tagged release.
