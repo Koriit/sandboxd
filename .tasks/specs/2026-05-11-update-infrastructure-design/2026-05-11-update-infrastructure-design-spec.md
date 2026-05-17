@@ -1064,15 +1064,24 @@ done
 '
 ```
 
-The current run's manifest is updated to `completed_ok: true` at
-step § 3.2.29 below, so this prune step **runs before** the final
-manifest update — but the filter on `completed_ok: true` already
-excludes the current set (its manifest still says `false` from step
-§ 3.2.19), so even if the prune ran twice it wouldn't touch this run's
-state. The re-ordering of binary swap and docker load (steps 20–21
-above) does not affect this property — the prune step looks only at
-already-completed sibling backup sets' manifests, not at the current
-run's binaries or images.
+**Ordering (binding):** this prune step **runs after** § 3.2.29
+(finalize manifest), not before, despite the lower section number.
+At the moment the prune iterates the backups root, the current run's
+manifest already says `completed_ok: true` (§ 3.2.29 flipped it), so
+the current set counts as one of the `RETENTION_KEEP=2` most-recent
+successful sets and is preserved by the keep-limit. The earlier
+ordering (prune before finalize) left the current set at
+`completed_ok: false`, so the prune skipped it under the
+`completed_ok: true` filter and the on-disk count drifted to
+`RETENTION_KEEP + 1` in steady state — a regression that surfaced
+only on the third successive update. The fix re-orders prune to run
+after finalize; the section number stays at § 3.2.25 to preserve the
+spec's stable identifiers, but the wall-clock order is `… §
+3.2.24 → § 3.2.26 → § 3.2.27 → § 3.2.28 → § 3.2.29 → § 3.2.25 →
+§ 3.2.30`. The re-ordering of binary swap and docker load (steps
+20–21 above) does not affect this property — the prune step looks
+only at already-completed sibling backup sets' manifests, not at the
+current run's binaries or images.
 
 Log: `step=prune_backups kept=2 pruned=<n>`.
 
