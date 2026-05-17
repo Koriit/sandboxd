@@ -10,6 +10,11 @@
 #   fulcio-root/root.{pem,key}  The Fulcio signing CA (issues the
 #                               end-entity certs cosign uses).
 #   ct-log/{privkey,pubkey}.pem CT log signing key.
+#   rekor/signing.key           PEM-encoded ECDSA P-256 private key used
+#                               as Rekor's transparency-log signer (passed
+#                               via --rekor_server.signer=<path>). Persists
+#                               across stack restarts so cached .sigstore
+#                               bundles remain valid for their lifetime.
 #   oidc/signing.{key,pub}.pem  RSA-2048 keypair used to mint OIDC JWTs.
 #   oidc/jwks.json              JWKS document derived from signing.pub.pem.
 #   oidc/discovery.json         OIDC well-known discovery document.
@@ -26,12 +31,13 @@ CA_DIR="$STATE_DIR/ca"
 CERTS_DIR="$STATE_DIR/certs"
 FULCIO_ROOT_DIR="$STATE_DIR/fulcio-root"
 CT_LOG_DIR="$STATE_DIR/ct-log"
+REKOR_DIR="$STATE_DIR/rekor"
 OIDC_DIR="$STATE_DIR/oidc"
 
 OIDC_ISSUER="${OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
 FULCIO_ROOT_PASSWD="${FULCIO_ROOT_PASSWD:-sandboxd-test}"
 
-mkdir -p "$CA_DIR" "$CERTS_DIR/oidc" "$FULCIO_ROOT_DIR" "$CT_LOG_DIR" "$OIDC_DIR"
+mkdir -p "$CA_DIR" "$CERTS_DIR/oidc" "$FULCIO_ROOT_DIR" "$CT_LOG_DIR" "$REKOR_DIR" "$OIDC_DIR"
 
 # --- TLS CA --------------------------------------------------------------
 
@@ -112,6 +118,24 @@ if [ ! -s "$CT_LOG_DIR/privkey.pem" ]; then
         -out "$CT_LOG_DIR/privkey.pem"
     openssl ec -in "$CT_LOG_DIR/privkey.pem" -pubout \
         -out "$CT_LOG_DIR/pubkey.pem" 2>/dev/null
+fi
+
+# --- Rekor transparency-log signing key ---------------------------------
+# Rekor v1.5.1's --rekor_server.signer accepts a path to a PEM-encoded
+# private key (parsed via go.step.sm/crypto/pemutil — accepts SEC1
+# `EC PRIVATE KEY` and PKCS8 `PRIVATE KEY` blocks). The in-memory signer
+# matches NewECDSASignerVerifier(P256, SHA256); mirror that here so the
+# public key Rekor publishes at /api/v1/log/publicKey is byte-identical
+# across container restarts. Without this, every `docker compose up`
+# minted a fresh key and invalidated cached .sigstore bundles.
+
+if [ ! -s "$REKOR_DIR/signing.key" ]; then
+    echo "[init.sh] generating Rekor signing key (ECDSA P-256, SEC1 PEM)"
+    openssl ecparam -name prime256v1 -genkey -noout \
+        -out "$REKOR_DIR/signing.key"
+    # The Rekor container runs as a non-root user; make the file
+    # world-readable (test-only stack, no real-world trust implication).
+    chmod 0644 "$REKOR_DIR/signing.key"
 fi
 
 # --- OIDC signing key + JWKS + discovery doc ----------------------------

@@ -293,16 +293,19 @@ def release_tarball_x86_64(sigstore_stack) -> Path:
       ``SANDBOX_RELEASE_FORCE_REBUILD=1`` overrides.
     * Re-sign (without rebuilding binaries) when the cached
       ``.sigstore`` bundle is older than the live stack's rekor public
-      key (``sigstore-stack/state/rekor.pub.cached.pem``). The local
-      Rekor instance runs with ``--rekor_server.signer=memory``, so
-      every container restart mints a fresh key. A bundle signed by a
-      previous run encodes a logID derived from the now-defunct key;
-      cosign verify-blob rejects it with ``rekor log public key not
-      found for payload``. The fixture detects this by comparing
-      mtimes — ``sigstore_stack`` writes the rekor pubkey cache file
-      on every bring-up — and re-drives ``build-local-tarball.sh``
-      with ``SANDBOX_RELEASE_SKIP_BUILD=1`` to re-stage + re-sign
-      without paying the cargo cost.
+      key (``sigstore-stack/state/rekor.pub.cached.pem``). Rekor now
+      runs with a persistent on-disk signer
+      (``--rekor_server.signer=<path>`` reading
+      ``sigstore-stack/state/rekor/signing.key``), so the pubkey is
+      stable across container restarts and this re-sign path should
+      not trigger under steady-state iteration. The mtime check stays
+      as belt-and-suspenders: if an operator deletes ``state/rekor/``
+      (or runs an old stack revision that regenerated the key), the
+      cached bundle would otherwise trip ``rekor log public key not
+      found for payload`` at verify-blob time. On detection the
+      fixture re-drives ``build-local-tarball.sh`` with
+      ``SANDBOX_RELEASE_SKIP_BUILD=1`` to re-stage + re-sign without
+      paying the cargo cost.
 
     Without the mtime guard, an iteration cycle that edits Rust code and
     re-runs pytest would happily reuse a stale tarball whose binaries
