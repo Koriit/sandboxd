@@ -272,47 +272,21 @@ def lima_delete(vm_name):
 def release_tarball_x86_64(sigstore_stack) -> Path:
     """Build the local release tarball once per test session.
 
-    Drives ``build-local-tarball.sh``; honors the script's
-    SANDBOX_RELEASE_SKIP_BUILD / SKIP_GATEWAY env vars when set in the
-    pytest invocation environment so iteration is fast.
+    Drives ``build-local-tarball.sh`` unconditionally on every pytest
+    invocation. Output lands at
+    ``tests/install-e2e/dist/sandboxd-<ver>-<arch>.tar.gz``. The script
+    itself relies on cargo's incremental cache plus the local docker
+    layer cache, so a warm rebuild is a fast no-op build (~1 min on a
+    warm host); the trade-off buys total elimination of cache-staleness
+    bugs (stale binaries, sigstore bundles signed against a previous
+    Rekor instance, etc.).
 
-    Depends on ``sigstore_stack``: the build script signs the
-    tarball against the local Fulcio + Rekor stack so install.sh's
-    real ``cosign verify-blob`` path can run end-to-end. If
-    ``sigstore_stack`` skipped (no Docker on the host), the build
-    script emits a zero-byte sigstore stub and downstream tests must
-    rely on the ``SANDBOX_INSTALL_SKIP_SIGSTORE=1`` test-only escape.
-
-    Cache shape:
-
-    * Output: ``tests/install-e2e/dist/sandboxd-<ver>-<arch>.tar.gz``.
-    * Skip rebuild when the cached tarball's mtime is newer than the
-      youngest ``*.rs`` file in the workspace tree. Mirrors the bumped
-      fixture's check (`release_tarball_x86_64_bumped` below) so a
-      workspace ``.rs`` edit invalidates the cached tarball.
-      ``SANDBOX_RELEASE_FORCE_REBUILD=1`` overrides.
-    * Re-sign (without rebuilding binaries) when the cached
-      ``.sigstore`` bundle is older than the live stack's rekor public
-      key (``sigstore-stack/state/rekor.pub.cached.pem``). Rekor now
-      runs with a persistent on-disk signer
-      (``--rekor_server.signer=<path>`` reading
-      ``sigstore-stack/state/rekor/signing.key``), so the pubkey is
-      stable across container restarts and this re-sign path should
-      not trigger under steady-state iteration. The mtime check stays
-      as belt-and-suspenders: if an operator deletes ``state/rekor/``
-      (or runs an old stack revision that regenerated the key), the
-      cached bundle would otherwise trip ``rekor log public key not
-      found for payload`` at verify-blob time. On detection the
-      fixture re-drives ``build-local-tarball.sh`` with
-      ``SANDBOX_RELEASE_SKIP_BUILD=1`` to re-stage + re-sign without
-      paying the cargo cost.
-
-    Without the mtime guard, an iteration cycle that edits Rust code and
-    re-runs pytest would happily reuse a stale tarball whose binaries
-    were built against the *pre-edit* tree — so tests would pass /
-    fail against artifacts that no longer reflect HEAD. The
-    ``test_release_tarball_x86_64_fixture_invalidates_on_rs_touch``
-    pytest case below pins this contract.
+    Depends on ``sigstore_stack``: the build script signs the tarball
+    against the local Fulcio + Rekor stack so install.sh's real
+    ``cosign verify-blob`` path can run end-to-end. If ``sigstore_stack``
+    skipped (no Docker on the host), the build script emits a zero-byte
+    sigstore stub and downstream tests must rely on the
+    ``SANDBOX_INSTALL_SKIP_SIGSTORE=1`` test-only escape.
     """
     if subprocess.run(["uname", "-m"], capture_output=True, text=True).stdout.strip() != "x86_64":
         pytest.skip("release_tarball_x86_64 fixture only assembles on x86_64 hosts")
@@ -320,45 +294,12 @@ def release_tarball_x86_64(sigstore_stack) -> Path:
     ver = _read_workspace_version()
     arch = "x86_64-unknown-linux-gnu"
     tarball = DIST_DIR / f"sandboxd-{ver}-{arch}.tar.gz"
-    bundle = Path(f"{tarball}.sigstore")
-    rekor_pub_cache = SIGSTORE_STACK_DIR / "state" / "rekor.pub.cached.pem"
 
-    force_rebuild = os.environ.get("SANDBOX_RELEASE_FORCE_REBUILD") == "1"
-    stale = (
-        not tarball.exists()
-        or tarball.stat().st_mtime < _newest_rs_mtime()
+    subprocess.run(
+        [str(HERE / "build-local-tarball.sh")],
+        check=True,
+        timeout=1800,
     )
-    # Bundle is stale relative to the live rekor key when the
-    # sigstore_stack fixture (which writes rekor_pub_cache on every
-    # bring-up) wrote a newer file than the cached bundle. A non-empty
-    # bundle is the canonical "tarball was signed against a previous
-    # stack run" signal — a zero-byte stub is the stack-down fallback
-    # and never triggers re-sign.
-    bundle_stale = (
-        bundle.exists()
-        and bundle.stat().st_size > 0
-        and rekor_pub_cache.exists()
-        and bundle.stat().st_mtime < rekor_pub_cache.stat().st_mtime
-    )
-
-    if force_rebuild or stale:
-        subprocess.run(
-            [str(HERE / "build-local-tarball.sh")],
-            check=True,
-            timeout=1800,
-        )
-    elif bundle_stale:
-        # Cargo + gateway artefacts are still fresh; only re-stage,
-        # re-tar, and re-sign. Pays no cargo build cost.
-        env = os.environ.copy()
-        env["SANDBOX_RELEASE_SKIP_BUILD"] = "1"
-        env["SANDBOX_RELEASE_SKIP_GATEWAY"] = "1"
-        subprocess.run(
-            [str(HERE / "build-local-tarball.sh")],
-            check=True,
-            timeout=600,
-            env=env,
-        )
 
     assert tarball.exists(), f"tarball not produced: {tarball}"
     return tarball
@@ -383,33 +324,6 @@ def _bump_patch_version(version: str) -> str:
     return ".".join(parts)
 
 
-def _newest_rs_mtime() -> float:
-    """Return the youngest mtime (in seconds since epoch) across every
-    ``*.rs`` file under the workspace.
-
-    Used by the bumped-tarball fixture's cache-validity check: a cached
-    tarball whose mtime is older than the youngest source file is
-    stale and must be rebuilt. Walks ``sandboxd/`` only (the workspace
-    root), skipping the cargo target dir which contains build-time
-    generated ``.rs`` files we don't want to invalidate against.
-    """
-    workspace = PROJECT_ROOT / "sandboxd"
-    newest = 0.0
-    for root, dirs, files in os.walk(workspace):
-        # Skip target/, .git/, etc. — they contain generated or
-        # unrelated files we don't want to invalidate against.
-        dirs[:] = [d for d in dirs if d not in ("target", ".git", "node_modules")]
-        for name in files:
-            if name.endswith(".rs"):
-                try:
-                    mtime = os.path.getmtime(os.path.join(root, name))
-                    if mtime > newest:
-                        newest = mtime
-                except OSError:
-                    continue
-    return newest
-
-
 @pytest.fixture(scope="session")
 def release_tarball_x86_64_bumped(release_tarball_x86_64, sigstore_stack) -> Path:
     """Build a release tarball at a bumped version distinct from the
@@ -424,25 +338,19 @@ def release_tarball_x86_64_bumped(release_tarball_x86_64, sigstore_stack) -> Pat
     whose binary's ``/version`` endpoint reports a different value
     than the base tarball's.
 
-    Cache shape:
+    Built unconditionally per pytest invocation (output at
+    ``tests/install-e2e/dist/sandboxd-<bumped>-<arch>.tar.gz``). The
+    bump version defaults to a patch-level bump (``X.Y.Z`` ->
+    ``X.Y.(Z+1)``); set ``SANDBOX_RELEASE_BUMP_VERSION`` in the pytest
+    invocation env to pick a different shape (the build script honours
+    the same env var).
 
-    * Output: ``tests/install-e2e/dist/sandboxd-<bumped>-<arch>.tar.gz``.
-    * Skip rebuild when the cached tarball's mtime is newer than the
-      youngest ``*.rs`` file in the workspace tree. This is the same
-      shape as cargo's incremental cache, lifted up to the tarball
-      level. ``SANDBOX_RELEASE_FORCE_REBUILD=1`` overrides.
-
-    The bump version defaults to a patch-level bump (``X.Y.Z`` ->
-    ``X.Y.(Z+1)``); set ``SANDBOX_RELEASE_BUMP_VERSION`` in the
-    pytest invocation env to pick a different shape (the build
-    script honours the same env var).
-
-    Depends on ``release_tarball_x86_64`` so the base tarball is
-    built first — the bumped build reuses the same docker cargo cache
-    (under ``tests/install-e2e/.build-cache``) so the bumped rebuild
-    is incremental on a warm cache. The two builds use distinct
-    target dirs (``target/portable`` vs ``target/portable-bumped``)
-    to keep their cargo fingerprints isolated across version-flips.
+    Depends on ``release_tarball_x86_64`` so the base tarball is built
+    first — the bumped build reuses the same docker cargo cache (under
+    ``tests/install-e2e/.build-cache``) so the bumped rebuild is
+    incremental on a warm cache. The two builds use distinct target
+    dirs (``target/portable`` vs ``target/portable-bumped``) to keep
+    their cargo fingerprints isolated across version-flips.
     """
     if subprocess.run(["uname", "-m"], capture_output=True, text=True).stdout.strip() != "x86_64":
         pytest.skip("release_tarball_x86_64_bumped fixture only assembles on x86_64 hosts")
@@ -458,52 +366,22 @@ def release_tarball_x86_64_bumped(release_tarball_x86_64, sigstore_stack) -> Pat
 
     arch = "x86_64-unknown-linux-gnu"
     tarball = DIST_DIR / f"sandboxd-{bumped_ver}-{arch}.tar.gz"
-    bundle = Path(f"{tarball}.sigstore")
-    rekor_pub_cache = SIGSTORE_STACK_DIR / "state" / "rekor.pub.cached.pem"
 
-    force_rebuild = os.environ.get("SANDBOX_RELEASE_FORCE_REBUILD") == "1"
-    stale = (
-        not tarball.exists()
-        or tarball.stat().st_mtime < _newest_rs_mtime()
+    env = os.environ.copy()
+    env["SANDBOX_RELEASE_BUMP_VERSION"] = bumped_ver
+    # The build script auto-detects the bumped build and reuses
+    # the base tarball's gateway-image bytes (identical) rather
+    # than re-running `make gateway-image`. The bumped cargo
+    # build uses a separate target dir
+    # (`sandboxd/target/portable-bumped/`) so the base build's
+    # incremental cache is unaffected.
+    subprocess.run(
+        [str(HERE / "build-local-tarball.sh")],
+        check=True,
+        timeout=3600,  # first build is slow: every crate rebuilds
+                       # because CARGO_PKG_VERSION env-var changes.
+        env=env,
     )
-    # Mirror release_tarball_x86_64's bundle-staleness check: the local
-    # Rekor signer is memory-only, so every stack restart invalidates
-    # any previously-written .sigstore bundle. Re-sign without rebuild
-    # via SANDBOX_RELEASE_SKIP_BUILD=1.
-    bundle_stale = (
-        bundle.exists()
-        and bundle.stat().st_size > 0
-        and rekor_pub_cache.exists()
-        and bundle.stat().st_mtime < rekor_pub_cache.stat().st_mtime
-    )
-
-    if force_rebuild or stale:
-        env = os.environ.copy()
-        env["SANDBOX_RELEASE_BUMP_VERSION"] = bumped_ver
-        # The build script auto-detects the bumped build and reuses
-        # the base tarball's gateway-image bytes (identical) rather
-        # than re-running `make gateway-image`. The bumped cargo
-        # build uses a separate target dir
-        # (`sandboxd/target/portable-bumped/`) so the base build's
-        # incremental cache is unaffected.
-        subprocess.run(
-            [str(HERE / "build-local-tarball.sh")],
-            check=True,
-            timeout=3600,  # first build is slow: every crate rebuilds
-                            # because CARGO_PKG_VERSION env-var changes.
-            env=env,
-        )
-    elif bundle_stale:
-        env = os.environ.copy()
-        env["SANDBOX_RELEASE_BUMP_VERSION"] = bumped_ver
-        env["SANDBOX_RELEASE_SKIP_BUILD"] = "1"
-        env["SANDBOX_RELEASE_SKIP_GATEWAY"] = "1"
-        subprocess.run(
-            [str(HERE / "build-local-tarball.sh")],
-            check=True,
-            timeout=600,
-            env=env,
-        )
 
     assert tarball.exists(), f"bumped tarball not produced: {tarball}"
     return tarball
@@ -534,11 +412,8 @@ def release_tarball_x86_64_bumped_chain(release_tarball_x86_64, sigstore_stack) 
     binaries. The fixture is ``scope="session"``, so this happens
     once per pytest invocation.
 
-    Cache shape per link: ``dist/sandboxd-<v>-<arch>.tar.gz``. A link
-    is rebuilt only when its cached tarball is older than the
-    youngest ``*.rs`` file in the workspace (same shape as the
-    single bumped fixture). ``SANDBOX_RELEASE_FORCE_REBUILD=1``
-    forces every link to rebuild.
+    Each link is rebuilt unconditionally per invocation; output lives
+    at ``dist/sandboxd-<v>-<arch>.tar.gz``.
 
     Returns: list of pathlib.Path entries, ordered (oldest → newest).
     Length defaults to 3; override with ``SANDBOX_RELEASE_BUMP_CHAIN_LEN``.
@@ -564,41 +439,17 @@ def release_tarball_x86_64_bumped_chain(release_tarball_x86_64, sigstore_stack) 
 
     arch = "x86_64-unknown-linux-gnu"
     chain_tarballs = []
-    force_rebuild = os.environ.get("SANDBOX_RELEASE_FORCE_REBUILD") == "1"
-    newest_rs = _newest_rs_mtime()
-    rekor_pub_cache = SIGSTORE_STACK_DIR / "state" / "rekor.pub.cached.pem"
 
     for ver in chain_versions:
         tarball = DIST_DIR / f"sandboxd-{ver}-{arch}.tar.gz"
-        bundle = Path(f"{tarball}.sigstore")
-        stale = not tarball.exists() or tarball.stat().st_mtime < newest_rs
-        bundle_stale = (
-            bundle.exists()
-            and bundle.stat().st_size > 0
-            and rekor_pub_cache.exists()
-            and bundle.stat().st_mtime < rekor_pub_cache.stat().st_mtime
+        env = os.environ.copy()
+        env["SANDBOX_RELEASE_BUMP_VERSION"] = ver
+        subprocess.run(
+            [str(HERE / "build-local-tarball.sh")],
+            check=True,
+            timeout=3600,
+            env=env,
         )
-
-        if force_rebuild or stale:
-            env = os.environ.copy()
-            env["SANDBOX_RELEASE_BUMP_VERSION"] = ver
-            subprocess.run(
-                [str(HERE / "build-local-tarball.sh")],
-                check=True,
-                timeout=3600,
-                env=env,
-            )
-        elif bundle_stale:
-            env = os.environ.copy()
-            env["SANDBOX_RELEASE_BUMP_VERSION"] = ver
-            env["SANDBOX_RELEASE_SKIP_BUILD"] = "1"
-            env["SANDBOX_RELEASE_SKIP_GATEWAY"] = "1"
-            subprocess.run(
-                [str(HERE / "build-local-tarball.sh")],
-                check=True,
-                timeout=600,
-                env=env,
-            )
 
         assert tarball.exists(), f"chain link not produced: {tarball}"
         chain_tarballs.append(tarball)
@@ -1211,10 +1062,10 @@ def sigstore_stack():
         # Rekor's /ping returns 200 once Trillian is initialised.
         _wait_http_200("http://127.0.0.1:3000/ping", deadline_seconds=60.0)
 
-        # Cache the Rekor public key on disk so install.sh inside the
-        # VM (which gets the file copied in) can point at a path rather
-        # than re-fetching at install time.
-        rekor_pub_path = SIGSTORE_STACK_DIR / "state" / "rekor.pub.cached.pem"
+        # Snapshot the live Rekor public key to disk so install.sh
+        # inside the VM (which gets the file copied in) can point at a
+        # path rather than re-fetching at install time.
+        rekor_pub_path = SIGSTORE_STACK_DIR / "state" / "rekor.pub.pem"
         import urllib.request
         with urllib.request.urlopen(
             "http://127.0.0.1:3000/api/v1/log/publicKey", timeout=5,
@@ -1357,8 +1208,10 @@ def peercred_connector_binary() -> Path:
 def _newest_helper_src_mtime() -> float:
     """Return youngest mtime across the peercred-connector crate sources.
 
-    Walks ``src/`` and ``Cargo.toml``; skips ``target/``. Same shape as
-    ``_newest_rs_mtime`` but scoped to a single helper crate.
+    Walks ``src/``, ``Cargo.toml``, and ``Cargo.lock``; skips ``target/``.
+    Used by the peercred-connector cache check; scoped to a single
+    standalone helper crate so it stays orthogonal to the workspace
+    tarball fixture (which builds unconditionally).
     """
     newest = 0.0
     candidates = [
