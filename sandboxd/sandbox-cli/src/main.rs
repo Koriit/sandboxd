@@ -350,9 +350,8 @@ enum Command {
     ///
     /// Connects tolerantly: the CLI ↔ daemon strict-equality handshake
     /// is bypassed for this subcommand so the operator can use doctor
-    /// to *diagnose* a version skew, not be refused by it. Full check
-    /// implementation lands in a follow-up session — this stub is the
-    /// dispatch arm so the bypass is structurally in place.
+    /// to *diagnose* a version skew, not be refused by it. The check
+    /// inventory and output contract live in [`sandbox_cli::doctor`].
     Doctor {
         /// Print all checks (including passes) rather than just the
         /// ones that failed or surfaced a skip-hint.

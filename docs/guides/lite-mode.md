@@ -7,10 +7,6 @@ Lite mode runs each session inside a Docker container instead of a Lima/QEMU vir
 
 For the broader security model that lite mode plugs into, see [Hardening](/guides/hardening/) and [Networking](/concepts/networking/). For the operational lifecycle that lite shares with Lima, see [Sessions](/concepts/sessions/).
 
-:::note
-The `--lite` first-use warning emitted by `sandbox create --lite` points at `docs/lite.md` for historical / search reasons; that shorthand resolves to this page.
-:::
-
 ## What lite mode is
 
 A lite session is a container-backed session: instead of a Lima/QEMU VM, the session lives inside a Docker container running an Ubuntu-based image with the same `sandbox-guest` agent the Lima backend uses. Activate it explicitly per session with either flag — the two are equivalent:

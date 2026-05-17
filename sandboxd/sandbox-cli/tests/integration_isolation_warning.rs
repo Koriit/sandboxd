@@ -159,7 +159,7 @@ async fn integration_isolation_warning_fires_for_lite_flag() {
     // backend.rs pins this same string at the renderer level; the
     // duplication here verifies the wiring (eprint! reaches the
     // subprocess's stderr) without re-pinning the bytes a third time.
-    let expected = "lite: container-backed session \u{2014} container-level isolation only (not VM-grade)\n      see docs/lite.md for the trade-off details\n";
+    let expected = "lite: container-backed session \u{2014} container-level isolation only (not VM-grade)\n      see guides/lite-mode for the trade-off details\n";
     assert!(
         stderr.starts_with(expected),
         "stderr must begin with the spec warning bytes; got:\n{stderr}"
@@ -188,7 +188,7 @@ async fn integration_isolation_warning_fires_for_backend_container() {
         "stderr must contain the warning, got:\n{stderr}"
     );
     assert!(
-        stderr.contains("see docs/lite.md for the trade-off details"),
+        stderr.contains("see guides/lite-mode for the trade-off details"),
         "stderr must include the docs reference line, got:\n{stderr}"
     );
 }

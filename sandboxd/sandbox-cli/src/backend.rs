@@ -511,8 +511,14 @@ pub fn render_feature_mismatch(
 ///
 /// ```text
 /// lite: container-backed session — container-level isolation only (not VM-grade)
-///       see docs/lite.md for the trade-off details
+///       see guides/lite-mode for the trade-off details
 /// ```
+///
+/// The trailing path is the published-site slug of the lite-mode
+/// guide (`docs/guides/lite-mode.md` in the repo). The original spec
+/// wording was `docs/lite.md`, but the Starlight site config exposes
+/// no alias under `/docs/lite` — operators following that shorthand
+/// got a 404. The slug now matches what actually publishes.
 ///
 /// Returns the empty string for [`BackendKind::Lima`] — the warning is
 /// container-specific. **Wire-format contract** — pinned by a
@@ -520,10 +526,10 @@ pub fn render_feature_mismatch(
 pub fn render_isolation_warning(backend: BackendKind) -> String {
     match backend {
         BackendKind::Container => {
-            // Hard-code the exact bytes the spec requires. A multi-line
-            // string literal preserves the em dash and the six-space
-            // indent on line 2 verbatim.
-            "lite: container-backed session \u{2014} container-level isolation only (not VM-grade)\n      see docs/lite.md for the trade-off details\n".to_string()
+            // Hard-code the exact bytes. A multi-line string literal
+            // preserves the em dash and the six-space indent on line 2
+            // verbatim.
+            "lite: container-backed session \u{2014} container-level isolation only (not VM-grade)\n      see guides/lite-mode for the trade-off details\n".to_string()
         }
         BackendKind::Lima => String::new(),
     }
@@ -908,7 +914,7 @@ error: `--force-rootless-docker` is only meaningful for the container backend
     #[test]
     fn render_isolation_warning_container_matches_spec_byte_for_byte() {
         let rendered = render_isolation_warning(BackendKind::Container);
-        let expected = "lite: container-backed session \u{2014} container-level isolation only (not VM-grade)\n      see docs/lite.md for the trade-off details\n";
+        let expected = "lite: container-backed session \u{2014} container-level isolation only (not VM-grade)\n      see guides/lite-mode for the trade-off details\n";
         assert_eq!(rendered, expected);
     }
 
