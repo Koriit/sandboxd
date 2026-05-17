@@ -3,7 +3,7 @@ title: Use workspaces
 description: Provision source code into a session using clone, shared mount, sandbox cp / sync, or git remote transport.
 ---
 
-This guide shows you how to use each workspace mode with copy-pasteable commands. For background on the four modes and their trade-offs, see [workspaces concepts](/concepts/workspaces/).
+This guide shows you how to use each workspace mode with copy-pasteable commands. For background on the five modes and their trade-offs, see [workspaces concepts](/concepts/workspaces/).
 
 ## Before you start
 
