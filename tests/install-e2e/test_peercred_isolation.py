@@ -34,6 +34,7 @@ together).
 
 from __future__ import annotations
 
+import base64
 import json
 import re
 import time
@@ -45,6 +46,7 @@ from conftest import (
     PEERCRED_CONNECTOR_VM_PATH,
     TEST_UID_BOB,
     TEST_UID_NOPASSWD,
+    _run,
     copy_tarball_to_vm,
     install_multi_operator_users_conf,
     install_sh_cmd,
@@ -780,4 +782,228 @@ def test_session_isolation_404_on_foreign_id(
     assert session_id not in r.stdout, (
         f"bob's `sandbox ps` leaked alice's session id {session_id!r}:\n"
         f"{r.stdout}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Non-owner sequential requests over one peercred-connector connection
+# ---------------------------------------------------------------------------
+
+def _split_pipelined_responses(raw):
+    """Split a byte stream carrying two back-to-back HTTP/1.1 responses.
+
+    Each HTTP/1.1 response on the wire is ``status-line CRLF headers
+    CRLF CRLF body``; the body length is fixed by the ``Content-Length``
+    header. We rely on that header — every sandboxd endpoint touched
+    here stamps it — to read exactly ``Content-Length`` body bytes and
+    treat the remainder as the next response. Two passes return
+    ``(status_a, headers_a, body_a), (status_b, headers_b, body_b)``.
+
+    The parser operates on bytes (no CRLF -> LF rewriting) so the
+    response framing survives intact; ``capture_bytes=True`` in
+    ``_run`` is what keeps ``raw`` as bytes rather than text.
+    """
+    def parse_one(buf):
+        sep = buf.find(b"\r\n\r\n")
+        if sep < 0:
+            raise AssertionError(
+                f"response missing CRLF/CRLF header terminator:\n{buf!r}"
+            )
+        head = buf[:sep].decode("ascii", errors="replace")
+        rest = buf[sep + 4 :]
+        lines = head.split("\r\n")
+        status_parts = lines[0].split(" ", 2)
+        if len(status_parts) < 2 or not status_parts[1].isdigit():
+            raise AssertionError(
+                f"malformed status line: {lines[0]!r}\nfull head:\n{head!r}"
+            )
+        status = int(status_parts[1])
+        headers = {}
+        for line in lines[1:]:
+            if ":" in line:
+                k, _, v = line.partition(":")
+                headers[k.strip().lower()] = v.strip()
+        cl = headers.get("content-length")
+        if cl is None:
+            raise AssertionError(
+                "response missing Content-Length; the pipelined parser "
+                "needs it to find the next response boundary.\n"
+                f"head:\n{head!r}"
+            )
+        body_len = int(cl)
+        if len(rest) < body_len:
+            raise AssertionError(
+                f"response body truncated: header says Content-Length={body_len} "
+                f"but only {len(rest)} bytes follow the header terminator.\n"
+                f"head:\n{head!r}\nrest:\n{rest!r}"
+            )
+        body = rest[:body_len]
+        remainder = rest[body_len:]
+        return (status, headers, body), remainder
+
+    first, remainder = parse_one(raw)
+    second, trailing = parse_one(remainder)
+    # Trailing bytes after the second response would indicate either a
+    # third response (unexpected) or stray bytes (corruption). Fail loud.
+    if trailing:
+        raise AssertionError(
+            f"unexpected trailing bytes after second response: {trailing!r}"
+        )
+    return first, second
+
+
+@pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
+def test_non_owner_sequential_requests_share_kept_alive_connection(
+    distro_template,
+    vm_factory,
+    release_tarball_x86_64,
+    peercred_connector_binary,
+    sigstore_stack,
+):
+    """Two HTTP/1.1 requests pipelined over a single peercred-connector
+    connection under a non-owner uid both receive their full responses.
+
+    Wire shape:
+      * Request 1: ``GET /version`` with ``Connection: keep-alive``.
+        Daemon responds 200 OK with a one-field JSON body.
+      * Request 2: ``GET /sessions/<alice-owned id>`` with
+        ``Connection: close``. Daemon's per-caller storage filter
+        rejects the foreign-owner row and responds 404 with the
+        Spec § 5 ``{"error":"session not found: <id>"}`` body.
+
+    The peercred-connector writes both requests in one ``write_all``
+    (HTTP/1.1 pipelining), then reads until EOF; the daemon emits both
+    responses on the wire and closes after the second per the
+    ``Connection: close`` on request 2.
+
+    This pins the invariant that the connector does NOT half-close its
+    write side between the request blob and the read loop. If it did
+    (the regressed shape), hyper's server-side would observe the
+    write-side close and abort the in-flight first response — the test
+    would see a truncated or empty buffer instead of two complete
+    responses with valid ``Content-Length``-framed bodies.
+
+    Captured bytes flow:
+      * Connector writes raw response bytes to a file in the VM.
+      * The test pulls the file with ``capture_bytes=True`` so CRLF
+        survives intact; the splitter relies on byte-accurate
+        ``Content-Length`` accounting and cannot tolerate the
+        universal-newline rewrite that text-mode capture applies.
+    """
+    vm, invoking_user = _bring_up_peercred_vm(
+        vm_factory,
+        distro_template,
+        release_tarball_x86_64,
+        peercred_connector_binary,
+        sigstore_stack,
+    )
+
+    # Foreign-owner session for the second request. ``alice`` is the
+    # owner; bob (the uid the connector drops to below) is not, so the
+    # daemon's per-caller filter must answer 404.
+    session_id = uuid.uuid4().hex[:12]
+    _inject_synthetic_session(
+        vm,
+        session_id=session_id,
+        owner_username="alice",
+    )
+
+    # Compose the two-request blob. CRLF framing is load-bearing here:
+    # HTTP/1.1 mandates CRLF between every header line and CRLF/CRLF
+    # between headers and (the absent) body. Both requests are body-
+    # less GETs, so Content-Length is unnecessary on the request side.
+    req_one = (
+        "GET /version HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n"
+    )
+    req_two = (
+        f"GET /sessions/{session_id} HTTP/1.1\r\n"
+        "Host: localhost\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+    )
+    request_blob = req_one + req_two
+
+    # Stage the request file in the VM. Use base64 to ferry the bytes
+    # so the heredoc shell quoting never has to wrestle with CRLF (and
+    # so the file we land on disk matches the bytes verbatim).
+    encoded = base64.b64encode(request_blob.encode("ascii")).decode("ascii")
+    vm.shell(
+        f"echo {encoded} | base64 -d > /tmp/req-pipelined",
+        check=True,
+    )
+
+    # Invoke peercred-connector as bob; redirect raw response bytes to
+    # a file in the VM so we can pull them with byte-accurate fidelity
+    # below. The connector's stdout carries the wire bytes verbatim.
+    r = vm.shell(
+        f"sudo -u {invoking_user} {PEERCRED_CONNECTOR_VM_PATH} "
+        f"--uid {TEST_UID_BOB} "
+        f"--request-file /tmp/req-pipelined "
+        f"--socket {DAEMON_SOCK} "
+        f"> /tmp/resp-pipelined.bin",
+        timeout=30,
+    )
+    assert r.returncode == 0, (
+        f"peercred-connector exited {r.returncode}; the connector must "
+        f"complete the round trip cleanly when both requests get full "
+        f"responses (Connection: close on the second triggers EOF and a "
+        f"clean exit 0).\nstdout:\n{r.stdout!r}\nstderr:\n{r.stderr!r}"
+    )
+
+    # Pull the raw response bytes back to the host. ``capture_bytes
+    # =True`` keeps ``\r\n`` framing intact so the pipelined splitter
+    # below can count Content-Length bodies precisely. The default text
+    # path would rewrite CRLF -> LF and silently break the boundary
+    # arithmetic. The redirect that produced the file ran as the
+    # limactl-default user, so no sudo is needed to read it back.
+    pull = _run(
+        ["limactl", "shell", vm.name, "--", "cat", "/tmp/resp-pipelined.bin"],
+        timeout=30,
+        capture_bytes=True,
+    )
+    raw = pull.stdout
+    # Two full responses must have arrived. Empty / truncated stdout is
+    # exactly the regressed shape: hyper aborted on a premature write-
+    # side half-close before either response landed.
+    assert raw, (
+        "peercred-connector produced no response bytes — this is the "
+        "regressed shape where the connector half-closes its write side "
+        "and hyper's server aborts the in-flight response."
+    )
+    assert b"\r\n" in raw, (
+        "response bytes lack CRLF framing — capture_bytes=True should "
+        f"preserve it. got: {raw!r}"
+    )
+
+    (status_a, _headers_a, body_a), (status_b, _headers_b, body_b) = (
+        _split_pipelined_responses(raw)
+    )
+
+    # Request 1: GET /version → 200 OK with a {"version": "..."} body.
+    assert status_a == 200, (
+        f"first request (GET /version) returned status {status_a}; "
+        f"expected 200.\nbody:\n{body_a!r}"
+    )
+    body_a_json = json.loads(body_a)
+    assert "version" in body_a_json and isinstance(body_a_json["version"], str), (
+        f"first response body missing 'version' string: {body_a_json!r}"
+    )
+
+    # Request 2: GET /sessions/<alice-owned> as bob → 404 with the
+    # Spec § 5 error wording. The body matching here is the load-
+    # bearing part of this test: if the connector half-closed the
+    # write side prematurely, the second response would never land
+    # (hyper aborts before sending it). Receiving the full 404 body
+    # proves the kept-alive connection survived end-to-end.
+    assert status_b == 404, (
+        f"second request (GET /sessions/{session_id}) returned status "
+        f"{status_b}; expected 404 for a foreign-owner session.\n"
+        f"body:\n{body_b!r}"
+    )
+    body_b_json = json.loads(body_b)
+    assert body_b_json == {"error": f"session not found: {session_id}"}, (
+        f"second response body did not match Spec § 5 shape: {body_b_json!r}"
     )

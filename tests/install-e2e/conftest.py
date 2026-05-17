@@ -75,21 +75,31 @@ def pytest_runtest_makereport(item, call):
 # Lima primitives.
 # ---------------------------------------------------------------------------
 
-def _run(cmd, *, check=True, timeout=120, capture=True, env=None):
-    """Thin wrapper around subprocess.run with sensible defaults."""
+def _run(cmd, *, check=True, timeout=120, capture=True, env=None, capture_bytes=False):
+    """Thin wrapper around subprocess.run with sensible defaults.
+
+    By default streams are decoded as text (``subprocess.run(text=True)``)
+    which applies universal-newline translation — convenient for shell
+    output, but destructive for any test that needs to inspect bytes
+    verbatim (HTTP wire frames, binary payloads). Pass ``capture_bytes
+    =True`` to switch the underlying call to bytes mode so the captured
+    stdout/stderr are ``bytes`` objects with no CRLF -> LF rewriting.
+    Mutually exclusive with the default text mode; existing call sites
+    are unaffected.
+    """
     result = subprocess.run(
         cmd,
         check=False,
         timeout=timeout,
         capture_output=capture,
-        text=True,
+        text=not capture_bytes,
         env=env,
     )
     if check and result.returncode != 0:
         raise AssertionError(
             f"command failed (exit {result.returncode}): {cmd}\n"
-            f"stdout:\n{result.stdout}\n"
-            f"stderr:\n{result.stderr}"
+            f"stdout:\n{result.stdout!r}\n"
+            f"stderr:\n{result.stderr!r}"
         )
     return result
 
