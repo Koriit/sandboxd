@@ -11,7 +11,7 @@ For the per-flag CLI reference, see [`sandbox update`](/reference/cli/#sandbox-u
 
 Before the first upgrade on a host, confirm:
 
-- **Production install.** `sandbox update` refuses to run against a developer build (no `/etc/systemd/system/sandboxd.service`, or `/var/lib/sandbox/` missing/not owned by `sandbox:sandbox`). Dev installs upgrade by re-running `make setup-dev-env`.
+- **Production install.** `sandbox update` refuses to run against a developer build. Detection is by *both* the systemd unit at `/etc/systemd/system/sandboxd.service` and the install-state file at `/var/lib/sandbox/.install-state.json` being present; if either is missing the host is treated as a dev install. Dev installs upgrade by re-running `make setup-dev-env`.
 - **`cosign` on PATH (or available to bootstrap).** The CLI verifies the release tarball's sigstore signature before any state change. `install.sh` already installs `cosign` at a pinned version + sha256; the update flow reuses that. If cosign is missing entirely, the CLI bootstraps it on first run.
 - **`sandbox` group membership.** The lock file at `/var/lib/sandbox/.update.lock` is mode `0664 sandbox:sandbox`; the operator running `sandbox update` must be in the `sandbox` group to acquire it directly. Membership is granted by `install.sh` (the invoking operator is added to `sandbox`) and re-granted by `useradd -aG sandbox <other>` for additional operators.
 - **The install log is writable.** `/var/log/sandbox-install.log` (mode `0640 root:root`) is the shared forensic record for `install.sh`, `uninstall.sh`, and `sandbox update`. Each step appends one `step=<name> action=<verb> status=<ok|fail>` line. The path is overridable via the `SANDBOXD_INSTALL_LOG` env var when `/var/log` is read-only.
