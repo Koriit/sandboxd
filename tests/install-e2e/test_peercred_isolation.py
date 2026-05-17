@@ -612,11 +612,20 @@ def _parse_http_status(response_bytes):
     peercred-connector dumps the daemon's raw response to stdout; we
     parse the status line directly rather than depending on a Python
     HTTP client (none of which understand reading from a string).
+
+    Tolerates both ``\\r\\n`` and ``\\n`` line framing. The connector's
+    on-the-wire output uses CRLF (HTTP/1.1 spec), but the response
+    travels through ``subprocess.run(..., text=True)`` which applies
+    universal-newline translation (``\\r\\n`` -> ``\\n``) on capture.
+    Both framings reach this parser depending on whether the caller
+    captured bytes or decoded text; accept either.
     """
     text = response_bytes
     if isinstance(text, bytes):
         text = text.decode("utf-8", errors="replace")
-    first_line, _, rest = text.partition("\r\n")
+    # Normalize to LF-only framing so the splitter below is single-arm.
+    text = text.replace("\r\n", "\n")
+    first_line, _, rest = text.partition("\n")
     parts = first_line.split(" ", 2)
     if len(parts) < 2 or not parts[1].isdigit():
         raise AssertionError(
@@ -742,8 +751,9 @@ def integration_session_isolation_404_on_foreign_id(
 
     # Body shape per Spec § 5: ``{"error":"session not found: <id>"}``.
     # The body is at the tail of the response after the blank line
-    # separating headers from body.
-    body_split = rest.split("\r\n\r\n", 1)
+    # separating headers from body. ``_parse_http_status`` normalised
+    # CRLF -> LF, so the blank-line separator is now ``\n\n``.
+    body_split = rest.split("\n\n", 1)
     assert len(body_split) == 2, (
         f"could not separate headers from body in:\n{rest!r}"
     )
