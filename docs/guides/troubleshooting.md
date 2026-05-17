@@ -452,10 +452,10 @@ The route helper enforces a **pair-membership rule**: the operator invoking it (
 Every helper invocation — allowed or denied — writes one JSON-Lines record to the audit log. To diagnose a deny:
 
 ```bash
-# Production (post-Spec-3 daemon runs as the `sandbox` user):
+# Production install (operator install via install.sh; daemon runs as the `sandbox` user):
 sudo -u sandbox tail -n 20 /var/lib/sandbox/route-helper-audit.log
 
-# Today's-mode / dev-mode (daemon runs as the invoking operator):
+# Developer install (daemon runs as the invoking operator):
 tail -n 20 "$XDG_RUNTIME_DIR/sandboxd/route-helper-audit.log"
 # Or, if XDG_RUNTIME_DIR is unset (rare): ~/.local/share/sandboxd/route-helper-audit.log
 ```
