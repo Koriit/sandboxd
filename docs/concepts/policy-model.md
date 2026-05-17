@@ -162,7 +162,7 @@ For debugging what the active policy allows, `sandbox describe` prints a human s
 
 ## Presets
 
-Presets are reusable host-list templates that the CLI expands into v2 policy rules before the request ever reaches the daemon. Ten built-ins ship with every CLI release (`npm:`, `pypi:`, `cargo:`, `goproxy:`, `maven:`, `gradle:`, `dockerhub:`, `github:`, `github-repo:`, `github-pr:`), and user-defined JSON presets under `$XDG_CONFIG_HOME/sandboxd/presets/` extend the catalog for site-specific destinations.
+Presets are reusable host-list templates that the CLI expands into v2 policy rules before the request ever reaches the daemon. Eleven built-ins ship with every CLI release (`npm:`, `pypi:`, `cargo:`, `goproxy:`, `maven:`, `gradle:`, `dockerhub:`, `github:`, `github-repo:`, `github-pr:`, `ubuntu:`), and user-defined JSON presets under `$XDG_CONFIG_HOME/sandboxd/presets/` extend the catalog for site-specific destinations.
 
 Expansion is entirely client-side — the daemon receives the fully materialized effective policy and stores the original `--preset` invocation strings as a `source_presets` audit trail attached to the `policy_applied` / `policy_updated` events. See the [network policies guide → Presets](/guides/network-policies/#presets) for invocation syntax, built-in catalog, and user-preset authoring rules.
 
