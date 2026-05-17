@@ -315,7 +315,12 @@ pub async fn fetch_session_counts(socket_path: &str) -> SessionCounts {
         reachable: true,
     };
     for s in sessions {
-        if s.state == "Stopped" {
+        // `SessionState` derives serde with `rename_all = "snake_case"`,
+        // so the wire value is lowercase (`"stopped"` / `"running"`
+        // / ...). The DB column and the `Display` impl use the
+        // PascalCase variant name, but neither reaches this path —
+        // we read off the JSON wire here.
+        if s.state == "stopped" {
             counts.stopped += 1;
         } else {
             counts.active += 1;
@@ -428,7 +433,9 @@ async fn fetch_stopped_sessions_with_proto(socket_path: &str) -> Vec<(String, u3
     };
     sessions
         .into_iter()
-        .filter(|s| s.state == "Stopped")
+        // `SessionState` serializes via `rename_all = "snake_case"`; the
+        // wire format is lowercase.
+        .filter(|s| s.state == "stopped")
         .map(|s| (s.id, s.guest_protocol_version))
         .collect()
 }
