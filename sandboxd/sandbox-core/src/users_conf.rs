@@ -1902,10 +1902,7 @@ mod tests {
         assert_eq!(entry.get("cidr"), Some(&serde_json::json!("10.209.0.0/24")));
         assert_eq!(entry.get("comment"), Some(&serde_json::json!("alice prod")));
         // Top-level schema version stamped, as always.
-        assert_eq!(
-            output.get("_schema_version"),
-            Some(&serde_json::json!(1))
-        );
+        assert_eq!(output.get("_schema_version"), Some(&serde_json::json!(1)));
     }
 
     #[test]
@@ -1930,10 +1927,7 @@ mod tests {
             "V001 must not synthesise `allow_users` when absent"
         );
         assert_eq!(entry.get("cidr"), Some(&serde_json::json!("10.209.0.0/24")));
-        assert_eq!(
-            output.get("_schema_version"),
-            Some(&serde_json::json!(1))
-        );
+        assert_eq!(output.get("_schema_version"), Some(&serde_json::json!(1)));
     }
 
     // -----------------------------------------------------------------

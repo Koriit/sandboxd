@@ -948,11 +948,9 @@ mod tests {
         // phase 1 must be visible.
         let conn = Connection::open(&restore_db).expect("open restored");
         let name: String = conn
-            .query_row(
-                "SELECT name FROM sessions WHERE id = 1",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT name FROM sessions WHERE id = 1", [], |row| {
+                row.get(0)
+            })
             .expect("recovered row must be present");
         assert_eq!(name, "kept-across-wal-replay");
     }
@@ -1022,11 +1020,10 @@ mod tests {
         // The table itself might not exist (CREATE TABLE landed in
         // the WAL too), or the row might be missing. Either way,
         // the SELECT must NOT find the committed row.
-        let lookup: rusqlite::Result<String> = conn.query_row(
-            "SELECT name FROM sessions WHERE id = 1",
-            [],
-            |row| row.get(0),
-        );
+        let lookup: rusqlite::Result<String> =
+            conn.query_row("SELECT name FROM sessions WHERE id = 1", [], |row| {
+                row.get(0)
+            });
         match lookup {
             Err(_) => { /* Table or row absent — the loss-on-recovery contract */ }
             Ok(name) => panic!(
@@ -1148,8 +1145,7 @@ mod tests {
                 assert!(
                     matches!(
                         kind,
-                        std::io::ErrorKind::NotADirectory
-                            | std::io::ErrorKind::AlreadyExists
+                        std::io::ErrorKind::NotADirectory | std::io::ErrorKind::AlreadyExists
                     ),
                     "expected NotADirectory or AlreadyExists; got {kind:?}: {io_err}"
                 );
@@ -1217,10 +1213,7 @@ mod tests {
         ];
         for (dir_name, from, to) in sets.iter() {
             let set_dir = root.join(dir_name);
-            write_synth_manifest(
-                &set_dir,
-                &synth_manifest(from, to, &dir_name[..20], false),
-            );
+            write_synth_manifest(&set_dir, &synth_manifest(from, to, &dir_name[..20], false));
         }
 
         let outcome = prune_old_backup_sets_at(root).expect("prune ok");

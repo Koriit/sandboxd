@@ -1024,8 +1024,7 @@ mod tests {
     #[test]
     fn apply_migration_in_memory_runs_v001_against_users_conf_bytes() {
         // V001 input from Spec 1 § 5.5 (single-user pool — Output A).
-        let input =
-            br#"{"subnets":[{"cidr":"10.209.0.0/24","allow_users":["alice"]}]}"#.to_vec();
+        let input = br#"{"subnets":[{"cidr":"10.209.0.0/24","allow_users":["alice"]}]}"#.to_vec();
 
         // Look up V001 in the production registry rather than the
         // synthetic test registry — this is the daemon-side path
@@ -1035,14 +1034,9 @@ mod tests {
         let id = v001.id();
         let target = v001.target_file();
         assert_eq!(id, 1, "V001 id");
-        assert_eq!(
-            target,
-            TargetFile::UsersConf,
-            "V001 must target users.conf"
-        );
+        assert_eq!(target, TargetFile::UsersConf, "V001 must target users.conf");
 
-        let out =
-            apply_migration_in_memory(id, &input, target).expect("V001 transform succeeds");
+        let out = apply_migration_in_memory(id, &input, target).expect("V001 transform succeeds");
 
         // Output is JSON containing the stamped `_schema_version` and
         // the prepended `"sandbox"` entry in `allow_users`. Exact

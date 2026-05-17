@@ -102,7 +102,9 @@ fn current_username() -> String {
 /// roll back, #2/#3 never hit the create path).
 fn write_users_conf(dir: &Path, user: &str) -> PathBuf {
     let path = dir.join("users.conf");
-    let body = format!(r#"{{"_schema_version":1,"subnets":[{{"cidr":"10.219.0.0/24","allow_users":["{user}"]}}]}}"#);
+    let body = format!(
+        r#"{{"_schema_version":1,"subnets":[{{"cidr":"10.219.0.0/24","allow_users":["{user}"]}}]}}"#
+    );
     let mut f = std::fs::File::create(&path).expect("create users.conf");
     f.write_all(body.as_bytes()).expect("write users.conf");
     f.flush().expect("flush users.conf");

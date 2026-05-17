@@ -266,13 +266,8 @@ async fn integration_session_create_refused_on_missing_gateway_image() {
     // not matter for this test — both Lima and Container reach the
     // same pre-flight gate before any backend code runs.
     let body = r#"{"backend":"container","cpus":1.0,"memory_mb":256}"#.to_string();
-    let (status, body_bytes) = http_post_json(
-        &daemon.socket,
-        "/sessions",
-        body,
-        Duration::from_secs(15),
-    )
-    .await;
+    let (status, body_bytes) =
+        http_post_json(&daemon.socket, "/sessions", body, Duration::from_secs(15)).await;
 
     // Spec § 11.6: refusal status maps via `error_response` to 500.
     assert_eq!(
@@ -292,9 +287,7 @@ async fn integration_session_create_refused_on_missing_gateway_image() {
         .get("error")
         .and_then(|v| v.as_str())
         .unwrap_or_else(|| {
-            panic!(
-                "refusal body must have a top-level `error` string; got: {parsed}"
-            )
+            panic!("refusal body must have a top-level `error` string; got: {parsed}")
         });
 
     assert!(

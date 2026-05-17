@@ -6051,12 +6051,17 @@ async fn diagnostics_handler(
     // outcome.
     let gateway_probe = {
         let tag = gateway_tag.clone();
-        let join = tokio::task::spawn_blocking(move || sandbox_core::gateway::gateway_image_present(&tag)).await;
+        let join =
+            tokio::task::spawn_blocking(move || sandbox_core::gateway::gateway_image_present(&tag))
+                .await;
         match join {
             Ok(Ok(true)) => (true, None),
             Ok(Ok(false)) => (false, None),
             Ok(Err(e)) => (false, Some(format!("{e}"))),
-            Err(e) => (false, Some(format!("daemon-side probe task failed to run: {e}"))),
+            Err(e) => (
+                false,
+                Some(format!("daemon-side probe task failed to run: {e}")),
+            ),
         }
     };
     let lite_probe = {
@@ -6077,7 +6082,9 @@ async fn diagnostics_handler(
                 Ok(out) if out.status.success() => Ok(true),
                 Ok(out) => {
                     let stderr_lower = String::from_utf8_lossy(&out.stderr).to_lowercase();
-                    if stderr_lower.contains("no such image") || stderr_lower.contains("no such object") {
+                    if stderr_lower.contains("no such image")
+                        || stderr_lower.contains("no such object")
+                    {
                         Ok(false)
                     } else {
                         Err(format!(
@@ -6094,7 +6101,10 @@ async fn diagnostics_handler(
             Ok(Ok(true)) => (true, None),
             Ok(Ok(false)) => (false, None),
             Ok(Err(e)) => (false, Some(e)),
-            Err(e) => (false, Some(format!("daemon-side probe task failed to run: {e}"))),
+            Err(e) => (
+                false,
+                Some(format!("daemon-side probe task failed to run: {e}")),
+            ),
         }
     };
 

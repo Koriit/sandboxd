@@ -57,8 +57,7 @@ use sandbox_core::backend::{
     lite_image_tag_for_version,
 };
 use sandbox_core::guest::{
-    DAEMON_GUEST_PROTO_VERSION, SANDBOX_GUEST_VERSION, can_refresh_in_place,
-    is_protocol_compatible,
+    DAEMON_GUEST_PROTO_VERSION, SANDBOX_GUEST_VERSION, can_refresh_in_place, is_protocol_compatible,
 };
 use sandbox_core::session::SessionId;
 use sandbox_core::{
@@ -431,14 +430,8 @@ async fn integration_guest_refresh_container_backend() {
     let base_dir = TempDir::new().expect("tempdir base_dir");
     let staged_path = place_test_guest(base_dir.path(), &placeholder_sleep_script("v-new"));
 
-    let runtime = ContainerRuntime::new(
-        lite_image_tag(),
-        128,
-        1.0,
-        1000,
-        1000,
-        staged_path.clone(),
-    );
+    let runtime =
+        ContainerRuntime::new(lite_image_tag(), 128, 1.0, 1000, 1000, staged_path.clone());
 
     let tmp = TempDir::new().expect("tempdir for store");
     let (store, _orphans) = SessionStore::new(tmp.path().to_path_buf()).expect("open store");
@@ -547,14 +540,8 @@ async fn integration_guest_binary_swap_picked_up_by_new_sessions() {
 
     // Stage v1 and create container #1.
     let staged_path = place_test_guest(base_dir.path(), &placeholder_sleep_script("v-one"));
-    let runtime = ContainerRuntime::new(
-        lite_image_tag(),
-        128,
-        1.0,
-        1000,
-        1000,
-        staged_path.clone(),
-    );
+    let runtime =
+        ContainerRuntime::new(lite_image_tag(), 128, 1.0, 1000, 1000, staged_path.clone());
 
     let tmp = TempDir::new().expect("tempdir for store");
     let (store, _orphans) = SessionStore::new(tmp.path().to_path_buf()).expect("open store");
@@ -677,14 +664,8 @@ async fn integration_guest_binary_swap_picked_up_by_new_sessions() {
 async fn integration_guest_binary_shared_inode_across_sessions() {
     let base_dir = TempDir::new().expect("tempdir base_dir");
     let staged_path = place_test_guest(base_dir.path(), &placeholder_sleep_script("shared"));
-    let runtime = ContainerRuntime::new(
-        lite_image_tag(),
-        128,
-        1.0,
-        1000,
-        1000,
-        staged_path.clone(),
-    );
+    let runtime =
+        ContainerRuntime::new(lite_image_tag(), 128, 1.0, 1000, 1000, staged_path.clone());
 
     let tmp = TempDir::new().expect("tempdir for store");
     let (store, _orphans) = SessionStore::new(tmp.path().to_path_buf()).expect("open store");
@@ -750,7 +731,9 @@ async fn integration_guest_binary_shared_inode_across_sessions() {
          /usr/local/bin/sandbox-guest; got A={src_a}, B={src_b}",
     );
     assert_eq!(
-        std::path::PathBuf::from(&src_a).canonicalize().expect("canonicalize A"),
+        std::path::PathBuf::from(&src_a)
+            .canonicalize()
+            .expect("canonicalize A"),
         staged_path.canonicalize().expect("canonicalize staged"),
         "containers must bind-mount the daemon-staged path verbatim",
     );
@@ -812,13 +795,10 @@ fn bind_mount_source_for_guest(container_name: &str) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     let json_str = String::from_utf8(output.stdout).expect("Mounts utf8");
-    let mounts: serde_json::Value =
-        serde_json::from_str(json_str.trim()).expect("Mounts parse");
+    let mounts: serde_json::Value = serde_json::from_str(json_str.trim()).expect("Mounts parse");
     let arr = mounts.as_array().expect("Mounts is array");
     for m in arr {
-        if m.get("Destination").and_then(|v| v.as_str())
-            == Some("/usr/local/bin/sandbox-guest")
-        {
+        if m.get("Destination").and_then(|v| v.as_str()) == Some("/usr/local/bin/sandbox-guest") {
             return m
                 .get("Source")
                 .and_then(|v| v.as_str())

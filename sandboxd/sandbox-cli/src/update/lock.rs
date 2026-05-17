@@ -681,9 +681,7 @@ mod tests {
             &path,
             serde_json::to_vec(&LockPayload {
                 pid: 99999,
-                started_at: chrono::Utc::now()
-                    .format("%Y-%m-%dT%H:%M:%SZ")
-                    .to_string(),
+                started_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
                 target_version: "1.1.0".to_string(),
                 from_version: "1.0.0".to_string(),
                 was_running: false,

@@ -365,9 +365,7 @@ async fn integration_guest_refresh_lima_backend() {
             // `parse_limactl_error`) would still surface as an
             // unexpected message shape.
             assert!(
-                msg.contains("guest")
-                    || msg.contains("limactl")
-                    || msg.contains("sandbox-guest"),
+                msg.contains("guest") || msg.contains("limactl") || msg.contains("sandbox-guest"),
                 "refresh failed with SandboxError::Lima but the message does not \
                  name a Lima refresh step (limactl / guest / sandbox-guest); got: {msg}"
             );

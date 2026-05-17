@@ -1338,10 +1338,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
             s
         }
         Err(e) => {
-            log_step(
-                "extract",
-                &format!("action=stage status=fail err=\"{e}\""),
-            );
+            log_step("extract", &format!("action=stage status=fail err=\"{e}\""));
             eprintln!("sandbox update: {e}");
             return 1i32;
         }
@@ -3129,9 +3126,18 @@ mod tests {
         }
         // § 3.2.24 flips on pending-migrations independently of
         // up-to-date.
-        assert_eq!(stateful_step_verdict("§ 3.2.24", false, true), "would execute");
-        assert_eq!(stateful_step_verdict("§ 3.2.24", false, false), "would skip");
-        assert_eq!(stateful_step_verdict("§ 3.2.24", true, true), "would execute");
+        assert_eq!(
+            stateful_step_verdict("§ 3.2.24", false, true),
+            "would execute"
+        );
+        assert_eq!(
+            stateful_step_verdict("§ 3.2.24", false, false),
+            "would skip"
+        );
+        assert_eq!(
+            stateful_step_verdict("§ 3.2.24", true, true),
+            "would execute"
+        );
         assert_eq!(stateful_step_verdict("§ 3.2.24", true, false), "would skip");
     }
 
@@ -3425,8 +3431,7 @@ mod tests {
         // location depending on the daemon build; reuse the same
         // resolver so the test follows the function under test rather
         // than reaching past it.
-        let canonical_readable =
-            std::fs::read(sandbox_core::users_conf::users_conf_path()).is_ok();
+        let canonical_readable = std::fs::read(sandbox_core::users_conf::users_conf_path()).is_ok();
 
         if canonical_readable {
             // A dev host with /etc/sandboxd/users.conf readable. The

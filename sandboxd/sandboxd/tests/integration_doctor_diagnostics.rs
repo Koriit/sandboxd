@@ -76,7 +76,9 @@ fn current_username() -> String {
 /// concurrent test runs don't collide on the same allocation pool.
 fn write_users_conf(dir: &Path, user: &str, cidr: &str) -> PathBuf {
     let path = dir.join("users.conf");
-    let body = format!(r#"{{"_schema_version":1,"subnets":[{{"cidr":"{cidr}","allow_users":["{user}"]}}]}}"#);
+    let body = format!(
+        r#"{{"_schema_version":1,"subnets":[{{"cidr":"{cidr}","allow_users":["{user}"]}}]}}"#
+    );
     let mut f = std::fs::File::create(&path).expect("create users.conf");
     f.write_all(body.as_bytes()).expect("write users.conf");
     f.flush().expect("flush users.conf");
