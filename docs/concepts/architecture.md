@@ -81,13 +81,14 @@ The same binary is also installed as a `git-remote-sandbox` symlink. When git in
 
 A lightweight binary running inside each VM that listens on TCP port 5123 (localhost only). The daemon communicates with it through `limactl shell` (SSH tunnel) piped to `socat` to bridge stdin/stdout to the agent's TCP port. Lima does not support kernel AF_VSOCK, so TCP-over-SSH is used instead.
 
-Supported operations:
+Supported operations (one-frame request/response over a length-prefixed JSON protocol):
 
-- Ping (liveness check).
-- Command execution (arbitrary command + args, returns stdout/stderr/exit code).
-- File upload (base64-encoded data written to a path).
-- File download (read a path, return base64-encoded data).
-- Git upload-pack and receive-pack (relay git protocol streams).
+- `Ping` — liveness check.
+- `Exec` — execute a command and return stdout/stderr/exit code.
+- `Status` — report hostname, uptime, and load average.
+- `Version` — self-report the guest's compile-time protocol and binary versions, used by `sandbox doctor` to detect drift between the daemon-recorded version and the actually-running guest.
+
+File transfer is *not* a guest-agent operation. `sandbox cp` dispatches to the backend's native tool (`limactl cp` for Lima, `docker cp` for container) and `sandbox sync` uses host `rsync` with the backend's shell as the remote-shell transport — both bypass the guest channel entirely. Likewise, git push/pull through `git-remote-sandbox` tunnels the pack protocol over `sandbox ssh` (`limactl shell`), not over the guest agent.
 
 ### sandbox-core (shared library)
 
@@ -225,8 +226,10 @@ Each session runs in a separate QEMU/KVM virtual machine. The VM provides hardwa
 
 QEMU hardening is enabled by default (disabled with `--no-hardening`):
 
-- **Device lockdown** — unnecessary virtual devices are disabled.
-- **Seccomp sandboxing** — the QEMU process is restricted to the minimum set of system calls.
+- **Device lockdown** — unnecessary virtual devices are disabled (no VGA, no USB, no audio; only `virtio-net-pci`, `virtio-blk`, and `virtio-rng-pci` remain).
+- **Cgroup resource limits** — the QEMU process runs in a transient `sandbox.slice` scope with `MemoryMax`, `CPUQuota`, and `TasksMax` ceilings derived from the session config.
+
+QEMU's `-sandbox on` seccomp filter is deliberately not enabled, because it strips setuid from child processes and would break the setuid `qemu-bridge-helper` that attaches the data NIC. See [Hardening → Seccomp is deliberately off](/guides/hardening/#seccomp-is-deliberately-off) for the rationale and the layers that provide defence in depth instead.
 
 ### Network isolation
 
