@@ -377,13 +377,16 @@ make build
 # Equivalent to: cd sandboxd && cargo build --workspace
 ```
 
-This produces three binaries in `sandboxd/target/debug/`:
+This produces every workspace binary under `sandboxd/target/debug/`:
 
 | Binary | Description |
 |--------|-------------|
 | `sandboxd` | The daemon |
-| `sandbox` | The CLI |
-| `sandbox-guest` | The VM-side guest agent |
+| `sandbox` | The CLI (also reused as `git-remote-sandbox` via a symlink) |
+| `sandbox-guest` | The VM/container-side guest agent |
+| `sandbox-route-helper` | Cap'd helper that installs default routes inside container netns'es on the daemon's behalf |
+| `sandbox-nft-deny-logger` | Gateway-container binary that emits structured `deny` records (TCP DNAT + UDP NFLOG) |
+| `sandbox-nft-allow-logger` | Gateway-container binary that audits allowed UDP flows via NFCT |
 
 ### Build the gateway container image
 
