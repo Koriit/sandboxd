@@ -1053,4 +1053,269 @@ mod tests {
         let parsed: BackupManifest = serde_json::from_value(json).unwrap();
         assert!(parsed.completed_at.is_none());
     }
+
+    /// `create_backup_set_dir_at` happy path: the returned path is the
+    /// `<root>/<set_name>` join, the directory now exists, and the
+    /// intermediate `<root>` was created on demand (`mkdir -p` semantics
+    /// — `create_dir_all` is what the test-only path uses internally).
+    ///
+    /// Pre-this test the function was reached only transitively by the
+    /// production `create_backup_set_dir` path (which shells to sudo
+    /// and is not hermetic). MF27 from the M16-S4 triage flagged the
+    /// in-process variant's lack of direct coverage.
+    #[test]
+    fn create_backup_set_dir_at_creates_target_under_uncreated_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Nest the "root" one level below the tempdir so `mkdir -p`
+        // semantics are exercised — `<tmp>/backups/` doesn't exist
+        // when we call. The function's `create_dir_all` must create
+        // both the root and the set subdirectory.
+        let root = tmp.path().join("backups");
+        assert!(!root.exists(), "root must not exist pre-call");
+        let set_name = backup_set_name("2026-05-17T09:00:00Z", "1.0.0", "1.1.0");
+
+        let target = create_backup_set_dir_at(&root, &set_name).expect("create ok");
+
+        assert_eq!(
+            target,
+            root.join(&set_name),
+            "returned path must be <root>/<set_name>"
+        );
+        assert!(target.exists(), "target directory must exist after call");
+        assert!(target.is_dir(), "target must be a directory");
+        // `mkdir -p` semantics: the parent was created too.
+        assert!(root.exists(), "root must exist after call");
+        assert!(root.is_dir(), "root must be a directory");
+    }
+
+    /// `create_backup_set_dir_at` is idempotent: a second call against
+    /// an already-existing set directory is a no-op and does not
+    /// disturb pre-existing contents. Pins the "re-run of a partially
+    /// completed update doesn't clobber the backup set" property that
+    /// § 3.2.15-3.2.17 idempotency relies on at one layer up.
+    #[test]
+    fn create_backup_set_dir_at_idempotent_preserves_existing_contents() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let set_name = "2026-05-17T09:00:00Z-from-1.0.0-to-1.1.0";
+
+        let target = create_backup_set_dir_at(root, set_name).expect("first call ok");
+        // Drop a sentinel file inside; the second call must leave it
+        // intact.
+        let sentinel = target.join("sentinel.bin");
+        std::fs::write(&sentinel, b"sentinel-bytes").expect("write sentinel");
+
+        let target_again = create_backup_set_dir_at(root, set_name).expect("second call ok");
+
+        assert_eq!(target, target_again, "second call returns same path");
+        assert!(sentinel.exists(), "sentinel must survive idempotent call");
+        assert_eq!(
+            std::fs::read(&sentinel).expect("read sentinel"),
+            b"sentinel-bytes",
+            "sentinel contents must be byte-identical to pre-call"
+        );
+    }
+
+    /// `create_backup_set_dir_at` error arm: when an intermediate path
+    /// component is a regular file (not a directory), `create_dir_all`
+    /// returns `io::ErrorKind::NotADirectory` (or `AlreadyExists` on
+    /// some kernels — both shapes route through `BackupError::Io` via
+    /// the `From<std::io::Error>` impl). Pins the typed-error surface
+    /// so a regression that swallowed the io error and returned a
+    /// degraded path would fail loudly.
+    #[test]
+    fn create_backup_set_dir_at_propagates_io_error_when_root_is_a_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Make a regular file at the path we'll pass as `root`. This
+        // is the foot-gun shape an operator could trip over if the
+        // backups parent path got accidentally clobbered to a file
+        // (e.g. a botched `tee` redirection during a manual rollback).
+        let root_as_file = tmp.path().join("backups");
+        std::fs::write(&root_as_file, b"oops, this is a file").expect("seed regular file");
+
+        let err = create_backup_set_dir_at(&root_as_file, "any-set-name")
+            .expect_err("must error when intermediate component is a file");
+
+        match err {
+            BackupError::Io(io_err) => {
+                // The two kernel-dependent shapes we accept here both
+                // unambiguously identify the "not a directory" cause.
+                // `NotADirectory` is the Linux-canonical mapping;
+                // `AlreadyExists` can surface on older kernels or
+                // tmpfs variants. Anything else (PermissionDenied,
+                // NotFound, ...) is a regression worth surfacing.
+                let kind = io_err.kind();
+                assert!(
+                    matches!(
+                        kind,
+                        std::io::ErrorKind::NotADirectory
+                            | std::io::ErrorKind::AlreadyExists
+                    ),
+                    "expected NotADirectory or AlreadyExists; got {kind:?}: {io_err}"
+                );
+            }
+            other => panic!("expected BackupError::Io, got {other:?}"),
+        }
+    }
+
+    /// `prune_old_backup_sets_at` early-return arm: when the backups
+    /// root does not exist (fresh install before the first update has
+    /// ever run, or a host where the daemon's startup-time mkdir
+    /// hasn't landed yet), the function returns an empty
+    /// `PruneOutcome` without erroring. Spec 5 § 3.2.25's idempotency
+    /// promise depends on this — the prune step must be a no-op when
+    /// there are no sets to consider. MF28 from the M16-S4 triage
+    /// flagged this early-return as uncovered.
+    #[test]
+    fn prune_old_backup_sets_at_empty_outcome_when_root_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let absent_root = tmp.path().join("does-not-exist");
+        assert!(!absent_root.exists(), "preflight: root must be absent");
+
+        let outcome = prune_old_backup_sets_at(&absent_root).expect("must not error");
+
+        assert!(
+            outcome.pruned.is_empty(),
+            "absent root: nothing to prune; got {:?}",
+            outcome.pruned
+        );
+        assert!(
+            outcome.kept.is_empty(),
+            "absent root: nothing to keep; got {:?}",
+            outcome.kept
+        );
+        assert!(
+            outcome.preserved_forensic.is_empty(),
+            "absent root: nothing preserved; got {:?}",
+            outcome.preserved_forensic
+        );
+        // The absent root must remain absent — the early-return must
+        // not have side-effects (e.g. accidental mkdir).
+        assert!(
+            !absent_root.exists(),
+            "early-return must not create the absent root: {}",
+            absent_root.display()
+        );
+    }
+
+    /// `prune_old_backup_sets_at` skips every in-progress set (Spec 5
+    /// § 5.2: `completed_ok: false` is forensic — never auto-prune).
+    /// With three in-progress sets and zero successful ones, all three
+    /// land in `preserved_forensic` and the on-disk tree is unchanged
+    /// after the prune. Complements
+    /// `retention_prune_keeps_two_newest_and_preserves_forensic` which
+    /// pins the mixed case; this pins the all-in-progress edge.
+    #[test]
+    fn prune_old_backup_sets_at_preserves_when_all_sets_in_progress() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        let sets = [
+            ("2026-05-07T12:00:00Z-from-0.9.4-to-0.9.5", "0.9.4", "0.9.5"),
+            ("2026-05-09T09:11:42Z-from-0.9.5-to-1.0.0", "0.9.5", "1.0.0"),
+            ("2026-05-11T14:23:11Z-from-1.0.0-to-1.1.0", "1.0.0", "1.1.0"),
+        ];
+        for (dir_name, from, to) in sets.iter() {
+            let set_dir = root.join(dir_name);
+            write_synth_manifest(
+                &set_dir,
+                &synth_manifest(from, to, &dir_name[..20], false),
+            );
+        }
+
+        let outcome = prune_old_backup_sets_at(root).expect("prune ok");
+
+        assert!(
+            outcome.pruned.is_empty(),
+            "no successful sets means nothing to prune; got: {:?}",
+            outcome.pruned
+        );
+        assert!(
+            outcome.kept.is_empty(),
+            "no successful sets means nothing kept; got: {:?}",
+            outcome.kept
+        );
+        assert_eq!(
+            outcome.preserved_forensic.len(),
+            3,
+            "every in-progress set is forensic: {:?}",
+            outcome.preserved_forensic
+        );
+        // The on-disk tree is unchanged byte-for-byte (each set
+        // directory still has its manifest).
+        for (dir_name, _, _) in sets.iter() {
+            let manifest_path = root.join(dir_name).join("manifest.json");
+            assert!(
+                manifest_path.exists(),
+                "in-progress set's manifest must survive: {}",
+                manifest_path.display()
+            );
+        }
+    }
+
+    /// Atomic-write rename invariant for the manifest finalize step:
+    /// `prune_old_backup_sets_at` reads each set's manifest and routes
+    /// on the `completed_ok` flag. A set whose manifest is **mid-flip**
+    /// — i.e. structurally valid JSON but with the post-write
+    /// `completed_ok=true` token spliced in without a fresh
+    /// `completed_at` — must still parse and route through the
+    /// success path. Pins the property that the manifest writer's
+    /// `serde(default)` tolerance on `completed_at` doesn't accidentally
+    /// reject a manifest whose `completed_at` would land on the next
+    /// finalize call.
+    ///
+    /// In the production flow the atomic write happens through
+    /// `sudo install -m 0644 <tmp> <dst>` (Spec 5 § 6.3 — no torn
+    /// writes possible because `install` uses rename(2)); the test
+    /// stages the post-rename "new" state directly via `std::fs::write`
+    /// and asserts the manifest parses and is routed into `kept` (not
+    /// `preserved_forensic`).
+    #[test]
+    fn prune_old_backup_sets_at_routes_finalized_manifest_without_completed_at_into_kept() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let set_dir = root.join("2026-05-11T14:23:11Z-from-1.0.0-to-1.1.0");
+        std::fs::create_dir_all(&set_dir).expect("mkdir");
+
+        // The mid-flip shape: `completed_ok: true` reached disk but
+        // `completed_at` did not. This is the exact byte layout an
+        // older daemon would have written before the
+        // `serde(default) completed_at` field was added — and the
+        // exact rollback-recoverable shape if a `finalize_manifest`
+        // call landed `completed_ok` but a crash happened before the
+        // accompanying `completed_at` write reached disk (the
+        // production code writes both fields in one rename, so this
+        // is a forward-compat assertion as much as a backward-compat
+        // one).
+        let raw = serde_json::json!({
+            "from_version": "1.0.0",
+            "to_version": "1.1.0",
+            "started_at": "2026-05-11T14:23:11Z",
+            "completed_ok": true,
+            "arch": "x86_64-unknown-linux-gnu",
+            "files": {}
+        });
+        std::fs::write(
+            set_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&raw).unwrap(),
+        )
+        .expect("write");
+
+        let outcome = prune_old_backup_sets_at(root).expect("prune ok");
+
+        assert_eq!(
+            outcome.kept.len(),
+            1,
+            "completed_ok=true must route through the success arm regardless \
+             of completed_at presence; got kept={:?}",
+            outcome.kept
+        );
+        assert!(
+            outcome.preserved_forensic.is_empty(),
+            "missing completed_at must not flip a finalized manifest into \
+             the forensic bucket; got preserved={:?}",
+            outcome.preserved_forensic
+        );
+        assert!(set_dir.exists(), "kept set must remain on disk");
+    }
 }
