@@ -55,7 +55,14 @@
 //! 7. Reads the response until EOF or a 64 KiB cap. Writes the
 //!    bytes verbatim to stdout. The cap is a safety bound — real
 //!    daemon responses for `GET /sessions[/id]` are under 16 KiB
-//!    in practice.
+//!    in practice. The helper does NOT half-close the write side
+//!    before reading: for the requests it sends (no body, or a
+//!    Content-Length-stamped body) hyper completes parsing on the
+//!    terminating CRLF/CRLF, and a premature `shutdown(Write)`
+//!    causes hyper's server-side to abort the in-flight response.
+//!    If a future request type ever needs to signal end-of-body
+//!    via EOF (indefinite-length request body), the half-close
+//!    must happen AFTER the response is fully read.
 //! 8. Exits `0` on success, non-zero on any error.
 //!
 //! ## What this helper does NOT do
@@ -308,13 +315,6 @@ fn forward(request_path: &std::path::Path, socket_path: &std::path::Path) -> Res
     })?;
 
     stream.write_all(&request_bytes).map_err(Error::Write)?;
-    // Half-close the write side so the daemon sees EOF if the
-    // request body has indefinite length (e.g. no Content-Length
-    // header on a GET). For Content-Length-stamped requests this
-    // is a no-op; for the test harness's typical short GET it
-    // ensures the daemon's HTTP parser sees the request as
-    // complete.
-    let _ = stream.shutdown(std::net::Shutdown::Write);
 
     let mut buf = Vec::with_capacity(8 * 1024);
     let mut chunk = [0u8; 8 * 1024];
