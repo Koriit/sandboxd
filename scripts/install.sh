@@ -743,37 +743,41 @@ tarball_fetch() {
 # ----------------------------------------------------------------------------
 
 sigstore_verify() {
-    # Test-only escape hatch. The Lima E2E harness assembles unsigned
-    # local-build tarballs that have no valid sigstore bundle; the
-    # air-gapped test exercises the rest of the script with this set so
-    # the un-patched cosign_bootstrap + comprehensive egress block are
-    # the actual code under test. THIS ENV VAR MUST NEVER BE SET IN
-    # PRODUCTION — it disables the cryptographic trust root that
-    # protects against tampered tarballs. The variable is documented
-    # here (not in --help / not in installation.md) so a real operator
-    # has no path to discover it; only the in-tree test harness sets it.
-    # Mirrors the route-helper's `test-env-override` Cargo feature
-    # pattern (see sandbox-route-helper/Cargo.toml).
+    # BEGIN_TEST_ENV — stripped from published install.sh at docs-deploy time
+    #
+    # Test env vars below are intentionally not present in the artifact
+    # operators run via `curl … | bash` (.github/workflows/docs.yml
+    # sed-strips every BEGIN_TEST_ENV…END_TEST_ENV span before staging
+    # site/public/install.sh). The source tree keeps them so the
+    # install-e2e harness can drive the real cosign-verify path against
+    # the local Sigstore stack without forking a parallel installer.
+    #
+    # SANDBOX_INSTALL_SKIP_SIGSTORE — short-circuit verify entirely.
+    # The air-gapped test assembles unsigned local-build tarballs and
+    # exercises the rest of the script with this set; the un-patched
+    # cosign_bootstrap + comprehensive egress block are the actual code
+    # under test. THIS ENV VAR MUST NEVER BE SET IN PRODUCTION — it
+    # disables the cryptographic trust root that protects against
+    # tampered tarballs.
     if [ "${SANDBOX_INSTALL_SKIP_SIGSTORE:-0}" = "1" ]; then
         log_warn "step=sigstore_verify action=skip reason=test-env-override"
         return 0
     fi
+    # END_TEST_ENV
 
-    # Test-only trust-material redirect. The install-e2e harness boots
-    # a local Sigstore stack (Fulcio + Rekor + CT log) and signs the
-    # local-build tarball against it, so the real cosign verify-blob
-    # path can be exercised end-to-end without reaching the production
-    # sigstore.dev TUF mirror. The four SANDBOX_INSTALL_TEST_* env vars
-    # below let the harness substitute the trust roots; the identity
-    # values (certificate-identity-regexp, certificate-oidc-issuer)
-    # stay byte-identical to production because the local stack mints
-    # tokens that satisfy them. Unset → behavior byte-identical to a
-    # production install (no extra cosign flags, no extra env vars
-    # exported to the cosign process). THESE ENV VARS MUST NEVER BE
-    # SET IN PRODUCTION — same warning as SANDBOX_INSTALL_SKIP_SIGSTORE
-    # above; deliberately undocumented in --help / installation.md.
     cert_chain_arg=""
     rekor_url_arg=""
+    # BEGIN_TEST_ENV
+    #
+    # Trust-material redirect. The install-e2e harness boots a local
+    # Sigstore stack (Fulcio + Rekor + CT log) and signs the local-build
+    # tarball against it, so the real cosign verify-blob path can be
+    # exercised end-to-end without reaching the production sigstore.dev
+    # TUF mirror. The four SANDBOX_INSTALL_TEST_* env vars below let the
+    # harness substitute the trust roots; the identity values
+    # (certificate-identity-regexp, certificate-oidc-issuer) stay
+    # byte-identical to production because the local stack mints tokens
+    # that satisfy them.
     if [ -n "${SANDBOX_INSTALL_TEST_FULCIO_ROOT:-}" ]; then
         cert_chain_arg="--certificate-chain=${SANDBOX_INSTALL_TEST_FULCIO_ROOT}"
     fi
@@ -788,21 +792,21 @@ sigstore_verify() {
     if [ -n "${SANDBOX_INSTALL_TEST_CT_LOG_PUBLIC_KEY:-}" ]; then
         export SIGSTORE_CT_LOG_PUBLIC_KEY_FILE="${SANDBOX_INSTALL_TEST_CT_LOG_PUBLIC_KEY}"
     fi
+    # END_TEST_ENV
 
-    # Test-only diagnostic toggle. In production, cosign's stdout/stderr
-    # are suppressed to keep install output clean; that makes test
-    # triage impossible when verify-blob fails inside a Lima VM. When
-    # SANDBOX_INSTALL_TEST_DEBUG_COSIGN_STDERR=1 is set, route the
-    # cosign output to a fixed log file BEFORE die() fires, so the
-    # operator (or test harness) can read what cosign actually said.
-    # MUST NEVER BE SET IN PRODUCTION — exposing cosign internals to
-    # the install log is at best noise, at worst an info-leak vector;
-    # documented here (not in --help) for the same reasons as the
-    # SANDBOX_INSTALL_TEST_* trust-material vars above.
+    # BEGIN_TEST_ENV
+    #
+    # Diagnostic toggle. In production cosign's stdout/stderr are
+    # suppressed; that makes test triage impossible when verify-blob
+    # fails inside a Lima VM. When SANDBOX_INSTALL_TEST_DEBUG_COSIGN_STDERR=1
+    # is set, route cosign output to a fixed log file BEFORE die() fires
+    # so the test harness can read what cosign actually said.
     cosign_debug_log="/tmp/sandbox-install-cosign-debug.log"
+    # END_TEST_ENV
     # shellcheck disable=SC2086 # cert_chain_arg + rekor_url_arg are
     # deliberately unquoted so empty values expand to nothing rather
     # than passing a bare `''` argv slot that cosign would reject.
+    # BEGIN_TEST_ENV
     if [ "${SANDBOX_INSTALL_TEST_DEBUG_COSIGN_STDERR:-0}" = "1" ]; then
         "$COSIGN" verify-blob \
             --bundle "$TMPDIR_INSTALL/release.tar.gz.sigstore" \
@@ -814,6 +818,7 @@ sigstore_verify() {
             >"$cosign_debug_log" 2>&1 \
             || die "sigstore verification failed for $TMPDIR_INSTALL/release.tar.gz (cosign log: $cosign_debug_log)"
     else
+    # END_TEST_ENV
         "$COSIGN" verify-blob \
             --bundle "$TMPDIR_INSTALL/release.tar.gz.sigstore" \
             --certificate-identity-regexp '^https://github\.com/Koriit/sandboxd/\.github/workflows/release\.yml@' \
@@ -823,7 +828,9 @@ sigstore_verify() {
             "$TMPDIR_INSTALL/release.tar.gz" \
             >/dev/null 2>&1 \
             || die "sigstore verification failed for $TMPDIR_INSTALL/release.tar.gz"
+    # BEGIN_TEST_ENV
     fi
+    # END_TEST_ENV
     log_ok "step=sigstore_verify bundle=release.tar.gz.sigstore identity=Koriit/sandboxd/release.yml"
 }
 
