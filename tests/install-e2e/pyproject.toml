@@ -14,7 +14,7 @@ py-modules = []
 [tool.pytest.ini_options]
 testpaths = ["."]
 python_files = ["test_*.py"]
-python_functions = ["test_*", "integration_*"]
+python_functions = ["test_*"]
 timeout = 900
 markers = [
     "lima: requires limactl + KVM (every test in this suite)",

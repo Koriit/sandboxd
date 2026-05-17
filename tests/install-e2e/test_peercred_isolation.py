@@ -7,18 +7,18 @@ uids on the same Linux kernel) and therefore run inside the
 install-e2e Lima VM harness rather than the host-level
 ``cargo nextest`` profile:
 
-* ``integration_route_helper_uid_without_passwd_denies_cleanly``
+* ``test_route_helper_uid_without_passwd_denies_cleanly``
   (closes #148, pins Spec 1 § 8.4 / § 3.4) — a uid that does not
   resolve in ``/etc/passwd`` is denied at the route-helper's
   pair-check step before any netns work, and the deny lands in the
   JSON-Lines audit log per Spec 1 § 3.5.
 
-* ``integration_owner_isolation_uid_without_passwd_closes_connection``
+* ``test_owner_isolation_uid_without_passwd_closes_connection``
   (closes #150, pins Spec 2 § 4.1 / § 7.5) — a connection from a uid
   with no passwd entry is closed cleanly by the daemon's peercred-
   aware acceptor; no panic, no response body, no leaked socket.
 
-* ``integration_session_isolation_404_on_foreign_id``
+* ``test_session_isolation_404_on_foreign_id``
   (closes #151, pins Spec 2 § 5 / § 7.5 / § 9.2) — a session owned
   by operator alice returns 404 when operator bob queries it by id.
   Wire shape matches Spec 2 § 5: status 404, body
@@ -163,7 +163,7 @@ def _bring_up_peercred_vm(
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
-def integration_route_helper_uid_without_passwd_denies_cleanly(
+def test_route_helper_uid_without_passwd_denies_cleanly(
     distro_template,
     vm_factory,
     release_tarball_x86_64,
@@ -359,7 +359,7 @@ def _request_bytes(line, headers=None):
 
 
 @pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
-def integration_owner_isolation_uid_without_passwd_closes_connection(
+def test_owner_isolation_uid_without_passwd_closes_connection(
     distro_template,
     vm_factory,
     release_tarball_x86_64,
@@ -636,7 +636,7 @@ def _parse_http_status(response_bytes):
 
 
 @pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
-def integration_session_isolation_404_on_foreign_id(
+def test_session_isolation_404_on_foreign_id(
     distro_template,
     vm_factory,
     release_tarball_x86_64,

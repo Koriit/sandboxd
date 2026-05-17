@@ -983,7 +983,7 @@ def assert_doctor_passes(vm, *, user=None, timeout=60, sock_path=None):
     # `sudo -u <user> env SANDBOX_SOCKET=... sandbox doctor` — the env
     # wrapper is required because `sudo -u` drops most of the caller's
     # env unless we replant the socket path explicitly. Mirrors
-    # integration_systemd_unit_smokes.
+    # test_systemd_unit_smokes.
     cmd = f"sudo -u {user} env SANDBOX_SOCKET={sock_path} /usr/local/bin/sandbox doctor"
     r = vm.shell(cmd, timeout=timeout)
     text = r.stdout + r.stderr

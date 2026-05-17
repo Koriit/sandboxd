@@ -28,7 +28,7 @@ from conftest import (
 
 
 @pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
-def integration_systemd_unit_smokes(
+def test_systemd_unit_smokes(
     distro_template, vm_factory, release_tarball_x86_64, sigstore_stack,
 ):
     """systemd unit installs, starts, listens, and passes doctor.
