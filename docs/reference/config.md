@@ -106,10 +106,10 @@ Under the base dir, the daemon creates:
 ```
 {base_dir}/
 ├── sessions.db           # SQLite: sessions, network info, policies
-├── ca/
-│   └── <session-id>/     # per-session CA material
 ├── sessions/
 │   └── <session-id>/
+│       ├── ca/           # per-session CA material (cert.pem, key.pem,
+│       │                 # mitmproxy-ca.pem, mitmproxy-ca-cert.pem)
 │       └── events/
 │           └── <layer>-YYYY-MM-DD.jsonl   # only when --events-persist is set
 └── ...
