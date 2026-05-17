@@ -3570,4 +3570,115 @@ mod tests {
         // invoked.
         assert!(!Path::new(lock::LOCK_PATH).exists() || std::fs::read(lock::LOCK_PATH).is_err());
     }
+
+    // -----------------------------------------------------------------
+    // Wire-format contract: `SessionState` serializes via
+    // `rename_all = "snake_case"`, so the daemon emits `"stopped"` (not
+    // `"Stopped"`) on the `/sessions` endpoint. `fetch_session_counts`
+    // and `classify_stopped_sessions` MUST compare against the lowercase
+    // wire token. A regression that flips either call to `"Stopped"`
+    // (the `Display` form) silently miscounts every stopped session as
+    // active. These tests pin the lowercase contract end-to-end against
+    // a real in-process UDS so the `http_get` → serde → filter pipeline
+    // is exercised exactly as it runs in production.
+    // -----------------------------------------------------------------
+
+    use axum::Router;
+    use axum::response::Json;
+    use axum::routing::get;
+    use serde_json::{Value, json};
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use tokio::net::UnixListener;
+
+    async fn spawn_sessions_fixture(body: Value) -> (TempDir, String) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sock_path = tmp.path().join("sandboxd.sock");
+        let sock_str = sock_path.to_string_lossy().into_owned();
+
+        let app = Router::new().route(
+            "/sessions",
+            get(move || {
+                let body = body.clone();
+                async move { Json(body) }
+            }),
+        );
+
+        let listener = UnixListener::bind(&sock_path).expect("bind unix socket");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        (tmp, sock_str)
+    }
+
+    #[test]
+    fn session_state_serializes_to_lowercase_snake_case() {
+        use sandbox_core::SessionState;
+
+        assert_eq!(
+            serde_json::to_string(&SessionState::Stopped).expect("serialize Stopped"),
+            "\"stopped\"",
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionState::Running).expect("serialize Running"),
+            "\"running\"",
+        );
+
+        let round_trip: SessionState =
+            serde_json::from_str("\"stopped\"").expect("deserialize stopped");
+        assert_eq!(round_trip, SessionState::Stopped);
+
+        // The PascalCase form the `Display` impl prints is NOT the wire
+        // format; deserialising it must fail. This is the pin that
+        // catches a regression where someone accidentally swaps the
+        // `rename_all` directive for `Display`-based ser/de.
+        assert!(
+            serde_json::from_str::<SessionState>("\"Stopped\"").is_err(),
+            "PascalCase must not deserialize — wire format is snake_case",
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_session_counts_buckets_lowercase_stopped() {
+        let body = json!([
+            { "state": "stopped" },
+            { "state": "stopped" },
+            { "state": "running" },
+            { "state": "creating" },
+        ]);
+        let (_tmp, sock) = spawn_sessions_fixture(body).await;
+
+        let counts = fetch_session_counts(&sock).await;
+        assert!(counts.reachable, "daemon was reachable");
+        assert_eq!(counts.stopped, 2, "two lowercase `stopped` entries");
+        assert_eq!(counts.active, 2, "running + creating are active");
+    }
+
+    #[tokio::test]
+    async fn classify_stopped_sessions_filters_by_lowercase_stopped() {
+        let body = json!([
+            { "id": "a", "state": "stopped", "guest_protocol_version": 7 },
+            { "id": "b", "state": "stopped", "guest_protocol_version": 0 },
+            { "id": "c", "state": "running", "guest_protocol_version": 7 },
+            // A capital-S "Stopped" entry (i.e. someone wrote the
+            // `Display` form to the wire by accident) MUST NOT be
+            // classified as stopped — the wire contract is lowercase.
+            { "id": "d", "state": "Stopped", "guest_protocol_version": 7 },
+        ]);
+        let (_tmp, sock) = spawn_sessions_fixture(body).await;
+
+        let set = classify_stopped_sessions(&sock, 7).await;
+        assert!(set.classified, "daemon was reachable, classification ran");
+        assert_eq!(set.target_proto, 7);
+        let ids: Vec<&str> = set.stopped.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["a", "b"],
+            "only lowercase `stopped` rows are classified",
+        );
+        assert_eq!(set.stopped[0].bucket, CompatBucket::Ok);
+        assert_eq!(set.stopped[1].bucket, CompatBucket::Recreate);
+    }
 }
