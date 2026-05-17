@@ -73,7 +73,7 @@ All five modes land data in the same place: `/home/agent/workspace/` inside the 
 
 ## Isolation trade-offs
 
-Only shared mount reduces the VM's isolation from the host; the other three modes preserve full isolation.
+Only shared mount reduces the VM's isolation from the host; the other four modes preserve full isolation.
 
 - **Clone** pulls bytes through the gateway at creation time, then closes the loop. The only lasting exposure is whatever the policy allows for network.
 - **`sandbox cp`** dispatches to `limactl cp` / `docker cp` — both operate over the backend's already-authenticated control channel; no extra network exposure is opened on the host or in the gateway path.
