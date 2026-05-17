@@ -24,7 +24,7 @@ Plus the teardown pair:
 | `sandbox stop <session>` | Halt the VM, keep the config. Fast restart later. |
 | `sandbox rm <session>` | Full teardown. Session ID is gone. |
 
-All of these are thin wrappers around the [HTTP API](/reference/http-api/). If you want to skip the CLI and speak HTTP over the Unix socket directly, the reference page documents every endpoint.
+Most of these are thin wrappers around the [HTTP API](/reference/http-api/) — `create`, `exec`, `stop`, and `rm` each map to a single endpoint. `sandbox cp` is the exception: it resolves the session via the API and then dispatches to the backend's native copy tool (`limactl cp` for Lima, `docker cp` for the container backend), so the data path never crosses the daemon. If you want to skip the CLI and speak HTTP over the Unix socket directly, the reference page documents every endpoint.
 
 ## Pattern 1: one-shot run from a shell script
 
