@@ -77,7 +77,29 @@ struct TestNetwork {
 }
 
 impl TestNetwork {
-    fn create(label: &str) -> Self {
+    /// Create a per-session docker network whose name matches the
+    /// canonical `sandbox-net-{session_id}` shape the orphan reaper's
+    /// dual-anchor IPAM gate expects.
+    ///
+    /// Using `session_id` (rather than an arbitrary label) is
+    /// load-bearing for nextest concurrency safety: any test in the
+    /// suite that boots a real `sandboxd` triggers the daemon's
+    /// startup orphan reaper, which enumerates every `sandbox-*`
+    /// container on the host. With a canonical network name, the
+    /// reaper parses the sibling network, observes its IPAM subnets
+    /// fall outside the daemon's own allocator pool (test daemons use
+    /// `10.2xx.x.x/24`; this network sits in `10.98.x.y/28`), and
+    /// skips the entire session-id tuple — container included. A
+    /// non-canonical name (e.g. `sandbox-net-roundtrip-{nanos}`)
+    /// would not parse as a session id, leave `out_of_pool_sids`
+    /// empty for our session, and the reaper would happily `docker
+    /// rm -f` the test container out from under the in-flight
+    /// `runtime.delete`, surfacing as
+    /// `removal of container ... is already in progress` from
+    /// dockerd. See `sandboxd/.config/nextest.toml`'s comment on the
+    /// `docker-sandbox-namespace` group for the namespace-pollution
+    /// rationale.
+    fn create(session_id: &SessionId) -> Self {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -87,7 +109,7 @@ impl TestNetwork {
         let subnet = format!("10.98.{third}.{fourth_base}/28");
         let gateway_ip = format!("10.98.{third}.{}", fourth_base.wrapping_add(2));
         let container_ip = format!("10.98.{third}.{}", fourth_base.wrapping_add(3));
-        let name = format!("sandbox-net-phase3d-{label}-{nanos}");
+        let name = format!("sandbox-net-{session_id}");
 
         let output = Command::new("docker")
             .args(["network", "create", "--subnet", &subnet, &name])
@@ -311,7 +333,6 @@ fn guest_bind_source_for_tests() -> std::path::PathBuf {
 #[tokio::test]
 async fn integration_create_session_container_backend_round_trip() {
     ensure_round_trip_image();
-    let net = TestNetwork::create("roundtrip");
     let runtime = ContainerRuntime::new(
         ROUND_TRIP_IMAGE_TAG,
         256,
@@ -345,6 +366,11 @@ async fn integration_create_session_container_backend_round_trip() {
         .expect("query session by id")
         .expect("session row present");
     assert_eq!(reloaded.backend, BackendKind::Container);
+
+    // Create the docker network AFTER the session row exists so its
+    // name carries the session id (see `TestNetwork::create` docs for
+    // the dual-anchor reaper-skip rationale).
+    let net = TestNetwork::create(&session.id);
 
     // Run the dispatch path: register network → create → start.
     let _cleanup = ContainerCleanup::new(&session.id);
