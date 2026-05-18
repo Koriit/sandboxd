@@ -93,6 +93,7 @@ use std::net::Ipv4Addr;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::process::{Command, ExitCode};
 
+use nix::errno::Errno;
 use nix::ifaddrs::getifaddrs;
 use nix::sched::{CloneFlags, setns};
 use nix::unistd::{Uid, User};
@@ -261,7 +262,10 @@ fn run() -> ExitCode {
     // name is a deny path per § 3.4.
     let for_user_uid = match User::from_name(&for_user) {
         Ok(Some(u)) => u.uid.as_raw(),
-        Ok(None) => {
+        // ENOENT-on-not-found is glibc-version-specific (≥2.36 surfaces it
+        // as an error instead of Ok(None)); collapse with Ok(None) for
+        // stable audit classification across libc versions.
+        Ok(None) | Err(Errno::ENOENT) => {
             let msg = format!("--for-user {for_user} does not resolve to a uid");
             return deny_with_audit(
                 "for-user-unresolvable",
