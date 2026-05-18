@@ -205,7 +205,7 @@ pub fn dev_mode_refusal_text() -> &'static str {
      - `make setup-dev-env`      reapplies dev-mode /etc files\n\
      \n\
      To switch from dev to system install, follow:\n  \
-     https://Koriit.github.io/sandboxd/docs/migrate-dev-to-system\n"
+     https://Koriit.github.io/sandboxd/start/installation#dev-mode-vs-operator-mode-coexistence\n"
 }
 
 // ---------------------------------------------------------------------------
