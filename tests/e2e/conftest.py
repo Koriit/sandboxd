@@ -111,6 +111,7 @@ import atexit  # noqa: E402  -- after module-level setup
 import getpass  # noqa: E402
 if "SANDBOX_USERS_CONF" not in os.environ:
     _users_conf_payload = {
+        "_schema_version": 1,
         "subnets": [
             {
                 "comment": (
