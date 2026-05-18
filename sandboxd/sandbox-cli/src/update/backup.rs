@@ -611,11 +611,15 @@ fn write_sandbox_owned_file(dst: &Path, bytes: &[u8], mode: u32) -> Result<(), B
     Ok(())
 }
 
-/// Read a `sandbox`-owned file via `sudo -k cat`. The current process
-/// may not have direct read access (depending on mode) so we always
-/// elevate.
+/// Read a `sandbox`-owned file. Tries an unprivileged read first and
+/// falls back to `sudo cat` when that fails — mirrors `list_dir_sudo`.
 fn read_sandbox_owned_file(path: &Path) -> Result<Vec<u8>, BackupError> {
-    run_sudo_capture(&["-k", "cat", path.to_str().unwrap()])
+    // Tests pass a tempdir we own; production passes /var/lib/...
+    // For the test path we can read directly; production needs sudo.
+    if let Ok(bytes) = std::fs::read(path) {
+        return Ok(bytes);
+    }
+    run_sudo_capture(&["cat", path.to_str().unwrap()])
 }
 
 /// List the basenames of every entry under `dir`. Uses `sudo -k ls -1`
