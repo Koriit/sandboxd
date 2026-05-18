@@ -1,4 +1,4 @@
-.PHONY: build fmt fmt-check test test-integration test-e2e test-e2e-container test-e2e-matrix gateway-image lite-image docs-dev docs-build clean \
+.PHONY: build fmt fmt-check test test-integration test-e2e test-e2e-container test-e2e-matrix test-install-e2e test-install-e2e-quick gateway-image lite-image docs-dev docs-build clean \
 	setup-dev-env install-route-helper-prod-cap install-route-helper-test-cap setup-bridge-conf setup-users-conf setup-bridge-helper-setuid
 
 # Green/reset for ✓ confirmation lines. TTY-aware: empty when stdout
@@ -123,6 +123,48 @@ test-e2e-matrix: $(VENV_STAMP) gateway-image lite-image install-route-helper-pro
 
 # Back-compat alias. `make test-e2e` continues to run the full matrix.
 test-e2e: test-e2e-matrix
+
+# Install-E2E suite — boots Lima VMs and exercises install.sh /
+# uninstall.sh / update.sh end-to-end against a freshly-built local
+# tarball (which the `local_tarball` fixture builds via
+# `tests/install-e2e/build-local-tarball.sh`; the script invokes
+# `make gateway-image` itself when needed, so we deliberately do NOT
+# declare it as a Make prereq here). The route helper is installed
+# *inside* the Lima VM by `install.sh`, not on the host, so neither
+# `install-route-helper-prod-cap` nor `install-route-helper-test-cap`
+# is required.
+#
+# Mirrors the e2e venv-stamp pattern: the stamp name embeds the host
+# Python minor version so a 3.12 → 3.13 host upgrade invalidates the
+# marker and forces a venv rebuild against the new interpreter.
+INSTALL_E2E_VENV_STAMP := tests/install-e2e/.venv/.installed.$(PY_VERSION)
+
+$(INSTALL_E2E_VENV_STAMP): tests/install-e2e/pyproject.toml
+	rm -rf tests/install-e2e/.venv
+	python3 -m venv tests/install-e2e/.venv
+	tests/install-e2e/.venv/bin/python -c \
+		"import tomllib, subprocess, sys; \
+		deps = tomllib.load(open('tests/install-e2e/pyproject.toml', 'rb'))['project']['dependencies']; \
+		subprocess.check_call([sys.executable, '-m', 'pip', 'install'] + deps)"
+	touch $(INSTALL_E2E_VENV_STAMP)
+
+# Full install-e2e suite. Wall clock ~2h on a warm runner (each test
+# boots its own Lima VM). Use `TEST=` to narrow selection while
+# iterating, e.g.
+#   make test-install-e2e TEST="test_install_happy_path.py -k ubuntu-22.04"
+test-install-e2e: $(INSTALL_E2E_VENV_STAMP)
+	cd tests/install-e2e && . .venv/bin/activate && \
+	  python -m pytest -v -rs --durations=20 --timeout=600 $(TEST)
+
+# Single happy-path smoke for fast confidence in the install path
+# (~5-7 min wall clock — one Lima VM, ubuntu-22.04 only). Threads
+# `TEST=` at the end so callers can layer extra flags, e.g.
+#   make test-install-e2e-quick TEST=--collect-only
+test-install-e2e-quick: $(INSTALL_E2E_VENV_STAMP)
+	cd tests/install-e2e && . .venv/bin/activate && \
+	  python -m pytest -v -rs --durations=20 --timeout=600 \
+	  test_install_happy_path.py::test_install_fresh_then_doctor_passes \
+	  -k "ubuntu-22.04" $(TEST)
 
 # Always run `docker build`; Docker's layer cache handles the no-op case
 # cheaply (a few seconds for context upload when nothing has changed).
