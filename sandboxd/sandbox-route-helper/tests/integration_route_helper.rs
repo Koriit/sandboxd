@@ -190,6 +190,21 @@ fn runner_username() -> String {
         .to_string()
 }
 
+/// Resolve the test runner's numeric uid as a string. Used by the
+/// fault-injection tests where the caller-uid lookup is forced to fail
+/// and the helper records `uid:<n>` as the placeholder `caller`.
+fn runner_uid_string() -> String {
+    let output = Command::new("id")
+        .arg("-u")
+        .output()
+        .expect("`id -u` should succeed");
+    assert!(output.status.success(), "`id -u` exit non-zero");
+    String::from_utf8(output.stdout)
+        .expect("`id -u` output is utf-8")
+        .trim()
+        .to_string()
+}
+
 /// Write `contents` to a tempfile and return it. The tempfile owns
 /// the on-disk path and removes it on drop.
 fn write_users_conf(contents: &str) -> NamedTempFile {
@@ -239,6 +254,53 @@ fn run_helper_with_audit(
         .args(args)
         .env("SANDBOX_USERS_CONF", users_conf.path())
         .env("SANDBOX_ROUTE_HELPER_AUDIT_LOG", audit_log_path)
+        .output()
+        .expect("invoking helper should succeed");
+    let audit_lines = read_audit_log_lines(audit_log_path);
+    (output, audit_lines)
+}
+
+/// Which `User::*` call the fault-injection env var targets. Mirrors
+/// the helper-side `InjectionSite` enum.
+enum InjectionSite {
+    CallerUid,
+    ForUser,
+}
+
+impl InjectionSite {
+    fn as_str(&self) -> &'static str {
+        match self {
+            InjectionSite::CallerUid => "caller_uid",
+            InjectionSite::ForUser => "for_user",
+        }
+    }
+}
+
+/// Run the cap'd installed helper with both an audit-log tempfile and
+/// a `SANDBOX_ROUTE_HELPER_TEST_INJECT_USER_RESOLUTION_ERROR=<site>:<errno>`
+/// injection. The test-feature build honors that env var by failing
+/// the targeted `User::from_uid` / `User::from_name` call with the
+/// given errno, letting the integration tests exercise the
+/// `caller-uid-resolution-error` and `for-user-resolution-error`
+/// audit branches deterministically. Production builds ignore the
+/// var (same privilege story as the other test-only env vars).
+fn run_helper_with_user_resolution_error_injected(
+    helper: &Path,
+    users_conf: &NamedTempFile,
+    audit_log_path: &Path,
+    site: InjectionSite,
+    inject_errno: i32,
+    args: &[&str],
+) -> (Output, Vec<serde_json::Value>) {
+    let injection = format!("{}:{}", site.as_str(), inject_errno);
+    let output = Command::new(helper)
+        .args(args)
+        .env("SANDBOX_USERS_CONF", users_conf.path())
+        .env("SANDBOX_ROUTE_HELPER_AUDIT_LOG", audit_log_path)
+        .env(
+            "SANDBOX_ROUTE_HELPER_TEST_INJECT_USER_RESOLUTION_ERROR",
+            injection,
+        )
         .output()
         .expect("invoking helper should succeed");
     let audit_lines = read_audit_log_lines(audit_log_path);
@@ -1032,6 +1094,124 @@ fn integration_route_helper_denies_when_username_unresolvable() {
     assert!(
         record.get("pool").is_none(),
         "audit `pool` must be absent on for-user-unresolvable deny; got: {record}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Non-ENOENT errno on user resolution (spec § 3.4 / 8.4)
+// ---------------------------------------------------------------------------
+//
+// `getpwuid_r` / `getpwnam_r` can return errnos other than `ENOENT` (the
+// "no such user" path covered above) — EIO from a downed NSS service,
+// ENOMEM under memory pressure, EINTR mid-syscall, etc. None of those
+// are reachable deterministically from a hermetic test, so the
+// `test-env-override` build of the helper exposes a fault-injection
+// seam (`SANDBOX_ROUTE_HELPER_TEST_INJECT_USER_RESOLUTION_ERROR=<site>:<errno>`)
+// that forces the targeted `User::from_uid` / `User::from_name` call
+// to return `Err(Errno::from_raw(<errno>))`. The `<site>` selector
+// (`caller_uid` or `for_user`) lets the two arms be exercised
+// independently — without it, the caller-uid lookup (which fires
+// first) would mask the for-user arm. Production builds ignore the
+// env var (same privilege story as `SANDBOX_USERS_CONF`).
+
+/// Injected `EIO` on the caller-uid `User::from_uid` lookup forces the
+/// `caller-uid-resolution-error` audit branch. `EIO` is deliberately
+/// not `ENOENT` (5 vs. 2) — `ENOENT` would be collapsed into the
+/// `caller-uid-unresolvable` arm by the libc-version fix.
+#[test]
+fn integration_route_helper_denies_when_caller_uid_resolution_errors() {
+    let helper = verify_installed_test_helper();
+    let runner = runner_username();
+    let users_conf = users_conf_for_pool("10.209.0.0/24", &[runner.as_str()]);
+    let (audit_dir, audit_path) = make_audit_log_path();
+    let _audit_keep = audit_dir;
+
+    // libc::EIO == 5 on Linux. Using the raw integer keeps the test
+    // free of a libc dependency just to name the constant.
+    let eio: i32 = 5;
+    let (output, audit_lines) = run_helper_with_user_resolution_error_injected(
+        &helper,
+        &users_conf,
+        &audit_path,
+        InjectionSite::CallerUid,
+        eio,
+        &["--for-user", &runner, "1", "10.209.0.2"],
+    );
+
+    assert!(
+        !output.status.success(),
+        "helper must deny; got exit success. stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("username resolution failed for uid"),
+        "stderr must contain 'username resolution failed for uid'; got: {stderr}"
+    );
+
+    // The audit record's `caller` field is the `uid:<n>` placeholder
+    // (we couldn't resolve a name); `for_user` is whatever was on the
+    // CLI. Pid is the literal `1` argv we passed.
+    let placeholder = format!("uid:{}", runner_uid_string());
+    let record = assert_audit_record_shape(&audit_lines, "denied", &placeholder, &runner, 1);
+    assert_eq!(
+        record["reason"].as_str(),
+        Some("caller-uid-resolution-error"),
+        "audit `reason` must be 'caller-uid-resolution-error'; got: {record}"
+    );
+    assert!(
+        record.get("pool").is_none(),
+        "audit `pool` must be absent on caller-uid-resolution-error deny; got: {record}"
+    );
+}
+
+/// Injected `EIO` on the `--for-user` `User::from_name` lookup forces
+/// the `for-user-resolution-error` audit branch. The site selector
+/// (`for_user`) makes this independent of the caller-uid lookup, which
+/// is allowed to succeed naturally so the helper reaches the
+/// for-user-name resolution step.
+#[test]
+fn integration_route_helper_denies_when_for_user_resolution_errors() {
+    let helper = verify_installed_test_helper();
+    let runner = runner_username();
+    let users_conf = users_conf_for_pool("10.209.0.0/24", &[runner.as_str()]);
+    let (audit_dir, audit_path) = make_audit_log_path();
+    let _audit_keep = audit_dir;
+
+    let eio: i32 = 5;
+    let (output, audit_lines) = run_helper_with_user_resolution_error_injected(
+        &helper,
+        &users_conf,
+        &audit_path,
+        InjectionSite::ForUser,
+        eio,
+        &["--for-user", &runner, "1", "10.209.0.2"],
+    );
+
+    assert!(
+        !output.status.success(),
+        "helper must deny; got exit success. stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("username resolution failed for"),
+        "stderr must contain 'username resolution failed for'; got: {stderr}"
+    );
+
+    // Caller-uid lookup succeeded naturally, so audit `caller` is the
+    // runner's name (not the `uid:<n>` placeholder).
+    let record = assert_audit_record_shape(&audit_lines, "denied", &runner, &runner, 1);
+    assert_eq!(
+        record["reason"].as_str(),
+        Some("for-user-resolution-error"),
+        "audit `reason` must be 'for-user-resolution-error'; got: {record}"
+    );
+    assert!(
+        record.get("pool").is_none(),
+        "audit `pool` must be absent on for-user-resolution-error deny; got: {record}"
     );
 }
 

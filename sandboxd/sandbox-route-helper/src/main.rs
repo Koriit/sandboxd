@@ -105,6 +105,81 @@ mod pair_check;
 use audit::{AuditOutcome, AuditRecord, Decision};
 use pair_check::{Verdict, pair_check};
 
+/// Fault-injection env var for the `Err(non-ENOENT)` arms of
+/// `User::from_uid` / `User::from_name`. Honored only in
+/// `test-env-override` builds (privilege story: a cap'd binary that let
+/// an attacker steer libc errors via env would be a step backwards from
+/// the production hardening).
+///
+/// Format: `<site>:<errno>` where `<site>` is `caller_uid` (targets the
+/// `User::from_uid` lookup) or `for_user` (targets the `User::from_name`
+/// lookup), and `<errno>` is the base-10 integer errno value to return.
+/// Unparseable values are treated as "no injection".
+///
+/// `getpwuid_r` / `getpwnam_r` can legitimately return errnos other
+/// than `ENOENT` under environment conditions (NSS service down,
+/// `EIO`, `EINTR`, `ENOMEM`, ...) that cannot be reproduced
+/// deterministically in a hermetic test. This env var is the seam that
+/// lets the integration tests cover the `caller-uid-resolution-error`
+/// and `for-user-resolution-error` audit branches independently.
+#[cfg(feature = "test-env-override")]
+const SANDBOX_ROUTE_HELPER_TEST_INJECT_USER_RESOLUTION_ERROR_ENV: &str =
+    "SANDBOX_ROUTE_HELPER_TEST_INJECT_USER_RESOLUTION_ERROR";
+
+/// Which site the injected errno targets.
+#[cfg(feature = "test-env-override")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InjectionSite {
+    CallerUid,
+    ForUser,
+}
+
+/// Parse the env-var value `"<site>:<errno>"` and return the injected
+/// errno iff `site` matches `want`. Returns `None` in production builds
+/// unconditionally.
+#[cfg(feature = "test-env-override")]
+fn injected_user_resolution_errno(want: InjectionSite) -> Option<Errno> {
+    let raw = std::env::var(SANDBOX_ROUTE_HELPER_TEST_INJECT_USER_RESOLUTION_ERROR_ENV).ok()?;
+    let (site, errno_str) = raw.split_once(':')?;
+    let parsed_site = match site {
+        "caller_uid" => InjectionSite::CallerUid,
+        "for_user" => InjectionSite::ForUser,
+        _ => return None,
+    };
+    if parsed_site != want {
+        return None;
+    }
+    errno_str.parse::<i32>().ok().map(Errno::from_raw)
+}
+#[cfg(not(feature = "test-env-override"))]
+#[derive(Clone, Copy)]
+enum InjectionSite {
+    CallerUid,
+    ForUser,
+}
+#[cfg(not(feature = "test-env-override"))]
+fn injected_user_resolution_errno(_want: InjectionSite) -> Option<Errno> {
+    None
+}
+
+/// `User::from_uid` with the `test-env-override` fault-injection seam.
+/// Production builds inline to a direct call.
+fn resolve_user_from_uid(uid: Uid) -> Result<Option<User>, Errno> {
+    if let Some(errno) = injected_user_resolution_errno(InjectionSite::CallerUid) {
+        return Err(errno);
+    }
+    User::from_uid(uid)
+}
+
+/// `User::from_name` with the `test-env-override` fault-injection seam.
+/// Production builds inline to a direct call.
+fn resolve_user_from_name(name: &str) -> Result<Option<User>, Errno> {
+    if let Some(errno) = injected_user_resolution_errno(InjectionSite::ForUser) {
+        return Err(errno);
+    }
+    User::from_name(name)
+}
+
 /// Single deny exit code per the spec — the stderr reason carries the
 /// "what went wrong" payload, distinct codes per step would only
 /// invite scripts to grow ad-hoc dependencies on internal step
@@ -216,7 +291,7 @@ fn run() -> ExitCode {
     // resolves to the same uid as `caller` (e.g. via NSS misconfig) to
     // sneak through pair-check on a name-mismatch.
     let caller_uid = Uid::current();
-    let caller_name = match User::from_uid(caller_uid) {
+    let caller_name = match resolve_user_from_uid(caller_uid) {
         Ok(Some(u)) => u.name,
         // ENOENT-on-not-found is glibc-version-specific (≥2.36 surfaces it
         // as an error instead of Ok(None)); collapse with Ok(None) for
@@ -264,7 +339,7 @@ fn run() -> ExitCode {
 
     // Resolve `--for-user` to a uid strictly. An unresolvable for-user
     // name is a deny path per § 3.4.
-    let for_user_uid = match User::from_name(&for_user) {
+    let for_user_uid = match resolve_user_from_name(&for_user) {
         Ok(Some(u)) => u.uid.as_raw(),
         // ENOENT-on-not-found is glibc-version-specific (≥2.36 surfaces it
         // as an error instead of Ok(None)); collapse with Ok(None) for
