@@ -210,7 +210,32 @@ struct TestNetwork {
 }
 
 impl TestNetwork {
-    fn create(label: &str) -> Self {
+    /// Create a per-session docker network whose name matches the
+    /// canonical `sandbox-net-{session_id}` shape the orphan reaper's
+    /// dual-anchor IPAM gate expects.
+    ///
+    /// Using `session_id` (rather than an arbitrary label) is
+    /// load-bearing for nextest concurrency safety: any test in the
+    /// suite that boots a real `sandboxd` triggers the daemon's
+    /// startup orphan reaper, which enumerates every `sandbox-*`
+    /// container on the host. With a canonical network name, the
+    /// reaper parses the sibling network, observes its IPAM subnets
+    /// fall outside the daemon's own allocator pool (test daemons use
+    /// `10.2xx.x.x/24`; this network sits in `10.97.x.y/28`), and
+    /// skips the entire session-id tuple — container included.
+    ///
+    /// A non-canonical name (e.g. `sandbox-net-refresh-{label}-{nanos}`)
+    /// would not parse as a session id via
+    /// `parse_network_session_id`, leave `out_of_pool_sids` empty for
+    /// our session, and let the reaper `docker rm -f` the in-flight
+    /// container — surfacing inside the test as either a vanished
+    /// container on the next `docker inspect` ("no such object") or
+    /// a concurrent-rm race on our own `runtime.delete`
+    /// ("removal of container ... is already in progress"). See
+    /// `sandboxd/.config/nextest.toml`'s comment on the
+    /// `docker-sandbox-namespace` group for the namespace-pollution
+    /// rationale.
+    fn create(session_id: &SessionId) -> Self {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -220,7 +245,7 @@ impl TestNetwork {
         let subnet = format!("10.97.{third}.{fourth_base}/28");
         let gateway_ip = format!("10.97.{third}.{}", fourth_base.wrapping_add(2));
         let container_ip = format!("10.97.{third}.{}", fourth_base.wrapping_add(3));
-        let name = format!("sandbox-net-refresh-{label}-{nanos}");
+        let name = format!("sandbox-net-{session_id}");
 
         let output = Command::new("docker")
             .args(["network", "create", "--subnet", &subnet, &name])
@@ -419,8 +444,6 @@ fn read_in_container_guest_bytes(container_name: &str) -> Vec<u8> {
 /// dependency from this test.
 #[tokio::test]
 async fn integration_guest_refresh_container_backend() {
-    let net = TestNetwork::create("refresh");
-
     // Per-test base directory. The daemon would point its
     // `guest_bind_source` at the FHS install path
     // (`/usr/local/libexec/sandboxd/sandbox-guest`); the test fixture
@@ -447,6 +470,11 @@ async fn integration_guest_refresh_container_backend() {
             "",
         )
         .expect("persist session");
+
+    // Create the docker network AFTER the session row exists so its
+    // name carries the session id (see `TestNetwork::create` docs for
+    // the dual-anchor reaper-skip rationale).
+    let net = TestNetwork::create(&session.id);
 
     let _cleanup = ContainerCleanup::new(&session.id);
     runtime.register_session(session.id, net.to_container_network());
@@ -535,7 +563,6 @@ async fn integration_guest_refresh_container_backend() {
 /// `/usr/local/bin/sandbox-guest`, without per-session refresh work.
 #[tokio::test]
 async fn integration_guest_binary_swap_picked_up_by_new_sessions() {
-    let net = TestNetwork::create("swap");
     let base_dir = TempDir::new().expect("tempdir base_dir");
 
     // Stage v1 and create container #1.
@@ -557,6 +584,10 @@ async fn integration_guest_binary_swap_picked_up_by_new_sessions() {
             SANDBOX_GUEST_VERSION,
         )
         .expect("persist session #1");
+    // Create the docker network AFTER the session row exists so its
+    // name carries the session id (see `TestNetwork::create` docs for
+    // the dual-anchor reaper-skip rationale).
+    let net = TestNetwork::create(&session_one.id);
     let _c1 = ContainerCleanup::new(&session_one.id);
     runtime.register_session(session_one.id, net.to_container_network());
     let handle_one = runtime
@@ -584,9 +615,6 @@ async fn integration_guest_binary_swap_picked_up_by_new_sessions() {
     let v2_bytes = placeholder_sleep_script("v-two-rewritten");
     replace_test_guest_atomically(&staged_path, &v2_bytes);
 
-    // New network for container #2 (each container needs its own /28 IP).
-    let net2 = TestNetwork::create("swap2");
-
     let session_two = store
         .create_session_with_backend(
             SessionConfig::default(),
@@ -597,6 +625,9 @@ async fn integration_guest_binary_swap_picked_up_by_new_sessions() {
             SANDBOX_GUEST_VERSION,
         )
         .expect("persist session #2");
+    // New network for container #2 (each container needs its own /28
+    // IP). Same canonical-name rationale as session #1 above.
+    let net2 = TestNetwork::create(&session_two.id);
     let _c2 = ContainerCleanup::new(&session_two.id);
     runtime.register_session(session_two.id, net2.to_container_network());
     let handle_two = runtime
@@ -672,7 +703,6 @@ async fn integration_guest_binary_shared_inode_across_sessions() {
     let store = Arc::new(store);
 
     // Container A.
-    let net_a = TestNetwork::create("shareda");
     let session_a = store
         .create_session_with_backend(
             SessionConfig::default(),
@@ -683,6 +713,10 @@ async fn integration_guest_binary_shared_inode_across_sessions() {
             SANDBOX_GUEST_VERSION,
         )
         .expect("persist session A");
+    // Create the docker network AFTER the session row exists so its
+    // name carries the session id (see `TestNetwork::create` docs for
+    // the dual-anchor reaper-skip rationale).
+    let net_a = TestNetwork::create(&session_a.id);
     let _cleanup_a = ContainerCleanup::new(&session_a.id);
     runtime.register_session(session_a.id, net_a.to_container_network());
     let handle_a = runtime
@@ -695,7 +729,6 @@ async fn integration_guest_binary_shared_inode_across_sessions() {
         .expect("runtime.start A");
 
     // Container B.
-    let net_b = TestNetwork::create("sharedb");
     let session_b = store
         .create_session_with_backend(
             SessionConfig::default(),
@@ -706,6 +739,8 @@ async fn integration_guest_binary_shared_inode_across_sessions() {
             SANDBOX_GUEST_VERSION,
         )
         .expect("persist session B");
+    // Same canonical-name rationale as container A above.
+    let net_b = TestNetwork::create(&session_b.id);
     let _cleanup_b = ContainerCleanup::new(&session_b.id);
     runtime.register_session(session_b.id, net_b.to_container_network());
     let handle_b = runtime
