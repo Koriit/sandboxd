@@ -107,7 +107,7 @@ TEST ?=
 # host; runs in ~5-10 min on a warm runner.
 test-e2e-container: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod-cap
 	cd tests/e2e && . .venv/bin/activate && \
-	  python -m pytest -v -rs --timeout=600 \
+	  python -m pytest -v -rs --timeout=600 --durations=20 \
 	  -m "not lima" -k "not [lima]" $(TEST)
 
 # Merge-to-main: full matrix -- Lima + container parametrizations plus
@@ -119,7 +119,7 @@ test-e2e-container: $(VENV_STAMP) gateway-image lite-image install-route-helper-
 # `_lima_required_for_lima_tests` fixture; everything else runs.
 test-e2e-matrix: $(VENV_STAMP) gateway-image lite-image install-route-helper-prod-cap
 	cd tests/e2e && . .venv/bin/activate && \
-	  python -m pytest -v -rs --timeout=600 $(TEST)
+	  python -m pytest -v -rs --timeout=600 --durations=20 $(TEST)
 
 # Back-compat alias. `make test-e2e` continues to run the full matrix.
 test-e2e: test-e2e-matrix

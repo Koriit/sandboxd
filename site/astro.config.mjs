@@ -39,13 +39,13 @@ const mermaidStrategy = isDev ? 'pre-mermaid' : 'img-svg';
 
 // https://astro.build/config
 export default defineConfig({
-  // Published URL is assigned by GitHub Pages once the repo goes live.
-  // TODO(m9-s16+): set the real URL after the repo slug is known, and pair
-  // it with a matching `base:` if the site is served from a subpath
-  // (GitHub project Pages). Until then we use a path-less placeholder so
-  // Starlight's links-validator doesn't flag every internal link as
-  // invalid for missing a non-existent base prefix.
-  site: 'https://example.github.io',
+  // Published as a GitHub Pages project site at https://Koriit.github.io/sandboxd/.
+  // Splitting origin (`site`) from path prefix (`base`) is the Astro idiom
+  // for project-site deployments: Starlight's links-validator and built-in
+  // route helpers both expect `base` to carry the subpath so internal links
+  // resolve correctly under the `/sandboxd/` prefix.
+  site: 'https://Koriit.github.io',
+  base: '/sandboxd/',
   output: 'static',
 
   markdown: {
