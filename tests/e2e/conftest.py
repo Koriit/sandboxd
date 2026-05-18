@@ -62,6 +62,71 @@ CARGO_WORKSPACE = PROJECT_ROOT / "sandboxd"
 SANDBOXD_BIN = CARGO_WORKSPACE / "target" / "debug" / "sandboxd"
 SANDBOX_BIN = CARGO_WORKSPACE / "target" / "debug" / "sandbox"
 
+# Rust source-of-truth files we extract values from at test-collection time
+# so the harness never drifts out of step with the daemon it drives.
+SANDBOX_CORE_CARGO_TOML = CARGO_WORKSPACE / "sandbox-core" / "Cargo.toml"
+SANDBOX_CORE_USERS_CONF_RS = CARGO_WORKSPACE / "sandbox-core" / "src" / "users_conf.rs"
+
+
+def _read_workspace_version() -> str:
+    """Extract `sandbox-core`'s package version from its Cargo.toml.
+
+    This is the same value the Makefile's `gateway-image` target passes
+    to `docker build -t sandbox-gateway:<version>` and the daemon's
+    `CARGO_PKG_VERSION` at run-time. Reading the Cargo.toml directly
+    keeps the preflight check working on hosts without a Rust toolchain
+    (e.g. operators who only need to inspect an already-built image).
+    """
+    if not SANDBOX_CORE_CARGO_TOML.exists():
+        raise RuntimeError(
+            f"Cannot read workspace version: {SANDBOX_CORE_CARGO_TOML} not found"
+        )
+    text = SANDBOX_CORE_CARGO_TOML.read_text()
+    # Match the first `version = "X.Y.Z"` under `[package]` — Cargo.toml's
+    # package section is the first table, so the first match is correct.
+    matches = re.findall(r'(?m)^\s*version\s*=\s*"([^"]+)"', text)
+    if not matches:
+        raise RuntimeError(
+            f"Cannot extract version from {SANDBOX_CORE_CARGO_TOML}: "
+            f"no `version = \"...\"` line found"
+        )
+    return matches[0]
+
+
+def _read_min_supported_users_conf_schema() -> int:
+    """Extract DAEMON_MIN_SUPPORTED_USERS_CONF_SCHEMA from users_conf.rs.
+
+    Bridges the daemon's source-of-truth schema floor into the synthesized
+    users.conf payload below so a future bump of the Rust constant forces
+    a deterministic test-collection failure here rather than a mid-matrix
+    surprise once a test daemon refuses to boot.
+    """
+    if not SANDBOX_CORE_USERS_CONF_RS.exists():
+        raise RuntimeError(
+            f"Cannot read users.conf schema constant: "
+            f"{SANDBOX_CORE_USERS_CONF_RS} not found"
+        )
+    text = SANDBOX_CORE_USERS_CONF_RS.read_text()
+    matches = re.findall(
+        r"const\s+DAEMON_MIN_SUPPORTED_USERS_CONF_SCHEMA\s*:\s*\w+\s*=\s*(\d+)",
+        text,
+    )
+    if len(matches) == 0:
+        raise RuntimeError(
+            f"Cannot extract DAEMON_MIN_SUPPORTED_USERS_CONF_SCHEMA from "
+            f"{SANDBOX_CORE_USERS_CONF_RS}: no matching `const ... = N;` line found"
+        )
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"Cannot extract DAEMON_MIN_SUPPORTED_USERS_CONF_SCHEMA from "
+            f"{SANDBOX_CORE_USERS_CONF_RS}: expected one declaration, "
+            f"found {len(matches)}"
+        )
+    return int(matches[0])
+
+
+SANDBOX_GATEWAY_IMAGE_TAG = f"sandbox-gateway:{_read_workspace_version()}"
+
 # Maximum time to wait for the daemon socket to appear (seconds).
 DAEMON_STARTUP_TIMEOUT = 10
 
@@ -111,7 +176,7 @@ import atexit  # noqa: E402  -- after module-level setup
 import getpass  # noqa: E402
 if "SANDBOX_USERS_CONF" not in os.environ:
     _users_conf_payload = {
-        "_schema_version": 1,
+        "_schema_version": _read_min_supported_users_conf_schema(),
         "subnets": [
             {
                 "comment": (
@@ -363,16 +428,20 @@ def _preflight_checks():
         )
 
     # 2. Gateway image exists — both backends require it (the gateway
-    #    container is the egress chokepoint for every session).
+    #    container is the egress chokepoint for every session). The
+    #    daemon composes the tag as `sandbox-gateway:<workspace-version>`
+    #    at run-time (see `CARGO_PKG_VERSION` use in the backend) and
+    #    refuses `:latest`, so the preflight must inspect the same
+    #    versioned tag that `make gateway-image` produces.
     try:
         subprocess.run(
-            ["docker", "image", "inspect", "sandbox-gateway"],
+            ["docker", "image", "inspect", SANDBOX_GATEWAY_IMAGE_TAG],
             capture_output=True, timeout=30, check=True,
         )
     except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
         pytest.skip(
-            "Docker image 'sandbox-gateway' not found. Build it with: "
-            "make gateway-image"
+            f"Docker image {SANDBOX_GATEWAY_IMAGE_TAG!r} not found. "
+            f"Build it with: make gateway-image"
         )
 
     # Cleanup of stale sandbox-* resources is intentionally NOT done here.
