@@ -95,7 +95,48 @@ test-group = 'lima'
 #     allocates a `sandbox-net-{id}` bridge before the test reads
 #     the persisted row and tears the daemon down. Belongs in the
 #     same group so a parallel reaper does not race the cleanup.
-filter = 'test(/^integration_orphan_reaper/) | test(/^integration_reaper_/) | test(/^integration_container_runtime/) | test(/^integration_rootless_docker/) | test(/^integration_default_hardened_docker/) | test(/^integration_route_helper_for_user_/) | test(/^integration_route_helper_missing_for_user_/) | test(/^integration_guest_refresh_container_backend/) | test(/^integration_guest_binary_/) | test(/^integration_create_session_container_/) | test(/^integration_create_stamps_owner_from_peercred/)'
+#
+# Every test binary that spawns the real `sandboxd` binary also
+# belongs in this group. The daemon's startup path runs the orphan
+# reaper unconditionally (`main.rs::reap_orphans`); on a host with
+# Docker the reaper will `docker rm -f` any `sandbox-{12hex}` whose
+# session id is not in the spawning daemon's live set. The
+# orphan-reaper integration tests stand fresh `sandbox-{12hex}`
+# resources up on the host as a fixture — a concurrent daemon-
+# spawning test trips the cross-daemon race because the test's
+# `sandbox-net-{id}` (whose IPAM is out-of-pool relative to the
+# spawned daemon's allocator pool and therefore protects its
+# `sandbox-{id}` sibling via `out_of_pool_sids`) is created
+# *after* the `sandbox-{id}` container itself. Any external
+# reaper that snapshots `list_sandbox_networks` before our network
+# is up but snapshots `list_sandbox_containers` after our container
+# is up sees the container with no protective sibling and reaps it.
+# The dual-anchor IPAM gate documented in `orphan_reaper.rs`
+# explicitly notes this single-anchor fallback when the sibling
+# network is not yet observable. Serialising daemon-spawning binaries
+# with namespace fixtures via the same `docker-sandbox-namespace`
+# group closes the race by construction. The `binary(...)` clauses
+# below enumerate the daemon-spawning test crates currently in the
+# workspace; new daemon-spawning binaries must be added here.
+filter = '''
+    test(/^integration_orphan_reaper/)
+  | test(/^integration_reaper_/)
+  | test(/^integration_container_runtime/)
+  | test(/^integration_rootless_docker/)
+  | test(/^integration_default_hardened_docker/)
+  | test(/^integration_route_helper_for_user_/)
+  | test(/^integration_route_helper_missing_for_user_/)
+  | test(/^integration_guest_refresh_container_backend/)
+  | test(/^integration_guest_binary_/)
+  | test(/^integration_create_session_container_/)
+  | test(/^integration_create_stamps_owner_from_peercred/)
+  | binary(integration_owner_peercred)
+  | binary(integration_doctor_diagnostics)
+  | binary(integration_schema_mismatch_refusal)
+  | binary(integration_session_create_refused_on_missing_gateway_image)
+  | binary(integration_users_conf_startup)
+  | binary(integration_version_endpoint)
+'''
 test-group = 'docker-sandbox-namespace'
 
 [test-groups]
