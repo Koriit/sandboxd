@@ -398,7 +398,6 @@ def release_tarball_x86_64_bumped(release_tarball_x86_64, sigstore_stack) -> Pat
 
 
 @pytest.fixture(scope="session")
-@pytest.mark.timeout(2700)
 def release_tarball_x86_64_bumped_chain(release_tarball_x86_64, sigstore_stack) -> list:
     """Build a chain of N successively bumped release tarballs.
 

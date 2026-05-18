@@ -32,6 +32,7 @@ from conftest import (
 )
 
 
+@pytest.mark.timeout(2700)
 @pytest.mark.parametrize("distro_template", ["ubuntu-22.04"])
 def test_update_backup_retention_prunes_oldest(
     distro_template,
