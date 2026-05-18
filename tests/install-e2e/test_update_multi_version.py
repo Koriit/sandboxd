@@ -21,6 +21,10 @@ binary output.
 from __future__ import annotations
 
 import json
+import sqlite3
+import subprocess
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -146,31 +150,47 @@ def test_update_fresh_install_to_next_version(
     # to /var/lib/sandbox/backups/, then preserves the live copy
     # through the update. After a successful update the live DB at
     # /var/lib/sandbox/sessions.db must (a) exist, (b) be a
-    # well-formed SQLite database (sqlite3's `PRAGMA integrity_check`
-    # returns "ok"), and (c) carry the `sessions` table the daemon
-    # depends on for queries. Without these assertions a regression
-    # that left the DB truncated or corrupted post-update would only
+    # well-formed SQLite database (`PRAGMA integrity_check` returns
+    # "ok"), and (c) carry the `sessions` table the daemon depends
+    # on for queries. Without these assertions a regression that
+    # left the DB truncated or corrupted post-update would only
     # surface on the next session-create — too late for the update
     # test to catch.
-    integrity = vm.shell(
-        "sudo sqlite3 /var/lib/sandbox/sessions.db 'PRAGMA integrity_check;'",
+    #
+    # The DB is mode 0600 owned by sandbox:sandbox and the guest has
+    # no sqlite CLI (the daemon uses rusqlite statically, so an
+    # operator install never needs one). Stage a world-readable copy
+    # under /tmp, pull it to the host with `limactl copy`, and run
+    # the checks against Python's bundled `sqlite3` module — keeping
+    # the guest's tool surface honest to the real install contract.
+    vm.shell(
+        "sudo install -m 0644 -o root -g root "
+        "/var/lib/sandbox/sessions.db /tmp/sessions.db.inspect",
         check=True, timeout=10,
     )
-    assert integrity.stdout.strip() == "ok", (
-        f"post-update sessions.db integrity_check failed: {integrity.stdout!r}; "
-        f"the live DB at /var/lib/sandbox/sessions.db is corrupted or truncated"
-    )
-    # `sessions` table must exist (the migration set is up-to-date
-    # post-update; the table presence is the minimum schema-shape
-    # assertion).
-    sessions_table = vm.shell(
-        "sudo sqlite3 /var/lib/sandbox/sessions.db "
-        "\"SELECT name FROM sqlite_master WHERE type='table' AND name='sessions';\"",
-        check=True, timeout=10,
-    )
-    assert sessions_table.stdout.strip() == "sessions", (
-        f"post-update sessions.db missing `sessions` table: {sessions_table.stdout!r}"
-    )
+    with tempfile.TemporaryDirectory() as tmpdir:
+        host_db = Path(tmpdir) / "sessions.db"
+        subprocess.run(
+            ["limactl", "copy", f"{vm.name}:/tmp/sessions.db.inspect", str(host_db)],
+            check=True, timeout=60, capture_output=True, text=True,
+        )
+        with sqlite3.connect(f"file:{host_db}?mode=ro", uri=True) as conn:
+            integrity = conn.execute("PRAGMA integrity_check;").fetchone()
+            assert integrity is not None and integrity[0] == "ok", (
+                f"post-update sessions.db integrity_check failed: {integrity!r}; "
+                f"the live DB at /var/lib/sandbox/sessions.db is corrupted or truncated"
+            )
+            # `sessions` table must exist (the migration set is up-to-
+            # date post-update; the table presence is the minimum
+            # schema-shape assertion).
+            row = conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='sessions';"
+            ).fetchone()
+            assert row is not None and row[0] == "sessions", (
+                f"post-update sessions.db missing `sessions` table: {row!r}"
+            )
+    vm.shell("sudo rm -f /tmp/sessions.db.inspect", check=True, timeout=10)
 
     # 4. Spec § 7.2 step 10 (post-update green-light gate): doctor
     # passes against the running v' daemon.
