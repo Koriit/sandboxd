@@ -27,6 +27,8 @@ use tokio::net::UnixListener;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+mod common;
+
 /// Spin a fake daemon serving `/backends` (Lima + Container) and
 /// `/sessions` (success). The warning is emitted client-side before
 /// the daemon is contacted, but `/sessions` must still answer so the
@@ -98,7 +100,9 @@ async fn spawn_dual_backend_daemon() -> (TempDir, String) {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    common::wait_for_daemon_ready(&sock_path, "/version")
+        .await
+        .expect("fake daemon failed to become ready");
 
     (tmp, sock_str)
 }

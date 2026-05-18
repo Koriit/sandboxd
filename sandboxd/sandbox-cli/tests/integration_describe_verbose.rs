@@ -25,6 +25,8 @@ use tokio::net::UnixListener;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+mod common;
+
 async fn spawn_describe_daemon(session_id: &str, backend: &str) -> (TempDir, String) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let sock_path = tmp.path().join("sandboxd.sock");
@@ -97,7 +99,9 @@ async fn spawn_describe_daemon(session_id: &str, backend: &str) -> (TempDir, Str
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    common::wait_for_daemon_ready(&sock_path, "/version")
+        .await
+        .expect("fake daemon failed to become ready");
 
     (tmp, sock_str)
 }

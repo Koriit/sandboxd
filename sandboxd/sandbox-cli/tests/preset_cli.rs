@@ -42,6 +42,8 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
+mod common;
+
 // ---------------------------------------------------------------------------
 // Fake-daemon harness
 // ---------------------------------------------------------------------------
@@ -196,10 +198,12 @@ async fn spawn_unix_server(sock_path: &std::path::Path, app: Router) {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    // Let the spawned accept-loop task register before the client
-    // connects. 50ms is plenty — on CI the local-filesystem bind is
-    // instant.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Probe for a real 200 — kernel-level connect succeeds before the
+    // spawned axum task is scheduled to accept, so a fixed sleep
+    // flaked under nextest concurrent load.
+    common::wait_for_daemon_ready(sock_path, "/version")
+        .await
+        .expect("fake daemon failed to become ready");
 }
 
 /// Spawn the compiled `sandbox` binary with a fixed argv, stream its

@@ -35,6 +35,8 @@ use tokio::net::UnixListener;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+mod common;
+
 /// Counts of each route the fake daemon served.
 #[derive(Default)]
 struct RouteCounters {
@@ -97,8 +99,12 @@ async fn spawn_counting_daemon() -> (TempDir, String, CountersHandle) {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    // Let the spawned accept-loop register before the CLI dials in.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Probe for a real 200 — kernel-level connect succeeds before the
+    // spawned axum task is scheduled to accept, so a fixed sleep
+    // flaked under nextest concurrent load.
+    common::wait_for_daemon_ready(&sock_path, "/version")
+        .await
+        .expect("fake daemon failed to become ready");
 
     (tmp, sock_str, counters)
 }

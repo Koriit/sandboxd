@@ -29,6 +29,8 @@ use tokio::net::UnixListener;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+mod common;
+
 const TEST_SESSION_ID: &str = "abcdef012345";
 
 /// Stand up a fake daemon serving `GET /sessions/{id}` -> `SessionDto`
@@ -67,7 +69,9 @@ async fn spawn_fake_daemon(backend: &str) -> (TempDir, String) {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    common::wait_for_daemon_ready(&sock_path, "/version")
+        .await
+        .expect("fake daemon failed to become ready");
 
     (tmp, sock_str)
 }
