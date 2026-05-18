@@ -218,7 +218,11 @@ fn run() -> ExitCode {
     let caller_uid = Uid::current();
     let caller_name = match User::from_uid(caller_uid) {
         Ok(Some(u)) => u.name,
-        Ok(None) => {
+        // ENOENT-on-not-found is glibc-version-specific (≥2.36 surfaces it
+        // as an error instead of Ok(None)); collapse with Ok(None) for
+        // stable audit classification across libc versions. Mirrors the
+        // `User::from_name` arm below for the `--for-user` lookup.
+        Ok(None) | Err(Errno::ENOENT) => {
             let raw = caller_uid.as_raw();
             let msg = format!("caller uid {raw} does not resolve to a username");
             // No `caller` name to put in the audit record — fall back
