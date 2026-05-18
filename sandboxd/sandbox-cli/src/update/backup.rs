@@ -444,11 +444,16 @@ fn sha256_of_file(path: &Path) -> Result<(String, u64), BackupError> {
     Ok((hex_encode(ctx.finish().as_ref()), total))
 }
 
-/// Compute sha256 + size by shelling out to `sudo -k sha256sum`. Used
-/// for destinations the current process cannot read directly (e.g.
-/// `sessions.db.bak` owned `sandbox:sandbox` at mode `0600`).
+/// Compute sha256 + size of a `sandbox`-owned file. Tries an
+/// unprivileged read first and falls back to `sudo sha256sum` when
+/// that fails — mirrors `read_sandbox_owned_file`.
 fn sha256_of_file_sudo(path: &Path) -> Result<(String, u64), BackupError> {
-    let out = run_sudo_capture(&["-k", "sha256sum", path.to_str().unwrap()])?;
+    // Tests pass a tempdir we own; production passes /var/lib/...
+    // For the test path we can hash directly; production needs sudo.
+    if let Ok(result) = sha256_of_file(path) {
+        return Ok(result);
+    }
+    let out = run_sudo_capture(&["sha256sum", path.to_str().unwrap()])?;
     let stdout = String::from_utf8_lossy(&out);
     let first = stdout.split_whitespace().next().unwrap_or("");
     if first.len() != 64 {
@@ -458,7 +463,7 @@ fn sha256_of_file_sudo(path: &Path) -> Result<(String, u64), BackupError> {
             stderr: format!("unexpected sha256sum output: {stdout}"),
         });
     }
-    let size = match run_sudo_capture(&["-k", "stat", "-c", "%s", path.to_str().unwrap()]) {
+    let size = match run_sudo_capture(&["stat", "-c", "%s", path.to_str().unwrap()]) {
         Ok(bytes) => String::from_utf8_lossy(&bytes)
             .trim()
             .parse::<u64>()
