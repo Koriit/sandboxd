@@ -279,7 +279,7 @@ def lima_delete(vm_name):
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="session")
-def release_tarball_x86_64(sigstore_stack) -> Path:
+def release_tarball_x86_64(sigstore_stack, pinned_cosign_binary) -> Path:
     """Build the local release tarball once per test session.
 
     Drives ``build-local-tarball.sh`` unconditionally on every pytest
@@ -297,6 +297,14 @@ def release_tarball_x86_64(sigstore_stack) -> Path:
     skipped (no Docker on the host), the build script emits a zero-byte
     sigstore stub and downstream tests must rely on the
     ``SANDBOX_INSTALL_SKIP_SIGSTORE=1`` test-only escape.
+
+    Depends on ``pinned_cosign_binary``: the build script's signing
+    branch needs a cosign binary. Older harness runs assumed cosign was
+    pre-staged at ``/tmp/cosign`` by the dev shell, which silently
+    degraded to a zero-byte stub when ``/tmp`` was cleared (e.g. after a
+    host reboot). We pass the pinned-and-sha-verified binary
+    explicitly via ``COSIGN_BIN`` so the signing branch always wins
+    when the stack is up.
     """
     if subprocess.run(["uname", "-m"], capture_output=True, text=True).stdout.strip() != "x86_64":
         pytest.skip("release_tarball_x86_64 fixture only assembles on x86_64 hosts")
@@ -305,10 +313,21 @@ def release_tarball_x86_64(sigstore_stack) -> Path:
     arch = "x86_64-unknown-linux-gnu"
     tarball = DIST_DIR / f"sandboxd-{ver}-{arch}.tar.gz"
 
+    # The download branch in ``pinned_cosign_binary`` doesn't chmod +x
+    # the cached blob (its other consumer copies the bytes into the VM
+    # and chmods there). The build script needs an executable host-side
+    # binary, so ensure the bit is set here. Idempotent: a no-op when
+    # the bit is already on.
+    pinned_cosign_binary.chmod(pinned_cosign_binary.stat().st_mode | 0o111)
+
+    env = os.environ.copy()
+    env["COSIGN_BIN"] = str(pinned_cosign_binary)
+
     subprocess.run(
         [str(HERE / "build-local-tarball.sh")],
         check=True,
         timeout=1800,
+        env=env,
     )
 
     assert tarball.exists(), f"tarball not produced: {tarball}"
@@ -335,7 +354,9 @@ def _bump_patch_version(version: str) -> str:
 
 
 @pytest.fixture(scope="session")
-def release_tarball_x86_64_bumped(release_tarball_x86_64, sigstore_stack) -> Path:
+def release_tarball_x86_64_bumped(
+    release_tarball_x86_64, sigstore_stack, pinned_cosign_binary,
+) -> Path:
     """Build a release tarball at a bumped version distinct from the
     workspace's current CARGO_PKG_VERSION.
 
@@ -379,6 +400,10 @@ def release_tarball_x86_64_bumped(release_tarball_x86_64, sigstore_stack) -> Pat
 
     env = os.environ.copy()
     env["SANDBOX_RELEASE_BUMP_VERSION"] = bumped_ver
+    # See ``release_tarball_x86_64`` for the COSIGN_BIN rationale —
+    # same fix applies here so the bumped tarball gets a real
+    # signature.
+    env["COSIGN_BIN"] = str(pinned_cosign_binary)
     # The build script auto-detects the bumped build and reuses
     # the base tarball's gateway-image bytes (identical) rather
     # than re-running `make gateway-image`. The bumped cargo
@@ -398,7 +423,9 @@ def release_tarball_x86_64_bumped(release_tarball_x86_64, sigstore_stack) -> Pat
 
 
 @pytest.fixture(scope="session")
-def release_tarball_x86_64_bumped_chain(release_tarball_x86_64, sigstore_stack) -> list:
+def release_tarball_x86_64_bumped_chain(
+    release_tarball_x86_64, sigstore_stack, pinned_cosign_binary,
+) -> list:
     """Build a chain of N successively bumped release tarballs.
 
     ``test_update_backup_retention`` needs three real bumped binaries
@@ -454,6 +481,8 @@ def release_tarball_x86_64_bumped_chain(release_tarball_x86_64, sigstore_stack) 
         tarball = DIST_DIR / f"sandboxd-{ver}-{arch}.tar.gz"
         env = os.environ.copy()
         env["SANDBOX_RELEASE_BUMP_VERSION"] = ver
+        # See ``release_tarball_x86_64`` for the COSIGN_BIN rationale.
+        env["COSIGN_BIN"] = str(pinned_cosign_binary)
         subprocess.run(
             [str(HERE / "build-local-tarball.sh")],
             check=True,

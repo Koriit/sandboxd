@@ -625,13 +625,23 @@ if [ "$stack_up" -eq 1 ] && [ -n "$cosign_bin" ] && [ -x "$cosign_bin" ]; then
     # need a sig file separately) under their .tmp suffixes.
     rm -f "$sig_path" "$cert_path"
     printf 'build-local-tarball.sh: wrote sigstore bundle %s\n' "$bundle_path"
+elif [ "$stack_up" -eq 1 ]; then
+    # Stack is up but cosign is unreachable. This violates the contract
+    # ("if the stack is up, the tarball gets a real signature"): every
+    # downstream cosign-verify happy-path test would then fail with
+    # `sigstore verification failed` against the empty bundle, with no
+    # signal that the build script itself silently degraded. The
+    # install-e2e harness sets COSIGN_BIN via the pytest fixture
+    # (``release_tarball_x86_64`` -> ``pinned_cosign_binary``); a missing
+    # binary at this point means the fixture chain is broken, not that
+    # the operator wants the air-gapped fallback. Refuse loudly so the
+    # test surfaces the real cause instead of a downstream-shaped lie.
+    printf 'build-local-tarball.sh: Sigstore stack is reachable at %s but no cosign binary is available (PATH, /tmp/cosign, $COSIGN_BIN all empty); refusing to emit zero-byte stub because that would mask the failure as a downstream verify-blob error. Set $COSIGN_BIN to a usable cosign binary, or stop the stack to take the air-gapped fallback explicitly.\n' \
+        "$SIGSTORE_FULCIO_URL" >&2
+    exit 1
 else
-    if [ "$stack_up" -eq 0 ]; then
-        printf 'build-local-tarball.sh: local Sigstore stack not reachable at %s/healthz; emitting zero-byte sigstore stub\n' \
-            "$SIGSTORE_FULCIO_URL" >&2
-    else
-        printf 'build-local-tarball.sh: no cosign binary on PATH or /tmp/cosign; emitting zero-byte sigstore stub\n' >&2
-    fi
+    printf 'build-local-tarball.sh: local Sigstore stack not reachable at %s/healthz; emitting zero-byte sigstore stub\n' \
+        "$SIGSTORE_FULCIO_URL" >&2
     # Zero-byte stub. install.sh's sigstore_verify with
     # SANDBOX_INSTALL_SKIP_SIGSTORE=1 still accepts this shape; the
     # air-gapped test path uses this fallback.
