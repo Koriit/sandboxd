@@ -72,6 +72,173 @@ def pytest_runtest_makereport(item, call):
 
 
 # ---------------------------------------------------------------------------
+# Pre-suite environment cleanup.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="session", autouse=True)
+def _pre_suite_cleanup():
+    """Remove orphan gateway containers and reclaim root-owned pytest tmpdir.
+
+    Context: tests/e2e/ runs spawn ``sandbox-gw-*`` Docker containers with
+    ``restart: unless-stopped``.  Their bind-mount sources live under
+    ``/tmp/pytest-of-{USER}/pytest-N/...``.  When a tests/e2e/ run is
+    aborted, the containers keep restarting; once pytest's normal tmpdir
+    finalizer removes the bind-mount source files, Docker (running as root)
+    re-creates the missing directory tree — flipping the ownership of
+    ``/tmp/pytest-of-{USER}`` to root.  The next pytest invocation then
+    fails every test that calls ``tmp_path`` with:
+      OSError: The temporary directory /tmp/pytest-of-USER is not owned by
+               the current user.
+
+    This fixture runs once at suite start, before any test, to break that
+    cycle.
+
+    Orphan detection — a container is an orphan from a prior test run iff:
+      1. Its name matches ``sandbox-gw-<12-hex-id>`` (all gateway containers).
+      2. At least one of its bind-mount source paths is under
+         ``/tmp/pytest-of-*/`` (only pytest-managed runs ever use that
+         prefix as a base-dir; dev sandboxd sessions use XDG_RUNTIME_DIR
+         or ~/.local/share/sandboxd/).
+      3. RestartCount >= 1 (crashlooping because its source files are gone).
+
+    Criteria 2 alone is already safe: no live dev session can satisfy it
+    because dev sandboxd's ``--base-dir`` never resolves under /tmp/pytest-of-*.
+    Criteria 3 adds a belt-and-suspenders guard against a race where an
+    ongoing test run's gateway container happens to share the temp-path
+    prefix with an older orphan we are inspecting.
+
+    Tmpdir reclaim:
+      If ``/tmp/pytest-of-{USER}`` exists and is root-owned (the
+      contamination has already occurred), the fixture tries ``rm -rf`` as
+      the current user.  If that fails (root-owned files inside), it prints
+      an actionable message and exits pytest rather than proceeding with a
+      broken environment.  It does NOT run sudo — that would be a silent
+      privilege escalation.
+    """
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    if not user:
+        # Best-effort; skip cleanup if we can't determine the invoking user.
+        return
+
+    # --- Step 1: reap orphan gateway containers ---
+    if shutil.which("docker") is not None:
+        _reap_orphan_gateways()
+
+    # --- Step 2: reclaim root-owned tmpdir ---
+    pytest_tmpdir = Path(f"/tmp/pytest-of-{user}")
+    if pytest_tmpdir.exists():
+        _reclaim_pytest_tmpdir(pytest_tmpdir)
+
+
+def _reap_orphan_gateways() -> None:
+    """Identify and remove orphan sandbox-gw-* containers from prior test runs."""
+    import re as _re
+    _GW_NAME_RE = _re.compile(r"^sandbox-gw-[0-9a-f]{12}$")
+
+    # List all sandbox-gw-* containers (running + stopped).
+    result = subprocess.run(
+        ["docker", "ps", "-a",
+         "--filter", "name=sandbox-gw-",
+         "--format", "{{.ID}}"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        print(f"[pre-suite-cleanup] docker ps failed; skipping gateway reap: {result.stderr.strip()}")
+        return
+
+    container_ids = [c.strip() for c in result.stdout.splitlines() if c.strip()]
+    if not container_ids:
+        return
+
+    for cid in container_ids:
+        try:
+            inspect = subprocess.run(
+                ["docker", "inspect", cid],
+                capture_output=True, text=True, timeout=15,
+            )
+            if inspect.returncode != 0:
+                continue
+            info = json.loads(inspect.stdout)
+            if not info:
+                continue
+            data = info[0]
+
+            # Criterion 1: name must be sandbox-gw-<12-hex-id>
+            name = data.get("Name", "").lstrip("/")
+            if not _GW_NAME_RE.match(name):
+                continue
+
+            # Criterion 2: at least one bind-mount source under /tmp/pytest-of-*/
+            mounts = data.get("Mounts", [])
+            pytest_mounts = [
+                m["Source"] for m in mounts
+                if m.get("Type") == "bind"
+                and m.get("Source", "").startswith("/tmp/pytest-of-")
+            ]
+            if not pytest_mounts:
+                # No pytest-tmpdir bind mounts — could be a live dev session.
+                continue
+
+            # Criterion 3: crashlooping (RestartCount >= 1)
+            restart_count = data.get("RestartCount", 0)
+            if restart_count < 1:
+                # Container is alive and healthy — don't touch it.
+                continue
+
+            print(
+                f"[pre-suite-cleanup] Removing orphan gateway container {name!r} "
+                f"(RestartCount={restart_count}, pytest-bind-mounts={pytest_mounts})"
+            )
+            subprocess.run(
+                ["docker", "rm", "-f", cid],
+                capture_output=True, timeout=30,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[pre-suite-cleanup] Warning: could not inspect container {cid}: {exc}")
+
+
+def _reclaim_pytest_tmpdir(pytest_tmpdir: Path) -> None:
+    """Reclaim /tmp/pytest-of-USER if it is root-owned; exit with instructions if unable."""
+    try:
+        stat = pytest_tmpdir.stat()
+    except OSError:
+        return
+
+    if stat.st_uid == os.getuid():
+        # Owned by us — no contamination.
+        return
+
+    print(
+        f"\n[pre-suite-cleanup] {pytest_tmpdir} is owned by uid={stat.st_uid} "
+        f"(current uid={os.getuid()}).  Attempting removal as current user..."
+    )
+    # Try rm -rf as the current user; will fail if root-owned files are inside.
+    rm_result = subprocess.run(
+        ["rm", "-rf", str(pytest_tmpdir)],
+        capture_output=True, text=True, timeout=30,
+    )
+    if rm_result.returncode == 0:
+        print(f"[pre-suite-cleanup] Removed {pytest_tmpdir} successfully.")
+        return
+
+    # rm failed — root-owned files inside; we cannot remove without sudo.
+    print(
+        f"\n[pre-suite-cleanup] ERROR: Could not remove {pytest_tmpdir} "
+        f"(owned by root).\n"
+        f"This happens when a Docker gateway container (restart: unless-stopped) "
+        f"re-creates the directory after its bind-mount source was deleted.\n"
+        f"\nTo fix, run:\n\n"
+        f"    sudo rm -rf {pytest_tmpdir}\n\n"
+        f"Then re-run the test suite."
+    )
+    pytest.exit(
+        f"Contaminated tmpdir: {pytest_tmpdir} is not owned by the current user. "
+        f"Run: sudo rm -rf {pytest_tmpdir}",
+        returncode=3,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Lima primitives.
 # ---------------------------------------------------------------------------
 
