@@ -88,6 +88,28 @@ Full flag list: `--version`, `--from`, `--cosign-bundle`, `--source-url`, `--yes
 
 The `sandbox` system user is created (if not already present); the invoking operator (from `$SUDO_USER`) is added to the `sandbox` group.
 
+### Why a dedicated `sandbox` user
+
+The daemon's binaries live in shared system paths (`/usr/local/bin/sandboxd`, `/usr/local/libexec/sandboxd/sandbox-route-helper`, the gateway image in the host Docker daemon). The dedicated `sandbox` user + system-service shape is what makes those shared binaries safe and sensible. Without it, the alternative is a per-user install — and a per-user install fails for five concrete reasons:
+
+1. **Divergent versions against shared substrate.** Per-user installs put `sandboxd` and the CLI somewhere user-writable, but several artifacts *must* be system-shared regardless: `sandbox-route-helper` needs root to apply file capabilities, `/etc/sandboxd/users.conf` is root-owned for the helper's authorization boundary, `/etc/qemu/bridge.conf` lives in `/etc`, and the gateway image sits in the host's Docker daemon. With per-user daemons, nothing stops operators from installing *different versions* of `sandboxd` while all of them talk to the same shared route-helper and gateway image — exactly the kind of version skew the CLI ↔ daemon strict-equality check (see [`sandbox doctor`](/reference/cli/#sandbox-doctor)) exists to prevent. One canonical install, one daemon, one version.
+2. **No defense-in-depth.** A user service runs the daemon as the operator's own uid. Daemon compromise would still grant access to `$HOME`, `~/.ssh`, browser tokens, dotfiles. The dedicated `sandbox` user closes that gap; a user service does not.
+3. **Linger is real operational cost.** User services require `loginctl enable-linger` to survive logout/reboot. Automatable, but an extra concept to know exists, and a subtle failure mode (*"I rebooted and sandboxd didn't come back — why?"*).
+4. **`journalctl` / `systemctl` friction across users.** With a user service, debugging requires knowing which user runs sandboxd and either `sudo -u <user> -i` or `--machine=<user>@.host`. With a system service, `systemctl status sandboxd` and `journalctl -u sandboxd` just work for anyone with read access.
+5. **Conventional shape.** Server-style daemons (Postgres, Redis, Nginx, Docker) are all system services with a `User=` directive. User services are mostly desktop-session-bound things (gnome-keyring, pipewire). For a daemon that fronts an API and brokers untrusted code execution, a system service matches operator expectations and tooling.
+
+Multi-operator hosts work via `sudo usermod -aG sandbox <user>` — group membership is the install-time gate for socket access (`0660 sandbox:sandbox` at `/run/sandbox/sandboxd.sock`). Per-operator session visibility is enforced inside the daemon at the API layer via an `owner_username` filter, not by filesystem modes.
+
+#### Known limitation — `qemu-bridge-helper` is cross-user
+
+The dedicated-user model isolates operators from each other at the daemon, at the API, and at the `sandbox-route-helper` (which enforces a per-user pair-membership check against `users.conf`). It does **not** isolate operators at QEMU's own `qemu-bridge-helper`: that binary is setuid-root, ships with QEMU, and by design implements no per-caller authorization. Any local user with shell access can invoke it directly and create or modify bridges in the `sb-*` namespace that sandboxd manages, potentially interfering with other operators' sandboxes.
+
+This is a known limitation, deliberately not mitigated in v1 — see [GitHub issue #8](https://github.com/Koriit/sandboxd/issues/8). The deployment model assumes operators on a multi-tenant host are mutually-trusted members of the `sandbox` group. The fix would require either forking `qemu-bridge-helper` with a sandboxd-aware authorization layer, or bypassing it entirely and pre-creating bridges from a higher-privilege sandboxd component.
+
+#### Dev install opt-out
+
+The dev install (`make setup-dev-env`) deliberately skips this shape: contributors run the daemon as their own user with state under `~/.local/share/sandboxd/`. See [Developer install](#developer-install-make-setup-dev-env) below.
+
 ### Trust chain
 
 The install chain is auditable at every link:

@@ -183,7 +183,7 @@ Net effect is safe.
 
 1. Attach `virtio-balloon-pci` to every Lima session unconditionally
    at boot, with `deflate-on-oom=on` and an initial
-   `stats-polling-interval` of 15 s.
+   `guest-stats-polling-interval` of 15 s.
 2. Ship an in-daemon per-session controller that estimates guest
    slack and drives balloon-inflate/deflate pulses to reclaim it.
 3. Expose a single binary CLI knob (`--balloon=enabled|disabled`)
@@ -228,7 +228,7 @@ the wrapper appends:
 
 ```sh
 EXTRA_ARGS="$EXTRA_ARGS \
-    -device virtio-balloon-pci,id=balloon0,deflate-on-oom=on,stats-polling-interval=15"
+    -device virtio-balloon-pci,id=balloon0,deflate-on-oom=on,guest-stats-polling-interval=15"
 ```
 
 Properties of this addition:
@@ -243,7 +243,7 @@ Properties of this addition:
   OOM-kill fires. Free safety floor; pairs with the controller's
   own `safety_floor_bytes` exit condition but does not depend on
   it.
-- **`stats-polling-interval=15`** — initial value, hardcoded in
+- **`guest-stats-polling-interval=15`** — initial value, hardcoded in
   the wrapper from the `BalloonConfig::Default`
   `idle_stats_interval_secs` field (15). The choice is read once
   at boot and baked into the QEMU command line; updates to
@@ -251,7 +251,7 @@ Properties of this addition:
   without a VM restart. The controller dynamically bumps to
   `cfg.pulse_stats_interval_secs` (default `1`) immediately before
   each pulse and restores `cfg.idle_stats_interval_secs` immediately
-  after, via `qom-set` on the device's `stats-polling-interval`
+  after, via `qom-set` on the device's `guest-stats-polling-interval`
   property. Idle baseline is therefore one virtio-balloon stats
   refresh every 15 s — near-zero overhead.
 - **No explicit `bus=`.** virtio-balloon-pci lands on `pcie.0`
@@ -284,10 +284,10 @@ pub fn balloon_set_actual(&self, target_bytes: u64) -> Result<(), SandboxError>;
 
 /// Returns the most recent guest memory stats reported via
 /// virtio-balloon. Freshness is bounded by the device's current
-/// `stats-polling-interval`.
+/// `guest-stats-polling-interval`.
 pub fn balloon_guest_stats(&self) -> Result<BalloonGuestStats, SandboxError>;
 
-/// Changes the device's `stats-polling-interval` property at
+/// Changes the device's `guest-stats-polling-interval` property at
 /// runtime. The controller bumps to
 /// `cfg.pulse_stats_interval_secs` (default `1`) pre-pulse and
 /// restores `cfg.idle_stats_interval_secs` (default `15`) post-
@@ -299,11 +299,11 @@ QMP commands used internally:
 
 - `balloon` with `{"value": <bytes>}` — drives `actual`.
 - `query-balloon` returning `{"actual": <bytes>}` — real-time, not
-  gated by stats-polling-interval.
+  gated by guest-stats-polling-interval.
 - `qom-get` with `{"path": "/machine/peripheral/balloon0",
   "property": "guest-stats"}` — returns the stats snapshot.
 - `qom-set` with the same path and `"property":
-  "stats-polling-interval"` — runtime polling-interval change.
+  "guest-stats-polling-interval"` — runtime polling-interval change.
 
 The `BalloonGuestStats` struct (new, alongside `QmpClient`):
 
@@ -847,7 +847,7 @@ In `sandbox-core/src/lima.rs`:
 - Extend the existing `QEMU_WRAPPER_SCRIPT` content tests (the
   module already has wrapper-content assertions) to assert the
   rendered script contains
-  `-device virtio-balloon-pci,id=balloon0,deflate-on-oom=on,stats-polling-interval=15`
+  `-device virtio-balloon-pci,id=balloon0,deflate-on-oom=on,guest-stats-polling-interval=15`
   in the always-on `EXTRA_ARGS` section.
 
 In `sandbox-core/src/session.rs`:
@@ -879,7 +879,7 @@ Lima VM and is selected by the `integration` nextest profile
   `safety_margin_bytes`)).
 - `integration_balloon_polling_interval_dynamic` — during a
   pulse, observe via `qom-get` that
-  `stats-polling-interval == 1`; after the pulse, observe it is
+  `guest-stats-polling-interval == 1`; after the pulse, observe it is
   back to `15`.
 - `integration_balloon_abort_on_pressure` — start a guest-side
   memory-stress task that reserves close to (`mem_total −
