@@ -1228,7 +1228,7 @@ main() {
     detect_arch
     detect_tty
 
-    TMPDIR_INSTALL=$(mktemp -d "/tmp/sandbox-install.XXXXXX")
+    TMPDIR_INSTALL=$(mktemp -d "/var/tmp/sandbox-install.XXXXXX")
     trap cleanup_tmpdir EXIT INT TERM HUP
 
     ensure_install_log

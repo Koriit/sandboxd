@@ -23,7 +23,6 @@ flow) is a separate downstream task.
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -32,8 +31,6 @@ import pytest
 
 
 HERE = Path(__file__).resolve().parent
-
-COSIGN_BIN = os.environ.get("COSIGN_BIN", shutil.which("cosign") or "/tmp/cosign")
 
 
 # The stack itself is brought up by the session-scope ``sigstore_stack``
@@ -45,9 +42,9 @@ COSIGN_BIN = os.environ.get("COSIGN_BIN", shutil.which("cosign") or "/tmp/cosign
 
 
 @pytest.fixture(scope="module")
-def stack_with_cosign(sigstore_stack):
-    if not Path(COSIGN_BIN).is_file():
-        pytest.skip(f"cosign binary not found at {COSIGN_BIN}")
+def stack_with_cosign(sigstore_stack, pinned_cosign_binary):
+    if not pinned_cosign_binary.is_file():
+        pytest.skip(f"cosign binary not found at {pinned_cosign_binary}")
     return sigstore_stack
 
 
@@ -59,7 +56,7 @@ def stack_with_cosign(sigstore_stack):
 
 
 @pytest.mark.timeout(180)
-def test_cosign_sign_and_verify_blob_end_to_end(stack_with_cosign, tmp_path):
+def test_cosign_sign_and_verify_blob_end_to_end(stack_with_cosign, pinned_cosign_binary, tmp_path):
     """sign-blob + verify-blob round-trip against the local stack.
 
     Exercises the full chain that install.sh's ``sigstore_verify`` step
@@ -68,6 +65,7 @@ def test_cosign_sign_and_verify_blob_end_to_end(stack_with_cosign, tmp_path):
     the production-shaped subject identity regex.
     """
     stack = stack_with_cosign
+    cosign_bin = str(pinned_cosign_binary)
     venv_python = HERE / ".venv" / "bin" / "python"
     python = str(venv_python) if venv_python.is_file() else sys.executable
 
@@ -91,7 +89,7 @@ def test_cosign_sign_and_verify_blob_end_to_end(stack_with_cosign, tmp_path):
     }
     sign_rc = subprocess.run(
         [
-            COSIGN_BIN, "sign-blob",
+            cosign_bin, "sign-blob",
             "--identity-token", token,
             "--fulcio-url", stack.fulcio_url,
             "--rekor-url", stack.rekor_url,
@@ -117,7 +115,7 @@ def test_cosign_sign_and_verify_blob_end_to_end(stack_with_cosign, tmp_path):
     }
     verify_rc = subprocess.run(
         [
-            COSIGN_BIN, "verify-blob",
+            cosign_bin, "verify-blob",
             "--certificate-identity-regexp",
             r"^https://github\.com/Koriit/sandboxd/\.github/workflows/release\.yml@.*",
             "--certificate-oidc-issuer",
