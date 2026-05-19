@@ -771,11 +771,19 @@ def test_session_isolation_404_on_foreign_id(
     # ``sandbox ps`` must not surface alice's row. Re-using the CLI
     # path because it's the operator-visible surface for the list
     # endpoint.
-    r = vm.shell(
-        f"sudo -u bob env SANDBOX_SOCKET={DAEMON_SOCK} "
-        "/usr/local/bin/sandbox ps",
-        timeout=30,
-    )
+    #
+    # Retry up to 3 times: under heavy host load the daemon occasionally
+    # returns "operation was canceled" for a list request mid-flight.
+    for attempt in range(3):
+        r = vm.shell(
+            f"sudo -u bob env SANDBOX_SOCKET={DAEMON_SOCK} "
+            "/usr/local/bin/sandbox ps",
+            timeout=30,
+        )
+        if r.returncode == 0:
+            break
+        if attempt < 2:
+            time.sleep(2)
     assert r.returncode == 0, (
         f"sandbox ps as bob failed:\nstdout:\n{r.stdout}\nstderr:\n{r.stderr}"
     )
