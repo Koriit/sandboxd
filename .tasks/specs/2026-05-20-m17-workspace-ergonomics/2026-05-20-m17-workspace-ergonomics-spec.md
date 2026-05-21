@@ -410,6 +410,30 @@ and Lima backends both advertise `Local` in their
 `workspace_modes` capability sets (see § Lima Backend, § Container
 Backend).
 
+**Forward-compat: unknown-variant tolerance on the wire.** The wire
+serialisation of `EnumSet<WorkspaceModeKind>` (used by
+`Capabilities::workspace_modes`, list-repr per the `#[enumset(
+serialize_repr = "list")]` attribute above) **silently drops unknown
+variants on deserialisation**. This is the forward-compat convention
+for all `EnumSet`-typed capability fields exposed by the daemon.
+
+Concretely: an older CLI built against a `WorkspaceModeKind` that
+contains only `Shared` and `Clone`, when it receives
+`["shared", "clone", "local"]` from a newer daemon, parses the
+capabilities response successfully and exposes `{ Shared, Clone }`.
+The unknown `"local"` entry is ignored; the response does not fail
+to parse, and no other field on `Capabilities` is affected.
+
+Implementation: either a custom `Deserialize` impl on the wire-side
+wrapper (deserialising into `Vec<String>` first and filtering against
+the known variants), or `#[serde(other)]` on a sentinel variant. The
+choice is left to the implementer; the behavioural requirement is
+"unknown variant on the wire → silently dropped, capability set
+parse succeeds, the rest of the `Capabilities` response is unchanged".
+
+This convention also extends to any other `EnumSet`-typed field that
+may be added to `Capabilities` in future milestones.
+
 ## Parser
 
 `WorkspaceMode::parse_flag` becomes the single entry point for the
@@ -1224,9 +1248,58 @@ renderer expands into a multi-line block per workspace.
 
 ### Wire surface
 
-`SessionConfigDto.workspace_mode` stays a single rendered string for
-back-compat (existing JSON consumers expect a flat string). The
-renderer extends to:
+`SessionConfigDto` grows a new optional field
+`workspace_mode_detail: Option<WorkspaceModeDetailDto>` carrying the
+structured workspace fields. The legacy `workspace_mode: Option<String>`
+flat-string field is **retained** for back-compat with existing JSON
+consumers; the daemon populates both fields from the same in-memory
+`WorkspaceMode`. New consumers (including the in-tree CLI) read
+`workspace_mode_detail` and ignore the flat string; old consumers
+keep working unchanged.
+
+The new DTO type is **explicit** — per the
+`feedback_api_dto_separation` memory note ("API responses must be
+explicit DTOs, not flattened domain structs"), the wire shape is a
+purpose-built DTO mirroring (but not equalling) the domain
+`WorkspaceMode`:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WorkspaceModeDetailDto {
+    Shared {
+        host_path: String,
+        guest_path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        security_model: Option<WorkspaceSecurityModelDto>,
+    },
+    Clone {
+        repo_url: String,
+    },
+    Local {
+        host_path: String,
+        guest_path: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkspaceSecurityModelDto {
+    #[serde(rename = "mapped-xattr")]
+    MappedXattr,
+    #[serde(rename = "none")]
+    NoneMapping,
+}
+```
+
+`WorkspaceSecurityModelDto` is a parallel DTO type that mirrors
+`WorkspaceSecurityModel`'s wire form (`mapped-xattr` / `none`) but
+lives on the API surface in `sandbox-core/src/api/dto.rs`, separate
+from the domain enum in `sandbox-core/src/session.rs`. The two are
+kept in lock-step by the mapper; the duplication is the cost of the
+DTO-vs-domain split required by the memory note.
+
+The flat `workspace_mode` string field continues to render as
+before:
 
 - `shared:<host_path>` — default guest path, no security-model
   override (`security_model = None`).
@@ -1252,16 +1325,34 @@ is faithful to the wire-rendered string in both directions. An
 output string round-trips through `parse_flag` to the same
 `WorkspaceMode`.
 
+Cross-version skew on the wire surface:
+
+- **Older client, newer daemon.** The unknown `workspace_mode_detail`
+  field is ignored cleanly (serde's default behaviour for unknown
+  fields on a `Deserialize`-derived struct). The client continues to
+  read the flat `workspace_mode` string as today.
+- **Newer client, older daemon.** The new client sees
+  `workspace_mode_detail = None` and falls back to printing the flat
+  `workspace_mode` string verbatim — matching today's CLI behaviour.
+
 ### `sandbox describe` rendering
 
-The CLI renders the `Workspace:` block from
-`SessionConfigDto.workspace_mode` (the rendered string). It re-runs
-`WorkspaceMode::parse_flag` against the string to recover the
-structured fields and then formats them. Round-trip safety (§ Wire
-surface above) means this never fails on a string produced by the
-daemon. Parse failure (which would indicate a daemon/CLI version
-skew) renders as `Workspace: <unparseable: ...>` and the rest of the
-describe output is unaffected.
+The CLI renders the `Workspace:` block by reading
+`SessionConfigDto.workspace_mode_detail` directly. No re-parsing on
+the CLI side, no `parse_flag` call on the display path: the
+structured fields arrive structured, the renderer formats them.
+This avoids the host-path-existence-check failure that re-parsing
+would impose when the CLI runs on a different machine from the
+daemon (e.g. host paths recorded by the daemon that do not exist on
+the operator's laptop), and removes a parser dependency from the
+display code.
+
+If `workspace_mode_detail` is absent (an older daemon talking to a
+newer CLI), the CLI falls back to printing the flat-string
+`workspace_mode` verbatim on the single-line form
+(`Workspace:   shared:/home/user/proj`), matching today's behaviour.
+The multi-line block format only renders when the structured detail
+is available.
 
 The `Config:` block in `render_describe_one` currently has:
 
@@ -1467,8 +1558,16 @@ rely on.
 `sandbox-cli/src/main.rs` (describe rendering):
 
 - Expand existing `render_describe_one` tests with golden-form
-  outputs for each `WorkspaceMode` variant. Byte-for-byte assertion
-  on the `Workspace:` block.
+  outputs for each `WorkspaceMode` variant, rendered from
+  `SessionConfigDto.workspace_mode_detail`. Byte-for-byte assertion
+  on the `Workspace:` block for shared (with and without explicit
+  guest/security tokens), clone, local, and the no-workspace case.
+- Older-daemon fallback: construct a `SessionConfigDto` with
+  `workspace_mode = Some("shared:/home/user/proj")` and
+  `workspace_mode_detail = None` (simulating a newer CLI talking to
+  an older daemon); assert the rendered output is the historical
+  single-line `Workspace:   shared:/home/user/proj` form, not the
+  new multi-line block.
 
 ### Integration tests (named `integration_*`, run under
 `make test-integration`)
@@ -1727,6 +1826,52 @@ without them.
   security_model }` shape per § Domain types.
 - `WorkspaceMode::parse_flag` extended to handle the
   `shared:<host>[:<guest>][:<model>]` grammar per § Parser.
+- Replace the hand-rolled CLI-side `--workspace` validation in
+  `sandbox-cli/src/main.rs` (currently the `strip_prefix("shared:")`
+  + `Path::exists()` block in the `Create` arm, around lines
+  815-835 as a hint) with a call to `WorkspaceMode::parse_flag(...)`
+  so the new grammar (`shared:<host>[:<guest>][:<model>]`,
+  `local:<host>[:<guest>]`) is accepted on both sides without
+  divergence. The `local:` mode token is accepted at parse time in
+  S1 but the resulting `WorkspaceMode::Local` value is rejected by
+  the existing `SessionSpec::validate(&caps)` capability check
+  until S2 advertises `Local` in `Capabilities::workspace_modes`
+  for the relevant backend. Operators on S1 see a clear "backend
+  does not support local workspaces" message rather than a
+  CLI-side "unknown mode" error.
+- Update the clap doc string for `--workspace` (around lines 99-104
+  as a hint) to describe the new grammar accurately. The current
+  text — "mounts a host directory into the VM at
+  /home/agent/workspace via 9p" — is outdated on two counts (it
+  omits `local:`, and the default guest path is no longer
+  `/home/agent/workspace`). New text covers all three modes, both
+  optional tokens for `shared:`, and the
+  `guest_path = host_path` default.
+- DTO/mapper updates per § `sandbox describe` → Wire surface:
+  - Add `workspace_mode_detail: Option<WorkspaceModeDetailDto>` to
+    `SessionConfigDto` in `sandbox-core/src/api/dto.rs` (with
+    `#[serde(skip_serializing_if = "Option::is_none")]` for the
+    older-client back-compat path).
+  - Add the `WorkspaceModeDetailDto` and `WorkspaceSecurityModelDto`
+    types in the same file per the DTO shape in § Wire surface.
+  - Update `sandbox-core/src/api/mapper.rs` to populate
+    `workspace_mode_detail` from the in-memory `WorkspaceMode`
+    alongside the existing `render_workspace_mode` flat-string
+    population.
+  - Update the `SessionMountInfo.workspace_path` docstring in the
+    same file to reflect the new semantics: the value is now
+    `guest_path` from `WorkspaceMode::Shared`, defaulting to
+    `host_path` (no longer the historical hardcoded
+    `/home/agent/workspace/`).
+  - Update `sandbox-core/src/api/mapper.rs` to populate
+    `SessionMountInfo.workspace_path` from the resolved
+    `guest_path` rather than the hardcoded constant.
+- `EnumSet<WorkspaceModeKind>` unknown-variant tolerance on the
+  wire per § Domain types ("Forward-compat: unknown-variant
+  tolerance on the wire"). The tolerance applies as soon as
+  `Capabilities` carries any newly-introduced variant, so it
+  lands in S1 even though `Local` itself is not yet advertised by
+  any backend until S2.
 - Custom deserialiser shim per § Backward Compatibility (handles
   legacy `Shared` records without `guest_path`).
 - Match-site fan-out: every destructure of
@@ -1740,7 +1885,10 @@ without them.
   2026-05-14 spec.
 - `sandbox describe` rendering updated to the new
   `Workspace:` block format per § `sandbox describe` (shared and
-  clone variants only — local lands in S2).
+  clone variants only — local lands in S2). The CLI consumes the
+  new `workspace_mode_detail` DTO field directly (no re-parsing
+  via `parse_flag`); the older-daemon fallback prints the flat
+  `workspace_mode` string verbatim.
 - Unit tests enumerated in § Tests (parser, backward-compat,
   template, container argv, describe — shared subset).
 - Docs updates for the shared layer:
