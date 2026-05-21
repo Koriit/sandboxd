@@ -233,6 +233,18 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         rsync_args: Vec<String>,
     },
+    /// Push, pull, or unlock the `local:` workspace for a sandbox session.
+    ///
+    /// Operator-driven counterpart to the create-time initial-push rsync:
+    /// `push` mirrors the host workspace into the guest, `pull` mirrors
+    /// the guest workspace back to the host, and `unlock` clears a stuck
+    /// workspace lock (orphan-lock recovery). All three operations
+    /// require the session to be in `local:` workspace mode; push/pull
+    /// additionally require the session to be `Running`.
+    Workspace {
+        #[command(subcommand)]
+        action: WorkspaceAction,
+    },
     /// Open an interactive SSH session (or run a command) in a sandbox.
     Ssh {
         /// Session name or ID.
@@ -609,6 +621,89 @@ enum PresetAction {
     Expand {
         /// Raw invocation string, e.g. `github-repo:repo=foo/bar`.
         raw: String,
+    },
+}
+
+/// `sandbox workspace` subcommands.
+///
+/// Push and pull mirror the `local:` workspace tree between host and
+/// guest via rsync. Unlock clears a stuck workspace lock (orphan-lock
+/// recovery). The push/pull surface is intentionally narrow: no
+/// trailing pass-through args (unlike `sandbox sync`), one of
+/// `-f`/`-n` is required, and the daemon-side workspace-lock serialises
+/// concurrent invocations on the same session.
+#[derive(Subcommand, Debug, Clone)]
+enum WorkspaceAction {
+    /// Push the host `local:` workspace into the guest.
+    ///
+    /// Mirrors the host `host_path` recorded on the session into the
+    /// guest workspace via rsync; deletions on the host are mirrored
+    /// into the guest (the `--delete` behavior is the contract — use
+    /// `-n` to inspect first).
+    Push {
+        /// Session name or ID.
+        session: String,
+        /// Required to perform the destructive mirror operation.
+        /// Mutually exclusive with `-n`/`--dry-run`.
+        #[arg(short = 'f', long = "force", conflicts_with = "dry_run")]
+        force: bool,
+        /// Show what would change without modifying the guest.
+        /// Mutually exclusive with `-f`/`--force`.
+        #[arg(short = 'n', long = "dry-run", conflicts_with = "force")]
+        dry_run: bool,
+        /// Preserve in-tree symlinks; skip out-of-tree symlinks.
+        /// Default is to follow all symlinks (`-L`).
+        #[arg(long = "safe-links")]
+        safe_links: bool,
+        /// Skip the `.gitignore` filter; transfer everything.
+        #[arg(long = "no-gitignore")]
+        no_gitignore: bool,
+    },
+    /// Pull the guest `local:` workspace back to the host.
+    ///
+    /// Mirrors the guest workspace into the host destination via rsync;
+    /// deletions in the guest are mirrored into the host destination
+    /// (the `--delete` behavior is the contract — use `-n` to inspect
+    /// first).
+    Pull {
+        /// Session name or ID.
+        session: String,
+        /// Required to perform the destructive mirror operation.
+        /// Mutually exclusive with `-n`/`--dry-run`.
+        #[arg(short = 'f', long = "force", conflicts_with = "dry_run")]
+        force: bool,
+        /// Show what would change without modifying the host.
+        /// Mutually exclusive with `-f`/`--force`.
+        #[arg(short = 'n', long = "dry-run", conflicts_with = "force")]
+        dry_run: bool,
+        /// Preserve in-tree symlinks; skip out-of-tree symlinks.
+        /// Default is to follow all symlinks (`-L`).
+        #[arg(long = "safe-links")]
+        safe_links: bool,
+        /// Skip the `.gitignore` filter; transfer everything.
+        #[arg(long = "no-gitignore")]
+        no_gitignore: bool,
+        /// Override the host destination path. Default: the
+        /// `host_path` recorded on the session at create time.
+        #[arg(long)]
+        dest: Option<String>,
+    },
+    /// Clear a stuck workspace lock on a session.
+    ///
+    /// Without `--force`, the request is sent with an empty (sentinel)
+    /// token — the daemon adjudicates the wrong-token mismatch and
+    /// returns 409 if the lock is currently held by a different
+    /// caller. With `--force`, the daemon releases the lock
+    /// unconditionally (orphan-lock recovery after a SIGKILL'd CLI).
+    /// Idempotent on an already-unlocked session: returns success.
+    Unlock {
+        /// Session name or ID.
+        session: String,
+        /// Bypass the token-match check; release the lock
+        /// unconditionally. Use this when the lock is orphaned (a
+        /// previous CLI was SIGKILL'd before it could release).
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -1249,6 +1344,7 @@ fn build_request(command: &Command) -> Option<Request<String>> {
         | Command::Logs { .. }
         | Command::Cp { .. }
         | Command::Sync { .. }
+        | Command::Workspace { .. }
         | Command::Inspect { .. }
         | Command::Describe { .. }
         | Command::Events { .. } => return None,
@@ -1752,13 +1848,14 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
         | Command::Logs { .. }
         | Command::Cp { .. }
         | Command::Sync { .. }
+        | Command::Workspace { .. }
         | Command::Inspect { .. }
         | Command::Describe { .. }
         | Command::Events { .. } => {
             // These commands are handled separately and never call
             // handle_response. Reaching here indicates a dispatch bug.
             unreachable!(
-                "ssh/logs/cp/sync/inspect/describe/events commands should be handled before send_request"
+                "ssh/logs/cp/sync/workspace/inspect/describe/events commands should be handled before send_request"
             );
         }
         Command::Version | Command::Doctor { .. } => {
@@ -4337,6 +4434,908 @@ async fn handle_sync(socket_path: &str, src: &str, dst: &str, rsync_args: &[Stri
     }
 }
 
+/// Direction of a `sandbox workspace` rsync mirror.
+///
+/// Carried into [`plan_workspace_sync_argv`] so the planner emits the
+/// correct src/dst ordering for whichever direction the operator picked.
+/// Push: host → guest. Pull: guest → host. The variant is a flat enum
+/// rather than a bool so future directions (e.g. a bidirectional
+/// `sync`) can be added without re-spelling existing call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceSyncDirection {
+    Push,
+    Pull,
+}
+
+/// Operator-supplied inputs for [`plan_workspace_sync_argv`].
+///
+/// Aggregating the inputs into a struct (vs. a long positional argument
+/// list) makes the planner call sites self-documenting and lets new
+/// flags slot in without churning every test fixture.
+///
+/// **Field semantics.**
+///
+/// - `direction` — push vs pull. Drives the src/dst ordering and the
+///   `sandbox-<id>:<guest>/` token's position.
+/// - `backend` — picks the rsync shell-transport (`-e <shell>`) value:
+///   `"limactl shell"` for Lima, `"docker exec -i"` for container.
+///   Mirrors the convention `plan_sync_command` and
+///   `sandbox_core::workspace_rsync::run_initial_push` use.
+/// - `session_id` — string form of the canonical [`sandbox_core::SessionId`]
+///   (carried as `String` so the planner stays decoupled from the
+///   `SessionId` newtype; the call site formats `id.to_string()` once).
+///   Concatenated into the `sandbox-<id>:<path>/` remote spec.
+/// - `host_path` — the host-side root of the workspace. Trailing slash
+///   is appended by the planner if absent (spec § Trailing-slash rule).
+/// - `guest_path` — the guest-side root of the workspace. Same trailing-
+///   slash rule as `host_path`.
+/// - `dest_override` (pull only) — operator-supplied override of the
+///   host destination via `--dest <path>`. When `Some(p)`, replaces
+///   `host_path` in the dst position for the pull direction. The CLI
+///   handler is responsible for resolving any `~` and the
+///   existing-file rejection before constructing the plan; the planner
+///   takes the resolved string verbatim.
+/// - `force` / `dry_run` — operator's `-f` / `-n` choice. Exactly one
+///   must be set; otherwise the planner returns a usage error string.
+/// - `safe_links` — when `true`, `-L` is replaced by `-a --safe-links`
+///   (the archive flag `-a` is split out so the resulting argv has a
+///   distinct `-a` token followed by `--safe-links`, matching the
+///   spec's documented Push/pull commands argv layout).
+/// - `no_gitignore` — when `true`, the `--filter=:- .gitignore` token is
+///   omitted entirely from the argv.
+#[derive(Debug, Clone)]
+struct WorkspaceSyncPlan {
+    direction: WorkspaceSyncDirection,
+    backend: sandbox_core::BackendKind,
+    session_id: String,
+    host_path: String,
+    guest_path: String,
+    dest_override: Option<String>,
+    force: bool,
+    dry_run: bool,
+    safe_links: bool,
+    no_gitignore: bool,
+}
+
+/// Pure planner that builds the rsync argv for `sandbox workspace
+/// push|pull`. Sibling of [`plan_sync_command`] and the daemon-side
+/// `sandbox_core::workspace_rsync::run_initial_push` builder; the three
+/// share the rsync wire shape so a single audit covers all three call
+/// paths.
+///
+/// **Argv layout.** Per spec § Push/pull commands → Argv layout:
+///
+/// ```text
+/// rsync -aL --delete --filter=':- .gitignore' \
+///   -e <shell> [--dry-run] <src> <dst>
+/// ```
+///
+/// - `-L` ↔ `--safe-links` toggle: with `safe_links == false` the argv
+///   carries the combined `-aL` token (archive + dereference all
+///   symlinks). With `safe_links == true` the argv carries the split
+///   `-a --safe-links` pair: archive on its own, plus rsync's
+///   `--safe-links` (in-tree symlinks preserved; out-of-tree symlinks
+///   skipped).
+/// - `--filter=':- .gitignore'` drops when `no_gitignore == true`.
+/// - `--dry-run` appends when `dry_run == true`.
+/// - `<src>`/`<dst>` always carry a trailing `/`. Push: `<src>` is the
+///   host path, `<dst>` is `sandbox-<session>:<guest_path>/`. Pull:
+///   the order is swapped, and `dest_override` (if set) replaces the
+///   host path in the `<dst>` position.
+///
+/// **Usage errors (returned as `Err(String)`).**
+///
+/// - Both `force` and `dry_run` set → "`-f`/`--force` and `-n`/`--dry-run` are mutually exclusive".
+/// - Neither `force` nor `dry_run` set → "one of `-f`/`--force` or `-n`/`--dry-run` is required".
+///
+/// The CLI dispatcher relies on `clap`'s `conflicts_with` to surface
+/// the both-set case before reaching the planner, but the planner
+/// re-checks anyway so the pure function is safe to call from any
+/// future call site that doesn't go through `clap`.
+///
+/// The returned `Vec<String>` includes `"rsync"` as `argv[0]` — callers
+/// pass `argv[1..]` to `std::process::Command::new("rsync").args(...)`.
+fn plan_workspace_sync_argv(plan: &WorkspaceSyncPlan) -> Result<Vec<String>, String> {
+    // Exactly one of `force` / `dry_run` must be set. `clap`'s
+    // `conflicts_with` on `WorkspaceAction::Push`/`Pull` already
+    // catches the both-set case during argv parsing; this re-check is
+    // belt-and-braces so non-CLI callers (and unit tests) get a
+    // uniform error vocabulary.
+    match (plan.force, plan.dry_run) {
+        (false, false) => {
+            return Err("one of `-f`/`--force` or `-n`/`--dry-run` is required".to_string());
+        }
+        (true, true) => {
+            return Err("`-f`/`--force` and `-n`/`--dry-run` are mutually exclusive".to_string());
+        }
+        _ => {}
+    }
+
+    // Shell-transport: `-e <transport>` slots in as rsync's remote-shell
+    // exec. Matches `plan_sync_command` and `workspace_rsync::build_argv`
+    // verbatim so all three rsync paths share the same `<shell>` token
+    // per backend.
+    let shell = match plan.backend {
+        sandbox_core::BackendKind::Lima => "limactl shell",
+        sandbox_core::BackendKind::Container => "docker exec -i",
+    };
+
+    // Trailing-slash rule (spec § Trailing-slash rule): every endpoint
+    // carries `/` so rsync mirrors the *contents* of the directory,
+    // not the directory entry itself. We append only when absent so
+    // operator-supplied paths that already end in `/` are not doubled.
+    let with_slash = |p: &str| {
+        if p.ends_with('/') {
+            p.to_string()
+        } else {
+            format!("{p}/")
+        }
+    };
+
+    let session_name = format!("sandbox-{}", plan.session_id);
+    let remote = format!("{session_name}:{}", with_slash(&plan.guest_path));
+
+    // For pull, `dest_override` replaces the host_path in the dst
+    // position. The CLI handler is responsible for resolving `~` and
+    // rejecting existing-file destinations before constructing the
+    // plan — the planner is path-agnostic and takes whatever string
+    // the call site supplies. Trailing-slash normalisation applies
+    // uniformly to the override and the default.
+    let host_arg = match (plan.direction, plan.dest_override.as_deref()) {
+        (WorkspaceSyncDirection::Pull, Some(dest)) => with_slash(dest),
+        _ => with_slash(&plan.host_path),
+    };
+
+    let (src, dst) = match plan.direction {
+        WorkspaceSyncDirection::Push => (host_arg, remote),
+        WorkspaceSyncDirection::Pull => (remote, host_arg),
+    };
+
+    // argv[0] is the program name itself. Returning it inside the
+    // vector (rather than as a `(program, args)` tuple) matches the
+    // shape the spec § Unit tests block asserts on (the test
+    // fixtures compare against `["rsync", "-aL", "--delete", ...]`).
+    let mut argv: Vec<String> = Vec::with_capacity(10);
+    argv.push("rsync".to_string());
+
+    // Symlink-handling flag: default `-aL` (archive + dereference all),
+    // or split `-a --safe-links` when the operator opts into safe-link
+    // semantics. The split is load-bearing: rsync's `--safe-links`
+    // does *not* compose with `-L`, so the single `-aL` cannot be
+    // augmented — the planner must drop `-L` entirely.
+    if plan.safe_links {
+        argv.push("-a".to_string());
+        argv.push("--safe-links".to_string());
+    } else {
+        argv.push("-aL".to_string());
+    }
+    argv.push("--delete".to_string());
+    if !plan.no_gitignore {
+        // Per-directory merge of `.gitignore` files; matched entries
+        // are excluded from both transfer and deletion consideration.
+        // See spec § Filter source asymmetry: the filter reads the
+        // .gitignore on whichever side is the rsync source.
+        argv.push("--filter=:- .gitignore".to_string());
+    }
+    argv.push("-e".to_string());
+    argv.push(shell.to_string());
+    if plan.dry_run {
+        // `--dry-run` is placed after `-e <shell>` and before the
+        // src/dst operands. rsync accepts it anywhere among the
+        // options, but pinning a stable position keeps the argv test
+        // fixtures readable.
+        argv.push("--dry-run".to_string());
+    }
+    argv.push(src);
+    argv.push(dst);
+
+    Ok(argv)
+}
+
+/// Expand a leading `~` in a `--dest` value against the CLI process's
+/// `$HOME`. Mirrors the rule applied to `--workspace`'s host path at
+/// session create time: the daemon never sees a `~` (it runs with a
+/// different `$HOME`), so the CLI resolves the substitution before
+/// constructing the rsync argv.
+///
+/// `~` alone resolves to `$HOME`; `~/suffix` resolves to `$HOME/suffix`.
+/// `~user` is rejected (not supported here — the host_path parser at
+/// create time also rejects it). Inputs that don't start with `~` pass
+/// through verbatim.
+///
+/// Returns an operator-facing error string on `$HOME` lookup failure or
+/// `~user` form; the caller pairs it with `eprintln!("Error: {e}")` +
+/// `process::exit(...)`.
+fn expand_dest_tilde(dest: &str) -> Result<String, String> {
+    let trimmed = dest.trim_start();
+    if !trimmed.starts_with('~') {
+        return Ok(dest.to_string());
+    }
+    let home = std::env::var("HOME").map_err(|_| {
+        format!(
+            "--dest starts with `~` but $HOME is not set; \
+             pass an absolute path instead (got: {dest:?})"
+        )
+    })?;
+    if home.is_empty() {
+        return Err(format!(
+            "--dest starts with `~` but $HOME is empty; \
+             pass an absolute path instead (got: {dest:?})"
+        ));
+    }
+    if trimmed == "~" {
+        Ok(home)
+    } else if let Some(suffix) = trimmed.strip_prefix("~/") {
+        Ok(format!("{home}/{suffix}"))
+    } else {
+        // `~user` form — not supported.
+        Err(format!(
+            "--dest `~user` form is not supported; pass an absolute path instead (got: {dest:?})"
+        ))
+    }
+}
+
+/// Fetch the session DTO via `GET /sessions/{session}`. Shared between
+/// the three `sandbox workspace` handlers so they have a single place
+/// where the lookup error vocabulary is shaped. On any non-2xx response
+/// or transport failure, the helper prints the daemon's error message
+/// (or a transport-level diagnostic) to stderr and `process::exit(1)`s
+/// — there is no return path for the failure case, matching the
+/// pattern `handle_cp` / `handle_sync` use.
+async fn fetch_session_dto(socket_path: &str, session: &str) -> SessionDto {
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/sessions/{session}"))
+        .body(String::new())
+        .expect("failed to build request");
+
+    let (status, body) = match send_request(socket_path, req).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{e}");
+            process::exit(1);
+        }
+    };
+
+    if !status.is_success() {
+        if let Ok(api_err) = serde_json::from_str::<sandbox_core::ApiError>(&body) {
+            eprintln!("Error: {}", api_err.error);
+        } else {
+            eprintln!("Error ({status}): {body}");
+        }
+        process::exit(1);
+    }
+
+    match serde_json::from_str(&body) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to parse session response: {e}");
+            process::exit(1);
+        }
+    }
+}
+
+/// Resolve a session's `local:` workspace paths from the DTO. Returns
+/// `(host_path, guest_path)` if the session is in `local:` mode;
+/// otherwise prints the spec-mandated mode-mismatch error and exits 2
+/// (clap's misuse convention).
+///
+/// The error wording — `"sandbox workspace push/pull only applies to
+/// local: workspaces; this session uses <mode>"` — comes from spec
+/// § Push/pull commands → Errors. The `<mode>` token is `shared`,
+/// `clone`, or `<empty>` when `workspace_mode_detail` is absent.
+fn require_local_workspace(session: &SessionDto) -> (String, String) {
+    use sandbox_core::WorkspaceModeDetailDto;
+    match &session.config.workspace_mode_detail {
+        Some(WorkspaceModeDetailDto::Local {
+            host_path,
+            guest_path,
+        }) => (host_path.clone(), guest_path.clone()),
+        Some(WorkspaceModeDetailDto::Shared { .. }) => {
+            eprintln!(
+                "Error: sandbox workspace push/pull only applies to local: \
+                 workspaces; this session uses shared:"
+            );
+            process::exit(2);
+        }
+        Some(WorkspaceModeDetailDto::Clone { .. }) => {
+            eprintln!(
+                "Error: sandbox workspace push/pull only applies to local: \
+                 workspaces; this session uses clone:"
+            );
+            process::exit(2);
+        }
+        None => {
+            eprintln!(
+                "Error: sandbox workspace push/pull only applies to local: \
+                 workspaces; this session uses <empty>:"
+            );
+            process::exit(2);
+        }
+    }
+}
+
+/// Verify a session is in `SessionState::Running`. Push and pull both
+/// require the shell transport (`limactl shell` / `docker exec -i`),
+/// which is only viable for running sessions. Stopped/Creating/Error
+/// sessions fail fast here so the daemon-side lock acquire isn't
+/// even attempted.
+///
+/// Exit code 1 mirrors the spec § Push/pull commands → Errors line
+/// "Session not running → exit code 1".
+fn require_running_session(session: &SessionDto) {
+    use sandbox_core::session::SessionState;
+    if session.state != SessionState::Running {
+        let display_name = session
+            .name
+            .as_deref()
+            .unwrap_or_else(|| session.id.as_ref());
+        eprintln!(
+            "Error: session {display_name} is not running (state: {}); start it first",
+            session.state
+        );
+        process::exit(1);
+    }
+}
+
+/// Acquire the daemon-side workspace lock via
+/// `POST /sessions/<id>/workspace-lock`. Returns the granted
+/// `lock_token` on success; on 4xx (notably 409 Conflict on a held
+/// lock, 400 on a non-Running session) prints the daemon's error
+/// verbatim and exits 1.
+///
+/// The lock acquire is the *atomic* state-gate: between this call and
+/// the matching release, the daemon refuses competing acquires and
+/// also refuses `stop`/`rm` on the same session. See spec § Workspace
+/// lock → Lifecycle interaction.
+async fn acquire_workspace_lock(
+    socket_path: &str,
+    session: &str,
+    op: sandbox_core::WorkspaceOpDto,
+) -> String {
+    let body = serde_json::to_string(&sandbox_core::WorkspaceLockAcquireRequest { op })
+        .expect("acquire request always serialises");
+    let req = Request::builder()
+        .method("POST")
+        .uri(format!("/sessions/{session}/workspace-lock"))
+        .header("content-type", "application/json")
+        .body(body)
+        .expect("failed to build acquire request");
+
+    let (status, resp_body) = match send_request(socket_path, req).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("{e}");
+            process::exit(1);
+        }
+    };
+
+    if !status.is_success() {
+        if let Ok(api_err) = serde_json::from_str::<sandbox_core::ApiError>(&resp_body) {
+            eprintln!("Error: {}", api_err.error);
+        } else {
+            eprintln!("Error ({status}): {resp_body}");
+        }
+        process::exit(1);
+    }
+
+    let parsed: sandbox_core::WorkspaceLockAcquireResponse = match serde_json::from_str(&resp_body)
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Failed to parse workspace-lock response: {e}");
+            process::exit(1);
+        }
+    };
+    parsed.lock_token
+}
+
+/// Release the daemon-side workspace lock via
+/// `DELETE /sessions/<id>/workspace-lock`. Best-effort: release
+/// failures log to stderr but do not modify the caller's intended
+/// exit code (typically rsync's). The daemon treats an already-
+/// unlocked session as a no-op 200 (idempotent DELETE semantics per
+/// spec § API endpoints).
+///
+/// `force` is the operator's `--force` opt-in: with `force == true`,
+/// the daemon bypasses the token-match check. The CLI release on the
+/// happy path of push/pull passes `force == false` (strict-match);
+/// `sandbox workspace unlock --force` is the one call site that
+/// passes `force == true`.
+async fn release_workspace_lock(
+    socket_path: &str,
+    session: &str,
+    lock_token: &str,
+    force: bool,
+) -> (hyper::StatusCode, String) {
+    let body = serde_json::to_string(&sandbox_core::WorkspaceLockReleaseRequest {
+        lock_token: lock_token.to_string(),
+        force,
+    })
+    .expect("release request always serialises");
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/sessions/{session}/workspace-lock"))
+        .header("content-type", "application/json")
+        .body(body)
+        .expect("failed to build release request");
+
+    match send_request(socket_path, req).await {
+        Ok(r) => r,
+        Err(e) => {
+            // Transport-level failure (socket disappeared, timeout).
+            // The caller in push/pull logs but proceeds; surface a
+            // synthetic status so the caller's branching is uniform.
+            (hyper::StatusCode::INTERNAL_SERVER_ERROR, e)
+        }
+    }
+}
+
+/// Exit code used when a `sandbox workspace push|pull` rsync child is
+/// interrupted by SIGINT. The Unix convention for a signal-terminated
+/// process is `128 + signo`; SIGINT is 2 → 130. Matches the existing
+/// [`EVENTS_SIGINT_EXIT_CODE`] for `sandbox events`.
+const WORKSPACE_SIGINT_EXIT_CODE: i32 = 130;
+
+/// Exit code used when the rsync child is interrupted by SIGTERM.
+/// Same `128 + signo` convention as above; SIGTERM is 15 → 143.
+#[cfg(unix)]
+const WORKSPACE_SIGTERM_EXIT_CODE: i32 = 143;
+
+/// Run a workspace-lock release request and forward any non-success
+/// status as a `Warning:` line on stderr. This is the
+/// release-failure-must-not-mask-rsync-exit-code contract from the
+/// spec, factored out so the normal-return path, the scopeguard
+/// drop-path, and the signal-handling arm all behave identically.
+async fn release_workspace_lock_best_effort(socket_path: &str, session: &str, lock_token: &str) {
+    let (release_status, release_body) =
+        release_workspace_lock(socket_path, session, lock_token, false).await;
+    if release_status.is_success() {
+        return;
+    }
+    if let Ok(api_err) = serde_json::from_str::<sandbox_core::ApiError>(&release_body) {
+        eprintln!(
+            "Warning: failed to release workspace lock for {session}: {}",
+            api_err.error
+        );
+    } else {
+        eprintln!(
+            "Warning: failed to release workspace lock for {session} \
+             ({release_status}): {release_body}"
+        );
+    }
+}
+
+/// Drive [`release_workspace_lock_best_effort`] from a synchronous
+/// context — specifically, the `Drop` closure of the scopeguard that
+/// covers normal-return + panic-unwind. We can't call `.await` from
+/// `Drop`, and we can't use `tokio::runtime::Handle::current().block_on(...)`
+/// from inside an existing runtime context (tokio forbids re-entry).
+///
+/// Building a fresh `current_thread` runtime is *not* sufficient on
+/// its own: tokio rejects `block_on` from within any existing runtime
+/// context — including the outer `#[tokio::main]` runtime that is
+/// still on this OS thread when the scopeguard fires on the normal
+/// success path. The robust pattern is to dispatch the runtime + the
+/// `block_on` to a brand-new OS thread via `std::thread::spawn`, which
+/// has no tokio context attached, and then `join()` it synchronously
+/// so the drop scope still observes completion before unwinding
+/// proceeds. Failure to construct the runtime — or a panic in the
+/// spawned thread — is logged but does not propagate; the scopeguard
+/// can run during an unwind, where a second panic would abort the
+/// process.
+fn release_workspace_lock_blocking(socket_path: &str, session: &str, lock_token: &str) {
+    // Move owned copies into the spawned thread so it can outlive the
+    // borrow scope of the caller (the scopeguard already captures
+    // owned `String`s, but the helper takes `&str`).
+    let socket = socket_path.to_owned();
+    let session_owned = session.to_owned();
+    let lock_token = lock_token.to_owned();
+    let session_for_log = session_owned.clone();
+    let handle = std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!(
+                    "Warning: failed to release workspace lock for {session_owned}: \
+                     could not build runtime for cleanup ({e})"
+                );
+                return;
+            }
+        };
+        rt.block_on(release_workspace_lock_best_effort(
+            &socket,
+            &session_owned,
+            &lock_token,
+        ));
+    });
+    if let Err(e) = handle.join() {
+        eprintln!(
+            "Warning: failed to release workspace lock for {session_for_log}: \
+             release thread panicked ({e:?})"
+        );
+    }
+}
+
+/// Common push/pull flow factored from [`handle_workspace_push`] and
+/// [`handle_workspace_pull`]. Both follow the same sequence:
+///
+/// 1. Fetch the session DTO.
+/// 2. Verify the session is in `local:` workspace mode.
+/// 3. Verify the session is `Running`.
+/// 4. (Pull only) Resolve `--dest`: `~` expansion, existing-file
+///    rejection, `create_dir_all(dirname)`.
+/// 5. Acquire the daemon-side workspace lock.
+/// 6. Build the rsync argv via [`plan_workspace_sync_argv`].
+/// 7. Spawn rsync as a child future; race it against SIGINT/SIGTERM.
+/// 8. Release the workspace lock (best-effort, on every exit path).
+/// 9. Exit with rsync's exit code (or `128 + signo` on signal).
+///
+/// **Release-on-cancel guarantee.** The acquired lock MUST be released
+/// regardless of how this function exits: normal rsync success, rsync
+/// non-zero, planner usage error, child-spawn failure, panic anywhere
+/// after acquire, SIGINT, or SIGTERM. The guarantee is implemented by
+/// a [`scopeguard::guard`] whose drop closure issues the release —
+/// scopeguard covers normal-return + panic-unwind. The signal arms of
+/// the `tokio::select!` race release inline before exiting with the
+/// conventional `128 + signo` exit code; they then forget the guard so
+/// the cleanup does not double-fire. Release failures degrade to a
+/// stderr warning per spec § Push/pull commands — never masking the
+/// rsync exit code. Operators have `sandbox workspace unlock --force`
+/// as the manual recovery path if the daemon was unreachable.
+#[allow(clippy::too_many_arguments)] // each arg maps to a distinct clap flag
+async fn run_workspace_push_or_pull(
+    socket_path: &str,
+    session_arg: &str,
+    direction: WorkspaceSyncDirection,
+    force: bool,
+    dry_run: bool,
+    safe_links: bool,
+    no_gitignore: bool,
+    dest: Option<String>,
+) {
+    let session = fetch_session_dto(socket_path, session_arg).await;
+    let (host_path, guest_path) = require_local_workspace(&session);
+    require_running_session(&session);
+
+    // `--dest` resolution: only meaningful on pull. The planner
+    // accepts the resolved string verbatim and slots it into the dst
+    // position. Push has no analogue — the host path is fixed at
+    // the session's recorded `host_path`.
+    let dest_override: Option<String> = if matches!(direction, WorkspaceSyncDirection::Pull) {
+        match dest.as_deref() {
+            None => None,
+            Some(raw) => {
+                let expanded = match expand_dest_tilde(raw) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        process::exit(1);
+                    }
+                };
+                // Existing-file rejection: `--dest` must name a
+                // directory (existing or to-be-created), never a
+                // regular file. Spec § CLI shape: `Existing file at
+                // --dest → Rejected with an error before rsync is
+                // spawned`.
+                let dest_path = Path::new(&expanded);
+                if let Ok(meta) = std::fs::metadata(dest_path) {
+                    if meta.is_file() {
+                        eprintln!(
+                            "Error: --dest {expanded} is an existing file; \
+                             expected a directory"
+                        );
+                        process::exit(1);
+                    }
+                }
+                // `create_dir_all(dirname(dest))` lets rsync create
+                // the leaf itself. Spec § CLI shape: "the CLI does
+                // create_dir_all(dirname(<--dest>)) before spawning
+                // rsync; rsync creates the leaf itself."
+                if let Some(parent) = dest_path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            eprintln!(
+                                "Error: failed to create parent of --dest \
+                                 {expanded}: {e}"
+                            );
+                            process::exit(1);
+                        }
+                    }
+                }
+                Some(expanded)
+            }
+        }
+    } else {
+        // Push: ignore `dest` if somehow provided. The clap surface
+        // restricts `--dest` to the Pull variant, but this guard makes
+        // the planner contract explicit.
+        None
+    };
+
+    // Workspace-lock op tag for the acquire request. Push and pull
+    // both lock the same per-session mutex; the op tag only exists so
+    // the conflict response can name the held op accurately.
+    let op = match direction {
+        WorkspaceSyncDirection::Push => sandbox_core::WorkspaceOpDto::Push,
+        WorkspaceSyncDirection::Pull => sandbox_core::WorkspaceOpDto::Pull,
+    };
+
+    let lock_token = acquire_workspace_lock(socket_path, session_arg, op).await;
+
+    // Release-on-cancel guard. From this point on, every exit path —
+    // normal return, planner error, child-spawn error, rsync non-zero,
+    // panic during spawn, SIGINT, SIGTERM — must release the lock. The
+    // scopeguard covers the normal-return + panic-unwind cases; the
+    // signal arms of the `tokio::select!` race release inline and then
+    // `ScopeGuard::into_inner` the guard so the drop is a no-op (we
+    // can't release twice — the daemon would return 409 wrong-token on
+    // the second call). Captured `String`s are owned to keep the guard
+    // `'static` regardless of the surrounding borrow scope.
+    let release_socket = socket_path.to_string();
+    let release_session = session_arg.to_string();
+    let release_token = lock_token.clone();
+    let release_guard = scopeguard::guard((), move |()| {
+        release_workspace_lock_blocking(&release_socket, &release_session, &release_token);
+    });
+
+    // Build the argv. Pure function — usage errors (neither / both of
+    // `-f`/`-n`) are surfaced here. clap's `conflicts_with` already
+    // catches both-set, but neither-set falls through to the planner.
+    let plan = WorkspaceSyncPlan {
+        direction,
+        backend: session.backend,
+        session_id: session.id.to_string(),
+        host_path,
+        guest_path,
+        dest_override,
+        force,
+        dry_run,
+        safe_links,
+        no_gitignore,
+    };
+    let argv = match plan_workspace_sync_argv(&plan) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            // Drop the guard *here* (rather than letting it ride to
+            // the end of the function) so the release flush is awaited
+            // synchronously before we exit. This is identical to
+            // letting scopeguard fire on scope exit, but the explicit
+            // drop makes the ordering reviewable.
+            drop(release_guard);
+            process::exit(2);
+        }
+    };
+
+    // Inherit stdin/stdout/stderr so rsync's progress and error
+    // messages reach the operator verbatim. argv[0] is "rsync" (the
+    // program); argv[1..] is the actual flag list.
+    let program = argv[0].clone();
+    let mut cmd = tokio::process::Command::new(&program);
+    cmd.args(&argv[1..]);
+    // `kill_on_drop` is the belt-and-suspenders companion to the
+    // explicit `child.kill()` in the signal arm: if anything causes
+    // this future to be dropped before `child.wait()` resolves (e.g.
+    // a panic between `spawn()` and the `select!`), the rsync child
+    // is reaped instead of being left as a zombie of the daemon.
+    cmd.kill_on_drop(true);
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: failed to execute {program}: {e}");
+            drop(release_guard);
+            process::exit(1);
+        }
+    };
+
+    // Signal plumbing. `ctrl_c()` covers SIGINT on all platforms
+    // tokio supports; the SIGTERM stream is Unix-only, so it sits
+    // behind a `cfg(unix)` arm. Both signals follow the standard
+    // shell convention of exit code `128 + signo` (130 / 143).
+    //
+    // We deliberately do NOT install handlers for arbitrary other
+    // signals — uncaught SIGKILL still strands the lock, but no
+    // user-space code can intercept SIGKILL; that's the contract the
+    // spec calls out via the `sandbox workspace unlock --force`
+    // operator escape hatch and the daemon-restart auto-clear.
+    let ctrlc = tokio::signal::ctrl_c();
+    tokio::pin!(ctrlc);
+
+    #[cfg(unix)]
+    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+        Ok(s) => Some(s),
+        Err(e) => {
+            // Installing the SIGTERM listener can fail (e.g. on
+            // platforms where the signal-driver isn't usable in
+            // the current runtime). The release guard still
+            // covers the panic + normal-return paths; we lose
+            // only the SIGTERM-explicit exit code, not the lock
+            // release. The lock is reclaimed when the process
+            // dies anyway because daemon-side locks are
+            // in-memory and reset on daemon restart per spec.
+            tracing::warn!(error = %e, "could not install SIGTERM handler");
+            None
+        }
+    };
+
+    enum Outcome {
+        Exited(i32),
+        Interrupted,
+        Terminated,
+    }
+
+    // Future representing "any registered termination signal fired".
+    // On non-Unix platforms only SIGINT is hooked. Returning the same
+    // `Outcome::Interrupted` for the SIGINT arm and `Outcome::Terminated`
+    // for SIGTERM keeps the post-select logic uniform.
+    let outcome = {
+        #[cfg(unix)]
+        {
+            let sigterm_fut = async {
+                match sigterm.as_mut() {
+                    Some(s) => {
+                        s.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                res = child.wait() => match res {
+                    Ok(status) => Outcome::Exited(status.code().unwrap_or(1)),
+                    Err(e) => {
+                        eprintln!("Error: rsync child wait failed: {e}");
+                        Outcome::Exited(1)
+                    }
+                },
+                _ = &mut ctrlc => Outcome::Interrupted,
+                _ = sigterm_fut => Outcome::Terminated,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::select! {
+                res = child.wait() => match res {
+                    Ok(status) => Outcome::Exited(status.code().unwrap_or(1)),
+                    Err(e) => {
+                        eprintln!("Error: rsync child wait failed: {e}");
+                        Outcome::Exited(1)
+                    }
+                },
+                _ = &mut ctrlc => Outcome::Interrupted,
+            }
+        }
+    };
+
+    match outcome {
+        Outcome::Exited(code) => {
+            // Normal path. Dropping `release_guard` here runs the
+            // scopeguard's closure, which spins up a one-shot
+            // runtime and issues the release. Equivalent to letting
+            // the function end, but explicit-drop makes the ordering
+            // obvious: release fires before `process::exit`.
+            drop(release_guard);
+            process::exit(code);
+        }
+        Outcome::Interrupted => {
+            eprintln!("interrupted; killing rsync");
+            // `kill().await` reaps the child; with `kill_on_drop` set
+            // the drop would do this anyway, but the explicit await
+            // gives us the reap *before* we issue the release so the
+            // daemon-side cleanup isn't racing the (now-defunct)
+            // child holding any guest-side resources.
+            let _ = child.kill().await;
+            // Release inline so we can await it; then defuse the
+            // scopeguard so the drop closure doesn't double-release
+            // and trip the daemon's wrong-token check.
+            release_workspace_lock_best_effort(socket_path, session_arg, &lock_token).await;
+            scopeguard::ScopeGuard::into_inner(release_guard);
+            process::exit(WORKSPACE_SIGINT_EXIT_CODE);
+        }
+        Outcome::Terminated => {
+            eprintln!("terminated; killing rsync");
+            let _ = child.kill().await;
+            release_workspace_lock_best_effort(socket_path, session_arg, &lock_token).await;
+            scopeguard::ScopeGuard::into_inner(release_guard);
+            #[cfg(unix)]
+            {
+                process::exit(WORKSPACE_SIGTERM_EXIT_CODE);
+            }
+            // `Outcome::Terminated` is never constructed on non-unix
+            // (no SIGTERM arm in the select!) but the compiler
+            // requires the match to be exhaustive; fall back to a
+            // generic "killed by signal" code if we ever get here.
+            #[cfg(not(unix))]
+            {
+                process::exit(1);
+            }
+        }
+    }
+}
+
+/// Dispatch `sandbox workspace push <session> ...`. See
+/// [`run_workspace_push_or_pull`] for the orchestration shape.
+async fn handle_workspace_push(
+    socket_path: &str,
+    session: &str,
+    force: bool,
+    dry_run: bool,
+    safe_links: bool,
+    no_gitignore: bool,
+) {
+    run_workspace_push_or_pull(
+        socket_path,
+        session,
+        WorkspaceSyncDirection::Push,
+        force,
+        dry_run,
+        safe_links,
+        no_gitignore,
+        None,
+    )
+    .await;
+}
+
+/// Dispatch `sandbox workspace pull <session> [--dest <path>] ...`. See
+/// [`run_workspace_push_or_pull`] for the orchestration shape.
+async fn handle_workspace_pull(
+    socket_path: &str,
+    session: &str,
+    force: bool,
+    dry_run: bool,
+    safe_links: bool,
+    no_gitignore: bool,
+    dest: Option<String>,
+) {
+    run_workspace_push_or_pull(
+        socket_path,
+        session,
+        WorkspaceSyncDirection::Pull,
+        force,
+        dry_run,
+        safe_links,
+        no_gitignore,
+        dest,
+    )
+    .await;
+}
+
+/// Dispatch `sandbox workspace unlock <session> [--force]`. Sends a
+/// release request with an empty (sentinel) `lock_token`. Without
+/// `--force`, the daemon adjudicates the empty token as a wrong-token
+/// mismatch and returns 409 if the lock is currently held — the
+/// operator must `--force` to clear an orphan lock. With `--force`,
+/// the daemon releases unconditionally. The already-unlocked case is
+/// a 200 idempotent no-op per spec § API endpoints → Idempotent on
+/// already-unlocked.
+///
+/// Per spec § Orchestrator decisions Q6: the empty-string lock_token
+/// is the documented sentinel for `unlock` without `--force`; the
+/// daemon's `LockToken::from_str` rejects it as unparseable and
+/// adjudicates as "wrong token".
+async fn handle_workspace_unlock(socket_path: &str, session: &str, force: bool) {
+    let (status, body) = release_workspace_lock(socket_path, session, "", force).await;
+
+    if status.is_success() {
+        println!("workspace lock released");
+        return;
+    }
+
+    // 409 (lock held, wrong token) and other 4xx surface the daemon
+    // error verbatim. The 409 hint string includes the recommended
+    // `--force` workflow, so the operator sees what to try next.
+    if let Ok(api_err) = serde_json::from_str::<sandbox_core::ApiError>(&body) {
+        eprintln!("Error: {}", api_err.error);
+    } else {
+        eprintln!("Error ({status}): {body}");
+    }
+    process::exit(1);
+}
+
 /// Check whether this binary was invoked as `git-remote-sandbox` (i.e. as a
 /// git remote helper).  Returns `true` if `argv[0]` ends with
 /// `git-remote-sandbox`, in which case the caller should enter remote-helper
@@ -5219,6 +6218,56 @@ async fn main() {
     } = &cli.command
     {
         handle_sync(&cli.socket, src, dst, rsync_args).await;
+        return;
+    }
+
+    // Handle workspace push/pull/unlock specially — push/pull resolve
+    // the session, acquire the daemon-side workspace lock, spawn rsync
+    // with stdio inherited, then release the lock. Unlock is a single
+    // DELETE call. None of the three fits the generic single
+    // request/response shape `send_request` provides.
+    if let Command::Workspace { action } = &cli.command {
+        match action {
+            WorkspaceAction::Push {
+                session,
+                force,
+                dry_run,
+                safe_links,
+                no_gitignore,
+            } => {
+                handle_workspace_push(
+                    &cli.socket,
+                    session,
+                    *force,
+                    *dry_run,
+                    *safe_links,
+                    *no_gitignore,
+                )
+                .await;
+            }
+            WorkspaceAction::Pull {
+                session,
+                force,
+                dry_run,
+                safe_links,
+                no_gitignore,
+                dest,
+            } => {
+                handle_workspace_pull(
+                    &cli.socket,
+                    session,
+                    *force,
+                    *dry_run,
+                    *safe_links,
+                    *no_gitignore,
+                    dest.clone(),
+                )
+                .await;
+            }
+            WorkspaceAction::Unlock { session, force } => {
+                handle_workspace_unlock(&cli.socket, session, *force).await;
+            }
+        }
         return;
     }
 
@@ -9646,6 +10695,371 @@ mod tests {
             v as u32,
             sandbox_core::guest::DAEMON_GUEST_PROTO_VERSION,
             "payload must mirror the constant"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // plan_workspace_sync_argv — operator-driven `sandbox workspace
+    // push|pull` argv shape.
+    //
+    // Sibling of `plan_sync_command` and `workspace_rsync::build_argv`.
+    // Pins the rsync wire shape: `-aL` ↔ `-a --safe-links` toggle, the
+    // `--filter=:- .gitignore` drop, `--dry-run` placement, src/dst
+    // swap on push vs pull, and `--dest` override on pull. The
+    // assertions compare against the *full* argv (program + flags) so
+    // a reorder or accidental token drop fails loudly.
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a baseline plan with the given (direction, force,
+    /// dry_run) tuple. Other fields take spec-mandated defaults so the
+    /// per-test override block stays small.
+    fn baseline_workspace_plan(
+        direction: WorkspaceSyncDirection,
+        backend: sandbox_core::BackendKind,
+        force: bool,
+        dry_run: bool,
+    ) -> WorkspaceSyncPlan {
+        WorkspaceSyncPlan {
+            direction,
+            backend,
+            session_id: "abc123".to_string(),
+            host_path: "/host/path".to_string(),
+            guest_path: "/guest/path".to_string(),
+            dest_override: None,
+            force,
+            dry_run,
+            safe_links: false,
+            no_gitignore: false,
+        }
+    }
+
+    /// Push, Lima backend, force-mode, no extras: argv pins the
+    /// canonical baseline shape. The wire layout follows spec §
+    /// Push/pull commands → Argv layout: `rsync -aL --delete
+    /// --filter=':- .gitignore' -e <shell> <src> <dst>`.
+    #[test]
+    fn plan_push_force_lima() {
+        let plan = baseline_workspace_plan(
+            WorkspaceSyncDirection::Push,
+            sandbox_core::BackendKind::Lima,
+            true,  // force
+            false, // dry_run
+        );
+        let argv = plan_workspace_sync_argv(&plan).expect("baseline must plan");
+        assert_eq!(
+            argv,
+            vec![
+                "rsync".to_string(),
+                "-aL".to_string(),
+                "--delete".to_string(),
+                "--filter=:- .gitignore".to_string(),
+                "-e".to_string(),
+                "limactl shell".to_string(),
+                "/host/path/".to_string(),
+                "sandbox-abc123:/guest/path/".to_string(),
+            ]
+        );
+    }
+
+    /// Push, container backend, dry-run mode: the `-e` transport is
+    /// `"docker exec -i"` (no `-t`, per the rsync binary-protocol
+    /// requirement that stdin remain a clean pipe), and `--dry-run`
+    /// is appended after `-e <shell>` and before the src/dst pair.
+    #[test]
+    fn plan_push_dry_run_container() {
+        let plan = baseline_workspace_plan(
+            WorkspaceSyncDirection::Push,
+            sandbox_core::BackendKind::Container,
+            false, // force
+            true,  // dry_run
+        );
+        let argv = plan_workspace_sync_argv(&plan).expect("dry-run must plan");
+        assert!(
+            argv.iter().any(|a| a == "--dry-run"),
+            "--dry-run absent: {argv:?}"
+        );
+        // Sanity-check the `-e` transport pair sits in the right place.
+        let e_idx = argv.iter().position(|a| a == "-e").expect("-e present");
+        assert_eq!(
+            argv.get(e_idx + 1).map(String::as_str),
+            Some("docker exec -i"),
+            "-e shell transport must be 'docker exec -i' on container backend: {argv:?}"
+        );
+    }
+
+    /// `safe_links == true` replaces the combined `-aL` token with the
+    /// split `-a --safe-links` pair. rsync's `--safe-links` does not
+    /// compose with `-L`, so the planner must drop `-L` entirely
+    /// when the operator opts into safe-link semantics.
+    #[test]
+    fn plan_push_safe_links() {
+        let mut plan = baseline_workspace_plan(
+            WorkspaceSyncDirection::Push,
+            sandbox_core::BackendKind::Lima,
+            true,
+            false,
+        );
+        plan.safe_links = true;
+        let argv = plan_workspace_sync_argv(&plan).expect("safe-links must plan");
+        // `-aL` must be absent; `-a` + `--safe-links` must be present
+        // in order, immediately after `rsync`.
+        assert!(
+            !argv.iter().any(|a| a == "-aL"),
+            "-aL must be replaced when safe_links=true: {argv:?}"
+        );
+        assert_eq!(argv.get(1).map(String::as_str), Some("-a"));
+        assert_eq!(argv.get(2).map(String::as_str), Some("--safe-links"));
+    }
+
+    /// `no_gitignore == true` drops the `--filter=:- .gitignore` token
+    /// from the argv entirely. The rest of the shape is unchanged.
+    #[test]
+    fn plan_push_no_gitignore() {
+        let mut plan = baseline_workspace_plan(
+            WorkspaceSyncDirection::Push,
+            sandbox_core::BackendKind::Lima,
+            true,
+            false,
+        );
+        plan.no_gitignore = true;
+        let argv = plan_workspace_sync_argv(&plan).expect("no-gitignore must plan");
+        assert!(
+            argv.iter().all(|a| !a.starts_with("--filter")),
+            "--filter must be absent when no_gitignore=true: {argv:?}"
+        );
+    }
+
+    /// Pull, Lima backend, force-mode: src/dst swap. The remote
+    /// `sandbox-<id>:<guest>/` token now sits in the src position;
+    /// `<host>/` sits in the dst position.
+    #[test]
+    fn plan_pull_force_lima() {
+        let plan = baseline_workspace_plan(
+            WorkspaceSyncDirection::Pull,
+            sandbox_core::BackendKind::Lima,
+            true,
+            false,
+        );
+        let argv = plan_workspace_sync_argv(&plan).expect("pull must plan");
+        assert_eq!(
+            argv,
+            vec![
+                "rsync".to_string(),
+                "-aL".to_string(),
+                "--delete".to_string(),
+                "--filter=:- .gitignore".to_string(),
+                "-e".to_string(),
+                "limactl shell".to_string(),
+                "sandbox-abc123:/guest/path/".to_string(),
+                "/host/path/".to_string(),
+            ]
+        );
+    }
+
+    /// `--dest <path>` (pull only) replaces the host path in the dst
+    /// position. The trailing-slash rule applies to the override
+    /// uniformly with the default host_path.
+    #[test]
+    fn plan_pull_dest_override() {
+        let mut plan = baseline_workspace_plan(
+            WorkspaceSyncDirection::Pull,
+            sandbox_core::BackendKind::Lima,
+            true,
+            false,
+        );
+        plan.dest_override = Some("/custom/dst".to_string());
+        let argv = plan_workspace_sync_argv(&plan).expect("dest override must plan");
+        // dst is the last argv token. /host/path/ must NOT appear in
+        // dst; /custom/dst/ must appear instead.
+        assert_eq!(argv.last().map(String::as_str), Some("/custom/dst/"));
+        // src is the second-to-last token and remains the
+        // sandbox-<id>:<guest>/ remote spec.
+        assert_eq!(
+            argv.iter().rev().nth(1).map(String::as_str),
+            Some("sandbox-abc123:/guest/path/")
+        );
+    }
+
+    /// Neither `-f` nor `-n` set → usage error. The planner enforces
+    /// this even though clap's `conflicts_with` already catches the
+    /// both-set case; the neither-set case is the one clap cannot
+    /// express directly with `conflicts_with` and falls through to
+    /// the planner for adjudication.
+    #[test]
+    fn plan_rejects_neither_force_nor_dry_run() {
+        let plan = baseline_workspace_plan(
+            WorkspaceSyncDirection::Push,
+            sandbox_core::BackendKind::Lima,
+            false, // force
+            false, // dry_run
+        );
+        let err = plan_workspace_sync_argv(&plan).expect_err("must reject neither-set");
+        assert!(
+            err.contains("required"),
+            "neither-set error must mention `required`: {err:?}"
+        );
+    }
+
+    /// Both `-f` and `-n` set → usage error. clap's `conflicts_with`
+    /// normally catches this before the planner runs, but the planner
+    /// re-checks for non-clap callers (unit tests, hand-rolled
+    /// invocations).
+    #[test]
+    fn plan_rejects_both_force_and_dry_run() {
+        let plan = baseline_workspace_plan(
+            WorkspaceSyncDirection::Push,
+            sandbox_core::BackendKind::Lima,
+            true, // force
+            true, // dry_run
+        );
+        let err = plan_workspace_sync_argv(&plan).expect_err("must reject both-set");
+        assert!(
+            err.contains("mutually exclusive"),
+            "both-set error must mention `mutually exclusive`: {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // expand_dest_tilde — CLI-side `~` resolution for `--dest`.
+    // -----------------------------------------------------------------------
+
+    /// No leading `~` → input passes through verbatim. Mirrors the
+    /// `expand_host_tilde_in_workspace_flag` short-circuit on non-`~`
+    /// inputs.
+    #[test]
+    fn expand_dest_tilde_passthrough_when_no_tilde() {
+        let out = expand_dest_tilde("/abs/path").expect("absolute path passes through");
+        assert_eq!(out, "/abs/path");
+    }
+
+    /// Bare `~` expands to `$HOME`. The exact `$HOME` value is whatever
+    /// the test environment carries; this test only asserts the
+    /// expansion happens (no residual `~`) and the result is non-empty.
+    #[test]
+    fn expand_dest_tilde_resolves_bare_tilde() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        // SAFETY: tests run single-threaded by nextest, and we restore
+        // the original value below. The `set_var`/`remove_var` calls
+        // are needed because we may run under CI where `$HOME` is
+        // pinned or unset.
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let out = expand_dest_tilde("~").expect("~ resolves with HOME set");
+        assert_eq!(out, home);
+        assert!(!out.starts_with('~'), "expansion left literal `~`: {out}");
+    }
+
+    /// `~/suffix` expands to `$HOME/suffix`.
+    #[test]
+    fn expand_dest_tilde_resolves_tilde_slash_suffix() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let out = expand_dest_tilde("~/proj/dst").expect("~/suffix resolves with HOME set");
+        assert_eq!(out, format!("{home}/proj/dst"));
+    }
+
+    /// `~user` form is rejected (not supported). The host_path parser
+    /// at create time also rejects this form; `--dest` mirrors the
+    /// rejection for consistency.
+    #[test]
+    fn expand_dest_tilde_rejects_tilde_user_form() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        let err = expand_dest_tilde("~alice/proj").expect_err("~user must be rejected");
+        assert!(
+            err.contains("~user"),
+            "rejection must mention `~user` form: {err}"
+        );
+    }
+
+    // ----- Release-on-cancel scopeguard mechanics ------------------
+    //
+    // These tests exercise the scopeguard wrapper used by
+    // `run_workspace_push_or_pull` to guarantee release-on-cancel.
+    // They do not touch the HTTP-release helpers — the asserted
+    // behavior is the scopeguard primitive (closure fires on normal
+    // scope exit and on panic-unwind). The HTTP release path is
+    // exercised in higher-level integration coverage (Phase 7).
+
+    /// The drop closure of `scopeguard::guard` must fire when the
+    /// guarded value goes out of scope on the normal-return path —
+    /// the foundation of the post-rsync release.
+    #[test]
+    fn release_guard_fires_on_normal_exit() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let fired = Arc::new(AtomicBool::new(false));
+        {
+            let fired_inner = Arc::clone(&fired);
+            let _guard = scopeguard::guard((), move |()| {
+                fired_inner.store(true, Ordering::SeqCst);
+            });
+            // Guard is alive here; the closure has not yet run.
+            assert!(
+                !fired.load(Ordering::SeqCst),
+                "guard closure must not fire while the guard is alive"
+            );
+        }
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "guard closure must fire on normal scope exit"
+        );
+    }
+
+    /// The drop closure must also fire when the scope unwinds due to
+    /// a panic between acquire and release. `catch_unwind` confines
+    /// the panic so the test binary keeps running, and the same
+    /// `AtomicBool` flag verifies the closure ran during unwind.
+    #[test]
+    fn release_guard_fires_on_panic() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_inner = Arc::clone(&fired);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = scopeguard::guard((), move |()| {
+                fired_inner.store(true, Ordering::SeqCst);
+            });
+            panic!("simulated rsync-flow panic");
+        }));
+        assert!(
+            result.is_err(),
+            "catch_unwind must observe the simulated panic"
+        );
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "guard closure must fire on panic-unwind"
+        );
+    }
+
+    /// `scopeguard::ScopeGuard::into_inner` defuses the guard so the
+    /// drop closure does NOT run — this is the exit path used by the
+    /// signal arms of the `select!` in `run_workspace_push_or_pull`,
+    /// where the release has already been issued inline and a second
+    /// release would trip the daemon's wrong-token check.
+    #[test]
+    fn release_guard_defused_via_into_inner() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let fired = Arc::new(AtomicBool::new(false));
+        {
+            let fired_inner = Arc::clone(&fired);
+            let guard = scopeguard::guard((), move |()| {
+                fired_inner.store(true, Ordering::SeqCst);
+            });
+            scopeguard::ScopeGuard::into_inner(guard);
+        }
+        assert!(
+            !fired.load(Ordering::SeqCst),
+            "guard closure must NOT fire after into_inner defuses it"
         );
     }
 }

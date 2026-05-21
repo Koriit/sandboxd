@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::backend::BackendKind;
 use crate::policy::{Destination, HttpFilter, Protocol};
 use crate::session::{SessionId, SessionState, WorkspaceSecurityModel};
+use crate::workspace_lock::WorkspaceOp;
 
 // ---------------------------------------------------------------------------
 // Session DTOs
@@ -395,6 +396,83 @@ impl From<WorkspaceSecurityModel> for WorkspaceSecurityModelDto {
 }
 
 // ---------------------------------------------------------------------------
+// Workspace-lock DTOs
+// ---------------------------------------------------------------------------
+
+/// Wire mirror of [`crate::workspace_lock::WorkspaceOp`].
+///
+/// Lives on the API surface so a future shape change in the domain
+/// enum cannot silently leak onto the wire. The two are kept in
+/// lock-step by the [`From`] impls below.
+///
+/// Wire form: `"push"` / `"pull"` (snake_case via the derive). Used
+/// as the request body for `POST /sessions/{id}/workspace-lock`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceOpDto {
+    Push,
+    Pull,
+}
+
+impl From<WorkspaceOp> for WorkspaceOpDto {
+    fn from(op: WorkspaceOp) -> Self {
+        match op {
+            WorkspaceOp::Push => Self::Push,
+            WorkspaceOp::Pull => Self::Pull,
+        }
+    }
+}
+
+impl From<WorkspaceOpDto> for WorkspaceOp {
+    fn from(op: WorkspaceOpDto) -> Self {
+        match op {
+            WorkspaceOpDto::Push => Self::Push,
+            WorkspaceOpDto::Pull => Self::Pull,
+        }
+    }
+}
+
+/// Request body for `POST /sessions/{id}/workspace-lock` — acquire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceLockAcquireRequest {
+    /// Which operation is about to start. Names the active op in the
+    /// 409 returned by a subsequent acquire while this lock is held.
+    pub op: WorkspaceOpDto,
+}
+
+/// Response body for `POST /sessions/{id}/workspace-lock` — acquire
+/// (200 OK path).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceLockAcquireResponse {
+    /// Opaque token the CLI must echo back on the matching release.
+    /// Carried as a string (UUID-shaped today) to keep the wire
+    /// stable if the in-process token representation changes.
+    pub lock_token: String,
+}
+
+/// Request body for `DELETE /sessions/{id}/workspace-lock` —
+/// release.
+///
+/// `force = true` skips the token-match check, providing the
+/// operator-facing escape hatch for orphan-lock recovery
+/// (`sandbox workspace unlock <session> --force`). `force` is
+/// `#[serde(default)]` so older clients that omit the field default
+/// to a strict-match release.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceLockReleaseRequest {
+    /// Token returned by the matching acquire. Daemons parse via
+    /// [`crate::workspace_lock::LockToken::from_str`]; unparseable
+    /// values are treated as a sentinel "wrong token" so the release
+    /// adjudication stays uniform.
+    pub lock_token: String,
+    /// Operator escape hatch: skip the token match, release
+    /// unconditionally on `Locked`. Defaults to `false` for
+    /// backward-compat with clients that omit the field.
+    #[serde(default)]
+    pub force: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Policy DTOs
 // ---------------------------------------------------------------------------
 
@@ -454,6 +532,82 @@ impl PolicyRuleDto {
         match &self.level {
             PolicyLevelDto::Http { http_filters } => Some(http_filters.as_slice()),
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Acquire-request round-trips with `op: push` on the wire.
+    /// The snake_case derive on [`WorkspaceOpDto`] pins the token
+    /// for both directions.
+    #[test]
+    fn workspace_lock_acquire_request_round_trip_push() {
+        let json = r#"{"op": "push"}"#;
+        let req: WorkspaceLockAcquireRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.op, WorkspaceOpDto::Push);
+        let back = serde_json::to_string(&req).unwrap();
+        assert!(back.contains("\"op\":\"push\""), "wire JSON: {back}");
+    }
+
+    /// Acquire-request round-trips with `op: pull` on the wire.
+    #[test]
+    fn workspace_lock_acquire_request_round_trip_pull() {
+        let json = r#"{"op": "pull"}"#;
+        let req: WorkspaceLockAcquireRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.op, WorkspaceOpDto::Pull);
+        let back = serde_json::to_string(&req).unwrap();
+        assert!(back.contains("\"op\":\"pull\""), "wire JSON: {back}");
+    }
+
+    /// Release-request with `force: true` round-trips cleanly. The
+    /// operator-facing `unlock --force` path is the only consumer of
+    /// this shape today.
+    #[test]
+    fn workspace_lock_release_request_round_trip_force_true() {
+        let json = r#"{"lock_token": "abc-123", "force": true}"#;
+        let req: WorkspaceLockReleaseRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.lock_token, "abc-123");
+        assert!(req.force);
+    }
+
+    /// Release-request with explicit `force: false` decodes to
+    /// `false` (the strict-match path).
+    #[test]
+    fn workspace_lock_release_request_round_trip_force_false() {
+        let json = r#"{"lock_token": "abc-123", "force": false}"#;
+        let req: WorkspaceLockReleaseRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.lock_token, "abc-123");
+        assert!(!req.force);
+    }
+
+    /// Older clients that omit `force` decode to `force = false`
+    /// via `#[serde(default)]`. Pins the backward-compat shape so an
+    /// older CLI talking to a newer daemon does not surprise the
+    /// release adjudication with an absent field.
+    #[test]
+    fn workspace_lock_release_request_force_defaults_false_when_absent() {
+        let json = r#"{"lock_token": "abc-123"}"#;
+        let req: WorkspaceLockReleaseRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.lock_token, "abc-123");
+        assert!(
+            !req.force,
+            "absent `force` must default to false so older clients get a strict-match release"
+        );
+    }
+
+    /// `WorkspaceOpDto ↔ WorkspaceOp` round-trips through the
+    /// `From` impls both ways.
+    #[test]
+    fn workspace_op_dto_round_trips_with_domain() {
+        for (domain, dto) in [
+            (WorkspaceOp::Push, WorkspaceOpDto::Push),
+            (WorkspaceOp::Pull, WorkspaceOpDto::Pull),
+        ] {
+            assert_eq!(WorkspaceOpDto::from(domain), dto);
+            assert_eq!(WorkspaceOp::from(dto), domain);
         }
     }
 }

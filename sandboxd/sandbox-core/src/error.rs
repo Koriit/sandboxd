@@ -97,6 +97,22 @@ pub enum SandboxError {
         daemon_proto: u32,
         reason: String,
     },
+
+    /// A request conflicts with the current per-session state.
+    ///
+    /// Carries the operator-facing message verbatim — the `Display`
+    /// impl renders it without any prefix, so call sites have full
+    /// control over phrasing (workspace-lock contention names the
+    /// active op; lifecycle 409s tell the operator how to recover).
+    /// Distinct from [`SandboxError::GuestProtocolIncompatible`],
+    /// which is the other 409-mapped variant but carries structured
+    /// fields and a fixed-template message; `Conflict(String)` is
+    /// the generic 409 channel.
+    ///
+    /// HTTP mapping: `409 Conflict` via the daemon's
+    /// `error_response` helper.
+    #[error("{0}")]
+    Conflict(String),
 }
 
 /// Map a [`UsersConfigError`] into [`SandboxError::InvalidArgument`].
@@ -299,6 +315,18 @@ mod tests {
             }
             other => panic!("expected InvalidArgument, got {other:?}"),
         }
+    }
+
+    /// `Conflict(String)`'s `Display` must render the carried
+    /// message verbatim with no prefix — the wire body is the
+    /// operator-facing message exactly. Workspace-lock contention
+    /// and lifecycle 409s both rely on this property to surface
+    /// their hint strings unaltered.
+    #[test]
+    fn conflict_display_renders_carried_message_verbatim() {
+        let msg = "session has an active push operation";
+        let err = SandboxError::Conflict(msg.to_string());
+        assert_eq!(err.to_string(), msg);
     }
 
     #[test]

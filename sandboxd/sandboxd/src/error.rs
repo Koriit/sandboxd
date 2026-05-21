@@ -47,6 +47,7 @@ use tracing::error;
 /// | `InvalidArgument`             | `400 Bad Request`           |
 /// | `RootlessDockerRefused`       | `400 Bad Request`           |
 /// | `GuestProtocolIncompatible`   | `409 Conflict`              |
+/// | `Conflict`                    | `409 Conflict`              |
 /// | `Network` / `Ca` /            | `500 Internal Server Error` |
 /// | `Gateway` / `Lima`            |                             |
 /// | `Io` / `Database` /           | `500 Internal Server Error` |
@@ -65,6 +66,7 @@ pub fn error_response(err: SandboxError) -> (StatusCode, Json<ApiError>) {
         SandboxError::InvalidArgument(_) => (StatusCode::BAD_REQUEST, err.to_string()),
         SandboxError::RootlessDockerRefused => (StatusCode::BAD_REQUEST, err.to_string()),
         SandboxError::GuestProtocolIncompatible { .. } => (StatusCode::CONFLICT, err.to_string()),
+        SandboxError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
         SandboxError::Network(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
         SandboxError::Ca(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
         SandboxError::Gateway(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
@@ -76,4 +78,22 @@ pub fn error_response(err: SandboxError) -> (StatusCode, Json<ApiError>) {
     };
     error!(%status, error = %msg, "handler error");
     (status, Json(ApiError::new(msg)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Conflict(msg)` maps to `409 Conflict` and the response body
+    /// carries the supplied message verbatim. Pins the contract
+    /// consumed by the workspace-lock acquire/release handlers and
+    /// the lifecycle 409s.
+    #[test]
+    fn maps_conflict_to_409() {
+        let (status, body) = error_response(SandboxError::Conflict(
+            "session has an active push operation".into(),
+        ));
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.0.error, "session has an active push operation");
+    }
 }

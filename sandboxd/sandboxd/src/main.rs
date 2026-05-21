@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,13 +32,15 @@ use sandbox_core::{
     DnsCache, DockerExecLdsProbe, DockerHealth, EventBus, EventBusConfig, ExecRequest,
     ExecResponse, GateRequest, GateService, GateServiceOutcome, GateStatus, GatewayHealth,
     GatewayManager, GatewayShutdownReason, GatewayStatus, GuestConnector, GuestResponse,
-    HealthComponent, LdsAckOutcome, LdsStatsProbe, LimaManager, NetworkHealth, NetworkInfo,
-    NetworkManager, OperatorIdentity, PersistConfig, PersistentSink, Policy, PolicyApplyStatus,
-    PolicyCompiler, PolicyDistributor, SandboxError, Session, SessionConfig, SessionDto,
-    SessionHealth, SessionId, SessionIngestor, SessionMountInfo, SessionNetworkInfo, SessionState,
-    SessionStore, UpdatePolicyRequest, UsersConfig, VmIpSessionMap, VmStatus, attach_vm_to_bridge,
-    bind_gate_listener, detach_vm_from_bridge, generate_ca_inject_script, generate_domain_ip_rules,
-    hash_policy, load_users_config, mac_from_session_id, propagate_dns_changes, read_resolved_json,
+    HealthComponent, LdsAckOutcome, LdsStatsProbe, LimaManager, LockState, LockToken,
+    NetworkHealth, NetworkInfo, NetworkManager, OperatorIdentity, PersistConfig, PersistentSink,
+    Policy, PolicyApplyStatus, PolicyCompiler, PolicyDistributor, SandboxError, Session,
+    SessionConfig, SessionDto, SessionHealth, SessionId, SessionIngestor, SessionMountInfo,
+    SessionNetworkInfo, SessionState, SessionStore, UpdatePolicyRequest, UsersConfig,
+    VmIpSessionMap, VmStatus, WorkspaceLockAcquireRequest, WorkspaceLockAcquireResponse,
+    WorkspaceLockReleaseRequest, WorkspaceOp, attach_vm_to_bridge, bind_gate_listener,
+    detach_vm_from_bridge, generate_ca_inject_script, generate_domain_ip_rules, hash_policy,
+    load_users_config, mac_from_session_id, propagate_dns_changes, read_resolved_json,
     remove_gate_socket, serve_gate_listener, users_conf_path, wait_for_lds_ack,
     write_file_to_container,
 };
@@ -836,6 +839,23 @@ struct AppState {
     /// gateway teardown. Keyed by session ID so a gateway bounce can
     /// abort-and-respawn without leaking the previous ingestor.
     ingestors: Mutex<HashMap<SessionId, SessionIngestor>>,
+    /// Per-session workspace lock map.
+    ///
+    /// Serialises the workspace operations defined in
+    /// [`sandbox_core::WorkspaceOp`] (initial / pull / push) so that two
+    /// callers cannot concurrently mutate the same session's workspace
+    /// view. The outer `std::sync::Mutex` guards only mutations of the
+    /// map itself (`entry(...).or_insert_with(...)`), so it is held
+    /// briefly and never across `.await`. The inner
+    /// `tokio::sync::Mutex<LockState>` is the per-session async lock
+    /// that handlers hold across the long-running rsync / guest
+    /// transitions — that one MUST be a tokio mutex because it crosses
+    /// `.await` boundaries.
+    ///
+    /// Inserted lazily by [`workspace_lock_for_map`] on first reference
+    /// for a session; entries are pruned by the session-lifecycle
+    /// handlers (remove path) so the map size tracks live sessions.
+    workspace_locks: std::sync::Mutex<HashMap<SessionId, Arc<Mutex<sandbox_core::LockState>>>>,
     /// Per-session policy-propagation tracker.
     ///
     /// Records, for each session, the hash of the most recently
@@ -886,6 +906,53 @@ fn runtime_for(state: &AppState, kind: BackendKind) -> Arc<dyn SessionRuntime> {
             .get(&kind)
             .unwrap_or_else(|| panic!("runtime for {kind:?} must be registered at startup")),
     )
+}
+
+/// Inner helper: look up (or lazily create) the per-session workspace
+/// lock entry in a bare lock map.
+///
+/// Kept separate from [`workspace_lock_for`] so unit tests can drive
+/// the map shape directly without paying the cost of building a full
+/// [`AppState`] (which owns a live `SessionStore`, `LimaRuntime`,
+/// `ContainerRuntime`, `NetworkManager`, `GatewayManager`, etc.).
+///
+/// Returns a cloned [`Arc`] so the caller releases the outer
+/// `std::sync::Mutex` immediately and then awaits the inner
+/// `tokio::sync::Mutex<LockState>` without holding the map lock
+/// across `.await`. The `entry(...).or_insert_with(...)` shape
+/// guarantees idempotent creation: concurrent first-acquire calls
+/// for the same session race for the outer sync mutex, and only the
+/// first creates the inner `LockState`; subsequent calls receive
+/// the same `Arc`.
+///
+/// Panics if the outer `std::sync::Mutex` is poisoned. The map is
+/// only ever held briefly to swap an `Arc` clone in or out — a
+/// poisoned map means a panic already aborted that critical section,
+/// and the daemon is in an unrecoverable state. This matches the
+/// `expect(...)` convention other short-lived `std::sync::Mutex`
+/// locks use in this crate.
+fn workspace_lock_for_map(
+    map: &std::sync::Mutex<HashMap<SessionId, Arc<Mutex<sandbox_core::LockState>>>>,
+    session_id: &SessionId,
+) -> Arc<Mutex<sandbox_core::LockState>> {
+    let mut guard = map.lock().expect("workspace_locks mutex poisoned");
+    guard
+        .entry(*session_id)
+        .or_insert_with(|| Arc::new(Mutex::new(sandbox_core::LockState::new())))
+        .clone()
+}
+
+/// Look up (or lazily create) the per-session workspace lock for
+/// [`SessionId`].
+///
+/// Thin wrapper over [`workspace_lock_for_map`] that targets the
+/// [`AppState::workspace_locks`] field directly — the shape the
+/// workspace acquire/release handlers use.
+fn workspace_lock_for(
+    state: &AppState,
+    session_id: &SessionId,
+) -> Arc<Mutex<sandbox_core::LockState>> {
+    workspace_lock_for_map(&state.workspace_locks, session_id)
 }
 
 /// Project a [`SessionConfig`] + [`BackendKind`] pair back into the
@@ -1190,6 +1257,10 @@ fn app(state: Arc<AppState>) -> Router {
         .route(
             "/sessions/{id}/policy",
             post(update_policy).delete(clear_policy),
+        )
+        .route(
+            "/sessions/{id}/workspace-lock",
+            post(acquire_workspace_lock).delete(release_workspace_lock),
         )
         .route("/sessions/{id}/health", get(session_health))
         .route("/rebuild-image", post(rebuild_image))
@@ -3562,6 +3633,34 @@ async fn stop_session(
         .into_response();
     }
 
+    // Acquire the per-session workspace-lock mutex and HOLD it across
+    // the entire teardown (orchestrator decision Q4). The acquire is
+    // cheap on the steady-state Unlocked path; on a contended path a
+    // concurrent push/pull is in flight and we must refuse the stop.
+    //
+    // Atomicity contract (spec § Workspace lock — Lifecycle interaction):
+    // the workspace acquire handler reads the session state INSIDE this
+    // same mutex's critical section, so:
+    //   * stop-first: stop holds the mutex for the full teardown; a
+    //     concurrent acquire waits, then sees state != Running and
+    //     returns 400.
+    //   * acquire-first: acquire transitions LockState to Locked and
+    //     releases the mutex; stop arrives, takes the mutex, observes
+    //     `active_op() == Some(_)` here, and returns 409.
+    //
+    // `lock_state` must live for the rest of the function body — it is
+    // a `tokio::sync::Mutex` guard, so holding it across `.await`
+    // points is safe (and required, by the atomicity contract above).
+    // Renaming to `_lock_state` would suppress clippy's unused-binding
+    // lint AT THE COST of dropping the guard immediately; do NOT do
+    // that.
+    let lock_mutex = workspace_lock_for(&state, &session.id);
+    let lock_state = lock_mutex.lock().await;
+    let session_name_or_id = session.name.as_deref().unwrap_or(session.id.as_ref());
+    if let Err(e) = lifecycle_lock_check(&lock_state, session_name_or_id) {
+        return error_response(e).into_response();
+    }
+
     info!(session_id = %session.id, "stopping session");
 
     // Mark this session as "stopping" so the gateway monitor doesn't restart
@@ -3673,6 +3772,23 @@ async fn remove_session(
         Ok(None) => return error_response(SandboxError::SessionNotFound(id)).into_response(),
         Err(e) => return error_response(e).into_response(),
     };
+
+    // Acquire the per-session workspace-lock mutex and HOLD it across
+    // the entire teardown — same contract as `stop_session`. See the
+    // detailed comment block there for the atomicity argument; the
+    // shape is identical (stop and remove are both "lifecycle exits"
+    // for the purposes of the lock-vs-lifecycle interaction).
+    //
+    // `remove` accepts any session state (a stopped session can be
+    // removed without first running stop), so unlike `stop_session`
+    // there is no state-precondition early-return above this block —
+    // the lock check is the first guard.
+    let lock_mutex = workspace_lock_for(&state, &session.id);
+    let lock_state = lock_mutex.lock().await;
+    let session_name_or_id = session.name.as_deref().unwrap_or(session.id.as_ref());
+    if let Err(e) = lifecycle_lock_check(&lock_state, session_name_or_id) {
+        return error_response(e).into_response();
+    }
 
     info!(
         session_id = %session.id,
@@ -3954,6 +4070,179 @@ async fn clear_policy(
             error!(session_id = %session.id, error = %e, "policy clear failed");
             error_response(e).into_response()
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Workspace-lock handlers
+// ---------------------------------------------------------------------------
+
+/// Pure-function body of the workspace-lock acquire handler.
+///
+/// Lifecycle-gate + state-machine adjudication for the
+/// `POST /sessions/{id}/workspace-lock` endpoint, factored out of the
+/// async HTTP handler so the contract can be unit-tested without
+/// driving the full `AppState`. Atomicity (state-check and lock-take
+/// happen inside the same per-session async-mutex critical section)
+/// is the caller's responsibility — see [`acquire_workspace_lock`].
+///
+/// * Returns [`SandboxError::InvalidArgument`] (→ 400) when the
+///   session is not in [`SessionState::Running`]. The error wording
+///   matches the spec § Workspace lock — API endpoints:
+///   `session is in state <State>; workspace operations require Running`.
+/// * Returns [`SandboxError::Conflict`] (→ 409, via `error_response`)
+///   when the lock is already held; the message names the active op
+///   (e.g. `session has an active push operation`) so the CLI can
+///   surface it verbatim.
+/// * On success, returns the freshly-minted [`LockToken`] and the
+///   passed-in `lock_state` is now `Locked { op, token }`.
+fn acquire_workspace_lock_inner(
+    session_state: SessionState,
+    lock_state: &mut LockState,
+    op: WorkspaceOp,
+) -> Result<LockToken, SandboxError> {
+    if session_state != SessionState::Running {
+        return Err(SandboxError::InvalidArgument(format!(
+            "session is in state {session_state}; workspace operations require Running"
+        )));
+    }
+    lock_state.acquire(op)
+}
+
+/// Pure-function body of the workspace-lock release handler.
+///
+/// Delegates straight through to [`LockState::release`] — kept as a
+/// thin wrapper so the symmetry with [`acquire_workspace_lock_inner`]
+/// is obvious at the call site and so the handler's "inner logic" is
+/// uniformly a single function call from outside the mutex critical
+/// section.
+fn release_workspace_lock_inner(
+    lock_state: &mut LockState,
+    token: LockToken,
+    force: bool,
+) -> Result<(), SandboxError> {
+    lock_state.release(&token, force)
+}
+
+/// Predicate run by `stop_session` / `remove_session` before any
+/// teardown work to refuse the lifecycle transition when a workspace
+/// op (push/pull) is in flight.
+///
+/// Returns `Ok(())` on `LockState::Unlocked`. Returns
+/// `SandboxError::Conflict` (→ 409 via `error_response`) when the
+/// state is `Locked { op, .. }`; the message is spec-pinned (§
+/// Workspace lock — Lifecycle interaction):
+///
+/// ```text
+/// session has an active <push|pull> operation; cancel the operation
+/// or run 'sandbox workspace unlock <session> --force'
+/// ```
+///
+/// `session_name_or_id` is the operator-facing reference embedded in
+/// the recovery hint: prefer the user-given session name; fall back to
+/// the session id (orchestrator decision Q7). The caller composes this
+/// with `session.name.as_deref().unwrap_or(session.id.as_ref())`.
+///
+/// Pure-function shape (no async-mutex involvement) so the wording
+/// contract can be exercised by unit tests without standing up a
+/// runtime; the atomicity invariant — state-read serialised with the
+/// acquire/release handlers through the same per-session
+/// `tokio::sync::Mutex` — is the caller's responsibility (handled in
+/// the `stop_session` / `remove_session` wrappers).
+fn lifecycle_lock_check(
+    lock_state: &LockState,
+    session_name_or_id: &str,
+) -> Result<(), SandboxError> {
+    if let Some(active_op) = lock_state.active_op() {
+        return Err(SandboxError::Conflict(format!(
+            "session has an active {active_op} operation; cancel the operation or run 'sandbox workspace unlock {session_name_or_id} --force'"
+        )));
+    }
+    Ok(())
+}
+
+/// `POST /sessions/{id}/workspace-lock` — acquire the per-session
+/// workspace lock for a `push` or `pull` operation.
+///
+/// Behaviour:
+/// 1. Resolve the session by name or id, scoped to the calling
+///    operator. Missing → 404.
+/// 2. Fetch the per-session lock-mutex `Arc` and acquire the inner
+///    async mutex. The state-read in step 3 happens **after** the
+///    mutex acquire so a concurrent `stop`/`remove` cannot transition
+///    the session between the state-check and the lock-take (spec
+///    § Workspace lock — Lifecycle interaction; orchestrator
+///    decisions Q2/Q4).
+/// 3. Reject (400) if the session is not `Running`.
+/// 4. Try to acquire the lock; on conflict, return 409 via
+///    `error_response` with the daemon-rendered message
+///    (`session has an active <op> operation`).
+/// 5. On success, return 200 with the minted `lock_token`. The async
+///    mutex is released on return — the handler does NOT hold it
+///    across rsync; the CLI re-acquires nothing during the operation
+///    body because the state-machine itself encodes the "held" state.
+async fn acquire_workspace_lock(
+    State(state): State<Arc<AppState>>,
+    Extension(operator): Extension<OperatorIdentity>,
+    Path(id): Path<String>,
+    Json(req): Json<WorkspaceLockAcquireRequest>,
+) -> impl IntoResponse {
+    let session = match state.store.get_session_by_name_or_id(&id, &operator.name) {
+        Ok(Some(s)) => s,
+        Ok(None) => return error_response(SandboxError::SessionNotFound(id)).into_response(),
+        Err(e) => return error_response(e).into_response(),
+    };
+
+    let lock_mutex = workspace_lock_for(&state, &session.id);
+    let mut lock_state = lock_mutex.lock().await;
+
+    match acquire_workspace_lock_inner(session.state, &mut lock_state, req.op.into()) {
+        Ok(token) => {
+            let body = WorkspaceLockAcquireResponse {
+                lock_token: token.to_string(),
+            };
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Err(e) => error_response(e).into_response(),
+    }
+}
+
+/// `DELETE /sessions/{id}/workspace-lock` — release the per-session
+/// workspace lock previously taken by [`acquire_workspace_lock`].
+///
+/// Behaviour:
+/// 1. Resolve the session by name or id. Missing → 404.
+/// 2. Acquire the per-session async mutex.
+/// 3. Parse `req.lock_token`. Per spec § Workspace lock — Force-
+///    release token semantics + orchestrator decision Q6, unparseable
+///    input is mapped to the all-zeroes [`LockToken::nil`] sentinel
+///    so the release adjudication path stays uniform: the state-
+///    machine treats it as a wrong-token release unless `force=true`.
+/// 4. Delegate to [`LockState::release`]. On conflict (wrong token,
+///    `force=false`) → 409 via `error_response`. On success or
+///    idempotent already-unlocked → 200 with an empty JSON object,
+///    matching the convention used by `update_policy` /
+///    `clear_policy` for empty-success bodies.
+async fn release_workspace_lock(
+    State(state): State<Arc<AppState>>,
+    Extension(operator): Extension<OperatorIdentity>,
+    Path(id): Path<String>,
+    Json(req): Json<WorkspaceLockReleaseRequest>,
+) -> impl IntoResponse {
+    let session = match state.store.get_session_by_name_or_id(&id, &operator.name) {
+        Ok(Some(s)) => s,
+        Ok(None) => return error_response(SandboxError::SessionNotFound(id)).into_response(),
+        Err(e) => return error_response(e).into_response(),
+    };
+
+    let lock_mutex = workspace_lock_for(&state, &session.id);
+    let mut lock_state = lock_mutex.lock().await;
+
+    let token = LockToken::from_str(&req.lock_token).unwrap_or_else(|_| LockToken::nil());
+
+    match release_workspace_lock_inner(&mut lock_state, token, req.force) {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({}))).into_response(),
+        Err(e) => error_response(e).into_response(),
     }
 }
 
@@ -7670,6 +7959,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vm_ip_map,
         component_health_state: Mutex::new(HashMap::new()),
         ingestors: Mutex::new(HashMap::new()),
+        workspace_locks: std::sync::Mutex::new(HashMap::new()),
         propagation_states: Arc::new(PropagationStates::new()),
         daemon_uid,
         daemon_user: daemon_user_resolved,
@@ -7795,6 +8085,331 @@ mod tests {
     fn error_body(err: SandboxError) -> (StatusCode, ApiError) {
         let (status, Json(body)) = error_response(err);
         (status, body)
+    }
+
+    // -----------------------------------------------------------------------
+    // workspace_lock_for_map — per-session lock-map fetch helper.
+    //
+    // Drives the inner free function rather than the `AppState`-typed
+    // wrapper so the tests stay independent of the daemon's heavyweight
+    // state graph (`SessionStore`, runtimes, network/gateway managers).
+    // The wrapper is a one-line delegate so the contract is identical.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn workspace_lock_for_returns_same_arc_for_same_session_id() {
+        let map: std::sync::Mutex<HashMap<SessionId, Arc<Mutex<sandbox_core::LockState>>>> =
+            std::sync::Mutex::new(HashMap::new());
+        let sid = SessionId::generate();
+
+        let a = workspace_lock_for_map(&map, &sid);
+        let b = workspace_lock_for_map(&map, &sid);
+
+        // Both calls must yield handles to the SAME inner mutex — Phase
+        // 3's acquire/release handlers rely on this to serialise
+        // workspace ops for a single session. If `entry(...).or_insert_with`
+        // were ever replaced with an unconditional insert, this would
+        // catch the regression: two distinct `Arc`s would mean two
+        // independent lock states for the same session.
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "workspace_lock_for_map must return the same Arc for repeat calls with the same session id"
+        );
+    }
+
+    #[test]
+    fn workspace_lock_for_returns_distinct_arc_for_different_session_ids() {
+        let map: std::sync::Mutex<HashMap<SessionId, Arc<Mutex<sandbox_core::LockState>>>> =
+            std::sync::Mutex::new(HashMap::new());
+        let sid1 = SessionId::generate();
+        let sid2 = SessionId::generate();
+        assert_ne!(sid1, sid2, "generate() must produce distinct ids");
+
+        let a = workspace_lock_for_map(&map, &sid1);
+        let b = workspace_lock_for_map(&map, &sid2);
+
+        // Different sessions get independent locks — pinning that an
+        // operation on session A cannot block an operation on session B.
+        assert!(
+            !Arc::ptr_eq(&a, &b),
+            "workspace_lock_for_map must return distinct Arcs for distinct session ids"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // acquire_workspace_lock_inner / release_workspace_lock_inner —
+    // pure-function bodies of the workspace-lock handlers.
+    //
+    // The async HTTP handler shells take `State<Arc<AppState>>`, which
+    // is awkward to construct in a unit test (it owns live runtimes /
+    // store / gateway / network managers). The inner pure functions
+    // carry the entire lifecycle-and-state-machine adjudication, so
+    // testing them is sufficient for the Phase 3 contract. Wire-level
+    // coverage (HTTP-status mapping, JSON shapes) lives in the Phase 7
+    // integration tests.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn acquire_returns_token_when_session_running_and_unlocked() {
+        // Happy path: a Running session with an Unlocked state-machine
+        // entry must mint a token and transition the state to Locked.
+        let mut lock = LockState::new();
+        let token =
+            acquire_workspace_lock_inner(SessionState::Running, &mut lock, WorkspaceOp::Push)
+                .expect("acquire on Running + Unlocked must succeed");
+        assert!(lock.is_locked());
+        assert_eq!(lock.active_op(), Some(WorkspaceOp::Push));
+        // The returned token must match the one now held inside the
+        // state-machine — the release path is a token-match, so a
+        // drifted token here would be undetectable until release time.
+        match lock {
+            LockState::Locked { token: held, .. } => assert_eq!(held, token),
+            other => panic!("expected Locked after acquire, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn acquire_returns_invalid_argument_when_session_not_running() {
+        // Strict Running-only gate (orchestrator Q9): every other
+        // SessionState variant must surface InvalidArgument with the
+        // spec-pinned wording so the CLI surfaces a uniform diagnostic.
+        // SessionState has four variants — Creating, Running, Stopped,
+        // Error; this enumerates the three that must reject.
+        for state in [
+            SessionState::Creating,
+            SessionState::Stopped,
+            SessionState::Error,
+        ] {
+            let mut lock = LockState::new();
+            let err = acquire_workspace_lock_inner(state, &mut lock, WorkspaceOp::Pull)
+                .expect_err("acquire must reject any non-Running session");
+            match err {
+                SandboxError::InvalidArgument(msg) => {
+                    let observed = format!("session is in state {state}");
+                    assert!(
+                        msg.contains(&observed),
+                        "rejection message must include the observed state `{state}`; got: {msg}"
+                    );
+                    assert!(
+                        msg.contains("require Running"),
+                        "rejection message must point at the Running requirement; got: {msg}"
+                    );
+                }
+                other => panic!("expected InvalidArgument, got {other:?}"),
+            }
+            // Critical: a rejected acquire must NOT have mutated the
+            // lock state. If the state-check happened *after* the
+            // acquire, this would catch it.
+            assert!(
+                !lock.is_locked(),
+                "rejected acquire must leave the lock state Unlocked"
+            );
+        }
+    }
+
+    #[test]
+    fn acquire_returns_conflict_when_locked() {
+        // Pre-Locked state — the state-machine's existing conflict
+        // path must surface as a SandboxError::Conflict (mapped to 409
+        // by error_response).
+        let mut lock = LockState::new();
+        lock.acquire(WorkspaceOp::Push).expect("seed acquire");
+        let err = acquire_workspace_lock_inner(SessionState::Running, &mut lock, WorkspaceOp::Pull)
+            .expect_err("acquire on Locked must conflict");
+        match err {
+            SandboxError::Conflict(msg) => {
+                assert!(
+                    msg.contains("active push operation"),
+                    "conflict message must name the held op (push); got: {msg}"
+                );
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn release_succeeds_with_matching_token() {
+        let mut lock = LockState::new();
+        let token = lock.acquire(WorkspaceOp::Push).expect("seed acquire");
+        release_workspace_lock_inner(&mut lock, token, false)
+            .expect("release with matching token must succeed");
+        assert_eq!(lock, LockState::Unlocked);
+    }
+
+    #[test]
+    fn release_returns_conflict_with_wrong_token_and_force_false() {
+        let mut lock = LockState::new();
+        let _held = lock.acquire(WorkspaceOp::Pull).expect("seed acquire");
+        let wrong = LockToken::new_v4();
+        let err = release_workspace_lock_inner(&mut lock, wrong, false)
+            .expect_err("mismatched release without force must conflict");
+        match err {
+            SandboxError::Conflict(msg) => {
+                assert!(
+                    msg.contains("lock_token mismatch"),
+                    "conflict message must say `lock_token mismatch`; got: {msg}"
+                );
+                assert!(
+                    msg.contains("force=true"),
+                    "conflict message must mention the force=true escape hatch; got: {msg}"
+                );
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+        // Failed release must leave the lock held — otherwise a hostile
+        // client could probe for tokens by reading post-release state.
+        assert!(lock.is_locked());
+    }
+
+    #[test]
+    fn release_succeeds_with_wrong_token_and_force_true() {
+        // Operator escape hatch (orphan-lock recovery). The wrong
+        // token plus force=true must release unconditionally — this is
+        // the path `sandbox workspace unlock <session> --force` drives.
+        let mut lock = LockState::new();
+        let _held = lock.acquire(WorkspaceOp::Push).expect("seed acquire");
+        let wrong = LockToken::new_v4();
+        release_workspace_lock_inner(&mut lock, wrong, true)
+            .expect("force-release with wrong token must succeed");
+        assert_eq!(lock, LockState::Unlocked);
+    }
+
+    #[test]
+    fn release_is_idempotent_when_already_unlocked() {
+        // Idempotent DELETE: re-issuing release on an already-Unlocked
+        // lock must be a no-op success regardless of `force`. Pins the
+        // spec § Workspace lock — "Idempotent on already-unlocked"
+        // contract so a retrying CLI doesn't see a spurious 409.
+        let mut lock = LockState::new();
+        let any = LockToken::new_v4();
+        release_workspace_lock_inner(&mut lock, any, false)
+            .expect("release on Unlocked must succeed (force=false)");
+        assert_eq!(lock, LockState::Unlocked);
+        release_workspace_lock_inner(&mut lock, any, true)
+            .expect("release on Unlocked must succeed (force=true)");
+        assert_eq!(lock, LockState::Unlocked);
+    }
+
+    #[test]
+    fn release_treats_unparseable_token_as_wrong_when_force_false() {
+        // The HTTP handler maps LockToken::from_str failures to
+        // LockToken::nil(); the state-machine then adjudicates as
+        // wrong-token. Drive that adjudication path through the inner
+        // helper so a future refactor that changes the sentinel choice
+        // can't silently let unparseable input through. Without
+        // `force=true`, the nil sentinel must still produce a 409.
+        let mut lock = LockState::new();
+        let _held = lock.acquire(WorkspaceOp::Push).expect("seed acquire");
+        let sentinel = LockToken::nil();
+        let err = release_workspace_lock_inner(&mut lock, sentinel, false)
+            .expect_err("nil-sentinel release without force must conflict");
+        assert!(matches!(err, SandboxError::Conflict(_)));
+        assert!(lock.is_locked(), "failed release must not mutate state");
+    }
+
+    // -----------------------------------------------------------------------
+    // lifecycle_lock_check — pre-teardown guard run by
+    // `stop_session` / `remove_session`.
+    //
+    // The full lifecycle wrappers carry async-mutex acquisition,
+    // session store lookups, and (in stop's case) a Running-state
+    // precondition; the wording contract and the Unlocked→Locked
+    // discrimination both live in this pure helper. Wire-level
+    // coverage (full HTTP-status, the per-session mutex held across
+    // a real backend teardown) lives in the Phase 7 integration
+    // tests.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn lifecycle_lock_check_passes_when_unlocked() {
+        // Steady-state path: the per-session lock has never been
+        // acquired (or was already released). Lifecycle handlers
+        // proceed with teardown.
+        let lock = LockState::new();
+        lifecycle_lock_check(&lock, "any-session")
+            .expect("Unlocked must allow lifecycle transition");
+    }
+
+    #[test]
+    fn lifecycle_lock_check_returns_conflict_when_push_active() {
+        // A push is in flight — the lifecycle transition must be
+        // refused with a 409-mapping error whose message names the
+        // active op (push) and includes the session reference verbatim
+        // so the CLI can surface it.
+        let mut lock = LockState::new();
+        lock.acquire(WorkspaceOp::Push).expect("seed acquire");
+        let err = lifecycle_lock_check(&lock, "demo-session")
+            .expect_err("Locked must refuse lifecycle transition");
+        match err {
+            SandboxError::Conflict(msg) => {
+                assert!(
+                    msg.contains("active push operation"),
+                    "message must name the active op (push); got: {msg}"
+                );
+                assert!(
+                    msg.contains("demo-session"),
+                    "message must include the session reference verbatim so \
+                     the operator can copy the recovery command; got: {msg}"
+                );
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lifecycle_lock_check_returns_conflict_when_pull_active() {
+        // Symmetric path for the pull op — pins that the helper
+        // delegates the op-name to `WorkspaceOp`'s Display impl rather
+        // than hard-coding `push` (which would silently misreport pull
+        // contention).
+        let mut lock = LockState::new();
+        lock.acquire(WorkspaceOp::Pull).expect("seed acquire");
+        let err = lifecycle_lock_check(&lock, "demo-session")
+            .expect_err("Locked must refuse lifecycle transition");
+        match err {
+            SandboxError::Conflict(msg) => {
+                assert!(
+                    msg.contains("active pull operation"),
+                    "message must name the active op (pull); got: {msg}"
+                );
+                assert!(
+                    msg.contains("demo-session"),
+                    "message must include the session reference; got: {msg}"
+                );
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lifecycle_lock_check_includes_unlock_force_hint() {
+        // Spec § Workspace lock — Lifecycle interaction pins the
+        // recovery hint: the conflict message MUST mention `unlock`
+        // and `--force` so the operator (or an LLM agent reading the
+        // error) can immediately drive the orphan-lock escape hatch
+        // without consulting docs.
+        let mut lock = LockState::new();
+        lock.acquire(WorkspaceOp::Push).expect("seed acquire");
+        let err = lifecycle_lock_check(&lock, "sess-abc")
+            .expect_err("Locked must refuse lifecycle transition");
+        match err {
+            SandboxError::Conflict(msg) => {
+                assert!(
+                    msg.contains("unlock"),
+                    "message must mention `unlock`; got: {msg}"
+                );
+                assert!(
+                    msg.contains("--force"),
+                    "message must mention the `--force` flag; got: {msg}"
+                );
+                assert!(
+                    msg.contains("sandbox workspace unlock sess-abc --force"),
+                    "message must embed the literal recovery command \
+                     interpolated with the session reference; got: {msg}"
+                );
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------------

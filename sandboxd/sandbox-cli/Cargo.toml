@@ -39,6 +39,17 @@ nix = { version = "0.29", features = ["user", "fs", "signal"] }
 # workspace alias.
 ring = { workspace = true }
 sandbox-core.workspace = true
+# `scopeguard::guard` powers the release-on-cancel guard wrapping
+# rsync in `run_workspace_push_or_pull`: the workspace lock acquired
+# from the daemon MUST be released on every exit path (success, rsync
+# non-zero, panic, SIGINT, SIGTERM) so an interrupted push/pull does
+# not strand the session in a locked state. scopeguard fires on
+# normal-return + panic-unwind; the signal-handling arm of the
+# `tokio::select!` race performs the same release inline before the
+# CLI exits with the conventional 128+signo code. The crate is
+# zero-dependency and already pulled in transitively via other
+# workspace crates; pinning `"1"` accepts any 1.x release.
+scopeguard = "1"
 serde.workspace = true
 serde_json.workspace = true
 # `cfg_migrations::atomic_write` uses `NamedTempFile::new_in(parent) +

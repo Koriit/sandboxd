@@ -28,6 +28,7 @@ pub mod store;
 pub mod test_support;
 pub mod users_conf;
 pub mod vm_network;
+pub mod workspace_lock;
 pub mod workspace_rsync;
 
 pub use api::{
@@ -38,8 +39,9 @@ pub use api::{
     LifecycleEventDto, MitmproxyEventBodyDto, MitmproxyEventDto, NetworkHealth,
     PolicyApplyStatusDto, PolicyDto, PolicyLevelDto, PolicyRuleDto, PropagationStatusResponse,
     SessionConfigDto, SessionDto, SessionHealth, SessionMountInfo, SessionNetworkInfo,
-    SessionRootlessDockerDto, UpdatePolicyRequest, WorkspaceModeDetailDto,
-    WorkspaceSecurityModelDto, event_to_jsonl_line,
+    SessionRootlessDockerDto, UpdatePolicyRequest, WorkspaceLockAcquireRequest,
+    WorkspaceLockAcquireResponse, WorkspaceLockReleaseRequest, WorkspaceModeDetailDto,
+    WorkspaceOpDto, WorkspaceSecurityModelDto, event_to_jsonl_line,
 };
 pub use atomic_listener_writer::{
     AtomicListenerWriter, ListenerWriteError, listener_host_root, session_listener_host_dir,
@@ -121,3 +123,4 @@ pub use users_conf::{
     UsersConfigError, load_users_config, load_users_config_from, users_conf_path,
 };
 pub use vm_network::{attach_vm_to_bridge, detach_vm_from_bridge};
+pub use workspace_lock::{LockState, LockToken, WorkspaceOp};

@@ -182,9 +182,62 @@ Workspace:
 
 The initial push runs after the VM/container reaches `Running` but before `sandbox create` returns. If `rsync` exits non-zero — for example, a host file with `chmod 000` that the daemon cannot read — the create call surfaces an HTTP 5xx with `local-workspace rsync failed (exit <N>): <rsync stderr>`, and the daemon tears the VM/container, network, and CA state down before responding. You will not see a half-seeded session in `sandbox ps`; the failed create leaves no orphan resources on the host. Fix the underlying issue (permissions, missing path) and re-run.
 
-### Push and pull updates back into and out of the snapshot
+### Push and pull edits between host and guest
 
-Operator-driven push (host → guest) and pull (guest → host) of the `local:` snapshot land in a follow-up release (`sandbox workspace push` / `pull`). Until then, `local:` is create-time snapshot only; to sync further changes use `sandbox cp` for individual files or `sandbox sync` for delta-mode directory mirrors.
+After the create-time snapshot, `sandbox workspace push` mirrors changes from the host into the guest, and `sandbox workspace pull` mirrors changes from the guest back to the host. Both commands operate on the `host_path` and `guest_path` the session was created with (`sandbox describe` shows them).
+
+Push host edits into the guest:
+
+```bash
+# Inspect first — see what would change without modifying the guest.
+sandbox workspace push -n dev
+
+# Then mirror the host tree into the guest.
+sandbox workspace push -f dev
+```
+
+Pull guest edits back to the host:
+
+```bash
+sandbox workspace pull -n dev
+sandbox workspace pull -f dev
+```
+
+Exactly one of `-f`/`--force` and `-n`/`--dry-run` is required. The CLI refuses bare `sandbox workspace push <s>` with a usage error — the `-f`/`-n` gate is intentional, since both commands always run with `--delete` semantics: deletions on the source are mirrored to the destination. Use `-n` to inspect first, `-f` to apply.
+
+The default flag set is `rsync -aL --delete --filter=':- .gitignore'` plus the backend-appropriate `-e` shell transport (`limactl shell` for Lima, `docker exec -i` for the container backend). Two flags adjust this baseline:
+
+- `--safe-links` — replace the default `-L` with `--safe-links`. In-tree symlinks are preserved as symlinks; out-of-tree symlinks (anything that resolves outside the source root) are skipped instead of followed. Use this when your tree contains intentional symlinks you want to keep as symlinks, or when you want to avoid following a symlink that points outside the workspace.
+- `--no-gitignore` — drop the `:- .gitignore` filter so the push or pull transfers everything, including ignored files. Useful for `.env`-style files you want copied but cannot un-ignore in your `.gitignore`.
+- `--dest <path>` (pull only) — override the host destination. The default is the session's recorded `host_path`. A leading `~` expands against your `$HOME`; the CLI rejects `--dest` pointing at an existing file (it must be a directory, existing or to be created), and it calls `mkdir -p` on the parent of `--dest` before invoking rsync.
+
+```bash
+# Pull a snapshot into a sibling directory without touching the original.
+sandbox workspace pull -f --dest ~/work/dev-snapshot dev
+```
+
+`.gitignore` is read from the **source** side of each operation: push respects the host's `.gitignore`, pull respects the guest's. This is rsync's filter-source semantics, not a sandboxd choice. If you keep `.gitignore` in sync between the two sides (the usual case — a `push -f` from the host overwrites the guest's copy on the next push), the two filters agree. If the guest's `.gitignore` has diverged (e.g. you edited it inside the session), a subsequent pull will use the divergent guest copy, which can surprise. The simplest fix is to keep `.gitignore` versioned and committed.
+
+While a push or pull is running, the session is locked: a second `push`/`pull` on the same session returns `409 Conflict` with a recovery hint, and `sandbox stop`/`sandbox rm` refuses with the same 409 until the in-flight operation completes. Two CLIs cannot race against the same `local:` snapshot.
+
+### Recovering an orphan workspace lock
+
+If a `sandbox workspace push` or `pull` CLI process is killed mid-flight (typically by `SIGKILL` — a non-catchable signal that bypasses the CLI's release-on-cancel guard), the daemon-side lock can outlive the CLI. Subsequent operations on the session then see:
+
+```text
+$ sandbox workspace push -f dev
+Error: session has an active push operation; cancel the operation or run 'sandbox workspace unlock dev --force'
+```
+
+`sandbox stop dev` and `sandbox rm dev` surface the same 409 with the same hint. The recovery is the operator command the hint names:
+
+```bash
+sandbox workspace unlock dev --force
+```
+
+`--force` releases the lock unconditionally, ignoring the token check. The vanilla `sandbox workspace unlock dev` (no `--force`) is the graceful-release path for automation that retained the original `lock_token` from acquire; hand-operators almost always need `--force` because they never see the token. Either form is a 200 no-op against a session whose lock is not currently held, so it is safe to re-issue.
+
+Daemon restarts also clear orphan locks — the lock state is in-memory only and resets on every daemon boot. If you can wait for the next daemon restart, no manual action is needed. `sandbox workspace unlock --force` is the recovery path you reach for when you cannot.
 
 ## Copy individual files with `sandbox cp`
 
@@ -244,15 +297,19 @@ Under the hood `sandbox sync` dispatches the host's `rsync` with the backend's n
 
 `sandbox sync` requires `rsync` on **both** sides. sandboxd-provisioned base images (Lima golden image, Lite container image) ship rsync by default. If you supply a custom image, install rsync yourself.
 
-`cp` vs. `sync` — pick by semantic, not by tree size:
+`cp` vs. `sync` vs. `local:` push/pull — pick by semantic, not by tree size:
 
-| | `sandbox cp` | `sandbox sync` |
-|---|---|---|
-| One-shot copy of a file or tree | Yes | Yes |
-| Retransfers full source on re-run | Yes | No (only deltas) |
-| Preserves attributes (mode, ownership, mtimes) | Yes (via `cp`/`scp`) | Yes (`-a`) |
-| Deletes destination entries no longer on source | No | Yes (`--delete`) |
-| Backend tool dependency | `limactl` / `docker` | `rsync` (host + session) |
+| | `sandbox cp` | `sandbox sync` | `local:` push/pull |
+|---|---|---|---|
+| One-shot copy of a file or tree | Yes | Yes | Yes |
+| Retransfers full source on re-run | Yes | No (only deltas) | No (only deltas) |
+| Preserves attributes (mode, ownership, mtimes) | Yes (via `cp`/`scp`) | Yes (`-a`) | Yes (`-a`) |
+| Deletes destination entries no longer on source | No | Yes (`--delete`) | Yes (`--delete`, always) |
+| Honours `.gitignore` filter on the source side | No | No | Yes (default; opt out via `--no-gitignore`) |
+| Operates on operator-supplied paths | Yes (any path) | Yes (any path) | No (paths fixed at session create) |
+| Requires `local:` workspace mode | No | No | Yes |
+| Lock-protected against concurrent invocations | No | No | Yes (per-session daemon mutex) |
+| Backend tool dependency | `limactl` / `docker` | `rsync` (host + session) | `rsync` (host + session) |
 
 ## Sync via `git push` and `git pull`
 

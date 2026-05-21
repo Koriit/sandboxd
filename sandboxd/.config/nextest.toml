@@ -138,6 +138,7 @@ filter = '''
   | binary(integration_version_endpoint)
   | binary(integration_local_workspace)
   | binary(integration_shared_guest_path)
+  | binary(integration_workspace_lock)
 '''
 test-group = 'docker-sandbox-namespace'
 

@@ -16,10 +16,13 @@ Backend coverage: each function is parametrized over
 runs only the container half on PR-time; ``make test-e2e-matrix``
 runs both.
 
-Out of scope: ``sandbox workspace push`` / ``pull`` arms — those land
-in M17-S3. The create + describe + gitignore + teardown surface is
-the M17-S2 deliverable; push/pull is covered later in dedicated arms
-of this file (added by S3).
+The push/pull arms (``test_workspace_local_push_propagates_host_edit``
+et al.) exercise the operator-driven sync surface
+(``sandbox workspace push`` / ``pull``). The container backend is
+exercised exhaustively; selected push/pull arms parametrize over
+``["lima", "container"]`` while the dry-run / dest-override /
+no-gitignore variants run on the container backend only to keep the
+matrix bounded.
 """
 
 from __future__ import annotations
@@ -482,6 +485,455 @@ def test_workspace_local_create_failure_tears_down(sandbox_cli, backend, tmp_pat
             sandbox_cli("rm", "ws-local-fail", timeout=120)
         except Exception:
             pass
+        if host_dir is not None:
+            try:
+                shutil.rmtree(host_dir)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Push/pull arms — operator-driven sync after session create.
+# ---------------------------------------------------------------------------
+
+def _guest_write(backend: str, session_id: str, guest_path: str, body: str) -> None:
+    """Write ``body`` into ``guest_path`` from inside the guest.
+
+    Uses the backend's native exec transport — ``limactl shell`` for
+    Lima, ``docker exec`` for the container backend. We avoid
+    ``sandbox exec`` here because the workspace-lock state machine
+    deliberately gates push/pull on a daemon-side mutex, and using the
+    CLI to seed test fixtures keeps the test orthogonal to that gate.
+
+    The body is piped to the guest via stdin (``tee >file``) so the
+    bytes round-trip verbatim — no shell-quoting or backslash-escape
+    interpretation. Trailing newlines in ``body`` are preserved.
+    """
+    if backend == "container":
+        ctr = f"sandbox-{session_id}"
+        argv = ["docker", "exec", "-i", ctr, "sh", "-c",
+                f"cat > {guest_path}"]
+    else:
+        vm = lima_vm_name(session_id)
+        argv = ["limactl", "shell", vm, "sh", "-c",
+                f"cat > {guest_path}"]
+    proc = subprocess.run(
+        argv, input=body, text=True,
+        capture_output=True, timeout=60,
+    )
+    assert proc.returncode == 0, (
+        f"failed to write {guest_path} in guest ({backend}): "
+        f"rc={proc.returncode} stderr={proc.stderr!r}"
+    )
+
+
+@pytest.mark.timeout(600)
+def test_workspace_local_push_propagates_host_edit(sandbox_cli, backend, tmp_path):
+    """Spec § Push/pull commands — host edit propagates via ``push -f``.
+
+    Create a ``local:`` session (which runs the initial create-time
+    push). Edit a file on the host *after* the create-time push has
+    mirrored the initial tree. Run ``sandbox workspace push -f
+    <session>`` and assert the edit is visible inside the guest.
+
+    Container coverage is the primary signal; Lima parametrization is
+    best-effort and gated by host KVM/qemu-bridge-helper prereqs (the
+    ``lima`` marker is set on the parametrize id by the harness).
+    """
+    session_id = None
+    host_dir = None
+    try:
+        host_dir = tempfile.mkdtemp(prefix="sandbox-local-push-host-")
+        with open(os.path.join(host_dir, "edited.txt"), "w") as f:
+            f.write("initial-bytes\n")
+
+        guest_path = _guest_path_for(backend)
+        result = sandbox_cli(
+            "create",
+            *make_create_args(
+                backend, "ws-local-push-host",
+                "--workspace", f"local:{host_dir}:{guest_path}",
+            ),
+            timeout=600,
+        )
+        assert result.returncode == 0, (
+            f"create failed (rc={result.returncode}).\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        session_id = parse_session_id(result.stdout)
+        wait_for_state(sandbox_cli, "ws-local-push-host", "Running", timeout=10)
+
+        # Sanity: create-time push mirrored the initial bytes.
+        seed = sandbox_cli(
+            "exec", "ws-local-push-host", "--",
+            "cat", f"{guest_path}/edited.txt", timeout=60,
+        )
+        assert seed.returncode == 0 and seed.stdout == "initial-bytes\n", (
+            f"create-time push must seed `edited.txt`; got rc={seed.returncode} "
+            f"stdout={seed.stdout!r} stderr={seed.stderr!r}"
+        )
+
+        # Edit the host file. The push must mirror this into the guest.
+        with open(os.path.join(host_dir, "edited.txt"), "w") as f:
+            f.write("host-edit-after-create\n")
+
+        push = sandbox_cli(
+            "workspace", "push", "-f", "ws-local-push-host",
+            timeout=300,
+        )
+        assert push.returncode == 0, (
+            f"sandbox workspace push -f failed (rc={push.returncode}).\n"
+            f"stdout: {push.stdout}\nstderr: {push.stderr}"
+        )
+
+        post = sandbox_cli(
+            "exec", "ws-local-push-host", "--",
+            "cat", f"{guest_path}/edited.txt", timeout=60,
+        )
+        assert post.returncode == 0 and post.stdout == "host-edit-after-create\n", (
+            f"host edit must propagate to guest after `workspace push -f`; "
+            f"got rc={post.returncode} stdout={post.stdout!r} stderr={post.stderr!r}"
+        )
+
+        sandbox_cli("rm", "ws-local-push-host", timeout=120)
+        session_id = None
+
+    finally:
+        if session_id is not None:
+            sandbox_cli("rm", "ws-local-push-host", timeout=120)
+        if host_dir is not None:
+            try:
+                shutil.rmtree(host_dir)
+            except OSError:
+                pass
+
+
+@pytest.mark.timeout(600)
+def test_workspace_local_pull_propagates_guest_edit(sandbox_cli, backend, tmp_path):
+    """Spec § Push/pull commands — guest edit propagates via ``pull -f``.
+
+    Create a ``local:`` session. Edit a file *inside the guest* (via
+    the backend's native exec — ``docker exec`` / ``limactl shell``).
+    Run ``sandbox workspace pull -f <session>`` and assert the edit is
+    visible on the host at the recorded ``host_path``.
+
+    Both backends parametrize; Lima is best-effort per the harness's
+    ``lima`` marker / prereq check.
+    """
+    session_id = None
+    host_dir = None
+    try:
+        host_dir = tempfile.mkdtemp(prefix="sandbox-local-pull-host-")
+        with open(os.path.join(host_dir, "from-guest.txt"), "w") as f:
+            f.write("host-original\n")
+
+        guest_path = _guest_path_for(backend)
+        result = sandbox_cli(
+            "create",
+            *make_create_args(
+                backend, "ws-local-pull-guest",
+                "--workspace", f"local:{host_dir}:{guest_path}",
+            ),
+            timeout=600,
+        )
+        assert result.returncode == 0, (
+            f"create failed (rc={result.returncode}).\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        session_id = parse_session_id(result.stdout)
+        wait_for_state(sandbox_cli, "ws-local-pull-guest", "Running", timeout=10)
+
+        # Edit the file from inside the guest. Use the backend's native
+        # exec transport to keep the seed write orthogonal to the
+        # daemon-side workspace-lock surface.
+        _guest_write(
+            backend, session_id, f"{guest_path}/from-guest.txt",
+            "guest-edited\n",
+        )
+
+        pull = sandbox_cli(
+            "workspace", "pull", "-f", "ws-local-pull-guest",
+            timeout=300,
+        )
+        assert pull.returncode == 0, (
+            f"sandbox workspace pull -f failed (rc={pull.returncode}).\n"
+            f"stdout: {pull.stdout}\nstderr: {pull.stderr}"
+        )
+
+        with open(os.path.join(host_dir, "from-guest.txt")) as f:
+            host_contents = f.read()
+        assert host_contents == "guest-edited\n", (
+            f"guest edit must appear on host after `workspace pull -f`; "
+            f"host file contents: {host_contents!r}"
+        )
+
+        sandbox_cli("rm", "ws-local-pull-guest", timeout=120)
+        session_id = None
+
+    finally:
+        if session_id is not None:
+            sandbox_cli("rm", "ws-local-pull-guest", timeout=120)
+        if host_dir is not None:
+            try:
+                shutil.rmtree(host_dir)
+            except OSError:
+                pass
+
+
+@pytest.mark.container
+@pytest.mark.timeout(600)
+def test_workspace_local_push_dry_run(sandbox_cli, tmp_path):
+    """Spec § Push/pull commands — ``-n`` is side-effect-free.
+
+    Edit a host file. Run ``sandbox workspace push -n <session>`` and
+    assert:
+
+    1. The CLI exits 0 (dry-run is not a failure mode).
+    2. The guest's view of the file is unchanged — dry-run mutates
+       nothing.
+
+    The CLI's rsync invocation does not pass ``-v``, so rsync's
+    archive-mode dry-run is silent by default (no "would-transfer"
+    file list on stdout); the load-bearing contract is that the
+    guest tree is untouched.
+
+    Container backend is enough to pin the dry-run contract; the
+    planner is backend-uniform.
+    """
+    backend = "container"
+    session_id = None
+    host_dir = None
+    try:
+        host_dir = tempfile.mkdtemp(prefix="sandbox-local-push-dryrun-")
+        with open(os.path.join(host_dir, "watched.txt"), "w") as f:
+            f.write("pre-edit\n")
+
+        guest_path = _guest_path_for(backend)
+        result = sandbox_cli(
+            "create",
+            *make_create_args(
+                backend, "ws-local-push-dry",
+                "--workspace", f"local:{host_dir}:{guest_path}",
+            ),
+            timeout=600,
+        )
+        assert result.returncode == 0, (
+            f"create failed (rc={result.returncode}).\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        session_id = parse_session_id(result.stdout)
+        wait_for_state(sandbox_cli, "ws-local-push-dry", "Running", timeout=10)
+
+        # Edit the host file *after* the create-time push so dry-run
+        # has a real diff to report (otherwise rsync prints nothing).
+        with open(os.path.join(host_dir, "watched.txt"), "w") as f:
+            f.write("post-edit-but-not-pushed\n")
+
+        dry = sandbox_cli(
+            "workspace", "push", "-n", "ws-local-push-dry",
+            timeout=120,
+        )
+        assert dry.returncode == 0, (
+            f"sandbox workspace push -n must exit 0; "
+            f"rc={dry.returncode}\nstdout: {dry.stdout}\nstderr: {dry.stderr}"
+        )
+
+        # The guest must still see the pre-edit contents — dry-run is
+        # side-effect-free.
+        post = sandbox_cli(
+            "exec", "ws-local-push-dry", "--",
+            "cat", f"{guest_path}/watched.txt", timeout=60,
+        )
+        assert post.returncode == 0 and post.stdout == "pre-edit\n", (
+            f"dry-run must not mutate the guest; expected `pre-edit` in guest "
+            f"after `push -n`, got rc={post.returncode} stdout={post.stdout!r}"
+        )
+
+        sandbox_cli("rm", "ws-local-push-dry", timeout=120)
+        session_id = None
+
+    finally:
+        if session_id is not None:
+            sandbox_cli("rm", "ws-local-push-dry", timeout=120)
+        if host_dir is not None:
+            try:
+                shutil.rmtree(host_dir)
+            except OSError:
+                pass
+
+
+@pytest.mark.container
+@pytest.mark.timeout(600)
+def test_workspace_local_pull_dest_override(sandbox_cli, tmp_path):
+    """Spec § Push/pull commands — ``--dest`` routes pull elsewhere.
+
+    Create a ``local:`` session. Edit a guest file. Run ``sandbox
+    workspace pull -f --dest <alt> <session>``. Assert:
+
+    1. The edit appears at the ``--dest`` location.
+    2. The original ``host_path`` is unchanged (the pull is routed
+       elsewhere, not mirrored back to its create-time source).
+
+    Container backend is enough — the override is CLI-side argv
+    construction and backend-uniform.
+    """
+    backend = "container"
+    session_id = None
+    host_dir = None
+    alt_dir = None
+    try:
+        host_dir = tempfile.mkdtemp(prefix="sandbox-local-pull-dest-src-")
+        with open(os.path.join(host_dir, "rerouted.txt"), "w") as f:
+            f.write("host-original\n")
+
+        # `--dest` must name a non-file path (existing dir or
+        # to-be-created dir). Provide an existing, empty dir to keep
+        # the test orthogonal to the `create_dir_all(dirname(dest))`
+        # branch — that branch is unit-tested.
+        alt_dir = tempfile.mkdtemp(prefix="sandbox-local-pull-dest-alt-")
+
+        guest_path = _guest_path_for(backend)
+        result = sandbox_cli(
+            "create",
+            *make_create_args(
+                backend, "ws-local-pull-dest",
+                "--workspace", f"local:{host_dir}:{guest_path}",
+            ),
+            timeout=600,
+        )
+        assert result.returncode == 0, (
+            f"create failed (rc={result.returncode}).\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        session_id = parse_session_id(result.stdout)
+        wait_for_state(sandbox_cli, "ws-local-pull-dest", "Running", timeout=10)
+
+        # Edit from inside the guest.
+        _guest_write(
+            backend, session_id, f"{guest_path}/rerouted.txt",
+            "from-guest-rerouted\n",
+        )
+
+        pull = sandbox_cli(
+            "workspace", "pull", "-f", "--dest", alt_dir,
+            "ws-local-pull-dest",
+            timeout=300,
+        )
+        assert pull.returncode == 0, (
+            f"sandbox workspace pull --dest failed (rc={pull.returncode}).\n"
+            f"stdout: {pull.stdout}\nstderr: {pull.stderr}"
+        )
+
+        # The guest edit landed at the override path.
+        with open(os.path.join(alt_dir, "rerouted.txt")) as f:
+            alt_contents = f.read()
+        assert alt_contents == "from-guest-rerouted\n", (
+            f"`--dest` must route the pull to the override path; "
+            f"alt_dir contents: {alt_contents!r}"
+        )
+
+        # The original host_path is untouched — pull routed elsewhere.
+        with open(os.path.join(host_dir, "rerouted.txt")) as f:
+            orig_contents = f.read()
+        assert orig_contents == "host-original\n", (
+            f"`--dest` must leave the recorded host_path unchanged; "
+            f"original host file: {orig_contents!r}"
+        )
+
+        sandbox_cli("rm", "ws-local-pull-dest", timeout=120)
+        session_id = None
+
+    finally:
+        if session_id is not None:
+            sandbox_cli("rm", "ws-local-pull-dest", timeout=120)
+        for d in (host_dir, alt_dir):
+            if d is not None:
+                try:
+                    shutil.rmtree(d)
+                except OSError:
+                    pass
+
+
+@pytest.mark.container
+@pytest.mark.timeout(600)
+def test_workspace_local_push_no_gitignore(sandbox_cli, tmp_path):
+    """Spec § Push/pull commands — ``--no-gitignore`` bypasses filter.
+
+    Create a session with a ``.gitignore`` that ignores ``excluded/``.
+    The create-time filter drops ``excluded/`` from the guest. Run
+    ``sandbox workspace push -f --no-gitignore <session>``. Assert the
+    file lands in the guest — the post-create push filter is dropped.
+
+    Container backend is enough — the planner contract is
+    backend-uniform.
+    """
+    backend = "container"
+    session_id = None
+    host_dir = None
+    try:
+        host_dir = tempfile.mkdtemp(prefix="sandbox-local-push-nogi-")
+        with open(os.path.join(host_dir, ".gitignore"), "w") as f:
+            f.write("excluded/\n")
+        os.makedirs(os.path.join(host_dir, "excluded"))
+        with open(os.path.join(host_dir, "excluded", "file.txt"), "w") as f:
+            f.write("formerly-ignored\n")
+
+        guest_path = _guest_path_for(backend)
+        result = sandbox_cli(
+            "create",
+            *make_create_args(
+                backend, "ws-local-push-nogi",
+                "--workspace", f"local:{host_dir}:{guest_path}",
+            ),
+            timeout=600,
+        )
+        assert result.returncode == 0, (
+            f"create failed (rc={result.returncode}).\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        session_id = parse_session_id(result.stdout)
+        wait_for_state(sandbox_cli, "ws-local-push-nogi", "Running", timeout=10)
+
+        # Sanity: create-time filter dropped `excluded/`. If this
+        # baseline fails the rest of the assertion is moot.
+        baseline = sandbox_cli(
+            "exec", "ws-local-push-nogi", "--",
+            "test", "-e", f"{guest_path}/excluded",
+            timeout=60,
+        )
+        assert baseline.returncode != 0, (
+            f"baseline: create-time `.gitignore` filter must drop "
+            f"`excluded/`; saw exit 0 from `test -e`."
+        )
+
+        push = sandbox_cli(
+            "workspace", "push", "-f", "--no-gitignore",
+            "ws-local-push-nogi",
+            timeout=300,
+        )
+        assert push.returncode == 0, (
+            f"sandbox workspace push -f --no-gitignore failed "
+            f"(rc={push.returncode}).\n"
+            f"stdout: {push.stdout}\nstderr: {push.stderr}"
+        )
+
+        post = sandbox_cli(
+            "exec", "ws-local-push-nogi", "--",
+            "cat", f"{guest_path}/excluded/file.txt",
+            timeout=60,
+        )
+        assert post.returncode == 0 and post.stdout == "formerly-ignored\n", (
+            f"`--no-gitignore` push must transfer files matched by "
+            f".gitignore; rc={post.returncode} stdout={post.stdout!r} "
+            f"stderr={post.stderr!r}"
+        )
+
+        sandbox_cli("rm", "ws-local-push-nogi", timeout=120)
+        session_id = None
+
+    finally:
+        if session_id is not None:
+            sandbox_cli("rm", "ws-local-push-nogi", timeout=120)
         if host_dir is not None:
             try:
                 shutil.rmtree(host_dir)
