@@ -1536,13 +1536,14 @@ directly, **not** `std::process::Command` wrapped in
 `spawn_blocking`. The async-aware variant properly supports
 cancellation — dropping the future or calling `child.kill()` cleanly
 terminates the rsync child process — which is load-bearing for the
-cancellation, daemon-SIGTERM, and session-create-timeout paths
-described in § `local:` Mode → Cancellation and timeout.
+cancellation, daemon-SIGTERM, and client-HTTP-timeout-driven
+request-drop paths described in § `local:` Mode → Cancellation and
+timeout.
 
 Stdout/stderr are captured per § Rsync invocation: exit codes,
 stdio, ownership: stdout is logged at INFO level on the daemon;
 stderr is captured and, on non-zero exit, surfaced verbatim in the
-daemon's `InvalidState` / `Internal` response so the operator sees
+daemon's `InvalidArgument` / `Internal` response so the operator sees
 rsync's own error (e.g. `rsync: command not found`, permission
 denied, EROFS on the container-rootfs case). The container backend
 follows the same orchestration pattern via its own `docker exec -i`
