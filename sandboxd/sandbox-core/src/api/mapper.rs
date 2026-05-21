@@ -1312,9 +1312,9 @@ mod tests {
 
     #[test]
     fn workspace_mode_detail_dto_local_round_trip() {
-        // Wire-surface-only in S1 (no domain mapping); the DTO must still
-        // serialise and deserialise cleanly so future daemons can populate
-        // it and current clients consume it without a release-train pin.
+        // The DTO must serialise and deserialise cleanly for the `Local`
+        // arm — the mapper populates it from the in-memory `WorkspaceMode`
+        // and the CLI describe renderer consumes it on the wire.
         let dto = WorkspaceModeDetailDto::Local {
             host_path: "/tmp/sbx-l".into(),
             guest_path: "/srv/work".into(),
