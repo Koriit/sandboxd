@@ -788,6 +788,14 @@ push command is not subject to the session-create timeout — it runs
 under the operator's terminal until it completes — so trees that
 do not fit the create envelope can still be seeded incrementally.
 
+**No workspace-lock interaction at create time.** The initial
+push on `sandbox create` does **not** acquire the workspace
+lock. The session is in `Creating` state during the daemon-side
+rsync and is therefore not yet eligible for client-driven
+workspace operations (the lock acquire would return a 400 from
+the state gate regardless). The lock subsystem governs only
+post-create push/pull — see § Workspace lock.
+
 ### Default rsync invocation
 
 The baseline flag set for both the create-time push and the
@@ -968,16 +976,28 @@ See § CLI shape for the surface. Implementation notes:
 - The push/pull planner is a sibling of `plan_sync_command` in
   `sandbox-cli`. It produces an `rsync ...` argv and `exec`s it with
   stdio inherited, the same way `sandbox sync` does today.
-- The session resolution (name → id) and state check
-  (must be Running) happen client-side before constructing the argv,
-  to fail fast with operator-readable errors. The daemon-side
-  validation happens too (so a misbehaving CLI can't bypass the
-  state gate) but is redundant on the happy path.
+- The session resolution (name → id) happens client-side. The
+  state check (must be Running) is enforced atomically on the
+  daemon side as part of the workspace-lock acquire — see §
+  Workspace lock → API endpoints (a 400 response when the
+  session is not in a state that allows workspace ops). The CLI
+  may still issue a client-side `GET /sessions/<id>` to
+  fail-fast for the common error cases (clear "session not
+  found" / "session not running" messages without spawning the
+  rsync subprocess), but the atomic gate is the lock acquire
+  itself — the previous "client-side state check then
+  construct argv" sequence is collapsed to "lock acquire (which
+  state-gates atomically) then construct argv then spawn rsync
+  then release". See § Push/pull commands → Error contracts
+  for the propagation rules.
 - The session mode check (must be Local) happens by reading
   `GET /sessions/<id>` first, inspecting `workspace_mode`, and
   rejecting client-side if it's not local. The DTO already exposes
   `workspace_mode` as a rendered string (`render_workspace_mode`);
-  parsing `local:` out of it is straightforward.
+  parsing `local:` out of it is straightforward. (The mode check
+  remains client-side — the lock subsystem does not encode mode
+  semantics; the mode gate is a separate, idempotent, read-only
+  check.)
 - `--dest` (pull only) defaults to the session's recorded
   `host_path`. The default is computed client-side from the same
   `GET /sessions/<id>` round-trip used for the mode check.
@@ -1019,6 +1039,297 @@ and pull will filter differently. Push uses the host's older
 symmetric filter rules between the two directions should keep the
 two `.gitignore` files in sync (which a `push -f` from the host
 naturally accomplishes, modulo the gitignore filter itself).
+
+**Error contracts (push/pull).** Push and pull surface three
+distinct daemon-driven error classes that the CLI propagates
+verbatim:
+
+- **Not running / not local** — the session resolution and the
+  client-side `GET /sessions/<id>` check (per the bullets above)
+  fail with a CLI-side message naming the session and the
+  observed state or mode. The daemon-side validation enforces the
+  same contract on the wire so a misbehaving CLI cannot bypass
+  the gate.
+- **Lock contention** — reported as HTTP 409 Conflict; see §
+  Workspace lock. The CLI never spawns rsync when the lock
+  acquire returns a conflict; the daemon's error message is
+  printed verbatim.
+- **Rsync non-zero exit** — exit code propagated to the CLI per §
+  `local:` Mode → Rsync invocation: exit codes, stdio,
+  ownership.
+
+## Workspace lock
+
+### Goal
+
+Prevent concurrent workspace operations (push, pull) on the same
+session, and prevent destructive lifecycle operations (`sandbox
+stop`, `sandbox delete`) from racing with an in-flight workspace
+op. The lock is the daemon-side mutual-exclusion primitive that
+makes push and pull on the same session strictly serial, and
+that makes "rsync running while the VM gets torn down" an
+impossible state rather than a tolerated race.
+
+### Lock state (daemon-side)
+
+The daemon maintains a per-session **workspace lock** in memory.
+The lock is *not* persisted to the session DB — it resets to
+`Unlocked` on every daemon restart. See § Persistence and serde
+below for why this is the deliberate design.
+
+Lock state is one of:
+
+- `Unlocked`.
+- `Locked { op: WorkspaceOp, token: LockToken, acquired_at: SystemTime }`.
+
+Where:
+
+- `WorkspaceOp` is a typed enum with variants `Push` and `Pull`.
+  (Both variants block both other variants — a held `Push` lock
+  rejects an incoming `Pull` acquire, and vice versa. The
+  variant only exists so the rejection error message can name
+  the active op accurately.)
+- `LockToken` is an opaque daemon-generated identifier
+  sufficient to prevent foreign release — recommended shape is a
+  UUID v4 or equivalent. The token is returned to the acquiring
+  CLI on success and must be presented to release the lock
+  cleanly.
+
+Lock acquire, release, and inspection operations are performed
+under a per-session mutex (or equivalent atomic primitive) so
+acquire is observably atomic — no partial states are visible to
+concurrent callers.
+
+### API endpoints
+
+Three new endpoints. All three follow the existing handler
+conventions: `error_response()` maps `SandboxError` variants to
+HTTP status codes (CLAUDE.md convention), DTOs live in
+`sandbox-core/src/api/dto.rs`, the handler return type is `impl
+IntoResponse`, and any `std::process::Command` work (there is
+none for the lock subsystem itself, but the surrounding
+push/pull machinery follows the rule) is wrapped in
+`tokio::task::spawn_blocking`.
+
+1. **`POST /sessions/{id}/workspace-lock`** — acquire.
+   - Request body (DTO):
+     `WorkspaceLockAcquireRequest { op: "push" | "pull" }`.
+   - Response body on success (200):
+     `WorkspaceLockAcquireResponse { lock_token: "<uuid>" }`.
+     Lock transitions to `Locked { op, token, acquired_at = now }`.
+   - **409 Conflict** if the lock is already held. The response
+     body names the active op:
+     `{ "error": "session has an active push operation" }`
+     (or `"... pull operation"`). The error message is what the
+     CLI surfaces verbatim.
+   - **400 Bad Request** if the session's lifecycle state does
+     not allow workspace operations — e.g. `Creating`,
+     `Stopped`, `Errored`. The response includes the observed
+     state:
+     `{ "error": "session is in state Stopped; workspace operations require Running" }`.
+   - **404 Not Found** if the session id is unknown.
+2. **`DELETE /sessions/{id}/workspace-lock`** — release.
+   - Request body (DTO):
+     `WorkspaceLockReleaseRequest { lock_token: "<uuid>", force: bool }`.
+     The `force` field defaults to `false` (Serde `#[serde(default)]`).
+   - Response on success (200): empty body. Lock transitions to
+     `Unlocked`.
+   - **409 Conflict** if the supplied `lock_token` does not
+     match the current lock and `force == false`:
+     `{ "error": "lock_token mismatch; pass force=true to override" }`.
+   - With `force == true`, the token check is bypassed: the
+     lock is released unconditionally. This is the orphan-lock
+     recovery path used by `sandbox workspace unlock --force`
+     (see CLI flow below).
+   - **Idempotent on already-unlocked.** Releasing an already-
+     unlocked lock returns **200 OK with empty body** —
+     conventional DELETE semantics. This applies regardless of
+     `force`. (Rationale: a CLI retrying release after a
+     transient network error should see a no-op success, not a
+     spurious 409 or 404.) This behaviour is documented
+     explicitly so implementers do not default to 404.
+3. **`GET /sessions/{id}/workspace-lock`** — *not provided*.
+   Lock state is not part of the inspection surface; it is a
+   transient runtime concern, surfaced only by the conflict
+   response on the acquire endpoint. See § Persistence and
+   serde.
+
+### CLI flow
+
+Both `sandbox workspace push` and `sandbox workspace pull`
+follow this flow, ordered:
+
+1. **Acquire lock.** `POST /sessions/{id}/workspace-lock` with
+   `{"op": "push"}` or `{"op": "pull"}`. On 409, the CLI exits
+   non-zero with the daemon's error message; rsync is *not*
+   spawned. On 400 or 404, the CLI exits non-zero with the
+   daemon's error message.
+2. **Spawn rsync.** Via the existing `-e 'limactl shell ...'`
+   or `-e 'docker exec ...'` transport, stdio inherited per §
+   `local:` Mode → Rsync invocation: exit codes, stdio,
+   ownership.
+3. **Release lock.** After rsync exits (success or failure),
+   `DELETE /sessions/{id}/workspace-lock` with the lock_token
+   returned by step 1. Release is best-effort — if the release
+   call itself fails (network error, daemon restart), the CLI
+   logs a warning to stderr but does *not* change the rsync
+   exit code. The lock-release failure is observable but does
+   not mask the operation's real outcome.
+4. **Crash-safety.** The CLI uses a `Drop`-style guard (or
+   equivalent — e.g. a `scopeguard::defer!` block, or a
+   `signal_hook`-driven cleanup on `SIGINT`/`SIGTERM`) so the
+   release call runs even on panic, on Ctrl+C, or on
+   `process::exit` from a deeper failure path. The guard fires
+   the same `DELETE` call as step 3, with the token captured at
+   acquire time. The guard's release is itself best-effort: a
+   second failure to release (CLI is being SIGKILL'd, daemon is
+   unreachable) leaves an orphan lock that the operator clears
+   via `sandbox workspace unlock --force` (see below).
+
+The "check session state then acquire" race window flagged in
+SF-15's original "client-side state check" formulation is closed
+by collapsing the two operations into a single atomic acquire on
+the daemon. The CLI no longer performs a separate state-check
+round-trip before acquire; the daemon's acquire handler enforces
+the state gate (400 if not Running) and the lock check (409 if
+already held) atomically.
+
+### New CLI command: `sandbox workspace unlock`
+
+Add a new subcommand under `sandbox workspace`:
+
+```
+sandbox workspace unlock <session> [--force]
+```
+
+Behaviour:
+
+- **Without `--force`.** Calls `DELETE /sessions/{id}/workspace-lock`
+  with an empty (or operator-supplied, but in practice unknown)
+  `lock_token` and `force=false`. Returns the daemon's 409
+  token-mismatch error unless the operator happens to know the
+  current lock_token. Documented as the "graceful release" path,
+  reserved for automation that retained the token from acquire;
+  in practice, hand-operators almost always pass `--force`.
+- **With `--force`.** Calls `DELETE /sessions/{id}/workspace-lock`
+  with `force=true`; the daemon releases the lock unconditionally
+  (ignoring the token). Used to recover orphan locks left behind
+  by a crashed CLI session. On a `200`, the CLI prints "workspace
+  lock released" and exits 0. On a `404` for the session itself,
+  the CLI prints "session not found" and exits non-zero. On a
+  `200` against an already-unlocked session (idempotent path),
+  the CLI prints "workspace lock released" and exits 0 — the
+  operator does not need to know whether a lock was actually held.
+
+The subcommand's clap help text explicitly names the expected
+use:
+
+```
+Force-releases an orphan workspace lock left by a crashed CLI session.
+```
+
+The `--force` flag is the expected and documented use of this
+command in practice. Without `--force`, the call returns the 409
+token-mismatch error (since the operator does not have the
+original token); the help text and `docs/guides/workspaces.md`
+both call this out.
+
+### Lifecycle interaction
+
+The daemon handlers for `POST /sessions/{id}/stop` and `DELETE
+/sessions/{id}` (the latter is the existing `remove_session`
+handler in `sandboxd/sandboxd/src/main.rs`) check the workspace
+lock state *before* any teardown work begins:
+
+- **Unlocked.** Proceed as today.
+- **Locked.** Return **409 Conflict** with the daemon error:
+  `session has an active <push|pull> operation; cancel the operation or run 'sandbox workspace unlock <name> --force'`
+  Substitute `<push|pull>` based on the active `WorkspaceOp` and
+  `<name>` with the session's CLI-visible name. The CLI
+  surfaces the error verbatim.
+
+The check runs synchronously inside the handler, before any of
+the existing teardown sequence (cancel ingestor, teardown
+networking, stop the VM/container, remove the session record).
+The lock-state check shares the same per-session mutex as the
+acquire/release path, so there is no race between "stop is
+checking the lock" and "push is acquiring the lock".
+
+### Concurrency and races
+
+- Lock acquire, release, and lifecycle-handler check operations
+  all run under the same per-session mutex (or equivalent — a
+  `tokio::sync::Mutex` is the natural choice given the async
+  handler context, though a `parking_lot::Mutex` guarded with
+  `spawn_blocking` is equally valid). Acquire is observably
+  atomic — no partial states are visible to concurrent callers.
+- If two CLIs race to acquire the same session's lock, exactly
+  one succeeds; the other gets the documented 409 with the
+  active-op name. The mutex serialises access; the lock state
+  is the single source of truth.
+- The CLI's previous "check session state, then acquire" sequence
+  collapses to a single acquire call. The daemon enforces both
+  the state gate (400 if not Running) and the lock gate (409 if
+  already held) inside the mutex-guarded handler, with no
+  separately-observable intermediate state.
+- The lifecycle handlers (`stop`, `delete`) take the same mutex
+  before reading the lock state. A push that acquires the lock
+  between "stop reads the lock as Unlocked" and "stop begins
+  teardown" cannot happen because the lock acquire and the
+  lock-state read serialise through the same critical section.
+
+### Orphan locks
+
+The lock survives only in daemon memory. If the daemon restarts,
+all locks reset to `Unlocked` (no on-disk state to recover from).
+If the CLI crashes mid-rsync without firing its `Drop` guard
+(e.g. SIGKILL), the lock remains held until one of:
+
+1. The same CLI re-runs and explicitly releases — only viable
+   if the CLI persisted the lock_token, which the spec does not
+   require. In practice this is not a recovery path.
+2. A different CLI runs `sandbox workspace unlock <session>
+   --force`. The expected operator recovery path.
+3. The daemon restarts. The lock state is in-memory only and
+   resets on restart.
+
+The expected operator workflow on orphan-lock detection:
+
+- The operator runs `sandbox workspace push <s> -f`.
+- Receives a 409 with `session has an active push operation; cancel the operation or run 'sandbox workspace unlock <s> --force'`.
+- Runs `sandbox workspace unlock <s> --force`.
+- Re-runs `sandbox workspace push <s> -f`. Succeeds.
+
+Documented in `docs/guides/workspaces.md` next to the
+push/pull section.
+
+### Persistence and serde
+
+- The workspace lock is **not** persisted to the session DB. No
+  migration is needed.
+- No new fields are added to `SessionConfigDto` or
+  `SessionMountInfo`. The lock state is a runtime concern of the
+  daemon, surfaced only through the lock API endpoints.
+- `sandbox describe` does **not** surface the workspace lock
+  state. The lock is transient runtime info, not session config;
+  surfacing it via `describe` would create a parallel
+  inspection surface that drifts from the API. Operators
+  inspecting lock state in practice would call `POST
+  /sessions/{id}/workspace-lock` and observe whether they get a
+  success or a 409 — this is the documented introspection path.
+- Lock state resets on daemon restart by design. A held lock
+  represents an in-flight CLI operation; if the daemon restarts,
+  the in-flight rsync is dead anyway (the daemon-side shell
+  transport that rsync's `-e` flag invokes is no longer running
+  on the daemon side, though for push/pull the daemon is not
+  involved in the rsync itself — but the CLI's monitoring
+  expectation that the daemon is reachable for the release call
+  also breaks). Resetting to Unlocked on restart matches the
+  operational reality: the lock would have been orphaned anyway.
+- The lock subsystem adds no fields to any persisted struct, so
+  no forward-compat shim is required. A daemon restart's "reset
+  all locks" behaviour is implicit in the "not persisted"
+  property.
 
 ## Lima Backend
 
@@ -1555,6 +1866,38 @@ rely on.
   command parser rejects before the planner — pick one).
 - Neither set: usage error.
 
+Workspace-lock subsystem (location TBD — likely a new
+`sandbox-core/src/workspace_lock.rs` or equivalent, owned by
+whichever crate holds the per-session in-memory runtime state):
+
+- `acquire_when_unlocked_succeeds` — a fresh lock starts
+  `Unlocked`; an `acquire(Push)` transitions to `Locked { op:
+  Push, token: T, acquired_at: _ }` and returns `T`.
+- `acquire_when_locked_returns_conflict` — after a successful
+  `acquire(Push)`, a second `acquire(Push)` returns a
+  conflict error naming the active op; a second `acquire(Pull)`
+  also returns conflict naming the active op as `Push`. (Both
+  ops block both other ops; see § Workspace lock → Lock
+  state.)
+- `release_with_correct_token_unlocks` — `release(T,
+  force=false)` after `acquire` returning `T` transitions the
+  lock back to `Unlocked`.
+- `release_with_wrong_token_returns_conflict` — `release(T2,
+  force=false)` where `T2 != T` returns the documented
+  token-mismatch conflict; the lock remains `Locked`.
+- `release_with_force_ignores_token` — `release(T2, force=true)`
+  where `T2 != T` transitions the lock to `Unlocked` regardless
+  of the token mismatch.
+- `release_when_already_unlocked_is_idempotent` —
+  `release(any-token, force=false)` and `release(any-token,
+  force=true)` on an `Unlocked` lock both return success
+  (matching the API's documented 200 OK on idempotent
+  release).
+- `restart_resets_locks` — construct a lock state map, simulate
+  a daemon restart by dropping and re-constructing the
+  in-memory state, assert all locks are `Unlocked`. (Asserts
+  the "lock state is not persisted" property.)
+
 `sandbox-cli/src/main.rs` (describe rendering):
 
 - Expand existing `render_describe_one` tests with golden-form
@@ -1597,6 +1940,32 @@ rely on.
   `/srv/work` inside the guest and writes round-trip to the host.
 - `integration_shared_guest_path_container` — same shape against
   the container backend.
+- `integration_workspace_lock_push_blocks_pull` — boots a
+  `local:` session, acquires a push lock via `POST
+  /sessions/{id}/workspace-lock` with `{"op":"push"}`,
+  attempts a second acquire with `{"op":"pull"}`, asserts the
+  response is HTTP 409 with the documented error message
+  naming the active push op. Releases via `DELETE` and asserts
+  a subsequent pull acquire succeeds.
+- `integration_workspace_lock_blocks_stop` — boots a `local:`
+  session, acquires a push lock, attempts `POST
+  /sessions/{id}/stop`, asserts the response is HTTP 409 with
+  the documented error message including the `sandbox
+  workspace unlock --force` recovery hint. Releases the lock
+  and asserts the subsequent stop succeeds.
+- `integration_workspace_lock_blocks_delete` — same shape as
+  the stop test but exercises `DELETE /sessions/{id}` (the
+  `remove_session` handler). Asserts the same 409 contract;
+  asserts a successful delete after release.
+- `integration_workspace_lock_force_release` — boots a `local:`
+  session, acquires a push lock, deliberately discards the
+  token (simulating a crashed CLI), calls `DELETE
+  /sessions/{id}/workspace-lock` with `{"force":true}` and an
+  unrelated token, asserts 200. A subsequent acquire succeeds.
+- `integration_workspace_lock_idempotent_release` — calls
+  `DELETE /sessions/{id}/workspace-lock` against an unlocked
+  session, asserts 200 with empty body (both `force=false`
+  and `force=true` paths).
 
 ### E2E tests (`tests/e2e/`)
 
@@ -1616,8 +1985,28 @@ rely on.
   - Create a session with `shared:<tempdir>:/srv/work`.
   - Assert the mount appears at `/srv/work`.
   - Cross-check writes round-trip to the host.
+- `test_workspace_lock.py` — exercises the workspace-lock
+  subsystem across both backends (matrix parameterisation
+  via `@pytest.mark.parametrize("backend", ["lima",
+  "container"])` per the marker convention adopted in §
+  Tests → E2E tests and SF-6's resolution):
+  - Push-versus-stop interleave: create a `local:` session,
+    populate the host source with enough content to make
+    `sandbox workspace push -f` long-running (e.g. several
+    hundred MB of dummy files), spawn the push as a
+    background subprocess, wait briefly for the push to
+    acquire the lock, run `sandbox stop <session>`, assert
+    the stop call exits non-zero with the documented 409
+    error text. Wait for the push to complete; assert
+    `sandbox stop <session>` then succeeds.
+  - Orphan-lock recovery: simulate a crashed CLI by killing
+    the push subprocess with SIGKILL (so the `Drop` guard
+    does not fire), assert `sandbox workspace push -f`
+    returns the 409 lock-contention error, run `sandbox
+    workspace unlock <session> --force`, assert the
+    subsequent push succeeds.
 
-Both new e2e files follow the existing `tests/e2e/conftest.py`
+The new e2e files all follow the existing `tests/e2e/conftest.py`
 session-lifecycle pattern. The full e2e matrix run
 (`make test-e2e-matrix`) covers both backends; the container-only
 PR-time run (`make test-e2e-container`) covers the container
@@ -1651,6 +2040,12 @@ branches.
 - The "`cp` vs. `sync`" table extends to cover `local:` push/pull
   as a separate row, clarifying the "this is mode-aware, not a
   generic file mover" distinction.
+- The "Snapshot a host directory (`local:` mode)" section gains
+  a "Recovering an orphan workspace lock" sub-paragraph
+  documenting the `sandbox workspace unlock <session> --force`
+  recovery path, the 409-on-stop/push/pull symptom that
+  triggers it, and the expected operator workflow per §
+  Workspace lock → Orphan locks.
 
 ### `docs/guides/hardening.md`
 
@@ -1961,8 +2356,24 @@ discoverability-zero without them.
   [--no-gitignore]` CLI subcommand.
 - `sandbox workspace pull <session> {-f|-n} [--safe-links]
   [--no-gitignore] [--dest <path>]` CLI subcommand.
+- `sandbox workspace unlock <session> [--force]` CLI subcommand
+  per § Workspace lock → New CLI command.
+- Workspace-lock subsystem per § Workspace lock: daemon-side
+  per-session lock state, `POST` / `DELETE
+  /sessions/{id}/workspace-lock` endpoints, lifecycle-handler
+  integration on `stop` and `delete` (409 Conflict when a lock
+  is held), CLI flow integration on push/pull (acquire →
+  rsync → release with `Drop`-style crash-safety guard),
+  orphan-lock recovery path via `unlock --force`. The
+  subsystem enlarges S2's scope beyond the original spec; the
+  milestone doc and session plan will be updated separately
+  to reflect the addition.
 - Client-side state and mode checks (must be Running, must be
-  `local:`) with the documented error messages.
+  `local:`) with the documented error messages. (The "must be
+  Running" check is enforced atomically on the daemon side
+  through the lock acquire's state gate per § Workspace lock,
+  collapsing the previous "check state, then acquire" race
+  window into a single atomic operation.)
 - `sandbox describe` rendering of the `Local` variant in the
   `Workspace:` block.
 - Unit tests for the local-subset of § Tests (parser variants,
@@ -1970,12 +2381,14 @@ discoverability-zero without them.
   `Local` argv shape).
 - Integration tests (`integration_*` prefix) enumerated in §
   Tests → Integration tests.
-- E2E tests (`tests/e2e/test_workspace_local.py` +
-  `test_workspace_shared_guest_path.py`) enumerated in § Tests →
+- E2E tests (`tests/e2e/test_workspace_local.py`,
+  `test_workspace_shared_guest_path.py`,
+  `test_workspace_lock.py`) enumerated in § Tests →
   E2E tests.
 - Docs updates for the local layer:
   - `docs/guides/workspaces.md` new "Snapshot a host directory
-    (`local:`)" section.
+    (`local:`)" section, plus the "Recovering an orphan
+    workspace lock" sub-paragraph per § Docs Changes.
   - `docs/guides/hardening.md` trade-off bullet under "Security
     trade-offs you choose".
   - `docs/concepts/workspaces.md` updated mode list and trade-off
