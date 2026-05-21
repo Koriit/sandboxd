@@ -34,9 +34,15 @@ sandbox workspace push <session> {-f | -n} [--safe-links] [--no-gitignore]
 sandbox workspace pull <session> {-f | -n} [--safe-links] [--no-gitignore] [--dest <path>]
 ```
 
-One milestone (M17), four sessions: (S1) `shared:` parser + guest-path
-+ securityModel; (S2) `local:` mode end-to-end with push/pull; (S3)
-six-track review across both; (S4) spec-delivery verification.
+One milestone (M17), five sessions: (S1) `shared:` parser +
+guest-path + securityModel + DTO scaffold; (S2) `local:` mode core
+(variant, parser arm, daemon-side rsync orchestration at create,
+capability advertisement, describe rendering — no push/pull, no
+lock); (S3) push/pull commands + workspace-lock subsystem (the lock
+state machine, the three API endpoints, lifecycle integration,
+`unlock --force` CLI, orphan recovery, and the push/pull CLI that
+consumes the lock from day one); (S4) six-track review across
+S1+S2+S3; (S5) spec-delivery verification.
 
 ## Motivation
 
@@ -197,7 +203,7 @@ unchanged.
 `--no-gitignore` is a top-level flag on `sandbox create` (not part of
 the `--workspace` value). It is meaningful only when `--workspace`
 resolves to `local:`; combined with any non-`local:` mode the daemon
-rejects the request with `InvalidConfig` and the exact error string:
+rejects the request with `InvalidArgument` and the exact error string:
 
 > `--no-gitignore is only meaningful for local: workspaces; this session uses <mode>:`
 
@@ -787,8 +793,9 @@ The lifecycle:
    then runs an initial rsync push from `host_path` to `guest_path`.
    The push is **blocking**: if rsync exits non-zero, session
    creation fails (the session record is rolled back, the
-   VM/container is torn down, the daemon returns `InvalidState` /
-   `Internal` with the rsync stderr surfaced).
+   VM/container is torn down, the daemon returns `InvalidArgument`
+   (for caller-supplied bad request shape) or `Internal` (for
+   rsync-itself-failed) with the rsync stderr surfaced).
 2. **Push** (`sandbox workspace push <session> -f`). Rsync from
    `host_path` to `guest_path`. The operator decides when to refresh.
 3. **Pull** (`sandbox workspace pull <session> -f`). Rsync from
@@ -818,27 +825,38 @@ explicit semantics:
 2. **Cancellation.** The daemon-side rsync is spawned via
    `tokio::process::Command`, **not** `std::process::Command`
    wrapped in `spawn_blocking`. The async-aware variant properly
-   supports cancellation: when the request future is dropped (the
-   CLI hits Ctrl+C, the daemon receives SIGTERM, the session-create
-   timeout fires), the child process receives a `kill()` and exits
-   cleanly. The cleanup macro then runs as for any other create
-   failure.
-3. **Timeout.** The rsync invocation runs inside the existing
-   session-create timeout envelope. If rsync exceeds the timeout,
-   the envelope's deadline cancellation fires `cleanup_and_return!`
-   with an `Internal` response naming the rsync timeout (e.g.
-   "initial rsync exceeded session-create timeout after Ns; session
-   rolled back"). The operator's recovery path is documented below.
+   supports drop-based cancellation: when the request future is
+   dropped, the spawned future drops the `Child`, and
+   `tokio::process::Command`'s kill-on-drop behaviour sends `kill()`
+   to the rsync process. The request future is dropped when:
+   - the CLI's HTTP socket closes (operator hit Ctrl+C, network
+     drop, or the CLI's `CLI_HTTP_TIMEOUT` — currently 600 seconds,
+     see `sandbox-cli/src/main.rs` — fires);
+   - the daemon receives `SIGTERM` during graceful shutdown.
+
+   The cleanup macro then runs as for any other create failure.
+3. **Timeout source.** There is **no** daemon-side
+   `tokio::time::timeout` wrapping `create_session`; the CLI's
+   `CLI_HTTP_TIMEOUT` is the operator-facing contract. If the
+   create-time rsync exceeds that budget, the CLI closes its
+   connection, the daemon's request future is dropped, and the
+   cleanup chain runs per item 2 above. Documented consequence: an
+   operator creating a `local:` session with a tree large enough to
+   need more than `CLI_HTTP_TIMEOUT` of initial-push wall-clock
+   time will see the CLI report "request timed out" and find no
+   session record on re-listing; the recovery path is in the next
+   paragraph.
 
 **Recovery for oversized trees.** If a session's source tree is
-large enough to exceed the timeout envelope, the operator's path is
-to create the session with a smaller subset (e.g. by adding entries
-to `.gitignore` or by maintaining a `.local-only-ignore` sidecar
-that the operator passes via custom rsync, etc.) and then add the
-rest via `sandbox workspace push -f` after the session is up. The
-push command is not subject to the session-create timeout — it runs
-under the operator's terminal until it completes — so trees that
-do not fit the create envelope can still be seeded incrementally.
+large enough to exceed the client's HTTP timeout, the operator's
+path is to create the session with a smaller subset (e.g. by adding
+entries to `.gitignore` or by maintaining a `.local-only-ignore`
+sidecar that the operator passes via custom rsync, etc.) and then
+add the rest via `sandbox workspace push -f` after the session is
+up. The push command is not subject to the session-create client
+HTTP timeout — it runs under the operator's terminal until it
+completes — so trees that do not fit the create envelope can still
+be seeded incrementally.
 
 **No workspace-lock interaction at create time.** The initial
 push on `sandbox create` does **not** acquire the workspace
@@ -1069,8 +1087,7 @@ See § CLI shape for the surface. Implementation notes:
   ```
   rsync -aL --delete --filter=':- .gitignore' \
     -e <shell> \
-    [--dry-run|--mkpath] \
-    [pass-through extras — none on push/pull surface] \
+    [--dry-run] \
     <src> <dst>
   ```
 
@@ -1136,7 +1153,7 @@ below for why this is the deliberate design.
 Lock state is one of:
 
 - `Unlocked`.
-- `Locked { op: WorkspaceOp, token: LockToken, acquired_at: SystemTime }`.
+- `Locked { op: WorkspaceOp, token: LockToken }`.
 
 Where:
 
@@ -1172,7 +1189,7 @@ push/pull machinery follows the rule) is wrapped in
      `WorkspaceLockAcquireRequest { op: "push" | "pull" }`.
    - Response body on success (200):
      `WorkspaceLockAcquireResponse { lock_token: "<uuid>" }`.
-     Lock transitions to `Locked { op, token, acquired_at = now }`.
+     Lock transitions to `Locked { op, token }`.
    - **409 Conflict** if the lock is already held. The response
      body names the active op:
      `{ "error": "session has an active push operation" }`
@@ -1180,7 +1197,7 @@ push/pull machinery follows the rule) is wrapped in
      CLI surfaces verbatim.
    - **400 Bad Request** if the session's lifecycle state does
      not allow workspace operations — e.g. `Creating`,
-     `Stopped`, `Errored`. The response includes the observed
+     `Stopped`, `Error`. The response includes the observed
      state:
      `{ "error": "session is in state Stopped; workspace operations require Running" }`.
    - **404 Not Found** if the session id is unknown.
@@ -1209,6 +1226,28 @@ push/pull machinery follows the rule) is wrapped in
    transient runtime concern, surfaced only by the conflict
    response on the acquire endpoint. See § Persistence and
    serde.
+
+### Error mapping
+
+The 409 Conflict responses (acquire-when-held, release-with-mismatched-token-and-`force=false`, and the lifecycle-handler refusal documented in § Lifecycle interaction below) use a **new
+`SandboxError::Conflict(String)` variant** added to
+`sandbox-core/src/error.rs` in the same diff as the lock subsystem.
+The `error_response` helper in `sandboxd/src/error.rs` is extended
+to map `Conflict(String)` to `StatusCode::CONFLICT`. The carried
+`String` is rendered verbatim into the response body as the
+documented error text for each endpoint (e.g. `session has an
+active push operation`, `lock_token mismatch; pass force=true to
+override`, `session has an active push operation; cancel the
+operation or run 'sandbox workspace unlock <name> --force'`).
+The flat-string shape matches the existing
+`GuestProtocolIncompatible` precedent — the only other
+`SandboxError` variant mapping to 409 today.
+
+Adding a new `SandboxError` variant requires updating every
+`match` over `SandboxError` (exhaustiveness check) — a few sites
+in handlers and tests; this is the chosen cost. The S3 in-scope
+list pins this work; the S4 review track 1 confirms no handler
+bypasses `error_response` to construct 409s ad-hoc.
 
 ### CLI flow
 
@@ -1539,8 +1578,8 @@ format!(
 
 `security_model` on `WorkspaceMode::Shared` is meaningless for the
 container backend (no 9p layer). Per the 2026-05-14 spec, the
-container backend rejects `Some(_)` with `InvalidConfig` and a
-message naming `security_model`. `None` is accepted.
+container backend rejects `Some(_)` with `SandboxError::InvalidArgument`
+and a message naming `security_model`. `None` is accepted.
 
 The bind-mount target may now be any guest path. Docker normally
 auto-creates the mountpoint directory for a `--mount` target, but
@@ -1903,7 +1942,7 @@ rely on.
   `--mount type=bind,src=/a,dst=/a`.
 - `Shared { host=/a, guest=/home/agent/workspace, model=None }`
   produces `--mount type=bind,src=/a,dst=/home/agent/workspace`.
-- `Shared { ..., model=Some(_) }` returns `InvalidConfig` with a
+- `Shared { ..., model=Some(_) }` returns `InvalidArgument` with a
   message containing `security_model` (pre-existing test, kept
   passing under the new struct shape).
 - `Local { ... }` produces *no* `--mount` for the workspace
@@ -1931,13 +1970,16 @@ rely on.
   command parser rejects before the planner — pick one).
 - Neither set: usage error.
 
-Workspace-lock subsystem (location TBD — likely a new
-`sandbox-core/src/workspace_lock.rs` or equivalent, owned by
-whichever crate holds the per-session in-memory runtime state):
+Workspace-lock subsystem (state-machine unit tests live inline as
+`#[cfg(test)] mod tests { ... }` within
+`sandbox-core/src/workspace_lock.rs`, matching the pattern in
+`session.rs`, `dns_propagation.rs`, and other per-session runtime
+modules; the lock-map container `HashMap<SessionId,
+Arc<Mutex<LockState>>>` lives on `sandboxd::AppState`):
 
 - `acquire_when_unlocked_succeeds` — a fresh lock starts
   `Unlocked`; an `acquire(Push)` transitions to `Locked { op:
-  Push, token: T, acquired_at: _ }` and returns `T`.
+  Push, token: T }` and returns `T`.
 - `acquire_when_locked_returns_conflict` — after a successful
   `acquire(Push)`, a second `acquire(Push)` returns a
   conflict error naming the active op; a second `acquire(Pull)`
@@ -1979,6 +2021,12 @@ whichever crate holds the per-session in-memory runtime state):
 
 ### Integration tests (named `integration_*`, run under
 `make test-integration`)
+
+Workspace-lock endpoint-level integration tests live in
+`sandboxd/sandboxd/tests/integration_workspace_lock.rs` (matching
+the existing daemon-integration-test pattern); the other
+integration tests below live in their respective crates' `tests/`
+directories per the existing convention.
 
 - `integration_lima_local_create_and_push` — boots a Lima session with
   `local:/tmp/<tempdir>:/srv/work`, asserts the create-time push
@@ -2151,15 +2199,20 @@ Suggested content (the doc author may refine wording):
   explicitly pull? → `local:`.
 - Otherwise prefer `clone:` (cleaner) or `shared:` (live edit).
 
-### Upgrade notes
+### Breaking-default and rollback notes (folded into `docs/guides/workspaces.md`)
 
-A short paragraph in `docs/internal/upgrade-notes.md` (or
-`docs/changelog.md` — wherever the project tracks operator-facing
-breaking changes) documents:
+The project is at 0.0.1 with no external users and no
+operator-facing changelog infrastructure; M17 deliberately does
+**not** introduce a separate upgrade-tracking file under
+`docs/internal/`. Instead, the existing operator-facing
+`docs/guides/workspaces.md` absorbs two
+short inline notes (a paragraph in the "Mount a host directory
+(shared mode)" section, and a paragraph in the new "Snapshot a
+host directory (`local:` mode)" section) documenting:
 
 - The default `shared:` guest path is no longer
-  `/home/agent/workspace`; it is the host path. Operators relying on
-  the old default must add an explicit `:<guest_path>` token.
+  `/home/agent/workspace`; it is the host path. Operators relying
+  on the old default must add an explicit `:<guest_path>` token.
 - Daemons older than this spec cannot read records written with
   `local:` workspaces. Roll forward, do not roll back across a
   `local:` session.
@@ -2264,328 +2317,671 @@ breaking changes) documents:
   image's content. Documented in `docs/guides/workspaces.md` as a
   caveat; not pre-validated by the daemon — the surface of
   "paths the image already uses" is image-defined, not daemon-defined.
-- **Oversized `local:` source trees exceeding the session-create
-  timeout envelope.** The behaviour is now pinned (see § `local:`
-  Mode → Cancellation and timeout): the rsync runs inside the
-  existing timeout envelope, a timeout triggers
-  `cleanup_and_return!` with an `Internal` response, and the
-  recovery path is "create with a smaller subset, push the rest
-  afterwards via `sandbox workspace push -f`". The remaining open
-  question is purely empirical — does the existing envelope (Lima
-  base provisioning routinely takes 30-60s) leave headroom for
-  rsync of a typical workspace, or does the envelope itself need to
-  grow? Verification pinned in M17-S4's example replay; not a
-  blocker, since the recovery path is in place either way.
+- **Oversized `local:` source trees exceeding the client's HTTP
+  timeout.** The contract is now pinned (see § `local:` Mode →
+  Cancellation and timeout): there is no daemon-side
+  `tokio::time::timeout` around `create_session`; the CLI's
+  `CLI_HTTP_TIMEOUT` (currently 600 seconds) is the operator-facing
+  budget. If the create-time rsync exceeds that budget the CLI
+  closes its connection, the daemon's request future is dropped,
+  `tokio::process::Command`'s kill-on-drop tears down the rsync
+  child, and `cleanup_and_return!` rolls the session back. The
+  documented recovery path is "create with a smaller subset, push
+  the rest afterwards via `sandbox workspace push -f`". The
+  remaining open question is purely empirical — does
+  `CLI_HTTP_TIMEOUT` (600s) leave headroom for rsync of a typical
+  workspace on top of Lima base provisioning (routinely 30-60s),
+  or does the client timeout itself need to grow? Verification
+  pinned in M17-S5's example replay; not a blocker, since the
+  recovery path is in place either way.
 
 ## Sessions
 
-### M17-S1 — `shared:` guest-path + securityModel + breaking default
+The authoritative session breakdown lives in
+`docs/internal/milestones/M17.md`; this section mirrors that
+breakdown with the spec-level details the milestone doc summarises.
+Five sessions: S1 (shared layer + DTO scaffold), S2 (`local:` core
+only), S3 (push/pull + workspace-lock subsystem), S4 (six-track
+review), S5 (delivery).
+
+### M17-S1 — `shared:` guest-path + securityModel + breaking default + DTO scaffold
 
 **Entry criteria.** Fresh.
 
 **Spec reference.** This document, §§ CLI shape (shared variant),
-Domain types, Parser (shared variant), Backward Compatibility, Lima
-Backend (shared), Container Backend (shared), `sandbox describe`,
-Tests (shared subset), Docs Changes (shared subset).
+Domain types (shared subset + `WorkspaceSecurityModel`), Parser
+(shared variant + friendly-hint branch + input normalization),
+Backward Compatibility, Lima Backend (shared), Container Backend
+(shared), `sandbox describe` (Wire surface —
+`WorkspaceModeDetailDto` / `WorkspaceSecurityModelDto`; shared and
+clone rendering), Tests (shared subset), Docs Changes (shared
+subset).
 
 **Rationale.** The shared-side changes are small in surface but
-fan-out-y in destructure sites: every `match` on
+fan-out-y in destructure sites: every `match` arm on
 `WorkspaceMode::Shared` across the workspace gains the new
-`guest_path` field in the same diff or the build breaks. Splitting
+`guest_path` field (and the `security_model` field from the
+2026-05-14 design) in the same diff or the build breaks. Splitting
 the domain change from the template/integration would leave a
 non-compiling intermediate, so the entire shared-mode surface lands
 as one PR. The breaking default change (`guest_path = host_path`
 instead of `/home/agent/workspace`) lands here too — it cannot be
 phased without confusing operators about which version they're on.
-Docs ship in the same session because the new grammar is invisible
-without them.
+The DTO refactor (`SessionConfigDto.workspace_mode_detail` as a
+structured field plus the `WorkspaceModeDetailDto` /
+`WorkspaceSecurityModelDto` types, the
+`SessionMountInfo.workspace_path` semantic shift, and the CLI
+describe renderer reading the structured field directly) ships
+here because the shared-mode `Workspace:` block format already
+lands and re-parsing a flat string round-trip violates the
+project's DTO-separation convention. Replacing the CLI's
+hand-rolled `--workspace` validator with `WorkspaceMode::parse_flag`
+also ships here so the new grammar is accepted on both sides
+without divergence. Docs ship in the same session because the new
+grammar is invisible without them.
 
 **In scope.**
 
-- `WorkspaceSecurityModel` enum and the `Shared { ..., guest_path,
-  security_model }` shape per § Domain types.
-- `WorkspaceMode::parse_flag` extended to handle the
-  `shared:<host>[:<guest>][:<model>]` grammar per § Parser.
-- Replace the hand-rolled `--workspace` validator in
+- `WorkspaceSecurityModel` enum (variants `MappedXattr` and
+  `NoneMapping` — the latter renamed from `None` to avoid the
+  `Option::None` collision per § Domain types) and the
+  `WorkspaceMode::Shared { host_path, guest_path, security_model }`
+  shape per § Domain types.
+- `WorkspaceMode::parse_flag` extended to the
+  `shared:<host>[:<guest>][:<security-model>]` grammar per § Parser
+  (right-to-left token classification, strip-model-then-strip-guest,
+  `~` expansion both sides, absoluteness check, closed-enum tokens
+  for `mapped-xattr` / `none`, friendly-hint branch for
+  `passthrough` / `mapped-file`, input normalization).
+- Replace the hand-rolled CLI-side `--workspace` validator in
   `sandbox-cli/src/main.rs` (the `strip_prefix("shared:")` +
   `Path::exists()` block in the `Create` arm) with a call to
-  `WorkspaceMode::parse_flag(...)` so the new grammar
-  (`shared:<host>[:<guest>][:<model>]`,
-  `local:<host>[:<guest>]`) is accepted on both sides without
-  divergence. The `local:` mode token is accepted at parse time in
-  S1 but the resulting `WorkspaceMode::Local` value is rejected by
-  the existing `SessionSpec::validate(&caps)` capability check
-  until S2 advertises `Local` in `Capabilities::workspace_modes`
-  for the relevant backend. Operators on S1 see a clear "backend
-  does not support local workspaces" message rather than a
-  CLI-side "unknown mode" error.
+  `WorkspaceMode::parse_flag(...)` so the new grammar — including
+  the `local:` mode token that lands in S2 — parses on the CLI
+  without divergence. In this session the resulting
+  `WorkspaceMode::Local` value is rejected downstream by
+  `SessionSpec::validate(&caps)` because no backend advertises
+  `Local` yet; operators see a clear "backend does not support
+  local workspaces" message rather than a CLI-side "unknown mode"
+  error.
 - Update the `--workspace` clap doc string in
-  `sandbox-cli/src/main.rs` to describe the new grammar
-  accurately. The current text — "mounts a host directory into
-  the VM at /home/agent/workspace via 9p" — is outdated on two
-  counts (it omits `local:`, and the default guest path is no
-  longer `/home/agent/workspace`). New text covers all three
-  modes, both optional tokens for `shared:`, and the
-  `guest_path = host_path` default.
-- DTO/mapper updates per § `sandbox describe` → Wire surface:
-  - Add `workspace_mode_detail: Option<WorkspaceModeDetailDto>` to
-    `SessionConfigDto` in `sandbox-core/src/api/dto.rs` (with
-    `#[serde(skip_serializing_if = "Option::is_none")]` for the
-    older-client back-compat path).
-  - Add the `WorkspaceModeDetailDto` and `WorkspaceSecurityModelDto`
-    types in the same file per the DTO shape in § Wire surface.
-  - Update `sandbox-core/src/api/mapper.rs` to populate
-    `workspace_mode_detail` from the in-memory `WorkspaceMode`
-    alongside the existing `render_workspace_mode` flat-string
-    population.
-  - Update the `SessionMountInfo.workspace_path` docstring in the
-    same file to reflect the new semantics: the value is now
-    `guest_path` from `WorkspaceMode::Shared`, defaulting to
-    `host_path` (no longer the historical hardcoded
-    `/home/agent/workspace/`).
-  - Update `sandbox-core/src/api/mapper.rs` to populate
-    `SessionMountInfo.workspace_path` from the resolved
-    `guest_path` rather than the hardcoded constant.
-- `EnumSet<WorkspaceModeKind>` unknown-variant tolerance on the
-  wire per § Domain types ("Forward-compat: unknown-variant
-  tolerance on the wire"). The tolerance applies as soon as
-  `Capabilities` carries any newly-introduced variant, so it
-  lands in S1 even though `Local` itself is not yet advertised by
-  any backend until S2.
-- Custom deserialiser shim per § Backward Compatibility (handles
-  legacy `Shared` records without `guest_path`).
-- Match-site fan-out: every destructure of
-  `WorkspaceMode::Shared` across the workspace updated to include
-  the new fields.
+  `sandbox-cli/src/main.rs` to describe the new grammar accurately
+  (covers shared with optional `:<guest>:<security-model>` tokens,
+  local with optional `:<guest>`, and the `guest_path = host_path`
+  default).
+- Custom deserialiser shim per § Backward Compatibility: legacy
+  `Shared` records without `guest_path` recover with
+  `guest_path = host_path`. No SQLite migration — the change is
+  JSON-blob-only.
+- `EnumSet<WorkspaceModeKind>` wire-side unknown-variant tolerance
+  per § Domain types (silently drop unknown variants on
+  deserialise). Lands here even though `Local` is not yet
+  advertised, because the tolerance applies to *any* unknown
+  variant.
+- Match-site fan-out: every destructure of `WorkspaceMode::Shared`
+  across the workspace (mapper, lima, container, daemon main,
+  integration tests, spec tests) updated to include the two new
+  fields.
 - Lima template: `mountPoint` interpolated from `guest_path`,
   `securityModel` from the resolved model. Symmetric YAML-injection
   sanitisation across both paths.
 - Container backend: `--mount` argv emits `dst=<guest_path>`.
-  Rejection of `security_model: Some(_)` retained from the
-  2026-05-14 spec.
-- `sandbox describe` rendering updated to the new
-  `Workspace:` block format per § `sandbox describe` (shared and
-  clone variants only — local lands in S2). The CLI consumes the
-  new `workspace_mode_detail` DTO field directly (no re-parsing
-  via `parse_flag`); the older-daemon fallback prints the flat
+  Rejection of `security_model: Some(_)` with
+  `SandboxError::InvalidArgument` retained from the 2026-05-14
+  design.
+- DTO scaffold per § `sandbox describe` → Wire surface:
+  - Add `workspace_mode_detail: Option<WorkspaceModeDetailDto>` to
+    `SessionConfigDto` in `sandbox-core/src/api/dto.rs` (with
+    `#[serde(skip_serializing_if = "Option::is_none")]` for older-
+    client back-compat).
+  - Add `WorkspaceModeDetailDto` (sum type over shared/clone, with
+    the `local` arm landing in S2) and `WorkspaceSecurityModelDto`
+    in the same file.
+  - Update `sandbox-core/src/api/mapper.rs` to populate
+    `workspace_mode_detail` from the in-memory `WorkspaceMode`
+    alongside the existing flat-string `render_workspace_mode`
+    (kept for back-compat).
+  - Update the `SessionMountInfo.workspace_path` docstring to
+    reflect that the value now derives from `guest_path` (not the
+    historical hardcoded `/home/agent/workspace/`); update the
+    mapper to populate it from the resolved `guest_path`.
+- `sandbox describe` rendering of the `Workspace:` block per
+  § `sandbox describe` (shared and clone variants only — local
+  lands in S2). The CLI consumes the new `workspace_mode_detail`
+  DTO field directly (no re-parsing via `parse_flag`); the
+  older-daemon fallback (DTO field absent) prints the flat
   `workspace_mode` string verbatim.
-- Unit tests enumerated in § Tests (parser, backward-compat,
-  template, container argv, describe — shared subset).
-- Docs updates for the shared layer:
-  `docs/guides/workspaces.md` syntax and when-to-use,
-  `docs/guides/hardening.md` per-session model note,
-  `docs/internal/upgrade-notes.md` breaking-default note.
+- Unit tests enumerated in § Tests (shared subset): parser matrix
+  rows (including normalization and friendly-hint cases); `~`
+  expansion both sides; relative-path rejection; empty-token
+  rejection; daemon-side unresolved-`~` rejection; backward-compat
+  (legacy JSON without `guest_path` key, forward-compat round-trip
+  with and without `security_model`); Lima template (default
+  model, `NoneMapping`, custom guest path, both at once,
+  YAML-injection probe); container backend argv (default path,
+  custom guest path, `Some(_)` rejection); describe golden-form
+  for shared and clone, plus the older-daemon flat-string fallback.
+- Docs updates for the shared layer per § Docs Changes:
+  - `docs/guides/workspaces.md` — the "Mount a host directory"
+    section gains the guest-path paragraph and the existing
+    `:<security-model>` paragraph (optional-token order
+    documented as `:<guest-path>:<security-model>`). Adds the
+    inline breaking-default note (folded here per § Breaking-
+    default and rollback notes — no separate upgrade-tracking
+    file is created).
+  - `docs/guides/hardening.md` — per-session model decision note;
+    non-exposure of `passthrough` / `mapped-file` with rationale.
 
 **Explicitly deferred.**
 
-- `local:` mode end-to-end → M17-S2.
-- Six-track review of S1+S2 → M17-S3.
-- Spec-delivery verification → M17-S4.
+- `local:` mode core (variant, parser arm, rsync orchestration,
+  capability advertisement) → M17-S2.
+- Push/pull CLI commands + workspace-lock subsystem → M17-S3.
+- Six-track review of S1+S2+S3 → M17-S4.
+- Spec-delivery verification → M17-S5.
 
 **Exit criteria.**
 
 - All shared-subset unit tests from § Tests pass under the default
   nextest profile.
-- `cargo nextest run --workspace` default profile clean;
-  `cargo nextest run --workspace --profile integration` clean.
-- `cargo clippy --workspace` clean; `cargo fmt --check` clean.
+- `cd sandboxd && cargo nextest run --workspace` default profile
+  clean; `cd sandboxd && cargo nextest run --workspace --profile
+  integration` clean.
+- `cd sandboxd && cargo clippy --workspace -- -D warnings` clean;
+  `cd sandboxd && cargo fmt --check` clean.
 - Manual example replay (Lima): `sandbox create --workspace
   shared:/tmp/sbx-a:/srv/work:none` produces a guest mount at
   `/srv/work` with `securityModel: none` in the rendered YAML;
   guest-side `ln -s a b` round-trips as a real symlink to the host
-  at `/tmp/sbx-a/b`.
-- Manual example replay (container): same shape, asserting
-  `--mount type=bind,src=/tmp/sbx-a,dst=/srv/work` in the daemon's
+  at `/tmp/sbx-a/b`. Default invocation produces a host-side
+  regular file with `user.virtfs.symlink.target` xattr.
+- Manual example replay (container): `sandbox create --workspace
+  shared:/tmp/sbx-a:/home/agent/work` records `--mount
+  type=bind,src=/tmp/sbx-a,dst=/home/agent/work` in the daemon's
   `docker create` argv (visible in daemon logs).
-- Docs updates landed and reviewed.
+- DTO surface verified: `GET /sessions/<id>` against a `shared:`
+  session populates `workspace_mode_detail` with the structured
+  fields; the CLI's `sandbox describe` renders the multi-line
+  block from the structured field; a hand-constructed DTO with
+  `workspace_mode_detail = None` falls back to the historical
+  single-line form.
+- `docs/guides/workspaces.md` and `docs/guides/hardening.md`
+  updated (no separate upgrade-tracking file is created — the
+  breaking-default note is folded inline into
+  `docs/guides/workspaces.md`); code review approved.
 
-### M17-S2 — `local:` mode end-to-end
+### M17-S2 — `local:` mode core (variant, rsync orchestration, describe)
 
-**Entry criteria.** M17-S1 complete — shared layer landed, tests
-green.
+**Entry criteria.** M17-S1 complete — shared layer + DTO scaffold
+landed, default-profile and integration-profile nextest passing,
+docs updated.
 
-**Spec reference.** This document, §§ CLI shape (local variant),
-Domain types (Local + WorkspaceModeKind::Local), Parser (local
-variant), `local:` Mode (full section), Push/Pull Commands, Lima
-Backend (local), Container Backend (local), `sandbox describe`
-(local), Tests (local subset, including integration + E2E), Docs
-Changes (local subset).
+**Spec reference.** This document, §§ CLI shape (local variant +
+`--no-gitignore` on `sandbox create`), Domain types (Local +
+`WorkspaceModeKind::Local`), Parser (local variant + directory-
+required check), `local:` Mode (full section: Lifecycle,
+Cancellation and timeout, Default rsync invocation, Filter
+interaction, Rsync invocation: exit codes, stdio, ownership,
+rsync prerequisites, Parent-directory creation), Lima Backend
+(local + Cache-path interaction + Daemon-side rsync
+orchestration), Container Backend (local + Read-only rootfs
+interaction), `sandbox describe` (local), Tests (local create-side
+subset; push/pull and lock tests deferred to S3), Docs Changes
+(local subset, the `local:` mode sections only — push/pull and
+orphan-lock docs ship in S3 alongside their CLI surface).
 
-**Rationale.** `local:` mode is additive — new enum variant, new
-parser arm, new CLI subcommands, new backend orchestration. The
-parser surface from S1 is the foundation; the rsync orchestration
-and the workspace-aware CLI subcommands are isolated additions that
-do not destabilise S1's match-site fan-out. The integration tests
-require real backends (Lima VM, Docker container), so this session
-is heavier than S1 in test infrastructure but lighter in destructure
-fan-out. Docs ship in the same session because the new mode is
-discoverability-zero without them.
+**Rationale.** `local:` mode core is the foundation push/pull
+stand on. Landing the variant, the parser arm, the capability
+advertisement on both backends, the daemon-side initial-push rsync
+orchestration (with `tokio::process::Command` for kill-on-drop
+cancellation, explicit rollback on failure, blocking semantics
+inside the create handler), the cache-path interaction (Lima
+fast-path stays eligible for `local:`), the container `--read-only`
+writable-paths constraints, and the describe-renderer integration
+of the third variant — all in one session — gives push/pull (S3) a
+stable substrate to consume. The integration tests that exercise
+the create-time push end-to-end live here so the substrate is
+proven before S3 layers operator-driven ops on top.
 
 **In scope.**
 
 - `WorkspaceMode::Local { host_path, guest_path }` variant +
-  `WorkspaceModeKind::Local` enum value per § Domain types.
-- `WorkspaceMode::parse_flag` extended to handle the
-  `local:<host>[:<guest>]` grammar per § Parser. Sharing the
+  `WorkspaceModeKind::Local` enum value per § Domain types. The
+  custom deserialiser shim from S1 extends to `Local` for
+  consistency. `WorkspaceModeDetailDto` from S1 gains its `Local`
+  arm here.
+- `WorkspaceMode::parse_flag` extended to the
+  `local:<host>[:<guest>]` grammar per § Parser — shares the
   right-to-left token classifier with the shared grammar (no
-  duplicated parsing logic).
-- `--no-gitignore` flag on `sandbox create`, gated to `local:`
-  workspaces with the conflict error for other modes.
-- Daemon-side rsync orchestration: parent-dir creation, initial
-  push at session-create, blocking failure semantics. Implemented
-  for both Lima and container backends per § Lima Backend (local)
-  and § Container Backend (local).
+  duplicated parsing logic); `~` expansion both sides; absoluteness
+  check; directory-required check for `local:`
+  (`std::fs::metadata(path)?.is_dir()`) with the documented "use
+  `sandbox cp` for single files" error.
+- `--no-gitignore` flag on `sandbox create` per § `--no-gitignore`
+  on `sandbox create`: top-level flag, meaningful only with
+  `--workspace local:`; combined with `shared:` the daemon returns
+  `InvalidArgument` with the documented exact error message. Not
+  persisted — governs the create-time push only.
+- Daemon-side rsync orchestration per § `local:` Mode and § Lima
+  Backend (local) / § Container Backend (local):
+  - Parent-dir creation inside the guest (`--mkpath` on rsync
+    3.2.3+, or a `limactl shell` / `docker exec` `mkdir -p`
+    fallback).
+  - Blocking initial push from `host_path` to `guest_path`. Spawn
+    via `tokio::process::Command` directly (carve-out from the
+    `spawn_blocking` rule per § Lima Backend → Daemon-side rsync
+    orchestration) so request cancellation / SIGTERM /
+    client-HTTP-timeout-driven request drops reliably tear down
+    the rsync child via kill-on-drop.
+  - Rsync stdout logged at INFO; stderr captured and surfaced
+    verbatim in the daemon's `InvalidArgument` / `Internal`
+    response on failure.
+  - Explicit rollback on rsync failure: the session record +
+    VM/container are torn down (no orphan artefacts) before the
+    daemon returns the error.
+  - Cancellation/timeout coverage per § Cancellation and timeout:
+    the cancellation source is the request future being dropped
+    (CLI's `CLI_HTTP_TIMEOUT` fires, Ctrl+C, SIGTERM, network
+    drop); no daemon-side `tokio::time::timeout` envelope; the
+    `cleanup_and_return!` macro covers each path.
+- Default rsync invocation per § Default rsync invocation:
+  `rsync -aL --delete --filter=':- .gitignore' -e <shell-transport>
+  <src> <dst>`. The `--filter` drops under `--no-gitignore`. All
+  non-zero exit codes fatal at create time.
+- Lima cache-path interaction per § Lima Backend → Cache-path
+  interaction: `Local` is fast-path-eligible. The
+  `has_shared_mount` predicate in `sandboxd/src/main.rs` narrows
+  from "any workspace mode" to "is the workspace mode `Shared`?"
+  (rename the variable in the same diff for clarity).
+- Container backend per § Container Backend → `local:` mode and
+  § Read-only rootfs interaction: no `--mount` for the workspace;
+  explicit writable-paths-list documented for the operator-facing
+  error path when rsync fails with EROFS against a non-writable
+  target.
 - `Capabilities::workspace_modes` for both backends advertises
   `Local`.
-- `sandbox workspace push <session> {-f|-n} [--safe-links]
-  [--no-gitignore]` CLI subcommand.
-- `sandbox workspace pull <session> {-f|-n} [--safe-links]
-  [--no-gitignore] [--dest <path>]` CLI subcommand.
-- `sandbox workspace unlock <session> [--force]` CLI subcommand
-  per § Workspace lock → New CLI command.
-- Workspace-lock subsystem per § Workspace lock: daemon-side
-  per-session lock state, `POST` / `DELETE
-  /sessions/{id}/workspace-lock` endpoints, lifecycle-handler
-  integration on `stop` and `delete` (409 Conflict when a lock
-  is held), CLI flow integration on push/pull (acquire →
-  rsync → release with `Drop`-style crash-safety guard),
-  orphan-lock recovery path via `unlock --force`. The
-  subsystem enlarges S2's scope beyond the original spec; the
-  milestone doc and session plan will be updated separately
-  to reflect the addition.
-- Client-side state and mode checks (must be Running, must be
-  `local:`) with the documented error messages. (The "must be
-  Running" check is enforced atomically on the daemon side
-  through the lock acquire's state gate per § Workspace lock,
-  collapsing the previous "check state, then acquire" race
-  window into a single atomic operation.)
 - `sandbox describe` rendering of the `Local` variant in the
-  `Workspace:` block.
-- Unit tests for the local-subset of § Tests (parser variants,
-  describe rendering, push/pull planner, container backend
-  `Local` argv shape).
-- Integration tests (`integration_*` prefix) enumerated in §
-  Tests → Integration tests.
-- E2E tests (`tests/e2e/test_workspace_local.py`,
-  `test_workspace_shared_guest_path.py`,
-  `test_workspace_lock.py`) enumerated in § Tests →
-  E2E tests.
-- Docs updates for the local layer:
-  - `docs/guides/workspaces.md` new "Snapshot a host directory
-    (`local:`)" section, plus the "Recovering an orphan
-    workspace lock" sub-paragraph per § Docs Changes.
-  - `docs/guides/hardening.md` trade-off bullet under "Security
-    trade-offs you choose".
-  - `docs/concepts/workspaces.md` updated mode list and trade-off
-    table.
-  - `docs/internal/upgrade-notes.md` rollback caveat for
-    `local:` records.
+  `Workspace:` block per § `sandbox describe`. Renders directly
+  from `workspace_mode_detail.Local`.
+- Unit tests for the local create-side subset of § Tests: parser
+  matrix rows for `local:`, the directory-required test, describe
+  rendering for `Local`, container backend `Local` argv shape (no
+  workspace `--mount`), capability-set assertions.
+- Integration tests (`integration_*` prefix) per § Tests →
+  Integration tests, create-side subset:
+  `integration_lima_local_create_and_push`,
+  `integration_container_local_create_and_push`,
+  `integration_local_gitignore_filter`,
+  `integration_local_create_failure_tears_down`,
+  `integration_shared_guest_path_lima`,
+  `integration_shared_guest_path_container`.
+- E2E test scaffold for create-side flows in
+  `tests/e2e/test_workspace_local.py` (the create + describe path)
+  and `tests/e2e/test_workspace_shared_guest_path.py` per § Tests
+  → E2E tests, both following the function-level
+  `@pytest.mark.parametrize("backend", ["lima", "container"])`
+  pattern. The push/pull arms of `test_workspace_local.py` land in
+  S3.
+- Docs updates for the local-mode-core layer per § Docs Changes:
+  - `docs/guides/workspaces.md` — new top-level "Snapshot a host
+    directory (`local:` mode)" section between "Mount a host
+    directory" and "Copy individual files with `sandbox cp`";
+    covers when-to-pick, `--no-gitignore` semantics on create,
+    the create-time filter-interaction note. The inline
+    `local:`-rollback caveat (daemons predating M17 cannot
+    deserialise `WorkspaceMode::Local`; roll forward, do not
+    roll back across a `local:` session) lands here. The push/pull
+    sub-section lands in S3.
+  - `docs/guides/hardening.md` — new bullet under "Security
+    trade-offs you choose": **`local:` snapshot.** No 9p surface,
+    no live host writes; trade-off is staleness.
+  - `docs/concepts/workspaces.md` — mode list grows from four to
+    five (clone, shared, local, cp, git-remote); `local:` sits
+    between `clone:` and `shared:` on the live-edits / isolation
+    axis in the trade-off table.
 
 **Explicitly deferred.**
 
-- Six-track review → M17-S3.
-- Spec-delivery verification → M17-S4.
+- Push/pull CLI commands → M17-S3.
+- Workspace-lock subsystem (daemon state, API endpoints,
+  `unlock --force` CLI, lifecycle interaction, orphan recovery)
+  → M17-S3.
+- Six-track review → M17-S4.
+- Spec-delivery verification → M17-S5.
 
 **Exit criteria.**
 
-- All local-subset unit, integration, and E2E tests from § Tests
+- All local create-side unit and integration tests from § Tests
   pass.
-- `cargo nextest run --workspace` default profile clean;
-  `cargo nextest run --workspace --profile integration` clean;
-  `make test-e2e-matrix` clean (both backends).
-- `cargo clippy --workspace` clean; `cargo fmt --check` clean.
+- `cd sandboxd && cargo nextest run --workspace` default profile
+  clean; `cd sandboxd && cargo nextest run --workspace --profile
+  integration` clean.
+- `cd sandboxd && cargo clippy --workspace -- -D warnings` clean;
+  `cd sandboxd && cargo fmt --check` clean.
 - Manual example replay (Lima): `sandbox create --workspace
-  local:/tmp/sbx-l` populates `/tmp/sbx-l` inside the guest;
-  `sandbox workspace push -f` after host edit propagates the edit;
-  `sandbox workspace pull -f` after guest edit propagates back.
+  local:/tmp/sbx-l` populates `/tmp/sbx-l` inside the guest at
+  create time. `sandbox describe <s>` renders `Mode: local` /
+  `Host path: /tmp/sbx-l` / `Guest path: /tmp/sbx-l`.
+- Manual example replay (container): `sandbox create --workspace
+  local:/tmp/sbx-l:/home/agent/local` populates
+  `/home/agent/local` inside the container at create time.
+- Manual example replay (filter): `local:` with a `.gitignore`
+  excluding `excluded/` does not transfer that directory at create
+  time; the same source with `--no-gitignore` does.
+- Manual cancellation probe: Ctrl+C on a long-running
+  `sandbox create --workspace local:<big-tree>` leaves no orphan
+  VM/container/network artefacts.
+- `docs/guides/workspaces.md` `local:`-mode section (including the
+  inline `local:`-rollback caveat), `docs/guides/hardening.md`
+  no-9p-surface bullet, `docs/concepts/workspaces.md` five-mode
+  list all landed; code review approved.
+
+### M17-S3 — Push/pull commands + workspace-lock subsystem
+
+**Entry criteria.** M17-S2 complete — `local:` mode core landed,
+capability advertisement live on both backends, default-profile
+and integration-profile nextest passing, create-time push
+integration tests green.
+
+**Spec reference.** This document, §§ CLI shape (push / pull /
+unlock), Push/pull commands (full section), Workspace lock (full
+section: Goal, Lock state, API endpoints, Error mapping, CLI flow,
+New CLI command, Lifecycle interaction, Concurrency and races,
+Orphan locks, Persistence and serde), Tests (push/pull planner
+subset, workspace-lock unit + integration + E2E subset), Docs
+Changes (push/pull + orphan-lock recovery sub-sections).
+
+**Rationale.** Push and pull are the operator-driven ops `local:`
+mode exists to enable; the workspace-lock subsystem is the
+daemon-side primitive that makes those ops safe to run concurrently
+and against a session that might also be stopped/deleted in
+parallel. Bundling them in a single session avoids a no-op
+intermediate where push/pull would briefly ship with a client-side
+race window that the lock then closes: the push/pull CLI uses the
+daemon lock from day 1. The lock subsystem has its own self-
+contained surface (in-memory state machine, three API endpoints,
+dedicated DTOs, a new `unlock --force` CLI subcommand, lifecycle
+hooks on `stop`/`delete`, dedicated unit + integration + E2E
+tests) but is conceptually inseparable from the push/pull commands
+that drive it. Docs ship in the same session because the push/pull
+commands and the orphan-lock recovery flow are discoverability-
+zero without them.
+
+**In scope.**
+
+- `sandbox workspace push <session> {-f|-n} [--safe-links]
+  [--no-gitignore]` CLI subcommand per § Push/pull commands.
+- `sandbox workspace pull <session> {-f|-n} [--safe-links]
+  [--no-gitignore] [--dest <path>]` CLI subcommand per § Push/pull
+  commands. `--dest` defaults to the session's recorded
+  `host_path`; the dirname is `create_dir_all`-ed before the rsync
+  spawn; CLI-side `~` expansion against the operator's `$HOME`.
+- Push/pull planner argv shape per § Push/pull commands → Argv
+  layout: `rsync -aL --delete --filter=':- .gitignore' -e <shell>
+  [--dry-run] <src> <dst>`; `-L` swaps to `--safe-links` under
+  `--safe-links`; `--filter` drops under `--no-gitignore`;
+  `--dry-run` under `-n`; one of `-f` / `-n` is required.
+- Filter-source asymmetry on push vs pull documented per
+  § Push/pull commands → Filter source asymmetry.
+- Workspace-lock subsystem per § Workspace lock (full section):
+  - New `sandbox-core/src/workspace_lock.rs` module exporting
+    `WorkspaceLock` (the per-session lock state machine),
+    `WorkspaceOp` enum (`Push`, `Pull`), and `LockToken` (newtype
+    around UUID). Per-session in-memory lock state (`Unlocked` /
+    `Locked { op, token }`) under a per-session mutex; not
+    persisted; resets on daemon restart by design. Lock-map
+    container (`HashMap<SessionId, Arc<Mutex<LockState>>>`) lives
+    on `sandboxd::AppState`.
+  - `WorkspaceLockAcquireRequest` / `WorkspaceLockAcquireResponse`
+    / `WorkspaceLockReleaseRequest` DTOs in
+    `sandbox-core/src/api/dto.rs`.
+  - `POST /sessions/{id}/workspace-lock` (acquire) per § API
+    endpoints — `WorkspaceOp` enum (`Push` / `Pull`), UUID-shaped
+    opaque `lock_token`, 200 on success, 409 when held, 400 when
+    session state is not Running, 404 when session id is unknown.
+  - `DELETE /sessions/{id}/workspace-lock` (release) per § API
+    endpoints — request body carries `lock_token` and `force: bool`
+    (default `false`); 200 on success, 409 on token mismatch
+    unless `force=true`, idempotent 200 on already-unlocked.
+  - `GET` endpoint deliberately not provided per § API endpoints
+    item 3.
+  - **New `SandboxError::Conflict(String)` variant** added to
+    `sandbox-core/src/error.rs` per § Workspace lock → Error
+    mapping; `error_response` in `sandboxd/src/error.rs` extended
+    to map `Conflict(String)` to `StatusCode::CONFLICT`. Every
+    `match` over `SandboxError` (handlers, tests) updated for
+    exhaustiveness.
+- CLI flow integration per § Workspace lock → CLI flow: push and
+  pull both follow acquire → spawn rsync → release; release runs
+  via a `Drop`-style guard so Ctrl+C, panic, and SIGTERM still
+  fire the release; release failures are best-effort.
+- `sandbox workspace unlock <session> [--force]` CLI subcommand
+  per § Workspace lock → New CLI command.
+- Lifecycle-handler integration per § Workspace lock → Lifecycle
+  interaction: `POST /sessions/{id}/stop` and `DELETE
+  /sessions/{id}` handlers acquire the same per-session mutex and
+  check the workspace lock state before any teardown work; a held
+  lock returns 409 Conflict with the documented error text
+  including the `sandbox workspace unlock <name> --force` recovery
+  hint.
+- Orphan-lock recovery flow per § Workspace lock → Orphan locks:
+  the documented operator workflow lands in the docs alongside the
+  push/pull section.
+- Unit tests per § Tests:
+  - Push/pull planner full-argv assertions for both backends, each
+    variant (force, dry-run, `--safe-links`, `--no-gitignore`,
+    `--dest`, both-flags-set, neither-flag-set).
+  - Workspace-lock state-machine unit tests live inline as
+    `#[cfg(test)] mod tests { ... }` within
+    `sandbox-core/src/workspace_lock.rs` (matching the pattern in
+    `session.rs`, `dns_propagation.rs`):
+    `acquire_when_unlocked_succeeds`,
+    `acquire_when_locked_returns_conflict` (push-blocks-push AND
+    push-blocks-pull AND pull-blocks-push),
+    `release_with_correct_token_unlocks`,
+    `release_with_wrong_token_returns_conflict`,
+    `release_with_force_ignores_token`,
+    `release_when_already_unlocked_is_idempotent` (both `force`
+    paths), `restart_resets_locks`.
+- Integration tests (`integration_*` prefix) per § Tests →
+  Integration tests. The endpoint-level integration tests live in
+  `sandboxd/sandboxd/tests/integration_workspace_lock.rs`
+  (matching the existing daemon-integration-test pattern):
+  `integration_lima_local_pull`, `integration_container_local_pull`,
+  `integration_workspace_lock_push_blocks_pull`,
+  `integration_workspace_lock_blocks_stop`,
+  `integration_workspace_lock_blocks_delete`,
+  `integration_workspace_lock_force_release`,
+  `integration_workspace_lock_idempotent_release`.
+- E2E test additions per § Tests → E2E tests:
+  - `tests/e2e/test_workspace_local.py` — push and pull arms added
+    on top of S2's create arm, function-level parametrize.
+  - `tests/e2e/test_workspace_lock.py` — new file covering the
+    push-versus-stop interleave and the orphan-lock recovery
+    flow.
+- Docs updates per § Docs Changes:
+  - `docs/guides/workspaces.md` — push/pull sub-section under the
+    `local:`-mode section (the `-f`/`-n` safety gate, the
+    `--safe-links` and `--no-gitignore` flags, the `--dest <path>`
+    override on pull); separate "Recovering an orphan workspace
+    lock" paragraph documenting the `sandbox workspace unlock
+    --force` workflow.
+  - `docs/guides/workspaces.md` — the "`cp` vs. `sync`" comparison
+    table grows a row for `local:` push/pull.
+
+**Explicitly deferred.**
+
+- Six-track review → M17-S4.
+- Spec-delivery verification → M17-S5.
+- A `sandbox workspace status` subcommand — § Out of Scope;
+  `push -n` / `pull -n` already serve the diff need.
+- Auto-detection of "this is a git repo, gitignore is fine" vs
+  "this is not a git repo" — § Out of Scope.
+- Lock-token persistence across CLI invocations — § Orphan locks
+  notes that the same-CLI re-release path is "not a recovery
+  path in practice".
+
+**Exit criteria.**
+
+- All push/pull and workspace-lock unit, integration, and E2E
+  tests from § Tests pass.
+- `cd sandboxd && cargo nextest run --workspace` default profile
+  clean; `cd sandboxd && cargo nextest run --workspace --profile
+  integration` clean; `make test-e2e-matrix` clean (both
+  backends).
+- `cd sandboxd && cargo clippy --workspace -- -D warnings` clean;
+  `cd sandboxd && cargo fmt --check` clean.
+- Manual example replay (Lima): with a `local:` session running,
+  `sandbox workspace push -f` after a host edit propagates the
+  edit to the guest; `sandbox workspace pull -f` after a guest
+  edit propagates back; `sandbox workspace push -n` prints the
+  rsync dry-run output without mutating anything.
 - Manual example replay (container): same shape against the
   container backend.
-- Manual example replay (filter): `local:` with a `.gitignore`
-  excluding `excluded/` does not transfer that directory; the same
-  source with `--no-gitignore` does.
-- Docs landed and reviewed.
+- Manual lock probe: with a `local:` session running, hold a lock
+  by running a long push in one shell; attempt `sandbox stop <s>`
+  in another and observe the documented 409 with the
+  `unlock --force` hint; SIGKILL the push CLI, run
+  `sandbox workspace unlock <s> --force`, and observe the next
+  push succeeds.
+- Manual idempotency probe: `sandbox workspace unlock
+  <unlocked-session> --force` exits 0 and prints "workspace lock
+  released".
+- `docs/guides/workspaces.md` push/pull + orphan-lock-recovery
+  sub-sections landed and reviewed.
 
-### M17-S3 — Six-track review (covering S1 + S2)
+### M17-S4 — Six-track review (covering S1 + S2 + S3)
 
-**Entry criteria.** M17-S2 complete — both shared and local layers
-landed, all tests green.
+**Entry criteria.** M17-S3 complete — shared/local/push-pull/lock
+layers all landed, all tests green.
 
 **Spec reference.** This document, all sections.
 
-**Rationale.** The expanded M17 touches a security-relevant surface
-(hardening posture via `securityModel`), a persistence-relevant
-surface (`config_json` blob shape, with a custom deserialiser shim),
-and adds a new orchestration code path (daemon-side rsync at
-session-create). The parser has documented footguns. A multi-track
-review calibrated to this spec's actual surface catches
-spec-vs-impl drift, parser corner cases, docs-vs-code contradictions,
-and premature widening that compile-and-test cannot.
+**Rationale.** The expanded M17 touches a security-relevant
+surface (the hardening posture via `securityModel`), a persistence-
+relevant surface (the `config_json` blob shape, with a custom
+deserialiser shim recovering legacy records), three new
+orchestration code paths (daemon-side rsync at session-create with
+blocking-failure tear-down; daemon-side per-session in-memory lock
+with lifecycle-handler integration; CLI-side `Drop`-guard release
+of that lock), and a new wire-protocol surface (three workspace-
+lock endpoints, a structured DTO field for describe). The parser
+carries documented footguns in the compact form. Six review tracks
+calibrated to this spec's actual surface catch failure modes that
+compile-and-test cannot: drift between spec text and
+implementation, parser corner cases the unit tests miss, docs that
+contradict the code, premature widening, `unwrap`/`expect` leaks
+in the new rsync orchestration path, and lock-state race windows
+that hermetic tests cannot probe.
 
 **In scope.**
 
 Six tracks, each delegated to a separate review agent in parallel:
 
-- **Track 1 — Implementation vs. spec.** Re-read the spec
-  section-by-section; compare every concrete claim (CLI shape,
-  default values, parser grammar table, persistence semantics, exact
+- **Track 1 — Implementation vs. spec.** Re-read the spec section-
+  by-section; compare every concrete claim (CLI shape across all
+  five new subcommands/flags, default values, parser grammar table
+  including the normalization and friendly-hint cases, persistence
+  semantics including the `Some(_)`-preservation round-trip, exact
   match between `WorkspaceSecurityModel` variants and accepted
-  tokens, `as_yaml` output vs YAML in the template, container
-  `--mount` argv shape, push/pull argv shape, `sandbox describe`
-  block format, capability set membership) against the
-  implementation; flag any divergence. Confirm both `host_path` and
-  `guest_path` are sanitised on the Lima path.
+  parser tokens, `as_yaml()` output vs YAML interpolated into the
+  Lima template, container `--mount type=bind,src=...,dst=...`
+  argv shape, push/pull argv shape, workspace-lock
+  acquire/release/idempotent-release wire contracts including the
+  exact 400/404/409 error messages, lifecycle-handler 409 message
+  including the `unlock --force` hint, `sandbox describe` block
+  format for all variants including the older-daemon flat-string
+  fallback, capability set membership across both backends,
+  `SessionMountInfo.workspace_path` semantic shift) against the
+  implementation; flag any divergence. Confirm both `host_path`
+  and `guest_path` are sanitised on the Lima path. Confirm the
+  lock acquire and the lifecycle-handler lock-check serialise
+  through the same per-session mutex. Confirm no handler bypasses
+  `error_response` to construct 409s ad-hoc — every 409 is
+  emitted through `SandboxError::Conflict(String)`.
 - **Track 2 — Code quality.** Review every touched file
-  (`sandbox-core/src/session.rs`, `lima.rs`,
-  `backend/container.rs`, every match-site updated for the new
-  fields, `sandbox-cli/src/main.rs`'s push/pull planner) for:
-  idiomatic Rust; no superfluous clones in the parser or planner;
-  error-message clarity (rsync stderr surfaced verbatim, container
-  rejection naming `security_model`, push/pull errors naming the
-  session and mode); no `unwrap`/`expect` in non-test paths around
-  new code; no accidental `pub` widening; `WorkspaceSecurityModel`
-  remains `Copy`; field names consistent across struct definitions,
-  match patterns, JSON wire form, YAML output, CLI rendering.
-- **Track 3 — Unit test quality.** For every unit test in S1+S2:
-  verify the assertion is non-tautological. Parser tests must
-  assert all three fields of `Shared` and both fields of `Local`
-  (not just `host_path`). Template tests must assert exact
-  `mountPoint:` and `securityModel:` substrings. Container backend
-  tests must assert exact `--mount type=bind,src=...,dst=...`
-  shape. Push/pull planner tests must assert the full argv vector,
-  not just the binary name. Backward-compat tests must construct
-  legacy JSON manually (no `guest_path` key) — not JSON with
-  `null`. Describe-render tests must assert byte-for-byte block
-  format.
+  (`sandbox-core/src/session.rs`, `sandbox-core/src/lima.rs`,
+  `sandbox-core/src/backend/container.rs`,
+  `sandbox-core/src/api/dto.rs` + `mapper.rs`,
+  `sandbox-core/src/workspace_lock.rs`,
+  `sandbox-core/src/error.rs` (for the new `Conflict` variant),
+  every match-site updated for the new fields,
+  `sandbox-cli/src/main.rs`'s push/pull planner + `unlock`
+  subcommand + `Drop`-guard release path, the daemon-side rsync
+  orchestration site, the lifecycle-handler integration in
+  `sandboxd/src/main.rs`) for: idiomatic Rust; no superfluous
+  clones in the parser, planner, or DTO mapper; error-message
+  clarity; no `unwrap`/`expect` in non-test paths around new
+  code; no accidental `pub` widening; `WorkspaceSecurityModel`
+  remains `Copy`; field names consistent. Confirm the daemon-side
+  rsync uses `tokio::process::Command` (the async-aware variant)
+  rather than `std::process::Command` in `spawn_blocking`.
+  Confirm the CLI release-guard fires on Ctrl+C, panic, and
+  SIGTERM paths.
+- **Track 3 — Unit test quality.** For every unit test added in
+  S1+S2+S3: verify the assertion is non-tautological. Parser
+  tests must assert *all* three fields of `Shared` and both
+  fields of `Local`. Template tests must assert exact
+  `mountPoint:` and `securityModel:` substrings. Container
+  backend argv tests must assert exact `--mount
+  type=bind,src=...,dst=...` shape. Push/pull planner tests must
+  assert the full argv vector. Backward-compat tests must
+  construct legacy JSON manually (no `guest_path` key) — not JSON
+  with `null`. Describe-render tests must assert byte-for-byte
+  block format, including the older-daemon flat-string fallback
+  path. Container-rejection test must assert the error message
+  contains `security_model`. Lock state-machine tests must cover
+  all six documented transitions; restart-resets-locks must
+  assert via dropping and re-constructing the lock map.
 - **Track 4 — Integration / E2E test quality.** Confirm the
-  example replays from S1 and S2 were performed; artefacts recorded
-  (Lima YAML excerpts, `docker create` argv from daemon logs,
-  host-side stat outputs, rsync stderr captures). Confirm
-  `integration_local_create_failure_tears_down` actually drives the
-  rsync failure (chmod or similar) rather than mocking it. Confirm
-  E2E tests run on both backends per their marker decorators.
-- **Track 5 — Docs quality.** Verify
-  `docs/guides/workspaces.md` documents the three-token shared
-  grammar accurately (including footguns), the new
-  `local:` section reads as a peer mode (not as an afterthought),
-  the cp/sync/local-push/pull distinction is clear. Verify
+  example replays from S1, S2, and S3 were performed; artefacts
+  recorded (Lima YAML excerpts, `docker create` argv from daemon
+  logs, host-side `stat -c %F` output, host-side `getfattr -d`
+  output for the default case, rsync stderr captures, lock-409
+  response bodies, `sandbox stop` 409 response bodies). Confirm
+  `integration_local_create_failure_tears_down` actually drives
+  the rsync failure (chmod or similar, not mocked). Confirm
+  `integration_workspace_lock_blocks_stop` actually races the
+  lock acquire against the stop request (not just sequencing the
+  two). Confirm both E2E files
+  (`test_workspace_local.py`, `test_workspace_lock.py`,
+  `test_workspace_shared_guest_path.py`) run on both backends per
+  their function-level `parametrize("backend", ["lima",
+  "container"])` decorators.
+- **Track 5 — Docs quality.** Verify `docs/guides/workspaces.md`
+  documents the three-token shared grammar accurately (including
+  the path-with-colons footgun); explains when to pick `none`,
+  points at the trade-off; the new `local:` section reads as a
+  peer mode; the cp/sync/local-push/pull distinction is clear in
+  the comparison table; the orphan-lock recovery sub-section is
+  discoverable from the push/pull section; the inline breaking-
+  default note and the `local:`-rollback caveat are present and
+  legible (no separate upgrade-tracking file is created). Verify
   `docs/guides/hardening.md` covers both the per-session model
-  decision (shared) and the no-9p-surface bullet (local). Verify
-  `docs/concepts/workspaces.md` lists five modes. Verify
-  `docs/internal/upgrade-notes.md` documents both breaking changes
-  (shared default, local rollback).
+  decision (shared) and the no-9p-surface bullet (local); the
+  default is unchanged for `shared:`; `passthrough` /
+  `mapped-file` are deliberately not exposed with rationale;
+  `none` does not alter the QEMU privilege model. Verify
+  `docs/concepts/workspaces.md` lists five modes. Verify the docs
+  do not contradict the spec on any of these points.
 - **Track 6 — Workarounds + deprecated patterns.** Grep touched
-  files for: new `unwrap()`/`expect()` in non-test paths;
-  `TODO`/`FIXME` introduced in S1+S2; any milestone tag (`M17` /
-  `S1` / `S2`) embedded in code or test comments per CLAUDE.md's
-  "no milestone tags in code or tests" convention; any
+  files for: (a) any new `unwrap()`/`expect()` in non-test paths;
+  (b) any `TODO`/`FIXME` introduced in S1+S2+S3; (c) any place
+  where `passthrough` or `mapped-file` accidentally appears as a
+  recognised model token; (d) any milestone tag (`M17` / `S1` /
+  `S2` / `S3`) embedded in code or test comments per CLAUDE.md's
+  "no milestone tags in code or tests" convention; (e) any
   hardcoded `/home/agent/workspace` that survived the shared-side
-  guest-path migration; any duplicated rsync orchestration between
-  the daemon and the CLI (push/pull); any
-  `passthrough`/`mapped-file` token sneaking into a code path.
+  guest-path migration; (f) any duplicated rsync orchestration
+  between the daemon (create-time push) and the CLI (push/pull)
+  that should share a planner; (g) any flat-string re-parse of
+  `workspace_mode` in the CLI describe path that should consume
+  `workspace_mode_detail` instead.
 
 **Explicitly deferred.**
 
-- Claim-to-code map + example replay write-up → M17-S4.
+- Claim-to-code map + example replay write-up + out-of-scope grep
+  → M17-S5.
 
 **Exit criteria.**
 
@@ -2593,109 +2989,140 @@ Six tracks, each delegated to a separate review agent in parallel:
   prioritised list.
 - Every "must-fix" finding addressed, re-implemented where needed,
   and re-tested.
-- `cargo nextest run --workspace` default and integration profiles
-  clean post-fixes; `cargo clippy --workspace` clean;
-  `cargo fmt --check` clean.
+- `cd sandboxd && cargo nextest run --workspace` default and
+  integration profiles clean post-fixes.
+- `cd sandboxd && cargo clippy --workspace -- -D warnings` clean;
+  `cd sandboxd && cargo fmt --check` clean.
 - `make test-e2e-matrix` clean post-fixes.
 
-### M17-S4 — Spec-delivery verification
+### M17-S5 — Spec-delivery verification
 
-**Entry criteria.** M17-S3 complete — all review findings addressed,
-all tests passing.
+**Entry criteria.** M17-S4 complete — all review findings
+addressed, all tests passing.
 
 **Spec reference.** This document, all sections.
 
 **Rationale.** M17 is the terminal milestone for this spec. The
 verification session closes the incentive gap that decomposition
-creates: S1's and S2's exit criteria measure "are the in-scope tests
-green?", not "is every spec claim provably delivered?". Re-reading
-the spec end-to-end as if unfamiliar with the implementation and
-mapping every concrete claim to a code+test locator (or to an
-explicit out-of-scope bullet, or to a tracked follow-on) is what
-proves the spec landed.
+creates: S1's, S2's, and S3's exit criteria measure "are the in-
+scope tests green?", not "is every spec claim provably
+delivered?". Re-reading the spec end-to-end as if unfamiliar with
+the implementation and mapping every concrete claim to a code+test
+locator (or to an explicit out-of-scope bullet, or to a tracked
+follow-on) is what proves the spec landed.
 
 **In scope.**
 
-- **Claim-to-code map.** Every concrete claim across § Summary, §
-  Motivation, § CLI shape, § Domain types, § Parser, § Backward
-  Compatibility, § `local:` Mode, § Push/pull commands, § Lima
-  Backend, § Container Backend, § `sandbox describe`, § Tests, §
-  Docs Changes, § Out of Scope, § Known Gaps maps to (a) a code
-  locator (file path + function/symbol) + a test locator, (b) an
-  explicit out-of-scope bullet from the spec, or (c) a `progress`
-  todo for future work. Format per the project's claim-to-code
-  convention.
+- **Claim-to-code map.** Every concrete claim across § Summary,
+  § Motivation, § CLI shape, § Domain types, § Parser, § Backward
+  Compatibility, § `local:` Mode, § Push/pull commands,
+  § Workspace lock, § Lima Backend, § Container Backend,
+  § `sandbox describe`, § Tests, § Docs Changes, § Out of Scope,
+  § Known Gaps maps to (a) a code locator (file path +
+  function/symbol) + a test locator, (b) an explicit out-of-scope
+  bullet from the spec, or (c) a `progress` todo for future work.
 - **Example replay (Lima)**, against a live session in hardened
   mode:
   - `shared:/tmp/sbx-a` → `mountPoint: /tmp/sbx-a` in the rendered
-    YAML; default `securityModel: mapped-xattr`.
+    YAML; default `securityModel: mapped-xattr`; guest-side
+    `ln -s a b` produces a host-side regular file with
+    `user.virtfs.symlink.target` xattr.
   - `shared:/tmp/sbx-a:/srv/work` → `mountPoint: /srv/work`.
   - `shared:/tmp/sbx-a:/srv/work:none` → both substitutions; a
     guest-side `ln -s` round-trips as a real host symlink at
     `/tmp/sbx-a/b`.
-  - `shared:~/proj` → with `HOME=/home/user`, host=`/home/user/proj`,
-    `mountPoint: /home/user/proj` (guest inherits resolved host).
-  - `shared:~/proj:~/work` → host=`/home/user/proj`,
+  - `shared:/tmp/sbx-explicit:mapped-xattr` → confirms the
+    explicit form produces the same result as the omitted form.
+  - `shared:~/proj` → with `HOME=/home/user`,
+    `host_path=/home/user/proj`, `mountPoint:
+    /home/user/proj`.
+  - `shared:~/proj:~/work` → `host_path=/home/user/proj`,
     `mountPoint: /home/agent/work` (each `~` expands per side).
   - `local:/tmp/sbx-l` → on-create push populates `/tmp/sbx-l` in
-    the guest; `push -f` after host edit propagates; `pull -f` after
-    guest edit propagates back.
+    the guest; `push -f` after host edit propagates; `pull -f`
+    after guest edit propagates back.
   - `local:/tmp/sbx-l:/srv/work` → guest content lands at
     `/srv/work` instead.
   - `local:/tmp/sbx-l --no-gitignore` → gitignored host content
     transfers into the guest at create time.
-- **Example replay (container)**, against a live container session:
-  - `shared:/tmp/sbx-a:/srv/work` → `--mount
-    type=bind,src=/tmp/sbx-a,dst=/srv/work` in the `docker
+- **Example replay (container)**, against a live container
+  session:
+  - `shared:/tmp/sbx-a:/home/agent/work` → `--mount
+    type=bind,src=/tmp/sbx-a,dst=/home/agent/work` in the `docker
     create` argv (captured from daemon logs).
   - `local:/tmp/sbx-l:/home/agent/local` → on-create rsync
     populates `/home/agent/local` inside the container;
     `push -f` and `pull -f` work.
+- **Workspace-lock example replay** (against either backend):
+  - Acquire a push lock via the API, record the returned
+    `lock_token`, attempt a second acquire and capture the 409
+    response body verbatim.
+  - With the lock held, attempt `sandbox stop <s>` and capture
+    the 409 response body verbatim (must include the
+    `sandbox workspace unlock --force` hint).
+  - Release the lock with the correct token, observe the
+    subsequent acquire succeeds.
+  - Acquire again, deliberately discard the token, run
+    `sandbox workspace unlock <s> --force`, observe 200 and that
+    the next acquire succeeds.
+  - Restart the daemon while a lock is held; observe the lock is
+    gone after restart.
 - **Compact-form footgun probe.** `sandbox create --workspace
   shared:/tmp/sbx-foo:none` against a host path that genuinely
   exists at `/tmp/sbx-foo:none` (literal). Record the observed
-  behaviour and confirm § Known Gaps's caveat matches.
-  Repeat for `shared:/tmp/foo:/tmp/bar` (literal path with colon).
-- **Out-of-scope conformance.** Grep verify that the § Out of
-  scope list is genuinely absent from new code: no
+  parser behaviour and confirm § Known Gaps's caveat matches.
+  Repeat for `shared:/tmp/foo:/tmp/bar`.
+- **Out-of-scope conformance.** Grep verification that § Out of
+  Scope is genuinely absent from new code: no
   `--workspace-guest-path` flag, no `--security-model` flag, no
-  rsync `--include`/`--exclude` plumbing, no filesystem-watcher
-  daemon, no `sandbox workspace status` subcommand.
+  `passthrough` / `mapped-file` token, no rsync `--include` /
+  `--exclude` plumbing, no filesystem-watcher daemon, no
+  `sandbox workspace status` subcommand, no post-create mutation
+  entry point for `host_path` / `guest_path` / `security_model`,
+  no `cache` flag, no `GET /sessions/{id}/workspace-lock`
+  endpoint.
 - **Persistence round-trip probe.** Serialise a `SessionConfig`
-  with `WorkspaceMode::Shared { host=/a, guest=/b, model=Some(NoneMapping) }`,
-  persist via the store, re-load, confirm round-trip.
-  Serialise `WorkspaceMode::Local { host=/a, guest=/b }`, persist,
-  re-load, confirm round-trip. Hand-craft a legacy JSON blob with no
-  `guest_path` key on `Shared`, persist as raw text into a row,
-  reload via the daemon, confirm `guest_path = host_path` recovery.
-- **Known-gap reconciliation.** Each `Known Gaps` bullet is either
-  resolved or tracked as a `progress` todo (compact-form path
-  footgun, container read-only / guest-path interaction, rollback
-  past `local:`, guest-path collisions with image contents,
-  initial-push timeout envelope).
+  with `WorkspaceMode::Shared { host=/a, guest=/b,
+  model=Some(NoneMapping) }`, persist via the store, re-load,
+  confirm round-trip. Serialise `WorkspaceMode::Local { host=/a,
+  guest=/b }`, persist, re-load, confirm round-trip. Hand-craft a
+  legacy JSON blob with no `guest_path` key on `Shared`, persist
+  as raw text into a row, reload via the daemon, confirm
+  `guest_path = host_path` recovery. Serialise without the
+  `security_model` field (manually craft the JSON), re-load,
+  confirm `security_model` reads as `None`. Confirm no
+  workspace-lock state is persisted anywhere in the session DB.
+- **Known-gap reconciliation.** Each `Known Gaps` bullet is
+  either resolved or tracked as a `progress` todo.
 - **Deliverable.** Write the delivery file at
   `.tasks/specs/2026-05-20-m17-workspace-ergonomics/2026-05-20-m17-workspace-ergonomics-delivery.md`.
 
 **Explicitly deferred.** Nothing — this session closes the spec.
 
-**Exit criteria.** Conjunctive — ALL must hold before M17-S4 is
+**Exit criteria.** Conjunctive — ALL must hold before M17-S5 is
 marked complete:
 
-- Delivery file exists; every BLOCKER-tagged item in the
-  claim-to-code map is resolved.
+- Delivery file exists; every BLOCKER-tagged item in the claim-
+  to-code map is resolved.
 - Every concrete claim across all spec sections has a code
   locator, an out-of-scope citation, or a named follow-on tracking
   reference.
 - All example replays complete without deviation: rendered YAML
   exact, `docker create` argv exact, rsync command-line exact,
-  push/pull behaviour matches the spec on both backends.
+  `stat -c %F` / `getfattr -d` outputs exact, push/pull behaviour
+  matches the spec on both backends, workspace-lock 409 /
+  `unlock --force` flow matches the spec verbatim.
 - Compact-form footgun observations recorded with concrete output
   and reconciled against § Known Gaps.
-- Out-of-scope items absent from new code (grep for each item).
+- Out-of-scope items absent from new code.
 - Persistence round-trip probe completes without deviation,
-  including the legacy-record recovery case.
-- Known-gap reconciliation: each bullet either resolved or tracked.
-- `cargo nextest run --workspace` default profile clean.
-- `cargo nextest run --workspace --profile integration` clean.
+  including the legacy-record recovery case and the workspace-
+  lock non-persistence assertion.
+- Known-gap reconciliation: each bullet either resolved or
+  tracked.
+- `cd sandboxd && cargo nextest run --workspace` default profile
+  clean.
+- `cd sandboxd && cargo nextest run --workspace --profile
+  integration` clean.
 - `make test-e2e-matrix` clean.
 - Code review of the delivery artefact approved.
