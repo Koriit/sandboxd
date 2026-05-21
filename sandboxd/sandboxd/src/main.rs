@@ -1698,10 +1698,11 @@ async fn create_session(
         //   not a VM's veth.
         // - `gateway_ip` (the .2) → `gateway_ip` unchanged.
         //
-        // `workspace_host_path` is populated when the request asked
-        // for `--workspace shared:<path>` — the runtime turns it into
-        // a `docker create --mount type=bind,source=<path>,...` flag
-        // (spec § "Workspace bind"). For other workspace modes
+        // `workspace_bind` is populated when the request asked
+        // for `--workspace shared:<host>[:<guest>]` — the runtime
+        // turns it into a `docker create --mount
+        // type=bind,src=<host>,dst=<guest>` flag (spec § "Container
+        // Backend / Shared bind-mount"). For other workspace modes
         // (`Clone`, `Empty`) the field stays `None` and the lite
         // image runs with a read-only rootfs.
         //
@@ -1747,13 +1748,39 @@ async fn create_session(
                     );
                 }
             };
-            // Pull the host path out of the parsed workspace mode
-            // (set on `config` above when `req.workspace =
-            // Some("shared:<path>")`). Other variants don't bind a
-            // host path into the container.
-            let workspace_host_path = match &config.workspace_mode {
-                Some(sandbox_core::WorkspaceMode::Shared { host_path }) => {
-                    Some(PathBuf::from(host_path))
+            // Pull the (host, guest) pair out of the parsed workspace
+            // mode (set on `config` above when `req.workspace =
+            // Some("shared:<host>[:<guest>][:<model>]")`). Other
+            // variants don't bind a host path into the container.
+            //
+            // `security_model` is meaningless for a Docker bind-mount
+            // (it is a 9p concept on the Lima side); the daemon-side
+            // mapper rejects any `Some(_)` value here so the runtime
+            // stays unaware of the field — see the M17 spec
+            // § "Container Backend / Shared bind-mount".
+            let workspace_bind = match &config.workspace_mode {
+                Some(sandbox_core::WorkspaceMode::Shared {
+                    host_path,
+                    guest_path,
+                    security_model,
+                }) => {
+                    if security_model.is_some() {
+                        cleanup_net_ca_and_return!(
+                            state,
+                            session_id,
+                            error_response(sandbox_core::SandboxError::InvalidArgument(
+                                "security_model is not supported by the container \
+                                 backend (9p-only concept); omit the :<model> token \
+                                 from --workspace shared:…"
+                                    .to_string(),
+                            ))
+                            .into_response()
+                        );
+                    }
+                    Some(sandbox_core::backend::WorkspaceBind {
+                        host_path: PathBuf::from(host_path),
+                        guest_path: PathBuf::from(guest_path),
+                    })
                 }
                 _ => None,
             };
@@ -1771,7 +1798,7 @@ async fn create_session(
                 docker_network: network_info.docker_network_name.clone(),
                 container_ip,
                 gateway_ip,
-                workspace_host_path,
+                workspace_bind,
                 route_helper_path: Some(route_helper_path),
                 // Per-session CA: bind-mounted read-only into the
                 // container at /etc/ssl/certs/sandbox-ca.pem and
@@ -3062,12 +3089,6 @@ fn session_network_info_for(
     }
 }
 
-/// In-session absolute path of the workspace, unified across backends.
-/// Both Lima and container plant the workspace at this path; the
-/// `WorkspaceMode::Shared` host bind and the `WorkspaceMode::Clone`
-/// `git clone <url> <path>` invocations already use the same target.
-const SESSION_WORKSPACE_PATH: &str = "/home/agent/workspace/";
-
 /// Build a backend-neutral [`SessionMountInfo`] for a session.
 ///
 /// Container sessions populate every field. Lima sessions populate
@@ -3077,10 +3098,41 @@ const SESSION_WORKSPACE_PATH: &str = "/home/agent/workspace/";
 /// directory are not bind-/volume-backed (the guest agent installs
 /// the CA into the system trust store; home is a regular VM
 /// directory).
+///
+/// `workspace_path` is derived from the in-memory `WorkspaceMode`:
+///
+/// - `Shared` → the operator-resolved `guest_path` (M17 breaking
+///   default: equals `host_path` when no explicit `:<guest>` token
+///   was supplied at create time).
+/// - `Clone` → the historical `/home/agent/workspace` clone target.
+/// - No workspace mode → the historical default for the empty case.
+///
+/// A trailing `/` is appended so the rendered wire field keeps its
+/// pre-M17 shape (e.g. `/home/agent/workspace/`); operator scripts
+/// that grep on the trailing slash stay byte-compatible.
 fn session_mount_info_for(session: &Session) -> SessionMountInfo {
-    let workspace_host_path = match &session.config.workspace_mode {
-        Some(sandbox_core::WorkspaceMode::Shared { host_path }) => Some(host_path.clone()),
-        _ => None,
+    // Default workspace target retained for the `Clone` and empty
+    // cases — `Shared` overrides this with the operator's `guest_path`.
+    const CLONE_WORKSPACE_PATH: &str = "/home/agent/workspace";
+
+    let (workspace_path_raw, workspace_host_path) = match &session.config.workspace_mode {
+        Some(sandbox_core::WorkspaceMode::Shared {
+            host_path,
+            guest_path,
+            ..
+        }) => (guest_path.clone(), Some(host_path.clone())),
+        Some(sandbox_core::WorkspaceMode::Clone { .. }) => (CLONE_WORKSPACE_PATH.to_string(), None),
+        None => (CLONE_WORKSPACE_PATH.to_string(), None),
+    };
+    // Re-add the trailing `/` that the pre-M17 hardcoded constant
+    // carried, so the wire form stays byte-identical for scripts
+    // (e.g. `workspace_path: "/home/agent/workspace/"`). The parser
+    // strips trailing `/` from `guest_path` in normalization, so we
+    // reattach exactly one here.
+    let workspace_path = if workspace_path_raw.ends_with('/') {
+        workspace_path_raw
+    } else {
+        format!("{workspace_path_raw}/")
     };
     let (ca_bundle_path, home_volume) = match session.backend {
         sandbox_core::backend::BackendKind::Container => (
@@ -3096,7 +3148,7 @@ fn session_mount_info_for(session: &Session) -> SessionMountInfo {
         sandbox_core::backend::BackendKind::Lima => (None, None),
     };
     SessionMountInfo {
-        workspace_path: SESSION_WORKSPACE_PATH.to_string(),
+        workspace_path,
         workspace_host_path,
         ca_bundle_path,
         home_volume,

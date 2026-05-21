@@ -125,7 +125,7 @@ impl TestNetwork {
             docker_network: self.name.clone(),
             container_ip: self.container_ip.parse().unwrap(),
             gateway_ip: self.gateway_ip.parse().unwrap(),
-            workspace_host_path: None,
+            workspace_bind: None,
             // No route helper: integration tests deliberately exercise
             // the lifecycle without depending on /etc/sandboxd/users.conf
             // (Phase 3D wires the helper).

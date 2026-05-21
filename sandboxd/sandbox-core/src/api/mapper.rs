@@ -18,7 +18,7 @@ use crate::session::{Session, SessionConfig, WorkspaceMode};
 
 use super::dto::{
     PolicyDto, PolicyLevelDto, PolicyRuleDto, SessionConfigDto, SessionDto, SessionMountInfo,
-    SessionNetworkInfo, SessionRootlessDocker as SessionRootlessDockerDto,
+    SessionNetworkInfo, SessionRootlessDocker as SessionRootlessDockerDto, WorkspaceModeDetailDto,
 };
 
 // ---------------------------------------------------------------------------
@@ -217,6 +217,10 @@ impl From<&SessionConfig> for SessionConfigDto {
             resolved_cpus: cpus_wire as f64,
             resolved_memory_mb: config.memory_mb,
             workspace_mode: config.workspace_mode.as_ref().map(render_workspace_mode),
+            workspace_mode_detail: config
+                .workspace_mode
+                .as_ref()
+                .map(render_workspace_mode_detail),
             hardened: config.hardened,
             repo: config.repo.clone(),
             boot_cmd: config.boot_cmd.clone(),
@@ -225,16 +229,77 @@ impl From<&SessionConfig> for SessionConfigDto {
     }
 }
 
-/// Render a workspace mode as a short string (`"shared:<path>"` or
-/// `"clone:<url>"`) for the wire representation.
+/// Render a workspace mode as a short string for the legacy flat
+/// `workspace_mode` wire field.
 ///
-/// Kept as a free function (not an `impl Display for WorkspaceMode`) so
-/// that the wire surface and any future debug/log formatting stay
-/// decoupled — changing one must not silently change the other.
+/// The four `Shared` compact-form cases follow the M17 spec
+/// (§ "Wire surface"):
+///
+/// - `shared:<host>` — default guest path (equal to `host_path`) and
+///   no security-model override (`security_model = None`).
+/// - `shared:<host>:<guest>` — explicit guest path, no security-model
+///   override.
+/// - `shared:<host>:<model>` — default guest path, explicit
+///   `Some(_)` security model (any inner variant, including
+///   `MappedXattr`, is preserved verbatim so the renderer round-trips
+///   through `parse_flag`).
+/// - `shared:<host>:<guest>:<model>` — full triple, explicit guest
+///   path and explicit security model.
+///
+/// `Clone` renders unchanged. Kept as a free function (not an
+/// `impl Display for WorkspaceMode`) so that the wire surface and any
+/// future debug/log formatting stay decoupled — changing one must not
+/// silently change the other.
 fn render_workspace_mode(mode: &WorkspaceMode) -> String {
     match mode {
-        WorkspaceMode::Shared { host_path } => format!("shared:{host_path}"),
+        WorkspaceMode::Shared {
+            host_path,
+            guest_path,
+            security_model,
+        } => {
+            let guest_explicit = guest_path != host_path;
+            // The "skip default values for compactness" rule applies
+            // only to `Option::None`: a `Some(_)` value renders the
+            // token verbatim regardless of which inner variant it
+            // carries (including `MappedXattr`), so the explicit
+            // operator intent round-trips through the renderer.
+            match (guest_explicit, security_model) {
+                (false, None) => format!("shared:{host_path}"),
+                (true, None) => format!("shared:{host_path}:{guest_path}"),
+                (false, Some(model)) => {
+                    format!("shared:{host_path}:{}", model.as_yaml())
+                }
+                (true, Some(model)) => {
+                    format!("shared:{host_path}:{guest_path}:{}", model.as_yaml())
+                }
+            }
+        }
         WorkspaceMode::Clone { repo_url } => format!("clone:{repo_url}"),
+    }
+}
+
+/// Project an in-memory [`WorkspaceMode`] onto the structured
+/// [`WorkspaceModeDetailDto`] surfaced by `SessionConfigDto`.
+///
+/// The DTO's `Local` variant is wire-surface-only for S1: the domain
+/// `WorkspaceMode` only carries `Shared` and `Clone` today, so this
+/// mapper has no `Local` arm. The variant exists on the DTO side
+/// solely so the wire schema is forward-compat with M17-S2 (which
+/// lands `WorkspaceMode::Local` on the domain side).
+fn render_workspace_mode_detail(mode: &WorkspaceMode) -> WorkspaceModeDetailDto {
+    match mode {
+        WorkspaceMode::Shared {
+            host_path,
+            guest_path,
+            security_model,
+        } => WorkspaceModeDetailDto::Shared {
+            host_path: host_path.clone(),
+            guest_path: guest_path.clone(),
+            security_model: security_model.map(Into::into),
+        },
+        WorkspaceMode::Clone { repo_url } => WorkspaceModeDetailDto::Clone {
+            repo_url: repo_url.clone(),
+        },
     }
 }
 
@@ -463,6 +528,11 @@ mod tests {
             disk_gb: 20,
             workspace_mode: Some(WorkspaceMode::Shared {
                 host_path: "/home/olek/project".into(),
+                // Default-shape fixture: `guest_path = host_path`,
+                // `security_model = None`. The render then collapses
+                // to the bare `shared:<host>` compact form.
+                guest_path: "/home/olek/project".into(),
+                security_model: None,
             }),
             hardened: true,
             repo: None,
@@ -681,6 +751,8 @@ mod tests {
                 disk_gb: 20,
                 workspace_mode: Some(WorkspaceMode::Shared {
                     host_path: "/home/olek/proj".into(),
+                    guest_path: "/home/olek/proj".into(),
+                    security_model: None,
                 }),
                 hardened: false,
                 repo: None,
@@ -908,5 +980,257 @@ mod tests {
         assert_eq!(dto.id.as_str(), "0123456789ab");
         assert_eq!(dto.config.cpus, 2.0_f32);
         assert_eq!(dto.backend, crate::backend::BackendKind::Lima);
+    }
+
+    // -- workspace_mode_detail mapper coverage ------------------------------
+
+    use crate::api::dto::{WorkspaceModeDetailDto, WorkspaceSecurityModelDto};
+    use crate::session::WorkspaceSecurityModel;
+
+    fn base_session_config() -> SessionConfig {
+        SessionConfig {
+            cpus: 2,
+            memory_mb: 4096,
+            disk_gb: 20,
+            workspace_mode: None,
+            hardened: true,
+            repo: None,
+            boot_cmd: None,
+            template: None,
+            cpus_decimal: None,
+            rootless_docker: None,
+        }
+    }
+
+    #[test]
+    fn workspace_mode_detail_shared_default_collapses_guest_and_security() {
+        // `Shared` with `guest_path == host_path` and `security_model: None`
+        // is the post-M17 default-shape fixture: the DTO still carries both
+        // paths verbatim, and `security_model` is omitted from the wire via
+        // `skip_serializing_if`.
+        let config = SessionConfig {
+            workspace_mode: Some(WorkspaceMode::Shared {
+                host_path: "/home/olek/project".into(),
+                guest_path: "/home/olek/project".into(),
+                security_model: None,
+            }),
+            ..base_session_config()
+        };
+        let dto: SessionConfigDto = (&config).into();
+        let detail = dto
+            .workspace_mode_detail
+            .expect("workspace_mode_detail populated for Shared");
+        match detail {
+            WorkspaceModeDetailDto::Shared {
+                host_path,
+                guest_path,
+                security_model,
+            } => {
+                assert_eq!(host_path, "/home/olek/project");
+                assert_eq!(guest_path, "/home/olek/project");
+                assert!(security_model.is_none());
+            }
+            other => panic!("expected Shared variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_mode_detail_shared_carries_explicit_guest_path() {
+        let config = SessionConfig {
+            workspace_mode: Some(WorkspaceMode::Shared {
+                host_path: "/tmp/sbx-a".into(),
+                guest_path: "/srv/work".into(),
+                security_model: None,
+            }),
+            ..base_session_config()
+        };
+        let dto: SessionConfigDto = (&config).into();
+        let detail = dto.workspace_mode_detail.unwrap();
+        assert_eq!(
+            detail,
+            WorkspaceModeDetailDto::Shared {
+                host_path: "/tmp/sbx-a".into(),
+                guest_path: "/srv/work".into(),
+                security_model: None,
+            }
+        );
+    }
+
+    #[test]
+    fn workspace_mode_detail_shared_preserves_some_mapped_xattr() {
+        let config = SessionConfig {
+            workspace_mode: Some(WorkspaceMode::Shared {
+                host_path: "/home/olek/project".into(),
+                guest_path: "/home/olek/project".into(),
+                security_model: Some(WorkspaceSecurityModel::MappedXattr),
+            }),
+            ..base_session_config()
+        };
+        let dto: SessionConfigDto = (&config).into();
+        let detail = dto.workspace_mode_detail.unwrap();
+        assert_eq!(
+            detail,
+            WorkspaceModeDetailDto::Shared {
+                host_path: "/home/olek/project".into(),
+                guest_path: "/home/olek/project".into(),
+                security_model: Some(WorkspaceSecurityModelDto::MappedXattr),
+            }
+        );
+    }
+
+    #[test]
+    fn workspace_mode_detail_shared_preserves_some_none_mapping() {
+        let config = SessionConfig {
+            workspace_mode: Some(WorkspaceMode::Shared {
+                host_path: "/home/olek/project".into(),
+                guest_path: "/home/olek/project".into(),
+                security_model: Some(WorkspaceSecurityModel::NoneMapping),
+            }),
+            ..base_session_config()
+        };
+        let dto: SessionConfigDto = (&config).into();
+        let detail = dto.workspace_mode_detail.unwrap();
+        assert_eq!(
+            detail,
+            WorkspaceModeDetailDto::Shared {
+                host_path: "/home/olek/project".into(),
+                guest_path: "/home/olek/project".into(),
+                security_model: Some(WorkspaceSecurityModelDto::NoneMapping),
+            }
+        );
+    }
+
+    #[test]
+    fn workspace_mode_detail_shared_full_triple_round_trip() {
+        let config = SessionConfig {
+            workspace_mode: Some(WorkspaceMode::Shared {
+                host_path: "/tmp/sbx-a".into(),
+                guest_path: "/srv/work".into(),
+                security_model: Some(WorkspaceSecurityModel::NoneMapping),
+            }),
+            ..base_session_config()
+        };
+        let dto: SessionConfigDto = (&config).into();
+        let detail = dto.workspace_mode_detail.unwrap();
+        assert_eq!(
+            detail,
+            WorkspaceModeDetailDto::Shared {
+                host_path: "/tmp/sbx-a".into(),
+                guest_path: "/srv/work".into(),
+                security_model: Some(WorkspaceSecurityModelDto::NoneMapping),
+            }
+        );
+    }
+
+    #[test]
+    fn workspace_mode_detail_clone_carries_repo_url() {
+        let config = SessionConfig {
+            workspace_mode: Some(WorkspaceMode::Clone {
+                repo_url: "https://github.com/example/app.git".into(),
+            }),
+            ..base_session_config()
+        };
+        let dto: SessionConfigDto = (&config).into();
+        let detail = dto.workspace_mode_detail.unwrap();
+        assert_eq!(
+            detail,
+            WorkspaceModeDetailDto::Clone {
+                repo_url: "https://github.com/example/app.git".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn workspace_mode_detail_absent_workspace_renders_none() {
+        let config = SessionConfig {
+            workspace_mode: None,
+            ..base_session_config()
+        };
+        let dto: SessionConfigDto = (&config).into();
+        assert!(dto.workspace_mode_detail.is_none());
+
+        let json = serde_json::to_string(&dto).unwrap();
+        assert!(
+            !json.contains("workspace_mode_detail"),
+            "workspace_mode_detail key must be omitted when None; json = {json}"
+        );
+    }
+
+    // -- WorkspaceModeDetailDto wire-shape round-trips -----------------------
+
+    #[test]
+    fn workspace_mode_detail_dto_shared_round_trip_no_security_model() {
+        let dto = WorkspaceModeDetailDto::Shared {
+            host_path: "/tmp/sbx-a".into(),
+            guest_path: "/srv/work".into(),
+            security_model: None,
+        };
+        let value = serde_json::to_value(&dto).unwrap();
+        assert_eq!(value["type"], "shared");
+        assert_eq!(value["host_path"], "/tmp/sbx-a");
+        assert_eq!(value["guest_path"], "/srv/work");
+        assert!(
+            value.as_object().unwrap().get("security_model").is_none(),
+            "security_model None must be omitted via skip_serializing_if; value = {value:?}"
+        );
+        let back: WorkspaceModeDetailDto = serde_json::from_value(value).unwrap();
+        assert_eq!(back, dto);
+    }
+
+    #[test]
+    fn workspace_mode_detail_dto_shared_round_trip_some_mapped_xattr() {
+        let dto = WorkspaceModeDetailDto::Shared {
+            host_path: "/tmp/sbx-a".into(),
+            guest_path: "/tmp/sbx-a".into(),
+            security_model: Some(WorkspaceSecurityModelDto::MappedXattr),
+        };
+        let value = serde_json::to_value(&dto).unwrap();
+        assert_eq!(value["type"], "shared");
+        assert_eq!(value["security_model"], "mapped-xattr");
+        let back: WorkspaceModeDetailDto = serde_json::from_value(value).unwrap();
+        assert_eq!(back, dto);
+    }
+
+    #[test]
+    fn workspace_mode_detail_dto_shared_round_trip_some_none_mapping() {
+        let dto = WorkspaceModeDetailDto::Shared {
+            host_path: "/tmp/sbx-a".into(),
+            guest_path: "/tmp/sbx-a".into(),
+            security_model: Some(WorkspaceSecurityModelDto::NoneMapping),
+        };
+        let value = serde_json::to_value(&dto).unwrap();
+        assert_eq!(value["type"], "shared");
+        assert_eq!(value["security_model"], "none");
+        let back: WorkspaceModeDetailDto = serde_json::from_value(value).unwrap();
+        assert_eq!(back, dto);
+    }
+
+    #[test]
+    fn workspace_mode_detail_dto_clone_round_trip() {
+        let dto = WorkspaceModeDetailDto::Clone {
+            repo_url: "https://github.com/example/app.git".into(),
+        };
+        let value = serde_json::to_value(&dto).unwrap();
+        assert_eq!(value["type"], "clone");
+        assert_eq!(value["repo_url"], "https://github.com/example/app.git");
+        let back: WorkspaceModeDetailDto = serde_json::from_value(value).unwrap();
+        assert_eq!(back, dto);
+    }
+
+    #[test]
+    fn workspace_mode_detail_dto_local_round_trip() {
+        // Wire-surface-only in S1 (no domain mapping); the DTO must still
+        // serialise and deserialise cleanly so future daemons can populate
+        // it and current clients consume it without a release-train pin.
+        let dto = WorkspaceModeDetailDto::Local {
+            host_path: "/tmp/sbx-l".into(),
+            guest_path: "/srv/work".into(),
+        };
+        let value = serde_json::to_value(&dto).unwrap();
+        assert_eq!(value["type"], "local");
+        assert_eq!(value["host_path"], "/tmp/sbx-l");
+        assert_eq!(value["guest_path"], "/srv/work");
+        let back: WorkspaceModeDetailDto = serde_json::from_value(value).unwrap();
+        assert_eq!(back, dto);
     }
 }

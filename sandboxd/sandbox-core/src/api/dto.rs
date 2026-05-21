@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::backend::BackendKind;
 use crate::policy::{Destination, HttpFilter, Protocol};
-use crate::session::{SessionId, SessionState};
+use crate::session::{SessionId, SessionState, WorkspaceSecurityModel};
 
 // ---------------------------------------------------------------------------
 // Session DTOs
@@ -226,9 +226,12 @@ pub struct SessionNetworkInfo {
 /// the other.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionMountInfo {
-    /// In-session absolute path of the workspace. Unified across
-    /// backends — both Lima and container use
-    /// `/home/agent/workspace/`.
+    /// In-session absolute path of the workspace. Derived from the
+    /// resolved `guest_path` on the session's `WorkspaceMode::Shared`
+    /// (defaults to the `host_path` when the operator did not supply
+    /// an explicit guest path). For `WorkspaceMode::Clone` and the
+    /// unset case the daemon falls back to the historical
+    /// `/home/agent/workspace/` value.
     pub workspace_path: String,
     /// Absolute host path bound into the session at `workspace_path`.
     /// Set only when the session was created with
@@ -306,6 +309,19 @@ pub struct SessionConfigDto {
     /// `"shared:<absolute host path>"` or `"clone:<repo url>"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace_mode: Option<String>,
+    /// Structured workspace-mode projection. New consumers (including
+    /// the in-tree CLI) read this directly and ignore
+    /// [`Self::workspace_mode`]; older clients see the field missing
+    /// and continue to use the flat-string field, preserving
+    /// backward-compat.
+    ///
+    /// Forward-compat on the wire: records and clients predating M17
+    /// round-trip via `#[serde(default)]`; the daemon populates this
+    /// from the same in-memory `WorkspaceMode` that drives the flat
+    /// string, so the two fields are always consistent for a fresh
+    /// daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_mode_detail: Option<WorkspaceModeDetailDto>,
     pub hardened: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
@@ -313,6 +329,69 @@ pub struct SessionConfigDto {
     pub boot_cmd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub template: Option<String>,
+}
+
+/// Wire representation of [`crate::session::WorkspaceMode`].
+///
+/// Distinct from the domain enum per the project's "API responses must
+/// be explicit DTOs, not flattened domain structs" convention — adding
+/// a new domain variant stays inert on the wire until the mapper in
+/// [`super::mapper`] is updated to project it.
+///
+/// All three variants are declared in M17-S1 to lock the wire surface
+/// before the `Local` domain variant lands in M17-S2. The mapper's
+/// `Local` arm remains a compile-time `unreachable!()` until the
+/// domain variant lands.
+///
+/// Tagging: `{"type": "shared" | "clone" | "local", ...}`. Inner
+/// field names stay `snake_case`, matching the rest of the wire
+/// surface. `security_model: None` is omitted via
+/// `skip_serializing_if`, mirroring the domain shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WorkspaceModeDetailDto {
+    Shared {
+        host_path: String,
+        guest_path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        security_model: Option<WorkspaceSecurityModelDto>,
+    },
+    Clone {
+        repo_url: String,
+    },
+    Local {
+        host_path: String,
+        guest_path: String,
+    },
+}
+
+/// Wire representation of [`crate::session::WorkspaceSecurityModel`].
+///
+/// Parallel DTO mirroring the domain enum's `mapped-xattr` / `none`
+/// wire tokens. Lives on the API surface so a future shape change in
+/// the domain enum cannot silently leak onto the wire. The two are
+/// kept in lock-step by the mapper.
+///
+/// Wire-out only on `GET /sessions` — the daemon never deserialises
+/// this DTO field (so the `Dto → Domain` direction has no mapper
+/// today). The derive keeps `Deserialize` available so the type
+/// round-trips cleanly via `serde_json::from_value` in tests and so
+/// future request shapes can adopt it without a surface change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkspaceSecurityModelDto {
+    #[serde(rename = "mapped-xattr")]
+    MappedXattr,
+    #[serde(rename = "none")]
+    NoneMapping,
+}
+
+impl From<WorkspaceSecurityModel> for WorkspaceSecurityModelDto {
+    fn from(model: WorkspaceSecurityModel) -> Self {
+        match model {
+            WorkspaceSecurityModel::MappedXattr => Self::MappedXattr,
+            WorkspaceSecurityModel::NoneMapping => Self::NoneMapping,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

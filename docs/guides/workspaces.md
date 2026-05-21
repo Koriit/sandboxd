@@ -48,6 +48,14 @@ sandbox exec dev -- ls /home/agent/workspace
 
 Shared mode exposes a host directory live inside the VM via 9p. Use it for interactive development when you want the host IDE and the in-VM toolchain to share the same files.
 
+The full grammar of the flag value is:
+
+```text
+shared:<host>[:<guest>][:<security-model>]
+```
+
+Both optional tokens are positional. `<guest>` is the in-VM mount point; when omitted it **defaults to `<host>` verbatim**. `<security-model>` selects the 9p model and is one of `mapped-xattr` (default) or `none`.
+
 Mount the current directory:
 
 ```bash
@@ -55,23 +63,60 @@ sandbox create --name dev \
     --workspace "shared:$(pwd)"
 ```
 
-Combine with a boot command to install dependencies after the mount:
+Combine with a boot command to install dependencies after the mount. Because the guest path now defaults to the host path, refer to it directly:
 
 ```bash
 sandbox create --name dev \
     --workspace "shared:$(pwd)" \
-    --boot-cmd "cd /home/agent/workspace && npm install"
+    --boot-cmd "cd $(pwd) && npm install"
 ```
+
+Three forms of the same flag, from minimal to fully explicit:
+
+```bash
+# Host path only; guest path = host path, security model = mapped-xattr.
+sandbox create --workspace "shared:/home/user/proj"
+
+# Explicit guest path; security model still defaults to mapped-xattr.
+sandbox create --workspace "shared:/home/user/proj:/srv/work"
+
+# Full triple — host, guest, and security model.
+sandbox create --workspace "shared:/home/user/proj:/srv/work:none"
+```
+
+> **Breaking default.** The historical fixed mount point `/home/agent/workspace` is gone. The guest path now defaults to the host path so that build artefacts and tool output that reference absolute host directories survive a host-to-guest round trip without translation. If you relied on the old layout, pass an explicit guest path (e.g. `shared:$(pwd):/home/agent/workspace`).
+
+### Pick a guest path
+
+Set `<guest>` when:
+
+- You need the in-VM path to differ from the host path — for example, mounting `/Users/alice/proj` (macOS-style) into `/home/agent/proj` so guest-side scripts that assume a Linux home directory still work.
+- The host path contains characters that the in-VM toolchain handles poorly (spaces, mixed case on a case-insensitive host).
+- You want to preserve the legacy `/home/agent/workspace` layout for an existing pipeline; pass it explicitly.
+
+Leave `<guest>` off when the host path is already a valid absolute Linux path and you want the simplest configuration — that is the new default.
+
+A leading `~` in the host token expands against the CLI process's `$HOME` (the same expansion the shell would do for an unquoted argument). A leading `~` in the guest token is a literal substitution to `/home/agent` — it is not a lookup inside the VM.
+
+### Pick a security model
+
+`<security-model>` selects the 9p file-attribute strategy:
+
+- `mapped-xattr` (default) — file ownership and permissions on the host side are stored in extended attributes. Sandbox-side files are not owned by the operator's uid on the host filesystem; that is the safer default.
+- `none` — opt in when you need real-symlink interop in both directions. A build step inside the guest that creates a symlink will land on the host as a real symlink, not as a 9p-encoded placeholder. The price is that file ownership reflects the guest's view, which is less restrictive than `mapped-xattr`.
+
+The 9p models `passthrough` and `mapped-file` are deliberately not exposed by `sandboxd`. See [hardening — 9p shared mounts](/guides/hardening/#9p-shared-mounts) for the full trade-off and the rationale.
 
 Constraints:
 
-- The host path must be absolute and must already exist.
+- The host path must be absolute (after `~` expansion) and must already exist.
+- The guest path must be absolute. A leading `~` on the guest token is rewritten to `/home/agent` literally.
 - `--workspace` and `--repo` are mutually exclusive.
 
-Verify the mount:
+Verify the mount, substituting your chosen guest path:
 
 ```bash
-sandbox exec dev -- ls /home/agent/workspace
+sandbox exec dev -- ls "$(pwd)"
 ```
 
 Changes on either side appear immediately on the other — no sync step needed.

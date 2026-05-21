@@ -136,7 +136,7 @@ impl TestNetwork {
             docker_network: self.name.clone(),
             container_ip: self.container_ip.parse().unwrap(),
             gateway_ip: self.gateway_ip.parse().unwrap(),
-            workspace_host_path: None,
+            workspace_bind: None,
             route_helper_path: helper,
             ca_host_path: None,
         }

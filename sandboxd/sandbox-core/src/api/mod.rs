@@ -11,7 +11,8 @@ pub mod mapper;
 
 pub use dto::{
     PolicyDto, PolicyLevelDto, PolicyRuleDto, SessionConfigDto, SessionDto, SessionMountInfo,
-    SessionNetworkInfo, SessionRootlessDocker as SessionRootlessDockerDto,
+    SessionNetworkInfo, SessionRootlessDocker as SessionRootlessDockerDto, WorkspaceModeDetailDto,
+    WorkspaceSecurityModelDto,
 };
 pub use event_dto::{
     DenyLoggerEventBodyDto, DenyLoggerEventDto, DenyProtocolDto, DnsEventBodyDto, DnsEventDto,

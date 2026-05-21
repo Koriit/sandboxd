@@ -10,7 +10,8 @@ use hyper_util::rt::TokioIo;
 use sandbox_core::{
     ApiError, EventDto, ExecResponse, Policy, PolicyDto, PolicyLevelDto, PolicyRule, PolicyRuleDto,
     PropagationStatusResponse, SessionDto, SessionHealth, SessionMountInfo, SessionNetworkInfo,
-    SessionRootlessDockerDto, UpdatePolicyRequest,
+    SessionRootlessDockerDto, UpdatePolicyRequest, WorkspaceModeDetailDto,
+    WorkspaceSecurityModelDto,
 };
 use tokio::net::UnixStream;
 
@@ -96,8 +97,12 @@ enum Command {
         /// Command to execute after clone (or after setup if no repo).
         #[arg(long)]
         boot_cmd: Option<String>,
-        /// Workspace mode: `shared:<host-path>` mounts a host directory into
-        /// the VM at /home/agent/workspace via 9p.
+        /// Workspace mode: `shared:<host>[:<guest>][:<security-model>]`
+        /// (9p / bind mount), or `local:<host>[:<guest>]` (rsync
+        /// snapshot, lands in a follow-up release). The guest path
+        /// defaults to the host path; the security model defaults to
+        /// `mapped-xattr` (alternative: `none`). See
+        /// `docs/guides/workspaces.md` for the full grammar.
         ///
         /// Mutually exclusive with --repo.
         #[arg(long, conflicts_with = "repo")]
@@ -691,6 +696,82 @@ fn expand_and_merge_presets(
     (effective, source_presets)
 }
 
+/// Expand a leading `~` in the host-path token of a `--workspace` value
+/// against the CLI process's `$HOME`. Mirrors the shell-expansion the
+/// operator would have got had they typed an absolute path, while
+/// keeping the substitution on the CLI side of the wire — the daemon
+/// runs with a different `$HOME` and the [`WorkspaceMode::parse_flag`]
+/// parser explicitly rejects any residual `~` it sees.
+///
+/// Layout of the expected input: `<mode>:<host>[:<guest>][:<security>]`.
+/// Only the host-path token is expanded; the guest-path token (if any)
+/// uses literal `~` → `/home/agent` substitution inside the shared
+/// parser and is left untouched here. Inputs that do not contain a `:`
+/// or whose host token does not start with `~` pass through verbatim —
+/// `parse_flag` is the authoritative grammar gate downstream.
+///
+/// On `$HOME`-unset or expanded-path-does-not-exist, returns a friendly
+/// error string suitable for printing as an `Error: ...` line. The
+/// host-path existence check is part of the historical CLI contract:
+/// surfacing typos before the request hits the daemon keeps the
+/// operator-facing error path short.
+fn expand_host_tilde_in_workspace_flag(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    // Find the mode prefix (everything before the first `:`); if there
+    // is no `:` the value is malformed but we leave that diagnosis to
+    // `parse_flag` so the operator sees one consistent error vocabulary.
+    let Some((mode, rest)) = trimmed.split_once(':') else {
+        return Ok(value.to_string());
+    };
+    // Right-to-left classification of optional trailing tokens happens
+    // inside `parse_flag`; here we only need the *first* colon-segment
+    // after the mode prefix, which is always the host-path token.
+    let (host_token, tail) = match rest.split_once(':') {
+        Some((h, t)) => (h, Some(t)),
+        None => (rest, None),
+    };
+    let host_token_trimmed = host_token.trim();
+    if !host_token_trimmed.starts_with('~') {
+        return Ok(value.to_string());
+    }
+    let home = std::env::var("HOME").map_err(|_| {
+        format!(
+            "--workspace host path starts with `~` but $HOME is not set; \
+             pass an absolute path instead (got: {value:?})"
+        )
+    })?;
+    if home.is_empty() {
+        return Err(format!(
+            "--workspace host path starts with `~` but $HOME is empty; \
+             pass an absolute path instead (got: {value:?})"
+        ));
+    }
+    let expanded_host = if host_token_trimmed == "~" {
+        home.clone()
+    } else if let Some(suffix) = host_token_trimmed.strip_prefix("~/") {
+        format!("{home}/{suffix}")
+    } else {
+        // `~user` form — not supported; let `parse_flag` produce the
+        // canonical absolute-path error.
+        return Ok(value.to_string());
+    };
+    if !Path::new(&expanded_host).exists() {
+        return Err(format!(
+            "--workspace path does not exist after `~` expansion: {expanded_host} \
+             (from {value:?})"
+        ));
+    }
+    let mut rebuilt = String::with_capacity(value.len() + home.len());
+    rebuilt.push_str(mode);
+    rebuilt.push(':');
+    rebuilt.push_str(&expanded_host);
+    if let Some(t) = tail {
+        rebuilt.push(':');
+        rebuilt.push_str(t);
+    }
+    Ok(rebuilt)
+}
+
 /// Build the `POST /sessions` request from a `Command::Create` and the
 /// backend the preflight chose.
 ///
@@ -813,26 +894,26 @@ fn build_create_request_body(
         body.insert("boot_cmd".into(), serde_json::Value::String(cmd.clone()));
     }
     if let Some(ws) = workspace {
-        // Validate the workspace value client-side before sending.
-        let path_part = ws.strip_prefix("shared:").unwrap_or("");
-        if !ws.starts_with("shared:") {
-            eprintln!("Error: --workspace must start with 'shared:', got: {ws}");
+        // Resolve the workspace value client-side before sending. The
+        // CLI is the only site that expands a leading `~` in the host
+        // path against `$HOME`: the daemon parser rejects any residual
+        // `~` because the operator's `$HOME` does not match the
+        // daemon's. After expansion we hand the value to
+        // `WorkspaceMode::parse_flag` — the single pure parser shared
+        // with the daemon — and stamp the resolved string into the
+        // request body so the daemon parses the same input we did.
+        let expanded = match expand_host_tilde_in_workspace_flag(ws) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                process::exit(1);
+            }
+        };
+        if let Err(e) = sandbox_core::WorkspaceMode::parse_flag(&expanded) {
+            eprintln!("Error: --workspace {e}");
             process::exit(1);
         }
-        if path_part.is_empty() {
-            eprintln!("Error: --workspace shared: path must not be empty");
-            process::exit(1);
-        }
-        let p = Path::new(path_part);
-        if !p.is_absolute() {
-            eprintln!("Error: --workspace path must be absolute, got: {path_part}");
-            process::exit(1);
-        }
-        if !p.exists() {
-            eprintln!("Error: --workspace path does not exist: {path_part}");
-            process::exit(1);
-        }
-        body.insert("workspace".into(), serde_json::Value::String(ws.clone()));
+        body.insert("workspace".into(), serde_json::Value::String(expanded));
     }
     if *no_hardening {
         body.insert("hardened".into(), serde_json::json!(false));
@@ -1801,10 +1882,10 @@ fn render_describe_one(
         format_memory_field(&session.config)
     );
     let _ = writeln!(out, "  Disk:        {} GB", session.config.disk_gb);
-    let _ = writeln!(
+    render_workspace_block(
+        session.config.workspace_mode_detail.as_ref(),
+        session.config.workspace_mode.as_deref(),
         out,
-        "  Workspace:   {}",
-        session.config.workspace_mode.as_deref().unwrap_or("-")
     );
     let _ = writeln!(out, "  Hardened:    {}", session.config.hardened);
     let _ = writeln!(
@@ -1889,6 +1970,87 @@ fn render_capabilities_block(lookup: &CapabilitiesLookup, out: &mut String) {
                 render_workspace_modes(caps)
             );
         }
+    }
+}
+
+/// Render the `Workspace:` portion of the `Config:` block.
+///
+/// When the daemon populates `workspace_mode_detail` (M17+), the
+/// renderer emits a multi-line block with `Mode:` / `Host path:` /
+/// `Guest path:` / `Security:` rows for `Shared` (and the `Local`
+/// equivalent without the `Security:` row), or `Mode:` / `Repo:` for
+/// `Clone`. The `Security:` value mirrors the spec § rendering rule:
+/// `mapped-xattr (default)` when the operator passed no override
+/// (`security_model = None`), and the model verbatim for any
+/// `Some(_)` choice.
+///
+/// When `workspace_mode_detail` is absent (older daemons predating
+/// M17), the renderer falls back to the historical single-line
+/// `Workspace:   <flat-string>` form, sourcing the value from the
+/// retained `workspace_mode: Option<String>` field. This keeps the
+/// CLI compatible with pre-M17 daemons.
+fn render_workspace_block(
+    detail: Option<&WorkspaceModeDetailDto>,
+    flat: Option<&str>,
+    out: &mut String,
+) {
+    use std::fmt::Write as _;
+    match detail {
+        Some(WorkspaceModeDetailDto::Shared {
+            host_path,
+            guest_path,
+            security_model,
+        }) => {
+            let _ = writeln!(out, "  Workspace:");
+            let _ = writeln!(out, "    Mode:        shared");
+            let _ = writeln!(out, "    Host path:   {host_path}");
+            let _ = writeln!(out, "    Guest path:  {guest_path}");
+            let _ = writeln!(
+                out,
+                "    Security:    {}",
+                render_security_model(*security_model)
+            );
+        }
+        Some(WorkspaceModeDetailDto::Clone { repo_url }) => {
+            let _ = writeln!(out, "  Workspace:");
+            let _ = writeln!(out, "    Mode:  clone");
+            let _ = writeln!(out, "    Repo:  {repo_url}");
+        }
+        Some(WorkspaceModeDetailDto::Local {
+            host_path,
+            guest_path,
+        }) => {
+            // S1: the DTO variant exists for wire-surface forward compat —
+            // the CLI may receive this from a future daemon even though
+            // the domain variant lands in M17-S2. Render analogously to
+            // Shared minus the `Security:` row.
+            let _ = writeln!(out, "  Workspace:");
+            let _ = writeln!(out, "    Mode:        local");
+            let _ = writeln!(out, "    Host path:   {host_path}");
+            let _ = writeln!(out, "    Guest path:  {guest_path}");
+        }
+        None => {
+            // Older-daemon fallback: render the historical single-line
+            // form using the flat string. Pre-M17 daemons populate only
+            // `workspace_mode: Option<String>`; the new structured
+            // field is absent.
+            let _ = writeln!(out, "  Workspace:   {}", flat.unwrap_or("-"));
+        }
+    }
+}
+
+/// Render the `Security:` value for the shared-workspace describe row.
+///
+/// `None` means "no operator override at create time"; we annotate the
+/// inherited default with `(default)` so the inheritance is visible.
+/// `Some(_)` means the operator typed the model explicitly at create
+/// time; the value is rendered verbatim without an annotation because
+/// it is operator-asserted, not inherited.
+fn render_security_model(model: Option<WorkspaceSecurityModelDto>) -> &'static str {
+    match model {
+        None => "mapped-xattr (default)",
+        Some(WorkspaceSecurityModelDto::MappedXattr) => "mapped-xattr",
+        Some(WorkspaceSecurityModelDto::NoneMapping) => "none",
     }
 }
 
@@ -6355,6 +6517,11 @@ mod tests {
                 resolved_cpus: 2.0,
                 resolved_memory_mb: 4096,
                 workspace_mode: Some("shared:/home/olek/project".into()),
+                workspace_mode_detail: Some(WorkspaceModeDetailDto::Shared {
+                    host_path: "/home/olek/project".into(),
+                    guest_path: "/home/olek/project".into(),
+                    security_model: None,
+                }),
                 hardened: true,
                 repo: Some("https://github.com/example/app.git".into()),
                 boot_cmd: Some("make setup".into()),
@@ -6768,6 +6935,7 @@ mod tests {
             resolved_cpus: 1.6,
             resolved_memory_mb: 13107,
             workspace_mode: None,
+            workspace_mode_detail: None,
             hardened: false,
             repo: None,
             boot_cmd: None,
@@ -6789,6 +6957,7 @@ mod tests {
             resolved_cpus: 2.0,
             resolved_memory_mb: 4096,
             workspace_mode: None,
+            workspace_mode_detail: None,
             hardened: true,
             repo: None,
             boot_cmd: None,
@@ -6810,6 +6979,7 @@ mod tests {
             resolved_cpus: 1.5,
             resolved_memory_mb: 2048,
             workspace_mode: None,
+            workspace_mode_detail: None,
             hardened: false,
             repo: None,
             boot_cmd: None,
@@ -6987,6 +7157,188 @@ mod tests {
         assert!(
             rendered.contains("Session:      eeee11112222"),
             "session data must still render despite caps failure, got:\n{rendered}"
+        );
+    }
+
+    // -- Workspace block rendering --------------------------------------------
+
+    /// `Shared` with `security_model = None` (no operator override at
+    /// create time) renders the `mapped-xattr (default)` annotation so
+    /// the operator can tell the value was inherited, not asserted.
+    #[test]
+    fn describe_renders_shared_workspace_with_default_security_annotation() {
+        let mut dto = make_session_dto(
+            "1111aaaa2222",
+            Some("shared-default"),
+            None,
+            chrono::Utc::now(),
+        );
+        dto.config.workspace_mode = Some("shared:/home/olek/project".into());
+        dto.config.workspace_mode_detail = Some(WorkspaceModeDetailDto::Shared {
+            host_path: "/home/olek/project".into(),
+            guest_path: "/home/olek/project".into(),
+            security_model: None,
+        });
+        let rendered = render_describe(std::slice::from_ref(&dto), None);
+        assert!(
+            rendered.contains("  Workspace:\n"),
+            "expected multi-line Workspace header, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("    Mode:        shared\n"),
+            "expected Mode row, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("    Host path:   /home/olek/project\n"),
+            "expected Host path row, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("    Guest path:  /home/olek/project\n"),
+            "expected Guest path row, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("    Security:    mapped-xattr (default)\n"),
+            "expected default-annotated Security row, got:\n{rendered}"
+        );
+    }
+
+    /// `Some(MappedXattr)` is an operator-asserted choice — the
+    /// `(default)` annotation must NOT appear because the value is no
+    /// longer inherited.
+    #[test]
+    fn describe_renders_shared_workspace_with_explicit_mapped_xattr() {
+        let mut dto = make_session_dto(
+            "1111aaaa3333",
+            Some("shared-mapped"),
+            None,
+            chrono::Utc::now(),
+        );
+        dto.config.workspace_mode = Some("shared:/home/olek/project:mapped-xattr".into());
+        dto.config.workspace_mode_detail = Some(WorkspaceModeDetailDto::Shared {
+            host_path: "/home/olek/project".into(),
+            guest_path: "/home/olek/project".into(),
+            security_model: Some(WorkspaceSecurityModelDto::MappedXattr),
+        });
+        let rendered = render_describe(std::slice::from_ref(&dto), None);
+        assert!(
+            rendered.contains("    Security:    mapped-xattr\n"),
+            "expected verbatim Security row, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("    Security:    mapped-xattr (default)"),
+            "explicit Some(MappedXattr) must not carry (default) annotation, got:\n{rendered}"
+        );
+    }
+
+    /// `Some(NoneMapping)` renders the `none` wire token verbatim.
+    #[test]
+    fn describe_renders_shared_workspace_with_explicit_none() {
+        let mut dto = make_session_dto(
+            "1111aaaa4444",
+            Some("shared-none"),
+            None,
+            chrono::Utc::now(),
+        );
+        dto.config.workspace_mode = Some("shared:/home/olek/project:none".into());
+        dto.config.workspace_mode_detail = Some(WorkspaceModeDetailDto::Shared {
+            host_path: "/home/olek/project".into(),
+            guest_path: "/home/olek/project".into(),
+            security_model: Some(WorkspaceSecurityModelDto::NoneMapping),
+        });
+        let rendered = render_describe(std::slice::from_ref(&dto), None);
+        assert!(
+            rendered.contains("    Security:    none\n"),
+            "expected `none` Security row, got:\n{rendered}"
+        );
+    }
+
+    /// Custom `guest_path` distinct from `host_path` renders both
+    /// rows with the operator's resolved values.
+    #[test]
+    fn describe_renders_shared_workspace_with_custom_guest_path() {
+        let mut dto = make_session_dto(
+            "1111aaaa5555",
+            Some("shared-guest"),
+            None,
+            chrono::Utc::now(),
+        );
+        dto.config.workspace_mode = Some("shared:/tmp/sbx-a:/srv/work".into());
+        dto.config.workspace_mode_detail = Some(WorkspaceModeDetailDto::Shared {
+            host_path: "/tmp/sbx-a".into(),
+            guest_path: "/srv/work".into(),
+            security_model: None,
+        });
+        let rendered = render_describe(std::slice::from_ref(&dto), None);
+        assert!(
+            rendered.contains("    Host path:   /tmp/sbx-a\n"),
+            "expected operator's host path, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("    Guest path:  /srv/work\n"),
+            "expected operator's guest path distinct from host, got:\n{rendered}"
+        );
+    }
+
+    /// `Clone` renders the two-row block with `Mode: clone` and
+    /// `Repo: <url>` — no host/guest path rows.
+    #[test]
+    fn describe_renders_clone_workspace_block() {
+        let mut dto = make_session_dto(
+            "1111aaaa6666",
+            Some("clone-block"),
+            None,
+            chrono::Utc::now(),
+        );
+        dto.config.workspace_mode = Some("clone:https://github.com/example/app.git".into());
+        dto.config.workspace_mode_detail = Some(WorkspaceModeDetailDto::Clone {
+            repo_url: "https://github.com/example/app.git".into(),
+        });
+        let rendered = render_describe(std::slice::from_ref(&dto), None);
+        assert!(
+            rendered.contains("  Workspace:\n"),
+            "expected multi-line Workspace header, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("    Mode:  clone\n"),
+            "expected `Mode: clone` row, got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("    Repo:  https://github.com/example/app.git\n"),
+            "expected `Repo:` row, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("Host path:"),
+            "Clone must not render a Host path row, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("Security:"),
+            "Clone must not render a Security row, got:\n{rendered}"
+        );
+    }
+
+    /// Older daemon (predating M17) populates only `workspace_mode`
+    /// (the flat string) and leaves `workspace_mode_detail = None`.
+    /// The CLI must fall back to the historical single-line render
+    /// so the operator-facing surface stays compatible across the
+    /// daemon-vs-CLI version skew.
+    #[test]
+    fn describe_renders_older_daemon_workspace_single_line_fallback() {
+        let mut dto = make_session_dto(
+            "1111aaaa7777",
+            Some("legacy-daemon"),
+            None,
+            chrono::Utc::now(),
+        );
+        dto.config.workspace_mode = Some("shared:/foo".into());
+        dto.config.workspace_mode_detail = None;
+        let rendered = render_describe(std::slice::from_ref(&dto), None);
+        assert!(
+            rendered.contains("  Workspace:   shared:/foo\n"),
+            "expected single-line fallback when detail is absent, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("    Mode:"),
+            "fallback must not emit multi-line Mode row, got:\n{rendered}"
         );
     }
 

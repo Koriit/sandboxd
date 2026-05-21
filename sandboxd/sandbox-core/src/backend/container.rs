@@ -192,6 +192,28 @@ const PIDS_LIMIT: u32 = 512;
 // Per-session network info (populated by daemon / tests via register_session)
 // ---------------------------------------------------------------------------
 
+/// Pair of (host, guest) absolute paths for a `WorkspaceMode::Shared`
+/// bind-mount on the container backend.
+///
+/// The host path is the source of the `--mount type=bind` argument;
+/// the guest path is the destination inside the container. Both are
+/// always populated — when the operator did not supply an explicit
+/// `guest_path`, the parser fills it from `host_path` (M17 breaking
+/// default; see `WorkspaceMode::parse_flag`).
+///
+/// The container backend deliberately omits a `security_model` field:
+/// 9p `securityModel` semantics do not apply to a Docker bind, and
+/// the daemon-side mapper into [`ContainerNetwork`] rejects any
+/// `Some(security_model)` value with `InvalidArgument` before the
+/// runtime sees the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceBind {
+    /// Absolute host path; substituted as `--mount src=…`.
+    pub host_path: PathBuf,
+    /// Absolute in-container path; substituted as `--mount dst=…`.
+    pub guest_path: PathBuf,
+}
+
 /// Per-session network and bind-mount knobs the daemon allocates on
 /// the host side and passes down to the container backend at
 /// [`SessionRuntime::create`] time.
@@ -211,13 +233,21 @@ pub struct ContainerNetwork {
     /// Gateway container IP, the `.2` of the per-session /28. Used for
     /// `--dns` and (Phase 3A) handed to the route helper at start time.
     pub gateway_ip: IpAddr,
-    /// Optional host path bound into `/home/agent/workspace/` inside
-    /// the container. `None` means no workspace bind. Aligned with the
-    /// spec's [`crate::session::WorkspaceMode::Shared`] semantics — the bind target is
-    /// unified with Lima's workspace mount across both backends, so
-    /// an operator's `--workspace shared:<path>` lands at the same
-    /// in-guest path regardless of the backend they chose.
-    pub workspace_host_path: Option<PathBuf>,
+    /// Optional bind-mount pair (host + guest path) installed into
+    /// the container at `docker create` time. `None` means no
+    /// workspace bind. Aligned with the spec's
+    /// [`crate::session::WorkspaceMode::Shared`] semantics — the
+    /// operator-supplied `guest_path` is the bind target inside the
+    /// container, unified with Lima's workspace mount across both
+    /// backends so `--workspace shared:<host>[:<guest>]` lands at the
+    /// same in-guest path regardless of the backend they chose.
+    ///
+    /// The container backend does not carry a `security_model` —
+    /// that field is meaningful only for 9p on the Lima side, and
+    /// the daemon-side mapper into this struct rejects any
+    /// `Some(security_model)` value with `InvalidArgument` before the
+    /// runtime sees the request (see `sandboxd/src/main.rs::create_session`).
+    pub workspace_bind: Option<WorkspaceBind>,
     /// Path to the `sandbox-route-helper` binary. When `None`, the
     /// runtime skips the route-installation step at `start` — useful
     /// for hardening tests that exercise lifecycle without requiring
@@ -458,7 +488,7 @@ fn capabilities_for_container() -> Capabilities {
         per_session_no_cache: false,
         // Spec §"Workspace" — both workspace modes are supported on the
         // container backend: `Shared` advertises a Docker bind-mount
-        // (the daemon threads `workspace_host_path` from the
+        // (the daemon threads `workspace_bind` from the
         // request through `ContainerNetwork`, and `docker create --mount`
         // lights up at create time); `Clone` advertises the same in-guest
         // `git clone <url> /home/agent/workspace/` flow Lima uses — the
@@ -510,16 +540,19 @@ fn build_create_argv(
     let ip_arg = network.container_ip.to_string();
     let label_arg = format!("sandbox.session_id={session_id}");
     let home_mount = format!("type=volume,src={home_volume},dst=/home/agent");
-    let workspace_mount = network.workspace_host_path.as_ref().map(|p| {
-        // Spec § "Workspace" — bind target unified with Lima at
-        // `/home/agent/workspace/`. The home volume mounts at
-        // `/home/agent`; this bind shadows the volume's content
-        // at the workspace subdirectory, which is the intended
-        // semantics (operator-supplied workspace files take
-        // precedence over the volume's empty `workspace/`).
+    let workspace_mount = network.workspace_bind.as_ref().map(|bind| {
+        // Spec § "Container Backend / Shared bind-mount" — the
+        // bind target is the operator-resolved `guest_path`,
+        // unified with Lima's workspace mount. The home volume
+        // mounts at `/home/agent`; a bind whose `guest_path` lands
+        // anywhere under `/home/agent` shadows the volume's
+        // content at that subpath, which is the intended semantics
+        // (operator-supplied workspace files take precedence over
+        // the volume's empty contents).
         format!(
-            "type=bind,src={},dst=/home/agent/workspace/",
-            p.to_string_lossy().into_owned()
+            "type=bind,src={},dst={}",
+            bind.host_path.to_string_lossy(),
+            bind.guest_path.to_string_lossy(),
         )
     });
     let ca_args = build_ca_mount_args(network);
@@ -1613,7 +1646,7 @@ mod tests {
             caps.workspace_modes,
             EnumSet::all(),
             "container backend advertises both workspace modes — `Shared` \
-             (Docker bind-mount via ContainerNetwork.workspace_host_path) \
+             (Docker bind-mount via ContainerNetwork.workspace_bind) \
              and `Clone` (in-guest `git clone` dispatched through \
              GuestConnector after the lite container's entrypoint comes up)",
         );
@@ -1633,7 +1666,7 @@ mod tests {
             docker_network: "sandbox-net-x".into(),
             container_ip: "10.0.0.3".parse().unwrap(),
             gateway_ip: "10.0.0.2".parse().unwrap(),
-            workspace_host_path: None,
+            workspace_bind: None,
             route_helper_path: None,
             ca_host_path: None,
         };
@@ -1645,24 +1678,29 @@ mod tests {
     }
 
     /// Shared-workspace contract: the daemon resolves
-    /// `WorkspaceMode::Shared { host_path }` into a
-    /// `ContainerNetwork.workspace_host_path = Some(<path>)`, and that
-    /// value round-trips through `register_session` /
-    /// `lookup_session` unchanged so `create()` can render it as a
-    /// `docker create --mount type=bind,source=<host_path>,...` flag.
+    /// `WorkspaceMode::Shared { host_path, guest_path, .. }` into a
+    /// `ContainerNetwork.workspace_bind = Some(WorkspaceBind { … })`,
+    /// and the (host, guest) pair round-trips through `register_session`
+    /// / `lookup_session` unchanged so `create()` can render it as a
+    /// `docker create --mount type=bind,src=<host>,dst=<guest>` flag.
     /// Pinning the round-trip here catches silent drift in the
     /// registry — e.g. accidentally storing a stale clone, or
-    /// dropping the optional path on the way back out.
+    /// dropping the optional bind on the way back out.
     #[test]
-    fn register_session_round_trips_workspace_host_path() {
+    fn register_session_round_trips_workspace_bind() {
         let rt = test_runtime();
         let sid = SessionId::generate();
         let host_path = std::path::PathBuf::from("/tmp/workspace-fixture");
+        let guest_path = std::path::PathBuf::from("/home/agent/work");
+        let bind = WorkspaceBind {
+            host_path: host_path.clone(),
+            guest_path: guest_path.clone(),
+        };
         let net = ContainerNetwork {
             docker_network: "sandbox-net-x".into(),
             container_ip: "10.0.0.3".parse().unwrap(),
             gateway_ip: "10.0.0.2".parse().unwrap(),
-            workspace_host_path: Some(host_path.clone()),
+            workspace_bind: Some(bind.clone()),
             // Bare name resolved via $PATH at start time; mirrors how
             // the daemon actually wires it (see main.rs container
             // branch).
@@ -1672,9 +1710,10 @@ mod tests {
         rt.register_session(sid, net);
         let got = rt.lookup_session(&sid).expect("registered");
         assert_eq!(
-            got.workspace_host_path,
-            Some(host_path),
-            "Shared workspace host path must round-trip through the registry verbatim",
+            got.workspace_bind,
+            Some(bind),
+            "Shared workspace bind (host + guest path) must round-trip \
+             through the registry verbatim",
         );
         assert_eq!(
             got.route_helper_path,
@@ -1728,7 +1767,7 @@ mod tests {
             docker_network: "sandbox-net-x".into(),
             container_ip: "10.0.0.3".parse().unwrap(),
             gateway_ip: "10.0.0.2".parse().unwrap(),
-            workspace_host_path: None,
+            workspace_bind: None,
             route_helper_path: None,
             ca_host_path: Some(host_path.clone()),
         };
@@ -1782,7 +1821,7 @@ mod tests {
             docker_network: "sandbox-net-y".into(),
             container_ip: "10.0.0.4".parse().unwrap(),
             gateway_ip: "10.0.0.2".parse().unwrap(),
-            workspace_host_path: None,
+            workspace_bind: None,
             route_helper_path: None,
             ca_host_path: None,
         };
@@ -1808,7 +1847,7 @@ mod tests {
             docker_network: "sandbox-net-x".into(),
             container_ip: "10.0.0.3".parse().unwrap(),
             gateway_ip: "10.0.0.2".parse().unwrap(),
-            workspace_host_path: None,
+            workspace_bind: None,
             route_helper_path: None,
             ca_host_path: None,
         };
@@ -1978,7 +2017,7 @@ mod tests {
                 docker_network: "sandbox-net-x".into(),
                 container_ip: "10.0.0.3".parse().unwrap(),
                 gateway_ip: "10.0.0.2".parse().unwrap(),
-                workspace_host_path: None,
+                workspace_bind: None,
                 route_helper_path: None,
                 ca_host_path: None,
             },

@@ -3,7 +3,7 @@ use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
 use enumset::EnumSetType;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
 /// Docker-style 12-hex-character session identifier.
@@ -130,14 +130,66 @@ impl AsRef<str> for SessionId {
     }
 }
 
+/// Per-mount choice of 9p `securityModel` for [`WorkspaceMode::Shared`].
+///
+/// `mapped-xattr` is the default and keeps the QEMU process unprivileged
+/// by storing guest ownership/symlink metadata in host xattrs rather than
+/// applying them to the host filesystem directly. `none` (`NoneMapping`)
+/// trades that property for real-symlink interop in both directions, at
+/// the cost of guest-side chown/mknod/setuid being silently no-ops.
+///
+/// The variant is named `NoneMapping` rather than `None` so it does not
+/// visually collide with `Option::None` at match sites: matching on
+/// `Some(WorkspaceSecurityModel::NoneMapping)` is unambiguous in a way
+/// that `Some(WorkspaceSecurityModel::None)` is not. The wire form,
+/// CLI token, and rendered describe value all stay `none` via the
+/// per-variant `#[serde(rename)]` attributes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum WorkspaceSecurityModel {
+    #[default]
+    #[serde(rename = "mapped-xattr")]
+    MappedXattr,
+    #[serde(rename = "none")]
+    NoneMapping,
+}
+
+impl WorkspaceSecurityModel {
+    /// Return the wire token used in CLI flags, JSON serialization, and
+    /// the rendered Lima `securityModel:` line.
+    pub fn as_yaml(&self) -> &'static str {
+        match self {
+            Self::MappedXattr => "mapped-xattr",
+            Self::NoneMapping => "none",
+        }
+    }
+}
+
 /// How the workspace directory is made available inside the VM.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// The serde representation uses a custom deserializer (see the
+/// `Deserialize` impl below) so that legacy persisted records that
+/// pre-date the `guest_path` field still load cleanly: a missing
+/// `guest_path`, or an empty-string `guest_path`, recovers as
+/// `guest_path = host_path`. The serializer side is the default derive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkspaceMode {
     /// Mount a host directory into the VM via 9p (bidirectional, live).
     Shared {
         /// Absolute path on the host to mount.
         host_path: String,
+        /// Absolute path inside the guest at which the host directory
+        /// appears. Defaults to `host_path` when the operator does not
+        /// supply an explicit value; the parser always populates this
+        /// field on fresh constructions. Legacy on-disk records lacking
+        /// the field recover via the custom deserializer below.
+        #[serde(default)]
+        guest_path: String,
+        /// 9p security model. `None` means "use the backend default"
+        /// (`mapped-xattr` on Lima; the container backend rejects any
+        /// `Some(_)` value as the bind-mount has no 9p layer).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        security_model: Option<WorkspaceSecurityModel>,
     },
     /// Clone a git repository into the VM at /home/agent/workspace/.
     Clone {
@@ -146,21 +198,73 @@ pub enum WorkspaceMode {
     },
 }
 
+impl<'de> Deserialize<'de> for WorkspaceMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Private mirror with `guest_path` modelled as `Option<String>` so
+        // that legacy records (missing the field, or with an empty-string
+        // value) can be detected and recovered to `host_path`. The
+        // recovery rule matches the new default semantics — see the
+        // `Backward Compatibility` section of the workspace-ergonomics
+        // spec for the rationale.
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum Wire {
+            Shared {
+                host_path: String,
+                #[serde(default)]
+                guest_path: Option<String>,
+                #[serde(default)]
+                security_model: Option<WorkspaceSecurityModel>,
+            },
+            Clone {
+                repo_url: String,
+            },
+        }
+
+        match Wire::deserialize(deserializer)? {
+            Wire::Shared {
+                host_path,
+                guest_path,
+                security_model,
+            } => {
+                let guest_path = match guest_path {
+                    Some(g) if !g.is_empty() => g,
+                    _ => host_path.clone(),
+                };
+                Ok(WorkspaceMode::Shared {
+                    host_path,
+                    guest_path,
+                    security_model,
+                })
+            }
+            Wire::Clone { repo_url } => Ok(WorkspaceMode::Clone { repo_url }),
+        }
+    }
+}
+
 /// Kind discriminator for [`WorkspaceMode`], without the variant payload.
 ///
-/// `WorkspaceMode` is data-bearing (`Shared { host_path }`,
-/// `Clone { repo_url }`), so it cannot itself participate in
-/// [`enumset::EnumSet`] — `EnumSetType` requires unit variants only.
-/// `WorkspaceModeKind` is the companion unit-only enum used by
-/// [`crate::backend::Capabilities::workspace_modes`] to declare which
-/// kinds of workspace handoff a backend supports, independent of any
-/// concrete instance.
+/// `WorkspaceMode` is data-bearing (`Shared { host_path, guest_path,
+/// security_model }`, `Clone { repo_url }`), so it cannot itself
+/// participate in [`enumset::EnumSet`] — `EnumSetType` requires unit
+/// variants only. `WorkspaceModeKind` is the companion unit-only enum
+/// used by [`crate::backend::Capabilities::workspace_modes`] to declare
+/// which kinds of workspace handoff a backend supports, independent of
+/// any concrete instance.
 ///
 /// The kind is derivable from a `WorkspaceMode` via [`WorkspaceMode::kind`].
 ///
-/// See spec § "Capabilities model" — the spec sketches this set as
-/// `EnumSet<WorkspaceMode>`; in practice the discriminator is the
-/// kind, and validation never depends on the payload.
+/// **Forward-compat wire tolerance.** When deserializing an
+/// `EnumSet<WorkspaceModeKind>` (e.g. from a newer daemon's capability
+/// response), unknown variants are silently dropped. This is implemented
+/// via a sentinel `Unknown` variant attached to `#[serde(other)]`; the
+/// kind is gated as private and stripped by [`Capabilities`] when the
+/// `EnumSet` is constructed from the wire form. See the
+/// [`deserialize_workspace_mode_kind_set`] free function used by
+/// capability fields for the filtered round-trip.
 #[derive(Debug, EnumSetType, Serialize, Deserialize)]
 #[enumset(serialize_repr = "list")]
 #[serde(rename_all = "snake_case")]
@@ -169,6 +273,43 @@ pub enum WorkspaceModeKind {
     Shared,
     /// Git clone into the VM/container; corresponds to [`WorkspaceMode::Clone`].
     Clone,
+}
+
+/// Deserialize an `EnumSet<WorkspaceModeKind>` from a list of string
+/// tokens, silently dropping any token that does not match a known
+/// variant.
+///
+/// This is the forward-compat convention for `EnumSet`-typed
+/// capability fields exposed by the daemon: an older CLI built against
+/// `WorkspaceModeKind = { Shared, Clone }` that receives
+/// `["shared", "clone", "local"]` from a newer daemon must parse the
+/// response successfully and expose `{ Shared, Clone }`. The unknown
+/// `"local"` token is ignored without failing the parse.
+///
+/// Wire format: a JSON array of lower-snake-case strings, matching the
+/// `serialize_repr = "list"` shape of `EnumSet<WorkspaceModeKind>`.
+pub fn deserialize_workspace_mode_kind_set<'de, D>(
+    deserializer: D,
+) -> Result<enumset::EnumSet<WorkspaceModeKind>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw: Vec<String> = Vec::deserialize(deserializer)?;
+    let mut set = enumset::EnumSet::<WorkspaceModeKind>::empty();
+    for token in raw {
+        match token.as_str() {
+            "shared" => {
+                set |= WorkspaceModeKind::Shared;
+            }
+            "clone" => {
+                set |= WorkspaceModeKind::Clone;
+            }
+            _ => {
+                // Unknown variant on the wire — silently drop.
+            }
+        }
+    }
+    Ok(set)
 }
 
 impl WorkspaceMode {
@@ -185,30 +326,245 @@ impl WorkspaceMode {
 
     /// Parse a workspace mode from the CLI `--workspace` flag value.
     ///
-    /// Accepted formats:
-    /// - `shared:/absolute/host/path`
+    /// Accepted grammar:
+    ///
+    /// ```text
+    /// shared:<host-path>[:<guest-path>][:<security-model>]
+    /// clone:<repo-url>
+    /// ```
+    ///
+    /// Path tokens are absolute (start with `/`); guest-side `~` is a
+    /// literal substitution to `/home/agent`. Host-side `~` must be
+    /// expanded by the caller before invoking this function — the
+    /// daemon parser explicitly rejects any residual `~` in `host_path`
+    /// because the operator's `$HOME` does not match the daemon's.
+    /// The CLI is the sole site that performs host-`~` expansion;
+    /// `parse_flag` is otherwise environment-free and pure.
+    ///
+    /// Security-model tokens are the closed set `{mapped-xattr, none}`.
+    /// The 9p models `passthrough` and `mapped-file` are deliberately
+    /// not exposed; passing either as the trailing token short-circuits
+    /// with an explicit pointer at `mapped-xattr` / `none`.
+    ///
+    /// Normalization (applied before any other step):
+    /// 1. Trim leading and trailing ASCII whitespace from the whole input.
+    /// 2. Mode prefixes are matched case-sensitively
+    ///    (`Shared:/srv/repo` → unknown mode).
+    /// 3. A single trailing `/` on `host_path` and `guest_path` is
+    ///    stripped after reassembly (`/srv/repo/` → `/srv/repo`).
+    ///    Multiple trailing slashes collapse the same way. The root
+    ///    path `/` is preserved.
     pub fn parse_flag(value: &str) -> Result<Self, String> {
-        if let Some(path) = value.strip_prefix("shared:") {
-            if path.is_empty() {
-                return Err("shared workspace path must not be empty".into());
-            }
-            if !Path::new(path).is_absolute() {
+        // Normalization: trim leading/trailing ASCII whitespace from the
+        // whole input. Internal whitespace is preserved into the path
+        // and will be caught by the absolute-path or existence checks
+        // downstream.
+        let input = value.trim();
+        if input.is_empty() {
+            return Err(format!(
+                "unknown workspace mode: {value:?}. Expected \
+                 'shared:<host-path>[:<guest-path>][:<security-model>]' or \
+                 'clone:<repo-url>'"
+            ));
+        }
+
+        // Mode-prefix split: find the first `:`. Mode matching is
+        // case-sensitive.
+        let (mode, rest) = match input.split_once(':') {
+            Some((m, r)) => (m, r),
+            None => {
                 return Err(format!(
-                    "shared workspace path must be absolute, got: {path}"
+                    "unknown workspace mode: {value:?}. Expected \
+                     'shared:<host-path>[:<guest-path>][:<security-model>]' or \
+                     'clone:<repo-url>'"
                 ));
             }
-            if !Path::new(path).exists() {
-                return Err(format!("shared workspace path does not exist: {path}"));
+        };
+
+        match mode {
+            "shared" => parse_shared(rest),
+            "clone" => {
+                if rest.is_empty() {
+                    return Err("clone workspace repo url must not be empty".into());
+                }
+                Ok(Self::Clone {
+                    repo_url: rest.to_string(),
+                })
             }
-            Ok(Self::Shared {
-                host_path: path.to_string(),
-            })
-        } else {
-            Err(format!(
-                "unknown workspace mode: {value}. Expected 'shared:<host-path>'"
-            ))
+            _ => Err(format!(
+                "unknown workspace mode: {value:?}. Expected \
+                 'shared:<host-path>[:<guest-path>][:<security-model>]' or \
+                 'clone:<repo-url>'"
+            )),
         }
     }
+}
+
+/// Parse the payload of `shared:<rest>` per the grammar in
+/// [`WorkspaceMode::parse_flag`].
+///
+/// Pulled out into a free function so the (slightly long) right-to-left
+/// classifier algorithm stays readable next to the per-step documentation
+/// in the spec.
+fn parse_shared(rest: &str) -> Result<WorkspaceMode, String> {
+    if rest.is_empty() {
+        return Err(
+            "shared workspace requires a host path: shared:<host-path>[:<guest-path>][:<security-model>]"
+                .into(),
+        );
+    }
+
+    // Tokenise on `:`. For `shared:` we accept 1..=3 tokens after the
+    // mode prefix. Empty tokens (`shared:/srv::/dst`) are rejected here:
+    // every position carries semantic meaning, so a literal empty token
+    // is always a mistake.
+    let tokens: Vec<&str> = rest.split(':').collect();
+    if tokens.iter().any(|t| t.is_empty()) {
+        return Err(format!(
+            "shared workspace contains an empty token: {rest:?}"
+        ));
+    }
+    if tokens.len() > 3 {
+        return Err(format!(
+            "shared workspace expects at most 3 tokens (host, guest, security-model), got {n}: {rest:?}",
+            n = tokens.len()
+        ));
+    }
+
+    // We'll work with a `Vec` that we pop trailing tokens off as we
+    // classify them right-to-left.
+    let mut tokens: Vec<String> = tokens.into_iter().map(str::to_string).collect();
+
+    // Step A — strip a trailing security-model token. The closed enum
+    // is { mapped-xattr, none }. The friendly-hint branch fires for the
+    // deliberately-unexposed 9p models { passthrough, mapped-file }.
+    let mut security_model: Option<WorkspaceSecurityModel> = None;
+    if tokens.len() >= 2 {
+        match tokens.last().map(String::as_str) {
+            Some("mapped-xattr") => {
+                security_model = Some(WorkspaceSecurityModel::MappedXattr);
+                tokens.pop();
+            }
+            Some("none") => {
+                security_model = Some(WorkspaceSecurityModel::NoneMapping);
+                tokens.pop();
+            }
+            Some("passthrough") | Some("mapped-file") => {
+                return Err(format!(
+                    "`passthrough` and `mapped-file` security models are not exposed; \
+                     see `docs/guides/hardening.md`. Use `mapped-xattr` (default) or `none`. \
+                     (Got: {tok:?})",
+                    tok = tokens.last().unwrap()
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    // Step B — strip a trailing guest-path token. The classifier accepts
+    // tokens that start with `/` (absolute) or `~` (literal `/home/agent`
+    // substitution per the spec).
+    let guest_path: Option<String> = if tokens.len() >= 2 {
+        let last = tokens.last().expect("len >= 2");
+        if last.starts_with('/') || last.starts_with('~') {
+            let g = tokens.pop().expect("len >= 2");
+            Some(g)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Step C — the remaining tokens reassemble into `host_path`. The
+    // join recovers literal colons inside the host path that survived
+    // the right-to-left classification.
+    let raw_host_path = tokens.join(":");
+    let host_path = strip_trailing_slashes(&raw_host_path);
+
+    // Step D — `~` expansion and absoluteness.
+    //
+    // `parse_flag` is a single pure function; the CLI is responsible
+    // for expanding host-side `~` before invoking us (per the
+    // orchestrator's M17-S1 Q4 decision). Any residual `~` in
+    // `host_path` is a sign that the caller bypassed the CLI's
+    // expansion step and constructed the request directly — reject
+    // with an explicit pointer at the contract.
+    if host_path.starts_with('~') {
+        return Err(format!(
+            "host_path must be absolute; CLI should have expanded `~` before sending. \
+             (Got: {host_path:?})"
+        ));
+    }
+    if !Path::new(&host_path).is_absolute() {
+        return Err(format!(
+            "shared workspace host_path must be absolute, got: {host_path:?}"
+        ));
+    }
+
+    // `guest_path` undergoes `~` expansion on both sides as a literal
+    // string replacement to `/home/agent` — environment-free, so the
+    // CLI and the daemon arrive at the same result. The substituted
+    // value must still be absolute.
+    let guest_path = match guest_path {
+        Some(g) => {
+            let expanded = expand_guest_tilde(&g);
+            let normalized = strip_trailing_slashes(&expanded);
+            if !Path::new(&normalized).is_absolute() {
+                return Err(format!(
+                    "shared workspace guest_path must be absolute, got: {normalized:?}"
+                ));
+            }
+            normalized
+        }
+        None => host_path.clone(),
+    };
+
+    // Host path existence is checked at parse time per the historical
+    // contract: surfacing typos at the CLI before the request hits
+    // the daemon is part of what makes the operator-facing error path
+    // friendly. The daemon-side parse re-runs the same check; on the
+    // daemon's host the operator's typed path resolves to the same
+    // filesystem entry (or it doesn't, and the daemon emits the same
+    // error verbatim).
+    if !Path::new(&host_path).exists() {
+        return Err(format!(
+            "shared workspace host_path does not exist: {host_path:?}"
+        ));
+    }
+
+    Ok(WorkspaceMode::Shared {
+        host_path,
+        guest_path,
+        security_model,
+    })
+}
+
+/// Strip a single trailing `/` (or any run of trailing slashes) from a
+/// path string, while preserving the root `/`.
+fn strip_trailing_slashes(path: &str) -> String {
+    if path == "/" {
+        return path.to_string();
+    }
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        // The whole string was slashes; collapse to the root.
+        return "/".to_string();
+    }
+    trimmed.to_string()
+}
+
+/// Expand a leading `~` in a guest-side path to the canonical guest user
+/// home (`/home/agent`). The substitution is environment-free and runs
+/// identically on the CLI and the daemon, per the spec.
+fn expand_guest_tilde(path: &str) -> String {
+    if path == "~" {
+        return "/home/agent".to_string();
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return format!("/home/agent/{rest}");
+    }
+    path.to_string()
 }
 
 /// Current state of a sandbox session.
@@ -861,53 +1217,476 @@ mod tests {
         assert!(!json.contains("cpus_decimal"), "wire JSON: {json}");
     }
 
+    // -----------------------------------------------------------------
+    // WorkspaceMode + parse_flag tests
+    // -----------------------------------------------------------------
+
+    /// Helper: assemble the canonical `Shared` payload for a parser
+    /// expected-value assertion. Most parser tests construct the same
+    /// shape so a tiny constructor keeps the tests readable.
+    fn shared(host: &str, guest: &str, model: Option<WorkspaceSecurityModel>) -> WorkspaceMode {
+        WorkspaceMode::Shared {
+            host_path: host.into(),
+            guest_path: guest.into(),
+            security_model: model,
+        }
+    }
+
+    // -- Parser positive cases ----------------------------------------
+
     #[test]
-    fn workspace_mode_parse_shared() {
-        // We cannot test with a real path that must exist, so test the
-        // validation logic for non-absolute and empty paths.
-        let err = WorkspaceMode::parse_flag("shared:").unwrap_err();
-        assert!(err.contains("must not be empty"), "err = {err}");
-
-        let err = WorkspaceMode::parse_flag("shared:relative/path").unwrap_err();
-        assert!(err.contains("must be absolute"), "err = {err}");
-
-        let err = WorkspaceMode::parse_flag("shared:/nonexistent/path/xyzzy").unwrap_err();
-        assert!(err.contains("does not exist"), "err = {err}");
-
-        // Use /tmp which is guaranteed to exist.
+    fn parse_flag_shared_host_only_defaults_guest_to_host() {
+        // `/tmp` is guaranteed to exist on every host the test runs on.
         let mode = WorkspaceMode::parse_flag("shared:/tmp").unwrap();
+        assert_eq!(mode, shared("/tmp", "/tmp", None));
+    }
+
+    #[test]
+    fn parse_flag_shared_with_explicit_guest_path() {
+        let mode = WorkspaceMode::parse_flag("shared:/tmp:/srv/work").unwrap();
+        assert_eq!(mode, shared("/tmp", "/srv/work", None));
+    }
+
+    #[test]
+    fn parse_flag_shared_with_security_model_mapped_xattr() {
+        // SF-17: explicit `mapped-xattr` token is preserved as
+        // `Some(MappedXattr)`, NOT collapsed to `None`. The describe
+        // renderer relies on this distinction.
+        let mode = WorkspaceMode::parse_flag("shared:/tmp:mapped-xattr").unwrap();
         assert_eq!(
             mode,
-            WorkspaceMode::Shared {
-                host_path: "/tmp".into()
-            }
+            shared("/tmp", "/tmp", Some(WorkspaceSecurityModel::MappedXattr))
         );
     }
 
     #[test]
-    fn workspace_mode_parse_unknown() {
+    fn parse_flag_shared_with_security_model_none() {
+        let mode = WorkspaceMode::parse_flag("shared:/tmp:none").unwrap();
+        assert_eq!(
+            mode,
+            shared("/tmp", "/tmp", Some(WorkspaceSecurityModel::NoneMapping))
+        );
+    }
+
+    #[test]
+    fn parse_flag_shared_with_explicit_guest_and_security_model_mapped_xattr() {
+        let mode = WorkspaceMode::parse_flag("shared:/tmp:/srv/work:mapped-xattr").unwrap();
+        assert_eq!(
+            mode,
+            shared(
+                "/tmp",
+                "/srv/work",
+                Some(WorkspaceSecurityModel::MappedXattr),
+            )
+        );
+    }
+
+    #[test]
+    fn parse_flag_shared_with_explicit_guest_and_security_model_none() {
+        let mode = WorkspaceMode::parse_flag("shared:/tmp:/srv/work:none").unwrap();
+        assert_eq!(
+            mode,
+            shared(
+                "/tmp",
+                "/srv/work",
+                Some(WorkspaceSecurityModel::NoneMapping)
+            )
+        );
+    }
+
+    #[test]
+    fn parse_flag_shared_guest_path_that_looks_like_a_model_name() {
+        // Step A only classifies the closed enum tokens
+        // {mapped-xattr, none} as security models. A guest path that
+        // happens to live at `/path-named-none` is absolute and starts
+        // with `/`, so step B consumes it as a guest path; it does
+        // NOT get reclassified as `NoneMapping`. The slot
+        // disambiguation is "model token must be the *exact* enum
+        // spelling, otherwise it is treated as a path classification
+        // candidate."
+        let mode = WorkspaceMode::parse_flag("shared:/tmp:/path-named-none").unwrap();
+        assert_eq!(mode, shared("/tmp", "/path-named-none", None));
+    }
+
+    #[test]
+    fn parse_flag_shared_strips_trailing_whitespace() {
+        // SF-16: leading/trailing whitespace on the whole input is
+        // trimmed before any other step.
+        let mode = WorkspaceMode::parse_flag("  shared:/tmp  ").unwrap();
+        assert_eq!(mode, shared("/tmp", "/tmp", None));
+    }
+
+    #[test]
+    fn parse_flag_shared_strips_trailing_slash_on_host_path() {
+        // SF-16: a single trailing `/` on host_path is stripped during
+        // parsing. The persisted host_path is the canonical form.
+        let mode = WorkspaceMode::parse_flag("shared:/tmp/").unwrap();
+        assert_eq!(mode, shared("/tmp", "/tmp", None));
+    }
+
+    #[test]
+    fn parse_flag_shared_strips_trailing_slash_on_guest_path() {
+        let mode = WorkspaceMode::parse_flag("shared:/tmp:/srv/work/").unwrap();
+        assert_eq!(mode, shared("/tmp", "/srv/work", None));
+    }
+
+    #[test]
+    fn parse_flag_shared_collapses_multiple_trailing_slashes_on_host() {
+        let mode = WorkspaceMode::parse_flag("shared:/tmp//").unwrap();
+        assert_eq!(mode, shared("/tmp", "/tmp", None));
+    }
+
+    #[test]
+    fn parse_flag_shared_preserves_root_host_path() {
+        // The root path `/` must be preserved; the trailing-slash strip
+        // doesn't reduce it to an empty string.
+        let mode = WorkspaceMode::parse_flag("shared:/").unwrap();
+        assert_eq!(mode, shared("/", "/", None));
+    }
+
+    #[test]
+    fn parse_flag_shared_with_guest_tilde_expands_to_home_agent() {
+        // Guest-side `~` is a literal substitution to `/home/agent`,
+        // environment-independent.
+        let mode = WorkspaceMode::parse_flag("shared:/tmp:~/work").unwrap();
+        assert_eq!(mode, shared("/tmp", "/home/agent/work", None));
+    }
+
+    #[test]
+    fn parse_flag_shared_with_guest_tilde_only_expands_to_home_agent() {
+        let mode = WorkspaceMode::parse_flag("shared:/tmp:~").unwrap();
+        assert_eq!(mode, shared("/tmp", "/home/agent", None));
+    }
+
+    #[test]
+    fn parse_flag_clone_repo_url() {
+        let mode = WorkspaceMode::parse_flag("clone:https://github.com/example/repo.git").unwrap();
+        assert_eq!(
+            mode,
+            WorkspaceMode::Clone {
+                repo_url: "https://github.com/example/repo.git".into()
+            }
+        );
+    }
+
+    // -- Parser negative cases ----------------------------------------
+
+    #[test]
+    fn parse_flag_empty_input_errors() {
+        let err = WorkspaceMode::parse_flag("").unwrap_err();
+        assert!(err.contains("unknown workspace mode"), "err = {err}");
+    }
+
+    #[test]
+    fn parse_flag_mode_only_no_colon_errors() {
+        let err = WorkspaceMode::parse_flag("shared").unwrap_err();
+        assert!(err.contains("unknown workspace mode"), "err = {err}");
+    }
+
+    #[test]
+    fn parse_flag_empty_mode_prefix_errors() {
+        let err = WorkspaceMode::parse_flag(":/tmp").unwrap_err();
+        assert!(err.contains("unknown workspace mode"), "err = {err}");
+    }
+
+    #[test]
+    fn parse_flag_shared_colon_only_errors() {
+        let err = WorkspaceMode::parse_flag("shared:").unwrap_err();
+        assert!(
+            err.contains("requires a host path") || err.contains("empty"),
+            "err = {err}"
+        );
+    }
+
+    #[test]
+    fn parse_flag_shared_double_colon_errors() {
+        // `shared::` — the rest is `:`, which splits to two empty
+        // tokens. Empty tokens are rejected.
+        let err = WorkspaceMode::parse_flag("shared::").unwrap_err();
+        assert!(err.contains("empty"), "err = {err}");
+    }
+
+    #[test]
+    fn parse_flag_shared_triple_colon_errors() {
+        let err = WorkspaceMode::parse_flag("shared:::").unwrap_err();
+        assert!(err.contains("empty"), "err = {err}");
+    }
+
+    #[test]
+    fn parse_flag_shared_internal_empty_token_errors() {
+        // `shared:/srv::/dst` — empty middle token.
+        let err = WorkspaceMode::parse_flag("shared:/srv::/dst").unwrap_err();
+        assert!(err.contains("empty"), "err = {err}");
+    }
+
+    #[test]
+    fn parse_flag_shared_relative_host_path_errors() {
+        let err = WorkspaceMode::parse_flag("shared:rel/path").unwrap_err();
+        assert!(err.contains("must be absolute"), "err = {err}");
+    }
+
+    #[test]
+    fn parse_flag_shared_relative_guest_path_errors() {
+        // `rel/guest` does not start with `/` or `~`, so step B does
+        // NOT classify it as a guest path. Instead it falls through
+        // step C and merges into the host path
+        // (`/tmp:rel/guest`), which fails the host-path-exists check.
+        let err = WorkspaceMode::parse_flag("shared:/tmp:rel/guest").unwrap_err();
+        assert!(err.contains("does not exist"), "err = {err}");
+    }
+
+    #[test]
+    fn parse_flag_shared_unresolved_tilde_in_host_errors() {
+        // Q4: `parse_flag` is a single pure function. The CLI is
+        // responsible for expanding host-side `~` before invocation;
+        // any residual `~` in `host_path` reaching the parser is a
+        // bypass-the-CLI bug.
+        let err = WorkspaceMode::parse_flag("shared:~/proj").unwrap_err();
+        assert!(
+            err.contains("CLI should have expanded `~` before sending"),
+            "err = {err}"
+        );
+    }
+
+    #[test]
+    fn parse_flag_shared_friendly_hint_for_passthrough() {
+        // SF-18: `passthrough` short-circuits with the friendly hint
+        // naming the two supported values.
+        let err = WorkspaceMode::parse_flag("shared:/tmp:passthrough").unwrap_err();
+        assert!(
+            err.contains("passthrough") && err.contains("mapped-file"),
+            "err = {err}"
+        );
+        assert!(
+            err.contains("mapped-xattr") && err.contains("none"),
+            "err = {err}"
+        );
+    }
+
+    #[test]
+    fn parse_flag_shared_friendly_hint_for_mapped_file() {
+        let err = WorkspaceMode::parse_flag("shared:/tmp:mapped-file").unwrap_err();
+        assert!(
+            err.contains("passthrough") && err.contains("mapped-file"),
+            "err = {err}"
+        );
+        assert!(
+            err.contains("mapped-xattr") && err.contains("none"),
+            "err = {err}"
+        );
+    }
+
+    #[test]
+    fn parse_flag_shared_mixed_case_mode_prefix_errors() {
+        // Mode matching is case-sensitive.
+        let err = WorkspaceMode::parse_flag("Shared:/tmp").unwrap_err();
+        assert!(err.contains("unknown workspace mode"), "err = {err}");
+    }
+
+    #[test]
+    fn parse_flag_shared_nonexistent_path_errors() {
+        let err = WorkspaceMode::parse_flag("shared:/nonexistent/path/xyzzy").unwrap_err();
+        assert!(err.contains("does not exist"), "err = {err}");
+    }
+
+    #[test]
+    fn parse_flag_unknown_mode_errors() {
         let err = WorkspaceMode::parse_flag("foobar:/some/path").unwrap_err();
         assert!(err.contains("unknown workspace mode"), "err = {err}");
     }
 
     #[test]
-    fn workspace_mode_serialization_shared() {
-        let mode = WorkspaceMode::Shared {
-            host_path: "/home/user/project".into(),
-        };
+    fn parse_flag_shared_too_many_tokens_errors() {
+        // Four tokens after `shared:` is unparseable — even with the
+        // right-to-left classifier, only host + guest + model are
+        // meaningful slots.
+        let err = WorkspaceMode::parse_flag("shared:/a:/b:/c:none").unwrap_err();
+        assert!(
+            err.contains("at most 3 tokens") || err.contains("empty"),
+            "err = {err}"
+        );
+    }
+
+    // -- Backward-compatibility / round-trip --------------------------
+
+    #[test]
+    fn workspace_mode_legacy_blob_without_guest_path_recovers_to_host_path() {
+        // Legacy on-disk records pre-date the `guest_path` field.
+        // The custom deserializer must recover `guest_path = host_path`.
+        let json = r#"{"type":"shared","host_path":"/srv/repo"}"#;
+        let mode: WorkspaceMode = serde_json::from_str(json).unwrap();
+        assert_eq!(mode, shared("/srv/repo", "/srv/repo", None));
+    }
+
+    #[test]
+    fn workspace_mode_legacy_blob_with_empty_guest_path_recovers_to_host_path() {
+        // Defensive arm: hand-edited records with an empty-string
+        // `guest_path` are treated the same as missing.
+        let json = r#"{"type":"shared","host_path":"/srv/repo","guest_path":""}"#;
+        let mode: WorkspaceMode = serde_json::from_str(json).unwrap();
+        assert_eq!(mode, shared("/srv/repo", "/srv/repo", None));
+    }
+
+    #[test]
+    fn workspace_mode_round_trip_with_security_model_mapped_xattr() {
+        // SF-17: an explicit `Some(MappedXattr)` survives serialization
+        // and deserialization without collapsing to `None`.
+        let mode = shared("/a", "/b", Some(WorkspaceSecurityModel::MappedXattr));
+        let json = serde_json::to_string(&mode).unwrap();
+        assert!(
+            json.contains("\"security_model\":\"mapped-xattr\""),
+            "wire JSON: {json}"
+        );
+        let deser: WorkspaceMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser, mode);
+    }
+
+    #[test]
+    fn workspace_mode_round_trip_with_security_model_none_mapping() {
+        let mode = shared("/a", "/b", Some(WorkspaceSecurityModel::NoneMapping));
+        let json = serde_json::to_string(&mode).unwrap();
+        assert!(
+            json.contains("\"security_model\":\"none\""),
+            "wire JSON: {json}"
+        );
+        let deser: WorkspaceMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser, mode);
+    }
+
+    #[test]
+    fn workspace_mode_round_trip_without_security_model_omits_field() {
+        // `#[serde(skip_serializing_if = "Option::is_none")]` keeps the
+        // field off the wire when unset; the round-trip then preserves
+        // `None`.
+        let mode = shared("/a", "/b", None);
+        let json = serde_json::to_string(&mode).unwrap();
+        assert!(
+            !json.contains("security_model"),
+            "security_model should be omitted when None; wire JSON: {json}"
+        );
+        let deser: WorkspaceMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser, mode);
+    }
+
+    #[test]
+    fn workspace_mode_round_trip_shared_full_payload() {
+        // Forward-compat: serialise current shape, deserialise, check
+        // every field round-trips.
+        let mode = shared("/a", "/b", None);
         let json = serde_json::to_string(&mode).unwrap();
         let deser: WorkspaceMode = serde_json::from_str(&json).unwrap();
         assert_eq!(deser, mode);
     }
 
     #[test]
-    fn workspace_mode_serialization_clone() {
+    fn workspace_mode_round_trip_clone() {
         let mode = WorkspaceMode::Clone {
             repo_url: "https://github.com/example/repo.git".into(),
         };
         let json = serde_json::to_string(&mode).unwrap();
         let deser: WorkspaceMode = serde_json::from_str(&json).unwrap();
         assert_eq!(deser, mode);
+    }
+
+    #[test]
+    fn workspace_security_model_default_is_mapped_xattr() {
+        assert_eq!(
+            WorkspaceSecurityModel::default(),
+            WorkspaceSecurityModel::MappedXattr
+        );
+    }
+
+    #[test]
+    fn workspace_security_model_as_yaml_matches_wire_form() {
+        assert_eq!(
+            WorkspaceSecurityModel::MappedXattr.as_yaml(),
+            "mapped-xattr"
+        );
+        assert_eq!(WorkspaceSecurityModel::NoneMapping.as_yaml(), "none");
+    }
+
+    #[test]
+    fn workspace_security_model_serializes_with_kebab_case_tokens() {
+        let mapped = serde_json::to_string(&WorkspaceSecurityModel::MappedXattr).unwrap();
+        assert_eq!(mapped, "\"mapped-xattr\"");
+        let none = serde_json::to_string(&WorkspaceSecurityModel::NoneMapping).unwrap();
+        assert_eq!(none, "\"none\"");
+        // And the round-trip preserves identity.
+        let deser: WorkspaceSecurityModel = serde_json::from_str(&mapped).unwrap();
+        assert_eq!(deser, WorkspaceSecurityModel::MappedXattr);
+        let deser: WorkspaceSecurityModel = serde_json::from_str(&none).unwrap();
+        assert_eq!(deser, WorkspaceSecurityModel::NoneMapping);
+    }
+
+    // -- EnumSet<WorkspaceModeKind> unknown-variant tolerance ---------
+
+    #[test]
+    fn workspace_mode_kind_set_drops_unknown_variants_on_deserialize() {
+        // An older CLI built against `{Shared, Clone}` may receive a
+        // newer daemon's capability response that contains additional
+        // variants (e.g. `"local"`). The unknown variant must be
+        // silently dropped — the set parses to `{Shared, Clone}` plus
+        // any other valid variants present.
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(deserialize_with = "deserialize_workspace_mode_kind_set")]
+            kinds: enumset::EnumSet<WorkspaceModeKind>,
+        }
+
+        let json = r#"{"kinds":["shared","clone","local","quantum_blockchain"]}"#;
+        let w: Wrapper = serde_json::from_str(json).unwrap();
+        assert!(w.kinds.contains(WorkspaceModeKind::Shared));
+        assert!(w.kinds.contains(WorkspaceModeKind::Clone));
+        assert_eq!(w.kinds.len(), 2);
+    }
+
+    #[test]
+    fn workspace_mode_kind_set_empty_array_parses_to_empty_set() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(deserialize_with = "deserialize_workspace_mode_kind_set")]
+            kinds: enumset::EnumSet<WorkspaceModeKind>,
+        }
+
+        let json = r#"{"kinds":[]}"#;
+        let w: Wrapper = serde_json::from_str(json).unwrap();
+        assert!(w.kinds.is_empty());
+    }
+
+    #[test]
+    fn workspace_mode_kind_set_all_unknown_yields_empty_set() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(deserialize_with = "deserialize_workspace_mode_kind_set")]
+            kinds: enumset::EnumSet<WorkspaceModeKind>,
+        }
+
+        let json = r#"{"kinds":["local","foobar"]}"#;
+        let w: Wrapper = serde_json::from_str(json).unwrap();
+        assert!(w.kinds.is_empty());
+    }
+
+    #[test]
+    fn workspace_mode_kind_default_serialize_still_uses_list_repr() {
+        // Sanity check that the existing `serialize_repr = "list"`
+        // shape continues to work — the new free-function deserializer
+        // is opt-in via `#[serde(deserialize_with = ...)]` on
+        // consuming structs, so the underlying `EnumSet<T>` round-trip
+        // is unchanged for callers that don't need tolerance.
+        let mut set = enumset::EnumSet::<WorkspaceModeKind>::empty();
+        set |= WorkspaceModeKind::Shared;
+        let json = serde_json::to_string(&set).unwrap();
+        assert_eq!(json, r#"["shared"]"#);
+    }
+
+    #[test]
+    fn workspace_mode_kind_matches_workspace_mode_variant() {
+        let m = shared("/tmp", "/tmp", None);
+        assert_eq!(m.kind(), WorkspaceModeKind::Shared);
+        let m = WorkspaceMode::Clone {
+            repo_url: "x".into(),
+        };
+        assert_eq!(m.kind(), WorkspaceModeKind::Clone);
     }
 
     // -----------------------------------------------------------------

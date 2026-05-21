@@ -189,6 +189,27 @@ Do not run `--no-hardening` against real workloads. The hardened configuration i
 
 Use clone mode (`--repo`) plus `sandbox cp` or git remote transport when isolation matters more than convenience. See [workspaces concepts](/concepts/workspaces/) for the trade-off and [workspaces guide](/guides/workspaces/) for the commands.
 
+#### Per-session `securityModel`
+
+The `--workspace` flag's trailing token selects the 9p `securityModel`:
+
+```text
+shared:<host>[:<guest>][:<security-model>]
+```
+
+`sandboxd` exposes two of the four 9p models. The rest are deliberately omitted:
+
+| Model | Exposed? | When to pick it |
+|---|---|---|
+| `mapped-xattr` | Yes (default) | Most cases. File ownership and modes are stored in extended attributes on the host; sandbox-side files do not actually carry the operator's uid. Safer because a guest that escapes 9p still does not own host-visible artefacts. |
+| `none` | Yes (opt in) | Real-symlink interop both directions. A build step inside the guest that creates a symlink lands on the host as an actual symlink, not as a 9p-encoded placeholder. The cost is that file ownership reflects the guest's view, which is less restrictive than `mapped-xattr`. |
+| `passthrough` | No | Would require `sandboxd` to run as root so guest uids could be applied directly to host inodes. Incompatible with the rootless-Docker, `cap_net_admin`-only privilege envelope this guide documents. |
+| `mapped-file` | No | Functionally equivalent to `mapped-xattr` for the cases that matter, with the additional cost of a metadata-persistence file inside the host workspace. Operators rarely want a hidden sidecar file appearing in the directory they share. |
+
+The default is `mapped-xattr`. Override to `none` only when symlink semantics matter — for example, a `make install` step inside the guest that lays down symlinks expected to round-trip back to the operator's host filesystem.
+
+Set the model at create time via the third colon-segment of the flag value (see [workspaces guide](/guides/workspaces/#pick-a-security-model)). The choice is persisted on the session record and cannot be changed after create; `sandbox rm` plus a fresh `create` is the only way to revisit it.
+
 ### SLIRP management network
 
 The VM has two NICs. `eth1` is a TAP device on the per-session Docker bridge — the data plane that routes through the gateway. `eth0` is a **SLIRP** interface used only for Lima's SSH management channel. This section explains what SLIRP is and why it's the trade-off it is.

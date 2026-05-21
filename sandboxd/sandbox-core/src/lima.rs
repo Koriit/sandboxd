@@ -1444,21 +1444,33 @@ provision:
         // host directory is writable by the guest.  This is a documented
         // trade-off — see docs/workspaces.md.
         let mounts_section = match &config.workspace_mode {
-            Some(WorkspaceMode::Shared { host_path }) => {
-                // Validate the host_path contains only characters safe for
+            Some(WorkspaceMode::Shared {
+                host_path,
+                guest_path,
+                security_model,
+            }) => {
+                // Validate both paths contain only characters safe for
                 // YAML string interpolation.  This prevents injection of
                 // arbitrary YAML via crafted directory names containing
                 // quotes, newlines, or other YAML-special characters.
-                let safe_path = sanitize_yaml_path(host_path);
+                // The same sanitization story applies symmetrically to
+                // the operator-supplied `guest_path` (M17 spec
+                // § "Lima Backend / Shared mount block").
+                let safe_host = sanitize_yaml_path(host_path);
+                let safe_guest = sanitize_yaml_path(guest_path);
+                // `securityModel` defaults to `mapped-xattr` when the
+                // operator did not pick one (`None`); an explicit
+                // `Some(_)` is honoured verbatim.
+                let model = security_model.unwrap_or_default().as_yaml();
                 format!(
                     "\
 mountType: \"9p\"
 mounts:
-- location: \"{safe_path}\"
-  mountPoint: \"/home/agent/workspace\"
+- location: \"{safe_host}\"
+  mountPoint: \"{safe_guest}\"
   writable: true
   9p:
-    securityModel: mapped-xattr
+    securityModel: {model}
     cache: mmap"
                 )
             }
@@ -2393,6 +2405,10 @@ mod tests {
             disk_gb: 20,
             workspace_mode: Some(WorkspaceMode::Shared {
                 host_path: "/home/user/project".into(),
+                // Default: `guest_path` equals `host_path` when the
+                // operator did not pick one.
+                guest_path: "/home/user/project".into(),
+                security_model: None,
             }),
             hardened: true,
             repo: None,
@@ -2416,14 +2432,19 @@ mod tests {
             "template should specify 9p mount type"
         );
 
-        // Should mount the host path to /home/agent/workspace.
+        // Should mount the host path at the operator-resolved guest
+        // path. Under the M17 breaking-default rule, the guest path
+        // defaults to the host path when the operator does not supply
+        // an explicit value — so this fixture lands the workspace at
+        // `/home/user/project` inside the guest too.
         assert!(
             template.contains("location: \"/home/user/project\""),
             "template should reference the host path"
         );
         assert!(
-            template.contains("mountPoint: \"/home/agent/workspace\""),
-            "template should mount to /home/agent/workspace"
+            template.contains("mountPoint: \"/home/user/project\""),
+            "template should mount to the resolved guest path \
+             (default: equal to host path)"
         );
         assert!(
             template.contains("writable: true"),

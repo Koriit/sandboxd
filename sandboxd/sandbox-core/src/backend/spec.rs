@@ -495,6 +495,8 @@ mod tests {
     fn validate_rejects_unsupported_workspace_mode() {
         let spec = container_spec(Some(WorkspaceMode::Shared {
             host_path: "/tmp".into(),
+            guest_path: "/tmp".into(),
+            security_model: None,
         }));
         let err = spec
             .validate(&container_caps_clone_only())

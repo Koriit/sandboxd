@@ -133,7 +133,7 @@ impl TestNetwork {
             docker_network: self.name.clone(),
             container_ip: self.container_ip.parse().unwrap(),
             gateway_ip: self.gateway_ip.parse().unwrap(),
-            workspace_host_path: None,
+            workspace_bind: None,
             route_helper_path: None,
             // The test fixtures here construct a `ContainerNetwork`
             // directly for low-level runtime exercise; the daemon's
@@ -555,7 +555,7 @@ fn integration_create_session_container_rejects_hardened() {
 /// Workspace-mode contract — both workspace modes are *accepted*
 /// request shapes on the container backend. The capability matrix
 /// advertises `workspace_modes: { Shared, Clone }`. `Shared` threads the
-/// operator-supplied host path through `ContainerNetwork::workspace_host_path`
+/// operator-supplied host path through `ContainerNetwork::workspace_bind`
 /// and `ContainerRuntime` turns it into a `docker create --mount type=bind,...`
 /// flag with the unified bind target `/home/agent/workspace/`. `Clone`
 /// is dispatched in-guest after the lite container's entrypoint
@@ -612,6 +612,8 @@ fn integration_create_session_container_advertises_workspace_capabilities() {
         },
         workspace_mode: Some(WorkspaceMode::Shared {
             host_path: "/tmp".into(),
+            guest_path: "/tmp".into(),
+            security_model: None,
         }),
         repo: None,
         boot_cmd: None,

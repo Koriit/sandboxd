@@ -37,7 +37,8 @@ pub use api::{
     LifecycleEventDto, MitmproxyEventBodyDto, MitmproxyEventDto, NetworkHealth,
     PolicyApplyStatusDto, PolicyDto, PolicyLevelDto, PolicyRuleDto, PropagationStatusResponse,
     SessionConfigDto, SessionDto, SessionHealth, SessionMountInfo, SessionNetworkInfo,
-    SessionRootlessDockerDto, UpdatePolicyRequest, event_to_jsonl_line,
+    SessionRootlessDockerDto, UpdatePolicyRequest, WorkspaceModeDetailDto,
+    WorkspaceSecurityModelDto, event_to_jsonl_line,
 };
 pub use atomic_listener_writer::{
     AtomicListenerWriter, ListenerWriteError, listener_host_root, session_listener_host_dir,
@@ -103,7 +104,7 @@ pub use process::run_with_timeout;
 pub use qmp::{QmpClient, mac_from_session_id};
 pub use session::{
     Session, SessionConfig, SessionId, SessionRootlessDocker, SessionState, WorkspaceMode,
-    WorkspaceModeKind,
+    WorkspaceModeKind, WorkspaceSecurityModel,
 };
 pub use store::{OrphanInfo, ResolveOutcome, SessionStore};
 // Only the daemon-side users-conf surface is re-exported at the crate
