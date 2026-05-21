@@ -316,6 +316,43 @@ sandbox workspace pull <session> {-f | -n} [--safe-links] [--no-gitignore] [--de
     neither `/a/b` nor `/a` existing creates `/a/b/` first, then
     rsync populates `c`.
 
+Proposed clap help-text blocks (the implementer may refine
+wording; operator discoverability matters):
+
+```
+sandbox workspace push <session> {-f | -n} [--safe-links] [--no-gitignore]
+
+Push the local: workspace from host to guest. Mirrors host source into
+guest workspace via rsync; deletions are mirrored (the --delete behavior
+is the contract — use -n to inspect first).
+
+  -f, --force        Required to perform the destructive mirror operation.
+                     Mutually exclusive with -n.
+  -n, --dry-run      Show what would change without modifying the guest.
+                     Mutually exclusive with -f.
+  --safe-links       Preserve in-tree symlinks; skip out-of-tree symlinks.
+                     Default is to follow all symlinks (-L).
+  --no-gitignore     Skip the .gitignore filter; transfer everything.
+```
+
+```
+sandbox workspace pull <session> {-f | -n} [--safe-links] [--no-gitignore] [--dest <path>]
+
+Pull the local: workspace from guest to host. Mirrors guest workspace
+into host destination via rsync; deletions are mirrored (the --delete
+behavior is the contract — use -n to inspect first).
+
+  -f, --force        Required to perform the destructive mirror operation.
+                     Mutually exclusive with -n.
+  -n, --dry-run      Show what would change without modifying the host.
+                     Mutually exclusive with -f.
+  --safe-links       Preserve in-tree symlinks; skip out-of-tree symlinks.
+                     Default is to follow all symlinks (-L).
+  --no-gitignore     Skip the .gitignore filter; transfer everything.
+  --dest <path>      Override the host destination path. Default: the
+                     host_path recorded on the session at create time.
+```
+
 Errors:
 
 - Session not running → `error: session <id> is not running (state:
@@ -409,6 +446,14 @@ pub enum WorkspaceModeKind {
 and Lima backends both advertise `Local` in their
 `workspace_modes` capability sets (see § Lima Backend, § Container
 Backend).
+
+**Canonical wire-order.** The variants are declared (and thus
+serialised in the `list`-repr `EnumSet`) in the order `Shared`,
+`Clone`, `Local`. This is also the order used by
+`render_workspace_modes` (the CLI display helper in
+`sandbox-cli/src/main.rs`). Adding new variants in the future
+appends to the end of the enum; the order is part of the wire
+contract.
 
 **Forward-compat: unknown-variant tolerance on the wire.** The wire
 serialisation of `EnumSet<WorkspaceModeKind>` (used by
@@ -701,6 +746,13 @@ A symmetric rule applies to `WorkspaceMode::Local`'s `guest_path`
 The custom deserialiser is shared between `Shared` and `Local` for
 consistency.
 
+An empty-string `guest_path` is treated the same as missing —
+recovery is `guest_path = host_path`. This defensive arm in the
+custom deserializer never arises through the spec's own
+serializer (which uses `#[serde(default, skip_serializing_if =
+"Option::is_none")]` and emits either the field or omits it
+entirely, never `""`). It exists only for hand-edited records.
+
 No SQLite migration is added. The schema change lives entirely in the
 JSON blob in `sessions.config_json`; the migration set in
 `sandbox-core/migrations/` is untouched. This matches the CLAUDE.md
@@ -932,6 +984,10 @@ The rsync binary must be present on both sides:
 - **Host.** `sandbox` checks the local rsync exists when dispatching
   push/pull. If missing, the CLI emits "rsync not found on host;
   install rsync to use `sandbox workspace push/pull`" and exits 1.
+  The initial-push rsync runs on the daemon's host (the same
+  machine as the CLI in standard installs). `rsync` must be
+  present in the daemon's `$PATH`; the install scripts in `tools/`
+  already ensure this for the supported platforms.
 - **Guest.** Both the Lima base image and the container ("lite")
   image already ship rsync (required for `sandbox sync`). The
   `local:` mode adds no new image dependency — the existing image
@@ -1222,10 +1278,19 @@ Behaviour:
   operator does not need to know whether a lock was actually held.
 
 The subcommand's clap help text explicitly names the expected
-use:
+use. Proposed clap help-text block (the implementer may refine
+wording):
 
 ```
-Force-releases an orphan workspace lock left by a crashed CLI session.
+sandbox workspace unlock <session> [--force]
+
+Release a workspace lock on a local: session. Intended use is
+orphan-lock recovery after a crashed CLI session.
+
+  --force            Release the lock unconditionally, ignoring the
+                     token check. This is the expected mode in practice
+                     (hand-operators almost never possess the original
+                     lock_token).
 ```
 
 The `--force` flag is the expected and documented use of this
@@ -1462,7 +1527,7 @@ pub struct WorkspaceBind {
 // or: workspace_host_path -> workspace_bind: Option<WorkspaceBind>
 ```
 
-The `--mount` argv at `backend/container.rs:521` becomes:
+The `--mount` argv in `build_create_argv`'s workspace-mount clause in `sandbox-core/src/backend/container.rs` becomes:
 
 ```rust
 format!(
@@ -1969,10 +2034,16 @@ whichever crate holds the per-session in-memory runtime state):
 
 ### E2E tests (`tests/e2e/`)
 
+All `local:`-mode E2E tests are parametrized at the function
+level via `@pytest.mark.parametrize("backend", ["lima",
+"container"])`. Each test runs twice (once per backend); the
+test body uses the `backend` parameter when creating the
+session. This is the chosen pattern for backend matrix coverage
+in M17; existing per-backend `pytest.mark.lima` file markers in
+`test_hardening.py` are not extended.
+
 - `test_workspace_local.py` — exercises the full `local:` happy
-  path across both backends (matrix parameterisation; the file uses
-  `@pytest.mark.lima` / `@pytest.mark.container` per M12-S13's
-  marker convention):
+  path across both backends, parametrized as above:
   - Create a session with `local:<tempdir>`.
   - Assert workspace contents present inside the session.
   - Run `sandbox workspace push -f` after editing host-side, assert
@@ -1980,16 +2051,13 @@ whichever crate holds the per-session in-memory runtime state):
   - Run `sandbox workspace pull -f` after editing guest-side, assert
     the edit propagated.
   - `sandbox describe` shows `Mode: local`, the right paths.
-- `test_workspace_shared_guest_path.py` — exercises the guest-path
-  branch of `shared:`:
+- `test_workspace_shared_guest_path.py` — exercises the
+  guest-path branch of `shared:`, parametrized as above:
   - Create a session with `shared:<tempdir>:/srv/work`.
   - Assert the mount appears at `/srv/work`.
   - Cross-check writes round-trip to the host.
 - `test_workspace_lock.py` — exercises the workspace-lock
-  subsystem across both backends (matrix parameterisation
-  via `@pytest.mark.parametrize("backend", ["lima",
-  "container"])` per the marker convention adopted in §
-  Tests → E2E tests and SF-6's resolution):
+  subsystem across both backends, parametrized as above:
   - Push-versus-stop interleave: create a `local:` session,
     populate the host source with enough content to make
     `sandbox workspace push -f` long-running (e.g. several
@@ -2046,6 +2114,11 @@ branches.
   recovery path, the 409-on-stop/push/pull symptom that
   triggers it, and the expected operator workflow per §
   Workspace lock → Orphan locks.
+- Add a brief footgun callout in `docs/guides/workspaces.md`: if
+  the operator writes `shared:~/projects/*` (with a literal `*`),
+  the shell expands the glob before `sandbox` sees the argument.
+  Operators should quote the value or use a single path. The
+  parser does NOT expand globs.
 
 ### `docs/guides/hardening.md`
 
@@ -2065,6 +2138,18 @@ overview to list five (not four) modes: clone, shared, local, cp,
 git-remote. Place `local:` between `clone:` and `shared:` in the
 trade-off table — it sits between them on the live-edits / isolation
 axis.
+
+Add a brief "When to use `local:`" section to
+`docs/concepts/workspaces.md` after the existing trade-off table.
+Suggested content (the doc author may refine wording):
+
+- Have a non-git source tree (private packages, generated files,
+  scratch directory)? → `local:`.
+- Want offline reproducibility (no clone race against an upstream)?
+  → `local:`.
+- Want isolated work that doesn't echo back to host until you
+  explicitly pull? → `local:`.
+- Otherwise prefer `clone:` (cleaner) or `shared:` (live edit).
 
 ### Upgrade notes
 
@@ -2221,11 +2306,11 @@ without them.
   security_model }` shape per § Domain types.
 - `WorkspaceMode::parse_flag` extended to handle the
   `shared:<host>[:<guest>][:<model>]` grammar per § Parser.
-- Replace the hand-rolled CLI-side `--workspace` validation in
-  `sandbox-cli/src/main.rs` (currently the `strip_prefix("shared:")`
-  + `Path::exists()` block in the `Create` arm, around lines
-  815-835 as a hint) with a call to `WorkspaceMode::parse_flag(...)`
-  so the new grammar (`shared:<host>[:<guest>][:<model>]`,
+- Replace the hand-rolled `--workspace` validator in
+  `sandbox-cli/src/main.rs` (the `strip_prefix("shared:")` +
+  `Path::exists()` block in the `Create` arm) with a call to
+  `WorkspaceMode::parse_flag(...)` so the new grammar
+  (`shared:<host>[:<guest>][:<model>]`,
   `local:<host>[:<guest>]`) is accepted on both sides without
   divergence. The `local:` mode token is accepted at parse time in
   S1 but the resulting `WorkspaceMode::Local` value is rejected by
@@ -2234,13 +2319,13 @@ without them.
   for the relevant backend. Operators on S1 see a clear "backend
   does not support local workspaces" message rather than a
   CLI-side "unknown mode" error.
-- Update the clap doc string for `--workspace` (around lines 99-104
-  as a hint) to describe the new grammar accurately. The current
-  text — "mounts a host directory into the VM at
-  /home/agent/workspace via 9p" — is outdated on two counts (it
-  omits `local:`, and the default guest path is no longer
-  `/home/agent/workspace`). New text covers all three modes, both
-  optional tokens for `shared:`, and the
+- Update the `--workspace` clap doc string in
+  `sandbox-cli/src/main.rs` to describe the new grammar
+  accurately. The current text — "mounts a host directory into
+  the VM at /home/agent/workspace via 9p" — is outdated on two
+  counts (it omits `local:`, and the default guest path is no
+  longer `/home/agent/workspace`). New text covers all three
+  modes, both optional tokens for `shared:`, and the
   `guest_path = host_path` default.
 - DTO/mapper updates per § `sandbox describe` → Wire surface:
   - Add `workspace_mode_detail: Option<WorkspaceModeDetailDto>` to
