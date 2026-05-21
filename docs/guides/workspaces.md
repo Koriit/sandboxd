@@ -1,9 +1,9 @@
 ---
 title: Use workspaces
-description: Provision source code into a session using clone, shared mount, sandbox cp / sync, or git remote transport.
+description: Provision source code into a session using clone, shared mount, local snapshot, sandbox cp / sync, or git remote transport.
 ---
 
-This guide shows you how to use each workspace mode with copy-pasteable commands. For background on the five modes and their trade-offs, see [workspaces concepts](/concepts/workspaces/).
+This guide shows you how to use each workspace mode with copy-pasteable commands. For background on the modes and their trade-offs, see [workspaces concepts](/concepts/workspaces/).
 
 ## Before you start
 
@@ -122,6 +122,69 @@ sandbox exec dev -- ls "$(pwd)"
 Changes on either side appear immediately on the other — no sync step needed.
 
 Shared mount reduces VM isolation. If your workload does not need live bidirectional visibility, prefer clone plus `sandbox cp` or git remote transport. See [hardening](/guides/hardening/#9p-shared-mounts) for the full trade-off.
+
+## Snapshot a host directory (`local:` mode)
+
+`local:` is the snapshot-style cousin of `shared:`. At session-creation time the daemon `rsync`s your host directory into the guest; after that, no live host-to-guest link exists. The guest sees a static copy of the tree as it was at create time. There is no 9p surface, no bind mount, and no path through which a guest write reaches your host filesystem.
+
+Reach for `local:` when you want the convenience of seeding the session with a directory you already have on disk, but do not need (or do not want) live bidirectional visibility. Typical fits: a non-git scratch tree, generated files you do not want to commit, or a directory where isolation matters more than ergonomic in-place editing.
+
+`shared:` vs. `local:`, at a glance:
+
+| Property | `shared:` | `local:` |
+|---|---|---|
+| Host-side writes appear in guest | Instantly | Only at create time (snapshot) |
+| Guest-side writes appear on host | Instantly | Never (no live link) |
+| Filesystem surface added to VM | 9p | None |
+| Best for | Interactive IDE-driven dev | Isolated runs over a known tree |
+
+The flag grammar is `local:<host>[:<guest>]`. `<host>` must be an existing absolute directory after `~` expansion. `<guest>` is the in-VM path; **when omitted it defaults to `<host>` verbatim**, matching the M17 default rule for `shared:`. There is no security-model token — `local:` has no 9p surface, so the `mapped-xattr` / `none` choice does not apply.
+
+Three forms of the flag, from minimal to fully explicit:
+
+```bash
+# Host path only; guest path = host path.
+sandbox create --workspace "local:/home/user/proj"
+
+# Explicit guest path.
+sandbox create --workspace "local:/home/user/proj:/srv/work"
+
+# With the current directory.
+sandbox create --workspace "local:$(pwd):/home/agent/work"
+```
+
+By default, the create-time push honours each `.gitignore` in the source tree (rsync `--filter=':- .gitignore'`). Files matched by an ignore rule do not land in the guest. To transfer everything, pass `--no-gitignore`:
+
+```bash
+sandbox create --name dev \
+    --workspace "local:$(pwd)" \
+    --no-gitignore
+```
+
+`--no-gitignore` is meaningful only with `--workspace local:`; the CLI refuses it for any other mode (the daemon enforces the same gate, so a hand-rolled HTTP request gets a 400 with the same text).
+
+Verify the snapshot landed:
+
+```bash
+sandbox exec dev -- ls "$(pwd)"
+```
+
+`sandbox describe dev` renders the chosen mode and paths under the `Workspace:` block:
+
+```text
+Workspace:
+  Mode:        local
+  Host path:   /home/user/proj
+  Guest path:  /srv/work
+```
+
+### Create-time rsync failure tears the session down
+
+The initial push runs after the VM/container reaches `Running` but before `sandbox create` returns. If `rsync` exits non-zero — for example, a host file with `chmod 000` that the daemon cannot read — the create call surfaces an HTTP 5xx with `local-workspace rsync failed (exit <N>): <rsync stderr>`, and the daemon tears the VM/container, network, and CA state down before responding. You will not see a half-seeded session in `sandbox ps`; the failed create leaves no orphan resources on the host. Fix the underlying issue (permissions, missing path) and re-run.
+
+### Push and pull updates back into and out of the snapshot
+
+Operator-driven push (host → guest) and pull (guest → host) of the `local:` snapshot land in a follow-up release (`sandbox workspace push` / `pull`). Until then, `local:` is create-time snapshot only; to sync further changes use `sandbox cp` for individual files or `sandbox sync` for delta-mode directory mirrors.
 
 ## Copy individual files with `sandbox cp`
 

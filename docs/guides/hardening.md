@@ -210,6 +210,17 @@ The default is `mapped-xattr`. Override to `none` only when symlink semantics ma
 
 Set the model at create time via the third colon-segment of the flag value (see [workspaces guide](/guides/workspaces/#pick-a-security-model)). The choice is persisted on the session record and cannot be changed after create; `sandbox rm` plus a fresh `create` is the only way to revisit it.
 
+### `local:` snapshot workspace
+
+`--workspace local:<path>` seeds the guest with a one-shot `rsync` snapshot of a host directory. Unlike `shared:`, no 9p device is attached and no host directory is bound into the VM:
+
+- No 9p filesystem surface added to QEMU — one device-emulation category fewer than `shared:`.
+- No live host writes are visible to the guest after create. The guest sees the tree as it was at create time.
+- No live guest writes are visible to the host. Guest-side modifications stay inside the session.
+- Trade-off is staleness: the operator decides when (and whether) to push or pull updates across the boundary via the dedicated `sandbox workspace push` / `pull` commands.
+
+Reach for `local:` when you want to seed a session from a host directory without giving up the isolation properties of clone mode. See [workspaces concepts](/concepts/workspaces/) for the broader comparison and [workspaces guide](/guides/workspaces/#snapshot-a-host-directory-local-mode) for the commands.
+
 ### SLIRP management network
 
 The VM has two NICs. `eth1` is a TAP device on the per-session Docker bridge — the data plane that routes through the gateway. `eth0` is a **SLIRP** interface used only for Lima's SSH management channel. This section explains what SLIRP is and why it's the trade-off it is.

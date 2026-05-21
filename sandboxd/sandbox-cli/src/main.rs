@@ -116,6 +116,18 @@ enum Command {
         /// Skip pre-baked image, use full create path.
         #[arg(long)]
         no_cache: bool,
+        /// Skip the `.gitignore` filter on the create-time initial-push
+        /// rsync for `local:` workspaces.
+        ///
+        /// Meaningful only when `--workspace` resolves to a `local:`
+        /// mode; the CLI rejects the combination with any other mode
+        /// (including absent `--workspace`) before the request goes on
+        /// the wire, and the daemon mirrors the rejection for non-CLI
+        /// clients. The create-time choice is **not** persisted —
+        /// subsequent `sandbox workspace push` / `pull` invocations
+        /// carry their own `--no-gitignore` flag.
+        #[arg(long = "no-gitignore")]
+        no_gitignore: bool,
         /// Backend that should host the session (`lima` or `container`).
         ///
         /// Mutually exclusive with `--lite`. When neither is set, the
@@ -772,6 +784,51 @@ fn expand_host_tilde_in_workspace_flag(value: &str) -> Result<String, String> {
     Ok(rebuilt)
 }
 
+/// CLI-side gate for `--no-gitignore`: only meaningful when paired
+/// with a `local:` workspace. Returns the operator-facing error string
+/// that the caller pairs with `eprintln!` + `process::exit(1)`.
+///
+/// Mirrors the daemon-side rejection in `create_session` byte-for-byte
+/// so a CLI-driven failure and a hand-rolled HTTP-client failure both
+/// surface the same diagnostic. The `<mode>` token is `shared`,
+/// `clone`, or the literal `<empty>` (no `--workspace` passed). Parses
+/// the `--workspace` value with [`sandbox_core::WorkspaceMode::parse_flag`]
+/// — the single pure parser shared with the daemon.
+///
+/// Spec § `--no-gitignore` on `sandbox create` pins the rejection
+/// wording; the literal string lives at the call sites (CLI + daemon)
+/// rather than as a shared constant because:
+/// - The daemon-side check is independent (a misbehaving CLI cannot
+///   bypass the gate by skipping this client-side validation).
+/// - There is no `sandbox-core` location both sides reasonably depend
+///   on for human-readable error strings (the existing
+///   `SandboxError::InvalidArgument` carries owned strings, not a
+///   shared error catalog).
+fn validate_no_gitignore_for_workspace(workspace: Option<&str>) -> Result<(), String> {
+    // Resolve the mode token from the parsed workspace flag. We
+    // tolerate parse failures here (an invalid workspace value will
+    // be reported by the existing `parse_flag` call below, which
+    // produces a more informative diagnostic); fall back to `<empty>`
+    // so the rejection still fires for the `--no-gitignore` +
+    // `--workspace <invalid>` combination.
+    let mode = match workspace {
+        None => "<empty>",
+        Some(ws) => match sandbox_core::WorkspaceMode::parse_flag(ws) {
+            Ok(sandbox_core::WorkspaceMode::Local { .. }) => return Ok(()),
+            Ok(sandbox_core::WorkspaceMode::Shared { .. }) => "shared",
+            Ok(sandbox_core::WorkspaceMode::Clone { .. }) => "clone",
+            // An unparseable `--workspace` value still triggers the
+            // gate — there is no `local:` mode on the request, so
+            // `--no-gitignore` has no meaning. Use `<empty>` as the
+            // mode token for consistency with the absent-flag case.
+            Err(_) => "<empty>",
+        },
+    };
+    Err(format!(
+        "--no-gitignore is only meaningful for local: workspaces; this session uses {mode}:"
+    ))
+}
+
 /// Build the `POST /sessions` request from a `Command::Create` and the
 /// backend the preflight chose.
 ///
@@ -801,6 +858,7 @@ fn build_create_request_body(
         workspace,
         no_hardening,
         no_cache,
+        no_gitignore,
         backend: _backend,
         lite: _lite,
         force_rootless_docker,
@@ -808,6 +866,20 @@ fn build_create_request_body(
     else {
         unreachable!("build_create_request_body called with non-Create command");
     };
+
+    // `--no-gitignore` is only meaningful when paired with a `local:`
+    // workspace. Mirror the daemon-side gate client-side so the
+    // operator sees the rejection before the request reaches the
+    // wire (fail-fast, matching the existing pattern for malformed
+    // `--workspace` values below). The daemon-side check in
+    // `create_session` is the authoritative one — this CLI check
+    // exists for operator latency only.
+    if *no_gitignore {
+        if let Err(e) = validate_no_gitignore_for_workspace(workspace.as_deref()) {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    }
 
     let mut body = serde_json::Map::new();
     if let Some(n) = name {
@@ -920,6 +992,17 @@ fn build_create_request_body(
     }
     if *no_cache {
         body.insert("no_cache".into(), serde_json::json!(true));
+    }
+    // Only stamp `no_gitignore` on the wire when the operator passed
+    // `--no-gitignore`. Older daemons that don't know about the field
+    // would tolerate it anyway (via `#[serde(default)]` and serde's
+    // unknown-field behaviour), but omitting the field when false
+    // keeps the body bit-equal to the historical shape and avoids
+    // misleading log lines on older daemons that surface request
+    // bodies verbatim. The CLI's pre-validation above has already
+    // confirmed the workspace mode is `local:` when this fires.
+    if *no_gitignore {
+        body.insert("no_gitignore".into(), serde_json::json!(true));
     }
     // Only stamp `force_rootless_docker` when the operator explicitly
     // passed `--force-rootless-docker`. The conditional insert below
@@ -2076,6 +2159,9 @@ fn render_workspace_modes(caps: &sandbox_core::Capabilities) -> String {
     }
     if modes.contains(WorkspaceModeKind::Clone) {
         parts.push("clone");
+    }
+    if modes.contains(WorkspaceModeKind::Local) {
+        parts.push("local");
     }
     parts.join(", ")
 }
@@ -5352,6 +5438,7 @@ mod tests {
                 workspace: None,
                 no_hardening: false,
                 no_cache: false,
+                no_gitignore: false,
                 backend: None,
                 lite: false,
                 force_rootless_docker: false,
@@ -5552,6 +5639,7 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: false,
+            no_gitignore: false,
             backend: None,
             lite: false,
             force_rootless_docker: false,
@@ -5584,6 +5672,7 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: false,
+            no_gitignore: false,
             backend: None,
             lite: false,
             force_rootless_docker: false,
@@ -5613,6 +5702,7 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: false,
+            no_gitignore: false,
             backend: None,
             lite: false,
             force_rootless_docker: false,
@@ -5989,6 +6079,7 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: false,
+            no_gitignore: false,
             backend: None,
             lite: false,
             force_rootless_docker: false,
@@ -6014,6 +6105,7 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: false,
+            no_gitignore: false,
             backend: None,
             lite: false,
             force_rootless_docker: false,
@@ -6067,6 +6159,7 @@ mod tests {
             workspace: None,
             no_hardening: true,
             no_cache: false,
+            no_gitignore: false,
             backend: None,
             lite: false,
             force_rootless_docker: false,
@@ -6094,6 +6187,7 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: false,
+            no_gitignore: false,
             backend: None,
             lite: false,
             force_rootless_docker: false,
@@ -6245,6 +6339,7 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: true,
+            no_gitignore: false,
             backend: None,
             lite: false,
             force_rootless_docker: false,
@@ -6272,6 +6367,7 @@ mod tests {
             workspace: None,
             no_hardening: false,
             no_cache: false,
+            no_gitignore: false,
             backend: None,
             lite: false,
             force_rootless_docker: false,
@@ -6281,6 +6377,125 @@ mod tests {
         assert!(
             body.get("no_cache").is_none(),
             "default (no_cache=false) should omit the field from request body"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_no_gitignore_for_workspace — CLI-side pre-validation gate.
+    //
+    // Pure predicate; matches the daemon-side
+    // `validate_no_gitignore_against_workspace` rejection wording
+    // byte-for-byte so a CLI-driven failure and a hand-rolled HTTP
+    // client failure both surface the same diagnostic. The literal
+    // string lives at both call sites because there is no shared
+    // error catalog in `sandbox-core` today.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_no_gitignore_accepts_local_workspace() {
+        // `/tmp` is guaranteed to exist and be a directory on every
+        // host the test runs on; the parser's SF-11 directory-required
+        // check passes.
+        assert_eq!(
+            validate_no_gitignore_for_workspace(Some("local:/tmp")),
+            Ok(())
+        );
+        // Explicit guest path also lands on the local arm.
+        assert_eq!(
+            validate_no_gitignore_for_workspace(Some("local:/tmp:/srv/work")),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn validate_no_gitignore_rejects_shared_workspace() {
+        let err = validate_no_gitignore_for_workspace(Some("shared:/tmp"))
+            .expect_err("flag + shared: must reject");
+        assert_eq!(
+            err,
+            "--no-gitignore is only meaningful for local: workspaces; this session uses shared:"
+        );
+    }
+
+    #[test]
+    fn validate_no_gitignore_rejects_clone_workspace() {
+        let err =
+            validate_no_gitignore_for_workspace(Some("clone:https://example.invalid/repo.git"))
+                .expect_err("flag + clone: must reject");
+        assert_eq!(
+            err,
+            "--no-gitignore is only meaningful for local: workspaces; this session uses clone:"
+        );
+    }
+
+    #[test]
+    fn validate_no_gitignore_rejects_absent_workspace() {
+        let err = validate_no_gitignore_for_workspace(None)
+            .expect_err("flag + absent --workspace must reject");
+        assert_eq!(
+            err,
+            "--no-gitignore is only meaningful for local: workspaces; this session uses <empty>:"
+        );
+    }
+
+    #[test]
+    fn build_create_request_with_no_gitignore_and_local_workspace() {
+        // Happy path: `--no-gitignore` + `--workspace local:` stamps
+        // `no_gitignore: true` on the wire body. `/tmp` is the same
+        // safe always-exists path the session-side parser tests use
+        // — the parser's SF-11 directory check requires a real
+        // directory on the host running the test.
+        let cmd = Command::Create {
+            name: Some("local-skip-gitignore".into()),
+            cpus: Some(2.0),
+            memory: Some(4096),
+            disk: 20,
+            template: None,
+            policy: None,
+            preset: vec![],
+            repo: None,
+            boot_cmd: None,
+            workspace: Some("local:/tmp".into()),
+            no_hardening: false,
+            no_cache: false,
+            no_gitignore: true,
+            backend: None,
+            lite: false,
+            force_rootless_docker: false,
+        };
+        let req = build_create_request_body(&cmd, sandbox_core::BackendKind::Lima);
+        let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
+        assert_eq!(
+            body["no_gitignore"], true,
+            "--no-gitignore should stamp no_gitignore=true on the wire body"
+        );
+    }
+
+    #[test]
+    fn build_create_request_default_omits_no_gitignore() {
+        let cmd = Command::Create {
+            name: Some("default".into()),
+            cpus: Some(2.0),
+            memory: Some(4096),
+            disk: 20,
+            template: None,
+            policy: None,
+            preset: vec![],
+            repo: None,
+            boot_cmd: None,
+            workspace: None,
+            no_hardening: false,
+            no_cache: false,
+            no_gitignore: false,
+            backend: None,
+            lite: false,
+            force_rootless_docker: false,
+        };
+        let req = build_create_request_body(&cmd, sandbox_core::BackendKind::Lima);
+        let body: serde_json::Value = serde_json::from_str(req.body()).unwrap();
+        assert!(
+            body.get("no_gitignore").is_none(),
+            "default (no_gitignore=false) must omit the field from the request body so older daemons see a bit-equal request"
         );
     }
 
@@ -7085,8 +7300,8 @@ mod tests {
             "Lima honours hardening, got:\n{rendered}"
         );
         assert!(
-            rendered.contains("workspace_modes:      shared, clone"),
-            "Lima advertises both workspace modes, got:\n{rendered}"
+            rendered.contains("workspace_modes:      shared, clone, local"),
+            "Lima advertises every workspace mode, got:\n{rendered}"
         );
     }
 
@@ -7313,6 +7528,86 @@ mod tests {
         assert!(
             !rendered.contains("Security:"),
             "Clone must not render a Security row, got:\n{rendered}"
+        );
+    }
+
+    /// `Local` renders the three-row block with `Mode: local`,
+    /// `Host path:`, and `Guest path:` rows — no `Security:` row
+    /// (only `shared:` has a security model).
+    ///
+    /// Byte-equal golden test pinning the exact rendered substring so
+    /// future refactors of `render_workspace_block` cannot silently
+    /// shift the operator-facing surface. The 13-char value-column
+    /// padding matches the `Shared` arm pattern (see
+    /// `describe_renders_shared_workspace_*` tests above).
+    #[test]
+    fn describe_renders_local_workspace_block() {
+        let mut dto = make_session_dto(
+            "1111aaaa8888",
+            Some("local-block"),
+            None,
+            chrono::Utc::now(),
+        );
+        dto.config.workspace_mode = Some("local:/home/user/proj:/srv/work".into());
+        dto.config.workspace_mode_detail = Some(WorkspaceModeDetailDto::Local {
+            host_path: "/home/user/proj".into(),
+            guest_path: "/srv/work".into(),
+        });
+        let rendered = render_describe(std::slice::from_ref(&dto), None);
+        // Byte-equal golden: the four-line `Workspace:` block must
+        // appear verbatim in the rendered output, including the
+        // exact 13-char value-column padding.
+        let expected = "  Workspace:\n    \
+            Mode:        local\n    \
+            Host path:   /home/user/proj\n    \
+            Guest path:  /srv/work\n";
+        assert!(
+            rendered.contains(expected),
+            "expected verbatim Local block; got:\n{rendered}"
+        );
+        // The Local workspace block has no Security row (only shared:
+        // carries a security model) and no Repo row (only clone:
+        // names a repo URL inside the workspace block). Note: the
+        // top-level `Repo:` row in `Config:` comes from the session-
+        // level `repo` field and is unrelated; we scope the
+        // negative assertion to the workspace block by checking for
+        // the indented multi-line forms.
+        assert!(
+            !rendered.contains("    Security:"),
+            "Local must not render a Security row inside Workspace, got:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("    Repo:"),
+            "Local must not render a Repo row inside Workspace, got:\n{rendered}"
+        );
+    }
+
+    /// `Local` with `guest_path == host_path` still renders both rows
+    /// verbatim — the describe surface is uniform across the
+    /// guest-explicit and guest-equals-host cases (no compact-form
+    /// collapse in describe; the compact-form rule applies only to
+    /// the flat-string `workspace_mode` field).
+    #[test]
+    fn describe_renders_local_workspace_block_with_default_guest_path() {
+        let mut dto = make_session_dto(
+            "1111aaaa9999",
+            Some("local-default"),
+            None,
+            chrono::Utc::now(),
+        );
+        dto.config.workspace_mode = Some("local:/home/user/proj".into());
+        dto.config.workspace_mode_detail = Some(WorkspaceModeDetailDto::Local {
+            host_path: "/home/user/proj".into(),
+            guest_path: "/home/user/proj".into(),
+        });
+        let rendered = render_describe(std::slice::from_ref(&dto), None);
+        let expected = "  Workspace:\n    \
+            Mode:        local\n    \
+            Host path:   /home/user/proj\n    \
+            Guest path:  /home/user/proj\n";
+        assert!(
+            rendered.contains(expected),
+            "expected verbatim Local block with equal host/guest paths; got:\n{rendered}"
         );
     }
 

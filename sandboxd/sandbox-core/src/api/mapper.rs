@@ -246,6 +246,10 @@ impl From<&SessionConfig> for SessionConfigDto {
 /// - `shared:<host>:<guest>:<model>` — full triple, explicit guest
 ///   path and explicit security model.
 ///
+/// `Local` collapses the guest-equals-host case symmetrically with
+/// `Shared`: `local:<host>` when `guest_path == host_path`,
+/// `local:<host>:<guest>` otherwise.
+///
 /// `Clone` renders unchanged. Kept as a free function (not an
 /// `impl Display for WorkspaceMode`) so that the wire surface and any
 /// future debug/log formatting stay decoupled — changing one must not
@@ -275,17 +279,25 @@ fn render_workspace_mode(mode: &WorkspaceMode) -> String {
             }
         }
         WorkspaceMode::Clone { repo_url } => format!("clone:{repo_url}"),
+        WorkspaceMode::Local {
+            host_path,
+            guest_path,
+        } => {
+            if guest_path == host_path {
+                format!("local:{host_path}")
+            } else {
+                format!("local:{host_path}:{guest_path}")
+            }
+        }
     }
 }
 
 /// Project an in-memory [`WorkspaceMode`] onto the structured
 /// [`WorkspaceModeDetailDto`] surfaced by `SessionConfigDto`.
 ///
-/// The DTO's `Local` variant is wire-surface-only for S1: the domain
-/// `WorkspaceMode` only carries `Shared` and `Clone` today, so this
-/// mapper has no `Local` arm. The variant exists on the DTO side
-/// solely so the wire schema is forward-compat with M17-S2 (which
-/// lands `WorkspaceMode::Local` on the domain side).
+/// The DTO's `Local` variant landed in M17-S1 as a forward-compat
+/// scaffold; M17-S2 wires it to the domain `WorkspaceMode::Local`
+/// variant here.
 fn render_workspace_mode_detail(mode: &WorkspaceMode) -> WorkspaceModeDetailDto {
     match mode {
         WorkspaceMode::Shared {
@@ -299,6 +311,13 @@ fn render_workspace_mode_detail(mode: &WorkspaceMode) -> WorkspaceModeDetailDto 
         },
         WorkspaceMode::Clone { repo_url } => WorkspaceModeDetailDto::Clone {
             repo_url: repo_url.clone(),
+        },
+        WorkspaceMode::Local {
+            host_path,
+            guest_path,
+        } => WorkspaceModeDetailDto::Local {
+            host_path: host_path.clone(),
+            guest_path: guest_path.clone(),
         },
     }
 }
@@ -1119,6 +1138,84 @@ mod tests {
                 guest_path: "/srv/work".into(),
                 security_model: Some(WorkspaceSecurityModelDto::NoneMapping),
             }
+        );
+    }
+
+    #[test]
+    fn workspace_mode_detail_local_basic() {
+        // Default-shape `Local` (`guest_path == host_path`) projects
+        // through the mapper to a DTO that carries both paths verbatim.
+        let config = SessionConfig {
+            workspace_mode: Some(WorkspaceMode::Local {
+                host_path: "/home/olek/project".into(),
+                guest_path: "/home/olek/project".into(),
+            }),
+            ..base_session_config()
+        };
+        let dto: SessionConfigDto = (&config).into();
+        let detail = dto
+            .workspace_mode_detail
+            .expect("workspace_mode_detail populated for Local");
+        assert_eq!(
+            detail,
+            WorkspaceModeDetailDto::Local {
+                host_path: "/home/olek/project".into(),
+                guest_path: "/home/olek/project".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn workspace_mode_detail_local_explicit_guest_path() {
+        let config = SessionConfig {
+            workspace_mode: Some(WorkspaceMode::Local {
+                host_path: "/tmp/sbx-l".into(),
+                guest_path: "/srv/work".into(),
+            }),
+            ..base_session_config()
+        };
+        let dto: SessionConfigDto = (&config).into();
+        let detail = dto.workspace_mode_detail.unwrap();
+        assert_eq!(
+            detail,
+            WorkspaceModeDetailDto::Local {
+                host_path: "/tmp/sbx-l".into(),
+                guest_path: "/srv/work".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn render_workspace_mode_local_collapses_default_guest_path() {
+        // `guest_path == host_path` collapses to the compact
+        // `local:<host>` form, symmetric with `shared:<host>`.
+        let config = SessionConfig {
+            workspace_mode: Some(WorkspaceMode::Local {
+                host_path: "/home/olek/project".into(),
+                guest_path: "/home/olek/project".into(),
+            }),
+            ..base_session_config()
+        };
+        let dto: SessionConfigDto = (&config).into();
+        assert_eq!(
+            dto.workspace_mode.as_deref(),
+            Some("local:/home/olek/project")
+        );
+    }
+
+    #[test]
+    fn render_workspace_mode_local_emits_pair_when_guest_path_differs() {
+        let config = SessionConfig {
+            workspace_mode: Some(WorkspaceMode::Local {
+                host_path: "/tmp/sbx-l".into(),
+                guest_path: "/srv/work".into(),
+            }),
+            ..base_session_config()
+        };
+        let dto: SessionConfigDto = (&config).into();
+        assert_eq!(
+            dto.workspace_mode.as_deref(),
+            Some("local:/tmp/sbx-l:/srv/work")
         );
     }
 

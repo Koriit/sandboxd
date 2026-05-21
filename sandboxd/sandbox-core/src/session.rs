@@ -196,6 +196,26 @@ pub enum WorkspaceMode {
         /// Git repository URL.
         repo_url: String,
     },
+    /// One-shot host-snapshot sync: rsync `host_path` into `guest_path`
+    /// at session-create time. Unlike `Shared` there is no 9p device or
+    /// bind-mount — the guest sees ordinary local files refreshed only
+    /// when the operator explicitly invokes `sandbox workspace push` /
+    /// `pull`. See the M17 spec § `local:` Mode for the full lifecycle.
+    ///
+    /// `guest_path` defaults to the resolved `host_path` (per the
+    /// parser); the custom deserializer below recovers a missing or
+    /// empty `guest_path` symmetrically with `Shared` so a record
+    /// hand-edited to drop the field still loads.
+    Local {
+        /// Absolute path on the host whose contents are mirrored
+        /// into the guest at create time.
+        host_path: String,
+        /// Absolute path inside the guest at which the mirror lands.
+        /// Defaults to `host_path` when the operator does not supply
+        /// an explicit value.
+        #[serde(default)]
+        guest_path: String,
+    },
 }
 
 impl<'de> Deserialize<'de> for WorkspaceMode {
@@ -222,6 +242,11 @@ impl<'de> Deserialize<'de> for WorkspaceMode {
             Clone {
                 repo_url: String,
             },
+            Local {
+                host_path: String,
+                #[serde(default)]
+                guest_path: Option<String>,
+            },
         }
 
         match Wire::deserialize(deserializer)? {
@@ -241,6 +266,19 @@ impl<'de> Deserialize<'de> for WorkspaceMode {
                 })
             }
             Wire::Clone { repo_url } => Ok(WorkspaceMode::Clone { repo_url }),
+            Wire::Local {
+                host_path,
+                guest_path,
+            } => {
+                let guest_path = match guest_path {
+                    Some(g) if !g.is_empty() => g,
+                    _ => host_path.clone(),
+                };
+                Ok(WorkspaceMode::Local {
+                    host_path,
+                    guest_path,
+                })
+            }
         }
     }
 }
@@ -273,6 +311,13 @@ pub enum WorkspaceModeKind {
     Shared,
     /// Git clone into the VM/container; corresponds to [`WorkspaceMode::Clone`].
     Clone,
+    /// Host-snapshot rsync; corresponds to [`WorkspaceMode::Local`].
+    ///
+    /// Declared **after** `Clone` so the source-order-sensitive
+    /// renderers (`serialize_repr = "list"`,
+    /// `sandbox-cli::render_workspace_modes`) emit a stable
+    /// `["shared", "clone", "local"]` sequence.
+    Local,
 }
 
 /// Deserialize an `EnumSet<WorkspaceModeKind>` from a list of string
@@ -304,6 +349,9 @@ where
             "clone" => {
                 set |= WorkspaceModeKind::Clone;
             }
+            "local" => {
+                set |= WorkspaceModeKind::Local;
+            }
             _ => {
                 // Unknown variant on the wire — silently drop.
             }
@@ -321,6 +369,7 @@ impl WorkspaceMode {
         match self {
             Self::Shared { .. } => WorkspaceModeKind::Shared,
             Self::Clone { .. } => WorkspaceModeKind::Clone,
+            Self::Local { .. } => WorkspaceModeKind::Local,
         }
     }
 
@@ -363,8 +412,9 @@ impl WorkspaceMode {
         if input.is_empty() {
             return Err(format!(
                 "unknown workspace mode: {value:?}. Expected \
-                 'shared:<host-path>[:<guest-path>][:<security-model>]' or \
-                 'clone:<repo-url>'"
+                 'shared:<host-path>[:<guest-path>][:<security-model>]', \
+                 'clone:<repo-url>', or \
+                 'local:<host-path>[:<guest-path>]'"
             ));
         }
 
@@ -391,6 +441,7 @@ impl WorkspaceMode {
                     repo_url: rest.to_string(),
                 })
             }
+            "local" => parse_local(rest),
             _ => Err(format!(
                 "unknown workspace mode: {value:?}. Expected \
                  'shared:<host-path>[:<guest-path>][:<security-model>]' or \
@@ -438,6 +489,8 @@ fn parse_shared(rest: &str) -> Result<WorkspaceMode, String> {
     // Step A — strip a trailing security-model token. The closed enum
     // is { mapped-xattr, none }. The friendly-hint branch fires for the
     // deliberately-unexposed 9p models { passthrough, mapped-file }.
+    // Step A is exclusive to `shared:` — `local:` mode has no security
+    // model.
     let mut security_model: Option<WorkspaceSecurityModel> = None;
     if tokens.len() >= 2 {
         match tokens.last().map(String::as_str) {
@@ -461,6 +514,98 @@ fn parse_shared(rest: &str) -> Result<WorkspaceMode, String> {
         }
     }
 
+    let (host_path, guest_path) = parse_host_guest_pair_from_tokens(tokens, "shared")?;
+
+    Ok(WorkspaceMode::Shared {
+        host_path,
+        guest_path,
+        security_model,
+    })
+}
+
+/// Parse the payload of `local:<rest>` per the grammar in
+/// [`WorkspaceMode::parse_flag`].
+///
+/// Shares the right-to-left token classifier with `parse_shared` via
+/// [`parse_host_guest_pair`]; the `local:` mode does not accept a
+/// security-model token (the corresponding step A in `parse_shared`
+/// is skipped here). After the classifier resolves the host/guest
+/// pair, the spec's SF-11 directory-required check rejects single-file
+/// or missing host paths with a pointer at `sandbox cp`.
+fn parse_local(rest: &str) -> Result<WorkspaceMode, String> {
+    let (host_path, guest_path) = parse_host_guest_pair(rest, "local")?;
+
+    // SF-11 — `local:`-only directory-required check. A regular-file
+    // `host_path` (or any other non-directory) is rejected with the
+    // explicit pointer at `sandbox cp`. The check is intentionally
+    // `unwrap_or(false)`: any metadata failure (ENOENT, EACCES, …)
+    // resolves to "not a directory" so the operator sees the same
+    // crisp error regardless of the underlying syscall failure.
+    let is_dir = std::fs::metadata(&host_path)
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+    if !is_dir {
+        return Err(format!(
+            "host_path must be a directory for `local:`; to seed a single file, \
+             use `sandbox cp <file> <session>:<path>` after creating the session. \
+             (Got: {host_path:?})"
+        ));
+    }
+
+    Ok(WorkspaceMode::Local {
+        host_path,
+        guest_path,
+    })
+}
+
+/// Tokenise `rest` and run the right-to-left host/guest classifier
+/// (spec steps B/C/D) shared between `parse_shared` and `parse_local`.
+///
+/// `mode_label` is the user-facing prefix used in error messages
+/// (`"shared"` or `"local"`).
+///
+/// Step A (security-model strip) is exclusive to `parse_shared` and
+/// runs on the caller's side before delegating to
+/// [`parse_host_guest_pair_from_tokens`]. `parse_local` has no
+/// security-model concept, so it calls this entry point which performs
+/// tokenisation, empty-token rejection, and the same 1..=2 cap from the
+/// spec's grammar (`local:<host>[:<guest>]`).
+fn parse_host_guest_pair(rest: &str, mode_label: &str) -> Result<(String, String), String> {
+    if rest.is_empty() {
+        return Err(format!(
+            "{mode_label} workspace requires a host path: {mode_label}:<host-path>[:<guest-path>]"
+        ));
+    }
+
+    let tokens: Vec<&str> = rest.split(':').collect();
+    if tokens.iter().any(|t| t.is_empty()) {
+        return Err(format!(
+            "{mode_label} workspace contains an empty token: {rest:?}"
+        ));
+    }
+    if tokens.len() > 2 {
+        return Err(format!(
+            "{mode_label} workspace expects at most 2 tokens (host, guest), got {n}: {rest:?}",
+            n = tokens.len()
+        ));
+    }
+
+    let tokens: Vec<String> = tokens.into_iter().map(str::to_string).collect();
+    parse_host_guest_pair_from_tokens(tokens, mode_label)
+}
+
+/// Apply spec steps B/C/D to an already-tokenised `tokens` vector that
+/// has had any security-model trailing token popped off by the caller.
+///
+/// `mode_label` is the user-facing prefix used in error messages
+/// (`"shared"` or `"local"`). Returns the resolved `(host_path,
+/// guest_path)` pair after `~` expansion (guest side), trailing-slash
+/// normalisation, absolute-path enforcement, and the host-path-exists
+/// check.
+fn parse_host_guest_pair_from_tokens(
+    mut tokens: Vec<String>,
+    mode_label: &str,
+) -> Result<(String, String), String> {
     // Step B — strip a trailing guest-path token. The classifier accepts
     // tokens that start with `/` (absolute) or `~` (literal `/home/agent`
     // substitution per the spec).
@@ -498,7 +643,7 @@ fn parse_shared(rest: &str) -> Result<WorkspaceMode, String> {
     }
     if !Path::new(&host_path).is_absolute() {
         return Err(format!(
-            "shared workspace host_path must be absolute, got: {host_path:?}"
+            "{mode_label} workspace host_path must be absolute, got: {host_path:?}"
         ));
     }
 
@@ -512,7 +657,7 @@ fn parse_shared(rest: &str) -> Result<WorkspaceMode, String> {
             let normalized = strip_trailing_slashes(&expanded);
             if !Path::new(&normalized).is_absolute() {
                 return Err(format!(
-                    "shared workspace guest_path must be absolute, got: {normalized:?}"
+                    "{mode_label} workspace guest_path must be absolute, got: {normalized:?}"
                 ));
             }
             normalized
@@ -529,15 +674,11 @@ fn parse_shared(rest: &str) -> Result<WorkspaceMode, String> {
     // error verbatim).
     if !Path::new(&host_path).exists() {
         return Err(format!(
-            "shared workspace host_path does not exist: {host_path:?}"
+            "{mode_label} workspace host_path does not exist: {host_path:?}"
         ));
     }
 
-    Ok(WorkspaceMode::Shared {
-        host_path,
-        guest_path,
-        security_model,
-    })
+    Ok((host_path, guest_path))
 }
 
 /// Strip a single trailing `/` (or any run of trailing slashes) from a
@@ -1622,11 +1763,11 @@ mod tests {
 
     #[test]
     fn workspace_mode_kind_set_drops_unknown_variants_on_deserialize() {
-        // An older CLI built against `{Shared, Clone}` may receive a
-        // newer daemon's capability response that contains additional
-        // variants (e.g. `"local"`). The unknown variant must be
-        // silently dropped — the set parses to `{Shared, Clone}` plus
-        // any other valid variants present.
+        // An older CLI built against `{Shared, Clone, Local}` may
+        // receive a newer daemon's capability response that contains
+        // additional variants (e.g. a future `"sftp"` mode). The
+        // unknown variant must be silently dropped — the set parses
+        // to the known variants only.
         #[derive(Deserialize)]
         struct Wrapper {
             #[serde(deserialize_with = "deserialize_workspace_mode_kind_set")]
@@ -1637,7 +1778,8 @@ mod tests {
         let w: Wrapper = serde_json::from_str(json).unwrap();
         assert!(w.kinds.contains(WorkspaceModeKind::Shared));
         assert!(w.kinds.contains(WorkspaceModeKind::Clone));
-        assert_eq!(w.kinds.len(), 2);
+        assert!(w.kinds.contains(WorkspaceModeKind::Local));
+        assert_eq!(w.kinds.len(), 3);
     }
 
     #[test]
@@ -1661,7 +1803,7 @@ mod tests {
             kinds: enumset::EnumSet<WorkspaceModeKind>,
         }
 
-        let json = r#"{"kinds":["local","foobar"]}"#;
+        let json = r#"{"kinds":["sftp","foobar"]}"#;
         let w: Wrapper = serde_json::from_str(json).unwrap();
         assert!(w.kinds.is_empty());
     }
@@ -1687,6 +1829,227 @@ mod tests {
             repo_url: "x".into(),
         };
         assert_eq!(m.kind(), WorkspaceModeKind::Clone);
+        let m = WorkspaceMode::Local {
+            host_path: "/tmp".into(),
+            guest_path: "/tmp".into(),
+        };
+        assert_eq!(m.kind(), WorkspaceModeKind::Local);
+    }
+
+    // -----------------------------------------------------------------
+    // `local:` parser + serde — M17-S2
+    // -----------------------------------------------------------------
+
+    /// Helper: assemble the canonical `Local` payload for a parser
+    /// expected-value assertion.
+    fn local(host: &str, guest: &str) -> WorkspaceMode {
+        WorkspaceMode::Local {
+            host_path: host.into(),
+            guest_path: guest.into(),
+        }
+    }
+
+    // -- Parser positive cases (`local:`) ----------------------------------
+
+    #[test]
+    fn parse_flag_local_host_only_defaults_guest_to_host() {
+        // Spec § Parser-unit-test matrix: `local:/srv/repo` →
+        // `host=/srv/repo, guest=/srv/repo`. `/tmp` is guaranteed to
+        // exist and be a directory on every host the test runs on.
+        let mode = WorkspaceMode::parse_flag("local:/tmp").unwrap();
+        assert_eq!(mode, local("/tmp", "/tmp"));
+    }
+
+    #[test]
+    fn parse_flag_local_with_explicit_guest_path() {
+        // Spec § Parser-unit-test matrix:
+        // `local:/srv/repo:/srv/dest` → `host=/srv/repo, guest=/srv/dest`.
+        let mode = WorkspaceMode::parse_flag("local:/tmp:/srv/work").unwrap();
+        assert_eq!(mode, local("/tmp", "/srv/work"));
+    }
+
+    #[test]
+    fn parse_flag_local_with_guest_tilde_expands_to_home_agent() {
+        // Guest-side `~` is the same environment-free substitution as
+        // for `shared:` — the parser arm shares the classifier.
+        let mode = WorkspaceMode::parse_flag("local:/tmp:~/work").unwrap();
+        assert_eq!(mode, local("/tmp", "/home/agent/work"));
+    }
+
+    #[test]
+    fn parse_flag_local_strips_trailing_slash_on_host_path() {
+        let mode = WorkspaceMode::parse_flag("local:/tmp/").unwrap();
+        assert_eq!(mode, local("/tmp", "/tmp"));
+    }
+
+    #[test]
+    fn parse_flag_local_strips_trailing_slash_on_guest_path() {
+        let mode = WorkspaceMode::parse_flag("local:/tmp:/srv/work/").unwrap();
+        assert_eq!(mode, local("/tmp", "/srv/work"));
+    }
+
+    #[test]
+    fn parse_flag_local_strips_leading_and_trailing_whitespace() {
+        let mode = WorkspaceMode::parse_flag("  local:/tmp  ").unwrap();
+        assert_eq!(mode, local("/tmp", "/tmp"));
+    }
+
+    // -- Parser negative cases (`local:`) ----------------------------------
+
+    #[test]
+    fn parse_flag_local_security_model_suffix_is_folded_into_host() {
+        // Spec § Parser-unit-test matrix:
+        // `local:/srv/repo:none` → no `:none` security-model strip
+        // (mode is `local`, not `shared`); step C folds the trailing
+        // `:none` into `host_path=/srv/repo:none`; host-path-exists
+        // check rejects.
+        let err = WorkspaceMode::parse_flag("local:/srv/repo:none").unwrap_err();
+        assert!(err.contains("does not exist"), "err = {err}");
+    }
+
+    #[test]
+    fn parse_flag_local_unclassified_trailing_token_folds_into_host() {
+        // Spec § Parser-unit-test matrix:
+        // `local:/srv/repo:bogus` → tokens [/srv/repo, bogus]; step B
+        // skips (no `/` or `~` prefix); step C folds into
+        // `host_path=/srv/repo:bogus`; host-path-exists rejects.
+        let err = WorkspaceMode::parse_flag("local:/srv/repo:bogus").unwrap_err();
+        assert!(err.contains("does not exist"), "err = {err}");
+    }
+
+    #[test]
+    fn parse_flag_local_relative_host_path_errors() {
+        // `local:proj` — relative path, rejected with "must be absolute".
+        let err = WorkspaceMode::parse_flag("local:proj").unwrap_err();
+        assert!(err.contains("must be absolute"), "err = {err}");
+    }
+
+    #[test]
+    fn parse_flag_local_empty_payload_errors() {
+        // `local:` — empty rest after the mode prefix.
+        let err = WorkspaceMode::parse_flag("local:").unwrap_err();
+        assert!(
+            err.contains("requires a host path") || err.contains("empty"),
+            "err = {err}"
+        );
+    }
+
+    #[test]
+    fn parse_flag_local_empty_token_errors() {
+        // `local:/srv::/dst` — empty middle token, rejected.
+        let err = WorkspaceMode::parse_flag("local:/srv::/dst").unwrap_err();
+        assert!(err.contains("empty"), "err = {err}");
+    }
+
+    #[test]
+    fn parse_flag_local_too_many_tokens_errors() {
+        // `local:` accepts at most 2 tokens (host, guest). The third
+        // token is not a security-model slot for `local:`, so the
+        // parser rejects rather than silently dropping.
+        let err = WorkspaceMode::parse_flag("local:/a:/b:/c").unwrap_err();
+        assert!(
+            err.contains("at most 2 tokens") || err.contains("empty"),
+            "err = {err}"
+        );
+    }
+
+    #[test]
+    fn parse_flag_local_unresolved_tilde_in_host_errors() {
+        // Same Q4-style contract as `shared:` — daemon-side host-`~` is
+        // a CLI-bypass bug.
+        let err = WorkspaceMode::parse_flag("local:~/proj").unwrap_err();
+        assert!(
+            err.contains("CLI should have expanded `~` before sending"),
+            "err = {err}"
+        );
+    }
+
+    #[test]
+    fn parse_flag_local_nonexistent_host_path_errors() {
+        let err = WorkspaceMode::parse_flag("local:/nonexistent/path/xyzzy").unwrap_err();
+        assert!(err.contains("does not exist"), "err = {err}");
+    }
+
+    /// SF-11 — `local:` requires `host_path` to be a directory. A
+    /// regular-file `host_path` is rejected with the explicit pointer
+    /// at `sandbox cp`.
+    #[test]
+    fn parse_flag_local_regular_file_host_path_errors() {
+        // Build a tempfile under a unique-per-test path so we don't
+        // race with other tests on the same host.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "sandbox-local-host-file-{}.tmp",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"single-file payload").expect("write temp file");
+        let path_str = path.to_string_lossy().to_string();
+
+        let input = format!("local:{path_str}");
+        let err = WorkspaceMode::parse_flag(&input).unwrap_err();
+        // The error must name the spec's `sandbox cp` recovery and
+        // require directory-ness explicitly.
+        assert!(
+            err.contains("must be a directory for `local:`"),
+            "err = {err}"
+        );
+        assert!(
+            err.contains("sandbox cp"),
+            "err must point at `sandbox cp` for single-file seeding: {err}"
+        );
+
+        // Cleanup; failure is non-fatal (temp dir is reaped anyway).
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parse_flag_local_nonexistent_path_rejected_before_directory_check() {
+        // A path that does not exist is rejected by the host-path-exists
+        // check in step D (shared with the `shared:` parser) — the
+        // SF-11 directory check fires only on existing non-directory
+        // paths. The user-facing error is "does not exist" rather than
+        // the directory-required hint.
+        let err = WorkspaceMode::parse_flag("local:/definitely/not/a/real/path").unwrap_err();
+        assert!(err.contains("does not exist"), "err = {err}");
+    }
+
+    // -- Serde round-trip + legacy-record recovery (`Local`) ---------------
+
+    #[test]
+    fn workspace_mode_round_trip_local_default_guest_path() {
+        let mode = local("/srv/repo", "/srv/repo");
+        let json = serde_json::to_string(&mode).unwrap();
+        let deser: WorkspaceMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser, mode);
+    }
+
+    #[test]
+    fn workspace_mode_round_trip_local_explicit_guest_path() {
+        let mode = local("/srv/repo", "/srv/dest");
+        let json = serde_json::to_string(&mode).unwrap();
+        let deser: WorkspaceMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser, mode);
+    }
+
+    #[test]
+    fn workspace_mode_local_blob_without_guest_path_recovers_to_host_path() {
+        // Symmetric with the `Shared` legacy-record recovery: a Local
+        // record written without `guest_path` (e.g. by a hand-edited
+        // record, or a future client that emits the compact form)
+        // recovers `guest_path = host_path` via the custom
+        // deserializer shim.
+        let json = r#"{"type":"local","host_path":"/srv/repo"}"#;
+        let mode: WorkspaceMode = serde_json::from_str(json).unwrap();
+        assert_eq!(mode, local("/srv/repo", "/srv/repo"));
+    }
+
+    #[test]
+    fn workspace_mode_local_blob_with_empty_guest_path_recovers_to_host_path() {
+        // Defensive arm: hand-edited records with an empty-string
+        // `guest_path` are treated the same as missing.
+        let json = r#"{"type":"local","host_path":"/srv/repo","guest_path":""}"#;
+        let mode: WorkspaceMode = serde_json::from_str(json).unwrap();
+        assert_eq!(mode, local("/srv/repo", "/srv/repo"));
     }
 
     // -----------------------------------------------------------------

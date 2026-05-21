@@ -1652,6 +1652,7 @@ mod tests {
         );
         assert!(caps.workspace_modes.contains(WorkspaceModeKind::Shared));
         assert!(caps.workspace_modes.contains(WorkspaceModeKind::Clone));
+        assert!(caps.workspace_modes.contains(WorkspaceModeKind::Local));
     }
 
     /// Round-trip the `register_session` / `lookup_session` /

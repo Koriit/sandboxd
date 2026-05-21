@@ -1474,7 +1474,15 @@ mounts:
     cache: mmap"
                 )
             }
-            _ => "mounts: []".to_string(),
+            // `Local` is an explicit-sync host snapshot — the daemon
+            // populates `guest_path` via rsync after the VM reaches
+            // Running, with no 9p device involved. Emit no `mounts:`
+            // block so the Lima fast-path cache stays eligible.
+            Some(WorkspaceMode::Local { .. }) => "mounts: []".to_string(),
+            // `Clone` performs an in-guest `git clone` after boot — no
+            // mount surface needed.
+            Some(WorkspaceMode::Clone { .. }) => "mounts: []".to_string(),
+            None => "mounts: []".to_string(),
         };
 
         // When hardened, tell Lima to disable video and audio devices.  Lima
@@ -2501,6 +2509,58 @@ mod tests {
         assert!(
             template.contains("mtu: 1280"),
             "template should clamp eth0 MTU to 1280 (libslirp PMTU workaround)"
+        );
+    }
+
+    /// `local:` is an explicit-sync host snapshot — the daemon
+    /// orchestrates an initial rsync push after boot. The Lima
+    /// template MUST emit no 9p mount block so the fast-path cache
+    /// stays eligible (a 9p block would invalidate the cache key).
+    #[test]
+    fn test_generate_template_local_workspace_no_mount() {
+        let mgr = LimaManager::with_limactl_path(
+            PathBuf::from("/tmp/test"),
+            PathBuf::from("limactl"),
+            DEFAULT_BASE_VM_NAME.to_string(),
+        );
+        let id = SessionId::generate();
+        let config = SessionConfig {
+            cpus: 1,
+            memory_mb: 1024,
+            disk_gb: 10,
+            workspace_mode: Some(WorkspaceMode::Local {
+                host_path: "/tmp/sbx-local-host".into(),
+                guest_path: "/srv/work".into(),
+            }),
+            hardened: true,
+            repo: None,
+            boot_cmd: None,
+            template: None,
+            cpus_decimal: None,
+            rootless_docker: None,
+        };
+
+        let template = mgr.generate_template(&id, &config);
+
+        assert!(
+            template.contains("mounts: []"),
+            "local workspace should not produce mounts (no 9p, no bind), got:\n{template}"
+        );
+        assert!(
+            !template.contains("9p:"),
+            "local workspace must not reference 9p mount config, got:\n{template}"
+        );
+        // The host path must not appear anywhere in the template —
+        // the daemon-side rsync wields it separately; baking it into
+        // the YAML would expose host-path-shaped data to the cached
+        // VM image.
+        assert!(
+            !template.contains("/tmp/sbx-local-host"),
+            "host_path must not leak into the Lima template for local: mode, got:\n{template}"
+        );
+        assert!(
+            !template.contains("/srv/work"),
+            "guest_path must not leak into the Lima template for local: mode, got:\n{template}"
         );
     }
 

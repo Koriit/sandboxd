@@ -731,6 +731,7 @@ mod tests {
         );
         assert!(caps.workspace_modes.contains(WorkspaceModeKind::Shared));
         assert!(caps.workspace_modes.contains(WorkspaceModeKind::Clone));
+        assert!(caps.workspace_modes.contains(WorkspaceModeKind::Local));
     }
 
     /// Golden test for `Capabilities::for_lima()` — pins each field

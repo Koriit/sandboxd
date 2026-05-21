@@ -138,6 +138,21 @@ pub struct CreateSessionRequest {
     /// When `true`, the daemon always creates a fresh VM from scratch
     /// instead of cloning from the base image.
     pub no_cache: Option<bool>,
+    /// Skip the `.gitignore` filter on the create-time initial-push
+    /// rsync for `local:` workspaces. Meaningful only when `workspace`
+    /// resolves to a `local:` mode; the daemon rejects the combination
+    /// with any other workspace mode at request-parse time.
+    ///
+    /// Request-only DTO field; not persisted to the session record
+    /// (the operator's create-time choice does not propagate to
+    /// subsequent `sandbox workspace push` / `pull` invocations — those
+    /// carry their own `--no-gitignore` flag).
+    ///
+    /// `Option<bool>` + `#[serde(default)]` so older CLIs that omit
+    /// the field deserialise to `None`; the daemon treats `None` and
+    /// `Some(false)` identically (don't skip the filter).
+    #[serde(default)]
+    pub no_gitignore: Option<bool>,
     /// Original `--preset` invocation strings forwarded by the CLI.
     ///
     /// Populated by the CLI when presets expanded into the policy
@@ -261,6 +276,10 @@ mod tests {
         assert!(req.hardened.is_none());
         assert!(req.no_cache.is_none());
         assert!(
+            req.no_gitignore.is_none(),
+            "no_gitignore must default to None so older CLIs that omit the field round-trip as 'don't skip the filter'"
+        );
+        assert!(
             req.source_presets.is_empty(),
             "source_presets must default to empty on an empty request object"
         );
@@ -272,6 +291,42 @@ mod tests {
             !req.force_rootless_docker,
             "force_rootless_docker must default to false so a fresh opt-in is required per invocation"
         );
+    }
+
+    /// Older CLIs that omit `no_gitignore` decode to `None` (the
+    /// daemon treats this as "don't skip the filter"). Pinned so an
+    /// older-CLI → newer-daemon path keeps deserialising cleanly.
+    #[test]
+    fn deserialize_no_gitignore_absent_defaults_none() {
+        let req: CreateSessionRequest =
+            serde_json::from_str(r#"{"workspace": "local:/tmp/proj"}"#).unwrap();
+        assert!(
+            req.no_gitignore.is_none(),
+            "absent no_gitignore must round-trip as None for older CLIs"
+        );
+    }
+
+    /// Newer CLIs that send `no_gitignore: true` round-trip as
+    /// `Some(true)` so the daemon can consume the value for the
+    /// create-time push.
+    #[test]
+    fn deserialize_no_gitignore_true() {
+        let req: CreateSessionRequest =
+            serde_json::from_str(r#"{"workspace": "local:/tmp/proj", "no_gitignore": true}"#)
+                .unwrap();
+        assert_eq!(req.no_gitignore, Some(true));
+    }
+
+    /// `no_gitignore: false` is an explicit operator choice (or an
+    /// older daemon's serialiser) that round-trips as `Some(false)`.
+    /// The daemon collapses `None` and `Some(false)` to the same
+    /// "don't skip" path at consumption time.
+    #[test]
+    fn deserialize_no_gitignore_false() {
+        let req: CreateSessionRequest =
+            serde_json::from_str(r#"{"workspace": "local:/tmp/proj", "no_gitignore": false}"#)
+                .unwrap();
+        assert_eq!(req.no_gitignore, Some(false));
     }
 
     /// Older CLIs that never send `force_rootless_docker` decode to

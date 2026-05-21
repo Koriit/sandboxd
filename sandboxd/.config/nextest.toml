@@ -136,6 +136,8 @@ filter = '''
   | binary(integration_session_create_refused_on_missing_gateway_image)
   | binary(integration_users_conf_startup)
   | binary(integration_version_endpoint)
+  | binary(integration_local_workspace)
+  | binary(integration_shared_guest_path)
 '''
 test-group = 'docker-sandbox-namespace'
 

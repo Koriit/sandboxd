@@ -28,6 +28,7 @@ pub mod store;
 pub mod test_support;
 pub mod users_conf;
 pub mod vm_network;
+pub mod workspace_rsync;
 
 pub use api::{
     CreateSessionRequest, DecisionKind, DenyLoggerEventBodyDto, DenyLoggerEventDto,

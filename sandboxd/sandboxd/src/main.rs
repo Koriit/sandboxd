@@ -1245,6 +1245,44 @@ fn compute_initial_dns_policy(req: &CreateSessionRequest) -> String {
     }
 }
 
+/// Daemon-side gate for `CreateSessionRequest.no_gitignore`: only
+/// meaningful when the parsed workspace mode is `local:`. Returns
+/// `Ok(())` when the combination is valid (no flag, or flag + `local:`)
+/// and the operator-facing rejection string otherwise.
+///
+/// Extracted as a pure function so the gate can be unit-tested without
+/// driving the full `create_session` handler (no `AppState`, no HTTP
+/// machinery). The wording is pinned by the M17 workspace-ergonomics
+/// spec § `--no-gitignore` on `sandbox create`:
+///
+/// > `--no-gitignore is only meaningful for local: workspaces; this session uses <mode>:`
+///
+/// where `<mode>` is `shared`, `clone`, or the literal `<empty>` when
+/// no workspace mode is set. The CLI's
+/// `validate_no_gitignore_for_workspace` mirrors this verbatim so a
+/// hand-rolled HTTP client (bypassing the CLI gate) surfaces the same
+/// diagnostic. Both sides own the literal text rather than a shared
+/// constant because `sandbox-core` does not carry a human-readable
+/// error catalog today; adding one for a single message would
+/// over-index for this scope.
+fn validate_no_gitignore_against_workspace(
+    no_gitignore: bool,
+    workspace_mode: Option<&sandbox_core::WorkspaceMode>,
+) -> Result<(), String> {
+    if !no_gitignore {
+        return Ok(());
+    }
+    let mode_token = match workspace_mode {
+        Some(sandbox_core::WorkspaceMode::Local { .. }) => return Ok(()),
+        Some(sandbox_core::WorkspaceMode::Shared { .. }) => "shared",
+        Some(sandbox_core::WorkspaceMode::Clone { .. }) => "clone",
+        None => "<empty>",
+    };
+    Err(format!(
+        "--no-gitignore is only meaningful for local: workspaces; this session uses {mode_token}:"
+    ))
+}
+
 async fn create_session(
     State(state): State<Arc<AppState>>,
     Extension(operator): Extension<OperatorIdentity>,
@@ -1303,6 +1341,27 @@ async fn create_session(
                 repo_url: repo_url.clone(),
             })
     };
+
+    // `--no-gitignore` is only meaningful for `local:` workspaces. The
+    // CLI mirrors this gate client-side for fail-fast operator
+    // feedback, but the daemon's check is the authoritative one — a
+    // hand-rolled HTTP client that bypasses the CLI surfaces the same
+    // diagnostic. Run BEFORE any network / CA / runtime setup so the
+    // rejection never burns a session id, network allocation, or
+    // gateway container. Plain `error_response(...).into_response()`
+    // — no `cleanup_net_ca_and_return!` needed because no state has
+    // been allocated yet.
+    //
+    // Plumbed into a local for Phase 3's rsync orchestration block,
+    // which will consume the bool when it constructs the
+    // initial-push argv. Phase 2 just lands the wire field and the
+    // rejection gate; the consumer is added later.
+    let no_gitignore_initial_push = req.no_gitignore.unwrap_or(false);
+    if let Err(msg) =
+        validate_no_gitignore_against_workspace(no_gitignore_initial_push, workspace_mode.as_ref())
+    {
+        return error_response(SandboxError::InvalidArgument(msg)).into_response();
+    }
 
     // Which backend hosts this session. Default to Lima for back-compat
     // with older CLIs that omit the field. The chosen kind is then
@@ -1611,11 +1670,22 @@ async fn create_session(
     //
     // Shared workspace (9p mount) requires the slow path because the
     // clone doesn't carry mount configuration from the session template.
-    let has_shared_mount = matches!(
+    //
+    // `local:` mode (`WorkspaceMode::Local`) deliberately does NOT add a
+    // 9p mount to the Lima template — the host workspace is mirrored
+    // into the guest by a daemon-side rsync after the VM reaches
+    // `Running` (see `workspace_rsync::run_initial_push` below). The
+    // cached golden image therefore stays valid for `local:` sessions,
+    // and the fast-path clone is still eligible. The predicate's name
+    // documents that intent: only modes that *require* a per-session
+    // template render disqualify the cache hit.
+    let workspace_requires_template_render = matches!(
         &config.workspace_mode,
         Some(sandbox_core::WorkspaceMode::Shared { .. })
     );
-    let use_cache = !req.no_cache.unwrap_or(false) && req.template.is_none() && !has_shared_mount;
+    let use_cache = !req.no_cache.unwrap_or(false)
+        && req.template.is_none()
+        && !workspace_requires_template_render;
 
     // Helper closure: cleanup VM + network + CA on failure, set state to Error.
     // This macro avoids repeating the cleanup pattern in every error branch.
@@ -2061,6 +2131,38 @@ async fn create_session(
                         error = %e,
                         "failed to apply explicit initial policy on lite session — failing create"
                     );
+                    cleanup_lite_gateway_and_return!(error_response(e).into_response());
+                }
+            }
+        }
+
+        // `local:` workspace — host→guest rsync push after policy apply,
+        // before repo clone. Mirrors the Lima branch's `local:` block at
+        // the bottom of this handler. The container branch uses
+        // `cleanup_lite_gateway_and_return!` (not `cleanup_and_return!`)
+        // for failure-path teardown — same as the policy-apply and
+        // guest-ping rejections sandboxed in this branch.
+        if let Some(sandbox_core::WorkspaceMode::Local {
+            host_path,
+            guest_path,
+        }) = &config.workspace_mode
+        {
+            let session_name = format!("sandbox-{session_id}");
+            match sandbox_core::workspace_rsync::run_initial_push(
+                backend_kind,
+                &session_name,
+                host_path,
+                guest_path,
+                no_gitignore_initial_push,
+            )
+            .await
+            {
+                Ok(()) => {
+                    info!(%session_id, host_path = %host_path, guest_path = %guest_path,
+                        "local-workspace initial push complete (lite)");
+                }
+                Err(e) => {
+                    error!(%session_id, error = %e, "local-workspace rsync failed (lite)");
                     cleanup_lite_gateway_and_return!(error_response(e).into_response());
                 }
             }
@@ -2625,6 +2727,51 @@ async fn create_session(
         }
     }
 
+    // `local:` workspace: mirror the host directory into the guest now
+    // that the VM/container is Running and (if requested) the initial
+    // policy has been applied. Runs before the repo clone so a session
+    // that combines `--workspace local:<host>` with `--repo <url>`
+    // first seeds the host snapshot, then layers the repo clone on top
+    // (matching the precedence operators expect from the CLI argument
+    // order: workspace contents are the substrate, repo is an overlay).
+    //
+    // Spec § Cancellation and timeout: any non-zero exit collapses to
+    // `SandboxError::Internal` with rsync's stderr embedded; the
+    // `cleanup_and_return!` macro tears the VM/container, network, and
+    // CA state down so the session row is removed from the store and
+    // the operator does not see a half-seeded `Running` session. The
+    // macro is in scope from its definition above (line ~1693).
+    if let Some(sandbox_core::WorkspaceMode::Local {
+        host_path,
+        guest_path,
+    }) = &config.workspace_mode
+    {
+        // Session-name convention: matches `plan_sync_command`'s
+        // `sandbox-<id>` form used by `sandbox sync`, so the shell-
+        // transport target (`limactl shell sandbox-<id>` /
+        // `docker exec sandbox-<id>`) resolves the same way for both
+        // create-time push and operator-driven push/pull.
+        let session_name = format!("sandbox-{session_id}");
+        match sandbox_core::workspace_rsync::run_initial_push(
+            backend_kind,
+            &session_name,
+            host_path,
+            guest_path,
+            no_gitignore_initial_push,
+        )
+        .await
+        {
+            Ok(()) => {
+                info!(%session_id, host_path = %host_path, guest_path = %guest_path,
+                    "local-workspace initial push complete");
+            }
+            Err(e) => {
+                error!(%session_id, error = %e, "local-workspace rsync failed");
+                cleanup_and_return!(state, session_id, error_response(e).into_response());
+            }
+        }
+    }
+
     // If a repo URL was provided, clone it into /home/agent/workspace/.
     if let Some(repo_url) = &req.repo {
         // Pre-warm DNS for the repo host so the DNS propagation loop
@@ -3122,6 +3269,12 @@ fn session_mount_info_for(session: &Session) -> SessionMountInfo {
             ..
         }) => (guest_path.clone(), Some(host_path.clone())),
         Some(sandbox_core::WorkspaceMode::Clone { .. }) => (CLONE_WORKSPACE_PATH.to_string(), None),
+        // `Local` is a host-snapshot rsync: the wire field surfaces the
+        // operator's resolved `guest_path` (where the daemon-side rsync
+        // landed the snapshot inside the guest). `workspace_host_path`
+        // stays `None` — there is no bind-mount, the host path is only
+        // a one-shot source.
+        Some(sandbox_core::WorkspaceMode::Local { guest_path, .. }) => (guest_path.clone(), None),
         None => (CLONE_WORKSPACE_PATH.to_string(), None),
     };
     // Re-add the trailing `/` that the pre-M17 hardcoded constant
@@ -7684,6 +7837,100 @@ mod tests {
                  got {normalised} for input {cpus}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_no_gitignore_against_workspace — request-shape validation.
+    //
+    // Pure predicate; we drive every accept/reject branch directly so
+    // the rejection-message wording is pinned without driving the full
+    // `create_session` handler. The wording matches the M17 spec §
+    // `--no-gitignore` on `sandbox create` and is mirrored on the CLI
+    // side (`validate_no_gitignore_for_workspace`) — both sites carry
+    // the literal string because there is no shared error catalog in
+    // `sandbox-core` today.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_no_gitignore_accepts_flag_with_local_workspace() {
+        let mode = sandbox_core::WorkspaceMode::Local {
+            host_path: "/tmp/proj".into(),
+            guest_path: "/tmp/proj".into(),
+        };
+        assert_eq!(
+            validate_no_gitignore_against_workspace(true, Some(&mode)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn validate_no_gitignore_accepts_absent_flag_regardless_of_mode() {
+        // Flag off → predicate is a no-op for every mode (including
+        // None) — pins that the gate never fires unless the operator
+        // explicitly passed `--no-gitignore`.
+        let shared = sandbox_core::WorkspaceMode::Shared {
+            host_path: "/tmp/x".into(),
+            guest_path: "/tmp/x".into(),
+            security_model: None,
+        };
+        let clone = sandbox_core::WorkspaceMode::Clone {
+            repo_url: "https://example.invalid/repo.git".into(),
+        };
+        let local = sandbox_core::WorkspaceMode::Local {
+            host_path: "/tmp/y".into(),
+            guest_path: "/tmp/y".into(),
+        };
+        assert_eq!(validate_no_gitignore_against_workspace(false, None), Ok(()));
+        assert_eq!(
+            validate_no_gitignore_against_workspace(false, Some(&shared)),
+            Ok(())
+        );
+        assert_eq!(
+            validate_no_gitignore_against_workspace(false, Some(&clone)),
+            Ok(())
+        );
+        assert_eq!(
+            validate_no_gitignore_against_workspace(false, Some(&local)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn validate_no_gitignore_rejects_flag_with_shared_workspace() {
+        let mode = sandbox_core::WorkspaceMode::Shared {
+            host_path: "/tmp/proj".into(),
+            guest_path: "/tmp/proj".into(),
+            security_model: None,
+        };
+        let err = validate_no_gitignore_against_workspace(true, Some(&mode))
+            .expect_err("flag + shared: must reject");
+        assert_eq!(
+            err,
+            "--no-gitignore is only meaningful for local: workspaces; this session uses shared:"
+        );
+    }
+
+    #[test]
+    fn validate_no_gitignore_rejects_flag_with_clone_workspace() {
+        let mode = sandbox_core::WorkspaceMode::Clone {
+            repo_url: "https://example.invalid/repo.git".into(),
+        };
+        let err = validate_no_gitignore_against_workspace(true, Some(&mode))
+            .expect_err("flag + clone: must reject");
+        assert_eq!(
+            err,
+            "--no-gitignore is only meaningful for local: workspaces; this session uses clone:"
+        );
+    }
+
+    #[test]
+    fn validate_no_gitignore_rejects_flag_without_workspace() {
+        let err = validate_no_gitignore_against_workspace(true, None)
+            .expect_err("flag + absent workspace must reject");
+        assert_eq!(
+            err,
+            "--no-gitignore is only meaningful for local: workspaces; this session uses <empty>:"
+        );
     }
 
     // -----------------------------------------------------------------------

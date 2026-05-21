@@ -456,6 +456,7 @@ pub fn render_feature_mismatch(
             let kind_str = match kind {
                 WorkspaceModeKind::Shared => "shared",
                 WorkspaceModeKind::Clone => "clone",
+                WorkspaceModeKind::Local => "local",
             };
             let backend_flag = if ctx.lite_flag_used {
                 "`--lite`"
