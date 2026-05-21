@@ -196,12 +196,62 @@ unchanged.
 
 `--no-gitignore` is a top-level flag on `sandbox create` (not part of
 the `--workspace` value). It is meaningful only when `--workspace`
-resolves to `local:`; combined with `shared:` or `--repo` the daemon
-returns `InvalidConfig` naming `--no-gitignore`. The flag drops the
-`--filter=':- .gitignore'` rule from the initial-push rsync invocation
-(see § `local:` Mode). Not persisted to the session record — it
-governs the create-time push only; subsequent `sandbox workspace push`
-/ `pull` invocations carry their own `--no-gitignore` flag.
+resolves to `local:`; combined with any non-`local:` mode the daemon
+rejects the request with `InvalidConfig` and the exact error string:
+
+> `--no-gitignore is only meaningful for local: workspaces; this session uses <mode>:`
+
+where `<mode>` is `shared` or `clone` depending on the parsed
+`WorkspaceMode`. (`--repo` and `--workspace` are already mutually
+exclusive at the clap surface via `conflicts_with`, so a
+`--no-gitignore` + `--repo` combination is impossible to construct
+on the CLI; the daemon error covers the case of a `--no-gitignore` +
+`shared:` invocation and any non-CLI client that bypasses the clap
+gate.)
+
+The CLI pre-validates the same combination client-side and exits
+with the equivalent message before the request goes on the wire —
+fail-fast, mirroring the existing rsync-planner state-check pattern
+in `sandbox-cli/src/main.rs`'s `plan_sync_command`. The daemon-side
+check is the authoritative one (so a misbehaving CLI cannot bypass
+the gate); the CLI-side check exists for operator latency only.
+
+The flag drops the `--filter=':- .gitignore'` rule from the
+initial-push rsync invocation (see § `local:` Mode). It is **not
+persisted** to the session record — see § `--no-gitignore`
+persistence below for the rationale and consequences.
+
+### `--no-gitignore` persistence
+
+The create-time `--no-gitignore` choice is **not** persisted to the
+session record. It governs only the initial push at session-create
+time; after creation, the flag has no ongoing semantics. Subsequent
+`sandbox workspace push` / `pull` invocations carry their own
+`--no-gitignore` flag — the operator's create-time choice does not
+implicitly propagate forward.
+
+Concretely, `SessionConfig` gains no `no_gitignore_on_create:
+Option<bool>` field. The `--no-gitignore` value is consumed by the
+create-time push code path and discarded thereafter; the only place
+it is observable is the daemon's structured log line for the
+initial-push rsync invocation (which records the actual rsync argv).
+
+The create-time choice is **not retrievable** from `sandbox
+describe`. Operators who want to remember whether they created a
+session with `--no-gitignore` must consult their shell history; the
+session record itself is the wrong place to carry per-invocation
+flag state. The reasoning:
+
+- The create-time push is a one-shot operation; the flag describes
+  a transient input, not a persistent property of the session.
+- Persisting the flag would imply "this session was created with
+  `--no-gitignore`, so future push/pull invocations should default
+  to that behaviour", which would surprise operators who expect
+  their explicit flags to be authoritative on each invocation.
+- The describe output already has enough variants to render
+  (`shared` / `local` / `clone`; default vs explicit security
+  model); adding a flag-derived field for `--no-gitignore`
+  proliferates the surface without buying clarity.
 
 ### `sandbox workspace push` / `pull`
 
@@ -224,12 +274,17 @@ sandbox workspace pull <session> {-f | -n} [--safe-links] [--no-gitignore] [--de
   happen without writing. Mutually exclusive with `-f`.
 - One of `-f` / `-n` is **required**. Bare `sandbox workspace push
   <session>` exits with a usage error pointing at the safety gate.
-- `--safe-links` — replaces the default `-L` (follow symlinks
-  including out-of-tree) with rsync's `--safe-links` (skip symlinks
-  pointing outside the source tree). Symlinks inside the tree are
-  preserved as symlinks. Useful when the source tree contains
-  symlinks to outside the workspace that the operator does not want
-  followed.
+- `--safe-links` — by default, push/pull use `-L` to follow all
+  symlinks (copying targets as regular files and directories). When
+  `--safe-links` is passed, the `-L` default is dropped and rsync's
+  `--safe-links` semantics apply instead: in-tree symlinks are
+  preserved as symlinks on the destination; symlinks pointing
+  outside the source tree are skipped entirely (no file, no symlink,
+  no entry of any kind on the destination). Useful when the source
+  tree contains symlinks to external locations that should not be
+  dereferenced or transferred. The user-visible model is "default
+  is `-L`; `--safe-links` opts out of dereferencing and protects
+  against out-of-tree links".
 - `--no-gitignore` — drops `--filter=':- .gitignore'` from the
   invocation. Includes gitignored files (typically `node_modules`,
   `.env`, build output) in transfer and in deletion consideration on
@@ -239,6 +294,27 @@ sandbox workspace pull <session> {-f | -n} [--safe-links] [--no-gitignore] [--de
   Useful for pulling a snapshot to a sibling directory without
   clobbering the original. The `--dest` value follows the same
   absolute-or-`~`-expanded rule as `host_path` at create time.
+  Semantics:
+  - **`--delete` is always on** for both push and pull, regardless
+    of `--dest`. The `-f`/`--force` gate is the destructive-op
+    opt-in (the operator has already affirmed mirror-with-delete
+    semantics by passing `-f`); `--dest` does not relax that gate.
+    An operator who wants safe inspection of "what would change"
+    uses `-n`/`--dry-run` first; `--dest` is not a way to escape
+    the delete behaviour.
+  - **Existing directory at `--dest`.** Contents-into-dir
+    semantics: `<src>/...` lands at `<dest>/...`. Both source and
+    destination carry trailing slashes (see § Push/pull commands
+    → trailing-slash rule).
+  - **Existing file at `--dest`.** Rejected with an error before
+    rsync is spawned ("`--dest` <path> is an existing file; expected
+    a directory or a non-existent path"). The CLI's `std::fs::metadata`
+    check runs before argv construction.
+  - **Missing parent directory.** The CLI calls
+    `std::fs::create_dir_all(dirname(<--dest>))` before spawning
+    rsync; rsync creates the leaf itself. So `--dest=/a/b/c` with
+    neither `/a/b` nor `/a` existing creates `/a/b/` first, then
+    rsync populates `c`.
 
 Errors:
 
@@ -645,6 +721,49 @@ The lifecycle:
    away with the VM/container as usual. The host directory is never
    touched on session deletion.
 
+### Cancellation and timeout
+
+The initial-push rsync runs inside the same blocking session-create
+handler as VM/container provisioning. Three failure modes need
+explicit semantics:
+
+1. **Rsync non-zero exit during create.** The session is rolled back
+   via the existing `cleanup_and_return!` macro in
+   `sandboxd/src/main.rs`: the VM or container is torn down, the
+   network teardown runs, the session record is removed from the
+   store. Sessions are either complete or absent — there is no
+   half-seeded `Running` state with a warning attached. (The
+   alternative "leave the session Running and let the operator
+   complete the seeding via `sandbox workspace push -f`" was
+   considered and rejected: it splits the create contract into
+   "complete" and "partially complete" buckets, complicates the
+   describe-output story, and forces every downstream consumer of
+   the session state machine to handle a new intermediate state.)
+2. **Cancellation.** The daemon-side rsync is spawned via
+   `tokio::process::Command`, **not** `std::process::Command`
+   wrapped in `spawn_blocking`. The async-aware variant properly
+   supports cancellation: when the request future is dropped (the
+   CLI hits Ctrl+C, the daemon receives SIGTERM, the session-create
+   timeout fires), the child process receives a `kill()` and exits
+   cleanly. The cleanup macro then runs as for any other create
+   failure.
+3. **Timeout.** The rsync invocation runs inside the existing
+   session-create timeout envelope. If rsync exceeds the timeout,
+   the envelope's deadline cancellation fires `cleanup_and_return!`
+   with an `Internal` response naming the rsync timeout (e.g.
+   "initial rsync exceeded session-create timeout after Ns; session
+   rolled back"). The operator's recovery path is documented below.
+
+**Recovery for oversized trees.** If a session's source tree is
+large enough to exceed the timeout envelope, the operator's path is
+to create the session with a smaller subset (e.g. by adding entries
+to `.gitignore` or by maintaining a `.local-only-ignore` sidecar
+that the operator passes via custom rsync, etc.) and then add the
+rest via `sandbox workspace push -f` after the session is up. The
+push command is not subject to the session-create timeout — it runs
+under the operator's terminal until it completes — so trees that
+do not fit the create envelope can still be seeded incrementally.
+
 ### Default rsync invocation
 
 The baseline flag set for both the create-time push and the
@@ -661,9 +780,11 @@ Where:
 - `-a` — archive (perms, ownership, times, group, recursion).
 - `-L` (`--copy-links`) — follow symlinks during transfer, copying
   the resolved file rather than the link. Includes symlinks pointing
-  outside the source tree. `--safe-links` (on the push/pull commands)
-  replaces `-L` with the rsync flag that follows in-tree symlinks
-  only.
+  outside the source tree. When `--safe-links` is passed on the
+  push/pull commands, the `-L` default is dropped: in-tree symlinks
+  are preserved as symlinks on the destination, and out-of-tree
+  symlinks are skipped entirely. See § CLI shape for the full
+  user-facing description.
 - `--delete` — mirror semantics: destination entries absent on the
   source are deleted. Combined with `--filter=':- .gitignore'`, this
   means gitignored files on the destination are *protected* from
@@ -688,6 +809,25 @@ Source/destination form for an upload push:
 
 Source/destination flip for pull.
 
+**Trailing-slash rule (push and pull).** Both source and destination
+always carry trailing slashes for `local:` push and pull. The
+workspace is always a directory whose contents are mirrored — the
+intended semantics is uniformly "mirror contents of A into B", and
+the trailing-slash convention is what tells rsync to operate on the
+directory's contents rather than the directory entry itself.
+Concretely:
+
+- **Push** (host → guest): `<host_path>/` → `sandbox-<id>:<guest_path>/`.
+- **Pull** (guest → host): `sandbox-<id>:<guest_path>/` →
+  `<host_path>/` (or `<--dest>/` when `--dest` is set).
+
+The CLI ensures both ends carry trailing slashes before constructing
+the rsync argv, regardless of whether the operator typed a path with
+or without the slash. This includes `--dest`: a `--dest=/a/b`
+invocation gets a `/a/b/` argv after the planner normalises it.
+Uniform contents-into-dir semantics across every push/pull
+combination.
+
 ### Filter interaction
 
 A frequent question is "if `.env` is gitignored and I want it in the
@@ -706,6 +846,53 @@ The gitignore default exists precisely to avoid transferring
 `.gitignore` exists in the first place. Documenting both options as
 ordinary usage avoids the "the default is wrong" trap.
 
+### Rsync invocation: exit codes, stdio, ownership
+
+The `-aL --delete --filter` baseline above leaves several invocation
+details unstated; this subsection pins them.
+
+1. **Exit codes.** All non-zero rsync exit codes are fatal — at
+   create time (where they trigger `cleanup_and_return!` per §
+   Cancellation and timeout) and on operator-driven push/pull
+   (where they exit the CLI with the rsync exit code). Codes 23
+   ("partial transfer due to errors") and 24 ("vanished source
+   files") are **not** special-cased — they fail the operation just
+   like catastrophic errors. The simpler "all-non-zero-fatal" rule
+   keeps the contract uniform; operators who want partial-transfer
+   tolerance can run rsync directly via the shell-transport
+   escape hatch already documented in § Out of Scope.
+2. **Stdout.** On the daemon-side initial push, rsync's stdout is
+   captured and logged at INFO level on the daemon (so operators
+   running with daemon log access see transfer summaries). On
+   CLI-driven push/pull, stdio is inherited as the spec already
+   states (the operator's terminal is the natural place for rsync's
+   one-line completion summary).
+3. **Stderr.** On the daemon-side initial push, stderr is captured;
+   on non-zero exit, the captured stderr is surfaced verbatim in
+   the daemon's error response so the operator sees rsync's own
+   diagnostic (e.g. `rsync: command not found`, `permission denied`,
+   `mkdir failed: EROFS`). On CLI-driven push/pull, stderr is
+   inherited.
+4. **`-z` / `--compress`.** Explicitly **not** passed. Local
+   transport (`limactl shell`, `docker exec -i`) is not over a
+   bandwidth-constrained link and does not benefit from rsync's
+   compression — the CPU cost of compress/decompress exceeds the
+   savings from a smaller wire payload on a loopback-class
+   connection. Documented here explicitly so a reviewer comparing
+   to a generic remote-rsync invocation does not second-guess the
+   omission. (Mirrors the existing `plan_sync_command` convention.)
+5. **Ownership semantics under `-a`.** The `-a` flag expands to
+   `-rlptgoD`, which includes `-o` (preserve owner) and `-g`
+   (preserve group). Rsync running unprivileged inside the guest
+   (as the `agent` user, uid 1000) cannot chown files to other
+   uids; rsync silently tolerates the chown failures and proceeds.
+   Documented consequence: files inside the guest workspace are
+   always owned by `agent`, regardless of the host file's
+   ownership. This is the desired outcome (the guest user is
+   the one who reads and writes the workspace inside the VM /
+   container) and matches the existing `sandbox sync` contract;
+   the `-a` flag is preserved unchanged.
+
 ### rsync prerequisites
 
 The rsync binary must be present on both sides:
@@ -720,6 +907,13 @@ The rsync binary must be present on both sides:
   required for sync and `local:` mode". Documented in
   `docs/guides/workspaces.md` next to the `sandbox sync`
   prerequisite paragraph.
+- **Version pin.** Both images ship rsync ≥ 3.2.7 (Ubuntu 24.04
+  noble), which supports `--mkpath` (introduced in rsync 3.2.3).
+  Implementers MAY use `--mkpath` for parent-dir creation;
+  pre-create-via-shell is the fallback if the image's rsync is
+  ever downgraded. Pinning the version here makes the
+  `--mkpath`-vs-`mkdir -p` choice in § Parent-directory creation
+  testable rather than implicit.
 
 ### Parent-directory creation
 
@@ -788,6 +982,20 @@ See § CLI shape for the surface. Implementation notes:
     accepts trailing `--`-separated rsync flags). This keeps the
     surface narrow and reviewable.
 
+**Filter source asymmetry on push vs pull.** The gitignore filter
+(`--filter=':- .gitignore'`) reads `.gitignore` from whichever side
+is the rsync source: the host's `.gitignore` on push, the guest's
+`.gitignore` on pull. Rsync's filter engine is source-relative either
+way, so this is a property of rsync's contract rather than a choice
+this spec makes. The practical implication: if the operator has
+edited `.gitignore` inside the session without syncing it back to the
+host (e.g. added a new ignore entry in the guest workspace), push
+and pull will filter differently. Push uses the host's older
+`.gitignore`, pull uses the guest's newer one. Operators wanting
+symmetric filter rules between the two directions should keep the
+two `.gitignore` files in sync (which a `push -f` from the host
+naturally accomplishes, modulo the gitignore filter itself).
+
 ## Lima Backend
 
 ### Shared mount block
@@ -847,16 +1055,59 @@ After the VM reaches Running, the backend:
 `Capabilities::workspace_modes` for Lima becomes `{Shared, Clone,
 Local}` — `EnumSet::all()` once `Local` joins the kind enum.
 
+### Cache-path interaction
+
+The daemon's session-create path picks between a fast cached-image
+clone and a slow template-render boot. The current heuristic
+(`sandboxd/src/main.rs`) keys on `has_shared_mount` and disables the
+cache whenever a `Shared` workspace is configured, because the cached
+golden image does not carry mount configuration. With three workspace
+modes, the rule expands to:
+
+- **`Shared`** (any `guest_path`, any `security_model`) — fast-path
+  cache stays **disabled**. The 9p mount block must be
+  template-rendered at boot; the cached golden image lacks the mount
+  configuration regardless of whether the guest path is the default
+  or explicit. Unchanged from current behaviour.
+- **`Local`** — fast-path cache is **enabled**. The Lima template
+  emits no `mounts:` block for `local:` mode (see § Lima Backend →
+  `local:` mode), so the cached image is fully compatible. The
+  post-create rsync runs after the VM reaches Running and is
+  independent of how the VM was booted (cached clone vs template
+  render). This saves the ~30s of template-render latency that the
+  current rule imposes on every workspace-bearing session.
+- **`Clone`** — unchanged (whatever the current fast-path/slow-path
+  decision is for clone-mode sessions). This spec does not alter
+  clone-mode cache eligibility.
+
+Concretely, the `has_shared_mount` predicate in `sandboxd/src/main.rs`
+expands to "is the workspace mode `Shared`?" — `Local` returns
+`false` and remains cache-eligible, `Shared` returns `true` and forces
+the slow path as today. The variable name should probably evolve with
+the predicate (`workspace_requires_template_render` or similar), but
+the underlying choice is mechanical.
+
 ### Daemon-side rsync orchestration
 
-The create-time push is a daemon-side rsync invocation. Per CLAUDE.md
+The create-time push is a daemon-side rsync invocation. CLAUDE.md's
 "All `std::process::Command` calls in async handlers are wrapped in
-`tokio::task::spawn_blocking`", the rsync spawn lives inside a
-`spawn_blocking` closure. Stdout/stderr are captured; on non-zero
-exit, the captured stderr is surfaced verbatim in the daemon's
-`InvalidState` / `Internal` response so the operator sees rsync's own
-error (e.g. `rsync: command not found`, permission denied, network
-hiccup).
+`tokio::task::spawn_blocking`" rule has an explicit carve-out for
+async-aware variants: the rsync spawn uses `tokio::process::Command`
+directly, **not** `std::process::Command` wrapped in
+`spawn_blocking`. The async-aware variant properly supports
+cancellation — dropping the future or calling `child.kill()` cleanly
+terminates the rsync child process — which is load-bearing for the
+cancellation, daemon-SIGTERM, and session-create-timeout paths
+described in § `local:` Mode → Cancellation and timeout.
+
+Stdout/stderr are captured per § Rsync invocation: exit codes,
+stdio, ownership: stdout is logged at INFO level on the daemon;
+stderr is captured and, on non-zero exit, surfaced verbatim in the
+daemon's `InvalidState` / `Internal` response so the operator sees
+rsync's own error (e.g. `rsync: command not found`, permission
+denied, EROFS on the container-rootfs case). The container backend
+follows the same orchestration pattern via its own `docker exec -i`
+transport.
 
 ## Container Backend
 
@@ -923,29 +1174,46 @@ the full set once the kind enum gains the third variant.
 ### Read-only rootfs interaction
 
 The container ("lite") image is launched with `--read-only`. The
-push/pull paths write into the bind-mounted home volume's
-`workspace/` (the default `guest_path = host_path` case may not be
-inside `/home/agent/`!). For `local:` mode, if `guest_path` is
-outside `/home/agent`, the rsync write target sits on the read-only
-rootfs and rsync fails with a clear error.
+writable surfaces the image actually exposes — and therefore the
+viable destinations for a `local:` rsync write or a `shared:`
+bind-mount target — are:
 
-This is acceptable as a documented constraint. Two practical
-patterns:
+- **`/home/agent/...`** — Docker volume mount, owned by uid 1000
+  (the `agent` user). Rsync running as `agent` can freely `mkdir`
+  subdirectories anywhere under this prefix; the home volume is the
+  primary writable area.
+- **`/tmp/...`** — tmpfs.
+- **`/run/...`** — tmpfs.
 
-1. **Default `guest_path = host_path` with a host path outside
-   `/home/agent`**. The operator hits the read-only failure on
-   create; they retry with an explicit `:guest_path` inside
-   `/home/agent`. The error message is rsync's, which names the
-   path.
-2. **Explicit `:<guest_path>` inside `/home/agent`**. Works for any
-   host path. Documented as the recommended idiom in
-   `docs/guides/workspaces.md`'s `local:` section.
+Everything outside this set sits on the read-only rootfs and is not
+writable.
 
-The daemon does not pre-validate the `guest_path`-vs-rootfs
-constraint for the container backend, because the relevant writable
-paths depend on the image (the home-volume mount point is part of the
-image contract, not the daemon's). The rsync error is the natural
-diagnostic.
+For `local:` mode, a `guest_path` outside the writable set fails at
+rsync time with EROFS: the parent-dir creation step (`mkdir -p` or
+rsync `--mkpath`) cannot create directories on the read-only rootfs.
+The daemon does **not** pre-validate the `guest_path`-vs-rootfs
+constraint — the relevant writable paths depend on the image (the
+home-volume mount point and the tmpfs locations are part of the image
+contract, not the daemon's), and the rsync EROFS error names the
+offending path directly.
+
+Two practical patterns:
+
+1. **Default `guest_path = host_path` with a host path outside the
+   writable set**. The operator hits the EROFS failure on create;
+   they retry with an explicit `:guest_path` inside `/home/agent`,
+   `/tmp`, or `/run`.
+2. **Explicit `:<guest_path>` inside the writable set**. Works for
+   any host path. The `/home/agent` choice is the recommended idiom
+   for persistent work (the home volume survives restarts);
+   `/tmp/...` and `/run/...` are legitimate ephemeral choices for
+   `local:` mode where the operator wants tmpfs-backed work — fast,
+   ephemeral, useful for build-heavy workloads that fit in RAM. The
+   default `guest_path = host_path` will not land on tmpfs unless
+   the operator explicitly sets a tmpfs path.
+
+Documented as the recommended idiom in
+`docs/guides/workspaces.md`'s `local:` section.
 
 ## `sandbox describe`
 
@@ -1394,12 +1662,15 @@ breaking changes) documents:
   would close this gap — left deferred until operator feedback
   shows the generic error is misleading in practice.
 - **Container `--read-only` interaction with `guest_path` outside
-  `/home/agent`.** Documented as an rsync-failure-at-create-time, not
-  pre-validated by the daemon. A pre-flight that probes the
-  container image for writable mount points would catch this
-  before session-create proceeds — deferred; the rsync error is
-  legible and the documented idiom (`:<guest_path>` inside
-  `/home/agent`) sidesteps it.
+  the image's writable set.** The writable surfaces on the lite
+  image (`/home/agent/...`, `/tmp/...`, `/run/...`) are listed in §
+  Container Backend → Read-only rootfs interaction. A `guest_path`
+  outside that set fails at rsync time with EROFS, not pre-validated
+  by the daemon. A pre-flight that probes the container image for
+  writable mount points would catch this before session-create
+  proceeds — deferred; the rsync error is legible and the documented
+  idioms (`:<guest_path>` inside `/home/agent`, `/tmp`, or `/run`)
+  sidestep it.
 - **Rollback past a `local:` session is destructive.** A daemon
   predating this spec cannot deserialise `WorkspaceMode::Local`; the
   session is unloadable. Acceptable given the pre-0.1.0 envelope,
@@ -1414,15 +1685,18 @@ breaking changes) documents:
   image's content. Documented in `docs/guides/workspaces.md` as a
   caveat; not pre-validated by the daemon — the surface of
   "paths the image already uses" is image-defined, not daemon-defined.
-- **Initial-push blocking semantics versus session-create timeout.**
-  Large `local:` source trees may exceed the existing session-create
-  timeout. The rsync invocation runs inside the same blocking
-  session-create handler as VM/container provisioning and inherits
-  its timeout. The implementer should verify the existing timeout
-  envelope (Lima base provisioning routinely takes 30-60s) leaves
-  headroom for rsync of a typical workspace; if not, the timeout
-  may need a per-session override. Verification pinned in M17-S4's
-  example replay.
+- **Oversized `local:` source trees exceeding the session-create
+  timeout envelope.** The behaviour is now pinned (see § `local:`
+  Mode → Cancellation and timeout): the rsync runs inside the
+  existing timeout envelope, a timeout triggers
+  `cleanup_and_return!` with an `Internal` response, and the
+  recovery path is "create with a smaller subset, push the rest
+  afterwards via `sandbox workspace push -f`". The remaining open
+  question is purely empirical — does the existing envelope (Lima
+  base provisioning routinely takes 30-60s) leave headroom for
+  rsync of a typical workspace, or does the envelope itself need to
+  grow? Verification pinned in M17-S4's example replay; not a
+  blocker, since the recovery path is in place either way.
 
 ## Sessions
 
