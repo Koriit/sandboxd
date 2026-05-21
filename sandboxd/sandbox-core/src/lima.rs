@@ -1454,7 +1454,7 @@ provision:
                 // arbitrary YAML via crafted directory names containing
                 // quotes, newlines, or other YAML-special characters.
                 // The same sanitization story applies symmetrically to
-                // the operator-supplied `guest_path` (M17 spec
+                // the operator-supplied `guest_path` (per spec
                 // § "Lima Backend / Shared mount block").
                 let safe_host = sanitize_yaml_path(host_path);
                 let safe_guest = sanitize_yaml_path(guest_path);
@@ -2441,10 +2441,10 @@ mod tests {
         );
 
         // Should mount the host path at the operator-resolved guest
-        // path. Under the M17 breaking-default rule, the guest path
-        // defaults to the host path when the operator does not supply
-        // an explicit value — so this fixture lands the workspace at
-        // `/home/user/project` inside the guest too.
+        // path. The guest path defaults to the host path when the
+        // operator does not supply an explicit value — so this
+        // fixture lands the workspace at `/home/user/project` inside
+        // the guest too.
         assert!(
             template.contains("location: \"/home/user/project\""),
             "template should reference the host path"
@@ -2458,6 +2458,12 @@ mod tests {
             template.contains("writable: true"),
             "template should make mount writable"
         );
+        // Default branch: `security_model: None` resolves to the Lima
+        // backend default of `mapped-xattr` in the rendered template.
+        assert!(
+            template.contains("securityModel: mapped-xattr"),
+            "default (None) security model should render as mapped-xattr"
+        );
         assert!(
             template.contains("step=net-tune"),
             "template should include the net-tune provision step"
@@ -2465,6 +2471,81 @@ mod tests {
         assert!(
             template.contains("mtu: 1280"),
             "template should clamp eth0 MTU to 1280 (libslirp PMTU workaround)"
+        );
+    }
+
+    #[test]
+    fn test_generate_template_shared_workspace_with_mapped_xattr() {
+        use crate::session::WorkspaceSecurityModel;
+
+        let mgr = LimaManager::with_limactl_path(
+            PathBuf::from("/tmp/test"),
+            PathBuf::from("limactl"),
+            DEFAULT_BASE_VM_NAME.to_string(),
+        );
+        let id = SessionId::parse("550e8400e29b").unwrap();
+        let config = SessionConfig {
+            cpus: 2,
+            memory_mb: 4096,
+            disk_gb: 20,
+            workspace_mode: Some(WorkspaceMode::Shared {
+                host_path: "/home/user/project".into(),
+                guest_path: "/home/user/project".into(),
+                security_model: Some(WorkspaceSecurityModel::MappedXattr),
+            }),
+            hardened: true,
+            repo: None,
+            boot_cmd: None,
+            template: None,
+            cpus_decimal: None,
+            rootless_docker: None,
+        };
+
+        let template = mgr.generate_template(&id, &config);
+
+        // SF-17 round-trip: an explicit `Some(MappedXattr)` should
+        // serialize to the same `securityModel: mapped-xattr` line as
+        // the default (None) branch — preserving operator intent.
+        assert!(
+            template.contains("securityModel: mapped-xattr"),
+            "explicit Some(MappedXattr) should render as mapped-xattr"
+        );
+    }
+
+    #[test]
+    fn test_generate_template_shared_workspace_with_none_mapping() {
+        use crate::session::WorkspaceSecurityModel;
+
+        let mgr = LimaManager::with_limactl_path(
+            PathBuf::from("/tmp/test"),
+            PathBuf::from("limactl"),
+            DEFAULT_BASE_VM_NAME.to_string(),
+        );
+        let id = SessionId::parse("550e8400e29b").unwrap();
+        let config = SessionConfig {
+            cpus: 2,
+            memory_mb: 4096,
+            disk_gb: 20,
+            workspace_mode: Some(WorkspaceMode::Shared {
+                host_path: "/home/user/project".into(),
+                guest_path: "/home/user/project".into(),
+                security_model: Some(WorkspaceSecurityModel::NoneMapping),
+            }),
+            hardened: true,
+            repo: None,
+            boot_cmd: None,
+            template: None,
+            cpus_decimal: None,
+            rootless_docker: None,
+        };
+
+        let template = mgr.generate_template(&id, &config);
+
+        // SF-17 round-trip: an explicit `Some(NoneMapping)` should
+        // serialize to `securityModel: none` (the YAML wire form).
+        assert!(
+            template.contains("securityModel: none"),
+            "explicit Some(NoneMapping) should render as none"
         );
     }
 

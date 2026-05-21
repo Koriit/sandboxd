@@ -350,8 +350,8 @@ async fn integration_container_local_create_and_push() {
 
     // Push from <host>/srv to /home/agent/work inside the guest. We
     // pick a writable guest path because the alpine fixture has a
-    // writable rootfs; the spec's M17-S1 breaking default (guest_path
-    // == host_path) is exercised by the shared-guest-path sibling
+    // writable rootfs; the spec's breaking default (guest_path ==
+    // host_path) is exercised by the shared-guest-path sibling
     // file, not here — this test pins the explicit-guest-path arm.
     let host_arg = host_root.join("srv").to_string_lossy().to_string();
     let guest_arg = "/home/agent/work";
@@ -505,10 +505,9 @@ async fn integration_local_gitignore_filter() {
 /// rsync cannot open it for read. This produces a non-zero exit
 /// (typically exit 23, "partial transfer due to error") with an
 /// `Operation not permitted` / `Permission denied` line in stderr.
-/// The production module's "all-non-zero-exits-fatal" rule (per
-/// orchestrator decision Q4 in the M17-S2 master plan, mirroring
-/// spec § Rsync invocation → Exit codes) collapses any such exit to
-/// `Internal`.
+/// The production module's "all-non-zero-exits-fatal" rule
+/// (mirroring spec § Rsync invocation → Exit codes) collapses any
+/// such exit to `Internal`.
 #[tokio::test]
 async fn integration_local_create_failure_tears_down() {
     let host_src = TempDir::new().expect("host tempdir");

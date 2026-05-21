@@ -330,8 +330,8 @@ fn resolve_allocation_pool(daemon_uid: u32, config: &UsersConfig) -> Result<Cidr
         Ok(None) | Err(_) => format!("uid {daemon_uid}"),
     };
 
-    // Grep-stable phrasing: Phase 2D's install docs will reference the
-    // "no users.conf subnet matches daemon user" prefix verbatim. Do
+    // Grep-stable phrasing: the install docs reference the "no
+    // users.conf subnet matches daemon user" prefix verbatim. Do
     // not re-word without coordinating the docs change.
     Err(SandboxError::InvalidArgument(format!(
         "no users.conf subnet matches daemon user {user_label} \
@@ -1323,7 +1323,7 @@ fn compute_initial_dns_policy(req: &CreateSessionRequest) -> String {
 ///
 /// Extracted as a pure function so the gate can be unit-tested without
 /// driving the full `create_session` handler (no `AppState`, no HTTP
-/// machinery). The wording is pinned by the M17 workspace-ergonomics
+/// machinery). The wording is pinned by the workspace-ergonomics
 /// spec § `--no-gitignore` on `sandbox create`:
 ///
 /// > `--no-gitignore is only meaningful for local: workspaces; this session uses <mode>:`
@@ -1399,7 +1399,7 @@ async fn create_session(
         match sandbox_core::WorkspaceMode::parse_flag(ws) {
             Ok(mode) => Some(mode),
             Err(e) => {
-                return error_response(SandboxError::Internal(format!(
+                return error_response(SandboxError::InvalidArgument(format!(
                     "invalid workspace value: {e}"
                 )))
                 .into_response();
@@ -1423,10 +1423,8 @@ async fn create_session(
     // — no `cleanup_net_ca_and_return!` needed because no state has
     // been allocated yet.
     //
-    // Plumbed into a local for Phase 3's rsync orchestration block,
-    // which will consume the bool when it constructs the
-    // initial-push argv. Phase 2 just lands the wire field and the
-    // rejection gate; the consumer is added later.
+    // Plumbed into a local for the rsync orchestration block, which
+    // consumes the bool when it constructs the initial-push argv.
     let no_gitignore_initial_push = req.no_gitignore.unwrap_or(false);
     if let Err(msg) =
         validate_no_gitignore_against_workspace(no_gitignore_initial_push, workspace_mode.as_ref())
@@ -1897,7 +1895,7 @@ async fn create_session(
             // `security_model` is meaningless for a Docker bind-mount
             // (it is a 9p concept on the Lima side); the daemon-side
             // mapper rejects any `Some(_)` value here so the runtime
-            // stays unaware of the field — see the M17 spec
+            // stays unaware of the field — see the spec
             // § "Container Backend / Shared bind-mount".
             let workspace_bind = match &config.workspace_mode {
                 Some(sandbox_core::WorkspaceMode::Shared {
@@ -3319,14 +3317,14 @@ fn session_network_info_for(
 ///
 /// `workspace_path` is derived from the in-memory `WorkspaceMode`:
 ///
-/// - `Shared` → the operator-resolved `guest_path` (M17 breaking
-///   default: equals `host_path` when no explicit `:<guest>` token
-///   was supplied at create time).
+/// - `Shared` → the operator-resolved `guest_path` (equals
+///   `host_path` when no explicit `:<guest>` token was supplied at
+///   create time).
 /// - `Clone` → the historical `/home/agent/workspace` clone target.
 /// - No workspace mode → the historical default for the empty case.
 ///
 /// A trailing `/` is appended so the rendered wire field keeps its
-/// pre-M17 shape (e.g. `/home/agent/workspace/`); operator scripts
+/// historical shape (e.g. `/home/agent/workspace/`); operator scripts
 /// that grep on the trailing slash stay byte-compatible.
 fn session_mount_info_for(session: &Session) -> SessionMountInfo {
     // Default workspace target retained for the `Clone` and empty
@@ -3348,7 +3346,7 @@ fn session_mount_info_for(session: &Session) -> SessionMountInfo {
         Some(sandbox_core::WorkspaceMode::Local { guest_path, .. }) => (guest_path.clone(), None),
         None => (CLONE_WORKSPACE_PATH.to_string(), None),
     };
-    // Re-add the trailing `/` that the pre-M17 hardcoded constant
+    // Re-add the trailing `/` that the historical hardcoded constant
     // carried, so the wire form stays byte-identical for scripts
     // (e.g. `workspace_path: "/home/agent/workspace/"`). The parser
     // strips trailing `/` from `guest_path` in normalization, so we
@@ -6639,7 +6637,7 @@ async fn diagnostics_handler(
             "db_binary_version": session.guest_binary_version,
             // Live probe is out of scope for v1 of the endpoint;
             // doctor's verbose C12 will fan out per-session
-            // GuestRequest::Version probes when M16 lands.
+            // GuestRequest::Version probes in a future iteration.
             "drift": false,
         }));
     }
@@ -8136,6 +8134,62 @@ mod tests {
         );
     }
 
+    /// Workspace locks are per-process state — nothing in the on-disk
+    /// session record encodes the lock, so a daemon restart always
+    /// reconstructs every entry as `LockState::Unlocked` on first
+    /// reference. The contract is documented on
+    /// [`sandbox_core::LockState::new`] and load-bearing for orphan-lock
+    /// recovery: an operator who restarts the daemon to escape a
+    /// wedged-lock situation must observe a clean state, not a
+    /// persisted `Locked` row.
+    ///
+    /// We model "restart" by dropping the map and re-constructing it.
+    /// The same `SessionId` then resolves to a fresh `Unlocked` entry.
+    /// `tokio::sync::Mutex::blocking_lock()` lets us reach into the
+    /// inner mutex from a synchronous test without a runtime.
+    #[test]
+    fn restart_resets_locks() {
+        let sid = SessionId::generate();
+
+        // Pre-restart: acquire the lock so the in-memory map is in a
+        // non-trivial `Locked` state. If the lock survived "restart",
+        // step 4 below would observe `is_locked() == true`.
+        {
+            let map: std::sync::Mutex<HashMap<SessionId, Arc<Mutex<sandbox_core::LockState>>>> =
+                std::sync::Mutex::new(HashMap::new());
+            let lock_arc = workspace_lock_for_map(&map, &sid);
+            let mut guard = lock_arc.blocking_lock();
+            let _token = guard
+                .acquire(WorkspaceOp::Push)
+                .expect("acquire on fresh Unlocked must succeed");
+            assert!(
+                guard.is_locked(),
+                "sanity: lock should be Locked after acquire"
+            );
+            // `map` (and the Arc inside it) goes out of scope at the
+            // block end — modelling the daemon's process exit.
+        }
+
+        // Post-restart: a new empty map, same `SessionId`. The first
+        // `workspace_lock_for_map` lookup must lazily insert a fresh
+        // `LockState::new()` — i.e. `Unlocked`.
+        let new_map: std::sync::Mutex<HashMap<SessionId, Arc<Mutex<sandbox_core::LockState>>>> =
+            std::sync::Mutex::new(HashMap::new());
+        let lock_arc = workspace_lock_for_map(&new_map, &sid);
+        let guard = lock_arc.blocking_lock();
+        assert!(
+            !guard.is_locked(),
+            "after `restart` (map dropped + reconstructed) the same SessionId \
+             must resolve to a fresh Unlocked state — the workspace lock is \
+             per-process and never persisted across daemon lifetimes"
+        );
+        assert_eq!(
+            guard.active_op(),
+            None,
+            "post-restart lock state must have no active workspace op"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // acquire_workspace_lock_inner / release_workspace_lock_inner —
     // pure-function bodies of the workspace-lock handlers.
@@ -8307,6 +8361,31 @@ mod tests {
         assert!(lock.is_locked(), "failed release must not mutate state");
     }
 
+    #[test]
+    fn release_treats_unparseable_token_as_wrong_when_force_true() {
+        // Symmetric to the `force=false` test above: the HTTP handler
+        // routes any unparseable `lock_token` string to
+        // `LockToken::nil()` and forwards `force` verbatim. The
+        // contract per orchestrator Q6 is that `force=true` always
+        // overrides a wrong-token rejection — including the nil
+        // sentinel that an empty or malformed string lands on. This
+        // is the operator escape hatch for `sandbox workspace unlock
+        // --force` when the original token has been lost.
+        let mut lock = LockState::new();
+        let _held = lock.acquire(WorkspaceOp::Push).expect("seed acquire");
+        assert!(lock.is_locked(), "sanity: seeded lock must be Locked");
+
+        let sentinel = LockToken::nil();
+        release_workspace_lock_inner(&mut lock, sentinel, true)
+            .expect("nil-sentinel release with force=true must succeed (operator override)");
+        assert_eq!(
+            lock,
+            LockState::Unlocked,
+            "force=true release must transition state-machine to Unlocked even \
+             when the supplied token is the unparseable-input sentinel"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // lifecycle_lock_check — pre-teardown guard run by
     // `stop_session` / `remove_session`.
@@ -8459,7 +8538,7 @@ mod tests {
     //
     // Pure predicate; we drive every accept/reject branch directly so
     // the rejection-message wording is pinned without driving the full
-    // `create_session` handler. The wording matches the M17 spec §
+    // `create_session` handler. The wording matches the spec §
     // `--no-gitignore` on `sandbox create` and is mirrored on the CLI
     // side (`validate_no_gitignore_for_workspace`) — both sites carry
     // the literal string because there is no shared error catalog in
@@ -8597,8 +8676,8 @@ mod tests {
     #[test]
     fn resolve_allocation_pool_errs_when_no_subnet_matches_uid() {
         let runner_uid = nix::unistd::Uid::current();
-        // The bogus username is the same sentinel Phase 2A uses in its
-        // `allows_uid_rejects_bogus_username` test — a name that
+        // The bogus username is the same sentinel that
+        // `allows_uid_rejects_bogus_username` uses — a name that
         // cannot exist on any practical host so `getpwnam_r` returns
         // `Ok(None)` and `find_subnet_by_uid` misses.
         let raw = r#"{

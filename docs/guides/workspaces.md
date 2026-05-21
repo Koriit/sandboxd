@@ -84,6 +84,8 @@ sandbox create --workspace "shared:/home/user/proj:/srv/work"
 sandbox create --workspace "shared:/home/user/proj:/srv/work:none"
 ```
 
+> **Footgun: colons in paths.** The parser tokenizes on `:` from right to left. A host path containing a colon (e.g. `/data:archive`) will be misclassified — the rightmost token after the mode prefix is read as the security model or guest path. Avoid colons in host paths, or pass an explicit guest path (e.g. `shared:/data:archive:/srv/work`) to disambiguate. The same applies to a guest path that happens to be literally `/none` or `/mapped-xattr`, either of which would be classified as a security model.
+
 > **Breaking default.** The historical fixed mount point `/home/agent/workspace` is gone. The guest path now defaults to the host path so that build artefacts and tool output that reference absolute host directories survive a host-to-guest round trip without translation. If you relied on the old layout, pass an explicit guest path (e.g. `shared:$(pwd):/home/agent/workspace`).
 
 ### Pick a guest path
@@ -97,6 +99,8 @@ Set `<guest>` when:
 Leave `<guest>` off when the host path is already a valid absolute Linux path and you want the simplest configuration — that is the new default.
 
 A leading `~` in the host token expands against the CLI process's `$HOME` (the same expansion the shell would do for an unquoted argument). A leading `~` in the guest token is a literal substitution to `/home/agent` — it is not a lookup inside the VM.
+
+> **Note: shell globs expand before the CLI sees them.** `--workspace shared:~/projects/*` is expanded by your shell, not by sandboxd, so the CLI sees whatever paths the glob produced (often more than one, or none). Quote the value or pass a literal path to keep the parser's view aligned with what you typed.
 
 ### Pick a security model
 
@@ -127,7 +131,7 @@ Shared mount reduces VM isolation. If your workload does not need live bidirecti
 
 `local:` is the snapshot-style cousin of `shared:`. At session-creation time the daemon `rsync`s your host directory into the guest; after that, no live host-to-guest link exists. The guest sees a static copy of the tree as it was at create time. There is no 9p surface, no bind mount, and no path through which a guest write reaches your host filesystem.
 
-Reach for `local:` when you want the convenience of seeding the session with a directory you already have on disk, but do not need (or do not want) live bidirectional visibility. Typical fits: a non-git scratch tree, generated files you do not want to commit, or a directory where isolation matters more than ergonomic in-place editing.
+Reach for `local:` when you want the convenience of seeding the session with a directory you already have on disk, but do not need (or do not want) live bidirectional visibility. Typical fits: a non-git scratch tree, generated files you do not want to commit, or a directory where isolation matters more than ergonomic in-place editing. See [hardening](/guides/hardening/#local-snapshot-workspace) for the isolation-trade-off notes that justify reaching for `local:` over `shared:`.
 
 `shared:` vs. `local:`, at a glance:
 
@@ -138,7 +142,7 @@ Reach for `local:` when you want the convenience of seeding the session with a d
 | Filesystem surface added to VM | 9p | None |
 | Best for | Interactive IDE-driven dev | Isolated runs over a known tree |
 
-The flag grammar is `local:<host>[:<guest>]`. `<host>` must be an existing absolute directory after `~` expansion. `<guest>` is the in-VM path; **when omitted it defaults to `<host>` verbatim**, matching the M17 default rule for `shared:`. There is no security-model token — `local:` has no 9p surface, so the `mapped-xattr` / `none` choice does not apply.
+The flag grammar is `local:<host>[:<guest>]`. `<host>` must be an existing absolute directory after `~` expansion. `<guest>` is the in-VM path; **when omitted it defaults to `<host>` verbatim**, matching the new default rule for `shared:`. There is no security-model token — `local:` has no 9p surface, so the `mapped-xattr` / `none` choice does not apply.
 
 Three forms of the flag, from minimal to fully explicit:
 
@@ -152,6 +156,8 @@ sandbox create --workspace "local:/home/user/proj:/srv/work"
 # With the current directory.
 sandbox create --workspace "local:$(pwd):/home/agent/work"
 ```
+
+> **Rollback caveat.** Daemons older than this release cannot read records written with `local:` workspaces — the `WorkspaceMode::Local` variant is not in their schema. Roll forward; do not roll back across a session created with `local:`.
 
 By default, the create-time push honours each `.gitignore` in the source tree (rsync `--filter=':- .gitignore'`). Files matched by an ignore rule do not land in the guest. To transfer everything, pass `--no-gitignore`:
 
@@ -295,7 +301,7 @@ sandbox sync ./src dev:/home/agent/workspace/src
 
 Under the hood `sandbox sync` dispatches the host's `rsync` with the backend's native shell as rsync's remote-shell (`-e`) transport — `limactl shell` for Lima, `docker exec -i` for container. The baseline flag set is `-a --delete`: archive mode (perms, ownership, mtimes, symlinks, recursion) plus mirror semantics. Errors and progress reach you in rsync's native form. Out-of-scope: filter rules, partial transfers, bandwidth limits — operators wanting those can run `rsync` directly with the same `-e <rsh>` pattern this command uses.
 
-`sandbox sync` requires `rsync` on **both** sides. sandboxd-provisioned base images (Lima golden image, Lite container image) ship rsync by default. If you supply a custom image, install rsync yourself.
+`sandbox sync` and `local:` workspaces both require `rsync` on **both** the host and the guest. sandboxd-provisioned base images (Lima golden image, Lite container image) ship rsync by default. If you supply a custom image, install rsync yourself.
 
 `cp` vs. `sync` vs. `local:` push/pull — pick by semantic, not by tree size:
 

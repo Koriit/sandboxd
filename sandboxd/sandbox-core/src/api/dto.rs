@@ -316,11 +316,11 @@ pub struct SessionConfigDto {
     /// and continue to use the flat-string field, preserving
     /// backward-compat.
     ///
-    /// Forward-compat on the wire: records and clients predating M17
-    /// round-trip via `#[serde(default)]`; the daemon populates this
-    /// from the same in-memory `WorkspaceMode` that drives the flat
-    /// string, so the two fields are always consistent for a fresh
-    /// daemon.
+    /// Forward-compat on the wire: older records and clients that
+    /// omit this field round-trip via `#[serde(default)]`; the daemon
+    /// populates this from the same in-memory `WorkspaceMode` that
+    /// drives the flat string, so the two fields are always
+    /// consistent for a fresh daemon.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_mode_detail: Option<WorkspaceModeDetailDto>,
     pub hardened: bool,
@@ -339,10 +339,9 @@ pub struct SessionConfigDto {
 /// a new domain variant stays inert on the wire until the mapper in
 /// [`super::mapper`] is updated to project it.
 ///
-/// All three variants are declared in M17-S1 to lock the wire surface
-/// before the `Local` domain variant lands in M17-S2. The mapper's
-/// `Local` arm remains a compile-time `unreachable!()` until the
-/// domain variant lands.
+/// Three workspace modes are wired into the DTO: `Shared`, `Clone`,
+/// and `Local`. Each variant carries the operator-supplied paths and,
+/// for `Shared`, the security model.
 ///
 /// Tagging: `{"type": "shared" | "clone" | "local", ...}`. Inner
 /// field names stay `snake_case`, matching the rest of the wire

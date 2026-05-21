@@ -99,8 +99,9 @@ enum Command {
         boot_cmd: Option<String>,
         /// Workspace mode: `shared:<host>[:<guest>][:<security-model>]`
         /// (9p / bind mount), or `local:<host>[:<guest>]` (rsync
-        /// snapshot, lands in a follow-up release). The guest path
-        /// defaults to the host path; the security model defaults to
+        /// snapshot at session create; operator-driven push/pull via
+        /// `sandbox workspace push|pull`). The guest path defaults to
+        /// the host path; the security model defaults to
         /// `mapped-xattr` (alternative: `none`). See
         /// `docs/guides/workspaces.md` for the full grammar.
         ///
@@ -2155,8 +2156,8 @@ fn render_capabilities_block(lookup: &CapabilitiesLookup, out: &mut String) {
 
 /// Render the `Workspace:` portion of the `Config:` block.
 ///
-/// When the daemon populates `workspace_mode_detail` (M17+), the
-/// renderer emits a multi-line block with `Mode:` / `Host path:` /
+/// When the daemon populates `workspace_mode_detail`, the renderer
+/// emits a multi-line block with `Mode:` / `Host path:` /
 /// `Guest path:` / `Security:` rows for `Shared` (and the `Local`
 /// equivalent without the `Security:` row), or `Mode:` / `Repo:` for
 /// `Clone`. The `Security:` value mirrors the spec § rendering rule:
@@ -2164,11 +2165,11 @@ fn render_capabilities_block(lookup: &CapabilitiesLookup, out: &mut String) {
 /// (`security_model = None`), and the model verbatim for any
 /// `Some(_)` choice.
 ///
-/// When `workspace_mode_detail` is absent (older daemons predating
-/// M17), the renderer falls back to the historical single-line
+/// When `workspace_mode_detail` is absent (older daemons), the
+/// renderer falls back to the historical single-line
 /// `Workspace:   <flat-string>` form, sourcing the value from the
 /// retained `workspace_mode: Option<String>` field. This keeps the
-/// CLI compatible with pre-M17 daemons.
+/// CLI compatible with older daemons.
 fn render_workspace_block(
     detail: Option<&WorkspaceModeDetailDto>,
     flat: Option<&str>,
@@ -2182,38 +2183,35 @@ fn render_workspace_block(
             security_model,
         }) => {
             let _ = writeln!(out, "  Workspace:");
-            let _ = writeln!(out, "    Mode:        shared");
-            let _ = writeln!(out, "    Host path:   {host_path}");
-            let _ = writeln!(out, "    Guest path:  {guest_path}");
+            let _ = writeln!(out, "    Mode:       shared");
+            let _ = writeln!(out, "    Host path:  {host_path}");
+            let _ = writeln!(out, "    Guest path: {guest_path}");
             let _ = writeln!(
                 out,
-                "    Security:    {}",
+                "    Security:   {}",
                 render_security_model(*security_model)
             );
         }
         Some(WorkspaceModeDetailDto::Clone { repo_url }) => {
             let _ = writeln!(out, "  Workspace:");
-            let _ = writeln!(out, "    Mode:  clone");
-            let _ = writeln!(out, "    Repo:  {repo_url}");
+            let _ = writeln!(out, "    Mode:       clone");
+            let _ = writeln!(out, "    Repo:       {repo_url}");
         }
         Some(WorkspaceModeDetailDto::Local {
             host_path,
             guest_path,
         }) => {
-            // S1: the DTO variant exists for wire-surface forward compat —
-            // the CLI may receive this from a future daemon even though
-            // the domain variant lands in M17-S2. Render analogously to
-            // Shared minus the `Security:` row.
+            // Render analogously to Shared minus the `Security:` row.
             let _ = writeln!(out, "  Workspace:");
-            let _ = writeln!(out, "    Mode:        local");
-            let _ = writeln!(out, "    Host path:   {host_path}");
-            let _ = writeln!(out, "    Guest path:  {guest_path}");
+            let _ = writeln!(out, "    Mode:       local");
+            let _ = writeln!(out, "    Host path:  {host_path}");
+            let _ = writeln!(out, "    Guest path: {guest_path}");
         }
         None => {
             // Older-daemon fallback: render the historical single-line
-            // form using the flat string. Pre-M17 daemons populate only
-            // `workspace_mode: Option<String>`; the new structured
-            // field is absent.
+            // form using the flat string. Older daemons populate only
+            // `workspace_mode: Option<String>`; the structured field
+            // is absent.
             let _ = writeln!(out, "  Workspace:   {}", flat.unwrap_or("-"));
         }
     }
@@ -5055,6 +5053,21 @@ async fn run_workspace_push_or_pull(
         // the planner contract explicit.
         None
     };
+
+    // Pre-flight: verify `rsync` is on the host's `$PATH` BEFORE
+    // acquiring the per-session workspace lock. If we acquired the
+    // lock first and then discovered rsync was missing, we'd leave
+    // an orphan lock requiring `sandbox workspace unlock --force` to
+    // recover. The host-side `which` binary ships in `coreutils` on
+    // every realistic operator host, so calling it avoids pulling in
+    // the `which` crate as a dependency.
+    match std::process::Command::new("which").arg("rsync").output() {
+        Ok(out) if out.status.success() => {}
+        _ => {
+            eprintln!("rsync not found on host; install rsync to use sandbox workspace push/pull");
+            process::exit(1);
+        }
+    }
 
     // Workspace-lock op tag for the acquire request. Push and pull
     // both lock the same per-session mutex; the op tag only exists so
@@ -8449,19 +8462,19 @@ mod tests {
             "expected multi-line Workspace header, got:\n{rendered}"
         );
         assert!(
-            rendered.contains("    Mode:        shared\n"),
+            rendered.contains("    Mode:       shared\n"),
             "expected Mode row, got:\n{rendered}"
         );
         assert!(
-            rendered.contains("    Host path:   /home/olek/project\n"),
+            rendered.contains("    Host path:  /home/olek/project\n"),
             "expected Host path row, got:\n{rendered}"
         );
         assert!(
-            rendered.contains("    Guest path:  /home/olek/project\n"),
+            rendered.contains("    Guest path: /home/olek/project\n"),
             "expected Guest path row, got:\n{rendered}"
         );
         assert!(
-            rendered.contains("    Security:    mapped-xattr (default)\n"),
+            rendered.contains("    Security:   mapped-xattr (default)\n"),
             "expected default-annotated Security row, got:\n{rendered}"
         );
     }
@@ -8485,11 +8498,11 @@ mod tests {
         });
         let rendered = render_describe(std::slice::from_ref(&dto), None);
         assert!(
-            rendered.contains("    Security:    mapped-xattr\n"),
+            rendered.contains("    Security:   mapped-xattr\n"),
             "expected verbatim Security row, got:\n{rendered}"
         );
         assert!(
-            !rendered.contains("    Security:    mapped-xattr (default)"),
+            !rendered.contains("    Security:   mapped-xattr (default)"),
             "explicit Some(MappedXattr) must not carry (default) annotation, got:\n{rendered}"
         );
     }
@@ -8511,7 +8524,7 @@ mod tests {
         });
         let rendered = render_describe(std::slice::from_ref(&dto), None);
         assert!(
-            rendered.contains("    Security:    none\n"),
+            rendered.contains("    Security:   none\n"),
             "expected `none` Security row, got:\n{rendered}"
         );
     }
@@ -8534,11 +8547,11 @@ mod tests {
         });
         let rendered = render_describe(std::slice::from_ref(&dto), None);
         assert!(
-            rendered.contains("    Host path:   /tmp/sbx-a\n"),
+            rendered.contains("    Host path:  /tmp/sbx-a\n"),
             "expected operator's host path, got:\n{rendered}"
         );
         assert!(
-            rendered.contains("    Guest path:  /srv/work\n"),
+            rendered.contains("    Guest path: /srv/work\n"),
             "expected operator's guest path distinct from host, got:\n{rendered}"
         );
     }
@@ -8563,11 +8576,11 @@ mod tests {
             "expected multi-line Workspace header, got:\n{rendered}"
         );
         assert!(
-            rendered.contains("    Mode:  clone\n"),
+            rendered.contains("    Mode:       clone\n"),
             "expected `Mode: clone` row, got:\n{rendered}"
         );
         assert!(
-            rendered.contains("    Repo:  https://github.com/example/app.git\n"),
+            rendered.contains("    Repo:       https://github.com/example/app.git\n"),
             "expected `Repo:` row, got:\n{rendered}"
         );
         assert!(
@@ -8586,7 +8599,7 @@ mod tests {
     ///
     /// Byte-equal golden test pinning the exact rendered substring so
     /// future refactors of `render_workspace_block` cannot silently
-    /// shift the operator-facing surface. The 13-char value-column
+    /// shift the operator-facing surface. The 12-char value-column
     /// padding matches the `Shared` arm pattern (see
     /// `describe_renders_shared_workspace_*` tests above).
     #[test]
@@ -8605,11 +8618,11 @@ mod tests {
         let rendered = render_describe(std::slice::from_ref(&dto), None);
         // Byte-equal golden: the four-line `Workspace:` block must
         // appear verbatim in the rendered output, including the
-        // exact 13-char value-column padding.
+        // exact 12-char value-column padding.
         let expected = "  Workspace:\n    \
-            Mode:        local\n    \
-            Host path:   /home/user/proj\n    \
-            Guest path:  /srv/work\n";
+            Mode:       local\n    \
+            Host path:  /home/user/proj\n    \
+            Guest path: /srv/work\n";
         assert!(
             rendered.contains(expected),
             "expected verbatim Local block; got:\n{rendered}"
@@ -8651,19 +8664,19 @@ mod tests {
         });
         let rendered = render_describe(std::slice::from_ref(&dto), None);
         let expected = "  Workspace:\n    \
-            Mode:        local\n    \
-            Host path:   /home/user/proj\n    \
-            Guest path:  /home/user/proj\n";
+            Mode:       local\n    \
+            Host path:  /home/user/proj\n    \
+            Guest path: /home/user/proj\n";
         assert!(
             rendered.contains(expected),
             "expected verbatim Local block with equal host/guest paths; got:\n{rendered}"
         );
     }
 
-    /// Older daemon (predating M17) populates only `workspace_mode`
-    /// (the flat string) and leaves `workspace_mode_detail = None`.
-    /// The CLI must fall back to the historical single-line render
-    /// so the operator-facing surface stays compatible across the
+    /// Older daemons populate only `workspace_mode` (the flat string)
+    /// and leave `workspace_mode_detail = None`. The CLI must fall
+    /// back to the historical single-line render so the
+    /// operator-facing surface stays compatible across the
     /// daemon-vs-CLI version skew.
     #[test]
     fn describe_renders_older_daemon_workspace_single_line_fallback() {

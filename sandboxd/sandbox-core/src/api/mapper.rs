@@ -232,7 +232,7 @@ impl From<&SessionConfig> for SessionConfigDto {
 /// Render a workspace mode as a short string for the legacy flat
 /// `workspace_mode` wire field.
 ///
-/// The four `Shared` compact-form cases follow the M17 spec
+/// The four `Shared` compact-form cases follow the workspace spec
 /// (§ "Wire surface"):
 ///
 /// - `shared:<host>` — default guest path (equal to `host_path`) and
@@ -294,10 +294,6 @@ fn render_workspace_mode(mode: &WorkspaceMode) -> String {
 
 /// Project an in-memory [`WorkspaceMode`] onto the structured
 /// [`WorkspaceModeDetailDto`] surfaced by `SessionConfigDto`.
-///
-/// The DTO's `Local` variant landed in M17-S1 as a forward-compat
-/// scaffold; M17-S2 wires it to the domain `WorkspaceMode::Local`
-/// variant here.
 fn render_workspace_mode_detail(mode: &WorkspaceMode) -> WorkspaceModeDetailDto {
     match mode {
         WorkspaceMode::Shared {
@@ -1024,8 +1020,8 @@ mod tests {
     #[test]
     fn workspace_mode_detail_shared_default_collapses_guest_and_security() {
         // `Shared` with `guest_path == host_path` and `security_model: None`
-        // is the post-M17 default-shape fixture: the DTO still carries both
-        // paths verbatim, and `security_model` is omitted from the wire via
+        // is the default-shape fixture: the DTO still carries both paths
+        // verbatim, and `security_model` is omitted from the wire via
         // `skip_serializing_if`.
         let config = SessionConfig {
             workspace_mode: Some(WorkspaceMode::Shared {

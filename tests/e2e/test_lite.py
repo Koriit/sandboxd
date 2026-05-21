@@ -528,7 +528,7 @@ def test_lite_workspace_uid_alignment(lite_harness, tmp_path):
 
     sid = lite_harness.create(
         "--name", "lite-ws-uid",
-        "--workspace", f"shared:{host_dir}",
+        "--workspace", f"shared:{host_dir}:/home/agent/workspace",
     )
     assert sid is not None
 

@@ -1,6 +1,6 @@
 """E2E tests for the ``sandbox workspace`` lock subsystem.
 
-The lock subsystem ships in M17-S3 alongside the ``sandbox workspace
+The lock subsystem ships alongside the ``sandbox workspace
 push|pull|unlock`` CLI surface; this file exercises the operator-facing
 edge cases that aren't covered by the daemon-spawning integration tests
 in ``sandboxd/sandboxd/tests/integration_workspace_lock.rs``:

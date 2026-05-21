@@ -198,8 +198,8 @@ const PIDS_LIMIT: u32 = 512;
 /// The host path is the source of the `--mount type=bind` argument;
 /// the guest path is the destination inside the container. Both are
 /// always populated — when the operator did not supply an explicit
-/// `guest_path`, the parser fills it from `host_path` (M17 breaking
-/// default; see `WorkspaceMode::parse_flag`).
+/// `guest_path`, the parser fills it from `host_path` (see
+/// `WorkspaceMode::parse_flag`).
 ///
 /// The container backend deliberately omits a `security_model` field:
 /// 9p `securityModel` semantics do not apply to a Docker bind, and
@@ -1904,6 +1904,81 @@ mod tests {
             "guest bind-mount `-v` (at index {v_idx}) must precede image tag \
              (at index {image_idx}); docker's CLI grammar rejects flags after \
              positional args",
+        );
+    }
+
+    /// When `ContainerNetwork.workspace_bind = Some(_)`, the resulting
+    /// `docker create` argv must include a `--mount type=bind,src=…,dst=…`
+    /// pair so the operator-supplied host directory is materialized
+    /// inside the container at `guest_path`. This is the container-side
+    /// analogue of the Lima 9p mount block — without this pair, a
+    /// `Shared` workspace under the container backend would silently
+    /// degrade to an empty bind target.
+    #[test]
+    fn container_run_argv_includes_workspace_bind_mount() {
+        let sid = SessionId::parse("0123456789ab").expect("valid 12-hex");
+        let bind = WorkspaceBind {
+            host_path: std::path::PathBuf::from("/tmp/h"),
+            guest_path: std::path::PathBuf::from("/srv/g"),
+        };
+        let network = ContainerNetwork {
+            docker_network: "sandbox-net-x".into(),
+            container_ip: "10.0.0.3".parse().unwrap(),
+            gateway_ip: "10.0.0.2".parse().unwrap(),
+            workspace_bind: Some(bind),
+            route_helper_path: None,
+            ca_host_path: None,
+        };
+        let guest_bind_source =
+            std::path::PathBuf::from("/usr/local/libexec/sandboxd/sandbox-guest");
+        let args = build_create_argv(
+            &sid,
+            &network,
+            DEFAULT_LITE_IMAGE_TAG,
+            1000,
+            1000,
+            512,
+            1.0,
+            &guest_bind_source,
+        );
+
+        // The workspace bind appears as an adjacent `--mount` / spec
+        // pair. Find every `--mount` flag, look for the one whose value
+        // matches the expected workspace spec, and assert the pair is
+        // adjacent (i.e. the spec follows the flag).
+        let expected_spec = "type=bind,src=/tmp/h,dst=/srv/g";
+        let mount_idx = args
+            .iter()
+            .enumerate()
+            .find_map(|(i, a)| {
+                if a == "--mount" && args.get(i + 1).map(String::as_str) == Some(expected_spec) {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "workspace bind-mount pair `--mount {expected_spec}` not found in argv {args:?}"
+                )
+            });
+        assert_eq!(
+            args[mount_idx + 1],
+            expected_spec,
+            "workspace --mount must be immediately followed by its spec",
+        );
+
+        // Order invariant: the bind-mount must come BEFORE the image
+        // tag, same constraint as the guest bind-mount — docker rejects
+        // flags after the positional image argument.
+        let image_idx = args
+            .iter()
+            .position(|a| a == DEFAULT_LITE_IMAGE_TAG)
+            .expect("image tag must appear in argv");
+        assert!(
+            mount_idx < image_idx,
+            "workspace `--mount` (at index {mount_idx}) must precede image tag \
+             (at index {image_idx})",
         );
     }
 

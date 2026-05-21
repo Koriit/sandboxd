@@ -1,10 +1,11 @@
-"""E2E tests for the M17 ``shared:<host>:<guest>`` operator-supplied
+"""E2E tests for the ``shared:<host>:<guest>`` operator-supplied
 guest-path branch.
 
-M17-S1 promoted the historical fixed ``/home/agent/workspace`` mount
-point into an operator-controllable guest path: ``--workspace
-shared:<host>:<guest>`` lands the host directory at the chosen
-``<guest>`` inside the session rather than the legacy default. The
+The workspace spec promoted the historical fixed
+``/home/agent/workspace`` mount point into an operator-controllable
+guest path: ``--workspace shared:<host>:<guest>`` lands the host
+directory at the chosen ``<guest>`` inside the session rather than
+the legacy default. The
 runtime-layer integration tests already pin the bind-mount mechanics
 on the container backend (``integration_shared_guest_path_container``);
 the Lima half — which requires a real 9p mount and a booted VM — lives

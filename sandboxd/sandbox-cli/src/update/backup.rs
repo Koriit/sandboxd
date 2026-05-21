@@ -1067,8 +1067,8 @@ mod tests {
     ///
     /// Pre-this test the function was reached only transitively by the
     /// production `create_backup_set_dir` path (which shells to sudo
-    /// and is not hermetic). MF27 from the M16-S4 triage flagged the
-    /// in-process variant's lack of direct coverage.
+    /// and is not hermetic). Triage flagged the in-process variant's
+    /// lack of direct coverage.
     #[test]
     fn create_backup_set_dir_at_creates_target_under_uncreated_root() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1169,8 +1169,8 @@ mod tests {
     /// hasn't landed yet), the function returns an empty
     /// `PruneOutcome` without erroring. Spec 5 § 3.2.25's idempotency
     /// promise depends on this — the prune step must be a no-op when
-    /// there are no sets to consider. MF28 from the M16-S4 triage
-    /// flagged this early-return as uncovered.
+    /// there are no sets to consider. Triage flagged this
+    /// early-return as uncovered.
     #[test]
     fn prune_old_backup_sets_at_empty_outcome_when_root_absent() {
         let tmp = tempfile::tempdir().expect("tempdir");

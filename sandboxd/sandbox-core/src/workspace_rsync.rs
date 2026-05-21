@@ -5,7 +5,7 @@
 //! `Running` to mirror the host workspace into the guest. The module is
 //! deliberately small and free of `sandboxd`-internal types so the
 //! same primitives can later back operator-driven `sandbox workspace
-//! push/pull` from a CLI-side planner (M17-S3).
+//! push/pull` from a CLI-side planner.
 //!
 //! ## Argv shape
 //!

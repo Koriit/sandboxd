@@ -129,6 +129,12 @@ pub struct Capabilities {
     /// `WorkspaceMode` is data-bearing and cannot derive
     /// `EnumSetType`, so the kind discriminator is used. See
     /// [`WorkspaceModeKind`].
+    ///
+    /// Deserialized via [`crate::session::deserialize_workspace_mode_kind_set`]
+    /// so that an older client reading a newer daemon's capability
+    /// response silently drops unknown variants instead of failing the
+    /// response wholesale.
+    #[serde(deserialize_with = "crate::session::deserialize_workspace_mode_kind_set")]
     pub workspace_modes: EnumSet<WorkspaceModeKind>,
 }
 

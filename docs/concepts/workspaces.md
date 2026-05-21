@@ -46,6 +46,8 @@ When to pick `local:`:
 
 Prefer `clone:` when a remote git URL is already the source of truth; prefer `shared:` when interactive live editing (IDE on host, build/test in guest) is the dominant flow.
 
+See [hardening](/guides/hardening/#local-snapshot-workspace) for the security-trade-off notes behind picking `local:` over `shared:`.
+
 ### Shared mount
 
 The host directory is mounted into the VM via QEMU's 9p filesystem. Reads and writes flow both ways in real time — the VM and the host see the same bytes with no sync step.

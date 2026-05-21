@@ -697,14 +697,14 @@ fn real_group_resolver() -> Result<GroupMembership, String> {
 /// as the dev-vs-prod heuristic. That signal conflates two
 /// independent host facts — "the `sandbox` system user exists" and
 /// "the host was installed by install.sh" — and produced misleading
-/// hints during the M15 installer window (the user appears before
-/// the install-state file, and during uninstall the file disappears
+/// hints during the installer window (the user appears before the
+/// install-state file, and during uninstall the file disappears
 /// before the user). The install-state file's lifecycle is bound to
 /// install.sh's two-phase write (atomic move after every other
 /// invariant is in place), so it is the single source of truth that
-/// other M16 paths already consult (`is_dev_mode` in
-/// `update/mod.rs`, the `--check` / `--dry-run` graceful-degradation
-/// branches in the same module).
+/// other paths already consult (`is_dev_mode` in `update/mod.rs`,
+/// the `--check` / `--dry-run` graceful-degradation branches in the
+/// same module).
 fn is_prod_install_signal(install_state_path: &Path) -> bool {
     install_state_path.exists()
 }

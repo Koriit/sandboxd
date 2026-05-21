@@ -200,7 +200,7 @@ pub enum WorkspaceMode {
     /// at session-create time. Unlike `Shared` there is no 9p device or
     /// bind-mount — the guest sees ordinary local files refreshed only
     /// when the operator explicitly invokes `sandbox workspace push` /
-    /// `pull`. See the M17 spec § `local:` Mode for the full lifecycle.
+    /// `pull`. See the workspace spec § `local:` Mode for the full lifecycle.
     ///
     /// `guest_path` defaults to the resolved `host_path` (per the
     /// parser); the custom deserializer below recovers a missing or
@@ -380,6 +380,7 @@ impl WorkspaceMode {
     /// ```text
     /// shared:<host-path>[:<guest-path>][:<security-model>]
     /// clone:<repo-url>
+    /// local:<host-path>[:<guest-path>]
     /// ```
     ///
     /// Path tokens are absolute (start with `/`); guest-side `~` is a
@@ -425,8 +426,9 @@ impl WorkspaceMode {
             None => {
                 return Err(format!(
                     "unknown workspace mode: {value:?}. Expected \
-                     'shared:<host-path>[:<guest-path>][:<security-model>]' or \
-                     'clone:<repo-url>'"
+                     'shared:<host-path>[:<guest-path>][:<security-model>]', \
+                     'clone:<repo-url>', or \
+                     'local:<host-path>[:<guest-path>]'"
                 ));
             }
         };
@@ -444,8 +446,9 @@ impl WorkspaceMode {
             "local" => parse_local(rest),
             _ => Err(format!(
                 "unknown workspace mode: {value:?}. Expected \
-                 'shared:<host-path>[:<guest-path>][:<security-model>]' or \
-                 'clone:<repo-url>'"
+                 'shared:<host-path>[:<guest-path>][:<security-model>]', \
+                 'clone:<repo-url>', or \
+                 'local:<host-path>[:<guest-path>]'"
             )),
         }
     }
@@ -630,11 +633,10 @@ fn parse_host_guest_pair_from_tokens(
     // Step D — `~` expansion and absoluteness.
     //
     // `parse_flag` is a single pure function; the CLI is responsible
-    // for expanding host-side `~` before invoking us (per the
-    // orchestrator's M17-S1 Q4 decision). Any residual `~` in
-    // `host_path` is a sign that the caller bypassed the CLI's
-    // expansion step and constructed the request directly — reject
-    // with an explicit pointer at the contract.
+    // for expanding host-side `~` before invoking us. Any residual
+    // `~` in `host_path` is a sign that the caller bypassed the
+    // CLI's expansion step and constructed the request directly —
+    // reject with an explicit pointer at the contract.
     if host_path.starts_with('~') {
         return Err(format!(
             "host_path must be absolute; CLI should have expanded `~` before sending. \
@@ -1532,11 +1534,14 @@ mod tests {
 
     #[test]
     fn parse_flag_shared_colon_only_errors() {
+        // `shared:` — `rest` after stripping the mode prefix is the
+        // empty string, so the parser takes the
+        // `rest.is_empty()` arm in `parse_shared` and surfaces
+        // "requires a host path". The other empty-token arm fires for
+        // `shared::` (see neighbouring test); this input never reaches
+        // tokenisation.
         let err = WorkspaceMode::parse_flag("shared:").unwrap_err();
-        assert!(
-            err.contains("requires a host path") || err.contains("empty"),
-            "err = {err}"
-        );
+        assert!(err.contains("requires a host path"), "err = {err}");
     }
 
     #[test]
@@ -1640,12 +1645,12 @@ mod tests {
     fn parse_flag_shared_too_many_tokens_errors() {
         // Four tokens after `shared:` is unparseable — even with the
         // right-to-left classifier, only host + guest + model are
-        // meaningful slots.
+        // meaningful slots. `shared:/a:/b:/c:none` tokenises to
+        // `["/a", "/b", "/c", "none"]` (no empties), so the parser
+        // surfaces the `len() > 3` arm verbatim; the empty-token arm
+        // never fires for this input.
         let err = WorkspaceMode::parse_flag("shared:/a:/b:/c:none").unwrap_err();
-        assert!(
-            err.contains("at most 3 tokens") || err.contains("empty"),
-            "err = {err}"
-        );
+        assert!(err.contains("at most 3 tokens"), "err = {err}");
     }
 
     // -- Backward-compatibility / round-trip --------------------------
@@ -1710,11 +1715,34 @@ mod tests {
     }
 
     #[test]
-    fn workspace_mode_round_trip_shared_full_payload() {
-        // Forward-compat: serialise current shape, deserialise, check
-        // every field round-trips.
+    fn workspace_mode_round_trip_shared_default_security_model() {
+        // Forward-compat (default-shape arm): serialise the
+        // `security_model: None` payload, deserialise, check every
+        // field round-trips. The companion test below exercises the
+        // `Some(_)` arm so both branches of the
+        // `skip_serializing_if = "Option::is_none"` attribute stay
+        // pinned.
         let mode = shared("/a", "/b", None);
         let json = serde_json::to_string(&mode).unwrap();
+        let deser: WorkspaceMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(deser, mode);
+    }
+
+    #[test]
+    fn workspace_mode_round_trip_shared_with_security_model() {
+        // Forward-compat (explicit-Some arm): serialise a payload that
+        // carries `security_model: Some(MappedXattr)`, deserialise,
+        // check the inner variant survives the wire trip. Without
+        // this companion the round-trip suite would only exercise the
+        // `skip_serializing_if` branch — a regression that broke the
+        // serialize/deserialize of `Some(_)` payloads would slip past
+        // the default-shape test.
+        let mode = shared("/a", "/b", Some(WorkspaceSecurityModel::MappedXattr));
+        let json = serde_json::to_string(&mode).unwrap();
+        assert!(
+            json.contains("\"security_model\""),
+            "Some(_) variant must be present on the wire; got {json}"
+        );
         let deser: WorkspaceMode = serde_json::from_str(&json).unwrap();
         assert_eq!(deser, mode);
     }
@@ -1837,7 +1865,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // `local:` parser + serde — M17-S2
+    // `local:` parser + serde
     // -----------------------------------------------------------------
 
     /// Helper: assemble the canonical `Local` payload for a parser
@@ -1926,12 +1954,12 @@ mod tests {
 
     #[test]
     fn parse_flag_local_empty_payload_errors() {
-        // `local:` — empty rest after the mode prefix.
+        // `local:` — empty rest after the mode prefix. The parser
+        // takes the `rest.is_empty()` arm in `parse_host_guest_pair`
+        // and surfaces "requires a host path"; the empty-token arm
+        // is unreachable for this input (no `:` to split).
         let err = WorkspaceMode::parse_flag("local:").unwrap_err();
-        assert!(
-            err.contains("requires a host path") || err.contains("empty"),
-            "err = {err}"
-        );
+        assert!(err.contains("requires a host path"), "err = {err}");
     }
 
     #[test]
@@ -1946,11 +1974,11 @@ mod tests {
         // `local:` accepts at most 2 tokens (host, guest). The third
         // token is not a security-model slot for `local:`, so the
         // parser rejects rather than silently dropping.
+        // `local:/a:/b:/c` tokenises to `["/a", "/b", "/c"]` (no
+        // empties), so the parser surfaces the `len() > 2` arm
+        // verbatim; the empty-token arm never fires for this input.
         let err = WorkspaceMode::parse_flag("local:/a:/b:/c").unwrap_err();
-        assert!(
-            err.contains("at most 2 tokens") || err.contains("empty"),
-            "err = {err}"
-        );
+        assert!(err.contains("at most 2 tokens"), "err = {err}");
     }
 
     #[test]

@@ -746,7 +746,7 @@ def test_shared_mount(sandbox_cli, backend):
             "create",
             *make_create_args(
                 backend, "ws-shared",
-                "--workspace", f"shared:{host_dir}",
+                "--workspace", f"shared:{host_dir}:/home/agent/workspace",
             ),
             timeout=600,
         )

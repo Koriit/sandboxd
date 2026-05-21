@@ -1,8 +1,8 @@
-"""E2E tests for the M17 ``local:`` workspace mode.
+"""E2E tests for the ``local:`` workspace mode.
 
-``local:`` is the snapshot-style workspace introduced in M17: at
-session-creation time the daemon rsyncs the host source tree into the
-guest, then leaves the session running with no live link to the host.
+``local:`` is a snapshot-style workspace: at session-creation time the
+daemon rsyncs the host source tree into the guest, then leaves the
+session running with no live link to the host.
 These tests boot real Lima/QEMU VMs and Docker containers, so each is
 SLOW (3-10 minutes per Lima invocation). Run with generous timeouts:
 
@@ -145,7 +145,7 @@ def test_workspace_local_create_and_describe(sandbox_cli, backend, tmp_path):
     3. The host source tree is present inside the guest at the
        resolved guest path — the create-time rsync push actually ran.
 
-    Push/pull arms are deferred to M17-S3 (see this file's docstring).
+    Push/pull arms are covered by separate tests (see this file's docstring).
     """
     session_id = None
     host_dir = None
@@ -180,12 +180,12 @@ def test_workspace_local_create_and_describe(sandbox_cli, backend, tmp_path):
         session_id = parse_session_id(result.stdout)
         wait_for_state(sandbox_cli, "ws-local-cd", "Running", timeout=10)
 
-        # (2) `sandbox describe` Workspace block. The multi-line form
-        # is the M17 surface; the four `Workspace:`/`Mode:`/`Host
-        # path:`/`Guest path:` lines must all be present. The
-        # byte-equal goldens in the CLI source pin the exact spacing;
-        # here we assert the load-bearing fragments so a future
-        # whitespace tweak in the renderer doesn't break the e2e gate.
+        # (2) `sandbox describe` Workspace block. The four
+        # `Workspace:`/`Mode:`/`Host path:`/`Guest path:` lines must
+        # all be present in the multi-line form. The byte-equal
+        # goldens in the CLI source pin the exact spacing; here we
+        # assert the load-bearing fragments so a future whitespace
+        # tweak in the renderer doesn't break the e2e gate.
         describe = sandbox_cli("describe", "ws-local-cd", timeout=60)
         assert describe.returncode == 0, (
             f"sandbox describe failed (rc={describe.returncode}).\n"
@@ -195,13 +195,13 @@ def test_workspace_local_create_and_describe(sandbox_cli, backend, tmp_path):
         assert "Workspace:" in out, (
             f"describe output missing Workspace: header; got:\n{out}"
         )
-        assert "Mode:        local" in out, (
-            f"describe output missing `Mode:        local` row; got:\n{out}"
+        assert "Mode:       local" in out, (
+            f"describe output missing `Mode:       local` row; got:\n{out}"
         )
-        assert f"Host path:   {host_dir}" in out, (
+        assert f"Host path:  {host_dir}" in out, (
             f"describe output missing host-path row for {host_dir!r}; got:\n{out}"
         )
-        assert f"Guest path:  {guest_path}" in out, (
+        assert f"Guest path: {guest_path}" in out, (
             f"describe output missing guest-path row for {guest_path!r}; "
             f"got:\n{out}"
         )

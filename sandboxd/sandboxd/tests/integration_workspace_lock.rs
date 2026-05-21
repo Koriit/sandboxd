@@ -1,18 +1,17 @@
 //! Daemon-driven HTTP-boundary integration coverage for the workspace
 //! lock surface (`POST` / `DELETE /sessions/{id}/workspace-lock`) plus
-//! the Phase 4 lifecycle 409 path on `stop` / `remove`, and a single
-//! container-backend pull happy-path that mirrors M17-S2's
+//! the lifecycle 409 path on `stop` / `remove`, and a single
+//! container-backend pull happy-path that mirrors the
 //! `integration_container_local_create_and_push` shape.
 //!
 //! ## Lima coverage deferred to E2E
 //!
 //! The Lima half of the local-pull exercise
-//! (`integration_lima_local_pull`) is deferred to E2E per orchestrator
-//! decision Q5 (master plan § 7), with the same rationale as M17-S2's
-//! `integration_local_workspace.rs`: booting a real Lima VM at the
-//! runtime layer requires `NetworkManager` plumbing from `AppState`
-//! that is out of scope here, and the per-test runtime would blow past
-//! the project's per-test budget.
+//! (`integration_lima_local_pull`) is deferred to E2E with the same
+//! rationale as `integration_local_workspace.rs`: booting a real Lima
+//! VM at the runtime layer requires `NetworkManager` plumbing from
+//! `AppState` that is out of scope here, and the per-test runtime
+//! would blow past the project's per-test budget.
 //!
 //! ## What's covered
 //!
@@ -20,7 +19,7 @@
 //!   alpine+rsync fixture container. Seed contents inside the guest via
 //!   `docker exec`, run a hand-rolled `rsync` pull from host
 //!   (`docker exec -i` transport), assert the host tempdir mirrors the
-//!   guest tree. Runtime-level — no daemon — mirroring M17-S2's push
+//!   guest tree. Runtime-level — no daemon — mirroring the push
 //!   shape inverted.
 //!
 //! - `integration_workspace_lock_push_blocks_pull` — Daemon HTTP path:
@@ -31,11 +30,11 @@
 //! - `integration_workspace_lock_blocks_stop` — Daemon HTTP path:
 //!   acquire `op=push`; `POST /sessions/<id>/stop` → 409 carrying the
 //!   `sandbox workspace unlock` recovery hint; release; re-`POST stop`
-//!   → 200. Pins Phase 4's atomicity contract for stop.
+//!   → 200. Pins the atomicity contract for stop.
 //!
 //! - `integration_workspace_lock_blocks_delete` — Daemon HTTP path:
 //!   acquire `op=push`; `DELETE /sessions/<id>` → 409; release;
-//!   re-`DELETE` → 200. Pins Phase 4's atomicity contract for delete.
+//!   re-`DELETE` → 200. Pins the atomicity contract for delete.
 //!
 //! - `integration_workspace_lock_force_release` — Daemon HTTP path:
 //!   acquire `push` (token T1); release with a different token +
@@ -52,16 +51,15 @@
 //!   Daemon HTTP path: seed a session in `Creating` state (not
 //!   `Running`); acquire → 400 with the spec-verbatim wording
 //!   `"session is in state ...; workspace operations require Running"`.
-//!   Pins Phase 3's state-gate.
+//!   Pins the state-gate.
 //!
 //! ## Workspace-mode choice for tests 2-7
 //!
-//! Per master plan § 3 (Phase 7) "backend pattern note", and confirmed
-//! against the spec § Workspace lock → API endpoints (the acquire
-//! handler's only precondition is `state == Running`, not
-//! workspace mode), tests 2-7 seed a session row directly into
-//! `SessionStore` with the default `SessionConfig` (no workspace mode)
-//! and force-transition it to `Running` via
+//! Per the spec § Workspace lock → API endpoints (the acquire
+//! handler's only precondition is `state == Running`, not workspace
+//! mode), tests 2-7 seed a session row directly into `SessionStore`
+//! with the default `SessionConfig` (no workspace mode) and
+//! force-transition it to `Running` via
 //! `SessionStore::update_state_reconcile`. There is no real container
 //! backing the session — the lock subsystem is entirely a daemon-side
 //! state machine, gated only on the persisted session state, so
@@ -71,7 +69,7 @@
 //! Test 1 (`integration_container_local_pull`) DOES require a real
 //! container because it exercises the actual rsync transport against a
 //! live `docker exec -i` shell. It uses the same alpine+rsync fixture
-//! image as M17-S2's push test.
+//! image as the push test.
 
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -509,9 +507,9 @@ struct TestNetwork {
 impl TestNetwork {
     fn create(session_id: &SessionId) -> Self {
         // Distinct /28 base from neighbouring integration test crates
-        // (M17-S2's create_and_push uses 10.97.x.y, shared-guest-path
-        // uses 10.96.x.y, container-runtime fixtures use 10.98.x.y).
-        // Use 10.95.x.y here.
+        // (create_and_push uses 10.97.x.y, shared-guest-path uses
+        // 10.96.x.y, container-runtime fixtures use 10.98.x.y). Use
+        // 10.95.x.y here.
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
