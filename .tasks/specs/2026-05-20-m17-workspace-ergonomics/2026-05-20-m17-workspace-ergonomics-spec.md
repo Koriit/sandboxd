@@ -112,13 +112,27 @@ disambiguates by content (`/` or `~`-prefix for path tokens, closed
 enum for security-model tokens) rather than by position alone. See §
 Parser for the full algorithm and grammar table.
 
-`~` expands on both sides:
+`~` expands, but only on the CLI side of the wire:
 
-- Host-side `~` resolves at parse time on the CLI invoking machine
-  (via `std::env::home_dir` equivalent), matching how shell expansion
-  would behave if the operator typed the literal path.
-- Guest-side `~` resolves to `/home/agent` at session creation time
-  (the canonical guest user home; not the host's home directory).
+- Host-side `~` resolves at parse time **only on the CLI invoking
+  machine** (via `std::env::home_dir` equivalent), matching how shell
+  expansion would behave if the operator typed the literal path. The
+  CLI rewrites the `--workspace` value to carry an absolute host path
+  before the request is sent to the daemon. The daemon parser rejects
+  any unresolved `~` in `host_path` with an explicit error
+  ("host_path must be absolute; CLI should have expanded `~` before
+  sending"). This avoids the trap where the operator's `$HOME` is
+  `/home/olek` but the daemon's `$HOME` is `/var/lib/sandbox` (the
+  project convention has the daemon running as `sandbox:sandbox`):
+  using a single parser on both sides with environment-dependent
+  expansion would otherwise produce two different results from the
+  same input string.
+- Guest-side `~` is a **literal string replacement** to `/home/agent`
+  — not a `$HOME` lookup inside the guest. The substitution runs at
+  parse time and the resolved absolute path is what goes on the wire
+  and into the session record. The choice of `/home/agent` is the
+  canonical guest user home, hardcoded in the parser; the guest
+  process environment is irrelevant to the rewrite.
 
 Both sides store **resolved absolute paths** in the session record;
 the `~` is never persisted. The serialised `WorkspaceMode::Shared` /
@@ -145,9 +159,11 @@ sandbox create --workspace shared:~/proj
 
 sandbox create --workspace shared:~/proj:~/work
                   # host_path=/home/user/proj, guest_path=/home/agent/work.
-                  # `~` resolves to /home/user on the host side and to
-                  # /home/agent on the guest side — each path is
-                  # expanded against its own side.
+                  # Host-side `~` resolves to the operator's `$HOME`
+                  # on the CLI (e.g. /home/user) before the value
+                  # goes on the wire; the daemon never sees a `~`.
+                  # Guest-side `~` is a literal substitution to
+                  # /home/agent — not a lookup inside the guest.
 
 sandbox create --workspace shared:/home/user/proj:/srv/work
                   # host_path=/home/user/proj, guest_path=/srv/work,
@@ -241,22 +257,37 @@ In `sandbox-core/src/session.rs`:
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
 pub enum WorkspaceSecurityModel {
     #[default]
+    #[serde(rename = "mapped-xattr")]
     MappedXattr,
-    None,
+    #[serde(rename = "none")]
+    NoneMapping,
 }
 
 impl WorkspaceSecurityModel {
     pub fn as_yaml(&self) -> &'static str {
         match self {
             Self::MappedXattr => "mapped-xattr",
-            Self::None => "none",
+            Self::NoneMapping => "none",
         }
     }
 }
+```
 
+The variant is named `NoneMapping` (not `None`) so it does not
+visually collide with `Option::None` in `match` arms — `match
+security_model { Some(WorkspaceSecurityModel::NoneMapping) => ... }`
+is unambiguous in a way that `Some(WorkspaceSecurityModel::None)`
+is not. The CLI token, JSON wire form, and rendered describe value
+all stay `none` via the per-variant `#[serde(rename = ...)]`
+attributes; the rename is a Rust-identifier-only change with no
+user-facing impact. (The default `#[serde(rename_all =
+"kebab-case")]` on the enum is replaced with per-variant renames
+because `NoneMapping` would otherwise serialise as
+`"none-mapping"`, which is not the desired wire form.)
+
+```rust
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkspaceMode {
@@ -308,10 +339,30 @@ Backend).
 `WorkspaceMode::parse_flag` becomes the single entry point for the
 extended grammar. The algorithm:
 
+Normalization (applied to the input string before any other step,
+in this order):
+
+1. Trim leading and trailing ASCII whitespace from the whole input.
+   `"shared:/srv/repo "` and `" shared:/srv/repo"` both parse the
+   same as `shared:/srv/repo`. Internal whitespace is not touched
+   and is preserved into `host_path` if present (it then fails the
+   existence check, since paths with leading/trailing whitespace
+   are vanishingly rare and the operator is most likely typing a
+   typo).
+2. The mode prefix is matched **case-sensitively** against the
+   exact tokens `shared` / `clone` / `local`. `Shared:/srv/repo` is
+   rejected with the existing "unknown workspace mode" error.
+3. Trailing-slash stripping on `host_path` is deferred to step C
+   (where the path is reassembled) — see step C below.
+
+Algorithm:
+
 1. **Mode prefix split.** Find the first `:`. The substring before is
    the mode (`shared`, `clone`, or `local`); the substring after is
-   the `rest` payload. Reject unknown modes with the existing
-   "unknown workspace mode" error.
+   the `rest` payload. Reject unknown modes (or an empty mode
+   prefix, e.g. `:/foo`) with the existing "unknown workspace mode"
+   error. An input with no `:` at all (e.g. the literal `"shared"`)
+   also yields this error — the mode prefix is required.
 2. **Mode `clone:`.** Treat `rest` as the repo URL verbatim (no
    colon-tokenisation — git URLs contain colons). Return
    `Clone { repo_url: rest }`. Unchanged from current behaviour.
@@ -333,6 +384,18 @@ Step A — strip a trailing security-model token (shared only):
   {`mapped-xattr`, `none`} AND mode is `shared`:
   consume `tokens[-1]` as `security_model`, leave the rest in
   `tokens`. Otherwise `security_model = None`.
+- **Friendly-hint branch (shared only).** If `len(tokens) >= 2`
+  AND `tokens[-1]` ∈ {`passthrough`, `mapped-file`} AND mode is
+  `shared`: short-circuit with the explicit error
+  "`passthrough` and `mapped-file` security models are not exposed;
+  see `docs/guides/hardening.md`. Use `mapped-xattr` (default) or
+  `none`." rather than folding the unrecognised model name into
+  `host_path`. This is the one place where the parser pre-validates
+  a suffix — the names are 9p security-model spellings, so an
+  operator who types them clearly meant the security-model slot;
+  surfacing the closed-enum boundary here is more useful than the
+  generic "host_path does not exist" failure. See § Known Gaps for
+  why other unrecognised suffixes are folded rather than hinted.
 
 Step B — strip a trailing guest-path token:
 
@@ -353,18 +416,46 @@ Step C — the remaining tokens reassemble into `host_path`:
   classifications. This is the documented compact-form footgun (see
   § Known Gaps): a literal host path of the form `/foo:none` cannot
   be expressed; the parser will see `host_path=/foo,
-  security_model=Some(None)`.
+  security_model=Some(NoneMapping)`.
+- **Trailing-slash strip.** After reassembly, a single trailing `/`
+  on `host_path` is stripped (`/srv/repo/` → `/srv/repo`). The
+  root path `/` is preserved. Multiple trailing slashes are
+  collapsed to none (`/srv/repo//` → `/srv/repo`). This
+  normalisation lives in `parse_flag` so the persisted
+  `host_path` is canonical and round-trips through the renderer
+  without churn. The same rule applies to `guest_path` when it
+  was supplied via step B.
 
 Step D — `~` expansion and absoluteness:
 
-- `host_path` and `guest_path` undergo `~` expansion (`std::env`'s
-  home dir for `host_path`; literal `/home/agent` substitution for
-  `guest_path`).
-- Both must be absolute after expansion. Reject with the existing
-  "must be absolute" error otherwise.
+- `host_path` undergoes `~` expansion **only on the CLI side** (via
+  `std::env`'s home dir, resolving to the operator's home). The
+  daemon parser does NOT perform `~` expansion on `host_path`; it
+  rejects any unresolved `~` with "host_path must be absolute; CLI
+  should have expanded `~` before sending". This split keeps the
+  parser a pure function on both sides while pinning the
+  environment-dependent step to the side that actually has the right
+  environment. See § CLI shape's `~` expansion paragraph for the
+  rationale.
+- `guest_path` undergoes `~` expansion on both sides as a literal
+  string replacement to `/home/agent` — this is environment-free, so
+  both the CLI and the daemon arrive at the same result.
+- Both paths must be absolute after expansion. Reject with the
+  existing "must be absolute" error otherwise.
 - `host_path` must exist on the host (existing check). `guest_path`
   is not checked at parse time — it is created at session-creation
   time by the backend.
+- **`local:`-only directory requirement.** When mode is `local`,
+  `host_path` must additionally be a directory:
+  `std::fs::metadata(path)?.is_dir()` must hold. A single-file
+  `host_path` is rejected with a clear error pointing at
+  `sandbox cp`: "host_path must be a directory for `local:`; to
+  seed a single file, use `sandbox cp <file> <session>:<path>`
+  after creating the session." `shared:` mode does not impose this
+  extra check — the historical contract has always allowed
+  whatever existence the host filesystem supports for `shared:`,
+  and bind-mounts of single files are a legitimate (if niche)
+  pattern.
 - If `guest_path` was not provided in the input, set it equal to the
   resolved `host_path`.
 
@@ -374,16 +465,31 @@ Disambiguation rule (formal):
 |----------------|---------------------|------------------------------------------|
 | `mapped-xattr` | security model      | mode == `shared` AND `len >= 2`          |
 | `none`         | security model      | mode == `shared` AND `len >= 2`          |
+| `passthrough`  | friendly-hint error | mode == `shared` AND `len >= 2`          |
+| `mapped-file`  | friendly-hint error | mode == `shared` AND `len >= 2`          |
 | `/...`         | guest path          | starts with `/` (post-model-strip)       |
 | `~/...`        | guest path          | starts with `~` (post-model-strip)       |
 | anything else  | merges into host    | falls through to step C                  |
+
+Note on unclassified trailing tokens: any token that fails every
+classification rule above is **folded into `host_path` by step C**
+(via `tokens.join(':')`). The parser does NOT pre-validate the
+suffix or emit a "did you mean…?" diagnostic — instead the
+host-path-exists check in step D rejects the resulting compound
+path. This is the same compact-form footgun that the `/foo:none`
+case exhibits in § Known Gaps, extended to arbitrary garbage
+suffixes; both share one diagnosis ("`host_path` does not exist")
+and one workaround (avoid colon-bearing host paths, or move the
+directory). The exception to "no pre-validation" is the
+`passthrough` / `mapped-file` early hint described in step A — see
+that step for the rationale and behaviour.
 
 Parser-unit-test matrix (minimum, see § Tests):
 
 - `shared:/srv/repo` → `host=/srv/repo, guest=/srv/repo, model=None`
 - `shared:/srv/repo:/srv/dest` → `host=/srv/repo, guest=/srv/dest, model=None`
 - `shared:/srv/repo:mapped-xattr` → `host=/srv/repo, guest=/srv/repo, model=Some(MappedXattr)`
-- `shared:/srv/repo:none` → `host=/srv/repo, guest=/srv/repo, model=Some(None)`
+- `shared:/srv/repo:none` → `host=/srv/repo, guest=/srv/repo, model=Some(NoneMapping)`
 - `shared:/srv/repo:/srv/dest:mapped-xattr` → full triple
 - `shared:/srv/repo:/srv/dest:none` → full triple, `none` model
 - `shared:~/proj` → `host=<HOME>/proj, guest=<HOME>/proj, model=None`
@@ -393,18 +499,63 @@ Parser-unit-test matrix (minimum, see § Tests):
 - `shared:/srv/repo:bogus` → host has trailing colons accumulated;
   passes parse step C, then the host-path-exists check rejects.
   Parser does not pre-validate the suffix.
+- `shared:/srv/repo:bogus:mapped-xattr` → tokens `[/srv/repo, bogus,
+  mapped-xattr]`; step A consumes the trailing `mapped-xattr` as the
+  security model; step B sees `bogus`, which does not start with `/`
+  or `~`, and skips; step C folds the remainder into
+  `host_path=/srv/repo:bogus`, `model=Some(MappedXattr)`, `guest`
+  inherits the resolved host path. The host-path-exists check rejects
+  `/srv/repo:bogus`. Documents that step-A consumption does not
+  retroactively reclassify a non-path middle token.
+- `shared:/srv/repo:/srv/dst:bogus` → tokens `[/srv/repo, /srv/dst,
+  bogus]`; step A: `bogus` is not a model token, skip; step B:
+  `bogus` does not start with `/` or `~`, skip; step C:
+  `host_path=/srv/repo:/srv/dst:bogus`. The host-path-exists check
+  rejects. Documents that an invalid trailing model name is folded
+  into the host path rather than reported as "unknown model".
+- `local:/srv/repo:bogus` → tokens `[/srv/repo, bogus]`; step A
+  skipped (mode is `local`, not `shared`); step B: `bogus` does not
+  start with `/`, skip; step C: `host_path=/srv/repo:bogus`. The
+  host-path-exists check rejects.
 - `local:/srv/repo` → `host=/srv/repo, guest=/srv/repo`
 - `local:/srv/repo:/srv/dest` → `host=/srv/repo, guest=/srv/dest`
 - `local:/srv/repo:none` → host-path-exists check rejects `/srv/repo:none`
   (no security model is meaningful for `local:`; the trailing
   `:none` is consumed into the host path).
+- `shared:/srv/repo:passthrough` → step A's friendly-hint branch
+  fires (see step A in § Parser): the parser returns
+  "`passthrough` and `mapped-file` security models are not exposed;
+  see `docs/guides/hardening.md`. Use `mapped-xattr` (default) or
+  `none`." rather than folding `passthrough` into the host path.
+- `shared:/srv/repo:mapped-file` → same friendly hint as
+  `passthrough`.
+- `""` (empty input) → "unknown workspace mode" error (mode-prefix
+  split finds no `:`).
+- `"shared"` (mode only, no colon) → "unknown workspace mode" error.
+- `":/foo"` (empty mode prefix) → "unknown workspace mode" error.
+- `shared:/srv/repo/` → trailing slash is **stripped** during
+  parsing; resulting `host_path=/srv/repo`. Documents the
+  normalization (see step C / step D normalization rules).
+- `"shared:/srv/repo "` (trailing whitespace) → leading/trailing
+  whitespace on the full input is **auto-trimmed** before parsing;
+  resulting `host_path=/srv/repo`. Documents the normalization (see
+  the normalization paragraph below).
+- `Shared:/srv/repo` (mixed-case mode prefix) → "unknown workspace
+  mode" error. Mode matching is **case-sensitive**.
 - `clone:https://example.com/x.git` → unchanged.
 
 The parser is a pure function returning `Result<WorkspaceMode,
-String>`. CLI-side validation in `sandbox-cli/src/main.rs` continues
-to call it directly so the operator sees parse errors before the
-request goes on the wire; daemon-side validation calls it again so a
-malformed payload on the API surface is rejected at the same point.
+String>`, parameterised on the caller side (CLI vs daemon) only to
+the extent that the CLI performs host-side `~` expansion before
+invoking it. CLI-side validation in `sandbox-cli/src/main.rs`
+continues to call it directly so the operator sees parse errors
+before the request goes on the wire; daemon-side validation calls
+the same function (on the already-expanded payload) so a malformed
+request body on the API surface is rejected at the same point. The
+daemon parser path rejects any residual `~` in `host_path` with the
+explicit error named in Step D — by construction this only fires if
+the CLI failed to expand (a bug) or a non-CLI client constructed the
+request directly.
 
 ## Backward Compatibility
 
@@ -612,6 +763,13 @@ See § CLI shape for the surface. Implementation notes:
 - `--dest` (pull only) defaults to the session's recorded
   `host_path`. The default is computed client-side from the same
   `GET /sessions/<id>` round-trip used for the mode check.
+- `--dest <path>` follows the same CLI-only `~` expansion rule as
+  `host_path` at create time: the CLI resolves any leading `~` to
+  the operator's `$HOME` before constructing the rsync argv, so the
+  daemon-facing surface and any persisted artefact carry only
+  absolute paths. The invariant "the daemon never sees an
+  unresolved `~`" holds uniformly across create-time and post-create
+  paths.
 - Argv layout, all variants:
 
   ```
@@ -802,17 +960,29 @@ renderer expands into a multi-line block per workspace.
 back-compat (existing JSON consumers expect a flat string). The
 renderer extends to:
 
-- `shared:<host_path>` — default guest path, default model.
-- `shared:<host_path>:<guest_path>` — explicit guest, default model.
+- `shared:<host_path>` — default guest path, no security-model
+  override (`security_model = None`).
+- `shared:<host_path>:<guest_path>` — explicit guest, no
+  security-model override.
 - `shared:<host_path>:<security_model>` — default guest, explicit
-  model.
-- `shared:<host_path>:<guest_path>:<security_model>` — full triple.
+  `Some(_)` security model.
+- `shared:<host_path>:<guest_path>:<security_model>` — full triple,
+  explicit `Some(_)` security model.
 - `clone:<repo_url>` — unchanged.
 - `local:<host_path>` / `local:<host_path>:<guest_path>` — new.
 
-The "skip default values for compactness" rule matches the parser's
-disambiguation: an output string round-trips through `parse_flag` to
-the same `WorkspaceMode`.
+The "skip default values for compactness" rule applies **only to
+`Option::None`**: a `security_model` of `None` (no override
+specified) renders without the `:<security-model>` token, but any
+`Some(_)` value renders the token verbatim regardless of whether
+its inner variant happens to match `WorkspaceSecurityModel`'s
+`#[default]`. This preserves explicit operator intent — a
+`Some(MappedXattr)` set deliberately at create time round-trips
+through the renderer and `parse_flag` back to `Some(MappedXattr)`,
+not collapsed to `None`. The DTO field `Option<WorkspaceSecurityModel>`
+is faithful to the wire-rendered string in both directions. An
+output string round-trips through `parse_flag` to the same
+`WorkspaceMode`.
 
 ### `sandbox describe` rendering
 
@@ -887,9 +1057,16 @@ Field name choices:
   Omitted for `clone:` (which has no guest path concept beyond the
   hardcoded `/home/agent/workspace/`).
 - `Security:` — `mapped-xattr` / `none`. Only emitted for
-  `shared:`. When `security_model` is `None` (default), the rendered
-  value is `mapped-xattr (default)` to make the inheritance visible
-  to the operator.
+  `shared:`. When `security_model` is `Option::None` (no operator
+  override at create time), the rendered value is
+  `mapped-xattr (default)` to make the inheritance visible to the
+  operator. When `security_model` is `Some(MappedXattr)` (the
+  operator explicitly typed `:mapped-xattr` at create time), the
+  rendered value is `mapped-xattr` (no `(default)` annotation)
+  because the value is now operator-asserted, not inherited.
+  `Some(NoneMapping)` renders as `none`. This mirrors the wire
+  surface rule (§ Wire surface): explicit `Some(_)` is preserved
+  through render.
 - `Repo:` — repo URL. `clone:` only.
 
 The byte-for-byte format above is what the unit test in § Tests
@@ -920,6 +1097,38 @@ rely on.
   absolute".
 - `parse_flag` — empty-tokens rejection: `shared:`, `local:`,
   `shared:/srv::/dst` (double colon) all return an error.
+- `parse_flag` — input normalization (SF-16 cases):
+  - Empty input `""` → "unknown workspace mode" error.
+  - Mode-only `"shared"` (no `:`) → "unknown workspace mode" error.
+  - Empty mode prefix `:/foo` → "unknown workspace mode" error.
+  - Mixed-case mode `Shared:/srv/repo` → "unknown workspace mode"
+    error (case-sensitive matching).
+  - Trailing slash `shared:/srv/repo/` → parses with
+    `host_path=/srv/repo` (strip applied in step C).
+  - Trailing whitespace `"shared:/srv/repo "` → parses with
+    `host_path=/srv/repo` (whitespace trimmed in the normalization
+    step).
+- `parse_flag` — friendly-hint branch (SF-18 cases):
+  - `shared:/srv/repo:passthrough` → error containing
+    "passthrough and mapped-file security models are not exposed".
+  - `shared:/srv/repo:mapped-file` → same friendly error.
+- `parse_flag` — local-mode directory requirement (SF-11):
+  asserting `local:<file-path>` (a regular file, not a directory)
+  fails with an error containing "must be a directory" and naming
+  `sandbox cp` as the alternative.
+- `parse_flag` — daemon-side `~` rejection (MF-1): asserting that
+  the daemon-side entry point rejects an unresolved `~` in
+  `host_path` (e.g. `shared:~/proj` on the daemon side after the
+  CLI has been bypassed) with the error
+  "host_path must be absolute; CLI should have expanded `~` before
+  sending". CLI-side parsing of the same input still expands and
+  succeeds.
+- `render_workspace_mode` round-trip — `Some(_)` preservation
+  (SF-17): construct `Shared { host=/a, guest=/a,
+  model=Some(MappedXattr) }`, render to wire string, assert it
+  contains `:mapped-xattr`. Parse the rendered string, assert the
+  parsed `security_model` equals `Some(MappedXattr)` (not collapsed
+  to `None`).
 
 `sandbox-core/src/session.rs` (backward-compat):
 
@@ -930,7 +1139,7 @@ rely on.
   model=None }`, deserialise into the same struct, assert equality
   on all three fields.
 - Forward-compat with `security_model`: serialise a `Shared` with
-  `model=Some(None)`, round-trip, assert preserved.
+  `model=Some(NoneMapping)`, round-trip, assert preserved.
 - Local round-trip: serialise/deserialise `Local { host=/a, guest=/b }`,
   assert equality.
 
@@ -941,9 +1150,9 @@ rely on.
   mapped-xattr`.
 - `Shared { host=/a, guest=/srv/work, model=None }` renders
   `mountPoint: "/srv/work"`.
-- `Shared { host=/a, guest=/a, model=Some(None) }` renders
+- `Shared { host=/a, guest=/a, model=Some(NoneMapping) }` renders
   `securityModel: none`.
-- `Shared { host=/a, guest=/srv/work, model=Some(None) }` renders both
+- `Shared { host=/a, guest=/srv/work, model=Some(NoneMapping) }` renders both
   guest path and `securityModel: none`.
 - `Local { host=/a, guest=/srv/work }` renders `mounts: []` (no 9p
   block).
@@ -1169,6 +1378,21 @@ breaking changes) documents:
   symlink; a `--workspace-host-path` / `--workspace-guest-path`
   separate-flag surface would eliminate the ambiguity — left
   deferred until a real user hits it.
+- **Unclassified-trailing-token folding.** An unrecognised trailing
+  token (e.g. `shared:/srv/repo:bogus`, `local:/srv/repo:bogus`,
+  `shared:/srv/repo:/srv/dst:bogus`) is folded into `host_path` by
+  step C rather than diagnosed as "unknown model" or "bad guest
+  path". The host-path-exists check in step D then rejects the
+  compound path with "host_path does not exist". Operators see a
+  generic error pointing at a path they probably did not intend
+  to type. The parser does not pre-validate the suffix in the
+  general case (the `passthrough` / `mapped-file` early hint in
+  step A is the one exception — those strings are recognisable as
+  attempted security-model spellings, so the targeted hint there
+  pays off). A richer per-token diagnostic surface
+  ("token `bogus` is neither a path nor a known security model")
+  would close this gap — left deferred until operator feedback
+  shows the generic error is misleading in practice.
 - **Container `--read-only` interaction with `guest_path` outside
   `/home/agent`.** Documented as an rsync-failure-at-create-time, not
   pre-validated by the daemon. A pre-flight that probes the
@@ -1518,7 +1742,7 @@ proves the spec landed.
   rsync `--include`/`--exclude` plumbing, no filesystem-watcher
   daemon, no `sandbox workspace status` subcommand.
 - **Persistence round-trip probe.** Serialise a `SessionConfig`
-  with `WorkspaceMode::Shared { host=/a, guest=/b, model=Some(None) }`,
+  with `WorkspaceMode::Shared { host=/a, guest=/b, model=Some(NoneMapping) }`,
   persist via the store, re-load, confirm round-trip.
   Serialise `WorkspaceMode::Local { host=/a, guest=/b }`, persist,
   re-load, confirm round-trip. Hand-craft a legacy JSON blob with no
