@@ -320,19 +320,36 @@ def wait_for_socket(vm_name, sock_path, *, timeout=SOCKET_WAIT_TIMEOUT):
     shell`` lands as is not in the ``sandbox`` group, so an unprivileged
     ``test -S`` would always fail with EACCES regardless of whether the
     socket exists.
+
+    Each per-poll ``limactl shell`` invocation gets its own short
+    inner timeout. Under host load ``limactl shell`` itself can take
+    several seconds just to start, so without the catch a single slow
+    probe would propagate ``subprocess.TimeoutExpired`` and abort
+    ``wait_for_socket`` long before its outer budget expired. We swallow
+    *only* ``TimeoutExpired`` here — every other exception from
+    ``lima_shell`` is a real failure and must keep propagating.
     """
     deadline = time.monotonic() + timeout
+    last_error = "no probe completed"
     while time.monotonic() < deadline:
-        result = lima_shell(
-            vm_name,
-            f"sudo test -S {sock_path} && echo ok",
-            timeout=10,
-        )
-        if result.returncode == 0 and "ok" in result.stdout:
-            return
+        try:
+            result = lima_shell(
+                vm_name,
+                f"sudo test -S {sock_path} && echo ok",
+                timeout=5,
+            )
+            if result.returncode == 0 and "ok" in result.stdout:
+                return
+            last_error = (
+                f"rc={result.returncode} stdout={result.stdout!r} "
+                f"stderr={result.stderr!r}"
+            )
+        except subprocess.TimeoutExpired as e:
+            last_error = f"limactl shell timed out after {e.timeout}s"
         time.sleep(2)
     raise AssertionError(
-        f"{sock_path} did not appear in {vm_name} within {timeout}s"
+        f"{sock_path} did not appear in {vm_name} within {timeout}s; "
+        f"last={last_error}"
     )
 
 

@@ -1131,7 +1131,9 @@ impl axum::serve::Listener for PeerCredListener {
             };
 
             let uid_raw = ucred.uid();
-            match resolve_uid_to_name(uid_raw) {
+            match resolve_uid_to_name_with_retry(uid_raw, UID_RESOLVE_ATTEMPTS, UID_RESOLVE_BACKOFF)
+                .await
+            {
                 Some(name) => {
                     return (
                         stream,
@@ -1141,7 +1143,8 @@ impl axum::serve::Listener for PeerCredListener {
                 None => {
                     warn!(
                         uid = uid_raw,
-                        "peer uid does not resolve to a username; closing connection"
+                        attempts = UID_RESOLVE_ATTEMPTS,
+                        "peer uid does not resolve to a username after retries; closing connection"
                     );
                     drop(stream);
                     continue;
@@ -1168,6 +1171,18 @@ impl axum::serve::Listener for PeerCredListener {
     }
 }
 
+/// Total attempts (initial + retries) for [`resolve_uid_to_name_with_retry`].
+///
+/// `getpwuid_r` can return transient `Ok(None)` for a valid uid under
+/// host load (concurrent `/etc/passwd` readers/writers, NSS cache
+/// eviction, slow NSS modules). Three attempts with a short backoff
+/// absorb these transient absences without measurably delaying the
+/// happy path or stretching the genuine-deny path.
+const UID_RESOLVE_ATTEMPTS: u32 = 3;
+
+/// Backoff between successive `getpwuid_r` attempts.
+const UID_RESOLVE_BACKOFF: Duration = Duration::from_millis(50);
+
 /// Resolve a uid to a username via `getpwuid_r`. Returns `None` on any
 /// error (lookup failure or no matching record) so callers can collapse
 /// "Err" and "Ok(None)" to the same "deny" path.
@@ -1179,6 +1194,39 @@ fn resolve_uid_to_name(uid: u32) -> Option<String> {
         Ok(None) => None,
         Err(_) => None,
     }
+}
+
+/// [`resolve_uid_to_name`] with bounded retry + backoff to absorb
+/// transient `getpwuid_r` failures under host load. A persistently
+/// missing passwd entry (uid genuinely not in `/etc/passwd` / NSS)
+/// still returns `None` after `attempts` tries, so the peer-cred
+/// listener's deny path is unchanged for that case — just delayed
+/// by ~`(attempts - 1) * backoff` in the worst case.
+async fn resolve_uid_to_name_with_retry(
+    uid: u32,
+    attempts: u32,
+    backoff: Duration,
+) -> Option<String> {
+    retry_lookup(attempts, backoff, || resolve_uid_to_name(uid)).await
+}
+
+/// Generic retry-with-backoff wrapper around a synchronous fallible
+/// lookup. Extracted from [`resolve_uid_to_name_with_retry`] so the
+/// retry/backoff logic itself is unit-testable (the live
+/// `getpwuid_r`-backed lookup is exercised by integration tests).
+async fn retry_lookup<T, F>(attempts: u32, backoff: Duration, mut lookup: F) -> Option<T>
+where
+    F: FnMut() -> Option<T>,
+{
+    for attempt in 0..attempts {
+        if let Some(value) = lookup() {
+            return Some(value);
+        }
+        if attempt + 1 < attempts {
+            tokio::time::sleep(backoff).await;
+        }
+    }
+    None
 }
 
 /// Bridge from axum's `Connected` trait into the request extension
@@ -10420,5 +10468,70 @@ mod tests {
              `sandboxd <semver>\\n`; any extra token silently breaks \
              Spec 4 § 4.4.5's `awk '{{print $2}}'` parse"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // retry_lookup — bounded retry/backoff wrapper used by
+    // `resolve_uid_to_name_with_retry` on the peer-cred accept path.
+    //
+    // The live `getpwuid_r`-backed lookup is exercised by the
+    // integration tests (e.g. `integration_route_helper_uid_without_passwd_*`);
+    // here we just pin the retry/backoff scheduling itself so a
+    // refactor of the loop body cannot silently drop retries or
+    // misorder the early-return.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn retry_lookup_returns_first_success_without_retrying() {
+        let mut calls: u32 = 0;
+        let result = retry_lookup(3, Duration::from_millis(0), || {
+            calls += 1;
+            Some("alice")
+        })
+        .await;
+        assert_eq!(result, Some("alice"));
+        assert_eq!(
+            calls, 1,
+            "happy path must not consume backoff or extra attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_lookup_recovers_on_later_attempt() {
+        let mut calls: u32 = 0;
+        let result = retry_lookup(3, Duration::from_millis(0), || {
+            calls += 1;
+            if calls < 3 { None } else { Some("bob") }
+        })
+        .await;
+        assert_eq!(result, Some("bob"));
+        assert_eq!(calls, 3, "must keep retrying until success or exhaustion");
+    }
+
+    #[tokio::test]
+    async fn retry_lookup_exhausts_attempts_and_returns_none() {
+        let mut calls: u32 = 0;
+        let result: Option<&'static str> = retry_lookup(3, Duration::from_millis(0), || {
+            calls += 1;
+            None
+        })
+        .await;
+        assert_eq!(result, None);
+        assert_eq!(
+            calls, 3,
+            "persistent absence must still hit the deny path after exactly `attempts` tries"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_lookup_with_zero_attempts_never_calls_lookup() {
+        let mut calls: u32 = 0;
+        let result: Option<&'static str> = retry_lookup(0, Duration::from_millis(0), || {
+            calls += 1;
+            Some("never")
+        })
+        .await;
+        assert_eq!(result, None);
+        assert_eq!(calls, 0);
     }
 }
