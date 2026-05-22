@@ -3,7 +3,7 @@ name: Release
 # Tag-triggered release pipeline.
 #
 # The release process is: bump every workspace crate's `version` field
-# (sandboxd/*/Cargo.toml) to X.Y.Z, commit on main, tag vX.Y.Z, push the
+# (sandboxd/*/Cargo.toml) to X.Y.Z, commit on master, tag vX.Y.Z, push the
 # tag. This workflow fires on the tag push and builds against the tagged
 # commit. Pre-release tags (-rc1, -alpha.2) are supported by the second
 # pattern so release-candidate testing uses the same pipeline. The
@@ -210,7 +210,7 @@ jobs:
   # However § 4.1 explicitly states "The release workflow does NOT
   # re-publish the scripts (they ride the docs deploy)" — the canonical
   # path is for `docs.yml` to pick up `site/public/install.sh` (a copy
-  # or symlink of `scripts/install.sh`) on every push to main.
+  # or symlink of `scripts/install.sh`) on every push to master.
   #
   # Following § 4.1 (the authoritative hosting section), this workflow
   # therefore intentionally does not publish the install scripts. The

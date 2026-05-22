@@ -2,7 +2,7 @@ name: Docs site
 
 on:
   push:
-    branches: [main]
+    branches: [master]
     paths:
       - 'docs/**'
       - 'site/**'
@@ -85,7 +85,7 @@ jobs:
 
   deploy:
     needs: build
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
