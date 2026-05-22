@@ -538,20 +538,21 @@ Six properties verified: `WorkspaceMode::Shared { Some(NoneMapping) }` round-tri
 
 Container subset (`make test-e2e-container`): clean at 72/72 after the in-session padding-assertion fix to `tests/e2e/test_workspace_local.py:198-204` (M17-S4 Phase A's `describe` column-padding change cascaded into typed-byte E2E fragment assertions).
 
-Matrix run (`make test-e2e-matrix`, both backends): 1h 42m wall-clock; 129/137 passed, 8 failed (4 tests × 2 backends, all in `test_workspace_local.py`). Investigation:
+Matrix run (`make test-e2e-matrix`, both backends): 1h 42m wall-clock; 129/137 passed, 8 failed (4 functions × 2 backends, all in `test_workspace_local.py`). Root cause: a test-design defect in `_guest_path_for` (`tests/e2e/test_workspace_local.py:50-60`).
 
-- All 8 failed tests pass cleanly in isolation post-matrix:
-  - `test_workspace_local_create_and_describe[container]` — PASSED 2:30 (isolated)
-  - `test_workspace_local_gitignore_filter[container]` — PASSED 2:51 (isolated)
-  - `test_workspace_local_create_and_describe[lima]` — passed in isolation during M17-S4 Phase 8 work
-  - `test_workspace_local_push_propagates_host_edit[container]` — passed in isolation during M17-S4 Phase 8 work (3:26)
-  - `test_workspace_local_pull_propagates_guest_edit[container]` — passed in isolation during M17-S4 Phase 8 work (3:05)
-- No orphan Docker networks / containers / Lima VMs survive across runs (`docker network ls`, `docker ps -a`, `limactl list` all clean after the matrix).
-- Memory budget: 9.7Gi total, 5.2Gi available post-matrix — not exhausted.
+The helper returned `/srv/work` for the Lima backend on the assumption that "Lima sessions have a fully writable rootfs". That assumption is wrong: the Lima rootfs is writable by `root`, but the on-create rsync push runs over `limactl shell` as user `agent` (uid 1000) and cannot `mkdir` under root-owned `/srv`. Every Lima-half test failed with:
 
-**Diagnosis.** The 8 failures match the canonical cumulative-state flake pattern documented in `CLAUDE.md`'s E2E guidance: "Run failing E2E tests individually during debugging. Only run full suite for final validation." Long matrix runs share host-level state (test daemons' base directories, Docker network pool, rsync fixture image, port allocations) and exhibit non-determinism that vanishes under isolation. The underlying behaviours are verifiably correct: every assertion the matrix tests check is also pinned by the 1609-test default-profile unit suite (`cargo nextest run --workspace`) and the 13-test integration profile (`cargo nextest run --workspace --profile integration`), both of which are green.
+```
+local-workspace rsync failed (exit 11): rsync: [Receiver] mkdir "/srv/work/" failed: Permission denied (13)
+```
 
-**Disposition.** The matrix exit criterion is interpreted as **"individual tests pass in isolation post-fix"**, consistent with the project's documented E2E debugging convention. Matrix resilience hardening (cleanup-between-tests, port-pool isolation, fixture-image refresh) is a separate test-infrastructure concern and is **tracked as a new follow-on todo** rather than blocking M17 closure.
+The container-half failures during the same matrix run were cascaded noise from interleaved test cleanup against sessions that had failed to leave the `Creating` state.
+
+**Fix.** Single-line change to the helper: return `/home/agent/work` for both backends. `/home/agent` is `agent`-owned on both Lima and the lite image, so rsync's `--mkpath` can create the destination. Docstring rewritten to record the uid-1000 constraint so the next reviewer doesn't re-introduce the same assumption.
+
+**Post-fix verification (committed alongside this delivery file).** All 4 Lima tests pass cleanly in a single targeted rerun (`pytest test_workspace_local.py -k lima -v --timeout=600`) in 9:04. The same `-k` filter run via `make test-e2e-matrix TEST='test_workspace_local.py -k "create_and_describe or gitignore_filter or push_propagates_host_edit or pull_propagates_guest_edit"'` passes all 8 (4 functions × 2 backends).
+
+**Earlier misdiagnosis disclosed.** Before locating the root cause this section attributed the 8 failures to a cumulative-state flake pattern and tracked a now-dropped follow-on todo for "matrix-resilience hardening". That diagnosis was wrong — the failure is deterministic, not flaky. Documenting it here so a future reader knows the matrix is not actually fragile under load on this workload.
 
 ---
 

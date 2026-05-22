@@ -50,14 +50,16 @@ from conftest import (
 def _guest_path_for(backend: str) -> str:
     """Return a writable guest path appropriate for ``backend``.
 
-    Lima sessions have a fully writable rootfs, so any absolute path
-    (e.g. ``/srv/work``) is safe. Lite containers run with
-    ``--read-only`` and writable tmpfs/volume mounts at
-    ``/home/agent``, ``/tmp``, ``/run``; we route the local-mode
-    snapshot under ``/home/agent`` so rsync's ``--mkpath`` can create
-    the parent directory inside a writable area.
+    The on-create rsync push runs over the shell transport as
+    ``agent`` (uid 1000), so the destination's parent must be
+    writable by that uid. On both backends ``/home/agent`` is
+    ``agent``-owned, so ``/home/agent/work`` works uniformly. Other
+    paths like ``/srv/work`` look attractive on Lima because the
+    rootfs is fully writable, but only by ``root`` — rsync's
+    ``--mkpath`` would need to ``mkdir`` under root-owned ``/srv``
+    and fails with ``Permission denied (13)``.
     """
-    return "/home/agent/work" if backend == "container" else "/srv/work"
+    return "/home/agent/work"
 
 
 def _no_orphan_lima_vm(session_id: str) -> bool:
