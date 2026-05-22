@@ -5367,13 +5367,19 @@ fn invoked_as_remote_helper() -> bool {
 
 /// Parse a `sandbox::` URL into (session, repo_path).
 ///
-/// URL format: `sandbox::<session>/<repo-path>`
+/// URL format: `sandbox::<session>[/<repo-path>]`
 /// The part after `sandbox::` is passed as the second argument to the
-/// remote helper. It has the form `<session>/<repo-path>` where repo-path
-/// can contain slashes.
+/// remote helper. It has the form `<session>[/<repo-path>]` where
+/// repo-path can contain slashes; when no slash is present, the caller
+/// is expected to resolve the repo path from the session's workspace
+/// configuration via the daemon.
 ///
-/// Returns `(session, repo_path)`.
-fn parse_remote_helper_url(url: &str) -> Result<(String, String), String> {
+/// Returns `(session, Some(repo_path))` when the URL contained a slash
+/// and `(session, None)` when the URL is slash-less. The runtime
+/// caller in [`run_remote_helper`] resolves the slash-less case by
+/// querying the daemon for the session's `guest_path` (see
+/// [`resolve_default_repo_path`]).
+fn parse_remote_helper_url(url: &str) -> Result<(String, Option<String>), String> {
     // The URL git passes to us is the part after "sandbox::" — but git may
     // also pass the full URL including the scheme prefix in some cases.
     let payload = url.strip_prefix("sandbox::").unwrap_or(url);
@@ -5388,13 +5394,36 @@ fn parse_remote_helper_url(url: &str) -> Result<(String, String), String> {
         if repo_path.is_empty() || repo_path == "/" {
             return Err(format!("empty repo path in URL: {url}"));
         }
-        Ok((session.to_string(), repo_path.to_string()))
+        Ok((session.to_string(), Some(repo_path.to_string())))
     } else {
-        // No slash — treat the whole thing as session, use default repo path.
+        // No slash — treat the whole thing as session; the caller resolves
+        // the repo path from the session DTO at runtime.
         if payload.is_empty() {
             return Err(format!("empty URL: {url}"));
         }
-        Ok((payload.to_string(), "/home/agent/workspace".to_string()))
+        Ok((payload.to_string(), None))
+    }
+}
+
+/// Pick the default repo path for a slash-less `sandbox::<session>`
+/// remote-helper URL given the session's `workspace_mode_detail`.
+///
+/// - `Shared { guest_path, .. }` and `Local { guest_path, .. }`
+///   → use that guest_path (M17 made the guest mount point
+///   operator-configurable, so we must read it from the DTO rather
+///   than assume `/home/agent/workspace`).
+/// - `Clone { .. }` and `None` (no workspace, or an older daemon
+///   that doesn't populate the detail field) → fall back to
+///   `/home/agent/workspace`. Clone-mode sessions land the repo at
+///   that path by convention, and an older daemon that omits the
+///   field could have been a pre-M17 session in shared-mode at the
+///   historical default — falling back preserves backward
+///   compatibility in both shapes.
+fn resolve_default_repo_path(detail: Option<&WorkspaceModeDetailDto>) -> String {
+    match detail {
+        Some(WorkspaceModeDetailDto::Shared { guest_path, .. })
+        | Some(WorkspaceModeDetailDto::Local { guest_path, .. }) => guest_path.clone(),
+        Some(WorkspaceModeDetailDto::Clone { .. }) | None => "/home/agent/workspace".to_string(),
     }
 }
 
@@ -5406,7 +5435,7 @@ fn parse_remote_helper_url(url: &str) -> Result<(String, String), String> {
 /// - Git sends `capabilities\n` → we respond `connect\n\n`
 /// - Git sends `connect <service>\n` → we respond `\n` then proxy
 ///   stdin/stdout to the daemon's git endpoint for that service.
-fn run_remote_helper() {
+async fn run_remote_helper() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!("Usage: git-remote-sandbox <remote-name> <url>");
@@ -5416,7 +5445,7 @@ fn run_remote_helper() {
 
     let url = &args[2];
 
-    let (session, repo_path) = match parse_remote_helper_url(url) {
+    let (session, repo_path_opt) = match parse_remote_helper_url(url) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("Error: {e}");
@@ -5429,6 +5458,71 @@ fn run_remote_helper() {
     // not available in remote-helper mode (git controls argv), so the env var
     // is the only override path here.
     let socket_path = default_socket_path();
+
+    // For slash-less URLs (`sandbox::<session>` with no path), resolve the
+    // default repo path from the session's workspace configuration. M17
+    // made the guest mount point operator-configurable, so we can no
+    // longer assume `/home/agent/workspace`. On daemon error (404,
+    // network, parse) we print a helpful message and exit non-zero —
+    // never silently fall back, since that would surface the wrong
+    // directory to git.
+    let repo_path = match repo_path_opt {
+        Some(p) => p,
+        None => {
+            let req = match Request::builder()
+                .method("GET")
+                .uri(format!("/sessions/{session}"))
+                .body(String::new())
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!(
+                        "Error: failed to build session lookup request for `{url}`: {e}\n\
+                         Hint: pass an explicit path, e.g. `sandbox::{session}/<repo-path>`."
+                    );
+                    process::exit(1);
+                }
+            };
+
+            let lookup = send_request(&socket_path, req).await;
+
+            match lookup {
+                Ok((status, body)) if status.is_success() => {
+                    match serde_json::from_str::<SessionDto>(&body) {
+                        Ok(dto) => {
+                            resolve_default_repo_path(dto.config.workspace_mode_detail.as_ref())
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "Error: failed to parse session response for `{url}`: {e}\n\
+                                 Hint: pass an explicit path, e.g. `sandbox::{session}/<repo-path>`."
+                            );
+                            process::exit(1);
+                        }
+                    }
+                }
+                Ok((status, body)) => {
+                    let detail = if let Ok(api_err) = serde_json::from_str::<ApiError>(&body) {
+                        api_err.error
+                    } else {
+                        format!("HTTP {status}: {body}")
+                    };
+                    eprintln!(
+                        "Error: cannot resolve default repo path for `{url}` — {detail}\n\
+                         Hint: pass an explicit path, e.g. `sandbox::{session}/<repo-path>`."
+                    );
+                    process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Error: cannot resolve default repo path for `{url}` — {e}\n\
+                         Hint: pass an explicit path, e.g. `sandbox::{session}/<repo-path>`."
+                    );
+                    process::exit(1);
+                }
+            }
+        }
+    };
 
     // Read commands from stdin line by line.
     // We track a pending `connect` service so we can break out of the loop
@@ -6145,7 +6239,7 @@ async fn dispatch_create_preflight(
 async fn main() {
     // Check if we were invoked as git-remote-sandbox (git remote helper mode).
     if invoked_as_remote_helper() {
-        run_remote_helper();
+        run_remote_helper().await;
         return;
     }
 
@@ -7331,7 +7425,10 @@ mod tests {
         let (session, repo_path) =
             parse_remote_helper_url("my-session/home/agent/workspace/repo.git").unwrap();
         assert_eq!(session, "my-session");
-        assert_eq!(repo_path, "/home/agent/workspace/repo.git");
+        assert_eq!(
+            repo_path,
+            Some("/home/agent/workspace/repo.git".to_string())
+        );
     }
 
     #[test]
@@ -7340,15 +7437,28 @@ mod tests {
         let (session, repo_path) =
             parse_remote_helper_url("sandbox::my-session/home/agent/workspace/repo").unwrap();
         assert_eq!(session, "my-session");
-        assert_eq!(repo_path, "/home/agent/workspace/repo");
+        assert_eq!(repo_path, Some("/home/agent/workspace/repo".to_string()));
     }
 
     #[test]
     fn parse_remote_helper_url_session_only() {
-        // No slash — defaults to /home/agent/workspace.
+        // No slash — the path is left unresolved (None) so the caller
+        // can derive the default from the session's workspace
+        // configuration via the daemon. M17 made the guest mount point
+        // operator-configurable, so the parser must not bake in the
+        // historical `/home/agent/workspace` default.
         let (session, repo_path) = parse_remote_helper_url("my-session").unwrap();
         assert_eq!(session, "my-session");
-        assert_eq!(repo_path, "/home/agent/workspace");
+        assert_eq!(repo_path, None);
+    }
+
+    #[test]
+    fn parse_remote_helper_url_session_only_with_scheme_prefix() {
+        // Same as above but with the `sandbox::` prefix git sometimes
+        // includes when invoking the helper.
+        let (session, repo_path) = parse_remote_helper_url("sandbox::my-session").unwrap();
+        assert_eq!(session, "my-session");
+        assert_eq!(repo_path, None);
     }
 
     #[test]
@@ -7360,6 +7470,49 @@ mod tests {
     fn parse_remote_helper_url_empty_session() {
         // Starts with slash — empty session name.
         assert!(parse_remote_helper_url("/home/agent/workspace").is_err());
+    }
+
+    // -- resolve_default_repo_path tests ------------------------------------
+
+    #[test]
+    fn resolve_default_repo_path_shared_uses_guest_path() {
+        let detail = WorkspaceModeDetailDto::Shared {
+            host_path: "/host/proj".into(),
+            guest_path: "/mnt/work".into(),
+            security_model: None,
+        };
+        assert_eq!(resolve_default_repo_path(Some(&detail)), "/mnt/work");
+    }
+
+    #[test]
+    fn resolve_default_repo_path_local_uses_guest_path() {
+        let detail = WorkspaceModeDetailDto::Local {
+            host_path: "/host/proj".into(),
+            guest_path: "/srv/repo".into(),
+        };
+        assert_eq!(resolve_default_repo_path(Some(&detail)), "/srv/repo");
+    }
+
+    #[test]
+    fn resolve_default_repo_path_clone_uses_legacy_default() {
+        // Clone-mode sessions land the repo at /home/agent/workspace
+        // by convention; the parser default preserves that for slash-
+        // less URLs.
+        let detail = WorkspaceModeDetailDto::Clone {
+            repo_url: "https://example/r.git".into(),
+        };
+        assert_eq!(
+            resolve_default_repo_path(Some(&detail)),
+            "/home/agent/workspace"
+        );
+    }
+
+    #[test]
+    fn resolve_default_repo_path_none_uses_legacy_default() {
+        // No workspace, or an older daemon that doesn't populate
+        // `workspace_mode_detail` — fall back to the historical
+        // default for backward compatibility.
+        assert_eq!(resolve_default_repo_path(None), "/home/agent/workspace");
     }
 
     // -- No-cache and yes flag tests ------------------------------------------
