@@ -1712,6 +1712,16 @@ async fn send_request_with_timeout(
         // Spec 3 § 7.3.
         enforce_version_handshake(&mut sender).await?;
 
+        // Wait until the connection's internal dispatcher is ready for the
+        // next request. The `conn` task signals readiness asynchronously
+        // (via hyper's `want` mechanism) after processing the version-check
+        // response; without this `.ready()` await the second `send_request`
+        // can race with the signal and fail with "connection was not ready".
+        sender
+            .ready()
+            .await
+            .map_err(|e| format!("request failed: {e}"))?;
+
         let response = sender
             .send_request(req)
             .await
