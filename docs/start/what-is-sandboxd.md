@@ -42,4 +42,4 @@ It is probably not what you want if you need sub-second start-up, macOS guests, 
 
 The CLI talks to a single daemon over a Unix socket. The daemon owns session lifecycle, drives `limactl` to manage VMs, allocates per-session Docker bridges, and compiles policy rules into configuration for Envoy, mitmproxy, CoreDNS, and nftables. A guest agent inside each VM handles command execution and file transfer.
 
-For the full component breakdown and the traffic path, see [Architecture](/concepts/architecture/). When you are ready to install, jump to [Installation](/start/installation/) or the [Quickstart](/start/quickstart/).
+For the full component breakdown and the traffic path, see [Architecture](/sandboxd/concepts/architecture/). When you are ready to install, jump to [Installation](/sandboxd/start/installation/) or the [Quickstart](/sandboxd/start/quickstart/).

@@ -5,7 +5,7 @@ description: Drive sandboxd from Claude Code, another coding agent, or a CI runn
 
 sandboxd is designed to be driven non-interactively. This guide shows you how to plug it into a coding agent or a CI runner: create a session from a script, run commands in it, copy artifacts in and out, and tear it down cleanly.
 
-You need sandboxd installed and the daemon running. See [Installation](/start/installation/) and the [Quickstart](/start/quickstart/) if you are starting from zero.
+You need sandboxd installed and the daemon running. See [Installation](/sandboxd/start/installation/) and the [Quickstart](/sandboxd/start/quickstart/) if you are starting from zero.
 
 ## The non-interactive surface
 
@@ -24,7 +24,7 @@ Plus the teardown pair:
 | `sandbox stop <session>` | Halt the VM, keep the config. Fast restart later. |
 | `sandbox rm <session>` | Full teardown. Session ID is gone. |
 
-Most of these are thin wrappers around the [HTTP API](/reference/http-api/) — `create`, `exec`, `stop`, and `rm` each map to a single endpoint. `sandbox cp` is the exception: it resolves the session via the API and then dispatches to the backend's native copy tool (`limactl cp` for Lima, `docker cp` for the container backend), so the data path never crosses the daemon. If you want to skip the CLI and speak HTTP over the Unix socket directly, the reference page documents every endpoint.
+Most of these are thin wrappers around the [HTTP API](/sandboxd/reference/http-api/) — `create`, `exec`, `stop`, and `rm` each map to a single endpoint. `sandbox cp` is the exception: it resolves the session via the API and then dispatches to the backend's native copy tool (`limactl cp` for Lima, `docker cp` for the container backend), so the data path never crosses the daemon. If you want to skip the CLI and speak HTTP over the Unix socket directly, the reference page documents every endpoint.
 
 ## Pattern 1: one-shot run from a shell script
 
@@ -72,7 +72,7 @@ Coding agents like Claude Code typically want to keep a session alive across man
 2. **Per tool call**: `sandbox exec claude-$SESSION -- <cmd>` or `sandbox cp ...`.
 3. **At agent exit**: `sandbox stop claude-$SESSION` (fast restart later) or `sandbox rm` (clean slate).
 
-Using `--workspace shared:$PROJECT_DIR` mounts a host directory into the VM at `/home/agent/workspace` over 9p, so changes the agent makes inside the session are immediately visible on the host and vice versa. See [Workspaces](/guides/workspaces/) for details.
+Using `--workspace shared:$PROJECT_DIR` mounts a host directory into the VM at `/home/agent/workspace` over 9p, so changes the agent makes inside the session are immediately visible on the host and vice versa. See [Workspaces](/sandboxd/guides/workspaces/) for details.
 
 Example: a Python wrapper that an agent might use.
 
@@ -189,7 +189,7 @@ When integrating into an agent, a good pattern is to tail the log in the backgro
 
 ## What to read next
 
-- [HTTP API reference](/reference/http-api/) — skip the CLI and speak JSON directly.
-- [Workspaces](/guides/workspaces/) — `shared:` vs `clone:` trade-offs.
-- [Network policies](/guides/network-policies/) — author policies that your agent ships with its tools.
-- [Hardening](/guides/hardening/) — lock down the host side before running untrusted code inside a session.
+- [HTTP API reference](/sandboxd/reference/http-api/) — skip the CLI and speak JSON directly.
+- [Workspaces](/sandboxd/guides/workspaces/) — `shared:` vs `clone:` trade-offs.
+- [Network policies](/sandboxd/guides/network-policies/) — author policies that your agent ships with its tools.
+- [Hardening](/sandboxd/guides/hardening/) — lock down the host side before running untrusted code inside a session.

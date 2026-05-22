@@ -5,7 +5,7 @@ description: Diagnose and fix common sandboxd issues — VM boot failures, gatew
 
 Common issues and solutions for sandboxd operators. Each section lists the symptom, how to diagnose it, and how to fix it.
 
-If you are just getting started, check [Installation](/start/installation/) for setup-time errors. For command reference, see the [CLI reference](/reference/cli/).
+If you are just getting started, check [Installation](/sandboxd/start/installation/) for setup-time errors. For command reference, see the [CLI reference](/sandboxd/reference/cli/).
 
 ## Which layer denied my request?
 
@@ -221,7 +221,7 @@ sandbox events <session> --layer=deny-logger --decision=deny --follow
 
 Walk the checklist:
 
-1. **Does any rule cover the destination?** A UDP rule must declare `protocol: "udp"` explicitly; a TCP rule does not implicitly cover UDP. Confirm with `sandbox describe <session>`. If the destination isn't named, add a `transport`-level UDP rule (see [the UDP destinations section](/guides/network-policies/#udp-destinations)) and `sandbox policy update`.
+1. **Does any rule cover the destination?** A UDP rule must declare `protocol: "udp"` explicitly; a TCP rule does not implicitly cover UDP. Confirm with `sandbox describe <session>`. If the destination isn't named, add a `transport`-level UDP rule (see [the UDP destinations section](/sandboxd/guides/network-policies/#udp-destinations)) and `sandbox policy update`.
 2. **Did DNS propagate the IP into `policy_allow_udp`?** For domain-based UDP rules (e.g. `ntp.ubuntu.com:123`), the rule's IPs land in nft only after CoreDNS resolves them and sandboxd injects them. A bare-IP UDP rule (CIDR literal) is in the set immediately. Check the live state:
    ```bash
    docker exec sandbox-gw-<session_id> nft list set inet sandbox_dnat policy_allow_udp
@@ -268,7 +268,7 @@ docker exec sandbox-gw-<session_id> sysctl net.netfilter.nf_conntrack_udp_timeou
 docker exec sandbox-gw-<session_id> conntrack -L -p udp 2>/dev/null
 ```
 
-The expected per-flow audit shape is documented in [policy model → UDP-specific caveats](/concepts/policy-model/#udp-specific-caveats) and the design rationale in the [UDP subsection of the networking design](/concepts/networking/#nftables).
+The expected per-flow audit shape is documented in [policy model → UDP-specific caveats](/sandboxd/concepts/policy-model/#udp-specific-caveats) and the design rationale in the [UDP subsection of the networking design](/sandboxd/concepts/networking/#nftables).
 
 ### Why don't I get ICMP unreachable on a denied UDP send?
 
@@ -317,7 +317,7 @@ sandbox policy status <session> --wait --timeout 10s
 
 `sandbox policy status --wait` polls until the session's applied policy hash matches the most recent `policy_propagated` lifecycle event, then exits 0. Under the hood the same event is available on the unified stream as `sandbox events <session> --event policy_propagated --follow`.
 
-See [networking → Synchronous DNS-policy gating](/concepts/networking/#synchronous-dns-policy-gating) for the design.
+See [networking → Synchronous DNS-policy gating](/sandboxd/concepts/networking/#synchronous-dns-policy-gating) for the design.
 
 ### Non-HTTP traffic to a level `http` destination
 
@@ -395,7 +395,7 @@ Fix: filter by `layer=mitmproxy` and the session ID, not by a VM bridge IP. The 
 
 **Symptom:** A deny event on the deny-logger layer shows a destination IP that does not match what the application dialed.
 
-`sandbox-nft-deny-logger` records the original 5-tuple from the kernel, before any DNAT could mutate it. The exact source depends on protocol: TCP-deny reads the pre-DNAT destination via `SO_ORIGINAL_DST` on the accepted (DNAT-redirected) socket; UDP-deny pulls the 5-tuple from the kernel-emitted NFLOG group 1 message (and there is no DNAT on the UDP-deny path, so the destination in the NFLOG payload is literally what the VM dialed). Either way the event names what the VM was trying to reach, not the gateway's listener address. See the [networking concept guide](/concepts/networking/) for the full datapath.
+`sandbox-nft-deny-logger` records the original 5-tuple from the kernel, before any DNAT could mutate it. The exact source depends on protocol: TCP-deny reads the pre-DNAT destination via `SO_ORIGINAL_DST` on the accepted (DNAT-redirected) socket; UDP-deny pulls the 5-tuple from the kernel-emitted NFLOG group 1 message (and there is no DNAT on the UDP-deny path, so the destination in the NFLOG payload is literally what the VM dialed). Either way the event names what the VM was trying to reach, not the gateway's listener address. See the [networking concept guide](/sandboxd/concepts/networking/) for the full datapath.
 
 ## File transfer failures
 

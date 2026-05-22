@@ -3,7 +3,7 @@ title: Networking
 description: The per-session network, gateway container, DNS interception, nftables, and TLS interception — as a model you can reason about.
 ---
 
-Every sandbox session gets its own network stack with a single exit: the gateway container. This page explains the model — what exists, why, and how a packet travels from inside the VM to the internet. For hands-on rule writing, see [network policies](/guides/network-policies/).
+Every sandbox session gets its own network stack with a single exit: the gateway container. This page explains the model — what exists, why, and how a packet travels from inside the VM to the internet. For hands-on rule writing, see [network policies](/sandboxd/guides/network-policies/).
 
 ## The model in one picture
 
@@ -27,7 +27,7 @@ Each VM has two network interfaces, with very different roles:
 
 `eth0` exists because Lima needs an SSH channel to the VM and SLIRP provides one without requiring TAP devices or root on the host. It is **not** a path for user workloads: the guest installs a default route over `eth1` with a lower metric than SLIRP's, so any `connect()` from an application inside the VM goes out through the gateway, not through SLIRP. The SLIRP interface is effectively invisible to applications running inside the VM.
 
-This matters for the threat model: the policy layer (DNS filtering, nftables, Envoy, mitmproxy) applies to traffic that reaches the gateway. That covers the entire data plane by construction. SLIRP carries only the Lima management channel; it doesn't and can't carry application traffic to arbitrary internet destinations. See [SLIRP management network](/guides/hardening/#slirp-management-network) in the hardening guide for the trade-offs this design makes.
+This matters for the threat model: the policy layer (DNS filtering, nftables, Envoy, mitmproxy) applies to traffic that reaches the gateway. That covers the entire data plane by construction. SLIRP carries only the Lima management channel; it doesn't and can't carry application traffic to arbitrary internet destinations. See [SLIRP management network](/sandboxd/guides/hardening/#slirp-management-network) in the hardening guide for the trade-offs this design makes.
 
 ## Per-session isolation
 
@@ -132,7 +132,7 @@ The gateway holds three nftables tables, each with a distinct role:
 - **TCP.** PREROUTING packets whose `(daddr, dport)` is in `policy_allow_tcp` are DNAT-redirected to Envoy's intercepting listener on `127.0.0.1:10000`; everything else is redirected to the nft-deny-logger on `127.0.0.1:10001`. The nft-deny-logger recovers the pre-DNAT destination via `SO_ORIGINAL_DST` on the accepted socket and closes the connection with `SO_LINGER{1,0}` so the VM sees a RST immediately instead of a silent hang.
 - **UDP.** PREROUTING packets whose `(daddr, dport)` is in `policy_allow_udp` `accept` and fall through to MASQUERADE — they exit the gateway directly to upstream, with no userland hop. Anything else hits an `nft log group 1 ; drop` rule: the kernel emits a netlink message carrying the original 5-tuple (before any DNAT could mutate it) and silently drops the packet. The nft-deny-logger subscribes to NFLOG group 1 and emits a JSONL `event: "deny"` record for the dropped datagram. There is no ICMP unreachable — the deny is silent at the network layer; the audit log is the attribution.
 
-UDP allow-flow audit is closed by a second netlink subscription. The nft-allow-logger subscribes to `nfnetlink_conntrack`'s `NFNLGRP_CONNTRACK_NEW` multicast group, filters for UDP, and emits a JSONL `event: "allow"` record per new tracked flow. The granularity is per-flow, not per-packet: a long-lived UDP "session" produces one allow record per new conntrack entry, not one per datagram. See [`sandbox events`](/reference/cli/#sandbox-events) for the event surface and the troubleshooting guide for the 30-second NFCT-rollover behaviour that shapes how flows reappear in the audit log.
+UDP allow-flow audit is closed by a second netlink subscription. The nft-allow-logger subscribes to `nfnetlink_conntrack`'s `NFNLGRP_CONNTRACK_NEW` multicast group, filters for UDP, and emits a JSONL `event: "allow"` record per new tracked flow. The granularity is per-flow, not per-packet: a long-lived UDP "session" produces one allow record per new conntrack entry, not one per datagram. See [`sandbox events`](/sandboxd/reference/cli/#sandbox-events) for the event surface and the troubleshooting guide for the 30-second NFCT-rollover behaviour that shapes how flows reappear in the audit log.
 
 The deny-all baseline in the `sandbox` table is the safety net: even if `sandbox_dnat` disappeared, no forwarded packet would leave the namespace. Level-3 (HTTPS inspection) traffic is not routed through nftables DNAT a second time; Envoy itself opens a loopback CONNECT tunnel to mitmproxy on `127.0.0.1:18080` (see [Request flow](#request-flow) below).
 
@@ -217,13 +217,13 @@ The propagation is **synchronously gated** between CoreDNS and sandboxd:
 
 The trade-off is **first-resolution latency**: a brand-new IP for a host adds the gate round-trip (nft injection + Envoy LDS ack) to the DNS-resolve time. Steady-state resolutions of already-admitted IPs short-circuit the gate and pay no extra cost.
 
-If sandboxd is slow or unreachable, the plugin **fails open** at a deadline (default 1500 ms) and releases the DNS answer anyway, emitting a `dns_gate_timed_out` lifecycle event. The traffic that follows may then race propagation and be dropped by Envoy until the steady-state reconciler closes the gap — but this is a deadline-bounded fallback, not the normal path. See [troubleshooting](/guides/troubleshooting/#l3-destination-fails-on-first-request-after-policy-change) for the operator-side view of the fallback case.
+If sandboxd is slow or unreachable, the plugin **fails open** at a deadline (default 1500 ms) and releases the DNS answer anyway, emitting a `dns_gate_timed_out` lifecycle event. The traffic that follows may then race propagation and be dropped by Envoy until the steady-state reconciler closes the gap — but this is a deadline-bounded fallback, not the normal path. See [troubleshooting](/sandboxd/guides/troubleshooting/#l3-destination-fails-on-first-request-after-policy-change) for the operator-side view of the fallback case.
 
 The propagation loop publishes a `policy_propagated` lifecycle event once all three enforcement layers (CoreDNS, nftables `policy_allow_{tcp,udp}` sets, and Envoy's L3 filter chains) have reconciled to the latest applied policy. The event carries `policy_hash`, the SHA-256 hex digest of the canonical JSON form of the effective policy, and is emitted only on hash transitions (so a steady state produces no repeat events). Scripts that need to wait for the new policy to be live can observe that event via `sandbox events --event policy_propagated --follow`, or invoke `sandbox policy status --wait` to block until the hash transitions.
 
 ### Event attribution
 
-Every policy-enforcing component emits structured events that sandboxd ingests and publishes on a per-session ring buffer. Most layers carry the VM's bridge IP on the record, and sandboxd stamps the envelope `session` by looking up `(vm_ip → session_id)` at ingest time. mitmproxy is the exception: by the time a request reaches the addon, the TCP peer is Envoy's loopback-connect source, not the VM. So the mitmproxy ingestor attributes its events to the **per-session watcher** that produced the line — one watcher per session, reading that session's mitmproxy JSONL log — rather than via the VM-IP map. The nft-loggers attribute by `src_ip` per the same VM-IP map; the source of that IP differs by protocol — TCP-deny reads it from the accepted socket via `SO_ORIGINAL_DST` (with the pre-DNAT destination on the same call), UDP-deny pulls it straight out of the kernel-emitted NFLOG message (where the original 5-tuple appears before any DNAT could mutate it, and there is no DNAT for UDP-deny anyway), and UDP-allow pulls it from the NFCT `NFCT_T_NEW` event's ORIGINAL tuple. All three resolve to the VM's bridge IP and go back through the VM-IP map. See [`sandbox events`](/reference/cli/#sandbox-events) for the replay/stream surface.
+Every policy-enforcing component emits structured events that sandboxd ingests and publishes on a per-session ring buffer. Most layers carry the VM's bridge IP on the record, and sandboxd stamps the envelope `session` by looking up `(vm_ip → session_id)` at ingest time. mitmproxy is the exception: by the time a request reaches the addon, the TCP peer is Envoy's loopback-connect source, not the VM. So the mitmproxy ingestor attributes its events to the **per-session watcher** that produced the line — one watcher per session, reading that session's mitmproxy JSONL log — rather than via the VM-IP map. The nft-loggers attribute by `src_ip` per the same VM-IP map; the source of that IP differs by protocol — TCP-deny reads it from the accepted socket via `SO_ORIGINAL_DST` (with the pre-DNAT destination on the same call), UDP-deny pulls it straight out of the kernel-emitted NFLOG message (where the original 5-tuple appears before any DNAT could mutate it, and there is no DNAT for UDP-deny anyway), and UDP-allow pulls it from the NFCT `NFCT_T_NEW` event's ORIGINAL tuple. All three resolve to the VM's bridge IP and go back through the VM-IP map. See [`sandbox events`](/sandboxd/reference/cli/#sandbox-events) for the replay/stream surface.
 
 ## TLS interception
 
@@ -243,7 +243,7 @@ Each session uses its own CA. Compromise of one session's CA does not affect oth
 
 ### What breaks under interception
 
-Applications that pin certificates — or ship a private trust store — will reject the session CA. Those destinations need a lower assurance level (`tls` or `transport`) that skips MITM. See [policy model](/concepts/policy-model/) for what each level does.
+Applications that pin certificates — or ship a private trust store — will reject the session CA. Those destinations need a lower assurance level (`tls` or `transport`) that skips MITM. See [policy model](/sandboxd/concepts/policy-model/) for what each level does.
 
 ## Lifecycle implications
 
@@ -254,12 +254,12 @@ Networking is created and destroyed with the session, in a specific order:
 - **Start.** The stored subnet and IPs are reused; a new gateway container is created with the existing CA.
 - **Remove.** Everything released, including the CA files.
 
-See [sessions](/concepts/sessions/) for the broader lifecycle picture.
+See [sessions](/sandboxd/concepts/sessions/) for the broader lifecycle picture.
 
 ## Related reading
 
-- [Policy model](/concepts/policy-model/) — how assurance levels map onto the components above.
-- [Architecture](/concepts/architecture/) — how the gateway fits into the rest of the system.
-- [Network policies guide](/guides/network-policies/) — authoring and applying rules.
-- [Hardening](/guides/hardening/) — the security properties this network model enforces.
-- [Troubleshooting](/guides/troubleshooting/) — diagnosing network failures in a running session.
+- [Policy model](/sandboxd/concepts/policy-model/) — how assurance levels map onto the components above.
+- [Architecture](/sandboxd/concepts/architecture/) — how the gateway fits into the rest of the system.
+- [Network policies guide](/sandboxd/guides/network-policies/) — authoring and applying rules.
+- [Hardening](/sandboxd/guides/hardening/) — the security properties this network model enforces.
+- [Troubleshooting](/sandboxd/guides/troubleshooting/) — diagnosing network failures in a running session.

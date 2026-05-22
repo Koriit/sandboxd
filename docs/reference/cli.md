@@ -5,7 +5,7 @@ description: Complete reference for the sandbox command-line tool — every subc
 
 Complete reference for the `sandbox` command-line tool. The CLI communicates with the `sandboxd` daemon over a Unix socket.
 
-For a condensed tour of the main commands, see the [Quickstart](/start/quickstart/). For the daemon's HTTP API that backs the CLI, see [Architecture](/concepts/architecture/).
+For a condensed tour of the main commands, see the [Quickstart](/sandboxd/start/quickstart/). For the daemon's HTTP API that backs the CLI, see [Architecture](/sandboxd/concepts/architecture/).
 
 ## Global options
 
@@ -36,7 +36,7 @@ Implications:
 - `sandbox rm` cannot remove another operator's session — root is the only escape hatch.
 - The `sandbox` system user (the daemon's runtime user post-install) is not a special case at the API: a `sudo -u sandbox sandbox ps` lists only sessions whose `owner_username` is `sandbox`, which in normal operation is none.
 
-For the HTTP-level mechanics see [HTTP API: caller identity and per-caller isolation](/reference/http-api/#caller-identity-and-per-caller-isolation).
+For the HTTP-level mechanics see [HTTP API: caller identity and per-caller isolation](/sandboxd/reference/http-api/#caller-identity-and-per-caller-isolation).
 
 ## Session identifiers
 
@@ -72,10 +72,10 @@ sandbox create [OPTIONS]
 | `--workspace <mode>` | | Workspace mode (e.g., `shared:/path/to/dir`) |
 | `--boot-cmd <cmd>` | | Command to execute after provisioning |
 | `--policy <path>` | | Path to a policy JSON file to apply after creation |
-| `--preset <invocation>` | | Preset invocation to apply on top of `--policy`. Repeatable. See [`--preset` invocations](#preset-invocations) below and the [Presets guide](/guides/network-policies/#presets). |
+| `--preset <invocation>` | | Preset invocation to apply on top of `--policy`. Repeatable. See [`--preset` invocations](#preset-invocations) below and the [Presets guide](/sandboxd/guides/network-policies/#presets). |
 | `--template <path>` | | Path to a custom Lima YAML template |
 | `--backend <name>` | resolved | Which backend hosts the session: `lima` or `container`. When omitted, the daemon resolves from `SANDBOX_DEFAULT_BACKEND`, the per-user config (`~/.config/sandboxd/config.json`), and finally the hardcoded default `lima`. Mutually exclusive with `--lite`. |
-| `--lite` | | Sugar for `--backend container`. Mutually exclusive with `--backend`. See [Lite mode](/guides/lite-mode/). |
+| `--lite` | | Sugar for `--backend container`. Mutually exclusive with `--backend`. See [Lite mode](/sandboxd/guides/lite-mode/). |
 | `--no-hardening` | | Disable QEMU hardening (device lockdown, cgroup limits). Lima only. |
 | `--no-cache` | | Skip the pre-baked base image and use the full create path. **Lima only** — rejected on the container backend (the lite image is shared across concurrent lite sessions, so a per-session cache-bust would force every other lite session to rebuild). Use [`sandbox rebuild-image --backend container --no-cache`](#sandbox-rebuild-image) for operator-driven lite-image rebuilds. |
 | `--force-rootless-docker` | | Operator opt-in override that allows session-create on a rootless Docker host (container backend only — combining it with a Lima-resolved backend is a misuse error). Off by default; the daemon refuses container-backend session-create on rootless Docker so accidental mode-mismatch can't slip through. The flag is per-invocation and never persisted. |
@@ -111,7 +111,7 @@ sandbox create --name dev --preset 'npm:' --preset 'pypi:'
 Interaction with `--policy`:
 
 - Presets merge **into** the policy file — both sets of rules contribute to the effective policy.
-- Rule identity is the `(host, port)` pair. Any collision between the policy file and a preset expansion (or between two preset expansions) is a hard error that names every contributing source. See [`(host, port)` uniqueness](/guides/network-policies/#host-and-port-uniqueness) for the exact error shape.
+- Rule identity is the `(host, port)` pair. Any collision between the policy file and a preset expansion (or between two preset expansions) is a hard error that names every contributing source. See [`(host, port)` uniqueness](/sandboxd/guides/network-policies/#host-and-port-uniqueness) for the exact error shape.
 
 Errors (text-identical to the CLI's `Error: <...>` line on stderr, exit code 1):
 
@@ -141,7 +141,7 @@ Errors (text-identical to the CLI's `Error: <...>` line on stderr, exit code 1):
     - declared by preset invocation 'npm:' (built-in 'npm')
   ```
 
-See the [Presets guide](/guides/network-policies/#presets) for the built-in catalog and user-preset file format, and [`sandbox policy preset`](#sandbox-policy-preset) below for the client-local inspection subcommands.
+See the [Presets guide](/sandboxd/guides/network-policies/#presets) for the built-in catalog and user-preset file format, and [`sandbox policy preset`](#sandbox-policy-preset) below for the client-local inspection subcommands.
 
 Example:
 
@@ -523,7 +523,7 @@ sandbox logs my-sandbox -f
 
 ## sandbox events
 
-Replay or stream the session's event stream — every per-request decision made by the gateway's DNS, Envoy, mitmproxy, and nft-logger layers (deny + allow), plus the session's lifecycle events. Thin client over [`GET /sessions/{id}/events`](/reference/http-api/#get-sessionsidevents--replay-or-stream-events).
+Replay or stream the session's event stream — every per-request decision made by the gateway's DNS, Envoy, mitmproxy, and nft-logger layers (deny + allow), plus the session's lifecycle events. Thin client over [`GET /sessions/{id}/events`](/sandboxd/reference/http-api/#get-sessionsidevents--replay-or-stream-events).
 
 ### Synopsis
 
@@ -563,7 +563,7 @@ returns every DNS or mitmproxy event **and** whose decision is deny. An `--event
 
 ### Output
 
-- **JSONL** (default when stdout is not a TTY, or when `--json` is set): each line is a single JSON object matching the wire shape documented under [`GET /sessions/{id}/events`](/reference/http-api/#get-sessionsidevents--replay-or-stream-events). Lines the CLI cannot parse as an event — most notably the synthetic `lifecycle.ring_buffer_lag` marker the server emits when a follow stream falls behind — are passed through unchanged in JSONL mode.
+- **JSONL** (default when stdout is not a TTY, or when `--json` is set): each line is a single JSON object matching the wire shape documented under [`GET /sessions/{id}/events`](/sandboxd/reference/http-api/#get-sessionsidevents--replay-or-stream-events). Lines the CLI cannot parse as an event — most notably the synthetic `lifecycle.ring_buffer_lag` marker the server emits when a follow stream falls behind — are passed through unchanged in JSONL mode.
 - **Table** (default when stdout is a TTY, or when `--table` is set): a fixed-column layout with `TIME`, `SESSION` (first 8 chars of the id), `LAYER`, `EVENT`, `HOST:PORT`, and `DETAIL` columns. `DETAIL` is truncated to 60 characters with `…`. Deny rows are wrapped in ANSI red when stdout is a TTY. Any line the table renderer cannot parse as an `EventDto` is emitted on its own row prefixed with `! ` so nothing is dropped silently.
 
 ### Exit behavior
@@ -623,7 +623,7 @@ The events stream is intended as the operator-facing feedback loop for tightenin
 
 6. **Re-run the workload.** Run `sandbox events dev --decision=deny` once more — no new denies means the policy is tight enough.
 
-The `tests/e2e/test_discovery.py` suite encodes this exact flow end-to-end. See [Network policies](/guides/network-policies/) for how to structure the policy JSON once you know which targets to allow.
+The `tests/e2e/test_discovery.py` suite encodes this exact flow end-to-end. See [Network policies](/sandboxd/guides/network-policies/) for how to structure the policy JSON once you know which targets to allow.
 
 ---
 
@@ -845,8 +845,8 @@ At least one of `--policy`, `--preset`, or `--clear` must be supplied. `--policy
 ### Details
 
 - With `--policy`, the policy file is validated client-side before sending to the daemon; invalid JSON or a rejected schema aborts the request.
-- The policy must parse as a valid `Policy` JSON structure (see [policy model](/concepts/policy-model/)).
-- With `--preset`, each invocation is expanded locally into a rule set and merged with the (optional) `--policy` file. `(host, port)` collisions across the file and preset expansions are hard errors that name every contributing source — see [`(host, port)` uniqueness](/guides/network-policies/#host-and-port-uniqueness).
+- The policy must parse as a valid `Policy` JSON structure (see [policy model](/sandboxd/concepts/policy-model/)).
+- With `--preset`, each invocation is expanded locally into a rule set and merged with the (optional) `--policy` file. `(host, port)` collisions across the file and preset expansions are hard errors that name every contributing source — see [`(host, port)` uniqueness](/sandboxd/guides/network-policies/#host-and-port-uniqueness).
 - The original `--preset` invocation strings are sent to the daemon as a `source_presets` audit field alongside the effective policy.
 - `--clear` is a no-op when the session already has no policy.
 
@@ -875,7 +875,7 @@ sandbox policy update my-sandbox --clear
 
 ## sandbox policy preset
 
-Inspect the built-in and user-configured preset catalog. All three subcommands are **client-local** — they do not contact the sandbox daemon and do not require the Unix socket to be reachable. User presets are loaded from `$XDG_CONFIG_HOME/sandboxd/presets/*.json` (falling back to `$HOME/.config/sandboxd/presets/*.json`); see the [Presets guide](/guides/network-policies/#user-presets) for the file format.
+Inspect the built-in and user-configured preset catalog. All three subcommands are **client-local** — they do not contact the sandbox daemon and do not require the Unix socket to be reachable. User presets are loaded from `$XDG_CONFIG_HOME/sandboxd/presets/*.json` (falling back to `$HOME/.config/sandboxd/presets/*.json`); see the [Presets guide](/sandboxd/guides/network-policies/#user-presets) for the file format.
 
 ### Synopsis
 
@@ -1030,7 +1030,7 @@ sandbox policy preset expand 'github-repo:repo=rust-lang/rustlings' > /tmp/expan
 sandbox create --name dev --policy /tmp/expanded.json
 ```
 
-See the [Presets guide](/guides/network-policies/#presets) for a tour of the built-in catalog and the user-preset file format.
+See the [Presets guide](/sandboxd/guides/network-policies/#presets) for a tour of the built-in catalog and the user-preset file format.
 
 ---
 
@@ -1095,7 +1095,7 @@ sandbox policy status <session> [--wait] [--timeout <duration>]
 
 - Exits 0 when the latest policy-apply has propagated, or when no policy has ever been applied (nothing to wait for).
 - Exits non-zero on daemon errors. With `--wait`, exits non-zero if the deadline passes before the policy propagates — useful in scripts and the E2E suite to fail fast instead of `time.sleep()`-ing.
-- See [networking → Synchronous DNS-policy gating](/concepts/networking/#synchronous-dns-policy-gating) for the propagation model and the `policy_propagated` lifecycle event this command waits on.
+- See [networking → Synchronous DNS-policy gating](/sandboxd/concepts/networking/#synchronous-dns-policy-gating) for the propagation model and the `policy_propagated` lifecycle event this command waits on.
 
 ### Examples
 
@@ -1144,7 +1144,7 @@ sandbox rebuild-image --backend lima
 
 ## sandbox update
 
-Apply a pending sandboxd upgrade — or report what would happen. Orchestrates the full upgrade flow: pre-flight checks (read-only), confirmation prompt, then the stateful steps that stop the daemon, install new binaries, run config migrations, and restart. Each privileged step uses `sudo -k <action>` so every elevation appears as its own line in `/var/log/sandbox-install.log`. The operator-facing walkthrough lives at [Operate: update](/operate/update/).
+Apply a pending sandboxd upgrade — or report what would happen. Orchestrates the full upgrade flow: pre-flight checks (read-only), confirmation prompt, then the stateful steps that stop the daemon, install new binaries, run config migrations, and restart. Each privileged step uses `sudo -k <action>` so every elevation appears as its own line in `/var/log/sandbox-install.log`. The operator-facing walkthrough lives at [Operate: update](/sandboxd/operate/update/).
 
 ### Synopsis
 
@@ -1204,13 +1204,13 @@ sandbox update --check; rc=$?
 [ $rc -eq 3 ] && sudo sandbox update --yes
 ```
 
-For the full operator walkthrough — pre-flight, the stateful flow, backup mechanics, lock-file semantics, and the rollback recipe — see [Operate: update](/operate/update/). For the manual recipe to restore a previous release, see [Roll back a sandboxd upgrade](/guides/rollback/).
+For the full operator walkthrough — pre-flight, the stateful flow, backup mechanics, lock-file semantics, and the rollback recipe — see [Operate: update](/sandboxd/operate/update/). For the manual recipe to restore a previous release, see [Roll back a sandboxd upgrade](/sandboxd/guides/rollback/).
 
 ---
 
 ## sandbox doctor
 
-Diagnose the local sandboxd installation. Connects tolerantly: the CLI ↔ daemon strict-equality version handshake is bypassed for this subcommand, so `sandbox doctor` can *diagnose* a version skew rather than be refused by it. The same property makes `doctor` the load-bearing post-update verification step and the post-rollback green-light gate in the [rollback recipe](/guides/rollback/).
+Diagnose the local sandboxd installation. Connects tolerantly: the CLI ↔ daemon strict-equality version handshake is bypassed for this subcommand, so `sandbox doctor` can *diagnose* a version skew rather than be refused by it. The same property makes `doctor` the load-bearing post-update verification step and the post-rollback green-light gate in the [rollback recipe](/sandboxd/guides/rollback/).
 
 ### Synopsis
 

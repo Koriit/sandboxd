@@ -3,7 +3,7 @@ title: HTTP API reference
 description: Endpoints served by sandboxd over its Unix socket — request and response shapes, status codes, and error format.
 ---
 
-`sandboxd` listens for HTTP/1.1 requests on a Unix domain socket. The default path is `$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock`, falling back to `~/.local/share/sandboxd/sandboxd.sock`. The socket path is overridden by the `SANDBOX_SOCKET` environment variable or the `--socket` flag — see the [daemon config reference](/reference/config/).
+`sandboxd` listens for HTTP/1.1 requests on a Unix domain socket. The default path is `$XDG_RUNTIME_DIR/sandboxd/sandboxd.sock`, falling back to `~/.local/share/sandboxd/sandboxd.sock`. The socket path is overridden by the `SANDBOX_SOCKET` environment variable or the `--socket` flag — see the [daemon config reference](/sandboxd/reference/config/).
 
 The CLI is a thin wrapper over this API. Every endpoint accepts and returns JSON. All `{id}` path parameters accept either a full session ID, a unique session-ID prefix, or a session name.
 
@@ -178,7 +178,7 @@ The daemon does not expose HTTP endpoints for file transfer. The CLI's
 `sandbox cp` and `sandbox sync` commands dispatch directly to the
 backend's native copy tool (`limactl cp` / `docker cp`) or to host
 `rsync` over the backend's native shell — see the [CLI
-reference](/reference/cli/#sandbox-cp).
+reference](/sandboxd/reference/cli/#sandbox-cp).
 
 ### `GET /sessions/{id}/health` — detailed health
 
@@ -206,7 +206,7 @@ Success: `200 OK` with:
 
 ### `GET /sessions/{id}/events` — replay or stream events
 
-Returns the session's event stream as newline-delimited JSON (one event per line). Every per-request and per-connection decision made by the gateway's DNS / Envoy / mitmproxy / deny-logger layers, plus the session's lifecycle events, flows through this endpoint. The corresponding CLI wrapper is [`sandbox events`](/reference/cli/#sandbox-events).
+Returns the session's event stream as newline-delimited JSON (one event per line). Every per-request and per-connection decision made by the gateway's DNS / Envoy / mitmproxy / deny-logger layers, plus the session's lifecycle events, flows through this endpoint. The corresponding CLI wrapper is [`sandbox events`](/sandboxd/reference/cli/#sandbox-events).
 
 Query parameters (all optional):
 
@@ -290,7 +290,7 @@ Session must be `running`. The daemon compiles the policy, distributes it to the
 
 Success: `200 OK` with `{ "status": "ok", "message": "policy applied successfully" }`.
 
-For the full policy schema (assurance levels, HTTP filters, destinations, protocols) see the [policy model](/concepts/policy-model/).
+For the full policy schema (assurance levels, HTTP filters, destinations, protocols) see the [policy model](/sandboxd/concepts/policy-model/).
 
 ### `DELETE /sessions/{id}/policy` — clear policy
 
@@ -302,7 +302,7 @@ Success: `200 OK` with `{ "status": "ok", "message": "policy cleared; session is
 
 No request body. Reports whether the most recent policy-apply has reconciled across every enforcement layer (CoreDNS, the nftables `policy_allow_{tcp,udp}` sets, and Envoy's L3 filter chains).
 
-Backs the [`sandbox policy status`](/reference/cli/#sandbox-policy-status) command and the E2E suite's `wait_for_policy` helper.
+Backs the [`sandbox policy status`](/sandboxd/reference/cli/#sandbox-policy-status) command and the E2E suite's `wait_for_policy` helper.
 
 Success: `200 OK` with:
 
@@ -453,7 +453,7 @@ Notes:
 
 ## See also
 
-- [CLI reference](/reference/cli/) — the user-facing wrapper over every endpoint above.
-- [Config reference](/reference/config/) — socket path, base dir, and log-file flags.
-- [Sessions](/concepts/sessions/) — lifecycle and persistence model.
-- [Policy model](/concepts/policy-model/) — what each assurance level does.
+- [CLI reference](/sandboxd/reference/cli/) — the user-facing wrapper over every endpoint above.
+- [Config reference](/sandboxd/reference/config/) — socket path, base dir, and log-file flags.
+- [Sessions](/sandboxd/concepts/sessions/) — lifecycle and persistence model.
+- [Policy model](/sandboxd/concepts/policy-model/) — what each assurance level does.

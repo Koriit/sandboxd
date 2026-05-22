@@ -5,7 +5,7 @@ description: Every flag, environment variable, and default path that controls ho
 
 This page enumerates the full configuration surface of `sandboxd` (the daemon) and `sandbox` (the CLI). Neither binary reads a config file — everything is controlled via CLI flags and a small number of environment variables.
 
-For the HTTP endpoints served by the daemon, see the [HTTP API reference](/reference/http-api/). For the CLI subcommands, see the [CLI reference](/reference/cli/).
+For the HTTP endpoints served by the daemon, see the [HTTP API reference](/sandboxd/reference/http-api/). For the CLI subcommands, see the [CLI reference](/sandboxd/reference/cli/).
 
 ## `sandboxd` flags
 
@@ -33,7 +33,7 @@ Global flags apply to every subcommand:
 | `--socket <path>` | same resolution as the daemon | Unix socket to connect to. Overridden by `SANDBOX_SOCKET` when the flag is not passed. |
 | `--yes`, `-y` | off | Assume yes to interactive prompts; use defaults without prompting. |
 
-See the [CLI reference](/reference/cli/) for the subcommand-specific flags.
+See the [CLI reference](/sandboxd/reference/cli/) for the subcommand-specific flags.
 
 ## Environment variables
 
@@ -68,7 +68,7 @@ RUST_LOG=debug sandboxd
 RUST_LOG=sandboxd=trace,sandbox_core=info sandboxd
 ```
 
-See [Daemon logging](/concepts/logging/) for how log output is routed.
+See [Daemon logging](/sandboxd/concepts/logging/) for how log output is routed.
 
 ### QEMU wrapper environment
 
@@ -115,19 +115,19 @@ Under the base dir, the daemon creates:
 └── ...
 ```
 
-`sessions.db` persists the full session state machine — see [Sessions](/concepts/sessions/) for what survives a daemon restart and the compatibility rules for evolving the schema.
+`sessions.db` persists the full session state machine — see [Sessions](/sandboxd/concepts/sessions/) for what survives a daemon restart and the compatibility rules for evolving the schema.
 
 The `sessions/<id>/events/` tree is populated only when `--events-persist` is set; see the next section for what lives there.
 
 ## Event persistence
 
-When `--events-persist` is set, the daemon spawns a persistent sink alongside the in-memory event bus that backs [`GET /sessions/{id}/events`](/reference/http-api/#get-sessionsidevents--replay-or-stream-events). Every event published on the bus is also forwarded to a JSONL file on disk, keyed by `(session_id, layer, UTC date)`:
+When `--events-persist` is set, the daemon spawns a persistent sink alongside the in-memory event bus that backs [`GET /sessions/{id}/events`](/sandboxd/reference/http-api/#get-sessionsidevents--replay-or-stream-events). Every event published on the bus is also forwarded to a JSONL file on disk, keyed by `(session_id, layer, UTC date)`:
 
 ```
 {base_dir}/sessions/<session-id>/events/<layer>-YYYY-MM-DD.jsonl
 ```
 
-Layer names match the [HTTP API filter values](/reference/http-api/#get-sessionsidevents--replay-or-stream-events): `dns`, `envoy`, `mitmproxy`, `deny-logger`, `lifecycle`. Each line is the same JSON shape that the HTTP endpoint emits. Files rotate at UTC midnight — the day boundary is the `YYYY-MM-DD` segment of the filename, not a timer.
+Layer names match the [HTTP API filter values](/sandboxd/reference/http-api/#get-sessionsidevents--replay-or-stream-events): `dns`, `envoy`, `mitmproxy`, `deny-logger`, `lifecycle`. Each line is the same JSON shape that the HTTP endpoint emits. Files rotate at UTC midnight — the day boundary is the `YYYY-MM-DD` segment of the filename, not a timer.
 
 The sink is **best-effort and never backpressures the bus.** Internally, the relay between the broadcast channel and the writer task is a bounded mpsc channel with a 100 000-event capacity. When the writer falls behind (disk slow, filesystem issue, or a burst that outruns `write(2)`), events are dropped at the relay rather than stalling producers. Each drop is logged at `warn!` with a running total (`dropped_total=N`) so operators can see the signal in the tracing stream. The in-memory ring buffer served by `/sessions/{id}/events` is unaffected — it always reflects the live bus.
 
@@ -167,6 +167,6 @@ sandboxd --events-persist --events-persist-retention-days 30
 
 ## See also
 
-- [Daemon logging](/concepts/logging/) — where tracing output goes and how to run under systemd / launchd.
-- [HTTP API reference](/reference/http-api/) — what the socket actually serves.
-- [CLI reference](/reference/cli/) — subcommands and their flags.
+- [Daemon logging](/sandboxd/concepts/logging/) — where tracing output goes and how to run under systemd / launchd.
+- [HTTP API reference](/sandboxd/reference/http-api/) — what the socket actually serves.
+- [CLI reference](/sandboxd/reference/cli/) — subcommands and their flags.

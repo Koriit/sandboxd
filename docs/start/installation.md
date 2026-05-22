@@ -8,7 +8,7 @@ This guide covers two install paths:
 - [**Operator install**](#operator-install-curl--bash) — the supported production install via the signed `install.sh` hosted on GitHub Pages. This is what you want unless you're building sandboxd from source.
 - [**Developer install**](#developer-install-make-setup-dev-env) — for contributors who want to build the daemon from source and run it as their own user. Same machine-level prerequisites; different artifact layout.
 
-If you want the fast path through create/exec/ssh once installed, see [Quickstart](/start/quickstart/).
+If you want the fast path through create/exec/ssh once installed, see [Quickstart](/sandboxd/start/quickstart/).
 
 ## System requirements
 
@@ -18,7 +18,7 @@ If you want the fast path through create/exec/ssh once installed, see [Quickstar
 | Linux kernel | 5.8+ | `sandbox-route-helper` needs `pidfd_open(2)` (5.3+) and `setns(pidfd, ...)` (5.8+) |
 | KVM | `/dev/kvm` accessible | Required for hardware-accelerated VMs |
 | Docker | 24.0+ | For gateway containers and networking |
-| Lima | 2.1+ | VM management (`limactl` must be on PATH); skippable at runtime if you only use [lite mode](/guides/lite-mode/) |
+| Lima | 2.1+ | VM management (`limactl` must be on PATH); skippable at runtime if you only use [lite mode](/sandboxd/guides/lite-mode/) |
 | QEMU | 8.0+ | `qemu-system-x86` with OVMF firmware |
 | `setcap`, `jq`, `curl` | any recent | `install.sh` probes for all three |
 | Rust | 1.88+ (stable) | Developer install only — for building from source |
@@ -92,7 +92,7 @@ The `sandbox` system user is created (if not already present); the invoking oper
 
 The daemon's binaries live in shared system paths (`/usr/local/bin/sandboxd`, `/usr/local/libexec/sandboxd/sandbox-route-helper`, the gateway image in the host Docker daemon). The dedicated `sandbox` user + system-service shape is what makes those shared binaries safe and sensible. Without it, the alternative is a per-user install — and a per-user install fails for five concrete reasons:
 
-1. **Divergent versions against shared substrate.** Per-user installs put `sandboxd` and the CLI somewhere user-writable, but several artifacts *must* be system-shared regardless: `sandbox-route-helper` needs root to apply file capabilities, `/etc/sandboxd/users.conf` is root-owned for the helper's authorization boundary, `/etc/qemu/bridge.conf` lives in `/etc`, and the gateway image sits in the host's Docker daemon. With per-user daemons, nothing stops operators from installing *different versions* of `sandboxd` while all of them talk to the same shared route-helper and gateway image — exactly the kind of version skew the CLI ↔ daemon strict-equality check (see [`sandbox doctor`](/reference/cli/#sandbox-doctor)) exists to prevent. One canonical install, one daemon, one version.
+1. **Divergent versions against shared substrate.** Per-user installs put `sandboxd` and the CLI somewhere user-writable, but several artifacts *must* be system-shared regardless: `sandbox-route-helper` needs root to apply file capabilities, `/etc/sandboxd/users.conf` is root-owned for the helper's authorization boundary, `/etc/qemu/bridge.conf` lives in `/etc`, and the gateway image sits in the host's Docker daemon. With per-user daemons, nothing stops operators from installing *different versions* of `sandboxd` while all of them talk to the same shared route-helper and gateway image — exactly the kind of version skew the CLI ↔ daemon strict-equality check (see [`sandbox doctor`](/sandboxd/reference/cli/#sandbox-doctor)) exists to prevent. One canonical install, one daemon, one version.
 2. **No defense-in-depth.** A user service runs the daemon as the operator's own uid. Daemon compromise would still grant access to `$HOME`, `~/.ssh`, browser tokens, dotfiles. The dedicated `sandbox` user closes that gap; a user service does not.
 3. **Linger is real operational cost.** User services require `loginctl enable-linger` to survive logout/reboot. Automatable, but an extra concept to know exists, and a subtle failure mode (*"I rebooted and sandboxd didn't come back — why?"*).
 4. **`journalctl` / `systemctl` friction across users.** With a user service, debugging requires knowing which user runs sandboxd and either `sudo -u <user> -i` or `--machine=<user>@.host`. With a system service, `systemctl status sandboxd` and `journalctl -u sandboxd` just work for anyone with read access.
@@ -182,7 +182,7 @@ sandbox update --check; rc=$?
 
 A full upgrade keeps a versioned backup of every file the installer wrote under `/var/lib/sandbox/backups/<timestamp>-from-<v>-to-<v>/`. The last two successful sets are kept; older ones are pruned automatically. Sets from interrupted or failed upgrades carry `completed_ok: false` and are preserved forensically — they are never auto-pruned.
 
-If something goes wrong: the upgrade is auto-recoverable (re-run `sudo sandbox update`); for manual rollback to an earlier version, follow the [rollback recipe](/guides/rollback/).
+If something goes wrong: the upgrade is auto-recoverable (re-run `sudo sandbox update`); for manual rollback to an earlier version, follow the [rollback recipe](/sandboxd/guides/rollback/).
 
 ## Developer install (`make setup-dev-env`)
 
@@ -655,6 +655,6 @@ In dev mode (no `sandbox` system user, daemon run by hand), checks specific to t
 
 ## Next steps
 
-- [Quickstart](/start/quickstart/) for the condensed path through create/exec/ssh.
-- [CLI reference](/reference/cli/) for every command and flag.
-- [Troubleshooting](/guides/troubleshooting/) for common setup errors and how to diagnose them.
+- [Quickstart](/sandboxd/start/quickstart/) for the condensed path through create/exec/ssh.
+- [CLI reference](/sandboxd/reference/cli/) for every command and flag.
+- [Troubleshooting](/sandboxd/guides/troubleshooting/) for common setup errors and how to diagnose them.

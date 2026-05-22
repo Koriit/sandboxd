@@ -5,7 +5,7 @@ description: What a sandboxd session is, how its lifecycle maps to CLI commands,
 
 A **session** is the unit of isolation in sandboxd. Every session is one Linux VM plus its own gateway container, its own Docker bridge, its own CA, and its own network policy. You talk to a session through the daemon; the daemon tracks its state in a SQLite database so nothing is lost across daemon restarts.
 
-This page explains the session model, the lifecycle, and which pieces survive across daemon restarts. For day-to-day commands, see the [CLI reference](/reference/cli/). For the underlying components, see [Architecture](/concepts/architecture/).
+This page explains the session model, the lifecycle, and which pieces survive across daemon restarts. For day-to-day commands, see the [CLI reference](/sandboxd/reference/cli/). For the underlying components, see [Architecture](/sandboxd/concepts/architecture/).
 
 ## What a session contains
 
@@ -20,7 +20,7 @@ When you run `sandbox create`, the daemon provisions a bundle of resources that 
 
 All of this is session-scoped. Two sessions on the same host share nothing at runtime.
 
-Sessions can be backed by one of two runtimes: a Lima/QEMU VM (the default, VM-grade isolation) or a Docker container (lite mode, container-level isolation, faster session creation). The session contract — gateway, policy, workspace, persistence — is identical across both. See [Lite mode](/guides/lite-mode/) for the trade-off and when to choose each.
+Sessions can be backed by one of two runtimes: a Lima/QEMU VM (the default, VM-grade isolation) or a Docker container (lite mode, container-level isolation, faster session creation). The session contract — gateway, policy, workspace, persistence — is identical across both. See [Lite mode](/sandboxd/guides/lite-mode/) for the trade-off and when to choose each.
 
 ## Identifiers
 
@@ -30,7 +30,7 @@ Every session has a 12-character lowercase-hex **session ID** (for example `550e
 - any unique prefix of the session ID (Docker-style), or
 - the session's `--name`.
 
-See the [CLI reference](/reference/cli/) for the prefix-disambiguation rules.
+See the [CLI reference](/sandboxd/reference/cli/) for the prefix-disambiguation rules.
 
 ## Session ownership
 
@@ -121,7 +121,7 @@ Use `stop` when you want to pause a session overnight; use `rm` when you are don
 
 ## What to read next
 
-- [Architecture](/concepts/architecture/) — how the daemon, VM, guest agent, and gateway fit together.
-- [Workspaces](/concepts/workspaces/) — how source code gets into a session.
-- [Policy model](/concepts/policy-model/) — what an applied policy actually does.
-- [CLI reference](/reference/cli/) — every command and flag.
+- [Architecture](/sandboxd/concepts/architecture/) — how the daemon, VM, guest agent, and gateway fit together.
+- [Workspaces](/sandboxd/concepts/workspaces/) — how source code gets into a session.
+- [Policy model](/sandboxd/concepts/policy-model/) — what an applied policy actually does.
+- [CLI reference](/sandboxd/reference/cli/) — every command and flag.

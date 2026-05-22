@@ -3,7 +3,7 @@ title: Architecture
 description: High-level overview of sandboxd components — CLI, daemon, Lima VM, guest agent, and gateway container — and how they fit together.
 ---
 
-This page gives you a high-level overview of sandboxd's architecture. For the CLI surface, see the [CLI reference](/reference/cli/). For the full end-to-end install path, see [Installation](/start/installation/).
+This page gives you a high-level overview of sandboxd's architecture. For the CLI surface, see the [CLI reference](/sandboxd/reference/cli/). For the full end-to-end install path, see [Installation](/sandboxd/start/installation/).
 
 ## Components at a glance
 
@@ -46,7 +46,7 @@ Responsibilities:
 - Compile and distribute network policies to gateway components.
 - Relay command execution, file transfer, and git operations to the guest agent.
 - Maintain a SQLite database of sessions and their network info.
-- Run background DNS propagation loops that update nftables `policy_allow_{tcp,udp}` sets and Envoy L3 filter chains as DNS resolutions change, and emit a `policy_propagated` lifecycle event once the applied policy has reconciled across all three enforcement layers. The CoreDNS plugin can also gate individual responses synchronously through the daemon (see [networking → Synchronous DNS-policy gating](/concepts/networking/#synchronous-dns-policy-gating)).
+- Run background DNS propagation loops that update nftables `policy_allow_{tcp,udp}` sets and Envoy L3 filter chains as DNS resolutions change, and emit a `policy_propagated` lifecycle event once the applied policy has reconciled across all three enforcement layers. The CoreDNS plugin can also gate individual responses synchronously through the daemon (see [networking → Synchronous DNS-policy gating](/sandboxd/concepts/networking/#synchronous-dns-policy-gating)).
 - Ingest structured decisions from CoreDNS, Envoy, mitmproxy, and the two nft-loggers (deny + allow); publish them alongside sandboxd's own lifecycle events on a per-session event bus backed by a bounded ring buffer and an optional JSONL disk log.
 
 Key modules (in `sandbox-core`):
@@ -216,7 +216,7 @@ sandbox prints stdout, exits with code 0
 | POST | `/rebuild-image` | `rebuild_image` | Rebuild the pre-baked base VM image |
 | GET | `/base-image-status` | `base_image_status` | Check base image build status |
 
-The `{id}` parameter accepts a session's human-readable name, its full 12-character hex session ID, or any unique prefix of the session ID (Docker-style). See [CLI reference](/reference/cli/) for details.
+The `{id}` parameter accepts a session's human-readable name, its full 12-character hex session ID, or any unique prefix of the session ID (Docker-style). See [CLI reference](/sandboxd/reference/cli/) for details.
 
 ## Security model
 
@@ -229,7 +229,7 @@ QEMU hardening is enabled by default (disabled with `--no-hardening`):
 - **Device lockdown** — unnecessary virtual devices are disabled (no VGA, no USB, no audio; only `virtio-net-pci`, `virtio-blk`, and `virtio-rng-pci` remain).
 - **Cgroup resource limits** — the QEMU process runs in a transient `sandbox.slice` scope with `MemoryMax`, `CPUQuota`, and `TasksMax` ceilings derived from the session config.
 
-QEMU's `-sandbox on` seccomp filter is deliberately not enabled, because it strips setuid from child processes and would break the setuid `qemu-bridge-helper` that attaches the data NIC. See [Hardening → Seccomp is deliberately off](/guides/hardening/#seccomp-is-deliberately-off) for the rationale and the layers that provide defence in depth instead.
+QEMU's `-sandbox on` seccomp filter is deliberately not enabled, because it strips setuid from child processes and would break the setuid `qemu-bridge-helper` that attaches the data NIC. See [Hardening → Seccomp is deliberately off](/sandboxd/guides/hardening/#seccomp-is-deliberately-off) for the rationale and the layers that provide defence in depth instead.
 
 ### Network isolation
 
@@ -247,7 +247,7 @@ Without a policy, all outbound network traffic is blocked. DNS queries return `N
 
 ### API isolation
 
-The daemon socket is shared by every operator on the host, but each session is owned by the user that created it. The daemon learns the connecting uid from the kernel via `SO_PEERCRED` on every accepted connection, stamps that identity into the session row on create, and filters every storage read and write by `owner_username` at the `SessionStore` boundary. A request for a session owned by a different operator returns HTTP 404 — indistinguishable from a non-existent session ID — so foreign session IDs cannot be enumerated through the API. The `owner_username` field is exposed on `SessionDto`. See [Sessions → Session ownership](/concepts/sessions/#session-ownership) for the full model.
+The daemon socket is shared by every operator on the host, but each session is owned by the user that created it. The daemon learns the connecting uid from the kernel via `SO_PEERCRED` on every accepted connection, stamps that identity into the session row on create, and filters every storage read and write by `owner_username` at the `SessionStore` boundary. A request for a session owned by a different operator returns HTTP 404 — indistinguishable from a non-existent session ID — so foreign session IDs cannot be enumerated through the API. The `owner_username` field is exposed on `SessionDto`. See [Sessions → Session ownership](/sandboxd/concepts/sessions/#session-ownership) for the full model.
 
 ## Storage
 

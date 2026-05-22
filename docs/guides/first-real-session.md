@@ -3,9 +3,9 @@ title: Your first real session
 description: Go beyond the quickstart — clone a repo into a session, apply a network policy, run a real build, and copy artifacts back to your host.
 ---
 
-The [Quickstart](/start/quickstart/) gets a session running and a shell inside it. This guide walks you through a realistic flow: you clone a repository into the session, apply a network policy that restricts what the session can reach, run a real command inside, and copy an artifact back to the host.
+The [Quickstart](/sandboxd/start/quickstart/) gets a session running and a shell inside it. This guide walks you through a realistic flow: you clone a repository into the session, apply a network policy that restricts what the session can reach, run a real command inside, and copy an artifact back to the host.
 
-You need sandboxd installed and the daemon running. If either is missing, see [Installation](/start/installation/) and the [Quickstart](/start/quickstart/).
+You need sandboxd installed and the daemon running. If either is missing, see [Installation](/sandboxd/start/installation/) and the [Quickstart](/sandboxd/start/quickstart/).
 
 ## What you will build
 
@@ -67,7 +67,7 @@ Save this as `~/policies/rust-build.json`:
 
 This grants the session "TLS-verified passthrough" to exactly those five hosts. That is: the gateway terminates the TLS SNI, verifies the destination, but does not MITM the traffic. Anything else — DNS lookups, direct-IP connections, other domains — is denied.
 
-For a deeper look at what each assurance level means, see [Policy model](/concepts/policy-model/).
+For a deeper look at what each assurance level means, see [Policy model](/sandboxd/concepts/policy-model/).
 
 ## 2. Create the session
 
@@ -178,7 +178,7 @@ If you want to pause instead, `sandbox stop rust-build` halts the VM but keeps t
 
 ## What to read next
 
-- [Workspaces](/guides/workspaces/) — use `--workspace shared:...` to mount a host directory instead of cloning.
-- [Network policies](/guides/network-policies/) — author and distribute policies at scale.
-- [Integrate with a coding agent](/guides/integrate-agent/) — drive all of this from a script.
-- [Concepts: policy model](/concepts/policy-model/) — what each assurance level does under the hood.
+- [Workspaces](/sandboxd/guides/workspaces/) — use `--workspace shared:...` to mount a host directory instead of cloning.
+- [Network policies](/sandboxd/guides/network-policies/) — author and distribute policies at scale.
+- [Integrate with a coding agent](/sandboxd/guides/integrate-agent/) — drive all of this from a script.
+- [Concepts: policy model](/sandboxd/concepts/policy-model/) — what each assurance level does under the hood.

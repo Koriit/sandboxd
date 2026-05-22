@@ -3,7 +3,7 @@ title: Write and apply network policies
 description: Author a policy file, apply it to a session, verify it, and troubleshoot denials.
 ---
 
-This guide walks you through writing a policy file, attaching it to a session, updating it live, and diagnosing the denial messages you will see when something does not match. For the underlying model — assurance levels, rule fields, validation rules — see [policy model](/concepts/policy-model/).
+This guide walks you through writing a policy file, attaching it to a session, updating it live, and diagnosing the denial messages you will see when something does not match. For the underlying model — assurance levels, rule fields, validation rules — see [policy model](/sandboxd/concepts/policy-model/).
 
 ## Before you start
 
@@ -155,7 +155,7 @@ sandbox policy update dev --clear
 - **Envoy L3 filter chains (level `http` destinations)** — driven by DNS. Envoy only knows which IPs belong to an L3-inspected domain after CoreDNS resolves that domain and sandboxd rewrites the listener file. For a brand-new L3 rule, the first request races the propagation loop: if the client's TLS handshake begins before Envoy picks up the rewritten listener (typically sub-second), Envoy finds no matching filter chain and drops the connection. Retrying or warming DNS with a prior `getent hosts` / `nslookup` closes the race.
 - **nftables allow rules** — follow the same DNS-driven path. An IP literal dialed before CoreDNS has answered for its name is dropped.
 
-The behavior is deliberately fail-closed: an unknown destination is denied, never silently passed through. See [networking → Synchronous DNS-policy gating](/concepts/networking/#synchronous-dns-policy-gating) for the mechanism.
+The behavior is deliberately fail-closed: an unknown destination is denied, never silently passed through. See [networking → Synchronous DNS-policy gating](/sandboxd/concepts/networking/#synchronous-dns-policy-gating) for the mechanism.
 
 If you need to block until the new policy is live (e.g. in a setup script that immediately dials an L3 destination), sandboxd emits a `policy_propagated` lifecycle event once CoreDNS, nftables, and Envoy have all reconciled to the latest policy hash:
 
@@ -184,7 +184,7 @@ UDP destinations behave differently from TCP. Worth knowing before you add UDP r
 
 - **Only `transport` is meaningful for UDP.** There is no L7 inspection (mitmproxy does not handle UDP), no SNI for `tls`, and no equivalent of HTTP CONNECT. The policy compiler rejects level `http` with `protocol: "udp"`; `tls` with `protocol: "udp"` is also not a viable shape. Use `transport` for any UDP rule.
 - **No userland proxy on the data path.** Allowed UDP exits the gateway directly to upstream via nftables MASQUERADE; Envoy and mitmproxy are not in the path. This is the intended design — UDP cannot be inspected, so there is no reason to route it through the inspection pipeline.
-- **Audit is per-flow, not per-packet.** A nft-allow-logger in the gateway subscribes to the kernel's conntrack `NFCT_T_NEW` event stream and writes one `event: "allow"` JSONL line per new tracked UDP flow. A long-lived UDP exchange produces one allow record at the start of the flow, not one per datagram. This is a meaningful difference from TCP: an Envoy access log records per-connection, but a UDP allow record records per *conntrack flow*, which the kernel ages out after 30 seconds of silence (see the [troubleshooting guide's UDP entries](/guides/troubleshooting/#udp-traffic) for the rollover behaviour).
+- **Audit is per-flow, not per-packet.** A nft-allow-logger in the gateway subscribes to the kernel's conntrack `NFCT_T_NEW` event stream and writes one `event: "allow"` JSONL line per new tracked UDP flow. A long-lived UDP exchange produces one allow record at the start of the flow, not one per datagram. This is a meaningful difference from TCP: an Envoy access log records per-connection, but a UDP allow record records per *conntrack flow*, which the kernel ages out after 30 seconds of silence (see the [troubleshooting guide's UDP entries](/sandboxd/guides/troubleshooting/#udp-traffic) for the rollover behaviour).
 - **Denied UDP is silent at the network level.** There is no ICMP port-unreachable on the wire — the kernel drops the datagram and the VM-side socket sees only timeouts. The deny is recorded in the audit log: a nft-deny-logger subscribes to NFLOG group 1 and writes a `event: "deny"` JSONL record carrying the original 5-tuple. So "no ICMP" does not mean "no observability"; it means observability lives in the JSONL stream, not in the in-VM error path.
 
 A worked example — allow NTP synchronisation against the Ubuntu time pool:
@@ -235,7 +235,7 @@ The fastest way to see *what* got denied and *which layer* denied it is the unif
 sandbox events <session> --decision=deny --follow
 ```
 
-Each event names the layer (`dns`, `envoy`, `mitmproxy`, `deny-logger`), the decision, and the reason — so you know at a glance whether a call was blocked by DNS allow-list filtering, by the firewall, by Envoy's SNI check, by an mitmproxy `http_filters` mismatch, or by never having matched any rule at all. See [`sandbox events`](/reference/cli/#sandbox-events) for filtering options; the subsections below cover each layer's failure modes in detail.
+Each event names the layer (`dns`, `envoy`, `mitmproxy`, `deny-logger`), the decision, and the reason — so you know at a glance whether a call was blocked by DNS allow-list filtering, by the firewall, by Envoy's SNI check, by an mitmproxy `http_filters` mismatch, or by never having matched any rule at all. See [`sandbox events`](/sandboxd/reference/cli/#sandbox-events) for filtering options; the subsections below cover each layer's failure modes in detail.
 
 ### `NXDOMAIN` on a domain you expect to work
 
@@ -309,7 +309,7 @@ docker exec "sandbox-gw-$(sandbox inspect dev | jq -r '.[0].id')" \
 
 Presets are reusable host-list templates that expand to v2 policy rules inside the CLI. They encode the allow-lists for common ecosystems (npm, PyPI, cargo, GitHub, ...) so you do not have to spell out a dozen rules from scratch every time you want an agent to `npm install` or `git clone` from a single repo.
 
-Preset expansion happens entirely client-side — the daemon receives the fully-expanded effective policy and never sees preset names or parameters beyond a `source_presets` audit trail attached to the `policy_applied` event. Presets apply on top of (or alongside) an optional `--policy` file; see [`sandbox create --preset`](/reference/cli/#preset-invocations) for the flag reference.
+Preset expansion happens entirely client-side — the daemon receives the fully-expanded effective policy and never sees preset names or parameters beyond a `source_presets` audit trail attached to the `policy_applied` event. Presets apply on top of (or alongside) an optional `--policy` file; see [`sandbox create --preset`](/sandboxd/reference/cli/#preset-invocations) for the flag reference.
 
 ### Built-in catalog
 
@@ -364,7 +364,7 @@ A preset invocation is a single string:
 - `<name>` is one of the preset names in `sandbox policy preset list`.
 - Unparameterized presets take a trailing colon with nothing after it: `'npm:'`, `'pypi:'`.
 - Parameters are `key=val` pairs separated by commas: `'github-repo:repo=foo/bar,repo=baz/qux'`.
-- **Values may not contain raw `,`, `:`, or `=`.** There is no escape mechanism — a forbidden character in a value is a hard error (see [`--preset` errors](/reference/cli/#preset-invocations)). In practice no built-in preset param needs any of those characters; design user presets around param shapes that avoid them.
+- **Values may not contain raw `,`, `:`, or `=`.** There is no escape mechanism — a forbidden character in a value is a hard error (see [`--preset` errors](/sandboxd/reference/cli/#preset-invocations)). In practice no built-in preset param needs any of those characters; design user presets around param shapes that avoid them.
 - Whitespace inside a value is preserved verbatim; no trimming.
 
 Repeated keys stack in invocation order. For `github-repo`, each `repo=` value contributes its own path-filter block; for `github-pr`, `repo=` and `pr=` values are paired positionally (first `repo=` with first `pr=`, second with second, ...).
@@ -464,11 +464,11 @@ sandbox policy update my-agent \
     --preset 'github-repo:repo=rust-lang/rustlings'
 ```
 
-For the full flag surface, see [CLI reference → `sandbox create --preset`](/reference/cli/#preset-invocations), [`sandbox policy update`](/reference/cli/#sandbox-policy-update), and [`sandbox policy preset`](/reference/cli/#sandbox-policy-preset).
+For the full flag surface, see [CLI reference → `sandbox create --preset`](/sandboxd/reference/cli/#preset-invocations), [`sandbox policy update`](/sandboxd/reference/cli/#sandbox-policy-update), and [`sandbox policy preset`](/sandboxd/reference/cli/#sandbox-policy-preset).
 
 ## Related reading
 
-- [Policy model](/concepts/policy-model/) — assurance levels and rule shape.
-- [Networking](/concepts/networking/) — the enforcement pipeline your policy feeds.
-- [Troubleshooting](/guides/troubleshooting/) — broader session-level diagnostics.
-- [CLI reference](/reference/cli/) — full flag surface for `create`, `policy update`, `describe`, `inspect`, `policy preset`.
+- [Policy model](/sandboxd/concepts/policy-model/) — assurance levels and rule shape.
+- [Networking](/sandboxd/concepts/networking/) — the enforcement pipeline your policy feeds.
+- [Troubleshooting](/sandboxd/guides/troubleshooting/) — broader session-level diagnostics.
+- [CLI reference](/sandboxd/reference/cli/) — full flag surface for `create`, `policy update`, `describe`, `inspect`, `policy preset`.

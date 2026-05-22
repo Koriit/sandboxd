@@ -3,7 +3,7 @@ title: Workspaces
 description: How sandboxd delivers source code into a session — the six provisioning modes and their isolation trade-offs.
 ---
 
-A workspace is whatever source code and project files a session can see. sandboxd offers six ways to get those files into — and out of — a VM, and the choice has real isolation consequences. This page explains the model. For hands-on commands, see the [workspaces guide](/guides/workspaces/).
+A workspace is whatever source code and project files a session can see. sandboxd offers six ways to get those files into — and out of — a VM, and the choice has real isolation consequences. This page explains the model. For hands-on commands, see the [workspaces guide](/sandboxd/guides/workspaces/).
 
 ## Why multiple modes
 
@@ -46,13 +46,13 @@ When to pick `local:`:
 
 Prefer `clone:` when a remote git URL is already the source of truth; prefer `shared:` when interactive live editing (IDE on host, build/test in guest) is the dominant flow.
 
-See [hardening](/guides/hardening/#local-snapshot-workspace) for the security-trade-off notes behind picking `local:` over `shared:`.
+See [hardening](/sandboxd/guides/hardening/#local-snapshot-workspace) for the security-trade-off notes behind picking `local:` over `shared:`.
 
 ### Shared mount
 
 The host directory is mounted into the VM via QEMU's 9p filesystem. Reads and writes flow both ways in real time — the VM and the host see the same bytes with no sync step.
 
-Shared mount trades isolation for developer ergonomics. The guest has read-write access to the chosen host directory, and 9p adds a filesystem-protocol surface reachable from inside the VM. See [hardening](/guides/hardening/) for the security-trade-offs section.
+Shared mount trades isolation for developer ergonomics. The guest has read-write access to the chosen host directory, and 9p adds a filesystem-protocol surface reachable from inside the VM. See [hardening](/sandboxd/guides/hardening/) for the security-trade-offs section.
 
 ### `sandbox cp`
 
@@ -98,7 +98,7 @@ Only shared mount reduces the VM's isolation from the host; the other five modes
 - **`sandbox cp`** dispatches to `limactl cp` / `docker cp` — both operate over the backend's already-authenticated control channel; no extra network exposure is opened on the host or in the gateway path.
 - **`sandbox sync`** runs `rsync` with the backend's session tool as the remote-shell, so the bytes ride that same control channel. No SSH/rsync daemon is exposed to the network.
 - **Git remote transport** works the same way: the daemon already has a socket into the VM, so git's pack protocol rides it without opening anything new.
-- **Shared mount** is different. QEMU's 9p filesystem exposes a directory live. The guest can write anything, at any time, to anything under that directory. A VM escape paired with 9p access expands the blast radius to those host files. See [hardening](/guides/hardening/#9p-shared-mounts) for the detailed security-model notes.
+- **Shared mount** is different. QEMU's 9p filesystem exposes a directory live. The guest can write anything, at any time, to anything under that directory. A VM escape paired with 9p access expands the blast radius to those host files. See [hardening](/sandboxd/guides/hardening/#9p-shared-mounts) for the detailed security-model notes.
 
 ## Boot commands
 
@@ -117,6 +117,6 @@ You can combine modes: clone at creation, then use `sandbox cp` or `sandbox sync
 
 ## Next steps
 
-- [Workspaces guide](/guides/workspaces/) — commands and concrete flows for each mode.
-- [Sessions](/concepts/sessions/) — how a workspace fits into the broader session lifecycle.
-- [Networking](/concepts/networking/) — what clone mode needs from your policy.
+- [Workspaces guide](/sandboxd/guides/workspaces/) — commands and concrete flows for each mode.
+- [Sessions](/sandboxd/concepts/sessions/) — how a workspace fits into the broader session lifecycle.
+- [Networking](/sandboxd/concepts/networking/) — what clone mode needs from your policy.

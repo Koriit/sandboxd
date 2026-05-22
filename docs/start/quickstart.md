@@ -5,7 +5,7 @@ description: Install prerequisites, build sandboxd, and run your first policy-bo
 
 This page takes you from a fresh Linux host to a running sandbox session you can shell into. You need about five minutes, plus the first-boot image download.
 
-If you hit a snag, jump to [Troubleshooting](/guides/troubleshooting/) or the deeper [Installation guide](/start/installation/).
+If you hit a snag, jump to [Troubleshooting](/sandboxd/guides/troubleshooting/) or the deeper [Installation guide](/sandboxd/start/installation/).
 
 ## Prerequisites
 
@@ -15,7 +15,7 @@ You need a Linux x86_64 host with KVM, Docker, Lima, QEMU, and a Rust toolchain.
 ls /dev/kvm && docker info >/dev/null && limactl --version && rustc --version
 ```
 
-If any of those fail, stop here and follow [Installation](/start/installation/). The most common blockers are KVM group membership and Docker group membership — both require a logout after `usermod -aG`.
+If any of those fail, stop here and follow [Installation](/sandboxd/start/installation/). The most common blockers are KVM group membership and Docker group membership — both require a logout after `usermod -aG`.
 
 ## 1. Clone and build
 
@@ -107,7 +107,7 @@ sandbox rm hello
 
 ## What to read next
 
-- [Architecture](/concepts/architecture/) for what the components do and how traffic flows.
-- [CLI reference](/reference/cli/) for every command and flag.
-- [Troubleshooting](/guides/troubleshooting/) when something does not work.
-- [Lite mode](/guides/lite-mode/) when you want sub-second session creation in exchange for container-level isolation instead of VM-grade.
+- [Architecture](/sandboxd/concepts/architecture/) for what the components do and how traffic flows.
+- [CLI reference](/sandboxd/reference/cli/) for every command and flag.
+- [Troubleshooting](/sandboxd/guides/troubleshooting/) when something does not work.
+- [Lite mode](/sandboxd/guides/lite-mode/) when you want sub-second session creation in exchange for container-level isolation instead of VM-grade.

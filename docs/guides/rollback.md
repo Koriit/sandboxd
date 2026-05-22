@@ -146,5 +146,5 @@ If you have a recurring need for automated rollback, please open an issue on [Gi
 
 ## Related
 
-* [Installation](/start/installation/#to-upgrade) — the `sudo sandbox update` flow and how backup sets are created.
-* [Troubleshooting](/guides/troubleshooting/) — diagnose a misbehaving daemon before deciding to roll back.
+* [Installation](/sandboxd/start/installation/#to-upgrade) — the `sudo sandbox update` flow and how backup sets are created.
+* [Troubleshooting](/sandboxd/guides/troubleshooting/) — diagnose a misbehaving daemon before deciding to roll back.

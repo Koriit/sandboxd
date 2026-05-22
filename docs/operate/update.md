@@ -5,7 +5,7 @@ description: Operator walkthrough of `sandbox update` — pre-flight checks, the
 
 `sandbox update` applies an in-place upgrade of the sandboxd binaries, systemd unit, and configuration migrations. It is idempotent: re-running after an interrupted upgrade converges to the same end state without operator intervention. This page is the operator's reference for what the command does, what it leaves behind, and how to recover if something goes wrong.
 
-For the per-flag CLI reference, see [`sandbox update`](/reference/cli/#sandbox-update). For the per-step engineering specification, see Spec 5 (in the repository under `.tasks/specs/`).
+For the per-flag CLI reference, see [`sandbox update`](/sandboxd/reference/cli/#sandbox-update). For the per-step engineering specification, see Spec 5 (in the repository under `.tasks/specs/`).
 
 ## Operator preconditions
 
@@ -184,7 +184,7 @@ Captured once at first acquisition (`systemctl is-active sandboxd` returns `acti
 
 There is no `sandbox rollback` subcommand in v1. The recipe is manual but copy-pasteable: identify the backup set to restore (default: most recent with `completed_ok: true`), verify the prior gateway image is still loaded (or re-load it from the prior release tarball), stop the daemon, restore binaries + `/etc` files + `sessions.db` from the backup set, re-apply route-helper setcap, remove the lock file, start the daemon, and verify with `sandbox doctor`.
 
-See [Roll back a sandboxd upgrade](/guides/rollback/) for the verbatim recipe. The recipe is what `sandbox doctor` post-rollback is designed to gate — every check should pass, `/version` should report the previous version, and any sessions in the restored database should be visible.
+See [Roll back a sandboxd upgrade](/sandboxd/guides/rollback/) for the verbatim recipe. The recipe is what `sandbox doctor` post-rollback is designed to gate — every check should pass, `/version` should report the previous version, and any sessions in the restored database should be visible.
 
 Why is there no automated rollback? Three reasons:
 
@@ -223,7 +223,7 @@ Every failure path leaves the lock in place. The next invocation adopts and resu
 
 ## Related
 
-- [`sandbox update`](/reference/cli/#sandbox-update) — per-flag CLI reference.
-- [Roll back a sandboxd upgrade](/guides/rollback/) — verbatim recipe for restoring from a backup set.
-- [Installation](/start/installation/#to-upgrade) — first-time `sudo sandbox update` walkthrough.
-- [Troubleshooting](/guides/troubleshooting/) — diagnose a misbehaving daemon before deciding to roll back.
+- [`sandbox update`](/sandboxd/reference/cli/#sandbox-update) — per-flag CLI reference.
+- [Roll back a sandboxd upgrade](/sandboxd/guides/rollback/) — verbatim recipe for restoring from a backup set.
+- [Installation](/sandboxd/start/installation/#to-upgrade) — first-time `sudo sandbox update` walkthrough.
+- [Troubleshooting](/sandboxd/guides/troubleshooting/) — diagnose a misbehaving daemon before deciding to roll back.

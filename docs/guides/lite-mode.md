@@ -5,7 +5,7 @@ description: Container-backed sessions for fast, ephemeral agent runs — what t
 
 Lite mode runs each session inside a Docker container instead of a Lima/QEMU virtual machine. The trade is simple: you get session-creation in the low-second range and a much smaller resource footprint, but you give up VM-grade isolation. This guide explains the trade in detail, lists the workloads that lite cannot host, and gives you a clear rule for when to pick lite versus Lima.
 
-For the broader security model that lite mode plugs into, see [Hardening](/guides/hardening/) and [Networking](/concepts/networking/). For the operational lifecycle that lite shares with Lima, see [Sessions](/concepts/sessions/).
+For the broader security model that lite mode plugs into, see [Hardening](/sandboxd/guides/hardening/) and [Networking](/sandboxd/concepts/networking/). For the operational lifecycle that lite shares with Lima, see [Sessions](/sandboxd/concepts/sessions/).
 
 ## What lite mode is
 
@@ -76,7 +76,7 @@ The daemon does **not** use Docker user-namespace remapping (`--userns=...`). Us
 
 ## Prerequisites
 
-Lite mode requires Docker 24.0+ on the host. That is already a sandboxd prerequisite; see [Installation](/start/installation/) for the install steps. If you only intend to use lite mode and never spin up a Lima VM, the Lima/QEMU/KVM stack is not needed at runtime — but you still build the workspace via `make build`, which compiles every crate.
+Lite mode requires Docker 24.0+ on the host. That is already a sandboxd prerequisite; see [Installation](/sandboxd/start/installation/) for the install steps. If you only intend to use lite mode and never spin up a Lima VM, the Lima/QEMU/KVM stack is not needed at runtime — but you still build the workspace via `make build`, which compiles every crate.
 
 The first lite session on a fresh daemon-version triggers a Docker build of the lite image (a few minutes, one time). Subsequent lite sessions reuse the cached image and start in seconds.
 
@@ -112,7 +112,7 @@ When in doubt, start with Lima — it is the default for a reason. Switch a sess
 
 ## Related reading
 
-- [Hardening](/guides/hardening/) — the layered defence model lite plugs into.
-- [Sessions](/concepts/sessions/) — the lifecycle and persistence semantics that apply to both backends.
-- [Networking](/concepts/networking/) — the gateway-mediated egress that wraps both backends identically.
-- [Installation](/start/installation/) — Docker prerequisites and host setup.
+- [Hardening](/sandboxd/guides/hardening/) — the layered defence model lite plugs into.
+- [Sessions](/sandboxd/concepts/sessions/) — the lifecycle and persistence semantics that apply to both backends.
+- [Networking](/sandboxd/concepts/networking/) — the gateway-mediated egress that wraps both backends identically.
+- [Installation](/sandboxd/start/installation/) — Docker prerequisites and host setup.

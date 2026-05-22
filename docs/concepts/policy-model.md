@@ -3,7 +3,7 @@ title: Policy model
 description: How network policies describe what a session can reach — assurance levels, rule shape, and the four layers that enforce them.
 ---
 
-A network policy is the contract between you and a sandbox session: what the agent inside can reach on the network, and how deeply each destination is inspected. This page explains the model. For writing and applying policies, see the [network policies guide](/guides/network-policies/). For what the enforcement infrastructure actually does, see [networking](/concepts/networking/).
+A network policy is the contract between you and a sandbox session: what the agent inside can reach on the network, and how deeply each destination is inspected. This page explains the model. For writing and applying policies, see the [network policies guide](/sandboxd/guides/network-policies/). For what the enforcement infrastructure actually does, see [networking](/sandboxd/concepts/networking/).
 
 ## Default is deny
 
@@ -51,7 +51,7 @@ A policy is a JSON document with a `version` and an ordered `rules` array. Every
 }
 ```
 
-The `version` field is the **schema version** of the document format — it tells the daemon which policy DTO shape the file conforms to. The current schema is `2.0.0`; minor bumps (`2.x.x`) are accepted as backward-compatible, and the major must match exactly. It is *not* a per-policy revision counter — editing a policy does not require bumping `version`. Per-policy identity is tracked separately by the daemon as `policy_hash`, the SHA-256 digest of the canonical JSON form, surfaced on the `policy_propagated` and `policy_updated` lifecycle events and as `expected_hash` / `propagated_hash` on `GET /sessions/{id}/policy/propagation-status` (see [networking → Synchronous DNS-policy gating](/concepts/networking/#synchronous-dns-policy-gating)).
+The `version` field is the **schema version** of the document format — it tells the daemon which policy DTO shape the file conforms to. The current schema is `2.0.0`; minor bumps (`2.x.x`) are accepted as backward-compatible, and the major must match exactly. It is *not* a per-policy revision counter — editing a policy does not require bumping `version`. Per-policy identity is tracked separately by the daemon as `policy_hash`, the SHA-256 digest of the canonical JSON form, surfaced on the `policy_propagated` and `policy_updated` lifecycle events and as `expected_hash` / `propagated_hash` on `GET /sessions/{id}/policy/propagation-status` (see [networking → Synchronous DNS-policy gating](/sandboxd/concepts/networking/#synchronous-dns-policy-gating)).
 
 ### Fields
 
@@ -74,7 +74,7 @@ The `protocol` enum accepts `tcp` or `udp` symmetrically, but the two protocols 
 - **Allow audit is per-flow, not per-packet.** Every accepted UDP flow produces one `event: "allow"` JSONL record at flow start, sourced from the kernel's conntrack `NFCT_T_NEW` event. A long-lived UDP exchange does not produce one record per datagram. Conntrack ages the flow out after 30 s of silence (`net.netfilter.nf_conntrack_udp_timeout`); the next packet on the same 5-tuple opens a new flow with a new allow record. TCP allow audit, by contrast, is per-connection via Envoy's access log.
 - **Deny is silent at the network level.** A blocked UDP datagram is dropped at nft with no ICMP unreachable on the wire — the VM-side socket sees only timeouts. Audit attribution lives in the JSONL stream: a `event: "deny"` record carrying the original 5-tuple is written by `sandbox-nft-deny-logger` from the kernel's NFLOG group 1 stream. TCP deny, by contrast, is a RST close on a redirected listener socket.
 
-These properties are also reflected in the [network policies guide](/guides/network-policies/#udp-destinations) (with a worked NTP example) and the [troubleshooting guide's UDP section](/guides/troubleshooting/#udp-traffic) (for diagnosis flow).
+These properties are also reflected in the [network policies guide](/sandboxd/guides/network-policies/#udp-destinations) (with a worked NTP example) and the [troubleshooting guide's UDP section](/sandboxd/guides/troubleshooting/#udp-traffic) (for diagnosis flow).
 
 ### Hosts
 
@@ -156,24 +156,24 @@ Because every rule carries an explicit port and protocol (v2 policy schema), eve
 
 ## Applying policies
 
-Policies are a property of a session. You attach one at creation with `--policy <file>` and/or one or more `--preset <invocation>` flags, and update them live with `sandbox policy update`. The update path re-compiles and hot-reloads all four components without restarting the session. See the [network policies guide](/guides/network-policies/) for the commands.
+Policies are a property of a session. You attach one at creation with `--policy <file>` and/or one or more `--preset <invocation>` flags, and update them live with `sandbox policy update`. The update path re-compiles and hot-reloads all four components without restarting the session. See the [network policies guide](/sandboxd/guides/network-policies/) for the commands.
 
-For debugging what the active policy allows, `sandbox describe` prints a human summary and `sandbox inspect` returns the full JSON representation. See the [CLI reference](/reference/cli/) for output shapes.
+For debugging what the active policy allows, `sandbox describe` prints a human summary and `sandbox inspect` returns the full JSON representation. See the [CLI reference](/sandboxd/reference/cli/) for output shapes.
 
 ## Presets
 
 Presets are reusable host-list templates that the CLI expands into v2 policy rules before the request ever reaches the daemon. Eleven built-ins ship with every CLI release (`npm:`, `pypi:`, `cargo:`, `goproxy:`, `maven:`, `gradle:`, `dockerhub:`, `github:`, `github-repo:`, `github-pr:`, `ubuntu:`), and user-defined JSON presets under `$XDG_CONFIG_HOME/sandboxd/presets/` extend the catalog for site-specific destinations.
 
-Expansion is entirely client-side — the daemon receives the fully materialized effective policy and stores the original `--preset` invocation strings as a `source_presets` audit trail attached to the `policy_applied` / `policy_updated` events. See the [network policies guide → Presets](/guides/network-policies/#presets) for invocation syntax, built-in catalog, and user-preset authoring rules.
+Expansion is entirely client-side — the daemon receives the fully materialized effective policy and stores the original `--preset` invocation strings as a `source_presets` audit trail attached to the `policy_applied` / `policy_updated` events. See the [network policies guide → Presets](/sandboxd/guides/network-policies/#presets) for invocation syntax, built-in catalog, and user-preset authoring rules.
 
 ## Observability
 
-Every policy-enforcing component (CoreDNS, Envoy, mitmproxy, nft-deny-logger, nft-allow-logger) emits a structured event per decision, and sandboxd itself emits lifecycle events — including `policy_applied`, `policy_updated`, `policy_propagated`, `gateway_ready`, and `gateway_shutdown`. All of them land in a unified per-session stream you can replay or follow with `sandbox events <session>`. The `policy_propagated` event in particular closes the DNS-propagation window: it fires once the applied policy's hash has reconciled across CoreDNS, the nftables `policy_allow_{tcp,udp}` sets, and Envoy's L3 filter chains. See [`sandbox events`](/reference/cli/#sandbox-events) for the full CLI surface and [networking → Synchronous DNS-policy gating](/concepts/networking/#synchronous-dns-policy-gating) for why the propagation is observable at all.
+Every policy-enforcing component (CoreDNS, Envoy, mitmproxy, nft-deny-logger, nft-allow-logger) emits a structured event per decision, and sandboxd itself emits lifecycle events — including `policy_applied`, `policy_updated`, `policy_propagated`, `gateway_ready`, and `gateway_shutdown`. All of them land in a unified per-session stream you can replay or follow with `sandbox events <session>`. The `policy_propagated` event in particular closes the DNS-propagation window: it fires once the applied policy's hash has reconciled across CoreDNS, the nftables `policy_allow_{tcp,udp}` sets, and Envoy's L3 filter chains. See [`sandbox events`](/sandboxd/reference/cli/#sandbox-events) for the full CLI surface and [networking → Synchronous DNS-policy gating](/sandboxd/concepts/networking/#synchronous-dns-policy-gating) for why the propagation is observable at all.
 
 Note the asymmetry between TCP and UDP audit granularity: TCP allow events come from Envoy's access log (per connection), TCP deny events come from `nft-deny-logger`'s redirected listener (per accepted-then-RST-closed connection), UDP allow events come from `nft-allow-logger`'s NFCT subscription (per new conntrack flow, with 30 s rollover after silence), and UDP deny events come from `nft-deny-logger`'s NFLOG subscription (per dropped datagram, no ICMP attribution on the wire). Per-protocol caveats are spelled out alongside the [`protocol` field](#udp-specific-caveats) above.
 
 ## Related reading
 
-- [Network policies guide](/guides/network-policies/) — write a policy, apply it, troubleshoot denials.
-- [Networking](/concepts/networking/) — the infrastructure the compiler targets.
-- [Hardening](/guides/hardening/) — where policy fits into the broader security posture.
+- [Network policies guide](/sandboxd/guides/network-policies/) — write a policy, apply it, troubleshoot denials.
+- [Networking](/sandboxd/concepts/networking/) — the infrastructure the compiler targets.
+- [Hardening](/sandboxd/guides/hardening/) — where policy fits into the broader security posture.

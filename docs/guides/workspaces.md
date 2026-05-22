@@ -3,13 +3,13 @@ title: Use workspaces
 description: Provision source code into a session using clone, shared mount, local snapshot, sandbox cp / sync, or git remote transport.
 ---
 
-This guide shows you how to use each workspace mode with copy-pasteable commands. For background on the modes and their trade-offs, see [workspaces concepts](/concepts/workspaces/).
+This guide shows you how to use each workspace mode with copy-pasteable commands. For background on the modes and their trade-offs, see [workspaces concepts](/sandboxd/concepts/workspaces/).
 
 ## Before you start
 
 You need:
 
-- A running `sandboxd` daemon — see [Quickstart](/start/quickstart/) if you have not set one up.
+- A running `sandboxd` daemon — see [Quickstart](/sandboxd/start/quickstart/) if you have not set one up.
 - The `sandbox` CLI on your `PATH`.
 - For git remote transport, the `git-remote-sandbox` symlink on your `PATH` alongside `sandbox`.
 
@@ -41,7 +41,7 @@ sandbox exec dev -- ls /home/agent/workspace
 ### Troubleshooting clone
 
 - **Clone fails, session still comes up.** Clone failure is non-fatal. The session reaches `Running` with an empty workspace. Check the daemon logs for the `git clone` error, then fix the policy or URL and redo.
-- **`NXDOMAIN` on the git host.** The domain is not in the policy. See [network policies](/guides/network-policies/).
+- **`NXDOMAIN` on the git host.** The domain is not in the policy. See [network policies](/sandboxd/guides/network-policies/).
 - **`Connection refused`.** DNS resolved but the IP is not allowed. Check the policy's assurance level and CIDR coverage.
 
 ## Mount a host directory (shared mode)
@@ -109,7 +109,7 @@ A leading `~` in the host token expands against the CLI process's `$HOME` (the s
 - `mapped-xattr` (default) — file ownership and permissions on the host side are stored in extended attributes. Sandbox-side files are not owned by the operator's uid on the host filesystem; that is the safer default.
 - `none` — opt in when you need real-symlink interop in both directions. A build step inside the guest that creates a symlink will land on the host as a real symlink, not as a 9p-encoded placeholder. The price is that file ownership reflects the guest's view, which is less restrictive than `mapped-xattr`.
 
-The 9p models `passthrough` and `mapped-file` are deliberately not exposed by `sandboxd`. See [hardening — 9p shared mounts](/guides/hardening/#9p-shared-mounts) for the full trade-off and the rationale.
+The 9p models `passthrough` and `mapped-file` are deliberately not exposed by `sandboxd`. See [hardening — 9p shared mounts](/sandboxd/guides/hardening/#9p-shared-mounts) for the full trade-off and the rationale.
 
 Constraints:
 
@@ -125,13 +125,13 @@ sandbox exec dev -- ls "$(pwd)"
 
 Changes on either side appear immediately on the other — no sync step needed.
 
-Shared mount reduces VM isolation. If your workload does not need live bidirectional visibility, prefer clone plus `sandbox cp` or git remote transport. See [hardening](/guides/hardening/#9p-shared-mounts) for the full trade-off.
+Shared mount reduces VM isolation. If your workload does not need live bidirectional visibility, prefer clone plus `sandbox cp` or git remote transport. See [hardening](/sandboxd/guides/hardening/#9p-shared-mounts) for the full trade-off.
 
 ## Snapshot a host directory (`local:` mode)
 
 `local:` is the snapshot-style cousin of `shared:`. At session-creation time the daemon `rsync`s your host directory into the guest; after that, no live host-to-guest link exists. The guest sees a static copy of the tree as it was at create time. There is no 9p surface, no bind mount, and no path through which a guest write reaches your host filesystem.
 
-Reach for `local:` when you want the convenience of seeding the session with a directory you already have on disk, but do not need (or do not want) live bidirectional visibility. Typical fits: a non-git scratch tree, generated files you do not want to commit, or a directory where isolation matters more than ergonomic in-place editing. See [hardening](/guides/hardening/#local-snapshot-workspace) for the isolation-trade-off notes that justify reaching for `local:` over `shared:`.
+Reach for `local:` when you want the convenience of seeding the session with a directory you already have on disk, but do not need (or do not want) live bidirectional visibility. Typical fits: a non-git scratch tree, generated files you do not want to commit, or a directory where isolation matters more than ergonomic in-place editing. See [hardening](/sandboxd/guides/hardening/#local-snapshot-workspace) for the isolation-trade-off notes that justify reaching for `local:` over `shared:`.
 
 `shared:` vs. `local:`, at a glance:
 
@@ -407,6 +407,6 @@ sandbox rm review
 
 ## Where to go next
 
-- [Network policies](/guides/network-policies/) — open specific destinations so clone and other network operations can reach them.
-- [First real session](/guides/first-real-session/) — put workspaces, policy, and the agent together in one flow.
-- [Troubleshooting](/guides/troubleshooting/) — when something does not work.
+- [Network policies](/sandboxd/guides/network-policies/) — open specific destinations so clone and other network operations can reach them.
+- [First real session](/sandboxd/guides/first-real-session/) — put workspaces, policy, and the agent together in one flow.
+- [Troubleshooting](/sandboxd/guides/troubleshooting/) — when something does not work.

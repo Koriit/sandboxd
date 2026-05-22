@@ -5,7 +5,7 @@ description: Where sandboxd writes tracing output, how to control the log level,
 
 `sandboxd` emits structured tracing output via `tracing_subscriber::fmt`. You choose where that output goes; the daemon does not manage log rotation itself — hand that off to your init system or `logrotate`.
 
-For the daemon config surface (flags and env vars), see the [config reference](/reference/config/).
+For the daemon config surface (flags and env vars), see the [config reference](/sandboxd/reference/config/).
 
 ## Where logs go
 
@@ -93,5 +93,5 @@ The file is opened in append mode. To rotate, use `logrotate` with `copytruncate
 
 ## What to read next
 
-- [Daemon config reference](/reference/config/) — every flag and environment variable.
-- [Troubleshooting](/guides/troubleshooting/) — debugging a daemon that will not start.
+- [Daemon config reference](/sandboxd/reference/config/) — every flag and environment variable.
+- [Troubleshooting](/sandboxd/guides/troubleshooting/) — debugging a daemon that will not start.

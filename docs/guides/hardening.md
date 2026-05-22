@@ -3,7 +3,7 @@ title: Hardening
 description: The layers of defence applied to every session, what they protect against, and how to turn each knob up or down.
 ---
 
-Every sandbox session is hardened by default — you do not opt in. This guide walks through each hardening layer as an operational knob: what it protects against, how it is configured, and when (if ever) you would turn it off. For the broader security model, see [networking](/concepts/networking/) and [policy model](/concepts/policy-model/).
+Every sandbox session is hardened by default — you do not opt in. This guide walks through each hardening layer as an operational knob: what it protects against, how it is configured, and when (if ever) you would turn it off. For the broader security model, see [networking](/sandboxd/concepts/networking/) and [policy model](/sandboxd/concepts/policy-model/).
 
 ## The security model
 
@@ -86,7 +86,7 @@ The gateway container ships with a tight capability set and a read-only root.
 
 ### Privileged helpers and the `SANDBOX_USERS_CONF` boundary
 
-Two privileged helpers exist in the install footprint: `qemu-bridge-helper` (setuid root, ships with QEMU) and `sandbox-route-helper` (cap'd `cap_net_admin,cap_sys_admin=eip`, lives at `/usr/local/libexec/sandboxd/sandbox-route-helper`). Both are invoked by the daemon, not by operators directly. `qemu-bridge-helper` cross-checks the caller's uid against its own ACL before attaching a TAP device; `sandbox-route-helper` enforces a **pair-membership check** against `/etc/sandboxd/users.conf` before any namespace mutation — both the calling process's uid (the daemon, via `getuid`) and the operator name passed in `--for-user` (which the daemon reads from `SO_PEERCRED` on its accepted Unix socket) must appear in the same pool's `allow_users`. A compromised daemon cannot invent operator names that are not already paired with its own runtime uid; a local user with `allow_users` access cannot drive the helper from outside the daemon because they cannot forge the `SO_PEERCRED`-derived `--for-user` argument the daemon supplies. Every allow/deny decision is recorded to a JSON-Lines audit log; see [Audit log](/start/installation/#audit-log) in the installation guide for the on-disk path, field set, and the deny-path-write-failure escalation contract.
+Two privileged helpers exist in the install footprint: `qemu-bridge-helper` (setuid root, ships with QEMU) and `sandbox-route-helper` (cap'd `cap_net_admin,cap_sys_admin=eip`, lives at `/usr/local/libexec/sandboxd/sandbox-route-helper`). Both are invoked by the daemon, not by operators directly. `qemu-bridge-helper` cross-checks the caller's uid against its own ACL before attaching a TAP device; `sandbox-route-helper` enforces a **pair-membership check** against `/etc/sandboxd/users.conf` before any namespace mutation — both the calling process's uid (the daemon, via `getuid`) and the operator name passed in `--for-user` (which the daemon reads from `SO_PEERCRED` on its accepted Unix socket) must appear in the same pool's `allow_users`. A compromised daemon cannot invent operator names that are not already paired with its own runtime uid; a local user with `allow_users` access cannot drive the helper from outside the daemon because they cannot forge the `SO_PEERCRED`-derived `--for-user` argument the daemon supplies. Every allow/deny decision is recorded to a JSON-Lines audit log; see [Audit log](/sandboxd/start/installation/#audit-log) in the installation guide for the on-disk path, field set, and the deny-path-write-failure escalation contract.
 
 The `sandbox-route-helper` binary's authorization model rests on the integrity of `/etc/sandboxd/users.conf`. Two concrete defences keep the file trustworthy:
 
@@ -95,7 +95,7 @@ The `sandbox-route-helper` binary's authorization model rests on the integrity o
 
 ## Layer 3 — Network isolation
 
-Network hardening cannot be turned off per session. For the full model see [networking](/concepts/networking/). The security-relevant guarantees:
+Network hardening cannot be turned off per session. For the full model see [networking](/sandboxd/concepts/networking/). The security-relevant guarantees:
 
 - **Per-session bridge.** Each session lives on its own `/28` Docker bridge. Sessions cannot reach each other.
 - **Deny-all baseline.** nftables rules in the gateway drop every forwarded packet by default. DNAT rules that route traffic through the proxy pipeline are installed only after the gateway's policy-enforcing components (CoreDNS, Envoy, mitmproxy) and audit loggers (sandbox-nft-deny-logger, sandbox-nft-allow-logger) pass readiness.
@@ -187,7 +187,7 @@ Do not run `--no-hardening` against real workloads. The hardened configuration i
 - The guest has direct read-write access to the chosen host directory.
 - Writes flow both ways with no review or approval step.
 
-Use clone mode (`--repo`) plus `sandbox cp` or git remote transport when isolation matters more than convenience. See [workspaces concepts](/concepts/workspaces/) for the trade-off and [workspaces guide](/guides/workspaces/) for the commands.
+Use clone mode (`--repo`) plus `sandbox cp` or git remote transport when isolation matters more than convenience. See [workspaces concepts](/sandboxd/concepts/workspaces/) for the trade-off and [workspaces guide](/sandboxd/guides/workspaces/) for the commands.
 
 #### Per-session `securityModel`
 
@@ -208,7 +208,7 @@ shared:<host>[:<guest>][:<security-model>]
 
 The default is `mapped-xattr`. Override to `none` only when symlink semantics matter — for example, a `make install` step inside the guest that lays down symlinks expected to round-trip back to the operator's host filesystem.
 
-Set the model at create time via the third colon-segment of the flag value (see [workspaces guide](/guides/workspaces/#pick-a-security-model)). The choice is persisted on the session record and cannot be changed after create; `sandbox rm` plus a fresh `create` is the only way to revisit it.
+Set the model at create time via the third colon-segment of the flag value (see [workspaces guide](/sandboxd/guides/workspaces/#pick-a-security-model)). The choice is persisted on the session record and cannot be changed after create; `sandbox rm` plus a fresh `create` is the only way to revisit it.
 
 ### `local:` snapshot workspace
 
@@ -219,7 +219,7 @@ Set the model at create time via the third colon-segment of the flag value (see 
 - No live guest writes are visible to the host. Guest-side modifications stay inside the session.
 - Trade-off is staleness: the operator decides when (and whether) to push or pull updates across the boundary via the dedicated `sandbox workspace push` / `pull` commands.
 
-Reach for `local:` when you want to seed a session from a host directory without giving up the isolation properties of clone mode. See [workspaces concepts](/concepts/workspaces/) for the broader comparison and [workspaces guide](/guides/workspaces/#snapshot-a-host-directory-local-mode) for the commands.
+Reach for `local:` when you want to seed a session from a host directory without giving up the isolation properties of clone mode. See [workspaces concepts](/sandboxd/concepts/workspaces/) for the broader comparison and [workspaces guide](/sandboxd/guides/workspaces/#snapshot-a-host-directory-local-mode) for the commands.
 
 ### SLIRP management network
 
@@ -237,7 +237,7 @@ Removing SLIRP would require replacing Lima's SSH provisioning; it is not curren
 
 ## Related reading
 
-- [Networking](/concepts/networking/) — how the network-isolation layer actually works.
-- [Policy model](/concepts/policy-model/) — the contract that defines what traffic is allowed.
-- [Workspaces concepts](/concepts/workspaces/) — the isolation cost of each provisioning mode.
-- [Troubleshooting](/guides/troubleshooting/) — when a hardened session misbehaves.
+- [Networking](/sandboxd/concepts/networking/) — how the network-isolation layer actually works.
+- [Policy model](/sandboxd/concepts/policy-model/) — the contract that defines what traffic is allowed.
+- [Workspaces concepts](/sandboxd/concepts/workspaces/) — the isolation cost of each provisioning mode.
+- [Troubleshooting](/sandboxd/guides/troubleshooting/) — when a hardened session misbehaves.
