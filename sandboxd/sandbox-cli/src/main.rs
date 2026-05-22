@@ -4436,14 +4436,14 @@ async fn handle_sync(socket_path: &str, src: &str, dst: &str, rsync_args: &[Stri
 ///
 /// Carried into [`plan_workspace_sync_argv`] so the planner emits the
 /// correct src/dst ordering for whichever direction the operator picked.
-/// Push: host → guest. Pull: guest → host. The variant is a flat enum
-/// rather than a bool so future directions (e.g. a bidirectional
-/// `sync`) can be added without re-spelling existing call sites.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorkspaceSyncDirection {
-    Push,
-    Pull,
-}
+/// Push: host → guest. Pull: guest → host.
+///
+/// Re-exported as a local alias of [`sandbox_core::Direction`] — the
+/// shared workspace-rsync builder owns the canonical direction enum,
+/// and the CLI inherits it so both call sites speak the same vocabulary.
+/// All existing `WorkspaceSyncDirection::{Push,Pull}` use sites continue
+/// to work because the variants are inherited through the alias.
+type WorkspaceSyncDirection = sandbox_core::Direction;
 
 /// Operator-supplied inputs for [`plan_workspace_sync_argv`].
 ///
@@ -4549,84 +4549,46 @@ fn plan_workspace_sync_argv(plan: &WorkspaceSyncPlan) -> Result<Vec<String>, Str
         _ => {}
     }
 
-    // Shell-transport: `-e <transport>` slots in as rsync's remote-shell
-    // exec. Matches `plan_sync_command` and `workspace_rsync::build_argv`
-    // verbatim so all three rsync paths share the same `<shell>` token
-    // per backend.
-    let shell = match plan.backend {
-        sandbox_core::BackendKind::Lima => "limactl shell",
-        sandbox_core::BackendKind::Container => "docker exec -i",
+    // The shared builder owns the rsync wire shape (transports,
+    // trailing-slash rule, `-aL` ↔ `-a --safe-links` toggle, filter
+    // drop, `--dry-run` placement, src/dst swap on Push vs Pull).
+    // CLI-specific concerns that the shared builder does NOT carry:
+    //
+    // - `--dest <path>` override (pull only). The planner is path-
+    //   agnostic and takes whatever string the call site supplies for
+    //   `host_path`; we feed the override in here so the shared
+    //   builder's trailing-slash normalisation applies uniformly.
+    //   Push ignores `dest_override` — clap's surface restricts
+    //   `--dest` to Pull, and `run_workspace_push_or_pull`
+    //   defensively clears it for Push.
+    // - `--mkpath` is intentionally left off (create-time push opts
+    //   in, operator push/pull leaves it off because the destination
+    //   should already exist).
+    // - The CLI returns argv with `"rsync"` as `argv[0]`; the shared
+    //   builder returns argv WITHOUT the program name, so we prepend
+    //   here. Returning the program inside the vector (rather than as
+    //   a separate field) matches the shape the spec § Unit tests
+    //   block asserts on.
+    let host_path = match (plan.direction, plan.dest_override.as_deref()) {
+        (WorkspaceSyncDirection::Pull, Some(dest)) => dest.to_string(),
+        _ => plan.host_path.clone(),
     };
 
-    // Trailing-slash rule (spec § Trailing-slash rule): every endpoint
-    // carries `/` so rsync mirrors the *contents* of the directory,
-    // not the directory entry itself. We append only when absent so
-    // operator-supplied paths that already end in `/` are not doubled.
-    let with_slash = |p: &str| {
-        if p.ends_with('/') {
-            p.to_string()
-        } else {
-            format!("{p}/")
-        }
+    let opts = sandbox_core::WorkspaceRsyncOptions {
+        backend: plan.backend,
+        session_name: format!("sandbox-{}", plan.session_id),
+        host_path,
+        guest_path: plan.guest_path.clone(),
+        direction: plan.direction,
+        no_gitignore: plan.no_gitignore,
+        dry_run: plan.dry_run,
+        safe_links: plan.safe_links,
+        mkpath: false,
     };
 
-    let session_name = format!("sandbox-{}", plan.session_id);
-    let remote = format!("{session_name}:{}", with_slash(&plan.guest_path));
-
-    // For pull, `dest_override` replaces the host_path in the dst
-    // position. The CLI handler is responsible for resolving `~` and
-    // rejecting existing-file destinations before constructing the
-    // plan — the planner is path-agnostic and takes whatever string
-    // the call site supplies. Trailing-slash normalisation applies
-    // uniformly to the override and the default.
-    let host_arg = match (plan.direction, plan.dest_override.as_deref()) {
-        (WorkspaceSyncDirection::Pull, Some(dest)) => with_slash(dest),
-        _ => with_slash(&plan.host_path),
-    };
-
-    let (src, dst) = match plan.direction {
-        WorkspaceSyncDirection::Push => (host_arg, remote),
-        WorkspaceSyncDirection::Pull => (remote, host_arg),
-    };
-
-    // argv[0] is the program name itself. Returning it inside the
-    // vector (rather than as a `(program, args)` tuple) matches the
-    // shape the spec § Unit tests block asserts on (the test
-    // fixtures compare against `["rsync", "-aL", "--delete", ...]`).
-    let mut argv: Vec<String> = Vec::with_capacity(10);
+    let mut argv = Vec::with_capacity(10);
     argv.push("rsync".to_string());
-
-    // Symlink-handling flag: default `-aL` (archive + dereference all),
-    // or split `-a --safe-links` when the operator opts into safe-link
-    // semantics. The split is load-bearing: rsync's `--safe-links`
-    // does *not* compose with `-L`, so the single `-aL` cannot be
-    // augmented — the planner must drop `-L` entirely.
-    if plan.safe_links {
-        argv.push("-a".to_string());
-        argv.push("--safe-links".to_string());
-    } else {
-        argv.push("-aL".to_string());
-    }
-    argv.push("--delete".to_string());
-    if !plan.no_gitignore {
-        // Per-directory merge of `.gitignore` files; matched entries
-        // are excluded from both transfer and deletion consideration.
-        // See spec § Filter source asymmetry: the filter reads the
-        // .gitignore on whichever side is the rsync source.
-        argv.push("--filter=:- .gitignore".to_string());
-    }
-    argv.push("-e".to_string());
-    argv.push(shell.to_string());
-    if plan.dry_run {
-        // `--dry-run` is placed after `-e <shell>` and before the
-        // src/dst operands. rsync accepts it anywhere among the
-        // options, but pinning a stable position keeps the argv test
-        // fixtures readable.
-        argv.push("--dry-run".to_string());
-    }
-    argv.push(src);
-    argv.push(dst);
-
+    argv.extend(sandbox_core::build_workspace_rsync_argv(&opts));
     Ok(argv)
 }
 
