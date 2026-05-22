@@ -19,5 +19,29 @@
 //!   containing a `docker` shim to `PATH`, with configurable
 //!   `docker info --format '{{.SecurityOptions}}'` responses for
 //!   testing the rootless-Docker probe.
+//! - [`home_env_mutex`] — process-wide lock for tests that mutate `HOME`,
+//!   `XDG_RUNTIME_DIR`, or other XDG env vars; prevents races between
+//!   tests that run concurrently under `cargo test`.
 
 pub mod docker_path_stub;
+
+/// Returns a reference to the process-wide mutex that serializes all
+/// tests which mutate `HOME`, `XDG_RUNTIME_DIR`, `SANDBOX_LISTENER_DIR`,
+/// `SANDBOX_EVENTS_DIR`, or any other XDG / home-directory env var.
+///
+/// `cargo test` runs unit tests within the same binary concurrently on
+/// multiple threads. Without serialization, one test's `remove_var("HOME")`
+/// races with another test's `env::var("HOME")` and causes flakes. nextest
+/// provides per-test process isolation so the lock is belt-and-suspenders
+/// there, but it keeps `cargo test` deterministic.
+///
+/// # Usage
+///
+/// ```ignore
+/// let _guard = crate::test_support::home_env_mutex().lock().unwrap();
+/// // mutate HOME / XDG_RUNTIME_DIR here
+/// ```
+pub fn home_env_mutex() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}

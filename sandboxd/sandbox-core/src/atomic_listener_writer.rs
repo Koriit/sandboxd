@@ -568,16 +568,17 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Snapshot the trio of env vars `listener_host_root` reads, clear
-    /// them, run `body`, then restore. Returned by-value so the test body
-    /// stays linear.
+    /// them, run `body`, then restore. Holds `home_env_mutex` for the
+    /// duration so concurrent cargo-test threads cannot race on these vars.
     fn with_clean_env<F: FnOnce() -> R, R>(body: F) -> R {
+        // Serialize all tests that touch HOME / XDG vars.  nextest runs each
+        // test in its own process so the lock is belt-and-suspenders there.
+        let _guard = crate::test_support::home_env_mutex().lock().unwrap();
         let prior_override = std::env::var("SANDBOX_LISTENER_DIR").ok();
         let prior_runtime = std::env::var("XDG_RUNTIME_DIR").ok();
         let prior_home = std::env::var("HOME").ok();
-        // SAFETY: env mutation is process-global; nextest gives each
-        // test its own process under the default profile, so the
-        // unsafe block is sound. See the SANDBOX_SOCKET tests in
-        // `sandboxd/src/main.rs` for the same pattern.
+        // SAFETY: protected by home_env_mutex(); only one thread touches
+        // these vars at a time.
         unsafe {
             std::env::remove_var("SANDBOX_LISTENER_DIR");
             std::env::remove_var("XDG_RUNTIME_DIR");

@@ -401,13 +401,21 @@ mod tests {
     /// effects (PATH restored) before its own setup runs.
     #[test]
     fn sequential_stubs_do_not_leak() {
-        let baseline = env::var("PATH").ok();
+        // Snapshot PATH while holding the lock so another concurrent
+        // test cannot change it between our snapshot and our assertion.
+        let baseline = {
+            let _guard = path_mutex().lock().unwrap();
+            env::var("PATH").ok()
+        };
         {
             let _a = DockerPathStub::new(DockerInfoBehavior::ReportRootless);
         }
         {
             let _b = DockerPathStub::new(DockerInfoBehavior::ReportDefault);
         }
+        // Re-acquire the lock for the assertion so another test cannot
+        // modify PATH between _b.drop() (lock release) and the check.
+        let _guard = path_mutex().lock().unwrap();
         assert_eq!(env::var("PATH").ok(), baseline);
     }
 }
