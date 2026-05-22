@@ -28,7 +28,7 @@ use sandbox_cli::presets::{self, Catalog, ParsedInvocation, Preset, PresetSource
 #[command(name = "sandbox", about = "Manage sandbox sessions", version)]
 struct Cli {
     /// Path to the sandboxd Unix socket.
-    #[arg(long, global = true, default_value_t = default_socket_path())]
+    #[arg(long, global = true, env = "SANDBOX_SOCKET", default_value_t = default_socket_path())]
     socket: String,
 
     /// Assume yes to interactive prompts (use defaults without prompting).
@@ -718,12 +718,10 @@ enum LogComponent {
 }
 
 fn default_socket_path() -> String {
-    // Honor SANDBOX_SOCKET as an override (symmetric with the daemon). The
-    // `--socket` flag, when passed explicitly, still takes precedence
-    // because clap only computes this default when no value is given.
-    if let Ok(sock) = std::env::var("SANDBOX_SOCKET") {
-        return sock;
-    }
+    // Returns the XDG/HOME-derived fallback path. SANDBOX_SOCKET is handled
+    // by clap's `env = "SANDBOX_SOCKET"` on the `--socket` arg (which is
+    // evaluated per-parse and takes precedence over this default). An
+    // explicit `--socket` flag takes precedence over the env var.
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
         return format!("{runtime_dir}/sandboxd/sandboxd.sock");
     }
@@ -6535,6 +6533,13 @@ async fn main() {
 mod tests {
     use super::*;
 
+    // Serializes all tests that read or write `SANDBOX_SOCKET`. Under
+    // `cargo test`, multiple test threads share the same process and can
+    // race on this env var. nextest provides per-test process isolation so
+    // the lock is belt-and-suspenders there, but it keeps `cargo test` safe.
+    static SANDBOX_SOCKET_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
     #[test]
     fn parse_create_no_name() {
         let cli = Cli::parse_from(["sandbox", "create"]);
@@ -6687,13 +6692,16 @@ mod tests {
 
     #[test]
     fn default_socket_path_set() {
-        // Ensure the test is not perturbed by an inherited SANDBOX_SOCKET
-        // from the surrounding shell -- the default value should end with
-        // `sandboxd.sock` regardless of outside state.
+        // When SANDBOX_SOCKET is absent, the clap env attr falls through to
+        // default_socket_path() and the resolved path must end with
+        // `sandboxd.sock`. Clear any inherited env var first so the test is
+        // hermetic. Hold SANDBOX_SOCKET_LOCK for the duration so concurrent
+        // cargo-test threads cannot race on the env var.
+        let _guard = SANDBOX_SOCKET_LOCK.lock().unwrap();
         let prior = std::env::var("SANDBOX_SOCKET").ok();
-        // SAFETY: Tests in this module that touch SANDBOX_SOCKET mutate and
-        // restore it in a single test body to avoid cross-test races under
-        // `cargo test` (nextest already provides per-test process isolation).
+        // SAFETY: protected by SANDBOX_SOCKET_LOCK; only one thread touches
+        // this var at a time. nextest runs each test in its own process so
+        // the lock is belt-and-suspenders there.
         unsafe { std::env::remove_var("SANDBOX_SOCKET") };
         let cli = Cli::parse_from(["sandbox", "ps"]);
         assert!(cli.socket.ends_with("sandboxd.sock"));
@@ -6711,18 +6719,21 @@ mod tests {
 
     #[test]
     fn default_socket_path_honors_sandbox_socket_env() {
-        // Save and restore the env var to keep the test hermetic. Both
-        // assertions live in one test so that parallel threads under
-        // `cargo test` cannot race on the same var (nextest runs each test
-        // in its own process, so this is belt-and-suspenders there).
+        // Hold SANDBOX_SOCKET_LOCK for the duration so concurrent cargo-test
+        // threads cannot interleave their env-var mutations with this test.
+        let _guard = SANDBOX_SOCKET_LOCK.lock().unwrap();
         let prior = std::env::var("SANDBOX_SOCKET").ok();
 
-        // SANDBOX_SOCKET is honored when no --socket flag is given. This
-        // matches the daemon's precedence: `--socket` > env > XDG/HOME.
-        // SAFETY: see note on the restore block; the test body is the only
-        // window in which the variable is mutated.
+        // SANDBOX_SOCKET is honored by clap's `env = "SANDBOX_SOCKET"` on
+        // the --socket arg when no explicit flag is given. This matches the
+        // daemon's precedence: `--socket` > env > XDG/HOME.
+        // Note: default_socket_path() itself no longer reads SANDBOX_SOCKET;
+        // clap reads the env var per-parse, which is safe and correct here
+        // because the lock prevents other threads from mutating it concurrently.
+        // SAFETY: protected by SANDBOX_SOCKET_LOCK; only one thread touches
+        // this var at a time. nextest runs each test in its own process so
+        // the lock is belt-and-suspenders there.
         unsafe { std::env::set_var("SANDBOX_SOCKET", "/tmp/from-env.sock") };
-        assert_eq!(default_socket_path(), "/tmp/from-env.sock");
         let cli = Cli::parse_from(["sandbox", "ps"]);
         assert_eq!(cli.socket, "/tmp/from-env.sock");
 

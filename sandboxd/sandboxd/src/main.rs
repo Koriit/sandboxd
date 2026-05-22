@@ -57,7 +57,7 @@ use tracing::{debug, error, info, warn};
 #[command(name = "sandboxd", about = "Sandbox daemon", version)]
 struct Args {
     /// Path to the Unix socket to listen on.
-    #[arg(long, default_value_t = default_socket_path())]
+    #[arg(long, env = "SANDBOX_SOCKET", default_value_t = default_socket_path())]
     socket: String,
 
     /// Base directory for daemon state (database, session data).
@@ -107,12 +107,10 @@ struct Args {
 }
 
 fn default_socket_path() -> String {
-    // Honor SANDBOX_SOCKET as an override (symmetric with the CLI). The
-    // `--socket` flag, when passed explicitly, still takes precedence
-    // because clap only computes this default when no value is given.
-    if let Ok(sock) = std::env::var("SANDBOX_SOCKET") {
-        return sock;
-    }
+    // Returns the XDG/HOME-derived fallback path. SANDBOX_SOCKET is handled
+    // by clap's `env = "SANDBOX_SOCKET"` on the `--socket` arg (which is
+    // evaluated per-parse and takes precedence over this default). An
+    // explicit `--socket` flag takes precedence over the env var.
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
         return format!("{runtime_dir}/sandboxd/sandboxd.sock");
     }
@@ -9065,23 +9063,14 @@ mod tests {
 
     #[test]
     fn default_socket_path_ends_with_sock() {
-        // Ensure the test is not perturbed by an inherited SANDBOX_SOCKET
-        // from the surrounding shell -- the default value should end with
-        // `sandboxd.sock` regardless of outside state.
-        let prior = std::env::var("SANDBOX_SOCKET").ok();
-        // SAFETY: Tests in this module that touch SANDBOX_SOCKET mutate and
-        // restore it in a single test body to avoid cross-test races under
-        // `cargo test` (nextest already provides per-test process isolation).
-        unsafe { std::env::remove_var("SANDBOX_SOCKET") };
+        // default_socket_path() returns the XDG/HOME fallback; it no longer
+        // reads SANDBOX_SOCKET (that is handled by clap's `env` attribute on
+        // the --socket arg). The path must end with `sandboxd.sock`.
         let path = default_socket_path();
         assert!(
             path.ends_with("sandboxd.sock"),
             "expected path to end with sandboxd.sock, got: {path}"
         );
-        // Restore prior state.
-        if let Some(v) = prior {
-            unsafe { std::env::set_var("SANDBOX_SOCKET", v) };
-        }
     }
 
     #[test]

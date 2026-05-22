@@ -15,7 +15,11 @@ path = "src/main.rs"
 
 [dependencies]
 chrono.workspace = true
-clap.workspace = true
+# `env = "…"` on #[arg] requires the clap `env` feature; without it the
+# `.env()` builder method is absent and the attr silently degrades under
+# workspace feature unification but fails when the crate is checked in
+# isolation.  Mirrors the explicit opt-in in sandboxd/Cargo.toml.
+clap = { workspace = true, features = ["env"] }
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
