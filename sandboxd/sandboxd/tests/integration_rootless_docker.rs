@@ -492,7 +492,7 @@ fn integration_rootless_docker_session_create_refused() {
     for token in &[
         "rootless docker",
         "--force-rootless-docker",
-        "§ Non-goals line 1195",
+        "outside the supported envelope",
     ] {
         assert!(
             combined.contains(token),
