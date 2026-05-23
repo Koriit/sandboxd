@@ -1,8 +1,8 @@
 //! Backend resolution, CLI config loader, and feature-mismatch error
 //! rendering for `sandbox create`.
 //!
-//! Defines a five-tier precedence chain
-//! the CLI must apply when picking a backend (`--lite` / `--backend`
+//! The CLI applies a five-tier precedence chain
+//! when picking a backend (`--lite` / `--backend`
 //! flags > `SANDBOX_DEFAULT_BACKEND` env > config file
 //! `default_backend` > hardcoded `BackendKind::Lima`). [`resolve_backend`]
 //! is the one place that chain is implemented; the same function is
@@ -81,7 +81,7 @@ pub enum RebuildImageBackend {
     /// Gateway image: refused. The gateway image is shipped pre-built
     /// per release and loaded by `sandbox update`; building it locally
     /// requires the full source tree, Docker, and network access to
-    /// upstream registries..1 keeps this variant in the
+    /// upstream registries. Keeping this variant in the
     /// enum so operators who try `sandbox rebuild-image --backend
     /// gateway` get a clear error message that points at `sandbox
     /// update` rather than a "no such variant" clap error.
@@ -95,7 +95,7 @@ impl RebuildImageBackend {
     /// The order is deterministic (Lima first, Container second) so the
     /// per-backend dispatch loop in [`crate`] can pin the request order
     /// in unit tests without juggling sets.
-    /// says "fan out to each backend in turn" and pins exit semantics
+    /// The design says "fan out to each backend in turn" and pins exit semantics
     /// rather than ordering, but a stable order is the only way to keep
     /// the operator-facing stderr lines reproducible and the dispatch
     /// test deterministic.
@@ -137,7 +137,7 @@ pub struct CliConfig {
     /// chain in [`resolve_backend`].
     #[serde(default)]
     pub default_backend: Option<BackendKind>,
-    /// Per-backend config knobs. the design keeps the map present so future
+    /// Per-backend config knobs. The map is kept present so future
     /// per-backend overrides (resource defaults, image tag pins) land
     /// without bumping the schema; the inner objects are intentionally
     /// empty for Phase 4A.
@@ -147,14 +147,13 @@ pub struct CliConfig {
 
 /// Per-backend configuration block.
 ///
-///  shows
-/// `{"backends": {"container": {}}}` as the canonical shape — empty
+/// The config file shape is `{"backends": {"container": {}}}` — empty
 /// objects are legal. The `lima` knob is intentionally absent at this
 /// phase to match the example; an `Option<...>` field can be
 /// added later without breaking forward-compat.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct BackendsConfig {
-    /// Container-backend knobs. the example shows `{}`; this struct
+    /// Container-backend knobs. The example shows `{}`; this struct
     /// holds no fields today and exists as an extensibility hook.
     #[serde(default)]
     pub container: Option<ContainerBackendConfig>,
@@ -353,10 +352,10 @@ pub fn resolve_backend(
 #[derive(Debug, Clone, Copy)]
 pub struct FeatureMismatchContext {
     /// True iff the operator passed `--lite` (vs. `--backend container`).
-    /// the example uses the `--lite` form; the wording adapts when the
+    /// The example uses the `--lite` form; the wording adapts when the
     /// flag was instead `--backend container`.
     pub lite_flag_used: bool,
-    /// True iff the operator passed `--no-hardening`. hardening
+    /// True iff the operator passed `--no-hardening`. The hardening
     /// example assumes the operator asked for hardening (no
     /// `--no-hardening`); when the operator passed `--no-hardening`
     /// the validation should not have fired in the first place, but
@@ -392,8 +391,7 @@ pub fn render_feature_mismatch(
     // conflict (drop the demanding flag, or switch backends).
     match feature {
         UnsupportedFeature::Hardening => {
-            // : exact
-            // wording for the `--hardened` ↔ `--lite` conflict. When
+            // The exact wording for the `--hardened` ↔ `--lite` conflict. When
             // `--backend container` was used instead of `--lite`, we
             // swap the flag name in both lines so the suggestion
             // matches the operator's invocation.
@@ -416,8 +414,7 @@ pub fn render_feature_mismatch(
             );
         }
         UnsupportedFeature::PerSessionNoCache(backend) => {
-            //
-            // forbidden on container" gives the exact three lines for
+            // The `--no-cache` is forbidden on container: this gives the exact three lines for
             // the container case. The `error:` line uses the backend
             // identifier the runtime advertised so a future backend
             // that also opts out of per-session no-cache surfaces
@@ -536,9 +533,8 @@ pub fn render_isolation_warning(backend: BackendKind) -> String {
 /// Render the `--no-cache` rejection error for the container
 /// backend.
 ///
-///
-/// container" gives the exact three-line shape this returns. Used by
-/// the up-front rejection layer before the daemon is ever contacted.
+/// The `--no-cache` forbidden-on-container shape gives the exact three lines this returns.
+/// Used by the up-front rejection layer before the daemon is ever contacted.
 pub fn render_no_cache_rejection_for_container(lite_flag_used: bool) -> String {
     // Same content as the [`UnsupportedFeature::PerSessionNoCache`]
     // arm of [`render_feature_mismatch`] — a single source of truth
@@ -763,7 +759,7 @@ mod tests {
 
     #[test]
     fn load_cli_config_parses_full_spec_example() {
-        //  canonical example.
+        // Parses the canonical config-file example.
         let tmp = tempfile::tempdir().expect("tempdir");
         write_config(
             tmp.path(),
@@ -817,8 +813,7 @@ mod tests {
     // Feature-mismatch error rendering — byte-equality contract
     // -----------------------------------------------------------------
 
-    ///  shows the
-    /// `--hardened` + `--lite` conflict verbatim. Pin every byte.
+    /// The feature-mismatch design shows the `--hardened` + `--lite` conflict verbatim. Pin every byte.
     #[test]
     fn render_hardening_with_lite_matches_spec_byte_for_byte() {
         let rendered = render_feature_mismatch(
@@ -856,8 +851,7 @@ error: `--hardened` requires a VM-backed session, but `--backend container` sele
         assert_eq!(rendered, expected);
     }
 
-    ///
-    /// container" gives the exact text. Pin every byte.
+    /// The `--no-cache` forbidden-on-container shape gives the exact text. Pin every byte.
     #[test]
     fn render_no_cache_rejection_for_container_with_lite_matches_spec() {
         let rendered = render_no_cache_rejection_for_container(true);
@@ -903,7 +897,7 @@ error: `--force-rootless-docker` is only meaningful for the container backend
     // Isolation warning — byte-equality contract
     // -----------------------------------------------------------------
 
-    ///  (lines 751-762) gives the exact two
+    /// The isolation-warning design gives the exact two
     /// lines that the CLI must emit before each `--lite` /
     /// `--backend container` create. Pin every byte — including the
     /// em dash (U+2014) and the six-space indent on line 2.

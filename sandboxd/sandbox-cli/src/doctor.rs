@@ -806,7 +806,7 @@ fn check_socket_perms(socket_path: &str, socket_reachable: bool) -> CheckRow {
 ///
 /// The CLI runs as the operator; the operative question is whether
 /// the *daemon* can read+write `/dev/kvm`. The answer comes from
-/// `GET /diagnostics`, evaluated daemon-side per.2.
+/// `GET /diagnostics`, evaluated daemon-side.
 fn check_kvm_accessible(
     diagnostics: Option<&DiagnosticsPayload>,
     socket_reachable: bool,

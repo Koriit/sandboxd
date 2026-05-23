@@ -363,7 +363,7 @@ impl<'de> Deserialize<'de> for Cidr4 {
 
 /// Top-level shape of `users.conf`.
 ///
-/// Example file (per the design
+/// Example file:
 ///
 /// ```json
 /// {

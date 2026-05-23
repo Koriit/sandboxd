@@ -345,7 +345,7 @@ pub struct PruneOutcome {
     /// successful sets).
     pub kept: Vec<String>,
     /// Set directory names skipped because their `completed_ok` flag is
-    /// not `true` (in-progress or failed)..2: never auto-prune.
+    /// not `true` (in-progress or failed). Never auto-pruned.
     pub preserved_forensic: Vec<String>,
 }
 
@@ -490,8 +490,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 /// `sudo` invocation prefix every backup helper runs through. The
 /// `-k` flag forces a fresh credential prompt by discarding any
-/// cached operator credentials before the call;.3 names
-/// this the "no-cached-sudo" invariant — every privileged step in
+/// cached operator credentials before the call; this enforces the "no-cached-sudo" invariant — every privileged step in
 /// the update flow must re-authenticate so an unattended terminal
 /// session cannot inadvertently authorize a stateful mutation.
 ///

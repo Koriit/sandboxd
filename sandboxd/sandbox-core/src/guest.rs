@@ -330,7 +330,7 @@ impl GuestConnector {
     ) -> Result<GuestResponse, SandboxError> {
         // Daemon-internal subsystem: the handler boundary already
         // performed the per-caller ownership check before reaching
-        // `GuestConnector`, so the bypass is safe (api-session-isolation).
+        // `GuestConnector`, so the bypass is safe (ownership already verified at the handler boundary).
         let session = self
             .store
             .get_session_unfiltered(session_id)?
@@ -1123,7 +1123,7 @@ mod tests {
         );
     }
 
-    // -- Compatibility-predicate tests (the documented contract) -----------------------
+    // -- Compatibility-predicate tests -------------------------------------------
 
     #[test]
     fn is_compatible_matches_current_version() {

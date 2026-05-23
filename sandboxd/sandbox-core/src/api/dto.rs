@@ -158,8 +158,7 @@ pub struct SessionDto {
 /// Wire representation of the rootless-Docker probe outcome stamped
 /// onto a container session at create time.
 ///
-///
-/// for the lite container backend; the daemon enforces this at
+/// This is only relevant for the lite container backend; the daemon enforces this at
 /// session-create time and records the probe outcome here so
 /// `sandbox inspect` and `sandbox describe` can render the operator-
 /// relevant pair without re-probing. Mirrors

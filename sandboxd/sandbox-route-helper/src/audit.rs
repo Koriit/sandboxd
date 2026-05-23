@@ -10,7 +10,7 @@
 //!
 //! ## Write-failure asymmetry
 //!
-//!
+//! The allow path and deny path differ in how they tolerate an audit-log write failure.
 //!
 //! - **Allow path** — log a structured stderr line and continue. The
 //!   privilege has already been granted; an audit-log infrastructure
@@ -33,9 +33,6 @@ use std::path::PathBuf;
 use serde_json::json;
 
 /// Production audit-log path (today; daemon runs as operator).
-///
-/// .log`
-/// when the daemon moves to a dedicated `sandbox` user.
 const DEFAULT_AUDIT_LOG_RELATIVE: &str = "sandboxd/route-helper-audit.log";
 
 /// Env-var override for the audit-log path, honored **only** in

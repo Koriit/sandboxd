@@ -212,7 +212,7 @@ pub fn dump_migration_set() -> Vec<MigrationEntry> {
 // Atomic write
 // ---------------------------------------------------------------------------
 
-/// Write `bytes` atomically over `path`..4: use
+/// Write `bytes` atomically over `path`. Use
 /// `NamedTempFile::new_in(parent)` + `persist(path)`. Same-FS rename
 /// guarantees no half-written state — `rename(2)` is atomic when src
 /// and dst are on the same filesystem.
@@ -867,7 +867,7 @@ mod tests {
         }
     }
 
-    /// Pin the binding selection rule from.2: every entry
+    /// Pin the binding selection rule: every entry
     /// in the **production** registry has `to_version() ==
     /// from_version() + 1`. A future contributor adding a
     /// multi-version-skip migration trips this test.

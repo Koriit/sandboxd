@@ -833,7 +833,7 @@ pub struct SessionConfig {
     /// runtime and the HTTP DTO render); `cpus` then carries the
     /// floored representation as a fallback for older readers.
     /// `None` on records written by daemons predating fractional cpus
-    /// (and on every Lima session, where integer cpus is the design).
+    /// (and on every Lima session, where only integer CPUs are supported).
     /// Forward-compatible via `#[serde(default)]` per CLAUDE.md
     /// "On-disk compatibility".
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1879,7 +1879,6 @@ mod tests {
 
     #[test]
     fn parse_flag_local_host_only_defaults_guest_to_host() {
-        //
         // `host=/srv/repo, guest=/srv/repo`. `/tmp` is guaranteed to
         // exist and be a directory on every host the test runs on.
         let mode = WorkspaceMode::parse_flag("local:/tmp").unwrap();
@@ -1888,7 +1887,6 @@ mod tests {
 
     #[test]
     fn parse_flag_local_with_explicit_guest_path() {
-        //
         // `local:/srv/repo:/srv/dest` → `host=/srv/repo, guest=/srv/dest`.
         let mode = WorkspaceMode::parse_flag("local:/tmp:/srv/work").unwrap();
         assert_eq!(mode, local("/tmp", "/srv/work"));
@@ -1924,7 +1922,6 @@ mod tests {
 
     #[test]
     fn parse_flag_local_security_model_suffix_is_folded_into_host() {
-        //
         // `local:/srv/repo:none` → no `:none` security-model strip
         // (mode is `local`, not `shared`); step C folds the trailing
         // `:none` into `host_path=/srv/repo:none`; host-path-exists
@@ -1935,7 +1932,6 @@ mod tests {
 
     #[test]
     fn parse_flag_local_unclassified_trailing_token_folds_into_host() {
-        //
         // `local:/srv/repo:bogus` → tokens [/srv/repo, bogus]; step B
         // skips (no `/` or `~` prefix); step C folds into
         // `host_path=/srv/repo:bogus`; host-path-exists rejects.

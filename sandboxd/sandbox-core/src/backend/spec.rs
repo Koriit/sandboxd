@@ -148,10 +148,10 @@ impl SessionSpec {
         self.backend_specific.kind()
     }
 
-    /// Validate the design against a backend's [`Capabilities`].
+    /// Validate the session spec against a backend's [`Capabilities`].
     ///
     /// Returns the first [`UnsupportedFeature`] mismatch found, or
-    /// `Ok(())` if the design is satisfiable. The body matches
+    /// `Ok(())` if the spec is satisfiable. The body matches
     /// exhaustively on `BackendSpecific` so adding a new variant
     /// produces a compile-time signal here. Capability flags
     /// (workspace modes, per-session-no-cache, etc.) are checked in
@@ -269,7 +269,7 @@ mod tests {
         }
     }
 
-    /// Serde shape for `BackendSpecific::Lima` matches the design
+    /// Serde shape for `BackendSpecific::Lima` matches the wire-format spec
     /// (`{ "backend": "lima", ... }`).
     #[test]
     fn backend_specific_lima_serde_shape() {
@@ -288,7 +288,7 @@ mod tests {
         assert_eq!(parsed, value);
     }
 
-    /// Serde shape for `BackendSpecific::Container` matches the design
+    /// Serde shape for `BackendSpecific::Container` matches the wire-format spec
     /// (`{ "backend": "container", ... }`, no `hardened` field).
     ///
     /// `cpus` is `f32` so the serde-rendered value is a JSON number

@@ -91,9 +91,9 @@ struct Args {
     /// filename-embedded `YYYY-MM-DD` is strictly older than
     /// `today - retention_days` are removed by an hourly pruner.
     ///
-    /// Default of 14 days matches the 2026-04-21 the event wire format /
-    /// "Retention" suggested value and covers roughly two sprint
-    /// cycles of traffic for post-incident review. Overridable via
+    /// Default of 14 days matches the event wire format / "Retention"
+    /// suggested value and covers roughly two sprint cycles of traffic
+    /// for post-incident review. Overridable via
     /// `SANDBOX_EVENTS_PERSIST_RETENTION_DAYS` (clap env-var fallback).
     /// Final defaults are measurement-driven — see
     /// `docs/internal/measurement-defaults-m10-s6.md` for the

@@ -158,7 +158,7 @@ pub fn lite_image_tag_for_daemon_probe(daemon_version: &str) -> String {
 
 /// Verbatim warning emitted on first-use rebuild of the lite image.
 ///
-///  pins this exact byte
+/// An integration test pins this exact byte
 /// sequence (note the en-dash `—` between "version" and "building"); the
 /// CLI surface and integration tests both rely on string equality.
 pub const LITE_FIRST_USE_WARNING: &str =
@@ -284,14 +284,13 @@ pub struct ContainerNetwork {
 pub struct ContainerRuntime {
     capabilities: Capabilities,
     image_tag: String,
-    /// Default memory ceiling in megabytes.
-    /// — `host_ram × 0.8` rounded down — is computed once at daemon
-    /// startup (Phase 3D) and threaded in here.
+    /// Default memory ceiling in megabytes — `host_ram × 0.8` rounded
+    /// down — computed once at daemon startup (Phase 3D) and threaded in here.
     default_memory_mb: u32,
-    /// Default CPU ceiling.  — `host_cpus × 0.8`
+    /// Default CPU ceiling — `host_cpus × 0.8`
     /// rounded to one decimal place.
     default_cpus: f64,
-    /// Linux uid the container runs as.  specifies
+    /// Linux uid the container runs as. The hardening contract specifies
     /// `1000:1000` unless the host uid differs from 1000 (for workspace
     /// bind-mount uid alignment), in which case the calling uid/gid are
     /// used.
@@ -331,9 +330,7 @@ impl ContainerRuntime {
     /// 80%-of-host defaults; tests pass arbitrary values.
     ///
     /// `user_uid` / `user_gid` are the in-container runtime identity.
-    ///  mandates non-root; the documented contract mandates
-    /// alignment with the host operator's uid when the host uid is not
-    /// 1000.
+    /// Hardening mandates non-root; alignment with the host operator's uid is required when the host uid is not 1000.
     ///
     /// `guest_bind_source` is the host path bound read-only into every
     /// container at `/usr/local/bin/sandbox-guest`. The daemon resolves
@@ -422,8 +419,8 @@ impl ContainerRuntime {
         })
     }
 
-    /// Resolve container memory/cpus from the design, falling back to
-    /// the runtime's defaults when the design carries `0` (treated as
+    /// Resolve container memory/cpus, falling back to the runtime's
+    /// defaults when the spec carries `0` (treated as
     /// "unset" — the request-boundary handler in `sandboxd` stamps
     /// `0`/`0.0` whenever the operator omitted `--cpus`/`--memory`,
     /// and this is where we substitute the daemon's host-80% defaults).
@@ -540,8 +537,7 @@ fn build_create_argv(
     let label_arg = format!("sandbox.session_id={session_id}");
     let home_mount = format!("type=volume,src={home_volume},dst=/home/agent");
     let workspace_mount = network.workspace_bind.as_ref().map(|bind| {
-        //  — the
-        // bind target is the operator-resolved `guest_path`,
+        // The bind target is the operator-resolved `guest_path`,
         // unified with Lima's workspace mount. The home volume
         // mounts at `/home/agent`; a bind whose `guest_path` lands
         // anywhere under `/home/agent` shadows the volume's

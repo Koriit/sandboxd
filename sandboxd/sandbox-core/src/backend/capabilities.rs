@@ -144,32 +144,21 @@ impl Capabilities {
     /// each field so a silent drift fails CI.
     pub fn for_lima() -> Self {
         Self {
-            //  — `kind` discriminates the
-            // backend so `UnsupportedFeature` carries it onward.
+            // `kind` discriminates the backend so `UnsupportedFeature` carries it onward.
             kind: BackendKind::Lima,
-            //  — Lima is
-            // the VM-isolation backend (QEMU + KVM).
+            // Lima is the VM-isolation backend (QEMU + KVM).
             isolation: IsolationLevel::Vm,
-            //  — Lima exposes KVM, so
-            // nested-virt workloads (e.g. inner containers using KVM)
-            // are honourable.
+            // Lima exposes KVM, so nested-virt workloads work.
             nested_virt: true,
-            //  — VMs have full kernel
-            // surface, so `mount`, raw `iptables`, etc. work.
+            // VMs have full kernel surface, so `mount`, raw `iptables`, etc. work.
             privileged_ops: true,
-            //  — Lima sessions get a real
-            // QEMU NIC, no `cap-drop` envelope around the guest.
+            // Lima sessions get a real QEMU NIC, no `cap-drop` envelope around the guest.
             raw_network: true,
-            //  / "Hardening" — Lima's QEMU
-            // wrapper honours the `--hardened` flag (device lockdown,
-            // `systemd-run` cgroup limits).
+            // Lima's QEMU wrapper honours the `--hardened` flag (device lockdown).
             hardening_flag: true,
-            //  — the
-            // `--no-cache` flag triggers a per-session full VM build
-            // instead of golden-image clone; only meaningful on Lima.
+            // The `--no-cache` flag triggers a per-session full VM build.
             per_session_no_cache: true,
-            //  — Lima supports both 9p
-            // shared-mount and clone-into-VM modes.
+            // Lima supports both 9p shared-mount and clone-into-VM modes.
             workspace_modes: EnumSet::all(),
         }
     }

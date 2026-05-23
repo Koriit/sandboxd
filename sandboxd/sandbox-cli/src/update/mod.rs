@@ -94,7 +94,7 @@ impl UpdateArgs {
 // ---------------------------------------------------------------------------
 
 /// Subset of `/var/lib/sandbox/.install-state.json` the pre-flight
-/// needs. the documented contract defines the full shape; we deserialize only the
+/// needs. The documented contract defines the full shape; we deserialize only the
 /// fields used here so older or newer state files still parse (any
 /// extra fields are ignored).
 #[derive(Debug, Clone, serde::Deserialize)]

@@ -38,8 +38,7 @@ pub use capabilities::{BackendKind, Capabilities, IsolationLevel, UnsupportedFea
 /// capability matrix to drive client-side validation and the
 /// `sandbox inspect -v` capability table.
 ///
-///  — the wire
-/// format is fixed at `[{"kind": "...", "capabilities": {...}}]`.
+/// The wire format is fixed at `[{"kind": "...", "capabilities": {...}}]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendInfo {
     pub kind: BackendKind,
@@ -231,9 +230,6 @@ impl<T: AsyncRead + AsyncWrite + ?Sized> AsyncReadWrite for T {}
 /// `docker exec <ctr> socat - TCP:127.0.0.1:5123`. The payload is
 /// sandboxd's structured JSON guest protocol (`ping`, `exec`,
 /// `file upload`, `status`).
-///
-///  for why this is split from
-/// [`SessionRuntime::exec_interactive`].
 #[async_trait]
 pub trait GuestTransport: Send + Sync {
     /// Open a fresh connection to the in-session agent. Each call

@@ -741,8 +741,7 @@ fn default_socket_path() -> String {
 ///
 /// Any [`presets::PresetError`] along the way prints its `Display` impl to
 /// stderr and calls `process::exit(1)` **before** returning. The
-/// error wording is required (Part 1 lines 140-150, Part 2
-/// "Error shapes"), so we defer to `PresetError`'s `Display` impl
+/// error wording is required, so we defer to `PresetError`'s `Display` impl
 /// verbatim — callers must not reformat or add a prefix.
 ///
 /// Returning `(Policy, Vec<String>)` keeps the call sites simple:
@@ -886,8 +885,7 @@ fn expand_host_tilde_in_workspace_flag(value: &str) -> Result<String, String> {
 /// the `--workspace` value with [`sandbox_core::WorkspaceMode::parse_flag`]
 /// — the single pure parser shared with the daemon.
 ///
-///
-/// wording; the literal string lives at the call sites (CLI + daemon)
+/// The rejection wording lives at the call sites (CLI + daemon)
 /// rather than as a shared constant because:
 /// - The daemon-side check is independent (a misbehaving CLI cannot
 ///   bypass the gate by skipping this client-side validation).
@@ -2037,7 +2035,7 @@ fn render_describe_one(
         "State:        {}",
         session.state.to_string().to_lowercase()
     );
-    //  — backend prominently alongside session
+    // Show backend prominently alongside session
     // id, state, and IP. `as_str()` matches the wire/persisted spelling
     // (`lima` / `container`).
     let _ = writeln!(out, "Backend:      {}", session.backend.as_str());
@@ -2120,8 +2118,7 @@ fn render_describe_one(
 
 /// Render the daemon-advertised capability matrix as a key/value block.
 ///
-///  — capability matrix is the
-/// `Capabilities` struct rendered as a key/value table. The keys are
+/// The `-v` view capability matrix is the `Capabilities` struct rendered as a key/value table. The keys are
 /// the struct field identifiers (so they match `serde_json` keys an
 /// operator may have already seen via `inspect`); values use each
 /// nested type's serialize form for stability.
@@ -5873,9 +5870,8 @@ fn handle_dump_proto_version() -> i32 {
 
 /// Per-backend dispatcher for `sandbox rebuild-image`.
 ///
-///  requires
-/// fanning out one HTTP call per selected backend, prefixing per-
-/// backend errors with `rebuild-image[<kind>]:`, and exiting non-zero
+/// Fans out one HTTP call per selected backend, prefixes per-backend
+/// errors with `rebuild-image[<kind>]:`, and exits non-zero
 /// if any selected backend fails. The fan-out is best-effort —
 /// remaining backends still run after one fails, so the operator sees
 /// every error in a single invocation rather than chasing them one
@@ -6052,8 +6048,8 @@ async fn dispatch_create_preflight(
     cli_config_xdg_override: Option<&Path>,
 ) -> sandbox_core::BackendKind {
     // Tier 4 of the precedence chain — load the per-user CLI config.
-    //  treats a missing file as not-an-
-    // error and a malformed file as a hard error with a path pointer.
+    // `load_cli_config` treats a missing file as not-an-error
+    // and a malformed file as a hard error with a path pointer.
     let cli_config = match load_cli_config(cli_config_xdg_override) {
         Ok(c) => c,
         Err(e) => {
@@ -7798,7 +7794,7 @@ mod tests {
         }
     }
 
-    /// : `--backend all` issues two HTTP
+    /// `--backend all` issues two HTTP
     /// requests in Lima-then-Container order, each with the per-
     /// backend JSON body.
     #[tokio::test]

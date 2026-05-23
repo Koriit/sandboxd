@@ -34,7 +34,7 @@
 //!   `Z` suffix (`YYYY-MM-DDTHH:MM:SS.mmmZ`). The mapper rounds (truncates)
 //!   sub-millisecond precision from the [`chrono::DateTime<Utc>`] source.
 //! - `session` is always present as a string; pre-session lifecycle events
-//!   serialize it as `""` as designed (Part 3, "Event shape").
+//!   serialize it as `""`.
 //! - IP addresses are strings on the wire (e.g., `"10.0.0.42"`); domain
 //!   carries [`std::net::Ipv4Addr`].
 

@@ -118,8 +118,7 @@ pub enum DecisionKind {
 impl DecisionKind {
     /// Parse a caller-provided decision string into a [`DecisionKind`].
     ///
-    /// Accepts `"allow"` and `"deny"` (case-sensitive — the design
-    /// prescribes lowercase). Any other value returns
+    /// Accepts `"allow"` and `"deny"` (case-sensitive — lowercase only). Any other value returns
     /// [`SandboxError::InvalidArgument`] with the offending text in
     /// the message.
     pub fn parse(s: &str) -> Result<Self, SandboxError> {
@@ -170,7 +169,7 @@ mod tests {
     #[test]
     fn parse_since_accepts_rfc3339_with_fractional_seconds() {
         // Both a plain second-precision timestamp and a fractional form
-        // must parse successfully. The design says "RFC 3339"; chrono's
+        // must parse successfully. The format is RFC 3339; chrono's
         // `parse_from_rfc3339` handles both shapes.
         for raw in [
             "2026-04-22T12:00:00Z",

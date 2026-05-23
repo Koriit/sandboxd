@@ -104,7 +104,7 @@ impl LimaRuntime {
     /// Convert a [`SessionSpec`] into the resource-shaped
     /// [`SessionConfig`] that `LimaManager` consumes.
     ///
-    /// Returns an error if the design targets a non-Lima backend. The
+    /// Returns an error if the spec targets a non-Lima backend. The
     /// daemon is expected to have already validated `spec.backend() ==
     /// BackendKind::Lima` before dispatching to this runtime; this
     /// guard is defense in depth.
@@ -134,7 +134,7 @@ impl LimaRuntime {
                 // consistent with the historical Lima record.
                 cpus_decimal: None,
                 // Rootless-Docker probe is gated to the container
-                // backend per. Lima sessions
+                // backend. Lima sessions
                 // never construct this state — the `None` keeps the
                 // persisted shape consistent with Lima records that
                 // predate the probe.

@@ -38,7 +38,7 @@ impl ConfigMigration for Migration {
         let transformed = sandbox_core::users_conf::migrate_v001(value);
         // Pretty-print so operator diffs against `git`-style backups
         // stay readable. The two-space indent matches the shape
-        // `install.sh` writes at first install (the documented contract.19).
+        // `install.sh` writes at first install (the documented shape).
         serde_json::to_vec_pretty(&transformed)
             .map(|mut v| {
                 // serde_json::to_vec_pretty does not emit a trailing
@@ -64,7 +64,7 @@ mod tests {
 
     /// Table-driven coverage for the documented contract inputs A/B/C plus an
     /// operator-customized row that exercises the "preserves unknown
-    /// keys" contract from.6. Bytes-in / bytes-out path,
+    /// keys" contract. Bytes-in / bytes-out path,
     /// because the framework calls `apply(&[u8]) -> Vec<u8>`.
     #[test]
     fn migration_v001_round_trip() {

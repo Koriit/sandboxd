@@ -1122,7 +1122,7 @@ mod tests {
 
     #[test]
     fn expand_github_interactive_hosts_use_any_asset_cdn_uses_get_head() {
-        //  two rows under `github:`.
+        // Expects two rows under `github:`:
         //   interactive → ANY /**
         //   asset CDN   → GET /**, HEAD /**
         let rules = expand_builtin("github", "github:");
