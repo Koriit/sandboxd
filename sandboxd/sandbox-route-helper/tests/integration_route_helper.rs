@@ -384,7 +384,7 @@ fn integration_route_helper_denies_when_gateway_ip_outside_all_subnets() {
 /// configured subnet, but that subnet's `allow_users` does not contain
 /// any name that resolves to the caller's uid (nor the implicit
 /// `--for-user=<caller>`). Helper denies before any netns operation
-/// with the spec § 3.3 stderr substring `pair-check failed` naming both
+/// with the stderr substring `pair-check failed` naming both
 /// identities.
 #[test]
 fn integration_route_helper_denies_when_caller_not_in_allow_users() {
@@ -423,7 +423,7 @@ fn integration_route_helper_denies_when_caller_not_in_allow_users() {
         stderr.contains("pair-check failed"),
         "stderr must contain 'pair-check failed'; got: {stderr}"
     );
-    // Spec § 3.3: stderr must name BOTH identities (caller and for-user)
+    //
     // for forensic clarity.
     assert!(
         stderr.contains(&format!("caller={runner}")),
@@ -691,7 +691,7 @@ fn integration_route_helper_denies_when_netns_ip_outside_caller_subnet() {
 }
 
 // ---------------------------------------------------------------------------
-// Pair-check + audit log tests — spec § 8.4
+// Pair-check + audit log tests —.4
 // ---------------------------------------------------------------------------
 
 /// Spin up a Docker container on a bridge whose subnet matches the
@@ -728,7 +728,7 @@ fn users_conf_for_pool(cidr: &str, allow_users: &[&str]) -> NamedTempFile {
 }
 
 /// Find the (expected single) audit-log record in `lines` and assert
-/// the spec § 3.5 field schema: `decision`, `caller`, `for_user`,
+/// the audit-record field schema: `decision`, `caller`, `for_user`,
 /// `gateway_ip`, `pid` always present; `pool` present iff
 /// gateway-ip-in-subnet (left to the caller to assert); `reason`
 /// present iff `decision == "denied"`; `ts` parseable as RFC 3339 UTC.
@@ -773,7 +773,7 @@ fn assert_audit_record_shape(
         Some(expected_pid as i64),
         "audit record pid mismatch: {r}"
     );
-    // `reason` field presence is decision-conditional per spec § 3.5.
+    // `reason` field presence is decision-conditional per.5.
     match expected_decision {
         "allowed" => assert!(
             r.get("reason").is_none(),
@@ -789,7 +789,7 @@ fn assert_audit_record_shape(
 }
 
 // ---------------------------------------------------------------------------
-// Allow path — `--for-user=<runner>`, matching caller (spec § 8.4)
+// Allow path — `--for-user=<runner>`, matching caller
 // ---------------------------------------------------------------------------
 
 /// Helper runs end-to-end with an explicit `--for-user=<runner>` that
@@ -874,13 +874,13 @@ fn integration_route_helper_accepts_for_user_matching_caller() {
 }
 
 // ---------------------------------------------------------------------------
-// Deny path — `--for-user=<other>` mismatches the runner (spec § 8.4)
+// Deny path — `--for-user=<other>` mismatches the runner
 // ---------------------------------------------------------------------------
 
 /// Helper runs with `--for-user` set to a name OTHER than the runner;
 /// pool contains ONLY the runner. Pair-check denies because for-user
-/// is not in `allow_users`. The deny path also exercises the spec
-/// § 3.3 stderr substring (`pair-check failed`) and the audit-record
+/// is not in `allow_users`. The deny path also exercises the
+/// stderr substring (`pair-check failed`) and the audit-record
 /// `decision="denied"` + `reason` field.
 #[test]
 fn integration_route_helper_denies_for_user_mismatch() {
@@ -948,11 +948,11 @@ fn integration_route_helper_denies_for_user_mismatch() {
 }
 
 // ---------------------------------------------------------------------------
-// Default `--for-user` path — omitting the flag (spec § 8.4)
+// Default `--for-user` path — omitting the flag
 // ---------------------------------------------------------------------------
 
 /// Helper runs WITHOUT `--for-user`; the flag defaults to the caller's
-/// name per spec § 3.1, so pair-check is `(runner, runner)` against
+/// name per.1, so pair-check is `(runner, runner)` against
 /// `[runner]` and succeeds. Otherwise identical to the explicit-flag
 /// allow-path test.
 #[test]
@@ -995,13 +995,13 @@ fn integration_route_helper_defaults_for_user_to_caller_when_omitted() {
 }
 
 // ---------------------------------------------------------------------------
-// Caller not in pool — even with a valid `--for-user` (spec § 8.4)
+// Caller not in pool — even with a valid `--for-user`
 // ---------------------------------------------------------------------------
 
 /// Pool contains a name OTHER than the runner; `--for-user` matches
 /// that other name. Pair-check still denies because the caller is not
 /// in the pool. Demonstrates that an attacker who controls argv (e.g.
-/// a compromised daemon, post-Spec-3) cannot bypass isolation by
+/// a compromised daemon) cannot bypass isolation by
 /// asserting a victim's identity — the caller's own identity must
 /// also be in the pool.
 #[test]
@@ -1046,11 +1046,11 @@ fn integration_route_helper_denies_when_caller_not_in_pool_even_with_valid_for_u
 }
 
 // ---------------------------------------------------------------------------
-// Unresolvable `--for-user` (spec § 8.4)
+// Unresolvable `--for-user`
 // ---------------------------------------------------------------------------
 
 /// `--for-user` is a sentinel name that does not exist on the host.
-/// Per spec § 3.4 this is a strict deny path — the helper denies
+/// Per.4 this is a strict deny path — the helper denies
 /// before reaching pair-check (it cannot even establish the
 /// for-user's numeric uid).
 #[test]
@@ -1098,7 +1098,7 @@ fn integration_route_helper_denies_when_username_unresolvable() {
 }
 
 // ---------------------------------------------------------------------------
-// Non-ENOENT errno on user resolution (spec § 3.4 / 8.4)
+// Non-ENOENT errno on user resolution
 // ---------------------------------------------------------------------------
 //
 // `getpwuid_r` / `getpwnam_r` can return errnos other than `ENOENT` (the
@@ -1216,7 +1216,7 @@ fn integration_route_helper_denies_when_for_user_resolution_errors() {
 }
 
 // ---------------------------------------------------------------------------
-// Audit-log on allowed decision (spec § 8.4)
+// Audit-log on allowed decision
 // ---------------------------------------------------------------------------
 
 /// Independent of any specific decision branch: assert the precise
@@ -1258,14 +1258,14 @@ fn integration_route_helper_writes_audit_log_on_allowed() {
         &runner,
         fixture.container_pid,
     );
-    // All spec § 3.5 fields present on the allowed record (sans
+    // All.5 fields present on the allowed record (sans
     // `reason`, asserted absent inside assert_audit_record_shape).
     assert_eq!(record["pool"].as_str(), Some(subnet));
     assert_eq!(record["gateway_ip"].as_str(), Some(gateway_ip));
 }
 
 // ---------------------------------------------------------------------------
-// Audit-log on denied decision (spec § 8.4)
+// Audit-log on denied decision
 // ---------------------------------------------------------------------------
 
 /// Independent of stderr substring: assert the precise JSON-Lines
@@ -1314,10 +1314,10 @@ fn integration_route_helper_writes_audit_log_on_denied() {
 }
 
 // ---------------------------------------------------------------------------
-// Audit-log write failure on deny still denies (spec § 8.4)
+// Audit-log write failure on deny still denies
 // ---------------------------------------------------------------------------
 
-/// Spec § 3.5: when the audit-log write fails on a deny path, the
+/// , the
 /// helper still exits `DENY_EXIT` AND escalates to stderr — the deny
 /// itself is unconditional and the forensic-record-availability
 /// invariant gains explicit escalation.
@@ -1382,10 +1382,10 @@ fn integration_route_helper_audit_log_write_failure_on_deny_still_denies() {
 }
 
 // ---------------------------------------------------------------------------
-// Audit-log write failure on allow still allows (spec § 3.5, § 8.4)
+// Audit-log write failure on allow still allows
 // ---------------------------------------------------------------------------
 
-/// Spec § 3.5 prescribes asymmetric handling of an audit-log write
+///
 /// failure across the two decision paths:
 ///
 /// - **Allow path** — log to stderr, return — the privilege has
@@ -1440,8 +1440,8 @@ fn integration_route_helper_audit_log_write_failure_on_allow_still_allows() {
         .output()
         .expect("invoking helper should succeed");
 
-    // Allow honored: exit 0 despite the audit-log failure (spec § 3.5
-    // — routing-path-availability wins on the allow side).
+    // Allow honored: exit 0 despite the audit-log failure — routing
+    // availability wins on the allow side.
     assert!(
         output.status.success(),
         "helper must still allow when audit-log write fails on the allow path; \
@@ -1476,10 +1476,9 @@ fn integration_route_helper_audit_log_write_failure_on_allow_still_allows() {
 
     // Sanity: the route actually landed inside the container despite
     // the audit-log failure. The route helper must never short-circuit
-    // an allow on an audit-write failure (spec § 3.5: routing-path-
-    // availability wins on the allow side); assert the post-install
-    // state directly to catch any future regression that conflates the
-    // two paths' fault handling.
+    // an allow on an audit-write failure; routing availability wins on
+    // the allow side. Assert the post-install state directly to catch
+    // any future regression that conflates the two paths' fault handling.
     let route = Command::new("docker")
         .args([
             "exec",

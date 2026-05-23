@@ -98,9 +98,8 @@ pub struct CreateSessionRequest {
     /// Number of CPU cores (default: 2 for Lima, daemon host-80% for
     /// Container).
     ///
-    /// `f32` so the spec § "Resource defaults — container only"
-    /// 1-decimal grammar (`0.8`, `1.5`, `2.0`, …) reaches the runtime
-    /// without truncation. Older CLIs that send
+    /// `f32` so the container backend's 1-decimal CPU grammar
+    /// (`0.8`, `1.5`, `2.0`, …) reaches the runtime without truncation. Older CLIs that send
     /// integers (`"cpus": 2`) round-trip cleanly through serde — JSON
     /// integers parse as `2.0_f32`. The daemon rounds to one decimal
     /// at request-parse time so `0.81` lands on the grid as `0.8`.
@@ -165,8 +164,8 @@ pub struct CreateSessionRequest {
     /// same.
     ///
     /// The daemon never expands presets itself — preset expansion is
-    /// strictly a CLI-local feature (spec Part 2 "Presets are CLI-
-    /// local"). This field is a pure passthrough for attribution.
+    /// strictly a CLI-local feature. This field is a pure passthrough
+    /// for attribution.
     #[serde(default)]
     pub source_presets: Vec<String>,
     /// Which backend should host the session.
@@ -182,11 +181,10 @@ pub struct CreateSessionRequest {
     #[serde(default)]
     pub backend: Option<crate::backend::BackendKind>,
     /// Operator opt-in to allow session-create on a rootless-Docker
-    /// host. Spec § Non-goals line 1195 declares rootless Docker out
-    /// of scope for the lite container backend; the daemon's
-    /// create handler probes the host with `docker info` and refuses
-    /// the request when the probe reports rootless mode unless this
-    /// field is `true`.
+    /// host. Rootless Docker is out of scope for the lite container
+    /// backend; the daemon's create handler probes the host with
+    /// `docker info` and refuses the request when the probe reports
+    /// rootless mode unless this field is `true`.
     ///
     /// Container-backend only — combining this flag with
     /// `--backend lima` is a CLI-level misuse error (clap rejects the
@@ -221,8 +219,7 @@ pub struct CreateSessionRequest {
 /// `policy_updated` lifecycle event. The field is additive and
 /// optional on the wire (`#[serde(default)]`): records from older
 /// CLIs decode cleanly, and the daemon never inspects the field for
-/// policy semantics — preset expansion stays CLI-local per spec
-/// Part 2.
+/// policy semantics — preset expansion stays CLI-local.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct UpdatePolicyRequest {
     /// The policy document to apply.
@@ -331,7 +328,7 @@ mod tests {
     }
 
     /// Older CLIs that never send `force_rootless_docker` decode to
-    /// `false`, matching the spec § Non-goals 1195 default-deny shape.
+    /// `false` (default-deny: rootless Docker is rejected unless opted in).
     #[test]
     fn deserialize_force_rootless_docker_absent_defaults_false() {
         let req: CreateSessionRequest =

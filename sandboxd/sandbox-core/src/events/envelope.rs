@@ -5,10 +5,8 @@
 //! policy state changes. The wire surface is in [`crate::api::event_dto`];
 //! these domain types never serialize directly.
 //!
-//! Spec reference: `.tasks/specs/2026-04-21-port-explicit-policies-presets-
-//! observability-design.md`, Part 3 ("Event surface", "Event shape",
-//! "Event categories"). Every event name and every layer-specific field
-//! name below is traceable to the spec's Event-categories tables.
+//! Every event name and every layer-specific field name below is part of
+//! the event wire surface defined by this codebase.
 //!
 //! Design notes:
 //!
@@ -22,11 +20,10 @@
 //!   publishing so downstream code cannot see malformed IPs.
 //! - `session: Option<SessionId>` is [`None`] for lifecycle events that
 //!   precede session creation (daemon boot, gateway boot before session
-//!   attachment). The DTO renders [`None`] as `""`, per spec.
+//!   attachment). The DTO renders [`None`] as `""`.
 //! - Traffic events carry no session on this struct; sandboxd's ingestion
 //!   layer stamps the envelope `session` from the `vm_ip → session_id` map
-//!   before publishing to the bus (spec Part 3, "Session-ID attribution
-//!   is sandboxd's job, not each component's").
+//!   before publishing to the bus.
 
 use std::net::Ipv4Addr;
 
@@ -108,7 +105,7 @@ impl Event {
 
 /// Per-layer traffic event.
 ///
-/// Variants correspond 1:1 to the `Layer` column of spec Part 3
+/// Variants correspond 1:1 to the `Layer` column of the event wire format
 /// / "Traffic events".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrafficEvent {
@@ -126,8 +123,7 @@ pub enum TrafficEvent {
 
 /// CoreDNS `query_allowed` / `query_denied`.
 ///
-/// Fields match the spec Part 3 "Traffic events" table for layer `dns`:
-/// `query`, `qtype`, `resolved_ips` (on allow), `reason` (on deny).
+/// Carries `query`, `qtype`, `resolved_ips` (on allow), `reason` (on deny).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DnsEvent {
     QueryAllowed {
@@ -147,7 +143,7 @@ pub enum DnsEvent {
 /// Harmonized across L1, L2, L3 filter chains; `connect_authority` is
 /// present only on L3 records (CONNECT-tunnel `REQUESTED_SERVER_NAME`).
 /// Named fields follow the plan's JSON field map (plan Phase 4, line 102):
-/// spec Part 3 Table names `matched_chain`, `cluster`; plan adds the
+/// the event wire format Table names `matched_chain`, `cluster`; plan adds the
 /// remaining access-log-standard fields so ingestion does not have to drop
 /// data that operators will want.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,8 +173,7 @@ pub struct EnvoyConnection {
 
 /// mitmproxy addon `request_allowed` / `request_denied`.
 ///
-/// Fields match the spec Part 3 "Traffic events" table for layer
-/// `mitmproxy`: `host`, `port`, `method`, `path`, and `reason` on deny.
+/// Carries `host`, `port`, `method`, `path`, and `reason` on deny.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MitmproxyEvent {
     RequestAllowed {
@@ -203,7 +198,7 @@ pub enum MitmproxyEvent {
 /// kinds that share a common envelope and flow through the same
 /// daemon-side ingest pipeline:
 ///
-/// - **`Deny`** — emitted by `sandbox-nft-deny-logger`. Spec Part 3
+/// - **`Deny`** — emitted by `sandbox-nft-deny-logger`.
 ///   / "Deny-logger component" + "Traffic events" row for layer
 ///   `deny-logger`. Pre-DNAT 5-tuple recovered via `SO_ORIGINAL_DST`
 ///   (TCP) or NFLOG payload parse (UDP). Same wire shape as `Allow`.
@@ -218,8 +213,7 @@ pub enum MitmproxyEvent {
 /// - **`RateLimited`** — emitted by either binary's per-process
 ///   `RateCap` flush ticker. Periodic summary of events dropped
 ///   because the per-second cap was hit. Carries `rate_limited_count`
-///   per spec Part 3 / "Hardening rules" § 5; no 5-tuple to attribute,
-///   so the watcher falls back to its owning session.
+///   no 5-tuple to attribute, so the watcher falls back to its owning session.
 ///
 /// The enum kept its original name to avoid churning every
 /// downstream consumer of `TrafficEvent::DenyLogger(...)`. The daemon-
@@ -245,7 +239,7 @@ pub enum DenyLoggerEvent {
 
 /// Payload of [`DenyLoggerEvent::Deny`].
 ///
-/// Field names match spec Part 3 / "Traffic events" row for layer
+/// Field names match the wire format row for layer
 /// `deny-logger` character-for-character.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DenyLoggerDeny {
@@ -300,8 +294,7 @@ pub struct DenyLoggerAllow {
 
 /// L4 protocol on a deny-logger / allow-logger 5-tuple event.
 ///
-/// Serialized on the wire as `"tcp"` / `"udp"` per spec Part 3 /
-/// "Traffic events" row for layer `deny-logger`. Reused on `allow`
+/// Serialized on the wire as `"tcp"` / `"udp"`. Reused on `allow`
 /// events so the wire shape is uniform — the allow-logger filters
 /// non-UDP at parse time, so in practice `DenyProtocol::Udp` is the
 /// only value an `Allow` payload carries.
@@ -317,9 +310,7 @@ pub enum DenyProtocol {
 
 /// sandboxd-emitted lifecycle event.
 ///
-/// Variants correspond 1:1 to the rows of spec Part 3 "Lifecycle events"
-/// table. Field sets mirror the spec's `Key fields` column exactly; see
-/// the per-variant docs for the source row.
+/// See per-variant docs for the fields each variant carries.
 ///
 /// No [`PartialEq`] derive: the [`Policy`] payload on
 /// `PolicyApplied` / `PolicyUpdated` cannot trivially be compared for
@@ -393,8 +384,7 @@ pub enum LifecycleEvent {
 
 /// Outcome of a policy-apply / policy-update action.
 ///
-/// Serialized as the lowercase strings `"ok"` / `"error"` to match the
-/// spec's `status` column for `policy_applied` / `policy_updated`.
+/// Serialized as the lowercase strings `"ok"` / `"error"` on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyApplyStatus {
     Ok,
@@ -404,8 +394,7 @@ pub enum PolicyApplyStatus {
 /// Subcomponent for [`LifecycleEvent::HealthDegraded`] /
 /// [`LifecycleEvent::HealthRestored`].
 ///
-/// Matches the spec's enumeration of gateway subcomponents:
-/// `deny-logger`, `envoy`, `mitmproxy`, `coredns`.
+/// Gateway subcomponents: `deny-logger`, `envoy`, `mitmproxy`, `coredns`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HealthComponent {
     DenyLogger,
@@ -414,10 +403,8 @@ pub enum HealthComponent {
     Coredns,
 }
 
-/// Reason carried on [`LifecycleEvent::GatewayShutdown`].
-///
-/// Matches the spec's `reason` values for `gateway_shutdown`:
-/// `session_stopped`, `daemon_shutdown`, `error`.
+/// Reason carried on [`LifecycleEvent::GatewayShutdown`]:
+/// `session_stopped`, `daemon_shutdown`, or `error`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatewayShutdownReason {
     SessionStopped,
@@ -436,9 +423,8 @@ pub enum GatewayShutdownReason {
 // lifecycle DTO does not derive [`PartialEq`], see the type's rustdoc for
 // why).
 //
-// Every test also asserts the serialized JSON carries the spec's exact
-// `layer` and `event` discriminators, plus the layer-specific field names
-// from spec Part 3 "Event categories".
+// Every test also asserts the serialized JSON carries the exact
+// `layer` and `event` discriminators, plus the layer-specific field names.
 
 #[cfg(test)]
 mod tests {
@@ -558,7 +544,7 @@ mod tests {
             ))),
         };
         let json = round_trip_traffic(event, "envoy", "connection_allowed");
-        // Spot-check spec field names appear at the top level.
+        // Spot-check wire field names appear at the top level.
         for field in [
             "timestamp",
             "session",
@@ -690,12 +676,11 @@ mod tests {
 
     // ----- traffic: deny-logger --------------------------------------------
     //
-    // Per spec Part 3 "Traffic events" row for `deny-logger`: every `deny`
-    // event carries `orig_dst_ip`, `orig_dst_port`, `protocol` (`tcp`/
-    // `udp`), `src_ip`, `src_port`. The `rate_limited` summary event
-    // carries `rate_limited_count` and `since_ts` (spec § "Hardening
-    // rules" #5). Note the kebab-case `deny-logger` layer literal — the
-    // only multi-word `layer` value in the spec.
+    // deny-logger: every `deny` event carries `orig_dst_ip`,
+    // `orig_dst_port`, `protocol` (`tcp`/`udp`), `src_ip`, `src_port`.
+    // The `rate_limited` summary event carries `rate_limited_count` and
+    // `since_ts`. Note the kebab-case `deny-logger` layer literal — the
+    // only multi-word `layer` value.
 
     #[test]
     fn env_round_trip_traffic_deny_logger_tcp() {
@@ -844,7 +829,7 @@ mod tests {
 
     #[test]
     fn env_round_trip_lifecycle_gateway_booting() {
-        // `gateway_booting` is a pre-session event per spec; session is None.
+        // `gateway_booting` is a pre-session event; session is None.
         let event = Event::Lifecycle {
             envelope: EventEnvelope {
                 timestamp: fixture_timestamp(),
@@ -942,7 +927,7 @@ mod tests {
             },
         };
         let json = round_trip_lifecycle(event, "health_degraded");
-        // Kebab-case literal per spec.
+        // Kebab-case literal.
         assert_eq!(json["component"], "deny-logger");
         assert_eq!(json["reason"], "healthcheck timeout");
     }

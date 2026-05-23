@@ -1,8 +1,7 @@
 //! Unified event stream: domain types.
 //!
-//! The event surface is defined by spec Part 3 of
-//! `.tasks/specs/2026-04-21-port-explicit-policies-presets-observability-
-//! design.md`. This module holds the domain representation of events.
+//! This module holds the domain representation of events that flow through
+//! the unified event stream.
 //! The wire (JSON) shape and the domain → wire mapper live in
 //! [`crate::api::event_dto`] and [`crate::api::event_mapper`] respectively.
 //!

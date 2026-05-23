@@ -187,7 +187,7 @@ impl SessionStore {
             .run(&mut conn)
             .map_err(|e| SandboxError::Internal(format!("migration error (V006+): {e}")))?;
 
-        // V006 substrate-orphan scan (api-session-isolation spec § 2.1.1).
+        // V006 substrate-orphan scan .
         // Fires exactly once: on the boot where refinery just applied
         // V006. The refinery report tells us which versions ran this
         // pass; cross-checking against `applied_before` would be
@@ -237,7 +237,7 @@ impl SessionStore {
     /// one `warn!` line per found orphan plus a summary line.
     ///
     /// **Diagnostic only.** The scan never deletes — that is the
-    /// operator's call once they have read the log lines. Spec 2 §
+    /// operator's call once they have read the log lines. the documented contract
     /// 2.1.1 lays out the rationale.
     fn run_v006_orphan_scan(base_dir: &Path) {
         let mut found: u32 = 0;
@@ -310,7 +310,7 @@ impl SessionStore {
             event = "v006_orphan_scan_complete",
             orphan_count = found,
             "V006 orphan scan complete - {found} orphan(s) logged above. \
-             Run `sandbox doctor` (Spec 3) for a reconciliation report. \
+             Run `sandbox doctor` (sandbox doctor) for a reconciliation report. \
              Do NOT auto-delete; review each orphan before cleanup."
         );
     }
@@ -541,11 +541,11 @@ impl SessionStore {
     /// re-inserted up to `INSERT_COLLISION_RETRIES` times before failing.
     ///
     /// `owner_username` is stamped into the `sessions.owner_username`
-    /// column added by V006 (api-session-isolation spec § 2.4) so every
+    /// column added by V006 (per-caller isolation) so every
     /// subsequent read or mutation filters by the caller's identity.
     /// `guest_proto` / `guest_bin_ver` are the protocol-version and
     /// binary-version stamps that drive the start-time compat gate
-    /// (api-session-isolation spec § 3.4); callers stamp the daemon's
+    /// for the start-time compat gate; callers stamp the daemon's
     /// current constants here so reads round-trip the real values.
     pub fn create_session(
         &self,
@@ -650,7 +650,7 @@ impl SessionStore {
 
     /// Retrieve a session by ID, or `None` if it does not exist.
     ///
-    /// Per-caller isolation (api-session-isolation spec § 2.4): the
+    /// Per-caller isolation (per-caller isolation): the
     /// `WHERE` clause also filters `owner_username = ?caller_username`,
     /// so a foreign session ID is indistinguishable on the wire from a
     /// truly nonexistent ID — both return `Ok(None)` and the handler
@@ -710,7 +710,7 @@ impl SessionStore {
 
     /// List all sessions owned by `caller_username`.
     ///
-    /// Per-caller isolation (api-session-isolation spec § 2.4): each
+    /// Per-caller isolation (per-caller isolation): each
     /// caller sees only their own rows. Other operators' sessions never
     /// surface on the wire — list endpoints return disjoint result sets
     /// per caller.
@@ -718,7 +718,7 @@ impl SessionStore {
     /// tasks that need the full session inventory irrespective of
     /// caller. **Not for handler code.** HTTP handlers must use
     /// [`Self::list_sessions`], which enforces ownership via the
-    /// `caller_username` filter. See `api-session-isolation` spec § 2.4
+    /// `caller_username` filter. See per-caller isolation
     /// for the rationale.
     pub fn list_sessions_unfiltered(&self) -> Result<Vec<Session>, SandboxError> {
         let conn = self
@@ -790,7 +790,7 @@ impl SessionStore {
     /// (see [`SessionState::can_transition_to`]).  Returns
     /// `SandboxError::InvalidState` if the transition is not valid.
     ///
-    /// Per-caller isolation (api-session-isolation spec § 2.4): only
+    /// Per-caller isolation (per-caller isolation): only
     /// rows owned by `caller_username` are considered; a foreign-owner
     /// row surfaces as `Err(SessionNotFound)` so the handler layer
     /// returns HTTP 404 indistinguishable from a truly-nonexistent ID.
@@ -851,7 +851,7 @@ impl SessionStore {
     /// Update both guest-version fields for a session atomically.
     ///
     /// Called by `start_session`'s refresh decision tree (api-session-
-    /// isolation spec § 3.9) **only after** both
+    /// isolation rule) **only after** both
     /// `runtime.refresh_guest_binary` and `runtime.start` have returned
     /// `Ok(())`, so a write here means the in-VM/in-container binary
     /// really is at `proto` / `binary_version`.
@@ -900,13 +900,12 @@ impl SessionStore {
     /// **INTERNAL: only the daemon's startup / reconciliation paths may
     /// call this method.** HTTP handlers must use [`Self::update_state`],
     /// which enforces ownership via the `caller_username` filter
-    /// (api-session-isolation spec § 2.4). A call from a request handler
+    /// (per-caller isolation). A call from a request handler
     /// is a security bug — it bypasses the per-caller 404-on-foreign-id
     /// property the rest of the store guarantees.
     ///
-    /// Authorized callers, exhaustively (api-session-isolation spec
-    /// § 7.3.1 enforces this list via a static-analysis test in
-    /// `sandbox-core/tests/update_state_reconcile_allow_list.rs`):
+    /// Authorized callers, exhaustively (enforced via a static-analysis
+    /// test in `sandbox-core/tests/update_state_reconcile_allow_list.rs`):
     /// - `sandboxd::main::list_sessions` — reconciler block inside the
     ///   list handler that back-stamps observed runtime state onto
     ///   rows already filtered by the caller's scope.
@@ -954,7 +953,7 @@ impl SessionStore {
     ///    lowercase hex chars), try [`Self::resolve_id_prefix`]. Returns the matching
     ///    session if exactly one ID has this prefix.
     ///
-    /// Per-caller isolation (api-session-isolation spec § 2.4): every
+    /// Per-caller isolation (per-caller isolation): every
     /// fallback path filters on `owner_username = caller_username`, so
     /// foreign rows never surface and the 404-on-foreign-id property
     /// holds across name lookup, ID prefix, and full-ID paths.
@@ -1019,7 +1018,7 @@ impl SessionStore {
     /// - [`ResolveOutcome::Ambiguous`] if multiple caller-owned sessions
     ///   match, listing all matching IDs.
     ///
-    /// Per-caller isolation (api-session-isolation spec § 2.4): foreign-
+    /// Per-caller isolation (per-caller isolation): foreign-
     /// owner rows are invisible — a prefix that matches another
     /// operator's session ID returns `NotFound`, not the foreign ID.
     ///
@@ -1095,7 +1094,7 @@ impl SessionStore {
 
     /// Store network info for a session (serialized as JSON).
     ///
-    /// Per-caller isolation (api-session-isolation spec § 2.4): only
+    /// Per-caller isolation (per-caller isolation): only
     /// rows owned by `caller_username` are mutated; a foreign-owner row
     /// surfaces as `Err(SessionNotFound)` so the handler layer returns
     /// HTTP 404 indistinguishable from a truly-nonexistent ID.
@@ -1129,7 +1128,7 @@ impl SessionStore {
 
     /// Retrieve network info for a session, if it has been set.
     ///
-    /// Per-caller isolation (api-session-isolation spec § 2.4): a
+    /// Per-caller isolation (per-caller isolation): a
     /// foreign-owner row is invisible — a query for a session ID
     /// the caller does not own surfaces as `Err(SessionNotFound)`
     /// (same shape as a truly-nonexistent ID).
@@ -1274,7 +1273,7 @@ impl SessionStore {
 
         let tx = conn.transaction()?;
 
-        // Per-caller isolation (api-session-isolation spec § 2.4): a
+        // Per-caller isolation (per-caller isolation): a
         // mutation targeting a foreign-owner row surfaces as
         // `SessionNotFound`. The owner check runs *inside* the
         // transaction so a concurrent `delete_session` cannot race in
@@ -1360,7 +1359,7 @@ impl SessionStore {
             .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
 
         let tx = conn.transaction()?;
-        // Per-caller isolation (api-session-isolation spec § 2.4):
+        // Per-caller isolation (per-caller isolation):
         // policy deletion is idempotent (no-op for missing rows) by
         // contract, but a foreign-owner session must not even be
         // *probed* via this call site — surface SessionNotFound for
@@ -1382,7 +1381,7 @@ impl SessionStore {
             } else {
                 // Distinguish "row owned by someone else" from "no
                 // session row at all": a totally absent row is allowed
-                // to no-op (the spec's idempotence rule); a foreign-
+                // to no-op (the idempotence rule); a foreign-
                 // owner row must surface 404 so the caller can't probe
                 // existence.
                 let mut probe = tx.prepare("SELECT 1 FROM sessions WHERE id = ?1")?;
@@ -1429,7 +1428,7 @@ impl SessionStore {
             .lock()
             .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
 
-        // Per-caller isolation (api-session-isolation spec § 2.4): a
+        // Per-caller isolation (per-caller isolation): a
         // foreign-owner session surfaces as `Ok(None)` — same shape as
         // a session with no policy, which is identical to the shape an
         // unprovisioned session presents.
@@ -1509,7 +1508,7 @@ impl SessionStore {
 
     /// Delete a session from the database and remove its per-session directory.
     ///
-    /// Per-caller isolation (api-session-isolation spec § 2.4): only
+    /// Per-caller isolation (per-caller isolation): only
     /// rows owned by `caller_username` may be deleted; a foreign-owner
     /// row surfaces as `Err(SessionNotFound)` so the handler layer
     /// returns HTTP 404 indistinguishable from a truly-nonexistent ID.
@@ -1860,9 +1859,9 @@ mod tests {
         (store, dir)
     }
 
-    /// Per-caller isolation (api-session-isolation spec § 2.4) requires
+    /// Per-caller isolation (per-caller isolation) requires
     /// every public store call to carry an owner identity. Tests in this
-    /// module that pre-date Spec 2 use this constant so the per-caller
+    /// module that pre-date pre-isolation use this constant so the per-caller
     /// filter is satisfied without making the test bodies noisier than
     /// the assertions they perform. Tests that *exercise* the per-caller
     /// isolation rules use distinct usernames inline.
@@ -3195,7 +3194,7 @@ mod tests {
     /// the `http`-leveled parent), then opens the DB via
     /// `SessionStore::new` — which runs V004 and the orphan sweep.
     ///
-    /// Exit criterion (M10.md § "Exit criteria"): "a seed DB containing
+    /// Exit criterion: "a seed DB containing
     /// v1-shaped rows lands cleanly, emits `policy_reset_on_upgrade`
     /// per affected session (tracing), and leaves those sessions with
     /// no attached policy."
@@ -3400,7 +3399,7 @@ mod tests {
         // `SessionStore::new` here because V006's `DELETE FROM sessions`
         // would cascade-delete every `session_policies` row before
         // V004's sweep ever sees them. The V004 sweep is its own
-        // unit; testing it in isolation matches the spec — V006's
+        // unit; testing it in isolation matches V006's
         // destructive step is covered separately by the V006 tests
         // below.
         let swept_sessions = with_default(subscriber, || {
@@ -3756,7 +3755,7 @@ mod tests {
     }
 
     // ========================================================================
-    // V006 migration tests (api-session-isolation spec § 7.1)
+    // V006 migration tests
     // ========================================================================
 
     /// V006 on a fresh DB: refinery runs V001..V006 with no rows to
@@ -3783,7 +3782,7 @@ mod tests {
     /// V006 on a V005-seeded DB with sessions present: the destructive
     /// `DELETE FROM sessions` step wipes pre-existing rows AND cascades
     /// through `session_policies` -> `policy_rules` ->
-    /// `policy_rule_http_filters` (via the V003 foreign keys). Spec §
+    /// `policy_rule_http_filters` (via the V003 foreign keys).
     /// 2.1 calls this out — every existing dev session is volatile and
     /// the cascade is the correct teardown shape for an upgrade.
     #[test]
@@ -4168,7 +4167,7 @@ mod tests {
     }
 
     // ========================================================================
-    // Per-caller filtering tests (api-session-isolation spec § 7.2)
+    // Per-caller filtering tests
     // ========================================================================
 
     /// Stamps the `caller_username` arg into the row.

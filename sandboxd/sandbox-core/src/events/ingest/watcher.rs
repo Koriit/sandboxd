@@ -28,7 +28,7 @@
 //! 4. For every parsed line, look up `session_id` via
 //!    [`VmIpSessionMap::lookup`] on the per-layer `client_ip` /
 //!    `src_ip`. On miss, warn + drop — publishing to a fabricated or
-//!    wrong session is worse than dropping (spec Part 3 / plan Phase
+//!    wrong session is worse than dropping (the event wire format / plan Phase
 //!    7 "drop events on vm_ip miss").
 //!
 //! # Why mpsc + select, not just `tokio::sync::watch`
@@ -379,8 +379,7 @@ fn drain_all(
 ///
 /// 1. The deny-logger's `rate_limited` summary carries no 5-tuple — it
 ///    is a per-session aggregate produced when the component's
-///    per-session event rate cap is hit (spec Part 3 / "Hardening
-///    rules" § 5).
+///    per-session event rate cap is hit (see hardening rate-cap rules).
 /// 2. Every mitmproxy event's `client_ip` is the kernel-chosen source
 ///    of Envoy's upstream connect to `127.0.0.1:18080` (typically the
 ///    gateway's bridge IP), not the VM. Mitmproxy runs on loopback
@@ -434,7 +433,7 @@ fn dispatch_line(
         Some(client_ip) => {
             let Some(sid) = vm_ip_map.lookup(client_ip) else {
                 // Dropping unattributable events is a deliberate design
-                // choice (spec Part 3, plan Phase 7): a fabricated /
+                // choice (the event wire format, plan Phase 7): a fabricated /
                 // wrong session on the envelope would be silently
                 // misleading, whereas a dropped event surfaces as a
                 // clear gap that operators can investigate via the warn
@@ -452,7 +451,7 @@ fn dispatch_line(
         None => {
             // No peer IP to look up. Two producer shapes hit this path:
             // (a) the deny-logger's `rate_limited` summary, which has no
-            // 5-tuple (spec Part 3 / "Hardening rules" § 5); and
+            // 5-tuple; and
             // (b) every mitmproxy event, whose `client_ip` reflects the
             // kernel-chosen source of Envoy's loopback connect and is
             // not the VM. Both producers run per-session by
@@ -534,7 +533,7 @@ mod tests {
 
     #[test]
     fn poll_interval_is_two_seconds() {
-        // Regression guard on a spec-dictated constant. If this test
+        // Regression guard on this constant. If this test
         // fails someone has changed the fallback poll rate — make sure
         // the corresponding docs + E2E waits get updated too.
         assert_eq!(POLL_INTERVAL, std::time::Duration::from_secs(2));

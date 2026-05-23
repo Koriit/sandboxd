@@ -1,6 +1,6 @@
 """Refusal-path tests for install.sh.
 
-Spec § 6.3:
+
 
 - ``test_install_refuses_wrong_arch_tarball`` — aarch64 MANIFEST on
   x86_64 host. Expect non-zero exit + clear error.
@@ -97,7 +97,7 @@ def test_install_refuses_when_preexisting(
 ):
     """Same-version re-install short-circuits (exit 0). Different-version refuses (exit 1).
 
-    Spec § 4.4.5: pre-existing install detection skips if the installed
+    
     version equals the target; otherwise it refuses and points the user
     at `sandbox update`.
     """

@@ -1,6 +1,6 @@
 """Idempotency + partial-failure recovery tests for install.sh.
 
-Spec §§ 6.3, 8.3, 8.4. Two cases:
+
 
 - ``test_install_idempotent_double_run`` — second run is all-skip.
 - ``test_install_partial_failure_recovery`` — kill install mid-step,
@@ -88,7 +88,7 @@ def test_install_partial_failure_recovery(
     Prior steps (useradd, operator_add) emit action=skip since they
     are inherently idempotent against an already-created user.
 
-    This is the genuine "mid-step kill" recovery shape from spec § 8.4
+    This is the genuine "mid-step kill" recovery shape from.4
     — previously this test removed the binary post-hoc, which only
     exercised "binary disappeared" and not "install was interrupted
     before binaries were copied".

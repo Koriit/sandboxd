@@ -1145,7 +1145,7 @@ def test_udp_allowed_ip_cidr_edge(sandbox_cli, backend):
 
         # Send UDP directly to the resolved IP — no nslookup inside
         # the VM, no CoreDNS round-trip. This is the "skipping DNS"
-        # property the spec calls out.
+        # property the design calls out.
         send = _send_udp_packet(
             sandbox_cli, session_name, target_ip, target_port,
         )
@@ -2804,7 +2804,7 @@ def test_policy_rejects_http_level_with_udp_protocol(sandbox_cli, backend):
     Posts a single rule with `level: http` and `protocol: udp` via
     `sandbox policy update --policy <file>`. The daemon must reject
     the request with a non-success exit code and an error message
-    containing the spec-mandated phrase ``assurance level 'http'
+    containing the required phrase ``assurance level 'http'
     requires protocol 'tcp'`` (per `PolicyCompiler::validate`). The
     session must remain alive afterwards — the failed apply must not
     knock it out of the running state.

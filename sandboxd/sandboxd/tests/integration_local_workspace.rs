@@ -20,7 +20,7 @@
 //!
 //! Container coverage at the runtime layer exercises every line of
 //! `run_initial_push`. The Lima half of the same exercise is left to
-//! E2E: spec § 11.4 lists `integration_lima_local_create_and_push`,
+//! E2E:.4 lists `integration_lima_local_create_and_push`,
 //! but the existing `sandbox-core/tests/lima_integration.rs` convention
 //! is "inert-VM tests only" — booting a Lima VM at the runtime layer
 //! requires `NetworkManager` plumbing from `AppState` (per the comment
@@ -47,7 +47,7 @@
 //! - `integration_create_session_rejects_no_gitignore_with_non_local_workspace`
 //!   — HTTP-boundary wire-shape pin for Phase 2's `--no-gitignore`
 //!   validation. Spawns the daemon, posts a `shared:`+`no_gitignore=true`
-//!   body, asserts 400 with the spec-verbatim rejection token. No
+//!   body, asserts 400 with the design-verbatim rejection token. No
 //!   backend boot required.
 
 use std::io::Write;
@@ -75,7 +75,7 @@ use tokio::net::UnixStream;
 // Test fixture: rsync-equipped alpine sleep container
 // ---------------------------------------------------------------------------
 //
-// The lite image is `--read-only` per spec § Hardening and the
+// The lite image is `--read-only` per the design
 // production daemon entrypoint expects route-helper scaffolding the
 // runtime-level tests deliberately avoid. We build a small alpine
 // image with `rsync` pre-installed and `sleep 3600` as the entrypoint
@@ -324,7 +324,7 @@ async fn start_container(
 // Test 1: happy-path mirror — container backend
 // ---------------------------------------------------------------------------
 
-/// Spec § 11.4 — `integration_container_local_create_and_push`.
+/// .
 ///
 /// Create a host source tree with known nested files. Boot a
 /// container. Call `run_initial_push(Container, …, no_gitignore=false)`
@@ -350,7 +350,7 @@ async fn integration_container_local_create_and_push() {
 
     // Push from <host>/srv to /home/agent/work inside the guest. We
     // pick a writable guest path because the alpine fixture has a
-    // writable rootfs; the spec's breaking default (guest_path ==
+    // writable rootfs; the breaking default (guest_path ==
     // host_path) is exercised by the shared-guest-path sibling
     // file, not here — this test pins the explicit-guest-path arm.
     let host_arg = host_root.join("srv").to_string_lossy().to_string();
@@ -391,7 +391,7 @@ async fn integration_container_local_create_and_push() {
 // Test 2: `.gitignore` filter respected by default, dropped on opt-in
 // ---------------------------------------------------------------------------
 
-/// Spec § 11.4 — `integration_local_gitignore_filter`.
+/// .
 ///
 /// Same host source, two pushes against two fresh containers (one
 /// container per push so neither test sees the other's leftover
@@ -487,10 +487,10 @@ async fn integration_local_gitignore_filter() {
 // Test 3: rsync failure surfaces as SandboxError::Internal w/ stderr
 // ---------------------------------------------------------------------------
 
-/// Spec § 11.4 — `integration_local_create_failure_tears_down`.
+/// .
 ///
 /// Library-level: assert the function returns the documented error
-/// shape on rsync failure. The orphan-cleanup half of the spec ("no
+/// shape on rsync failure. The orphan-cleanup half of the design ("no
 /// orphaned VM/container artefacts remain") is exercised by the
 /// daemon's `cleanup_and_return!` orchestration around the
 /// `run_initial_push` call site at `sandboxd/src/main.rs:2723`;
@@ -506,8 +506,7 @@ async fn integration_local_gitignore_filter() {
 /// (typically exit 23, "partial transfer due to error") with an
 /// `Operation not permitted` / `Permission denied` line in stderr.
 /// The production module's "all-non-zero-exits-fatal" rule
-/// (mirroring spec § Rsync invocation → Exit codes) collapses any
-/// such exit to `Internal`.
+/// maps such exit to `Internal`.
 #[tokio::test]
 async fn integration_local_create_failure_tears_down() {
     let host_src = TempDir::new().expect("host tempdir");
@@ -570,7 +569,7 @@ async fn integration_local_create_failure_tears_down() {
     // it would silently break that workflow.
     assert!(
         msg.contains("local-workspace rsync failed"),
-        "Internal error message must lead with the spec-verbatim \
+        "Internal error message must lead with the design-verbatim \
          `local-workspace rsync failed` prefix; got: {msg}"
     );
 
@@ -597,7 +596,7 @@ async fn integration_local_create_failure_tears_down() {
 // runtime code runs). Driving it through `POST /sessions` with a
 // gateway-image override forces the pre-flight gateway check to
 // pass; the daemon then hits the workspace-validation gate and
-// returns a 400 with the spec-verbatim rejection token.
+// returns a 400 with the design-verbatim rejection token.
 //
 // Mirrors the daemon-spawn pattern in
 // `integration_session_create_refused_on_missing_gateway_image.rs`
@@ -749,7 +748,7 @@ async fn http_post_json(
 /// `workspace: "shared:/tmp"` + `no_gitignore: true`, asserts:
 ///
 /// 1. HTTP 400 (`SandboxError::InvalidArgument` mapping).
-/// 2. The error body's `error` field carries the spec-verbatim
+/// 2. The error body's `error` field carries the design-verbatim
 ///    rejection token `"is only meaningful for local: workspaces"`.
 ///
 /// The request never reaches a backend boot — the gate fires
@@ -789,14 +788,14 @@ async fn integration_create_session_rejects_no_gitignore_with_non_local_workspac
             panic!("rejection body must have a top-level `error` string; got: {parsed}")
         });
 
-    // Spec-verbatim token from the Phase 2 rejection helper. Token
+    // Verbatim token from the Phase 2 rejection helper. Token
     // checked here mirrors the test in
     // `sandbox-core/src/api/mod.rs` for the validator helper; this
     // assertion pins the wire shape (the helper text reaching the
     // operator over HTTP) end-to-end.
     assert!(
         error_msg.contains("is only meaningful for local: workspaces"),
-        "rejection body must contain the spec-verbatim Phase 2 token \
+        "rejection body must contain the design-verbatim Phase 2 token \
          \"is only meaningful for local: workspaces\"; got: {error_msg}"
     );
 }

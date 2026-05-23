@@ -1,6 +1,6 @@
 //! Minimal HTTP/1.1 health server.
 //!
-//! Spec reference: `2026-04-21-port-explicit-policies-presets-observability-design.md`
+//! Design reference: `2026-04-21-port-explicit-policies-presets-observability-design.md`
 //! Part 3 / "Listener design / Healthcheck listener" and "Liveness
 //! posture", with `2026-05-01-udp-nft-loggers-design.md` Resolution 5
 //! pinning the response field names across the binary rename.

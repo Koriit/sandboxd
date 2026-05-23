@@ -1,19 +1,17 @@
 """Probes for the local Docker daemon's runtime mode.
 
-E2E tests that assert UID-alignment semantics (spec § Workspace,
-``2026-04-22-lite-mode-container-backend-design-spec.md`` lines
-572–574) only hold under default-hardened Docker. Rootless Docker
-remaps the container uid through ``/etc/subuid``, so a file written
-from inside the container as ``host_uid`` lands on the host as a
-sub-uid — the test would fail through no fault of the lite backend.
+E2E tests that assert UID-alignment semantics only hold under
+default-hardened Docker. Rootless Docker remaps the container uid
+through ``/etc/subuid``, so a file written from inside the container
+as ``host_uid`` lands on the host as a sub-uid — the test would fail
+through no fault of the lite backend.
 
-The lite spec calls out rootless Docker as out of scope (§
-"Non-goals" line 1195: *"Lite's target is **default-hardened
-Docker**. The daemon refuses session-create on rootless Docker by
-default; ``sandbox create --force-rootless-docker`` is an explicit
+Rootless Docker is out of scope for the lite backend. The daemon
+refuses session-create on rootless Docker by default;
+``sandbox create --force-rootless-docker`` is an explicit
 per-invocation escape hatch for users who accept they are operating
 outside the supported envelope. Alternative runtimes are a separate
-design."*).
+concern.
 
 The daemon enforces the non-goal at session-create time
 (``RootlessDockerRefused`` returned as HTTP 400), so e2e tests no

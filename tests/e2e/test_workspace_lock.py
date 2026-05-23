@@ -145,7 +145,7 @@ def _release_lock(
 def test_workspace_lock_blocks_stop_during_push(
     sandbox_cli, sandbox_daemon, tmp_path,
 ):
-    """Spec § Lifecycle interaction — held lock makes ``stop`` 409.
+    """
 
     Create a ``local:`` session. Acquire the workspace lock directly
     via HTTP (simulating an in-flight push). Try ``sandbox stop``.
@@ -241,7 +241,7 @@ def test_workspace_lock_blocks_stop_during_push(
 def test_workspace_lock_unlock_force_recovery(
     sandbox_cli, sandbox_daemon, tmp_path,
 ):
-    """Spec § Orphan locks — ``unlock --force`` recovers the session.
+    """
 
     Acquire a lock via HTTP. Confirm ``sandbox stop`` is blocked. Run
     ``sandbox workspace unlock <session> --force``. Assert exit 0.
@@ -323,7 +323,7 @@ def test_workspace_lock_unlock_force_recovery(
 def test_workspace_unlock_idempotent(
     sandbox_cli, sandbox_daemon, tmp_path,
 ):
-    """Spec § Push/pull commands — unlock on an unlocked session is a no-op.
+    """
 
     Create a ``local:`` session (no lock held). Run ``sandbox workspace
     unlock <session>`` without ``--force``. Assert exit 0 — the daemon
@@ -371,7 +371,7 @@ def test_workspace_unlock_idempotent(
             f"stderr: {unlock1.stderr}"
         )
         # The CLI prints "workspace lock released" on success regardless
-        # of whether anything was actually held — see spec § New CLI
+        # of whether anything was actually held — see 
         # command → idempotent on already-unlocked.
         assert "workspace lock released" in (unlock1.stdout or "") + (unlock1.stderr or ""), (
             f"unlock success output must surface the documented `workspace "

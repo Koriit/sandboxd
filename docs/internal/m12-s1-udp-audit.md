@@ -3,7 +3,7 @@
 Audit of UDP behavior end-to-end in `sandboxd` as it stands on master at the
 start of M12-S1. This is the read-only inventory that the M12-S1
 implementation phase (conntrack lookup), M12-S2 (e2e parity + doc
-reconciliation), and M12-S3 (spec coherence) will all depend on. Citations
+reconciliation), and M12-S3 (doc coherence) will all depend on. Citations
 are `file:line` against the working tree at audit time.
 
 A few orienting facts before the section walks:
@@ -277,10 +277,9 @@ d.protocol == DenyProtocol::Udp
 
 The verbatim explanatory comment, lines `670-694`:
 
-> Spec (`.tasks/specs/2026-04-21-port-explicit-policies-presets-
-> observability-design.md` lines 810-817) states the UDP deny-logger
-> should read `IP_ORIGDSTADDR` from the `recvmsg` cmsg and emit the
-> **pre-DNAT** destination (expected: `203.0.113.1:9999`).
+> The UDP deny-logger was designed to read `IP_ORIGDSTADDR` from the
+> `recvmsg` cmsg and emit the **pre-DNAT** destination (expected:
+> `203.0.113.1:9999`).
 >
 > Observed behavior on the current gateway image: the Linux kernel
 > does not expose the pre-DNAT destination via `IP_ORIGDSTADDR` for
@@ -299,7 +298,7 @@ The verbatim explanatory comment, lines `670-694`:
 > Like Test 1's stderr-signature relaxation, we pin the primary
 > contract (a `deny` event **is** emitted for a blocked UDP
 > datagram, with the correct src_ip and protocol) and accept the
-> DNAT-target orig_dst rather than the spec-prescribed pre-DNAT
+> DNAT-target orig_dst rather than the intended pre-DNAT
 > destination. The 5-tuple's pre-DNAT accuracy is tracked upstream
 > as a deny-logger UDP follow-up.
 
@@ -307,8 +306,7 @@ There is also a guard comment at `gateway_deny_pipeline.rs:696-699`:
 
 > NOTE: if this assertion ever fails with orig_dst = 203.0.113.1:9999,
 > the UDP pre-DNAT conntrack fix (deferred todo #29) has landed —
-> update this test to the spec-prescribed pre-DNAT tuple instead of
-> reverting.
+> update this test to the pre-DNAT tuple instead of reverting.
 
 ### 2.3 Proposed fix mechanism — conntrack netlink lookup
 
@@ -486,7 +484,7 @@ troubleshooting flow. M12-S2 reconciliation.
 **b12. `networking-design.md:1115-1121` "UDP" subsection is a stub.**
 Three bullet points ("narrow and intentional", "strongest review
 burden", "weakest service identity guarantees") that don't describe
-what the implementation does. M12-S2 / spec coherence pass.
+what the implementation does. M12-S2 / doc coherence pass.
 
 ### (c) Defer to M12-S9 (new follow-on, doesn't fit S1 or S2)
 
@@ -587,7 +585,7 @@ intended end-state. Today the deny path goes through the deny-logger
 binary (a userland process), not "purely nftables" — the nft DNAT
 points userland-ward. The allow path in nft is wired but unreachable
 (see b1). Wording should describe what the implementation actually
-does. **Tag: S2 reconciliation (spec-side).**
+does. **Tag: S2 reconciliation (doc-side).**
 
 **4.7 `networking-design.md:1395`** (in §17 Security model):
 
@@ -604,8 +602,8 @@ Same drift as 4.6. **Tag: S2 reconciliation.**
 Today the deny-logger drops UDP without ICMP unreachable
 (`sandbox-deny-logger/src/udp.rs:62-87`). The deny-logger is the
 endpoint — it doesn't reject upstream. **Tag: S2 reconciliation
-(consider whether to honor the spec by sending ICMP, or update the
-spec to match the silent-drop reality).**
+(decide whether to honor the original intent by sending ICMP, or
+document that the silent-drop is the correct behavior).**
 
 ### Already accurate (no action)
 

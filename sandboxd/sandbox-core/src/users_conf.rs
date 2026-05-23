@@ -5,8 +5,7 @@
 //! default route inside a target container's netns).
 //!
 //! The file is JSON, root-owned, mode `0644`. See the M11 lite-mode
-//! container backend spec, § "Config file: `/etc/sandboxd/users.conf`",
-//! for the canonical shape; the spec example is reproduced in
+//! container backend spec for the canonical shape; the design example is reproduced in
 //! [`UsersConfig`].
 //!
 //! # Path resolution
@@ -58,7 +57,7 @@
 //!   (with its own uid) to pick its allocation CIDR, and by the route
 //!   helper at step 4 (with the caller's uid) to authorize.
 //!
-//! Per the spec (line 406-408), `allow_users` entries are admin
+//! Per the design (line 406-408), `allow_users` entries are admin
 //! readability — the helper compares numeric uids internally so admin
 //! renames (`usermod`) take effect immediately. Username → uid
 //! resolution happens at lookup time via `getpwnam_r` (`nix`'s
@@ -183,7 +182,7 @@ pub enum UsersConfigError {
 }
 
 // ---------------------------------------------------------------------------
-// Daemon-side schema-mismatch refusal (Spec 5 § 4.7)
+// Daemon-side schema-mismatch refusal
 // ---------------------------------------------------------------------------
 
 /// The newest `users.conf` schema version this daemon binary can read.
@@ -206,10 +205,10 @@ pub const DAEMON_MIN_SUPPORTED_USERS_CONF_SCHEMA: u32 = 1;
 /// daemon's supported range.
 ///
 /// Called by the daemon immediately after `load_users_config()` succeeds
-/// (Spec 5 § 4.7 — convergence anchor that forces operators to run
+/// (the migration framework.7 — convergence anchor that forces operators to run
 /// `sandbox update` when the config file drifts behind the binary's
 /// supported version). The file's `_schema_version` is `Option<u32>`
-/// (Spec 1 § 4.2) — `None` is treated as `0`, which means a pre-V001
+/// (the documented contract) — `None` is treated as `0`, which means a pre-V001
 /// file fails the `MIN >= 1` check on a daemon that requires V001.
 ///
 /// Returns `Err(SchemaTooNew { .. })` when the file is ahead of the
@@ -364,7 +363,7 @@ impl<'de> Deserialize<'de> for Cidr4 {
 
 /// Top-level shape of `users.conf`.
 ///
-/// Example file (per spec § "Config file"):
+/// Example file (per the design
 ///
 /// ```json
 /// {
@@ -379,7 +378,7 @@ impl<'de> Deserialize<'de> for Cidr4 {
 pub struct UsersConfig {
     /// Schema version of the on-disk file, written as the `_schema_version`
     /// key. `None` means the file predates the migration framework and is
-    /// treated as version `0` by the framework (Spec 5); V001 advances it
+    /// treated as version `0` by the framework; V001 advances it
     /// to `Some(1)`. The underscore prefix is the project's convention for
     /// metadata that sits alongside domain data inside the same JSON
     /// object — the Rust field name stays idiomatic via `#[serde(rename)]`.
@@ -436,8 +435,7 @@ impl UsersConfig {
     ///   authorize).
     ///
     /// Resolves each `allow_users` entry via `getpwnam_r` and compares
-    /// numerically. Per spec line 406-408: admin renames take effect
-    /// immediately — no caching.
+    /// numerically. Admin renames take effect immediately — no caching.
     pub fn find_subnet_by_uid(&self, target_uid: u32) -> Option<&SubnetEntry> {
         self.subnets
             .iter()
@@ -496,8 +494,8 @@ impl SubnetEntry {
 /// (e.g. a file with no `_schema_version` field, which would not yet
 /// satisfy the typed shape if the field were non-optional). The file-IO
 /// wrapper (atomic-rename write, lock file, backup folder) is owned by
-/// the migration framework in Spec 5; this function is the content
-/// contribution from Spec 1.
+/// the migration framework in the install framework; this function is the content
+/// contribution
 ///
 /// # Idempotency
 ///
@@ -505,7 +503,7 @@ impl SubnetEntry {
 /// Two distinct paths reach this contract:
 ///
 /// - A file already at `_schema_version: 1` is unchanged. (The framework
-///   never invokes this branch under normal operation per Spec 5 § 4.2 —
+///   never invokes this branch under normal operation —
 ///   it returns early when current == target — but the branch remains as
 ///   defense-in-depth for ad-hoc test or tool invocations.)
 /// - A pool whose `allow_users` already contains `"sandbox"` is left
@@ -518,7 +516,7 @@ impl SubnetEntry {
 /// Inputs that are not `Value::Object` (or whose `subnets` field is not
 /// an array, or whose `allow_users` is not an array) are returned
 /// unchanged — the framework will validate the produced value against
-/// `UsersConfig` after the transform runs (Spec 5), so a malformed input
+/// `UsersConfig` after the transform runs, so a malformed input
 /// surfaces as a typed parse error downstream rather than a silent
 /// mutation here. We deliberately do not coerce or repair shapes the
 /// strict schema would reject.
@@ -822,7 +820,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Roundtrip parse — happy path matching the spec example.
+    // Roundtrip parse — happy path matching the design example.
     // -----------------------------------------------------------------
 
     #[test]
@@ -1054,7 +1052,7 @@ mod tests {
 
     #[test]
     fn cidr_host_bits_error_message_mentions_network_address() {
-        // Verifies the static reason text the spec calls for: operators
+        // Verifies the static reason text the design calls for: operators
         // confused about base vs. host address get a clear hint.
         let err = Cidr4::parse("10.209.0.5/20").unwrap_err();
         assert!(
@@ -1524,7 +1522,7 @@ mod tests {
 
         // Other u32 values round-trip the same way — the field's typing
         // is `Option<u32>`, not a "must be 1" constraint (that policy
-        // belongs to the migration framework in Spec 5, not the parser).
+        // belongs to the migration framework in the install framework, not the parser).
         let raw_v7 = r#"{
             "_schema_version": 7,
             "subnets": []
@@ -1584,22 +1582,22 @@ mod tests {
     // -----------------------------------------------------------------
     // Migration V001 — pure transform.
     //
-    // Inputs and outputs follow Spec 1 § 5.5 verbatim. The transform is
+    // Inputs and outputs follow the documented contract verbatim. The transform is
     // pure (no I/O), so each row is a single `assert_eq!` between
     // `serde_json::Value` trees. `Value` equality is structural — key
-    // order inside an object is not part of the comparison, so the spec
+    // order inside an object is not part of the comparison, so the design
     // examples' textual order is incidental to the test contract.
     // -----------------------------------------------------------------
 
     /// Parse a JSON literal into a `serde_json::Value`. Tiny helper so the
-    /// table-style tests below stay close to the spec's example shapes.
+    /// table-style tests below stay close to the example shapes.
     fn json(raw: &str) -> serde_json::Value {
         serde_json::from_str(raw).expect("json literal must parse")
     }
 
     #[test]
     fn v001_adds_sandbox_to_single_user_pool() {
-        // Spec § 5.5 — Input A → Output A.
+        // .
         let input = json(
             r#"{
                 "subnets": [
@@ -1620,7 +1618,7 @@ mod tests {
 
     #[test]
     fn v001_adds_sandbox_to_multiple_pools_independently() {
-        // Spec § 5.5 — Input B → Output B. Each pool is migrated
+        // . Each pool is migrated
         // independently; the operator's `comment` field rides through.
         let input = json(
             r#"{
@@ -1644,7 +1642,7 @@ mod tests {
 
     #[test]
     fn v001_noops_pool_already_containing_sandbox() {
-        // Spec § 5.5 — Input C → Output C. Operator hand-added `sandbox`
+        // . Operator hand-added `sandbox`
         // in a different order; V001 must not shuffle.
         let input = json(
             r#"{
@@ -1666,7 +1664,7 @@ mod tests {
 
     #[test]
     fn v001_noops_when_schema_version_already_one() {
-        // Spec § 5.5 — Input D. Bit-equal output.
+        // . Bit-equal output.
         let input = json(
             r#"{
                 "_schema_version": 1,
@@ -1931,7 +1929,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Daemon-side schema-version validator (Spec 5 § 4.7).
+    // Daemon-side schema-version validator.
     //
     // Construct a `UsersConfig` directly with the field we want to drive;
     // the validator is a pure function on the loaded struct, so we don't

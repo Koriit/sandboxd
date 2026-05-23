@@ -66,7 +66,7 @@ pub enum GatewayStatus {
 /// `gateway_monitor` uses this enum as a first-pass signal — an
 /// `Unhealthy` verdict here means Docker has already observed `retries`
 /// consecutive failures and is the canonical "container unhealthy"
-/// signal the spec calls for: Docker marks the container unhealthy,
+/// signal Docker acts on: Docker marks the container unhealthy,
 /// sandboxd's gateway health polling observes this, and the gateway
 /// container is restarted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,8 +127,8 @@ impl DockerHealth {
 /// The full reference threaded into `docker run` is composed by
 /// [`gateway_image_tag_for_version`] using the daemon's compile-time
 /// `CARGO_PKG_VERSION` so production session-create never resolves
-/// the bare repository name as `:latest` — the daemon-productionization
-/// spec § 8.1 forbids unpinned references.
+/// the bare repository name as `:latest` — unpinned image references
+/// are forbidden.
 pub const GATEWAY_IMAGE_REPOSITORY: &str = "sandbox-gateway";
 
 /// Compose the full `sandbox-gateway:<daemon_version>` image tag from a
@@ -207,7 +207,7 @@ pub fn gateway_image_present(tag: &str) -> Result<bool, SandboxError> {
 /// the missing tag.
 pub fn missing_gateway_image_hint(tag: &str) -> String {
     format!(
-        "gateway image missing: {tag} — run 'sandbox update' to load (Spec 5), \
+        "gateway image missing: {tag} — run 'sandbox update' to load it, \
          or 'docker load < gateway-image.tar' for the manual path"
     )
 }
@@ -259,9 +259,6 @@ pub const GATEWAY_ENVOY_PORT: u16 = 10000;
 /// connections to destinations *not* matched by a policy `allow` rule are
 /// DNAT'd here; the deny-logger reads `SO_ORIGINAL_DST`, emits a structured
 /// `deny` event, and closes the socket with RST.
-///
-/// See spec `.tasks/specs/2026-04-21-port-explicit-policies-presets-observability-design.md`
-/// Part 3 § "Listener design".
 pub const GATEWAY_DENY_LOGGER_TCP_PORT: u16 = 10001;
 
 /// NFLOG group the kernel emits dropped-UDP packets on. Denied UDP
@@ -1312,9 +1309,9 @@ impl GatewayManager {
     /// Order matches the historical wait order (Envoy → CoreDNS →
     /// mitmproxy) with deny-logger appended last. deny-logger is the
     /// data-path ingress for deny traffic and binds on the gateway
-    /// bridge IP rather than 127.0.0.1 (spec 2026-04-21 Part 3 /
-    /// "Deny-logger component / Listener design"), so its probe goes
-    /// through `$(hostname -i)`.
+    /// bridge IP rather than 127.0.0.1 (PREROUTING DNAT to loopback is
+    /// dropped by the kernel as a martian), so its probe goes through
+    /// `$(hostname -i)`.
     fn wait_for_components(&self, session_id: &SessionId) -> Result<(), SandboxError> {
         let container_name = container_name(session_id);
         let deadline = Instant::now() + COMPONENT_READY_TIMEOUT;
@@ -1454,8 +1451,7 @@ pub const KNOWN_COMPONENTS: &[(&str, &str)] = &[
 /// bind on that address rather than 127.0.0.1 (PREROUTING DNAT to
 /// loopback is dropped by the kernel as a martian destination unless
 /// `route_localnet=1` is set, which the gateway container does not
-/// enable — see spec 2026-04-21 Part 3 / "Deny-logger component /
-/// Listener design"). The same pattern is used by the container's
+/// enable). The same pattern is used by the container's
 /// `healthcheck.sh` and `entrypoint.sh`.
 pub fn component_probe(component: &str) -> Option<&'static [&'static str]> {
     match component {

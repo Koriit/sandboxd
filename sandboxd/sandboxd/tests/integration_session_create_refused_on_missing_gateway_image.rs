@@ -1,7 +1,7 @@
 //! HTTP-level coverage for the missing-gateway-image refusal on
 //! `POST /sessions`.
 //!
-//! Spec 3 § 11.6 lists `integration_session_create_refused_on_missing_gateway_image`
+//! the documented contract lists `integration_session_create_refused_on_missing_gateway_image`
 //! as the wire-shape complement to the primitive-level
 //! `integration_session_create_image_contracts.rs` test in
 //! `sandbox-core/tests/`. The primitive test pins the daemon-side
@@ -210,7 +210,7 @@ async fn http_post_json(
 // Test
 // ---------------------------------------------------------------------------
 
-/// Spec 3 § 11.6 — `integration_session_create_refused_on_missing_gateway_image`.
+/// the documented contract — `integration_session_create_refused_on_missing_gateway_image`.
 ///
 /// Spawn the daemon with `SANDBOX_GATEWAY_TAG_OVERRIDE` set to a
 /// guaranteed-absent tag (timestamp-suffixed so this run never depends
@@ -269,7 +269,7 @@ async fn integration_session_create_refused_on_missing_gateway_image() {
     let (status, body_bytes) =
         http_post_json(&daemon.socket, "/sessions", body, Duration::from_secs(15)).await;
 
-    // Spec § 11.6: refusal status maps via `error_response` to 500.
+    // .
     assert_eq!(
         status,
         hyper::StatusCode::INTERNAL_SERVER_ERROR,

@@ -1,12 +1,11 @@
 //! In-memory `GET /backends` cache scoped to one CLI invocation.
 //!
-//! Spec § "CLI learns capabilities via `GET /backends`" mandates the CLI
-//! fetch the daemon's capability matrix once per invocation, cache it
-//! for the invocation's lifetime, and serve subsequent lookups locally.
-//! [`BackendsCache`] is that one place — every `Capabilities` lookup
-//! the CLI does (client-side validation, future `inspect -v` capability
-//! table) goes through this cache so the daemon sees exactly one
-//! `/backends` request per `sandbox` invocation.
+//! The CLI fetches the daemon's capability matrix once per invocation,
+//! caches it for the invocation's lifetime, and serves subsequent
+//! lookups locally. [`BackendsCache`] is that one place — every
+//! `Capabilities` lookup the CLI does (client-side validation, future
+//! `inspect -v` capability table) goes through this cache so the daemon
+//! sees exactly one `/backends` request per `sandbox` invocation.
 //!
 //! # Concurrency model
 //!
@@ -83,9 +82,9 @@ impl std::error::Error for BackendsCacheError {}
 ///
 /// `BackendsCache` is intentionally *not* `Clone`. Sharing a cache
 /// between independent code paths would tempt callers into thinking
-/// the cache is process-global; the spec's contract is "one fetch per
-/// invocation", which is most naturally enforced by passing a single
-/// owned `BackendsCache` down the create-handler call chain.
+/// the cache is process-global. "One fetch per invocation" is most
+/// naturally enforced by passing a single owned `BackendsCache` down
+/// the create-handler call chain.
 pub struct BackendsCache {
     socket: String,
     cached: Option<Vec<BackendInfo>>,

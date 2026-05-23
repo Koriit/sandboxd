@@ -18,7 +18,7 @@ set -eu
 # Shared constants — bootstrap copy of scripts/lib.sh.
 #
 # These constants MUST stay byte-identical to the values in
-# `scripts/lib.sh` (Spec 5 § 3.1.9). The drift-check test
+# `scripts/lib.sh`. The drift-check test
 # `tests/install-e2e/test_lib_sh_drift.py` enforces this.
 #
 # Why duplicate? `install.sh` is delivered via `curl ... | bash`, so the
@@ -70,8 +70,8 @@ __sandbox_lib_sh_path=$(__sandbox_lib_sh_resolve) && {
 DEFAULT_SOURCE_URL="https://github.com/Koriit/sandboxd/releases/download"
 LATEST_API_URL="https://api.github.com/repos/Koriit/sandboxd/releases/latest"
 
-# Install log destination. Defaults to `/var/log/sandbox-install.log`
-# (Spec 4 § 4.6). Operators on hosts where `/var/log` is read-only —
+# Install log destination. Defaults to `/var/log/sandbox-install.log`.
+# Operators on hosts where `/var/log` is read-only —
 # container-build chroots, read-only-root images, ephemeral CI VMs —
 # can override via `$SANDBOXD_INSTALL_LOG`. The override is honoured
 # verbatim; an empty or unset variable falls back to the canonical
@@ -229,7 +229,7 @@ setup_colors() {
 }
 
 ensure_install_log() {
-    # Create the install log on first run. Mode 0640 root:root; spec § 4.6.
+    # Create the install log on first run. Mode 0640 root:root.
     if [ -e "$INSTALL_LOG" ]; then
         return 0
     fi
@@ -596,7 +596,7 @@ pkg_name_for() {
 # Special-case URL hints appended after the install command — for
 # prereqs whose distro packages are commonly out-of-date or unavailable
 # in default repos and where upstream docs are the canonical install
-# path. Matches the example in spec § 4.4.6.
+# path.
 pkg_hint_for() {
     case "$1" in
         docker) echo "# or follow https://docs.docker.com/engine/install/" ;;

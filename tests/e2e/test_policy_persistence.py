@@ -8,7 +8,7 @@ persistence via ``SessionStore::{set_policy,get_policy,load_all_policies}``
 plus startup hydration in ``sandboxd::main`` before
 ``reconcile_networking`` runs closes this gap.
 
-This test covers spec § 6 "E2E test" end-to-end:
+This test covers 
 
 1. Create a session and apply a restrictive policy (allow ``example.com``
    only; everything else denied by the implicit default-deny).
@@ -24,7 +24,7 @@ This test covers spec § 6 "E2E test" end-to-end:
 Pattern follows ``test_networking.py::test_daemon_restart_recovery``
 for the restart mechanics (reuses the same stdout/stderr log files so the
 fixture can adopt the restarted process). Uses SIGTERM (not SIGKILL) per
-spec § 6 step 4: "Stop the daemon process (SIGTERM; await exit) and
+; await exit) and
 restart it with the same base_dir."
 
 These tests boot real Lima/QEMU VMs and are SLOW. Run with:

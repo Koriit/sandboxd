@@ -1,7 +1,7 @@
 # Plan vs Implementation Report
 
 **Generated:** 2026-04-16
-**Scope:** All milestones (M0-M9, F1) from `docs/session-plan.md`
+**Scope:** All milestones (M0-M9, F1)
 
 ## Summary
 
@@ -288,6 +288,6 @@
 
 ## Overall Assessment
 
-The implementation faithfully follows the session plan with well-justified deviations. Every milestone's exit criteria are met. The four major architectural pivots (TCP-over-SSH instead of vsock, 9p instead of virtio-fs, qemu-bridge-helper instead of QMP hot-add, docker exec instead of nsenter) all moved in the direction of simplicity and reduced privilege requirements. The M8.5 remediation milestone was the most significant unplanned addition -- it redesigned the privilege model after discovering Lima refuses root, resulting in a strictly more secure architecture.
+The implementation faithfully follows the milestone plan with well-justified deviations. Every milestone's exit criteria are met. The four major architectural pivots (TCP-over-SSH instead of vsock, 9p instead of virtio-fs, qemu-bridge-helper instead of QMP hot-add, docker exec instead of nsenter) all moved in the direction of simplicity and reduced privilege requirements. The M8.5 remediation milestone was the most significant unplanned addition -- it redesigned the privilege model after discovering Lima refuses root, resulting in a strictly more secure architecture.
 
 The only incomplete item is M9-S7 (Review 3), which was added to the plan but whose execution commit has not landed yet. F1 (macOS support) remains explicitly deferred and is not on the critical path.

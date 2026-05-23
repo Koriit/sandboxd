@@ -1,8 +1,8 @@
 //! `peercred-connector` — setuid-root test helper that forwards a
 //! request to the sandboxd unix socket under a caller-specified uid.
 //!
-//! Spec reference: `2026-05-11-api-session-isolation-guest-compat-design`
-//! § 9.2 (Multi-uid test harness for `SO_PEERCRED` — Lima VM path).
+//! Design reference: `2026-05-11-api-session-isolation-guest-compat-design`
+//! (multi-uid test harness for `SO_PEERCRED` — Lima VM path).
 //!
 //! ## Why this exists
 //!
@@ -16,7 +16,7 @@
 //!
 //! This helper is the second option. It is installed setuid-root
 //! inside the Lima E2E VM template (`install -o root -m 4755 .../`)
-//! by Spec 4 § 6's provisioning step, NEVER on the host CI runner or
+//! by provisioning, NEVER on the host CI runner or
 //! the developer workstation. It is not a privilege-cap'd production
 //! binary; it lives in `sandboxd/tests/helpers/`, not the workspace
 //! `[workspace.members]` list, and the release tarball never carries
@@ -36,7 +36,7 @@
 //!   transmitted verbatim; the helper does not parse or modify
 //!   them. Mandatory.
 //! - `--socket <path>` — daemon unix socket path. Defaults to
-//!   `/run/sandbox/sandboxd.sock` (Spec 3's production location).
+//!   `/run/sandbox/sandboxd.sock` (the production location).
 //!
 //! The helper:
 //!
@@ -132,7 +132,7 @@ const EXIT_RESPONSE_TOO_LARGE: u8 = 5;
 /// EOFs.
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
-/// Production default daemon socket path (Spec 3 § 5.2). The Lima
+/// Production default daemon socket path. The Lima
 /// VM template's `--socket` override is rarely needed; lite-mode
 /// dev hosts may pass `--socket` explicitly.
 const DEFAULT_SOCKET_PATH: &str = "/run/sandbox/sandboxd.sock";

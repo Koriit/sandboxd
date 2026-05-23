@@ -13,15 +13,15 @@
 //! (both shapes are perfectly valid policies) but would silently
 //! weaken the preset's posture.
 //!
-//! See `.tasks/specs/2026-04-21-port-explicit-policies-presets-observability-design.md`
-//! Part 2 § "Two method-filter postures" for the design rationale.
+//! The two postures reflect the consume-only vs. interactive access pattern:
+//! read-only registries need only GET/HEAD, while interactive hosts
+//! (e.g. github.com) need arbitrary methods.
 
 use sandbox_core::{HttpFilter, HttpMethod};
 
 /// The consume-only posture: `[GET /**, HEAD /**]`.
 ///
-/// Recursive-wildcard path matcher (Part 1 § "Path matcher
-/// semantics"): `/**` matches every request path under the host. The
+/// Recursive-wildcard path matcher: `/**` matches every request path under the host. The
 /// two-method split is deliberate — `HEAD` requests are used by
 /// package registries and CDN tooling for cheap existence / ETag
 /// probes, so allowing `HEAD` alongside `GET` matches the

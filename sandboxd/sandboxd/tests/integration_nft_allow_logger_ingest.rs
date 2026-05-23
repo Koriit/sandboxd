@@ -73,7 +73,7 @@ async fn next_event(
 /// - The `nft_logger` parser accepts `layer == "allow-logger"` paired
 ///   with `event == "allow"` and reuses the deny-logger 5-tuple shape.
 /// - `src_ip` attribution still goes through `vm_ip_map.lookup` (per
-///   spec Part 3 / "drop events on vm_ip miss"); a bound source IP must
+///   the wire format); a bound source IP must
 ///   resolve to the test session.
 /// - The shared `rate_limited` summary survives the layer rename — an
 ///   `allow-logger` rate-limited record carries no 5-tuple so it falls

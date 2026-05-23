@@ -1,10 +1,10 @@
 //! Integration test: `sandbox describe -v` renders a Capabilities
 //! block per session, fetched from the daemon's `/backends` endpoint.
 //!
-//! Spec § "sandbox inspect → -v view" (lines 769-775) — the human-
-//! readable detail view (the CLI's `describe` command, see handoff
-//! § "Spec/CLI nomenclature discrepancy") under `-v` shows the full
-//! capability matrix for each session's backend.
+//! The human-readable detail view (the CLI's `describe` command) under
+//! `-v` shows the full capability matrix for each session's backend.
+//! Note: the CLI calls this "Capabilities" while the daemon endpoint is
+//! `/backends` — the naming is intentionally distinct.
 //!
 //! This test pins the end-to-end wiring: the CLI subprocess fetches
 //! `/backends`, threads the matching `Capabilities` value through

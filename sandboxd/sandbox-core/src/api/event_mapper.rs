@@ -43,14 +43,14 @@ use super::event_dto::{
 /// Render a timestamp as RFC 3339 with millisecond precision and a `Z`
 /// suffix.
 ///
-/// Matches the spec's example `"2026-04-21T12:34:56.789Z"` exactly.
+/// Matches the example `"2026-04-21T12:34:56.789Z"` exactly.
 fn render_timestamp(ts: &DateTime<Utc>) -> String {
     ts.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 /// Render the envelope's `session` field.
 ///
-/// [`None`] → `""` per spec; [`Some`] → the 12-hex-char session id.
+/// [`None`] → `""` as designed; [`Some`] → the 12-hex-char session id.
 fn render_session(session: &Option<SessionId>) -> String {
     session
         .as_ref()
@@ -374,11 +374,11 @@ pub fn event_to_jsonl_line(event: &Event) -> Result<String, serde_json::Error> {
 // DTO wire-shape assertions
 // ---------------------------------------------------------------------------
 //
-// These tests pin the on-wire contract documented in spec Part 3 "Event
-// shape" / "Event categories". A failing assertion here is a signal that
-// some downstream consumer (CLI filter flag, HTTP endpoint, E2E test) will
+// These tests pin the on-wire contract (event wire format "Event shape" /
+// "Event categories"). A failing assertion here is a signal that some
+// downstream consumer (CLI filter flag, HTTP endpoint, E2E test) will
 // need coordinated updates — do not adjust these tests without
-// corresponding spec edits.
+// corresponding changes to the other consumers.
 
 #[cfg(test)]
 mod tests {
@@ -466,7 +466,7 @@ mod tests {
 
     #[test]
     fn dto_session_is_empty_string_when_prelifecycle() {
-        // `gateway_booting` precedes session attribution (spec Part 3,
+        // `gateway_booting` precedes session attribution (the event wire format,
         // "Event shape"). The envelope's `session` is None; the wire
         // renders it as `""`.
         let event = Event::Lifecycle {
@@ -481,14 +481,14 @@ mod tests {
             json["session"], "",
             "pre-session lifecycle events must serialize session as \"\""
         );
-        // Sanity-check the spec-mandated `layer` value is still there.
+        // Sanity-check the required `layer` value is still there.
         assert_eq!(json["layer"], "lifecycle");
     }
 
     #[test]
     fn dto_layer_field_matches_spec() {
         // Exhaustive check: every variant's serialized `layer` must be one
-        // of the spec's five values — `dns`, `envoy`, `mitmproxy`,
+        // of the five values — `dns`, `envoy`, `mitmproxy`,
         // `deny-logger`, `lifecycle`. No `sandboxd`, no `audit`, no
         // surprises. Note the kebab-case on `deny-logger` (the only
         // multi-word layer name).
@@ -561,10 +561,10 @@ mod tests {
 
     #[test]
     fn dto_event_field_matches_spec_per_variant() {
-        // Full enumeration of every event string the spec prescribes in
+        // Full enumeration of every event string the design prescribes in
         // Part 3 "Event categories". Each row asserts the variant
         // serializes its `event` discriminator character-for-character to
-        // the spec value.
+        // the design value.
         let envelope = EventEnvelope {
             timestamp: Utc.with_ymd_and_hms(2026, 4, 22, 9, 45, 0).unwrap(),
             session: Some(sid()),
@@ -788,10 +788,10 @@ mod tests {
 
     // ----- deny-logger -----------------------------------------------------
     //
-    // Wire shape comes from spec Part 3 "Traffic events" row for layer
+    // Wire shape comes from the wire format row for layer
     // `deny-logger`: the `deny` event carries `orig_dst_ip`,
     // `orig_dst_port`, `protocol` (`tcp`/`udp`), `src_ip`, `src_port`. The
-    // `rate_limited` summary event (spec § "Hardening rules" #5) carries
+    // `rate_limited` summary event carries
     // `rate_limited_count` and `since_ts`.
 
     #[test]
@@ -910,7 +910,7 @@ mod tests {
     #[test]
     fn dto_deny_logger_rate_limited_wire_shape() {
         // `rate_limited` summary event — `rate_limited_count` is the
-        // spec-authoritative field name (spec § "Hardening rules" #5).
+        // canonical wire field name.
         // `since_ts` must use the same RFC 3339 + ms + `Z` format as the
         // envelope timestamp.
         let ts = Utc.with_ymd_and_hms(2026, 4, 22, 9, 45, 0).unwrap()

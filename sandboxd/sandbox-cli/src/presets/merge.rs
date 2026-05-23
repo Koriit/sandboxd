@@ -6,12 +6,12 @@
 //! `github-repo:repo=foo/bar` both declare `api.github.com:443`), and
 //! user-preset repeatable fan-out can produce intra-preset duplicates
 //! too.  [`merge_effective`] is the gate that catches either shape and
-//! turns it into the spec-mandated error naming every contributing
+//! turns it into the required error naming every contributing
 //! source.
 //!
 //! # Semantics
 //!
-//! Mirrors spec Part 2 § "Semantics" (lines 344-362):
+//! Merge semantics (lines 344-362 of the event wire format spec):
 //!
 //! 1. Start with an empty `Vec<PolicyRule>`.
 //! 2. Extend with the policy file's rules (if any).
@@ -62,7 +62,7 @@ use super::{Catalog, DuplicateDestination, ParsedInvocation, Preset, PresetError
 
 /// Merge a policy file and a set of preset expansions into a single
 /// effective [`Policy`], enforcing `(host, port)` uniqueness with the
-/// spec-mandated source-attributed error shape.
+/// required source-attributed error shape.
 ///
 /// # Arguments
 ///
@@ -139,8 +139,8 @@ pub fn merge_effective(
         }
     }
 
-    // 2. Uniqueness pass.  Keyed on the rule's `(host, port)` identity
-    //    per spec Part 1 § "Identity and uniqueness".  A `Vec<usize>`
+    // 2. Uniqueness pass.  Keyed on the rule's `(host, port)` identity.
+    //    A `Vec<usize>`
     //    preserves first-seen order — so the duplicate error lists
     //    sources in the exact order they appeared in the merged list,
     //    which matches what the operator sees when they read the
@@ -366,7 +366,7 @@ mod tests {
             "error must mention api.github.com:443 collision, got:\n{rendered}"
         );
         // Each collision block names both preset invocations with the
-        // spec-mandated wording.
+        // required wording.
         assert!(
             rendered.contains("declared by preset invocation 'github:' (built-in 'github')"),
             "error must attribute to github: invocation, got:\n{rendered}"
@@ -401,8 +401,8 @@ mod tests {
         let err = merge_effective(Some(&file), Some(&file_path), &catalog, &expansions)
             .expect_err("file/preset overlap must error");
 
-        // Golden-string assertion — the exact wording Part 1 § "Error
-        // shape for duplicates" (lines 140-150) pins down, with file
+        // Golden-string assertion — the exact wording (lines 140-150 of the
+        // policy-rule spec) pins the error shape, with file
         // path first (it was the first-seen source) and built-in
         // preset invocation second.
         assert_eq!(

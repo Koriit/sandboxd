@@ -5,9 +5,7 @@
 # CoreDNS in the design-specified order, waits for readiness, then
 # monitors all processes.
 #
-# Startup order (per networking-design.md § Component lifecycle + spec
-# 2026-04-21 Part 3 / "Deny-logger component" + 2026-05-01 UDP nft-
-# loggers spec):
+# Startup order:
 #   1. mitmproxy        (must be ready before Envoy, which forwards to it)
 #   2. Envoy            (must be ready before DNS, which triggers resolution)
 #   3. nft-deny-logger  (must be ready before VM traffic starts —
@@ -15,8 +13,7 @@
 #                        :10001 and the kernel mirrors denied UDP via
 #                        NFLOG group 1; HEALTHCHECK probes :10003)
 #   3'. nft-allow-logger (started in parallel with the deny-logger; the
-#                        two are independent failure domains per
-#                        spec 2026-05-01 Decision 4. Owns the NFCT
+#                        two are independent failure domains. Owns the NFCT
 #                        subscription on `NFNLGRP_CONNTRACK_NEW`,
 #                        emitting one JSONL `allow` record per new
 #                        UDP flow; HEALTHCHECK probes :10004. Both
@@ -209,8 +206,7 @@ wait_for_ready "Envoy" "curl -sf http://127.0.0.1:9901/ready"
 # bridge IP — NOT 127.0.0.1. For the deny-logger this is load-bearing:
 # PREROUTING DNAT to loopback is dropped by the kernel as a martian
 # destination unless `route_localnet=1` is enabled on the ingress
-# interface, which the gateway container does not enable (see spec
-# 2026-04-21 Part 3 / "Deny-logger component / Listener design"). The
+# interface, which the gateway container does not enable. The
 # allow-logger doesn't have a DNAT'd listener (its only socket is
 # `/health`), but it binds the same way for symmetry with the
 # HEALTHCHECK probe (which discovers the bridge IP via `hostname -i`).
@@ -245,7 +241,7 @@ log "Discovered gateway bridge IP: ${GATEWAY_IP}"
 # without per-file configuration.
 #
 # Filename note: both producers write under
-# their spec-mandated names — `nft-deny.jsonl` and `nft-allow.jsonl`.
+# their canonical names — `nft-deny.jsonl` and `nft-allow.jsonl`.
 # The daemon-side ingest watcher's known-producer list at
 # `sandbox-core/src/events/ingest/watcher.rs` keys on these literal
 # filenames; both binaries' `--event-path` clap defaults match.

@@ -16,7 +16,7 @@
 //! out of scope — `QEMU_BRIDGE_HELPER_PATH` there is install
 //! metadata, not daemon config. The tests below only scan source.
 //!
-//! Spec reference: daemon-productionization §§ 9.1-9.3 + § 11.5.
+//! Design reference: daemon-productionization (QEMU wrapper removal + image pinning).
 
 use std::fs;
 use std::path::{Path, PathBuf};

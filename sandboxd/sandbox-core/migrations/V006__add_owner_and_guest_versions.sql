@@ -1,5 +1,5 @@
 -- V006__add_owner_and_guest_versions.sql
--- Spec 2: API session isolation + guest version compatibility.
+-- V006: API session isolation + guest version compatibility.
 --
 -- This migration is destructive on the dev-mode upgrade path: it deletes
 -- every existing row in `sessions` and its policy-cascade descendants
@@ -8,8 +8,8 @@
 --   * Dev sessions are volatile (stopped VMs are routinely thrown away).
 --   * The backfill marker leaks an unresolvable owner name into the
 --     filter and would force a "treat __legacy__ as any caller" carve-out
---     that contradicts the spec's only-own-sessions rule.
---   * End-user installs (Spec 4) are greenfield — there is no `sessions.db`
+--     that contradicts the per-caller isolation rule.
+--   * End-user installs are greenfield — there is no `sessions.db`
 --     to migrate. The destructive step only fires on developer machines
 --     that already have a stopped-session row from before V006.
 --

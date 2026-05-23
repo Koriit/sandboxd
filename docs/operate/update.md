@@ -5,7 +5,7 @@ description: Operator walkthrough of `sandbox update` — pre-flight checks, the
 
 `sandbox update` applies an in-place upgrade of the sandboxd binaries, systemd unit, and configuration migrations. It is idempotent: re-running after an interrupted upgrade converges to the same end state without operator intervention. This page is the operator's reference for what the command does, what it leaves behind, and how to recover if something goes wrong.
 
-For the per-flag CLI reference, see [`sandbox update`](/sandboxd/reference/cli/#sandbox-update). For the per-step engineering specification, see Spec 5 (in the repository under `.tasks/specs/`).
+For the per-flag CLI reference, see [`sandbox update`](/sandboxd/reference/cli/#sandbox-update).
 
 ## Operator preconditions
 

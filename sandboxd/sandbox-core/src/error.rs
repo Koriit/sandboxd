@@ -45,15 +45,13 @@ pub enum SandboxError {
     /// --force-rootless-docker`. Container-backend session creation
     /// is refused because rootless Docker enables userns-remap, which
     /// shifts ownership of bind-mounted workspace files in ways that
-    /// the spec § Workspace UID-alignment contract does not cover.
+    /// the workspace UID-alignment contract does not cover.
     ///
-    /// Spec reference: § Non-goals line 1195 — "Lite's target is
-    /// default-hardened Docker. The daemon refuses session-create on
-    /// rootless Docker by default; `sandbox create
-    /// --force-rootless-docker` is an explicit per-invocation escape
-    /// hatch for users who accept they are operating outside the
-    /// supported envelope. Alternative runtimes are a separate
-    /// design."
+    /// Rootless Docker is out of scope for the lite container backend:
+    /// the daemon refuses session-create on rootless Docker by default.
+    /// `sandbox create --force-rootless-docker` is an explicit
+    /// per-invocation escape hatch for users who accept operating
+    /// outside the supported envelope.
     ///
     /// The variant carries no payload because the rejection text is a
     /// fixed contract message; the `Display` impl renders it
@@ -64,11 +62,10 @@ pub enum SandboxError {
     /// HTTP mapping: `400 Bad Request` (request invalid for the host
     /// environment), per the daemon's `error_response` helper.
     #[error(
-        "rootless docker is not supported (spec § Non-goals line 1195 — \
+        "rootless docker is not supported — \
         Lite's target is default-hardened Docker; alternative runtimes \
-        are a separate design); pass `sandbox create \
-        --force-rootless-docker` to opt in per-invocation if you accept \
-        operating outside the supported envelope"
+        are outside the supported envelope. Pass `sandbox create \
+        --force-rootless-docker` to opt in per-invocation"
     )]
     RootlessDockerRefused,
 
@@ -84,7 +81,7 @@ pub enum SandboxError {
     ///
     /// The literal tokens `refresh is not viable` and
     /// `recreate the session` are load-bearing for the integration
-    /// tests pinned in the api-session-isolation spec § 7.5.
+    /// tests pinned in the per-caller isolation.5.
     #[error(
         "session {session_id} was created with guest protocol {session_proto}; \
         daemon supports {daemon_proto}; refresh is not viable for this session \
@@ -209,11 +206,10 @@ mod tests {
 
     #[test]
     fn rootless_docker_refused_display_carries_machine_greppable_token() {
-        // The daemon's container-backend gate cites § Non-goals line
-        // 1195 and points at `--force-rootless-docker`. Test
-        // assertions across waves match on the lowercase
-        // `rootless docker` substring, so any rewording of the
-        // Display string must keep that token intact.
+        // The daemon's container-backend gate and downstream test
+        // assertions match on `rootless docker` (lowercase) and
+        // `--force-rootless-docker`. Rewording the Display string
+        // must keep both tokens intact.
         let err = SandboxError::RootlessDockerRefused;
         let msg = err.to_string();
         assert!(
@@ -224,15 +220,11 @@ mod tests {
             msg.contains("--force-rootless-docker"),
             "missing escape-hatch flag pointer: {msg}"
         );
-        assert!(
-            msg.contains("§ Non-goals line 1195"),
-            "missing spec citation: {msg}"
-        );
     }
 
     #[test]
     fn guest_protocol_incompatible_display_carries_load_bearing_tokens() {
-        // The api-session-isolation spec § 7.5 integration tests assert
+        // The per-caller isolation.5 integration tests assert
         // both `refresh is not viable` and `recreate the session` as
         // substrings of the response body. The full Display string is
         // generated from the `#[error(...)]` template above; this test
@@ -266,7 +258,7 @@ mod tests {
 
     #[test]
     fn users_config_schema_too_new_maps_to_invalid_argument_with_clear_display() {
-        // Spec 5 § 4.7 + § 13: the daemon-startup validator's two
+        // Daemon-startup validator's two
         // schema-mismatch variants ride through the same
         // `From<UsersConfigError> for SandboxError` mapping the rest of
         // the loader uses (`to_string()` → `InvalidArgument`). The load-

@@ -230,7 +230,7 @@ def make_create_args(backend: str, name: str, *extra: str) -> tuple[str, ...]:
     ``_VM_RESOURCE_ARGS`` and uses no flag.
     For ``backend == "container"``, passes ``--lite`` and skips the
     Lima-specific resource args (the lite backend uses host-80%
-    defaults — see spec § "Resource defaults", line ~620).
+    defaults — see , line ~620).
 
     Tests should call this from inside a parametrized test that takes
     the ``backend`` fixture::

@@ -246,7 +246,7 @@ def test_lima_guest_refresh_backend(sandbox_cli):
     HTTP endpoint.  ``start_session`` (the ``sandbox start`` handler)
     internally calls ``runtime.refresh_guest_binary`` when the persisted
     guest protocol version does not match the daemon's compiled-in
-    constant (spec § 7.5 / Spec 2 § 3.3).
+    constant.
 
     This test exercises the nearest observable equivalent:
     1. ``sandbox create`` — create + start the session.

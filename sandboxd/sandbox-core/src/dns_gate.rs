@@ -1,8 +1,7 @@
 //! Synchronous DNS-policy gate IPC.
 //!
-//! This module implements the sandboxd side of the gate handshake
-//! described in
-//! `.tasks/specs/2026-04-25-synchronous-dns-policy-gating-design/`. The
+//! This module implements the sandboxd side of the synchronous DNS-policy
+//! gate handshake. The
 //! CoreDNS plugin holds the VM's DNS answer until sandboxd has applied
 //! the corresponding nft / Envoy state and acked.
 //!
@@ -72,7 +71,7 @@ pub enum GateRequestKind {
 
 /// CoreDNS → sandboxd gate request.
 ///
-/// Field shapes mirror the spec's wire-format table; see the spec's
+/// Field shapes mirror the wire-format table; see the
 /// "Wire format" section for the full contract.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GateRequest {
@@ -504,10 +503,10 @@ mod tests {
     #[test]
     fn request_round_trips_through_json() {
         // Codec stability: the on-wire representation must remain
-        // backwards-compatible with the spec fixture.
+        // backwards-compatible with the design fixture.
         let req = sample_request();
         let s = serde_json::to_string(&req).unwrap();
-        // Sanity-check key fields show up snake_case as the spec
+        // Sanity-check key fields show up snake_case as the design
         // specifies.
         assert!(s.contains("\"kind\":\"propagate_and_ack\""));
         assert!(s.contains("\"version\":1"));

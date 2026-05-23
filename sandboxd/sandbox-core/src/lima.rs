@@ -1454,8 +1454,7 @@ provision:
                 // arbitrary YAML via crafted directory names containing
                 // quotes, newlines, or other YAML-special characters.
                 // The same sanitization story applies symmetrically to
-                // the operator-supplied `guest_path` (per spec
-                // § "Lima Backend / Shared mount block").
+                // the operator-supplied `guest_path`.
                 let safe_host = sanitize_yaml_path(host_path);
                 let safe_guest = sanitize_yaml_path(guest_path);
                 // `securityModel` defaults to `mapped-xattr` when the
@@ -3077,7 +3076,7 @@ mod tests {
     // shape so a future contributor cannot silently reintroduce the
     // hardcoded path or the rootless wrapper.
     //
-    // Spec reference: daemon-productionization §§ 9.1-9.3 + § 11.5.
+    // Design reference: daemon-productionization (QEMU wrapper + image pinning).
     // ---------------------------------------------------------------
 
     /// The `-netdev bridge,…` line emits no `helper=` parameter. The

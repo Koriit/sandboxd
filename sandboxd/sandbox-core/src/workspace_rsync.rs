@@ -9,8 +9,6 @@
 //!
 //! ## Argv shape
 //!
-//! Per spec § Default rsync invocation:
-//!
 //! ```text
 //! rsync -aL --delete --filter=':- .gitignore' \
 //!   -e <shell-transport> --mkpath \
@@ -19,30 +17,28 @@
 //!
 //! where `<shell-transport>` is `limactl shell` (Lima) or
 //! `docker exec -i` (container). The `--filter=':- .gitignore'` flag is
-//! dropped when `no_gitignore == true`. Both `<host>` and `<guest>` are
-//! given trailing `/` per spec § Trailing-slash rule so rsync mirrors
-//! directory contents rather than the directory entry itself.
-//! `--mkpath` (rsync ≥ 3.2.3) delegates parent-directory creation to
-//! rsync; the base + lite images ship rsync 3.2.7+ via cloud-init.
+//! dropped when `no_gitignore == true`. Both `<host>` and `<guest>` carry
+//! a trailing `/` so rsync mirrors directory contents rather than the
+//! directory entry itself. `--mkpath` (rsync ≥ 3.2.3) delegates
+//! parent-directory creation to rsync; the base + lite images ship
+//! rsync 3.2.7+ via cloud-init.
 //!
 //! ## Cancellation
 //!
 //! The spawned `rsync` child is tagged `kill_on_drop(true)`. When the
 //! HTTP request future is dropped (operator Ctrl+C, daemon SIGTERM
 //! during graceful shutdown, CLI HTTP timeout), `tokio::process::Child`
-//! sends `SIGKILL` to the rsync process — see spec § Cancellation and
-//! timeout.
+//! sends `SIGKILL` to the rsync process after a cancellation timeout.
 //!
 //! ## Error mapping
 //!
 //! Non-zero rsync exits collapse to
 //! `SandboxError::Internal(format!("local-workspace rsync failed (exit
-//! {code}): {stderr}"))` per spec § Rsync invocation → Exit codes.
-//! All non-zero exits are fatal (codes 23 "partial transfer" and 24
-//! "vanished source" are not special-cased — the uniform "all-non-zero-
-//! fatal" rule keeps the contract simple). The captured stderr is
-//! decoded lossy (UTF-8 with U+FFFD replacement chars) so binary noise
-//! never panics the error path.
+//! {code}): {stderr}"))`. All non-zero exits are fatal (codes 23
+//! "partial transfer" and 24 "vanished source" are not special-cased —
+//! the uniform "all-non-zero-fatal" rule keeps the contract simple). The
+//! captured stderr is decoded lossy (UTF-8 with U+FFFD replacement chars)
+//! so binary noise never panics the error path.
 
 use std::process::Stdio;
 
@@ -82,7 +78,7 @@ pub enum Direction {
 ///   the shell transport. Concatenated into the
 ///   `sandbox-<name>:<path>/` remote spec.
 /// - `host_path` — host-side root. Trailing slash appended by the
-///   builder if absent (spec § Trailing-slash rule).
+///   builder if absent.
 /// - `guest_path` — guest-side root. Same trailing-slash rule.
 /// - `direction` — push vs pull. Drives src/dst ordering and the
 ///   `sandbox-<name>:<guest>/` token's position.
@@ -120,8 +116,7 @@ pub struct WorkspaceRsyncOptions {
 /// operator-facing planner prepends `"rsync"` itself so its test
 /// fixtures and operator diagnostics see the full argv.
 ///
-/// Wire shape (spec § Default rsync invocation, § Push/pull commands
-/// → Argv layout):
+/// Argv layout:
 ///
 /// ```text
 /// [-aL | -a --safe-links] --delete [--filter=:- .gitignore]
@@ -132,7 +127,7 @@ pub struct WorkspaceRsyncOptions {
 /// (container, with `-i` forwarding stdin so rsync's binary protocol
 /// speaks both ways; no `-t` because a TTY would line-buffer and
 /// corrupt the wire format). Trailing slashes are appended to both
-/// endpoints if absent (spec § Trailing-slash rule).
+/// endpoints if absent.
 pub fn build_workspace_rsync_argv(opts: &WorkspaceRsyncOptions) -> Vec<String> {
     // Shell-transport: `-e <transport>` slots in as rsync's remote-
     // shell exec, matching the convention `plan_sync_command` uses
@@ -146,7 +141,7 @@ pub fn build_workspace_rsync_argv(opts: &WorkspaceRsyncOptions) -> Vec<String> {
         BackendKind::Container => "docker exec -i",
     };
 
-    // Trailing-slash rule (spec § Trailing-slash rule): both
+    // Trailing-slash rule: both
     // endpoints always carry `/` so rsync mirrors the *contents* of
     // the directory rather than the directory entry itself. We
     // append only when absent so caller-supplied paths that already
@@ -181,20 +176,17 @@ pub fn build_workspace_rsync_argv(opts: &WorkspaceRsyncOptions) -> Vec<String> {
     } else {
         // `-a` — archive (perms, ownership, times, recursion).
         // `-L` — follow symlinks during transfer (copy resolved
-        // files). Same baseline the spec defines for both create-
+        // files). Same baseline the design defines for both create-
         // time push and operator-driven push/pull.
         argv.push("-aL".to_string());
     }
     // `--delete` — mirror semantics: destination entries absent on
     // the source are removed. Combined with `--filter`, gitignored
-    // destination entries are protected from deletion (spec §
-    // Default rsync invocation).
+    // destination entries are protected from deletion.
     argv.push("--delete".to_string());
     if !opts.no_gitignore {
         // Per-directory merge of `.gitignore` files; matched entries
         // are excluded from both transfer and deletion consideration.
-        // Spec § Filter interaction documents the operator-facing
-        // semantics.
         argv.push("--filter=:- .gitignore".to_string());
     }
     argv.push("-e".to_string());
@@ -228,7 +220,7 @@ pub fn build_workspace_rsync_argv(opts: &WorkspaceRsyncOptions) -> Vec<String> {
 /// until rsync exits or the future is dropped. Drop semantics: the
 /// underlying [`tokio::process::Child`] is tagged `kill_on_drop(true)`,
 /// so a dropped request future tears the rsync child down via
-/// `SIGKILL` (spec § Cancellation and timeout).
+/// `SIGKILL`.
 ///
 /// `session_name` is the `sandbox-<id>` form the backends accept on the
 /// shell transport. Callers in `sandboxd::create_session` build it as
@@ -278,7 +270,7 @@ pub async fn run_initial_push(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // Request future drop ⇒ child killed. Spec § Cancellation and
+        // Request future drop ⇒ child killed.
         // timeout: no daemon-side `tokio::time::timeout`; the operator-
         // facing budget is the CLI's `CLI_HTTP_TIMEOUT`.
         .kill_on_drop(true);
@@ -297,10 +289,8 @@ pub async fn run_initial_push(
         .ok_or_else(|| SandboxError::Internal("failed to capture rsync stderr".into()))?;
 
     // Drain stdout line-by-line to INFO so daemon-log consumers see
-    // transfer summaries (spec § Rsync invocation → Stdout). Stderr is
-    // accumulated for the error path so non-zero exits can surface the
-    // operator-facing diagnostic verbatim (spec § Rsync invocation →
-    // Stderr).
+    // transfer summaries. Stderr is accumulated for the error path so
+    // non-zero exits can surface the operator-facing diagnostic verbatim.
     let stdout_task = tokio::spawn(async move {
         let mut reader = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = reader.next_line().await {
@@ -456,7 +446,7 @@ mod tests {
         );
     }
 
-    /// Trailing-slash rule (spec § Trailing-slash rule): both source
+    /// Trailing-slash rule: both source
     /// and destination always end with `/`. This test pins the rule
     /// when the caller passes paths *without* trailing slashes — the
     /// builder must append them.
@@ -495,7 +485,7 @@ mod tests {
     }
 
     /// `--mkpath` is present in the create-time-push argv (Phase 3
-    /// picks the rsync-driven parent-create path per spec § Parent-
+    /// picks the rsync-driven parent-create path per the design
     /// directory creation, since base + lite images ship rsync ≥
     /// 3.2.7). Operator-driven push/pull opts out via
     /// `mkpath: false` because the destination should already exist.

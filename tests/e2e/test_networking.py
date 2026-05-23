@@ -181,8 +181,8 @@ def _probe_gateway_tcp(sandbox_cli, name: str, ip: str, port: int = 53,
     Replaces the legacy ``ping <gateway_ip>`` check used across the
     M3 networking suite. ``ping`` relies on raw ICMP sockets, which
     require ``CAP_NET_RAW`` — but the lite container backend's
-    spec-mandated hardening posture drops every Linux capability
-    (spec § Hardening line 547: ``--cap-drop ALL``) and § "What this
+    required hardening posture drops every Linux capability
+    and § "What this
     breaks" line 561-562 explicitly enumerates ``ping`` as a
     by-design forbidden tool: *"Raw network sockets. ``CAP_NET_RAW``
     dropped; ``ping`` and similar tools fail."* The Lima backend
@@ -287,7 +287,7 @@ def test_gateway_traffic_flow(sandbox_cli, backend):
         # 4. Verify the session can reach its gateway IP. Backend-neutral
         #    TCP probe to the gateway's CoreDNS listener (port 53),
         #    replacing the legacy ICMP ping — `CAP_NET_RAW` is dropped on
-        #    the lite container backend (spec § Hardening line 561-562),
+        #    the lite container backend,
         #    so ping is by-design unavailable there. See
         #    `_probe_gateway_tcp` for the rationale.
         reach_result = _probe_gateway_tcp(sandbox_cli, "net-flow-test", gateway_ip)
@@ -729,7 +729,7 @@ def test_stop_start_with_networking(sandbox_cli, backend):
         #    drift here is a daemon-side regression. The reachability
         #    probe targets gateway TCP/53 (CoreDNS) instead of ICMP
         #    ping; the lite container backend drops `CAP_NET_RAW` per
-        #    spec § Hardening line 561-562, so ping is by-design
+        #    , so ping is by-design
         #    unavailable there. See `_probe_gateway_tcp` for the
         #    rationale.
         post_restart_net = inspect_session_network(sandbox_cli, "net-restart-test")
@@ -874,7 +874,7 @@ def test_concurrent_sessions(sandbox_cli):
         # 6. Verify both can reach their respective gateways. TCP probe
         #    to the gateway's CoreDNS listener (port 53), replacing the
         #    legacy ICMP ping — `CAP_NET_RAW` is dropped on the lite
-        #    container backend (spec § Hardening line 561-562), so ping
+        #    container backend, so ping
         #    is by-design unavailable there. See `_probe_gateway_tcp`
         #    for the rationale.
         reach_a = _probe_gateway_tcp(sandbox_cli, "net-multi-a", gw_ip_a)
@@ -895,7 +895,7 @@ def test_concurrent_sessions(sandbox_cli):
         #    by the gateway's prerouting nftables ruleset
         #    (``sandbox-core/src/gateway.rs:1462-1486``), so a Lima ping
         #    cleanly observes the no-route-to-host outcome. The
-        #    container backend drops ``CAP_NET_RAW`` (spec § Hardening
+        #    container backend drops ``CAP_NET_RAW`` (
         #    line 561-562) and DNATs every TCP/UDP packet from the
         #    session's saddr — making this leg untestable there, which
         #    is why the whole test is Lima-marked at the top.
@@ -1161,7 +1161,7 @@ def test_gateway_crash_recovery(sandbox_cli, backend):
         # Verify the session can reach its gateway after crash recovery.
         # Backend-neutral TCP probe to gateway TCP/53 (CoreDNS) — replaces
         # the prior backend-conditional ping (skipped on container per
-        # spec § Hardening line 561-562: `CAP_NET_RAW` dropped, ping
+        # , ping
         # by-design fails on the lite container backend). The TCP probe
         # works on both backends without raw sockets; see
         # `_probe_gateway_tcp` for the rationale.

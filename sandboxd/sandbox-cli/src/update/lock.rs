@@ -1,18 +1,17 @@
-//! `sandbox update` lock file — Spec 5 § 6.
+//! `sandbox update` lock file.
 //!
 //! Path: `/var/lib/sandbox/.update.lock`. Mode `0664 sandbox:sandbox`.
 //! Persistent across reboots (under `/var/lib/`, not `/run/`) so re-runs
 //! can detect and adopt a dead-PID predecessor.
 //!
-//! The acquisition strategy follows § 6.2.1 pseudo-code: take a
-//! non-blocking advisory `flock` via `flock(2)` on a file descriptor we
-//! keep open in-process, *then* read the existing JSON payload, decide
-//! whether this is a fresh acquisition or a dead-PID adoption, and
-//! write the new payload. The "flock first, then read-and-write
-//! payload" ordering rule is binding (§ 6.2.2): no racing process can
-//! observe a partial payload while we hold the exclusive lock.
+//! The acquisition strategy: take a non-blocking advisory `flock` via
+//! `flock(2)` on a file descriptor we keep open in-process, *then* read
+//! the existing JSON payload, decide whether this is a fresh acquisition
+//! or a dead-PID adoption, and write the new payload. The "flock first,
+//! then read-and-write payload" ordering rule is binding: no racing
+//! process can observe a partial payload while we hold the exclusive lock.
 //!
-//! The `was_running` flag is *sticky* (§ 6.4): on dead-PID adoption we
+//! The `was_running` flag is *sticky*: on dead-PID adoption we
 //! preserve the predecessor's value verbatim rather than re-evaluating
 //! `systemctl is-active` (which would always read `inactive` after the
 //! stop-daemon step).
@@ -38,10 +37,10 @@ use nix::fcntl::flock;
 use nix::sys::signal::kill;
 use nix::unistd::Pid;
 
-/// Canonical lock-file path. Spec 5 § 6.1.
+/// Canonical lock-file path.
 pub const LOCK_PATH: &str = "/var/lib/sandbox/.update.lock";
 
-/// Stale-payload threshold (§ 6.2.1 step 3): a payload older than this
+/// Stale-payload threshold: a payload older than this
 /// triggers an `adopt-stale` log line but is otherwise treated like a
 /// normal dead-PID adoption.
 pub const STALE_THRESHOLD: Duration = Duration::from_secs(24 * 60 * 60);
@@ -50,7 +49,7 @@ pub const STALE_THRESHOLD: Duration = Duration::from_secs(24 * 60 * 60);
 // Payload
 // ---------------------------------------------------------------------------
 
-/// JSON shape of the lock file's payload (§ 6.1).
+/// JSON shape of the lock file's payload.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LockPayload {
     pub pid: u32,
@@ -67,7 +66,7 @@ pub struct LockPayload {
 /// Why a `LockOwner::acquire` call could not produce a held lock.
 #[derive(Debug, thiserror::Error)]
 pub enum LockError {
-    /// Another live process holds the lock. Refuse — § 6.2.3 row 2.
+    /// Another live process holds the lock. Refuse.
     #[error("another sandbox update is in progress (pid {pid}); wait for it to finish.")]
     HeldByLivePid { pid: u32 },
     /// Could not acquire the kernel `flock` even after the dead-PID
@@ -91,7 +90,7 @@ pub enum LockError {
 }
 
 /// How the acquisition resolved — surfaced for the log line emitted by
-/// the caller (§ 6.2.1 step 4: `step=acquire_lock ... action=<acquire|adopt|adopt-stale>`).
+/// the caller (`step=acquire_lock ... action=<acquire|adopt|adopt-stale>`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcquisitionKind {
     /// Fresh acquisition: file was absent or the prior payload was
@@ -116,10 +115,9 @@ pub enum AcquisitionKind {
 ///
 /// Drop semantics: closing the inner `File` releases the kernel `flock`;
 /// we also best-effort `unlink` the path so a successful run leaves no
-/// stale payload (§ 6.3). For aborted runs the `Drop` path also
+/// stale payload. For aborted runs the `Drop` path also
 /// removes the file — but the dead-PID adoption flow is designed to
-/// handle the case where a `Drop` did not run (process killed mid-flight),
-/// see § 6.3.
+/// handle the case where a `Drop` did not run (process killed mid-flight).
 #[derive(Debug)]
 pub struct UpdateLock {
     /// The open FD; kept alive for the lifetime of the value so the
@@ -182,8 +180,8 @@ pub struct AcquireParams<'a> {
     pub target_version: &'a str,
     pub from_version: &'a str,
     /// Closure returning the current `systemctl is-active sandboxd`
-    /// reading. Only invoked on the fresh-acquisition branch (§ 6.4
-    /// step 1). The adoption branch reads the prior payload's value.
+    /// reading. Only invoked on the fresh-acquisition branch.
+    /// The adoption branch reads the prior payload's value.
     pub probe_was_running: &'a dyn Fn() -> bool,
     /// Closure returning `true` iff the given PID is currently alive
     /// (`kill -0`). Injected for tests; production uses
@@ -219,9 +217,9 @@ pub fn pid_is_live(pid: u32) -> bool {
     }
 }
 
-/// Acquire the lock. Implements § 6.2.1.
+/// Acquire the lock.
 ///
-/// Outcomes (§ 6.2.3):
+/// Outcomes:
 ///   * File absent or stale-and-dead → fresh / adopt[-stale] acquisition;
 ///     returns `Ok(UpdateLock)`.
 ///   * `flock -n` fails and the prior PID is alive → `Err(HeldByLivePid)`.
@@ -229,12 +227,12 @@ pub fn pid_is_live(pid: u32) -> bool {
 ///     retry succeeds we adopt; otherwise `Err(BusyAfterRetry)`.
 pub fn acquire(params: AcquireParams<'_>) -> Result<UpdateLock, LockError> {
     // Step 1: Open the file `O_RDWR|O_CREAT`. The on-disk mode of a
-    // freshly-created file is `0664` (the spec-pinned shape); we set
+    // freshly-created file is `0664` (the design-pinned shape); we set
     // `umask` semantics via `OpenOptions`. The actual install of the
     // file at the right ownership (`sandbox:sandbox`) on a fresh-host
-    // first-run is the wrapping shell flow's job (§ 6.2.1 step 1 in the
-    // spec uses `sudo -k -u sandbox install -m 0664 /dev/null
-    // "$lockfile"`); from Rust we open whatever the operator-side install
+    // first-run is the wrapping shell flow's job (`sudo -k -u sandbox
+    // install -m 0664 /dev/null "$lockfile"`);
+    // from Rust we open whatever the operator-side install
     // left in place and assert that we hold a writable FD.
     let file = OpenOptions::new()
         .read(true)
@@ -254,7 +252,7 @@ pub fn acquire(params: AcquireParams<'_>) -> Result<UpdateLock, LockError> {
         // EWOULDBLOCK. Peek at the existing payload to decide whether
         // the holder is live. The read is *without* the flock — we may
         // see a partial write; the parse-failure / PID-zero branch
-        // tolerates that (§ 6.2.2).
+        // tolerates that (flock-first ordering rule).
         //
         // We tolerate parse failure (covered by `read_payload`'s
         // internal `serde_json::from_str(..).ok()` collapse) and
@@ -335,7 +333,7 @@ fn classify_acquisition(
         Some(p) => p,
         None => {
             // No prior payload — pure fresh acquisition. Sample
-            // was_running NOW (§ 6.4 step 1).
+            // was_running NOW.
             return (AcquisitionKind::Fresh, probe_was_running());
         }
     };
@@ -364,7 +362,7 @@ fn classify_acquisition(
     }
     // Prior payload claims a live PID but we got the flock — race
     // where the live holder released but its payload is stale.
-    // Treat as adoption to preserve stickiness; the spec leaves this
+    // Treat as adoption to preserve stickiness; the design leaves this
     // edge to operator judgement.
     (
         AcquisitionKind::Adopt {
@@ -480,7 +478,7 @@ mod tests {
         true
     }
 
-    /// § 6.2.3 row 2: a live PID payload + held flock → refuse.
+    /// Live PID payload + held flock → refuse.
     #[test]
     fn lock_file_acquisition_refuses_on_live_holder() {
         let (_dir, path) = tmp_lock_path();
@@ -545,7 +543,7 @@ mod tests {
         drop(holder);
     }
 
-    /// § 6.4 (on-disk half): the sticky `was_running` byte that
+    /// On-disk half: the sticky `was_running` byte that
     /// `lock_file_acquisition_preserves_was_running_across_adopt`
     /// asserts in-memory must also reach disk under the held flock,
     /// so an operator reading the lock file post-adopt sees the
@@ -654,7 +652,7 @@ mod tests {
         }
     }
 
-    /// Spec § 6.2.3: the dead-PID retry branch. When the prior PID
+    /// . When the prior PID
     /// is reported dead, the helper sleeps briefly and retries
     /// `flock` once. If a *competing* adopter takes the flock during
     /// the sleep, the retry also fails — surfaced as
@@ -729,7 +727,7 @@ mod tests {
         drop(competing);
     }
 
-    /// § 6.2.3 row 3: file present + flock released + PID dead → adopt.
+    /// File present + flock released + PID dead → adopt.
     #[test]
     fn lock_file_acquisition_adopts_on_dead_pid_payload() {
         let (_dir, path) = tmp_lock_path();
@@ -771,14 +769,14 @@ mod tests {
         }
     }
 
-    /// § 6.4: sticky `was_running` survives adoption — even when the
+    /// Sticky `was_running` survives adoption — even when the
     /// fresh probe would return the opposite.
     #[test]
     fn lock_file_acquisition_preserves_was_running_across_adopt() {
         let (_dir, path) = tmp_lock_path();
         // Predecessor wrote was_running=true; use a recent timestamp
         // so the AdoptStale branch isn't triggered (the stickiness
-        // contract is the same either way, but Adopt is the spec's
+        // contract is the same either way, but Adopt is the
         // primary case).
         let recent = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         std::fs::write(
@@ -814,7 +812,7 @@ mod tests {
         );
     }
 
-    /// § 6.2.2 — binding ordering rule: the kernel `flock` must be
+    /// Binding ordering rule: the kernel `flock` must be
     /// taken before any payload write. Verify by inspecting that
     /// during a held lock, the payload is observable to a reader (the
     /// write completed under the flock) and a second non-blocking
@@ -856,7 +854,7 @@ mod tests {
         drop(holder);
     }
 
-    /// § 6.3: dropping the [`UpdateLock`] removes the file. Verify by
+    /// Dropping the [`UpdateLock`] removes the file. Verify by
     /// observing that after `drop` the path no longer exists, and a
     /// subsequent fresh acquisition starts from an empty slate.
     #[test]

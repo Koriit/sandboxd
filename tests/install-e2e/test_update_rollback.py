@@ -1,6 +1,6 @@
-"""`sandbox update` + manual rollback per Spec 5 § 7.2.
+"""`sandbox update` + manual rollback per the install framework.2.
 
-Spec 5 ships only the documented manual rollback recipe; there is no
+the install framework ships only the documented manual rollback recipe; there is no
 automated ``sandbox rollback`` subcommand (§ 12 out of scope). This
 test installs base version v, updates to a bumped v', then runs the
 verbatim recipe from § 7.2 and asserts the rolled-back state.
@@ -37,7 +37,7 @@ def test_update_then_manual_rollback(
     release_tarball_x86_64_bumped,
     sigstore_stack,
 ):
-    """End-to-end rollback recipe from Spec 5 § 7.2.
+    """End-to-end rollback recipe from the install framework.2.
 
     Steps:
       1. Install base version v.
@@ -131,13 +131,13 @@ def test_update_then_manual_rollback(
         backup_manifest["files"].get("sessions.db-shm.bak", {}).get("sha256")
     )
 
-    # 3. Run the rollback recipe (Spec 5 § 7.2). The recipe is split
+    # 3. Run the rollback recipe . The recipe is split
     # into two phases here so the sessions.db sha256 can be sampled
     # AFTER the install but BEFORE `systemctl start sandboxd`. Without
     # the split, a parallel WAL checkpoint or any startup-time DB write
     # could mutate the bytes between `install` and our read, producing
     # a sha mismatch that does NOT reflect a real rollback regression.
-    # The recipe content is otherwise verbatim with the spec.
+    # The recipe content is otherwise verbatim with the design.
     #
     # Phase 1 — stop + install backup artifacts. Stops short of
     # `systemctl start sandboxd` so the daemon never gets a chance
@@ -228,7 +228,7 @@ sudo rm -f /var/lib/sandbox/.update.lock
         f"rollback recipe phase 2 (systemctl start) failed:\n{r.stdout}\n{r.stderr}"
     )
     # install_state still says v' (rollback recipe does NOT rewrite
-    # install_state — the spec § 7.2 deliberately leaves operator audit
+    # install_state — the design § 7.2 deliberately leaves operator audit
     # at v', since the v' artifacts have technically been applied and
     # then reverted). The next `sandbox update` flow will see this
     # state and may attempt to "upgrade" again; that's the documented
@@ -254,10 +254,10 @@ sudo rm -f /var/lib/sandbox/.update.lock
         "sudo test -e /var/lib/sandbox/.update.lock"
     ).returncode != 0, "lock file should be removed by rollback recipe"
 
-    # Spec § 7.2 step 10 — rollback recipe ends with sandbox doctor;
+    # 
     # doctor must pass regardless of install_state/version skew. The
     # rollback leaves install_state.installed_version pointing at the
     # bumped version while /version (and the binary on disk) report
     # the rolled-back base version; doctor's green-light gate is the
-    # spec-mandated recipe terminator and must succeed under that skew.
+    # required recipe terminator and must succeed under that skew.
     assert_doctor_passes(vm)

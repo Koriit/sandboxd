@@ -106,7 +106,7 @@ pub async fn propagation_status(
 ) -> Response {
     // Resolve session name-or-id, scoped to the caller's owner_username
     // so a foreign session id returns the same 404 shape as a truly
-    // nonexistent id (spec § 2.4).
+    // nonexistent id.
     let session = match state.store.get_session_by_name_or_id(&id, &operator.name) {
         Ok(Some(s)) => s,
         Ok(None) => return map_error(SandboxError::SessionNotFound(id)).into_response(),

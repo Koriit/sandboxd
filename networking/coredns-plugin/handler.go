@@ -144,7 +144,7 @@ type responseInterceptor struct {
 // emits a `propagate_and_ack` request to sandboxd with the resolved
 // IPs and blocks on the daemon's ack until success or deadline. On
 // success / noop the answer is released to the client; on rejection
-// the answer is still released (fail-open per spec) so a transient
+// the answer is still released (fail-open) so a transient
 // daemon issue does not punch a hole in DNS resolution. Every
 // outcome is reported via the structured-events sink so operators can
 // detect regressions.

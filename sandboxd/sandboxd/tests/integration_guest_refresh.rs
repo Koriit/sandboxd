@@ -1,7 +1,7 @@
 //! Integration tests for the guest-version refresh path
-//! (api-session-isolation spec §§ 3.4, 3.8, 3.9; §§ 7.4, 7.5).
+//! (per-caller isolation).
 //!
-//! Under spec § 3.8.1's bind-mount design, the container backend's
+//! Under.8.1's bind-mount design, the container backend's
 //! refresh path is not a `docker cp` into the rootfs; instead, every
 //! container session bind-mounts the installed `sandbox-guest` from
 //! the FHS libexec path (`/usr/local/libexec/sandboxd/sandbox-guest`,
@@ -70,7 +70,7 @@ use tempfile::TempDir;
 // Hermetic tests — no Docker daemon
 // ---------------------------------------------------------------------------
 
-/// Spec § 7.5 refuse arm: assert the daemon's `error_response` helper
+///
 /// maps `GuestProtocolIncompatible` to HTTP 409 with both load-bearing
 /// message tokens (`refresh is not viable`, `recreate the session`) in
 /// the JSON body's `error` field. Drives the same code path
@@ -107,7 +107,7 @@ fn integration_guest_refresh_refuses_when_unsalvageable() {
     );
 }
 
-/// Spec § 7.4 fast-path: the compat predicate accepts the daemon's own
+///
 /// proto version, so a freshly-stamped session takes the no-refresh
 /// arm. This pins the decision the `start_session` handler makes and
 /// rules out a regression that would silently call
@@ -123,7 +123,7 @@ fn integration_guest_refresh_fast_path_skips_refresh() {
     assert!(!can_refresh_in_place(0));
 }
 
-/// Spec § 7.4 (storage half) — after a refresh + start, the daemon
+/// , the daemon
 /// calls `SessionStore::update_guest_versions` to atomically stamp the
 /// new versions. This test exercises the store API directly: insert a
 /// session with stale (`proto = 0`, `bin = ""`) versions, call
@@ -418,7 +418,7 @@ fn read_in_container_guest_bytes(container_name: &str) -> Vec<u8> {
     std::fs::read(&host_dst).expect("read host tempfile")
 }
 
-/// Spec § 7.4 (bind-mount design) — exercise the container
+///
 /// backend's `refresh_guest_binary` end-to-end against the
 /// production-shape `--read-only` lite image
 /// (`sandboxd-lite:<workspace_version>`, the same image `make
@@ -431,7 +431,7 @@ fn read_in_container_guest_bytes(container_name: &str) -> Vec<u8> {
 /// 3. `SessionStore::update_guest_versions` writes the daemon's
 ///    current `DAEMON_GUEST_PROTO_VERSION` / `SANDBOX_GUEST_VERSION`
 ///    into the row, mirroring the daemon's post-refresh atomic
-///    update (spec § 3.9).
+///    update.
 /// 4. The refresh sequence is idempotent — a second call against the
 ///    same container succeeds.
 ///
@@ -511,7 +511,7 @@ async fn integration_guest_refresh_container_backend() {
         "post-refresh in-container `/usr/local/bin/sandbox-guest` must be \
          bit-identical to the daemon's host-side staged file — that's the \
          load-bearing property of the bind-mount design (api-session-isolation \
-         spec § 3.8.1)"
+        .8.1)"
     );
 
     // Idempotency: re-running refresh against the same container is a
@@ -527,7 +527,7 @@ async fn integration_guest_refresh_container_backend() {
         "second refresh must leave the bind-mount source intact",
     );
 
-    // Spec § 3.9 — after refresh + start succeed, the daemon stamps
+    // , the daemon stamps
     // the current versions on the row. Mirror the orchestrator's
     // call here so the integration coverage includes the store-side
     // write (the existing hermetic test
@@ -554,7 +554,7 @@ async fn integration_guest_refresh_container_backend() {
 
 /// Change the host-side bind-mount source bytes between two container
 /// creates; verify the second container sees the new bytes through
-/// its bind-mount (api-session-isolation spec § 3.8.1).
+/// its bind-mount (per-caller isolation).
 ///
 /// This pins the "new sessions automatically pick up the refreshed
 /// daemon's guest" property of the bind-mount design: a `sandbox
@@ -661,7 +661,7 @@ async fn integration_guest_binary_swap_picked_up_by_new_sessions() {
 
 /// Start two container sessions; verify their bind-mounted
 /// `/usr/local/bin/sandbox-guest` resolves to the same backing inode
-/// on the host (api-session-isolation spec § 3.8.1).
+/// on the host (per-caller isolation).
 ///
 /// The bind-mount design's load-bearing property is that one host
 /// inode is shared across every live session — the kernel does not

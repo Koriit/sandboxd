@@ -5,7 +5,7 @@ import starlightLinksValidator from 'starlight-links-validator';
 import rehypeMermaid from 'rehype-mermaid';
 
 // --- Mermaid strategy decision ---------------------------------------------
-// Design spec §9 requires Mermaid diagrams to be rendered to SVG at build
+// Mermaid diagrams must be to be rendered to SVG at build
 // time (no client-side JS) and to swap with Starlight's dark/light toggle.
 //
 // rehype-mermaid offers four strategies:
@@ -96,9 +96,9 @@ export default defineConfig({
             },
           ]
         : [],
-      // Fail the build on broken internal links (spec §6, quality gates).
+      // Fail the build on broken internal links
       plugins: [starlightLinksValidator()],
-      // Taxonomy per spec §3: four top-level groups in this order.
+      // Taxonomy: four top-level groups in this order.
       sidebar: [
         {
           label: 'Start here',

@@ -9,15 +9,14 @@
 //! "ecosystem presets then GitHub family" order here only for
 //! readability during review.
 //!
-//! # Relationship to the spec
+//! # Relationship to the design
 //!
-//! The first 10 entries mirror Part 2 of the spec at
-//! `.tasks/specs/2026-04-21-port-explicit-policies-presets-observability-design.md`
-//! lines 428-568. The plain `github` preset unifies the two rows in
-//! the spec's table (interactive hosts + asset CDN) under a single
-//! preset name; operators who need narrower scope than `github:`
-//! use `github-repo` / `github-pr` instead. The 11th entry, `ubuntu`,
-//! is the first distro-level default-allow preset.
+//! The first 10 entries cover ecosystem presets (npm, pypi, cargo,
+//! goproxy, maven, gradle, dockerhub) and the GitHub family. The plain
+//! `github` preset unifies interactive hosts + asset CDN under a single
+//! preset name; operators who need narrower scope use `github-repo` /
+//! `github-pr` instead. The 11th entry, `ubuntu`, is the first
+//! distro-level default-allow preset.
 //!
 //! # Determinism
 //!
@@ -66,7 +65,7 @@ pub struct BuiltinPreset {
 /// [`super::Catalog::list`]); this array's order does not leak to the
 /// user.
 pub const BUILTINS: &[BuiltinPreset] = &[
-    // ----- Unparameterized ecosystem presets (spec lines 428-444) ----
+    // ----- Unparameterized ecosystem presets ----
     BuiltinPreset {
         name: "npm",
         description: "Allow npm registry reads (registry.npmjs.org).",
@@ -102,7 +101,7 @@ pub const BUILTINS: &[BuiltinPreset] = &[
         description: "Allow Docker Hub image pulls (registry-1.docker.io and friends).",
         expand: expand_dockerhub,
     },
-    // ----- GitHub family (spec lines 442-568) ------------------------
+    // ----- GitHub family ------------------------
     BuiltinPreset {
         name: "github",
         description: "Allow broad GitHub access (github.com, api.github.com interactive + asset CDN).",
@@ -174,7 +173,7 @@ fn consume_rules(hosts: &[&str]) -> Vec<PolicyRule> {
 }
 
 // ---------------------------------------------------------------------------
-// Unparameterized ecosystem presets (spec lines 428-444)
+// Unparameterized ecosystem presets
 // ---------------------------------------------------------------------------
 
 fn expand_npm(_inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetError> {
@@ -231,7 +230,7 @@ fn expand_dockerhub(_inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetEr
 }
 
 // ---------------------------------------------------------------------------
-// github (unparameterized, mixed-posture; spec lines 442-443)
+// github (unparameterized, mixed-posture)
 // ---------------------------------------------------------------------------
 
 /// Interactive GitHub hosts — accept `ANY /**` because legitimate
@@ -260,7 +259,7 @@ fn expand_github(_inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetError
 }
 
 // ---------------------------------------------------------------------------
-// github-repo (parameterized; spec lines 500-535)
+// github-repo (parameterized)
 // ---------------------------------------------------------------------------
 //
 // Determinism contract: with one `repo=owner/name` value the http
@@ -274,7 +273,7 @@ fn expand_github(_inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetError
 // (they do not depend on `${repo}`).
 
 /// Validate a `repo=owner/name` value against the DNS-ish shape
-/// documented in the spec. Returns a structured error rather than a
+/// documented in the design. Returns a structured error rather than a
 /// string match so the CLI can surface a targeted message.
 fn validate_repo_value(raw: &str) -> Result<(), String> {
     // Exactly one `/`, non-empty owner and name, each component
@@ -324,7 +323,7 @@ struct RepoTemplate {
 
 /// github-repo templates for `github.com`: git-pack URL set (both the
 /// canonical `.git` form and the no-`.git` form GitHub also serves).
-/// Spec lines 507-512.
+
 const GITHUB_REPO_GITHUB_COM_TEMPLATES: &[RepoTemplate] = &[
     // `.git`-suffixed URLs — canonical.
     RepoTemplate {
@@ -359,7 +358,7 @@ const GITHUB_REPO_GITHUB_COM_TEMPLATES: &[RepoTemplate] = &[
 ];
 
 /// github-repo templates for `api.github.com`: repo-scoped REST API.
-/// Spec lines 513-515. `GET /user` and `GET /rate_limit` are shared
+/// `GET /user` and `GET /rate_limit` are shared
 /// across all repos and appended once outside this list.
 const GITHUB_REPO_API_TEMPLATES: &[RepoTemplate] = &[RepoTemplate {
     method: HttpMethod::Any,
@@ -367,7 +366,7 @@ const GITHUB_REPO_API_TEMPLATES: &[RepoTemplate] = &[RepoTemplate {
 }];
 
 /// github-repo templates for `codeload.github.com` (archive downloads).
-/// Spec lines 516-517.
+
 const GITHUB_REPO_CODELOAD_TEMPLATES: &[RepoTemplate] = &[
     RepoTemplate {
         method: HttpMethod::Get,
@@ -379,7 +378,7 @@ const GITHUB_REPO_CODELOAD_TEMPLATES: &[RepoTemplate] = &[
     },
 ];
 
-/// github-repo templates for `raw.githubusercontent.com`. Spec lines
+/// github-repo templates for `raw.githubusercontent.com`.
 /// 523-524.
 const GITHUB_REPO_RAW_TEMPLATES: &[RepoTemplate] = &[
     RepoTemplate {
@@ -392,7 +391,7 @@ const GITHUB_REPO_RAW_TEMPLATES: &[RepoTemplate] = &[
     },
 ];
 
-/// Always-needed API probes that are not per-repo. Spec line 515.
+/// Always-needed API probes that are not per-repo.
 fn api_github_com_shared_probes() -> Vec<HttpFilter> {
     vec![
         HttpFilter {
@@ -469,14 +468,14 @@ fn expand_github_repo(inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetE
         http_rule("codeload.github.com", codeload_filters),
         http_rule("raw.githubusercontent.com", raw_filters),
         // Signed, opaque release-asset URLs: `tls` is the tightest
-        // workable level (spec lines 518-522).
+        // workable level.
         tls_rule("objects.githubusercontent.com"),
         tls_rule("release-assets.githubusercontent.com"),
     ])
 }
 
 // ---------------------------------------------------------------------------
-// github-pr (parameterized; spec lines 538-557)
+// github-pr (parameterized)
 // ---------------------------------------------------------------------------
 //
 // Determinism contract: pairs are walked in lockstep in invocation
@@ -492,7 +491,7 @@ struct PrTemplate {
     path: &'static str,
 }
 
-/// github-pr templates for `api.github.com`. Spec lines 546-552.
+/// github-pr templates for `api.github.com`.
 const GITHUB_PR_API_TEMPLATES: &[PrTemplate] = &[
     PrTemplate {
         method: HttpMethod::Any,
@@ -512,7 +511,7 @@ const GITHUB_PR_API_TEMPLATES: &[PrTemplate] = &[
     },
 ];
 
-/// github-pr templates for `github.com` (PR UI paths). Spec lines
+/// github-pr templates for `github.com` (PR UI paths).
 /// 554-555.
 const GITHUB_PR_GITHUB_COM_TEMPLATES: &[PrTemplate] = &[
     PrTemplate {
@@ -662,13 +661,13 @@ fn is_positive_integer(s: &str) -> bool {
 //     sources.list uses `https://` mirrors on 22.04+ (the test base
 //     image is 24.04 per `lima.rs`), and apt's transport defaults
 //     fetch over HTTPS first. Without an easy way to verify the
-//     negative path on a fresh base image, the spec prescribes
+//     negative path on a fresh base image, the design prescribes
 //     defaulting to omit.
 //
-//   * **snap / livepatch / changelogs: omitted.** The spec says
-//     scope by what an unmodified Ubuntu base image actually opens
-//     during the first 60 s of boot + a sample `apt update` cycle;
-//     without an easy way to measure that here, default to omit.
+//   * **snap / livepatch / changelogs: omitted.** Scope is defined by
+//     what an unmodified Ubuntu base image actually opens during the
+//     first 60 s of boot + a sample `apt update` cycle; without an
+//     easy way to measure that here, default to omit.
 //     Real workloads that hit `api.snapcraft.io` etc. add a project
 //     policy rule explicitly; the preset can grow later if those
 //     hosts turn out to be load-bearing for the typical Ubuntu agent
@@ -873,14 +872,13 @@ mod tests {
     /// DELETE for publish / yank / owner management, but those
     /// mutating workflows are deliberately scoped to an explicit
     /// grant outside the built-in — see the fixture's `_comment`
-    /// block for the rationale and the spec's "Known gaps" section.
+    /// block for the rationale and the design's "Known gaps" section.
     ///
     /// If you are intentionally changing the host set or per-host
     /// method posture, update the fixture in the same commit — the
     /// test asserts equality in both directions to catch adds and
     /// removes. Document the rationale in the fixture's leading
-    /// `_comment` block and, if the change affects spec §"Known
-    /// gaps", update that section too.
+    /// `_comment` block.
     #[test]
     fn cargo_preset_matches_frozen_trace() {
         use std::collections::BTreeMap;
@@ -1124,7 +1122,7 @@ mod tests {
 
     #[test]
     fn expand_github_interactive_hosts_use_any_asset_cdn_uses_get_head() {
-        // Spec lines 442-443: two rows under `github:`.
+        //  two rows under `github:`.
         //   interactive → ANY /**
         //   asset CDN   → GET /**, HEAD /**
         let rules = expand_builtin("github", "github:");

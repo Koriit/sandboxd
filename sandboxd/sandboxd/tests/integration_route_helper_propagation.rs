@@ -1,5 +1,5 @@
 //! Integration tests for the daemon → route-helper identity
-//! propagation path (helper-identity-assertion spec § 8.5).
+//! propagation path (helper-identity-assertion.5).
 //!
 //! These exercise the `SO_PEERCRED` →
 //! `OperatorIdentity` → `RuntimeStartArgs::for_user` →
@@ -11,7 +11,7 @@
 //!  - `integration_route_helper_for_user_propagated` — the container
 //!    backend's `runtime.start()` invoked the stub with
 //!    `--for-user <operator-name>` between the binary name and the two
-//!    positional args (the wire shape spec § 6.5 pins).
+//!    positional args (the wire shape.5 pins).
 //!  - `integration_route_helper_for_user_falls_through_lima` — the Lima
 //!    backend's `runtime.start()` never invokes the helper, regardless
 //!    of whether `RuntimeStartArgs::for_user` is populated. The stub's
@@ -20,7 +20,7 @@
 //!    — defensive: if a handler ever reaches `ContainerRuntime::start`
 //!    with `for_user = None` AND a helper path configured, the runtime
 //!    returns `SandboxError::Internal` rather than silently dropping the
-//!    pair-check assertion. Pins spec § 6.3's "programming error"
+//!    pair-check assertion. Pins.3's "programming error"
 //!    contract.
 //!
 //! Profile selection: every test name is prefixed `integration_` so the
@@ -236,8 +236,8 @@ fn container_spec() -> SessionSpec {
 /// Resolve a stable host path for the bind-mount source the runtime
 /// passes as `guest_bind_source`. Necessary for any test that
 /// `docker create`s a real container — dockerd errors at create time
-/// if the mount source does not exist. See api-session-isolation
-/// spec § 3.8.1 for the bind-mount design.
+/// if the mount source does not exist. See the api-session-isolation
+/// design for the bind-mount details.
 fn guest_bind_source_for_tests() -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::OnceLock;
@@ -260,10 +260,10 @@ fn guest_bind_source_for_tests() -> std::path::PathBuf {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Spec § 8.5, test 1: the container backend's `runtime.start` invokes
+/// , test 1: the container backend's `runtime.start` invokes
 /// the configured helper with `--for-user <operator-name>` placed
 /// between the binary name and the two positional args (matching the
-/// wire-shape pin in spec § 6.5).
+/// wire-shape pin in.5).
 ///
 /// The test points `ContainerNetwork::route_helper_path` at a stub
 /// shell script that writes its argv to a tempfile and exits `0`,
@@ -323,7 +323,7 @@ async fn integration_route_helper_for_user_propagated() {
     );
     assert_eq!(
         argv[0], "--for-user",
-        "first argv item must be the --for-user flag (spec § 6.5); got: {argv:?}"
+        "first argv item must be the --for-user flag; got: {argv:?}"
     );
     assert_eq!(
         argv[1], "daemon-test-operator",
@@ -349,7 +349,7 @@ async fn integration_route_helper_for_user_propagated() {
     drop(stub_dir);
 }
 
-/// Spec § 8.5, test 2: `LimaRuntime::start` never invokes the route
+/// , test 2: `LimaRuntime::start` never invokes the route
 /// helper. We assert this hermetically — without a real Lima VM — by
 /// observing that the stub helper's argv-capture file does NOT exist
 /// after the Lima backend's invocation site is the only one that ran.
@@ -361,7 +361,7 @@ async fn integration_route_helper_for_user_propagated() {
 /// `BackendKind::Lima` never reaches `invoke_route_helper`. The
 /// strongest hermetic assertion is structural: the
 /// `RuntimeStartArgs::for_user` field is threaded into the Lima call
-/// site for forward-compat (spec § 6.4) but `LimaRuntime::start` does
+/// site for forward-compat but `LimaRuntime::start` does
 /// not consult it. We confirm that by inspecting the recorded argv:
 /// it must remain absent (no invocations) for the entire test run.
 #[tokio::test]
@@ -382,7 +382,7 @@ async fn integration_route_helper_for_user_falls_through_lima() {
     // dispatch trait separates the two backends — only the container
     // runtime's `route_helper_path` ever calls the stub. A real Lima
     // VM boot here would be 30-60s and require KVM access; the
-    // structural assertion below is what the spec § 8.5 test name
+    // structural assertion below is what the test name
     // ("for_user_falls_through_lima") names.
     //
     // The hermetic shape: construct an empty `ContainerRuntime` with
@@ -410,7 +410,7 @@ async fn integration_route_helper_for_user_falls_through_lima() {
     // compat). Lima's `runtime.start` would consume these, but we do
     // NOT actually invoke a real Lima runtime here — a hermetic
     // construction-only check that pins the data shape is sufficient
-    // for this spec test: the structural invariant is that the Lima
+    // for this test: the structural invariant is that the Lima
     // call site can carry `for_user` without reaching the helper.
     let lima_args = RuntimeStartArgs {
         lima_bridge: Some("sandbox-test-bridge".to_string()),
@@ -425,7 +425,7 @@ async fn integration_route_helper_for_user_falls_through_lima() {
     assert_eq!(
         lima_args.for_user.as_deref(),
         Some("daemon-test-operator"),
-        "lima call sites must accept for_user for forward-compat (spec § 6.4)"
+        "lima call sites must accept for_user for forward-compat"
     );
 
     // The structural assertion: nothing in the workspace's Lima path
@@ -448,7 +448,7 @@ async fn integration_route_helper_for_user_falls_through_lima() {
     );
 }
 
-/// Defensive test for spec § 6.3: if a handler ever dispatches through
+/// Defensive test for.3: if a handler ever dispatches through
 /// `ContainerRuntime::start` with `for_user = None` AND the session
 /// has a `route_helper_path` configured, the runtime must surface an
 /// `Internal` error rather than silently invoking the helper with a
@@ -486,7 +486,7 @@ async fn integration_route_helper_missing_for_user_with_helper_path_errors() {
         .expect("runtime.create");
 
     // for_user is deliberately None even though route_helper_path is
-    // configured. This is the failure shape spec § 6.3 names: a
+    // configured. This is the failure shape.3 names: a
     // programming error where a handler forgot the operator extension.
     let args = RuntimeStartArgs {
         for_user: None,

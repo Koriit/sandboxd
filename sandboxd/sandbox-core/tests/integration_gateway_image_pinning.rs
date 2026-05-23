@@ -14,7 +14,7 @@
 //!
 //! Test name uses the workspace `integration_*` prefix so the default
 //! nextest profile filters it out; the integration profile selects it
-//! by prefix. Spec reference: daemon-productionization § 11.6 —
+//! by prefix. Design reference: daemon-productionization (image pinning) —
 //! `integration_gateway_image_pinned_to_daemon_version`.
 
 use std::process::Command;

@@ -1,6 +1,6 @@
 """Air-gapped install path.
 
-Spec § 6.3 / § 8.6 / § 10.6. The fuller air-gapped flow has two parts:
+
 
 1. Pre-stage cosign at /usr/local/bin/cosign (the script's fallback).
 2. Drop network egress between the cosign-staging step and the rest of
@@ -85,7 +85,7 @@ def test_install_air_gapped(
     # Confirm install.sh will accept this binary (sha256 matches the pin).
     vm.shell("test -x /usr/local/bin/cosign", check=True, timeout=10)
 
-    # Comprehensive egress block per spec § 8.6: drop ALL NEW outbound
+    # Comprehensive egress block per.6: drop ALL NEW outbound
     # except loopback. ESTABLISHED/RELATED is kept so the limactl shell
     # session (a connection initiated from the host BEFORE the block
     # was installed) survives — without that exemption iptables would

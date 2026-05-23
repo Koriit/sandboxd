@@ -1,10 +1,9 @@
-//! Daemon-startup schema-mismatch refusal tests (Spec 5 § 4.7).
+//! Daemon-startup schema-mismatch refusal tests.
 //!
 //! Each test spawns the freshly-built `sandboxd` binary with a
 //! tempfile `users.conf` (via `SANDBOX_USERS_CONF`) carrying a specific
 //! `_schema_version`, asserts the process exits non-zero in well under
-//! 5 seconds, and pins the operator-facing stderr substring per
-//! Spec 5 § 4.7 / § 9.3.
+//! 5 seconds, and pins the operator-facing stderr substring.
 //!
 //! The happy-path "accepts a file at the supported schema version"
 //! test is the inverse of the refusal tests: the daemon advances past
@@ -13,7 +12,7 @@
 //! does **not** contain the `schema version` token rather than waiting
 //! for full daemon readiness, because waiting on Lima/gateway init in
 //! a hermetic unit-test context would require booting external state
-//! Phase 5 § 9.3 specifically scopes out.
+//! that these hermetic tests specifically scope out.
 //!
 //! Test names start with `integration_` so they are selected by the
 //! `integration` nextest profile (see `sandboxd/.config/nextest.toml`).
@@ -101,7 +100,7 @@ fn spawn_and_wait(users_conf: &str, deadline_secs: u64) -> (String, i32) {
 // ---------------------------------------------------------------------------
 
 /// `users.conf` at `_schema_version: 99` (ahead of the binary's max of
-/// 1) refuses startup. Spec 5 § 4.7 names the substring `users.conf
+/// 1) refuses startup..7 names the substring `users.conf
 /// schema version 99 is newer`.
 #[test]
 fn integration_daemon_refuses_start_on_schema_too_new() {
@@ -136,7 +135,7 @@ fn integration_daemon_refuses_start_on_schema_too_new() {
 
 /// `users.conf` at `_schema_version: 0` (below the binary's min of 1)
 /// refuses startup with the `is older than this binary supports`
-/// substring. Spec 5 § 4.7's MIN-side behaviour.
+/// substring..7's MIN-side behaviour.
 #[test]
 fn integration_daemon_refuses_start_on_schema_too_old() {
     // `_schema_version` field set explicitly to 0 (operators with

@@ -62,7 +62,7 @@ use tokio::sync::broadcast::error::RecvError;
 
 /// `Content-Type` header value for the JSONL response body.
 ///
-/// Spec Part 3 § "HTTP endpoint" names this verbatim (`application/jsonl`).
+/// The observability HTTP endpoint names this verbatim (`application/jsonl`).
 /// Exposed publicly so tests can assert against the exact literal without
 /// importing the constant's value twice.
 pub const APPLICATION_JSONL: &str = "application/jsonl";
@@ -130,7 +130,7 @@ pub async fn get_session_events(
 ) -> Response {
     // Resolve session name-or-id, scoped to the caller's owner_username
     // so a foreign session id returns the same 404 shape as a truly
-    // nonexistent id (spec § 2.4).
+    // nonexistent id.
     let session = match state.store.get_session_by_name_or_id(&id, &operator.name) {
         Ok(Some(s)) => s,
         Ok(None) => return error_response(SandboxError::SessionNotFound(id)),
@@ -138,7 +138,7 @@ pub async fn get_session_events(
     };
 
     // Translate the wire DTO into the domain predicate. Unknown values
-    // fail loud as 400 InvalidArgument, matching the spec contract.
+    // fail loud as 400 InvalidArgument, matching the design contract.
     let filter = match EventsFilter::from_query(&q) {
         Ok(f) => f,
         Err(e) => return error_response(e),

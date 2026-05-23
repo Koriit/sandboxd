@@ -21,8 +21,8 @@ publish = false
 # membership clean — release tarballs ship the four `sandboxd/*`
 # crates plus the route-helper, never this one.
 #
-# Spec reference: api-session-isolation § 9.2 — "Multi-uid test
-# harness for `SO_PEERCRED` — Lima VM path". The helper is installed
+# Multi-uid test harness for `SO_PEERCRED` — Lima VM path (api-session-isolation § 9.2).
+# The helper is installed
 # setuid-root inside the Lima E2E test VM template
 # (`install -o root -m 4755 .../peercred-connector
 # /usr/local/lib/sandboxd-tests/peercred-connector`) so the tests

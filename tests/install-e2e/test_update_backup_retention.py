@@ -1,4 +1,4 @@
-"""`sandbox update` backup-set retention — Spec 5 §§ 3.2.25, 5.2.
+"""`sandbox update` backup-set retention — the install framework.2.25, 5.2.
 
 The retention policy keeps the 2 most recent ``completed_ok: true``
 sets; sets with ``completed_ok: false`` are preserved forensically and
@@ -43,7 +43,7 @@ def test_update_backup_retention_prunes_oldest(
 ):
     """Three consecutive updates leave 2 successful backup sets on disk.
 
-    Spec 5 § 5.2 keep=2 retention. After the 3rd update, the oldest
+    the install framework.2 keep=2 retention. After the 3rd update, the oldest
     successful set (the v→v.1 transition) is pruned.
     """
     vm = vm_factory(distro_template)
@@ -133,7 +133,7 @@ def test_update_backup_retention_prunes_oldest(
             f"got {ok_pairs}\nraw:\n{manifests}"
         )
         # Total manifest count must equal the expected `ok_pairs`
-        # length. Spec § 5.2 keep=2 prunes successful sets to two;
+        # length. 
         # the only manifests that ride past the prune are (a) the
         # two most recent successful sets, (b) forensic
         # `completed_ok != true` sets (preserved indefinitely).

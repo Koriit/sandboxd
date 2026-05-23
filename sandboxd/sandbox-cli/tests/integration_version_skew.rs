@@ -1,6 +1,5 @@
 //! Binary-level integration test for the CLI ↔ daemon strict
-//! version-equality handshake (spec § 7.1, § 11.6 —
-//! `integration_cli_refuses_on_version_skew`).
+//! version-equality handshake (`integration_cli_refuses_on_version_skew`).
 //!
 //! Pins the end-to-end refusal contract: when the CLI dials a daemon
 //! whose `GET /version` reports a different `CARGO_PKG_VERSION` than
@@ -77,7 +76,7 @@ async fn spawn_mock_daemon() -> (
 
     // The `/sessions` counter is the canary: if it ever increments,
     // the CLI sent the caller's request despite the version skew —
-    // exactly the failure mode the spec § 7 strict-equality rule
+    // exactly the failure mode the strict-equality version rule
     // exists to prevent.
     let sessions_counter = Arc::new(AtomicUsize::new(0));
     let counter_for_handler = Arc::clone(&sessions_counter);
@@ -150,7 +149,7 @@ async fn integration_cli_refuses_on_version_skew() {
     assert_eq!(
         exit_code,
         2,
-        "spec § 7.3: CLI must exit with code 2 on version skew; \
+        "CLI must exit with code 2 on version skew; \
          got {exit_code}, stderr = {:?}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -162,7 +161,7 @@ async fn integration_cli_refuses_on_version_skew() {
     for token in ["version mismatch", "CLI is", "daemon is", "both must match"] {
         assert!(
             stderr.contains(token),
-            "spec § 7.3: stderr must contain the verbatim token {token:?}; \
+            "stderr must contain the verbatim token {token:?}; \
              got stderr = {stderr:?}"
         );
     }
@@ -191,7 +190,7 @@ async fn integration_cli_refuses_on_version_skew() {
     let sessions_hits = sessions_counter.load(Ordering::SeqCst);
     assert_eq!(
         sessions_hits, 0,
-        "spec § 7.1: the strict-equality rule must short-circuit \
+        "the strict-equality version check must short-circuit \
          *before* the caller's request is sent; mock daemon observed \
          {sessions_hits} hit(s) on /sessions despite the skew, which \
          means the gate is being bypassed"
@@ -243,7 +242,7 @@ async fn integration_cli_version_subcommand_bypasses_handshake() {
         stdout.trim_end_matches('\n'),
         format!("sandbox {}", env!("CARGO_PKG_VERSION")),
         "`sandbox version` must print exactly `sandbox <CARGO_PKG_VERSION>\\n` \
-         per spec § 7.6; got stdout = {stdout:?}"
+         per.6; got stdout = {stdout:?}"
     );
 
     // Most-important canary: the local-answer path never opens a
@@ -259,7 +258,7 @@ async fn integration_cli_version_subcommand_bypasses_handshake() {
     let sessions_hits = sessions_counter.load(Ordering::SeqCst);
     assert_eq!(
         sessions_hits, 0,
-        "`sandbox version` must not contact the daemon (spec § 7.5); \
+        "`sandbox version` must not contact the daemon; \
          mock daemon observed {sessions_hits} hit(s)"
     );
 }

@@ -1,11 +1,11 @@
-"""`sandbox update` completes with all network egress blocked — Spec 5 §§ 6.3, 9.1.
+"""`sandbox update` completes with all network egress blocked — the install framework.3, 9.1.
 
 Operator scenario: a host with no internet access (e.g. enterprise
 network with strict egress policy). They've fetched the release
 tarball + sigstore bundle out of band; ``sandbox update --from
 <tarball>`` should complete without any outbound network call.
 
-Network access points the flow could touch (Spec 5 § 12):
+Network access points the flow could touch :
   * GitHub Releases API — opt-out via ``--from``.
   * GitHub Releases tarball CDN — opt-out via ``--from``.
   * Sigstore Rekor / cosign verify — wired in a later milestone but
@@ -139,7 +139,7 @@ def test_update_air_gapped(
     wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
     wait_for_socket(vm.name, "/run/sandbox/sandboxd.sock", timeout=60)
 
-    # Spec § 7.2 step 10 (the post-update green-light gate): run
+    # 
     # `sandbox doctor` and assert all checks pass. Doctor's checks
     # run against the local unix socket (egress is blocked but
     # loopback is allowed by the iptables fixture above), so the

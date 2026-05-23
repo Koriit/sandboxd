@@ -16,15 +16,13 @@
 //! is captured by the `event` discriminator on the bus rather than a
 //! separate domain pipeline ("additive change, not a new pipeline").
 //!
-//! Source of truth for the on-disk shape: spec Part 3 / "Deny-logger
-//! component" (`.tasks/specs/2026-04-21-port-explicit-policies-presets-
-//! observability-design.md`):
+//! The on-disk shape follows the event wire format / "Deny-logger component":
 //!
 //! - Common envelope fields `timestamp`, `layer`, `event`.
-//! - `deny` / `allow` payload (spec "Traffic events" row for `deny-logger`,
+//! - `deny` / `allow` payload (traffic event for `deny-logger`,
 //!   identical for the allow variant): `orig_dst_ip`, `orig_dst_port`,
 //!   `protocol` (`"tcp"` / `"udp"`), `src_ip`, `src_port`.
-//! - `rate_limited` summary payload (spec "Hardening rules" § 5):
+//! - `rate_limited` summary payload (
 //!   `rate_limited_count`, `since_ts`.
 //!
 //! # Layer / event pairing

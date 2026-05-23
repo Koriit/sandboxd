@@ -61,7 +61,7 @@
 #                                  MANIFEST, and the daemon's `/version`
 #                                  endpoint (CARGO_PKG_VERSION) genuinely
 #                                  reports the bumped version. This is the
-#                                  multi-version harness Spec 5 § 9.1's
+#                                  multi-version harness the install framework.1's
 #                                  `test_update_fresh_install_to_next_version`
 #                                  depends on. The first bumped build is
 #                                  slower than incremental rebuilds since

@@ -9,7 +9,7 @@
 //! via [`LimaRuntime::manager`].
 //!
 //! - [`LimaRuntime::create`] dispatches to `LimaManager::create_vm`
-//!   (or `create_vm_with_custom_template` when the spec carries a
+//!   (or `create_vm_with_custom_template` when the design carries a
 //!   template).
 //! - [`LimaRuntime::start`] consumes [`RuntimeStartArgs`] for
 //!   docker bridge / MAC / `SessionConfig` populated by the daemon
@@ -104,7 +104,7 @@ impl LimaRuntime {
     /// Convert a [`SessionSpec`] into the resource-shaped
     /// [`SessionConfig`] that `LimaManager` consumes.
     ///
-    /// Returns an error if the spec targets a non-Lima backend. The
+    /// Returns an error if the design targets a non-Lima backend. The
     /// daemon is expected to have already validated `spec.backend() ==
     /// BackendKind::Lima` before dispatching to this runtime; this
     /// guard is defense in depth.
@@ -118,7 +118,7 @@ impl LimaRuntime {
                 cpus: *cpus,
                 memory_mb: *memory_mb,
                 // `disk_gb` is carried at the SessionSpec level (see
-                // `backend::spec`); fall back to SessionConfig::default
+                // `backend::spec::SessionSpec`); fall back to SessionConfig::default
                 // if the request did not specify a size.
                 disk_gb: spec
                     .disk_gb
@@ -129,12 +129,12 @@ impl LimaRuntime {
                 boot_cmd: spec.boot_cmd.clone(),
                 template: spec.template.clone(),
                 // Lima's `BackendSpecific::Lima` carries integer `cpus`
-                // by spec — the precise `cpus_decimal` only applies to
-                // container sessions. None here keeps the persisted
-                // shape consistent with the historical Lima record.
+                // (not the decimal form). `cpus_decimal` only applies to
+                // container sessions; `None` keeps the persisted shape
+                // consistent with the historical Lima record.
                 cpus_decimal: None,
                 // Rootless-Docker probe is gated to the container
-                // backend per spec § Non-goals 1195. Lima sessions
+                // backend per. Lima sessions
                 // never construct this state — the `None` keeps the
                 // persisted shape consistent with Lima records that
                 // predate the probe.
@@ -186,7 +186,7 @@ impl SessionRuntime for LimaRuntime {
     /// [`LimaManager::create_vm_with_custom_template`]; otherwise it
     /// generates the template inline via
     /// [`LimaManager::create_vm`]. This branch was previously open-coded
-    /// in the daemon handler (see Phase 1C handoff §5).
+    /// in the daemon handler (see Phase 1C handoff).
     async fn create(
         &self,
         session_id: &SessionId,
@@ -738,7 +738,7 @@ mod tests {
     /// independently. This is the canonical regression guard called
     /// out in the Phase 1B handoff (Task 5 / Verification 9): if any
     /// field flips, a future maintainer must consciously update the
-    /// expectations here and update the spec § "Capabilities model"
+    /// expectations here and update the capabilities model design doc
     /// at the same time.
     #[test]
     fn capabilities_for_lima_returns_expected_values() {

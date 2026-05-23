@@ -12,7 +12,7 @@ Group=sandbox
 # Defense-in-depth for the unix socket mode: the daemon explicitly
 # chmod()s sandboxd.sock to 0660 immediately after bind(), but
 # UMask=0117 ensures the inode never even momentarily exists at a
-# more permissive mode under a pre-exec race. See spec § 5.1.
+# more permissive mode under a pre-exec race. The daemon sets this via the socket-path mechanism.
 UMask=0117
 
 # State and runtime dirs are auto-created with correct ownership/modes.

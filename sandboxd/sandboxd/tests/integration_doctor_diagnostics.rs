@@ -1,6 +1,6 @@
 //! End-to-end coverage for `sandbox doctor` + `GET /diagnostics`.
 //!
-//! Spec § 11.6 enumerates five doctor/diagnostics integration tests
+//!
 //! for the daemon-productionization revision:
 //!
 //! - `integration_doctor_hard_fails_on_missing_gateway_image`
@@ -222,8 +222,8 @@ async fn http_get(
 
 /// Pre-create `<base_dir>/sessions/` with mode `0755`; start the
 /// daemon; assert it corrects the mode to `0700` (the
-/// `ensure_base_dir_layout` contract). Spec § 5.4 pins the correction
-/// behavior; this integration test exercises it end-to-end against
+/// `ensure_base_dir_layout` contract). This integration test exercises
+/// the behavior end-to-end against
 /// the real daemon binary so a regression that quietly removed the
 /// chmod call (or moved it past a startup error) would surface.
 #[test]
@@ -289,7 +289,7 @@ fn integration_subdir_mode_correction_at_startup() {
         & 0o777;
     assert_eq!(
         mode, 0o700,
-        "spec § 5.4: startup must correct sessions/ from 0755 to 0700; got {mode:04o}"
+        "startup must correct sessions/ from 0755 to 0700; got {mode:04o}"
     );
 
     let _ = proc.kill();
@@ -310,7 +310,7 @@ fn integration_subdir_mode_correction_at_startup() {
 ///
 /// - exit code is `1` (C7 hard-failed),
 /// - C7 row renders the `✗` glyph and names the gateway-image check,
-/// - the row carries the remediation hint substring spec § 8.5
+/// - the row carries the remediation hint substring.5
 ///   mandates (`sandbox update` and/or `make gateway-image`).
 ///
 /// We additionally probe `GET /diagnostics` to pin the wire-level
@@ -368,7 +368,7 @@ async fn integration_doctor_hard_fails_on_missing_gateway_image() {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let exit_code = output.status.code().expect("exited normally");
 
-    // Spec § 8.5: missing gateway image → C7 is a hard failure;
+    // ;
     // doctor's process exit code flips to 1.
     assert_eq!(
         exit_code, 1,
@@ -396,7 +396,7 @@ async fn integration_doctor_hard_fails_on_missing_gateway_image() {
 /// Spawn a daemon pointed at a guaranteed-absent lite-image tag
 /// (timestamp-suffixed unique tag, mirroring the gateway test's
 /// isolation pattern). Run `sandbox doctor --verbose`. The lite
-/// image is informational only per spec § 6.2 / § 8.4 — missing it
+/// image is informational only — missing it
 /// must NOT trip the C8 row to `✗`. The test asserts unconditionally:
 ///
 /// - `/diagnostics` reports `lite_image_present: false`,
@@ -449,7 +449,7 @@ async fn integration_doctor_informational_on_missing_lite_image() {
 
     // C8 must render — and as Skip (not Fail). The SKIPPED token is
     // the load-bearing assertion; missing-lite alone does not raise
-    // doctor's exit code to `1` (spec § 6.2 — informational only).
+    // doctor's exit code to `1`.
     assert!(
         stdout.contains("lite image present"),
         "C8 row must always appear in verbose mode; got: {stdout}"
@@ -483,7 +483,7 @@ async fn integration_doctor_informational_on_missing_lite_image() {
 /// We do not assert exit code `0` here because the daemon's host may
 /// be missing the gateway image; that case is covered by the
 /// dedicated test above. The contract pinned here is "doctor runs to
-/// completion against a real daemon and emits the spec-shaped
+/// completion against a real daemon and emits the design-shaped
 /// output".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn integration_doctor_full_pass_against_running_daemon() {
@@ -500,10 +500,10 @@ async fn integration_doctor_full_pass_against_running_daemon() {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let exit_code = output.status.code().expect("exited normally");
 
-    // Header line — load-bearing token from spec § 6.3.
+    // Header line — load-bearing token from.3.
     assert!(
         stdout.contains("sandbox doctor \u{2014} checking deployment"),
-        "header line must match spec § 6.3; got: {stdout}"
+        "header line must match.3; got: {stdout}"
     );
 
     // The first three rows all show up in verbose mode regardless
@@ -567,17 +567,17 @@ async fn integration_kvm_check_via_daemon_diagnostics() {
     let writable = parsed.get("kvm_writable").and_then(|v| v.as_bool());
     assert!(
         readable.is_some(),
-        "spec § 13.2: kvm_readable must be present + boolean; body={parsed}"
+        "kvm_readable must be present + boolean; body={parsed}"
     );
     assert!(
         writable.is_some(),
-        "spec § 13.2: kvm_writable must be present + boolean; body={parsed}"
+        "kvm_writable must be present + boolean; body={parsed}"
     );
 
-    // Spec § 13.2 enumerates the system-level fields the endpoint
-    // returns. Pin the keys here so a regression that renames or
-    // drops one fails this test loudly. The `*_probe_failed` /
-    // `*_probe_error` companions added per the Spec 3 § 13.2
+    // `GET /diagnostics` returns these keys. Pin them here so a
+    // regression that renames or drops one fails this test loudly.
+    // The `*_probe_failed` / `*_probe_error` companions were added
+    // to the contract so doctor C7/C8 can
     // `probe_failed` variant must also appear so doctor C7/C8 can
     // distinguish "image absent" from "probe could not run".
     for key in [
@@ -597,7 +597,7 @@ async fn integration_kvm_check_via_daemon_diagnostics() {
     ] {
         assert!(
             parsed.get(key).is_some(),
-            "spec § 13.2: `{key}` must appear in /diagnostics body; body={parsed}"
+            "`{key}` must appear in /diagnostics body; body={parsed}"
         );
     }
 }

@@ -84,7 +84,7 @@ const (
 	// resolution gap, but operators see a `dns_gate_rejected` event.
 	gateOutcomeRejected
 	// gateOutcomeTimedOut: deadline fired before the ack arrived.
-	// Fail-open per spec.
+	// Fail-open on timeout.
 	gateOutcomeTimedOut
 	// gateOutcomeProtocolError: daemon returned an error envelope
 	// (unsupported_version, malformed_request, etc.).

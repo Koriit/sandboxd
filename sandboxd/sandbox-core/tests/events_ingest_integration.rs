@@ -18,7 +18,7 @@
 //!    per layer, all three layers, to catch a parser-dispatch
 //!    regression.
 //! 3. A line whose source IP is NOT bound to any session is dropped
-//!    (warn + skip) rather than published — matches the spec's "drop
+//!    (warn + skip) rather than published — matches the "drop
 //!    events on vm_ip miss" note.
 //! 4. [`SessionIngestor::abort`] stops the background task so
 //!    subsequent appends do not land on the bus.
@@ -342,7 +342,7 @@ async fn integration_mitmproxy_event_attributes_via_watcher_session_even_with_un
 }
 
 /// End-to-end: `nft-deny.jsonl` records are parsed and surface on the
-/// session bus. Covers both event shapes prescribed by spec Part 3:
+/// session bus. Covers both event shapes prescribed by the event wire format:
 ///
 /// 1. A TCP `deny` record — the 5-tuple drives a `vm_ip_map.lookup` on
 ///    the VM's bridge IP, stamping the same session as the other
@@ -366,14 +366,13 @@ async fn deny_logger_jsonl_appears_on_bus() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // --- Deny (TCP) — the 5-tuple shape authored by the deny-logger
-    // component per spec Part 3 / "Traffic events" row for `deny-logger`:
+    // component  row for `deny-logger`:
     // `orig_dst_ip`, `orig_dst_port`, `protocol`, `src_ip`, `src_port`.
     let deny_line = r#"{"timestamp":"2026-04-22T09:45:10.000Z","layer":"deny-logger","event":"deny","orig_dst_ip":"203.0.113.1","orig_dst_port":8443,"protocol":"tcp","src_ip":"10.0.0.42","src_port":51234}"#;
     append_jsonl_line(&events_dir.join("nft-deny.jsonl"), deny_line).await;
 
     // --- Rate-limited summary — no 5-tuple; `rate_limited_count` +
-    // `since_ts` per spec Part 3 / "Hardening rules" § 5. Attribution
-    // must fall back to the ingestor's own session.
+    // `since_ts`. Attribution must fall back to the ingestor's own session.
     let rate_limited_line = r#"{"timestamp":"2026-04-22T09:45:11.000Z","layer":"deny-logger","event":"rate_limited","rate_limited_count":17,"since_ts":"2026-04-22T09:45:10.000Z"}"#;
     append_jsonl_line(&events_dir.join("nft-deny.jsonl"), rate_limited_line).await;
 

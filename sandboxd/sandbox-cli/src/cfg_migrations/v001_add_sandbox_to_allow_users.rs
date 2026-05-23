@@ -1,11 +1,11 @@
-//! V001 adapter: applies Spec 1 § 5's pure `migrate_v001` transform to
+//! V001 adapter: applies the documented contract
 //! `/etc/sandboxd/users.conf` via the framework's [`ConfigMigration`]
 //! trait.
 //!
 //! The pure transform (which adds `"sandbox"` to every subnet's
 //! `allow_users` and stamps `_schema_version: 1`) lives in
 //! `sandbox_core::users_conf::migrate_v001` together with the
-//! `UsersConfig` schema struct — Spec 5 § 4.1 deliberately keeps the
+//! `UsersConfig` schema struct —.1 deliberately keeps the
 //! content-level invariant next to the schema definition that tests it.
 //! This adapter wraps that transform with serde-driven byte ↔ value
 //! round-trip plumbing so the framework's apply loop can drive it.
@@ -38,7 +38,7 @@ impl ConfigMigration for Migration {
         let transformed = sandbox_core::users_conf::migrate_v001(value);
         // Pretty-print so operator diffs against `git`-style backups
         // stay readable. The two-space indent matches the shape
-        // `install.sh` writes at first install (Spec 4 § 4.4.19).
+        // `install.sh` writes at first install (the documented contract.19).
         serde_json::to_vec_pretty(&transformed)
             .map(|mut v| {
                 // serde_json::to_vec_pretty does not emit a trailing
@@ -62,9 +62,9 @@ mod tests {
         serde_json::from_str(raw).expect("test json literal must parse")
     }
 
-    /// Table-driven coverage for Spec 1 § 5.5 inputs A/B/C plus an
+    /// Table-driven coverage for the documented contract inputs A/B/C plus an
     /// operator-customized row that exercises the "preserves unknown
-    /// keys" contract from Spec 5 § 4.6. Bytes-in / bytes-out path,
+    /// keys" contract from.6. Bytes-in / bytes-out path,
     /// because the framework calls `apply(&[u8]) -> Vec<u8>`.
     #[test]
     fn migration_v001_round_trip() {
@@ -81,7 +81,7 @@ mod tests {
                 expected: r#"{ "_schema_version": 1, "subnets": [] }"#,
             },
             Row {
-                name: "Spec 1 § 5.5 Input A — single user pool",
+                name: "the documented contract Input A — single user pool",
                 input: r#"{
                     "subnets": [
                         { "cidr": "10.209.0.0/24", "allow_users": ["alice"] }
@@ -95,7 +95,7 @@ mod tests {
                 }"#,
             },
             Row {
-                name: "Spec 1 § 5.5 Input B — multi-user, multi-pool",
+                name: "the documented contract Input B — multi-user, multi-pool",
                 input: r#"{
                     "subnets": [
                         { "cidr": "10.209.0.0/24", "allow_users": ["alice"], "comment": "alice prod" },
@@ -111,7 +111,7 @@ mod tests {
                 }"#,
             },
             Row {
-                name: "Spec 1 § 5.5 Input C — sandbox already present",
+                name: "the documented contract Input C — sandbox already present",
                 input: r#"{
                     "subnets": [
                         { "cidr": "10.209.0.0/24", "allow_users": ["alice", "sandbox"] }
@@ -125,7 +125,7 @@ mod tests {
                 }"#,
             },
             Row {
-                // Spec 5 § 4.6 — operator-added top-level keys must
+                // Operator-added top-level keys must
                 // survive the round-trip. V001's pure transform uses
                 // `serde_json::Value` precisely so unknown keys ride
                 // through; the byte-level adapter must not drop them.
@@ -170,7 +170,7 @@ mod tests {
     /// Note: this is the **adapter** idempotency, distinct from the
     /// framework's selection-rule idempotency (the apply loop never
     /// invokes `apply` on a file at the target version in the first
-    /// place — § 4.2 binding rule). Both shoulds hold; this test pins
+    /// place). Both shoulds hold; this test pins
     /// the inner property.
     #[test]
     fn migration_v001_idempotent_when_already_applied() {

@@ -342,8 +342,9 @@ pub fn read_resolved_json(session_id: &SessionId) -> Result<ResolvedReport, Sand
 /// `(domain, ip, ttl)` stream. This function attaches the rule's
 /// `port` (and routes to the `tcp`/`udp` set based on the rule's
 /// protocol) when it materialises the effective nftables ruleset.
-/// See `.tasks/specs/2026-04-21-port-explicit-policies-presets-observability-design.md`
-/// §"Compiler consequences — nftables" (Part 1, lines 173-177).
+/// Each allow element is `<ip> . <port>` keyed on the rule's explicit port
+/// and protocol; the port-explicit design superseded the earlier hardcoded
+/// `dport { 80, 443 }` approach.
 ///
 /// Called by the DNS propagation loop; both tables are fully
 /// regenerated on each call (flush-and-redefine, not incremental

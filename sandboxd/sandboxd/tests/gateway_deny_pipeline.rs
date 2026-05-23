@@ -527,14 +527,12 @@ async fn integration_tcp_connect_to_non_allowlisted_destination_emits_deny_event
         String::from_utf8_lossy(&curl_out.stderr)
     );
     let curl_stderr = String::from_utf8_lossy(&curl_out.stderr).to_lowercase();
-    // Spec
-    // (`.tasks/specs/2026-04-21-port-explicit-policies-presets-observability-design.md`
-    // §"TCP deny path", lines 790–870) calls for `accept +
-    // SO_ORIGINAL_DST + close(SO_LINGER{1,0})` → RST, which would
-    // surface to curl as "Connection reset by peer" or "Empty reply
-    // from server". Empirically against the current gateway image the
-    // SYN is dropped silently, so curl exits with code 28 and stderr
-    // "connection timed out". This assertion matches the e2e practice
+    // The TCP deny path calls for `accept + SO_ORIGINAL_DST +
+    // close(SO_LINGER{1,0})` → RST, which would surface to curl as
+    // "Connection reset by peer" or "Empty reply from server". Empirically
+    // against the current gateway image the SYN is dropped silently, so
+    // curl exits with code 28 and stderr "connection timed out". This
+    // assertion matches the e2e practice
     // in `tests/e2e/test_policy.py` (accepts timeout / refused /
     // no route as valid deny signatures). The *load-bearing*
     // deny-logger contract is the `deny` event with correct 5-tuple
@@ -676,12 +674,9 @@ async fn integration_udp_send_to_non_allowlisted_destination_emits_deny_event() 
         String::from_utf8_lossy(&nc_out.stdout)
     );
 
-    // Spec (`.tasks/specs/2026-04-21-port-explicit-policies-presets-
-    // observability-design.md` lines 810-817): the UDP deny event
-    // carries the **pre-DNAT** destination — `203.0.113.1:9999` here.
-    //
-    // Per `2026-05-01-udp-nft-loggers-design.md` Decision 2,
-    // unmatched UDP is mirrored to NFLOG group 1 at PREROUTING and
+    // The UDP deny event carries the **pre-DNAT** destination —
+    // `203.0.113.1:9999` here. Unmatched UDP is mirrored to NFLOG
+    // group 1 at PREROUTING and
     // then dropped — no DNAT, no userland listener, no conntrack
     // lookup. NFLOG copies the original IPv4+UDP headers to
     // userspace via `NFULA_PAYLOAD`, so the

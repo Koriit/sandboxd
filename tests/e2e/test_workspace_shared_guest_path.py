@@ -1,7 +1,7 @@
 """E2E tests for the ``shared:<host>:<guest>`` operator-supplied
 guest-path branch.
 
-The workspace spec promoted the historical fixed
+The shared-workspace feature promoted the historical fixed
 ``/home/agent/workspace`` mount point into an operator-controllable
 guest path: ``--workspace shared:<host>:<guest>`` lands the host
 directory at the chosen ``<guest>`` inside the session rather than
@@ -57,7 +57,7 @@ def _guest_path_for(backend: str) -> str:
 
 @pytest.mark.timeout(600)
 def test_workspace_shared_explicit_guest_path(sandbox_cli, backend, tmp_path):
-    """Spec § Tests / E2E — ``test_workspace_shared_guest_path.py``.
+    """
 
     Create a session with ``--workspace shared:<host>:<guest>``. Verify:
 

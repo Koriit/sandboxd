@@ -343,8 +343,8 @@ async fn policy_preset_expand_github_repo_emits_valid_policy() {
 
 /// `sandbox policy preset expand 'does-not-exist:'` exits non-zero
 /// with the `UnknownPreset` error text on stderr. Verifies that the
-/// CLI surfaces the `PresetError::Display` output verbatim (spec
-/// Part 2 "Error shapes").
+/// CLI surfaces the `PresetError::Display` output verbatim (preset
+/// error shapes).
 #[tokio::test]
 async fn policy_preset_expand_unknown_preset_exits_nonzero() {
     let (status, stdout, stderr) =
@@ -553,12 +553,12 @@ async fn policy_update_with_no_flags_errors_with_three_option_guidance() {
     assert!(stderr.contains("--clear"), "stderr:\n{stderr}");
 }
 
-/// Integration-style test mirroring the cross-check the spec asks for:
+/// Integration-style test mirroring the cross-check the design asks for:
 /// a create request with only `--preset 'npm:'` produces a daemon-side
 /// body that carries `source_presets: ["npm:"]` AND a policy whose
 /// rules include the npm registry host.
 ///
-/// This is the "daemon sees the wire shape the spec specifies" test.
+/// This is the "daemon sees the wire shape the design specifies" test.
 /// It complements the unit tests that verify CLI-internal types.
 #[tokio::test]
 async fn create_with_npm_preset_ships_source_presets() {

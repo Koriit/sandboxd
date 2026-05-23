@@ -1,5 +1,5 @@
 //! Hermetic integration test for the `sandbox update` stateful flow's
-//! idempotency contract — Spec 5 § 9.3.
+//! idempotency contract —.3.
 //!
 //! The full stateful flow (`update::apply_stateful` in `mod.rs`) needs
 //! root, `systemctl`, `docker`, a real `/run/sandbox/sandboxd.sock`,
@@ -21,7 +21,7 @@
 //!
 //! ## What "idempotent" means here
 //!
-//! Spec 5 §§ 3.2.15-17 + 5.2: re-running each backup primitive on
+//! Re-running each backup primitive on
 //! identical bytes is a no-op (`action=skip reason=identical`). The
 //! retention prune sees the same world after a second run if nothing
 //! else changed. This test exercises both halves against a synthetic
@@ -83,7 +83,7 @@ fn seed_synthetic_backup_tree(root: &Path, n_successful: usize) -> std::path::Pa
     in_progress_dir
 }
 
-/// **Spec 5 § 9.3 anchor:** stub install in a temp tree, simulated
+/// **the migration framework.3 anchor:** stub install in a temp tree, simulated
 /// update, second run all-skip.
 ///
 /// Concretely: seed the backups tree, run the retention-prune step,
@@ -133,7 +133,7 @@ fn integration_update_flow_idempotent() {
     );
 }
 
-/// Spec 5 § 3.2.15: the per-file copy primitive is sha256-idempotent.
+/// The per-file copy primitive is sha256-idempotent.
 /// Re-copying identical bytes returns `CopyAction::Skipped` — pinning
 /// the "second run = all skip" contract for the backup half of the
 /// stateful phase.
@@ -166,7 +166,7 @@ fn integration_backup_sha256_skip_branch_when_destination_identical() {
     assert_eq!(outcome.sha256.len(), 64, "sha256 hex should be 64 chars");
 }
 
-/// Spec 5 § 3.2.15: when the source file is absent, the primitive
+/// When the source file is absent, the primitive
 /// reports `CopyAction::SourceAbsent` and emits no manifest entry. The
 /// orchestration uses this to skip backing up `bridge.conf` on hosts
 /// that have not yet enabled QEMU bridge networking.
@@ -180,9 +180,9 @@ fn integration_backup_returns_source_absent_when_src_missing() {
     assert!(!dst.exists(), "no destination created when source absent");
 }
 
-/// Spec 5 § 5.2: a backup set with `completed_ok: false` is never
+/// A backup set with `completed_ok: false` is never
 /// auto-pruned, regardless of how many successful sets follow it. The
-/// `test_update_partial_failure_backup_set_preserved` Lima test (§ 9.1)
+/// `test_update_partial_failure_backup_set_preserved` Lima test
 /// covers the same property at the VM level; this is the hermetic
 /// version.
 #[test]
@@ -249,7 +249,7 @@ fn integration_backup_retention_never_prunes_failed_sets() {
     assert!(failed_dir.exists(), "failed set must survive prune (§ 5.2)");
 }
 
-/// Spec 5 § 3.2.18: the install-state's `previous_version` field is
+/// The install-state's `previous_version` field is
 /// `Option<String>` with `#[serde(default)]`. Older state files
 /// written by install.sh (which doesn't write the field) deserialise
 /// successfully with `previous_version: None`.
@@ -271,7 +271,7 @@ fn integration_install_state_tolerates_pre_spec5_state_file_shape() {
     assert_eq!(state.installed_version, "1.0.0");
 }
 
-/// Spec 5 § 3.2.24: the migrate-glue's tempfile path scheme places the
+/// The migrate-glue's tempfile path scheme places the
 /// per-migration tempfile next to the destination so the rename is
 /// atomic. A re-run produces the same path for the same `(target,
 /// migration_id)` pair — pinning the "second run is identical" anchor
@@ -285,6 +285,6 @@ fn integration_migrate_tempfile_path_is_stable_across_reruns() {
     assert_eq!(
         p1.to_str().unwrap(),
         "/etc/sandboxd/.users.conf.tmp.V001",
-        "Spec 5 § 3.2.24 canonical tempfile shape"
+        "the migration framework.2.24 canonical tempfile shape"
     );
 }

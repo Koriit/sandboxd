@@ -230,7 +230,7 @@ async fn resolves_by_name_and_by_id() {
     assert_eq!(body_by_name.propagated, body_by_id.propagated);
 }
 
-/// Spec § 2.4 + § 7.5 — foreign session ids must surface as HTTP 404,
+/// .5 — foreign session ids must surface as HTTP 404,
 /// indistinguishable on the wire from a truly nonexistent id. The
 /// handler resolves through `get_session_by_name_or_id`, which is
 /// scoped to the caller's `owner_username`; alice's session is

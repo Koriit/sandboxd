@@ -1,12 +1,12 @@
 //! Subprocess-free integration tests for the post-extraction trust
-//! check that pairs with sigstore verification — Spec 5 § 3.1.10.
+//! check that pairs with sigstore verification —.1.10.
 //!
 //! The signature-verify half is exercised end-to-end by the Lima E2E
 //! suite (real cosign binary, real release bundle); these tests cover
 //! the per-file digest half, which is hermetic enough to run inside the
 //! workspace integration profile.
 //!
-//! Spec 5 § 3.1.10's trust chain is sigstore(tarball) → MANIFEST →
+//! Trust chain: sigstore(tarball) → MANIFEST →
 //! sha256(file vs MANIFEST). The check pinned here is the third link:
 //! a MANIFEST that lists artefacts with sha256 values that do not match
 //! the on-disk bytes must surface `FetchError::ArtifactDigestMismatch`
@@ -54,7 +54,7 @@ fn stage_with_one_artefact(dest: &std::path::Path, recorded_sha: &str) -> Staged
     }
 }
 
-/// **Spec 5 § 3.1.10 anchor:** a MANIFEST that lists a tampered sha256
+/// **the migration framework.1.10 anchor:** a MANIFEST that lists a tampered sha256
 /// must produce `FetchError::ArtifactDigestMismatch { path, expected,
 /// got }` with all three fields populated faithfully. This is the
 /// production guarantee — without it, a tampered tarball with a valid
@@ -102,7 +102,7 @@ fn integration_artifact_digest_match_passes() {
 }
 
 /// Operator-pasted MANIFEST values often arrive in upper-case hex from
-/// some tools; the spec calls for `sha256sum -c` semantics which are
+/// some tools; the design calls for `sha256sum -c` semantics which are
 /// case-insensitive. Pin that here so a future refactor doesn't make
 /// case the wrong kind of trust boundary.
 #[test]

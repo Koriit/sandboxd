@@ -7,8 +7,7 @@
 //! the concrete, validated effective policy plus a `source_presets`
 //! audit field.
 //!
-//! See `.tasks/specs/2026-04-21-port-explicit-policies-presets-observability-design.md`
-//! Part 2 for the design.
+//! Presets are validated at load time (Part 2 of the observability design).
 //!
 //! # Current scope
 //!
@@ -33,8 +32,8 @@
 //!   [`PresetError::UnknownParamRef`]) that built-ins and the
 //!   user-preset expander share.
 //! - The [`PresetError`] hierarchy grows as phases need new failure
-//!   shapes. Every variant has a `Display` impl that matches the
-//!   wording called out in the spec and the Phase 0 decisions.
+//!   shapes. Every variant has a `Display` impl with operator-facing
+//!   error wording.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -156,12 +155,11 @@ impl Catalog {
 
     /// Look up a preset by name.
     ///
-    /// Resolution order (matches the spec's namespacing rule in Part 2
-    /// § "User-configured presets"):
+    /// Resolution order:
     /// 1. If `name` is in the shadow-conflict set (i.e. both a built-in
     ///    and a user preset file declare it), return
-    ///    [`PresetError::ShadowedName`] naming the user file. D-3 is
-    ///    emphatic that user files cannot override built-ins.
+    ///    [`PresetError::ShadowedName`] naming the user file. User files
+    ///    cannot override built-ins.
     /// 2. Otherwise return the matching built-in if any — built-ins
     ///    win in the absence of a conflict.
     /// 3. Otherwise return the matching user preset if any.
@@ -376,10 +374,10 @@ pub enum PresetError {
     },
 
     /// A user preset file declared more than one `repeatable: true`
-    /// param. Spec Part 2 lines 601-607 reserve multi-repeatable
-    /// semantics for built-ins (the paired `repo=`/`pr=` shape of
-    /// `github-pr`) because the CLI needs hand-written pairing logic
-    /// that a JSON template cannot express.
+    /// param. Multi-repeatable semantics are reserved for built-ins
+    /// (the paired `repo=`/`pr=` shape of `github-pr`) because the CLI
+    /// needs hand-written pairing logic that a JSON template cannot
+    /// express.
     TooManyRepeatableParams { path: PathBuf, count: usize },
 
     /// An invocation omitted a parameter declared `required: true`.
@@ -417,9 +415,8 @@ pub enum PresetError {
     UnknownParamRef { preset: String, ref_name: String },
 }
 
-/// Render a single `DuplicateDestination` collision block in the
-/// spec-mandated shape (Part 1 § "Error shape for duplicates", lines
-/// 140-150).  Shared between the single-collision
+/// Render a single `DuplicateDestination` collision block.
+/// Shared between the single-collision
 /// [`PresetError::DuplicateDestination`] variant and each block of the
 /// multi-collision [`PresetError::DuplicateDestinations`] variant so
 /// both error shapes stay textually identical per collision.

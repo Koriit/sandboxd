@@ -8,8 +8,7 @@
 //! binary's own `src/main.rs`, which is why these live here.
 //!
 //! Test names are intentionally `integration_*`-prefixed-or-suffixed
-//! per the project convention; the names used here mirror the Spec 5
-//! § 9.2 test labels so the spec rows map 1:1 to function names.
+//! per the project convention so the design rows map 1:1 to function names.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -21,7 +20,7 @@ fn sandbox_bin() -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// rebuild-image --backend gateway (Spec 5 § 8.1)
+// rebuild-image --backend gateway
 // ---------------------------------------------------------------------------
 
 /// `sandbox rebuild-image --backend gateway` exits 2 with the
@@ -46,7 +45,7 @@ fn integration_rebuild_image_gateway_backend_refuses_with_pointer_to_update() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         code, 2,
-        "Spec 5 § 8.1: --backend gateway must exit 2; stderr was:\n{stderr}"
+        "the migration framework.1: --backend gateway must exit 2; stderr was:\n{stderr}"
     );
     assert!(
         stderr.contains("sandbox update"),
@@ -60,7 +59,7 @@ fn integration_rebuild_image_gateway_backend_refuses_with_pointer_to_update() {
 }
 
 // ---------------------------------------------------------------------------
-// apply-config-migration access gating (Spec 5 § 4.3)
+// apply-config-migration access gating
 // ---------------------------------------------------------------------------
 
 /// `apply-config-migration` invoked by a non-root caller (the test
@@ -92,7 +91,7 @@ fn integration_apply_config_migration_subprocess_refuses_non_root_caller() {
 }
 
 // ---------------------------------------------------------------------------
-// dump-migration-set (Spec 5 § 3.1.4 — exit-criterion #9)
+// dump-migration-set
 // ---------------------------------------------------------------------------
 
 /// `sandbox dump-migration-set` exits 0 and prints a JSON array
@@ -125,7 +124,7 @@ fn integration_dump_migration_set_exits_zero_with_documented_json_shape() {
 }
 
 // ---------------------------------------------------------------------------
-// dump-proto-version (Spec 5 § 3.1.7 — pre-flight per-session classification)
+// dump-proto-version
 // ---------------------------------------------------------------------------
 
 /// `sandbox dump-proto-version` exits 0 and emits the documented
@@ -160,14 +159,14 @@ fn integration_dump_proto_version_exits_zero_with_documented_json_shape() {
 }
 
 // ---------------------------------------------------------------------------
-// integration_config_migration_applies_v001_to_legacy_file (Spec 5 § 9.3)
+// integration_config_migration_applies_v001_to_legacy_file
 // ---------------------------------------------------------------------------
 
 /// Stage a pre-V001 `users.conf` in a tempdir, run the framework's
 /// `apply_pending_at` against it (via the in-process library entry
 /// point so we don't need root for the canonical-path arm), assert the
 /// file post-condition stamps `_schema_version: 1` and prepends
-/// `"sandbox"` to every `allow_users` per Spec 1 § 5.5.
+/// `"sandbox"` to every `allow_users` per the documented contract.
 #[test]
 fn integration_config_migration_applies_v001_to_legacy_file() {
     use sandbox_cli::cfg_migrations::{TargetFile, apply_pending_at};
@@ -175,7 +174,7 @@ fn integration_config_migration_applies_v001_to_legacy_file() {
     let tmp = TempDir::new().expect("tempdir");
     let path = tmp.path().join("users.conf");
 
-    // Spec 1 § 5.5 Input B (multi-pool, multi-user, with comment).
+    // the documented contract Input B (multi-pool, multi-user, with comment).
     let legacy = br#"{
         "subnets": [
             { "cidr": "10.209.0.0/24", "allow_users": ["alice"], "comment": "alice prod" },

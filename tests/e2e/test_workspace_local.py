@@ -135,7 +135,7 @@ def _no_orphan_docker_resources(session_id: str) -> tuple[bool, str]:
 
 @pytest.mark.timeout(600)
 def test_workspace_local_create_and_describe(sandbox_cli, backend, tmp_path):
-    """Spec § Tests / E2E — ``test_workspace_local.py`` create + describe.
+    """
 
     Create a session with ``--workspace local:<host>:<guest>``. Verify:
 
@@ -248,7 +248,7 @@ def test_workspace_local_create_and_describe(sandbox_cli, backend, tmp_path):
 
 @pytest.mark.timeout(600)
 def test_workspace_local_gitignore_filter(sandbox_cli, backend, tmp_path):
-    """Spec § Tests / E2E — gitignore filter on/off (``--no-gitignore``).
+    """
 
     Default behaviour: ``rsync --filter=':- .gitignore'`` drops anything
     matched by a ``.gitignore`` file in the host tree. Operator opt-out:
@@ -449,7 +449,7 @@ def test_workspace_local_create_failure_tears_down(sandbox_cli, backend, tmp_pat
         # routes the message there should not require a test change.
         combined = (result.stdout or "") + (result.stderr or "")
         assert "local-workspace rsync failed" in combined, (
-            f"CLI must surface the spec-verbatim "
+            f"CLI must surface the design-verbatim "
             f"`local-workspace rsync failed` prefix from the daemon "
             f"so operators can grep for it; got:\n"
             f"stdout: {result.stdout}\nstderr: {result.stderr}"
@@ -531,7 +531,7 @@ def _guest_write(backend: str, session_id: str, guest_path: str, body: str) -> N
 
 @pytest.mark.timeout(600)
 def test_workspace_local_push_propagates_host_edit(sandbox_cli, backend, tmp_path):
-    """Spec § Push/pull commands — host edit propagates via ``push -f``.
+    """
 
     Create a ``local:`` session (which runs the initial create-time
     push). Edit a file on the host *after* the create-time push has
@@ -612,7 +612,7 @@ def test_workspace_local_push_propagates_host_edit(sandbox_cli, backend, tmp_pat
 
 @pytest.mark.timeout(600)
 def test_workspace_local_pull_propagates_guest_edit(sandbox_cli, backend, tmp_path):
-    """Spec § Push/pull commands — guest edit propagates via ``pull -f``.
+    """
 
     Create a ``local:`` session. Edit a file *inside the guest* (via
     the backend's native exec — ``docker exec`` / ``limactl shell``).
@@ -685,7 +685,7 @@ def test_workspace_local_pull_propagates_guest_edit(sandbox_cli, backend, tmp_pa
 @pytest.mark.container
 @pytest.mark.timeout(600)
 def test_workspace_local_push_dry_run(sandbox_cli, tmp_path):
-    """Spec § Push/pull commands — ``-n`` is side-effect-free.
+    """
 
     Edit a host file. Run ``sandbox workspace push -n <session>`` and
     assert:
@@ -767,7 +767,7 @@ def test_workspace_local_push_dry_run(sandbox_cli, tmp_path):
 @pytest.mark.container
 @pytest.mark.timeout(600)
 def test_workspace_local_pull_dest_override(sandbox_cli, tmp_path):
-    """Spec § Push/pull commands — ``--dest`` routes pull elsewhere.
+    """
 
     Create a ``local:`` session. Edit a guest file. Run ``sandbox
     workspace pull -f --dest <alt> <session>``. Assert:
@@ -859,7 +859,7 @@ def test_workspace_local_pull_dest_override(sandbox_cli, tmp_path):
 @pytest.mark.container
 @pytest.mark.timeout(600)
 def test_workspace_local_push_no_gitignore(sandbox_cli, tmp_path):
-    """Spec § Push/pull commands — ``--no-gitignore`` bypasses filter.
+    """
 
     Create a session with a ``.gitignore`` that ignores ``excluded/``.
     The create-time filter drops ``excluded/`` from the guest. Run

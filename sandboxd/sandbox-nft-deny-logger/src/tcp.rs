@@ -1,8 +1,8 @@
 //! TCP listener: emit one `deny` event per accepted connection, then
 //! close the socket with RST.
 //!
-//! Spec reference: Part 3 / "Listener design / TCP listener" (lines
-//! 803-811) and "Hardening rules" §§ 1, 3 (lines 835-843).
+//! Design reference: Part 3 / "Listener design / TCP listener" (lines
+//! 803-811) and "Hardening rules" (lines 835-843).
 //!
 //! The socket is **never read from**. Payload bytes are attacker-
 //! controlled; every field on the emitted event comes from the kernel
@@ -126,7 +126,7 @@ fn try_reserve(counter: &Arc<AtomicU32>, cap: u32) -> Option<ConnGuard> {
 /// Run the accept loop against an already-bound `listener`, emitting
 /// one deny event per accepted connection that fits under both caps.
 ///
-/// Concurrency cap (spec Part 3 / "Hardening rules" § 6): a shared
+/// Concurrency cap: a shared
 /// `AtomicU32` counts live handler tasks. Accepts past `conn_cap` are
 /// RST-closed immediately and counted into the periodic
 /// `rate_limited` summary (plan Phase 3) without emitting a deny
@@ -269,7 +269,7 @@ fn read_original_dst(socket: &TcpStream) -> io::Result<SocketAddrV4> {
 /// Apply `SO_LINGER {onoff=1, linger=0}` so the subsequent `close(2)`
 /// sends RST instead of the normal FIN handshake.
 ///
-/// Spec Part 3 / "Hardening rules" § 3. Failure here is non-fatal:
+///  / "Hardening rules". Failure here is non-fatal:
 /// without LINGER the close falls back to FIN, but the deny event is
 /// already emitted so the audit trail is intact.
 fn apply_linger_zero(socket: &TcpStream) {
@@ -367,7 +367,7 @@ mod tests {
     /// deterministically — the loopback-burst variant below covers
     /// the same invariant through the full accept loop but can't pin
     /// the exact deny/drop split without artificially slowing the
-    /// handler (spec forbids adding production-path test hooks).
+    /// handler (production-path test hooks are not permitted).
     #[test]
     fn try_reserve_refuses_past_cap_and_releases_on_drop() {
         let counter = Arc::new(AtomicU32::new(0));
@@ -428,8 +428,8 @@ mod tests {
     ///    everything else panics. No retries, no error-kind heuristics
     ///    around what counts as transient.
     ///
-    /// Plan Phase 3 / `tcp_respects_concurrency_cap`. Spec Part 3 /
-    /// "Hardening rules" § 6.
+    /// Plan Phase 3 / `tcp_respects_concurrency_cap`.  /
+    /// "Hardening rules".
     #[tokio::test]
     async fn integration_tcp_respects_concurrency_cap() {
         let dir = tempfile::tempdir().unwrap();

@@ -1,4 +1,4 @@
-//! Config migration framework — Spec 5 § 4.
+//! Config migration framework —.
 //!
 //! A small Rust module set inside `sandbox-cli/` that applies versioned
 //! transforms to `/etc/sandboxd/users.conf` and `/etc/qemu/bridge.conf`.
@@ -9,7 +9,7 @@
 //! The framework lives in `sandbox-cli/` rather than `sandbox-core/`
 //! because the only invoker is the CLI's `sandbox update` orchestration
 //! — the daemon never applies migrations itself. The daemon's role is
-//! to **refuse to start** on schema mismatch (Spec 5 § 4.7, which lives
+//! to **refuse to start** on schema mismatch (the migration framework.7, which lives
 //! in `sandbox-core::users_conf` / `sandbox-core::bridge_conf`); that
 //! refusal does not need the framework or its registry.
 
@@ -54,7 +54,7 @@ pub enum MigrationError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TargetFile {
     /// `/etc/sandboxd/users.conf` (JSON; `_schema_version` top-level
-    /// integer per Spec 1 § 4.2).
+    /// integer per the documented contract).
     UsersConf,
     /// `/etc/qemu/bridge.conf` (text; first-line
     /// `# sandbox-schema-version: <int>` header). Reserved — no
@@ -152,7 +152,7 @@ pub fn registry() -> &'static [&'static dyn ConfigMigration] {
 /// Return the full ordered list of pending migrations for `file` from
 /// `current` (exclusive) to `target` (inclusive). Used for display
 /// purposes — the `--check` pending-migrations summary and the
-/// confirmation prompt. The `apply_pending` loop in § 4.3 does NOT
+/// confirmation prompt. The `apply_pending` loop does NOT
 /// call this; it uses `find()` on the registry directly for sequential
 /// one-step-at-a-time application.
 pub fn pending(file: TargetFile, current: u32, target: u32) -> Vec<&'static dyn ConfigMigration> {
@@ -212,7 +212,7 @@ pub fn dump_migration_set() -> Vec<MigrationEntry> {
 // Atomic write
 // ---------------------------------------------------------------------------
 
-/// Write `bytes` atomically over `path`. Spec 5 § 4.4: use
+/// Write `bytes` atomically over `path`..4: use
 /// `NamedTempFile::new_in(parent)` + `persist(path)`. Same-FS rename
 /// guarantees no half-written state — `rename(2)` is atomic when src
 /// and dst are on the same filesystem.
@@ -328,8 +328,8 @@ pub fn apply_pending_at(file: TargetFile, path: &Path) -> Result<Vec<u32>, Migra
 }
 
 /// Apply a single migration in memory and return the produced bytes
-/// without writing anywhere. Used by `sandbox update --dry-run` (Spec 5
-/// § 3.1.12) and by the hidden `--apply-config-migration` subcommand
+/// without writing anywhere. Used by `sandbox update --dry-run`
+/// and by the hidden `--apply-config-migration` subcommand
 /// (which then `sudo -k mv`s the result into place externally).
 ///
 /// `migration` is resolved by id from the static registry. The caller
@@ -537,8 +537,7 @@ mod tests {
 
     /// Synthetic V001 (0→1) + V002 (1→2) registry; seed a tempfile at
     /// V0; run apply_pending; assert applied == [101, 102] and the
-    /// final on-disk version reads as 2. Pins the walk-chain contract
-    /// of Spec 5 § 4.3.
+    /// final on-disk version reads as 2. Pins the walk-chain contract.
     #[test]
     fn apply_pending_walks_chain() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -707,7 +706,7 @@ mod tests {
     /// rejected with `MigrationError::Validation` before the atomic
     /// rename — the file on disk stays at its pre-migration content.
     ///
-    /// Spec 5 § 4.4 fail-closed contract: a buggy migration that
+    /// Fail-closed contract: a buggy migration that
     /// produces bytes the daemon won't load must never reach the
     /// canonical path. A regression that disabled the round-trip
     /// check would trip this test.
@@ -757,7 +756,7 @@ mod tests {
     /// rejected with `MigrationError::Validation` before the atomic
     /// rename — the file on disk stays at its pre-migration content.
     ///
-    /// Spec 5 § 4.5 contract: every migration is responsible for
+    /// Stamping contract: every migration is responsible for
     /// stamping its `to_version` into the file. A regression that
     /// disabled the version-marker sanity check would trip this test.
     #[test]
@@ -868,7 +867,7 @@ mod tests {
         }
     }
 
-    /// Pin the binding selection rule from Spec 5 § 4.2: every entry
+    /// Pin the binding selection rule from.2: every entry
     /// in the **production** registry has `to_version() ==
     /// from_version() + 1`. A future contributor adding a
     /// multi-version-skip migration trips this test.
@@ -1023,7 +1022,7 @@ mod tests {
     /// post-call doesn't require spawning a subprocess to surface.
     #[test]
     fn apply_migration_in_memory_runs_v001_against_users_conf_bytes() {
-        // V001 input from Spec 1 § 5.5 (single-user pool — Output A).
+        // V001 input from the documented contract (single-user pool — Output A).
         let input = br#"{"subnets":[{"cidr":"10.209.0.0/24","allow_users":["alice"]}]}"#.to_vec();
 
         // Look up V001 in the production registry rather than the
@@ -1041,7 +1040,7 @@ mod tests {
         // Output is JSON containing the stamped `_schema_version` and
         // the prepended `"sandbox"` entry in `allow_users`. Exact
         // bytes aren't pinned (serde may shuffle map key order, and
-        // the V001 spec doesn't constrain that); parse and assert
+        // the V001 migration doesn't constrain that); parse and assert
         // structural shape.
         let parsed: serde_json::Value =
             serde_json::from_slice(&out).expect("V001 output is valid JSON");

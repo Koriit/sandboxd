@@ -12,10 +12,8 @@
 //! satisfied. An empty axis is "no constraint" for that dimension. An
 //! `EventsFilter::default()` matches every event.
 //!
-//! Spec reference: `.tasks/specs/2026-04-21-port-explicit-policies-
-//! presets-observability-design.md`, Part 3 § "HTTP endpoint" and
-//! Part 3 § "Event categories" (for the enumeration of layer and
-//! event-name literals).
+//! The enumeration of layer and event-name literals matches the event
+//! categories defined in the observability system.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -37,7 +35,7 @@ use super::events_query_dto::{DecisionKind, EventsQueryDto};
 ///
 /// Variant set matches [`super::event_dto::EventDto`] exactly: `Dns`,
 /// `Envoy`, `Mitmproxy`, `DenyLogger`, `Lifecycle`. The on-wire
-/// representation mirrors the spec's layer literals from Part 3
+/// representation mirrors the layer literals from Part 3
 /// "Event shape": four lowercase single-word values plus the multi-word
 /// kebab-case `deny-logger`.
 ///
@@ -53,11 +51,11 @@ pub enum LayerKind {
 }
 
 impl LayerKind {
-    /// Parse a spec-authoritative layer string.
+    /// Parse a wire layer string.
     ///
     /// Accepts exactly `"dns"`, `"envoy"`, `"mitmproxy"`,
-    /// `"deny-logger"`, `"lifecycle"` (case-sensitive — the spec
-    /// prescribes lowercase / kebab-case). Any other value returns
+    /// `"deny-logger"`, `"lifecycle"` (case-sensitive — lowercase /
+    /// kebab-case). Any other value returns
     /// [`SandboxError::InvalidArgument`] with the offending text.
     pub fn parse(s: &str) -> Result<Self, SandboxError> {
         match s {
@@ -100,7 +98,7 @@ impl fmt::Display for LayerKind {
 /// Enumerates every event name the domain can emit today, grouped by
 /// layer for readability. Source of truth is
 /// [`crate::events::TrafficEvent`] / [`crate::events::LifecycleEvent`]
-/// plus the spec's Part 3 "Event categories" tables.
+/// plus the Part 3 "Event categories" tables.
 ///
 /// A mid-stream additive event (e.g., a future synthetic
 /// `ring_buffer_lag` lifecycle event) requires a new variant here
@@ -139,7 +137,7 @@ pub enum EventName {
 }
 
 impl EventName {
-    /// Parse a spec-authoritative event string.
+    /// Parse a wire event string.
     ///
     /// The accepted values are the snake_case strings used as
     /// `#[serde(tag = "event")]` discriminators on each per-layer DTO.
@@ -230,7 +228,7 @@ impl EventsFilter {
     ///
     /// Unknown layer / decision / event strings produce
     /// [`SandboxError::InvalidArgument`] with the offending text in
-    /// the error message — the spec explicitly calls out that an
+    /// the error message — the design explicitly calls out that an
     /// unknown `decision=reset` must fail loud rather than silently
     /// matching nothing.
     ///
@@ -778,7 +776,7 @@ mod tests {
 
     #[test]
     fn layer_axis_union_dns_and_deny_logger() {
-        // Mirrors the spec's repeat-param semantics:
+        // Mirrors the repeat-param semantics:
         // `?layer=dns&layer=deny-logger`.
         let mut f = EventsFilter::default();
         f.layers.insert(LayerKind::Dns);
@@ -902,7 +900,7 @@ mod tests {
 
     #[test]
     fn since_millisecond_boundary_is_inclusive() {
-        // Spec intent: `t >= since`. An event whose timestamp equals
+        // intent: `t >= since`. An event whose timestamp equals
         // `since` must match (no off-by-one drop at the boundary).
         let boundary = ts();
         let f = EventsFilter {

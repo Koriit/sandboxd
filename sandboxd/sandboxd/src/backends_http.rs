@@ -3,8 +3,10 @@
 //! The CLI fetches this endpoint once per invocation, caches the result
 //! for the invocation's lifetime, and uses it to drive client-side
 //! validation (e.g. rejecting `--hardened` against the container backend)
-//! and the `sandbox inspect -v` capability matrix render. See spec
-//! § "CLI learns capabilities via `GET /backends`" for the full contract.
+//! and the `sandbox inspect -v` capability matrix render. The endpoint
+//! returns a JSON map of backend kind → `Capabilities` DTO; the CLI
+//! caches this for the invocation lifetime and uses it for client-side
+//! validation and describe rendering.
 //!
 //! # Wiring
 //!

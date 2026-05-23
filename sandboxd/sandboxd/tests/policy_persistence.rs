@@ -25,7 +25,7 @@ use sandbox_core::{
 use tempfile::TempDir;
 
 /// Username every test-side caller is stamped as. The per-caller
-/// `owner_username` filter (spec § 2.4) requires every store call to
+/// `owner_username` filter requires every store call to
 /// carry the same identity so the fixture session is visible to later
 /// reads.
 const TEST_CALLER: &str = "test-operator";

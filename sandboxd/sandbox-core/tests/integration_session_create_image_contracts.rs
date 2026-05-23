@@ -11,7 +11,7 @@
 //!    successfully, the image is observable via `docker image
 //!    inspect`. The test re-uses the lite-image build contract
 //!    already pinned by `integration_lite_image_build_*` but renames
-//!    it to align with the daemon-productionization spec § 11.6
+//!    it to align with the daemon-productionization.6
 //!    naming.
 //!
 //! 2. **Missing gateway image is a hard refusal.** A daemon started
@@ -26,7 +26,7 @@
 //!    - the operator-visible hint rendered for that tag includes
 //!      the load-bearing substrings (`sandbox update`, the tag).
 //!
-//! Spec reference: daemon-productionization § 11.6 —
+//! Design reference: daemon-productionization (image pinning) —
 //! `integration_session_create_builds_lite_image_on_demand`,
 //! `integration_session_create_refused_on_missing_gateway_image`.
 
@@ -232,7 +232,7 @@ fn integration_session_create_refused_on_missing_gateway_image() {
     );
 
     // The operator-visible hint rendered for that tag includes the
-    // tokens the spec mandates: the missing tag and the
+    // tokens the design mandates: the missing tag and the
     // `sandbox update` remediation pointer.
     let hint = missing_gateway_image_hint(&tag);
     assert!(

@@ -11,8 +11,8 @@
 //!   wire-shape `SessionDto` round-trips with `backend == "container"`.
 //! - `integration_create_session_container_first_use_warning_surfaces`
 //!   — first call to `ensure_image` for a unique daemon-version tag
-//!   yields the verbatim spec warning string; the second call for the
-//!   same tag yields no warning (cache hit).
+//!   yields the verbatim first-use warning string; the second call for
+//!   the same tag yields no warning (cache hit).
 //! - `integration_create_session_container_rejects_hardened` — the
 //!   daemon rejects a `hardened: true` request when the container
 //!   backend is selected, before any state is allocated. Hermetic; no
@@ -25,7 +25,7 @@
 //!   Hermetic; no Docker daemon required.
 //! - `integration_create_session_lima_rejects_fractional_cpus` — the
 //!   daemon rejects a fractional `cpus` request on the Lima backend
-//!   with HTTP 400, surfacing the spec-aligned "integer cores"
+//!   with HTTP 400, surfacing the design-aligned "integer cores"
 //!   message rather than silently truncating `1.5` to `1` via the
 //!   downstream `as u32` cast. Hermetic; no Lima or limactl required.
 //!
@@ -285,8 +285,8 @@ fn container_spec() -> SessionSpec {
 /// passes as `guest_bind_source`. Tests that `docker create` a real
 /// container need the bind-mount source to exist on disk; tests that
 /// only exercise hermetic capability checks pass a synthetic path
-/// directly to `ContainerRuntime::new`. See api-session-isolation
-/// spec § 3.8.1 for the bind-mount design.
+/// directly to `ContainerRuntime::new`. See the api-session-isolation
+/// design for the bind-mount details.
 fn guest_bind_source_for_tests() -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::OnceLock;
@@ -425,7 +425,7 @@ async fn integration_create_session_container_first_use_warning_surfaces() {
     let _image_guard = TestImage::new(tag.clone());
 
     // First call: image is absent; `ensure_image` must build it and
-    // return `Built { warning }` carrying the spec-verbatim notice.
+    // return `Built { warning }` carrying the design-verbatim notice.
     let first_outcome = tokio::task::spawn_blocking({
         let tag = tag.clone();
         move || ensure_image(&tag)
@@ -442,7 +442,7 @@ async fn integration_create_session_container_first_use_warning_surfaces() {
     };
     assert_eq!(
         warning, LITE_FIRST_USE_WARNING,
-        "warning text must match the spec verbatim"
+        "warning text must match the design verbatim"
     );
 
     // Now drive the wire-shape end of the wiring: a session DTO
@@ -496,7 +496,7 @@ async fn integration_create_session_container_first_use_warning_surfaces() {
 ///
 /// The error shape pinned here:
 /// - `UnsupportedFeature::Hardening` is the canonical variant
-/// - its `Display` text matches the spec-verbatim sentence the CLI
+/// - its `Display` text matches the design-verbatim sentence the CLI
 ///   re-emits to operators
 #[test]
 fn integration_create_session_container_rejects_hardened() {
@@ -661,8 +661,8 @@ fn integration_create_session_container_advertises_workspace_capabilities() {
 ///
 /// The hole this test closes: a non-CLI HTTP client posting
 /// `{"backend":"container","no_cache":true}` was silently accepted —
-/// the CLI was the only enforcer of the spec § "CLI & UX → `sandbox
-/// create --no-cache` is forbidden on container" rule. Now the
+/// the CLI was the only enforcer of the rule that `sandbox create --no-cache`
+/// is forbidden on container. Now the
 /// validate gate is the canonical enforcer; the CLI's pre-check
 /// remains as a no-round-trip operator nicety.
 ///
@@ -774,7 +774,7 @@ fn integration_create_session_container_rejects_no_cache() {
 ///
 /// The hole this test closes: a non-CLI HTTP client posting
 /// `{"backend":"lima","cpus":1.5}` was silently downsized to a 1-CPU
-/// session via the `as u32` cast at the spec-projection site — a
+/// session via the `as u32` cast at the design-projection site — a
 /// classic "I asked for X, got Y" bug invisible to operators. The
 /// daemon now refuses such requests with HTTP 400; the CLI's path
 /// (which never reaches the daemon with a fractional Lima value)

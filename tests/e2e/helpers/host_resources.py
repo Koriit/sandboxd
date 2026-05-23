@@ -5,7 +5,7 @@ Mirrors the daemon's ``compute_default_resource_limits`` in
 verify the daemon's choice of resource defaults without re-implementing
 the formula by hand at every assertion site.
 
-The formula is the spec § "Resource defaults — container only":
+The formula is the design § "Resource defaults — container only":
 
 * ``memory_mb = floor(host_ram_mb * 0.8)``  (whole MB)
 * ``cpus = round(host_cpus * 0.8 * 10) / 10``  (one decimal place)

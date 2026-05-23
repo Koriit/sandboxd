@@ -31,8 +31,7 @@ impl From<&Session> for SessionDto {
         // `resolved_cpus`/`resolved_memory_mb` fields. The container
         // backend persists `0` as the "unset" sentinel and lets
         // `ContainerRuntime::resource_ceilings` substitute the daemon's
-        // host-80% default at create-time (spec § "Resource defaults —
-        // container only"); surfacing that resolved pair on the wire
+        // host-80% default at create-time; surfacing that resolved pair on the wire
         // lets HTTP-level callers confirm the actually-applied
         // ceiling without inspecting cgroup files. Lima sessions don't
         // use the sentinel — `cpus`/`memory_mb` are already the
@@ -76,7 +75,7 @@ impl From<&Session> for SessionDto {
             created_at: session.created_at,
             updated_at: session.updated_at,
             // V006 stamps the operator's username into the session row
-            // (api-session-isolation spec § 2.4 + § 2.6) at create time;
+            // (per-caller isolation) at create time;
             // surface that value verbatim on the wire so list / get
             // endpoints render the owner without a separate lookup.
             owner_username: session.owner_username.clone(),
@@ -232,8 +231,7 @@ impl From<&SessionConfig> for SessionConfigDto {
 /// Render a workspace mode as a short string for the legacy flat
 /// `workspace_mode` wire field.
 ///
-/// The four `Shared` compact-form cases follow the workspace spec
-/// (§ "Wire surface"):
+/// The four `Shared` compact-form cases follow the workspace wire format:
 ///
 /// - `shared:<host>` — default guest path (equal to `host_path`) and
 ///   no security-model override (`security_model = None`).

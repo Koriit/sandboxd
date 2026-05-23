@@ -1,7 +1,7 @@
 //! `sandbox-nft-deny-logger` — a gateway-container component that closes
 //! the silent-denial gap in the L3 flow.
 //!
-//! Spec references:
+//! Design references:
 //!   - `2026-04-21-port-explicit-policies-presets-observability-design.md`
 //!     Part 3 / "Deny-logger component" — original deny-logger contract.
 //!   - `2026-05-01-udp-nft-loggers-design.md` Decisions 2, 4, 5 — the
@@ -52,7 +52,7 @@ mod tcp;
 
 /// CLI arguments for the nft-deny-logger binary.
 ///
-/// Defaults match the spec's listener-port assignments: TCP on `:10001`,
+/// Defaults match the listener-port assignments: TCP on `:10001`,
 /// health on `:10003`. The UDP listener port (`:10002`) is gone — the
 /// UDP deny path is now NFLOG-driven, and the NFLOG group number is
 /// the new tunable.

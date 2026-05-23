@@ -43,7 +43,7 @@ pub struct SessionDto {
     /// Username of the operator that created the session — the value
     /// the daemon read from `SO_PEERCRED` + `getpwuid_r` at create
     /// time and stamped into the `owner_username` SQL column
-    /// (api-session-isolation spec § 2.4 + § 2.6). Surfaced on the
+    /// (per-caller isolation). Surfaced on the
     /// wire so `sandbox ps` / `inspect` can render "who owns this
     /// session" without a separate lookup; since every list / get
     /// endpoint is already filtered to the caller's own sessions, the
@@ -74,8 +74,7 @@ pub struct SessionDto {
     pub policy: Option<PolicyDto>,
     /// Operator-facing warnings produced during the request that
     /// produced this DTO. Populated by `POST /sessions` with the
-    /// container backend's first-use lite-image build notice (spec
-    /// § "Lite mode → first-use warning"); empty (and therefore
+    /// container backend's first-use lite-image build notice; empty (and therefore
     /// omitted) on every other endpoint and on the steady-state
     /// container path. Always treated as additive: older daemons
     /// rolling forward to a newer record never see this field, and
@@ -159,7 +158,7 @@ pub struct SessionDto {
 /// Wire representation of the rootless-Docker probe outcome stamped
 /// onto a container session at create time.
 ///
-/// Spec § Non-goals line 1195 declares rootless Docker out of scope
+///
 /// for the lite container backend; the daemon enforces this at
 /// session-create time and records the probe outcome here so
 /// `sandbox inspect` and `sandbox describe` can render the operator-
@@ -271,8 +270,7 @@ pub struct SessionMountInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfigDto {
     /// User-requested CPU ceiling. The wire type is `f32` (widened
-    /// from a historical `u32`) so the spec § "Resource defaults —
-    /// container only" 1-decimal precision survives the persisted
+    /// from a historical `u32`) so the resource-defaults 1-decimal precision survives the persisted
     /// round-trip.
     /// Lima sessions still see whole-number values; container
     /// sessions see whatever the operator passed (e.g. `1.5`) or

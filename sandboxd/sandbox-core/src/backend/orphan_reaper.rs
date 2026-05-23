@@ -1,6 +1,6 @@
 //! Boot-time orphan cleanup for the lite container backend.
 //!
-//! Spec § "Orphan cleanup on daemon start" (lite-mode container backend
+//!  (lite-mode container backend
 //! design): on every daemon boot, enumerate Docker resources living in
 //! the `sandbox-` namespace and prune any that are not referenced by a
 //! row in `sessions.db`. Same code path handles crash recovery — a
@@ -53,7 +53,7 @@
 //! /28 must not be torn down, because the out-of-pool half is by
 //! definition not ours. See [`DockerOps::inspect_network_ipam`] for
 //! the IPAM probe surface and `docs/concepts/networking.md`
-//! § "The naming scheme" for the prose-side dual-anchor description.
+//! for the prose-side dual-anchor description.
 //!
 //! Scope limitation: the dual-anchor protects siblings of out-of-pool
 //! networks **observed during the network pass**. A container or volume
@@ -71,7 +71,7 @@
 //!   continues. Daemon startup must not abort because Docker is unhappy.
 //! - Idempotent: re-running the reaper on a clean state is a no-op (the
 //!   live set covers everything; the reap-list is empty).
-//! - No daemon-config knob: the reaper runs unconditionally per spec
+//! - No daemon-config knob: the reaper runs unconditionally as designed
 //!   contract — there is no opt-in/opt-out env var or CLI flag.
 //!
 //! # Test seam
@@ -97,11 +97,9 @@ use crate::users_conf::Cidr4;
 // ---------------------------------------------------------------------------
 
 /// Prefix shared by every per-session home volume — `sandbox-home-{id}`
-/// (spec § "Per-session home volume").
 const HOME_VOLUME_PREFIX: &str = "sandbox-home-";
 
 /// Prefix shared by every per-session docker network — `sandbox-net-{id}`
-/// (spec § "Per-session network").
 const NETWORK_PREFIX: &str = "sandbox-net-";
 
 // ---------------------------------------------------------------------------
@@ -430,7 +428,7 @@ fn ipam_subnets_in_pool(subnets: &[Cidr4], pool: &Cidr4) -> bool {
 /// `docker <args>` with the standard 60s wall-clock timeout, returning
 /// trimmed stdout on success. Mirrors `container::run_docker` byte-for-
 /// byte but kept module-local so the reaper does not depend on
-/// `container.rs`'s internals; the spec calls this a sibling concern,
+/// `container.rs`'s internals; the design calls this a sibling concern,
 /// not an extension of the per-session lifecycle.
 async fn run_docker_raw(args: &[&str], operation: &'static str) -> Result<String, SandboxError> {
     use std::time::Duration;

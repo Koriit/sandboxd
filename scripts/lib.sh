@@ -1,16 +1,12 @@
 # lib.sh — shared shell constants for sandboxd installer and updater.
 #
-# Sourced by `scripts/install.sh` (Spec 4) and by the `sandbox update`
-# shell paths (Spec 5 § 3.1.9) so both fetch the same pinned cosign
-# version and matching SHA-256 checksums. A future Rust-side
-# cosign-bootstrap helper consumes the same values via `include_str!`
-# or a parallel `const`-mirror; whichever, the source of truth is this
-# file.
+# Sourced by `scripts/install.sh` and by the `sandbox update` shell
+# paths so both fetch the same pinned cosign version and matching
+# SHA-256 checksums. A future Rust-side cosign-bootstrap helper consumes
+# the same values via `include_str!` or a parallel `const`-mirror;
+# whichever, the source of truth is this file.
 #
 # POSIX `sh`-compatible. No bashisms.
-#
-# Bump process: see § 7.3 of the install-infrastructure design spec
-# (`docs/internal/specs/2026-04-29-install-infrastructure-design/...`).
 
 # Pinned cosign release used to verify signed release tarballs. The
 # variables below are referenced by `cosign_bootstrap` in install.sh

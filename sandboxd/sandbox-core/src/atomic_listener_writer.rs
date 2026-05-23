@@ -146,8 +146,7 @@ pub enum ListenerWriteError {
     /// the existing `policy_listener` — breaking the listener-identity
     /// invariants this design relies on (see the module-level rustdoc
     /// for the empirical warm-restart-with-drain caveat) and the
-    /// connection-preservation guidance in
-    /// `.tasks/specs/2026-04-19-l3-envoy-mitmproxy-flow-design.md`.
+    /// connection-preservation guidance in the L3/Envoy flow design.
     #[error(
         "listener-file invariant violated: field(s) outside the \
          filter-chains region differ between generations — {diff_summary}. \

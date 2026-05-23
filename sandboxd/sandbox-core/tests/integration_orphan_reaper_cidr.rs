@@ -2,8 +2,8 @@
 //!
 //! These tests stand up real Docker fixtures and exercise the
 //! second of the two ownership anchors documented at
-//! `sandbox-core/src/backend/orphan_reaper.rs` § "Dual-anchor
-//! ownership model": networks must lie inside the daemon's
+//! `sandbox-core/src/backend/orphan_reaper.rs` (dual-anchor
+//! ownership model): networks must lie inside the daemon's
 //! `NetworkManager` allocator pool to be reaped, even when the
 //! `sandbox-net-{12hex}` name prefix matches and the derived
 //! session id is absent from the live set.

@@ -1,6 +1,6 @@
 """E2E tests for the M11 lite-mode container backend.
 
-Covers the spec § "E2E tests" lite-specific assertions: feature
+Covers the design § "E2E tests" lite-specific assertions: feature
 rejection, hardening posture, resource defaults, gateway parity,
 git-remote-sandbox parity, and the β home-volume lifecycle. These
 assertions exercise the *container* backend end-to-end through the
@@ -131,8 +131,8 @@ def _get_session_json(socket_path: str, session_id: str, timeout: float = 5.0) -
 
 @pytest.mark.timeout(300)
 def test_hardened_rejected_for_lite(sandbox_cli):
-    """Spec § "CLI & UX → Feature-mismatch errors": ``--hardened`` ↔
-    ``--lite`` is a CLI-side rejection (exit 2) with the spec-shaped
+    """"CLI & UX → Feature-mismatch errors": ``--hardened`` ↔
+    ``--lite`` is a CLI-side rejection (exit 2) with the design-shaped
     error wording. The daemon is never contacted; the rejection lives
     in ``render_feature_mismatch`` (sandbox-cli/src/backend.rs).
     """
@@ -160,8 +160,8 @@ def test_hardened_rejected_for_lite(sandbox_cli):
 
 @pytest.mark.timeout(300)
 def test_no_cache_rejected_for_lite(sandbox_cli):
-    """Spec § "`sandbox create --no-cache` is forbidden on container":
-    ``--lite --no-cache`` exits 2 with the spec error wording. The
+    """"`sandbox create --no-cache` is forbidden on container":
+    ``--lite --no-cache`` exits 2 with the design error wording. The
     rejection is the CLI-side gate in ``main.rs`` (runs before the
     daemon is contacted); the daemon-side mirror lives in
     ``SessionSpec::validate``.
@@ -177,7 +177,7 @@ def test_no_cache_rejected_for_lite(sandbox_cli):
     assert "--no-cache" in result.stderr, (
         f"stderr must mention --no-cache.\nstderr: {result.stderr}"
     )
-    # Spec wording: "`--no-cache` is not supported with `--lite` /
+    # the documented designwording: "`--no-cache` is not supported with `--lite` /
     # container backend"
     assert "not supported" in result.stderr, (
         f"stderr must say 'not supported'.\nstderr: {result.stderr}"
@@ -191,7 +191,7 @@ def test_no_cache_rejected_for_lite(sandbox_cli):
 
 @pytest.mark.timeout(300)
 def test_lite_rootfs_is_readonly(lite_harness):
-    """Spec § Hardening: lite containers run with ``--read-only``, so
+    """
     writes to ``/`` fail with EROFS. ``LiteBackendHarness`` captures
     the probe so this test can stay focused on the create + assert
     shape.
@@ -207,7 +207,7 @@ def test_lite_rootfs_is_readonly(lite_harness):
 
 @pytest.mark.timeout(300)
 def test_lite_blocks_docker_in_docker(lite_harness):
-    """Spec § Hardening: no privileged mode, no Docker socket mount.
+    """
 
     Probe: ``ls /var/run/docker.sock`` returns non-zero (the path is
     absent inside the namespace).
@@ -223,7 +223,7 @@ def test_lite_blocks_docker_in_docker(lite_harness):
 
 @pytest.mark.timeout(300)
 def test_lite_blocks_user_namespace(lite_harness):
-    """Spec § Hardening: ``--cap-drop ALL`` removes CAP_SYS_ADMIN, so
+    """
     new user namespaces cannot be created. Probe via ``unshare --user
     true``.
     """
@@ -238,7 +238,7 @@ def test_lite_blocks_user_namespace(lite_harness):
 
 @pytest.mark.timeout(300)
 def test_lite_resource_defaults_match_host_80pct(lite_harness, sandbox_daemon):
-    """Spec § "Resource defaults — container only": creating a lite
+    """"Resource defaults — container only": creating a lite
     session without ``--cpus`` / ``--memory`` applies the daemon's
     host-80% defaults at the runtime layer.
 
@@ -407,7 +407,7 @@ def test_lite_git_remote_sandbox(
 
 @pytest.mark.timeout(600)
 def test_lite_gateway_parity(lite_harness, sandbox_cli):
-    """Spec § "Gateway integration": the gateway container (Envoy +
+    """"Gateway integration": the gateway container (Envoy +
     mitmproxy + CoreDNS) is attached to lite sessions exactly the same
     way it is attached to Lima sessions. Apply a policy that allows
     only ``example.com`` and verify the allow path succeeds while a
@@ -499,7 +499,7 @@ def test_lite_gateway_parity(lite_harness, sandbox_cli):
 
 @pytest.mark.timeout(300)
 def test_lite_workspace_uid_alignment(lite_harness, tmp_path):
-    """Spec § "Workspace bind": mounting a host directory as
+    """"Workspace bind": mounting a host directory as
     ``--workspace shared:<path>`` makes it available at
     ``/home/agent/workspace/`` inside the lite container, and files
     written from inside the session land on the host with the *host*
@@ -573,7 +573,7 @@ def test_lite_workspace_uid_alignment(lite_harness, tmp_path):
 
 @pytest.mark.timeout(600)
 def test_lite_home_volume_lifecycle_beta(lite_harness, sandbox_cli):
-    """Spec § "Home directory persistence (beta)": the named volume
+    """"Home directory persistence (beta)": the named volume
     ``sandbox-home-<id>`` is mounted at ``/home/agent`` and survives
     ``stop`` + ``start``; ``rm`` removes the volume.
 
@@ -650,12 +650,12 @@ def test_lite_home_volume_lifecycle_beta(lite_harness, sandbox_cli):
 def test_lite_orphan_cleanup_on_daemon_restart(
     lite_harness, sandbox_binaries, sandbox_daemon
 ):
-    """Spec § "Orphan cleanup on daemon start" / spec § Testing line 1023:
+    """"Orphan cleanup on daemon start" / 
     "kill the daemon mid-create, restart, assert orphan container and
     volume are reaped".
 
     We approximate "kill mid-create" with the simpler, deterministic
-    variant the spec authorises: create the lite session normally,
+    variant the design authorises: create the lite session normally,
     SIGKILL the daemon (so it has no chance to clean anything up),
     then mutate ``sessions.db`` to delete the session row — that
     leaves the ``sandbox-<id>`` container and ``sandbox-home-<id>``

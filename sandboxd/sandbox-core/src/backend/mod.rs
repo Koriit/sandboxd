@@ -6,7 +6,7 @@
 //! (see V005 migration) into a `HashMap<BackendKind, Arc<dyn SessionRuntime>>`
 //! held on `AppState`.
 //!
-//! See spec § "Architecture / Two traits" for the full rationale.
+//! See.
 
 use std::sync::Arc;
 
@@ -40,7 +40,7 @@ pub use capabilities::{BackendKind, Capabilities, IsolationLevel, UnsupportedFea
 /// capability matrix to drive client-side validation and the
 /// `sandbox inspect -v` capability table.
 ///
-/// See spec §"CLI learns capabilities via `GET /backends`" — the wire
+///  — the wire
 /// format is fixed at `[{"kind": "...", "capabilities": {...}}]`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendInfo {
@@ -128,8 +128,7 @@ pub struct RuntimeStartArgs {
 /// inner string — each backend's impl dereferences the handle through
 /// its own discovery primitive (`limactl list` / `docker inspect`).
 ///
-/// This is the structural convention shared by both backends; see spec
-/// § "Persistence / Handle persistence: none, by convention".
+/// This is the structural convention shared by both backends.
 /// `RuntimeHandle` is **not** persisted — the daemon rehydrates it on
 /// startup from the session id alone.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -177,7 +176,7 @@ impl std::fmt::Display for RuntimeHandle {
 /// over without semantic loss; `Unknown` carries the backend-specific
 /// status string for diagnostic display.
 ///
-/// See spec § "Architecture / Two traits". The runtime impls (Phase
+/// See. The runtime impls (Phase
 /// 1B+) are responsible for normalising backend output into one of
 /// these variants.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,7 +234,7 @@ impl<T: AsyncRead + AsyncWrite + ?Sized> AsyncReadWrite for T {}
 /// sandboxd's structured JSON guest protocol (`ping`, `exec`,
 /// `file upload`, `status`).
 ///
-/// See spec § "Architecture / Two traits" for why this is split from
+///  for why this is split from
 /// [`SessionRuntime::exec_interactive`].
 #[async_trait]
 pub trait GuestTransport: Send + Sync {
@@ -254,7 +253,7 @@ pub trait GuestTransport: Send + Sync {
 /// — a single instance per kind is shared across all sessions of that
 /// kind.
 ///
-/// See spec § "Architecture / Two traits".
+/// See.
 #[async_trait]
 pub trait SessionRuntime: Send + Sync {
     /// Which backend this runtime represents. Used by the daemon's
@@ -272,11 +271,10 @@ pub trait SessionRuntime: Send + Sync {
     /// Networking, gateway, and policy work happen outside the
     /// runtime.
     ///
-    /// The spec sketch (line 113) omits the session id; the daemon
-    /// assigns it before dispatch and passes it explicitly here,
-    /// mirroring `LimaManager::create_vm` and the deterministic-handle
-    /// convention in spec § "Persistence / Handle persistence: none,
-    /// by convention".
+    /// The session id is assigned by the daemon before dispatch and passed
+    /// explicitly here, mirroring `LimaManager::create_vm` and the
+    /// deterministic-handle convention: handles are not persisted by the
+    /// backend.
     async fn create(
         &self,
         session_id: &SessionId,
@@ -333,7 +331,7 @@ pub trait SessionRuntime: Send + Sync {
     /// push the binary, restart the guest service, return the runtime
     /// to its previous state if it wasn't already started for this
     /// call) and for atomicity within that substrate. The daemon
-    /// orchestrator (api-session-isolation spec § 3.4) only resumes
+    /// orchestrator (per-caller isolation) only resumes
     /// the normal start path after `Ok(())`.
     ///
     /// Idempotent — repeated invocations of this method on the same
@@ -407,7 +405,7 @@ mod tests {
     }
 
     /// `BackendInfo` serializes to the `{"kind": "...", "capabilities": {...}}`
-    /// shape mandated by the spec for `GET /backends`. Pinned here so a
+    /// shape mandated by the design for `GET /backends`. Pinned here so a
     /// silent rename of either field (or a stray `#[serde(rename)]`)
     /// breaks compile-time rather than reaching CLI consumers.
     #[test]

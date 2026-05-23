@@ -65,8 +65,8 @@ impl<'de> Deserialize<'de> for Policy {
                 return Err(D::Error::custom(
                     "policy file uses schema v1.0.0, which is no longer supported. \
                      v1 conflated port and protocol; v2 requires an explicit port per rule. \
-                     See .tasks/specs/2026-04-21-port-explicit-policies-presets-observability-design.md \
-                     for migration examples.",
+                     Update your policy file to schema 2.0.0: add an explicit `port` field \
+                     to each rule.",
                 ));
             }
             if version != SCHEMA_VERSION {
@@ -615,9 +615,8 @@ pub const ENVOY_ACCESS_LOG_IN_CONTAINER: &str = "/var/log/gateway/events/envoy.j
 ///
 /// Used by [`PolicyCompiler::validate_with_sources`] to attribute
 /// `(host, port)` collisions to their originating source (policy file,
-/// preset application). The spec mandates that duplicate errors name
-/// every contributing source so operators can resolve collisions
-/// without guessing.
+/// preset application). Duplicate errors name every contributing source
+/// so operators can resolve collisions without guessing.
 ///
 /// A caller that does not distinguish sources can pass an empty slice
 /// and the validator will report every rule as [`RuleSource::PolicyFile`]
@@ -634,7 +633,7 @@ pub enum RuleSource {
 }
 
 impl RuleSource {
-    /// Human-readable label for the duplicate-rule error shape per spec:
+    /// Human-readable label for the duplicate-rule error shape:
     ///
     /// - `"policy file <path>"`        — [`RuleSource::PolicyFile`] with a path
     /// - `"inline policy"`             — [`RuleSource::PolicyFile`] with no path
@@ -648,7 +647,7 @@ impl RuleSource {
     }
 }
 
-/// Format the spec-mandated duplicate-rule error naming both sources:
+/// Format the duplicate-rule error naming both sources:
 ///
 /// ```text
 /// policy validation failed: duplicate destination (api.github.com, 443)
@@ -886,9 +885,8 @@ impl PolicyCompiler {
     /// `policy.rules`), missing entries default to
     /// [`RuleSource::PolicyFile`] with no path — the single-source case.
     ///
-    /// Duplicate `(host, port)` rules produce the spec-mandated error
-    /// shape naming every source, so operators can resolve policy-file /
-    /// preset collisions.
+    /// Duplicate `(host, port)` rules produce an error naming every
+    /// source so operators can resolve policy-file / preset collisions.
     pub fn validate_with_sources(
         policy: &Policy,
         sources: &[RuleSource],
@@ -983,9 +981,7 @@ impl PolicyCompiler {
     /// own set (`policy_allow_tcp`, `policy_allow_udp`) keyed on
     /// `ipv4_addr . inet_service`. The hardcoded `dport { 80, 443 }`
     /// port set from v1 is gone; each allow element carries the explicit
-    /// port from its policy rule. See
-    /// `.tasks/specs/2026-04-21-port-explicit-policies-presets-observability-design.md`
-    /// §"Compiler consequences — nftables" (Part 1, lines 162-180).
+    /// port from its policy rule.
     ///
     /// **Cross-table set references.** Ideally `sandbox_policy.output`
     /// would reference the sets living in `sandbox_dnat` directly
@@ -2563,8 +2559,8 @@ mod tests {
 
     #[test]
     fn validate_duplicate_error_names_both_sources() {
-        // Spec error shape — sources are named so the operator can
-        // resolve policy-file / preset collisions without guessing.
+        // Sources are named so the operator can resolve policy-file /
+        // preset collisions without guessing.
         let policy = Policy {
             version: SCHEMA_VERSION.to_string(),
             rules: vec![
@@ -2596,7 +2592,7 @@ mod tests {
         let msg = err.to_string();
         assert!(
             msg.contains("duplicate destination (api.github.com, 443)"),
-            "expected spec duplicate-header; got: {msg}"
+            "expected duplicate-header; got: {msg}"
         );
         assert!(
             msg.contains("declared by preset 'github'"),
@@ -2741,11 +2737,10 @@ mod tests {
 
     #[test]
     fn validate_accepts_port_boundary_values() {
-        // u16 covers 1..=65535; 0 is reserved (spec: BETWEEN 1 AND 65535).
-        // `port: u16` rejects anything outside 0..=65535 at the type
-        // level. The in-range check the spec mandates sits on the store
-        // side (V004 migration — Commit 5), but exercising the Rust
-        // surface at 1 and 65535 protects the type contract.
+        // u16 covers 1..=65535; 0 is reserved. `port: u16` rejects
+        // anything outside 0..=65535 at the type level. The in-range
+        // CHECK sits on the store side (V004 migration), but exercising
+        // the Rust surface at 1 and 65535 protects the type contract.
         for port in [1u16, 22, 443, 65535] {
             let policy = Policy {
                 version: SCHEMA_VERSION.to_string(),
@@ -2861,7 +2856,7 @@ mod tests {
 
     #[test]
     fn parse_rejects_port_zero() {
-        // `port: 0` is outside the spec range [1, 65535]. u16 accepts
+        // `port: 0` is outside the valid range [1, 65535]. u16 accepts
         // 0, so this is a validator-level check — parser lets it
         // through but validate() rejects it.
         //
@@ -5603,7 +5598,7 @@ mod tests {
         );
         assert!(
             bootstrap.contains("port_value: 18080"),
-            "mitmproxy cluster must target port 18080 (not 8080 — see design spec):\n{bootstrap}"
+            "mitmproxy cluster must target port 18080 (not 8080):\n{bootstrap}"
         );
         assert!(
             bootstrap.contains("envoy.extensions.upstreams.http.v3.HttpProtocolOptions"),
@@ -5646,10 +5641,9 @@ mod tests {
         let compiled = PolicyCompiler::compile(&tls_policy(), &test_network_info()).unwrap();
         let bootstrap = &compiled.envoy_bootstrap_config;
 
-        // The design spec explicitly forbids wrapping the upstream
-        // transport socket in PROXY protocol. The CONNECT preface is
-        // emitted via per-chain `tcp_proxy.tunneling_config`, not via
-        // a transport-socket header.
+        // The upstream transport socket must NOT be wrapped in PROXY
+        // protocol. The CONNECT preface is emitted via per-chain
+        // `tcp_proxy.tunneling_config`, not via a transport-socket header.
         assert!(
             !bootstrap.contains("upstream_proxy_protocol"),
             "mitmproxy cluster must NOT wrap its transport in upstream_proxy_protocol:\n{bootstrap}"

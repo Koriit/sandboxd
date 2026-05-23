@@ -20,7 +20,7 @@ import { docsSchema } from '@astrojs/starlight/schema';
 // we keep the explicit `glob()` loader so we can tweak the pattern. The
 // `pattern` mirrors Starlight's default: recursive markdown variants,
 // excluding files whose name starts with `_`. We additionally exclude:
-//   - `internal/**`  — unpublished planning notes (session-plan, review, etc.)
+//   - `internal/**`  — unpublished planning notes (internal docs, review, etc.)
 //   - `README.md`    — GitHub-only landing; replaced by `index.md` once
 //                      authored. Excluded now to avoid build failures if the
 //                      file still exists at scaffold time.
@@ -42,7 +42,7 @@ export const collections = {
     }),
     // Extend Starlight's built-in schema to make `description` required on
     // every page. `title` is already required by `docsSchema()`. This
-    // enforces the frontmatter minimum stated in the design spec §6/§8.
+    // enforces the frontmatter minimum: every page needs a description.
     schema: docsSchema({
       extend: z.object({
         description: z.string(),

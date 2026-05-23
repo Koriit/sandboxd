@@ -1,6 +1,6 @@
 //! Integration test for the lite-mode orphan reaper.
 //!
-//! Spec § "Orphan cleanup on daemon start" — the reaper enumerates the
+//!  — the reaper enumerates the
 //! `sandbox-` Docker namespace at boot and removes any container,
 //! `sandbox-home-*` volume, or `sandbox-net-*` network whose derived
 //! session id is not present in `sessions.db`.

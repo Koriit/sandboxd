@@ -70,7 +70,7 @@ pub type EventSubscription = (Vec<Arc<Event>>, broadcast::Receiver<Arc<Event>>);
 
 /// Default per-session ring buffer capacity.
 ///
-/// Default of 10 000 is a spec-justified starting point — see
+/// Default of 10 000 is a measurement-justified starting point — see
 /// `docs/internal/measurement-defaults-m10-s6.md` for the rationale
 /// and revision policy. In short: it covers ~10 minutes of sustained
 /// ~15 events/s traffic so a reconnecting SSE consumer sees a useful

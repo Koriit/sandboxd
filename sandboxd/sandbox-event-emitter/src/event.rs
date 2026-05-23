@@ -8,7 +8,7 @@
 //! per line, matching the per-layer conventions already in use by
 //! Envoy / CoreDNS / mitmproxy inside the gateway container.
 //!
-//! Spec reference: `2026-04-21-port-explicit-policies-presets-observability-design.md`
+//! Design reference: `2026-04-21-port-explicit-policies-presets-observability-design.md`
 //! Part 3 / "Traffic events" table row for layer `deny-logger` (the
 //! `deny` / `rate_limited` shape) and
 //! `2026-05-01-udp-nft-loggers-design.md` Decision 3 / Decision 5
@@ -42,7 +42,7 @@ pub enum Protocol {
 /// shape across the historical UDP-listener and current NFLOG data
 /// sources, per `2026-05-01-udp-nft-loggers-design.md`).
 ///
-/// Field names are spec-canonical; **do not rename** without updating
+/// Field names are wire-canonical; **do not rename** without updating
 /// the ingest parser in sandbox-core. The wire shape is part of the
 /// daemon-side ingest contract.
 #[derive(Debug, Clone, Serialize)]
@@ -61,7 +61,7 @@ pub struct DenyRecord {
 /// ## Field rationale
 ///
 /// The wire envelope mirrors [`DenyRecord`] field-for-field on purpose:
-/// the spec calls out the allow event as "analogous to the deny events"
+/// the design calls out the allow event as "analogous to the deny events"
 /// (Decision 3 / 5) and the daemon-side event-mapper in
 /// `sandbox-core/src/api/event_mapper.rs` consumes both shapes through
 /// the same code path, with only the `event` discriminator distinguishing
@@ -84,12 +84,12 @@ pub struct DenyRecord {
 ///
 /// ## Fields deliberately omitted
 ///
-/// - **`flow_id` / conntrack tuple-id.** Considered, omitted. The spec
-///   resolves the allow-event signal to NEW-only (Resolution 7 — no
-///   `NFCT_T_DESTROY` subscription, no per-flow lifecycle), so there is
-///   no second event to correlate the id against. If a future follow-on
-///   adds an `allow_end` event sourced from `NFCT_T_DESTROY`, it can
-///   add `flow_id` additively without breaking the existing wire shape.
+/// - **`flow_id` / conntrack tuple-id.** Considered, omitted. The
+///   allow-event signal is NEW-only (no `NFCT_T_DESTROY` subscription,
+///   no per-flow lifecycle), so there is no second event to correlate
+///   the id against. If a future follow-on adds an `allow_end` event
+///   sourced from `NFCT_T_DESTROY`, it can add `flow_id` additively
+///   without breaking the existing wire shape.
 /// - **`flow_start_ts` distinct from envelope `timestamp`.** The envelope
 ///   `timestamp` (added by the emitter at line write time) is the
 ///   moment the logger observed the NFCT_T_NEW event, which on a
@@ -351,12 +351,11 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
         assert_eq!(json["event"], "rate_limited");
         assert_eq!(json["layer"], "deny-logger");
-        // Spec name — see spec Part 3 / "Hardening rules" § 5 and the
-        // plan's Q5 / the fix(events) commit on the base branch.
+        // the canonical wire field name.
         assert_eq!(json["rate_limited_count"], 42);
         assert!(
             json.get("dropped_events_count").is_none(),
-            "spec field is rate_limited_count, not dropped_events_count"
+            "wire field is rate_limited_count, not dropped_events_count"
         );
     }
 

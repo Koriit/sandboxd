@@ -8,7 +8,7 @@
 //! The ingest layer calls [`VmIpSessionMap::lookup`] to stamp the
 //! `session` field on each [`crate::events::EventEnvelope`]
 //! before publishing it to the [`crate::events::EventBus`] — this is the
-//! "session-ID attribution is sandboxd's job" concern from spec Part 3.
+//! "session-ID attribution is sandboxd's job" concern from the event wire format.
 //!
 //! Design notes:
 //!

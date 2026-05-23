@@ -8,7 +8,7 @@ jobs:
     # Lima requires KVM / nested virtualization. GitHub-hosted runners
     # do not expose /dev/kvm; this job rides on the same
     # `[self-hosted, kvm]` runner label `ci.yml`'s `e2e-matrix` job
-    # uses. Spec § 10.2 flags the dependency.
+    # uses.
     runs-on: [self-hosted, kvm]
     timeout-minutes: 60
     steps:

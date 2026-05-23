@@ -62,8 +62,8 @@ pub const SANDBOX_GUEST_VERSION: &str = env!("SANDBOX_GUEST_VERSION");
 ///
 /// For v1 the daemon supports exactly one protocol version (its own);
 /// future widening (a multi-version range, e.g.
-/// `DAEMON_GUEST_PROTO_VERSION-1 ..= DAEMON_GUEST_PROTO_VERSION`) lands
-/// in a follow-up spec and only edits this function.
+/// `DAEMON_GUEST_PROTO_VERSION-1 ..= DAEMON_GUEST_PROTO_VERSION`) only
+/// requires editing this function.
 pub fn is_protocol_compatible(session_proto: u32) -> bool {
     session_proto == DAEMON_GUEST_PROTO_VERSION
 }
@@ -78,7 +78,7 @@ pub fn is_protocol_compatible(session_proto: u32) -> bool {
 /// flip its arm to `false` without touching the daemon dispatch.
 ///
 /// `session_proto == 0` is treated as "unknown / pre-V006 record" — but
-/// V006 deletes all rows on apply (spec § 2.1), so this arm is
+/// V006 deletes all rows on apply, so this arm is
 /// defensive: in practice every row reaches this function with a real
 /// proto value. Integration tests construct synthetic `proto = 0` rows
 /// to drive the refuse arm of the start-session decision tree.
@@ -144,11 +144,11 @@ pub enum GuestRequest {
     Status,
     /// Ask the guest to self-report its compile-time
     /// [`DAEMON_GUEST_PROTO_VERSION`] and [`SANDBOX_GUEST_VERSION`]
-    /// constants. Used by diagnostic surfaces (Spec 3's `sandbox
+    /// constants. Used by diagnostic surfaces (the `sandbox
     /// doctor`, optional post-start cross-checks) to detect drift
     /// between the persisted DB columns and the actually-running guest
     /// binary. Not part of the refresh-on-start decision tree — that
-    /// path is DB-driven (spec § 3.10).
+    /// path is DB-driven.
     Version,
 }
 
@@ -330,8 +330,7 @@ impl GuestConnector {
     ) -> Result<GuestResponse, SandboxError> {
         // Daemon-internal subsystem: the handler boundary already
         // performed the per-caller ownership check before reaching
-        // `GuestConnector`, so the bypass is safe (api-session-isolation
-        // spec § 2.4).
+        // `GuestConnector`, so the bypass is safe (api-session-isolation).
         let session = self
             .store
             .get_session_unfiltered(session_id)?
@@ -1124,7 +1123,7 @@ mod tests {
         );
     }
 
-    // -- Compatibility-predicate tests (Spec 2 § 7.3) -----------------------
+    // -- Compatibility-predicate tests (the documented contract) -----------------------
 
     #[test]
     fn is_compatible_matches_current_version() {

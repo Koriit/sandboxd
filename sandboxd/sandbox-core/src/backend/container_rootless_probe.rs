@@ -1,13 +1,13 @@
 //! Rootless-Docker probe for the container backend.
 //!
-//! Spec § Non-goals line 1195 declares rootless Docker out of scope:
+//!
 //! Lite's target is **default-hardened Docker**. An earlier audit
 //! caught the gap between this prose contract and the daemon's
 //! actual behavior — a polarity-inverted `is_rootless_docker()` skipif
 //! on `tests/e2e/test_lite.py:493` was silently masking the fact that
 //! the daemon happily created container sessions on rootless hosts,
 //! where userns-remap shifts ownership of bind-mounted workspace files
-//! in ways the spec § Workspace UID-alignment contract does not cover.
+//! in ways the workspace UID-alignment contract does not cover.
 //!
 //! This module is the daemon-side detection point that closes the loop:
 //! it runs `docker info --format '{{.SecurityOptions}}'` once per

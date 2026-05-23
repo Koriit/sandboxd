@@ -1,6 +1,6 @@
 # `install-e2e` — install.sh / `sandbox update` E2E suite
 
-Pytest suite that boots a fresh Lima VM per test, runs `install.sh` or `sandbox update` end-to-end against it, and asserts the produced on-disk state matches the spec. Each test owns a dedicated VM; there is no shared install state between tests.
+Pytest suite that boots a fresh Lima VM per test, runs `install.sh` or `sandbox update` end-to-end against it, and asserts the produced on-disk state matches the design. Each test owns a dedicated VM; there is no shared install state between tests.
 
 The harness lives in `conftest.py`; the per-feature suites are `test_install_*.py` (install.sh paths) and `test_update_*.py` (`sandbox update` paths). See `make test-e2e-container` and `make test-e2e-matrix` for the canonical entry points.
 

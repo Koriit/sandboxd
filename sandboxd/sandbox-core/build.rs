@@ -4,7 +4,7 @@
 //! the source as a compile-time env var, so
 //! `sandbox-core::guest::SANDBOX_GUEST_VERSION` reflects the version of
 //! the guest binary built in this workspace without manually mirroring
-//! it. Spec 2 § 3.2 calls for this so the daemon's `create_session` /
+//! it. the documented contract calls for this so the daemon's `create_session` /
 //! refresh paths stamp `sessions.guest_binary_version` with the
 //! authoritative value.
 

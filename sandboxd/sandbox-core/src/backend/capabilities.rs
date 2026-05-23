@@ -1,6 +1,6 @@
 //! Capability surface shared by every [`super::SessionRuntime`] impl.
 //!
-//! See spec §"Capabilities model" for the rationale. Each backend declares
+//! See. Each backend declares
 //! a single [`Capabilities`] value which is consulted at request time by
 //! [`super::SessionSpec::validate`] and surfaced (in a future phase) on
 //! the `GET /backends` HTTP endpoint.
@@ -20,7 +20,7 @@ use crate::session::WorkspaceModeKind;
 /// representation matches the persisted `sessions.backend` column added
 /// by the V005 migration and the `BackendSpecific` variant tag.
 ///
-/// See spec §"Capabilities model" — `BackendKind` and `BackendSpecific`.
+/// See.
 ///
 /// `Default = Lima` so legacy on-disk rows that predate the V005
 /// `sessions.backend` column (and any older JSON snapshots that omit
@@ -73,7 +73,7 @@ impl std::fmt::Display for BackendKind {
 
 /// How strongly a backend isolates session workloads from the host.
 ///
-/// See spec §"Capabilities model" — `IsolationLevel`. `Vm` denotes
+/// See. `Vm` denotes
 /// hardware-accelerated VM isolation (Lima/QEMU); `Container` denotes
 /// Linux-namespace + cgroup isolation (Docker lite mode).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,7 +91,7 @@ pub enum IsolationLevel {
 /// constructors (or `..` syntax against a baseline) — adding a new
 /// capability never silently picks up a `false` default.
 ///
-/// See spec §"Capabilities model" — `Capabilities`. The `kind` field is
+/// See. The `kind` field is
 /// included here (rather than passed as a separate argument to
 /// [`super::SessionSpec::validate`]) so a `Capabilities` value carries
 /// everything the validator needs to attribute an
@@ -125,10 +125,8 @@ pub struct Capabilities {
     pub per_session_no_cache: bool,
     /// Set of [`WorkspaceModeKind`]s the backend can satisfy.
     ///
-    /// The spec sketches this as `EnumSet<WorkspaceMode>`; in practice
-    /// `WorkspaceMode` is data-bearing and cannot derive
-    /// `EnumSetType`, so the kind discriminator is used. See
-    /// [`WorkspaceModeKind`].
+    /// `WorkspaceMode` is data-bearing and cannot derive `EnumSetType`,
+    /// so the kind discriminator is used instead. See [`WorkspaceModeKind`].
     ///
     /// Deserialized via [`crate::session::deserialize_workspace_mode_kind_set`]
     /// so that an older client reading a newer daemon's capability
@@ -141,39 +139,38 @@ pub struct Capabilities {
 impl Capabilities {
     /// Static capability descriptor for the Lima/QEMU backend.
     ///
-    /// Each field is justified by the design spec
-    /// (`.tasks/specs/2026-04-22-lite-mode-container-backend-design`)
-    /// — see the per-field comments. This constructor is the canonical
-    /// source of truth used by [`super::lima::LimaRuntime::new`]
+    /// See the per-field comments for justification. This constructor
+    /// is the canonical source of truth used by
+    /// [`super::lima::LimaRuntime::new`]
     /// (Phase 1B+); a regression test in `backend::lima::tests` pins
     /// each field so a silent drift fails CI.
     pub fn for_lima() -> Self {
         Self {
-            // Spec § "Capabilities model" — `kind` discriminates the
+            //  — `kind` discriminates the
             // backend so `UnsupportedFeature` carries it onward.
             kind: BackendKind::Lima,
-            // Spec § "Architecture / Two implementations" — Lima is
+            //  — Lima is
             // the VM-isolation backend (QEMU + KVM).
             isolation: IsolationLevel::Vm,
-            // Spec § "What this breaks" — Lima exposes KVM, so
+            //  — Lima exposes KVM, so
             // nested-virt workloads (e.g. inner containers using KVM)
             // are honourable.
             nested_virt: true,
-            // Spec § "What this breaks" — VMs have full kernel
+            //  — VMs have full kernel
             // surface, so `mount`, raw `iptables`, etc. work.
             privileged_ops: true,
-            // Spec § "What this breaks" — Lima sessions get a real
+            //  — Lima sessions get a real
             // QEMU NIC, no `cap-drop` envelope around the guest.
             raw_network: true,
-            // Spec § "Capabilities model" / "Hardening" — Lima's QEMU
+            //  / "Hardening" — Lima's QEMU
             // wrapper honours the `--hardened` flag (device lockdown,
             // `systemd-run` cgroup limits).
             hardening_flag: true,
-            // Spec § "CLI & UX / `sandbox create --no-cache`" — the
+            //  — the
             // `--no-cache` flag triggers a per-session full VM build
             // instead of golden-image clone; only meaningful on Lima.
             per_session_no_cache: true,
-            // Spec § "Workspace modes" — Lima supports both 9p
+            //  — Lima supports both 9p
             // shared-mount and clone-into-VM modes.
             workspace_modes: EnumSet::all(),
         }
@@ -187,18 +184,18 @@ impl Capabilities {
 /// to ripple through the CLI's error printer; an exhaustive `match` on
 /// this enum forces that review.
 ///
-/// See spec §"Capabilities model" — `UnsupportedFeature`.
+/// See.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnsupportedFeature {
-    /// The spec asked for the QEMU `--hardened` flag but the target
+    /// The session requested the QEMU `--hardened` flag but the target
     /// backend does not support it.
     Hardening,
-    /// The spec asked for a workspace mode the target backend cannot
+    /// The session requested a workspace mode the target backend cannot
     /// satisfy. Carries the requested kind plus the backend that
     /// rejected it for operator-facing error messages.
     WorkspaceMode(WorkspaceModeKind, BackendKind),
-    /// The spec asked for `--no-cache` against a backend that does not
+    /// The session requested `--no-cache` against a backend that does not
     /// support per-session cache invalidation.
     PerSessionNoCache(BackendKind),
 }

@@ -200,7 +200,7 @@ pub enum WorkspaceMode {
     /// at session-create time. Unlike `Shared` there is no 9p device or
     /// bind-mount — the guest sees ordinary local files refreshed only
     /// when the operator explicitly invokes `sandbox workspace push` /
-    /// `pull`. See the workspace spec § `local:` Mode for the full lifecycle.
+    /// `pull`. See the workspace.
     ///
     /// `guest_path` defaults to the resolved `host_path` (per the
     /// parser); the custom deserializer below recovers a missing or
@@ -226,9 +226,8 @@ impl<'de> Deserialize<'de> for WorkspaceMode {
         // Private mirror with `guest_path` modelled as `Option<String>` so
         // that legacy records (missing the field, or with an empty-string
         // value) can be detected and recovered to `host_path`. The
-        // recovery rule matches the new default semantics — see the
-        // `Backward Compatibility` section of the workspace-ergonomics
-        // spec for the rationale.
+        // recovery rule matches the new default semantics: legacy records
+        // without `guest_path` recover with `guest_path = host_path`.
         #[derive(Deserialize)]
         #[serde(tag = "type", rename_all = "snake_case")]
         enum Wire {
@@ -459,7 +458,7 @@ impl WorkspaceMode {
 ///
 /// Pulled out into a free function so the (slightly long) right-to-left
 /// classifier algorithm stays readable next to the per-step documentation
-/// in the spec.
+/// in the design.
 fn parse_shared(rest: &str) -> Result<WorkspaceMode, String> {
     if rest.is_empty() {
         return Err(
@@ -533,7 +532,7 @@ fn parse_shared(rest: &str) -> Result<WorkspaceMode, String> {
 /// [`parse_host_guest_pair`]; the `local:` mode does not accept a
 /// security-model token (the corresponding step A in `parse_shared`
 /// is skipped here). After the classifier resolves the host/guest
-/// pair, the spec's SF-11 directory-required check rejects single-file
+/// pair, the SF-11 directory-required check rejects single-file
 /// or missing host paths with a pointer at `sandbox cp`.
 fn parse_local(rest: &str) -> Result<WorkspaceMode, String> {
     let (host_path, guest_path) = parse_host_guest_pair(rest, "local")?;
@@ -572,7 +571,7 @@ fn parse_local(rest: &str) -> Result<WorkspaceMode, String> {
 /// [`parse_host_guest_pair_from_tokens`]. `parse_local` has no
 /// security-model concept, so it calls this entry point which performs
 /// tokenisation, empty-token rejection, and the same 1..=2 cap from the
-/// spec's grammar (`local:<host>[:<guest>]`).
+/// the grammar (`local:<host>[:<guest>]`).
 fn parse_host_guest_pair(rest: &str, mode_label: &str) -> Result<(String, String), String> {
     if rest.is_empty() {
         return Err(format!(
@@ -597,7 +596,7 @@ fn parse_host_guest_pair(rest: &str, mode_label: &str) -> Result<(String, String
     parse_host_guest_pair_from_tokens(tokens, mode_label)
 }
 
-/// Apply spec steps B/C/D to an already-tokenised `tokens` vector that
+/// Apply parsing steps B/C/D to an already-tokenised `tokens` vector that
 /// has had any security-model trailing token popped off by the caller.
 ///
 /// `mode_label` is the user-facing prefix used in error messages
@@ -611,7 +610,7 @@ fn parse_host_guest_pair_from_tokens(
 ) -> Result<(String, String), String> {
     // Step B — strip a trailing guest-path token. The classifier accepts
     // tokens that start with `/` (absolute) or `~` (literal `/home/agent`
-    // substitution per the spec).
+    // substitution per the design).
     let guest_path: Option<String> = if tokens.len() >= 2 {
         let last = tokens.last().expect("len >= 2");
         if last.starts_with('/') || last.starts_with('~') {
@@ -699,7 +698,7 @@ fn strip_trailing_slashes(path: &str) -> String {
 
 /// Expand a leading `~` in a guest-side path to the canonical guest user
 /// home (`/home/agent`). The substitution is environment-free and runs
-/// identically on the CLI and the daemon, per the spec.
+/// identically on the CLI and the daemon, per the design.
 fn expand_guest_tilde(path: &str) -> String {
     if path == "~" {
         return "/home/agent".to_string();
@@ -822,8 +821,8 @@ pub struct SessionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template: Option<String>,
     /// 1-decimal CPU value for the container backend (`0.8`, `1.5`,
-    /// `2.0`, …). The wire boundary is `f32` so the spec § "Resource
-    /// defaults — container only" precision survives end-to-end (the
+    /// `2.0`, …). The wire boundary is `f32` so the resource-defaults
+    /// precision survives end-to-end (the
     /// historical `u32` shape silently truncated `1.5` to `1` in
     /// `ContainerRuntime::resource_ceilings`).
     ///
@@ -834,7 +833,7 @@ pub struct SessionConfig {
     /// runtime and the HTTP DTO render); `cpus` then carries the
     /// floored representation as a fallback for older readers.
     /// `None` on records written by daemons predating fractional cpus
-    /// (and on every Lima session, where integer cpus is the spec).
+    /// (and on every Lima session, where integer cpus is the design).
     /// Forward-compatible via `#[serde(default)]` per CLAUDE.md
     /// "On-disk compatibility".
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -876,7 +875,7 @@ pub struct SessionConfig {
 /// forced: true`.
 ///
 /// Lima sessions never construct this — the probe is gated to the
-/// container backend by spec § Non-goals 1195.
+/// container backend by.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionRootlessDocker {
     /// `true` when the host's `docker info` reported `name=rootless`
@@ -940,8 +939,7 @@ pub struct Session {
     /// Username of the operator who created this session. Stamped at
     /// `POST /sessions` from `SO_PEERCRED`-resolved identity and used
     /// as the per-caller filter on every subsequent
-    /// `SessionStore` read or mutation (api-session-isolation spec
-    /// § 2.4). Persisted as the `sessions.owner_username` SQLite column
+    /// `SessionStore` read or mutation. Persisted as the `sessions.owner_username` SQLite column
     /// added by migration V006; legacy rows written before V006 are
     /// erased by V006's destructive `DELETE FROM sessions` step, so
     /// every row reaching this field has a real value.
@@ -953,7 +951,7 @@ pub struct Session {
     pub owner_username: String,
     /// Daemon ↔ guest wire-protocol version stamped at session-create
     /// time. Bumped only when the protocol shape changes; the
-    /// `start_session` compat gate (api-session-isolation spec § 3.4)
+    /// `start_session` compat gate (per-caller isolation)
     /// reads this to decide whether to take the fast path, refresh the
     /// guest binary, or refuse.
     ///
@@ -1881,7 +1879,7 @@ mod tests {
 
     #[test]
     fn parse_flag_local_host_only_defaults_guest_to_host() {
-        // Spec § Parser-unit-test matrix: `local:/srv/repo` →
+        //
         // `host=/srv/repo, guest=/srv/repo`. `/tmp` is guaranteed to
         // exist and be a directory on every host the test runs on.
         let mode = WorkspaceMode::parse_flag("local:/tmp").unwrap();
@@ -1890,7 +1888,7 @@ mod tests {
 
     #[test]
     fn parse_flag_local_with_explicit_guest_path() {
-        // Spec § Parser-unit-test matrix:
+        //
         // `local:/srv/repo:/srv/dest` → `host=/srv/repo, guest=/srv/dest`.
         let mode = WorkspaceMode::parse_flag("local:/tmp:/srv/work").unwrap();
         assert_eq!(mode, local("/tmp", "/srv/work"));
@@ -1926,7 +1924,7 @@ mod tests {
 
     #[test]
     fn parse_flag_local_security_model_suffix_is_folded_into_host() {
-        // Spec § Parser-unit-test matrix:
+        //
         // `local:/srv/repo:none` → no `:none` security-model strip
         // (mode is `local`, not `shared`); step C folds the trailing
         // `:none` into `host_path=/srv/repo:none`; host-path-exists
@@ -1937,7 +1935,7 @@ mod tests {
 
     #[test]
     fn parse_flag_local_unclassified_trailing_token_folds_into_host() {
-        // Spec § Parser-unit-test matrix:
+        //
         // `local:/srv/repo:bogus` → tokens [/srv/repo, bogus]; step B
         // skips (no `/` or `~` prefix); step C folds into
         // `host_path=/srv/repo:bogus`; host-path-exists rejects.
@@ -2015,7 +2013,7 @@ mod tests {
 
         let input = format!("local:{path_str}");
         let err = WorkspaceMode::parse_flag(&input).unwrap_err();
-        // The error must name the spec's `sandbox cp` recovery and
+        // The error must name the `sandbox cp` recovery and
         // require directory-ness explicitly.
         assert!(
             err.contains("must be a directory for `local:`"),

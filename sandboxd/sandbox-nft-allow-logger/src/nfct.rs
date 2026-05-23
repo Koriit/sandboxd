@@ -253,7 +253,7 @@ impl NfctSubscriber {
     /// once with `nl_groups = 0x1` and immediately start receiving.
     ///
     /// Requires `CAP_NET_ADMIN` — present in the gateway container by
-    /// virtue of `--cap-add NET_ADMIN` (audit §2.4). The conntrack
+    /// virtue of `--cap-add NET_ADMIN` (audit). The conntrack
     /// subsystem is loaded by the existing gateway-container netlink
     /// setup.
     pub fn bind() -> Result<Self, NfctError> {

@@ -1,7 +1,7 @@
 //! Integration tests: the per-create isolation warning fires for the
 //! container backend (and only the container backend).
 //!
-//! Spec § "Isolation warning" (lines 751-762) mandates that **every**
+//!  (lines 751-762) mandates that **every**
 //! `--lite` / `--backend container` create prints a fixed two-line
 //! warning to stderr **before** the daemon round-trip, and that
 //! `--backend lima` does **not** print anything. The byte-equality
@@ -144,7 +144,7 @@ async fn run_sandbox(args: &[&str], socket: &str) -> (std::process::ExitStatus, 
     (output.status, stderr)
 }
 
-/// `sandbox create --lite` emits the spec's exact two-line warning to
+/// `sandbox create --lite` emits the exact two-line warning to
 /// stderr. Pin both lines (including the em dash and the six-space
 /// indent on line 2) — this is the wire-format contract.
 #[tokio::test]
@@ -159,14 +159,14 @@ async fn integration_isolation_warning_fires_for_lite_flag() {
         status.code()
     );
     // The warning is the first two lines of stderr — assert the exact
-    // bytes per spec § "Isolation warning". A subsequent unit test in
+    // bytes per. A subsequent unit test in
     // backend.rs pins this same string at the renderer level; the
     // duplication here verifies the wiring (eprint! reaches the
     // subprocess's stderr) without re-pinning the bytes a third time.
     let expected = "lite: container-backed session \u{2014} container-level isolation only (not VM-grade)\n      see guides/lite-mode for the trade-off details\n";
     assert!(
         stderr.starts_with(expected),
-        "stderr must begin with the spec warning bytes; got:\n{stderr}"
+        "stderr must begin with the design warning bytes; got:\n{stderr}"
     );
 }
 

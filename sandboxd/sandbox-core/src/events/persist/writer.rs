@@ -143,7 +143,7 @@ mod tests {
         assert_eq!(
             p,
             PathBuf::from("/var/lib/sandboxd/sessions/0123456789ab/events/dns-2026-04-22.jsonl"),
-            "path layout must match spec (no extra events/ prefix)"
+            "path layout must not include extra events/ prefix"
         );
     }
 

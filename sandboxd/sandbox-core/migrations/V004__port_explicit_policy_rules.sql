@@ -1,6 +1,4 @@
--- M10-S1 Phase 2 Commit 5 — v2 port-explicit policy schema (spec
--- `.tasks/specs/2026-04-21-port-explicit-policies-presets-observability-
--- design.md`, Part 1 § "Schema bump and migration").
+-- v2 port-explicit policy schema.
 --
 -- v2 rule identity is `(host, port)`. v1 rows lack a port column and
 -- may carry the deprecated protocol tokens `http`, `https`, `any`
@@ -35,7 +33,7 @@
 --     commit 2 of this phase; `destination_kind` keeps its name for
 --     continuity — only the `value` side of the pair changed.
 --   - New required `port` column with `CHECK (port BETWEEN 1 AND 65535)`
---     enforcing the spec's u16 range constraint.
+--     enforcing the u16 range constraint.
 --   - `protocol` CHECK tightened to `('tcp', 'udp')` — v1 tokens
 --     `http`, `https`, `any` are rejected at insert time.
 --
@@ -92,8 +90,8 @@ WHERE protocol NOT IN ('tcp', 'udp');
 -- (If a future migration needs to preserve tcp/udp rows, it would
 -- have to augment them with a port value supplied out-of-band,
 -- e.g. via the config_json. That is explicitly out of scope for
--- v2: the spec says "delete v1-shaped rows via table-copy"
--- without a preservation path.)
+-- v2: v1-shaped rows are deleted via table-copy without a
+-- preservation path.)
 DELETE FROM policy_rules;
 
 -- Step 5. Swap the tables.

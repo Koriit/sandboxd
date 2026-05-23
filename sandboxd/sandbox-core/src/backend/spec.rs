@@ -4,7 +4,7 @@
 //! `SessionSpec` is the daemon's authoritative view of "create a session
 //! shaped like *this*"; it is validated against a backend's
 //! [`super::Capabilities`] both client-side (CLI, fast feedback) and
-//! server-side (defense in depth) per spec §"Validation sites".
+//! server-side (defense in depth).
 //!
 //! Forward-compatibility on the wire follows the CLAUDE.md blob-field
 //! rule: any new field landing here must be `Option<T>` with
@@ -33,15 +33,13 @@ use super::capabilities::{BackendKind, Capabilities, UnsupportedFeature};
 /// The container variant is intentionally a near-clone of Lima's minus
 /// `hardened`; carrying both as a tagged enum (rather than collapsing
 /// into Lima's variant) means future divergence — extra fields,
-/// new defaults — does not require a schema migration. See spec
-/// §"Capabilities model" — `BackendKind` and `BackendSpecific`.
+/// new defaults — does not require a schema migration.
 ///
 /// CPU type per backend reflects what the backend actually accepts:
 /// Lima/QEMU pins integer cores (the Lima YAML and QEMU `-smp` flag
 /// both take whole CPUs), while Docker accepts a 1-decimal fraction
 /// (`--cpus 1.5`) as the cgroup CPU-quota knob. Container's `cpus`
-/// is therefore `f32` — preserving the spec § "Resource defaults —
-/// container only" 1-decimal precision end-to-end. Historically the
+/// is therefore `f32` — preserving 1-decimal CPU precision end-to-end. Historically the
 /// container variant was `cpus: u32` with an implicit `as f64`
 /// widening in `ContainerRuntime::resource_ceilings`, which silently
 /// truncated `1.5` to `1`.
@@ -100,8 +98,6 @@ impl BackendSpecific {
 /// inspect output for both backends; a future container backend could
 /// also honour it for storage-size hints.
 ///
-/// See spec §"Capabilities model" — `BackendSpecific` / `SessionSpec`.
-///
 /// `Eq` is intentionally not derived because `BackendSpecific::Container`
 /// carries `cpus: f32`; float types only implement `PartialEq`. Tests
 /// that previously asserted `Eq`-style equality continue to work via
@@ -147,23 +143,20 @@ pub struct SessionSpec {
 }
 
 impl SessionSpec {
-    /// Which [`BackendKind`] this spec targets.
+    /// Which [`BackendKind`] this [`SessionSpec`] targets.
     pub fn backend(&self) -> BackendKind {
         self.backend_specific.kind()
     }
 
-    /// Validate the spec against a backend's [`Capabilities`].
+    /// Validate the design against a backend's [`Capabilities`].
     ///
     /// Returns the first [`UnsupportedFeature`] mismatch found, or
-    /// `Ok(())` if the spec is satisfiable. The body matches
+    /// `Ok(())` if the design is satisfiable. The body matches
     /// exhaustively on `BackendSpecific` so adding a new variant
     /// produces a compile-time signal here. Capability flags
-    /// (workspace modes, future per-session-no-cache, etc.) are
-    /// checked in their own blocks below.
-    ///
-    /// See spec §"Validation sites" — called both by the CLI (after
-    /// parse, before any network I/O) and by the daemon on every
-    /// authoritative request.
+    /// (workspace modes, per-session-no-cache, etc.) are checked in
+    /// their own blocks below. Called both by the CLI (after parse,
+    /// before any network I/O) and by the daemon on every request.
     pub fn validate(&self, caps: &Capabilities) -> Result<(), UnsupportedFeature> {
         // Hardening: a Lima-shaped spec asking for hardened=true is
         // only honourable if caps.hardening_flag is set. We drive off
@@ -211,10 +204,9 @@ mod tests {
     use crate::session::WorkspaceModeKind;
 
     /// Baseline `Capabilities` value for a "Lima-shaped" backend, used
-    /// in tests to keep struct literals in one place. Matches the
-    /// per-backend defaults documented in spec § "What this breaks"
-    /// and § "Hardening" — Lima offers full VM isolation, hardening,
-    /// per-session cache invalidation, and both workspace modes.
+    /// in tests to keep struct literals in one place. Lima offers full
+    /// VM isolation, hardening, per-session cache invalidation, and
+    /// both workspace modes.
     fn lima_caps() -> Capabilities {
         Capabilities {
             kind: BackendKind::Lima,
@@ -230,11 +222,9 @@ mod tests {
 
     /// Baseline `Capabilities` value for a "container-shaped" backend
     /// — namespace + cgroup isolation only, no QEMU hardening flag, no
-    /// per-session cache invalidation. Matches spec § "What this
-    /// breaks". Workspace modes default to `Clone` only here for the
-    /// validate test that exercises the WorkspaceMode mismatch; a
-    /// Phase 1B `Capabilities::default_for_container()` may evolve
-    /// this set.
+    /// per-session cache invalidation. Workspace modes default to
+    /// `Clone` only here for the validate test that exercises the
+    /// WorkspaceMode mismatch.
     fn container_caps_clone_only() -> Capabilities {
         Capabilities {
             kind: BackendKind::Container,
@@ -279,7 +269,7 @@ mod tests {
         }
     }
 
-    /// Serde shape for `BackendSpecific::Lima` matches the spec
+    /// Serde shape for `BackendSpecific::Lima` matches the design
     /// (`{ "backend": "lima", ... }`).
     #[test]
     fn backend_specific_lima_serde_shape() {
@@ -298,7 +288,7 @@ mod tests {
         assert_eq!(parsed, value);
     }
 
-    /// Serde shape for `BackendSpecific::Container` matches the spec
+    /// Serde shape for `BackendSpecific::Container` matches the design
     /// (`{ "backend": "container", ... }`, no `hardened` field).
     ///
     /// `cpus` is `f32` so the serde-rendered value is a JSON number
@@ -354,9 +344,8 @@ mod tests {
         assert_eq!(parsed, container, "json={json}");
     }
 
-    /// Round-trip the spec § "Resource defaults — container only"
-    /// 1-decimal grid through serde without precision drift. Pins
-    /// the contract todo #67 enforces: `0.8`, `1.5`, `2.0` survive
+    /// Round-trip the container backend's 1-decimal CPU grid through
+    /// serde without precision drift: `0.8`, `1.5`, `2.0` survive
     /// the parse → store → serialize round-trip with bit-equality.
     #[test]
     fn backend_specific_container_cpus_one_decimal_grid_roundtrip() {
@@ -463,7 +452,7 @@ mod tests {
     /// whose hardening_flag is false yields `UnsupportedFeature::Hardening`.
     #[test]
     fn validate_rejects_hardening_when_caps_disable_it() {
-        // Take Lima caps and flip hardening off so the spec's request
+        // Take Lima caps and flip hardening off so the request
         // for hardened=true is refused.
         let mut caps = lima_caps();
         caps.hardening_flag = false;
@@ -475,7 +464,7 @@ mod tests {
         assert_eq!(err, UnsupportedFeature::Hardening);
     }
 
-    /// Hardening flag is irrelevant when the spec asks for
+    /// Hardening flag is irrelevant when the design asks for
     /// `hardened: false` — even on caps with hardening disabled the
     /// validate succeeds.
     #[test]

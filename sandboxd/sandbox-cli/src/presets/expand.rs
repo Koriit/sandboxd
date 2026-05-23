@@ -10,7 +10,7 @@
 //!   is owned by that fn.
 //! - **User-configured presets** substitute `${param}` into every
 //!   string field of every [`RawRuleTemplate`], applying the
-//!   Phase 2 parameter spec (required / optional, at most one
+//!   Phase 2 parameter rules (required / optional, at most one
 //!   repeatable param) and fanning out over the repeatable param
 //!   when present. The result is a `Vec<PolicyRule>` whose
 //!   `${param}` tokens have been resolved.
@@ -22,10 +22,6 @@
 //! template that does not depend on the param (Phase 4 will either
 //! merge or error). This is deliberate — each user repeat produces a
 //! full copy of the rule set with substitution applied.
-//!
-//! See `.tasks/handoffs/20260423-m10-s5-implementation-plan.md`
-//! § "Phase 3 — Built-in presets" for the plan that drives this
-//! module.
 
 use sandbox_core::{AssuranceLevel, Destination, HttpFilter, HttpMethod, PolicyRule, Protocol};
 
@@ -37,8 +33,8 @@ use super::{Catalog, ParsedInvocation, Preset, PresetError};
 /// Resolve `inv` against `catalog` and return its full rule set.
 ///
 /// Built-in dispatch is a direct call to the preset's fn pointer.
-/// User-preset dispatch walks the preset's `params` spec to validate
-/// the invocation, then substitutes `${param}` into each rule
+/// User-preset dispatch validates the invocation against the preset's
+/// `params` definition, then substitutes `${param}` into each rule
 /// template, fanning out over the at-most-one repeatable param.
 pub fn expand(catalog: &Catalog, inv: &ParsedInvocation) -> Result<Vec<PolicyRule>, PresetError> {
     match catalog.find(&inv.name)? {
@@ -125,7 +121,7 @@ fn expand_user_preset(
     // Missing optional non-repeatable params substitute to the empty
     // string. That is consistent with the Phase 2 scaffolding (which
     // preserves `${param}` in rule template strings verbatim and
-    // leaves substitution to this expander) and with the spec's
+    // leaves substitution to this expander) and with the
     // reading that optional params are omitted rather than defaulted.
 
     let mut non_repeating: Vec<(String, String)> = Vec::new();

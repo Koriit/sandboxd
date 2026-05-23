@@ -146,7 +146,7 @@ fn docker_image_inspect_succeeds(tag: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// First-use path: a fresh daemon-version tag is built, the warning
-/// text matches the spec verbatim, and `docker image inspect` confirms
+/// text matches the design verbatim, and `docker image inspect` confirms
 /// the image is registered with the host docker daemon afterwards.
 #[test]
 fn integration_lite_image_build_first_use_emits_warning_and_tags_image() {
@@ -160,7 +160,7 @@ fn integration_lite_image_build_first_use_emits_warning_and_tags_image() {
         EnsureImageOutcome::Built { warning } => {
             assert_eq!(
                 warning, LITE_FIRST_USE_WARNING,
-                "warning text must match the spec verbatim"
+                "warning text must match LITE_FIRST_USE_WARNING verbatim"
             );
         }
         EnsureImageOutcome::AlreadyPresent => {

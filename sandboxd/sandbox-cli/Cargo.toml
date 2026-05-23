@@ -34,9 +34,9 @@ hyper-util.workspace = true
 # `nix::sys::signal::kill` (the dead-PID probe — `kill(pid, 0)` returns
 # Ok iff the process still exists, ESRCH/EPERM otherwise).
 nix = { version = "0.29", features = ["user", "fs", "signal"] }
-# `ring::digest::SHA256` powers the backup-set sha256 hashing (Spec 5
-# § 3.2.15-17): each backup file's hash is captured in the manifest's
-# `files` map and compared against the source for idempotent re-runs
+# `ring::digest::SHA256` powers the backup-set sha256 hashing:
+# each backup file's hash is captured in the manifest's `files` map
+# and compared against the source for idempotent re-runs
 # (skip copy when bytes already match). `ring` is already in the
 # workspace dep set (used by sandbox-core for guest-agent hash, policy
 # fingerprint, and CA material) so this pulls it through the existing
@@ -58,7 +58,7 @@ serde.workspace = true
 serde_json.workspace = true
 # `cfg_migrations::atomic_write` uses `NamedTempFile::new_in(parent) +
 # persist(path)` to land each migration's output via rename(2) on the
-# same filesystem (Spec 5 § 4.4). Tempfile was already a dev-dep here
+# same filesystem. Tempfile was already a dev-dep here
 # for the binary-level tests; promoted to a runtime dep because the
 # migration framework's atomic-write path is production code.
 tempfile.workspace = true

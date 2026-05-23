@@ -91,7 +91,7 @@ struct Args {
     /// filename-embedded `YYYY-MM-DD` is strictly older than
     /// `today - retention_days` are removed by an hourly pruner.
     ///
-    /// Default of 14 days matches the 2026-04-21 spec Part 3 /
+    /// Default of 14 days matches the 2026-04-21 the event wire format /
     /// "Retention" suggested value and covers roughly two sprint
     /// cycles of traffic for post-incident review. Overridable via
     /// `SANDBOX_EVENTS_PERSIST_RETENTION_DAYS` (clap env-var fallback).
@@ -137,7 +137,7 @@ const BASE_DIR_SUBDIRS: &[&str] = &["sessions", "events", "backups"];
 
 /// The numeric mode every per-daemon state-dir subdirectory must
 /// carry. `0700` matches the daemon-uid-only access expectation
-/// recorded in the daemon-productionization spec § 5.1: the daemon
+/// recorded in the daemon-productionization.1: the daemon
 /// reads and writes its own state; no other uid has any business
 /// there.
 const BASE_DIR_SUBDIR_MODE: u32 = 0o700;
@@ -234,7 +234,7 @@ fn ensure_base_dir_layout(base_dir: &std::path::Path) -> Result<(), SandboxError
 }
 
 /// Mode pinned on `sandboxd.sock` immediately after bind. The
-/// daemon-productionization spec § 5.1 documents the socket as
+/// daemon-productionization.1 documents the socket as
 /// `0660 sandbox:sandbox`; doctor check C5 reads `stat(sock).mode &
 /// 0o777` against this constant. Forcing the mode explicitly avoids
 /// a false-negative on a host running under a `077`-style umask
@@ -248,8 +248,8 @@ const SOCKET_MODE: u32 = 0o660;
 ///
 /// `tokio::net::UnixListener::bind` creates the socket inode under the
 /// process umask, so the mode of the resulting file is non-deterministic
-/// across operator environments. The daemon-productionization spec
-/// § 5.1 nails the contract at `0660`; doctor check C5 (§ 6.3) reads
+/// across operator environments. The socket mode contract is `0660`;
+/// doctor check C5 reads
 /// the on-disk mode to verify it. Calling `set_permissions` immediately
 /// after the bind, before the accept loop starts, makes the contract
 /// hold regardless of umask and regardless of whether the operator
@@ -291,7 +291,7 @@ use sandbox_core::gateway::{gateway_image_present, missing_gateway_image_hint};
 // scopes `NetworkManager`'s per-session /28 allocation pool.
 //
 // See:
-//   - lite-mode container backend spec § "Install-time setup" / "Config file:
+//   - lite-mode container backend the documented contract / "Config file:
 //     /etc/sandboxd/users.conf" — the contract this validation enforces.
 //   - `sandbox_core::users_conf` — the loader that produces a parsed
 //     [`UsersConfig`]; we layer the daemon-uid lookup on top.
@@ -962,7 +962,7 @@ fn workspace_lock_for(
 ///
 /// - `Lima` carries the full Lima-side surface (`hardened`,
 ///   `memory_mb`, `cpus`).
-/// - `Container` mirrors the lite-mode wire shape from the spec —
+/// - `Container` mirrors the lite-mode wire shape from the design —
 ///   only `memory_mb` and `cpus` land on `BackendSpecific`; the
 ///   container backend rejects `--hardened` via its capability
 ///   matrix, and the request-side validation in `create_session`
@@ -1013,8 +1013,8 @@ fn session_spec_from_config(
     }
 }
 
-/// Round a request-supplied `cpus` value to the spec § "Resource
-/// defaults — container only" 1-decimal grid (e.g. `0.81 → 0.8`,
+/// Round a request-supplied `cpus` value to the 1-decimal grid
+/// (e.g. `0.81 → 0.8`,
 /// `1.55 → 1.5`).
 ///
 /// Mirrors the rounding [`compute_default_resource_limits`] applies to
@@ -1047,7 +1047,7 @@ use sandboxd::propagation::{PropagatedEdge, PropagationStates};
 // Peer-credential acceptor
 // ---------------------------------------------------------------------------
 //
-// Helper-identity-assertion spec § 6.1: every connection accepted on the
+// Helper-identity-assertion.1: every connection accepted on the
 // daemon's Unix socket is augmented with the operator identity the
 // kernel reports via `SO_PEERCRED`. The acceptor reads the credentials
 // immediately after `accept(2)`, resolves the uid to a username via
@@ -1244,8 +1244,8 @@ impl Connected<IncomingStream<'_, PeerCredListener>> for PeerCredAddr {
 /// `ConnectInfo<PeerCredAddr>` axum installs and inserts a plain
 /// `Extension<OperatorIdentity>` into the request's extension map.
 ///
-/// Handlers extract `Extension<OperatorIdentity>` directly (per spec
-/// § 6.2 wire shape); the layer hides the listener's `PeerCredAddr`
+/// Handlers extract `Extension<OperatorIdentity>` directly; the layer
+/// hides the listener's `PeerCredAddr`
 /// newtype so handler signatures do not have to reference an
 /// implementation detail of the orphan-rule workaround.
 async fn operator_identity_layer(mut req: Request, next: Next) -> axum::response::Response {
@@ -1369,8 +1369,7 @@ fn compute_initial_dns_policy(req: &CreateSessionRequest) -> String {
 ///
 /// Extracted as a pure function so the gate can be unit-tested without
 /// driving the full `create_session` handler (no `AppState`, no HTTP
-/// machinery). The wording is pinned by the workspace-ergonomics
-/// spec § `--no-gitignore` on `sandbox create`:
+/// machinery). The wording is:
 ///
 /// > `--no-gitignore is only meaningful for local: workspaces; this session uses <mode>:`
 ///
@@ -1498,7 +1497,7 @@ async fn create_session(
     // - For Container we feed `0` sentinels through, which
     //   `ContainerRuntime::resource_ceilings` interprets as "unset"
     //   and substitutes with the daemon's `compute_default_resource_limits`
-    //   host-80% ceilings (spec § "Resource defaults"). Without this
+    //   host-80% ceilings. Without this
     //   the host-80% path was unreachable through the public CLI
     //   surface (the previous `unwrap_or(2)/(4096)` always fired and
     //   produced Lima-leaning numbers regardless of backend).
@@ -1511,8 +1510,8 @@ async fn create_session(
     // container session that took the host-80% default has `0` in
     // both columns by construction.
     //
-    // `req.cpus` is `Option<f32>` so the spec § "Resource defaults —
-    // container only" 1-decimal grammar (`0.8`, `1.5`, …) reaches the
+    // `req.cpus` is `Option<f32>` so the 1-decimal grammar
+    // (`0.8`, `1.5`, …) reaches the
     // runtime without truncation. Lima sessions still see whole-number
     // cores (QEMU's `-smp` grammar pins integers), so we floor any
     // fractional value on the Lima path. The container path normalises
@@ -1535,7 +1534,7 @@ async fn create_session(
     // `SessionDto.warnings` is reserved for post-success operator
     // notices (e.g. lite-image first-use), not for masking malformed
     // sizing requests — so we hard-reject with HTTP 400 to mirror the
-    // spec § "Validation sites" pattern already used by `--hardened`
+    // the documented contract pattern already used by `--hardened`
     // on the container backend.
     if backend_kind == BackendKind::Lima && cpus_decimal_request.is_some_and(|c| c.fract() != 0.0) {
         return error_response(SandboxError::InvalidArgument(
@@ -1601,9 +1600,8 @@ async fn create_session(
     // `BackendSpecific::Container` does not carry `hardened`, so the
     // SessionSpec-level `validate()` path silently drops a `true`
     // value. Reject up front when a container request explicitly sets
-    // `hardened: true` so the failure mode matches spec §
-    // "Hardening" — operator-facing 400 with the same
-    // `UnsupportedFeature::Hardening` message Lima would surface
+    // `hardened: true` so the caller gets an operator-facing 400 with
+    // the same `UnsupportedFeature::Hardening` message Lima surfaces
     // through the validate path. `req.hardened == Some(true)` is the
     // wire-level signal of an *explicit* opt-in; an absent field
     // (operator did not pass `--hardened` and old CLIs that don't yet
@@ -1617,10 +1615,10 @@ async fn create_session(
         .into_response();
     }
 
-    // Daemon-side authoritative validation: spec § "Validation sites"
+    // Daemon-side authoritative validation: the documented contract
     // requires the daemon to repeat the capability check the CLI did.
     // The runtime is the single source of truth for its capability
-    // matrix. Threading `req.no_cache` through the spec projection
+    // matrix. Threading `req.no_cache` through the design projection
     // ensures a non-CLI HTTP client posting
     // `{"backend":"container","no_cache":true}` is refused by
     // `SessionSpec::validate` rather than silently honoured.
@@ -1635,7 +1633,7 @@ async fn create_session(
             .into_response();
     }
 
-    // Rootless-Docker enforcement (spec § Non-goals).
+    // Rootless-Docker enforcement.
     // Run BEFORE any container artifacts are touched —
     // including the lite-image build below and every subsequent
     // session-create step (CA, network, runtime). On rootless hosts
@@ -1672,7 +1670,7 @@ async fn create_session(
     // Container backend: ensure the lite image exists *before* we
     // burn a session row + network allocation. The first build of a
     // given daemon version surfaces a verbatim warning string back
-    // to the caller (spec § "Lite mode → first-use warning"); steady-
+    // to the caller; steady-
     // state hits return `AlreadyPresent` and contribute nothing to
     // `warnings`.
     let mut warnings: Vec<String> = Vec::new();
@@ -1699,11 +1697,11 @@ async fn create_session(
     // `req.name` is cloned because both backend branches below need to
     // reach back into `req` (workspace mode for container, repo/policy
     // for the shared post-create plumbing).
-    // Spec 2: the session is stamped with the operator's username at
+    // design note: the session is stamped with the operator's username at
     // creation time so every subsequent per-caller filter in
     // `SessionStore` matches. Guest-version fields are stamped from
     // the daemon's compiled-in constants so the start-time compat
-    // predicate (api-session-isolation spec § 3.3) immediately accepts
+    // predicate (per-caller isolation) immediately accepts
     // freshly-created sessions on the fast path.
     let session = match state.store.create_session_with_backend(
         config.clone(),
@@ -1886,21 +1884,20 @@ async fn create_session(
         // `workspace_bind` is populated when the request asked
         // for `--workspace shared:<host>[:<guest>]` — the runtime
         // turns it into a `docker create --mount
-        // type=bind,src=<host>,dst=<guest>` flag (spec § "Container
-        // Backend / Shared bind-mount"). For other workspace modes
+        // type=bind,src=<host>,dst=<guest>` flag. For other workspace modes
         // (`Clone`, `Empty`) the field stays `None` and the lite
         // image runs with a read-only rootfs.
         //
         // `route_helper_path = Some(...)` lets the runtime invoke
         // the setcap helper at start time to install the default
-        // route via the gateway IP inside the container's netns
-        // (spec § "Routing"). [`resolve_route_helper_path`] resolves
+        // route via the gateway IP inside the container's netns.
+        // [`resolve_route_helper_path`] resolves
         // the absolute path of the helper at the call site via a
         // two-step lookup: (0) the `$SANDBOX_ROUTE_HELPER_PATH` env
         // var (fail-closed if set but missing/un-cap'd), (1) the
         // canonical install path
-        // `/usr/local/libexec/sandboxd/sandbox-route-helper` per FHS
-        // § 4.7. Each candidate must carry `CAP_SYS_ADMIN+ep`.
+        // `/usr/local/libexec/sandboxd/sandbox-route-helper` (FHS § 4.7).
+        // Each candidate must carry `CAP_SYS_ADMIN+ep`.
         // Surfacing the lookup error here means lite-mode session
         // creation fails fast with an operator-actionable message
         // rather than at `docker start` time with `os error 2`.
@@ -1941,8 +1938,8 @@ async fn create_session(
             // `security_model` is meaningless for a Docker bind-mount
             // (it is a 9p concept on the Lima side); the daemon-side
             // mapper rejects any `Some(_)` value here so the runtime
-            // stays unaware of the field — see the spec
-            // § "Container Backend / Shared bind-mount".
+            // stays unaware of the field (container backend has no
+            // 9p security-model concept).
             let workspace_bind = match &config.workspace_mode {
                 Some(sandbox_core::WorkspaceMode::Shared {
                     host_path,
@@ -1992,7 +1989,7 @@ async fn create_session(
                 // (L3-HTTP policy levels) verifies cleanly. Mirrors
                 // the Lima `inject_ca_into_vm` path; differs in
                 // mechanism because the lite container's rootfs is
-                // read-only per spec § Hardening.
+                // read-only per.
                 ca_host_path: Some(ca_dir.join("cert.pem")),
             };
             state
@@ -2850,7 +2847,7 @@ async fn create_session(
     // (matching the precedence operators expect from the CLI argument
     // order: workspace contents are the substrate, repo is an overlay).
     //
-    // Spec § Cancellation and timeout: any non-zero exit collapses to
+    //
     // `SandboxError::Internal` with rsync's stderr embedded; the
     // `cleanup_and_return!` macro tears the VM/container, network, and
     // CA state down so the session row is removed from the store and
@@ -3443,13 +3440,13 @@ async fn start_session(
         .into_response();
     }
 
-    // Guest-version compat gate (api-session-isolation spec § 3.4).
+    // Guest-version compat gate (per-caller isolation).
     // The persisted `guest_protocol_version` decides which arm we
     // enter:
     //   - compatible: existing fast path, no refresh.
     //   - refreshable: `runtime.refresh_guest_binary` then the fast
     //     path; on success, atomically stamp the new versions into the
-    //     row (§ 3.9).
+    //     row atomically.
     //   - otherwise: 409 with the structured `GuestProtocolIncompatible`
     //     error.
     let needs_refresh =
@@ -3588,7 +3585,7 @@ async fn start_session(
 
     // Atomic guest-version stamp: only after BOTH refresh and start
     // succeed do we update the persisted version columns (api-session-
-    // isolation spec § 3.9). A failure here is logged but does not
+    // isolation.9). A failure here is logged but does not
     // fail the start — the runtime is genuinely running, and a future
     // start_session will re-run the (idempotent) refresh + retry the
     // update.
@@ -3614,7 +3611,7 @@ async fn start_session(
     // DNS-gate-listener restore but skips `attach_vm_to_bridge` +
     // `inject_ca_into_vm` because they're VM-only steps that try to run
     // `sudo bash -c ...` inside the guest, and the lite image has neither
-    // sudo nor those bridge helpers (M11 spec § "Routing").
+    // sudo nor those bridge helpers (M11.
     let restore_result = match session.backend {
         BackendKind::Container => {
             restore_session_networking_lite(&session.id, &operator.name, &state).await
@@ -3682,7 +3679,7 @@ async fn stop_session(
     // cheap on the steady-state Unlocked path; on a contended path a
     // concurrent push/pull is in flight and we must refuse the stop.
     //
-    // Atomicity contract (spec § Workspace lock — Lifecycle interaction):
+    // Atomicity contract:
     // the workspace acquire handler reads the session state INSIDE this
     // same mutex's critical section, so:
     //   * stop-first: stop holds the mutex for the full teardown; a
@@ -4131,8 +4128,7 @@ async fn clear_policy(
 /// is the caller's responsibility — see [`acquire_workspace_lock`].
 ///
 /// * Returns [`SandboxError::InvalidArgument`] (→ 400) when the
-///   session is not in [`SessionState::Running`]. The error wording
-///   matches the spec § Workspace lock — API endpoints:
+///   session is not in [`SessionState::Running`]. Error message:
 ///   `session is in state <State>; workspace operations require Running`.
 /// * Returns [`SandboxError::Conflict`] (→ 409, via `error_response`)
 ///   when the lock is already held; the message names the active op
@@ -4174,8 +4170,7 @@ fn release_workspace_lock_inner(
 ///
 /// Returns `Ok(())` on `LockState::Unlocked`. Returns
 /// `SandboxError::Conflict` (→ 409 via `error_response`) when the
-/// state is `Locked { op, .. }`; the message is spec-pinned (§
-/// Workspace lock — Lifecycle interaction):
+/// state is `Locked { op, .. }`; the message is:
 ///
 /// ```text
 /// session has an active <push|pull> operation; cancel the operation
@@ -4214,9 +4209,7 @@ fn lifecycle_lock_check(
 /// 2. Fetch the per-session lock-mutex `Arc` and acquire the inner
 ///    async mutex. The state-read in step 3 happens **after** the
 ///    mutex acquire so a concurrent `stop`/`remove` cannot transition
-///    the session between the state-check and the lock-take (spec
-///    § Workspace lock — Lifecycle interaction; orchestrator
-///    decisions Q2/Q4).
+///    the session between the state-check and the lock-take.
 /// 3. Reject (400) if the session is not `Running`.
 /// 4. Try to acquire the lock; on conflict, return 409 via
 ///    `error_response` with the daemon-rendered message
@@ -4257,7 +4250,7 @@ async fn acquire_workspace_lock(
 /// Behaviour:
 /// 1. Resolve the session by name or id. Missing → 404.
 /// 2. Acquire the per-session async mutex.
-/// 3. Parse `req.lock_token`. Per spec § Workspace lock — Force-
+/// 3. Parse `req.lock_token`. Per -
 ///    release token semantics + orchestrator decision Q6, unparseable
 ///    input is mapped to the all-zeroes [`LockToken::nil`] sentinel
 ///    so the release adjudication path stays uniform: the state-
@@ -4805,7 +4798,7 @@ async fn cancel_dns_gate_listener(session_id: &SessionId, state: &AppState) {
 /// 1. Looks up the current policy (returns `unknown_session` when none).
 /// 2. Merges the plugin-supplied IPs into the shared cache for the
 ///    current TTL window (UNION semantics — tolerates short-window
-///    rotation per spec).
+///    rotation as designed).
 /// 3. Captures Envoy's pre-rewrite LDS counter triple via
 ///    [`DockerExecLdsProbe`].
 /// 4. Short-circuits to `Noop` when the policy has no domain rules
@@ -6067,7 +6060,7 @@ async fn restore_session_networking(
 /// ingestor, and re-arms the synchronous DNS-gate listener after a stop /
 /// start cycle. Does **not** attach a VM to a bridge or inject a CA into
 /// a VM (both Lima-only — the lite image has no `sudo`, no QEMU, and the
-/// CA is baked into the image at build time per spec § "Routing").
+/// CA is baked into the image at build time per.
 ///
 /// Mirrors `restore_session_networking` steps 1, 2, 2b, plus the ingestor +
 /// DNS-gate-listener restoration that the Lima path inherits implicitly from
@@ -6419,7 +6412,7 @@ async fn rebuild_image(State(state): State<Arc<AppState>>, body: Bytes) -> impl 
             }
         }
         BackendKind::Container => {
-            // Per spec § "rebuild-image": the container rebuild lock
+            // Per the documented contract: the container rebuild lock
             // is owned inside `rebuild_lite_image` (the same
             // image-namespace lock that `ensure_image` uses), so we
             // deliberately do NOT acquire `state.base_image_lock`
@@ -6469,7 +6462,7 @@ async fn base_image_status(State(state): State<Arc<AppState>>) -> impl IntoRespo
 ///
 /// Returns gateway status per running session. This is a daemon-wide
 /// ops probe and is explicitly carved out of per-caller filtering by
-/// api-session-isolation spec § 2.6 — the response covers every
+/// per-caller isolation.6 — the response covers every
 /// running session on the daemon regardless of caller identity.
 async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let sessions = match state.store.list_sessions_unfiltered() {
@@ -6533,7 +6526,7 @@ async fn version_handler() -> impl IntoResponse {
 ///   `gateway_image_probe_error`, `lite_image_probe_error`,
 ///   `users_conf_pool`. The `*_probe_failed` companions to the
 ///   image-presence booleans distinguish "docker reports image
-///   absent" from "probe could not run" per Spec 3 § 13.2 so
+///   absent" from "probe could not run" per the documented contract so
 ///   doctor's C7/C8 can emit the right operator hint.
 /// - **Per-operator scoped data** (filtered by `caller_username`
 ///   from `OperatorIdentity`): `guest_version_drift`,
@@ -6545,7 +6538,7 @@ async fn version_handler() -> impl IntoResponse {
 /// the per-session endpoints use — an operator cannot infer another
 /// operator's session ids from this surface.
 ///
-/// Authentication: yes (per spec § 13.2). The endpoint extracts
+/// Authentication: yes (per.2). The endpoint extracts
 /// `Extension<OperatorIdentity>` from the request; the
 /// `unresolvable peer-cred close-on-failure` policy applies as on
 /// every other endpoint, so a handler reach implies a resolved
@@ -6579,7 +6572,7 @@ async fn diagnostics_handler(
     let lite_tag = sandbox_core::lite_image_tag_for_daemon_probe(env!("CARGO_PKG_VERSION"));
 
     // Probe outcome: the daemon distinguishes three states per
-    // Spec 3 § 13.2 (probe_failed variant) so doctor's C7/C8 can
+    // the documented contract (probe_failed variant) so doctor's C7/C8 can
     // emit the right operator hint — "image missing" vs "docker
     // daemon unreachable" need different remediations. Returning
     // (present, probe_failed_error) keeps the wire shape
@@ -6789,7 +6782,7 @@ async fn diagnostics_handler(
         // `*_probe_failed` discriminates "docker reports image
         // absent" (probe ran, result negative) from "docker daemon
         // unreachable / fork failed / unexpected stderr" (probe did
-        // not run to a verdict). Spec 3 § 13.2 — added so doctor
+        // not run to a verdict). the documented contract — added so doctor
         // C7/C8 can emit the right operator hint (image-missing →
         // `sandbox update`; probe-failed → restart docker /
         // sandboxd). When the probe succeeded the field is `false`;
@@ -7681,7 +7674,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(sandbox_err.into());
         }
     };
-    // Spec 5 § 4.7 — convergence anchor that forces operators to run
+    // Convergence anchor that forces operators to run
     // `sandbox update` when the on-disk config file drifts behind (or
     // ahead of) the binary's supported schema range. The `users.conf`
     // validator fires immediately after `load_users_config()` succeeds;
@@ -7773,7 +7766,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // dyn-trait object.
     let (default_memory_mb, default_cpus) = compute_default_resource_limits();
     let daemon_gid = nix::unistd::Gid::current().as_raw();
-    // Spec § Hardening — root degrades to the 1000:1000 floor; non-1000
+    // ; non-1000
     // host uids pass through for workspace bind-mount alignment.
     let (container_uid, container_gid) = map_container_uid_gid(daemon_uid, daemon_gid);
     // The runtime's image tag must match the one `ensure_image`
@@ -7788,7 +7781,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // binary read-only into every session at
     // `/usr/local/bin/sandbox-guest`; refresh becomes `docker
     // restart` against the same already-current source
-    // (api-session-isolation spec § 3.8.1). The bind-mount source is
+    // (per-caller isolation). The bind-mount source is
     // resolved via `sandbox_core::guest_agent_path` — production
     // builds find it at the FHS install path
     // (`/usr/local/libexec/sandboxd/sandbox-guest`), dev / test builds
@@ -7908,7 +7901,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Run startup reconciliation (VM state).
     reconcile(&store, &lima_runtime);
 
-    // Lite container backend orphan cleanup. Spec § "Orphan cleanup
+    // Lite container backend orphan cleanup.
     // on daemon start" extends the gateway-container reconcile pattern
     // with a Docker-side sweep: any `sandbox-{id}` container,
     // `sandbox-home-{id}` volume, or `sandbox-net-{id}` network whose
@@ -8070,7 +8063,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = app(Arc::clone(&state));
 
-    // Wrap the listener with the peer-cred acceptor (spec § 6.1): every
+    // Wrap the listener with the peer-cred acceptor: every
     // accepted connection has `SO_PEERCRED` read, the uid resolved to a
     // username, and the resulting `OperatorIdentity` attached to every
     // request flowing through it via
@@ -8378,7 +8371,7 @@ mod tests {
     fn release_is_idempotent_when_already_unlocked() {
         // Idempotent DELETE: re-issuing release on an already-Unlocked
         // lock must be a no-op success regardless of `force`. Pins the
-        // spec § Workspace lock — "Idempotent on already-unlocked"
+        //  — "Idempotent on already-unlocked"
         // contract so a retrying CLI doesn't see a spurious 409.
         let mut lock = LockState::new();
         let any = LockToken::new_v4();
@@ -8508,7 +8501,7 @@ mod tests {
 
     #[test]
     fn lifecycle_lock_check_includes_unlock_force_hint() {
-        // Spec § Workspace lock — Lifecycle interaction pins the
+        //
         // recovery hint: the conflict message MUST mention `unlock`
         // and `--force` so the operator (or an LLM agent reading the
         // error) can immediately drive the orphan-lock escape hatch
@@ -8554,7 +8547,7 @@ mod tests {
         assert_eq!(round_cpus_one_decimal(1.55), 1.5);
         assert_eq!(round_cpus_one_decimal(2.04), 2.0);
         // Banker's-rounding edge — `round` ties toward zero in `f64`?
-        // Not required by the contract; the spec only mandates the
+        // Not required by the contract; the design only mandates the
         // 1-decimal grid. We pin `1.5` and `2.0` (exactly on grid)
         // round to themselves.
         assert_eq!(round_cpus_one_decimal(1.5), 1.5);
@@ -8562,8 +8555,8 @@ mod tests {
         assert_eq!(round_cpus_one_decimal(0.8), 0.8);
     }
 
-    /// Round-trip the spec § "Resource defaults — container only"
-    /// 1-decimal grid through the request-parse-time normalisation
+    /// Round-trip the 1-decimal grid through the request-parse-time
+    /// normalisation
     /// without precision drift. `0.8`, `1.5`, `2.0` survive the
     /// parse → store → serialize round-trip with bit-equality on the
     /// boundary helper.
@@ -8584,8 +8577,8 @@ mod tests {
     //
     // Pure predicate; we drive every accept/reject branch directly so
     // the rejection-message wording is pinned without driving the full
-    // `create_session` handler. The wording matches the spec §
-    // `--no-gitignore` on `sandbox create` and is mirrored on the CLI
+    // `create_session` handler. The wording mirrors the rejection
+    // message for `--no-gitignore` on `sandbox create` and is mirrored on the CLI
     // side (`validate_no_gitignore_for_workspace`) — both sites carry
     // the literal string because there is no shared error catalog in
     // `sandbox-core` today.
@@ -10013,7 +10006,7 @@ mod tests {
 
     // -- RebuildImageRequest body deserialization -------------------------
 
-    /// Spec § "rebuild-image": an empty body must decode as
+    /// : an empty body must decode as
     /// `{ "backend": "lima", "no_cache": false }` so older CLIs that
     /// POST `/rebuild-image` with no body keep working (backwards-
     /// compat at the wire).
@@ -10094,7 +10087,7 @@ mod tests {
     // The function is synchronous and operates on `std::fs::*` only;
     // we drive it against a tempdir per test so no two cases share
     // filesystem state. The four cases pin the four behaviors
-    // documented in the daemon-productionization spec § 5.4:
+    // documented in the daemon-productionization.4:
     //   1. missing subdir → created at mode 0700
     //   2. wrong mode → corrected in place
     //   3. correct mode → no-op
@@ -10256,7 +10249,7 @@ mod tests {
     // -----------------------------------------------------------------------
     // bind_socket — socket mode pin.
     //
-    // The daemon-productionization spec § 5.1 fixes
+    // The daemon-productionization.1 fixes
     // `/run/sandbox/sandboxd.sock` at mode `0660`, and doctor check C5
     // reads `stat(sock).mode & 0o777` against that constant. The
     // umask of the invoking process is unconstrained (dev shells run
@@ -10268,8 +10261,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// The socket inode created by `bind_socket` carries mode `0660`
-    /// regardless of the test process's umask. Pins the spec § 5.1
-    /// contract that doctor check C5 reads.
+    /// regardless of the test process's umask. Pins the contract that
+    /// doctor check C5 reads.
     #[tokio::test]
     async fn socket_bind_sets_mode_0660() {
         use std::os::unix::fs::PermissionsExt;
@@ -10305,7 +10298,7 @@ mod tests {
         let mode = md.permissions().mode() & 0o777;
         assert_eq!(
             mode, 0o660,
-            "socket mode must be pinned to 0660 (spec § 5.1, doctor C5); got {mode:o}"
+            "socket mode must be pinned to 0660; got {mode:o}"
         );
     }
 
@@ -10369,7 +10362,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // `/version` endpoint (spec § 7.2, § 11.2).
+    // `/version` endpoint.
     //
     // The handler is parameter-less and returns the daemon's compile-time
     // `CARGO_PKG_VERSION` wrapped in a single-field JSON object. Two pins:
@@ -10405,7 +10398,7 @@ mod tests {
         assert_eq!(
             parsed,
             serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }),
-            "spec § 7.2 pins the body shape to exactly \
+            "/version body shape must be exactly \
              `{{\"version\": \"<CARGO_PKG_VERSION>\"}}`"
         );
     }
@@ -10416,7 +10409,7 @@ mod tests {
         assert_eq!(
             response.status(),
             StatusCode::OK,
-            "spec § 7.2: handler returns 200 OK on every invocation; \
+            "/version handler returns 200 OK on every invocation; \
              there is no error path"
         );
         let content_type = response
@@ -10433,9 +10426,9 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // `sandboxd --version` output format pin (spec § 7.6).
+    // `sandboxd --version` output format pin.
     //
-    // Spec 4 § 4.4.5's half-installed-state detection parses the output
+    // the documented contract.5's half-installed-state detection parses the output
     // with `awk '{print $2}'`, which depends on the format being exactly
     // two space-separated tokens (`sandboxd <semver>`) followed by a
     // single newline. A regression that adds a trailing token (build
@@ -10453,9 +10446,9 @@ mod tests {
         assert_eq!(
             rendered,
             format!("sandboxd {}\n", env!("CARGO_PKG_VERSION")),
-            "spec § 7.6 pins `sandboxd --version` to exactly \
+            "`sandboxd --version` must output exactly \
              `sandboxd <semver>\\n`; any extra token silently breaks \
-             Spec 4 § 4.4.5's `awk '{{print $2}}'` parse"
+             the `awk '{{print $2}}'` version-extract pattern"
         );
     }
 

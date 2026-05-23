@@ -39,10 +39,10 @@ struct DistributionState {
 /// into a bind-mounted directory via
 /// [`AtomicListenerWriter`], producing a
 /// `MovedTo` inotify event that triggers Envoy's LDS reload without a
-/// listener drain. See
-/// `.tasks/specs/2026-04-19-l3-envoy-mitmproxy-flow-design.md` and
-/// upstream Envoy issue `#20474` for the constraints this design
-/// respects.
+/// listener drain. See upstream Envoy issue `#20474` for the constraints
+/// this design respects (listener identity must not change between
+/// filter-chain rewrites; only `filter_chains` / `default_filter_chain`
+/// may differ).
 pub struct PolicyDistributor;
 
 impl PolicyDistributor {

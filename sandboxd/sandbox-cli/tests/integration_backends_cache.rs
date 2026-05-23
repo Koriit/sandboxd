@@ -1,7 +1,7 @@
 //! Integration test: the CLI fires exactly one `GET /backends` per
 //! invocation.
 //!
-//! Spec § "CLI learns capabilities via `GET /backends`" mandates a
+//!  mandates a
 //! single fetch per CLI invocation. This is what makes capability
 //! validation cheap enough to run on every `create` without waiting on
 //! a daemon roundtrip per check; it also keeps the daemon's audit log
@@ -14,7 +14,7 @@
 //! exits successfully the test asserts the counter is exactly 1.
 //!
 //! Both the [`BackendsCache`] unit-test (`cache_starts_empty`) and this
-//! binary-level test live in the repo because the spec invariant holds
+//! binary-level test live in the repo because the design invariant holds
 //! at *both* layers — the cache module enforces single-fetch via its
 //! `Option<Vec<_>>` cache field, and `main`'s dispatch must not
 //! construct a second `BackendsCache` for the same invocation.
@@ -177,8 +177,7 @@ async fn integration_backends_cache_create_fires_exactly_one_get_backends() {
     let sessions_hits = counters.sessions.load(Ordering::SeqCst);
     assert_eq!(
         backends_hits, 1,
-        "spec § \"CLI learns capabilities via GET /backends\" mandates exactly one fetch per \
-         invocation; observed {backends_hits}"
+        "CLI must fetch GET /backends exactly once per invocation; observed {backends_hits}"
     );
     assert_eq!(
         sessions_hits, 1,

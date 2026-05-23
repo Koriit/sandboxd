@@ -1,6 +1,6 @@
 """Uninstall coverage — clean, purge, and double-run cases.
 
-Spec §§ 6.3, 8.5. Three cases:
+
 
 - ``test_uninstall_after_install_clean`` — install, then uninstall (no
   --purge), assert state dir kept, user kept.

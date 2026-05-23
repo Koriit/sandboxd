@@ -3,10 +3,6 @@
 # daemon version (see `ContainerRuntime::ensure_image`); never pulled
 # from a registry.
 #
-# Spec: `.tasks/specs/2026-04-22-lite-mode-container-backend-design`
-#       § "Image building / Dockerfile shape" — base, packages, user,
-#       and entrypoint are all pinned by the spec.
-#
 # This Dockerfile must remain self-contained (`Dockerfile` + a
 # prebuilt `sandbox-guest` binary in the build context, nothing else).
 # The daemon embeds this file via `include_str!` at compile time and
@@ -27,8 +23,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # runtime "command not found" the first time an operator reaches for
 # directory mirroring.
 
-# Ubuntu 24.04 ships a default `ubuntu` user at uid 1000; the spec pins the
-# agent user at uid 1000 / gid 1000, so remove the default first.
+# Ubuntu 24.04 ships a default `ubuntu` user at uid 1000; the agent user
+# is pinned at uid 1000 / gid 1000, so remove the default first.
 RUN userdel --remove ubuntu 2>/dev/null || true \
     && useradd --uid 1000 --user-group --create-home --shell /bin/bash agent \
     && install -d -o agent -g agent /home/agent/workspace

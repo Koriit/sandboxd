@@ -27,7 +27,7 @@
 //!      arg flows through the `EXTRA_ARGS` build path and the
 //!      stub captures the full composed argv.
 //!
-//! Spec reference: daemon-productionization § 11.6 —
+//! Design reference: daemon-productionization (image pinning) —
 //! `integration_qemu_wrapper_no_helper_param_in_netdev`.
 
 use std::os::unix::fs::PermissionsExt;

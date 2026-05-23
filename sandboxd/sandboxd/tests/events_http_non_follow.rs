@@ -384,7 +384,7 @@ async fn get_events_unknown_session_returns_404() {
 }
 
 /// `decision=reset` is not in the allowed set (`allow` / `deny`).  The
-/// spec says this must fail loud as a 400 with the offending value in
+/// the design says this must fail loud as a 400 with the offending value in
 /// the error body — no silent match-nothing.
 #[tokio::test]
 async fn get_events_unknown_decision_returns_400() {
@@ -410,10 +410,10 @@ async fn get_events_unknown_decision_returns_400() {
 // lives in `tests/events_http_follow.rs` (replay + live, client-drop,
 // broadcast lag marker).
 
-/// The spec names the response `Content-Type` literally as
-/// `application/jsonl`.  Other tests already assert this; this test
-/// isolates the header-level contract (including that it is present on
-/// an empty-body response, which `since=<future>` gives us).
+/// The response `Content-Type` must be literally `application/jsonl`.
+/// Other tests already assert this; this test isolates the header-level
+/// contract (including that it is present on an empty-body response,
+/// which `since=<future>` gives us).
 #[tokio::test]
 async fn get_events_content_type_application_jsonl() {
     let (store, _tmp) = fresh_store();

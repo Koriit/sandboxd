@@ -2,11 +2,9 @@
 //!
 //! This module implements the XDG loader. It reads `*.json` files
 //! from the user's preset directory, validates the structural and
-//! semantic constraints the spec calls out (see
-//! `.tasks/specs/2026-04-21-port-explicit-policies-presets-observability-design.md`
-//! Part 2 § "User-configured presets"), and returns a list of
-//! [`UserPreset`] values whose `${param}` references are preserved
-//! verbatim for expansion at apply time.
+//! semantic constraints (name shape, unknown fields, parameter rules),
+//! and returns a list of [`UserPreset`] values whose `${param}` references
+//! are preserved verbatim for expansion at apply time.
 //!
 //! # Error handling contract
 //!
@@ -14,8 +12,7 @@
 //!
 //! - **Per-file soft errors** (malformed JSON, bad `name` shape,
 //!   unknown fields, IO errors reading a single file) emit a warning to
-//!   stderr and skip the offending file. Sibling files still load. This
-//!   is the "warn-and-skip" spec contract (Part 2 § "Loading errors").
+//!   stderr and skip the offending file. Sibling files still load.
 //! - **Cross-file hard errors** (two files declaring the same `name`,
 //!   a preset with more than one `repeatable: true` param) propagate
 //!   out as a [`PresetError`]. These are operator bugs that silent
@@ -75,7 +72,7 @@ pub struct UserParamSpec {
     /// (`--preset 'p:name=val'`) and in `${name}` template references.
     pub name: String,
     /// Parameter value type. Currently only [`ParamType::String`] is
-    /// supported; the spec does not reserve any other types yet.
+    /// supported; the design does not reserve any other types yet.
     #[serde(rename = "type")]
     pub r#type: ParamType,
     /// Whether the invocation must include this param.
@@ -88,7 +85,7 @@ pub struct UserParamSpec {
 
 /// Parameter value type.
 ///
-/// `String` is the only variant — the spec says user presets get string
+/// `String` is the only variant — the design says user presets get string
 /// substitution only (no conditionals, no iteration). Extending this
 /// enum would also require extending the template expander in Phase 3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -222,7 +219,7 @@ pub fn load_user_presets(xdg_override: Option<&Path>) -> Result<Vec<UserPreset>,
 /// caller-supplied sink. Exposed for unit testing.
 ///
 /// The sink receives already-formatted lines — no trailing newline, no
-/// leading prefix beyond the spec's `warning: ...` form. The caller is
+/// leading prefix beyond the `warning: ...` form. The caller is
 /// responsible for line-termination (stderr path adds a newline via
 /// `eprintln!`).
 pub fn load_user_presets_with_warnings(
@@ -236,7 +233,7 @@ pub fn load_user_presets_with_warnings(
         return Ok(Vec::new());
     };
 
-    // Probe the directory. ENOENT is the spec-defined "silent" case;
+    // Probe the directory. ENOENT is the design-defined "silent" case;
     // other IO errors are "warn and return empty".
     let entries = match fs::read_dir(&base_dir) {
         Ok(entries) => entries,
@@ -340,7 +337,7 @@ fn load_one(path: &Path, warn: &mut dyn FnMut(&str)) -> Result<Option<UserPreset
     };
 
     // Validate `name` shape — DNS-ish, no colons/dots/slashes. The
-    // spec (D-2) reserves `:` and `,` and `=` in invocation strings;
+    // invocation grammar reserves `:`, `,`, and `=` in invocation strings;
     // the loader rejects those plus `.`/`/` proactively to stop a
     // user preset from ever tripping the invocation parser.
     if !is_valid_preset_name(&file.name) {
@@ -353,7 +350,7 @@ fn load_one(path: &Path, warn: &mut dyn FnMut(&str)) -> Result<Option<UserPreset
         return Ok(None);
     }
 
-    // At most one repeatable param per preset. This is the spec's
+    // At most one repeatable param per preset. This is the
     // only hard multi-repeatable restriction (Part 2 lines 601-607).
     let repeatable_count = file.params.iter().filter(|p| p.repeatable).count();
     if repeatable_count > 1 {
@@ -392,7 +389,7 @@ fn load_one(path: &Path, warn: &mut dyn FnMut(&str)) -> Result<Option<UserPreset
 /// Resolve the XDG preset base directory.
 ///
 /// Delegates to [`crate::cli_xdg::resolve_sandboxd_config_dir`] —
-/// spec § "CLI & UX → Config file" mandates "one resolver, not two"
+/// the documented contract mandates "one resolver, not two"
 /// for `~/.config/sandboxd/presets/` and
 /// `~/.config/sandboxd/config.json`. Both call sites append their own
 /// per-feature subpath after the shared resolver returns the base.
@@ -595,7 +592,7 @@ mod tests {
         );
         assert!(
             warnings[0].starts_with("warning: preset file"),
-            "warning must start with spec-mandated prefix: {}",
+            "warning must start with required prefix: {}",
             warnings[0]
         );
     }

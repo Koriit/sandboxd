@@ -1,5 +1,4 @@
-//! End-to-end coverage for the `GET /version` daemon endpoint
-//! (spec § 7.2, § 11.6 — `integration_version_endpoint_real_socket`).
+//! End-to-end coverage for the `GET /version` daemon endpoint.
 //!
 //! Spins up the daemon binary against a freshly-provisioned tempdir,
 //! issues `GET /version` over its real unix socket (no in-process
@@ -223,7 +222,7 @@ async fn integration_version_endpoint_real_socket() {
     assert_eq!(
         status,
         hyper::StatusCode::OK,
-        "spec § 7.2: `GET /version` is always 200 OK; \
+        "`GET /version` must always return 200 OK; \
          got {status:?}, body = {:?}",
         String::from_utf8_lossy(&body)
     );
@@ -231,7 +230,7 @@ async fn integration_version_endpoint_real_socket() {
     let ct = content_type.expect("daemon must emit Content-Type for /version");
     assert!(
         ct.starts_with("application/json"),
-        "spec § 7.2: /version body is JSON; got Content-Type = {ct:?}"
+        "/version response must be JSON; got Content-Type = {ct:?}"
     );
 
     let parsed: serde_json::Value =
@@ -239,7 +238,7 @@ async fn integration_version_endpoint_real_socket() {
     assert_eq!(
         parsed,
         serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }),
-        "spec § 7.2 pins the body to exactly \
+        "/version body must be exactly \
          `{{\"version\": \"<CARGO_PKG_VERSION>\"}}`; got {parsed}"
     );
 }

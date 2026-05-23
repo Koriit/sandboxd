@@ -319,7 +319,7 @@ async fn integration_container_runtime_create_start_stop_delete_round_trip() {
     assert_eq!(status, RuntimeStatus::Stopped);
 }
 
-/// Phase 3A handoff Task 4 / test 2 — every spec § "Hardening" flag is
+/// Phase 3A handoff Task 4 / test 2 — every the documented contract flag is
 /// reflected in `docker inspect` HostConfig output. Pinned per flag so
 /// a silent regression in `create()` (e.g. a typo'd flag, a re-ordered
 /// arg slice that drops one) fails this test rather than silently

@@ -9,16 +9,16 @@
 //! through an `Extension<OperatorIdentity>` extractor.
 //!
 //! The struct lives in `sandbox-core` (rather than the daemon binary)
-//! because two specs share it:
+//! because two subsystems share it:
 //!
-//! - Spec 1 (helper identity assertion) threads `OperatorIdentity::name`
+//! - The helper-identity-assertion subsystem threads `OperatorIdentity::name`
 //!   through `RuntimeStartArgs::for_user` into the route helper's
 //!   `--for-user` argv flag for the pair-membership check.
-//! - Spec 2 (API session isolation) stamps `OperatorIdentity::name` as
+//! - The api-session-isolation subsystem stamps `OperatorIdentity::name` as
 //!   the `owner_username` column on every newly-created session and uses
 //!   it as the per-caller filter on every `SessionStore` read.
 //!
-//! See the helper-identity-assertion design spec § 6.2 for the wire
+//! See the helper-identity-assertion design.2 for the wire
 //! contract.
 
 /// Resolved identity of an operator on the other end of the daemon's
@@ -35,7 +35,7 @@
 /// The struct is deliberately `Clone + Debug` (handlers move clones
 /// into background tasks; structured logging dumps the value) but does
 /// not derive `Serialize`/`Deserialize` — it is never persisted or
-/// emitted on the wire as a unit. Spec 2 stamps the `name` field into
+/// emitted on the wire as a unit. The design stamps the `name` field into
 /// the `owner_username` SQL column; the uid is structural-only and
 /// never reaches operator-visible surfaces.
 #[derive(Debug, Clone, PartialEq, Eq)]

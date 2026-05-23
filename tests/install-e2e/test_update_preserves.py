@@ -1,4 +1,4 @@
-"""`sandbox update` preserves operator-owned files — Spec 5 §§ 4.5, 9.1.
+"""`sandbox update` preserves operator-owned files — the install framework.5, 9.1.
 
 Two preservation contracts are exercised end-to-end:
 
@@ -11,13 +11,13 @@ Two preservation contracts are exercised end-to-end:
 * ``test_update_preserves_customized_users_conf`` — the operator edits
   ``/etc/sandboxd/users.conf`` to add a custom subnet line; the
   update's config-migration step must roll the schema forward without
-  dropping the custom line (Spec 1 § 5.5 Input C → Output C').
+  dropping the custom line (the documented contract Input C → Output C').
 
   CAVEAT: the bumped tarball is built from a patch-bumped Cargo.toml,
   not a Cargo.toml that registers a new V002 migration, so the
   framework's apply chain is a no-op across this update. The test
   pins the *observable* invariant — the operator's custom subnet
-  line survives the update — which is the user-facing contract Spec 1
+  line survives the update — which is the user-facing contract the documented design
   § 5.5 commits to. V001→V002 chaining is exercised by the unit and
   integration migration tests.
 """
@@ -52,7 +52,7 @@ def test_update_preserves_systemd_drop_in(
 ):
     """A systemd drop-in survives the update bit-for-bit.
 
-    The drop-in is content the operator wrote — Spec 5 § 4.5 commits
+    The drop-in is content the operator wrote — the install framework.5 commits
     to never touching ``*.service.d``. ``§ 3.2.23 install systemd
     unit`` writes only ``sandboxd.service`` (the unit itself); the
     drop-in directory is operator territory.
@@ -133,7 +133,7 @@ def test_update_preserves_systemd_drop_in(
         f"sudo grep -q 'SANDBOX_TEST_MARKER=operator-owned' {drop_in_path}",
     ).returncode == 0
 
-    # Spec § 7.2 step 10: post-update doctor green-light. Waits for
+    # 
     # the daemon socket first (the update restarts the unit at
     # § 3.2.26; the unit may still be activating when the CLI returns).
     wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
@@ -151,14 +151,14 @@ def test_update_preserves_customized_users_conf(
 ):
     """A custom subnet added to users.conf survives the update.
 
-    The post-update file contains the operator's custom line. Spec 1
-    § 5.5 + Spec 5 § 4.5: the config-migration framework rewrites
+    The post-update file contains the operator's custom line. the documented design
+    § 5.5 + the install framework.5: the config-migration framework rewrites
     structurally (schema_version stamp + canonical key order) but
     preserves operator-added entries.
 
     Single-version-tarball caveat: with no actual schema migration
     pending, the framework's apply chain is a no-op and the file is
-    bit-for-bit identical. The real Spec 1 § 5.5 contract — V0 file
+    bit-for-bit identical. The real the documented contract contract — V0 file
     with operator subnet → V1 file with stamp + subnet preserved —
     is exercised by ``migration_v001_round_trip`` (unit test) and
     ``integration_config_migration_applies_v001_to_legacy_file``. This
@@ -181,7 +181,7 @@ def test_update_preserves_customized_users_conf(
         "sudo cat /etc/sandboxd/users.conf", check=True, timeout=10,
     ).stdout
     parsed = json.loads(original)
-    # The schema's `subnets` array is operator-tunable per Spec 1
+    # The schema's `subnets` array is operator-tunable per the documented design
     # § 5.5; injecting an extra row mirrors the brainstorm case
     # ("operator-added subnet").
     parsed.setdefault("subnets", []).append({
@@ -205,8 +205,8 @@ def test_update_preserves_customized_users_conf(
     # `from.is_file()` is true, so a directory short-circuits the
     # cosign call. Going through `--from <tarball>` would route
     # through cosign verify-blob and add noise that obscures the
-    # users.conf-preservation contract under test (Spec 1 § 5.5,
-    # Spec 5 § 4.5).
+    # users.conf-preservation contract under test (the documented contract,
+    # the install framework.5).
     bumped_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64_bumped)
     bumped_ver = version_from_tarball(bumped_in_vm)
     stage_dir = "/tmp/sandbox-update-preserves-users-stage"
@@ -236,10 +236,10 @@ def test_update_preserves_customized_users_conf(
         f"custom subnet dropped during update; post subnets: {post!r}"
     )
 
-    # Spec § 7.2 step 10: post-update doctor green-light. The
+    # 
     # customized users.conf must still validate against the daemon's
     # schema — doctor's daemon-startup check is the post-update
-    # signal that the schema-mismatch refusal (Spec 5 § 4.7) did
+    # signal that the schema-mismatch refusal  did
     # NOT fire.
     wait_for_systemd_active(vm.name, "sandboxd", timeout=60)
     wait_for_socket(vm.name, "/run/sandbox/sandboxd.sock", timeout=60)

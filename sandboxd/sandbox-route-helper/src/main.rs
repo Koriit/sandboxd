@@ -22,18 +22,18 @@
 //!
 //! Each invocation runs ordered steps; any step that denies prints a
 //! single `sandbox-route-helper: <reason>` line to stderr, writes an
-//! append-only JSON-Lines audit record (per spec § 3.5), and exits with
+//! append-only JSON-Lines audit record , and exits with
 //! code `1`. No netns mutation occurs on the deny path — the helper
 //! exits before reaching the route install.
 //!
 //! 1. Caller identity — read `getuid()` and resolve to a username via
-//!    `getpwuid_r`. STRICT per spec § 3.4: unresolvable uid denies.
+//!    `getpwuid_r`. STRICT — unresolvable uid unresolvable uid denies.
 //! 2. Argv parse — `--for-user <name>` (optional, defaults to caller)
 //!    plus the two positional args. Strict resolution of `--for-user`
-//!    via `getpwnam_r` per spec § 3.4.
+//!    via `getpwnam_r`.
 //! 3. Load `users.conf`; locate the subnet whose CIDR contains the
 //!    gateway IP argument.
-//! 4. **Pair-membership check** (spec §§ 3.1–3.2) — both the caller's
+//! 4. **Pair-membership check** — both the caller's
 //!    uid AND the `--for-user` uid must appear in the chosen pool's
 //!    `allow_users` (each resolved numerically via `getpwnam_r`).
 //! 5. `pidfd_open(container_pid)` then `setns(pidfd, CLONE_NEWNET)` —
@@ -180,7 +180,7 @@ fn resolve_user_from_name(name: &str) -> Result<Option<User>, Errno> {
     User::from_name(name)
 }
 
-/// Single deny exit code per the spec — the stderr reason carries the
+/// Single deny exit code per the design — the stderr reason carries the
 /// "what went wrong" payload, distinct codes per step would only
 /// invite scripts to grow ad-hoc dependencies on internal step
 /// numbering.
@@ -190,7 +190,7 @@ fn main() -> ExitCode {
     run()
 }
 
-/// Render the pool field for an audit record. Spec § 3.5 specifies the
+/// Render the pool field for an audit record.
 /// CIDR string form (e.g. `"10.209.0.0/20"`).
 fn pool_string(subnet: &SubnetEntry) -> String {
     format!("{}/{}", subnet.cidr.base(), subnet.cidr.prefix_len())
@@ -212,8 +212,8 @@ fn emit_audit(record: &AuditRecord<'_>) -> AuditOutcome {
     audit::write_record(&path, record)
 }
 
-/// Deny path: write the audit-deny record (with the per-spec-§3.5
-/// escalation if the write fails), print the stderr reason, and return
+/// Deny path: write the audit-deny record (with stderr escalation
+/// if the write fails), print the stderr reason, and return
 /// `DENY_EXIT`. Used by every deny branch in `run`.
 fn deny_with_audit(
     reason_tag: &'static str,
@@ -234,7 +234,7 @@ fn deny_with_audit(
     });
     eprintln!("sandbox-route-helper: {stderr_msg}");
     if let AuditOutcome::WriteFailed(err) = outcome {
-        // Deny-path escalation per spec § 3.5: surface the missing
+        // Deny-path escalation to show the operator that surface the missing
         // forensic record on stderr. The deny itself is unconditional
         // (the exit code below stays `DENY_EXIT`); the escalation only
         // adds the operator-visible signal that the audit trail
@@ -244,7 +244,7 @@ fn deny_with_audit(
     ExitCode::from(DENY_EXIT)
 }
 
-/// Allow-path post-success audit. Spec § 3.5: write-failure surfaces on
+/// Allow-path post-success audit.
 /// stderr but DOES NOT block the allow (routing-path-availability wins).
 fn allow_audit(caller: &str, for_user: &str, pool: Option<&str>, gateway_ip: &str, pid: i32) {
     let outcome = emit_audit(&AuditRecord {
@@ -284,7 +284,7 @@ fn run() -> ExitCode {
     } = parsed;
     let gateway_ip_str = gateway_ip.to_string();
 
-    // Step 1 — caller identity. STRICT resolution per spec § 3.4:
+    // Step 1 — caller identity. STRICT resolution —
     // unresolvable uid is a deny path, not a stderr-clarity hint. The
     // pair-check below needs both identities reliably; falling back to
     // numeric-only comparison would allow a request whose `for_user`
@@ -333,12 +333,12 @@ fn run() -> ExitCode {
         }
     };
 
-    // `--for-user` defaults to the caller's name when omitted (§ 3.1),
+    // `--for-user` defaults to the caller's name when omitted,
     // so direct-CLI helper invocations remain meaningful.
     let for_user = for_user_arg.unwrap_or_else(|| caller_name.clone());
 
     // Resolve `--for-user` to a uid strictly. An unresolvable for-user
-    // name is a deny path per § 3.4.
+    // name is a deny path.
     let for_user_uid = match resolve_user_from_name(&for_user) {
         Ok(Some(u)) => u.uid.as_raw(),
         // ENOENT-on-not-found is glibc-version-specific (≥2.36 surfaces it
@@ -407,10 +407,10 @@ fn run() -> ExitCode {
     };
     let pool = pool_string(subnet);
 
-    // Step 4 — pair-membership check per spec §§ 3.1–3.2. Both caller
+    // Step 4 — pair-membership check per the membership check. Both caller
     // and for-user uids must appear in the pool's `allow_users` (each
     // resolved numerically via `SubnetEntry::allows_uid`). On mismatch,
-    // exit DENY_EXIT with stderr naming both identities (§ 3.3).
+    // exit DENY_EXIT with stderr naming both identities.
     let verdict = pair_check(subnet, caller_uid.as_raw(), for_user_uid);
     if verdict == Verdict::Denied {
         let msg =
@@ -514,7 +514,7 @@ fn run() -> ExitCode {
 // ---------------------------------------------------------------------------
 
 /// Parsed argv. `for_user_arg` is `None` if `--for-user` was omitted —
-/// the caller defaults it to `name(getuid())` per spec § 3.1, which
+/// the caller defaults it to `name(getuid())` and defaults to the caller username, which
 /// preserves the pre-existing direct-CLI invocation shape.
 struct ParsedArgs {
     container_pid: i32,
@@ -525,7 +525,7 @@ struct ParsedArgs {
 /// Parse argv: optional `--for-user <name>` before the two positional
 /// args. `argv[0]` is the program name.
 ///
-/// Hand-rolled per spec § 9.4 — pulling `clap` into the cap'd helper
+/// Hand-rolled — pulling `clap` into the cap'd helper
 /// would inflate the TCB by several thousand lines that have to be
 /// reviewed for the privilege story. The flag accepts both
 /// `--for-user <name>` (two-arg form) and `--for-user=<name>` (one-arg
@@ -537,7 +537,7 @@ fn parse_argv(args: &[OsString]) -> Result<ParsedArgs, String> {
     // Walk argv left-to-right, consuming `--for-user` (and value) where
     // it appears. Anything that is not the flag is a positional. We
     // intentionally do NOT accept `--for-user` after the positionals,
-    // because the daemon emits it before them (§ 6.5) and an
+    // because the daemon emits it before them and an
     // after-positionals form would create two ways to spell the same
     // intent for no benefit.
     let mut for_user_arg: Option<String> = None;
@@ -654,7 +654,7 @@ fn pidfd_open(pid: i32) -> Result<OwnedFd, i32> {
 }
 
 /// Render a `pidfd_open` errno into the helper's stderr phrasing.
-/// ESRCH gets the dedicated "not found" message that the spec calls
+/// ESRCH gets the dedicated "not found" message that the design calls
 /// out; everything else surfaces the errno verbatim (callers reading
 /// stderr can look the symbol up).
 fn format_pidfd_error(pid: i32, errno: i32) -> String {
@@ -680,7 +680,7 @@ fn drop_pidfd(fd: OwnedFd) {
 /// the (already-entered) netns falls inside the caller's subnet.
 ///
 /// IPv6 addresses are ignored: the project is IPv4-only today (no IPv6
-/// in the Lima setup), and the spec is explicit that IPv6 enforcement
+/// in the Lima setup), and the design is explicit that IPv6 enforcement
 /// is deferred. Interfaces without an address (e.g. an unconfigured
 /// `eth0` that hasn't yet had an IP assigned) are skipped — they have
 /// no address to validate.
@@ -689,7 +689,7 @@ fn drop_pidfd(fd: OwnedFd) {
 /// step-7 `ip route replace` would then fail at the kernel level
 /// (nothing to attach the default route to), which is the natural
 /// surface for that misconfiguration. Adding an explicit "must have at
-/// least one non-lo address" check would over-specify what the spec
+/// least one non-lo address" check would over-specify what the design
 /// asks of step 6.
 fn enforce_netns_addresses_in_subnet(subnet: &SubnetEntry) -> Result<(), String> {
     let iter = getifaddrs().map_err(|err| format!("getifaddrs failed: {err}"))?;

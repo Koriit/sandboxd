@@ -74,7 +74,7 @@ fn integration_gateway_lifecycle() {
     // `create_gateway` (before any policy is applied): `sandbox`
     // (deny-all forward/input baseline) and `sandbox_dnat` (DNS →
     // CoreDNS, all other TCP → Envoy:10000). Once a policy is
-    // applied, `sandbox_policy` joins the set — giving the spec's
+    // applied, `sandbox_policy` joins the set — giving the
     // three-table steady state. The legacy `sandbox_l3` transparent-
     // DNAT table is gone: L3 traffic reaches mitmproxy via Envoy
     // CONNECT tunneling, not kernel-level redirection.
@@ -106,8 +106,8 @@ fn integration_gateway_lifecycle() {
     // mitmproxy runs in regular (forward-proxy) mode on loopback —
     // it must NOT listen on 0.0.0.0:8080, the loopback 18080 port
     // must be open inside the container, and crucially nothing must
-    // be listening on 18080 on the VM-facing IP (spec requirement:
-    // "nothing is listening on 18080 on the VM-facing IP"). A
+    // be listening on 18080 on the VM-facing IP (mitmproxy must bind
+    // loopback only — "nothing is listening on 18080 on the VM-facing IP"). A
     // regression that bound mitmproxy to 0.0.0.0:18080 instead of
     // 127.0.0.1:18080 would expose the forward proxy to the sandboxed
     // VM and short-circuit the Envoy filter chains.

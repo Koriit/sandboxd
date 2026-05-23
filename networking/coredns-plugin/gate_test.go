@@ -196,7 +196,7 @@ func TestGateClientFailsClosedOnRejected(t *testing.T) {
 
 // TestGateClientReleasesResponseOnTimeout: the server reads but never
 // replies; the client must hit its wall-clock deadline and return
-// gateOutcomeTimedOut. This is the spec's fail-open path — the
+// gateOutcomeTimedOut. This is the fail-open path — the
 // caller releases the response without the daemon's ack.
 func TestGateClientReleasesResponseOnTimeout(t *testing.T) {
 	srv, path := newStubGateServer(t)

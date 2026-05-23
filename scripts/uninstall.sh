@@ -23,7 +23,7 @@ set -eu
 # Install log destination. `$SANDBOXD_INSTALL_LOG` mirrors install.sh
 # so the two scripts append to the same operator-overridden file
 # when set; unset / empty falls back to the canonical
-# `/var/log/sandbox-install.log` (Spec 4 § 4.6).
+# `/var/log/sandbox-install.log`.
 INSTALL_LOG="${SANDBOXD_INSTALL_LOG:-/var/log/sandbox-install.log}"
 STATE_PATH="/var/lib/sandbox/.install-state.json"
 SCRIPT_NAME="uninstall.sh"

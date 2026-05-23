@@ -37,11 +37,10 @@ jobs:
       - name: Test
         run: make test
 
-  # Shellcheck for the install / uninstall scripts. The spec's install-
-  # infrastructure design (§ 8.2) requires POSIX-sh (`-s sh`) plus
-  # stylistic warnings (`-S style`) on both scripts. The scripts
-  # themselves land in a follow-up session; until then the step
-  # short-circuits when neither file exists rather than failing CI.
+  # Shellcheck for the install / uninstall scripts. Both scripts must pass
+  # POSIX-sh (`-s sh`) plus stylistic warnings (`-S style`). The scripts
+  # themselves are not yet present; until then the step short-circuits
+  # when neither file exists rather than failing CI.
   shellcheck:
     runs-on: ubuntu-latest
     steps:
@@ -97,8 +96,7 @@ jobs:
       - name: Run integration tests
         run: make test-integration
 
-  # PR-time + push-to-master: container backend only. Spec § "CI policy"
-  # (lines ~1060-1070): "PR | Full E2E against container only | ~5-10 min".
+  # PR-time + push-to-master: container backend only (~5-10 min).
   # Lite has no Lima/KVM dependency, so this job runs unmodified on stock
   # GitHub-hosted `ubuntu-latest` runners.
   e2e-container:
@@ -130,8 +128,7 @@ jobs:
       - name: Run container-only E2E suite
         run: make test-e2e-container
 
-  # Merge-to-master: full matrix -- both backends. Spec § "CI policy":
-  # "Merge to master | Full E2E matrix (both backends) | ~30-45 min".
+  # Merge-to-master: full matrix -- both backends (~30-45 min).
   #
   # The Lima half of the matrix requires `/dev/kvm` (nested virtualization),
   # which stock GitHub-hosted `ubuntu-latest` runners do NOT provide. The

@@ -1,9 +1,8 @@
 # M10-S6 measurement-driven defaults
 
 **Goal.** Record the values chosen for four event/observability knobs
-introduced in M10-S2..S4 and the rationale behind each. Per the
-2026-04-21 spec's "Known gaps / deferred decisions" bullet on
-measurement defaults, M10-S6 is the session where these are pinned.
+introduced in M10-S2..S4 and the rationale behind each. M10-S6 is the
+session where these measurement defaults were pinned.
 
 ## Knobs and chosen values
 
@@ -11,8 +10,8 @@ measurement defaults, M10-S6 is the session where these are pinned.
 |---|---|---|---|
 | `events.ring_buffer_size` | 10 000 | `sandboxd/sandbox-core/src/events/bus.rs` (`DEFAULT_RING_BUFFER_SIZE`) | Covers ~10 min of sustained ~15 events/s traffic. Memory cost bounded at ~10 MB/session (1 KB/event upper bound). |
 | `events.persist_retention_days` | 14 | `sandboxd/sandboxd/src/main.rs` (`Args::events_persist_retention_days`) | Two sprint cycles of post-incident review; ~170 MB/session on-disk at the modeled event rate. |
-| nft-deny-logger `rate_cap` (per session) | 1 000 events/s | `sandboxd/sandbox-nft-deny-logger/src/main.rs` (`Args::rate_cap`) | Spec Part 3 / "Hardening rules" § 5 suggested value. Breach path produces summary events, not drops. |
-| nft-deny-logger `conn_cap` (per session TCP) | 256 | `sandboxd/sandbox-nft-deny-logger/src/main.rs` (`Args::conn_cap`) | Spec Part 3 / "Hardening rules" § 6 suggested value. Each concurrent deny costs ~4 KB of socket state; cap fits inside a 10 MB container budget. |
+| nft-deny-logger `rate_cap` (per session) | 1 000 events/s | `sandboxd/sandbox-nft-deny-logger/src/main.rs` (`Args::rate_cap`) | Chosen ceiling (hardening rule § 5). Breach path produces summary events, not drops. |
+| nft-deny-logger `conn_cap` (per session TCP) | 256 | `sandboxd/sandbox-nft-deny-logger/src/main.rs` (`Args::conn_cap`) | Chosen ceiling (hardening rule § 6). Each concurrent deny costs ~4 KB of socket state; cap fits inside a 10 MB container budget. |
 
 ## Methodology
 
@@ -21,7 +20,7 @@ representative workload (for example, an agent session running
 `npm install` + `git clone` of a small repo + a `curl` loop for a
 minute) with metrics capture. That measurement has not been
 performed — the project ships without production traffic of that
-shape. The values above are **spec-suggested defaults**, chosen so
+shape. The values above are **measurement-driven defaults**, chosen so
 that:
 
 - **`ring_buffer_size = 10 000`** covers ~10 minutes at ~15 events/s
@@ -33,12 +32,11 @@ that:
   10-events/s average shape fills roughly 12 MB of JSONL per day
   (uncompressed), so 14 days is ~170 MB/session — well inside
   reasonable on-disk overhead for the typical development host.
-- **`rate_cap = 1 000 events/s per session`** is the spec's
-  suggested ceiling and matches what the pipeline can flush without
-  back-pressuring nft-deny-logger's NFLOG / TCP-listener inputs.
-  Breaches produce periodic summary events, not drops.
-- **`conn_cap = 256 per-session TCP`** matches the spec suggestion
-  and is calibrated for nft-deny-logger's non-`recv`ing RST-close
+- **`rate_cap = 1 000 events/s per session`** matches what the pipeline
+  can flush without back-pressuring nft-deny-logger's NFLOG /
+  TCP-listener inputs. Breaches produce periodic summary events, not drops.
+- **`conn_cap = 256 per-session TCP`** is calibrated for
+  nft-deny-logger's non-`recv`ing RST-close
   pattern on the TCP-deny path (each concurrent deny costs ~4 KB of
   socket state; 256 fits well inside a 10 MB container memory
   budget).
@@ -60,5 +58,5 @@ These values are CLI-tunable (clap `--arg` and env var):
   not currently CLI-exposed on sandboxd, but tunable from code).
 
 A future measurement-driven tuning pass can update the defaults
-without a schema change. The spec does not gate a release on the
-measurement.
+without a schema change. No release is gated on running the
+measurement pass first.

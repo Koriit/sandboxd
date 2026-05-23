@@ -13,9 +13,8 @@
 //! `publish(Event)` entrypoint accepts the envelopes built here);
 //! this module is the sandboxd-side producer surface feeding it.
 //!
-//! Spec reference: `.tasks/specs/2026-04-21-port-explicit-policies-presets-
-//! observability-design.md`, Part 3 "Lifecycle events". Each builder
-//! maps 1:1 to a row of that table.
+//! Each builder maps 1:1 to a lifecycle event type in the unified event
+//! stream (see the event wire format in [`crate::api::event_dto`]).
 
 use chrono::Utc;
 

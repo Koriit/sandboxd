@@ -1,7 +1,7 @@
 //! `sandbox-nft-allow-logger` — gateway-container component that
 //! closes the UDP allow-flow audit gap.
 //!
-//! Spec references:
+//! Design references:
 //!   - `2026-05-01-udp-nft-loggers-design.md` Decisions 3, 4, 5 — the
 //!     new NFCT-driven allow-flow audit log, the binary-rename family,
 //!     and the shared lib crate.
@@ -74,7 +74,7 @@ mod nfct;
 
 /// CLI arguments for the nft-allow-logger binary.
 ///
-/// Defaults match the spec's listener-port assignments: health on
+/// Defaults match the listener-port assignments: health on
 /// `:10004` (one above the deny-logger's `:10003` — Decision 4 /
 /// Resolution 5). NFCT subscription is groupless on the consumer side
 /// (multicast on `NFNLGRP_CONNTRACK_NEW`, family-1 nl_group bit), so
@@ -182,7 +182,7 @@ async fn run(args: Args) -> std::io::Result<()> {
     // would silently miss every UDP allow event, which is strictly
     // worse than going unhealthy and being restarted by Docker's
     // HEALTHCHECK. The conntrack subsystem is loaded inside the
-    // gateway container by the existing audit-§2.4 setup;
+    // gateway container by the existing audit setup;
     // `CAP_NET_ADMIN` is in the run flags.
     let nfct_subscriber = nfct::NfctSubscriber::bind()
         .map_err(|e| std::io::Error::other(format!("nfct bind: {e}")))?;

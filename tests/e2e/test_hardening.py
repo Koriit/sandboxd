@@ -9,7 +9,7 @@ Run with generous timeouts:
     python -m pytest test_hardening.py -v --timeout=600
 
 Backend coverage: **Lima only**. The lite container backend has no QEMU
-process, no ``--hardened`` flag (the spec rejects it on lite —
+process, no ``--hardened`` flag (the design rejects it on lite —
 § "Out of scope" line ~1175), and no systemd-scope cgroup wrapper
 around session execution. These tests therefore intentionally do NOT
 take the ``backend`` fixture and run unparametrised against the Lima

@@ -1,8 +1,6 @@
 //! Wire-facing DTOs for the unified event stream.
 //!
-//! Serialized JSON shape matches spec Part 3 of
-//! `.tasks/specs/2026-04-21-port-explicit-policies-presets-observability-
-//! design.md` exactly:
+//! Serialized JSON shape matches the event wire format exactly:
 //!
 //! ```json
 //! {
@@ -25,7 +23,7 @@
 //!   `"layer": "<name>"` as its discriminator. Kebab-case is the
 //!   superset: single-word variants (`Dns`, `Envoy`, `Mitmproxy`,
 //!   `Lifecycle`) render identically to lowercase, while the
-//!   multi-word `DenyLogger` renders as `"deny-logger"` per spec Part 3
+//!   multi-word `DenyLogger` renders as `"deny-logger"`
 //!   "Traffic events" (which names the layer `deny-logger`). The
 //!   per-layer payload struct carries the envelope fields (`timestamp`,
 //!   `session`) and `#[serde(flatten)]`s its per-event body. The body's
@@ -36,7 +34,7 @@
 //!   `Z` suffix (`YYYY-MM-DDTHH:MM:SS.mmmZ`). The mapper rounds (truncates)
 //!   sub-millisecond precision from the [`chrono::DateTime<Utc>`] source.
 //! - `session` is always present as a string; pre-session lifecycle events
-//!   serialize it as `""` per spec (Part 3, "Event shape").
+//!   serialize it as `""` as designed (Part 3, "Event shape").
 //! - IP addresses are strings on the wire (e.g., `"10.0.0.42"`); domain
 //!   carries [`std::net::Ipv4Addr`].
 
@@ -169,15 +167,15 @@ pub enum MitmproxyEventBodyDto {
 // Deny-logger / allow-logger (the nft-logger family)
 // ---------------------------------------------------------------------------
 //
-// Wire shape per spec Part 3 / "Traffic events" row for layer
+// Wire shape  row for layer
 // `deny-logger`:
 //
 //     | deny-logger | ... | deny | orig_dst_ip, orig_dst_port,
 //                              protocol (tcp/udp), src_ip, src_port |
 //
 // The `rate_limited` summary event carries `rate_limited_count` plus
-// `since_ts` marking the start of the summarised window, per spec
-// Part 3 / "Hardening rules" § 5.
+// `since_ts` marking the start of the summarised window, as designed
+// Part 3 / "Hardening rules".
 //
 // The enum also carries an `allow` variant with the same 5-tuple
 // shape as `deny`; the only structural difference is the `event`
@@ -230,7 +228,7 @@ pub enum DenyLoggerEventBodyDto {
 
 /// Wire value of the deny-logger `deny` event's `protocol` field.
 ///
-/// Spec Part 3 / "Traffic events" row for `deny-logger` prescribes the
+///  / "Traffic events" row for `deny-logger` prescribes the
 /// literals `"tcp"` and `"udp"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -294,7 +292,7 @@ pub enum LifecycleEventBodyDto {
 
 /// Wire value of `policy_applied` / `policy_updated` `status`.
 ///
-/// Spec Part 3 "Lifecycle events" prescribes the literals `"ok"` and
+///  "Lifecycle events" prescribes the literals `"ok"` and
 /// `"error"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -305,7 +303,7 @@ pub enum PolicyApplyStatusDto {
 
 /// Wire value of `health_degraded` / `health_restored` `component`.
 ///
-/// Spec enumerates gateway subcomponents: `deny-logger`, `envoy`,
+/// The wire format enumerates gateway subcomponents: `deny-logger`, `envoy`,
 /// `mitmproxy`, `coredns`. Note the kebab-case on `deny-logger`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -318,7 +316,7 @@ pub enum HealthComponentDto {
 
 /// Wire value of `gateway_shutdown` `reason`.
 ///
-/// Spec lists `session_stopped`, `daemon_shutdown`, `error`.
+/// The wire format lists `session_stopped`, `daemon_shutdown`, `error`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GatewayShutdownReasonDto {

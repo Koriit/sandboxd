@@ -2,11 +2,10 @@
 //! files written by the three policy-enforcing subcomponents inside the
 //! gateway container.
 //!
-//! Spec reference: `.tasks/specs/2026-04-21-port-explicit-policies-presets-
-//! observability-design.md`, Part 3 "Envoy access log", "CoreDNS structured
-//! emission", "mitmproxy structured emission", and the session-ID stamping
-//! paragraph in "Event shape" ("session-ID attribution is sandboxd's job,
-//! not each component's").
+//! The three producers — Envoy (access log), the CoreDNS plugin, and the
+//! mitmproxy addon — each write one JSONL record per decision. Session-ID
+//! attribution is sandboxd's responsibility, not each component's; it
+//! is stamped here at ingest time.
 //!
 //! # Shape
 //!

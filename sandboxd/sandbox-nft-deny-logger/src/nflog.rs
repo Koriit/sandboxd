@@ -218,7 +218,7 @@ impl NflogSubscriber {
     /// `libnetfilter_log` setup sequence.
     ///
     /// Requires `CAP_NET_ADMIN` — present in the gateway container by
-    /// virtue of `--cap-add NET_ADMIN` (audit §2.4).
+    /// virtue of `--cap-add NET_ADMIN` (audit).
     pub fn bind(group: u16) -> Result<Self, NflogError> {
         if group == 0 {
             return Err(NflogError::Protocol(

@@ -1,7 +1,7 @@
 //! Cross-cutting infrastructure for the gateway container's nft-layer
 //! loggers.
 //!
-//! Spec reference: `2026-05-01-udp-nft-loggers-design.md`, Decision 5
+//! Design reference: `2026-05-01-udp-nft-loggers-design.md`, Decision 5
 //! (Shared lib crate `sandbox-event-emitter`).
 //!
 //! This crate owns the pieces both `sandbox-nft-deny-logger` and

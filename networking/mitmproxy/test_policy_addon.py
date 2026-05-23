@@ -652,9 +652,7 @@ class TestPerSegmentGlob:
     This is a deliberate tightening of the pre-v2 ``fnmatch``
     semantics — ``/api/*`` used to match ``/api/v1/users`` and now
     does not.  Operators migrating policies must review path filters
-    during the v1→v2 rewrite.  The spec at
-    ``.tasks/specs/2026-04-21-port-explicit-policies-presets-observability-design.md``
-    (lines 221-243) is authoritative.
+    during the v1→v2 rewrite.
     """
 
     def test_star_does_not_cross_slash(self) -> None:
@@ -1064,7 +1062,7 @@ class TestPathGlobMatcher:
     These exercise the matcher in isolation from the addon plumbing —
     they catch regressions in the per-segment glob semantics before
     they manifest as mysterious 599s.  The table covers the full
-    documented behaviour plus the edge cases noted in the spec:
+    documented behaviour plus edge cases:
     anchoring, case-sensitivity, regex-metachar escaping, empty
     inputs, trailing-slash distinction.
     """

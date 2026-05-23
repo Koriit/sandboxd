@@ -1,4 +1,4 @@
-"""`sandbox update` confirmation prompt classifies stopped sessions — Spec 5 § 3.1.7.
+"""`sandbox update` confirmation prompt classifies stopped sessions — the install framework.1.7.
 
 When an operator runs ``sandbox update`` and the target binary's
 ``DAEMON_GUEST_PROTO_VERSION`` is incompatible with a stopped
@@ -26,7 +26,7 @@ in the ``recreate`` bucket if the host's
 Today the constant is ``1`` and bumping it would be feature work
 outside this test's scope. The synthetic-row shape matches the one
 ``test_peercred_isolation.py`` already uses for its session-isolation
-proofs (Spec 2 § 7.5) — same column set, same SQL shape, lifted to
+proofs (the documented contract) — same column set, same SQL shape, lifted to
 this test for the proto-version classification proof.
 
 Why ``n`` at the prompt rather than ``--yes`` or ``--dry-run``:
@@ -226,7 +226,7 @@ def test_update_classifies_stopped_session_with_zero_proto_as_recreate(
 
     # 3. No mutation: install state's installed_version is still v.
     # The prompt-abort path runs entirely in the read-only pre-flight
-    # (Spec 5 § 2.5); no lock acquisition, no install-state write.
+    # ; no lock acquisition, no install-state write.
     post_state = vm.shell(
         "sudo cat /var/lib/sandbox/.install-state.json",
         check=True, timeout=10,

@@ -12,14 +12,14 @@
 //! drift'd guest protocol, and no substrate resources are orphaned.
 //!
 //! The check inventory (C1-C13) is enumerated in the daemon-
-//! productionization spec § 6.2. The output format is pinned in
-//! § 6.3 — three exact-text examples — and is load-bearing for the
-//! integration tests in § 11.6. Message tokens, glyphs, indentation,
-//! and the summary-line wording are byte-for-byte stable.
+//! productionization.2. The output format is pinned in
+//! Three exact-text examples pin the output format, and it is
+//! load-bearing for the integration tests. Message tokens, glyphs,
+//! indentation, and the summary-line wording are byte-for-byte stable.
 //!
 //! # Execution shape
 //!
-//! Two phases per spec § 13.6:
+//! Two phases per.6:
 //!
 //! 1. Serial — C1 (daemon running) and C2 (socket reachable). If
 //!    either fails, every downstream check that requires a running
@@ -35,7 +35,7 @@
 //!    walks the table — fan-out completion order is non-deterministic
 //!    but the rendered report is byte-stable.
 //!
-//! # Exit codes (§ 6.4)
+//! # Exit codes
 //!
 //! - `0` — every check is `Pass` or `Skip` (skips never fail the run).
 //! - `1` — at least one check is `Fail`.
@@ -43,7 +43,7 @@
 //!   resolution panic, etc.). Distinct from `1` so wrapper scripts
 //!   can disambiguate "daemon broken" from "doctor broken".
 //!
-//! # Dev-mode degradation (§ 12.2)
+//! # Dev-mode degradation
 //!
 //! C4 (current user in `sandbox` group), C5 (socket perms), and
 //! C10 (state-dir mode) are system-service-specific. On a dev box
@@ -63,11 +63,10 @@ use hyper_util::rt::TokioIo;
 use tokio::net::UnixStream;
 
 // ---------------------------------------------------------------------------
-// Internal-error type (spec § 6.4 — exit code 2)
+// Internal-error type
 // ---------------------------------------------------------------------------
 
-/// `doctor` itself could not run. Surfaces to `process::exit(2)` per
-/// spec § 6.4, distinct from exit-1 ("daemon-side check failed") so
+/// `doctor` itself could not run. Surfaces to `process::exit(2)`, distinct from exit-1 ("daemon-side check failed") so
 /// operator scripts can disambiguate "doctor broken" from "deployment
 /// broken".
 ///
@@ -157,7 +156,7 @@ where
 
 /// Run the full doctor pipeline against the daemon reachable at
 /// `socket_path` and write the formatted report to stdout. Returns
-/// the process exit code per § 6.4.
+/// the process exit code (0 = all pass/skip, 1 = any fail, 2 = doctor itself failed).
 ///
 /// `verbose=false` suppresses passing rows so the operator sees only
 /// the actionable failures + skips; `verbose=true` echoes every row.
@@ -165,7 +164,7 @@ where
 ///
 /// Returns `Err(DoctorInternalError)` when doctor itself cannot run
 /// (socket path unresolvable, renderer panicked, etc.); the caller is
-/// responsible for mapping that to `process::exit(2)` per spec § 6.4.
+/// responsible for mapping that to `process::exit(2)` per.4.
 pub async fn run(socket_path: &str, verbose: bool) -> Result<i32, DoctorInternalError> {
     let outcomes = execute_checks(socket_path).await;
     // The renderer is synchronous and writes to stdout; wrap in
@@ -255,7 +254,7 @@ pub struct CheckRow {
 /// hung daemon does not stall doctor.
 const DOCTOR_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Resolve the `(serial, parallel)` phase outputs, in spec § 13.6 order.
+/// Resolve the `(serial, parallel)` phase outputs, in.6 order.
 ///
 /// Public-in-crate so the unit tests in `mod tests` can exercise the
 /// runner directly. The wrapper [`run`] composes this with the
@@ -356,7 +355,7 @@ pub(crate) async fn execute_checks(socket_path: &str) -> Vec<CheckRow> {
 
     // Drain the JoinSet; a panicking task surfaces as a `JoinError`
     // and is re-raised here so [`run`]'s `catch_unwind` boundary routes
-    // it to exit code 2 per spec § 6.4.
+    // it to exit code 2 per.4.
     let mut parallel: Vec<CheckRow> = Vec::with_capacity(11);
     while let Some(joined) = set.join_next().await {
         match joined {
@@ -402,7 +401,7 @@ fn check_id_ordinal(id: &str) -> u32 {
 /// `systemctl` reports `inactive` or `not-found` — both fall through
 /// to a `connect()` probe, which succeeds when the developer is
 /// running sandboxd by hand in another terminal. The two-step
-/// fallback is the spec's § 12.2 dev-mode degradation rule.
+/// fallback is the dev-mode degradation rule.
 async fn check_daemon_running(socket_path: &str) -> CheckRow {
     let systemd_state = systemctl_is_active("sandboxd");
     if let Some(state) = systemd_state.as_deref()
@@ -417,7 +416,7 @@ async fn check_daemon_running(socket_path: &str) -> CheckRow {
         };
     }
 
-    // Per spec § 12.2: `inactive`, `failed`, and `not-found` all
+    // Per.2: `inactive`, `failed`, and `not-found` all
     // fall through to the dev-mode `connect()` probe. The unit may
     // be installed but stopped while the operator is iterating with
     // a hand-launched daemon (typical `cargo run -p sandboxd` dev
@@ -538,8 +537,7 @@ async fn check_version_match(socket_path: &str, socket_reachable: bool) -> Check
             outcome: CheckOutcome::Fail {
                 detail: format!("CLI={cli_version}, daemon={daemon_version}"),
                 hint: Some(
-                    "versions differ \u{2014} reinstall to align \
-                     (Spec 5 sandbox update \u{2014} both at once)"
+                    "versions differ \u{2014} reinstall sandbox-cli and sandboxd together"
                         .to_string(),
                 ),
             },
@@ -562,7 +560,7 @@ async fn check_version_match(socket_path: &str, socket_reachable: bool) -> Check
 /// C4 — current user in `sandbox` group.
 ///
 /// In dev mode there is no `sandbox` system group; we report this as
-/// `Skip` rather than `Fail` per spec § 12.2. Production: the
+/// `Skip` rather than `Fail` per.2. Production: the
 /// operator must be in the group or the unix socket's `0660` mode
 /// will refuse them.
 pub(crate) fn check_group_membership() -> CheckRow {
@@ -679,16 +677,16 @@ fn real_group_resolver() -> Result<GroupMembership, String> {
 }
 
 // ---------------------------------------------------------------------------
-// Dev-vs-prod classification signal (Spec 3 § 12.2 / Spec 4 § 4.5)
+// Dev-vs-prod classification signal (the documented contract / the documented contract)
 // ---------------------------------------------------------------------------
 
 /// Canonical signal for "this host was provisioned by install.sh" —
 /// the install-state file at `/var/lib/sandbox/.install-state.json`
-/// (Spec 4 § 4.5). When the file is present the install is a
+/// (the documented contract). When the file is present the install is a
 /// system-service install and doctor's environment-aware checks
 /// (C5, C10) run their strict-mode comparisons; when it is absent
 /// the install is dev mode (or corrupted, same disposition) and the
-/// strict-mode comparisons are skipped per Spec 3 § 12.2.
+/// strict-mode comparisons are skipped per the documented contract.
 ///
 /// Pulled into a pure function so it can be unit-tested against
 /// synthetic paths; the production callers pass [`INSTALL_STATE_PATH`].
@@ -717,7 +715,7 @@ fn is_prod_install_signal(install_state_path: &Path) -> bool {
 ///
 /// Production: `srw-rw---- sandbox:sandbox` (mode `0660`). Dev: the
 /// developer owns the socket under `$XDG_RUNTIME_DIR/sandboxd/`; the
-/// mode varies and the spec § 12.2 specifies a `Skip (dev mode)` row.
+/// mode varies; the dev-mode degradation rule specifies a `Skip (dev mode)` row.
 /// Dev-vs-prod classification uses the install-state file's presence
 /// per [`is_prod_install_signal`]; the strict-mode comparison is
 /// applied only on prod installs.
@@ -748,7 +746,7 @@ fn check_socket_perms(socket_path: &str, socket_reachable: bool) -> CheckRow {
     };
 
     // Dev-mode signal: absence of the install-state file at
-    // `/var/lib/sandbox/.install-state.json` (Spec 4 § 4.5) means
+    // `/var/lib/sandbox/.install-state.json` (the documented contract) means
     // there is no system install of sandboxd, so there is no
     // `0660 sandbox:sandbox` invariant to require.
     if !is_prod_install_signal(Path::new(crate::update::INSTALL_STATE_PATH)) {
@@ -808,7 +806,7 @@ fn check_socket_perms(socket_path: &str, socket_reachable: bool) -> CheckRow {
 ///
 /// The CLI runs as the operator; the operative question is whether
 /// the *daemon* can read+write `/dev/kvm`. The answer comes from
-/// `GET /diagnostics`, evaluated daemon-side per spec § 13.2.
+/// `GET /diagnostics`, evaluated daemon-side per.2.
 fn check_kvm_accessible(
     diagnostics: Option<&DiagnosticsPayload>,
     socket_reachable: bool,
@@ -888,7 +886,7 @@ fn check_gateway_image(
             outcome: CheckOutcome::Pass { detail: tag },
         },
         Some(d) if d.gateway_image_probe_failed => {
-            // Spec 3 § 13.2 `probe_failed` variant: the daemon's
+            // the documented contract `probe_failed` variant: the daemon's
             // `docker image inspect` could not run to a verdict, so
             // we cannot tell whether the image is loaded. Emit the
             // "restart docker / sandboxd" hint instead of the
@@ -918,7 +916,7 @@ fn check_gateway_image(
             outcome: CheckOutcome::Fail {
                 detail: format!("missing {tag}"),
                 hint: Some(
-                    "sandbox update to load the image (Spec 5); \
+                    "sandbox update to load the image; \
                      or in dev: make gateway-image && docker load"
                         .to_string(),
                 ),
@@ -959,7 +957,7 @@ fn check_lite_image(diagnostics: Option<&DiagnosticsPayload>, socket_reachable: 
             outcome: CheckOutcome::Pass { detail: tag },
         },
         Some(d) if d.lite_image_probe_failed => {
-            // Spec 3 § 13.2 `probe_failed` variant: docker probe did
+            // the documented contract `probe_failed` variant: docker probe did
             // not run to a verdict. C8 is informational (the lite
             // image is built on first session-create), so we render
             // this as `Skip` — but with the probe-failure detail and
@@ -1025,7 +1023,7 @@ fn check_route_helper_caps() -> CheckRow {
             outcome: CheckOutcome::Fail {
                 detail: format!("missing: {HELPER_PATH}"),
                 hint: Some(
-                    "sandbox update re-runs setcap (Spec 5); \
+                    "sandbox update re-runs setcap; \
                      or `make install-route-helper-prod-cap` in dev"
                         .to_string(),
                 ),
@@ -1084,7 +1082,7 @@ fn check_route_helper_caps() -> CheckRow {
             outcome: CheckOutcome::Fail {
                 detail: format!("getcap reported: {}", stdout.trim()),
                 hint: Some(
-                    "sandbox update re-runs setcap (Spec 5); \
+                    "sandbox update re-runs setcap; \
                      or `make install-route-helper-prod-cap` in dev"
                         .to_string(),
                 ),
@@ -1103,8 +1101,8 @@ fn check_route_helper_caps() -> CheckRow {
 /// systemd unit's `StateDirectory` invariant). Dev: the operator's
 /// own `~/.local/share/sandboxd/` lives at the developer's umask;
 /// we skip the strict-mode comparison with the dev-mode annotation
-/// per spec § 12.2. Dev-vs-prod classification consults the
-/// install-state file (Spec 4 § 4.5) via [`is_prod_install_signal`].
+/// per.2. Dev-vs-prod classification consults the
+/// install-state file (the documented contract) via [`is_prod_install_signal`].
 fn check_state_dir_mode() -> CheckRow {
     const PROD_PATH: &str = "/var/lib/sandbox";
     let path = Path::new(PROD_PATH);
@@ -1239,7 +1237,7 @@ fn check_users_conf_pool(
 ///
 /// Skipped in default mode (kept cheap). Verbose mode would expand
 /// this; since the report formatter doesn't materialise the row
-/// conditionally on verbose (the spec example pins the row in the
+/// conditionally on verbose (the design example pins the row in the
 /// daemon-down case as well), we emit `Skip` with a "verbose only"
 /// annotation and let the verbose path render the drift detail when
 /// the diagnostics payload has it.
@@ -1385,7 +1383,7 @@ pub(crate) struct DiagnosticsPayload {
     pub lite_image_present: bool,
     /// `true` when the daemon's `docker image inspect` probe could
     /// not run to a verdict (docker daemon unreachable, fork
-    /// failure, unexpected stderr). Spec 3 § 13.2 added the variant
+    /// failure, unexpected stderr). the documented contract added the variant
     /// so C7 can emit the "restart docker / sandboxd" hint instead
     /// of the misleading "image missing" hint. `#[serde(default)]`
     /// keeps this readable against an older daemon that omits the
@@ -1533,10 +1531,10 @@ const YELLOW: &str = "\x1b[33m";
 const RED: &str = "\x1b[31m";
 const RESET: &str = "\x1b[0m";
 
-/// Pad `name` to the spec's display column width (40 chars after the
-/// glyph + space, give or take Unicode wcwidth). The spec's examples
-/// align the detail-or-`SKIPPED` token at roughly column 42. We use
-/// 40 char-count padding which lands the detail column at column 42
+/// Pad `name` to the display column width (40 chars after the
+/// glyph + space, give or take Unicode wcwidth). The output aligns
+/// the detail-or-`SKIPPED` token at roughly column 42. We use 40
+/// char-count padding which lands the detail column at column 42
 /// for ASCII-only check names.
 const NAME_COLUMN_WIDTH: usize = 40;
 
@@ -1602,7 +1600,7 @@ pub(crate) fn render_report<W: std::io::Write>(
 
     // Default mode: when failures are present and we suppressed the
     // dependent-skips, the report can render with only the root-cause
-    // failure followed by the summary. The spec § 6.3 partial-fail
+    // failure followed by the summary. The.3 partial-fail
     // example shows the skipped rows present in non-verbose mode
     // *only* for the daemon-down case where they cascade. Emit a
     // blank line between the last printed row and the summary in
@@ -1616,10 +1614,8 @@ pub(crate) fn render_report<W: std::io::Write>(
         let _ = writeln!(out);
     }
 
-    // For the default-mode "daemon-down" output (spec § 6.3 third
-    // example) the spec lists every skip on its own line. Emit them
-    // here to mirror that example when at least one fail triggered
-    // the cascade.
+    // For the default-mode "daemon-down" output, list every skip on
+    // its own line when at least one fail triggered the cascade.
     if !verbose && failed > 0 {
         for row in rows {
             if let CheckOutcome::Skip { detail, .. } = &row.outcome {
@@ -1700,7 +1696,7 @@ mod tests {
     }
 
     /// All-pass report exits 0 and surfaces every check under
-    /// `--verbose`. Pins the spec § 6.3 happy-path shape.
+    /// `--verbose`. Pins the happy-path output shape.
     #[test]
     fn doctor_exits_0_when_all_pass() {
         let rows = vec![
@@ -1733,7 +1729,7 @@ mod tests {
         assert_eq!(code, 1, "any-fail must exit 1");
     }
 
-    /// Skipped checks do not flip exit-code-1; spec § 6.4 pins this.
+    /// Skipped checks do not flip exit-code-1;.4 pins this.
     #[test]
     fn doctor_exits_0_when_skips_but_no_fails() {
         let rows = vec![
@@ -1815,7 +1811,7 @@ mod tests {
     }
 
     /// Hint lines are indented 4 spaces and prefixed `hint:` per the
-    /// spec § 6.3 example. The token is load-bearing for the
+    /// output format. The token is load-bearing for the
     /// integration test that greps the failure output.
     #[test]
     fn fail_hint_is_indented_with_hint_prefix() {
@@ -1835,7 +1831,7 @@ mod tests {
     }
 
     /// C4 — sandbox group absent → Skip with dev-mode annotation
-    /// per spec § 12.2.
+    /// per.2.
     #[test]
     fn group_check_skips_when_sandbox_group_absent() {
         let row = check_group_membership_with(|| Ok(GroupMembership::SandboxGroupAbsent));
@@ -1954,7 +1950,7 @@ mod tests {
         }
     }
 
-    /// C7 — Spec 3 § 13.2 `probe_failed` variant: the daemon could
+    /// C7 — the documented contract `probe_failed` variant: the daemon could
     /// not run `docker image inspect` to a verdict. The doctor row
     /// must remain Fail (C7 is a hard check) but the hint must
     /// guide the operator toward docker / sandboxd reachability,
@@ -2016,7 +2012,7 @@ mod tests {
         }
     }
 
-    /// C8 — Spec 3 § 13.2 `probe_failed`: lite-image probe could
+    /// C8 — the documented contract `probe_failed`: lite-image probe could
     /// not run to a verdict. C8 stays Skip (informational), but the
     /// hint switches to docker / sandboxd reachability so an
     /// operator doesn't waste time on `sandbox rebuild-image` when
@@ -2077,7 +2073,7 @@ mod tests {
 
     /// `is_prod_install_signal` flips on the presence of the
     /// install-state file at `/var/lib/sandbox/.install-state.json`
-    /// (Spec 4 § 4.5). Pinned here so a future refactor can't
+    /// (the documented contract). Pinned here so a future refactor can't
     /// silently widen the predicate to consult system-user existence
     /// again — that's the conflation #156 fixed.
     #[test]
@@ -2166,7 +2162,7 @@ mod tests {
         assert!(out.contains("hint: image will be built on first session create"));
     }
 
-    /// Spec § 6.4 — when doctor itself cannot resolve a socket path
+    ///
     /// (neither `SANDBOX_SOCKET`, `XDG_RUNTIME_DIR`, nor `HOME` is
     /// set), the strict resolver must surface
     /// [`DoctorInternalError::SocketPathUnresolvable`] so the CLI
@@ -2217,7 +2213,7 @@ mod tests {
         );
     }
 
-    /// Spec § 6.4 — `DoctorInternalError::Display` carries the
+    ///
     /// operator-facing message that gets written to stderr before
     /// `process::exit(2)`. Pin the wording so the CLI dispatch stays
     /// diagnosable.

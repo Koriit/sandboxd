@@ -1,4 +1,4 @@
-//! Pair-membership identity check per spec §§ 3.1–3.2.
+//! Pair-membership identity check per.1–3.2.
 //!
 //! A pool authorizes a request iff **both** the caller's identity and
 //! the asserted `--for-user` identity appear in the pool's `allow_users`.
@@ -8,8 +8,8 @@
 //! take effect immediately, no caching).
 //!
 //! This module is extracted from `main.rs` so the algorithm is unit-
-//! testable without standing up a cap'd binary. The unit tests in §
-//! 8.1 of the spec parametrize a [`Resolver`] seam so they can fix
+//! testable without standing up a cap'd binary. The unit tests
+//! parametrize a [`Resolver`] seam so they can fix
 //! `name → uid` mappings deterministically; production callers wire
 //! the seam to `getpwnam_r`.
 
@@ -39,7 +39,7 @@ pub enum Verdict {
     Denied,
 }
 
-/// Pair-check per spec §§ 3.1–3.2.
+/// Pair-check per.1–3.2.
 ///
 /// Returns `Allowed` iff `caller_uid` and `for_user_uid` are both
 /// numerically members of `subnet.allow_users` (resolution via
@@ -49,7 +49,7 @@ pub enum Verdict {
 /// `SubnetEntry::allows_uid` call) so unit tests can drive it directly.
 /// `caller_uid` and `for_user_uid` are the **resolved** numeric uids —
 /// the caller is responsible for surface-level resolution (and for
-/// denying when resolution fails, per spec § 3.4); pair-check itself
+/// denying when resolution fails, per.4); pair-check itself
 /// only compares numeric membership.
 pub fn pair_check(subnet: &SubnetEntry, caller_uid: u32, for_user_uid: u32) -> Verdict {
     let caller_in = subnet.allows_uid(caller_uid);
@@ -63,7 +63,7 @@ pub fn pair_check(subnet: &SubnetEntry, caller_uid: u32, for_user_uid: u32) -> V
 
 /// Test-only variant of [`pair_check`] that resolves names through an
 /// arbitrary [`Resolver`] seam instead of `getpwnam_r`. Used by the
-/// spec § 8.1 table-driven unit tests so the pool's `allow_users` names
+/// table-driven unit tests so the pool's `allow_users` names
 /// map to deterministic uids without depending on host `/etc/passwd`.
 ///
 /// This mirrors what `SubnetEntry::allows_uid` does (resolve each name
@@ -95,14 +95,14 @@ pub(crate) fn pair_check_with_resolver(
 
 #[cfg(test)]
 mod tests {
-    //! Spec § 8.1 — pair-check function unit tests.
+    //! .
     //!
     //! Eight rows, one per `(pool, caller, for_user)` shape. The
     //! resolver fixes the test universe: alice=1001, bob=1002,
     //! mallory=1003, eve=1004, sandbox=2000.
     //!
     //! The "for_user omitted" row collapses to "for_user == caller"
-    //! because the argv-level defaulting (§ 3.1: `let for_user =
+    //! because the argv-level defaulting (`let for_user =
     //! for_user_arg.unwrap_or_else(|| caller_name.clone())`) happens in
     //! the argv parser, not in `pair_check`. The test calls
     //! `pair_check_with_resolver` with `for_user_name == caller_name`
@@ -135,7 +135,7 @@ mod tests {
 
     #[test]
     fn pair_check_allows_when_caller_eq_for_user_post_v001() {
-        // `--for-user` omitted → defaults to caller (§ 3.1). The
+        // `--for-user` omitted → defaults to caller. The
         // algorithmic state is identical to "for_user == caller".
         let caller = "alice";
         let for_user = caller;

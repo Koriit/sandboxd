@@ -14,7 +14,7 @@
 //! deny-logger / CoreDNS regardless of whether B's bridge is reachable.
 //! Lima retains an ICMP-based behavioural check (ICMP is not DNAT'd
 //! by the prerouting rules), but `CAP_NET_RAW` is dropped on the lite
-//! container backend (spec § Hardening) and there is no working ICMP
+//! container backend and there is no working ICMP
 //! path. Hence the structural integration coverage in this file: it
 //! locks in the *forward-chain* shape — for every per-session gateway,
 //! the only egress accepts admit either traffic that PREROUTING

@@ -7,8 +7,7 @@
 //! single place where unknown layer / decision / event values fail
 //! loud as [`crate::error::SandboxError::InvalidArgument`].
 //!
-//! Spec reference: `.tasks/specs/2026-04-21-port-explicit-policies-
-//! presets-observability-design.md`, Part 3 § "HTTP endpoint":
+//! The query parameter shape follows the HTTP endpoint contract:
 //!
 //! ```text
 //! GET /sessions/{id}/events?follow=true&layer=<name>&decision=<allow|deny>
@@ -17,7 +16,7 @@
 //!
 //! All fields are optional on the wire. The serde `#[serde(default)]`
 //! attributes let callers omit any field they do not care about, which
-//! matches the spec's "empty filter matches everything" intuition
+//! matches the "empty filter matches everything" intuition
 //! implemented by [`super::events_filter`].
 
 use chrono::{DateTime, Utc};
@@ -27,7 +26,7 @@ use crate::error::SandboxError;
 
 /// Parsed query string for `GET /sessions/{id}/events`.
 ///
-/// Field semantics mirror the spec's query-string syntax exactly:
+/// Field semantics mirror the query-string syntax exactly:
 ///
 /// - `follow`: when `true`, the HTTP handler streams chunked JSONL;
 ///   when `false` (default), it replays the current ring buffer and
@@ -108,10 +107,7 @@ impl EventsQueryDto {
 /// Kept as a tiny enum rather than a raw string so downstream code
 /// (`EventsFilter::matches`) can dispatch without re-parsing. The
 /// [`Self::parse`] helper is the single conversion point; it rejects
-/// anything other than the two spec-authoritative values.
-///
-/// Spec reference: Part 3 § "HTTP endpoint" — the `decision` filter
-/// accepts `allow` or `deny`.
+/// anything other than the two wire-canonical values (`allow` or `deny`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DecisionKind {
@@ -122,7 +118,7 @@ pub enum DecisionKind {
 impl DecisionKind {
     /// Parse a caller-provided decision string into a [`DecisionKind`].
     ///
-    /// Accepts `"allow"` and `"deny"` (case-sensitive — the spec
+    /// Accepts `"allow"` and `"deny"` (case-sensitive — the design
     /// prescribes lowercase). Any other value returns
     /// [`SandboxError::InvalidArgument`] with the offending text in
     /// the message.
@@ -174,7 +170,7 @@ mod tests {
     #[test]
     fn parse_since_accepts_rfc3339_with_fractional_seconds() {
         // Both a plain second-precision timestamp and a fractional form
-        // must parse successfully. The spec says "RFC 3339"; chrono's
+        // must parse successfully. The the design says "RFC 3339"; chrono's
         // `parse_from_rfc3339` handles both shapes.
         for raw in [
             "2026-04-22T12:00:00Z",

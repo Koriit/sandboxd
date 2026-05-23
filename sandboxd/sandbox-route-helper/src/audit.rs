@@ -1,7 +1,7 @@
 //! Append-only JSON-Lines audit log for the route helper.
 //!
 //! One record per helper invocation, written before exit, on every
-//! allowed-and-denied path. The shape is fixed by spec § 3.5:
+//! allowed-and-denied path. The shape is fixed by.5:
 //!
 //! ```json
 //! {"ts":"2026-05-11T14:23:09.123Z","decision":"allowed","caller":"alice","for_user":"alice","pool":"10.209.0.0/20","gateway_ip":"10.209.0.2","pid":12345}
@@ -10,7 +10,7 @@
 //!
 //! ## Write-failure asymmetry
 //!
-//! Spec § 3.5 distinguishes the two paths' tolerance for a failed write:
+//!
 //!
 //! - **Allow path** — log a structured stderr line and continue. The
 //!   privilege has already been granted; an audit-log infrastructure
@@ -34,8 +34,8 @@ use serde_json::json;
 
 /// Production audit-log path (today; daemon runs as operator).
 ///
-/// Spec § 3.5 swings this to `/var/lib/sandbox/route-helper-audit.log`
-/// in Spec 3 when the daemon moves to a dedicated `sandbox` user.
+/// .log`
+/// when the daemon moves to a dedicated `sandbox` user.
 const DEFAULT_AUDIT_LOG_RELATIVE: &str = "sandboxd/route-helper-audit.log";
 
 /// Env-var override for the audit-log path, honored **only** in
@@ -73,10 +73,9 @@ pub fn audit_log_path() -> PathBuf {
     PathBuf::from("/tmp").join(DEFAULT_AUDIT_LOG_RELATIVE)
 }
 
-/// One field captured for the `caller` / `for_user` audit objects per
-/// spec § 3.5. The spec illustrates them as bare strings; we encode them
-/// as strings on the wire (the typed shape inside the helper is
-/// implementation choice).
+/// One field captured for the `caller` / `for_user` audit objects.
+/// Both are encoded as strings on the wire (the typed enum inside
+/// the helper is an implementation detail).
 #[derive(Clone, Copy)]
 pub enum Decision<'a> {
     /// Allow path. No `reason` field is emitted.
@@ -102,8 +101,8 @@ pub struct AuditRecord<'a> {
     pub caller: &'a str,
     pub for_user: &'a str,
     /// CIDR string (e.g. `"10.209.0.0/20"`). `None` when the gateway IP
-    /// did not match any configured subnet (spec § 3.5 — `pool` is
-    /// absent on `"gateway-ip not in any subnet"`).
+    /// did not match any configured subnet (`pool` is absent on
+    /// `"gateway-ip not in any subnet"` deny records).
     pub pool: Option<&'a str>,
     pub gateway_ip: &'a str,
     pub pid: i32,

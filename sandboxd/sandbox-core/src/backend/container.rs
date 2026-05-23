@@ -24,7 +24,7 @@
 //!
 //! # Hardening defaults
 //!
-//! Per spec § "Hardening" — every flag in the table is applied at
+//! Per the documented contract — every flag in the table is applied at
 //! `docker create` time and is not relaxable by callers:
 //!
 //! - `--read-only` — rootfs immutable.
@@ -32,7 +32,7 @@
 //! - `--tmpfs /run` (`rw,nosuid,nodev,size=16m`) — process-runtime state.
 //! - `--security-opt no-new-privileges` — prevents setuid escalation.
 //! - `--security-opt seccomp=builtin` — Docker's default seccomp profile.
-//!   Spec § "Hardening" prints this as `seccomp=default`, which is not a
+//!    prints this as `seccomp=default`, which is not a
 //!   valid Docker CLI argument (Docker reads `default` as a filename and
 //!   exits non-zero). The operator-intent reading is "Docker's default
 //!   seccomp profile" — `builtin` is Docker's documented spelling for
@@ -49,7 +49,7 @@
 //!
 //! # Lifecycle
 //!
-//! - [`SessionRuntime::create`]: validates the spec, looks up the
+//! - [`SessionRuntime::create`]: validates the design, looks up the
 //!   per-session network info registered via
 //!   [`ContainerRuntime::register_session`], then `docker create`s the
 //!   container with the hardening flags + network attachment + DNS
@@ -58,7 +58,7 @@
 //!   container PID and invoking `sandbox-route-helper` is wired here:
 //!   when the network info has a non-`None` `route_helper_path` and
 //!   `gateway_ip`, the runtime spawns the helper between `docker start`
-//!   and returning. Per spec § "Networking → Timing invariant", the
+//!   and returning. Per the documented contract, the
 //!   agent does no outbound I/O before this point so the window is
 //!   benign even though the default route still points at `.1`.
 //! - [`SessionRuntime::stop`]: `docker stop -t 10 <name>`. Idempotent —
@@ -95,7 +95,7 @@ use enumset::EnumSet;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Stop timeout passed to `docker stop -t`. Matches the spec's "bounded
+/// Stop timeout passed to `docker stop -t`. Matches the "bounded
 /// timeout" requirement and gives in-container processes a reasonable
 /// window to flush before SIGKILL.
 const DOCKER_STOP_GRACE_SECS: u64 = 10;
@@ -158,14 +158,14 @@ pub fn lite_image_tag_for_daemon_probe(daemon_version: &str) -> String {
 
 /// Verbatim warning emitted on first-use rebuild of the lite image.
 ///
-/// Spec § "Image building / First-use warning" pins this exact byte
+///  pins this exact byte
 /// sequence (note the en-dash `—` between "version" and "building"); the
 /// CLI surface and integration tests both rely on string equality.
 pub const LITE_FIRST_USE_WARNING: &str =
     "lite: first use on this daemon version — building lite image";
 
 /// Dockerfile baked into `sandboxd` and written to the build-context
-/// staging directory at [`ensure_image`] time. Spec § "Image building /
+/// staging directory at [`ensure_image`] time.
 /// Dockerfile shape" — bumping the Dockerfile invalidates the daemon
 /// version (callers are expected to bump `CARGO_PKG_VERSION` when this
 /// content changes; the version is part of the tag, so an old image
@@ -180,12 +180,12 @@ const LITE_DOCKERFILE: &str = include_str!("../../../images/lite/Dockerfile");
 const DOCKER_BUILD_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Tmpfs flag values shared by the `/tmp` and `/run` mounts —
-/// `rw,nosuid,nodev` plus per-mount size. Centralised so the spec
-/// audit trail (§ "Hardening") stays grep-able from one place.
+/// `rw,nosuid,nodev` plus per-mount size. Centralised so the design
+/// audit trail stays grep-able from one place.
 const TMPFS_TMP_FLAGS: &str = "rw,nosuid,nodev,size=256m";
 const TMPFS_RUN_FLAGS: &str = "rw,nosuid,nodev,size=16m";
 
-/// Pids-limit ceiling (§ "Hardening" — fork-bomb mitigation).
+/// Pids-limit ceiling — fork-bomb mitigation.
 const PIDS_LIMIT: u32 = 512;
 
 // ---------------------------------------------------------------------------
@@ -235,7 +235,7 @@ pub struct ContainerNetwork {
     pub gateway_ip: IpAddr,
     /// Optional bind-mount pair (host + guest path) installed into
     /// the container at `docker create` time. `None` means no
-    /// workspace bind. Aligned with the spec's
+    /// workspace bind. Aligned with the
     /// [`crate::session::WorkspaceMode::Shared`] semantics — the
     /// operator-supplied `guest_path` is the bind target inside the
     /// container, unified with Lima's workspace mount across both
@@ -265,7 +265,7 @@ pub struct ContainerNetwork {
     /// container so HTTPS traffic transparently rewritten by mitmproxy
     /// (L3-HTTP policy MITM) verifies cleanly. The Lima approach
     /// (`update-ca-certificates` over a writable rootfs) is unavailable
-    /// here because the spec § Hardening mandates `--read-only`; the
+    /// here because the hardening requirements mandate `--read-only`; the
     /// bind-mount + env-var path achieves the same effect without
     /// touching the rootfs. `None` means no CA injection.
     pub ca_host_path: Option<PathBuf>,
@@ -284,14 +284,14 @@ pub struct ContainerNetwork {
 pub struct ContainerRuntime {
     capabilities: Capabilities,
     image_tag: String,
-    /// Default memory ceiling in megabytes. Spec § "Resource defaults"
+    /// Default memory ceiling in megabytes.
     /// — `host_ram × 0.8` rounded down — is computed once at daemon
     /// startup (Phase 3D) and threaded in here.
     default_memory_mb: u32,
-    /// Default CPU ceiling. Spec § "Resource defaults" — `host_cpus × 0.8`
+    /// Default CPU ceiling.  — `host_cpus × 0.8`
     /// rounded to one decimal place.
     default_cpus: f64,
-    /// Linux uid the container runs as. Spec § "Hardening" specifies
+    /// Linux uid the container runs as.  specifies
     /// `1000:1000` unless the host uid differs from 1000 (for workspace
     /// bind-mount uid alignment), in which case the calling uid/gid are
     /// used.
@@ -302,7 +302,7 @@ pub struct ContainerRuntime {
     /// {guest_bind_source}:/usr/local/bin/sandbox-guest:ro` bind-mount
     /// at `docker create` time so the in-image baked guest is overlaid
     /// by the daemon's current binary; refresh is implemented as a
-    /// `docker restart` (api-session-isolation spec § 3.8.1). The path
+    /// `docker restart` (per-caller isolation). The path
     /// is set by the daemon at construction time (see `main.rs` —
     /// resolved via `sandbox_core::guest_agent_path`, which finds the
     /// FHS install path `/usr/local/libexec/sandboxd/sandbox-guest` in
@@ -331,7 +331,7 @@ impl ContainerRuntime {
     /// 80%-of-host defaults; tests pass arbitrary values.
     ///
     /// `user_uid` / `user_gid` are the in-container runtime identity.
-    /// Spec § "Hardening" mandates non-root; spec § "Workspace" mandates
+    ///  mandates non-root; the documented contract mandates
     /// alignment with the host operator's uid when the host uid is not
     /// 1000.
     ///
@@ -412,7 +412,7 @@ impl ContainerRuntime {
 
     /// Resolve a runtime handle back to a [`SessionId`] by stripping
     /// the canonical `sandbox-` prefix. Container handles share Lima's
-    /// naming convention (spec § "Persistence / Handle persistence").
+    /// naming convention.
     fn session_id_from_handle(handle: &RuntimeHandle) -> Result<SessionId, SandboxError> {
         crate::lima::parse_session_id_from_name(handle.as_str()).ok_or_else(|| {
             SandboxError::InvalidArgument(format!(
@@ -422,8 +422,8 @@ impl ContainerRuntime {
         })
     }
 
-    /// Resolve container memory/cpus from the spec, falling back to
-    /// the runtime's defaults when the spec carries `0` (treated as
+    /// Resolve container memory/cpus from the design, falling back to
+    /// the runtime's defaults when the design carries `0` (treated as
     /// "unset" — the request-boundary handler in `sandboxd` stamps
     /// `0`/`0.0` whenever the operator omitted `--cpus`/`--memory`,
     /// and this is where we substitute the daemon's host-80% defaults).
@@ -464,29 +464,28 @@ impl ContainerRuntime {
 
 /// Static [`Capabilities`] for the container backend. Mirrors
 /// [`Capabilities::for_lima`] in placement intent — pinned source of
-/// truth for the discovery endpoint (Phase 3C). Spec §"Capabilities
-/// model" + §"What this breaks" justifies each field.
+/// truth for the discovery endpoint (Phase 3C).
 fn capabilities_for_container() -> Capabilities {
     Capabilities {
         kind: BackendKind::Container,
-        // Spec §"Architecture / Two implementations" — container is
+        // The documented contract for "Architecture / Two implementations" — container is
         // namespace + cgroup isolation only.
         isolation: IsolationLevel::Container,
-        // Spec §"What this breaks" — kernel modules / KVM not
+        // The documented contract for "What this breaks" — kernel modules / KVM not
         // exposed in default-seccomp container.
         nested_virt: false,
-        // Spec §"What this breaks" — `cap-drop=ALL` and read-only
+        // The documented contract for "What this breaks" — `cap-drop=ALL` and read-only
         // rootfs forbid `mount`, raw `iptables`, etc.
         privileged_ops: false,
-        // Spec §"What this breaks" — `CAP_NET_RAW` dropped; raw sockets
+        // The documented contract for "What this breaks" — `CAP_NET_RAW` dropped; raw sockets
         // (and therefore `ping`) do not work.
         raw_network: false,
-        // Spec §"Capabilities model" — `--hardened` is QEMU-only.
+        // The documented contract for "Capabilities model" — `--hardened` is QEMU-only.
         hardening_flag: false,
-        // Spec §"CLI & UX / `sandbox create --no-cache`" — no
+        // The documented contract for "CLI & UX / `sandbox create --no-cache`" — no
         // per-session slow path; rebuild-image is the operator surface.
         per_session_no_cache: false,
-        // Spec §"Workspace" — both workspace modes are supported on the
+        // The documented contract for "Workspace" — both workspace modes are supported on the
         // container backend: `Shared` advertises a Docker bind-mount
         // (the daemon threads `workspace_bind` from the
         // request through `ContainerNetwork`, and `docker create --mount`
@@ -541,7 +540,7 @@ fn build_create_argv(
     let label_arg = format!("sandbox.session_id={session_id}");
     let home_mount = format!("type=volume,src={home_volume},dst=/home/agent");
     let workspace_mount = network.workspace_bind.as_ref().map(|bind| {
-        // Spec § "Container Backend / Shared bind-mount" — the
+        //  — the
         // bind target is the operator-resolved `guest_path`,
         // unified with Lima's workspace mount. The home volume
         // mounts at `/home/agent`; a bind whose `guest_path` lands
@@ -556,7 +555,7 @@ fn build_create_argv(
         )
     });
     let ca_args = build_ca_mount_args(network);
-    // api-session-isolation spec § 3.8.1 — the installed
+    // per-caller isolation.8.1 — the installed
     // `sandbox-guest` is bind-mounted read-only at the canonical
     // in-container path so refresh becomes `docker restart` rather
     // than a `docker cp` into the `--read-only` rootfs. One inode is
@@ -581,7 +580,7 @@ fn build_create_argv(
         ip_arg,
         "--dns".to_string(),
         dns_arg,
-        // Hardening — every flag in spec § "Hardening" applied
+        // Hardening — every flag in the documented contract applied
         // verbatim, in table order.
         "--read-only".to_string(),
         "--tmpfs".to_string(),
@@ -628,7 +627,7 @@ fn build_create_argv(
 }
 
 /// Compose the `docker restart` argv for the container backend's
-/// refresh path (api-session-isolation spec § 3.8.1). Pure function
+/// refresh path (per-caller isolation). Pure function
 /// so the unit test pins the load-bearing `restart` subcommand and
 /// rules out a regression that reintroduces the obsolete `docker
 /// cp` path.
@@ -653,7 +652,7 @@ impl SessionRuntime for ContainerRuntime {
     /// `docker create` the container with hardening flags, network
     /// attachment, DNS pointer, named home volume, the read-only
     /// bind-mount of the daemon-staged `sandbox-guest` binary
-    /// (api-session-isolation spec § 3.8.1), and the optional
+    /// (per-caller isolation), and the optional
     /// workspace bind-mount.
     async fn create(
         &self,
@@ -690,7 +689,7 @@ impl SessionRuntime for ContainerRuntime {
 
     /// `docker start <name>`, then optionally invoke
     /// `sandbox-route-helper --for-user <name> <pid> <gateway-ip>` if a
-    /// helper path was registered. Spec § "Lifecycle" — the helper runs
+    /// helper path was registered.  — the helper runs
     /// between `docker start` and the agent-ready wait. Idempotent retries
     /// on already-running containers are safe (Docker's start command is
     /// idempotent for running containers).
@@ -836,8 +835,7 @@ impl SessionRuntime for ContainerRuntime {
     /// **Bind-mount design.** The lite container has no init system —
     /// `ENTRYPOINT ["/usr/bin/tini", "--",
     /// "/usr/local/bin/sandbox-guest"]` is the only path the new binary
-    /// becomes the live process. Under the bind-mount design (spec §
-    /// 3.8.1), the daemon stages `sandbox-guest` once at startup into
+    /// becomes the live process. Under the bind-mount design ((/// 3.8.1), the daemon stages `sandbox-guest` once at startup into
     /// `{base_dir}/guest/sandbox-guest` and `create()` adds a
     /// read-only bind-mount of that path at the canonical in-container
     /// location. Refresh therefore reduces to **`docker restart`** —
@@ -956,8 +954,7 @@ impl SessionRuntime for ContainerRuntime {
 // ---------------------------------------------------------------------------
 
 /// [`GuestTransport`] over `docker exec <container> socat -
-/// TCP:127.0.0.1:5123` — the spec § "Architecture / Two implementations"
-/// pattern that mirrors Lima's `limactl shell <vm> -- socat -
+/// TCP:127.0.0.1:5123` — same pattern as Lima's `limactl shell <vm> -- socat -
 /// TCP:127.0.0.1:5123` exactly. The `sandbox-guest` agent binds TCP on
 /// `127.0.0.1:5123` inside the container; reaching it via `docker exec`
 /// is the dual of Lima reaching it via `limactl shell` and works
@@ -1052,7 +1049,7 @@ impl AsyncWrite for ContainerTransportStream {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Canonical home-volume name (spec § "Per-session home volume").
+/// Canonical home-volume name.
 ///
 /// Re-exported from `backend/mod.rs` so the daemon's inspect surface
 /// (`session_mount_info_for`) can reach the same string the runtime
@@ -1064,7 +1061,7 @@ pub fn home_volume_name(session_id: &SessionId) -> String {
 }
 
 /// Format the cpus knob as a one-decimal string (`2.0`, `0.5`) since
-/// the docker CLI accepts decimals and spec § "Resource defaults"
+/// the docker CLI accepts decimals and the documented contract
 /// pins one-decimal precision.
 fn format_cpus(cpus: f64) -> String {
     format!("{cpus:.1}")
@@ -1108,7 +1105,7 @@ const SANDBOX_CA_ENV_VARS: &[&str] = &[
 /// HTTPS-client trust env vars. See the field doc on
 /// [`ContainerNetwork::ca_host_path`] for the rationale (Lima's
 /// `update-ca-certificates`-based path is incompatible with the
-/// spec-mandated `--read-only` rootfs).
+/// required `--read-only` rootfs).
 ///
 /// `CURL_CA_BUNDLE` / `SSL_CERT_FILE` override the system bundle, which
 /// is the desired behaviour here: every request inside the container is
@@ -1208,14 +1205,13 @@ async fn inspect_container_pid(container_name: &str) -> Result<i32, SandboxError
 }
 
 /// Spawn `sandbox-route-helper --for-user <name> <pid> <gateway_ip>`
-/// and wait for completion. Per the route-helper contract (spec §
-/// "Networking → Helper authorization flow"), exit 0 is success and any
+/// and wait for completion. Per the route-helper contract ((/// "Networking → Helper authorization flow"), exit 0 is success and any
 /// non-zero exit is a deny — stderr carries the load-bearing reason
 /// which we surface to the caller verbatim.
 ///
 /// The `--for-user` flag is emitted BEFORE the two positional args to
-/// match the helper's `parse_argv` accept-flags-then-positionals order
-/// (helper crate-level docs § "Invocation"). `for_user` is the operator
+/// match the helper's `parse_argv` accept-flags-then-positionals order.
+/// `for_user` is the operator
 /// name the daemon resolved from `SO_PEERCRED`; the helper independently
 /// verifies it lands in `users.conf`'s `allow_users` for the chosen
 /// pool, alongside the daemon's own runtime uid (pair-membership check).
@@ -1267,7 +1263,7 @@ async fn invoke_route_helper(
 // ---------------------------------------------------------------------------
 
 /// Compute the daemon-wide default container memory/CPU ceilings from
-/// the host's resources, per spec § "Resource defaults — container only".
+/// the host's resources.
 ///
 /// Returns `(memory_mb, cpus)`:
 /// - `memory_mb` = `host_ram_mb × 0.8`, floored to whole MB.
@@ -1277,7 +1273,7 @@ async fn invoke_route_helper(
 /// `ContainerRuntime::new`); host RAM/CPU changes between daemon
 /// restarts pick up new defaults on the next boot.
 ///
-/// Internal type for the cpu default is `f64` so the spec's one-decimal
+/// Internal type for the cpu default is `f64` so the one-decimal
 /// precision survives all the way to docker's `--cpus <n>` flag (see
 /// `format_cpus`). The wire-level [`BackendSpecific::Container`]
 /// field is `f32` (widened from a historical `u32`), so an explicit
@@ -1310,7 +1306,7 @@ pub fn compute_default_resource_limits() -> (u32, f64) {
 /// Best-effort `MemTotal` read from `/proc/meminfo` in megabytes.
 /// Falls back to 4096 MB when the file cannot be read or the line is
 /// missing — keeps the daemon bootable on a non-Linux dev host (the
-/// production target is Linux per spec § "Architecture").
+/// production target is Linux.
 fn read_host_ram_mb_or_default() -> u64 {
     const FALLBACK_MB: u64 = 4096;
     let raw = match std::fs::read_to_string("/proc/meminfo") {
@@ -1344,16 +1340,16 @@ fn read_host_ram_mb_or_default() -> u64 {
 }
 
 /// Map a host (uid, gid) onto the in-container `--user <uid>:<gid>`
-/// pair per spec § Hardening line 544 + § Workspace lines 568-571.
+/// pair.
 ///
 /// Branch logic:
-/// - `daemon_uid == 0` → `(1000, 1000)`. Spec mandates non-root
-///   (line 281); root degrades to the spec floor 1000:1000 so a
+/// - `daemon_uid == 0` → `(1000, 1000)`. requires non-root
+///   (line 281); root degrades to the design floor 1000:1000 so a
 ///   `sudo sandboxd` / `User=root` systemd unit cannot leak root into
 ///   the container or root-own bind-mounted writes.
-/// - `daemon_uid == 1000` → `(1000, 1000)`. Spec primary branch; uid
+/// - `daemon_uid == 1000` → `(1000, 1000)`. Primary branch; uid
 ///   alignment is already trivial.
-/// - otherwise → `(daemon_uid, daemon_gid)`. Spec § Workspace's
+/// - otherwise → `(daemon_uid, daemon_gid)`.
 ///   "calling uid/gid when host uid ≠ 1000" so workspace bind-mount
 ///   writes are owned by the operator on the host.
 pub fn map_container_uid_gid(daemon_uid: u32, daemon_gid: u32) -> (u32, u32) {
@@ -1365,7 +1361,7 @@ pub fn map_container_uid_gid(daemon_uid: u32, daemon_gid: u32) -> (u32, u32) {
 
 /// Best-effort host CPU count. Falls back to 2.0 when
 /// `available_parallelism` errors (e.g. cgroup v1 oddities). Returned as
-/// `f64` because the spec's `× 0.8` multiplier produces a fractional
+/// `f64` because the `× 0.8` multiplier produces a fractional
 /// value that flows directly into the `--cpus` ceiling.
 fn read_host_cpus_or_default() -> f64 {
     match std::thread::available_parallelism() {
@@ -1438,11 +1434,10 @@ fn container_image_lock() -> &'static Mutex<()> {
 ///   `Built` outcome and `AlreadyPresent` for the rest.
 /// - Build context: a fresh `tempfile::TempDir` populated with the
 ///   embedded `LITE_DOCKERFILE` and the `sandbox-guest` binary
-///   located via [`guest_agent_path`]. The spec mentions
-///   `{runtime_dir}/images/lite/` — using a tempdir is functionally
-///   equivalent (the staging surface has no purpose beyond the
-///   `docker build` invocation) and removes a runtime-dir dependency
-///   that 3B does not need.
+///   located via [`guest_agent_path`]. A `tempfile::TempDir` is used
+///   instead of a persistent `{runtime_dir}/images/lite/` staging path
+///   because the staging surface has no purpose beyond the `docker build`
+///   invocation, and a tempdir removes a runtime-dir dependency.
 pub fn ensure_image(daemon_version: &str) -> Result<EnsureImageOutcome, SandboxError> {
     let tag = lite_image_tag_for_version(daemon_version);
 
@@ -1565,7 +1560,7 @@ fn build_lite_image(tag: &str, no_cache: bool) -> Result<(), SandboxError> {
 /// `ensure_image` short-circuits when the image is already present;
 /// `rebuild_lite_image` always runs `docker build`, which is what
 /// `sandbox rebuild-image --backend container` asks for. `no_cache:
-/// true` adds `docker build --no-cache` (spec § "rebuild-image"),
+/// true` adds `docker build --no-cache`,
 /// otherwise the build runs with cache enabled — fast path for
 /// incremental rebuilds when the operator just wants to pick up
 /// `sandbox-guest` changes without rebuilding every Dockerfile layer.
@@ -1574,8 +1569,7 @@ fn build_lite_image(tag: &str, no_cache: bool) -> Result<(), SandboxError> {
 /// so concurrent ensure-and-rebuild paths cannot race; the lock is
 /// container-scoped and independent of Lima's `base_image_lock`, so
 /// concurrent `rebuild --backend lima` and `rebuild --backend
-/// container` still run in parallel (spec Phase 4C: per-backend lock
-/// model).
+/// container` still run in parallel (per-backend lock model).
 ///
 /// Synchronous: callers from async contexts must wrap in
 /// `tokio::task::spawn_blocking` (CLAUDE.md `spawn_blocking`
@@ -1840,7 +1834,7 @@ mod tests {
 
     /// The installed `sandbox-guest` is bind-mounted read-only into
     /// every container at the canonical in-container path
-    /// (api-session-isolation spec § 3.8.1). The flag pair must
+    /// (per-caller isolation). The flag pair must
     /// appear verbatim in the `docker create` argv; a regression in
     /// the source path, destination, or `:ro` mode flag would
     /// silently break the bind-mount design (refresh would still
@@ -1951,7 +1945,7 @@ mod tests {
         // The workspace bind appears as an adjacent `--mount` / spec
         // pair. Find every `--mount` flag, look for the one whose value
         // matches the expected workspace spec, and assert the pair is
-        // adjacent (i.e. the spec follows the flag).
+        // adjacent (i.e. the design follows the flag).
         let expected_spec = "type=bind,src=/tmp/h,dst=/srv/g";
         let mount_idx = args
             .iter()
@@ -1989,7 +1983,7 @@ mod tests {
     }
 
     /// `refresh_guest_binary` must invoke `docker restart`, NOT
-    /// `docker cp`. The original api-session-isolation spec § 3.8.1
+    /// `docker cp`. The original per-caller isolation.8.1
     /// design used `cp` to push the embedded bytes into the
     /// container's writable layer; the bind-mount design replaces
     /// that with a restart against the already-current bind-mount
@@ -2006,7 +2000,7 @@ mod tests {
         assert!(
             !argv.iter().any(|a| a == "cp"),
             "refresh must not invoke `docker cp` — api-session-isolation \
-             spec § 3.8.1 replaced cp with the bind-mount + restart \
+            .8.1 replaced cp with the bind-mount + restart \
              design; got argv {argv:?}",
         );
         assert_eq!(
@@ -2039,7 +2033,7 @@ mod tests {
         );
     }
 
-    /// `home_volume_name` follows the spec's `sandbox-home-{session_id}`
+    /// `home_volume_name` follows the `sandbox-home-{session_id}`
     /// shape — pinned because `delete()` constructs the volume name from
     /// the session id and a drift would orphan the volume.
     #[test]
@@ -2048,8 +2042,8 @@ mod tests {
         assert_eq!(home_volume_name(&sid), "sandbox-home-0123456789ab");
     }
 
-    /// `format_cpus` pins one-decimal precision (spec § "Resource
-    /// defaults") so `--cpus 0.8` renders unambiguously.
+    /// `format_cpus` pins one-decimal precision so `--cpus 0.8`
+    /// renders unambiguously.
     #[test]
     fn format_cpus_one_decimal() {
         assert_eq!(format_cpus(2.0), "2.0");
@@ -2091,7 +2085,7 @@ mod tests {
         let rt = test_runtime();
         let sid = SessionId::generate();
         // Register a network entry so we get past the session lookup
-        // before reaching the spec-shape check; otherwise the test
+        // before reaching the design-shape check; otherwise the test
         // would conflate two failure modes.
         rt.register_session(
             sid,
@@ -2135,7 +2129,7 @@ mod tests {
     }
 
     /// `resource_ceilings` falls back to the runtime's defaults when
-    /// the spec carries `0`/`0.0`; passes through non-zero values
+    /// the design carries `0`/`0.0`; passes through non-zero values
     /// unchanged with f32→f64 lossless widening.
     ///
     /// The historical shape was `cpus: u32` with `as f64` widening
@@ -2250,13 +2244,13 @@ mod tests {
     }
 
     /// `read_host_ram_mb_or_default` parses `/proc/meminfo` on Linux. On
-    /// the test host (Linux per spec) we expect a non-fallback value;
+    /// the test host (Linux as designed) we expect a non-fallback value;
     /// at minimum it must exceed the 4096 MB fallback floor so we can
     /// distinguish "real read" from "fallback fired".
     ///
     /// Skipped silently on non-Linux dev hosts: on those the function
     /// is allowed to return the fallback, and the assertion would
-    /// flake. Production target is Linux per spec § "Architecture".
+    /// flake. Production target is Linux.
     #[test]
     fn read_host_ram_mb_or_default_reads_meminfo_on_linux() {
         if !cfg!(target_os = "linux") {
@@ -2282,9 +2276,9 @@ mod tests {
         assert!(cpus >= 1.0, "expected at least 1 CPU, got {cpus}");
     }
 
-    /// `map_container_uid_gid` enforces spec § Hardening line 544 +
-    /// § Workspace lines 568-571: root degrades to the 1000:1000 floor,
-    /// uid 1000 stays put, and any other uid/gid pass through verbatim
+    /// `map_container_uid_gid` enforces the UID alignment contract:
+    /// root degrades to the 1000:1000 floor, uid 1000 stays put,
+    /// and any other uid/gid pass through verbatim
     /// for workspace bind-mount alignment.
     #[test]
     fn map_container_uid_gid_branches_match_spec() {

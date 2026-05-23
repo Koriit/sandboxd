@@ -1,6 +1,6 @@
 """Happy-path install tests across distros.
 
-Covers the fresh-install matrix entries from spec § 6.3:
+Covers the fresh-install matrix entries from.3:
 - ``test_install_fresh_then_doctor_passes``      [ubuntu-22.04, debian-12]
 - ``test_install_fresh_then_doctor_passes_rhel_paths`` [fedora-41]
 
@@ -67,7 +67,7 @@ def test_install_fresh_then_doctor_passes(
 
     # Doctor must report 0 failed checks — the test name promises green.
     # `assert_doctor_passes` enforces both the exit code AND the
-    # "checks passed, 0 failed" output token per spec § 6.2.
+    # "checks passed, 0 failed" output token per.2.
     assert_doctor_passes(vm)
 
     # ---------------- Uninstall path ----------------

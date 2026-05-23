@@ -1,5 +1,4 @@
-//! Release tarball fetch + sigstore verification + extraction —
-//! Spec 5 §§ 3.1.4, 3.1.9, 3.1.10.
+//! Release tarball fetch + sigstore verification + extraction.
 //!
 //! Three responsibilities:
 //!
@@ -28,7 +27,7 @@ use ring::digest;
 // ---------------------------------------------------------------------------
 
 /// On-disk location of the `cosign` binary used for `verify-blob`.
-/// install.sh's `cosign_bootstrap` step (Spec 4 § 4.4.8) is the canonical
+/// install.sh's `cosign_bootstrap` step is the canonical
 /// installer; `sandbox update` reuses the result. If the file is missing
 /// the update flow refuses with [`FetchError::CosignNotFound`] pointing
 /// the operator at the install docs — bootstrapping cosign from the
@@ -119,7 +118,7 @@ pub enum ManifestError {
     Io(#[from] std::io::Error),
     #[error("parse MANIFEST: {0}")]
     Parse(serde_json::Error),
-    /// **Operator-facing message — verbatim in the spec § 3.1.10.**
+    /// **Operator-facing message — verbatim; must not be changed.**
     #[error("MANIFEST arch mismatch: tarball says {tarball_arch}, expected {installed_arch}")]
     ArchMismatch {
         tarball_arch: String,
@@ -133,7 +132,7 @@ pub enum ManifestError {
 }
 
 // ---------------------------------------------------------------------------
-// Sigstore verification + per-file digest check (Spec 5 § 3.1.10)
+// Sigstore verification + per-file digest check
 // ---------------------------------------------------------------------------
 
 /// Errors surfaced by [`verify_signature`] and [`verify_artifact_digests`].
@@ -147,7 +146,7 @@ pub enum FetchError {
     /// `/usr/local/bin/cosign` is absent. Surfaced when the operator
     /// never ran install.sh on this host, or has uninstalled cosign
     /// out-of-band. The update flow does not bootstrap cosign — that is
-    /// install.sh's responsibility (Spec 5 § 3.1.9, separation of
+    /// install.sh's responsibility (the migration framework.1.9, separation of
     /// concerns).
     #[error(
         "cosign binary not found at {path} — \
@@ -182,7 +181,7 @@ pub enum FetchError {
 /// Resolve the cosign bundle path that pairs with `tarball`. If
 /// `bundle_override` is `Some` (operator passed `--cosign-bundle`), that
 /// wins. Otherwise we look for `<tarball>.sigstore` as a sibling — same
-/// convention install.sh § 4.4.10 uses.
+/// convention install.sh uses.
 fn resolve_bundle_path(
     tarball: &Path,
     bundle_override: Option<&Path>,
@@ -208,7 +207,7 @@ fn resolve_bundle_path(
     })
 }
 
-/// Spec 5 § 3.1.10: invoke `cosign verify-blob` against the release
+/// Invoke `cosign verify-blob` against the release
 /// tarball before any extraction. Mirrors install.sh's `sigstore_verify`
 /// byte-for-byte on the flags so a tarball that install.sh accepts is
 /// also accepted here (and vice versa).
@@ -293,7 +292,7 @@ pub fn verify_signature(tarball: &Path, bundle: Option<&Path>) -> Result<(), Fet
     Ok(())
 }
 
-/// Spec 5 § 3.1.10: after the tarball is extracted, every entry in
+/// After the tarball is extracted, every entry in
 /// `manifest.artifacts` must hash-match its on-disk file under
 /// `stage.stage_dir`. Mirrors install.sh's `sha256sum -c` step. The
 /// trust chain is `cosign(tarball) → manifest(tarball-bytes) → sha256(file
@@ -346,7 +345,7 @@ pub fn read_manifest(path: &Path) -> Result<Manifest, ManifestError> {
     serde_json::from_slice(&bytes).map_err(ManifestError::Parse)
 }
 
-/// Spec 5 § 3.1.10: cross-check the MANIFEST's `arch` against the
+/// Cross-check the MANIFEST's `arch` against the
 /// `installed_arch` recorded in `/var/lib/sandbox/.install-state.json`
 /// — **not** against a live `uname -m` probe. Operators who upgrade
 /// onto a host whose install-state arch and uname-m arch have diverged
@@ -361,7 +360,7 @@ pub fn check_manifest_arch(manifest: &Manifest, installed_arch: &str) -> Result<
     Ok(())
 }
 
-/// Spec 5 § 3.1.10: the MANIFEST `version` must equal the target
+/// The MANIFEST `version` must equal the target
 /// version the operator asked for (latest, `--version`, or the
 /// `MANIFEST.version` of a local `--from` tarball — in the last case
 /// this check is tautological but still cheap).
@@ -379,7 +378,7 @@ pub fn check_manifest_version(
 }
 
 // ---------------------------------------------------------------------------
-// Tarball extraction (Spec 5 § 3.1.10)
+// Tarball extraction
 // ---------------------------------------------------------------------------
 
 /// The staged-tarball layout. Mirrors install.sh's `STAGE` shape so
@@ -426,7 +425,7 @@ impl StagedTarball {
 }
 
 /// Extract a release tarball into `dest_dir` and return the staged
-/// tree's root + parsed MANIFEST. Mirrors install.sh § 4.4.20's
+/// tree's root + parsed MANIFEST. Mirrors install.sh's
 /// `extract_tarball` shape: `tar -xzf <tarball> -C <dest>` produces a
 /// single top-level directory `sandboxd-<version>-<arch>/` containing
 /// `bin/`, `systemd/`, `images/`, `MANIFEST`.
@@ -506,7 +505,7 @@ pub fn peek_manifest_in_tarball(tarball: &Path) -> Result<Manifest, ManifestErro
 }
 
 // ---------------------------------------------------------------------------
-// Latest-version resolution (Spec 5 § 3.1.4)
+// Latest-version resolution
 // ---------------------------------------------------------------------------
 
 /// GitHub Releases API endpoint for the latest tag. Used by the

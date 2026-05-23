@@ -1,7 +1,7 @@
 //! Integration tests: `sandbox create --no-cache` is rejected
 //! client-side when the resolved backend is the container backend.
 //!
-//! Spec § "CLI & UX → `sandbox create --no-cache` is forbidden on
+//!
 //! container" mandates that the CLI surface this mismatch with exit
 //! code 2 (clap-style misuse) *before* the daemon is contacted, so the
 //! operator never burns a Unix-socket roundtrip on a guaranteed-to-fail
@@ -17,7 +17,7 @@
 //! CLI's preflight finds whichever backend the test selected. In the
 //! rejection cases the CLI exits before sending `POST /sessions`, so
 //! the daemon's session counter stays at zero — that double-checks the
-//! "before the daemon is contacted" half of the spec contract.
+//! "before the daemon is contacted" half of the design contract.
 
 use std::process::Stdio;
 use std::sync::Arc;
@@ -71,7 +71,7 @@ async fn spawn_dual_backend_daemon() -> (TempDir, String, SessionsCounter) {
                 // clone-on-container plumbing has landed. The
                 // `--no-cache` rejection asserted
                 // by these tests is independent of workspace modes;
-                // the mock is kept spec-accurate so the preflight
+                // the mock is kept well-formed so the preflight
                 // does not skip on a malformed capability matrix.
                 Json(json!([
                     {
@@ -193,7 +193,7 @@ async fn integration_no_cache_rejection_with_lite_flag_exits_two() {
     assert_eq!(
         status.code(),
         Some(2),
-        "spec mandates exit code 2 (misuse) for --no-cache on container backend; \
+        "the design requires exit code 2 (misuse) for --no-cache on container backend; \
          got {:?}\nstderr:\n{stderr}",
         status.code()
     );
@@ -233,7 +233,7 @@ async fn integration_no_cache_rejection_with_backend_container_exits_two() {
     assert_eq!(
         status.code(),
         Some(2),
-        "spec mandates exit code 2 (misuse) for --no-cache on container backend; \
+        "the design requires exit code 2 (misuse) for --no-cache on container backend; \
          got {:?}\nstderr:\n{stderr}",
         status.code()
     );

@@ -3,7 +3,7 @@
 //! Pins four contracts:
 //!
 //! 1. `integration_rootless_docker_session_create_refused` — the daemon
-//!    returns HTTP 400 with the spec-shaped rejection body when the
+//!    returns HTTP 400 with the design-shaped rejection body when the
 //!    rootless-Docker probe reports `name=rootless` and the operator
 //!    did not pass `--force-rootless-docker`. No container artifacts
 //!    are allocated (the probe runs before `setup_session_networking`,
@@ -444,13 +444,13 @@ impl<'a> Drop for SessionCleanupGuard<'a> {
 // ---------------------------------------------------------------------------
 
 /// Test 1 — rootless host without `--force-rootless-docker`: HTTP 400
-/// surfaces through the CLI as exit 1 with the spec-shaped message;
+/// surfaces through the CLI as exit 1 with the design-shaped message;
 /// no docker artifacts (sandbox-{id} container, sandbox-net-{id}
 /// network, sandbox-home-{id} volume) are created.
 ///
 /// The probe must run *before* any docker artifact allocation — Wave
 /// 2 confirmed this ordering by placing the gate immediately after
-/// the spec validation pass and before the per-session network
+/// the design validation pass and before the per-session network
 /// allocation. This test pins that ordering by snapshotting the
 /// docker artifact namespace before the create call and asserting it
 /// is unchanged afterwards.
@@ -644,7 +644,7 @@ fn integration_rootless_docker_force_flag_rejected_on_lima() {
     // output on stderr (no swallowing, no rewording).
     for line in &[
         "error: `--force-rootless-docker` is only meaningful for the container backend",
-        "help: rootless-Docker detection (spec § Non-goals 1195) is a container-backend gate",
+        "help: rootless-Docker detection is a container-backend gate",
         "help: drop `--force-rootless-docker`, or pass `--backend container` / `--lite` if you intended a container session",
     ] {
         assert!(

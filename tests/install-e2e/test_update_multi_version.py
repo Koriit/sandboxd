@@ -1,4 +1,4 @@
-"""Spec 5 § 9.1 tests that require a multi-version tarball harness.
+"""the install framework.1 tests that require a multi-version tarball harness.
 
 These tests depend on a v' tarball whose binaries' compiled-in
 `CARGO_PKG_VERSION` differs from the v tarball's. The
@@ -57,7 +57,7 @@ def test_update_fresh_install_to_next_version(
       by the update flow from the MANIFEST, which the build wrote with
       the bumped version too).
 
-    Together these pin the multi-version-aware fields of Spec 5 § 9.1's
+    Together these pin the multi-version-aware fields of the install framework.1's
     fresh-install-to-next-version contract.
     """
     vm = vm_factory(distro_template)
@@ -92,7 +92,7 @@ def test_update_fresh_install_to_next_version(
     # `from.is_file()` is true, so a directory short-circuits the
     # cosign call. Going through `--from <tarball>` would route
     # through cosign verify-blob and add noise that obscures the
-    # multi-version contract under test (Spec 5 § 9.1).
+    # multi-version contract under test .
     bumped_tarball_in_vm = copy_tarball_to_vm(vm, release_tarball_x86_64_bumped)
     bumped_ver = version_from_tarball(bumped_tarball_in_vm)
     assert bumped_ver != base_ver, (
@@ -135,7 +135,7 @@ def test_update_fresh_install_to_next_version(
         f"the same binary as base (multi-version harness skipped)."
     )
 
-    # 2. Install-state advanced to v'. Spec 5 § 3.2.29.
+    # 2. Install-state advanced to v'. the install framework.2.29.
     state = json.loads(
         vm.shell(
             "sudo cat /var/lib/sandbox/.install-state.json",
@@ -146,7 +146,7 @@ def test_update_fresh_install_to_next_version(
         f"install-state did not advance to {bumped_ver}: {state!r}"
     )
 
-    # 3. sessions.db integrity — Spec 5 § 3.2.15 backs the DB up
+    # 3. sessions.db integrity — the install framework.2.15 backs the DB up
     # to /var/lib/sandbox/backups/, then preserves the live copy
     # through the update. After a successful update the live DB at
     # /var/lib/sandbox/sessions.db must (a) exist, (b) be a
@@ -192,6 +192,6 @@ def test_update_fresh_install_to_next_version(
             )
     vm.shell("sudo rm -f /tmp/sessions.db.inspect", check=True, timeout=10)
 
-    # 4. Spec § 7.2 step 10 (post-update green-light gate): doctor
+    # 4. 
     # passes against the running v' daemon.
     assert_doctor_passes(vm)

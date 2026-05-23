@@ -70,7 +70,7 @@ $(VENV_STAMP): tests/e2e/pyproject.toml
 	touch $(VENV_STAMP)
 
 TEST ?=
-# CI policy (spec § "CI policy", lines ~1060-1070):
+# CI policy:
 #
 #   | Trigger           | Scope                           | Wall clock |
 #   | ----------------- | ------------------------------- | ---------- |

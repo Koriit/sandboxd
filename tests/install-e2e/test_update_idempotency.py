@@ -1,4 +1,4 @@
-"""`sandbox update` idempotency + partial-failure tests — Spec 5 §§ 3.2, 9.1.
+"""`sandbox update` idempotency + partial-failure tests — the install framework.2, 9.1.
 
 Three end-to-end cases against a Lima VM:
 
@@ -97,7 +97,7 @@ def test_update_interrupted_then_resumed(
     # executed by the base v binary on disk, keeping a clean "the
     # running CLI is v, not v'" invariant for the test. The remaining
     # three binary swaps still emit `action=skip` for the install_binary
-    # step on resume, which is what the spec § 9.1 idempotency
+    # step on resume, which is what the design § 9.1 idempotency
     # assertion below pins.
     stage_dir = "/tmp/sandbox-update-prestage"
     vm.shell(
@@ -183,16 +183,15 @@ def test_update_interrupted_then_resumed(
         f"resume run should have adopted the stale lock; log:\n{log}"
     )
 
-    # Spec § 9.1 contract: "the resume run mostly skips already-completed
+    # "the resume run mostly skips already-completed
     # steps". Parse the install log and count `action=skip` lines. With
     # three of the four bumped binaries pre-staged (sandboxd, sandbox-
     # route-helper, sandbox-guest; see the rationale at pre-stage time),
     # all three of those `install_binary` entries must record
     # action=skip. The fourth `install_binary` (sandbox CLI) is expected
     # to land as action=install because we intentionally left the v
-    # binary in place. The spec lists 18 stateful steps; this assertion
-    # pins the idempotency contract on the binary-install layer
-    # specifically.
+    # binary in place. This assertion pins the idempotency contract on
+    # the binary-install layer specifically.
     parsed = parse_install_log_actions(log)
     install_binary_actions = parsed.get("install_binary", [])
     skip_count = install_binary_actions.count("skip")
@@ -251,7 +250,7 @@ def test_update_partial_failure_backup_set_preserved(
 ):
     """A real failure mid-update leaves the backup set with
     completed_ok=false and that set is preserved across the subsequent
-    successful run's retention prune. Spec 5 §§ 3.2.19, 3.2.24, 5.2.
+    successful run's retention prune. the install framework.2.19, 3.2.24, 5.2.
 
     Strategy:
       * Install base version.
@@ -266,11 +265,11 @@ def test_update_partial_failure_backup_set_preserved(
         NOT prune the forensic set, and creates a second set marked
         ``completed_ok: true``.
 
-    This pins two spec contracts at once:
-      * § 3.2.19 — the in-progress manifest is written BEFORE the
+    This pins two update contracts at once:
+      * Step 3.2.19 — the in-progress manifest is written BEFORE the
         migrate step. If production code stops writing it at backup
         time, the first-run assertion fails.
-      * § 5.2 — retention prune skips forensic sets. If production
+      * Step 5.2 — retention prune skips forensic sets. If production
         prune logic regresses to delete completed_ok=false sets, the
         second-run assertion fails.
     """

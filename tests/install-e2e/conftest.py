@@ -613,7 +613,7 @@ def release_tarball_x86_64_bumped_chain(
     """Build a chain of N successively bumped release tarballs.
 
     ``test_update_backup_retention`` needs three real bumped binaries
-    in sequence (v → v+1 → v+2 → v+3) to verify Spec 5 § 5.2's keep=2
+    in sequence (v → v+1 → v+2 → v+3) to verify the install framework.2's keep=2
     retention prune. The synthesised MANIFEST-only fake-bump path
     can't satisfy this: ``verify_version`` in the update flow queries
     the daemon's ``/version`` post-restart and aborts on mismatch.
@@ -977,7 +977,7 @@ def version_from_tarball(tarball_path):
     """Extract the version string encoded in the tarball filename.
 
     Tarball naming convention is ``sandboxd-<version>-<arch>.tar.gz``
-    (spec § 2.1). install.sh's resolve_target_version step skips
+   . install.sh's resolve_target_version step skips
     network lookup when ``--from`` is set but does NOT auto-derive the
     version from the tarball filename — operators are expected to pass
     ``--version`` alongside ``--from``. The harness mirrors that
@@ -1042,7 +1042,7 @@ def assert_doctor_passes(vm, *, user=None, timeout=60, sock_path=None):
     """Run `sandbox doctor` and assert it reports zero failures.
 
     The CLI's doctor command exit code is 0 on green; we also assert
-    the ``"checks passed, 0 failed"`` token per spec § 6.2 — exit code
+    the ``"checks passed, 0 failed"`` token per.2 — exit code
     alone is insufficient because a broken doctor might silently exit 0
     without performing checks.
 
@@ -1149,7 +1149,7 @@ def assert_full_install_landed(vm):
 
 # Mirrors the COSIGN_SHA256_AMD64 / COSIGN_VERSION constants in
 # scripts/install.sh. If install.sh bumps cosign, update these in
-# lockstep — there is no automated drift check (call out in the spec
+# lockstep — there is no automated drift check (call out in the design
 # review pass).
 COSIGN_VERSION = "v2.4.1"
 COSIGN_SHA256_AMD64 = (
@@ -1351,7 +1351,7 @@ def pinned_cosign_binary() -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Multi-uid peercred test harness (Spec 2 § 9.2, Spec 1 § 8.4).
+# Multi-uid peercred test harness (the documented contract, the documented contract).
 # ---------------------------------------------------------------------------
 #
 # The peercred-connector helper lives at
@@ -1467,7 +1467,7 @@ def _newest_helper_src_mtime() -> float:
 def provision_peercred_connector_in_vm(vm, host_binary):
     """Copy ``peercred-connector`` into the VM and install it setuid-root.
 
-    Mirrors Spec 2 § 9.2's provisioning recipe:
+    Mirrors the documented contract's provisioning recipe:
 
     ```
     install -o root -g root -m 4755 <built-binary> \
@@ -1520,22 +1520,22 @@ def provision_peercred_connector_in_vm(vm, host_binary):
 # - ``bob`` (uid 4002)   — second operator, attempts cross-user reads
 # - uid 7777             — synthetic uid with NO ``/etc/passwd`` entry,
 #                          used by tests that pin the unresolvable-uid
-#                          deny/close behavior (Spec 1 § 8.4 #148 and
-#                          Spec 2 § 4.1 / 7.5 #150)
+#                          deny/close behavior (the documented contract #148 and
+#                          the documented contract / 7.5 #150)
 #
 # alice and bob both join the ``sandbox`` group so they can traverse
 # the socket's 0660 sandbox:sandbox parent dir / socket node. The
 # install harness's pre-existing ``lima`` user is also in that group
 # (install.sh's ``add_operator_to_group`` does this when run under
-# sudo); we don't reuse ``lima`` because Spec 2 § 7.5 wants two real
+# sudo); we don't reuse ``lima`` because the documented contract wants two real
 # operator uids distinct from any administrative role.
 #
 # uid 7777 is created with ``useradd`` and immediately ``userdel``-ed
 # so the uid number remains stranded in the kernel uid space without
 # a passwd entry — exactly the "uid without passwd lookup result"
 # state the deny/close tests exercise. The ``userdel`` step is what
-# decouples the uid number from the name; this is the same shape Spec
-# 1 § 8.4 specifies for the route-helper test.
+# decouples the uid number from the name; this is the "uid without passwd
+# lookup result" shape the route-helper integration tests exercise.
 
 TEST_UID_ALICE = 4001
 TEST_UID_BOB = 4002
@@ -1643,7 +1643,7 @@ def vm_invoking_user(vm):
 
 
 # ---------------------------------------------------------------------------
-# Route-helper audit-log scraping (Spec 1 § 3.5).
+# Route-helper audit-log scraping (the documented contract).
 # ---------------------------------------------------------------------------
 
 def read_route_helper_audit_log(vm, audit_log_path):
@@ -1651,7 +1651,7 @@ def read_route_helper_audit_log(vm, audit_log_path):
 
     Returns a list of dicts (one per record). Empty list if the file
     does not exist (the helper writes to the resolved path on demand;
-    an absent file means no record was ever appended). Per Spec 1
+    an absent file means no record was ever appended). Per the documented design
     § 3.5 every invocation writes exactly one record.
 
     The audit-log path inside the VM depends on the helper's

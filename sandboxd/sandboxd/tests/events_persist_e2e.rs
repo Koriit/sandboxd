@@ -14,7 +14,7 @@
 //!      session, drop the sink, and verify both files exist with
 //!      valid JSON on every line.
 //!   2. `integration_persistent_sink_pruner_removes_old_files` —
-//!      fabricate files at `today-20` and `today-1` under the spec
+//!      fabricate files at `today-20` and `today-1` under the design
 //!      layout, spawn the sink with `retention_days = 14` and a
 //!      fast test interval (`SANDBOX_TEST_PRUNER_INTERVAL_SECS=1`),
 //!      confirm the stale file is removed and the recent one
@@ -201,7 +201,7 @@ async fn integration_persistent_sink_pruner_removes_old_files() {
     let sid = SessionId::parse("0123456789ab").unwrap();
     let today = Utc::now().date_naive();
 
-    // Fabricate the two fixture files under the spec layout.
+    // Fabricate the two fixture files under the design layout.
     let events_dir = base.join("sessions").join(sid.as_str()).join("events");
     fs::create_dir_all(&events_dir).await.unwrap();
     let old_date = today - chrono::Duration::days(20);

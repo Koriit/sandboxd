@@ -8,20 +8,20 @@ install-e2e Lima VM harness rather than the host-level
 ``cargo nextest`` profile:
 
 * ``test_route_helper_uid_without_passwd_denies_cleanly``
-  (closes #148, pins Spec 1 § 8.4 / § 3.4) — a uid that does not
+  (closes #148, pins the documented contract / § 3.4) — a uid that does not
   resolve in ``/etc/passwd`` is denied at the route-helper's
   pair-check step before any netns work, and the deny lands in the
-  JSON-Lines audit log per Spec 1 § 3.5.
+  JSON-Lines audit log per the documented contract.
 
 * ``test_owner_isolation_uid_without_passwd_closes_connection``
-  (closes #150, pins Spec 2 § 4.1 / § 7.5) — a connection from a uid
+  (closes #150, pins the documented contract / § 7.5) — a connection from a uid
   with no passwd entry is closed cleanly by the daemon's peercred-
   aware acceptor; no panic, no response body, no leaked socket.
 
 * ``test_session_isolation_404_on_foreign_id``
-  (closes #151, pins Spec 2 § 5 / § 7.5 / § 9.2) — a session owned
+  (closes #151, pins the documented contract.5 / § 9.2) — a session owned
   by operator alice returns 404 when operator bob queries it by id.
-  Wire shape matches Spec 2 § 5: status 404, body
+  Wire shape matches the documented contract, body
   ``{"error":"session not found: <id>"}``.
 
 The harness pieces (peercred-connector helper, alice/bob users,
@@ -71,12 +71,12 @@ from conftest import (
 # top-to-bottom as a single sequence of assertions, not as a re-
 # implementation of the setup boilerplate.
 
-# Production paths (Spec 3, install.sh):
+# Production paths (the documented design, install.sh):
 DAEMON_SOCK = "/run/sandbox/sandboxd.sock"
 ROUTE_HELPER = "/usr/local/libexec/sandboxd/sandbox-route-helper"
 
 # Audit-log path the route-helper resolves to when XDG_RUNTIME_DIR is
-# set to a writable test tempdir (Spec 1 § 3.5 lookup order, step 2:
+# set to a writable test tempdir (the documented contract lookup order, step 2:
 # ``$XDG_RUNTIME_DIR/sandboxd/route-helper-audit.log``). Tests that
 # invoke the helper directly via ``setpriv`` pin this path by setting
 # ``XDG_RUNTIME_DIR`` in the invocation environment.
@@ -173,13 +173,13 @@ def test_route_helper_uid_without_passwd_denies_cleanly(
     sigstore_stack,
 ):
     """A route-helper invocation from a uid with no /etc/passwd entry
-    must be denied at the caller-identity step (Spec 1 § 3.4), with
-    the deny landing in the audit log (Spec 1 § 3.5).
+    must be denied at the caller-identity step (the documented contract), with
+    the deny landing in the audit log (the documented contract).
 
     Behavior pinned:
       * Helper exits ``DENY_EXIT`` (1).
       * stderr contains ``caller uid <n> does not resolve to a username``
-        verbatim (the Spec § 3.4 wording).
+        verbatim (the 
       * An audit-log JSON-Lines record is written with
         ``decision == "denied"``, ``reason == "caller-uid-unresolvable"``,
         and the caller field falls back to ``uid:<n>`` since there is
@@ -202,7 +202,7 @@ def test_route_helper_uid_without_passwd_denies_cleanly(
     Audit-log path:
       The helper resolves the audit log via
       ``$XDG_RUNTIME_DIR/sandboxd/route-helper-audit.log`` when
-      ``XDG_RUNTIME_DIR`` is set (Spec 1 § 3.5 step 2 of the lookup
+      ``XDG_RUNTIME_DIR`` is set (the documented contract step 2 of the lookup
       order). The test sets ``XDG_RUNTIME_DIR`` to a world-writable
       tempdir so the audit-log write succeeds even from a uid that
       has no homedir or default runtime dir.
@@ -257,14 +257,14 @@ def test_route_helper_uid_without_passwd_denies_cleanly(
         f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
     )
 
-    # Spec § 3.4 wording. Substring match — the helper formats the
+    # 
     # numeric uid into the string, so we anchor on the verbatim
     # prefix and the explicit "does not resolve to a username" suffix.
     expected_substring = (
         f"caller uid {TEST_UID_NOPASSWD} does not resolve to a username"
     )
     assert expected_substring in r.stderr, (
-        f"stderr did not contain Spec § 3.4 wording {expected_substring!r}:\n"
+        f"stderr did not contain "
         f"stderr:\n{r.stderr}"
     )
 
@@ -291,7 +291,7 @@ def test_route_helper_uid_without_passwd_denies_cleanly(
         f"audit record decision: expected 'denied', got {rec.get('decision')!r}\n"
         f"full record: {rec!r}"
     )
-    # Per Spec § 3.5, the reason tag for an unresolvable caller uid is
+    # Per 
     # ``caller-uid-unresolvable`` (matching the route-helper's literal
     # at sandbox-route-helper/src/main.rs).
     assert rec.get("reason") == "caller-uid-unresolvable", (
@@ -299,7 +299,7 @@ def test_route_helper_uid_without_passwd_denies_cleanly(
         f"got {rec.get('reason')!r}\nfull record: {rec!r}"
     )
     # The caller field falls back to ``uid:<n>`` since no name resolves
-    # (Spec § 3.4 deny-record-completeness invariant: include as much
+    # (
     # identity as the helper could establish, never silently drop).
     assert rec.get("caller") == f"uid:{TEST_UID_NOPASSWD}", (
         f"audit record caller: expected 'uid:{TEST_UID_NOPASSWD}', "
@@ -369,7 +369,7 @@ def test_owner_isolation_uid_without_passwd_closes_connection(
     sigstore_stack,
 ):
     """The daemon's peercred acceptor closes connections from uids
-    that do not resolve in ``/etc/passwd``, per Spec 2 § 4.1.
+    that do not resolve in ``/etc/passwd``, per the documented contract.
 
     Behavior pinned:
       * peercred-connector's ``setresuid(7777)`` succeeds (the helper
@@ -395,7 +395,7 @@ def test_owner_isolation_uid_without_passwd_closes_connection(
     kernel may emit either a graceful FIN (peer reads ``n == 0`` and
     the connector exits 0) or RST (peer reads ``ECONNRESET`` and the
     connector exits 4 with "Connection reset by peer" on stderr).
-    Spec 2 § 4.1 specifies "close the connection without sending a
+    the documented contract specifies "close the connection without sending a
     response" — both close shapes satisfy that invariant, since the
     observable contract is "no response bytes flowed back to the
     client". This test therefore accepts either arm.
@@ -439,7 +439,7 @@ def test_owner_isolation_uid_without_passwd_closes_connection(
     # drops the real/effective/saved uid+gid; supplementary groups
     # (including ``sandbox``) are NOT touched by ``setresgid`` and so
     # the helper retains group-read access to the 0660 daemon socket.
-    # This is the same shape Spec 2 § 9.2 specifies for the multi-uid
+    # This is the same shape the documented contract specifies for the multi-uid
     # harness.
     r = vm.shell(
         f"sudo -u {invoking_user} {PEERCRED_CONNECTOR_VM_PATH} "
@@ -449,7 +449,7 @@ def test_owner_isolation_uid_without_passwd_closes_connection(
         timeout=30,
     )
 
-    # Spec 2 § 4.1 invariant: the daemon closed the connection without
+    # the documented contract invariant: the daemon closed the connection without
     # sending a response. Two observable shapes both satisfy this:
     #
     #   - exit 0, empty stdout, empty stderr: the kernel delivered a
@@ -480,7 +480,7 @@ def test_owner_isolation_uid_without_passwd_closes_connection(
     else:
         raise AssertionError(
             f"peercred-connector exited {r.returncode}; expected 0 "
-            f"(graceful FIN) or 4 (RST). Both satisfy Spec 2 § 4.1's "
+            f"(graceful FIN) or 4 (RST). Both satisfy the documented contract's "
             f"'close without sending a response' invariant.\n"
             f"stdout:\n{r.stdout!r}\nstderr:\n{r.stderr!r}"
         )
@@ -647,15 +647,15 @@ def test_session_isolation_404_on_foreign_id(
 ):
     """A session owned by alice returns 404 when queried by bob.
 
-    Behavior pinned (Spec 2 § 5 + § 7.5 + § 9.2):
+    Behavior pinned (the documented contract.5 + § 9.2):
       * A session row owned by ``owner_username = alice`` is invisible
         to a peercred caller resolved as ``bob`` — the SessionStore
         filter rejects foreign-owner rows from every per-id endpoint
         (H3, H5, H6, ...; for this test we exercise H3 ``GET /sessions/{id}``).
       * The 404 body matches ``{"error":"session not found: <id>"}``
-        verbatim (Spec § 5 wire-shape: indistinguishable from a truly
+        verbatim (
         nonexistent id, so bob cannot infer existence-but-not-owned).
-      * No 403 leaks through — the spec is explicit that the response
+      * No 403 leaks through — the design is explicit that the response
         is 404, not 403, to avoid telegraphing whether the id exists.
 
     Mechanism:
@@ -673,7 +673,7 @@ def test_session_isolation_404_on_foreign_id(
     backend provisioning (Lima VM boot or container start) plus
     network + CA setup, which is expensive and orthogonal to the
     invariant under test (the per-caller storage filter). The
-    synthetic-row injection is the same technique Spec 2 § 7.5 uses
+    synthetic-row injection is the same technique the documented contract uses
     for the host-level ``integration_synthetic_foreign_owner_returns_404``
     test; here we lift it into the Lima multi-uid harness so the
     peercred path is end-to-end real.
@@ -687,7 +687,7 @@ def test_session_isolation_404_on_foreign_id(
     )
 
     # Synthesize a session id alice owns. The id format is 12 lowercase
-    # hex chars per Spec § "session id format"; we generate one fresh
+    # hex chars per "session id format"; we generate one fresh
     # for the test so we never collide with anything else in the DB.
     session_id = uuid.uuid4().hex[:12]
     _inject_synthetic_session(
@@ -751,7 +751,7 @@ def test_session_isolation_404_on_foreign_id(
         f"full response:\n{r.stdout!r}"
     )
 
-    # Body shape per Spec § 5: ``{"error":"session not found: <id>"}``.
+    # Body shape per "error":"session not found: <id>"}``.
     # The body is at the tail of the response after the blank line
     # separating headers from body. ``_parse_http_status`` normalised
     # CRLF -> LF, so the blank-line separator is now ``\n\n``.
@@ -762,12 +762,12 @@ def test_session_isolation_404_on_foreign_id(
     body = body_split[1]
     body_json = json.loads(body)
     assert body_json == {"error": f"session not found: {session_id}"}, (
-        f"body did not match Spec § 5 shape; got: {body_json!r}"
+        f"body did not match "
     )
 
     # ---------------- Sanity: bob ALSO cannot see it via list ----------------
 
-    # Spec § 5 also pins ``GET /sessions`` (the list endpoint) — bob's
+    # 
     # ``sandbox ps`` must not surface alice's row. Re-using the CLI
     # path because it's the operator-visible surface for the list
     # endpoint.
@@ -877,7 +877,7 @@ def test_non_owner_sequential_requests_share_kept_alive_connection(
       * Request 2: ``GET /sessions/<alice-owned id>`` with
         ``Connection: close``. Daemon's per-caller storage filter
         rejects the foreign-owner row and responds 404 with the
-        Spec § 5 ``{"error":"session not found: <id>"}`` body.
+        "error":"session not found: <id>"}`` body.
 
     The peercred-connector writes both requests in one ``write_all``
     (HTTP/1.1 pipelining), then reads until EOF; the daemon emits both
@@ -1001,7 +1001,7 @@ def test_non_owner_sequential_requests_share_kept_alive_connection(
     )
 
     # Request 2: GET /sessions/<alice-owned> as bob → 404 with the
-    # Spec § 5 error wording. The body matching here is the load-
+    # 
     # bearing part of this test: if the connector half-closed the
     # write side prematurely, the second response would never land
     # (hyper aborts before sending it). Receiving the full 404 body
@@ -1013,5 +1013,5 @@ def test_non_owner_sequential_requests_share_kept_alive_connection(
     )
     body_b_json = json.loads(body_b)
     assert body_b_json == {"error": f"session not found: {session_id}"}, (
-        f"second response body did not match Spec § 5 shape: {body_b_json!r}"
+        f"second response body did not match "
     )

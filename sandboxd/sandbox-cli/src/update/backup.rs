@@ -1,13 +1,13 @@
-//! Backup-set management for `sandbox update` — Spec 5 §§ 5.1-5.5.
+//! Backup-set management for `sandbox update`.
 //!
 //! A "backup set" is one subdirectory under `/var/lib/sandbox/backups/`
 //! capturing every artefact `sandbox update` mutates: the daemon
 //! binary, the CLI binary, the route-helper, `sessions.db`, and the
 //! managed `/etc` files. Each set carries a `manifest.json` recording
 //! the from/to versions, timestamps, and per-file sha256 hashes —
-//! that manifest is what the retention prune at § 3.2.25 reads to
+//! that manifest is what the retention prune reads to
 //! decide which sets are eligible for removal (`completed_ok: true`
-//! only) and what the rollback recipe at § 7.2 enumerates when an
+//! only) and what the rollback recipe enumerates when an
 //! operator wants to step back.
 //!
 //! ## Ownership / mode contract
@@ -17,13 +17,13 @@
 //! cannot accidentally invoke the old binary from PATH (the rollback
 //! recipe `install -m 0755`s them back in place). The `sessions.db`
 //! backup is `0600` (same as the production DB). `/etc` files are
-//! `0644` (matches the production modes documented in Spec 4 § 4.4).
+//! `0644` (matches the production modes documented).
 //!
 //! ## Idempotency
 //!
 //! Every per-file copy method short-circuits if the destination
 //! already exists and its bytes match the source's bytes (compared via
-//! sha256). The shell pseudo-code in the spec uses `cmp -s`; we use a
+//! sha256). The shell pseudo-code in the design uses `cmp -s`; we use a
 //! sha256 round-trip so the same hash drops into the manifest's
 //! `files` map without a second pass.
 //!
@@ -31,7 +31,7 @@
 //!
 //! All file operations that need to land at `sandbox:sandbox` ownership
 //! shell out via `sudo -k -u sandbox install ...` (matching install.sh
-//! § 4.4.14's pattern). `/etc` files require a two-step `sudo cat |
+//! conventions). `/etc` files require a two-step `sudo cat |
 //! sudo -u sandbox tee` because the destination directory is owned by
 //! `sandbox:sandbox` but the source is `root:root`-only readable; the
 //! intermediate "read as root, write as sandbox" pipeline keeps both
@@ -47,12 +47,12 @@ use serde::{Deserialize, Serialize};
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Parent directory for every backup set. Spec 5 § 5.1. Created by the
+/// Parent directory for every backup set. Created by the
 /// daemon at first start (mode `0700 sandbox:sandbox`).
 pub const BACKUPS_ROOT: &str = "/var/lib/sandbox/backups";
 
-/// Number of `completed_ok: true` backup sets to keep around. Spec 5
-/// § 5.2. Sets with `completed_ok: false` (in-progress / failed) are
+/// Number of `completed_ok: true` backup sets to keep around.
+/// Sets with `completed_ok: false` (in-progress / failed) are
 /// **never** auto-pruned — they preserve forensic evidence until the
 /// operator removes them manually.
 pub const RETENTION_KEEP: usize = 2;
@@ -83,22 +83,22 @@ pub const GUEST_BIN_PATH: &str = "/usr/local/libexec/sandboxd/sandbox-guest";
 // Manifest shape
 // ---------------------------------------------------------------------------
 
-/// Per-file entry inside the manifest's `files` map. Spec 5 § 5.3.
+/// Per-file entry inside the manifest's `files` map.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestFileEntry {
     pub sha256: String,
     pub size: u64,
 }
 
-/// Backup set manifest. Spec 5 § 5.3. Written at step § 3.2.19 with
-/// `completed_ok: false`, finalised at step § 3.2.29 with
+/// Backup set manifest. Written at the manifest-write step with
+/// `completed_ok: false`, finalised at the install-state-finalize step with
 /// `completed_ok: true`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupManifest {
     pub from_version: String,
     pub to_version: String,
     pub started_at: String,
-    /// `None` until step § 3.2.29 finalises the set.
+    /// `None` until the install-state-finalize step finalises the set.
     #[serde(default)]
     pub completed_at: Option<String>,
     pub completed_ok: bool,
@@ -188,7 +188,7 @@ pub enum CopyAction {
     /// source — we performed a fresh copy.
     Copied,
     /// The destination already existed with identical bytes — no
-    /// state mutation. Spec 5 § 3.2.15-17 idempotency anchor.
+    /// state mutation..2.15-17 idempotency anchor.
     Skipped,
     /// The source did not exist — the backup step is a no-op (e.g.
     /// `bridge.conf` on a fresh install that has not yet touched the
@@ -197,7 +197,7 @@ pub enum CopyAction {
 }
 
 /// Copy `src` to `dst` as `sandbox:sandbox` at `mode`, with sha256
-/// idempotency. Spec 5 §§ 3.2.15 / 3.2.17.
+/// idempotency..2.15 / 3.2.17.
 ///
 /// Behaviour:
 /// * Source missing → returns `CopyAction::SourceAbsent` (no file
@@ -250,7 +250,7 @@ pub fn backup_sandbox_owned_file(
 }
 
 /// Backup an `/etc` file (root-owned, world-readable at `0644`) into
-/// the `sandbox`-owned backup set. Spec 5 § 3.2.16. The two-step
+/// the `sandbox`-owned backup set..2.16. The two-step
 /// `sudo cat | sudo -u sandbox tee` pipeline lets the daemon-user
 /// land bytes it cannot read in-place but can be handed via the
 /// pipeline.
@@ -299,8 +299,8 @@ pub fn backup_etc_file(src: &Path, dst: &Path, mode: u32) -> Result<CopyOutcome,
 // Manifest write / finalise
 // ---------------------------------------------------------------------------
 
-/// Write the in-progress manifest at `<set>/manifest.json` per Spec 5
-/// § 3.2.19. Owned `sandbox:sandbox` at mode `0644`. Idempotent: the
+/// Write the in-progress manifest at `<set>/manifest.json`. Owned `sandbox:sandbox`
+/// at mode `0644`. Idempotent: the
 /// write goes through a tempfile under the set directory so a re-run
 /// overwrites whatever was there.
 pub fn write_in_progress_manifest(
@@ -312,14 +312,14 @@ pub fn write_in_progress_manifest(
 }
 
 /// Re-read the manifest from a set directory. Used by retention prune
-/// (§ 3.2.25) and by tests that verify post-write shape.
+/// and by tests that verify post-write shape.
 pub fn read_manifest(set_dir: &Path) -> Result<BackupManifest, BackupError> {
     let bytes = read_sandbox_owned_file(&set_dir.join("manifest.json"))?;
     serde_json::from_slice(&bytes).map_err(BackupError::Decode)
 }
 
 /// Finalise the manifest with `completed_ok: true` and a `completed_at`
-/// timestamp. Spec 5 § 3.2.29.
+/// timestamp..2.29.
 pub fn finalize_manifest(
     set_dir: &Path,
     completed_at: &str,
@@ -345,12 +345,11 @@ pub struct PruneOutcome {
     /// successful sets).
     pub kept: Vec<String>,
     /// Set directory names skipped because their `completed_ok` flag is
-    /// not `true` (in-progress or failed). Spec 5 § 5.2: never auto-prune.
+    /// not `true` (in-progress or failed)..2: never auto-prune.
     pub preserved_forensic: Vec<String>,
 }
 
 /// Apply the retention policy to every set under `BACKUPS_ROOT`.
-/// Spec 5 §§ 3.2.25 / 5.2.
 ///
 /// Algorithm:
 /// 1. Enumerate every subdirectory of the backups root.
@@ -361,7 +360,7 @@ pub struct PruneOutcome {
 /// 5. Keep the first `RETENTION_KEEP`; `rm -rf` the rest.
 ///
 /// Call ordering: this function runs AFTER `finalize_manifest`
-/// (§ 3.2.29 flips the current run's set to `completed_ok: true`),
+/// (which flips the current run's set to `completed_ok: true`),
 /// so the current run is counted as one of the `RETENTION_KEEP`
 /// most-recent successful sets. Running it before finalize would
 /// leave the current set at `completed_ok: false`, partition it
@@ -491,7 +490,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 /// `sudo` invocation prefix every backup helper runs through. The
 /// `-k` flag forces a fresh credential prompt by discarding any
-/// cached operator credentials before the call; Spec 5 § 6.3 names
+/// cached operator credentials before the call;.3 names
 /// this the "no-cached-sudo" invariant — every privileged step in
 /// the update flow must re-authenticate so an unattended terminal
 /// session cannot inadvertently authorize a stateful mutation.
@@ -695,7 +694,7 @@ mod tests {
         std::fs::write(set_dir.join("manifest.json"), bytes).unwrap();
     }
 
-    /// `backup_set_name` produces the layout documented in § 5.1 and
+    /// `backup_set_name` produces the layout `<ISO8601>-from-<ver>-to-<ver>` and
     /// the prefix is lexicographically chronological.
     #[test]
     fn backup_set_name_shape() {
@@ -835,7 +834,7 @@ mod tests {
     /// only `sessions.db` loses the most recent commit; the bundle
     /// recovers it via SQLite's normal WAL-replay on first open.
     ///
-    /// This pins the design contract behind extending § 3.2.15 to
+    /// This pins the design contract: the backup step must
     /// bundle `sessions.db` + `sessions.db-wal` + `sessions.db-shm`.
     /// The test uses plain `std::fs::copy` to exercise the design
     /// contract — the production `backup_sandbox_owned_file` adds
@@ -916,7 +915,7 @@ mod tests {
         assert!(src_shm.exists(), "-shm must exist alongside -wal");
 
         // Phase 2 — bundle all three files into a backup set
-        // mirroring what § 3.2.15 produces in production. Plain
+        // mirroring what the sessions.db backup step produces in production. Plain
         // `fs::copy` exercises the file-bundling contract without
         // sudo; production's `backup_sandbox_owned_file` adds
         // sha256-idempotency + ownership transfer on top.
@@ -1098,7 +1097,7 @@ mod tests {
     /// an already-existing set directory is a no-op and does not
     /// disturb pre-existing contents. Pins the "re-run of a partially
     /// completed update doesn't clobber the backup set" property that
-    /// § 3.2.15-3.2.17 idempotency relies on at one layer up.
+    /// the backup-step idempotency relies on at one layer up.
     #[test]
     fn create_backup_set_dir_at_idempotent_preserves_existing_contents() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1167,7 +1166,7 @@ mod tests {
     /// root does not exist (fresh install before the first update has
     /// ever run, or a host where the daemon's startup-time mkdir
     /// hasn't landed yet), the function returns an empty
-    /// `PruneOutcome` without erroring. Spec 5 § 3.2.25's idempotency
+    /// `PruneOutcome` without erroring..2.25's idempotency
     /// promise depends on this — the prune step must be a no-op when
     /// there are no sets to consider. Triage flagged this
     /// early-return as uncovered.
@@ -1203,8 +1202,8 @@ mod tests {
         );
     }
 
-    /// `prune_old_backup_sets_at` skips every in-progress set (Spec 5
-    /// § 5.2: `completed_ok: false` is forensic — never auto-prune).
+    /// `prune_old_backup_sets_at` skips every in-progress set
+    /// (`completed_ok: false` is forensic — never auto-prune).
     /// With three in-progress sets and zero successful ones, all three
     /// land in `preserved_forensic` and the on-disk tree is unchanged
     /// after the prune. Complements
@@ -1267,7 +1266,7 @@ mod tests {
     /// finalize call.
     ///
     /// In the production flow the atomic write happens through
-    /// `sudo install -m 0644 <tmp> <dst>` (Spec 5 § 6.3 — no torn
+    /// `sudo install -m 0644 <tmp> <dst>` (the migration framework.3 — no torn
     /// writes possible because `install` uses rename(2)); the test
     /// stages the post-rename "new" state directly via `std::fs::write`
     /// and asserts the manifest parses and is routed into `kept` (not

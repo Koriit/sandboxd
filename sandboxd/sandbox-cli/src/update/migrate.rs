@@ -1,9 +1,9 @@
-//! Config-migration glue for `sandbox update` — Spec 5 §§ 3.2.24, 4.3.
+//! Config-migration glue for `sandbox update`.
 //!
 //! The framework in `sandbox-cli/src/cfg_migrations/` owns the
 //! versioned-transform contract and the atomic-write primitive. This
-//! module wires the framework into the `sandbox update` stateful step
-//! § 3.2.24: walk each managed file's pending migration chain, run
+//! module wires the framework into the `sandbox update` stateful step:
+//! walk each managed file's pending migration chain, run
 //! the transform in-process, write to a sudo-controlled tempfile at a
 //! canonical path (`/etc/sandboxd/.users.conf.tmp.V001` and friends),
 //! and `sudo -k mv` the tempfile over the destination in one atomic
@@ -19,12 +19,11 @@
 //!    tempfile in `/etc/sandboxd/` because the directory is `0755
 //!    root:root`. We need a `sudo` elevation for both the tempfile
 //!    create and the rename.
-//! 2. The atomic-write contract (Spec 5 § 4.4) requires the tempfile
-//!    and destination to be on the same filesystem so `rename(2)` is
-//!    atomic. Doing the tempfile under `/tmp` and `sudo mv` across
-//!    filesystems would degrade to a copy-then-unlink — non-atomic.
-//!    Pinning the tempfile path under `/etc/sandboxd/` keeps the
-//!    rename atomic.
+//! 2. The atomic-write contract requires the tempfile and destination
+//!    to be on the same filesystem so `rename(2)` is atomic. Doing the
+//!    tempfile under `/tmp` and `sudo mv` across filesystems would
+//!    degrade to a copy-then-unlink — non-atomic. Pinning the tempfile
+//!    path under `/etc/sandboxd/` keeps the rename atomic.
 //!
 //! The actual transform runs in-process via the hidden CLI subcommand
 //! `sandbox --apply-config-migration --file <path> --migration V<NNN>
@@ -40,8 +39,8 @@ use std::process::Command;
 
 use crate::cfg_migrations;
 
-/// Canonical tempfile path for a migration's pending write. Spec 5
-/// § 3.2.24: `/etc/sandboxd/.users.conf.tmp.V001` (hidden dot-prefix
+/// Canonical tempfile path for a migration's pending write.
+/// Example: `/etc/sandboxd/.users.conf.tmp.V001` (hidden dot-prefix
 /// plus `.tmp.V<NNN>` suffix; the basename pattern is the canonical
 /// one the `--apply-config-migration` gate accepts).
 pub fn tempfile_path_for(target: cfg_migrations::TargetFile, migration_id: u32) -> PathBuf {
@@ -93,7 +92,7 @@ pub enum ApplyError {
 
 /// Apply every pending migration for the given target file, in
 /// registry order, with one `sudo -k sandbox --apply-config-migration
-/// ...` invocation per migration. Spec 5 § 3.2.24.
+/// ...` invocation per migration..2.24.
 ///
 /// Returns the (possibly empty) list of applied migration ids. Empty
 /// is the idempotent re-run shape — a second `sandbox update` after a
@@ -152,7 +151,7 @@ pub fn apply_file_chain(target: cfg_migrations::TargetFile) -> Result<ApplyOutco
 /// Invoke the hidden `--apply-config-migration` subcommand against the
 /// canonical CLI binary. Production resolves the binary via
 /// `/proc/self/exe` (so a half-replaced binary keeps running its own
-/// code per Spec 5 § 10.3) but for the production `sandbox update`
+/// code per.3) but for the production `sandbox update`
 /// path we want the **new** binary — the binary swap has already
 /// landed at this point of the flow. We invoke `/usr/local/bin/sandbox`
 /// directly.
@@ -213,7 +212,7 @@ mod tests {
     use super::*;
 
     /// The canonical tempfile path lives next to the destination so a
-    /// rename across the same FS is atomic. Spec 5 § 4.4.
+    /// rename across the same FS is atomic..4.
     #[test]
     fn tempfile_path_lives_next_to_destination() {
         let p = tempfile_path_for(cfg_migrations::TargetFile::UsersConf, 1);

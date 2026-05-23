@@ -2,16 +2,16 @@
 //!
 //! The method is the daemon's escape hatch for moving a session row
 //! into a target state **without** the storage-boundary per-caller
-//! filter (api-session-isolation spec § 2.4). Reconcilers, error/
-//! cleanup branches, and startup-time fixups need it; HTTP request
-//! handlers must **never** call it — they have an `OperatorIdentity`
-//! in scope and must go through [`SessionStore::update_state`] so the
-//! per-caller filter rejects a foreign session id as `SessionNotFound`.
+//! filter. Reconcilers, error/cleanup branches, and startup-time fixups
+//! need it; HTTP request handlers must **never** call it — they have an
+//! `OperatorIdentity` in scope and must go through
+//! [`SessionStore::update_state`] so the per-caller filter rejects a
+//! foreign session id as `SessionNotFound`.
 //!
-//! Spec § 7.3.1 mandates a hermetic test that greps the workspace
-//! source tree for every `update_state_reconcile` call and asserts the
-//! resulting set of `<file>:<enclosing-function>` pairs is **exactly**
-//! the allow-list pinned below. Both directions are caught:
+//! A hermetic test greps the workspace source tree for every
+//! `update_state_reconcile` call and asserts the resulting set of
+//! `<file>:<enclosing-function>` pairs is **exactly** the allow-list
+//! pinned below. Both directions are caught:
 //!
 //! - A new caller added without updating `ALLOW_LIST` fails the test
 //!   ("a request handler accidentally bypassed the filter").
@@ -188,9 +188,9 @@ fn discovered_call_sites() -> BTreeSet<String> {
     sites
 }
 
-/// Spec § 7.3.1: every caller of `update_state_reconcile` must appear
-/// in `ALLOW_LIST` — and every entry in `ALLOW_LIST` must correspond
-/// to a real caller. Both directions catch drift.
+/// Every caller of `update_state_reconcile` must appear in `ALLOW_LIST`
+/// — and every entry in `ALLOW_LIST` must correspond to a real caller.
+/// Both directions catch drift.
 #[test]
 fn test_update_state_reconcile_caller_whitelist() {
     let discovered = discovered_call_sites();
@@ -227,10 +227,9 @@ fn test_update_state_reconcile_caller_whitelist() {
     assert!(msg.is_empty(), "{msg}");
 }
 
-/// Spec § 7.3.1 (secondary): belt-and-suspenders against the
-/// "developer adds a *new* handler that calls
-/// `update_state_reconcile`" foot-gun. Asserts no **non-allow-listed**
-/// caller's enclosing function carries an axum
+/// Belt-and-suspenders against the "developer adds a *new* handler
+/// that calls `update_state_reconcile`" foot-gun. Asserts no
+/// **non-allow-listed** caller's enclosing function carries an axum
 /// `Extension<OperatorIdentity>` extractor within ±10 lines of the
 /// `fn` declaration.
 ///

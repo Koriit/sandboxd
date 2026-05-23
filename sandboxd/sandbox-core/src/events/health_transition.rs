@@ -9,7 +9,7 @@
 //! transition-detection step lives here so integration tests can import
 //! the same logic instead of re-implementing it.
 //!
-//! Spec reference: `2026-04-21-port-explicit-policies-presets-
+//! Design reference: `2026-04-21-port-explicit-policies-presets-
 //! observability-design.md`, Part 3 / "Lifecycle events" — only emit on
 //! actual flips so the event stream stays sparse under sustained outage.
 //!

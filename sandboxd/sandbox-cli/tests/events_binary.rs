@@ -63,8 +63,8 @@ async fn events_handler() -> (StatusCode, HeaderMap, String) {
 
 /// `/version` handler matching the production daemon's single-field
 /// JSON shape. The CLI's streaming path now performs the same
-/// version-equality handshake the request/response path does (Spec 3
-/// § 7.3), so the mock daemon must reply with the CLI's compile-time
+/// version-equality handshake the request/response path does, so the
+/// mock daemon must reply with the CLI's compile-time
 /// `CARGO_PKG_VERSION` for the events stream to be opened. Built into
 /// the test fixture so the route is part of the contract the test
 /// pins, not a tangential setup detail.
@@ -91,7 +91,7 @@ async fn spawn_test_server() -> (TempDir, String, tokio::task::JoinHandle<()>) {
     // `/sessions/{id}/events` is the exact route the CLI hits; the
     // handler ignores the session id. `/version` answers the strict
     // CLI ↔ daemon equality handshake the streaming path runs before
-    // it opens the events stream (Spec 3 § 7.3).
+    // it opens the events stream.
     let app: Router = Router::new()
         .route("/version", get(version_handler))
         .route("/sessions/{session}/events", get(events_handler));
@@ -231,7 +231,7 @@ async fn spawn_test_server_with_skew() -> (TempDir, String, tokio::task::JoinHan
 /// wording and exit with `CLI_VERSION_MISMATCH_EXIT_CODE` (2) —
 /// matching the request/response path's contract.
 ///
-/// Before the Spec 3 § 7.3 fix the streaming path bypassed the
+/// Before the an earlier fix the streaming path bypassed the
 /// equality gate entirely, so this test would have shown a successful
 /// stream against a skewed daemon. After the fix the gate fires
 /// immediately after the hyper handshake and the events handler is

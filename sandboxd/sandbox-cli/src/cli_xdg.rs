@@ -1,7 +1,7 @@
 //! XDG config-path resolution shared by the CLI's user-config
 //! consumers.
 //!
-//! Spec § "CLI & UX → Config file" mandates "one resolver, not two":
+//!  mandates "one resolver, not two":
 //! `~/.config/sandboxd/presets/` (preset catalog) and
 //! `~/.config/sandboxd/config.json` (CLI defaults) must agree on how
 //! they discover `~/.config/sandboxd/`. This module is that one

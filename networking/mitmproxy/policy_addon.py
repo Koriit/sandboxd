@@ -160,7 +160,7 @@ def _peer_ip(flow: "http.HTTPFlow") -> "str | None":
 # call.  Patterns are tiny (≤64 chars, ≤10 metachars) so
 # ``re.fullmatch`` is cheap and we don't cache — simpler wins.
 # Reference implementations exist in Express.js ``path-to-regexp`` and
-# Go ``path.Match``; the spec calls them out as precedent.
+# Go ``path.Match``.
 
 
 def _path_glob_match(pattern: str, path: str) -> bool:

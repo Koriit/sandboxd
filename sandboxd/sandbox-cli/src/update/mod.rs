@@ -1,17 +1,15 @@
-//! `sandbox update` orchestration — Spec 5.
+//! `sandbox update` orchestration — the install framework.
 //!
-//! Spans the **pre-flight** half (§§ 3.1.1-3.1.12: arg parse, dev-mode
-//! detect, install-state read, target-version resolution, version
-//! compare with `--check` exit gate, active-session check,
-//! stopped-session count, disk-space check, cosign-pin, MANIFEST
-//! arch/version cross-check, migration dry-run delegate, confirmation
-//! prompt) and the **stateful** half (§§ 3.2.13-3.2.30: lock
-//! acquisition → 18 idempotent steps → lock release). Both phases
-//! share the install-state shape, dev-mode detection, and pending-
-//! migration enumeration helpers defined here.
+//! Spans the **pre-flight** half (arg parse, dev-mode detect,
+//! install-state read, target-version resolution, version compare with
+//! `--check` exit gate, active-session check, stopped-session count,
+//! disk-space check, cosign-pin, MANIFEST arch/version cross-check,
+//! migration dry-run delegate, confirmation prompt) and the **stateful**
+//! half (lock acquisition → 18 idempotent steps → lock release). Both
+//! phases share the install-state shape, dev-mode detection, and
+//! pending-migration enumeration helpers defined here.
 //!
-//! The stateful phase is the heart of Spec 5 — see § 3.2 in the spec
-//! for the verbatim step-by-step contract. Every step in [`apply_stateful`]
+//! The stateful phase is the heart of the install framework. Every step in [`apply_stateful`]
 //! inspects current state and short-circuits when the desired state is
 //! already in place; the flow is safe to re-run after any failure
 //! (convergence is the contract).
@@ -30,14 +28,13 @@ pub mod migrate;
 // Constants (operator-visible paths)
 // ---------------------------------------------------------------------------
 
-/// Canonical install-state path. Spec 4 § 4.5.
+/// Canonical install-state path. the documented contract.
 pub const INSTALL_STATE_PATH: &str = "/var/lib/sandbox/.install-state.json";
 
 /// Canonical systemd unit path (presence is the dev-vs-system gate).
-/// Spec 5 § 11.
 pub const SYSTEMD_UNIT_PATH: &str = "/etc/systemd/system/sandboxd.service";
 
-/// Default release-tarball mirror. Spec 5 § 2.1 (`--source-url`).
+/// Default release-tarball mirror (`--source-url`).
 pub const DEFAULT_SOURCE_URL: &str = "https://github.com/Koriit/sandboxd/releases/download";
 
 // ---------------------------------------------------------------------------
@@ -48,7 +45,7 @@ pub const DEFAULT_SOURCE_URL: &str = "https://github.com/Koriit/sandboxd/release
 /// `Command::Update` variant in `main.rs` field-for-field.
 ///
 /// `version`'s default is the string `"latest"` (matching install.sh
-/// § 4.4.9), resolved to a concrete tag via the GitHub Releases API
+/// convention), resolved to a concrete tag via the GitHub Releases API
 /// later in the flow.
 #[derive(Debug, Clone)]
 pub struct UpdateArgs {
@@ -68,14 +65,14 @@ pub struct UpdateArgs {
 }
 
 impl UpdateArgs {
-    /// Spec 5 § 2.5: `--check` and `--dry-run` are read-only and MUST
+    /// `--check` and `--dry-run` are read-only and MUST
     /// NOT require root or acquire the lock. The full flow (no flags)
     /// requires root.
     pub fn is_read_only(&self) -> bool {
         self.check || self.dry_run
     }
 
-    /// Spec 5 § 3.1.1: reject incompatible combinations early.
+    /// Reject incompatible combinations early.
     pub fn validate(&self) -> Result<(), String> {
         if self.cosign_bundle.is_some() && self.from.is_none() {
             return Err("--cosign-bundle requires --from".to_string());
@@ -97,7 +94,7 @@ impl UpdateArgs {
 // ---------------------------------------------------------------------------
 
 /// Subset of `/var/lib/sandbox/.install-state.json` the pre-flight
-/// needs. Spec 4 § 4.5 defines the full shape; we deserialize only the
+/// needs. the documented contract defines the full shape; we deserialize only the
 /// fields used here so older or newer state files still parse (any
 /// extra fields are ignored).
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -110,10 +107,10 @@ pub struct InstallState {
     pub installed_at: String,
     #[serde(default)]
     pub installed_by_operator: String,
-    /// New in Spec 5 § 3.2.18 — the version installed **before** this
+    /// The version installed **before** this
     /// update run swapped the binaries. Older state files written by
     /// install.sh predate this field; `#[serde(default)]` keeps them
-    /// readable. The post-update finalize step (§ 3.2.29) preserves
+    /// readable. The post-update finalize step preserves
     /// this field across rewrites.
     #[serde(default)]
     pub previous_version: Option<String>,
@@ -122,10 +119,10 @@ pub struct InstallState {
 impl InstallState {
     /// The "version unknown" shape that the read-only modes
     /// (`--check` / `--dry-run`) fall back to when the operator isn't
-    /// in the `sandbox` group and can't read the state file. Spec 5
-    /// § 3.1.3 mandates the graceful-degradation path: pretend the
-    /// installed version is `"unknown"` and derive the arch from
-    /// `uname -m` (the comparison side that's still meaningful).
+    /// in the `sandbox` group and can't read the state file.
+    /// Graceful-degradation path: pretend the installed version is
+    /// `"unknown"` and derive the arch from `uname -m` (the comparison
+    /// side that's still meaningful).
     pub fn unknown_with_host_arch() -> Self {
         Self {
             installed_version: "unknown".to_string(),
@@ -137,7 +134,7 @@ impl InstallState {
     }
 }
 
-/// Spec 5 § 3.1.3 fallback: `uname -m` mapped onto the release-tarball
+/// Detect host architecture: `uname -m` mapped onto the release-tarball
 /// arch-triple convention.
 pub fn detect_host_arch() -> String {
     let uname = nix::sys::utsname::uname().ok();
@@ -154,8 +151,7 @@ pub fn detect_host_arch() -> String {
 
 /// Read the install state file at `path`. Returns `Ok(None)` when the
 /// file is absent or unreadable — the read-only modes degrade
-/// gracefully; the full-update path treats `None` as a hard refusal
-/// (§ 3.1.3).
+/// gracefully; the full-update path treats `None` as a hard refusal.
 pub fn read_install_state(path: &Path) -> std::io::Result<Option<InstallState>> {
     match std::fs::read(path) {
         Ok(bytes) => match serde_json::from_slice::<InstallState>(&bytes) {
@@ -169,10 +165,10 @@ pub fn read_install_state(path: &Path) -> std::io::Result<Option<InstallState>> 
 }
 
 // ---------------------------------------------------------------------------
-// Dev-mode detection (§ 3.1.2 / § 11)
+// Dev-mode detection
 // ---------------------------------------------------------------------------
 
-/// Spec 5 § 11 / § 3.1.2: a system install requires *both* the systemd
+/// A system install requires *both* the systemd
 /// unit and the install-state file to exist. Anything else is a dev
 /// install (or a corrupted system install — same refusal either way).
 pub fn is_dev_mode(systemd_unit: &Path, install_state: &Path) -> bool {
@@ -180,7 +176,7 @@ pub fn is_dev_mode(systemd_unit: &Path, install_state: &Path) -> bool {
         return true;
     }
     if !install_state.exists() {
-        // The spec's shell pseudo-code also tries `sudo -k test -r`;
+        // The the install pseudo-code also tries `sudo -k test -r`;
         // we cannot escalate from Rust without external help, so a
         // missing file (regardless of mode) trips dev-mode here. The
         // outer shell wrapper around `sandbox update` can elevate
@@ -190,7 +186,7 @@ pub fn is_dev_mode(systemd_unit: &Path, install_state: &Path) -> bool {
     false
 }
 
-/// The spec § 11 verbatim refusal text. Returned as a String so the
+/// The. Returned as a String so the
 /// caller can route it to stderr without owning the formatting.
 pub fn dev_mode_refusal_text() -> &'static str {
     "sandbox update is for system installs only.\n\
@@ -212,7 +208,7 @@ pub fn dev_mode_refusal_text() -> &'static str {
 // Version comparison
 // ---------------------------------------------------------------------------
 
-/// Result of the version comparison at § 3.1.5.
+/// Result of the version comparison step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VersionCompare {
     UpToDate,
@@ -282,7 +278,7 @@ async fn http_get(socket_path: &str, path: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Snapshot of `/sessions` filtered into the two counts the pre-flight
-/// cares about: active (non-Stopped) and stopped. § 3.1.6 + § 3.1.7.
+/// cares about: active (non-Stopped) and stopped.
 #[derive(Debug, Clone, Default)]
 pub struct SessionCounts {
     pub active: usize,
@@ -329,7 +325,7 @@ pub async fn fetch_session_counts(socket_path: &str) -> SessionCounts {
     counts
 }
 
-/// Stopped-session compat bucket — Spec 5 § 3.1.7. The pre-flight
+/// Stopped-session compat bucket —.1.7. The pre-flight
 /// classifies each stopped session against the target binary's
 /// `DAEMON_GUEST_PROTO_VERSION` and renders the three-bucket
 /// breakdown in the confirmation prompt so the operator knows up
@@ -372,7 +368,7 @@ pub struct SessionCompat {
 }
 
 /// Snapshot of the per-session compat classification surfaced in the
-/// confirmation prompt and the install log. Spec 5 § 3.1.7.
+/// confirmation prompt and the install log..1.7.
 #[derive(Debug, Clone, Default)]
 pub struct SessionCompatSet {
     pub target_proto: u32,
@@ -387,7 +383,7 @@ pub struct SessionCompatSet {
 /// Classify a single session against the upgrade target's protocol
 /// version. Same three-bucket decision tree the daemon's runtime arm
 /// (`start-session`) uses, factored out so the CLI can render it ahead
-/// of time. Spec 5 § 3.1.7.
+/// of time..1.7.
 ///
 /// Mirrors [`sandbox_core::guest::is_protocol_compatible`] /
 /// [`sandbox_core::guest::can_refresh_in_place`] but applied against
@@ -398,7 +394,7 @@ pub fn classify_session_compat(session_proto: u32, target_proto: u32) -> CompatB
         CompatBucket::Ok
     } else if session_proto != 0 {
         // `can_refresh_in_place` is `session_proto != 0` for the
-        // current daemon (Spec 5 § 3.1.7's "session_proto == 0 →
+        // current daemon (the migration framework.1.7's "session_proto == 0 →
         // unsalvageable" arm). The target binary's predicate may
         // widen this in a future release; until that happens, mirror
         // the constant so the classification matches runtime
@@ -413,7 +409,7 @@ pub fn classify_session_compat(session_proto: u32, target_proto: u32) -> CompatB
 /// `guest_protocol_version`. Returns an empty `Vec` when the daemon
 /// is unreachable or the response is malformed — the read-only modes
 /// degrade gracefully. The list endpoint already filters to the
-/// caller's own sessions (api-session-isolation spec § 2.4), so this
+/// caller's own sessions (per-caller isolation), so this
 /// is the operator's view, not the system-wide one.
 async fn fetch_stopped_sessions_with_proto(socket_path: &str) -> Vec<(String, u32)> {
     let body = match http_get(socket_path, "/sessions").await {
@@ -475,10 +471,10 @@ pub async fn classify_stopped_sessions(socket_path: &str, target_proto: u32) -> 
 }
 
 // ---------------------------------------------------------------------------
-// Disk-space check (§ 3.1.8)
+// Disk-space check
 // ---------------------------------------------------------------------------
 
-/// Per-mountpoint free-space budget in KB (Spec 5 § 3.1.8 table).
+/// Per-mountpoint free-space budget in KB.
 pub struct DiskBudget {
     pub usr_local_kb: u64,
     pub var_lib_kb: u64,
@@ -512,7 +508,7 @@ impl DiskCheck {
     }
 }
 
-/// Read the free-space budget against the pinned paths. Spec 5 § 3.1.8.
+/// Read the free-space budget against the pinned paths..1.8.
 pub fn check_disk_space(budget: &DiskBudget) -> DiskCheck {
     let rows = vec![
         DiskRow {
@@ -568,11 +564,11 @@ fn first_existing_ancestor(path: &Path) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// `--check` output (§ 2.2)
+// `--check` output
 // ---------------------------------------------------------------------------
 
 /// Inputs to the `--check` renderer. Each piece is computed by the
-/// pre-flight; the renderer just lays them out per § 2.2.
+/// pre-flight; the renderer lays them out.
 pub struct CheckReport<'a> {
     pub state: &'a InstallState,
     pub target_version: &'a str,
@@ -592,7 +588,7 @@ pub struct PendingMigration {
 
 /// Convert a `ConfigMigration::name()` slug (snake_case module suffix
 /// such as `add_sandbox_to_allow_users`) into the human-friendly
-/// rendering Spec 5 § 2.2 pins for `--check` output. Underscores
+/// rendering.2 pins for `--check` output. Underscores
 /// become spaces; everything else is left verbatim so existing
 /// migration names that already read naturally (e.g. a future
 /// `add per-pool rate limit metadata`-style slug) round-trip through
@@ -606,7 +602,7 @@ pub fn pending_migration_human_description(name: &str) -> String {
     name.replace('_', " ")
 }
 
-/// Render the `--check` report to a sink. Spec 5 § 2.2 output shape.
+/// Render the `--check` report to a sink..2 output shape.
 pub fn render_check_report<W: Write>(out: &mut W, r: &CheckReport<'_>) -> std::io::Result<()> {
     match r.compare {
         VersionCompare::UpToDate => {
@@ -671,12 +667,12 @@ pub fn render_check_report<W: Write>(out: &mut W, r: &CheckReport<'_>) -> std::i
 }
 
 // ---------------------------------------------------------------------------
-// `--dry-run` output (§ 2.3)
+// `--dry-run` output
 // ---------------------------------------------------------------------------
 
-/// Render the `--dry-run` plan to a sink. The pre-flight block (§ 3.1)
+/// Render the `--dry-run` plan to a sink. The pre-flight block
 /// is rendered first with per-step verdicts; the stateful block
-/// (§ 3.2) lists the 18 stateful steps with `would execute` /
+/// lists the 18 stateful steps with `would execute` /
 /// `would skip` annotations.
 pub fn render_dry_run<W: Write>(
     out: &mut W,
@@ -740,7 +736,7 @@ pub fn render_dry_run<W: Write>(
     writeln!(out)?;
 
     writeln!(out, "Stateful (§ 3.2) — projected:")?;
-    // The 18 stateful steps, in spec order. Per § 2.3 the verdict is
+    // The 18 stateful steps, in execution order. The verdict is
     // either "would execute" or "would skip" — we now project the
     // per-step idempotency check onto the read-only inputs so the
     // operator sees which steps are no-ops against the current
@@ -751,11 +747,9 @@ pub fn render_dry_run<W: Write>(
     //
     // - Steps that never have an idempotency shortcut (they always
     //   converge by re-running their setup logic, even if that
-    //   logic is a no-op) stay `would execute`: § 3.2.13 (lock
-    //   acquire), § 3.2.19 (manifest write), § 3.2.25 (prune
-    //   no-op when nothing eligible), § 3.2.26 (daemon start),
-    //   § 3.2.27 (version verify), § 3.2.28 (doctor), § 3.2.29
-    //   (install-state finalize), § 3.2.30 (lock release).
+    //   logic is a no-op) stay `would execute`: lock acquire, manifest
+    //   write, prune (no-op when nothing eligible), daemon start,
+    //   version verify, doctor, install-state finalize, lock release.
     //
     // - Steps that have a "destination already matches source"
     //   idempotency shortcut (sha256-compared file copies, image
@@ -764,15 +758,14 @@ pub fn render_dry_run<W: Write>(
     //   file the step writes is byte-identical with the on-disk
     //   destination.
     //
-    // - § 3.2.14 (stop daemon) skips when the daemon is not
-    //   running (the on-disk `was_running` probe runs at start
-    //   time; --dry-run cannot reach the daemon-running probe
-    //   from a read-only pre-flight, so we render this as `would
-    //   execute` outside the up-to-date case).
+    // - Stop-daemon skips when the daemon is not running (the
+    //   on-disk `was_running` probe runs at start time; --dry-run
+    //   cannot reach the daemon-running probe from a read-only
+    //   pre-flight, so we render this as `would execute` outside
+    //   the up-to-date case).
     //
-    // - § 3.2.24 (apply config migrations) skips when the
-    //   pre-flight enumerated zero pending migrations (already
-    //   surfaced in § 3.1.11).
+    // - Apply-config-migrations skips when the pre-flight
+    //   enumerated zero pending migrations.
     //
     // Treating "current == target" as the gate for the
     // sha256-shortcut steps is a conservative projection: a fresh
@@ -818,12 +811,12 @@ pub fn render_dry_run<W: Write>(
 /// Project the per-step idempotency check onto the read-only
 /// `--dry-run` inputs. Returns `"would skip"` when the step is
 /// projected to be a no-op against the current install, `"would
-/// execute"` otherwise. Spec 5 § 2.3.
+/// execute"` otherwise..3.
 ///
 /// `up_to_date` is `current_installed_version == target_version`:
 /// the pre-condition under which every sha256-compared file copy
 /// would find the destination matching the source and short-circuit.
-/// `has_pending_migrations` flips § 3.2.24's verdict.
+/// `has_pending_migrations` flips the apply-config-migrations step's verdict.
 ///
 /// The projection deliberately stays read-only — it does NOT shell
 /// out to compare actual on-disk sha256s or query docker / setcap
@@ -850,7 +843,7 @@ pub fn stateful_step_verdict(
         | "§ 3.2.29" | "§ 3.2.30" => return "would execute",
         _ => {}
     }
-    // § 3.2.24 — config migration apply: skips when no pending.
+    // Config migration apply: skips when no pending.
     if step_id == "§ 3.2.24" {
         return if has_pending_migrations {
             "would execute"
@@ -858,9 +851,9 @@ pub fn stateful_step_verdict(
             "would skip"
         };
     }
-    // § 3.2.14 (stop daemon) — without a running-daemon probe in
-    // the read-only pre-flight we conservatively render `would
-    // execute` outside the up-to-date case. On an up-to-date
+    // Stop-daemon — without a running-daemon probe in the
+    // read-only pre-flight we conservatively render `would execute`
+    // outside the up-to-date case. On an up-to-date
     // install there is no operator-intent to swap binaries, so we
     // also mark this `would skip` (the daemon would not be stopped
     // because nothing else mutates).
@@ -875,11 +868,11 @@ pub fn stateful_step_verdict(
 }
 
 // ---------------------------------------------------------------------------
-// Confirmation prompt (§ 2.4)
+// Confirmation prompt
 // ---------------------------------------------------------------------------
 
 /// Render the confirmation prompt summary (no input read; caller wires
-/// up stdin). § 2.4. Returns the rendered string.
+/// up stdin). Returns the rendered string.
 ///
 /// `pending_db_migrations` is the staged daemon's migration set as
 /// returned by `dump-migration-set`; passing an empty slice elides the
@@ -937,7 +930,7 @@ pub fn render_confirmation_summary(
             "inactive (will remain stopped after upgrade)"
         }
     ));
-    // Per-session compat breakdown: § 3.1.7. When the daemon was
+    // Per-session compat breakdown. When the daemon was
     // unreachable (`classified == false`), fall back to the flat count.
     let classified = session_compat.is_some_and(|c| c.classified);
     if classified {
@@ -980,8 +973,8 @@ pub fn render_confirmation_summary(
 }
 
 /// Read one line of stdin and return `true` iff it's exactly the
-/// lowercase token `y` (the spec contract — anything else aborts).
-/// Trims a trailing `\n` only; case-sensitive by spec.
+/// lowercase token `y` (the design contract — anything else aborts).
+/// Trims a trailing `\n` only; case-sensitive (anything other than lowercase `y` aborts).
 pub fn read_yes_no<R: Read>(input: R) -> bool {
     let mut s = String::new();
     let mut buf = [0u8; 1];
@@ -1002,11 +995,11 @@ pub fn read_yes_no<R: Read>(input: R) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Pending-migration enumeration (§ 3.1.11)
+// Pending-migration enumeration
 // ---------------------------------------------------------------------------
 
 /// Enumerate config migrations pending against the current installation.
-/// Spec 5 § 3.1.11. Reads the on-disk file's `_schema_version` and
+/// Reads the on-disk file's `_schema_version` and
 /// diffs against the registry's `latest_for`. On read error (e.g.
 /// permission-denied for the read-only mode) returns an empty list —
 /// the operator sees a blank `Pending config migrations` section, the
@@ -1069,18 +1062,18 @@ pub fn enumerate_pending_config_migrations() -> Vec<PendingMigration> {
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Exit codes Spec 5 § 2.2 / § 2.3 pin:
+/// Exit codes:
 /// - `0` — up-to-date (`--check`), `--dry-run` printed plan, or
 ///   confirmation prompt answered `N`.
 /// - `1` — error (pre-flight refused).
 /// - `2` — argument parse failure / `--check`+`--dry-run` combo / etc.
 /// - `3` — update available (`--check` only).
 pub async fn run(args: UpdateArgs) -> i32 {
-    // § 3.1.1 — arg-parse + sanity.
+    // Arg-parse + sanity.
     if let Err(msg) = args.validate() {
         // Log the arg-validation refusal so the operator's audit
         // trail names the rejected combination before the eprintln
-        // exit. Spec § 3.1.1 mandates a `step=parse_args` line
+        // exit.
         // regardless of outcome.
         log_step(
             "parse_args",
@@ -1104,7 +1097,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
         ),
     );
 
-    // § 3.1.2 — dev-mode detect / refuse.
+    // Dev-mode detect / refuse.
     if is_dev_mode(Path::new(SYSTEMD_UNIT_PATH), Path::new(INSTALL_STATE_PATH)) {
         log_step("dev_mode_check", "is_dev=1 action=refuse status=fail");
         eprintln!("{}", dev_mode_refusal_text());
@@ -1112,7 +1105,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
     }
     log_step("dev_mode_check", "is_dev=0 action=continue status=ok");
 
-    // § 3.1.3 — install state read (graceful in read-only modes;
+    // Install state read (graceful in read-only modes;
     // hard refusal in full-update mode).
     let state = match read_install_state(Path::new(INSTALL_STATE_PATH)) {
         Ok(Some(s)) => {
@@ -1149,7 +1142,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
         }
     };
 
-    // § 3.1.4 — target-version resolution. Three paths:
+    // Target-version resolution. Three paths:
     //   1. `--from <tarball>` → read MANIFEST.version from the local
     //      tarball; no network call.
     //   2. `--version <v>` → use that string verbatim.
@@ -1172,7 +1165,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
         }
     };
 
-    // § 3.1.5 — version compare.
+    // Version compare.
     let compare = compare_versions(&state.installed_version, &target_version);
     log_step(
         "version_compare",
@@ -1201,7 +1194,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
         session_counts: session_counts.clone(),
     };
 
-    // `--check` early-exit gate (§ 3.1.5): print the report, exit
+    // `--check` early-exit gate: print the report, exit
     // 0 (up to date) or 3 (update available) without touching the
     // rest of the flow.
     if args.check {
@@ -1214,7 +1207,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
         };
     }
 
-    // `--dry-run` exit gate (§ 2.3): print plan, exit 0 (plan ok) or
+    // `--dry-run` exit gate: print plan, exit 0 (plan ok) or
     // 1 (pre-flight blocks plan).
     let disk = check_disk_space(&DEFAULT_BUDGET);
     if args.dry_run {
@@ -1226,17 +1219,17 @@ pub async fn run(args: UpdateArgs) -> i32 {
 
     // ----- Full-update path (no flags) -----
 
-    // § 3.1.5 up-to-date short-circuit — this MUST run before any
-    // pre-flight gate (§ 3.1.6 active sessions, § 3.1.8 disk, ...).
-    // An operator already at the target version should see the no-op
-    // fast path, not an active-sessions refusal that only applies
-    // when there is actually work to do.
+    // Up-to-date short-circuit — this MUST run before any pre-flight
+    // gate (active sessions, disk space, ...). An operator already at
+    // the target version should see the no-op fast path, not an
+    // active-sessions refusal that only applies when there is actually
+    // work to do.
     if matches!(compare, VersionCompare::UpToDate) {
         println!("Status: up to date");
         return 0i32;
     }
 
-    // § 3.1.6 — active sessions check.
+    // Active sessions check.
     if session_counts.reachable && session_counts.active > 0 && !args.force {
         log_step(
             "active_session_check",
@@ -1263,7 +1256,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
         ),
     );
 
-    // § 3.1.8 — disk space.
+    // Disk space.
     if !disk.passes() {
         log_step("disk_check", "action=check status=fail");
         eprintln!("sandbox update: disk-space check failed:");
@@ -1281,16 +1274,16 @@ pub async fn run(args: UpdateArgs) -> i32 {
     }
     log_step("disk_check", "action=check status=ok");
 
-    // §§ 3.1.9 / 3.1.10 — cosign bootstrap (handled by install.sh on a
-    // prior run; we only invoke verify-blob here), sigstore verify, then
-    // MANIFEST arch + version cross-check.
+    // Cosign bootstrap (handled by install.sh on a prior run; we only
+    // invoke verify-blob here), sigstore verify, then MANIFEST arch +
+    // version cross-check.
     //
     // The arch/version cross-check is cheap and surfaces operator-facing
     // mismatches before we ever invoke cosign. The sigstore step is the
     // trust root for the tarball bytes: a tampered tarball with a valid
     // MANIFEST shape but mutated artefact bytes is caught by the
     // signature check on the whole tarball, then again by the per-file
-    // sha256 check that runs after extraction (see prologue to § 3.2.20).
+    // sha256 check that runs after extraction.
     if let Some(from) = args.from.as_ref() {
         if let Err(e) = check_manifest_from_tarball(from, &target_version, &state.installed_arch) {
             eprintln!("sandbox update: {e}");
@@ -1317,14 +1310,13 @@ pub async fn run(args: UpdateArgs) -> i32 {
         }
     }
 
-    // § 3.1.10 (extract + sha256 cross-check) — stage the tarball BEFORE
-    // the confirmation prompt so the prompt can enumerate the target's
-    // DB migrations and classify each session against the *target*
-    // binary's protocol version. Extraction itself is to a private
-    // tempdir; the lock is acquired later (§ 3.2.13) before any
-    // host-state mutation. Failure here is operator-actionable so we
-    // surface it directly rather than waiting until the lock-held
-    // window.
+    // Extract + sha256 cross-check — stage the tarball BEFORE the
+    // confirmation prompt so the prompt can enumerate the target's DB
+    // migrations and classify each session against the *target* binary's
+    // protocol version. Extraction itself is to a private tempdir; the
+    // lock is acquired later (before any host-state mutation). Failure
+    // here is operator-actionable so we surface it directly rather than
+    // waiting until the lock-held window.
     let staged = match prepare_staged_tarball(&args, &target_version) {
         Ok(s) => {
             log_step(
@@ -1363,9 +1355,9 @@ pub async fn run(args: UpdateArgs) -> i32 {
         }
     }
 
-    // § 3.1.11 — migration dry-run delegate. We run the framework's
-    // in-memory walk against the current registry; § 3.2.24 will
-    // commit the actual writes during the stateful phase (S3).
+    // Migration dry-run delegate. We run the framework's in-memory walk
+    // against the current registry; the apply-config-migrations step
+    // will commit the actual writes during the stateful phase.
     for file in [
         cfg_migrations::TargetFile::UsersConf,
         cfg_migrations::TargetFile::BridgeConf,
@@ -1397,9 +1389,9 @@ pub async fn run(args: UpdateArgs) -> i32 {
         );
     }
 
-    // § 3.1.4 / § 3.1.7 — query the staged (target-version) binary for
-    // (a) the pending DB-migration enumeration and (b) the target
-    // daemon's `DAEMON_GUEST_PROTO_VERSION`. Both are read-only
+    // Query the staged (target-version) binary for (a) the pending
+    // DB-migration enumeration and (b) the target daemon's
+    // `DAEMON_GUEST_PROTO_VERSION`. Both are read-only
     // subprocess calls against the just-extracted binary; failure here
     // does not block the upgrade — we degrade to the unclassified
     // prompt shape and log the reason, so operator awareness wins over
@@ -1432,9 +1424,9 @@ pub async fn run(args: UpdateArgs) -> i32 {
         }
     };
 
-    // § 3.1.12 — confirmation prompt.
+    // Confirmation prompt.
     // The sticky `was_running` is sampled here from the live systemd
-    // probe (the lock isn't acquired yet — that happens in § 3.2.13).
+    // probe (the lock isn't acquired yet).
     let daemon_was_running = systemctl_is_active("sandboxd");
     let summary = render_confirmation_summary(
         &state.installed_version,
@@ -1468,7 +1460,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
         ),
     );
 
-    // ----- Stateful phase (§§ 3.2.13-3.2.30) -----
+    // ----- Stateful phase -----
     apply_stateful(StatefulInputs {
         state: &state,
         target_version: &target_version,
@@ -1480,7 +1472,7 @@ pub async fn run(args: UpdateArgs) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// Stateful phase (§§ 3.2.13-3.2.30)
+// Stateful phase
 // ---------------------------------------------------------------------------
 
 /// Inputs to [`apply_stateful`]. Threaded through every step so the
@@ -1505,23 +1497,22 @@ struct StatefulInputs<'a> {
     staged: &'a fetch::StagedTarball,
 }
 
-/// The full 18-step stateful orchestration. Spec 5 §§ 3.2.13-3.2.30.
+/// The full 18-step stateful orchestration..2.13-3.2.30.
 ///
 /// Returns the operator-visible exit code: `0` on success, `1` on any
 /// failed step. Each step appends a `step=<name> action=<verb>
 /// status=<ok|fail>` line to the install log (`/var/log/sandbox-install.log`)
 /// in the `sandbox-update` second-token format that matches install.sh.
 ///
-/// Idempotency contract per § 3.2: every step inspects current state
+/// Idempotency contract: every step inspects current state
 /// and short-circuits when the desired state is already in place. A
 /// re-run after any failure converges to the same end state.
 async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
     use std::process::Command;
 
-    // § 3.2.13 — Acquire lock. From here on, all state mutations
-    // happen under the held flock. The Drop impl on UpdateLock
-    // releases the kernel flock; the file is `rm`'d at § 3.2.30 on
-    // success.
+    // Acquire lock. From here on, all state mutations happen under
+    // the held flock. The Drop impl on UpdateLock releases the kernel
+    // flock; the file is `rm`'d at lock-release on success.
     let was_running = inputs.daemon_was_running;
     let acquire_params = lock::AcquireParams {
         path: Path::new(lock::LOCK_PATH),
@@ -1561,7 +1552,7 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         ),
     );
 
-    // § 3.2.14 — Stop daemon (only if `was_running`).
+    // Stop daemon (only if `was_running`).
     if sticky_was_running {
         let out = Command::new("sudo")
             .args(["-k", "systemctl", "stop", "sandboxd"])
@@ -1605,9 +1596,9 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         );
     }
 
-    // § 3.2.15 / § 3.2.16 / § 3.2.17 — backups + manifest. We need a
-    // staged tarball at this point so we know which `<stage>/bin/*`
-    // files to compare against for binary-backup idempotency hashes.
+    // Backups + manifest. We need a staged tarball at this point so we
+    // know which `<stage>/bin/*` files to compare against for
+    // binary-backup idempotency hashes.
     // The orchestration extracts the tarball into a private tempdir
     // under `/tmp`; the staged tree lives only for the duration of
     // the run.
@@ -1644,23 +1635,22 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         files: std::collections::BTreeMap::new(),
     };
 
-    // § 3.2.15 — Backup sessions.db plus its WAL companion files.
+    // Backup sessions.db plus its WAL companion files.
     // The daemon runs SQLite in WAL journal mode (`store.rs:117`);
     // committed transactions may live in `sessions.db-wal` between
     // checkpoints, with offsets indexed via `sessions.db-shm`. A
     // backup that copied only `sessions.db` would silently lose any
     // post-last-checkpoint commits. Bundling all three files lets
     // SQLite restore cleanly without manual `PRAGMA wal_checkpoint`
-    // orchestration — the daemon's stop at § 3.2.14 has already
-    // ensured the WAL is quiescent for a clean shutdown, but the
-    // bundle is also correct against a daemon killed mid-write
-    // (the recovery path SQLite runs on next open handles a
-    // truncated WAL transparently).
+    // orchestration — the stop-daemon step has already ensured the
+    // WAL is quiescent for a clean shutdown, but the bundle is also
+    // correct against a daemon killed mid-write (the recovery path
+    // SQLite runs on next open handles a truncated WAL transparently).
     //
     // Each companion file is copied via the same idempotent
     // `backup_sandbox_owned_file` helper; the WAL/SHM may legitimately
     // be absent (a freshly-checkpointed daemon removes them at
-    // close), so `SourceAbsent` is the spec-faithful no-op outcome
+    // close), so `SourceAbsent` is the design-faithful no-op outcome
     // for those two paths, not a failure.
     for (src, dst_name) in [
         (backup::SESSIONS_DB_PATH, "sessions.db.bak"),
@@ -1722,7 +1712,7 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         }
     }
 
-    // § 3.2.16 — Backup /etc files (users.conf, bridge.conf).
+    // Backup /etc files (users.conf, bridge.conf).
     for (src, dst_name, mode) in [
         (backup::USERS_CONF_PATH, "users.conf.bak", 0o644u32),
         (backup::BRIDGE_CONF_PATH, "bridge.conf.bak", 0o644u32),
@@ -1782,7 +1772,7 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         }
     }
 
-    // § 3.2.17 — Backup binaries.
+    // Backup binaries.
     for (src, dst_name) in [
         (backup::SANDBOXD_BIN_PATH, "sandboxd.bak"),
         (backup::SANDBOX_BIN_PATH, "sandbox.bak"),
@@ -1844,7 +1834,7 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         }
     }
 
-    // § 3.2.18 — Update install state's previous_version.
+    // Update install state's previous_version.
     if let Err(e) = write_install_state_previous_version(&inputs.state.installed_version) {
         log_step(
             "record_previous_version",
@@ -1861,9 +1851,9 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         ),
     );
 
-    // § 3.2.19 — Write in-progress manifest. Image-load-before-binary-
-    // swap ordering (binding per § 3.2.19) kicks in next: § 3.2.20
-    // runs the docker load first; § 3.2.21 installs the new binaries.
+    // Write in-progress manifest. Image-load-before-binary-swap ordering
+    // kicks in next: docker load runs first, then the new binaries are
+    // installed.
     if let Err(e) = backup::write_in_progress_manifest(&backup_set_dir, &manifest) {
         log_step(
             "backup_manifest",
@@ -1881,7 +1871,7 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
     // extraction.
     let staged = inputs.staged;
 
-    // § 3.2.20 — docker load gateway image (BEFORE binary swap).
+    // Docker load gateway image (BEFORE binary swap).
     let image_tar = staged.gateway_image_tar();
     let tag = format!("sandbox-gateway:{}", inputs.target_version);
     let inspect = Command::new("docker")
@@ -1927,7 +1917,7 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         }
     }
 
-    // § 3.2.21 — Install new binaries (sha256 compare for idempotency).
+    // Install new binaries (sha256 compare for idempotency).
     for (src, dst, mode) in [
         (staged.sandboxd_bin(), backup::SANDBOXD_BIN_PATH, 0o755u32),
         (staged.sandbox_bin(), backup::SANDBOX_BIN_PATH, 0o755u32),
@@ -1954,8 +1944,8 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         }
     }
 
-    // § 3.2.22 — Setcap on route-helper (capabilities stripped by
-    // the overwrite at § 3.2.21).
+    // Setcap on route-helper (capabilities stripped by the overwrite
+    // in the install-binaries step).
     let helper = backup::ROUTE_HELPER_BIN_PATH;
     let expected = "cap_net_admin,cap_sys_admin=eip";
     let cur_out = Command::new("getcap").arg(helper).output();
@@ -1996,7 +1986,7 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         }
     }
 
-    // § 3.2.23 — Install systemd unit (idempotent via sha256 compare).
+    // Install systemd unit (idempotent via sha256 compare).
     let unit_src = staged.systemd_unit();
     let unit_dst = SYSTEMD_UNIT_PATH;
     match install_root_file_if_changed(&unit_src, unit_dst, 0o644) {
@@ -2007,7 +1997,7 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
             );
             if action == "install" {
                 // daemon-reload after unit replacement so systemctl
-                // start in § 3.2.26 picks up the new unit. A swallowed
+                // start picks up the new unit. A swallowed
                 // failure would leave systemd serving the cached view
                 // of the OLD unit while we'd happily report ok — fail
                 // loud instead, with a forensic-parity log line.
@@ -2053,19 +2043,19 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         }
     }
 
-    // § 3.2.24 — Apply config migrations (per file, atomically).
+    // Apply config migrations (per file, atomically).
     //
     // Test-only failure-injection hook gated behind the
     // `test-env-override` Cargo feature so the env-var name string
     // never appears in a release binary. Used by
     // tests/install-e2e/test_update_idempotency.py
     // (test_update_partial_failure_backup_set_preserved) to verify the
-    // spec-§ 3.2.19 in-progress-manifest contract: a mid-update failure
-    // at the migrate step must leave a backup-set manifest with
-    // `completed_ok: false` on disk, which the next successful run
-    // must preserve (spec § 5.2). When `SANDBOX_UPDATE_TEST_FAIL_AT_STEP`
-    // is set to `migrate`, return a failure here before any migration
-    // runs — the in-progress manifest from § 3.2.19 is already on disk.
+    // in-progress-manifest contract: a mid-update failure at the migrate
+    // step must leave a backup-set manifest with `completed_ok: false`
+    // on disk, which the next successful run must preserve. When
+    // `SANDBOX_UPDATE_TEST_FAIL_AT_STEP` is set to `migrate`, return a
+    // failure here before any migration runs — the in-progress manifest
+    // is already on disk.
     #[cfg(feature = "test-env-override")]
     if std::env::var("SANDBOX_UPDATE_TEST_FAIL_AT_STEP")
         .ok()
@@ -2124,7 +2114,7 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         }
     }
 
-    // § 3.2.26 — Start daemon (only if `was_running`).
+    // Start daemon (only if `was_running`).
     if sticky_was_running {
         match Command::new("sudo")
             .args(["-k", "systemctl", "start", "sandboxd"])
@@ -2170,7 +2160,7 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         );
     }
 
-    // § 3.2.27 — Verify post-start. 30s socket-appearance wait loop,
+    // Verify post-start. 30s socket-appearance wait loop,
     // then curl /version. Skipped when the daemon was stopped
     // intentionally (was_running == false).
     if sticky_was_running {
@@ -2233,10 +2223,9 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         );
     }
 
-    // § 3.2.28 — `sandbox doctor --verbose`. The CLI binary on disk
-    // is the new one (we just installed it). Spec 5 § 10.3 — the
-    // running process keeps executing the old code, so we exec the
-    // new binary explicitly.
+    // `sandbox doctor --verbose`. The CLI binary on disk is the new one
+    // (we just installed it) — the running process keeps executing the
+    // old code, so we exec the new binary explicitly.
     //
     // Drop privileges to the `sandbox` user for the doctor invocation.
     // The operator runs `sudo sandbox update`, so this code runs as
@@ -2245,7 +2234,7 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
     // sandbox group, so C4 would `Fail` and the doctor would exit 1
     // even on an otherwise-healthy host. Running doctor as the
     // `sandbox` user matches the operator-facing contract (operators
-    // are added to the sandbox group by install.sh § 4.4.10) and
+    // are added to the sandbox group by install.sh) and
     // mirrors how `assert_doctor_passes` in the e2e harness invokes it.
     //
     // `SANDBOX_SOCKET` is explicitly planted to the systemd-managed
@@ -2295,7 +2284,7 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         }
     }
 
-    // § 3.2.29 — Update install state + finalize backup manifest.
+    // Update install state + finalize backup manifest.
     if let Err(e) = write_install_state_post_upgrade(&inputs) {
         log_step("finalize_state", &format!("status=fail err=\"{e}\""));
         eprintln!("sandbox update: failed to finalize install state: {e}");
@@ -2326,7 +2315,7 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         }
     }
 
-    // § 3.2.25 — Prune older backup sets. Runs AFTER finalize_manifest
+    // Prune older backup sets. Runs AFTER finalize_manifest
     // so the current run's set is `completed_ok: true` at this point
     // and counts toward `RETENTION_KEEP=2`. The earlier ordering
     // (prune before finalize) left the current set at
@@ -2352,8 +2341,8 @@ async fn apply_stateful(inputs: StatefulInputs<'_>) -> i32 {
         }
     }
 
-    // § 3.2.30 — Release the lock. Dropping `held_lock` removes the
-    // file and closes the FD (releases the kernel flock).
+    // Release the lock. Dropping `held_lock` removes the file and
+    // closes the FD (releases the kernel flock).
     drop(held_lock);
     log_step("release_lock", "status=ok");
     log_step(
@@ -2548,7 +2537,7 @@ fn files_byte_equal(a: &Path, b: &Path) -> Result<bool, std::io::Error> {
 }
 
 /// `curl --unix-socket <sock> http://localhost/version` and pluck the
-/// `version` field. Spec 5 § 3.2.27.
+/// `version` field..2.27.
 async fn query_daemon_version(sock: &str) -> Result<String, String> {
     let bytes = http_get(sock, "/version")
         .await
@@ -2563,7 +2552,7 @@ async fn query_daemon_version(sock: &str) -> Result<String, String> {
 }
 
 /// Update `.install-state.json`'s `previous_version` field before any
-/// binary swap. Spec 5 § 3.2.18.
+/// binary swap..2.18.
 ///
 /// Implementation: read the current state (as root), set the field,
 /// write via a tempfile owned by the current process, then `sudo
@@ -2581,9 +2570,9 @@ fn write_install_state_previous_version(previous_version: &str) -> Result<(), St
     })
 }
 
-/// Finalize `.install-state.json` after a successful upgrade. Spec 5
-/// § 3.2.29: set `installed_version`, `installed_at`, and
-/// `updated_by_operator`; preserve `previous_version` from § 3.2.18.
+/// Finalize `.install-state.json` after a successful upgrade:
+/// set `installed_version`, `installed_at`, and `updated_by_operator`;
+/// preserve `previous_version` recorded earlier.
 fn write_install_state_post_upgrade(inputs: &StatefulInputs<'_>) -> Result<(), String> {
     let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let operator = std::env::var("SUDO_USER").unwrap_or_else(|_| "(direct-root)".to_string());
@@ -2661,7 +2650,7 @@ where
     Ok(())
 }
 
-/// Canonical install-log path. Spec 4 § 4.6. Operators on hosts where
+/// Canonical install-log path. the documented contract. Operators on hosts where
 /// `/var/log` is read-only can override via `$SANDBOXD_INSTALL_LOG`
 /// (parsed by [`resolve_install_log_path`]); install.sh / uninstall.sh
 /// read the same env var so the three writers stay in sync.
@@ -2693,7 +2682,7 @@ pub fn resolve_install_log_path(env_override: Option<&str>) -> String {
 /// Append a `step=...` line to the install log (default
 /// `/var/log/sandbox-install.log`, or whatever
 /// `$SANDBOXD_INSTALL_LOG` points at) with the `sandbox-update`
-/// second token. Matches install.sh's `log_ok` shape (Spec 5 § 2.6).
+/// second token. Matches install.sh's `log_ok` shape.
 /// Best-effort — log write failure does not abort the upgrade.
 fn log_step(step: &str, fields: &str) {
     use std::io::Write;
@@ -2730,7 +2719,7 @@ fn log_step(step: &str, fields: &str) {
 // Internal helpers (target version, MANIFEST read, systemctl probe)
 // ---------------------------------------------------------------------------
 
-/// Resolve the target version per Spec 5 § 3.1.4. Three paths:
+/// Resolve the target version per.1.4. Three paths:
 ///
 /// 1. `--from <tarball.tar.gz>` — peek MANIFEST out of the tarball
 ///    via `tar -O -xzf ... '*/MANIFEST'`. The tarball file's
@@ -2772,7 +2761,7 @@ fn resolve_target_version(args: &UpdateArgs, _state: &InstallState) -> Result<St
 }
 
 /// Run the arch + version cross-check against a `--from` tarball or
-/// pre-extracted directory. Spec 5 § 3.1.10.
+/// pre-extracted directory..1.10.
 fn check_manifest_from_tarball(
     from: &Path,
     target_version: &str,
@@ -2797,7 +2786,7 @@ fn check_manifest_from_tarball(
 }
 
 /// In-memory migration walk for the given file. Mirrors the production
-/// `apply_pending_at` walk but without writing — § 3.1.11.
+/// `apply_pending_at` walk but without writing.
 fn dry_run_migration(file: cfg_migrations::TargetFile) -> Result<(), String> {
     let path = file.canonical_path();
     let bytes = match std::fs::read(&path) {
@@ -2909,7 +2898,7 @@ mod tests {
     }
 
     /// `--check` against an up-to-date installation produces the
-    /// minimal three-line shape (§ 2.2 sample 2).
+    /// minimal three-line shape.
     #[test]
     fn check_report_up_to_date_format() {
         let state = sample_state();
@@ -2935,8 +2924,7 @@ mod tests {
     }
 
     /// `--check` with an upgrade available produces the longer
-    /// shape (§ 2.2 sample 1) including "Run `sudo sandbox update` to
-    /// apply.".
+    /// shape including "Run `sudo sandbox update` to apply.".
     #[test]
     fn check_report_update_available_format() {
         let state = sample_state();
@@ -2978,9 +2966,9 @@ mod tests {
 
     /// `pending_migration_human_description` translates the
     /// snake_case migration slug used in `ConfigMigration::name()`
-    /// into the human-friendly rendering Spec 5 § 2.2 pins for
+    /// into the human-friendly rendering.2 pins for
     /// `--check`. Underscores become spaces; everything else is
-    /// verbatim. The default migration name shipped in the spec
+    /// verbatim. The default migration name shipped in the design
     /// (`add per-pool rate limit metadata`) already reads as a
     /// human sentence so it round-trips unchanged.
     #[test]
@@ -3040,8 +3028,8 @@ mod tests {
 
         // Every step with a sha256 / image-presence / caps /
         // unit-bytes idempotency shortcut must read `would skip`
-        // on an up-to-date install. § 3.2.14 (stop daemon) is in
-        // the up-to-date skip group per the projection rationale.
+        // on an up-to-date install. Stop-daemon is in the up-to-date
+        // skip group per the projection rationale.
         for id in [
             "§ 3.2.14",
             "§ 3.2.15",
@@ -3089,9 +3077,9 @@ mod tests {
     }
 
     /// `stateful_step_verdict` projects the per-step idempotency
-    /// rules without touching the renderer. Pin a few critical
-    /// rows: § 3.2.13 always executes (lock acquire), § 3.2.21
-    /// flips with up-to-date, § 3.2.24 flips with the pending-
+    /// rules without touching the renderer. Pin a few critical rows:
+    /// lock-acquire always executes, install-binaries flips with
+    /// up-to-date, apply-config-migrations flips with the pending-
     /// migrations bool.
     #[test]
     fn stateful_step_verdict_rules() {
@@ -3124,8 +3112,8 @@ mod tests {
             assert_eq!(stateful_step_verdict(id, true, false), "would skip");
             assert_eq!(stateful_step_verdict(id, false, false), "would execute");
         }
-        // § 3.2.24 flips on pending-migrations independently of
-        // up-to-date.
+        // Apply-config-migrations flips on pending-migrations independently
+        // of up-to-date.
         assert_eq!(
             stateful_step_verdict("§ 3.2.24", false, true),
             "would execute"
@@ -3141,7 +3129,7 @@ mod tests {
         assert_eq!(stateful_step_verdict("§ 3.2.24", true, false), "would skip");
     }
 
-    /// `--dry-run` lists all 18 stateful step ids (§§ 3.2.13-3.2.30).
+    /// `--dry-run` lists all 18 stateful step ids.
     #[test]
     fn dry_run_lists_all_18_stateful_steps() {
         let state = sample_state();
@@ -3178,7 +3166,7 @@ mod tests {
         assert!(s.contains("would execute"), "got:\n{s}");
     }
 
-    /// Spec § 2.4: the literal token `Proceed? [y/N]:` is the
+    ///
     /// idempotency E2E anchor.
     #[test]
     fn confirmation_summary_contains_proceed_token() {
@@ -3223,7 +3211,7 @@ mod tests {
         );
     }
 
-    /// Spec 5 § 3.1.7 — `classify_session_compat` splits sessions into
+    /// `classify_session_compat` splits sessions into
     /// three buckets: `Ok` for exact-match, `RefreshInPlace` when the
     /// target's `can_refresh_in_place` accepts the session's proto,
     /// `Recreate` for the unsalvageable case (`session_proto == 0`).
@@ -3235,7 +3223,7 @@ mod tests {
         assert_eq!(classify_session_compat(1, 2), CompatBucket::RefreshInPlace);
         // Newer-than-target proto, non-zero → refresh (the daemon's
         // refresh path stages its embedded guest into the session;
-        // narrowing this is a future-spec change, not a current bucket).
+        // narrowing this is a future protocol change, not a current bucket).
         assert_eq!(classify_session_compat(3, 2), CompatBucket::RefreshInPlace);
         // Proto = 0 (legacy / pre-V006) → unsalvageable.
         assert_eq!(classify_session_compat(0, 2), CompatBucket::Recreate);
@@ -3253,7 +3241,7 @@ mod tests {
 
     /// `render_confirmation_summary` renders the operator-visible
     /// three-bucket breakdown when the per-session classification was
-    /// computed; this pins the prompt shape Spec 5 § 2.4
+    /// computed; this pins the prompt shape.4
     /// recreate-classification contract calls for.
     #[test]
     fn confirmation_summary_renders_three_bucket_breakdown() {
@@ -3307,7 +3295,7 @@ mod tests {
         assert!(s.contains("V007 (add_widget_table)"), "got: {s}");
         assert!(s.contains("6 -> 7"), "got: {s}");
         assert!(s.contains("[sessions.db]"), "got: {s}");
-        // Placeholder spec-internals string is gone.
+        // Placeholder internal string is gone.
         assert!(
             !s.contains("(enumerated after extraction at"),
             "placeholder leaked: {s}"
@@ -3316,7 +3304,7 @@ mod tests {
 
     /// When the classification step couldn't run (daemon unreachable
     /// or staged-binary probe failed), the prompt falls back to the
-    /// flat `stopped sessions: N` line — no spec-internals leak.
+    /// flat `stopped sessions: N` line — no internal-state leak.
     #[test]
     fn confirmation_summary_falls_back_to_flat_count_without_classification() {
         let s = render_confirmation_summary(
@@ -3368,7 +3356,7 @@ mod tests {
     }
 
     /// `resolve_install_log_path` honours a non-empty
-    /// `$SANDBOXD_INSTALL_LOG` value verbatim (Spec 4 § 4.6 env
+    /// `$SANDBOXD_INSTALL_LOG` value verbatim (the documented contract env
     /// override). Pure-function test — pinned against a synthetic
     /// path so the process env is never poked.
     #[test]
@@ -3451,7 +3439,7 @@ mod tests {
                 );
             }
         } else {
-            // Clean environment (the spec contract this test
+            // Clean environment (the design contract this test
             // originally claimed to pin): canonical path is not
             // readable, so the function returns an empty vec — the
             // `continue` arms in `enumerate_pending_config_migrations`

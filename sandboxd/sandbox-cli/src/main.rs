@@ -48,12 +48,12 @@ enum Command {
         name: Option<String>,
         /// Number of CPU cores. Defaults are backend-specific:
         /// `lima` falls back to 2 cores; `container` falls back to
-        /// the daemon's host-80% ceiling (spec § "Resource defaults").
+        /// the daemon's host-80% ceiling.
         /// Omit to take the backend default; pass an explicit value
         /// to override.
         ///
-        /// `f32` so the spec § "Resource defaults — container only"
-        /// 1-decimal grammar (`0.8`, `1.5`, `2.0`, …) reaches the
+        /// `f32` so the resource-defaults 1-decimal grammar (`0.8`, `1.5`,
+        /// `2.0`, …) reaches the
         /// daemon without truncation. The daemon rounds
         /// to one decimal at request-parse time so `0.81` lands on
         /// the grid as `0.8`. Lima sessions truncate the fractional
@@ -63,7 +63,7 @@ enum Command {
         cpus: Option<f32>,
         /// Memory in megabytes. Defaults are backend-specific:
         /// `lima` falls back to 4096 MB; `container` falls back to
-        /// the daemon's host-80% ceiling (spec § "Resource defaults").
+        /// the daemon's host-80% ceiling.
         /// Omit to take the backend default; pass an explicit value
         /// to override.
         #[arg(long)]
@@ -135,7 +135,7 @@ enum Command {
         /// backend is resolved from `SANDBOX_DEFAULT_BACKEND`, the
         /// per-user config (`~/.config/sandboxd/config.json` →
         /// `default_backend`), and finally the hardcoded default
-        /// `lima`. See spec § "CLI & UX → Invocation".
+        /// `lima`. See.
         #[arg(long, value_enum)]
         backend: Option<BackendKindArg>,
         /// Sugar for `--backend container` — the container ("lite")
@@ -145,7 +145,7 @@ enum Command {
         #[arg(long, conflicts_with = "backend")]
         lite: bool,
         /// Allow session-create on rootless Docker (operator opt-in;
-        /// spec § Non-goals 1195 — explicitly outside the supported
+        ///
         /// envelope).
         ///
         /// By default the daemon probes `docker info` and refuses
@@ -314,7 +314,7 @@ enum Command {
         #[arg(required = true)]
         sessions: Vec<String>,
         /// Append the daemon-advertised capability matrix for each
-        /// session's backend. Spec § "sandbox inspect" → `-v` view.
+        /// session's backend. The `-v` flag appends the capability matrix.
         #[arg(short, long)]
         verbose: bool,
     },
@@ -390,7 +390,7 @@ enum Command {
     },
     /// Rebuild the pre-baked backend image(s).
     ///
-    /// Spec § "`rebuild-image`: extend the existing flat command":
+    /// :
     /// `--backend` selects which backend's image to rebuild
     /// (`lima`, `container`, or `all`; default `all`); `--no-cache`
     /// passes through to `docker build --no-cache` for the container
@@ -416,14 +416,14 @@ enum Command {
 
     /// Apply a pending sandboxd upgrade (or report what would happen).
     ///
-    /// `sandbox update` orchestrates Spec 5 § 3's full upgrade flow:
+    /// `sandbox update` orchestrates
     /// pre-flight checks (read-only), confirmation prompt, and the
     /// stateful steps that stop the daemon, install new binaries, run
     /// config migrations, and restart. Each privileged step uses
     /// `sudo -k <action>` so every elevation appears as its own line
-    /// in `/var/log/sandbox-install.log` (Spec 5 § 2.6).
+    /// in `/var/log/sandbox-install.log`.
     ///
-    /// Exit codes (Spec 5 § 2.2):
+    /// Exit codes:
     /// - `0` — up to date (`--check`), `--dry-run` printed plan, or
     ///   confirmation prompt answered `N`.
     /// - `1` — error (pre-flight refused, network failure, etc.).
@@ -455,20 +455,20 @@ enum Command {
         source_url: String,
         /// Read-only mode: report installed vs available, then exit.
         /// Never acquires the lock, never contacts cosign, never
-        /// extracts anything. Spec 5 § 2.2.
+        /// extracts anything..2.
         #[arg(long, conflicts_with = "dry_run")]
         check: bool,
         /// Read-only mode: print the step-by-step plan
         /// (`would execute` / `would skip` per stateful step) and
-        /// exit. Never mutates state. Spec 5 § 2.3.
+        /// exit. Never mutates state..3.
         #[arg(long)]
         dry_run: bool,
         /// Skip the interactive confirmation prompt. Equivalent to
-        /// answering `y`. Spec 5 § 2.4.
+        /// answering `y`..4.
         #[arg(long)]
         yes: bool,
-        /// Proceed past the "active sessions exist" guard
-        /// (§ 3.1.6). The daemon stop will terminate active
+        /// Proceed past the "active sessions exist" guard.
+        /// The daemon stop will terminate active
         /// sessions mid-flight — use only when the daemon is wedged
         /// and you want to upgrade anyway.
         #[arg(long)]
@@ -485,7 +485,7 @@ enum Command {
     /// memory and write the result to `--out`. The outer
     /// `sandbox update` flow then `sudo -k mv`s the output into place.
     ///
-    /// Refusal arms (Spec 5 § 4.3 access-gating block — `clap-hide` is
+    /// Refusal arms (the migration framework.3 access-gating block — `clap-hide` is
     /// not access control):
     ///
     /// 1. Caller must be root (`getuid() == 0`).
@@ -512,7 +512,7 @@ enum Command {
 
     /// Hidden internal affordance: print the static migration registry
     /// as JSON to stdout. Used by `sandbox update --dry-run` for the
-    /// stopped-session classification step (Spec 5 § 3.1.4). Read-only
+    /// stopped-session classification step. Read-only
     /// — no privilege check, no path arguments.
     #[command(hide = true, name = "dump-migration-set")]
     DumpMigrationSet,
@@ -521,7 +521,7 @@ enum Command {
     /// constants as JSON to stdout. Invoked by `sandbox update` against
     /// the *staged* (target-version) CLI binary so the pre-flight can
     /// classify each persisted session against the upgrade target's
-    /// `DAEMON_GUEST_PROTO_VERSION` (Spec 5 § 3.1.7). The shape is
+    /// `DAEMON_GUEST_PROTO_VERSION`. The shape is
     /// `{ "daemon_guest_proto_version": <u32> }` — operator-stable, so
     /// future protocol bumps add fields rather than renaming this key.
     /// Read-only; no privilege check, no path arguments.
@@ -744,7 +744,7 @@ fn default_socket_path() -> String {
 ///
 /// Any [`presets::PresetError`] along the way prints its `Display` impl to
 /// stderr and calls `process::exit(1)` **before** returning. The
-/// error wording is spec-mandated (Part 1 lines 140-150, Part 2
+/// error wording is required (Part 1 lines 140-150, Part 2
 /// "Error shapes"), so we defer to `PresetError`'s `Display` impl
 /// verbatim — callers must not reformat or add a prefix.
 ///
@@ -889,7 +889,7 @@ fn expand_host_tilde_in_workspace_flag(value: &str) -> Result<String, String> {
 /// the `--workspace` value with [`sandbox_core::WorkspaceMode::parse_flag`]
 /// — the single pure parser shared with the daemon.
 ///
-/// Spec § `--no-gitignore` on `sandbox create` pins the rejection
+///
 /// wording; the literal string lives at the call sites (CLI + daemon)
 /// rather than as a shared constant because:
 /// - The daemon-side check is independent (a misbehaving CLI cannot
@@ -1010,7 +1010,7 @@ fn build_create_request_body(
     //   sibling field for audit.
     //
     // Preset errors short-circuit to stderr + exit(1) BEFORE any
-    // Unix-socket work — this matches the spec invariant "the daemon
+    // Unix-socket work — this matches the design invariant "the daemon
     // never sees a malformed preset invocation".
     let (file_policy, file_path): (Option<Policy>, Option<std::path::PathBuf>) =
         if let Some(policy_path) = policy {
@@ -1307,7 +1307,7 @@ fn build_request(command: &Command) -> Option<Request<String>> {
             .expect("failed to build request"),
         Command::RebuildImage { .. } => {
             // rebuild-image fans out one HTTP call per selected
-            // backend (spec § "rebuild-image"). The single-request
+            // backend. The single-request
             // shape `build_request` returns cannot express that;
             // `main` short-circuits this command into
             // [`dispatch_rebuild_image`] before reaching this match,
@@ -1480,7 +1480,7 @@ fn display_session(session: &SessionDto) {
 /// thinking the session had no CPU budget; the daemon already plumbs
 /// the resolved value through `resolved_cpus`, so this helper picks
 /// the right value to render and decorates the default case with a
-/// `(default)` suffix per spec § "Resource defaults — container only".
+/// `(default)` suffix per.
 ///
 /// - Stored value > 0 (operator-supplied explicit ceiling): render
 ///   the value verbatim. Lima sessions always take this branch
@@ -1493,7 +1493,7 @@ fn display_session(session: &SessionDto) {
 /// `f32` formatting omits a trailing `.0` for integer-valued
 /// fractions (e.g. `2.0` → `2`) so Lima sessions render the same
 /// way as before todo #67. The `:.1` formatting on container
-/// fractions preserves the spec's 1-decimal grammar.
+/// fractions preserves the 1-decimal grammar.
 fn format_cpus_field(config: &sandbox_core::SessionConfigDto) -> String {
     if config.cpus == 0.0 {
         // Container "use the daemon default" path. `resolved_cpus`
@@ -1537,7 +1537,7 @@ const CLI_VERSION_MISMATCH_EXIT_CODE: i32 = 2;
 /// Format the verbatim stderr message printed when the CLI detects a
 /// version skew with the daemon. The tokens `version mismatch`,
 /// `CLI is`, `daemon is`, and `both must match` are load-bearing — the
-/// integration test in spec § 11.6 greps for them, and downstream
+/// integration test in.6 greps for them, and downstream
 /// scripts may match the wording to surface a friendly upgrade hint.
 fn render_version_mismatch_message(cli_version: &str, daemon_version: &str) -> String {
     format!(
@@ -1564,12 +1564,12 @@ fn check_daemon_version_equality(cli_version: &str, daemon_version: &str) -> Res
 /// the skew via doctor's C3 check rather than being refused at the
 /// gate. Every other subcommand performs the strict equality check
 /// inside `send_request_with_timeout` immediately after socket
-/// connect, per spec § 7.5.
+/// connect, per.5.
 ///
 /// The dispatch in `main` short-circuits both `Version` and `Doctor`
 /// before reaching the socket-connect path, so this predicate is the
 /// single source of truth for the bypass set; it is queried by the
-/// unit tests in spec § 11.3 so the bypass surface is asserted at
+/// unit tests in.3 so the bypass surface is asserted at
 /// every refactor.
 #[cfg_attr(not(test), allow(dead_code))]
 fn command_bypasses_version_check(command: &Command) -> bool {
@@ -1608,7 +1608,7 @@ struct DaemonVersionResponse {
 /// (`send_request_with_timeout`) and the long-lived streaming path
 /// (`stream_events_to_stdout`) so every side-channel CLI command that
 /// connects to the daemon goes through the same equality gate, per
-/// Spec 3 § 7.3. Subcommands that need to bypass the check (e.g.
+/// the documented contract. Subcommands that need to bypass the check (e.g.
 /// `sandbox version`, `sandbox doctor`, `sandbox update`) are routed
 /// before the socket-connect path in `main` and never call this
 /// helper — see [`command_bypasses_version_check`].
@@ -1700,7 +1700,7 @@ async fn send_request_with_timeout(
             }
         });
 
-        // Strict CLI ↔ daemon version-equality handshake (spec § 7.1).
+        // Strict CLI ↔ daemon version-equality handshake.
         // Fired on every CLI invocation that reaches the daemon — the
         // bypass for `sandbox version` / `sandbox doctor` is handled
         // upstream in `main` (see `command_bypasses_version_check`).
@@ -1709,7 +1709,7 @@ async fn send_request_with_timeout(
         // request is never sent against a skewed daemon. The same
         // helper is invoked from `stream_events_to_stdout` so the
         // streaming side-channel inherits the gate symmetrically per
-        // Spec 3 § 7.3.
+        // the documented contract.
         enforce_version_handshake(&mut sender).await?;
 
         // Wait until the connection's internal dispatcher is ready for the
@@ -1947,7 +1947,7 @@ async fn fetch_sessions_parallel(
     }
 
     // Await every task. Collect results preserving input order; surface
-    // the FIRST error in input order, mirroring the spec's "names the
+    // the FIRST error in input order, mirroring the "names the
     // first missing id" requirement.
     let mut results: Vec<Result<SessionDto, String>> = Vec::with_capacity(handles.len());
     for handle in handles {
@@ -1984,7 +1984,7 @@ enum CapabilitiesLookup {
 /// Render a slice of `SessionDto` as the human-readable `sandbox describe`
 /// output. Separator between sessions is a single blank line.
 ///
-/// Layout follows the spec §2:
+/// Layout:
 /// - header block (Session, Name, State, **Backend**, Created, Updated)
 /// - `Config:` block
 /// - `Runtime:` block
@@ -2003,7 +2003,7 @@ enum CapabilitiesLookup {
 /// arg list.
 ///
 /// Timestamps are rendered as absolute UTC plus the existing relative
-/// age suffix (e.g. `5m ago`), matching the sample in the spec.
+/// age suffix (e.g. `5m ago`), matching the sample in the design.
 fn render_describe(
     sessions: &[SessionDto],
     verbose_caps: Option<
@@ -2032,15 +2032,15 @@ fn render_describe_one(
     let name = session.name.as_deref().unwrap_or("-");
     let _ = writeln!(out, "Session:      {}", session.id);
     let _ = writeln!(out, "Name:         {name}");
-    // Render state in lowercase to match spec §2 (and the wire/JSON
-    // snake_case serde representation), not the capitalized `Display`
-    // impl used by `ps` table headers.
+    // Render state in lowercase to match the wire/JSON snake_case serde
+    // representation, not the capitalized `Display` impl used by `ps`
+    // table headers.
     let _ = writeln!(
         out,
         "State:        {}",
         session.state.to_string().to_lowercase()
     );
-    // Spec § "sandbox inspect" — backend prominently alongside session
+    //  — backend prominently alongside session
     // id, state, and IP. `as_str()` matches the wire/persisted spelling
     // (`lima` / `container`).
     let _ = writeln!(out, "Backend:      {}", session.backend.as_str());
@@ -2123,7 +2123,7 @@ fn render_describe_one(
 
 /// Render the daemon-advertised capability matrix as a key/value block.
 ///
-/// Spec § "sandbox inspect → -v view" — capability matrix is the
+///  — capability matrix is the
 /// `Capabilities` struct rendered as a key/value table. The keys are
 /// the struct field identifiers (so they match `serde_json` keys an
 /// operator may have already seen via `inspect`); values use each
@@ -2168,7 +2168,7 @@ fn render_capabilities_block(lookup: &CapabilitiesLookup, out: &mut String) {
 /// emits a multi-line block with `Mode:` / `Host path:` /
 /// `Guest path:` / `Security:` rows for `Shared` (and the `Local`
 /// equivalent without the `Security:` row), or `Mode:` / `Repo:` for
-/// `Clone`. The `Security:` value mirrors the spec § rendering rule:
+/// `Clone`. The `Security:` value follows the rendering rule:
 /// `mapped-xattr (default)` when the operator passed no override
 /// (`security_model = None`), and the model verbatim for any
 /// `Some(_)` choice.
@@ -2274,7 +2274,7 @@ fn render_workspace_modes(caps: &sandbox_core::Capabilities) -> String {
 /// block; missing data renders as `none` (matching the `Policy: none`
 /// shape) rather than absent.
 ///
-/// Field labels mirror the spec's "operator-readable" naming so a
+/// Field labels mirror the "operator-readable" naming so a
 /// human reader and the e2e suite parse the same surface — the e2e
 /// suite uses the JSON output of `sandbox inspect`, so the field
 /// *contents* (IPs / CIDR strings) are what matters for tests; the
@@ -2334,7 +2334,7 @@ fn render_mounts_block(mounts: Option<&SessionMountInfo>, out: &mut String) {
 
 /// Render the rootless-Docker probe outcome.
 ///
-/// Spec § Non-goals line 1195 makes rootless Docker out-of-scope for
+///
 /// the lite container backend; the daemon stamps the probe outcome
 /// onto each container session at create time so operators can see
 /// (a) whether the host was detected as rootless, and (b) whether
@@ -2403,7 +2403,7 @@ fn render_policy_rule(idx: usize, rule: &PolicyRuleDto, out: &mut String) {
     // Top line: `  [i] <action> <protocol>  <destination>`.
     //
     // "action" is the level variant name (`allow` for any non-deny level
-    // keeps faith with the sample in the spec, which uses `allow http`,
+    // keeps faith with the sample in the design, which uses `allow http`,
     // `allow tls`, etc.; `deny` is left as-is).  We map each level to a
     // (action, level_word) pair so the top line stays compact and the
     // sub-lines carry the detail.
@@ -2461,8 +2461,8 @@ fn protocol_to_str(protocol: &sandbox_core::Protocol) -> &'static str {
 ///
 /// None of the three subcommands contact the daemon — they inspect
 /// the CLI's built-in catalog plus the user's XDG preset directory.
-/// Errors exit non-zero with the spec-mandated `PresetError` wording
-/// on stderr so operators can paste-and-compare against the spec.
+/// Errors exit non-zero with the required `PresetError` wording
+/// on stderr so operators can paste-and-compare against the design.
 ///
 /// Output contracts (enforced by unit tests in `tests/preset_cli.rs`):
 /// - `list`: one line per preset, `NAME<TAB>SOURCE`. SOURCE is
@@ -2723,7 +2723,7 @@ fn print_preset_details(preset: &Preset) {
     match preset {
         Preset::Builtin(b) => {
             println!("Source: built-in");
-            // Built-in param schemas are hard-coded per the spec.
+            // Built-in param schemas are hard-coded per the design.
             // Keep this table in lock-step with the expander bodies
             // in `presets::builtin` — the unit test
             // `show_github_repo_documents_repo_param` guards against
@@ -2808,7 +2808,7 @@ async fn handle_inspect(socket_path: &str, sessions: &[String]) {
 }
 
 /// Handle `sandbox describe <session>...`: render human-readable sections
-/// for each session per the spec §2 layout. Any missing session causes a
+/// for each session. Any missing session causes a
 /// non-zero exit with an error on stderr and no stdout.
 ///
 /// When `verbose` is set, additionally fetches the daemon's capability
@@ -2838,7 +2838,7 @@ async fn handle_describe(socket_path: &str, sessions: &[String], verbose: bool) 
 }
 
 /// Fetch the capability matrix for every backend referenced by the
-/// supplied DTOs. The cache is constructed per-invocation per spec
+/// supplied DTOs. The cache is constructed per-invocation as designed
 /// "exactly one /backends fetch per CLI invocation" — a single
 /// [`BackendsCache`] services every session in the slice.
 ///
@@ -2880,7 +2880,7 @@ async fn fetch_capabilities_for(
 /// arg and any user-supplied trailing command — i.e. the caller can
 /// pass the values straight to [`std::process::Command`].
 ///
-/// Backend-specific shapes (spec § "Lifecycle"):
+/// Backend-specific shapes:
 ///
 /// - **Lima** — `limactl shell sandbox-<id> [-- <cmd>...]`. The
 ///   pre-existing path; the `--` separator is omitted when the user
@@ -3316,7 +3316,7 @@ fn split_jsonl_lines(buffer: &mut Vec<u8>) -> Vec<String> {
 // * SESSION is truncated to the first 8 chars of the session_id
 //   envelope field. Full UUIDs are too wide for the row.
 // * LAYER and EVENT are left-padded to fixed widths — `deny-logger` is
-//   the widest layer name the spec uses today; `policy_reset_on_upgrade`
+//   the widest layer name the design uses today; `policy_reset_on_upgrade`
 //   is the widest event name.
 // * HOST:PORT is reconstructed from whichever of `host:port` or
 //   `orig_dst_ip:orig_dst_port` the event carries; `-` when neither.
@@ -3422,7 +3422,7 @@ fn truncate_detail(detail: &str) -> String {
 /// Extract (timestamp, session, layer, event, host:port, detail, is_deny)
 /// from an `EventDto` for the `--table` renderer.
 ///
-/// `layer` is the spec's kebab-case layer name; `event` is the body's
+/// `layer` is the kebab-case layer name; `event` is the body's
 /// snake_case event-name discriminator; `host:port` is pulled from
 /// whichever shape the body exposes (HTTP-style `host:port`, Envoy
 /// `dst_ip:dst_port`, deny-logger `orig_dst_ip:orig_dst_port`) or `-`
@@ -3759,7 +3759,7 @@ async fn stream_events_to_stdout(socket_path: &str, args: &EventsArgs) -> Result
         }
     });
 
-    // Strict CLI ↔ daemon version-equality handshake (Spec 3 § 7.3).
+    // Strict CLI ↔ daemon version-equality handshake (the documented contract).
     // `sandbox events` does not reach `send_request_with_timeout`
     // because of its streaming response shape, but the version gate
     // must still fire so a CLI ↔ daemon skew refuses the stream
@@ -4060,7 +4060,7 @@ fn plan_cp_command(
     }
 }
 
-/// Parse a `session:path` spec, returning `(session, path)` if the spec
+/// Parse a `session:path` spec, returning `(session, path)` if the design
 /// contains a colon, or `None` if it's a local path.
 fn parse_remote_spec(spec: &str) -> Option<(&str, &str)> {
     // Split on the first colon only.
@@ -4472,7 +4472,7 @@ type WorkspaceSyncDirection = sandbox_core::Direction;
 ///   `SessionId` newtype; the call site formats `id.to_string()` once).
 ///   Concatenated into the `sandbox-<id>:<path>/` remote spec.
 /// - `host_path` — the host-side root of the workspace. Trailing slash
-///   is appended by the planner if absent (spec § Trailing-slash rule).
+///   is appended by the planner if absent.
 /// - `guest_path` — the guest-side root of the workspace. Same trailing-
 ///   slash rule as `host_path`.
 /// - `dest_override` (pull only) — operator-supplied override of the
@@ -4486,7 +4486,7 @@ type WorkspaceSyncDirection = sandbox_core::Direction;
 /// - `safe_links` — when `true`, `-L` is replaced by `-a --safe-links`
 ///   (the archive flag `-a` is split out so the resulting argv has a
 ///   distinct `-a` token followed by `--safe-links`, matching the
-///   spec's documented Push/pull commands argv layout).
+///   the documented Push/pull commands argv layout).
 /// - `no_gitignore` — when `true`, the `--filter=:- .gitignore` token is
 ///   omitted entirely from the argv.
 #[derive(Debug, Clone)]
@@ -4509,7 +4509,7 @@ struct WorkspaceSyncPlan {
 /// share the rsync wire shape so a single audit covers all three call
 /// paths.
 ///
-/// **Argv layout.** Per spec § Push/pull commands → Argv layout:
+/// **Argv layout.** Per :
 ///
 /// ```text
 /// rsync -aL --delete --filter=':- .gitignore' \
@@ -4575,8 +4575,7 @@ fn plan_workspace_sync_argv(plan: &WorkspaceSyncPlan) -> Result<Vec<String>, Str
     // - The CLI returns argv with `"rsync"` as `argv[0]`; the shared
     //   builder returns argv WITHOUT the program name, so we prepend
     //   here. Returning the program inside the vector (rather than as
-    //   a separate field) matches the shape the spec § Unit tests
-    //   block asserts on.
+    //   a separate field) matches the shape the unit-tests assert on.
     let host_path = match (plan.direction, plan.dest_override.as_deref()) {
         (WorkspaceSyncDirection::Pull, Some(dest)) => dest.to_string(),
         _ => plan.host_path.clone(),
@@ -4685,13 +4684,12 @@ async fn fetch_session_dto(socket_path: &str, session: &str) -> SessionDto {
 
 /// Resolve a session's `local:` workspace paths from the DTO. Returns
 /// `(host_path, guest_path)` if the session is in `local:` mode;
-/// otherwise prints the spec-mandated mode-mismatch error and exits 2
+/// otherwise prints the required mode-mismatch error and exits 2
 /// (clap's misuse convention).
 ///
 /// The error wording — `"sandbox workspace push/pull only applies to
-/// local: workspaces; this session uses <mode>"` — comes from spec
-/// § Push/pull commands → Errors. The `<mode>` token is `shared`,
-/// `clone`, or `<empty>` when `workspace_mode_detail` is absent.
+/// local: workspaces; this session uses <mode>"` — uses `<mode>` =
+/// `shared`, `clone`, or `<empty>` when `workspace_mode_detail` is absent.
 fn require_local_workspace(session: &SessionDto) -> (String, String) {
     use sandbox_core::WorkspaceModeDetailDto;
     match &session.config.workspace_mode_detail {
@@ -4729,8 +4727,7 @@ fn require_local_workspace(session: &SessionDto) -> (String, String) {
 /// sessions fail fast here so the daemon-side lock acquire isn't
 /// even attempted.
 ///
-/// Exit code 1 mirrors the spec § Push/pull commands → Errors line
-/// "Session not running → exit code 1".
+/// Exit code 1: "Session not running → exit code 1".
 fn require_running_session(session: &SessionDto) {
     use sandbox_core::session::SessionState;
     if session.state != SessionState::Running {
@@ -4754,7 +4751,7 @@ fn require_running_session(session: &SessionDto) {
 ///
 /// The lock acquire is the *atomic* state-gate: between this call and
 /// the matching release, the daemon refuses competing acquires and
-/// also refuses `stop`/`rm` on the same session. See spec § Workspace
+/// also refuses `stop`/`rm` on the same session. See
 /// lock → Lifecycle interaction.
 async fn acquire_workspace_lock(
     socket_path: &str,
@@ -4802,8 +4799,7 @@ async fn acquire_workspace_lock(
 /// `DELETE /sessions/<id>/workspace-lock`. Best-effort: release
 /// failures log to stderr but do not modify the caller's intended
 /// exit code (typically rsync's). The daemon treats an already-
-/// unlocked session as a no-op 200 (idempotent DELETE semantics per
-/// spec § API endpoints).
+/// unlocked session as a no-op 200 (idempotent DELETE semantics).
 ///
 /// `force` is the operator's `--force` opt-in: with `force == true`,
 /// the daemon bypasses the token-match check. The CLI release on the
@@ -4951,7 +4947,7 @@ fn release_workspace_lock_blocking(socket_path: &str, session: &str, lock_token:
 /// the `tokio::select!` race release inline before exiting with the
 /// conventional `128 + signo` exit code; they then forget the guard so
 /// the cleanup does not double-fire. Release failures degrade to a
-/// stderr warning per spec § Push/pull commands — never masking the
+/// stderr warning per the design
 /// rsync exit code. Operators have `sandbox workspace unlock --force`
 /// as the manual recovery path if the daemon was unreachable.
 #[allow(clippy::too_many_arguments)] // each arg maps to a distinct clap flag
@@ -4986,7 +4982,7 @@ async fn run_workspace_push_or_pull(
                 };
                 // Existing-file rejection: `--dest` must name a
                 // directory (existing or to-be-created), never a
-                // regular file. Spec § CLI shape: `Existing file at
+                // regular file.
                 // --dest → Rejected with an error before rsync is
                 // spawned`.
                 let dest_path = Path::new(&expanded);
@@ -5000,7 +4996,7 @@ async fn run_workspace_push_or_pull(
                     }
                 }
                 // `create_dir_all(dirname(dest))` lets rsync create
-                // the leaf itself. Spec § CLI shape: "the CLI does
+                // the leaf itself.
                 // create_dir_all(dirname(<--dest>)) before spawning
                 // rsync; rsync creates the leaf itself."
                 if let Some(parent) = dest_path.parent() {
@@ -5122,9 +5118,9 @@ async fn run_workspace_push_or_pull(
     //
     // We deliberately do NOT install handlers for arbitrary other
     // signals — uncaught SIGKILL still strands the lock, but no
-    // user-space code can intercept SIGKILL; that's the contract the
-    // spec calls out via the `sandbox workspace unlock --force`
-    // operator escape hatch and the daemon-restart auto-clear.
+    // user-space code can intercept SIGKILL. The `sandbox workspace
+    // unlock --force` operator escape hatch and daemon-restart auto-clear
+    // are the recovery paths for a stranded lock.
     let ctrlc = tokio::signal::ctrl_c();
     tokio::pin!(ctrlc);
 
@@ -5140,7 +5136,7 @@ async fn run_workspace_push_or_pull(
             // only the SIGTERM-explicit exit code, not the lock
             // release. The lock is reclaimed when the process
             // dies anyway because daemon-side locks are
-            // in-memory and reset on daemon restart per spec.
+            // in-memory and reset on daemon restart as designed.
             tracing::warn!(error = %e, "could not install SIGTERM handler");
             None
         }
@@ -5293,10 +5289,10 @@ async fn handle_workspace_pull(
 /// mismatch and returns 409 if the lock is currently held — the
 /// operator must `--force` to clear an orphan lock. With `--force`,
 /// the daemon releases unconditionally. The already-unlocked case is
-/// a 200 idempotent no-op per spec § API endpoints → Idempotent on
+/// a 200 idempotent no-op per the design
 /// already-unlocked.
 ///
-/// Per spec § Orchestrator decisions Q6: the empty-string lock_token
+/// Per
 /// is the documented sentinel for `unlock` without `--force`; the
 /// daemon's `LockToken::from_str` rejects it as unparseable and
 /// adjudicates as "wrong token".
@@ -5671,7 +5667,7 @@ async fn check_base_image_staleness(socket_path: &str) {
 /// hidden subcommand. Returns the process exit code; the caller
 /// `process::exit`s on it.
 ///
-/// Spec 5 § 4.3 access-gating block — four refusal arms applied in
+/// Access-gating block — four refusal arms applied in
 /// order. The first match wins (we don't continue to deeper checks if
 /// the caller is unprivileged, etc.).
 fn handle_apply_config_migration(file_arg: &str, migration_arg: &str, out_arg: &str) -> i32 {
@@ -5690,8 +5686,7 @@ enum ApplyGateOutcome {
 }
 
 /// Pure access-gate function used by the unit tests to verify each
-/// refusal arm's stderr substring. Mirrors the four arms in Spec 5
-/// § 4.3 exactly.
+/// refusal arm's stderr substring.
 fn apply_config_migration_gate(
     file_arg: &str,
     migration_arg: &str,
@@ -5840,8 +5835,8 @@ fn parse_migration_id(raw: &str) -> Option<u32> {
     tail.parse::<u32>().ok()
 }
 
-/// `--dump-migration-set` handler. Writes the JSON shape pinned in
-/// Spec 5 § 3.1.4 to stdout. Read-only; exits `0` on success.
+/// `--dump-migration-set` handler. Writes the migration set JSON
+/// to stdout. Read-only; exits `0` on success.
 fn handle_dump_migration_set() -> i32 {
     let entries = sandbox_cli::cfg_migrations::dump_migration_set();
     match serde_json::to_string(&entries) {
@@ -5861,7 +5856,7 @@ fn handle_dump_migration_set() -> i32 {
 /// `sandbox_core::guest::DAEMON_GUEST_PROTO_VERSION`. Invoked by the
 /// `sandbox update` pre-flight against the *staged* (target-version)
 /// CLI binary so it can classify each persisted session against the
-/// upgrade target's protocol constant (Spec 5 § 3.1.7). Read-only;
+/// upgrade target's protocol constant. Read-only;
 /// exits `0` on success.
 fn handle_dump_proto_version() -> i32 {
     let payload = serde_json::json!({
@@ -5881,7 +5876,7 @@ fn handle_dump_proto_version() -> i32 {
 
 /// Per-backend dispatcher for `sandbox rebuild-image`.
 ///
-/// Spec § "`rebuild-image`: extend the existing flat command" requires
+///  requires
 /// fanning out one HTTP call per selected backend, prefixing per-
 /// backend errors with `rebuild-image[<kind>]:`, and exiting non-zero
 /// if any selected backend fails. The fan-out is best-effort —
@@ -5894,7 +5889,7 @@ fn handle_dump_proto_version() -> i32 {
 /// - At least one backend fails → exit 1 (after attempting every
 ///   selected backend).
 async fn dispatch_rebuild_image(socket_path: &str, backend: RebuildImageBackend, no_cache: bool) {
-    // Spec 5 § 8.1: `--backend gateway` is refused client-side with
+    // `--backend gateway` is refused client-side with
     // exit code 2 and a verbatim pointer at `sandbox update`. The
     // refusal must fire before any HTTP request is built; the unit
     // test `rebuild_image_gateway_backend_refuses_with_pointer_to_update`
@@ -5921,7 +5916,7 @@ async fn dispatch_rebuild_image(socket_path: &str, backend: RebuildImageBackend,
 }
 
 /// Outcome of [`run_rebuild_image_dispatch`]. Two return signals: the
-/// per-backend stderr lines (already formatted with the spec's
+/// per-backend stderr lines (already formatted with the
 /// `rebuild-image[<kind>]:` prefix) and a final all-or-some flag that
 /// drives the exit code.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -5929,7 +5924,7 @@ struct RebuildDispatchOutcome {
     /// `true` iff every selected backend's HTTP call succeeded.
     all_ok: bool,
     /// One stderr line per backend, in dispatch order. Pre-formatted
-    /// per spec (`rebuild-image[<kind>]: ...` for failures, plain
+    /// as designed (`rebuild-image[<kind>]: ...` for failures, plain
     /// status for successes).
     lines: Vec<String>,
 }
@@ -6020,17 +6015,17 @@ async fn send_rebuild_image_request(
 /// Pre-flight gate for `sandbox create`.
 ///
 /// Runs the work that must happen before the daemon is contacted, in
-/// the order the spec mandates:
+/// the order the design mandates:
 ///
 /// 1. Resolve the backend across the five-tier precedence chain
 ///    (`--lite`, `--backend`, env, config, hardcoded Lima).
 /// 2. If the resolved backend is `Container` and `--no-cache` is set,
-///    render the spec's three-line error and exit 2 — this never
+///    render the three-line error and exit 2 — this never
 ///    reaches the daemon.
 /// 3. Lazily fetch `/backends` once via [`BackendsCache`] and project
 ///    the operator's flags into a [`sandbox_core::SessionSpec`].
 /// 4. Run [`sandbox_core::SessionSpec::validate`] against the cached capabilities;
-///    on `Err`, render the spec's `error:`+`help:` shape and exit 2.
+///    on `Err`, render the `error:`+`help:` shape and exit 2.
 ///
 /// Returns `Ok(())` when every gate passes; the caller proceeds to
 /// build the request body and send it. Errors short-circuit by calling
@@ -6060,7 +6055,7 @@ async fn dispatch_create_preflight(
     cli_config_xdg_override: Option<&Path>,
 ) -> sandbox_core::BackendKind {
     // Tier 4 of the precedence chain — load the per-user CLI config.
-    // Spec § "CLI & UX → Config file" treats a missing file as not-an-
+    //  treats a missing file as not-an-
     // error and a malformed file as a hard error with a path pointer.
     let cli_config = match load_cli_config(cli_config_xdg_override) {
         Ok(c) => c,
@@ -6070,7 +6065,7 @@ async fn dispatch_create_preflight(
         }
     };
 
-    // Run the spec's five-tier resolver against the actual env + the
+    // Run the five-tier resolver against the actual env + the
     // loaded config.
     let inputs = BackendResolutionInputs {
         lite_flag,
@@ -6086,7 +6081,7 @@ async fn dispatch_create_preflight(
         }
     };
 
-    // Spec § "Isolation warning" (lines 751-762): every container-
+    //  (lines 751-762): every container-
     // backed create prints a per-invocation warning to stderr **before**
     // the daemon round-trip. Lima creates emit nothing — the helper
     // returns an empty string in that case, so the unconditional
@@ -6096,10 +6091,10 @@ async fn dispatch_create_preflight(
     // unreachable.
     eprint!("{}", render_isolation_warning(resolved_backend));
 
-    // Spec § "CLI & UX → `sandbox create --no-cache` is forbidden on
+    //
     // container": the rejection runs *before* the daemon is
     // contacted. Mirrors the daemon-side gate (which lives in
-    // `SessionSpec::validate` once SessionSpec carries no_cache) but
+    // `SessionSpec::validate` once SessionSpeccarries no_cache) but
     // executes earlier so the operator never burns a round-trip.
     if no_cache && resolved_backend == sandbox_core::BackendKind::Container {
         eprint!("{}", render_no_cache_rejection_for_container(lite_flag));
@@ -6108,7 +6103,7 @@ async fn dispatch_create_preflight(
 
     // `--force-rootless-docker` is the operator's per-invocation
     // opt-in to allow session-create on a rootless Docker host
-    // (spec § Non-goals 1195); it is only meaningful for the
+    // it is only meaningful for the
     // container backend. Combining it with a resolved Lima backend
     // is operator confusion the CLI rejects up-front so the daemon
     // never sees a malformed request. Same shape as the
@@ -6146,7 +6141,7 @@ async fn dispatch_create_preflight(
         }
     };
 
-    // Project the args into a SessionSpec for validation.
+    // Project the args into a SessionSpecfor validation.
     let workspace_mode = workspace.and_then(|raw| {
         // The full validation of `--workspace` (path exists, is
         // absolute, etc.) lives later in `build_request` to preserve
@@ -6182,7 +6177,7 @@ async fn dispatch_create_preflight(
         // The CLI runs its own dedicated `--no-cache`/Container reject
         // (`render_no_cache_rejection_for_container`) before this
         // `SessionSpec::validate` call, so threading the value through
-        // here would only duplicate that gate. Leave the spec field as
+        // here would only duplicate that gate. Leave the design field as
         // `None` — the daemon-side validate does the authoritative
         // check via the request's `no_cache` field.
         no_cache: None,
@@ -6221,8 +6216,7 @@ async fn main() {
     // inside `send_request_with_timeout`: the operator should always
     // be able to ask "what version of the CLI do I have?" without a
     // running daemon and without being refused by a skew. Output
-    // format is the same `<name> <semver>\n` pin as `sandbox --version`
-    // (spec § 7.6).
+    // format is the same `<name> <semver>\n` pin as `sandbox --version`.
     if matches!(cli.command, Command::Version) {
         println!("sandbox {}", env!("CARGO_PKG_VERSION"));
         return;
@@ -6236,7 +6230,7 @@ async fn main() {
     // probes `/version` directly via its C3 check; the comparison is
     // surfaced as a `Fail` row, not a refusal.
     //
-    // Exit code semantics (spec § 6.4):
+    // Exit code semantics:
     //   `0` — every check pass or skip
     //   `1` — at least one check fails
     //   `2` — doctor itself couldn't run (socket path unresolvable,
@@ -6251,9 +6245,9 @@ async fn main() {
         }
     }
 
-    // Hidden affordances for `sandbox update` orchestration (Spec 5
-    // § 4.3 / § 3.1.4). Both dispatch entirely client-side — no
-    // socket access — so route them before any other branch.
+    // Hidden affordances for `sandbox update` orchestration.
+    // Both dispatch entirely client-side — no socket access — so route
+    // them before any other branch.
     if let Command::ApplyConfigMigration {
         file,
         migration,
@@ -6439,11 +6433,11 @@ async fn main() {
         }
     }
 
-    // rebuild-image fans out one HTTP call per selected backend
-    // (spec § "rebuild-image"). The single-call
+    // rebuild-image fans out one HTTP call per selected backend.
+    // The single-call
     // build_request / send_request flow does not fit a multi-call
     // command, so the dispatcher owns the full request loop, error
-    // formatting (`rebuild-image[<kind>]: <msg>` per spec), and
+    // formatting (`rebuild-image[<kind>]: <msg>` as designed), and
     // exit-code mapping ("non-zero exit if any selected backend
     // fails").
     if let Command::RebuildImage { backend, no_cache } = &cli.command {
@@ -6452,10 +6446,9 @@ async fn main() {
     }
 
     // `sandbox update` runs its own orchestration loop (pre-flight,
-    // confirmation prompt, stateful steps). Spec 5 § 2.2 / § 2.3 pin
-    // its exit-code semantics (0 / 1 / 2 / 3); `update::run` returns
-    // the exit code as a `process::ExitCode`, which `process::exit`
-    // here forwards verbatim.
+    // confirmation prompt, stateful steps); exit-code semantics
+    // (0 / 1 / 2 / 3) are defined by `update::run`, which returns the
+    // exit code as a `process::ExitCode` forwarded verbatim here.
     if let Command::Update {
         version,
         from,
@@ -6489,7 +6482,7 @@ async fn main() {
     // Create has a dedicated dispatch path because the request body
     // depends on a backend choice that is the output
     // of an async preflight (config load → resolver → /backends fetch
-    // → SessionSpec validation). Running it here keeps `build_request`
+    // → SessionSpecvalidation). Running it here keeps `build_request`
     // sync for every other command and confines the new logic to one
     // explicit branch.
     let req = if let Command::Create {
@@ -7718,7 +7711,7 @@ mod tests {
     // -- Rebuild-image tests --------------------------------------------------
 
     /// Default invocation: `--backend` defaults to `all`, `--no-cache`
-    /// defaults to `false` (spec § "rebuild-image": defaults).
+    /// defaults to `false`.
     #[test]
     fn parse_rebuild_image_defaults_to_all_no_cache_false() {
         let cli = Cli::parse_from(["sandbox", "rebuild-image"]);
@@ -7731,7 +7724,7 @@ mod tests {
         }
     }
 
-    /// `--backend container --no-cache` is the spec's example shape;
+    /// `--backend container --no-cache` is the example shape;
     /// pin both fields make it through the parser.
     #[test]
     fn parse_rebuild_image_backend_container_no_cache() {
@@ -7808,7 +7801,7 @@ mod tests {
         }
     }
 
-    /// Spec § "rebuild-image": `--backend all` issues two HTTP
+    /// : `--backend all` issues two HTTP
     /// requests in Lima-then-Container order, each with the per-
     /// backend JSON body.
     #[tokio::test]
@@ -7821,7 +7814,7 @@ mod tests {
         assert_eq!(calls.len(), 2, "all → two HTTP calls");
         assert_eq!(calls[0].0, sandbox_core::backend::BackendKind::Lima);
         assert_eq!(calls[1].0, sandbox_core::backend::BackendKind::Container);
-        // Spec § "rebuild-image": JSON wire body carries the resolved
+        // : JSON wire body carries the resolved
         // backend kind plus no_cache.
         let lima_body: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
         assert_eq!(lima_body["backend"], serde_json::json!("lima"));
@@ -7832,7 +7825,7 @@ mod tests {
     }
 
     /// Per-backend errors must be prefixed with `rebuild-image[<kind>]:`
-    /// (spec § "rebuild-image"); a single failing backend forces
+    /// A single failing backend forces
     /// `all_ok = false`, but remaining backends still run (best-effort
     /// dispatch — operator sees every error in one invocation).
     #[tokio::test]
@@ -7849,7 +7842,7 @@ mod tests {
         assert!(!outcome.all_ok, "any failure flips all_ok to false");
         // Both backends were still attempted (best-effort dispatch).
         assert_eq!(recorder.lock().unwrap().len(), 2);
-        // Lima line carries the spec's prefix shape and the daemon's
+        // Lima line carries the prefix shape and the daemon's
         // raw error message.
         assert!(
             outcome
@@ -8126,7 +8119,7 @@ mod tests {
 
     // Visual regression harness: render a realistic multi-rule example and
     // eprint it (invisible under normal test runs, visible under
-    // `--no-capture`). Keeps the spec sample near the implementation.
+    // `--no-capture`). Keeps the design sample near the implementation.
     #[test]
     fn describe_visual_preview() {
         let policy = PolicyDto {
@@ -8441,7 +8434,7 @@ mod tests {
     }
 
     /// Default-view `describe` (no `-v`) must show `Backend:` adjacent
-    /// to `State:` per spec § "sandbox inspect → Default view".
+    /// to `State:` per.
     #[test]
     fn describe_default_view_shows_backend_in_session_block() {
         let mut dto = make_session_dto("abcdef012345", Some("lite-box"), None, chrono::Utc::now());
@@ -9030,7 +9023,7 @@ mod tests {
         .await;
 
         let err = result.expect_err("expected a missing-session error");
-        // Spec: "names the first missing id". Here "missing-one" is the
+        // The error names the first missing id. Here "missing-one" is the
         // only missing one; the error string must contain its id.
         assert!(
             err.contains("missing-one"),
@@ -9681,7 +9674,7 @@ mod tests {
             true,
         );
         assert_eq!(program, "docker");
-        // Spec § "Lifecycle" — `docker exec -it <ctr> <cmd>...`. No
+        //  — `docker exec -it <ctr> <cmd>...`. No
         // `--` separator: docker exec parses positional args after the
         // container name as the command.
         assert_eq!(
@@ -10501,7 +10494,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // CLI ↔ daemon strict version-equality handshake (spec § 7.1, § 11.3).
+    // CLI ↔ daemon strict version-equality handshake.
     //
     // `check_daemon_version_equality` is the equality predicate
     // `send_request_with_timeout` calls after `GET /version`; on `Ok`
@@ -10532,7 +10525,7 @@ mod tests {
     fn version_handshake_refuses_on_skew_with_verbatim_stderr() {
         // The four tokens `version mismatch`, `CLI is`, `daemon is`,
         // and `both must match` are load-bearing — the integration
-        // test in spec § 11.6 greps for them, and downstream scripts
+        // test in.6 greps for them, and downstream scripts
         // may match the wording to surface a friendly upgrade hint.
         let err = check_daemon_version_equality("1.0.3", "1.0.4")
             .expect_err("skewed pair must fail the equality predicate");
@@ -10559,7 +10552,7 @@ mod tests {
         // routes the `Err` to stderr and then exits.
         assert_eq!(
             CLI_VERSION_MISMATCH_EXIT_CODE, 2,
-            "version-mismatch exit code is pinned to 2 by spec § 7.3"
+            "version-mismatch exit code is pinned to 2 by.3"
         );
     }
 
@@ -10605,10 +10598,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // `sandbox --version` output format pin (spec § 7.6).
+    // `sandbox --version` output format pin.
     //
     // The format is `sandbox <semver>\n` — exactly two space-separated
-    // tokens, with the semver in column 2. Spec 4 § 4.4.5's
+    // tokens, with the semver in column 2. the documented contract.5's
     // half-installed-state detection parses the output with
     // `awk '{print $2}'`; a regression that adds a trailing token
     // (build SHA, commit hash, ...) would silently break that parse.
@@ -10618,20 +10611,20 @@ mod tests {
     fn sandbox_version_flag_produces_pinned_two_token_line() {
         // clap derives the `--version` output from `#[command(name,
         // version)]` — we render it here through the same builder and
-        // assert the exact `<name> <semver>\n` shape spec § 7.6 pins.
+        // assert the exact `<name> <semver>\n` shape.6 pins.
         use clap::CommandFactory;
         let rendered = Cli::command().render_version();
         assert_eq!(
             rendered,
             format!("sandbox {}\n", env!("CARGO_PKG_VERSION")),
-            "spec § 7.6 pins the output to exactly `sandbox <semver>\\n`; \
-             any trailing token (build SHA, etc.) silently breaks Spec 4's \
-             `awk '{{print $2}}'` parse"
+            "`sandbox --version` must output exactly `sandbox <semver>\\n`; \
+             any trailing token (build SHA, etc.) silently breaks \
+             the `awk '{{print $2}}'` version-extract pattern"
         );
     }
 
     // -----------------------------------------------------------------------
-    // Spec 5 § 8.1 — `rebuild-image --backend gateway` refusal.
+    // `rebuild-image --backend gateway` refusal.
     // -----------------------------------------------------------------------
 
     /// Pin the `Gateway` variant parses, and the refusal text is
@@ -10662,11 +10655,11 @@ mod tests {
     // `src/main.rs`). The unit-level surface is covered by
     // `parse_rebuild_image_backend_gateway` (variant parses) above.
 
-    /// Spec 5 § 9.2 — `rebuild_image_container_backend_sends_correct_body`.
+    /// Test: `rebuild_image_container_backend_sends_correct_body`.
     /// Regression: the existing dispatch test already pins the wire
     /// body shape (see `dispatch_rebuild_image_container_only_fires_once`
     /// elsewhere in this module); this test names the assertion under
-    /// the spec's exact label so the spec's § 9.2 row maps 1:1 to a
+    /// the exact label so the design rows map 1:1 to a
     /// test function name.
     #[tokio::test]
     async fn rebuild_image_container_backend_sends_correct_body() {
@@ -10682,7 +10675,7 @@ mod tests {
         assert_eq!(body["no_cache"], serde_json::json!(false));
     }
 
-    /// Spec 5 § 9.2 — `rebuild_image_lima_backend_sends_correct_body`.
+    /// Test: `rebuild_image_lima_backend_sends_correct_body`.
     #[tokio::test]
     async fn rebuild_image_lima_backend_sends_correct_body() {
         let recorder = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -10698,7 +10691,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Spec 5 § 4.3 — `--apply-config-migration` access gating.
+    // `--apply-config-migration` access gating.
     //
     // Four refusal arms, applied in order. Tests drive the inner
     // function with an injected euid so we can exercise the non-root
@@ -10706,8 +10699,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Helper: drive the access gate and assert it produced a refusal
-    /// whose message carries the given substring. Each refusal arm in
-    /// § 4.3 names a load-bearing substring that we pin here.
+    /// whose message carries the given substring. Each refusal arm
+    /// names a load-bearing substring that we pin here.
     fn assert_gate_refuses_with(
         file_arg: &str,
         migration_arg: &str,
@@ -10728,7 +10721,7 @@ mod tests {
         }
     }
 
-    /// Spec 5 § 9.2 `apply_config_migration_refuses_non_root_caller`.
+    /// Test: `apply_config_migration_refuses_non_root_caller`.
     /// Pins the `requires root` substring from arm 1.
     #[test]
     fn apply_config_migration_refuses_non_root_caller() {
@@ -10741,7 +10734,7 @@ mod tests {
         );
     }
 
-    /// Spec 5 § 9.2 `apply_config_migration_refuses_non_canonical_file`.
+    /// Test: `apply_config_migration_refuses_non_canonical_file`.
     /// Pins the `canonical paths` substring from arm 2.
     #[test]
     fn apply_config_migration_refuses_non_canonical_file() {
@@ -10754,7 +10747,7 @@ mod tests {
         );
     }
 
-    /// Spec 5 § 9.2 `apply_config_migration_refuses_arbitrary_out_path`.
+    /// Test: `apply_config_migration_refuses_arbitrary_out_path`.
     /// Pins the `tempfile under the same directory as --file`
     /// substring from arm 3.
     #[test]
@@ -10768,7 +10761,7 @@ mod tests {
         );
     }
 
-    /// Spec 5 § 9.2 `apply_config_migration_refuses_unknown_migration_id`.
+    /// Test: `apply_config_migration_refuses_unknown_migration_id`.
     /// Pins the `not found in registry` substring from arm 4.
     #[test]
     fn apply_config_migration_refuses_unknown_migration_id() {
@@ -10794,10 +10787,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Spec 5 § 3.1.4 — `--dump-migration-set`.
+    // `--dump-migration-set`.
     // -----------------------------------------------------------------------
 
-    /// Spec 5 exit-criteria #9: `sandbox dump-migration-set` exits 0
+    /// the install framework exit-criteria #9: `sandbox dump-migration-set` exits 0
     /// and prints a JSON array. Unit-tested at the handler level
     /// here; the subprocess shape (which exercises `process::exit(0)`)
     /// lives in `tests/integration_cfg_migrations_cli.rs`.
@@ -10820,14 +10813,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Spec 5 § 3.1.7 — `--dump-proto-version`.
+    // `--dump-proto-version`.
     // -----------------------------------------------------------------------
 
     /// `--dump-proto-version` emits the single-field
     /// `{ "daemon_guest_proto_version": <u32> }` payload carrying this
     /// binary's `DAEMON_GUEST_PROTO_VERSION`. The shape is the
     /// operator-stable contract the update pre-flight depends on for
-    /// per-session compat classification (§ 3.1.7). Subprocess shape
+    /// per-session compat classification. Subprocess shape
     /// lives in `tests/integration_cfg_migrations_cli.rs`.
     #[test]
     fn dump_proto_version_payload_carries_daemon_proto_const() {
@@ -10860,7 +10853,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Helper: build a baseline plan with the given (direction, force,
-    /// dry_run) tuple. Other fields take spec-mandated defaults so the
+    /// dry_run) tuple. Other fields take required defaults so the
     /// per-test override block stays small.
     fn baseline_workspace_plan(
         direction: WorkspaceSyncDirection,
@@ -10883,8 +10876,7 @@ mod tests {
     }
 
     /// Push, Lima backend, force-mode, no extras: argv pins the
-    /// canonical baseline shape. The wire layout follows spec §
-    /// Push/pull commands → Argv layout: `rsync -aL --delete
+    /// canonical baseline shape. Argv layout: `rsync -aL --delete
     /// --filter=':- .gitignore' -e <shell> <src> <dst>`.
     #[test]
     fn plan_push_force_lima() {

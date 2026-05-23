@@ -173,7 +173,7 @@ class LiteBackendHarness:
     # ------------------------------------------------------------------ #
 
     def assert_rootfs_readonly(self, session_id: str) -> None:
-        """Spec § Hardening: rootfs is mounted read-only.
+        """
 
         Writes to ``/`` must fail with a "read-only file system"-shaped
         error, both for the bare path and for typical system paths.
@@ -203,7 +203,7 @@ class LiteBackendHarness:
         )
 
     def assert_no_dind(self, session_id: str) -> None:
-        """Spec § Hardening: Docker-in-Docker is blocked.
+        """
 
         Two complementary checks:
 
@@ -228,7 +228,7 @@ class LiteBackendHarness:
         )
 
     def assert_no_userns(self, session_id: str) -> None:
-        """Spec § Hardening: ``unshare --user`` is blocked.
+        """
 
         ``cap-drop=ALL`` removes ``CAP_SYS_ADMIN``, so creating a new
         user namespace fails with EPERM. Probe via ``unshare --user

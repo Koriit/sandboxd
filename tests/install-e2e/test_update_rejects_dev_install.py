@@ -1,4 +1,4 @@
-"""`sandbox update` refuses on dev installs — Spec 5 § 11.
+"""`sandbox update` refuses on dev installs — the install framework.
 
 A dev install is detected by either:
 
@@ -62,7 +62,7 @@ def test_update_rejects_dev_install(
         f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
     )
     combined = r.stdout + r.stderr
-    # Anchored on Spec 5 § 11's documented refusal text.
+    # Anchored on the install framework.
     for marker in (
         "system installs only",
         "/etc/systemd/system/sandboxd.service",

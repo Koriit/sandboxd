@@ -1,5 +1,5 @@
 """Two concurrent `sandbox update` runs — second refuses with the
-"another update is in progress" message — Spec 5 §§ 6.2, 9.1.
+"another update is in progress" message — the install framework.2, 9.1.
 
 The first invocation acquires the kernel ``flock`` on
 ``/var/lib/sandbox/.update.lock`` and writes the JSON payload (PID,
@@ -86,16 +86,16 @@ def test_update_concurrent_refused(
 
     # Synthesise a held lock: a background `flock -n <lock> sleep 60`
     # holds the kernel flock. We write the payload first (mode 0664
-    # owner sandbox:sandbox per Spec 5 § 10.1), then hand the FD to flock.
+    # owner sandbox:sandbox per the install framework.1), then hand the FD to flock.
     #
     # `started_at` is rendered dynamically as "5 minutes ago" so the
     # payload appears RECENT against the lock's 24-hour staleness
-    # threshold (Spec § 6.2.3 — `AdoptStale` fires for payloads older
+    # threshold (
     # than 24h). A fixed timestamp like "2026-05-12T00:00:00Z" was
     # safe when first written but drifts past 24h as the calendar
     # advances, eventually crossing the adopt-vs-adopt-stale
     # boundary. The dynamic value pins the test against the
-    # `HeldByLivePid` refusal path the spec contract names; an
+    # `HeldByLivePid` refusal path the design contract names; an
     # adopt-stale outcome would mean a different code path which
     # this test is not designed to exercise.
     started_at = vm.shell(
@@ -171,7 +171,7 @@ exit $RC
         f"`sandbox update` should have refused while flock was held; "
         f"got exit 0\nstdout:\n{r.stdout}\nstderr:\n{r.stderr}"
     )
-    # Spec § 6.2: `LockError::HeldByLivePid` surfaces via `eprintln!`
+    # 
     # (the CLI's standard error-rendering path), so the refusal
     # message must land on STDERR only — stdout should be empty
     # modulo any `log_step` lines that fire before the lock probe.
@@ -183,7 +183,7 @@ exit $RC
         and "update" in r.stderr
         and "in progress" in r.stderr
     ), (
-        f"refusal message must land on stderr (spec § 6.2 — error rendering via "
+        f"refusal message must land on stderr (.2 — error rendering via "
         f"eprintln!); missing 'another ... update ... in progress' marker.\n"
         f"stderr:\n{r.stderr}\nstdout (for diagnostic context only):\n{r.stdout}"
     )

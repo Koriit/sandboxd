@@ -11,7 +11,7 @@
 //!
 //! ## Why container-only at the runtime layer
 //!
-//! Spec § 11.4 lists both
+//!
 //! `integration_shared_guest_path_lima` and
 //! `integration_shared_guest_path_container`. The Lima half requires
 //! booting a real VM (the 9p mount is materialised at boot time, not
@@ -202,7 +202,7 @@ fn container_spec() -> SessionSpec {
             memory_mb: 256,
             cpus: 1.0,
         },
-        // The workspace_mode field on the SessionSpec is informational
+        // The workspace_mode field on the SessionSpecis informational
         // at the runtime layer; the actual bind comes from
         // `ContainerNetwork.workspace_bind`. We leave it as None here
         // so the runtime takes the same code path the daemon does
@@ -236,7 +236,7 @@ fn docker_exec_capture(container_name: &str, argv: &[&str]) -> String {
 // Test: container backend honours operator-supplied `:<guest_path>`
 // ---------------------------------------------------------------------------
 
-/// Spec § 11.4 — `integration_shared_guest_path_container`.
+/// .
 ///
 /// Create a host tempdir with known contents. Boot a container with
 /// `ContainerNetwork.workspace_bind = Some(WorkspaceBind { host_path:
@@ -254,7 +254,7 @@ fn docker_exec_capture(container_name: &str, argv: &[&str]) -> String {
 /// The guest path `/home/agent/work` is chosen because the alpine
 /// fixture writable area extends across the rootfs (no read-only
 /// mount). The production lite image is `--read-only` with writable
-/// areas at `/home/agent/`, `/tmp/`, and `/run/`; the spec's
+/// areas at `/home/agent/`, `/tmp/`, and `/run/`; the
 /// constraint that the container backend requires the guest path
 /// live inside a writable area is honoured by picking a `/home/agent/`
 /// child path here.
@@ -513,8 +513,8 @@ async fn http_post_json(
     .unwrap_or_else(|_| panic!("HTTP request timed out after {timeout:?}"))
 }
 
-/// HTTP-boundary pin for the spec § "Container Backend / Shared
-/// bind-mount" rejection: the container backend has no 9p layer, so
+/// HTTP-boundary pin for the container backend shared bind-mount
+/// rejection: the container backend has no 9p layer, so
 /// any operator-supplied `:<security_model>` token (e.g.
 /// `shared:/tmp:none`) must be refused with 400 +
 /// `SandboxError::InvalidArgument`. The mapper at
@@ -567,7 +567,7 @@ async fn integration_container_rejects_security_model() {
             panic!("rejection body must have a top-level `error` string; got: {parsed}")
         });
 
-    // Spec § "Container Backend / Shared bind-mount" — the rejection
+    //  — the rejection
     // message must name the offending field so the operator can map
     // the error back to their `--workspace shared:…:<model>` invocation.
     assert!(

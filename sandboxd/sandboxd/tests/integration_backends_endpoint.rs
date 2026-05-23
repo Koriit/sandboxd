@@ -4,9 +4,8 @@
 //! `tower::ServiceExt::oneshot` against a `BackendsApiState` populated
 //! with a real `LimaRuntime`. The router is the same one
 //! `sandboxd::main::app` merges into the top-level router, so this test
-//! pins the wire shape the CLI deserializes (spec § "CLI learns
-//! capabilities via `GET /backends`") without booting Lima/gateway/
-//! network/CA-manager.
+//! pins the wire shape the CLI deserializes via `GET /backends`
+//! without booting Lima/gateway/network/CA-manager.
 //!
 //! Test names start with `integration_backends_endpoint_` so they are
 //! selected by the `integration` nextest profile (see
@@ -73,7 +72,7 @@ async fn integration_backends_endpoint_lists_registered_backends_in_stable_order
     assert_eq!(infos[0].capabilities.kind, BackendKind::Lima);
     assert_eq!(infos[0].capabilities.isolation, IsolationLevel::Vm);
 
-    // Spec wire format: top-level array of `{kind, capabilities}`
+    // Wire format: top-level array of `{kind, capabilities}`
     // objects with lowercase backend tags. Re-parse as untyped JSON so
     // a stray `#[serde(tag = ...)]` on `BackendInfo` is caught here
     // even if `BackendInfo`'s own deserializer would tolerate it.

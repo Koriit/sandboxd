@@ -24,7 +24,7 @@
 //!
 //! - `integration_workspace_lock_push_blocks_pull` — Daemon HTTP path:
 //!   acquire `op=push` → 200 with token; acquire `op=pull` → 409 with
-//!   the spec-pinned `"active push operation"` token; release with the
+//!   the design-pinned `"active push operation"` token; release with the
 //!   first token → 200; re-acquire `op=pull` → 200.
 //!
 //! - `integration_workspace_lock_blocks_stop` — Daemon HTTP path:
@@ -49,15 +49,14 @@
 //!
 //! - `integration_workspace_lock_acquire_rejected_when_not_running` —
 //!   Daemon HTTP path: seed a session in `Creating` state (not
-//!   `Running`); acquire → 400 with the spec-verbatim wording
+//!   `Running`); acquire → 400 with the design-verbatim wording
 //!   `"session is in state ...; workspace operations require Running"`.
 //!   Pins the state-gate.
 //!
 //! ## Workspace-mode choice for tests 2-7
 //!
-//! Per the spec § Workspace lock → API endpoints (the acquire
-//! handler's only precondition is `state == Running`, not workspace
-//! mode), tests 2-7 seed a session row directly into `SessionStore`
+//! The acquire handler's only precondition is `state == Running`, not workspace
+//! mode, so tests 2-7 seed a session row directly into `SessionStore`
 //! with the default `SessionConfig` (no workspace mode) and
 //! force-transition it to `Running` via
 //! `SessionStore::update_state_reconcile`. There is no real container
@@ -621,7 +620,7 @@ fn container_spec() -> SessionSpec {
     }
 }
 
-/// Spec § Tests → Integration tests — `integration_container_local_pull`.
+/// .
 ///
 /// Seed contents inside the guest by `docker exec`-ing `mkdir` +
 /// `tee`. Then invoke the host-side `rsync` client against
@@ -631,8 +630,7 @@ fn container_spec() -> SessionSpec {
 /// `workspace_rsync::run_initial_push` uses for the push direction).
 /// Verify the host tempdir mirrors the guest tree.
 ///
-/// Container backend only — the Lima half is deferred to E2E per
-/// orchestrator decision Q5 (master plan § 7).
+/// Container backend only — the Lima half is deferred to E2E.
 #[tokio::test]
 async fn integration_container_local_pull() {
     ensure_local_ws_image();
@@ -690,9 +688,8 @@ async fn integration_container_local_pull() {
     //         -e "docker exec -i"
     //         sandbox-<id>:/home/agent/work/  <host_dst>/
     //
-    // Trailing slashes on both ends are load-bearing (spec §
-    // Trailing-slash rule): rsync mirrors the *contents* of the
-    // directory, not the directory entry itself.
+    // Trailing slashes on both ends are load-bearing: rsync mirrors
+    // the *contents* of the directory, not the directory entry itself.
     let remote = format!("{container_name}:/home/agent/work/");
     let host_arg = format!("{}/", host_dst_path.display());
     let pull_output = Command::new("rsync")
@@ -746,12 +743,12 @@ async fn integration_container_local_pull() {
 // the existing daemon-spawning tests claim (see comment block on the
 // other integration_local_workspace test in this crate).
 
-/// Spec § Workspace lock — Tests `integration_workspace_lock_push_blocks_pull`.
+/// .
 ///
 /// 1. Acquire `op=push` against the seeded `Running` session → 200,
 ///    body carries a `lock_token`.
 /// 2. Acquire `op=pull` while the push lock is held → 409 with body
-///    `error` containing the spec-pinned `"active push operation"`
+///    `error` containing the design-pinned `"active push operation"`
 ///    token.
 /// 3. Release with the original token + `force=false` → 200.
 /// 4. Re-acquire `op=pull` → 200 (lock genuinely cleared).
@@ -789,7 +786,7 @@ async fn integration_workspace_lock_push_blocks_pull() {
     let err = parse_error_field(&body);
     assert!(
         err.contains("active push operation"),
-        "conflict body must contain the spec-pinned `active push operation` token; got: {err}"
+        "conflict body must contain the design-pinned `active push operation` token; got: {err}"
     );
 
     // (3) release with the original token — 200
@@ -816,7 +813,7 @@ async fn integration_workspace_lock_push_blocks_pull() {
     );
 }
 
-/// Spec § Workspace lock — Tests `integration_workspace_lock_blocks_stop`.
+/// .
 ///
 /// Phase 4 atomicity contract: while a workspace operation holds the
 /// lock, `POST /sessions/<id>/stop` must refuse with HTTP 409 and the
@@ -891,7 +888,7 @@ async fn integration_workspace_lock_blocks_stop() {
     );
 }
 
-/// Spec § Workspace lock — Tests `integration_workspace_lock_blocks_delete`.
+/// .
 ///
 /// Phase 4 atomicity contract mirror for the remove path. While a
 /// workspace operation holds the lock, `DELETE /sessions/<id>` must
@@ -950,7 +947,7 @@ async fn integration_workspace_lock_blocks_delete() {
     );
 }
 
-/// Spec § Workspace lock — Tests `integration_workspace_lock_force_release`.
+/// .
 ///
 /// Operator escape hatch: `force=true` skips the token-match check.
 /// Acquire push (token T1), release with a deliberately different
@@ -996,7 +993,7 @@ async fn integration_workspace_lock_force_release() {
     let _ = parse_lock_token(&body);
 }
 
-/// Spec § Workspace lock — Tests `integration_workspace_lock_idempotent_release`.
+/// .
 ///
 /// Two contracts:
 ///
@@ -1073,12 +1070,12 @@ async fn integration_workspace_lock_idempotent_release() {
     );
 }
 
-/// Spec § Workspace lock — Tests
+///
 /// `integration_workspace_lock_acquire_rejected_when_not_running`.
 ///
 /// Phase 3 state-gate: the acquire handler refuses with HTTP 400 when
 /// the session is not in `Running` state. The error wording is
-/// spec-pinned (§ Workspace lock — API endpoints).
+/// pinned by the workspace-lock API contract.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn integration_workspace_lock_acquire_rejected_when_not_running() {
     let tmp = TempDir::new().expect("tempdir");
@@ -1098,14 +1095,14 @@ async fn integration_workspace_lock_acquire_rejected_when_not_running() {
         String::from_utf8_lossy(&body)
     );
     let err = parse_error_field(&body);
-    // Spec-verbatim wording from Phase 3's handler
+    // Verbatim wording from Phase 3's handler
     // (`acquire_workspace_lock_inner` in `sandboxd/src/main.rs`).
     assert!(
         err.contains("workspace operations require Running"),
-        "rejection must carry the spec-verbatim `workspace operations require Running` token; got: {err}"
+        "rejection must carry the design-verbatim `workspace operations require Running` token; got: {err}"
     );
     assert!(
         err.contains("session is in state"),
-        "rejection must lead with the spec-verbatim `session is in state` prefix; got: {err}"
+        "rejection must lead with the design-verbatim `session is in state` prefix; got: {err}"
     );
 }

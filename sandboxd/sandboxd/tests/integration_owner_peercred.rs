@@ -1,5 +1,5 @@
 //! End-to-end coverage for the `SO_PEERCRED` → `OperatorIdentity` →
-//! storage-boundary-filter pipeline (api-session-isolation spec § 7.5).
+//! storage-boundary-filter pipeline (per-caller isolation).
 //!
 //! Three contracts are pinned here, all driven through the real
 //! `PeerCredListener` acceptor on a freshly-spawned daemon binary:
@@ -20,7 +20,7 @@
 //!    bypasses the (impractical-on-a-single-uid host) "really run as
 //!    bob" requirement while still exercising the full HTTP pipeline
 //!    with a real peer-cred extension; the multi-uid path lives in
-//!    the Lima E2E harness (spec § 7.5).
+//!    the Lima E2E harness.
 //!
 //! 3. `integration_list_returns_only_callers_sessions` — same fixture
 //!    shape: one synthetic-foreign row + one runner-owned row;
@@ -290,12 +290,12 @@ async fn integration_create_stamps_owner_from_peercred() {
     let daemon = Daemon::spawn_with_base_dir(tmp, base_dir.clone());
 
     // Request a Lima session so the (always-built-into-the-daemon)
-    // capability matrix accepts the spec without requiring docker
+    // capability matrix accepts the design without requiring docker
     // probe responses. The persisted row's `owner_username` stamp
     // happens *before* `create_network` or `LimaManager::start_vm` —
     // see `create_session` handler in `sandboxd/src/main.rs`, where
     // `store.create_session_with_backend(.., &operator.name, ..)`
-    // fires immediately after spec validation. So the test only needs
+    // fires immediately after session-spec validation. So the test only needs
     // the request to *reach* the handler; whether it then succeeds
     // (on a fully-provisioned Lima/QEMU host) or fails fast (no docker)
     // or runs long (Lima present, VM boot in progress) is irrelevant
@@ -390,9 +390,9 @@ async fn integration_create_stamps_owner_from_peercred() {
 /// against the same DB; issue `GET /sessions/<id>` as the runner; the
 /// daemon must return `404`.
 ///
-/// The spec text names `GET /sessions/<id>` as the focal endpoint;
-/// the same filter wraps every per-id endpoint (H3, H5..H12), so the
-/// per-endpoint matrix is the unit-tested concern and this test pins
+/// `GET /sessions/<id>` is the focal endpoint for this ownership check;
+/// the same filter wraps every per-id endpoint (H3, H5..H12). The
+/// per-endpoint matrix is the unit-tested concern; this test pins
 /// the wiring at the storage boundary through one real HTTP path.
 #[tokio::test]
 async fn integration_synthetic_foreign_owner_returns_404() {

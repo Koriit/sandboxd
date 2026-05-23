@@ -1,7 +1,7 @@
 //! Daemon-side schema-version validator for `/etc/qemu/bridge.conf`.
 //!
 //! The daemon does **not** otherwise parse this file — it is QEMU's,
-//! consumed only by `qemu-bridge-helper`. Spec 5 § 4.7 layers a small
+//! consumed only by `qemu-bridge-helper`..7 layers a small
 //! schema-mismatch refusal on top so the convergence property of the
 //! update flow extends to both managed config files. v1 ships with
 //! `bridge.conf` at version `0` (no migration applies to it yet);
@@ -10,7 +10,7 @@
 //!
 //! Version detection: first-line comment of the form
 //! `# sandbox-schema-version: <int>`. QEMU's bridge-helper parser
-//! ignores `#`-prefixed lines (verified in Spec 3 § 9), so the marker
+//! ignores `#`-prefixed lines (verified this works, so the marker
 //! is transparent to QEMU. A file with no marker is treated as
 //! version `0`.
 
@@ -137,7 +137,7 @@ pub fn read_bridge_conf_schema_version(bytes: &[u8]) -> Result<u32, std::str::Ut
 ///
 /// A **missing** `bridge.conf` is **not** an error: the daemon does not
 /// require the file to exist (operators without QEMU/Lima never create
-/// it). This matches Spec 5 § 4.7's text "the daemon reads bridge.conf
+/// it). This matches.7's text "the daemon reads bridge.conf
 /// for this check only; it does not otherwise parse the file."
 pub fn validate_schema_version() -> Result<(), BridgeConfigError> {
     let path = bridge_conf_path();

@@ -1,7 +1,7 @@
 //! Per-second event rate cap + periodic `rate_limited` summary.
 //!
-//! Spec reference: `2026-04-21-port-explicit-policies-presets-observability-design.md`
-//! Part 3 / "Hardening rules" § 5.
+//! Design reference: `2026-04-21-port-explicit-policies-presets-observability-design.md`
+//! Part 3 / "Hardening rules".
 //!
 //! The deny-logger (and the allow-logger that shares this crate)
 //! must not spam its JSONL file — a misbehaving VM could open
@@ -43,7 +43,7 @@ use chrono::{DateTime, TimeZone, Utc};
 
 use crate::event::EventEmitter;
 
-/// 1-second rolling window — matches the spec's "1000 events/s per
+/// 1-second rolling window — matches the "1000 events/s per
 /// session" shape. Defined here so tests and the flush ticker agree.
 pub const WINDOW: Duration = Duration::from_secs(1);
 
@@ -103,7 +103,7 @@ impl RateCap {
     /// Count one drop *without* attempting admission. Used by the TCP
     /// concurrency-cap path, where the refusal happens at accept and
     /// no deny event is ever eligible — the drop still feeds the
-    /// periodic summary per spec § 6 / plan Phase 3.
+    /// periodic summary per.
     pub fn record_drop(&self, now: DateTime<Utc>) {
         self.maybe_rollover(now);
         self.dropped.fetch_add(1, Ordering::Relaxed);
