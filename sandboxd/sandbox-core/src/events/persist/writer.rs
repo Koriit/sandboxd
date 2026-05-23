@@ -89,10 +89,21 @@ impl LayerWriter {
 
     /// Append `line` to the file. `line` is expected to include its
     /// own trailing `\n` — [`crate::api::event_to_jsonl_line`] already
-    /// does. No additional flushing is performed; the kernel buffer
-    /// is implicitly flushed on close (at rotation / drop).
+    /// does.
+    ///
+    /// `tokio::fs::File` offloads `write(2)` onto a blocking thread and
+    /// returns `Poll::Ready` as soon as the bytes are queued — the
+    /// actual kernel write may still be in-flight when `write_all`
+    /// resolves. The explicit `flush()` waits for that background task
+    /// to complete, ensuring that:
+    ///
+    /// * rotation (which drops the old `File` handle) never races with
+    ///   an unfinished write on the file being replaced, and
+    /// * callers that read the file immediately after (e.g. tests) see
+    ///   the written bytes.
     pub(super) async fn append_line(&mut self, line: &str) -> io::Result<()> {
-        self.file.write_all(line.as_bytes()).await
+        self.file.write_all(line.as_bytes()).await?;
+        self.file.flush().await
     }
 }
 
