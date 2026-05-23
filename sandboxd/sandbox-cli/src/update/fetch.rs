@@ -146,7 +146,7 @@ pub enum FetchError {
     /// `/usr/local/bin/cosign` is absent. Surfaced when the operator
     /// never ran install.sh on this host, or has uninstalled cosign
     /// out-of-band. The update flow does not bootstrap cosign — that is
-    /// install.sh's responsibility (the migration framework.1.9, separation of
+    /// install.sh's responsibility (separation of
     /// concerns).
     #[error(
         "cosign binary not found at {path} — \

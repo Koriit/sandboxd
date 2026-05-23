@@ -1,7 +1,7 @@
 //! Integration test: the CLI fires exactly one `GET /backends` per
 //! invocation.
 //!
-//!  mandates a
+//! The design mandates a
 //! single fetch per CLI invocation. This is what makes capability
 //! validation cheap enough to run on every `create` without waiting on
 //! a daemon roundtrip per check; it also keeps the daemon's audit log

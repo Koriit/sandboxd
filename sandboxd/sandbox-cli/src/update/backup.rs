@@ -188,7 +188,7 @@ pub enum CopyAction {
     /// source — we performed a fresh copy.
     Copied,
     /// The destination already existed with identical bytes — no
-    /// state mutation..2.15-17 idempotency anchor.
+    /// state mutation. Idempotency anchor for the binary-install steps.
     Skipped,
     /// The source did not exist — the backup step is a no-op (e.g.
     /// `bridge.conf` on a fresh install that has not yet touched the
@@ -197,7 +197,7 @@ pub enum CopyAction {
 }
 
 /// Copy `src` to `dst` as `sandbox:sandbox` at `mode`, with sha256
-/// idempotency..2.15 / 3.2.17.
+/// idempotency.
 ///
 /// Behaviour:
 /// * Source missing → returns `CopyAction::SourceAbsent` (no file
@@ -250,7 +250,7 @@ pub fn backup_sandbox_owned_file(
 }
 
 /// Backup an `/etc` file (root-owned, world-readable at `0644`) into
-/// the `sandbox`-owned backup set..2.16. The two-step
+/// the `sandbox`-owned backup set. The two-step
 /// `sudo cat | sudo -u sandbox tee` pipeline lets the daemon-user
 /// land bytes it cannot read in-place but can be handed via the
 /// pipeline.
@@ -319,7 +319,7 @@ pub fn read_manifest(set_dir: &Path) -> Result<BackupManifest, BackupError> {
 }
 
 /// Finalise the manifest with `completed_ok: true` and a `completed_at`
-/// timestamp..2.29.
+/// timestamp.
 pub fn finalize_manifest(
     set_dir: &Path,
     completed_at: &str,
@@ -1166,7 +1166,7 @@ mod tests {
     /// root does not exist (fresh install before the first update has
     /// ever run, or a host where the daemon's startup-time mkdir
     /// hasn't landed yet), the function returns an empty
-    /// `PruneOutcome` without erroring..2.25's idempotency
+    /// `PruneOutcome` without erroring. Idempotency
     /// promise depends on this — the prune step must be a no-op when
     /// there are no sets to consider. Triage flagged this
     /// early-return as uncovered.

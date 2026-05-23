@@ -5,8 +5,6 @@
 //! daemon dispatches by the persisted `sessions.backend` column
 //! (see V005 migration) into a `HashMap<BackendKind, Arc<dyn SessionRuntime>>`
 //! held on `AppState`.
-//!
-//! See.
 
 use std::sync::Arc;
 
@@ -176,7 +174,7 @@ impl std::fmt::Display for RuntimeHandle {
 /// over without semantic loss; `Unknown` carries the backend-specific
 /// status string for diagnostic display.
 ///
-/// See. The runtime impls (Phase
+/// The runtime impls (Phase
 /// 1B+) are responsible for normalising backend output into one of
 /// these variants.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,8 +250,6 @@ pub trait GuestTransport: Send + Sync {
 /// on `AppState`. Implementations are stateless over [`RuntimeHandle`]
 /// — a single instance per kind is shared across all sessions of that
 /// kind.
-///
-/// See.
 #[async_trait]
 pub trait SessionRuntime: Send + Sync {
     /// Which backend this runtime represents. Used by the daemon's

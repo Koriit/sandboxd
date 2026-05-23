@@ -237,8 +237,7 @@ impl SessionStore {
     /// one `warn!` line per found orphan plus a summary line.
     ///
     /// **Diagnostic only.** The scan never deletes — that is the
-    /// operator's call once they have read the log lines. the documented contract
-    /// 2.1.1 lays out the rationale.
+    /// operator's call once they have read the log lines.
     fn run_v006_orphan_scan(base_dir: &Path) {
         let mut found: u32 = 0;
 
@@ -310,7 +309,7 @@ impl SessionStore {
             event = "v006_orphan_scan_complete",
             orphan_count = found,
             "V006 orphan scan complete - {found} orphan(s) logged above. \
-             Run `sandbox doctor` (sandbox doctor) for a reconciliation report. \
+             Run `sandbox doctor` for a reconciliation report. \
              Do NOT auto-delete; review each orphan before cleanup."
         );
     }
@@ -650,7 +649,7 @@ impl SessionStore {
 
     /// Retrieve a session by ID, or `None` if it does not exist.
     ///
-    /// Per-caller isolation (per-caller isolation): the
+    /// Per-caller isolation: the
     /// `WHERE` clause also filters `owner_username = ?caller_username`,
     /// so a foreign session ID is indistinguishable on the wire from a
     /// truly nonexistent ID — both return `Ok(None)` and the handler
@@ -710,7 +709,7 @@ impl SessionStore {
 
     /// List all sessions owned by `caller_username`.
     ///
-    /// Per-caller isolation (per-caller isolation): each
+    /// Per-caller isolation: each
     /// caller sees only their own rows. Other operators' sessions never
     /// surface on the wire — list endpoints return disjoint result sets
     /// per caller.
@@ -790,7 +789,7 @@ impl SessionStore {
     /// (see [`SessionState::can_transition_to`]).  Returns
     /// `SandboxError::InvalidState` if the transition is not valid.
     ///
-    /// Per-caller isolation (per-caller isolation): only
+    /// Per-caller isolation: only
     /// rows owned by `caller_username` are considered; a foreign-owner
     /// row surfaces as `Err(SessionNotFound)` so the handler layer
     /// returns HTTP 404 indistinguishable from a truly-nonexistent ID.
@@ -953,7 +952,7 @@ impl SessionStore {
     ///    lowercase hex chars), try [`Self::resolve_id_prefix`]. Returns the matching
     ///    session if exactly one ID has this prefix.
     ///
-    /// Per-caller isolation (per-caller isolation): every
+    /// Per-caller isolation: every
     /// fallback path filters on `owner_username = caller_username`, so
     /// foreign rows never surface and the 404-on-foreign-id property
     /// holds across name lookup, ID prefix, and full-ID paths.
@@ -1018,7 +1017,7 @@ impl SessionStore {
     /// - [`ResolveOutcome::Ambiguous`] if multiple caller-owned sessions
     ///   match, listing all matching IDs.
     ///
-    /// Per-caller isolation (per-caller isolation): foreign-
+    /// Per-caller isolation: foreign-
     /// owner rows are invisible — a prefix that matches another
     /// operator's session ID returns `NotFound`, not the foreign ID.
     ///
@@ -1094,7 +1093,7 @@ impl SessionStore {
 
     /// Store network info for a session (serialized as JSON).
     ///
-    /// Per-caller isolation (per-caller isolation): only
+    /// Per-caller isolation: only
     /// rows owned by `caller_username` are mutated; a foreign-owner row
     /// surfaces as `Err(SessionNotFound)` so the handler layer returns
     /// HTTP 404 indistinguishable from a truly-nonexistent ID.
@@ -1128,7 +1127,7 @@ impl SessionStore {
 
     /// Retrieve network info for a session, if it has been set.
     ///
-    /// Per-caller isolation (per-caller isolation): a
+    /// Per-caller isolation: a
     /// foreign-owner row is invisible — a query for a session ID
     /// the caller does not own surfaces as `Err(SessionNotFound)`
     /// (same shape as a truly-nonexistent ID).
@@ -1273,7 +1272,7 @@ impl SessionStore {
 
         let tx = conn.transaction()?;
 
-        // Per-caller isolation (per-caller isolation): a
+        // Per-caller isolation: a
         // mutation targeting a foreign-owner row surfaces as
         // `SessionNotFound`. The owner check runs *inside* the
         // transaction so a concurrent `delete_session` cannot race in
@@ -1359,7 +1358,7 @@ impl SessionStore {
             .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
 
         let tx = conn.transaction()?;
-        // Per-caller isolation (per-caller isolation):
+        // Per-caller isolation:
         // policy deletion is idempotent (no-op for missing rows) by
         // contract, but a foreign-owner session must not even be
         // *probed* via this call site — surface SessionNotFound for
@@ -1428,7 +1427,7 @@ impl SessionStore {
             .lock()
             .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
 
-        // Per-caller isolation (per-caller isolation): a
+        // Per-caller isolation: a
         // foreign-owner session surfaces as `Ok(None)` — same shape as
         // a session with no policy, which is identical to the shape an
         // unprovisioned session presents.
@@ -1508,7 +1507,7 @@ impl SessionStore {
 
     /// Delete a session from the database and remove its per-session directory.
     ///
-    /// Per-caller isolation (per-caller isolation): only
+    /// Per-caller isolation: only
     /// rows owned by `caller_username` may be deleted; a foreign-owner
     /// row surfaces as `Err(SessionNotFound)` so the handler layer
     /// returns HTTP 404 indistinguishable from a truly-nonexistent ID.
@@ -1859,7 +1858,7 @@ mod tests {
         (store, dir)
     }
 
-    /// Per-caller isolation (per-caller isolation) requires
+    /// Per-caller isolation requires
     /// every public store call to carry an owner identity. Tests in this
     /// module that pre-date pre-isolation use this constant so the per-caller
     /// filter is satisfied without making the test bodies noisier than

@@ -137,7 +137,7 @@ const BASE_DIR_SUBDIRS: &[&str] = &["sessions", "events", "backups"];
 
 /// The numeric mode every per-daemon state-dir subdirectory must
 /// carry. `0700` matches the daemon-uid-only access expectation
-/// recorded in the daemon-productionization.1: the daemon
+/// recorded in the daemon-productionization design: the daemon
 /// reads and writes its own state; no other uid has any business
 /// there.
 const BASE_DIR_SUBDIR_MODE: u32 = 0o700;
@@ -234,7 +234,7 @@ fn ensure_base_dir_layout(base_dir: &std::path::Path) -> Result<(), SandboxError
 }
 
 /// Mode pinned on `sandboxd.sock` immediately after bind. The
-/// daemon-productionization.1 documents the socket as
+/// design documents the socket as
 /// `0660 sandbox:sandbox`; doctor check C5 reads `stat(sock).mode &
 /// 0o777` against this constant. Forcing the mode explicitly avoids
 /// a false-negative on a host running under a `077`-style umask
@@ -291,8 +291,8 @@ use sandbox_core::gateway::{gateway_image_present, missing_gateway_image_hint};
 // scopes `NetworkManager`'s per-session /28 allocation pool.
 //
 // See:
-//   - lite-mode container backend the documented contract / "Config file:
-//     /etc/sandboxd/users.conf" — the contract this validation enforces.
+//   - lite-mode container backend ("Config file:
+//     /etc/sandboxd/users.conf") — the contract this validation enforces.
 //   - `sandbox_core::users_conf` — the loader that produces a parsed
 //     [`UsersConfig`]; we layer the daemon-uid lookup on top.
 
@@ -1047,7 +1047,7 @@ use sandboxd::propagation::{PropagatedEdge, PropagationStates};
 // Peer-credential acceptor
 // ---------------------------------------------------------------------------
 //
-// Helper-identity-assertion.1: every connection accepted on the
+// Helper-identity-assertion: every connection accepted on the
 // daemon's Unix socket is augmented with the operator identity the
 // kernel reports via `SO_PEERCRED`. The acceptor reads the credentials
 // immediately after `accept(2)`, resolves the uid to a username via
@@ -1989,7 +1989,7 @@ async fn create_session(
                 // (L3-HTTP policy levels) verifies cleanly. Mirrors
                 // the Lima `inject_ca_into_vm` path; differs in
                 // mechanism because the lite container's rootfs is
-                // read-only per.
+                // read-only.
                 ca_host_path: Some(ca_dir.join("cert.pem")),
             };
             state
@@ -3584,8 +3584,8 @@ async fn start_session(
     }
 
     // Atomic guest-version stamp: only after BOTH refresh and start
-    // succeed do we update the persisted version columns (api-session-
-    // isolation.9). A failure here is logged but does not
+    // succeed do we update the persisted version columns.
+    // A failure here is logged but does not
     // fail the start — the runtime is genuinely running, and a future
     // start_session will re-run the (idempotent) refresh + retry the
     // update.
@@ -3611,7 +3611,7 @@ async fn start_session(
     // DNS-gate-listener restore but skips `attach_vm_to_bridge` +
     // `inject_ca_into_vm` because they're VM-only steps that try to run
     // `sudo bash -c ...` inside the guest, and the lite image has neither
-    // sudo nor those bridge helpers (M11.
+    // sudo nor those bridge helpers.
     let restore_result = match session.backend {
         BackendKind::Container => {
             restore_session_networking_lite(&session.id, &operator.name, &state).await
@@ -6060,7 +6060,7 @@ async fn restore_session_networking(
 /// ingestor, and re-arms the synchronous DNS-gate listener after a stop /
 /// start cycle. Does **not** attach a VM to a bridge or inject a CA into
 /// a VM (both Lima-only — the lite image has no `sudo`, no QEMU, and the
-/// CA is baked into the image at build time per.
+/// CA is baked into the image at build time).
 ///
 /// Mirrors `restore_session_networking` steps 1, 2, 2b, plus the ingestor +
 /// DNS-gate-listener restoration that the Lima path inherits implicitly from
@@ -6462,7 +6462,7 @@ async fn base_image_status(State(state): State<Arc<AppState>>) -> impl IntoRespo
 ///
 /// Returns gateway status per running session. This is a daemon-wide
 /// ops probe and is explicitly carved out of per-caller filtering by
-/// per-caller isolation.6 — the response covers every
+/// per-caller isolation — the response covers every
 /// running session on the daemon regardless of caller identity.
 async fn health_check(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let sessions = match state.store.list_sessions_unfiltered() {

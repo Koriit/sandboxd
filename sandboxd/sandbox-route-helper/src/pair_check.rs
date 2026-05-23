@@ -1,4 +1,4 @@
-//! Pair-membership identity check per.1–3.2.
+//! Pair-membership identity check.
 //!
 //! A pool authorizes a request iff **both** the caller's identity and
 //! the asserted `--for-user` identity appear in the pool's `allow_users`.
@@ -39,7 +39,7 @@ pub enum Verdict {
     Denied,
 }
 
-/// Pair-check per.1–3.2.
+/// Pair-check.
 ///
 /// Returns `Allowed` iff `caller_uid` and `for_user_uid` are both
 /// numerically members of `subnet.allow_users` (resolution via
@@ -49,7 +49,7 @@ pub enum Verdict {
 /// `SubnetEntry::allows_uid` call) so unit tests can drive it directly.
 /// `caller_uid` and `for_user_uid` are the **resolved** numeric uids —
 /// the caller is responsible for surface-level resolution (and for
-/// denying when resolution fails, per.4); pair-check itself
+/// denying when resolution fails); pair-check itself
 /// only compares numeric membership.
 pub fn pair_check(subnet: &SubnetEntry, caller_uid: u32, for_user_uid: u32) -> Verdict {
     let caller_in = subnet.allows_uid(caller_uid);

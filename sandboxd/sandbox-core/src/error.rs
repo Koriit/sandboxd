@@ -81,7 +81,7 @@ pub enum SandboxError {
     ///
     /// The literal tokens `refresh is not viable` and
     /// `recreate the session` are load-bearing for the integration
-    /// tests pinned in the per-caller isolation.5.
+    /// tests pinned in the per-caller isolation integration tests.
     #[error(
         "session {session_id} was created with guest protocol {session_proto}; \
         daemon supports {daemon_proto}; refresh is not viable for this session \
@@ -224,7 +224,7 @@ mod tests {
 
     #[test]
     fn guest_protocol_incompatible_display_carries_load_bearing_tokens() {
-        // The per-caller isolation.5 integration tests assert
+        // The per-caller isolation integration tests assert
         // both `refresh is not viable` and `recreate the session` as
         // substrings of the response body. The full Display string is
         // generated from the `#[error(...)]` template above; this test

@@ -555,7 +555,7 @@ fn build_create_argv(
         )
     });
     let ca_args = build_ca_mount_args(network);
-    // per-caller isolation.8.1 — the installed
+    // per-caller isolation — the installed
     // `sandbox-guest` is bind-mounted read-only at the canonical
     // in-container path so refresh becomes `docker restart` rather
     // than a `docker cp` into the `--read-only` rootfs. One inode is
@@ -835,7 +835,7 @@ impl SessionRuntime for ContainerRuntime {
     /// **Bind-mount design.** The lite container has no init system —
     /// `ENTRYPOINT ["/usr/bin/tini", "--",
     /// "/usr/local/bin/sandbox-guest"]` is the only path the new binary
-    /// becomes the live process. Under the bind-mount design ((/// 3.8.1), the daemon stages `sandbox-guest` once at startup into
+    /// becomes the live process. Under the bind-mount design, the daemon stages `sandbox-guest` once at startup into
     /// `{base_dir}/guest/sandbox-guest` and `create()` adds a
     /// read-only bind-mount of that path at the canonical in-container
     /// location. Refresh therefore reduces to **`docker restart`** —
@@ -1205,7 +1205,7 @@ async fn inspect_container_pid(container_name: &str) -> Result<i32, SandboxError
 }
 
 /// Spawn `sandbox-route-helper --for-user <name> <pid> <gateway_ip>`
-/// and wait for completion. Per the route-helper contract ((/// "Networking → Helper authorization flow"), exit 0 is success and any
+/// and wait for completion. Per the route-helper contract ("Networking → Helper authorization flow"), exit 0 is success and any
 /// non-zero exit is a deny — stderr carries the load-bearing reason
 /// which we surface to the caller verbatim.
 ///
@@ -1983,7 +1983,7 @@ mod tests {
     }
 
     /// `refresh_guest_binary` must invoke `docker restart`, NOT
-    /// `docker cp`. The original per-caller isolation.8.1
+    /// `docker cp`. The original per-caller isolation
     /// design used `cp` to push the embedded bytes into the
     /// container's writable layer; the bind-mount design replaces
     /// that with a restart against the already-current bind-mount

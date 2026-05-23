@@ -200,7 +200,7 @@ pub enum WorkspaceMode {
     /// at session-create time. Unlike `Shared` there is no 9p device or
     /// bind-mount — the guest sees ordinary local files refreshed only
     /// when the operator explicitly invokes `sandbox workspace push` /
-    /// `pull`. See the workspace.
+    /// `pull`.
     ///
     /// `guest_path` defaults to the resolved `host_path` (per the
     /// parser); the custom deserializer below recovers a missing or
@@ -571,7 +571,7 @@ fn parse_local(rest: &str) -> Result<WorkspaceMode, String> {
 /// [`parse_host_guest_pair_from_tokens`]. `parse_local` has no
 /// security-model concept, so it calls this entry point which performs
 /// tokenisation, empty-token rejection, and the same 1..=2 cap from the
-/// the grammar (`local:<host>[:<guest>]`).
+/// grammar (`local:<host>[:<guest>]`).
 fn parse_host_guest_pair(rest: &str, mode_label: &str) -> Result<(String, String), String> {
     if rest.is_empty() {
         return Err(format!(
@@ -875,7 +875,7 @@ pub struct SessionConfig {
 /// forced: true`.
 ///
 /// Lima sessions never construct this — the probe is gated to the
-/// container backend by.
+/// container backend only.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionRootlessDocker {
     /// `true` when the host's `docker info` reported `name=rootless`

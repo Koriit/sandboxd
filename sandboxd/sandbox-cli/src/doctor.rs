@@ -164,7 +164,7 @@ where
 ///
 /// Returns `Err(DoctorInternalError)` when doctor itself cannot run
 /// (socket path unresolvable, renderer panicked, etc.); the caller is
-/// responsible for mapping that to `process::exit(2)` per.4.
+/// responsible for mapping that to `process::exit(2)`.
 pub async fn run(socket_path: &str, verbose: bool) -> Result<i32, DoctorInternalError> {
     let outcomes = execute_checks(socket_path).await;
     // The renderer is synchronous and writes to stdout; wrap in
@@ -254,7 +254,7 @@ pub struct CheckRow {
 /// hung daemon does not stall doctor.
 const DOCTOR_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Resolve the `(serial, parallel)` phase outputs, in.6 order.
+/// Resolve the `(serial, parallel)` phase outputs in canonical order.
 ///
 /// Public-in-crate so the unit tests in `mod tests` can exercise the
 /// runner directly. The wrapper [`run`] composes this with the
@@ -355,7 +355,7 @@ pub(crate) async fn execute_checks(socket_path: &str) -> Vec<CheckRow> {
 
     // Drain the JoinSet; a panicking task surfaces as a `JoinError`
     // and is re-raised here so [`run`]'s `catch_unwind` boundary routes
-    // it to exit code 2 per.4.
+    // it to exit code 2.
     let mut parallel: Vec<CheckRow> = Vec::with_capacity(11);
     while let Some(joined) = set.join_next().await {
         match joined {
@@ -416,7 +416,7 @@ async fn check_daemon_running(socket_path: &str) -> CheckRow {
         };
     }
 
-    // Per.2: `inactive`, `failed`, and `not-found` all
+    // `inactive`, `failed`, and `not-found` all
     // fall through to the dev-mode `connect()` probe. The unit may
     // be installed but stopped while the operator is iterating with
     // a hand-launched daemon (typical `cargo run -p sandboxd` dev
@@ -560,7 +560,7 @@ async fn check_version_match(socket_path: &str, socket_reachable: bool) -> Check
 /// C4 — current user in `sandbox` group.
 ///
 /// In dev mode there is no `sandbox` system group; we report this as
-/// `Skip` rather than `Fail` per.2. Production: the
+/// `Skip` rather than `Fail` in dev mode. Production: the
 /// operator must be in the group or the unix socket's `0660` mode
 /// will refuse them.
 pub(crate) fn check_group_membership() -> CheckRow {
@@ -677,7 +677,7 @@ fn real_group_resolver() -> Result<GroupMembership, String> {
 }
 
 // ---------------------------------------------------------------------------
-// Dev-vs-prod classification signal (the documented contract / the documented contract)
+// Dev-vs-prod classification signal
 // ---------------------------------------------------------------------------
 
 /// Canonical signal for "this host was provisioned by install.sh" —
@@ -1100,8 +1100,8 @@ fn check_route_helper_caps() -> CheckRow {
 /// Production: `/var/lib/sandbox/` is `0750 sandbox:sandbox` (the
 /// systemd unit's `StateDirectory` invariant). Dev: the operator's
 /// own `~/.local/share/sandboxd/` lives at the developer's umask;
-/// we skip the strict-mode comparison with the dev-mode annotation
-/// per.2. Dev-vs-prod classification consults the
+/// we skip the strict-mode comparison with the dev-mode annotation. Dev-vs-prod
+/// classification consults the
 /// install-state file (the documented contract) via [`is_prod_install_signal`].
 fn check_state_dir_mode() -> CheckRow {
     const PROD_PATH: &str = "/var/lib/sandbox";

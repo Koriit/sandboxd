@@ -28,7 +28,7 @@ pub mod migrate;
 // Constants (operator-visible paths)
 // ---------------------------------------------------------------------------
 
-/// Canonical install-state path. the documented contract.
+/// Canonical install-state path.
 pub const INSTALL_STATE_PATH: &str = "/var/lib/sandbox/.install-state.json";
 
 /// Canonical systemd unit path (presence is the dev-vs-system gate).
@@ -176,7 +176,7 @@ pub fn is_dev_mode(systemd_unit: &Path, install_state: &Path) -> bool {
         return true;
     }
     if !install_state.exists() {
-        // The the install pseudo-code also tries `sudo -k test -r`;
+        // The install pseudo-code also tries `sudo -k test -r`;
         // we cannot escalate from Rust without external help, so a
         // missing file (regardless of mode) trips dev-mode here. The
         // outer shell wrapper around `sandbox update` can elevate
@@ -325,7 +325,7 @@ pub async fn fetch_session_counts(socket_path: &str) -> SessionCounts {
     counts
 }
 
-/// Stopped-session compat bucket —.1.7. The pre-flight
+/// Stopped-session compat bucket. The pre-flight
 /// classifies each stopped session against the target binary's
 /// `DAEMON_GUEST_PROTO_VERSION` and renders the three-bucket
 /// breakdown in the confirmation prompt so the operator knows up
@@ -368,7 +368,7 @@ pub struct SessionCompat {
 }
 
 /// Snapshot of the per-session compat classification surfaced in the
-/// confirmation prompt and the install log..1.7.
+/// confirmation prompt and the install log.
 #[derive(Debug, Clone, Default)]
 pub struct SessionCompatSet {
     pub target_proto: u32,
@@ -383,7 +383,7 @@ pub struct SessionCompatSet {
 /// Classify a single session against the upgrade target's protocol
 /// version. Same three-bucket decision tree the daemon's runtime arm
 /// (`start-session`) uses, factored out so the CLI can render it ahead
-/// of time..1.7.
+/// of time.
 ///
 /// Mirrors [`sandbox_core::guest::is_protocol_compatible`] /
 /// [`sandbox_core::guest::can_refresh_in_place`] but applied against
@@ -394,7 +394,7 @@ pub fn classify_session_compat(session_proto: u32, target_proto: u32) -> CompatB
         CompatBucket::Ok
     } else if session_proto != 0 {
         // `can_refresh_in_place` is `session_proto != 0` for the
-        // current daemon (the migration framework.1.7's "session_proto == 0 →
+        // current daemon ("session_proto == 0 →
         // unsalvageable" arm). The target binary's predicate may
         // widen this in a future release; until that happens, mirror
         // the constant so the classification matches runtime
@@ -508,7 +508,7 @@ impl DiskCheck {
     }
 }
 
-/// Read the free-space budget against the pinned paths..1.8.
+/// Read the free-space budget against the pinned paths.
 pub fn check_disk_space(budget: &DiskBudget) -> DiskCheck {
     let rows = vec![
         DiskRow {
@@ -1497,7 +1497,7 @@ struct StatefulInputs<'a> {
     staged: &'a fetch::StagedTarball,
 }
 
-/// The full 18-step stateful orchestration..2.13-3.2.30.
+/// The full 18-step stateful orchestration.
 ///
 /// Returns the operator-visible exit code: `0` on success, `1` on any
 /// failed step. Each step appends a `step=<name> action=<verb>
@@ -2537,7 +2537,7 @@ fn files_byte_equal(a: &Path, b: &Path) -> Result<bool, std::io::Error> {
 }
 
 /// `curl --unix-socket <sock> http://localhost/version` and pluck the
-/// `version` field..2.27.
+/// `version` field.
 async fn query_daemon_version(sock: &str) -> Result<String, String> {
     let bytes = http_get(sock, "/version")
         .await
@@ -2552,7 +2552,7 @@ async fn query_daemon_version(sock: &str) -> Result<String, String> {
 }
 
 /// Update `.install-state.json`'s `previous_version` field before any
-/// binary swap..2.18.
+/// binary swap.
 ///
 /// Implementation: read the current state (as root), set the field,
 /// write via a tempfile owned by the current process, then `sudo
@@ -2719,7 +2719,7 @@ fn log_step(step: &str, fields: &str) {
 // Internal helpers (target version, MANIFEST read, systemctl probe)
 // ---------------------------------------------------------------------------
 
-/// Resolve the target version per.1.4. Three paths:
+/// Resolve the target version. Three paths:
 ///
 /// 1. `--from <tarball.tar.gz>` — peek MANIFEST out of the tarball
 ///    via `tar -O -xzf ... '*/MANIFEST'`. The tarball file's
@@ -2761,7 +2761,7 @@ fn resolve_target_version(args: &UpdateArgs, _state: &InstallState) -> Result<St
 }
 
 /// Run the arch + version cross-check against a `--from` tarball or
-/// pre-extracted directory..1.10.
+/// pre-extracted directory.
 fn check_manifest_from_tarball(
     from: &Path,
     target_version: &str,

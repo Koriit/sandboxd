@@ -1,5 +1,5 @@
 //! Subprocess-free integration tests for the post-extraction trust
-//! check that pairs with sigstore verification —.1.10.
+//! check that pairs with sigstore verification.
 //!
 //! The signature-verify half is exercised end-to-end by the Lima E2E
 //! suite (real cosign binary, real release bundle); these tests cover
@@ -54,7 +54,7 @@ fn stage_with_one_artefact(dest: &std::path::Path, recorded_sha: &str) -> Staged
     }
 }
 
-/// **the migration framework.1.10 anchor:** a MANIFEST that lists a tampered sha256
+/// **Fetch-integrity anchor:** a MANIFEST that lists a tampered sha256
 /// must produce `FetchError::ArtifactDigestMismatch { path, expected,
 /// got }` with all three fields populated faithfully. This is the
 /// production guarantee — without it, a tampered tarball with a valid

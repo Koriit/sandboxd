@@ -1,7 +1,7 @@
 //! Append-only JSON-Lines audit log for the route helper.
 //!
 //! One record per helper invocation, written before exit, on every
-//! allowed-and-denied path. The shape is fixed by.5:
+//! allowed-and-denied path. The shape is fixed:
 //!
 //! ```json
 //! {"ts":"2026-05-11T14:23:09.123Z","decision":"allowed","caller":"alice","for_user":"alice","pool":"10.209.0.0/20","gateway_ip":"10.209.0.2","pid":12345}

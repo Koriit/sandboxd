@@ -1,5 +1,5 @@
 //! Integration tests for the daemon → route-helper identity
-//! propagation path (helper-identity-assertion.5).
+//! propagation path (helper-identity-assertion wire contract).
 //!
 //! These exercise the `SO_PEERCRED` →
 //! `OperatorIdentity` → `RuntimeStartArgs::for_user` →
@@ -11,7 +11,7 @@
 //!  - `integration_route_helper_for_user_propagated` — the container
 //!    backend's `runtime.start()` invoked the stub with
 //!    `--for-user <operator-name>` between the binary name and the two
-//!    positional args (the wire shape.5 pins).
+//!    positional args (the wire shape).
 //!  - `integration_route_helper_for_user_falls_through_lima` — the Lima
 //!    backend's `runtime.start()` never invokes the helper, regardless
 //!    of whether `RuntimeStartArgs::for_user` is populated. The stub's
@@ -263,7 +263,7 @@ fn guest_bind_source_for_tests() -> std::path::PathBuf {
 /// , test 1: the container backend's `runtime.start` invokes
 /// the configured helper with `--for-user <operator-name>` placed
 /// between the binary name and the two positional args (matching the
-/// wire-shape pin in.5).
+/// wire-shape pin).
 ///
 /// The test points `ContainerNetwork::route_helper_path` at a stub
 /// shell script that writes its argv to a tempfile and exits `0`,

@@ -18,8 +18,7 @@
 //! *or* when `force == true` (operator escape hatch for
 //! orphan-lock recovery). The state-machine is per-process — it is
 //! deliberately **not** persisted to the session store, so a daemon
-//! restart resets every session to `Unlocked` (
-//! lock — Persistence and serde).
+//! restart resets every session to `Unlocked`. Lock state is not persisted.
 //!
 //! ## Wire shape
 //!
@@ -28,8 +27,7 @@
 //! string so the wire stays stable even if the in-process token
 //! representation later changes. The release-handler treats
 //! unparseable strings as a sentinel "wrong token" so the
-//! adjudication path stays uniform ( —
-//! Force-release token semantics).
+//! adjudication path stays uniform (force-release token semantics).
 
 use std::fmt;
 use std::str::FromStr;
@@ -44,8 +42,7 @@ use crate::error::SandboxError;
 /// stay insulated from the underlying representation. The release
 /// handler compares tokens byte-wise via `PartialEq`; the all-zeroes
 /// "nil" UUID is reserved as a sentinel for unparseable input on the
-/// release path (
-/// semantics).
+/// release path (force-release semantics).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LockToken(uuid::Uuid);
 
@@ -241,8 +238,7 @@ mod tests {
 
     /// `acquire` on `Locked` returns `Conflict` and the message names
     /// the currently-active op. Covers all four op-pair combinations
-    /// to pin the message content (
-    /// mapping).
+    /// to pin the message content (all four op-pair combinations).
     #[test]
     fn acquire_when_locked_returns_conflict() {
         for (held, attempted) in [

@@ -83,7 +83,7 @@ fn seed_synthetic_backup_tree(root: &Path, n_successful: usize) -> std::path::Pa
     in_progress_dir
 }
 
-/// **the migration framework.3 anchor:** stub install in a temp tree, simulated
+/// **Idempotency anchor:** stub install in a temp tree, simulated
 /// update, second run all-skip.
 ///
 /// Concretely: seed the backups tree, run the retention-prune step,
@@ -285,6 +285,6 @@ fn integration_migrate_tempfile_path_is_stable_across_reruns() {
     assert_eq!(
         p1.to_str().unwrap(),
         "/etc/sandboxd/.users.conf.tmp.V001",
-        "the migration framework.2.24 canonical tempfile shape"
+        "canonical tempfile shape"
     );
 }

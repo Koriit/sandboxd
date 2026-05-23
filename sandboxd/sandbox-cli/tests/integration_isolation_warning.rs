@@ -1,7 +1,7 @@
 //! Integration tests: the per-create isolation warning fires for the
 //! container backend (and only the container backend).
 //!
-//!  (lines 751-762) mandates that **every**
+//! Lines 751-762 of the isolation-warning design mandate that **every**
 //! `--lite` / `--backend container` create prints a fixed two-line
 //! warning to stderr **before** the daemon round-trip, and that
 //! `--backend lima` does **not** print anything. The byte-equality

@@ -1,6 +1,6 @@
 //! Capability surface shared by every [`super::SessionRuntime`] impl.
 //!
-//! See. Each backend declares
+//! Each backend declares
 //! a single [`Capabilities`] value which is consulted at request time by
 //! [`super::SessionSpec::validate`] and surfaced (in a future phase) on
 //! the `GET /backends` HTTP endpoint.
@@ -19,8 +19,6 @@ use crate::session::WorkspaceModeKind;
 /// Serialised lower-case (`"lima"` / `"container"`) so the on-the-wire
 /// representation matches the persisted `sessions.backend` column added
 /// by the V005 migration and the `BackendSpecific` variant tag.
-///
-/// See.
 ///
 /// `Default = Lima` so legacy on-disk rows that predate the V005
 /// `sessions.backend` column (and any older JSON snapshots that omit
@@ -73,7 +71,7 @@ impl std::fmt::Display for BackendKind {
 
 /// How strongly a backend isolates session workloads from the host.
 ///
-/// See. `Vm` denotes
+/// `Vm` denotes
 /// hardware-accelerated VM isolation (Lima/QEMU); `Container` denotes
 /// Linux-namespace + cgroup isolation (Docker lite mode).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,7 +89,7 @@ pub enum IsolationLevel {
 /// constructors (or `..` syntax against a baseline) — adding a new
 /// capability never silently picks up a `false` default.
 ///
-/// See. The `kind` field is
+/// The `kind` field is
 /// included here (rather than passed as a separate argument to
 /// [`super::SessionSpec::validate`]) so a `Capabilities` value carries
 /// everything the validator needs to attribute an
@@ -183,8 +181,6 @@ impl Capabilities {
 /// `#[non_exhaustive]` — adding a new capability mismatch is expected
 /// to ripple through the CLI's error printer; an exhaustive `match` on
 /// this enum forces that review.
-///
-/// See.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnsupportedFeature {

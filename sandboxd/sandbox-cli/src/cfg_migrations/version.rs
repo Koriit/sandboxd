@@ -1,4 +1,4 @@
-//! Schema-version detection per managed file..5.
+//! Schema-version detection per managed file.
 //!
 //! Two files are versioned today, each with its own marker:
 //!

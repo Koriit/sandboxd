@@ -135,7 +135,7 @@ enum Command {
         /// backend is resolved from `SANDBOX_DEFAULT_BACKEND`, the
         /// per-user config (`~/.config/sandboxd/config.json` →
         /// `default_backend`), and finally the hardcoded default
-        /// `lima`. See.
+        /// `lima`.
         #[arg(long, value_enum)]
         backend: Option<BackendKindArg>,
         /// Sugar for `--backend container` — the container ("lite")
@@ -144,9 +144,7 @@ enum Command {
         /// Mutually exclusive with `--backend`.
         #[arg(long, conflicts_with = "backend")]
         lite: bool,
-        /// Allow session-create on rootless Docker (operator opt-in;
-        ///
-        /// envelope).
+        /// Allow session-create on rootless Docker (operator opt-in; explicitly outside the supported envelope).
         ///
         /// By default the daemon probes `docker info` and refuses
         /// container-backend session-create when the host is in
@@ -390,7 +388,6 @@ enum Command {
     },
     /// Rebuild the pre-baked backend image(s).
     ///
-    /// :
     /// `--backend` selects which backend's image to rebuild
     /// (`lima`, `container`, or `all`; default `all`); `--no-cache`
     /// passes through to `docker build --no-cache` for the container
@@ -416,7 +413,7 @@ enum Command {
 
     /// Apply a pending sandboxd upgrade (or report what would happen).
     ///
-    /// `sandbox update` orchestrates
+    /// `sandbox update` orchestrates the full upgrade flow:
     /// pre-flight checks (read-only), confirmation prompt, and the
     /// stateful steps that stop the daemon, install new binaries, run
     /// config migrations, and restart. Each privileged step uses
@@ -455,16 +452,16 @@ enum Command {
         source_url: String,
         /// Read-only mode: report installed vs available, then exit.
         /// Never acquires the lock, never contacts cosign, never
-        /// extracts anything..2.
+        /// extracts anything.
         #[arg(long, conflicts_with = "dry_run")]
         check: bool,
         /// Read-only mode: print the step-by-step plan
         /// (`would execute` / `would skip` per stateful step) and
-        /// exit. Never mutates state..3.
+        /// exit. Never mutates state.
         #[arg(long)]
         dry_run: bool,
         /// Skip the interactive confirmation prompt. Equivalent to
-        /// answering `y`..4.
+        /// answering `y`.
         #[arg(long)]
         yes: bool,
         /// Proceed past the "active sessions exist" guard.
@@ -485,7 +482,7 @@ enum Command {
     /// memory and write the result to `--out`. The outer
     /// `sandbox update` flow then `sudo -k mv`s the output into place.
     ///
-    /// Refusal arms (the migration framework.3 access-gating block — `clap-hide` is
+    /// Refusal arms (access-gating block — `clap-hide` is
     /// not access control):
     ///
     /// 1. Caller must be root (`getuid() == 0`).
@@ -1480,7 +1477,7 @@ fn display_session(session: &SessionDto) {
 /// thinking the session had no CPU budget; the daemon already plumbs
 /// the resolved value through `resolved_cpus`, so this helper picks
 /// the right value to render and decorates the default case with a
-/// `(default)` suffix per.
+/// `(default)` suffix.
 ///
 /// - Stored value > 0 (operator-supplied explicit ceiling): render
 ///   the value verbatim. Lima sessions always take this branch
@@ -1537,7 +1534,7 @@ const CLI_VERSION_MISMATCH_EXIT_CODE: i32 = 2;
 /// Format the verbatim stderr message printed when the CLI detects a
 /// version skew with the daemon. The tokens `version mismatch`,
 /// `CLI is`, `daemon is`, and `both must match` are load-bearing — the
-/// integration test in.6 greps for them, and downstream
+/// integration test greps for them, and downstream
 /// scripts may match the wording to surface a friendly upgrade hint.
 fn render_version_mismatch_message(cli_version: &str, daemon_version: &str) -> String {
     format!(
@@ -1564,12 +1561,12 @@ fn check_daemon_version_equality(cli_version: &str, daemon_version: &str) -> Res
 /// the skew via doctor's C3 check rather than being refused at the
 /// gate. Every other subcommand performs the strict equality check
 /// inside `send_request_with_timeout` immediately after socket
-/// connect, per.5.
+/// connect, per the version-check contract.
 ///
 /// The dispatch in `main` short-circuits both `Version` and `Doctor`
 /// before reaching the socket-connect path, so this predicate is the
 /// single source of truth for the bypass set; it is queried by the
-/// unit tests in.3 so the bypass surface is asserted at
+/// unit tests so the bypass surface is asserted at
 /// every refactor.
 #[cfg_attr(not(test), allow(dead_code))]
 fn command_bypasses_version_check(command: &Command) -> bool {
@@ -8434,7 +8431,7 @@ mod tests {
     }
 
     /// Default-view `describe` (no `-v`) must show `Backend:` adjacent
-    /// to `State:` per.
+    /// to `State:`.
     #[test]
     fn describe_default_view_shows_backend_in_session_block() {
         let mut dto = make_session_dto("abcdef012345", Some("lite-box"), None, chrono::Utc::now());

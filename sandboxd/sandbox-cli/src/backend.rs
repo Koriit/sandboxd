@@ -1,7 +1,7 @@
 //! Backend resolution, CLI config loader, and feature-mismatch error
 //! rendering for `sandbox create`.
 //!
-//!  defines a five-tier precedence chain
+//! Defines a five-tier precedence chain
 //! the CLI must apply when picking a backend (`--lite` / `--backend`
 //! flags > `SANDBOX_DEFAULT_BACKEND` env > config file
 //! `default_backend` > hardcoded `BackendKind::Lima`). [`resolve_backend`]
@@ -10,8 +10,8 @@
 //! does not depend on disk I/O.
 //!
 //! The config loader for `~/.config/sandboxd/config.json` is also here
-//! ([`load_cli_config`]).  mandates the
-//! loader share its XDG resolver with the preset catalog (see
+//! ([`load_cli_config`]). The loader must
+//! share its XDG resolver with the preset catalog (see
 //! [`crate::cli_xdg`]).
 //!
 //! [`render_feature_mismatch`] and [`render_no_cache_rejection_for_container`]
@@ -502,7 +502,7 @@ pub fn render_feature_mismatch(
 /// Render the per-create isolation warning for the container
 /// backend.
 ///
-///  (lines 751-762) mandates the **exact**
+/// Lines 751-762 of the isolation-warning design mandate the **exact**
 /// two-line shape below, character-for-character. Note the leading
 /// `lite:` token, the em dash (`—`, U+2014) on line 1, and the **six**
 /// spaces of indentation on line 2:

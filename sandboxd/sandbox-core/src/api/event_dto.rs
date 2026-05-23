@@ -228,7 +228,7 @@ pub enum DenyLoggerEventBodyDto {
 
 /// Wire value of the deny-logger `deny` event's `protocol` field.
 ///
-///  / "Traffic events" row for `deny-logger` prescribes the
+/// The "Traffic events" row for `deny-logger` prescribes the
 /// literals `"tcp"` and `"udp"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -292,7 +292,7 @@ pub enum LifecycleEventBodyDto {
 
 /// Wire value of `policy_applied` / `policy_updated` `status`.
 ///
-///  "Lifecycle events" prescribes the literals `"ok"` and
+/// "Lifecycle events" prescribes the literals `"ok"` and
 /// `"error"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

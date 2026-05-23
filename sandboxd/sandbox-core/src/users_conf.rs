@@ -205,7 +205,7 @@ pub const DAEMON_MIN_SUPPORTED_USERS_CONF_SCHEMA: u32 = 1;
 /// daemon's supported range.
 ///
 /// Called by the daemon immediately after `load_users_config()` succeeds
-/// (the migration framework.7 — convergence anchor that forces operators to run
+/// (the schema-version migration — convergence anchor that forces operators to run
 /// `sandbox update` when the config file drifts behind the binary's
 /// supported version). The file's `_schema_version` is `Option<u32>`
 /// (the documented contract) — `None` is treated as `0`, which means a pre-V001

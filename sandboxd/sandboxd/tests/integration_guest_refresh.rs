@@ -1,7 +1,7 @@
 //! Integration tests for the guest-version refresh path
 //! (per-caller isolation).
 //!
-//! Under.8.1's bind-mount design, the container backend's
+//! Under the bind-mount design, the container backend's
 //! refresh path is not a `docker cp` into the rootfs; instead, every
 //! container session bind-mounts the installed `sandbox-guest` from
 //! the FHS libexec path (`/usr/local/libexec/sandboxd/sandbox-guest`,

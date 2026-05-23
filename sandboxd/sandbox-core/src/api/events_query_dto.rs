@@ -170,7 +170,7 @@ mod tests {
     #[test]
     fn parse_since_accepts_rfc3339_with_fractional_seconds() {
         // Both a plain second-precision timestamp and a fractional form
-        // must parse successfully. The the design says "RFC 3339"; chrono's
+        // must parse successfully. The design says "RFC 3339"; chrono's
         // `parse_from_rfc3339` handles both shapes.
         for raw in [
             "2026-04-22T12:00:00Z",

@@ -45,7 +45,7 @@ fn integration_rebuild_image_gateway_backend_refuses_with_pointer_to_update() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         code, 2,
-        "the migration framework.1: --backend gateway must exit 2; stderr was:\n{stderr}"
+        "CLI refusal check: --backend gateway must exit 2; stderr was:\n{stderr}"
     );
     assert!(
         stderr.contains("sandbox update"),

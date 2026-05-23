@@ -103,7 +103,7 @@ impl RateCap {
     /// Count one drop *without* attempting admission. Used by the TCP
     /// concurrency-cap path, where the refusal happens at accept and
     /// no deny event is ever eligible — the drop still feeds the
-    /// periodic summary per.
+    /// periodic summary.
     pub fn record_drop(&self, now: DateTime<Utc>) {
         self.maybe_rollover(now);
         self.dropped.fetch_add(1, Ordering::Relaxed);

@@ -9,7 +9,7 @@
 //! The framework lives in `sandbox-cli/` rather than `sandbox-core/`
 //! because the only invoker is the CLI's `sandbox update` orchestration
 //! — the daemon never applies migrations itself. The daemon's role is
-//! to **refuse to start** on schema mismatch (the migration framework.7, which lives
+//! to **refuse to start** on schema mismatch (the schema-version check, which lives
 //! in `sandbox-core::users_conf` / `sandbox-core::bridge_conf`); that
 //! refusal does not need the framework or its registry.
 

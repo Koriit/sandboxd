@@ -92,7 +92,7 @@ pub enum ApplyError {
 
 /// Apply every pending migration for the given target file, in
 /// registry order, with one `sudo -k sandbox --apply-config-migration
-/// ...` invocation per migration..2.24.
+/// ...` invocation per migration.
 ///
 /// Returns the (possibly empty) list of applied migration ids. Empty
 /// is the idempotent re-run shape — a second `sandbox update` after a

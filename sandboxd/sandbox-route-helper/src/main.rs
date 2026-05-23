@@ -22,12 +22,12 @@
 //!
 //! Each invocation runs ordered steps; any step that denies prints a
 //! single `sandbox-route-helper: <reason>` line to stderr, writes an
-//! append-only JSON-Lines audit record , and exits with
+//! append-only JSON-Lines audit record, and exits with
 //! code `1`. No netns mutation occurs on the deny path — the helper
 //! exits before reaching the route install.
 //!
 //! 1. Caller identity — read `getuid()` and resolve to a username via
-//!    `getpwuid_r`. STRICT — unresolvable uid unresolvable uid denies.
+//!    `getpwuid_r`. STRICT — unresolvable uid denies.
 //! 2. Argv parse — `--for-user <name>` (optional, defaults to caller)
 //!    plus the two positional args. Strict resolution of `--for-user`
 //!    via `getpwnam_r`.
@@ -234,10 +234,9 @@ fn deny_with_audit(
     });
     eprintln!("sandbox-route-helper: {stderr_msg}");
     if let AuditOutcome::WriteFailed(err) = outcome {
-        // Deny-path escalation to show the operator that surface the missing
-        // forensic record on stderr. The deny itself is unconditional
-        // (the exit code below stays `DENY_EXIT`); the escalation only
-        // adds the operator-visible signal that the audit trail
+        // Deny-path escalation: shows the operator that the audit record is missing.
+        // The deny itself is unconditional (the exit code below stays `DENY_EXIT`);
+        // the escalation only adds the operator-visible signal that the audit trail
         // evaporated.
         eprintln!("sandbox-route-helper: audit log write failed: {err}");
     }
