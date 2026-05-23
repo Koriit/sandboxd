@@ -65,6 +65,42 @@ jobs:
             echo "scripts/install.sh and scripts/uninstall.sh not present yet; skipping."
           fi
 
+  # Integration tests: every `integration_*`-prefixed test in the Rust
+  # workspace. These require out-of-process state — a real gateway container,
+  # a cap'd route helper binary, the `nft -c` / `envoy --mode validate` CLIs
+  # shipped inside the gateway image, and Docker for the container-runtime
+  # tests. The `make test-integration` target handles building the gateway
+  # image, lite image, and cap'd route helper before running the suite.
+  #
+  # `sudo setcap` (used by `install-route-helper-test-cap`) requires root;
+  # GitHub-hosted `ubuntu-latest` runners provide passwordless sudo. The
+  # `libcap2-bin` package (setcap/getcap) is pre-installed on ubuntu-latest.
+  integration:
+    runs-on: ubuntu-latest
+    needs: cargo
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            sandboxd/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('sandboxd/**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Run integration tests
+        run: make test-integration
+
   # PR-time + push-to-master: container backend only. Spec § "CI policy"
   # (lines ~1060-1070): "PR | Full E2E against container only | ~5-10 min".
   # Lite has no Lima/KVM dependency, so this job runs unmodified on stock
