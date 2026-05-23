@@ -28,24 +28,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Format check
-        working-directory: sandboxd
-        run: cargo fmt --all -- --check
-
-      - name: Build
-        working-directory: sandboxd
-        run: cargo build --workspace
-
       - name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
-      - name: Test
-        working-directory: sandboxd
-        run: cargo nextest run --workspace
+      - name: Build
+        run: make build
 
-      - name: Clippy
-        working-directory: sandboxd
-        run: cargo clippy --workspace -- -D warnings
+      - name: Test
+        run: make test
 
   # Shellcheck for the install / uninstall scripts. The spec's install-
   # infrastructure design (§ 8.2) requires POSIX-sh (`-s sh`) plus
