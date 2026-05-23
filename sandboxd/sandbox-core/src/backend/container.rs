@@ -806,11 +806,17 @@ impl SessionRuntime for ContainerRuntime {
 
         match run_docker(&args, "docker inspect (container status)").await {
             Ok(stdout) => Ok(parse_docker_state_status(&stdout)),
-            // `docker inspect` emits "no such object" (lowercase) while
-            // `docker rm/stop` emit "No such container" (mixed case).
-            // Both shapes mean the container is gone; surface as Stopped.
+            // `docker inspect` emits "no such object" in lowercase on
+            // newer Docker releases (≥24) and "No such object" in mixed
+            // case on some older releases. `docker rm/stop` emit "No such
+            // container" (mixed case). All shapes mean the container is
+            // gone; surface as Stopped. Case-fold the check so a Docker
+            // version bump on CI does not introduce a spurious failure.
             Err(SandboxError::Gateway(msg))
-                if msg.contains("No such container") || msg.contains("no such object") =>
+                if {
+                    let lower = msg.to_lowercase();
+                    lower.contains("no such container") || lower.contains("no such object")
+                } =>
             {
                 Ok(RuntimeStatus::Stopped)
             }
