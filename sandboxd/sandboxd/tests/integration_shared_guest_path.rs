@@ -262,6 +262,16 @@ fn docker_exec_capture(container_name: &str, argv: &[&str]) -> String {
 async fn integration_shared_guest_path_container() {
     let host_dir = TempDir::new().expect("host tempdir");
     let host_root = host_dir.path();
+    // Make the bind-mount source world-writable so the container user
+    // (UID 1000) can write into it regardless of the host UID that owns
+    // the tempdir (on CI the runner is typically UID 1001, not 1000).
+    // TempDir::new() creates with mode 0o700; the container runs as
+    // 1000:1000 and would get EACCES on the write step without this.
+    std::fs::set_permissions(
+        host_root,
+        std::os::unix::fs::PermissionsExt::from_mode(0o777),
+    )
+    .expect("chmod 0o777 on host bind-mount dir");
     // Seed a single file so the host-visible bind is unambiguously
     // populated before the container starts.
     std::fs::write(host_root.join("from_host.txt"), b"host-bytes\n").expect("write from_host.txt");
