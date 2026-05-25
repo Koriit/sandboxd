@@ -11,7 +11,7 @@ pub mod mapper;
 
 pub use dto::{
     PolicyDto, PolicyLevelDto, PolicyRuleDto, SessionConfigDto, SessionDto, SessionMountInfo,
-    SessionNetworkInfo, SessionRootlessDocker as SessionRootlessDockerDto,
+    SessionNetworkInfo, SessionRootlessDocker as SessionRootlessDockerDto, SshConfigDto,
     WorkspaceLockAcquireRequest, WorkspaceLockAcquireResponse, WorkspaceLockReleaseRequest,
     WorkspaceModeDetailDto, WorkspaceOpDto, WorkspaceSecurityModelDto,
 };

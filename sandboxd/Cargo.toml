@@ -40,6 +40,13 @@ rcgen = "0.14"
 ring = "0.17"
 schemars = "0.8"
 semver = "1"
+# `ssh-key` is the pure-Rust OpenSSH key implementation used by the
+# daemon to generate and serialise per-session ed25519 keypairs for the
+# cross-user SSH proxy (see the cross-user CLI access spec). Only the
+# `ed25519` algorithm is exposed by the daemon API and `rand_core` is
+# pulled in so callers can opt into the system RNG without enabling
+# `ssh-key`'s default heavy feature set (ecdsa, rsa, etc.).
+ssh-key = { version = "0.6", default-features = false, features = ["ed25519", "rand_core", "alloc", "getrandom"] }
 tempfile = "3"
 time = "0.3"
 

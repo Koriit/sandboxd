@@ -446,6 +446,52 @@ pub struct WorkspaceLockAcquireResponse {
     pub lock_token: String,
 }
 
+/// Response body for `GET /sessions/{id}/ssh-config`.
+///
+/// Carries the SSH client configuration block plus the private key
+/// for the calling operator to write into `~/.ssh/sandbox/keys/<id>`.
+/// Consumed by the `sandbox` CLI's `~/.ssh/sandbox/` management
+/// module on first command for a session (see the cross-user CLI
+/// access spec for the full operator flow).
+///
+/// **Dedicated DTO.** This is *not* a flattened serialisation of
+/// [`crate::ssh::SshKeypair`]: the wire carries a `private_key` field
+/// (renamed from the persistence-side `private`) and adds the
+/// `config` field that the daemon assembles from a template
+/// server-side. Keeping a separate DTO is the standard
+/// per-endpoint pattern in this crate (see `SessionDto`,
+/// `PolicyDto`, etc.) and ensures a future shape change to the
+/// persisted [`crate::ssh::SshKeypair`] cannot silently break the
+/// `ssh-config` endpoint's contract with M18-S5's CLI consumer.
+///
+/// # Trust model (load-bearing)
+///
+/// The `private_key` field is sent to the calling operator over a
+/// peercred-authenticated Unix-socket connection. Members of the
+/// `sandbox` OS group can already reach the daemon socket; per the
+/// cross-user CLI access spec, that membership is exactly the
+/// "trusted with every session's private key" boundary. Tightening
+/// this surface (per-session capability tokens, daemon-issued SSH
+/// certs, etc.) was considered and explicitly deferred — see the
+/// spec's Alternatives section.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SshConfigDto {
+    /// SSH client configuration block. Multi-line text suitable for
+    /// inclusion under `~/.ssh/sandbox/config` between the marker
+    /// comments managed by the CLI. The `IdentityFile` line carries
+    /// a placeholder string the CLI rewrites to the per-session
+    /// key path before exec'ing `ssh`; the `HostName` / `Port` are
+    /// syntactic placeholders since the actual connection is opened
+    /// by the `ProxyCommand sandbox proxy <id>` shim.
+    pub config: String,
+    /// OpenSSH-format private key string. The CLI writes this to
+    /// `~/.ssh/sandbox/keys/<id>` with mode 0600 before invoking
+    /// `ssh`. For Lima sessions the daemon reads Lima's own per-VM
+    /// key on demand; for container sessions it returns the
+    /// per-session keypair persisted in `sessions.ssh_keypair_json`.
+    pub private_key: String,
+}
+
 /// Request body for `DELETE /sessions/{id}/workspace-lock` —
 /// release.
 ///

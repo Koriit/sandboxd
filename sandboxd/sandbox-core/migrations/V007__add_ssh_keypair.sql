@@ -1,0 +1,35 @@
+-- V007__add_ssh_keypair.sql
+-- Adds the per-session SSH keypair column used by the daemon-mediated
+-- SSH proxy. Forward-only.
+--
+-- For container sessions, the daemon generates an ed25519 keypair at
+-- session-create time, persists it here, and injects the public half
+-- into the container at `/run/sandbox/authorized_keys` via tmpfs
+-- bind-mount. The `GET /sessions/{id}/ssh-config` endpoint serves the
+-- private half (plus a ready-to-include SSH config block) to the
+-- session's owner, who writes it under `~/.ssh/sandbox/keys/<id>` so
+-- the operator's `ssh` client can reach the in-container sshd through
+-- the daemon proxy.
+--
+-- For Lima sessions the column stays `NULL`: Lima already manages the
+-- per-VM SSH credentials on disk under the daemon's `~/.lima/`, and
+-- the daemon reads them on demand when serving the ssh-config
+-- endpoint.
+--
+-- The column is `BLOB NULL` so existing rows continue to deserialise
+-- without any backfill; the on-disk shape is the JSON envelope
+-- `{"public": "<openssh-pubkey>", "private": "<openssh-private-key>"}`.
+-- Pre-V007 container sessions read back with `ssh_keypair = None` and
+-- surface `404 SSH_NOT_AVAILABLE` on the endpoint — lazy keypair
+-- generation is explicitly out of scope (would require sshd hot-reload
+-- inside the lite-image, which is not designed for it). Operators
+-- recreate the session instead.
+--
+-- The keypair is plaintext at rest. The trust model is documented in
+-- the cross-user CLI access spec: any member of the `sandbox` OS group
+-- can reach the daemon socket and therefore request the private key
+-- via the HTTP API, so file-level secrecy on `sessions.db` (mode 0600
+-- enforced at open time in `SessionStore::new`) is the boundary.
+
+ALTER TABLE sessions
+    ADD COLUMN ssh_keypair_json BLOB NULL;

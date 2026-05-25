@@ -18,6 +18,7 @@ pub mod policy_distributor;
 pub mod process;
 pub mod qmp;
 pub mod session;
+pub mod ssh;
 pub mod store;
 /// Test-only helpers shared across `sandbox-core`'s integration tests
 /// and the daemon's `tests/` integration suite. Production code paths
@@ -39,7 +40,7 @@ pub use api::{
     LifecycleEventDto, MitmproxyEventBodyDto, MitmproxyEventDto, NetworkHealth,
     PolicyApplyStatusDto, PolicyDto, PolicyLevelDto, PolicyRuleDto, PropagationStatusResponse,
     SessionConfigDto, SessionDto, SessionHealth, SessionMountInfo, SessionNetworkInfo,
-    SessionRootlessDockerDto, UpdatePolicyRequest, WorkspaceLockAcquireRequest,
+    SessionRootlessDockerDto, SshConfigDto, UpdatePolicyRequest, WorkspaceLockAcquireRequest,
     WorkspaceLockAcquireResponse, WorkspaceLockReleaseRequest, WorkspaceModeDetailDto,
     WorkspaceOpDto, WorkspaceSecurityModelDto, event_to_jsonl_line,
 };
@@ -109,6 +110,7 @@ pub use session::{
     Session, SessionConfig, SessionId, SessionRootlessDocker, SessionState, WorkspaceMode,
     WorkspaceModeKind, WorkspaceSecurityModel,
 };
+pub use ssh::{SSH_CONFIG_IDENTITY_FILE_PLACEHOLDER, SshKeypair, render_ssh_config_block};
 pub use store::{OrphanInfo, ResolveOutcome, SessionStore};
 // Only the daemon-side users-conf surface is re-exported at the crate
 // root: `sandboxd` consumes it via `sandbox_core::*`. The helper-side

@@ -968,6 +968,35 @@ pub struct Session {
     /// paths still deserialize cleanly (defaulting to the empty string).
     #[serde(default)]
     pub guest_binary_version: String,
+    /// Per-session SSH keypair used by the daemon-mediated SSH proxy.
+    /// Generated at session-create time for container sessions and
+    /// persisted in `sessions.ssh_keypair_json` (V007 migration).
+    ///
+    /// `None` for:
+    /// * Lima sessions — Lima manages per-VM SSH credentials on the
+    ///   daemon-side `~/.lima/`, so the daemon reads them on demand
+    ///   when serving the `GET /sessions/{id}/ssh-config` endpoint.
+    /// * Pre-V007 container sessions — the `ssh-config` endpoint
+    ///   returns `404 SSH_NOT_AVAILABLE` for these; lazy keypair
+    ///   generation is explicitly out of scope (would require sshd
+    ///   hot-reload, which the lite-image is not designed for).
+    ///
+    /// **Trust-model note**: the private half is stored plaintext at
+    /// rest under the SQLite file's 0600 mode (enforced in
+    /// `SessionStore::new`). Any member of the `sandbox` OS group can
+    /// already retrieve it through the `GET /sessions/{id}/ssh-config`
+    /// endpoint, so the file mode is the boundary — do not weaken it
+    /// without revisiting the cross-user CLI access spec's security
+    /// considerations. See [`crate::ssh::SshKeypair`] for the full
+    /// rationale.
+    ///
+    /// `#[serde(default, skip_serializing_if = "Option::is_none")]`
+    /// keeps the JSON envelope omitted when absent so an older daemon
+    /// rolling back over a record this newer daemon wrote silently
+    /// skips the unknown field. Mirrors the forward-compat convention
+    /// every additive `Session` / `SessionConfig` field follows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_keypair: Option<crate::ssh::SshKeypair>,
 }
 
 impl Session {
@@ -989,6 +1018,7 @@ impl Session {
             owner_username: String::new(),
             guest_protocol_version: 0,
             guest_binary_version: String::new(),
+            ssh_keypair: None,
         }
     }
 
@@ -1019,6 +1049,7 @@ impl Session {
             owner_username: String::new(),
             guest_protocol_version: 0,
             guest_binary_version: String::new(),
+            ssh_keypair: None,
         }
     }
 

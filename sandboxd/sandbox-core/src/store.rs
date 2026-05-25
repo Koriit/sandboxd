@@ -618,10 +618,26 @@ impl SessionStore {
             InsertError::Other(SandboxError::Internal(format!("lock poisoned: {e}")))
         })?;
 
+        // Per the cross-user CLI access spec, the SSH keypair persists
+        // plaintext in `ssh_keypair_json` (BLOB NULL added by V007).
+        // The DB file is mode 0600 (enforced at `SessionStore::new`
+        // time) and any member of the `sandbox` OS group can already
+        // retrieve the private half via the daemon API, so file-level
+        // secrecy is the boundary — do not weaken it without revisiting
+        // the trust-model premise. See [`crate::ssh::SshKeypair`].
+        let ssh_keypair_json: Option<String> = match &session.ssh_keypair {
+            Some(kp) => Some(serde_json::to_string(kp).map_err(|e| {
+                InsertError::Other(SandboxError::Internal(format!(
+                    "failed to serialize ssh_keypair: {e}"
+                )))
+            })?),
+            None => None,
+        };
+
         let res = conn.execute(
             "INSERT INTO sessions (id, name, state, config, created_at, updated_at, backend, \
-                 owner_username, guest_protocol_version, guest_binary_version)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 owner_username, guest_protocol_version, guest_binary_version, ssh_keypair_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 session.id.as_str(),
                 session.name,
@@ -633,6 +649,7 @@ impl SessionStore {
                 session.owner_username,
                 session.guest_protocol_version as i64,
                 session.guest_binary_version,
+                ssh_keypair_json,
             ],
         );
 
@@ -666,7 +683,7 @@ impl SessionStore {
 
         let mut stmt = conn.prepare(
             "SELECT id, name, state, config, created_at, updated_at, backend, \
-                 owner_username, guest_protocol_version, guest_binary_version
+                 owner_username, guest_protocol_version, guest_binary_version, ssh_keypair_json
              FROM sessions WHERE id = ?1 AND owner_username = ?2",
         )?;
 
@@ -696,7 +713,7 @@ impl SessionStore {
 
         let mut stmt = conn.prepare(
             "SELECT id, name, state, config, created_at, updated_at, backend, \
-                 owner_username, guest_protocol_version, guest_binary_version
+                 owner_username, guest_protocol_version, guest_binary_version, ssh_keypair_json
              FROM sessions WHERE id = ?1",
         )?;
 
@@ -727,7 +744,7 @@ impl SessionStore {
 
         let mut stmt = conn.prepare(
             "SELECT id, name, state, config, created_at, updated_at, backend, \
-                 owner_username, guest_protocol_version, guest_binary_version
+                 owner_username, guest_protocol_version, guest_binary_version, ssh_keypair_json
              FROM sessions ORDER BY created_at ASC",
         )?;
 
@@ -759,7 +776,7 @@ impl SessionStore {
 
         let mut stmt = conn.prepare(
             "SELECT id, name, state, config, created_at, updated_at, backend, \
-                 owner_username, guest_protocol_version, guest_binary_version
+                 owner_username, guest_protocol_version, guest_binary_version, ssh_keypair_json
              FROM sessions WHERE owner_username = ?1 ORDER BY created_at ASC",
         )?;
 
@@ -781,6 +798,55 @@ impl SessionStore {
             sessions.push(row?);
         }
         Ok(sessions)
+    }
+
+    /// Persist a freshly generated SSH keypair onto an existing
+    /// session row.
+    ///
+    /// Called by the daemon's container session-create path *after*
+    /// the row has been inserted but *before* the runtime spins up
+    /// the container, so the pubkey is available for the tmpfs
+    /// authorized_keys injection. Lima sessions never invoke this
+    /// helper — Lima manages its own SSH credentials outside the
+    /// daemon DB.
+    ///
+    /// Per-caller isolation: the `UPDATE` filters on
+    /// `owner_username = caller_username` so a foreign-owner row
+    /// surfaces as `SessionNotFound`, mirroring every other
+    /// per-session mutation in the store.
+    ///
+    /// **Trust-model note**: the persisted private half is plaintext at
+    /// rest under the SQLite file's 0600 mode (enforced in
+    /// `SessionStore::new`). The boundary is the file mode; any
+    /// member of the `sandbox` OS group can already retrieve the
+    /// keypair via `GET /sessions/{id}/ssh-config`. Do not weaken
+    /// the file mode without revisiting the cross-user CLI access
+    /// spec's security considerations.
+    pub fn set_ssh_keypair(
+        &self,
+        id: &SessionId,
+        caller_username: &str,
+        keypair: &crate::ssh::SshKeypair,
+    ) -> Result<(), SandboxError> {
+        let json = serde_json::to_string(keypair)
+            .map_err(|e| SandboxError::Internal(format!("failed to serialize ssh_keypair: {e}")))?;
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| SandboxError::Internal(format!("lock poisoned: {e}")))?;
+
+        let rows_affected = conn.execute(
+            "UPDATE sessions SET ssh_keypair_json = ?1
+             WHERE id = ?2 AND owner_username = ?3",
+            params![json, id.as_str(), caller_username],
+        )?;
+
+        if rows_affected == 0 {
+            return Err(SandboxError::SessionNotFound(id.to_string()));
+        }
+
+        Ok(())
     }
 
     /// Update the state of a session and refresh its `updated_at` timestamp.
@@ -981,7 +1047,8 @@ impl SessionStore {
 
             let mut stmt = conn.prepare(
                 "SELECT id, name, state, config, created_at, updated_at, backend, \
-                     owner_username, guest_protocol_version, guest_binary_version
+                     owner_username, guest_protocol_version, guest_binary_version, \
+                     ssh_keypair_json
                  FROM sessions WHERE name = ?1 AND owner_username = ?2",
             )?;
 
@@ -1778,7 +1845,8 @@ enum InsertError {
 ///
 /// Column order matches every `SELECT ... FROM sessions` in this module:
 /// `id, name, state, config, created_at, updated_at, backend,
-///  owner_username, guest_protocol_version, guest_binary_version`.
+///  owner_username, guest_protocol_version, guest_binary_version,
+///  ssh_keypair_json`.
 fn row_to_session(row: &rusqlite::Row<'_>) -> Result<Session, SandboxError> {
     let id_str: String = row.get(0)?;
     let name: Option<String> = row.get(1)?;
@@ -1800,6 +1868,13 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> Result<Session, SandboxError> {
     let owner_username: String = row.get(7)?;
     let guest_protocol_version: i64 = row.get(8)?;
     let guest_binary_version: String = row.get(9)?;
+    // Column 10 (`ssh_keypair_json`) was introduced by V007. The
+    // column is nullable so pre-V007 container sessions read back
+    // with `ssh_keypair = None` (the `GET /sessions/{id}/ssh-config`
+    // handler maps that to `404 SSH_NOT_AVAILABLE`); Lima sessions
+    // always store `NULL` because Lima manages its own keys outside
+    // the daemon DB.
+    let ssh_keypair_json: Option<String> = row.get(10)?;
 
     let id = SessionId::parse(&id_str)
         .map_err(|e| SandboxError::Internal(format!("invalid session id in database: {e}")))?;
@@ -1827,6 +1902,13 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> Result<Session, SandboxError> {
         ))
     })?;
 
+    let ssh_keypair = match ssh_keypair_json {
+        Some(json) => Some(serde_json::from_str(&json).map_err(|e| {
+            SandboxError::Internal(format!("invalid ssh_keypair JSON in database: {e}"))
+        })?),
+        None => None,
+    };
+
     Ok(Session {
         id,
         name,
@@ -1838,6 +1920,7 @@ fn row_to_session(row: &rusqlite::Row<'_>) -> Result<Session, SandboxError> {
         owner_username,
         guest_protocol_version,
         guest_binary_version,
+        ssh_keypair,
     })
 }
 
@@ -4163,6 +4246,201 @@ mod tests {
             .expect("get")
             .expect("session row must survive reopen");
         assert_eq!(row.owner_username, "alice");
+    }
+
+    // ========================================================================
+    // V007 migration tests — ssh_keypair_json column added by the
+    // cross-user CLI access spec.
+    // ========================================================================
+
+    /// V007 on a fresh DB: refinery runs V001..V007 and the new
+    /// `ssh_keypair_json` column is present afterwards. Pinned so a
+    /// future re-numbering of the migration set does not silently drop
+    /// the column from the table.
+    #[test]
+    fn test_v007_applies_cleanly_to_fresh_db() {
+        let dir = TempDir::new().expect("tempdir");
+        let (_store, _orphans) = SessionStore::new(dir.path().to_path_buf()).expect("open fresh");
+
+        let conn = Connection::open(dir.path().join("sessions.db")).unwrap();
+        let cols = column_names(&conn, "sessions");
+        assert!(
+            cols.iter().any(|c| c == "ssh_keypair_json"),
+            "expected `ssh_keypair_json` column after V007; got {cols:?}"
+        );
+    }
+
+    /// V007 applied on top of an existing V006 row preserves the row
+    /// and stamps the new column to NULL. Catches a regression where a
+    /// migration author accidentally writes a destructive step here,
+    /// matching how the test suite already pins V005 / V006 behaviour.
+    #[test]
+    fn test_v007_preserves_existing_v006_rows() {
+        let dir = TempDir::new().expect("tempdir");
+        let db_path = dir.path().join("sessions.db");
+
+        // Seed at V006: insert a row with the V006-shape columns (no
+        // `ssh_keypair_json` yet).
+        {
+            let mut conn = Connection::open(&db_path).expect("open raw");
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            embedded::migrations::runner()
+                .set_target(refinery::Target::Version(6))
+                .run(&mut conn)
+                .expect("V001..V006");
+
+            let now = Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO sessions (id, name, state, config, created_at, updated_at, backend, \
+                     owner_username, guest_protocol_version, guest_binary_version)
+                 VALUES (?1, 'pre-v007', 'Stopped', '{}', ?2, ?2, 'container', 'alice', 0, '')",
+                params!["abcd12345678", now],
+            )
+            .unwrap();
+
+            // Sanity: column not yet present at V006.
+            let cols = column_names(&conn, "sessions");
+            assert!(
+                !cols.iter().any(|c| c == "ssh_keypair_json"),
+                "sessions must not have ssh_keypair_json at V006; got {cols:?}"
+            );
+        }
+
+        // Apply V007 via the unbounded runner — going through
+        // `SessionStore::new` would also apply any future V008+.
+        {
+            let mut conn = Connection::open(&db_path).expect("reopen raw");
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            embedded::migrations::runner()
+                .set_target(refinery::Target::Version(7))
+                .run(&mut conn)
+                .expect("apply V007");
+        }
+
+        let conn = Connection::open(&db_path).unwrap();
+        let cols = column_names(&conn, "sessions");
+        assert!(
+            cols.iter().any(|c| c == "ssh_keypair_json"),
+            "ssh_keypair_json must exist after V007; got {cols:?}"
+        );
+
+        // The pre-V007 row must still be present and the new column
+        // must read back as NULL — the spec's forward-compat contract
+        // ("pre-existing container sessions surface 404
+        // SSH_NOT_AVAILABLE") depends on this exact shape.
+        let mut stmt = conn
+            .prepare("SELECT name, ssh_keypair_json FROM sessions WHERE id = 'abcd12345678'")
+            .unwrap();
+        let row: (String, Option<String>) = stmt
+            .query_row([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .expect("row survives V007");
+        assert_eq!(row.0, "pre-v007");
+        assert!(
+            row.1.is_none(),
+            "ssh_keypair_json must default to NULL on a pre-V007 row; got {:?}",
+            row.1
+        );
+    }
+
+    /// Full round-trip: `Session.ssh_keypair = Some(_)` survives an
+    /// insert + read cycle through the store. Pins both the persistence
+    /// path (insert + UPDATE shapes) and the `row_to_session`
+    /// deserialiser.
+    #[test]
+    fn test_ssh_keypair_round_trips_through_store() {
+        let (store, _dir) = test_store();
+        let session = store
+            .create_session(SessionConfig::default(), None, "alice", 0, "")
+            .expect("create");
+
+        // Newly-created sessions never carry a keypair (the daemon
+        // generates one for the container backend only, after the row
+        // is inserted).
+        let fetched = store
+            .get_session(&session.id, "alice")
+            .expect("get")
+            .expect("exists");
+        assert!(
+            fetched.ssh_keypair.is_none(),
+            "freshly created session must have ssh_keypair = None"
+        );
+
+        // Stamp a keypair via the dedicated setter and confirm it
+        // round-trips through the SELECT path.
+        let kp = crate::ssh::SshKeypair::generate(session.id.as_str()).expect("generate");
+        store
+            .set_ssh_keypair(&session.id, "alice", &kp)
+            .expect("set_ssh_keypair");
+
+        let after = store
+            .get_session(&session.id, "alice")
+            .expect("get")
+            .expect("exists");
+        assert_eq!(
+            after.ssh_keypair.as_ref(),
+            Some(&kp),
+            "ssh_keypair must round-trip byte-for-byte through the store"
+        );
+    }
+
+    /// `set_ssh_keypair` refuses a foreign-owner session, mirroring
+    /// every other per-session mutation in the store.
+    #[test]
+    fn test_set_ssh_keypair_refuses_foreign_session() {
+        let (store, _dir) = test_store();
+        let session = store
+            .create_session(SessionConfig::default(), None, "alice", 0, "")
+            .expect("create");
+
+        let kp = crate::ssh::SshKeypair::generate(session.id.as_str()).expect("generate");
+        let result = store.set_ssh_keypair(&session.id, "bob", &kp);
+        assert!(
+            matches!(result, Err(SandboxError::SessionNotFound(_))),
+            "foreign caller must hit SessionNotFound; got {result:?}"
+        );
+
+        // The legitimate owner can still see the keypair as None — the
+        // foreign-caller UPDATE must not have leaked.
+        let after = store
+            .get_session(&session.id, "alice")
+            .expect("get")
+            .expect("exists");
+        assert!(
+            after.ssh_keypair.is_none(),
+            "foreign-caller set_ssh_keypair must not mutate the row"
+        );
+    }
+
+    /// `set_ssh_keypair` against a non-existent session surfaces
+    /// `SessionNotFound` — the contract's symmetric arm.
+    #[test]
+    fn test_set_ssh_keypair_nonexistent() {
+        let (store, _dir) = test_store();
+        let kp = crate::ssh::SshKeypair::generate("ffffffffffff").expect("generate");
+        let result = store.set_ssh_keypair(&missing_id(), TEST_CALLER, &kp);
+        assert!(matches!(result, Err(SandboxError::SessionNotFound(_))));
+    }
+
+    /// Legacy V007-naive JSON snapshot (a `Session` blob lacking the
+    /// `ssh_keypair` field) deserialises cleanly with the field
+    /// defaulting to `None`. Mirrors the forward-compat
+    /// rule "fields added to persisted structs must be `Option<T>` with
+    /// `#[serde(default)]` so older daemons rolling back do not fail
+    /// to load".
+    #[test]
+    fn test_session_serde_legacy_record_without_ssh_keypair() {
+        let legacy_json = r#"{
+            "id": "0123456789ab",
+            "state": "creating",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "config": {"cpus": 2, "memory_mb": 4096, "disk_gb": 20, "hardened": true}
+        }"#;
+        let session: Session = serde_json::from_str(legacy_json).expect("legacy decode");
+        assert!(
+            session.ssh_keypair.is_none(),
+            "missing ssh_keypair field must default to None on legacy records"
+        );
     }
 
     // ========================================================================

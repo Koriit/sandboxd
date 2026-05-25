@@ -22,6 +22,7 @@ schemars.workspace = true
 semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+ssh-key.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
