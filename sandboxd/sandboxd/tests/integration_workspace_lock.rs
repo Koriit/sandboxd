@@ -467,8 +467,8 @@ fn parse_lock_token(body: &[u8]) -> String {
 const LOCAL_WS_IMAGE_TAG: &str = "sandboxd-local-ws-test-rsync:latest";
 const LOCAL_WS_DOCKERFILE: &str = "FROM alpine:latest\n\
 RUN apk add --no-cache rsync shadow \\\n\
-    && groupadd --gid 1000 agent \\\n\
-    && useradd --uid 1000 --gid 1000 --shell /bin/sh --create-home agent\n\
+    && groupadd --gid 1000 sandbox \\\n\
+    && useradd --uid 1000 --gid 1000 --shell /bin/sh --create-home sandbox\n\
 ENTRYPOINT [\"sh\", \"-c\", \"exec sleep 3600\"]\n";
 
 static LOCAL_WS_IMAGE_BUILD: Once = Once::new();
@@ -657,7 +657,7 @@ async fn integration_container_local_pull() {
         .await
         .expect("runtime.start");
 
-    // Seed a known nested tree inside the guest. /home/agent is the
+    // Seed a known nested tree inside the guest. /home/sandbox is the
     // writable area on the alpine fixture (mirroring the production
     // lite image's writable mount).
     let seed_status = Command::new("docker")
@@ -666,15 +666,15 @@ async fn integration_container_local_pull() {
             &container_name,
             "sh",
             "-c",
-            "mkdir -p /home/agent/work/sub \
-             && printf 'pulled-from-guest\\n' > /home/agent/work/foo.txt \
-             && printf 'nested-from-guest\\n' > /home/agent/work/sub/bar.txt",
+            "mkdir -p /home/sandbox/work/sub \
+             && printf 'pulled-from-guest\\n' > /home/sandbox/work/foo.txt \
+             && printf 'nested-from-guest\\n' > /home/sandbox/work/sub/bar.txt",
         ])
         .status()
         .expect("docker exec for guest seed");
     assert!(
         seed_status.success(),
-        "guest-side seed of /home/agent/work/{{foo.txt,sub/bar.txt}} must succeed"
+        "guest-side seed of /home/sandbox/work/{{foo.txt,sub/bar.txt}} must succeed"
     );
 
     // Host destination — a fresh empty tempdir. The pull should
@@ -686,11 +686,11 @@ async fn integration_container_local_pull() {
     // output for a pull on the container backend:
     //   rsync -aL --delete --filter=':- .gitignore'
     //         -e "docker exec -i"
-    //         sandbox-<id>:/home/agent/work/  <host_dst>/
+    //         sandbox-<id>:/home/sandbox/work/  <host_dst>/
     //
     // Trailing slashes on both ends are load-bearing: rsync mirrors
     // the *contents* of the directory, not the directory entry itself.
-    let remote = format!("{container_name}:/home/agent/work/");
+    let remote = format!("{container_name}:/home/sandbox/work/");
     let host_arg = format!("{}/", host_dst_path.display());
     let pull_output = Command::new("rsync")
         .args([
@@ -715,7 +715,7 @@ async fn integration_container_local_pull() {
     assert_eq!(
         foo.trim(),
         "pulled-from-guest",
-        "host destination must carry the guest's /home/agent/work/foo.txt verbatim"
+        "host destination must carry the guest's /home/sandbox/work/foo.txt verbatim"
     );
 
     // Nested file pulled to the host.

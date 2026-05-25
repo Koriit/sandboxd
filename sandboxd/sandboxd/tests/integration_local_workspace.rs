@@ -86,18 +86,19 @@ use tokio::net::UnixStream;
 // client speaks the remote-server protocol against the in-container
 // `rsync --server` worker.
 
-// Image contract: alpine + `rsync` + an `agent` user matching the
-// runtime's `--user 1000:1000` flag, with `/home/agent` owned by
-// agent so the docker volume (also mounted at `/home/agent`) is
-// initialised with agent's ownership at first mount. The production
-// lite image follows the same pattern (`useradd --uid 1000 ... agent
-// && install -d -o agent -g agent /home/agent/workspace`); we keep
-// the bare essentials needed for rsync to write under `/home/agent/`.
+// Image contract: alpine + `rsync` + a `sandbox` user matching the
+// runtime's `--user 1000:1000` flag, with `/home/sandbox` owned by
+// sandbox so the docker volume (also mounted at `/home/sandbox`) is
+// initialised with sandbox's ownership at first mount. The production
+// lite image follows the same pattern (`useradd --uid 1000 ...
+// sandbox && install -d -o sandbox -g sandbox /home/sandbox/workspace`);
+// we keep the bare essentials needed for rsync to write under
+// `/home/sandbox/`.
 const LOCAL_WS_IMAGE_TAG: &str = "sandboxd-local-ws-test-rsync:latest";
 const LOCAL_WS_DOCKERFILE: &str = "FROM alpine:latest\n\
 RUN apk add --no-cache rsync shadow \\\n\
-    && groupadd --gid 1000 agent \\\n\
-    && useradd --uid 1000 --gid 1000 --shell /bin/sh --create-home agent\n\
+    && groupadd --gid 1000 sandbox \\\n\
+    && useradd --uid 1000 --gid 1000 --shell /bin/sh --create-home sandbox\n\
 ENTRYPOINT [\"sh\", \"-c\", \"exec sleep 3600\"]\n";
 
 static LOCAL_WS_IMAGE_BUILD: Once = Once::new();
@@ -348,13 +349,13 @@ async fn integration_container_local_create_and_push() {
     let (session_id, container_name, _guards) = start_container(None).await;
     let session_name = format!("sandbox-{session_id}");
 
-    // Push from <host>/srv to /home/agent/work inside the guest. We
+    // Push from <host>/srv to /home/sandbox/work inside the guest. We
     // pick a writable guest path because the alpine fixture has a
     // writable rootfs; the breaking default (guest_path ==
     // host_path) is exercised by the shared-guest-path sibling
     // file, not here — this test pins the explicit-guest-path arm.
     let host_arg = host_root.join("srv").to_string_lossy().to_string();
-    let guest_arg = "/home/agent/work";
+    let guest_arg = "/home/sandbox/work";
     run_initial_push(
         BackendKind::Container,
         &session_name,
@@ -366,21 +367,21 @@ async fn integration_container_local_create_and_push() {
     .expect("run_initial_push happy path must succeed");
 
     // Top-level file at the bind target.
-    let foo = docker_exec_capture(&container_name, &["cat", "/home/agent/work/foo.txt"]);
+    let foo = docker_exec_capture(&container_name, &["cat", "/home/sandbox/work/foo.txt"]);
     assert_eq!(
         foo, "hello from host",
-        "create-time push must mirror <host>/srv/foo.txt → /home/agent/work/foo.txt"
+        "create-time push must mirror <host>/srv/foo.txt → /home/sandbox/work/foo.txt"
     );
 
     // Nested file under the bind target.
-    let bar = docker_exec_capture(&container_name, &["cat", "/home/agent/work/sub/bar.txt"]);
+    let bar = docker_exec_capture(&container_name, &["cat", "/home/sandbox/work/sub/bar.txt"]);
     assert_eq!(
         bar, "nested-bytes",
         "create-time push must mirror nested entries under the guest path"
     );
 
     // Bind target's existence as a directory inside the guest.
-    let kind = docker_exec_capture(&container_name, &["stat", "-c", "%F", "/home/agent/work"]);
+    let kind = docker_exec_capture(&container_name, &["stat", "-c", "%F", "/home/sandbox/work"]);
     assert_eq!(
         kind, "directory",
         "guest path must exist as a directory after --mkpath; got: {kind}"
@@ -415,7 +416,7 @@ async fn integration_local_gitignore_filter() {
     std::fs::write(host_root.join("excluded/secret.txt"), b"hidden\n").expect("write secret.txt");
 
     let host_arg = host_root.to_string_lossy().to_string();
-    let guest_arg = "/home/agent/work";
+    let guest_arg = "/home/sandbox/work";
 
     // -- Run #1: default filter, `excluded/` must be dropped --------------
     {
@@ -432,7 +433,7 @@ async fn integration_local_gitignore_filter() {
         .expect("default-filter push must succeed");
 
         // `kept.txt` survives the filter.
-        let kept = docker_exec_capture(&container_name, &["cat", "/home/agent/work/kept.txt"]);
+        let kept = docker_exec_capture(&container_name, &["cat", "/home/sandbox/work/kept.txt"]);
         assert_eq!(kept, "keep-me");
 
         // `excluded/` must be absent. Use `test -e` via `sh -c` so the
@@ -443,7 +444,7 @@ async fn integration_local_gitignore_filter() {
                 &container_name,
                 "sh",
                 "-c",
-                "test -e /home/agent/work/excluded && echo PRESENT || echo ABSENT",
+                "test -e /home/sandbox/work/excluded && echo PRESENT || echo ABSENT",
             ])
             .output()
             .expect("docker exec test -e");
@@ -474,7 +475,7 @@ async fn integration_local_gitignore_filter() {
 
         let secret = docker_exec_capture(
             &container_name,
-            &["cat", "/home/agent/work/excluded/secret.txt"],
+            &["cat", "/home/sandbox/work/excluded/secret.txt"],
         );
         assert_eq!(
             secret, "hidden",
@@ -534,7 +535,7 @@ async fn integration_local_create_failure_tears_down() {
     let (session_id, _container_name, _guards) = start_container(None).await;
     let session_name = format!("sandbox-{session_id}");
     let host_arg = host_root.to_string_lossy().to_string();
-    let guest_arg = "/home/agent/work";
+    let guest_arg = "/home/sandbox/work";
 
     let result = run_initial_push(
         BackendKind::Container,

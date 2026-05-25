@@ -486,11 +486,14 @@ fn capabilities_for_container() -> Capabilities {
         // container backend: `Shared` advertises a Docker bind-mount
         // (the daemon threads `workspace_bind` from the
         // request through `ContainerNetwork`, and `docker create --mount`
-        // lights up at create time); `Clone` advertises the same in-guest
-        // `git clone <url> /home/agent/workspace/` flow Lima uses — the
-        // daemon dispatches it via the backend-agnostic `GuestConnector`
-        // after the lite container's entrypoint (`sandbox-guest`) is up,
-        // mirroring the Lima `--repo` path.
+        // lights up at create time); `Clone` advertises the same
+        // in-guest `git clone <url> <home>/workspace/` flow Lima uses —
+        // the daemon dispatches it via the backend-agnostic
+        // `GuestConnector` after the lite container's entrypoint
+        // (`sandbox-guest`) is up, mirroring the Lima `--repo` path.
+        // The literal home path diverges by backend (container:
+        // `/home/sandbox`, Lima: `/home/agent`); the shape of the
+        // clone-into-`<home>/workspace` contract does not.
         workspace_modes: EnumSet::all(),
     }
 }
@@ -535,12 +538,12 @@ fn build_create_argv(
     let dns_arg = network.gateway_ip.to_string();
     let ip_arg = network.container_ip.to_string();
     let label_arg = format!("sandbox.session_id={session_id}");
-    let home_mount = format!("type=volume,src={home_volume},dst=/home/agent");
+    let home_mount = format!("type=volume,src={home_volume},dst=/home/sandbox");
     let workspace_mount = network.workspace_bind.as_ref().map(|bind| {
         // The bind target is the operator-resolved `guest_path`,
         // unified with Lima's workspace mount. The home volume
-        // mounts at `/home/agent`; a bind whose `guest_path` lands
-        // anywhere under `/home/agent` shadows the volume's
+        // mounts at `/home/sandbox`; a bind whose `guest_path`
+        // lands anywhere under `/home/sandbox` shadows the volume's
         // content at that subpath, which is the intended semantics
         // (operator-supplied workspace files take precedence over
         // the volume's empty contents).
@@ -589,6 +592,18 @@ fn build_create_argv(
         "seccomp=builtin".to_string(),
         "--cap-drop".to_string(),
         "ALL".to_string(),
+        // Lower the privileged-port floor inside the container netns so
+        // the in-image sshd can bind `127.0.0.1:22` as uid 1000 without
+        // CAP_NET_BIND_SERVICE. The sysctl is namespaced (net), applies
+        // only to this container, and works under `--cap-drop ALL +
+        // no-new-privileges` because no capability or privilege gain
+        // is involved on the sshd side — the kernel simply treats 22+
+        // as unprivileged for this netns. sshd is reachable only via
+        // the daemon-mediated `docker exec` byte mover (delivered in a
+        // later session); the container does not expose port 22 to
+        // the host.
+        "--sysctl".to_string(),
+        "net.ipv4.ip_unprivileged_port_start=22".to_string(),
         "--user".to_string(),
         user_arg,
         "--pids-limit".to_string(),
@@ -1688,7 +1703,7 @@ mod tests {
         let rt = test_runtime();
         let sid = SessionId::generate();
         let host_path = std::path::PathBuf::from("/tmp/workspace-fixture");
-        let guest_path = std::path::PathBuf::from("/home/agent/work");
+        let guest_path = std::path::PathBuf::from("/home/sandbox/work");
         let bind = WorkspaceBind {
             host_path: host_path.clone(),
             guest_path: guest_path.clone(),

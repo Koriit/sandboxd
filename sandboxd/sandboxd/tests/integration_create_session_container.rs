@@ -557,11 +557,12 @@ fn integration_create_session_container_rejects_hardened() {
 /// advertises `workspace_modes: { Shared, Clone }`. `Shared` threads the
 /// operator-supplied host path through `ContainerNetwork::workspace_bind`
 /// and `ContainerRuntime` turns it into a `docker create --mount type=bind,...`
-/// flag with the unified bind target `/home/agent/workspace/`. `Clone`
-/// is dispatched in-guest after the lite container's entrypoint
-/// (`sandbox-guest`) is up: the daemon issues `git clone <url>
-/// /home/agent/workspace/` through the backend-agnostic `GuestConnector`,
-/// mirroring the Lima `--repo` path.
+/// flag. `Clone` is dispatched in-guest after the lite container's
+/// entrypoint (`sandbox-guest`) is up: the daemon issues `git clone
+/// <url> <home>/workspace/` through the backend-agnostic
+/// `GuestConnector`, mirroring the Lima `--repo` path. The literal
+/// home dir diverges by backend (container: `/home/sandbox`, Lima:
+/// `/home/agent`); the shape of the workspace contract does not.
 ///
 /// This test pins three pieces of the public contract:
 ///   1. The capability matrix advertises exactly `{ Shared, Clone }` —

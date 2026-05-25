@@ -9,7 +9,7 @@ For the broader security model that lite mode plugs into, see [Hardening](/sandb
 
 ## What lite mode is
 
-A lite session is a container-backed session: instead of a Lima/QEMU VM, the session lives inside a Docker container running an Ubuntu-based image with the same `sandbox-guest` agent the Lima backend uses. Activate it explicitly per session with either flag — the two are equivalent:
+A lite session is a container-backed session: instead of a Lima/QEMU VM, the session lives inside a Docker container running an Ubuntu-based image with the same `sandbox-guest` agent the Lima backend uses. The lite image ships with a small bundled `sshd` listening on `127.0.0.1:22` inside the container's network namespace (not exposed to the host) so the daemon-mediated SSH and SSH-shaped operations (`sandbox ssh`, `sandbox cp`, `sandbox sync`, `git-remote-sandbox`, external SSH tooling) reach a session through the same mechanism on both backends. The in-container guest user is named `sandbox` (uid 1000); the Lima backend continues to use `agent` (uid 1000) on its VM. Activate lite mode explicitly per session with either flag — the two are equivalent:
 
 ```bash
 sandbox create --name fast --lite
@@ -47,7 +47,7 @@ These are the capabilities the Lima backend has and the lite backend does not �
 The session contract does not change with the backend. Across both lite and Lima you keep:
 
 - **Workspace bind mount.** `--workspace shared:<path>` and `--workspace clone:<repo>` work the same way on both backends.
-- **Per-session home volume.** `/home/agent` lives in a named Docker volume `sandbox-home-{session_id}` for lite sessions — it survives `sandbox stop` / `sandbox start` and is deleted with `sandbox rm`. The Lima backend offers the equivalent on top of its VM disk. Either way you get state within a session, clean slate between sessions.
+- **Per-session home volume.** `/home/sandbox` lives in a named Docker volume `sandbox-home-{session_id}` for lite sessions — it survives `sandbox stop` / `sandbox start` and is deleted with `sandbox rm`. The Lima backend offers the equivalent (`/home/agent` on its VM disk; Lima keeps the historical `agent` username). Either way you get state within a session, clean slate between sessions.
 - **Gateway and policy parity.** Per-session gateway container, per-session bridge, per-session CA, TLS interception, applied policy, and DNS-driven egress filtering all run identically on both backends.
 - **Same CLI surface.** `sandbox cp`, `sandbox ssh`, `sandbox exec`, `git-remote-sandbox`, `sandbox logs`, `sandbox policy update` — every command works against both backends without flags.
 
