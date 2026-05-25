@@ -1,5 +1,6 @@
 .PHONY: build fmt fmt-check test test-integration test-e2e test-e2e-container test-e2e-matrix test-install-e2e test-install-e2e-quick gateway-image lite-image docs-dev docs-build clean \
-	setup-dev-env install-route-helper-prod-cap install-route-helper-test-cap setup-bridge-conf setup-users-conf setup-bridge-helper-setuid
+	setup-dev-env install-route-helper-prod-cap install-route-helper-test-cap setup-bridge-conf setup-users-conf setup-bridge-helper-setuid \
+	setup-sandbox-user setup-operator-group-membership setup-test-sudoers-fragment
 
 # Green/reset for ✓ confirmation lines. TTY-aware: empty when stdout
 # is piped/redirected, so non-TTY consumers (CI logs, `less` without
@@ -259,8 +260,152 @@ USERS_CONF_PATH             := /etc/sandboxd/users.conf
 BRIDGE_CONF_PATH            := /etc/qemu/bridge.conf
 QEMU_BRIDGE_HELPER_PATH     := /usr/lib/qemu/qemu-bridge-helper
 
-setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap setup-bridge-conf setup-users-conf setup-bridge-helper-setuid
+# Path of the sudoers fragment authorising the operator to run the
+# fallback `sudo -u sandbox` daemon launch without a password prompt.
+# `setup-test-sudoers-fragment` writes this file; the e2e harness
+# reads it back via the `SANDBOXD_TEST_SUDOERS_FRAGMENT` env-var name
+# (no consumers need the raw path beyond visudo validation here, so
+# keeping it as a Makefile-local constant is enough).
+TEST_SUDOERS_FRAGMENT_PATH  := /etc/sudoers.d/sandboxd-test
+
+setup-dev-env: install-route-helper-prod-cap install-route-helper-test-cap setup-bridge-conf setup-users-conf setup-bridge-helper-setuid setup-sandbox-user setup-operator-group-membership setup-test-sudoers-fragment
 	@echo "$(GREEN)✓ make setup-dev-env complete$(RESET)"
+
+# setup-sandbox-user — create the `sandbox` system user and group
+# that the e2e harness drops the daemon to. Mirrors the production
+# `install.sh` Step 12 behaviour (system user, no-create-home,
+# no-login shell, `/var/lib/sandbox` as $HOME). Adds the user to the
+# `docker` and `kvm` groups when they exist so the daemon can reach
+# `/dev/kvm` and the Docker socket without root.
+#
+# Idempotence:
+#
+#   - User present  → print `✓ already configured` and invoke no sudo.
+#   - User missing  → emit a `[sudo]` announce line first, then
+#                     `sudo useradd`. Group adds via `usermod -aG`
+#                     are themselves idempotent (already-member is a
+#                     no-op exit 0).
+#
+# Group-only pre-existing state (group `sandbox` exists but the
+# matching user does not, as can happen on hosts whose group was
+# created by an earlier partial setup) is detected separately and
+# left untouched — `useradd --user-group` would refuse to create a
+# group that already exists, so we pass the existing group through
+# `--gid sandbox` when only the group is present.
+setup-sandbox-user:
+	@if getent passwd sandbox >/dev/null 2>&1; then \
+	  echo "$(GREEN)✓ already configured: system user 'sandbox' exists$(RESET)"; \
+	else \
+	  if getent group sandbox >/dev/null 2>&1; then \
+	    echo "[sudo] useradd --system --gid sandbox --no-create-home --home-dir /var/lib/sandbox --shell /usr/sbin/nologin sandbox  (group already exists; binding user to it)"; \
+	    sudo -k useradd \
+	        --system \
+	        --gid sandbox \
+	        --no-create-home \
+	        --home-dir /var/lib/sandbox \
+	        --shell /usr/sbin/nologin \
+	        --comment "sandboxd - isolated environment broker" \
+	        sandbox; \
+	  else \
+	    echo "[sudo] useradd --system --user-group --no-create-home --home-dir /var/lib/sandbox --shell /usr/sbin/nologin sandbox"; \
+	    sudo -k useradd \
+	        --system \
+	        --user-group \
+	        --no-create-home \
+	        --home-dir /var/lib/sandbox \
+	        --shell /usr/sbin/nologin \
+	        --comment "sandboxd - isolated environment broker" \
+	        sandbox; \
+	  fi; \
+	fi
+	@if getent group docker >/dev/null 2>&1; then \
+	  if id -nG sandbox 2>/dev/null | tr ' ' '\n' | grep -qx docker; then \
+	    echo "$(GREEN)✓ already configured: user 'sandbox' is in group 'docker'$(RESET)"; \
+	  else \
+	    echo "[sudo] usermod -aG docker sandbox"; \
+	    sudo -k usermod -aG docker sandbox; \
+	  fi; \
+	fi
+	@if getent group kvm >/dev/null 2>&1; then \
+	  if id -nG sandbox 2>/dev/null | tr ' ' '\n' | grep -qx kvm; then \
+	    echo "$(GREEN)✓ already configured: user 'sandbox' is in group 'kvm'$(RESET)"; \
+	  else \
+	    echo "[sudo] usermod -aG kvm sandbox"; \
+	    sudo -k usermod -aG kvm sandbox; \
+	  fi; \
+	fi
+
+# setup-operator-group-membership — add the invoking operator
+# ($USER) to the `sandbox` group so the operator's CLI can read/write
+# the daemon socket at `/run/sandbox/sandboxd.sock` (mode 0660,
+# group=sandbox). Idempotent: an already-member operator is a no-op.
+#
+# Implementation note: group changes do **not** take effect in the
+# current login session. The operator must log out + back in, or run
+# subsequent commands inside `sg sandbox -c '...'`, before the new
+# group is visible. The e2e harness asserts group membership at
+# start-up (see `tests/e2e/conftest.py`) and fails loudly with the
+# remediation instructions if the test process is not in the group.
+setup-operator-group-membership:
+	@if [ -z "$$USER" ] || [ "$$USER" = "root" ]; then \
+	  echo "$(GREEN)✓ already configured: operator-group-add skipped (no non-root $$USER set)$(RESET)"; \
+	elif id -nG "$$USER" 2>/dev/null | tr ' ' '\n' | grep -qx sandbox; then \
+	  echo "$(GREEN)✓ already configured: operator '$$USER' is in group 'sandbox'$(RESET)"; \
+	else \
+	  echo "[sudo] usermod -aG sandbox $$USER  (operator-group membership; new group visible after re-login or via 'sg sandbox -c …')"; \
+	  sudo -k usermod -aG sandbox "$$USER"; \
+	  echo "$(GREEN)✓ added '$$USER' to group 'sandbox' — re-login (or 'sg sandbox -c …') required for the change to take effect in the current shell$(RESET)"; \
+	fi
+
+# setup-test-sudoers-fragment — install a NOPASSWD sudoers fragment
+# that authorises the invoking operator ($USER) to run **only** the
+# freshly-built workspace test binary at
+# `sandboxd/target/debug/sandboxd` as the `sandbox` user, without a
+# password prompt. The e2e harness falls back to
+# `sudo -u sandbox <test-binary>` when systemd is not available
+# (`/run/systemd/system` missing); CI hosts without this fragment in
+# place would silently hang on the password prompt and exhaust the
+# wait-for-socket deadline with no actionable error.
+#
+# Scope is intentionally narrow: the fragment whitelists the **one**
+# absolute path of the workspace's debug `sandboxd` binary plus the
+# CLI flags the harness passes (`--socket`, `--base-dir`). It does
+# not authorise running any other binary as `sandbox`, nor any other
+# user as `sandbox`. The fragment is validated via `visudo -c -f` on
+# a tempfile before being installed at the canonical path, so a
+# malformed fragment never lands in `/etc/sudoers.d/` (a broken
+# fragment there can disable sudo system-wide).
+#
+# Idempotence: if the canonical path already contains the exact text
+# we would write, print `✓ already configured` and invoke no sudo.
+setup-test-sudoers-fragment:
+	@if [ -z "$$USER" ] || [ "$$USER" = "root" ]; then \
+	  echo "$(GREEN)✓ already configured: sudoers fragment skipped (no non-root $$USER set)$(RESET)"; \
+	else \
+	  test_binary="$$(pwd)/sandboxd/target/debug/sandboxd"; \
+	  fragment_envkeep="Defaults!$$test_binary env_keep += \"SANDBOX_USERS_CONF SANDBOX_BASE_VM_NAME SANDBOX_SOCKET\""; \
+	  fragment="$$USER ALL=(sandbox) NOPASSWD: $$test_binary, $$test_binary *"; \
+	  tmp=$$(mktemp); \
+	  printf '# Managed by `make setup-test-sudoers-fragment` — do not edit.\n# Allows the e2e harness to launch sandboxd as the `sandbox`\n# system user via the fallback path (sudo -u sandbox <test-binary> …)\n# when systemd is unavailable. The path is the absolute path of the\n# checked-out workspace`s debug build of sandboxd; re-run the make\n# target after moving the workspace to a new location.\n#\n# The env_keep directive is required for the harness to propagate the\n# SANDBOX_USERS_CONF tempfile path and SANDBOX_BASE_VM_NAME through\n# sudo (which strips the environment by default).\n%s\n%s\n' "$$fragment_envkeep" "$$fragment" > "$$tmp"; \
+	  chmod 0440 "$$tmp"; \
+	  if sudo -k visudo -c -f "$$tmp" >/dev/null 2>&1; then \
+	    : ok; \
+	  else \
+	    echo "ERROR: generated sudoers fragment failed visudo validation. Contents:"; \
+	    cat "$$tmp"; \
+	    rm -f "$$tmp"; \
+	    exit 1; \
+	  fi; \
+	  if sudo -k test -f $(TEST_SUDOERS_FRAGMENT_PATH) && sudo -k cmp -s "$$tmp" $(TEST_SUDOERS_FRAGMENT_PATH); then \
+	    echo "$(GREEN)✓ already configured: $(TEST_SUDOERS_FRAGMENT_PATH) matches expected NOPASSWD fragment$(RESET)"; \
+	    rm -f "$$tmp"; \
+	  else \
+	    echo "[sudo] install -o root -g root -m 0440 <validated-fragment> $(TEST_SUDOERS_FRAGMENT_PATH)"; \
+	    echo "      contents: $$fragment"; \
+	    sudo -k install -o root -g root -m 0440 "$$tmp" $(TEST_SUDOERS_FRAGMENT_PATH); \
+	    rm -f "$$tmp"; \
+	  fi; \
+	fi
 
 # install-route-helper-prod-cap — production cap'd install at the
 # canonical FHS-libexec path. Default-feature build (no
