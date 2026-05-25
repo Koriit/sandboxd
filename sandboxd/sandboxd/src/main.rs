@@ -1309,6 +1309,7 @@ fn app(state: Arc<AppState>) -> Router {
             post(acquire_workspace_lock).delete(release_workspace_lock),
         )
         .route("/sessions/{id}/health", get(session_health))
+        .route("/sessions/{id}/ssh-config", get(get_ssh_config))
         .route("/rebuild-image", post(rebuild_image))
         .route("/base-image-status", get(base_image_status))
         .route("/health", get(health_check))
@@ -1976,6 +1977,103 @@ async fn create_session(
                     );
                 }
             };
+            // Per-session SSH credential staging.
+            //
+            // The cross-user CLI access spec puts every CLI operation
+            // that reaches *inside* a session through the daemon, with
+            // SSH-shaped commands tunnelling through a per-session
+            // sshd via `ProxyCommand`. The keypair is generated once
+            // here at session-create time and persisted in
+            // `sessions.ssh_keypair_json` (V007). The public half is
+            // staged to disk under `{base_dir}/sessions/<id>/ssh/`
+            // along with synthetic `/etc/passwd` and `/etc/group`
+            // overlays, and bind-mounted into the container at
+            // `docker create` time.
+            //
+            // **Why the synthetic /etc/passwd**: when `daemon_uid !=
+            // 1000` (the cross-user case the M18 milestone exists to
+            // fix), OpenSSH's `getpwuid(geteuid())` lookup fails
+            // inside the container because the in-image `sandbox`
+            // user is uid 1000 but the container runs under the
+            // daemon's uid. todo #221's decision (b) overlays a
+            // single-entry passwd file that maps the runtime uid to
+            // the `sandbox` account, reusing the same tmpfs bind-mount
+            // surface as the authorized_keys injection. The
+            // alternatives — forcing `--user 1000:1000` and
+            // re-architecting workspace bind-mount ownership (option
+            // a), or rebuilding the lite image per uid (option c) —
+            // were rejected for higher blast radius.
+            let ssh_host_dir = state
+                .base_dir
+                .join("sessions")
+                .join(session_id.as_str())
+                .join("ssh");
+            let ssh_keypair_for_staging =
+                match sandbox_core::SshKeypair::generate(session_id.as_str()) {
+                    Ok(kp) => kp,
+                    Err(e) => {
+                        cleanup_net_ca_and_return!(
+                            state,
+                            session_id,
+                            error_response(e).into_response()
+                        );
+                    }
+                };
+            {
+                // Stage the three files (authorized_keys, passwd,
+                // group) on a blocking task — `stage_ssh_credentials`
+                // performs sync I/O. `daemon_uid`/`daemon_gid` come
+                // from the container runtime's configured identity so
+                // the synthetic passwd entry matches whatever uid the
+                // container will actually run under at
+                // `--user <uid>:<gid>` time.
+                let ssh_host_dir_owned = ssh_host_dir.clone();
+                let kp_owned = ssh_keypair_for_staging.clone();
+                let daemon_uid = state.container_runtime.user_uid();
+                let daemon_gid = state.container_runtime.user_gid();
+                let stage_result = tokio::task::spawn_blocking(move || {
+                    sandbox_core::backend::stage_ssh_credentials(
+                        &ssh_host_dir_owned,
+                        &kp_owned,
+                        daemon_uid,
+                        daemon_gid,
+                    )
+                })
+                .await;
+                match stage_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        cleanup_net_ca_and_return!(
+                            state,
+                            session_id,
+                            error_response(e).into_response()
+                        );
+                    }
+                    Err(e) => {
+                        cleanup_net_ca_and_return!(
+                            state,
+                            session_id,
+                            error_response(SandboxError::Internal(format!(
+                                "spawn_blocking join failed staging ssh credentials: {e}"
+                            )))
+                            .into_response()
+                        );
+                    }
+                }
+            }
+            // Persist the keypair onto the session row so the
+            // `GET /sessions/{id}/ssh-config` handler can serve it
+            // later. Per-caller isolation: `set_ssh_keypair` filters
+            // on the owner_username column, same as every other
+            // per-session mutation in the store.
+            if let Err(e) =
+                state
+                    .store
+                    .set_ssh_keypair(&session_id, &operator.name, &ssh_keypair_for_staging)
+            {
+                cleanup_net_ca_and_return!(state, session_id, error_response(e).into_response());
+            }
+
             let container_network = sandbox_core::backend::ContainerNetwork {
                 docker_network: network_info.docker_network_name.clone(),
                 container_ip,
@@ -1991,6 +2089,11 @@ async fn create_session(
                 // mechanism because the lite container's rootfs is
                 // read-only.
                 ca_host_path: Some(ca_dir.join("cert.pem")),
+                // Per-session SSH staging: the runtime emits three
+                // `--mount type=bind,readonly` flags pointing at the
+                // three files we just staged above
+                // (authorized_keys + synthetic passwd / group).
+                ssh_host_dir: Some(ssh_host_dir),
             };
             state
                 .container_runtime
@@ -6339,6 +6442,127 @@ async fn session_health(
     };
 
     (StatusCode::OK, Json(health)).into_response()
+}
+
+/// `GET /sessions/{id}/ssh-config` — serve the per-session SSH client
+/// config block plus the private key for the calling operator.
+///
+/// Implements the cross-user CLI access spec § Daemon API → ssh-config:
+///
+/// * Container sessions: read the keypair persisted in
+///   `sessions.ssh_keypair_json` (V007 migration). Pre-V007 rows
+///   surface as `Session.ssh_keypair == None`; we map that to
+///   `404 Not Found` with the typed `SSH_NOT_AVAILABLE` error token
+///   in the response body. Lazy keypair generation is explicitly
+///   out of scope — injecting a new `authorized_keys` into a running
+///   container would require sshd hot-reload that the lite image is
+///   not designed for.
+/// * Lima sessions: Lima manages per-VM SSH credentials on disk under
+///   the daemon's `~/.lima/_config/user{,.pub}`. The daemon reads the
+///   private half on demand and serves it through the same DTO
+///   shape, so M18-S5's CLI can dispatch backend-agnostically.
+///
+/// Session ownership is enforced via the existing
+/// `get_session_by_name_or_id(&id, &operator.name)` path — a foreign
+/// owner's session is invisible (returns the same 404 as a truly
+/// non-existent session id, per the per-caller isolation rule).
+///
+/// **Trust-model note**: the private key bytes are returned in the
+/// response body to a peercred-authenticated caller. Per the
+/// cross-user CLI access spec security considerations, any member of
+/// the `sandbox` OS group is trusted with every session's private
+/// key (the trust model the daemon already enforces by virtue of
+/// socket-group membership). Tightening this surface (per-session
+/// capability tokens, daemon-issued SSH certificates, etc.) was
+/// considered and explicitly deferred in the spec's Alternatives
+/// section.
+async fn get_ssh_config(
+    State(state): State<Arc<AppState>>,
+    Extension(operator): Extension<OperatorIdentity>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let session = match state.store.get_session_by_name_or_id(&id, &operator.name) {
+        Ok(Some(s)) => s,
+        Ok(None) => return error_response(SandboxError::SessionNotFound(id)).into_response(),
+        Err(e) => return error_response(e).into_response(),
+    };
+
+    let private_key = match session.backend {
+        BackendKind::Container => match session.ssh_keypair.as_ref() {
+            Some(kp) => kp.private.clone(),
+            None => {
+                // V007 forward-compat: pre-migration container rows
+                // carry `ssh_keypair = None`. The typed
+                // `SSH_NOT_AVAILABLE` token is the wire signal M18-S5
+                // matches on to render the operator-actionable
+                // "recreate this session" message.
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(sandbox_core::ApiError::new(
+                        "SSH_NOT_AVAILABLE: this session pre-dates the per-session SSH \
+                         keypair (V007). Recreate the session to enable cross-user SSH \
+                         access: `sandbox rm <id> && sandbox create ...`",
+                    )),
+                )
+                    .into_response();
+            }
+        },
+        BackendKind::Lima => {
+            // Lima manages its own SSH credentials under
+            // `~/.lima/_config/user` (private) and the matching `.pub`
+            // (public). The daemon (running as `sandbox`) reads its
+            // own home directory; the CLI never sees the file
+            // directly. A `spawn_blocking` is appropriate even for
+            // this small read because the handler dispatches off the
+            // async runtime.
+            let key_result = tokio::task::spawn_blocking(read_lima_user_private_key).await;
+            match key_result {
+                Ok(Ok(k)) => k,
+                Ok(Err(e)) => return error_response(e).into_response(),
+                Err(e) => {
+                    return error_response(SandboxError::Internal(format!(
+                        "spawn_blocking join failed reading Lima user key: {e}"
+                    )))
+                    .into_response();
+                }
+            }
+        }
+    };
+
+    let config = sandbox_core::render_ssh_config_block(session.id.as_str());
+    let dto = sandbox_core::SshConfigDto {
+        config,
+        private_key,
+    };
+    (StatusCode::OK, Json(dto)).into_response()
+}
+
+/// Read the daemon's Lima-managed SSH private key from
+/// `~/.lima/_config/user`. Returns the file contents verbatim as an
+/// OpenSSH-format string.
+///
+/// The daemon runs as the `sandbox` system user (per M18-S1's
+/// systemd-unit launch posture); Lima writes the key under that user's
+/// home directory at `~/.lima/_config/user`. The file mode is 0600 (set
+/// by Lima at write time) so only the daemon process can read it.
+/// This helper is invoked from `get_ssh_config` to serve the private
+/// half to the calling operator over the peercred-authenticated socket.
+fn read_lima_user_private_key() -> Result<String, SandboxError> {
+    // Resolve the daemon's `$HOME` rather than assuming
+    // `/home/sandbox`; integration tests run the daemon under their
+    // own uid + home, and Lima follows `$HOME` for its config dir.
+    let home_dir = std::env::var_os("HOME").ok_or_else(|| {
+        SandboxError::Internal(
+            "HOME environment variable is not set; cannot locate Lima user key".to_string(),
+        )
+    })?;
+    let path = PathBuf::from(home_dir).join(".lima/_config/user");
+    std::fs::read_to_string(&path).map_err(|e| {
+        SandboxError::Internal(format!(
+            "failed to read Lima user key {}: {e}",
+            path.display()
+        ))
+    })
 }
 
 /// JSON body for `POST /rebuild-image`.

@@ -142,6 +142,7 @@ impl TestNetwork {
             // covered by the unit test
             // `container_runtime_create_includes_ca_mount_when_path_set`.
             ca_host_path: None,
+            ssh_host_dir: None,
         }
     }
 }

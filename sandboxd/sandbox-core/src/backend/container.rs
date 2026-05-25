@@ -269,6 +269,35 @@ pub struct ContainerNetwork {
     /// bind-mount + env-var path achieves the same effect without
     /// touching the rootfs. `None` means no CA injection.
     pub ca_host_path: Option<PathBuf>,
+    /// Optional host path of the per-session SSH staging directory
+    /// holding the three files the runtime bind-mounts into the
+    /// container for the daemon-mediated SSH proxy:
+    ///
+    /// * `authorized_keys` → `/run/sandbox/authorized_keys` —
+    ///   the public half of the per-session ed25519 keypair, read by
+    ///   the in-image sshd via its `AuthorizedKeysFile` directive.
+    /// * `passwd` → `/etc/passwd` — synthetic, single-entry passwd
+    ///   file mapping the container's runtime uid (which may be the
+    ///   daemon's uid rather than the in-image 1000 when host-side
+    ///   bind-mount uid alignment is required) to the `sandbox`
+    ///   account. The cross-user CLI access todo #221 decision was
+    ///   option (b): a synthetic `/etc/passwd` overlay reuses the
+    ///   tmpfs surface we already need for the authorized_keys
+    ///   bind-mount, so sshd's `getpwuid(geteuid())` call succeeds
+    ///   under any daemon uid without breaking the workspace
+    ///   bind-mount uid-alignment contract.
+    /// * `group` → `/etc/group` — symmetric one-entry group file for
+    ///   sshd's `getgrgid` lookup.
+    ///
+    /// When `Some`, the daemon has staged the three files; the runtime
+    /// emits the three `--mount type=bind,readonly` flags at
+    /// `docker create` time. When `None`, the lite-image still has its
+    /// best-effort sshd path (the launch wrapper logs a startup
+    /// failure and falls through to `sandbox-guest`); the
+    /// `GET /sessions/{id}/ssh-config` endpoint surfaces `404
+    /// SSH_NOT_AVAILABLE` for any container session whose row reaches
+    /// the runtime without staged credentials.
+    pub ssh_host_dir: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -373,6 +402,19 @@ impl ContainerRuntime {
     /// the daemon version → tag mapping at the call site.
     pub fn image_tag(&self) -> &str {
         &self.image_tag
+    }
+
+    /// In-container runtime uid (the `--user <uid>:<gid>` flag's
+    /// uid half). Exposed so the daemon's session-create path can
+    /// stamp the synthetic `/etc/passwd` overlay (todo #221, decision
+    /// (b)) with the same uid the container will actually run under.
+    pub fn user_uid(&self) -> u32 {
+        self.user_uid
+    }
+
+    /// In-container runtime gid — symmetric to [`Self::user_uid`].
+    pub fn user_gid(&self) -> u32 {
+        self.user_gid
     }
 
     /// Register the per-session network info this runtime needs at
@@ -554,6 +596,7 @@ fn build_create_argv(
         )
     });
     let ca_args = build_ca_mount_args(network);
+    let ssh_args = build_ssh_mount_args(network);
     // per-caller isolation — the installed
     // `sandbox-guest` is bind-mounted read-only at the canonical
     // in-container path so refresh becomes `docker restart` rather
@@ -630,6 +673,15 @@ fn build_create_argv(
     }
 
     args.extend(ca_args);
+    // Per-session SSH credential bind-mounts (authorized_keys +
+    // synthetic /etc/passwd and /etc/group). See
+    // [`build_ssh_mount_args`] and the field doc on
+    // [`ContainerNetwork::ssh_host_dir`] for the
+    // todo-#221 decision rationale: option (b) — overlay a synthetic
+    // passwd file so OpenSSH's getpwuid lookup succeeds under any
+    // daemon uid, without breaking the workspace bind-mount uid
+    // alignment contract.
+    args.extend(ssh_args);
 
     // Trailing positional: image tag — must come last so subsequent
     // entrypoint args (none here) line up with the docker CLI grammar.
@@ -1123,6 +1175,54 @@ const SANDBOX_CA_ENV_VARS: &[&str] = &[
 /// intercepted by mitmproxy through Envoy, and the synthesized server
 /// cert is signed by the per-session CA. The system Ubuntu bundle is
 /// never the right answer for that traffic.
+/// Compose the per-session SSH credential bind-mount flags.
+///
+/// Returns three `--mount type=bind,...,readonly` argv pairs (six
+/// strings total) when [`ContainerNetwork::ssh_host_dir`] is `Some`,
+/// pointing at the three files the daemon staged under the per-session
+/// SSH directory:
+///
+/// * `<dir>/authorized_keys` → `/run/sandbox/authorized_keys` — read
+///   by the in-image sshd's `AuthorizedKeysFile` directive.
+/// * `<dir>/passwd` → `/etc/passwd` — synthetic one-entry passwd file
+///   resolving the daemon's runtime uid to the `sandbox` account so
+///   OpenSSH's `getpwuid(geteuid())` lookup succeeds even when the
+///   container runs under a uid that is not in the in-image passwd
+///   file (todo #221, decision (b) — see field doc on
+///   [`ContainerNetwork::ssh_host_dir`]).
+/// * `<dir>/group` → `/etc/group` — symmetric one-entry group file for
+///   sshd's `getgrgid` lookup.
+///
+/// All three are mounted `readonly`. Each individual `--mount
+/// type=bind` lands on top of the corresponding tmpfs / read-only
+/// rootfs entry; Docker resolves mount order so the per-file bind
+/// shadows the in-image content at exactly that path without
+/// re-introducing a writable surface.
+///
+/// `Vec::new()` when `ssh_host_dir` is `None` — pre-V007 sessions
+/// (or unit-test fixtures that omit the SSH wiring) still produce a
+/// valid `docker create` argv with the launch wrapper's best-effort
+/// sshd taking its existing failure path.
+fn build_ssh_mount_args(network: &ContainerNetwork) -> Vec<String> {
+    let Some(dir) = network.ssh_host_dir.as_ref() else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(6);
+    for (file_name, dst) in [
+        ("authorized_keys", "/run/sandbox/authorized_keys"),
+        ("passwd", "/etc/passwd"),
+        ("group", "/etc/group"),
+    ] {
+        let src = dir.join(file_name);
+        out.push("--mount".to_string());
+        out.push(format!(
+            "type=bind,src={},dst={dst},readonly",
+            src.to_string_lossy()
+        ));
+    }
+    out
+}
+
 fn build_ca_mount_args(network: &ContainerNetwork) -> Vec<String> {
     let Some(ca_path) = network.ca_host_path.as_ref() else {
         return Vec::new();
@@ -1368,6 +1468,121 @@ pub fn map_container_uid_gid(daemon_uid: u32, daemon_gid: u32) -> (u32, u32) {
         0 | 1000 => (1000, 1000),
         _ => (daemon_uid, daemon_gid),
     }
+}
+
+/// Stage the per-session SSH credential files under `dir` so the
+/// container runtime can bind-mount them into the new container at
+/// `docker create` time.
+///
+/// Writes three files inside `dir` (creating `dir` if it does not
+/// already exist):
+///
+/// * `authorized_keys` — the public half of `keypair`. Read by the
+///   in-image sshd via its `AuthorizedKeysFile /run/sandbox/authorized_keys`
+///   directive. File mode `0644` (operator-readable; the sshd's
+///   `StrictModes no` setting in the lite-image config tolerates the
+///   bind-mount's loose ownership).
+/// * `passwd` — synthetic one-entry passwd file mapping the daemon's
+///   `daemon_uid` to the `sandbox` account at `/home/sandbox`,
+///   `/bin/bash`. This is the todo-#221 decision (b): an in-container
+///   `/etc/passwd` overlay so OpenSSH's `getpwuid(geteuid())` lookup
+///   succeeds under any daemon uid, without breaking the workspace
+///   bind-mount uid-alignment contract.
+/// * `group` — synthetic one-entry group file for the symmetric
+///   `getgrgid` lookup.
+///
+/// `daemon_uid` / `daemon_gid` are the host-side identifiers the
+/// container runs under — when the daemon runs as uid 1000 these
+/// match the in-image `sandbox` user trivially; when the daemon
+/// runs as a system uid (the common production case for the
+/// `sandbox` system user added in M18-S1) these are non-1000 and
+/// the synthetic `/etc/passwd` overlay is what lets sshd start.
+///
+/// **Trust-model note**: the per-session SSH key is stored plaintext
+/// in this staging directory because the directory lives under
+/// `{base_dir}/sessions/<id>/` (mode 0700, owned by the daemon),
+/// and the file mode is the boundary. Any member of the `sandbox`
+/// OS group can already request the keypair via the daemon API per
+/// the cross-user CLI access spec; on-disk staging only widens the
+/// surface to "anyone who can read the daemon's `base_dir`", which
+/// is by construction the same set.
+pub fn stage_ssh_credentials(
+    dir: &Path,
+    keypair: &crate::ssh::SshKeypair,
+    daemon_uid: u32,
+    daemon_gid: u32,
+) -> Result<(), SandboxError> {
+    use std::fs;
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::create_dir_all(dir).map_err(|e| {
+        SandboxError::Internal(format!(
+            "failed to create SSH staging dir {}: {e}",
+            dir.display()
+        ))
+    })?;
+    // 0700 on the directory — only the daemon should be able to
+    // traverse it before the container picks the files up via
+    // bind-mount.
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|e| {
+        SandboxError::Internal(format!(
+            "failed to chmod 0700 on SSH staging dir {}: {e}",
+            dir.display()
+        ))
+    })?;
+
+    // authorized_keys: the OpenSSH-format pubkey on a single line.
+    // sshd appends a trailing newline parser tolerance, but writing
+    // one explicitly keeps the file shape predictable in diagnostics
+    // and avoids depending on `ssh-key`'s trailing-newline policy.
+    let mut pubkey_line = keypair.public.clone();
+    if !pubkey_line.ends_with('\n') {
+        pubkey_line.push('\n');
+    }
+    write_staging_file(&dir.join("authorized_keys"), pubkey_line.as_bytes(), 0o644)?;
+
+    // Synthetic /etc/passwd. Single entry mapping the runtime uid to
+    // the `sandbox` username sshd's `AllowUsers sandbox` directive
+    // accepts. Format: `user:x:uid:gid:gecos:home:shell`. `x` in the
+    // password slot defers to PAM / shadow which is irrelevant here
+    // (`PasswordAuthentication no` in the in-image sshd config), but
+    // is required syntactically; OpenSSH's `getpwuid()` does not
+    // consult it.
+    let passwd_line =
+        format!("sandbox:x:{daemon_uid}:{daemon_gid}:Sandbox guest user:/home/sandbox:/bin/bash\n");
+    write_staging_file(&dir.join("passwd"), passwd_line.as_bytes(), 0o644)?;
+
+    // Synthetic /etc/group. Single entry for the matching gid. The
+    // trailing empty member list is conventional for one-user groups.
+    let group_line = format!("sandbox:x:{daemon_gid}:\n");
+    write_staging_file(&dir.join("group"), group_line.as_bytes(), 0o644)?;
+
+    // Helper closure factored out so error wrapping is uniform
+    // across the three files.
+    fn write_staging_file(path: &Path, bytes: &[u8], mode: u32) -> Result<(), SandboxError> {
+        let mut f = std::fs::File::create(path).map_err(|e| {
+            SandboxError::Internal(format!(
+                "failed to create SSH staging file {}: {e}",
+                path.display()
+            ))
+        })?;
+        f.write_all(bytes).map_err(|e| {
+            SandboxError::Internal(format!(
+                "failed to write SSH staging file {}: {e}",
+                path.display()
+            ))
+        })?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|e| {
+            SandboxError::Internal(format!(
+                "failed to chmod {mode:o} on SSH staging file {}: {e}",
+                path.display()
+            ))
+        })?;
+        Ok(())
+    }
+
+    Ok(())
 }
 
 /// Best-effort host CPU count. Falls back to 2.0 when
@@ -1681,6 +1896,7 @@ mod tests {
             workspace_bind: None,
             route_helper_path: None,
             ca_host_path: None,
+            ssh_host_dir: None,
         };
         rt.register_session(sid, net.clone());
         let got = rt.lookup_session(&sid).expect("registered");
@@ -1718,6 +1934,7 @@ mod tests {
             // branch).
             route_helper_path: Some(std::path::PathBuf::from("sandbox-route-helper")),
             ca_host_path: None,
+            ssh_host_dir: None,
         };
         rt.register_session(sid, net);
         let got = rt.lookup_session(&sid).expect("registered");
@@ -1782,6 +1999,7 @@ mod tests {
             workspace_bind: None,
             route_helper_path: None,
             ca_host_path: Some(host_path.clone()),
+            ssh_host_dir: None,
         };
 
         let args = build_ca_mount_args(&net);
@@ -1836,6 +2054,7 @@ mod tests {
             workspace_bind: None,
             route_helper_path: None,
             ca_host_path: None,
+            ssh_host_dir: None,
         };
         assert!(
             build_ca_mount_args(&no_ca).is_empty(),
@@ -1862,6 +2081,7 @@ mod tests {
             workspace_bind: None,
             route_helper_path: None,
             ca_host_path: None,
+            ssh_host_dir: None,
         };
         let guest_bind_source =
             std::path::PathBuf::from("/usr/local/libexec/sandboxd/sandbox-guest");
@@ -1939,6 +2159,7 @@ mod tests {
             workspace_bind: Some(bind),
             route_helper_path: None,
             ca_host_path: None,
+            ssh_host_dir: None,
         };
         let guest_bind_source =
             std::path::PathBuf::from("/usr/local/libexec/sandboxd/sandbox-guest");
@@ -2107,6 +2328,7 @@ mod tests {
                 workspace_bind: None,
                 route_helper_path: None,
                 ca_host_path: None,
+                ssh_host_dir: None,
             },
         );
         // `hardened: false` so we move past `SessionSpec::validate` (which
@@ -2297,5 +2519,217 @@ mod tests {
         assert_eq!(map_container_uid_gid(1000, 1000), (1000, 1000));
         assert_eq!(map_container_uid_gid(1500, 1500), (1500, 1500));
         assert_eq!(map_container_uid_gid(1500, 2000), (1500, 2000));
+    }
+
+    /// `build_ssh_mount_args` returns the expected three `--mount`
+    /// pairs when `ssh_host_dir` is `Some`, and an empty vector
+    /// otherwise. Pins the bind-mount destination paths (read by the
+    /// in-image sshd) against accidental drift; M18-S2's image and
+    /// the daemon's runtime must agree on the same byte sequence.
+    #[test]
+    fn build_ssh_mount_args_emits_three_readonly_pairs() {
+        let dir = std::path::PathBuf::from("/tmp/sandbox-test/ssh");
+        let net = ContainerNetwork {
+            docker_network: "sandbox-net-x".into(),
+            container_ip: "10.0.0.3".parse().unwrap(),
+            gateway_ip: "10.0.0.2".parse().unwrap(),
+            workspace_bind: None,
+            route_helper_path: None,
+            ca_host_path: None,
+            ssh_host_dir: Some(dir.clone()),
+        };
+
+        let args = build_ssh_mount_args(&net);
+        assert_eq!(
+            args.len(),
+            6,
+            "expected three --mount/spec pairs (= 6 strings); got {args:?}"
+        );
+
+        // Each pair must be (--mount, type=bind,src=<dir>/<file>,dst=<dst>,readonly).
+        let pairs: Vec<(&str, &str)> = args
+            .chunks(2)
+            .map(|c| (c[0].as_str(), c[1].as_str()))
+            .collect();
+        let expected = [
+            (
+                "--mount",
+                "type=bind,src=/tmp/sandbox-test/ssh/authorized_keys,\
+                 dst=/run/sandbox/authorized_keys,readonly",
+            ),
+            (
+                "--mount",
+                "type=bind,src=/tmp/sandbox-test/ssh/passwd,dst=/etc/passwd,readonly",
+            ),
+            (
+                "--mount",
+                "type=bind,src=/tmp/sandbox-test/ssh/group,dst=/etc/group,readonly",
+            ),
+        ];
+        for (i, (got, want)) in pairs.iter().zip(expected.iter()).enumerate() {
+            // Strip the formatter's whitespace from the multi-line
+            // expected literal so the assertion compares the exact
+            // byte sequence the runtime emits.
+            let want_spec = want.1.replace("\n                 ", "");
+            assert_eq!(got.0, want.0, "pair {i}: flag mismatch");
+            assert_eq!(got.1, &want_spec, "pair {i}: spec mismatch");
+        }
+    }
+
+    /// Symmetric arm: with `ssh_host_dir == None`, the helper returns
+    /// an empty vector so `args.extend(...)` is a no-op. Pre-V007
+    /// rows (and unit-test fixtures that omit the SSH wiring) keep
+    /// taking the lite-image's best-effort sshd path.
+    #[test]
+    fn build_ssh_mount_args_no_ssh_dir_is_empty() {
+        let net = ContainerNetwork {
+            docker_network: "sandbox-net-y".into(),
+            container_ip: "10.0.0.4".parse().unwrap(),
+            gateway_ip: "10.0.0.2".parse().unwrap(),
+            workspace_bind: None,
+            route_helper_path: None,
+            ca_host_path: None,
+            ssh_host_dir: None,
+        };
+        assert!(build_ssh_mount_args(&net).is_empty());
+    }
+
+    /// `stage_ssh_credentials` writes the three documented files into
+    /// the staging directory with the right contents and permissions.
+    /// The synthetic `/etc/passwd` entry must carry the daemon's uid
+    /// so OpenSSH's `getpwuid(geteuid())` lookup succeeds in the
+    /// container under any `--user <uid>:<gid>` setting (todo #221,
+    /// decision (b)).
+    #[test]
+    fn stage_ssh_credentials_writes_three_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("ssh");
+        let kp = crate::ssh::SshKeypair::generate("0123456789ab").expect("generate");
+
+        stage_ssh_credentials(&dir, &kp, 1500, 1500).expect("stage");
+
+        // The directory itself must be 0700 so only the daemon can
+        // traverse it before docker resolves the bind-mount.
+        let meta = std::fs::metadata(&dir).expect("stat dir");
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o700,
+            "staging dir must be 0700, got {:o}",
+            meta.permissions().mode() & 0o777
+        );
+
+        // authorized_keys: ssh-ed25519 line, single line, ends in newline.
+        let ak = std::fs::read_to_string(dir.join("authorized_keys")).expect("read ak");
+        assert!(ak.starts_with("ssh-ed25519 "), "got: {ak}");
+        assert!(ak.ends_with('\n'), "must end in newline");
+        assert_eq!(
+            ak.trim_end().lines().count(),
+            1,
+            "authorized_keys must be a single line; got {ak:?}"
+        );
+
+        // /etc/passwd overlay: maps the supplied uid to `sandbox` at
+        // /home/sandbox + /bin/bash.
+        let passwd = std::fs::read_to_string(dir.join("passwd")).expect("read passwd");
+        assert!(
+            passwd.contains("sandbox:x:1500:1500:"),
+            "passwd must map the supplied uid/gid to sandbox; got {passwd:?}"
+        );
+        assert!(
+            passwd.contains(":/home/sandbox:/bin/bash"),
+            "passwd must point at /home/sandbox + /bin/bash; got {passwd:?}"
+        );
+
+        // /etc/group overlay: matching one-entry group file.
+        let group = std::fs::read_to_string(dir.join("group")).expect("read group");
+        assert!(
+            group.contains("sandbox:x:1500:"),
+            "group must map the supplied gid to sandbox; got {group:?}"
+        );
+    }
+
+    /// uid-contract regression: when the daemon's uid is *not* 1000,
+    /// the synthetic `/etc/passwd` overlay must still carry that uid
+    /// (not the in-image 1000). Without this, OpenSSH's
+    /// `getpwuid(geteuid())` would fail in the cross-user case the
+    /// M18 milestone exists to fix.
+    #[test]
+    fn stage_ssh_credentials_threads_daemon_uid_into_passwd() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let kp = crate::ssh::SshKeypair::generate("ffffffffffff").expect("generate");
+        stage_ssh_credentials(tmp.path(), &kp, 999, 999).expect("stage");
+        let passwd = std::fs::read_to_string(tmp.path().join("passwd")).expect("read passwd");
+        assert!(
+            passwd.contains(":999:999:"),
+            "synthetic passwd must carry the daemon uid (999), got: {passwd}"
+        );
+    }
+
+    /// End-to-end: when `ContainerNetwork.ssh_host_dir = Some(dir)`,
+    /// `build_create_argv` produces the three expected per-file
+    /// bind-mounts before the trailing image-tag positional, and they
+    /// stay grouped at the end of the flag list so docker's CLI
+    /// grammar accepts them. Mirrors
+    /// `container_run_argv_includes_workspace_bind_mount` in shape.
+    #[test]
+    fn container_run_argv_includes_ssh_bind_mounts() {
+        let sid = SessionId::parse("0123456789ab").expect("valid 12-hex");
+        let ssh_dir = std::path::PathBuf::from("/var/sandbox/sessions/0123456789ab/ssh");
+        let network = ContainerNetwork {
+            docker_network: "sandbox-net-x".into(),
+            container_ip: "10.0.0.3".parse().unwrap(),
+            gateway_ip: "10.0.0.2".parse().unwrap(),
+            workspace_bind: None,
+            route_helper_path: None,
+            ca_host_path: None,
+            ssh_host_dir: Some(ssh_dir.clone()),
+        };
+        let guest_bind_source =
+            std::path::PathBuf::from("/usr/local/libexec/sandboxd/sandbox-guest");
+        let args = build_create_argv(
+            &sid,
+            &network,
+            DEFAULT_LITE_IMAGE_TAG,
+            1500,
+            1500,
+            512,
+            1.0,
+            &guest_bind_source,
+        );
+
+        // The three SSH mounts appear as adjacent `--mount` / spec
+        // pairs. We just check the three dst paths are present
+        // somewhere in the argv — order across the three pairs is
+        // documented in `build_ssh_mount_args`, but we don't pin it
+        // here because the assertion above already covers it.
+        for dst in [
+            "dst=/run/sandbox/authorized_keys",
+            "dst=/etc/passwd",
+            "dst=/etc/group",
+        ] {
+            assert!(
+                args.iter().any(|a| a.contains(dst)),
+                "missing SSH bind-mount with {dst} in argv: {args:?}"
+            );
+        }
+
+        // Image tag must come last; every SSH mount flag must precede
+        // it (docker rejects flags after the positional image arg).
+        let image_idx = args
+            .iter()
+            .position(|a| a == DEFAULT_LITE_IMAGE_TAG)
+            .expect("image tag");
+        for (i, a) in args.iter().enumerate() {
+            if a.contains("dst=/run/sandbox/authorized_keys")
+                || a.contains("dst=/etc/passwd")
+                || a.contains("dst=/etc/group")
+            {
+                assert!(
+                    i < image_idx,
+                    "SSH bind-mount at index {i} must precede image tag at {image_idx}"
+                );
+            }
+        }
     }
 }

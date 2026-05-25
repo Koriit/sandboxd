@@ -135,6 +135,12 @@ impl TestNetwork {
             // `integration_create_session_container_*` exercises the
             // CA-mount wiring end-to-end via `create_session`.
             ca_host_path: None,
+            // SSH staging is wired by the daemon-level integration
+            // tests against a real `create_session` call site; the
+            // runtime-level integration tests stay on the existing
+            // best-effort sshd path documented in the lite-image
+            // launch wrapper.
+            ssh_host_dir: None,
         }
     }
 }
