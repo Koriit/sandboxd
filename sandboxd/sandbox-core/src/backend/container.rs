@@ -32,7 +32,7 @@
 //! - `--tmpfs /run` (`rw,nosuid,nodev,size=16m`) — process-runtime state.
 //! - `--security-opt no-new-privileges` — prevents setuid escalation.
 //! - `--security-opt seccomp=builtin` — Docker's default seccomp profile.
-//!    prints this as `seccomp=default`, which is not a
+//!   prints this as `seccomp=default`, which is not a
 //!   valid Docker CLI argument (Docker reads `default` as a filename and
 //!   exits non-zero). The operator-intent reading is "Docker's default
 //!   seccomp profile" — `builtin` is Docker's documented spelling for

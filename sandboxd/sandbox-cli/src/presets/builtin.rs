@@ -323,7 +323,6 @@ struct RepoTemplate {
 
 /// github-repo templates for `github.com`: git-pack URL set (both the
 /// canonical `.git` form and the no-`.git` form GitHub also serves).
-
 const GITHUB_REPO_GITHUB_COM_TEMPLATES: &[RepoTemplate] = &[
     // `.git`-suffixed URLs — canonical.
     RepoTemplate {
@@ -366,7 +365,6 @@ const GITHUB_REPO_API_TEMPLATES: &[RepoTemplate] = &[RepoTemplate {
 }];
 
 /// github-repo templates for `codeload.github.com` (archive downloads).
-
 const GITHUB_REPO_CODELOAD_TEMPLATES: &[RepoTemplate] = &[
     RepoTemplate {
         method: HttpMethod::Get,
