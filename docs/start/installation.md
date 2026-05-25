@@ -186,7 +186,9 @@ If something goes wrong: the upgrade is auto-recoverable (re-run `sudo sandbox u
 
 ## Developer install (`make setup-dev-env`)
 
-For contributors building sandboxd from source. This path runs the daemon as your own user (not the system `sandbox` user) with state under `~/.local/share/sandboxd/`. Helper installation, bridge-conf, `users.conf`, and the setuid step are folded into `make setup-dev-env`. See [Developer install — build from source](#developer-install--build-from-source) below for the full walkthrough. The two paths can coexist on the same host, but should not run two daemons in parallel: see [Dev-mode vs operator-mode coexistence](#dev-mode-vs-operator-mode-coexistence) below before mixing them.
+For contributors building sandboxd from source. The default ad-hoc developer flow runs the daemon as your own user (not the system `sandbox` user) with state under `~/.local/share/sandboxd/`. Helper installation, bridge-conf, `users.conf`, the `sandbox` system user, operator-group membership, the setuid step, and the e2e harness sudoers fragment are all folded into `make setup-dev-env`. See [Developer install — build from source](#developer-install--build-from-source) below for the full walkthrough. The two paths can coexist on the same host, but should not run two daemons in parallel: see [Dev-mode vs operator-mode coexistence](#dev-mode-vs-operator-mode-coexistence) below before mixing them.
+
+Note that the e2e test suite (M18-S1 onwards) launches the daemon as the dedicated `sandbox` system user — not your own uid — so the operator-vs-daemon-uid split is exercised by every test run. See the [E2E harness selection](#e2e-harness-selection-sandbox_harness) section below for the three available harness modes.
 
 ## KVM setup
 
@@ -454,7 +456,7 @@ Multiple `[sudo]` announce lines do not mean multiple password prompts: `sudo` c
 make setup-dev-env
 ```
 
-This composes the five sub-targets below. Each is independently runnable if you only need to (re)apply one step:
+This composes the sub-targets below. Each is independently runnable if you only need to (re)apply one step:
 
 | Sub-target | What it does |
 |---|---|
@@ -463,8 +465,41 @@ This composes the five sub-targets below. Each is independently runnable if you 
 | `make setup-bridge-conf` | Ensures `/etc/qemu/bridge.conf` authorizes sandbox bridges (`sb-*`); refuses to silently mutate an existing file with conflicting content |
 | `make setup-users-conf` | Installs `/etc/sandboxd/users.conf` from `contrib/users.conf.example` with `$USER` substituted; leaves an existing file alone |
 | `make setup-bridge-helper-setuid` | `chmod u+s /usr/lib/qemu/qemu-bridge-helper` if not already setuid |
+| `make setup-sandbox-user` | Creates the `sandbox` system user and group (mirrors `install.sh` Step 12); adds `sandbox` to the `docker` and `kvm` groups if present. Idempotent. |
+| `make setup-operator-group-membership` | Adds the invoking operator (`$USER`) to the `sandbox` group so the operator's CLI can read/write the daemon socket (mode `0660`, group `sandbox`) when the e2e harness launches the daemon as `sandbox`. Idempotent. **Re-login required for the new group membership to take effect in the current shell** — group changes are inherited only across login boundaries. Wrap subsequent invocations in `sg sandbox -c '…'` as an immediate workaround. |
+| `make setup-test-sudoers-fragment` | Installs `/etc/sudoers.d/sandboxd-test` authorising the invoking operator to run **only** the workspace's debug `sandboxd` binary (absolute path) as the `sandbox` user, without a password prompt. Consumed by the e2e harness's `SANDBOX_HARNESS=sandbox-sudo` fallback when systemd is unavailable. The fragment is validated via `visudo -c` before being installed; a malformed fragment never lands in `/etc/sudoers.d/`. Idempotent. |
 
 The sections below explain what each prerequisite does and document the manual install path if you cannot or do not want to use the make target.
+
+#### `sandbox` system user and operator group membership
+
+The e2e harness (M18-S1 onwards) launches sandboxd as the dedicated `sandbox` system user — mirroring how the production systemd unit at `sandboxd/contrib/systemd/sandboxd.service` runs the daemon — so cross-user CLI paths (`sandbox ssh`, `sandbox cp`, `git-remote-sandbox`, etc.) are exercised against a daemon that does **not** share a uid with the test operator. `make setup-sandbox-user` creates the user with `--system --no-create-home --home-dir /var/lib/sandbox --shell /usr/sbin/nologin` and binds it to the `docker` and `kvm` groups when present, matching `install.sh`'s production path.
+
+The operator's CLI talks to the daemon through a unix-domain socket at `/run/sandbox/sandboxd.sock` (mode `0660`, group `sandbox`). The operator must therefore be a member of the `sandbox` group; `make setup-operator-group-membership` adds them.
+
+**Group changes are not retroactive in your current shell.** After running the make target, log out and back in (or restart your shell), or wrap the next invocation in `sg sandbox -c '…'`. The e2e harness asserts group membership at session start and fails loudly with the same remediation instructions if the test process is not yet in the group.
+
+#### Sudoers fragment for the e2e harness fallback
+
+When systemd is unavailable on the host (CI containers, install-e2e environments that exercise a non-systemd Linux), the e2e harness falls back to launching the daemon via `sudo -u sandbox <workspace>/sandboxd/target/debug/sandboxd …`. Without a NOPASSWD sudoers fragment in place, `sudo` would silently prompt for a password and exhaust the wait-for-socket deadline with no actionable error, so `make setup-test-sudoers-fragment` provisions one scoped narrowly to the workspace's debug binary.
+
+The fragment lives at `/etc/sudoers.d/sandboxd-test`, mode `0440` owned by `root:root`, and authorises **only**:
+
+* The single absolute path `<workspace>/sandboxd/target/debug/sandboxd` (and that path followed by any args).
+* Run as `sandbox` (not any other user).
+* Three env vars in `env_keep` so the harness can thread `SANDBOX_USERS_CONF`, `SANDBOX_BASE_VM_NAME`, and `SANDBOX_SOCKET` through sudo: `Defaults!<binary-path> env_keep += "SANDBOX_USERS_CONF SANDBOX_BASE_VM_NAME SANDBOX_SOCKET"`.
+
+If you move the workspace to a different directory, re-run `make setup-test-sudoers-fragment` so the fragment's absolute path stays consistent with the new location.
+
+#### E2E harness selection (`SANDBOX_HARNESS`)
+
+`tests/e2e/conftest.py` selects between three daemon-launch modes via the `SANDBOX_HARNESS` env var:
+
+| `SANDBOX_HARNESS` value | Daemon launch | Socket path | When to use |
+|-------------------------|---------------|-------------|-------------|
+| `sandbox-systemd` (default) | systemd unit `sandboxd-test.service` (installed automatically each session via drop-in override) | `/run/sandbox/sandboxd.sock` | Default on systemd hosts; auto-falls-back to `sandbox-sudo` when `/run/systemd/system` is missing. |
+| `sandbox-sudo` | `sudo -u sandbox <test-binary>` | `/run/sandbox/sandboxd.sock` | Hosts without systemd, or when iterating on the harness itself. |
+| `test-user` (legacy) | spawned as the pytest process's own uid with temp paths | per-pytest tempdir | Baseline regression check for the diff-the-outcomes runs; this mode will be removed in M18-S9. |
 
 ### users.conf
 
