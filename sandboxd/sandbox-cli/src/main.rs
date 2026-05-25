@@ -5413,11 +5413,17 @@ async fn run_remote_helper() {
         }
     };
 
-    // Determine socket path via the shared helper, which honors SANDBOX_SOCKET
-    // and falls back to the XDG/HOME default. The `--socket` global flag is
-    // not available in remote-helper mode (git controls argv), so the env var
-    // is the only override path here.
-    let socket_path = default_socket_path();
+    // Determine socket path. The `--socket` global flag is not available
+    // in remote-helper mode (git controls argv), so ``SANDBOX_SOCKET`` is
+    // the only override path. Honour it directly here — the rest of the
+    // CLI relies on clap's ``env = "SANDBOX_SOCKET"`` annotation on the
+    // global ``--socket`` arg, which is not consulted in this entry
+    // point. Fall back to the XDG/HOME default when the env var is
+    // unset or empty.
+    let socket_path = std::env::var("SANDBOX_SOCKET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(default_socket_path);
 
     // For slash-less URLs (`sandbox::<session>` with no path), resolve the
     // default repo path from the session's workspace configuration. M17
