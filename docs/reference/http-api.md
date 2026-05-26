@@ -68,6 +68,8 @@ Success status codes are documented per endpoint below.
 | H10 | `GET /sessions/{id}/health` | `404` on foreign ID. |
 | H11 | `GET /sessions/{id}/events` | `404` on foreign ID. |
 | H12 | `GET /sessions/{id}/policy/propagation-status` | `404` on foreign ID. |
+| H13 | `GET /sessions/{id}/ssh-config` | `404` on foreign ID. |
+| H14 | `GET /sessions/{id}/proxy` | `404` on foreign ID — emitted **before** the WebSocket handshake so a foreign-owner caller never sees a successful upgrade followed by an opaque close. |
 
 The four non-session endpoints (`POST /rebuild-image`, `GET /base-image-status`, `GET /health`, `GET /backends`) have no caller filter — they expose only daemon-global state.
 
@@ -172,12 +174,131 @@ Success: `200 OK` with:
 }
 ```
 
+### `GET /sessions/{id}/ssh-config` — per-session SSH config block and private key
+
+No request body. Returns the daemon-emitted OpenSSH client config
+block plus the per-session private key for the calling operator. The
+CLI's [`~/.ssh/sandbox/` management module](/sandboxd/concepts/ssh-access/)
+calls this endpoint on the first SSH-shaped command per session to
+stage the on-disk config and key files.
+
+Success: `200 OK` with an [`SshConfigDto`](#sshconfigdto):
+
+```json
+{
+  "config": "Host sandbox-a1b2c3d4e5f6\n  HostName 127.0.0.1\n  Port 22\n  User sandbox\n  ProxyCommand sandbox proxy a1b2c3d4e5f6\n  ...\n",
+  "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----\n"
+}
+```
+
+The `config` text is generated server-side and ships with an
+`IdentityFile` placeholder (`<CLI-rewrites-this>`) that the CLI
+substitutes for the on-disk key path; the rest of the block is
+written verbatim into `~/.ssh/sandbox/sandbox-<id>`.
+
+Per-backend semantics:
+
+- **Container sessions** — the keypair is read from the session row
+  (persisted at create time, migration `V007`). Container sessions
+  created before `V007` carry no keypair; the daemon returns `404
+  Not Found` with the typed error token `SSH_NOT_AVAILABLE` in the
+  response body. The CLI translates this to a human message
+  instructing the operator to recreate the session — lazy keypair
+  generation is not supported because injecting a new
+  `authorized_keys` into a running container would require sshd
+  hot-reload that the lite image does not provide.
+- **Lima sessions** — the daemon serves the Lima-managed
+  `~/.lima/_config/user` (private half) under the same DTO shape, so
+  the CLI consumes a single endpoint regardless of backend.
+
+Session ownership is enforced per the same per-caller isolation rule
+every other `/sessions/{id}/...` endpoint follows (foreign owner →
+`404 Not Found`, indistinguishable from a truly-missing id).
+
+**Trust-model note**: the private key bytes are returned in the
+response body to a peercred-authenticated caller. Per the [SSH
+access trust model](/sandboxd/concepts/ssh-access/#trust-model), any
+member of the `sandbox` OS group is trusted with every session's
+private key (the trust model the daemon already enforces by virtue of
+socket-group membership).
+
+### `GET /sessions/{id}/proxy` — WebSocket byte mover into the session's sshd
+
+The load-bearing endpoint for every cross-operator SSH operation. The
+caller performs the standard HTTP-to-WebSocket upgrade handshake; the
+daemon responds with `101 Switching Protocols` and the connection
+becomes a WebSocket. After the handshake, the daemon ferries bytes
+bidirectionally between binary WebSocket frames and the session's
+sshd transport. This is what the [`sandbox proxy`
+hidden subcommand](/sandboxd/reference/cli/#sandbox-proxy-hidden)
+exercises through `ProxyCommand`, and what an `ssh sandbox-<id>`
+connection ultimately rides on.
+
+The session-ownership check runs **before** the WebSocket handshake
+— a foreign-owner caller sees `404 Not Found` over plain HTTP rather
+than a successful upgrade followed by an opaque close.
+
+#### Wire contract
+
+- **Binary frames only.** No per-frame framing layer; SSH does its
+  own channel multiplexing inside the tunnel, so the proxy
+  deliberately does not adopt Kubernetes-style channel-id prefix
+  framing.
+- **No SSH-protocol parsing.** The handler is a dumb byte mover.
+  Binary WebSocket frames carry raw SSH bytes; the proxy never
+  inspects the payload. SSH authentication and channel multiplexing
+  happen end-to-end between the operator's SSH client and the
+  in-session sshd.
+
+#### Per-backend transport
+
+- **Container** — daemon spawns `docker exec -i <ctr> socat -
+  TCP:127.0.0.1:22` with async pipes and ferries bytes between the
+  WebSocket halves and the child's stdio.
+- **Lima** — daemon discovers the host-side TCP port that Lima
+  forwards to the in-VM sshd's port 22 via `limactl list --json`'s
+  `sshLocalPort` field, then opens a `tokio::net::TcpStream` to
+  `127.0.0.1:<sshLocalPort>` and ferries bytes between the WebSocket
+  halves and the stream.
+
+#### Close codes
+
+On structured failure the daemon closes the WebSocket with an
+application-specific code from the IANA-reserved private range
+(4000–4999) so it does not collide with RFC 6455 standard codes or
+`tokio-tungstenite` reserved codes:
+
+| Code | Symbol | When |
+|------|--------|------|
+| `4001` | `BACKEND_UNAVAILABLE` | Backend dial / readiness failure — sshd is not listening, the VM/container is stopped, the route helper is down, etc. |
+| `4002` | `BACKEND_ERROR` | Backend exited non-zero or unexpectedly mid-stream. |
+
+Clean disconnects close with the standard `1000 Normal Closure`. The
+exact set of close codes is committed to the wire format from this
+release onward; consumers (the CLI's `sandbox proxy` shim, and any
+external WebSocket client) may match on them.
+
+#### Async-I/O carve-out
+
+The long-lived byte pumps in the proxy handler deliberately use
+`tokio::process::Command` with async pipes rather than the daemon's
+standard `std::process::Command` + `spawn_blocking` convention — a
+long-lived `docker exec`/`socat` byte pipe held inside
+`spawn_blocking` would occupy a blocking-task slot for the entire SSH
+session (potentially hours under VS Code Remote-SSH or JetBrains
+Gateway) and deadlock the executor under load. The one-shot `limactl
+list` probe used for Lima `sshLocalPort` discovery follows the
+standard convention. See the doc-comment in
+`sandboxd/sandboxd/src/proxy_http.rs` for the full rationale.
+
 ### File transfer
 
-The daemon does not expose HTTP endpoints for file transfer. The CLI's
-`sandbox cp` and `sandbox sync` commands dispatch directly to the
-backend's native copy tool (`limactl cp` / `docker cp`) or to host
-`rsync` over the backend's native shell — see the [CLI
+The daemon does not expose dedicated HTTP endpoints for file
+transfer. The CLI's `sandbox cp` and `sandbox sync` commands
+dispatch to the standard `scp` / `rsync` clients against the
+[`sandbox-<id>` SSH alias](/sandboxd/concepts/ssh-access/) the CLI
+manages under `~/.ssh/sandbox/`; the underlying transport is the
+`GET /sessions/{id}/proxy` WebSocket endpoint above. See the [CLI
 reference](/sandboxd/reference/cli/#sandbox-cp).
 
 ### `GET /sessions/{id}/health` — detailed health
@@ -398,6 +519,32 @@ Success: `200 OK` with:
 Field names and shapes evolve with the capability schema; consult the `sandbox-core::Capabilities` source for the authoritative DTO.
 
 ## Response shapes
+
+### `SshConfigDto`
+
+```json
+{
+  "config": "Host sandbox-a1b2c3d4e5f6\n  HostName 127.0.0.1\n  Port 22\n  User sandbox\n  ProxyCommand sandbox proxy a1b2c3d4e5f6\n  IdentityFile <CLI-rewrites-this>\n  UserKnownHostsFile /dev/null\n  StrictHostKeyChecking no\n  ServerAliveInterval 30\n  ControlMaster auto\n  ControlPath ~/.ssh/sandbox/sockets/%C\n  ControlPersist 60\n",
+  "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----\n"
+}
+```
+
+Two fields, both required:
+
+- `config` is the OpenSSH client config block for the session. The
+  CLI writes it verbatim to `~/.ssh/sandbox/sandbox-<id>` after
+  rewriting the `IdentityFile <CLI-rewrites-this>` placeholder to
+  the on-disk key path. The block contains a `Host sandbox-<id>`
+  alias with `ProxyCommand sandbox proxy <id>`, multiplexing
+  directives, and host-key options. See [SSH access — Per-session
+  config contents](/sandboxd/concepts/ssh-access/#per-session-config-contents)
+  for the full shape.
+- `private_key` is the PEM-encoded OpenSSH private key for the
+  session. The CLI writes it to `~/.ssh/sandbox/sandbox-<id>.key`
+  with mode `0600`. For container sessions this is the per-session
+  ed25519 keypair persisted at create time (migration `V007`); for
+  Lima sessions it is a copy of the daemon's
+  `~/.lima/_config/user` private key.
 
 ### `SessionDto`
 

@@ -68,7 +68,7 @@ sandbox create [OPTIONS]
 | `--cpus <n>` | backend default | Number of CPU cores. Lima sessions fall back to 2 cores; container ("lite") sessions fall back to the daemon's host-80% ceiling. Accepts a fractional value (`0.8`, `1.5`, `2.0`, …); the container backend rounds to one decimal at request-parse time. Lima sessions truncate the fractional part because QEMU's `-smp` flag pins integer cores. Passing a fractional value with an explicit `--backend lima` (or a Lima resolved default) is rejected; use an integer instead. |
 | `--memory <mb>` | backend default | Memory in megabytes. Lima sessions fall back to 4096 MB; container ("lite") sessions fall back to the daemon's host-80% ceiling. |
 | `--disk <gb>` | `20` | Disk size in gigabytes |
-| `--repo <url>` | | Git repository URL to clone into `/home/agent/workspace/` |
+| `--repo <url>` | | Git repository URL to clone into the session's workspace directory (`/home/sandbox/workspace/` on container sessions, `/home/agent/workspace/` on Lima). |
 | `--workspace <mode>` | | Workspace mode (e.g., `shared:/path/to/dir`) |
 | `--boot-cmd <cmd>` | | Command to execute after provisioning |
 | `--policy <path>` | | Path to a policy JSON file to apply after creation |
@@ -258,15 +258,23 @@ List sandbox sessions owned by the invoking operator with their current state, g
 
 The listing is **caller-scoped**: each operator sees only the sessions they created. A session created by another operator is omitted entirely — there is no "owned by X" column because every row is owned by the caller. Running `sudo sandbox ps` lists root-owned sessions; on a freshly-installed host with no root-created sessions, that is normally an empty table. See [Caller identity and per-operator scope](#caller-identity-and-per-operator-scope) for the full ownership model.
 
+By default `sandbox ps`/`sandbox ls` also runs an opportunistic reconcile pass against the local [`~/.ssh/sandbox/` managed area](/sandboxd/concepts/ssh-access/): the CLI computes the diff between the daemon's session list and the on-disk per-session SSH config entries, removes orphans (sessions deleted while the CLI was not running), and writes missing entries for active sessions. This keeps external SSH tooling (VS Code Remote-SSH, JetBrains Gateway, ad-hoc `ssh`/`scp`/`rsync`) honest without the operator having to think about it. Pass [`--no-reconcile`](#sandbox-ps-options) to suppress the pass — see below.
+
 ### Synopsis
 
 ```
-sandbox ps
+sandbox ps [--no-reconcile]
 ```
 
 ### Aliases
 
-`sandbox ls` is an alias for `sandbox ps`.
+`sandbox ls` is an alias for `sandbox ps`. The alias accepts the same options.
+
+### Options {#sandbox-ps-options}
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--no-reconcile` | off | Skip the opportunistic reconcile pass against `~/.ssh/sandbox/`. The command only reads the daemon's session list and prints it — no local SSH-config mutations. Intended for read-only tooling (scripts, monitoring, debugging) where a list operation must not mutate operator state. Note: orphan SSH-config entries left on disk in `--no-reconcile` mode are cleaned up the next time `sandbox ps`/`sandbox ls` runs without the flag, or lazily on the next `sandbox proxy` invocation that returns 404 for the orphan id. |
 
 ### Output columns
 
@@ -295,7 +303,7 @@ cafebabe1234  ci-run      stopped     -            -            2h ago
 
 ## sandbox ssh
 
-Open an interactive SSH session in a sandbox, or run a single command non-interactively. Uses `limactl shell` under the hood.
+Open an interactive SSH session in a sandbox, or run a single command non-interactively. Dispatches to the standard `ssh` client against the `sandbox-<id>` alias the CLI manages under [`~/.ssh/sandbox/`](/sandboxd/concepts/ssh-access/); the underlying transport is the daemon's `GET /sessions/{id}/proxy` WebSocket endpoint.
 
 ### Synopsis
 
@@ -310,6 +318,13 @@ sandbox ssh <session> [-- <command> [args...]]
 | `<session>` | Session name or session ID (see [Session identifiers](#session-identifiers)). |
 | `<command>` | Optional command to run non-interactively (after `--`) |
 
+### Details
+
+- The first invocation per session ensures the managed `~/.ssh/sandbox/sandbox-<id>` config + key files exist and the `Include` block is present at the top of `~/.ssh/config`. Subsequent invocations re-use the on-disk state and the existing ControlMaster multiplex socket if one is live.
+- If the daemon has rotated the per-session key since the local entry was written, the first SSH attempt fails with `Permission denied (publickey)` and the CLI silently re-fetches the config and retries once. The retry is matched **only at the outermost CLI dispatch** — nested invocations through `git-remote-sandbox` cannot stack retries.
+- TTY allocation, terminal resize, and signal forwarding are handled by the standard `ssh` client.
+- The in-session user is `sandbox` on both backends (uid 1000); the home directories differ for historical reasons — `/home/sandbox/` on container sessions, `/home/agent/` on Lima sessions. The SSH config block sets `User sandbox` uniformly.
+
 ### Examples
 
 ```bash
@@ -319,8 +334,8 @@ sandbox ssh my-sandbox
 # Run a single command
 sandbox ssh my-sandbox -- uname -a
 
-# Run a command with arguments
-sandbox ssh my-sandbox -- ls -la /home/agent/workspace
+# Run a command with arguments (container session — adjust path for Lima)
+sandbox ssh my-sandbox -- ls -la /home/sandbox/workspace
 ```
 
 ---
@@ -390,25 +405,27 @@ One of `<src>` or `<dst>` must use the `session:path` format to identify the rem
 
 ### Details
 
-- Dispatches to the backend's native copy tool: `limactl cp -r` for Lima sessions, `docker cp` for container sessions. Both recurse into directories transparently. (No daemon HTTP endpoint is involved; the host running `sandbox cp` needs the same backend binary the daemon would use.)
-- Errors (missing source, permission denied, unreachable session) come from the underlying tool verbatim.
+- Dispatches to the standard `scp` client against the `sandbox-<id>` alias the CLI manages under [`~/.ssh/sandbox/`](/sandboxd/concepts/ssh-access/), uniformly across both backends. The underlying transport is the daemon's `GET /sessions/{id}/proxy` WebSocket endpoint.
+- Recurses into directories transparently (scp's `-r`).
+- Errors (missing source, permission denied, unreachable session) come from `scp` verbatim.
 - Both source and destination cannot be remote.
+- Like [`sandbox ssh`](#sandbox-ssh), a stale local SSH config triggers a single transparent retry after the CLI re-fetches the config from the daemon.
 - For incremental directory mirroring (skip-unchanged, attribute preservation, deletion mirroring), use [`sandbox sync`](#sandbox-sync) instead — `cp` retransfers the full source on every invocation.
 
 ### Examples
 
 ```bash
-# Upload a file to the session
-sandbox cp local/config.toml my-sandbox:/home/agent/workspace/config.toml
+# Upload a file to a container session (use /home/agent/workspace on Lima)
+sandbox cp local/config.toml my-sandbox:/home/sandbox/workspace/config.toml
 
 # Download a file from the session
-sandbox cp my-sandbox:/home/agent/workspace/output.log ./output.log
+sandbox cp my-sandbox:/home/sandbox/workspace/output.log ./output.log
 
 # Upload a build artifact
-sandbox cp ./dist/app.tar.gz ci-run:/home/agent/workspace/app.tar.gz
+sandbox cp ./dist/app.tar.gz ci-run:/home/sandbox/workspace/app.tar.gz
 
-# Upload a directory (recurses transparently on both backends)
-sandbox cp ./dist my-sandbox:/home/agent/workspace/dist
+# Upload a directory (recurses transparently)
+sandbox cp ./dist my-sandbox:/home/sandbox/workspace/dist
 ```
 
 ---
@@ -435,39 +452,41 @@ One of `<src>` or `<dst>` must use the `session:path` format to identify the rem
 
 ### Details
 
-- Dispatches to the host's `rsync` binary with the backend's native shell as rsync's remote-shell transport: `rsync -a --delete -e 'limactl shell' …` for Lima, `rsync -a --delete -e 'docker exec -i' …` for container.
+- Dispatches to the host's `rsync` binary using standard `ssh` as the remote-shell transport against the `sandbox-<id>` alias the CLI manages under [`~/.ssh/sandbox/`](/sandboxd/concepts/ssh-access/): `rsync -a --delete -e ssh ... sandbox-<id>:...`. Both backends use the same shape — the alias resolves the daemon proxy for either runtime.
 - Baseline flag set is `-a --delete`: archive mode (preserves perms, ownership, mtimes, symlinks, recursion) plus mirror semantics (delete destination entries that no longer exist on the source).
 - Pass-through flags after `--` are layered on top of the baseline. Use them for `--exclude`, `--bwlimit`, `--partial`, `--info=progress2`, etc. The CLI does not interpret them — it splices them straight into rsync's argv between the baseline flags and the operands, which is the position rsync's synopsis (`rsync [OPTION...] SRC... [DEST]`) requires.
 - **Requires `rsync` on both the host and inside the session image.** sandboxd-provisioned base images (Lima golden image, Lite container image) include rsync by default. If you supply a custom image, install rsync yourself or `sandbox sync` will fail with `rsync: command not found` from whichever side is missing it.
 - Errors (missing source, permission denied, unreachable session) come from `rsync` verbatim. The exit code is propagated unchanged so callers can branch on rsync's documented exit-code table (`man rsync(1)`).
 - Both source and destination cannot be remote.
+- Like [`sandbox ssh`](#sandbox-ssh), a stale local SSH config triggers a single transparent retry after the CLI re-fetches the config from the daemon.
 
 ### Examples
 
 ```bash
-# Upload a directory tree to the session, preserving attributes
-sandbox sync ./src my-sandbox:/home/agent/workspace/src
+# Upload a directory tree to the container session, preserving attributes
+# (use /home/agent/workspace on Lima)
+sandbox sync ./src my-sandbox:/home/sandbox/workspace/src
 
 # Pull build artifacts back to the host, deleting host-side files
 # that no longer exist in the session (mirror semantics)
-sandbox sync ci-run:/home/agent/workspace/dist ./dist
+sandbox sync ci-run:/home/sandbox/workspace/dist ./dist
 
 # Re-run after editing a few files: rsync only retransfers the deltas
-sandbox sync ./src my-sandbox:/home/agent/workspace/src
+sandbox sync ./src my-sandbox:/home/sandbox/workspace/src
 
 # Demonstrate `--delete`: a file removed locally is removed in the
 # session on the next sync
 rm ./src/obsolete.go
-sandbox sync ./src my-sandbox:/home/agent/workspace/src
-# /home/agent/workspace/src/obsolete.go is now gone in the session too
+sandbox sync ./src my-sandbox:/home/sandbox/workspace/src
+# /home/sandbox/workspace/src/obsolete.go is now gone in the session too
 
 # Pass-through extra rsync flags after `--`. The CLI splices them
-# between the baseline `-a --delete -e <shell>` and the operands.
-sandbox sync ./src my-sandbox:/home/agent/workspace/src \
+# between the baseline `-a --delete -e ssh` and the operands.
+sandbox sync ./src my-sandbox:/home/sandbox/workspace/src \
     -- --exclude '*.log' --exclude 'target/' --info=progress2
 
 # Throttle bandwidth and keep partials across resumed runs.
-sandbox sync ci-run:/home/agent/workspace/artifacts ./out \
+sandbox sync ci-run:/home/sandbox/workspace/artifacts ./out \
     -- --bwlimit=1m --partial
 ```
 
@@ -1036,7 +1055,7 @@ See the [Presets guide](/sandboxd/guides/network-policies/#presets) for a tour o
 
 ## git-remote-sandbox (symlink)
 
-`git-remote-sandbox` is a symlink to the `sandbox` binary, not a subcommand. You never invoke it directly: git does, automatically, whenever it resolves a `sandbox::<session>/<repo-path>` URL. The binary detects it was invoked under that name (via `argv[0]`) and switches into git remote-helper mode, tunneling the git pack protocol over `sandbox ssh` to the repository inside the target session VM.
+`git-remote-sandbox` is a symlink to the `sandbox` binary, not a subcommand. You never invoke it directly: git does, automatically, whenever it resolves a `sandbox::<session>/<repo-path>` URL. The binary detects it was invoked under that name (via `argv[0]`) and switches into git remote-helper mode, tunneling the git pack protocol over [`sandbox ssh`](#sandbox-ssh) to the repository inside the target session.
 
 ### URL format
 
@@ -1047,16 +1066,16 @@ sandbox::<session>/<repo-path>
 | Part | Description |
 |------|-------------|
 | `<session>` | Session name or session ID (see [Session identifiers](#session-identifiers)). |
-| `<repo-path>` | Absolute path to the git repository inside the VM (e.g., `/home/agent/workspace`). If omitted, defaults to `/home/agent/workspace`. |
+| `<repo-path>` | Absolute path to the git repository inside the session (e.g., `/home/sandbox/workspace` for container sessions, `/home/agent/workspace` for Lima). If omitted, defaults to the per-backend workspace path. |
 
 ### Usage
 
 ```bash
-# Clone straight out of a session VM
-git clone sandbox::my-session/home/agent/workspace local-checkout
+# Clone straight out of a container session
+git clone sandbox::my-session/home/sandbox/workspace local-checkout
 
-# Or add the VM as a remote on an existing repo and push/pull normally
-git remote add origin sandbox::my-session/home/agent/workspace
+# Or add the session as a remote on an existing repo and push/pull normally
+git remote add origin sandbox::my-session/home/sandbox/workspace
 git push origin main
 git pull origin main
 ```
@@ -1065,6 +1084,40 @@ git pull origin main
 
 - The `git-remote-sandbox` symlink must be installed on `PATH` alongside the `sandbox` binary; git looks it up by name.
 - The daemon socket path can be overridden with the `SANDBOX_SOCKET` environment variable. The `--socket` global flag is not available in remote-helper mode because git controls argv.
+
+---
+
+## sandbox proxy (hidden) {#sandbox-proxy-hidden}
+
+`sandbox proxy <id>` is the `ProxyCommand` shim invoked by `ssh sandbox-<id>` for every connection that resolves through the managed [`~/.ssh/sandbox/sandbox-<id>`](/sandboxd/concepts/ssh-access/) config block. It is **hidden from `--help`** because operators do not invoke it directly — `ssh` does, automatically, via the generated `ProxyCommand` line.
+
+You may still encounter the subcommand if you read your own managed SSH config or trace an `ssh -v` log. This section documents the contract so the trace is interpretable.
+
+### Synopsis
+
+```
+sandbox proxy <id>
+```
+
+### What it does
+
+- Performs an HTTP-to-WebSocket upgrade against the daemon's [`GET /sessions/{id}/proxy`](/sandboxd/reference/http-api/#get-sessionsidproxy--websocket-byte-mover-into-the-sessions-sshd) endpoint over the same Unix-socket transport every other CLI ⇄ daemon call uses.
+- Bidirectionally ferries bytes between its own stdin/stdout (which `ssh` has connected to its SSH transport) and the WebSocket's binary frames.
+- Performs **no** SSH-protocol parsing, no retry, no drift recovery, no lifecycle cleanup beyond a lazy-404 sweep of the local managed entry when the daemon reports the session no longer exists. SSH authentication and channel multiplexing happen end-to-end between the operator's `ssh` client and the in-session sshd.
+
+### Exit codes
+
+| Exit code | Symbol | Meaning |
+|-----------|--------|---------|
+| `0` | `EXIT_OK` | Clean disconnect — one end half-closed and every byte was ferried across before exit. `ssh` reports a normal exit. |
+| `1` | `EXIT_GENERIC_FAILURE` | Generic failure — I/O error, handshake failure, malformed response, daemon socket unreachable. `ssh` reports the `ProxyCommand` as having failed (typically as `kex_exchange_identification: Connection closed by remote host`). |
+| `2` | `EXIT_SESSION_NOT_FOUND` | Daemon returned `404 Not Found` for the session id. The session either does not exist (typo, since-deleted, or never created) or belongs to another operator. The CLI also lazily cleans the orphaned `~/.ssh/sandbox/sandbox-<id>` entry off this exit. |
+
+The exit-code shape is committed: external tooling that wraps `sandbox proxy` (none ships in v1, but operators may script their own) can branch on these values without observing the stderr message.
+
+### Wire-format note
+
+The subcommand name (`proxy`) and its single positional argument (`<id>`) are wire-format-stable — the daemon-emitted SSH config block carries `ProxyCommand sandbox proxy <id>` verbatim. Renaming the subcommand is a breaking change for every session that ever wrote a managed config entry.
 
 ---
 
