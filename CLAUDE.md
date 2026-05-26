@@ -85,6 +85,7 @@ Test runner: cargo-nextest (config at `sandboxd/.config/nextest.toml`).
 ## Key conventions
 
 - All `std::process::Command` calls in async handlers are wrapped in `tokio::task::spawn_blocking`
+- **Async-I/O carve-out for long-lived child processes.** The `spawn_blocking` rule above applies to one-shot Command invocations (e.g. `limactl list`, `docker inspect`). The proxy WebSocket handler's container path holds a `docker exec ... socat` byte pump open for the entire SSH session (potentially hours under VS Code Remote-SSH or JetBrains Gateway); the Lima path holds an analogous TCP stream. Wrapping either in `spawn_blocking` would occupy a blocking-task slot for the session's lifetime and deadlock the executor under load. These long-lived pumps use `tokio::process::Command` (or `tokio::net::TcpStream`) with async pipes — see the Async-I/O carve-out doc-comment in `sandboxd/sandboxd/src/proxy_http.rs` for the full rationale. Any future "uniformly wrap Command in spawn_blocking" sweep must leave the carve-out site alone.
 - Guest agent communication is already async — do not wrap in spawn_blocking. Transport is a per-backend `socat`-bridged pipe (`limactl shell <vm> -- socat - TCP:127.0.0.1:5123` for Lima, `docker exec <ctr> socat - TCP:127.0.0.1:5123` for container) selected via the `SessionRuntime::guest_transport` seam in `sandbox-core::backend`
 - Error responses use `error_response()` helper that maps `SandboxError` variants to HTTP status codes
 - Handler return type is `impl IntoResponse` — use `match` on spawn_blocking results, not `?` operator
