@@ -24,7 +24,7 @@ Plus the teardown pair:
 | `sandbox stop <session>` | Halt the VM, keep the config. Fast restart later. |
 | `sandbox rm <session>` | Full teardown. Session ID is gone. |
 
-Most of these are thin wrappers around the [HTTP API](/sandboxd/reference/http-api/) — `create`, `exec`, `stop`, and `rm` each map to a single endpoint. `sandbox cp` is the exception: it resolves the session via the API and then dispatches to the backend's native copy tool (`limactl cp` for Lima, `docker cp` for the container backend), so the data path never crosses the daemon. If you want to skip the CLI and speak HTTP over the Unix socket directly, the reference page documents every endpoint.
+`create`, `exec`, `stop`, and `rm` are thin wrappers around the [HTTP API](/sandboxd/reference/http-api/) and each map to a single endpoint. `sandbox cp` (and the related `sandbox ssh` / `sandbox sync`) is a slightly thicker shim: it goes through the standard `scp` / `ssh` / `rsync` client against the [`sandbox-<id>` managed SSH alias](/sandboxd/concepts/ssh-access/), and the underlying byte transport is the daemon's [`GET /sessions/{id}/proxy`](/sandboxd/reference/http-api/#get-sessionsidproxy--websocket-byte-mover-into-the-sessions-sshd) WebSocket. The CLI auto-manages a per-session SSH config block under `~/.ssh/sandbox/` so external tooling (VS Code Remote-SSH, JetBrains Gateway, ad-hoc `scp`/`rsync`) reaches the session through the same alias without the CLI being in the data path. If you want to skip the CLI and speak HTTP over the Unix socket directly, the reference page documents every endpoint.
 
 ## Pattern 1: one-shot run from a shell script
 
@@ -72,7 +72,7 @@ Coding agents like Claude Code typically want to keep a session alive across man
 2. **Per tool call**: `sandbox exec claude-$SESSION -- <cmd>` or `sandbox cp ...`.
 3. **At agent exit**: `sandbox stop claude-$SESSION` (fast restart later) or `sandbox rm` (clean slate).
 
-Using `--workspace shared:$PROJECT_DIR` mounts a host directory into the VM at `/home/agent/workspace` over 9p, so changes the agent makes inside the session are immediately visible on the host and vice versa. See [Workspaces](/sandboxd/guides/workspaces/) for details.
+Using `--workspace shared:$PROJECT_DIR` mounts a host directory into the session's workspace path (`/home/agent/workspace` on Lima, `/home/sandbox/workspace` on container/lite) over 9p (Lima) or bind-mount (container), so changes the agent makes inside the session are immediately visible on the host and vice versa. See [Workspaces](/sandboxd/guides/workspaces/) for details.
 
 Example: a Python wrapper that an agent might use.
 
@@ -169,12 +169,17 @@ But note: the command line (including `"$API_TOKEN"`) is visible in `ps` on the 
 
 ```bash
 echo "$API_TOKEN" > /tmp/token
-sandbox cp /tmp/token my-session:/home/agent/.token
+# The session-side path uses the in-session user's home: ~ resolves to
+# /home/agent on Lima and /home/sandbox on container/lite. The `~`
+# expansion is performed by the session-side shell (or by scp's
+# remote-side argument handling), so the same command works on either
+# backend without per-backend branching.
+sandbox cp /tmp/token my-session:~/.token
 rm /tmp/token
-sandbox exec my-session -- bash -c 'cat /home/agent/.token | curl -H @- https://api.example.com'
+sandbox exec my-session -- bash -c 'cat ~/.token | curl -H @- https://api.example.com'
 ```
 
-File permissions inside the session follow the backend tool's behavior: `sandbox cp` dispatches to `limactl cp` (Lima) or `docker cp` (container), which preserve the source file's mode bits the same way `scp` and `docker cp` do natively. There is no in-band `--mode` knob — chmod the file on the host before copying, or run `sandbox exec <session> -- chmod 600 /home/agent/.token` afterwards.
+File permissions inside the session follow `scp`'s native behavior: `sandbox cp` dispatches the standard `scp` client against the managed `sandbox-<id>` SSH alias, so the source file's mode bits are preserved the same way `scp` does natively. There is no in-band `--mode` knob — chmod the file on the host before copying, or run `sandbox exec <session> -- chmod 600 ~/.token` afterwards.
 
 ## Observability
 

@@ -81,7 +81,7 @@ For an interactive shell, use `sandbox ssh`:
 sandbox ssh hello
 ```
 
-You land in the VM as the `agent` user. The workspace lives at `/home/agent/workspace`. Exit the shell with `Ctrl-D` or `exit`.
+You land in the VM as the `sandbox` user. The workspace lives at `/home/agent/workspace` on this Lima session (the in-VM user is named `sandbox` uniformly on both backends; Lima's home is pinned at `/home/agent/` for historical workspace-path compatibility — `--lite` sessions use `/home/sandbox/workspace`). Exit the shell with `Ctrl-D` or `exit`.
 
 ## 5. Copy files in and out
 

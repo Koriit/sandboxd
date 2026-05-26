@@ -67,15 +67,20 @@ A thin client that builds HTTP requests and sends them to the daemon over the Un
 
 Commands handled via the HTTP API: `create`, `start`, `stop`, `rm`, `ps`/`ls`, `exec`, `policy update`, `policy status`, `events`, `health`, `inspect`, `describe`, `rebuild-image`.
 
-Commands handled client-side (no daemon round-trip beyond the initial session lookup):
+SSH-shaped commands route through a per-session managed SSH config (see [SSH access](/sandboxd/concepts/ssh-access/)). The CLI fetches the per-session config block plus private key from the daemon's `GET /sessions/{id}/ssh-config` endpoint on first use, writes both to `~/.ssh/sandbox/`, ensures the marker-delimited `Include` block at the top of `~/.ssh/config`, and then invokes the standard `ssh` / `scp` / `rsync` clients against the `sandbox-<id>` alias. The underlying transport is the daemon's `GET /sessions/{id}/proxy` WebSocket endpoint (`ProxyCommand sandbox proxy <id>` in the per-session config).
 
-- `ssh` — resolves the session via the API, then invokes `limactl shell` directly.
+- `ssh` — fetches/refreshes the managed config entry, then invokes `ssh sandbox-<id>` (or `ssh sandbox-<id> -- <cmd>`).
+- `cp` — invokes `scp sandbox-<id>:...` uniformly across both backends.
+- `sync` — invokes `rsync -a --delete -e ssh sandbox-<id>:...` uniformly across both backends.
+- `workspace push|pull` — same `rsync` wrapper as `sync`.
 - `logs` — resolves the session via the API, then invokes `docker logs` or `docker exec` to read gateway logs.
-- `cp` — resolves the session, then dispatches to the backend's native copy tool (`limactl cp -r` for Lima, `docker cp` for the container backend). No daemon HTTP endpoint is involved on the data path.
-- `sync` — resolves the session, then runs `rsync -a --delete -e <backend-shell>` against it (`limactl shell` for Lima, `docker exec -i` for the container backend). Same no-daemon-data-path property as `cp`.
 - `policy preset` (`list` / `show` / `expand`) — entirely client-local. Loads built-in presets and any JSON files under `$XDG_CONFIG_HOME/sandboxd/presets/`; does not contact the daemon at all.
 
-The same binary is also installed as a `git-remote-sandbox` symlink. When git invokes it under that name for a `sandbox::` URL, it acts as a git remote helper and spawns `sandbox ssh <session>` to tunnel the git pack protocol to `git-upload-pack` / `git-receive-pack` inside the VM.
+A stale local SSH config (e.g. the daemon rotated the session keypair since the CLI's last invocation) triggers a single transparent retry at the outermost CLI dispatch — the CLI re-fetches the config from `GET /sessions/{id}/ssh-config`, rewrites the on-disk entry, and re-invokes the underlying SSH tool once. The retry is matched **only at the outermost CLI dispatch**, not inside `sandbox proxy`, so nested invocations from `git-remote-sandbox` cannot stack retries.
+
+The same binary is also installed as a `git-remote-sandbox` symlink. When git invokes it under that name for a `sandbox::` URL, it acts as a git remote helper and spawns `sandbox ssh <session>` to tunnel the git pack protocol to `git-upload-pack` / `git-receive-pack` inside the session — the SSH transport rides the same daemon-mediated proxy as every other SSH-shaped command.
+
+External tools that read `~/.ssh/config` (VS Code Remote-SSH, JetBrains Gateway, ad-hoc `ssh`/`scp`/`rsync`) see the same `Host sandbox-<id>` aliases and use them through the same `ProxyCommand` shim without the `sandbox` CLI being in the data path. See [External SSH tools](/sandboxd/guides/external-ssh-tools/).
 
 ### sandbox-guest (VM agent)
 
@@ -88,7 +93,7 @@ Supported operations (one-frame request/response over a length-prefixed JSON pro
 - `Status` — report hostname, uptime, and load average.
 - `Version` — self-report the guest's compile-time protocol and binary versions, used by `sandbox doctor` to detect drift between the daemon-recorded version and the actually-running guest.
 
-File transfer is *not* a guest-agent operation. `sandbox cp` dispatches to the backend's native tool (`limactl cp` for Lima, `docker cp` for container) and `sandbox sync` uses host `rsync` with the backend's shell as the remote-shell transport — both bypass the guest channel entirely. Likewise, git push/pull through `git-remote-sandbox` tunnels the pack protocol over `sandbox ssh` (`limactl shell`), not over the guest agent.
+File transfer is *not* a guest-agent operation. `sandbox cp` dispatches the standard `scp` client against the [`sandbox-<id>` SSH alias](/sandboxd/concepts/ssh-access/), and `sandbox sync` uses host `rsync` with `ssh sandbox-<id>` as the remote-shell transport. Both ride the daemon's `GET /sessions/{id}/proxy` WebSocket endpoint, not the guest agent. Likewise, git push/pull through `git-remote-sandbox` tunnels the pack protocol over `sandbox ssh`, which itself rides the daemon proxy.
 
 ### sandbox-core (shared library)
 
@@ -141,7 +146,7 @@ A session moves through these states:
 5. **Gateway + Network config.** The gateway container is created on the Docker bridge. The VM's bridge NIC is configured with a static IP via the guest agent. The CA certificate is injected into the VM's trust store.
 6. **State transition.** Session state moves to `Running`.
 7. **Policy.** If `--policy` or `--preset` was provided, the effective policy (preset expansions merged with the file) is compiled and distributed to gateway components. A `policy_applied` lifecycle event is emitted carrying the full effective policy plus the CLI's original `source_presets` invocation strings. A DNS propagation loop is started; once the loop has reconciled nftables allow sets and Envoy L3 filter chains to the applied policy, sandboxd emits `policy_propagated` with the policy's SHA-256 hash.
-8. **Workspace.** If `--repo` was provided, the repository is cloned into `/home/agent/workspace/`. If `--workspace shared:<path>` was provided, the host directory is mounted via 9p.
+8. **Workspace.** If `--repo` was provided, the repository is cloned into the session's workspace directory (`/home/sandbox/workspace/` on container sessions, `/home/agent/workspace/` on Lima). If `--workspace shared:<path>` was provided, the host directory is mounted via 9p.
 9. **Boot command.** If `--boot-cmd` was provided, it is executed via the guest agent.
 
 ### Stop
@@ -182,7 +187,8 @@ sandbox exec my-vm -- ls /root
 sandboxd receives request
     |
     +-- GuestConnector.exec(session_id, "ls", ["/root"])
-    |       (via limactl shell -> SSH -> socat -> TCP:5123 -> guest agent)
+    |       (via the daemon's per-backend guest transport — `limactl shell` -> SSH -> socat for Lima,
+    |        `docker exec` -> socat for container — onto the in-guest agent's TCP:5123)
     v
 sandbox-guest executes "ls /root"
     |
@@ -209,6 +215,8 @@ sandbox prints stdout, exits with code 0
 | GET | `/sessions/{id}/policy/propagation-status` | `policy_propagation_status` | Check whether the latest policy hash has propagated to all enforcement layers |
 | GET | `/sessions/{id}/events` | `get_events` | Replay or stream the session's event stream (traffic + lifecycle) |
 | GET | `/sessions/{id}/health` | `session_health` | Per-session health |
+| GET | `/sessions/{id}/ssh-config` | `get_ssh_config` | Per-session OpenSSH client config block + private key |
+| GET | `/sessions/{id}/proxy` | `get_proxy` | WebSocket byte mover into the session's sshd (binary frames; the `ProxyCommand` shim's transport) |
 | GET | `/health` | `health_check` | Global health |
 | GET | `/version` | `version_handler` | Daemon version as JSON `{"version": "X.Y.Z"}`; used by the CLI for the version-equality handshake |
 | GET | `/diagnostics` | `diagnostics_handler` | System-wide and per-operator diagnostic fields, scoped via peer-cred-resolved operator identity |

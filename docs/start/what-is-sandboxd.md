@@ -23,9 +23,9 @@ You talk to the daemon with the `sandbox` CLI over a Unix socket. The CLI create
 
 **You need to see what the agent actually talks to.** mitmproxy intercepts TLS with the per-session CA, so you can inspect HTTPS traffic that would otherwise be opaque. Policy rules can go as deep as matching HTTP methods and paths.
 
-**You want reproducible, disposable environments.** Sessions are cheap. You create one per task, run the agent, capture anything you care about, and remove it. State in `/home/agent/workspace` lives only as long as the session does, unless you bind-mount a host directory with `--workspace shared:<path>`.
+**You want reproducible, disposable environments.** Sessions are cheap. You create one per task, run the agent, capture anything you care about, and remove it. State in the session's workspace directory (`/home/agent/workspace` on Lima, `/home/sandbox/workspace` on container/lite) lives only as long as the session does, unless you bind-mount a host directory with `--workspace shared:<path>`.
 
-**You want to clone and push repositories into the VM without exposing ports.** `git-remote-sandbox` is a symlink to the `sandbox` binary that tunnels the git pack protocol over the daemon's SSH channel, so `git clone sandbox::my-session/home/agent/workspace` just works.
+**You want to clone and push repositories into the VM without exposing ports.** `git-remote-sandbox` is a symlink to the `sandbox` binary that tunnels the git pack protocol over the daemon's SSH proxy, so `git clone sandbox::my-session/home/agent/workspace` (Lima) or `git clone sandbox::my-session/home/sandbox/workspace` (container/lite) just works.
 
 ## When to use it
 

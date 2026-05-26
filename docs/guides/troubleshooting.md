@@ -399,33 +399,37 @@ Fix: filter by `layer=mitmproxy` and the session ID, not by a VM bridge IP. The 
 
 ## File transfer failures
 
-`sandbox cp` dispatches to the backend's native copy tool (`limactl cp` for Lima, `docker cp` for container sessions), so the symptoms you see come from those tools verbatim. The most common failure modes:
+`sandbox cp` dispatches the standard `scp` client against the [`sandbox-<id>` managed SSH alias](/sandboxd/concepts/ssh-access/), and `sandbox sync` does the same with `rsync -e ssh`. Both backends use this uniform path; failures come from `ssh` / `scp` / `rsync` or from the daemon's [`GET /sessions/{id}/proxy`](/sandboxd/reference/http-api/#get-sessionsidproxy--websocket-byte-mover-into-the-sessions-sshd) endpoint that backs the transport.
 
 ### Source file does not exist
 
-**Symptom (Lima):** `lost connection` or `scp: <path>: No such file or directory`. **Symptom (container):** `Error response from daemon: Could not find the file <path> in container ...`.
+**Symptom:** `scp: <path>: No such file or directory` or a similar message from rsync.
 
 Fix: double-check the path on the side reporting the error. Remember the syntax: `session:path` is the session side, plain paths are the host side.
 
 ### Session not running / not found
 
-**Symptom (Lima):** `instance "sandbox-<id>" does not exist` or `instance "sandbox-<id>" is stopped, run `limactl start ...` to start it`. **Symptom (container):** `Error response from daemon: No such container: sandbox-<id>` (when the session was deleted) or — uniquely on the container backend — copy *succeeds* against a stopped container because `docker cp` reads/writes the storage layer directly.
+**Symptom:** `ssh_exchange_identification: Connection closed by remote host` followed by `lost connection` from `scp` or `rsync error: unexplained error (code 255) at ...` from `rsync`. The CLI's outermost dispatch may retry once after re-fetching the SSH config; if the retry also fails the session is genuinely not reachable. `sandbox describe <id>` will tell you the state.
 
-Fix: `sandbox start <session>` first. The container-backend behavior of copying against a stopped container is intentional and matches `docker cp`'s native semantics.
+Fix: `sandbox start <session>` first if the session is stopped. If the session does not exist at all, the daemon returns `404 Not Found` on the proxy endpoint and the CLI lazily cleans up the local `~/.ssh/sandbox/sandbox-<id>` entry; you will see `Could not resolve hostname sandbox-<id>` on the immediate next attempt (the entry is gone).
 
-### `limactl` or `docker` not on PATH
+### `ssh` / `scp` / `rsync` not on PATH
 
-**Symptom:** `Error: failed to execute limactl: ...` or `Error: failed to execute docker: ...`.
+**Symptom:** `command not found: scp` (or `ssh` / `rsync`) from the CLI's underlying dispatch.
 
-Fix: install the missing dependency. The CLI no longer relays file content through the daemon, so the host running `sandbox cp` needs the same binary the daemon would use to manage the session.
+Fix: install the missing client. Standard OpenSSH (`ssh`, `scp`) and `rsync` are required on the host running the CLI; the CLI does not bundle them.
+
+### `Permission denied (publickey)` on first try
+
+**Symptom:** the underlying `ssh` / `scp` / `rsync` invocation prints `Permission denied (publickey)`, then the CLI silently retries once after re-fetching the SSH config from the daemon. If both attempts fail, you'll see the message bubble up.
+
+Fix: this is usually a stale local SSH config combined with a daemon-side key rotation that the CLI's single-retry path did not pick up (e.g. the session was deleted and recreated under the same name out-of-band). Run `sandbox ls` once — its opportunistic reconcile pass will rewrite the `~/.ssh/sandbox/sandbox-<id>` entry to match the daemon's current keypair — then retry the original command.
 
 ### `sandbox sync` against a stopped session
 
-**Symptom (Lima):** rsync's remote-shell exits before the protocol handshake; you'll see something like `instance "sandbox-<id>" is stopped, run \`limactl start ...\` to start it` from `limactl shell` followed by rsync's own `rsync error: unexplained error (code 255) at ...`. **Symptom (container):** `docker exec` exits with `Error response from daemon: Container <hash> is not running` and rsync wraps it in the same `unexplained error (code 255)` line.
+**Symptom:** rsync's `ssh` transport handshakes but the daemon returns close code `4001 BACKEND_UNAVAILABLE` on the WebSocket because the in-session sshd is not reachable; you'll see `Connection closed by remote host` from `ssh` followed by `rsync error: unexplained error (code 255) at ...`.
 
-`sandbox sync` uses `rsync -e "limactl shell"` (Lima) or `rsync -e "docker exec -i"` (container) as its remote-shell transport, and unlike `docker cp`, neither shell can attach to a stopped session — the directory protocol needs a live process on both sides.
-
-Fix: `sandbox start <session>` first.
+Fix: `sandbox start <session>` first. Both `cp` and `sync` need a running session because the daemon-mediated proxy needs a live sshd to ferry bytes into.
 
 ## Performance issues
 

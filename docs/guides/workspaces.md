@@ -32,9 +32,10 @@ sandbox create --name dev \
     --repo https://github.com/myorg/private-repo.git
 ```
 
-The repository lands in `/home/agent/workspace/` inside the VM. Verify it cloned:
+The repository lands in the session's workspace directory inside the VM — `/home/agent/workspace/` on Lima sessions (the default backend), `/home/sandbox/workspace/` on container/lite sessions. Verify it cloned:
 
 ```bash
+# Lima (default backend) — adjust path to /home/sandbox/workspace for --lite sessions.
 sandbox exec dev -- ls /home/agent/workspace
 ```
 
@@ -211,7 +212,7 @@ sandbox workspace pull -f dev
 
 Exactly one of `-f`/`--force` and `-n`/`--dry-run` is required. The CLI refuses bare `sandbox workspace push <s>` with a usage error — the `-f`/`-n` gate is intentional, since both commands always run with `--delete` semantics: deletions on the source are mirrored to the destination. Use `-n` to inspect first, `-f` to apply.
 
-The default flag set is `rsync -aL --delete --filter=':- .gitignore'` plus the backend-appropriate `-e` shell transport (`limactl shell` for Lima, `docker exec -i` for the container backend). Two flags adjust this baseline:
+The default flag set is `rsync -aL --delete --filter=':- .gitignore'` plus `-e ssh` against the [`sandbox-<id>` managed SSH alias](/sandboxd/concepts/ssh-access/), uniformly across both backends. Two flags adjust this baseline:
 
 - `--safe-links` — replace the default `-L` with `--safe-links`. In-tree symlinks are preserved as symlinks; out-of-tree symlinks (anything that resolves outside the source root) are skipped instead of followed. Use this when your tree contains intentional symlinks you want to keep as symlinks, or when you want to avoid following a symlink that points outside the workspace.
 - `--no-gitignore` — drop the `:- .gitignore` filter so the push or pull transfers everything, including ignored files. Useful for `.env`-style files you want copied but cannot un-ignore in your `.gitignore`.
@@ -267,7 +268,7 @@ Copy a directory (recursive by default):
 sandbox cp ./dist dev:/home/agent/workspace/dist
 ```
 
-Under the hood `sandbox cp` dispatches to the backend's native copy tool — `limactl cp` for Lima sessions and `docker cp` for container sessions — so file modes, sparse files, and directory trees are preserved by the same code path your operating system already trusts. Errors (missing source, permission denied, unreachable session) come from those tools verbatim, so they match the diagnostics you would see invoking them directly.
+Under the hood `sandbox cp` dispatches the standard `scp` client against the [`sandbox-<id>` managed SSH alias](/sandboxd/concepts/ssh-access/), uniformly across both backends. File modes, sparse files, and directory trees are preserved exactly the way `scp` preserves them natively. Errors (missing source, permission denied, unreachable session) come from `scp` verbatim, so they match the diagnostics you would see invoking it directly. The underlying byte transport is the daemon's `GET /sessions/{id}/proxy` WebSocket endpoint, so no extra network exposure is opened on the host or in the gateway path.
 
 `sandbox cp` works regardless of which workspace mode you chose at creation time.
 
@@ -299,7 +300,7 @@ sandbox sync ./src dev:/home/agent/workspace/src
 # /home/agent/workspace/src/obsolete.go is now gone in the session too
 ```
 
-Under the hood `sandbox sync` dispatches the host's `rsync` with the backend's native shell as rsync's remote-shell (`-e`) transport — `limactl shell` for Lima, `docker exec -i` for container. The baseline flag set is `-a --delete`: archive mode (perms, ownership, mtimes, symlinks, recursion) plus mirror semantics. Errors and progress reach you in rsync's native form. Out-of-scope: filter rules, partial transfers, bandwidth limits — operators wanting those can run `rsync` directly with the same `-e <rsh>` pattern this command uses.
+Under the hood `sandbox sync` dispatches the host's `rsync` with standard `ssh` as rsync's remote-shell (`-e`) transport against the [`sandbox-<id>` managed SSH alias](/sandboxd/concepts/ssh-access/), uniformly across both backends. The baseline flag set is `-a --delete`: archive mode (perms, ownership, mtimes, symlinks, recursion) plus mirror semantics. Errors and progress reach you in rsync's native form. Out-of-scope: filter rules, partial transfers, bandwidth limits — operators wanting those can run `rsync` directly with the same `-e ssh sandbox-<id>:...` pattern this command uses.
 
 `sandbox sync` and `local:` workspaces both require `rsync` on **both** the host and the guest. sandboxd-provisioned base images (Lima golden image, Lite container image) ship rsync by default. If you supply a custom image, install rsync yourself.
 
@@ -315,7 +316,7 @@ Under the hood `sandbox sync` dispatches the host's `rsync` with the backend's n
 | Operates on operator-supplied paths | Yes (any path) | Yes (any path) | No (paths fixed at session create) |
 | Requires `local:` workspace mode | No | No | Yes |
 | Lock-protected against concurrent invocations | No | No | Yes (per-session daemon mutex) |
-| Backend tool dependency | `limactl` / `docker` | `rsync` (host + session) | `rsync` (host + session) |
+| Host-side tool dependency | `scp` (OpenSSH) | `rsync` (host + session) | `rsync` (host + session) |
 
 ## Sync via `git push` and `git pull`
 

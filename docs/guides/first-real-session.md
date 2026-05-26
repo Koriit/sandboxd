@@ -132,7 +132,7 @@ If you need an interactive session to poke around mid-build, `sandbox ssh`:
 sandbox ssh rust-build
 ```
 
-You land as the `agent` user with the workspace at `/home/agent/workspace`. Exit with `Ctrl-D`.
+You land as the `sandbox` user with the workspace at `/home/agent/workspace` (the in-VM user is named `sandbox` on both backends; Lima's home is pinned at `/home/agent/` for historical workspace-path compatibility). Exit with `Ctrl-D`.
 
 ## 5. Copy the artifact back to your host
 

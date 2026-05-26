@@ -28,7 +28,7 @@ No single mechanism wins on all three. sandboxd exposes six modes so you can pic
 
 ### Clone mode
 
-At session creation, sandboxd runs `git clone` inside the VM to pull a repository into `/home/agent/workspace/`. The clone is a one-shot provisioning step — no ongoing link to the remote exists afterwards. Subsequent updates require either network access (permitted by policy) or one of the other modes.
+At session creation, sandboxd runs `git clone` inside the session to pull a repository into the workspace directory (`/home/sandbox/workspace/` on container sessions, `/home/agent/workspace/` on Lima). The clone is a one-shot provisioning step — no ongoing link to the remote exists afterwards. Subsequent updates require either network access (permitted by policy) or one of the other modes.
 
 Clone is the simplest model for CI-style workloads: the session starts with a known tree, runs some work, and is thrown away.
 
@@ -56,11 +56,11 @@ Shared mount trades isolation for developer ergonomics. The guest has read-write
 
 ### `sandbox cp`
 
-An explicit, scp-style copy between the host and a running session. The CLI dispatches to the backend's native copy tool — `limactl cp` for Lima sessions, `docker cp` for container sessions — so each invocation is a point-in-time transfer with no persistent mount and no network exposure. Good for moving config files, build artifacts, or logs across the boundary without giving up isolation. Notably, the daemon HTTP API is *not* in the path: the host running `sandbox cp` needs the same backend binary the daemon would use to manage the session.
+An explicit, scp-style copy between the host and a running session. The CLI dispatches the standard `scp` client against the [`sandbox-<id>` SSH alias](/sandboxd/concepts/ssh-access/) the daemon manages — uniformly across both backends — so each invocation is a point-in-time transfer with no persistent mount and no network exposure. Good for moving config files, build artifacts, or logs across the boundary without giving up isolation. The underlying transport is the daemon's `GET /sessions/{id}/proxy` WebSocket endpoint, so the data path is mediated by sandboxd's peercred-authenticated socket — no extra ports are opened on the host or in the gateway path.
 
 ### `sandbox sync`
 
-A directory-level delta sync built on `rsync`, using the backend's session tool as the remote-shell transport (`rsync -e "limactl shell"` for Lima, `rsync -e "docker exec -i"` for container). Unlike `sandbox cp`, it transfers only what changed between the source and destination trees and supports recursive directory copy with attribute preservation, includes/excludes, and dry-run via the trailing `-- <rsync-args>` slot. Use it when iterating on a host-side tree that needs to land inside a running session repeatedly without the cost of a full re-copy. The session must be running on both ends — the rsync remote-shell needs a live process to hand off to.
+A directory-level delta sync built on `rsync`, using standard `ssh` as the remote-shell transport (`rsync -a --delete -e ssh sandbox-<id>:...`) against the same managed SSH alias as `sandbox cp`. Unlike `sandbox cp`, it transfers only what changed between the source and destination trees and supports recursive directory copy with attribute preservation, includes/excludes, and dry-run via the trailing `-- <rsync-args>` slot. Use it when iterating on a host-side tree that needs to land inside a running session repeatedly without the cost of a full re-copy. The session must be running on both ends — the rsync remote-shell needs a live process to hand off to.
 
 ### Git remote transport
 
@@ -76,7 +76,7 @@ flowchart LR
     HostFS[("Host<br/>filesystem")]
     Remote(["Remote<br/>git host"])
     VM["Session VM"]
-    WS[("Workspace<br/>/home/agent/workspace")]
+    WS[("Workspace<br/>/home/{sandbox,agent}/workspace")]
 
     Remote -- "clone<br/>(one-shot)" --> WS
     HostFS -- "local:<br/>(rsync, create-time)" --> WS
@@ -94,10 +94,10 @@ All six modes land data in the guest's workspace directory. What differs is the 
 Only shared mount reduces the VM's isolation from the host; the other five modes preserve full isolation.
 
 - **Clone** pulls bytes through the gateway at creation time, then closes the loop. The only lasting exposure is whatever the policy allows for network.
-- **`local:` snapshot** runs `rsync` once during create over the backend's control channel (`limactl shell` or `docker exec -i`). No 9p device is attached and no host directory is bound into the VM; after the push, the host is invisible to the guest's filesystem.
-- **`sandbox cp`** dispatches to `limactl cp` / `docker cp` — both operate over the backend's already-authenticated control channel; no extra network exposure is opened on the host or in the gateway path.
-- **`sandbox sync`** runs `rsync` with the backend's session tool as the remote-shell, so the bytes ride that same control channel. No SSH/rsync daemon is exposed to the network.
-- **Git remote transport** works the same way: the daemon already has a socket into the VM, so git's pack protocol rides it without opening anything new.
+- **`local:` snapshot** runs `rsync` once during create over the daemon's per-backend control channel (`limactl shell` -> socat for Lima, `docker exec` -> socat for container). No 9p device is attached and no host directory is bound into the VM; after the push, the host is invisible to the guest's filesystem.
+- **`sandbox cp`** dispatches `scp sandbox-<id>:...` against the [managed SSH alias](/sandboxd/concepts/ssh-access/) — the bytes ride the daemon's `GET /sessions/{id}/proxy` WebSocket endpoint, gated by the peercred-authenticated socket; no extra network exposure is opened on the host or in the gateway path.
+- **`sandbox sync`** runs `rsync -e ssh sandbox-<id>:...` against the same managed alias, so the bytes ride the same daemon-mediated WebSocket. No SSH/rsync daemon is exposed to the network beyond the in-session sshd, which is loopback-bound inside the session's network namespace.
+- **Git remote transport** works the same way: `git-remote-sandbox` invokes `sandbox ssh` internally, so the pack protocol rides the daemon proxy without opening anything new.
 - **Shared mount** is different. QEMU's 9p filesystem exposes a directory live. The guest can write anything, at any time, to anything under that directory. A VM escape paired with 9p access expands the blast radius to those host files. See [hardening](/sandboxd/guides/hardening/#9p-shared-mounts) for the detailed security-model notes.
 
 ## Boot commands
