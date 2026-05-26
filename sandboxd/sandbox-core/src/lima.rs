@@ -130,8 +130,8 @@ After=network.target
 
 [Service]
 Type=simple
-User=agent
-Group=agent
+User=sandbox
+Group=sandbox
 ExecStart=/usr/local/bin/sandbox-guest
 Restart=always
 RestartSec=5
@@ -1303,7 +1303,7 @@ containerd:
   user: false
 
 user:
-  name: "agent"
+  name: "sandbox"
   home: "/home/agent"
 
 provision:
@@ -1322,12 +1322,17 @@ provision:
     #!/bin/bash
     set -eux -o pipefail
     echo "[sandbox-provision] step=user start=$(date -u +%Y-%m-%dT%H:%M:%S)"
-    # Create agent user with passwordless sudo (if not already present)
-    if ! id agent &>/dev/null; then
-      useradd -m -s /bin/bash agent
+    # Create the in-VM `sandbox` user (uid 1000) with passwordless sudo.
+    # Home is pinned at /home/agent so existing workspace-path literals
+    # baked into rsync, session bootstrap, and the operator-facing
+    # session API (`/home/agent/workspace`) keep working — the username
+    # change is the minimum needed to make the daemon-emitted
+    # `User sandbox` SSH config line resolve on the Lima backend.
+    if ! id sandbox &>/dev/null; then
+      useradd -m -d /home/agent -s /bin/bash sandbox
     fi
-    echo 'agent ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/agent
-    chmod 0440 /etc/sudoers.d/agent
+    echo 'sandbox ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/sandbox
+    chmod 0440 /etc/sudoers.d/sandbox
     echo "[sandbox-provision] step=user done=$(date -u +%Y-%m-%dT%H:%M:%S)"
 - mode: system
   script: |
@@ -1413,9 +1418,9 @@ provision:
       done
       echo "[sandbox-provision] apt-baseline succeeded after $attempt attempt(s)"
     fi
-    # Ensure the workspace directory exists for repo cloning (owned by agent, not root)
+    # Ensure the workspace directory exists for repo cloning (owned by sandbox, not root)
     mkdir -p /home/agent/workspace
-    chown agent:agent /home/agent/workspace
+    chown sandbox:sandbox /home/agent/workspace
     echo "[sandbox-provision] step=apt-baseline done=$(date -u +%Y-%m-%dT%H:%M:%S)"
 - mode: system
   script: |
@@ -1441,7 +1446,7 @@ provision:
         attempt=$((attempt + 1))
         sleep 5
       done
-      usermod -aG docker agent
+      usermod -aG docker sandbox
     fi
     echo "[sandbox-provision] step=docker done=$(date -u +%Y-%m-%dT%H:%M:%S)"
 "#,
@@ -1550,7 +1555,7 @@ containerd:
   user: false
 
 user:
-  name: "agent"
+  name: "sandbox"
   home: "/home/agent"
 
 provision:
@@ -1571,12 +1576,16 @@ provision:
     #!/bin/bash
     set -eux -o pipefail
     echo "[sandbox-provision] step=user start=$(date -u +%Y-%m-%dT%H:%M:%S)"
-    # Create agent user with passwordless sudo (if not already present)
-    if ! id agent &>/dev/null; then
-      useradd -m -s /bin/bash agent
+    # Create the in-VM `sandbox` user (uid 1000) with passwordless sudo.
+    # Home is pinned at /home/agent so existing workspace-path literals
+    # (rsync, session bootstrap, API DTOs) keep working — the username
+    # change is the minimum needed to make the daemon-emitted
+    # `User sandbox` SSH config line resolve on the Lima backend.
+    if ! id sandbox &>/dev/null; then
+      useradd -m -d /home/agent -s /bin/bash sandbox
     fi
-    echo 'agent ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/agent
-    chmod 0440 /etc/sudoers.d/agent
+    echo 'sandbox ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/sandbox
+    chmod 0440 /etc/sudoers.d/sandbox
     echo "[sandbox-provision] step=user done=$(date -u +%Y-%m-%dT%H:%M:%S)"
 - mode: system
   script: |
@@ -1653,9 +1662,9 @@ provision:
       done
       echo "[sandbox-provision] apt-baseline succeeded after $attempt attempt(s)"
     fi
-    # Ensure the workspace directory exists for repo cloning (owned by agent, not root)
+    # Ensure the workspace directory exists for repo cloning (owned by sandbox, not root)
     mkdir -p /home/agent/workspace
-    chown agent:agent /home/agent/workspace
+    chown sandbox:sandbox /home/agent/workspace
     echo "[sandbox-provision] step=apt-baseline done=$(date -u +%Y-%m-%dT%H:%M:%S)"
 - mode: system
   script: |
@@ -1677,7 +1686,7 @@ provision:
         attempt=$((attempt + 1))
         sleep 5
       done
-      usermod -aG docker agent
+      usermod -aG docker sandbox
     fi
     echo "[sandbox-provision] step=docker done=$(date -u +%Y-%m-%dT%H:%M:%S)"
 "#,
@@ -2315,8 +2324,14 @@ mod tests {
             "template should set hostname including the full session id"
         );
         assert!(
-            template.contains("name: \"agent\""),
-            "template should configure agent user"
+            template.contains("name: \"sandbox\""),
+            "template should configure the sandbox user"
+        );
+        assert!(
+            template.contains("home: \"/home/agent\""),
+            "template should pin the sandbox user's home at /home/agent so existing \
+             /home/agent/workspace paths in rsync, session bootstrap, and the API \
+             DTOs keep working"
         );
 
         // Verify provision scripts
@@ -2325,8 +2340,8 @@ mod tests {
             "template should set hostname"
         );
         assert!(
-            template.contains("useradd"),
-            "template should create agent user"
+            template.contains("useradd -m -d /home/agent -s /bin/bash sandbox"),
+            "template should create the sandbox user with home at /home/agent"
         );
         assert!(
             template.contains("NOPASSWD"),
@@ -2341,8 +2356,8 @@ mod tests {
             "template should install Docker"
         );
         assert!(
-            template.contains("usermod -aG docker agent"),
-            "template should add agent to docker group"
+            template.contains("usermod -aG docker sandbox"),
+            "template should add the sandbox user to the docker group"
         );
         assert!(
             template.contains("step=net-tune"),
@@ -3034,6 +3049,19 @@ mod tests {
             GUEST_AGENT_SERVICE_UNIT.contains("[Install]"),
             "service unit should have [Install] section"
         );
+        // Pin that the unit runs as the `sandbox` user (not the legacy
+        // `agent` username). The daemon-emitted SSH config block carries
+        // `User sandbox`, and the in-VM sshd must accept that username,
+        // so every in-VM process the daemon manages — including this
+        // guest-agent service — runs under the same identity.
+        assert!(
+            GUEST_AGENT_SERVICE_UNIT.contains("User=sandbox"),
+            "service unit should run as the sandbox user"
+        );
+        assert!(
+            GUEST_AGENT_SERVICE_UNIT.contains("Group=sandbox"),
+            "service unit should run as the sandbox group"
+        );
     }
 
     #[test]
@@ -3352,12 +3380,16 @@ mod tests {
 
         // Cloud-init provisioning scripts.
         assert!(
-            template.contains("name: \"agent\""),
-            "base template should configure agent user"
+            template.contains("name: \"sandbox\""),
+            "base template should configure the sandbox user"
         );
         assert!(
-            template.contains("useradd"),
-            "base template should create agent user"
+            template.contains("home: \"/home/agent\""),
+            "base template should pin the sandbox user's home at /home/agent"
+        );
+        assert!(
+            template.contains("useradd -m -d /home/agent -s /bin/bash sandbox"),
+            "base template should create the sandbox user with home at /home/agent"
         );
         assert!(
             template.contains("NOPASSWD"),
@@ -3372,8 +3404,8 @@ mod tests {
             "base template should install Docker"
         );
         assert!(
-            template.contains("usermod -aG docker agent"),
-            "base template should add agent to docker group"
+            template.contains("usermod -aG docker sandbox"),
+            "base template should add the sandbox user to the docker group"
         );
 
         // Hardened by default (video/audio disabled).
