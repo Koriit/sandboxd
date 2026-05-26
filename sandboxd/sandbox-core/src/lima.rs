@@ -212,9 +212,26 @@ if [ "$SANDBOX_QEMU_HARDENED" = "1" ]; then
         -device virtio-rng-pci"
 fi
 
-# If resource limit env vars are set and systemd-run is available, wrap
-# QEMU in a transient systemd scope with memory and CPU limits.
-if [ -n "$SANDBOX_QEMU_MEMORY_MB" ] && [ -n "$SANDBOX_QEMU_CPUS" ] && command -v systemd-run >/dev/null 2>&1; then
+# If resource limit env vars are set and the user-systemd instance is
+# reachable, wrap QEMU in a transient systemd scope with memory and CPU
+# limits.
+#
+# The `systemctl --user show-environment` probe is load-bearing: a system
+# user (e.g. `sandbox`, when the daemon runs as a hardened systemd unit
+# without `loginctl enable-linger sandbox`) has `systemd-run` *installed*
+# but no user-bus, so `systemd-run --user --scope` aborts immediately with
+# `Failed to connect to bus: No medium found` (exit 1). Lima sees QEMU
+# exit with status 1 before it ever opens its QMP socket and reports
+# `Driver stopped due to error: "exit status 1"` with no actionable
+# detail. The earlier `command -v systemd-run` gate alone is insufficient
+# because it answers "is the binary on PATH?" rather than "can we
+# actually use --user?". When the probe fails, fall back to running QEMU
+# directly: cgroup hardening is downgraded for that session, but the VM
+# boots — operators who want the cgroup limits restored should run
+# `loginctl enable-linger <daemon-user>` to make the user bus persist.
+if [ -n "$SANDBOX_QEMU_MEMORY_MB" ] && [ -n "$SANDBOX_QEMU_CPUS" ] \
+        && command -v systemd-run >/dev/null 2>&1 \
+        && systemctl --user show-environment >/dev/null 2>&1; then
     exec systemd-run --user --scope --slice=sandbox.slice \
         -p MemoryMax="$((SANDBOX_QEMU_MEMORY_MB + 512))M" \
         -p "CPUQuota=${SANDBOX_QEMU_CPUS}00%" \
@@ -3267,6 +3284,29 @@ mod tests {
         assert!(
             has_else_exec,
             "wrapper must have a fallback exec without systemd-run"
+        );
+    }
+
+    /// Regression: the systemd-run guard must also probe the user-bus.
+    ///
+    /// When the daemon runs as a system user (`User=sandbox` in the
+    /// production systemd unit) without `loginctl enable-linger`, the
+    /// `systemd-run` binary is present on PATH but `--user` cannot reach
+    /// any user-bus and aborts with exit 1. The wrapper would `exec`
+    /// straight into that failure and Lima would surface a generic QEMU
+    /// `"exit status 1"` with no QMP socket and no actionable stderr.
+    /// Asserting the `systemctl --user show-environment` probe is part of
+    /// the guard pins the resolution so a future contributor cannot
+    /// silently re-introduce the regression.
+    #[test]
+    fn test_qemu_wrapper_cgroup_gated_on_user_bus_reachability() {
+        assert!(
+            QEMU_WRAPPER_SCRIPT.contains("systemctl --user show-environment >/dev/null 2>&1"),
+            "wrapper must probe `systemctl --user show-environment` before \
+             invoking `systemd-run --user --scope` — otherwise a daemon \
+             running as a system user without an active user-bus exits \
+             with status 1 the moment the wrapper exec's systemd-run; \
+             full script:\n{QEMU_WRAPPER_SCRIPT}"
         );
     }
 
