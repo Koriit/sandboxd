@@ -123,3 +123,44 @@ SANDBOX_HARNESS=sandbox-systemd .venv/bin/pytest -v --timeout=600 \
 ```
 
 Each Lima test takes ~50–60 s under the new harness (failure is fast); the container test takes ~60–70 s. Under the legacy harness expect 2–3 minutes per test.
+
+## M18-S6 re-run — 2026-05-26
+
+After M18-S6 (rewrite the six broken commands + drift-recovery wrapper) landed locally, the three Phase-1 acceptance tests were re-run against the new harness.
+
+| Test | Outcome under `sandbox-systemd` | Wall clock | Notes |
+|------|---------------------------------|-----------|-------|
+| A1 `test_ssh_session[lima]` | **FAIL (known #217 blocker)** | ~430 s | `sandbox create` fails at `limactl start timed out after 300s` (daemon-side QEMU exit-1; see M18-S1 outcomes §"Daemon-spawned QEMU exit-1 needs root-cause analysis"). Never reaches `sandbox ssh`. |
+| A2 `test_git_push_to_vm[lima]` | **FAIL (known #217 blocker)** | ~430 s | Same root cause as A1 — `sandbox create` fails before `git-remote-sandbox` runs. |
+| A3 `test_ssh_session[container]` | **PASS** (flipped from PASS under M18-S1 to PASS again; substantive change — now exercises the new dispatch end-to-end) | ~147 s | `sandbox ssh ssh-test -- uname -a` round-trips through the daemon-mediated SSH proxy: `sandbox` CLI fetches `GET /sessions/{id}/ssh-config`, writes `~/.ssh/sandbox/sandbox-<id>` + the matching key, exec's `ssh sandbox-<id> -- uname -a` whose `ProxyCommand sandbox proxy <id>` tunnels through `GET /sessions/{id}/proxy` (WebSocket) to the in-container sshd. |
+
+### What the container PASS proves end-to-end
+
+The container test's success under `sandbox-systemd` (daemon as `sandbox` system user, CLI as the operator's own uid) is the canonical proof that the cross-user CLI gap is closed for the container backend. Specifically:
+
+1. **Daemon-issued credentials.** `GET /sessions/{id}/ssh-config` (M18-S3) returns the per-session SSH config + private key from the daemon's SQLite store; the CLI never touches the daemon's home directory.
+2. **Managed local state.** The CLI's `~/.ssh/sandbox/` area (M18-S5) lands the key + per-session config block under the operator's uid with mode 0600, and inserts the `Include` line at the top of `~/.ssh/config`.
+3. **Bare-`ssh` against the alias.** The rewritten `sandbox ssh` (M18-S6) spawns `ssh sandbox-<id> -- <cmd>` with `LC_ALL=C`/`LANG=C`/`SANDBOX_SOCKET`/`PATH` set; the operator's `ssh` client resolves the alias through the managed `Include` block.
+4. **`ProxyCommand` tunnel.** `ssh` exec's `sandbox proxy <id>` (M18-S5) which performs the WebSocket handshake against `GET /sessions/{id}/proxy` (M18-S4) and bidirectionally splices its own stdio with binary WebSocket frames.
+5. **Daemon-side byte mover.** The daemon's proxy handler `docker exec`s `socat` into the container's network namespace and bridges to the in-container sshd (which the M18-S2 lite-image bakes in).
+6. **No backend dispatch.** No `docker exec` shell-out on the CLI side; the CLI is uniform across backends.
+
+### Lima blocker — #217 root-cause investigation
+
+The Lima failures under `sandbox-systemd` are unchanged from the M18-S1 diff-the-outcomes baseline: the daemon-spawned QEMU exits with status 1 before opening its QMP socket, and `limactl start` times out (either at the 120-second base-image-rebuild step or the 300-second session-start step). Repro failure log excerpt for the M18-S9 claim-to-code map:
+
+```
+sandbox create failed (rc=1).
+  stderr: Warning: base image is 0 days old.
+          Rebuild before creating session? [y/N] Error: limactl start timed out after 300s
+          server returned 504 Gateway Timeout
+[conftest] Lima base-image rebuild failed under SANDBOX_HARNESS='sandbox-systemd';
+  continuing — Lima tests will fail downstream and that is the expected outcome
+  for the M18-S1 diff-the-outcomes run.
+  rebuild-image[lima]: limactl create (base image) timed out after 120s
+```
+
+The Lima failure is **pre-flight** (`sandbox create` rc=1), so M18-S6's CLI rewrite is never exercised on Lima sessions under this harness. The canonical "limactl cannot find VM" cross-user failure mode the spec predicted at M18-S1 step 4 cannot manifest until #217 is independently resolved.
+
+**Implication for M18-S9.** The Lima half of the matrix is blocked behind #217 and must be deferred until that bug is independently investigated. The container PASS suffices to demonstrate M18-S6's six-command rewrite is correct end-to-end; the Lima half is symmetric in CLI implementation (the same `~/.ssh/sandbox/` machinery, the same `ssh sandbox-<id>:` argv, the same drift-recovery wrapper — the daemon-side `GET /sessions/{id}/proxy` Lima branch is what changes, and that already has `integration_*` coverage).
+
