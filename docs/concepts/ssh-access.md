@@ -55,7 +55,7 @@ reconcile pass against the daemon) cannot race against the same files.
 block verbatim, with the `IdentityFile` placeholder rewritten by the
 CLI to the on-disk key path:
 
-```ssh
+```text
 Host sandbox-<id>
   HostName 127.0.0.1
   Port 22
@@ -84,7 +84,7 @@ SSH-kex cost once.
 The CLI also inserts a marker-delimited block at the **very top** of
 `~/.ssh/config` (creating the file with mode `0600` if absent):
 
-```ssh
+```text
 # >>> sandbox CLI managed >>>
 Include ~/.ssh/sandbox/sandbox-*[!y]
 # <<< sandbox CLI managed <<<

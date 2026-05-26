@@ -258,7 +258,7 @@ List sandbox sessions owned by the invoking operator with their current state, g
 
 The listing is **caller-scoped**: each operator sees only the sessions they created. A session created by another operator is omitted entirely — there is no "owned by X" column because every row is owned by the caller. Running `sudo sandbox ps` lists root-owned sessions; on a freshly-installed host with no root-created sessions, that is normally an empty table. See [Caller identity and per-operator scope](#caller-identity-and-per-operator-scope) for the full ownership model.
 
-By default `sandbox ps`/`sandbox ls` also runs an opportunistic reconcile pass against the local [`~/.ssh/sandbox/` managed area](/sandboxd/concepts/ssh-access/): the CLI computes the diff between the daemon's session list and the on-disk per-session SSH config entries, removes orphans (sessions deleted while the CLI was not running), and writes missing entries for active sessions. This keeps external SSH tooling (VS Code Remote-SSH, JetBrains Gateway, ad-hoc `ssh`/`scp`/`rsync`) honest without the operator having to think about it. Pass [`--no-reconcile`](#sandbox-ps-options) to suppress the pass — see below.
+By default `sandbox ps`/`sandbox ls` also runs an opportunistic reconcile pass against the local [`~/.ssh/sandbox/` managed area](/sandboxd/concepts/ssh-access/): the CLI computes the diff between the daemon's session list and the on-disk per-session SSH config entries, removes orphans (sessions deleted while the CLI was not running), and writes missing entries for active sessions. This keeps external SSH tooling (VS Code Remote-SSH, JetBrains Gateway, ad-hoc `ssh`/`scp`/`rsync`) honest without the operator having to think about it. Pass `--no-reconcile` to suppress the pass — see below.
 
 ### Synopsis
 
@@ -270,7 +270,7 @@ sandbox ps [--no-reconcile]
 
 `sandbox ls` is an alias for `sandbox ps`. The alias accepts the same options.
 
-### Options {#sandbox-ps-options}
+### Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
@@ -1087,7 +1087,7 @@ git pull origin main
 
 ---
 
-## sandbox proxy (hidden) {#sandbox-proxy-hidden}
+## sandbox proxy (hidden)
 
 `sandbox proxy <id>` is the `ProxyCommand` shim invoked by `ssh sandbox-<id>` for every connection that resolves through the managed [`~/.ssh/sandbox/sandbox-<id>`](/sandboxd/concepts/ssh-access/) config block. It is **hidden from `--help`** because operators do not invoke it directly — `ssh` does, automatically, via the generated `ProxyCommand` line.
 
