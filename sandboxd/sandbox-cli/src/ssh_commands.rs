@@ -1301,4 +1301,294 @@ mod tests {
         assert!(msg.contains("db lost"));
         assert!(!msg.contains("recreate"));
     }
+
+    // -----------------------------------------------------------------------
+    // run_with_drift_recovery — retry-path end-to-end coverage
+    //
+    // The state-machine tests above cover call-count invariants; the
+    // tests below drive the full operator-visible retry path:
+    //
+    // * a pre-existing **stale** entry on disk (simulating a prior
+    //   daemon-side rotation the local CLI missed) is overwritten by
+    //   the post-drift refresh — the on-disk bytes after a successful
+    //   retry match the *new* DTO, not the stale one;
+    // * a non-drift exit (e.g. `command not found` → 127) propagates
+    //   without re-fetching or rewriting the entry — the wrapper is
+    //   matched only on the locale-pinned pubkey-drift substring;
+    // * the architectural invariant that `sandbox proxy` is excluded
+    //   from drift recovery is asserted as a static source-level
+    //   property (no `run_with_drift_recovery` call site in
+    //   `proxy.rs`), so a future refactor that accidentally wires the
+    //   wrapper into the ProxyCommand shim breaks this test.
+    // -----------------------------------------------------------------------
+
+    /// Build a DTO whose config + key carry a tag that distinguishes
+    /// it from any other DTO produced in the same test. Used to prove
+    /// the post-drift refresh actually overwrites a pre-staged stale
+    /// entry rather than leaving the old bytes in place.
+    fn tagged_dto(id: &str, tag: &str) -> SshConfigDto {
+        // Embed the tag in a benign comment line inside the rendered
+        // config block. The daemon-emitted block carries an
+        // `IdentityFile <PLACEHOLDER>` line that `ensure_session_entry`
+        // rewrites; the rest of the block round-trips verbatim, so a
+        // `# tag=…` comment is a stable marker the test can grep for
+        // on disk.
+        let base = sandbox_core::render_ssh_config_block(id);
+        let tagged_config = format!("# tag={tag}\n{base}");
+        SshConfigDto {
+            config: tagged_config,
+            private_key: format!(
+                "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+                 fake-{id}-{tag}\n\
+                 -----END OPENSSH PRIVATE KEY-----\n"
+            ),
+        }
+    }
+
+    /// Drift-recovery's headline operator-visible promise: a **stale
+    /// local entry** under `~/.ssh/sandbox/` is silently refreshed
+    /// when the daemon's current keypair has rotated past it.
+    ///
+    /// Setup: pre-stage a per-session entry built from a "stale" DTO,
+    /// proving the wrapper inherits an existing on-disk state rather
+    /// than starting from an empty `HOME`. Run the wrapper with a
+    /// fetch callback that returns a **fresh** DTO (tag mismatch on
+    /// every field that gets written to disk) and an attempt closure
+    /// that fails the first call with `PublickeyDrift` and succeeds
+    /// the second. After the wrapper returns:
+    ///
+    /// * the post-drift refresh ran (fetch_dto called twice — once
+    ///   per attempt iteration);
+    /// * the attempt closure ran exactly twice (single-retry budget);
+    /// * the on-disk per-session config + key bytes now match the
+    ///   **fresh** DTO, not the stale one — i.e. the retry actually
+    ///   re-wrote the entry between attempts.
+    #[tokio::test]
+    async fn drift_recovery_overwrites_stale_local_entry_on_refresh() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let id = "0123456789ab";
+
+        // Pre-stage a stale entry under `~/.ssh/sandbox/`. After this
+        // call the per-session config + key are present with the
+        // `stale-` tag baked into both.
+        let stale_dto = tagged_dto(id, "stale-pre-rotation");
+        ssh_config::ensure_session_entry(home, id, &stale_dto).expect("pre-stage the stale entry");
+
+        // Sanity: the stale tag must actually be on disk before the
+        // wrapper runs — otherwise the post-condition below is vacuous.
+        let cfg_path = ssh_config::session_config_path(home, id);
+        let key_path = ssh_config::session_key_path(home, id);
+        let pre_cfg = std::fs::read_to_string(&cfg_path).unwrap();
+        let pre_key = std::fs::read_to_string(&key_path).unwrap();
+        assert!(
+            pre_cfg.contains("# tag=stale-pre-rotation"),
+            "pre-staged config must carry the stale tag; got: {pre_cfg}",
+        );
+        assert!(
+            pre_key.contains("fake-0123456789ab-stale-pre-rotation"),
+            "pre-staged key must carry the stale tag; got: {pre_key}",
+        );
+
+        // The wrapper's fetch callback returns the **fresh** DTO every
+        // time — modelling a daemon whose current keypair has already
+        // rotated past whatever the local entry carried. The attempt
+        // closure fails the first call with `PublickeyDrift` (the
+        // signal that drives the refresh) and succeeds the second.
+        let fetch_calls = Arc::new(AtomicUsize::new(0));
+        let attempt_calls = Arc::new(AtomicUsize::new(0));
+        let fc = Arc::clone(&fetch_calls);
+        let ac = Arc::clone(&attempt_calls);
+
+        let exit = run_with_drift_recovery(
+            home,
+            id,
+            move || {
+                let fc = Arc::clone(&fc);
+                async move {
+                    fc.fetch_add(1, Ordering::SeqCst);
+                    Ok(tagged_dto(id, "fresh-post-rotation"))
+                }
+            },
+            move |_alias, attempt_idx| {
+                let ac = Arc::clone(&ac);
+                async move {
+                    ac.fetch_add(1, Ordering::SeqCst);
+                    if attempt_idx == 0 {
+                        Ok(AttemptOutcome::PublickeyDrift)
+                    } else {
+                        Ok(AttemptOutcome::Exited(0))
+                    }
+                }
+            },
+        )
+        .await
+        .expect("must succeed after the single retry");
+
+        assert_eq!(exit, 0);
+        assert_eq!(
+            fetch_calls.load(Ordering::SeqCst),
+            2,
+            "must re-fetch ssh-config between the two attempts",
+        );
+        assert_eq!(
+            attempt_calls.load(Ordering::SeqCst),
+            2,
+            "must run the underlying tool exactly twice — single retry budget",
+        );
+
+        // The headline post-condition: the stale entry was overwritten
+        // with the fresh DTO. Both files must now carry the `fresh-`
+        // tag, and neither must carry the `stale-` tag.
+        let post_cfg = std::fs::read_to_string(&cfg_path).unwrap();
+        let post_key = std::fs::read_to_string(&key_path).unwrap();
+        assert!(
+            post_cfg.contains("# tag=fresh-post-rotation"),
+            "post-refresh config must carry the fresh tag; got: {post_cfg}",
+        );
+        assert!(
+            !post_cfg.contains("stale-pre-rotation"),
+            "post-refresh config must NOT carry the stale tag; got: {post_cfg}",
+        );
+        assert!(
+            post_key.contains("fake-0123456789ab-fresh-post-rotation"),
+            "post-refresh key must carry the fresh tag; got: {post_key}",
+        );
+        assert!(
+            !post_key.contains("stale-pre-rotation"),
+            "post-refresh key must NOT carry the stale tag; got: {post_key}",
+        );
+    }
+
+    /// Counterpart to the stale-overwrite test above: a **non-drift
+    /// exit** must propagate unchanged without re-fetching the DTO or
+    /// re-writing the local entry. The locale-pinned substring is the
+    /// only signal that triggers a retry; anything else
+    /// (`command not found` → 127, remote-side user error, etc.)
+    /// passes through.
+    ///
+    /// Pre-stage a known entry, run the wrapper with an attempt that
+    /// returns `Exited(127)` on the first call. After return:
+    ///
+    /// * the wrapper exited with the same 127 code;
+    /// * fetch_dto was called exactly **once** (the initial fetch —
+    ///   no post-drift refresh because there was no drift);
+    /// * the attempt closure ran exactly **once**;
+    /// * the on-disk entry is byte-identical to what was pre-staged
+    ///   (the wrapper's first-iteration write is allowed to be a
+    ///   no-op rewrite of the same content — what matters is the
+    ///   wrapper did NOT rewrite it with refreshed DTO content
+    ///   between attempts because there were no second attempts).
+    #[tokio::test]
+    async fn drift_recovery_does_not_retry_on_non_drift_exit() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let id = "0123456789ab";
+
+        let dto = tagged_dto(id, "only-dto");
+        // Pre-stage the entry so the post-condition below can grep
+        // for the tag — this also models the realistic case where a
+        // prior successful invocation already populated the entry.
+        ssh_config::ensure_session_entry(home, id, &dto).expect("pre-stage");
+
+        let fetch_calls = Arc::new(AtomicUsize::new(0));
+        let attempt_calls = Arc::new(AtomicUsize::new(0));
+        let fc = Arc::clone(&fetch_calls);
+        let ac = Arc::clone(&attempt_calls);
+
+        // 127 is the POSIX shell convention for "command not found";
+        // the wrapper must propagate it unchanged. A non-zero exit
+        // that is *not* `PublickeyDrift` is the only thing we are
+        // asserting on here — the specific code is incidental.
+        let exit = run_with_drift_recovery(
+            home,
+            id,
+            move || {
+                let fc = Arc::clone(&fc);
+                async move {
+                    fc.fetch_add(1, Ordering::SeqCst);
+                    Ok(tagged_dto(id, "only-dto"))
+                }
+            },
+            move |_alias, _attempt_idx| {
+                let ac = Arc::clone(&ac);
+                async move {
+                    ac.fetch_add(1, Ordering::SeqCst);
+                    Ok(AttemptOutcome::Exited(127))
+                }
+            },
+        )
+        .await
+        .expect("must succeed (the non-zero exit is bubbled as Ok(code))");
+
+        assert_eq!(exit, 127, "non-drift exit code must propagate verbatim");
+        assert_eq!(
+            fetch_calls.load(Ordering::SeqCst),
+            1,
+            "non-drift exit must NOT trigger a second fetch",
+        );
+        assert_eq!(
+            attempt_calls.load(Ordering::SeqCst),
+            1,
+            "non-drift exit must NOT trigger a second attempt",
+        );
+
+        // The on-disk entry must still carry the original tag — no
+        // refresh happened because no drift signal fired.
+        let cfg_path = ssh_config::session_config_path(home, id);
+        let key_path = ssh_config::session_key_path(home, id);
+        let post_cfg = std::fs::read_to_string(&cfg_path).unwrap();
+        let post_key = std::fs::read_to_string(&key_path).unwrap();
+        assert!(post_cfg.contains("# tag=only-dto"));
+        assert!(post_key.contains("fake-0123456789ab-only-dto"));
+    }
+
+    /// Architectural invariant: the `sandbox proxy` subcommand is
+    /// excluded from drift recovery. Spec § Key drift recovery:
+    /// "never inside `sandbox proxy`, so nested invocations from
+    /// `git-remote-sandbox` cannot stack retries."
+    ///
+    /// We cannot drive the proxy through `run_with_drift_recovery` in
+    /// a hermetic test (proxy needs a real WebSocket-capable daemon
+    /// socket, which would push this test into the integration tier).
+    /// Instead, assert the invariant statically: scan the `proxy.rs`
+    /// source and verify it contains no call site for the wrapper.
+    /// A future refactor that accidentally wires drift recovery into
+    /// the ProxyCommand shim (e.g. by importing `run_with_drift_recovery`
+    /// into the proxy run-loop) trips this test, surfacing the
+    /// regression at unit-test time rather than at e2e time where
+    /// nested `git-remote-sandbox` retries would stack.
+    #[test]
+    fn drift_recovery_is_not_invoked_from_proxy_shim() {
+        // Include the proxy.rs source verbatim at compile time. The
+        // path is relative to this file (`ssh_commands.rs`); both live
+        // in `sandbox-cli/src/`.
+        const PROXY_SOURCE: &str = include_str!("proxy.rs");
+
+        // The exact function name is the wire-level invariant. A
+        // hypothetical rename would force this needle to change too,
+        // and the test breakage at that point would be the cue to
+        // re-evaluate the architectural invariant — by design.
+        const FORBIDDEN_NEEDLE: &str = "run_with_drift_recovery";
+
+        // Strip comment lines so a benign doc-comment reference to the
+        // wrapper (which proxy.rs has — explaining *why* drift recovery
+        // is excluded) does not trip the static assertion. Only
+        // executable code matters for the invariant; references in
+        // `//`-prefixed comments are explanatory and stay legal.
+        let executable: String = PROXY_SOURCE
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            !executable.contains(FORBIDDEN_NEEDLE),
+            "proxy.rs must NOT invoke `{FORBIDDEN_NEEDLE}` — drift recovery is \
+             deliberately excluded from the `sandbox proxy` shim so nested \
+             `git-remote-sandbox` invocations cannot stack retries. If you \
+             intentionally wired the wrapper into the proxy run-loop, also \
+             revisit this invariant in the spec.",
+        );
+    }
 }
