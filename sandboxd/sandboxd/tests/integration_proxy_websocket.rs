@@ -199,6 +199,58 @@ fn wait_for(container: &str, deadline: Duration, mut pred: impl FnMut(&str) -> b
     false
 }
 
+/// Two-phase sshd-readiness probe.
+///
+/// Phase 1 polls `docker logs <ctr> 2>&1` until the entrypoint
+/// script's positive readiness line appears
+/// (`sandbox-entrypoint: sshd ready on 127.0.0.1:22`). This catches
+/// the race where OpenSSH's daemon-fork returns 0 to the parent
+/// before `bind(2)` completes in the daemonised child — the success-
+/// path log line is emitted by the parent *after* the parent confirms
+/// daemonisation succeeded, which is a strictly later signal than
+/// `ss -tlnH` showing the listen socket. Phase 1 also captures the
+/// failure-path log lines for the panic message if readiness never
+/// arrives.
+///
+/// Phase 2 confirms the listen socket is visible inside the container
+/// netns — guarantees the `listen()` call actually completed after
+/// the entrypoint logged readiness. A short 5s timeout here is fine:
+/// if Phase 1 succeeded, `listen()` is already in the queue.
+fn wait_for_sshd_ready(container: &str, phase1: Duration, phase2: Duration) -> Result<(), String> {
+    let start = Instant::now();
+    let mut last_logs = String::new();
+    while start.elapsed() < phase1 {
+        let output = Command::new("docker")
+            .args(["logs", container])
+            .output()
+            .map_err(|e| format!("failed to spawn `docker logs {container}`: {e}"))?;
+        let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        if combined.contains("sandbox-entrypoint: sshd ready on 127.0.0.1:22") {
+            last_logs = combined;
+            break;
+        }
+        last_logs = combined;
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if !last_logs.contains("sandbox-entrypoint: sshd ready on 127.0.0.1:22") {
+        return Err(format!(
+            "Phase 1: sshd-ready readiness line never appeared within {phase1:?}. \
+             Entrypoint logs:\n{last_logs}",
+        ));
+    }
+    if !wait_for(container, phase2, |out| {
+        out.lines().any(|line| line.contains("127.0.0.1:22"))
+    }) {
+        let listen = docker_exec(container, &["ss", "-tlnH"]).1;
+        return Err(format!(
+            "Phase 2: 127.0.0.1:22 listen socket not visible within {phase2:?} \
+             after sshd-ready log. Last `ss -tlnH`:\n{listen}\nEntrypoint logs:\n{last_logs}",
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Axum router under test — only the `/sessions/{id}/proxy` route.
 // ---------------------------------------------------------------------------
@@ -364,23 +416,17 @@ async fn integration_proxy_websocket_round_trip_container_backend() {
         String::from_utf8_lossy(&run.stderr),
     );
 
-    // Wait for sshd to bind 127.0.0.1:22 inside the container — this
-    // is the "the in-container sshd is ready to accept proxy bytes"
-    // signal.
-    let listening = wait_for(&container_name, Duration::from_secs(15), |out| {
-        out.lines().any(|line| line.contains("127.0.0.1:22"))
-    });
-    if !listening {
-        let logs = Command::new("docker")
-            .args(["logs", &container_name])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
-            .unwrap_or_default();
-        panic!(
-            "sshd did not start listening on 127.0.0.1:22 within 15s. \
-             entrypoint logs:\n{logs}\nlast `ss -tlnH`:\n{}",
-            docker_exec(&container_name, &["ss", "-tlnH"]).1
-        );
+    // Wait for sshd to be fully ready inside the container. The
+    // two-phase probe (entrypoint "sshd ready" log line, then listen-
+    // socket visibility) defeats the banner-write race where the
+    // proxy connects after `bind(2)` but before sshd finishes its
+    // post-accept setup — see `wait_for_sshd_ready`'s docstring.
+    if let Err(reason) = wait_for_sshd_ready(
+        &container_name,
+        Duration::from_secs(15),
+        Duration::from_secs(5),
+    ) {
+        panic!("{reason}");
     }
 
     // Step 6: mount the production proxy handler behind a one-route

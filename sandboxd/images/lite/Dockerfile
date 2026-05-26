@@ -125,7 +125,16 @@ RUN printf '%s\n' \
         '  # inside the container netns. Not exposed to the host —' \
         '  # reachable only via the daemon-mediated `docker exec` byte' \
         '  # mover delivered in a later session.' \
-        '  if ! /usr/sbin/sshd -f /etc/sandbox-sshd/sshd_config 2>/dev/null; then' \
+        '  if /usr/sbin/sshd -f /etc/sandbox-sshd/sshd_config 2>/dev/null; then' \
+        '    # Positive readiness signal on the success path. Tests' \
+        '    # (and operators) can grep `docker logs <ctr>` for this' \
+        '    # line as a deterministic "sshd is up" probe. Without it,' \
+        '    # the only entrypoint signal was the failure path — a' \
+        '    # listen-socket poll (`ss -tlnH`) catches `bind(2)` but' \
+        '    # not the post-accept setup, leaving a short race window' \
+        '    # where the proxy connects before sshd writes the banner.' \
+        '    echo "sandbox-entrypoint: sshd ready on 127.0.0.1:22" >&2' \
+        '  else' \
         '    echo "sandbox-entrypoint: sshd failed to start; continuing without it" >&2' \
         '  fi' \
         'else' \
