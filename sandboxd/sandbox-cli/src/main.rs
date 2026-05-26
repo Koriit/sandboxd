@@ -1585,6 +1585,25 @@ fn format_memory_field(config: &sandbox_core::SessionConfigDto) -> String {
 /// setup, so this must be generous.
 const CLI_HTTP_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Maximum time to wait for the daemon to respond to a base-image
+/// rebuild request (`POST /rebuild-image`).
+///
+/// The Lima rebuild path can legitimately take 15+ minutes on slow
+/// networks: the Ubuntu 24.04 cloud-image qcow2 is ~580 MiB and
+/// `cloud-images.ubuntu.com` has been observed serving as low as
+/// 1.3 MB/s on some hosts (~ 7-8 min download alone), after which
+/// `limactl start` runs cloud-init provisioning (apt installs of
+/// socat, git, Docker) which adds another minute or two. The
+/// daemon-side budget for these two phases is
+/// `BASE_CREATE_TIMEOUT + BASE_START_TIMEOUT = 1200 + 600 = 1800 s`
+/// (see `sandbox-core::lima`); we add a small grace margin on top so
+/// the CLI does not abandon the request a few seconds before the
+/// daemon would have surfaced the actual outcome.
+///
+/// This timeout is used only for `POST /rebuild-image` — every other
+/// CLI request continues to use `CLI_HTTP_TIMEOUT`.
+const CLI_REBUILD_IMAGE_TIMEOUT: Duration = Duration::from_secs(1900);
+
 /// Exit code the CLI uses when it refuses to proceed because the
 /// daemon's reported version does not match the CLI's compile-time
 /// `CARGO_PKG_VERSION`. Distinct from `1` (daemon-side error after a
@@ -5640,7 +5659,7 @@ async fn check_base_image_staleness(socket_path: &str) {
             .body(String::new())
             .expect("failed to build rebuild request");
 
-        match send_request_with_timeout(socket_path, rebuild_req, CLI_HTTP_TIMEOUT).await {
+        match send_request_with_timeout(socket_path, rebuild_req, CLI_REBUILD_IMAGE_TIMEOUT).await {
             Ok((s, _)) if s.is_success() => {
                 eprintln!("Done.");
             }
@@ -5996,7 +6015,8 @@ async fn send_rebuild_image_request(
         .header("content-type", "application/json")
         .body(body)
         .map_err(|e| format!("failed to build request: {e}"))?;
-    let (status, body) = send_request_with_timeout(socket_path, req, CLI_HTTP_TIMEOUT).await?;
+    let (status, body) =
+        send_request_with_timeout(socket_path, req, CLI_REBUILD_IMAGE_TIMEOUT).await?;
     if status.is_success() {
         return Ok(body);
     }

@@ -60,6 +60,19 @@ The default VM uses 4096 MB. The host needs about 3.8 GB free per session. Fix: 
 
 If `systemd-run` is not on `PATH` **or** the daemon's user-systemd bus is unreachable (the QEMU wrapper probes both before opting into the cgroup-limited path), QEMU runs without cgroup limits and a memory-hungry guest can trigger the host OOM killer. Check with `command -v systemd-run` and `sudo -u <daemon-user> systemctl --user show-environment`. Enable user sessions with `loginctl enable-linger <daemon-user>` so the user manager persists across logouts (in particular, the system user `sandbox` started by the production systemd unit has no active login session and therefore no user-bus by default).
 
+### Slow base-image download / e2e test timeouts
+
+**Symptom:** Lima-backed e2e tests time out at `--timeout=600` with the daemon journal showing `limactl create (base image) timed out`. The Lima download cache (`~/.cache/lima/download/by-url-sha256/`) shows a partial `data.tmp.*` file.
+
+The Ubuntu 24.04 cloud-image qcow2 is ~580 MiB; on slow-network hosts the effective throughput from `cloud-images.ubuntu.com` can drop as low as 1.3 MB/s, making the full download take 7+ minutes. Two safeguards exist:
+
+1. **Daemon-side `BASE_CREATE_TIMEOUT`** is 600 s — long enough to clear a 1.3 MB/s floor with margin. See `sandboxd/sandbox-core/src/lima.rs`.
+2. **Pre-warm fixture in the e2e harness** (`tests/e2e/conftest.py::_ensure_base_image`) runs the rebuild at *session* scope before any test starts. pytest-timeout's per-test budget does not cover session-scoped fixture setup, so a slow download no longer races a per-test deadline.
+
+The pre-warm fixture is `autouse=True` and skips itself if the daemon already reports a fresh base image. To force a fresh download (e.g. when the cached qcow2 is older than `BASE_IMAGE_MAX_AGE_DAYS`), invoke `sandbox rebuild-image` manually before starting the test session, or delete the cache contents at `~/.cache/lima/download/by-url-sha256/` and `~/.lima/sandbox-test-base/`.
+
+If the pre-warm itself fails (the fixture `pytest.fail`s with a Lima rebuild diagnostic), check upstream connectivity to `cloud-images.ubuntu.com`, free disk space under the Lima cache directory, and the daemon journal (`journalctl -u sandboxd-test.service`) for the underlying `limactl create` exit detail.
+
 ## Gateway unhealthy
 
 **Symptom:** `sandbox health` shows gateway components as unhealthy, or the container is in a crash loop.

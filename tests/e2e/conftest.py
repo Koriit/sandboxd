@@ -1032,22 +1032,72 @@ def _write_systemd_drop_in(
 
 
 def _reset_sandbox_state_dir() -> None:
-    """Wipe ``/var/lib/sandbox`` between pytest sessions.
+    """Wipe ``/var/lib/sandbox`` between pytest sessions, preserving the
+    Lima base-image cache and the golden base VM.
 
     The systemd unit's ``StateDirectory=sandbox`` re-creates the dir
     on the next start with the right ownership and mode; we just need
-    its contents gone so a fresh sessions.db lands. Skipped silently
-    when the dir does not exist (first-ever run).
+    the daemon-managed state (``sessions.db``, per-session subdirs,
+    gateway-container artefacts, etc.) gone so a fresh ``sessions.db``
+    lands.
+
+    What we explicitly **keep**:
+
+    * ``.cache/lima/download/`` — the Ubuntu cloud-image qcow2 cache.
+      The download is ~580 MiB and on slow-network hosts takes 7-10+
+      minutes; nuking it between every pytest session forces the
+      session-scoped pre-warm fixture to re-download from scratch,
+      which collides with the per-test pytest-timeout once Lima
+      tests start running. The cache is content-addressed
+      (``by-url-sha256/<hash>/``) so it cannot pollute future
+      sessions with stale data.
+    * ``.lima/<SANDBOX_BASE_VM_NAME>/`` — the golden base VM that
+      ``limactl clone`` derives every per-session VM from. Building
+      it from scratch costs the cloud-init provisioning round on top
+      of the download.
+    * ``base-image-meta.json`` — the freshness metadata the daemon
+      writes after a successful base-image build. Without this file
+      ``check_base_image()`` reports ``Stale`` even when the VM
+      itself is on disk, defeating the pre-warm short-circuit.
+
+    All three kept paths are managed via Lima's own age/freshness
+    semantics: ``BASE_IMAGE_MAX_AGE_DAYS`` in ``sandbox-core::lima``
+    forces a rebuild after 10 days regardless of what's on disk.
+
+    Skipped silently when the dir does not exist (first-ever run).
     """
     if not _SANDBOX_PROD_BASE_DIR.exists():
         return
-    # ``sudo find -delete`` over the contents (not the dir itself)
-    # so the directory's mode and ownership are preserved. We avoid
-    # ``rm -rf /var/lib/sandbox`` so a typo or env-var resolution
-    # mishap cannot land us in /.
+    # ``find ... -prune`` excludes both kept paths from the delete
+    # sweep. ``-mindepth 1`` keeps the base dir itself intact (its
+    # mode and ownership come from the systemd unit's
+    # ``StateDirectory=`` directive and we do not want to recreate
+    # them on every run). The two pruned trees stay byte-for-byte
+    # identical across reset, which is exactly what the pre-warm
+    # fixture's "is the image fresh?" check needs to short-circuit.
+    cache_dir = str(_SANDBOX_PROD_BASE_DIR / ".cache" / "lima")
+    base_vm_dir = str(
+        _SANDBOX_PROD_BASE_DIR / ".lima" /
+        os.environ.get("SANDBOX_BASE_VM_NAME", "sandbox-test-base")
+    )
+    meta_file = str(_SANDBOX_PROD_BASE_DIR / "base-image-meta.json")
     subprocess.run(
-        ["sudo", "-n", "find", str(_SANDBOX_PROD_BASE_DIR),
-         "-mindepth", "1", "-delete"],
+        [
+            "sudo", "-n", "find", str(_SANDBOX_PROD_BASE_DIR),
+            "-mindepth", "1",
+            # Order matters: the prunes go first, then the delete
+            # branch. ``find`` evaluates left-to-right with implicit
+            # ``-and``; once ``-prune`` succeeds it short-circuits
+            # the rest, so the pruned subtree is never visited for
+            # deletion.
+            "(",
+            "-path", cache_dir,
+            "-o", "-path", base_vm_dir,
+            "-o", "-path", meta_file,
+            ")",
+            "-prune",
+            "-o", "-delete",
+        ],
         capture_output=True, timeout=30,
     )
 
@@ -1674,31 +1724,77 @@ def _query_base_image_status(socket_path: str, timeout: float = 5.0) -> str | No
         return None
 
 
-@pytest.fixture(scope="session")
-def _ensure_base_image(sandbox_binaries: SandboxBinaries, sandbox_daemon):
-    """Build the golden base image once per test session.
+def _lima_available_for_prewarm() -> bool:
+    """Return True if the host can plausibly build a Lima base image.
 
-    This runs `sandbox rebuild-image` so that tests using clone-based
-    creation (without --no-cache) have a base image available.  With the
-    HTTPS apt sources and fast timeout config, this typically completes
-    in ~90 seconds.
+    Mirrors the prereq probes in ``_lima_required_for_lima_tests`` but
+    at session scope: when limactl is not installed, qemu-bridge-helper
+    is missing, or the bridge.conf is absent, there is no point burning
+    ten minutes of session-fixture setup on a doomed download — every
+    Lima-marked test will skip downstream anyway. Container tests can
+    still run.
+    """
+    try:
+        subprocess.run(
+            ["limactl", "--version"],
+            capture_output=True, timeout=15, check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    if _find_qemu_bridge_helper() is None:
+        return False
+    if not BRIDGE_CONF_PATH.exists():
+        return False
+    return True
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _ensure_base_image(sandbox_binaries: SandboxBinaries, sandbox_daemon):
+    """Pre-warm the golden base image once per test session.
+
+    This runs ``sandbox rebuild-image`` so that tests using clone-based
+    creation (without ``--no-cache``) have a base image available. With
+    HTTPS apt sources and fast timeout config, the container rebuild
+    typically completes in ~30 s; the Lima rebuild downloads a ~580 MiB
+    cloud-image qcow2 on first use and can take anywhere from 60 s on a
+    fast mirror to 10+ minutes on slow-network hosts.
+
+    Why session-scoped autouse — and why this fixture is load-bearing:
+
+    The pytest-timeout ``--timeout`` flag applies to test items and
+    per-test setup, but **not** to session-scoped fixture setup. So by
+    forcing this rebuild to land at session start (autouse, before any
+    test runs) the wall-clock cost of a slow base-image download does
+    not consume any per-test budget. Without the autouse hoist this
+    fixture would fire transitively from ``sandbox_cli`` the first time
+    a test pulls it in, and a 600 s pytest-timeout on that test would
+    end up racing the 580 MiB download — exactly the failure mode that
+    M18-S9 unblocking work exists to eliminate.
 
     If the daemon reports the image is already ``fresh`` (e.g. a previous
     test run left a valid base VM on disk), the rebuild is skipped.
 
+    Lima prereq probe: when limactl / qemu-bridge-helper / bridge.conf
+    are absent, every Lima-marked test will skip via
+    ``_lima_required_for_lima_tests``; rebuilding a Lima base image on
+    such a host is wasted time. The container rebuild still runs.
+
     Under the production-shaped harnesses (``sandbox-systemd`` and
-    ``sandbox-sudo``), the Lima rebuild is allowed to fail without
-    aborting the session: the cross-user bug under reproduction means
-    Lima-backed tests are expected to fail somewhere along the
-    create/use path anyway, and forcing a hard gate at base-image
-    rebuild would block the container-only tests too. The container
-    rebuild is still required to succeed in every harness; failing
-    that is a real harness fault, not the M18 bug under test.
+    ``sandbox-sudo``), a Lima rebuild *failure* (as opposed to absent
+    prereqs) is fatal: the pre-warm hoist exists specifically to make
+    Lima-backed tests reliable; if the build fails here, the operator
+    needs to know up front rather than watch every Lima test fail
+    downstream with an opaque per-test timeout. The container rebuild
+    is also fatal-on-failure in every harness.
     """
     socket_path = sandbox_daemon["socket"]
 
     status = _query_base_image_status(socket_path)
     if status == "fresh":
+        print(
+            "[conftest] base image already fresh; skipping pre-warm",
+            file=sys.stderr,
+        )
         return
 
     # In the legacy ``test-user`` harness, daemon-uid == operator-uid
@@ -1706,12 +1802,18 @@ def _ensure_base_image(sandbox_binaries: SandboxBinaries, sandbox_daemon):
     # behaviour of a single ``rebuild-image`` (default ``--backend
     # all``) with a hard fail on non-zero exit.
     if sandbox_daemon.get("_harness", "test-user") == "test-user":
+        print(
+            "[conftest] pre-warming base image "
+            "(harness=test-user, backend=all) — this can take several "
+            "minutes on a slow mirror",
+            file=sys.stderr,
+        )
         result = subprocess.run(
             [str(sandbox_binaries.sandbox), "--socket", socket_path,
              "rebuild-image"],
             capture_output=True,
             text=True,
-            timeout=1800,
+            timeout=2000,
         )
         if result.returncode != 0:
             pytest.fail(
@@ -1722,15 +1824,21 @@ def _ensure_base_image(sandbox_binaries: SandboxBinaries, sandbox_daemon):
         return
 
     # Production-shaped harnesses (``sandbox-systemd`` and
-    # ``sandbox-sudo``): run the two backend rebuilds separately so a
-    # Lima failure does not block the container tests. Container
-    # failure is still fatal.
+    # ``sandbox-sudo``): run the two backend rebuilds separately. The
+    # container rebuild is fast (~30 s) and required; the Lima rebuild
+    # downloads a 580 MiB qcow2 on first use and is required when Lima
+    # prereqs are present.
+    print(
+        "[conftest] pre-warming container base image "
+        f"(harness={SANDBOX_HARNESS})",
+        file=sys.stderr,
+    )
     container_result = subprocess.run(
         [str(sandbox_binaries.sandbox), "--socket", socket_path,
          "rebuild-image", "--backend", "container"],
         capture_output=True,
         text=True,
-        timeout=1800,
+        timeout=2000,
     )
     if container_result.returncode != 0:
         pytest.fail(
@@ -1740,29 +1848,49 @@ def _ensure_base_image(sandbox_binaries: SandboxBinaries, sandbox_daemon):
             f"stderr: {container_result.stderr}"
         )
 
+    if not _lima_available_for_prewarm():
+        print(
+            "[conftest] skipping Lima base-image pre-warm — limactl / "
+            "qemu-bridge-helper / bridge.conf not all present; every "
+            "Lima-marked test will skip via "
+            "_lima_required_for_lima_tests",
+            file=sys.stderr,
+        )
+        return
+
+    print(
+        "[conftest] pre-warming Lima base image "
+        f"(harness={SANDBOX_HARNESS}) — downloads ~580 MiB cloud-image "
+        "qcow2 on first use; this can take 1-10+ minutes depending on "
+        "network throughput. Subsequent sessions reuse the cached image.",
+        file=sys.stderr,
+    )
     lima_result = subprocess.run(
         [str(sandbox_binaries.sandbox), "--socket", socket_path,
          "rebuild-image", "--backend", "lima"],
         capture_output=True,
         text=True,
-        timeout=1800,
+        timeout=2000,
     )
     if lima_result.returncode != 0:
-        # Print so a developer running the suite sees what happened,
-        # but do not fail. Lima-backed tests will fail naturally
-        # downstream (either at create time for lack of a base image,
-        # or at ssh time for the cross-user bug the new harness
-        # exists to expose — both are expected failure modes under
-        # the new harness).
-        print(
-            "[conftest] Lima base-image rebuild failed under "
-            f"SANDBOX_HARNESS={SANDBOX_HARNESS!r}; continuing — Lima "
-            "tests will fail downstream and that is the expected "
-            "outcome for the diff-the-outcomes run.\n"
+        # Fatal — the operator needs to see this up front rather than
+        # learn about it from one Lima test at a time. With the pre-warm
+        # hoist in place there is no legitimate "build the container
+        # image so at least the container tests pass" fallback worth
+        # absorbing the noise from.
+        pytest.fail(
+            "Failed to build Lima base image during session pre-warm "
+            f"(exit {lima_result.returncode}). All Lima-marked tests "
+            "will fail downstream until this is resolved. See "
+            "docs/guides/troubleshooting.md for slow-network "
+            "remediation.\n"
             f"stdout: {lima_result.stdout}\n"
-            f"stderr: {lima_result.stderr}",
-            file=sys.stderr,
+            f"stderr: {lima_result.stderr}"
         )
+    print(
+        "[conftest] Lima base image pre-warm completed successfully",
+        file=sys.stderr,
+    )
 
 
 @pytest.fixture

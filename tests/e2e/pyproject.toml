@@ -16,6 +16,15 @@ testpaths = ["."]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
 timeout = 600
+# Exclude fixture setup/teardown from the per-test timeout. This is
+# essential for the session-scoped Lima base-image pre-warm (see
+# conftest.py::_ensure_base_image) which can legitimately take 10+
+# minutes on slow-network hosts to download the 580 MiB Ubuntu cloud
+# image. Without this flag, that download counts against whatever
+# test happens to trigger the fixture's first invocation, producing
+# spurious pytest-timeout failures even though the test body itself
+# would finish in well under 600 s.
+timeout_func_only = true
 markers = [
     "lima: test runs only on the Lima/QEMU backend",
     "container: test runs only on the lite container backend",

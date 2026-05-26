@@ -34,15 +34,29 @@ const LIST_VMS_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Timeout for `limactl create` when building the base image. The base
 /// image build path downloads the Ubuntu 24.04 cloud-image qcow2
-/// (`ubuntu-24.04-server-cloudimg-amd64.img`, ~580 MiB) on first use,
-/// which on a typical 5-10 MB/s mirror takes 60-120 s on its own — so
-/// the previous 120 s budget was a near-zero-margin race on fast hosts
-/// and a guaranteed timeout on slower ones. 300 s accommodates a 5 MB/s
-/// floor with headroom for the post-download `limactl create` work
-/// (qcow2 cloning, cloud-config generation). This is still a one-time
-/// cost amortized over every subsequent session against the cached
-/// base image.
-const BASE_CREATE_TIMEOUT: Duration = Duration::from_secs(300);
+/// (`ubuntu-24.04-server-cloudimg-amd64.img`, ~580 MiB) on first use.
+/// Observed effective throughput from `cloud-images.ubuntu.com` varies
+/// wildly — a fast mirror finishes in 60-120 s, but slow-network hosts
+/// see floors as low as ~1.3 MB/s, which makes the full download take
+/// ~7-8 minutes. The 1200 s budget here clears that observed floor
+/// with ample headroom for the post-download `limactl create` work
+/// (qcow2 cloning, cloud-config generation) and any one-off network
+/// jitter.
+///
+/// This bound is daemon-side and does not directly bound any e2e test:
+/// the harness's session-scoped pre-warm fixture (`_ensure_base_image`
+/// in `tests/e2e/conftest.py`) runs the rebuild *outside* any per-test
+/// pytest-timeout window. The fixture itself caps the rebuild
+/// subprocess at 1800 s, so 1200 s here leaves room without papering
+/// over a genuinely-stalled download.
+///
+/// This is a one-time cost amortized over every subsequent session
+/// against the cached base image — the harness's
+/// `_reset_sandbox_state_dir` deliberately preserves the Lima
+/// download cache and the golden base VM across pytest sessions so
+/// the freshness check short-circuits the rebuild after the first
+/// successful pre-warm.
+const BASE_CREATE_TIMEOUT: Duration = Duration::from_secs(1200);
 
 /// Timeout for `limactl start` when booting the base image (cloud-init
 /// provisioning runs on first boot: installs socat, git, Docker via
