@@ -2918,66 +2918,17 @@ async fn fetch_capabilities_for(
     map
 }
 
-/// Plan the program + argv `sandbox ssh` shells out to for a given
-/// session backend.
+/// Resolve `session` (either a name or canonical 12-char id) via the
+/// daemon to its canonical [`SessionDto`]. Surfaces the daemon's typed
+/// error envelope verbatim on failure and `process::exit`s with code
+/// 1 — mirrors the pattern the SSH-shaped handlers used pre-rewrite.
 ///
-/// Pulled out of [`handle_ssh`] as a pure function so unit tests can
-/// drive the dispatch without spawning a subprocess. The shape is
-/// `(program, args)` where `args` already includes the session-name
-/// arg and any user-supplied trailing command — i.e. the caller can
-/// pass the values straight to [`std::process::Command`].
-///
-/// Backend-specific shapes:
-///
-/// - **Lima** — `limactl shell sandbox-<id> [-- <cmd>...]`. The
-///   pre-existing path; the `--` separator is omitted when the user
-///   did not pass a trailing command so an interactive shell starts.
-/// - **Container** — `docker exec -i [-t] sandbox-<id> [<cmd>...]`.
-///   Mirrors `ContainerRuntime::exec_interactive` (`docker exec -i …`).
-///   The `-t` (allocate TTY) flag is added only when the parent
-///   process's stdin is itself a terminal — `docker exec -t` fails
-///   fast with "cannot attach stdin to a TTY-enabled container
-///   because stdin is not a terminal" when the caller is e.g. a
-///   pytest subprocess or any other pipe-fed parent. No `--user`:
-///   the container is created with `--user uid:gid` already, and
-///   `docker exec` inherits that identity by default.
-fn plan_ssh_command(
-    backend: sandbox_core::backend::BackendKind,
-    session_id: &sandbox_core::SessionId,
-    command: &[String],
-    stdin_is_tty: bool,
-) -> (&'static str, Vec<String>) {
-    let target_name = format!("sandbox-{session_id}");
-    match backend {
-        sandbox_core::backend::BackendKind::Lima => {
-            let mut args = vec!["shell".to_string(), target_name];
-            if !command.is_empty() {
-                args.push("--".to_string());
-                args.extend(command.iter().cloned());
-            }
-            ("limactl", args)
-        }
-        sandbox_core::backend::BackendKind::Container => {
-            // Always pass `-i` so stdin is forwarded to the in-container
-            // process. Only add `-t` when the caller's stdin is a real
-            // TTY: `docker exec -t` aborts at startup if stdin isn't a
-            // terminal (e.g. pytest's PIPE stdin), so passing it
-            // unconditionally would break every non-interactive caller.
-            let flags = if stdin_is_tty { "-it" } else { "-i" };
-            let mut args = vec!["exec".to_string(), flags.to_string(), target_name];
-            if !command.is_empty() {
-                args.extend(command.iter().cloned());
-            }
-            ("docker", args)
-        }
-    }
-}
-
-/// Handle the `ssh` subcommand: resolve session via daemon API, then
-/// exec the backend-appropriate shell helper (`limactl shell` for Lima,
-/// `docker exec -it` for Container).
-async fn handle_ssh(socket_path: &str, session: &str, command: &[String]) {
-    // Resolve the session name/id to a Session via the daemon API.
+/// Used by every SSH-shaped command (`ssh`, `cp`, `sync`, `workspace
+/// push|pull`) as the first step: even though the SSH-tool argv only
+/// needs the canonical session id, we resolve through the daemon so
+/// operators can pass either an id or a session name uniformly across
+/// every command.
+async fn resolve_session_for_ssh_dispatch(socket_path: &str, session: &str) -> SessionDto {
     let req = Request::builder()
         .method("GET")
         .uri(format!("/sessions/{session}"))
@@ -3001,43 +2952,131 @@ async fn handle_ssh(socket_path: &str, session: &str, command: &[String]) {
         process::exit(1);
     }
 
-    let session_resp: SessionDto = match serde_json::from_str(&body) {
+    match serde_json::from_str::<SessionDto>(&body) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("Failed to parse session response: {e}");
             process::exit(1);
         }
-    };
+    }
+}
 
-    // Dispatch on the persisted backend so container sessions reach
-    // `docker exec` instead of failing with
-    // `limactl shell sandbox-<id>: no such instance`.
-    //
-    // `stdin_is_tty` controls whether `docker exec` gets `-t`: passing
-    // `-t` when our own stdin is not a terminal (e.g. piped from a
-    // test harness) causes docker to abort with "cannot attach stdin
-    // to a TTY-enabled container because stdin is not a terminal".
-    let stdin_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
-    let (program, args) = plan_ssh_command(
-        session_resp.backend,
-        &session_resp.id,
-        command,
-        stdin_is_tty,
-    );
-
-    let mut cmd = std::process::Command::new(program);
-    cmd.args(&args);
-
-    // Use .status() to inherit stdin/stdout/stderr for interactive use.
-    match cmd.status() {
-        Ok(exit_status) => {
-            process::exit(exit_status.code().unwrap_or(1));
-        }
+/// Fetch `GET /sessions/{id}/ssh-config` and parse the response into
+/// an [`SshConfigDto`]. Used as the `fetch_dto` callback into
+/// [`sandbox_cli::ssh_commands::run_with_drift_recovery`]. The
+/// closure form lets the wrapper re-fetch on a drift signal without
+/// the dispatch site duplicating the request-building logic.
+async fn fetch_ssh_config_dto(
+    socket_path: &str,
+    id: &str,
+) -> Result<sandbox_core::SshConfigDto, sandbox_cli::ssh_commands::DriftRecoveryError> {
+    let req = sandbox_cli::ssh_commands::build_ssh_config_request(id);
+    let (status, body) = match send_request(socket_path, req).await {
+        Ok(r) => r,
         Err(e) => {
-            eprintln!("Failed to execute {program}: {e}");
-            process::exit(1);
+            return Err(sandbox_cli::ssh_commands::DriftRecoveryError::FetchDto(e));
+        }
+    };
+    sandbox_cli::ssh_commands::parse_ssh_config_response(
+        status,
+        &body,
+        std::path::Path::new(socket_path),
+        id,
+    )
+}
+
+/// Render the [`sandbox_cli::ssh_commands::DriftRecoveryError`] for an
+/// operator-facing error path and exit. Centralised so every SSH-shaped
+/// command's failure surface speaks the same vocabulary.
+fn fail_drift_recovery(err: sandbox_cli::ssh_commands::DriftRecoveryError) -> ! {
+    eprintln!("Error: {err}");
+    process::exit(1)
+}
+
+/// Extra environment variables passed to every spawned SSH-tool child
+/// so the `ProxyCommand sandbox proxy <id>` line in the daemon-emitted
+/// config block reaches the same daemon socket the parent CLI is
+/// talking to, and finds the same `sandbox` binary on `$PATH`.
+///
+/// * `SANDBOX_SOCKET` — propagated so the inner `sandbox proxy` shim
+///   reaches the same daemon the parent CLI is talking to. Without
+///   this the shim falls back to `default_socket_path()`, which
+///   silently breaks for operators using a non-default socket (CI
+///   harnesses, multi-daemon hosts).
+/// * `PATH` — prefixed with the directory of the running `sandbox`
+///   binary so `ssh`/`scp`/`rsync`'s `ProxyCommand sandbox proxy <id>`
+///   resolves to *this* binary (and not a stale system-installed
+///   one). Test harnesses commonly invoke us by absolute path against
+///   a `target/debug/sandbox` build that is not on `$PATH`; without
+///   the prefix the `ProxyCommand` would fail with "sandbox: command
+///   not found" and the operator would see `Connection closed by
+///   UNKNOWN port 65535` instead of an actionable error.
+fn ssh_child_extra_env(socket_path: &str) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = Vec::with_capacity(2);
+    env.push(("SANDBOX_SOCKET".to_string(), socket_path.to_string()));
+    if let Ok(self_exe) = std::env::current_exe() {
+        if let Some(parent) = self_exe.parent() {
+            let current = std::env::var("PATH").unwrap_or_default();
+            let prefixed = if current.is_empty() {
+                parent.display().to_string()
+            } else {
+                format!("{}:{current}", parent.display())
+            };
+            env.push(("PATH".to_string(), prefixed));
         }
     }
+    env
+}
+
+/// Handle the `ssh` subcommand: ensure the per-session SSH config
+/// entry exists under `~/.ssh/sandbox/`, spawn `ssh sandbox-<id> [--
+/// cmd]`, and wire the single-retry drift-recovery wrapper around the
+/// child process. Mirrors Spec § Architecture → CLI: persistent
+/// ssh-config (Per-session entry write + Per-command translation).
+///
+/// `LC_ALL=C` / `LANG=C` are injected into the child's environment so
+/// the `Permission denied (publickey)` substring the drift sniffer
+/// matches against is locale-stable. `SANDBOX_SOCKET` is also injected
+/// so the recursive `sandbox proxy` invocation triggered by the
+/// `ProxyCommand` directive reaches the same daemon socket.
+async fn handle_ssh(socket_path: &str, session: &str, command: &[String]) {
+    let session_dto = resolve_session_for_ssh_dispatch(socket_path, session).await;
+    let id = session_dto.id.as_str().to_string();
+    let home = match sandbox_cli::ssh_commands::resolve_home() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            process::exit(1);
+        }
+    };
+
+    let command = command.to_vec();
+    let socket_owned = socket_path.to_string();
+    let id_for_fetch = id.clone();
+
+    let exit_code = match sandbox_cli::ssh_commands::run_with_drift_recovery(
+        &home,
+        &id,
+        move || {
+            let s = socket_owned.clone();
+            let i = id_for_fetch.clone();
+            async move { fetch_ssh_config_dto(&s, &i).await }
+        },
+        move |alias, _attempt_idx| {
+            let extras = ssh_child_extra_env(socket_path);
+            let cmd = command.clone();
+            async move {
+                let (program, args) = sandbox_cli::ssh_commands::plan_ssh_argv(&alias, &cmd);
+                sandbox_cli::ssh_commands::spawn_ssh_tool_attempt(&program, &args, extras).await
+            }
+        },
+    )
+    .await
+    {
+        Ok(code) => code,
+        Err(e) => fail_drift_recovery(e),
+    };
+    process::exit(exit_code);
 }
 
 /// Handle the `logs` subcommand: resolve session via daemon API, then exec
@@ -4006,134 +4045,38 @@ async fn handle_events(
     }
 }
 
-/// Direction of a host <-> session transfer, derived by `handle_cp` /
-/// `handle_sync` from which side of the `src`/`dst` pair carried the
-/// `session:` prefix.
-///
-/// Carried into [`plan_cp_command`] and [`plan_sync_command`] so each
-/// planner can emit the correct argument ordering for whichever native
-/// tool handles the dispatch. A single shared enum (rather than two
-/// sibling functions per planner) keeps the dispatch surface a single
-/// pure helper across both `sandbox cp` and `sandbox sync`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TransferDirection {
-    /// Host filesystem -> session: source is local, destination is remote.
-    Upload,
-    /// Session -> host filesystem: source is remote, destination is local.
-    Download,
-}
-
-/// Pure planner that maps a backend-kind + direction + paths into the
-/// `(program, args)` tuple the caller will hand to
-/// `std::process::Command`. Mirrors [`plan_ssh_command`] so all
-/// session-targeting CLI commands share the same dispatch shape.
-///
-/// **Why this exists.** Dispatching to the backend's native copy
-/// command (`limactl cp` / `docker cp`) handles edge cases the
-/// daemon-side base64-over-HTTP pump glossed over: large files,
-/// sparse files, attribute preservation, directory recursion, and
-/// error message clarity.
-///
-/// **Backend shapes.**
-///
-/// - **Lima** — `limactl cp [-r] <src> <dst>` where the remote side
-///   has the form `sandbox-<id>:<path>`. In Lima 2.x `limactl cp` is
-///   implemented on top of `rsync` (older Lima versions wrapped
-///   `scp`). Unlike `scp`, rsync does **not** treat `-r` as a no-op
-///   when the source is a regular file: it tries to `chdir` into the
-///   source path, hits ENOTDIR, and aborts with rsync exit code 23.
-///   So `-r` is conditional on the caller-supplied `source_is_dir`
-///   flag — the caller must `stat` the source before invoking the
-///   planner. `docker cp` (the container backend) recurses by
-///   default and needs no analogous flag, which is why this
-///   conditional only lives on the Lima branch.
-/// - **Container** — `docker cp <src> <dst>` where the remote side
-///   has the form `sandbox-<id>:<path>`. `docker cp` already
-///   recurses into directories by default, no `-r` analogue is
-///   needed (and none exists). Works on running *and* stopped
-///   containers via the storage driver — a small UX upgrade over
-///   the old path which required `state == Running`.
-///
-/// **Sibling planner.** [`plan_sync_command`] follows the same shape
-/// for `sandbox sync` (rsync-based directory mirroring), sharing the
-/// [`TransferDirection`] enum and the `sandbox-<id>` runtime-handle
-/// convention. The two planners are deliberately parallel free
-/// functions rather than methods on a backend trait — the codebase
-/// does not use trait-object dispatch for backend kinds elsewhere,
-/// and adding one purely for these two helpers would not buy
-/// polymorphism we use.
-fn plan_cp_command(
-    backend: sandbox_core::backend::BackendKind,
-    session_id: &sandbox_core::SessionId,
-    direction: TransferDirection,
-    host_path: &str,
-    remote_path: &str,
-    source_is_dir: bool,
-) -> (&'static str, Vec<String>) {
-    let target_name = format!("sandbox-{session_id}");
-    let remote_arg = format!("{target_name}:{remote_path}");
-    let (src_arg, dst_arg) = match direction {
-        TransferDirection::Upload => (host_path.to_string(), remote_arg),
-        TransferDirection::Download => (remote_arg, host_path.to_string()),
-    };
-
-    match backend {
-        sandbox_core::backend::BackendKind::Lima => {
-            // `limactl cp` in Lima 2.x is rsync-backed (not scp). rsync
-            // refuses to `chdir` into a non-directory source when `-r`
-            // is set, so we only pass `-r` when the caller has
-            // verified the source is a directory. The caller is
-            // responsible for stat'ing the source — we cannot stat
-            // here in a pure planner without losing testability.
-            let mut args = vec!["cp".to_string()];
-            if source_is_dir {
-                args.push("-r".to_string());
-            }
-            args.push(src_arg);
-            args.push(dst_arg);
-            ("limactl", args)
-        }
-        sandbox_core::backend::BackendKind::Container => {
-            // `docker cp` already recurses into directories by default
-            // and has no `-r` flag. The argument shape matches Lima's
-            // exactly, only the program changes — keeping the user's
-            // mental model "remote side carries `session:path`" intact
-            // across both backends. `source_is_dir` is unused on this
-            // branch by design.
-            let _ = source_is_dir;
-            let args = vec!["cp".to_string(), src_arg, dst_arg];
-            ("docker", args)
-        }
-    }
-}
-
-/// Parse a `session:path` spec, returning `(session, path)` if the design
-/// contains a colon, or `None` if it's a local path.
+/// Parse a `session:path` spec, returning `(session, path)` if the spec
+/// contains a colon, or `None` if it is a local path.
 fn parse_remote_spec(spec: &str) -> Option<(&str, &str)> {
-    // Split on the first colon only.
+    // Split on the first colon only — paths after the colon may
+    // themselves contain colons (e.g. `session:/abs:with:colons.txt`).
     spec.split_once(':')
 }
 
 /// Handle the `cp` subcommand: copy files between host and sandbox VM
-/// by dispatching to the backend's native copy tool (`limactl cp` for
-/// Lima sessions, `docker cp` for container sessions).
+/// by dispatching to `scp sandbox-<id>:<path>` with stdio inherited
+/// for the operator's progress/error visibility.
 ///
-/// The CLI resolves the session via `GET /sessions/{id}` to discover
-/// the persisted backend kind and canonical session id, then hands the
-/// transfer to the native tool with stdio inherited so its native
-/// error messages reach the operator unchanged.
+/// Implements Spec § Architecture → CLI: persistent ssh-config
+/// (Per-command translation) — `sandbox cp` resolves through the
+/// daemon-mediated proxy via the `sandbox-<id>` alias the operator's
+/// `~/.ssh/config` Include block defines. The single-retry drift-
+/// recovery wrapper from
+/// [`sandbox_cli::ssh_commands::run_with_drift_recovery`] reauthorises
+/// the local entry against the daemon on a `Permission denied
+/// (publickey)` failure and retries once.
 async fn handle_cp(socket_path: &str, src: &str, dst: &str) {
+    use sandbox_cli::ssh_commands::TransferDirection;
+
     // Determine transfer direction by which side carries `session:`.
     let src_remote = parse_remote_spec(src);
     let dst_remote = parse_remote_spec(dst);
 
     let (session_arg, host_path, remote_path, direction) = match (src_remote, dst_remote) {
         (None, Some((session, remote_path))) => {
-            // Upload: local -> session.
             (session, src, remote_path, TransferDirection::Upload)
         }
         (Some((session, remote_path)), None) => {
-            // Download: session -> local.
             (session, dst, remote_path, TransferDirection::Download)
         }
         (Some(_), Some(_)) => {
@@ -4151,54 +4094,21 @@ async fn handle_cp(socket_path: &str, src: &str, dst: &str) {
         }
     };
 
-    // Resolve the session name/id to a SessionDto so we know the
-    // backend kind and the canonical session id used to derive the
-    // `sandbox-<id>` runtime handle. Mirrors the lookup in
-    // `handle_ssh` / `handle_logs` for parity across dispatch
-    // commands.
-    let req = Request::builder()
-        .method("GET")
-        .uri(format!("/sessions/{session_arg}"))
-        .body(String::new())
-        .expect("failed to build request");
-
-    let (status, body) = match send_request(socket_path, req).await {
-        Ok(r) => r,
+    let session_dto = resolve_session_for_ssh_dispatch(socket_path, session_arg).await;
+    let id = session_dto.id.as_str().to_string();
+    let home = match sandbox_cli::ssh_commands::resolve_home() {
+        Ok(h) => h,
         Err(e) => {
-            eprintln!("{e}");
-            process::exit(1);
-        }
-    };
-
-    if !status.is_success() {
-        if let Ok(api_err) = serde_json::from_str::<ApiError>(&body) {
-            eprintln!("Error: {}", api_err.error);
-        } else {
-            eprintln!("Error ({status}): {body}");
-        }
-        process::exit(1);
-    }
-
-    let session_resp: SessionDto = match serde_json::from_str(&body) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Failed to parse session response: {e}");
+            eprintln!("Error: {e}");
             process::exit(1);
         }
     };
 
     // Stat the host-side source so the planner can decide whether to
-    // pass `-r` to `limactl cp` (Lima 2.x's rsync-backed copy aborts
-    // with ENOTDIR when `-r` is set against a regular file). On
-    // Download the source lives on the VM side; remote-stat'ing from
-    // the host would require a daemon round-trip we deliberately
-    // avoid here, so we always pass `source_is_dir: false` for
-    // downloads — `limactl cp` (no `-r`) handles file-to-file and
-    // file-to-dir destinations fine, and an operator wanting a
-    // directory download invokes the explicit `sandbox cp -r` shape
-    // (the `-r` switch is currently unconditional on Lima but is
-    // about to become conditional; users wanting directory download
-    // can opt in via `sandbox sync` instead).
+    // pass `-r` to `scp`. On Download the source lives on the VM
+    // side; we deliberately do not remote-stat (would require a
+    // daemon round-trip on the happy path), and operators wanting
+    // directory download fall through to `sandbox sync`.
     let source_is_dir = match direction {
         TransferDirection::Upload => std::fs::metadata(host_path)
             .map(|m| m.is_dir())
@@ -4206,188 +4116,63 @@ async fn handle_cp(socket_path: &str, src: &str, dst: &str) {
         TransferDirection::Download => false,
     };
 
-    let (program, args) = plan_cp_command(
-        session_resp.backend,
-        &session_resp.id,
-        direction,
-        host_path,
-        remote_path,
-        source_is_dir,
-    );
+    let host_path = host_path.to_string();
+    let remote_path = remote_path.to_string();
+    let socket_owned = socket_path.to_string();
+    let id_for_fetch = id.clone();
 
-    // Inherit stdin/stdout/stderr so the native tool's progress and
-    // error messages reach the operator verbatim — that's the whole
-    // point of the refactor. We propagate the subprocess exit code
-    // unchanged so callers/scripts can branch on the same set of
-    // status codes the native tool already documents (scp's exit
-    // codes via `limactl cp`; docker's via `docker cp`).
-    let mut cmd = std::process::Command::new(program);
-    cmd.args(&args);
-
-    match cmd.status() {
-        Ok(exit_status) => {
-            process::exit(exit_status.code().unwrap_or(1));
-        }
-        Err(e) => {
-            // `limactl` or `docker` not on PATH (or any other spawn
-            // failure). Surface the program name explicitly so the
-            // operator immediately knows which dependency is missing.
-            eprintln!("Error: failed to execute {program}: {e}");
-            process::exit(1);
-        }
-    }
-}
-
-/// Pure planner that maps a backend-kind + direction + paths into the
-/// `(program, args)` tuple `handle_sync` will hand to
-/// `std::process::Command`. Sibling of [`plan_cp_command`] — same
-/// (backend, session, direction, host_path, remote_path) input shape,
-/// same `sandbox-<id>` runtime-handle convention, but emits an `rsync`
-/// invocation that uses the backend's native shell as the remote
-/// transport (rsync's `-e` slot).
-///
-/// **Why a separate command and not a `--rsync` flag on `cp`.** `cp`
-/// and `sync` carry different semantics: `cp` retransfers the full
-/// source on every invocation, mirroring `scp`/`docker cp`; `sync`
-/// preserves attributes, skips unchanged files, and (with the baseline
-/// flag set below) deletes destination entries that no longer exist
-/// on the source side. Folding both into `cp` would mean a single
-/// command with two distinct mental models — a `--delete` switch is
-/// not "deletion *in* a copy", it's "this is a mirror, not a copy".
-/// Splitting the surface keeps each command's contract obvious from
-/// its name alone.
-///
-/// **Baseline rsync flags.**
-///
-/// - `-a` (`--archive`) — recurse, preserve symlinks, perms, times,
-///   group, owner, devices, special files. The default for any
-///   directory-mirror workflow; without it, `sync` would behave like
-///   a slower `cp -r`.
-/// - `--delete` — remove files on the destination that are absent on
-///   the source, so the destination ends as a faithful mirror of the
-///   source. Out-of-scope: filter rules, partial transfers, bandwidth
-///   limits — operators wanting those should run `rsync` directly
-///   against the same `-e` shell-transport pattern this planner uses.
-///
-/// **Backend shapes.**
-///
-/// - **Lima** — `rsync -a --delete -e 'limactl shell' <src> <dst>`
-///   where the remote side has the form `sandbox-<id>:<path>`. rsync
-///   spawns `limactl shell sandbox-<id> rsync --server …` for the
-///   far side; `limactl shell INSTANCE [COMMAND...]` accepts that
-///   shape verbatim, and the underlying SSH transport is the same one
-///   that powers `limactl cp` on the cp path. We *don't* use
-///   `rsync -e 'ssh -F ~/.lima/<vm>/ssh.config'` even though it would
-///   also work — `limactl shell` is the supported public entrypoint;
-///   the per-VM ssh.config is an internal artefact whose path and
-///   contents Lima reserves the right to rearrange.
-/// - **Container** — `rsync -a --delete -e 'docker exec -i' <src>
-///   <dst>` where the remote side has the form `sandbox-<id>:<path>`.
-///   `docker exec -i <container> rsync --server …` is the
-///   shell-equivalent transport for a container; `-i` keeps stdin
-///   forwarded (rsync needs a binary-clean duplex pipe). No `-t` —
-///   allocating a TTY would corrupt rsync's wire protocol.
-///
-/// **rsync availability.** Both backends provision `rsync` into the
-/// session image (Lima base + per-session cloud-init, container Lite
-/// Dockerfile). If `rsync` is missing on either side, the operator
-/// sees the native error verbatim — `rsync: command not found` from
-/// the remote shell, or "No such file or directory (os error 2)"
-/// when the host-side `rsync` binary is missing. We deliberately do
-/// not pre-flight check for rsync: a probe round-trip would slow the
-/// happy path, and the native error already names the missing
-/// dependency.
-///
-/// **Trailing-slash auto-append on directory uploads.** rsync's
-/// long-standing convention is that a source path *with* a trailing
-/// slash means "copy the contents of this directory into the
-/// destination", while a path *without* one means "copy this
-/// directory itself into the destination" (which produces
-/// `<dst>/<basename(src)>/...`). Most users — and the E2E tests —
-/// expect contents-mirroring when they write `sandbox sync ./src
-/// remote:./dst`, so when the caller signals via `source_is_dir` that
-/// the local source is a directory and the path does not already end
-/// with `/`, the planner appends one before constructing `src_arg`
-/// for the upload case. We do **not** mutate the path on download —
-/// the source there lives on the VM side and the host has no easy
-/// way to remote-stat without a round-trip; users who want
-/// contents-mirroring on download supply the trailing slash
-/// explicitly. The decision to stat lives at the call site (in
-/// `handle_sync`) so the planner stays a pure function — testable
-/// without the filesystem and parametrizable from tests with both
-/// `true` and `false` source_is_dir.
-fn plan_sync_command(
-    backend: sandbox_core::backend::BackendKind,
-    session_id: &sandbox_core::SessionId,
-    direction: TransferDirection,
-    host_path: &str,
-    remote_path: &str,
-    extra_args: &[String],
-    source_is_dir: bool,
-) -> (&'static str, Vec<String>) {
-    let target_name = format!("sandbox-{session_id}");
-    let remote_arg = format!("{target_name}:{remote_path}");
-
-    // Auto-append a trailing slash on the host-side source path when
-    // (a) the caller has stat'd it and confirmed it's a directory and
-    // (b) the path doesn't already end in `/`. Only applied on
-    // Upload — see the docstring for the asymmetry rationale.
-    let host_arg = if matches!(direction, TransferDirection::Upload)
-        && source_is_dir
-        && !host_path.ends_with('/')
+    let exit_code = match sandbox_cli::ssh_commands::run_with_drift_recovery(
+        &home,
+        &id,
+        move || {
+            let s = socket_owned.clone();
+            let i = id_for_fetch.clone();
+            async move { fetch_ssh_config_dto(&s, &i).await }
+        },
+        move |alias, _attempt_idx| {
+            let host_path = host_path.clone();
+            let remote_path = remote_path.clone();
+            let extras = ssh_child_extra_env(socket_path);
+            async move {
+                let (program, args) = sandbox_cli::ssh_commands::plan_scp_argv(
+                    &alias,
+                    &host_path,
+                    &remote_path,
+                    direction,
+                    source_is_dir,
+                );
+                sandbox_cli::ssh_commands::spawn_ssh_tool_attempt(&program, &args, extras).await
+            }
+        },
+    )
+    .await
     {
-        format!("{host_path}/")
-    } else {
-        host_path.to_string()
+        Ok(code) => code,
+        Err(e) => fail_drift_recovery(e),
     };
-
-    let (src_arg, dst_arg) = match direction {
-        TransferDirection::Upload => (host_arg, remote_arg),
-        TransferDirection::Download => (remote_arg, host_arg),
-    };
-
-    let rsh = match backend {
-        sandbox_core::backend::BackendKind::Lima => "limactl shell",
-        // `-i` forwards stdin into the container so rsync can speak
-        // its binary protocol both ways. No `-t` — a TTY would line-
-        // buffer and corrupt the wire format.
-        sandbox_core::backend::BackendKind::Container => "docker exec -i",
-    };
-
-    // Argv layout: `[baseline flags] [pass-through flags] <src> <dst>`.
-    // rsync expects every flag to precede the file operands; splicing
-    // pass-through args between the baseline and operands keeps the
-    // operator-supplied flags in a position rsync accepts (man rsync(1)
-    // describes the synopsis as `rsync [OPTION...] SRC... [DEST]`).
-    let mut args = vec![
-        "-a".to_string(),
-        "--delete".to_string(),
-        "-e".to_string(),
-        rsh.to_string(),
-    ];
-    args.extend(extra_args.iter().cloned());
-    args.push(src_arg);
-    args.push(dst_arg);
-    ("rsync", args)
+    process::exit(exit_code);
 }
 
-/// Handle the `sync` subcommand: rsync-mirror a directory between host
-/// and session by dispatching to the host's `rsync` binary with the
-/// backend's native shell as the remote-shell (`-e`) transport. Mirrors
-/// the structure of `handle_cp` so the two commands have a single
-/// dispatch shape.
+/// Handle the `sync` subcommand: rsync-mirror a directory between
+/// host and session via `rsync -a --delete -e ssh sandbox-<id>:<path>`.
+///
+/// The shell transport is bare `ssh`; the operator's `~/.ssh/config`
+/// (via our managed `Include` block) resolves `sandbox-<id>` to the
+/// daemon-mediated proxy. Single-retry drift recovery from
+/// [`sandbox_cli::ssh_commands::run_with_drift_recovery`] reauthorises
+/// the local entry against the daemon on `Permission denied
+/// (publickey)`.
 async fn handle_sync(socket_path: &str, src: &str, dst: &str, rsync_args: &[String]) {
-    // Determine transfer direction by which side carries `session:`.
+    use sandbox_cli::ssh_commands::TransferDirection;
+
     let src_remote = parse_remote_spec(src);
     let dst_remote = parse_remote_spec(dst);
 
     let (session_arg, host_path, remote_path, direction) = match (src_remote, dst_remote) {
         (None, Some((session, remote_path))) => {
-            // Upload: local -> session.
             (session, src, remote_path, TransferDirection::Upload)
         }
         (Some((session, remote_path)), None) => {
-            // Download: session -> local.
             (session, dst, remote_path, TransferDirection::Download)
         }
         (Some(_), Some(_)) => {
@@ -4405,50 +4190,16 @@ async fn handle_sync(socket_path: &str, src: &str, dst: &str, rsync_args: &[Stri
         }
     };
 
-    // Resolve the session to a SessionDto so we know the persisted
-    // backend kind and the canonical session id used to derive the
-    // `sandbox-<id>` runtime handle. Mirrors the lookup in
-    // `handle_cp` / `handle_ssh` for parity across dispatch commands.
-    let req = Request::builder()
-        .method("GET")
-        .uri(format!("/sessions/{session_arg}"))
-        .body(String::new())
-        .expect("failed to build request");
-
-    let (status, body) = match send_request(socket_path, req).await {
-        Ok(r) => r,
+    let session_dto = resolve_session_for_ssh_dispatch(socket_path, session_arg).await;
+    let id = session_dto.id.as_str().to_string();
+    let home = match sandbox_cli::ssh_commands::resolve_home() {
+        Ok(h) => h,
         Err(e) => {
-            eprintln!("{e}");
+            eprintln!("Error: {e}");
             process::exit(1);
         }
     };
 
-    if !status.is_success() {
-        if let Ok(api_err) = serde_json::from_str::<ApiError>(&body) {
-            eprintln!("Error: {}", api_err.error);
-        } else {
-            eprintln!("Error ({status}): {body}");
-        }
-        process::exit(1);
-    }
-
-    let session_resp: SessionDto = match serde_json::from_str(&body) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Failed to parse session response: {e}");
-            process::exit(1);
-        }
-    };
-
-    // Stat the host-side source so the planner can auto-append a
-    // trailing slash on directory uploads (rsync's "copy contents,
-    // not the directory itself" idiom). On Download the source lives
-    // on the VM side; we deliberately do not remote-stat — users who
-    // want contents-mirroring on download write the trailing slash
-    // explicitly in the remote path. Pass `source_is_dir: false` for
-    // every download; the planner short-circuits the trailing-slash
-    // logic when it's not an upload anyway, but keeping the call
-    // site explicit documents the intent.
     let source_is_dir = match direction {
         TransferDirection::Upload => std::fs::metadata(host_path)
             .map(|m| m.is_dir())
@@ -4456,195 +4207,57 @@ async fn handle_sync(socket_path: &str, src: &str, dst: &str, rsync_args: &[Stri
         TransferDirection::Download => false,
     };
 
-    let (program, args) = plan_sync_command(
-        session_resp.backend,
-        &session_resp.id,
-        direction,
-        host_path,
-        remote_path,
-        rsync_args,
-        source_is_dir,
-    );
+    let host_path = host_path.to_string();
+    let remote_path = remote_path.to_string();
+    let rsync_args = rsync_args.to_vec();
+    let socket_owned = socket_path.to_string();
+    let id_for_fetch = id.clone();
 
-    // Inherit stdin/stdout/stderr so rsync's progress and error
-    // messages reach the operator verbatim. Propagate the subprocess
-    // exit code unchanged so callers/scripts can branch on rsync's
-    // documented exit codes (man rsync(1) lists the full table).
-    let mut cmd = std::process::Command::new(program);
-    cmd.args(&args);
-
-    match cmd.status() {
-        Ok(exit_status) => {
-            process::exit(exit_status.code().unwrap_or(1));
-        }
-        Err(e) => {
-            // `rsync` not on PATH (or any other spawn failure).
-            // Surface the program name explicitly so the operator
-            // immediately knows which dependency is missing.
-            eprintln!("Error: failed to execute {program}: {e}");
-            process::exit(1);
-        }
-    }
+    let exit_code = match sandbox_cli::ssh_commands::run_with_drift_recovery(
+        &home,
+        &id,
+        move || {
+            let s = socket_owned.clone();
+            let i = id_for_fetch.clone();
+            async move { fetch_ssh_config_dto(&s, &i).await }
+        },
+        move |alias, _attempt_idx| {
+            let host_path = host_path.clone();
+            let remote_path = remote_path.clone();
+            let rsync_args = rsync_args.clone();
+            let extras = ssh_child_extra_env(socket_path);
+            async move {
+                let (program, args) = sandbox_cli::ssh_commands::plan_sync_argv(
+                    &alias,
+                    &host_path,
+                    &remote_path,
+                    direction,
+                    &rsync_args,
+                    source_is_dir,
+                );
+                sandbox_cli::ssh_commands::spawn_ssh_tool_attempt(&program, &args, extras).await
+            }
+        },
+    )
+    .await
+    {
+        Ok(code) => code,
+        Err(e) => fail_drift_recovery(e),
+    };
+    process::exit(exit_code);
 }
 
-/// Direction of a `sandbox workspace` rsync mirror.
+/// Direction of a `sandbox workspace` rsync mirror — local alias of
+/// [`sandbox_core::Direction`]. Push: host → guest. Pull: guest → host.
 ///
-/// Carried into [`plan_workspace_sync_argv`] so the planner emits the
-/// correct src/dst ordering for whichever direction the operator picked.
-/// Push: host → guest. Pull: guest → host.
-///
-/// Re-exported as a local alias of [`sandbox_core::Direction`] — the
-/// shared workspace-rsync builder owns the canonical direction enum,
-/// and the CLI inherits it so both call sites speak the same vocabulary.
-/// All existing `WorkspaceSyncDirection::{Push,Pull}` use sites continue
-/// to work because the variants are inherited through the alias.
+/// The historical workspace planner (`plan_workspace_sync_argv`) lived
+/// alongside this alias until M18-S6 collapsed the backend dispatch
+/// into the SSH-alias path. The pure-function planner now lives in
+/// [`sandbox_cli::ssh_commands::plan_workspace_rsync_argv`] and is
+/// driven from `run_workspace_push_or_pull` below; this alias survives
+/// because the daemon-facing `WorkspaceOpDto` shape and the workspace-
+/// action enum still speak in `Direction`.
 type WorkspaceSyncDirection = sandbox_core::Direction;
-
-/// Operator-supplied inputs for [`plan_workspace_sync_argv`].
-///
-/// Aggregating the inputs into a struct (vs. a long positional argument
-/// list) makes the planner call sites self-documenting and lets new
-/// flags slot in without churning every test fixture.
-///
-/// **Field semantics.**
-///
-/// - `direction` — push vs pull. Drives the src/dst ordering and the
-///   `sandbox-<id>:<guest>/` token's position.
-/// - `backend` — picks the rsync shell-transport (`-e <shell>`) value:
-///   `"limactl shell"` for Lima, `"docker exec -i"` for container.
-///   Mirrors the convention `plan_sync_command` and
-///   `sandbox_core::workspace_rsync::run_initial_push` use.
-/// - `session_id` — string form of the canonical [`sandbox_core::SessionId`]
-///   (carried as `String` so the planner stays decoupled from the
-///   `SessionId` newtype; the call site formats `id.to_string()` once).
-///   Concatenated into the `sandbox-<id>:<path>/` remote spec.
-/// - `host_path` — the host-side root of the workspace. Trailing slash
-///   is appended by the planner if absent.
-/// - `guest_path` — the guest-side root of the workspace. Same trailing-
-///   slash rule as `host_path`.
-/// - `dest_override` (pull only) — operator-supplied override of the
-///   host destination via `--dest <path>`. When `Some(p)`, replaces
-///   `host_path` in the dst position for the pull direction. The CLI
-///   handler is responsible for resolving any `~` and the
-///   existing-file rejection before constructing the plan; the planner
-///   takes the resolved string verbatim.
-/// - `force` / `dry_run` — operator's `-f` / `-n` choice. Exactly one
-///   must be set; otherwise the planner returns a usage error string.
-/// - `safe_links` — when `true`, `-L` is replaced by `-a --safe-links`
-///   (the archive flag `-a` is split out so the resulting argv has a
-///   distinct `-a` token followed by `--safe-links`, matching the
-///   the documented Push/pull commands argv layout).
-/// - `no_gitignore` — when `true`, the `--filter=:- .gitignore` token is
-///   omitted entirely from the argv.
-#[derive(Debug, Clone)]
-struct WorkspaceSyncPlan {
-    direction: WorkspaceSyncDirection,
-    backend: sandbox_core::BackendKind,
-    session_id: String,
-    host_path: String,
-    guest_path: String,
-    dest_override: Option<String>,
-    force: bool,
-    dry_run: bool,
-    safe_links: bool,
-    no_gitignore: bool,
-}
-
-/// Pure planner that builds the rsync argv for `sandbox workspace
-/// push|pull`. Sibling of [`plan_sync_command`] and the daemon-side
-/// `sandbox_core::workspace_rsync::run_initial_push` builder; the three
-/// share the rsync wire shape so a single audit covers all three call
-/// paths.
-///
-/// **Argv layout.** Per :
-///
-/// ```text
-/// rsync -aL --delete --filter=':- .gitignore' \
-///   -e <shell> [--dry-run] <src> <dst>
-/// ```
-///
-/// - `-L` ↔ `--safe-links` toggle: with `safe_links == false` the argv
-///   carries the combined `-aL` token (archive + dereference all
-///   symlinks). With `safe_links == true` the argv carries the split
-///   `-a --safe-links` pair: archive on its own, plus rsync's
-///   `--safe-links` (in-tree symlinks preserved; out-of-tree symlinks
-///   skipped).
-/// - `--filter=':- .gitignore'` drops when `no_gitignore == true`.
-/// - `--dry-run` appends when `dry_run == true`.
-/// - `<src>`/`<dst>` always carry a trailing `/`. Push: `<src>` is the
-///   host path, `<dst>` is `sandbox-<session>:<guest_path>/`. Pull:
-///   the order is swapped, and `dest_override` (if set) replaces the
-///   host path in the `<dst>` position.
-///
-/// **Usage errors (returned as `Err(String)`).**
-///
-/// - Both `force` and `dry_run` set → "`-f`/`--force` and `-n`/`--dry-run` are mutually exclusive".
-/// - Neither `force` nor `dry_run` set → "one of `-f`/`--force` or `-n`/`--dry-run` is required".
-///
-/// The CLI dispatcher relies on `clap`'s `conflicts_with` to surface
-/// the both-set case before reaching the planner, but the planner
-/// re-checks anyway so the pure function is safe to call from any
-/// future call site that doesn't go through `clap`.
-///
-/// The returned `Vec<String>` includes `"rsync"` as `argv[0]` — callers
-/// pass `argv[1..]` to `std::process::Command::new("rsync").args(...)`.
-fn plan_workspace_sync_argv(plan: &WorkspaceSyncPlan) -> Result<Vec<String>, String> {
-    // Exactly one of `force` / `dry_run` must be set. `clap`'s
-    // `conflicts_with` on `WorkspaceAction::Push`/`Pull` already
-    // catches the both-set case during argv parsing; this re-check is
-    // belt-and-braces so non-CLI callers (and unit tests) get a
-    // uniform error vocabulary.
-    match (plan.force, plan.dry_run) {
-        (false, false) => {
-            return Err("one of `-f`/`--force` or `-n`/`--dry-run` is required".to_string());
-        }
-        (true, true) => {
-            return Err("`-f`/`--force` and `-n`/`--dry-run` are mutually exclusive".to_string());
-        }
-        _ => {}
-    }
-
-    // The shared builder owns the rsync wire shape (transports,
-    // trailing-slash rule, `-aL` ↔ `-a --safe-links` toggle, filter
-    // drop, `--dry-run` placement, src/dst swap on Push vs Pull).
-    // CLI-specific concerns that the shared builder does NOT carry:
-    //
-    // - `--dest <path>` override (pull only). The planner is path-
-    //   agnostic and takes whatever string the call site supplies for
-    //   `host_path`; we feed the override in here so the shared
-    //   builder's trailing-slash normalisation applies uniformly.
-    //   Push ignores `dest_override` — clap's surface restricts
-    //   `--dest` to Pull, and `run_workspace_push_or_pull`
-    //   defensively clears it for Push.
-    // - `--mkpath` is intentionally left off (create-time push opts
-    //   in, operator push/pull leaves it off because the destination
-    //   should already exist).
-    // - The CLI returns argv with `"rsync"` as `argv[0]`; the shared
-    //   builder returns argv WITHOUT the program name, so we prepend
-    //   here. Returning the program inside the vector (rather than as
-    //   a separate field) matches the shape the unit-tests assert on.
-    let host_path = match (plan.direction, plan.dest_override.as_deref()) {
-        (WorkspaceSyncDirection::Pull, Some(dest)) => dest.to_string(),
-        _ => plan.host_path.clone(),
-    };
-
-    let opts = sandbox_core::WorkspaceRsyncOptions {
-        backend: plan.backend,
-        session_name: format!("sandbox-{}", plan.session_id),
-        host_path,
-        guest_path: plan.guest_path.clone(),
-        direction: plan.direction,
-        no_gitignore: plan.no_gitignore,
-        dry_run: plan.dry_run,
-        safe_links: plan.safe_links,
-        mkpath: false,
-    };
-
-    let mut argv = Vec::with_capacity(10);
-    argv.push("rsync".to_string());
-    argv.extend(sandbox_core::build_workspace_rsync_argv(&opts));
-    Ok(argv)
-}
 
 /// Expand a leading `~` in a `--dest` value against the CLI process's
 /// `$HOME`. Mirrors the rule applied to `--workspace`'s host path at
@@ -4980,7 +4593,10 @@ fn release_workspace_lock_blocking(socket_path: &str, session: &str, lock_token:
 /// 4. (Pull only) Resolve `--dest`: `~` expansion, existing-file
 ///    rejection, `create_dir_all(dirname)`.
 /// 5. Acquire the daemon-side workspace lock.
-/// 6. Build the rsync argv via [`plan_workspace_sync_argv`].
+/// 6. Build the rsync argv via
+///    [`sandbox_cli::ssh_commands::plan_workspace_rsync_argv`] (after
+///    the drift-recovery wrapper has ensured the per-session
+///    `~/.ssh/sandbox/` entry exists).
 /// 7. Spawn rsync as a child future; race it against SIGINT/SIGTERM.
 /// 8. Release the workspace lock (best-effort, on every exit path).
 /// 9. Exit with rsync's exit code (or `128 + signo` on signal).
@@ -5108,86 +4724,228 @@ async fn run_workspace_push_or_pull(
         release_workspace_lock_blocking(&release_socket, &release_session, &release_token);
     });
 
-    // Build the argv. Pure function — usage errors (neither / both of
-    // `-f`/`-n`) are surfaced here. clap's `conflicts_with` already
-    // catches both-set, but neither-set falls through to the planner.
-    let plan = WorkspaceSyncPlan {
-        direction,
-        backend: session.backend,
-        session_id: session.id.to_string(),
-        host_path,
-        guest_path,
-        dest_override,
+    // Construct the workspace-rsync plan inputs up front so the
+    // closure passed to drift-recovery can build the argv on each
+    // attempt without re-deriving them from scratch. The plan-level
+    // usage errors (`-f`/`-n` neither/both) surface as
+    // `Err(_)` from the planner inside the closure on every retry,
+    // but we *also* validate once here so a usage error never burns
+    // a daemon ssh-config fetch.
+    let validate_plan = sandbox_cli::ssh_commands::WorkspaceRsyncPlan {
+        alias: "sandbox-placeholder",
+        host_path: host_path.clone(),
+        guest_path: guest_path.clone(),
+        direction: workspace_direction_to_planner(direction),
+        dest_override: dest_override.clone(),
         force,
         dry_run,
         safe_links,
         no_gitignore,
     };
-    let argv = match plan_workspace_sync_argv(&plan) {
-        Ok(v) => v,
+    if let Err(e) = sandbox_cli::ssh_commands::plan_workspace_rsync_argv(&validate_plan) {
+        eprintln!("Error: {e}");
+        drop(release_guard);
+        process::exit(2);
+    }
+
+    let id = session.id.as_str().to_string();
+    let home = match sandbox_cli::ssh_commands::resolve_home() {
+        Ok(h) => h,
         Err(e) => {
             eprintln!("Error: {e}");
-            // Drop the guard *here* (rather than letting it ride to
-            // the end of the function) so the release flush is awaited
-            // synchronously before we exit. This is identical to
-            // letting scopeguard fire on scope exit, but the explicit
-            // drop makes the ordering reviewable.
-            drop(release_guard);
-            process::exit(2);
-        }
-    };
-
-    // Inherit stdin/stdout/stderr so rsync's progress and error
-    // messages reach the operator verbatim. argv[0] is "rsync" (the
-    // program); argv[1..] is the actual flag list.
-    let program = argv[0].clone();
-    let mut cmd = tokio::process::Command::new(&program);
-    cmd.args(&argv[1..]);
-    // `kill_on_drop` is the belt-and-suspenders companion to the
-    // explicit `child.kill()` in the signal arm: if anything causes
-    // this future to be dropped before `child.wait()` resolves (e.g.
-    // a panic between `spawn()` and the `select!`), the rsync child
-    // is reaped instead of being left as a zombie of the daemon.
-    cmd.kill_on_drop(true);
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Error: failed to execute {program}: {e}");
             drop(release_guard);
             process::exit(1);
         }
     };
 
+    // Drive the underlying rsync invocation through the single-retry
+    // drift-recovery wrapper. The per-attempt closure owns the full
+    // signal-handled child lifecycle (SIGINT/SIGTERM arms exit the
+    // process inline, in which case the wrapper never observes the
+    // attempt's outcome — the workspace lock is released by the
+    // signal arm's explicit best-effort release call). A
+    // `Permission denied (publickey)` failure is surfaced as
+    // `AttemptOutcome::PublickeyDrift`, the wrapper re-fetches the
+    // SSH config, overwrites the local entry, and re-spawns once.
+    let socket_for_fetch = socket_path.to_string();
+    let socket_for_attempt_closure = socket_path.to_string();
+    let session_arg_owned = session_arg.to_string();
+    let id_for_fetch = id.clone();
+    let lock_token_for_signal = lock_token.clone();
+    let host_path_for_attempt = host_path;
+    let guest_path_for_attempt = guest_path;
+    let dest_override_for_attempt = dest_override;
+
+    let exit_code = match sandbox_cli::ssh_commands::run_with_drift_recovery(
+        &home,
+        &id,
+        move || {
+            let s = socket_for_fetch.clone();
+            let i = id_for_fetch.clone();
+            async move { fetch_ssh_config_dto(&s, &i).await }
+        },
+        move |alias, _attempt_idx| {
+            let host_path_clone = host_path_for_attempt.clone();
+            let guest_path_clone = guest_path_for_attempt.clone();
+            let dest_override_clone = dest_override_for_attempt.clone();
+            let socket_for_attempt = socket_for_attempt_closure.clone();
+            let session_for_attempt = session_arg_owned.clone();
+            let lock_token_attempt = lock_token_for_signal.clone();
+            async move {
+                let plan = sandbox_cli::ssh_commands::WorkspaceRsyncPlan {
+                    alias: alias.as_str(),
+                    host_path: host_path_clone,
+                    guest_path: guest_path_clone,
+                    direction: workspace_direction_to_planner(direction),
+                    dest_override: dest_override_clone,
+                    force,
+                    dry_run,
+                    safe_links,
+                    no_gitignore,
+                };
+                // The pre-flight `validate_plan` above already
+                // caught usage errors; a failure here would be a
+                // planner regression that surfaced between attempts.
+                let argv = sandbox_cli::ssh_commands::plan_workspace_rsync_argv(&plan)
+                    .map_err(sandbox_cli::ssh_commands::DriftRecoveryError::FetchDto)?;
+                run_workspace_rsync_attempt(
+                    argv,
+                    socket_for_attempt,
+                    session_for_attempt,
+                    lock_token_attempt,
+                )
+                .await
+            }
+        },
+    )
+    .await
+    {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            drop(release_guard);
+            process::exit(1);
+        }
+    };
+    // Normal path. Dropping `release_guard` here runs the scopeguard's
+    // closure (which spins up a one-shot runtime and issues the
+    // release); equivalent to letting the function end, but explicit
+    // drop makes the ordering reviewable.
+    drop(release_guard);
+    process::exit(exit_code);
+}
+
+/// Translate the daemon-facing [`WorkspaceSyncDirection`] enum
+/// (`sandbox_core::Direction`) to the planner-local
+/// [`sandbox_cli::ssh_commands::WorkspaceDirection`]. Two enums exist
+/// because the planner stays free of `sandbox_core::Direction`'s
+/// daemon-API dependencies; the conversion is exhaustive and total.
+fn workspace_direction_to_planner(
+    direction: WorkspaceSyncDirection,
+) -> sandbox_cli::ssh_commands::WorkspaceDirection {
+    match direction {
+        WorkspaceSyncDirection::Push => sandbox_cli::ssh_commands::WorkspaceDirection::Push,
+        WorkspaceSyncDirection::Pull => sandbox_cli::ssh_commands::WorkspaceDirection::Pull,
+    }
+}
+
+/// Run a single `rsync` workspace push/pull attempt under SIGINT and
+/// SIGTERM handlers, with the workspace lock released in the signal
+/// arms before the process exits. Returns an
+/// [`sandbox_cli::ssh_commands::AttemptOutcome`] so the drift-recovery
+/// wrapper can decide whether to retry on a pubkey-drift signal.
+///
+/// `LC_ALL=C` / `LANG=C` are set on the child environment so the
+/// stderr substring sniffer (`looks_like_publickey_drift`) is locale-
+/// stable. The `SANDBOX_SOCKET` env var is propagated so the
+/// `ProxyCommand sandbox proxy <id>` directive inside the per-session
+/// SSH config reaches the same daemon socket the parent CLI is using.
+///
+/// Signal arms `process::exit` directly — that aborts the future
+/// stack mid-flight and the drift-recovery wrapper never gets to see
+/// the outcome, which is correct because the operator asked to
+/// cancel.
+async fn run_workspace_rsync_attempt(
+    argv: Vec<String>,
+    socket_path: String,
+    session_arg: String,
+    lock_token: String,
+) -> Result<
+    sandbox_cli::ssh_commands::AttemptOutcome,
+    sandbox_cli::ssh_commands::DriftRecoveryError,
+> {
+    use sandbox_cli::ssh_commands::{
+        AttemptOutcome, DriftRecoveryError, looks_like_publickey_drift,
+    };
+
+    // argv[0] is "rsync" (the program); argv[1..] is the actual flag
+    // list — mirrors the convention `plan_workspace_rsync_argv` ships.
+    let program = argv[0].clone();
+    let mut cmd = tokio::process::Command::new(&program);
+    cmd.args(&argv[1..])
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::piped())
+        // `kill_on_drop` is the belt-and-suspenders companion to the
+        // explicit `child.kill()` in the signal arm: if anything
+        // causes this future to be dropped before `child.wait()`
+        // resolves (e.g. a panic between `spawn()` and the
+        // `select!`), the rsync child is reaped instead of being
+        // left as a zombie of the parent.
+        .kill_on_drop(true);
+    for (k, v) in ssh_child_extra_env(&socket_path) {
+        cmd.env(k, v);
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return Err(DriftRecoveryError::Spawn { program, source: e });
+        }
+    };
+
+    // Tee stderr to the operator's terminal AND capture into a
+    // buffer so the wrapper can inspect for the pubkey-drift signal
+    // after the child exits.
+    let stderr = child
+        .stderr
+        .take()
+        .expect("child stderr is piped by Command builder above");
+    let tee = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let mut parent_stderr = tokio::io::stderr();
+        let mut reader = stderr;
+        loop {
+            match tokio::io::AsyncReadExt::read(&mut reader, &mut chunk).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut parent_stderr, &chunk[..n])
+                        .await;
+                    let _ = tokio::io::AsyncWriteExt::flush(&mut parent_stderr).await;
+                }
+                Err(_) => break,
+            }
+        }
+        buf
+    });
+
     // Signal plumbing. `ctrl_c()` covers SIGINT on all platforms
-    // tokio supports; the SIGTERM stream is Unix-only, so it sits
-    // behind a `cfg(unix)` arm. Both signals follow the standard
-    // shell convention of exit code `128 + signo` (130 / 143).
-    //
-    // We deliberately do NOT install handlers for arbitrary other
-    // signals — uncaught SIGKILL still strands the lock, but no
-    // user-space code can intercept SIGKILL. The `sandbox workspace
-    // unlock --force` operator escape hatch and daemon-restart auto-clear
-    // are the recovery paths for a stranded lock.
+    // tokio supports; SIGTERM is Unix-only.
     let ctrlc = tokio::signal::ctrl_c();
     tokio::pin!(ctrlc);
 
     #[cfg(unix)]
-    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-    {
-        Ok(s) => Some(s),
-        Err(e) => {
-            // Installing the SIGTERM listener can fail (e.g. on
-            // platforms where the signal-driver isn't usable in
-            // the current runtime). The release guard still
-            // covers the panic + normal-return paths; we lose
-            // only the SIGTERM-explicit exit code, not the lock
-            // release. The lock is reclaimed when the process
-            // dies anyway because daemon-side locks are
-            // in-memory and reset on daemon restart as designed.
-            tracing::warn!(error = %e, "could not install SIGTERM handler");
-            None
-        }
-    };
+    let mut sigterm =
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not install SIGTERM handler");
+                None
+            }
+        };
 
     enum Outcome {
         Exited(i32),
@@ -5195,10 +4953,6 @@ async fn run_workspace_push_or_pull(
         Terminated,
     }
 
-    // Future representing "any registered termination signal fired".
-    // On non-Unix platforms only SIGINT is hooked. Returning the same
-    // `Outcome::Interrupted` for the SIGINT arm and `Outcome::Terminated`
-    // for SIGTERM keeps the post-select logic uniform.
     let outcome = {
         #[cfg(unix)]
         {
@@ -5239,42 +4993,27 @@ async fn run_workspace_push_or_pull(
 
     match outcome {
         Outcome::Exited(code) => {
-            // Normal path. Dropping `release_guard` here runs the
-            // scopeguard's closure, which spins up a one-shot
-            // runtime and issues the release. Equivalent to letting
-            // the function end, but explicit-drop makes the ordering
-            // obvious: release fires before `process::exit`.
-            drop(release_guard);
-            process::exit(code);
+            let stderr_bytes = tee.await.unwrap_or_default();
+            if code != 0 && looks_like_publickey_drift(&stderr_bytes) {
+                Ok(AttemptOutcome::PublickeyDrift)
+            } else {
+                Ok(AttemptOutcome::Exited(code))
+            }
         }
         Outcome::Interrupted => {
             eprintln!("interrupted; killing rsync");
-            // `kill().await` reaps the child; with `kill_on_drop` set
-            // the drop would do this anyway, but the explicit await
-            // gives us the reap *before* we issue the release so the
-            // daemon-side cleanup isn't racing the (now-defunct)
-            // child holding any guest-side resources.
             let _ = child.kill().await;
-            // Release inline so we can await it; then defuse the
-            // scopeguard so the drop closure doesn't double-release
-            // and trip the daemon's wrong-token check.
-            release_workspace_lock_best_effort(socket_path, session_arg, &lock_token).await;
-            scopeguard::ScopeGuard::into_inner(release_guard);
+            release_workspace_lock_best_effort(&socket_path, &session_arg, &lock_token).await;
             process::exit(WORKSPACE_SIGINT_EXIT_CODE);
         }
         Outcome::Terminated => {
             eprintln!("terminated; killing rsync");
             let _ = child.kill().await;
-            release_workspace_lock_best_effort(socket_path, session_arg, &lock_token).await;
-            scopeguard::ScopeGuard::into_inner(release_guard);
+            release_workspace_lock_best_effort(&socket_path, &session_arg, &lock_token).await;
             #[cfg(unix)]
             {
                 process::exit(WORKSPACE_SIGTERM_EXIT_CODE);
             }
-            // `Outcome::Terminated` is never constructed on non-unix
-            // (no SIGTERM arm in the select!) but the compiler
-            // requires the match to be exhaustive; fall back to a
-            // generic "killed by signal" code if we ever get here.
             #[cfg(not(unix))]
             {
                 process::exit(1);
@@ -9665,812 +9404,15 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // plan_ssh_command — backend-specific dispatch logic.
-    //
-    // Pure helper: returns `(program, args)` based on the session's
-    // backend kind. The handler then forwards them to
-    // `std::process::Command`, but the dispatch shape itself is what
-    // these tests pin so a future refactor cannot regress the
-    // Lima-only behaviour or wire the wrong `docker exec` flags.
-    // -----------------------------------------------------------------------
-
-    fn ssh_session_id() -> sandbox_core::SessionId {
-        sandbox_core::SessionId::parse("0123456789ab").expect("test fixture session id must parse")
-    }
-
-    #[test]
-    fn plan_ssh_lima_no_command_starts_interactive_shell() {
-        let sid = ssh_session_id();
-        let (program, args) =
-            plan_ssh_command(sandbox_core::backend::BackendKind::Lima, &sid, &[], true);
-        assert_eq!(program, "limactl");
-        assert_eq!(
-            args,
-            vec!["shell".to_string(), "sandbox-0123456789ab".to_string()]
-        );
-    }
-
-    #[test]
-    fn plan_ssh_lima_with_command_uses_double_dash_separator() {
-        let sid = ssh_session_id();
-        let cmd = vec!["echo".to_string(), "hello".to_string()];
-        let (program, args) =
-            plan_ssh_command(sandbox_core::backend::BackendKind::Lima, &sid, &cmd, true);
-        assert_eq!(program, "limactl");
-        assert_eq!(
-            args,
-            vec![
-                "shell".to_string(),
-                "sandbox-0123456789ab".to_string(),
-                "--".to_string(),
-                "echo".to_string(),
-                "hello".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn plan_ssh_container_no_command_with_tty_uses_docker_exec_it() {
-        let sid = ssh_session_id();
-        let (program, args) = plan_ssh_command(
-            sandbox_core::backend::BackendKind::Container,
-            &sid,
-            &[],
-            true,
-        );
-        assert_eq!(program, "docker");
-        assert_eq!(
-            args,
-            vec![
-                "exec".to_string(),
-                "-it".to_string(),
-                "sandbox-0123456789ab".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn plan_ssh_container_with_command_and_tty_appends_command_after_target() {
-        let sid = ssh_session_id();
-        let cmd = vec!["echo".to_string(), "hello".to_string()];
-        let (program, args) = plan_ssh_command(
-            sandbox_core::backend::BackendKind::Container,
-            &sid,
-            &cmd,
-            true,
-        );
-        assert_eq!(program, "docker");
-        //  — `docker exec -it <ctr> <cmd>...`. No
-        // `--` separator: docker exec parses positional args after the
-        // container name as the command.
-        assert_eq!(
-            args,
-            vec![
-                "exec".to_string(),
-                "-it".to_string(),
-                "sandbox-0123456789ab".to_string(),
-                "echo".to_string(),
-                "hello".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn plan_ssh_container_no_command_without_tty_drops_t_flag() {
-        // When the caller's stdin is not a TTY (pytest, CI, any
-        // pipe-fed parent), `docker exec -t` aborts at startup with
-        // "cannot attach stdin to a TTY-enabled container because
-        // stdin is not a terminal". Pin that we drop `-t` and keep
-        // `-i` so stdin is still forwarded.
-        let sid = ssh_session_id();
-        let (program, args) = plan_ssh_command(
-            sandbox_core::backend::BackendKind::Container,
-            &sid,
-            &[],
-            false,
-        );
-        assert_eq!(program, "docker");
-        assert_eq!(
-            args,
-            vec![
-                "exec".to_string(),
-                "-i".to_string(),
-                "sandbox-0123456789ab".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn plan_ssh_container_with_command_without_tty_drops_t_flag() {
-        let sid = ssh_session_id();
-        let cmd = vec!["echo".to_string(), "hello".to_string()];
-        let (program, args) = plan_ssh_command(
-            sandbox_core::backend::BackendKind::Container,
-            &sid,
-            &cmd,
-            false,
-        );
-        assert_eq!(program, "docker");
-        assert_eq!(
-            args,
-            vec![
-                "exec".to_string(),
-                "-i".to_string(),
-                "sandbox-0123456789ab".to_string(),
-                "echo".to_string(),
-                "hello".to_string(),
-            ]
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // plan_cp_command — backend-specific dispatch for `sandbox cp`.
-    //
-    // Pure planner: returns `(program, args)` from a (backend, session,
-    // direction, host_path, remote_path) input. The handler then hands
-    // them to `std::process::Command` with stdio inherited; these tests
-    // pin the dispatch shape so a future refactor cannot regress the
-    // argument ordering or the `-r` / no-`-r` choice between Lima's
-    // `limactl cp` (scp under the hood) and Docker's `docker cp`
-    // (recurses by default).
-    // -----------------------------------------------------------------------
-
-    fn cp_session_id() -> sandbox_core::SessionId {
-        sandbox_core::SessionId::parse("0123456789ab").expect("test fixture session id must parse")
-    }
-
-    #[test]
-    fn plan_cp_lima_upload_directory_emits_limactl_cp_with_recurse_flag() {
-        let sid = cp_session_id();
-        let (program, args) = plan_cp_command(
-            sandbox_core::backend::BackendKind::Lima,
-            &sid,
-            TransferDirection::Upload,
-            "./local/dist",
-            "/home/agent/workspace/dist",
-            true,
-        );
-        assert_eq!(program, "limactl");
-        // `-r` is conditional on Lima — passed only when the caller
-        // has stat'd the source and confirmed it's a directory. Lima
-        // 2.x's rsync-backed `limactl cp` aborts with ENOTDIR on a
-        // file-source + `-r` combination, so the planner must not
-        // emit `-r` unconditionally.
-        assert_eq!(
-            args,
-            vec![
-                "cp".to_string(),
-                "-r".to_string(),
-                "./local/dist".to_string(),
-                "sandbox-0123456789ab:/home/agent/workspace/dist".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn plan_cp_lima_omits_r_for_file_source() {
-        // Regression guard for the bug where `limactl cp -r <file>
-        // <remote>` aborts under Lima 2.x's internal rsync with
-        // `change_dir … failed: Not a directory (20)`. With
-        // `source_is_dir: false` the planner must emit a `cp`
-        // invocation that omits `-r` entirely.
-        let sid = cp_session_id();
-        let (program, args) = plan_cp_command(
-            sandbox_core::backend::BackendKind::Lima,
-            &sid,
-            TransferDirection::Upload,
-            "/tmp/sandbox-cp-test.txt",
-            "/home/agent/workspace/file.txt",
-            false,
-        );
-        assert_eq!(program, "limactl");
-        assert!(
-            !args.iter().any(|a| a == "-r"),
-            "lima cp on a file source must not emit `-r`; got args: {args:?}"
-        );
-        assert_eq!(
-            args,
-            vec![
-                "cp".to_string(),
-                "/tmp/sandbox-cp-test.txt".to_string(),
-                "sandbox-0123456789ab:/home/agent/workspace/file.txt".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn plan_cp_lima_keeps_r_for_directory_source() {
-        // Symmetric companion to the file-source omits-`-r` test: when
-        // the caller has confirmed the source is a directory, the
-        // planner must emit `-r` so `limactl cp` recurses correctly.
-        let sid = cp_session_id();
-        let (_, args) = plan_cp_command(
-            sandbox_core::backend::BackendKind::Lima,
-            &sid,
-            TransferDirection::Upload,
-            "/tmp/sandbox-cp-dir",
-            "/home/agent/workspace/dir",
-            true,
-        );
-        assert!(
-            args.iter().any(|a| a == "-r"),
-            "lima cp on a directory source must emit `-r`; got args: {args:?}"
-        );
-    }
-
-    #[test]
-    fn plan_cp_lima_download_swaps_src_and_dst_args() {
-        let sid = cp_session_id();
-        // Downloads always pass `source_is_dir: false` from the call
-        // site (the host cannot easily remote-stat the VM-side
-        // source), so the planner must omit `-r` on this branch.
-        let (program, args) = plan_cp_command(
-            sandbox_core::backend::BackendKind::Lima,
-            &sid,
-            TransferDirection::Download,
-            "./local/output.log",
-            "/home/agent/workspace/output.log",
-            false,
-        );
-        assert_eq!(program, "limactl");
-        assert_eq!(
-            args,
-            vec![
-                "cp".to_string(),
-                "sandbox-0123456789ab:/home/agent/workspace/output.log".to_string(),
-                "./local/output.log".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn plan_cp_container_upload_emits_docker_cp_without_recurse_flag() {
-        let sid = cp_session_id();
-        let (program, args) = plan_cp_command(
-            sandbox_core::backend::BackendKind::Container,
-            &sid,
-            TransferDirection::Upload,
-            "./local/file.txt",
-            "/home/agent/workspace/file.txt",
-            false,
-        );
-        assert_eq!(program, "docker");
-        // No `-r`: `docker cp` recurses into directories by default
-        // and rejects unknown flags. `source_is_dir` is unused on the
-        // container branch — pin that pinning the file shape stays
-        // backend-symmetric.
-        assert_eq!(
-            args,
-            vec![
-                "cp".to_string(),
-                "./local/file.txt".to_string(),
-                "sandbox-0123456789ab:/home/agent/workspace/file.txt".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn plan_cp_container_download_swaps_src_and_dst_args() {
-        let sid = cp_session_id();
-        let (program, args) = plan_cp_command(
-            sandbox_core::backend::BackendKind::Container,
-            &sid,
-            TransferDirection::Download,
-            "./local/output.log",
-            "/home/agent/workspace/output.log",
-            false,
-        );
-        assert_eq!(program, "docker");
-        assert_eq!(
-            args,
-            vec![
-                "cp".to_string(),
-                "sandbox-0123456789ab:/home/agent/workspace/output.log".to_string(),
-                "./local/output.log".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn plan_cp_directory_upload_uses_same_shape_as_file_upload() {
-        // Pin that directory copy goes through the same planner: the
-        // user-facing CLI surface is identical for files and
-        // directories — the backend tools handle the recursion under
-        // the hood. This is a meaningful behavior improvement over the
-        // previous in-tree path, which read the local file via
-        // `std::fs::read` and would fail on a directory.
-        let sid = cp_session_id();
-        let (lima_program, lima_args) = plan_cp_command(
-            sandbox_core::backend::BackendKind::Lima,
-            &sid,
-            TransferDirection::Upload,
-            "./dist",
-            "/home/agent/workspace/dist",
-            true,
-        );
-        assert_eq!(lima_program, "limactl");
-        assert_eq!(
-            lima_args,
-            vec![
-                "cp".to_string(),
-                "-r".to_string(),
-                "./dist".to_string(),
-                "sandbox-0123456789ab:/home/agent/workspace/dist".to_string(),
-            ]
-        );
-
-        let (docker_program, docker_args) = plan_cp_command(
-            sandbox_core::backend::BackendKind::Container,
-            &sid,
-            TransferDirection::Upload,
-            "./dist",
-            "/home/agent/workspace/dist",
-            true,
-        );
-        assert_eq!(docker_program, "docker");
-        assert_eq!(
-            docker_args,
-            vec![
-                "cp".to_string(),
-                "./dist".to_string(),
-                "sandbox-0123456789ab:/home/agent/workspace/dist".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn plan_cp_target_name_matches_runtime_handle_convention() {
-        // Both backends name their runtime resource `sandbox-<id>`
-        // (see `sandbox-core::backend::RuntimeHandle::from_session_id`
-        // and `sandbox-core::lima::vm_name`). Pin that the planner
-        // builds the same name on both branches so a future rename
-        // would fail at this test rather than silently breaking
-        // dispatch on one of the two backends.
-        let sid = cp_session_id();
-        for backend in [
-            sandbox_core::backend::BackendKind::Lima,
-            sandbox_core::backend::BackendKind::Container,
-        ] {
-            let (_, args) = plan_cp_command(
-                backend,
-                &sid,
-                TransferDirection::Upload,
-                "/tmp/x",
-                "/tmp/x",
-                true,
-            );
-            // Find the argument that contains the colon — that's the
-            // remote-side spec.
-            let remote_arg = args
-                .iter()
-                .find(|a| a.contains(':'))
-                .expect("planner must emit a remote-side <name>:<path> arg");
-            assert!(
-                remote_arg.starts_with("sandbox-0123456789ab:"),
-                "backend {backend:?} produced unexpected remote arg: {remote_arg}"
-            );
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // plan_sync_command — backend-specific dispatch for `sandbox sync`.
-    //
-    // Sibling of the cp planner. Pins the rsync invocation shape so a
-    // future refactor cannot accidentally rearrange the `-a --delete -e
-    // <rsh>` ordering or break the per-backend `<rsh>` choice (Lima
-    // `limactl shell`, container `docker exec -i`).
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn plan_sync_lima_upload_emits_rsync_with_limactl_shell_remote_shell() {
-        let sid = cp_session_id();
-        // Pass `source_is_dir: false` here so the planner does not
-        // auto-append a trailing slash to "./local/dir"; this test
-        // pins the `-a --delete -e <rsh>` baseline shape, separate
-        // from the trailing-slash auto-append behaviour which has its
-        // own dedicated tests below.
-        let (program, args) = plan_sync_command(
-            sandbox_core::backend::BackendKind::Lima,
-            &sid,
-            TransferDirection::Upload,
-            "./local/dir",
-            "/home/agent/workspace/dir",
-            &[],
-            false,
-        );
-        assert_eq!(program, "rsync");
-        // `-a --delete` is the baseline. `-e 'limactl shell'` slots
-        // `limactl shell <vm> rsync --server …` in as rsync's remote
-        // shell — `<vm>` is taken from the host portion of the
-        // `sandbox-<id>:<path>` argument by rsync's own parser.
-        assert_eq!(
-            args,
-            vec![
-                "-a".to_string(),
-                "--delete".to_string(),
-                "-e".to_string(),
-                "limactl shell".to_string(),
-                "./local/dir".to_string(),
-                "sandbox-0123456789ab:/home/agent/workspace/dir".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn plan_sync_lima_download_swaps_src_and_dst_args() {
-        let sid = cp_session_id();
-        // Downloads always pass `source_is_dir: false` from the call
-        // site — the host has no easy way to remote-stat the VM-side
-        // source. The planner must not mutate either path on this
-        // branch.
-        let (program, args) = plan_sync_command(
-            sandbox_core::backend::BackendKind::Lima,
-            &sid,
-            TransferDirection::Download,
-            "./local/dir",
-            "/home/agent/workspace/dir",
-            &[],
-            false,
-        );
-        assert_eq!(program, "rsync");
-        assert_eq!(
-            args,
-            vec![
-                "-a".to_string(),
-                "--delete".to_string(),
-                "-e".to_string(),
-                "limactl shell".to_string(),
-                "sandbox-0123456789ab:/home/agent/workspace/dir".to_string(),
-                "./local/dir".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn plan_sync_container_upload_emits_rsync_with_docker_exec_i_remote_shell() {
-        let sid = cp_session_id();
-        let (program, args) = plan_sync_command(
-            sandbox_core::backend::BackendKind::Container,
-            &sid,
-            TransferDirection::Upload,
-            "./local/dir",
-            "/home/agent/workspace/dir",
-            &[],
-            false,
-        );
-        assert_eq!(program, "rsync");
-        // `docker exec -i` (no `-t`): `-i` keeps stdin a binary-clean
-        // pipe so rsync can speak its wire protocol; allocating a TTY
-        // (`-t`) would line-buffer and corrupt it.
-        assert_eq!(
-            args,
-            vec![
-                "-a".to_string(),
-                "--delete".to_string(),
-                "-e".to_string(),
-                "docker exec -i".to_string(),
-                "./local/dir".to_string(),
-                "sandbox-0123456789ab:/home/agent/workspace/dir".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn plan_sync_container_download_swaps_src_and_dst_args() {
-        let sid = cp_session_id();
-        let (program, args) = plan_sync_command(
-            sandbox_core::backend::BackendKind::Container,
-            &sid,
-            TransferDirection::Download,
-            "./local/dir",
-            "/home/agent/workspace/dir",
-            &[],
-            false,
-        );
-        assert_eq!(program, "rsync");
-        assert_eq!(
-            args,
-            vec![
-                "-a".to_string(),
-                "--delete".to_string(),
-                "-e".to_string(),
-                "docker exec -i".to_string(),
-                "sandbox-0123456789ab:/home/agent/workspace/dir".to_string(),
-                "./local/dir".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn plan_sync_target_name_matches_runtime_handle_convention() {
-        // Both backends name their runtime resource `sandbox-<id>` —
-        // identical convention to plan_cp_command. Pin this so a
-        // future rename cannot silently break only one backend.
-        let sid = cp_session_id();
-        for backend in [
-            sandbox_core::backend::BackendKind::Lima,
-            sandbox_core::backend::BackendKind::Container,
-        ] {
-            let (_, args) = plan_sync_command(
-                backend,
-                &sid,
-                TransferDirection::Upload,
-                "/tmp/x",
-                "/tmp/x",
-                &[],
-                false,
-            );
-            let remote_arg = args
-                .iter()
-                .find(|a| a.contains(':') && !a.starts_with('-'))
-                .expect("planner must emit a remote-side <name>:<path> arg");
-            assert!(
-                remote_arg.starts_with("sandbox-0123456789ab:"),
-                "backend {backend:?} produced unexpected remote arg: {remote_arg}"
-            );
-        }
-    }
-
-    #[test]
-    fn plan_sync_baseline_flags_are_archive_and_delete() {
-        // Pin the baseline flag set explicitly: `-a` for attribute
-        // preservation + recursion, `--delete` for mirror semantics
-        // (the property that distinguishes `sync` from `cp` in the
-        // operator's mental model). A future change that drops
-        // either flag should fail this test rather than silently
-        // weaken the guarantee.
-        let sid = cp_session_id();
-        for backend in [
-            sandbox_core::backend::BackendKind::Lima,
-            sandbox_core::backend::BackendKind::Container,
-        ] {
-            let (_, args) = plan_sync_command(
-                backend,
-                &sid,
-                TransferDirection::Upload,
-                "/tmp/src",
-                "/tmp/dst",
-                &[],
-                false,
-            );
-            assert!(
-                args.iter().any(|a| a == "-a"),
-                "backend {backend:?} args missing `-a`: {args:?}"
-            );
-            assert!(
-                args.iter().any(|a| a == "--delete"),
-                "backend {backend:?} args missing `--delete`: {args:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn plan_sync_pass_through_args_splice_between_baseline_and_operands() {
-        // Operators can pass extra rsync flags after `--`; the planner
-        // must splice them between the baseline `-a --delete -e <rsh>`
-        // and the source/destination operands. rsync's synopsis is
-        // `rsync [OPTION...] SRC... [DEST]`, so flags placed after the
-        // operands would be treated as additional sources by rsync's
-        // argv parser. Pin the splice ordering so a refactor cannot
-        // accidentally append the extras after the operands.
-        let sid = cp_session_id();
-        let (program, args) = plan_sync_command(
-            sandbox_core::backend::BackendKind::Lima,
-            &sid,
-            TransferDirection::Upload,
-            "src/",
-            "dst/",
-            &["--exclude".to_string(), "*.log".to_string()],
-            true,
-        );
-        assert_eq!(program, "rsync");
-        assert_eq!(
-            args,
-            vec![
-                "-a".to_string(),
-                "--delete".to_string(),
-                "-e".to_string(),
-                "limactl shell".to_string(),
-                "--exclude".to_string(),
-                "*.log".to_string(),
-                "src/".to_string(),
-                "sandbox-0123456789ab:dst/".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn plan_sync_pass_through_args_apply_on_container_backend_too() {
-        // The splice rule is backend-agnostic: pass-through flags land
-        // in the same slot regardless of which native shell drives
-        // rsync's `-e` transport. Asserting both backends ensures a
-        // future divergence (e.g. someone special-casing one backend's
-        // arg layout) trips this test instead of silently shipping.
-        let sid = cp_session_id();
-        let (program, args) = plan_sync_command(
-            sandbox_core::backend::BackendKind::Container,
-            &sid,
-            TransferDirection::Download,
-            "out/",
-            "/home/agent/build/",
-            &[
-                "--bwlimit=1m".to_string(),
-                "--info=progress2".to_string(),
-                "--partial".to_string(),
-            ],
-            false,
-        );
-        assert_eq!(program, "rsync");
-        assert_eq!(
-            args,
-            vec![
-                "-a".to_string(),
-                "--delete".to_string(),
-                "-e".to_string(),
-                "docker exec -i".to_string(),
-                "--bwlimit=1m".to_string(),
-                "--info=progress2".to_string(),
-                "--partial".to_string(),
-                "sandbox-0123456789ab:/home/agent/build/".to_string(),
-                "out/".to_string(),
-            ]
-        );
-    }
-
-    #[test]
-    fn plan_sync_empty_pass_through_args_match_pre_passthrough_shape() {
-        // Empty extra-args must produce the historical no-passthrough
-        // argv exactly. Guards against a refactor that introduces a
-        // sentinel placeholder or a stray empty string.
-        let sid = cp_session_id();
-        let (_, with_extras) = plan_sync_command(
-            sandbox_core::backend::BackendKind::Lima,
-            &sid,
-            TransferDirection::Upload,
-            "src/",
-            "dst/",
-            &[],
-            true,
-        );
-        // Original baseline, written out for clarity:
-        let baseline = vec![
-            "-a".to_string(),
-            "--delete".to_string(),
-            "-e".to_string(),
-            "limactl shell".to_string(),
-            "src/".to_string(),
-            "sandbox-0123456789ab:dst/".to_string(),
-        ];
-        assert_eq!(with_extras, baseline);
-    }
-
-    // -----------------------------------------------------------------------
-    // plan_sync_command — trailing-slash auto-append on directory uploads.
-    //
-    // rsync's "copy contents into dest" idiom requires a trailing
-    // slash on the source path. The planner takes a `source_is_dir`
-    // hint from the call site (which has stat'd the host path) and
-    // auto-appends `/` so users can write the natural form
-    // `sandbox sync ./src remote:./dst` and get contents-mirroring,
-    // matching what e2e tests and most operators expect. The asymmetry
-    // — only on Upload, never on Download — is pinned here so a future
-    // refactor cannot accidentally remote-stat (a daemon round-trip
-    // we deliberately avoid).
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn plan_sync_command_appends_trailing_slash_when_source_is_directory_without_one() {
-        let sid = cp_session_id();
-        let (_, args) = plan_sync_command(
-            sandbox_core::backend::BackendKind::Lima,
-            &sid,
-            TransferDirection::Upload,
-            "/tmp/foo",
-            "/home/agent/dst",
-            &[],
-            true,
-        );
-        // The host-side source operand is the only argument that's
-        // neither a flag, the `-e` rsh string, nor the remote-side
-        // arg. Find it positionally — rsync's argv shape is
-        // `[OPTION...] SRC DEST`, so the second-to-last position is
-        // the source.
-        let src_arg = &args[args.len() - 2];
-        assert_eq!(
-            src_arg, "/tmp/foo/",
-            "directory upload without trailing slash must auto-trail to mirror contents; got: {args:?}"
-        );
-    }
-
-    #[test]
-    fn plan_sync_command_keeps_existing_trailing_slash_idempotent() {
-        // If the operator already wrote the trailing slash, the
-        // planner must not double it — `/tmp/foo//` would still work
-        // for rsync but is sloppy and would surface as a confusing
-        // path in error messages.
-        let sid = cp_session_id();
-        let (_, args) = plan_sync_command(
-            sandbox_core::backend::BackendKind::Lima,
-            &sid,
-            TransferDirection::Upload,
-            "/tmp/foo/",
-            "/home/agent/dst",
-            &[],
-            true,
-        );
-        let src_arg = &args[args.len() - 2];
-        assert_eq!(
-            src_arg, "/tmp/foo/",
-            "trailing slash auto-append must be idempotent; got: {args:?}"
-        );
-    }
-
-    #[test]
-    fn plan_sync_command_does_not_trail_slash_when_source_is_file() {
-        // File-source uploads must not get a trailing slash —
-        // `/tmp/file.txt/` would make rsync interpret the source as a
-        // (non-existent) directory and abort.
-        let sid = cp_session_id();
-        let (_, args) = plan_sync_command(
-            sandbox_core::backend::BackendKind::Lima,
-            &sid,
-            TransferDirection::Upload,
-            "/tmp/file.txt",
-            "/home/agent/file.txt",
-            &[],
-            false,
-        );
-        let src_arg = &args[args.len() - 2];
-        assert_eq!(
-            src_arg, "/tmp/file.txt",
-            "file-source upload must not gain a trailing slash; got: {args:?}"
-        );
-    }
-
-    #[test]
-    fn plan_sync_command_does_not_trail_slash_on_download() {
-        // Downloads always pass `source_is_dir: false` from the call
-        // site (the host cannot easily remote-stat the VM-side
-        // source). Pin that the planner makes no path mutation on
-        // the Download branch even if a future caller passed
-        // `source_is_dir: true` by mistake — the trailing-slash
-        // semantics only apply on Upload, where the host path *is*
-        // the source.
-        let sid = cp_session_id();
-        let (_, args) = plan_sync_command(
-            sandbox_core::backend::BackendKind::Lima,
-            &sid,
-            TransferDirection::Download,
-            "/tmp/local-out",
-            "/home/agent/remote-src",
-            &[],
-            false,
-        );
-        // On Download the host arg is the destination — last
-        // position. Pin that it stays unchanged.
-        let dst_arg = &args[args.len() - 1];
-        assert_eq!(
-            dst_arg, "/tmp/local-out",
-            "download must not mutate the host-side path; got: {args:?}"
-        );
-
-        // Belt-and-braces: even with `source_is_dir: true`, the
-        // planner must not mutate paths on Download.
-        let (_, args_with_true) = plan_sync_command(
-            sandbox_core::backend::BackendKind::Lima,
-            &sid,
-            TransferDirection::Download,
-            "/tmp/local-out",
-            "/home/agent/remote-src",
-            &[],
-            true,
-        );
-        let dst_arg_true = &args_with_true[args_with_true.len() - 1];
-        assert_eq!(
-            dst_arg_true, "/tmp/local-out",
-            "download must never trail-slash the host path regardless of source_is_dir; got: {args_with_true:?}"
-        );
-    }
+    // The pre-M18-S6 `plan_ssh_command` / `plan_cp_command` /
+    // `plan_sync_command` planners were backend-dispatching helpers
+    // that emitted `limactl shell …` / `docker exec …` argvs. They
+    // are replaced by the bare-`ssh`/`scp`/`rsync` planners in
+    // `sandbox_cli::ssh_commands` (which take the daemon-issued
+    // `sandbox-<id>` alias and require no backend dispatch — the
+    // daemon-mediated proxy collapses both backends behind the alias).
+    // The hermetic argv-shape tests now live next to the new
+    // planners; see `sandbox_cli::ssh_commands::tests`.
 
     // -- render_rootless_block -------------------------------------------------
 
@@ -10967,224 +9909,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // plan_workspace_sync_argv — operator-driven `sandbox workspace
-    // push|pull` argv shape.
-    //
-    // Sibling of `plan_sync_command` and `workspace_rsync::build_argv`.
-    // Pins the rsync wire shape: `-aL` ↔ `-a --safe-links` toggle, the
-    // `--filter=:- .gitignore` drop, `--dry-run` placement, src/dst
-    // swap on push vs pull, and `--dest` override on pull. The
-    // assertions compare against the *full* argv (program + flags) so
-    // a reorder or accidental token drop fails loudly.
-    // -----------------------------------------------------------------------
-
-    /// Helper: build a baseline plan with the given (direction, force,
-    /// dry_run) tuple. Other fields take required defaults so the
-    /// per-test override block stays small.
-    fn baseline_workspace_plan(
-        direction: WorkspaceSyncDirection,
-        backend: sandbox_core::BackendKind,
-        force: bool,
-        dry_run: bool,
-    ) -> WorkspaceSyncPlan {
-        WorkspaceSyncPlan {
-            direction,
-            backend,
-            session_id: "abc123".to_string(),
-            host_path: "/host/path".to_string(),
-            guest_path: "/guest/path".to_string(),
-            dest_override: None,
-            force,
-            dry_run,
-            safe_links: false,
-            no_gitignore: false,
-        }
-    }
-
-    /// Push, Lima backend, force-mode, no extras: argv pins the
-    /// canonical baseline shape. Argv layout: `rsync -aL --delete
-    /// --filter=':- .gitignore' -e <shell> <src> <dst>`.
-    #[test]
-    fn plan_push_force_lima() {
-        let plan = baseline_workspace_plan(
-            WorkspaceSyncDirection::Push,
-            sandbox_core::BackendKind::Lima,
-            true,  // force
-            false, // dry_run
-        );
-        let argv = plan_workspace_sync_argv(&plan).expect("baseline must plan");
-        assert_eq!(
-            argv,
-            vec![
-                "rsync".to_string(),
-                "-aL".to_string(),
-                "--delete".to_string(),
-                "--filter=:- .gitignore".to_string(),
-                "-e".to_string(),
-                "limactl shell".to_string(),
-                "/host/path/".to_string(),
-                "sandbox-abc123:/guest/path/".to_string(),
-            ]
-        );
-    }
-
-    /// Push, container backend, dry-run mode: the `-e` transport is
-    /// `"docker exec -i"` (no `-t`, per the rsync binary-protocol
-    /// requirement that stdin remain a clean pipe), and `--dry-run`
-    /// is appended after `-e <shell>` and before the src/dst pair.
-    #[test]
-    fn plan_push_dry_run_container() {
-        let plan = baseline_workspace_plan(
-            WorkspaceSyncDirection::Push,
-            sandbox_core::BackendKind::Container,
-            false, // force
-            true,  // dry_run
-        );
-        let argv = plan_workspace_sync_argv(&plan).expect("dry-run must plan");
-        assert!(
-            argv.iter().any(|a| a == "--dry-run"),
-            "--dry-run absent: {argv:?}"
-        );
-        // Sanity-check the `-e` transport pair sits in the right place.
-        let e_idx = argv.iter().position(|a| a == "-e").expect("-e present");
-        assert_eq!(
-            argv.get(e_idx + 1).map(String::as_str),
-            Some("docker exec -i"),
-            "-e shell transport must be 'docker exec -i' on container backend: {argv:?}"
-        );
-    }
-
-    /// `safe_links == true` replaces the combined `-aL` token with the
-    /// split `-a --safe-links` pair. rsync's `--safe-links` does not
-    /// compose with `-L`, so the planner must drop `-L` entirely
-    /// when the operator opts into safe-link semantics.
-    #[test]
-    fn plan_push_safe_links() {
-        let mut plan = baseline_workspace_plan(
-            WorkspaceSyncDirection::Push,
-            sandbox_core::BackendKind::Lima,
-            true,
-            false,
-        );
-        plan.safe_links = true;
-        let argv = plan_workspace_sync_argv(&plan).expect("safe-links must plan");
-        // `-aL` must be absent; `-a` + `--safe-links` must be present
-        // in order, immediately after `rsync`.
-        assert!(
-            !argv.iter().any(|a| a == "-aL"),
-            "-aL must be replaced when safe_links=true: {argv:?}"
-        );
-        assert_eq!(argv.get(1).map(String::as_str), Some("-a"));
-        assert_eq!(argv.get(2).map(String::as_str), Some("--safe-links"));
-    }
-
-    /// `no_gitignore == true` drops the `--filter=:- .gitignore` token
-    /// from the argv entirely. The rest of the shape is unchanged.
-    #[test]
-    fn plan_push_no_gitignore() {
-        let mut plan = baseline_workspace_plan(
-            WorkspaceSyncDirection::Push,
-            sandbox_core::BackendKind::Lima,
-            true,
-            false,
-        );
-        plan.no_gitignore = true;
-        let argv = plan_workspace_sync_argv(&plan).expect("no-gitignore must plan");
-        assert!(
-            argv.iter().all(|a| !a.starts_with("--filter")),
-            "--filter must be absent when no_gitignore=true: {argv:?}"
-        );
-    }
-
-    /// Pull, Lima backend, force-mode: src/dst swap. The remote
-    /// `sandbox-<id>:<guest>/` token now sits in the src position;
-    /// `<host>/` sits in the dst position.
-    #[test]
-    fn plan_pull_force_lima() {
-        let plan = baseline_workspace_plan(
-            WorkspaceSyncDirection::Pull,
-            sandbox_core::BackendKind::Lima,
-            true,
-            false,
-        );
-        let argv = plan_workspace_sync_argv(&plan).expect("pull must plan");
-        assert_eq!(
-            argv,
-            vec![
-                "rsync".to_string(),
-                "-aL".to_string(),
-                "--delete".to_string(),
-                "--filter=:- .gitignore".to_string(),
-                "-e".to_string(),
-                "limactl shell".to_string(),
-                "sandbox-abc123:/guest/path/".to_string(),
-                "/host/path/".to_string(),
-            ]
-        );
-    }
-
-    /// `--dest <path>` (pull only) replaces the host path in the dst
-    /// position. The trailing-slash rule applies to the override
-    /// uniformly with the default host_path.
-    #[test]
-    fn plan_pull_dest_override() {
-        let mut plan = baseline_workspace_plan(
-            WorkspaceSyncDirection::Pull,
-            sandbox_core::BackendKind::Lima,
-            true,
-            false,
-        );
-        plan.dest_override = Some("/custom/dst".to_string());
-        let argv = plan_workspace_sync_argv(&plan).expect("dest override must plan");
-        // dst is the last argv token. /host/path/ must NOT appear in
-        // dst; /custom/dst/ must appear instead.
-        assert_eq!(argv.last().map(String::as_str), Some("/custom/dst/"));
-        // src is the second-to-last token and remains the
-        // sandbox-<id>:<guest>/ remote spec.
-        assert_eq!(
-            argv.iter().rev().nth(1).map(String::as_str),
-            Some("sandbox-abc123:/guest/path/")
-        );
-    }
-
-    /// Neither `-f` nor `-n` set → usage error. The planner enforces
-    /// this even though clap's `conflicts_with` already catches the
-    /// both-set case; the neither-set case is the one clap cannot
-    /// express directly with `conflicts_with` and falls through to
-    /// the planner for adjudication.
-    #[test]
-    fn plan_rejects_neither_force_nor_dry_run() {
-        let plan = baseline_workspace_plan(
-            WorkspaceSyncDirection::Push,
-            sandbox_core::BackendKind::Lima,
-            false, // force
-            false, // dry_run
-        );
-        let err = plan_workspace_sync_argv(&plan).expect_err("must reject neither-set");
-        assert!(
-            err.contains("required"),
-            "neither-set error must mention `required`: {err:?}"
-        );
-    }
-
-    /// Both `-f` and `-n` set → usage error. clap's `conflicts_with`
-    /// normally catches this before the planner runs, but the planner
-    /// re-checks for non-clap callers (unit tests, hand-rolled
-    /// invocations).
-    #[test]
-    fn plan_rejects_both_force_and_dry_run() {
-        let plan = baseline_workspace_plan(
-            WorkspaceSyncDirection::Push,
-            sandbox_core::BackendKind::Lima,
-            true, // force
-            true, // dry_run
-        );
-        let err = plan_workspace_sync_argv(&plan).expect_err("must reject both-set");
-        assert!(
-            err.contains("mutually exclusive"),
-            "both-set error must mention `mutually exclusive`: {err:?}"
-        );
-    }
+    // The workspace-rsync planner now lives in
+    // `sandbox_cli::ssh_commands::plan_workspace_rsync_argv` and is
+    // covered by hermetic tests there (SSH-alias shape, dry-run
+    // placement, src/dst swap on pull, --dest override, safe-links,
+    // no-gitignore, usage-error variants). The pre-M18-S6
+    // `plan_workspace_sync_argv` (with `limactl shell`/`docker exec
+    // -i` per-backend transports) is gone — the daemon-mediated
+    // proxy collapses every transport to bare `ssh sandbox-<id>:`.
 
     // -----------------------------------------------------------------------
     // expand_dest_tilde — CLI-side `~` resolution for `--dest`.

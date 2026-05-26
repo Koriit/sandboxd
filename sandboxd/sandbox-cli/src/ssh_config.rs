@@ -93,6 +93,17 @@ use tempfile::NamedTempFile;
 /// Sub-directory under `~/.ssh/` we own end-to-end.
 pub const SANDBOX_DIR_NAME: &str = "sandbox";
 
+/// Per-session ControlMaster socket directory inside
+/// `~/.ssh/sandbox/`. The daemon-emitted SSH config block carries
+/// `ControlPath ~/.ssh/sandbox/sockets/%C` — OpenSSH creates the
+/// per-multiplex socket *file* under that path but does **not**
+/// auto-create the parent directory; if `sockets/` is absent the
+/// first `ssh sandbox-<id>` call dies with
+/// `unix_listener: cannot bind to path …/sockets/<hash>: …`. We
+/// pre-create the directory the first time we touch a session entry
+/// so the operator never sees that error.
+pub const SOCKETS_DIR_NAME: &str = "sockets";
+
 /// Lock file inside `~/.ssh/sandbox/` — flocked exclusive for every
 /// mutation in this module.
 pub const LOCK_FILE_NAME: &str = ".lock";
@@ -193,6 +204,13 @@ pub fn lock_path(home: &Path) -> PathBuf {
     sandbox_dir(home).join(LOCK_FILE_NAME)
 }
 
+/// `~/.ssh/sandbox/sockets/` — the ControlMaster socket directory the
+/// daemon-emitted SSH config block (`ControlPath
+/// ~/.ssh/sandbox/sockets/%C`) writes its multiplex sockets into.
+pub fn sockets_dir(home: &Path) -> PathBuf {
+    sandbox_dir(home).join(SOCKETS_DIR_NAME)
+}
+
 /// Per-session OpenSSH-config file: `~/.ssh/sandbox/sandbox-<id>`.
 pub fn session_config_path(home: &Path, id: &str) -> PathBuf {
     sandbox_dir(home).join(format!("sandbox-{id}"))
@@ -256,6 +274,20 @@ fn ensure_ssh_dir(home: &Path) -> Result<PathBuf, SshConfigError> {
 fn ensure_sandbox_dir(home: &Path) -> Result<PathBuf, SshConfigError> {
     ensure_ssh_dir(home)?;
     let dir = sandbox_dir(home);
+    create_dir_if_missing(&dir, MODE_DIR_PRIVATE)?;
+    Ok(dir)
+}
+
+/// Ensure `~/.ssh/sandbox/sockets/` exists with mode 0700. The
+/// daemon-emitted SSH config block carries
+/// `ControlPath ~/.ssh/sandbox/sockets/%C`; OpenSSH creates the per-
+/// multiplex socket file under that path but does not auto-create the
+/// parent directory. Pre-creating it sidesteps the
+/// `unix_listener: cannot bind` error operators would otherwise see on
+/// the first `ssh sandbox-<id>` call for a fresh `$HOME`.
+fn ensure_sockets_dir(home: &Path) -> Result<PathBuf, SshConfigError> {
+    ensure_sandbox_dir(home)?;
+    let dir = sockets_dir(home);
     create_dir_if_missing(&dir, MODE_DIR_PRIVATE)?;
     Ok(dir)
 }
@@ -529,6 +561,12 @@ pub fn ensure_session_entry(
 
     let _guard = LockGuard::acquire_exclusive(home)?;
     let sandbox_dir = ensure_sandbox_dir(home)?;
+    // The `ControlPath …/sockets/%C` directive in the daemon-emitted
+    // config requires the sockets directory to exist before `ssh`
+    // tries to bind a multiplex socket there. Pre-create now so the
+    // first `ssh sandbox-<id>` invocation does not die with
+    // `unix_listener: cannot bind to path …`.
+    ensure_sockets_dir(home)?;
 
     let key_path = session_key_path(home, id);
     let config_path = session_config_path(home, id);
@@ -835,6 +873,28 @@ mod tests {
     // -----------------------------------------------------------------------
     // ensure_session_entry — writes config + key + Include block
     // -----------------------------------------------------------------------
+
+    /// `ensure_session_entry` must pre-create `~/.ssh/sandbox/sockets/`
+    /// so the `ControlPath …/sockets/%C` directive in the daemon-
+    /// emitted config block does not die on the first `ssh` call with
+    /// `unix_listener: cannot bind to path …` (OpenSSH does not
+    /// auto-create the parent directory of `ControlPath`).
+    #[test]
+    fn ensure_session_entry_creates_sockets_dir() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let id = "0123456789ab";
+
+        ensure_session_entry(home, id, &fake_dto(id)).expect("write entry");
+
+        let sockets = sockets_dir(home);
+        assert!(sockets.is_dir(), "sockets/ must exist as a directory");
+        assert_eq!(
+            mode_bits(&sockets),
+            MODE_DIR_PRIVATE,
+            "sockets/ must be mode 0700"
+        );
+    }
 
     #[test]
     fn ensure_session_entry_writes_config_and_key_with_correct_modes() {

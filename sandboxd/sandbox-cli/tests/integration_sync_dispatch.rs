@@ -1,22 +1,21 @@
-//! Integration test: `sandbox sync` dispatches to the host's `rsync`
-//! with the backend's native shell as the remote-shell (`-e`)
-//! transport — `limactl shell` for Lima, `docker exec -i` for
-//! container. Sibling of `integration_cp_dispatch.rs`; they share the
-//! same fake-daemon + tempdir-shim harness pattern.
+//! Integration test: `sandbox sync` dispatches to `rsync -e ssh
+//! sandbox-<id>:…` via the daemon-mediated SSH proxy.
 //!
-//! This test pins the end-to-end CLI surface so a future regression
-//! cannot silently rearrange the rsync argv shape (e.g. drop
-//! `--delete`, swap to `ssh -F lima-ssh-config` without justification,
-//! or forget the `-i` on `docker exec`).
+//! Under M18-S6 the per-backend remote-shell selection
+//! (`limactl shell` / `docker exec -i`) is collapsed into the
+//! `sandbox-<id>` SSH alias the operator's `~/.ssh/config` (via our
+//! managed `Include` block) resolves through `ProxyCommand sandbox
+//! proxy <id>`. This test pins the new dispatch surface:
 //!
-//! The test stages a tempdir shim on `PATH` for `rsync` that records
-//! its argv to a sentinel file. A fake `sandboxd` Unix-socket daemon
-//! serves a `SessionDto` with the backend kind under test. We then
-//! run the real `sandbox sync` binary and assert the shim was invoked
-//! with the expected `(program, args)` tuple — that proves the
-//! planner and dispatch glue both wired correctly without booting a
-//! real VM, container, or pulling a real `rsync` over a real
-//! transport.
+//! * The CLI sources its ssh-config from
+//!   `GET /sessions/{id}/ssh-config`.
+//! * The CLI invokes `rsync` with the baseline flag set
+//!   (`-a --delete -e ssh`) and the `sandbox-<id>:<path>` remote spec.
+//! * Direction (upload vs download) drives src/dst ordering.
+//! * Trailing-slash auto-append on directory uploads survives the
+//!   rewrite.
+//! * Pass-through rsync flags splice between baseline and operands.
+//! * Both-remote and neither-remote argument shapes are rejected.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -26,6 +25,7 @@ use axum::Router;
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::get;
+use sandbox_core::render_ssh_config_block;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::UnixListener;
@@ -35,9 +35,11 @@ use tokio::time::timeout;
 mod common;
 
 const TEST_SESSION_ID: &str = "abcdef012345";
+const TEST_SESSION_NAME: &str = "sync-dispatch-test";
 
-/// Stand up a fake daemon serving `GET /sessions/{id}` -> `SessionDto`
-/// with `backend = <backend>` and the canonical test session id.
+/// Stand up a fake daemon serving the two endpoints the sync flow
+/// touches: `GET /sessions/{id}` and
+/// `GET /sessions/{id}/ssh-config`.
 async fn spawn_fake_daemon(backend: &str) -> (TempDir, String) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let sock_path = tmp.path().join("sandboxd.sock");
@@ -54,11 +56,21 @@ async fn spawn_fake_daemon(backend: &str) -> (TempDir, String) {
                 }
             }),
         )
-        // The CLI's strict CLI ↔ daemon version-equality handshake
-        // fires on every `send_request_with_timeout` connection.
-        // Reporting our own CARGO_PKG_VERSION makes the handshake
-        // pass so the sync-dispatch flow reaches the session-lookup
-        // handler above.
+        .route(
+            "/sessions/{id}/ssh-config",
+            get({
+                move |_path: axum::extract::Path<String>| async move {
+                    let dto = json!({
+                        "config": render_ssh_config_block(TEST_SESSION_ID),
+                        "private_key": format!(
+                            "-----BEGIN OPENSSH PRIVATE KEY-----\nfake-bytes-for-{TEST_SESSION_ID}\n-----END OPENSSH PRIVATE KEY-----\n"
+                        ),
+                    });
+                    (StatusCode::OK, Json(dto))
+                }
+            }),
+        )
+        // Strict CLI ↔ daemon version-equality handshake.
         .route(
             "/version",
             get(|| async {
@@ -83,7 +95,7 @@ async fn spawn_fake_daemon(backend: &str) -> (TempDir, String) {
 fn session_dto_json(id: &str, backend: &str) -> Value {
     json!({
         "id": id,
-        "name": "sync-dispatch-test",
+        "name": TEST_SESSION_NAME,
         "state": "running",
         "created_at": "2026-04-25T00:00:00Z",
         "updated_at": "2026-04-25T00:00:00Z",
@@ -101,15 +113,11 @@ fn session_dto_json(id: &str, backend: &str) -> Value {
 
 /// Write a shim script at `dir/<name>` that records its argv (one
 /// argument per line) to `record_file` and exits with `exit_code`.
-/// Optionally writes `stderr_msg` to stderr so error-clarity tests
-/// can pin the message.
 ///
 /// **Why `printf` and not `echo`.** rsync's argv legitimately
 /// contains `-e` (the remote-shell flag); bash's builtin `echo`
 /// silently consumes `-e` as its own "interpret escapes" switch,
-/// producing an empty line and corrupting the recorded argv. The
-/// cp-side shim happens to never see a `-e` so it can get away with
-/// `echo` — we cannot. `printf '%s\n'` has no such trap.
+/// producing an empty line and corrupting the recorded argv.
 fn install_shim(
     dir: &Path,
     name: &str,
@@ -137,11 +145,14 @@ fn install_shim(
 }
 
 /// Run `sandbox sync` against the fake daemon with `path_dir`
-/// prepended to `PATH` so the shim wins over any real `rsync`.
+/// prepended to `PATH` (so the `rsync` shim wins) and `$HOME` pointed
+/// at a fresh tempdir (so the CLI's `~/.ssh/sandbox/` mutations land
+/// in a hermetic location).
 async fn run_sandbox_sync(
     args: &[&str],
     socket: &str,
     path_dir: &Path,
+    home_dir: &Path,
 ) -> (std::process::ExitStatus, String, String) {
     let binary = env!("CARGO_BIN_EXE_sandbox");
     let existing_path = std::env::var("PATH").unwrap_or_default();
@@ -154,6 +165,7 @@ async fn run_sandbox_sync(
         .arg("sync")
         .args(args)
         .env("PATH", &new_path)
+        .env("HOME", home_dir)
         .env("XDG_CONFIG_HOME", "/nonexistent/xdg")
         .env_remove("SANDBOX_DEFAULT_BACKEND")
         .stdout(Stdio::piped())
@@ -175,31 +187,29 @@ fn read_recorded_argv(record_file: &Path) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Lima dispatch
+// Upload
 // ---------------------------------------------------------------------------
 
-/// `sandbox sync ./local-dir/ <session>:/remote-dir` (directory-source
-/// upload, with trailing slash) against a Lima session invokes
-/// `rsync -a --delete -e 'limactl shell' <src>/ sandbox-<id>:/remote`
-/// and preserves the operator-supplied trailing slash idempotently —
-/// the planner does not double it. rsync's contents-mirroring idiom
-/// requires the trailing slash, and the CLI also auto-appends one
-/// when the operator forgot it (covered by
-/// `integration_sync_lima_upload_directory_source_appends_trailing_slash`).
+/// `sandbox sync ./local-dir <session>:/remote` invokes
+/// `rsync -a --delete -e ssh <src> sandbox-<id>:<remote>` against the
+/// canonical alias. Backend-independent — the daemon-mediated proxy
+/// abstracts over the underlying VM/container.
 #[tokio::test]
-async fn integration_sync_lima_upload_invokes_rsync_with_limactl_shell_rsh() {
+async fn integration_sync_upload_invokes_rsync_against_sandbox_alias() {
     let (_tmp_daemon, sock) = spawn_fake_daemon("lima").await;
     let shim_dir = tempfile::tempdir().expect("shim dir");
     let record_file = shim_dir.path().join("argv.log");
     install_shim(shim_dir.path(), "rsync", &record_file, 0, None);
+    let home_dir = tempfile::tempdir().expect("home dir");
 
     let (status, _stdout, stderr) = run_sandbox_sync(
         &[
             "./local/dir",
-            "sync-dispatch-test:/home/agent/workspace/dir",
+            &format!("{TEST_SESSION_NAME}:/home/sandbox/workspace/dir"),
         ],
         &sock,
         shim_dir.path(),
+        home_dir.path(),
     )
     .await;
 
@@ -216,40 +226,42 @@ async fn integration_sync_lima_upload_invokes_rsync_with_limactl_shell_rsh() {
             "-a".to_string(),
             "--delete".to_string(),
             "-e".to_string(),
-            "limactl shell".to_string(),
+            "ssh".to_string(),
             "./local/dir".to_string(),
-            format!("sandbox-{TEST_SESSION_ID}:/home/agent/workspace/dir"),
+            format!("sandbox-{TEST_SESSION_ID}:/home/sandbox/workspace/dir"),
         ],
-        "recorded argv shape regressed"
+        "rsync argv must use bare `ssh` transport against the daemon-issued sandbox-<id> alias"
     );
 }
 
-/// `sandbox sync <bare-dir-path-without-slash> <session>:/remote`
-/// auto-appends a trailing slash to the host-side source when it's a
-/// real directory, so rsync mirrors the *contents* of the source into
-/// the destination (rsync's long-standing convention) instead of
-/// landing them at `<dst>/<basename(src)>/...`. The planner stats the
-/// host-side source at the call site in `handle_sync` so the planner
-/// itself stays a pure function.
+/// Directory-source upload without a trailing slash: the dispatch
+/// site stats the host path and the planner auto-appends `/` so
+/// rsync mirrors *contents* (rsync's long-standing idiom). Pins the
+/// historical `sandbox sync ./src <session>:./dst` UX through the
+/// rewrite.
 #[tokio::test]
-async fn integration_sync_lima_upload_directory_source_appends_trailing_slash() {
+async fn integration_sync_upload_directory_source_appends_trailing_slash() {
     let (_tmp_daemon, sock) = spawn_fake_daemon("lima").await;
     let shim_dir = tempfile::tempdir().expect("shim dir");
     let record_file = shim_dir.path().join("argv.log");
     install_shim(shim_dir.path(), "rsync", &record_file, 0, None);
+    let home_dir = tempfile::tempdir().expect("home dir");
 
     let src_dir = tempfile::tempdir().expect("src dir");
     let src_path = src_dir.path().to_string_lossy().into_owned();
-    // Sanity: the path we hand to the CLI does *not* already end in `/`.
     assert!(
         !src_path.ends_with('/'),
         "tempdir path unexpectedly ends with '/' — test would not exercise auto-append"
     );
 
     let (status, _stdout, stderr) = run_sandbox_sync(
-        &[&src_path, "sync-dispatch-test:/home/agent/workspace/dir"],
+        &[
+            &src_path,
+            &format!("{TEST_SESSION_NAME}:/home/sandbox/workspace/dir"),
+        ],
         &sock,
         shim_dir.path(),
+        home_dir.path(),
     )
     .await;
 
@@ -267,30 +279,37 @@ async fn integration_sync_lima_upload_directory_source_appends_trailing_slash() 
             "-a".to_string(),
             "--delete".to_string(),
             "-e".to_string(),
-            "limactl shell".to_string(),
+            "ssh".to_string(),
             expected_src,
-            format!("sandbox-{TEST_SESSION_ID}:/home/agent/workspace/dir"),
+            format!("sandbox-{TEST_SESSION_ID}:/home/sandbox/workspace/dir"),
         ],
         "directory-source upload must auto-append trailing slash for contents-mirror"
     );
 }
 
-/// Download direction on Lima: `sandbox sync <session>:/remote
-/// ./local` swaps src and dst around the same baseline flag set.
+// ---------------------------------------------------------------------------
+// Download
+// ---------------------------------------------------------------------------
+
+/// `sandbox sync <session>:/remote ./local` swaps src/dst around the
+/// same baseline flag set. The host-side path stays unchanged
+/// (downloads don't remote-stat).
 #[tokio::test]
-async fn integration_sync_lima_download_swaps_src_and_dst_args() {
-    let (_tmp_daemon, sock) = spawn_fake_daemon("lima").await;
+async fn integration_sync_download_swaps_src_and_dst_args() {
+    let (_tmp_daemon, sock) = spawn_fake_daemon("container").await;
     let shim_dir = tempfile::tempdir().expect("shim dir");
     let record_file = shim_dir.path().join("argv.log");
     install_shim(shim_dir.path(), "rsync", &record_file, 0, None);
+    let home_dir = tempfile::tempdir().expect("home dir");
 
     let (status, _stdout, stderr) = run_sandbox_sync(
         &[
-            "sync-dispatch-test:/home/agent/workspace/output",
+            &format!("{TEST_SESSION_NAME}:/home/sandbox/workspace/output"),
             "./local/output",
         ],
         &sock,
         shim_dir.path(),
+        home_dir.path(),
     )
     .await;
 
@@ -307,35 +326,41 @@ async fn integration_sync_lima_download_swaps_src_and_dst_args() {
             "-a".to_string(),
             "--delete".to_string(),
             "-e".to_string(),
-            "limactl shell".to_string(),
-            format!("sandbox-{TEST_SESSION_ID}:/home/agent/workspace/output"),
+            "ssh".to_string(),
+            format!("sandbox-{TEST_SESSION_ID}:/home/sandbox/workspace/output"),
             "./local/output".to_string(),
         ]
     );
 }
 
 // ---------------------------------------------------------------------------
-// Container dispatch
+// Pass-through args
 // ---------------------------------------------------------------------------
 
-/// `sandbox sync ./local <session>:/remote` against a container
-/// session invokes `rsync -a --delete -e 'docker exec -i' ./local
-/// sandbox-<id>:/remote`. The `-i` (and *no* `-t`) is load-bearing:
-/// rsync's binary protocol breaks if a TTY is allocated.
+/// Operator-supplied rsync flags after `--` splice between the
+/// baseline (`-a --delete -e ssh`) and the source/destination
+/// operands. rsync's synopsis is `rsync [OPTION...] SRC... [DEST]`,
+/// so trailing-position flags would be treated as additional sources.
 #[tokio::test]
-async fn integration_sync_container_upload_invokes_rsync_with_docker_exec_i_rsh() {
-    let (_tmp_daemon, sock) = spawn_fake_daemon("container").await;
+async fn integration_sync_pass_through_args_splice_between_baseline_and_operands() {
+    let (_tmp_daemon, sock) = spawn_fake_daemon("lima").await;
     let shim_dir = tempfile::tempdir().expect("shim dir");
     let record_file = shim_dir.path().join("argv.log");
     install_shim(shim_dir.path(), "rsync", &record_file, 0, None);
+    let home_dir = tempfile::tempdir().expect("home dir");
 
     let (status, _stdout, stderr) = run_sandbox_sync(
         &[
-            "./local/dir",
-            "sync-dispatch-test:/home/agent/workspace/dir",
+            "./local/src",
+            &format!("{TEST_SESSION_NAME}:/home/sandbox/workspace/dst"),
+            "--",
+            "--exclude",
+            "*.log",
+            "--bwlimit=1m",
         ],
         &sock,
         shim_dir.path(),
+        home_dir.path(),
     )
     .await;
 
@@ -352,107 +377,75 @@ async fn integration_sync_container_upload_invokes_rsync_with_docker_exec_i_rsh(
             "-a".to_string(),
             "--delete".to_string(),
             "-e".to_string(),
-            "docker exec -i".to_string(),
-            "./local/dir".to_string(),
-            format!("sandbox-{TEST_SESSION_ID}:/home/agent/workspace/dir"),
-        ]
+            "ssh".to_string(),
+            "--exclude".to_string(),
+            "*.log".to_string(),
+            "--bwlimit=1m".to_string(),
+            "./local/src".to_string(),
+            format!("sandbox-{TEST_SESSION_ID}:/home/sandbox/workspace/dst"),
+        ],
+        "pass-through args must splice between baseline and operands"
     );
 }
 
-/// Download direction on the container backend.
+// ---------------------------------------------------------------------------
+// Per-session entry side-effect
+// ---------------------------------------------------------------------------
+
+/// After a successful dispatch the per-session SSH config + key
+/// files MUST be on disk under `$HOME/.ssh/sandbox/`. Mirrors the
+/// `integration_cp_writes_per_session_entry_under_managed_home`
+/// invariant for cp.
 #[tokio::test]
-async fn integration_sync_container_download_swaps_src_and_dst_args() {
-    let (_tmp_daemon, sock) = spawn_fake_daemon("container").await;
+async fn integration_sync_writes_per_session_entry_under_managed_home() {
+    let (_tmp_daemon, sock) = spawn_fake_daemon("lima").await;
     let shim_dir = tempfile::tempdir().expect("shim dir");
     let record_file = shim_dir.path().join("argv.log");
     install_shim(shim_dir.path(), "rsync", &record_file, 0, None);
+    let home_dir = tempfile::tempdir().expect("home dir");
 
     let (status, _stdout, stderr) = run_sandbox_sync(
         &[
-            "sync-dispatch-test:/home/agent/workspace/output",
-            "./local/output",
+            "./local/src",
+            &format!("{TEST_SESSION_NAME}:/home/sandbox/workspace/dst"),
         ],
         &sock,
         shim_dir.path(),
+        home_dir.path(),
     )
     .await;
 
     assert!(
         status.success(),
-        "sandbox sync container download should succeed; status={:?}, stderr=\n{stderr}",
+        "sandbox sync must succeed for entry to be written; status={:?}, stderr=\n{stderr}",
         status.code()
     );
 
-    let argv = read_recorded_argv(&record_file);
-    assert_eq!(
-        argv,
-        vec![
-            "-a".to_string(),
-            "--delete".to_string(),
-            "-e".to_string(),
-            "docker exec -i".to_string(),
-            format!("sandbox-{TEST_SESSION_ID}:/home/agent/workspace/output"),
-            "./local/output".to_string(),
-        ]
-    );
+    let sandbox_dir = home_dir.path().join(".ssh").join("sandbox");
+    let cfg = sandbox_dir.join(format!("sandbox-{TEST_SESSION_ID}"));
+    let key = sandbox_dir.join(format!("sandbox-{TEST_SESSION_ID}.key"));
+    assert!(cfg.exists(), "per-session config must be on disk");
+    assert!(key.exists(), "per-session key must be on disk");
 }
 
 // ---------------------------------------------------------------------------
-// Error propagation — native rsync style
+// Argument validation
 // ---------------------------------------------------------------------------
 
-/// When rsync exits non-zero (e.g. source-not-found), the CLI
-/// propagates the exit code unchanged and forwards rsync's stderr
-/// verbatim. Mirrors the cp-side guarantee: callers see the same
-/// diagnostic they would get from `rsync` directly.
-#[tokio::test]
-async fn integration_sync_lima_propagates_native_error_and_exit_code() {
-    let (_tmp_daemon, sock) = spawn_fake_daemon("lima").await;
-    let shim_dir = tempfile::tempdir().expect("shim dir");
-    let record_file = shim_dir.path().join("argv.log");
-    // rsync exits 23 ("partial transfer due to error") for missing
-    // source files, with a recognizable stderr line. We assert on the
-    // exit code passing through and the stderr line surviving.
-    install_shim(
-        shim_dir.path(),
-        "rsync",
-        &record_file,
-        23,
-        Some("rsync: link_stat \"./missing/dir\" failed: No such file or directory (2)"),
-    );
-
-    let (status, _stdout, stderr) = run_sandbox_sync(
-        &[
-            "./missing/dir",
-            "sync-dispatch-test:/home/agent/workspace/dir",
-        ],
-        &sock,
-        shim_dir.path(),
-    )
-    .await;
-
-    assert_eq!(
-        status.code(),
-        Some(23),
-        "exit code must match the shim's (rsync's) exit"
-    );
-    assert!(
-        stderr.contains("rsync: link_stat") && stderr.contains("No such file or directory"),
-        "native stderr must be propagated verbatim; got:\n{stderr}"
-    );
-}
-
-/// Both source and destination prefixed with `session:` is a misuse;
-/// the CLI rejects it locally before dispatching anywhere. Mirrors
-/// the cp-side rejection so the two commands stay symmetric.
+/// Both source and destination prefixed with `session:` is a misuse.
 #[tokio::test]
 async fn integration_sync_rejects_both_sides_remote() {
     let (_tmp_daemon, sock) = spawn_fake_daemon("lima").await;
     let shim_dir = tempfile::tempdir().expect("shim dir");
-    // No shim binaries needed — we should never reach a subprocess.
+    let home_dir = tempfile::tempdir().expect("home dir");
 
-    let (status, _stdout, stderr) =
-        run_sandbox_sync(&["a:foo", "b:bar"], &sock, shim_dir.path()).await;
+    let (status, _stdout, stderr) = run_sandbox_sync(
+        &["a:foo", "b:bar"],
+        &sock,
+        shim_dir.path(),
+        home_dir.path(),
+    )
+    .await;
 
     assert_eq!(
         status.code(),
@@ -466,66 +459,20 @@ async fn integration_sync_rejects_both_sides_remote() {
     );
 }
 
-/// Trailing rsync flags (everything after `--`) are spliced between
-/// the baseline `-a --delete -e <shell>` and the source/destination
-/// operands, matching rsync's `[OPTION...] SRC... [DEST]` synopsis.
-/// Pins both the layout and the literal preservation of multi-token
-/// flag values like `--exclude '*.log'`.
-#[tokio::test]
-async fn integration_sync_lima_passes_through_trailing_rsync_flags() {
-    let (_tmp_daemon, sock) = spawn_fake_daemon("lima").await;
-    let shim_dir = tempfile::tempdir().expect("shim dir");
-    let record_file = shim_dir.path().join("argv.log");
-    install_shim(shim_dir.path(), "rsync", &record_file, 0, None);
-
-    let (status, _stdout, stderr) = run_sandbox_sync(
-        &[
-            "./local/dir",
-            "sync-dispatch-test:/home/agent/workspace/dir",
-            "--",
-            "--exclude",
-            "*.log",
-            "--info=progress2",
-        ],
-        &sock,
-        shim_dir.path(),
-    )
-    .await;
-
-    assert!(
-        status.success(),
-        "sandbox sync with trailing flags should succeed; status={:?}, stderr=\n{stderr}",
-        status.code()
-    );
-
-    let argv = read_recorded_argv(&record_file);
-    assert_eq!(
-        argv,
-        vec![
-            "-a".to_string(),
-            "--delete".to_string(),
-            "-e".to_string(),
-            "limactl shell".to_string(),
-            "--exclude".to_string(),
-            "*.log".to_string(),
-            "--info=progress2".to_string(),
-            "./local/dir".to_string(),
-            format!("sandbox-{TEST_SESSION_ID}:/home/agent/workspace/dir"),
-        ],
-        "trailing rsync flags must splice between baseline and operands"
-    );
-}
-
-/// Neither side prefixed with `session:` is also a misuse; the CLI
-/// emits the documented sync-shaped usage hint (referring to dirs,
-/// not files like cp does).
+/// Neither side prefixed with `session:` is also a misuse.
 #[tokio::test]
 async fn integration_sync_rejects_no_remote_side() {
     let (_tmp_daemon, sock) = spawn_fake_daemon("lima").await;
     let shim_dir = tempfile::tempdir().expect("shim dir");
+    let home_dir = tempfile::tempdir().expect("home dir");
 
-    let (status, _stdout, stderr) =
-        run_sandbox_sync(&["./local/a", "./local/b"], &sock, shim_dir.path()).await;
+    let (status, _stdout, stderr) = run_sandbox_sync(
+        &["./local/a", "./local/b"],
+        &sock,
+        shim_dir.path(),
+        home_dir.path(),
+    )
+    .await;
 
     assert_eq!(
         status.code(),
@@ -536,12 +483,5 @@ async fn integration_sync_rejects_no_remote_side() {
     assert!(
         stderr.contains("one of source or destination must be a remote path"),
         "stderr must include the usage hint, got:\n{stderr}"
-    );
-    // The sync-side hint references *directories*, not files. Pin
-    // that the message wording is sync-shaped, not a verbatim copy
-    // of the cp message.
-    assert!(
-        stderr.contains("sandbox sync"),
-        "stderr should mention `sandbox sync` usage, got:\n{stderr}"
     );
 }

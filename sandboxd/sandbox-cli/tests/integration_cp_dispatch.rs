@@ -1,19 +1,24 @@
-//! Integration test: `sandbox cp` dispatches to the backend's native
-//! copy tool (`limactl cp` for Lima, `docker cp` for container).
+//! Integration test: `sandbox cp` dispatches to `scp sandbox-<id>:…`
+//! via the daemon-mediated SSH proxy.
 //!
-//! `sandbox cp` dispatches directly to the backend's native copy
-//! tool rather than relaying bytes through the daemon. This test
-//! pins the end-to-end CLI surface so a regression cannot silently
-//! reintroduce a daemon-relayed pump or wire the wrong argument
-//! shape.
+//! Under M18-S6, `sandbox cp` no longer reaches into the backend
+//! directly (`limactl cp` / `docker cp`); it ensures a per-session
+//! ssh-config entry under `~/.ssh/sandbox/`, then exec's `scp` against
+//! the alias `sandbox-<id>`. The operator's `~/.ssh/config` (via our
+//! managed `Include` block) resolves that alias to a stanza whose
+//! `ProxyCommand sandbox proxy <id>` line tunnels the bytes through
+//! the daemon.
 //!
-//! The test stages a tempdir shim on `PATH` for both `limactl` and
-//! `docker` that records its argv to a sentinel file. A fake
-//! `sandboxd` Unix-socket daemon serves a `SessionDto` with the
-//! backend kind under test. We then run the real `sandbox cp` binary
-//! and assert the shim was invoked with the expected `(program, args)`
-//! tuple — that proves the planner and dispatch glue both wired
-//! correctly without booting a real VM or container runtime.
+//! This test pins the new dispatch surface:
+//!
+//! * The CLI sources its ssh-config from `GET /sessions/{id}/ssh-config`.
+//! * The CLI invokes `scp` (not `limactl cp` / `docker cp`).
+//! * The argv shape is `scp [-r] <src> <dst>` against
+//!   `sandbox-<id>:<path>`.
+//! * Direction (upload vs download) drives src/dst ordering.
+//! * `-r` is conditional on the host-side source being a directory.
+//! * Non-zero exit from `scp` propagates verbatim.
+//! * Both-remote and neither-remote argument shapes are rejected.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -23,6 +28,7 @@ use axum::Router;
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::get;
+use sandbox_core::render_ssh_config_block;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::UnixListener;
@@ -32,9 +38,14 @@ use tokio::time::timeout;
 mod common;
 
 const TEST_SESSION_ID: &str = "abcdef012345";
+const TEST_SESSION_NAME: &str = "cp-dispatch-test";
 
-/// Stand up a fake daemon serving `GET /sessions/{id}` -> `SessionDto`
-/// with `backend = <backend>` and the canonical test session id.
+/// Stand up a fake daemon serving the two endpoints the cp flow touches:
+///
+/// * `GET /sessions/{id}` → `SessionDto` with the requested backend.
+/// * `GET /sessions/{id}/ssh-config` → `SshConfigDto` with the canonical
+///   config block (CLI rewrites the `IdentityFile` placeholder before
+///   landing it on disk) and a synthetic private-key blob.
 async fn spawn_fake_daemon(backend: &str) -> (TempDir, String) {
     let tmp = tempfile::tempdir().expect("tempdir");
     let sock_path = tmp.path().join("sandboxd.sock");
@@ -51,10 +62,24 @@ async fn spawn_fake_daemon(backend: &str) -> (TempDir, String) {
                 }
             }),
         )
+        .route(
+            "/sessions/{id}/ssh-config",
+            get({
+                move |_path: axum::extract::Path<String>| async move {
+                    let dto = json!({
+                        "config": render_ssh_config_block(TEST_SESSION_ID),
+                        "private_key": format!(
+                            "-----BEGIN OPENSSH PRIVATE KEY-----\nfake-bytes-for-{TEST_SESSION_ID}\n-----END OPENSSH PRIVATE KEY-----\n"
+                        ),
+                    });
+                    (StatusCode::OK, Json(dto))
+                }
+            }),
+        )
         // The CLI fetches `GET /version` on every send_request_with_timeout
         // call (strict CLI ↔ daemon version-equality rule). Report the
         // test binary's own CARGO_PKG_VERSION so the handshake passes
-        // and the cp-dispatch flow reaches the session-lookup handler.
+        // and the cp-dispatch flow reaches the SSH-config-fetch handler.
         .route(
             "/version",
             get(|| async {
@@ -79,7 +104,7 @@ async fn spawn_fake_daemon(backend: &str) -> (TempDir, String) {
 fn session_dto_json(id: &str, backend: &str) -> Value {
     json!({
         "id": id,
-        "name": "cp-dispatch-test",
+        "name": TEST_SESSION_NAME,
         "state": "running",
         "created_at": "2026-04-25T00:00:00Z",
         "updated_at": "2026-04-25T00:00:00Z",
@@ -107,10 +132,6 @@ fn install_shim(
     stderr_msg: Option<&str>,
 ) {
     let shim_path = dir.join(name);
-    // The shim writes one arg per line so the assertion side can read
-    // the recorded argv unambiguously even when paths contain spaces
-    // (none of the test paths do, but pinning the format keeps the
-    // protocol explicit).
     let stderr_line = stderr_msg
         .map(|m| format!("echo '{m}' >&2\n"))
         .unwrap_or_default();
@@ -130,11 +151,14 @@ fn install_shim(
 }
 
 /// Run `sandbox cp` against the fake daemon with `path_dir` prepended
-/// to `PATH` so the shim wins over any real `limactl` / `docker`.
+/// to `PATH` (so the `scp` shim wins over the real one) and `$HOME`
+/// pointed at a fresh tempdir (so the CLI's `~/.ssh/sandbox/`
+/// mutations land in a hermetic location).
 async fn run_sandbox_cp(
     args: &[&str],
     socket: &str,
     path_dir: &Path,
+    home_dir: &Path,
 ) -> (std::process::ExitStatus, String, String) {
     let binary = env!("CARGO_BIN_EXE_sandbox");
     let existing_path = std::env::var("PATH").unwrap_or_default();
@@ -147,6 +171,7 @@ async fn run_sandbox_cp(
         .arg("cp")
         .args(args)
         .env("PATH", &new_path)
+        .env("HOME", home_dir)
         .env("XDG_CONFIG_HOME", "/nonexistent/xdg")
         .env_remove("SANDBOX_DEFAULT_BACKEND")
         .stdout(Stdio::piped())
@@ -169,76 +194,78 @@ fn read_recorded_argv(record_file: &Path) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Lima dispatch
+// Upload (file source) — no `-r`
 // ---------------------------------------------------------------------------
 
-/// `sandbox cp ./local-file <session>:/remote-file` (file-source
-/// upload) against a Lima session invokes `limactl cp <src> <dst>` —
-/// **without** `-r`. Lima 2.x's `limactl cp` is rsync-backed: passing
-/// `-r` against a regular-file source aborts with rsync exit code 23
-/// (rsync tries to `chdir` into the source, hits ENOTDIR). The CLI
-/// stats the host-side source and only emits `-r` when it's a
-/// directory.
+/// File-source upload: `sandbox cp ./local-file
+/// <session>:/remote-file` invokes `scp <src> <dst>` against
+/// `sandbox-<id>:<path>` — **without** `-r`. `scp -r` on a file source
+/// is wasteful but accepted; the planner deliberately omits it to
+/// match `cp`'s historical "single file" affordance.
 #[tokio::test]
-async fn integration_cp_lima_upload_file_source_omits_recurse_flag() {
+async fn integration_cp_file_upload_emits_scp_against_sandbox_alias_without_recurse() {
     let (_tmp_daemon, sock) = spawn_fake_daemon("lima").await;
     let shim_dir = tempfile::tempdir().expect("shim dir");
     let record_file = shim_dir.path().join("argv.log");
-    install_shim(shim_dir.path(), "limactl", &record_file, 0, None);
+    install_shim(shim_dir.path(), "scp", &record_file, 0, None);
+    let home_dir = tempfile::tempdir().expect("home dir");
 
-    // Stage a real file on disk so the CLI's `std::fs::metadata` call
-    // resolves (`is_dir() == false`), confirming the file-source code
-    // path is exercised rather than the "stat failed → fall back"
-    // path. Either path produces no `-r`, but pinning the live-stat
-    // case keeps this test honest about what it covers.
     let src_dir = tempfile::tempdir().expect("src dir");
     let src_file = src_dir.path().join("file.txt");
     std::fs::write(&src_file, b"contents").expect("write src file");
     let src_path = src_file.to_string_lossy().into_owned();
 
     let (status, _stdout, stderr) = run_sandbox_cp(
-        &[&src_path, "cp-dispatch-test:/home/agent/workspace/file.txt"],
+        &[
+            &src_path,
+            &format!("{TEST_SESSION_NAME}:/home/sandbox/workspace/file.txt"),
+        ],
         &sock,
         shim_dir.path(),
+        home_dir.path(),
     )
     .await;
 
     assert!(
         status.success(),
-        "sandbox cp should propagate shim exit 0; status={:?}, stderr=\n{stderr}",
+        "sandbox cp should propagate scp shim exit 0; status={:?}, stderr=\n{stderr}",
         status.code()
     );
-
     let argv = read_recorded_argv(&record_file);
     assert_eq!(
         argv,
         vec![
-            "cp".to_string(),
             src_path,
-            format!("sandbox-{TEST_SESSION_ID}:/home/agent/workspace/file.txt"),
+            format!("sandbox-{TEST_SESSION_ID}:/home/sandbox/workspace/file.txt"),
         ],
-        "file-source upload must not pass -r (rsync ENOTDIR regression)"
+        "file-source upload must invoke `scp <src> <dst>` against the alias"
     );
 }
 
-/// `sandbox cp ./local-dir <session>:/remote-dir` (directory-source
-/// upload) against a Lima session invokes `limactl cp -r <src> <dst>`.
-/// `-r` is conditional on the host-side source being a directory; the
-/// planner stats it at the call site.
+/// Directory-source upload: `sandbox cp ./local-dir
+/// <session>:/remote-dir` invokes `scp -r <src> <dst>` against
+/// `sandbox-<id>:<path>`. `-r` is conditional on the planner's
+/// `source_is_dir` flag, which the dispatch site stats at the host
+/// path.
 #[tokio::test]
-async fn integration_cp_lima_upload_directory_source_keeps_recurse_flag() {
+async fn integration_cp_directory_upload_passes_recurse_flag() {
     let (_tmp_daemon, sock) = spawn_fake_daemon("lima").await;
     let shim_dir = tempfile::tempdir().expect("shim dir");
     let record_file = shim_dir.path().join("argv.log");
-    install_shim(shim_dir.path(), "limactl", &record_file, 0, None);
+    install_shim(shim_dir.path(), "scp", &record_file, 0, None);
+    let home_dir = tempfile::tempdir().expect("home dir");
 
     let src_dir = tempfile::tempdir().expect("src dir");
     let src_path = src_dir.path().to_string_lossy().into_owned();
 
     let (status, _stdout, stderr) = run_sandbox_cp(
-        &[&src_path, "cp-dispatch-test:/home/agent/workspace/dir"],
+        &[
+            &src_path,
+            &format!("{TEST_SESSION_NAME}:/home/sandbox/workspace/dir"),
+        ],
         &sock,
         shim_dir.path(),
+        home_dir.path(),
     )
     .await;
 
@@ -247,40 +274,44 @@ async fn integration_cp_lima_upload_directory_source_keeps_recurse_flag() {
         "sandbox cp directory upload should succeed; status={:?}, stderr=\n{stderr}",
         status.code()
     );
-
     let argv = read_recorded_argv(&record_file);
     assert_eq!(
         argv,
         vec![
-            "cp".to_string(),
             "-r".to_string(),
             src_path,
-            format!("sandbox-{TEST_SESSION_ID}:/home/agent/workspace/dir"),
+            format!("sandbox-{TEST_SESSION_ID}:/home/sandbox/workspace/dir"),
         ],
         "directory-source upload must pass -r"
     );
 }
 
-/// Download direction on Lima: `sandbox cp <session>:/remote ./local`
-/// invokes `limactl cp <src> <dst>` (src/dst swapped from upload),
-/// **without** `-r`. Downloads always omit `-r` because the source
-/// lives on the VM side and remote-stat'ing from the host would
-/// require a daemon round-trip we deliberately avoid; users wanting a
-/// directory download invoke `sandbox sync` instead.
+// ---------------------------------------------------------------------------
+// Download
+// ---------------------------------------------------------------------------
+
+/// Download: `sandbox cp <session>:/remote ./local` invokes `scp
+/// <src> <dst>` with the src/dst swapped from upload, **without**
+/// `-r`. Downloads always omit `-r` — the source lives on the VM side
+/// and remote-stat'ing from the host would require a daemon
+/// round-trip we deliberately avoid; operators wanting a directory
+/// download fall through to `sandbox sync`.
 #[tokio::test]
-async fn integration_cp_lima_download_swaps_src_and_dst_args() {
-    let (_tmp_daemon, sock) = spawn_fake_daemon("lima").await;
+async fn integration_cp_download_swaps_src_and_dst_args() {
+    let (_tmp_daemon, sock) = spawn_fake_daemon("container").await;
     let shim_dir = tempfile::tempdir().expect("shim dir");
     let record_file = shim_dir.path().join("argv.log");
-    install_shim(shim_dir.path(), "limactl", &record_file, 0, None);
+    install_shim(shim_dir.path(), "scp", &record_file, 0, None);
+    let home_dir = tempfile::tempdir().expect("home dir");
 
     let (status, _stdout, stderr) = run_sandbox_cp(
         &[
-            "cp-dispatch-test:/home/agent/workspace/output.log",
+            &format!("{TEST_SESSION_NAME}:/home/sandbox/workspace/output.log"),
             "./local/output.log",
         ],
         &sock,
         shim_dir.path(),
+        home_dir.path(),
     )
     .await;
 
@@ -289,155 +320,141 @@ async fn integration_cp_lima_download_swaps_src_and_dst_args() {
         "sandbox cp download should succeed; status={:?}, stderr=\n{stderr}",
         status.code()
     );
-
     let argv = read_recorded_argv(&record_file);
     assert_eq!(
         argv,
         vec![
-            "cp".to_string(),
-            format!("sandbox-{TEST_SESSION_ID}:/home/agent/workspace/output.log"),
+            format!("sandbox-{TEST_SESSION_ID}:/home/sandbox/workspace/output.log"),
             "./local/output.log".to_string(),
         ]
     );
 }
 
 // ---------------------------------------------------------------------------
-// Container dispatch
+// Per-session entry side-effect
 // ---------------------------------------------------------------------------
 
-/// `sandbox cp ./local <session>:/remote` against a container session
-/// invokes `docker cp ./local sandbox-<id>:/remote` — no `-r` flag,
-/// because `docker cp` recurses by default and rejects unknown flags.
+/// After a successful dispatch the per-session SSH config + key
+/// files MUST be on disk under `$HOME/.ssh/sandbox/`. This pins the
+/// "ensure entry before exec" invariant the CLI promises.
 #[tokio::test]
-async fn integration_cp_container_upload_invokes_docker_cp_without_recurse_flag() {
-    let (_tmp_daemon, sock) = spawn_fake_daemon("container").await;
-    let shim_dir = tempfile::tempdir().expect("shim dir");
-    let record_file = shim_dir.path().join("argv.log");
-    install_shim(shim_dir.path(), "docker", &record_file, 0, None);
-
-    let (status, _stdout, stderr) = run_sandbox_cp(
-        &[
-            "./local/file.txt",
-            "cp-dispatch-test:/home/agent/workspace/file.txt",
-        ],
-        &sock,
-        shim_dir.path(),
-    )
-    .await;
-
-    assert!(
-        status.success(),
-        "sandbox cp should propagate shim exit 0; status={:?}, stderr=\n{stderr}",
-        status.code()
-    );
-
-    let argv = read_recorded_argv(&record_file);
-    assert_eq!(
-        argv,
-        vec![
-            "cp".to_string(),
-            "./local/file.txt".to_string(),
-            format!("sandbox-{TEST_SESSION_ID}:/home/agent/workspace/file.txt"),
-        ]
-    );
-}
-
-/// Download direction on container backend: src/dst swapped from
-/// upload, same `docker cp` shape (no `-r`).
-#[tokio::test]
-async fn integration_cp_container_download_swaps_src_and_dst_args() {
-    let (_tmp_daemon, sock) = spawn_fake_daemon("container").await;
-    let shim_dir = tempfile::tempdir().expect("shim dir");
-    let record_file = shim_dir.path().join("argv.log");
-    install_shim(shim_dir.path(), "docker", &record_file, 0, None);
-
-    let (status, _stdout, stderr) = run_sandbox_cp(
-        &[
-            "cp-dispatch-test:/home/agent/workspace/output.log",
-            "./local/output.log",
-        ],
-        &sock,
-        shim_dir.path(),
-    )
-    .await;
-
-    assert!(
-        status.success(),
-        "sandbox cp container download should succeed; status={:?}, stderr=\n{stderr}",
-        status.code()
-    );
-
-    let argv = read_recorded_argv(&record_file);
-    assert_eq!(
-        argv,
-        vec![
-            "cp".to_string(),
-            format!("sandbox-{TEST_SESSION_ID}:/home/agent/workspace/output.log"),
-            "./local/output.log".to_string(),
-        ]
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Error propagation — native tooling style
-// ---------------------------------------------------------------------------
-
-/// When the native tool exits non-zero (e.g. source-not-found), the
-/// CLI propagates the exit code unchanged and forwards the native
-/// stderr verbatim — callers see the same diagnostic they would get
-/// from `limactl cp` / `docker cp` directly.
-#[tokio::test]
-async fn integration_cp_lima_propagates_native_error_and_exit_code() {
+async fn integration_cp_writes_per_session_entry_under_managed_home() {
     let (_tmp_daemon, sock) = spawn_fake_daemon("lima").await;
     let shim_dir = tempfile::tempdir().expect("shim dir");
     let record_file = shim_dir.path().join("argv.log");
-    // Mimic scp's "no such file" exit. scp's exit codes vary by
-    // platform, but a generic non-zero with a recognizable stderr is
-    // what the CLI must propagate. Use `1` here — that's the canonical
-    // scp/`limactl cp` style failure.
+    install_shim(shim_dir.path(), "scp", &record_file, 0, None);
+    let home_dir = tempfile::tempdir().expect("home dir");
+
+    let src_dir = tempfile::tempdir().expect("src dir");
+    let src_file = src_dir.path().join("entry.txt");
+    std::fs::write(&src_file, b"hello").expect("write src");
+    let src_path = src_file.to_string_lossy().into_owned();
+
+    let (status, _stdout, stderr) = run_sandbox_cp(
+        &[
+            &src_path,
+            &format!("{TEST_SESSION_NAME}:/home/sandbox/workspace/entry.txt"),
+        ],
+        &sock,
+        shim_dir.path(),
+        home_dir.path(),
+    )
+    .await;
+
+    assert!(
+        status.success(),
+        "sandbox cp must succeed for entry to be written; status={:?}, stderr=\n{stderr}",
+        status.code()
+    );
+
+    let sandbox_dir = home_dir.path().join(".ssh").join("sandbox");
+    let cfg = sandbox_dir.join(format!("sandbox-{TEST_SESSION_ID}"));
+    let key = sandbox_dir.join(format!("sandbox-{TEST_SESSION_ID}.key"));
+    assert!(
+        cfg.exists(),
+        "per-session config must be staged under $HOME/.ssh/sandbox/"
+    );
+    assert!(
+        key.exists(),
+        "per-session key must be staged under $HOME/.ssh/sandbox/"
+    );
+    // The global Include block lands in `~/.ssh/config`.
+    let global = home_dir.path().join(".ssh").join("config");
+    assert!(
+        global.exists(),
+        "~/.ssh/config must be created with the managed Include block"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Error propagation
+// ---------------------------------------------------------------------------
+
+/// When `scp` exits non-zero (e.g. source-not-found), the CLI
+/// propagates the exit code unchanged and forwards the native stderr
+/// verbatim — callers see the same diagnostic they would get from
+/// invoking `scp` themselves.
+///
+/// Note: `LC_ALL=C` / `LANG=C` are injected by the CLI; the stderr
+/// substring sniffer (`looks_like_publickey_drift`) doesn't trigger
+/// here because the simulated message is a generic "No such file or
+/// directory" — drift recovery is matched only on the canonical
+/// `Permission denied (publickey)` substring.
+#[tokio::test]
+async fn integration_cp_propagates_native_error_and_exit_code() {
+    let (_tmp_daemon, sock) = spawn_fake_daemon("lima").await;
+    let shim_dir = tempfile::tempdir().expect("shim dir");
+    let record_file = shim_dir.path().join("argv.log");
     install_shim(
         shim_dir.path(),
-        "limactl",
+        "scp",
         &record_file,
         1,
         Some("scp: ./missing/file.txt: No such file or directory"),
     );
+    let home_dir = tempfile::tempdir().expect("home dir");
 
     let (status, _stdout, stderr) = run_sandbox_cp(
         &[
             "./missing/file.txt",
-            "cp-dispatch-test:/home/agent/workspace/file.txt",
+            &format!("{TEST_SESSION_NAME}:/home/sandbox/workspace/file.txt"),
         ],
         &sock,
         shim_dir.path(),
+        home_dir.path(),
     )
     .await;
 
     assert_eq!(
         status.code(),
         Some(1),
-        "exit code must match the shim's (native tool's) exit"
+        "exit code must match the scp shim's"
     );
     assert!(
         stderr.contains("scp:") && stderr.contains("No such file or directory"),
-        "native stderr must be propagated verbatim; got:\n{stderr}"
+        "scp stderr must be propagated verbatim; got:\n{stderr}"
     );
 }
 
+// ---------------------------------------------------------------------------
+// Argument validation
+// ---------------------------------------------------------------------------
+
 /// Both source and destination prefixed with `session:` is a misuse;
-/// the CLI rejects it locally before dispatching anywhere. This pins
-/// that the existing user-facing error message survives the refactor.
+/// the CLI rejects it locally before dispatching anywhere.
 #[tokio::test]
 async fn integration_cp_rejects_both_sides_remote() {
-    // We don't even need a daemon for this — the CLI rejects the
-    // misuse before any HTTP work. Stand one up anyway so we don't
-    // bypass the binary's startup path entirely.
     let (_tmp_daemon, sock) = spawn_fake_daemon("lima").await;
     let shim_dir = tempfile::tempdir().expect("shim dir");
-    // No shim binaries needed — we should never reach a subprocess.
+    let home_dir = tempfile::tempdir().expect("home dir");
 
-    let (status, _stdout, stderr) =
-        run_sandbox_cp(&["a:foo", "b:bar"], &sock, shim_dir.path()).await;
+    let (status, _stdout, stderr) = run_sandbox_cp(
+        &["a:foo", "b:bar"],
+        &sock,
+        shim_dir.path(),
+        home_dir.path(),
+    )
+    .await;
 
     assert_eq!(
         status.code(),
@@ -457,9 +474,15 @@ async fn integration_cp_rejects_both_sides_remote() {
 async fn integration_cp_rejects_no_remote_side() {
     let (_tmp_daemon, sock) = spawn_fake_daemon("lima").await;
     let shim_dir = tempfile::tempdir().expect("shim dir");
+    let home_dir = tempfile::tempdir().expect("home dir");
 
-    let (status, _stdout, stderr) =
-        run_sandbox_cp(&["./local/a", "./local/b"], &sock, shim_dir.path()).await;
+    let (status, _stdout, stderr) = run_sandbox_cp(
+        &["./local/a", "./local/b"],
+        &sock,
+        shim_dir.path(),
+        home_dir.path(),
+    )
+    .await;
 
     assert_eq!(
         status.code(),

@@ -16,5 +16,6 @@ pub mod cli_xdg;
 pub mod doctor;
 pub mod presets;
 pub mod proxy;
+pub mod ssh_commands;
 pub mod ssh_config;
 pub mod update;
