@@ -47,7 +47,7 @@ These are the capabilities the Lima backend has and the lite backend does not �
 The session contract does not change with the backend. Across both lite and Lima you keep:
 
 - **Workspace bind mount.** `--workspace shared:<path>` and `--workspace clone:<repo>` work the same way on both backends.
-- **Per-session home volume.** `/home/sandbox` lives in a named Docker volume `sandbox-home-{session_id}` for lite sessions — it survives `sandbox stop` / `sandbox start` and is deleted with `sandbox rm`. The Lima backend offers the equivalent (`/home/agent` on its VM disk; Lima keeps the historical `agent` username). Either way you get state within a session, clean slate between sessions.
+- **Per-session home volume.** `/home/sandbox` lives in a named Docker volume `sandbox-home-{session_id}` for lite sessions — it survives `sandbox stop` / `sandbox start` and is deleted with `sandbox rm`. The Lima backend offers the equivalent (`/home/agent` on its VM disk; the in-VM account is also `sandbox`, but the home directory path retains its historical name). Either way you get state within a session, clean slate between sessions.
 - **Gateway and policy parity.** Per-session gateway container, per-session bridge, per-session CA, TLS interception, applied policy, and DNS-driven egress filtering all run identically on both backends.
 - **Same CLI surface.** `sandbox cp`, `sandbox ssh`, `sandbox exec`, `git-remote-sandbox`, `sandbox logs`, `sandbox policy update` — every command works against both backends without flags.
 

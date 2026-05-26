@@ -11,7 +11,7 @@
 //!
 //! * **Container** — spawn `docker exec -i <ctr> socat - TCP:127.0.0.1:22`
 //!   as a `tokio::process::Command` child with async stdio. Same byte
-//!   mover the M18-S3 cross-user sshd integration test (`tests/
+//!   mover the cross-user sshd integration test (`tests/
 //!   integration_lite_image_sshd_cross_user.rs`) used as a
 //!   `ProxyCommand`, now lifted into the daemon.
 //! * **Lima** — discover the host-side TCP port Lima forwards to the
@@ -169,7 +169,7 @@ async fn run_proxy(socket: WebSocket, session: Session, lima: Arc<LimaManager>) 
 
 /// Container path: spawn `docker exec -i <name> socat -
 /// TCP:127.0.0.1:22` with async pipes, then ferry bytes between the
-/// WebSocket halves and the child's stdio. Same byte mover the M18-S3
+/// WebSocket halves and the child's stdio. Same byte mover the
 /// cross-user sshd integration test used as a `ProxyCommand`.
 async fn pump_container(socket: WebSocket, session_id: &SessionId) -> Result<(), SandboxError> {
     let container_name = format!("sandbox-{session_id}");
@@ -545,7 +545,7 @@ mod tests {
 
     /// `ProxyHttpError::NotFound` maps to `404` via the shared
     /// `error_response` helper. Pins the contract the CLI shim
-    /// (M18-S5) consumes for lazy-cleanup of stale local entries.
+    /// consumes for lazy-cleanup of stale local entries.
     #[tokio::test]
     async fn proxy_http_error_not_found_maps_to_404() {
         let resp = ProxyHttpError::NotFound("nonesuch".into()).into_response();
@@ -572,7 +572,7 @@ mod tests {
     }
 
     /// The IANA-private close codes the daemon uses to signal failure
-    /// to the CLI live in the 4000-4999 range. M18-S5's CLI matches
+    /// to the CLI live in the 4000-4999 range. The CLI matches
     /// against these constants directly; drift here would silently
     /// break the CLI's "render an actionable error" path.
     #[test]

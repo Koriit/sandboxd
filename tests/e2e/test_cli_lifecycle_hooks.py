@@ -1,4 +1,4 @@
-"""E2E tests for the M18-S7 lifecycle hooks.
+"""E2E tests for the CLI lifecycle hooks.
 
 The CLI's ``sandbox rm``, ``sandbox ls``, and ``sandbox proxy <id>``
 subcommands keep ``~/.ssh/sandbox/`` consistent with the daemon's

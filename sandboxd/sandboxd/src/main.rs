@@ -1992,11 +1992,11 @@ async fn create_session(
             // `docker create` time.
             //
             // **Why the synthetic /etc/passwd**: when `daemon_uid !=
-            // 1000` (the cross-user case the M18 milestone exists to
-            // fix), OpenSSH's `getpwuid(geteuid())` lookup fails
-            // inside the container because the in-image `sandbox`
-            // user is uid 1000 but the container runs under the
-            // daemon's uid. todo #221's decision (b) overlays a
+            // 1000` (the cross-user case the daemon-as-system-user
+            // design exists to fix), OpenSSH's `getpwuid(geteuid())`
+            // lookup fails inside the container because the in-image
+            // `sandbox` user is uid 1000 but the container runs under
+            // the daemon's uid. todo #221's decision (b) overlays a
             // single-entry passwd file that maps the runtime uid to
             // the `sandbox` account, reusing the same tmpfs bind-mount
             // surface as the authorized_keys injection. The
@@ -6461,7 +6461,7 @@ async fn session_health(
 /// * Lima sessions: Lima manages per-VM SSH credentials on disk under
 ///   the daemon's `~/.lima/_config/user{,.pub}`. The daemon reads the
 ///   private half on demand and serves it through the same DTO
-///   shape, so M18-S5's CLI can dispatch backend-agnostically.
+///   shape, so the CLI can dispatch backend-agnostically.
 ///
 /// Session ownership is enforced via the existing
 /// `get_session_by_name_or_id(&id, &operator.name)` path — a foreign
@@ -6585,8 +6585,8 @@ async fn get_proxy(
 /// `~/.lima/_config/user`. Returns the file contents verbatim as an
 /// OpenSSH-format string.
 ///
-/// The daemon runs as the `sandbox` system user (per M18-S1's
-/// systemd-unit launch posture); Lima writes the key under that user's
+/// The daemon runs as the `sandbox` system user under its
+/// systemd-unit launch posture; Lima writes the key under that user's
 /// home directory at `~/.lima/_config/user`. The file mode is 0600 (set
 /// by Lima at write time) so only the daemon process can read it.
 /// This helper is invoked from `get_ssh_config` to serve the private

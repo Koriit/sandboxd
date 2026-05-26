@@ -256,7 +256,7 @@ mod tests {
     fn render_ssh_config_block_matches_spec_template() {
         // Pin the exact byte sequence against the spec template. A
         // line-reorder / directive-rename here is a wire break with
-        // M18-S5's CLI consumer.
+        // the CLI's persistent ssh-config consumer.
         let block = render_ssh_config_block("0123456789ab");
         let expected = "\
 Host sandbox-0123456789ab
@@ -278,7 +278,7 @@ Host sandbox-0123456789ab
     #[test]
     fn render_ssh_config_block_threads_session_id_into_proxy_and_host() {
         // The session id must appear in both the `Host` alias and the
-        // `ProxyCommand` argv — M18-S5's CLI alias resolution and the
+        // `ProxyCommand` argv — the CLI's alias resolution and the
         // daemon proxy WebSocket endpoint both depend on the exact
         // string. Tested independently from the byte-equal template
         // assertion so a partial regression on either site shows up
@@ -297,7 +297,7 @@ Host sandbox-0123456789ab
 
     #[test]
     fn render_ssh_config_block_contains_identity_file_placeholder() {
-        // The placeholder token is wire format — M18-S5's CLI scans
+        // The placeholder token is wire format — the CLI scans
         // the block for it and overwrites in-place with the real
         // per-session key path. Renaming the token is a wire break.
         let block = render_ssh_config_block("0123456789ab");

@@ -188,7 +188,7 @@ If something goes wrong: the upgrade is auto-recoverable (re-run `sudo sandbox u
 
 For contributors building sandboxd from source. The default ad-hoc developer flow runs the daemon as your own user (not the system `sandbox` user) with state under `~/.local/share/sandboxd/`. Helper installation, bridge-conf, `users.conf`, the `sandbox` system user, operator-group membership, the setuid step, and the e2e harness sudoers fragment are all folded into `make setup-dev-env`. See [Developer install — build from source](#developer-install--build-from-source) below for the full walkthrough. The two paths can coexist on the same host, but should not run two daemons in parallel: see [Dev-mode vs operator-mode coexistence](#dev-mode-vs-operator-mode-coexistence) below before mixing them.
 
-Note that the e2e test suite (M18-S1 onwards) launches the daemon as the dedicated `sandbox` system user — not your own uid — so the operator-vs-daemon-uid split is exercised by every test run. See the [E2E harness selection](#e2e-harness-selection-sandbox_harness) section below for the three available harness modes.
+Note that the e2e test suite launches the daemon as the dedicated `sandbox` system user — not your own uid — so the operator-vs-daemon-uid split is exercised by every test run. See the [E2E harness selection](#e2e-harness-selection-sandbox_harness) section below for the three available harness modes.
 
 ## KVM setup
 
@@ -473,7 +473,7 @@ The sections below explain what each prerequisite does and document the manual i
 
 #### `sandbox` system user and operator group membership
 
-The e2e harness (M18-S1 onwards) launches sandboxd as the dedicated `sandbox` system user — mirroring how the production systemd unit at `sandboxd/contrib/systemd/sandboxd.service` runs the daemon — so cross-user CLI paths (`sandbox ssh`, `sandbox cp`, `git-remote-sandbox`, etc.) are exercised against a daemon that does **not** share a uid with the test operator. `make setup-sandbox-user` creates the user with `--system --no-create-home --home-dir /var/lib/sandbox --shell /usr/sbin/nologin` and binds it to the `docker` and `kvm` groups when present, matching `install.sh`'s production path.
+The e2e harness launches sandboxd as the dedicated `sandbox` system user — mirroring how the production systemd unit at `sandboxd/contrib/systemd/sandboxd.service` runs the daemon — so cross-user CLI paths (`sandbox ssh`, `sandbox cp`, `git-remote-sandbox`, etc.) are exercised against a daemon that does **not** share a uid with the test operator. `make setup-sandbox-user` creates the user with `--system --no-create-home --home-dir /var/lib/sandbox --shell /usr/sbin/nologin` and binds it to the `docker` and `kvm` groups when present, matching `install.sh`'s production path.
 
 The operator's CLI talks to the daemon through a unix-domain socket at `/run/sandbox/sandboxd.sock` (mode `0660`, group `sandbox`). The operator must therefore be a member of the `sandbox` group; `make setup-operator-group-membership` adds them.
 
@@ -499,7 +499,7 @@ If you move the workspace to a different directory, re-run `make setup-test-sudo
 |-------------------------|---------------|-------------|-------------|
 | `sandbox-systemd` (default) | systemd unit `sandboxd-test.service` (installed automatically each session via drop-in override) | `/run/sandbox/sandboxd.sock` | Default on systemd hosts; auto-falls-back to `sandbox-sudo` when `/run/systemd/system` is missing. |
 | `sandbox-sudo` | `sudo -u sandbox <test-binary>` | `/run/sandbox/sandboxd.sock` | Hosts without systemd, or when iterating on the harness itself. |
-| `test-user` (legacy) | spawned as the pytest process's own uid with temp paths | per-pytest tempdir | Baseline regression check for the diff-the-outcomes runs; this mode will be removed in M18-S9. |
+| `test-user` (legacy) | spawned as the pytest process's own uid with temp paths | per-pytest tempdir | Baseline regression check for the diff-the-outcomes runs; this mode is scheduled for removal once the cross-user harness is the verified default. |
 
 ### users.conf
 

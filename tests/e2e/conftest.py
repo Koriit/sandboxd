@@ -140,7 +140,7 @@ QEMU_BRIDGE_HELPER_PATHS = [
 BRIDGE_CONF_PATH = Path("/etc/qemu/bridge.conf")
 
 # ---------------------------------------------------------------------------
-# Cross-user harness selection (M18-S1)
+# Cross-user harness selection
 # ---------------------------------------------------------------------------
 #
 # Three harness modes, selected at session start by the ``SANDBOX_HARNESS``
@@ -801,8 +801,9 @@ class _SystemdDaemonHandle:
     matching test in ``test_lite.py`` swap the ``process`` entry for a
     fresh ``Popen`` mid-test; under the systemd harness those tests
     will need to be reworked to drive ``systemctl restart`` instead.
-    Out of scope for M18-S1 — see the Phase-1 acceptance set in the
-    spec; this shim documents the API delta so the rework is mechanical.
+    Out of scope for the cross-user harness rollout — see the Phase-1
+    acceptance set in the spec; this shim documents the API delta so
+    the rework is mechanical.
     """
 
     def __init__(self, service: str):
@@ -926,7 +927,7 @@ def _write_systemd_drop_in(
     # "Service has more than one ExecStart= setting".
     drop_in = textwrap.dedent(
         f"""\
-        # Managed by tests/e2e/conftest.py (M18-S1 cross-user harness).
+        # Managed by tests/e2e/conftest.py (cross-user harness).
         # Do not edit by hand — `make setup-dev-env` does not touch
         # this file, but every pytest session re-installs it.
         [Service]
@@ -1278,10 +1279,10 @@ def _launch_daemon_as_test_user(
 ) -> dict:
     """Legacy harness: launch the daemon as the test process's own user.
 
-    Identical to the pre-M18-S1 path. Retained for the diff-the-outcomes
-    baseline run; the cross-user Lima bug the spec is reproducing is
-    invisible under this harness because the daemon and the operator's
-    CLI share a uid.
+    Identical to the historical pre-cross-user-harness path. Retained
+    for the diff-the-outcomes baseline run; the cross-user Lima bug
+    the spec is reproducing is invisible under this harness because
+    the daemon and the operator's CLI share a uid.
     """
     socket_path = tmp_path / "sandboxd.sock"
     base_dir = tmp_path / "state"
@@ -1750,13 +1751,14 @@ def _ensure_base_image(sandbox_binaries: SandboxBinaries, sandbox_daemon):
         # Print so a developer running the suite sees what happened,
         # but do not fail. Lima-backed tests will fail naturally
         # downstream (either at create time for lack of a base image,
-        # or at ssh time for the cross-user bug under M18 — both are
-        # expected failure modes under the new harness).
+        # or at ssh time for the cross-user bug the new harness
+        # exists to expose — both are expected failure modes under
+        # the new harness).
         print(
             "[conftest] Lima base-image rebuild failed under "
             f"SANDBOX_HARNESS={SANDBOX_HARNESS!r}; continuing — Lima "
             "tests will fail downstream and that is the expected "
-            "outcome for the M18-S1 diff-the-outcomes run.\n"
+            "outcome for the diff-the-outcomes run.\n"
             f"stdout: {lima_result.stdout}\n"
             f"stderr: {lima_result.stderr}",
             file=sys.stderr,

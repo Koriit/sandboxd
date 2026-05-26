@@ -1494,9 +1494,9 @@ pub fn map_container_uid_gid(daemon_uid: u32, daemon_gid: u32) -> (u32, u32) {
 /// `daemon_uid` / `daemon_gid` are the host-side identifiers the
 /// container runs under — when the daemon runs as uid 1000 these
 /// match the in-image `sandbox` user trivially; when the daemon
-/// runs as a system uid (the common production case for the
-/// `sandbox` system user added in M18-S1) these are non-1000 and
-/// the synthetic `/etc/passwd` overlay is what lets sshd start.
+/// runs as a dedicated system uid (the common production case)
+/// these are non-1000 and the synthetic `/etc/passwd` overlay is
+/// what lets sshd start.
 ///
 /// **Trust-model note**: the per-session SSH key is stored plaintext
 /// in this staging directory because the directory lives under
@@ -2524,7 +2524,7 @@ mod tests {
     /// `build_ssh_mount_args` returns the expected three `--mount`
     /// pairs when `ssh_host_dir` is `Some`, and an empty vector
     /// otherwise. Pins the bind-mount destination paths (read by the
-    /// in-image sshd) against accidental drift; M18-S2's image and
+    /// in-image sshd) against accidental drift; the lite image and
     /// the daemon's runtime must agree on the same byte sequence.
     #[test]
     fn build_ssh_mount_args_emits_three_readonly_pairs() {
@@ -2685,7 +2685,7 @@ mod tests {
     /// the synthetic `/etc/passwd` overlay must still carry that uid
     /// (not the in-image 1000). Without this, OpenSSH's
     /// `getpwuid(geteuid())` would fail in the cross-user case the
-    /// M18 milestone exists to fix.
+    /// daemon-as-system-user design exists to fix.
     #[test]
     fn stage_ssh_credentials_threads_daemon_uid_into_passwd() {
         let tmp = tempfile::TempDir::new().expect("tempdir");

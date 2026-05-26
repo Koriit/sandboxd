@@ -551,9 +551,9 @@ enum Command {
     /// Hidden subcommand: `ProxyCommand` shim invoked by the daemon-
     /// emitted SSH config block.
     ///
-    /// The cross-user CLI access design (see the M18 milestone)
-    /// generates a `Host sandbox-<id>` block under `~/.ssh/sandbox/`
-    /// whose `ProxyCommand` line reads `sandbox proxy <id>`. The shim
+    /// The cross-user CLI access design generates a `Host
+    /// sandbox-<id>` block under `~/.ssh/sandbox/` whose
+    /// `ProxyCommand` line reads `sandbox proxy <id>`. The shim
     /// opens a WebSocket against the daemon's
     /// `GET /sessions/{id}/proxy` endpoint over the existing Unix-
     /// socket transport, then bidirectionally splices its own stdin
@@ -567,7 +567,7 @@ enum Command {
     /// wire break with the daemon-side template.
     ///
     /// Hidden because operators are not expected to invoke this
-    /// directly — `ssh sandbox-<id>` (or `sandbox ssh`, after M18-S6)
+    /// directly — `ssh sandbox-<id>` (or the `sandbox ssh` wrapper)
     /// is the user-facing surface.
     #[command(hide = true, name = "proxy")]
     Proxy {
@@ -4457,9 +4457,7 @@ async fn handle_sync(socket_path: &str, src: &str, dst: &str, rsync_args: &[Stri
 /// Direction of a `sandbox workspace` rsync mirror — local alias of
 /// [`sandbox_core::Direction`]. Push: host → guest. Pull: guest → host.
 ///
-/// The historical workspace planner (`plan_workspace_sync_argv`) lived
-/// alongside this alias until M18-S6 collapsed the backend dispatch
-/// into the SSH-alias path. The pure-function planner now lives in
+/// The pure-function planner lives in
 /// [`sandbox_cli::ssh_commands::plan_workspace_rsync_argv`] and is
 /// driven from `run_workspace_push_or_pull` below; this alias survives
 /// because the daemon-facing `WorkspaceOpDto` shape and the workspace-
@@ -6907,8 +6905,8 @@ mod tests {
     }
 
     #[test]
-    fn build_rm_request_returns_none_after_m18_s7() {
-        // M18-S7 intercepts `sandbox rm` in `main()` via `handle_rm`,
+    fn build_rm_request_returns_none_for_dispatch_bypass() {
+        // `sandbox rm` is intercepted in `main()` via `handle_rm`,
         // so the generic `build_request` pipeline never builds the
         // DELETE request itself. The two-step
         // resolve-then-DELETE-then-local-cleanup shape lives in
@@ -9654,7 +9652,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // The pre-M18-S6 `plan_ssh_command` / `plan_cp_command` /
+    // The historical `plan_ssh_command` / `plan_cp_command` /
     // `plan_sync_command` planners were backend-dispatching helpers
     // that emitted `limactl shell …` / `docker exec …` argvs. They
     // are replaced by the bare-`ssh`/`scp`/`rsync` planners in
@@ -9889,8 +9887,8 @@ mod tests {
         }
     }
 
-    /// `sandbox proxy` is hidden from `--help` per the M18-S5
-    /// milestone: operators are not the intended caller (the
+    /// `sandbox proxy` is hidden from `--help` by design:
+    /// operators are not the intended caller (the
     /// daemon-emitted SSH config block is). Verified by rendering the
     /// long help via clap and asserting the `proxy` token does not
     /// appear on a subcommand line. Renaming the flag or dropping
@@ -10163,7 +10161,7 @@ mod tests {
     // `sandbox_cli::ssh_commands::plan_workspace_rsync_argv` and is
     // covered by hermetic tests there (SSH-alias shape, dry-run
     // placement, src/dst swap on pull, --dest override, safe-links,
-    // no-gitignore, usage-error variants). The pre-M18-S6
+    // no-gitignore, usage-error variants). The historical
     // `plan_workspace_sync_argv` (with `limactl shell`/`docker exec
     // -i` per-backend transports) is gone — the daemon-mediated
     // proxy collapses every transport to bare `ssh sandbox-<id>:`.
@@ -10312,7 +10310,7 @@ mod tests {
         );
     }
 
-    // -- M18-S7 lifecycle hooks --------------------------------------------
+    // -- Lifecycle hooks ---------------------------------------------------
     //
     // Hermetic tests for the `sandbox rm` / `sandbox ls` cleanup hooks. The
     // `sandbox proxy` lazy-404 hook is tested separately in `proxy.rs`.

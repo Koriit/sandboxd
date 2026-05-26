@@ -1,11 +1,11 @@
-//! End-to-end integration test for the cross-user SSH proxy substrate
-//! delivered by M18-S3.
+//! End-to-end integration test for the cross-user SSH proxy
+//! substrate.
 //!
 //! Proves the load-bearing claim that decision (b) on todo #221 (the
 //! synthetic `/etc/passwd` overlay) is sufficient to let sshd start
 //! and accept the daemon-staged `authorized_keys` when the container
 //! runs under a daemon uid that is NOT the in-image `sandbox` user's
-//! uid (1000). Without this, the cross-user CLI access milestone
+//! uid (1000). Without this, the cross-user CLI access design
 //! never reaches the operator's `ssh` client — sshd fails on
 //! `getpwuid(geteuid())` and the lite-image's launch wrapper falls
 //! through to the legacy `docker exec`-based path.
@@ -37,11 +37,9 @@
 //! The dummy hostname in the `ssh` invocation is a syntactic
 //! placeholder; the `ProxyCommand` opens the real bytes pipe via
 //! `docker exec ... socat` — the same byte mover the daemon's
-//! WebSocket proxy (M18-S4) will adopt. The test does not depend on
-//! the WebSocket layer because it is not yet implemented; the
-//! `docker exec socat` substrate is the right shim to prove the
-//! per-session keypair contract independently of the WebSocket
-//! plumbing.
+//! WebSocket proxy adopts in production. The `docker exec socat`
+//! substrate is the right shim to prove the per-session keypair
+//! contract independently of the WebSocket plumbing.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -53,10 +51,10 @@ use sandbox_core::backend::{LITE_IMAGE_REPOSITORY, ensure_image, stage_ssh_crede
 
 // Non-1000 daemon uid used throughout the test — picked clear of any
 // real system uid range so a host-side collision with `useradd` is
-// vanishingly unlikely. Mirrors the production case the M18 milestone
-// exists to fix: when the daemon runs as the `sandbox` system user
-// (created by `setup-dev-env` with an arbitrary system uid), the
-// in-container effective uid is not 1000.
+// vanishingly unlikely. Mirrors the production case the cross-user
+// CLI access design exists to fix: when the daemon runs as the
+// `sandbox` system user (created by `setup-dev-env` with an arbitrary
+// system uid), the in-container effective uid is not 1000.
 const CROSS_USER_DAEMON_UID: u32 = 9876;
 const CROSS_USER_DAEMON_GID: u32 = 9876;
 
@@ -194,15 +192,16 @@ fn wait_for(container: &str, deadline: Duration, mut pred: impl FnMut(&str) -> b
 // Test
 // ---------------------------------------------------------------------------
 
-/// **The M18-S3 cross-user SSH proxy substrate proof.**
+/// **Cross-user SSH proxy substrate proof.**
 ///
 /// Stages a per-session keypair + synthetic `/etc/passwd` overlay,
 /// launches a container under `--user 9876:9876` (the non-1000
-/// cross-user case the milestone exists to fix), and authenticates an
+/// cross-user case the design exists to fix), and authenticates an
 /// outbound `ssh` against the in-container sshd via `docker exec
-/// socat` — the same byte mover M18-S4's WebSocket proxy will adopt.
+/// socat` — the same byte mover the daemon's WebSocket proxy uses.
 ///
-/// If this test passes, every load-bearing part of M18-S3 is wired:
+/// If this test passes, every load-bearing part of the keypair-
+/// injection substrate is wired:
 ///
 /// 1. `ssh-key`-based keypair generation produces an OpenSSH-format
 ///    public key that the in-image sshd accepts.
@@ -216,9 +215,9 @@ fn wait_for(container: &str, deadline: Duration, mut pred: impl FnMut(&str) -> b
 ///    resolves `getpwuid(9876)` so sshd starts at all.
 ///
 /// All four together are what the cross-user CLI proxy substrate
-/// promises; if the test passes the daemon-side WebSocket proxy
-/// (M18-S4) and the CLI-side `~/.ssh/sandbox/` module (M18-S5) can
-/// build on it without rediscovering this contract.
+/// promises; if the test passes the daemon-side WebSocket proxy and
+/// the CLI-side `~/.ssh/sandbox/` module can build on it without
+/// rediscovering this contract.
 #[test]
 fn integration_lite_image_sshd_accepts_staged_key_under_cross_user_uid() {
     ensure_sandbox_guest_in_exe_parent();

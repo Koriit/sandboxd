@@ -1,7 +1,7 @@
 //! Integration test: `sandbox sync` dispatches to `rsync -e ssh
 //! sandbox-<id>:…` via the daemon-mediated SSH proxy.
 //!
-//! Under M18-S6 the per-backend remote-shell selection
+//! Per-backend remote-shell selection
 //! (`limactl shell` / `docker exec -i`) is collapsed into the
 //! `sandbox-<id>` SSH alias the operator's `~/.ssh/config` (via our
 //! managed `Include` block) resolves through `ProxyCommand sandbox

@@ -1,8 +1,8 @@
 //! Integration test: `sandbox cp` dispatches to `scp sandbox-<id>:…`
 //! via the daemon-mediated SSH proxy.
 //!
-//! Under M18-S6, `sandbox cp` no longer reaches into the backend
-//! directly (`limactl cp` / `docker cp`); it ensures a per-session
+//! `sandbox cp` does not reach into the backend directly
+//! (`limactl cp` / `docker cp`); it ensures a per-session
 //! ssh-config entry under `~/.ssh/sandbox/`, then exec's `scp` against
 //! the alias `sandbox-<id>`. The operator's `~/.ssh/config` (via our
 //! managed `Include` block) resolves that alias to a stanza whose

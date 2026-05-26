@@ -1,10 +1,10 @@
-//! Integration test for M18-S4 — `GET /sessions/{id}/proxy` WebSocket
+//! Integration test for the `GET /sessions/{id}/proxy` WebSocket
 //! byte mover.
 //!
 //! The spec (`Phase 2 → step 4`) calls for a round-trip test that
 //! "opens a proxy connection and exchanges bytes through a stub-sshd
 //! inside the session." We satisfy that by reusing the same in-image
-//! sshd substrate the M18-S3 cross-user proof
+//! sshd substrate the cross-user proof
 //! (`sandbox-core::tests::integration_lite_image_sshd_cross_user`)
 //! already validates byte-for-byte, then layering the daemon's
 //! axum-served WebSocket proxy on top.
@@ -17,7 +17,7 @@
 //!    credential files (`authorized_keys` + synthetic `passwd` +
 //!    synthetic `group`) via `stage_ssh_credentials`. Container runs
 //!    under `--user 9876:9876` to exercise the cross-user path (the
-//!    whole reason the M18 milestone exists).
+//!    whole reason the cross-user CLI access design exists).
 //! 3. Launch the lite-image container under the production hardening
 //!    profile with the three SSH-credential bind-mounts.
 //! 4. Wait for sshd to bind `127.0.0.1:22` inside the container.
@@ -44,12 +44,13 @@
 //! WebSocket would require either a Rust SSH client library or
 //! spawning a real `ssh` client process whose stdio is bridged into
 //! the WebSocket. The first adds a dependency that has no other
-//! caller in the workspace; the second is what M18-S5's CLI shim does
+//! caller in the workspace; the second is what the CLI shim does
 //! and is the right home for an end-to-end test (out of scope here).
 //! The banner exchange exercises every byte-pump invariant this
-//! milestone owns: WebSocket upgrade, per-backend dispatch, async I/O
+//! handler owns: WebSocket upgrade, per-backend dispatch, async I/O
 //! carve-out, bidirectional byte transfer, and close-frame
-//! propagation. Anything that touches more belongs to M18-S5/S6.
+//! propagation. Anything that touches more belongs to the CLI
+//! integration tests.
 
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, Once};
@@ -71,17 +72,17 @@ use tokio_tungstenite::tungstenite::Message as ClientMessage;
 
 // Non-1000 daemon uid used throughout the test — picked clear of any
 // real system uid range so a host-side collision with `useradd` is
-// vanishingly unlikely. Mirrors the production case the M18 milestone
-// exists to fix: when the daemon runs as the `sandbox` system user
-// (created by `setup-dev-env` with an arbitrary system uid), the
-// in-container effective uid is not 1000.
+// vanishingly unlikely. Mirrors the production case the cross-user
+// CLI access design exists to fix: when the daemon runs as the
+// `sandbox` system user (created by `setup-dev-env` with an arbitrary
+// system uid), the in-container effective uid is not 1000.
 const CROSS_USER_DAEMON_UID: u32 = 9876;
 const CROSS_USER_DAEMON_GID: u32 = 9876;
 
 // ---------------------------------------------------------------------------
-// sandbox-guest staging — same one-time copy as the M18-S3 cross-user
-// test, so the lite Dockerfile's `COPY` of `sandbox-guest` resolves
-// under nextest's `target/<profile>/deps/` exe layout.
+// sandbox-guest staging — same one-time copy as the cross-user sshd
+// integration test, so the lite Dockerfile's `COPY` of `sandbox-guest`
+// resolves under nextest's `target/<profile>/deps/` exe layout.
 // ---------------------------------------------------------------------------
 
 static GUEST_STAGED: Once = Once::new();
@@ -127,7 +128,7 @@ fn ensure_sandbox_guest_in_exe_parent() {
 }
 
 // ---------------------------------------------------------------------------
-// Cleanup helpers — same RAII pattern as the M18-S3 cross-user test.
+// Cleanup helpers — same RAII pattern as the cross-user sshd test.
 // ---------------------------------------------------------------------------
 
 fn unique_label(label: &str) -> String {
@@ -265,7 +266,7 @@ fn wait_for_sshd_ready(container: &str, phase1: Duration, phase2: Duration) -> R
 /// We hand-inject a fixed operator name as a route extension instead
 /// of going through the real `PeerCredListener` peercred plumbing —
 /// that mechanism is exercised by `integration_owner_peercred.rs` and
-/// is not part of M18-S4's surface.
+/// is not part of this handler's surface.
 fn build_router(state: Arc<ProxyState>, operator_name: String) -> Router {
     Router::new()
         .route(
@@ -291,13 +292,13 @@ fn build_router(state: Arc<ProxyState>, operator_name: String) -> Router {
 // Test
 // ---------------------------------------------------------------------------
 
-/// **The M18-S4 proxy WebSocket round-trip proof.**
+/// **Proxy WebSocket round-trip proof.**
 ///
 /// Stages a per-session container running sshd, mounts the daemon's
 /// production `GET /sessions/{id}/proxy` handler behind an axum
 /// router, connects via `tokio-tungstenite`, and asserts the SSH
 /// server banner makes it back over the WebSocket — proving every
-/// byte-pump invariant the milestone owns (WebSocket upgrade,
+/// byte-pump invariant the handler owns (WebSocket upgrade,
 /// per-backend dispatch, async-I/O carve-out, bidirectional byte
 /// transfer, close-frame propagation).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
