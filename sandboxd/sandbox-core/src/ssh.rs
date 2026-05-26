@@ -34,7 +34,7 @@
 //! Both halves are serialised as OpenSSH-format strings — the same
 //! shape `~/.ssh/id_ed25519` / `~/.ssh/id_ed25519.pub` carry, so the
 //! CLI can write them out byte-for-byte into the per-session entry
-//! under `~/.ssh/sandbox/keys/<id>`. JSON envelope:
+//! at `~/.ssh/sandbox/sandbox-<id>.key`. JSON envelope:
 //!
 //! ```json
 //! { "public": "ssh-ed25519 AAAA... sandbox-<id>",
@@ -51,19 +51,21 @@ use crate::error::SandboxError;
 ///
 /// The comment is purely cosmetic — sshd does not consult it during
 /// authentication, but it gives operators a clue when they encounter a
-/// stray sandbox key in `~/.ssh/sandbox/keys/<id>`. The per-session
-/// `<id>` suffix is added by [`SshKeypair::generate`].
+/// stray sandbox key in `~/.ssh/sandbox/sandbox-<id>.key`. The
+/// per-session `<id>` suffix is added by [`SshKeypair::generate`].
 const SSH_KEY_COMMENT_PREFIX: &str = "sandbox";
 
 /// Placeholder rendered into the generated SSH config in place of the
 /// per-operator `IdentityFile` path. The CLI replaces this token with
-/// the absolute path of the on-disk key under
-/// `~/.ssh/sandbox/keys/<id>` when it writes the managed config block.
+/// the absolute path of the on-disk key at
+/// `~/.ssh/sandbox/sandbox-<id>.key` when it writes the managed
+/// config block.
 ///
-/// Pinned as a named constant so M18-S5's CLI consumer can match the
-/// exact token verbatim; renaming it without coordinating both ends
-/// is a wire break (the CLI scans the daemon-emitted block for the
-/// placeholder and silently no-ops if it disappears).
+/// Pinned as a named constant so the CLI's persistent ssh-config
+/// module can match the exact token verbatim; renaming it without
+/// coordinating both ends is a wire break (the CLI scans the
+/// daemon-emitted block for the placeholder and silently no-ops if
+/// it disappears).
 pub const SSH_CONFIG_IDENTITY_FILE_PLACEHOLDER: &str = "<CLI-rewrites-this>";
 
 /// Render the SSH client config block for the session `id`.
@@ -71,9 +73,10 @@ pub const SSH_CONFIG_IDENTITY_FILE_PLACEHOLDER: &str = "<CLI-rewrites-this>";
 /// Output is the multi-line template called out in the cross-user CLI
 /// access spec § Daemon API → `GET /sessions/{id}/ssh-config`. The
 /// shape is wire-format from this point on; every line is consumed by
-/// some downstream — the operator's `ssh` client, M18-S5's CLI module,
-/// the `Host sandbox-<id>` alias resolution path, etc. Rewording a
-/// directive or reordering the block is a wire break.
+/// some downstream — the operator's `ssh` client, the CLI's
+/// `ssh_config` module, the `Host sandbox-<id>` alias resolution
+/// path, etc. Rewording a directive or reordering the block is a
+/// wire break.
 ///
 /// `HostName 127.0.0.1` and `Port 22` are deliberately placeholder
 /// values — the actual connection is opened by the `ProxyCommand`
@@ -91,7 +94,7 @@ pub const SSH_CONFIG_IDENTITY_FILE_PLACEHOLDER: &str = "<CLI-rewrites-this>";
 pub fn render_ssh_config_block(session_id: &str) -> String {
     // Note: SSH config indentation is two spaces by convention; do not
     // change to tabs (the operator's `ssh` parses either, but the
-    // M18-S5 CLI tests pin this exact whitespace).
+    // CLI integration tests pin this exact whitespace).
     //
     // `id` is the inline-format binding for `session_id`; `ph` is the
     // local rename of `SSH_CONFIG_IDENTITY_FILE_PLACEHOLDER` so the
@@ -118,11 +121,11 @@ pub fn render_ssh_config_block(session_id: &str) -> String {
 /// column (V007 migration).
 ///
 /// Both fields are OpenSSH-format strings so the CLI can write them
-/// directly into the operator's `~/.ssh/sandbox/keys/<id>` area
-/// without re-encoding. The struct is `Clone` because the daemon
-/// commonly hands a copy to both the injection path (container
-/// backend) and the `ssh-config` response builder during the same
-/// session-create call.
+/// directly into the operator's per-session entry under
+/// `~/.ssh/sandbox/` without re-encoding. The struct is `Clone`
+/// because the daemon commonly hands a copy to both the injection
+/// path (container backend) and the `ssh-config` response builder
+/// during the same session-create call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshKeypair {
     /// OpenSSH-formatted public key — the exact bytes that go into
@@ -131,7 +134,7 @@ pub struct SshKeypair {
     pub public: String,
     /// OpenSSH-formatted private key (the PEM-style block starting
     /// with `-----BEGIN OPENSSH PRIVATE KEY-----`). Suitable for
-    /// dropping into `~/.ssh/sandbox/keys/<id>` with mode 0600.
+    /// dropping into `~/.ssh/sandbox/sandbox-<id>.key` with mode 0600.
     pub private: String,
 }
 

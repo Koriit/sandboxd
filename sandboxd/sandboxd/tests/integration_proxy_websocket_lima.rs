@@ -150,11 +150,7 @@ struct Daemon {
 }
 
 impl Daemon {
-    fn spawn_with_path_prefix(
-        tmp: TempDir,
-        base_dir: PathBuf,
-        path_prefix: &Path,
-    ) -> Self {
+    fn spawn_with_path_prefix(tmp: TempDir, base_dir: PathBuf, path_prefix: &Path) -> Self {
         let user = current_username();
         let socket = tmp.path().join("sandboxd.sock");
         let users_conf = write_users_conf(tmp.path(), &user);
@@ -290,7 +286,10 @@ async fn open_ws_via_unix_socket(
         .header(HeaderName::from_static("sec-websocket-key"), ws_key)
         .body(String::new())
         .expect("build upgrade request");
-    let resp = sender.send_request(req).await.expect("send upgrade request");
+    let resp = sender
+        .send_request(req)
+        .await
+        .expect("send upgrade request");
 
     let status = resp.status();
     if status != hyper::StatusCode::SWITCHING_PROTOCOLS {

@@ -449,10 +449,12 @@ pub struct WorkspaceLockAcquireResponse {
 /// Response body for `GET /sessions/{id}/ssh-config`.
 ///
 /// Carries the SSH client configuration block plus the private key
-/// for the calling operator to write into `~/.ssh/sandbox/keys/<id>`.
-/// Consumed by the `sandbox` CLI's `~/.ssh/sandbox/` management
-/// module on first command for a session (see the cross-user CLI
-/// access spec for the full operator flow).
+/// for the calling operator to stage under `~/.ssh/sandbox/` (the
+/// CLI's `ssh_config` module writes the per-session pair
+/// `sandbox-<id>` + `sandbox-<id>.key`). Consumed by the `sandbox`
+/// CLI's persistent SSH-config management module on the first
+/// SSH-shaped command for a session (see the cross-user CLI access
+/// spec for the full operator flow).
 ///
 /// **Dedicated DTO.** This is *not* a flattened serialisation of
 /// [`crate::ssh::SshKeypair`]: the wire carries a `private_key` field
@@ -462,7 +464,7 @@ pub struct WorkspaceLockAcquireResponse {
 /// per-endpoint pattern in this crate (see `SessionDto`,
 /// `PolicyDto`, etc.) and ensures a future shape change to the
 /// persisted [`crate::ssh::SshKeypair`] cannot silently break the
-/// `ssh-config` endpoint's contract with M18-S5's CLI consumer.
+/// `ssh-config` endpoint's contract with the CLI consumer.
 ///
 /// # Trust model (load-bearing)
 ///
@@ -476,18 +478,20 @@ pub struct WorkspaceLockAcquireResponse {
 /// spec's Alternatives section.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SshConfigDto {
-    /// SSH client configuration block. Multi-line text suitable for
-    /// inclusion under `~/.ssh/sandbox/config` between the marker
-    /// comments managed by the CLI. The `IdentityFile` line carries
-    /// a placeholder string the CLI rewrites to the per-session
-    /// key path before exec'ing `ssh`; the `HostName` / `Port` are
-    /// syntactic placeholders since the actual connection is opened
-    /// by the `ProxyCommand sandbox proxy <id>` shim.
+    /// SSH client configuration block. Multi-line text the CLI
+    /// writes to its per-session config file
+    /// `~/.ssh/sandbox/sandbox-<id>` (which the managed `Include`
+    /// block in `~/.ssh/config` then picks up via glob). The
+    /// `IdentityFile` line carries a placeholder string the CLI
+    /// rewrites to the per-session key path before exec'ing `ssh`;
+    /// the `HostName` / `Port` are syntactic placeholders since the
+    /// actual connection is opened by the `ProxyCommand sandbox
+    /// proxy <id>` shim.
     pub config: String,
     /// OpenSSH-format private key string. The CLI writes this to
-    /// `~/.ssh/sandbox/keys/<id>` with mode 0600 before invoking
-    /// `ssh`. For Lima sessions the daemon reads Lima's own per-VM
-    /// key on demand; for container sessions it returns the
+    /// `~/.ssh/sandbox/sandbox-<id>.key` with mode 0600 before
+    /// invoking `ssh`. For Lima sessions the daemon reads Lima's own
+    /// per-VM key on demand; for container sessions it returns the
     /// per-session keypair persisted in `sessions.ssh_keypair_json`.
     pub private_key: String,
 }

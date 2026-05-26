@@ -6494,12 +6494,16 @@ async fn get_ssh_config(
             None => {
                 // V007 forward-compat: pre-migration container rows
                 // carry `ssh_keypair = None`. The typed
-                // `SSH_NOT_AVAILABLE` token is the wire signal M18-S5
-                // matches on to render the operator-actionable
-                // "recreate this session" message.
+                // `SSH_NOT_AVAILABLE` `code` field is the wire signal
+                // the CLI matches on to render the operator-actionable
+                // "recreate this session" message. The `error` string
+                // carries the prefix verbatim for backward
+                // compatibility with consumers that predate the
+                // `code` field.
                 return (
                     StatusCode::NOT_FOUND,
-                    Json(sandbox_core::ApiError::new(
+                    Json(sandbox_core::ApiError::with_code(
+                        "SSH_NOT_AVAILABLE",
                         "SSH_NOT_AVAILABLE: this session pre-dates the per-session SSH \
                          keypair (V007). Recreate the session to enable cross-user SSH \
                          access: `sandbox rm <id> && sandbox create ...`",

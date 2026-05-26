@@ -9,14 +9,17 @@
 //! # Layout
 //!
 //! ```text
-//! ~/.ssh/                          # mode 0700 (created if absent)
+//! ~/.ssh/                          # mode 0700 (created if absent;
+//!                                  # never re-tightened on existing
+//!                                  # directories — we honour the
+//!                                  # operator's chosen mode).
 //!   config                         # mode 0600 (created if absent); the
 //!                                  # operator-owned ssh client config —
 //!                                  # we only insert a managed Include
 //!                                  # block at the top, never anywhere
 //!                                  # else.
 //!   sandbox/                       # mode 0700, owned end-to-end by us
-//!     sandbox-<id>                 # mode 0644: per-session OpenSSH
+//!     sandbox-<id>                 # mode 0600: per-session OpenSSH
 //!                                  # config block (`Host sandbox-<id>`
 //!                                  # …), `IdentityFile` rewritten to
 //!                                  # the on-disk key path.
@@ -60,15 +63,15 @@
 //! and commits via `persist`. A SIGKILL between `tempfile.write_all`
 //! and `tempfile.persist` leaves the original file untouched.
 //!
-//! # Reusability across M18-S6 / M18-S7
+//! # Reusability across the CLI's SSH-shaped commands and lifecycle hooks
 //!
-//! The five SSH-shaped commands the milestone rewrites
-//! (`sandbox ssh`, `cp`, `sync`, `workspace push`, `workspace pull`)
-//! all go through [`ensure_session_entry`] once per invocation; it
-//! takes the daemon's `SshConfigDto` and the session id, writes
-//! everything to disk, ensures the global `Include` block, and returns
-//! the alias name (`sandbox-<id>`) the caller passes to `ssh` / `scp` /
-//! `rsync`. The S7 lifecycle hooks use [`remove_session_entry`]
+//! The five SSH-shaped commands (`sandbox ssh`, `cp`, `sync`,
+//! `workspace push`, `workspace pull`) all go through
+//! [`ensure_session_entry`] once per invocation; it takes the
+//! daemon's `SshConfigDto` and the session id, writes everything to
+//! disk, ensures the global `Include` block, and returns the alias
+//! name (`sandbox-<id>`) the caller passes to `ssh` / `scp` /
+//! `rsync`. The lifecycle hooks use [`remove_session_entry`]
 //! (`sandbox rm` and `sandbox proxy` lazy-404),
 //! [`reconcile_against_list`] (`sandbox ls`), and
 //! [`query_existing`] (the proxy shim's quick "do I have a stale
@@ -126,9 +129,17 @@ pub const INCLUDE_MARKER_END: &str = "# <<< sandbox CLI managed <<<";
 pub const INCLUDE_LINE: &str = "Include ~/.ssh/sandbox/sandbox-*[!y]";
 
 // File mode bits.
+//
+// Spec § Architecture → CLI: persistent ssh-config is explicit that
+// `~/.ssh/sandbox/config` is mode 0600. The implementation switched
+// to per-session files (`sandbox-<id>` / `sandbox-<id>.key`) but the
+// mode contract carries forward: every artefact under `~/.ssh/sandbox/`
+// other than the sockets dir is 0600. The parent dir's 0700 mode
+// means no bytes are exposed in practice, but the per-file mode is
+// the explicit contract.
 const MODE_DIR_PRIVATE: u32 = 0o700;
 const MODE_FILE_KEY: u32 = 0o600;
-const MODE_FILE_CONFIG: u32 = 0o644;
+const MODE_FILE_CONFIG: u32 = 0o600;
 const MODE_FILE_SSH_CONFIG: u32 = 0o600;
 const MODE_FILE_LOCK: u32 = 0o600;
 
@@ -262,19 +273,24 @@ pub fn resolve_home() -> Result<PathBuf, SshConfigError> {
 // Directory + lock setup
 // ---------------------------------------------------------------------------
 
-/// Ensure `~/.ssh/` exists with mode 0700.
+/// Ensure `~/.ssh/` exists. If we create it, set mode 0700; if it
+/// already exists, honour the operator's chosen mode — the spec only
+/// authorises us to set the mode at creation time, never to silently
+/// tighten an existing directory's perms.
 fn ensure_ssh_dir(home: &Path) -> Result<PathBuf, SshConfigError> {
     let dir = ssh_dir(home);
-    create_dir_if_missing(&dir, MODE_DIR_PRIVATE)?;
+    create_dir_only_if_missing(&dir, MODE_DIR_PRIVATE)?;
     Ok(dir)
 }
 
-/// Ensure `~/.ssh/sandbox/` exists with mode 0700. Also ensures
-/// `~/.ssh/` exists first.
+/// Ensure `~/.ssh/sandbox/` exists with mode 0700. We own this
+/// directory end-to-end, so the always-tighten behaviour is correct
+/// here (an external process re-chmod-ing it would be a bug we want
+/// to recover from).
 fn ensure_sandbox_dir(home: &Path) -> Result<PathBuf, SshConfigError> {
     ensure_ssh_dir(home)?;
     let dir = sandbox_dir(home);
-    create_dir_if_missing(&dir, MODE_DIR_PRIVATE)?;
+    create_or_retighten_dir(&dir, MODE_DIR_PRIVATE)?;
     Ok(dir)
 }
 
@@ -288,22 +304,40 @@ fn ensure_sandbox_dir(home: &Path) -> Result<PathBuf, SshConfigError> {
 fn ensure_sockets_dir(home: &Path) -> Result<PathBuf, SshConfigError> {
     ensure_sandbox_dir(home)?;
     let dir = sockets_dir(home);
-    create_dir_if_missing(&dir, MODE_DIR_PRIVATE)?;
+    create_or_retighten_dir(&dir, MODE_DIR_PRIVATE)?;
     Ok(dir)
 }
 
-/// `mkdir -p` for a single level: create `path` if missing; if present,
-/// tighten the mode bits to `mode` (so a previous 0755 directory is
-/// brought down to 0700 the first time we touch it). On the create
-/// branch we set the mode via `DirBuilder` so we never momentarily
-/// expose a wider-than-intended view of the directory.
-fn create_dir_if_missing(path: &Path, mode: u32) -> Result<(), SshConfigError> {
+/// `mkdir -p` for a single level — for directories we own end-to-end
+/// (`~/.ssh/sandbox/` and `~/.ssh/sandbox/sockets/`): create with the
+/// given mode if missing; re-tighten an existing directory's mode to
+/// the same value (so a previous 0755 directory we own is brought
+/// down to 0700 the first time we touch it).
+fn create_or_retighten_dir(path: &Path, mode: u32) -> Result<(), SshConfigError> {
     use std::fs::DirBuilder;
     if path.exists() {
-        // Re-tighten mode in case the directory was created earlier
-        // with a wider umask.
         let perm = Permissions::from_mode(mode);
         std::fs::set_permissions(path, perm).map_err(|e| SshConfigError::io("chmod", path, e))?;
+        return Ok(());
+    }
+    let mut builder = DirBuilder::new();
+    builder.mode(mode);
+    builder
+        .create(path)
+        .map_err(|e| SshConfigError::io("mkdir", path, e))?;
+    Ok(())
+}
+
+/// `mkdir -p` for a single level — for directories owned by the
+/// operator that we only auto-create as a courtesy (`~/.ssh/`
+/// itself). If the directory does not exist, create it with `mode`.
+/// If it already exists, do nothing — never silently tighten an
+/// operator-owned directory's mode (an operator who deliberately set
+/// `~/.ssh/` to 0755 on a multi-user box should not be surprised by
+/// the CLI flipping it back on every invocation).
+fn create_dir_only_if_missing(path: &Path, mode: u32) -> Result<(), SshConfigError> {
+    use std::fs::DirBuilder;
+    if path.exists() {
         return Ok(());
     }
     let mut builder = DirBuilder::new();
@@ -639,7 +673,7 @@ fn unlink_if_present(path: &Path) -> Result<(), SshConfigError> {
     }
 }
 
-/// Check whether a per-session entry exists for `id`. M18-S7's
+/// Check whether a per-session entry exists for `id`. The
 /// `sandbox proxy` lazy-404 path uses this to skip an unnecessary
 /// flock-and-unlink round when there is nothing to clean up.
 pub fn query_existing(home: &Path, id: &str) -> Result<bool, SshConfigError> {
@@ -658,7 +692,7 @@ pub fn query_existing(home: &Path, id: &str) -> Result<bool, SshConfigError> {
 /// that were removed, ordered as discovered on disk. Acquires the
 /// flock so a concurrent `sandbox ssh` cannot race entry removal.
 ///
-/// Used by M18-S7's `sandbox ls` opportunistic reconcile pass.
+/// Used by the `sandbox ls` opportunistic reconcile pass.
 pub fn reconcile_against_list(
     home: &Path,
     live_ids: &[&str],
@@ -1247,9 +1281,9 @@ mod tests {
 
     /// The alias the CLI returns from [`ensure_session_entry`] must
     /// match the `Host sandbox-<id>` line in the daemon-emitted
-    /// config block. Pins the contract M18-S6's command wrappers
-    /// depend on: the returned string is the literal argument to pass
-    /// to `ssh` / `scp` / `rsync`.
+    /// config block. Pins the contract the SSH-shaped command
+    /// wrappers depend on: the returned string is the literal
+    /// argument to pass to `ssh` / `scp` / `rsync`.
     #[test]
     fn ssh_alias_for_matches_daemon_emitted_host_line() {
         let id = "0123456789ab";

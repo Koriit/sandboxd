@@ -543,6 +543,13 @@ pub fn build_ssh_config_request(id: &str) -> hyper::Request<String> {
 /// Translate an HTTP response from `GET /sessions/{id}/ssh-config`
 /// into either a parsed DTO or an operator-facing error message.
 /// Pure helper so the dispatch sites stay terse.
+///
+/// On a 404 with a typed `code: "SSH_NOT_AVAILABLE"` field, the
+/// daemon is signalling a pre-V007 container session — the CLI
+/// surfaces the operator-actionable "recreate the session"
+/// remediation. We match on the typed `code` field rather than the
+/// `error` string so a daemon-side rewording of the message text
+/// does not silently break the boundary.
 pub fn parse_ssh_config_response(
     status: hyper::StatusCode,
     body: &str,
@@ -553,13 +560,20 @@ pub fn parse_ssh_config_response(
         return serde_json::from_str(body)
             .map_err(|e| DriftRecoveryError::FetchDto(format!("parse ssh-config response: {e}")));
     }
-    // The daemon's typed error envelope carries the operator-actionable
-    // string; on 404 the `SSH_NOT_AVAILABLE` token signals a pre-V007
-    // container session that needs to be recreated.
-    let detail = match serde_json::from_str::<sandbox_core::ApiError>(body) {
-        Ok(api_err) => api_err.error,
-        Err(_) => format!("HTTP {status}: {body}"),
-    };
+    let api_err = serde_json::from_str::<sandbox_core::ApiError>(body).ok();
+    let typed_code = api_err.as_ref().and_then(|e| e.code.as_deref());
+    let detail = api_err
+        .as_ref()
+        .map(|e| e.error.clone())
+        .unwrap_or_else(|| format!("HTTP {status}: {body}"));
+    if status == hyper::StatusCode::NOT_FOUND && typed_code == Some("SSH_NOT_AVAILABLE") {
+        return Err(DriftRecoveryError::FetchDto(format!(
+            "GET /sessions/{id}/ssh-config (via {socket}): session pre-dates the \
+             per-session SSH keypair; recreate the session to enable cross-user SSH \
+             access (`sandbox rm {id} && sandbox create ...`). Daemon detail: {detail}",
+            socket = socket_path.display(),
+        )));
+    }
     Err(DriftRecoveryError::FetchDto(format!(
         "GET /sessions/{id}/ssh-config (via {socket}) failed: {detail}",
         socket = socket_path.display(),
@@ -617,15 +631,35 @@ mod tests {
         // The whole point of the rewrite is that there is no
         // `limactl`/`docker exec` dispatch any more — the operator's
         // SSH client reaches a single daemon-mediated endpoint via
-        // the `Host sandbox-<id>` config block. Pin that nothing
-        // backend-specific leaks into the planner output.
+        // the `Host sandbox-<id>` config block. Pin that the
+        // *program* is `ssh` and the *first positional argument* is
+        // the alias — a refactor that inserted a backend-specific
+        // wrapper (e.g. `limactl shell` between the program and the
+        // alias) would shift the positional, failing this assertion
+        // shape without false positives on operator-supplied
+        // arguments that happen to contain substrings like `exec`.
         let (program, args) = plan_ssh_argv(&alias(), &[]);
-        assert_ne!(program, "limactl");
-        assert_ne!(program, "docker");
-        for arg in &args {
-            assert!(!arg.contains("shell"));
-            assert!(!arg.contains("exec"));
-            assert!(!arg.contains("-it"));
+        assert_eq!(program, "ssh", "SSH planner must shell out to bare `ssh`");
+        assert_eq!(
+            args.first().map(String::as_str),
+            Some(alias().as_str()),
+            "first positional argument must be the alias; got: {args:?}",
+        );
+        // The whole-list "no backend-specific tokens" check stays —
+        // it catches a regression that pre-pended `--remote-shell`
+        // or similar — but is now scoped to argv slots before the
+        // `--` separator (where the operator's user-supplied
+        // command begins).
+        let pre_separator: Vec<&String> = args.iter().take_while(|a| a.as_str() != "--").collect();
+        for arg in pre_separator {
+            assert!(
+                !arg.contains("limactl"),
+                "no limactl token in pre-separator argv: {args:?}",
+            );
+            assert!(
+                !arg.contains("docker"),
+                "no docker token in pre-separator argv: {args:?}",
+            );
         }
     }
 
@@ -1182,5 +1216,89 @@ mod tests {
 
         assert!(matches!(err, DriftRecoveryError::FetchDto(_)));
         assert_eq!(attempt_calls.load(Ordering::SeqCst), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_ssh_config_response — wire-shape boundary
+    // -----------------------------------------------------------------------
+
+    /// On a 404 carrying the typed `code: SSH_NOT_AVAILABLE`, the
+    /// CLI must render the operator-actionable "recreate the
+    /// session" remediation. We match on the typed `code` field
+    /// rather than substring-sniffing the `error` text so a
+    /// daemon-side rewording cannot silently break the boundary.
+    #[test]
+    fn parse_ssh_config_response_404_with_typed_code_surfaces_recreate_remediation() {
+        let body = r#"{"error":"SSH_NOT_AVAILABLE: detail unused by the match","code":"SSH_NOT_AVAILABLE"}"#;
+        let id = "0123456789ab";
+        let err = parse_ssh_config_response(
+            hyper::StatusCode::NOT_FOUND,
+            body,
+            std::path::Path::new("/run/sandboxd.sock"),
+            id,
+        )
+        .expect_err("404 with SSH_NOT_AVAILABLE must surface as DriftRecoveryError::FetchDto");
+        let msg = match err {
+            DriftRecoveryError::FetchDto(m) => m,
+            other => panic!("unexpected error variant: {other:?}"),
+        };
+        assert!(
+            msg.contains("recreate the session"),
+            "operator-actionable remediation must appear in the rendered error; got: {msg}",
+        );
+        assert!(
+            msg.contains(id),
+            "rendered error must include the session id so the operator can act; got: {msg}",
+        );
+    }
+
+    /// On a 404 *without* the typed code, the CLI falls back to the
+    /// generic "GET /sessions/{id}/ssh-config failed" message. Pins
+    /// the boundary so a daemon that emits a 404 for some unrelated
+    /// reason (e.g. foreign-owner) is not mis-rendered as the
+    /// SSH_NOT_AVAILABLE remediation.
+    #[test]
+    fn parse_ssh_config_response_404_without_typed_code_falls_through_to_generic() {
+        let body = r#"{"error":"session not found: deadbeefcafe"}"#;
+        let id = "deadbeefcafe";
+        let err = parse_ssh_config_response(
+            hyper::StatusCode::NOT_FOUND,
+            body,
+            std::path::Path::new("/run/sandboxd.sock"),
+            id,
+        )
+        .expect_err("404 must surface as DriftRecoveryError::FetchDto");
+        let msg = match err {
+            DriftRecoveryError::FetchDto(m) => m,
+            other => panic!("unexpected error variant: {other:?}"),
+        };
+        assert!(
+            !msg.contains("recreate the session"),
+            "untyped 404 must NOT trigger the SSH_NOT_AVAILABLE branch; got: {msg}",
+        );
+        assert!(
+            msg.contains("session not found"),
+            "fallback path must preserve the daemon's error text; got: {msg}",
+        );
+    }
+
+    /// 5xx errors fall through to the generic message regardless of
+    /// the `code` field — the typed-code branch is 404-specific.
+    #[test]
+    fn parse_ssh_config_response_5xx_falls_through_to_generic() {
+        let body = r#"{"error":"db lost"}"#;
+        let err = parse_ssh_config_response(
+            hyper::StatusCode::INTERNAL_SERVER_ERROR,
+            body,
+            std::path::Path::new("/run/sandboxd.sock"),
+            "0123456789ab",
+        )
+        .expect_err("5xx must surface as DriftRecoveryError::FetchDto");
+        let msg = match err {
+            DriftRecoveryError::FetchDto(m) => m,
+            other => panic!("unexpected error variant: {other:?}"),
+        };
+        assert!(msg.contains("db lost"));
+        assert!(!msg.contains("recreate"));
     }
 }

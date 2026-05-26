@@ -129,14 +129,46 @@ impl From<UsersConfigError> for SandboxError {
 }
 
 /// API error response body returned by the daemon.
+///
+/// `error` is the human-readable operator-facing message and is the
+/// historical wire shape every error response carries. `code` is an
+/// optional machine-readable token the daemon attaches when a CLI
+/// consumer needs to branch on the error class rather than parse the
+/// `error` string. Today only `SSH_NOT_AVAILABLE` is emitted (the
+/// pre-V007 container-session 404 branch on
+/// `GET /sessions/{id}/ssh-config`); more codes may be added without
+/// breaking the wire (consumers that ignore the field continue to
+/// see the same `error` text they did before the field existed).
+///
+/// `code` is `#[serde(default, skip_serializing_if = "Option::is_none")]`
+/// so an older daemon that has not learned the field still
+/// deserialises a response from a newer one, and a newer daemon
+/// omits the field entirely when no code applies — preserving
+/// byte-for-byte compatibility with the historical wire shape on
+/// error responses that have no typed code.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ApiError {
     pub error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
 }
 
 impl ApiError {
     pub fn new(msg: impl Into<String>) -> Self {
-        Self { error: msg.into() }
+        Self {
+            error: msg.into(),
+            code: None,
+        }
+    }
+
+    /// Construct an `ApiError` with both the human-readable message
+    /// and a machine-readable code. CLI consumers branch on the
+    /// `code` field rather than substring-matching the `error`.
+    pub fn with_code(code: impl Into<String>, msg: impl Into<String>) -> Self {
+        Self {
+            error: msg.into(),
+            code: Some(code.into()),
+        }
     }
 }
 
@@ -198,10 +230,44 @@ mod tests {
     fn api_error_serialization() {
         let api_err = ApiError::new("test error");
         let json = serde_json::to_string(&api_err).unwrap();
+        // Backward-compat pin: `code` is absent by default and
+        // `skip_serializing_if = Option::is_none` keeps the wire
+        // shape byte-for-byte identical to the pre-`code`-field
+        // shape so older CLIs do not see a new key they cannot decode.
         assert_eq!(json, r#"{"error":"test error"}"#);
 
         let deserialized: ApiError = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.error, "test error");
+        assert!(deserialized.code.is_none(), "code must default to None");
+    }
+
+    #[test]
+    fn api_error_with_code_serializes_and_round_trips() {
+        let api_err = ApiError::with_code("SSH_NOT_AVAILABLE", "recreate the session");
+        assert_eq!(api_err.error, "recreate the session");
+        assert_eq!(api_err.code.as_deref(), Some("SSH_NOT_AVAILABLE"));
+
+        let json = serde_json::to_string(&api_err).unwrap();
+        // Field order is `error` before `code` per the struct definition.
+        assert_eq!(
+            json,
+            r#"{"error":"recreate the session","code":"SSH_NOT_AVAILABLE"}"#,
+        );
+
+        let deserialized: ApiError = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.error, "recreate the session");
+        assert_eq!(deserialized.code.as_deref(), Some("SSH_NOT_AVAILABLE"));
+    }
+
+    #[test]
+    fn api_error_deserializes_legacy_body_without_code_field() {
+        // Forward-compat: a body emitted by a pre-`code`-field daemon
+        // must still deserialise. Pinning `#[serde(default)]` on the
+        // `code` field is the load-bearing knob here.
+        let legacy = r#"{"error":"some failure"}"#;
+        let deserialized: ApiError = serde_json::from_str(legacy).unwrap();
+        assert_eq!(deserialized.error, "some failure");
+        assert!(deserialized.code.is_none());
     }
 
     #[test]

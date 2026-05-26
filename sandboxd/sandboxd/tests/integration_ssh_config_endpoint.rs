@@ -91,11 +91,7 @@ impl Daemon {
     /// `extra_env` lets the Lima test pin `HOME` to the tempdir so
     /// the handler's `~/.lima/_config/user` read lands inside the
     /// test's sandbox.
-    fn spawn_with_env(
-        tmp: TempDir,
-        base_dir: PathBuf,
-        extra_env: &[(&str, &Path)],
-    ) -> Self {
+    fn spawn_with_env(tmp: TempDir, base_dir: PathBuf, extra_env: &[(&str, &Path)]) -> Self {
         let user = current_username();
         let socket = tmp.path().join("sandboxd.sock");
         let users_conf = write_users_conf(tmp.path(), &user);
@@ -223,8 +219,7 @@ fn assert_private_key_parses_via_ssh_keygen(private_key: &str) {
             .mode(0o600)
             .open(&path)
             .expect("create keyfile");
-        f.write_all(private_key.as_bytes())
-            .expect("write keyfile");
+        f.write_all(private_key.as_bytes()).expect("write keyfile");
     }
     let out = Command::new("ssh-keygen")
         .args(["-y", "-f"])
@@ -339,8 +334,8 @@ async fn integration_get_ssh_config_container_backend() {
             )
             .expect("create container session row");
         let id = session.id;
-        let kp = SshKeypair::generate("integration_ssh_config_container")
-            .expect("keypair generation");
+        let kp =
+            SshKeypair::generate("integration_ssh_config_container").expect("keypair generation");
         store
             .set_ssh_keypair(&id, &owner, &kp)
             .expect("persist ssh_keypair");
@@ -421,11 +416,7 @@ async fn integration_get_ssh_config_lima_backend() {
         session.id.to_string()
     };
 
-    let daemon = Daemon::spawn_with_env(
-        tmp,
-        base_dir,
-        &[("HOME", lima_home.as_path())],
-    );
+    let daemon = Daemon::spawn_with_env(tmp, base_dir, &[("HOME", lima_home.as_path())]);
     let path = format!("/sessions/{session_id_str}/ssh-config");
     let (status, body) = http_get(&daemon.socket, &path, Duration::from_secs(15)).await;
     assert_eq!(
@@ -494,9 +485,20 @@ async fn integration_get_ssh_config_container_returns_404_when_keypair_absent() 
         String::from_utf8_lossy(&body),
     );
     let body_text = String::from_utf8_lossy(&body);
+    let api_err: sandbox_core::ApiError = serde_json::from_slice(&body)
+        .unwrap_or_else(|e| panic!("decode ApiError from 404 body: {e}; body={body_text}"));
+    // Typed-code field pin — this is what the CLI matches on.
+    assert_eq!(
+        api_err.code.as_deref(),
+        Some("SSH_NOT_AVAILABLE"),
+        "404 body must carry the typed `code` field set to SSH_NOT_AVAILABLE; got: {api_err:?}",
+    );
+    // Backward-compat prefix pin — the legacy substring stays in the
+    // `error` string so consumers that predate the typed `code` field
+    // still see the same operator-facing token they did before.
     assert!(
-        body_text.contains("SSH_NOT_AVAILABLE"),
-        "404 body must carry the typed `SSH_NOT_AVAILABLE` token so the CLI \
-         can render the recreate-the-session diagnostic; got: {body_text}"
+        api_err.error.starts_with("SSH_NOT_AVAILABLE:"),
+        "legacy SSH_NOT_AVAILABLE prefix must remain in the `error` string \
+         for backward-compat with consumers that predate the typed code; got: {api_err:?}",
     );
 }

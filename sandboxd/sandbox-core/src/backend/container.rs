@@ -2619,8 +2619,31 @@ mod tests {
             meta.permissions().mode() & 0o777
         );
 
+        // Per-file mode pins: the rustdoc on `stage_ssh_credentials`
+        // explicitly calls these out as 0644 (sshd's `StrictModes` is
+        // disabled on the in-image sshd_config so 0644 is acceptable;
+        // we pin the value here so a future umask-driven regression
+        // can be caught hermetically).
+        let ak_path = dir.join("authorized_keys");
+        let passwd_path = dir.join("passwd");
+        let group_path = dir.join("group");
+        for path in [&ak_path, &passwd_path, &group_path] {
+            let mode = std::fs::metadata(path)
+                .expect("stat file")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode,
+                0o644,
+                "{} must be mode 0644 (the contract `stage_ssh_credentials`'s \
+                 rustdoc pins); got {mode:o}",
+                path.display(),
+            );
+        }
+
         // authorized_keys: ssh-ed25519 line, single line, ends in newline.
-        let ak = std::fs::read_to_string(dir.join("authorized_keys")).expect("read ak");
+        let ak = std::fs::read_to_string(&ak_path).expect("read ak");
         assert!(ak.starts_with("ssh-ed25519 "), "got: {ak}");
         assert!(ak.ends_with('\n'), "must end in newline");
         assert_eq!(
@@ -2628,10 +2651,19 @@ mod tests {
             1,
             "authorized_keys must be a single line; got {ak:?}"
         );
+        // Byte-equality pin against the keypair we passed in. Without
+        // this, a future refactor that wrote *some* ed25519 pubkey
+        // (or shuffled keypair↔session mappings) would still pass
+        // every other assertion in this test.
+        assert_eq!(
+            ak.trim_end(),
+            kp.public.trim_end(),
+            "authorized_keys must carry the exact public-key bytes from the keypair argument",
+        );
 
         // /etc/passwd overlay: maps the supplied uid to `sandbox` at
         // /home/sandbox + /bin/bash.
-        let passwd = std::fs::read_to_string(dir.join("passwd")).expect("read passwd");
+        let passwd = std::fs::read_to_string(&passwd_path).expect("read passwd");
         assert!(
             passwd.contains("sandbox:x:1500:1500:"),
             "passwd must map the supplied uid/gid to sandbox; got {passwd:?}"
@@ -2642,7 +2674,7 @@ mod tests {
         );
 
         // /etc/group overlay: matching one-entry group file.
-        let group = std::fs::read_to_string(dir.join("group")).expect("read group");
+        let group = std::fs::read_to_string(&group_path).expect("read group");
         assert!(
             group.contains("sandbox:x:1500:"),
             "group must map the supplied gid to sandbox; got {group:?}"
@@ -2699,10 +2731,12 @@ mod tests {
         );
 
         // The three SSH mounts appear as adjacent `--mount` / spec
-        // pairs. We just check the three dst paths are present
-        // somewhere in the argv — order across the three pairs is
-        // documented in `build_ssh_mount_args`, but we don't pin it
-        // here because the assertion above already covers it.
+        // pairs (docker's CLI grammar requires each `--mount` to be
+        // immediately followed by its spec). Pin the adjacency per-
+        // mount so a future refactor that interleaved the SSH mounts
+        // with the workspace mount / env vars cannot pass silently
+        // by sneaking each `dst=...` into a string that no longer
+        // sits next to a `--mount` flag.
         for dst in [
             "dst=/run/sandbox/authorized_keys",
             "dst=/etc/passwd",
@@ -2711,6 +2745,14 @@ mod tests {
             assert!(
                 args.iter().any(|a| a.contains(dst)),
                 "missing SSH bind-mount with {dst} in argv: {args:?}"
+            );
+            // The `--mount` flag must be the IMMEDIATELY preceding
+            // arg — `args.windows(2)` of `["--mount", "<spec>"]`
+            // pairs.
+            assert!(
+                args.windows(2)
+                    .any(|w| w[0] == "--mount" && w[1].contains(dst)),
+                "{dst} must sit immediately after a `--mount` flag in argv: {args:?}",
             );
         }
 
