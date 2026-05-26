@@ -32,9 +32,17 @@ const INSTALL_GUEST_AGENT_STEP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Timeout for `limactl list`.
 const LIST_VMS_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Timeout for `limactl create` when building the base image (longer than
-/// per-session create because this is a one-time operation).
-const BASE_CREATE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Timeout for `limactl create` when building the base image. The base
+/// image build path downloads the Ubuntu 24.04 cloud-image qcow2
+/// (`ubuntu-24.04-server-cloudimg-amd64.img`, ~580 MiB) on first use,
+/// which on a typical 5-10 MB/s mirror takes 60-120 s on its own — so
+/// the previous 120 s budget was a near-zero-margin race on fast hosts
+/// and a guaranteed timeout on slower ones. 300 s accommodates a 5 MB/s
+/// floor with headroom for the post-download `limactl create` work
+/// (qcow2 cloning, cloud-config generation). This is still a one-time
+/// cost amortized over every subsequent session against the cached
+/// base image.
+const BASE_CREATE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Timeout for `limactl start` when booting the base image (cloud-init
 /// provisioning runs on first boot: installs socat, git, Docker via
