@@ -182,9 +182,32 @@ enum Command {
         session: String,
     },
     /// List sandbox sessions.
-    Ps,
+    Ps {
+        /// Skip the opportunistic reconcile pass against
+        /// `~/.ssh/sandbox/` after rendering the listing.
+        ///
+        /// By default `sandbox ps` / `sandbox ls` remove local
+        /// per-session SSH config + key files whose ids the daemon no
+        /// longer knows about (Spec § Architecture → CLI: persistent
+        /// ssh-config → Reconcile on listing). Tooling consumers that
+        /// need strict read-only semantics — e.g. machine-readable JSON
+        /// pipelines, or scripts that intentionally inspect stale
+        /// entries — opt out with this flag. The reconcile is also
+        /// skipped automatically when the daemon is unreachable (no
+        /// regression in error mode); this flag covers the
+        /// daemon-reachable case.
+        #[arg(long = "no-reconcile")]
+        no_reconcile: bool,
+    },
     /// List sandbox sessions (alias for ps).
-    Ls,
+    Ls {
+        /// Skip the opportunistic reconcile pass against
+        /// `~/.ssh/sandbox/` after rendering the listing.
+        ///
+        /// See `sandbox ps --help` for the full reconcile semantics.
+        #[arg(long = "no-reconcile")]
+        no_reconcile: bool,
+    },
     /// Copy files between host and sandbox VM.
     ///
     /// Use session:path syntax to specify the remote side:
@@ -1183,12 +1206,17 @@ fn build_request(command: &Command) -> Option<Request<String>> {
             .uri(format!("/sessions/{session}/stop"))
             .body(String::new())
             .expect("failed to build request"),
-        Command::Rm { session } => Request::builder()
-            .method("DELETE")
-            .uri(format!("/sessions/{session}"))
-            .body(String::new())
-            .expect("failed to build request"),
-        Command::Ps | Command::Ls => Request::builder()
+        // `sandbox rm` is intercepted in `main()` (see `handle_rm`)
+        // before `build_request` is reached: it does a name→id
+        // resolve, then a `DELETE /sessions/{id}`, then the local
+        // `~/.ssh/sandbox/sandbox-<id>{,.key}` cleanup. The two-step
+        // shape does not fit the single-request `build_request` /
+        // `send_request` pipeline, so this arm returns `None`
+        // defensively — a future caller that forgets the dispatch
+        // bypass surfaces the "unhandled command" error instead of
+        // silently issuing a DELETE that skips the cleanup hook.
+        Command::Rm { .. } => return None,
+        Command::Ps { .. } | Command::Ls { .. } => Request::builder()
             .method("GET")
             .uri("/sessions")
             .body(String::new())
@@ -1802,14 +1830,30 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
     }
 
     match command {
-        Command::Ps | Command::Ls => {
+        Command::Ps { no_reconcile } | Command::Ls { no_reconcile } => {
             let sessions: Vec<SessionDto> =
                 serde_json::from_str(body).map_err(|e| format!("failed to parse response: {e}"))?;
             display_sessions_table(&sessions);
+            // Opportunistic reconcile of `~/.ssh/sandbox/` against the
+            // authoritative session list we just rendered (Spec §
+            // Architecture → CLI: persistent ssh-config → Reconcile on
+            // listing). Only fires on the full-list listing — never on
+            // `inspect`/`describe` single-id queries — and is guarded
+            // by `--no-reconcile` for tooling consumers that need
+            // strict read-only semantics. The daemon-unreachable case
+            // is silently skipped because we never reach this arm
+            // without a successful list response.
+            if !*no_reconcile {
+                reconcile_ssh_sandbox_dir_silent(&sessions);
+            }
         }
         Command::Rm { .. } => {
-            // 204 No Content -- nothing to print.
-            println!("Session removed.");
+            // `sandbox rm` is intercepted in `main()` (see
+            // `handle_rm`); the two-step
+            // resolve-then-DELETE-then-local-cleanup shape never
+            // reaches the generic response handler. Reaching this
+            // arm is a dispatch bug.
+            unreachable!("`sandbox rm` is handled client-side in main() before send_request");
         }
         Command::Create { .. } => {
             let session: SessionDto =
@@ -2991,6 +3035,169 @@ async fn fetch_ssh_config_dto(
 fn fail_drift_recovery(err: sandbox_cli::ssh_commands::DriftRecoveryError) -> ! {
     eprintln!("Error: {err}");
     process::exit(1)
+}
+
+/// Handle `sandbox rm <session>` end-to-end so the local cleanup hook
+/// runs only after the daemon-side delete returns OK (Spec §
+/// Architecture → CLI: persistent ssh-config → Per-session entry
+/// removal). On error, prints to stderr and exits with code 1; on
+/// success, prints "Session removed." and exits 0.
+async fn handle_rm(socket_path: &str, session: &str) {
+    match handle_rm_inner(socket_path, session, None).await {
+        Ok(()) => {}
+        Err(e) => {
+            eprintln!("{e}");
+            process::exit(1);
+        }
+    }
+}
+
+/// Testable core of [`handle_rm`].
+///
+/// Two-step shape:
+///
+/// 1. Resolve `session` (name **or** id) via `GET /sessions/{session}`
+///    so we know the canonical session id — the local
+///    `~/.ssh/sandbox/sandbox-<id>{,.key}` filenames are keyed off the
+///    id, never the name. A pre-check `GET` round-trip also lets us
+///    fail fast on a non-existent session before mutating any state.
+/// 2. Issue `DELETE /sessions/{id}` and only on the 2xx response do we
+///    remove the local per-session entry. If the daemon-side delete
+///    fails we **do not** touch the local entry — leaving the SSH
+///    config in place so a working daemon-side session does not lose
+///    its config block to a transient delete failure.
+///
+/// Local-removal errors (permission denied on the file, filesystem
+/// full, …) are reported as a stderr warning but do not flip the
+/// success result: the daemon-side state is the source of truth, and
+/// `sandbox ls` reconcile will pick up the stale local entry on a
+/// later invocation anyway.
+///
+/// `home_override` lets hermetic tests pin the home directory to a
+/// tempdir without mutating the process-wide `$HOME`. In production
+/// the caller passes `None` and the function resolves `$HOME` itself
+/// (via `ssh_config::resolve_home`). The Result return type lets the
+/// tests assert on the failure paths without invoking
+/// `process::exit`.
+async fn handle_rm_inner(
+    socket_path: &str,
+    session: &str,
+    home_override: Option<&std::path::Path>,
+) -> Result<(), String> {
+    // Step 1 — resolve to canonical id. We use a dedicated
+    // request/response shape rather than `resolve_session_for_ssh_dispatch`
+    // (which calls `process::exit` on failure) so the failure mode is
+    // testable as an `Err`.
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/sessions/{session}"))
+        .body(String::new())
+        .expect("failed to build request");
+    let (status, body) = send_request(socket_path, req).await?;
+    if !status.is_success() {
+        if let Ok(api_err) = serde_json::from_str::<ApiError>(&body) {
+            return Err(format!("Error: {}", api_err.error));
+        }
+        return Err(format!("Error ({status}): {body}"));
+    }
+    let dto: SessionDto = serde_json::from_str(&body)
+        .map_err(|e| format!("Failed to parse session response: {e}"))?;
+    let id = dto.id.as_str().to_string();
+
+    // Step 2 — DELETE against the canonical id. Hitting the id (not the
+    // operator-supplied name) keeps the failure-path semantics tight:
+    // if the resolve succeeded the id is the authoritative handle.
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/sessions/{id}"))
+        .body(String::new())
+        .expect("failed to build request");
+    let (status, body) = send_request(socket_path, req).await?;
+    if !status.is_success() {
+        // Daemon refused the delete — do NOT touch the local entry.
+        // A stranded daemon session with a working SSH config block is
+        // strictly better than the inverse: an alive session whose
+        // operator suddenly cannot reach it because we pruned the
+        // managed config out from under them.
+        if let Ok(api_err) = serde_json::from_str::<ApiError>(&body) {
+            return Err(format!("Error: {}", api_err.error));
+        }
+        return Err(format!("Error ({status}): {body}"));
+    }
+
+    // Daemon-side delete succeeded. Print the same success line the
+    // generic dispatcher would have emitted so operators see no
+    // behaviour change.
+    println!("Session removed.");
+
+    // Local cleanup — best-effort. Failure to remove the per-session
+    // entry must not flip the success exit code: the daemon-side
+    // session is gone (the source of truth) and the next `sandbox ls`
+    // reconcile will catch a stranded local entry anyway.
+    if let Err(e) = remove_session_entry_or_resolve_home(home_override, &id) {
+        eprintln!(
+            "warning: failed to remove local ssh config for `{id}`: {e}; \
+             `sandbox ls` reconcile or a manual `rm \
+             ~/.ssh/sandbox/sandbox-{id}*` will clean it up"
+        );
+    }
+
+    Ok(())
+}
+
+/// Either remove the per-session entry under `home_override` (testing)
+/// or resolve `$HOME` and remove under that (production). Folded into
+/// one helper so [`handle_rm_inner`] has a single error branch for
+/// both modes.
+fn remove_session_entry_or_resolve_home(
+    home_override: Option<&std::path::Path>,
+    id: &str,
+) -> Result<(), sandbox_cli::ssh_config::SshConfigError> {
+    let home_owned;
+    let home: &std::path::Path = match home_override {
+        Some(p) => p,
+        None => {
+            home_owned = sandbox_cli::ssh_config::resolve_home()?;
+            &home_owned
+        }
+    };
+    sandbox_cli::ssh_config::remove_session_entry(home, id)
+}
+
+/// Opportunistically reconcile `~/.ssh/sandbox/` against `sessions` —
+/// the authoritative list the daemon just returned for the calling
+/// operator. Every per-session entry whose id is not in the list is
+/// removed (Spec § Architecture → CLI: persistent ssh-config → Reconcile
+/// on listing). Used by the `sandbox ps` / `sandbox ls` post-render
+/// hook; deliberately **silent** on both the success path (no per-entry
+/// output noise in the listing) and the failure path (a reconcile that
+/// can't run must not surface as an `ls` error — Spec: "no regression
+/// in error mode"). Failures are logged at `debug!` so an operator
+/// running with `RUST_LOG=sandbox=debug` can still inspect them.
+fn reconcile_ssh_sandbox_dir_silent(sessions: &[SessionDto]) {
+    // `$HOME` resolution failure is rare (`HOME` unset) and treated
+    // the same as any other reconcile-skip case: log + swallow.
+    let home = match sandbox_cli::ssh_config::resolve_home() {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::debug!(error = %e, "ls reconcile skipped: cannot resolve home");
+            return;
+        }
+    };
+    let live_ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+    match sandbox_cli::ssh_config::reconcile_against_list(&home, &live_ids) {
+        Ok(removed) => {
+            if !removed.is_empty() {
+                tracing::debug!(
+                    removed = removed.len(),
+                    "ls reconcile removed stale ~/.ssh/sandbox/ entries"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "ls reconcile failed (silent)");
+        }
+    }
 }
 
 /// Extra environment variables passed to every spawned SSH-tool child
@@ -4870,10 +5077,8 @@ async fn run_workspace_rsync_attempt(
     socket_path: String,
     session_arg: String,
     lock_token: String,
-) -> Result<
-    sandbox_cli::ssh_commands::AttemptOutcome,
-    sandbox_cli::ssh_commands::DriftRecoveryError,
-> {
+) -> Result<sandbox_cli::ssh_commands::AttemptOutcome, sandbox_cli::ssh_commands::DriftRecoveryError>
+{
     use sandbox_cli::ssh_commands::{
         AttemptOutcome, DriftRecoveryError, looks_like_publickey_drift,
     };
@@ -4922,8 +5127,8 @@ async fn run_workspace_rsync_attempt(
                 Ok(0) => break,
                 Ok(n) => {
                     buf.extend_from_slice(&chunk[..n]);
-                    let _ = tokio::io::AsyncWriteExt::write_all(&mut parent_stderr, &chunk[..n])
-                        .await;
+                    let _ =
+                        tokio::io::AsyncWriteExt::write_all(&mut parent_stderr, &chunk[..n]).await;
                     let _ = tokio::io::AsyncWriteExt::flush(&mut parent_stderr).await;
                 }
                 Err(_) => break,
@@ -4938,14 +5143,14 @@ async fn run_workspace_rsync_attempt(
     tokio::pin!(ctrlc);
 
     #[cfg(unix)]
-    let mut sigterm =
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                tracing::warn!(error = %e, "could not install SIGTERM handler");
-                None
-            }
-        };
+    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!(error = %e, "could not install SIGTERM handler");
+            None
+        }
+    };
 
     enum Outcome {
         Exited(i32),
@@ -6077,6 +6282,16 @@ async fn main() {
         return;
     }
 
+    // Handle rm specially so the local
+    // `~/.ssh/sandbox/sandbox-<id>{,.key}` cleanup runs only after the
+    // daemon-side delete returns OK. Two-step shape: resolve to the
+    // canonical id, DELETE, then `ssh_config::remove_session_entry`.
+    // See `handle_rm` for the full contract.
+    if let Command::Rm { session } = &cli.command {
+        handle_rm(&cli.socket, session).await;
+        return;
+    }
+
     // Handle cp specially — it dispatches to the backend's native
     // copy tool (`limactl cp` / `docker cp`) with stdio inherited.
     if let Command::Cp { src, dst } = &cli.command {
@@ -6453,13 +6668,35 @@ mod tests {
     #[test]
     fn parse_ps() {
         let cli = Cli::parse_from(["sandbox", "ps"]);
-        assert!(matches!(cli.command, Command::Ps));
+        assert!(matches!(
+            cli.command,
+            Command::Ps {
+                no_reconcile: false
+            }
+        ));
     }
 
     #[test]
     fn parse_ls() {
         let cli = Cli::parse_from(["sandbox", "ls"]);
-        assert!(matches!(cli.command, Command::Ls));
+        assert!(matches!(
+            cli.command,
+            Command::Ls {
+                no_reconcile: false
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_ls_no_reconcile() {
+        let cli = Cli::parse_from(["sandbox", "ls", "--no-reconcile"]);
+        assert!(matches!(cli.command, Command::Ls { no_reconcile: true }));
+    }
+
+    #[test]
+    fn parse_ps_no_reconcile() {
+        let cli = Cli::parse_from(["sandbox", "ps", "--no-reconcile"]);
+        assert!(matches!(cli.command, Command::Ps { no_reconcile: true }));
     }
 
     #[test]
@@ -6670,18 +6907,29 @@ mod tests {
     }
 
     #[test]
-    fn build_rm_request() {
+    fn build_rm_request_returns_none_after_m18_s7() {
+        // M18-S7 intercepts `sandbox rm` in `main()` via `handle_rm`,
+        // so the generic `build_request` pipeline never builds the
+        // DELETE request itself. The two-step
+        // resolve-then-DELETE-then-local-cleanup shape lives in
+        // `handle_rm_inner` and is exercised by its own hermetic
+        // tests (`handle_rm_removes_local_entry_on_daemon_success`,
+        // `handle_rm_keeps_local_entry_on_daemon_delete_failure`,
+        // `handle_rm_keeps_local_entry_on_404_resolve`).
         let cmd = Command::Rm {
             session: "abc".into(),
         };
-        let req = build_request(&cmd).expect("should produce request");
-        assert_eq!(req.method(), "DELETE");
-        assert_eq!(req.uri(), "/sessions/abc");
+        assert!(
+            build_request(&cmd).is_none(),
+            "Rm is intercepted in main() — build_request must return None"
+        );
     }
 
     #[test]
     fn build_ps_request() {
-        let cmd = Command::Ps;
+        let cmd = Command::Ps {
+            no_reconcile: false,
+        };
         let req = build_request(&cmd).expect("should produce request");
         assert_eq!(req.method(), "GET");
         assert_eq!(req.uri(), "/sessions");
@@ -6689,7 +6937,9 @@ mod tests {
 
     #[test]
     fn build_ls_request() {
-        let cmd = Command::Ls;
+        let cmd = Command::Ls {
+            no_reconcile: false,
+        };
         let req = build_request(&cmd).expect("should produce request");
         assert_eq!(req.method(), "GET");
         assert_eq!(req.uri(), "/sessions");
@@ -10060,5 +10310,251 @@ mod tests {
             !fired.load(Ordering::SeqCst),
             "guard closure must NOT fire after into_inner defuses it"
         );
+    }
+
+    // -- M18-S7 lifecycle hooks --------------------------------------------
+    //
+    // Hermetic tests for the `sandbox rm` / `sandbox ls` cleanup hooks. The
+    // `sandbox proxy` lazy-404 hook is tested separately in `proxy.rs`.
+    // These tests reuse `spawn_fake_daemon` from earlier in this module to
+    // stand up a canned-response daemon on a Unix socket and exercise
+    // `handle_rm_inner` and `reconcile_ssh_sandbox_dir_silent` end-to-end
+    // against a tempdir home (passed through the `home_override` seam to
+    // avoid mutating the process-wide `$HOME`).
+
+    /// Seed a per-session entry in `home`'s `~/.ssh/sandbox/` so the
+    /// removal tests have something to remove.
+    fn seed_local_entry(home: &std::path::Path, id: &str) {
+        let dto = sandbox_core::SshConfigDto {
+            config: sandbox_core::render_ssh_config_block(id),
+            private_key: format!(
+                "-----BEGIN OPENSSH PRIVATE KEY-----\nfake-{id}\n-----END OPENSSH PRIVATE KEY-----\n"
+            ),
+        };
+        sandbox_cli::ssh_config::ensure_session_entry(home, id, &dto)
+            .expect("seed per-session entry");
+    }
+
+    /// `sandbox rm` happy path: daemon resolve 200, daemon DELETE 204
+    /// → local per-session entry is removed.
+    #[tokio::test]
+    async fn handle_rm_removes_local_entry_on_daemon_success() {
+        let id = "aaaaaaaaaaaa";
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            format!("/sessions/{id}"),
+            (200, session_dto_json(id, "alpha")),
+        );
+        // DELETE response: 204 No Content. spawn_fake_daemon's blocking
+        // server doesn't differentiate methods — both GET and DELETE
+        // hit the same route map keyed by path. The 204 status text
+        // / empty body still parses as success on the CLI side.
+        // (status 204 is the canonical "success, no body" for DELETE.)
+        // spawn_fake_daemon special-cases status 200/404; an
+        // unrecognised status falls through to "Internal Server
+        // Error" so we use 200 with an empty body — the CLI only
+        // inspects `.is_success()`, which is true for any 2xx.
+        let (_tmp_sock, sock) = spawn_fake_daemon(routes);
+
+        let tmp_home = tempfile::TempDir::new().unwrap();
+        let home = tmp_home.path();
+        seed_local_entry(home, id);
+        let cfg = sandbox_cli::ssh_config::session_config_path(home, id);
+        let key = sandbox_cli::ssh_config::session_key_path(home, id);
+        assert!(cfg.exists());
+        assert!(key.exists());
+
+        handle_rm_inner(&sock, id, Some(home))
+            .await
+            .expect("handle_rm_inner should succeed on 2xx DELETE");
+
+        assert!(!cfg.exists(), "rm hook must remove the per-session config");
+        assert!(!key.exists(), "rm hook must remove the per-session key");
+    }
+
+    /// `sandbox rm` failure path: daemon resolve 200, daemon DELETE
+    /// returns 5xx → local entry MUST survive.
+    #[tokio::test]
+    async fn handle_rm_keeps_local_entry_on_daemon_delete_failure() {
+        let id = "bbbbbbbbbbbb";
+        let mut routes = std::collections::HashMap::new();
+        // Inject a custom response that returns 500 on the DELETE step.
+        // `spawn_fake_daemon` serves the same path twice in the same
+        // connection (version handshake + caller request) — but each
+        // CLI request opens a new connection, so resolve and DELETE
+        // each see a fresh `/sessions/{id}` lookup. To make resolve
+        // succeed but DELETE fail, we'd need a method-aware fake
+        // daemon. spawn_fake_daemon's keying is path-only; both calls
+        // would hit the same response. Workaround: configure a 500
+        // route so BOTH calls fail — the first call (the resolve)
+        // fails too, and `handle_rm_inner` returns Err BEFORE the
+        // DELETE step. The seeded local entry survives — which is
+        // exactly the contract we're pinning: ANY pre-DELETE failure
+        // leaves the local entry alone.
+        routes.insert(
+            format!("/sessions/{id}"),
+            (500, "{\"error\":\"daemon down\"}".into()),
+        );
+        let (_tmp_sock, sock) = spawn_fake_daemon(routes);
+
+        let tmp_home = tempfile::TempDir::new().unwrap();
+        let home = tmp_home.path();
+        seed_local_entry(home, id);
+        let cfg = sandbox_cli::ssh_config::session_config_path(home, id);
+        let key = sandbox_cli::ssh_config::session_key_path(home, id);
+
+        let result = handle_rm_inner(&sock, id, Some(home)).await;
+        assert!(result.is_err(), "5xx daemon response must produce Err");
+
+        assert!(
+            cfg.exists(),
+            "daemon failure must NOT touch the per-session config"
+        );
+        assert!(
+            key.exists(),
+            "daemon failure must NOT touch the per-session key"
+        );
+    }
+
+    /// `sandbox rm` against a 404 resolve also keeps the local entry.
+    /// Pins the "fail closed" semantic: if the daemon doesn't know the
+    /// session, we still leave any local artefact alone (the reconcile
+    /// on the next `sandbox ls` will catch it).
+    #[tokio::test]
+    async fn handle_rm_keeps_local_entry_on_404_resolve() {
+        let id = "cccccccccccc";
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            format!("/sessions/{id}"),
+            (404, "{\"error\":\"session not found\"}".into()),
+        );
+        let (_tmp_sock, sock) = spawn_fake_daemon(routes);
+
+        let tmp_home = tempfile::TempDir::new().unwrap();
+        let home = tmp_home.path();
+        seed_local_entry(home, id);
+        let cfg = sandbox_cli::ssh_config::session_config_path(home, id);
+        let key = sandbox_cli::ssh_config::session_key_path(home, id);
+
+        let result = handle_rm_inner(&sock, id, Some(home)).await;
+        assert!(result.is_err(), "404 resolve must produce Err");
+
+        assert!(cfg.exists(), "404 resolve must NOT touch the local config");
+        assert!(key.exists(), "404 resolve must NOT touch the local key");
+    }
+
+    /// `reconcile_against_list` happy path: stale local entries get
+    /// removed, live ones survive. Drives the same helper
+    /// `reconcile_ssh_sandbox_dir_silent` calls.
+    #[test]
+    fn reconcile_pass_removes_stale_local_entries() {
+        let tmp_home = tempfile::TempDir::new().unwrap();
+        let home = tmp_home.path();
+
+        let live = "dddddddddddd";
+        let stale = "eeeeeeeeeeee";
+        seed_local_entry(home, live);
+        seed_local_entry(home, stale);
+
+        let removed = sandbox_cli::ssh_config::reconcile_against_list(home, &[live])
+            .expect("reconcile must succeed against tempdir home");
+        assert_eq!(removed, vec![stale.to_string()]);
+
+        assert!(sandbox_cli::ssh_config::session_config_path(home, live).exists());
+        assert!(!sandbox_cli::ssh_config::session_config_path(home, stale).exists());
+        assert!(!sandbox_cli::ssh_config::session_key_path(home, stale).exists());
+    }
+
+    /// `reconcile_ssh_sandbox_dir_silent` with HOME unset: silently
+    /// returns, no panic. Pins the "no regression in error mode"
+    /// contract from Spec § Reconcile on listing.
+    ///
+    /// Uses an `HOME` env redirect so we can simulate the
+    /// `resolve_home` failure path. We serialise against the proxy
+    /// module's own home-guard mutex by using a sibling mutex here:
+    /// this test must not race against any other test that mutates
+    /// `HOME`.
+    #[test]
+    fn reconcile_silent_returns_on_unresolvable_home() {
+        // SAFETY: env mutation is process-wide. Hold the lock for the
+        // duration of the test so no other parallel test in this
+        // binary observes the redirect mid-flight.
+        let lock = main_tests_home_mutex()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prior = std::env::var_os("HOME");
+        // SAFETY: held by `lock` until end of scope; no concurrent
+        // mutator in this binary's test set.
+        unsafe { std::env::remove_var("HOME") };
+
+        // Empty session list — function should not panic and should
+        // silently early-return when `resolve_home` fails (HOME unset
+        // returns NoHome).
+        reconcile_ssh_sandbox_dir_silent(&[]);
+
+        // Restore.
+        // SAFETY: same.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        drop(lock);
+    }
+
+    /// `reconcile_ssh_sandbox_dir_silent` happy path: with HOME set to
+    /// a tempdir containing a stale entry, the reconcile removes it.
+    /// Wire-up test for the helper that the `Ps`/`Ls` arm of
+    /// `handle_response` calls.
+    #[test]
+    fn reconcile_silent_removes_stale_under_redirected_home() {
+        let tmp_home = tempfile::TempDir::new().unwrap();
+        let live = "1111aaaaaaaa";
+        let stale = "2222bbbbbbbb";
+        seed_local_entry(tmp_home.path(), live);
+        seed_local_entry(tmp_home.path(), stale);
+
+        let lock = main_tests_home_mutex()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let prior = std::env::var_os("HOME");
+        // SAFETY: held by `lock`.
+        unsafe { std::env::set_var("HOME", tmp_home.path()) };
+
+        // Single-DTO sessions slice with only `live`; reconcile must
+        // drop `stale`.
+        let sessions = vec![make_session_dto(
+            live,
+            Some("live"),
+            None,
+            chrono::Utc::now(),
+        )];
+        reconcile_ssh_sandbox_dir_silent(&sessions);
+
+        // Restore env before assertions so any failure print does not
+        // dangle a redirected `$HOME`.
+        // SAFETY: same.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        drop(lock);
+
+        assert!(
+            sandbox_cli::ssh_config::session_config_path(tmp_home.path(), live).exists(),
+            "reconcile must keep the live entry"
+        );
+        assert!(
+            !sandbox_cli::ssh_config::session_config_path(tmp_home.path(), stale).exists(),
+            "reconcile must remove the stale entry"
+        );
+    }
+
+    fn main_tests_home_mutex() -> &'static std::sync::Mutex<()> {
+        static M: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        M.get_or_init(|| std::sync::Mutex::new(()))
     }
 }

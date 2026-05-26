@@ -132,13 +132,37 @@ pub async fn run(socket_path: &str, id: &str) -> i32 {
             EXIT_GENERIC_FAILURE
         }
         Err(ProxyError::UpgradeRejected { status, body }) => {
-            // Distinguish 404 so M18-S7 can wire lazy-cleanup off the
-            // dedicated exit code. Body is included verbatim because
-            // the daemon's error response carries the typed
+            // Distinguish 404 so the lazy-cleanup hook below fires off
+            // the dedicated exit code. Body is included verbatim
+            // because the daemon's error response carries the typed
             // `SSH_NOT_AVAILABLE` token plus the operator-actionable
             // "recreate the session" message.
             if status == hyper::StatusCode::NOT_FOUND {
                 eprintln!("sandbox proxy: session {id} not found ({body})");
+                // Lazy-404 cleanup (Spec § Architecture → CLI:
+                // persistent ssh-config → Lazy cleanup): the daemon
+                // says this session is gone; drop the local
+                // `~/.ssh/sandbox/sandbox-<id>{,.key}` entry before
+                // exiting so a subsequent `ssh sandbox-<id>` does not
+                // find a stranded config block pointing at a
+                // ProxyCommand that will 404 again. The cleanup is a
+                // **one-shot housekeeping action** (no retry), which
+                // is why it lives here rather than in the M18-S6
+                // drift-recovery wrapper (`sandbox proxy` is
+                // deliberately excluded from drift recovery to keep
+                // nested `git-remote-sandbox` invocations from
+                // stacking retries; lazy-404 cleanup has no such
+                // stacking concern).
+                //
+                // Local-cleanup failure (permission denied on the
+                // file, filesystem full, …) is surfaced as a stderr
+                // warning but **does not** change the exit code: ssh's
+                // `ProxyCommand` consumer needs to see
+                // `EXIT_SESSION_NOT_FOUND` so the operator's outer
+                // `sandbox ssh` retry path can react to it. Stranded
+                // local files are harmless (the next `sandbox ls`
+                // reconcile picks them up).
+                lazy_cleanup_local_entry(id);
                 EXIT_SESSION_NOT_FOUND
             } else {
                 eprintln!("sandbox proxy: daemon refused upgrade with HTTP {status}: {body}");
@@ -149,6 +173,49 @@ pub async fn run(socket_path: &str, id: &str) -> i32 {
             eprintln!("sandbox proxy: {e}");
             EXIT_GENERIC_FAILURE
         }
+    }
+}
+
+/// Remove the local `~/.ssh/sandbox/sandbox-<id>{,.key}` per-session
+/// entry for `id`, swallowing every error into a stderr warning. The
+/// caller (the `EXIT_SESSION_NOT_FOUND` branch of [`run`]) preserves
+/// the exit code regardless of cleanup outcome — see the inline
+/// rationale at the call site.
+///
+/// The split between this function and
+/// [`lazy_cleanup_local_entry_at`] mirrors the testability seam used
+/// elsewhere in the CLI: the public form reads `$HOME` (a global
+/// process state that hermetic tests cannot mutate safely under
+/// nextest's in-process parallel test schedule), while the helper
+/// takes an explicit home root so the unit tests can drive it against
+/// a tempdir.
+fn lazy_cleanup_local_entry(id: &str) {
+    let home = match crate::ssh_config::resolve_home() {
+        Ok(h) => h,
+        Err(e) => {
+            // `$HOME` unset is the only realistic failure mode here.
+            // Skip silently at the warn level: a `ProxyCommand` shim
+            // running under a daemon-mediated `ssh` invocation
+            // shouldn't dump operator-facing chatter onto stderr in
+            // the common cases where there is nothing actionable.
+            tracing::debug!(error = %e, "sandbox proxy lazy-cleanup skipped: cannot resolve home");
+            return;
+        }
+    };
+    lazy_cleanup_local_entry_at(&home, id);
+}
+
+/// Cleanup the `~/.ssh/sandbox/sandbox-<id>{,.key}` entry under an
+/// explicit home root. Stderr-warning on failure, silent on success.
+/// Pulled out of [`lazy_cleanup_local_entry`] so hermetic tests can
+/// exercise the cleanup against a tempdir without mutating the
+/// process-wide `$HOME`.
+fn lazy_cleanup_local_entry_at(home: &std::path::Path, id: &str) {
+    if let Err(e) = crate::ssh_config::remove_session_entry(home, id) {
+        eprintln!(
+            "sandbox proxy: warning: failed to remove local ssh config for `{id}`: {e}; \
+             `sandbox ls` reconcile will clean it up"
+        );
     }
 }
 
@@ -495,17 +562,96 @@ mod tests {
     // Pre-handshake error mapping: 404 -> EXIT_SESSION_NOT_FOUND
     // -----------------------------------------------------------------------
 
+    /// Serialises every test that mutates `$HOME` so the in-process
+    /// thread pool nextest uses cannot interleave two redirections.
+    /// `$HOME` is global process state, but the proxy shim's lazy-404
+    /// cleanup path *must* be exercised end-to-end (the 404 → exit-code
+    /// branch and the `remove_session_entry` call share a function we
+    /// don't want to split for the test). Without serialisation a
+    /// parallel test in the same binary that happens to call
+    /// `ssh_config::resolve_home` (none today, but cheap insurance)
+    /// would observe the tempdir mid-redirect.
+    fn home_guard_mutex() -> &'static std::sync::Mutex<()> {
+        static M: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        M.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// RAII redirector for `$HOME`. Drops restore the prior value (or
+    /// remove the variable entirely if it was unset).
+    struct HomeGuard {
+        prior: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl HomeGuard {
+        fn redirect(home: &std::path::Path) -> Self {
+            let lock = home_guard_mutex().lock().unwrap_or_else(|p| p.into_inner());
+            let prior = std::env::var_os("HOME");
+            // SAFETY: we hold the process-wide mutex `home_guard_mutex` for
+            // the lifetime of this guard, so no other test in this
+            // binary can concurrently set/unset `HOME`. The guard is
+            // confined to the same `cfg(test)` module that owns the
+            // mutex; production code never invokes `set_var`/`remove_var`
+            // on `HOME`.
+            unsafe {
+                std::env::set_var("HOME", home);
+            }
+            HomeGuard { prior, _lock: lock }
+        }
+    }
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            // SAFETY: same mutex argument as above — we still hold it
+            // through `_lock` until the drop completes.
+            unsafe {
+                match self.prior.take() {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
     /// Stand up a hand-rolled "daemon" on a Unix socket that returns
     /// `404 Not Found` with the SSH_NOT_AVAILABLE body, then invoke
     /// the proxy shim's pre-handshake path. Verify the upgrade
-    /// rejection maps to EXIT_SESSION_NOT_FOUND.
+    /// rejection maps to EXIT_SESSION_NOT_FOUND **and** the local
+    /// `~/.ssh/sandbox/sandbox-<id>{,.key}` entry was cleaned up by
+    /// the lazy-404 hook (Spec § Architecture → CLI: persistent
+    /// ssh-config → Lazy cleanup).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn run_returns_session_not_found_on_404() {
+    async fn run_returns_session_not_found_on_404_and_cleans_up_local_entry() {
         use tempfile::TempDir;
 
         let tmp = TempDir::new().unwrap();
         let socket_path = tmp.path().join("d.sock");
         let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+
+        // Redirect `$HOME` to a tempdir for the duration of the test so
+        // the lazy-cleanup hook touches the tempdir, not the operator's
+        // real home. The guard's drop restores `$HOME`.
+        let home_tmp = TempDir::new().unwrap();
+        let _home_guard = HomeGuard::redirect(home_tmp.path());
+
+        // Pre-populate a per-session entry so the cleanup hook has
+        // something to remove. We use the same id (`deadbeefcafe`)
+        // the request targets — that's the path
+        // `lazy_cleanup_local_entry` will unlink.
+        let id = "deadbeefcafe";
+        let dto = sandbox_core::SshConfigDto {
+            config: sandbox_core::render_ssh_config_block(id),
+            private_key:
+                "-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n-----END OPENSSH PRIVATE KEY-----\n"
+                    .to_string(),
+        };
+        crate::ssh_config::ensure_session_entry(home_tmp.path(), id, &dto)
+            .expect("seed per-session entry");
+        let cfg_path = crate::ssh_config::session_config_path(home_tmp.path(), id);
+        let key_path = crate::ssh_config::session_key_path(home_tmp.path(), id);
+        assert!(
+            cfg_path.exists(),
+            "test setup: per-session config must exist"
+        );
+        assert!(key_path.exists(), "test setup: per-session key must exist");
 
         let server = tokio::spawn(async move {
             let (mut conn, _) = listener.accept().await.unwrap();
@@ -526,12 +672,110 @@ mod tests {
             let _ = conn.shutdown().await;
         });
 
-        let code = run(socket_path.to_str().unwrap(), "deadbeefcafe").await;
+        let code = run(socket_path.to_str().unwrap(), id).await;
         assert_eq!(
             code, EXIT_SESSION_NOT_FOUND,
-            "404 must map to EXIT_SESSION_NOT_FOUND (M18-S7 lazy-cleanup hook depends on this)"
+            "404 must map to EXIT_SESSION_NOT_FOUND"
+        );
+        // Lazy-cleanup pin: after the 404 the local entry must be gone.
+        assert!(
+            !cfg_path.exists(),
+            "lazy-404 cleanup must remove the per-session config file"
+        );
+        assert!(
+            !key_path.exists(),
+            "lazy-404 cleanup must remove the per-session key file"
         );
         let _ = server.await;
+    }
+
+    /// A non-404 daemon response must NOT touch the local entry — only
+    /// the 404 branch is the "session is gone" signal. Pins the
+    /// negative half of Spec § Architecture → CLI: persistent
+    /// ssh-config → Lazy cleanup.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_does_not_clean_up_local_entry_on_non_404_errors() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let socket_path = tmp.path().join("d.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
+
+        let home_tmp = TempDir::new().unwrap();
+        let _home_guard = HomeGuard::redirect(home_tmp.path());
+
+        let id = "deadbeefcafe";
+        let dto = sandbox_core::SshConfigDto {
+            config: sandbox_core::render_ssh_config_block(id),
+            private_key:
+                "-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n-----END OPENSSH PRIVATE KEY-----\n"
+                    .to_string(),
+        };
+        crate::ssh_config::ensure_session_entry(home_tmp.path(), id, &dto)
+            .expect("seed per-session entry");
+        let cfg_path = crate::ssh_config::session_config_path(home_tmp.path(), id);
+        let key_path = crate::ssh_config::session_key_path(home_tmp.path(), id);
+
+        let server = tokio::spawn(async move {
+            let (mut conn, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut conn, &mut buf).await;
+            let body = "internal";
+            let resp = format!(
+                "HTTP/1.1 500 Internal Server Error\r\n\
+                 content-length: {}\r\n\
+                 connection: close\r\n\
+                 \r\n{body}",
+                body.len()
+            );
+            let _ = conn.write_all(resp.as_bytes()).await;
+            let _ = conn.shutdown().await;
+        });
+
+        let code = run(socket_path.to_str().unwrap(), id).await;
+        assert_eq!(code, EXIT_GENERIC_FAILURE);
+        // The 500 branch must not invoke the cleanup hook.
+        assert!(
+            cfg_path.exists(),
+            "non-404 errors must NOT remove the local config"
+        );
+        assert!(
+            key_path.exists(),
+            "non-404 errors must NOT remove the local key"
+        );
+        let _ = server.await;
+    }
+
+    /// Hermetic exercise of the explicit-home cleanup helper. Pins
+    /// that it removes both the config and key files and that absent
+    /// files do not cause a non-zero exit (helper is fire-and-forget).
+    #[test]
+    fn lazy_cleanup_local_entry_at_removes_files() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let id = "0123456789ab";
+        let dto = sandbox_core::SshConfigDto {
+            config: sandbox_core::render_ssh_config_block(id),
+            private_key:
+                "-----BEGIN OPENSSH PRIVATE KEY-----\nfake\n-----END OPENSSH PRIVATE KEY-----\n"
+                    .to_string(),
+        };
+        crate::ssh_config::ensure_session_entry(home, id, &dto).unwrap();
+        let cfg = crate::ssh_config::session_config_path(home, id);
+        let key = crate::ssh_config::session_key_path(home, id);
+        assert!(cfg.exists());
+        assert!(key.exists());
+
+        lazy_cleanup_local_entry_at(home, id);
+
+        assert!(!cfg.exists());
+        assert!(!key.exists());
+
+        // Re-running the helper against the now-absent entry is a no-op.
+        // (idempotent — the underlying `remove_session_entry` tolerates
+        // missing files.)
+        lazy_cleanup_local_entry_at(home, id);
     }
 
     /// 500-class upgrade rejection (or any non-404 non-101) maps to
