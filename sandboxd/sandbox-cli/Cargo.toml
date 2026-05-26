@@ -20,6 +20,14 @@ chrono.workspace = true
 # workspace feature unification but fails when the crate is checked in
 # isolation.  Mirrors the explicit opt-in in sandboxd/Cargo.toml.
 clap = { workspace = true, features = ["env"] }
+# `futures_util::{SinkExt, StreamExt}` are the extension traits the
+# `sandbox proxy` shim uses to drive the `tokio-tungstenite`
+# `WebSocketStream` (which implements `futures::Sink`/`Stream`, not
+# `tokio`'s native shape). Default features are off because we only
+# need the stream/sink extension traits, not the executor / I/O
+# reexports — the daemon side already pulls this crate in with the
+# same minimal feature set.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
@@ -64,6 +72,19 @@ serde_json.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+# `tokio-tungstenite` is the WebSocket framing layer the
+# `sandbox proxy <id>` hidden subcommand sits on top of: the CLI drives
+# the HTTP/1.1 → WebSocket upgrade by hand through `hyper` (same
+# Unix-socket client every other daemon API call uses) so it can run
+# over the existing `UnixStream` rather than dialing TCP, then hands
+# the upgraded stream to `WebSocketStream::from_raw_socket` to get a
+# `Sink`/`Stream` over binary frames. Same version sandboxd's dev-deps
+# pin (0.29). Default features are off (no TLS, no `connect`) because
+# the daemon socket is Unix-local; the `handshake` feature is on
+# because tungstenite's WebSocket-key generator is the canonical way
+# to mint a Sec-WebSocket-Key nonce and it brings in the `http` types
+# we already use for the request URI.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 tracing.workspace = true
 
 [dev-dependencies]

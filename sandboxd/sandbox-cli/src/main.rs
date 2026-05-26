@@ -524,6 +524,33 @@ enum Command {
     /// Read-only; no privilege check, no path arguments.
     #[command(hide = true, name = "dump-proto-version")]
     DumpProtoVersion,
+
+    /// Hidden subcommand: `ProxyCommand` shim invoked by the daemon-
+    /// emitted SSH config block.
+    ///
+    /// The cross-user CLI access design (see the M18 milestone)
+    /// generates a `Host sandbox-<id>` block under `~/.ssh/sandbox/`
+    /// whose `ProxyCommand` line reads `sandbox proxy <id>`. The shim
+    /// opens a WebSocket against the daemon's
+    /// `GET /sessions/{id}/proxy` endpoint over the existing Unix-
+    /// socket transport, then bidirectionally splices its own stdin
+    /// and stdout with binary WebSocket frames. The daemon's byte
+    /// mover (`sandboxd::proxy_http`) carries those bytes into the
+    /// session's sshd per backend.
+    ///
+    /// **Wire format**: the subcommand name (`proxy`) and the single
+    /// positional argument (`<id>`) are pinned by
+    /// `sandbox_core::render_ssh_config_block`. Renaming either is a
+    /// wire break with the daemon-side template.
+    ///
+    /// Hidden because operators are not expected to invoke this
+    /// directly — `ssh sandbox-<id>` (or `sandbox ssh`, after M18-S6)
+    /// is the user-facing surface.
+    #[command(hide = true, name = "proxy")]
+    Proxy {
+        /// Session id (12 lowercase-hex chars).
+        session: String,
+    },
 }
 
 /// Policy subcommands.
@@ -1353,6 +1380,13 @@ fn build_request(command: &Command) -> Option<Request<String>> {
                  `dump-proto-version` are handled client-side in main() before build_request"
             );
         }
+        // `sandbox proxy` is the hidden `ProxyCommand` shim for the
+        // SSH-config tunnel. It performs its own HTTP-to-WebSocket
+        // upgrade against `/sessions/{id}/proxy` over the daemon
+        // socket and bidirectionally splices stdin/stdout with binary
+        // WebSocket frames; the generic single-request/response
+        // pipeline does not apply.
+        Command::Proxy { .. } => return None,
         // `sandbox update` runs its own orchestration (pre-flight,
         // confirmation prompt, stateful steps). It owns the full
         // process lifecycle and never hits the single-request /
@@ -1580,6 +1614,18 @@ fn command_bypasses_version_check(command: &Command) -> bool {
             // pre-flight queries the daemon read-only (active sessions
             // count) and tolerates `/version` returning anything.
             | Command::Update { .. }
+            // `sandbox proxy` is the WebSocket `ProxyCommand` shim
+            // generated into the per-session SSH config block. The
+            // shim's wire shape (subcommand name + positional argv) is
+            // pinned by `sandbox_core::render_ssh_config_block` and
+            // ships in the same crate as the daemon, so daemon ⇄ CLI
+            // skew on the proxy endpoint is structurally impossible
+            // (both ends move together). The shim also runs under
+            // stdin/stdout pipes wired to `ssh`'s process — a stderr
+            // warning from the version-check pre-flight would corrupt
+            // the SSH banner exchange. Bypass keeps the byte pipe
+            // clean.
+            | Command::Proxy { .. }
     )
 }
 
@@ -1883,6 +1929,13 @@ fn handle_response(command: &Command, status: hyper::StatusCode, body: &str) -> 
                 "`apply-config-migration` / `dump-migration-set` / `dump-proto-version` \
                  are handled client-side in main() before send_request"
             );
+        }
+        Command::Proxy { .. } => {
+            // The `sandbox proxy` shim has its own dispatch path in
+            // `main()` (it performs an HTTP-to-WebSocket upgrade and
+            // splices stdio with binary frames); it never reaches the
+            // generic request/response handler.
+            unreachable!("`sandbox proxy` is handled client-side in main() before send_request");
         }
         Command::Update { .. } => {
             // `sandbox update` runs its own orchestration loop in
@@ -6265,6 +6318,20 @@ async fn main() {
         process::exit(code);
     }
 
+    // Handle `sandbox proxy <id>` specially — the hidden ProxyCommand
+    // shim performs its own HTTP-to-WebSocket upgrade against
+    // `/sessions/{id}/proxy` on the daemon socket and bidirectionally
+    // splices stdin/stdout with binary WebSocket frames. It bypasses
+    // the version-equality handshake (see
+    // `command_bypasses_version_check`) because (a) it ships in the
+    // same crate as the daemon so structural skew is impossible and
+    // (b) any pre-flight stderr output would corrupt the SSH banner
+    // exchange running over the same pipe.
+    if let Command::Proxy { session } = &cli.command {
+        let code = sandbox_cli::proxy::run(&cli.socket, session).await;
+        process::exit(code);
+    }
+
     // Handle ssh specially — it doesn't follow the normal request/response flow.
     if let Command::Ssh { session, command } = &cli.command {
         handle_ssh(&cli.socket, session, command).await;
@@ -10594,6 +10661,66 @@ mod tests {
             "`sandbox version` must bypass the strict-equality check; it \
              answers locally without a daemon connection"
         );
+    }
+
+    #[test]
+    fn version_handshake_bypassed_for_proxy_subcommand() {
+        // `sandbox proxy <id>` is invoked as a `ProxyCommand` from the
+        // daemon-emitted SSH config with stdin/stdout connected to
+        // `ssh`'s pipes; any stderr line printed by the version
+        // pre-flight (or stdout, worse) would corrupt the SSH banner
+        // exchange. The pre-flight is also unnecessary because the
+        // proxy wire format ships in the same crate as the daemon —
+        // structural skew is impossible.
+        let cmd = Command::Proxy {
+            session: "0123456789ab".into(),
+        };
+        assert!(
+            command_bypasses_version_check(&cmd),
+            "`sandbox proxy` must bypass the version-equality check so the \
+             pre-flight cannot corrupt the SSH banner running over the \
+             ProxyCommand pipe"
+        );
+    }
+
+    /// `sandbox proxy <id>` parses as the `Proxy` variant. Pins the
+    /// argv shape the daemon's `render_ssh_config_block` writes into
+    /// every `ProxyCommand` line: `sandbox proxy <12-hex-id>`. A
+    /// rename of the subcommand or its positional argv slot here is
+    /// a wire break with the daemon-side template.
+    #[test]
+    fn proxy_subcommand_parses_with_session_id_positional() {
+        let cli = Cli::parse_from(["sandbox", "proxy", "0123456789ab"]);
+        match cli.command {
+            Command::Proxy { session } => assert_eq!(session, "0123456789ab"),
+            other => panic!("expected Command::Proxy, got {other:?}"),
+        }
+    }
+
+    /// `sandbox proxy` is hidden from `--help` per the M18-S5
+    /// milestone: operators are not the intended caller (the
+    /// daemon-emitted SSH config block is). Verified by rendering the
+    /// long help via clap and asserting the `proxy` token does not
+    /// appear on a subcommand line. Renaming the flag or dropping
+    /// `hide = true` would silently expose the wire-format-bound
+    /// subcommand to operator-visible documentation.
+    #[test]
+    fn proxy_subcommand_is_hidden_from_help() {
+        use clap::CommandFactory;
+        let help = Cli::command().render_long_help().to_string();
+        // Subcommands appear as a leading-space-or-tab `proxy` token
+        // in the help output's `Commands:` block; the long description
+        // mentions the subcommand name many times. Grep for the
+        // subcommand-line shape ("\n  proxy" with description after)
+        // rather than the substring.
+        for line in help.lines() {
+            let trimmed = line.trim_start();
+            assert!(
+                !trimmed.starts_with("proxy "),
+                "`sandbox proxy` must remain hidden; found subcommand line: {line:?}\n\
+                 full help:\n{help}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
