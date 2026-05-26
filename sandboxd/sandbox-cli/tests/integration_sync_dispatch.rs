@@ -439,13 +439,8 @@ async fn integration_sync_rejects_both_sides_remote() {
     let shim_dir = tempfile::tempdir().expect("shim dir");
     let home_dir = tempfile::tempdir().expect("home dir");
 
-    let (status, _stdout, stderr) = run_sandbox_sync(
-        &["a:foo", "b:bar"],
-        &sock,
-        shim_dir.path(),
-        home_dir.path(),
-    )
-    .await;
+    let (status, _stdout, stderr) =
+        run_sandbox_sync(&["a:foo", "b:bar"], &sock, shim_dir.path(), home_dir.path()).await;
 
     assert_eq!(
         status.code(),

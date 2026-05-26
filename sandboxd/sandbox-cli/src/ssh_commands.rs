@@ -635,8 +635,13 @@ mod tests {
 
     #[test]
     fn scp_argv_upload_file_no_recurse() {
-        let (program, args) =
-            plan_scp_argv(&alias(), "/local/file", "/remote/path", TransferDirection::Upload, false);
+        let (program, args) = plan_scp_argv(
+            &alias(),
+            "/local/file",
+            "/remote/path",
+            TransferDirection::Upload,
+            false,
+        );
         assert_eq!(program, "scp");
         assert_eq!(
             args,
@@ -649,8 +654,13 @@ mod tests {
 
     #[test]
     fn scp_argv_upload_directory_uses_dash_r() {
-        let (program, args) =
-            plan_scp_argv(&alias(), "/local/dir", "/remote/path", TransferDirection::Upload, true);
+        let (program, args) = plan_scp_argv(
+            &alias(),
+            "/local/dir",
+            "/remote/path",
+            TransferDirection::Upload,
+            true,
+        );
         assert_eq!(program, "scp");
         assert_eq!(
             args,
@@ -777,8 +787,14 @@ mod tests {
 
     #[test]
     fn sync_argv_uses_bare_ssh_transport_not_limactl_or_docker() {
-        let (_program, args) =
-            plan_sync_argv(&alias(), "/src", "/dst", TransferDirection::Upload, &[], false);
+        let (_program, args) = plan_sync_argv(
+            &alias(),
+            "/src",
+            "/dst",
+            TransferDirection::Upload,
+            &[],
+            false,
+        );
         // `-e ssh` (not `limactl shell` / `docker exec -i`).
         let e_idx = args.iter().position(|a| a == "-e").expect("-e present");
         assert_eq!(args.get(e_idx + 1).map(String::as_str), Some("ssh"));
@@ -788,7 +804,11 @@ mod tests {
     // plan_workspace_rsync_argv
     // -----------------------------------------------------------------------
 
-    fn workspace_plan_baseline(direction: WorkspaceDirection, force: bool, dry_run: bool) -> WorkspaceRsyncPlan<'static> {
+    fn workspace_plan_baseline(
+        direction: WorkspaceDirection,
+        force: bool,
+        dry_run: bool,
+    ) -> WorkspaceRsyncPlan<'static> {
         WorkspaceRsyncPlan {
             alias: "sandbox-abcdef012345",
             host_path: "/host/path".to_string(),
@@ -853,7 +873,10 @@ mod tests {
         let argv = plan_workspace_rsync_argv(&plan).expect("must plan");
         // dst is the override (with appended trailing slash); src is
         // the guest path.
-        assert_eq!(argv.last().map(String::as_str), Some("/custom/destination/"));
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("/custom/destination/")
+        );
     }
 
     #[test]
@@ -902,8 +925,7 @@ mod tests {
 
     #[test]
     fn drift_sniffer_matches_canonical_substring() {
-        let stderr =
-            b"some preamble\n@@ \nuser@host: Permission denied (publickey).\nmore noise\n";
+        let stderr = b"some preamble\n@@ \nuser@host: Permission denied (publickey).\nmore noise\n";
         assert!(looks_like_publickey_drift(stderr));
     }
 
@@ -914,7 +936,9 @@ mod tests {
         assert!(!looks_like_publickey_drift(
             b"ssh: connect to host 127.0.0.1 port 22: Connection refused\n"
         ));
-        assert!(!looks_like_publickey_drift(b"Host key verification failed.\n"));
+        assert!(!looks_like_publickey_drift(
+            b"Host key verification failed.\n"
+        ));
         assert!(!looks_like_publickey_drift(b"command not found\n"));
     }
 
